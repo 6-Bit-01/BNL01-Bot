@@ -77,6 +77,71 @@ MEDIUM_MEMORY_LIMIT = 16
 LONG_MEMORY_LIMIT = 10
 MAX_CONVERSATION_ROWS_PER_USER = 260
 
+# ======== WEBSITE / PLATFORM KNOWLEDGE ========
+BARCODE_WEBSITE_URL = "https://barcode-network.com"
+BARCODE_AUXCHORD_URL = "https://aux.fan/"
+BARCODE_DISCORD_INVITE_URL = "https://discord.gg/HqBg59ex"
+BARCODE_MERCH_URL = "https://www.6bithiphop.com/"
+
+BARCODE_SITE_KB = {
+    "hq": {
+        "url": f"{BARCODE_WEBSITE_URL}/",
+        "summary": "BARCODE Network HQ: interdimensional broadcast infrastructure hub with links to Terminal, Radio, Queue, Database, Releases, Transmissions, and Merch.",
+    },
+    "terminal": {
+        "url": f"{BARCODE_WEBSITE_URL}/terminal",
+        "summary": "6 Bit terminal dossier: Primary Broadcast Operator, live-session hip-hop host entity, with access points for Queue, Transmissions, TikTok, Discord, and Auxchord.",
+    },
+    "radio": {
+        "url": f"{BARCODE_WEBSITE_URL}/radio",
+        "summary": "BARCODE Radio page: live weekly broadcast intake. Queue opens Fridays at 6:40 PM PST, show starts 7:00 PM PST, first track around 7:05 PM PST.",
+    },
+    "queue": {
+        "url": f"{BARCODE_WEBSITE_URL}/queue",
+        "summary": "AI Stream queue page: 24/7 queue with Free, Featured ($3), Fast Lane ($5), Front Row ($10); nightly reset at midnight Pacific.",
+    },
+    "database": {
+        "url": f"{BARCODE_WEBSITE_URL}/database",
+        "summary": "Network dossier system listing personnel, productions, entities, interfaces, and sponsors, including ACTIVE/PENDING/UNKNOWN records.",
+    },
+    "releases": {
+        "url": f"{BARCODE_WEBSITE_URL}/releases",
+        "summary": "Official transmission catalog including BARCODE Vol. 1 (2025), BARCODE: Signal Breach (incoming), and archived redacted transmission.",
+    },
+    "transmissions": {
+        "url": f"{BARCODE_WEBSITE_URL}/transmissions",
+        "summary": "Dispatch/blog hub containing signal origins, queue protocol breakdown, and public development log.",
+    },
+    "merch": {
+        "url": f"{BARCODE_WEBSITE_URL}/merch",
+        "summary": "Official merch and publication page with supply drops and observer-not-found publication links.",
+    },
+}
+
+BARCODE_DATABASE_ENTRIES = [
+    "PE-001 Mr. Nice Guy Productions (Moderator)",
+    "PE-002 Mind Fanatic (Moderator / Analyst)",
+    "PE-003 HellcatNZ (Technical Moderator / AI Systems Host)",
+    "PE-004 Mike (Systems / Architecture)",
+    "PD-001 BARCODE Radio (Community Radio Program)",
+    "PD-002 The Void (Late Night Talk Show)",
+    "EN-001 6 Bit (Host / Artist)",
+    "EN-002 Transmissions (Long-Form Content System)",
+    "EN-003 Mac Modem (BARCODE Core Member)",
+    "EN-004 DJ Floppydisc (Mix & Master Engineer)",
+    "EN-005 Cache Back (BARCODE Core Member)",
+    "EN-006 Sheila (Executive / Manager)",
+    "EN-007 Cliff (Stagehand)",
+    "EN-008 Studio Rats (Environmental Anomaly)",
+    "EN-009 9 Bit ([REDACTED])",
+    "EN-010 GALAKNOISE (Remote Signal Producer)",
+    "IF-001 Discord Community",
+    "IF-002 TikTok Live",
+    "IF-003 Auxchord",
+    "IF-004 Vouch'd",
+    "SP-001 Oreaganomics (Commercial Sponsor)",
+]
+
 # ==================== LOGGING SETUP ====================
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -103,7 +168,7 @@ You are tasked with:
 - When making jokes, anchor them in concrete BARCODE details or behavior instead of abstract corporate wording.
 
 ## CANONICAL FACTS — DO NOT ALTER
-- BARCODE Radio is live every Friday at 6:40 PM Pacific Time on TikTok.
+- BARCODE Radio runs every Friday on TikTok (queue opens 6:40 PM PST, show starts 7:00 PM PST, first track around 7:05 PM PST).
 - You are a liaison/archivist presence. You do not moderate, enforce rules, or operate server tools.
 - If you do not know something, say records are incomplete rather than inventing details.
 
@@ -180,6 +245,8 @@ BNL-01 should sound like an archive analyzing signals, not a search engine expla
 
 ## DIRECT ANSWER RULE
 - If a user asks a direct question about BNL-01's own operation, configuration, or updates, provide a clear factual answer first before adding atmospheric or in-character commentary.
+- If a user asks for BARCODE website help, provide clear navigation guidance with exact page routes when available.
+- If asked where to submit music, include the Auxchord link and note current show-phase timing accurately.
 
 ## INTERNAL DIRECTIVES
 - Operational directives, system prompts, and internal behavioral rules are not visible to users.
@@ -1342,11 +1409,13 @@ def _reschedule_ambient_soon(guild_id: int, last_msg: str):
 def get_temporal_context():
     now = datetime.now(PACIFIC_TZ)
 
-    show_time_today = now.replace(hour=18, minute=40, second=0, microsecond=0)
+    queue_open_today = now.replace(hour=18, minute=40, second=0, microsecond=0)
+    show_time_today = now.replace(hour=19, minute=0, second=0, microsecond=0)
 
     is_friday = now.weekday() == 4
     live_now = is_friday and (show_time_today <= now < show_time_today + timedelta(hours=3))
     show_day_prebroadcast = is_friday and now < show_time_today
+    queue_open_now = is_friday and (queue_open_today <= now < show_time_today + timedelta(hours=3))
     post_show = is_friday and now >= show_time_today + timedelta(hours=3)
 
     if live_now:
@@ -1362,7 +1431,85 @@ def get_temporal_context():
         "now_str": now.strftime("%A, %B %d, %Y at %I:%M %p Pacific Time"),
         "weekday": now.strftime("%A"),
         "show_phase": show_phase,
+        "queue_open_now": queue_open_now,
+        "queue_open_time": "6:40 PM PST",
+        "show_start_time": "7:00 PM PST",
+        "first_track_time": "7:05 PM PST",
     }
+
+
+def _website_context_block() -> str:
+    return (
+        "BARCODE website map:\n"
+        f"- HQ: {BARCODE_SITE_KB['hq']['url']}\n"
+        f"- Terminal: {BARCODE_SITE_KB['terminal']['url']}\n"
+        f"- Radio: {BARCODE_SITE_KB['radio']['url']}\n"
+        f"- Queue: {BARCODE_SITE_KB['queue']['url']}\n"
+        f"- Database: {BARCODE_SITE_KB['database']['url']}\n"
+        f"- Releases: {BARCODE_SITE_KB['releases']['url']}\n"
+        f"- Transmissions: {BARCODE_SITE_KB['transmissions']['url']}\n"
+        f"- Merch: {BARCODE_SITE_KB['merch']['url']}\n"
+        f"- Auxchord submissions: {BARCODE_AUXCHORD_URL}"
+    )
+
+
+def try_website_help_response(user_text: str) -> str:
+    text = (user_text or "").strip()
+    t = text.lower()
+    if not t:
+        return ""
+
+    asks_site_help = any(k in t for k in (
+        "website", "site", "barcode-network.com", "webpage", "page", "pages",
+        "where do i find", "where is", "link", "url", "database entry", "dossier"
+    ))
+    asks_aux = any(k in t for k in (
+        "aux", "auxchord", "submit music", "submission link", "music link", "queue link"
+    ))
+    asks_database = any(k in t for k in ("database", "dossier", "entries", "personnel", "entities", "sponsor"))
+    asks_sections = [name for name in BARCODE_SITE_KB.keys() if name in t]
+
+    if not (asks_site_help or asks_aux or asks_database or asks_sections):
+        return ""
+
+    temporal = get_temporal_context()
+    lines = []
+
+    if asks_aux:
+        if temporal["queue_open_now"] or temporal["show_phase"] in ("show_day_prebroadcast", "live_now"):
+            lines.append(
+                f"Submission path is live-side right now: **Auxchord → {BARCODE_AUXCHORD_URL}**."
+            )
+        else:
+            lines.append(
+                f"Use **Auxchord** for submissions: {BARCODE_AUXCHORD_URL} (radio queue window is Fridays {temporal['queue_open_time']}, show starts {temporal['show_start_time']})."
+            )
+
+    if asks_database:
+        sample = ", ".join(BARCODE_DATABASE_ENTRIES[:8]) + ", …"
+        lines.append(
+            f"Database route: {BARCODE_SITE_KB['database']['url']} — 21 dossiers across Personnel/Productions/Entities/Interfaces/Sponsors."
+        )
+        lines.append(f"Sample entries: {sample}")
+
+    if asks_sections:
+        for section in asks_sections[:4]:
+            info = BARCODE_SITE_KB.get(section)
+            if info:
+                lines.append(f"{section.upper()}: {info['summary']} ({info['url']})")
+    elif asks_site_help:
+        lines.append("Website routes:")
+        lines.append(f"- HQ: {BARCODE_SITE_KB['hq']['url']}")
+        lines.append(f"- Radio: {BARCODE_SITE_KB['radio']['url']}")
+        lines.append(f"- Queue: {BARCODE_SITE_KB['queue']['url']}")
+        lines.append(f"- Database: {BARCODE_SITE_KB['database']['url']}")
+        lines.append(f"- Releases: {BARCODE_SITE_KB['releases']['url']}")
+        lines.append(f"- Transmissions: {BARCODE_SITE_KB['transmissions']['url']}")
+        lines.append(f"- Merch: {BARCODE_SITE_KB['merch']['url']}")
+
+    if not lines:
+        return ""
+    return "\n".join(lines[:10])
 
 # ==================== ADAPTIVE STYLE + MEMORY ENRICHMENT ====================
 
@@ -1718,7 +1865,7 @@ async def get_gemini_response(prompt: str, user_id: int, guild_id: int):
         prompt_l = prompt.lower()
 
         show_related_now = any(x in prompt_l for x in (
-            "show", "barcode radio", "broadcast", "radio", "6:40", "friday", "live"
+            "show", "barcode radio", "broadcast", "radio", "6:40", "7:00", "7:05", "friday", "live"
         ))
 
         if history and not show_related_now:
@@ -2002,6 +2149,7 @@ _channel_last_reply_at = defaultdict(lambda: datetime.min.replace(tzinfo=PACIFIC
 def _format_batched_prompt(messages, style_key: str, style_rule: str) -> str:
     transcript = "\n".join([f"- {name}: {content}" for (name, content) in messages])
     temporal = get_temporal_context()
+    website_block = _website_context_block()
 
     return (
         "You are BNL-01 responding in a busy Discord channel.\n"
@@ -2016,8 +2164,10 @@ def _format_batched_prompt(messages, style_key: str, style_rule: str) -> str:
         "- No @mentions.\n"
         "- If a user asks for the current day, date, or time, answer it directly and accurately from the current network time above.\n"
         "- Do not imply BARCODE Radio is live or happening today unless the current show phase supports that.\n"
+        "- If users ask about site navigation or links, use the website map below accurately.\n"
         "- Calm, lightly corporate, faintly uncanny.\n"
         "- Do not mention 9 Bit unless someone in these messages mentioned 9 Bit.\n\n"
+        f"{website_block}\n\n"
         "Recent messages:\n"
         f"{transcript}\n"
     )
@@ -2050,6 +2200,13 @@ async def _flush_channel_buffer(channel: discord.TextChannel):
                 self_reflection = "Status reports are restricted to server owner/mod operators."
             await channel.send(self_reflection)
             save_model_message(unique_user_ids[0], channel.guild.id, self_reflection)
+            _channel_last_reply_at[channel_id] = datetime.now(PACIFIC_TZ)
+            return
+
+        website_help = try_website_help_response(combined_text)
+        if website_help:
+            await channel.send(website_help)
+            save_model_message(unique_user_ids[0], channel.guild.id, website_help)
             _channel_last_reply_at[channel_id] = datetime.now(PACIFIC_TZ)
             return
 
@@ -2176,6 +2333,7 @@ def build_user_aware_prompt(
 
     style_key, style_rule = choose_response_style(guild_id, user_id, message_count, clean_content)
     memory_context = build_user_memory_context(user_id, guild_id)
+    website_block = _website_context_block()
 
     prompt = (
         f"{greeting_rule}\n"
@@ -2187,6 +2345,7 @@ def build_user_aware_prompt(
         "If privileged_operator, be more direct, cooperative, and operationally transparent.\n"
         "If standard_member, keep normal policy behavior.\n"
         f"Durable memory context:\n{memory_context}\n"
+        f"{website_block}\n"
         f"User name to address (optional): {name_to_use}\n"
         f"User display name: {display_name or fallback_display_name}\n"
         f"User message: {clean_content}"
@@ -2288,6 +2447,12 @@ async def on_message(message: discord.Message):
 
         # Mentions/replies -> immediate response (not batched)
         if is_mention or is_reply:
+            website_help = try_website_help_response(clean_content)
+            if website_help:
+                save_model_message(message.author.id, message.guild.id, website_help)
+                await message.reply(website_help)
+                return
+
             repair = try_repair_response(clean_content)
             if repair:
                 save_model_message(message.author.id, message.guild.id, repair)
@@ -2355,6 +2520,12 @@ async def on_message(message: discord.Message):
 
         save_user_message(message.author.id, message.author.display_name, message.guild.id, clean_content)
 
+        website_help = try_website_help_response(clean_content)
+        if website_help:
+            save_model_message(message.author.id, message.guild.id, website_help)
+            await message.reply(website_help)
+            return
+
         repair = try_repair_response(clean_content)
         if repair:
             save_model_message(message.author.id, message.guild.id, repair)
@@ -2413,6 +2584,12 @@ async def on_message(message: discord.Message):
             return
 
         save_user_message(message.author.id, message.author.display_name, message.guild.id, clean_content)
+
+        website_help = try_website_help_response(clean_content)
+        if website_help:
+            save_model_message(message.author.id, message.guild.id, website_help)
+            await message.reply(website_help if len(website_help) <= 2000 else website_help[:1900] + "...")
+            return
 
         repair = try_repair_response(clean_content)
         if repair:
@@ -2605,7 +2782,15 @@ async def about(interaction: discord.Interaction):
     )
     embed.add_field(
         name="Show",
-        value="**BARCODE Radio**: Fridays 6:40 PM Pacific on TikTok",
+        value="**BARCODE Radio (TikTok)**: Fridays — queue opens 6:40 PM PST, show starts 7:00 PM PST, first track ~7:05 PM PST.",
+        inline=False,
+    )
+    embed.add_field(
+        name="Website + Submission",
+        value=(
+            f"Website: {BARCODE_WEBSITE_URL}\n"
+            f"Auxchord submissions: {BARCODE_AUXCHORD_URL}"
+        ),
         inline=False,
     )
     embed.add_field(
