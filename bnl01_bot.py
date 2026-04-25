@@ -1564,6 +1564,40 @@ def _infer_recent_website_targets(user_id: int, guild_id: int) -> dict:
     return {"section": section, "entity": entity, "article": article}
 
 
+def _render_entity_response(alias: str, info: dict, include_link: bool = False, role_followup: bool = False) -> str:
+    summary = info.get("summary", "").strip()
+    role_detail = BARCODE_DOSSIER_KB.get(alias, {}).get("role_detail", "").strip()
+
+    m = re.match(
+        r"^(?P<code>[A-Z0-9-]+)\s+(?P<name>.+?)\s+is\s+(?:listed|marked)\s+(?:as|under)\s+(?P<role>.+?)\.?$",
+        summary,
+        flags=re.IGNORECASE
+    )
+
+    if m:
+        code = m.group("code").strip()
+        name = m.group("name").strip()
+        role = m.group("role").strip().rstrip(".")
+    else:
+        code = ""
+        name = alias.title()
+        role = "an active BARCODE record entry"
+
+    if role_followup and role_detail:
+        line = role_detail
+    else:
+        variants = [
+            f"{name} is logged in BARCODE records under {code or 'a tracked entry'}, with duties around {role.lower()}.",
+            f"In the Network index, {name} maps to {code or 'an active record'} and sits in the {role.lower()} lane.",
+            f"{name} appears in the BARCODE database as {code or 'a tracked node'} — role focus: {role.lower()}.",
+        ]
+        line = random.choice(variants)
+
+    if include_link and info.get("url"):
+        return f"{line} ({info['url']})"
+    return line
+
+
 def try_website_help_response(user_text: str, user_id: int = 0, guild_id: int = 0) -> str:
     text = (user_text or "").strip()
     t = text.lower()
@@ -1582,6 +1616,7 @@ def try_website_help_response(user_text: str, user_id: int = 0, guild_id: int = 
     asks_profile = any(k in t for k in (
         "tell me about", "who is", "who's", "whos", "what about", "mod", "dossier", "profile"
     ))
+    asks_person_followup = bool(re.search(r"\b(tell me about|what about)\s+(him|her|them)\b", t))
     asks_role_followup = bool(re.search(r"\b(what(?:'s| is)?|what does)\s+(he|she|they|it)\s+(do|work on)\b", t))
     asks_database = any(k in t for k in ("database", "dossier", "entries", "personnel", "entities", "sponsor"))
     asks_sections = [name for name in BARCODE_SITE_KB.keys() if name in t]
@@ -1602,6 +1637,10 @@ def try_website_help_response(user_text: str, user_id: int = 0, guild_id: int = 
 
     temporal = get_temporal_context()
     recent_targets = _infer_recent_website_targets(user_id, guild_id)
+    if asks_person_followup and not matched_entities and recent_targets.get("entity"):
+        alias = recent_targets["entity"]
+        matched_entities.append((alias, BARCODE_ENTITY_KB[alias]))
+
     if asks_role_followup and not matched_entities and recent_targets.get("entity"):
         alias = recent_targets["entity"]
         matched_entities.append((alias, BARCODE_ENTITY_KB[alias]))
@@ -1625,18 +1664,14 @@ def try_website_help_response(user_text: str, user_id: int = 0, guild_id: int = 
             if key in seen:
                 continue
             seen.add(key)
-            if asks_role_followup:
-                role_detail = BARCODE_DOSSIER_KB.get(alias, {}).get("role_detail")
-                if role_detail:
-                    if should_include_links or asks_for_link:
-                        lines.append(f"{role_detail} ({info['url']})")
-                    else:
-                        lines.append(role_detail)
-                    continue
-            if should_include_links or asks_for_link:
-                lines.append(f"{info['summary']} ({info['url']})")
-            else:
-                lines.append(info["summary"])
+            lines.append(
+                _render_entity_response(
+                    alias,
+                    info,
+                    include_link=(should_include_links or asks_for_link),
+                    role_followup=asks_role_followup
+                )
+            )
 
     if matched_articles:
         seen_articles = set()
