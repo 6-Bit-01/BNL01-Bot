@@ -80,7 +80,7 @@ MAX_CONVERSATION_ROWS_PER_USER = 260
 # ======== WEBSITE / PLATFORM KNOWLEDGE ========
 BARCODE_WEBSITE_URL = "https://barcode-network.com"
 BARCODE_AUXCHORD_URL = "https://aux.fan/"
-BARCODE_DISCORD_INVITE_URL = "https://discord.gg/"
+BARCODE_DISCORD_INVITE_URL = "https://discord.gg/HqBg59ex"
 BARCODE_MERCH_URL = "https://www.6bithiphop.com/"
 
 BARCODE_SITE_KB = {
