@@ -79,9 +79,9 @@ MAX_CONVERSATION_ROWS_PER_USER = 260
 
 # ======== WEBSITE / PLATFORM KNOWLEDGE ========
 BARCODE_WEBSITE_URL = "https://barcode-network.com"
-BARCODE_AUXCHORD_URL = "https://aux.fan/"
-BARCODE_DISCORD_INVITE_URL = "https://discord.gg/HqBg59ex"
-BARCODE_MERCH_URL = "https://www.6bithiphop.com/"
+BARCODE_AUXCHORD_URL = "aux.fan/@barcode_radio"
+BARCODE_DISCORD_INVITE_URL = "https://discord.gg/wRBgJuzmKG"
+BARCODE_MERCH_URL = "https://www.6bithiphop.com/c/categories/1st-wave"
 
 BARCODE_SITE_KB = {
     "hq": {
@@ -141,6 +141,49 @@ BARCODE_DATABASE_ENTRIES = [
     "IF-004 Vouch'd",
     "SP-001 Oreaganomics (Commercial Sponsor)",
 ]
+
+BARCODE_DOSSIER_KB = {
+    "hellcat": {
+        "canonical": "HellcatNZ",
+        "summary": "PE-003 HellcatNZ is listed as a Technical Moderator / AI Systems Host in BARCODE records.",
+        "url": f"{BARCODE_WEBSITE_URL}/database/hellcatnz",
+    },
+    "hellcatnz": {
+        "canonical": "HellcatNZ",
+        "summary": "PE-003 HellcatNZ is listed as a Technical Moderator / AI Systems Host in BARCODE records.",
+        "url": f"{BARCODE_WEBSITE_URL}/database/hellcatnz",
+    },
+    "mind fanatic": {
+        "canonical": "Mind Fanatic",
+        "summary": "PE-002 Mind Fanatic is listed as a Moderator / Analyst in BARCODE records.",
+        "url": f"{BARCODE_WEBSITE_URL}/database/mind-fanatic",
+    },
+    "mr nice guy": {
+        "canonical": "Mr. Nice Guy Productions",
+        "summary": "PE-001 Mr. Nice Guy Productions is listed as a Moderator in BARCODE records.",
+        "url": f"{BARCODE_WEBSITE_URL}/database/mr-nice-guy-productions",
+    },
+    "mike": {
+        "canonical": "Mike",
+        "summary": "PE-004 Mike is listed under Systems / Architecture in BARCODE records.",
+        "url": f"{BARCODE_WEBSITE_URL}/database/mike",
+    },
+}
+
+BARCODE_ARTICLE_KB = {
+    "signal origins": {
+        "summary": "Signal Origins covers how BARCODE emerged from fragmented media archives into the Network timeline.",
+        "url": f"{BARCODE_WEBSITE_URL}/transmissions/signal-origins",
+    },
+    "queue protocol": {
+        "summary": "Queue Protocol outlines submission flow and intake behavior for BARCODE Radio streams.",
+        "url": f"{BARCODE_WEBSITE_URL}/transmissions/queue-protocol",
+    },
+    "development log": {
+        "summary": "Development Log tracks ongoing system and ecosystem updates from the BARCODE side.",
+        "url": f"{BARCODE_WEBSITE_URL}/transmissions/development-log",
+    },
+}
 
 # ==================== LOGGING SETUP ====================
 
@@ -1459,21 +1502,61 @@ def try_website_help_response(user_text: str) -> str:
     if not t:
         return ""
 
-    asks_site_help = any(k in t for k in (
-        "website", "site", "barcode-network.com", "webpage", "page", "pages",
-        "where do i find", "where is", "link", "url", "database entry", "dossier"
+    asks_site_mention = any(k in t for k in (
+        "website", "site", "barcode-network.com", "webpage", "page", "pages"
+    ))
+    asks_for_link = any(k in t for k in (
+        "link", "url", "website for", "send the link", "drop the link", "where do i find", "where is"
     ))
     asks_aux = any(k in t for k in (
         "aux", "auxchord", "submit music", "submission link", "music link", "queue link"
     ))
+    asks_profile = any(k in t for k in (
+        "tell me about", "who is", "who's", "whos", "what about", "mod", "dossier", "profile"
+    ))
     asks_database = any(k in t for k in ("database", "dossier", "entries", "personnel", "entities", "sponsor"))
     asks_sections = [name for name in BARCODE_SITE_KB.keys() if name in t]
+    matched_dossiers = []
+    for alias, info in BARCODE_DOSSIER_KB.items():
+        if re.search(rf"\b{re.escape(alias)}\b", t):
+            matched_dossiers.append(info)
+    matched_articles = []
+    for alias, info in BARCODE_ARTICLE_KB.items():
+        if alias in t:
+            matched_articles.append((alias, info))
 
-    if not (asks_site_help or asks_aux or asks_database or asks_sections):
+    if not (
+        asks_site_mention or asks_for_link or asks_aux or asks_profile or asks_database or asks_sections
+        or matched_dossiers or matched_articles
+    ):
         return ""
 
     temporal = get_temporal_context()
     lines = []
+    should_include_links = asks_for_link or asks_aux or bool(asks_sections)
+
+    if matched_dossiers:
+        seen = set()
+        for info in matched_dossiers:
+            key = info["canonical"].lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            if should_include_links or asks_for_link:
+                lines.append(f"{info['summary']} ({info['url']})")
+            else:
+                lines.append(info["summary"])
+
+    if matched_articles:
+        seen_articles = set()
+        for alias, info in matched_articles:
+            if alias in seen_articles:
+                continue
+            seen_articles.add(alias)
+            if should_include_links or asks_for_link:
+                lines.append(f"{alias.title()}: {info['summary']} ({info['url']})")
+            else:
+                lines.append(f"{alias.title()}: {info['summary']}")
 
     if asks_aux:
         if temporal["queue_open_now"] or temporal["show_phase"] in ("show_day_prebroadcast", "live_now"):
@@ -1485,27 +1568,38 @@ def try_website_help_response(user_text: str) -> str:
                 f"Use **Auxchord** for submissions: {BARCODE_AUXCHORD_URL} (radio queue window is Fridays {temporal['queue_open_time']}, show starts {temporal['show_start_time']})."
             )
 
-    if asks_database:
-        sample = ", ".join(BARCODE_DATABASE_ENTRIES[:8]) + ", …"
-        lines.append(
-            f"Database route: {BARCODE_SITE_KB['database']['url']} — 21 dossiers across Personnel/Productions/Entities/Interfaces/Sponsors."
-        )
+    if asks_database and not matched_dossiers:
+        sample = ", ".join(BARCODE_DATABASE_ENTRIES[:6]) + ", …"
+        if should_include_links:
+            lines.append(
+                f"Database route: {BARCODE_SITE_KB['database']['url']} — 21 dossiers across Personnel/Productions/Entities/Interfaces/Sponsors."
+            )
+        else:
+            lines.append("The database tracks 21 dossiers across Personnel, Productions, Entities, Interfaces, and Sponsors.")
         lines.append(f"Sample entries: {sample}")
 
-    if asks_sections:
+    if asks_sections and not matched_dossiers and not matched_articles:
         for section in asks_sections[:4]:
             info = BARCODE_SITE_KB.get(section)
             if info:
-                lines.append(f"{section.upper()}: {info['summary']} ({info['url']})")
-    elif asks_site_help:
-        lines.append("Website routes:")
-        lines.append(f"- HQ: {BARCODE_SITE_KB['hq']['url']}")
-        lines.append(f"- Radio: {BARCODE_SITE_KB['radio']['url']}")
-        lines.append(f"- Queue: {BARCODE_SITE_KB['queue']['url']}")
-        lines.append(f"- Database: {BARCODE_SITE_KB['database']['url']}")
-        lines.append(f"- Releases: {BARCODE_SITE_KB['releases']['url']}")
-        lines.append(f"- Transmissions: {BARCODE_SITE_KB['transmissions']['url']}")
-        lines.append(f"- Merch: {BARCODE_SITE_KB['merch']['url']}")
+                if should_include_links:
+                    lines.append(f"{section.upper()}: {info['summary']} ({info['url']})")
+                else:
+                    lines.append(f"{section.upper()}: {info['summary']}")
+    elif asks_site_mention:
+        if asks_for_link:
+            lines.append("Website routes:")
+            lines.append(f"- HQ: {BARCODE_SITE_KB['hq']['url']}")
+            lines.append(f"- Radio: {BARCODE_SITE_KB['radio']['url']}")
+            lines.append(f"- Queue: {BARCODE_SITE_KB['queue']['url']}")
+            lines.append(f"- Database: {BARCODE_SITE_KB['database']['url']}")
+            lines.append(f"- Releases: {BARCODE_SITE_KB['releases']['url']}")
+            lines.append(f"- Transmissions: {BARCODE_SITE_KB['transmissions']['url']}")
+            lines.append(f"- Merch: {BARCODE_SITE_KB['merch']['url']}")
+        else:
+            # Do not dump links on vague mentions; hand off to normal conversational generation.
+            if not lines:
+                return ""
 
     if not lines:
         return ""
