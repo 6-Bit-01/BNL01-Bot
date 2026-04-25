@@ -146,26 +146,31 @@ BARCODE_DOSSIER_KB = {
     "hellcat": {
         "canonical": "HellcatNZ",
         "summary": "PE-003 HellcatNZ is listed as a Technical Moderator / AI Systems Host in BARCODE records.",
+        "role_detail": "HellcatNZ handles technical moderation and AI systems hosting functions for the Network stack.",
         "url": f"{BARCODE_WEBSITE_URL}/database/hellcatnz",
     },
     "hellcatnz": {
         "canonical": "HellcatNZ",
         "summary": "PE-003 HellcatNZ is listed as a Technical Moderator / AI Systems Host in BARCODE records.",
+        "role_detail": "HellcatNZ handles technical moderation and AI systems hosting functions for the Network stack.",
         "url": f"{BARCODE_WEBSITE_URL}/database/hellcatnz",
     },
     "mind fanatic": {
         "canonical": "Mind Fanatic",
         "summary": "PE-002 Mind Fanatic is listed as a Moderator / Analyst in BARCODE records.",
+        "role_detail": "Mind Fanatic is associated with moderation coverage and analyst-style review in the BARCODE community layer.",
         "url": f"{BARCODE_WEBSITE_URL}/database/mind-fanatic",
     },
     "mr nice guy": {
         "canonical": "Mr. Nice Guy Productions",
         "summary": "PE-001 Mr. Nice Guy Productions is listed as a Moderator in BARCODE records.",
+        "role_detail": "Mr. Nice Guy Productions is listed in moderation operations across the BARCODE records index.",
         "url": f"{BARCODE_WEBSITE_URL}/database/mr-nice-guy-productions",
     },
     "mike": {
         "canonical": "Mike",
         "summary": "PE-004 Mike is listed under Systems / Architecture in BARCODE records.",
+        "role_detail": "Mike is tied to systems and architecture responsibilities in BARCODE infrastructure records.",
         "url": f"{BARCODE_WEBSITE_URL}/database/mike",
     },
 }
@@ -183,6 +188,33 @@ BARCODE_ARTICLE_KB = {
         "summary": "Development Log tracks ongoing system and ecosystem updates from the BARCODE side.",
         "url": f"{BARCODE_WEBSITE_URL}/transmissions/development-log",
     },
+}
+
+BARCODE_ENTITY_KB = {
+    "mr nice guy productions": {"summary": "PE-001 Mr. Nice Guy Productions is listed as a Moderator.", "url": f"{BARCODE_WEBSITE_URL}/database/mr-nice-guy-productions"},
+    "mr nice guy": {"summary": "PE-001 Mr. Nice Guy Productions is listed as a Moderator.", "url": f"{BARCODE_WEBSITE_URL}/database/mr-nice-guy-productions"},
+    "mind fanatic": {"summary": "PE-002 Mind Fanatic is listed as a Moderator / Analyst.", "url": f"{BARCODE_WEBSITE_URL}/database/mind-fanatic"},
+    "hellcatnz": {"summary": "PE-003 HellcatNZ is listed as a Technical Moderator / AI Systems Host.", "url": f"{BARCODE_WEBSITE_URL}/database/hellcatnz"},
+    "hellcat": {"summary": "PE-003 HellcatNZ is listed as a Technical Moderator / AI Systems Host.", "url": f"{BARCODE_WEBSITE_URL}/database/hellcatnz"},
+    "mike": {"summary": "PE-004 Mike is listed under Systems / Architecture.", "url": f"{BARCODE_WEBSITE_URL}/database/mike"},
+    "barcode radio": {"summary": "PD-001 BARCODE Radio is listed as a Community Radio Program.", "url": f"{BARCODE_WEBSITE_URL}/database/barcode-radio"},
+    "the void": {"summary": "PD-002 The Void is listed as a Late Night Talk Show.", "url": f"{BARCODE_WEBSITE_URL}/database/the-void"},
+    "6 bit": {"summary": "EN-001 6 Bit is listed as Host / Artist.", "url": f"{BARCODE_WEBSITE_URL}/database/6-bit"},
+    "six bit": {"summary": "EN-001 6 Bit is listed as Host / Artist.", "url": f"{BARCODE_WEBSITE_URL}/database/6-bit"},
+    "transmissions": {"summary": "EN-002 Transmissions is listed as a Long-Form Content System.", "url": f"{BARCODE_WEBSITE_URL}/database/transmissions"},
+    "mac modem": {"summary": "EN-003 Mac Modem is listed as a BARCODE Core Member.", "url": f"{BARCODE_WEBSITE_URL}/database/mac-modem"},
+    "dj floppydisc": {"summary": "EN-004 DJ Floppydisc is listed as Mix & Master Engineer.", "url": f"{BARCODE_WEBSITE_URL}/database/dj-floppydisc"},
+    "cache back": {"summary": "EN-005 Cache Back is listed as a BARCODE Core Member.", "url": f"{BARCODE_WEBSITE_URL}/database/cache-back"},
+    "sheila": {"summary": "EN-006 Sheila is listed as Executive / Manager.", "url": f"{BARCODE_WEBSITE_URL}/database/sheila"},
+    "cliff": {"summary": "EN-007 Cliff is listed as Stagehand.", "url": f"{BARCODE_WEBSITE_URL}/database/cliff"},
+    "studio rats": {"summary": "EN-008 Studio Rats is listed as an Environmental Anomaly.", "url": f"{BARCODE_WEBSITE_URL}/database/studio-rats"},
+    "9 bit": {"summary": "EN-009 9 Bit is marked [REDACTED] in records.", "url": f"{BARCODE_WEBSITE_URL}/database/9-bit"},
+    "galaknoise": {"summary": "EN-010 GALAKNOISE is listed as Remote Signal Producer.", "url": f"{BARCODE_WEBSITE_URL}/database/galaknoise"},
+    "discord community": {"summary": "IF-001 Discord Community is listed as an active interface.", "url": f"{BARCODE_WEBSITE_URL}/database/discord-community"},
+    "tiktok live": {"summary": "IF-002 TikTok Live is listed as an active interface.", "url": f"{BARCODE_WEBSITE_URL}/database/tiktok-live"},
+    "auxchord": {"summary": "IF-003 Auxchord is listed as an interface endpoint.", "url": f"{BARCODE_WEBSITE_URL}/database/auxchord"},
+    "vouch'd": {"summary": "IF-004 Vouch'd is listed as an interface endpoint.", "url": f"{BARCODE_WEBSITE_URL}/database/vouchd"},
+    "oreaganomics": {"summary": "SP-001 Oreaganomics is listed as a Commercial Sponsor.", "url": f"{BARCODE_WEBSITE_URL}/database/oreaganomics"},
 }
 
 # ==================== LOGGING SETUP ====================
@@ -1496,7 +1528,43 @@ def _website_context_block() -> str:
     )
 
 
-def try_website_help_response(user_text: str) -> str:
+def _infer_recent_website_targets(user_id: int, guild_id: int) -> dict:
+    if not user_id or not guild_id:
+        return {"section": "", "entity": "", "article": ""}
+
+    history = get_conversation_history(user_id, guild_id, limit=12)
+    recent_chunks = []
+    for msg in history[-8:]:
+        parts = msg.get("parts") or [""]
+        recent_chunks.append((parts[0] or "").lower())
+
+    section = ""
+    entity = ""
+    article = ""
+
+    for chunk in reversed(recent_chunks):
+        if not entity:
+            for alias in BARCODE_ENTITY_KB.keys():
+                if re.search(rf"\b{re.escape(alias)}\b", chunk):
+                    entity = alias
+                    break
+        if not article:
+            for alias in BARCODE_ARTICLE_KB.keys():
+                if alias in chunk:
+                    article = alias
+                    break
+        if not section:
+            for key in BARCODE_SITE_KB.keys():
+                if re.search(rf"\b{re.escape(key)}\b", chunk):
+                    section = key
+                    break
+        if section and entity and article:
+            break
+
+    return {"section": section, "entity": entity, "article": article}
+
+
+def try_website_help_response(user_text: str, user_id: int = 0, guild_id: int = 0) -> str:
     text = (user_text or "").strip()
     t = text.lower()
     if not t:
@@ -1514,12 +1582,13 @@ def try_website_help_response(user_text: str) -> str:
     asks_profile = any(k in t for k in (
         "tell me about", "who is", "who's", "whos", "what about", "mod", "dossier", "profile"
     ))
+    asks_role_followup = bool(re.search(r"\b(what(?:'s| is)?|what does)\s+(he|she|they|it)\s+(do|work on)\b", t))
     asks_database = any(k in t for k in ("database", "dossier", "entries", "personnel", "entities", "sponsor"))
     asks_sections = [name for name in BARCODE_SITE_KB.keys() if name in t]
-    matched_dossiers = []
-    for alias, info in BARCODE_DOSSIER_KB.items():
+    matched_entities = []
+    for alias, info in BARCODE_ENTITY_KB.items():
         if re.search(rf"\b{re.escape(alias)}\b", t):
-            matched_dossiers.append(info)
+            matched_entities.append((alias, info))
     matched_articles = []
     for alias, info in BARCODE_ARTICLE_KB.items():
         if alias in t:
@@ -1527,21 +1596,43 @@ def try_website_help_response(user_text: str) -> str:
 
     if not (
         asks_site_mention or asks_for_link or asks_aux or asks_profile or asks_database or asks_sections
-        or matched_dossiers or matched_articles
+        or matched_entities or matched_articles
     ):
         return ""
 
     temporal = get_temporal_context()
+    recent_targets = _infer_recent_website_targets(user_id, guild_id)
+    if asks_role_followup and not matched_entities and recent_targets.get("entity"):
+        alias = recent_targets["entity"]
+        matched_entities.append((alias, BARCODE_ENTITY_KB[alias]))
+
+    if asks_for_link and not (asks_aux or asks_sections or asks_database or matched_entities or matched_articles):
+        if recent_targets.get("entity"):
+            alias = recent_targets["entity"]
+            matched_entities.append((alias, BARCODE_ENTITY_KB[alias]))
+        elif recent_targets.get("article"):
+            matched_articles.append((recent_targets["article"], BARCODE_ARTICLE_KB[recent_targets["article"]]))
+        elif recent_targets.get("section"):
+            asks_sections = [recent_targets["section"]]
+
     lines = []
     should_include_links = asks_for_link or asks_aux or bool(asks_sections)
 
-    if matched_dossiers:
+    if matched_entities:
         seen = set()
-        for info in matched_dossiers:
-            key = info["canonical"].lower()
+        for alias, info in matched_entities:
+            key = info["url"]
             if key in seen:
                 continue
             seen.add(key)
+            if asks_role_followup:
+                role_detail = BARCODE_DOSSIER_KB.get(alias, {}).get("role_detail")
+                if role_detail:
+                    if should_include_links or asks_for_link:
+                        lines.append(f"{role_detail} ({info['url']})")
+                    else:
+                        lines.append(role_detail)
+                    continue
             if should_include_links or asks_for_link:
                 lines.append(f"{info['summary']} ({info['url']})")
             else:
@@ -1568,7 +1659,7 @@ def try_website_help_response(user_text: str) -> str:
                 f"Use **Auxchord** for submissions: {BARCODE_AUXCHORD_URL} (radio queue window is Fridays {temporal['queue_open_time']}, show starts {temporal['show_start_time']})."
             )
 
-    if asks_database and not matched_dossiers:
+    if asks_database and not matched_entities:
         sample = ", ".join(BARCODE_DATABASE_ENTRIES[:6]) + ", …"
         if should_include_links:
             lines.append(
@@ -1578,7 +1669,7 @@ def try_website_help_response(user_text: str) -> str:
             lines.append("The database tracks 21 dossiers across Personnel, Productions, Entities, Interfaces, and Sponsors.")
         lines.append(f"Sample entries: {sample}")
 
-    if asks_sections and not matched_dossiers and not matched_articles:
+    if asks_sections and not matched_entities and not matched_articles:
         for section in asks_sections[:4]:
             info = BARCODE_SITE_KB.get(section)
             if info:
@@ -2297,7 +2388,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel):
             _channel_last_reply_at[channel_id] = datetime.now(PACIFIC_TZ)
             return
 
-        website_help = try_website_help_response(combined_text)
+        website_help = try_website_help_response(combined_text, unique_user_ids[0], channel.guild.id)
         if website_help:
             await channel.send(website_help)
             save_model_message(unique_user_ids[0], channel.guild.id, website_help)
@@ -2541,7 +2632,7 @@ async def on_message(message: discord.Message):
 
         # Mentions/replies -> immediate response (not batched)
         if is_mention or is_reply:
-            website_help = try_website_help_response(clean_content)
+            website_help = try_website_help_response(clean_content, message.author.id, message.guild.id)
             if website_help:
                 save_model_message(message.author.id, message.guild.id, website_help)
                 await message.reply(website_help)
@@ -2614,7 +2705,7 @@ async def on_message(message: discord.Message):
 
         save_user_message(message.author.id, message.author.display_name, message.guild.id, clean_content)
 
-        website_help = try_website_help_response(clean_content)
+        website_help = try_website_help_response(clean_content, message.author.id, message.guild.id)
         if website_help:
             save_model_message(message.author.id, message.guild.id, website_help)
             await message.reply(website_help)
@@ -2679,7 +2770,7 @@ async def on_message(message: discord.Message):
 
         save_user_message(message.author.id, message.author.display_name, message.guild.id, clean_content)
 
-        website_help = try_website_help_response(clean_content)
+        website_help = try_website_help_response(clean_content, message.author.id, message.guild.id)
         if website_help:
             save_model_message(message.author.id, message.guild.id, website_help)
             await message.reply(website_help if len(website_help) <= 2000 else website_help[:1900] + "...")
