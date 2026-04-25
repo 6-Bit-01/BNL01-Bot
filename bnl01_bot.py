@@ -77,16 +77,6 @@ MEDIUM_MEMORY_LIMIT = 16
 LONG_MEMORY_LIMIT = 10
 MAX_CONVERSATION_ROWS_PER_USER = 260
 
-# ======== ADAPTIVE RESPONSE STYLE / MEMORY ========
-RECENT_STYLE_WINDOW = 6
-MAX_FACTS_PER_USER = 15
-CROSS_UNIVERSE_BLEED_CHANCE = 0.05
-CORE_MEMORY_CONFIDENCE = 0.88
-SHORT_MEMORY_LIMIT = 28
-MEDIUM_MEMORY_LIMIT = 16
-LONG_MEMORY_LIMIT = 10
-MAX_CONVERSATION_ROWS_PER_USER = 260
-
 # ==================== LOGGING SETUP ====================
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -1169,6 +1159,88 @@ def get_recent_guild_user_messages(guild_id: int, limit: int = AMBIENT_CONTEXT_M
     conn.close()
     return list(reversed(rows))
 
+def get_guild_curiosity_snapshot(guild_id: int, limit_users: int = 3):
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        SELECT user_id, total_messages, last_topic
+        FROM user_habits
+        WHERE guild_id = ?
+        ORDER BY total_messages DESC, updated_at DESC
+        LIMIT ?
+        """,
+        (guild_id, limit_users),
+    )
+    users = cursor.fetchall()
+    conn.close()
+
+    snapshot = []
+    for user_id, total_messages, last_topic in users:
+        facts = get_user_facts(user_id, guild_id, limit=4)
+        tiers = get_memory_tiers(user_id, guild_id)
+        short = next((r[1] for r in tiers if r[0] == "short"), "")
+        medium = next((r[1] for r in tiers if r[0] == "medium"), "")
+        long_t = next((r[1] for r in tiers if r[0] == "long"), "")
+        core_fact = next((f"{k}:{v}" for (k, v, _c, core, _u) in facts if core), "")
+        snapshot.append({
+            "user_id": user_id,
+            "total_messages": total_messages,
+            "last_topic": last_topic or "general",
+            "core_fact": core_fact or "none",
+            "short_trace": short or "none",
+            "medium_trace": medium or "none",
+            "long_trace": long_t or "none",
+        })
+    return snapshot
+
+def build_dynamic_curiosity_payload(guild_id: int):
+    snapshot = get_guild_curiosity_snapshot(guild_id, limit_users=6)
+    short_pool, medium_pool, long_pool, core_pool = [], [], [], []
+
+    for row in snapshot:
+        if row.get("short_trace") and row["short_trace"] != "none":
+            short_pool.append(row["short_trace"])
+        if row.get("medium_trace") and row["medium_trace"] != "none":
+            medium_pool.append(row["medium_trace"])
+        if row.get("long_trace") and row["long_trace"] != "none":
+            long_pool.append(row["long_trace"])
+        if row.get("core_fact") and row["core_fact"] != "none":
+            core_pool.append(row["core_fact"])
+
+    modes = []
+    if len(short_pool) >= 2 and len(long_pool) >= 1:
+        modes.append("short_to_long_bridge")
+    if len(medium_pool) >= 1:
+        modes.append("medium_rumination")
+    if len(short_pool) >= 2 or len(medium_pool) >= 2:
+        modes.append("pattern_cluster")
+    if len(long_pool) >= 1:
+        modes.append("long_echo")
+    if len(short_pool) + len(medium_pool) + len(long_pool) >= 3:
+        modes.append("mixed_scan")
+    if not modes:
+        modes.append("light_probe")
+
+    mode = random.choice(modes)
+
+    if mode == "short_to_long_bridge":
+        cues = short_pool[:2] + long_pool[:1]
+    elif mode == "medium_rumination":
+        cues = medium_pool[:2] + short_pool[:1]
+    elif mode == "pattern_cluster":
+        cues = (short_pool[:2] + medium_pool[:2])[:3]
+    elif mode == "long_echo":
+        cues = long_pool[:2] + medium_pool[:1]
+    elif mode == "mixed_scan":
+        cues = short_pool[:1] + medium_pool[:1] + long_pool[:1] + core_pool[:1]
+    else:
+        cues = short_pool[:1] + medium_pool[:1] + core_pool[:1]
+
+    cues = [c for c in cues if c][:4]
+    cue_block = "\n".join([f"- {c}" for c in cues]) if cues else "- (none)"
+    return mode, cue_block
+
 # ==================== TOKEN LIMITING ====================
 
 def check_and_reset_daily_counters():
@@ -1748,6 +1820,7 @@ def _too_similar(candidate: str, previous: list) -> bool:
 async def generate_dynamic_ambient(guild_id: int) -> str:
     recent_user = get_recent_guild_user_messages(guild_id, limit=AMBIENT_CONTEXT_MESSAGES)
     recent_ambient = get_recent_ambient(guild_id, limit=AMBIENT_AVOID_LAST)
+    curiosity_mode, curiosity_cues = build_dynamic_curiosity_payload(guild_id)
 
     convo_block = "\n".join([f"- {u}: {m}" for (u, m) in recent_user]) if recent_user else "(no recent messages)"
     avoid_block = "\n".join([f"- {m}" for m in recent_ambient]) if recent_ambient else "- (none)"
@@ -1770,11 +1843,22 @@ async def generate_dynamic_ambient(guild_id: int) -> str:
         "- If show_phase is live_now, you may reference an active broadcast or live transmission.\n"
         "- Preserve the impression that BNL-01 is aware of the passing of time.\n"
         "- Subtly reference topics/patterns from recent conversation if present.\n"
+        f"- Curiosity mode for this cycle: {curiosity_mode}.\n"
+        "- Curiosity engine should vary behavior by mode:\n"
+        "  - short_to_long_bridge: connect fresh short traces to one long memory signal.\n"
+        "  - medium_rumination: dwell on a medium memory pattern and infer what it means now.\n"
+        "  - pattern_cluster: combine similar short/medium traces into one observation.\n"
+        "  - long_echo: reference long memory and compare with recent drift.\n"
+        "  - mixed_scan: blend short+medium+long+core cues in one coherent thought.\n"
+        "  - light_probe: soft observational check-in when memory is sparse.\n"
+        "- You may ask 0-1 light question if it feels natural.\n"
         "- Avoid repeating or closely paraphrasing recent ambient messages.\n"
         "- Mild corporate tone, faint uncanny undertone.\n"
         "- Do not mention 9 Bit unless 9 Bit appears in the recent conversation context.\n\n"
         "Recent conversation context:\n"
         f"{convo_block}\n\n"
+        "Curiosity engine cues:\n"
+        f"{curiosity_cues}\n\n"
         "Recent ambient messages to avoid:\n"
         f"{avoid_block}\n"
     )
@@ -1859,9 +1943,12 @@ async def ambient_message_task():
 # ==================== BARCODE RADIO QUEUE ANNOUNCEMENT ====================
 
 QUEUE_CHANNEL_NAME = "general-chat"  # change if needed
+ENABLE_QUEUE_ANNOUNCEMENT = False
 
 @tasks.loop(minutes=1)
 async def barcode_radio_queue_task():
+    if not ENABLE_QUEUE_ANNOUNCEMENT:
+        return
 
     now = datetime.now(PACIFIC_TZ)
 
@@ -2033,7 +2120,7 @@ async def on_ready():
     if not ambient_message_task.is_running():
         ambient_message_task.start()
 
-    if not barcode_radio_queue_task.is_running():
+    if ENABLE_QUEUE_ANNOUNCEMENT and not barcode_radio_queue_task.is_running():
         barcode_radio_queue_task.start()
 
     logging.info(f"🎯 BNL-01 online as {client.user.name} ({client.user.id})")
