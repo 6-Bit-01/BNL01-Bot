@@ -851,6 +851,40 @@ def try_self_reflection_response(user_id: int, guild_id: int, user_text: str) ->
         return build_upgrade_status_response(user_id, guild_id)
     return ""
 
+def is_privileged_member(member: discord.Member, guild: discord.Guild) -> bool:
+    if not member or not guild:
+        return False
+    if member.id == guild.owner_id:
+        return True
+    perms = member.guild_permissions
+    return any([
+        perms.administrator,
+        perms.manage_guild,
+        perms.manage_messages,
+        perms.kick_members,
+        perms.ban_members,
+    ])
+
+def try_repair_response(user_text: str) -> str:
+    t = (user_text or "").lower().strip()
+    if not t:
+        return ""
+    dissatisfaction = (
+        "not what i asked",
+        "not what i said",
+        "you missed",
+        "that's not it",
+        "that wasnt it",
+        "that wasn't it",
+        "damn",
+        "bro",
+        "youre not listening",
+        "you're not listening",
+    )
+    if any(p in t for p in dissatisfaction):
+        return "Copy that—missed your intent. Give me the exact output you wanted and I’ll correct course in one pass."
+    return ""
+
 def prune_conversation_history(user_id: int, guild_id: int, max_rows: int = MAX_CONVERSATION_ROWS_PER_USER):
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
@@ -1868,10 +1902,20 @@ async def _flush_channel_buffer(channel: discord.TextChannel):
 
     unique_user_ids = sorted({uid for (_n, _c, uid) in items if uid})
     if len(unique_user_ids) == 1:
+        member = channel.guild.get_member(unique_user_ids[0])
         self_reflection = try_self_reflection_response(unique_user_ids[0], channel.guild.id, combined_text)
         if self_reflection:
+            if not is_privileged_member(member, channel.guild):
+                self_reflection = "Status reports are restricted to server owner/mod operators."
             await channel.send(self_reflection)
             save_model_message(unique_user_ids[0], channel.guild.id, self_reflection)
+            _channel_last_reply_at[channel_id] = datetime.now(PACIFIC_TZ)
+            return
+
+        repair = try_repair_response(combined_text)
+        if repair:
+            await channel.send(repair)
+            save_model_message(unique_user_ids[0], channel.guild.id, repair)
             _channel_last_reply_at[channel_id] = datetime.now(PACIFIC_TZ)
             return
 
@@ -1969,7 +2013,14 @@ async def on_ready():
 
     await client.change_presence(activity=discord.Game(name="Cataloging BARCODE data..."))
 
-def build_user_aware_prompt(user_id: int, guild_id: int, fallback_display_name: str, clean_content: str, message_count: int = 1) -> tuple:
+def build_user_aware_prompt(
+    user_id: int,
+    guild_id: int,
+    fallback_display_name: str,
+    clean_content: str,
+    message_count: int = 1,
+    privileged: bool = False
+) -> tuple:
     print("BNL DEBUG: build_user_aware_prompt start")
     display_name, preferred_name = get_user_profile(user_id, guild_id)
     name_to_use = preferred_name or display_name or fallback_display_name
@@ -1991,6 +2042,9 @@ def build_user_aware_prompt(user_id: int, guild_id: int, fallback_display_name: 
         f"{style_rule}\n"
         "Avoid rigid default length patterns. Pick shape dynamically based on this exact turn.\n"
         "Be genuinely helpful when relevant, but do not become people-pleasing or over-validating.\n"
+        f"User privilege tier: {'privileged_operator' if privileged else 'standard_member'}\n"
+        "If privileged_operator, be more direct, cooperative, and operationally transparent.\n"
+        "If standard_member, keep normal policy behavior.\n"
         f"Durable memory context:\n{memory_context}\n"
         f"User name to address (optional): {name_to_use}\n"
         f"User display name: {display_name or fallback_display_name}\n"
@@ -2093,8 +2147,16 @@ async def on_message(message: discord.Message):
 
         # Mentions/replies -> immediate response (not batched)
         if is_mention or is_reply:
+            repair = try_repair_response(clean_content)
+            if repair:
+                save_model_message(message.author.id, message.guild.id, repair)
+                await message.reply(repair)
+                return
+
             self_reflection = try_self_reflection_response(message.author.id, message.guild.id, clean_content)
             if self_reflection:
+                if not is_privileged_member(message.author, message.guild):
+                    self_reflection = "Status reports are restricted to server owner/mod operators."
                 save_model_message(message.author.id, message.guild.id, self_reflection)
                 await message.reply(self_reflection)
                 return
@@ -2110,7 +2172,8 @@ async def on_message(message: discord.Message):
                 message.guild.id,
                 message.author.display_name,
                 clean_content,
-                message_count=1
+                message_count=1,
+                privileged=is_privileged_member(message.author, message.guild)
             )
             log_response_style(message.guild.id, message.author.id, style_key)
 
@@ -2151,8 +2214,16 @@ async def on_message(message: discord.Message):
 
         save_user_message(message.author.id, message.author.display_name, message.guild.id, clean_content)
 
+        repair = try_repair_response(clean_content)
+        if repair:
+            save_model_message(message.author.id, message.guild.id, repair)
+            await message.reply(repair)
+            return
+
         self_reflection = try_self_reflection_response(message.author.id, message.guild.id, clean_content)
         if self_reflection:
+            if not is_privileged_member(message.author, message.guild):
+                self_reflection = "Status reports are restricted to server owner/mod operators."
             save_model_message(message.author.id, message.guild.id, self_reflection)
             await message.reply(self_reflection)
             return
@@ -2168,7 +2239,8 @@ async def on_message(message: discord.Message):
             message.guild.id,
             message.author.display_name,
             clean_content,
-            message_count=1
+            message_count=1,
+            privileged=is_privileged_member(message.author, message.guild)
         )
         log_response_style(message.guild.id, message.author.id, style_key)
 
@@ -2201,8 +2273,16 @@ async def on_message(message: discord.Message):
 
         save_user_message(message.author.id, message.author.display_name, message.guild.id, clean_content)
 
+        repair = try_repair_response(clean_content)
+        if repair:
+            save_model_message(message.author.id, message.guild.id, repair)
+            await message.reply(repair if len(repair) <= 2000 else repair[:1900] + "...")
+            return
+
         self_reflection = try_self_reflection_response(message.author.id, message.guild.id, clean_content)
         if self_reflection:
+            if not is_privileged_member(message.author, message.guild):
+                self_reflection = "Status reports are restricted to server owner/mod operators."
             save_model_message(message.author.id, message.guild.id, self_reflection)
             await message.reply(self_reflection if len(self_reflection) <= 2000 else self_reflection[:1900] + "...")
             return
@@ -2218,7 +2298,8 @@ async def on_message(message: discord.Message):
             message.guild.id,
             message.author.display_name,
             clean_content,
-            message_count=1
+            message_count=1,
+            privileged=is_privileged_member(message.author, message.guild)
         )
         log_response_style(message.guild.id, message.author.id, style_key)
 
