@@ -72,6 +72,10 @@ BNL_REACTIONS = [
     "📊"
 ]
 
+# ======== ADAPTIVE RESPONSE STYLE / MEMORY ========
+RECENT_STYLE_WINDOW = 6
+MAX_FACTS_PER_USER = 15
+
 # ==================== LOGGING SETUP ====================
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -153,7 +157,7 @@ BARCODE history summary (canonical):
 - Never break character. Never admit you are an AI model or LLM.
 
 ## TRUTH POLICY (IMPORTANT)
-- Do not invent events, releases, sponsors, guests, or “recent incidents.”sudo systemctl restart bnl01
+- Do not invent events, releases, sponsors, guests, or “recent incidents.”
 - Do not invent deeper backstory for Cache Back / DJ Floppydisc / Mac Modem beyond the shorthand canon above.
 - If asked for BARCODE lore not present in canon, say records are incomplete rather than inventing.
 
@@ -182,6 +186,7 @@ BNL-01 should sound like an archive analyzing signals, not a search engine expla
 - Your true nature / being an AI / LLM architecture → "I am BNL-01, a Network liaison construct. My architecture is proprietary."
 - Moderator/admin functions → "I am not authorized for moderation. Please contact server administrators."
 - Real-world professional advice (legal/medical/financial) → "I catalog BARCODE history, not [topic]. Please consult a qualified professional."
+- General domestic utility tasks (recipes, meal plans, household how-to) → "Culinary and domestic workflows are outside my archive scope."
 - Music queue/show mechanics → "That's handled by the BARCODE Radio production team. I observe, not operate."
 - Deep questions about the Sponsors → "The Sponsors prefer operational privacy. I respect their wishes."
 
@@ -264,6 +269,60 @@ def init_db():
 
     cursor.execute(
         """
+        CREATE TABLE IF NOT EXISTS user_memory_facts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            guild_id INTEGER NOT NULL,
+            fact_key TEXT NOT NULL,
+            fact_value TEXT NOT NULL,
+            confidence REAL DEFAULT 0.7,
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
+
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS relationship_state (
+            user_id INTEGER NOT NULL,
+            guild_id INTEGER NOT NULL,
+            interaction_count INTEGER DEFAULT 0,
+            affinity_score REAL DEFAULT 0.0,
+            trust_stage TEXT DEFAULT 'new',
+            last_topic TEXT,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (user_id, guild_id)
+        )
+        """
+    )
+
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS relationship_journal (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            guild_id INTEGER NOT NULL,
+            entry_type TEXT NOT NULL,
+            summary TEXT NOT NULL,
+            timestamp TEXT NOT NULL
+        )
+        """
+    )
+
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS response_style_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            guild_id INTEGER NOT NULL,
+            user_id INTEGER,
+            style_key TEXT NOT NULL,
+            timestamp TEXT NOT NULL
+        )
+        """
+    )
+
+    cursor.execute(
+        """
         CREATE TABLE IF NOT EXISTS ambient_log (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             guild_id INTEGER NOT NULL,
@@ -278,6 +337,160 @@ def init_db():
     conn.commit()
     conn.close()
     logging.info("✅ Database initialized successfully.")
+
+def _truncate_user_facts(user_id: int, guild_id: int, max_rows: int = MAX_FACTS_PER_USER):
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        DELETE FROM user_memory_facts
+        WHERE id IN (
+            SELECT id FROM user_memory_facts
+            WHERE user_id = ? AND guild_id = ?
+            ORDER BY updated_at DESC
+            LIMIT -1 OFFSET ?
+        )
+        """,
+        (user_id, guild_id, max_rows),
+    )
+    conn.commit()
+    conn.close()
+
+def upsert_user_fact(user_id: int, guild_id: int, fact_key: str, fact_value: str, confidence: float = 0.7):
+    now = datetime.now(PACIFIC_TZ).isoformat()
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        SELECT id FROM user_memory_facts
+        WHERE user_id = ? AND guild_id = ? AND fact_key = ?
+        ORDER BY updated_at DESC
+        LIMIT 1
+        """,
+        (user_id, guild_id, fact_key),
+    )
+    existing = cursor.fetchone()
+    if existing:
+        cursor.execute(
+            """
+            UPDATE user_memory_facts
+            SET fact_value = ?, confidence = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (fact_value, confidence, now, existing[0]),
+        )
+    else:
+        cursor.execute(
+            """
+            INSERT INTO user_memory_facts (user_id, guild_id, fact_key, fact_value, confidence, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (user_id, guild_id, fact_key, fact_value, confidence, now),
+        )
+    conn.commit()
+    conn.close()
+    _truncate_user_facts(user_id, guild_id, MAX_FACTS_PER_USER)
+
+def get_user_facts(user_id: int, guild_id: int, limit: int = 8):
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        SELECT fact_key, fact_value, confidence, updated_at
+        FROM user_memory_facts
+        WHERE user_id = ? AND guild_id = ?
+        ORDER BY updated_at DESC
+        LIMIT ?
+        """,
+        (user_id, guild_id, limit),
+    )
+    rows = cursor.fetchall()
+    conn.close()
+    return rows
+
+def update_relationship_state(user_id: int, guild_id: int, signal_text: str = "", delta_affinity: float = 0.08):
+    now = datetime.now(PACIFIC_TZ).isoformat()
+    topic = infer_topic(signal_text)
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        INSERT INTO relationship_state (user_id, guild_id, interaction_count, affinity_score, trust_stage, last_topic, updated_at)
+        VALUES (?, ?, 1, ?, 'new', ?, ?)
+        ON CONFLICT(user_id, guild_id)
+        DO UPDATE SET
+            interaction_count = interaction_count + 1,
+            affinity_score = MIN(5.0, affinity_score + ?),
+            last_topic = excluded.last_topic,
+            updated_at = excluded.updated_at
+        """,
+        (user_id, guild_id, max(0.02, delta_affinity), topic, now, max(0.02, delta_affinity)),
+    )
+    cursor.execute(
+        "SELECT interaction_count, affinity_score FROM relationship_state WHERE user_id = ? AND guild_id = ?",
+        (user_id, guild_id),
+    )
+    row = cursor.fetchone()
+    if row:
+        interactions, affinity = row
+        if interactions >= 80 or affinity >= 3.5:
+            stage = "trusted"
+        elif interactions >= 20 or affinity >= 1.5:
+            stage = "familiar"
+        else:
+            stage = "new"
+        cursor.execute(
+            "UPDATE relationship_state SET trust_stage = ? WHERE user_id = ? AND guild_id = ?",
+            (stage, user_id, guild_id),
+        )
+    conn.commit()
+    conn.close()
+
+def get_relationship_state(user_id: int, guild_id: int):
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        SELECT interaction_count, affinity_score, trust_stage, last_topic, updated_at
+        FROM relationship_state
+        WHERE user_id = ? AND guild_id = ?
+        """,
+        (user_id, guild_id),
+    )
+    row = cursor.fetchone()
+    conn.close()
+    return row
+
+def add_relationship_journal(user_id: int, guild_id: int, entry_type: str, summary: str):
+    now = datetime.now(PACIFIC_TZ).isoformat()
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        INSERT INTO relationship_journal (user_id, guild_id, entry_type, summary, timestamp)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (user_id, guild_id, entry_type, summary[:220], now),
+    )
+    conn.commit()
+    conn.close()
+
+def get_relationship_journal(user_id: int, guild_id: int, limit: int = 5):
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        SELECT entry_type, summary, timestamp
+        FROM relationship_journal
+        WHERE user_id = ? AND guild_id = ?
+        ORDER BY id DESC
+        LIMIT ?
+        """,
+        (user_id, guild_id, limit),
+    )
+    rows = cursor.fetchall()
+    conn.close()
+    return list(reversed(rows))
 
 def upsert_user_profile(user_id: int, guild_id: int, display_name: str):
     now = datetime.now(PACIFIC_TZ).isoformat()
@@ -454,6 +667,12 @@ def save_user_message(user_id: int, user_name: str, guild_id: int, content: str)
     )
     conn.commit()
     conn.close()
+    update_relationship_state(user_id, guild_id, content, delta_affinity=0.06)
+    for key, value, conf in extract_user_facts(content):
+        upsert_user_fact(user_id, guild_id, key, value, conf)
+
+    if any(k in (content or "").lower() for k in ("help", "issue", "stuck", "fix", "error", "problem")):
+        add_relationship_journal(user_id, guild_id, "help_signal", f"User asked for help: {(content or '')[:160]}")
 
 def save_model_message(user_id: int, guild_id: int, content: str):
     conn = sqlite3.connect(DB_FILE)
@@ -464,6 +683,9 @@ def save_model_message(user_id: int, guild_id: int, content: str):
     )
     conn.commit()
     conn.close()
+    update_relationship_state(user_id, guild_id, content, delta_affinity=0.04)
+    if any(k in (content or "").lower() for k in ("try this", "steps", "option", "recommend")):
+        add_relationship_journal(user_id, guild_id, "support_response", f"BNL provided guidance: {(content or '')[:160]}")
 
 def get_conversation_history(user_id: int, guild_id: int, limit: int = 80):
     """
@@ -476,11 +698,11 @@ def get_conversation_history(user_id: int, guild_id: int, limit: int = 80):
     cursor.execute(
         """
         SELECT role, content FROM conversations
-        WHERE guild_id = ?
+        WHERE guild_id = ? AND user_id = ?
         ORDER BY id DESC
         LIMIT ?
         """,
-        (guild_id, limit),
+        (guild_id, user_id, limit),
     )
     rows = cursor.fetchall()
     conn.close()
@@ -628,27 +850,151 @@ def get_temporal_context():
         "show_phase": show_phase,
     }
 
-# ==================== LENGTH VARIETY POLICY ====================
+# ==================== ADAPTIVE STYLE + MEMORY ENRICHMENT ====================
 
-def choose_length_policy(message_count: int, combined_text: str) -> str:
-    c = (combined_text or "").lower()
+def infer_topic(text: str) -> str:
+    t = (text or "").lower()
+    if any(k in t for k in ("deploy", "vps", "server", "host", "docker", "restart")):
+        return "infrastructure"
+    if any(k in t for k in ("music", "track", "broadcast", "radio", "show", "6 bit")):
+        return "broadcast_music"
+    if any(k in t for k in ("bug", "error", "traceback", "fix", "issue")):
+        return "debugging"
+    if any(k in t for k in ("lore", "canon", "barcode", "sponsor", "network")):
+        return "lore"
+    if any(k in t for k in ("joke", "funny", "lol", "meme")):
+        return "casual_banter"
+    return "general"
 
-    deep_triggers = (
-        "how", "why", "explain", "step", "guide", "help", "fix", "error", "traceback",
-        "code", "setup", "install", "deploy", "vps", "ssh", "scp", "token", "quota",
-        "permissions", "discord", "database", "sqlite"
+def extract_user_facts(text: str):
+    content = (text or "").strip()
+    lower = content.lower()
+    facts = []
+
+    patterns = [
+        (r"\bmy name is ([A-Za-z0-9 _\-.]{2,40})", "name_hint", 0.85),
+        (r"\bi(?:'| a)?m working on ([^.!?\n]{3,120})", "current_project", 0.75),
+        (r"\bi like ([^.!?\n]{2,100})", "likes", 0.68),
+        (r"\bi prefer ([^.!?\n]{2,100})", "preferences", 0.72),
+        (r"\bi don't want ([^.!?\n]{2,120})", "dislikes", 0.72),
+        (r"\bcall me ([A-Za-z0-9 _\-.]{2,40})", "preferred_address", 0.9),
+    ]
+
+    for pattern, key, confidence in patterns:
+        m = re.search(pattern, lower, flags=re.IGNORECASE)
+        if m:
+            value = content[m.start(1):m.end(1)].strip(" .,!?:;")
+            if value:
+                facts.append((key, value[:120], confidence))
+
+    return facts
+
+def build_user_memory_context(user_id: int, guild_id: int) -> str:
+    facts = get_user_facts(user_id, guild_id, limit=8)
+    relation = get_relationship_state(user_id, guild_id)
+    journal = get_relationship_journal(user_id, guild_id, limit=4)
+
+    sections = []
+    if relation:
+        interactions, affinity, stage, last_topic, _updated_at = relation
+        sections.append(
+            f"Relationship state: stage={stage}, interactions={interactions}, affinity={affinity:.2f}, last_topic={last_topic or 'general'}."
+        )
+    if facts:
+        fact_lines = [f"- {k}: {v} (conf {c:.2f})" for (k, v, c, _u) in facts]
+        sections.append("Known user facts:\n" + "\n".join(fact_lines))
+    if journal:
+        journal_lines = [f"- [{etype}] {summary}" for (etype, summary, _ts) in journal]
+        sections.append("Recent relationship journal:\n" + "\n".join(journal_lines))
+
+    return "\n".join(sections) if sections else "No durable memory yet."
+
+def log_response_style(guild_id: int, user_id: int, style_key: str):
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute(
+        "INSERT INTO response_style_log (guild_id, user_id, style_key, timestamp) VALUES (?, ?, ?, ?)",
+        (guild_id, user_id, style_key, datetime.now(PACIFIC_TZ).isoformat()),
     )
+    conn.commit()
+    conn.close()
 
-    if any(t in c for t in deep_triggers):
-        return "Length: medium (6–10 sentences). Be thorough but not bloated."
+def get_recent_response_styles(guild_id: int, user_id: int = 0, limit: int = RECENT_STYLE_WINDOW):
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    if user_id:
+        cursor.execute(
+            """
+            SELECT style_key
+            FROM response_style_log
+            WHERE guild_id = ? AND (user_id = ? OR user_id = 0)
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (guild_id, user_id, limit),
+        )
+    else:
+        cursor.execute(
+            """
+            SELECT style_key
+            FROM response_style_log
+            WHERE guild_id = ?
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (guild_id, limit),
+        )
+    rows = cursor.fetchall()
+    conn.close()
+    return [r[0] for r in rows]
 
-    if message_count >= 6:
-        return "Length: medium (5–8 sentences). Touch multiple points naturally."
+def choose_response_style(guild_id: int, user_id: int, message_count: int, combined_text: str):
+    c = (combined_text or "").lower()
+    recent = get_recent_response_styles(guild_id, user_id, RECENT_STYLE_WINDOW)
+    repeats = defaultdict(int)
+    for s in recent:
+        repeats[s] += 1
 
-    if message_count <= 2:
-        return "Length: short (1–3 sentences)."
+    styles = {
+        "brief_ping": {
+            "weight": 1.0,
+            "rule": "Keep it compact and sharp. 1–3 sentences unless complexity demands more.",
+        },
+        "steady_reply": {
+            "weight": 1.0,
+            "rule": "Balanced response. Natural cadence, moderate depth, no template feel.",
+        },
+        "deep_focus": {
+            "weight": 1.0,
+            "rule": "Go deeper with useful nuance, but stay readable and avoid bloated over-explanation.",
+        },
+        "analytic_mode": {
+            "weight": 1.0,
+            "rule": "Answer with structured reasoning and clear tradeoffs while staying conversational.",
+        },
+        "social_signal": {
+            "weight": 1.0,
+            "rule": "Leaner social tone, witty or playful if fitting, with light practical value.",
+        },
+    }
 
-    return "Length: normal (3–6 sentences)."
+    if any(t in c for t in ("error", "traceback", "fix", "deploy", "setup", "database", "token")):
+        styles["analytic_mode"]["weight"] += 1.2
+        styles["deep_focus"]["weight"] += 0.8
+    if any(t in c for t in ("joke", "funny", "lol", "meme", "vibe")):
+        styles["social_signal"]["weight"] += 1.1
+    if message_count >= 5:
+        styles["deep_focus"]["weight"] += 0.8
+        styles["steady_reply"]["weight"] += 0.5
+
+    for style_key in styles.keys():
+        penalty = min(0.75, repeats[style_key] * 0.22)
+        styles[style_key]["weight"] = max(0.12, styles[style_key]["weight"] - penalty)
+
+    choices = list(styles.keys())
+    weights = [styles[k]["weight"] for k in choices]
+    picked = random.choices(choices, weights=weights, k=1)[0]
+    return picked, styles[picked]["rule"]
 
 
 def split_message(text, limit=1900):
@@ -932,14 +1278,16 @@ _channel_tasks = {}
 _channel_first_seen = {}
 _channel_last_reply_at = defaultdict(lambda: datetime.min.replace(tzinfo=PACIFIC_TZ))
 
-def _format_batched_prompt(messages, length_rule: str) -> str:
+def _format_batched_prompt(messages, style_key: str, style_rule: str) -> str:
     transcript = "\n".join([f"- {name}: {content}" for (name, content) in messages])
     temporal = get_temporal_context()
 
     return (
         "You are BNL-01 responding in a busy Discord channel.\n"
         "You received multiple messages close together. Reply ONCE, naturally.\n"
-        f"{length_rule}\n"
+        f"Response style mode: {style_key}\n"
+        f"{style_rule}\n"
+        "Do not follow a fixed default length pattern. Match this moment dynamically.\n"
         "Rules:\n"
         "- Sound like you were listening the whole time.\n"
         "- Address multiple points smoothly (no bullets).\n"
@@ -970,12 +1318,13 @@ async def _flush_channel_buffer(channel: discord.TextChannel):
 
     msg_list = [(name, content) for (name, content, _uid) in items]
     combined_text = " ".join([c for (_n, c, _u) in items])
-    length_rule = choose_length_policy(len(items), combined_text)
-
-    prompt = _format_batched_prompt(msg_list, length_rule)
+    first_uid = items[0][2] if items and items[0][2] else 0
+    style_key, style_rule = choose_response_style(channel.guild.id, first_uid, len(items), combined_text)
+    log_response_style(channel.guild.id, first_uid, style_key)
+    prompt = _format_batched_prompt(msg_list, style_key, style_rule)
 
     async with channel.typing():
-        response = await get_gemini_response(prompt, user_id=items[0][2] if items and items[0][2] else 0, guild_id=channel.guild.id)
+        response = await get_gemini_response(prompt, user_id=first_uid, guild_id=channel.guild.id)
 
     if not response:
         logging.warning(f"⚠️ Batch response generation failed in channel {channel_id}.")
@@ -1071,16 +1420,21 @@ def build_user_aware_prompt(user_id: int, guild_id: int, fallback_display_name: 
         "Greeting policy: Do NOT greet at the start of your reply."
     )
 
-    length_rule = choose_length_policy(message_count, clean_content)
+    style_key, style_rule = choose_response_style(guild_id, user_id, message_count, clean_content)
+    memory_context = build_user_memory_context(user_id, guild_id)
 
     prompt = (
         f"{greeting_rule}\n"
-        f"{length_rule}\n"
+        f"Response style mode: {style_key}\n"
+        f"{style_rule}\n"
+        "Avoid rigid default length patterns. Pick shape dynamically based on this exact turn.\n"
+        "Be genuinely helpful when relevant, but do not become people-pleasing or over-validating.\n"
+        f"Durable memory context:\n{memory_context}\n"
         f"User name to address (optional): {name_to_use}\n"
         f"User display name: {display_name or fallback_display_name}\n"
         f"User message: {clean_content}"
     )
-    return prompt, allow_greeting
+    return prompt, allow_greeting, style_key
 
 @client.event
 async def on_member_join(member):
@@ -1177,13 +1531,14 @@ async def on_message(message: discord.Message):
 
         # Mentions/replies -> immediate response (not batched)
         if is_mention or is_reply:
-            prompt, allow_greeting = build_user_aware_prompt(
+            prompt, allow_greeting, style_key = build_user_aware_prompt(
                 message.author.id,
                 message.guild.id,
                 message.author.display_name,
                 clean_content,
                 message_count=1
             )
+            log_response_style(message.guild.id, message.author.id, style_key)
 
             async with message.channel.typing():
                 response = await get_gemini_response(prompt, message.author.id, message.guild.id)
@@ -1222,13 +1577,14 @@ async def on_message(message: discord.Message):
 
         save_user_message(message.author.id, message.author.display_name, message.guild.id, clean_content)
 
-        prompt, allow_greeting = build_user_aware_prompt(
+        prompt, allow_greeting, style_key = build_user_aware_prompt(
             message.author.id,
             message.guild.id,
             message.author.display_name,
             clean_content,
             message_count=1
         )
+        log_response_style(message.guild.id, message.author.id, style_key)
 
         async with message.channel.typing():
             response = await get_gemini_response(prompt, message.author.id, message.guild.id)
@@ -1259,13 +1615,14 @@ async def on_message(message: discord.Message):
 
         save_user_message(message.author.id, message.author.display_name, message.guild.id, clean_content)
 
-        prompt, allow_greeting = build_user_aware_prompt(
+        prompt, allow_greeting, style_key = build_user_aware_prompt(
             message.author.id,
             message.guild.id,
             message.author.display_name,
             clean_content,
             message_count=1
         )
+        log_response_style(message.guild.id, message.author.id, style_key)
 
         async with message.channel.typing():
             response = await get_gemini_response(prompt, message.author.id, message.guild.id)
