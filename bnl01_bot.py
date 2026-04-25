@@ -59,18 +59,23 @@ GREETING_COOLDOWN_MINUTES = 90
 GREETING_CHANCE = 0.35
 
 # ======== PASSIVE REACTION CONFIG ========
-REACTION_CHANCE = 0.4
+REACTION_CHANCE = 0.24
 
-BNL_REACTIONS = [
-    "👁️",
-    "📡",
-    "⚙️",
-    "🧠",
-    "🛰️",
-    "🔍",
-    "💾",
-    "📊"
-]
+BNL_REACTIONS_BASE = ["👁️", "📡", "⚙️", "🧠", "🛰️", "🔍", "💾", "📊", "🖥️", "📼", "🧬", "📶"]
+BNL_REACTIONS_BROADCAST = ["📻", "🎚️", "🎛️", "🔊", "🎤", "📡", "📼"]
+BNL_REACTIONS_GLITCH = ["🧿", "🫨", "⚠️", "❓", "🌀", "☢️", "📛"]
+BNL_REACTIONS_TECH = ["🧠", "⚙️", "💻", "🛰️", "🗜️", "📈", "🔧"]
+BNL_REACTIONS_VIBE = ["🫡", "👀", "🔥", "💯", "😵‍💫", "🧪", "🕶️"]
+
+# ======== ADAPTIVE RESPONSE STYLE / MEMORY ========
+RECENT_STYLE_WINDOW = 6
+MAX_FACTS_PER_USER = 15
+CROSS_UNIVERSE_BLEED_CHANCE = 0.05
+CORE_MEMORY_CONFIDENCE = 0.88
+SHORT_MEMORY_LIMIT = 28
+MEDIUM_MEMORY_LIMIT = 16
+LONG_MEMORY_LIMIT = 10
+MAX_CONVERSATION_ROWS_PER_USER = 260
 
 # ======== ADAPTIVE RESPONSE STYLE / MEMORY ========
 RECENT_STYLE_WINDOW = 6
@@ -1563,6 +1568,34 @@ def split_message(text, limit=1900):
     parts.append(text)
     return parts
 
+_last_reaction_by_channel = {}
+
+def choose_contextual_reaction(message: discord.Message) -> str:
+    content = (message.content or "").lower()
+    pools = [BNL_REACTIONS_BASE]
+
+    if any(k in content for k in ("radio", "broadcast", "mix", "track", "song", "music", "tiktok", "show")):
+        pools.append(BNL_REACTIONS_BROADCAST)
+    if any(k in content for k in ("glitch", "bug", "error", "broken", "weird", "corrupt", "crash")):
+        pools.append(BNL_REACTIONS_GLITCH)
+    if any(k in content for k in ("code", "deploy", "server", "bot", "update", "memory", "database", "api")):
+        pools.append(BNL_REACTIONS_TECH)
+    if any(k in content for k in ("lol", "lmao", "damn", "crazy", "fire", "wild", "w")):
+        pools.append(BNL_REACTIONS_VIBE)
+
+    merged = []
+    for p in pools:
+        merged.extend(p)
+
+    if not merged:
+        merged = BNL_REACTIONS_BASE[:]
+
+    last = _last_reaction_by_channel.get(message.channel.id)
+    options = [e for e in merged if e != last] or merged
+    choice = random.choice(options)
+    _last_reaction_by_channel[message.channel.id] = choice
+    return choice
+
 # ==================== GEMINI API INTERACTION ====================
 
 def _extract_text_and_tokens(response):
@@ -2118,7 +2151,7 @@ async def on_message(message: discord.Message):
     # BNL occasionally reacts to messages across the server
     if random.random() < REACTION_CHANCE:
         try:
-            emoji = random.choice(BNL_REACTIONS)
+            emoji = choose_contextual_reaction(message)
             await message.add_reaction(emoji)
         except Exception:
             pass
