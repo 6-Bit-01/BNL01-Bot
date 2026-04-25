@@ -864,19 +864,40 @@ def try_repair_response(user_text: str) -> str:
     t = (user_text or "").lower().strip()
     if not t:
         return ""
-    dissatisfaction = (
+
+    hard_dissatisfaction = (
         "not what i asked",
         "not what i said",
+        "not what i meant",
+        "that's not what i asked",
+        "thats not what i asked",
+        "you answered the wrong thing",
+        "you ignored my question",
+        "you missed my point",
+        "you're not listening",
+        "youre not listening",
+    )
+    if any(p in t for p in hard_dissatisfaction):
+        return "Copy that—missed your intent. Give me the exact output you wanted and I’ll correct course in one pass."
+
+    # Soft dissatisfaction should not hijack clear follow-up questions.
+    has_question = "?" in t
+    looks_like_new_question = has_question and any(
+        q in t for q in ("how ", "what ", "why ", "can ", "could ", "will ", "is ", "are ", "do ", "does ")
+    )
+    if looks_like_new_question:
+        return ""
+
+    soft_dissatisfaction = (
         "you missed",
         "that's not it",
         "that wasnt it",
         "that wasn't it",
-        "damn",
-        "bro",
-        "youre not listening",
-        "you're not listening",
+        "that doesn't make sense",
+        "that doesnt make sense",
+        "what are you talking about",
     )
-    if any(p in t for p in dissatisfaction):
+    if any(p in t for p in soft_dissatisfaction):
         return "Copy that—missed your intent. Give me the exact output you wanted and I’ll correct course in one pass."
     return ""
 
