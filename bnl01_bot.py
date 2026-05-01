@@ -90,6 +90,22 @@ MAX_CONVERSATION_ROWS_PER_USER = 260
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
+WEBSITE_STATUS_LABEL_RE = re.compile(
+    r"^\s*(?:\*\*|__)?\s*(?:website\s+status|website\s+message|discord\s+message|status)\s*:\s*(?:\*\*|__)?\s*",
+    re.IGNORECASE,
+)
+
+
+def sanitize_website_status_message(message: str, limit: int = 240) -> str:
+    """Remove leading label wrappers and return plain website status text."""
+    cleaned = (message or "").strip()
+    while cleaned:
+        updated = WEBSITE_STATUS_LABEL_RE.sub("", cleaned, count=1).strip()
+        if updated == cleaned:
+            break
+        cleaned = updated
+    return cleaned[:limit]
+
 
 def update_website_status(status: str, mode: str, message: str) -> bool:
     """
@@ -100,7 +116,8 @@ def update_website_status(status: str, mode: str, message: str) -> bool:
         logging.warning("⚠️ BNL_API_KEY is missing; skipping website status update.")
         return False
 
-    payload = {"status": status, "mode": mode, "message": message}
+    sanitized_message = sanitize_website_status_message(message, limit=240)
+    payload = {"status": status, "mode": mode, "message": sanitized_message}
     data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(
         BNL_STATUS_URL,
@@ -269,7 +286,8 @@ def update_website_status_controlled(mode: str, message: str, status: str = "ONL
         logging.warning("⚠️ BNL_STATUS_URL missing. Cannot post website status updates.")
         return False
 
-    same_payload = (_last_website_status_mode == mode and _last_website_status_message == message)
+    sanitized_message = sanitize_website_status_message(message, limit=240)
+    same_payload = (_last_website_status_mode == mode and _last_website_status_message == sanitized_message)
     if same_payload and not force:
         return True
 
@@ -279,11 +297,11 @@ def update_website_status_controlled(mode: str, message: str, status: str = "ONL
             return True
 
     try:
-        ok = update_website_status(status=status, mode=mode, message=message)
+        ok = update_website_status(status=status, mode=mode, message=sanitized_message)
         if not ok:
             return False
         _last_website_status_mode = mode
-        _last_website_status_message = message
+        _last_website_status_message = sanitized_message
         _last_website_status_at = now
         logging.info(f"🌐 Website status updated: {mode}")
         return True
