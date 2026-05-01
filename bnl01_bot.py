@@ -39,6 +39,9 @@ DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 BNL_API_KEY = os.getenv("BNL_API_KEY")
 BNL_STATUS_URL = os.getenv("BNL_STATUS_URL")
 
+BNL_WEBSITE_RELAY_ENABLED = os.getenv("BNL_WEBSITE_RELAY_ENABLED", "true").strip().lower() not in {"false", "0", "off"}
+BNL_WEBSITE_RELAY_INTERVAL_MINUTES = max(1, int(os.getenv("BNL_WEBSITE_RELAY_INTERVAL_MINUTES", "20")))
+
 DAILY_TOKEN_LIMIT = 1_350_000
 PACIFIC_TZ = pytz.timezone("US/Pacific")
 DB_FILE = "bnl01_conversations.db"
@@ -323,17 +326,99 @@ def maybe_update_broadcast_status_from_text(text: str):
 
 def maybe_update_restricted_status_from_text(text: str):
     t = (text or "").lower()
-    restricted_markers = (
-        "are you an ai", "are you ai", "llm", "language model", "system prompt", "reveal your prompt",
-        "what are your instructions", "hidden instructions", "architecture", "jailbreak", "ignore previous instructions",
-        "financial advice", "medical advice", "legal advice", "moderate this", "ban user", "kick user",
-    )
-    if any(k in t for k in restricted_markers):
+    if any(k in t for k in RESTRICTED_MARKERS):
         update_website_status_controlled(
             mode="RESTRICTED",
             message="Restricted archive access attempt detected.",
             status="ONLINE",
         )
+
+
+RESTRICTED_MARKERS = (
+    "are you an ai", "are you ai", "llm", "language model", "system prompt", "reveal your prompt",
+    "what are your instructions", "hidden instructions", "architecture", "jailbreak", "ignore previous instructions",
+    "financial advice", "medical advice", "legal advice", "moderate this", "ban user", "kick user",
+)
+GLITCH_MARKERS = ("glitch", "bug", "error", "broken", "weird", "corrupt", "crash", "distort", "artifact")
+RELAY_FALLBACKS = [
+    "Network observation: Discord-side traffic is stable; archive fragments continue to accumulate.",
+    "Relay noise elevated. Community chatter remains coherent within broadcast layer tolerances.",
+    "Signal activity detected across the liaison corridor. Submission pressure is trending upward.",
+    "Broadcast-side movement registered. Containment chatter remains procedural.",
+    "Archive pressure nominal. Discord-side traffic shows intermittent packet clustering.",
+]
+
+
+def _website_relay_mode_from_context(messages: list[str], now_pt: datetime) -> str:
+    joined = " ".join((m or "").lower() for m in messages)
+    if any(k in joined for k in RESTRICTED_MARKERS):
+        return "RESTRICTED"
+    if any(k in joined for k in GLITCH_MARKERS):
+        return "SIGNAL_DEGRADATION"
+    friday_window = now_pt.weekday() == 4 and ((now_pt.hour == 18 and now_pt.minute >= 20) or (18 < now_pt.hour < 22) or (now_pt.hour == 22 and now_pt.minute <= 10))
+    if friday_window:
+        return "ACTIVE_LIAISON"
+    return "OBSERVATION"
+
+
+def _pick_varied_relay_fallback(avoid: str = "") -> str:
+    options = RELAY_FALLBACKS[:]
+    random.shuffle(options)
+    avoid_clean = (avoid or "").strip().lower()
+    for msg in options:
+        if msg.strip().lower() != avoid_clean:
+            return msg
+    return options[0] if options else "Network observation remains active."
+
+
+async def generate_dynamic_website_relay(guild_id: int) -> tuple[str, str]:
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        SELECT content
+        FROM conversations
+        WHERE guild_id = ? AND role = 'user'
+        ORDER BY id DESC
+        LIMIT 18
+        """,
+        (guild_id,),
+    )
+    rows = cursor.fetchall()
+    conn.close()
+
+    messages = [r[0].strip() for r in rows if r and r[0] and r[0].strip()]
+    now_pt = datetime.now(PACIFIC_TZ)
+    mode = _website_relay_mode_from_context(messages, now_pt)
+    signal_summary = get_recent_signal_summary(guild_id)
+
+    if GEMINI_API_KEY:
+        prompt = (
+            "You are BNL-01 generating a website-only relay ticker line.\n"
+            "Return one plain-text line under 240 chars. No markdown.\n"
+            "Do not quote users, no usernames, no private details.\n"
+            "Preferred vocabulary: signal activity, community chatter, submission pressure, relay noise, "
+            "broadcast-side movement, archive fragments, Discord-side traffic.\n"
+            "Tone: concise corporate, lightly sinister, signal-analysis.\n"
+            "Do not invent concrete new canon events, releases, sponsors, incidents, characters, or secrets.\n"
+            "Keep lore abstract if used. Do not mention 9 Bit unless context includes it.\n"
+            f"Mode: {mode}.\n"
+            f"Context summary: {signal_summary or 'limited Discord-side traffic'}.\n"
+        )
+        generated = sanitize_website_status_message(
+            await get_gemini_response(prompt, user_id=0, guild_id=guild_id) or "",
+            limit=240,
+        )
+    else:
+        generated = ""
+
+    if not generated:
+        generated = _pick_varied_relay_fallback(_last_website_status_message)
+
+    if generated.strip().lower() == (_last_website_status_message or "").strip().lower():
+        generated = _pick_varied_relay_fallback(generated)
+
+    return mode, sanitize_website_status_message(generated, limit=240)
 
 # ==================== VALIDATION ====================
 
@@ -2335,6 +2420,23 @@ async def barcode_radio_queue_task():
             update_website_status_controlled(mode=mode, message=website_msg[:240], status="ONLINE", force=True)
             mark_show_update_fired(guild.id, show_date, phase_key, discord_sent, website_msg)
 
+@tasks.loop(minutes=1)
+async def website_relay_task():
+    if not BNL_WEBSITE_RELAY_ENABLED:
+        return
+
+    now_pt = datetime.now(PACIFIC_TZ)
+    interval = max(1, BNL_WEBSITE_RELAY_INTERVAL_MINUTES)
+    if (now_pt.minute % interval) != 0:
+        return
+
+    for guild in client.guilds:
+        active_channel_id = get_guild_config(guild.id)
+        if not active_channel_id:
+            continue
+        mode, relay_message = await generate_dynamic_website_relay(guild.id)
+        update_website_status_controlled(mode=mode, message=relay_message, status="ONLINE")
+
 # ==================== BATCHED REPLY SYSTEM (ACTIVE CHANNEL ONLY) ====================
 
 _channel_buffers = defaultdict(lambda: deque(maxlen=BATCH_MAX_MESSAGES))  # channel_id -> deque[(name, content, user_id)]
@@ -2486,6 +2588,9 @@ async def on_ready():
 
     if not barcode_radio_queue_task.is_running():
         barcode_radio_queue_task.start()
+
+    if BNL_WEBSITE_RELAY_ENABLED and not website_relay_task.is_running():
+        website_relay_task.start()
 
     logging.info(f"🎯 BNL-01 online as {client.user.name} ({client.user.id})")
     logging.info(f"📡 Monitoring {len(client.guilds)} server(s)")
@@ -2983,6 +3088,7 @@ async def about(interaction: discord.Interaction):
         app_commands.Choice(name="intake", value="intake"),
         app_commands.Choice(name="live", value="live"),
         app_commands.Choice(name="sponsor", value="sponsor"),
+        app_commands.Choice(name="relay", value="relay"),
     ]
 )
 async def showtest(interaction: discord.Interaction, phase: app_commands.Choice[str]):
@@ -3002,40 +3108,49 @@ async def showtest(interaction: discord.Interaction, phase: app_commands.Choice[
         "intake": "submissions_open",
         "live": "show_live",
         "sponsor": "sponsor_window",
+        "relay": "relay",
     }
     phase_key = phase_map.get(phase.value)
     if not phase_key:
         await interaction.followup.send("❌ Invalid phase.", ephemeral=True)
         return
 
-    discord_msg, website_msg = await generate_showday_messages(interaction.guild.id, phase_key)
-    mode = "RESTRICTED" if phase_key == "sponsor_window" else "ACTIVE_LIAISON"
+    if phase_key == "relay":
+        mode, website_msg = await generate_dynamic_website_relay(interaction.guild.id)
+        discord_msg = ""
+    else:
+        discord_msg, website_msg = await generate_showday_messages(interaction.guild.id, phase_key)
+        mode = "RESTRICTED" if phase_key == "sponsor_window" else "ACTIVE_LIAISON"
     key_len = len(BNL_API_KEY) if BNL_API_KEY else 0
     logging.info(f"/showtest website bridge target URL: {BNL_STATUS_URL}")
     logging.info(f"/showtest BNL_API_KEY present: {bool(BNL_API_KEY)}")
     logging.info(f"/showtest BNL_API_KEY length: {key_len}")
     website_ok = update_website_status_controlled(mode=mode, message=website_msg[:240], status="ONLINE", force=True)
 
-    target_channel = interaction.channel if isinstance(interaction.channel, discord.TextChannel) else None
-    if not target_channel:
-        channel_id = get_guild_config(interaction.guild.id)
-        target_channel = interaction.guild.get_channel(channel_id) if channel_id else None
+    if phase_key != "relay":
+        target_channel = interaction.channel if isinstance(interaction.channel, discord.TextChannel) else None
+        if not target_channel:
+            channel_id = get_guild_config(interaction.guild.id)
+            target_channel = interaction.guild.get_channel(channel_id) if channel_id else None
 
-    if target_channel:
-        try:
-            await target_channel.send(discord_msg)
-            log_ambient(interaction.guild.id, discord_msg)
-        except Exception as e:
-            logging.error(f"Show-test Discord update failed (guild {interaction.guild.id}, {phase_key}): {e}")
-            await interaction.followup.send(
-                "⚠️ Test message could not be posted to the target channel. "
-                + ("Website status updated." if website_ok else "Website status update also failed."),
-                ephemeral=True,
-            )
-            return
+        if target_channel:
+            try:
+                await target_channel.send(discord_msg)
+                log_ambient(interaction.guild.id, discord_msg)
+            except Exception as e:
+                logging.error(f"Show-test Discord update failed (guild {interaction.guild.id}, {phase_key}): {e}")
+                await interaction.followup.send(
+                    "⚠️ Test message could not be posted to the target channel. "
+                    + ("Website status updated." if website_ok else "Website status update also failed."),
+                    ephemeral=True,
+                )
+                return
 
     if website_ok:
-        user_msg = f"✅ Show-day test fired for `{phase.value}` (mapped to `{phase_key}`)."
+        if phase_key == "relay":
+            user_msg = f"✅ Website relay test fired for `{phase.value}` with mode `{mode}`."
+        else:
+            user_msg = f"✅ Show-day test fired for `{phase.value}` (mapped to `{phase_key}`)."
     else:
         user_msg = (
             f"⚠️ Show-day Discord test fired for `{phase.value}` (mapped to `{phase_key}`), "
