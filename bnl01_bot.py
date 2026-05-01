@@ -20,6 +20,7 @@ import random
 import json
 import urllib.request
 import urllib.error
+import urllib.parse
 from collections import defaultdict, deque
 from datetime import datetime, timedelta
 
@@ -274,6 +275,86 @@ _last_website_status_mode = None
 _last_website_status_message = None
 _last_website_status_at = None
 _missing_status_key_warned = False
+BNL_CONTROL_FLAGS_TTL_SECONDS = 60
+_bnl_control_flags_cache = None
+_bnl_control_flags_cached_at = None
+
+
+def _build_bnl_control_flag_urls() -> list[str]:
+    explicit = os.getenv("BNL_CONTROL_FLAGS_URL", "").strip()
+    urls = []
+    if explicit:
+        urls.append(explicit)
+
+    base = (BNL_STATUS_URL or "").strip()
+    if not base:
+        return urls
+
+    parsed = urllib.parse.urlparse(base)
+    path = parsed.path or ""
+    derived_paths = []
+    if path.endswith("/status"):
+        derived_paths.append(path[:-7] + "/control-flags")
+    elif path.endswith("/update-status"):
+        derived_paths.append(path[:-13] + "/control-flags")
+    derived_paths.extend([path + "/control-flags", "/api/bnl/control-flags"])
+
+    seen = set(urls)
+    for candidate_path in derived_paths:
+        candidate = urllib.parse.urlunparse((parsed.scheme, parsed.netloc, candidate_path, "", "", ""))
+        if candidate and candidate not in seen:
+            seen.add(candidate)
+            urls.append(candidate)
+    return urls
+
+
+def get_bnl_control_flags(force_refresh: bool = False) -> dict:
+    """
+    Fetch website-managed BNL control flags with short in-memory cache.
+    Safe defaults on failure:
+      websiteRelayEnabled: True
+      heartbeatEnabled: True
+      showdayDiscordPostsEnabled: False
+    """
+    global _bnl_control_flags_cache, _bnl_control_flags_cached_at
+    now = datetime.now(PACIFIC_TZ)
+    defaults = {
+        "websiteRelayEnabled": True,
+        "heartbeatEnabled": True,
+        "showdayDiscordPostsEnabled": False,
+    }
+
+    if not force_refresh and _bnl_control_flags_cache and _bnl_control_flags_cached_at:
+        age = (now - _bnl_control_flags_cached_at).total_seconds()
+        if age < BNL_CONTROL_FLAGS_TTL_SECONDS:
+            return _bnl_control_flags_cache
+
+    for url in _build_bnl_control_flag_urls():
+        headers = {"Accept": "application/json"}
+        if BNL_API_KEY:
+            headers["x-api-key"] = BNL_API_KEY
+        req = urllib.request.Request(url, method="GET", headers=headers)
+        try:
+            with urllib.request.urlopen(req, timeout=8) as response:
+                code = getattr(response, "status", None) or response.getcode()
+                if not (200 <= code < 300):
+                    continue
+                body = response.read().decode("utf-8", errors="replace")
+                data = json.loads(body) if body else {}
+                flags = {
+                    "websiteRelayEnabled": bool(data.get("websiteRelayEnabled", defaults["websiteRelayEnabled"])),
+                    "heartbeatEnabled": bool(data.get("heartbeatEnabled", defaults["heartbeatEnabled"])),
+                    "showdayDiscordPostsEnabled": bool(data.get("showdayDiscordPostsEnabled", defaults["showdayDiscordPostsEnabled"])),
+                }
+                _bnl_control_flags_cache = flags
+                _bnl_control_flags_cached_at = now
+                return flags
+        except Exception as e:
+            logging.warning(f"⚠️ Control flags fetch failed for {url}: {e}")
+
+    _bnl_control_flags_cache = defaults
+    _bnl_control_flags_cached_at = now
+    return defaults
 
 def update_website_status_controlled(mode: str, message: str, status: str = "ONLINE", force: bool = False) -> bool:
     global _last_website_status_mode, _last_website_status_message, _last_website_status_at, _missing_status_key_warned
@@ -2394,6 +2475,7 @@ async def barcode_radio_queue_task():
 
             discord_post_count = get_showday_discord_post_count(guild.id, show_date)
             recently_posted = had_recent_showday_discord_post(guild.id, minutes=SHOWDAY_RECENT_POST_BLOCK_MINUTES)
+            flags = get_bnl_control_flags()
             should_post_discord = False
             if phase_key == "submissions_open":
                 should_post_discord = True
@@ -2407,6 +2489,8 @@ async def barcode_radio_queue_task():
                 should_post_discord = False
             if phase_key != "submissions_open" and recently_posted:
                 should_post_discord = False
+            if not flags.get("showdayDiscordPostsEnabled", False):
+                should_post_discord = False
 
             discord_sent = ""
             if should_post_discord and channel:
@@ -2417,12 +2501,18 @@ async def barcode_radio_queue_task():
                 except Exception as e:
                     logging.error(f"Show-day Discord update failed (guild {guild.id}, {phase_key}): {e}")
             mode = "RESTRICTED" if phase_key == "sponsor_window" else "ACTIVE_LIAISON"
-            update_website_status_controlled(mode=mode, message=website_msg[:240], status="ONLINE", force=True)
+            if flags.get("websiteRelayEnabled", True):
+                update_website_status_controlled(mode=mode, message=website_msg[:240], status="ONLINE", force=True)
             mark_show_update_fired(guild.id, show_date, phase_key, discord_sent, website_msg)
 
 @tasks.loop(minutes=1)
 async def website_relay_task():
     if not BNL_WEBSITE_RELAY_ENABLED:
+        return
+    flags = get_bnl_control_flags()
+    if not flags.get("websiteRelayEnabled", True):
+        return
+    if not flags.get("heartbeatEnabled", True):
         return
 
     now_pt = datetime.now(PACIFIC_TZ)
@@ -3121,6 +3211,7 @@ async def showtest(interaction: discord.Interaction, phase: app_commands.Choice[
     else:
         discord_msg, website_msg = await generate_showday_messages(interaction.guild.id, phase_key)
         mode = "RESTRICTED" if phase_key == "sponsor_window" else "ACTIVE_LIAISON"
+    flags = get_bnl_control_flags()
     key_len = len(BNL_API_KEY) if BNL_API_KEY else 0
     logging.info(f"/showtest website bridge target URL: {BNL_STATUS_URL}")
     logging.info(f"/showtest BNL_API_KEY present: {bool(BNL_API_KEY)}")
@@ -3156,6 +3247,19 @@ async def showtest(interaction: discord.Interaction, phase: app_commands.Choice[
             f"⚠️ Show-day Discord test fired for `{phase.value}` (mapped to `{phase_key}`), "
             "but website status update failed."
         )
+    warnings = []
+    if phase_key == "relay":
+        if not flags.get("websiteRelayEnabled", True):
+            warnings.append("automatic website relay is currently disabled by websiteRelayEnabled=false")
+        if not flags.get("heartbeatEnabled", True):
+            warnings.append("automatic heartbeat updates are currently disabled by heartbeatEnabled=false")
+    else:
+        if not flags.get("showdayDiscordPostsEnabled", False):
+            warnings.append("automatic show-day Discord posts are currently disabled by showdayDiscordPostsEnabled=false")
+        if not flags.get("websiteRelayEnabled", True):
+            warnings.append("automatic website status relay is currently disabled by websiteRelayEnabled=false")
+    if warnings:
+        user_msg += " Note: " + "; ".join(warnings) + "."
 
     try:
         await interaction.followup.send(user_msg, ephemeral=True)
