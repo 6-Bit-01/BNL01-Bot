@@ -286,6 +286,8 @@ BNL_CONTROL_FLAGS_TTL_SECONDS = 60
 _bnl_control_flags_cache = None
 _bnl_control_flags_cached_at = None
 _bnl_control_flags_404_warned = False
+_bnl_control_flags_last_source_url = None
+
 
 
 def _build_bnl_control_flag_urls() -> list[str]:
@@ -324,7 +326,7 @@ def get_bnl_control_flags(force_refresh: bool = False) -> dict:
       heartbeatEnabled: True
       showdayDiscordPostsEnabled: False
     """
-    global _bnl_control_flags_cache, _bnl_control_flags_cached_at, _bnl_control_flags_404_warned
+    global _bnl_control_flags_cache, _bnl_control_flags_cached_at, _bnl_control_flags_404_warned, _bnl_control_flags_last_source_url
     now = datetime.now(PACIFIC_TZ)
     defaults = {
         "websiteRelayEnabled": True,
@@ -369,6 +371,7 @@ def get_bnl_control_flags(force_refresh: bool = False) -> dict:
                 }
                 _bnl_control_flags_cache = flags
                 _bnl_control_flags_cached_at = now
+                _bnl_control_flags_last_source_url = url
                 logging.info(f"🌐 Control flags fetched from {url} (HTTP {code}).")
                 return flags
         except urllib.error.HTTPError as e:
@@ -387,6 +390,7 @@ def get_bnl_control_flags(force_refresh: bool = False) -> dict:
 
     _bnl_control_flags_cache = defaults
     _bnl_control_flags_cached_at = now
+    _bnl_control_flags_last_source_url = None
     return defaults
 
 def update_website_status_controlled(mode: str, message: str, status: str = "ONLINE", force: bool = False, current_directive: str = "", source: str = "relay") -> bool:
@@ -2856,6 +2860,28 @@ def _reset_debounce(channel: discord.TextChannel):
 
     _channel_tasks[cid] = asyncio.create_task(_schedule_flush(channel))
 
+def log_admin_controls_connection_check():
+    """Log whether website admin control flags are reachable and active."""
+    urls = _build_bnl_control_flag_urls()
+    if not urls:
+        logging.warning("⚠️ Admin controls check: no control-flags URL resolved. Set BNL_STATUS_URL or BNL_CONTROL_FLAGS_URL.")
+        return
+
+    flags = get_bnl_control_flags(force_refresh=True)
+    if _bnl_control_flags_last_source_url:
+        logging.info(
+            f"✅ Admin controls connected via {_bnl_control_flags_last_source_url} "
+            f"(websiteRelayEnabled={flags.get('websiteRelayEnabled')}, "
+            f"heartbeatEnabled={flags.get('heartbeatEnabled')}, "
+            f"showdayDiscordPostsEnabled={flags.get('showdayDiscordPostsEnabled')})."
+        )
+    else:
+        logging.warning(
+            "⚠️ Admin controls unreachable; using local defaults "
+            "(websiteRelayEnabled=True, heartbeatEnabled=True, showdayDiscordPostsEnabled=False)."
+        )
+
+
 # ==================== EVENT HANDLERS ====================
 
 @client.event
@@ -2879,6 +2905,7 @@ async def on_ready():
 
     logging.info(f"🎯 BNL-01 online as {client.user.name} ({client.user.id})")
     logging.info(f"📡 Monitoring {len(client.guilds)} server(s)")
+    log_admin_controls_connection_check()
 
     await asyncio.to_thread(
         update_website_status,
