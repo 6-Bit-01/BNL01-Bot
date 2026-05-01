@@ -123,6 +123,10 @@ def update_website_status(status: str, mode: str, message: str, current_directiv
     sanitized_message = sanitize_website_status_message(message, limit=240)
     sanitized_directive = sanitize_website_status_message(current_directive, limit=160)
     payload = {"status": status, "mode": mode, "message": sanitized_message, "currentDirective": sanitized_directive, "source": (source or "relay")[:32]}
+    logging.info(
+        f"🌐 Website status push attempt source={source} mode={mode} endpoint={BNL_STATUS_URL} "
+        f"message_preview={sanitized_message[:120]!r}"
+    )
     data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(
         BNL_STATUS_URL,
@@ -280,6 +284,7 @@ _missing_status_key_warned = False
 BNL_CONTROL_FLAGS_TTL_SECONDS = 60
 _bnl_control_flags_cache = None
 _bnl_control_flags_cached_at = None
+_bnl_control_flags_404_warned = False
 
 
 def _build_bnl_control_flag_urls() -> list[str]:
@@ -318,7 +323,7 @@ def get_bnl_control_flags(force_refresh: bool = False) -> dict:
       heartbeatEnabled: True
       showdayDiscordPostsEnabled: False
     """
-    global _bnl_control_flags_cache, _bnl_control_flags_cached_at
+    global _bnl_control_flags_cache, _bnl_control_flags_cached_at, _bnl_control_flags_404_warned
     now = datetime.now(PACIFIC_TZ)
     defaults = {
         "websiteRelayEnabled": True,
@@ -363,7 +368,19 @@ def get_bnl_control_flags(force_refresh: bool = False) -> dict:
                 }
                 _bnl_control_flags_cache = flags
                 _bnl_control_flags_cached_at = now
+                logging.info(f"🌐 Control flags fetched from {url} (HTTP {code}).")
                 return flags
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                if not _bnl_control_flags_404_warned:
+                    logging.info(
+                        f"ℹ️ Control flags endpoint not found (HTTP 404): {url}. "
+                        "Using default flags. If website-managed flags are required, expose GET /api/bnl/control-flags "
+                        "or set BNL_CONTROL_FLAGS_URL."
+                    )
+                    _bnl_control_flags_404_warned = True
+                continue
+            logging.warning(f"⚠️ Control flags fetch failed for {url} (HTTP {e.code}): {e.reason}")
         except Exception as e:
             logging.warning(f"⚠️ Control flags fetch failed for {url}: {e}")
 
@@ -389,11 +406,16 @@ def update_website_status_controlled(mode: str, message: str, status: str = "ONL
     sanitized_directive = sanitize_website_status_message(current_directive, limit=160)
     same_payload = (_last_website_status_mode == mode and _last_website_status_message == sanitized_message and _last_website_directive == sanitized_directive)
     if same_payload and not force:
+        logging.info(
+            f"🧾 Relay history append skipped (duplicate payload). mode={mode} "
+            f"message_preview={sanitized_message[:100]!r}"
+        )
         return True
 
     if _last_website_status_at and not force and _last_website_status_mode == mode:
         elapsed = (now - _last_website_status_at).total_seconds()
         if elapsed < STATUS_UPDATE_COOLDOWN_SECONDS:
+            logging.info(f"⏱️ Website status push skipped by cooldown ({elapsed:.1f}s < {STATUS_UPDATE_COOLDOWN_SECONDS}s) mode={mode}.")
             return True
 
     try:
@@ -558,6 +580,7 @@ def _build_relay_context(guild_id: int, limit: int = 20) -> str:
 
 
 async def generate_dynamic_website_relay(guild_id: int) -> tuple[str, str, str]:
+    logging.info(f"🛰️ Generating website relay message via generate_dynamic_website_relay(guild_id={guild_id}).")
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
     cursor.execute(
@@ -578,6 +601,10 @@ async def generate_dynamic_website_relay(guild_id: int) -> tuple[str, str, str]:
     mode = _website_relay_mode_from_context(messages, now_pt)
     signal_summary = get_recent_signal_summary(guild_id)
     relay_context = _build_relay_context(guild_id)
+    logging.info(
+        f"🧠 Relay context inspection guild={guild_id}: "
+        f"has_messages={bool(messages)} has_specific_context={bool(relay_context.strip())} mode={mode}"
+    )
 
     if GEMINI_API_KEY:
         prompt = (
@@ -627,6 +654,10 @@ async def generate_dynamic_website_relay(guild_id: int) -> tuple[str, str, str]:
             current_directive = random.choice(options)
 
     relay_message = sanitize_website_status_message(relay_message, limit=240)
+    logging.info(
+        f"📝 Relay generated guild={guild_id} preview={relay_message[:120]!r} "
+        f"context_used={bool(relay_context.strip())}"
+    )
     _remember_relay_message(guild_id, relay_message)
     return mode, relay_message, sanitize_website_status_message(current_directive, limit=160)
 
@@ -637,6 +668,7 @@ async def request_fresh_website_relay(guild_id: int, *, force: bool = True) -> t
     Returns (success, mode, sanitized_message).
     """
     try:
+        logging.info(f"📨 Fresh website relay requested guild={guild_id} force={force}.")
         mode, relay_message, directive = await generate_dynamic_website_relay(guild_id)
         sanitized = sanitize_website_status_message(relay_message, limit=240)
         sanitized_directive = sanitize_website_status_message(directive, limit=160)
@@ -2673,7 +2705,9 @@ async def website_relay_task():
         active_channel_id = get_guild_config(guild.id)
         if not active_channel_id:
             continue
+        logging.info(f"⏲️ website_relay_task tick guild={guild.id} active_channel={active_channel_id}.")
         mode, relay_message, directive = await generate_dynamic_website_relay(guild.id)
+        logging.info(f"📤 website_relay_task prepared mode={mode} preview={relay_message[:120]!r}")
         update_website_status_controlled(mode=mode, message=relay_message, status="ONLINE", current_directive=directive, source="relay")
 
 # ==================== BATCHED REPLY SYSTEM (ACTIVE CHANNEL ONLY) ====================
@@ -3336,6 +3370,10 @@ async def about(interaction: discord.Interaction):
 )
 async def showtest(interaction: discord.Interaction, phase: app_commands.Choice[str]):
     await interaction.response.defer(ephemeral=True)
+    logging.info(
+        f"🧪 /showtest received phase={phase.value} guild={getattr(interaction.guild, 'id', None)} "
+        f"triggered_by={interaction.user} ({interaction.user.id})"
+    )
 
     if not interaction.guild:
         await interaction.followup.send("❌ This command can only be used in a server.", ephemeral=True)
