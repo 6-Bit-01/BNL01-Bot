@@ -2965,6 +2965,62 @@ async def about(interaction: discord.Interaction):
     embed.set_footer(text="Use /setchannel to configure the liaison channel.")
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
+@tree.command(name="showtest", description="Manually test Friday show-day update behavior.")
+@app_commands.describe(phase="Show-day phase to simulate")
+@app_commands.choices(
+    phase=[
+        app_commands.Choice(name="intake", value="intake"),
+        app_commands.Choice(name="live", value="live"),
+        app_commands.Choice(name="sponsor", value="sponsor"),
+    ]
+)
+async def showtest(interaction: discord.Interaction, phase: app_commands.Choice[str]):
+    if not interaction.guild:
+        await interaction.response.send_message("❌ This command can only be used in a server.", ephemeral=True)
+        return
+
+    member = interaction.user if isinstance(interaction.user, discord.Member) else interaction.guild.get_member(interaction.user.id)
+    perms = member.guild_permissions if member else None
+    if not perms or (not perms.manage_guild and not perms.administrator):
+        await interaction.response.send_message("❌ You need Manage Server or Administrator permissions.", ephemeral=True)
+        return
+
+    phase_map = {
+        "intake": "submissions_open",
+        "live": "show_live",
+        "sponsor": "sponsor_window",
+    }
+    phase_key = phase_map.get(phase.value)
+    if not phase_key:
+        await interaction.response.send_message("❌ Invalid phase.", ephemeral=True)
+        return
+
+    discord_msg, website_msg = await generate_showday_messages(interaction.guild.id, phase_key)
+    mode = "RESTRICTED" if phase_key == "sponsor_window" else "ACTIVE_LIAISON"
+    update_website_status_controlled(mode=mode, message=website_msg[:240], status="ONLINE", force=True)
+
+    target_channel = interaction.channel if isinstance(interaction.channel, discord.TextChannel) else None
+    if not target_channel:
+        channel_id = get_guild_config(interaction.guild.id)
+        target_channel = interaction.guild.get_channel(channel_id) if channel_id else None
+
+    if target_channel:
+        try:
+            await target_channel.send(discord_msg)
+            log_ambient(interaction.guild.id, discord_msg)
+        except Exception as e:
+            logging.error(f"Show-test Discord update failed (guild {interaction.guild.id}, {phase_key}): {e}")
+            await interaction.response.send_message(
+                "⚠️ Website status updated, but test message could not be posted to the target channel.",
+                ephemeral=True,
+            )
+            return
+
+    await interaction.response.send_message(
+        f"✅ Show-day test fired for `{phase.value}` (mapped to `{phase_key}`).",
+        ephemeral=True,
+    )
+
 # ==================== ERROR HANDLER ====================
 
 @tree.error
