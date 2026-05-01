@@ -666,6 +666,17 @@ async def generate_dynamic_website_relay(guild_id: int) -> tuple[str, str, str]:
     _remember_relay_message(guild_id, relay_message)
     return mode, relay_message, sanitize_website_status_message(current_directive, limit=160)
 
+
+def resolve_network_guild_id(requested_guild_id: int) -> int:
+    """Resolve guild id for network-facing actions, honoring primary-guild override."""
+    if BNL_PRIMARY_GUILD_ID:
+        if requested_guild_id != BNL_PRIMARY_GUILD_ID:
+            logging.info(
+                f"🔁 Network action guild override: requested={requested_guild_id} -> primary={BNL_PRIMARY_GUILD_ID}"
+            )
+        return BNL_PRIMARY_GUILD_ID
+    return requested_guild_id
+
 async def request_fresh_website_relay(guild_id: int, *, force: bool = True) -> tuple[bool, str, str, str]:
     """
     Generate and post a fresh dynamic website relay update.
@@ -673,15 +684,16 @@ async def request_fresh_website_relay(guild_id: int, *, force: bool = True) -> t
     Returns (success, mode, sanitized_message).
     """
     try:
-        logging.info(f"📨 Fresh website relay requested guild={guild_id} force={force}.")
-        mode, relay_message, directive = await generate_dynamic_website_relay(guild_id)
+        target_guild_id = resolve_network_guild_id(guild_id)
+        logging.info(f"📨 Fresh website relay requested guild={guild_id} target_guild={target_guild_id} force={force}.")
+        mode, relay_message, directive = await generate_dynamic_website_relay(target_guild_id)
         sanitized = sanitize_website_status_message(relay_message, limit=240)
         sanitized_directive = sanitize_website_status_message(directive, limit=160)
         ok = update_website_status_controlled(mode=mode, message=sanitized, status="ONLINE", force=force, current_directive=sanitized_directive, source="relay")
         if ok:
-            logging.info(f"✅ Fresh website relay requested successfully (guild {guild_id}, mode {mode}).")
+            logging.info(f"✅ Fresh website relay requested successfully (guild {target_guild_id}, mode {mode}).")
         else:
-            logging.warning(f"⚠️ Fresh website relay request failed (guild {guild_id}, mode {mode}).")
+            logging.warning(f"⚠️ Fresh website relay request failed (guild {target_guild_id}, mode {mode}).")
         return ok, mode, sanitized, sanitized_directive
     except Exception as e:
         logging.error(f"❌ Fresh website relay request crashed safely (guild {guild_id}): {e}")
