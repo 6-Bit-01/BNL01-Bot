@@ -42,6 +42,7 @@ BNL_STATUS_URL = os.getenv("BNL_STATUS_URL")
 
 BNL_WEBSITE_RELAY_ENABLED = os.getenv("BNL_WEBSITE_RELAY_ENABLED", "true").strip().lower() not in {"false", "0", "off"}
 BNL_WEBSITE_RELAY_INTERVAL_MINUTES = max(1, int(os.getenv("BNL_WEBSITE_RELAY_INTERVAL_MINUTES", "20")))
+BNL_PRIMARY_GUILD_ID = int(os.getenv("BNL_PRIMARY_GUILD_ID", "0") or 0)
 
 DAILY_TOKEN_LIMIT = 1_350_000
 PACIFIC_TZ = pytz.timezone("US/Pacific")
@@ -2631,6 +2632,17 @@ async def generate_showday_messages(guild_id: int, phase_key: str):
     fallback = _pick_varied_fallback(phase_key)
     return fallback[:320], fallback[:240]
 
+
+def iter_managed_guilds():
+    """Yield guilds this bot should use for network-facing automation."""
+    if BNL_PRIMARY_GUILD_ID:
+        guild = client.get_guild(BNL_PRIMARY_GUILD_ID)
+        if guild is None:
+            logging.warning(f"⚠️ BNL_PRIMARY_GUILD_ID={BNL_PRIMARY_GUILD_ID} is set but the guild is not available to the bot.")
+            return []
+        return [guild]
+    return list(client.guilds)
+
 @tasks.loop(minutes=1)
 async def barcode_radio_queue_task():
     now = datetime.now(PACIFIC_TZ)
@@ -2644,7 +2656,7 @@ async def barcode_radio_queue_task():
         if age_min < 0 or age_min > phase["window_min"]:
             continue
         phase_key = phase["key"]
-        for guild in client.guilds:
+        for guild in iter_managed_guilds():
             if already_fired_show_update(guild.id, show_date, phase_key):
                 continue
             channel_id = get_guild_config(guild.id)
@@ -2701,7 +2713,7 @@ async def website_relay_task():
     if (now_pt.minute % interval) != 0:
         return
 
-    for guild in client.guilds:
+    for guild in iter_managed_guilds():
         active_channel_id = get_guild_config(guild.id)
         if not active_channel_id:
             continue
