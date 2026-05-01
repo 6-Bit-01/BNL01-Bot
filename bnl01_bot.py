@@ -255,7 +255,7 @@ _last_website_status_message = None
 _last_website_status_at = None
 _missing_status_key_warned = False
 
-def update_website_status_controlled(mode: str, message: str, status: str = "ONLINE", force: bool = False):
+def update_website_status_controlled(mode: str, message: str, status: str = "ONLINE", force: bool = False) -> bool:
     global _last_website_status_mode, _last_website_status_message, _last_website_status_at, _missing_status_key_warned
 
     now = datetime.now(PACIFIC_TZ)
@@ -263,43 +263,36 @@ def update_website_status_controlled(mode: str, message: str, status: str = "ONL
         if not _missing_status_key_warned:
             logging.warning("⚠️ BNL_API_KEY missing. Website status bridge disabled.")
             _missing_status_key_warned = True
-        return
+        return False
 
     if not BNL_STATUS_URL:
         logging.warning("⚠️ BNL_STATUS_URL missing. Cannot post website status updates.")
-        return
+        return False
 
     same_payload = (_last_website_status_mode == mode and _last_website_status_message == message)
     if same_payload and not force:
-        return
+        return True
 
     if _last_website_status_at and not force and _last_website_status_mode == mode:
         elapsed = (now - _last_website_status_at).total_seconds()
         if elapsed < STATUS_UPDATE_COOLDOWN_SECONDS:
-            return
-
-    payload = {"status": status, "mode": mode, "message": message}
-    req = urllib.request.Request(
-        BNL_STATUS_URL,
-        data=json.dumps(payload).encode("utf-8"),
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {BNL_API_KEY}",
-        },
-        method="POST",
-    )
+            return True
 
     try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            resp.read()
+        ok = update_website_status(status=status, mode=mode, message=message)
+        if not ok:
+            return False
         _last_website_status_mode = mode
         _last_website_status_message = message
         _last_website_status_at = now
         logging.info(f"🌐 Website status updated: {mode}")
+        return True
     except urllib.error.URLError as e:
         logging.warning(f"⚠️ Website status update failed: {e}")
+        return False
     except Exception as e:
         logging.warning(f"⚠️ Unexpected website status bridge failure: {e}")
+        return False
 
 def maybe_update_broadcast_status_from_text(text: str):
     t = (text or "").lower()
@@ -2975,14 +2968,16 @@ async def about(interaction: discord.Interaction):
     ]
 )
 async def showtest(interaction: discord.Interaction, phase: app_commands.Choice[str]):
+    await interaction.response.defer(ephemeral=True)
+
     if not interaction.guild:
-        await interaction.response.send_message("❌ This command can only be used in a server.", ephemeral=True)
+        await interaction.followup.send("❌ This command can only be used in a server.", ephemeral=True)
         return
 
     member = interaction.user if isinstance(interaction.user, discord.Member) else interaction.guild.get_member(interaction.user.id)
     perms = member.guild_permissions if member else None
     if not perms or (not perms.manage_guild and not perms.administrator):
-        await interaction.response.send_message("❌ You need Manage Server or Administrator permissions.", ephemeral=True)
+        await interaction.followup.send("❌ You need Manage Server or Administrator permissions.", ephemeral=True)
         return
 
     phase_map = {
@@ -2992,12 +2987,16 @@ async def showtest(interaction: discord.Interaction, phase: app_commands.Choice[
     }
     phase_key = phase_map.get(phase.value)
     if not phase_key:
-        await interaction.response.send_message("❌ Invalid phase.", ephemeral=True)
+        await interaction.followup.send("❌ Invalid phase.", ephemeral=True)
         return
 
     discord_msg, website_msg = await generate_showday_messages(interaction.guild.id, phase_key)
     mode = "RESTRICTED" if phase_key == "sponsor_window" else "ACTIVE_LIAISON"
-    update_website_status_controlled(mode=mode, message=website_msg[:240], status="ONLINE", force=True)
+    key_len = len(BNL_API_KEY) if BNL_API_KEY else 0
+    logging.info(f"/showtest website bridge target URL: {BNL_STATUS_URL}")
+    logging.info(f"/showtest BNL_API_KEY present: {bool(BNL_API_KEY)}")
+    logging.info(f"/showtest BNL_API_KEY length: {key_len}")
+    website_ok = update_website_status_controlled(mode=mode, message=website_msg[:240], status="ONLINE", force=True)
 
     target_channel = interaction.channel if isinstance(interaction.channel, discord.TextChannel) else None
     if not target_channel:
@@ -3010,16 +3009,25 @@ async def showtest(interaction: discord.Interaction, phase: app_commands.Choice[
             log_ambient(interaction.guild.id, discord_msg)
         except Exception as e:
             logging.error(f"Show-test Discord update failed (guild {interaction.guild.id}, {phase_key}): {e}")
-            await interaction.response.send_message(
-                "⚠️ Website status updated, but test message could not be posted to the target channel.",
+            await interaction.followup.send(
+                "⚠️ Test message could not be posted to the target channel. "
+                + ("Website status updated." if website_ok else "Website status update also failed."),
                 ephemeral=True,
             )
             return
 
-    await interaction.response.send_message(
-        f"✅ Show-day test fired for `{phase.value}` (mapped to `{phase_key}`).",
-        ephemeral=True,
-    )
+    if website_ok:
+        user_msg = f"✅ Show-day test fired for `{phase.value}` (mapped to `{phase_key}`)."
+    else:
+        user_msg = (
+            f"⚠️ Show-day Discord test fired for `{phase.value}` (mapped to `{phase_key}`), "
+            "but website status update failed."
+        )
+
+    try:
+        await interaction.followup.send(user_msg, ephemeral=True)
+    except Exception as e:
+        logging.error(f"/showtest followup.send failed (guild {getattr(interaction.guild, 'id', 'n/a')}): {e}")
 
 # ==================== ERROR HANDLER ====================
 
