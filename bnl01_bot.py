@@ -59,6 +59,9 @@ AMBIENT_MAX_CHARS = 280
 AMBIENT_RETRY_ON_SIMILAR = 1
 AMBIENT_FAIL_RESCHEDULE_MINUTES = 30
 SHOWDAY_WINDOW_MINUTES = 10
+SHOWDAY_MAX_DISCORD_POSTS_PER_FRIDAY = 2
+SHOWDAY_RECENT_POST_BLOCK_MINUTES = 30
+SHOWDAY_SPONSOR_POST_CHANCE = 0.35
 
 # ======== GREETING COOLDOWN ========
 GREETING_COOLDOWN_MINUTES = 90
@@ -1275,6 +1278,52 @@ def mark_show_update_fired(guild_id: int, show_date: str, phase_key: str, discor
     conn.commit()
     conn.close()
 
+def get_showday_discord_post_count(guild_id: int, show_date: str) -> int:
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        SELECT COUNT(*) FROM friday_show_updates
+        WHERE guild_id = ? AND show_date = ? AND discord_message IS NOT NULL AND TRIM(discord_message) != ''
+        """,
+        (guild_id, show_date),
+    )
+    row = cursor.fetchone()
+    conn.close()
+    return int(row[0] if row else 0)
+
+def had_recent_showday_discord_post(guild_id: int, minutes: int = SHOWDAY_RECENT_POST_BLOCK_MINUTES) -> bool:
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cutoff = (datetime.now(PACIFIC_TZ) - timedelta(minutes=minutes)).isoformat()
+    cursor.execute(
+        """
+        SELECT 1 FROM friday_show_updates
+        WHERE guild_id = ? AND discord_message IS NOT NULL AND TRIM(discord_message) != '' AND fired_at >= ?
+        ORDER BY fired_at DESC
+        LIMIT 1
+        """,
+        (guild_id, cutoff),
+    )
+    row = cursor.fetchone()
+    conn.close()
+    return bool(row)
+
+def is_active_channel_quiet(guild_id: int, minutes: int = 15) -> bool:
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cutoff_sql = f"-{max(1, int(minutes))} minutes"
+    cursor.execute(
+        """
+        SELECT COUNT(*) FROM conversations
+        WHERE guild_id = ? AND role = 'user' AND timestamp >= datetime('now', ?)
+        """,
+        (guild_id, cutoff_sql),
+    )
+    row = cursor.fetchone()
+    conn.close()
+    return int(row[0] if row else 0) == 0
+
 def save_user_message(user_id: int, user_name: str, guild_id: int, content: str):
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
@@ -2206,7 +2255,7 @@ async def generate_showday_messages(guild_id: int, phase_key: str):
 
     prompt = (
         "You are BNL-01. Generate exactly two lines.\n"
-        "Line 1: Discord update under 280 chars.\n"
+        "Line 1: Discord update under 320 chars.\n"
         "Line 2: Website status message under 240 chars.\n"
         "Voice: concise, corporate, lightly sinister, signal-analysis.\n"
         f"Event: {phase_desc}.\n"
@@ -2217,12 +2266,12 @@ async def generate_showday_messages(guild_id: int, phase_key: str):
     text = (await get_gemini_response(prompt, user_id=0, guild_id=guild_id) or "").strip()
     lines = [ln.strip(" -•\t") for ln in text.splitlines() if ln.strip()]
     if len(lines) >= 2:
-        discord_msg = lines[0][:280]
+        discord_msg = lines[0][:320]
         website_msg = lines[1][:240]
         if discord_msg and website_msg:
             return discord_msg, website_msg
     fallback = _pick_varied_fallback(phase_key)
-    return fallback[:280], fallback[:240]
+    return fallback[:320], fallback[:240]
 
 @tasks.loop(minutes=1)
 async def barcode_radio_queue_task():
@@ -2245,17 +2294,35 @@ async def barcode_radio_queue_task():
             last_ambient = (get_recent_ambient(guild.id, limit=1) or [""])[0]
             discord_msg, website_msg = await generate_showday_messages(guild.id, phase_key)
             if last_ambient and discord_msg.strip().lower() == last_ambient.strip().lower():
-                discord_msg = _pick_varied_fallback(phase_key, avoid=discord_msg)[:280]
-            if channel:
+                discord_msg = _pick_varied_fallback(phase_key, avoid=discord_msg)[:320]
+
+            discord_post_count = get_showday_discord_post_count(guild.id, show_date)
+            recently_posted = had_recent_showday_discord_post(guild.id, minutes=SHOWDAY_RECENT_POST_BLOCK_MINUTES)
+            should_post_discord = False
+            if phase_key == "submissions_open":
+                should_post_discord = True
+            elif phase_key == "show_live":
+                quiet = is_active_channel_quiet(guild.id, minutes=15)
+                should_post_discord = quiet or not recently_posted
+            elif phase_key == "sponsor_window":
+                should_post_discord = random.random() < SHOWDAY_SPONSOR_POST_CHANCE
+
+            if discord_post_count >= SHOWDAY_MAX_DISCORD_POSTS_PER_FRIDAY:
+                should_post_discord = False
+            if phase_key != "submissions_open" and recently_posted:
+                should_post_discord = False
+
+            discord_sent = ""
+            if should_post_discord and channel:
                 try:
                     await channel.send(discord_msg)
+                    discord_sent = discord_msg
+                    log_ambient(guild.id, discord_msg)
                 except Exception as e:
                     logging.error(f"Show-day Discord update failed (guild {guild.id}, {phase_key}): {e}")
-                    continue
             mode = "RESTRICTED" if phase_key == "sponsor_window" else "ACTIVE_LIAISON"
             update_website_status_controlled(mode=mode, message=website_msg[:240], status="ONLINE", force=True)
-            log_ambient(guild.id, discord_msg)
-            mark_show_update_fired(guild.id, show_date, phase_key, discord_msg, website_msg)
+            mark_show_update_fired(guild.id, show_date, phase_key, discord_sent, website_msg)
 
 # ==================== BATCHED REPLY SYSTEM (ACTIVE CHANNEL ONLY) ====================
 
