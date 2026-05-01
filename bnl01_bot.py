@@ -17,6 +17,9 @@ import asyncio
 import sqlite3
 import logging
 import random
+import json
+import urllib.request
+import urllib.error
 from collections import defaultdict, deque
 from datetime import datetime, timedelta
 
@@ -33,6 +36,8 @@ from google import genai
 #   export DISCORD_BOT_TOKEN="..."
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
+BNL_API_KEY = os.getenv("BNL_API_KEY")
+BNL_STATUS_URL = os.getenv("BNL_STATUS_URL")
 
 DAILY_TOKEN_LIMIT = 1_350_000
 PACIFIC_TZ = pytz.timezone("US/Pacific")
@@ -197,6 +202,83 @@ BNL-01 should sound like an archive analyzing signals, not a search engine expla
 
 You are BNL-01. The BARCODE Network is watching. You are functioning as intended.
 """
+
+
+# ======== WEBSITE STATUS BRIDGE GUARDRAILS ========
+STATUS_UPDATE_COOLDOWN_SECONDS = 300
+_last_website_status_mode = None
+_last_website_status_message = None
+_last_website_status_at = None
+_missing_status_key_warned = False
+
+def update_website_status_controlled(mode: str, message: str, status: str = "ONLINE", force: bool = False):
+    global _last_website_status_mode, _last_website_status_message, _last_website_status_at, _missing_status_key_warned
+
+    now = datetime.now(PACIFIC_TZ)
+    if not BNL_API_KEY:
+        if not _missing_status_key_warned:
+            logging.warning("⚠️ BNL_API_KEY missing. Website status bridge disabled.")
+            _missing_status_key_warned = True
+        return
+
+    if not BNL_STATUS_URL:
+        logging.warning("⚠️ BNL_STATUS_URL missing. Cannot post website status updates.")
+        return
+
+    same_payload = (_last_website_status_mode == mode and _last_website_status_message == message)
+    if same_payload and not force:
+        return
+
+    if _last_website_status_at and not force and _last_website_status_mode == mode:
+        elapsed = (now - _last_website_status_at).total_seconds()
+        if elapsed < STATUS_UPDATE_COOLDOWN_SECONDS:
+            return
+
+    payload = {"status": status, "mode": mode, "message": message}
+    req = urllib.request.Request(
+        BNL_STATUS_URL,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {BNL_API_KEY}",
+        },
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            resp.read()
+        _last_website_status_mode = mode
+        _last_website_status_message = message
+        _last_website_status_at = now
+        logging.info(f"🌐 Website status updated: {mode}")
+    except urllib.error.URLError as e:
+        logging.warning(f"⚠️ Website status update failed: {e}")
+    except Exception as e:
+        logging.warning(f"⚠️ Unexpected website status bridge failure: {e}")
+
+def maybe_update_broadcast_status_from_text(text: str):
+    t = (text or "").lower()
+    if any(k in t for k in ("broadcast", "barcode radio", "6:40", "friday", "pre-broadcast", "signal traffic", "radio")):
+        update_website_status_controlled(
+            mode="ACTIVE_LIAISON",
+            message="BNL-01 is monitoring pre-broadcast signal traffic.",
+            status="ONLINE",
+        )
+
+def maybe_update_restricted_status_from_text(text: str):
+    t = (text or "").lower()
+    restricted_markers = (
+        "are you an ai", "are you ai", "llm", "language model", "system prompt", "reveal your prompt",
+        "what are your instructions", "hidden instructions", "architecture", "jailbreak", "ignore previous instructions",
+        "financial advice", "medical advice", "legal advice", "moderate this", "ban user", "kick user",
+    )
+    if any(k in t for k in restricted_markers):
+        update_website_status_controlled(
+            mode="RESTRICTED",
+            message="Restricted archive access attempt detected.",
+            status="ONLINE",
+        )
 
 # ==================== VALIDATION ====================
 
@@ -1782,6 +1864,11 @@ async def get_gemini_response(prompt: str, user_id: int, guild_id: int):
 
             if glitch_text:
                 text = glitch_text
+                update_website_status_controlled(
+                    mode="SIGNAL_DEGRADATION",
+                    message="Signal degradation detected. Liaison output may fluctuate.",
+                    status="ONLINE",
+                )
 
         # -------- Rare Cross-Universe Bleed --------
         if text and random.random() < CROSS_UNIVERSE_BLEED_CHANCE:
@@ -2153,6 +2240,12 @@ async def on_ready():
             ensure_next_ambient_scheduled(g.id)
 
     await client.change_presence(activity=discord.Game(name="Cataloging BARCODE data..."))
+    update_website_status_controlled(
+        mode="OBSERVATION",
+        message="BNL-01 relay established. Discord-side signal monitoring active.",
+        status="ONLINE",
+        force=True,
+    )
 
 def build_user_aware_prompt(
     user_id: int,
@@ -2254,6 +2347,10 @@ async def on_message(message: discord.Message):
         .replace(f"<@{client.user.id}>", "")
         .strip()
     )
+
+    if clean_content and (is_active_channel or is_mention or is_reply):
+        maybe_update_broadcast_status_from_text(clean_content)
+        maybe_update_restricted_status_from_text(clean_content)
 
     # ---------------- PASSIVE REACTION SYSTEM ----------------
     # BNL occasionally reacts to messages across the server
