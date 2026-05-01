@@ -2582,7 +2582,17 @@ intents.message_content = True
 intents.guilds = True
 intents.members = True
 
-client = discord.Client(intents=intents)
+class BNLClient(discord.Client):
+    async def setup_hook(self):
+        # Start webhook listener early in startup so it is available
+        # even before Discord emits READY.
+        try:
+            await start_force_pull_listener()
+        except Exception as e:
+            logging.error(f"Failed to start force-pull webhook listener during setup: {e}")
+
+
+client = BNLClient(intents=intents)
 tree = app_commands.CommandTree(client)
 
 # ==================== AMBIENT MESSAGE TASK ====================
