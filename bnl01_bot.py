@@ -17,6 +17,9 @@ import asyncio
 import sqlite3
 import logging
 import random
+import json
+import urllib.request
+import urllib.error
 from collections import defaultdict, deque
 from datetime import datetime, timedelta
 
@@ -33,6 +36,8 @@ from google import genai
 #   export DISCORD_BOT_TOKEN="..."
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
+BNL_API_KEY = os.getenv("BNL_API_KEY")
+BNL_STATUS_URL = os.getenv("BNL_STATUS_URL", "https://www.barcode-network.com/api/bnl/status")
 
 DAILY_TOKEN_LIMIT = 1_350_000
 PACIFIC_TZ = pytz.timezone("US/Pacific")
@@ -80,6 +85,46 @@ MAX_CONVERSATION_ROWS_PER_USER = 260
 # ==================== LOGGING SETUP ====================
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+
+
+def update_website_status(status: str, mode: str, message: str) -> bool:
+    """
+    Send BNL-01 status to the BARCODE Network website bridge.
+    Returns True on success, False on failure or when not configured.
+    """
+    if not BNL_API_KEY:
+        logging.warning("⚠️ BNL_API_KEY is missing; skipping website status update.")
+        return False
+
+    payload = {"status": status, "mode": mode, "message": message}
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        BNL_STATUS_URL,
+        data=data,
+        method="POST",
+        headers={
+            "Content-Type": "application/json",
+            "x-api-key": BNL_API_KEY,
+        },
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=10) as response:
+            code = getattr(response, "status", None) or response.getcode()
+            if 200 <= code < 300:
+                logging.info(f"✅ Website status updated successfully ({code}) to {BNL_STATUS_URL}")
+                return True
+            logging.warning(f"⚠️ Website status update returned non-success code: {code}")
+            return False
+    except urllib.error.HTTPError as e:
+        logging.warning(f"⚠️ Website status update failed with HTTP error {e.code}: {e.reason}")
+        return False
+    except urllib.error.URLError as e:
+        logging.warning(f"⚠️ Website status update failed with URL error: {e.reason}")
+        return False
+    except Exception as e:
+        logging.warning(f"⚠️ Website status update failed with unexpected error: {e}")
+        return False
 
 # ==================== BNL-01 PERSONA & LORE ====================
 
@@ -2146,6 +2191,13 @@ async def on_ready():
 
     logging.info(f"🎯 BNL-01 online as {client.user.name} ({client.user.id})")
     logging.info(f"📡 Monitoring {len(client.guilds)} server(s)")
+
+    await asyncio.to_thread(
+        update_website_status,
+        "ONLINE",
+        "OBSERVATION",
+        "BNL-01 relay established. Discord-side signal monitoring active."
+    )
 
     for g in client.guilds:
         active_channel_id = get_guild_config(g.id)
