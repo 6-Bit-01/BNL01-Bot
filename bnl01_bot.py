@@ -42,6 +42,7 @@ BNL_STATUS_URL = os.getenv("BNL_STATUS_URL")
 
 BNL_WEBSITE_RELAY_ENABLED = os.getenv("BNL_WEBSITE_RELAY_ENABLED", "true").strip().lower() not in {"false", "0", "off"}
 BNL_WEBSITE_RELAY_INTERVAL_MINUTES = max(1, int(os.getenv("BNL_WEBSITE_RELAY_INTERVAL_MINUTES", "20")))
+BNL_PRIMARY_GUILD_ID = int(os.getenv("BNL_PRIMARY_GUILD_ID", "0") or 0)
 
 DAILY_TOKEN_LIMIT = 1_350_000
 PACIFIC_TZ = pytz.timezone("US/Pacific")
@@ -285,6 +286,8 @@ BNL_CONTROL_FLAGS_TTL_SECONDS = 60
 _bnl_control_flags_cache = None
 _bnl_control_flags_cached_at = None
 _bnl_control_flags_404_warned = False
+_bnl_control_flags_last_source_url = None
+
 
 
 def _build_bnl_control_flag_urls() -> list[str]:
@@ -323,7 +326,7 @@ def get_bnl_control_flags(force_refresh: bool = False) -> dict:
       heartbeatEnabled: True
       showdayDiscordPostsEnabled: False
     """
-    global _bnl_control_flags_cache, _bnl_control_flags_cached_at, _bnl_control_flags_404_warned
+    global _bnl_control_flags_cache, _bnl_control_flags_cached_at, _bnl_control_flags_404_warned, _bnl_control_flags_last_source_url
     now = datetime.now(PACIFIC_TZ)
     defaults = {
         "websiteRelayEnabled": True,
@@ -368,6 +371,7 @@ def get_bnl_control_flags(force_refresh: bool = False) -> dict:
                 }
                 _bnl_control_flags_cache = flags
                 _bnl_control_flags_cached_at = now
+                _bnl_control_flags_last_source_url = url
                 logging.info(f"🌐 Control flags fetched from {url} (HTTP {code}).")
                 return flags
         except urllib.error.HTTPError as e:
@@ -386,6 +390,7 @@ def get_bnl_control_flags(force_refresh: bool = False) -> dict:
 
     _bnl_control_flags_cache = defaults
     _bnl_control_flags_cached_at = now
+    _bnl_control_flags_last_source_url = None
     return defaults
 
 def update_website_status_controlled(mode: str, message: str, status: str = "ONLINE", force: bool = False, current_directive: str = "", source: str = "relay") -> bool:
@@ -661,6 +666,17 @@ async def generate_dynamic_website_relay(guild_id: int) -> tuple[str, str, str]:
     _remember_relay_message(guild_id, relay_message)
     return mode, relay_message, sanitize_website_status_message(current_directive, limit=160)
 
+
+def resolve_network_guild_id(requested_guild_id: int) -> int:
+    """Resolve guild id for network-facing actions, honoring primary-guild override."""
+    if BNL_PRIMARY_GUILD_ID:
+        if requested_guild_id != BNL_PRIMARY_GUILD_ID:
+            logging.info(
+                f"🔁 Network action guild override: requested={requested_guild_id} -> primary={BNL_PRIMARY_GUILD_ID}"
+            )
+        return BNL_PRIMARY_GUILD_ID
+    return requested_guild_id
+
 async def request_fresh_website_relay(guild_id: int, *, force: bool = True) -> tuple[bool, str, str, str]:
     """
     Generate and post a fresh dynamic website relay update.
@@ -668,15 +684,16 @@ async def request_fresh_website_relay(guild_id: int, *, force: bool = True) -> t
     Returns (success, mode, sanitized_message).
     """
     try:
-        logging.info(f"📨 Fresh website relay requested guild={guild_id} force={force}.")
-        mode, relay_message, directive = await generate_dynamic_website_relay(guild_id)
+        target_guild_id = resolve_network_guild_id(guild_id)
+        logging.info(f"📨 Fresh website relay requested guild={guild_id} target_guild={target_guild_id} force={force}.")
+        mode, relay_message, directive = await generate_dynamic_website_relay(target_guild_id)
         sanitized = sanitize_website_status_message(relay_message, limit=240)
         sanitized_directive = sanitize_website_status_message(directive, limit=160)
         ok = update_website_status_controlled(mode=mode, message=sanitized, status="ONLINE", force=force, current_directive=sanitized_directive, source="relay")
         if ok:
-            logging.info(f"✅ Fresh website relay requested successfully (guild {guild_id}, mode {mode}).")
+            logging.info(f"✅ Fresh website relay requested successfully (guild {target_guild_id}, mode {mode}).")
         else:
-            logging.warning(f"⚠️ Fresh website relay request failed (guild {guild_id}, mode {mode}).")
+            logging.warning(f"⚠️ Fresh website relay request failed (guild {target_guild_id}, mode {mode}).")
         return ok, mode, sanitized, sanitized_directive
     except Exception as e:
         logging.error(f"❌ Fresh website relay request crashed safely (guild {guild_id}): {e}")
@@ -2631,6 +2648,17 @@ async def generate_showday_messages(guild_id: int, phase_key: str):
     fallback = _pick_varied_fallback(phase_key)
     return fallback[:320], fallback[:240]
 
+
+def iter_managed_guilds():
+    """Yield guilds this bot should use for network-facing automation."""
+    if BNL_PRIMARY_GUILD_ID:
+        guild = client.get_guild(BNL_PRIMARY_GUILD_ID)
+        if guild is None:
+            logging.warning(f"⚠️ BNL_PRIMARY_GUILD_ID={BNL_PRIMARY_GUILD_ID} is set but the guild is not available to the bot.")
+            return []
+        return [guild]
+    return list(client.guilds)
+
 @tasks.loop(minutes=1)
 async def barcode_radio_queue_task():
     now = datetime.now(PACIFIC_TZ)
@@ -2644,7 +2672,7 @@ async def barcode_radio_queue_task():
         if age_min < 0 or age_min > phase["window_min"]:
             continue
         phase_key = phase["key"]
-        for guild in client.guilds:
+        for guild in iter_managed_guilds():
             if already_fired_show_update(guild.id, show_date, phase_key):
                 continue
             channel_id = get_guild_config(guild.id)
@@ -2701,7 +2729,7 @@ async def website_relay_task():
     if (now_pt.minute % interval) != 0:
         return
 
-    for guild in client.guilds:
+    for guild in iter_managed_guilds():
         active_channel_id = get_guild_config(guild.id)
         if not active_channel_id:
             continue
@@ -2844,6 +2872,28 @@ def _reset_debounce(channel: discord.TextChannel):
 
     _channel_tasks[cid] = asyncio.create_task(_schedule_flush(channel))
 
+def log_admin_controls_connection_check():
+    """Log whether website admin control flags are reachable and active."""
+    urls = _build_bnl_control_flag_urls()
+    if not urls:
+        logging.warning("⚠️ Admin controls check: no control-flags URL resolved. Set BNL_STATUS_URL or BNL_CONTROL_FLAGS_URL.")
+        return
+
+    flags = get_bnl_control_flags(force_refresh=True)
+    if _bnl_control_flags_last_source_url:
+        logging.info(
+            f"✅ Admin controls connected via {_bnl_control_flags_last_source_url} "
+            f"(websiteRelayEnabled={flags.get('websiteRelayEnabled')}, "
+            f"heartbeatEnabled={flags.get('heartbeatEnabled')}, "
+            f"showdayDiscordPostsEnabled={flags.get('showdayDiscordPostsEnabled')})."
+        )
+    else:
+        logging.warning(
+            "⚠️ Admin controls unreachable; using local defaults "
+            "(websiteRelayEnabled=True, heartbeatEnabled=True, showdayDiscordPostsEnabled=False)."
+        )
+
+
 # ==================== EVENT HANDLERS ====================
 
 @client.event
@@ -2867,6 +2917,7 @@ async def on_ready():
 
     logging.info(f"🎯 BNL-01 online as {client.user.name} ({client.user.id})")
     logging.info(f"📡 Monitoring {len(client.guilds)} server(s)")
+    log_admin_controls_connection_check()
 
     await asyncio.to_thread(
         update_website_status,
