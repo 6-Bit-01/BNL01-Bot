@@ -514,6 +514,25 @@ async def generate_dynamic_website_relay(guild_id: int) -> tuple[str, str]:
 
     return mode, sanitize_website_status_message(generated, limit=240)
 
+async def request_fresh_website_relay(guild_id: int, *, force: bool = True) -> tuple[bool, str, str]:
+    """
+    Generate and post a fresh dynamic website relay update.
+    Website only: no Discord post side effects.
+    Returns (success, mode, sanitized_message).
+    """
+    try:
+        mode, relay_message = await generate_dynamic_website_relay(guild_id)
+        sanitized = sanitize_website_status_message(relay_message, limit=240)
+        ok = update_website_status_controlled(mode=mode, message=sanitized, status="ONLINE", force=force)
+        if ok:
+            logging.info(f"✅ Fresh website relay requested successfully (guild {guild_id}, mode {mode}).")
+        else:
+            logging.warning(f"⚠️ Fresh website relay request failed (guild {guild_id}, mode {mode}).")
+        return ok, mode, sanitized
+    except Exception as e:
+        logging.error(f"❌ Fresh website relay request crashed safely (guild {guild_id}): {e}")
+        return False, "OBSERVATION", ""
+
 # ==================== VALIDATION ====================
 
 if GEMINI_API_KEY in ("YOUR_GEMINI_API_KEY_HERE", "PASTE_YOUR_GEMINI_API_KEY_HERE", "", None):
@@ -3219,7 +3238,7 @@ async def showtest(interaction: discord.Interaction, phase: app_commands.Choice[
         return
 
     if phase_key == "relay":
-        mode, website_msg = await generate_dynamic_website_relay(interaction.guild.id)
+        website_ok, mode, website_msg = await request_fresh_website_relay(interaction.guild.id, force=True)
         discord_msg = ""
     else:
         discord_msg, website_msg = await generate_showday_messages(interaction.guild.id, phase_key)
@@ -3229,7 +3248,12 @@ async def showtest(interaction: discord.Interaction, phase: app_commands.Choice[
     logging.info(f"/showtest website bridge target URL: {BNL_STATUS_URL}")
     logging.info(f"/showtest BNL_API_KEY present: {bool(BNL_API_KEY)}")
     logging.info(f"/showtest BNL_API_KEY length: {key_len}")
-    website_ok = update_website_status_controlled(mode=mode, message=website_msg[:240], status="ONLINE", force=True)
+    website_ok = website_ok if phase_key == "relay" else update_website_status_controlled(
+        mode=mode,
+        message=website_msg[:240],
+        status="ONLINE",
+        force=True,
+    )
 
     if phase_key != "relay":
         target_channel = interaction.channel if isinstance(interaction.channel, discord.TextChannel) else None
@@ -3257,8 +3281,8 @@ async def showtest(interaction: discord.Interaction, phase: app_commands.Choice[
             user_msg = f"✅ Show-day test fired for `{phase.value}` (mapped to `{phase_key}`)."
     else:
         user_msg = (
-            f"⚠️ Show-day Discord test fired for `{phase.value}` (mapped to `{phase_key}`), "
-            "but website status update failed."
+            f"⚠️ Show-day {'website relay' if phase_key == 'relay' else 'Discord test'} fired for `{phase.value}` "
+            f"(mapped to `{phase_key}`), but website status update failed."
         )
     warnings = []
     if phase_key == "relay":
