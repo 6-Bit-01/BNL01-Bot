@@ -66,6 +66,11 @@ AMBIENT_AVOID_LAST = 12
 AMBIENT_MAX_CHARS = 280
 AMBIENT_RETRY_ON_SIMILAR = 1
 AMBIENT_FAIL_RESCHEDULE_MINUTES = 30
+AMBIENT_POST_COOLDOWN_MINUTES = 25
+AMBIENT_SIMILARITY_THRESHOLD = 0.75
+AMBIENT_INCOMPLETE_ENDINGS = {
+    "and", "but", "or", "because", "while", "with", "to", "for", "of", "in", "the", "a", "an"
+}
 SHOWDAY_WINDOW_MINUTES = 10
 SHOWDAY_MAX_DISCORD_POSTS_PER_FRIDAY = 2
 SHOWDAY_RECENT_POST_BLOCK_MINUTES = 30
@@ -925,11 +930,17 @@ def init_db():
         CREATE TABLE IF NOT EXISTS ambient_log (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             guild_id INTEGER NOT NULL,
+            channel_id INTEGER,
             message TEXT NOT NULL,
+            source_type TEXT DEFAULT 'ambient',
+            posted_at TEXT,
             timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
         )
         """
     )
+    _try_alter(cursor, "ALTER TABLE ambient_log ADD COLUMN channel_id INTEGER")
+    _try_alter(cursor, "ALTER TABLE ambient_log ADD COLUMN source_type TEXT DEFAULT 'ambient'")
+    _try_alter(cursor, "ALTER TABLE ambient_log ADD COLUMN posted_at TEXT")
 
     cursor.execute(
         """
@@ -1633,29 +1644,74 @@ def update_guild_ambient_times(guild_id: int, last_ambient_message: str, next_am
     conn.commit()
     conn.close()
 
-def log_ambient(guild_id: int, message: str):
+def log_ambient(guild_id: int, channel_id: int, message: str, source_type: str = "ambient"):
+    posted_at = datetime.now(PACIFIC_TZ).isoformat()
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
-    cursor.execute("INSERT INTO ambient_log (guild_id, message) VALUES (?, ?)", (guild_id, message))
+    cursor.execute(
+        "INSERT INTO ambient_log (guild_id, channel_id, message, source_type, posted_at) VALUES (?, ?, ?, ?, ?)",
+        (guild_id, channel_id, message, source_type, posted_at),
+    )
     conn.commit()
     conn.close()
 
-def get_recent_ambient(guild_id: int, limit: int = AMBIENT_AVOID_LAST):
+def get_recent_ambient(guild_id: int, channel_id: int = None, limit: int = AMBIENT_AVOID_LAST):
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    if channel_id is None:
+        cursor.execute(
+            """
+            SELECT message
+            FROM ambient_log
+            WHERE guild_id = ? AND source_type = 'ambient'
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (guild_id, limit),
+        )
+    else:
+        cursor.execute(
+            """
+            SELECT message
+            FROM ambient_log
+            WHERE guild_id = ? AND channel_id = ? AND source_type = 'ambient'
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (guild_id, channel_id, limit),
+        )
+    rows = cursor.fetchall()
+    conn.close()
+    return [r[0] for r in rows]
+
+def get_last_ambient_posted_at(guild_id: int, channel_id: int) -> datetime:
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
     cursor.execute(
         """
-        SELECT message
+        SELECT posted_at, timestamp
         FROM ambient_log
-        WHERE guild_id = ?
+        WHERE guild_id = ? AND channel_id = ? AND source_type = 'ambient'
         ORDER BY id DESC
-        LIMIT ?
+        LIMIT 1
         """,
-        (guild_id, limit),
+        (guild_id, channel_id),
     )
-    rows = cursor.fetchall()
+    row = cursor.fetchone()
     conn.close()
-    return [r[0] for r in rows]
+    if not row:
+        return None
+    for value in row:
+        if not value:
+            continue
+        try:
+            dt = datetime.fromisoformat(value)
+            if dt.tzinfo is None:
+                dt = PACIFIC_TZ.localize(dt)
+            return dt
+        except Exception:
+            continue
+    return None
 
 def get_recent_signal_summary(guild_id: int, limit: int = 14) -> str:
     conn = sqlite3.connect(DB_FILE)
@@ -2556,21 +2612,66 @@ def _sanitize_ambient(text: str) -> str:
     text = trim_ambient_to_complete_sentence(text, AMBIENT_MAX_CHARS)
     return text
 
+def trim_to_complete_sentence(text: str, limit: int) -> str:
+    cleaned = re.sub(r"\s+", " ", (text or "").strip())
+    if not cleaned:
+        return ""
+    if len(cleaned) > limit:
+        cleaned = cleaned[:limit].strip()
+    sentence_end_matches = list(re.finditer(r"[.!?]", cleaned))
+    for match in reversed(sentence_end_matches):
+        candidate = cleaned[:match.end()].strip()
+        if not is_incomplete_ambient_message(candidate):
+            return candidate
+    if not is_incomplete_ambient_message(cleaned):
+        return cleaned
+    return ""
+
+def is_incomplete_ambient_message(text: str) -> bool:
+    cleaned = re.sub(r"\s+", " ", (text or "").strip())
+    if not cleaned:
+        return True
+    if cleaned.endswith("...") or cleaned.endswith("…"):
+        return True
+    if cleaned.endswith(("-", "—", ",", ":", ";")):
+        return True
+    if not re.search(r"[.!?]$", cleaned):
+        return True
+    last_word_match = re.search(r"([a-zA-Z]+)[^a-zA-Z]*$", cleaned.lower())
+    if last_word_match and last_word_match.group(1) in AMBIENT_INCOMPLETE_ENDINGS:
+        return True
+    return False
+
+def _normalize_ambient_text(text: str) -> str:
+    lowered = (text or "").lower()
+    lowered = re.sub(r"[^\w\s]", " ", lowered)
+    lowered = re.sub(r"\s+", " ", lowered).strip()
+    return lowered
+
+def _jaccard_similarity(a: str, b: str) -> float:
+    a_tokens = set(_normalize_ambient_text(a).split())
+    b_tokens = set(_normalize_ambient_text(b).split())
+    if not a_tokens or not b_tokens:
+        return 0.0
+    return float(len(a_tokens & b_tokens)) / float(len(a_tokens | b_tokens))
+
 def _too_similar(candidate: str, previous: list) -> bool:
-    c = (candidate or "").lower().strip()
+    c = _normalize_ambient_text(candidate)
     if not c:
         return True
     for p in previous:
-        p2 = (p or "").lower().strip()
+        p2 = _normalize_ambient_text(p)
         if not p2:
             continue
         if p2 in c or c in p2:
             return True
+        if _jaccard_similarity(c, p2) >= AMBIENT_SIMILARITY_THRESHOLD:
+            return True
     return False
 
-async def generate_dynamic_ambient(guild_id: int) -> str:
+async def generate_dynamic_ambient(guild_id: int, channel_id: int) -> str:
     recent_user = get_recent_guild_user_messages(guild_id, limit=AMBIENT_CONTEXT_MESSAGES)
-    recent_ambient = get_recent_ambient(guild_id, limit=AMBIENT_AVOID_LAST)
+    recent_ambient = get_recent_ambient(guild_id, channel_id=channel_id, limit=AMBIENT_AVOID_LAST)
     curiosity_mode, curiosity_cues = build_dynamic_curiosity_payload(guild_id)
 
     convo_block = "\n".join([f"- {u}: {m}" for (u, m) in recent_user]) if recent_user else "(no recent messages)"
@@ -2614,7 +2715,7 @@ async def generate_dynamic_ambient(guild_id: int) -> str:
         f"{avoid_block}\n"
     )
 
-    result = _sanitize_ambient(await get_gemini_response(prompt, user_id=0, guild_id=guild_id))
+    result = trim_to_complete_sentence(_sanitize_ambient(await get_gemini_response(prompt, user_id=0, guild_id=guild_id)), AMBIENT_MAX_CHARS)
 
     if not result or is_incomplete_ambient_message(result):
         retry_result = _sanitize_ambient(await get_gemini_response(prompt, user_id=0, guild_id=guild_id))
@@ -2627,10 +2728,12 @@ async def generate_dynamic_ambient(guild_id: int) -> str:
         return ""
 
     if _too_similar(result, recent_ambient) and AMBIENT_RETRY_ON_SIMILAR > 0:
+        logging.info(f"📡 Ambient rejected for guild {guild_id}: duplicate/similar to recent history. Retrying once.")
         prompt2 = prompt + "\nRewrite to be clearly different from the avoid list while staying in character.\n"
         result2 = _sanitize_ambient(await get_gemini_response(prompt2, user_id=0, guild_id=guild_id))
         if result2 and not is_incomplete_ambient_message(result2) and not _too_similar(result2, recent_ambient):
             return result2
+        logging.warning(f"⚠️ Ambient skipped after failed retry for guild {guild_id} (duplicate/similar).")
         return ""
 
     return result
@@ -2645,6 +2748,7 @@ intents.members = True
 
 client = discord.Client(intents=intents)
 tree = app_commands.CommandTree(client)
+_ambient_post_locks = {}
 
 # ==================== AMBIENT MESSAGE TASK ====================
 
@@ -2680,20 +2784,47 @@ async def ambient_message_task():
                     update_guild_ambient_times(guild_id, last_msg or "", _random_time_today_pacific().isoformat())
                     continue
 
-                msg = await generate_dynamic_ambient(guild_id)
+                lock_key = str(guild_id)
+                if lock_key not in _ambient_post_locks:
+                    _ambient_post_locks[lock_key] = asyncio.Lock()
+                async with _ambient_post_locks[lock_key]:
+                    last_posted_at = get_last_ambient_posted_at(guild_id, channel_id)
+                    if last_posted_at and (now - last_posted_at) < timedelta(minutes=AMBIENT_POST_COOLDOWN_MINUTES):
+                        logging.info(f"📡 Ambient skipped for guild {guild_id}: recent post exists in cooldown window.")
+                        next_scheduled = (last_posted_at + timedelta(minutes=AMBIENT_POST_COOLDOWN_MINUTES)).isoformat()
+                        update_guild_ambient_times(guild_id, last_msg or "", next_scheduled)
+                        logging.info(f"📡 Next ambient scheduled for guild {guild_id} at {next_scheduled}")
+                        continue
 
-                # No canned fallback: if generation fails, do not post; reschedule soon
-                if not msg:
-                    logging.warning(f"⚠️ Ambient generation failed for guild {guild_id}; rescheduling soon.")
-                    _reschedule_ambient_soon(guild_id, last_msg or "")
-                    continue
+                    logging.info(f"📡 Ambient generation started for guild {guild_id}")
+                    msg = await generate_dynamic_ambient(guild_id, channel_id)
 
-                await channel.send(msg)
-                log_ambient(guild_id, msg)
+                    if msg and is_incomplete_ambient_message(msg):
+                        logging.info(f"📡 Ambient rejected for guild {guild_id}: incomplete message. Retrying once.")
+                        retry_msg = await generate_dynamic_ambient(guild_id, channel_id)
+                        if retry_msg and not is_incomplete_ambient_message(retry_msg):
+                            msg = retry_msg
+                            logging.info(f"📡 Ambient retry succeeded for guild {guild_id} after incomplete rejection.")
+                        else:
+                            logging.warning(f"⚠️ Ambient skipped after failed retry for guild {guild_id} (incomplete).")
+                            _reschedule_ambient_soon(guild_id, last_msg or "")
+                            logging.info(f"📡 Next ambient scheduled for guild {guild_id}")
+                            continue
 
-                next_scheduled = _random_time_today_pacific().isoformat()
-                update_guild_ambient_times(guild_id, msg, next_scheduled)
-                logging.info(f"📡 Ambient posted in guild {guild_id} (next at {next_scheduled})")
+                    # No canned fallback: if generation fails, do not post; reschedule soon
+                    if not msg:
+                        logging.warning(f"⚠️ Ambient generation failed for guild {guild_id}; rescheduling soon.")
+                        _reschedule_ambient_soon(guild_id, last_msg or "")
+                        logging.info(f"📡 Next ambient scheduled for guild {guild_id}")
+                        continue
+
+                    await channel.send(msg)
+                    log_ambient(guild_id, channel_id, msg, source_type="ambient")
+
+                    next_scheduled = _random_time_today_pacific().isoformat()
+                    update_guild_ambient_times(guild_id, msg, next_scheduled)
+                    logging.info(f"📡 Ambient posted successfully in guild {guild_id}")
+                    logging.info(f"📡 Next ambient scheduled for guild {guild_id} at {next_scheduled}")
 
     except Exception as e:
         logging.error(f"❌ Error in ambient message task: {e}")
@@ -2795,7 +2926,7 @@ async def barcode_radio_queue_task():
                 continue
             channel_id = get_guild_config(guild.id)
             channel = guild.get_channel(channel_id) if channel_id else None
-            last_ambient = (get_recent_ambient(guild.id, limit=1) or [""])[0]
+            last_ambient = (get_recent_ambient(guild.id, channel_id=channel_id, limit=1) or [""])[0]
             discord_msg, website_msg = await generate_showday_messages(guild.id, phase_key)
             if last_ambient and discord_msg.strip().lower() == last_ambient.strip().lower():
                 discord_msg = _pick_varied_fallback(phase_key, avoid=discord_msg)[:320]
@@ -2824,7 +2955,7 @@ async def barcode_radio_queue_task():
                 try:
                     await channel.send(discord_msg)
                     discord_sent = discord_msg
-                    log_ambient(guild.id, discord_msg)
+                    log_ambient(guild.id, channel.id, discord_msg, source_type="showday")
                 except Exception as e:
                     logging.error(f"Show-day Discord update failed (guild {guild.id}, {phase_key}): {e}")
             mode = "RESTRICTED" if phase_key == "sponsor_window" else "ACTIVE_LIAISON"
@@ -3595,7 +3726,7 @@ async def showtest(interaction: discord.Interaction, phase: app_commands.Choice[
         if target_channel:
             try:
                 await target_channel.send(discord_msg)
-                log_ambient(interaction.guild.id, discord_msg)
+                log_ambient(interaction.guild.id, interaction.channel_id, discord_msg, source_type="showday")
             except Exception as e:
                 logging.error(f"Show-test Discord update failed (guild {interaction.guild.id}, {phase_key}): {e}")
                 await interaction.followup.send(
