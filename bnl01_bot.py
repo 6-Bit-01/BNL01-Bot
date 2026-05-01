@@ -2491,6 +2491,61 @@ async def get_gemini_response(prompt: str, user_id: int, guild_id: int):
 
 # ==================== DYNAMIC AMBIENT GENERATION ====================
 
+def trim_ambient_to_complete_sentence(text: str, limit: int) -> str:
+    text = (text or "").strip()
+    if not text:
+        return ""
+    if len(text) <= limit:
+        return text
+
+    truncated = text[:limit].strip()
+    if not truncated:
+        return ""
+
+    sentence_end = max(truncated.rfind("."), truncated.rfind("!"), truncated.rfind("?"))
+    if sentence_end != -1:
+        return truncated[:sentence_end + 1].strip()
+
+    split_idx = max(truncated.rfind(","), truncated.rfind(";"), truncated.rfind(":"))
+    if split_idx == -1:
+        return ""
+
+    candidate = truncated[:split_idx].strip()
+    if not candidate:
+        return ""
+
+    tail = candidate.split()[-1].lower() if candidate.split() else ""
+    connectors = {
+        "and", "but", "or", "because", "while", "with", "to", "for", "of", "in", "the", "a", "an"
+    }
+    if tail in connectors:
+        return ""
+    return candidate
+
+
+def is_incomplete_ambient_message(text: str) -> bool:
+    cleaned = (text or "").strip()
+    if not cleaned:
+        return True
+
+    lowered = cleaned.lower()
+    if lowered.endswith("...") or cleaned.endswith("…"):
+        return True
+
+    if cleaned.endswith(("-", "—", ",", ":", ";")):
+        return True
+
+    tokens = re.findall(r"[a-zA-Z']+", lowered)
+    if not tokens:
+        return False
+
+    tail = tokens[-1]
+    connectors = {
+        "and", "but", "or", "because", "while", "with", "to", "for", "of", "in", "the", "a", "an"
+    }
+    return tail in connectors
+
+
 def _sanitize_ambient(text: str) -> str:
     if not text:
         return ""
@@ -2498,8 +2553,7 @@ def _sanitize_ambient(text: str) -> str:
     text = text.replace("```", "").strip()
     text = re.sub(r"\s+", " ", text).strip()
     text = text.replace("@everyone", "everyone").replace("@here", "here")
-    if len(text) > AMBIENT_MAX_CHARS:
-        text = text[:AMBIENT_MAX_CHARS].rsplit(" ", 1)[0].strip() + "…"
+    text = trim_ambient_to_complete_sentence(text, AMBIENT_MAX_CHARS)
     return text
 
 def _too_similar(candidate: str, previous: list) -> bool:
@@ -2562,13 +2616,20 @@ async def generate_dynamic_ambient(guild_id: int) -> str:
 
     result = _sanitize_ambient(await get_gemini_response(prompt, user_id=0, guild_id=guild_id))
 
-    if not result or len(result) < 10:
+    if not result or is_incomplete_ambient_message(result):
+        retry_result = _sanitize_ambient(await get_gemini_response(prompt, user_id=0, guild_id=guild_id))
+        if not retry_result or is_incomplete_ambient_message(retry_result):
+            logging.warning("Ambient skipped after incomplete retry")
+            return ""
+        result = retry_result
+
+    if len(result) < 10:
         return ""
 
     if _too_similar(result, recent_ambient) and AMBIENT_RETRY_ON_SIMILAR > 0:
         prompt2 = prompt + "\nRewrite to be clearly different from the avoid list while staying in character.\n"
         result2 = _sanitize_ambient(await get_gemini_response(prompt2, user_id=0, guild_id=guild_id))
-        if result2 and not _too_similar(result2, recent_ambient):
+        if result2 and not is_incomplete_ambient_message(result2) and not _too_similar(result2, recent_ambient):
             return result2
         return ""
 
