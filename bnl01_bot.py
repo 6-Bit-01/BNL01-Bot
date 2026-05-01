@@ -120,7 +120,26 @@ def sanitize_website_status_message(message: str, limit: int = 240) -> str:
     return cleaned[:limit]
 
 
-def update_website_status(status: str, mode: str, message: str, current_directive: str = "", source: str = "relay") -> bool:
+def build_admin_note(mode: str, message: str, current_directive: str = "", source: str = "relay", compact: bool = False) -> str:
+    """Build a compact admin-only operator note for website relay payloads."""
+    msg = sanitize_website_status_message(message, limit=240)
+    directive = sanitize_website_status_message(current_directive, limit=160)
+    summary = msg[:120] if msg else "No public relay text was generated."
+    if compact:
+        return sanitize_website_status_message(
+            f"Likely meaning: this reads as {mode.lower().replace('_', ' ')} activity. Friction risk: visitors may read it as atmospheric rather than specific. Action: {directive or 'review latest Discord context only if updates look repetitive.'}",
+            limit=220,
+        )
+    bullets = [
+        f"- Plain read: mode `{mode}` indicates active monitoring, not an outage or hard incident.",
+        f"- Public line shown: \"{summary}\"",
+        "- Friction: wording is intentionally atmospheric; confirm it still maps to current Discord traffic.",
+        f"- Suggested action: {directive or 'If context changed quickly, run one more force-pull for a fresher snapshot.'}",
+    ]
+    return sanitize_website_status_message("\n".join(bullets), limit=300)
+
+
+def update_website_status(status: str, mode: str, message: str, current_directive: str = "", source: str = "relay", admin_note: str = "") -> bool:
     """
     Send BNL-01 status to the BARCODE Network website bridge.
     Returns True on success, False on failure or when not configured.
@@ -132,6 +151,9 @@ def update_website_status(status: str, mode: str, message: str, current_directiv
     sanitized_message = sanitize_website_status_message(message, limit=240)
     sanitized_directive = sanitize_website_status_message(current_directive, limit=160)
     payload = {"status": status, "mode": mode, "message": sanitized_message, "currentDirective": sanitized_directive, "source": (source or "relay")[:32]}
+    sanitized_admin_note = (admin_note or "").strip()
+    if sanitized_admin_note:
+        payload["adminNote"] = sanitized_admin_note[:300]
     logging.info(
         f"🌐 Website status push attempt source={source} mode={mode} endpoint={BNL_STATUS_URL} "
         f"message_preview={sanitized_message[:120]!r}"
@@ -401,7 +423,7 @@ def get_bnl_control_flags(force_refresh: bool = False) -> dict:
     _bnl_control_flags_last_source_url = None
     return defaults
 
-def update_website_status_controlled(mode: str, message: str, status: str = "ONLINE", force: bool = False, current_directive: str = "", source: str = "relay") -> bool:
+def update_website_status_controlled(mode: str, message: str, status: str = "ONLINE", force: bool = False, current_directive: str = "", source: str = "relay", admin_note: str = "") -> bool:
     global _last_website_status_mode, _last_website_status_message, _last_website_directive, _last_website_status_at, _missing_status_key_warned
 
     now = datetime.now(PACIFIC_TZ)
@@ -432,7 +454,14 @@ def update_website_status_controlled(mode: str, message: str, status: str = "ONL
             return True
 
     try:
-        ok = update_website_status(status=status, mode=mode, message=sanitized_message, current_directive=sanitized_directive, source=source)
+        ok = update_website_status(
+            status=status,
+            mode=mode,
+            message=sanitized_message,
+            current_directive=sanitized_directive,
+            source=source,
+            admin_note=admin_note,
+        )
         if not ok:
             return False
         _last_website_status_mode = mode
@@ -474,19 +503,19 @@ RESTRICTED_MARKERS = (
 )
 GLITCH_MARKERS = ("glitch", "bug", "error", "broken", "weird", "corrupt", "crash", "distort", "artifact")
 RELAY_DIRECTIVE_FALLBACKS = [
-    "Monitoring Discord-side relay traffic.",
-    "Observing community signal density.",
-    "Classifying pre-broadcast submission pressure.",
-    "Indexing BARCODE Radio chatter for useful patterns.",
-    "Tracking sponsor-window compliance.",
+    "Maintaining receiver alignment across the public access corridor.",
+    "Scanning the outer channel for stable host signal patterns.",
+    "Holding the listening window while the submission corridor stays open.",
+    "Watching signal drift through the transmission corridor.",
+    "Calibrating signal layers for cross-band interference.",
 ]
 
 RELAY_FALLBACKS = [
-    "Monitoring cycle active. Discord traffic is coherent and the archive remains orderly.",
-    "Relay corridor is quiet but live; pattern watch remains in effect.",
-    "Observation window open. No anomalies worth escalation yet.",
-    "BNL-01 continues passive surveillance. Signal posture remains stable.",
-    "Routine scan complete. Community cadence is readable and controlled.",
+    "Interdimensional broadcast is active; the public access corridor is open and stable.",
+    "Outer channel remains live with low signal drift across the transmission corridor.",
+    "Host signal is present in this layer; listening window remains aligned for visitors.",
+    "Broadcast aperture is open and readable; cross-band interference is currently light.",
+    "Submission corridor is active with steady receiver alignment on the public layer.",
 ]
 
 STALE_RELAY_PHRASES = (
@@ -632,6 +661,11 @@ async def generate_dynamic_website_relay(guild_id: int) -> tuple[str, str, str]:
             "Avoid stale phrases and concepts: submission pressure, short-burst chatter, archive buffer, signal activity high, "
             "community signal activity, engagement metrics, across all channels, broadcast-side movement.\n"
             "Keep it short: 1-3 sentences.\n"
+            "Public relay style: mysterious interdimensional broadcast station language; clear that something is active.\n"
+            "Use terms like interdimensional broadcast, outer channel, signal layer, transmission corridor, host signal, listening window, public access corridor, submission corridor, cross-band interference, broadcast aperture, signal drift, receiver alignment.\n"
+            "Avoid cheesy disaster language like containment breach, red alert, multiverse collapse, emergency protocol, catastrophic anomaly.\n"
+            "Do not include admin/operator advice in line 1.\n"
+            "Line 2 should be short and atmospheric, not analytical.\n"
             "Tone: concise corporate, lightly sinister, signal-analysis.\n"
             "Do not invent concrete new canon events, releases, sponsors, incidents, characters, or secrets.\n"
             "Keep lore abstract if used. Do not mention 9 Bit unless context includes it.\n"
@@ -698,7 +732,16 @@ async def request_fresh_website_relay(guild_id: int, *, force: bool = True) -> t
         mode, relay_message, directive = await generate_dynamic_website_relay(target_guild_id)
         sanitized = sanitize_website_status_message(relay_message, limit=240)
         sanitized_directive = sanitize_website_status_message(directive, limit=160)
-        ok = update_website_status_controlled(mode=mode, message=sanitized, status="ONLINE", force=force, current_directive=sanitized_directive, source="relay")
+        admin_note = build_admin_note(mode=mode, message=sanitized, current_directive=sanitized_directive, source="relay", compact=not force) if force else ""
+        ok = update_website_status_controlled(
+            mode=mode,
+            message=sanitized,
+            status="ONLINE",
+            force=force,
+            current_directive=sanitized_directive,
+            source="relay",
+            admin_note=admin_note,
+        )
         if ok:
             logging.info(f"✅ Fresh website relay requested successfully (guild {target_guild_id}, mode {mode}).")
         else:
@@ -738,6 +781,7 @@ async def _handle_force_pull(request: web.Request) -> web.Response:
             force=True,
             current_directive=directive,
             source="forcePull",
+            admin_note=build_admin_note(mode=mode, message=relay_message, current_directive=directive, source="forcePull"),
         )
         if ok:
             logging.info("Force-pull relay update succeeded")
