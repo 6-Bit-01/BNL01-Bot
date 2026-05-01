@@ -95,7 +95,7 @@ MAX_CONVERSATION_ROWS_PER_USER = 260
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 WEBSITE_STATUS_LABEL_RE = re.compile(
-    r"^\s*(?:\*\*|__)?\s*(?:website\s+status|website\s+message|discord\s+message|status)\s*:\s*(?:\*\*|__)?\s*",
+    r"^\s*(?:\*\*|__)?\s*(?:website\s+status|website\s+message|discord\s+message|current\s+directive|directive|relay|status)\s*:\s*(?:\*\*|__)?\s*",
     re.IGNORECASE,
 )
 
@@ -111,7 +111,7 @@ def sanitize_website_status_message(message: str, limit: int = 240) -> str:
     return cleaned[:limit]
 
 
-def update_website_status(status: str, mode: str, message: str) -> bool:
+def update_website_status(status: str, mode: str, message: str, current_directive: str = "", source: str = "relay") -> bool:
     """
     Send BNL-01 status to the BARCODE Network website bridge.
     Returns True on success, False on failure or when not configured.
@@ -121,7 +121,8 @@ def update_website_status(status: str, mode: str, message: str) -> bool:
         return False
 
     sanitized_message = sanitize_website_status_message(message, limit=240)
-    payload = {"status": status, "mode": mode, "message": sanitized_message}
+    sanitized_directive = sanitize_website_status_message(current_directive, limit=160)
+    payload = {"status": status, "mode": mode, "message": sanitized_message, "currentDirective": sanitized_directive, "source": (source or "relay")[:32]}
     data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(
         BNL_STATUS_URL,
@@ -273,6 +274,7 @@ You are BNL-01. The BARCODE Network is watching. You are functioning as intended
 STATUS_UPDATE_COOLDOWN_SECONDS = 300
 _last_website_status_mode = None
 _last_website_status_message = None
+_last_website_directive = None
 _last_website_status_at = None
 _missing_status_key_warned = False
 BNL_CONTROL_FLAGS_TTL_SECONDS = 60
@@ -369,8 +371,8 @@ def get_bnl_control_flags(force_refresh: bool = False) -> dict:
     _bnl_control_flags_cached_at = now
     return defaults
 
-def update_website_status_controlled(mode: str, message: str, status: str = "ONLINE", force: bool = False) -> bool:
-    global _last_website_status_mode, _last_website_status_message, _last_website_status_at, _missing_status_key_warned
+def update_website_status_controlled(mode: str, message: str, status: str = "ONLINE", force: bool = False, current_directive: str = "", source: str = "relay") -> bool:
+    global _last_website_status_mode, _last_website_status_message, _last_website_directive, _last_website_status_at, _missing_status_key_warned
 
     now = datetime.now(PACIFIC_TZ)
     if not BNL_API_KEY:
@@ -384,7 +386,8 @@ def update_website_status_controlled(mode: str, message: str, status: str = "ONL
         return False
 
     sanitized_message = sanitize_website_status_message(message, limit=240)
-    same_payload = (_last_website_status_mode == mode and _last_website_status_message == sanitized_message)
+    sanitized_directive = sanitize_website_status_message(current_directive, limit=160)
+    same_payload = (_last_website_status_mode == mode and _last_website_status_message == sanitized_message and _last_website_directive == sanitized_directive)
     if same_payload and not force:
         return True
 
@@ -394,11 +397,12 @@ def update_website_status_controlled(mode: str, message: str, status: str = "ONL
             return True
 
     try:
-        ok = update_website_status(status=status, mode=mode, message=sanitized_message)
+        ok = update_website_status(status=status, mode=mode, message=sanitized_message, current_directive=sanitized_directive, source=source)
         if not ok:
             return False
         _last_website_status_mode = mode
         _last_website_status_message = sanitized_message
+        _last_website_directive = sanitized_directive
         _last_website_status_at = now
         logging.info(f"🌐 Website status updated: {mode}")
         return True
@@ -434,6 +438,14 @@ RESTRICTED_MARKERS = (
     "financial advice", "medical advice", "legal advice", "moderate this", "ban user", "kick user",
 )
 GLITCH_MARKERS = ("glitch", "bug", "error", "broken", "weird", "corrupt", "crash", "distort", "artifact")
+RELAY_DIRECTIVE_FALLBACKS = [
+    "Monitoring Discord-side relay traffic.",
+    "Observing community signal density.",
+    "Classifying pre-broadcast submission pressure.",
+    "Indexing BARCODE Radio chatter for useful patterns.",
+    "Tracking sponsor-window compliance.",
+]
+
 RELAY_FALLBACKS = [
     "Network observation: Discord-side traffic is stable; archive fragments continue to accumulate.",
     "Relay noise elevated. Community chatter remains coherent within broadcast layer tolerances.",
@@ -465,7 +477,7 @@ def _pick_varied_relay_fallback(avoid: str = "") -> str:
     return options[0] if options else "Network observation remains active."
 
 
-async def generate_dynamic_website_relay(guild_id: int) -> tuple[str, str]:
+async def generate_dynamic_website_relay(guild_id: int) -> tuple[str, str, str]:
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
     cursor.execute(
@@ -489,7 +501,10 @@ async def generate_dynamic_website_relay(guild_id: int) -> tuple[str, str]:
     if GEMINI_API_KEY:
         prompt = (
             "You are BNL-01 generating a website-only relay ticker line.\n"
-            "Return one plain-text line under 240 chars. No markdown.\n"
+            "Return exactly two plain-text lines.\n"
+            "Line 1: message under 240 chars.\n"
+            "Line 2: current directive under 160 chars.\n"
+            "No markdown labels.\n"
             "Do not quote users, no usernames, no private details.\n"
             "Preferred vocabulary: signal activity, community chatter, submission pressure, relay noise, "
             "broadcast-side movement, archive fragments, Discord-side traffic.\n"
@@ -499,39 +514,53 @@ async def generate_dynamic_website_relay(guild_id: int) -> tuple[str, str]:
             f"Mode: {mode}.\n"
             f"Context summary: {signal_summary or 'limited Discord-side traffic'}.\n"
         )
-        generated = sanitize_website_status_message(
-            await get_gemini_response(prompt, user_id=0, guild_id=guild_id) or "",
-            limit=240,
-        )
+        generated = await get_gemini_response(prompt, user_id=0, guild_id=guild_id) or ""
     else:
         generated = ""
 
-    if not generated:
-        generated = _pick_varied_relay_fallback(_last_website_status_message)
+    relay_message = ""
+    current_directive = ""
+    if generated:
+        lines = [ln.strip() for ln in generated.splitlines() if ln.strip()]
+        if lines:
+            relay_message = sanitize_website_status_message(lines[0], limit=240)
+        if len(lines) > 1:
+            current_directive = sanitize_website_status_message(lines[1], limit=160)
 
-    if generated.strip().lower() == (_last_website_status_message or "").strip().lower():
-        generated = _pick_varied_relay_fallback(generated)
+    if not relay_message:
+        relay_message = _pick_varied_relay_fallback(_last_website_status_message)
+    if not current_directive:
+        current_directive = random.choice(RELAY_DIRECTIVE_FALLBACKS)
 
-    return mode, sanitize_website_status_message(generated, limit=240)
+    if relay_message.strip().lower() == (_last_website_status_message or "").strip().lower():
+        relay_message = _pick_varied_relay_fallback(relay_message)
 
-async def request_fresh_website_relay(guild_id: int, *, force: bool = True) -> tuple[bool, str, str]:
+    if current_directive.strip().lower() == (_last_website_directive or "").strip().lower():
+        options = [d for d in RELAY_DIRECTIVE_FALLBACKS if d.strip().lower() != (_last_website_directive or "").strip().lower()]
+        if options:
+            current_directive = random.choice(options)
+
+    return mode, sanitize_website_status_message(relay_message, limit=240), sanitize_website_status_message(current_directive, limit=160)
+
+async def request_fresh_website_relay(guild_id: int, *, force: bool = True) -> tuple[bool, str, str, str]:
     """
     Generate and post a fresh dynamic website relay update.
     Website only: no Discord post side effects.
     Returns (success, mode, sanitized_message).
     """
     try:
-        mode, relay_message = await generate_dynamic_website_relay(guild_id)
+        mode, relay_message, directive = await generate_dynamic_website_relay(guild_id)
         sanitized = sanitize_website_status_message(relay_message, limit=240)
-        ok = update_website_status_controlled(mode=mode, message=sanitized, status="ONLINE", force=force)
+        sanitized_directive = sanitize_website_status_message(directive, limit=160)
+        ok = update_website_status_controlled(mode=mode, message=sanitized, status="ONLINE", force=force, current_directive=sanitized_directive, source="relay")
         if ok:
             logging.info(f"✅ Fresh website relay requested successfully (guild {guild_id}, mode {mode}).")
         else:
             logging.warning(f"⚠️ Fresh website relay request failed (guild {guild_id}, mode {mode}).")
-        return ok, mode, sanitized
+        return ok, mode, sanitized, sanitized_directive
     except Exception as e:
         logging.error(f"❌ Fresh website relay request crashed safely (guild {guild_id}): {e}")
-        return False, "OBSERVATION", ""
+        return False, "OBSERVATION", "", ""
 
 # ==================== VALIDATION ====================
 
@@ -2556,8 +2585,8 @@ async def website_relay_task():
         active_channel_id = get_guild_config(guild.id)
         if not active_channel_id:
             continue
-        mode, relay_message = await generate_dynamic_website_relay(guild.id)
-        update_website_status_controlled(mode=mode, message=relay_message, status="ONLINE")
+        mode, relay_message, directive = await generate_dynamic_website_relay(guild.id)
+        update_website_status_controlled(mode=mode, message=relay_message, status="ONLINE", current_directive=directive, source="relay")
 
 # ==================== BATCHED REPLY SYSTEM (ACTIVE CHANNEL ONLY) ====================
 
@@ -2721,7 +2750,9 @@ async def on_ready():
         update_website_status,
         "ONLINE",
         "OBSERVATION",
-        "BNL-01 relay established. Discord-side signal monitoring active."
+        "BNL-01 relay established. Discord-side signal monitoring active.",
+        "Monitoring Discord-side relay traffic.",
+        "relay"
     )
 
     for g in client.guilds:
@@ -2735,6 +2766,8 @@ async def on_ready():
         message="BNL-01 relay established. Discord-side signal monitoring active.",
         status="ONLINE",
         force=True,
+        current_directive="Monitoring Discord-side relay traffic.",
+        source="relay",
     )
 
 def build_user_aware_prompt(
@@ -3238,10 +3271,11 @@ async def showtest(interaction: discord.Interaction, phase: app_commands.Choice[
         return
 
     if phase_key == "relay":
-        website_ok, mode, website_msg = await request_fresh_website_relay(interaction.guild.id, force=True)
+        website_ok, mode, website_msg, website_directive = await request_fresh_website_relay(interaction.guild.id, force=True)
         discord_msg = ""
     else:
         discord_msg, website_msg = await generate_showday_messages(interaction.guild.id, phase_key)
+        website_directive = ""
         mode = "RESTRICTED" if phase_key == "sponsor_window" else "ACTIVE_LIAISON"
     flags = get_bnl_control_flags()
     key_len = len(BNL_API_KEY) if BNL_API_KEY else 0
@@ -3253,6 +3287,7 @@ async def showtest(interaction: discord.Interaction, phase: app_commands.Choice[
         message=website_msg[:240],
         status="ONLINE",
         force=True,
+        source="relay",
     )
 
     if phase_key != "relay":
@@ -3276,7 +3311,7 @@ async def showtest(interaction: discord.Interaction, phase: app_commands.Choice[
 
     if website_ok:
         if phase_key == "relay":
-            user_msg = f"✅ Website relay test fired for `{phase.value}` with mode `{mode}`."
+            user_msg = f"✅ Website relay test fired for `{phase.value}` with mode `{mode}` and directive `{website_directive[:80]}`."
         else:
             user_msg = f"✅ Show-day test fired for `{phase.value}` (mapped to `{phase_key}`)."
     else:
