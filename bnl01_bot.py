@@ -26,6 +26,7 @@ from datetime import datetime, timedelta
 
 import pytz
 import discord
+from aiohttp import web
 from discord import app_commands
 from discord.ext import tasks
 from google import genai
@@ -43,6 +44,8 @@ BNL_STATUS_URL = os.getenv("BNL_STATUS_URL")
 BNL_WEBSITE_RELAY_ENABLED = os.getenv("BNL_WEBSITE_RELAY_ENABLED", "true").strip().lower() not in {"false", "0", "off"}
 BNL_WEBSITE_RELAY_INTERVAL_MINUTES = max(1, int(os.getenv("BNL_WEBSITE_RELAY_INTERVAL_MINUTES", "20")))
 BNL_PRIMARY_GUILD_ID = int(os.getenv("BNL_PRIMARY_GUILD_ID", "0") or 0)
+BNL_FORCE_PULL_SHARED_SECRET = os.getenv("BNL_FORCE_PULL_SHARED_SECRET", "").strip()
+BNL_FORCE_PULL_PORT = int(os.getenv("BNL_FORCE_PULL_PORT", "8787") or 8787)
 
 DAILY_TOKEN_LIMIT = 1_350_000
 PACIFIC_TZ = pytz.timezone("US/Pacific")
@@ -492,6 +495,7 @@ STALE_RELAY_PHRASES = (
     "broadcast-side movement",
 )
 _recent_relay_messages: dict[int, list[str]] = {}
+force_pull_runner = None
 
 
 def _website_relay_mode_from_context(messages: list[str], now_pt: datetime) -> str:
@@ -698,6 +702,59 @@ async def request_fresh_website_relay(guild_id: int, *, force: bool = True) -> t
     except Exception as e:
         logging.error(f"❌ Fresh website relay request crashed safely (guild {guild_id}): {e}")
         return False, "OBSERVATION", "", ""
+
+
+def _resolve_force_pull_guild() -> int | None:
+    if BNL_PRIMARY_GUILD_ID:
+        return BNL_PRIMARY_GUILD_ID
+    if client.guilds:
+        return client.guilds[0].id
+    return None
+
+
+async def _handle_force_pull(request: web.Request) -> web.Response:
+    if BNL_FORCE_PULL_SHARED_SECRET:
+        provided_secret = (request.headers.get("x-bnl-secret") or "").strip()
+        if provided_secret != BNL_FORCE_PULL_SHARED_SECRET:
+            logging.warning("Invalid force-pull secret rejected")
+            return web.json_response({"ok": False, "error": "unauthorized"}, status=401)
+
+    guild_id = _resolve_force_pull_guild()
+    if not guild_id:
+        return web.json_response({"ok": False, "error": "no_guild_available"}, status=503)
+
+    logging.info("Force-pull received")
+    try:
+        mode, relay_message, directive = await generate_dynamic_website_relay(guild_id)
+        ok = update_website_status_controlled(
+            mode=mode,
+            message=relay_message,
+            status="ONLINE",
+            force=True,
+            current_directive=directive,
+            source="forcePull",
+        )
+        if ok:
+            logging.info("Force-pull relay update succeeded")
+            return web.json_response({"ok": True, "mode": mode, "message": relay_message, "directive": directive})
+        logging.warning("Force-pull relay update failed")
+        return web.json_response({"ok": False, "error": "relay_update_failed"}, status=502)
+    except Exception as e:
+        logging.error(f"Force-pull relay update failed: {e}")
+        return web.json_response({"ok": False, "error": "internal_error"}, status=500)
+
+
+async def start_force_pull_listener():
+    global force_pull_runner
+    if force_pull_runner is not None:
+        return
+    app = web.Application()
+    app.router.add_post("/force-pull", _handle_force_pull)
+    force_pull_runner = web.AppRunner(app)
+    await force_pull_runner.setup()
+    site = web.TCPSite(force_pull_runner, host="0.0.0.0", port=BNL_FORCE_PULL_PORT)
+    await site.start()
+    logging.info(f"Force-pull webhook listening on port {BNL_FORCE_PULL_PORT}")
 
 # ==================== VALIDATION ====================
 
@@ -2525,7 +2582,17 @@ intents.message_content = True
 intents.guilds = True
 intents.members = True
 
-client = discord.Client(intents=intents)
+class BNLClient(discord.Client):
+    async def setup_hook(self):
+        # Start webhook listener early in startup so it is available
+        # even before Discord emits READY.
+        try:
+            await start_force_pull_listener()
+        except Exception as e:
+            logging.error(f"Failed to start force-pull webhook listener during setup: {e}")
+
+
+client = BNLClient(intents=intents)
 tree = app_commands.CommandTree(client)
 
 # ==================== AMBIENT MESSAGE TASK ====================
@@ -2899,6 +2966,7 @@ def log_admin_controls_connection_check():
 @client.event
 async def on_ready():
     init_db()
+    await start_force_pull_listener()
 
     try:
         synced = await tree.sync()
