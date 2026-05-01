@@ -329,6 +329,19 @@ def get_bnl_control_flags(force_refresh: bool = False) -> dict:
         if age < BNL_CONTROL_FLAGS_TTL_SECONDS:
             return _bnl_control_flags_cache
 
+    def _coerce_flag(value, fallback: bool) -> bool:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return value != 0
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in {"true", "1", "yes", "on", "enabled"}:
+                return True
+            if normalized in {"false", "0", "no", "off", "disabled"}:
+                return False
+        return fallback
+
     for url in _build_bnl_control_flag_urls():
         headers = {"Accept": "application/json"}
         if BNL_API_KEY:
@@ -342,9 +355,9 @@ def get_bnl_control_flags(force_refresh: bool = False) -> dict:
                 body = response.read().decode("utf-8", errors="replace")
                 data = json.loads(body) if body else {}
                 flags = {
-                    "websiteRelayEnabled": bool(data.get("websiteRelayEnabled", defaults["websiteRelayEnabled"])),
-                    "heartbeatEnabled": bool(data.get("heartbeatEnabled", defaults["heartbeatEnabled"])),
-                    "showdayDiscordPostsEnabled": bool(data.get("showdayDiscordPostsEnabled", defaults["showdayDiscordPostsEnabled"])),
+                    "websiteRelayEnabled": _coerce_flag(data.get("websiteRelayEnabled"), defaults["websiteRelayEnabled"]),
+                    "heartbeatEnabled": _coerce_flag(data.get("heartbeatEnabled"), defaults["heartbeatEnabled"]),
+                    "showdayDiscordPostsEnabled": _coerce_flag(data.get("showdayDiscordPostsEnabled"), defaults["showdayDiscordPostsEnabled"]),
                 }
                 _bnl_control_flags_cache = flags
                 _bnl_control_flags_cached_at = now
