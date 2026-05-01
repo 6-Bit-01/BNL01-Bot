@@ -447,12 +447,24 @@ RELAY_DIRECTIVE_FALLBACKS = [
 ]
 
 RELAY_FALLBACKS = [
-    "Network observation: Discord-side traffic is stable; archive fragments continue to accumulate.",
-    "Relay noise elevated. Community chatter remains coherent within broadcast layer tolerances.",
-    "Signal activity detected across the liaison corridor. Submission pressure is trending upward.",
-    "Broadcast-side movement registered. Containment chatter remains procedural.",
-    "Archive pressure nominal. Discord-side traffic shows intermittent packet clustering.",
+    "Monitoring cycle active. Discord traffic is coherent and the archive remains orderly.",
+    "Relay corridor is quiet but live; pattern watch remains in effect.",
+    "Observation window open. No anomalies worth escalation yet.",
+    "BNL-01 continues passive surveillance. Signal posture remains stable.",
+    "Routine scan complete. Community cadence is readable and controlled.",
 ]
+
+STALE_RELAY_PHRASES = (
+    "submission pressure",
+    "short-burst chatter",
+    "archive buffer",
+    "signal activity high",
+    "community signal activity",
+    "engagement metrics",
+    "across all channels",
+    "broadcast-side movement",
+)
+_recent_relay_messages: dict[int, list[str]] = {}
 
 
 def _website_relay_mode_from_context(messages: list[str], now_pt: datetime) -> str:
@@ -477,6 +489,74 @@ def _pick_varied_relay_fallback(avoid: str = "") -> str:
     return options[0] if options else "Network observation remains active."
 
 
+def _contains_stale_phrase(text: str) -> bool:
+    lowered = (text or "").lower()
+    return any(p in lowered for p in STALE_RELAY_PHRASES)
+
+
+def _normalize_for_repeat(text: str) -> str:
+    return re.sub(r"\s+", " ", (text or "").strip().lower())
+
+
+def _is_repetitive_relay(guild_id: int, message: str) -> bool:
+    normalized = _normalize_for_repeat(message)
+    if not normalized:
+        return True
+    recent = _recent_relay_messages.get(guild_id, [])
+    if normalized in recent:
+        return True
+    return False
+
+
+def _remember_relay_message(guild_id: int, message: str, max_items: int = 8):
+    normalized = _normalize_for_repeat(message)
+    if not normalized:
+        return
+    pool = _recent_relay_messages.setdefault(guild_id, [])
+    pool.append(normalized)
+    if len(pool) > max_items:
+        del pool[:-max_items]
+
+
+def _build_relay_context(guild_id: int, limit: int = 20) -> str:
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        SELECT user_name, content
+        FROM conversations
+        WHERE guild_id = ? AND role = 'user'
+        ORDER BY id DESC
+        LIMIT ?
+        """,
+        (guild_id, limit),
+    )
+    rows = cursor.fetchall()
+    conn.close()
+    if not rows:
+        return ""
+    names: list[str] = []
+    channels: list[str] = []
+    snippets: list[str] = []
+    for user_name, content in rows:
+        msg = (content or "").strip()
+        if not msg:
+            continue
+        if user_name and user_name not in names:
+            names.append(user_name)
+        channels.extend([c for c in re.findall(r"(#[a-z0-9\-_]{2,})", msg.lower()) if c not in channels])
+        if len(snippets) < 6:
+            snippets.append(msg[:120])
+    sections = []
+    if names:
+        sections.append("Recurring names: " + ", ".join(names[:6]))
+    if channels:
+        sections.append("Channels referenced: " + ", ".join(channels[:6]))
+    if snippets:
+        sections.append("Recent user lines: " + " | ".join(snippets))
+    return " || ".join(sections)
+
+
 async def generate_dynamic_website_relay(guild_id: int) -> tuple[str, str, str]:
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
@@ -497,6 +577,7 @@ async def generate_dynamic_website_relay(guild_id: int) -> tuple[str, str, str]:
     now_pt = datetime.now(PACIFIC_TZ)
     mode = _website_relay_mode_from_context(messages, now_pt)
     signal_summary = get_recent_signal_summary(guild_id)
+    relay_context = _build_relay_context(guild_id)
 
     if GEMINI_API_KEY:
         prompt = (
@@ -505,14 +586,17 @@ async def generate_dynamic_website_relay(guild_id: int) -> tuple[str, str, str]:
             "Line 1: message under 240 chars.\n"
             "Line 2: current directive under 160 chars.\n"
             "No markdown labels.\n"
-            "Do not quote users, no usernames, no private details.\n"
-            "Preferred vocabulary: signal activity, community chatter, submission pressure, relay noise, "
-            "broadcast-side movement, archive fragments, Discord-side traffic.\n"
+            "Use concrete Discord-side observations when present: recurring display names, channels, topics, jokes, questions, updates, or patterns.\n"
+            "Never invent users, channels, events, or topics.\n"
+            "Avoid stale phrases and concepts: submission pressure, short-burst chatter, archive buffer, signal activity high, "
+            "community signal activity, engagement metrics, across all channels, broadcast-side movement.\n"
+            "Keep it short: 1-3 sentences.\n"
             "Tone: concise corporate, lightly sinister, signal-analysis.\n"
             "Do not invent concrete new canon events, releases, sponsors, incidents, characters, or secrets.\n"
             "Keep lore abstract if used. Do not mention 9 Bit unless context includes it.\n"
             f"Mode: {mode}.\n"
             f"Context summary: {signal_summary or 'limited Discord-side traffic'}.\n"
+            f"Discord observations: {relay_context or 'No specific recent Discord observations available.'}\n"
         )
         generated = await get_gemini_response(prompt, user_id=0, guild_id=guild_id) or ""
     else:
@@ -527,12 +611,14 @@ async def generate_dynamic_website_relay(guild_id: int) -> tuple[str, str, str]:
         if len(lines) > 1:
             current_directive = sanitize_website_status_message(lines[1], limit=160)
 
-    if not relay_message:
+    if not relay_message or _contains_stale_phrase(relay_message):
         relay_message = _pick_varied_relay_fallback(_last_website_status_message)
     if not current_directive:
         current_directive = random.choice(RELAY_DIRECTIVE_FALLBACKS)
 
-    if relay_message.strip().lower() == (_last_website_status_message or "").strip().lower():
+    if relay_message.strip().lower() == (_last_website_status_message or "").strip().lower() or _is_repetitive_relay(guild_id, relay_message):
+        relay_message = _pick_varied_relay_fallback(relay_message)
+    if _contains_stale_phrase(relay_message):
         relay_message = _pick_varied_relay_fallback(relay_message)
 
     if current_directive.strip().lower() == (_last_website_directive or "").strip().lower():
@@ -540,7 +626,9 @@ async def generate_dynamic_website_relay(guild_id: int) -> tuple[str, str, str]:
         if options:
             current_directive = random.choice(options)
 
-    return mode, sanitize_website_status_message(relay_message, limit=240), sanitize_website_status_message(current_directive, limit=160)
+    relay_message = sanitize_website_status_message(relay_message, limit=240)
+    _remember_relay_message(guild_id, relay_message)
+    return mode, relay_message, sanitize_website_status_message(current_directive, limit=160)
 
 async def request_fresh_website_relay(guild_id: int, *, force: bool = True) -> tuple[bool, str, str, str]:
     """
@@ -1483,12 +1571,12 @@ def get_recent_signal_summary(guild_id: int, limit: int = 14) -> str:
         return ""
     avg_len = sum(len(m) for m in messages) / len(messages)
     if len(messages) >= 10:
-        volume = "submission pressure is elevated"
+        volume = "discord traffic volume is elevated"
     elif len(messages) >= 6:
-        volume = "signal activity is steady"
+        volume = "discord traffic volume is steady"
     else:
-        volume = "relay noise is light"
-    cadence = "short-burst chatter" if avg_len < 70 else "dense packet chatter"
+        volume = "discord traffic volume is light"
+    cadence = "rapid exchanges" if avg_len < 70 else "long-form exchanges"
     return f"{volume}; {cadence}"
 
 def already_fired_show_update(guild_id: int, show_date: str, phase_key: str) -> bool:
