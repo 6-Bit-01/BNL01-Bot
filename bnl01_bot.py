@@ -830,7 +830,7 @@ async def request_fresh_website_relay(guild_id: int, *, force: bool = True) -> t
         return False, "OBSERVATION", "", ""
 
 
-def _resolve_force_pull_guild() -> int | None:
+def _resolve_force_pull_guild():
     if BNL_PRIMARY_GUILD_ID:
         return BNL_PRIMARY_GUILD_ID
     if client.guilds:
@@ -1576,7 +1576,7 @@ def has_mod_role(member: discord.Member) -> bool:
     return any(role.id == BNL_MOD_ROLE_ID for role in getattr(member, "roles", []))
 
 
-def resolve_channel_policy(channel: discord.abc.GuildChannel | None) -> str:
+def resolve_channel_policy(channel) -> str:
     if not channel:
         return "unknown"
     cid = getattr(channel, "id", 0) or 0
