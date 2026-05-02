@@ -92,6 +92,14 @@ BNL_REACTIONS_GLITCH = ["🧿", "🫨", "⚠️", "❓", "🌀", "☢️", "📛
 BNL_REACTIONS_TECH = ["🧠", "⚙️", "💻", "🛰️", "🗜️", "📈", "🔧"]
 BNL_REACTIONS_VIBE = ["🫡", "👀", "🔥", "💯", "😵‍💫", "🧪", "🕶️"]
 
+PROTECTED_SYSTEM_CHANNELS = {"welcome", "episode-tracker"}
+PUBLIC_HOME_CHANNELS = {"barcode-bot"}
+PUBLIC_CONTEXT_CHANNELS = {"general-chat", "finished-tracks", "wips-and-demos", "collaboration-hub"}
+PUBLIC_SELECTIVE_CHANNELS = {"introductions", "social-links", "suggestions", "underground-nation", "hellcat-nz", "enter-data-ping-here", "daily-riddle"}
+REFERENCE_CANON_CHANNELS = {"announcements", "rules-and-guidelines", "faq", "resources", "roles"}
+INTERNAL_CONTROLLED_CHANNELS = {"research-and-development", "important", "planning-and-coordination", "mod-resources", "ai-avatar"}
+AI_IMAGE_TOOL_CHANNELS = {"ai-image-generator"}
+
 # ======== ADAPTIVE RESPONSE STYLE / MEMORY ========
 RECENT_STYLE_WINDOW = 6
 MAX_FACTS_PER_USER = 15
@@ -1579,34 +1587,44 @@ def resolve_channel_policy(channel: discord.abc.GuildChannel | None) -> str:
     if BNL_PRIMARY_GUILD_ID and guild_id and guild_id != BNL_PRIMARY_GUILD_ID:
         return "public_selective"
     name = ((getattr(channel, "name", "") or "").strip().lower())
-    exact_map = {
-        "welcome": "protected_system",
-        "episode-tracker": "protected_system",
-        "barcode-bot": "public_home",
-        "introductions": "public_selective",
-        "ai-image-generator": "ai_image_tool",
-    }
-    if name in exact_map:
-        return exact_map[name]
-    if name in {"reference-canon", "lore", "canon"}:
-        return "reference_canon"
-    if name in {"mod-chat", "admin", "staff", "ops"}:
-        return "internal_controlled"
-    if name in {"general", "chat", "lounge"}:
+    if name in PROTECTED_SYSTEM_CHANNELS:
+        return "protected_system"
+    if name in PUBLIC_HOME_CHANNELS:
+        return "public_home"
+    if name in PUBLIC_CONTEXT_CHANNELS:
         return "public_context"
-    if name in {"bot-commands", "commands"}:
+    if name in PUBLIC_SELECTIVE_CHANNELS:
         return "public_selective"
+    if name in REFERENCE_CANON_CHANNELS:
+        return "reference_canon"
+    if name in INTERNAL_CONTROLLED_CHANNELS:
+        return "internal_controlled"
+    if name in AI_IMAGE_TOOL_CHANNELS:
+        return "ai_image_tool"
     return "unknown"
 
 
 def website_relay_eligibility(policy: str) -> str:
-    if policy in {"public_home", "public_context", "reference_canon"}:
+    if policy in {"public_home", "public_context"}:
         return "yes"
-    if policy in {"public_selective", "ai_image_tool"}:
+    if policy == "public_selective":
         return "selective"
-    if policy in {"internal_controlled", "protected_system", "sealed_test"}:
-        return "no"
     return "no"
+
+
+def context_visibility_for_policy(policy: str) -> str:
+    mapping = {
+        "sealed_test": "test_only_no_public_relay",
+        "internal_controlled": "internal_no_passive_public_memory",
+        "protected_system": "protected_existing_behavior",
+        "reference_canon": "reference_only",
+        "ai_image_tool": "owner_approval_required",
+        "public_home": "public_context_allowed",
+        "public_context": "public_context_allowed",
+        "public_selective": "selective_public_context",
+        "unknown": "blocked_until_classified",
+    }
+    return mapping.get(policy, "blocked_until_classified")
 
 def try_repair_response(user_text: str) -> str:
     t = (user_text or "").lower().strip()
@@ -3856,7 +3874,7 @@ async def bnl_source_check(interaction: discord.Interaction):
         f"- testing_channel_id: `{BNL_TESTING_CHANNEL_ID or 'unset'}` ({testing_channel.mention if testing_channel else 'not found in this guild'})",
         f"- active_channel: {active_channel.mention if active_channel else 'none (mention/reply mode)'}",
         f"- current_channel: `{getattr(current_channel, 'name', 'unknown')}` (`{getattr(current_channel, 'id', 'n/a')}`)",
-        f"- context_visibility_category: `{policy}`",
+        f"- resolved_channel_policy: `{policy}`",
         f"- website_relay_eligibility: `{relay_eligibility}`",
         f"- primary_guild_match: `{primary_guild_match}`",
         f"- bnl_status_url_configured: `{bool(BNL_STATUS_URL)}`",
@@ -3892,13 +3910,14 @@ async def bnl_context_check(interaction: discord.Interaction):
     context_category = resolve_channel_policy(current_channel)
     relay_eligibility = website_relay_eligibility(context_category)
     primary_guild_match = bool(BNL_PRIMARY_GUILD_ID and guild.id == BNL_PRIMARY_GUILD_ID)
+    context_visibility = context_visibility_for_policy(context_category)
     lines = [
         "**BNL Context Diagnostic (report-only)**",
         f"- guild: `{guild.name}` (`{guild.id}`)",
         f"- resolved_channel_policy: `{context_category}`",
         f"- website_relay_eligibility: `{relay_eligibility}`",
         f"- primary_guild_match: `{primary_guild_match}`",
-        f"- context_visibility: `{context_category}`",
+        f"- context_visibility: `{context_visibility}`",
         f"- configured_active_channel: {active_channel.mention if active_channel else 'none'}",
         f"- configured_testing_channel: {testing_channel.mention if testing_channel else 'unset/not found'}",
         f"- current_channel: `{getattr(current_channel, 'name', 'unknown')}` (`{getattr(current_channel, 'id', 'n/a')}`)",
