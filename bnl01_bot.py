@@ -3998,6 +3998,49 @@ async def bnl_context_check(interaction: discord.Interaction):
     ]
     await interaction.response.send_message("\n".join(lines), ephemeral=True)
 
+
+@tree.command(name="bnl_status", description="Mod-readable runtime status snapshot (safe).")
+async def bnl_status(interaction: discord.Interaction):
+    if not interaction.guild:
+        await interaction.response.send_message("❌ This command can only be used in a server.", ephemeral=True)
+        return
+
+    guild = interaction.guild
+    member = interaction.user if isinstance(interaction.user, discord.Member) else guild.get_member(interaction.user.id)
+    is_owner = is_owner_operator(interaction.user)
+    has_named_admin_role = bool(member and any((getattr(role, "name", "") or "").strip() == "BARCODE_ADMIN" for role in member.roles))
+    is_mod = has_mod_role(member) or has_named_admin_role
+    if not is_owner and not is_mod:
+        await interaction.response.send_message("❌ You do not have permission to use this command.", ephemeral=True)
+        return
+
+    active_channel_id = get_guild_config(guild.id)
+    active_channel = guild.get_channel(active_channel_id) if active_channel_id else None
+    testing_channel = guild.get_channel(BNL_TESTING_CHANNEL_ID) if BNL_TESTING_CHANNEL_ID else None
+    current_channel = interaction.channel if isinstance(interaction.channel, discord.abc.GuildChannel) else None
+    policy = resolve_channel_policy(current_channel)
+    relay_eligibility = website_relay_eligibility(policy)
+    context_visibility = context_visibility_for_policy(policy)
+    flags_source_state = "available" if _bnl_control_flags_last_source_url else "not yet fetched"
+    website_bridge_configured = bool(BNL_STATUS_URL and BNL_API_KEY)
+
+    lines = [
+        "**BNL Runtime Status (safe)**",
+        "- online/command_responsive: `yes`",
+        f"- guild: `{guild.name}` (`{guild.id}`)",
+        f"- current_channel: `{getattr(current_channel, 'name', 'unknown')}` (`{getattr(current_channel, 'id', 'n/a')}`)",
+        f"- active_channel: {active_channel.mention if active_channel else 'none (mention/reply mode)'}",
+        f"- testing_channel: {testing_channel.mention if testing_channel else 'unset/not found'}",
+        f"- channel_policy: `{policy}`",
+        f"- relay_eligibility: `{relay_eligibility}`",
+        f"- context_visibility: `{context_visibility}`",
+        f"- ambient_throttle: cooldown=`{AMBIENT_POST_COOLDOWN_MINUTES}m` daily_cap=`{AMBIENT_DAILY_POST_CAP}` min_signal_messages=`{AMBIENT_MIN_SIGNAL_MESSAGES}` min_signal_users=`{AMBIENT_MIN_SIGNAL_UNIQUE_USERS}`",
+        f"- website_relay_enabled: `{BNL_WEBSITE_RELAY_ENABLED}` (interval `{BNL_WEBSITE_RELAY_INTERVAL_MINUTES}m`)",
+        f"- website_bridge_configured: `{'yes' if website_bridge_configured else 'no'}`",
+        f"- control_flags_source: `{flags_source_state}`",
+    ]
+    await interaction.response.send_message("\n".join(lines), ephemeral=True)
+
 @tree.command(name="showtest", description="Manually test Friday show-day update behavior.")
 @app_commands.describe(phase="Show-day phase to simulate")
 @app_commands.choices(
