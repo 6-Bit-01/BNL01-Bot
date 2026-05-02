@@ -127,14 +127,14 @@ def build_admin_note(mode: str, message: str, current_directive: str = "", sourc
     summary = msg[:120] if msg else "No public relay text was generated."
     if compact:
         return sanitize_website_status_message(
-            f"Likely meaning: this reads as {mode.lower().replace('_', ' ')} activity. Friction risk: visitors may read it as atmospheric rather than specific. Action: {directive or 'review latest Discord context only if updates look repetitive.'}",
+            f"Likely meaning: this reflects {mode.lower().replace('_', ' ')} conditions from recent Discord traffic. Visitor-facing text is intentionally atmospheric. Action: {directive or 'refresh relay only if the wording no longer matches current traffic.'}",
             limit=220,
         )
     bullets = [
-        f"- Plain read: mode `{mode}` indicates active monitoring, not an outage or hard incident.",
+        f"- Plain read: mode `{mode}` indicates what type of activity pattern was detected from recent Discord context.",
         f"- Public line shown: \"{summary}\"",
-        "- Friction: wording is intentionally atmospheric; confirm it still maps to current Discord traffic.",
-        f"- Suggested action: {directive or 'If context changed quickly, run one more force-pull for a fresher snapshot.'}",
+        "- Interpretation note: public wording is intentionally atmospheric; verify it still maps to real channel activity.",
+        f"- Suggested action: {directive or 'If context changed quickly, run one force-pull to refresh the relay snapshot.'}",
     ]
     return sanitize_website_status_message("\n".join(bullets), limit=300)
 
@@ -511,11 +511,11 @@ RELAY_DIRECTIVE_FALLBACKS = [
 ]
 
 RELAY_FALLBACKS = [
-    "Interdimensional broadcast is active; the public access corridor is open and stable.",
-    "Outer channel remains live with low signal drift across the transmission corridor.",
-    "Host signal is present in this layer; listening window remains aligned for visitors.",
-    "Broadcast aperture is open and readable; cross-band interference is currently light.",
-    "Submission corridor is active with steady receiver alignment on the public layer.",
+    "Interdimensional broadcast is active; the public access corridor is open.",
+    "Outer channel remains live with mild signal drift in the transmission corridor.",
+    "Host signal is present on this signal layer; the listening window is aligned.",
+    "Broadcast aperture is open; cross-band interference is light across the outer channel.",
+    "Submission corridor is active with steady receiver alignment in the public access corridor.",
 ]
 
 STALE_RELAY_PHRASES = (
@@ -665,8 +665,8 @@ async def generate_dynamic_website_relay(guild_id: int) -> tuple[str, str, str]:
             "Use terms like interdimensional broadcast, outer channel, signal layer, transmission corridor, host signal, listening window, public access corridor, submission corridor, cross-band interference, broadcast aperture, signal drift, receiver alignment.\n"
             "Avoid cheesy disaster language like containment breach, red alert, multiverse collapse, emergency protocol, catastrophic anomaly.\n"
             "Do not include admin/operator advice in line 1.\n"
-            "Line 2 should be short and atmospheric, not analytical.\n"
-            "Tone: concise corporate, lightly sinister, signal-analysis.\n"
+            "Line 2 should be short, atmospheric, and distinct from any admin analysis.\n"
+            "Tone: enigmatic broadcast-station surface text, minimal technical jargon, concise.\n"
             "Do not invent concrete new canon events, releases, sponsors, incidents, characters, or secrets.\n"
             "Keep lore abstract if used. Do not mention 9 Bit unless context includes it.\n"
             f"Mode: {mode}.\n"
