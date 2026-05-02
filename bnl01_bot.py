@@ -663,11 +663,7 @@ def _build_relay_context(guild_id: int, limit: int = 20) -> str:
         SELECT user_name, content
         FROM conversations
         WHERE guild_id = ? AND role = 'user'
-          AND (
-            channel_policy IN ('public_home', 'public_context', 'public_selective')
-            OR channel_policy IS NULL
-            OR TRIM(channel_policy) = ''
-          )
+          AND channel_policy IN ('public_home', 'public_context')
         ORDER BY id DESC
         LIMIT ?
         """,
@@ -708,11 +704,7 @@ async def generate_dynamic_website_relay(guild_id: int) -> tuple[str, str, str]:
         SELECT content
         FROM conversations
         WHERE guild_id = ? AND role = 'user'
-          AND (
-            channel_policy IN ('public_home', 'public_context', 'public_selective')
-            OR channel_policy IS NULL
-            OR TRIM(channel_policy) = ''
-          )
+          AND channel_policy IN ('public_home', 'public_context')
         ORDER BY id DESC
         LIMIT 18
         """,
@@ -1648,8 +1640,7 @@ def context_visibility_for_policy(policy: str) -> str:
 
 
 def allow_passive_memory_for_policy(policy: str) -> bool:
-    visibility = context_visibility_for_policy(policy)
-    return visibility in {"public_context_allowed", "selective_public_context", "protected_existing_behavior"}
+    return policy in {"public_home", "public_context"}
 
 def try_repair_response(user_text: str) -> str:
     t = (user_text or "").lower().strip()
@@ -1929,11 +1920,7 @@ def get_recent_signal_summary(guild_id: int, limit: int = 14) -> str:
         SELECT content
         FROM conversations
         WHERE guild_id = ? AND role = 'user'
-          AND (
-            channel_policy IN ('public_home', 'public_context', 'public_selective')
-            OR channel_policy IS NULL
-            OR TRIM(channel_policy) = ''
-          )
+          AND channel_policy IN ('public_home', 'public_context')
         ORDER BY id DESC
         LIMIT ?
         """,
@@ -2111,11 +2098,7 @@ def get_recent_guild_user_messages(guild_id: int, limit: int = AMBIENT_CONTEXT_M
         SELECT user_name, content
         FROM conversations
         WHERE guild_id = ? AND role = 'user'
-          AND (
-            channel_policy IN ('public_home', 'public_context', 'public_selective')
-            OR channel_policy IS NULL
-            OR TRIM(channel_policy) = ''
-          )
+          AND channel_policy IN ('public_home', 'public_context')
         ORDER BY id DESC
         LIMIT ?
         """,
@@ -3029,6 +3012,8 @@ async def ambient_message_task():
                 channel_policy = resolve_channel_policy(channel)
                 if not allow_passive_memory_for_policy(channel_policy):
                     logging.info(f"📡 Ambient skipped for guild {guild_id}: channel policy `{channel_policy}` not eligible.")
+                    next_scheduled = _random_time_today_pacific().isoformat()
+                    update_guild_ambient_times(guild_id, last_msg or "", next_scheduled)
                     continue
 
                 lock_key = str(guild_id)
