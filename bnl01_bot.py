@@ -69,7 +69,13 @@ AMBIENT_AVOID_LAST = 12
 AMBIENT_MAX_CHARS = 280
 AMBIENT_RETRY_ON_SIMILAR = 1
 AMBIENT_FAIL_RESCHEDULE_MINUTES = 30
-AMBIENT_POST_COOLDOWN_MINUTES = 25
+AMBIENT_POST_COOLDOWN_MINUTES = 240
+AMBIENT_DAILY_POST_CAP = 2
+AMBIENT_MIN_SIGNAL_MESSAGES = 3
+AMBIENT_MIN_SIGNAL_UNIQUE_USERS = 2
+AMBIENT_MIN_SIGNAL_CHARS = 120
+AMBIENT_RESCHEDULE_MIN_HOURS = 4
+AMBIENT_RESCHEDULE_MAX_HOURS = 6
 AMBIENT_SIMILARITY_THRESHOLD = 0.75
 AMBIENT_INCOMPLETE_ENDINGS = {
     "and", "but", "or", "because", "while", "with", "to", "for", "of", "in", "the", "a", "an"
@@ -2228,13 +2234,9 @@ def get_usage_stats():
 # ==================== AMBIENT SCHEDULING ====================
 
 def _random_time_today_pacific():
-    hour = random.randint(9, 21)
-    minute = random.randint(0, 59)
     now = datetime.now(PACIFIC_TZ)
-    scheduled = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
-    if scheduled <= now:
-        scheduled = scheduled + timedelta(days=1)
-    return scheduled
+    delay_hours = random.uniform(AMBIENT_RESCHEDULE_MIN_HOURS, AMBIENT_RESCHEDULE_MAX_HOURS)
+    return now + timedelta(hours=delay_hours)
 
 def ensure_next_ambient_scheduled(guild_id: int):
     active_channel_id, last_msg, next_at = get_guild_ambient_state(guild_id)
@@ -2246,8 +2248,37 @@ def ensure_next_ambient_scheduled(guild_id: int):
     update_guild_ambient_times(guild_id, last_msg or "", scheduled)
 
 def _reschedule_ambient_soon(guild_id: int, last_msg: str):
-    next_dt = datetime.now(PACIFIC_TZ) + timedelta(minutes=AMBIENT_FAIL_RESCHEDULE_MINUTES)
+    next_dt = _random_time_today_pacific()
     update_guild_ambient_times(guild_id, last_msg or "", next_dt.isoformat())
+
+def get_ambient_posts_today(guild_id: int, channel_id: int) -> int:
+    now = datetime.now(PACIFIC_TZ)
+    start_day = now.replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        SELECT COUNT(*)
+        FROM ambient_log
+        WHERE guild_id = ? AND channel_id = ? AND source_type = 'ambient' AND posted_at >= ?
+        """,
+        (guild_id, channel_id, start_day),
+    )
+    row = cursor.fetchone()
+    conn.close()
+    return int(row[0]) if row and row[0] is not None else 0
+
+def has_ambient_signal(guild_id: int) -> bool:
+    recent_user = get_recent_guild_user_messages(guild_id, limit=AMBIENT_CONTEXT_MESSAGES)
+    if len(recent_user) < AMBIENT_MIN_SIGNAL_MESSAGES:
+        return False
+    unique_users = set()
+    total_chars = 0
+    for username, content in recent_user:
+        if username:
+            unique_users.add(username.strip().lower())
+        total_chars += len((content or "").strip())
+    return len(unique_users) >= AMBIENT_MIN_SIGNAL_UNIQUE_USERS and total_chars >= AMBIENT_MIN_SIGNAL_CHARS
 
 def get_temporal_context():
     now = datetime.now(PACIFIC_TZ)
@@ -2977,6 +3008,19 @@ async def ambient_message_task():
                         next_scheduled = (last_posted_at + timedelta(minutes=AMBIENT_POST_COOLDOWN_MINUTES)).isoformat()
                         update_guild_ambient_times(guild_id, last_msg or "", next_scheduled)
                         logging.info(f"📡 Next ambient scheduled for guild {guild_id} at {next_scheduled}")
+                        continue
+
+                    posts_today = get_ambient_posts_today(guild_id, channel_id)
+                    if posts_today >= AMBIENT_DAILY_POST_CAP:
+                        logging.info(f"📡 Ambient skipped for guild {guild_id}: daily cap reached ({posts_today}/{AMBIENT_DAILY_POST_CAP}).")
+                        next_scheduled = _random_time_today_pacific().isoformat()
+                        update_guild_ambient_times(guild_id, last_msg or "", next_scheduled)
+                        continue
+
+                    if not has_ambient_signal(guild_id):
+                        logging.info(f"📡 Ambient skipped for guild {guild_id}: weak/no-signal context detected.")
+                        next_scheduled = _random_time_today_pacific().isoformat()
+                        update_guild_ambient_times(guild_id, last_msg or "", next_scheduled)
                         continue
 
                     logging.info(f"📡 Ambient generation started for guild {guild_id}")
