@@ -2248,7 +2248,7 @@ def ensure_next_ambient_scheduled(guild_id: int):
     update_guild_ambient_times(guild_id, last_msg or "", scheduled)
 
 def _reschedule_ambient_soon(guild_id: int, last_msg: str):
-    next_dt = _random_time_today_pacific()
+    next_dt = datetime.now(PACIFIC_TZ) + timedelta(minutes=AMBIENT_FAIL_RESCHEDULE_MINUTES)
     update_guild_ambient_times(guild_id, last_msg or "", next_dt.isoformat())
 
 def get_ambient_posts_today(guild_id: int, channel_id: int) -> int:
