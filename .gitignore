@@ -6,3 +6,6 @@ __pycache__/
 *.save*
 *.pyc
 .env
+
+# Local VPS recovery backups
+backups/
