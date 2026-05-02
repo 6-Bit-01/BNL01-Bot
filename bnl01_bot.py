@@ -127,14 +127,14 @@ def build_admin_note(mode: str, message: str, current_directive: str = "", sourc
     summary = msg[:120] if msg else "No public relay text was generated."
     if compact:
         return sanitize_website_status_message(
-            f"Likely meaning: this reads as {mode.lower().replace('_', ' ')} activity. Friction risk: visitors may read it as atmospheric rather than specific. Action: {directive or 'review latest Discord context only if updates look repetitive.'}",
+            f"Likely meaning: this reflects {mode.lower().replace('_', ' ')} conditions from recent Discord traffic. Visitor-facing text is intentionally atmospheric. Action: {directive or 'refresh relay only if the wording no longer matches current traffic.'}",
             limit=220,
         )
     bullets = [
-        f"- Plain read: mode `{mode}` indicates active monitoring, not an outage or hard incident.",
+        f"- Plain read: mode `{mode}` indicates what type of activity pattern was detected from recent Discord context.",
         f"- Public line shown: \"{summary}\"",
-        "- Friction: wording is intentionally atmospheric; confirm it still maps to current Discord traffic.",
-        f"- Suggested action: {directive or 'If context changed quickly, run one more force-pull for a fresher snapshot.'}",
+        "- Interpretation note: public wording is intentionally atmospheric; verify it still maps to real channel activity.",
+        f"- Suggested action: {directive or 'If context changed quickly, run one force-pull to refresh the relay snapshot.'}",
     ]
     return sanitize_website_status_message("\n".join(bullets), limit=300)
 
@@ -511,11 +511,11 @@ RELAY_DIRECTIVE_FALLBACKS = [
 ]
 
 RELAY_FALLBACKS = [
-    "Interdimensional broadcast is active; the public access corridor is open and stable.",
-    "Outer channel remains live with low signal drift across the transmission corridor.",
-    "Host signal is present in this layer; listening window remains aligned for visitors.",
-    "Broadcast aperture is open and readable; cross-band interference is currently light.",
-    "Submission corridor is active with steady receiver alignment on the public layer.",
+    "Interdimensional broadcast is active; the public access corridor is open.",
+    "Outer channel remains live with mild signal drift in the transmission corridor.",
+    "Host signal is present on this signal layer; the listening window is aligned.",
+    "Broadcast aperture is open; cross-band interference is light across the outer channel.",
+    "Submission corridor is active with steady receiver alignment in the public access corridor.",
 ]
 
 STALE_RELAY_PHRASES = (
@@ -527,8 +527,39 @@ STALE_RELAY_PHRASES = (
     "engagement metrics",
     "across all channels",
     "broadcast-side movement",
+    "elevated query volume",
+    "submission protocols",
+    "archival integrity",
+    "monitoring active",
+    "recurring mentions",
+    "ongoing observation",
+    "data acquisition",
+    "process and categorize incoming user data streams",
+    "user engagement remains stable",
+    "pattern deviations",
 )
 _recent_relay_messages: dict[int, list[str]] = {}
+_recent_relay_topics: dict[int, list[str]] = {}
+RELAY_ANGLE_ROTATION = [
+    "whisper",
+    "wonder",
+    "overheard transmission",
+    "field note",
+    "archive murmur",
+    "cross-band drift",
+    "host trace",
+    "corridor note",
+]
+RELAY_TOPIC_KEYWORDS = {
+    "submission_corridor": ("submit", "submission", "track", "send", "payload", "intake"),
+    "host_signal": ("host", "6 bit", "6bit", "voice", "carrier"),
+    "crowd_behavior": ("crowd", "chat", "people", "users", "everyone", "names"),
+    "low_band_chatter": ("low-band", "whisper", "murmur", "chatter", "static"),
+    "archive_pressure": ("archive", "backlog", "buffer", "history", "old"),
+    "signal_drift": ("drift", "interference", "cross-band", "phase", "offset"),
+    "timing_tension": ("friday", "tonight", "show", "countdown", "window"),
+    "outer_channel_movement": ("outer channel", "corridor", "aperture", "access"),
+}
 force_pull_runner = None
 
 
@@ -571,6 +602,30 @@ def _is_repetitive_relay(guild_id: int, message: str) -> bool:
     if normalized in recent:
         return True
     return False
+
+
+def _relay_topic_from_text(text: str) -> str:
+    lowered = (text or "").lower()
+    for topic, words in RELAY_TOPIC_KEYWORDS.items():
+        if any(w in lowered for w in words):
+            return topic
+    return "general_surface"
+
+
+def _remember_relay_topic(guild_id: int, message: str, max_items: int = 8):
+    topic = _relay_topic_from_text(message)
+    pool = _recent_relay_topics.setdefault(guild_id, [])
+    pool.append(topic)
+    if len(pool) > max_items:
+        del pool[:-max_items]
+
+
+def _recent_relay_topic_summary(guild_id: int, max_items: int = 5) -> str:
+    topics = _recent_relay_topics.get(guild_id, [])
+    if not topics:
+        return "no stored topic history"
+    trimmed = topics[-max_items:]
+    return ", ".join(trimmed)
 
 
 def _remember_relay_message(guild_id: int, message: str, max_items: int = 8):
@@ -644,6 +699,9 @@ async def generate_dynamic_website_relay(guild_id: int) -> tuple[str, str, str]:
     mode = _website_relay_mode_from_context(messages, now_pt)
     signal_summary = get_recent_signal_summary(guild_id)
     relay_context = _build_relay_context(guild_id)
+    recent_topics = _recent_relay_topic_summary(guild_id)
+    recent_lines = _recent_relay_messages.get(guild_id, [])[-5:]
+    angle_seed = random.choice(RELAY_ANGLE_ROTATION)
     logging.info(
         f"🧠 Relay context inspection guild={guild_id}: "
         f"has_messages={bool(messages)} has_specific_context={bool(relay_context.strip())} mode={mode}"
@@ -656,6 +714,7 @@ async def generate_dynamic_website_relay(guild_id: int) -> tuple[str, str, str]:
             "Line 1: message under 240 chars.\n"
             "Line 2: current directive under 160 chars.\n"
             "No markdown labels.\n"
+            "Public line must be 1-2 compact sentences max.\n"
             "Use concrete Discord-side observations when present: recurring display names, channels, topics, jokes, questions, updates, or patterns.\n"
             "Never invent users, channels, events, or topics.\n"
             "Avoid stale phrases and concepts: submission pressure, short-burst chatter, archive buffer, signal activity high, "
@@ -663,12 +722,19 @@ async def generate_dynamic_website_relay(guild_id: int) -> tuple[str, str, str]:
             "Keep it short: 1-3 sentences.\n"
             "Public relay style: mysterious interdimensional broadcast station language; clear that something is active.\n"
             "Use terms like interdimensional broadcast, outer channel, signal layer, transmission corridor, host signal, listening window, public access corridor, submission corridor, cross-band interference, broadcast aperture, signal drift, receiver alignment.\n"
+            "Rotate to one distinct angle for line 1 each time: whisper, wonder, overheard transmission, field note, archive murmur, cross-band drift, host trace, corridor note.\n"
+            "Include light uncertainty sometimes: not sure why, hard to say, something odd, may be nothing, worth watching, could just be timing.\n"
+            "Do not sound like a dry server report.\n"
             "Avoid cheesy disaster language like containment breach, red alert, multiverse collapse, emergency protocol, catastrophic anomaly.\n"
             "Do not include admin/operator advice in line 1.\n"
-            "Line 2 should be short and atmospheric, not analytical.\n"
-            "Tone: concise corporate, lightly sinister, signal-analysis.\n"
+            "Line 2 should be short, atmospheric, and distinct from any admin analysis.\n"
+            "Tone: enigmatic broadcast-station surface text, minimal technical jargon, concise.\n"
+            "Hard-avoid these public phrases: elevated query volume, submission protocols, archival integrity, monitoring active, recurring mentions, ongoing observation, data acquisition, process and categorize incoming user data streams, user engagement remains stable, pattern deviations.\n"
             "Do not invent concrete new canon events, releases, sponsors, incidents, characters, or secrets.\n"
             "Keep lore abstract if used. Do not mention 9 Bit unless context includes it.\n"
+            f"Angle seed for this update: {angle_seed}.\n"
+            f"Recent relay topics to avoid repeating unless context demands it: {recent_topics}.\n"
+            f"Recent public lines to avoid mirroring: {' || '.join(recent_lines) or 'none'}.\n"
             f"Mode: {mode}.\n"
             f"Context summary: {signal_summary or 'limited Discord-side traffic'}.\n"
             f"Discord observations: {relay_context or 'No specific recent Discord observations available.'}\n"
@@ -707,6 +773,7 @@ async def generate_dynamic_website_relay(guild_id: int) -> tuple[str, str, str]:
         f"context_used={bool(relay_context.strip())}"
     )
     _remember_relay_message(guild_id, relay_message)
+    _remember_relay_topic(guild_id, relay_message)
     return mode, relay_message, sanitize_website_status_message(current_directive, limit=160)
 
 
