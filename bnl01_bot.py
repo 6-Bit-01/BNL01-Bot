@@ -1571,24 +1571,31 @@ def has_mod_role(member: discord.Member) -> bool:
 def resolve_channel_policy(channel: discord.abc.GuildChannel | None) -> str:
     if not channel:
         return "unknown"
-    name = (getattr(channel, "name", "") or "").lower()
     cid = getattr(channel, "id", 0) or 0
+    guild_id = getattr(getattr(channel, "guild", None), "id", 0) or 0
+    active_channel_id = get_guild_config(guild_id) if guild_id else None
+
     if BNL_TESTING_CHANNEL_ID and cid == BNL_TESTING_CHANNEL_ID:
         return "sealed_test"
-    if "welcome" in name or "introduc" in name or "new-member" in name:
-        return "public_home"
-    if "episode-tracker" in name or "episode_tracker" in name:
-        return "protected_system"
-    if "general" in name or "chat" in name or "lounge" in name:
+    if active_channel_id and cid == active_channel_id:
         return "public_context"
-    if "bot" in name or "command" in name:
+    if BNL_PRIMARY_GUILD_ID and guild_id and guild_id != BNL_PRIMARY_GUILD_ID:
         return "public_selective"
+    name = (getattr(channel, "name", "") or "").lower()
+    if "episode-tracker" in name or "episode_tracker" in name or "ops" in name:
+        return "protected_system"
     if "canon" in name or "lore" in name or "reference" in name:
         return "reference_canon"
+    if "welcome" in name or "introduc" in name or "new-member" in name:
+        return "public_home"
     if "mod" in name or "admin" in name or "staff" in name or "ops" in name:
         return "internal_controlled"
     if "image" in name or "art" in name or "media" in name:
         return "ai_image_tool"
+    if "general" in name or "chat" in name or "lounge" in name:
+        return "public_context"
+    if "bot" in name or "command" in name:
+        return "public_selective"
     return "unknown"
 
 
