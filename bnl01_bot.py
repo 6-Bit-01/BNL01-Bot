@@ -663,6 +663,7 @@ def _build_relay_context(guild_id: int, limit: int = 20) -> str:
         SELECT user_name, content
         FROM conversations
         WHERE guild_id = ? AND role = 'user'
+          AND channel_policy IN ('public_home', 'public_context')
         ORDER BY id DESC
         LIMIT ?
         """,
@@ -703,6 +704,7 @@ async def generate_dynamic_website_relay(guild_id: int) -> tuple[str, str, str]:
         SELECT content
         FROM conversations
         WHERE guild_id = ? AND role = 'user'
+          AND channel_policy IN ('public_home', 'public_context')
         ORDER BY id DESC
         LIMIT 18
         """,
@@ -918,6 +920,8 @@ def init_db():
             user_id INTEGER NOT NULL,
             user_name TEXT NOT NULL,
             guild_id INTEGER NOT NULL,
+            channel_name TEXT,
+            channel_policy TEXT,
             role TEXT NOT NULL,
             content TEXT NOT NULL,
             timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
@@ -937,6 +941,8 @@ def init_db():
     )
     _try_alter(cursor, "ALTER TABLE guild_configs ADD COLUMN last_ambient_message TEXT")
     _try_alter(cursor, "ALTER TABLE guild_configs ADD COLUMN next_ambient_message_at TEXT")
+    _try_alter(cursor, "ALTER TABLE conversations ADD COLUMN channel_name TEXT")
+    _try_alter(cursor, "ALTER TABLE conversations ADD COLUMN channel_policy TEXT")
 
     cursor.execute(
         """
@@ -1632,6 +1638,10 @@ def context_visibility_for_policy(policy: str) -> str:
     }
     return mapping.get(policy, "blocked_until_classified")
 
+
+def allow_passive_memory_for_policy(policy: str) -> bool:
+    return policy in {"public_home", "public_context"}
+
 def try_repair_response(user_text: str) -> str:
     t = (user_text or "").lower().strip()
     if not t:
@@ -1910,6 +1920,7 @@ def get_recent_signal_summary(guild_id: int, limit: int = 14) -> str:
         SELECT content
         FROM conversations
         WHERE guild_id = ? AND role = 'user'
+          AND channel_policy IN ('public_home', 'public_context')
         ORDER BY id DESC
         LIMIT ?
         """,
@@ -2001,12 +2012,12 @@ def is_active_channel_quiet(guild_id: int, minutes: int = 15) -> bool:
     conn.close()
     return int(row[0] if row else 0) == 0
 
-def save_user_message(user_id: int, user_name: str, guild_id: int, content: str):
+def save_user_message(user_id: int, user_name: str, guild_id: int, content: str, channel_name: str = "", channel_policy: str = "unknown"):
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
     cursor.execute(
-        "INSERT INTO conversations (user_id, user_name, guild_id, role, content) VALUES (?, ?, ?, ?, ?)",
-        (user_id, user_name, guild_id, "user", content),
+        "INSERT INTO conversations (user_id, user_name, guild_id, channel_name, channel_policy, role, content) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (user_id, user_name, guild_id, (channel_name or "").lower()[:80], (channel_policy or "unknown")[:40], "user", content),
     )
     conn.commit()
     conn.close()
@@ -2020,12 +2031,12 @@ def save_user_message(user_id: int, user_name: str, guild_id: int, content: str)
     if any(k in (content or "").lower() for k in ("help", "issue", "stuck", "fix", "error", "problem")):
         add_relationship_journal(user_id, guild_id, "help_signal", f"User asked for help: {(content or '')[:160]}")
 
-def save_model_message(user_id: int, guild_id: int, content: str):
+def save_model_message(user_id: int, guild_id: int, content: str, channel_name: str = "", channel_policy: str = "unknown"):
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
     cursor.execute(
-        "INSERT INTO conversations (user_id, user_name, guild_id, role, content) VALUES (?, ?, ?, ?, ?)",
-        (user_id, "BNL-01", guild_id, "model", content),
+        "INSERT INTO conversations (user_id, user_name, guild_id, channel_name, channel_policy, role, content) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (user_id, "BNL-01", guild_id, (channel_name or "").lower()[:80], (channel_policy or "unknown")[:40], "model", content),
     )
     conn.commit()
     conn.close()
@@ -2087,6 +2098,7 @@ def get_recent_guild_user_messages(guild_id: int, limit: int = AMBIENT_CONTEXT_M
         SELECT user_name, content
         FROM conversations
         WHERE guild_id = ? AND role = 'user'
+          AND channel_policy IN ('public_home', 'public_context')
         ORDER BY id DESC
         LIMIT ?
         """,
@@ -2997,6 +3009,12 @@ async def ambient_message_task():
                 if not channel:
                     update_guild_ambient_times(guild_id, last_msg or "", _random_time_today_pacific().isoformat())
                     continue
+                channel_policy = resolve_channel_policy(channel)
+                if not allow_passive_memory_for_policy(channel_policy):
+                    logging.info(f"📡 Ambient skipped for guild {guild_id}: channel policy `{channel_policy}` not eligible.")
+                    next_scheduled = _random_time_today_pacific().isoformat()
+                    update_guild_ambient_times(guild_id, last_msg or "", next_scheduled)
+                    continue
 
                 lock_key = str(guild_id)
                 if lock_key not in _ambient_post_locks:
@@ -3208,6 +3226,11 @@ async def website_relay_task():
     for guild in iter_managed_guilds():
         active_channel_id = get_guild_config(guild.id)
         if not active_channel_id:
+            continue
+        active_channel = guild.get_channel(active_channel_id)
+        active_policy = resolve_channel_policy(active_channel)
+        relay_eligibility = website_relay_eligibility(active_policy)
+        if relay_eligibility == "no":
             continue
         logging.info(f"⏲️ website_relay_task tick guild={guild.id} active_channel={active_channel_id}.")
         mode, relay_message, directive = await generate_dynamic_website_relay(guild.id)
@@ -3508,6 +3531,8 @@ async def on_message(message: discord.Message):
     active_channel_id = get_guild_config(message.guild.id)
 
     is_active_channel = (active_channel_id is not None and message.channel.id == active_channel_id)
+    channel_policy = resolve_channel_policy(message.channel)
+    passive_memory_allowed = allow_passive_memory_for_policy(channel_policy)
     is_mention = client.user.mentioned_in(message)
     is_reply = (
         message.reference
@@ -3537,13 +3562,15 @@ async def on_message(message: discord.Message):
     # ---------------- PASSIVE SERVER OBSERVATION ----------------
     # BNL silently logs messages across the server so it can recall them later
     # but skips the active channel because those messages are logged below
-    if not client.user.mentioned_in(message) and not is_active_channel:
+    if passive_memory_allowed and not client.user.mentioned_in(message) and not is_active_channel:
         if message.content and len(message.content) < 400:
             save_user_message(
                 message.author.id,
                 message.author.display_name,
                 message.guild.id,
-                message.content.strip()
+                message.content.strip(),
+                channel_name=getattr(message.channel, "name", ""),
+                channel_policy=channel_policy,
             )
 
     # ---------------- ACTIVE CHANNEL ----------------
@@ -3554,7 +3581,7 @@ async def on_message(message: discord.Message):
         if not clean_content:
             return
 
-        save_user_message(message.author.id, message.author.display_name, message.guild.id, clean_content)
+        save_user_message(message.author.id, message.author.display_name, message.guild.id, clean_content, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy)
 
         # Mentions/replies -> immediate response (not batched)
         if is_mention or is_reply:
@@ -3623,7 +3650,7 @@ async def on_message(message: discord.Message):
             await message.reply("I monitor this channel passively. My active operations are in the designated liaison channel.")
             return
 
-        save_user_message(message.author.id, message.author.display_name, message.guild.id, clean_content)
+        save_user_message(message.author.id, message.author.display_name, message.guild.id, clean_content, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy)
 
         repair = try_repair_response(clean_content)
         if repair:
@@ -3682,7 +3709,7 @@ async def on_message(message: discord.Message):
             await message.reply("You pinged me. How may I assist with BARCODE operations?")
             return
 
-        save_user_message(message.author.id, message.author.display_name, message.guild.id, clean_content)
+        save_user_message(message.author.id, message.author.display_name, message.guild.id, clean_content, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy)
 
         repair = try_repair_response(clean_content)
         if repair:
