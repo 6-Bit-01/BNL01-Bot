@@ -1568,10 +1568,38 @@ def has_mod_role(member: discord.Member) -> bool:
     return any(role.id == BNL_MOD_ROLE_ID for role in getattr(member, "roles", []))
 
 
-def diagnostics_channel_allowed(interaction: discord.Interaction) -> bool:
-    if not BNL_TESTING_CHANNEL_ID:
-        return True
-    return bool(interaction.channel_id) and interaction.channel_id == BNL_TESTING_CHANNEL_ID
+def resolve_channel_policy(channel: discord.abc.GuildChannel | None) -> str:
+    if not channel:
+        return "unknown"
+    name = (getattr(channel, "name", "") or "").lower()
+    cid = getattr(channel, "id", 0) or 0
+    if BNL_TESTING_CHANNEL_ID and cid == BNL_TESTING_CHANNEL_ID:
+        return "sealed_test"
+    if "welcome" in name or "introduc" in name or "new-member" in name:
+        return "public_home"
+    if "episode-tracker" in name or "episode_tracker" in name:
+        return "protected_system"
+    if "general" in name or "chat" in name or "lounge" in name:
+        return "public_context"
+    if "bot" in name or "command" in name:
+        return "public_selective"
+    if "canon" in name or "lore" in name or "reference" in name:
+        return "reference_canon"
+    if "mod" in name or "admin" in name or "staff" in name or "ops" in name:
+        return "internal_controlled"
+    if "image" in name or "art" in name or "media" in name:
+        return "ai_image_tool"
+    return "unknown"
+
+
+def website_relay_eligibility(policy: str) -> str:
+    if policy in {"internal_controlled", "protected_system", "sealed_test"}:
+        return "restricted"
+    if policy in {"public_home", "public_context", "public_selective", "reference_canon"}:
+        return "eligible"
+    if policy == "ai_image_tool":
+        return "limited"
+    return "unknown"
 
 def try_repair_response(user_text: str) -> str:
     t = (user_text or "").lower().strip()
@@ -3801,18 +3829,17 @@ async def bnl_source_check(interaction: discord.Interaction):
     if not is_owner_operator(interaction.user):
         await interaction.response.send_message("❌ Owner-only command.", ephemeral=True)
         return
-    if not diagnostics_channel_allowed(interaction):
-        await interaction.response.send_message(
-            f"❌ Diagnostics are restricted to <#{BNL_TESTING_CHANNEL_ID}>.",
-            ephemeral=True,
-        )
-        return
 
     guild = interaction.guild
     active_channel_id = guild.id and get_guild_config(guild.id) if guild else None
     active_channel = guild.get_channel(active_channel_id) if guild and active_channel_id else None
     testing_channel = guild.get_channel(BNL_TESTING_CHANNEL_ID) if guild and BNL_TESTING_CHANNEL_ID else None
     mod_role = guild.get_role(BNL_MOD_ROLE_ID) if guild and BNL_MOD_ROLE_ID else None
+    current_channel = interaction.channel if isinstance(interaction.channel, discord.abc.GuildChannel) else None
+    policy = resolve_channel_policy(current_channel)
+    relay_eligibility = website_relay_eligibility(policy)
+    primary_guild_match = bool(guild and BNL_PRIMARY_GUILD_ID and guild.id == BNL_PRIMARY_GUILD_ID)
+    flags_source = _bnl_control_flags_last_source_url or "none"
 
     lines = [
         "**BNL Source Diagnostic**",
@@ -3821,6 +3848,13 @@ async def bnl_source_check(interaction: discord.Interaction):
         f"- mod_role_id: `{BNL_MOD_ROLE_ID or 'unset'}` ({mod_role.mention if mod_role else 'not found in this guild'})",
         f"- testing_channel_id: `{BNL_TESTING_CHANNEL_ID or 'unset'}` ({testing_channel.mention if testing_channel else 'not found in this guild'})",
         f"- active_channel: {active_channel.mention if active_channel else 'none (mention/reply mode)'}",
+        f"- current_channel: `{getattr(current_channel, 'name', 'unknown')}` (`{getattr(current_channel, 'id', 'n/a')}`)",
+        f"- context_visibility_category: `{policy}`",
+        f"- website_relay_eligibility: `{relay_eligibility}`",
+        f"- primary_guild_match: `{primary_guild_match}`",
+        f"- bnl_status_url_configured: `{bool(BNL_STATUS_URL)}`",
+        f"- bnl_api_key_configured: `{bool(BNL_API_KEY)}`",
+        f"- _bnl_control_flags_last_source_url: `{flags_source}`",
         f"- website_relay_enabled: `{BNL_WEBSITE_RELAY_ENABLED}` every `{BNL_WEBSITE_RELAY_INTERVAL_MINUTES}` min",
     ]
     await interaction.response.send_message("\n".join(lines), ephemeral=True)
@@ -3837,12 +3871,6 @@ async def bnl_context_check(interaction: discord.Interaction):
     if not is_owner_operator(interaction.user):
         await interaction.response.send_message("❌ Owner-only command.", ephemeral=True)
         return
-    if not diagnostics_channel_allowed(interaction):
-        await interaction.response.send_message(
-            f"❌ Diagnostics are restricted to <#{BNL_TESTING_CHANNEL_ID}>.",
-            ephemeral=True,
-        )
-        return
 
     if not interaction.guild:
         await interaction.response.send_message("❌ This command can only be used in a server.", ephemeral=True)
@@ -3853,6 +3881,8 @@ async def bnl_context_check(interaction: discord.Interaction):
     active_channel_id = get_guild_config(guild.id)
     active_channel = guild.get_channel(active_channel_id) if active_channel_id else None
     testing_channel = guild.get_channel(BNL_TESTING_CHANNEL_ID) if BNL_TESTING_CHANNEL_ID else None
+    current_channel = interaction.channel if isinstance(interaction.channel, discord.abc.GuildChannel) else None
+    context_category = resolve_channel_policy(current_channel)
 
     channel_policy = "active-channel full reply mode + ping-only elsewhere" if active_channel else "mention/reply mode in all channels"
     lines = [
@@ -3861,6 +3891,8 @@ async def bnl_context_check(interaction: discord.Interaction):
         f"- channel_policy: {channel_policy}",
         f"- configured_active_channel: {active_channel.mention if active_channel else 'none'}",
         f"- configured_testing_channel: {testing_channel.mention if testing_channel else 'unset/not found'}",
+        f"- current_channel: `{getattr(current_channel, 'name', 'unknown')}` (`{getattr(current_channel, 'id', 'n/a')}`)",
+        f"- context_visibility_category: `{context_category}`",
         f"- invoker_is_owner: `{is_owner_operator(interaction.user)}`",
         f"- invoker_has_mod_role: `{has_mod_role(member)}`",
         "- behavior_changes_applied: `none` (reporting only)",
