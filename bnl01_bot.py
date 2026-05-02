@@ -125,17 +125,18 @@ def build_admin_note(mode: str, message: str, current_directive: str = "", sourc
     msg = sanitize_website_status_message(message, limit=240)
     directive = sanitize_website_status_message(current_directive, limit=160)
     summary = msg[:120] if msg else "No public relay text was generated."
+    mode_read = mode.lower().replace("_", " ")
     if compact:
         return sanitize_website_status_message(
-            f"Likely meaning: this reads as {mode.lower().replace('_', ' ')} activity. Friction risk: visitors may read it as atmospheric rather than specific. Action: {directive or 'review latest Discord context only if updates look repetitive.'}",
-            limit=220,
+            f"Likely meaning: {mode_read} traffic is active and relay delivery looks healthy. Friction/confusion: atmospheric wording can hide concrete changes during light traffic. Suggested action: {directive or 'No immediate action; spot-check Discord context if this repeats across check-ins.'}",
+            limit=240,
         )
     bullets = [
-        f"- Plain read: mode `{mode}` indicates active monitoring, not an outage or hard incident.",
-        f"- Public line shown: \"{summary}\"",
-        "- Friction: wording is intentionally atmospheric; confirm it still maps to current Discord traffic.",
-        f"- Suggested action: {directive or 'If context changed quickly, run one more force-pull for a fresher snapshot.'}",
+        f"- Likely meaning: this looks like {mode_read} activity and normal relay operation.",
+        f"- Friction/confusion: public text is intentionally atmospheric, so visitors may miss concrete context. Public line: \"{summary}\"",
     ]
+    if directive:
+        bullets.append(f"- Suggested operator action: {directive}")
     return sanitize_website_status_message("\n".join(bullets), limit=300)
 
 
@@ -666,7 +667,7 @@ async def generate_dynamic_website_relay(guild_id: int) -> tuple[str, str, str]:
             "Avoid cheesy disaster language like containment breach, red alert, multiverse collapse, emergency protocol, catastrophic anomaly.\n"
             "Do not include admin/operator advice in line 1.\n"
             "Line 2 should be short and atmospheric, not analytical.\n"
-            "Tone: concise corporate, lightly sinister, signal-analysis.\n"
+            "Tone: mysterious broadcast station surface text, concise and readable.\n"
             "Do not invent concrete new canon events, releases, sponsors, incidents, characters, or secrets.\n"
             "Keep lore abstract if used. Do not mention 9 Bit unless context includes it.\n"
             f"Mode: {mode}.\n"
@@ -732,7 +733,7 @@ async def request_fresh_website_relay(guild_id: int, *, force: bool = True) -> t
         mode, relay_message, directive = await generate_dynamic_website_relay(target_guild_id)
         sanitized = sanitize_website_status_message(relay_message, limit=240)
         sanitized_directive = sanitize_website_status_message(directive, limit=160)
-        admin_note = build_admin_note(mode=mode, message=sanitized, current_directive=sanitized_directive, source="relay", compact=not force) if force else ""
+        admin_note = build_admin_note(mode=mode, message=sanitized, current_directive=sanitized_directive, source="relay", compact=False) if force else ""
         ok = update_website_status_controlled(
             mode=mode,
             message=sanitized,
