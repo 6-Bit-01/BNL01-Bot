@@ -1573,40 +1573,40 @@ def resolve_channel_policy(channel: discord.abc.GuildChannel | None) -> str:
         return "unknown"
     cid = getattr(channel, "id", 0) or 0
     guild_id = getattr(getattr(channel, "guild", None), "id", 0) or 0
-    active_channel_id = get_guild_config(guild_id) if guild_id else None
 
     if BNL_TESTING_CHANNEL_ID and cid == BNL_TESTING_CHANNEL_ID:
         return "sealed_test"
-    if active_channel_id and cid == active_channel_id:
-        return "public_context"
     if BNL_PRIMARY_GUILD_ID and guild_id and guild_id != BNL_PRIMARY_GUILD_ID:
         return "public_selective"
-    name = (getattr(channel, "name", "") or "").lower()
-    if "episode-tracker" in name or "episode_tracker" in name or "ops" in name:
-        return "protected_system"
-    if "canon" in name or "lore" in name or "reference" in name:
+    name = ((getattr(channel, "name", "") or "").strip().lower())
+    exact_map = {
+        "welcome": "protected_system",
+        "episode-tracker": "protected_system",
+        "barcode-bot": "public_home",
+        "introductions": "public_selective",
+        "ai-image-generator": "ai_image_tool",
+    }
+    if name in exact_map:
+        return exact_map[name]
+    if name in {"reference-canon", "lore", "canon"}:
         return "reference_canon"
-    if "welcome" in name or "introduc" in name or "new-member" in name:
-        return "public_home"
-    if "mod" in name or "admin" in name or "staff" in name or "ops" in name:
+    if name in {"mod-chat", "admin", "staff", "ops"}:
         return "internal_controlled"
-    if "image" in name or "art" in name or "media" in name:
-        return "ai_image_tool"
-    if "general" in name or "chat" in name or "lounge" in name:
+    if name in {"general", "chat", "lounge"}:
         return "public_context"
-    if "bot" in name or "command" in name:
+    if name in {"bot-commands", "commands"}:
         return "public_selective"
     return "unknown"
 
 
 def website_relay_eligibility(policy: str) -> str:
+    if policy in {"public_home", "public_context", "reference_canon"}:
+        return "yes"
+    if policy in {"public_selective", "ai_image_tool"}:
+        return "selective"
     if policy in {"internal_controlled", "protected_system", "sealed_test"}:
-        return "restricted"
-    if policy in {"public_home", "public_context", "public_selective", "reference_canon"}:
-        return "eligible"
-    if policy == "ai_image_tool":
-        return "limited"
-    return "unknown"
+        return "no"
+    return "no"
 
 def try_repair_response(user_text: str) -> str:
     t = (user_text or "").lower().strip()
@@ -3890,16 +3890,18 @@ async def bnl_context_check(interaction: discord.Interaction):
     testing_channel = guild.get_channel(BNL_TESTING_CHANNEL_ID) if BNL_TESTING_CHANNEL_ID else None
     current_channel = interaction.channel if isinstance(interaction.channel, discord.abc.GuildChannel) else None
     context_category = resolve_channel_policy(current_channel)
-
-    channel_policy = "active-channel full reply mode + ping-only elsewhere" if active_channel else "mention/reply mode in all channels"
+    relay_eligibility = website_relay_eligibility(context_category)
+    primary_guild_match = bool(BNL_PRIMARY_GUILD_ID and guild.id == BNL_PRIMARY_GUILD_ID)
     lines = [
         "**BNL Context Diagnostic (report-only)**",
         f"- guild: `{guild.name}` (`{guild.id}`)",
-        f"- channel_policy: {channel_policy}",
+        f"- resolved_channel_policy: `{context_category}`",
+        f"- website_relay_eligibility: `{relay_eligibility}`",
+        f"- primary_guild_match: `{primary_guild_match}`",
+        f"- context_visibility: `{context_category}`",
         f"- configured_active_channel: {active_channel.mention if active_channel else 'none'}",
         f"- configured_testing_channel: {testing_channel.mention if testing_channel else 'unset/not found'}",
         f"- current_channel: `{getattr(current_channel, 'name', 'unknown')}` (`{getattr(current_channel, 'id', 'n/a')}`)",
-        f"- context_visibility_category: `{context_category}`",
         f"- invoker_is_owner: `{is_owner_operator(interaction.user)}`",
         f"- invoker_has_mod_role: `{has_mod_role(member)}`",
         "- behavior_changes_applied: `none` (reporting only)",
