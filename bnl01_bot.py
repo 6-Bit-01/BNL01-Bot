@@ -1567,6 +1567,12 @@ def has_mod_role(member: discord.Member) -> bool:
         return False
     return any(role.id == BNL_MOD_ROLE_ID for role in getattr(member, "roles", []))
 
+
+def diagnostics_channel_allowed(interaction: discord.Interaction) -> bool:
+    if not BNL_TESTING_CHANNEL_ID:
+        return True
+    return bool(interaction.channel_id) and interaction.channel_id == BNL_TESTING_CHANNEL_ID
+
 def try_repair_response(user_text: str) -> str:
     t = (user_text or "").lower().strip()
     if not t:
@@ -3795,6 +3801,12 @@ async def bnl_source_check(interaction: discord.Interaction):
     if not is_owner_operator(interaction.user):
         await interaction.response.send_message("❌ Owner-only command.", ephemeral=True)
         return
+    if not diagnostics_channel_allowed(interaction):
+        await interaction.response.send_message(
+            f"❌ Diagnostics are restricted to <#{BNL_TESTING_CHANNEL_ID}>.",
+            ephemeral=True,
+        )
+        return
 
     guild = interaction.guild
     active_channel_id = guild.id and get_guild_config(guild.id) if guild else None
@@ -3824,6 +3836,12 @@ async def bnl_context_check(interaction: discord.Interaction):
         return
     if not is_owner_operator(interaction.user):
         await interaction.response.send_message("❌ Owner-only command.", ephemeral=True)
+        return
+    if not diagnostics_channel_allowed(interaction):
+        await interaction.response.send_message(
+            f"❌ Diagnostics are restricted to <#{BNL_TESTING_CHANNEL_ID}>.",
+            ephemeral=True,
+        )
         return
 
     if not interaction.guild:
