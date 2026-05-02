@@ -46,6 +46,9 @@ BNL_WEBSITE_RELAY_INTERVAL_MINUTES = max(1, int(os.getenv("BNL_WEBSITE_RELAY_INT
 BNL_PRIMARY_GUILD_ID = int(os.getenv("BNL_PRIMARY_GUILD_ID", "0") or 0)
 BNL_FORCE_PULL_SHARED_SECRET = os.getenv("BNL_FORCE_PULL_SHARED_SECRET", "").strip()
 BNL_FORCE_PULL_PORT = int(os.getenv("BNL_FORCE_PULL_PORT", "8787") or 8787)
+BNL_OWNER_USER_ID = int(os.getenv("BNL_OWNER_USER_ID", "0") or 0)
+BNL_MOD_ROLE_ID = int(os.getenv("BNL_MOD_ROLE_ID", "0") or 0)
+BNL_TESTING_CHANNEL_ID = int(os.getenv("BNL_TESTING_CHANNEL_ID", "0") or 0)
 
 DAILY_TOKEN_LIMIT = 1_350_000
 PACIFIC_TZ = pytz.timezone("US/Pacific")
@@ -1553,6 +1556,16 @@ def is_privileged_member(member: discord.Member, guild: discord.Guild) -> bool:
         perms.kick_members,
         perms.ban_members,
     ])
+
+
+def is_owner_operator(user: discord.abc.User) -> bool:
+    return bool(BNL_OWNER_USER_ID) and bool(user) and user.id == BNL_OWNER_USER_ID
+
+
+def has_mod_role(member: discord.Member) -> bool:
+    if not member or not BNL_MOD_ROLE_ID:
+        return False
+    return any(role.id == BNL_MOD_ROLE_ID for role in getattr(member, "roles", []))
 
 def try_repair_response(user_text: str) -> str:
     t = (user_text or "").lower().strip()
@@ -3769,6 +3782,72 @@ async def about(interaction: discord.Interaction):
     )
     embed.set_footer(text="Use /setchannel to configure the liaison channel.")
     await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@tree.command(name="bnl_source_check", description="Owner-only diagnostics for BNL source/config status.")
+async def bnl_source_check(interaction: discord.Interaction):
+    if not BNL_OWNER_USER_ID:
+        await interaction.response.send_message(
+            "❌ Owner diagnostics are disabled because `BNL_OWNER_USER_ID` is not configured.",
+            ephemeral=True,
+        )
+        return
+    if not is_owner_operator(interaction.user):
+        await interaction.response.send_message("❌ Owner-only command.", ephemeral=True)
+        return
+
+    guild = interaction.guild
+    active_channel_id = guild.id and get_guild_config(guild.id) if guild else None
+    active_channel = guild.get_channel(active_channel_id) if guild and active_channel_id else None
+    testing_channel = guild.get_channel(BNL_TESTING_CHANNEL_ID) if guild and BNL_TESTING_CHANNEL_ID else None
+    mod_role = guild.get_role(BNL_MOD_ROLE_ID) if guild and BNL_MOD_ROLE_ID else None
+
+    lines = [
+        "**BNL Source Diagnostic**",
+        f"- owner_user_id_configured: {'yes' if BNL_OWNER_USER_ID else 'no'}",
+        f"- owner_user_id: `{BNL_OWNER_USER_ID or 'unset'}`",
+        f"- mod_role_id: `{BNL_MOD_ROLE_ID or 'unset'}` ({mod_role.mention if mod_role else 'not found in this guild'})",
+        f"- testing_channel_id: `{BNL_TESTING_CHANNEL_ID or 'unset'}` ({testing_channel.mention if testing_channel else 'not found in this guild'})",
+        f"- active_channel: {active_channel.mention if active_channel else 'none (mention/reply mode)'}",
+        f"- website_relay_enabled: `{BNL_WEBSITE_RELAY_ENABLED}` every `{BNL_WEBSITE_RELAY_INTERVAL_MINUTES}` min",
+    ]
+    await interaction.response.send_message("\n".join(lines), ephemeral=True)
+
+
+@tree.command(name="bnl_context_check", description="Owner-only diagnostics for channel policy reporting.")
+async def bnl_context_check(interaction: discord.Interaction):
+    if not BNL_OWNER_USER_ID:
+        await interaction.response.send_message(
+            "❌ Owner diagnostics are disabled because `BNL_OWNER_USER_ID` is not configured.",
+            ephemeral=True,
+        )
+        return
+    if not is_owner_operator(interaction.user):
+        await interaction.response.send_message("❌ Owner-only command.", ephemeral=True)
+        return
+
+    if not interaction.guild:
+        await interaction.response.send_message("❌ This command can only be used in a server.", ephemeral=True)
+        return
+
+    guild = interaction.guild
+    member = interaction.user if isinstance(interaction.user, discord.Member) else guild.get_member(interaction.user.id)
+    active_channel_id = get_guild_config(guild.id)
+    active_channel = guild.get_channel(active_channel_id) if active_channel_id else None
+    testing_channel = guild.get_channel(BNL_TESTING_CHANNEL_ID) if BNL_TESTING_CHANNEL_ID else None
+
+    channel_policy = "active-channel full reply mode + ping-only elsewhere" if active_channel else "mention/reply mode in all channels"
+    lines = [
+        "**BNL Context Diagnostic (report-only)**",
+        f"- guild: `{guild.name}` (`{guild.id}`)",
+        f"- channel_policy: {channel_policy}",
+        f"- configured_active_channel: {active_channel.mention if active_channel else 'none'}",
+        f"- configured_testing_channel: {testing_channel.mention if testing_channel else 'unset/not found'}",
+        f"- invoker_is_owner: `{is_owner_operator(interaction.user)}`",
+        f"- invoker_has_mod_role: `{has_mod_role(member)}`",
+        "- behavior_changes_applied: `none` (reporting only)",
+    ]
+    await interaction.response.send_message("\n".join(lines), ephemeral=True)
 
 @tree.command(name="showtest", description="Manually test Friday show-day update behavior.")
 @app_commands.describe(phase="Show-day phase to simulate")
