@@ -3613,6 +3613,7 @@ _channel_generating = defaultdict(bool)
 _channel_generation_id = defaultdict(int)
 _channel_preempted_generation_id = defaultdict(int)
 _channel_message_interrupt_generation_id = defaultdict(int)
+_channel_interrupt_handoff = {}  # channel_id -> list[(name, content, user_id)] full-size merged batch for post-interrupt flush
 _channel_payload_wait_extended = defaultdict(bool)
 _channel_pending_request_intent = {}
 _channel_recent_typing_at = {}
@@ -3936,10 +3937,11 @@ async def _flush_channel_buffer(channel: discord.TextChannel):
     channel_policy = resolve_channel_policy(channel)
     sealed_test_channel = channel_policy == "sealed_test"
     now = datetime.now(PACIFIC_TZ)
+    handoff_items = _channel_interrupt_handoff.pop(channel_id, None)
     buf = _channel_buffers[channel_id]
-    message_count = len(buf)
+    message_count = len(handoff_items) if handoff_items is not None else len(buf)
 
-    if not buf:
+    if handoff_items is None and not buf:
         _log_batch_event(logging.INFO, "skip", guild_id, channel_id, 0, "empty_buffer")
         return
 
@@ -3963,7 +3965,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel):
 
     batch_start = _channel_first_seen.get(channel_id, now)
     cycle_deadline = batch_start + timedelta(seconds=batch_max_wait)
-    items = list(buf)
+    items = list(handoff_items) if handoff_items is not None else list(buf)
     pending_state = _consume_pending_request_intent(channel_id, now)
     if pending_state == "expired":
         _log_batch_event(logging.INFO, "pending_request_intent_expired", guild_id, channel_id, len(items), "ttl_elapsed")
@@ -4284,10 +4286,11 @@ async def _flush_channel_buffer(channel: discord.TextChannel):
                 _channel_preempted_generation_id[channel_id] = 0
                 _channel_message_interrupt_generation_id[channel_id] = 0
                 _log_batch_event(logging.INFO, "interrupted_buffer_regenerated", guild_id, channel_id, len(items), "reason=hard_interrupt_merge")
-                _channel_buffers[channel_id].extend(items)
+                _channel_interrupt_handoff[channel_id] = list(items)
                 if channel_id not in _channel_first_seen:
                     _channel_first_seen[channel_id] = batch_start
                 _channel_last_message_at[channel_id] = datetime.now(PACIFIC_TZ)
+                _log_batch_event(logging.INFO, "interrupted_buffer_handoff", guild_id, channel_id, len(items), "reason=full_context_preserved")
                 pending_task = _channel_tasks.get(channel_id)
                 if not pending_task or pending_task.done():
                     _channel_tasks[channel_id] = asyncio.create_task(_schedule_flush(channel))
