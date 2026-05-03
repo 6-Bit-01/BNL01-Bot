@@ -3610,6 +3610,8 @@ _channel_tasks = {}
 _channel_first_seen = {}
 _channel_last_message_at = {}
 _channel_last_reply_at = defaultdict(lambda: datetime.min.replace(tzinfo=PACIFIC_TZ))
+_channel_generating = defaultdict(bool)
+_channel_generation_preempted = defaultdict(bool)
 
 
 def _log_batch_event(level: int, event: str, guild_id: int, channel_id: int, message_count: int, reason: str):
@@ -3669,10 +3671,14 @@ async def _flush_channel_buffer(channel: discord.TextChannel):
         _log_batch_event(logging.INFO, "skip", guild_id, channel_id, message_count, "stale_batch")
         return
 
+    batch_start = _channel_first_seen.get(channel_id, now)
+    cycle_deadline = batch_start + timedelta(seconds=BATCH_MAX_WAIT_SECONDS)
     items = list(buf)
     buf.clear()
     _channel_first_seen.pop(channel_id, None)
     _channel_last_message_at.pop(channel_id, None)
+    _channel_generating[channel_id] = True
+    _channel_generation_preempted[channel_id] = False
     _log_batch_event(logging.INFO, "flush", guild_id, channel_id, len(items), "ready")
 
     msg_list = [(name, content) for (name, content, _uid) in items]
@@ -3729,15 +3735,45 @@ async def _flush_channel_buffer(channel: discord.TextChannel):
             _channel_last_reply_at[channel_id] = datetime.now(PACIFIC_TZ)
             return
 
-    style_key, style_rule = choose_response_style(channel.guild.id, first_uid, len(items), combined_text)
-    log_response_style(channel.guild.id, first_uid, style_key)
-    prompt = _format_batched_prompt(msg_list, style_key, style_rule)
+    regenerated_once = False
+    response = ""
+    while True:
+        msg_list = [(name, content) for (name, content, _uid) in items]
+        combined_text = " ".join([c for (_n, c, _u) in items])
+        first_uid = items[0][2] if items and items[0][2] else 0
+        unique_user_ids = sorted({uid for (_n, _c, uid) in items if uid})
+        style_key, style_rule = choose_response_style(channel.guild.id, first_uid, len(items), combined_text)
+        log_response_style(channel.guild.id, first_uid, style_key)
+        prompt = _format_batched_prompt(msg_list, style_key, style_rule)
 
-    async with channel.typing():
-        response = await get_gemini_response(prompt, user_id=first_uid, guild_id=channel.guild.id)
+        async with channel.typing():
+            response = await get_gemini_response(prompt, user_id=first_uid, guild_id=channel.guild.id)
 
-    if not response:
-        logging.warning(f"⚠️ Batch response generation failed in channel {channel_id}.")
+        if not response:
+            logging.warning(f"⚠️ Batch response generation failed in channel {channel_id}.")
+            _channel_generating[channel_id] = False
+            return
+
+        late_count = len(_channel_buffers[channel_id])
+        if late_count > 0:
+            _log_batch_event(logging.INFO, "late_message_during_generation", guild_id, channel_id, late_count, "detected")
+            if (not regenerated_once) and datetime.now(PACIFIC_TZ) < cycle_deadline:
+                late_items = list(_channel_buffers[channel_id])
+                _channel_buffers[channel_id].clear()
+                _channel_first_seen.pop(channel_id, None)
+                _channel_last_message_at.pop(channel_id, None)
+                items.extend(late_items)
+                regenerated_once = True
+                _log_batch_event(logging.INFO, "coalesced_late_messages", guild_id, channel_id, len(items), "merged")
+                _log_batch_event(logging.INFO, "regenerated_batch_once", guild_id, channel_id, len(items), "retry")
+                continue
+
+        break
+
+    if _channel_generation_preempted.get(channel_id):
+        _log_batch_event(logging.INFO, "stale_response_discarded", guild_id, channel_id, len(items), "direct_preempted")
+        _channel_generating[channel_id] = False
+        _channel_generation_preempted[channel_id] = False
         return
 
     if len(response) <= 2000:
@@ -3748,12 +3784,13 @@ async def _flush_channel_buffer(channel: discord.TextChannel):
         for chunk in chunks[1:]:
             await channel.send("..." + chunk)
 
-    # Save model response into each participant's personal history
     for uid in unique_user_ids:
         if not sealed_test_channel:
             save_model_message(uid, channel.guild.id, response, channel_name=getattr(channel, "name", ""), channel_policy=channel_policy)
 
     _channel_last_reply_at[channel_id] = datetime.now(PACIFIC_TZ)
+    _channel_generating[channel_id] = False
+    _channel_generation_preempted[channel_id] = False
 
 async def _schedule_flush(channel: discord.TextChannel):
     """
@@ -4038,6 +4075,9 @@ async def on_message(message: discord.Message):
             if restricted_recall_guard:
                 await message.reply(restricted_recall_guard)
                 return
+            if _channel_generating[message.channel.id]:
+                _channel_generation_preempted[message.channel.id] = True
+                _log_batch_event(logging.INFO, "stale_response_discarded", message.guild.id, message.channel.id, len(_channel_buffers[message.channel.id]), "direct_reply_preempted_generation")
             pending_count = len(_channel_buffers[message.channel.id])
             if pending_count:
                 _channel_buffers[message.channel.id].clear()
