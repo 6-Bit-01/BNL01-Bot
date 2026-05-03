@@ -3612,6 +3612,7 @@ _channel_last_reply_at = defaultdict(lambda: datetime.min.replace(tzinfo=PACIFIC
 _channel_generating = defaultdict(bool)
 _channel_generation_id = defaultdict(int)
 _channel_preempted_generation_id = defaultdict(int)
+_channel_message_interrupt_generation_id = defaultdict(int)
 _channel_payload_wait_extended = defaultdict(bool)
 _channel_pending_request_intent = {}
 _channel_recent_typing_at = {}
@@ -4068,6 +4069,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel):
             if late_count > 0:
                 _log_batch_event(logging.INFO, "late_message_during_generation", guild_id, channel_id, late_count, "detected")
                 _channel_preempted_generation_id[channel_id] = local_generation_id
+                _channel_message_interrupt_generation_id[channel_id] = local_generation_id
                 _log_batch_event(logging.INFO, "stale_generation_interrupted", guild_id, channel_id, late_count, "late_message_arrived")
                 if (not regenerated_once) and datetime.now(PACIFIC_TZ) < cycle_deadline:
                     late_items = list(_channel_buffers[channel_id])
@@ -4077,6 +4079,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel):
                     items.extend(late_items)
                     regenerated_once = True
                     _channel_preempted_generation_id[channel_id] = 0
+                    _channel_message_interrupt_generation_id[channel_id] = 0
                     _log_batch_event(logging.INFO, "coalesced_late_messages", guild_id, channel_id, len(items), "merged")
                     _log_batch_event(logging.INFO, "generation_requeued_after_interruption", guild_id, channel_id, len(items), "regenerate_latest_cluster")
                     _log_batch_event(logging.INFO, "late_request_continuation", guild_id, channel_id, len(items), "regenerate_with_late_payload")
@@ -4109,8 +4112,10 @@ async def _flush_channel_buffer(channel: discord.TextChannel):
             break
 
         if _channel_preempted_generation_id.get(channel_id) == local_generation_id:
-            _log_batch_event(logging.INFO, "stale_response_discarded", guild_id, channel_id, len(items), "interrupted_preempted")
             pending_after_discard = len(_channel_buffers[channel_id])
+            interrupted_by_message = (_channel_message_interrupt_generation_id.get(channel_id) == local_generation_id)
+            if pending_after_discard > 0 or interrupted_by_message:
+                _log_batch_event(logging.INFO, "stale_response_discarded", guild_id, channel_id, len(items), "interrupted_preempted")
             if pending_after_discard > 0:
                 _log_batch_event(
                     logging.INFO,
@@ -4123,7 +4128,10 @@ async def _flush_channel_buffer(channel: discord.TextChannel):
                 pending_task = _channel_tasks.get(channel_id)
                 if not pending_task or pending_task.done():
                     _channel_tasks[channel_id] = asyncio.create_task(_schedule_flush(channel))
-            return
+                return
+            _log_batch_event(logging.INFO, "stale_preempt_cleared_no_pending", guild_id, channel_id, len(items), "no_pending_messages")
+            _channel_preempted_generation_id[channel_id] = 0
+            _channel_message_interrupt_generation_id[channel_id] = 0
 
         should_pause_for_typing, typing_reason = _should_pause_for_recent_typing(channel, items, local_generation_id)
         if should_pause_for_typing:
@@ -4140,6 +4148,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel):
             late_after_pause = len(_channel_buffers[channel_id])
             if late_after_pause > 0:
                 _channel_preempted_generation_id[channel_id] = local_generation_id
+                _channel_message_interrupt_generation_id[channel_id] = local_generation_id
                 _log_batch_event(
                     logging.INFO,
                     "typing_pause_message_arrived",
@@ -4152,13 +4161,18 @@ async def _flush_channel_buffer(channel: discord.TextChannel):
                 _log_batch_event(logging.INFO, "typing_pause_expired_no_message", guild_id, channel_id, len(items), "send_proceed")
 
         if _channel_preempted_generation_id.get(channel_id) == local_generation_id:
-            _log_batch_event(logging.INFO, "stale_response_discarded", guild_id, channel_id, len(items), "typing_pause_preempted")
             pending_after_pause = len(_channel_buffers[channel_id])
+            interrupted_by_message_after_pause = (_channel_message_interrupt_generation_id.get(channel_id) == local_generation_id)
+            if pending_after_pause > 0 or interrupted_by_message_after_pause:
+                _log_batch_event(logging.INFO, "stale_response_discarded", guild_id, channel_id, len(items), "typing_pause_preempted")
             if pending_after_pause > 0:
                 pending_task = _channel_tasks.get(channel_id)
                 if not pending_task or pending_task.done():
                     _channel_tasks[channel_id] = asyncio.create_task(_schedule_flush(channel))
-            return
+                return
+            _log_batch_event(logging.INFO, "typing_preempt_cleared_no_pending", guild_id, channel_id, len(items), "typing_only_no_message")
+            _channel_preempted_generation_id[channel_id] = 0
+            _channel_message_interrupt_generation_id[channel_id] = 0
 
         if reason.startswith("request_payload_expected:") or reason in ("pending_request_payload_continuation", "pending_request_single_payload_continuation"):
             _log_batch_event(logging.INFO, "request_payload_items_preserved", guild_id, channel_id, len(collapsed_items), "list_items_included_in_prompt")
@@ -4501,6 +4515,7 @@ async def on_message(message: discord.Message):
                 return
             if _channel_generating[message.channel.id]:
                 _channel_preempted_generation_id[message.channel.id] = _channel_generation_id[message.channel.id]
+                _channel_message_interrupt_generation_id[message.channel.id] = _channel_generation_id[message.channel.id]
                 _log_batch_event(logging.INFO, "stale_response_discarded", message.guild.id, message.channel.id, len(_channel_buffers[message.channel.id]), "direct_reply_preempted_generation")
             pending_count = len(_channel_buffers[message.channel.id])
             if pending_count:
@@ -4571,6 +4586,7 @@ async def on_message(message: discord.Message):
             logging.info(f"[conversation] guild_id={message.guild.id} channel_id={message.channel.id} reason=sealed_test_free_speak")
         if _channel_generating[message.channel.id]:
             _channel_preempted_generation_id[message.channel.id] = _channel_generation_id[message.channel.id]
+            _channel_message_interrupt_generation_id[message.channel.id] = _channel_generation_id[message.channel.id]
             _log_batch_event(
                 logging.INFO,
                 "stale_generation_interrupted",
