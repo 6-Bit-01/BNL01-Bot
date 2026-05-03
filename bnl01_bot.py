@@ -164,15 +164,68 @@ def _safe_boundary_truncate(text: str, limit: int, min_chars: int = 0, use_ellip
     return fragment
 
 
-def sanitize_website_status_message(message: str, limit: int = 240, min_chars: int = 0) -> str:
-    """Remove label wrappers and return website-safe text without mid-word clipping."""
+def clean_website_text(message: str) -> str:
+    """Strip wrappers and normalize website-facing text."""
     cleaned = (message or "").strip()
     while cleaned:
         updated = WEBSITE_STATUS_LABEL_RE.sub("", cleaned, count=1).strip()
         if updated == cleaned:
             break
         cleaned = updated
-    return _safe_boundary_truncate(cleaned, limit=limit, min_chars=min_chars, use_ellipsis=True)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned
+
+
+def _is_complete_statement(text: str) -> bool:
+    stripped = (text or "").strip()
+    return bool(stripped) and stripped[-1] in ".!?" and not stripped.endswith("...") and not stripped.endswith("…")
+
+
+def fit_complete_statement(message: str, limit: int, min_chars: int = 0, fallback: str = "") -> str:
+    """Fit website-facing text into range with complete sentence endings only."""
+    cleaned = clean_website_text(message)
+    fallback_clean = clean_website_text(fallback)
+
+    def _pick_candidate(text: str) -> str:
+        if not text:
+            return ""
+        if len(text) <= limit and _is_complete_statement(text) and (len(text) >= min_chars or min_chars == 0):
+            return text
+        boundaries = [m.end() for m in re.finditer(r"[.!?](?:\s+|$)", text)]
+        for idx in reversed(boundaries):
+            candidate = text[:idx].strip()
+            if len(candidate) <= limit and _is_complete_statement(candidate) and (len(candidate) >= min_chars or min_chars == 0):
+                return candidate
+        return ""
+
+    chosen = _pick_candidate(cleaned)
+    if chosen:
+        return chosen
+
+    if fallback_clean:
+        fallback_chosen = _pick_candidate(fallback_clean)
+        if fallback_chosen:
+            return fallback_chosen
+
+    repair_fallback = "Public signal is quiet. BNL-01 remains online and listening across eligible BARCODE Network channels."
+    if min_chars >= 100:
+        repair_fallback = "Public signal is currently thin, so BNL-01 is holding a stable listening window until clearer Discord-side movement can be confirmed."
+    if limit <= 220:
+        repair_fallback = "Hold the relay in passive listen mode and refresh once clear public context returns from active Discord channels."
+    final_text = clean_website_text(repair_fallback)
+    if len(final_text) > limit:
+        final_text = _safe_boundary_truncate(final_text, limit=limit, min_chars=0, use_ellipsis=False).strip()
+        if final_text and final_text[-1] not in ".!?":
+            final_text = "Hold for a clean relay refresh." if limit >= 30 else "Hold."
+    return final_text
+
+
+def sanitize_website_status_message(message: str, limit: int = 240, min_chars: int = 0) -> str:
+    """Back-compat wrapper for website-safe complete statements without ellipsis clipping."""
+    return fit_complete_statement(message, limit=limit, min_chars=min_chars)
+
+
+
 
 
 def build_admin_note(mode: str, message: str, current_directive: str = "", source: str = "relay", compact: bool = False) -> str:
@@ -203,7 +256,7 @@ def update_website_status(status: str, mode: str, message: str, current_directiv
         logging.warning("⚠️ BNL_API_KEY is missing; skipping website status update.")
         return False
 
-    sanitized_message = sanitize_website_status_message(message, limit=360, min_chars=220)
+    sanitized_message = sanitize_website_status_message(message, limit=360, min_chars=0)
     sanitized_directive = sanitize_website_status_message(current_directive, limit=220, min_chars=120)
     payload = {"status": status, "mode": mode, "message": sanitized_message, "currentDirective": sanitized_directive, "source": (source or "relay")[:32]}
     sanitized_admin_note = (admin_note or "").strip()
@@ -492,7 +545,7 @@ def update_website_status_controlled(mode: str, message: str, status: str = "ONL
         logging.warning("⚠️ BNL_STATUS_URL missing. Cannot post website status updates.")
         return False
 
-    sanitized_message = sanitize_website_status_message(message, limit=360, min_chars=220)
+    sanitized_message = sanitize_website_status_message(message, limit=360, min_chars=0)
     sanitized_directive = sanitize_website_status_message(current_directive, limit=220, min_chars=120)
     same_payload = (_last_website_status_mode == mode and _last_website_status_message == sanitized_message and _last_website_directive == sanitized_directive)
     if same_payload and not force:
@@ -692,7 +745,7 @@ def _weak_context_relay_message(guild_id: int, signal_summary: str, relay_contex
         return "Public signal is quiet. BNL-01 remains online and listening across eligible BARCODE Network channels."
     if mode == "ARCHIVE_ECHO":
         if archive_hint:
-            clipped_hint = _safe_boundary_truncate(archive_hint, limit=110, min_chars=0, use_ellipsis=True)
+            clipped_hint = _safe_boundary_truncate(archive_hint, limit=110, min_chars=0, use_ellipsis=False)
             return "Current public signal is thin. Archive echo: " + clipped_hint
         return "Current public signal is thin. Archive echoes still point toward recurring curiosity around 6 Bit, submission flow, and the next broadcast window."
     if mode == "CANON_TRACE":
@@ -702,7 +755,7 @@ def _weak_context_relay_message(guild_id: int, signal_summary: str, relay_contex
     if mode == "QUESTION_OR_INVITATION":
         return "Public signal is low. If a new track, question, or odd fragment is ready, BNL-01 can catch it in the open corridor."
     if summary_hint:
-        clipped_summary = _safe_boundary_truncate(summary_hint, limit=80, min_chars=0, use_ellipsis=True)
+        clipped_summary = _safe_boundary_truncate(summary_hint, limit=80, min_chars=0, use_ellipsis=False)
         return "No strong current pattern detected. BNL-01 is comparing older public fragments against the shape of the next transmission. " + clipped_summary
     return "No strong current pattern detected. BNL-01 is comparing older public fragments against the shape of the next transmission."
 
@@ -837,13 +890,15 @@ async def generate_dynamic_website_relay(guild_id: int) -> tuple[str, str, str]:
         prompt = (
             "You are BNL-01 generating a website-only relay ticker line.\n"
             "Return exactly two plain-text lines.\n"
-            "Line 1: message about 120-360 chars, complete sentence(s), never cut mid-word or mid-sentence.\n"
-            "Line 2: current directive about 120-220 chars, complete sentence, never cut mid-word or mid-sentence.\n"
+            "Line 1: message about 220-360 chars, complete sentence(s), no ellipsis, and never cut mid-word or mid-sentence.\n"
+            "Line 2: current directive about 120-220 chars, complete sentence(s), no ellipsis, and never cut mid-word or mid-sentence.\n"
             "No markdown labels.\n"
             "Public line must be 1-2 compact sentences max.\n"
             "Use concrete Discord-side observations when present: recurring display names, channels, topics, jokes, questions, updates, or patterns.\n"
             "Never invent users, channels, events, or topics.\n"
             "If concrete details are missing, explicitly say public signal is thin/unclear instead of pretending there is current activity.\n"
+            "Do not exceed the character ranges and do not rely on truncation repair. Return complete sentences only.\n"
+            "If context is weak, use a short complete archival/low-signal fallback in range.\n"
             "Avoid stale phrases and concepts: submission pressure, short-burst chatter, archive buffer, signal activity high, "
             "community signal activity, engagement metrics, across all channels, broadcast-side movement.\n"
             "Keep it short: 1-3 sentences.\n"
@@ -894,14 +949,14 @@ async def generate_dynamic_website_relay(guild_id: int) -> tuple[str, str, str]:
         if options:
             current_directive = random.choice(options)
 
-    relay_message = sanitize_website_status_message(relay_message, limit=360, min_chars=120 if context_is_strong else 0)
+    relay_message = fit_complete_statement(relay_message, limit=360, min_chars=220 if context_is_strong else 0, fallback=_weak_context_relay_message(guild_id, signal_summary, relay_context))
     logging.info(
         f"📝 Relay generated guild={guild_id} preview={relay_message[:120]!r} "
         f"context_used={bool(relay_context.strip())}"
     )
     _remember_relay_message(guild_id, relay_message)
     _remember_relay_topic(guild_id, relay_message)
-    return mode, relay_message, sanitize_website_status_message(current_directive, limit=220, min_chars=120)
+    return mode, relay_message, fit_complete_statement(current_directive, limit=220, min_chars=120, fallback=random.choice(RELAY_DIRECTIVE_FALLBACKS))
 
 
 def resolve_network_guild_id(requested_guild_id: int) -> int:
@@ -924,8 +979,8 @@ async def request_fresh_website_relay(guild_id: int, *, force: bool = True) -> t
         target_guild_id = resolve_network_guild_id(guild_id)
         logging.info(f"📨 Fresh website relay requested guild={guild_id} target_guild={target_guild_id} force={force}.")
         mode, relay_message, directive = await generate_dynamic_website_relay(target_guild_id)
-        sanitized = sanitize_website_status_message(relay_message, limit=360, min_chars=220)
-        sanitized_directive = sanitize_website_status_message(directive, limit=220, min_chars=120)
+        sanitized = fit_complete_statement(relay_message, limit=360, min_chars=0, fallback=_weak_context_relay_message(target_guild_id, signal_summary="", relay_context=""))
+        sanitized_directive = fit_complete_statement(directive, limit=220, min_chars=120, fallback=random.choice(RELAY_DIRECTIVE_FALLBACKS))
         admin_note = build_admin_note(mode=mode, message=sanitized, current_directive=sanitized_directive, source="relay", compact=not force) if force else ""
         ok = update_website_status_controlled(
             mode=mode,
@@ -3244,11 +3299,11 @@ async def generate_showday_messages(guild_id: int, phase_key: str):
     lines = [ln.strip(" -•\t") for ln in text.splitlines() if ln.strip()]
     if len(lines) >= 2:
         discord_msg = lines[0][:320]
-        website_msg = sanitize_website_status_message(lines[1], limit=360, min_chars=220)
+        website_msg = fit_complete_statement(lines[1], limit=360, min_chars=220, fallback=_pick_varied_fallback(phase_key))
         if discord_msg and website_msg:
             return discord_msg, website_msg
     fallback = _pick_varied_fallback(phase_key)
-    return fallback[:320], sanitize_website_status_message(fallback, limit=360, min_chars=220)
+    return fallback[:320], fit_complete_statement(fallback, limit=360, min_chars=220, fallback=_pick_varied_fallback(phase_key, avoid=fallback))
 
 
 def iter_managed_guilds():
@@ -3313,7 +3368,7 @@ async def barcode_radio_queue_task():
                     logging.error(f"Show-day Discord update failed (guild {guild.id}, {phase_key}): {e}")
             mode = "RESTRICTED" if phase_key == "sponsor_window" else "ACTIVE_LIAISON"
             if flags.get("websiteRelayEnabled", True):
-                update_website_status_controlled(mode=mode, message=sanitize_website_status_message(website_msg, limit=360, min_chars=220), status="ONLINE", force=True)
+                update_website_status_controlled(mode=mode, message=fit_complete_statement(website_msg, limit=360, min_chars=220, fallback=_pick_varied_fallback(phase_key)), status="ONLINE", force=True)
             mark_show_update_fired(guild.id, show_date, phase_key, discord_sent, website_msg)
 
 @tasks.loop(minutes=1)
@@ -4201,7 +4256,7 @@ async def showtest(interaction: discord.Interaction, phase: app_commands.Choice[
     logging.info(f"/showtest BNL_API_KEY length: {key_len}")
     website_ok = website_ok if phase_key == "relay" else update_website_status_controlled(
         mode=mode,
-        message=sanitize_website_status_message(website_msg, limit=360, min_chars=220),
+        message=fit_complete_statement(website_msg, limit=360, min_chars=220, fallback=_pick_varied_fallback(phase_key)),
         status="ONLINE",
         force=True,
         source="relay",
