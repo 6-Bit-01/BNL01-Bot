@@ -225,6 +225,12 @@ def sanitize_website_status_message(message: str, limit: int = 240, min_chars: i
     return fit_complete_statement(message, limit=limit, min_chars=min_chars)
 
 
+
+
+def _website_message_min_chars(mode: str) -> int:
+    """Return message floor for website-facing relay text by mode strength."""
+    return 0 if (mode or "").strip().upper() in RELAY_WEAK_CONTEXT_MODES else 220
+
 def build_admin_note(mode: str, message: str, current_directive: str = "", source: str = "relay", compact: bool = False) -> str:
     """Build a compact admin-only operator note for website relay payloads."""
     msg = sanitize_website_status_message(message, limit=360, min_chars=220)
@@ -253,7 +259,8 @@ def update_website_status(status: str, mode: str, message: str, current_directiv
         logging.warning("⚠️ BNL_API_KEY is missing; skipping website status update.")
         return False
 
-    sanitized_message = sanitize_website_status_message(message, limit=360, min_chars=220)
+    message_min_chars = _website_message_min_chars(mode)
+    sanitized_message = sanitize_website_status_message(message, limit=360, min_chars=message_min_chars)
     sanitized_directive = sanitize_website_status_message(current_directive, limit=220, min_chars=120)
     payload = {"status": status, "mode": mode, "message": sanitized_message, "currentDirective": sanitized_directive, "source": (source or "relay")[:32]}
     sanitized_admin_note = (admin_note or "").strip()
@@ -542,7 +549,8 @@ def update_website_status_controlled(mode: str, message: str, status: str = "ONL
         logging.warning("⚠️ BNL_STATUS_URL missing. Cannot post website status updates.")
         return False
 
-    sanitized_message = sanitize_website_status_message(message, limit=360, min_chars=220)
+    message_min_chars = _website_message_min_chars(mode)
+    sanitized_message = sanitize_website_status_message(message, limit=360, min_chars=message_min_chars)
     sanitized_directive = sanitize_website_status_message(current_directive, limit=220, min_chars=120)
     same_payload = (_last_website_status_mode == mode and _last_website_status_message == sanitized_message and _last_website_directive == sanitized_directive)
     if same_payload and not force:
@@ -976,7 +984,7 @@ async def request_fresh_website_relay(guild_id: int, *, force: bool = True) -> t
         target_guild_id = resolve_network_guild_id(guild_id)
         logging.info(f"📨 Fresh website relay requested guild={guild_id} target_guild={target_guild_id} force={force}.")
         mode, relay_message, directive = await generate_dynamic_website_relay(target_guild_id)
-        sanitized = fit_complete_statement(relay_message, limit=360, min_chars=220, fallback=_weak_context_relay_message(target_guild_id, signal_summary="", relay_context=""))
+        sanitized = fit_complete_statement(relay_message, limit=360, min_chars=_website_message_min_chars(mode), fallback=_weak_context_relay_message(target_guild_id, signal_summary="", relay_context=""))
         sanitized_directive = fit_complete_statement(directive, limit=220, min_chars=120, fallback=random.choice(RELAY_DIRECTIVE_FALLBACKS))
         admin_note = build_admin_note(mode=mode, message=sanitized, current_directive=sanitized_directive, source="relay", compact=not force) if force else ""
         ok = update_website_status_controlled(
