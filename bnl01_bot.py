@@ -3676,11 +3676,30 @@ def _detect_request_payload_expectation(text: str):
         r"\btell me a joke about each\b", r"\babout each\b", r"\bfor each\b",
         r"\blist\b", r"\bnames\b", r"\beach of these\b", r"\bfollowing\b",
         r"\bbelow\b", r"\bhere are\b", r"\bgive me one for each\b", r"\bmake one for each\b",
+        r"\bthese people\b", r"\bthose people\b", r"\bthese characters\b", r"\bthose characters\b",
+        r"\bthese folks\b", r"\bthose folks\b", r"\bjoke about these people\b", r"\bjoke about them\b",
+        r"\bjoke about these\b", r"\babout these people\b", r"\babout those people\b", r"\babout them\b",
+        r"\babout these\b", r"\bthis list\b", r"\bthese entries\b", r"\bthese items\b",
     ]
     for pat in patterns:
         if re.search(pat, t):
             return True, pat
     return False, "none"
+
+
+def _is_single_payload_like_item(text: str):
+    t = (text or "").strip()
+    if not t:
+        return False
+    token_count = len([tok for tok in re.split(r"\s+", t) if tok])
+    has_alpha = bool(re.search(r"[a-zA-Z]", t))
+    if bool(re.fullmatch(r"[\d\W_]+", t)):
+        return True
+    if token_count <= 6 and len(t) <= 48 and has_alpha:
+        return True
+    if token_count <= 4 and len(t) <= 40:
+        return True
+    return False
 
 
 def _is_payload_like_cluster(items):
@@ -3691,13 +3710,7 @@ def _is_payload_like_cluster(items):
         return False
     payloadish = 0
     for t in texts:
-        token_count = len([tok for tok in re.split(r"\s+", t) if tok])
-        has_alpha = bool(re.search(r"[a-zA-Z]", t))
-        if bool(re.fullmatch(r"[\d\W_]+", t)):
-            payloadish += 1
-        elif token_count <= 5 and len(t) <= 40:
-            payloadish += 1
-        elif has_alpha and token_count <= 6:
+        if _is_single_payload_like_item(t):
             payloadish += 1
     return payloadish >= max(2, len(texts) - 1)
 
@@ -3751,6 +3764,8 @@ def _classify_batch_engagement(items, bot_user=None, pending_request_intent=Fals
     casual_chat_like = bool(re.search(r"\b(yeah|yep|same|ok|okay|cool|nice|true|fair)\b", lowered))
 
     if pending_request_intent and _is_payload_like_cluster(items):
+        if len(texts) == 1 and _is_single_payload_like_item(texts[0]):
+            return "answer", "pending_request_single_payload_continuation"
         return "answer", "pending_request_payload_continuation"
     if question_like or request_like or bot_named:
         if request_intent:
@@ -3917,10 +3932,14 @@ async def _flush_channel_buffer(channel: discord.TextChannel):
                 return
         decision, reason = _classify_batch_engagement(collapsed_items, client.user, pending_request_intent=bool(pending_state))
         answer_intent_locked = decision == "answer"
-        if pending_state and reason == "pending_request_payload_continuation":
+        if pending_state and reason in ("pending_request_payload_continuation", "pending_request_single_payload_continuation"):
             _log_batch_event(logging.INFO, "pending_request_intent_used", guild_id, channel_id, len(collapsed_items), "payload_continuation")
+            if reason == "pending_request_single_payload_continuation":
+                _log_batch_event(logging.INFO, "pending_request_single_payload_continuation", guild_id, channel_id, len(collapsed_items), "single_short_item")
         if reason.startswith("request_intent:"):
             _log_batch_event(logging.INFO, "request_intent_detected", guild_id, channel_id, len(collapsed_items), f"reason={reason}")
+        if reason.startswith("request_payload_expected:"):
+            _log_batch_event(logging.INFO, "request_payload_phrase_detected", guild_id, channel_id, len(collapsed_items), f"reason={reason}")
         _log_batch_event(logging.INFO, "batch_engagement_decision", guild_id, channel_id, len(collapsed_items), f"decision={decision};reason={reason}")
         if decision in ("skip", "observe"):
             _log_batch_event(logging.INFO, "batch_response_skipped", guild_id, channel_id, len(collapsed_items), "no_response_needed")
@@ -3956,10 +3975,14 @@ async def _flush_channel_buffer(channel: discord.TextChannel):
             if answer_intent_locked and decision != "answer":
                 _log_batch_event(logging.INFO, "request_intent_preserved", guild_id, channel_id, len(collapsed_items), f"reason={reason}")
                 decision, reason = "answer", "preserved_prior_request_intent"
-            if pending_state and reason == "pending_request_payload_continuation":
+            if pending_state and reason in ("pending_request_payload_continuation", "pending_request_single_payload_continuation"):
                 _log_batch_event(logging.INFO, "pending_request_intent_used", guild_id, channel_id, len(collapsed_items), "payload_continuation")
+                if reason == "pending_request_single_payload_continuation":
+                    _log_batch_event(logging.INFO, "pending_request_single_payload_continuation", guild_id, channel_id, len(collapsed_items), "single_short_item")
             if reason.startswith("request_intent:"):
                 _log_batch_event(logging.INFO, "request_intent_detected", guild_id, channel_id, len(collapsed_items), f"reason={reason}")
+            if reason.startswith("request_payload_expected:"):
+                _log_batch_event(logging.INFO, "request_payload_phrase_detected", guild_id, channel_id, len(collapsed_items), f"reason={reason}")
             _log_batch_event(logging.INFO, "batch_engagement_decision", guild_id, channel_id, len(collapsed_items), f"decision={decision};reason={reason}")
             if decision in ("skip", "observe"):
                 _log_batch_event(logging.INFO, "batch_response_skipped", guild_id, channel_id, len(collapsed_items), "no_response_needed")
@@ -4040,7 +4063,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel):
             if not sealed_test_channel:
                 save_model_message(uid, channel.guild.id, response, channel_name=getattr(channel, "name", ""), channel_policy=channel_policy)
 
-        if reason.startswith("request_intent:") or reason.startswith("request_payload_expected:") or reason == "pending_request_payload_continuation":
+        if reason.startswith("request_intent:") or reason.startswith("request_payload_expected:") or reason in ("pending_request_payload_continuation", "pending_request_single_payload_continuation"):
             _set_pending_request_intent(channel_id, datetime.now(PACIFIC_TZ), reason)
             _log_batch_event(logging.INFO, "pending_request_intent_set", guild_id, channel_id, len(collapsed_items), f"reason={reason}")
         _log_batch_event(logging.INFO, "batch_response_answer", guild_id, channel_id, len(collapsed_items), f"reason={reason}")
