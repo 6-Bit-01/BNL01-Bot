@@ -3856,9 +3856,9 @@ def _classify_batch_engagement(items, bot_user=None, pending_request_intent=Fals
 
     if multiline_payload_detected:
         return "answer", "single_message_multiline_request_payload"
+    if pending_request_intent and len(texts) == 1 and _is_single_payload_like_item(texts[0]):
+        return "answer", "pending_request_single_payload_continuation"
     if pending_request_intent and _is_payload_like_cluster(items):
-        if len(texts) == 1 and _is_single_payload_like_item(texts[0]):
-            return "answer", "pending_request_single_payload_continuation"
         return "answer", "pending_request_payload_continuation"
     if question_like or request_like or bot_named:
         if request_intent:
@@ -3970,6 +3970,8 @@ async def _flush_channel_buffer(channel: discord.TextChannel):
     if pending_state == "expired":
         _log_batch_event(logging.INFO, "pending_request_intent_expired", guild_id, channel_id, len(items), "ttl_elapsed")
         pending_state = None
+    elif pending_state:
+        _log_batch_event(logging.INFO, "pending_request_intent_available", guild_id, channel_id, len(items), "not_expired")
     buf.clear()
     _channel_first_seen.pop(channel_id, None)
     _channel_last_message_at.pop(channel_id, None)
@@ -4048,6 +4050,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel):
         answer_intent_locked = decision == "answer"
         if pending_state and reason in ("pending_request_payload_continuation", "pending_request_single_payload_continuation"):
             _log_batch_event(logging.INFO, "pending_request_intent_used", guild_id, channel_id, len(collapsed_items), "payload_continuation")
+            _log_batch_event(logging.INFO, "continuation_not_suppressed", guild_id, channel_id, len(collapsed_items), "classified_as_continuation_answer")
             if reason == "pending_request_single_payload_continuation":
                 _log_batch_event(logging.INFO, "pending_request_single_payload_continuation", guild_id, channel_id, len(collapsed_items), "single_short_item")
         if reason.startswith("request_intent:"):
@@ -4061,6 +4064,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel):
         if decision == "acknowledge" and pending_state and _is_payload_like_cluster(collapsed_items):
             decision, reason = "answer", "pending_request_payload_continuation"
             _log_batch_event(logging.INFO, "pending_request_intent_used", guild_id, channel_id, len(collapsed_items), "override_acknowledge")
+            _log_batch_event(logging.INFO, "continuation_not_suppressed", guild_id, channel_id, len(collapsed_items), "override_acknowledge_to_answer")
         if decision == "acknowledge":
             ack = _build_acknowledgement_response(collapsed_items)
             if not ack:
@@ -4103,6 +4107,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel):
                 decision, reason = "answer", "preserved_prior_request_intent"
             if pending_state and reason in ("pending_request_payload_continuation", "pending_request_single_payload_continuation"):
                 _log_batch_event(logging.INFO, "pending_request_intent_used", guild_id, channel_id, len(collapsed_items), "payload_continuation")
+                _log_batch_event(logging.INFO, "continuation_not_suppressed", guild_id, channel_id, len(collapsed_items), "classified_as_continuation_answer")
                 if reason == "pending_request_single_payload_continuation":
                     _log_batch_event(logging.INFO, "pending_request_single_payload_continuation", guild_id, channel_id, len(collapsed_items), "single_short_item")
             if reason.startswith("request_intent:"):
@@ -4116,6 +4121,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel):
             if decision == "acknowledge" and pending_state and _is_payload_like_cluster(collapsed_items):
                 decision, reason = "answer", "pending_request_payload_continuation"
                 _log_batch_event(logging.INFO, "pending_request_intent_used", guild_id, channel_id, len(collapsed_items), "override_acknowledge")
+                _log_batch_event(logging.INFO, "continuation_not_suppressed", guild_id, channel_id, len(collapsed_items), "override_acknowledge_to_answer")
             if decision == "acknowledge":
                 ack = _build_acknowledgement_response(collapsed_items)
                 if not ack:
