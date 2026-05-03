@@ -3840,6 +3840,60 @@ def _collect_request_payload_items(items):
     return payload_items
 
 
+def _collect_batch_request_payload_items(items, pending_state=False):
+    """
+    Collect payload items from both:
+    - single multiline request+list messages
+    - separate-message request/list batches (request line followed by short payload lines)
+    """
+    payload_items = []
+    seen = set()
+    request_anchor_seen = False
+    normalized_items = list(items or [])
+
+    for _name, content, _uid in normalized_items:
+        text = (content or "").strip()
+        if not text:
+            continue
+
+        multiline = _extract_multiline_request_payload(text)
+        if multiline:
+            request_anchor_seen = True
+            for raw_item in multiline.get("payload_items", []):
+                key = _normalize_payload_item_key(raw_item)
+                if not key or key in seen:
+                    continue
+                seen.add(key)
+                payload_items.append(raw_item.strip())
+            continue
+
+        intent, _ = _detect_request_intent(text)
+        expects_payload, _ = _detect_request_payload_expectation(text)
+        if intent and expects_payload:
+            request_anchor_seen = True
+            continue
+
+        if request_anchor_seen and _is_single_payload_like_item(text):
+            key = _normalize_payload_item_key(text)
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            payload_items.append(text)
+
+    if pending_state:
+        for _name, content, _uid in normalized_items:
+            text = (content or "").strip()
+            if not _is_single_payload_like_item(text):
+                continue
+            key = _normalize_payload_item_key(text)
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            payload_items.append(text)
+
+    return payload_items
+
+
 def _response_mentions_payload_item(response: str, item: str):
     response_norm = (response or "").lower()
     item_norm = _normalize_payload_item_key(item)
@@ -3936,6 +3990,54 @@ def _build_acknowledgement_response(items):
     if len(texts) <= 2 and sum(len(t) for t in texts) < 80:
         return ""
     return "Received."
+
+
+def _build_active_response_packet(channel_id: int, items, pending_state, bot_user=None):
+    collapsed_items = _collapse_consecutive_batch_fragments(items)
+    pending_request = bool(pending_state)
+    decision, reason = _classify_batch_engagement(
+        collapsed_items,
+        bot_user,
+        pending_request_intent=pending_request,
+    )
+    is_single_payload_continuation = reason == "pending_request_single_payload_continuation"
+    payload_items = _collect_batch_request_payload_items(items, pending_state=pending_request)
+    has_request_payload = bool(payload_items)
+    if (not has_request_payload) and pending_request and decision == "answer":
+        payload_items = [
+            (content or "").strip()
+            for (_name, content, _uid) in collapsed_items
+            if _is_single_payload_like_item(content)
+        ]
+        unique_payload_items = []
+        seen_payload = set()
+        for raw_item in payload_items:
+            key = _normalize_payload_item_key(raw_item)
+            if not key or key in seen_payload:
+                continue
+            seen_payload.add(key)
+            unique_payload_items.append(raw_item)
+        payload_items = unique_payload_items
+        has_request_payload = bool(payload_items)
+
+    ack_text = _build_acknowledgement_response(collapsed_items) if decision == "acknowledge" else ""
+    should_skip = decision in ("skip", "observe")
+    should_acknowledge = decision == "acknowledge" and bool(ack_text)
+    should_generate = decision == "answer"
+    return {
+        "items": list(items),
+        "collapsed_items": collapsed_items,
+        "decision": decision,
+        "reason": reason,
+        "payload_items": payload_items,
+        "has_request_payload": has_request_payload,
+        "pending_request_intent": pending_request,
+        "is_single_payload_continuation": is_single_payload_continuation,
+        "should_generate": should_generate,
+        "should_skip": should_skip,
+        "should_acknowledge": should_acknowledge,
+        "ack_text": ack_text,
+    }
 
 
 def _format_batched_prompt(messages, style_key: str, style_rule: str) -> str:
@@ -4099,7 +4201,11 @@ async def _flush_channel_buffer(channel: discord.TextChannel):
                     save_model_message(unique_user_ids[0], channel.guild.id, memory_recall, channel_name=getattr(channel, "name", ""), channel_policy=channel_policy)
                 _channel_last_reply_at[channel_id] = datetime.now(PACIFIC_TZ)
                 return
-        decision, reason = _classify_batch_engagement(collapsed_items, client.user, pending_request_intent=bool(pending_state))
+        active_packet = _build_active_response_packet(channel_id, collapsed_items, pending_state, bot_user=client.user)
+        decision, reason = active_packet["decision"], active_packet["reason"]
+        _log_batch_event(logging.INFO, "active_packet_built", guild_id, channel_id, len(active_packet["collapsed_items"]), f"payload_count={len(active_packet['payload_items'])};decision={decision};reason={reason}")
+        _log_batch_event(logging.INFO, "active_packet_payload_items", guild_id, channel_id, len(active_packet["collapsed_items"]), f"payload_count={len(active_packet['payload_items'])}")
+        _log_batch_event(logging.INFO, "active_packet_decision", guild_id, channel_id, len(active_packet["collapsed_items"]), f"decision={decision};reason={reason}")
         answer_intent_locked = decision == "answer"
         if pending_state and reason in ("pending_request_payload_continuation", "pending_request_single_payload_continuation"):
             _log_batch_event(logging.INFO, "pending_request_intent_used", guild_id, channel_id, len(collapsed_items), "payload_continuation")
@@ -4155,7 +4261,11 @@ async def _flush_channel_buffer(channel: discord.TextChannel):
             combined_text = " ".join([c for (_n, c, _u) in collapsed_items])
             first_uid = collapsed_items[0][2] if collapsed_items and collapsed_items[0][2] else 0
             unique_user_ids = sorted({uid for (_n, _c, uid) in collapsed_items if uid})
-            decision, reason = _classify_batch_engagement(collapsed_items, client.user, pending_request_intent=bool(pending_state))
+            active_packet = _build_active_response_packet(channel_id, collapsed_items, pending_state, bot_user=client.user)
+            decision, reason = active_packet["decision"], active_packet["reason"]
+            _log_batch_event(logging.INFO, "active_packet_built", guild_id, channel_id, len(active_packet["collapsed_items"]), f"payload_count={len(active_packet['payload_items'])};decision={decision};reason={reason}")
+            _log_batch_event(logging.INFO, "active_packet_payload_items", guild_id, channel_id, len(active_packet["collapsed_items"]), f"payload_count={len(active_packet['payload_items'])}")
+            _log_batch_event(logging.INFO, "active_packet_decision", guild_id, channel_id, len(active_packet["collapsed_items"]), f"decision={decision};reason={reason}")
             if answer_intent_locked and decision != "answer":
                 _log_batch_event(logging.INFO, "request_intent_preserved", guild_id, channel_id, len(collapsed_items), f"reason={reason}")
                 decision, reason = "answer", "preserved_prior_request_intent"
@@ -4197,7 +4307,12 @@ async def _flush_channel_buffer(channel: discord.TextChannel):
             style_key, style_rule = choose_response_style(channel.guild.id, first_uid, len(collapsed_items), combined_text)
             log_response_style(channel.guild.id, first_uid, style_key)
             prompt = _format_batched_prompt(msg_list, style_key, style_rule)
+            if active_packet["payload_items"]:
+                prompt += "\n\nACTIVE REQUEST PAYLOAD ITEMS (respond to every unique item):\n"
+                for i, item in enumerate(active_packet["payload_items"], start=1):
+                    prompt += f"{i}. {item}\n"
 
+            _log_batch_event(logging.INFO, "active_packet_generation_started", guild_id, channel_id, len(collapsed_items), f"payload_count={len(active_packet['payload_items'])};decision={decision};reason={reason}")
             async with channel.typing():
                 response = await get_gemini_response(prompt, user_id=first_uid, guild_id=channel.guild.id)
 
@@ -4205,10 +4320,10 @@ async def _flush_channel_buffer(channel: discord.TextChannel):
                 logging.warning(f"⚠️ Batch response generation failed in channel {channel_id}.")
                 return
 
-            payload_items = _collect_request_payload_items(collapsed_items)
+            payload_items = list(active_packet["payload_items"])
             if payload_items:
                 missing_items = _missing_request_payload_items(payload_items, response)
-                _log_batch_event(logging.INFO, "request_payload_completion_check", guild_id, channel_id, len(payload_items), f"missing={len(missing_items)}")
+                _log_batch_event(logging.INFO, "active_packet_completion_check", guild_id, channel_id, len(collapsed_items), f"payload_count={len(payload_items)};missing={len(missing_items)};decision={decision};reason={reason}")
                 if missing_items:
                     _log_batch_event(logging.INFO, "request_payload_items_missing", guild_id, channel_id, len(missing_items), f"missing_items={len(missing_items)}")
                     if not payload_completion_regenerated:
@@ -4224,12 +4339,12 @@ async def _flush_channel_buffer(channel: discord.TextChannel):
                         if regenerated:
                             response = regenerated
                             payload_completion_regenerated = True
-                            _log_batch_event(logging.INFO, "request_payload_completion_regenerated", guild_id, channel_id, len(missing_items), "single_retry")
+                            _log_batch_event(logging.INFO, "active_packet_completion_regenerated", guild_id, channel_id, len(collapsed_items), f"payload_count={len(payload_items)};missing={len(missing_items)};decision={decision};reason={reason}")
                             missing_items = _missing_request_payload_items(payload_items, response)
                     if not missing_items:
                         _log_batch_event(logging.INFO, "request_payload_completion_passed", guild_id, channel_id, len(payload_items), "after_regeneration")
                     else:
-                        _log_batch_event(logging.INFO, "request_payload_completion_incomplete_after_retry", guild_id, channel_id, len(payload_items), "best_effort_send")
+                        _log_batch_event(logging.INFO, "active_packet_completion_incomplete_after_retry", guild_id, channel_id, len(collapsed_items), f"payload_count={len(payload_items)};decision={decision};reason={reason}")
                 else:
                     _log_batch_event(logging.INFO, "request_payload_completion_passed", guild_id, channel_id, len(payload_items), "initial")
 
@@ -4378,7 +4493,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel):
                 if channel_id not in _channel_first_seen:
                     _channel_first_seen[channel_id] = batch_start
                 _channel_last_message_at[channel_id] = datetime.now(PACIFIC_TZ)
-                _log_batch_event(logging.INFO, "interrupted_buffer_handoff", guild_id, channel_id, len(items), "reason=full_context_preserved")
+                _log_batch_event(logging.INFO, "hard_interrupt_packet_handoff", guild_id, channel_id, len(items), "reason=full_context_preserved")
                 pending_task = _channel_tasks.get(channel_id)
                 if not pending_task or pending_task.done():
                     _channel_tasks[channel_id] = asyncio.create_task(_schedule_flush(channel))
