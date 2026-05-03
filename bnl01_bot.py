@@ -4114,14 +4114,19 @@ def _is_simple_humor_or_list_request(combined_text: str, payload_count: int) -> 
 
 
 def _build_payload_fallback_lines(missing_items):
+    def _sanitize_fallback_item(text: str):
+        # Prevent @everyone/@here/user/role mention expansion in fallback lines.
+        return (text or "").replace("@", "@\u200b")
+
     lines = []
     for item in missing_items:
         cleaned = (item or "").strip()
         if not cleaned:
             continue
+        safe_item = _sanitize_fallback_item(cleaned)
         lines.append(
-            cleaned + ": Records are thin, but the Network confirms one thing: "
-            + cleaned + " has already caused at least one suspicious blinking light."
+            safe_item + ": Records are thin, but the Network confirms one thing: "
+            + safe_item + " has already caused at least one suspicious blinking light."
         )
     return "\n".join(lines)
 
@@ -4172,6 +4177,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel):
     _channel_generation_id[channel_id] += 1
     local_generation_id = _channel_generation_id[channel_id]
     _channel_generating[channel_id] = True
+    safe_mentions = discord.AllowedMentions.none()
     try:
         _log_batch_event(logging.INFO, "flush", guild_id, channel_id, len(items), "ready")
 
@@ -4196,7 +4202,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel):
             channel_id,
         )
         if sealed_recall_guard:
-            await channel.send(sealed_recall_guard)
+            await channel.send(sealed_recall_guard, allowed_mentions=safe_mentions)
             _channel_last_reply_at[channel_id] = datetime.now(PACIFIC_TZ)
             return
 
@@ -4207,7 +4213,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel):
             channel_id,
         )
         if restricted_recall_guard:
-            await channel.send(restricted_recall_guard)
+            await channel.send(restricted_recall_guard, allowed_mentions=safe_mentions)
             _channel_last_reply_at[channel_id] = datetime.now(PACIFIC_TZ)
             return
         if len(unique_user_ids) == 1:
@@ -4219,7 +4225,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel):
             if self_reflection:
                 if not is_privileged_member(member, channel.guild):
                     self_reflection = "Status reports are restricted to server owner/mod operators."
-                await channel.send(self_reflection)
+                await channel.send(self_reflection, allowed_mentions=safe_mentions)
                 if not sealed_test_channel:
                     save_model_message(unique_user_ids[0], channel.guild.id, self_reflection, channel_name=getattr(channel, "name", ""), channel_policy=channel_policy)
                 _channel_last_reply_at[channel_id] = datetime.now(PACIFIC_TZ)
@@ -4227,7 +4233,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel):
 
             repair = try_repair_response(combined_text)
             if repair:
-                await channel.send(repair)
+                await channel.send(repair, allowed_mentions=safe_mentions)
                 if not sealed_test_channel:
                     save_model_message(unique_user_ids[0], channel.guild.id, repair, channel_name=getattr(channel, "name", ""), channel_policy=channel_policy)
                 _channel_last_reply_at[channel_id] = datetime.now(PACIFIC_TZ)
@@ -4235,7 +4241,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel):
 
             memory_recall = try_memory_recall_response(unique_user_ids[0], channel.guild.id, combined_text)
             if memory_recall:
-                await channel.send(memory_recall)
+                await channel.send(memory_recall, allowed_mentions=safe_mentions)
                 if not sealed_test_channel:
                     save_model_message(unique_user_ids[0], channel.guild.id, memory_recall, channel_name=getattr(channel, "name", ""), channel_policy=channel_policy)
                 _channel_last_reply_at[channel_id] = datetime.now(PACIFIC_TZ)
@@ -4343,7 +4349,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel):
                         return
                     _log_batch_event(logging.INFO, "generic_ack_suppressed", guild_id, channel_id, len(collapsed_items), f"reason={reason}")
                     return
-                await channel.send(ack)
+                await channel.send(ack, allowed_mentions=safe_mentions)
                 _log_batch_event(logging.INFO, "batch_response_acknowledge", guild_id, channel_id, len(collapsed_items), f"reason={reason}")
                 _channel_last_reply_at[channel_id] = datetime.now(PACIFIC_TZ)
                 return
@@ -4432,7 +4438,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel):
                         channel_id,
                     )
                     if sealed_recall_guard:
-                        await channel.send(sealed_recall_guard)
+                        await channel.send(sealed_recall_guard, allowed_mentions=safe_mentions)
                         _channel_last_reply_at[channel_id] = datetime.now(PACIFIC_TZ)
                         return
 
@@ -4443,7 +4449,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel):
                         channel_id,
                     )
                     if restricted_recall_guard:
-                        await channel.send(restricted_recall_guard)
+                        await channel.send(restricted_recall_guard, allowed_mentions=safe_mentions)
                         _channel_last_reply_at[channel_id] = datetime.now(PACIFIC_TZ)
                         return
                     continue
@@ -4567,12 +4573,12 @@ async def _flush_channel_buffer(channel: discord.TextChannel):
             _log_batch_event(logging.INFO, "message_arrived_after_send_commit", guild_id, channel_id, len(_channel_buffers[channel_id]), f"generation_id={local_generation_id}")
 
         if len(response) <= 2000:
-            await channel.send(response)
+            await channel.send(response, allowed_mentions=safe_mentions)
         else:
             chunks = split_message(response)
-            await channel.send(chunks[0] + "...")
+            await channel.send(chunks[0] + "...", allowed_mentions=safe_mentions)
             for chunk in chunks[1:]:
-                await channel.send("..." + chunk)
+                await channel.send("..." + chunk, allowed_mentions=safe_mentions)
         _log_batch_event(logging.INFO, "response_send_commit_complete", guild_id, channel_id, len(items), f"generation_id={local_generation_id}")
 
         for uid in unique_user_ids:
