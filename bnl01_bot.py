@@ -65,6 +65,10 @@ BATCH_REPLY_COOLDOWN_SECONDS = 2
 BATCH_REQUEST_PAYLOAD_EXTENSION_SECONDS = 6
 BATCH_REQUEST_PAYLOAD_MAX_WAIT_SECONDS = 16
 PENDING_REQUEST_INTENT_TTL_SECONDS = 20
+ADAPTIVE_PAYLOAD_WAIT_NO_ITEMS_SECONDS = 4
+ADAPTIVE_PAYLOAD_WAIT_WITH_ITEMS_SECONDS = 1.5
+ADAPTIVE_PAYLOAD_MAX_WAIT_SECONDS = 9
+ADAPTIVE_PAYLOAD_SEALED_BONUS_SECONDS = 0.75
 
 # ======== DYNAMIC AMBIENT CONFIG ========
 AMBIENT_CONTEXT_MESSAGES = 20
@@ -3625,8 +3629,52 @@ TYPING_SEND_GRACE_SECONDS = 1.5
 HARD_INTERRUPT_REEVALUATE_PAUSE_MIN_SECONDS = 0.75
 HARD_INTERRUPT_REEVALUATE_PAUSE_MAX_SECONDS = 1.5
 
-def _batch_max_wait_seconds(channel_id: int) -> int:
-    return BATCH_REQUEST_PAYLOAD_MAX_WAIT_SECONDS if _channel_payload_wait_extended.get(channel_id) else BATCH_MAX_WAIT_SECONDS
+def _batch_max_wait_seconds(channel_id: int, selected_wait_seconds: float = None) -> float:
+    if selected_wait_seconds is not None:
+        return max(0.5, float(selected_wait_seconds))
+    if _channel_payload_wait_extended.get(channel_id):
+        return float(BATCH_REQUEST_PAYLOAD_MAX_WAIT_SECONDS)
+    return float(BATCH_MAX_WAIT_SECONDS)
+
+
+def _adaptive_batch_wait_seconds(channel: discord.TextChannel, items, pending_state, now: datetime, start: datetime):
+    channel_id = channel.id
+    guild_id = channel.guild.id if channel.guild else 0
+    original_items = list(items or [])
+    collapsed = _collapse_consecutive_batch_fragments(original_items)
+    payload_items = _collect_batch_request_payload_items(original_items, pending_state=bool(pending_state))
+    payload_count = len(payload_items)
+    combined = " ".join([(content or "") for (_n, content, _u) in collapsed])
+    payload_expected, _payload_reason = _detect_request_payload_expectation(combined)
+    request_anchor = bool(payload_expected or pending_state)
+    base_wait = float(BATCH_WINDOW_SECONDS)
+    if request_anchor:
+        if payload_count > 0:
+            base_wait = ADAPTIVE_PAYLOAD_WAIT_WITH_ITEMS_SECONDS
+        else:
+            base_wait = ADAPTIVE_PAYLOAD_WAIT_NO_ITEMS_SECONDS
+        if resolve_channel_policy(channel) == "sealed_test":
+            base_wait += ADAPTIVE_PAYLOAD_SEALED_BONUS_SECONDS
+
+    elapsed_seconds = max(0.0, (now - start).total_seconds())
+    max_wait = float(BATCH_MAX_WAIT_SECONDS)
+    if request_anchor:
+        max_wait = float(min(BATCH_REQUEST_PAYLOAD_MAX_WAIT_SECONDS, ADAPTIVE_PAYLOAD_MAX_WAIT_SECONDS))
+    selected_wait = max(0.75, min(base_wait, max_wait))
+
+    _log_batch_event(logging.INFO, "adaptive_batch_wait_selected", guild_id, channel_id, len(collapsed), f"payload_count={payload_count};elapsed_seconds={elapsed_seconds:.2f};selected_wait_seconds={selected_wait:.2f}")
+    if request_anchor and payload_count > 0 and selected_wait < BATCH_WINDOW_SECONDS:
+        _log_batch_event(logging.INFO, "adaptive_payload_wait_shortened", guild_id, channel_id, len(collapsed), f"payload_count={payload_count};elapsed_seconds={elapsed_seconds:.2f};selected_wait_seconds={selected_wait:.2f}")
+    elif request_anchor and payload_count == 0 and selected_wait >= BATCH_WINDOW_SECONDS:
+        _log_batch_event(logging.INFO, "adaptive_payload_wait_extended", guild_id, channel_id, len(collapsed), f"payload_count={payload_count};elapsed_seconds={elapsed_seconds:.2f};selected_wait_seconds={selected_wait:.2f}")
+
+    return {
+        "selected_wait_seconds": selected_wait,
+        "max_wait_seconds": max_wait,
+        "payload_count": payload_count,
+        "elapsed_seconds": elapsed_seconds,
+        "request_anchor": request_anchor,
+    }
 
 
 def _log_batch_event(level: int, event: str, guild_id: int, channel_id: int, message_count: int, reason: str):
@@ -3649,33 +3697,8 @@ def _typing_signal_is_recent(channel_id: int, now: datetime):
 
 
 def _should_pause_for_recent_typing(channel: discord.TextChannel, items, generation_id: int):
-    channel_id = channel.id
-    now = datetime.now(PACIFIC_TZ)
-    if _channel_generation_typing_pause_used.get(channel_id):
-        return False, "already_paused_once"
-    if not _channel_generating.get(channel_id):
-        return False, "not_generating"
-    if _channel_generation_id.get(channel_id) != generation_id:
-        return False, "generation_changed"
-    if not _typing_signal_is_recent(channel_id, now):
-        return False, "typing_not_recent"
-
-    typing_user_id = _channel_recent_typing_user_id.get(channel_id)
-    if not typing_user_id or typing_user_id == client.user.id:
-        return False, "typing_user_invalid"
-
-    channel_policy = resolve_channel_policy(channel)
-    active_channel_id = get_guild_config(channel.guild.id) if channel.guild else None
-    is_active_scope = (active_channel_id is not None and channel_id == active_channel_id) or (channel_policy == "sealed_test")
-    if not is_active_scope:
-        return False, "channel_not_active_scope"
-
-    recent_speakers = {uid for (_n, _c, uid) in items if uid}
-    if recent_speakers and typing_user_id in recent_speakers:
-        return True, "recent_speaker_typing"
-    if len(recent_speakers) >= 2:
-        return True, "active_conversation_typing"
-    return False, "typing_user_not_relevant"
+    # Typing events are diagnostics only; sent messages are the source of truth.
+    return False, "typing_diagnostic_only"
 
 
 def _hard_interrupt_active_for_generation(channel_id: int, generation_id: int):
@@ -3806,6 +3829,17 @@ def _set_pending_request_intent(channel_id: int, now: datetime, reason: str):
 
 
 def _consume_pending_request_intent(channel_id: int, now: datetime):
+    state = _channel_pending_request_intent.get(channel_id)
+    if not state:
+        return None
+    expires_at = state.get("expires_at")
+    if not expires_at or now > expires_at:
+        _channel_pending_request_intent.pop(channel_id, None)
+        return "expired"
+    return state
+
+
+def _peek_pending_request_intent(channel_id: int, now: datetime):
     state = _channel_pending_request_intent.get(channel_id)
     if not state:
         return None
@@ -4130,7 +4164,7 @@ def _build_payload_fallback_lines(missing_items):
         )
     return "\n".join(lines)
 
-async def _flush_channel_buffer(channel: discord.TextChannel):
+async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_state=None):
     channel_id = channel.id
     guild_id = channel.guild.id
     channel_policy = resolve_channel_policy(channel)
@@ -4163,6 +4197,11 @@ async def _flush_channel_buffer(channel: discord.TextChannel):
         return
 
     batch_start = _channel_first_seen.get(channel_id, now)
+    selected_wait_seconds = float(BATCH_WINDOW_SECONDS)
+    if scheduler_wait_state and isinstance(scheduler_wait_state, dict):
+        selected_wait_seconds = float(scheduler_wait_state.get("selected_wait_seconds", selected_wait_seconds))
+    elif _channel_payload_wait_extended.get(channel_id):
+        selected_wait_seconds = ADAPTIVE_PAYLOAD_WAIT_WITH_ITEMS_SECONDS
     cycle_deadline = batch_start + timedelta(seconds=batch_max_wait)
     items = list(handoff_items) if handoff_items is not None else list(buf)
     pending_state = _consume_pending_request_intent(channel_id, now)
@@ -4369,6 +4408,9 @@ async def _flush_channel_buffer(channel: discord.TextChannel):
                 _log_batch_event(logging.INFO, "simple_request_style_clamped", guild_id, channel_id, len(collapsed_items), f"payload_count={len(active_packet['payload_items'])}")
 
             _log_batch_event(logging.INFO, "active_packet_generation_started", guild_id, channel_id, len(collapsed_items), f"payload_count={len(active_packet['payload_items'])};decision={decision};reason={reason}")
+            generation_elapsed = max(0.0, (datetime.now(PACIFIC_TZ) - batch_start).total_seconds())
+            _log_batch_event(logging.INFO, "generation_started_after_wait", guild_id, channel_id, len(collapsed_items), f"payload_count={len(active_packet['payload_items'])};elapsed_seconds={generation_elapsed:.2f};selected_wait_seconds={selected_wait_seconds:.2f}")
+            _log_batch_event(logging.INFO, "generation_typing_started", guild_id, channel_id, len(collapsed_items), f"payload_count={len(active_packet['payload_items'])};elapsed_seconds={generation_elapsed:.2f};selected_wait_seconds={selected_wait_seconds:.2f}")
             async with channel.typing():
                 response = await get_gemini_response(prompt, user_id=first_uid, guild_id=channel.guild.id)
 
@@ -4479,48 +4521,8 @@ async def _flush_channel_buffer(channel: discord.TextChannel):
             _channel_message_interrupt_generation_id[channel_id] = 0
 
         should_pause_for_typing, typing_reason = _should_pause_for_recent_typing(channel, items, local_generation_id)
-        if should_pause_for_typing:
-            _channel_generation_typing_pause_used[channel_id] = True
-            _log_batch_event(
-                logging.INFO,
-                "typing_pause_before_send",
-                guild_id,
-                channel_id,
-                len(items),
-                f"reason={typing_reason};grace_seconds={TYPING_SEND_GRACE_SECONDS}",
-            )
-            await asyncio.sleep(TYPING_SEND_GRACE_SECONDS)
-            late_after_pause = len(_channel_buffers[channel_id])
-            if late_after_pause > 0:
-                _channel_preempted_generation_id[channel_id] = local_generation_id
-                _channel_message_interrupt_generation_id[channel_id] = local_generation_id
-                _log_batch_event(
-                    logging.INFO,
-                    "typing_pause_message_arrived",
-                    guild_id,
-                    channel_id,
-                    late_after_pause,
-                    "message_after_typing_pause",
-                )
-            else:
-                _log_batch_event(logging.INFO, "typing_pause_expired_no_message", guild_id, channel_id, len(items), "send_proceed")
-        else:
-            if typing_reason in ("already_paused_once", "typing_user_not_relevant"):
-                _log_batch_event(logging.INFO, "typing_signal_ignored", guild_id, channel_id, len(items), f"reason={typing_reason}")
-
-        if _channel_preempted_generation_id.get(channel_id) == local_generation_id:
-            pending_after_pause = len(_channel_buffers[channel_id])
-            interrupted_by_message_after_pause = (_channel_message_interrupt_generation_id.get(channel_id) == local_generation_id)
-            if pending_after_pause > 0 or interrupted_by_message_after_pause:
-                _log_batch_event(logging.INFO, "stale_response_discarded", guild_id, channel_id, len(items), "typing_pause_preempted")
-            if pending_after_pause > 0:
-                pending_task = _channel_tasks.get(channel_id)
-                if not pending_task or pending_task.done():
-                    _channel_tasks[channel_id] = asyncio.create_task(_schedule_flush(channel))
-                return
-            _log_batch_event(logging.INFO, "typing_preempt_cleared_no_pending", guild_id, channel_id, len(items), "typing_only_no_message")
-            _channel_preempted_generation_id[channel_id] = 0
-            _channel_message_interrupt_generation_id[channel_id] = 0
+        if typing_reason:
+            _log_batch_event(logging.INFO, "typing_signal_ignored", guild_id, channel_id, len(items), f"reason={typing_reason}")
 
         if reason.startswith("request_payload_expected:") or reason in ("pending_request_payload_continuation", "pending_request_single_payload_continuation"):
             _log_batch_event(logging.INFO, "request_payload_items_preserved", guild_id, channel_id, len(collapsed_items), "list_items_included_in_prompt")
@@ -4604,31 +4606,39 @@ async def _schedule_flush(channel: discord.TextChannel):
     """
     channel_id = channel.id
     start = _channel_first_seen.get(channel_id, datetime.now(PACIFIC_TZ))
-    hard_wait = _batch_max_wait_seconds(channel_id)
-    deadline = start + timedelta(seconds=hard_wait)
     guild_id = channel.guild.id
 
     while True:
         now = datetime.now(PACIFIC_TZ)
+        pending_state = _peek_pending_request_intent(channel_id, now)
+        if pending_state == "expired":
+            pending_state = None
+        items_snapshot = list(_channel_buffers[channel_id])
+        wait_state = _adaptive_batch_wait_seconds(channel, items_snapshot, pending_state, now, start)
+        selected_wait_seconds = wait_state["selected_wait_seconds"]
+        max_wait_seconds = _batch_max_wait_seconds(channel_id, wait_state["max_wait_seconds"])
+        deadline = start + timedelta(seconds=max_wait_seconds)
+
         if now >= deadline:
             _log_batch_event(logging.INFO, "flush", guild_id, channel_id, len(_channel_buffers[channel_id]), "hard_deadline")
-            await _flush_channel_buffer(channel)
+            await _flush_channel_buffer(channel, scheduler_wait_state=wait_state)
             return
 
-        remaining = (deadline - now).total_seconds()
-        sleep_time = min(BATCH_WINDOW_SECONDS, max(0.1, remaining))
-        await asyncio.sleep(sleep_time)
         last_msg_at = _channel_last_message_at.get(channel_id)
         if last_msg_at is None:
             _log_batch_event(logging.INFO, "skip", guild_id, channel_id, 0, "no_last_message")
             return
-        quiet_for = (datetime.now(PACIFIC_TZ) - last_msg_at).total_seconds()
-        required_quiet = BATCH_WINDOW_SECONDS + (BATCH_REQUEST_PAYLOAD_EXTENSION_SECONDS if _channel_payload_wait_extended.get(channel_id) else 0)
-        if quiet_for >= required_quiet:
-            reason = "quiet_window_extended" if _channel_payload_wait_extended.get(channel_id) else "quiet_window"
-            _log_batch_event(logging.INFO, "flush", guild_id, channel_id, len(_channel_buffers[channel_id]), reason)
-            await _flush_channel_buffer(channel)
+
+        quiet_for = (now - last_msg_at).total_seconds()
+        if quiet_for >= selected_wait_seconds:
+            _log_batch_event(logging.INFO, "flush", guild_id, channel_id, len(_channel_buffers[channel_id]), f"adaptive_quiet_window;selected_wait_seconds={selected_wait_seconds:.2f}")
+            await _flush_channel_buffer(channel, scheduler_wait_state=wait_state)
             return
+
+        remaining_deadline = (deadline - now).total_seconds()
+        remaining_quiet = selected_wait_seconds - quiet_for
+        sleep_time = min(max(0.1, remaining_quiet), max(0.1, remaining_deadline), float(BATCH_WINDOW_SECONDS))
+        await asyncio.sleep(sleep_time)
 
 def _reset_debounce(channel: discord.TextChannel):
     cid = channel.id
