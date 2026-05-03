@@ -4063,7 +4063,14 @@ async def _flush_channel_buffer(channel: discord.TextChannel):
             ack = _build_acknowledgement_response(collapsed_items)
             if not ack:
                 if _hard_interrupt_active_for_generation(channel_id, local_generation_id):
-                    _log_batch_event(logging.INFO, "interrupted_followup_not_suppressed", guild_id, channel_id, len(collapsed_items), f"reason={reason}")
+                    _log_batch_event(logging.INFO, "interrupted_buffer_requeued", guild_id, channel_id, len(collapsed_items), f"reason=ack_suppression_blocked:{reason}")
+                    if channel_id not in _channel_first_seen:
+                        _channel_first_seen[channel_id] = datetime.now(PACIFIC_TZ)
+                    _channel_last_message_at[channel_id] = datetime.now(PACIFIC_TZ)
+                    pending_task = _channel_tasks.get(channel_id)
+                    if not pending_task or pending_task.done():
+                        _channel_tasks[channel_id] = asyncio.create_task(_schedule_flush(channel))
+                    return
                 _log_batch_event(logging.INFO, "generic_ack_suppressed", guild_id, channel_id, len(collapsed_items), f"reason={reason}")
                 return
             await channel.send(ack)
@@ -4111,7 +4118,14 @@ async def _flush_channel_buffer(channel: discord.TextChannel):
                 ack = _build_acknowledgement_response(collapsed_items)
                 if not ack:
                     if _hard_interrupt_active_for_generation(channel_id, local_generation_id):
-                        _log_batch_event(logging.INFO, "interrupted_followup_not_suppressed", guild_id, channel_id, len(collapsed_items), f"reason={reason}")
+                        _log_batch_event(logging.INFO, "interrupted_buffer_requeued", guild_id, channel_id, len(collapsed_items), f"reason=ack_suppression_blocked:{reason}")
+                        if channel_id not in _channel_first_seen:
+                            _channel_first_seen[channel_id] = datetime.now(PACIFIC_TZ)
+                        _channel_last_message_at[channel_id] = datetime.now(PACIFIC_TZ)
+                        pending_task = _channel_tasks.get(channel_id)
+                        if not pending_task or pending_task.done():
+                            _channel_tasks[channel_id] = asyncio.create_task(_schedule_flush(channel))
+                        return
                     _log_batch_event(logging.INFO, "generic_ack_suppressed", guild_id, channel_id, len(collapsed_items), f"reason={reason}")
                     return
                 await channel.send(ack)
@@ -4271,9 +4285,12 @@ async def _flush_channel_buffer(channel: discord.TextChannel):
                 _channel_message_interrupt_generation_id[channel_id] = 0
                 _log_batch_event(logging.INFO, "interrupted_buffer_regenerated", guild_id, channel_id, len(items), "reason=hard_interrupt_merge")
                 _channel_buffers[channel_id].extend(items)
-                _channel_first_seen[channel_id] = datetime.now(PACIFIC_TZ)
+                if channel_id not in _channel_first_seen:
+                    _channel_first_seen[channel_id] = batch_start
                 _channel_last_message_at[channel_id] = datetime.now(PACIFIC_TZ)
-                await _flush_channel_buffer(channel)
+                pending_task = _channel_tasks.get(channel_id)
+                if not pending_task or pending_task.done():
+                    _channel_tasks[channel_id] = asyncio.create_task(_schedule_flush(channel))
                 return
             if buffered_count > 0:
                 _log_batch_event(logging.INFO, "interrupted_buffer_requeued", guild_id, channel_id, buffered_count, "reason=fresh_batch_after_interrupt")
