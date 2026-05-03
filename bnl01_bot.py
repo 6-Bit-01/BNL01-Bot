@@ -1853,6 +1853,74 @@ def get_sealed_test_recall_guard_response(channel_policy: str, user_text: str, g
     )
     return sealed_test_recall_boundary_response()
 
+
+def _asks_recall_style_question(user_text: str) -> bool:
+    text = (user_text or "").strip().lower()
+    if not text:
+        return False
+    recall_tokens = (
+        "what did",
+        "what happened",
+        "what was said",
+        "what did i just say",
+        "what did i say",
+        "do you remember",
+        "recall",
+        "retrieve",
+        "quote",
+        "summarize",
+        "tell me what",
+    )
+    return any(token in text for token in recall_tokens)
+
+
+def _mentions_restricted_channel_target(user_text: str) -> bool:
+    text = (user_text or "").strip().lower()
+    if not text:
+        return False
+    restricted_tokens = (
+        "research-and-development",
+        "#research-and-development",
+        "important",
+        "#important",
+        "planning-and-coordination",
+        "#planning-and-coordination",
+        "mod-resources",
+        "#mod-resources",
+        "ai-avatar",
+        "#ai-avatar",
+        "internal_controlled",
+        "internal controlled",
+        "mod channel",
+        "mod channels",
+        "staff channel",
+        "internal channel",
+        "restricted channel",
+    )
+    return any(token in text for token in restricted_tokens)
+
+
+def restricted_channel_recall_boundary_response() -> str:
+    return (
+        "BNL-01 boundary notice: the channel you referenced is internal/restricted. "
+        "Its contents are not available for public recall from here, and I cannot "
+        "quote, summarize, retrieve, or invent those records in this channel."
+    )
+
+
+def get_restricted_channel_recall_guard_response(channel_policy: str, user_text: str, guild_id: int, channel_id: int) -> str:
+    if channel_policy in {"internal_controlled", "sealed_test"}:
+        return ""
+    if not _asks_recall_style_question(user_text):
+        return ""
+    if not _mentions_restricted_channel_target(user_text):
+        return ""
+    logging.info(
+        f"[conversation] guild_id={guild_id} channel_id={channel_id} reason=restricted_channel_recall_blocked"
+    )
+    return restricted_channel_recall_boundary_response()
+
+
 def try_repair_response(user_text: str) -> str:
     t = (user_text or "").lower().strip()
     if not t:
@@ -3622,6 +3690,17 @@ async def _flush_channel_buffer(channel: discord.TextChannel):
         await channel.send(sealed_recall_guard)
         _channel_last_reply_at[channel_id] = datetime.now(PACIFIC_TZ)
         return
+
+    restricted_recall_guard = get_restricted_channel_recall_guard_response(
+        channel_policy,
+        combined_text,
+        guild_id,
+        channel_id,
+    )
+    if restricted_recall_guard:
+        await channel.send(restricted_recall_guard)
+        _channel_last_reply_at[channel_id] = datetime.now(PACIFIC_TZ)
+        return
     if len(unique_user_ids) == 1:
         member = channel.guild.get_member(unique_user_ids[0])
         self_reflection = try_self_reflection_response(unique_user_ids[0], channel.guild.id, combined_text)
@@ -3949,6 +4028,16 @@ async def on_message(message: discord.Message):
             if sealed_recall_guard:
                 await message.reply(sealed_recall_guard)
                 return
+
+            restricted_recall_guard = get_restricted_channel_recall_guard_response(
+                channel_policy,
+                clean_content,
+                message.guild.id,
+                message.channel.id,
+            )
+            if restricted_recall_guard:
+                await message.reply(restricted_recall_guard)
+                return
             pending_count = len(_channel_buffers[message.channel.id])
             if pending_count:
                 _channel_buffers[message.channel.id].clear()
@@ -4042,6 +4131,16 @@ async def on_message(message: discord.Message):
             await message.reply(sealed_recall_guard)
             return
 
+        restricted_recall_guard = get_restricted_channel_recall_guard_response(
+            channel_policy,
+            clean_content,
+            message.guild.id,
+            message.channel.id,
+        )
+        if restricted_recall_guard:
+            await message.reply(restricted_recall_guard)
+            return
+
         if not is_sealed_test_channel:
             save_user_message(message.author.id, message.author.display_name, message.guild.id, clean_content, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy)
 
@@ -4109,6 +4208,16 @@ async def on_message(message: discord.Message):
         )
         if sealed_recall_guard:
             await message.reply(sealed_recall_guard)
+            return
+
+        restricted_recall_guard = get_restricted_channel_recall_guard_response(
+            channel_policy,
+            clean_content,
+            message.guild.id,
+            message.channel.id,
+        )
+        if restricted_recall_guard:
+            await message.reply(restricted_recall_guard)
             return
 
         if not is_sealed_test_channel:
