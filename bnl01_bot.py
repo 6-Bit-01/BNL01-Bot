@@ -3621,6 +3621,8 @@ _channel_generation_typing_pause_used = defaultdict(bool)
 
 TYPING_RECENT_WINDOW_SECONDS = 5
 TYPING_SEND_GRACE_SECONDS = 1.5
+HARD_INTERRUPT_REEVALUATE_PAUSE_MIN_SECONDS = 0.75
+HARD_INTERRUPT_REEVALUATE_PAUSE_MAX_SECONDS = 1.5
 
 def _batch_max_wait_seconds(channel_id: int) -> int:
     return BATCH_REQUEST_PAYLOAD_MAX_WAIT_SECONDS if _channel_payload_wait_extended.get(channel_id) else BATCH_MAX_WAIT_SECONDS
@@ -3673,6 +3675,14 @@ def _should_pause_for_recent_typing(channel: discord.TextChannel, items, generat
     if len(recent_speakers) >= 2:
         return True, "active_conversation_typing"
     return False, "typing_user_not_relevant"
+
+
+def _hard_interrupt_active_for_generation(channel_id: int, generation_id: int):
+    if _channel_message_interrupt_generation_id.get(channel_id) != generation_id:
+        return False
+    if _channel_preempted_generation_id.get(channel_id) != generation_id:
+        return False
+    return True
 
 
 def _collapse_consecutive_batch_fragments(items):
@@ -4052,6 +4062,8 @@ async def _flush_channel_buffer(channel: discord.TextChannel):
         if decision == "acknowledge":
             ack = _build_acknowledgement_response(collapsed_items)
             if not ack:
+                if _hard_interrupt_active_for_generation(channel_id, local_generation_id):
+                    _log_batch_event(logging.INFO, "interrupted_followup_not_suppressed", guild_id, channel_id, len(collapsed_items), f"reason={reason}")
                 _log_batch_event(logging.INFO, "generic_ack_suppressed", guild_id, channel_id, len(collapsed_items), f"reason={reason}")
                 return
             await channel.send(ack)
@@ -4098,6 +4110,8 @@ async def _flush_channel_buffer(channel: discord.TextChannel):
             if decision == "acknowledge":
                 ack = _build_acknowledgement_response(collapsed_items)
                 if not ack:
+                    if _hard_interrupt_active_for_generation(channel_id, local_generation_id):
+                        _log_batch_event(logging.INFO, "interrupted_followup_not_suppressed", guild_id, channel_id, len(collapsed_items), f"reason={reason}")
                     _log_batch_event(logging.INFO, "generic_ack_suppressed", guild_id, channel_id, len(collapsed_items), f"reason={reason}")
                     return
                 await channel.send(ack)
@@ -4229,6 +4243,44 @@ async def _flush_channel_buffer(channel: discord.TextChannel):
 
         if reason.startswith("request_payload_expected:") or reason in ("pending_request_payload_continuation", "pending_request_single_payload_continuation"):
             _log_batch_event(logging.INFO, "request_payload_items_preserved", guild_id, channel_id, len(collapsed_items), "list_items_included_in_prompt")
+
+        hard_interrupt = _hard_interrupt_active_for_generation(channel_id, local_generation_id)
+        buffered_count = len(_channel_buffers[channel_id])
+        stale_response = hard_interrupt or buffered_count > 0
+        _log_batch_event(
+            logging.INFO,
+            "final_presend_interrupt_check",
+            guild_id,
+            channel_id,
+            buffered_count,
+            f"hard_interrupt={int(hard_interrupt)};stale={int(stale_response)};generation_id={local_generation_id}",
+        )
+        if stale_response:
+            _log_batch_event(logging.INFO, "stale_response_blocked_before_send", guild_id, channel_id, buffered_count, "hard_message_interrupt")
+            if hard_interrupt:
+                pause_seconds = random.uniform(HARD_INTERRUPT_REEVALUATE_PAUSE_MIN_SECONDS, HARD_INTERRUPT_REEVALUATE_PAUSE_MAX_SECONDS)
+                await asyncio.sleep(pause_seconds)
+            if buffered_count > 0 and (not regenerated_once) and datetime.now(PACIFIC_TZ) < cycle_deadline:
+                late_items = list(_channel_buffers[channel_id])
+                _channel_buffers[channel_id].clear()
+                _channel_first_seen.pop(channel_id, None)
+                _channel_last_message_at.pop(channel_id, None)
+                items.extend(late_items)
+                regenerated_once = True
+                _channel_preempted_generation_id[channel_id] = 0
+                _channel_message_interrupt_generation_id[channel_id] = 0
+                _log_batch_event(logging.INFO, "interrupted_buffer_regenerated", guild_id, channel_id, len(items), "reason=hard_interrupt_merge")
+                _channel_buffers[channel_id].extend(items)
+                _channel_first_seen[channel_id] = datetime.now(PACIFIC_TZ)
+                _channel_last_message_at[channel_id] = datetime.now(PACIFIC_TZ)
+                await _flush_channel_buffer(channel)
+                return
+            if buffered_count > 0:
+                _log_batch_event(logging.INFO, "interrupted_buffer_requeued", guild_id, channel_id, buffered_count, "reason=fresh_batch_after_interrupt")
+                pending_task = _channel_tasks.get(channel_id)
+                if not pending_task or pending_task.done():
+                    _channel_tasks[channel_id] = asyncio.create_task(_schedule_flush(channel))
+            return
 
         if len(response) <= 2000:
             await channel.send(response)
@@ -4651,6 +4703,14 @@ async def on_message(message: discord.Message):
         if _channel_generating[message.channel.id]:
             _channel_preempted_generation_id[message.channel.id] = _channel_generation_id[message.channel.id]
             _channel_message_interrupt_generation_id[message.channel.id] = _channel_generation_id[message.channel.id]
+            _log_batch_event(
+                logging.INFO,
+                "hard_message_interrupt_detected",
+                message.guild.id,
+                message.channel.id,
+                len(_channel_buffers[message.channel.id]) + 1,
+                "new_message_while_generating",
+            )
             _log_batch_event(
                 logging.INFO,
                 "stale_generation_interrupted",
