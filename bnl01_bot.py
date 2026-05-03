@@ -618,8 +618,8 @@ RELAY_ANGLE_ROTATION = [
     "field note",
     "archive murmur",
     "cross-band drift",
-    "host trace",
     "corridor note",
+    "receiver note",
 ]
 RELAY_TOPIC_KEYWORDS = {
     "submission_corridor": ("submit", "submission", "track", "send", "payload", "intake"),
@@ -692,7 +692,8 @@ def _weak_context_relay_message(guild_id: int, signal_summary: str, relay_contex
         return "Public signal is quiet. BNL-01 remains online and listening across eligible BARCODE Network channels."
     if mode == "ARCHIVE_ECHO":
         if archive_hint:
-            return "Current public signal is thin. Archive echo: " + archive_hint[:110] + "."
+            clipped_hint = _safe_boundary_truncate(archive_hint, limit=110, min_chars=0, use_ellipsis=True)
+            return "Current public signal is thin. Archive echo: " + clipped_hint
         return "Current public signal is thin. Archive echoes still point toward recurring curiosity around 6 Bit, submission flow, and the next broadcast window."
     if mode == "CANON_TRACE":
         return "No strong Discord-side pattern has formed. BNL-01 is holding near the BARCODE Radio corridor until the next broadcast signal sharpens."
@@ -701,7 +702,8 @@ def _weak_context_relay_message(guild_id: int, signal_summary: str, relay_contex
     if mode == "QUESTION_OR_INVITATION":
         return "Public signal is low. If a new track, question, or odd fragment is ready, BNL-01 can catch it in the open corridor."
     if summary_hint:
-        return "No strong current pattern detected. BNL-01 is comparing older public fragments against the shape of the next transmission. " + summary_hint[:80] + "."
+        clipped_summary = _safe_boundary_truncate(summary_hint, limit=80, min_chars=0, use_ellipsis=True)
+        return "No strong current pattern detected. BNL-01 is comparing older public fragments against the shape of the next transmission. " + clipped_summary
     return "No strong current pattern detected. BNL-01 is comparing older public fragments against the shape of the next transmission."
 
 
@@ -846,8 +848,8 @@ async def generate_dynamic_website_relay(guild_id: int) -> tuple[str, str, str]:
             "community signal activity, engagement metrics, across all channels, broadcast-side movement.\n"
             "Keep it short: 1-3 sentences.\n"
             "Public relay style: BARCODE-flavored but honest; do not fake dynamic movement.\n"
-            "Use terms like interdimensional broadcast, outer channel, transmission corridor, host signal, listening window, public access corridor, submission corridor, cross-band interference, broadcast aperture, signal drift, receiver alignment.\n"
-            "Rotate to one distinct angle for line 1 each time: whisper, wonder, overheard transmission, field note, archive murmur, cross-band drift, host trace, corridor note.\n"
+            "Prefer grounded BARCODE terms like outer channel, transmission corridor, listening window, public access corridor, submission corridor, broadcast aperture, signal drift, receiver alignment, archive echo.\n"
+            "Rotate to one distinct angle for line 1 each time: whisper, wonder, overheard transmission, field note, archive murmur, cross-band drift, corridor note, receiver note.\n"
             "Include light uncertainty sometimes: not sure why, hard to say, something odd, may be nothing, worth watching, could just be timing.\n"
             "Do not sound like a dry server report.\n"
             "Avoid cheesy disaster language like containment breach, red alert, multiverse collapse, emergency protocol, catastrophic anomaly.\n"
