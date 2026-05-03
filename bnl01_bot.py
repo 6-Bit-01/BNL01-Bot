@@ -4383,6 +4383,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel):
                             + "Regenerate now and include every required payload item explicitly by name. "
                             + "Use a direct list format: Item Name: <brief line>. "
                             + "No bracketed stage directions, no cinematic narration, no long atmospheric prose. "
+                            + "Missing required payload items: " + ", ".join(missing_items) + ". "
                             + "Missing item count: " + str(len(missing_items)) + "."
                         )
                         async with channel.typing():
