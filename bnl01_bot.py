@@ -4008,6 +4008,14 @@ async def clear_guild_history_cmd(interaction: discord.Interaction):
 @tree.command(name="myname", description="Set the name BNL-01 should use for you in this server.")
 @app_commands.describe(name="Your preferred name (how BNL-01 should address you)")
 async def myname(interaction: discord.Interaction, name: str):
+    member = interaction.user if isinstance(interaction.user, discord.Member) else None
+    if not is_owner_operator(interaction.user) and not has_mod_role(member):
+        await interaction.response.send_message(
+            "❌ Access denied. `/myname` is restricted to the configured owner or mod role.",
+            ephemeral=True,
+        )
+        return
+
     preferred = name.strip()
     if not preferred or len(preferred) > 40:
         await interaction.response.send_message("❌ Name rejected. Keep it under 40 characters.", ephemeral=True)
