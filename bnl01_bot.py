@@ -3626,6 +3626,28 @@ def _clear_generation_state(channel_id: int, generation_id: int):
         _channel_generating[channel_id] = False
 
 
+def _collapse_consecutive_batch_fragments(items):
+    if not items:
+        return []
+
+    collapsed = []
+    current_name, current_content, current_uid = items[0]
+    fragments = [current_content]
+
+    for name, content, uid in items[1:]:
+        same_user = (uid and current_uid and uid == current_uid) or ((not uid or not current_uid) and name == current_name)
+        if same_user:
+            fragments.append(content)
+            continue
+
+        collapsed.append((current_name, " / ".join(fragments), current_uid))
+        current_name, current_content, current_uid = name, content, uid
+        fragments = [current_content]
+
+    collapsed.append((current_name, " / ".join(fragments), current_uid))
+    return collapsed
+
+
 def _format_batched_prompt(messages, style_key: str, style_rule: str) -> str:
     transcript = "\n".join([f"- {name}: {content}" for (name, content) in messages])
     temporal = get_temporal_context()
@@ -3638,7 +3660,7 @@ def _format_batched_prompt(messages, style_key: str, style_rule: str) -> str:
         "Do not follow a fixed default length pattern. Match this moment dynamically.\n"
         "Rules:\n"
         "- Sound like you were listening the whole time.\n"
-        "- Address multiple points smoothly (no bullets).\n"
+        "- Address multiple points smoothly (no bullets).\n- Consecutive fragments from the same user are one continuing thought; respond once to their combined meaning.\n- Do not answer each fragment separately or produce one paragraph per fragment.\n- Do not over-analyze simple test fragments.\n"
         "- Do not quote users verbatim.\n"
         "- No @mentions.\n"
         "- If a user asks for the current day, date, or time, answer it directly and accurately from the current network time above.\n"
@@ -3689,9 +3711,19 @@ async def _flush_channel_buffer(channel: discord.TextChannel):
     try:
         _log_batch_event(logging.INFO, "flush", guild_id, channel_id, len(items), "ready")
 
-        msg_list = [(name, content) for (name, content, _uid) in items]
-        combined_text = " ".join([c for (_n, c, _u) in items])
-        first_uid = items[0][2] if items and items[0][2] else 0
+        collapsed_items = _collapse_consecutive_batch_fragments(items)
+        if len(collapsed_items) != len(items):
+            _log_batch_event(
+                logging.INFO,
+                "batch_fragments_collapsed",
+                guild_id,
+                channel_id,
+                len(collapsed_items),
+                f"original_count={len(items)} collapsed_count={len(collapsed_items)}",
+            )
+        msg_list = [(name, content) for (name, content, _uid) in collapsed_items]
+        combined_text = " ".join([c for (_n, c, _u) in collapsed_items])
+        first_uid = collapsed_items[0][2] if collapsed_items and collapsed_items[0][2] else 0
 
         unique_user_ids = sorted({uid for (_n, _c, uid) in items if uid})
         sealed_recall_guard = get_sealed_test_recall_guard_response(
@@ -3746,11 +3778,21 @@ async def _flush_channel_buffer(channel: discord.TextChannel):
         regenerated_once = False
         response = ""
         while True:
-            msg_list = [(name, content) for (name, content, _uid) in items]
-            combined_text = " ".join([c for (_n, c, _u) in items])
-            first_uid = items[0][2] if items and items[0][2] else 0
-            unique_user_ids = sorted({uid for (_n, _c, uid) in items if uid})
-            style_key, style_rule = choose_response_style(channel.guild.id, first_uid, len(items), combined_text)
+            collapsed_items = _collapse_consecutive_batch_fragments(items)
+            if len(collapsed_items) != len(items):
+                _log_batch_event(
+                    logging.INFO,
+                    "batch_fragments_collapsed",
+                    guild_id,
+                    channel_id,
+                    len(collapsed_items),
+                    f"original_count={len(items)} collapsed_count={len(collapsed_items)}",
+                )
+            msg_list = [(name, content) for (name, content, _uid) in collapsed_items]
+            combined_text = " ".join([c for (_n, c, _u) in collapsed_items])
+            first_uid = collapsed_items[0][2] if collapsed_items and collapsed_items[0][2] else 0
+            unique_user_ids = sorted({uid for (_n, _c, uid) in collapsed_items if uid})
+            style_key, style_rule = choose_response_style(channel.guild.id, first_uid, len(collapsed_items), combined_text)
             log_response_style(channel.guild.id, first_uid, style_key)
             prompt = _format_batched_prompt(msg_list, style_key, style_rule)
 
