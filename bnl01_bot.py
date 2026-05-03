@@ -4229,7 +4229,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel):
                     if not missing_items:
                         _log_batch_event(logging.INFO, "request_payload_completion_passed", guild_id, channel_id, len(payload_items), "after_regeneration")
                     else:
-                        _log_batch_event(logging.INFO, "request_payload_completion_passed", guild_id, channel_id, len(payload_items), "best_effort_send")
+                        _log_batch_event(logging.INFO, "request_payload_completion_incomplete_after_retry", guild_id, channel_id, len(payload_items), "best_effort_send")
                 else:
                     _log_batch_event(logging.INFO, "request_payload_completion_passed", guild_id, channel_id, len(payload_items), "initial")
 
