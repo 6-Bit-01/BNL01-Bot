@@ -821,7 +821,7 @@ def _build_relay_context(guild_id: int, limit: int = 20) -> str:
         SELECT user_name, content
         FROM conversations
         WHERE guild_id = ? AND role = 'user'
-          AND channel_policy IN ('public_home', 'public_context')
+          AND channel_policy IN ('public_home', 'public_context', 'public_selective')
         ORDER BY id DESC
         LIMIT ?
         """,
@@ -1896,6 +1896,93 @@ def set_preferred_name(user_id: int, guild_id: int, preferred_name: str):
     conn.commit()
     conn.close()
 
+
+
+def get_recent_conversation_count(user_id: int, guild_id: int, limit: int = 200) -> int:
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        SELECT COUNT(*)
+        FROM (
+            SELECT id
+            FROM conversations
+            WHERE user_id=? AND guild_id=?
+            ORDER BY id DESC
+            LIMIT ?
+        )
+        """,
+        (user_id, guild_id, max(1, int(limit))),
+    )
+    row = cursor.fetchone()
+    conn.close()
+    return int(row[0]) if row and row[0] is not None else 0
+
+
+def get_recent_public_context_count(guild_id: int, limit: int = 500) -> int:
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        SELECT COUNT(*)
+        FROM (
+            SELECT id
+            FROM conversations
+            WHERE guild_id=?
+              AND channel_policy IN ('public_home', 'public_context', 'public_selective')
+            ORDER BY id DESC
+            LIMIT ?
+        )
+        """,
+        (guild_id, max(1, int(limit))),
+    )
+    row = cursor.fetchone()
+    conn.close()
+    return int(row[0]) if row and row[0] is not None else 0
+
+
+def conversation_rows_have_channel_policy_metadata(guild_id: int) -> bool:
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        SELECT 1
+        FROM conversations
+        WHERE guild_id=?
+          AND channel_policy IS NOT NULL
+          AND TRIM(channel_policy) != ''
+        LIMIT 1
+        """,
+        (guild_id,),
+    )
+    row = cursor.fetchone()
+    conn.close()
+    return bool(row)
+
+
+def get_guild_policy_counts(guild_id: int):
+    policies = ['sealed_test', 'internal_controlled', 'public_home', 'public_context', 'public_selective']
+    counts = dict((policy, 0) for policy in policies)
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        SELECT channel_policy, COUNT(*)
+        FROM conversations
+        WHERE guild_id=?
+          AND channel_policy IN ('sealed_test', 'internal_controlled', 'public_home', 'public_context', 'public_selective')
+        GROUP BY channel_policy
+        """,
+        (guild_id,),
+    )
+    rows = cursor.fetchall()
+    conn.close()
+    for row in rows:
+        policy = row[0]
+        count = row[1]
+        if policy in counts:
+            counts[policy] = int(count)
+    return counts
 def get_user_profile(user_id: int, guild_id: int):
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
@@ -4203,6 +4290,58 @@ async def bnl_context_check(interaction: discord.Interaction):
         f"- invoker_is_owner: `{is_owner_operator(interaction.user)}`",
         f"- invoker_has_mod_role: `{has_mod_role(member)}`",
         "- behavior_changes_applied: `none` (reporting only)",
+    ]
+    await interaction.response.send_message("\n".join(lines), ephemeral=True)
+
+
+
+@tree.command(name="bnl_memory_check", description="Owner-only safe memory/context diagnostic.")
+async def bnl_memory_check(interaction: discord.Interaction):
+    if not BNL_OWNER_USER_ID:
+        await interaction.response.send_message(
+            "❌ Owner diagnostics are disabled because `BNL_OWNER_USER_ID` is not configured.",
+            ephemeral=True,
+        )
+        return
+    if not is_owner_operator(interaction.user):
+        await interaction.response.send_message("❌ Owner-only command.", ephemeral=True)
+        return
+    if not interaction.guild:
+        await interaction.response.send_message("❌ This command can only be used in a server.", ephemeral=True)
+        return
+
+    guild = interaction.guild
+    current_channel = interaction.channel if isinstance(interaction.channel, discord.abc.GuildChannel) else None
+    policy = resolve_channel_policy(current_channel)
+    context_visibility = context_visibility_for_policy(policy)
+    relay_eligibility = website_relay_eligibility(policy)
+
+    display_name, preferred_name = get_user_profile(interaction.user.id, guild.id)
+    recent_user_rows = get_recent_conversation_count(interaction.user.id, guild.id, limit=200)
+    recent_public_rows = get_recent_public_context_count(guild.id, limit=500)
+    policy_metadata_exists = conversation_rows_have_channel_policy_metadata(guild.id)
+    policy_counts = get_guild_policy_counts(guild.id)
+
+    lines = [
+        "**BNL Memory Diagnostic (safe)**",
+        f"- guild: `{guild.name}` (`{guild.id}`)",
+        f"- channel: `{getattr(current_channel, 'name', 'unknown')}` (`{getattr(current_channel, 'id', 'n/a')}`)",
+        f"- resolved_channel_policy: `{policy}`",
+        f"- context_visibility: `{context_visibility}`",
+        f"- website_relay_eligibility: `{relay_eligibility}`",
+        f"- speaker_profile_exists: `{'yes' if (display_name is not None or preferred_name is not None) else 'no'}`",
+        f"- display_name_present: `{'yes' if bool(display_name) else 'no'}`",
+        f"- preferred_name_present: `{'yes' if bool(preferred_name) else 'no'}`",
+        f"- recent_user_conversation_rows: `{recent_user_rows}` (last 200 max)",
+        f"- recent_guild_public_context_rows: `{recent_public_rows}` (last 500 max)",
+        f"- channel_policy_metadata_exists_on_rows: `{'yes' if policy_metadata_exists else 'no'}`",
+        f"- policy_count_sealed_test: `{policy_counts.get('sealed_test', 0)}`",
+        f"- policy_count_internal_controlled: `{policy_counts.get('internal_controlled', 0)}`",
+        f"- policy_count_public_home: `{policy_counts.get('public_home', 0)}`",
+        f"- policy_count_public_context: `{policy_counts.get('public_context', 0)}`",
+        f"- policy_count_public_selective: `{policy_counts.get('public_selective', 0)}`",
+        "- raw_message_dump: `disabled`",
+        "- memory_mutation: `none (read-only diagnostic)`",
     ]
     await interaction.response.send_message("\n".join(lines), ephemeral=True)
 
