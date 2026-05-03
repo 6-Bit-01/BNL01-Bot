@@ -3845,13 +3845,23 @@ def _collect_batch_request_payload_items(items, pending_state=False):
     Collect payload items from both:
     - single multiline request+list messages
     - separate-message request/list batches (request line followed by short payload lines)
+
+    Separate-message continuation is anchored to the request author by default.
     """
     payload_items = []
     seen = set()
     request_anchor_seen = False
+    request_anchor_user_id = None
     normalized_items = list(items or [])
 
-    for _name, content, _uid in normalized_items:
+    def _add_payload(raw_item: str):
+        key = _normalize_payload_item_key(raw_item)
+        if not key or key in seen:
+            return
+        seen.add(key)
+        payload_items.append(raw_item.strip())
+
+    for _name, content, uid in normalized_items:
         text = (content or "").strip()
         if not text:
             continue
@@ -3859,37 +3869,36 @@ def _collect_batch_request_payload_items(items, pending_state=False):
         multiline = _extract_multiline_request_payload(text)
         if multiline:
             request_anchor_seen = True
+            request_anchor_user_id = uid if uid else request_anchor_user_id
             for raw_item in multiline.get("payload_items", []):
-                key = _normalize_payload_item_key(raw_item)
-                if not key or key in seen:
-                    continue
-                seen.add(key)
-                payload_items.append(raw_item.strip())
+                _add_payload(raw_item)
             continue
 
         intent, _ = _detect_request_intent(text)
         expects_payload, _ = _detect_request_payload_expectation(text)
         if intent and expects_payload:
             request_anchor_seen = True
+            request_anchor_user_id = uid if uid else request_anchor_user_id
             continue
 
         if request_anchor_seen and _is_single_payload_like_item(text):
-            key = _normalize_payload_item_key(text)
-            if not key or key in seen:
-                continue
-            seen.add(key)
-            payload_items.append(text)
+            same_anchor_user = bool(request_anchor_user_id and uid and uid == request_anchor_user_id)
+            missing_user_ids = (not request_anchor_user_id) or (not uid)
+            mentions_bot = bool(re.search(r"\b(bnl|bnl-01|barcode bot)\b", text.lower()))
+            conservative_other_user_payload = _is_single_payload_like_item(text) and len(text) >= 5 and not bool(re.search(r"^(lol|lmao|ok|okay|k|yep|yeah)$", text.lower()))
+
+            if same_anchor_user or (missing_user_ids and mentions_bot) or (mentions_bot and conservative_other_user_payload):
+                _add_payload(text)
 
     if pending_state:
-        for _name, content, _uid in normalized_items:
+        for _name, content, uid in normalized_items:
             text = (content or "").strip()
             if not _is_single_payload_like_item(text):
                 continue
-            key = _normalize_payload_item_key(text)
-            if not key or key in seen:
+            same_anchor_user = bool(request_anchor_user_id and uid and uid == request_anchor_user_id)
+            if request_anchor_user_id and uid and not same_anchor_user:
                 continue
-            seen.add(key)
-            payload_items.append(text)
+            _add_payload(text)
 
     return payload_items
 
@@ -3993,7 +4002,9 @@ def _build_acknowledgement_response(items):
 
 
 def _build_active_response_packet(channel_id: int, items, pending_state, bot_user=None):
-    collapsed_items = _collapse_consecutive_batch_fragments(items)
+    original_items = list(items or [])
+    payload_items = _collect_batch_request_payload_items(original_items, pending_state=bool(pending_state))
+    collapsed_items = _collapse_consecutive_batch_fragments(original_items)
     pending_request = bool(pending_state)
     decision, reason = _classify_batch_engagement(
         collapsed_items,
@@ -4001,7 +4012,6 @@ def _build_active_response_packet(channel_id: int, items, pending_state, bot_use
         pending_request_intent=pending_request,
     )
     is_single_payload_continuation = reason == "pending_request_single_payload_continuation"
-    payload_items = _collect_batch_request_payload_items(items, pending_state=pending_request)
     has_request_payload = bool(payload_items)
     if (not has_request_payload) and pending_request and decision == "answer":
         payload_items = [
@@ -4025,8 +4035,10 @@ def _build_active_response_packet(channel_id: int, items, pending_state, bot_use
     should_acknowledge = decision == "acknowledge" and bool(ack_text)
     should_generate = decision == "answer"
     return {
-        "items": list(items),
+        "items": original_items,
         "collapsed_items": collapsed_items,
+        "original_count": len(original_items),
+        "collapsed_count": len(collapsed_items),
         "decision": decision,
         "reason": reason,
         "payload_items": payload_items,
@@ -4201,11 +4213,13 @@ async def _flush_channel_buffer(channel: discord.TextChannel):
                     save_model_message(unique_user_ids[0], channel.guild.id, memory_recall, channel_name=getattr(channel, "name", ""), channel_policy=channel_policy)
                 _channel_last_reply_at[channel_id] = datetime.now(PACIFIC_TZ)
                 return
-        active_packet = _build_active_response_packet(channel_id, collapsed_items, pending_state, bot_user=client.user)
+        active_packet = _build_active_response_packet(channel_id, items, pending_state, bot_user=client.user)
         decision, reason = active_packet["decision"], active_packet["reason"]
-        _log_batch_event(logging.INFO, "active_packet_built", guild_id, channel_id, len(active_packet["collapsed_items"]), f"payload_count={len(active_packet['payload_items'])};decision={decision};reason={reason}")
-        _log_batch_event(logging.INFO, "active_packet_payload_items", guild_id, channel_id, len(active_packet["collapsed_items"]), f"payload_count={len(active_packet['payload_items'])}")
-        _log_batch_event(logging.INFO, "active_packet_decision", guild_id, channel_id, len(active_packet["collapsed_items"]), f"decision={decision};reason={reason}")
+        _log_batch_event(logging.INFO, "active_packet_original_count", guild_id, channel_id, active_packet["original_count"], f"original_count={active_packet['original_count']}")
+        _log_batch_event(logging.INFO, "active_packet_collapsed_count", guild_id, channel_id, active_packet["collapsed_count"], f"collapsed_count={active_packet['collapsed_count']}")
+        _log_batch_event(logging.INFO, "active_packet_built", guild_id, channel_id, active_packet["collapsed_count"], f"original_count={active_packet['original_count']};collapsed_count={active_packet['collapsed_count']};payload_count={len(active_packet['payload_items'])};decision={decision};reason={reason}")
+        _log_batch_event(logging.INFO, "active_packet_payload_items", guild_id, channel_id, active_packet["collapsed_count"], f"payload_count={len(active_packet['payload_items'])}")
+        _log_batch_event(logging.INFO, "active_packet_decision", guild_id, channel_id, active_packet["collapsed_count"], f"decision={decision};reason={reason}")
         answer_intent_locked = decision == "answer"
         if pending_state and reason in ("pending_request_payload_continuation", "pending_request_single_payload_continuation"):
             _log_batch_event(logging.INFO, "pending_request_intent_used", guild_id, channel_id, len(collapsed_items), "payload_continuation")
@@ -4261,11 +4275,13 @@ async def _flush_channel_buffer(channel: discord.TextChannel):
             combined_text = " ".join([c for (_n, c, _u) in collapsed_items])
             first_uid = collapsed_items[0][2] if collapsed_items and collapsed_items[0][2] else 0
             unique_user_ids = sorted({uid for (_n, _c, uid) in collapsed_items if uid})
-            active_packet = _build_active_response_packet(channel_id, collapsed_items, pending_state, bot_user=client.user)
+            active_packet = _build_active_response_packet(channel_id, items, pending_state, bot_user=client.user)
             decision, reason = active_packet["decision"], active_packet["reason"]
-            _log_batch_event(logging.INFO, "active_packet_built", guild_id, channel_id, len(active_packet["collapsed_items"]), f"payload_count={len(active_packet['payload_items'])};decision={decision};reason={reason}")
-            _log_batch_event(logging.INFO, "active_packet_payload_items", guild_id, channel_id, len(active_packet["collapsed_items"]), f"payload_count={len(active_packet['payload_items'])}")
-            _log_batch_event(logging.INFO, "active_packet_decision", guild_id, channel_id, len(active_packet["collapsed_items"]), f"decision={decision};reason={reason}")
+            _log_batch_event(logging.INFO, "active_packet_original_count", guild_id, channel_id, active_packet["original_count"], f"original_count={active_packet['original_count']}")
+            _log_batch_event(logging.INFO, "active_packet_collapsed_count", guild_id, channel_id, active_packet["collapsed_count"], f"collapsed_count={active_packet['collapsed_count']}")
+            _log_batch_event(logging.INFO, "active_packet_built", guild_id, channel_id, active_packet["collapsed_count"], f"original_count={active_packet['original_count']};collapsed_count={active_packet['collapsed_count']};payload_count={len(active_packet['payload_items'])};decision={decision};reason={reason}")
+            _log_batch_event(logging.INFO, "active_packet_payload_items", guild_id, channel_id, active_packet["collapsed_count"], f"payload_count={len(active_packet['payload_items'])}")
+            _log_batch_event(logging.INFO, "active_packet_decision", guild_id, channel_id, active_packet["collapsed_count"], f"decision={decision};reason={reason}")
             if answer_intent_locked and decision != "answer":
                 _log_batch_event(logging.INFO, "request_intent_preserved", guild_id, channel_id, len(collapsed_items), f"reason={reason}")
                 decision, reason = "answer", "preserved_prior_request_intent"
