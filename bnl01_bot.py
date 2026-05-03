@@ -3492,7 +3492,15 @@ async def website_relay_task():
 _channel_buffers = defaultdict(lambda: deque(maxlen=BATCH_MAX_MESSAGES))  # channel_id -> deque[(name, content, user_id)]
 _channel_tasks = {}
 _channel_first_seen = {}
+_channel_last_message_at = {}
 _channel_last_reply_at = defaultdict(lambda: datetime.min.replace(tzinfo=PACIFIC_TZ))
+
+
+def _log_batch_event(level: int, event: str, guild_id: int, channel_id: int, message_count: int, reason: str):
+    logging.log(
+        level,
+        f"[batch:{event}] guild_id={guild_id} channel_id={channel_id} message_count={message_count} reason={reason}",
+    )
 
 def _format_batched_prompt(messages, style_key: str, style_rule: str) -> str:
     transcript = "\n".join([f"- {name}: {content}" for (name, content) in messages])
@@ -3519,18 +3527,35 @@ def _format_batched_prompt(messages, style_key: str, style_rule: str) -> str:
 
 async def _flush_channel_buffer(channel: discord.TextChannel):
     channel_id = channel.id
+    guild_id = channel.guild.id
     now = datetime.now(PACIFIC_TZ)
+    buf = _channel_buffers[channel_id]
+    message_count = len(buf)
 
-    if (now - _channel_last_reply_at[channel_id]).total_seconds() < BATCH_REPLY_COOLDOWN_SECONDS:
+    if not buf:
+        _log_batch_event(logging.INFO, "skip", guild_id, channel_id, 0, "empty_buffer")
         return
 
-    buf = _channel_buffers[channel_id]
-    if not buf:
+    if (now - _channel_last_reply_at[channel_id]).total_seconds() < BATCH_REPLY_COOLDOWN_SECONDS:
+        buf.clear()
+        _channel_first_seen.pop(channel_id, None)
+        _channel_last_message_at.pop(channel_id, None)
+        _log_batch_event(logging.INFO, "skip", guild_id, channel_id, message_count, "reply_cooldown")
+        return
+
+    last_msg_at = _channel_last_message_at.get(channel_id)
+    if last_msg_at and (now - last_msg_at).total_seconds() > BATCH_MAX_WAIT_SECONDS:
+        buf.clear()
+        _channel_first_seen.pop(channel_id, None)
+        _channel_last_message_at.pop(channel_id, None)
+        _log_batch_event(logging.INFO, "skip", guild_id, channel_id, message_count, "stale_batch")
         return
 
     items = list(buf)
     buf.clear()
     _channel_first_seen.pop(channel_id, None)
+    _channel_last_message_at.pop(channel_id, None)
+    _log_batch_event(logging.INFO, "flush", guild_id, channel_id, len(items), "ready")
 
     msg_list = [(name, content) for (name, content, _uid) in items]
     combined_text = " ".join([c for (_n, c, _u) in items])
@@ -3596,24 +3621,35 @@ async def _schedule_flush(channel: discord.TextChannel):
     channel_id = channel.id
     start = _channel_first_seen.get(channel_id, datetime.now(PACIFIC_TZ))
     deadline = start + timedelta(seconds=BATCH_MAX_WAIT_SECONDS)
+    guild_id = channel.guild.id
 
     while True:
         now = datetime.now(PACIFIC_TZ)
         if now >= deadline:
+            _log_batch_event(logging.INFO, "flush", guild_id, channel_id, len(_channel_buffers[channel_id]), "hard_deadline")
             await _flush_channel_buffer(channel)
             return
 
         remaining = (deadline - now).total_seconds()
         sleep_time = min(BATCH_WINDOW_SECONDS, max(0.1, remaining))
         await asyncio.sleep(sleep_time)
-
-        await _flush_channel_buffer(channel)
-        return
+        last_msg_at = _channel_last_message_at.get(channel_id)
+        if last_msg_at is None:
+            _log_batch_event(logging.INFO, "skip", guild_id, channel_id, 0, "no_last_message")
+            return
+        quiet_for = (datetime.now(PACIFIC_TZ) - last_msg_at).total_seconds()
+        if quiet_for >= BATCH_WINDOW_SECONDS:
+            _log_batch_event(logging.INFO, "flush", guild_id, channel_id, len(_channel_buffers[channel_id]), "quiet_window")
+            await _flush_channel_buffer(channel)
+            return
 
 def _reset_debounce(channel: discord.TextChannel):
     cid = channel.id
     if cid not in _channel_first_seen:
         _channel_first_seen[cid] = datetime.now(PACIFIC_TZ)
+        _log_batch_event(logging.INFO, "create", channel.guild.id, cid, len(_channel_buffers[cid]), "new_batch")
+    elif len(_channel_buffers[cid]) >= BATCH_MAX_MESSAGES:
+        _log_batch_event(logging.INFO, "flush", channel.guild.id, cid, len(_channel_buffers[cid]), "buffer_max")
 
     t = _channel_tasks.get(cid)
     if t and not t.done():
@@ -3835,6 +3871,15 @@ async def on_message(message: discord.Message):
 
         # Mentions/replies -> immediate response (not batched)
         if is_mention or is_reply:
+            pending_count = len(_channel_buffers[message.channel.id])
+            if pending_count:
+                _channel_buffers[message.channel.id].clear()
+                _channel_first_seen.pop(message.channel.id, None)
+                _channel_last_message_at.pop(message.channel.id, None)
+                pending_task = _channel_tasks.get(message.channel.id)
+                if pending_task and not pending_task.done():
+                    pending_task.cancel()
+                _log_batch_event(logging.INFO, "skip", message.guild.id, message.channel.id, pending_count, "direct_reply_preempts_batch")
             repair = try_repair_response(clean_content)
             if repair:
                 save_model_message(message.author.id, message.guild.id, repair)
@@ -3888,6 +3933,10 @@ async def on_message(message: discord.Message):
 
         # Non-mention in active channel -> batch
         _channel_buffers[message.channel.id].append((message.author.display_name, clean_content, message.author.id))
+        _channel_last_message_at[message.channel.id] = datetime.now(PACIFIC_TZ)
+        if len(_channel_buffers[message.channel.id]) >= BATCH_MAX_MESSAGES:
+            await _flush_channel_buffer(message.channel)
+            return
         _reset_debounce(message.channel)
         return
 
