@@ -3662,8 +3662,10 @@ def _should_pause_for_recent_typing(channel: discord.TextChannel, items, generat
         return False, "typing_user_invalid"
 
     channel_policy = resolve_channel_policy(channel)
-    if channel_policy not in ("active", "free_speak", "sealed_test"):
-        return False, "channel_not_active_policy"
+    active_channel_id = get_guild_config(channel.guild.id) if channel.guild else None
+    is_active_scope = (active_channel_id is not None and channel_id == active_channel_id) or (channel_policy == "sealed_test")
+    if not is_active_scope:
+        return False, "channel_not_active_scope"
 
     recent_speakers = {uid for (_n, _c, uid) in items if uid}
     if recent_speakers and typing_user_id in recent_speakers:
