@@ -3610,6 +3610,9 @@ _channel_tasks = {}
 _channel_first_seen = {}
 _channel_last_message_at = {}
 _channel_last_reply_at = defaultdict(lambda: datetime.min.replace(tzinfo=PACIFIC_TZ))
+_channel_generating = defaultdict(bool)
+_channel_generation_id = defaultdict(int)
+_channel_preempted_generation_id = defaultdict(int)
 
 
 def _log_batch_event(level: int, event: str, guild_id: int, channel_id: int, message_count: int, reason: str):
@@ -3617,6 +3620,11 @@ def _log_batch_event(level: int, event: str, guild_id: int, channel_id: int, mes
         level,
         f"[batch:{event}] guild_id={guild_id} channel_id={channel_id} message_count={message_count} reason={reason}",
     )
+
+def _clear_generation_state(channel_id: int, generation_id: int):
+    if _channel_generation_id[channel_id] == generation_id:
+        _channel_generating[channel_id] = False
+
 
 def _format_batched_prompt(messages, style_key: str, style_rule: str) -> str:
     transcript = "\n".join([f"- {name}: {content}" for (name, content) in messages])
@@ -3669,91 +3677,148 @@ async def _flush_channel_buffer(channel: discord.TextChannel):
         _log_batch_event(logging.INFO, "skip", guild_id, channel_id, message_count, "stale_batch")
         return
 
+    batch_start = _channel_first_seen.get(channel_id, now)
+    cycle_deadline = batch_start + timedelta(seconds=BATCH_MAX_WAIT_SECONDS)
     items = list(buf)
     buf.clear()
     _channel_first_seen.pop(channel_id, None)
     _channel_last_message_at.pop(channel_id, None)
-    _log_batch_event(logging.INFO, "flush", guild_id, channel_id, len(items), "ready")
+    _channel_generation_id[channel_id] += 1
+    local_generation_id = _channel_generation_id[channel_id]
+    _channel_generating[channel_id] = True
+    try:
+        _log_batch_event(logging.INFO, "flush", guild_id, channel_id, len(items), "ready")
 
-    msg_list = [(name, content) for (name, content, _uid) in items]
-    combined_text = " ".join([c for (_n, c, _u) in items])
-    first_uid = items[0][2] if items and items[0][2] else 0
+        msg_list = [(name, content) for (name, content, _uid) in items]
+        combined_text = " ".join([c for (_n, c, _u) in items])
+        first_uid = items[0][2] if items and items[0][2] else 0
 
-    unique_user_ids = sorted({uid for (_n, _c, uid) in items if uid})
-    sealed_recall_guard = get_sealed_test_recall_guard_response(
-        channel_policy,
-        combined_text,
-        guild_id,
-        channel_id,
-    )
-    if sealed_recall_guard:
-        await channel.send(sealed_recall_guard)
+        unique_user_ids = sorted({uid for (_n, _c, uid) in items if uid})
+        sealed_recall_guard = get_sealed_test_recall_guard_response(
+            channel_policy,
+            combined_text,
+            guild_id,
+            channel_id,
+        )
+        if sealed_recall_guard:
+            await channel.send(sealed_recall_guard)
+            _channel_last_reply_at[channel_id] = datetime.now(PACIFIC_TZ)
+            return
+
+        restricted_recall_guard = get_restricted_channel_recall_guard_response(
+            channel_policy,
+            combined_text,
+            guild_id,
+            channel_id,
+        )
+        if restricted_recall_guard:
+            await channel.send(restricted_recall_guard)
+            _channel_last_reply_at[channel_id] = datetime.now(PACIFIC_TZ)
+            return
+        if len(unique_user_ids) == 1:
+            member = channel.guild.get_member(unique_user_ids[0])
+            self_reflection = try_self_reflection_response(unique_user_ids[0], channel.guild.id, combined_text)
+            if self_reflection:
+                if not is_privileged_member(member, channel.guild):
+                    self_reflection = "Status reports are restricted to server owner/mod operators."
+                await channel.send(self_reflection)
+                if not sealed_test_channel:
+                    save_model_message(unique_user_ids[0], channel.guild.id, self_reflection, channel_name=getattr(channel, "name", ""), channel_policy=channel_policy)
+                _channel_last_reply_at[channel_id] = datetime.now(PACIFIC_TZ)
+                return
+
+            repair = try_repair_response(combined_text)
+            if repair:
+                await channel.send(repair)
+                if not sealed_test_channel:
+                    save_model_message(unique_user_ids[0], channel.guild.id, repair, channel_name=getattr(channel, "name", ""), channel_policy=channel_policy)
+                _channel_last_reply_at[channel_id] = datetime.now(PACIFIC_TZ)
+                return
+
+            memory_recall = try_memory_recall_response(unique_user_ids[0], channel.guild.id, combined_text)
+            if memory_recall:
+                await channel.send(memory_recall)
+                if not sealed_test_channel:
+                    save_model_message(unique_user_ids[0], channel.guild.id, memory_recall, channel_name=getattr(channel, "name", ""), channel_policy=channel_policy)
+                _channel_last_reply_at[channel_id] = datetime.now(PACIFIC_TZ)
+                return
+
+        regenerated_once = False
+        response = ""
+        while True:
+            msg_list = [(name, content) for (name, content, _uid) in items]
+            combined_text = " ".join([c for (_n, c, _u) in items])
+            first_uid = items[0][2] if items and items[0][2] else 0
+            unique_user_ids = sorted({uid for (_n, _c, uid) in items if uid})
+            style_key, style_rule = choose_response_style(channel.guild.id, first_uid, len(items), combined_text)
+            log_response_style(channel.guild.id, first_uid, style_key)
+            prompt = _format_batched_prompt(msg_list, style_key, style_rule)
+
+            async with channel.typing():
+                response = await get_gemini_response(prompt, user_id=first_uid, guild_id=channel.guild.id)
+
+            if not response:
+                logging.warning(f"⚠️ Batch response generation failed in channel {channel_id}.")
+                return
+
+            late_count = len(_channel_buffers[channel_id])
+            if late_count > 0:
+                _log_batch_event(logging.INFO, "late_message_during_generation", guild_id, channel_id, late_count, "detected")
+                if (not regenerated_once) and datetime.now(PACIFIC_TZ) < cycle_deadline:
+                    late_items = list(_channel_buffers[channel_id])
+                    _channel_buffers[channel_id].clear()
+                    _channel_first_seen.pop(channel_id, None)
+                    _channel_last_message_at.pop(channel_id, None)
+                    items.extend(late_items)
+                    regenerated_once = True
+                    _log_batch_event(logging.INFO, "coalesced_late_messages", guild_id, channel_id, len(items), "merged")
+                    _log_batch_event(logging.INFO, "regenerated_batch_once", guild_id, channel_id, len(items), "retry")
+
+                    combined_text = " ".join([c for (_n, c, _u) in items])
+                    sealed_recall_guard = get_sealed_test_recall_guard_response(
+                        channel_policy,
+                        combined_text,
+                        guild_id,
+                        channel_id,
+                    )
+                    if sealed_recall_guard:
+                        await channel.send(sealed_recall_guard)
+                        _channel_last_reply_at[channel_id] = datetime.now(PACIFIC_TZ)
+                        return
+
+                    restricted_recall_guard = get_restricted_channel_recall_guard_response(
+                        channel_policy,
+                        combined_text,
+                        guild_id,
+                        channel_id,
+                    )
+                    if restricted_recall_guard:
+                        await channel.send(restricted_recall_guard)
+                        _channel_last_reply_at[channel_id] = datetime.now(PACIFIC_TZ)
+                        return
+                    continue
+
+            break
+
+        if _channel_preempted_generation_id.get(channel_id) == local_generation_id:
+            _log_batch_event(logging.INFO, "stale_response_discarded", guild_id, channel_id, len(items), "direct_preempted")
+            return
+
+        if len(response) <= 2000:
+            await channel.send(response)
+        else:
+            chunks = split_message(response)
+            await channel.send(chunks[0] + "...")
+            for chunk in chunks[1:]:
+                await channel.send("..." + chunk)
+
+        for uid in unique_user_ids:
+            if not sealed_test_channel:
+                save_model_message(uid, channel.guild.id, response, channel_name=getattr(channel, "name", ""), channel_policy=channel_policy)
+
         _channel_last_reply_at[channel_id] = datetime.now(PACIFIC_TZ)
-        return
-
-    restricted_recall_guard = get_restricted_channel_recall_guard_response(
-        channel_policy,
-        combined_text,
-        guild_id,
-        channel_id,
-    )
-    if restricted_recall_guard:
-        await channel.send(restricted_recall_guard)
-        _channel_last_reply_at[channel_id] = datetime.now(PACIFIC_TZ)
-        return
-    if len(unique_user_ids) == 1:
-        member = channel.guild.get_member(unique_user_ids[0])
-        self_reflection = try_self_reflection_response(unique_user_ids[0], channel.guild.id, combined_text)
-        if self_reflection:
-            if not is_privileged_member(member, channel.guild):
-                self_reflection = "Status reports are restricted to server owner/mod operators."
-            await channel.send(self_reflection)
-            if not sealed_test_channel:
-                save_model_message(unique_user_ids[0], channel.guild.id, self_reflection, channel_name=getattr(channel, "name", ""), channel_policy=channel_policy)
-            _channel_last_reply_at[channel_id] = datetime.now(PACIFIC_TZ)
-            return
-
-        repair = try_repair_response(combined_text)
-        if repair:
-            await channel.send(repair)
-            if not sealed_test_channel:
-                save_model_message(unique_user_ids[0], channel.guild.id, repair, channel_name=getattr(channel, "name", ""), channel_policy=channel_policy)
-            _channel_last_reply_at[channel_id] = datetime.now(PACIFIC_TZ)
-            return
-
-        memory_recall = try_memory_recall_response(unique_user_ids[0], channel.guild.id, combined_text)
-        if memory_recall:
-            await channel.send(memory_recall)
-            if not sealed_test_channel:
-                save_model_message(unique_user_ids[0], channel.guild.id, memory_recall, channel_name=getattr(channel, "name", ""), channel_policy=channel_policy)
-            _channel_last_reply_at[channel_id] = datetime.now(PACIFIC_TZ)
-            return
-
-    style_key, style_rule = choose_response_style(channel.guild.id, first_uid, len(items), combined_text)
-    log_response_style(channel.guild.id, first_uid, style_key)
-    prompt = _format_batched_prompt(msg_list, style_key, style_rule)
-
-    async with channel.typing():
-        response = await get_gemini_response(prompt, user_id=first_uid, guild_id=channel.guild.id)
-
-    if not response:
-        logging.warning(f"⚠️ Batch response generation failed in channel {channel_id}.")
-        return
-
-    if len(response) <= 2000:
-        await channel.send(response)
-    else:
-        chunks = split_message(response)
-        await channel.send(chunks[0] + "...")
-        for chunk in chunks[1:]:
-            await channel.send("..." + chunk)
-
-    # Save model response into each participant's personal history
-    for uid in unique_user_ids:
-        if not sealed_test_channel:
-            save_model_message(uid, channel.guild.id, response, channel_name=getattr(channel, "name", ""), channel_policy=channel_policy)
-
-    _channel_last_reply_at[channel_id] = datetime.now(PACIFIC_TZ)
+    finally:
+        _clear_generation_state(channel_id, local_generation_id)
 
 async def _schedule_flush(channel: discord.TextChannel):
     """
@@ -4038,6 +4103,9 @@ async def on_message(message: discord.Message):
             if restricted_recall_guard:
                 await message.reply(restricted_recall_guard)
                 return
+            if _channel_generating[message.channel.id]:
+                _channel_preempted_generation_id[message.channel.id] = _channel_generation_id[message.channel.id]
+                _log_batch_event(logging.INFO, "stale_response_discarded", message.guild.id, message.channel.id, len(_channel_buffers[message.channel.id]), "direct_reply_preempted_generation")
             pending_count = len(_channel_buffers[message.channel.id])
             if pending_count:
                 _channel_buffers[message.channel.id].clear()
