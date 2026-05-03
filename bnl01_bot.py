@@ -1807,6 +1807,52 @@ def context_visibility_for_policy(policy: str) -> str:
 def allow_passive_memory_for_policy(policy: str) -> bool:
     return policy in {"public_home", "public_context"}
 
+
+def _asks_about_sealed_test_recall(user_text: str) -> bool:
+    text = (user_text or "").strip().lower()
+    if not text:
+        return False
+    mentions_sealed_target = any(token in text for token in (
+        "#bnl-testing",
+        "bnl-testing",
+        "sealed_test",
+        "sealed test",
+    ))
+    if not mentions_sealed_target:
+        return False
+    recall_intent = any(token in text for token in (
+        "what did",
+        "what happened",
+        "what was said",
+        "what did i just say",
+        "what did i say",
+        "do you remember",
+        "recall",
+        "retrieve",
+        "quote",
+        "tell me what",
+    ))
+    return recall_intent
+
+
+def sealed_test_recall_boundary_response() -> str:
+    return (
+        "BNL-01 boundary notice: #bnl-testing is a sealed diagnostics channel. "
+        "Its test chatter is not carried into public memory or relay, and I cannot "
+        "retrieve or quote sealed test messages from this channel."
+    )
+
+
+def get_sealed_test_recall_guard_response(channel_policy: str, user_text: str, guild_id: int, channel_id: int) -> str:
+    if channel_policy == "sealed_test":
+        return ""
+    if not _asks_about_sealed_test_recall(user_text):
+        return ""
+    logging.info(
+        f"[conversation] guild_id={guild_id} channel_id={channel_id} reason=sealed_test_recall_blocked"
+    )
+    return sealed_test_recall_boundary_response()
+
 def try_repair_response(user_text: str) -> str:
     t = (user_text or "").lower().strip()
     if not t:
@@ -3566,6 +3612,16 @@ async def _flush_channel_buffer(channel: discord.TextChannel):
     first_uid = items[0][2] if items and items[0][2] else 0
 
     unique_user_ids = sorted({uid for (_n, _c, uid) in items if uid})
+    sealed_recall_guard = get_sealed_test_recall_guard_response(
+        channel_policy,
+        combined_text,
+        guild_id,
+        channel_id,
+    )
+    if sealed_recall_guard:
+        await channel.send(sealed_recall_guard)
+        _channel_last_reply_at[channel_id] = datetime.now(PACIFIC_TZ)
+        return
     if len(unique_user_ids) == 1:
         member = channel.guild.get_member(unique_user_ids[0])
         self_reflection = try_self_reflection_response(unique_user_ids[0], channel.guild.id, combined_text)
@@ -3884,6 +3940,15 @@ async def on_message(message: discord.Message):
 
         # Mentions/replies -> immediate response (not batched)
         if is_mention or is_reply:
+            sealed_recall_guard = get_sealed_test_recall_guard_response(
+                channel_policy,
+                clean_content,
+                message.guild.id,
+                message.channel.id,
+            )
+            if sealed_recall_guard:
+                await message.reply(sealed_recall_guard)
+                return
             pending_count = len(_channel_buffers[message.channel.id])
             if pending_count:
                 _channel_buffers[message.channel.id].clear()
@@ -3967,6 +4032,15 @@ async def on_message(message: discord.Message):
         if not clean_content:
             await message.reply("I monitor this channel passively. My active operations are in the designated liaison channel.")
             return
+        sealed_recall_guard = get_sealed_test_recall_guard_response(
+            channel_policy,
+            clean_content,
+            message.guild.id,
+            message.channel.id,
+        )
+        if sealed_recall_guard:
+            await message.reply(sealed_recall_guard)
+            return
 
         if not is_sealed_test_channel:
             save_user_message(message.author.id, message.author.display_name, message.guild.id, clean_content, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy)
@@ -4026,6 +4100,15 @@ async def on_message(message: discord.Message):
     if active_channel_id is None and (is_mention or is_reply):
         if not clean_content:
             await message.reply("You pinged me. How may I assist with BARCODE operations?")
+            return
+        sealed_recall_guard = get_sealed_test_recall_guard_response(
+            channel_policy,
+            clean_content,
+            message.guild.id,
+            message.channel.id,
+        )
+        if sealed_recall_guard:
+            await message.reply(sealed_recall_guard)
             return
 
         if not is_sealed_test_channel:
