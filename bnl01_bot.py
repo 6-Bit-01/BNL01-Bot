@@ -3640,8 +3640,9 @@ def _batch_max_wait_seconds(channel_id: int, selected_wait_seconds: float = None
 def _adaptive_batch_wait_seconds(channel: discord.TextChannel, items, pending_state, now: datetime, start: datetime):
     channel_id = channel.id
     guild_id = channel.guild.id if channel.guild else 0
-    collapsed = _collapse_consecutive_batch_fragments(list(items or []))
-    payload_items = _collect_batch_request_payload_items(collapsed, pending_state=bool(pending_state))
+    original_items = list(items or [])
+    collapsed = _collapse_consecutive_batch_fragments(original_items)
+    payload_items = _collect_batch_request_payload_items(original_items, pending_state=bool(pending_state))
     payload_count = len(payload_items)
     combined = " ".join([(content or "") for (_n, content, _u) in collapsed])
     payload_expected, _payload_reason = _detect_request_payload_expectation(combined)
@@ -3828,6 +3829,17 @@ def _set_pending_request_intent(channel_id: int, now: datetime, reason: str):
 
 
 def _consume_pending_request_intent(channel_id: int, now: datetime):
+    state = _channel_pending_request_intent.get(channel_id)
+    if not state:
+        return None
+    expires_at = state.get("expires_at")
+    if not expires_at or now > expires_at:
+        _channel_pending_request_intent.pop(channel_id, None)
+        return "expired"
+    return state
+
+
+def _peek_pending_request_intent(channel_id: int, now: datetime):
     state = _channel_pending_request_intent.get(channel_id)
     if not state:
         return None
@@ -4596,7 +4608,7 @@ async def _schedule_flush(channel: discord.TextChannel):
 
     while True:
         now = datetime.now(PACIFIC_TZ)
-        pending_state = _consume_pending_request_intent(channel_id, now)
+        pending_state = _peek_pending_request_intent(channel_id, now)
         if pending_state == "expired":
             pending_state = None
         items_snapshot = list(_channel_buffers[channel_id])
