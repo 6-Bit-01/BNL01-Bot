@@ -4067,6 +4067,19 @@ async def _flush_channel_buffer(channel: discord.TextChannel):
 
         if _channel_preempted_generation_id.get(channel_id) == local_generation_id:
             _log_batch_event(logging.INFO, "stale_response_discarded", guild_id, channel_id, len(items), "interrupted_preempted")
+            pending_after_discard = len(_channel_buffers[channel_id])
+            if pending_after_discard > 0:
+                _log_batch_event(
+                    logging.INFO,
+                    "generation_requeued_after_interruption",
+                    guild_id,
+                    channel_id,
+                    pending_after_discard,
+                    "fresh_batch_after_discard",
+                )
+                pending_task = _channel_tasks.get(channel_id)
+                if not pending_task or pending_task.done():
+                    _channel_tasks[channel_id] = asyncio.create_task(_schedule_flush(channel))
             return
 
         if reason.startswith("request_payload_expected:") or reason in ("pending_request_payload_continuation", "pending_request_single_payload_continuation"):
