@@ -1710,19 +1710,14 @@ def try_self_reflection_response(user_id: int, guild_id: int, user_text: str) ->
     if not t:
         return ""
 
-    triggers = (
-        "have you been upgraded",
-        "are you upgraded",
-        "do you feel different",
-        "are you different now",
-        "how are you feeling",
-        "how do you feel",
-        "are you more alive",
+    operator_triggers = (
         "self check",
         "status pulse",
-        "what changed in you",
+        "run status pulse",
+        "memory tracks status",
+        "upgrade status",
     )
-    if any(p in t for p in triggers):
+    if any(p in t for p in operator_triggers):
         return build_upgrade_status_response(user_id, guild_id)
     return ""
 
@@ -3647,6 +3642,26 @@ def _collapse_consecutive_batch_fragments(items):
     collapsed.append((current_name, " / ".join(fragments), current_uid))
     return collapsed
 
+
+
+def _detect_request_intent(text: str):
+    t = (text or "").strip().lower()
+    if not t:
+        return False, "empty"
+    if "?" in t:
+        return True, "question_mark"
+    patterns = [
+        r"\bremember these\b", r"\btell me\b", r"\bmake me\b", r"\bwrite\b", r"\bdraft\b",
+        r"\bgive me\b", r"\bexplain\b", r"\bhelp\b", r"\bfix\b", r"\bsummarize\b",
+        r"\bmake a joke\b", r"\btell me a joke\b", r"\babout each\b", r"\bfor each\b",
+        r"\bcan you\b", r"\bcould you\b", r"\bplease\b", r"\bshow me\b",
+    ]
+    for pat in patterns:
+        if re.search(pat, t):
+            return True, pat
+    if re.search(r"\b(bnl|bnl-01|barcode bot)\b", t) and re.search(r"\b(remember|tell|make|write|draft|give|explain|help|fix|summarize|joke)\b", t):
+        return True, "addressed_imperative"
+    return False, "none"
 def _classify_batch_engagement(items, bot_user=None):
     if not items:
         return "skip", "empty_batch"
@@ -3668,8 +3683,9 @@ def _classify_batch_engagement(items, bot_user=None):
         bool(re.match(r"^\s*(?:" + question_starter + r"|" + helper_starter + r")", t.lower()))
         for t in texts
     )
+    request_intent, request_reason = _detect_request_intent(combined)
     question_like = ("?" in combined) or clause_question_like
-    request_like = bool(re.search(r"\b(help|explain|tell me|please|can you|could you|show|fix)\b", lowered))
+    request_like = request_intent or bool(re.search(r"\b(help|explain|tell me|please|can you|could you|show|fix)\b", lowered))
     bot_named = bool(re.search(r"\b(bnl|bnl-01|barcode bot)\b", lowered))
     numeric_only_cluster = all(bool(re.fullmatch(r"[\d\W_]+", t)) for t in texts)
     short_fragment_cluster = token_count <= max(8, len(texts) * 3)
@@ -3679,6 +3695,8 @@ def _classify_batch_engagement(items, bot_user=None):
     casual_chat_like = bool(re.search(r"\b(yeah|yep|same|ok|okay|cool|nice|true|fair)\b", lowered))
 
     if question_like or request_like or bot_named:
+        if request_intent:
+            return "answer", f"request_intent:{request_reason}"
         return "answer", "question_request_or_addressed"
     if numeric_only_cluster:
         return "skip", "noise_fragment_cluster"
@@ -3805,7 +3823,10 @@ async def _flush_channel_buffer(channel: discord.TextChannel):
             return
         if len(unique_user_ids) == 1:
             member = channel.guild.get_member(unique_user_ids[0])
+            casual_status_like = bool(re.search(r"\b(how are you|how are you feeling|how's it going|you good|how are things|how do you feel)\b", combined_text.lower()))
             self_reflection = try_self_reflection_response(unique_user_ids[0], channel.guild.id, combined_text)
+            if casual_status_like and not self_reflection:
+                _log_batch_event(logging.INFO, "self_report_suppressed", guild_id, channel_id, len(collapsed_items), "casual_status_checkin")
             if self_reflection:
                 if not is_privileged_member(member, channel.guild):
                     self_reflection = "Status reports are restricted to server owner/mod operators."
@@ -3831,6 +3852,9 @@ async def _flush_channel_buffer(channel: discord.TextChannel):
                 _channel_last_reply_at[channel_id] = datetime.now(PACIFIC_TZ)
                 return
         decision, reason = _classify_batch_engagement(collapsed_items, client.user)
+        answer_intent_locked = decision == "answer"
+        if reason.startswith("request_intent:"):
+            _log_batch_event(logging.INFO, "request_intent_detected", guild_id, channel_id, len(collapsed_items), f"reason={reason}")
         _log_batch_event(logging.INFO, "batch_engagement_decision", guild_id, channel_id, len(collapsed_items), f"decision={decision};reason={reason}")
         if decision in ("skip", "observe"):
             _log_batch_event(logging.INFO, "batch_response_skipped", guild_id, channel_id, len(collapsed_items), "no_response_needed")
@@ -3860,6 +3884,11 @@ async def _flush_channel_buffer(channel: discord.TextChannel):
             first_uid = collapsed_items[0][2] if collapsed_items and collapsed_items[0][2] else 0
             unique_user_ids = sorted({uid for (_n, _c, uid) in collapsed_items if uid})
             decision, reason = _classify_batch_engagement(collapsed_items, client.user)
+            if answer_intent_locked and decision != "answer":
+                _log_batch_event(logging.INFO, "request_intent_preserved", guild_id, channel_id, len(collapsed_items), f"reason={reason}")
+                decision, reason = "answer", "preserved_prior_request_intent"
+            if reason.startswith("request_intent:"):
+                _log_batch_event(logging.INFO, "request_intent_detected", guild_id, channel_id, len(collapsed_items), f"reason={reason}")
             _log_batch_event(logging.INFO, "batch_engagement_decision", guild_id, channel_id, len(collapsed_items), f"decision={decision};reason={reason}")
             if decision in ("skip", "observe"):
                 _log_batch_event(logging.INFO, "batch_response_skipped", guild_id, channel_id, len(collapsed_items), "no_response_needed")
@@ -3892,6 +3921,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel):
                     items.extend(late_items)
                     regenerated_once = True
                     _log_batch_event(logging.INFO, "coalesced_late_messages", guild_id, channel_id, len(items), "merged")
+                    _log_batch_event(logging.INFO, "late_request_continuation", guild_id, channel_id, len(items), "regenerate_with_late_payload")
                     _log_batch_event(logging.INFO, "regenerated_batch_once", guild_id, channel_id, len(items), "retry")
 
                     combined_text = " ".join([c for (_n, c, _u) in items])
