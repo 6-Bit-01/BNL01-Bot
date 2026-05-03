@@ -3335,6 +3335,7 @@ intents.messages = True
 intents.message_content = True
 intents.guilds = True
 intents.members = True
+intents.typing = True
 
 client = discord.Client(intents=intents)
 tree = app_commands.CommandTree(client)
@@ -3613,6 +3614,12 @@ _channel_generation_id = defaultdict(int)
 _channel_preempted_generation_id = defaultdict(int)
 _channel_payload_wait_extended = defaultdict(bool)
 _channel_pending_request_intent = {}
+_channel_recent_typing_at = {}
+_channel_recent_typing_user_id = {}
+_channel_generation_typing_pause_used = defaultdict(bool)
+
+TYPING_RECENT_WINDOW_SECONDS = 5
+TYPING_SEND_GRACE_SECONDS = 1.5
 
 def _batch_max_wait_seconds(channel_id: int) -> int:
     return BATCH_REQUEST_PAYLOAD_MAX_WAIT_SECONDS if _channel_payload_wait_extended.get(channel_id) else BATCH_MAX_WAIT_SECONDS
@@ -3627,6 +3634,42 @@ def _log_batch_event(level: int, event: str, guild_id: int, channel_id: int, mes
 def _clear_generation_state(channel_id: int, generation_id: int):
     if _channel_generation_id[channel_id] == generation_id:
         _channel_generating[channel_id] = False
+        _channel_generation_typing_pause_used[channel_id] = False
+
+
+def _typing_signal_is_recent(channel_id: int, now: datetime):
+    typed_at = _channel_recent_typing_at.get(channel_id)
+    if not typed_at:
+        return False
+    return (now - typed_at).total_seconds() <= TYPING_RECENT_WINDOW_SECONDS
+
+
+def _should_pause_for_recent_typing(channel: discord.TextChannel, items, generation_id: int):
+    channel_id = channel.id
+    now = datetime.now(PACIFIC_TZ)
+    if _channel_generation_typing_pause_used.get(channel_id):
+        return False, "already_paused_once"
+    if not _channel_generating.get(channel_id):
+        return False, "not_generating"
+    if _channel_generation_id.get(channel_id) != generation_id:
+        return False, "generation_changed"
+    if not _typing_signal_is_recent(channel_id, now):
+        return False, "typing_not_recent"
+
+    typing_user_id = _channel_recent_typing_user_id.get(channel_id)
+    if not typing_user_id or typing_user_id == client.user.id:
+        return False, "typing_user_invalid"
+
+    channel_policy = resolve_channel_policy(channel)
+    if channel_policy not in ("active", "free_speak", "sealed_test"):
+        return False, "channel_not_active_policy"
+
+    recent_speakers = {uid for (_n, _c, uid) in items if uid}
+    if recent_speakers and typing_user_id in recent_speakers:
+        return True, "recent_speaker_typing"
+    if len(recent_speakers) >= 2:
+        return True, "active_conversation_typing"
+    return False, "typing_user_not_relevant"
 
 
 def _collapse_consecutive_batch_fragments(items):
@@ -4082,6 +4125,41 @@ async def _flush_channel_buffer(channel: discord.TextChannel):
                     _channel_tasks[channel_id] = asyncio.create_task(_schedule_flush(channel))
             return
 
+        should_pause_for_typing, typing_reason = _should_pause_for_recent_typing(channel, items, local_generation_id)
+        if should_pause_for_typing:
+            _channel_generation_typing_pause_used[channel_id] = True
+            _log_batch_event(
+                logging.INFO,
+                "typing_pause_before_send",
+                guild_id,
+                channel_id,
+                len(items),
+                f"reason={typing_reason};grace_seconds={TYPING_SEND_GRACE_SECONDS}",
+            )
+            await asyncio.sleep(TYPING_SEND_GRACE_SECONDS)
+            late_after_pause = len(_channel_buffers[channel_id])
+            if late_after_pause > 0:
+                _channel_preempted_generation_id[channel_id] = local_generation_id
+                _log_batch_event(
+                    logging.INFO,
+                    "typing_pause_message_arrived",
+                    guild_id,
+                    channel_id,
+                    late_after_pause,
+                    "message_after_typing_pause",
+                )
+            else:
+                _log_batch_event(logging.INFO, "typing_pause_expired_no_message", guild_id, channel_id, len(items), "send_proceed")
+
+        if _channel_preempted_generation_id.get(channel_id) == local_generation_id:
+            _log_batch_event(logging.INFO, "stale_response_discarded", guild_id, channel_id, len(items), "typing_pause_preempted")
+            pending_after_pause = len(_channel_buffers[channel_id])
+            if pending_after_pause > 0:
+                pending_task = _channel_tasks.get(channel_id)
+                if not pending_task or pending_task.done():
+                    _channel_tasks[channel_id] = asyncio.create_task(_schedule_flush(channel))
+            return
+
         if reason.startswith("request_payload_expected:") or reason in ("pending_request_payload_continuation", "pending_request_single_payload_continuation"):
             _log_batch_event(logging.INFO, "request_payload_items_preserved", guild_id, channel_id, len(collapsed_items), "list_items_included_in_prompt")
 
@@ -4308,6 +4386,26 @@ Rules:
         greeting = f"{username} has entered the BARCODE Network."
 
     await welcome_channel.send(f"{greeting}\n\nWelcome {member.mention}")
+
+@client.event
+async def on_typing(channel, user, when):
+    if not user or user == client.user:
+        return
+    if not isinstance(channel, discord.TextChannel):
+        return
+    if not channel.guild:
+        return
+    active_channel_id = get_guild_config(channel.guild.id)
+    channel_policy = resolve_channel_policy(channel)
+    is_active_scope = (active_channel_id is not None and channel.id == active_channel_id) or (channel_policy == "sealed_test")
+    if not is_active_scope:
+        return
+    if not _channel_generating.get(channel.id):
+        return
+
+    _channel_recent_typing_at[channel.id] = datetime.now(PACIFIC_TZ)
+    _channel_recent_typing_user_id[channel.id] = user.id
+    _log_batch_event(logging.INFO, "typing_signal_observed", channel.guild.id, channel.id, len(_channel_buffers[channel.id]), f"user_id={user.id};reason=active_generation")
 
 @client.event
 async def on_message(message: discord.Message):
