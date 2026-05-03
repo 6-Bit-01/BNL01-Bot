@@ -3647,6 +3647,62 @@ def _collapse_consecutive_batch_fragments(items):
     collapsed.append((current_name, " / ".join(fragments), current_uid))
     return collapsed
 
+def _classify_batch_engagement(items, bot_user=None):
+    if not items:
+        return "skip", "empty_batch"
+
+    texts = []
+    for _name, content, _uid in items:
+        t = (content or "").strip()
+        if t:
+            texts.append(t)
+    if not texts:
+        return "skip", "empty_text"
+
+    combined = " ".join(texts).strip()
+    lowered = combined.lower()
+    token_count = len([tok for tok in re.split(r"\s+", combined) if tok])
+    question_starter = r"(?:what|why|how|when|where|who)\b"
+    helper_starter = r"(?:can you|could you|would you|do you|did you|is it|are you|should i|should we)\b"
+    clause_question_like = any(
+        bool(re.match(r"^\s*(?:" + question_starter + r"|" + helper_starter + r")", t.lower()))
+        for t in texts
+    )
+    question_like = ("?" in combined) or clause_question_like
+    request_like = bool(re.search(r"\b(help|explain|tell me|please|can you|could you|show|fix)\b", lowered))
+    bot_named = bool(re.search(r"\b(bnl|bnl-01|barcode bot)\b", lowered))
+    numeric_only_cluster = all(bool(re.fullmatch(r"[\d\W_]+", t)) for t in texts)
+    short_fragment_cluster = token_count <= max(8, len(texts) * 3)
+    test_like = bool(re.search(r"\b(test|testing|ping|check|lol|lmao|haha)\b", lowered))
+    distinct_users = len({uid for (_n, _c, uid) in items if uid})
+    substantive_cluster = token_count >= 18 or (token_count >= 12 and len(texts) >= 3)
+    casual_chat_like = bool(re.search(r"\b(yeah|yep|same|ok|okay|cool|nice|true|fair)\b", lowered))
+
+    if question_like or request_like or bot_named:
+        return "answer", "question_request_or_addressed"
+    if numeric_only_cluster:
+        return "skip", "noise_fragment_cluster"
+    if test_like or short_fragment_cluster:
+        return "acknowledge", "light_fragment_or_test_cluster"
+    if distinct_users >= 2:
+        if substantive_cluster and not casual_chat_like:
+            return "answer", "substantive_multi_user_discussion"
+        if substantive_cluster:
+            return "acknowledge", "casual_multi_user_discussion"
+        return "observe", "ambient_multi_user_chat"
+    return "skip", "no_response_needed"
+
+
+def _build_acknowledgement_response(items):
+    texts = [(content or "").strip() for (_name, content, _uid) in items if (content or "").strip()]
+    if not texts:
+        return "Got it."
+    if all(bool(re.fullmatch(r"[\d\W_]+", t)) for t in texts):
+        return "Noted."
+    if len(texts) <= 2 and sum(len(t) for t in texts) < 80:
+        return "Got it — I’m following."
+    return "Heard. I’m tracking the thread."
+
 
 def _format_batched_prompt(messages, style_key: str, style_rule: str) -> str:
     transcript = "\n".join([f"- {name}: {content}" for (name, content) in messages])
@@ -3660,6 +3716,7 @@ def _format_batched_prompt(messages, style_key: str, style_rule: str) -> str:
         "Do not follow a fixed default length pattern. Match this moment dynamically.\n"
         "Rules:\n"
         "- Sound like you were listening the whole time.\n"
+        "- Treat this batch as one live conversational moment and respond to the latest combined state.\n"
         "- Address multiple points smoothly (no bullets).\n- Consecutive fragments from the same user are one continuing thought; respond once to their combined meaning.\n- Do not answer each fragment separately or produce one paragraph per fragment.\n- Do not over-analyze simple test fragments.\n"
         "- Do not quote users verbatim.\n"
         "- No @mentions.\n"
@@ -3724,7 +3781,6 @@ async def _flush_channel_buffer(channel: discord.TextChannel):
         msg_list = [(name, content) for (name, content, _uid) in collapsed_items]
         combined_text = " ".join([c for (_n, c, _u) in collapsed_items])
         first_uid = collapsed_items[0][2] if collapsed_items and collapsed_items[0][2] else 0
-
         unique_user_ids = sorted({uid for (_n, _c, uid) in items if uid})
         sealed_recall_guard = get_sealed_test_recall_guard_response(
             channel_policy,
@@ -3774,6 +3830,17 @@ async def _flush_channel_buffer(channel: discord.TextChannel):
                     save_model_message(unique_user_ids[0], channel.guild.id, memory_recall, channel_name=getattr(channel, "name", ""), channel_policy=channel_policy)
                 _channel_last_reply_at[channel_id] = datetime.now(PACIFIC_TZ)
                 return
+        decision, reason = _classify_batch_engagement(collapsed_items, client.user)
+        _log_batch_event(logging.INFO, "batch_engagement_decision", guild_id, channel_id, len(collapsed_items), f"decision={decision};reason={reason}")
+        if decision in ("skip", "observe"):
+            _log_batch_event(logging.INFO, "batch_response_skipped", guild_id, channel_id, len(collapsed_items), "no_response_needed")
+            return
+        if decision == "acknowledge":
+            ack = _build_acknowledgement_response(collapsed_items)
+            await channel.send(ack)
+            _log_batch_event(logging.INFO, "batch_response_acknowledge", guild_id, channel_id, len(collapsed_items), f"reason={reason}")
+            _channel_last_reply_at[channel_id] = datetime.now(PACIFIC_TZ)
+            return
 
         regenerated_once = False
         response = ""
@@ -3792,6 +3859,17 @@ async def _flush_channel_buffer(channel: discord.TextChannel):
             combined_text = " ".join([c for (_n, c, _u) in collapsed_items])
             first_uid = collapsed_items[0][2] if collapsed_items and collapsed_items[0][2] else 0
             unique_user_ids = sorted({uid for (_n, _c, uid) in collapsed_items if uid})
+            decision, reason = _classify_batch_engagement(collapsed_items, client.user)
+            _log_batch_event(logging.INFO, "batch_engagement_decision", guild_id, channel_id, len(collapsed_items), f"decision={decision};reason={reason}")
+            if decision in ("skip", "observe"):
+                _log_batch_event(logging.INFO, "batch_response_skipped", guild_id, channel_id, len(collapsed_items), "no_response_needed")
+                return
+            if decision == "acknowledge":
+                ack = _build_acknowledgement_response(collapsed_items)
+                await channel.send(ack)
+                _log_batch_event(logging.INFO, "batch_response_acknowledge", guild_id, channel_id, len(collapsed_items), f"reason={reason}")
+                _channel_last_reply_at[channel_id] = datetime.now(PACIFIC_TZ)
+                return
             style_key, style_rule = choose_response_style(channel.guild.id, first_uid, len(collapsed_items), combined_text)
             log_response_style(channel.guild.id, first_uid, style_key)
             prompt = _format_batched_prompt(msg_list, style_key, style_rule)
@@ -3858,6 +3936,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel):
             if not sealed_test_channel:
                 save_model_message(uid, channel.guild.id, response, channel_name=getattr(channel, "name", ""), channel_policy=channel_policy)
 
+        _log_batch_event(logging.INFO, "batch_response_answer", guild_id, channel_id, len(collapsed_items), f"reason={reason}")
         _channel_last_reply_at[channel_id] = datetime.now(PACIFIC_TZ)
     finally:
         _clear_generation_state(channel_id, local_generation_id)
