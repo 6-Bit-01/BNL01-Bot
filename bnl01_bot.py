@@ -3816,6 +3816,54 @@ def _consume_pending_request_intent(channel_id: int, now: datetime):
     return state
 
 
+
+
+def _normalize_payload_item_key(item: str):
+    t = (item or "").strip().lower()
+    t = re.sub(r"\s+", " ", t)
+    return t
+
+
+def _collect_request_payload_items(items):
+    payload_items = []
+    seen = set()
+    for _name, content, _uid in items:
+        detected = _extract_multiline_request_payload(content)
+        if not detected:
+            continue
+        for raw_item in detected.get("payload_items", []):
+            key = _normalize_payload_item_key(raw_item)
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            payload_items.append(raw_item.strip())
+    return payload_items
+
+
+def _response_mentions_payload_item(response: str, item: str):
+    response_norm = (response or "").lower()
+    item_norm = _normalize_payload_item_key(item)
+    if not response_norm or not item_norm:
+        return False
+    if item_norm in response_norm:
+        return True
+    item_tokens = [tok for tok in re.split(r"[^a-z0-9]+", item_norm) if tok]
+    if not item_tokens:
+        return False
+    token_hits = 0
+    for tok in item_tokens:
+        if re.search(r"\b" + re.escape(tok) + r"\b", response_norm):
+            token_hits += 1
+    required = 2 if len(item_tokens) >= 2 else 1
+    return token_hits >= required
+
+
+def _missing_request_payload_items(payload_items, response: str):
+    missing = []
+    for item in payload_items:
+        if not _response_mentions_payload_item(response, item):
+            missing.append(item)
+    return missing
 def _classify_batch_engagement(items, bot_user=None, pending_request_intent=False):
     if not items:
         return "skip", "empty_batch"
@@ -3900,9 +3948,14 @@ def _format_batched_prompt(messages, style_key: str, style_rule: str) -> str:
             continue
         multiline_payload_found = True
         rendered_messages.append(f"- {name}: {detected['request_line']}")
-        rendered_messages.append("  payload items:")
-        for item in detected["payload_items"]:
-            rendered_messages.append(f"  - {item}")
+        rendered_messages.append("REQUEST-LIST PAYLOAD DETECTED")
+        rendered_messages.append("Request:")
+        rendered_messages.append(f"{detected['request_line']}")
+        rendered_messages.append("Payload items:")
+        for i, item in enumerate(detected["payload_items"], start=1):
+            rendered_messages.append(f"{i}. {item}")
+        rendered_messages.append("Completion rule:")
+        rendered_messages.append("Respond to every payload item above.")
     transcript = "\n".join(rendered_messages)
     temporal = get_temporal_context()
 
@@ -3918,10 +3971,10 @@ def _format_batched_prompt(messages, style_key: str, style_rule: str) -> str:
         "- Address multiple points smoothly (no bullets).\n- Consecutive fragments from the same user are one continuing thought; respond once to their combined meaning.\n- Do not answer each fragment separately or produce one paragraph per fragment.\n- Do not over-analyze simple test fragments.\n"
         "- Do not quote users verbatim.\n"
         "- No @mentions.\n"
-        "- If asked to handle a list of people/items, use every provided list item unless impossible.\n"
+        "- If asked to handle a list of people/items, respond to every unique payload item unless impossible.\n"
         "- If a message has a request line followed by newline-separated lines, those later lines are payload/list items for that request.\n"
         "- When payload/list items are present, do not ask for clarification about references like these people/items/names/them.\n"
-        "- If this is a continuation with one newly added payload item, answer that new item directly.\n"
+        "- Do not answer only the first payload item.\n- Do not silently skip any payload item.\n- Duplicate payload items may be treated once unless the user asks for duplicates separately.\n- If an item is unfamiliar, still mention it and respond briefly instead of skipping it.\n- If this is a continuation with one newly added payload item, answer that new item directly.\n"
         "- If a user asks for the current day, date, or time, answer it directly and accurately from the current network time above.\n"
         "- Do not imply BARCODE Radio is live or happening today unless the current show phase supports that.\n"
         "- Calm, lightly corporate, faintly uncanny.\n"
@@ -4085,6 +4138,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel):
             return
 
         regenerated_once = False
+        payload_completion_regenerated = False
         response = ""
         while True:
             collapsed_items = _collapse_consecutive_batch_fragments(items)
@@ -4150,6 +4204,34 @@ async def _flush_channel_buffer(channel: discord.TextChannel):
             if not response:
                 logging.warning(f"⚠️ Batch response generation failed in channel {channel_id}.")
                 return
+
+            payload_items = _collect_request_payload_items(collapsed_items)
+            if payload_items:
+                missing_items = _missing_request_payload_items(payload_items, response)
+                _log_batch_event(logging.INFO, "request_payload_completion_check", guild_id, channel_id, len(payload_items), f"missing={len(missing_items)}")
+                if missing_items:
+                    _log_batch_event(logging.INFO, "request_payload_items_missing", guild_id, channel_id, len(missing_items), f"missing_items={len(missing_items)}")
+                    if not payload_completion_regenerated:
+                        correction_prompt = (
+                            prompt
+                            + "\n\nCORRECTION REQUIRED: Your last draft omitted required payload items. "
+                            + "You must respond to every payload item in the request list. "
+                            + "Missing items: " + ", ".join(missing_items) + ". "
+                            + "Regenerate once now and include each missing item explicitly."
+                        )
+                        async with channel.typing():
+                            regenerated = await get_gemini_response(correction_prompt, user_id=first_uid, guild_id=channel.guild.id)
+                        if regenerated:
+                            response = regenerated
+                            payload_completion_regenerated = True
+                            _log_batch_event(logging.INFO, "request_payload_completion_regenerated", guild_id, channel_id, len(missing_items), "single_retry")
+                            missing_items = _missing_request_payload_items(payload_items, response)
+                    if not missing_items:
+                        _log_batch_event(logging.INFO, "request_payload_completion_passed", guild_id, channel_id, len(payload_items), "after_regeneration")
+                    else:
+                        _log_batch_event(logging.INFO, "request_payload_completion_passed", guild_id, channel_id, len(payload_items), "best_effort_send")
+                else:
+                    _log_batch_event(logging.INFO, "request_payload_completion_passed", guild_id, channel_id, len(payload_items), "initial")
 
             late_count = len(_channel_buffers[channel_id])
             if late_count > 0:
