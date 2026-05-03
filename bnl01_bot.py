@@ -3792,12 +3792,12 @@ def _classify_batch_engagement(items, bot_user=None, pending_request_intent=Fals
 def _build_acknowledgement_response(items):
     texts = [(content or "").strip() for (_name, content, _uid) in items if (content or "").strip()]
     if not texts:
-        return "Got it."
+        return ""
     if all(bool(re.fullmatch(r"[\d\W_]+", t)) for t in texts):
-        return "Noted."
+        return ""
     if len(texts) <= 2 and sum(len(t) for t in texts) < 80:
-        return "Got it — I’m following."
-    return "Heard. I’m tracking the thread."
+        return ""
+    return "Received."
 
 
 def _format_batched_prompt(messages, style_key: str, style_rule: str) -> str:
@@ -3816,6 +3816,8 @@ def _format_batched_prompt(messages, style_key: str, style_rule: str) -> str:
         "- Address multiple points smoothly (no bullets).\n- Consecutive fragments from the same user are one continuing thought; respond once to their combined meaning.\n- Do not answer each fragment separately or produce one paragraph per fragment.\n- Do not over-analyze simple test fragments.\n"
         "- Do not quote users verbatim.\n"
         "- No @mentions.\n"
+        "- If asked to handle a list of people/items, use every provided list item unless impossible.\n"
+        "- If this is a continuation with one newly added payload item, answer that new item directly.\n"
         "- If a user asks for the current day, date, or time, answer it directly and accurately from the current network time above.\n"
         "- Do not imply BARCODE Radio is live or happening today unless the current show phase supports that.\n"
         "- Calm, lightly corporate, faintly uncanny.\n"
@@ -3955,6 +3957,9 @@ async def _flush_channel_buffer(channel: discord.TextChannel):
             _log_batch_event(logging.INFO, "pending_request_intent_used", guild_id, channel_id, len(collapsed_items), "override_acknowledge")
         if decision == "acknowledge":
             ack = _build_acknowledgement_response(collapsed_items)
+            if not ack:
+                _log_batch_event(logging.INFO, "generic_ack_suppressed", guild_id, channel_id, len(collapsed_items), f"reason={reason}")
+                return
             await channel.send(ack)
             _log_batch_event(logging.INFO, "batch_response_acknowledge", guild_id, channel_id, len(collapsed_items), f"reason={reason}")
             _channel_last_reply_at[channel_id] = datetime.now(PACIFIC_TZ)
@@ -3998,6 +4003,9 @@ async def _flush_channel_buffer(channel: discord.TextChannel):
                 _log_batch_event(logging.INFO, "pending_request_intent_used", guild_id, channel_id, len(collapsed_items), "override_acknowledge")
             if decision == "acknowledge":
                 ack = _build_acknowledgement_response(collapsed_items)
+                if not ack:
+                    _log_batch_event(logging.INFO, "generic_ack_suppressed", guild_id, channel_id, len(collapsed_items), f"reason={reason}")
+                    return
                 await channel.send(ack)
                 _log_batch_event(logging.INFO, "batch_response_acknowledge", guild_id, channel_id, len(collapsed_items), f"reason={reason}")
                 _channel_last_reply_at[channel_id] = datetime.now(PACIFIC_TZ)
@@ -4016,6 +4024,8 @@ async def _flush_channel_buffer(channel: discord.TextChannel):
             late_count = len(_channel_buffers[channel_id])
             if late_count > 0:
                 _log_batch_event(logging.INFO, "late_message_during_generation", guild_id, channel_id, late_count, "detected")
+                _channel_preempted_generation_id[channel_id] = local_generation_id
+                _log_batch_event(logging.INFO, "stale_generation_interrupted", guild_id, channel_id, late_count, "late_message_arrived")
                 if (not regenerated_once) and datetime.now(PACIFIC_TZ) < cycle_deadline:
                     late_items = list(_channel_buffers[channel_id])
                     _channel_buffers[channel_id].clear()
@@ -4023,7 +4033,9 @@ async def _flush_channel_buffer(channel: discord.TextChannel):
                     _channel_last_message_at.pop(channel_id, None)
                     items.extend(late_items)
                     regenerated_once = True
+                    _channel_preempted_generation_id[channel_id] = 0
                     _log_batch_event(logging.INFO, "coalesced_late_messages", guild_id, channel_id, len(items), "merged")
+                    _log_batch_event(logging.INFO, "generation_requeued_after_interruption", guild_id, channel_id, len(items), "regenerate_latest_cluster")
                     _log_batch_event(logging.INFO, "late_request_continuation", guild_id, channel_id, len(items), "regenerate_with_late_payload")
                     _log_batch_event(logging.INFO, "regenerated_batch_once", guild_id, channel_id, len(items), "retry")
 
@@ -4054,8 +4066,24 @@ async def _flush_channel_buffer(channel: discord.TextChannel):
             break
 
         if _channel_preempted_generation_id.get(channel_id) == local_generation_id:
-            _log_batch_event(logging.INFO, "stale_response_discarded", guild_id, channel_id, len(items), "direct_preempted")
+            _log_batch_event(logging.INFO, "stale_response_discarded", guild_id, channel_id, len(items), "interrupted_preempted")
+            pending_after_discard = len(_channel_buffers[channel_id])
+            if pending_after_discard > 0:
+                _log_batch_event(
+                    logging.INFO,
+                    "generation_requeued_after_interruption",
+                    guild_id,
+                    channel_id,
+                    pending_after_discard,
+                    "fresh_batch_after_discard",
+                )
+                pending_task = _channel_tasks.get(channel_id)
+                if not pending_task or pending_task.done():
+                    _channel_tasks[channel_id] = asyncio.create_task(_schedule_flush(channel))
             return
+
+        if reason.startswith("request_payload_expected:") or reason in ("pending_request_payload_continuation", "pending_request_single_payload_continuation"):
+            _log_batch_event(logging.INFO, "request_payload_items_preserved", guild_id, channel_id, len(collapsed_items), "list_items_included_in_prompt")
 
         if len(response) <= 2000:
             await channel.send(response)
@@ -4072,6 +4100,8 @@ async def _flush_channel_buffer(channel: discord.TextChannel):
         if reason.startswith("request_intent:") or reason.startswith("request_payload_expected:") or reason in ("pending_request_payload_continuation", "pending_request_single_payload_continuation"):
             _set_pending_request_intent(channel_id, datetime.now(PACIFIC_TZ), reason)
             _log_batch_event(logging.INFO, "pending_request_intent_set", guild_id, channel_id, len(collapsed_items), f"reason={reason}")
+        if reason in ("pending_request_payload_continuation", "pending_request_single_payload_continuation"):
+            _log_batch_event(logging.INFO, "pending_request_continuation_answer", guild_id, channel_id, len(collapsed_items), f"reason={reason}")
         _log_batch_event(logging.INFO, "batch_response_answer", guild_id, channel_id, len(collapsed_items), f"reason={reason}")
         _channel_last_reply_at[channel_id] = datetime.now(PACIFIC_TZ)
     finally:
@@ -4441,6 +4471,16 @@ async def on_message(message: discord.Message):
         # Non-mention in active channel -> batch
         if active_test_free_speak:
             logging.info(f"[conversation] guild_id={message.guild.id} channel_id={message.channel.id} reason=sealed_test_free_speak")
+        if _channel_generating[message.channel.id]:
+            _channel_preempted_generation_id[message.channel.id] = _channel_generation_id[message.channel.id]
+            _log_batch_event(
+                logging.INFO,
+                "stale_generation_interrupted",
+                message.guild.id,
+                message.channel.id,
+                len(_channel_buffers[message.channel.id]) + 1,
+                "new_message_while_generating",
+            )
         _channel_buffers[message.channel.id].append((message.author.display_name, clean_content, message.author.id))
         _channel_last_message_at[message.channel.id] = datetime.now(PACIFIC_TZ)
         if len(_channel_buffers[message.channel.id]) >= BATCH_MAX_MESSAGES:
