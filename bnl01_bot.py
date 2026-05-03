@@ -3910,14 +3910,18 @@ def _response_mentions_payload_item(response: str, item: str):
         return False
     if item_norm in response_norm:
         return True
-    item_tokens = [tok for tok in re.split(r"[^a-z0-9]+", item_norm) if tok]
+    item_tokens = [tok for tok in re.split(r"[^a-z0-9]+", item_norm) if tok and len(tok) >= 2]
     if not item_tokens:
         return False
+    weak_tokens = {"the", "and", "for", "with", "from", "that", "this", "these", "those", "name", "people", "person"}
+    meaningful_tokens = [tok for tok in item_tokens if tok not in weak_tokens]
+    if meaningful_tokens:
+        item_tokens = meaningful_tokens
     token_hits = 0
     for tok in item_tokens:
         if re.search(r"\b" + re.escape(tok) + r"\b", response_norm):
             token_hits += 1
-    required = 2 if len(item_tokens) >= 2 else 1
+    required = len(item_tokens) if len(item_tokens) >= 2 else 1
     return token_hits >= required
 
 
@@ -4089,6 +4093,7 @@ def _format_batched_prompt(messages, style_key: str, style_rule: str) -> str:
         "- If a message has a request line followed by newline-separated lines, those later lines are payload/list items for that request.\n"
         "- When payload/list items are present, do not ask for clarification about references like these people/items/names/them.\n"
         "- Do not answer only the first payload item.\n- Do not silently skip any payload item.\n- Duplicate payload items may be treated once unless the user asks for duplicates separately.\n- If an item is unfamiliar, still mention it and respond briefly instead of skipping it.\n- If this is a continuation with one newly added payload item, answer that new item directly.\n"
+        "- For simple joke/list/name requests, answer in a direct list. Mention every payload item by name. Keep each item brief. Do not write cinematic narration.\n"
         "- If a user asks for the current day, date, or time, answer it directly and accurately from the current network time above.\n"
         "- Do not imply BARCODE Radio is live or happening today unless the current show phase supports that.\n"
         "- Calm, lightly corporate, faintly uncanny.\n"
@@ -4097,6 +4102,33 @@ def _format_batched_prompt(messages, style_key: str, style_rule: str) -> str:
         f"{transcript}\n"
         f"Multiline payload detected in batch: {'yes' if multiline_payload_found else 'no'}\n"
     )
+
+
+def _is_simple_humor_or_list_request(combined_text: str, payload_count: int) -> bool:
+    if payload_count <= 1:
+        return False
+    text = (combined_text or "").lower()
+    humor_cues = bool(re.search(r"\b(joke|funny|roast|quip|punchline)\b", text))
+    list_cues = bool(re.search(r"\b(these people|these names|these items|list|about these|about them)\b", text))
+    return humor_cues or list_cues
+
+
+def _build_payload_fallback_lines(missing_items):
+    def _sanitize_fallback_item(text: str):
+        # Prevent @everyone/@here/user/role mention expansion in fallback lines.
+        return (text or "").replace("@", "@\u200b")
+
+    lines = []
+    for item in missing_items:
+        cleaned = (item or "").strip()
+        if not cleaned:
+            continue
+        safe_item = _sanitize_fallback_item(cleaned)
+        lines.append(
+            safe_item + ": Records are thin, but the Network confirms one thing: "
+            + safe_item + " has already caused at least one suspicious blinking light."
+        )
+    return "\n".join(lines)
 
 async def _flush_channel_buffer(channel: discord.TextChannel):
     channel_id = channel.id
@@ -4145,6 +4177,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel):
     _channel_generation_id[channel_id] += 1
     local_generation_id = _channel_generation_id[channel_id]
     _channel_generating[channel_id] = True
+    safe_mentions = discord.AllowedMentions.none()
     try:
         _log_batch_event(logging.INFO, "flush", guild_id, channel_id, len(items), "ready")
 
@@ -4169,7 +4202,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel):
             channel_id,
         )
         if sealed_recall_guard:
-            await channel.send(sealed_recall_guard)
+            await channel.send(sealed_recall_guard, allowed_mentions=safe_mentions)
             _channel_last_reply_at[channel_id] = datetime.now(PACIFIC_TZ)
             return
 
@@ -4180,7 +4213,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel):
             channel_id,
         )
         if restricted_recall_guard:
-            await channel.send(restricted_recall_guard)
+            await channel.send(restricted_recall_guard, allowed_mentions=safe_mentions)
             _channel_last_reply_at[channel_id] = datetime.now(PACIFIC_TZ)
             return
         if len(unique_user_ids) == 1:
@@ -4192,7 +4225,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel):
             if self_reflection:
                 if not is_privileged_member(member, channel.guild):
                     self_reflection = "Status reports are restricted to server owner/mod operators."
-                await channel.send(self_reflection)
+                await channel.send(self_reflection, allowed_mentions=safe_mentions)
                 if not sealed_test_channel:
                     save_model_message(unique_user_ids[0], channel.guild.id, self_reflection, channel_name=getattr(channel, "name", ""), channel_policy=channel_policy)
                 _channel_last_reply_at[channel_id] = datetime.now(PACIFIC_TZ)
@@ -4200,7 +4233,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel):
 
             repair = try_repair_response(combined_text)
             if repair:
-                await channel.send(repair)
+                await channel.send(repair, allowed_mentions=safe_mentions)
                 if not sealed_test_channel:
                     save_model_message(unique_user_ids[0], channel.guild.id, repair, channel_name=getattr(channel, "name", ""), channel_policy=channel_policy)
                 _channel_last_reply_at[channel_id] = datetime.now(PACIFIC_TZ)
@@ -4208,7 +4241,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel):
 
             memory_recall = try_memory_recall_response(unique_user_ids[0], channel.guild.id, combined_text)
             if memory_recall:
-                await channel.send(memory_recall)
+                await channel.send(memory_recall, allowed_mentions=safe_mentions)
                 if not sealed_test_channel:
                     save_model_message(unique_user_ids[0], channel.guild.id, memory_recall, channel_name=getattr(channel, "name", ""), channel_policy=channel_policy)
                 _channel_last_reply_at[channel_id] = datetime.now(PACIFIC_TZ)
@@ -4316,7 +4349,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel):
                         return
                     _log_batch_event(logging.INFO, "generic_ack_suppressed", guild_id, channel_id, len(collapsed_items), f"reason={reason}")
                     return
-                await channel.send(ack)
+                await channel.send(ack, allowed_mentions=safe_mentions)
                 _log_batch_event(logging.INFO, "batch_response_acknowledge", guild_id, channel_id, len(collapsed_items), f"reason={reason}")
                 _channel_last_reply_at[channel_id] = datetime.now(PACIFIC_TZ)
                 return
@@ -4327,6 +4360,13 @@ async def _flush_channel_buffer(channel: discord.TextChannel):
                 prompt += "\n\nACTIVE REQUEST PAYLOAD ITEMS (respond to every unique item):\n"
                 for i, item in enumerate(active_packet["payload_items"], start=1):
                     prompt += f"{i}. {item}\n"
+            if _is_simple_humor_or_list_request(combined_text, len(active_packet["payload_items"])):
+                prompt += (
+                    "\nUse strict direct format for this response:\n"
+                    "Item Name: <brief response>\n"
+                    "No long intro. No bracketed stage directions. No cinematic prose.\n"
+                )
+                _log_batch_event(logging.INFO, "simple_request_style_clamped", guild_id, channel_id, len(collapsed_items), f"payload_count={len(active_packet['payload_items'])}")
 
             _log_batch_event(logging.INFO, "active_packet_generation_started", guild_id, channel_id, len(collapsed_items), f"payload_count={len(active_packet['payload_items'])};decision={decision};reason={reason}")
             async with channel.typing():
@@ -4339,16 +4379,18 @@ async def _flush_channel_buffer(channel: discord.TextChannel):
             payload_items = list(active_packet["payload_items"])
             if payload_items:
                 missing_items = _missing_request_payload_items(payload_items, response)
-                _log_batch_event(logging.INFO, "active_packet_completion_check", guild_id, channel_id, len(collapsed_items), f"payload_count={len(payload_items)};missing={len(missing_items)};decision={decision};reason={reason}")
+                _log_batch_event(logging.INFO, "active_packet_completion_check", guild_id, channel_id, len(collapsed_items), f"payload_count={len(payload_items)};missing_count={len(missing_items)};decision={decision};reason={reason}")
                 if missing_items:
                     _log_batch_event(logging.INFO, "request_payload_items_missing", guild_id, channel_id, len(missing_items), f"missing_items={len(missing_items)}")
                     if not payload_completion_regenerated:
                         correction_prompt = (
                             prompt
                             + "\n\nCORRECTION REQUIRED: Your last draft omitted required payload items. "
-                            + "You must respond to every payload item in the request list. "
-                            + "Missing items: " + ", ".join(missing_items) + ". "
-                            + "Regenerate once now and include each missing item explicitly."
+                            + "Regenerate now and include every required payload item explicitly by name. "
+                            + "Use a direct list format: Item Name: <brief line>. "
+                            + "No bracketed stage directions, no cinematic narration, no long atmospheric prose. "
+                            + "Missing required payload items: " + ", ".join(missing_items) + ". "
+                            + "Missing item count: " + str(len(missing_items)) + "."
                         )
                         async with channel.typing():
                             regenerated = await get_gemini_response(correction_prompt, user_id=first_uid, guild_id=channel.guild.id)
@@ -4358,11 +4400,15 @@ async def _flush_channel_buffer(channel: discord.TextChannel):
                             _log_batch_event(logging.INFO, "active_packet_completion_regenerated", guild_id, channel_id, len(collapsed_items), f"payload_count={len(payload_items)};missing={len(missing_items)};decision={decision};reason={reason}")
                             missing_items = _missing_request_payload_items(payload_items, response)
                     if not missing_items:
-                        _log_batch_event(logging.INFO, "request_payload_completion_passed", guild_id, channel_id, len(payload_items), "after_regeneration")
+                        _log_batch_event(logging.INFO, "active_packet_completion_passed", guild_id, channel_id, len(payload_items), "after_regeneration")
                     else:
+                        fallback_lines = _build_payload_fallback_lines(missing_items)
+                        if fallback_lines:
+                            response = response.rstrip() + "\n\n" + fallback_lines
+                            _log_batch_event(logging.INFO, "active_packet_completion_fallback_appended", guild_id, channel_id, len(collapsed_items), f"payload_count={len(payload_items)};missing_count={len(missing_items)}")
                         _log_batch_event(logging.INFO, "active_packet_completion_incomplete_after_retry", guild_id, channel_id, len(collapsed_items), f"payload_count={len(payload_items)};decision={decision};reason={reason}")
                 else:
-                    _log_batch_event(logging.INFO, "request_payload_completion_passed", guild_id, channel_id, len(payload_items), "initial")
+                    _log_batch_event(logging.INFO, "active_packet_completion_passed", guild_id, channel_id, len(payload_items), "initial")
 
             late_count = len(_channel_buffers[channel_id])
             if late_count > 0:
@@ -4392,7 +4438,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel):
                         channel_id,
                     )
                     if sealed_recall_guard:
-                        await channel.send(sealed_recall_guard)
+                        await channel.send(sealed_recall_guard, allowed_mentions=safe_mentions)
                         _channel_last_reply_at[channel_id] = datetime.now(PACIFIC_TZ)
                         return
 
@@ -4403,7 +4449,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel):
                         channel_id,
                     )
                     if restricted_recall_guard:
-                        await channel.send(restricted_recall_guard)
+                        await channel.send(restricted_recall_guard, allowed_mentions=safe_mentions)
                         _channel_last_reply_at[channel_id] = datetime.now(PACIFIC_TZ)
                         return
                     continue
@@ -4520,14 +4566,20 @@ async def _flush_channel_buffer(channel: discord.TextChannel):
                 if not pending_task or pending_task.done():
                     _channel_tasks[channel_id] = asyncio.create_task(_schedule_flush(channel))
             return
+        _log_batch_event(logging.INFO, "response_send_commit_start", guild_id, channel_id, len(items), f"generation_id={local_generation_id}")
+        if hard_interrupt:
+            _log_batch_event(logging.INFO, "hard_interrupt_seen_before_commit", guild_id, channel_id, len(items), f"generation_id={local_generation_id}")
+        if len(_channel_buffers[channel_id]) > 0:
+            _log_batch_event(logging.INFO, "message_arrived_after_send_commit", guild_id, channel_id, len(_channel_buffers[channel_id]), f"generation_id={local_generation_id}")
 
         if len(response) <= 2000:
-            await channel.send(response)
+            await channel.send(response, allowed_mentions=safe_mentions)
         else:
             chunks = split_message(response)
-            await channel.send(chunks[0] + "...")
+            await channel.send(chunks[0] + "...", allowed_mentions=safe_mentions)
             for chunk in chunks[1:]:
-                await channel.send("..." + chunk)
+                await channel.send("..." + chunk, allowed_mentions=safe_mentions)
+        _log_batch_event(logging.INFO, "response_send_commit_complete", guild_id, channel_id, len(items), f"generation_id={local_generation_id}")
 
         for uid in unique_user_ids:
             if not sealed_test_channel:
