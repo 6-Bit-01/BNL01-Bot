@@ -573,6 +573,15 @@ RELAY_FALLBACKS = [
     "Submission corridor is active with steady receiver alignment in the public access corridor.",
 ]
 
+RELAY_WEAK_CONTEXT_MODES = (
+    "LOW_SIGNAL_STATUS",
+    "ARCHIVE_ECHO",
+    "CANON_TRACE",
+    "LIGHT_SPECULATION",
+    "QUESTION_OR_INVITATION",
+    "MEMORY_WONDER",
+)
+
 STALE_RELAY_PHRASES = (
     "submission pressure",
     "short-burst chatter",
@@ -592,9 +601,16 @@ STALE_RELAY_PHRASES = (
     "process and categorize incoming user data streams",
     "user engagement remains stable",
     "pattern deviations",
+    "subtle resonance",
+    "interdimensional currents",
+    "host trace",
+    "adjacent signal layer",
+    "pre-echo",
+    "core frequency remains stable",
 )
 _recent_relay_messages: dict[int, list[str]] = {}
 _recent_relay_topics: dict[int, list[str]] = {}
+_recent_weak_context_modes: dict[int, list[str]] = {}
 RELAY_ANGLE_ROTATION = [
     "whisper",
     "wonder",
@@ -638,6 +654,55 @@ def _pick_varied_relay_fallback(avoid: str = "") -> str:
         if msg.strip().lower() != avoid_clean:
             return msg
     return options[0] if options else "Network observation remains active."
+
+
+def _assess_relay_context_strength(messages: list[str], relay_context: str) -> tuple[bool, str]:
+    if not messages:
+        return False, "no_recent_public_messages"
+    informative = 0
+    for msg in messages[:12]:
+        lowered = (msg or "").lower()
+        if len(lowered) >= 25 and ("?" in lowered or "#" in lowered or any(k in lowered for k in ("6 bit", "broadcast", "show", "track", "submit"))):
+            informative += 1
+    if informative >= 2 and relay_context.strip():
+        return True, "public_context_sufficient"
+    if informative >= 3:
+        return True, "public_context_message_dense"
+    return False, "public_context_weak"
+
+
+def _pick_weak_context_mode(guild_id: int) -> str:
+    recent = _recent_weak_context_modes.get(guild_id, [])
+    choices = [m for m in RELAY_WEAK_CONTEXT_MODES if m not in recent[-3:]]
+    if not choices:
+        choices = list(RELAY_WEAK_CONTEXT_MODES)
+    mode = random.choice(choices)
+    history = _recent_weak_context_modes.setdefault(guild_id, [])
+    history.append(mode)
+    if len(history) > 8:
+        del history[:-8]
+    return mode
+
+
+def _weak_context_relay_message(guild_id: int, signal_summary: str, relay_context: str) -> str:
+    mode = _pick_weak_context_mode(guild_id)
+    archive_hint = relay_context.split("||")[0].strip() if relay_context.strip() else ""
+    summary_hint = (signal_summary or "").strip()
+    if mode == "LOW_SIGNAL_STATUS":
+        return "Public signal is quiet. BNL-01 remains online and listening across eligible BARCODE Network channels."
+    if mode == "ARCHIVE_ECHO":
+        if archive_hint:
+            return "Current public signal is thin. Archive echo: " + archive_hint[:110] + "."
+        return "Current public signal is thin. Archive echoes still point toward recurring curiosity around 6 Bit, submission flow, and the next broadcast window."
+    if mode == "CANON_TRACE":
+        return "No strong Discord-side pattern has formed. BNL-01 is holding near the BARCODE Radio corridor until the next broadcast signal sharpens."
+    if mode == "LIGHT_SPECULATION":
+        return "Public channels are quiet, but the relay keeps catching a faint pre-broadcast shape. It may be nothing. BNL-01 is still listening."
+    if mode == "QUESTION_OR_INVITATION":
+        return "Public signal is low. If a new track, question, or odd fragment is ready, BNL-01 can catch it in the open corridor."
+    if summary_hint:
+        return "No strong current pattern detected. BNL-01 is comparing older public fragments against the shape of the next transmission. " + summary_hint[:80] + "."
+    return "No strong current pattern detected. BNL-01 is comparing older public fragments against the shape of the next transmission."
 
 
 def _contains_stale_phrase(text: str) -> bool:
@@ -756,29 +821,32 @@ async def generate_dynamic_website_relay(guild_id: int) -> tuple[str, str, str]:
     mode = _website_relay_mode_from_context(messages, now_pt)
     signal_summary = get_recent_signal_summary(guild_id)
     relay_context = _build_relay_context(guild_id)
+    context_is_strong, context_reason = _assess_relay_context_strength(messages, relay_context)
     recent_topics = _recent_relay_topic_summary(guild_id)
     recent_lines = _recent_relay_messages.get(guild_id, [])[-5:]
     angle_seed = random.choice(RELAY_ANGLE_ROTATION)
     logging.info(
         f"🧠 Relay context inspection guild={guild_id}: "
-        f"has_messages={bool(messages)} has_specific_context={bool(relay_context.strip())} mode={mode}"
+        f"has_messages={bool(messages)} has_specific_context={bool(relay_context.strip())} mode={mode} "
+        f"context_is_strong={context_is_strong} reason={context_reason}"
     )
 
-    if GEMINI_API_KEY:
+    if GEMINI_API_KEY and context_is_strong:
         prompt = (
             "You are BNL-01 generating a website-only relay ticker line.\n"
             "Return exactly two plain-text lines.\n"
-            "Line 1: message about 220-360 chars, complete sentence(s), never cut mid-word or mid-sentence.\n"
+            "Line 1: message about 120-360 chars, complete sentence(s), never cut mid-word or mid-sentence.\n"
             "Line 2: current directive about 120-220 chars, complete sentence, never cut mid-word or mid-sentence.\n"
             "No markdown labels.\n"
             "Public line must be 1-2 compact sentences max.\n"
             "Use concrete Discord-side observations when present: recurring display names, channels, topics, jokes, questions, updates, or patterns.\n"
             "Never invent users, channels, events, or topics.\n"
+            "If concrete details are missing, explicitly say public signal is thin/unclear instead of pretending there is current activity.\n"
             "Avoid stale phrases and concepts: submission pressure, short-burst chatter, archive buffer, signal activity high, "
             "community signal activity, engagement metrics, across all channels, broadcast-side movement.\n"
             "Keep it short: 1-3 sentences.\n"
-            "Public relay style: mysterious interdimensional broadcast station language; clear that something is active.\n"
-            "Use terms like interdimensional broadcast, outer channel, signal layer, transmission corridor, host signal, listening window, public access corridor, submission corridor, cross-band interference, broadcast aperture, signal drift, receiver alignment.\n"
+            "Public relay style: BARCODE-flavored but honest; do not fake dynamic movement.\n"
+            "Use terms like interdimensional broadcast, outer channel, transmission corridor, host signal, listening window, public access corridor, submission corridor, cross-band interference, broadcast aperture, signal drift, receiver alignment.\n"
             "Rotate to one distinct angle for line 1 each time: whisper, wonder, overheard transmission, field note, archive murmur, cross-band drift, host trace, corridor note.\n"
             "Include light uncertainty sometimes: not sure why, hard to say, something odd, may be nothing, worth watching, could just be timing.\n"
             "Do not sound like a dry server report.\n"
@@ -810,21 +878,21 @@ async def generate_dynamic_website_relay(guild_id: int) -> tuple[str, str, str]:
             current_directive = sanitize_website_status_message(lines[1], limit=220, min_chars=120)
 
     if not relay_message or _contains_stale_phrase(relay_message):
-        relay_message = _pick_varied_relay_fallback(_last_website_status_message)
+        relay_message = _weak_context_relay_message(guild_id, signal_summary, relay_context) if not context_is_strong else _pick_varied_relay_fallback(_last_website_status_message)
     if not current_directive:
         current_directive = random.choice(RELAY_DIRECTIVE_FALLBACKS)
 
     if relay_message.strip().lower() == (_last_website_status_message or "").strip().lower() or _is_repetitive_relay(guild_id, relay_message):
-        relay_message = _pick_varied_relay_fallback(relay_message)
+        relay_message = _weak_context_relay_message(guild_id, signal_summary, relay_context) if not context_is_strong else _pick_varied_relay_fallback(relay_message)
     if _contains_stale_phrase(relay_message):
-        relay_message = _pick_varied_relay_fallback(relay_message)
+        relay_message = _weak_context_relay_message(guild_id, signal_summary, relay_context) if not context_is_strong else _pick_varied_relay_fallback(relay_message)
 
     if current_directive.strip().lower() == (_last_website_directive or "").strip().lower():
         options = [d for d in RELAY_DIRECTIVE_FALLBACKS if d.strip().lower() != (_last_website_directive or "").strip().lower()]
         if options:
             current_directive = random.choice(options)
 
-    relay_message = sanitize_website_status_message(relay_message, limit=360, min_chars=220)
+    relay_message = sanitize_website_status_message(relay_message, limit=360, min_chars=120 if context_is_strong else 0)
     logging.info(
         f"📝 Relay generated guild={guild_id} preview={relay_message[:120]!r} "
         f"context_used={bool(relay_context.strip())}"
@@ -1971,11 +2039,11 @@ def get_recent_signal_summary(guild_id: int, limit: int = 14) -> str:
         return ""
     avg_len = sum(len(m) for m in messages) / len(messages)
     if len(messages) >= 10:
-        volume = "discord traffic volume is elevated"
+        volume = "public Discord traffic appears elevated"
     elif len(messages) >= 6:
-        volume = "discord traffic volume is steady"
+        volume = "public Discord traffic appears steady"
     else:
-        volume = "discord traffic volume is light"
+        volume = "public Discord traffic appears light"
     cadence = "rapid exchanges" if avg_len < 70 else "long-form exchanges"
     return f"{volume}; {cadence}"
 
