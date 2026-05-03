@@ -4164,7 +4164,7 @@ def _build_payload_fallback_lines(missing_items):
         )
     return "\n".join(lines)
 
-async def _flush_channel_buffer(channel: discord.TextChannel):
+async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_state=None):
     channel_id = channel.id
     guild_id = channel.guild.id
     channel_policy = resolve_channel_policy(channel)
@@ -4198,7 +4198,9 @@ async def _flush_channel_buffer(channel: discord.TextChannel):
 
     batch_start = _channel_first_seen.get(channel_id, now)
     selected_wait_seconds = float(BATCH_WINDOW_SECONDS)
-    if _channel_payload_wait_extended.get(channel_id):
+    if scheduler_wait_state and isinstance(scheduler_wait_state, dict):
+        selected_wait_seconds = float(scheduler_wait_state.get("selected_wait_seconds", selected_wait_seconds))
+    elif _channel_payload_wait_extended.get(channel_id):
         selected_wait_seconds = ADAPTIVE_PAYLOAD_WAIT_WITH_ITEMS_SECONDS
     cycle_deadline = batch_start + timedelta(seconds=batch_max_wait)
     items = list(handoff_items) if handoff_items is not None else list(buf)
@@ -4619,7 +4621,7 @@ async def _schedule_flush(channel: discord.TextChannel):
 
         if now >= deadline:
             _log_batch_event(logging.INFO, "flush", guild_id, channel_id, len(_channel_buffers[channel_id]), "hard_deadline")
-            await _flush_channel_buffer(channel)
+            await _flush_channel_buffer(channel, scheduler_wait_state=wait_state)
             return
 
         last_msg_at = _channel_last_message_at.get(channel_id)
@@ -4630,7 +4632,7 @@ async def _schedule_flush(channel: discord.TextChannel):
         quiet_for = (now - last_msg_at).total_seconds()
         if quiet_for >= selected_wait_seconds:
             _log_batch_event(logging.INFO, "flush", guild_id, channel_id, len(_channel_buffers[channel_id]), f"adaptive_quiet_window;selected_wait_seconds={selected_wait_seconds:.2f}")
-            await _flush_channel_buffer(channel)
+            await _flush_channel_buffer(channel, scheduler_wait_state=wait_state)
             return
 
         remaining_deadline = (deadline - now).total_seconds()
