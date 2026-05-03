@@ -62,6 +62,9 @@ BATCH_WINDOW_SECONDS = 4
 BATCH_MAX_WAIT_SECONDS = 10
 BATCH_MAX_MESSAGES = 8
 BATCH_REPLY_COOLDOWN_SECONDS = 2
+BATCH_REQUEST_PAYLOAD_EXTENSION_SECONDS = 6
+BATCH_REQUEST_PAYLOAD_MAX_WAIT_SECONDS = 16
+PENDING_REQUEST_INTENT_TTL_SECONDS = 20
 
 # ======== DYNAMIC AMBIENT CONFIG ========
 AMBIENT_CONTEXT_MESSAGES = 20
@@ -3608,6 +3611,8 @@ _channel_last_reply_at = defaultdict(lambda: datetime.min.replace(tzinfo=PACIFIC
 _channel_generating = defaultdict(bool)
 _channel_generation_id = defaultdict(int)
 _channel_preempted_generation_id = defaultdict(int)
+_channel_payload_wait_extended = defaultdict(bool)
+_channel_pending_request_intent = {}
 
 
 def _log_batch_event(level: int, event: str, guild_id: int, channel_id: int, message_count: int, reason: str):
@@ -3662,7 +3667,57 @@ def _detect_request_intent(text: str):
     if re.search(r"\b(bnl|bnl-01|barcode bot)\b", t) and re.search(r"\b(remember|tell|make|write|draft|give|explain|help|fix|summarize|joke)\b", t):
         return True, "addressed_imperative"
     return False, "none"
-def _classify_batch_engagement(items, bot_user=None):
+def _detect_request_payload_expectation(text: str):
+    t = (text or "").strip().lower()
+    if not t:
+        return False, "empty"
+    patterns = [
+        r"\bremember these\b", r"\bthese names\b", r"\btell me a joke about them\b",
+        r"\btell me a joke about each\b", r"\babout each\b", r"\bfor each\b",
+        r"\blist\b", r"\bnames\b", r"\beach of these\b", r"\bfollowing\b",
+        r"\bbelow\b", r"\bhere are\b", r"\bgive me one for each\b", r"\bmake one for each\b",
+    ]
+    for pat in patterns:
+        if re.search(pat, t):
+            return True, pat
+    return False, "none"
+
+
+def _is_payload_like_cluster(items):
+    if not items:
+        return False
+    texts = [(content or "").strip() for (_n, content, _u) in items if (content or "").strip()]
+    if not texts:
+        return False
+    payloadish = 0
+    for t in texts:
+        token_count = len([tok for tok in re.split(r"\s+", t) if tok])
+        has_alpha = bool(re.search(r"[a-zA-Z]", t))
+        if bool(re.fullmatch(r"[\d\W_]+", t)):
+            payloadish += 1
+        elif token_count <= 5 and len(t) <= 40:
+            payloadish += 1
+        elif has_alpha and token_count <= 6:
+            payloadish += 1
+    return payloadish >= max(2, len(texts) - 1)
+
+
+def _set_pending_request_intent(channel_id: int, now: datetime, reason: str):
+    _channel_pending_request_intent[channel_id] = {"expires_at": now + timedelta(seconds=PENDING_REQUEST_INTENT_TTL_SECONDS), "reason": reason}
+
+
+def _consume_pending_request_intent(channel_id: int, now: datetime):
+    state = _channel_pending_request_intent.get(channel_id)
+    if not state:
+        return None
+    expires_at = state.get("expires_at")
+    if not expires_at or now > expires_at:
+        _channel_pending_request_intent.pop(channel_id, None)
+        return "expired"
+    return state
+
+
+def _classify_batch_engagement(items, bot_user=None, pending_request_intent=False):
     if not items:
         return "skip", "empty_batch"
 
@@ -3684,6 +3739,7 @@ def _classify_batch_engagement(items, bot_user=None):
         for t in texts
     )
     request_intent, request_reason = _detect_request_intent(combined)
+    payload_expected, payload_reason = _detect_request_payload_expectation(combined)
     question_like = ("?" in combined) or clause_question_like
     request_like = request_intent or bool(re.search(r"\b(help|explain|tell me|please|can you|could you|show|fix)\b", lowered))
     bot_named = bool(re.search(r"\b(bnl|bnl-01|barcode bot)\b", lowered))
@@ -3694,9 +3750,13 @@ def _classify_batch_engagement(items, bot_user=None):
     substantive_cluster = token_count >= 18 or (token_count >= 12 and len(texts) >= 3)
     casual_chat_like = bool(re.search(r"\b(yeah|yep|same|ok|okay|cool|nice|true|fair)\b", lowered))
 
+    if pending_request_intent and _is_payload_like_cluster(items):
+        return "answer", "pending_request_payload_continuation"
     if question_like or request_like or bot_named:
         if request_intent:
             return "answer", f"request_intent:{request_reason}"
+        if payload_expected:
+            return "answer", f"request_payload_expected:{payload_reason}"
         return "answer", "question_request_or_addressed"
     if numeric_only_cluster:
         return "skip", "noise_fragment_cluster"
@@ -3775,8 +3835,12 @@ async def _flush_channel_buffer(channel: discord.TextChannel):
         return
 
     batch_start = _channel_first_seen.get(channel_id, now)
-    cycle_deadline = batch_start + timedelta(seconds=BATCH_MAX_WAIT_SECONDS)
+    cycle_deadline = batch_start + timedelta(seconds=BATCH_REQUEST_PAYLOAD_MAX_WAIT_SECONDS)
     items = list(buf)
+    pending_state = _consume_pending_request_intent(channel_id, now)
+    if pending_state == "expired":
+        _log_batch_event(logging.INFO, "pending_request_intent_expired", guild_id, channel_id, len(items), "ttl_elapsed")
+        pending_state = None
     buf.clear()
     _channel_first_seen.pop(channel_id, None)
     _channel_last_message_at.pop(channel_id, None)
@@ -3851,14 +3915,19 @@ async def _flush_channel_buffer(channel: discord.TextChannel):
                     save_model_message(unique_user_ids[0], channel.guild.id, memory_recall, channel_name=getattr(channel, "name", ""), channel_policy=channel_policy)
                 _channel_last_reply_at[channel_id] = datetime.now(PACIFIC_TZ)
                 return
-        decision, reason = _classify_batch_engagement(collapsed_items, client.user)
+        decision, reason = _classify_batch_engagement(collapsed_items, client.user, pending_request_intent=bool(pending_state))
         answer_intent_locked = decision == "answer"
+        if pending_state and reason == "pending_request_payload_continuation":
+            _log_batch_event(logging.INFO, "pending_request_intent_used", guild_id, channel_id, len(collapsed_items), "payload_continuation")
         if reason.startswith("request_intent:"):
             _log_batch_event(logging.INFO, "request_intent_detected", guild_id, channel_id, len(collapsed_items), f"reason={reason}")
         _log_batch_event(logging.INFO, "batch_engagement_decision", guild_id, channel_id, len(collapsed_items), f"decision={decision};reason={reason}")
         if decision in ("skip", "observe"):
             _log_batch_event(logging.INFO, "batch_response_skipped", guild_id, channel_id, len(collapsed_items), "no_response_needed")
             return
+        if decision == "acknowledge" and pending_state and _is_payload_like_cluster(collapsed_items):
+            decision, reason = "answer", "pending_request_payload_continuation"
+            _log_batch_event(logging.INFO, "pending_request_intent_used", guild_id, channel_id, len(collapsed_items), "override_acknowledge")
         if decision == "acknowledge":
             ack = _build_acknowledgement_response(collapsed_items)
             await channel.send(ack)
@@ -3883,16 +3952,21 @@ async def _flush_channel_buffer(channel: discord.TextChannel):
             combined_text = " ".join([c for (_n, c, _u) in collapsed_items])
             first_uid = collapsed_items[0][2] if collapsed_items and collapsed_items[0][2] else 0
             unique_user_ids = sorted({uid for (_n, _c, uid) in collapsed_items if uid})
-            decision, reason = _classify_batch_engagement(collapsed_items, client.user)
+            decision, reason = _classify_batch_engagement(collapsed_items, client.user, pending_request_intent=bool(pending_state))
             if answer_intent_locked and decision != "answer":
                 _log_batch_event(logging.INFO, "request_intent_preserved", guild_id, channel_id, len(collapsed_items), f"reason={reason}")
                 decision, reason = "answer", "preserved_prior_request_intent"
+            if pending_state and reason == "pending_request_payload_continuation":
+                _log_batch_event(logging.INFO, "pending_request_intent_used", guild_id, channel_id, len(collapsed_items), "payload_continuation")
             if reason.startswith("request_intent:"):
                 _log_batch_event(logging.INFO, "request_intent_detected", guild_id, channel_id, len(collapsed_items), f"reason={reason}")
             _log_batch_event(logging.INFO, "batch_engagement_decision", guild_id, channel_id, len(collapsed_items), f"decision={decision};reason={reason}")
             if decision in ("skip", "observe"):
                 _log_batch_event(logging.INFO, "batch_response_skipped", guild_id, channel_id, len(collapsed_items), "no_response_needed")
                 return
+            if decision == "acknowledge" and pending_state and _is_payload_like_cluster(collapsed_items):
+                decision, reason = "answer", "pending_request_payload_continuation"
+                _log_batch_event(logging.INFO, "pending_request_intent_used", guild_id, channel_id, len(collapsed_items), "override_acknowledge")
             if decision == "acknowledge":
                 ack = _build_acknowledgement_response(collapsed_items)
                 await channel.send(ack)
@@ -3966,9 +4040,13 @@ async def _flush_channel_buffer(channel: discord.TextChannel):
             if not sealed_test_channel:
                 save_model_message(uid, channel.guild.id, response, channel_name=getattr(channel, "name", ""), channel_policy=channel_policy)
 
+        if reason.startswith("request_intent:") or reason.startswith("request_payload_expected:") or reason == "pending_request_payload_continuation":
+            _set_pending_request_intent(channel_id, datetime.now(PACIFIC_TZ), reason)
+            _log_batch_event(logging.INFO, "pending_request_intent_set", guild_id, channel_id, len(collapsed_items), f"reason={reason}")
         _log_batch_event(logging.INFO, "batch_response_answer", guild_id, channel_id, len(collapsed_items), f"reason={reason}")
         _channel_last_reply_at[channel_id] = datetime.now(PACIFIC_TZ)
     finally:
+        _channel_payload_wait_extended[channel_id] = False
         _clear_generation_state(channel_id, local_generation_id)
 
 async def _schedule_flush(channel: discord.TextChannel):
@@ -3979,7 +4057,8 @@ async def _schedule_flush(channel: discord.TextChannel):
     """
     channel_id = channel.id
     start = _channel_first_seen.get(channel_id, datetime.now(PACIFIC_TZ))
-    deadline = start + timedelta(seconds=BATCH_MAX_WAIT_SECONDS)
+    hard_wait = BATCH_REQUEST_PAYLOAD_MAX_WAIT_SECONDS if _channel_payload_wait_extended.get(channel_id) else BATCH_MAX_WAIT_SECONDS
+    deadline = start + timedelta(seconds=hard_wait)
     guild_id = channel.guild.id
 
     while True:
@@ -3997,8 +4076,10 @@ async def _schedule_flush(channel: discord.TextChannel):
             _log_batch_event(logging.INFO, "skip", guild_id, channel_id, 0, "no_last_message")
             return
         quiet_for = (datetime.now(PACIFIC_TZ) - last_msg_at).total_seconds()
-        if quiet_for >= BATCH_WINDOW_SECONDS:
-            _log_batch_event(logging.INFO, "flush", guild_id, channel_id, len(_channel_buffers[channel_id]), "quiet_window")
+        required_quiet = BATCH_WINDOW_SECONDS + (BATCH_REQUEST_PAYLOAD_EXTENSION_SECONDS if _channel_payload_wait_extended.get(channel_id) else 0)
+        if quiet_for >= required_quiet:
+            reason = "quiet_window_extended" if _channel_payload_wait_extended.get(channel_id) else "quiet_window"
+            _log_batch_event(logging.INFO, "flush", guild_id, channel_id, len(_channel_buffers[channel_id]), reason)
             await _flush_channel_buffer(channel)
             return
 
@@ -4009,6 +4090,13 @@ def _reset_debounce(channel: discord.TextChannel):
         _log_batch_event(logging.INFO, "create", channel.guild.id, cid, len(_channel_buffers[cid]), "new_batch")
     elif len(_channel_buffers[cid]) >= BATCH_MAX_MESSAGES:
         _log_batch_event(logging.INFO, "flush", channel.guild.id, cid, len(_channel_buffers[cid]), "buffer_max")
+
+    combined = " ".join([(content or "") for (_n, content, _u) in _channel_buffers[cid]])
+    payload_expected, payload_reason = _detect_request_payload_expectation(combined)
+    if payload_expected and not _channel_payload_wait_extended[cid]:
+        _channel_payload_wait_extended[cid] = True
+        _log_batch_event(logging.INFO, "request_payload_expected", channel.guild.id, cid, len(_channel_buffers[cid]), f"reason={payload_reason}")
+        _log_batch_event(logging.INFO, "request_payload_wait_extended", channel.guild.id, cid, len(_channel_buffers[cid]), f"reason={payload_reason}")
 
     t = _channel_tasks.get(cid)
     if t and not t.done():
