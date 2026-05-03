@@ -4008,8 +4008,26 @@ async def clear_guild_history_cmd(interaction: discord.Interaction):
 @tree.command(name="myname", description="Set the name BNL-01 should use for you in this server.")
 @app_commands.describe(name="Your preferred name (how BNL-01 should address you)")
 async def myname(interaction: discord.Interaction, name: str):
-    member = interaction.user if isinstance(interaction.user, discord.Member) else None
-    if not is_owner_operator(interaction.user) and not has_mod_role(member):
+    if not interaction.guild:
+        await interaction.response.send_message("❌ This command can only be used in a server.", ephemeral=True)
+        return
+
+    guild = interaction.guild
+    member = interaction.user if isinstance(interaction.user, discord.Member) else guild.get_member(interaction.user.id)
+    if not member:
+        try:
+            member = await guild.fetch_member(interaction.user.id)
+        except Exception as e:
+            logging.warning(
+                f"⚠️ /myname could not resolve guild member for role check guild={guild.id} user={interaction.user.id}: {e}"
+            )
+
+    is_owner = is_owner_operator(interaction.user)
+    is_mod = has_mod_role(member)
+    logging.info(
+        f"🪪 /myname attempt guild={guild.id} user={interaction.user.id} owner_authorized={is_owner} mod_authorized={is_mod}"
+    )
+    if not is_owner and not is_mod:
         await interaction.response.send_message(
             "❌ Access denied. `/myname` is restricted to the configured owner or mod role.",
             ephemeral=True,
@@ -4021,7 +4039,26 @@ async def myname(interaction: discord.Interaction, name: str):
         await interaction.response.send_message("❌ Name rejected. Keep it under 40 characters.", ephemeral=True)
         return
 
-    set_preferred_name(interaction.user.id, interaction.guild.id, preferred)
+    write_ok = False
+    verified_ok = False
+    try:
+        set_preferred_name(interaction.user.id, guild.id, preferred)
+        write_ok = True
+        _, stored_preferred_name = get_user_profile(interaction.user.id, guild.id)
+        verified_ok = (stored_preferred_name == preferred)
+    except Exception as e:
+        logging.error(f"❌ /myname save failed guild={guild.id} user={interaction.user.id}: {e}")
+
+    logging.info(
+        f"🧾 /myname persistence guild={guild.id} user={interaction.user.id} write_ok={write_ok} readback_verified={verified_ok}"
+    )
+    if not verified_ok:
+        await interaction.response.send_message(
+            "❌ Preferred name save could not be verified. Please try again in a moment.",
+            ephemeral=True,
+        )
+        return
+
     await interaction.response.send_message(
         f"✅ Logged preferred designation: **{preferred}**. The Network… acknowledges.",
         ephemeral=True
