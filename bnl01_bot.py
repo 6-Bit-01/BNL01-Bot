@@ -3611,7 +3611,8 @@ _channel_first_seen = {}
 _channel_last_message_at = {}
 _channel_last_reply_at = defaultdict(lambda: datetime.min.replace(tzinfo=PACIFIC_TZ))
 _channel_generating = defaultdict(bool)
-_channel_generation_preempted = defaultdict(bool)
+_channel_generation_id = defaultdict(int)
+_channel_preempted_generation_id = defaultdict(int)
 
 
 def _log_batch_event(level: int, event: str, guild_id: int, channel_id: int, message_count: int, reason: str):
@@ -3620,9 +3621,10 @@ def _log_batch_event(level: int, event: str, guild_id: int, channel_id: int, mes
         f"[batch:{event}] guild_id={guild_id} channel_id={channel_id} message_count={message_count} reason={reason}",
     )
 
-def _clear_generation_state(channel_id: int):
-    _channel_generating[channel_id] = False
-    _channel_generation_preempted[channel_id] = False
+def _clear_generation_state(channel_id: int, generation_id: int):
+    if _channel_generation_id[channel_id] == generation_id:
+        _channel_generating[channel_id] = False
+
 
 def _format_batched_prompt(messages, style_key: str, style_rule: str) -> str:
     transcript = "\n".join([f"- {name}: {content}" for (name, content) in messages])
@@ -3681,8 +3683,9 @@ async def _flush_channel_buffer(channel: discord.TextChannel):
     buf.clear()
     _channel_first_seen.pop(channel_id, None)
     _channel_last_message_at.pop(channel_id, None)
+    _channel_generation_id[channel_id] += 1
+    local_generation_id = _channel_generation_id[channel_id]
     _channel_generating[channel_id] = True
-    _channel_generation_preempted[channel_id] = False
     try:
         _log_batch_event(logging.INFO, "flush", guild_id, channel_id, len(items), "ready")
 
@@ -3770,11 +3773,34 @@ async def _flush_channel_buffer(channel: discord.TextChannel):
                     regenerated_once = True
                     _log_batch_event(logging.INFO, "coalesced_late_messages", guild_id, channel_id, len(items), "merged")
                     _log_batch_event(logging.INFO, "regenerated_batch_once", guild_id, channel_id, len(items), "retry")
+
+                    combined_text = " ".join([c for (_n, c, _u) in items])
+                    sealed_recall_guard = get_sealed_test_recall_guard_response(
+                        channel_policy,
+                        combined_text,
+                        guild_id,
+                        channel_id,
+                    )
+                    if sealed_recall_guard:
+                        await channel.send(sealed_recall_guard)
+                        _channel_last_reply_at[channel_id] = datetime.now(PACIFIC_TZ)
+                        return
+
+                    restricted_recall_guard = get_restricted_channel_recall_guard_response(
+                        channel_policy,
+                        combined_text,
+                        guild_id,
+                        channel_id,
+                    )
+                    if restricted_recall_guard:
+                        await channel.send(restricted_recall_guard)
+                        _channel_last_reply_at[channel_id] = datetime.now(PACIFIC_TZ)
+                        return
                     continue
 
             break
 
-        if _channel_generation_preempted.get(channel_id):
+        if _channel_preempted_generation_id.get(channel_id) == local_generation_id:
             _log_batch_event(logging.INFO, "stale_response_discarded", guild_id, channel_id, len(items), "direct_preempted")
             return
 
@@ -3792,7 +3818,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel):
 
         _channel_last_reply_at[channel_id] = datetime.now(PACIFIC_TZ)
     finally:
-        _clear_generation_state(channel_id)
+        _clear_generation_state(channel_id, local_generation_id)
 
 async def _schedule_flush(channel: discord.TextChannel):
     """
@@ -4078,7 +4104,7 @@ async def on_message(message: discord.Message):
                 await message.reply(restricted_recall_guard)
                 return
             if _channel_generating[message.channel.id]:
-                _channel_generation_preempted[message.channel.id] = True
+                _channel_preempted_generation_id[message.channel.id] = _channel_generation_id[message.channel.id]
                 _log_batch_event(logging.INFO, "stale_response_discarded", message.guild.id, message.channel.id, len(_channel_buffers[message.channel.id]), "direct_reply_preempted_generation")
             pending_count = len(_channel_buffers[message.channel.id])
             if pending_count:
