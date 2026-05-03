@@ -821,7 +821,7 @@ def _build_relay_context(guild_id: int, limit: int = 20) -> str:
         SELECT user_name, content
         FROM conversations
         WHERE guild_id = ? AND role = 'user'
-          AND channel_policy IN ('public_home', 'public_context')
+          AND channel_policy IN ('public_home', 'public_context', 'public_selective')
         ORDER BY id DESC
         LIMIT ?
         """,
@@ -1929,7 +1929,7 @@ def get_recent_public_context_count(guild_id: int, limit: int = 500) -> int:
             SELECT id
             FROM conversations
             WHERE guild_id=?
-              AND channel_policy IN ('public_home', 'public_context')
+              AND channel_policy IN ('public_home', 'public_context', 'public_selective')
             ORDER BY id DESC
             LIMIT ?
         )
@@ -1960,36 +1960,29 @@ def conversation_rows_have_channel_policy_metadata(guild_id: int) -> bool:
     return bool(row)
 
 
-def sealed_internal_test_rows_excluded_from_public_relay(guild_id: int) -> bool:
+def get_guild_policy_counts(guild_id: int):
+    policies = ['sealed_test', 'internal_controlled', 'public_home', 'public_context', 'public_selective']
+    counts = dict((policy, 0) for policy in policies)
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
     cursor.execute(
         """
-        SELECT COUNT(*)
+        SELECT channel_policy, COUNT(*)
         FROM conversations
         WHERE guild_id=?
-          AND channel_policy IN ('sealed_test', 'internal_controlled')
+          AND channel_policy IN ('sealed_test', 'internal_controlled', 'public_home', 'public_context', 'public_selective')
+        GROUP BY channel_policy
         """,
         (guild_id,),
     )
-    excluded_rows = cursor.fetchone()
-    cursor.execute(
-        """
-        SELECT COUNT(*)
-        FROM conversations
-        WHERE guild_id=?
-          AND channel_policy IN ('sealed_test', 'internal_controlled')
-          AND channel_policy IN ('public_home', 'public_context')
-        """,
-        (guild_id,),
-    )
-    overlap_rows = cursor.fetchone()
+    rows = cursor.fetchall()
     conn.close()
-    excluded_total = int(excluded_rows[0]) if excluded_rows and excluded_rows[0] is not None else 0
-    overlap_total = int(overlap_rows[0]) if overlap_rows and overlap_rows[0] is not None else 0
-    if excluded_total == 0:
-        return True
-    return overlap_total == 0
+    for row in rows:
+        policy = row[0]
+        count = row[1]
+        if policy in counts:
+            counts[policy] = int(count)
+    return counts
 def get_user_profile(user_id: int, guild_id: int):
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
@@ -4327,7 +4320,7 @@ async def bnl_memory_check(interaction: discord.Interaction):
     recent_user_rows = get_recent_conversation_count(interaction.user.id, guild.id, limit=200)
     recent_public_rows = get_recent_public_context_count(guild.id, limit=500)
     policy_metadata_exists = conversation_rows_have_channel_policy_metadata(guild.id)
-    sealed_excluded = sealed_internal_test_rows_excluded_from_public_relay(guild.id)
+    policy_counts = get_guild_policy_counts(guild.id)
 
     lines = [
         "**BNL Memory Diagnostic (safe)**",
@@ -4342,7 +4335,11 @@ async def bnl_memory_check(interaction: discord.Interaction):
         f"- recent_user_conversation_rows: `{recent_user_rows}` (last 200 max)",
         f"- recent_guild_public_context_rows: `{recent_public_rows}` (last 500 max)",
         f"- channel_policy_metadata_exists_on_rows: `{'yes' if policy_metadata_exists else 'no'}`",
-        f"- sealed_internal_test_rows_excluded_from_public_relay: `{'yes' if sealed_excluded else 'no'}`",
+        f"- policy_count_sealed_test: `{policy_counts.get('sealed_test', 0)}`",
+        f"- policy_count_internal_controlled: `{policy_counts.get('internal_controlled', 0)}`",
+        f"- policy_count_public_home: `{policy_counts.get('public_home', 0)}`",
+        f"- policy_count_public_context: `{policy_counts.get('public_context', 0)}`",
+        f"- policy_count_public_selective: `{policy_counts.get('public_selective', 0)}`",
         "- raw_message_dump: `disabled`",
         "- memory_mutation: `none (read-only diagnostic)`",
     ]
