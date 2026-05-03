@@ -3614,6 +3614,9 @@ _channel_preempted_generation_id = defaultdict(int)
 _channel_payload_wait_extended = defaultdict(bool)
 _channel_pending_request_intent = {}
 
+def _batch_max_wait_seconds(channel_id: int) -> int:
+    return BATCH_REQUEST_PAYLOAD_MAX_WAIT_SECONDS if _channel_payload_wait_extended.get(channel_id) else BATCH_MAX_WAIT_SECONDS
+
 
 def _log_batch_event(level: int, event: str, guild_id: int, channel_id: int, message_count: int, reason: str):
     logging.log(
@@ -3841,16 +3844,19 @@ async def _flush_channel_buffer(channel: discord.TextChannel):
         _log_batch_event(logging.INFO, "skip", guild_id, channel_id, message_count, "reply_cooldown")
         return
 
+    batch_max_wait = _batch_max_wait_seconds(channel_id)
     last_msg_at = _channel_last_message_at.get(channel_id)
-    if last_msg_at and (now - last_msg_at).total_seconds() > BATCH_MAX_WAIT_SECONDS:
+    if last_msg_at and (now - last_msg_at).total_seconds() > batch_max_wait:
+        stale_reason = "extended_payload_stale_batch" if _channel_payload_wait_extended.get(channel_id) else "stale_batch"
+        _log_batch_event(logging.INFO, "stale_batch_allowed_extended_payload", guild_id, channel_id, message_count, f"extended={int(_channel_payload_wait_extended.get(channel_id))};max_wait={batch_max_wait}")
         buf.clear()
         _channel_first_seen.pop(channel_id, None)
         _channel_last_message_at.pop(channel_id, None)
-        _log_batch_event(logging.INFO, "skip", guild_id, channel_id, message_count, "stale_batch")
+        _log_batch_event(logging.INFO, "skip", guild_id, channel_id, message_count, stale_reason)
         return
 
     batch_start = _channel_first_seen.get(channel_id, now)
-    cycle_deadline = batch_start + timedelta(seconds=BATCH_REQUEST_PAYLOAD_MAX_WAIT_SECONDS)
+    cycle_deadline = batch_start + timedelta(seconds=batch_max_wait)
     items = list(buf)
     pending_state = _consume_pending_request_intent(channel_id, now)
     if pending_state == "expired":
@@ -4080,7 +4086,7 @@ async def _schedule_flush(channel: discord.TextChannel):
     """
     channel_id = channel.id
     start = _channel_first_seen.get(channel_id, datetime.now(PACIFIC_TZ))
-    hard_wait = BATCH_REQUEST_PAYLOAD_MAX_WAIT_SECONDS if _channel_payload_wait_extended.get(channel_id) else BATCH_MAX_WAIT_SECONDS
+    hard_wait = _batch_max_wait_seconds(channel_id)
     deadline = start + timedelta(seconds=hard_wait)
     guild_id = channel.guild.id
 
