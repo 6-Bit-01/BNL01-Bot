@@ -3669,7 +3669,8 @@ def _classify_batch_engagement(items, bot_user=None):
     short_fragment_cluster = token_count <= max(8, len(texts) * 3)
     test_like = bool(re.search(r"\b(test|testing|ping|check|lol|lmao|haha)\b", lowered))
     distinct_users = len({uid for (_n, _c, uid) in items if uid})
-    discussion_like = (token_count >= 12 and len(texts) >= 2) or distinct_users >= 2
+    substantive_cluster = token_count >= 18 or (token_count >= 12 and len(texts) >= 3)
+    casual_chat_like = bool(re.search(r"\b(yeah|yep|same|ok|okay|cool|nice|true|fair)\b", lowered))
 
     if question_like or request_like or bot_named:
         return "answer", "question_request_or_addressed"
@@ -3677,7 +3678,11 @@ def _classify_batch_engagement(items, bot_user=None):
         return "skip", "noise_fragment_cluster"
     if test_like or short_fragment_cluster:
         return "acknowledge", "light_fragment_or_test_cluster"
-    if discussion_like:
+    if distinct_users >= 2:
+        if substantive_cluster and not casual_chat_like:
+            return "answer", "substantive_multi_user_discussion"
+        if substantive_cluster:
+            return "acknowledge", "casual_multi_user_discussion"
         return "observe", "ambient_multi_user_chat"
     return "skip", "no_response_needed"
 
