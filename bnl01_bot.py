@@ -3736,6 +3736,32 @@ def _detect_request_payload_expectation(text: str):
     return False, "none"
 
 
+def _extract_multiline_request_payload(text: str):
+    raw = (text or "").strip()
+    if not raw or "\n" not in raw:
+        return None
+
+    lines = [ln.strip() for ln in raw.splitlines()]
+    if len(lines) < 2:
+        return None
+
+    for idx, line in enumerate(lines):
+        if not line:
+            continue
+        request_intent, _ = _detect_request_intent(line)
+        payload_expected, _ = _detect_request_payload_expectation(line)
+        if not (request_intent and payload_expected):
+            continue
+        payload_items = [item for item in lines[idx + 1:] if item]
+        if payload_items:
+            return {
+                "request_line": line,
+                "payload_items": payload_items,
+                "line_index": idx,
+            }
+    return None
+
+
 def _is_single_payload_like_item(text: str):
     t = (text or "").strip()
     if not t:
@@ -3792,6 +3818,11 @@ def _classify_batch_engagement(items, bot_user=None, pending_request_intent=Fals
         return "skip", "empty_text"
 
     combined = " ".join(texts).strip()
+    multiline_payload_detected = False
+    for t in texts:
+        if _extract_multiline_request_payload(t):
+            multiline_payload_detected = True
+            break
     lowered = combined.lower()
     token_count = len([tok for tok in re.split(r"\s+", combined) if tok])
     question_starter = r"(?:what|why|how|when|where|who)\b"
@@ -3812,6 +3843,8 @@ def _classify_batch_engagement(items, bot_user=None, pending_request_intent=Fals
     substantive_cluster = token_count >= 18 or (token_count >= 12 and len(texts) >= 3)
     casual_chat_like = bool(re.search(r"\b(yeah|yep|same|ok|okay|cool|nice|true|fair)\b", lowered))
 
+    if multiline_payload_detected:
+        return "answer", "single_message_multiline_request_payload"
     if pending_request_intent and _is_payload_like_cluster(items):
         if len(texts) == 1 and _is_single_payload_like_item(texts[0]):
             return "answer", "pending_request_single_payload_continuation"
@@ -3847,7 +3880,19 @@ def _build_acknowledgement_response(items):
 
 
 def _format_batched_prompt(messages, style_key: str, style_rule: str) -> str:
-    transcript = "\n".join([f"- {name}: {content}" for (name, content) in messages])
+    rendered_messages = []
+    multiline_payload_found = False
+    for name, content in messages:
+        detected = _extract_multiline_request_payload(content)
+        if not detected:
+            rendered_messages.append(f"- {name}: {content}")
+            continue
+        multiline_payload_found = True
+        rendered_messages.append(f"- {name}: {detected['request_line']}")
+        rendered_messages.append("  payload items:")
+        for item in detected["payload_items"]:
+            rendered_messages.append(f"  - {item}")
+    transcript = "\n".join(rendered_messages)
     temporal = get_temporal_context()
 
     return (
@@ -3863,6 +3908,8 @@ def _format_batched_prompt(messages, style_key: str, style_rule: str) -> str:
         "- Do not quote users verbatim.\n"
         "- No @mentions.\n"
         "- If asked to handle a list of people/items, use every provided list item unless impossible.\n"
+        "- If a message has a request line followed by newline-separated lines, those later lines are payload/list items for that request.\n"
+        "- When payload/list items are present, do not ask for clarification about references like these people/items/names/them.\n"
         "- If this is a continuation with one newly added payload item, answer that new item directly.\n"
         "- If a user asks for the current day, date, or time, answer it directly and accurately from the current network time above.\n"
         "- Do not imply BARCODE Radio is live or happening today unless the current show phase supports that.\n"
@@ -3870,6 +3917,7 @@ def _format_batched_prompt(messages, style_key: str, style_rule: str) -> str:
         "- Do not mention 9 Bit unless someone in these messages mentioned 9 Bit.\n\n"
         "Recent messages:\n"
         f"{transcript}\n"
+        f"Multiline payload detected in batch: {'yes' if multiline_payload_found else 'no'}\n"
     )
 
 async def _flush_channel_buffer(channel: discord.TextChannel):
@@ -4161,6 +4209,9 @@ async def _flush_channel_buffer(channel: discord.TextChannel):
                 )
             else:
                 _log_batch_event(logging.INFO, "typing_pause_expired_no_message", guild_id, channel_id, len(items), "send_proceed")
+        else:
+            if typing_reason in ("already_paused_once", "typing_user_not_relevant"):
+                _log_batch_event(logging.INFO, "typing_signal_ignored", guild_id, channel_id, len(items), f"reason={typing_reason}")
 
         if _channel_preempted_generation_id.get(channel_id) == local_generation_id:
             pending_after_pause = len(_channel_buffers[channel_id])
@@ -4405,9 +4456,18 @@ Rules:
 
 @client.event
 async def on_typing(channel, user, when):
-    if not user or user == client.user:
+    if not user:
+        return
+    if user == client.user:
+        if isinstance(channel, discord.TextChannel) and channel.guild:
+            _log_batch_event(logging.INFO, "typing_signal_ignored", channel.guild.id, channel.id, len(_channel_buffers[channel.id]), "reason=bot_user")
+        return
+    if getattr(user, "bot", False):
+        if isinstance(channel, discord.TextChannel) and channel.guild:
+            _log_batch_event(logging.INFO, "typing_signal_ignored", channel.guild.id, channel.id, len(_channel_buffers[channel.id]), "reason=bot_user")
         return
     if not isinstance(channel, discord.TextChannel):
+        logging.info("[batch:typing_signal_ignored] guild_id=0 channel_id=0 message_count=0 reason=not_text_channel")
         return
     if not channel.guild:
         return
@@ -4415,8 +4475,10 @@ async def on_typing(channel, user, when):
     channel_policy = resolve_channel_policy(channel)
     is_active_scope = (active_channel_id is not None and channel.id == active_channel_id) or (channel_policy == "sealed_test")
     if not is_active_scope:
+        _log_batch_event(logging.INFO, "typing_signal_ignored", channel.guild.id, channel.id, len(_channel_buffers[channel.id]), "reason=not_active_scope")
         return
     if not _channel_generating.get(channel.id):
+        _log_batch_event(logging.INFO, "typing_signal_ignored", channel.guild.id, channel.id, len(_channel_buffers[channel.id]), "reason=not_generating")
         return
 
     _channel_recent_typing_at[channel.id] = datetime.now(PACIFIC_TZ)
