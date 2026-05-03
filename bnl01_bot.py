@@ -3662,7 +3662,13 @@ def _classify_batch_engagement(items, bot_user=None):
     combined = " ".join(texts).strip()
     lowered = combined.lower()
     token_count = len([tok for tok in re.split(r"\s+", combined) if tok])
-    question_like = ("?" in combined) or bool(re.search(r"\b(what|why|how|when|where|who|can|could|would|should|do|did|is|are)\b", lowered))
+    question_starter = r"(?:what|why|how|when|where|who)\b"
+    helper_starter = r"(?:can you|could you|would you|do you|did you|is it|are you|should i|should we)\b"
+    clause_question_like = any(
+        bool(re.match(r"^\s*(?:" + question_starter + r"|" + helper_starter + r")", t.lower()))
+        for t in texts
+    )
+    question_like = ("?" in combined) or clause_question_like
     request_like = bool(re.search(r"\b(help|explain|tell me|please|can you|could you|show|fix)\b", lowered))
     bot_named = bool(re.search(r"\b(bnl|bnl-01|barcode bot)\b", lowered))
     numeric_only_cluster = all(bool(re.fullmatch(r"[\d\W_]+", t)) for t in texts)
@@ -3775,9 +3781,6 @@ async def _flush_channel_buffer(channel: discord.TextChannel):
         msg_list = [(name, content) for (name, content, _uid) in collapsed_items]
         combined_text = " ".join([c for (_n, c, _u) in collapsed_items])
         first_uid = collapsed_items[0][2] if collapsed_items and collapsed_items[0][2] else 0
-        decision, reason = _classify_batch_engagement(collapsed_items, client.user)
-        _log_batch_event(logging.INFO, "batch_engagement_decision", guild_id, channel_id, len(collapsed_items), f"decision={decision};reason={reason}")
-
         unique_user_ids = sorted({uid for (_n, _c, uid) in items if uid})
         sealed_recall_guard = get_sealed_test_recall_guard_response(
             channel_policy,
@@ -3798,15 +3801,6 @@ async def _flush_channel_buffer(channel: discord.TextChannel):
         )
         if restricted_recall_guard:
             await channel.send(restricted_recall_guard)
-            _channel_last_reply_at[channel_id] = datetime.now(PACIFIC_TZ)
-            return
-        if decision in ("skip", "observe"):
-            _log_batch_event(logging.INFO, "batch_response_skipped", guild_id, channel_id, len(collapsed_items), "no_response_needed")
-            return
-        if decision == "acknowledge":
-            ack = _build_acknowledgement_response(collapsed_items)
-            await channel.send(ack)
-            _log_batch_event(logging.INFO, "batch_response_acknowledge", guild_id, channel_id, len(collapsed_items), f"reason={reason}")
             _channel_last_reply_at[channel_id] = datetime.now(PACIFIC_TZ)
             return
         if len(unique_user_ids) == 1:
@@ -3836,6 +3830,17 @@ async def _flush_channel_buffer(channel: discord.TextChannel):
                     save_model_message(unique_user_ids[0], channel.guild.id, memory_recall, channel_name=getattr(channel, "name", ""), channel_policy=channel_policy)
                 _channel_last_reply_at[channel_id] = datetime.now(PACIFIC_TZ)
                 return
+        decision, reason = _classify_batch_engagement(collapsed_items, client.user)
+        _log_batch_event(logging.INFO, "batch_engagement_decision", guild_id, channel_id, len(collapsed_items), f"decision={decision};reason={reason}")
+        if decision in ("skip", "observe"):
+            _log_batch_event(logging.INFO, "batch_response_skipped", guild_id, channel_id, len(collapsed_items), "no_response_needed")
+            return
+        if decision == "acknowledge":
+            ack = _build_acknowledgement_response(collapsed_items)
+            await channel.send(ack)
+            _log_batch_event(logging.INFO, "batch_response_acknowledge", guild_id, channel_id, len(collapsed_items), f"reason={reason}")
+            _channel_last_reply_at[channel_id] = datetime.now(PACIFIC_TZ)
+            return
 
         regenerated_once = False
         response = ""
