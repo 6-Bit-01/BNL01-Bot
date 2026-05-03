@@ -1759,9 +1759,11 @@ def resolve_channel_policy(channel) -> str:
 
     if BNL_TESTING_CHANNEL_ID and cid == BNL_TESTING_CHANNEL_ID:
         return "sealed_test"
+    name = ((getattr(channel, "name", "") or "").strip().lower())
+    if name == "bnl-testing":
+        return "sealed_test"
     if BNL_PRIMARY_GUILD_ID and guild_id and guild_id != BNL_PRIMARY_GUILD_ID:
         return "public_selective"
-    name = ((getattr(channel, "name", "") or "").strip().lower())
     if name in PROTECTED_SYSTEM_CHANNELS:
         return "protected_system"
     if name in PUBLIC_HOME_CHANNELS:
@@ -3528,6 +3530,8 @@ def _format_batched_prompt(messages, style_key: str, style_rule: str) -> str:
 async def _flush_channel_buffer(channel: discord.TextChannel):
     channel_id = channel.id
     guild_id = channel.guild.id
+    channel_policy = resolve_channel_policy(channel)
+    sealed_test_channel = channel_policy == "sealed_test"
     now = datetime.now(PACIFIC_TZ)
     buf = _channel_buffers[channel_id]
     message_count = len(buf)
@@ -3569,21 +3573,24 @@ async def _flush_channel_buffer(channel: discord.TextChannel):
             if not is_privileged_member(member, channel.guild):
                 self_reflection = "Status reports are restricted to server owner/mod operators."
             await channel.send(self_reflection)
-            save_model_message(unique_user_ids[0], channel.guild.id, self_reflection)
+            if not sealed_test_channel:
+                save_model_message(unique_user_ids[0], channel.guild.id, self_reflection, channel_name=getattr(channel, "name", ""), channel_policy=channel_policy)
             _channel_last_reply_at[channel_id] = datetime.now(PACIFIC_TZ)
             return
 
         repair = try_repair_response(combined_text)
         if repair:
             await channel.send(repair)
-            save_model_message(unique_user_ids[0], channel.guild.id, repair)
+            if not sealed_test_channel:
+                save_model_message(unique_user_ids[0], channel.guild.id, repair, channel_name=getattr(channel, "name", ""), channel_policy=channel_policy)
             _channel_last_reply_at[channel_id] = datetime.now(PACIFIC_TZ)
             return
 
         memory_recall = try_memory_recall_response(unique_user_ids[0], channel.guild.id, combined_text)
         if memory_recall:
             await channel.send(memory_recall)
-            save_model_message(unique_user_ids[0], channel.guild.id, memory_recall)
+            if not sealed_test_channel:
+                save_model_message(unique_user_ids[0], channel.guild.id, memory_recall, channel_name=getattr(channel, "name", ""), channel_policy=channel_policy)
             _channel_last_reply_at[channel_id] = datetime.now(PACIFIC_TZ)
             return
 
@@ -3608,7 +3615,8 @@ async def _flush_channel_buffer(channel: discord.TextChannel):
 
     # Save model response into each participant's personal history
     for uid in unique_user_ids:
-        save_model_message(uid, channel.guild.id, response)
+        if not sealed_test_channel:
+            save_model_message(uid, channel.guild.id, response, channel_name=getattr(channel, "name", ""), channel_policy=channel_policy)
 
     _channel_last_reply_at[channel_id] = datetime.now(PACIFIC_TZ)
 
@@ -3818,6 +3826,9 @@ async def on_message(message: discord.Message):
 
     is_active_channel = (active_channel_id is not None and message.channel.id == active_channel_id)
     channel_policy = resolve_channel_policy(message.channel)
+    is_sealed_test_channel = channel_policy == "sealed_test"
+    active_test_free_speak = is_sealed_test_channel
+    should_handle_as_active_channel = is_active_channel or active_test_free_speak
     passive_memory_allowed = allow_passive_memory_for_policy(channel_policy)
     is_mention = client.user.mentioned_in(message)
     is_reply = (
@@ -3832,9 +3843,10 @@ async def on_message(message: discord.Message):
         .strip()
     )
 
-    if clean_content and (is_active_channel or is_mention or is_reply):
-        maybe_update_broadcast_status_from_text(clean_content)
-        maybe_update_restricted_status_from_text(clean_content)
+    if clean_content and (should_handle_as_active_channel or is_mention or is_reply):
+        if not is_sealed_test_channel:
+            maybe_update_broadcast_status_from_text(clean_content)
+            maybe_update_restricted_status_from_text(clean_content)
 
     # ---------------- PASSIVE REACTION SYSTEM ----------------
     # BNL occasionally reacts to messages across the server
@@ -3848,7 +3860,7 @@ async def on_message(message: discord.Message):
     # ---------------- PASSIVE SERVER OBSERVATION ----------------
     # BNL silently logs messages across the server so it can recall them later
     # but skips the active channel because those messages are logged below
-    if passive_memory_allowed and not client.user.mentioned_in(message) and not is_active_channel:
+    if passive_memory_allowed and not client.user.mentioned_in(message) and not should_handle_as_active_channel:
         if message.content and len(message.content) < 400:
             save_user_message(
                 message.author.id,
@@ -3860,14 +3872,15 @@ async def on_message(message: discord.Message):
             )
 
     # ---------------- ACTIVE CHANNEL ----------------
-    if is_active_channel:
+    if should_handle_as_active_channel:
         if not clean_content and (is_mention or is_reply):
             await message.reply("You pinged me. How may I assist with BARCODE operations?")
             return
         if not clean_content:
             return
 
-        save_user_message(message.author.id, message.author.display_name, message.guild.id, clean_content, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy)
+        if not is_sealed_test_channel:
+            save_user_message(message.author.id, message.author.display_name, message.guild.id, clean_content, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy)
 
         # Mentions/replies -> immediate response (not batched)
         if is_mention or is_reply:
@@ -3882,7 +3895,8 @@ async def on_message(message: discord.Message):
                 _log_batch_event(logging.INFO, "skip", message.guild.id, message.channel.id, pending_count, "direct_reply_preempts_batch")
             repair = try_repair_response(clean_content)
             if repair:
-                save_model_message(message.author.id, message.guild.id, repair)
+                if not is_sealed_test_channel:
+                    save_model_message(message.author.id, message.guild.id, repair, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy)
                 await message.reply(repair)
                 return
 
@@ -3890,13 +3904,15 @@ async def on_message(message: discord.Message):
             if self_reflection:
                 if not is_privileged_member(message.author, message.guild):
                     self_reflection = "Status reports are restricted to server owner/mod operators."
-                save_model_message(message.author.id, message.guild.id, self_reflection)
+                if not is_sealed_test_channel:
+                    save_model_message(message.author.id, message.guild.id, self_reflection, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy)
                 await message.reply(self_reflection)
                 return
 
             memory_recall = try_memory_recall_response(message.author.id, message.guild.id, clean_content)
             if memory_recall:
-                save_model_message(message.author.id, message.guild.id, memory_recall)
+                if not is_sealed_test_channel:
+                    save_model_message(message.author.id, message.guild.id, memory_recall, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy)
                 await message.reply(memory_recall)
                 return
 
@@ -3917,7 +3933,8 @@ async def on_message(message: discord.Message):
                 await message.reply("[NETWORK ERROR] Temporary synchronization issue. Try again.")
                 return
 
-            save_model_message(message.author.id, message.guild.id, response)
+            if not is_sealed_test_channel:
+                save_model_message(message.author.id, message.guild.id, response, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy)
 
             if allow_greeting:
                 set_last_greeting_at(message.author.id, message.guild.id, datetime.now(PACIFIC_TZ).isoformat())
@@ -3932,6 +3949,8 @@ async def on_message(message: discord.Message):
             return
 
         # Non-mention in active channel -> batch
+        if active_test_free_speak:
+            logging.info(f"[conversation] guild_id={message.guild.id} channel_id={message.channel.id} reason=sealed_test_free_speak")
         _channel_buffers[message.channel.id].append((message.author.display_name, clean_content, message.author.id))
         _channel_last_message_at[message.channel.id] = datetime.now(PACIFIC_TZ)
         if len(_channel_buffers[message.channel.id]) >= BATCH_MAX_MESSAGES:
@@ -3941,7 +3960,7 @@ async def on_message(message: discord.Message):
         return
 
     # ---------------- OTHER CHANNELS (PING-ONLY IF ACTIVE CHANNEL SET) ----------------
-    if active_channel_id is not None and not is_active_channel:
+    if active_channel_id is not None and not should_handle_as_active_channel:
         if not (is_mention or is_reply):
             return
 
@@ -3949,7 +3968,8 @@ async def on_message(message: discord.Message):
             await message.reply("I monitor this channel passively. My active operations are in the designated liaison channel.")
             return
 
-        save_user_message(message.author.id, message.author.display_name, message.guild.id, clean_content, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy)
+        if not is_sealed_test_channel:
+            save_user_message(message.author.id, message.author.display_name, message.guild.id, clean_content, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy)
 
         repair = try_repair_response(clean_content)
         if repair:
@@ -4008,7 +4028,8 @@ async def on_message(message: discord.Message):
             await message.reply("You pinged me. How may I assist with BARCODE operations?")
             return
 
-        save_user_message(message.author.id, message.author.display_name, message.guild.id, clean_content, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy)
+        if not is_sealed_test_channel:
+            save_user_message(message.author.id, message.author.display_name, message.guild.id, clean_content, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy)
 
         repair = try_repair_response(clean_content)
         if repair:
@@ -4389,6 +4410,8 @@ async def bnl_memory_check(interaction: discord.Interaction):
         f"- policy_count_public_home: `{policy_counts.get('public_home', 0)}`",
         f"- policy_count_public_context: `{policy_counts.get('public_context', 0)}`",
         f"- policy_count_public_selective: `{policy_counts.get('public_selective', 0)}`",
+        "- sealed_test_memory_capture: `disabled`",
+        "- sealed_test_free_speak: `enabled`",
         "- raw_message_dump: `disabled`",
         "- memory_mutation: `none (read-only diagnostic)`",
     ]
