@@ -5259,6 +5259,10 @@ async def _generate_direct_payload_session(session_key, reason: str):
         return
     async with anchor_message.channel.typing():
         response = await get_gemini_response(prompt, session["requester_user_id"], session["guild_id"])
+    if generation_revision != int(session.get("revision", 0)):
+        session["generating"] = False
+        logging.info(f"direct_payload_session_generation_deferred payload_count={len(session.get('payload_lines', []))} reason=revision_changed_after_generation")
+        return
     if response and direct_payload_items:
         missing_items = _missing_request_payload_items(direct_payload_items, response)
         logging.info(f"direct_payload_completion_missing_strict missing_count={len(missing_items)}")
