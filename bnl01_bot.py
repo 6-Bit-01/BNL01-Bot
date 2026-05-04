@@ -42,6 +42,7 @@ BNL_API_KEY = os.getenv("BNL_API_KEY")
 BNL_STATUS_URL = os.getenv("BNL_STATUS_URL")
 
 BNL_WEBSITE_RELAY_ENABLED = os.getenv("BNL_WEBSITE_RELAY_ENABLED", "true").strip().lower() not in {"false", "0", "off"}
+BNL_ACTIVE_BATCHING_ENABLED = os.getenv("BNL_ACTIVE_BATCHING_ENABLED", "false").strip().lower() in {"true", "1", "on"}
 BNL_WEBSITE_RELAY_INTERVAL_MINUTES = max(1, int(os.getenv("BNL_WEBSITE_RELAY_INTERVAL_MINUTES", "20")))
 BNL_PRIMARY_GUILD_ID = int(os.getenv("BNL_PRIMARY_GUILD_ID", "0") or 0)
 BNL_FORCE_PULL_SHARED_SECRET = os.getenv("BNL_FORCE_PULL_SHARED_SECRET", "").strip()
@@ -4335,8 +4336,14 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
         selected_wait_seconds = ADAPTIVE_PAYLOAD_WAIT_WITH_ITEMS_SECONDS
     cycle_deadline = batch_start + timedelta(seconds=batch_max_wait)
     items = list(handoff_items) if handoff_items is not None else list(buf)
-    pending_state = _consume_pending_request_intent(channel_id, now)
-    pending_anchor = _consume_pending_request_anchor(channel_id, now)
+    if BNL_ACTIVE_BATCHING_ENABLED:
+        pending_state = _consume_pending_request_intent(channel_id, now)
+        pending_anchor = _consume_pending_request_anchor(channel_id, now)
+    else:
+        pending_state = None
+        pending_anchor = None
+        _channel_pending_request_intent.pop(channel_id, None)
+        _channel_pending_request_anchor.pop(channel_id, None)
     if pending_state == "expired":
         _log_batch_event(logging.INFO, "pending_request_intent_expired", guild_id, channel_id, len(items), "ttl_elapsed")
         pending_state = None
@@ -4870,7 +4877,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
             if not sealed_test_channel:
                 save_model_message(uid, channel.guild.id, response, channel_name=getattr(channel, "name", ""), channel_policy=channel_policy)
 
-        if reason.startswith("request_intent:") or reason.startswith("request_payload_expected:") or reason in ("pending_request_payload_continuation", "pending_request_single_payload_continuation"):
+        if BNL_ACTIVE_BATCHING_ENABLED and (reason.startswith("request_intent:") or reason.startswith("request_payload_expected:") or reason in ("pending_request_payload_continuation", "pending_request_single_payload_continuation")):
             _set_pending_request_intent(channel_id, datetime.now(PACIFIC_TZ), reason)
             _set_pending_request_anchor(channel_id, guild_id, first_uid, "request_payload", datetime.now(PACIFIC_TZ), reason)
             _log_batch_event(logging.INFO, "pending_request_intent_set", guild_id, channel_id, len(collapsed_items), f"reason={reason}")
@@ -4895,11 +4902,15 @@ async def _schedule_flush(channel: discord.TextChannel):
 
     while True:
         now = datetime.now(PACIFIC_TZ)
-        pending_state = _peek_pending_request_intent(channel_id, now)
-        pending_anchor = _peek_pending_request_anchor(channel_id, now)
-        if pending_state == "expired":
+        if BNL_ACTIVE_BATCHING_ENABLED:
+            pending_state = _peek_pending_request_intent(channel_id, now)
+            pending_anchor = _peek_pending_request_anchor(channel_id, now)
+            if pending_state == "expired":
+                pending_state = None
+            if pending_anchor == "expired":
+                pending_anchor = None
+        else:
             pending_state = None
-        if pending_anchor == "expired":
             pending_anchor = None
         items_snapshot = list(_channel_buffers[channel_id])
         wait_state = _adaptive_batch_wait_seconds(channel, items_snapshot, (pending_state or pending_anchor), now, start)
@@ -5169,6 +5180,9 @@ async def on_message(message: discord.Message):
         .strip()
     )
 
+    addressed_to_bot = bool(re.search(r"\b(bnl|bnl-01|barcode bot)\b", clean_content.lower())) if clean_content else False
+    direct_request = is_mention or is_reply or ((not BNL_ACTIVE_BATCHING_ENABLED) and addressed_to_bot)
+
     if clean_content and (should_handle_as_active_channel or is_mention or is_reply):
         if not is_sealed_test_channel:
             maybe_update_broadcast_status_from_text(clean_content)
@@ -5199,7 +5213,7 @@ async def on_message(message: discord.Message):
 
     # ---------------- ACTIVE CHANNEL ----------------
     if should_handle_as_active_channel:
-        if not clean_content and (is_mention or is_reply):
+        if not clean_content and direct_request:
             await message.reply("You pinged me. How may I assist with BARCODE operations?")
             return
         if not clean_content:
@@ -5209,7 +5223,7 @@ async def on_message(message: discord.Message):
             save_user_message(message.author.id, message.author.display_name, message.guild.id, clean_content, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy)
 
         # Mentions/replies -> immediate response (not batched)
-        if is_mention or is_reply:
+        if direct_request:
             sealed_recall_guard = get_sealed_test_recall_guard_response(
                 channel_policy,
                 clean_content,
@@ -5297,7 +5311,9 @@ async def on_message(message: discord.Message):
                     await message.channel.send("..." + chunk)
             return
 
-        # Non-mention in active channel -> batch
+        # Non-mention in active channel -> batch (kill-switched by env)
+        if not BNL_ACTIVE_BATCHING_ENABLED:
+            return
         if active_test_free_speak:
             logging.info(f"[conversation] guild_id={message.guild.id} channel_id={message.channel.id} reason=sealed_test_free_speak")
         if _channel_generating[message.channel.id]:
@@ -5329,7 +5345,7 @@ async def on_message(message: discord.Message):
 
     # ---------------- OTHER CHANNELS (PING-ONLY IF ACTIVE CHANNEL SET) ----------------
     if active_channel_id is not None and not should_handle_as_active_channel:
-        if not (is_mention or is_reply):
+        if not direct_request:
             return
 
         if not clean_content:
@@ -5410,7 +5426,7 @@ async def on_message(message: discord.Message):
         return
 
     # ---------------- NO ACTIVE CHANNEL SET (RESPOND TO MENTIONS/REPLIES ANYWHERE) ----------------
-    if active_channel_id is None and (is_mention or is_reply):
+    if active_channel_id is None and direct_request:
         if not clean_content:
             await message.reply("You pinged me. How may I assist with BARCODE operations?")
             return
