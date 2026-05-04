@@ -5355,6 +5355,71 @@ def _build_direct_payload_prompt(base_prompt: str, payload_items, request_text: 
         lines.append("For simple joke/list requests, prefer per-item format like `Name: <answer>`.")
     return base_prompt + "\n" + "\n".join(lines)
 
+
+def _classify_direct_interaction_diagnostic(
+    *,
+    clean_content: str,
+    direct_request: bool,
+    is_command_or_empty: bool,
+    channel_policy: str,
+    session_key,
+    message_author_id: int,
+    channel_id: int,
+):
+    now_utc = datetime.now(timezone.utc)
+    now_pt = datetime.now(PACIFIC_TZ)
+    active_direct_session = _direct_payload_sessions.get(session_key)
+    active_payload_session = bool(active_direct_session)
+    direct_generation_active = bool(_channel_generating[channel_id])
+    recent_followup = 0
+    recent_reply_seconds = (now_pt - _channel_last_reply_at[channel_id]).total_seconds()
+    has_recent_bot_reply = 0 <= recent_reply_seconds <= 20
+    payload_expected, _ = _detect_request_payload_expectation(clean_content or "")
+    payload_items = _collect_inline_direct_payload_items(clean_content or "") if clean_content else []
+    is_fragment = bool(clean_content) and not direct_request and not payload_items and len((clean_content or "").split()) <= 3 and "?" not in (clean_content or "")
+
+    action = "new_direct_request_candidate"
+    reason = "incomplete_direct_request"
+
+    if is_command_or_empty:
+        action, reason = "ignore_random_fragment", "command_or_empty"
+    elif channel_policy in {"protected_system", "reference_canon", "internal_controlled"}:
+        action, reason = "ignore_random_fragment", "protected_channel_policy"
+    elif direct_generation_active and bool(clean_content):
+        action, reason = "abort_rethink_candidate", "same_user_recent_direct"
+    elif active_payload_session and message_author_id == int(active_direct_session.get("requester_user_id", 0)):
+        if direct_request:
+            action, reason = "answer_now", "complete_direct_question"
+        else:
+            action, reason = "payload_session_append_candidate", "same_user_active_payload_session"
+    elif direct_request:
+        if payload_expected and len(payload_items) == 0:
+            action, reason = "wait_for_more", "expects_followup_items"
+        elif clean_content and len((clean_content or "").split()) <= 3 and "?" not in (clean_content or ""):
+            action, reason = "ask_clarification", "missing_subject"
+        else:
+            action, reason = "answer_now", "complete_direct_question"
+    elif has_recent_bot_reply:
+        action, reason = "recent_followup_candidate", "same_user_recent_direct"
+        recent_followup = 1
+    elif is_fragment:
+        action, reason = "ignore_random_fragment", "random_fragment_no_context"
+    else:
+        action, reason = "ignore_random_fragment", "other_user_no_context"
+
+    logging.info(
+        "direct_interaction_diagnostic action=%s reason=%s direct_request=%d active_payload_session=%d recent_followup=%d direct_generation_active=%d payload_expected=%d payload_items=%d channel_policy=%s",
+        action,
+        reason,
+        1 if direct_request else 0,
+        1 if active_payload_session else 0,
+        int(recent_followup),
+        1 if direct_generation_active else 0,
+        1 if payload_expected else 0,
+        len(payload_items),
+        channel_policy,
+    )
+
 @client.event
 async def on_message(message: discord.Message):
     print("BNL DEBUG: on_message triggered")
@@ -5389,6 +5454,15 @@ async def on_message(message: discord.Message):
 
     addressed_to_bot = bool(re.search(r"\b(bnl|bnl-01|barcode bot)\b", clean_content.lower())) if clean_content else False
     direct_request = is_mention or is_reply or ((not BNL_ACTIVE_BATCHING_ENABLED) and addressed_to_bot)
+    _classify_direct_interaction_diagnostic(
+        clean_content=clean_content,
+        direct_request=direct_request,
+        is_command_or_empty=(not clean_content),
+        channel_policy=channel_policy,
+        session_key=_direct_session_key(message),
+        message_author_id=message.author.id,
+        channel_id=message.channel.id,
+    )
 
     session_key = _direct_session_key(message)
     active_direct_session = _direct_payload_sessions.get(session_key)
