@@ -4421,6 +4421,17 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                         post_generation_regeneration_pending["payload_count"],
                     ),
                 )
+                _log_batch_event(
+                    logging.INFO,
+                    "post_generation_regeneration_prompt_ready",
+                    guild_id,
+                    channel_id,
+                    post_generation_regeneration_pending["final_count"],
+                    "final_count={0};payload_count={1}".format(
+                        post_generation_regeneration_pending["final_count"],
+                        post_generation_regeneration_pending["payload_count"],
+                    ),
+                )
                 post_generation_regeneration_pending = None
 
             _log_batch_event(logging.INFO, "active_packet_generation_started", guild_id, channel_id, len(collapsed_items), f"payload_count={len(active_packet['payload_items'])};decision={decision};reason={reason}")
@@ -4536,18 +4547,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                     rebuilt_combined_text = " ".join([c for (_n, c, _u) in rebuilt_collapsed_items])
                     rebuilt_first_uid = rebuilt_collapsed_items[0][2] if rebuilt_collapsed_items and rebuilt_collapsed_items[0][2] else 0
                     rebuilt_style_key, rebuilt_style_rule = choose_response_style(channel.guild.id, rebuilt_first_uid, len(rebuilt_collapsed_items), rebuilt_combined_text)
-                    rebuilt_prompt = _format_batched_prompt(rebuilt_msg_list, rebuilt_style_key, rebuilt_style_rule)
-                    if rebuilt_packet["payload_items"]:
-                        rebuilt_prompt += "\n\nACTIVE REQUEST PAYLOAD ITEMS (respond to every unique item):\n"
-                        for i, item in enumerate(rebuilt_packet["payload_items"], start=1):
-                            rebuilt_prompt += f"{i}. {item}\n"
-                    if _is_simple_humor_or_list_request(rebuilt_combined_text, len(rebuilt_packet["payload_items"])):
-                        rebuilt_prompt += (
-                            "\nUse strict direct format for this response:\n"
-                            "Item Name: <brief response>\n"
-                            "No long intro. No bracketed stage directions. No cinematic prose.\n"
-                        )
-                    _ = rebuilt_prompt
+                    _format_batched_prompt(rebuilt_msg_list, rebuilt_style_key, rebuilt_style_rule)
                     _log_batch_event(
                         logging.INFO,
                         "post_generation_packet_rebuilt",
