@@ -5439,7 +5439,12 @@ async def on_message(message: discord.Message):
     session_key = _direct_session_key(message)
     active_direct_session = _direct_payload_sessions.get(session_key)
     if active_direct_session and not getattr(message.author, "bot", False):
-        if (not message.content.startswith("/")) and (not (is_mention or is_reply or addressed_to_bot or conversational_candidate or followup_candidate)):
+        explicit_new_direct_request = bool(is_mention or is_reply or addressed_to_bot)
+        if explicit_new_direct_request:
+            active_direct_session["completed"] = True
+            _direct_payload_sessions.pop(session_key, None)
+            logging.info(f"direct_payload_session_expired payload_count={len(active_direct_session.get('payload_lines', []))} reason=new_direct_request")
+        elif not message.content.startswith("/"):
             line = (message.content or "").strip()
             if line:
                 active_direct_session["payload_lines"].append(line)
@@ -5450,11 +5455,8 @@ async def on_message(message: discord.Message):
                     logging.info(f"direct_payload_session_generation_invalidated payload_count={len(active_direct_session['payload_lines'])} reason=new_payload_during_generation")
                 logging.info(f"direct_payload_session_payload_added payload_count={len(active_direct_session['payload_lines'])}")
                 logging.info(f"direct_payload_session_timer_reset payload_count={len(active_direct_session['payload_lines'])}")
+                logging.info("conversational_continuation_detected reason=active_request")
                 return
-        if direct_request:
-            active_direct_session["completed"] = True
-            _direct_payload_sessions.pop(session_key, None)
-            logging.info(f"direct_payload_session_expired payload_count={len(active_direct_session.get('payload_lines', []))} reason=new_direct_request")
 
     if clean_content and (should_handle_as_active_channel or is_mention or is_reply):
         if not is_sealed_test_channel:
