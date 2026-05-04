@@ -70,6 +70,9 @@ ADAPTIVE_PAYLOAD_WAIT_NO_ITEMS_SECONDS = 4
 ADAPTIVE_PAYLOAD_WAIT_WITH_ITEMS_SECONDS = 1.5
 ADAPTIVE_PAYLOAD_MAX_WAIT_SECONDS = 9
 ADAPTIVE_PAYLOAD_SEALED_BONUS_SECONDS = 0.75
+DIRECT_PAYLOAD_QUIET_SECONDS = 1.25
+DIRECT_PAYLOAD_HARD_CAP_SECONDS = 6.0
+
 
 # ======== DYNAMIC AMBIENT CONFIG ========
 AMBIENT_CONTEXT_MESSAGES = 20
@@ -5170,108 +5173,126 @@ async def on_typing(channel, user, when):
     _log_batch_event(logging.DEBUG, "typing_signal_observed", channel.guild.id, channel.id, len(_channel_buffers[channel.id]), "reason=active_generation")
 
 
-async def _collect_direct_payload_lines(anchor_message: discord.Message, clean_content: str, is_direct_request: bool):
-    payload_expected, _ = _detect_request_payload_expectation(clean_content)
-    if (not is_direct_request) or (not payload_expected):
-        return clean_content, []
-
-    collected = [clean_content]
-    follow_up_lines = []
-    history_items = []
-    seen_count = 0
-    accepted_count = 0
-    ignored_count = 0
-    logging.info("direct_payload_wait_started")
-
-    window_seconds = 4.0
-    anchor_created_at = anchor_message.created_at
-    if anchor_created_at.tzinfo is None:
-        anchor_created_at = anchor_created_at.replace(tzinfo=timezone.utc)
-    cutoff = anchor_created_at + timedelta(seconds=window_seconds)
-
-    remaining = (cutoff - datetime.now(timezone.utc)).total_seconds()
-    if remaining > 0:
-        await asyncio.sleep(remaining)
-
-    logging.info("direct_payload_history_scan_started")
-    try:
-        async for follow_up in anchor_message.channel.history(limit=50, after=anchor_message, oldest_first=True):
-            created_at = follow_up.created_at
-            if created_at.tzinfo is None:
-                created_at = created_at.replace(tzinfo=timezone.utc)
-            if created_at > cutoff:
-                break
-            history_items.append(follow_up)
-    except (discord.Forbidden, discord.HTTPException, discord.NotFound) as exc:
-        logging.info(f"direct_payload_history_scan_failed error_type={type(exc).__name__}")
-        history_items = []
-
-    logging.info(f"direct_payload_history_scan_complete history_count={len(history_items)}")
-
-    for follow_up in history_items:
-        seen_count += 1
-        if follow_up.author == client.user:
-            ignored_count += 1
+def _collect_inline_direct_payload_items(clean_content: str):
+    payload_items = []
+    multiline = _extract_multiline_request_payload(clean_content)
+    if multiline:
+        payload_items.extend(multiline.get("payload_items", []))
+    if not payload_items:
+        inline_match = re.search(r"\b(?:about|for)\s+(.+)$", clean_content, re.IGNORECASE)
+        if inline_match:
+            candidate_text = inline_match.group(1).strip().rstrip(".!?")
+            candidate_text = re.sub(r"^\b(?:these|the|those)\s+(?:people|names|items)\b\s*", "", candidate_text, flags=re.IGNORECASE).strip()
+            candidate_text = re.sub(r"\b(?:please|thanks?)\b$", "", candidate_text, flags=re.IGNORECASE).strip(" ,")
+            if candidate_text:
+                parts = [p.strip(" .,!?:;") for p in re.split(r",|\band\b", candidate_text, flags=re.IGNORECASE)]
+                payload_items.extend([p for p in parts if _is_single_payload_like_item(p)])
+    unique = []
+    seen = set()
+    for raw_item in payload_items:
+        key = _normalize_payload_item_key(raw_item)
+        if not key or key in seen:
             continue
-        if getattr(follow_up.author, "bot", False):
-            ignored_count += 1
-            continue
-        if follow_up.guild is None or anchor_message.guild is None:
-            ignored_count += 1
-            continue
-        if follow_up.guild.id != anchor_message.guild.id:
-            ignored_count += 1
-            continue
-        if follow_up.channel.id != anchor_message.channel.id:
-            ignored_count += 1
-            continue
-        if follow_up.author.id != anchor_message.author.id:
-            ignored_count += 1
-            continue
-        line = (follow_up.content or "").strip()
-        if (not line) or line.startswith("/"):
-            ignored_count += 1
-            continue
-        follow_up_lines.append(line)
-        accepted_count += 1
+        seen.add(key)
+        unique.append(raw_item.strip())
+    return unique
 
-    if follow_up_lines:
-        collected.extend(follow_up_lines)
 
-    def _dedupe_payload_items(items):
-        unique = []
-        seen = set()
-        for raw_item in items:
-            key = _normalize_payload_item_key(raw_item)
-            if not key or key in seen:
-                continue
+def _direct_session_key(message: discord.Message):
+    return (message.guild.id if message.guild else 0, message.channel.id, message.author.id)
+
+
+_direct_payload_sessions = {}
+
+
+async def _generate_direct_payload_session(session_key, reason: str):
+    session = _direct_payload_sessions.get(session_key)
+    if not session:
+        return
+    if session.get("completed"):
+        return
+    session["completed"] = True
+    payload_lines = list(session.get("payload_lines", []))
+    anchor_message = session.get("anchor_message")
+    payload_count = len(payload_lines)
+
+    if payload_count == 0:
+        logging.info("direct_payload_session_expired payload_count=0 reason=no_payload")
+        try:
+            await anchor_message.reply("I can do that—send the list/items and I’ll run it.")
+        except Exception:
+            pass
+        _direct_payload_sessions.pop(session_key, None)
+        return
+
+    logging.info(f"direct_payload_session_generation_started payload_count={payload_count} reason={reason}")
+    direct_content = session["request_text"] + "\n" + "\n".join(payload_lines)
+    direct_payload_items = []
+    seen = set()
+    for line in payload_lines:
+        key = _normalize_payload_item_key(line)
+        if key and key not in seen:
             seen.add(key)
-            unique.append(raw_item.strip())
-        return unique
+            direct_payload_items.append(line)
 
-    payload_source = "inline"
-    if follow_up_lines:
-        payload_items = _dedupe_payload_items(follow_up_lines)
-        payload_source = "history"
+    prompt, allow_greeting, style_key = build_user_aware_prompt(
+        session["requester_user_id"],
+        session["guild_id"],
+        session["requester_display_name"],
+        direct_content,
+        message_count=1,
+        privileged=is_privileged_member(session["requester_member"], session["guild"])
+    )
+    prompt = _build_direct_payload_prompt(prompt, direct_payload_items, direct_content)
+    log_response_style(session["guild_id"], session["requester_user_id"], style_key)
+    await _apply_direct_response_pacing(True, len(direct_payload_items))
+    async with anchor_message.channel.typing():
+        response = await get_gemini_response(prompt, session["requester_user_id"], session["guild_id"])
+    if response and direct_payload_items:
+        missing_items = _missing_request_payload_items(direct_payload_items, response)
+        logging.info(f"direct_payload_completion_check missing_count={len(missing_items)}")
+        if missing_items:
+            correction_prompt = prompt + "\n\nCORRECTION REQUIRED: Regenerate and include every required payload item explicitly by name.\nMissing required payload items: " + ", ".join(missing_items) + "."
+            async with anchor_message.channel.typing():
+                response = await get_gemini_response(correction_prompt, session["requester_user_id"], session["guild_id"])
+            missing_items = _missing_request_payload_items(direct_payload_items, response or "")
+            logging.info(f"direct_payload_completion_regenerated missing_count={len(missing_items)}")
+            if missing_items:
+                fallback_lines = _build_payload_fallback_lines(missing_items)
+                if fallback_lines:
+                    response = ((response or "").strip() + "\n\n" + fallback_lines).strip()
+                    logging.info(f"direct_payload_completion_fallback_appended missing_count={len(missing_items)}")
+
+    if not response:
+        response = "[NETWORK ERROR] Temporary synchronization issue. Try again."
+    if len(response) <= 2000:
+        await anchor_message.reply(response)
     else:
-        payload_items = []
-        multiline = _extract_multiline_request_payload(clean_content)
-        if multiline:
-            payload_items.extend(multiline.get("payload_items", []))
-        if not payload_items:
-            inline_match = re.search(r"\b(?:about|for)\s+(.+)$", clean_content, re.IGNORECASE)
-            if inline_match:
-                candidate_text = inline_match.group(1).strip().rstrip(".!?")
-                candidate_text = re.sub(r"^\b(?:these|the|those)\s+(?:people|names|items)\b\s*", "", candidate_text, flags=re.IGNORECASE).strip()
-                candidate_text = re.sub(r"\b(?:please|thanks?)\b$", "", candidate_text, flags=re.IGNORECASE).strip(" ,")
-                if candidate_text:
-                    parts = [p.strip(" .,!?:;") for p in re.split(r",|\band\b", candidate_text, flags=re.IGNORECASE)]
-                    payload_items.extend([p for p in parts if _is_single_payload_like_item(p)])
-        payload_items = _dedupe_payload_items(payload_items)
+        chunks = split_message(response)
+        await anchor_message.reply(chunks[0] + "...")
+        for chunk in chunks[1:]:
+            await anchor_message.channel.send("..." + chunk)
+    if allow_greeting:
+        set_last_greeting_at(session["requester_user_id"], session["guild_id"], datetime.now(PACIFIC_TZ).isoformat())
+    save_model_message(session["requester_user_id"], session["guild_id"], response, channel_name=getattr(anchor_message.channel, "name", ""), channel_policy=session["channel_policy"])
+    logging.info(f"direct_payload_session_completed payload_count={payload_count}")
+    _direct_payload_sessions.pop(session_key, None)
 
-    logging.info(f"direct_payload_filter_counts seen_count={seen_count} accepted_count={accepted_count} ignored_count={ignored_count}")
-    logging.info(f"direct_payload_items_collected payload_count={len(payload_items)} source={payload_source}")
-    return "\n".join(collected), payload_items
+
+async def _direct_session_timer(session_key):
+    while True:
+        session = _direct_payload_sessions.get(session_key)
+        if not session or session.get("completed"):
+            return
+        now = datetime.now(timezone.utc)
+        if now >= session["hard_deadline"]:
+            await _generate_direct_payload_session(session_key, "hard_cap")
+            return
+        quiet_elapsed = (now - session["last_payload_at"]).total_seconds() if session.get("last_payload_at") else 0
+        if session.get("payload_lines") and quiet_elapsed >= DIRECT_PAYLOAD_QUIET_SECONDS:
+            await _generate_direct_payload_session(session_key, "quiet_timeout")
+            return
+        await asyncio.sleep(0.2)
 
 
 async def _apply_direct_response_pacing(payload_expected: bool, payload_count: int):
@@ -5334,6 +5355,22 @@ async def on_message(message: discord.Message):
     addressed_to_bot = bool(re.search(r"\b(bnl|bnl-01|barcode bot)\b", clean_content.lower())) if clean_content else False
     direct_request = is_mention or is_reply or ((not BNL_ACTIVE_BATCHING_ENABLED) and addressed_to_bot)
 
+    session_key = _direct_session_key(message)
+    active_direct_session = _direct_payload_sessions.get(session_key)
+    if active_direct_session and not getattr(message.author, "bot", False):
+        if (not message.content.startswith("/")) and (not direct_request):
+            line = (message.content or "").strip()
+            if line:
+                active_direct_session["payload_lines"].append(line)
+                active_direct_session["last_payload_at"] = datetime.now(timezone.utc)
+                logging.info(f"direct_payload_session_payload_added payload_count={len(active_direct_session['payload_lines'])}")
+                logging.info(f"direct_payload_session_timer_reset payload_count={len(active_direct_session['payload_lines'])}")
+                return
+        if direct_request:
+            active_direct_session["completed"] = True
+            _direct_payload_sessions.pop(session_key, None)
+            logging.info(f"direct_payload_session_expired payload_count={len(active_direct_session.get('payload_lines', []))} reason=new_direct_request")
+
     if clean_content and (should_handle_as_active_channel or is_mention or is_reply):
         if not is_sealed_test_channel:
             maybe_update_broadcast_status_from_text(clean_content)
@@ -5375,7 +5412,7 @@ async def on_message(message: discord.Message):
 
         # Mentions/replies -> immediate response (not batched)
         if direct_request:
-            direct_content, direct_payload_items = await _collect_direct_payload_lines(message, clean_content, direct_request)
+            direct_content, direct_payload_items = clean_content, _collect_inline_direct_payload_items(clean_content)
             sealed_recall_guard = get_sealed_test_recall_guard_response(
                 channel_policy,
                 direct_content,
@@ -5429,6 +5466,30 @@ async def on_message(message: discord.Message):
                 if not is_sealed_test_channel:
                     save_model_message(message.author.id, message.guild.id, memory_recall, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy)
                 await message.reply(memory_recall)
+                return
+
+            payload_expected, _ = _detect_request_payload_expectation(direct_content)
+            if payload_expected and len(direct_payload_items) == 0:
+                session = {
+                    "guild_id": message.guild.id,
+                    "guild": message.guild,
+                    "channel_id": message.channel.id,
+                    "requester_user_id": message.author.id,
+                    "requester_display_name": message.author.display_name,
+                    "requester_member": message.author,
+                    "channel_policy": channel_policy,
+                    "request_text": direct_content,
+                    "anchor_message_id": message.id,
+                    "anchor_message": message,
+                    "payload_lines": [],
+                    "created_at": datetime.now(timezone.utc),
+                    "last_payload_at": None,
+                    "hard_deadline": datetime.now(timezone.utc) + timedelta(seconds=DIRECT_PAYLOAD_HARD_CAP_SECONDS),
+                    "completed": False,
+                }
+                _direct_payload_sessions[session_key] = session
+                session["timer_task"] = asyncio.create_task(_direct_session_timer(session_key))
+                logging.info("direct_payload_session_created")
                 return
 
             prompt, allow_greeting, style_key = build_user_aware_prompt(
@@ -5527,7 +5588,7 @@ async def on_message(message: discord.Message):
         if not clean_content:
             await message.reply("I monitor this channel passively. My active operations are in the designated liaison channel.")
             return
-        direct_content, direct_payload_items = await _collect_direct_payload_lines(message, clean_content, direct_request)
+        direct_content, direct_payload_items = clean_content, _collect_inline_direct_payload_items(clean_content)
         sealed_recall_guard = get_sealed_test_recall_guard_response(
             channel_policy,
             direct_content,
@@ -5631,7 +5692,7 @@ async def on_message(message: discord.Message):
         if not clean_content:
             await message.reply("You pinged me. How may I assist with BARCODE operations?")
             return
-        direct_content, direct_payload_items = await _collect_direct_payload_lines(message, clean_content, direct_request)
+        direct_content, direct_payload_items = clean_content, _collect_inline_direct_payload_items(clean_content)
         sealed_recall_guard = get_sealed_test_recall_guard_response(
             channel_policy,
             direct_content,
