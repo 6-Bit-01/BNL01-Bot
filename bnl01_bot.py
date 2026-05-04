@@ -3973,6 +3973,8 @@ def _collect_batch_request_payload_items(items, pending_state=False, pending_anc
             if split_anchor:
                 request_anchor_seen = True
                 request_anchor_user_id = uid if uid else request_anchor_user_id
+                previous_text = text
+                continue
 
         if request_anchor_seen and _is_single_payload_like_item(text):
             same_anchor_user = bool(request_anchor_user_id and uid and uid == request_anchor_user_id)
