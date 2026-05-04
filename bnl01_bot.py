@@ -5217,9 +5217,19 @@ async def _generate_direct_payload_session(session_key, reason: str):
     payload_count = len(payload_lines)
     logging.info(f"direct_payload_session_generation_snapshot payload_count={payload_count} revision={generation_revision}")
 
-    if generation_revision != int(session.get("revision", 0)):
-        session["generating"] = False
-        logging.info(f"direct_payload_session_generation_deferred payload_count={len(session.get('payload_lines', []))} reason=revision_changed")
+    def _abort_if_invalidated(abort_reason: str):
+        current_session = _direct_payload_sessions.get(session_key)
+        if not current_session:
+            session["generating"] = False
+            return True
+        if current_session.get("generation_invalidated") or generation_revision != int(current_session.get("revision", 0)):
+            current_session["generating"] = False
+            current_session["generation_invalidated"] = False
+            logging.info(f"direct_payload_session_generation_aborted payload_count={len(current_session.get('payload_lines', []))} reason={abort_reason}")
+            return True
+        return False
+
+    if _abort_if_invalidated("revision_changed_before_send"):
         return
 
     if payload_count == 0:
@@ -5253,15 +5263,11 @@ async def _generate_direct_payload_session(session_key, reason: str):
     prompt = _build_direct_payload_prompt(prompt, direct_payload_items, direct_content)
     log_response_style(session["guild_id"], session["requester_user_id"], style_key)
     await _apply_direct_response_pacing(True, len(direct_payload_items))
-    if generation_revision != int(session.get("revision", 0)):
-        session["generating"] = False
-        logging.info(f"direct_payload_session_generation_deferred payload_count={len(session.get('payload_lines', []))} reason=revision_changed")
+    if _abort_if_invalidated("revision_changed_before_send"):
         return
     async with anchor_message.channel.typing():
         response = await get_gemini_response(prompt, session["requester_user_id"], session["guild_id"])
-    if generation_revision != int(session.get("revision", 0)):
-        session["generating"] = False
-        logging.info(f"direct_payload_session_generation_deferred payload_count={len(session.get('payload_lines', []))} reason=revision_changed_after_generation")
+    if _abort_if_invalidated("revision_changed_before_send"):
         return
     if response and direct_payload_items:
         missing_items = _missing_request_payload_items(direct_payload_items, response)
@@ -5271,6 +5277,8 @@ async def _generate_direct_payload_session(session_key, reason: str):
             correction_prompt = prompt + "\n\nCORRECTION REQUIRED: Regenerate and include every required payload item explicitly by name.\nMissing required payload items: " + ", ".join(missing_items) + "."
             async with anchor_message.channel.typing():
                 response = await get_gemini_response(correction_prompt, session["requester_user_id"], session["guild_id"])
+            if _abort_if_invalidated("revision_changed_before_send"):
+                return
             missing_items = _missing_request_payload_items(direct_payload_items, response or "")
             logging.info(f"direct_payload_completion_missing_strict missing_count={len(missing_items)}")
             logging.info(f"direct_payload_completion_regenerated missing_count={len(missing_items)}")
@@ -5282,6 +5290,8 @@ async def _generate_direct_payload_session(session_key, reason: str):
 
     if not response:
         response = "[NETWORK ERROR] Temporary synchronization issue. Try again."
+    if _abort_if_invalidated("revision_changed_before_send"):
+        return
     if len(response) <= 2000:
         await anchor_message.reply(response)
     else:
@@ -5289,9 +5299,13 @@ async def _generate_direct_payload_session(session_key, reason: str):
         await anchor_message.reply(chunks[0] + "...")
         for chunk in chunks[1:]:
             await anchor_message.channel.send("..." + chunk)
+    if _abort_if_invalidated("revision_changed_before_send"):
+        return
     if allow_greeting:
         set_last_greeting_at(session["requester_user_id"], session["guild_id"], datetime.now(PACIFIC_TZ).isoformat())
     save_model_message(session["requester_user_id"], session["guild_id"], response, channel_name=getattr(anchor_message.channel, "name", ""), channel_policy=session["channel_policy"])
+    if _abort_if_invalidated("revision_changed_before_send"):
+        return
     session["completed"] = True
     session["generating"] = False
     logging.info(f"direct_payload_session_completed payload_count={payload_count} revision={generation_revision}")
@@ -5386,7 +5400,8 @@ async def on_message(message: discord.Message):
                 active_direct_session["last_payload_at"] = datetime.now(timezone.utc)
                 active_direct_session["revision"] = int(active_direct_session.get("revision", 0)) + 1
                 if active_direct_session.get("generating"):
-                    logging.info(f"direct_payload_session_generation_deferred payload_count={len(active_direct_session['payload_lines'])} reason=new_payload_during_generation")
+                    active_direct_session["generation_invalidated"] = True
+                    logging.info(f"direct_payload_session_generation_invalidated payload_count={len(active_direct_session['payload_lines'])} reason=new_payload_during_generation")
                 logging.info(f"direct_payload_session_payload_added payload_count={len(active_direct_session['payload_lines'])}")
                 logging.info(f"direct_payload_session_timer_reset payload_count={len(active_direct_session['payload_lines'])}")
                 return
@@ -5511,6 +5526,7 @@ async def on_message(message: discord.Message):
                     "hard_deadline": datetime.now(timezone.utc) + timedelta(seconds=DIRECT_PAYLOAD_HARD_CAP_SECONDS),
                     "completed": False,
                     "generating": False,
+                    "generation_invalidated": False,
                     "revision": 0,
                 }
                 _direct_payload_sessions[session_key] = session
