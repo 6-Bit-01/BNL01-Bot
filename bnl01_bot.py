@@ -4566,16 +4566,19 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
             log_response_style(channel.guild.id, first_uid, style_key)
             prompt = _format_batched_prompt(msg_list, style_key, style_rule)
             if active_packet["payload_items"]:
-                prompt += "\n\nACTIVE REQUEST PAYLOAD ITEMS (respond to every unique item):\n"
+                prompt += f"\n\nPRIMARY REQUEST ACTION: {active_packet.get('request_action', 'generic_request')}\n"
+                prompt += "Preserve what the user asked and satisfy that requested action first.\n"
+                prompt += "BNL flavor is welcome, but it must not override the user's task.\n"
+                prompt += "Address every payload item somewhere in the response unless the user requests a strict format.\n"
+                prompt += "ACTIVE REQUEST PAYLOAD ITEMS:\n"
                 for i, item in enumerate(active_packet["payload_items"], start=1):
                     prompt += f"{i}. {item}\n"
             if _is_simple_humor_or_list_request(combined_text, len(active_packet["payload_items"])):
                 prompt += (
-                    "\nUse strict direct format for this response:\n"
-                    "Item Name: <brief response>\n"
-                    "No long intro. No bracketed stage directions. No cinematic prose.\n"
+                    "\nKeep the response concise and natural for this conversation.\n"
+                    "Complete the requested action in an original shape, and avoid unrelated archive-analysis detours.\n"
                 )
-                _log_batch_event(logging.INFO, "simple_request_style_clamped", guild_id, channel_id, len(collapsed_items), f"payload_count={len(active_packet['payload_items'])}")
+                _log_batch_event(logging.INFO, "active_request_action_clamped", guild_id, channel_id, len(collapsed_items), f"payload_count={len(active_packet['payload_items'])};request_action={active_packet.get('request_action','generic_request')}")
             if post_generation_regeneration_pending:
                 _log_batch_event(
                     logging.INFO,
@@ -4623,8 +4626,8 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                             prompt
                             + "\n\nCORRECTION REQUIRED: Your last draft omitted required payload items. "
                             + "Regenerate now and include every required payload item explicitly by name. "
-                            + "Use a direct list format: Item Name: <brief line>. "
-                            + "No bracketed stage directions, no cinematic narration, no long atmospheric prose. "
+                            + "Preserve the user's requested action and keep a natural response shape unless the user explicitly asked for a strict format. "
+                            + "Avoid long atmospheric detours that ignore the task. "
                             + "Missing required payload items: " + ", ".join(missing_items) + ". "
                             + "Missing item count: " + str(len(missing_items)) + "."
                         )
