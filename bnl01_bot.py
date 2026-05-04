@@ -4540,14 +4540,9 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                     )
                     _channel_preempted_generation_id[channel_id] = local_generation_id
                     _channel_message_interrupt_generation_id[channel_id] = local_generation_id
-                    rebuilt_packet = _build_active_response_packet(channel_id, items, pending_state, bot_user=client.user)
-                    rebuilt_payload_count = len(rebuilt_packet["payload_items"])
-                    rebuilt_collapsed_items = _collapse_consecutive_batch_fragments(items)
-                    rebuilt_msg_list = [(name, content) for (name, content, _uid) in rebuilt_collapsed_items]
-                    rebuilt_combined_text = " ".join([c for (_n, c, _u) in rebuilt_collapsed_items])
-                    rebuilt_first_uid = rebuilt_collapsed_items[0][2] if rebuilt_collapsed_items and rebuilt_collapsed_items[0][2] else 0
-                    rebuilt_style_key, rebuilt_style_rule = choose_response_style(channel.guild.id, rebuilt_first_uid, len(rebuilt_collapsed_items), rebuilt_combined_text)
-                    _format_batched_prompt(rebuilt_msg_list, rebuilt_style_key, rebuilt_style_rule)
+                    rebuilt_payload_count = len(
+                        _build_active_response_packet(channel_id, items, pending_state, bot_user=client.user)["payload_items"]
+                    )
                     _log_batch_event(
                         logging.INFO,
                         "post_generation_packet_rebuilt",
