@@ -4455,12 +4455,14 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                         if not pending_task or pending_task.done():
                             _channel_tasks[channel_id] = asyncio.create_task(_schedule_flush(channel))
                         return
-                if (pending_state or pending_anchor) and _is_payload_like_cluster(collapsed_items):
-                    decision, reason = "answer", "pending_request_payload_continuation"
-                    _log_batch_event(logging.INFO, "payload_continuation_not_suppressed", guild_id, channel_id, len(collapsed_items), "override_ack_suppression_to_answer")
-                else:
-                    _log_batch_event(logging.INFO, "generic_ack_suppressed", guild_id, channel_id, len(collapsed_items), f"reason={reason}")
-                    return
+                    if (pending_state or pending_anchor) and _is_payload_like_cluster(collapsed_items):
+                        decision, reason = "answer", "pending_request_payload_continuation"
+                        _log_batch_event(logging.INFO, "payload_continuation_not_suppressed", guild_id, channel_id, len(collapsed_items), "override_ack_suppression_to_answer")
+                    else:
+                        _log_batch_event(logging.INFO, "generic_ack_suppressed", guild_id, channel_id, len(collapsed_items), f"reason={reason}")
+                        return
+                if decision == "answer":
+                    continue
                 await channel.send(ack, allowed_mentions=safe_mentions)
                 _log_batch_event(logging.INFO, "batch_response_acknowledge", guild_id, channel_id, len(collapsed_items), f"reason={reason}")
                 _channel_last_reply_at[channel_id] = datetime.now(PACIFIC_TZ)
