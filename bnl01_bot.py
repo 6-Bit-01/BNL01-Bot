@@ -22,7 +22,7 @@ import urllib.request
 import urllib.error
 import urllib.parse
 from collections import defaultdict, deque
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import pytz
 import discord
@@ -5177,58 +5177,66 @@ async def _collect_direct_payload_lines(anchor_message: discord.Message, clean_c
 
     collected = [clean_content]
     follow_up_lines = []
+    history_items = []
     seen_count = 0
     accepted_count = 0
     ignored_count = 0
     logging.info("direct_payload_wait_started")
-    deadline = datetime.now(PACIFIC_TZ) + timedelta(seconds=4)
-    while datetime.now(PACIFIC_TZ) < deadline:
-        timeout = (deadline - datetime.now(PACIFIC_TZ)).total_seconds()
-        if timeout <= 0:
-            break
-        try:
-            follow_up = await client.wait_for("message", timeout=timeout)
-        except asyncio.TimeoutError:
-            break
+
+    window_seconds = 4.0
+    anchor_created_at = anchor_message.created_at
+    if anchor_created_at.tzinfo is None:
+        anchor_created_at = anchor_created_at.replace(tzinfo=timezone.utc)
+    cutoff = anchor_created_at + timedelta(seconds=window_seconds)
+
+    remaining = (cutoff - datetime.now(timezone.utc)).total_seconds()
+    if remaining > 0:
+        await asyncio.sleep(remaining)
+
+    logging.info("direct_payload_history_scan_started")
+    try:
+        async for follow_up in anchor_message.channel.history(limit=50, after=anchor_message, oldest_first=True):
+            created_at = follow_up.created_at
+            if created_at.tzinfo is None:
+                created_at = created_at.replace(tzinfo=timezone.utc)
+            if created_at > cutoff:
+                break
+            history_items.append(follow_up)
+    except (discord.Forbidden, discord.HTTPException, discord.NotFound) as exc:
+        logging.info(f"direct_payload_history_scan_failed error_type={type(exc).__name__}")
+        history_items = []
+
+    logging.info(f"direct_payload_history_scan_complete history_count={len(history_items)}")
+
+    for follow_up in history_items:
         seen_count += 1
-        logging.info(f"direct_payload_candidate_seen count={seen_count}")
-        if not follow_up:
-            ignored_count += 1
-            logging.info(f"direct_payload_candidate_ignored count={ignored_count} reason=empty_event")
-            continue
         if follow_up.author == client.user:
             ignored_count += 1
-            logging.info(f"direct_payload_candidate_ignored count={ignored_count} reason=self_message")
             continue
         if getattr(follow_up.author, "bot", False):
             ignored_count += 1
-            logging.info(f"direct_payload_candidate_ignored count={ignored_count} reason=bot_author")
             continue
         if follow_up.guild is None or anchor_message.guild is None:
             ignored_count += 1
-            logging.info(f"direct_payload_candidate_ignored count={ignored_count} reason=missing_guild")
             continue
         if follow_up.guild.id != anchor_message.guild.id:
             ignored_count += 1
-            logging.info(f"direct_payload_candidate_ignored count={ignored_count} reason=other_guild")
             continue
         if follow_up.channel.id != anchor_message.channel.id:
             ignored_count += 1
-            logging.info(f"direct_payload_candidate_ignored count={ignored_count} reason=other_channel")
             continue
         if follow_up.author.id != anchor_message.author.id:
             ignored_count += 1
-            logging.info(f"direct_payload_candidate_ignored count={ignored_count} reason=other_user")
             continue
         line = (follow_up.content or "").strip()
         if (not line) or line.startswith("/"):
             ignored_count += 1
-            logging.info(f"direct_payload_candidate_ignored count={ignored_count} reason=empty_or_command")
             continue
-        collected.append(line)
         follow_up_lines.append(line)
         accepted_count += 1
-        logging.info(f"direct_payload_candidate_accepted count={accepted_count}")
+
+    if follow_up_lines:
+        collected.extend(follow_up_lines)
 
     def _dedupe_payload_items(items):
         unique = []
@@ -5241,8 +5249,10 @@ async def _collect_direct_payload_lines(anchor_message: discord.Message, clean_c
             unique.append(raw_item.strip())
         return unique
 
+    payload_source = "inline"
     if follow_up_lines:
         payload_items = _dedupe_payload_items(follow_up_lines)
+        payload_source = "history"
     else:
         payload_items = []
         multiline = _extract_multiline_request_payload(clean_content)
@@ -5258,7 +5268,9 @@ async def _collect_direct_payload_lines(anchor_message: discord.Message, clean_c
                     parts = [p.strip(" .,!?:;") for p in re.split(r",|\band\b", candidate_text, flags=re.IGNORECASE)]
                     payload_items.extend([p for p in parts if _is_single_payload_like_item(p)])
         payload_items = _dedupe_payload_items(payload_items)
-    logging.info(f"direct_payload_items_collected payload_count={len(payload_items)}")
+
+    logging.info(f"direct_payload_filter_counts seen_count={seen_count} accepted_count={accepted_count} ignored_count={ignored_count}")
+    logging.info(f"direct_payload_items_collected payload_count={len(payload_items)} source={payload_source}")
     return "\n".join(collected), payload_items
 
 
