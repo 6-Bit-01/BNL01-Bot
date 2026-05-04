@@ -5355,6 +5355,78 @@ def _build_direct_payload_prompt(base_prompt: str, payload_items, request_text: 
         lines.append("For simple joke/list requests, prefer per-item format like `Name: <answer>`.")
     return base_prompt + "\n" + "\n".join(lines)
 
+
+_contextual_interaction_states = {}
+
+
+def _contextual_state_key(message: discord.Message):
+    return (message.guild.id if message.guild else 0, message.channel.id, message.author.id)
+
+
+def _expire_contextual_state_if_needed(state_key, now_utc: datetime):
+    state = _contextual_interaction_states.get(state_key)
+    if not state:
+        return
+    if now_utc >= state.get("expires_at", now_utc):
+        logging.info("interaction_state_expired reason=timeout")
+        _contextual_interaction_states.pop(state_key, None)
+
+
+def _score_contextual_signal(clean_content: str, has_state: bool, same_user_recent: bool, direct_request: bool, room_has_bot_turn: bool):
+    text = (clean_content or "").strip()
+    lower = text.lower()
+    score = 0
+    reasons = []
+    request_like = bool(re.search(r"\?|\b(can you|could you|would you|help|what|why|how|compare|tell me|make|when)\b", lower))
+    ack_like = lower in {"lol", "lmao", "ok", "okay", "thanks", "thx", "nice", "yep", "yup"}
+    if direct_request:
+        score += 6; reasons.append("direct_request")
+    if request_like:
+        score += 4; reasons.append("request_like")
+    if has_state and same_user_recent:
+        score += 3; reasons.append("same_user_active_state")
+    if room_has_bot_turn:
+        score += 1; reasons.append("room_active_topic")
+    if len(text) <= 3 and not has_state:
+        score -= 2; reasons.append("very_short_no_state")
+    if ack_like:
+        reasons.append("ack_like")
+    logging.info(f"contextual_signal_score score={score} reason_codes={','.join(reasons) if reasons else 'none'}")
+    return score, request_like, ack_like
+
+
+def _decide_contextual_action(clean_content: str, score: int, request_like: bool, ack_like: bool, has_state: bool):
+    text = (clean_content or "").strip()
+    payload_expected, _ = _detect_request_payload_expectation(text)
+    if has_state and text and not request_like and not ack_like:
+        return "continue", "same_user_followup"
+    if payload_expected and len(_collect_inline_direct_payload_items(text)) == 0:
+        return "wait", "payload_collection_expected"
+    if request_like and len(text.split()) <= 5 and not text.endswith("?"):
+        return "clarify", "incomplete_request"
+    if request_like or score >= 5:
+        return "answer", "clear_request"
+    if ack_like and has_state:
+        return "observe", "light_ack_contextual"
+    if score <= 0:
+        return "silent", "noise_or_unrelated"
+    return "observe", "room_observation"
+
+
+def _touch_contextual_state(state_key, action: str, now_utc: datetime):
+    state = _contextual_interaction_states.get(state_key)
+    if not state:
+        state = {"message_count": 0, "revision": 0, "expires_at": now_utc + timedelta(seconds=90)}
+        _contextual_interaction_states[state_key] = state
+        logging.info("interaction_state_created state_type=same_user_same_channel")
+    state["message_count"] += 1
+    state["revision"] += 1
+    state["last_action"] = action
+    state["expires_at"] = now_utc + timedelta(seconds=90)
+    logging.info(f"interaction_state_updated message_count={state['message_count']} revision={state['revision']}")
+    return state
+
+
 @client.event
 async def on_message(message: discord.Message):
     print("BNL DEBUG: on_message triggered")
@@ -5590,8 +5662,71 @@ async def on_message(message: discord.Message):
                     await message.channel.send("..." + chunk)
             return
 
-        # Non-mention in active channel -> batch (kill-switched by env)
+        # Non-mention in active channel -> contextual conversation judgment (or batch when explicitly enabled)
         if not BNL_ACTIVE_BATCHING_ENABLED:
+            now_utc = datetime.now(timezone.utc)
+            state_key = _contextual_state_key(message)
+            _expire_contextual_state_if_needed(state_key, now_utc)
+            state = _contextual_interaction_states.get(state_key)
+            has_state = bool(state)
+            room_has_bot_turn = False
+            try:
+                async for hist_msg in message.channel.history(limit=8):
+                    if hist_msg.author == client.user:
+                        room_has_bot_turn = True
+                        break
+            except Exception:
+                room_has_bot_turn = False
+            score, request_like, ack_like = _score_contextual_signal(clean_content, has_state, has_state, False, room_has_bot_turn)
+            action, reason = _decide_contextual_action(clean_content, score, request_like, ack_like, has_state)
+            logging.info(f"contextual_conversation_decision action={action} reason={reason}")
+
+            if action in ("wait", "continue"):
+                state = _touch_contextual_state(state_key, action, now_utc)
+                if state.get("generating"):
+                    state["generation_invalidated"] = True
+                    logging.info("interaction_generation_invalidated reason=new_relevant_context")
+                return
+            if action == "silent":
+                return
+            if action == "observe":
+                return
+            if action == "clarify":
+                _touch_contextual_state(state_key, action, now_utc)
+                await message.reply("Can you add a little more detail so I can help correctly?")
+                return
+            if action == "answer":
+                state = _touch_contextual_state(state_key, action, now_utc)
+                state["generating"] = True
+                revision = int(state.get("revision", 0))
+                prompt, allow_greeting, style_key = build_user_aware_prompt(
+                    message.author.id,
+                    message.guild.id,
+                    message.author.display_name,
+                    clean_content,
+                    message_count=1,
+                    privileged=is_privileged_member(message.author, message.guild)
+                )
+                log_response_style(message.guild.id, message.author.id, style_key)
+                async with message.channel.typing():
+                    response = await get_gemini_response(prompt, message.author.id, message.guild.id)
+                latest = _contextual_interaction_states.get(state_key)
+                if not latest or latest.get("generation_invalidated") or revision != int(latest.get("revision", 0)):
+                    if latest:
+                        latest["generating"] = False
+                        latest["generation_invalidated"] = False
+                    logging.info("interaction_generation_invalidated reason=new_relevant_context")
+                    return
+                latest["generating"] = False
+                latest["completed"] = True
+                logging.info("interaction_state_completed reason=answered")
+                if not response:
+                    await message.reply("[NETWORK ERROR] Temporary synchronization issue. Try again.")
+                    return
+                if not is_sealed_test_channel:
+                    save_model_message(message.author.id, message.guild.id, response, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy)
+                await message.reply(response if len(response) <= 2000 else split_message(response)[0])
+                return
             return
         if active_test_free_speak:
             logging.info(f"[conversation] guild_id={message.guild.id} channel_id={message.channel.id} reason=sealed_test_free_speak")
