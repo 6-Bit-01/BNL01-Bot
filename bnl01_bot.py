@@ -3064,6 +3064,10 @@ def _extract_text_and_tokens(response):
         return "", None
 
 async def get_gemini_response(prompt: str, user_id: int, guild_id: int):
+    def _is_gemini_503(exc: Exception) -> bool:
+        msg = str(exc or "").lower()
+        return ("503" in msg and "unavailable" in msg) or "service unavailable" in msg
+
     try:
         if not check_quota_availability():
             tokens_used, _ = get_usage_stats()
@@ -3096,16 +3100,32 @@ async def get_gemini_response(prompt: str, user_id: int, guild_id: int):
         )
         print("BNL DEBUG: sending prompt to Gemini")
 
-        response = gemini_client.models.generate_content(
-            model="models/gemini-2.5-flash",
-            contents=f"""{BNL01_SYSTEM_PROMPT}
+        request_contents = f"""{BNL01_SYSTEM_PROMPT}
 
         Conversation history:
         {conversation_context}
 
         User: {prompt}
         BNL-01:"""
-        )
+        try:
+            response = gemini_client.models.generate_content(
+                model="models/gemini-2.5-flash",
+                contents=request_contents
+            )
+        except Exception as e:
+            if _is_gemini_503(e):
+                await asyncio.sleep(0.8)
+                try:
+                    response = gemini_client.models.generate_content(
+                        model="models/gemini-2.5-flash",
+                        contents=request_contents
+                    )
+                except Exception as retry_error:
+                    if _is_gemini_503(retry_error):
+                        logging.error("direct_generation_failed reason=gemini_503")
+                    raise
+            else:
+                raise
 
         text, tokens = _extract_text_and_tokens(response)
 
@@ -5202,6 +5222,17 @@ def _direct_session_key(message: discord.Message):
 
 
 _direct_payload_sessions = {}
+_recent_direct_response_window = {}
+DIRECT_FOLLOWUP_WINDOW_SECONDS = 45
+
+def _mark_recent_direct_response(channel_id: int, user_id: int):
+    _recent_direct_response_window[(channel_id, user_id)] = datetime.now(timezone.utc)
+
+def _is_recent_direct_followup(channel_id: int, user_id: int) -> bool:
+    ts = _recent_direct_response_window.get((channel_id, user_id))
+    if not ts:
+        return False
+    return (datetime.now(timezone.utc) - ts).total_seconds() <= DIRECT_FOLLOWUP_WINDOW_SECONDS
 
 
 async def _generate_direct_payload_session(session_key, reason: str):
@@ -5388,12 +5419,27 @@ async def on_message(message: discord.Message):
     )
 
     addressed_to_bot = bool(re.search(r"\b(bnl|bnl-01|barcode bot)\b", clean_content.lower())) if clean_content else False
-    direct_request = is_mention or is_reply or ((not BNL_ACTIVE_BATCHING_ENABLED) and addressed_to_bot)
+    conversational_channel_allowed = channel_policy in {"public_home", "public_context", "public_selective"} or is_active_channel
+    followup_candidate = _is_recent_direct_followup(message.channel.id, message.author.id) if clean_content else False
+    conversational_candidate = (
+        bool(clean_content)
+        and conversational_channel_allowed
+        and (not is_sealed_test_channel)
+        and (not getattr(message.author, "bot", False))
+    )
+    direct_request = is_mention or is_reply or ((not BNL_ACTIVE_BATCHING_ENABLED) and addressed_to_bot) or conversational_candidate or followup_candidate
+    if conversational_candidate and not (is_mention or is_reply or addressed_to_bot):
+        logging.info("conversational_response_candidate reason=allowed_channel")
+        if len(clean_content.split()) <= 2 and len(clean_content) <= 20:
+            logging.info("conversational_minimal_ack reason=low_detail")
+    if followup_candidate and not (is_mention or is_reply or addressed_to_bot):
+        logging.info("conversational_response_candidate reason=followup")
+        logging.info("conversational_continuation_detected reason=same_user_recent_response")
 
     session_key = _direct_session_key(message)
     active_direct_session = _direct_payload_sessions.get(session_key)
     if active_direct_session and not getattr(message.author, "bot", False):
-        if (not message.content.startswith("/")) and (not direct_request):
+        if (not message.content.startswith("/")) and (not (is_mention or is_reply or addressed_to_bot or conversational_candidate or followup_candidate)):
             line = (message.content or "").strip()
             if line:
                 active_direct_session["payload_lines"].append(line)
@@ -5588,6 +5634,7 @@ async def on_message(message: discord.Message):
                 await message.reply(chunks[0] + "...")
                 for chunk in chunks[1:]:
                     await message.channel.send("..." + chunk)
+            _mark_recent_direct_response(message.channel.id, message.author.id)
             return
 
         # Non-mention in active channel -> batch (kill-switched by env)
@@ -5727,6 +5774,7 @@ async def on_message(message: discord.Message):
             await message.reply(chunks[0] + "...")
             for chunk in chunks[1:]:
                 await message.channel.send("..." + chunk)
+        _mark_recent_direct_response(message.channel.id, message.author.id)
         return
 
     # ---------------- NO ACTIVE CHANNEL SET (RESPOND TO MENTIONS/REPLIES ANYWHERE) ----------------
@@ -5825,6 +5873,7 @@ async def on_message(message: discord.Message):
             set_last_greeting_at(message.author.id, message.guild.id, datetime.now(PACIFIC_TZ).isoformat())
 
         await message.reply(response if len(response) <= 2000 else response[:1900] + "...")
+        _mark_recent_direct_response(message.channel.id, message.author.id)
         return
 
 # ==================== SLASH COMMANDS ====================
