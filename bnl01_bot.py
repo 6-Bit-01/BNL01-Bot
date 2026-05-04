@@ -22,7 +22,7 @@ import urllib.request
 import urllib.error
 import urllib.parse
 from collections import defaultdict, deque
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import pytz
 import discord
@@ -5181,54 +5181,86 @@ async def _collect_direct_payload_lines(anchor_message: discord.Message, clean_c
     accepted_count = 0
     ignored_count = 0
     logging.info("direct_payload_wait_started")
-    deadline = datetime.now(PACIFIC_TZ) + timedelta(seconds=4)
-    while datetime.now(PACIFIC_TZ) < deadline:
-        timeout = (deadline - datetime.now(PACIFIC_TZ)).total_seconds()
-        if timeout <= 0:
+
+    window_seconds = 4.0
+    poll_interval_seconds = 0.2
+    anchor_created_at = anchor_message.created_at
+    if anchor_created_at.tzinfo is None:
+        anchor_created_at = anchor_created_at.replace(tzinfo=timezone.utc)
+    cutoff = anchor_created_at + timedelta(seconds=window_seconds)
+
+    while True:
+        now_utc = datetime.now(timezone.utc)
+        if now_utc >= cutoff:
             break
+
         try:
-            follow_up = await client.wait_for("message", timeout=timeout)
-        except asyncio.TimeoutError:
+            history = []
+            async for follow_up in anchor_message.channel.history(limit=50, after=anchor_message, oldest_first=True):
+                created_at = follow_up.created_at
+                if created_at.tzinfo is None:
+                    created_at = created_at.replace(tzinfo=timezone.utc)
+                if created_at > cutoff:
+                    break
+                history.append(follow_up)
+        except Exception:
+            history = []
+
+        prior_count = len(follow_up_lines)
+        follow_up_lines = []
+        for follow_up in history:
+            seen_count += 1
+            logging.info(f"direct_payload_candidate_seen count={seen_count}")
+            if not follow_up:
+                ignored_count += 1
+                logging.info(f"direct_payload_candidate_ignored count={ignored_count} reason=empty_event")
+                continue
+            if follow_up.author == client.user:
+                ignored_count += 1
+                logging.info(f"direct_payload_candidate_ignored count={ignored_count} reason=self_message")
+                continue
+            if getattr(follow_up.author, "bot", False):
+                ignored_count += 1
+                logging.info(f"direct_payload_candidate_ignored count={ignored_count} reason=bot_author")
+                continue
+            if follow_up.guild is None or anchor_message.guild is None:
+                ignored_count += 1
+                logging.info(f"direct_payload_candidate_ignored count={ignored_count} reason=missing_guild")
+                continue
+            if follow_up.guild.id != anchor_message.guild.id:
+                ignored_count += 1
+                logging.info(f"direct_payload_candidate_ignored count={ignored_count} reason=other_guild")
+                continue
+            if follow_up.channel.id != anchor_message.channel.id:
+                ignored_count += 1
+                logging.info(f"direct_payload_candidate_ignored count={ignored_count} reason=other_channel")
+                continue
+            if follow_up.author.id != anchor_message.author.id:
+                ignored_count += 1
+                logging.info(f"direct_payload_candidate_ignored count={ignored_count} reason=other_user")
+                continue
+            line = (follow_up.content or "").strip()
+            if (not line) or line.startswith("/"):
+                ignored_count += 1
+                logging.info(f"direct_payload_candidate_ignored count={ignored_count} reason=empty_or_command")
+                continue
+            follow_up_lines.append(line)
+            accepted_count += 1
+            logging.info(f"direct_payload_candidate_accepted count={accepted_count}")
+
+        if len(follow_up_lines) > prior_count:
+            remaining = (cutoff - datetime.now(timezone.utc)).total_seconds()
+            if remaining > 0:
+                await asyncio.sleep(min(poll_interval_seconds, remaining))
+            continue
+
+        remaining = (cutoff - datetime.now(timezone.utc)).total_seconds()
+        if remaining <= 0:
             break
-        seen_count += 1
-        logging.info(f"direct_payload_candidate_seen count={seen_count}")
-        if not follow_up:
-            ignored_count += 1
-            logging.info(f"direct_payload_candidate_ignored count={ignored_count} reason=empty_event")
-            continue
-        if follow_up.author == client.user:
-            ignored_count += 1
-            logging.info(f"direct_payload_candidate_ignored count={ignored_count} reason=self_message")
-            continue
-        if getattr(follow_up.author, "bot", False):
-            ignored_count += 1
-            logging.info(f"direct_payload_candidate_ignored count={ignored_count} reason=bot_author")
-            continue
-        if follow_up.guild is None or anchor_message.guild is None:
-            ignored_count += 1
-            logging.info(f"direct_payload_candidate_ignored count={ignored_count} reason=missing_guild")
-            continue
-        if follow_up.guild.id != anchor_message.guild.id:
-            ignored_count += 1
-            logging.info(f"direct_payload_candidate_ignored count={ignored_count} reason=other_guild")
-            continue
-        if follow_up.channel.id != anchor_message.channel.id:
-            ignored_count += 1
-            logging.info(f"direct_payload_candidate_ignored count={ignored_count} reason=other_channel")
-            continue
-        if follow_up.author.id != anchor_message.author.id:
-            ignored_count += 1
-            logging.info(f"direct_payload_candidate_ignored count={ignored_count} reason=other_user")
-            continue
-        line = (follow_up.content or "").strip()
-        if (not line) or line.startswith("/"):
-            ignored_count += 1
-            logging.info(f"direct_payload_candidate_ignored count={ignored_count} reason=empty_or_command")
-            continue
-        collected.append(line)
-        follow_up_lines.append(line)
-        accepted_count += 1
-        logging.info(f"direct_payload_candidate_accepted count={accepted_count}")
+        await asyncio.sleep(min(poll_interval_seconds, remaining))
+
+    if follow_up_lines:
+        collected.extend(follow_up_lines)
 
     def _dedupe_payload_items(items):
         unique = []
