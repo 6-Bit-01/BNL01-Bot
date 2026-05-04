@@ -4354,10 +4354,14 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                 return
         active_packet = _build_active_response_packet(channel_id, items, pending_state, pending_anchor=pending_anchor, bot_user=client.user)
         decision, reason = active_packet["decision"], active_packet["reason"]
+        payload_count = len(active_packet["payload_items"])
         _log_batch_event(logging.INFO, "active_packet_original_count", guild_id, channel_id, active_packet["original_count"], f"original_count={active_packet['original_count']}")
         _log_batch_event(logging.INFO, "active_packet_collapsed_count", guild_id, channel_id, active_packet["collapsed_count"], f"collapsed_count={active_packet['collapsed_count']}")
-        _log_batch_event(logging.INFO, "active_packet_built", guild_id, channel_id, active_packet["collapsed_count"], f"original_count={active_packet['original_count']};collapsed_count={active_packet['collapsed_count']};payload_count={len(active_packet['payload_items'])};decision={decision};reason={reason}")
-        _log_batch_event(logging.INFO, "active_packet_payload_items", guild_id, channel_id, active_packet["collapsed_count"], f"payload_count={len(active_packet['payload_items'])}")
+        _log_batch_event(logging.INFO, "active_packet_built", guild_id, channel_id, active_packet["collapsed_count"], f"original_count={active_packet['original_count']};collapsed_count={active_packet['collapsed_count']};payload_count={payload_count};decision={decision};reason={reason}")
+        _log_batch_event(logging.INFO, "active_packet_payload_items", guild_id, channel_id, active_packet["collapsed_count"], f"payload_count={payload_count}")
+        if payload_count > 0 and decision != "answer":
+            _log_batch_event(logging.INFO, "payload_items_force_answer", guild_id, channel_id, len(collapsed_items), f"message_count={len(collapsed_items)};payload_count={payload_count}")
+            decision, reason = "answer", "payload_items_present"
         _log_batch_event(logging.INFO, "active_packet_decision", guild_id, channel_id, active_packet["collapsed_count"], f"decision={decision};reason={reason}")
         answer_intent_locked = decision == "answer"
         if (pending_state or pending_anchor) and reason in ("pending_request_payload_continuation", "pending_request_single_payload_continuation"):
@@ -4379,23 +4383,29 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
             _log_batch_event(logging.INFO, "pending_request_intent_used", guild_id, channel_id, len(collapsed_items), "override_acknowledge")
             _log_batch_event(logging.INFO, "continuation_not_suppressed", guild_id, channel_id, len(collapsed_items), "override_acknowledge_to_answer")
         if decision == "acknowledge":
-            ack = _build_acknowledgement_response(collapsed_items)
-            if not ack:
-                if _hard_interrupt_active_for_generation(channel_id, local_generation_id):
-                    _log_batch_event(logging.INFO, "interrupted_buffer_requeued", guild_id, channel_id, len(collapsed_items), f"reason=ack_suppression_blocked:{reason}")
-                    if channel_id not in _channel_first_seen:
-                        _channel_first_seen[channel_id] = datetime.now(PACIFIC_TZ)
-                    _channel_last_message_at[channel_id] = datetime.now(PACIFIC_TZ)
-                    pending_task = _channel_tasks.get(channel_id)
-                    if not pending_task or pending_task.done():
-                        _channel_tasks[channel_id] = asyncio.create_task(_schedule_flush(channel))
+            if payload_count > 0:
+                decision, reason = "answer", "payload_items_present"
+                _log_batch_event(logging.INFO, "payload_items_force_answer", guild_id, channel_id, len(collapsed_items), f"message_count={len(collapsed_items)};payload_count={payload_count}")
+            if decision == "answer":
+                answer_intent_locked = True
+            else:
+                ack = _build_acknowledgement_response(collapsed_items)
+                if not ack:
+                    if _hard_interrupt_active_for_generation(channel_id, local_generation_id):
+                        _log_batch_event(logging.INFO, "interrupted_buffer_requeued", guild_id, channel_id, len(collapsed_items), f"reason=ack_suppression_blocked:{reason}")
+                        if channel_id not in _channel_first_seen:
+                            _channel_first_seen[channel_id] = datetime.now(PACIFIC_TZ)
+                        _channel_last_message_at[channel_id] = datetime.now(PACIFIC_TZ)
+                        pending_task = _channel_tasks.get(channel_id)
+                        if not pending_task or pending_task.done():
+                            _channel_tasks[channel_id] = asyncio.create_task(_schedule_flush(channel))
+                        return
+                    _log_batch_event(logging.INFO, "generic_ack_suppressed", guild_id, channel_id, len(collapsed_items), f"reason={reason}")
                     return
-                _log_batch_event(logging.INFO, "generic_ack_suppressed", guild_id, channel_id, len(collapsed_items), f"reason={reason}")
+                await channel.send(ack)
+                _log_batch_event(logging.INFO, "batch_response_acknowledge", guild_id, channel_id, len(collapsed_items), f"reason={reason}")
+                _channel_last_reply_at[channel_id] = datetime.now(PACIFIC_TZ)
                 return
-            await channel.send(ack)
-            _log_batch_event(logging.INFO, "batch_response_acknowledge", guild_id, channel_id, len(collapsed_items), f"reason={reason}")
-            _channel_last_reply_at[channel_id] = datetime.now(PACIFIC_TZ)
-            return
 
         regenerated_once = False
         post_generation_capture_used = False
@@ -4419,10 +4429,14 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
             unique_user_ids = sorted({uid for (_n, _c, uid) in collapsed_items if uid})
             active_packet = _build_active_response_packet(channel_id, items, pending_state, pending_anchor=pending_anchor, bot_user=client.user)
             decision, reason = active_packet["decision"], active_packet["reason"]
+            payload_count = len(active_packet["payload_items"])
             _log_batch_event(logging.INFO, "active_packet_original_count", guild_id, channel_id, active_packet["original_count"], f"original_count={active_packet['original_count']}")
             _log_batch_event(logging.INFO, "active_packet_collapsed_count", guild_id, channel_id, active_packet["collapsed_count"], f"collapsed_count={active_packet['collapsed_count']}")
-            _log_batch_event(logging.INFO, "active_packet_built", guild_id, channel_id, active_packet["collapsed_count"], f"original_count={active_packet['original_count']};collapsed_count={active_packet['collapsed_count']};payload_count={len(active_packet['payload_items'])};decision={decision};reason={reason}")
-            _log_batch_event(logging.INFO, "active_packet_payload_items", guild_id, channel_id, active_packet["collapsed_count"], f"payload_count={len(active_packet['payload_items'])}")
+            _log_batch_event(logging.INFO, "active_packet_built", guild_id, channel_id, active_packet["collapsed_count"], f"original_count={active_packet['original_count']};collapsed_count={active_packet['collapsed_count']};payload_count={payload_count};decision={decision};reason={reason}")
+            _log_batch_event(logging.INFO, "active_packet_payload_items", guild_id, channel_id, active_packet["collapsed_count"], f"payload_count={payload_count}")
+            if payload_count > 0 and decision != "answer":
+                _log_batch_event(logging.INFO, "payload_items_force_answer", guild_id, channel_id, len(collapsed_items), f"message_count={len(collapsed_items)};payload_count={payload_count}")
+                decision, reason = "answer", "payload_items_present"
             _log_batch_event(logging.INFO, "active_packet_decision", guild_id, channel_id, active_packet["collapsed_count"], f"decision={decision};reason={reason}")
             if answer_intent_locked and decision != "answer":
                 _log_batch_event(logging.INFO, "request_intent_preserved", guild_id, channel_id, len(collapsed_items), f"reason={reason}")
@@ -4446,6 +4460,9 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                 _log_batch_event(logging.INFO, "pending_request_intent_used", guild_id, channel_id, len(collapsed_items), "override_acknowledge")
                 _log_batch_event(logging.INFO, "continuation_not_suppressed", guild_id, channel_id, len(collapsed_items), "override_acknowledge_to_answer")
             if decision == "acknowledge":
+                if payload_count > 0:
+                    decision, reason = "answer", "payload_items_present"
+                    _log_batch_event(logging.INFO, "payload_items_force_answer", guild_id, channel_id, len(collapsed_items), f"message_count={len(collapsed_items)};payload_count={payload_count}")
                 ack = _build_acknowledgement_response(collapsed_items)
                 if not ack:
                     if _hard_interrupt_active_for_generation(channel_id, local_generation_id):
@@ -4460,6 +4477,9 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                     if (pending_state or pending_anchor) and _is_payload_like_cluster(collapsed_items):
                         decision, reason = "answer", "pending_request_payload_continuation"
                         _log_batch_event(logging.INFO, "payload_continuation_not_suppressed", guild_id, channel_id, len(collapsed_items), "override_ack_suppression_to_answer")
+                    elif payload_count > 0:
+                        decision, reason = "answer", "payload_items_present"
+                        _log_batch_event(logging.INFO, "payload_items_force_answer", guild_id, channel_id, len(collapsed_items), f"message_count={len(collapsed_items)};payload_count={payload_count}")
                     else:
                         _log_batch_event(logging.INFO, "generic_ack_suppressed", guild_id, channel_id, len(collapsed_items), f"reason={reason}")
                         return
