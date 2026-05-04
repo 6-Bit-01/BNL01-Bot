@@ -5176,6 +5176,7 @@ async def _collect_direct_payload_lines(anchor_message: discord.Message, clean_c
         return clean_content, []
 
     collected = [clean_content]
+    follow_up_lines = []
     logging.info("direct_payload_wait_started")
     deadline = datetime.now(PACIFIC_TZ) + timedelta(seconds=4)
     while datetime.now(PACIFIC_TZ) < deadline:
@@ -5198,12 +5199,41 @@ async def _collect_direct_payload_lines(anchor_message: discord.Message, clean_c
         if not line or line.startswith("/"):
             continue
         collected.append(line)
-    payload_items = _collect_request_payload_items([("user", line) for line in collected])
+        follow_up_lines.append(line)
+
+    def _dedupe_payload_items(items):
+        unique = []
+        seen = set()
+        for raw_item in items:
+            key = _normalize_payload_item_key(raw_item)
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            unique.append(raw_item.strip())
+        return unique
+
+    if follow_up_lines:
+        payload_items = _dedupe_payload_items(follow_up_lines)
+    else:
+        payload_items = []
+        multiline = _extract_multiline_request_payload(clean_content)
+        if multiline:
+            payload_items.extend(multiline.get("payload_items", []))
+        if not payload_items:
+            inline_match = re.search(r"\b(?:about|for)\s+(.+)$", clean_content, re.IGNORECASE)
+            if inline_match:
+                candidate_text = inline_match.group(1).strip().rstrip(".!?")
+                candidate_text = re.sub(r"^\b(?:these|the|those)\s+(?:people|names|items)\b\s*", "", candidate_text, flags=re.IGNORECASE).strip()
+                candidate_text = re.sub(r"\b(?:please|thanks?)\b$", "", candidate_text, flags=re.IGNORECASE).strip(" ,")
+                if candidate_text:
+                    parts = [p.strip(" .,!?:;") for p in re.split(r",|\band\b", candidate_text, flags=re.IGNORECASE)]
+                    payload_items.extend([p for p in parts if _is_single_payload_like_item(p)])
+        payload_items = _dedupe_payload_items(payload_items)
     logging.info(f"direct_payload_items_collected payload_count={len(payload_items)}")
     return "\n".join(collected), payload_items
 
 
-def _build_direct_payload_prompt(base_prompt: str, payload_items) -> str:
+def _build_direct_payload_prompt(base_prompt: str, payload_items, request_text: str) -> str:
     if not payload_items:
         return base_prompt
     lines = ["", "DIRECT REQUEST PAYLOAD ITEMS:"]
@@ -5212,7 +5242,7 @@ def _build_direct_payload_prompt(base_prompt: str, payload_items) -> str:
     lines.append("")
     lines.append("Instruction:")
     lines.append("Respond to every required payload item by name. Do not omit any item.")
-    if _is_simple_humor_or_list_request(" ".join(payload_items), len(payload_items)):
+    if _is_simple_humor_or_list_request(request_text, len(payload_items)):
         lines.append("For simple joke/list requests, prefer per-item format like `Name: <answer>`.")
     return base_prompt + "\n" + "\n".join(lines)
 
@@ -5356,7 +5386,7 @@ async def on_message(message: discord.Message):
                 message_count=1,
                 privileged=is_privileged_member(message.author, message.guild)
             )
-            prompt = _build_direct_payload_prompt(prompt, direct_payload_items)
+            prompt = _build_direct_payload_prompt(prompt, direct_payload_items, direct_content)
             log_response_style(message.guild.id, message.author.id, style_key)
 
             async with message.channel.typing():
@@ -5494,7 +5524,7 @@ async def on_message(message: discord.Message):
             message_count=1,
             privileged=is_privileged_member(message.author, message.guild)
         )
-        prompt = _build_direct_payload_prompt(prompt, direct_payload_items)
+        prompt = _build_direct_payload_prompt(prompt, direct_payload_items, direct_content)
         log_response_style(message.guild.id, message.author.id, style_key)
 
         async with message.channel.typing():
@@ -5596,7 +5626,7 @@ async def on_message(message: discord.Message):
             message_count=1,
             privileged=is_privileged_member(message.author, message.guild)
         )
-        prompt = _build_direct_payload_prompt(prompt, direct_payload_items)
+        prompt = _build_direct_payload_prompt(prompt, direct_payload_items, direct_content)
         log_response_style(message.guild.id, message.author.id, style_key)
 
         async with message.channel.typing():
