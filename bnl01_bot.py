@@ -42,6 +42,7 @@ BNL_API_KEY = os.getenv("BNL_API_KEY")
 BNL_STATUS_URL = os.getenv("BNL_STATUS_URL")
 
 BNL_WEBSITE_RELAY_ENABLED = os.getenv("BNL_WEBSITE_RELAY_ENABLED", "true").strip().lower() not in {"false", "0", "off"}
+BNL_ACTIVE_BATCHING_ENABLED = os.getenv("BNL_ACTIVE_BATCHING_ENABLED", "false").strip().lower() in {"true", "1", "on"}
 BNL_WEBSITE_RELAY_INTERVAL_MINUTES = max(1, int(os.getenv("BNL_WEBSITE_RELAY_INTERVAL_MINUTES", "20")))
 BNL_PRIMARY_GUILD_ID = int(os.getenv("BNL_PRIMARY_GUILD_ID", "0") or 0)
 BNL_FORCE_PULL_SHARED_SECRET = os.getenv("BNL_FORCE_PULL_SHARED_SECRET", "").strip()
@@ -5297,7 +5298,9 @@ async def on_message(message: discord.Message):
                     await message.channel.send("..." + chunk)
             return
 
-        # Non-mention in active channel -> batch
+        # Non-mention in active channel -> batch (kill-switched by env)
+        if not BNL_ACTIVE_BATCHING_ENABLED:
+            return
         if active_test_free_speak:
             logging.info(f"[conversation] guild_id={message.guild.id} channel_id={message.channel.id} reason=sealed_test_free_speak")
         if _channel_generating[message.channel.id]:
