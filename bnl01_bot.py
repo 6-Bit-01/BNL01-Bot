@@ -5170,6 +5170,9 @@ async def on_message(message: discord.Message):
         .strip()
     )
 
+    addressed_to_bot = bool(re.search(r"\b(bnl|bnl-01|barcode bot)\b", clean_content.lower())) if clean_content else False
+    direct_request = is_mention or is_reply or ((not BNL_ACTIVE_BATCHING_ENABLED) and addressed_to_bot)
+
     if clean_content and (should_handle_as_active_channel or is_mention or is_reply):
         if not is_sealed_test_channel:
             maybe_update_broadcast_status_from_text(clean_content)
@@ -5200,7 +5203,7 @@ async def on_message(message: discord.Message):
 
     # ---------------- ACTIVE CHANNEL ----------------
     if should_handle_as_active_channel:
-        if not clean_content and (is_mention or is_reply):
+        if not clean_content and direct_request:
             await message.reply("You pinged me. How may I assist with BARCODE operations?")
             return
         if not clean_content:
@@ -5210,7 +5213,7 @@ async def on_message(message: discord.Message):
             save_user_message(message.author.id, message.author.display_name, message.guild.id, clean_content, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy)
 
         # Mentions/replies -> immediate response (not batched)
-        if is_mention or is_reply:
+        if direct_request:
             sealed_recall_guard = get_sealed_test_recall_guard_response(
                 channel_policy,
                 clean_content,
@@ -5332,7 +5335,7 @@ async def on_message(message: discord.Message):
 
     # ---------------- OTHER CHANNELS (PING-ONLY IF ACTIVE CHANNEL SET) ----------------
     if active_channel_id is not None and not should_handle_as_active_channel:
-        if not (is_mention or is_reply):
+        if not direct_request:
             return
 
         if not clean_content:
@@ -5413,7 +5416,7 @@ async def on_message(message: discord.Message):
         return
 
     # ---------------- NO ACTIVE CHANNEL SET (RESPOND TO MENTIONS/REPLIES ANYWHERE) ----------------
-    if active_channel_id is None and (is_mention or is_reply):
+    if active_channel_id is None and direct_request:
         if not clean_content:
             await message.reply("You pinged me. How may I assist with BARCODE operations?")
             return
