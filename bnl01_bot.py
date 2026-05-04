@@ -3628,6 +3628,7 @@ TYPING_RECENT_WINDOW_SECONDS = 5
 TYPING_SEND_GRACE_SECONDS = 1.5
 HARD_INTERRUPT_REEVALUATE_PAUSE_MIN_SECONDS = 0.75
 HARD_INTERRUPT_REEVALUATE_PAUSE_MAX_SECONDS = 1.5
+POST_GENERATION_CAPTURE_GRACE_SECONDS = 0.5
 
 def _batch_max_wait_seconds(channel_id: int, selected_wait_seconds: float = None) -> float:
     if selected_wait_seconds is not None:
@@ -4330,6 +4331,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
             return
 
         regenerated_once = False
+        post_generation_capture_used = False
         payload_completion_regenerated = False
         response = ""
         while True:
@@ -4451,6 +4453,87 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                         _log_batch_event(logging.INFO, "active_packet_completion_incomplete_after_retry", guild_id, channel_id, len(collapsed_items), f"payload_count={len(payload_items)};decision={decision};reason={reason}")
                 else:
                     _log_batch_event(logging.INFO, "active_packet_completion_passed", guild_id, channel_id, len(payload_items), "initial")
+
+            request_payload_expected = (
+                bool(active_packet["payload_items"])
+                or reason.startswith("request_payload_expected:")
+                or reason.startswith("request_intent:")
+                or reason in ("pending_request_payload_continuation", "pending_request_single_payload_continuation")
+                or bool(pending_state)
+                or _is_simple_humor_or_list_request(combined_text, len(active_packet["payload_items"]))
+            )
+            if (not post_generation_capture_used) and request_payload_expected and datetime.now(PACIFIC_TZ) < cycle_deadline:
+                post_generation_capture_used = True
+                payload_count = len(active_packet["payload_items"])
+                original_count = len(items)
+                _log_batch_event(
+                    logging.INFO,
+                    "post_generation_capture_wait",
+                    guild_id,
+                    channel_id,
+                    original_count,
+                    "original_count={0};added_count=0;final_count={0};payload_count={1};grace_seconds={2:.2f}".format(
+                        original_count,
+                        payload_count,
+                        POST_GENERATION_CAPTURE_GRACE_SECONDS,
+                    ),
+                )
+                await asyncio.sleep(POST_GENERATION_CAPTURE_GRACE_SECONDS)
+                late_after_generation = list(_channel_buffers[channel_id])
+                if late_after_generation:
+                    added_count = len(late_after_generation)
+                    _channel_buffers[channel_id].clear()
+                    _channel_first_seen.pop(channel_id, None)
+                    _channel_last_message_at.pop(channel_id, None)
+                    items.extend(late_after_generation)
+                    final_count = len(items)
+                    _log_batch_event(
+                        logging.INFO,
+                        "post_generation_buffer_drained",
+                        guild_id,
+                        channel_id,
+                        original_count,
+                        "original_count={0};added_count={1};final_count={2};payload_count={3}".format(
+                            original_count,
+                            added_count,
+                            final_count,
+                            payload_count,
+                        ),
+                    )
+                    _log_batch_event(
+                        logging.INFO,
+                        "stale_response_blocked_by_post_generation_capture",
+                        guild_id,
+                        channel_id,
+                        final_count,
+                        "original_count={0};added_count={1};final_count={2};payload_count={3}".format(
+                            original_count,
+                            added_count,
+                            final_count,
+                            payload_count,
+                        ),
+                    )
+                    _channel_preempted_generation_id[channel_id] = local_generation_id
+                    _channel_message_interrupt_generation_id[channel_id] = local_generation_id
+                    rebuilt_packet = _build_active_response_packet(channel_id, items, pending_state, bot_user=client.user)
+                    rebuilt_payload_count = len(rebuilt_packet["payload_items"])
+                    _log_batch_event(
+                        logging.INFO,
+                        "post_generation_packet_rebuilt",
+                        guild_id,
+                        channel_id,
+                        final_count,
+                        "original_count={0};added_count={1};final_count={2};payload_count={3}".format(
+                            original_count,
+                            added_count,
+                            final_count,
+                            rebuilt_payload_count,
+                        ),
+                    )
+                    regenerated_once = True
+                    _channel_preempted_generation_id[channel_id] = 0
+                    _channel_message_interrupt_generation_id[channel_id] = 0
+                    continue
 
             late_count = len(_channel_buffers[channel_id])
             if late_count > 0:
