@@ -632,6 +632,9 @@ RELAY_FALLBACKS = [
     "Broadcast aperture is open; cross-band interference is light across the outer channel.",
     "Submission corridor is active with steady receiver alignment in the public access corridor.",
 ]
+RELAY_WEAK_CONTEXT_STANDBY_MESSAGE = "BNL-01 remains online. Public relay is standing by until fresh Discord-side signal returns."
+RELAY_WEAK_CONTEXT_STANDBY_DIRECTIVE = "Monitor public channels. Do not refresh relay again until fresh context appears."
+WEAK_CONTEXT_REPEAT_COOLDOWN_SECONDS = 3 * 60 * 60
 
 RELAY_WEAK_CONTEXT_MODES = (
     "LOW_SIGNAL_STATUS",
@@ -745,26 +748,11 @@ def _pick_weak_context_mode(guild_id: int) -> str:
 
 
 def _weak_context_relay_message(guild_id: int, signal_summary: str, relay_context: str) -> str:
-    mode = _pick_weak_context_mode(guild_id)
-    archive_hint = relay_context.split("||")[0].strip() if relay_context.strip() else ""
-    summary_hint = (signal_summary or "").strip()
-    if mode == "LOW_SIGNAL_STATUS":
-        return "Public signal is quiet. BNL-01 remains online and listening across eligible BARCODE Network channels."
-    if mode == "ARCHIVE_ECHO":
-        if archive_hint:
-            clipped_hint = _safe_boundary_truncate(archive_hint, limit=110, min_chars=0, use_ellipsis=False)
-            return "Current public signal is thin. Archive echo: " + clipped_hint
-        return "Current public signal is thin. Archive echoes still point toward recurring curiosity around 6 Bit, submission flow, and the next broadcast window."
-    if mode == "CANON_TRACE":
-        return "No strong Discord-side pattern has formed. BNL-01 is holding near the BARCODE Radio corridor until the next broadcast signal sharpens."
-    if mode == "LIGHT_SPECULATION":
-        return "Public channels are quiet, but the relay keeps catching a faint pre-broadcast shape. It may be nothing. BNL-01 is still listening."
-    if mode == "QUESTION_OR_INVITATION":
-        return "Public signal is low. If a new track, question, or odd fragment is ready, BNL-01 can catch it in the open corridor."
-    if summary_hint:
-        clipped_summary = _safe_boundary_truncate(summary_hint, limit=80, min_chars=0, use_ellipsis=False)
-        return "No strong current pattern detected. BNL-01 is comparing older public fragments against the shape of the next transmission. " + clipped_summary
-    return "No strong current pattern detected. BNL-01 is comparing older public fragments against the shape of the next transmission."
+    return RELAY_WEAK_CONTEXT_STANDBY_MESSAGE
+
+
+def _is_weak_context_fallback(message: str) -> bool:
+    return _normalize_for_repeat(message) == _normalize_for_repeat(RELAY_WEAK_CONTEXT_STANDBY_MESSAGE)
 
 
 def _contains_stale_phrase(text: str) -> bool:
@@ -860,7 +848,7 @@ def _build_relay_context(guild_id: int, limit: int = 20) -> str:
     return " || ".join(sections)
 
 
-async def generate_dynamic_website_relay(guild_id: int) -> tuple[str, str, str]:
+async def generate_dynamic_website_relay(guild_id: int) -> tuple[str, str, str, dict]:
     logging.info(f"🛰️ Generating website relay message via generate_dynamic_website_relay(guild_id={guild_id}).")
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
@@ -883,6 +871,7 @@ async def generate_dynamic_website_relay(guild_id: int) -> tuple[str, str, str]:
     mode = _website_relay_mode_from_context(messages, now_pt)
     signal_summary = get_recent_signal_summary(guild_id)
     relay_context = _build_relay_context(guild_id)
+    source_channel_count = len(set(re.findall(r"(#[a-z0-9\-_]{2,})", relay_context.lower()))) if relay_context else 0
     context_is_strong, context_reason = _assess_relay_context_strength(messages, relay_context)
     recent_topics = _recent_relay_topic_summary(guild_id)
     recent_lines = _recent_relay_messages.get(guild_id, [])[-5:]
@@ -890,8 +879,15 @@ async def generate_dynamic_website_relay(guild_id: int) -> tuple[str, str, str]:
     logging.info(
         f"🧠 Relay context inspection guild={guild_id}: "
         f"has_messages={bool(messages)} has_specific_context={bool(relay_context.strip())} mode={mode} "
-        f"context_is_strong={context_is_strong} reason={context_reason}"
+        f"context_is_strong={context_is_strong} reason={context_reason} source_channel_count={source_channel_count}"
     )
+
+    if mode == "SIGNAL_DEGRADATION" and not context_is_strong and context_reason == "public_context_weak":
+        logging.info(
+            f"website_relay_signal_degradation_blocked_for_quiet_context mode={mode} reason={context_reason} "
+            f"elapsed_seconds=0 source_channel_count={source_channel_count}"
+        )
+        mode = "OBSERVATION"
 
     if GEMINI_API_KEY and context_is_strong:
         prompt = (
@@ -944,7 +940,7 @@ async def generate_dynamic_website_relay(guild_id: int) -> tuple[str, str, str]:
     if not relay_message or _contains_stale_phrase(relay_message):
         relay_message = _weak_context_relay_message(guild_id, signal_summary, relay_context) if not context_is_strong else _pick_varied_relay_fallback(_last_website_status_message)
     if not current_directive:
-        current_directive = random.choice(RELAY_DIRECTIVE_FALLBACKS)
+        current_directive = RELAY_WEAK_CONTEXT_STANDBY_DIRECTIVE if not context_is_strong else random.choice(RELAY_DIRECTIVE_FALLBACKS)
 
     if relay_message.strip().lower() == (_last_website_status_message or "").strip().lower() or _is_repetitive_relay(guild_id, relay_message):
         relay_message = _weak_context_relay_message(guild_id, signal_summary, relay_context) if not context_is_strong else _pick_varied_relay_fallback(relay_message)
@@ -963,7 +959,19 @@ async def generate_dynamic_website_relay(guild_id: int) -> tuple[str, str, str]:
     )
     _remember_relay_message(guild_id, relay_message)
     _remember_relay_topic(guild_id, relay_message)
-    return mode, relay_message, fit_complete_statement(current_directive, limit=220, min_chars=120, fallback=random.choice(RELAY_DIRECTIVE_FALLBACKS))
+    if context_is_strong:
+        logging.info(
+            f"website_relay_fresh_context_detected mode={mode} reason={context_reason} elapsed_seconds=0 "
+            f"source_channel_count={source_channel_count}"
+        )
+    metadata = {
+        "context_is_strong": context_is_strong,
+        "reason": context_reason,
+        "has_specific_context": bool(relay_context.strip()),
+        "source_channel_count": source_channel_count,
+        "is_weak_fallback": _is_weak_context_fallback(relay_message),
+    }
+    return mode, relay_message, fit_complete_statement(current_directive, limit=220, min_chars=120, fallback=RELAY_WEAK_CONTEXT_STANDBY_DIRECTIVE), metadata
 
 
 def resolve_network_guild_id(requested_guild_id: int) -> int:
@@ -985,7 +993,7 @@ async def request_fresh_website_relay(guild_id: int, *, force: bool = True) -> t
     try:
         target_guild_id = resolve_network_guild_id(guild_id)
         logging.info(f"📨 Fresh website relay requested guild={guild_id} target_guild={target_guild_id} force={force}.")
-        mode, relay_message, directive = await generate_dynamic_website_relay(target_guild_id)
+        mode, relay_message, directive, _relay_meta = await generate_dynamic_website_relay(target_guild_id)
         sanitized = fit_complete_statement(relay_message, limit=360, min_chars=0, fallback=_weak_context_relay_message(target_guild_id, signal_summary="", relay_context=""))
         sanitized_directive = fit_complete_statement(directive, limit=220, min_chars=120, fallback=random.choice(RELAY_DIRECTIVE_FALLBACKS))
         admin_note = build_admin_note(mode=mode, message=sanitized, current_directive=sanitized_directive, source="relay", compact=not force) if force else ""
@@ -1029,7 +1037,7 @@ async def _handle_force_pull(request: web.Request) -> web.Response:
 
     logging.info("Force-pull received")
     try:
-        mode, relay_message, directive = await generate_dynamic_website_relay(guild_id)
+        mode, relay_message, directive, _relay_meta = await generate_dynamic_website_relay(guild_id)
         ok = update_website_status_controlled(
             mode=mode,
             message=relay_message,
@@ -3602,8 +3610,27 @@ async def website_relay_task():
         if relay_eligibility == "no":
             continue
         logging.info(f"⏲️ website_relay_task tick guild={guild.id} active_channel={active_channel_id}.")
-        mode, relay_message, directive = await generate_dynamic_website_relay(guild.id)
+        mode, relay_message, directive, relay_meta = await generate_dynamic_website_relay(guild.id)
         logging.info(f"📤 website_relay_task prepared mode={mode} preview={relay_message[:120]!r}")
+        elapsed = (datetime.now(PACIFIC_TZ) - _last_website_status_at).total_seconds() if _last_website_status_at else 0.0
+        weak_quiet = (
+            not relay_meta.get("has_specific_context")
+            and not relay_meta.get("context_is_strong")
+            and relay_meta.get("reason") == "public_context_weak"
+        )
+        weak_repeat = weak_quiet and relay_meta.get("is_weak_fallback") and _is_weak_context_fallback(_last_website_status_message or "")
+        if weak_quiet and not weak_repeat:
+            logging.info(
+                f"website_relay_weak_context_skip mode={mode} reason={relay_meta.get('reason')} elapsed_seconds={elapsed:.1f} "
+                f"source_channel_count={relay_meta.get('source_channel_count', 0)}"
+            )
+            continue
+        if weak_repeat and elapsed < WEAK_CONTEXT_REPEAT_COOLDOWN_SECONDS:
+            logging.info(
+                f"website_relay_fallback_deduped mode={mode} reason={relay_meta.get('reason')} elapsed_seconds={elapsed:.1f} "
+                f"source_channel_count={relay_meta.get('source_channel_count', 0)}"
+            )
+            continue
         update_website_status_controlled(mode=mode, message=relay_message, status="ONLINE", current_directive=directive, source="relay")
 
 # ==================== BATCHED REPLY SYSTEM (ACTIVE CHANNEL ONLY) ====================
