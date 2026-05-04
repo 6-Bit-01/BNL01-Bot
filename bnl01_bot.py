@@ -5421,7 +5421,7 @@ async def on_message(message: discord.Message):
     plain_text_name_seen = bool(re.search(r"\b(bnl|bnl-01|barcode bot)\b", clean_content.lower())) if clean_content else False
     real_direct_target = bool(is_mention or is_reply)
     channel_allows_conversation = bool(
-        channel_policy in {"public_home", "public_context", "public_selective", "sealed_test"}
+        channel_policy in {"public_home", "sealed_test"}
         or is_active_channel
     )
     followup_candidate = _is_recent_direct_followup(message.channel.id, message.author.id) if clean_content else False
