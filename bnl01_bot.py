@@ -5418,28 +5418,21 @@ async def on_message(message: discord.Message):
         .strip()
     )
 
-    addressed_to_bot = bool(re.search(r"\b(bnl|bnl-01|barcode bot)\b", clean_content.lower())) if clean_content else False
-    conversational_channel_allowed = channel_policy in {"public_home", "public_context", "public_selective"} or is_active_channel
-    followup_candidate = _is_recent_direct_followup(message.channel.id, message.author.id) if clean_content else False
-    conversational_candidate = (
-        bool(clean_content)
-        and conversational_channel_allowed
-        and (not is_sealed_test_channel)
-        and (not getattr(message.author, "bot", False))
+    plain_text_name_seen = bool(re.search(r"\b(bnl|bnl-01|barcode bot)\b", clean_content.lower())) if clean_content else False
+    real_direct_target = bool(is_mention or is_reply)
+    channel_allows_conversation = bool(
+        channel_policy in {"public_home", "public_context", "public_selective", "sealed_test"}
+        or is_active_channel
     )
-    direct_request = is_mention or is_reply or ((not BNL_ACTIVE_BATCHING_ENABLED) and addressed_to_bot) or conversational_candidate or followup_candidate
-    if conversational_candidate and not (is_mention or is_reply or addressed_to_bot):
-        logging.info("conversational_response_candidate reason=allowed_channel")
-        if len(clean_content.split()) <= 2 and len(clean_content) <= 20:
-            logging.info("conversational_minimal_ack reason=low_detail")
-    if followup_candidate and not (is_mention or is_reply or addressed_to_bot):
-        logging.info("conversational_response_candidate reason=followup")
-        logging.info("conversational_continuation_detected reason=same_user_recent_response")
+    followup_candidate = _is_recent_direct_followup(message.channel.id, message.author.id) if clean_content else False
+    logging.info(f"response_route_channel_policy policy={channel_policy}")
+    logging.info(f"response_route_real_direct_target active={int(real_direct_target)}")
+    logging.info(f"response_route_plain_text_name_seen seen={int(plain_text_name_seen)}")
 
     session_key = _direct_session_key(message)
     active_direct_session = _direct_payload_sessions.get(session_key)
     if active_direct_session and not getattr(message.author, "bot", False):
-        explicit_new_direct_request = bool(is_mention or is_reply or addressed_to_bot)
+        explicit_new_direct_request = real_direct_target
         if explicit_new_direct_request:
             active_direct_session["completed"] = True
             _direct_payload_sessions.pop(session_key, None)
@@ -5456,7 +5449,25 @@ async def on_message(message: discord.Message):
                 logging.info(f"direct_payload_session_payload_added payload_count={len(active_direct_session['payload_lines'])}")
                 logging.info(f"direct_payload_session_timer_reset payload_count={len(active_direct_session['payload_lines'])}")
                 logging.info("conversational_continuation_detected reason=active_request")
+                logging.info("response_route_active_session active=1")
+                logging.info("response_route_decision route=active_session reason=direct_payload_continuation")
                 return
+
+    active_same_user_session = bool(_direct_payload_sessions.get(session_key))
+    message_should_enter_conversation = bool(clean_content and (channel_allows_conversation or real_direct_target or followup_candidate or active_same_user_session))
+    logging.info(f"response_route_active_session active={int(active_same_user_session)}")
+    if message_should_enter_conversation:
+        if channel_allows_conversation and not real_direct_target:
+            logging.info("response_route_decision route=conversation_allowed reason=channel_policy")
+            if len(clean_content.split()) <= 2 and len(clean_content) <= 20:
+                logging.info("conversational_minimal_ack reason=low_detail")
+        elif real_direct_target:
+            logging.info("response_route_decision route=real_direct_target reason=mention_or_reply")
+        elif followup_candidate:
+            logging.info("response_route_decision route=conversation_allowed reason=recent_followup_window")
+            logging.info("conversational_continuation_detected reason=same_user_recent_response")
+    else:
+        logging.info("response_route_decision route=policy_blocked reason=no_conversation_route")
 
     if clean_content and (should_handle_as_active_channel or is_mention or is_reply):
         if not is_sealed_test_channel:
@@ -5488,7 +5499,7 @@ async def on_message(message: discord.Message):
 
     # ---------------- ACTIVE CHANNEL ----------------
     if should_handle_as_active_channel:
-        if not clean_content and direct_request:
+        if not clean_content and message_should_enter_conversation:
             await message.reply("You pinged me. How may I assist with BARCODE operations?")
             return
         if not clean_content:
@@ -5498,7 +5509,7 @@ async def on_message(message: discord.Message):
             save_user_message(message.author.id, message.author.display_name, message.guild.id, clean_content, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy)
 
         # Mentions/replies -> immediate response (not batched)
-        if direct_request:
+        if message_should_enter_conversation:
             direct_content, direct_payload_items = clean_content, _collect_inline_direct_payload_items(clean_content)
             sealed_recall_guard = get_sealed_test_recall_guard_response(
                 channel_policy,
@@ -5673,7 +5684,7 @@ async def on_message(message: discord.Message):
 
     # ---------------- OTHER CHANNELS (PING-ONLY IF ACTIVE CHANNEL SET) ----------------
     if active_channel_id is not None and not should_handle_as_active_channel:
-        if not direct_request:
+        if not real_direct_target:
             return
 
         if not clean_content:
@@ -5780,7 +5791,7 @@ async def on_message(message: discord.Message):
         return
 
     # ---------------- NO ACTIVE CHANNEL SET (RESPOND TO MENTIONS/REPLIES ANYWHERE) ----------------
-    if active_channel_id is None and direct_request:
+    if active_channel_id is None and message_should_enter_conversation:
         if not clean_content:
             await message.reply("You pinged me. How may I assist with BARCODE operations?")
             return
