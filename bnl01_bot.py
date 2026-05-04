@@ -5177,6 +5177,9 @@ async def _collect_direct_payload_lines(anchor_message: discord.Message, clean_c
 
     collected = [clean_content]
     follow_up_lines = []
+    seen_count = 0
+    accepted_count = 0
+    ignored_count = 0
     logging.info("direct_payload_wait_started")
     deadline = datetime.now(PACIFIC_TZ) + timedelta(seconds=4)
     while datetime.now(PACIFIC_TZ) < deadline:
@@ -5187,19 +5190,45 @@ async def _collect_direct_payload_lines(anchor_message: discord.Message, clean_c
             follow_up = await client.wait_for("message", timeout=timeout)
         except asyncio.TimeoutError:
             break
-        if not follow_up or follow_up.author == client.user:
+        seen_count += 1
+        logging.info(f"direct_payload_candidate_seen count={seen_count}")
+        if not follow_up:
+            ignored_count += 1
+            logging.info(f"direct_payload_candidate_ignored count={ignored_count} reason=empty_event")
+            continue
+        if follow_up.author == client.user:
+            ignored_count += 1
+            logging.info(f"direct_payload_candidate_ignored count={ignored_count} reason=self_message")
+            continue
+        if getattr(follow_up.author, "bot", False):
+            ignored_count += 1
+            logging.info(f"direct_payload_candidate_ignored count={ignored_count} reason=bot_author")
             continue
         if follow_up.guild is None or anchor_message.guild is None:
+            ignored_count += 1
+            logging.info(f"direct_payload_candidate_ignored count={ignored_count} reason=missing_guild")
             continue
-        if follow_up.guild.id != anchor_message.guild.id or follow_up.channel.id != anchor_message.channel.id:
+        if follow_up.guild.id != anchor_message.guild.id:
+            ignored_count += 1
+            logging.info(f"direct_payload_candidate_ignored count={ignored_count} reason=other_guild")
+            continue
+        if follow_up.channel.id != anchor_message.channel.id:
+            ignored_count += 1
+            logging.info(f"direct_payload_candidate_ignored count={ignored_count} reason=other_channel")
             continue
         if follow_up.author.id != anchor_message.author.id:
+            ignored_count += 1
+            logging.info(f"direct_payload_candidate_ignored count={ignored_count} reason=other_user")
             continue
         line = (follow_up.content or "").strip()
-        if not line or line.startswith("/"):
+        if (not line) or line.startswith("/"):
+            ignored_count += 1
+            logging.info(f"direct_payload_candidate_ignored count={ignored_count} reason=empty_or_command")
             continue
         collected.append(line)
         follow_up_lines.append(line)
+        accepted_count += 1
+        logging.info(f"direct_payload_candidate_accepted count={accepted_count}")
 
     def _dedupe_payload_items(items):
         unique = []
@@ -5231,6 +5260,18 @@ async def _collect_direct_payload_lines(anchor_message: discord.Message, clean_c
         payload_items = _dedupe_payload_items(payload_items)
     logging.info(f"direct_payload_items_collected payload_count={len(payload_items)}")
     return "\n".join(collected), payload_items
+
+
+async def _apply_direct_response_pacing(payload_expected: bool, payload_count: int):
+    if payload_expected:
+        delay_seconds = random.uniform(0.5, 1.5) if payload_count > 0 else random.uniform(0.25, 0.75)
+        reason = "payload_processing"
+    else:
+        delay_seconds = random.uniform(0.5, 1.25)
+        reason = "direct_simple_request"
+    delay_seconds = max(0.2, min(delay_seconds, 1.5))
+    logging.info(f"direct_response_pacing_delay seconds={delay_seconds:.2f} reason={reason}")
+    await asyncio.sleep(delay_seconds)
 
 
 def _build_direct_payload_prompt(base_prompt: str, payload_items, request_text: str) -> str:
@@ -5389,6 +5430,8 @@ async def on_message(message: discord.Message):
             prompt = _build_direct_payload_prompt(prompt, direct_payload_items, direct_content)
             log_response_style(message.guild.id, message.author.id, style_key)
 
+            payload_expected, _ = _detect_request_payload_expectation(direct_content)
+            await _apply_direct_response_pacing(payload_expected, len(direct_payload_items))
             async with message.channel.typing():
                 logging.info(f"direct_payload_generation_started payload_count={len(direct_payload_items)}")
                 response = await get_gemini_response(prompt, message.author.id, message.guild.id)
@@ -5527,6 +5570,8 @@ async def on_message(message: discord.Message):
         prompt = _build_direct_payload_prompt(prompt, direct_payload_items, direct_content)
         log_response_style(message.guild.id, message.author.id, style_key)
 
+        payload_expected, _ = _detect_request_payload_expectation(direct_content)
+        await _apply_direct_response_pacing(payload_expected, len(direct_payload_items))
         async with message.channel.typing():
             logging.info(f"direct_payload_generation_started payload_count={len(direct_payload_items)}")
             response = await get_gemini_response(prompt, message.author.id, message.guild.id)
@@ -5629,6 +5674,8 @@ async def on_message(message: discord.Message):
         prompt = _build_direct_payload_prompt(prompt, direct_payload_items, direct_content)
         log_response_style(message.guild.id, message.author.id, style_key)
 
+        payload_expected, _ = _detect_request_payload_expectation(direct_content)
+        await _apply_direct_response_pacing(payload_expected, len(direct_payload_items))
         async with message.channel.typing():
             logging.info(f"direct_payload_generation_started payload_count={len(direct_payload_items)}")
             response = await get_gemini_response(prompt, message.author.id, message.guild.id)
