@@ -720,7 +720,7 @@ def _pick_varied_relay_fallback(avoid: str = "") -> str:
     return options[0] if options else "Network observation remains active."
 
 
-def _assess_relay_context_strength(messages: list[str], relay_context: str) -> tuple[bool, str]:
+def _assess_relay_context_strength(messages: list[str], relay_context: str, unique_users: int = 0, total_chars: int = 0) -> tuple[bool, str]:
     if not messages:
         return False, "no_recent_public_messages"
     informative = 0
@@ -728,6 +728,13 @@ def _assess_relay_context_strength(messages: list[str], relay_context: str) -> t
         lowered = (msg or "").lower()
         if len(lowered) >= 25 and ("?" in lowered or "#" in lowered or any(k in lowered for k in ("6 bit", "broadcast", "show", "track", "submit"))):
             informative += 1
+    ambient_comparable = (
+        len(messages) >= max(3, min(AMBIENT_MIN_SIGNAL_MESSAGES, 5))
+        and unique_users >= max(2, min(AMBIENT_MIN_SIGNAL_UNIQUE_USERS, 3))
+        and total_chars >= max(120, min(AMBIENT_MIN_SIGNAL_CHARS, 260))
+    )
+    if ambient_comparable:
+        return True, "ambient_comparable_public_signal"
     if informative >= 2 and relay_context.strip():
         return True, "public_context_sufficient"
     if informative >= 3:
@@ -855,33 +862,46 @@ async def generate_dynamic_website_relay(guild_id: int) -> tuple[str, str, str, 
     cursor = conn.cursor()
     cursor.execute(
         """
-        SELECT content
+        SELECT user_name, content, channel_policy
         FROM conversations
         WHERE guild_id = ? AND role = 'user'
-          AND channel_policy IN ('public_home', 'public_context')
+          AND channel_policy IN ('public_home', 'public_context', 'public_selective')
         ORDER BY id DESC
-        LIMIT 18
+        LIMIT 24
         """,
         (guild_id,),
     )
     rows = cursor.fetchall()
     conn.close()
 
-    messages = [r[0].strip() for r in rows if r and r[0] and r[0].strip()]
+    messages = [r[1].strip() for r in rows if r and len(r) > 1 and r[1] and r[1].strip()]
+    unique_users = len({(r[0] or "").strip().lower() for r in rows if r and r[0] and (r[0] or "").strip()})
+    total_chars = sum(len((r[1] or "").strip()) for r in rows if r and len(r) > 1 and r[1] and r[1].strip())
+    eligible_policies = sorted({(r[2] or "").strip() for r in rows if r and len(r) > 2 and (r[2] or "").strip()})
     now_pt = datetime.now(PACIFIC_TZ)
     mode = _website_relay_mode_from_context(messages, now_pt)
     signal_summary = get_recent_signal_summary(guild_id)
     relay_context = _build_relay_context(guild_id)
     source_channel_count = len(set(re.findall(r"(#[a-z0-9\-_]{2,})", relay_context.lower()))) if relay_context else 0
-    context_is_strong, context_reason = _assess_relay_context_strength(messages, relay_context)
+    context_is_strong, context_reason = _assess_relay_context_strength(messages, relay_context, unique_users=unique_users, total_chars=total_chars)
     logging.info(f"website_relay_context_sources guild={guild_id} source_channel_count={source_channel_count}")
     logging.info(f"website_relay_recent_message_count guild={guild_id} count={len(messages)}")
     logging.info(f"website_relay_eligible_channel_count guild={guild_id} count={source_channel_count}")
+    logging.info(
+        f"website_relay_ambient_comparable_signal guild={guild_id} messages={len(messages)} "
+        f"unique_users={unique_users} total_chars={total_chars}"
+    )
     logging.info(
         f"website_relay_context_strength_decision guild={guild_id} strong={context_is_strong} reason={context_reason}"
     )
     if not context_is_strong:
         logging.info(f"website_relay_context_rejected_reason guild={guild_id} reason={context_reason}")
+        logging.info(f"website_relay_blocker_applied guild={guild_id} blocker={context_reason}")
+    else:
+        logging.info(
+            f"website_relay_fresh_public_context_used guild={guild_id} reason={context_reason} "
+            f"messages={len(messages)} users={unique_users} policies={','.join(eligible_policies) or 'none'}"
+        )
     recent_topics = _recent_relay_topic_summary(guild_id)
     recent_lines = _recent_relay_messages.get(guild_id, [])[-5:]
     angle_seed = random.choice(RELAY_ANGLE_ROTATION)
@@ -969,10 +989,6 @@ async def generate_dynamic_website_relay(guild_id: int) -> tuple[str, str, str, 
     _remember_relay_message(guild_id, relay_message)
     _remember_relay_topic(guild_id, relay_message)
     if context_is_strong:
-        logging.info(
-            f"website_relay_fresh_public_context_used guild={guild_id} mode={mode} reason={context_reason} "
-            f"source_channel_count={source_channel_count}"
-        )
         logging.info(
             f"website_relay_fresh_context_detected mode={mode} reason={context_reason} elapsed_seconds=0 "
             f"source_channel_count={source_channel_count}"
