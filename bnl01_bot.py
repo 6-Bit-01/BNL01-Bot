@@ -5203,6 +5203,112 @@ def _direct_session_key(message: discord.Message):
 
 _direct_payload_sessions = {}
 
+_direct_followup_windows = {}
+DIRECT_FOLLOWUP_WINDOW_SECONDS = 45
+
+def _direct_followup_key(message: discord.Message):
+    return (message.guild.id if message.guild else 0, message.channel.id, message.author.id)
+
+def _has_direct_followup_window(message: discord.Message) -> bool:
+    key = _direct_followup_key(message)
+    expires_at = _direct_followup_windows.get(key)
+    if not expires_at:
+        return False
+    if datetime.now(timezone.utc) >= expires_at:
+        _direct_followup_windows.pop(key, None)
+        return False
+    return True
+
+def _mark_direct_followup_window(message: discord.Message):
+    key = _direct_followup_key(message)
+    _direct_followup_windows[key] = datetime.now(timezone.utc) + timedelta(seconds=DIRECT_FOLLOWUP_WINDOW_SECONDS)
+
+def _classify_direct_response_action(message: discord.Message, clean_content: str, direct_request: bool, has_active_session: bool):
+    if has_active_session and direct_request:
+        return "new_direct_request_cancel_previous_session"
+    if has_active_session and (not direct_request) and clean_content:
+        return "direct_payload_session_append"
+    if direct_request:
+        payload_expected, _ = _detect_request_payload_expectation(clean_content)
+        inline_payload_items = _collect_inline_direct_payload_items(clean_content)
+        if payload_expected and len(inline_payload_items) == 0:
+            return "direct_payload_session_create"
+        return "direct_answer_now"
+    if _has_direct_followup_window(message) and clean_content and (not clean_content.startswith('/')):
+        return "direct_followup_window_answer"
+    if clean_content and _is_single_payload_like_item(clean_content):
+        return "ignore_random_fragment"
+    return "ignore_random_fragment"
+
+async def _run_direct_generation(message: discord.Message, direct_content: str, direct_payload_items, channel_policy: str, is_sealed_test_channel: bool):
+    sealed_recall_guard = get_sealed_test_recall_guard_response(channel_policy, direct_content, message.guild.id, message.channel.id)
+    if sealed_recall_guard:
+        await message.reply(sealed_recall_guard)
+        return True
+    restricted_recall_guard = get_restricted_channel_recall_guard_response(channel_policy, direct_content, message.guild.id, message.channel.id)
+    if restricted_recall_guard:
+        await message.reply(restricted_recall_guard)
+        return True
+    repair = try_repair_response(direct_content)
+    if repair:
+        if not is_sealed_test_channel:
+            save_model_message(message.author.id, message.guild.id, repair, channel_name=getattr(message.channel, 'name', ''), channel_policy=channel_policy)
+        await message.reply(repair if len(repair) <= 2000 else repair[:1900] + '...')
+        _mark_direct_followup_window(message)
+        return True
+    self_reflection = try_self_reflection_response(message.author.id, message.guild.id, direct_content)
+    if self_reflection:
+        if not is_privileged_member(message.author, message.guild):
+            self_reflection = 'Status reports are restricted to server owner/mod operators.'
+        if not is_sealed_test_channel:
+            save_model_message(message.author.id, message.guild.id, self_reflection, channel_name=getattr(message.channel, 'name', ''), channel_policy=channel_policy)
+        await message.reply(self_reflection if len(self_reflection) <= 2000 else self_reflection[:1900] + '...')
+        _mark_direct_followup_window(message)
+        return True
+    memory_recall = try_memory_recall_response(message.author.id, message.guild.id, direct_content)
+    if memory_recall:
+        if not is_sealed_test_channel:
+            save_model_message(message.author.id, message.guild.id, memory_recall, channel_name=getattr(message.channel, 'name', ''), channel_policy=channel_policy)
+        await message.reply(memory_recall if len(memory_recall) <= 2000 else memory_recall[:1900] + '...')
+        _mark_direct_followup_window(message)
+        return True
+
+    prompt, allow_greeting, style_key = build_user_aware_prompt(message.author.id, message.guild.id, message.author.display_name, direct_content, message_count=1, privileged=is_privileged_member(message.author, message.guild))
+    prompt = _build_direct_payload_prompt(prompt, direct_payload_items, direct_content)
+    log_response_style(message.guild.id, message.author.id, style_key)
+    payload_expected, _ = _detect_request_payload_expectation(direct_content)
+    await _apply_direct_response_pacing(payload_expected, len(direct_payload_items))
+    async with message.channel.typing():
+        logging.info(f"direct_payload_generation_started payload_count={len(direct_payload_items)}")
+        response = await get_gemini_response(prompt, message.author.id, message.guild.id)
+    if response and direct_payload_items:
+        missing_items = _missing_request_payload_items(direct_payload_items, response)
+        if missing_items:
+            correction_prompt = prompt + "\n\nCORRECTION REQUIRED: Regenerate and include every required payload item explicitly by name.\nMissing required payload items: " + ", ".join(missing_items) + "."
+            async with message.channel.typing():
+                response = await get_gemini_response(correction_prompt, message.author.id, message.guild.id)
+            missing_items = _missing_request_payload_items(direct_payload_items, response or '')
+            if missing_items:
+                fallback_lines = _build_payload_fallback_lines(missing_items)
+                if fallback_lines:
+                    response = ((response or '').strip() + "\n\n" + fallback_lines).strip()
+    if not response:
+        await message.reply('[NETWORK ERROR] Temporary synchronization issue. Try again.')
+        return True
+    if not is_sealed_test_channel:
+        save_model_message(message.author.id, message.guild.id, response, channel_name=getattr(message.channel, 'name', ''), channel_policy=channel_policy)
+    if allow_greeting:
+        set_last_greeting_at(message.author.id, message.guild.id, datetime.now(PACIFIC_TZ).isoformat())
+    if len(response) <= 2000:
+        await message.reply(response)
+    else:
+        chunks = split_message(response)
+        await message.reply(chunks[0] + '...')
+        for chunk in chunks[1:]:
+            await message.channel.send('...' + chunk)
+    _mark_direct_followup_window(message)
+    return True
+
 
 async def _generate_direct_payload_session(session_key, reason: str):
     session = _direct_payload_sessions.get(session_key)
@@ -5392,23 +5498,23 @@ async def on_message(message: discord.Message):
 
     session_key = _direct_session_key(message)
     active_direct_session = _direct_payload_sessions.get(session_key)
-    if active_direct_session and not getattr(message.author, "bot", False):
-        if (not message.content.startswith("/")) and (not direct_request):
-            line = (message.content or "").strip()
-            if line:
-                active_direct_session["payload_lines"].append(line)
-                active_direct_session["last_payload_at"] = datetime.now(timezone.utc)
-                active_direct_session["revision"] = int(active_direct_session.get("revision", 0)) + 1
-                if active_direct_session.get("generating"):
-                    active_direct_session["generation_invalidated"] = True
-                    logging.info(f"direct_payload_session_generation_invalidated payload_count={len(active_direct_session['payload_lines'])} reason=new_payload_during_generation")
-                logging.info(f"direct_payload_session_payload_added payload_count={len(active_direct_session['payload_lines'])}")
-                logging.info(f"direct_payload_session_timer_reset payload_count={len(active_direct_session['payload_lines'])}")
-                return
-        if direct_request:
-            active_direct_session["completed"] = True
-            _direct_payload_sessions.pop(session_key, None)
-            logging.info(f"direct_payload_session_expired payload_count={len(active_direct_session.get('payload_lines', []))} reason=new_direct_request")
+    direct_action = _classify_direct_response_action(message, clean_content, direct_request, bool(active_direct_session))
+    if active_direct_session and direct_action == "direct_payload_session_append" and not getattr(message.author, "bot", False):
+        line = (message.content or "").strip()
+        if line:
+            active_direct_session["payload_lines"].append(line)
+            active_direct_session["last_payload_at"] = datetime.now(timezone.utc)
+            active_direct_session["revision"] = int(active_direct_session.get("revision", 0)) + 1
+            if active_direct_session.get("generating"):
+                active_direct_session["generation_invalidated"] = True
+                logging.info(f"direct_payload_session_generation_invalidated payload_count={len(active_direct_session['payload_lines'])} reason=new_payload_during_generation")
+            logging.info(f"direct_payload_session_payload_added payload_count={len(active_direct_session['payload_lines'])}")
+            logging.info(f"direct_payload_session_timer_reset payload_count={len(active_direct_session['payload_lines'])}")
+            return
+    if active_direct_session and direct_action == "new_direct_request_cancel_previous_session":
+        active_direct_session["completed"] = True
+        _direct_payload_sessions.pop(session_key, None)
+        logging.info(f"direct_payload_session_expired payload_count={len(active_direct_session.get('payload_lines', []))} reason=new_direct_request")
 
     if clean_content and (should_handle_as_active_channel or is_mention or is_reply):
         if not is_sealed_test_channel:
@@ -5449,28 +5555,12 @@ async def on_message(message: discord.Message):
         if not is_sealed_test_channel:
             save_user_message(message.author.id, message.author.display_name, message.guild.id, clean_content, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy)
 
-        # Mentions/replies -> immediate response (not batched)
-        if direct_request:
+        # Direct or follow-up responses -> orchestrated path
+        if direct_action in {"direct_answer_now", "direct_followup_window_answer", "direct_payload_session_create"}:
+            if not clean_content:
+                await message.reply("You pinged me. How may I assist with BARCODE operations?")
+                return
             direct_content, direct_payload_items = clean_content, _collect_inline_direct_payload_items(clean_content)
-            sealed_recall_guard = get_sealed_test_recall_guard_response(
-                channel_policy,
-                direct_content,
-                message.guild.id,
-                message.channel.id,
-            )
-            if sealed_recall_guard:
-                await message.reply(sealed_recall_guard)
-                return
-
-            restricted_recall_guard = get_restricted_channel_recall_guard_response(
-                channel_policy,
-                direct_content,
-                message.guild.id,
-                message.channel.id,
-            )
-            if restricted_recall_guard:
-                await message.reply(restricted_recall_guard)
-                return
             if _channel_generating[message.channel.id]:
                 _channel_preempted_generation_id[message.channel.id] = _channel_generation_id[message.channel.id]
                 _channel_message_interrupt_generation_id[message.channel.id] = _channel_generation_id[message.channel.id]
@@ -5484,112 +5574,25 @@ async def on_message(message: discord.Message):
                 if pending_task and not pending_task.done():
                     pending_task.cancel()
                 _log_batch_event(logging.INFO, "skip", message.guild.id, message.channel.id, pending_count, "direct_reply_preempts_batch")
-            repair = try_repair_response(direct_content)
-            if repair:
-                if not is_sealed_test_channel:
-                    save_model_message(message.author.id, message.guild.id, repair, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy)
-                await message.reply(repair)
-                return
 
-            self_reflection = try_self_reflection_response(message.author.id, message.guild.id, direct_content)
-            if self_reflection:
-                if not is_privileged_member(message.author, message.guild):
-                    self_reflection = "Status reports are restricted to server owner/mod operators."
-                if not is_sealed_test_channel:
-                    save_model_message(message.author.id, message.guild.id, self_reflection, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy)
-                await message.reply(self_reflection)
-                return
-
-            memory_recall = try_memory_recall_response(message.author.id, message.guild.id, direct_content)
-            if memory_recall:
-                if not is_sealed_test_channel:
-                    save_model_message(message.author.id, message.guild.id, memory_recall, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy)
-                await message.reply(memory_recall)
-                return
-
-            payload_expected, _ = _detect_request_payload_expectation(direct_content)
-            if payload_expected and len(direct_payload_items) == 0:
+            if direct_action == "direct_payload_session_create":
                 session = {
-                    "guild_id": message.guild.id,
-                    "guild": message.guild,
-                    "channel_id": message.channel.id,
-                    "requester_user_id": message.author.id,
-                    "requester_display_name": message.author.display_name,
-                    "requester_member": message.author,
-                    "channel_policy": channel_policy,
-                    "request_text": direct_content,
-                    "anchor_message_id": message.id,
-                    "anchor_message": message,
-                    "payload_lines": [],
-                    "created_at": datetime.now(timezone.utc),
-                    "last_payload_at": None,
+                    "guild_id": message.guild.id, "guild": message.guild, "channel_id": message.channel.id,
+                    "requester_user_id": message.author.id, "requester_display_name": message.author.display_name,
+                    "requester_member": message.author, "channel_policy": channel_policy, "request_text": direct_content,
+                    "anchor_message_id": message.id, "anchor_message": message, "payload_lines": [],
+                    "created_at": datetime.now(timezone.utc), "last_payload_at": None,
                     "hard_deadline": datetime.now(timezone.utc) + timedelta(seconds=DIRECT_PAYLOAD_HARD_CAP_SECONDS),
-                    "completed": False,
-                    "generating": False,
-                    "generation_invalidated": False,
-                    "revision": 0,
+                    "completed": False, "generating": False, "generation_invalidated": False, "revision": 0,
                 }
                 _direct_payload_sessions[session_key] = session
                 session["timer_task"] = asyncio.create_task(_direct_session_timer(session_key))
                 logging.info("direct_payload_session_created")
                 return
 
-            prompt, allow_greeting, style_key = build_user_aware_prompt(
-                message.author.id,
-                message.guild.id,
-                message.author.display_name,
-                direct_content,
-                message_count=1,
-                privileged=is_privileged_member(message.author, message.guild)
-            )
-            prompt = _build_direct_payload_prompt(prompt, direct_payload_items, direct_content)
-            log_response_style(message.guild.id, message.author.id, style_key)
-
-            payload_expected, _ = _detect_request_payload_expectation(direct_content)
-            await _apply_direct_response_pacing(payload_expected, len(direct_payload_items))
-            async with message.channel.typing():
-                logging.info(f"direct_payload_generation_started payload_count={len(direct_payload_items)}")
-                response = await get_gemini_response(prompt, message.author.id, message.guild.id)
-            if response and direct_payload_items:
-                missing_items = _missing_request_payload_items(direct_payload_items, response)
-                logging.info(f"direct_payload_completion_check missing_count={len(missing_items)}")
-                if missing_items:
-                    correction_prompt = (
-                        prompt
-                        + "\n\nCORRECTION REQUIRED: Regenerate and include every required payload item explicitly by name.\n"
-                        + "Missing required payload items: " + ", ".join(missing_items) + "."
-                    )
-                    async with message.channel.typing():
-                        response = await get_gemini_response(correction_prompt, message.author.id, message.guild.id)
-                    missing_items = _missing_request_payload_items(direct_payload_items, response or "")
-                    logging.info(f"direct_payload_completion_regenerated missing_count={len(missing_items)}")
-                    if missing_items:
-                        response = (response or "").strip()
-                        fallback_lines = _build_payload_fallback_lines(missing_items)
-                        if fallback_lines:
-                            response = (response + "\n\n" + fallback_lines).strip() if response else fallback_lines
-                            logging.info(f"direct_payload_completion_fallback_appended missing_count={len(missing_items)}")
-            logging.info(f"direct_payload_generation_complete payload_count={len(direct_payload_items)}")
-
-            if not response:
-                await message.reply("[NETWORK ERROR] Temporary synchronization issue. Try again.")
+            handled = await _run_direct_generation(message, direct_content, direct_payload_items, channel_policy, is_sealed_test_channel)
+            if handled:
                 return
-
-            if not is_sealed_test_channel:
-                save_model_message(message.author.id, message.guild.id, response, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy)
-
-            if allow_greeting:
-                set_last_greeting_at(message.author.id, message.guild.id, datetime.now(PACIFIC_TZ).isoformat())
-
-            if len(response) <= 2000:
-                await message.reply(response)
-            else:
-                chunks = split_message(response)
-                await message.reply(chunks[0] + "...")
-                for chunk in chunks[1:]:
-                    await message.channel.send("..." + chunk)
-            return
-
         # Non-mention in active channel -> batch (kill-switched by env)
         if not BNL_ACTIVE_BATCHING_ENABLED:
             return
@@ -5624,7 +5627,7 @@ async def on_message(message: discord.Message):
 
     # ---------------- OTHER CHANNELS (PING-ONLY IF ACTIVE CHANNEL SET) ----------------
     if active_channel_id is not None and not should_handle_as_active_channel:
-        if not direct_request:
+        if direct_action not in {"direct_answer_now", "direct_followup_window_answer", "direct_payload_session_create"}:
             return
 
         if not clean_content:
@@ -5730,7 +5733,7 @@ async def on_message(message: discord.Message):
         return
 
     # ---------------- NO ACTIVE CHANNEL SET (RESPOND TO MENTIONS/REPLIES ANYWHERE) ----------------
-    if active_channel_id is None and direct_request:
+    if active_channel_id is None and direct_action in {"direct_answer_now", "direct_followup_window_answer", "direct_payload_session_create"}:
         if not clean_content:
             await message.reply("You pinged me. How may I assist with BARCODE operations?")
             return
