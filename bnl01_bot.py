@@ -3680,6 +3680,10 @@ _channel_pending_request_anchor = {}
 _channel_recent_typing_at = {}
 _channel_recent_typing_user_id = {}
 _channel_generation_typing_pause_used = defaultdict(bool)
+_direct_payload_sessions = {}
+
+DIRECT_PAYLOAD_QUIET_SECONDS = 1.25
+DIRECT_PAYLOAD_HARD_CAP_SECONDS = 6.0
 
 TYPING_RECENT_WINDOW_SECONDS = 5
 TYPING_SEND_GRACE_SECONDS = 1.5
@@ -5175,69 +5179,6 @@ async def _collect_direct_payload_lines(anchor_message: discord.Message, clean_c
     if (not is_direct_request) or (not payload_expected):
         return clean_content, []
 
-    collected = [clean_content]
-    follow_up_lines = []
-    history_items = []
-    seen_count = 0
-    accepted_count = 0
-    ignored_count = 0
-    logging.info("direct_payload_wait_started")
-
-    window_seconds = 4.0
-    anchor_created_at = anchor_message.created_at
-    if anchor_created_at.tzinfo is None:
-        anchor_created_at = anchor_created_at.replace(tzinfo=timezone.utc)
-    cutoff = anchor_created_at + timedelta(seconds=window_seconds)
-
-    remaining = (cutoff - datetime.now(timezone.utc)).total_seconds()
-    if remaining > 0:
-        await asyncio.sleep(remaining)
-
-    logging.info("direct_payload_history_scan_started")
-    try:
-        async for follow_up in anchor_message.channel.history(limit=50, after=anchor_message, oldest_first=True):
-            created_at = follow_up.created_at
-            if created_at.tzinfo is None:
-                created_at = created_at.replace(tzinfo=timezone.utc)
-            if created_at > cutoff:
-                break
-            history_items.append(follow_up)
-    except (discord.Forbidden, discord.HTTPException, discord.NotFound) as exc:
-        logging.info(f"direct_payload_history_scan_failed error_type={type(exc).__name__}")
-        history_items = []
-
-    logging.info(f"direct_payload_history_scan_complete history_count={len(history_items)}")
-
-    for follow_up in history_items:
-        seen_count += 1
-        if follow_up.author == client.user:
-            ignored_count += 1
-            continue
-        if getattr(follow_up.author, "bot", False):
-            ignored_count += 1
-            continue
-        if follow_up.guild is None or anchor_message.guild is None:
-            ignored_count += 1
-            continue
-        if follow_up.guild.id != anchor_message.guild.id:
-            ignored_count += 1
-            continue
-        if follow_up.channel.id != anchor_message.channel.id:
-            ignored_count += 1
-            continue
-        if follow_up.author.id != anchor_message.author.id:
-            ignored_count += 1
-            continue
-        line = (follow_up.content or "").strip()
-        if (not line) or line.startswith("/"):
-            ignored_count += 1
-            continue
-        follow_up_lines.append(line)
-        accepted_count += 1
-
-    if follow_up_lines:
-        collected.extend(follow_up_lines)
-
     def _dedupe_payload_items(items):
         unique = []
         seen = set()
@@ -5249,29 +5190,21 @@ async def _collect_direct_payload_lines(anchor_message: discord.Message, clean_c
             unique.append(raw_item.strip())
         return unique
 
-    payload_source = "inline"
-    if follow_up_lines:
-        payload_items = _dedupe_payload_items(follow_up_lines)
-        payload_source = "history"
-    else:
-        payload_items = []
-        multiline = _extract_multiline_request_payload(clean_content)
-        if multiline:
-            payload_items.extend(multiline.get("payload_items", []))
-        if not payload_items:
-            inline_match = re.search(r"\b(?:about|for)\s+(.+)$", clean_content, re.IGNORECASE)
-            if inline_match:
-                candidate_text = inline_match.group(1).strip().rstrip(".!?")
-                candidate_text = re.sub(r"^\b(?:these|the|those)\s+(?:people|names|items)\b\s*", "", candidate_text, flags=re.IGNORECASE).strip()
-                candidate_text = re.sub(r"\b(?:please|thanks?)\b$", "", candidate_text, flags=re.IGNORECASE).strip(" ,")
-                if candidate_text:
-                    parts = [p.strip(" .,!?:;") for p in re.split(r",|\band\b", candidate_text, flags=re.IGNORECASE)]
-                    payload_items.extend([p for p in parts if _is_single_payload_like_item(p)])
-        payload_items = _dedupe_payload_items(payload_items)
-
-    logging.info(f"direct_payload_filter_counts seen_count={seen_count} accepted_count={accepted_count} ignored_count={ignored_count}")
-    logging.info(f"direct_payload_items_collected payload_count={len(payload_items)} source={payload_source}")
-    return "\n".join(collected), payload_items
+    payload_items = []
+    multiline = _extract_multiline_request_payload(clean_content)
+    if multiline:
+        payload_items.extend(multiline.get("payload_items", []))
+    if not payload_items:
+        inline_match = re.search(r"\b(?:about|for)\s+(.+)$", clean_content, re.IGNORECASE)
+        if inline_match:
+            candidate_text = inline_match.group(1).strip().rstrip(".!?")
+            candidate_text = re.sub(r"^\b(?:these|the|those)\s+(?:people|names|items)\b\s*", "", candidate_text, flags=re.IGNORECASE).strip()
+            candidate_text = re.sub(r"\b(?:please|thanks?)\b$", "", candidate_text, flags=re.IGNORECASE).strip(" ,")
+            if candidate_text:
+                parts = [p.strip(" .,!?:;") for p in re.split(r",|\band\b", candidate_text, flags=re.IGNORECASE)]
+                payload_items.extend([p for p in parts if _is_single_payload_like_item(p)])
+    payload_items = _dedupe_payload_items(payload_items)
+    return clean_content, payload_items
 
 
 async def _apply_direct_response_pacing(payload_expected: bool, payload_count: int):
@@ -5298,6 +5231,16 @@ def _build_direct_payload_prompt(base_prompt: str, payload_items, request_text: 
     if _is_simple_humor_or_list_request(request_text, len(payload_items)):
         lines.append("For simple joke/list requests, prefer per-item format like `Name: <answer>`.")
     return base_prompt + "\n" + "\n".join(lines)
+
+
+async def _expire_direct_payload_session(session_key, reason: str):
+    session = _direct_payload_sessions.pop(session_key, None)
+    if not session:
+        return
+    task = session.get("task")
+    if task and not task.done() and task is not asyncio.current_task():
+        task.cancel()
+    logging.info(f"direct_payload_session_expired payload_count={len(session.get('payload_lines', []))} reason={reason}")
 
 @client.event
 async def on_message(message: discord.Message):
