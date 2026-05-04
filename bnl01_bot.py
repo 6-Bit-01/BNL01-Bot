@@ -4463,6 +4463,8 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                 if payload_count > 0:
                     decision, reason = "answer", "payload_items_present"
                     _log_batch_event(logging.INFO, "payload_items_force_answer", guild_id, channel_id, len(collapsed_items), f"message_count={len(collapsed_items)};payload_count={payload_count}")
+                if decision == "answer":
+                    continue
                 ack = _build_acknowledgement_response(collapsed_items)
                 if not ack:
                     if _hard_interrupt_active_for_generation(channel_id, local_generation_id):
@@ -4477,14 +4479,9 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                     if (pending_state or pending_anchor) and _is_payload_like_cluster(collapsed_items):
                         decision, reason = "answer", "pending_request_payload_continuation"
                         _log_batch_event(logging.INFO, "payload_continuation_not_suppressed", guild_id, channel_id, len(collapsed_items), "override_ack_suppression_to_answer")
-                    elif payload_count > 0:
-                        decision, reason = "answer", "payload_items_present"
-                        _log_batch_event(logging.INFO, "payload_items_force_answer", guild_id, channel_id, len(collapsed_items), f"message_count={len(collapsed_items)};payload_count={payload_count}")
-                    else:
-                        _log_batch_event(logging.INFO, "generic_ack_suppressed", guild_id, channel_id, len(collapsed_items), f"reason={reason}")
-                        return
-                if decision == "answer":
-                    continue
+                        continue
+                    _log_batch_event(logging.INFO, "generic_ack_suppressed", guild_id, channel_id, len(collapsed_items), f"reason={reason}")
+                    return
                 await channel.send(ack, allowed_mentions=safe_mentions)
                 _log_batch_event(logging.INFO, "batch_response_acknowledge", guild_id, channel_id, len(collapsed_items), f"reason={reason}")
                 _channel_last_reply_at[channel_id] = datetime.now(PACIFIC_TZ)
