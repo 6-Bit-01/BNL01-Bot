@@ -5170,12 +5170,13 @@ async def on_typing(channel, user, when):
     _log_batch_event(logging.DEBUG, "typing_signal_observed", channel.guild.id, channel.id, len(_channel_buffers[channel.id]), "reason=active_generation")
 
 
-async def _collect_direct_payload_lines(anchor_message: discord.Message, clean_content: str, is_direct_request: bool) -> str:
+async def _collect_direct_payload_lines(anchor_message: discord.Message, clean_content: str, is_direct_request: bool):
     payload_expected, _ = _detect_request_payload_expectation(clean_content)
     if (not is_direct_request) or (not payload_expected):
-        return clean_content
+        return clean_content, []
 
     collected = [clean_content]
+    logging.info("direct_payload_wait_started")
     deadline = datetime.now(PACIFIC_TZ) + timedelta(seconds=4)
     while datetime.now(PACIFIC_TZ) < deadline:
         timeout = (deadline - datetime.now(PACIFIC_TZ)).total_seconds()
@@ -5197,7 +5198,23 @@ async def _collect_direct_payload_lines(anchor_message: discord.Message, clean_c
         if not line or line.startswith("/"):
             continue
         collected.append(line)
-    return "\n".join(collected)
+    payload_items = _collect_request_payload_items([("user", line) for line in collected])
+    logging.info(f"direct_payload_items_collected payload_count={len(payload_items)}")
+    return "\n".join(collected), payload_items
+
+
+def _build_direct_payload_prompt(base_prompt: str, payload_items) -> str:
+    if not payload_items:
+        return base_prompt
+    lines = ["", "DIRECT REQUEST PAYLOAD ITEMS:"]
+    for idx, item in enumerate(payload_items, start=1):
+        lines.append(f"{idx}. {item}")
+    lines.append("")
+    lines.append("Instruction:")
+    lines.append("Respond to every required payload item by name. Do not omit any item.")
+    if _is_simple_humor_or_list_request(" ".join(payload_items), len(payload_items)):
+        lines.append("For simple joke/list requests, prefer per-item format like `Name: <answer>`.")
+    return base_prompt + "\n" + "\n".join(lines)
 
 @client.event
 async def on_message(message: discord.Message):
@@ -5275,7 +5292,7 @@ async def on_message(message: discord.Message):
 
         # Mentions/replies -> immediate response (not batched)
         if direct_request:
-            direct_content = await _collect_direct_payload_lines(message, clean_content, direct_request)
+            direct_content, direct_payload_items = await _collect_direct_payload_lines(message, clean_content, direct_request)
             sealed_recall_guard = get_sealed_test_recall_guard_response(
                 channel_policy,
                 direct_content,
@@ -5339,10 +5356,32 @@ async def on_message(message: discord.Message):
                 message_count=1,
                 privileged=is_privileged_member(message.author, message.guild)
             )
+            prompt = _build_direct_payload_prompt(prompt, direct_payload_items)
             log_response_style(message.guild.id, message.author.id, style_key)
 
             async with message.channel.typing():
+                logging.info(f"direct_payload_generation_started payload_count={len(direct_payload_items)}")
                 response = await get_gemini_response(prompt, message.author.id, message.guild.id)
+            if response and direct_payload_items:
+                missing_items = _missing_request_payload_items(direct_payload_items, response)
+                logging.info(f"direct_payload_completion_check missing_count={len(missing_items)}")
+                if missing_items:
+                    correction_prompt = (
+                        prompt
+                        + "\n\nCORRECTION REQUIRED: Regenerate and include every required payload item explicitly by name.\n"
+                        + "Missing required payload items: " + ", ".join(missing_items) + "."
+                    )
+                    async with message.channel.typing():
+                        response = await get_gemini_response(correction_prompt, message.author.id, message.guild.id)
+                    missing_items = _missing_request_payload_items(direct_payload_items, response or "")
+                    logging.info(f"direct_payload_completion_regenerated missing_count={len(missing_items)}")
+                    if missing_items:
+                        response = (response or "").strip()
+                        fallback_lines = _build_payload_fallback_lines(missing_items)
+                        if fallback_lines:
+                            response = (response + "\n\n" + fallback_lines).strip() if response else fallback_lines
+                            logging.info(f"direct_payload_completion_fallback_appended missing_count={len(missing_items)}")
+            logging.info(f"direct_payload_generation_complete payload_count={len(direct_payload_items)}")
 
             if not response:
                 await message.reply("[NETWORK ERROR] Temporary synchronization issue. Try again.")
@@ -5403,7 +5442,7 @@ async def on_message(message: discord.Message):
         if not clean_content:
             await message.reply("I monitor this channel passively. My active operations are in the designated liaison channel.")
             return
-        direct_content = await _collect_direct_payload_lines(message, clean_content, direct_request)
+        direct_content, direct_payload_items = await _collect_direct_payload_lines(message, clean_content, direct_request)
         sealed_recall_guard = get_sealed_test_recall_guard_response(
             channel_policy,
             direct_content,
@@ -5455,10 +5494,32 @@ async def on_message(message: discord.Message):
             message_count=1,
             privileged=is_privileged_member(message.author, message.guild)
         )
+        prompt = _build_direct_payload_prompt(prompt, direct_payload_items)
         log_response_style(message.guild.id, message.author.id, style_key)
 
         async with message.channel.typing():
+            logging.info(f"direct_payload_generation_started payload_count={len(direct_payload_items)}")
             response = await get_gemini_response(prompt, message.author.id, message.guild.id)
+        if response and direct_payload_items:
+            missing_items = _missing_request_payload_items(direct_payload_items, response)
+            logging.info(f"direct_payload_completion_check missing_count={len(missing_items)}")
+            if missing_items:
+                correction_prompt = (
+                    prompt
+                    + "\n\nCORRECTION REQUIRED: Regenerate and include every required payload item explicitly by name.\n"
+                    + "Missing required payload items: " + ", ".join(missing_items) + "."
+                )
+                async with message.channel.typing():
+                    response = await get_gemini_response(correction_prompt, message.author.id, message.guild.id)
+                missing_items = _missing_request_payload_items(direct_payload_items, response or "")
+                logging.info(f"direct_payload_completion_regenerated missing_count={len(missing_items)}")
+                if missing_items:
+                    response = (response or "").strip()
+                    fallback_lines = _build_payload_fallback_lines(missing_items)
+                    if fallback_lines:
+                        response = (response + "\n\n" + fallback_lines).strip() if response else fallback_lines
+                        logging.info(f"direct_payload_completion_fallback_appended missing_count={len(missing_items)}")
+        logging.info(f"direct_payload_generation_complete payload_count={len(direct_payload_items)}")
 
         if not response:
             await message.reply("[NETWORK ERROR] Temporary synchronization issue. Try again.")
@@ -5483,7 +5544,7 @@ async def on_message(message: discord.Message):
         if not clean_content:
             await message.reply("You pinged me. How may I assist with BARCODE operations?")
             return
-        direct_content = await _collect_direct_payload_lines(message, clean_content, direct_request)
+        direct_content, direct_payload_items = await _collect_direct_payload_lines(message, clean_content, direct_request)
         sealed_recall_guard = get_sealed_test_recall_guard_response(
             channel_policy,
             direct_content,
@@ -5535,10 +5596,32 @@ async def on_message(message: discord.Message):
             message_count=1,
             privileged=is_privileged_member(message.author, message.guild)
         )
+        prompt = _build_direct_payload_prompt(prompt, direct_payload_items)
         log_response_style(message.guild.id, message.author.id, style_key)
 
         async with message.channel.typing():
+            logging.info(f"direct_payload_generation_started payload_count={len(direct_payload_items)}")
             response = await get_gemini_response(prompt, message.author.id, message.guild.id)
+        if response and direct_payload_items:
+            missing_items = _missing_request_payload_items(direct_payload_items, response)
+            logging.info(f"direct_payload_completion_check missing_count={len(missing_items)}")
+            if missing_items:
+                correction_prompt = (
+                    prompt
+                    + "\n\nCORRECTION REQUIRED: Regenerate and include every required payload item explicitly by name.\n"
+                    + "Missing required payload items: " + ", ".join(missing_items) + "."
+                )
+                async with message.channel.typing():
+                    response = await get_gemini_response(correction_prompt, message.author.id, message.guild.id)
+                missing_items = _missing_request_payload_items(direct_payload_items, response or "")
+                logging.info(f"direct_payload_completion_regenerated missing_count={len(missing_items)}")
+                if missing_items:
+                    response = (response or "").strip()
+                    fallback_lines = _build_payload_fallback_lines(missing_items)
+                    if fallback_lines:
+                        response = (response + "\n\n" + fallback_lines).strip() if response else fallback_lines
+                        logging.info(f"direct_payload_completion_fallback_appended missing_count={len(missing_items)}")
+        logging.info(f"direct_payload_generation_complete payload_count={len(direct_payload_items)}")
 
         if not response:
             await message.reply("[NETWORK ERROR] Temporary synchronization issue. Try again.")
