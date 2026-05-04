@@ -4073,12 +4073,11 @@ def _response_mentions_payload_item(response: str, item: str):
     meaningful_tokens = [tok for tok in item_tokens if tok not in weak_tokens]
     if meaningful_tokens:
         item_tokens = meaningful_tokens
-    token_hits = 0
-    for tok in item_tokens:
-        if re.search(r"\b" + re.escape(tok) + r"\b", response_norm):
-            token_hits += 1
-    required = len(item_tokens) if len(item_tokens) >= 2 else 1
-    return token_hits >= required
+    if len(item_tokens) >= 2:
+        joined_pattern = r"\b" + r"[\s\-_.,:;!?/\\()]+".join(re.escape(tok) for tok in item_tokens) + r"\b"
+        if re.search(joined_pattern, response_norm):
+            return True
+    return all(re.search(r"\b" + re.escape(tok) + r"\b", response_norm) for tok in item_tokens)
 
 
 def _missing_request_payload_items(payload_items, response: str):
@@ -5209,12 +5208,19 @@ async def _generate_direct_payload_session(session_key, reason: str):
     session = _direct_payload_sessions.get(session_key)
     if not session:
         return
-    if session.get("completed"):
+    if session.get("completed") or session.get("generating"):
         return
-    session["completed"] = True
+    session["generating"] = True
+    generation_revision = int(session.get("revision", 0))
     payload_lines = list(session.get("payload_lines", []))
     anchor_message = session.get("anchor_message")
     payload_count = len(payload_lines)
+    logging.info(f"direct_payload_session_generation_snapshot payload_count={payload_count} revision={generation_revision}")
+
+    if generation_revision != int(session.get("revision", 0)):
+        session["generating"] = False
+        logging.info(f"direct_payload_session_generation_deferred payload_count={len(session.get('payload_lines', []))} reason=revision_changed")
+        return
 
     if payload_count == 0:
         logging.info("direct_payload_session_expired payload_count=0 reason=no_payload")
@@ -5222,6 +5228,7 @@ async def _generate_direct_payload_session(session_key, reason: str):
             await anchor_message.reply("I can do that—send the list/items and I’ll run it.")
         except Exception:
             pass
+        session["generating"] = False
         _direct_payload_sessions.pop(session_key, None)
         return
 
@@ -5246,16 +5253,22 @@ async def _generate_direct_payload_session(session_key, reason: str):
     prompt = _build_direct_payload_prompt(prompt, direct_payload_items, direct_content)
     log_response_style(session["guild_id"], session["requester_user_id"], style_key)
     await _apply_direct_response_pacing(True, len(direct_payload_items))
+    if generation_revision != int(session.get("revision", 0)):
+        session["generating"] = False
+        logging.info(f"direct_payload_session_generation_deferred payload_count={len(session.get('payload_lines', []))} reason=revision_changed")
+        return
     async with anchor_message.channel.typing():
         response = await get_gemini_response(prompt, session["requester_user_id"], session["guild_id"])
     if response and direct_payload_items:
         missing_items = _missing_request_payload_items(direct_payload_items, response)
+        logging.info(f"direct_payload_completion_missing_strict missing_count={len(missing_items)}")
         logging.info(f"direct_payload_completion_check missing_count={len(missing_items)}")
         if missing_items:
             correction_prompt = prompt + "\n\nCORRECTION REQUIRED: Regenerate and include every required payload item explicitly by name.\nMissing required payload items: " + ", ".join(missing_items) + "."
             async with anchor_message.channel.typing():
                 response = await get_gemini_response(correction_prompt, session["requester_user_id"], session["guild_id"])
             missing_items = _missing_request_payload_items(direct_payload_items, response or "")
+            logging.info(f"direct_payload_completion_missing_strict missing_count={len(missing_items)}")
             logging.info(f"direct_payload_completion_regenerated missing_count={len(missing_items)}")
             if missing_items:
                 fallback_lines = _build_payload_fallback_lines(missing_items)
@@ -5275,7 +5288,9 @@ async def _generate_direct_payload_session(session_key, reason: str):
     if allow_greeting:
         set_last_greeting_at(session["requester_user_id"], session["guild_id"], datetime.now(PACIFIC_TZ).isoformat())
     save_model_message(session["requester_user_id"], session["guild_id"], response, channel_name=getattr(anchor_message.channel, "name", ""), channel_policy=session["channel_policy"])
-    logging.info(f"direct_payload_session_completed payload_count={payload_count}")
+    session["completed"] = True
+    session["generating"] = False
+    logging.info(f"direct_payload_session_completed payload_count={payload_count} revision={generation_revision}")
     _direct_payload_sessions.pop(session_key, None)
 
 
@@ -5287,11 +5302,13 @@ async def _direct_session_timer(session_key):
         now = datetime.now(timezone.utc)
         if now >= session["hard_deadline"]:
             await _generate_direct_payload_session(session_key, "hard_cap")
-            return
+            await asyncio.sleep(0.2)
+            continue
         quiet_elapsed = (now - session["last_payload_at"]).total_seconds() if session.get("last_payload_at") else 0
-        if session.get("payload_lines") and quiet_elapsed >= DIRECT_PAYLOAD_QUIET_SECONDS:
+        if session.get("payload_lines") and quiet_elapsed >= DIRECT_PAYLOAD_QUIET_SECONDS and not session.get("generating"):
             await _generate_direct_payload_session(session_key, "quiet_timeout")
-            return
+            await asyncio.sleep(0.2)
+            continue
         await asyncio.sleep(0.2)
 
 
@@ -5363,6 +5380,9 @@ async def on_message(message: discord.Message):
             if line:
                 active_direct_session["payload_lines"].append(line)
                 active_direct_session["last_payload_at"] = datetime.now(timezone.utc)
+                active_direct_session["revision"] = int(active_direct_session.get("revision", 0)) + 1
+                if active_direct_session.get("generating"):
+                    logging.info(f"direct_payload_session_generation_deferred payload_count={len(active_direct_session['payload_lines'])} reason=new_payload_during_generation")
                 logging.info(f"direct_payload_session_payload_added payload_count={len(active_direct_session['payload_lines'])}")
                 logging.info(f"direct_payload_session_timer_reset payload_count={len(active_direct_session['payload_lines'])}")
                 return
@@ -5486,6 +5506,8 @@ async def on_message(message: discord.Message):
                     "last_payload_at": None,
                     "hard_deadline": datetime.now(timezone.utc) + timedelta(seconds=DIRECT_PAYLOAD_HARD_CAP_SECONDS),
                     "completed": False,
+                    "generating": False,
+                    "revision": 0,
                 }
                 _direct_payload_sessions[session_key] = session
                 session["timer_task"] = asyncio.create_task(_direct_session_timer(session_key))
