@@ -4129,6 +4129,35 @@ def _build_acknowledgement_response(items):
     return "Received."
 
 
+def _has_structured_intent(items, payload_items, pending_state=False, pending_anchor=None):
+    texts = [(content or "").strip() for (_n, content, _u) in (items or []) if (content or "").strip()]
+    if not texts:
+        return False
+    combined = " ".join(texts)
+    lowered = combined.lower()
+    if payload_items:
+        return True
+    if pending_state or pending_anchor:
+        return True
+    if "?" in combined:
+        return True
+    if re.search(r"\b(bnl|bnl-01|barcode bot|barcode|bot|website|radio|6 bit|mac modem|dj floppydisc|cache back|sponsors)\b", lowered):
+        return True
+    if re.search(r"\b(respond to|answer|tell me|what is|who is|why|how|can you|should i|do you|help|compare|rank|explain|describe|summarize|rewrite|joke|roast)\b", lowered):
+        return True
+    return False
+
+
+def _detect_request_action(text: str):
+    t=(text or "").lower()
+    mapping=[("respond_to_user",r"\brespond to\b"),("joke",r"\b(joke|funny)\b"),("roast",r"\broast\b"),("compare",r"\bcompare\b"),("rank",r"\brank\b"),("explain",r"\bexplain\b"),("describe",r"\bdescribe\b"),("summarize",r"\bsummarize\b"),("rewrite",r"\brewrite\b"),("answer_question",r"\?"),("opinion",r"\b(opinion|think about)\b"),("clarify",r"\bclarify\b")]
+    for k,p in mapping:
+        if re.search(p,t):
+            return k
+    if re.search(r"\b(tell me|can you|could you|please)\b",t):
+        return "generic_request"
+    return "generic_request"
+
 def _build_active_response_packet(channel_id: int, items, pending_state, pending_anchor=None, bot_user=None):
     original_items = list(items or [])
     payload_items = _collect_batch_request_payload_items(original_items, pending_state=bool(pending_state), pending_anchor=pending_anchor)
@@ -4162,6 +4191,12 @@ def _build_active_response_packet(channel_id: int, items, pending_state, pending
     should_skip = decision in ("skip", "observe")
     should_acknowledge = decision == "acknowledge" and bool(ack_text)
     should_generate = decision == "answer"
+    combined_text = " ".join([(content or "") for (_n, content, _u) in original_items]).strip()
+    request_action = _detect_request_action(combined_text)
+    request_anchor_detected = bool(re.search(r"\b(these people|these things|this list|tell me|compare|rank|explain|describe|summarize|rewrite|respond to|answer)\b", combined_text.lower()))
+    addressed_to_bot = bool(re.search(r"\b(bnl|bnl-01|barcode bot)\b", combined_text.lower()))
+    is_direct_question = "?" in combined_text
+    has_structured_intent = _has_structured_intent(original_items, payload_items, pending_state=pending_request, pending_anchor=pending_anchor)
     return {
         "items": original_items,
         "collapsed_items": collapsed_items,
@@ -4173,6 +4208,12 @@ def _build_active_response_packet(channel_id: int, items, pending_state, pending
         "has_request_payload": has_request_payload,
         "pending_request_intent": pending_request,
         "is_single_payload_continuation": is_single_payload_continuation,
+        "request_action": request_action,
+        "request_style": "list" if has_request_payload else "chat",
+        "request_anchor_detected": request_anchor_detected,
+        "has_structured_intent": has_structured_intent,
+        "addressed_to_bot": addressed_to_bot,
+        "is_direct_question": is_direct_question,
         "should_generate": should_generate,
         "should_skip": should_skip,
         "should_acknowledge": should_acknowledge,
@@ -4388,7 +4429,11 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
         _log_batch_event(logging.INFO, "active_packet_payload_items", guild_id, channel_id, active_packet["collapsed_count"], f"payload_count={payload_count}")
         if payload_count > 0 and decision != "answer":
             _log_batch_event(logging.INFO, "payload_items_force_answer", guild_id, channel_id, len(collapsed_items), f"message_count={len(collapsed_items)};payload_count={payload_count}")
+            _log_batch_event(logging.INFO, "payload_force_answer_preserved_request_action", guild_id, channel_id, len(collapsed_items), f"payload_count={payload_count};request_action={active_packet.get('request_action','generic_request')}")
             decision, reason = "answer", "payload_items_present"
+        if active_packet.get("has_structured_intent") and decision == "acknowledge":
+            decision, reason = "answer", "structured_intent_present"
+            _log_batch_event(logging.INFO, "structured_intent_not_suppressed", guild_id, channel_id, len(collapsed_items), f"payload_count={payload_count};request_action={active_packet.get('request_action','generic_request')};has_structured_intent=1;addressed_to_bot={1 if active_packet.get('addressed_to_bot') else 0}")
         _log_batch_event(logging.INFO, "active_packet_decision", guild_id, channel_id, active_packet["collapsed_count"], f"decision={decision};reason={reason}")
         answer_intent_locked = decision == "answer"
         if (pending_state or pending_anchor) and reason in ("pending_request_payload_continuation", "pending_request_single_payload_continuation"):
@@ -4463,7 +4508,11 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
             _log_batch_event(logging.INFO, "active_packet_payload_items", guild_id, channel_id, active_packet["collapsed_count"], f"payload_count={payload_count}")
             if payload_count > 0 and decision != "answer":
                 _log_batch_event(logging.INFO, "payload_items_force_answer", guild_id, channel_id, len(collapsed_items), f"message_count={len(collapsed_items)};payload_count={payload_count}")
+                _log_batch_event(logging.INFO, "payload_force_answer_preserved_request_action", guild_id, channel_id, len(collapsed_items), f"payload_count={payload_count};request_action={active_packet.get('request_action','generic_request')}")
                 decision, reason = "answer", "payload_items_present"
+            if active_packet.get("has_structured_intent") and decision == "acknowledge":
+                decision, reason = "answer", "structured_intent_present"
+                _log_batch_event(logging.INFO, "structured_intent_not_suppressed", guild_id, channel_id, len(collapsed_items), f"payload_count={payload_count};request_action={active_packet.get('request_action','generic_request')};has_structured_intent=1;addressed_to_bot={1 if active_packet.get('addressed_to_bot') else 0}")
             _log_batch_event(logging.INFO, "active_packet_decision", guild_id, channel_id, active_packet["collapsed_count"], f"decision={decision};reason={reason}")
             if answer_intent_locked and decision != "answer":
                 _log_batch_event(logging.INFO, "request_intent_preserved", guild_id, channel_id, len(collapsed_items), f"reason={reason}")
