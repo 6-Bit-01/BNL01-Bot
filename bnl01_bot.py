@@ -5256,6 +5256,7 @@ async def _generate_direct_payload_session(session_key, reason: str):
     anchor_message = session.get("anchor_message")
     payload_count = len(payload_lines)
     last_committed_payload_count = int(session.get("last_committed_payload_count", 0))
+    has_uncommitted_payload = payload_count > last_committed_payload_count
     logging.info(f"direct_payload_session_generation_snapshot payload_count={payload_count} revision={generation_revision}")
 
     def _abort_if_invalidated(abort_reason: str):
@@ -5281,6 +5282,15 @@ async def _generate_direct_payload_session(session_key, reason: str):
             pass
         session["generating"] = False
         _direct_payload_sessions.pop(session_key, None)
+        return
+
+    if not has_uncommitted_payload and last_committed_payload_count > 0:
+        session["generating"] = False
+        logging.info(
+            f"direct_session_generation_skipped_no_uncommitted_payload payload_count={payload_count} "
+            f"last_committed_payload_count={last_committed_payload_count} revision={generation_revision} "
+            "reason=committed_snapshot_idle"
+        )
         return
 
     logging.info(f"direct_payload_session_generation_started payload_count={payload_count} reason={reason}")
@@ -5381,12 +5391,23 @@ async def _direct_session_timer(session_key):
                 logging.info("direct_payload_session_expired payload_count=0 reason=no_payload_timeout")
                 _direct_payload_sessions.pop(session_key, None)
                 return
+        payload_count = len(session.get("payload_lines", []))
+        last_committed_payload_count = int(session.get("last_committed_payload_count", 0))
+        has_uncommitted_payload = payload_count > last_committed_payload_count
         if now >= session["hard_deadline"]:
-            await _generate_direct_payload_session(session_key, "hard_cap")
+            if has_uncommitted_payload or last_committed_payload_count == 0:
+                await _generate_direct_payload_session(session_key, "hard_cap")
+            elif not session.get("generating"):
+                session["generating"] = False
+                logging.info(
+                    f"direct_session_generation_skipped_no_uncommitted_payload payload_count={payload_count} "
+                    f"last_committed_payload_count={last_committed_payload_count} revision={int(session.get('revision', 0))} "
+                    "reason=committed_snapshot_idle"
+                )
             await asyncio.sleep(0.2)
             continue
         quiet_elapsed = (now - session["last_payload_at"]).total_seconds() if session.get("last_payload_at") else 0
-        if session.get("payload_lines") and len(session.get("payload_lines", [])) > int(session.get("last_committed_payload_count", 0)) and quiet_elapsed >= DIRECT_PAYLOAD_QUIET_SECONDS and not session.get("generating"):
+        if payload_count > last_committed_payload_count and quiet_elapsed >= DIRECT_PAYLOAD_QUIET_SECONDS and not session.get("generating"):
             await _generate_direct_payload_session(session_key, "quiet_timeout")
             await asyncio.sleep(0.2)
             continue
