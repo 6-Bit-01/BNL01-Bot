@@ -4182,6 +4182,31 @@ def _build_acknowledgement_response(items):
     return "Received."
 
 
+def _is_orphan_short_fragment_message(text: str) -> bool:
+    t = (text or "").strip()
+    if not t:
+        return False
+
+    lowered = t.lower()
+    token_count = len([tok for tok in re.split(r"\s+", t) if tok])
+
+    if "?" in t:
+        return False
+    if re.search(r"\b(what|why|how|when|where|who)\b", lowered):
+        return False
+    if re.search(r"\b(can you|could you|would you|tell me|please|explain|help|make|write|joke|summarize|compare|rank|describe)\b", lowered):
+        return False
+
+    if re.fullmatch(r"(lol|lmao|haha+|ok|okay|k|thanks|thank you|thx|poop|yo|sup)\W*", lowered):
+        return True
+
+    if token_count <= 4 and len(t) <= 32:
+        if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9 .,'&\-]{0,31}", t):
+            return True
+
+    return False
+
+
 def _has_structured_intent(items, payload_items, pending_state=False, pending_anchor=None):
     texts = [(content or "").strip() for (_n, content, _u) in (items or []) if (content or "").strip()]
     if not texts:
@@ -5490,7 +5515,21 @@ async def on_message(message: discord.Message):
                 return
 
     active_same_user_session = bool(_direct_payload_sessions.get(session_key))
-    message_should_enter_conversation = bool(clean_content and (channel_allows_conversation or real_direct_target or followup_candidate or active_same_user_session))
+    suppress_orphan_fragment = bool(
+        clean_content
+        and channel_allows_conversation
+        and not active_same_user_session
+        and not real_direct_target
+        and not message.content.startswith("/")
+        and _is_orphan_short_fragment_message(clean_content)
+    )
+    if suppress_orphan_fragment:
+        logging.info("response_route_suppressed_orphan_fragment reason=short_fragment_no_active_session")
+    message_should_enter_conversation = bool(
+        clean_content
+        and (channel_allows_conversation or real_direct_target or followup_candidate or active_same_user_session)
+        and not suppress_orphan_fragment
+    )
     logging.info(f"response_route_active_session active={int(active_same_user_session)}")
     if message_should_enter_conversation:
         if channel_allows_conversation and not real_direct_target:
