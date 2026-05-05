@@ -5375,18 +5375,21 @@ async def _direct_session_timer(session_key):
             return
         now = datetime.now(timezone.utc)
         payload_lines = session.get("payload_lines", [])
+        payload_count = len(payload_lines)
+        last_committed_payload_count = int(session.get("last_committed_payload_count", 0))
+        has_uncommitted_payload = payload_count > last_committed_payload_count
         if not payload_lines and not session.get("last_bot_response_at") and not session.get("generating"):
             created_at = session.get("created_at") or now
             if (now - created_at).total_seconds() >= DIRECT_NO_PAYLOAD_TIMEOUT_SECONDS:
                 logging.info("direct_payload_session_expired payload_count=0 reason=no_payload_timeout")
                 _direct_payload_sessions.pop(session_key, None)
                 return
-        if now >= session["hard_deadline"]:
+        if has_uncommitted_payload and now >= session["hard_deadline"]:
             await _generate_direct_payload_session(session_key, "hard_cap")
             await asyncio.sleep(0.2)
             continue
         quiet_elapsed = (now - session["last_payload_at"]).total_seconds() if session.get("last_payload_at") else 0
-        if session.get("payload_lines") and len(session.get("payload_lines", [])) > int(session.get("last_committed_payload_count", 0)) and quiet_elapsed >= DIRECT_PAYLOAD_QUIET_SECONDS and not session.get("generating"):
+        if has_uncommitted_payload and quiet_elapsed >= DIRECT_PAYLOAD_QUIET_SECONDS and not session.get("generating"):
             await _generate_direct_payload_session(session_key, "quiet_timeout")
             await asyncio.sleep(0.2)
             continue
