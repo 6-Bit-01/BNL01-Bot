@@ -73,6 +73,7 @@ ADAPTIVE_PAYLOAD_SEALED_BONUS_SECONDS = 0.75
 DIRECT_PAYLOAD_QUIET_SECONDS = 3.5
 DIRECT_PAYLOAD_HARD_CAP_SECONDS = 10.0
 DIRECT_PRE_SEND_GRACE_SECONDS = 1.0
+DIRECT_NO_PAYLOAD_TIMEOUT_SECONDS = 40.0
 
 
 # ======== DYNAMIC AMBIENT CONFIG ========
@@ -5373,6 +5374,13 @@ async def _direct_session_timer(session_key):
             _direct_payload_sessions.pop(session_key, None)
             return
         now = datetime.now(timezone.utc)
+        payload_lines = session.get("payload_lines", [])
+        if not payload_lines and not session.get("last_bot_response_at") and not session.get("generating"):
+            created_at = session.get("created_at") or now
+            if (now - created_at).total_seconds() >= DIRECT_NO_PAYLOAD_TIMEOUT_SECONDS:
+                logging.info("direct_payload_session_expired payload_count=0 reason=no_payload_timeout")
+                _direct_payload_sessions.pop(session_key, None)
+                return
         if now >= session["hard_deadline"]:
             await _generate_direct_payload_session(session_key, "hard_cap")
             await asyncio.sleep(0.2)
