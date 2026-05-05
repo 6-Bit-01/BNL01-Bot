@@ -5256,6 +5256,10 @@ async def _generate_direct_payload_session(session_key, reason: str):
     anchor_message = session.get("anchor_message")
     payload_count = len(payload_lines)
     last_committed_payload_count = int(session.get("last_committed_payload_count", 0))
+    has_uncommitted_payload = payload_count > last_committed_payload_count
+    if not has_uncommitted_payload:
+        session["generating"] = False
+        return
     logging.info(f"direct_payload_session_generation_snapshot payload_count={payload_count} revision={generation_revision}")
 
     def _abort_if_invalidated(abort_reason: str):
