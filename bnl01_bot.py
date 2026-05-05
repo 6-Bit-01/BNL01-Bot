@@ -5228,7 +5228,7 @@ _recent_direct_response_window = {}
 DIRECT_FOLLOWUP_WINDOW_SECONDS = 60
 
 
-def _mark_recent_direct_response(channel_id: int, user_id: int, meta: dict | None = None):
+def _mark_recent_direct_response(channel_id: int, user_id: int, meta=None):
     snapshot = {"committed_at": datetime.now(timezone.utc)}
     if meta:
         snapshot.update(meta)
