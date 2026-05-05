@@ -5391,7 +5391,10 @@ async def _direct_session_timer(session_key):
                 await asyncio.sleep(0.2)
                 continue
             if not has_uncommitted_payload:
-                logging.info(f"direct_session_timer_idle reason=no_uncommitted_payload payload_count={payload_count} last_committed_payload_count={last_committed_payload_count}")
+                last_idle_log_at = session.get("last_idle_log_at")
+                if not last_idle_log_at or (now - last_idle_log_at).total_seconds() >= 10:
+                    logging.info(f"direct_session_timer_idle reason=no_uncommitted_payload payload_count={payload_count} last_committed_payload_count={last_committed_payload_count}")
+                    session["last_idle_log_at"] = now
         quiet_elapsed = (now - session["last_payload_at"]).total_seconds() if session.get("last_payload_at") else 0
         if has_uncommitted_payload and quiet_elapsed >= DIRECT_PAYLOAD_QUIET_SECONDS and not session.get("generating"):
             await _generate_direct_payload_session(session_key, "quiet_timeout")
