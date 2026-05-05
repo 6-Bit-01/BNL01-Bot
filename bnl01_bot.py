@@ -5227,14 +5227,36 @@ _direct_payload_sessions = {}
 _recent_direct_response_window = {}
 DIRECT_FOLLOWUP_WINDOW_SECONDS = 60
 
-def _mark_recent_direct_response(channel_id: int, user_id: int):
-    _recent_direct_response_window[(channel_id, user_id)] = datetime.now(timezone.utc)
+
+def _mark_recent_direct_response(channel_id: int, user_id: int, meta: dict | None = None):
+    snapshot = {"committed_at": datetime.now(timezone.utc)}
+    if meta:
+        snapshot.update(meta)
+    _recent_direct_response_window[(channel_id, user_id)] = snapshot
 
 def _is_recent_direct_followup(channel_id: int, user_id: int) -> bool:
-    ts = _recent_direct_response_window.get((channel_id, user_id))
+    entry = _recent_direct_response_window.get((channel_id, user_id))
+    if not entry:
+        return False
+    ts = entry.get("committed_at") if isinstance(entry, dict) else entry
     if not ts:
         return False
     return (datetime.now(timezone.utc) - ts).total_seconds() <= DIRECT_FOLLOWUP_WINDOW_SECONDS
+
+
+def _get_recent_direct_response_meta(channel_id: int, user_id: int) -> dict:
+    entry = _recent_direct_response_window.get((channel_id, user_id)) or {}
+    return entry if isinstance(entry, dict) else {"committed_at": entry}
+
+
+def _is_clear_new_direct_request(text: str) -> bool:
+    lowered = (text or "").strip().lower()
+    if not lowered:
+        return False
+    markers = ("new topic", "forget that", "start over", "now explain", "different question")
+    if any(m in lowered for m in markers):
+        return True
+    return len(lowered.split()) >= 7 and ("?" in lowered or lowered.startswith(("what ", "how ", "why ", "can you ")))
 
 
 def _direct_session_is_expired(session) -> bool:
@@ -5355,6 +5377,7 @@ async def _generate_direct_payload_session(session_key, reason: str):
     if _abort_if_invalidated("revision_changed_before_send"):
         return
     session["last_generation_snapshot_revision"] = generation_revision
+    _mark_recent_direct_response(session["channel_id"], session["requester_user_id"], {"request_text": session.get("original_request_text", ""), "payload_count": payload_count})
     session["last_committed_revision"] = generation_revision
     session["last_committed_payload_count"] = payload_count
     session["last_bot_response_at"] = datetime.now(timezone.utc)
@@ -5391,7 +5414,10 @@ async def _direct_session_timer(session_key):
                 await asyncio.sleep(0.2)
                 continue
             if not has_uncommitted_payload:
-                logging.info(f"direct_session_timer_idle reason=no_uncommitted_payload payload_count={payload_count} last_committed_payload_count={last_committed_payload_count}")
+                last_idle_log_at = session.get("last_idle_log_at")
+                if not last_idle_log_at or (now - last_idle_log_at).total_seconds() >= 10:
+                    logging.info(f"direct_session_timer_idle reason=no_uncommitted_payload payload_count={payload_count} last_committed_payload_count={last_committed_payload_count}")
+                    session["last_idle_log_at"] = now
         quiet_elapsed = (now - session["last_payload_at"]).total_seconds() if session.get("last_payload_at") else 0
         if has_uncommitted_payload and quiet_elapsed >= DIRECT_PAYLOAD_QUIET_SECONDS and not session.get("generating"):
             await _generate_direct_payload_session(session_key, "quiet_timeout")
@@ -5415,12 +5441,13 @@ async def _apply_direct_response_pacing(payload_expected: bool, payload_count: i
 def _build_direct_payload_prompt(base_prompt: str, payload_items, request_text: str) -> str:
     if not payload_items:
         return base_prompt
-    lines = ["", "DIRECT REQUEST PAYLOAD ITEMS:"]
+    logging.info("direct_session_model_prompt_sanitized removed_payload_labels=1")
+    lines = ["", "Items to address:"]
     for idx, item in enumerate(payload_items, start=1):
         lines.append(f"{idx}. {item}")
     lines.append("")
-    lines.append("Instruction:")
-    lines.append("Respond to every required payload item by name. Do not omit any item.")
+    lines.append("Additional details:")
+    lines.append("Respond to every required item by name. Do not omit any item.")
     if _is_simple_humor_or_list_request(request_text, len(payload_items)):
         lines.append("For simple joke/list requests, prefer per-item format like `Name: <answer>`.")
     return base_prompt + "\n" + "\n".join(lines)
@@ -5492,6 +5519,43 @@ async def on_message(message: discord.Message):
                 logging.info("response_route_active_session active=1")
                 logging.info("response_route_decision route=active_session reason=direct_payload_continuation")
                 return
+
+    if not active_direct_session and followup_candidate and clean_content and not real_direct_target and not message.content.startswith("/"):
+        if _is_clear_new_direct_request(clean_content):
+            logging.info("direct_session_recent_followup_new_request reason=clear_new_request")
+        else:
+            logging.info("direct_session_recent_followup_detected reason=recent_committed_response")
+            recent_meta = _get_recent_direct_response_meta(message.channel.id, message.author.id)
+            seed_request = recent_meta.get("request_text") or "Continue the prior request with the following details."
+            session = {
+                "guild_id": message.guild.id,
+                "guild": message.guild,
+                "channel_id": message.channel.id,
+                "requester_user_id": message.author.id,
+                "requester_display_name": message.author.display_name,
+                "requester_member": message.author,
+                "channel_policy": channel_policy,
+                "request_text": seed_request,
+                "original_request_text": seed_request,
+                "anchor_message_id": message.id,
+                "anchor_message": message,
+                "payload_lines": [clean_content],
+                "created_at": datetime.now(timezone.utc),
+                "last_payload_at": datetime.now(timezone.utc),
+                "hard_deadline": datetime.now(timezone.utc) + timedelta(seconds=DIRECT_PAYLOAD_HARD_CAP_SECONDS),
+                "completed": False,
+                "generating": False,
+                "generation_invalidated": False,
+                "revision": 1,
+                "last_generation_snapshot_revision": 0,
+                "last_committed_revision": 0,
+                "last_committed_payload_count": 0,
+                "last_bot_response_at": recent_meta.get("committed_at"),
+            }
+            _direct_payload_sessions[session_key] = session
+            session["timer_task"] = asyncio.create_task(_direct_session_timer(session_key))
+            logging.info(f"direct_session_recent_followup_appended payload_count={len(session['payload_lines'])}")
+            return
 
     active_same_user_session = bool(_direct_payload_sessions.get(session_key))
     message_should_enter_conversation = bool(clean_content and (channel_allows_conversation or real_direct_target or followup_candidate or active_same_user_session))
@@ -5692,7 +5756,7 @@ async def on_message(message: discord.Message):
                 await message.reply(chunks[0] + "...")
                 for chunk in chunks[1:]:
                     await message.channel.send("..." + chunk)
-            _mark_recent_direct_response(message.channel.id, message.author.id)
+            _mark_recent_direct_response(message.channel.id, message.author.id, {"request_text": direct_content, "payload_count": len(direct_payload_items)})
             return
 
         # Non-mention in active channel -> batch (kill-switched by env)
@@ -5832,7 +5896,7 @@ async def on_message(message: discord.Message):
             await message.reply(chunks[0] + "...")
             for chunk in chunks[1:]:
                 await message.channel.send("..." + chunk)
-        _mark_recent_direct_response(message.channel.id, message.author.id)
+        _mark_recent_direct_response(message.channel.id, message.author.id, {"request_text": direct_content, "payload_count": len(direct_payload_items)})
         return
 
     # ---------------- NO ACTIVE CHANNEL SET (RESPOND TO MENTIONS/REPLIES ANYWHERE) ----------------
@@ -5931,7 +5995,7 @@ async def on_message(message: discord.Message):
             set_last_greeting_at(message.author.id, message.guild.id, datetime.now(PACIFIC_TZ).isoformat())
 
         await message.reply(response if len(response) <= 2000 else response[:1900] + "...")
-        _mark_recent_direct_response(message.channel.id, message.author.id)
+        _mark_recent_direct_response(message.channel.id, message.author.id, {"request_text": direct_content, "payload_count": len(direct_payload_items)})
         return
 
 # ==================== SLASH COMMANDS ====================
