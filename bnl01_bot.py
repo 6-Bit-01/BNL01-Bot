@@ -74,6 +74,8 @@ DIRECT_PAYLOAD_QUIET_SECONDS = 3.5
 DIRECT_PAYLOAD_HARD_CAP_SECONDS = 10.0
 DIRECT_PRE_SEND_GRACE_SECONDS = 1.0
 DIRECT_NO_PAYLOAD_TIMEOUT_SECONDS = 40.0
+DIRECT_SESSION_REPLY_LIMIT_60S = 2
+DIRECT_SESSION_GEMINI_LIMIT_5M = 5
 
 
 # ======== DYNAMIC AMBIENT CONFIG ========
@@ -958,7 +960,7 @@ async def generate_dynamic_website_relay(guild_id: int) -> tuple[str, str, str, 
             f"Context summary: {signal_summary or 'limited Discord-side traffic'}.\n"
             f"Discord observations: {relay_context or 'No specific recent Discord observations available.'}\n"
         )
-        generated = await get_gemini_response(prompt, user_id=0, guild_id=guild_id) or ""
+        generated = await get_gemini_response(prompt, user_id=0, guild_id=guild_id, gemini_call_route="website_relay") or ""
     else:
         generated = ""
 
@@ -3065,7 +3067,8 @@ def _extract_text_and_tokens(response):
     except Exception:
         return "", None
 
-async def get_gemini_response(prompt: str, user_id: int, guild_id: int):
+async def get_gemini_response(prompt: str, user_id: int, guild_id: int, gemini_call_route: str = "memory"):
+    logging.info(f"gemini_call_route={gemini_call_route}")
     def _is_gemini_503(exc: Exception) -> bool:
         msg = str(exc or "").lower()
         return ("503" in msg and "unavailable" in msg) or "service unavailable" in msg
@@ -3371,10 +3374,10 @@ async def generate_dynamic_ambient(guild_id: int, channel_id: int) -> str:
         f"{avoid_block}\n"
     )
 
-    result = trim_to_complete_sentence(_sanitize_ambient(await get_gemini_response(prompt, user_id=0, guild_id=guild_id)), AMBIENT_MAX_CHARS)
+    result = trim_to_complete_sentence(_sanitize_ambient(await get_gemini_response(prompt, user_id=0, guild_id=guild_id, gemini_call_route="ambient")), AMBIENT_MAX_CHARS)
 
     if not result or is_incomplete_ambient_message(result):
-        retry_result = _sanitize_ambient(await get_gemini_response(prompt, user_id=0, guild_id=guild_id))
+        retry_result = _sanitize_ambient(await get_gemini_response(prompt, user_id=0, guild_id=guild_id, gemini_call_route="ambient"))
         if not retry_result or is_incomplete_ambient_message(retry_result):
             logging.warning("Ambient skipped after incomplete retry")
             return ""
@@ -3386,7 +3389,7 @@ async def generate_dynamic_ambient(guild_id: int, channel_id: int) -> str:
     if _too_similar(result, recent_ambient) and AMBIENT_RETRY_ON_SIMILAR > 0:
         logging.info(f"📡 Ambient rejected for guild {guild_id}: duplicate/similar to recent history. Retrying once.")
         prompt2 = prompt + "\nRewrite to be clearly different from the avoid list while staying in character.\n"
-        result2 = _sanitize_ambient(await get_gemini_response(prompt2, user_id=0, guild_id=guild_id))
+        result2 = _sanitize_ambient(await get_gemini_response(prompt2, user_id=0, guild_id=guild_id, gemini_call_route="ambient"))
         if result2 and not is_incomplete_ambient_message(result2) and not _too_similar(result2, recent_ambient):
             return result2
         logging.warning(f"⚠️ Ambient skipped after failed retry for guild {guild_id} (duplicate/similar).")
@@ -3563,7 +3566,7 @@ async def generate_showday_messages(guild_id: int, phase_key: str):
         "Do not quote users. No usernames. No emojis except optional one at start.\n"
         "Do not repeat generic stock wording. Keep it fresh.\n"
     )
-    text = (await get_gemini_response(prompt, user_id=0, guild_id=guild_id) or "").strip()
+    text = (await get_gemini_response(prompt, user_id=0, guild_id=guild_id, gemini_call_route="website_relay") or "").strip()
     lines = [ln.strip(" -•\t") for ln in text.splitlines() if ln.strip()]
     if len(lines) >= 2:
         discord_msg = lines[0][:320]
@@ -5244,6 +5247,23 @@ def _direct_session_is_expired(session) -> bool:
     return (datetime.now(timezone.utc) - last_bot_response_at).total_seconds() > DIRECT_FOLLOWUP_WINDOW_SECONDS
 
 
+def _prune_old_timestamps(ts_deque: deque, window_seconds: int):
+    now = datetime.now(timezone.utc)
+    while ts_deque and (now - ts_deque[0]).total_seconds() > window_seconds:
+        ts_deque.popleft()
+
+
+def _trip_direct_session_breaker(session_key, session, reason: str):
+    safe_payload_count = len(session.get("payload_lines", []))
+    safe_revision = int(session.get("revision", 0))
+    logging.info(f"direct_session_circuit_breaker_tripped reason={reason} payload_count={safe_payload_count} revision={safe_revision}")
+    session["completed"] = True
+    session["generating"] = False
+    _direct_payload_sessions.pop(session_key, None)
+
+
+
+
 async def _generate_direct_payload_session(session_key, reason: str):
     session = _direct_payload_sessions.get(session_key)
     if not session:
@@ -5258,6 +5278,24 @@ async def _generate_direct_payload_session(session_key, reason: str):
     last_committed_payload_count = int(session.get("last_committed_payload_count", 0))
     has_uncommitted_payload = payload_count > last_committed_payload_count
     logging.info(f"direct_payload_session_generation_snapshot payload_count={payload_count} revision={generation_revision}")
+    fingerprint = f"{generation_revision}:{payload_count}:{last_committed_payload_count}"
+    generation_attempt_counts = session.setdefault("generation_attempt_counts", {})
+    attempt_count = int(generation_attempt_counts.get(fingerprint, 0)) + 1
+    generation_attempt_counts[fingerprint] = attempt_count
+    if last_committed_payload_count > 0 and attempt_count > 1:
+        logging.info(
+            f"direct_session_generation_skipped_no_uncommitted_payload payload_count={payload_count} "
+            f"last_committed_payload_count={last_committed_payload_count} revision={generation_revision} "
+            "reason=duplicate_fingerprint_after_commit"
+        )
+        session["generating"] = False
+        return
+    gemini_attempts = session.setdefault("recent_gemini_attempt_timestamps", deque())
+    gemini_attempts.append(datetime.now(timezone.utc))
+    _prune_old_timestamps(gemini_attempts, 300)
+    if len(gemini_attempts) > DIRECT_SESSION_GEMINI_LIMIT_5M:
+        _trip_direct_session_breaker(session_key, session, "gemini_attempt_rate")
+        return
 
     def _abort_if_invalidated(abort_reason: str):
         current_session = _direct_payload_sessions.get(session_key)
@@ -5321,7 +5359,7 @@ async def _generate_direct_payload_session(session_key, reason: str):
     if _abort_if_invalidated("revision_changed_before_send"):
         return
     async with anchor_message.channel.typing():
-        response = await get_gemini_response(prompt, session["requester_user_id"], session["guild_id"])
+        response = await get_gemini_response(prompt, session["requester_user_id"], session["guild_id"], gemini_call_route="direct_session")
     if _abort_if_invalidated("revision_changed_before_send"):
         return
     if response and direct_payload_items:
@@ -5331,7 +5369,7 @@ async def _generate_direct_payload_session(session_key, reason: str):
         if missing_items:
             correction_prompt = prompt + "\n\nCORRECTION REQUIRED: Regenerate and include every required payload item explicitly by name.\nMissing required payload items: " + ", ".join(missing_items) + "."
             async with anchor_message.channel.typing():
-                response = await get_gemini_response(correction_prompt, session["requester_user_id"], session["guild_id"])
+                response = await get_gemini_response(correction_prompt, session["requester_user_id"], session["guild_id"], gemini_call_route="direct_session")
             if _abort_if_invalidated("revision_changed_before_send"):
                 return
             missing_items = _missing_request_payload_items(direct_payload_items, response or "")
@@ -5358,6 +5396,12 @@ async def _generate_direct_payload_session(session_key, reason: str):
         for chunk in chunks[1:]:
             await anchor_message.channel.send("..." + chunk)
     if _abort_if_invalidated("revision_changed_before_send"):
+        return
+    reply_timestamps = session.setdefault("recent_reply_timestamps", deque())
+    reply_timestamps.append(datetime.now(timezone.utc))
+    _prune_old_timestamps(reply_timestamps, 60)
+    if len(reply_timestamps) > DIRECT_SESSION_REPLY_LIMIT_60S:
+        _trip_direct_session_breaker(session_key, session, "reply_rate")
         return
     if allow_greeting:
         set_last_greeting_at(session["requester_user_id"], session["guild_id"], datetime.now(PACIFIC_TZ).isoformat())
@@ -5646,6 +5690,9 @@ async def on_message(message: discord.Message):
                     "last_committed_revision": 0,
                     "last_committed_payload_count": 0,
                     "last_bot_response_at": None,
+                    "recent_reply_timestamps": deque(),
+                    "recent_gemini_attempt_timestamps": deque(),
+                    "generation_attempt_counts": {},
                 }
                 _direct_payload_sessions[session_key] = session
                 session["timer_task"] = asyncio.create_task(_direct_session_timer(session_key))
@@ -5667,7 +5714,7 @@ async def on_message(message: discord.Message):
             await _apply_direct_response_pacing(payload_expected, len(direct_payload_items))
             async with message.channel.typing():
                 logging.info(f"direct_payload_generation_started payload_count={len(direct_payload_items)}")
-                response = await get_gemini_response(prompt, message.author.id, message.guild.id)
+                response = await get_gemini_response(prompt, message.author.id, message.guild.id, gemini_call_route="direct_session")
             if response and direct_payload_items:
                 missing_items = _missing_request_payload_items(direct_payload_items, response)
                 logging.info(f"direct_payload_completion_check missing_count={len(missing_items)}")
@@ -5678,7 +5725,7 @@ async def on_message(message: discord.Message):
                         + "Missing required payload items: " + ", ".join(missing_items) + "."
                     )
                     async with message.channel.typing():
-                        response = await get_gemini_response(correction_prompt, message.author.id, message.guild.id)
+                        response = await get_gemini_response(correction_prompt, message.author.id, message.guild.id, gemini_call_route="direct_session")
                     missing_items = _missing_request_payload_items(direct_payload_items, response or "")
                     logging.info(f"direct_payload_completion_regenerated missing_count={len(missing_items)}")
                     if missing_items:
@@ -5808,7 +5855,7 @@ async def on_message(message: discord.Message):
         await _apply_direct_response_pacing(payload_expected, len(direct_payload_items))
         async with message.channel.typing():
             logging.info(f"direct_payload_generation_started payload_count={len(direct_payload_items)}")
-            response = await get_gemini_response(prompt, message.author.id, message.guild.id)
+            response = await get_gemini_response(prompt, message.author.id, message.guild.id, gemini_call_route="direct_session")
         if response and direct_payload_items:
             missing_items = _missing_request_payload_items(direct_payload_items, response)
             logging.info(f"direct_payload_completion_check missing_count={len(missing_items)}")
@@ -5819,7 +5866,7 @@ async def on_message(message: discord.Message):
                     + "Missing required payload items: " + ", ".join(missing_items) + "."
                 )
                 async with message.channel.typing():
-                    response = await get_gemini_response(correction_prompt, message.author.id, message.guild.id)
+                    response = await get_gemini_response(correction_prompt, message.author.id, message.guild.id, gemini_call_route="direct_session")
                 missing_items = _missing_request_payload_items(direct_payload_items, response or "")
                 logging.info(f"direct_payload_completion_regenerated missing_count={len(missing_items)}")
                 if missing_items:
@@ -5913,7 +5960,7 @@ async def on_message(message: discord.Message):
         await _apply_direct_response_pacing(payload_expected, len(direct_payload_items))
         async with message.channel.typing():
             logging.info(f"direct_payload_generation_started payload_count={len(direct_payload_items)}")
-            response = await get_gemini_response(prompt, message.author.id, message.guild.id)
+            response = await get_gemini_response(prompt, message.author.id, message.guild.id, gemini_call_route="direct_session")
         if response and direct_payload_items:
             missing_items = _missing_request_payload_items(direct_payload_items, response)
             logging.info(f"direct_payload_completion_check missing_count={len(missing_items)}")
@@ -5924,7 +5971,7 @@ async def on_message(message: discord.Message):
                     + "Missing required payload items: " + ", ".join(missing_items) + "."
                 )
                 async with message.channel.typing():
-                    response = await get_gemini_response(correction_prompt, message.author.id, message.guild.id)
+                    response = await get_gemini_response(correction_prompt, message.author.id, message.guild.id, gemini_call_route="direct_session")
                 missing_items = _missing_request_payload_items(direct_payload_items, response or "")
                 logging.info(f"direct_payload_completion_regenerated missing_count={len(missing_items)}")
                 if missing_items:
