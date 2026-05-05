@@ -5550,7 +5550,7 @@ async def on_message(message: discord.Message):
                 "last_generation_snapshot_revision": 0,
                 "last_committed_revision": 0,
                 "last_committed_payload_count": 0,
-                "last_bot_response_at": recent_meta.get("committed_at"),
+                "last_bot_response_at": None,
             }
             _direct_payload_sessions[session_key] = session
             session["timer_task"] = asyncio.create_task(_direct_session_timer(session_key))
