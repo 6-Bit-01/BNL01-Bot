@@ -70,8 +70,10 @@ ADAPTIVE_PAYLOAD_WAIT_NO_ITEMS_SECONDS = 4
 ADAPTIVE_PAYLOAD_WAIT_WITH_ITEMS_SECONDS = 1.5
 ADAPTIVE_PAYLOAD_MAX_WAIT_SECONDS = 9
 ADAPTIVE_PAYLOAD_SEALED_BONUS_SECONDS = 0.75
-DIRECT_PAYLOAD_QUIET_SECONDS = 1.25
-DIRECT_PAYLOAD_HARD_CAP_SECONDS = 6.0
+DIRECT_PAYLOAD_QUIET_SECONDS = 3.5
+DIRECT_PAYLOAD_HARD_CAP_SECONDS = 10.0
+DIRECT_PRE_SEND_GRACE_SECONDS = 1.0
+DIRECT_NO_PAYLOAD_TIMEOUT_SECONDS = 40.0
 
 
 # ======== DYNAMIC AMBIENT CONFIG ========
@@ -5223,7 +5225,7 @@ def _direct_session_key(message: discord.Message):
 
 _direct_payload_sessions = {}
 _recent_direct_response_window = {}
-DIRECT_FOLLOWUP_WINDOW_SECONDS = 45
+DIRECT_FOLLOWUP_WINDOW_SECONDS = 60
 
 def _mark_recent_direct_response(channel_id: int, user_id: int):
     _recent_direct_response_window[(channel_id, user_id)] = datetime.now(timezone.utc)
@@ -5233,6 +5235,13 @@ def _is_recent_direct_followup(channel_id: int, user_id: int) -> bool:
     if not ts:
         return False
     return (datetime.now(timezone.utc) - ts).total_seconds() <= DIRECT_FOLLOWUP_WINDOW_SECONDS
+
+
+def _direct_session_is_expired(session) -> bool:
+    last_bot_response_at = session.get("last_bot_response_at")
+    if not last_bot_response_at:
+        return False
+    return (datetime.now(timezone.utc) - last_bot_response_at).total_seconds() > DIRECT_FOLLOWUP_WINDOW_SECONDS
 
 
 async def _generate_direct_payload_session(session_key, reason: str):
@@ -5246,6 +5255,7 @@ async def _generate_direct_payload_session(session_key, reason: str):
     payload_lines = list(session.get("payload_lines", []))
     anchor_message = session.get("anchor_message")
     payload_count = len(payload_lines)
+    last_committed_payload_count = int(session.get("last_committed_payload_count", 0))
     logging.info(f"direct_payload_session_generation_snapshot payload_count={payload_count} revision={generation_revision}")
 
     def _abort_if_invalidated(abort_reason: str):
@@ -5274,10 +5284,14 @@ async def _generate_direct_payload_session(session_key, reason: str):
         return
 
     logging.info(f"direct_payload_session_generation_started payload_count={payload_count} reason={reason}")
-    direct_content = session["request_text"] + "\n" + "\n".join(payload_lines)
+    delta_mode = bool(session.get("last_bot_response_at") and payload_count > last_committed_payload_count)
+    generation_lines = payload_lines[last_committed_payload_count:] if delta_mode else payload_lines
+    if delta_mode:
+        logging.info(f"direct_session_delta_continuation_started from_payload_count={last_committed_payload_count} to_payload_count={payload_count}")
+    direct_content = session["original_request_text"] + "\n" + "\n".join(generation_lines)
     direct_payload_items = []
     seen = set()
-    for line in payload_lines:
+    for line in generation_lines:
         key = _normalize_payload_item_key(line)
         if key and key not in seen:
             seen.add(key)
@@ -5321,7 +5335,10 @@ async def _generate_direct_payload_session(session_key, reason: str):
 
     if not response:
         response = "[NETWORK ERROR] Temporary synchronization issue. Try again."
+    logging.info(f"direct_session_pre_send_grace_started revision={generation_revision} payload_count={payload_count}")
+    await asyncio.sleep(DIRECT_PRE_SEND_GRACE_SECONDS)
     if _abort_if_invalidated("revision_changed_before_send"):
+        logging.info("direct_session_pre_send_abort reason=revision_changed_before_send")
         return
     if len(response) <= 2000:
         await anchor_message.reply(response)
@@ -5337,24 +5354,39 @@ async def _generate_direct_payload_session(session_key, reason: str):
     save_model_message(session["requester_user_id"], session["guild_id"], response, channel_name=getattr(anchor_message.channel, "name", ""), channel_policy=session["channel_policy"])
     if _abort_if_invalidated("revision_changed_before_send"):
         return
-    session["completed"] = True
+    session["last_generation_snapshot_revision"] = generation_revision
+    session["last_committed_revision"] = generation_revision
+    session["last_committed_payload_count"] = payload_count
+    session["last_bot_response_at"] = datetime.now(timezone.utc)
     session["generating"] = False
-    logging.info(f"direct_payload_session_completed payload_count={payload_count} revision={generation_revision}")
-    _direct_payload_sessions.pop(session_key, None)
+    session["generation_invalidated"] = False
+    logging.info(f"direct_session_committed revision={generation_revision} payload_count={payload_count}")
+    if delta_mode:
+        logging.info(f"direct_session_delta_completed new_payload_count={payload_count}")
 
 
 async def _direct_session_timer(session_key):
     while True:
         session = _direct_payload_sessions.get(session_key)
-        if not session or session.get("completed"):
+        if not session:
+            return
+        if _direct_session_is_expired(session) and not session.get("generating"):
+            _direct_payload_sessions.pop(session_key, None)
             return
         now = datetime.now(timezone.utc)
+        payload_lines = session.get("payload_lines", [])
+        if not payload_lines and not session.get("last_bot_response_at") and not session.get("generating"):
+            created_at = session.get("created_at") or now
+            if (now - created_at).total_seconds() >= DIRECT_NO_PAYLOAD_TIMEOUT_SECONDS:
+                logging.info("direct_payload_session_expired payload_count=0 reason=no_payload_timeout")
+                _direct_payload_sessions.pop(session_key, None)
+                return
         if now >= session["hard_deadline"]:
             await _generate_direct_payload_session(session_key, "hard_cap")
             await asyncio.sleep(0.2)
             continue
         quiet_elapsed = (now - session["last_payload_at"]).total_seconds() if session.get("last_payload_at") else 0
-        if session.get("payload_lines") and quiet_elapsed >= DIRECT_PAYLOAD_QUIET_SECONDS and not session.get("generating"):
+        if session.get("payload_lines") and len(session.get("payload_lines", [])) > int(session.get("last_committed_payload_count", 0)) and quiet_elapsed >= DIRECT_PAYLOAD_QUIET_SECONDS and not session.get("generating"):
             await _generate_direct_payload_session(session_key, "quiet_timeout")
             await asyncio.sleep(0.2)
             continue
@@ -5442,12 +5474,13 @@ async def on_message(message: discord.Message):
             if line:
                 active_direct_session["payload_lines"].append(line)
                 active_direct_session["last_payload_at"] = datetime.now(timezone.utc)
+                active_direct_session["hard_deadline"] = datetime.now(timezone.utc) + timedelta(seconds=DIRECT_PAYLOAD_HARD_CAP_SECONDS)
                 active_direct_session["revision"] = int(active_direct_session.get("revision", 0)) + 1
                 if active_direct_session.get("generating"):
                     active_direct_session["generation_invalidated"] = True
                     logging.info(f"direct_payload_session_generation_invalidated payload_count={len(active_direct_session['payload_lines'])} reason=new_payload_during_generation")
                 logging.info(f"direct_payload_session_payload_added payload_count={len(active_direct_session['payload_lines'])}")
-                logging.info(f"direct_payload_session_timer_reset payload_count={len(active_direct_session['payload_lines'])}")
+                logging.info(f"direct_session_quiet_wait_reset payload_count={len(active_direct_session['payload_lines'])}")
                 logging.info("conversational_continuation_detected reason=active_request")
                 logging.info("response_route_active_session active=1")
                 logging.info("response_route_decision route=active_session reason=direct_payload_continuation")
@@ -5577,6 +5610,7 @@ async def on_message(message: discord.Message):
                     "requester_member": message.author,
                     "channel_policy": channel_policy,
                     "request_text": direct_content,
+                    "original_request_text": direct_content,
                     "anchor_message_id": message.id,
                     "anchor_message": message,
                     "payload_lines": [],
@@ -5587,6 +5621,10 @@ async def on_message(message: discord.Message):
                     "generating": False,
                     "generation_invalidated": False,
                     "revision": 0,
+                    "last_generation_snapshot_revision": 0,
+                    "last_committed_revision": 0,
+                    "last_committed_payload_count": 0,
+                    "last_bot_response_at": None,
                 }
                 _direct_payload_sessions[session_key] = session
                 session["timer_task"] = asyncio.create_task(_direct_session_timer(session_key))
