@@ -18,6 +18,7 @@ import sqlite3
 import logging
 import random
 import json
+import sys
 import urllib.request
 import urllib.error
 import urllib.parse
@@ -958,7 +959,7 @@ async def generate_dynamic_website_relay(guild_id: int) -> tuple[str, str, str, 
             f"Context summary: {signal_summary or 'limited Discord-side traffic'}.\n"
             f"Discord observations: {relay_context or 'No specific recent Discord observations available.'}\n"
         )
-        generated = await get_gemini_response(prompt, user_id=0, guild_id=guild_id) or ""
+        generated = await get_gemini_response(prompt, user_id=0, guild_id=guild_id, route="website_relay") or ""
     else:
         generated = ""
 
@@ -3065,12 +3066,13 @@ def _extract_text_and_tokens(response):
     except Exception:
         return "", None
 
-async def get_gemini_response(prompt: str, user_id: int, guild_id: int):
+async def get_gemini_response(prompt: str, user_id: int, guild_id: int, route: str = "unknown"):
     def _is_gemini_503(exc: Exception) -> bool:
         msg = str(exc or "").lower()
         return ("503" in msg and "unavailable" in msg) or "service unavailable" in msg
 
     try:
+        _log_gemini_call_route(route)
         if not check_quota_availability():
             tokens_used, _ = get_usage_stats()
             pct = (tokens_used / DAILY_TOKEN_LIMIT) * 100
@@ -3371,10 +3373,10 @@ async def generate_dynamic_ambient(guild_id: int, channel_id: int) -> str:
         f"{avoid_block}\n"
     )
 
-    result = trim_to_complete_sentence(_sanitize_ambient(await get_gemini_response(prompt, user_id=0, guild_id=guild_id)), AMBIENT_MAX_CHARS)
+    result = trim_to_complete_sentence(_sanitize_ambient(await get_gemini_response(prompt, user_id=0, guild_id=guild_id, route="ambient")), AMBIENT_MAX_CHARS)
 
     if not result or is_incomplete_ambient_message(result):
-        retry_result = _sanitize_ambient(await get_gemini_response(prompt, user_id=0, guild_id=guild_id))
+        retry_result = _sanitize_ambient(await get_gemini_response(prompt, user_id=0, guild_id=guild_id, route="ambient"))
         if not retry_result or is_incomplete_ambient_message(retry_result):
             logging.warning("Ambient skipped after incomplete retry")
             return ""
@@ -3386,7 +3388,7 @@ async def generate_dynamic_ambient(guild_id: int, channel_id: int) -> str:
     if _too_similar(result, recent_ambient) and AMBIENT_RETRY_ON_SIMILAR > 0:
         logging.info(f"📡 Ambient rejected for guild {guild_id}: duplicate/similar to recent history. Retrying once.")
         prompt2 = prompt + "\nRewrite to be clearly different from the avoid list while staying in character.\n"
-        result2 = _sanitize_ambient(await get_gemini_response(prompt2, user_id=0, guild_id=guild_id))
+        result2 = _sanitize_ambient(await get_gemini_response(prompt2, user_id=0, guild_id=guild_id, route="ambient"))
         if result2 and not is_incomplete_ambient_message(result2) and not _too_similar(result2, recent_ambient):
             return result2
         logging.warning(f"⚠️ Ambient skipped after failed retry for guild {guild_id} (duplicate/similar).")
@@ -3563,7 +3565,7 @@ async def generate_showday_messages(guild_id: int, phase_key: str):
         "Do not quote users. No usernames. No emojis except optional one at start.\n"
         "Do not repeat generic stock wording. Keep it fresh.\n"
     )
-    text = (await get_gemini_response(prompt, user_id=0, guild_id=guild_id) or "").strip()
+    text = (await get_gemini_response(prompt, user_id=0, guild_id=guild_id, route="ambient") or "").strip()
     lines = [ln.strip(" -•\t") for ln in text.splitlines() if ln.strip()]
     if len(lines) >= 2:
         discord_msg = lines[0][:320]
@@ -4666,9 +4668,11 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
             _log_batch_event(logging.INFO, "active_packet_generation_started", guild_id, channel_id, len(collapsed_items), f"payload_count={len(active_packet['payload_items'])};decision={decision};reason={reason}")
             generation_elapsed = max(0.0, (datetime.now(PACIFIC_TZ) - batch_start).total_seconds())
             _log_batch_event(logging.INFO, "generation_started_after_wait", guild_id, channel_id, len(collapsed_items), f"payload_count={len(active_packet['payload_items'])};elapsed_seconds={generation_elapsed:.2f};selected_wait_seconds={selected_wait_seconds:.2f}")
+            if not _loop_guard_allows_send("active_batch", guild_id, channel_id, 0):
+                return
             _log_batch_event(logging.INFO, "generation_typing_started", guild_id, channel_id, len(collapsed_items), f"payload_count={len(active_packet['payload_items'])};elapsed_seconds={generation_elapsed:.2f};selected_wait_seconds={selected_wait_seconds:.2f}")
             async with channel.typing():
-                response = await get_gemini_response(prompt, user_id=first_uid, guild_id=channel.guild.id)
+                response = await get_gemini_response(prompt, user_id=first_uid, guild_id=channel.guild.id, route="active_batch")
 
             if not response:
                 logging.warning(f"⚠️ Batch response generation failed in channel {channel_id}.")
@@ -4691,7 +4695,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                             + "Missing item count: " + str(len(missing_items)) + "."
                         )
                         async with channel.typing():
-                            regenerated = await get_gemini_response(correction_prompt, user_id=first_uid, guild_id=channel.guild.id)
+                            regenerated = await get_gemini_response(correction_prompt, user_id=first_uid, guild_id=channel.guild.id, route="active_batch")
                         if regenerated:
                             response = regenerated
                             payload_completion_regenerated = True
@@ -4910,6 +4914,8 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                 if not pending_task or pending_task.done():
                     _channel_tasks[channel_id] = asyncio.create_task(_schedule_flush(channel))
             return
+        if not _loop_guard_allows_send("active_batch", guild_id, channel_id, 0):
+            return
         _log_batch_event(logging.INFO, "response_send_commit_start", guild_id, channel_id, len(items), f"generation_id={local_generation_id}")
         if hard_interrupt:
             _log_batch_event(logging.INFO, "hard_interrupt_seen_before_commit", guild_id, channel_id, len(items), f"generation_id={local_generation_id}")
@@ -4923,6 +4929,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
             await channel.send(chunks[0] + "...", allowed_mentions=safe_mentions)
             for chunk in chunks[1:]:
                 await channel.send("..." + chunk, allowed_mentions=safe_mentions)
+        _loop_guard_mark_sent("active_batch", guild_id, channel_id, 0)
         _log_batch_event(logging.INFO, "response_send_commit_complete", guild_id, channel_id, len(items), f"generation_id={local_generation_id}")
 
         for uid in unique_user_ids:
@@ -5227,6 +5234,133 @@ _direct_payload_sessions = {}
 _recent_direct_response_window = {}
 DIRECT_FOLLOWUP_WINDOW_SECONDS = 60
 
+CONSUMED_MESSAGE_TTL_SECONDS = 15 * 60
+_consumed_messages = {}
+_loop_guard_last_send = {}
+
+def _route_log_ids(message: discord.Message) -> str:
+    guild_id = message.guild.id if message.guild else 0
+    channel_id = message.channel.id if message.channel else 0
+    user_id = message.author.id if message.author else 0
+    message_id = getattr(message, "id", 0)
+    return f"guild_id={guild_id} channel_id={channel_id} user_id={user_id} message_id={message_id}"
+
+def _cleanup_consumed_messages(now: datetime = None):
+    now = now or datetime.now(timezone.utc)
+    expired_ids = [
+        message_id
+        for message_id, record in _consumed_messages.items()
+        if (now - record.get("timestamp", now)).total_seconds() > CONSUMED_MESSAGE_TTL_SECONDS
+    ]
+    for message_id in expired_ids:
+        _consumed_messages.pop(message_id, None)
+
+def _log_response_route_selected(route: str, message: discord.Message):
+    logging.info(f"response_route_selected route={route} {_route_log_ids(message)}")
+
+def _mark_message_consumed(message: discord.Message, route: str):
+    now = datetime.now(timezone.utc)
+    _cleanup_consumed_messages(now)
+    message_id = getattr(message, "id", None)
+    if message_id is None:
+        return
+    _consumed_messages[message_id] = {
+        "message_id": message_id,
+        "guild_id": message.guild.id if message.guild else 0,
+        "channel_id": message.channel.id if message.channel else 0,
+        "user_id": message.author.id if message.author else 0,
+        "route": route,
+        "timestamp": now,
+    }
+    logging.info(f"message_consumed route={route} {_route_log_ids(message)}")
+
+def _is_message_consumed(message: discord.Message) -> bool:
+    _cleanup_consumed_messages()
+    message_id = getattr(message, "id", None)
+    return message_id in _consumed_messages if message_id is not None else False
+
+def _skip_consumed_message_for_route(message: discord.Message, route: str) -> bool:
+    if _is_message_consumed(message):
+        logging.info(f"route_skipped_consumed_message route={route} {_route_log_ids(message)}")
+        return True
+    return False
+
+def _loop_guard_key(route: str, guild_id: int, channel_id: int, user_id: int = 0):
+    return (route, guild_id or 0, channel_id or 0, user_id or 0)
+
+def _consumed_message_ids_for_guard(route: str, guild_id: int, channel_id: int, user_id: int = 0) -> set:
+    _cleanup_consumed_messages()
+
+    def _matching_ids(require_route: bool) -> set:
+        ids = set()
+        for message_id, record in _consumed_messages.items():
+            if require_route and record.get("route") != route:
+                continue
+            if record.get("guild_id") != (guild_id or 0) or record.get("channel_id") != (channel_id or 0):
+                continue
+            if user_id and record.get("user_id") != user_id:
+                continue
+            ids.add(message_id)
+        return ids
+
+    route_ids = _matching_ids(True)
+    return route_ids or _matching_ids(False)
+
+def _loop_guard_allows_send(route: str, guild_id: int, channel_id: int, user_id: int = 0) -> bool:
+    key = _loop_guard_key(route, guild_id, channel_id, user_id)
+    consumed_ids = _consumed_message_ids_for_guard(route, guild_id, channel_id, user_id)
+    sent_ids = _loop_guard_last_send.get(key, set())
+    if consumed_ids - sent_ids:
+        logging.info(f"loop_guard_send_allowed reason=new_user_input route={route}")
+        return True
+    logging.info(f"loop_guard_tripped reason=no_new_user_input route={route}")
+    return False
+
+def _loop_guard_mark_sent(route: str, guild_id: int, channel_id: int, user_id: int = 0):
+    key = _loop_guard_key(route, guild_id, channel_id, user_id)
+    _loop_guard_last_send[key] = _consumed_message_ids_for_guard(route, guild_id, channel_id, user_id)
+
+def _route_from_message_context(channel_allows_conversation: bool, real_direct_target: bool, followup_candidate: bool) -> str:
+    if real_direct_target:
+        return "direct_immediate"
+    if followup_candidate:
+        return "recent_followup"
+    if channel_allows_conversation:
+        return "conversation_allowed"
+    return "ambient"
+
+async def _send_reply_with_loop_guard(message: discord.Message, route: str, content: str, **kwargs) -> bool:
+    if not _loop_guard_allows_send(route, message.guild.id, message.channel.id, message.author.id):
+        return False
+    await message.reply(content, **kwargs)
+    _loop_guard_mark_sent(route, message.guild.id, message.channel.id, message.author.id)
+    return True
+
+async def _send_channel_with_loop_guard(channel: discord.TextChannel, route: str, content: str, user_id: int = 0, **kwargs) -> bool:
+    guild_id = channel.guild.id if channel.guild else 0
+    if not _loop_guard_allows_send(route, guild_id, channel.id, user_id):
+        return False
+    await channel.send(content, **kwargs)
+    _loop_guard_mark_sent(route, guild_id, channel.id, user_id)
+    return True
+
+def _mark_route_message_consumed(message: discord.Message, route: str):
+    _log_response_route_selected(route, message)
+    _mark_message_consumed(message, route)
+
+def _infer_gemini_call_route(route: str) -> str:
+    if route and route != "unknown":
+        return route
+    frame = sys._getframe(2)
+    while frame:
+        if frame.f_code.co_name == "_generate_direct_payload_session":
+            return "direct_session"
+        frame = frame.f_back
+    return route or "unknown"
+
+def _log_gemini_call_route(route: str):
+    logging.info(f"gemini_call_route={_infer_gemini_call_route(route)}")
+
 def _mark_recent_direct_response(channel_id: int, user_id: int):
     _recent_direct_response_window[(channel_id, user_id)] = datetime.now(timezone.utc)
 
@@ -5464,6 +5598,8 @@ async def on_message(message: discord.Message):
     session_key = _direct_session_key(message)
     active_direct_session = _direct_payload_sessions.get(session_key)
     if active_direct_session and not getattr(message.author, "bot", False):
+        if _skip_consumed_message_for_route(message, "direct_session"):
+            return
         explicit_new_direct_request = real_direct_target
         if explicit_new_direct_request:
             active_direct_session["completed"] = True
@@ -5472,6 +5608,7 @@ async def on_message(message: discord.Message):
         elif not message.content.startswith("/"):
             line = (message.content or "").strip()
             if line:
+                _mark_route_message_consumed(message, "direct_session")
                 active_direct_session["payload_lines"].append(line)
                 active_direct_session["last_payload_at"] = datetime.now(timezone.utc)
                 active_direct_session["hard_deadline"] = datetime.now(timezone.utc) + timedelta(seconds=DIRECT_PAYLOAD_HARD_CAP_SECONDS)
@@ -5488,6 +5625,7 @@ async def on_message(message: discord.Message):
 
     active_same_user_session = bool(_direct_payload_sessions.get(session_key))
     message_should_enter_conversation = bool(clean_content and (channel_allows_conversation or real_direct_target or followup_candidate or active_same_user_session))
+    selected_response_route = _route_from_message_context(channel_allows_conversation, real_direct_target, followup_candidate)
     logging.info(f"response_route_active_session active={int(active_same_user_session)}")
     if message_should_enter_conversation:
         if channel_allows_conversation and not real_direct_target:
@@ -5533,7 +5671,7 @@ async def on_message(message: discord.Message):
     # ---------------- ACTIVE CHANNEL ----------------
     if should_handle_as_active_channel:
         if not clean_content and message_should_enter_conversation:
-            await message.reply("You pinged me. How may I assist with BARCODE operations?")
+            await _send_reply_with_loop_guard(message, route, "You pinged me. How may I assist with BARCODE operations?")
             return
         if not clean_content:
             return
@@ -5543,6 +5681,10 @@ async def on_message(message: discord.Message):
 
         # Mentions/replies -> immediate response (not batched)
         if message_should_enter_conversation:
+            route = selected_response_route
+            if _skip_consumed_message_for_route(message, route):
+                return
+            _mark_route_message_consumed(message, route)
             direct_content, direct_payload_items = clean_content, _collect_inline_direct_payload_items(clean_content)
             sealed_recall_guard = get_sealed_test_recall_guard_response(
                 channel_policy,
@@ -5551,7 +5693,8 @@ async def on_message(message: discord.Message):
                 message.channel.id,
             )
             if sealed_recall_guard:
-                await message.reply(sealed_recall_guard)
+                _log_response_route_selected("memory_recall", message)
+                await _send_reply_with_loop_guard(message, "memory_recall", sealed_recall_guard)
                 return
 
             restricted_recall_guard = get_restricted_channel_recall_guard_response(
@@ -5561,7 +5704,8 @@ async def on_message(message: discord.Message):
                 message.channel.id,
             )
             if restricted_recall_guard:
-                await message.reply(restricted_recall_guard)
+                _log_response_route_selected("memory_recall", message)
+                await _send_reply_with_loop_guard(message, "memory_recall", restricted_recall_guard)
                 return
             if _channel_generating[message.channel.id]:
                 _channel_preempted_generation_id[message.channel.id] = _channel_generation_id[message.channel.id]
@@ -5578,25 +5722,28 @@ async def on_message(message: discord.Message):
                 _log_batch_event(logging.INFO, "skip", message.guild.id, message.channel.id, pending_count, "direct_reply_preempts_batch")
             repair = try_repair_response(direct_content)
             if repair:
+                _log_response_route_selected("repair", message)
                 if not is_sealed_test_channel:
                     save_model_message(message.author.id, message.guild.id, repair, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy)
-                await message.reply(repair)
+                await _send_reply_with_loop_guard(message, "repair", repair)
                 return
 
             self_reflection = try_self_reflection_response(message.author.id, message.guild.id, direct_content)
             if self_reflection:
+                _log_response_route_selected("self_reflection", message)
                 if not is_privileged_member(message.author, message.guild):
                     self_reflection = "Status reports are restricted to server owner/mod operators."
                 if not is_sealed_test_channel:
                     save_model_message(message.author.id, message.guild.id, self_reflection, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy)
-                await message.reply(self_reflection)
+                await _send_reply_with_loop_guard(message, "self_reflection", self_reflection)
                 return
 
             memory_recall = try_memory_recall_response(message.author.id, message.guild.id, direct_content)
             if memory_recall:
+                _log_response_route_selected("memory_recall", message)
                 if not is_sealed_test_channel:
                     save_model_message(message.author.id, message.guild.id, memory_recall, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy)
-                await message.reply(memory_recall)
+                await _send_reply_with_loop_guard(message, "memory_recall", memory_recall)
                 return
 
             payload_expected, _ = _detect_request_payload_expectation(direct_content)
@@ -5627,6 +5774,7 @@ async def on_message(message: discord.Message):
                     "last_bot_response_at": None,
                 }
                 _direct_payload_sessions[session_key] = session
+                _mark_route_message_consumed(message, "direct_session")
                 session["timer_task"] = asyncio.create_task(_direct_session_timer(session_key))
                 logging.info("direct_payload_session_created")
                 return
@@ -5644,9 +5792,11 @@ async def on_message(message: discord.Message):
 
             payload_expected, _ = _detect_request_payload_expectation(direct_content)
             await _apply_direct_response_pacing(payload_expected, len(direct_payload_items))
+            if not _loop_guard_allows_send(route, message.guild.id, message.channel.id, message.author.id):
+                return
             async with message.channel.typing():
                 logging.info(f"direct_payload_generation_started payload_count={len(direct_payload_items)}")
-                response = await get_gemini_response(prompt, message.author.id, message.guild.id)
+                response = await get_gemini_response(prompt, message.author.id, message.guild.id, route=route)
             if response and direct_payload_items:
                 missing_items = _missing_request_payload_items(direct_payload_items, response)
                 logging.info(f"direct_payload_completion_check missing_count={len(missing_items)}")
@@ -5657,7 +5807,7 @@ async def on_message(message: discord.Message):
                         + "Missing required payload items: " + ", ".join(missing_items) + "."
                     )
                     async with message.channel.typing():
-                        response = await get_gemini_response(correction_prompt, message.author.id, message.guild.id)
+                        response = await get_gemini_response(correction_prompt, message.author.id, message.guild.id, route=route)
                     missing_items = _missing_request_payload_items(direct_payload_items, response or "")
                     logging.info(f"direct_payload_completion_regenerated missing_count={len(missing_items)}")
                     if missing_items:
@@ -5669,7 +5819,7 @@ async def on_message(message: discord.Message):
             logging.info(f"direct_payload_generation_complete payload_count={len(direct_payload_items)}")
 
             if not response:
-                await message.reply("[NETWORK ERROR] Temporary synchronization issue. Try again.")
+                await _send_reply_with_loop_guard(message, route, "[NETWORK ERROR] Temporary synchronization issue. Try again.")
                 return
 
             if not is_sealed_test_channel:
@@ -5679,10 +5829,10 @@ async def on_message(message: discord.Message):
                 set_last_greeting_at(message.author.id, message.guild.id, datetime.now(PACIFIC_TZ).isoformat())
 
             if len(response) <= 2000:
-                await message.reply(response)
+                await _send_reply_with_loop_guard(message, route, response)
             else:
                 chunks = split_message(response)
-                await message.reply(chunks[0] + "...")
+                await _send_reply_with_loop_guard(message, route, chunks[0] + "...")
                 for chunk in chunks[1:]:
                     await message.channel.send("..." + chunk)
             _mark_recent_direct_response(message.channel.id, message.author.id)
@@ -5690,6 +5840,8 @@ async def on_message(message: discord.Message):
 
         # Non-mention in active channel -> batch (kill-switched by env)
         if not BNL_ACTIVE_BATCHING_ENABLED:
+            return
+        if _skip_consumed_message_for_route(message, "active_batch"):
             return
         if active_test_free_speak:
             logging.info(f"[conversation] guild_id={message.guild.id} channel_id={message.channel.id} reason=sealed_test_free_speak")
@@ -5712,6 +5864,7 @@ async def on_message(message: discord.Message):
                 len(_channel_buffers[message.channel.id]) + 1,
                 "new_message_while_generating",
             )
+        _mark_route_message_consumed(message, "active_batch")
         _channel_buffers[message.channel.id].append((message.author.display_name, clean_content, message.author.id))
         _channel_last_message_at[message.channel.id] = datetime.now(PACIFIC_TZ)
         if len(_channel_buffers[message.channel.id]) >= BATCH_MAX_MESSAGES:
@@ -5725,8 +5878,13 @@ async def on_message(message: discord.Message):
         if not real_direct_target:
             return
 
+        route = "direct_immediate"
+        if _skip_consumed_message_for_route(message, route):
+            return
+        _mark_route_message_consumed(message, route)
+
         if not clean_content:
-            await message.reply("I monitor this channel passively. My active operations are in the designated liaison channel.")
+            await _send_reply_with_loop_guard(message, route, "I monitor this channel passively. My active operations are in the designated liaison channel.")
             return
         direct_content, direct_payload_items = clean_content, _collect_inline_direct_payload_items(clean_content)
         sealed_recall_guard = get_sealed_test_recall_guard_response(
@@ -5736,7 +5894,8 @@ async def on_message(message: discord.Message):
             message.channel.id,
         )
         if sealed_recall_guard:
-            await message.reply(sealed_recall_guard)
+            _log_response_route_selected("memory_recall", message)
+            await _send_reply_with_loop_guard(message, "memory_recall", sealed_recall_guard)
             return
 
         restricted_recall_guard = get_restricted_channel_recall_guard_response(
@@ -5746,7 +5905,8 @@ async def on_message(message: discord.Message):
             message.channel.id,
         )
         if restricted_recall_guard:
-            await message.reply(restricted_recall_guard)
+            _log_response_route_selected("memory_recall", message)
+            await _send_reply_with_loop_guard(message, "memory_recall", restricted_recall_guard)
             return
 
         if not is_sealed_test_channel:
@@ -5754,22 +5914,25 @@ async def on_message(message: discord.Message):
 
         repair = try_repair_response(direct_content)
         if repair:
+            _log_response_route_selected("repair", message)
             save_model_message(message.author.id, message.guild.id, repair)
-            await message.reply(repair)
+            await _send_reply_with_loop_guard(message, "repair", repair)
             return
 
         self_reflection = try_self_reflection_response(message.author.id, message.guild.id, direct_content)
         if self_reflection:
+            _log_response_route_selected("self_reflection", message)
             if not is_privileged_member(message.author, message.guild):
                 self_reflection = "Status reports are restricted to server owner/mod operators."
             save_model_message(message.author.id, message.guild.id, self_reflection)
-            await message.reply(self_reflection)
+            await _send_reply_with_loop_guard(message, "self_reflection", self_reflection)
             return
 
         memory_recall = try_memory_recall_response(message.author.id, message.guild.id, direct_content)
         if memory_recall:
+            _log_response_route_selected("memory_recall", message)
             save_model_message(message.author.id, message.guild.id, memory_recall)
-            await message.reply(memory_recall)
+            await _send_reply_with_loop_guard(message, "memory_recall", memory_recall)
             return
 
         prompt, allow_greeting, style_key = build_user_aware_prompt(
@@ -5785,9 +5948,11 @@ async def on_message(message: discord.Message):
 
         payload_expected, _ = _detect_request_payload_expectation(direct_content)
         await _apply_direct_response_pacing(payload_expected, len(direct_payload_items))
+        if not _loop_guard_allows_send(route, message.guild.id, message.channel.id, message.author.id):
+            return
         async with message.channel.typing():
             logging.info(f"direct_payload_generation_started payload_count={len(direct_payload_items)}")
-            response = await get_gemini_response(prompt, message.author.id, message.guild.id)
+            response = await get_gemini_response(prompt, message.author.id, message.guild.id, route=route)
         if response and direct_payload_items:
             missing_items = _missing_request_payload_items(direct_payload_items, response)
             logging.info(f"direct_payload_completion_check missing_count={len(missing_items)}")
@@ -5798,7 +5963,7 @@ async def on_message(message: discord.Message):
                     + "Missing required payload items: " + ", ".join(missing_items) + "."
                 )
                 async with message.channel.typing():
-                    response = await get_gemini_response(correction_prompt, message.author.id, message.guild.id)
+                    response = await get_gemini_response(correction_prompt, message.author.id, message.guild.id, route=route)
                 missing_items = _missing_request_payload_items(direct_payload_items, response or "")
                 logging.info(f"direct_payload_completion_regenerated missing_count={len(missing_items)}")
                 if missing_items:
@@ -5810,7 +5975,7 @@ async def on_message(message: discord.Message):
         logging.info(f"direct_payload_generation_complete payload_count={len(direct_payload_items)}")
 
         if not response:
-            await message.reply("[NETWORK ERROR] Temporary synchronization issue. Try again.")
+            await _send_reply_with_loop_guard(message, route, "[NETWORK ERROR] Temporary synchronization issue. Try again.")
             return
 
         save_model_message(message.author.id, message.guild.id, response)
@@ -5819,10 +5984,10 @@ async def on_message(message: discord.Message):
             set_last_greeting_at(message.author.id, message.guild.id, datetime.now(PACIFIC_TZ).isoformat())
 
         if len(response) <= 2000:
-            await message.reply(response)
+            await _send_reply_with_loop_guard(message, route, response)
         else:
             chunks = split_message(response)
-            await message.reply(chunks[0] + "...")
+            await _send_reply_with_loop_guard(message, route, chunks[0] + "...")
             for chunk in chunks[1:]:
                 await message.channel.send("..." + chunk)
         _mark_recent_direct_response(message.channel.id, message.author.id)
@@ -5830,8 +5995,12 @@ async def on_message(message: discord.Message):
 
     # ---------------- NO ACTIVE CHANNEL SET (RESPOND TO MENTIONS/REPLIES ANYWHERE) ----------------
     if active_channel_id is None and message_should_enter_conversation:
+        route = selected_response_route
+        if _skip_consumed_message_for_route(message, route):
+            return
+        _mark_route_message_consumed(message, route)
         if not clean_content:
-            await message.reply("You pinged me. How may I assist with BARCODE operations?")
+            await _send_reply_with_loop_guard(message, route, "You pinged me. How may I assist with BARCODE operations?")
             return
         direct_content, direct_payload_items = clean_content, _collect_inline_direct_payload_items(clean_content)
         sealed_recall_guard = get_sealed_test_recall_guard_response(
@@ -5841,7 +6010,8 @@ async def on_message(message: discord.Message):
             message.channel.id,
         )
         if sealed_recall_guard:
-            await message.reply(sealed_recall_guard)
+            _log_response_route_selected("memory_recall", message)
+            await _send_reply_with_loop_guard(message, "memory_recall", sealed_recall_guard)
             return
 
         restricted_recall_guard = get_restricted_channel_recall_guard_response(
@@ -5851,7 +6021,8 @@ async def on_message(message: discord.Message):
             message.channel.id,
         )
         if restricted_recall_guard:
-            await message.reply(restricted_recall_guard)
+            _log_response_route_selected("memory_recall", message)
+            await _send_reply_with_loop_guard(message, "memory_recall", restricted_recall_guard)
             return
 
         if not is_sealed_test_channel:
@@ -5859,22 +6030,25 @@ async def on_message(message: discord.Message):
 
         repair = try_repair_response(direct_content)
         if repair:
+            _log_response_route_selected("repair", message)
             save_model_message(message.author.id, message.guild.id, repair)
-            await message.reply(repair if len(repair) <= 2000 else repair[:1900] + "...")
+            await _send_reply_with_loop_guard(message, "repair", repair if len(repair) <= 2000 else repair[:1900] + "...")
             return
 
         self_reflection = try_self_reflection_response(message.author.id, message.guild.id, direct_content)
         if self_reflection:
+            _log_response_route_selected("self_reflection", message)
             if not is_privileged_member(message.author, message.guild):
                 self_reflection = "Status reports are restricted to server owner/mod operators."
             save_model_message(message.author.id, message.guild.id, self_reflection)
-            await message.reply(self_reflection if len(self_reflection) <= 2000 else self_reflection[:1900] + "...")
+            await _send_reply_with_loop_guard(message, "self_reflection", self_reflection if len(self_reflection) <= 2000 else self_reflection[:1900] + "...")
             return
 
         memory_recall = try_memory_recall_response(message.author.id, message.guild.id, direct_content)
         if memory_recall:
+            _log_response_route_selected("memory_recall", message)
             save_model_message(message.author.id, message.guild.id, memory_recall)
-            await message.reply(memory_recall if len(memory_recall) <= 2000 else memory_recall[:1900] + "...")
+            await _send_reply_with_loop_guard(message, "memory_recall", memory_recall if len(memory_recall) <= 2000 else memory_recall[:1900] + "...")
             return
 
         prompt, allow_greeting, style_key = build_user_aware_prompt(
@@ -5890,9 +6064,11 @@ async def on_message(message: discord.Message):
 
         payload_expected, _ = _detect_request_payload_expectation(direct_content)
         await _apply_direct_response_pacing(payload_expected, len(direct_payload_items))
+        if not _loop_guard_allows_send(route, message.guild.id, message.channel.id, message.author.id):
+            return
         async with message.channel.typing():
             logging.info(f"direct_payload_generation_started payload_count={len(direct_payload_items)}")
-            response = await get_gemini_response(prompt, message.author.id, message.guild.id)
+            response = await get_gemini_response(prompt, message.author.id, message.guild.id, route=route)
         if response and direct_payload_items:
             missing_items = _missing_request_payload_items(direct_payload_items, response)
             logging.info(f"direct_payload_completion_check missing_count={len(missing_items)}")
@@ -5903,7 +6079,7 @@ async def on_message(message: discord.Message):
                     + "Missing required payload items: " + ", ".join(missing_items) + "."
                 )
                 async with message.channel.typing():
-                    response = await get_gemini_response(correction_prompt, message.author.id, message.guild.id)
+                    response = await get_gemini_response(correction_prompt, message.author.id, message.guild.id, route=route)
                 missing_items = _missing_request_payload_items(direct_payload_items, response or "")
                 logging.info(f"direct_payload_completion_regenerated missing_count={len(missing_items)}")
                 if missing_items:
@@ -5915,7 +6091,7 @@ async def on_message(message: discord.Message):
         logging.info(f"direct_payload_generation_complete payload_count={len(direct_payload_items)}")
 
         if not response:
-            await message.reply("[NETWORK ERROR] Temporary synchronization issue. Try again.")
+            await _send_reply_with_loop_guard(message, route, "[NETWORK ERROR] Temporary synchronization issue. Try again.")
             return
 
         save_model_message(message.author.id, message.guild.id, response)
@@ -5923,7 +6099,7 @@ async def on_message(message: discord.Message):
         if allow_greeting:
             set_last_greeting_at(message.author.id, message.guild.id, datetime.now(PACIFIC_TZ).isoformat())
 
-        await message.reply(response if len(response) <= 2000 else response[:1900] + "...")
+        await _send_reply_with_loop_guard(message, route, response if len(response) <= 2000 else response[:1900] + "...")
         _mark_recent_direct_response(message.channel.id, message.author.id)
         return
 
