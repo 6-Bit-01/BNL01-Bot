@@ -37,6 +37,8 @@ from google import genai
 #   export GEMINI_API_KEY="..."
 #   export DISCORD_BOT_TOKEN="..."
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip() or "gemini-2.5-flash"
+GEMINI_FALLBACK_MODEL = os.getenv("GEMINI_FALLBACK_MODEL", "gemini-2.5-flash-lite").strip() or "gemini-2.5-flash-lite"
 DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 BNL_API_KEY = os.getenv("BNL_API_KEY")
 BNL_STATUS_URL = os.getenv("BNL_STATUS_URL")
@@ -3065,11 +3067,46 @@ def _extract_text_and_tokens(response):
     except Exception:
         return "", None
 
-async def get_gemini_response(prompt: str, user_id: int, guild_id: int):
-    def _is_gemini_503(exc: Exception) -> bool:
-        msg = str(exc or "").lower()
-        return ("503" in msg and "unavailable" in msg) or "service unavailable" in msg
+def _is_gemini_503(exc: Exception) -> bool:
+    msg = str(exc or "").lower()
+    return ("503" in msg and "unavailable" in msg) or "service unavailable" in msg
 
+def _gemini_model_resource_name(model_name: str) -> str:
+    model_name = (model_name or "").strip()
+    if model_name.startswith("models/"):
+        return model_name
+    return f"models/{model_name}"
+
+def _generate_gemini_content_with_fallback(contents: str, route: str):
+    logging.info(f"gemini_model_attempt model={GEMINI_MODEL} route={route}")
+    try:
+        return gemini_client.models.generate_content(
+            model=_gemini_model_resource_name(GEMINI_MODEL),
+            contents=contents
+        )
+    except Exception as primary_error:
+        if not _is_gemini_503(primary_error):
+            raise
+
+        logging.warning(
+            f"gemini_primary_unavailable_trying_fallback primary={GEMINI_MODEL} "
+            f"fallback={GEMINI_FALLBACK_MODEL} reason=gemini_503"
+        )
+        logging.info(f"gemini_model_attempt model={GEMINI_FALLBACK_MODEL} route={route}")
+        try:
+            response = gemini_client.models.generate_content(
+                model=_gemini_model_resource_name(GEMINI_FALLBACK_MODEL),
+                contents=contents
+            )
+            logging.info(f"gemini_fallback_succeeded fallback={GEMINI_FALLBACK_MODEL}")
+            return response
+        except Exception as fallback_error:
+            if _is_gemini_503(fallback_error):
+                logging.error(f"gemini_fallback_failed fallback={GEMINI_FALLBACK_MODEL} reason=gemini_503")
+                logging.error("direct_generation_failed reason=gemini_503")
+            raise
+
+async def get_gemini_response(prompt: str, user_id: int, guild_id: int, route: str = "get_gemini_response"):
     try:
         if not check_quota_availability():
             tokens_used, _ = get_usage_stats()
@@ -3109,25 +3146,7 @@ async def get_gemini_response(prompt: str, user_id: int, guild_id: int):
 
         User: {prompt}
         BNL-01:"""
-        try:
-            response = gemini_client.models.generate_content(
-                model="models/gemini-2.5-flash",
-                contents=request_contents
-            )
-        except Exception as e:
-            if _is_gemini_503(e):
-                await asyncio.sleep(0.8)
-                try:
-                    response = gemini_client.models.generate_content(
-                        model="models/gemini-2.5-flash",
-                        contents=request_contents
-                    )
-                except Exception as retry_error:
-                    if _is_gemini_503(retry_error):
-                        logging.error("direct_generation_failed reason=gemini_503")
-                    raise
-            else:
-                raise
+        response = _generate_gemini_content_with_fallback(request_contents, route)
 
         text, tokens = _extract_text_and_tokens(response)
 
@@ -3156,10 +3175,7 @@ async def get_gemini_response(prompt: str, user_id: int, guild_id: int):
         {text}
         """
 
-            glitch_response = gemini_client.models.generate_content(
-                model="models/gemini-2.5-flash",
-                contents=glitch_prompt
-            )
+            glitch_response = _generate_gemini_content_with_fallback(glitch_prompt, "glitch_rewrite")
 
             glitch_text, _ = _extract_text_and_tokens(glitch_response)
 
@@ -3188,10 +3204,7 @@ async def get_gemini_response(prompt: str, user_id: int, guild_id: int):
         {text}
         """
 
-            bleed_response = gemini_client.models.generate_content(
-                model="models/gemini-2.5-flash",
-                contents=bleed_prompt
-            )
+            bleed_response = _generate_gemini_content_with_fallback(bleed_prompt, "cross_universe_bleed")
             bleed_text, _ = _extract_text_and_tokens(bleed_response)
             if bleed_text:
                 text = bleed_text
