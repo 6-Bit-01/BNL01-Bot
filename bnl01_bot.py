@@ -5232,6 +5232,62 @@ def _collect_inline_direct_payload_items(clean_content: str):
     return unique
 
 
+def _is_direct_session_delta_continuation_text(text: str) -> bool:
+    t = (text or "").strip().lower()
+    if not t:
+        return False
+    delta_patterns = [
+        r"^also\s+(?:add|include)\b",
+        r"^(?:add|include)\b.+\btoo\b",
+        r"^(?:and\s+)?(?:add|include)\b",
+        r"^forgot\b",
+        r"^(?:i\s+)?forgot\b",
+        r"^one\s+more\b",
+        r"^another\s+one\b",
+        r"^plus\b",
+    ]
+    return any(re.search(pattern, t) for pattern in delta_patterns)
+
+
+def _is_clear_new_direct_request_after_commit(text: str) -> bool:
+    t = (text or "").strip().lower()
+    if not t:
+        return False
+    if _is_direct_session_delta_continuation_text(t):
+        return False
+
+    strong_request_patterns = [
+        r"\btell\s+me\b",
+        r"^(?:please\s+)?write\b",
+        r"^(?:please\s+)?make\b",
+        r"\bredo\b",
+        r"\btry\s+again\b",
+        r"\bdo\s+it\s+again\b",
+        r"\bturn\s+this\s+into\b",
+        r"^(?:please\s+)?summarize\b",
+        r"^(?:please\s+)?explain\b",
+        r"^(?:please\s+)?create\b",
+    ]
+    if any(re.search(pattern, t) for pattern in strong_request_patterns):
+        return True
+
+    token_count = len([tok for tok in re.split(r"\s+", t) if tok])
+    contextual_request_patterns = [
+        r"\bone\s+joke\b",
+        r"\btogether\b",
+        r"\bcombine\b",
+        r"\bcombined\b",
+        r"\blist\b",
+    ]
+    if any(re.search(pattern, t) for pattern in contextual_request_patterns):
+        request_intent, _ = _detect_request_intent(t)
+        payload_expected, _ = _detect_request_payload_expectation(t)
+        if request_intent or payload_expected or token_count >= 3:
+            return True
+
+    return False
+
+
 def _direct_session_key(message: discord.Message):
     return (message.guild.id if message.guild else 0, message.channel.id, message.author.id)
 
@@ -5498,19 +5554,42 @@ async def on_message(message: discord.Message):
         elif not message.content.startswith("/"):
             line = (message.content or "").strip()
             if line:
-                active_direct_session["payload_lines"].append(line)
-                active_direct_session["last_payload_at"] = datetime.now(timezone.utc)
-                active_direct_session["hard_deadline"] = datetime.now(timezone.utc) + timedelta(seconds=DIRECT_PAYLOAD_HARD_CAP_SECONDS)
-                active_direct_session["revision"] = int(active_direct_session.get("revision", 0)) + 1
-                if active_direct_session.get("generating"):
-                    active_direct_session["generation_invalidated"] = True
-                    logging.info(f"direct_payload_session_generation_invalidated payload_count={len(active_direct_session['payload_lines'])} reason=new_payload_during_generation")
-                logging.info(f"direct_payload_session_payload_added payload_count={len(active_direct_session['payload_lines'])}")
-                logging.info(f"direct_session_quiet_wait_reset payload_count={len(active_direct_session['payload_lines'])}")
-                logging.info("conversational_continuation_detected reason=active_request")
-                logging.info("response_route_active_session active=1")
-                logging.info("response_route_decision route=active_session reason=direct_payload_continuation")
-                return
+                session_already_committed = bool(
+                    active_direct_session.get("last_bot_response_at")
+                    or int(active_direct_session.get("last_committed_payload_count", 0)) > 0
+                )
+                if session_already_committed and _is_clear_new_direct_request_after_commit(clean_content or line):
+                    payload_count = len(active_direct_session.get("payload_lines", []))
+                    last_committed_payload_count = int(active_direct_session.get("last_committed_payload_count", 0))
+                    logging.info(
+                        "direct_session_new_request_after_commit_detected "
+                        f"payload_count={payload_count};last_committed_payload_count={last_committed_payload_count}"
+                    )
+                    active_direct_session["completed"] = True
+                    _direct_payload_sessions.pop(session_key, None)
+                    logging.info(
+                        "direct_session_closed_for_new_request "
+                        f"payload_count={payload_count};last_committed_payload_count={last_committed_payload_count}"
+                    )
+                else:
+                    active_direct_session["payload_lines"].append(line)
+                    active_direct_session["last_payload_at"] = datetime.now(timezone.utc)
+                    active_direct_session["hard_deadline"] = datetime.now(timezone.utc) + timedelta(seconds=DIRECT_PAYLOAD_HARD_CAP_SECONDS)
+                    active_direct_session["revision"] = int(active_direct_session.get("revision", 0)) + 1
+                    if active_direct_session.get("generating"):
+                        active_direct_session["generation_invalidated"] = True
+                        logging.info(f"direct_payload_session_generation_invalidated payload_count={len(active_direct_session['payload_lines'])} reason=new_payload_during_generation")
+                    logging.info(f"direct_payload_session_payload_added payload_count={len(active_direct_session['payload_lines'])}")
+                    logging.info(f"direct_session_quiet_wait_reset payload_count={len(active_direct_session['payload_lines'])}")
+                    if session_already_committed:
+                        logging.info(
+                            "direct_session_delta_continuation_kept "
+                            f"payload_count={len(active_direct_session['payload_lines'])};last_committed_payload_count={int(active_direct_session.get('last_committed_payload_count', 0))}"
+                        )
+                    logging.info("conversational_continuation_detected reason=active_request")
+                    logging.info("response_route_active_session active=1")
+                    logging.info("response_route_decision route=active_session reason=direct_payload_continuation")
+                    return
 
     active_same_user_session = bool(_direct_payload_sessions.get(session_key))
     message_should_enter_conversation = bool(clean_content and (channel_allows_conversation or real_direct_target or followup_candidate or active_same_user_session))
