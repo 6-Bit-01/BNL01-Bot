@@ -5257,6 +5257,84 @@ def _direct_session_is_expired(session) -> bool:
     return (datetime.now(timezone.utc) - last_bot_response_at).total_seconds() > DIRECT_FOLLOWUP_WINDOW_SECONDS
 
 
+def _is_ack_after_committed_direct_response(text: str) -> bool:
+    cleaned = re.sub(r"\s+", " ", (text or "").strip().lower())
+    if not cleaned:
+        return False
+    normalized = re.sub(r"[^a-z0-9\s']+", " ", cleaned)
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    if not normalized:
+        return False
+
+    addition_prefixes = (
+        "add ",
+        "also add ",
+        "include ",
+        "also include ",
+        "forgot ",
+        "i forgot ",
+        "one more ",
+        "one more:",
+    )
+    if (
+        cleaned.startswith(addition_prefixes)
+        or (normalized.endswith(" too") and normalized.startswith(("include ", "add ")))
+    ):
+        return False
+
+    exact_acks = {
+        "haha",
+        "hahah",
+        "hahaha",
+        "lol",
+        "lmao",
+        "nice",
+        "good one",
+        "that was funny",
+        "thanks",
+        "thank you",
+        "cool",
+        "awesome",
+        "perfect",
+        "fire",
+        "dope",
+        "hell yeah",
+    }
+    if normalized in exact_acks:
+        return True
+
+    tokens = normalized.split()
+    if len(tokens) > 4 or len(normalized) > 48:
+        return False
+
+    ack_tokens = {
+        "haha",
+        "hahah",
+        "hahaha",
+        "lol",
+        "lmao",
+        "nice",
+        "thanks",
+        "thank",
+        "you",
+        "cool",
+        "awesome",
+        "perfect",
+        "fire",
+        "dope",
+        "good",
+        "one",
+        "that",
+        "was",
+        "funny",
+        "hell",
+        "yeah",
+    }
+    if all(token in ack_tokens or re.fullmatch(r"ha(?:ha)*h?", token) for token in tokens):
+        return True
+    return False
+
+
 async def _generate_direct_payload_session(session_key, reason: str):
     session = _direct_payload_sessions.get(session_key)
     if not session:
@@ -5490,13 +5568,23 @@ async def on_message(message: discord.Message):
     session_key = _direct_session_key(message)
     active_direct_session = _direct_payload_sessions.get(session_key)
     if active_direct_session and not getattr(message.author, "bot", False):
+        line = (message.content or "").strip()
+        already_committed_direct_response = bool(
+            active_direct_session.get("last_bot_response_at")
+            or int(active_direct_session.get("last_committed_payload_count", 0)) > 0
+        )
+        if line and already_committed_direct_response and _is_ack_after_committed_direct_response(line):
+            logging.info(
+                f"direct_session_ack_after_commit_ignored "
+                f"payload_count={len(active_direct_session.get('payload_lines', []))}"
+            )
+            return
         explicit_new_direct_request = real_direct_target
         if explicit_new_direct_request:
             active_direct_session["completed"] = True
             _direct_payload_sessions.pop(session_key, None)
             logging.info(f"direct_payload_session_expired payload_count={len(active_direct_session.get('payload_lines', []))} reason=new_direct_request")
         elif not message.content.startswith("/"):
-            line = (message.content or "").strip()
             if line:
                 active_direct_session["payload_lines"].append(line)
                 active_direct_session["last_payload_at"] = datetime.now(timezone.utc)
