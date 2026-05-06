@@ -5382,6 +5382,19 @@ async def _direct_session_timer(session_key):
                 _direct_payload_sessions.pop(session_key, None)
                 return
         if now >= session["hard_deadline"]:
+            payload_count = len(payload_lines)
+            last_committed_payload_count = int(session.get("last_committed_payload_count", 0))
+            revision = int(session.get("revision", 0))
+            last_committed_revision = int(session.get("last_committed_revision", 0))
+            if (
+                session.get("last_bot_response_at")
+                and payload_count == last_committed_payload_count
+                and revision == last_committed_revision
+            ):
+                logging.info("direct_session_timer_idle_committed_snapshot")
+                session["hard_deadline"] = now + timedelta(seconds=DIRECT_PAYLOAD_HARD_CAP_SECONDS)
+                await asyncio.sleep(0.2)
+                continue
             await _generate_direct_payload_session(session_key, "hard_cap")
             await asyncio.sleep(0.2)
             continue
