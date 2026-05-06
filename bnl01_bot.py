@@ -18,6 +18,7 @@ import sqlite3
 import logging
 import random
 import json
+import hashlib
 import urllib.request
 import urllib.error
 import urllib.parse
@@ -762,12 +763,182 @@ def _pick_weak_context_mode(guild_id: int) -> str:
     return mode
 
 
+LOW_SIGNAL_RELAY_ANGLES = (
+    "carrier_trace",
+    "network_posture",
+    "quiet_room_observation",
+    "residual_echo",
+    "question_formation",
+)
+
+LOW_SIGNAL_FORBIDDEN_PUBLIC_TERMS = (
+    "public_context_weak",
+    "no_recent_public_messages",
+    "ambient_comparable",
+    "internal",
+    "diagnostic",
+    "traceback",
+    "error",
+)
+
+
+def _low_signal_seed(guild_id: int, reason: str, recent_relay_messages: list[str]) -> int:
+    now_pt = datetime.now(PACIFIC_TZ)
+    interval = max(1, BNL_WEBSITE_RELAY_INTERVAL_MINUTES)
+    bucket_minute = (now_pt.minute // interval) * interval
+    seed_material = f"{guild_id}|{reason}|{now_pt:%Y%m%d%H}|{bucket_minute}|{'|'.join(recent_relay_messages[-4:])}"
+    return int(hashlib.sha256(seed_material.encode("utf-8", errors="ignore")).hexdigest()[:12], 16)
+
+
+def _format_recent_relay_messages_for_prompt(recent_relay_messages: list[str], limit: int = 5) -> str:
+    cleaned = []
+    for msg in recent_relay_messages[-limit:]:
+        text = clean_website_text(msg)[:220]
+        if text:
+            cleaned.append(text)
+    return " || ".join(cleaned) if cleaned else "none"
+
+
+def _sanitize_low_signal_candidate(message: str, guild_id: int, recent_relay_messages: list[str]) -> str:
+    line = (message or "").strip().splitlines()[0].strip() if message else ""
+    line = re.sub(r"^[-*\d.)\s]+", "", line).strip()
+    line = re.sub(r"^(message|relay|line)\s*:\s*", "", line, flags=re.IGNORECASE).strip()
+    line = line.strip('"\'`')
+    candidate = fit_complete_statement(line, limit=300, min_chars=0, fallback="")
+    if not candidate or len(candidate) > 300:
+        return ""
+    lowered = candidate.lower()
+    if candidate.endswith("...") or candidate.endswith("…"):
+        return ""
+    if any(term in lowered for term in LOW_SIGNAL_FORBIDDEN_PUBLIC_TERMS):
+        return ""
+    if _contains_stale_phrase(candidate):
+        return ""
+    recent_norm = {_normalize_for_repeat(m) for m in recent_relay_messages if m}
+    if _normalize_for_repeat(candidate) in recent_norm:
+        return ""
+    if _normalize_for_repeat(candidate) == _normalize_for_repeat(RELAY_WEAK_CONTEXT_STANDBY_MESSAGE):
+        return ""
+    if _is_repetitive_relay(guild_id, candidate):
+        return ""
+    return candidate
+
+
+def _build_low_signal_fallback_message(guild_id: int, reason: str, recent_relay_messages: list[str], relay_meta: dict) -> str:
+    seed = _low_signal_seed(guild_id, reason, recent_relay_messages)
+    has_public_residue = bool(
+        relay_meta.get("message_count")
+        or relay_meta.get("has_relay_context")
+        or (relay_meta.get("signal_summary") or "").strip()
+    )
+    angle_order = [a for a in LOW_SIGNAL_RELAY_ANGLES if has_public_residue or a != "residual_echo"]
+    start = seed % len(angle_order)
+    angle_order = angle_order[start:] + angle_order[:start]
+    bridge_terms = ["website bridge", "public relay bridge", "BARCODE relay"]
+    quiet_terms = ["public corridor", "eligible public channels", "outer room"]
+    filter_terms = ["relay filter", "public filter", "receiver filter"]
+
+    for offset, angle in enumerate(angle_order):
+        bridge = bridge_terms[(seed + offset) % len(bridge_terms)]
+        quiet = quiet_terms[(seed // 3 + offset) % len(quiet_terms)]
+        relay_filter = filter_terms[(seed // 5 + offset) % len(filter_terms)]
+        if angle == "carrier_trace":
+            candidate = f"The {bridge} is active, but the {quiet} is carrying thin signal right now."
+        elif angle == "network_posture":
+            candidate = f"BNL-01 is holding observation posture and refusing to turn quiet public channels into movement."
+        elif angle == "quiet_room_observation":
+            candidate = f"The room is quiet, not empty. BNL-01 is keeping the public relay open for signal that clears the filter."
+        elif angle == "residual_echo":
+            candidate = f"Recent public residue is still on the glass, but nothing fresh has cleared the {relay_filter} this pass."
+        else:
+            candidate = "A light question sits at the receiver edge: what becomes visible when the public signal is clear enough to name?"
+        cleaned = _sanitize_low_signal_candidate(candidate, guild_id, recent_relay_messages)
+        if cleaned:
+            return cleaned
+
+    repair = "Public signal is quiet. BNL-01 remains online and observing eligible BARCODE Network channels."
+    if recent_relay_messages and _normalize_for_repeat(repair) in {_normalize_for_repeat(m) for m in recent_relay_messages}:
+        repair = "The public corridor is quiet. BNL-01 is keeping the bridge active without inventing movement."
+    return repair
+
+
+async def build_low_signal_relay_message(guild_id: int, reason: str, recent_relay_messages: list[str], relay_meta: dict) -> str:
+    safe_reason = re.sub(r"[^a-zA-Z0-9_ -]", "", (reason or "public_context_weak"))[:80] or "public_context_weak"
+    recent_display = _format_recent_relay_messages_for_prompt(recent_relay_messages)
+    has_public_residue = bool(
+        relay_meta.get("message_count")
+        or relay_meta.get("has_relay_context")
+        or (relay_meta.get("signal_summary") or "").strip()
+    )
+    residual_rule = "Residual echo is allowed because source-safe recent public residue exists." if has_public_residue else "Do not choose residual echo; no source-safe recent public residue is available."
+    prompt = (
+        "You are generating a public BARCODE Network website relay line for BNL-01.\n\n"
+        "Truth state:\n"
+        "- Public Discord signal is weak.\n"
+        "- No fresh public event has cleared the relay filter.\n"
+        "- The website bridge is active.\n"
+        "- BNL-01 is observing eligible public channels only.\n"
+        f"- Reason: {safe_reason}.\n"
+        f"- Recent relay messages to avoid: {recent_display}.\n"
+        f"- {residual_rule}\n\n"
+        "Choose one truthful angle: carrier trace, network posture, quiet room observation, residual echo when allowed, or question formation.\n"
+        "Write one fresh public relay message in BNL-01's voice.\n\n"
+        "Rules:\n"
+        "- Do not invent activity.\n"
+        "- Do not mention user names unless provided in eligible current public context.\n"
+        "- Do not say the same thing as recent relay messages.\n"
+        "- Do not sound like an error message.\n"
+        "- Do not say waiting for movement in a default or repetitive way.\n"
+        "- No trailing ellipses.\n"
+        "- 1-2 complete sentences.\n"
+        "- Max 300 characters.\n"
+        "Return only the public relay message."
+    )
+
+    if GEMINI_API_KEY and check_quota_availability():
+        try:
+            response = await asyncio.to_thread(_generate_gemini_content_with_fallback, prompt, "website_low_signal_relay")
+            generated, tokens = _extract_text_and_tokens(response)
+            if tokens:
+                increment_token_usage(tokens)
+                logging.info(f"📊 Tokens used: {tokens}")
+            candidate = _sanitize_low_signal_candidate(generated, guild_id, recent_relay_messages)
+            if candidate:
+                logging.info(f"website_low_signal_relay_generated guild={guild_id} reason={safe_reason}")
+                return candidate
+            if generated:
+                logging.info(f"website_low_signal_relay_rejected guild={guild_id} reason={safe_reason}")
+        except Exception as e:
+            logging.warning(f"⚠️ Low-signal relay generation failed guild={guild_id} reason={safe_reason}: {e}")
+
+    fallback = _build_low_signal_fallback_message(guild_id, safe_reason, recent_relay_messages, relay_meta)
+    logging.info(f"website_low_signal_relay_fallback guild={guild_id} reason={safe_reason}")
+    return fallback
+
+
 def _weak_context_relay_message(guild_id: int, signal_summary: str, relay_context: str) -> str:
-    return RELAY_WEAK_CONTEXT_STANDBY_MESSAGE
+    recent_relay_messages = _recent_relay_messages.get(guild_id, [])[-5:]
+    return _build_low_signal_fallback_message(
+        guild_id,
+        "public_context_weak",
+        recent_relay_messages,
+        {"signal_summary": signal_summary, "has_relay_context": bool((relay_context or "").strip())},
+    )
 
 
 def _is_weak_context_fallback(message: str) -> bool:
-    return _normalize_for_repeat(message) == _normalize_for_repeat(RELAY_WEAK_CONTEXT_STANDBY_MESSAGE)
+    normalized = _normalize_for_repeat(message)
+    if normalized == _normalize_for_repeat(RELAY_WEAK_CONTEXT_STANDBY_MESSAGE):
+        return True
+    low_signal_markers = (
+        "bridge active",
+        "public corridor is quiet",
+        "public signal is quiet",
+        "thin signal",
+        "observation posture",
+        "nothing fresh has cleared",
+    )
+    return any(marker in normalized for marker in low_signal_markers)
 
 
 def _contains_stale_phrase(text: str) -> bool:
@@ -973,15 +1144,41 @@ async def generate_dynamic_website_relay(guild_id: int) -> tuple[str, str, str, 
         if len(lines) > 1:
             current_directive = sanitize_website_status_message(lines[1], limit=220, min_chars=120)
 
+    low_signal_generated = False
+    low_signal_recent_messages = _recent_relay_messages.get(guild_id, [])[-5:]
+    if _last_website_status_message:
+        low_signal_recent_messages = low_signal_recent_messages + [_last_website_status_message]
+    low_signal_meta = {
+        "signal_summary": signal_summary,
+        "has_relay_context": bool(relay_context.strip()),
+        "source_channel_count": source_channel_count,
+        "message_count": len(messages),
+        "unique_users": unique_users,
+    }
+
     if not relay_message or _contains_stale_phrase(relay_message):
-        relay_message = _weak_context_relay_message(guild_id, signal_summary, relay_context) if not context_is_strong else _pick_varied_relay_fallback(_last_website_status_message)
+        if not context_is_strong:
+            relay_message = await build_low_signal_relay_message(guild_id, context_reason, low_signal_recent_messages, low_signal_meta)
+            low_signal_generated = True
+        else:
+            relay_message = _pick_varied_relay_fallback(_last_website_status_message)
     if not current_directive:
         current_directive = RELAY_WEAK_CONTEXT_STANDBY_DIRECTIVE if not context_is_strong else random.choice(RELAY_DIRECTIVE_FALLBACKS)
 
     if relay_message.strip().lower() == (_last_website_status_message or "").strip().lower() or _is_repetitive_relay(guild_id, relay_message):
-        relay_message = _weak_context_relay_message(guild_id, signal_summary, relay_context) if not context_is_strong else _pick_varied_relay_fallback(relay_message)
+        if not context_is_strong:
+            low_signal_recent_messages = low_signal_recent_messages + [relay_message]
+            relay_message = await build_low_signal_relay_message(guild_id, context_reason, low_signal_recent_messages, low_signal_meta)
+            low_signal_generated = True
+        else:
+            relay_message = _pick_varied_relay_fallback(relay_message)
     if _contains_stale_phrase(relay_message):
-        relay_message = _weak_context_relay_message(guild_id, signal_summary, relay_context) if not context_is_strong else _pick_varied_relay_fallback(relay_message)
+        if not context_is_strong:
+            low_signal_recent_messages = low_signal_recent_messages + [relay_message]
+            relay_message = await build_low_signal_relay_message(guild_id, context_reason, low_signal_recent_messages, low_signal_meta)
+            low_signal_generated = True
+        else:
+            relay_message = _pick_varied_relay_fallback(relay_message)
 
     if current_directive.strip().lower() == (_last_website_directive or "").strip().lower():
         options = [d for d in RELAY_DIRECTIVE_FALLBACKS if d.strip().lower() != (_last_website_directive or "").strip().lower()]
@@ -1005,7 +1202,8 @@ async def generate_dynamic_website_relay(guild_id: int) -> tuple[str, str, str, 
         "reason": context_reason,
         "has_specific_context": bool(relay_context.strip()),
         "source_channel_count": source_channel_count,
-        "is_weak_fallback": _is_weak_context_fallback(relay_message),
+        "is_weak_fallback": (not context_is_strong and not low_signal_generated and _is_weak_context_fallback(relay_message)),
+        "is_low_signal_dynamic": (not context_is_strong and low_signal_generated),
     }
     return mode, relay_message, fit_complete_statement(current_directive, limit=220, min_chars=120, fallback=RELAY_WEAK_CONTEXT_STANDBY_DIRECTIVE), metadata
 
@@ -3685,8 +3883,9 @@ async def website_relay_task():
             and not relay_meta.get("context_is_strong")
             and relay_meta.get("reason") == "public_context_weak"
         )
+        low_signal_dynamic = weak_quiet and relay_meta.get("is_low_signal_dynamic")
         weak_repeat = weak_quiet and relay_meta.get("is_weak_fallback") and _is_weak_context_fallback(_last_website_status_message or "")
-        if weak_quiet and not weak_repeat:
+        if weak_quiet and not low_signal_dynamic and not weak_repeat:
             logging.info(
                 f"website_relay_weak_context_skip mode={mode} reason={relay_meta.get('reason')} elapsed_seconds={elapsed:.1f} "
                 f"source_channel_count={relay_meta.get('source_channel_count', 0)}"
