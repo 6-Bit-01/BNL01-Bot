@@ -45,10 +45,6 @@ BNL_STATUS_URL = os.getenv("BNL_STATUS_URL")
 
 BNL_WEBSITE_RELAY_ENABLED = os.getenv("BNL_WEBSITE_RELAY_ENABLED", "true").strip().lower() not in {"false", "0", "off"}
 BNL_ACTIVE_BATCHING_ENABLED = os.getenv("BNL_ACTIVE_BATCHING_ENABLED", "false").strip().lower() in {"true", "1", "on"}
-# The env flag remains a global kill switch/default for optional batching surfaces,
-# but sealed testing and the configured active/home channel must keep active packet
-# assembly available so no-name conversational list/request traffic is not stolen
-# by direct payload sessions before a batch can form.
 BNL_WEBSITE_RELAY_INTERVAL_MINUTES = max(1, int(os.getenv("BNL_WEBSITE_RELAY_INTERVAL_MINUTES", "20")))
 BNL_PRIMARY_GUILD_ID = int(os.getenv("BNL_PRIMARY_GUILD_ID", "0") or 0)
 BNL_FORCE_PULL_SHARED_SECRET = os.getenv("BNL_FORCE_PULL_SHARED_SECRET", "").strip()
@@ -4405,8 +4401,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
         selected_wait_seconds = ADAPTIVE_PAYLOAD_WAIT_WITH_ITEMS_SECONDS
     cycle_deadline = batch_start + timedelta(seconds=batch_max_wait)
     items = list(handoff_items) if handoff_items is not None else list(buf)
-    active_packet_batching_enabled = _active_packet_batching_enabled_for_channel(channel)
-    if active_packet_batching_enabled:
+    if BNL_ACTIVE_BATCHING_ENABLED:
         pending_state = _consume_pending_request_intent(channel_id, now)
         pending_anchor = _consume_pending_request_anchor(channel_id, now)
     else:
@@ -4947,7 +4942,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
             if not sealed_test_channel:
                 save_model_message(uid, channel.guild.id, response, channel_name=getattr(channel, "name", ""), channel_policy=channel_policy)
 
-        if active_packet_batching_enabled and (reason.startswith("request_intent:") or reason.startswith("request_payload_expected:") or reason in ("pending_request_payload_continuation", "pending_request_single_payload_continuation")):
+        if BNL_ACTIVE_BATCHING_ENABLED and (reason.startswith("request_intent:") or reason.startswith("request_payload_expected:") or reason in ("pending_request_payload_continuation", "pending_request_single_payload_continuation")):
             _set_pending_request_intent(channel_id, datetime.now(PACIFIC_TZ), reason)
             _set_pending_request_anchor(channel_id, guild_id, first_uid, "request_payload", datetime.now(PACIFIC_TZ), reason)
             _log_batch_event(logging.INFO, "pending_request_intent_set", guild_id, channel_id, len(collapsed_items), f"reason={reason}")
@@ -4972,7 +4967,7 @@ async def _schedule_flush(channel: discord.TextChannel):
 
     while True:
         now = datetime.now(PACIFIC_TZ)
-        if _active_packet_batching_enabled_for_channel(channel):
+        if BNL_ACTIVE_BATCHING_ENABLED:
             pending_state = _peek_pending_request_intent(channel_id, now)
             pending_anchor = _peek_pending_request_anchor(channel_id, now)
             if pending_state == "expired":
@@ -5492,80 +5487,6 @@ async def _apply_direct_response_pacing(payload_expected: bool, payload_count: i
     await asyncio.sleep(delay_seconds)
 
 
-def _active_packet_batching_enabled_for_channel(channel) -> bool:
-    """Return whether active packet assembly should be available for this channel."""
-    channel_policy = resolve_channel_policy(channel)
-    if channel_policy == "sealed_test":
-        return True
-    try:
-        active_channel_id = get_guild_config(channel.guild.id)
-    except Exception:
-        active_channel_id = None
-    if active_channel_id is not None and channel.id == active_channel_id:
-        return True
-    return BNL_ACTIVE_BATCHING_ENABLED
-
-
-def _message_should_claim_active_batch(
-    *,
-    clean_content: str,
-    should_handle_as_active_channel: bool,
-    channel_allows_conversation: bool,
-    direct_addressed_to_bot: bool,
-    channel,
-) -> bool:
-    return bool(
-        clean_content
-        and should_handle_as_active_channel
-        and channel_allows_conversation
-        and not direct_addressed_to_bot
-        and _active_packet_batching_enabled_for_channel(channel)
-    )
-
-
-async def _claim_active_batch_message(message: discord.Message, clean_content: str, channel_policy: str, is_sealed_test_channel: bool, active_test_free_speak: bool):
-    """Add a no-name active-channel message to the batch buffer and claim the route."""
-    logging.info("response_route_decision route=active_batch reason=no_name_channel_batching")
-    logging.info("route_skipped_direct_session reason=active_batch_claimed_message")
-    if not is_sealed_test_channel:
-        maybe_update_broadcast_status_from_text(clean_content)
-        maybe_update_restricted_status_from_text(clean_content)
-        save_user_message(
-            message.author.id,
-            message.author.display_name,
-            message.guild.id,
-            clean_content,
-            channel_name=getattr(message.channel, "name", ""),
-            channel_policy=channel_policy,
-        )
-    if active_test_free_speak:
-        logging.info(f"[conversation] guild_id={message.guild.id} channel_id={message.channel.id} reason=sealed_test_free_speak")
-    if _channel_generating[message.channel.id]:
-        _channel_preempted_generation_id[message.channel.id] = _channel_generation_id[message.channel.id]
-        _channel_message_interrupt_generation_id[message.channel.id] = _channel_generation_id[message.channel.id]
-        _log_batch_event(
-            logging.INFO,
-            "hard_message_interrupt_detected",
-            message.guild.id,
-            message.channel.id,
-            len(_channel_buffers[message.channel.id]) + 1,
-            "new_message_while_generating",
-        )
-        _log_batch_event(
-            logging.INFO,
-            "stale_generation_interrupted",
-            message.guild.id,
-            message.channel.id,
-            len(_channel_buffers[message.channel.id]) + 1,
-            "new_message_while_generating",
-        )
-    _channel_buffers[message.channel.id].append((message.author.display_name, clean_content, message.author.id))
-    _channel_last_message_at[message.channel.id] = datetime.now(PACIFIC_TZ)
-    if len(_channel_buffers[message.channel.id]) >= BATCH_MAX_MESSAGES:
-        await _flush_channel_buffer(message.channel)
-        return
-    _reset_debounce(message.channel)
-
 def _build_direct_payload_prompt(base_prompt: str, payload_items, request_text: str) -> str:
     if not payload_items:
         return base_prompt
@@ -5613,7 +5534,6 @@ async def on_message(message: discord.Message):
 
     plain_text_name_seen = bool(re.search(r"\b(bnl|bnl-01|barcode bot)\b", clean_content.lower())) if clean_content else False
     real_direct_target = bool(is_mention or is_reply)
-    direct_addressed_to_bot = bool(real_direct_target or plain_text_name_seen)
     channel_allows_conversation = bool(
         channel_policy in {"public_home", "sealed_test"}
         or is_active_channel
@@ -5623,44 +5543,10 @@ async def on_message(message: discord.Message):
     logging.info(f"response_route_real_direct_target active={int(real_direct_target)}")
     logging.info(f"response_route_plain_text_name_seen seen={int(plain_text_name_seen)}")
 
-    active_batch_claims_message = _message_should_claim_active_batch(
-        clean_content=clean_content,
-        should_handle_as_active_channel=should_handle_as_active_channel,
-        channel_allows_conversation=channel_allows_conversation,
-        direct_addressed_to_bot=direct_addressed_to_bot,
-        channel=message.channel,
-    )
-
     session_key = _direct_session_key(message)
     active_direct_session = _direct_payload_sessions.get(session_key)
-    if active_direct_session and active_batch_claims_message:
-        session_already_committed = bool(
-            active_direct_session.get("last_bot_response_at")
-            or int(active_direct_session.get("last_committed_payload_count", 0)) > 0
-        )
-        if session_already_committed and _is_clear_new_direct_request_after_commit(clean_content):
-            payload_count = len(active_direct_session.get("payload_lines", []))
-            last_committed_payload_count = int(active_direct_session.get("last_committed_payload_count", 0))
-            logging.info(
-                "direct_session_new_request_after_commit_detected "
-                f"payload_count={payload_count};last_committed_payload_count={last_committed_payload_count}"
-            )
-            active_direct_session["completed"] = True
-            _direct_payload_sessions.pop(session_key, None)
-            active_direct_session = None
-            logging.info(
-                "direct_session_closed_for_new_request "
-                f"payload_count={payload_count};last_committed_payload_count={last_committed_payload_count}"
-            )
-        else:
-            active_batch_claims_message = False
-
-    if active_batch_claims_message and active_direct_session is None:
-        await _claim_active_batch_message(message, clean_content, channel_policy, is_sealed_test_channel, active_test_free_speak)
-        return
-
     if active_direct_session and not getattr(message.author, "bot", False):
-        explicit_new_direct_request = direct_addressed_to_bot
+        explicit_new_direct_request = real_direct_target
         if explicit_new_direct_request:
             active_direct_session["completed"] = True
             _direct_payload_sessions.pop(session_key, None)
@@ -5706,14 +5592,14 @@ async def on_message(message: discord.Message):
                     return
 
     active_same_user_session = bool(_direct_payload_sessions.get(session_key))
-    message_should_enter_conversation = bool(clean_content and (channel_allows_conversation or direct_addressed_to_bot or followup_candidate or active_same_user_session))
+    message_should_enter_conversation = bool(clean_content and (channel_allows_conversation or real_direct_target or followup_candidate or active_same_user_session))
     logging.info(f"response_route_active_session active={int(active_same_user_session)}")
     if message_should_enter_conversation:
-        if channel_allows_conversation and not direct_addressed_to_bot:
+        if channel_allows_conversation and not real_direct_target:
             logging.info("response_route_decision route=conversation_allowed reason=channel_policy")
             if len(clean_content.split()) <= 2 and len(clean_content) <= 20:
                 logging.info("conversational_minimal_ack reason=low_detail")
-        elif direct_addressed_to_bot:
+        elif real_direct_target:
             logging.info("response_route_decision route=real_direct_target reason=mention_or_reply")
         elif followup_candidate:
             logging.info("response_route_decision route=conversation_allowed reason=recent_followup_window")
@@ -5760,8 +5646,8 @@ async def on_message(message: discord.Message):
         if not is_sealed_test_channel:
             save_user_message(message.author.id, message.author.display_name, message.guild.id, clean_content, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy)
 
-        # Explicit mentions/replies or plain-name calls -> immediate response (not batched)
-        if message_should_enter_conversation and direct_addressed_to_bot:
+        # Mentions/replies -> immediate response (not batched)
+        if message_should_enter_conversation:
             direct_content, direct_payload_items = clean_content, _collect_inline_direct_payload_items(clean_content)
             sealed_recall_guard = get_sealed_test_recall_guard_response(
                 channel_policy,
@@ -5907,8 +5793,8 @@ async def on_message(message: discord.Message):
             _mark_recent_direct_response(message.channel.id, message.author.id)
             return
 
-        # No-name active-channel conversation -> active packet batch.
-        if not _active_packet_batching_enabled_for_channel(message.channel):
+        # Non-mention in active channel -> batch (kill-switched by env)
+        if not BNL_ACTIVE_BATCHING_ENABLED:
             return
         if active_test_free_speak:
             logging.info(f"[conversation] guild_id={message.guild.id} channel_id={message.channel.id} reason=sealed_test_free_speak")
@@ -5941,7 +5827,7 @@ async def on_message(message: discord.Message):
 
     # ---------------- OTHER CHANNELS (PING-ONLY IF ACTIVE CHANNEL SET) ----------------
     if active_channel_id is not None and not should_handle_as_active_channel:
-        if not direct_addressed_to_bot:
+        if not real_direct_target:
             return
 
         if not clean_content:
@@ -6048,7 +5934,7 @@ async def on_message(message: discord.Message):
         return
 
     # ---------------- NO ACTIVE CHANNEL SET (RESPOND TO MENTIONS/REPLIES ANYWHERE) ----------------
-    if active_channel_id is None and message_should_enter_conversation and direct_addressed_to_bot:
+    if active_channel_id is None and message_should_enter_conversation:
         if not clean_content:
             await message.reply("You pinged me. How may I assist with BARCODE operations?")
             return
