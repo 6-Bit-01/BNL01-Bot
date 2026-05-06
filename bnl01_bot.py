@@ -431,10 +431,14 @@ You are BNL-01. The BARCODE Network is watching. You are functioning as intended
 
 # ======== WEBSITE STATUS BRIDGE GUARDRAILS ========
 STATUS_UPDATE_COOLDOWN_SECONDS = 300
+LOW_SIGNAL_RELAY_MIN_PUBLISH_MINUTES = 45
 _last_website_status_mode = None
 _last_website_status_message = None
 _last_website_directive = None
 _last_website_status_at = None
+_last_low_signal_relay_published_at = None
+_last_low_signal_relay_message = None
+_low_signal_relay_quiet_streak_active = False
 _missing_status_key_warned = False
 BNL_CONTROL_FLAGS_TTL_SECONDS = 300
 _bnl_control_flags_cache = None
@@ -939,6 +943,38 @@ def _is_weak_context_fallback(message: str) -> bool:
         "nothing fresh has cleared",
     )
     return any(marker in normalized for marker in low_signal_markers)
+
+
+def _low_signal_publish_gate(now: datetime, mode: str, relay_meta: dict) -> tuple[bool, float, float]:
+    if mode != "OBSERVATION":
+        return True, 0.0, LOW_SIGNAL_RELAY_MIN_PUBLISH_MINUTES * 60
+    if relay_meta.get("context_is_strong"):
+        return True, 0.0, LOW_SIGNAL_RELAY_MIN_PUBLISH_MINUTES * 60
+    if not relay_meta.get("is_low_signal_dynamic"):
+        return True, 0.0, LOW_SIGNAL_RELAY_MIN_PUBLISH_MINUTES * 60
+    if not _low_signal_relay_quiet_streak_active or not _last_low_signal_relay_published_at:
+        return True, 0.0, LOW_SIGNAL_RELAY_MIN_PUBLISH_MINUTES * 60
+
+    elapsed = (now - _last_low_signal_relay_published_at).total_seconds()
+    min_seconds = LOW_SIGNAL_RELAY_MIN_PUBLISH_MINUTES * 60
+    return elapsed >= min_seconds, elapsed, min_seconds
+
+
+def _remember_low_signal_publish_state(now: datetime, mode: str, message: str, relay_meta: dict):
+    global _last_low_signal_relay_published_at, _last_low_signal_relay_message, _low_signal_relay_quiet_streak_active
+
+    low_signal_observation = (
+        mode == "OBSERVATION"
+        and relay_meta.get("is_low_signal_dynamic")
+        and not relay_meta.get("context_is_strong")
+    )
+    if low_signal_observation:
+        _last_low_signal_relay_published_at = now
+        _last_low_signal_relay_message = sanitize_website_status_message(message, limit=360, min_chars=0)
+        _low_signal_relay_quiet_streak_active = True
+        return
+
+    _low_signal_relay_quiet_streak_active = False
 
 
 def _contains_stale_phrase(text: str) -> bool:
@@ -3897,7 +3933,17 @@ async def website_relay_task():
                 f"source_channel_count={relay_meta.get('source_channel_count', 0)}"
             )
             continue
-        update_website_status_controlled(mode=mode, message=relay_message, status="ONLINE", current_directive=directive, source="relay")
+        cadence_allowed, low_signal_elapsed, low_signal_min_seconds = _low_signal_publish_gate(datetime.now(PACIFIC_TZ), mode, relay_meta)
+        if not cadence_allowed:
+            logging.info(
+                f"website_relay_low_signal_cadence_skip mode={mode} reason={relay_meta.get('reason')} "
+                f"elapsed_seconds={low_signal_elapsed:.1f} min_seconds={low_signal_min_seconds:.1f} "
+                f"source_channel_count={relay_meta.get('source_channel_count', 0)}"
+            )
+            continue
+        update_ok = update_website_status_controlled(mode=mode, message=relay_message, status="ONLINE", current_directive=directive, source="relay")
+        if update_ok:
+            _remember_low_signal_publish_state(datetime.now(PACIFIC_TZ), mode, relay_message, relay_meta)
 
 # ==================== BATCHED REPLY SYSTEM (ACTIVE CHANNEL ONLY) ====================
 
