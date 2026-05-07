@@ -945,12 +945,19 @@ RELAY_FORBIDDEN_SHOW_STATE_PATTERNS = (
 
 RELAY_SHOW_CONTEXT_MARKERS = (
     "barcode radio",
-    "6 bit",
     "6:40",
     "tiktok",
+    "go live",
+    "going live",
+    "live stream",
+    "livestream",
+    "live window",
     "broadcast",
     "friday",
-    "show",
+    "show queue",
+    "show submission",
+    "show submissions",
+    "show window",
     "on-air",
     "on air",
 )
@@ -959,6 +966,18 @@ RELAY_SHOW_CONTEXT_MARKERS = (
 def _relay_context_supports_show_reference(*texts: str) -> bool:
     combined = " ".join(t or "" for t in texts).lower()
     return any(marker in combined for marker in RELAY_SHOW_CONTEXT_MARKERS)
+
+
+def _lane_retry_for_mismatch(guild_id: int, current_lane: str) -> tuple[str, str]:
+    last_lane = _last_relay_lane_by_guild.get(guild_id, "")
+    candidates = ["carrier_trace", "network_posture"]
+    for lane in candidates:
+        if lane != current_lane and lane != last_lane:
+            return lane, "lane_mismatch_low_signal_lane"
+    for lane in candidates:
+        if lane != current_lane:
+            return lane, "lane_mismatch_low_signal_lane"
+    return "network_posture", "lane_mismatch_low_signal_lane"
 
 
 def _message_mentions_show_context(message: str) -> bool:
@@ -1506,8 +1525,10 @@ async def generate_dynamic_website_relay(guild_id: int) -> tuple[str, str, str, 
 
     lane_ok, lane_mismatch_reason = _validate_relay_lane_adherence(relay_message, relay_lane, context_is_strong, guild_id)
     if not lane_ok:
-        if not context_is_strong:
-            old_lane = relay_lane
+        old_lane = relay_lane
+        if context_is_strong and old_lane == "current_signal":
+            retry_lane, retry_reason = _lane_retry_for_mismatch(guild_id, old_lane)
+        else:
             retry_lane, retry_reason = _select_website_relay_lane(
                 guild_id,
                 context_is_strong,
@@ -1515,18 +1536,40 @@ async def generate_dynamic_website_relay(guild_id: int) -> tuple[str, str, str, 
                 low_signal_meta,
                 avoid_lane=old_lane,
             )
-            relay_lane = retry_lane
+            if retry_lane == old_lane or retry_lane == "current_signal":
+                retry_lane, retry_reason = _lane_retry_for_mismatch(guild_id, old_lane)
+        relay_lane = retry_lane
+        low_signal_meta["relay_lane"] = relay_lane
+        relay_lane_reason = retry_reason
+        logging.info(
+            f"website_relay_lane_retry guild={guild_id} old_lane={old_lane} "
+            f"new_lane={relay_lane} reason={lane_mismatch_reason}"
+        )
+        low_signal_recent_messages = low_signal_recent_messages + [relay_message]
+        relay_message = await build_low_signal_relay_message(
+            guild_id,
+            lane_mismatch_reason or context_reason,
+            low_signal_recent_messages,
+            low_signal_meta,
+            relay_lane=relay_lane,
+        )
+        low_signal_generated = True
+        lane_ok, lane_mismatch_reason = _validate_relay_lane_adherence(relay_message, relay_lane, False, guild_id)
+        if not lane_ok:
+            relay_message = _build_low_signal_fallback_message(
+                guild_id,
+                lane_mismatch_reason or context_reason,
+                low_signal_recent_messages,
+                low_signal_meta,
+                relay_lane="network_posture",
+            )
+            relay_lane = "network_posture"
             low_signal_meta["relay_lane"] = relay_lane
-            relay_lane_reason = retry_reason
+            relay_lane_reason = "lane_mismatch_safe_fallback"
             logging.info(
                 f"website_relay_lane_retry guild={guild_id} old_lane={old_lane} "
-                f"new_lane={relay_lane} reason={lane_mismatch_reason}"
+                f"new_lane={relay_lane} reason=post_retry_validation"
             )
-            low_signal_recent_messages = low_signal_recent_messages + [relay_message]
-            relay_message = await build_low_signal_relay_message(guild_id, context_reason, low_signal_recent_messages, low_signal_meta, relay_lane=relay_lane)
-            low_signal_generated = True
-        else:
-            relay_message = _pick_varied_relay_fallback(relay_message)
 
     temporal_sanitized = _sanitize_relay_temporal_claims(
         relay_message,
