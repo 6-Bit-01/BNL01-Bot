@@ -1047,10 +1047,12 @@ def _sanitize_relay_temporal_claims(
 
 def _validate_relay_lane_adherence(message: str, lane: str, context_is_strong: bool, guild_id: int) -> tuple[bool, str]:
     safe_lane = lane if lane in RELAY_LANES else "carrier_trace"
-    lowered = (message or "").lower()
+    normalized = re.sub(
+        r"\s+",
+        " ",
+        (message or "").replace("–", "-").replace("—", "-").lower(),
+    ).strip()
     thin_signal_markers = (
-        "public signal is thin",
-        "signal is thin",
         "public signal is quiet",
         "public channels are quiet",
         "public corridor is quiet",
@@ -1061,15 +1063,30 @@ def _validate_relay_lane_adherence(message: str, lane: str, context_is_strong: b
         "weak signal",
         "thin signal",
         "quiet public",
+        "holding a stable listening window",
+        "stable listening window",
+        "clearer discord-side movement",
+        "clearer public movement",
+        "until clearer movement",
+        "until clearer discord-side movement can",
+        "until clearer discord-side movement returns",
+        "until clearer public signal returns",
+    )
+    thin_signal_patterns = (
+        r"\bpublic signal\s+(?:is\s+(?:currently\s+)?|remains\s+)thin\b",
+        r"\bsignal\s+is\s+(?:currently\s+)?thin\b",
     )
     if safe_lane == "current_signal":
         if not context_is_strong:
             logging.info(f"website_relay_lane_mismatch guild={guild_id} lane={safe_lane} reason=weak_context")
             return False, "weak_context"
-        if any(marker in lowered for marker in thin_signal_markers):
+        has_thin_signal_text = any(marker in normalized for marker in thin_signal_markers) or any(
+            re.search(pattern, normalized) for pattern in thin_signal_patterns
+        )
+        if has_thin_signal_text:
             logging.info(f"website_relay_lane_mismatch guild={guild_id} lane={safe_lane} reason=thin_signal_text")
             return False, "thin_signal_text"
-    if safe_lane == "residual_echo" and not any(marker in lowered for marker in ("residue", "echo", "afterimage", "archive", "still on", "recent")):
+    if safe_lane == "residual_echo" and not any(marker in normalized for marker in ("residue", "echo", "afterimage", "archive", "still on", "recent")):
         logging.info(f"website_relay_lane_mismatch guild={guild_id} lane={safe_lane} reason=missing_residual_anchor")
         return False, "missing_residual_anchor"
     return True, ""
