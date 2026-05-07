@@ -683,6 +683,8 @@ STALE_RELAY_PHRASES = (
 _recent_relay_messages: dict[int, list[str]] = {}
 _recent_relay_topics: dict[int, list[str]] = {}
 _recent_weak_context_modes: dict[int, list[str]] = {}
+_last_relay_lane_by_guild: dict[int, str] = {}
+_recent_relay_lanes_by_guild = defaultdict(lambda: deque(maxlen=8))
 RELAY_ANGLE_ROTATION = [
     "whisper",
     "wonder",
@@ -763,13 +765,44 @@ def _pick_weak_context_mode(guild_id: int) -> str:
     return mode
 
 
+RELAY_LANES = (
+    "current_signal",
+    "carrier_trace",
+    "residual_echo",
+    "dormant_signal",
+    "network_posture",
+    "question_formation",
+)
+
 LOW_SIGNAL_RELAY_ANGLES = (
     "carrier_trace",
     "network_posture",
-    "quiet_room_observation",
     "residual_echo",
     "question_formation",
 )
+
+RELAY_LANE_RULES = {
+    "current_signal": (
+        "Use strong eligible public Discord context. Mention current users, topics, tracks, questions, "
+        "or public movement only when the supplied current public context supports it."
+    ),
+    "carrier_trace": (
+        "The bridge is active but public signal is thin. Focus on signal, bridge, or carrier state "
+        "without pretending activity happened."
+    ),
+    "residual_echo": (
+        "Use only source-safe recent public residue. Do not pretend older context just happened and do not overstate weak chatter."
+    ),
+    "dormant_signal": (
+        "Disabled/future-only unless source-safe public data exists without long-term memory. Do not use long-term memory."
+    ),
+    "network_posture": (
+        "Comment on BNL-01's relay, listening, filtering, or monitoring posture without sounding like an error message."
+    ),
+    "question_formation": (
+        "Form one light curiosity or question. It must not sound like engagement bait and must not be overused."
+    ),
+}
 
 LOW_SIGNAL_FORBIDDEN_PUBLIC_TERMS = (
     "public_context_weak",
@@ -799,6 +832,87 @@ def _format_recent_relay_messages_for_prompt(recent_relay_messages: list[str], l
     return " || ".join(cleaned) if cleaned else "none"
 
 
+def _has_source_safe_public_residue(relay_meta: dict) -> bool:
+    return bool(
+        relay_meta.get("message_count")
+        or relay_meta.get("has_relay_context")
+        or (relay_meta.get("signal_summary") or "").strip()
+    )
+
+
+def _relay_lane_recently_overused(guild_id: int, lane: str, limit: int = 4, max_count: int = 1) -> bool:
+    recent = list(_recent_relay_lanes_by_guild.get(guild_id, []))[-limit:]
+    return recent.count(lane) > max_count
+
+
+def _select_website_relay_lane(
+    guild_id: int,
+    context_is_strong: bool,
+    context_reason: str,
+    relay_meta: dict,
+    avoid_lane: str = "",
+) -> tuple[str, str]:
+    has_public_residue = _has_source_safe_public_residue(relay_meta)
+    last_lane = _last_relay_lane_by_guild.get(guild_id, "")
+
+    if context_is_strong:
+        return "current_signal", "context_is_strong"
+
+    candidates = ["carrier_trace", "network_posture"]
+    if has_public_residue:
+        candidates.append("residual_echo")
+    if not _relay_lane_recently_overused(guild_id, "question_formation", limit=6, max_count=0):
+        candidates.append("question_formation")
+
+    filtered = [lane for lane in candidates if lane != avoid_lane]
+    if filtered:
+        candidates = filtered
+    non_repeat = [lane for lane in candidates if lane != last_lane]
+    if non_repeat:
+        candidates = non_repeat
+
+    seed = _low_signal_seed(guild_id, context_reason or "public_context_weak", list(_recent_relay_messages.get(guild_id, []))[-5:])
+    lane = candidates[seed % len(candidates)] if candidates else "carrier_trace"
+    if lane == "residual_echo" and not has_public_residue:
+        lane = "carrier_trace"
+    if lane == "dormant_signal":
+        lane = "network_posture"
+    if lane == "question_formation" and _relay_lane_recently_overused(guild_id, lane, limit=6, max_count=0):
+        lane = "network_posture" if last_lane != "network_posture" else "carrier_trace"
+
+    if context_reason == "public_context_weak":
+        reason = "public_context_weak"
+    elif has_public_residue:
+        reason = "source_safe_public_residue"
+    else:
+        reason = context_reason or "weak_public_context"
+    return lane, reason
+
+
+def _build_relay_lane_prompt(lane: str, has_public_residue: bool) -> str:
+    safe_lane = lane if lane in RELAY_LANES else "carrier_trace"
+    disabled_note = "Dormant signal is disabled/future-only for this release; do not choose it."
+    residue_note = (
+        "Residual echo is allowed because source-safe recent public residue exists."
+        if has_public_residue
+        else "Residual echo is not allowed because no source-safe recent public residue is available."
+    )
+    return (
+        f"Selected relay lane: {safe_lane}.\n"
+        "Write only within this lane.\n"
+        f"Lane rule: {RELAY_LANE_RULES.get(safe_lane, RELAY_LANE_RULES['carrier_trace'])}\n"
+        f"{residue_note}\n"
+        f"{disabled_note}\n"
+    )
+
+
+def _remember_relay_lane(guild_id: int, lane: str):
+    if lane not in RELAY_LANES:
+        return
+    _last_relay_lane_by_guild[guild_id] = lane
+    _recent_relay_lanes_by_guild[guild_id].append(lane)
+
+
 def _sanitize_low_signal_candidate(message: str, guild_id: int, recent_relay_messages: list[str]) -> str:
     line = (message or "").strip().splitlines()[0].strip() if message else ""
     line = re.sub(r"^[-*\d.)\s]+", "", line).strip()
@@ -824,16 +938,15 @@ def _sanitize_low_signal_candidate(message: str, guild_id: int, recent_relay_mes
     return candidate
 
 
-def _build_low_signal_fallback_message(guild_id: int, reason: str, recent_relay_messages: list[str], relay_meta: dict) -> str:
+def _build_low_signal_fallback_message(guild_id: int, reason: str, recent_relay_messages: list[str], relay_meta: dict, relay_lane: str = "") -> str:
     seed = _low_signal_seed(guild_id, reason, recent_relay_messages)
-    has_public_residue = bool(
-        relay_meta.get("message_count")
-        or relay_meta.get("has_relay_context")
-        or (relay_meta.get("signal_summary") or "").strip()
-    )
+    has_public_residue = _has_source_safe_public_residue(relay_meta)
     angle_order = [a for a in LOW_SIGNAL_RELAY_ANGLES if has_public_residue or a != "residual_echo"]
-    start = seed % len(angle_order)
-    angle_order = angle_order[start:] + angle_order[:start]
+    if relay_lane in angle_order:
+        angle_order = [relay_lane] + [a for a in angle_order if a != relay_lane]
+    else:
+        start = seed % len(angle_order)
+        angle_order = angle_order[start:] + angle_order[:start]
     bridge_terms = ["website bridge", "public relay bridge", "BARCODE relay"]
     quiet_terms = ["public corridor", "eligible public channels", "outer room"]
     filter_terms = ["relay filter", "public filter", "receiver filter"]
@@ -846,8 +959,6 @@ def _build_low_signal_fallback_message(guild_id: int, reason: str, recent_relay_
             candidate = f"The {bridge} is active, but the {quiet} is carrying thin signal right now."
         elif angle == "network_posture":
             candidate = f"BNL-01 is holding observation posture and refusing to turn quiet public channels into movement."
-        elif angle == "quiet_room_observation":
-            candidate = f"The room is quiet, not empty. BNL-01 is keeping the public relay open for signal that clears the filter."
         elif angle == "residual_echo":
             candidate = f"Recent public residue is still on the glass, but nothing fresh has cleared the {relay_filter} this pass."
         else:
@@ -862,15 +973,11 @@ def _build_low_signal_fallback_message(guild_id: int, reason: str, recent_relay_
     return repair
 
 
-async def build_low_signal_relay_message(guild_id: int, reason: str, recent_relay_messages: list[str], relay_meta: dict) -> str:
+async def build_low_signal_relay_message(guild_id: int, reason: str, recent_relay_messages: list[str], relay_meta: dict, relay_lane: str = "") -> str:
     safe_reason = re.sub(r"[^a-zA-Z0-9_ -]", "", (reason or "public_context_weak"))[:80] or "public_context_weak"
     recent_display = _format_recent_relay_messages_for_prompt(recent_relay_messages)
-    has_public_residue = bool(
-        relay_meta.get("message_count")
-        or relay_meta.get("has_relay_context")
-        or (relay_meta.get("signal_summary") or "").strip()
-    )
-    residual_rule = "Residual echo is allowed because source-safe recent public residue exists." if has_public_residue else "Do not choose residual echo; no source-safe recent public residue is available."
+    has_public_residue = _has_source_safe_public_residue(relay_meta)
+    relay_lane_prompt = _build_relay_lane_prompt(relay_lane or "carrier_trace", has_public_residue)
     prompt = (
         "You are generating a public BARCODE Network website relay line for BNL-01.\n\n"
         "Truth state:\n"
@@ -880,8 +987,7 @@ async def build_low_signal_relay_message(guild_id: int, reason: str, recent_rela
         "- BNL-01 is observing eligible public channels only.\n"
         f"- Reason: {safe_reason}.\n"
         f"- Recent relay messages to avoid: {recent_display}.\n"
-        f"- {residual_rule}\n\n"
-        "Choose one truthful angle: carrier trace, network posture, quiet room observation, residual echo when allowed, or question formation.\n"
+        f"- {relay_lane_prompt}\n"
         "Write one fresh public relay message in BNL-01's voice.\n\n"
         "Rules:\n"
         "- Do not invent activity.\n"
@@ -904,15 +1010,15 @@ async def build_low_signal_relay_message(guild_id: int, reason: str, recent_rela
                 logging.info(f"📊 Tokens used: {tokens}")
             candidate = _sanitize_low_signal_candidate(generated, guild_id, recent_relay_messages)
             if candidate:
-                logging.info(f"website_low_signal_relay_generated guild={guild_id} reason={safe_reason}")
+                logging.info(f"website_low_signal_relay_generated guild={guild_id} reason={safe_reason} relay_lane={relay_lane or 'carrier_trace'}")
                 return candidate
             if generated:
-                logging.info(f"website_low_signal_relay_rejected guild={guild_id} reason={safe_reason}")
+                logging.info(f"website_low_signal_relay_rejected guild={guild_id} reason={safe_reason} relay_lane={relay_lane or 'carrier_trace'}")
         except Exception as e:
             logging.warning(f"⚠️ Low-signal relay generation failed guild={guild_id} reason={safe_reason}: {e}")
 
-    fallback = _build_low_signal_fallback_message(guild_id, safe_reason, recent_relay_messages, relay_meta)
-    logging.info(f"website_low_signal_relay_fallback guild={guild_id} reason={safe_reason}")
+    fallback = _build_low_signal_fallback_message(guild_id, safe_reason, recent_relay_messages, relay_meta, relay_lane=relay_lane)
+    logging.info(f"website_low_signal_relay_fallback guild={guild_id} reason={safe_reason} relay_lane={relay_lane or 'carrier_trace'}")
     return fallback
 
 
@@ -1080,6 +1186,24 @@ async def generate_dynamic_website_relay(guild_id: int) -> tuple[str, str, str, 
             f"website_relay_fresh_public_context_used guild={guild_id} reason={context_reason} "
             f"messages={len(messages)} users={unique_users} policies={','.join(eligible_policies) or 'none'}"
         )
+    lane_source_meta = {
+        "signal_summary": signal_summary,
+        "has_relay_context": bool(relay_context.strip()),
+        "source_channel_count": source_channel_count,
+        "message_count": len(messages),
+        "unique_users": unique_users,
+    }
+    relay_lane, relay_lane_reason = _select_website_relay_lane(
+        guild_id,
+        context_is_strong,
+        context_reason,
+        lane_source_meta,
+    )
+    logging.info(
+        f"website_relay_lane_selected guild={guild_id} lane={relay_lane} "
+        f"reason={relay_lane_reason} context_is_strong={context_is_strong}"
+    )
+
     recent_topics = _recent_relay_topic_summary(guild_id)
     recent_lines = _recent_relay_messages.get(guild_id, [])[-5:]
     angle_seed = random.choice(RELAY_ANGLE_ROTATION)
@@ -1100,7 +1224,7 @@ async def generate_dynamic_website_relay(guild_id: int) -> tuple[str, str, str, 
         prompt = (
             "You are BNL-01 generating a website-only relay ticker line.\n"
             "Return exactly two plain-text lines.\n"
-            "Line 1: message about 220-360 chars, complete sentence(s), no ellipsis, and never cut mid-word or mid-sentence.\n"
+            "Line 1: message about 220-300 chars, complete sentence(s), no ellipsis, and never cut mid-word or mid-sentence.\n"
             "Line 2: current directive about 120-220 chars, complete sentence(s), no ellipsis, and never cut mid-word or mid-sentence.\n"
             "No markdown labels.\n"
             "Public line must be 1-2 compact sentences max.\n"
@@ -1108,6 +1232,7 @@ async def generate_dynamic_website_relay(guild_id: int) -> tuple[str, str, str, 
             "Never invent users, channels, events, or topics.\n"
             "If concrete details are missing, explicitly say public signal is thin/unclear instead of pretending there is current activity.\n"
             "Do not exceed the character ranges and do not rely on truncation repair. Return complete sentences only.\n"
+            "Do not publish raw internal diagnostic terms like public_context_weak.\n"
             "If context is weak, use a short complete archival/low-signal fallback in range.\n"
             "Avoid stale phrases and concepts: submission pressure, short-burst chatter, archive buffer, signal activity high, "
             "community signal activity, engagement metrics, across all channels, broadcast-side movement.\n"
@@ -1124,6 +1249,7 @@ async def generate_dynamic_website_relay(guild_id: int) -> tuple[str, str, str, 
             "Hard-avoid these public phrases: elevated query volume, submission protocols, archival integrity, monitoring active, recurring mentions, ongoing observation, data acquisition, process and categorize incoming user data streams, user engagement remains stable, pattern deviations.\n"
             "Do not invent concrete new canon events, releases, sponsors, incidents, characters, or secrets.\n"
             "Keep lore abstract if used. Do not mention 9 Bit unless context includes it.\n"
+            f"{_build_relay_lane_prompt(relay_lane, _has_source_safe_public_residue(lane_source_meta))}\n"
             f"Angle seed for this update: {angle_seed}.\n"
             f"Recent relay topics to avoid repeating unless context demands it: {recent_topics}.\n"
             f"Recent public lines to avoid mirroring: {' || '.join(recent_lines) or 'none'}.\n"
@@ -1140,7 +1266,7 @@ async def generate_dynamic_website_relay(guild_id: int) -> tuple[str, str, str, 
     if generated:
         lines = [ln.strip() for ln in generated.splitlines() if ln.strip()]
         if lines:
-            relay_message = sanitize_website_status_message(lines[0], limit=360, min_chars=220)
+            relay_message = sanitize_website_status_message(lines[0], limit=300, min_chars=220)
         if len(lines) > 1:
             current_directive = sanitize_website_status_message(lines[1], limit=220, min_chars=120)
 
@@ -1148,17 +1274,12 @@ async def generate_dynamic_website_relay(guild_id: int) -> tuple[str, str, str, 
     low_signal_recent_messages = _recent_relay_messages.get(guild_id, [])[-5:]
     if _last_website_status_message:
         low_signal_recent_messages = low_signal_recent_messages + [_last_website_status_message]
-    low_signal_meta = {
-        "signal_summary": signal_summary,
-        "has_relay_context": bool(relay_context.strip()),
-        "source_channel_count": source_channel_count,
-        "message_count": len(messages),
-        "unique_users": unique_users,
-    }
+    low_signal_meta = dict(lane_source_meta)
+    low_signal_meta["relay_lane"] = relay_lane
 
     if not relay_message or _contains_stale_phrase(relay_message):
         if not context_is_strong:
-            relay_message = await build_low_signal_relay_message(guild_id, context_reason, low_signal_recent_messages, low_signal_meta)
+            relay_message = await build_low_signal_relay_message(guild_id, context_reason, low_signal_recent_messages, low_signal_meta, relay_lane=relay_lane)
             low_signal_generated = True
         else:
             relay_message = _pick_varied_relay_fallback(_last_website_status_message)
@@ -1167,15 +1288,47 @@ async def generate_dynamic_website_relay(guild_id: int) -> tuple[str, str, str, 
 
     if relay_message.strip().lower() == (_last_website_status_message or "").strip().lower() or _is_repetitive_relay(guild_id, relay_message):
         if not context_is_strong:
+            old_lane = relay_lane
+            retry_lane, retry_reason = _select_website_relay_lane(
+                guild_id,
+                context_is_strong,
+                context_reason,
+                low_signal_meta,
+                avoid_lane=old_lane,
+            )
+            if retry_lane != old_lane:
+                relay_lane = retry_lane
+                low_signal_meta["relay_lane"] = relay_lane
+                relay_lane_reason = retry_reason
+                logging.info(
+                    f"website_relay_lane_retry guild={guild_id} old_lane={old_lane} "
+                    f"new_lane={relay_lane} reason=similar_to_recent"
+                )
             low_signal_recent_messages = low_signal_recent_messages + [relay_message]
-            relay_message = await build_low_signal_relay_message(guild_id, context_reason, low_signal_recent_messages, low_signal_meta)
+            relay_message = await build_low_signal_relay_message(guild_id, context_reason, low_signal_recent_messages, low_signal_meta, relay_lane=relay_lane)
             low_signal_generated = True
         else:
             relay_message = _pick_varied_relay_fallback(relay_message)
     if _contains_stale_phrase(relay_message):
         if not context_is_strong:
+            old_lane = relay_lane
+            retry_lane, retry_reason = _select_website_relay_lane(
+                guild_id,
+                context_is_strong,
+                context_reason,
+                low_signal_meta,
+                avoid_lane=old_lane,
+            )
+            if retry_lane != old_lane:
+                relay_lane = retry_lane
+                low_signal_meta["relay_lane"] = relay_lane
+                relay_lane_reason = retry_reason
+                logging.info(
+                    f"website_relay_lane_retry guild={guild_id} old_lane={old_lane} "
+                    f"new_lane={relay_lane} reason=stale_phrase"
+                )
             low_signal_recent_messages = low_signal_recent_messages + [relay_message]
-            relay_message = await build_low_signal_relay_message(guild_id, context_reason, low_signal_recent_messages, low_signal_meta)
+            relay_message = await build_low_signal_relay_message(guild_id, context_reason, low_signal_recent_messages, low_signal_meta, relay_lane=relay_lane)
             low_signal_generated = True
         else:
             relay_message = _pick_varied_relay_fallback(relay_message)
@@ -1192,6 +1345,7 @@ async def generate_dynamic_website_relay(guild_id: int) -> tuple[str, str, str, 
     )
     _remember_relay_message(guild_id, relay_message)
     _remember_relay_topic(guild_id, relay_message)
+    _remember_relay_lane(guild_id, relay_lane)
     if context_is_strong:
         logging.info(
             f"website_relay_fresh_context_detected mode={mode} reason={context_reason} elapsed_seconds=0 "
@@ -1202,6 +1356,9 @@ async def generate_dynamic_website_relay(guild_id: int) -> tuple[str, str, str, 
         "reason": context_reason,
         "has_specific_context": bool(relay_context.strip()),
         "source_channel_count": source_channel_count,
+        "relay_lane": relay_lane,
+        "relay_lane_reason": relay_lane_reason,
+        "dormant_signal_enabled": False,
         "is_weak_fallback": (not context_is_strong and not low_signal_generated and _is_weak_context_fallback(relay_message)),
         "is_low_signal_dynamic": (not context_is_strong and low_signal_generated),
     }
