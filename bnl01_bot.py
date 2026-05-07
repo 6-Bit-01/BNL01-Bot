@@ -897,13 +897,163 @@ def _build_relay_lane_prompt(lane: str, has_public_residue: bool) -> str:
         if has_public_residue
         else "Residual echo is not allowed because no source-safe recent public residue is available."
     )
+    current_signal_note = (
+        "If current_signal is selected, describe real current eligible public context only; "
+        "do not use it for generic thin-signal, quiet-channel, or fallback text. "
+        "If the available context is weak or thin, the lane should be carrier_trace, network_posture, or residual_echo instead."
+    )
     return (
         f"Selected relay lane: {safe_lane}.\n"
         "Write only within this lane.\n"
         f"Lane rule: {RELAY_LANE_RULES.get(safe_lane, RELAY_LANE_RULES['carrier_trace'])}\n"
+        f"{current_signal_note}\n"
         f"{residue_note}\n"
         f"{disabled_note}\n"
+        "Do not contradict the selected lane; if the line says public signal is thin, unclear, quiet, or nothing fresh cleared, it is not a current_signal line.\n"
     )
+
+
+def _is_relay_show_window_active(now_pacific: datetime = None) -> bool:
+    """Return true only during the conservative Friday BARCODE Radio show/pre-show window."""
+    now = now_pacific or datetime.now(PACIFIC_TZ)
+    if now.tzinfo is None:
+        now = PACIFIC_TZ.localize(now)
+    else:
+        now = now.astimezone(PACIFIC_TZ)
+    if now.weekday() != 4:
+        return False
+    show_start = now.replace(hour=18, minute=40, second=0, microsecond=0)
+    window_start = show_start - timedelta(minutes=30)
+    window_end = show_start + timedelta(hours=3, minutes=30)
+    return window_start <= now <= window_end
+
+
+RELAY_FORBIDDEN_SHOW_STATE_PATTERNS = (
+    (re.compile(r"\b(?:an?\s+echo\s+of\s+)?6\s*bit[’']s\s+imminent\s+broadcast\b", re.IGNORECASE), "six_bit_imminent_broadcast", "the next scheduled BARCODE Radio broadcast"),
+    (re.compile(r"\bimminent\s+broadcast\b", re.IGNORECASE), "imminent_broadcast", "next scheduled broadcast"),
+    (re.compile(r"\bbroadcast\s+is\s+imminent\b", re.IGNORECASE), "broadcast_is_imminent", "broadcast remains scheduled"),
+    (re.compile(r"\bpre[-\s]?broadcast\b", re.IGNORECASE), "pre_broadcast", "scheduled broadcast"),
+    (re.compile(r"\bpre[-\s]?show\s+signal\b", re.IGNORECASE), "pre_show_signal", "upcoming BARCODE Radio cycle"),
+    (re.compile(r"\bhost\s+protocol\s+activat(?:ing|es|ed)\b", re.IGNORECASE), "host_protocol_activating", "host channel remains scheduled"),
+    (re.compile(r"\bhost\s+protocol\s+initiali[sz](?:ing|ed|es)?\b", re.IGNORECASE), "host_protocol_initialized", "host channel remains scheduled"),
+    (re.compile(r"\bbroadcast\s+window\s+open(?:ing|s|ed)?\b", re.IGNORECASE), "broadcast_window_opening", "future broadcast window"),
+    (re.compile(r"\blive\s+window\b", re.IGNORECASE), "live_window", "future broadcast window"),
+    (re.compile(r"\b6\s*bit\s+is\s+about\s+to\s+go\s+live\b", re.IGNORECASE), "six_bit_about_to_go_live", "6 Bit remains scheduled for the next BARCODE Radio cycle"),
+    (re.compile(r"\b(?:about\s+to\s+go\s+live|going\s+live\s+soon|live\s+now|now\s+live|on[-\s]?air\s+now)\b", re.IGNORECASE), "active_live_claim", "scheduled for a future BARCODE Radio window"),
+)
+
+
+RELAY_SHOW_CONTEXT_MARKERS = (
+    "barcode radio",
+    "6 bit",
+    "6:40",
+    "tiktok",
+    "broadcast",
+    "friday",
+    "show",
+    "on-air",
+    "on air",
+)
+
+
+def _relay_context_supports_show_reference(*texts: str) -> bool:
+    combined = " ".join(t or "" for t in texts).lower()
+    return any(marker in combined for marker in RELAY_SHOW_CONTEXT_MARKERS)
+
+
+def _message_mentions_show_context(message: str) -> bool:
+    return _relay_context_supports_show_reference(message)
+
+
+def _drop_show_context_sentences(message: str) -> str:
+    sentences = re.findall(r"[^.!?]+[.!?]", clean_website_text(message))
+    kept = [s.strip() for s in sentences if not _message_mentions_show_context(s)]
+    return " ".join(kept).strip()
+
+
+def _sanitize_relay_temporal_claims(
+    message: str,
+    guild_id: int,
+    *,
+    show_context_supported: bool = False,
+    now_pacific: datetime = None,
+    limit: int = 360,
+    min_chars: int = 0,
+) -> str:
+    candidate = clean_website_text(message)
+    if not candidate:
+        return ""
+    if _is_relay_show_window_active(now_pacific):
+        return fit_complete_statement(candidate, limit=limit, min_chars=min_chars, fallback="")
+
+    changed = False
+    for pattern, phrase_key, replacement in RELAY_FORBIDDEN_SHOW_STATE_PATTERNS:
+        if pattern.search(candidate):
+            candidate = pattern.sub(replacement, candidate)
+            changed = True
+            logging.info(
+                f"website_relay_temporal_sanitize guild={guild_id} "
+                f"reason=show_window_inactive phrase={phrase_key}"
+            )
+
+    if _message_mentions_show_context(candidate) and not show_context_supported:
+        stripped = _drop_show_context_sentences(candidate)
+        if stripped:
+            candidate = stripped
+            changed = True
+            logging.info(
+                f"website_relay_temporal_sanitize guild={guild_id} "
+                "reason=unsupported_show_context phrase=show_reference_removed"
+            )
+        else:
+            logging.info(
+                f"website_relay_temporal_sanitize guild={guild_id} "
+                "reason=unsupported_show_context phrase=show_reference_rejected"
+            )
+            return ""
+
+    sanitized = fit_complete_statement(candidate, limit=limit, min_chars=min_chars, fallback="")
+    if not sanitized:
+        return ""
+    if any(pattern.search(sanitized) for pattern, _phrase_key, _replacement in RELAY_FORBIDDEN_SHOW_STATE_PATTERNS):
+        logging.info(
+            f"website_relay_temporal_sanitize guild={guild_id} "
+            "reason=show_window_inactive phrase=unresolved_active_show_claim"
+        )
+        return ""
+    if changed and sanitized != candidate:
+        logging.info(f"website_relay_temporal_sanitize guild={guild_id} reason=complete_statement_refit phrase=boundary")
+    return sanitized
+
+
+def _validate_relay_lane_adherence(message: str, lane: str, context_is_strong: bool, guild_id: int) -> tuple[bool, str]:
+    safe_lane = lane if lane in RELAY_LANES else "carrier_trace"
+    lowered = (message or "").lower()
+    thin_signal_markers = (
+        "public signal is thin",
+        "signal is thin",
+        "public signal is quiet",
+        "public channels are quiet",
+        "public corridor is quiet",
+        "nothing fresh",
+        "no fresh public",
+        "no specific recent",
+        "unclear",
+        "weak signal",
+        "thin signal",
+        "quiet public",
+    )
+    if safe_lane == "current_signal":
+        if not context_is_strong:
+            logging.info(f"website_relay_lane_mismatch guild={guild_id} lane={safe_lane} reason=weak_context")
+            return False, "weak_context"
+        if any(marker in lowered for marker in thin_signal_markers):
+            logging.info(f"website_relay_lane_mismatch guild={guild_id} lane={safe_lane} reason=thin_signal_text")
+            return False, "thin_signal_text"
+    if safe_lane == "residual_echo" and not any(marker in lowered for marker in ("residue", "echo", "afterimage", "archive", "still on", "recent")):
+        logging.info(f"website_relay_lane_mismatch guild={guild_id} lane={safe_lane} reason=missing_residual_anchor")
+        return False, "missing_residual_anchor"
+    return True, ""
 
 
 def _remember_relay_lane(guild_id: int, lane: str):
@@ -927,6 +1077,15 @@ def _sanitize_low_signal_candidate(message: str, guild_id: int, recent_relay_mes
     if any(term in lowered for term in LOW_SIGNAL_FORBIDDEN_PUBLIC_TERMS):
         return ""
     if _contains_stale_phrase(candidate):
+        return ""
+    candidate = _sanitize_relay_temporal_claims(
+        candidate,
+        guild_id,
+        show_context_supported=False,
+        limit=300,
+        min_chars=0,
+    )
+    if not candidate:
         return ""
     recent_norm = {_normalize_for_repeat(m) for m in recent_relay_messages if m}
     if _normalize_for_repeat(candidate) in recent_norm:
@@ -985,6 +1144,8 @@ async def build_low_signal_relay_message(guild_id: int, reason: str, recent_rela
         "- No fresh public event has cleared the relay filter.\n"
         "- The website bridge is active.\n"
         "- BNL-01 is observing eligible public channels only.\n"
+        "- Do not mention BARCODE Radio, 6 Bit broadcast timing, pre-broadcast state, host protocol, or live windows unless current eligible public context supports it.\n"
+        "- Outside the real Friday show/pre-show window, never imply the broadcast is imminent, active, opening, live, or about to happen.\n"
         f"- Reason: {safe_reason}.\n"
         f"- Recent relay messages to avoid: {recent_display}.\n"
         f"- {relay_lane_prompt}\n"
@@ -1010,8 +1171,11 @@ async def build_low_signal_relay_message(guild_id: int, reason: str, recent_rela
                 logging.info(f"📊 Tokens used: {tokens}")
             candidate = _sanitize_low_signal_candidate(generated, guild_id, recent_relay_messages)
             if candidate:
-                logging.info(f"website_low_signal_relay_generated guild={guild_id} reason={safe_reason} relay_lane={relay_lane or 'carrier_trace'}")
-                return candidate
+                lane_ok, _lane_reason = _validate_relay_lane_adherence(candidate, relay_lane or "carrier_trace", False, guild_id)
+                if lane_ok:
+                    logging.info(f"website_low_signal_relay_generated guild={guild_id} reason={safe_reason} relay_lane={relay_lane or 'carrier_trace'}")
+                    return candidate
+                candidate = ""
             if generated:
                 logging.info(f"website_low_signal_relay_rejected guild={guild_id} reason={safe_reason} relay_lane={relay_lane or 'carrier_trace'}")
         except Exception as e:
@@ -1166,6 +1330,11 @@ async def generate_dynamic_website_relay(guild_id: int) -> tuple[str, str, str, 
     mode = _website_relay_mode_from_context(messages, now_pt)
     signal_summary = get_recent_signal_summary(guild_id)
     relay_context = _build_relay_context(guild_id)
+    show_context_supported = _relay_context_supports_show_reference(
+        " ".join(messages),
+        signal_summary,
+        relay_context,
+    )
     source_channel_count = len(set(re.findall(r"(#[a-z0-9\-_]{2,})", relay_context.lower()))) if relay_context else 0
     context_is_strong, context_reason = _assess_relay_context_strength(messages, relay_context, unique_users=unique_users, total_chars=total_chars)
     logging.info(f"website_relay_context_sources guild={guild_id} source_channel_count={source_channel_count}")
@@ -1230,7 +1399,9 @@ async def generate_dynamic_website_relay(guild_id: int) -> tuple[str, str, str, 
             "Public line must be 1-2 compact sentences max.\n"
             "Use concrete Discord-side observations when present: recurring display names, channels, topics, jokes, questions, updates, or patterns.\n"
             "Never invent users, channels, events, or topics.\n"
-            "If concrete details are missing, explicitly say public signal is thin/unclear instead of pretending there is current activity.\n"
+            "If concrete details are missing, explicitly say public signal is thin/unclear instead of pretending there is current activity, but do not present that as a current_signal lane.\n"
+            "Do not mention BARCODE Radio, 6 Bit broadcast timing, pre-broadcast state, host protocol, or live windows unless current eligible public context supports it.\n"
+            "Outside the real Friday show/pre-show window, never imply the broadcast is imminent, active, opening, live, or about to happen; use scheduled/future language only if show context is directly supported.\n"
             "Do not exceed the character ranges and do not rely on truncation repair. Return complete sentences only.\n"
             "Do not publish raw internal diagnostic terms like public_context_weak.\n"
             "If context is weak, use a short complete archival/low-signal fallback in range.\n"
@@ -1332,6 +1503,45 @@ async def generate_dynamic_website_relay(guild_id: int) -> tuple[str, str, str, 
             low_signal_generated = True
         else:
             relay_message = _pick_varied_relay_fallback(relay_message)
+
+    lane_ok, lane_mismatch_reason = _validate_relay_lane_adherence(relay_message, relay_lane, context_is_strong, guild_id)
+    if not lane_ok:
+        if not context_is_strong:
+            old_lane = relay_lane
+            retry_lane, retry_reason = _select_website_relay_lane(
+                guild_id,
+                context_is_strong,
+                context_reason,
+                low_signal_meta,
+                avoid_lane=old_lane,
+            )
+            relay_lane = retry_lane
+            low_signal_meta["relay_lane"] = relay_lane
+            relay_lane_reason = retry_reason
+            logging.info(
+                f"website_relay_lane_retry guild={guild_id} old_lane={old_lane} "
+                f"new_lane={relay_lane} reason={lane_mismatch_reason}"
+            )
+            low_signal_recent_messages = low_signal_recent_messages + [relay_message]
+            relay_message = await build_low_signal_relay_message(guild_id, context_reason, low_signal_recent_messages, low_signal_meta, relay_lane=relay_lane)
+            low_signal_generated = True
+        else:
+            relay_message = _pick_varied_relay_fallback(relay_message)
+
+    temporal_sanitized = _sanitize_relay_temporal_claims(
+        relay_message,
+        guild_id,
+        show_context_supported=show_context_supported,
+        now_pacific=now_pt,
+        limit=360,
+        min_chars=220 if context_is_strong else 0,
+    )
+    if temporal_sanitized:
+        relay_message = temporal_sanitized
+    else:
+        relay_message = _weak_context_relay_message(guild_id, signal_summary, relay_context)
+        low_signal_generated = not context_is_strong
+        logging.info(f"website_relay_temporal_sanitize guild={guild_id} reason=fallback_after_rejection phrase=relay_message")
 
     if current_directive.strip().lower() == (_last_website_directive or "").strip().lower():
         options = [d for d in RELAY_DIRECTIVE_FALLBACKS if d.strip().lower() != (_last_website_directive or "").strip().lower()]
