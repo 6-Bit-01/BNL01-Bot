@@ -86,7 +86,7 @@ AMBIENT_MAX_CHARS = 280
 AMBIENT_RETRY_ON_SIMILAR = 1
 AMBIENT_FAIL_RESCHEDULE_MINUTES = 30
 AMBIENT_POST_COOLDOWN_MINUTES = 240
-AMBIENT_DAILY_POST_CAP = 2
+AMBIENT_DAILY_POST_CAP = 1
 AMBIENT_MIN_SIGNAL_MESSAGES = 3
 AMBIENT_MIN_SIGNAL_UNIQUE_USERS = 2
 AMBIENT_MIN_SIGNAL_CHARS = 120
@@ -3440,6 +3440,28 @@ def _reschedule_ambient_soon(guild_id: int, last_msg: str):
     next_dt = datetime.now(PACIFIC_TZ) + timedelta(minutes=AMBIENT_FAIL_RESCHEDULE_MINUTES)
     update_guild_ambient_times(guild_id, last_msg or "", next_dt.isoformat())
 
+def _random_next_day_ambient_time_pacific():
+    now = datetime.now(PACIFIC_TZ)
+    next_day = (now + timedelta(days=1)).date()
+    start_hour = 9
+    end_hour = 22
+    hour = random.randint(start_hour, end_hour)
+    minute = random.randint(0, 59)
+    scheduled = datetime(
+        next_day.year,
+        next_day.month,
+        next_day.day,
+        hour,
+        minute,
+        0,
+    )
+    return PACIFIC_TZ.localize(scheduled)
+
+def schedule_next_day_ambient(guild_id: int, last_msg: str):
+    next_dt = _random_next_day_ambient_time_pacific().isoformat()
+    update_guild_ambient_times(guild_id, last_msg or "", next_dt)
+    return next_dt
+
 def get_ambient_posts_today(guild_id: int, channel_id: int) -> int:
     now = datetime.now(PACIFIC_TZ)
     start_day = now.replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
@@ -4103,6 +4125,50 @@ def _too_similar(candidate: str, previous: list) -> bool:
             return True
     return False
 
+AMBIENT_MODE_OPTIONS = [
+    "room_observation",
+    "memory_echo",
+    "show_cycle_awareness",
+    "quiet_network_presence",
+    "community_pattern",
+]
+_ambient_runtime_state = {}
+
+def _set_ambient_runtime_state(guild_id: int, mode: str = None, skip_reason: str = None):
+    state = _ambient_runtime_state.get(guild_id, {})
+    if mode:
+        state["last_mode"] = mode
+    if skip_reason:
+        state["last_skip_reason"] = skip_reason
+    _ambient_runtime_state[guild_id] = state
+
+def _get_ambient_runtime_state(guild_id: int) -> dict:
+    return _ambient_runtime_state.get(guild_id, {})
+
+def _select_ambient_mode(guild_id: int, show_phase: str) -> str:
+    choices = list(AMBIENT_MODE_OPTIONS)
+    if show_phase == "off_cycle" and "show_cycle_awareness" in choices:
+        choices.remove("show_cycle_awareness")
+    if not choices:
+        choices = ["room_observation"]
+    last_mode = _get_ambient_runtime_state(guild_id).get("last_mode")
+    filtered = [m for m in choices if m != last_mode]
+    return random.choice(filtered or choices)
+
+def _looks_like_internal_process_report(text: str) -> bool:
+    t = _normalize_ambient_text(text)
+    if not t:
+        return True
+    process_patterns = [
+        r"\b(i|bnl|the archive|the network|this system)\b.*\b(processing|catalog|assimilat|integrat|measur|scan|ingest|index)\w*",
+        r"\b(status|archive|network)\s+(update|report)\b",
+        r"\ball\s+(recent|activity|signals|messages)\b.*\b(catalog|processed|indexed|logged)\b",
+    ]
+    for pattern in process_patterns:
+        if re.search(pattern, t):
+            return True
+    return False
+
 async def generate_dynamic_ambient(guild_id: int, channel_id: int) -> str:
     recent_user = get_recent_guild_user_messages(guild_id, limit=AMBIENT_CONTEXT_MESSAGES)
     recent_ambient = get_recent_ambient(guild_id, channel_id=channel_id, limit=AMBIENT_AVOID_LAST)
@@ -4112,7 +4178,15 @@ async def generate_dynamic_ambient(guild_id: int, channel_id: int) -> str:
     avoid_block = "\n".join([f"- {m}" for m in recent_ambient]) if recent_ambient else "- (none)"
 
     temporal = get_temporal_context()
+    ambient_mode = _select_ambient_mode(guild_id, temporal["show_phase"])
 
+    mode_guidance = {
+        "room_observation": "Anchor in a fresh public-room pattern; stay concrete and understated.",
+        "memory_echo": "Let memory tint the line, but keep recent public context as the subject.",
+        "show_cycle_awareness": "Use show-cycle timing only if supported by current phase; avoid hype.",
+        "quiet_network_presence": "Minimal atmospheric presence; no status-report framing.",
+        "community_pattern": "Observe a pattern across several recent public messages without naming users.",
+    }
     prompt = (
         "You are BNL-01. Generate ONE ambient Discord message to post.\n"
         f"Current network time: {temporal['now_str']}\n"
@@ -4128,8 +4202,10 @@ async def generate_dynamic_ambient(guild_id: int, channel_id: int) -> str:
         "- If show_phase is show_day_prebroadcast, you may reference preparation for tonight's show or pre-broadcast checks.\n"
         "- If show_phase is live_now, you may reference an active broadcast or live transmission.\n"
         "- Preserve the impression that BNL-01 is aware of the passing of time.\n"
-        "- Subtly reference topics/patterns from recent conversation if present.\n"
+        "- Anchor the line in recent public conversation context first.\n"
+        "- Memory/curiosity cues are background influence for tone and angle, not the main subject.\n"
         f"- Curiosity mode for this cycle: {curiosity_mode}.\n"
+        f"- Ambient mode for this cycle: {ambient_mode} ({mode_guidance.get(ambient_mode, 'keep variety in rhetorical shape')}).\n"
         "- Curiosity engine should vary behavior by mode:\n"
         "  - short_to_long_bridge: connect fresh short traces to one long memory signal.\n"
         "  - medium_rumination: dwell on a medium memory pattern and infer what it means now.\n"
@@ -4139,6 +4215,8 @@ async def generate_dynamic_ambient(guild_id: int, channel_id: int) -> str:
         "  - light_probe: soft observational check-in when memory is sparse.\n"
         "- You may ask 0-1 light question if it feels natural.\n"
         "- Avoid repeating or closely paraphrasing recent ambient messages.\n"
+        "- Avoid internal process reports where the main subject is BNL/archive/network processing inputs.\n"
+        "- Avoid confident user attribution; do not name specific users unless direct speaker-message pairing is explicit.\n"
         "- Mild corporate tone, faint uncanny undertone.\n"
         "- Do not mention 9 Bit unless 9 Bit appears in the recent conversation context.\n\n"
         "Recent conversation context:\n"
@@ -4151,10 +4229,10 @@ async def generate_dynamic_ambient(guild_id: int, channel_id: int) -> str:
 
     result = trim_to_complete_sentence(_sanitize_ambient(await get_gemini_response(prompt, user_id=0, guild_id=guild_id)), AMBIENT_MAX_CHARS)
 
-    if not result or is_incomplete_ambient_message(result):
+    if not result or is_incomplete_ambient_message(result) or _looks_like_internal_process_report(result):
         retry_result = _sanitize_ambient(await get_gemini_response(prompt, user_id=0, guild_id=guild_id))
-        if not retry_result or is_incomplete_ambient_message(retry_result):
-            logging.warning("Ambient skipped after incomplete retry")
+        if not retry_result or is_incomplete_ambient_message(retry_result) or _looks_like_internal_process_report(retry_result):
+            logging.warning("Ambient skipped after retry (incomplete or internal-process shape)")
             return ""
         result = retry_result
 
@@ -4170,6 +4248,7 @@ async def generate_dynamic_ambient(guild_id: int, channel_id: int) -> str:
         logging.warning(f"⚠️ Ambient skipped after failed retry for guild {guild_id} (duplicate/similar).")
         return ""
 
+    _set_ambient_runtime_state(guild_id, mode=ambient_mode)
     return result
 
 # ==================== DISCORD BOT SETUP ====================
@@ -4231,20 +4310,22 @@ async def ambient_message_task():
                 async with _ambient_post_locks[lock_key]:
                     last_posted_at = get_last_ambient_posted_at(guild_id, channel_id)
                     if last_posted_at and (now - last_posted_at) < timedelta(minutes=AMBIENT_POST_COOLDOWN_MINUTES):
-                        logging.info(f"📡 Ambient skipped for guild {guild_id}: recent post exists in cooldown window.")
+                        _set_ambient_runtime_state(guild_id, skip_reason="cooldown_window")
                         next_scheduled = (last_posted_at + timedelta(minutes=AMBIENT_POST_COOLDOWN_MINUTES)).isoformat()
                         update_guild_ambient_times(guild_id, last_msg or "", next_scheduled)
-                        logging.info(f"📡 Next ambient scheduled for guild {guild_id} at {next_scheduled}")
                         continue
 
                     posts_today = get_ambient_posts_today(guild_id, channel_id)
                     if posts_today >= AMBIENT_DAILY_POST_CAP:
-                        logging.info(f"📡 Ambient skipped for guild {guild_id}: daily cap reached ({posts_today}/{AMBIENT_DAILY_POST_CAP}).")
-                        next_scheduled = _random_time_today_pacific().isoformat()
-                        update_guild_ambient_times(guild_id, last_msg or "", next_scheduled)
+                        prev_reason = _get_ambient_runtime_state(guild_id).get("last_skip_reason")
+                        if prev_reason != "daily_cap_reached":
+                            logging.info(f"📡 Ambient skipped for guild {guild_id}: daily cap reached ({posts_today}/{AMBIENT_DAILY_POST_CAP}).")
+                        _set_ambient_runtime_state(guild_id, skip_reason="daily_cap_reached")
+                        schedule_next_day_ambient(guild_id, last_msg or "")
                         continue
 
                     if not has_ambient_signal(guild_id):
+                        _set_ambient_runtime_state(guild_id, skip_reason="weak_signal")
                         logging.info(f"📡 Ambient skipped for guild {guild_id}: weak/no-signal context detected.")
                         next_scheduled = _random_time_today_pacific().isoformat()
                         update_guild_ambient_times(guild_id, last_msg or "", next_scheduled)
@@ -4261,22 +4342,21 @@ async def ambient_message_task():
                             logging.info(f"📡 Ambient retry succeeded for guild {guild_id} after incomplete rejection.")
                         else:
                             logging.warning(f"⚠️ Ambient skipped after failed retry for guild {guild_id} (incomplete).")
+                            _set_ambient_runtime_state(guild_id, skip_reason="failed_retry_incomplete")
                             _reschedule_ambient_soon(guild_id, last_msg or "")
-                            logging.info(f"📡 Next ambient scheduled for guild {guild_id}")
                             continue
 
                     # No canned fallback: if generation fails, do not post; reschedule soon
                     if not msg:
                         logging.warning(f"⚠️ Ambient generation failed for guild {guild_id}; rescheduling soon.")
+                        _set_ambient_runtime_state(guild_id, skip_reason="generation_failed_or_rejected")
                         _reschedule_ambient_soon(guild_id, last_msg or "")
-                        logging.info(f"📡 Next ambient scheduled for guild {guild_id}")
                         continue
 
                     await channel.send(msg)
                     log_ambient(guild_id, channel_id, msg, source_type="ambient")
 
-                    next_scheduled = _random_time_today_pacific().isoformat()
-                    update_guild_ambient_times(guild_id, msg, next_scheduled)
+                    next_scheduled = schedule_next_day_ambient(guild_id, msg)
                     logging.info(f"📡 Ambient posted successfully in guild {guild_id}")
                     logging.info(f"📡 Next ambient scheduled for guild {guild_id} at {next_scheduled}")
 
@@ -7261,6 +7341,10 @@ async def bnl_status(interaction: discord.Interaction):
 
     active_channel_id = get_guild_config(guild.id)
     active_channel = guild.get_channel(active_channel_id) if active_channel_id else None
+    _active_channel_id, _last_ambient_message, next_ambient_message_at = get_guild_ambient_state(guild.id)
+    ambient_posts_today = get_ambient_posts_today(guild.id, active_channel_id) if active_channel_id else 0
+    last_ambient_posted_at = get_last_ambient_posted_at(guild.id, active_channel_id) if active_channel_id else None
+    ambient_runtime = _get_ambient_runtime_state(guild.id)
     testing_channel = guild.get_channel(BNL_TESTING_CHANNEL_ID) if BNL_TESTING_CHANNEL_ID else None
     current_channel = interaction.channel if isinstance(interaction.channel, discord.abc.GuildChannel) else None
     policy = resolve_channel_policy(current_channel)
@@ -7280,6 +7364,11 @@ async def bnl_status(interaction: discord.Interaction):
         f"- relay_eligibility: `{relay_eligibility}`",
         f"- context_visibility: `{context_visibility}`",
         f"- ambient_throttle: cooldown=`{AMBIENT_POST_COOLDOWN_MINUTES}m` daily_cap=`{AMBIENT_DAILY_POST_CAP}` min_signal_messages=`{AMBIENT_MIN_SIGNAL_MESSAGES}` min_signal_users=`{AMBIENT_MIN_SIGNAL_UNIQUE_USERS}`",
+        f"- ambient_posts_today: `{ambient_posts_today}`",
+        f"- last_ambient_posted_at: `{last_ambient_posted_at.isoformat() if last_ambient_posted_at else 'none'}`",
+        f"- next_ambient_message_at: `{next_ambient_message_at or 'none'}`",
+        f"- last_ambient_mode: `{ambient_runtime.get('last_mode', 'unknown')}`",
+        f"- last_ambient_skip_reason: `{ambient_runtime.get('last_skip_reason', 'unknown')}`",
         f"- website_relay_enabled: `{BNL_WEBSITE_RELAY_ENABLED}` (interval `{BNL_WEBSITE_RELAY_INTERVAL_MINUTES}m`)",
         f"- website_bridge_configured: `{'yes' if website_bridge_configured else 'no'}`",
         f"- control_flags_source: `{flags_source_state}`",
