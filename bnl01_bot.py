@@ -2313,6 +2313,79 @@ def add_short_memory_trace(user_id: int, guild_id: int, content: str):
     _add_memory_tier_entry(user_id, guild_id, "short", summary, _memory_salience_score(text))
     _consolidate_memory_tiers(user_id, guild_id)
 
+
+def _is_low_value_acknowledgement(text: str) -> bool:
+    t = (text or "").strip().lower()
+    if not t:
+        return True
+    blocked_exact = {
+        "received.",
+        "received",
+        "acknowledged.",
+        "acknowledged",
+        "no response needed.",
+        "no response needed",
+        "ok",
+        "okay",
+        "thanks",
+        "thank you",
+        "lol",
+        "lmao",
+    }
+    if t in blocked_exact:
+        return True
+    blocked_fragments = (
+        "no response needed",
+        "testing normal public channel behavior",
+        "diagnostic",
+        "diagnostics",
+    )
+    return any(fragment in t for fragment in blocked_fragments)
+
+
+def is_meaningful_memory_candidate(content: str, role: str) -> bool:
+    text = (content or "").strip()
+    if not text:
+        return False
+    if len(text) < 16:
+        return False
+    if len(text.split()) <= 2:
+        return False
+    if _is_low_value_acknowledgement(text):
+        return False
+    if role == "model":
+        model_low_value_markers = (
+            "copy that",
+            "acknowledged",
+            "no response needed",
+            "status pulse",
+            "diagnostic",
+        )
+        lowered = text.lower()
+        if any(marker in lowered for marker in model_low_value_markers):
+            return False
+    return True
+
+
+def maybe_add_memory_trace(
+    user_id: int,
+    guild_id: int,
+    content: str,
+    channel_policy: str,
+    role: str,
+    source=None,
+    channel_name: str = "",
+):
+    policy = (channel_policy or "").strip().lower()
+    normalized_role = (role or "").strip().lower()
+    if policy not in {"public_home", "public_context"}:
+        return
+    if normalized_role == "model":
+        return
+    if not is_meaningful_memory_candidate(content, normalized_role):
+        return
+    add_short_memory_trace(user_id, guild_id, content)
+
 def get_memory_tiers(user_id: int, guild_id: int):
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
@@ -2770,6 +2843,57 @@ def get_guild_policy_counts(guild_id: int):
         if policy in counts:
             counts[policy] = int(count)
     return counts
+
+
+def get_guild_role_counts(guild_id: int):
+    counts = {"user": 0, "model": 0}
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        SELECT role, COUNT(*)
+        FROM conversations
+        WHERE guild_id=?
+          AND role IN ('user', 'model')
+        GROUP BY role
+        """,
+        (guild_id,),
+    )
+    rows = cursor.fetchall()
+    conn.close()
+    for role, count in rows:
+        if role in counts:
+            counts[role] = int(count)
+    return counts
+
+
+def get_unknown_policy_model_row_count(guild_id: int) -> int:
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        SELECT COUNT(*)
+        FROM conversations
+        WHERE guild_id=?
+          AND role='model'
+          AND (channel_policy IS NULL OR TRIM(channel_policy) = '' OR channel_policy = 'unknown')
+        """,
+        (guild_id,),
+    )
+    row = cursor.fetchone()
+    conn.close()
+    return int(row[0]) if row and row[0] is not None else 0
+
+
+def memory_tiers_has_source_fields() -> bool:
+    required_fields = {"channel_name", "channel_policy", "role", "source_visibility", "source_conversation_id"}
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("PRAGMA table_info(memory_tiers)")
+    rows = cursor.fetchall()
+    conn.close()
+    existing = {str(r[1]) for r in rows if len(r) > 1}
+    return required_fields.issubset(existing)
 def get_user_profile(user_id: int, guild_id: int):
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
@@ -3061,7 +3185,15 @@ def save_user_message(user_id: int, user_name: str, guild_id: int, content: str,
     prune_conversation_history(user_id, guild_id, MAX_CONVERSATION_ROWS_PER_USER)
     update_relationship_state(user_id, guild_id, content, delta_affinity=0.06)
     update_user_habits(user_id, guild_id, content)
-    add_short_memory_trace(user_id, guild_id, content)
+    maybe_add_memory_trace(
+        user_id,
+        guild_id,
+        content,
+        channel_policy=channel_policy,
+        role="user",
+        source="conversations",
+        channel_name=channel_name,
+    )
     for key, value, conf in extract_user_facts(content):
         upsert_user_fact(user_id, guild_id, key, value, conf)
 
@@ -3079,7 +3211,15 @@ def save_model_message(user_id: int, guild_id: int, content: str, channel_name: 
     conn.close()
     prune_conversation_history(user_id, guild_id, MAX_CONVERSATION_ROWS_PER_USER)
     update_relationship_state(user_id, guild_id, content, delta_affinity=0.04)
-    add_short_memory_trace(user_id, guild_id, content)
+    maybe_add_memory_trace(
+        user_id,
+        guild_id,
+        content,
+        channel_policy=channel_policy,
+        role="model",
+        source="conversations",
+        channel_name=channel_name,
+    )
     if any(k in (content or "").lower() for k in ("try this", "steps", "option", "recommend")):
         add_relationship_journal(user_id, guild_id, "support_response", f"BNL provided guidance: {(content or '')[:160]}")
 
@@ -7061,6 +7201,12 @@ async def bnl_memory_check(interaction: discord.Interaction):
     recent_public_rows = get_recent_public_context_count(guild.id, limit=500)
     policy_metadata_exists = conversation_rows_have_channel_policy_metadata(guild.id)
     policy_counts = get_guild_policy_counts(guild.id)
+    role_counts = get_guild_role_counts(guild.id)
+    unknown_policy_model_rows = get_unknown_policy_model_row_count(guild.id)
+    tier_counts = get_memory_tier_counts(interaction.user.id, guild.id)
+    memory_source_fields_available = memory_tiers_has_source_fields()
+    memory_tier_source_policy_state = "source-gated" if memory_source_fields_available else "source fields unavailable"
+    sealed_test_rows_present = policy_counts.get("sealed_test", 0) > 0
 
     lines = [
         "**BNL Memory Diagnostic (safe)**",
@@ -7080,7 +7226,17 @@ async def bnl_memory_check(interaction: discord.Interaction):
         f"- policy_count_public_home: `{policy_counts.get('public_home', 0)}`",
         f"- policy_count_public_context: `{policy_counts.get('public_context', 0)}`",
         f"- policy_count_public_selective: `{policy_counts.get('public_selective', 0)}`",
-        "- sealed_test_memory_capture: `disabled`",
+        f"- role_count_user: `{role_counts.get('user', 0)}`",
+        f"- role_count_model: `{role_counts.get('model', 0)}`",
+        f"- unknown_policy_model_rows: `{unknown_policy_model_rows}`",
+        f"- memory_tier_count_short: `{tier_counts.get('short', 0)}`",
+        f"- memory_tier_count_medium: `{tier_counts.get('medium', 0)}`",
+        f"- memory_tier_count_long: `{tier_counts.get('long', 0)}`",
+        f"- memory_tiers_source_fields_available: `{'yes' if memory_source_fields_available else 'no'}`",
+        "- memory_tier_future_writes_source_gated: `yes`",
+        f"- memory_tiers_source_policy: `{memory_tier_source_policy_state}`",
+        "- sealed_test_passive_capture: `disabled`",
+        f"- sealed_test_conversation_rows: `{'present' if sealed_test_rows_present else 'none'}`",
         "- sealed_test_free_speak: `enabled`",
         "- raw_message_dump: `disabled`",
         "- memory_mutation: `none (read-only diagnostic)`",
