@@ -685,6 +685,7 @@ _recent_relay_topics: dict[int, list[str]] = {}
 _recent_weak_context_modes: dict[int, list[str]] = {}
 _last_relay_lane_by_guild: dict[int, str] = {}
 _recent_relay_lanes_by_guild = defaultdict(lambda: deque(maxlen=8))
+_last_relay_metadata_by_guild: dict[int, dict] = {}
 RELAY_ANGLE_ROTATION = [
     "whisper",
     "wonder",
@@ -1300,12 +1301,12 @@ def _remember_relay_message(guild_id: int, message: str, max_items: int = 8):
         del pool[:-max_items]
 
 
-def _build_relay_context(guild_id: int, limit: int = 20) -> str:
+def _build_relay_context(guild_id: int, limit: int = 20) -> tuple[str, dict]:
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
     cursor.execute(
         """
-        SELECT user_name, content
+        SELECT user_name, content, channel_policy, channel_name
         FROM conversations
         WHERE guild_id = ? AND role = 'user'
           AND channel_policy IN ('public_home', 'public_context', 'public_selective')
@@ -1316,28 +1317,42 @@ def _build_relay_context(guild_id: int, limit: int = 20) -> str:
     )
     rows = cursor.fetchall()
     conn.close()
-    if not rows:
-        return ""
-    names: list[str] = []
-    channels: list[str] = []
-    snippets: list[str] = []
-    for user_name, content in rows:
-        msg = (content or "").strip()
-        if not msg:
+    blocks: list[str] = []
+    speakers = set()
+    channels = set()
+    policies = set()
+    for idx, row in enumerate(rows, start=1):
+        user_name = (row[0] or "").strip() if len(row) > 0 else ""
+        content = (row[1] or "").strip() if len(row) > 1 else ""
+        channel_policy = (row[2] or "").strip() if len(row) > 2 else ""
+        channel_name = (row[3] or "").strip() if len(row) > 3 else ""
+        if not content:
             continue
-        if user_name and user_name not in names:
-            names.append(user_name)
-        channels.extend([c for c in re.findall(r"(#[a-z0-9\-_]{2,})", msg.lower()) if c not in channels])
-        if len(snippets) < 6:
-            snippets.append(msg[:120])
-    sections = []
-    if names:
-        sections.append("Recurring names: " + ", ".join(names[:6]))
-    if channels:
-        sections.append("Channels referenced: " + ", ".join(channels[:6]))
-    if snippets:
-        sections.append("Recent user lines: " + " | ".join(snippets))
-    return " || ".join(sections)
+        speaker = user_name or "unknown_user"
+        policy = channel_policy or "unknown_policy"
+        channel = channel_name or "unknown"
+        snippet = clean_website_text(content)[:180]
+        if not snippet:
+            continue
+        speakers.add(speaker.lower())
+        policies.add(policy)
+        channels.add(channel.lower())
+        blocks.append(
+            f"[public_message_{len(blocks)+1}]\n"
+            f"speaker: {speaker}\n"
+            f"policy: {policy}\n"
+            f"channel: {channel}\n"
+            f"content: {snippet}"
+        )
+    context = "\n\n".join(blocks)
+    meta = {
+        "source_message_count": len(blocks),
+        "source_speaker_count": len(speakers),
+        "source_channel_count": len(channels),
+        "eligible_policies": sorted(policies),
+        "attribution_context_format": "structured_pairs",
+    }
+    return context, meta
 
 
 async def generate_dynamic_website_relay(guild_id: int) -> tuple[str, str, str, dict]:
@@ -1365,13 +1380,13 @@ async def generate_dynamic_website_relay(guild_id: int) -> tuple[str, str, str, 
     now_pt = datetime.now(PACIFIC_TZ)
     mode = _website_relay_mode_from_context(messages, now_pt)
     signal_summary = get_recent_signal_summary(guild_id)
-    relay_context = _build_relay_context(guild_id)
+    relay_context, relay_context_meta = _build_relay_context(guild_id)
     show_context_supported = _relay_context_supports_show_reference(
         " ".join(messages),
         signal_summary,
         relay_context,
     )
-    source_channel_count = len(set(re.findall(r"(#[a-z0-9\-_]{2,})", relay_context.lower()))) if relay_context else 0
+    source_channel_count = relay_context_meta.get("source_channel_count", 0)
     context_is_strong, context_reason = _assess_relay_context_strength(messages, relay_context, unique_users=unique_users, total_chars=total_chars)
     logging.info(f"website_relay_context_sources guild={guild_id} source_channel_count={source_channel_count}")
     logging.info(f"website_relay_recent_message_count guild={guild_id} count={len(messages)}")
@@ -1395,8 +1410,8 @@ async def generate_dynamic_website_relay(guild_id: int) -> tuple[str, str, str, 
         "signal_summary": signal_summary,
         "has_relay_context": bool(relay_context.strip()),
         "source_channel_count": source_channel_count,
-        "message_count": len(messages),
-        "unique_users": unique_users,
+        "message_count": relay_context_meta.get("source_message_count", len(messages)),
+        "unique_users": relay_context_meta.get("source_speaker_count", unique_users),
     }
     relay_lane, relay_lane_reason = _select_website_relay_lane(
         guild_id,
@@ -1434,6 +1449,11 @@ async def generate_dynamic_website_relay(guild_id: int) -> tuple[str, str, str, 
             "No markdown labels.\n"
             "Public line must be 1-2 compact sentences max.\n"
             "Use concrete Discord-side observations when present: recurring display names, channels, topics, jokes, questions, updates, or patterns.\n"
+            "Speaker attribution must remain tied to exact supplied speaker/message blocks.\n"
+            "Do not transfer one user's statement to another user.\n"
+            "Do not infer that a listed name said a line unless that line is in that person's message block.\n"
+            "Only name a user when a specific supplied speaker/message pair directly supports the claim.\n"
+            "When uncertain, do not name the person; prefer generalized room language like people are talking about/public chatter is leaning toward/several recent messages point at.\n"
             "Never invent users, channels, events, or topics.\n"
             "If concrete details are missing, explicitly say public signal is thin/unclear instead of pretending there is current activity, but do not present that as a current_signal lane.\n"
             "Do not mention BARCODE Radio, 6 Bit broadcast timing, pre-broadcast state, host protocol, or live windows unless current eligible public context supports it.\n"
@@ -1625,13 +1645,18 @@ async def generate_dynamic_website_relay(guild_id: int) -> tuple[str, str, str, 
         "context_is_strong": context_is_strong,
         "reason": context_reason,
         "has_specific_context": bool(relay_context.strip()),
+        "source_message_count": relay_context_meta.get("source_message_count", len(messages)),
+        "source_speaker_count": relay_context_meta.get("source_speaker_count", unique_users),
         "source_channel_count": source_channel_count,
+        "attribution_context_format": relay_context_meta.get("attribution_context_format", "structured_pairs"),
+        "eligible_policies": relay_context_meta.get("eligible_policies", eligible_policies),
         "relay_lane": relay_lane,
         "relay_lane_reason": relay_lane_reason,
         "dormant_signal_enabled": False,
         "is_weak_fallback": (not context_is_strong and not low_signal_generated and _is_weak_context_fallback(relay_message)),
         "is_low_signal_dynamic": (not context_is_strong and low_signal_generated),
     }
+    _last_relay_metadata_by_guild[guild_id] = dict(metadata)
     return mode, relay_message, fit_complete_statement(current_directive, limit=220, min_chars=120, fallback=RELAY_WEAK_CONTEXT_STANDBY_DIRECTIVE), metadata
 
 
@@ -7373,6 +7398,15 @@ async def bnl_status(interaction: discord.Interaction):
         f"- website_bridge_configured: `{'yes' if website_bridge_configured else 'no'}`",
         f"- control_flags_source: `{flags_source_state}`",
     ]
+    relay_diag = _last_relay_metadata_by_guild.get(guild.id, {})
+    if relay_diag:
+        lines.extend([
+            f"- relay_source_message_count: `{relay_diag.get('source_message_count', 0)}`",
+            f"- relay_source_speaker_count: `{relay_diag.get('source_speaker_count', 0)}`",
+            f"- relay_attribution_context_format: `{relay_diag.get('attribution_context_format', 'structured_pairs')}`",
+            f"- relay_last_context_reason: `{relay_diag.get('reason', 'unknown')}`",
+            f"- relay_last_lane: `{relay_diag.get('relay_lane', 'unknown')}`",
+        ])
     await interaction.response.send_message("\n".join(lines), ephemeral=True)
 
 @tree.command(name="showtest", description="Manually test Friday show-day update behavior.")
