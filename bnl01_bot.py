@@ -5446,7 +5446,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
             generation_elapsed = max(0.0, (datetime.now(PACIFIC_TZ) - batch_start).total_seconds())
             _log_batch_event(logging.INFO, "generation_started_after_wait", guild_id, channel_id, len(collapsed_items), f"payload_count={len(active_packet['payload_items'])};elapsed_seconds={generation_elapsed:.2f};selected_wait_seconds={selected_wait_seconds:.2f}")
             _log_batch_event(logging.INFO, "generation_typing_started", guild_id, channel_id, len(collapsed_items), f"payload_count={len(active_packet['payload_items'])};elapsed_seconds={generation_elapsed:.2f};selected_wait_seconds={selected_wait_seconds:.2f}")
-            async with channel.typing():
+            if True:  # typing indicator disabled: Discord 429 was aborting bot replies
                 response = await get_gemini_response(prompt, user_id=first_uid, guild_id=channel.guild.id)
 
             if not response:
@@ -5469,7 +5469,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                             + "Missing required payload items: " + ", ".join(missing_items) + ". "
                             + "Missing item count: " + str(len(missing_items)) + "."
                         )
-                        async with channel.typing():
+                        if True:  # typing indicator disabled: Discord 429 was aborting bot replies
                             regenerated = await get_gemini_response(correction_prompt, user_id=first_uid, guild_id=channel.guild.id)
                         if regenerated:
                             response = regenerated
@@ -6223,7 +6223,7 @@ async def _generate_direct_payload_session(session_key, reason: str):
     await _apply_direct_response_pacing(True, len(direct_payload_items))
     if _abort_if_invalidated("revision_changed_before_send"):
         return
-    async with anchor_message.channel.typing():
+    if True:  # typing indicator disabled: Discord 429 was aborting on_message
         response = await get_gemini_response(prompt, session["requester_user_id"], session["guild_id"])
     if _abort_if_invalidated("revision_changed_before_send"):
         return
@@ -6233,7 +6233,7 @@ async def _generate_direct_payload_session(session_key, reason: str):
         logging.info(f"direct_payload_completion_check missing_count={len(missing_items)}")
         if missing_items:
             correction_prompt = prompt + "\n\nCORRECTION REQUIRED: Regenerate and include every required payload item explicitly by name.\nMissing required payload items: " + ", ".join(missing_items) + "."
-            async with anchor_message.channel.typing():
+            if True:  # typing indicator disabled: Discord 429 was aborting on_message
                 response = await get_gemini_response(correction_prompt, session["requester_user_id"], session["guild_id"])
             if _abort_if_invalidated("revision_changed_before_send"):
                 return
@@ -6603,7 +6603,7 @@ async def on_message(message: discord.Message):
 
             payload_expected, _ = _detect_request_payload_expectation(direct_content)
             await _apply_direct_response_pacing(payload_expected, len(direct_payload_items))
-            async with message.channel.typing():
+            if True:  # typing indicator disabled: Discord 429 was aborting on_message
                 logging.info(f"direct_payload_generation_started payload_count={len(direct_payload_items)}")
                 response = await get_gemini_response(prompt, message.author.id, message.guild.id)
             if response and direct_payload_items:
@@ -6615,7 +6615,7 @@ async def on_message(message: discord.Message):
                         + "\n\nCORRECTION REQUIRED: Regenerate and include every required payload item explicitly by name.\n"
                         + "Missing required payload items: " + ", ".join(missing_items) + "."
                     )
-                    async with message.channel.typing():
+                    if True:  # typing indicator disabled: Discord 429 was aborting on_message
                         response = await get_gemini_response(correction_prompt, message.author.id, message.guild.id)
                     missing_items = _missing_request_payload_items(direct_payload_items, response or "")
                     logging.info(f"direct_payload_completion_regenerated missing_count={len(missing_items)}")
@@ -6744,7 +6744,7 @@ async def on_message(message: discord.Message):
 
         payload_expected, _ = _detect_request_payload_expectation(direct_content)
         await _apply_direct_response_pacing(payload_expected, len(direct_payload_items))
-        async with message.channel.typing():
+        if True:  # typing indicator disabled: Discord 429 was aborting on_message
             logging.info(f"direct_payload_generation_started payload_count={len(direct_payload_items)}")
             response = await get_gemini_response(prompt, message.author.id, message.guild.id)
         if response and direct_payload_items:
@@ -6756,7 +6756,7 @@ async def on_message(message: discord.Message):
                     + "\n\nCORRECTION REQUIRED: Regenerate and include every required payload item explicitly by name.\n"
                     + "Missing required payload items: " + ", ".join(missing_items) + "."
                 )
-                async with message.channel.typing():
+                if True:  # typing indicator disabled: Discord 429 was aborting on_message
                     response = await get_gemini_response(correction_prompt, message.author.id, message.guild.id)
                 missing_items = _missing_request_payload_items(direct_payload_items, response or "")
                 logging.info(f"direct_payload_completion_regenerated missing_count={len(missing_items)}")
@@ -6849,7 +6849,7 @@ async def on_message(message: discord.Message):
 
         payload_expected, _ = _detect_request_payload_expectation(direct_content)
         await _apply_direct_response_pacing(payload_expected, len(direct_payload_items))
-        async with message.channel.typing():
+        if True:  # typing indicator disabled: Discord 429 was aborting on_message
             logging.info(f"direct_payload_generation_started payload_count={len(direct_payload_items)}")
             response = await get_gemini_response(prompt, message.author.id, message.guild.id)
         if response and direct_payload_items:
@@ -6861,7 +6861,7 @@ async def on_message(message: discord.Message):
                     + "\n\nCORRECTION REQUIRED: Regenerate and include every required payload item explicitly by name.\n"
                     + "Missing required payload items: " + ", ".join(missing_items) + "."
                 )
-                async with message.channel.typing():
+                if True:  # typing indicator disabled: Discord 429 was aborting on_message
                     response = await get_gemini_response(correction_prompt, message.author.id, message.guild.id)
                 missing_items = _missing_request_payload_items(direct_payload_items, response or "")
                 logging.info(f"direct_payload_completion_regenerated missing_count={len(missing_items)}")
