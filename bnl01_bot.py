@@ -92,8 +92,6 @@ AMBIENT_MIN_SIGNAL_UNIQUE_USERS = 2
 AMBIENT_MIN_SIGNAL_CHARS = 120
 AMBIENT_RESCHEDULE_MIN_HOURS = 4
 AMBIENT_RESCHEDULE_MAX_HOURS = 6
-AMBIENT_NEXT_DAY_MIN_HOURS = 20
-AMBIENT_NEXT_DAY_MAX_HOURS = 30
 AMBIENT_SIMILARITY_THRESHOLD = 0.75
 AMBIENT_INCOMPLETE_ENDINGS = {
     "and", "but", "or", "because", "while", "with", "to", "for", "of", "in", "the", "a", "an"
@@ -3444,8 +3442,20 @@ def _reschedule_ambient_soon(guild_id: int, last_msg: str):
 
 def _random_next_day_ambient_time_pacific():
     now = datetime.now(PACIFIC_TZ)
-    delay_hours = random.uniform(AMBIENT_NEXT_DAY_MIN_HOURS, AMBIENT_NEXT_DAY_MAX_HOURS)
-    return now + timedelta(hours=delay_hours)
+    next_day = (now + timedelta(days=1)).date()
+    start_hour = 9
+    end_hour = 22
+    hour = random.randint(start_hour, end_hour)
+    minute = random.randint(0, 59)
+    scheduled = datetime(
+        next_day.year,
+        next_day.month,
+        next_day.day,
+        hour,
+        minute,
+        0,
+    )
+    return PACIFIC_TZ.localize(scheduled)
 
 def schedule_next_day_ambient(guild_id: int, last_msg: str):
     next_dt = _random_next_day_ambient_time_pacific().isoformat()
@@ -4347,7 +4357,6 @@ async def ambient_message_task():
                     log_ambient(guild_id, channel_id, msg, source_type="ambient")
 
                     next_scheduled = schedule_next_day_ambient(guild_id, msg)
-                    _set_ambient_runtime_state(guild_id, skip_reason="posted")
                     logging.info(f"📡 Ambient posted successfully in guild {guild_id}")
                     logging.info(f"📡 Next ambient scheduled for guild {guild_id} at {next_scheduled}")
 
@@ -7222,10 +7231,6 @@ async def bnl_context_check(interaction: discord.Interaction):
     member = interaction.user if isinstance(interaction.user, discord.Member) else guild.get_member(interaction.user.id)
     active_channel_id = get_guild_config(guild.id)
     active_channel = guild.get_channel(active_channel_id) if active_channel_id else None
-    _active_channel_id, _last_ambient_message, next_ambient_message_at = get_guild_ambient_state(guild.id)
-    ambient_posts_today = get_ambient_posts_today(guild.id, active_channel_id) if active_channel_id else 0
-    last_ambient_posted_at = get_last_ambient_posted_at(guild.id, active_channel_id) if active_channel_id else None
-    ambient_runtime = _get_ambient_runtime_state(guild.id)
     testing_channel = guild.get_channel(BNL_TESTING_CHANNEL_ID) if BNL_TESTING_CHANNEL_ID else None
     current_channel = interaction.channel if isinstance(interaction.channel, discord.abc.GuildChannel) else None
     context_category = resolve_channel_policy(current_channel)
