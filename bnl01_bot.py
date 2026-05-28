@@ -2827,9 +2827,13 @@ def build_operations_brief_context(guild_id: int, user_text: str) -> str:
     lines = ["Internal operations context (safe summary only):"]
     active_override = get_active_show_state_override(guild_id)
     if active_override:
-        episode_date = active_override[1] or "unknown_date"
-        safe_summary = _safe_truncate_summary(active_override[2] or "", 160)
-        lines.append(f"- Active show-state override: {episode_date} — {safe_summary}")
+        episode_date = active_override[5] or active_override[1] or "unknown_date"
+        public_safe = bool(active_override[3])
+        if public_safe:
+            safe_summary = _safe_truncate_summary(active_override[2] or "", 160)
+            lines.append(f"- Active show-state override: {episode_date} — {safe_summary}")
+        else:
+            lines.append(f"- Active show-state override: present for {episode_date}, but summary is restricted.")
     else:
         lines.append("- Active show-state override: none currently active.")
 
