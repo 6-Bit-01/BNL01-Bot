@@ -2845,7 +2845,7 @@ def build_operations_brief_context(guild_id: int, user_text: str) -> str:
     else:
         lines.append("- Recent official broadcast memory: none available.")
 
-    flags = get_website_control_flags()
+    flags = get_bnl_control_flags()
     relay_enabled = bool(flags.get("websiteRelayEnabled", True)) if isinstance(flags, dict) else True
     bridge_configured = bool(BNL_STATUS_URL and BNL_API_KEY)
     lines.append(f"- Website relay flag: {'enabled' if relay_enabled else 'disabled'}")
