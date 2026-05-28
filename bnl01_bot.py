@@ -3738,13 +3738,21 @@ def build_scoped_broadcast_memory_context(guild_id: int, scope: str, public_only
 BROADCAST_MEMORY_LANGUAGE_LIFT_GUIDANCE = (
     "Broadcast-memory usage guidance:\n"
     "- Treat cleaned broadcast-memory summaries as factual source context.\n"
+    "- This is a factual BARCODE Radio scheduling/status answer when show-state context is active.\n"
+    "- Lead with the concrete reason from the source summary in the first sentence.\n"
+    "- Keep the source summary as the spine of the answer; do not replace it with atmospheric interpretation.\n"
+    "- Keep show-state answers short: usually 1–3 sentences.\n"
     "- Do not quote raw mod notes wholesale.\n"
     "- Never expose raw_note.\n"
     "- Do not mechanically repeat cleaned_summary verbatim unless it already reads naturally.\n"
     "- Translate memory facts into natural BNL/BARCODE language while preserving factual meaning.\n"
     "- You may use stronger in-universe operational phrasing when appropriate "
     "(for example: internal review, containment review, asset control, broadcast control, Network review, control room intervention).\n"
+    "- Weird signal/physics/adjacent-reality language is allowed only as supporting flavor, not as the cause itself.\n"
+    "- Use BARCODE Network as the default parent organization name.\n"
+    "- If you create a stylistic sub-unit, frame it under BARCODE Network and do not replace BARCODE Network with another parent-entity name.\n"
     "- Do not invent new events, names, accusations, artist details, payments, moderation actions, or private facts.\n"
+    "- Do not invent a different cancellation cause when the source summary already provides one.\n"
     "- Do not canonize artist names, usernames, song titles, or random public phrases.\n"
     "- Official broadcast memory remains source truth; creative wording is surface language only."
 )
@@ -3766,6 +3774,12 @@ def build_show_state_override_context(guild_id: int, user_text: str) -> dict:
         f"- Source summary: {cleaned_summary}",
         "- Normal queue opening does not apply while this episode is unavailable.",
         "- Answer the user's actual question using this context.",
+        "- First sentence: plain factual scheduling/status answer grounded in the source summary.",
+        "- Optional second sentence: BNL/BARCODE operational interpretation that supports the same facts.",
+        "- Optional third sentence: restrained atmospheric/glitch flavor that supports the factual explanation.",
+        "- Do not let atmospheric language carry the explanation by itself.",
+        "- Use BARCODE Network as the default parent organization name.",
+        "- Do not replace BARCODE Network with unsupported parent labels (for example, BARCODE Nexus).",
         "- Do not mention show-state, context block, override, database, diagnostics, test channel, or internal implementation.",
         "- Do not invent new events, artist facts, payments, moderation actions, or private facts.",
         "- Use natural BNL/BARCODE language, not canned wording.",
@@ -5468,6 +5482,12 @@ def _get_recent_show_state_topic_context(guild_id: int, channel_id: int, user_id
                 f"- Source summary: {ctx.get('cleaned_summary', '')}\n"
                 "- The user is following up on the immediately previous BARCODE Radio scheduling answer.\n"
                 "- Answer the current follow-up using the source summary above.\n"
+                "- First sentence: plain factual scheduling/status answer grounded in the source summary.\n"
+                "- Optional second sentence: BNL/BARCODE operational interpretation that supports the same facts.\n"
+                "- Optional third sentence: restrained atmospheric/glitch flavor that supports the factual explanation.\n"
+                "- Do not let atmospheric language carry the explanation by itself.\n"
+                "- Use BARCODE Network as the default parent organization name.\n"
+                "- Do not replace BARCODE Network with unsupported parent labels (for example, BARCODE Nexus).\n"
                 "- Stay on the BARCODE Radio scheduling/cancellation topic unless the user clearly changes topics.\n"
                 "- Do not use unrelated durable memory unless the user explicitly changes topics.\n"
                 "- If the user asks for the reason, explain the cancellation reason from the source summary.\n"
