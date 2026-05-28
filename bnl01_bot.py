@@ -2900,6 +2900,52 @@ def is_internal_operations_request(text: str) -> bool:
     return keyword_hits >= 2
 
 
+def is_member_activity_request(text: str) -> bool:
+    """Detect narrow operator requests for the private R&D member activity readout."""
+    t = re.sub(r"\s+", " ", (text or "").strip().lower())
+    if not t:
+        return False
+    compact = t.replace("/", " ").replace("-", " ")
+    compact = re.sub(r"[^a-z0-9\s']+", " ", compact)
+    compact = re.sub(r"\s+", " ", compact).strip()
+    if not compact:
+        return False
+
+    phrase_hits = (
+        "who joined",
+        "who left",
+        "recent joins",
+        "recent join",
+        "recent leaves",
+        "recent leave",
+        "recent member activity",
+        "new members",
+        "new member",
+        "member activity",
+        "roster activity",
+        "carl bot joins",
+        "carl bot join",
+        "server joins",
+        "server join",
+        "anyone leave",
+        "anyone left",
+        "joins or leaves",
+        "join leave activity",
+        "join and leave activity",
+        "joins and leaves",
+    )
+    if any(phrase in compact for phrase in phrase_hits):
+        return True
+
+    if re.search(r"\bwho\s+(?:has\s+)?(?:joined|left)\b", compact):
+        return True
+    if re.search(r"\b(?:recent|latest)\s+(?:server\s+)?(?:joins|joined|leaves|left)\b", compact):
+        return True
+    if re.search(r"\b(?:join|joins|leave|leaves|left)\b", compact) and re.search(r"\b(?:activity|members?|roster|server|carl\s+bot)\b", compact):
+        return True
+    return False
+
+
 def build_operations_brief_context(guild_id: int, user_text: str) -> str:
     lines = ["Internal operations context (safe summary only):"]
     active_override = get_active_show_state_override(guild_id)
@@ -3970,6 +4016,56 @@ def get_member_activity_event_counts(guild_id: int) -> tuple:
     total = int(total_row[0]) if total_row and total_row[0] is not None else 0
     recent = int(recent_row[0]) if recent_row and recent_row[0] is not None else 0
     return total, recent
+
+
+def get_recent_member_activity_events(guild_id: int, limit: int = 10, days: int = 14) -> list[dict]:
+    """Return safe private member activity fields for approved R&D operator readouts only."""
+    safe_limit = max(1, min(int(limit or 10), 50))
+    safe_days = max(1, min(int(days or 14), 90))
+    since = (datetime.now(PACIFIC_TZ) - timedelta(days=safe_days)).isoformat()
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        SELECT member_name, member_user_id, event_type, source_channel_name, source_kind, created_at
+        FROM member_activity_events
+        WHERE guild_id=? AND created_at>=?
+        ORDER BY created_at DESC
+        LIMIT ?
+        """,
+        (guild_id, since, safe_limit),
+    )
+    rows = cursor.fetchall()
+    conn.close()
+    events = []
+    for member_name, member_user_id, event_type, source_channel_name, source_kind, created_at in rows:
+        events.append(
+            {
+                "member_name": member_name,
+                "member_user_id": member_user_id,
+                "event_type": event_type,
+                "source_channel_name": source_channel_name,
+                "source_kind": source_kind,
+                "created_at": created_at,
+            }
+        )
+    return events
+
+
+def format_member_activity_summary(events: list[dict]) -> str:
+    if not events:
+        return "No private member activity events are logged yet. This will populate when Carl Bot join/leave logs are captured in R&D."
+
+    join_count = sum(1 for event in events if (event.get("event_type") or "").lower() == "joined")
+    leave_count = sum(1 for event in events if (event.get("event_type") or "").lower() == "left")
+    lines = [f"Recent member activity: {join_count} joins, {leave_count} leave{'s' if leave_count != 1 else ''} in the last 14 days."]
+    for event in events[:5]:
+        event_type = (event.get("event_type") or "member event").lower()
+        label = "joined" if event_type == "joined" else "left" if event_type == "left" else "member event"
+        display_name = (event.get("member_name") or event.get("member_user_id") or "Unknown member")
+        timestamp = event.get("created_at") or "unknown time"
+        lines.append(f"{label}: {display_name} — {timestamp}")
+    return "\n".join(lines)
 
 
 def add_broadcast_memory_entry(guild_id: int, message: discord.Message, processed: dict):
@@ -7959,6 +8055,11 @@ async def on_message(message: discord.Message):
             return
         if not clean_content:
             await message.reply("Tag me with what you need: operations brief, mod actions, recap hooks, or dossier seed suggestions.")
+            return
+        if is_member_activity_request(clean_content):
+            events = get_recent_member_activity_events(message.guild.id, limit=10, days=14)
+            await message.reply(format_member_activity_summary(events))
+            _mark_recent_direct_response(message.channel.id, message.author.id)
             return
         ops_context = build_operations_brief_context(message.guild.id, clean_content)
         ops_prompt = (
