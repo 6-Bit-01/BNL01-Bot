@@ -19,6 +19,7 @@ import logging
 import random
 import json
 import hashlib
+import uuid
 import urllib.request
 import urllib.error
 import urllib.parse
@@ -707,6 +708,69 @@ RELAY_TOPIC_KEYWORDS = {
     "outer_channel_movement": ("outer channel", "corridor", "aperture", "access"),
 }
 force_pull_runner = None
+_force_pull_state_by_guild: dict[int, dict] = {}
+_force_pull_tasks_by_guild: dict[int, asyncio.Task] = {}
+
+
+def _utc_now_iso() -> str:
+    return datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+
+
+def _get_force_pull_state(guild_id: int) -> dict:
+    state = _force_pull_state_by_guild.get(guild_id)
+    if state is None:
+        state = {
+            "last_force_pull_requested_at": "",
+            "last_force_pull_started_at": "",
+            "last_force_pull_completed_at": "",
+            "last_force_pull_status": "idle",
+            "last_force_pull_error": "",
+        }
+        _force_pull_state_by_guild[guild_id] = state
+    return state
+
+
+def _safe_force_pull_error(exc: Exception) -> str:
+    msg = " ".join(str(exc).strip().split())
+    return msg[:240]
+
+
+async def _run_force_pull_relay_update(guild_id: int, request_id: str = ""):
+    state = _get_force_pull_state(guild_id)
+    state["last_force_pull_started_at"] = _utc_now_iso()
+    state["last_force_pull_status"] = "running"
+    state["last_force_pull_error"] = ""
+    tag = f" request_id={request_id}" if request_id else ""
+    logging.info(f"Force-pull background relay update started guild={guild_id}{tag}")
+    try:
+        mode, relay_message, directive, _relay_meta = await generate_dynamic_website_relay(guild_id)
+        ok = update_website_status_controlled(
+            mode=mode,
+            message=relay_message,
+            status="ONLINE",
+            force=True,
+            current_directive=directive,
+            source="forcePull",
+            admin_note=build_admin_note(mode=mode, message=relay_message, current_directive=directive, source="forcePull"),
+        )
+        state["last_force_pull_completed_at"] = _utc_now_iso()
+        if ok:
+            state["last_force_pull_status"] = "succeeded"
+            state["last_force_pull_error"] = ""
+            logging.info(f"Force-pull background relay update succeeded guild={guild_id} mode={mode}{tag}")
+        else:
+            state["last_force_pull_status"] = "failed"
+            state["last_force_pull_error"] = "relay_update_failed"
+            logging.warning(f"Force-pull background relay update failed guild={guild_id} mode={mode}{tag}")
+    except Exception as e:
+        state["last_force_pull_completed_at"] = _utc_now_iso()
+        state["last_force_pull_status"] = "failed"
+        state["last_force_pull_error"] = _safe_force_pull_error(e)
+        logging.error(f"Force-pull background relay update crashed guild={guild_id}{tag}: {e}")
+    finally:
+        task = _force_pull_tasks_by_guild.get(guild_id)
+        if task is asyncio.current_task():
+            _force_pull_tasks_by_guild.pop(guild_id, None)
 
 
 def _website_relay_mode_from_context(messages: list[str], now_pt: datetime) -> str:
@@ -1721,26 +1785,32 @@ async def _handle_force_pull(request: web.Request) -> web.Response:
     if not guild_id:
         return web.json_response({"ok": False, "error": "no_guild_available"}, status=503)
 
-    logging.info("Force-pull received")
-    try:
-        mode, relay_message, directive, _relay_meta = await generate_dynamic_website_relay(guild_id)
-        ok = update_website_status_controlled(
-            mode=mode,
-            message=relay_message,
-            status="ONLINE",
-            force=True,
-            current_directive=directive,
-            source="forcePull",
-            admin_note=build_admin_note(mode=mode, message=relay_message, current_directive=directive, source="forcePull"),
-        )
-        if ok:
-            logging.info("Force-pull relay update succeeded")
-            return web.json_response({"ok": True, "mode": mode, "message": relay_message, "directive": directive})
-        logging.warning("Force-pull relay update failed")
-        return web.json_response({"ok": False, "error": "relay_update_failed"}, status=502)
-    except Exception as e:
-        logging.error(f"Force-pull relay update failed: {e}")
-        return web.json_response({"ok": False, "error": "internal_error"}, status=500)
+    state = _get_force_pull_state(guild_id)
+    state["last_force_pull_requested_at"] = _utc_now_iso()
+
+    existing = _force_pull_tasks_by_guild.get(guild_id)
+    if existing and not existing.done():
+        logging.info(f"Force-pull received while already running guild={guild_id}")
+        return web.json_response({
+            "ok": True,
+            "accepted": True,
+            "status": "already_running",
+            "message": "force_pull_already_running",
+            "guild_id": guild_id,
+        }, status=202)
+
+    request_id = uuid.uuid4().hex[:12]
+    task = asyncio.create_task(_run_force_pull_relay_update(guild_id, request_id=request_id))
+    _force_pull_tasks_by_guild[guild_id] = task
+
+    logging.info(f"Force-pull accepted guild={guild_id} request_id={request_id}")
+    return web.json_response({
+        "ok": True,
+        "accepted": True,
+        "status": "queued",
+        "message": "force_pull_accepted",
+        "guild_id": guild_id,
+    }, status=202)
 
 
 async def start_force_pull_listener():
@@ -7517,6 +7587,14 @@ async def bnl_status(interaction: discord.Interaction):
         f"- website_bridge_configured: `{'yes' if website_bridge_configured else 'no'}`",
         f"- control_flags_source: `{flags_source_state}`",
     ]
+    force_pull_diag = _get_force_pull_state(guild.id)
+    lines.extend([
+        f"- force_pull_status: `{force_pull_diag.get('last_force_pull_status', 'idle')}`",
+        f"- force_pull_last_requested_at: `{force_pull_diag.get('last_force_pull_requested_at') or 'none'}`",
+        f"- force_pull_last_completed_at: `{force_pull_diag.get('last_force_pull_completed_at') or 'none'}`",
+        f"- force_pull_last_error: `{force_pull_diag.get('last_force_pull_error') or 'none'}`",
+    ])
+
     relay_diag = _last_relay_metadata_by_guild.get(guild.id, {})
     if relay_diag:
         lines.extend([
