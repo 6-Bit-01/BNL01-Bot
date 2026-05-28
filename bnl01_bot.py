@@ -3640,6 +3640,50 @@ def get_recent_broadcast_memory(guild_id: int, public_only: bool = False, limit:
     return rows
 
 
+def get_broadcast_memory_diagnostic_dates(guild_id: int):
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        SELECT episode_date
+        FROM broadcast_memory
+        WHERE guild_id=? AND status='active'
+        ORDER BY id DESC
+        LIMIT 1
+        """,
+        (guild_id,),
+    )
+    latest_written = cursor.fetchone()
+    cursor.execute(
+        """
+        SELECT MAX(episode_date)
+        FROM broadcast_memory
+        WHERE guild_id=? AND status='active'
+        """,
+        (guild_id,),
+    )
+    latest_show = cursor.fetchone()
+    conn.close()
+    return (
+        latest_written[0] if latest_written else None,
+        latest_show[0] if latest_show else None,
+    )
+
+
+def _safe_truncate_summary(text: str, limit: int = 120) -> str:
+    summary = (text or "").strip()
+    if not summary:
+        return ""
+    if len(summary) <= limit:
+        return summary
+    candidate = summary[:limit].rstrip()
+    split_at = candidate.rfind(" ")
+    if split_at >= int(limit * 0.6):
+        candidate = candidate[:split_at].rstrip()
+    candidate = candidate.rstrip(".,;:!-")
+    return f"{candidate}..."
+
+
 def get_active_show_state_override(guild_id: int, show_date: str = None):
     now_pt = datetime.now(PACIFIC_TZ)
     now_iso = now_pt.isoformat()
@@ -4356,14 +4400,29 @@ def choose_response_style(guild_id: int, user_id: int, message_count: int, combi
 
 
 def split_message(text, limit=1900):
+    content = text or ""
+    chunk_limit = max(300, int(limit))
+    if not content:
+        return [""]
+    if len(content) <= chunk_limit:
+        return [content]
     parts = []
-    while len(text) > limit:
-        split_at = text.rfind('.', 0, limit)
-        if split_at == -1:
-            split_at = limit
-        parts.append(text[:split_at+1])
-        text = text[split_at+1:]
-    parts.append(text)
+    remaining = content
+    while len(remaining) > chunk_limit:
+        split_at = -1
+        for marker in ("\n\n", "\n", ". ", " "):
+            idx = remaining.rfind(marker, 0, chunk_limit + 1)
+            if idx != -1:
+                split_at = idx + len(marker)
+                break
+        if split_at <= 0:
+            split_at = chunk_limit
+        part = remaining[:split_at].rstrip()
+        if part:
+            parts.append(part)
+        remaining = remaining[split_at:].lstrip()
+    if remaining:
+        parts.append(remaining)
     return parts
 
 
@@ -4371,6 +4430,12 @@ async def send_safe_ephemeral_chunks(interaction: discord.Interaction, text: str
     chunks = split_message(text or "", limit=max(300, int(limit)))
     if not chunks:
         chunks = ["(no diagnostic output)"]
+    if len(chunks) > 1:
+        total = len(chunks)
+        chunks = [
+            chunk if idx == 0 else f"**BNL Diagnostic (continued {idx+1}/{total})**\n{chunk}"
+            for idx, chunk in enumerate(chunks)
+        ]
     if not interaction.response.is_done():
         await interaction.response.send_message(chunks[0], ephemeral=True)
         for chunk in chunks[1:]:
@@ -7895,8 +7960,8 @@ async def bnl_memory_check(interaction: discord.Interaction):
     memory_source_fields_available = memory_tiers_has_source_fields()
     memory_tier_source_policy_state = "source-gated" if memory_source_fields_available else "source fields unavailable"
     sealed_test_rows_present = policy_counts.get("sealed_test", 0) > 0
-    broadcast_entries = get_recent_broadcast_memory(guild.id, public_only=False, limit=1)
     broadcast_count = len(get_recent_broadcast_memory(guild.id, public_only=False, limit=500))
+    latest_written_episode_date, latest_show_episode_date = get_broadcast_memory_diagnostic_dates(guild.id)
     active_override = get_active_show_state_override(guild.id)
 
     lines = [
@@ -7940,13 +8005,14 @@ async def bnl_memory_check(interaction: discord.Interaction):
         "- memory_mutation: `none (read-only diagnostic)`",
         f"- broadcast_memory_channel_configured: `{'yes' if BNL_BROADCAST_MEMORY_CHANNEL_ID else 'no'}`",
         f"- broadcast_memory_entries_active: `{broadcast_count}`",
-        f"- broadcast_memory_latest_episode_date: `{broadcast_entries[0][0] if broadcast_entries else 'none'}`",
+        f"- broadcast_memory_latest_written_episode_date: `{latest_written_episode_date or 'none'}`",
+        f"- broadcast_memory_latest_show_episode_date: `{latest_show_episode_date or 'none'}`",
         f"- active_show_state_override: `{'yes' if active_override else 'no'}`",
         f"- active_show_state_target_show_date: `{active_override[5] if active_override else 'none'}`",
         f"- active_show_state_valid_until: `{active_override[6] if active_override else 'none'}`",
         f"- active_show_state_span_count: `{active_override[7] if active_override else 0}`",
         f"- active_show_state_needs_clarification: `{active_override[8] if active_override else 0}`",
-        f"- active_show_state_summary: `{(active_override[2][:120] + '...') if active_override and active_override[3] else 'hidden_or_none'}`",
+        f"- active_show_state_summary: `{_safe_truncate_summary(active_override[2], 120) if active_override and active_override[3] else 'hidden_or_none'}`",
     ]
     await send_safe_ephemeral_chunks(interaction, "\n".join(lines), limit=1700)
 
@@ -7980,8 +8046,8 @@ async def bnl_status(interaction: discord.Interaction):
     flags_source_state = "available" if _bnl_control_flags_last_source_url else "not yet fetched"
     website_bridge_configured = bool(BNL_STATUS_URL and BNL_API_KEY)
     broadcast_channel = guild.get_channel(BNL_BROADCAST_MEMORY_CHANNEL_ID) if BNL_BROADCAST_MEMORY_CHANNEL_ID else None
-    broadcast_entries = get_recent_broadcast_memory(guild.id, public_only=False, limit=1)
     broadcast_count = len(get_recent_broadcast_memory(guild.id, public_only=False, limit=500))
+    latest_written_episode_date, latest_show_episode_date = get_broadcast_memory_diagnostic_dates(guild.id)
     active_override = get_active_show_state_override(guild.id)
 
     lines = [
@@ -8005,13 +8071,14 @@ async def bnl_status(interaction: discord.Interaction):
         f"- control_flags_source: `{flags_source_state}`",
         f"- broadcast_memory_channel: `{broadcast_channel.mention if broadcast_channel else 'unset/not found'}`",
         f"- broadcast_memory_entries_active: `{broadcast_count}`",
-        f"- broadcast_memory_latest_episode_date: `{broadcast_entries[0][0] if broadcast_entries else 'none'}`",
+        f"- broadcast_memory_latest_written_episode_date: `{latest_written_episode_date or 'none'}`",
+        f"- broadcast_memory_latest_show_episode_date: `{latest_show_episode_date or 'none'}`",
         f"- active_show_state_override: `{'yes' if active_override else 'no'}`",
         f"- active_show_state_target_show_date: `{active_override[5] if active_override else 'none'}`",
         f"- active_show_state_valid_until: `{active_override[6] if active_override else 'none'}`",
         f"- active_show_state_span_count: `{active_override[7] if active_override else 0}`",
         f"- active_show_state_needs_clarification: `{active_override[8] if active_override else 0}`",
-        f"- active_show_state_summary: `{(active_override[2][:120] + '...') if active_override and (is_owner or active_override[3]) else 'hidden_or_none'}`",
+        f"- active_show_state_summary: `{_safe_truncate_summary(active_override[2], 120) if active_override and (is_owner or active_override[3]) else 'hidden_or_none'}`",
     ]
     force_pull_diag = _get_force_pull_state(guild.id)
     lines.extend([
