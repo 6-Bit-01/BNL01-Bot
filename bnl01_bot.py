@@ -3766,6 +3766,12 @@ def build_show_state_override_context(guild_id: int, user_text: str) -> dict:
         f"- Source summary: {cleaned_summary}",
         "- Normal queue opening does not apply while this episode is unavailable.",
         "- Answer the user's actual question using this context.",
+        "- First sentence: plain factual scheduling/status answer grounded in the source summary.",
+        "- Optional second sentence: BNL/BARCODE operational interpretation that supports the same facts.",
+        "- Optional third sentence: restrained atmospheric/glitch flavor that supports the factual explanation.",
+        "- Do not let atmospheric language carry the explanation by itself.",
+        "- Use BARCODE Network as the default parent organization name.",
+        "- Do not replace BARCODE Network with unsupported parent labels (for example, BARCODE Nexus).",
         "- Do not mention show-state, context block, override, database, diagnostics, test channel, or internal implementation.",
         "- Do not invent new events, artist facts, payments, moderation actions, or private facts.",
         "- Use natural BNL/BARCODE language, not canned wording.",
@@ -3777,6 +3783,7 @@ def build_show_state_override_context(guild_id: int, user_text: str) -> dict:
         "cleaned_summary": cleaned_summary,
         "valid_until": valid_until,
         "queue_opening_applies": False,
+        "context_source": "override",
         "context_block": "\n".join(lines),
     }
 
@@ -4768,10 +4775,25 @@ async def get_gemini_response(prompt: str, user_id: int, guild_id: int, route: s
         )
         print("BNL DEBUG: sending prompt to Gemini")
 
+        is_show_state_route = (route or "").startswith("show_state")
+        show_state_route_block = ""
+        if is_show_state_route:
+            show_state_route_block = (
+                "\nShow-state route instruction:\n"
+                "- This is a factual BARCODE Radio scheduling/status answer.\n"
+                "- Apply the Direct Answer Rule.\n"
+                "- First sentence must clearly answer using the active source summary.\n"
+                "- If the user asks why, first sentence must explain the stored reason.\n"
+                "- Use BARCODE Network as the parent organization in the factual part.\n"
+                "- BNL-style weirdness may appear only after the factual reason is clear.\n"
+                "- Do not let glitch/adjacent-reality language become the cause.\n"
+            )
+
         request_contents = f"""{BNL01_SYSTEM_PROMPT}
 
         Conversation history:
         {conversation_context}
+        {show_state_route_block}
 
         User: {prompt}
         BNL-01:"""
@@ -4785,6 +4807,14 @@ async def get_gemini_response(prompt: str, user_id: int, guild_id: int, route: s
 
         # -------- AI Generated Glitch Event --------
         if text and random.random() < 0.08:
+            show_state_rewrite_guard = ""
+            if is_show_state_route:
+                show_state_rewrite_guard = """
+        - Preserve the first factual sentence as factual and clearly readable.
+        - Preserve the stored cancellation/unavailable reason from the source summary.
+        - Preserve BARCODE Network as the parent organization in the factual part.
+        - Preserve that the episode is unavailable/canceled/paused.
+        """
             glitch_prompt = f"""
         Rewrite the following BNL-01 response into a more obvious BARCODE-style glitch event.
 
@@ -4799,6 +4829,7 @@ async def get_gemini_response(prompt: str, user_id: int, guild_id: int, route: s
         - Do NOT make the whole message unreadable.
         - Keep the result concise enough to work naturally in Discord.
         - At least part of the response must remain clearly understandable.
+        {show_state_rewrite_guard}
 
         Original response:
         {text}
@@ -4818,6 +4849,14 @@ async def get_gemini_response(prompt: str, user_id: int, guild_id: int, route: s
 
         # -------- Rare Cross-Universe Bleed --------
         if text and random.random() < CROSS_UNIVERSE_BLEED_CHANCE:
+            show_state_bleed_guard = ""
+            if is_show_state_route:
+                show_state_bleed_guard = """
+        - Preserve the first factual sentence as factual and clearly readable.
+        - Preserve the stored cancellation/unavailable reason from the source summary.
+        - Preserve BARCODE Network as the parent organization in the factual part.
+        - Preserve that the episode is unavailable/canceled/paused.
+        """
             bleed_prompt = f"""
         Rewrite the response as if a minor interdimensional broadcast bleed briefly affected BNL-01.
 
@@ -4828,6 +4867,7 @@ async def get_gemini_response(prompt: str, user_id: int, guild_id: int, route: s
         - If the topic is food, household, or recipes, you may output a short "interdimensional recipe fragment."
         - Keep it concise enough for Discord.
         - Do not claim real-world certainty for anomalous details.
+        {show_state_bleed_guard}
 
         Original response:
         {text}
@@ -5462,12 +5502,19 @@ def _get_recent_show_state_topic_context(guild_id: int, channel_id: int, user_id
             "cleaned_summary": ctx.get("cleaned_summary", ""),
             "valid_until": "",
             "queue_opening_applies": False,
+            "context_source": "followup",
             "context_block": (
                 "Current BARCODE Radio follow-up context from the prior exchange:\n"
                 f"- Target show date: {ctx.get('target_show_date', '') or 'next'}\n"
                 f"- Source summary: {ctx.get('cleaned_summary', '')}\n"
                 "- The user is following up on the immediately previous BARCODE Radio scheduling answer.\n"
                 "- Answer the current follow-up using the source summary above.\n"
+                "- First sentence: plain factual scheduling/status answer grounded in the source summary.\n"
+                "- Optional second sentence: BNL/BARCODE operational interpretation that supports the same facts.\n"
+                "- Optional third sentence: restrained atmospheric/glitch flavor that supports the factual explanation.\n"
+                "- Do not let atmospheric language carry the explanation by itself.\n"
+                "- Use BARCODE Network as the default parent organization name.\n"
+                "- Do not replace BARCODE Network with unsupported parent labels (for example, BARCODE Nexus).\n"
                 "- Stay on the BARCODE Radio scheduling/cancellation topic unless the user clearly changes topics.\n"
                 "- Do not use unrelated durable memory unless the user explicitly changes topics.\n"
                 "- If the user asks for the reason, explain the cancellation reason from the source summary.\n"
@@ -7743,9 +7790,12 @@ async def on_message(message: discord.Message):
 
             payload_expected, _ = _detect_request_payload_expectation(direct_content)
             await _apply_direct_response_pacing(payload_expected, len(direct_payload_items))
+            show_state_route = "get_gemini_response"
+            if show_state_ctx:
+                show_state_route = "show_state_followup" if show_state_ctx.get("context_source") == "followup" else "show_state_direct"
             if True:  # typing indicator disabled: Discord 429 was aborting on_message
                 logging.info(f"direct_payload_generation_started payload_count={len(direct_payload_items)}")
-                response = await get_gemini_response(prompt, message.author.id, message.guild.id)
+                response = await get_gemini_response(prompt, message.author.id, message.guild.id, route=show_state_route)
             if response and direct_payload_items:
                 missing_items = _missing_request_payload_items(direct_payload_items, response)
                 logging.info(f"direct_payload_completion_check missing_count={len(missing_items)}")
@@ -7756,7 +7806,7 @@ async def on_message(message: discord.Message):
                         + "Missing required payload items: " + ", ".join(missing_items) + "."
                     )
                     if True:  # typing indicator disabled: Discord 429 was aborting on_message
-                        response = await get_gemini_response(correction_prompt, message.author.id, message.guild.id)
+                        response = await get_gemini_response(correction_prompt, message.author.id, message.guild.id, route=show_state_route)
                     missing_items = _missing_request_payload_items(direct_payload_items, response or "")
                     logging.info(f"direct_payload_completion_regenerated missing_count={len(missing_items)}")
                     if missing_items:
@@ -7894,9 +7944,12 @@ async def on_message(message: discord.Message):
 
         payload_expected, _ = _detect_request_payload_expectation(direct_content)
         await _apply_direct_response_pacing(payload_expected, len(direct_payload_items))
+        show_state_route = "get_gemini_response"
+        if show_state_ctx:
+            show_state_route = "show_state_followup" if show_state_ctx.get("context_source") == "followup" else "show_state_direct"
         if True:  # typing indicator disabled: Discord 429 was aborting on_message
             logging.info(f"direct_payload_generation_started payload_count={len(direct_payload_items)}")
-            response = await get_gemini_response(prompt, message.author.id, message.guild.id)
+            response = await get_gemini_response(prompt, message.author.id, message.guild.id, route=show_state_route)
         if response and direct_payload_items:
             missing_items = _missing_request_payload_items(direct_payload_items, response)
             logging.info(f"direct_payload_completion_check missing_count={len(missing_items)}")
@@ -7907,7 +7960,7 @@ async def on_message(message: discord.Message):
                     + "Missing required payload items: " + ", ".join(missing_items) + "."
                 )
                 if True:  # typing indicator disabled: Discord 429 was aborting on_message
-                    response = await get_gemini_response(correction_prompt, message.author.id, message.guild.id)
+                    response = await get_gemini_response(correction_prompt, message.author.id, message.guild.id, route=show_state_route)
                 missing_items = _missing_request_payload_items(direct_payload_items, response or "")
                 logging.info(f"direct_payload_completion_regenerated missing_count={len(missing_items)}")
                 if missing_items:
@@ -8009,9 +8062,12 @@ async def on_message(message: discord.Message):
 
         payload_expected, _ = _detect_request_payload_expectation(direct_content)
         await _apply_direct_response_pacing(payload_expected, len(direct_payload_items))
+        show_state_route = "get_gemini_response"
+        if show_state_ctx:
+            show_state_route = "show_state_followup" if show_state_ctx.get("context_source") == "followup" else "show_state_direct"
         if True:  # typing indicator disabled: Discord 429 was aborting on_message
             logging.info(f"direct_payload_generation_started payload_count={len(direct_payload_items)}")
-            response = await get_gemini_response(prompt, message.author.id, message.guild.id)
+            response = await get_gemini_response(prompt, message.author.id, message.guild.id, route=show_state_route)
         if response and direct_payload_items:
             missing_items = _missing_request_payload_items(direct_payload_items, response)
             logging.info(f"direct_payload_completion_check missing_count={len(missing_items)}")
@@ -8022,7 +8078,7 @@ async def on_message(message: discord.Message):
                     + "Missing required payload items: " + ", ".join(missing_items) + "."
                 )
                 if True:  # typing indicator disabled: Discord 429 was aborting on_message
-                    response = await get_gemini_response(correction_prompt, message.author.id, message.guild.id)
+                    response = await get_gemini_response(correction_prompt, message.author.id, message.guild.id, route=show_state_route)
                 missing_items = _missing_request_payload_items(direct_payload_items, response or "")
                 logging.info(f"direct_payload_completion_regenerated missing_count={len(missing_items)}")
                 if missing_items:
