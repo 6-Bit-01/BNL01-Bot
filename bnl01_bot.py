@@ -7657,7 +7657,13 @@ async def on_message(message: discord.Message):
         response = await get_gemini_response(ops_prompt, message.author.id, message.guild.id, route="internal_operations_brief")
         if not response:
             response = "Current status: I can help with internal ops planning, but I hit a temporary sync issue. Please retry in a moment."
-        await message.reply(response)
+        if len(response) <= 2000:
+            await message.reply(response)
+        else:
+            chunks = split_message(response)
+            await message.reply(chunks[0] + "...")
+            for chunk in chunks[1:]:
+                await message.channel.send("..." + chunk)
         _mark_recent_direct_response(message.channel.id, message.author.id)
         return
 
