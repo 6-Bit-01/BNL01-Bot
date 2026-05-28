@@ -3744,22 +3744,29 @@ def _stringify_embed_value(value) -> list:
     return parts
 
 
-def _member_activity_text_from_message(message: discord.Message) -> str:
+def _member_activity_text_from_embed_dict(embed_dict: dict) -> str:
+    parts = _stringify_embed_value(embed_dict or {})
+    return "\n".join(part for part in parts if part).strip()
+
+
+def _member_activity_text_from_message(message: discord.Message, include_embeds: bool = True) -> str:
     parts = []
     content = (getattr(message, "content", "") or "").strip()
     if content:
         parts.append(content)
-    for embed in getattr(message, "embeds", []) or []:
-        try:
-            embed_dict = embed.to_dict()
-        except Exception:
-            embed_dict = {}
-        parts.extend(_stringify_embed_value(embed_dict))
+    if include_embeds:
+        for embed in getattr(message, "embeds", []) or []:
+            try:
+                embed_dict = embed.to_dict()
+            except Exception:
+                embed_dict = {}
+            embed_text = _member_activity_text_from_embed_dict(embed_dict)
+            if embed_text:
+                parts.append(embed_text)
     return "\n".join(part for part in parts if part).strip()
 
 
-def _extract_member_activity_event(message: discord.Message) -> dict:
-    text = _member_activity_text_from_message(message)
+def _extract_member_activity_event_from_text(text: str, source_author: str = "") -> dict:
     if not text:
         return {}
     lowered = text.lower()
@@ -3774,8 +3781,7 @@ def _extract_member_activity_event(message: discord.Message) -> dict:
     else:
         return {}
 
-    source_author = (getattr(getattr(message, "author", None), "display_name", "") or getattr(getattr(message, "author", None), "name", "") or "").strip()
-    source_author_lower = source_author.lower()
+    source_author_lower = (source_author or "").strip().lower()
     source_kind = "carl_bot_log" if "carl" in source_author_lower else "unknown"
     if source_kind != "carl_bot_log" and "carl-bot" not in lowered and "carl bot" not in lowered:
         return {}
@@ -3802,6 +3808,8 @@ def _extract_member_activity_event(message: discord.Message) -> dict:
 
     if not member_name and user_id:
         member_name = user_id
+    if not member_name and not user_id:
+        return {}
 
     raw_excerpt = re.sub(r"\s+", " ", text).strip()[:300]
     return {
@@ -3811,6 +3819,34 @@ def _extract_member_activity_event(message: discord.Message) -> dict:
         "source_kind": source_kind,
         "raw_excerpt": raw_excerpt,
     }
+
+def _extract_member_activity_event(message: discord.Message) -> dict:
+    source_author = (getattr(getattr(message, "author", None), "display_name", "") or getattr(getattr(message, "author", None), "name", "") or "").strip()
+    text = _member_activity_text_from_message(message)
+    return _extract_member_activity_event_from_text(text, source_author=source_author)
+
+
+def _extract_member_activity_events(message: discord.Message) -> list:
+    source_author = (getattr(getattr(message, "author", None), "display_name", "") or getattr(getattr(message, "author", None), "name", "") or "").strip()
+    events = []
+    for embed in getattr(message, "embeds", []) or []:
+        try:
+            embed_dict = embed.to_dict()
+        except Exception:
+            embed_dict = {}
+        event = _extract_member_activity_event_from_text(
+            _member_activity_text_from_embed_dict(embed_dict),
+            source_author=source_author,
+        )
+        if event:
+            events.append(event)
+
+    if events:
+        return events
+
+    content_text = _member_activity_text_from_message(message, include_embeds=False)
+    fallback_event = _extract_member_activity_event_from_text(content_text, source_author=source_author)
+    return [fallback_event] if fallback_event else []
 
 def _member_activity_event_is_duplicate(guild_id: int, member_user_id: str, member_name: str, event_type: str, source_channel_name: str, now: datetime) -> bool:
     since = (now - timedelta(hours=12)).isoformat()
@@ -3845,55 +3881,69 @@ def maybe_record_member_activity_event(message: discord.Message, channel_policy:
         return False
     if not is_research_and_development_channel(message):
         return False
-    event = _extract_member_activity_event(message)
-    if not event:
-        return False
-    if not event.get("member_user_id") and not event.get("member_name"):
+    events = _extract_member_activity_events(message)
+    if not events:
         return False
 
     guild_id = int(message.guild.id)
     source_channel_name = (getattr(message.channel, "name", "") or "").strip().lower()[:80]
     source_author = (getattr(message.author, "display_name", "") or getattr(message.author, "name", "") or "")[:120]
     now = datetime.now(PACIFIC_TZ)
-    if _member_activity_event_is_duplicate(
-        guild_id,
-        event.get("member_user_id"),
-        event.get("member_name"),
-        event.get("event_type") or "unknown_member_event",
-        source_channel_name,
-        now,
-    ):
-        logging.info("member_activity_event_skipped reason=duplicate")
-        return False
+    inserted_count = 0
+    seen_event_keys = set()
 
     conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    cursor.execute(
-        """
-        INSERT INTO member_activity_events (
-            guild_id, member_user_id, member_name, event_type, source_channel_name,
-            source_channel_policy, source_message_author, source_kind, visibility,
-            public_safe, raw_excerpt, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'admin_only', 0, ?, ?)
-        """,
-        (
-            guild_id,
-            event.get("member_user_id"),
-            event.get("member_name"),
-            event.get("event_type") or "unknown_member_event",
-            source_channel_name,
-            (channel_policy or "unknown")[:40],
-            source_author,
-            event.get("source_kind") or "unknown",
-            event.get("raw_excerpt") or "",
-            now.isoformat(),
-        ),
-    )
-    conn.commit()
-    conn.close()
-    logging.info(f"member_activity_event_recorded guild={guild_id} type={event.get('event_type')} source={source_channel_name}")
-    return True
+    try:
+        cursor = conn.cursor()
+        for event in events:
+            if not event.get("member_user_id") and not event.get("member_name"):
+                continue
+            event_type = event.get("event_type") or "unknown_member_event"
+            dedupe_identity = event.get("member_user_id") or event.get("member_name")
+            event_key = (dedupe_identity, event_type, source_channel_name)
+            if event_key in seen_event_keys:
+                logging.info("member_activity_event_skipped reason=duplicate_same_message")
+                continue
+            seen_event_keys.add(event_key)
+            if _member_activity_event_is_duplicate(
+                guild_id,
+                event.get("member_user_id"),
+                event.get("member_name"),
+                event_type,
+                source_channel_name,
+                now,
+            ):
+                logging.info("member_activity_event_skipped reason=duplicate")
+                continue
+            cursor.execute(
+                """
+                INSERT INTO member_activity_events (
+                    guild_id, member_user_id, member_name, event_type, source_channel_name,
+                    source_channel_policy, source_message_author, source_kind, visibility,
+                    public_safe, raw_excerpt, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'admin_only', 0, ?, ?)
+                """,
+                (
+                    guild_id,
+                    event.get("member_user_id"),
+                    event.get("member_name"),
+                    event_type,
+                    source_channel_name,
+                    (channel_policy or "unknown")[:40],
+                    source_author,
+                    event.get("source_kind") or "unknown",
+                    event.get("raw_excerpt") or "",
+                    now.isoformat(),
+                ),
+            )
+            inserted_count += 1
+        conn.commit()
+    finally:
+        conn.close()
 
+    if inserted_count:
+        logging.info(f"member_activity_events_recorded guild={guild_id} count={inserted_count} source={source_channel_name}")
+    return inserted_count > 0
 
 def get_member_activity_event_counts(guild_id: int) -> tuple:
     conn = sqlite3.connect(DB_FILE)
