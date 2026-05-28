@@ -2792,16 +2792,16 @@ def context_visibility_for_policy(policy: str) -> str:
 def allow_passive_memory_for_policy(policy: str) -> bool:
     return policy in {"public_home", "public_context"}
 
-def is_planning_coordination_channel(message: discord.Message) -> bool:
+def is_research_and_development_channel(message: discord.Message) -> bool:
     if not message or not getattr(message, "channel", None):
         return False
     channel = message.channel
     channel_id = int(getattr(channel, "id", 0) or 0)
-    if channel_id == 1292010005180055627:
+    if channel_id == 1369051635657084970:
         return True
     name = (getattr(channel, "name", "") or "").strip().lower()
     normalized = re.sub(r"[^a-z0-9-]+", "-", name).strip("-")
-    return normalized == "planning-and-coordination"
+    return normalized == "research-and-development"
 
 
 def is_internal_operations_request(text: str) -> bool:
@@ -7633,7 +7633,7 @@ async def on_message(message: discord.Message):
         )
         return
 
-    if is_planning_coordination_channel(message):
+    if is_research_and_development_channel(message):
         if not real_direct_target:
             return
         member = message.author if isinstance(message.author, discord.Member) else message.guild.get_member(message.author.id)
@@ -7652,7 +7652,7 @@ async def on_message(message: discord.Message):
             "Use this structure: Current status / What matters / Suggested next actions / Optional Do not do yet.\n"
             "Do not write a lore monologue.\n"
             "Do not expose raw database rows, raw notes, or restricted internal details.\n"
-            "Do not convert planning discussion into canon.\n"
+            "Do not convert research-and-development operations discussion into canon.\n"
             "Do not imply website dossier, queue, or payment integrations are live unless explicitly stated in context.\n"
             "Do not publish or relay anything automatically.\n"
             f"{ops_context}\n"
@@ -7660,7 +7660,7 @@ async def on_message(message: discord.Message):
         )
         response = await get_gemini_response(ops_prompt, message.author.id, message.guild.id, route="internal_operations_brief")
         if not response:
-            response = "Current status: I can help with internal ops planning, but I hit a temporary sync issue. Please retry in a moment."
+            response = "Current status: I can help with internal operations, but I hit a temporary sync issue. Please retry in a moment."
         if len(response) <= 2000:
             await message.reply(response)
         else:
