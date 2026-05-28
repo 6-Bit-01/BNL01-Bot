@@ -6716,6 +6716,9 @@ def build_user_aware_prompt(
     style_key, style_rule = choose_response_style(guild_id, user_id, message_count, clean_content)
     memory_context = build_user_memory_context(user_id, guild_id)
     broadcast_context = build_broadcast_memory_context(guild_id, clean_content, channel_policy, is_owner_or_mod=privileged)
+    broadcast_prompt_block = ""
+    if broadcast_context:
+        broadcast_prompt_block = f"Broadcast memory context:\n{broadcast_context}\n"
 
     prompt = (
         f"{greeting_rule}\n"
@@ -6727,7 +6730,7 @@ def build_user_aware_prompt(
         "If privileged_operator, be more direct, cooperative, and operationally transparent.\n"
         "If standard_member, keep normal policy behavior.\n"
         f"Durable memory context:\n{memory_context}\n"
-        f"{('Broadcast memory context:\\n' + broadcast_context + '\\n') if broadcast_context else ''}"
+        f"{broadcast_prompt_block}"
         f"User name to address (optional): {name_to_use}\n"
         f"User display name: {display_name or fallback_display_name}\n"
         f"User message: {clean_content}"
