@@ -3749,73 +3749,36 @@ BROADCAST_MEMORY_LANGUAGE_LIFT_GUIDANCE = (
     "- Official broadcast memory remains source truth; creative wording is surface language only."
 )
 
-def get_show_state_override_direct_response(guild_id: int, user_text: str) -> str:
+def build_show_state_override_context(guild_id: int, user_text: str) -> dict:
     if not _is_show_state_status_query(user_text):
-        return ""
+        return {}
     override = get_active_show_state_override(guild_id)
     if not override:
-        return ""
-    summary = (override[2] or "").strip()
-    target_show = (override[5] or "").strip()
-    if not summary:
-        return ""
-
-    lowered = (user_text or "").lower()
-    asks_why = "why" in lowered
-    asks_queue = bool(re.search(r"\bwhen does .*queue open\b|\bare submissions open\b", lowered))
-    asks_show_status = any(k in lowered for k in (
-        "is there a show", "is the show", "next week", "this friday", "happening", "schedule", "status"
-    ))
-
-    status_tail_options = [
-        "Network control has pulled that slot into internal review.",
-        "That slot is being held for Network review.",
-        "Broadcast control has locked that slot for containment review.",
+        return {}
+    cleaned_summary = (override[2] or "").strip()
+    target_show_date = (override[5] or "").strip()
+    valid_until = (override[6] or "").strip()
+    if not cleaned_summary:
+        return {}
+    lines = [
+        "Authoritative show-state context:",
+        f"- The {target_show_date or 'next'} BARCODE Radio episode is not proceeding as a normal broadcast.",
+        f"- Source summary: {cleaned_summary}",
+        "- Normal queue opening does not apply while this context is active.",
+        "- Answer the user's actual question using this context.",
+        "- Do not mention override, show_state, database, diagnostics, test channel, or internal implementation.",
+        "- Do not invent new events, artist facts, payments, moderation actions, or private facts.",
+        "- Use natural BNL/BARCODE language, not canned wording.",
     ]
-    reason_tail_options = [
-        "the last episode slipped outside controllable Network limits.",
-        "the previous broadcast pushed beyond normal control-room boundaries.",
-        "the last transmission stopped behaving like a manageable Network asset.",
-    ]
-    safe_reason_options = [
-        "the stored broadcast-memory note marks this slot as unavailable.",
-        "the current broadcast-memory note marks this episode as paused.",
-    ]
-    seed_text = f"{target_show}|{summary}|{user_text or ''}"
-    seed = sum(ord(ch) for ch in seed_text) % 997 if seed_text else 0
-    status_tail = status_tail_options[seed % len(status_tail_options)]
-    summary_lower = summary.lower()
-    rogue_reason_markers = (
-        "rogue",
-        "outside network control",
-        "outside normal control",
-        "6 bit",
-        "cliff",
-        "mods",
-        "viewers",
-        "control",
-        "containment",
-    )
-    reason_is_rogue_arc = any(marker in summary_lower for marker in rogue_reason_markers)
-    if reason_is_rogue_arc:
-        reason_tail = reason_tail_options[(seed // 3) % len(reason_tail_options)]
-    else:
-        reason_tail = safe_reason_options[(seed // 5) % len(safe_reason_options)]
-
-    show_label = f"The {target_show} BARCODE Radio episode" if target_show else "The next BARCODE Radio episode"
-    status_line = f"Negative. {show_label} is not proceeding as a normal broadcast. {status_tail}"
-    reason_line = f"Reason: {reason_tail}"
-    queue_line = "Queue intake is paused while the next slot remains under Network review."
-
-    if asks_queue and asks_why:
-        return f"{queue_line} {reason_line}"
-    if asks_queue:
-        return queue_line
-    if asks_why and asks_show_status:
-        return f"{status_line} {reason_line}"
-    if asks_why:
-        return reason_line
-    return status_line
+    if valid_until:
+        lines.insert(3, f"- This context is valid through: {valid_until}.")
+    return {
+        "target_show_date": target_show_date,
+        "cleaned_summary": cleaned_summary,
+        "valid_until": valid_until,
+        "queue_opening_applies": False,
+        "context_block": "\n".join(lines),
+    }
 
 
 def get_broadcast_memory_diagnostic_dates(guild_id: int):
@@ -5451,12 +5414,62 @@ _channel_pending_request_anchor = {}
 _channel_recent_typing_at = {}
 _channel_recent_typing_user_id = {}
 _channel_generation_typing_pause_used = defaultdict(bool)
+_show_state_topic_context = {}
+SHOW_STATE_TOPIC_TTL_SECONDS = 300
 
 TYPING_RECENT_WINDOW_SECONDS = 5
 TYPING_SEND_GRACE_SECONDS = 1.5
 HARD_INTERRUPT_REEVALUATE_PAUSE_MIN_SECONDS = 0.75
 HARD_INTERRUPT_REEVALUATE_PAUSE_MAX_SECONDS = 1.5
 POST_GENERATION_CAPTURE_GRACE_SECONDS = 0.5
+
+
+def _show_state_topic_key(guild_id: int, channel_id: int):
+    return f"{guild_id}:{channel_id}"
+
+
+def _store_show_state_topic_context(guild_id: int, channel_id: int, user_id: int, show_state_ctx: dict):
+    if not show_state_ctx:
+        return
+    _show_state_topic_context[_show_state_topic_key(guild_id, channel_id)] = {
+        "target_show_date": show_state_ctx.get("target_show_date", ""),
+        "cleaned_summary": show_state_ctx.get("cleaned_summary", ""),
+        "created_at": datetime.now(timezone.utc),
+        "last_user_id": user_id,
+        "last_bot_answer_type": "show_state",
+    }
+
+
+def _get_recent_show_state_topic_context(guild_id: int, channel_id: int, user_id: int, direct_target: bool, user_text: str) -> dict:
+    key = _show_state_topic_key(guild_id, channel_id)
+    ctx = _show_state_topic_context.get(key)
+    if not ctx:
+        return {}
+    created_at = ctx.get("created_at")
+    if not created_at or (datetime.now(timezone.utc) - created_at).total_seconds() > SHOW_STATE_TOPIC_TTL_SECONDS:
+        _show_state_topic_context.pop(key, None)
+        return {}
+    if ctx.get("last_bot_answer_type") != "show_state":
+        return {}
+    if not direct_target:
+        return {}
+    text = (user_text or "").strip().lower()
+    if not text:
+        return {}
+    if _is_show_state_status_query(text) or len(text) <= 80 or bool(re.search(r"\b(it|that|this|why|how|when|what)\b", text)):
+        return {
+            "target_show_date": ctx.get("target_show_date", ""),
+            "cleaned_summary": ctx.get("cleaned_summary", ""),
+            "valid_until": "",
+            "queue_opening_applies": False,
+            "context_block": (
+                "Authoritative show-state continuity context from the immediately prior exchange:\n"
+                f"- Target show date: {ctx.get('target_show_date', '') or 'next'}\n"
+                f"- Source summary: {ctx.get('cleaned_summary', '')}\n"
+                "- Continue naturally from the prior answer and address the user's current follow-up."
+            ),
+        }
+    return {}
 
 def _batch_max_wait_seconds(channel_id: int, selected_wait_seconds: float = None) -> float:
     if selected_wait_seconds is not None:
@@ -6846,6 +6859,7 @@ def build_user_aware_prompt(
     guild_id: int,
     fallback_display_name: str,
     clean_content: str,
+    show_state_context: str = "",
     message_count: int = 1,
     privileged: bool = False,
     channel_policy: str = "unknown"
@@ -6872,6 +6886,10 @@ def build_user_aware_prompt(
             f"{BROADCAST_MEMORY_LANGUAGE_LIFT_GUIDANCE}\n"
         )
 
+    show_state_prompt_block = ""
+    if show_state_context:
+        show_state_prompt_block = f"{show_state_context}\n"
+
     prompt = (
         f"{greeting_rule}\n"
         f"Response style mode: {style_key}\n"
@@ -6883,6 +6901,7 @@ def build_user_aware_prompt(
         "If standard_member, keep normal policy behavior.\n"
         f"Durable memory context:\n{memory_context}\n"
         f"{broadcast_prompt_block}"
+        f"{show_state_prompt_block}"
         f"User name to address (optional): {name_to_use}\n"
         f"User display name: {display_name or fallback_display_name}\n"
         f"User message: {clean_content}"
@@ -7667,12 +7686,6 @@ async def on_message(message: discord.Message):
                     save_model_message(message.author.id, message.guild.id, memory_recall, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy)
                 await message.reply(memory_recall)
                 return
-            override_reply = get_show_state_override_direct_response(message.guild.id, direct_content)
-            if override_reply:
-                if not is_sealed_test_channel:
-                    save_model_message(message.author.id, message.guild.id, override_reply, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy)
-                await message.reply(override_reply)
-                return
 
             payload_expected, _ = _detect_request_payload_expectation(direct_content)
             if payload_expected and len(direct_payload_items) == 0:
@@ -7706,11 +7719,15 @@ async def on_message(message: discord.Message):
                 logging.info("direct_payload_session_created")
                 return
 
+            show_state_ctx = build_show_state_override_context(message.guild.id, direct_content)
+            if not show_state_ctx:
+                show_state_ctx = _get_recent_show_state_topic_context(message.guild.id, message.channel.id, message.author.id, real_direct_target, direct_content)
             prompt, allow_greeting, style_key = build_user_aware_prompt(
                 message.author.id,
                 message.guild.id,
                 message.author.display_name,
                 direct_content,
+                show_state_context=show_state_ctx.get("context_block", ""),
                 message_count=1,
                 privileged=is_privileged_member(message.author, message.guild),
                 channel_policy=channel_policy,
@@ -7745,8 +7762,11 @@ async def on_message(message: discord.Message):
             logging.info(f"direct_payload_generation_complete payload_count={len(direct_payload_items)}")
 
             if not response:
-                await message.reply("[NETWORK ERROR] Temporary synchronization issue. Try again.")
-                return
+                if show_state_ctx:
+                    response = "The current broadcast-memory note marks that BARCODE Radio slot as unavailable."
+                else:
+                    await message.reply("[NETWORK ERROR] Temporary synchronization issue. Try again.")
+                    return
 
             if not is_sealed_test_channel:
                 save_model_message(message.author.id, message.guild.id, response, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy)
@@ -7754,6 +7774,8 @@ async def on_message(message: discord.Message):
             if allow_greeting:
                 set_last_greeting_at(message.author.id, message.guild.id, datetime.now(PACIFIC_TZ).isoformat())
 
+            if show_state_ctx:
+                _store_show_state_topic_context(message.guild.id, message.channel.id, message.author.id, show_state_ctx)
             if len(response) <= 2000:
                 await message.reply(response)
             else:
@@ -7847,17 +7869,16 @@ async def on_message(message: discord.Message):
             save_model_message(message.author.id, message.guild.id, memory_recall)
             await message.reply(memory_recall)
             return
-        override_reply = get_show_state_override_direct_response(message.guild.id, direct_content)
-        if override_reply:
-            save_model_message(message.author.id, message.guild.id, override_reply)
-            await message.reply(override_reply)
-            return
 
+        show_state_ctx = build_show_state_override_context(message.guild.id, direct_content)
+        if not show_state_ctx:
+            show_state_ctx = _get_recent_show_state_topic_context(message.guild.id, message.channel.id, message.author.id, True, direct_content)
         prompt, allow_greeting, style_key = build_user_aware_prompt(
             message.author.id,
             message.guild.id,
             message.author.display_name,
             direct_content,
+            show_state_context=show_state_ctx.get("context_block", ""),
             message_count=1,
             privileged=is_privileged_member(message.author, message.guild),
             channel_policy=channel_policy,
@@ -7892,14 +7913,19 @@ async def on_message(message: discord.Message):
         logging.info(f"direct_payload_generation_complete payload_count={len(direct_payload_items)}")
 
         if not response:
-            await message.reply("[NETWORK ERROR] Temporary synchronization issue. Try again.")
-            return
+            if show_state_ctx:
+                response = "The current broadcast-memory note marks that BARCODE Radio slot as unavailable."
+            else:
+                await message.reply("[NETWORK ERROR] Temporary synchronization issue. Try again.")
+                return
 
         save_model_message(message.author.id, message.guild.id, response)
 
         if allow_greeting:
             set_last_greeting_at(message.author.id, message.guild.id, datetime.now(PACIFIC_TZ).isoformat())
 
+        if show_state_ctx:
+            _store_show_state_topic_context(message.guild.id, message.channel.id, message.author.id, show_state_ctx)
         if len(response) <= 2000:
             await message.reply(response)
         else:
@@ -7958,17 +7984,16 @@ async def on_message(message: discord.Message):
             save_model_message(message.author.id, message.guild.id, memory_recall)
             await message.reply(memory_recall if len(memory_recall) <= 2000 else memory_recall[:1900] + "...")
             return
-        override_reply = get_show_state_override_direct_response(message.guild.id, direct_content)
-        if override_reply:
-            save_model_message(message.author.id, message.guild.id, override_reply)
-            await message.reply(override_reply if len(override_reply) <= 2000 else override_reply[:1900] + "...")
-            return
 
+        show_state_ctx = build_show_state_override_context(message.guild.id, direct_content)
+        if not show_state_ctx:
+            show_state_ctx = _get_recent_show_state_topic_context(message.guild.id, message.channel.id, message.author.id, True, direct_content)
         prompt, allow_greeting, style_key = build_user_aware_prompt(
             message.author.id,
             message.guild.id,
             message.author.display_name,
             direct_content,
+            show_state_context=show_state_ctx.get("context_block", ""),
             message_count=1,
             privileged=is_privileged_member(message.author, message.guild),
             channel_policy=channel_policy,
@@ -8003,14 +8028,19 @@ async def on_message(message: discord.Message):
         logging.info(f"direct_payload_generation_complete payload_count={len(direct_payload_items)}")
 
         if not response:
-            await message.reply("[NETWORK ERROR] Temporary synchronization issue. Try again.")
-            return
+            if show_state_ctx:
+                response = "The current broadcast-memory note marks that BARCODE Radio slot as unavailable."
+            else:
+                await message.reply("[NETWORK ERROR] Temporary synchronization issue. Try again.")
+                return
 
         save_model_message(message.author.id, message.guild.id, response)
 
         if allow_greeting:
             set_last_greeting_at(message.author.id, message.guild.id, datetime.now(PACIFIC_TZ).isoformat())
 
+        if show_state_ctx:
+            _store_show_state_topic_context(message.guild.id, message.channel.id, message.author.id, show_state_ctx)
         await message.reply(response if len(response) <= 2000 else response[:1900] + "...")
         _mark_recent_direct_response(message.channel.id, message.author.id)
         return
