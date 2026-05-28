@@ -3733,11 +3733,44 @@ def get_show_state_override_direct_response(guild_id: int, user_text: str) -> st
     override = get_active_show_state_override(guild_id)
     if not override:
         return ""
-    summary = _safe_truncate_summary(override[2] or "", 240)
-    target_show = override[5] or "next scheduled episode"
+    summary = (override[2] or "").strip()
+    target_show = (override[5] or "").strip()
     if not summary:
         return ""
-    return f"Show-state update: {target_show} is currently overridden. {summary}"
+
+    lowered = (user_text or "").lower()
+    asks_why = "why" in lowered
+    asks_queue = bool(re.search(r"\bwhen does .*queue open\b|\bare submissions open\b", lowered))
+    asks_show_status = any(k in lowered for k in (
+        "is there a show", "is the show", "next week", "this friday", "happening", "schedule", "status"
+    ))
+
+    if target_show:
+        status_line = (
+            f"Negative. The {target_show} BARCODE Radio episode is not proceeding as a normal broadcast. "
+            "BARCODE Network has pulled that slot into system maintenance."
+        )
+    else:
+        status_line = (
+            "Negative. The next BARCODE Radio episode is not proceeding as a normal broadcast. "
+            "BARCODE Network has pulled that slot into system maintenance."
+        )
+
+    reason_line = (
+        "Because the last broadcast stopped behaving like a controllable Network transmission, "
+        "so the next slot is being used for system maintenance."
+    )
+    queue_line = "Normal queue opening does not apply while the episode is canceled for maintenance."
+
+    if asks_queue and asks_why:
+        return f"{queue_line} {reason_line}"
+    if asks_queue:
+        return queue_line
+    if asks_why and asks_show_status:
+        return f"{status_line} {reason_line}"
+    if asks_why:
+        return reason_line
+    return status_line
 
 
 def get_broadcast_memory_diagnostic_dates(guild_id: int):
