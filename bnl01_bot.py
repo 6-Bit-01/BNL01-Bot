@@ -2797,20 +2797,22 @@ def _recent_friday_pacific_for_note(note_text: str, now_pacific: datetime = None
     days_since_friday = (now.weekday() - 4) % 7
     this_friday = (now - timedelta(days=days_since_friday)).date()
     previous_friday = this_friday - timedelta(days=7)
+    most_recent_completed_friday = this_friday if (now.weekday() != 4 or now >= show_start) else previous_friday
     if any(p in text for p in ("last show", "last week's episode", "last week episode", "last week’s episode")):
-        return this_friday.isoformat() if now.weekday() != 4 or now >= show_start else previous_friday.isoformat()
+        return most_recent_completed_friday.isoformat()
     if now.weekday() == 4 and now < show_start and not any(p in text for p in ("tonight", "today's show", "todays show", "today show")):
         return previous_friday.isoformat()
-    return this_friday.isoformat() if now.weekday() == 4 else previous_friday.isoformat()
+    return this_friday.isoformat() if now.weekday() == 4 else most_recent_completed_friday.isoformat()
 
 
 def _extract_exact_episode_date(note_text: str) -> str:
     text = (note_text or "").strip()
-    patterns = [
+    now_pt = datetime.now(PACIFIC_TZ)
+    date_patterns = [
         r"\b(20\d{2}-\d{2}-\d{2})\b",
         r"\b(20\d{2}/\d{2}/\d{2})\b",
     ]
-    for pattern in patterns:
+    for pattern in date_patterns:
         match = re.search(pattern, text, flags=re.IGNORECASE)
         if not match:
             continue
@@ -2820,6 +2822,30 @@ def _extract_exact_episode_date(note_text: str) -> str:
             return parsed.isoformat()
         except Exception:
             continue
+
+    short_match = re.search(r"\b([01]?\d)/([0-3]?\d)(?:/(\d{2}|\d{4}))?\b", text)
+    if not short_match:
+        return ""
+    month = int(short_match.group(1))
+    day = int(short_match.group(2))
+    year_token = short_match.group(3)
+    if month < 1 or month > 12 or day < 1 or day > 31:
+        return ""
+    if year_token:
+        year = int(year_token)
+        if len(year_token) == 2:
+            year = 2000 + year
+    else:
+        year = now_pt.year
+    try:
+        candidate = datetime(year, month, day).date()
+    except Exception:
+        return ""
+    if not year_token:
+        # Conservative guard: avoid mapping M/D to obviously unreasonable far-future dates.
+        if candidate > (now_pt.date() + timedelta(days=45)):
+            candidate = datetime(year - 1, month, day).date()
+    return candidate.isoformat()
     return ""
 
 
@@ -3731,7 +3757,7 @@ async def process_broadcast_memory_notes(message) -> list[dict]:
                     "importance": "medium",
                     "public_safe": primary.get("public_safe", True),
                     "affects_next_show": False,
-                    "usage_scope": "internal",
+                    "usage_scope": "ambient,direct" if primary.get("public_safe", True) else "internal",
                     "cleaned_summary": ref_summary,
                     "episode_date": prior_date,
                 }
@@ -7830,7 +7856,7 @@ async def bnl_context_check(interaction: discord.Interaction):
         f"- invoker_has_mod_role: `{has_mod_role(member)}`",
         "- behavior_changes_applied: `none` (reporting only)",
     ]
-    await interaction.response.send_message("\n".join(lines), ephemeral=True)
+    await send_safe_ephemeral_chunks(interaction, "\n".join(lines), limit=1700)
 
 
 
