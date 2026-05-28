@@ -3842,7 +3842,9 @@ def build_user_memory_context(user_id: int, guild_id: int) -> str:
             tier_lines.append("Medium summaries:\n" + "\n".join([f"- {r[1]}" for r in medium]))
         if long_t:
             tier_lines.append("Long traces:\n" + "\n".join([f"- {r[1]}" for r in long_t]))
-        if cautious_rows and trusted_rows:
+        if cautious_rows and not trusted_rows:
+            tier_lines.append("Legacy/mixed memory only: yes (allowed cautiously; lower authority than source-safe memory).")
+        elif cautious_rows and trusted_rows:
             tier_lines.append("Legacy/mixed memory present: yes (down-ranked for reply authority).")
         sections.append("\n".join(tier_lines))
 
