@@ -3593,8 +3593,12 @@ def get_recent_broadcast_memory(guild_id: int, public_only: bool = False, limit:
     return rows
 
 
-def get_active_show_state_override(guild_id: int):
-    now_iso = datetime.now(PACIFIC_TZ).isoformat()
+def get_active_show_state_override(guild_id: int, show_date: str = None):
+    now_pt = datetime.now(PACIFIC_TZ)
+    now_iso = now_pt.isoformat()
+    target_show_date = (show_date or "").strip()
+    if not target_show_date:
+        target_show_date = _next_friday_pacific(now_pt).date().isoformat()
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
     cursor.execute(
@@ -3603,9 +3607,13 @@ def get_active_show_state_override(guild_id: int):
         FROM broadcast_memory
         WHERE guild_id=? AND status='active' AND affects_next_show=1 AND entry_type='show_state_override' AND importance='high'
           AND (valid_until IS NULL OR valid_until='' OR valid_until >= ?)
+          AND (target_show_date IS NOT NULL AND target_show_date != '' AND target_show_date <= ?)
+          AND (
+                valid_until IS NULL OR valid_until='' OR substr(valid_until, 1, 10) >= ?
+              )
         ORDER BY id DESC LIMIT 1
         """,
-        (guild_id, now_iso),
+        (guild_id, now_iso, target_show_date, target_show_date),
     )
     row = cursor.fetchone()
     conn.close()
@@ -4922,7 +4930,7 @@ async def barcode_radio_queue_task():
         for guild in iter_managed_guilds():
             if already_fired_show_update(guild.id, show_date, phase_key):
                 continue
-            active_override = get_active_show_state_override(guild.id)
+            active_override = get_active_show_state_override(guild.id, show_date=show_date)
             if active_override:
                 logging.warning(f"showday_update_blocked_by_override guild={guild.id} phase={phase_key} override_id={active_override[0]}")
                 mark_show_update_fired(guild.id, show_date, phase_key, "", f"Blocked by show_state_override: {active_override[2]}")
