@@ -2792,6 +2792,66 @@ def context_visibility_for_policy(policy: str) -> str:
 def allow_passive_memory_for_policy(policy: str) -> bool:
     return policy in {"public_home", "public_context"}
 
+def is_planning_coordination_channel(message: discord.Message) -> bool:
+    if not message or not getattr(message, "channel", None):
+        return False
+    channel = message.channel
+    channel_id = int(getattr(channel, "id", 0) or 0)
+    if channel_id == 1292010005180055627:
+        return True
+    name = (getattr(channel, "name", "") or "").strip().lower()
+    normalized = re.sub(r"[^a-z0-9-]+", "-", name).strip("-")
+    return normalized == "planning-and-coordination"
+
+
+def is_internal_operations_request(text: str) -> bool:
+    t = re.sub(r"\s+", " ", (text or "").strip().lower())
+    if not t:
+        return False
+    phrase_hits = [
+        "operations brief", "mod brief", "action items", "dossier seed", "artist follow-up",
+        "website update", "discord update", "queue status", "show status", "broadcast memory",
+        "what should mods know", "what should we tell people", "what needs updating", "what's next",
+        "what do we need", "summarize where we are",
+    ]
+    if any(p in t for p in phrase_hits):
+        return True
+    keyword_hits = 0
+    for kw in ("brief", "status", "plan", "recap", "action", "mods", "update", "operations", "follow-up", "seed"):
+        if kw in t:
+            keyword_hits += 1
+    return keyword_hits >= 2
+
+
+def build_operations_brief_context(guild_id: int, user_text: str) -> str:
+    lines = ["Internal operations context (safe summary only):"]
+    active_override = get_active_show_state_override(guild_id)
+    if active_override:
+        episode_date = active_override[1] or "unknown_date"
+        safe_summary = _safe_truncate_summary(active_override[2] or "", 160)
+        lines.append(f"- Active show-state override: {episode_date} — {safe_summary}")
+    else:
+        lines.append("- Active show-state override: none currently active.")
+
+    recent_memory = get_recent_broadcast_memory(guild_id, public_only=True, limit=5)[:5]
+    if recent_memory:
+        lines.append("- Recent official broadcast memory:")
+        for episode_date, cleaned_summary, entry_type, _importance, _public_safe, _affects_next_show, _usage_scope, _target_show_date, _valid_until, _override_span_count, _needs_clarification in recent_memory:
+            lines.append(f"  - {episode_date}: {_safe_truncate_summary(cleaned_summary or '', 120)} ({entry_type})")
+    else:
+        lines.append("- Recent official broadcast memory: none available.")
+
+    flags = get_website_control_flags()
+    relay_enabled = bool(flags.get("websiteRelayEnabled", True)) if isinstance(flags, dict) else True
+    bridge_configured = bool(BNL_STATUS_URL and BNL_API_KEY)
+    lines.append(f"- Website relay flag: {'enabled' if relay_enabled else 'disabled'}")
+    lines.append(f"- Website bridge configured: {'yes' if bridge_configured else 'no'}")
+    lines.append("- Known gaps: website dossiers not connected yet; queue runtime not connected yet; payment event state not connected yet; public chatter layer not implemented yet.")
+    lines.append("- Next-step categories: broadcast memory note, Discord announcement, website update suggestion, dossier seed suggestion (not canon), recap candidate, admin-only note.")
+    if is_internal_operations_request(user_text):
+        lines.append("- Request intent appears operational; prioritize action guidance over diagnostics.")
+    return "\n".join(lines)
+
 
 def _truncate_raw_note(note: str, limit: int = 400) -> str:
     text = re.sub(r"\s+", " ", (note or "").strip())
@@ -7567,6 +7627,38 @@ async def on_message(message: discord.Message):
             + "; ".join(summary_bits)
             + f" | Public-safe: {safe_txt}"
         )
+        return
+
+    if is_planning_coordination_channel(message):
+        if not real_direct_target:
+            return
+        member = message.author if isinstance(message.author, discord.Member) else message.guild.get_member(message.author.id)
+        allowed = is_owner_operator(message.author) or has_mod_role(member) or is_privileged_member(member, message.guild)
+        if not allowed:
+            await message.reply("Operations briefings are restricted to BARCODE operators and mods.")
+            return
+        if not clean_content:
+            await message.reply("Tag me with what you need: operations brief, mod actions, recap hooks, or dossier seed suggestions.")
+            return
+        ops_context = build_operations_brief_context(message.guild.id, clean_content)
+        ops_prompt = (
+            "This is an internal BARCODE operations answer.\n"
+            "Be plain, useful, short, and action-oriented.\n"
+            "Keep it usually under 8 short lines unless the user asks for depth.\n"
+            "Use this structure: Current status / What matters / Suggested next actions / Optional Do not do yet.\n"
+            "Do not write a lore monologue.\n"
+            "Do not expose raw database rows, raw notes, or restricted internal details.\n"
+            "Do not convert planning discussion into canon.\n"
+            "Do not imply website dossier, queue, or payment integrations are live unless explicitly stated in context.\n"
+            "Do not publish or relay anything automatically.\n"
+            f"{ops_context}\n"
+            f"Operator request: {clean_content}"
+        )
+        response = await get_gemini_response(ops_prompt, message.author.id, message.guild.id, route="internal_operations_brief")
+        if not response:
+            response = "Current status: I can help with internal ops planning, but I hit a temporary sync issue. Please retry in a moment."
+        await message.reply(response)
+        _mark_recent_direct_response(message.channel.id, message.author.id)
         return
 
     session_key = _direct_session_key(message)
