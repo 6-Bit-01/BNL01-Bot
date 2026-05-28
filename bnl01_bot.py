@@ -1493,6 +1493,7 @@ async def generate_dynamic_website_relay(guild_id: int) -> tuple[str, str, str, 
 
     recent_topics = _recent_relay_topic_summary(guild_id)
     recent_lines = _recent_relay_messages.get(guild_id, [])[-5:]
+    relay_broadcast_context = build_scoped_broadcast_memory_context(guild_id, scope="relay", public_only=True, limit=3)
     angle_seed = random.choice(RELAY_ANGLE_ROTATION)
     logging.info(
         f"🧠 Relay context inspection guild={guild_id}: "
@@ -1547,6 +1548,7 @@ async def generate_dynamic_website_relay(guild_id: int) -> tuple[str, str, str, 
             f"Angle seed for this update: {angle_seed}.\n"
             f"Recent relay topics to avoid repeating unless context demands it: {recent_topics}.\n"
             f"Recent public lines to avoid mirroring: {' || '.join(recent_lines) or 'none'}.\n"
+            f"Public-safe relay-eligible broadcast memory:\n{relay_broadcast_context or '- (none)'}\n"
             f"Mode: {mode}.\n"
             f"Context summary: {signal_summary or 'limited Discord-side traffic'}.\n"
             f"Discord observations: {relay_context or 'No specific recent Discord observations available.'}\n"
@@ -3639,6 +3641,79 @@ def get_recent_broadcast_memory(guild_id: int, public_only: bool = False, limit:
     conn.close()
     return rows
 
+def get_latest_broadcast_episode_date(guild_id: int, public_only: bool = False, usage_scope: str = ""):
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    query = "SELECT MAX(episode_date) FROM broadcast_memory WHERE guild_id=? AND status='active'"
+    params = [guild_id]
+    if public_only:
+        query += " AND public_safe=1"
+    if usage_scope:
+        query += " AND instr(',' || ifnull(usage_scope, '') || ',', ',' || ? || ',') > 0"
+        params.append(usage_scope)
+    cursor.execute(query, tuple(params))
+    row = cursor.fetchone()
+    conn.close()
+    return row[0] if row and row[0] else None
+
+def _is_broadcast_memory_relevant(text: str) -> bool:
+    t = (text or "").lower()
+    return any(k in t for k in (
+        "barcode radio", "show", "broadcast", "friday", "next episode", "last episode",
+        "last week", "cliff", "6 bit", "queue", "cancel", "cancelled", "canceled",
+        "maintenance", "running joke", "status", "happening"
+    ))
+
+def build_broadcast_memory_context(guild_id: int, user_text: str, channel_policy: str, is_owner_or_mod: bool = False) -> str:
+    if not _is_broadcast_memory_relevant(user_text):
+        return ""
+    include_internal = (channel_policy == "broadcast_memory") or bool(is_owner_or_mod)
+    rows = get_recent_broadcast_memory(guild_id, public_only=not include_internal, limit=25)
+    if not rows:
+        return ""
+    latest_episode = get_latest_broadcast_episode_date(guild_id, public_only=not include_internal)
+    selected = []
+    for episode_date, cleaned_summary, entry_type, _importance, public_safe, _affects_next_show, _usage_scope, _target_show_date, _valid_until, _override_span_count, _needs_clarification in rows:
+        if not cleaned_summary:
+            continue
+        if latest_episode and episode_date != latest_episode and any(k in (user_text or "").lower() for k in ("last episode", "last week", "what happened")):
+            continue
+        if (not include_internal) and not public_safe:
+            continue
+        selected.append((episode_date, entry_type, _safe_truncate_summary(cleaned_summary, 160)))
+        if len(selected) >= 5:
+            break
+    if not selected:
+        return ""
+    lines = [f"- {d} [{t}] {s}" for d, t, s in selected[:5]]
+    return "Broadcast memory context (cleaned summaries only):\n" + "\n".join(lines)
+
+def build_scoped_broadcast_memory_context(guild_id: int, scope: str, public_only: bool = True, limit: int = 3) -> str:
+    rows = get_recent_broadcast_memory(guild_id, public_only=public_only, limit=25)
+    selected = []
+    for episode_date, cleaned_summary, entry_type, _importance, _public_safe, _affects_next_show, usage_scope, _target_show_date, _valid_until, _override_span_count, _needs_clarification in rows:
+        scope_txt = (usage_scope or "").lower()
+        if scope and scope not in scope_txt:
+            continue
+        if not cleaned_summary:
+            continue
+        selected.append(f"- {episode_date} [{entry_type}] {_safe_truncate_summary(cleaned_summary, 140)}")
+        if len(selected) >= limit:
+            break
+    return "\n".join(selected)
+
+def get_show_state_override_direct_response(guild_id: int, user_text: str) -> str:
+    if not _is_broadcast_memory_relevant(user_text):
+        return ""
+    override = get_active_show_state_override(guild_id)
+    if not override:
+        return ""
+    summary = _safe_truncate_summary(override[2] or "", 240)
+    target_show = override[5] or "next scheduled episode"
+    if not summary:
+        return ""
+    return f"Show-state update: {target_show} is currently overridden. {summary}"
+
 
 def get_broadcast_memory_diagnostic_dates(guild_id: int):
     conn = sqlite3.connect(DB_FILE)
@@ -4810,6 +4885,7 @@ async def generate_dynamic_ambient(guild_id: int, channel_id: int) -> str:
 
     temporal = get_temporal_context()
     ambient_mode = _select_ambient_mode(guild_id, temporal["show_phase"])
+    ambient_broadcast_context = build_scoped_broadcast_memory_context(guild_id, scope="ambient", public_only=True, limit=3)
 
     mode_guidance = {
         "room_observation": "Anchor in a fresh public-room pattern; stay concrete and understated.",
@@ -4837,6 +4913,7 @@ async def generate_dynamic_ambient(guild_id: int, channel_id: int) -> str:
         "- Memory/curiosity cues are background influence for tone and angle, not the main subject.\n"
         f"- Curiosity mode for this cycle: {curiosity_mode}.\n"
         f"- Ambient mode for this cycle: {ambient_mode} ({mode_guidance.get(ambient_mode, 'keep variety in rhetorical shape')}).\n"
+        f"- Public-safe ambient-eligible broadcast memory:\n{ambient_broadcast_context or '- (none)'}\n"
         "- Curiosity engine should vary behavior by mode:\n"
         "  - short_to_long_bridge: connect fresh short traces to one long memory signal.\n"
         "  - medium_rumination: dwell on a medium memory pattern and infer what it means now.\n"
@@ -6596,7 +6673,8 @@ def build_user_aware_prompt(
     fallback_display_name: str,
     clean_content: str,
     message_count: int = 1,
-    privileged: bool = False
+    privileged: bool = False,
+    channel_policy: str = "unknown"
 ) -> tuple:
     print("BNL DEBUG: build_user_aware_prompt start")
     display_name, preferred_name = get_user_profile(user_id, guild_id)
@@ -6612,6 +6690,7 @@ def build_user_aware_prompt(
 
     style_key, style_rule = choose_response_style(guild_id, user_id, message_count, clean_content)
     memory_context = build_user_memory_context(user_id, guild_id)
+    broadcast_context = build_broadcast_memory_context(guild_id, clean_content, channel_policy, is_owner_or_mod=privileged)
 
     prompt = (
         f"{greeting_rule}\n"
@@ -6623,6 +6702,7 @@ def build_user_aware_prompt(
         "If privileged_operator, be more direct, cooperative, and operationally transparent.\n"
         "If standard_member, keep normal policy behavior.\n"
         f"Durable memory context:\n{memory_context}\n"
+        f"{('Broadcast memory context:\\n' + broadcast_context + '\\n') if broadcast_context else ''}"
         f"User name to address (optional): {name_to_use}\n"
         f"User display name: {display_name or fallback_display_name}\n"
         f"User message: {clean_content}"
@@ -6932,7 +7012,8 @@ async def _generate_direct_payload_session(session_key, reason: str):
         session["requester_display_name"],
         direct_content,
         message_count=1,
-        privileged=is_privileged_member(session["requester_member"], session["guild"])
+        privileged=is_privileged_member(session["requester_member"], session["guild"]),
+        channel_policy=session.get("channel_policy", "unknown"),
     )
     prompt = _build_direct_payload_prompt(prompt, direct_payload_items, direct_content)
     log_response_style(session["guild_id"], session["requester_user_id"], style_key)
@@ -7309,6 +7390,12 @@ async def on_message(message: discord.Message):
                     save_model_message(message.author.id, message.guild.id, memory_recall, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy)
                 await message.reply(memory_recall)
                 return
+            override_reply = get_show_state_override_direct_response(message.guild.id, direct_content)
+            if override_reply:
+                if not is_sealed_test_channel:
+                    save_model_message(message.author.id, message.guild.id, override_reply, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy)
+                await message.reply(override_reply)
+                return
 
             payload_expected, _ = _detect_request_payload_expectation(direct_content)
             if payload_expected and len(direct_payload_items) == 0:
@@ -7348,7 +7435,8 @@ async def on_message(message: discord.Message):
                 message.author.display_name,
                 direct_content,
                 message_count=1,
-                privileged=is_privileged_member(message.author, message.guild)
+                privileged=is_privileged_member(message.author, message.guild),
+                channel_policy=channel_policy,
             )
             prompt = _build_direct_payload_prompt(prompt, direct_payload_items, direct_content)
             log_response_style(message.guild.id, message.author.id, style_key)
@@ -7482,6 +7570,11 @@ async def on_message(message: discord.Message):
             save_model_message(message.author.id, message.guild.id, memory_recall)
             await message.reply(memory_recall)
             return
+        override_reply = get_show_state_override_direct_response(message.guild.id, direct_content)
+        if override_reply:
+            save_model_message(message.author.id, message.guild.id, override_reply)
+            await message.reply(override_reply)
+            return
 
         prompt, allow_greeting, style_key = build_user_aware_prompt(
             message.author.id,
@@ -7489,7 +7582,8 @@ async def on_message(message: discord.Message):
             message.author.display_name,
             direct_content,
             message_count=1,
-            privileged=is_privileged_member(message.author, message.guild)
+            privileged=is_privileged_member(message.author, message.guild),
+            channel_policy=channel_policy,
         )
         prompt = _build_direct_payload_prompt(prompt, direct_payload_items, direct_content)
         log_response_style(message.guild.id, message.author.id, style_key)
@@ -7587,6 +7681,11 @@ async def on_message(message: discord.Message):
             save_model_message(message.author.id, message.guild.id, memory_recall)
             await message.reply(memory_recall if len(memory_recall) <= 2000 else memory_recall[:1900] + "...")
             return
+        override_reply = get_show_state_override_direct_response(message.guild.id, direct_content)
+        if override_reply:
+            save_model_message(message.author.id, message.guild.id, override_reply)
+            await message.reply(override_reply if len(override_reply) <= 2000 else override_reply[:1900] + "...")
+            return
 
         prompt, allow_greeting, style_key = build_user_aware_prompt(
             message.author.id,
@@ -7594,7 +7693,8 @@ async def on_message(message: discord.Message):
             message.author.display_name,
             direct_content,
             message_count=1,
-            privileged=is_privileged_member(message.author, message.guild)
+            privileged=is_privileged_member(message.author, message.guild),
+            channel_policy=channel_policy,
         )
         prompt = _build_direct_payload_prompt(prompt, direct_payload_items, direct_content)
         log_response_style(message.guild.id, message.author.id, style_key)
@@ -7963,6 +8063,7 @@ async def bnl_memory_check(interaction: discord.Interaction):
     broadcast_count = len(get_recent_broadcast_memory(guild.id, public_only=False, limit=500))
     latest_written_episode_date, latest_show_episode_date = get_broadcast_memory_diagnostic_dates(guild.id)
     active_override = get_active_show_state_override(guild.id)
+    latest_broadcast_context_episode_date = get_latest_broadcast_episode_date(guild.id, public_only=False)
 
     lines = [
         "**BNL Memory Diagnostic (safe)**",
@@ -8004,9 +8105,14 @@ async def bnl_memory_check(interaction: discord.Interaction):
         "- raw_message_dump: `disabled`",
         "- memory_mutation: `none (read-only diagnostic)`",
         f"- broadcast_memory_channel_configured: `{'yes' if BNL_BROADCAST_MEMORY_CHANNEL_ID else 'no'}`",
+        "- broadcast_memory_usage_enabled: `yes`",
+        "- broadcast_memory_direct_context_enabled: `yes`",
+        "- broadcast_memory_ambient_context_enabled: `yes`",
+        "- broadcast_memory_relay_context_enabled: `yes`",
         f"- broadcast_memory_entries_active: `{broadcast_count}`",
         f"- broadcast_memory_latest_written_episode_date: `{latest_written_episode_date or 'none'}`",
         f"- broadcast_memory_latest_show_episode_date: `{latest_show_episode_date or 'none'}`",
+        f"- latest_broadcast_context_episode_date: `{latest_broadcast_context_episode_date or 'none'}`",
         f"- active_show_state_override: `{'yes' if active_override else 'no'}`",
         f"- active_show_state_target_show_date: `{active_override[5] if active_override else 'none'}`",
         f"- active_show_state_valid_until: `{active_override[6] if active_override else 'none'}`",
@@ -8049,6 +8155,7 @@ async def bnl_status(interaction: discord.Interaction):
     broadcast_count = len(get_recent_broadcast_memory(guild.id, public_only=False, limit=500))
     latest_written_episode_date, latest_show_episode_date = get_broadcast_memory_diagnostic_dates(guild.id)
     active_override = get_active_show_state_override(guild.id)
+    latest_broadcast_context_episode_date = get_latest_broadcast_episode_date(guild.id, public_only=False)
 
     lines = [
         "**BNL Runtime Status (safe)**",
@@ -8070,9 +8177,14 @@ async def bnl_status(interaction: discord.Interaction):
         f"- website_bridge_configured: `{'yes' if website_bridge_configured else 'no'}`",
         f"- control_flags_source: `{flags_source_state}`",
         f"- broadcast_memory_channel: `{broadcast_channel.mention if broadcast_channel else 'unset/not found'}`",
+        "- broadcast_memory_usage_enabled: `yes`",
+        "- broadcast_memory_direct_context_enabled: `yes`",
+        "- broadcast_memory_ambient_context_enabled: `yes`",
+        "- broadcast_memory_relay_context_enabled: `yes`",
         f"- broadcast_memory_entries_active: `{broadcast_count}`",
         f"- broadcast_memory_latest_written_episode_date: `{latest_written_episode_date or 'none'}`",
         f"- broadcast_memory_latest_show_episode_date: `{latest_show_episode_date or 'none'}`",
+        f"- latest_broadcast_context_episode_date: `{latest_broadcast_context_episode_date or 'none'}`",
         f"- active_show_state_override: `{'yes' if active_override else 'no'}`",
         f"- active_show_state_target_show_date: `{active_override[5] if active_override else 'none'}`",
         f"- active_show_state_valid_until: `{active_override[6] if active_override else 'none'}`",
