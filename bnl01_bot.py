@@ -3761,12 +3761,12 @@ def build_show_state_override_context(guild_id: int, user_text: str) -> dict:
     if not cleaned_summary:
         return {}
     lines = [
-        "Authoritative show-state context:",
+        "Current BARCODE Radio scheduling context:",
         f"- The {target_show_date or 'next'} BARCODE Radio episode is not proceeding as a normal broadcast.",
         f"- Source summary: {cleaned_summary}",
-        "- Normal queue opening does not apply while this context is active.",
+        "- Normal queue opening does not apply while this episode is unavailable.",
         "- Answer the user's actual question using this context.",
-        "- Do not mention override, show_state, database, diagnostics, test channel, or internal implementation.",
+        "- Do not mention show-state, context block, override, database, diagnostics, test channel, or internal implementation.",
         "- Do not invent new events, artist facts, payments, moderation actions, or private facts.",
         "- Use natural BNL/BARCODE language, not canned wording.",
     ]
@@ -5463,7 +5463,7 @@ def _get_recent_show_state_topic_context(guild_id: int, channel_id: int, user_id
             "valid_until": "",
             "queue_opening_applies": False,
             "context_block": (
-                "Authoritative show-state continuity context from the immediately prior exchange:\n"
+                "Current BARCODE Radio follow-up context from the prior exchange:\n"
                 f"- Target show date: {ctx.get('target_show_date', '') or 'next'}\n"
                 f"- Source summary: {ctx.get('cleaned_summary', '')}\n"
                 "- Continue naturally from the prior answer and address the user's current follow-up."
