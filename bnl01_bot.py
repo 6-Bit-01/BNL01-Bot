@@ -5440,7 +5440,7 @@ def _store_show_state_topic_context(guild_id: int, channel_id: int, user_id: int
     }
 
 
-def _get_recent_show_state_topic_context(guild_id: int, channel_id: int, user_id: int, direct_target: bool, user_text: str) -> dict:
+def _get_recent_show_state_topic_context(guild_id: int, channel_id: int, user_id: int, response_route_allowed: bool, user_text: str) -> dict:
     key = _show_state_topic_key(guild_id, channel_id)
     ctx = _show_state_topic_context.get(key)
     if not ctx:
@@ -5451,7 +5451,7 @@ def _get_recent_show_state_topic_context(guild_id: int, channel_id: int, user_id
         return {}
     if ctx.get("last_bot_answer_type") != "show_state":
         return {}
-    if not direct_target:
+    if not response_route_allowed:
         return {}
     text = (user_text or "").strip().lower()
     if not text:
@@ -5466,7 +5466,13 @@ def _get_recent_show_state_topic_context(guild_id: int, channel_id: int, user_id
                 "Current BARCODE Radio follow-up context from the prior exchange:\n"
                 f"- Target show date: {ctx.get('target_show_date', '') or 'next'}\n"
                 f"- Source summary: {ctx.get('cleaned_summary', '')}\n"
-                "- Continue naturally from the prior answer and address the user's current follow-up."
+                "- The user is following up on the immediately previous BARCODE Radio scheduling answer.\n"
+                "- Answer the current follow-up using the source summary above.\n"
+                "- Stay on the BARCODE Radio scheduling/cancellation topic unless the user clearly changes topics.\n"
+                "- Do not use unrelated durable memory unless the user explicitly changes topics.\n"
+                "- If the user asks for the reason, explain the cancellation reason from the source summary.\n"
+                "- If the user asks about the kind of maintenance/review, explain it from the source summary.\n"
+                "- Do not mention show-state, context block, override, database, diagnostics, test channel, or internal implementation."
             ),
         }
     return {}
@@ -7721,7 +7727,7 @@ async def on_message(message: discord.Message):
 
             show_state_ctx = build_show_state_override_context(message.guild.id, direct_content)
             if not show_state_ctx:
-                show_state_ctx = _get_recent_show_state_topic_context(message.guild.id, message.channel.id, message.author.id, real_direct_target, direct_content)
+                show_state_ctx = _get_recent_show_state_topic_context(message.guild.id, message.channel.id, message.author.id, True, direct_content)
             prompt, allow_greeting, style_key = build_user_aware_prompt(
                 message.author.id,
                 message.guild.id,
