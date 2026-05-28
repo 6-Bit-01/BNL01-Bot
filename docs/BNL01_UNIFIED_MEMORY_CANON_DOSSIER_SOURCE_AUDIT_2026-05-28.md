@@ -24,8 +24,8 @@ This PR intentionally does **not** implement runtime or schema behavior changes.
 ### Consequence
 Website sections below provide:
 1) architecture-ready classification framework,
-2) expected data-lane mapping, and
-3) explicit follow-up checklist for PR #164 to complete source validation once repo access is available.
+2) known website-source anchors from available project references, and
+3) explicit follow-up checklist for PR #164 to reconcile implementation design with those existing references once repo access is available.
 
 ## Current source inventory (bot)
 
@@ -141,6 +141,94 @@ High-level observed build path:
 ## Website canon/dossier/source map (framework + pending verification)
 Because direct website repo inspection was blocked, this section defines required classification targets and expected source-lane boundaries to validate in PR #164:
 
+## Verified website-source anchors to incorporate later
+Even though direct clone/fetch failed in this environment, available project references already establish that the website side is **not blank** and already includes canon/dossier/release structure:
+
+1. `src/content.ts` includes a structured `databasePage` model with:
+   - designation prefixes (`EN`, `PE`, `SP`, `IF`, `PD`)
+   - categories (`Entity`, `Personnel`, `Sponsor`, `Interface`, `Production`)
+   - status, clearance, origin
+   - entries with fields including `id`, `name`, `image`, `category`, `status`, `clearance`, `role`, `origin`, `summary`, `tags`, `notes`, `link`, `files`
+
+2. `src/content.ts` includes public-facing dossier/entity records, including references for:
+   - 6 Bit
+   - BARCODE Radio
+   - Discord Community
+   - Auxchord
+   - TikTok Live
+   - BNL-01
+   - BARCODE personnel/mods
+   - BARCODE entities such as Mac Modem, DJ Floppydisc, Cache Back, Sheila, Cliff, Studio Rats, 9 Bit, GALAKNOISE
+   - Sponsor/interface entries such as Oreaganomics and Vouch’d
+
+3. `src/content.ts` includes release/catalog anchors, including:
+   - BARCODE: Signal Breach
+   - BARCODE Vol. 1
+   - archived/redacted BARCODE Vol. 0 material
+
+4. `BARCODE_NETWORK_MASTER_SOURCE_OF_TRUTH_2026-05-27.md` defines the intended BNL memory source-safety lanes:
+   - Canon memory
+   - Project/source-doc memory
+   - User/member memory
+   - Artist/dossier memory
+   - Channel-scoped context
+   - Session/show memory
+   - Temporary conversation memory
+   - Restricted/admin memory
+   - BNL internal operational state
+
+5. The same master source doc defines source labels:
+   - `source_doc`
+   - `github_source`
+   - `discord_message`
+   - `admin_note`
+   - `user_declared`
+   - `inferred_low_confidence`
+   - `queue_event`
+   - `payment_event`
+   - `show_event`
+   - `manual_mod_note`
+
+6. The same master source doc defines visibility levels:
+   - `public_safe`
+   - `bnl_safe`
+   - `admin_only`
+   - `restricted`
+   - `do_not_repeat`
+
+7. The same master source doc defines confidence levels:
+   - `verified`
+   - `likely`
+   - `unverified`
+   - `stale`
+   - `contradicted`
+
+8. The same master source doc defines dossier types:
+   - Artist dossier
+   - Member/community dossier
+   - Mod/staff dossier
+   - BARCODE collaborator dossier
+   - Character/lore dossier
+   - Sponsor/ad dossier
+   - Track/song dossier
+   - Show/session dossier
+
+9. The same master source doc defines eventual dossier fields, including:
+   - public display name
+   - Discord identity
+   - TikTok handle
+   - email/contact if provided
+   - submitted tracks
+   - played/completed/removed/no-show history
+   - Spotlight history
+   - Wheel Chosen history
+   - Priority Signal/payment history where appropriate
+   - station consideration status
+   - permissions/release status
+   - admin notes
+   - BNL-safe memory notes
+   - restricted notes
+
 ## Required website source classes
 1. **Public canon**
    - BARCODE world entities/program pages approved for public consumption.
@@ -167,10 +255,11 @@ Because direct website repo inspection was blocked, this section defines require
 
 ## Current disconnects
 1. No shared source registry unifying all lanes under one authority model.
-2. Website canon/dossiers/releases are not currently first-class prompt sources in this repo.
+2. Website canon/dossiers/releases are not currently first-class prompt sources in this repo, even though existing project references indicate website-side structures already exist.
 3. Queue/payment/event state not currently normalized as source-aware knowledge records.
 4. Memory tiers still contain legacy-source records requiring cautious down-rank.
 5. Public chatter and user memory lanes can influence tone/context but are not fully entity-linked with provenance.
+6. Website repo file-by-file validation was not completed in this Codex environment; however, follow-on implementation should reconcile architecture with existing `databasePage`, release catalog anchors, and master-source taxonomy rather than inventing a net-new dossier system from scratch.
 
 ## Current risks
 1. **Over-centering risk** (e.g., recently tested entities like Cliff) due to recency/chatter prominence.
@@ -178,6 +267,7 @@ Because direct website repo inspection was blocked, this section defines require
 3. **Visibility leakage risk** if future admin/internal notes are not hard-gated by visibility policy.
 4. **Staleness risk** for operational queue/payment/show data if freshness isn’t embedded in source records.
 5. **Correction lineage risk** outside broadcast lane if future dossier/event facts lack supersession history.
+6. **Architecture drift risk** if future PRs model dossiers/events without first reconciling to known website structures in `src/content.ts` and `BARCODE_NETWORK_MASTER_SOURCE_OF_TRUTH_2026-05-27.md`.
 
 ## Future dossier requirements (first-class objects)
 Dossiers should be structured records, not plain memory blobs.
@@ -386,11 +476,12 @@ Diagnostic output principles:
 - read-only source-lane inventory, authority/visibility/confidence/freshness reporting
 - no behavior change
 
-## PR #164 — Website canon/dossier exposure v1
+## PR #164 — Website canon/dossier export or import v1
+- begin by reconciling implementation with existing website references (`src/content.ts` structures + `BARCODE_NETWORK_MASTER_SOURCE_OF_TRUTH_2026-05-27.md` taxonomy)
 - expose/import public-safe website canon/dossier/release entities
 - read-only integration
 - no chatter writes
-- complete deferred website file-level validation from this audit
+- complete deferred website file-level validation from this audit (because direct clone/fetch was blocked in this environment)
 
 ## PR #165 — Unified source-aware prompt assembly v1
 - inject ranked context blocks by source authority
@@ -421,4 +512,3 @@ This audit intentionally does **not**:
 - alter website production behavior
 
 Implementation is deferred to staged PRs above.
-
