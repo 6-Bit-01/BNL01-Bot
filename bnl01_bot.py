@@ -2075,6 +2075,26 @@ def init_db():
     _try_alter(cursor, "ALTER TABLE broadcast_memory ADD COLUMN supersedes_id INTEGER")
     _try_alter(cursor, "ALTER TABLE broadcast_memory ADD COLUMN superseded_by_id INTEGER")
 
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS member_activity_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            guild_id INTEGER NOT NULL,
+            member_user_id TEXT,
+            member_name TEXT,
+            event_type TEXT NOT NULL,
+            source_channel_name TEXT,
+            source_channel_policy TEXT,
+            source_message_author TEXT,
+            source_kind TEXT,
+            visibility TEXT DEFAULT 'admin_only',
+            public_safe INTEGER DEFAULT 0,
+            raw_excerpt TEXT,
+            created_at TEXT NOT NULL
+        )
+        """
+    )
+
     cursor.execute("INSERT OR IGNORE INTO token_usage (id) VALUES (1)")
 
     conn.commit()
@@ -2791,6 +2811,50 @@ def context_visibility_for_policy(policy: str) -> str:
 
 def allow_passive_memory_for_policy(policy: str) -> bool:
     return policy in {"public_home", "public_context"}
+
+
+def is_direct_bnl_target(message: discord.Message) -> bool:
+    """Return True only for direct BNL user tags or replies to BNL messages."""
+    bot_user = getattr(client, "user", None)
+    bot_id = int(getattr(bot_user, "id", 0) or 0)
+    if not message or not bot_user or not bot_id:
+        return False
+
+    for mentioned_user in getattr(message, "mentions", []) or []:
+        if int(getattr(mentioned_user, "id", 0) or 0) == bot_id:
+            return True
+
+    raw_mentions = getattr(message, "raw_mentions", []) or []
+    if any(int(user_id) == bot_id for user_id in raw_mentions):
+        return True
+
+    reference = getattr(message, "reference", None)
+    resolved = getattr(reference, "resolved", None) if reference else None
+    if getattr(resolved, "author", None) == bot_user:
+        return True
+
+    return False
+
+
+def is_internal_channel_redirect_candidate(channel_policy: str, message: discord.Message) -> bool:
+    if channel_policy != "internal_controlled":
+        return False
+    return not is_research_and_development_channel(message)
+
+
+async def maybe_send_internal_operations_redirect(message: discord.Message):
+    """Best-effort redirect for non-approved internal channels; never blocks observation."""
+    try:
+        channel = getattr(message, "channel", None)
+        guild_me = getattr(getattr(message, "guild", None), "me", None)
+        if channel and guild_me and hasattr(channel, "permissions_for"):
+            perms = channel.permissions_for(guild_me)
+            if not getattr(perms, "send_messages", False):
+                return
+        await message.reply("Use #research-and-development for BNL operations requests.")
+    except Exception as exc:
+        logging.info(f"internal_operations_redirect_skipped reason={type(exc).__name__}")
+
 
 def is_research_and_development_channel(message: discord.Message) -> bool:
     if not message or not getattr(message, "channel", None):
@@ -3661,6 +3725,188 @@ def save_model_message(user_id: int, guild_id: int, content: str, channel_name: 
     )
     if any(k in (content or "").lower() for k in ("try this", "steps", "option", "recommend")):
         add_relationship_journal(user_id, guild_id, "support_response", f"BNL provided guidance: {(content or '')[:160]}")
+
+
+def _stringify_embed_value(value) -> list:
+    parts = []
+    if value is None:
+        return parts
+    if isinstance(value, dict):
+        for nested_value in value.values():
+            parts.extend(_stringify_embed_value(nested_value))
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            parts.extend(_stringify_embed_value(item))
+    else:
+        text = str(value).strip()
+        if text:
+            parts.append(text)
+    return parts
+
+
+def _member_activity_text_from_message(message: discord.Message) -> str:
+    parts = []
+    content = (getattr(message, "content", "") or "").strip()
+    if content:
+        parts.append(content)
+    for embed in getattr(message, "embeds", []) or []:
+        try:
+            embed_dict = embed.to_dict()
+        except Exception:
+            embed_dict = {}
+        parts.extend(_stringify_embed_value(embed_dict))
+    return "\n".join(part for part in parts if part).strip()
+
+
+def _extract_member_activity_event(message: discord.Message) -> dict:
+    text = _member_activity_text_from_message(message)
+    if not text:
+        return {}
+    lowered = text.lower()
+    joined_signal = bool(re.search(r"\bmember\s+joined\b|\bjoined\s+the\s+server\b|\b\d+(?:st|nd|rd|th)\s+to\s+join\b", lowered))
+    left_signal = bool(re.search(r"\bmember\s+left\b|\bleft\s+the\s+server\b|\bmember\s+leave\b", lowered))
+    if joined_signal and not left_signal:
+        event_type = "joined"
+    elif left_signal and not joined_signal:
+        event_type = "left"
+    elif joined_signal or left_signal:
+        event_type = "unknown_member_event"
+    else:
+        return {}
+
+    source_author = (getattr(getattr(message, "author", None), "display_name", "") or getattr(getattr(message, "author", None), "name", "") or "").strip()
+    source_author_lower = source_author.lower()
+    source_kind = "carl_bot_log" if "carl" in source_author_lower else "unknown"
+    if source_kind != "carl_bot_log" and "carl-bot" not in lowered and "carl bot" not in lowered:
+        return {}
+
+    user_id = ""
+    id_match = re.search(r"(?:\bID\b|User\s*ID|member_user_id)\D{0,20}(\d{15,25})", text, flags=re.IGNORECASE)
+    if not id_match:
+        id_match = re.search(r"<@!?(\d{15,25})>", text)
+    if id_match:
+        user_id = id_match.group(1)
+
+    member_name = ""
+    for pattern in (
+        r"(?:User|Member|Username|Name)\s*[:\-]\s*([^\n|]+)",
+        r"Member\s+(?:joined|left)\s*[:\-]?\s*([^\n|]+)",
+        r"^([^\n]{2,80})\n.*\b(?:ID|Account created|\d+(?:st|nd|rd|th)\s+to\s+join)\b",
+    ):
+        match = re.search(pattern, text, flags=re.IGNORECASE | re.DOTALL)
+        if match:
+            candidate = re.sub(r"<@!?\d{15,25}>", "", match.group(1)).strip(" *`_:-\n\r\t")
+            if candidate and not re.search(r"\bmember\s+(joined|left)\b", candidate, re.IGNORECASE):
+                member_name = candidate[:120]
+                break
+
+    if not member_name and user_id:
+        member_name = user_id
+
+    raw_excerpt = re.sub(r"\s+", " ", text).strip()[:300]
+    return {
+        "member_user_id": user_id or None,
+        "member_name": member_name or None,
+        "event_type": event_type,
+        "source_kind": source_kind,
+        "raw_excerpt": raw_excerpt,
+    }
+
+def _member_activity_event_is_duplicate(guild_id: int, member_user_id: str, member_name: str, event_type: str, source_channel_name: str, now: datetime) -> bool:
+    since = (now - timedelta(hours=12)).isoformat()
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    if member_user_id:
+        cursor.execute(
+            """
+            SELECT 1 FROM member_activity_events
+            WHERE guild_id=? AND member_user_id=? AND event_type=? AND source_channel_name=? AND created_at>=?
+            LIMIT 1
+            """,
+            (guild_id, member_user_id, event_type, source_channel_name, since),
+        )
+    else:
+        cursor.execute(
+            """
+            SELECT 1 FROM member_activity_events
+            WHERE guild_id=? AND member_user_id IS NULL AND member_name=? AND event_type=? AND source_channel_name=? AND created_at>=?
+            LIMIT 1
+            """,
+            (guild_id, member_name, event_type, source_channel_name, since),
+        )
+    duplicate = cursor.fetchone() is not None
+    conn.close()
+    return duplicate
+
+
+def maybe_record_member_activity_event(message: discord.Message, channel_policy: str) -> bool:
+    """Record clear private R&D member join/leave logs without feeding public/user memory."""
+    if not message or not getattr(message, "guild", None):
+        return False
+    if not is_research_and_development_channel(message):
+        return False
+    event = _extract_member_activity_event(message)
+    if not event:
+        return False
+    if not event.get("member_user_id") and not event.get("member_name"):
+        return False
+
+    guild_id = int(message.guild.id)
+    source_channel_name = (getattr(message.channel, "name", "") or "").strip().lower()[:80]
+    source_author = (getattr(message.author, "display_name", "") or getattr(message.author, "name", "") or "")[:120]
+    now = datetime.now(PACIFIC_TZ)
+    if _member_activity_event_is_duplicate(
+        guild_id,
+        event.get("member_user_id"),
+        event.get("member_name"),
+        event.get("event_type") or "unknown_member_event",
+        source_channel_name,
+        now,
+    ):
+        logging.info("member_activity_event_skipped reason=duplicate")
+        return False
+
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        INSERT INTO member_activity_events (
+            guild_id, member_user_id, member_name, event_type, source_channel_name,
+            source_channel_policy, source_message_author, source_kind, visibility,
+            public_safe, raw_excerpt, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'admin_only', 0, ?, ?)
+        """,
+        (
+            guild_id,
+            event.get("member_user_id"),
+            event.get("member_name"),
+            event.get("event_type") or "unknown_member_event",
+            source_channel_name,
+            (channel_policy or "unknown")[:40],
+            source_author,
+            event.get("source_kind") or "unknown",
+            event.get("raw_excerpt") or "",
+            now.isoformat(),
+        ),
+    )
+    conn.commit()
+    conn.close()
+    logging.info(f"member_activity_event_recorded guild={guild_id} type={event.get('event_type')} source={source_channel_name}")
+    return True
+
+
+def get_member_activity_event_counts(guild_id: int) -> tuple:
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("SELECT COUNT(*) FROM member_activity_events WHERE guild_id=?", (guild_id,))
+    total_row = cursor.fetchone()
+    since = (datetime.now(PACIFIC_TZ) - timedelta(days=7)).isoformat()
+    cursor.execute("SELECT COUNT(*) FROM member_activity_events WHERE guild_id=? AND created_at>=?", (guild_id, since))
+    recent_row = cursor.fetchone()
+    conn.close()
+    total = int(total_row[0]) if total_row and total_row[0] is not None else 0
+    recent = int(recent_row[0]) if recent_row and recent_row[0] is not None else 0
+    return total, recent
 
 
 def add_broadcast_memory_entry(guild_id: int, message: discord.Message, processed: dict):
@@ -7466,20 +7712,21 @@ async def on_message(message: discord.Message):
     if message.content.startswith("/"):
         return
 
-    upsert_user_profile(message.author.id, message.guild.id, message.author.display_name)
-
     active_channel_id = get_guild_config(message.guild.id)
 
     is_active_channel = (active_channel_id is not None and message.channel.id == active_channel_id)
     channel_policy = resolve_channel_policy(message.channel)
+    if channel_policy != "internal_controlled":
+        upsert_user_profile(message.author.id, message.guild.id, message.author.display_name)
     is_sealed_test_channel = channel_policy == "sealed_test"
     active_test_free_speak = is_sealed_test_channel
     should_handle_as_active_channel = is_active_channel or active_test_free_speak
     passive_memory_allowed = allow_passive_memory_for_policy(channel_policy)
-    is_mention = client.user.mentioned_in(message)
-    is_reply = (
-        message.reference
-        and message.reference.resolved
+    real_direct_target = is_direct_bnl_target(message)
+    is_mention = real_direct_target
+    is_reply = bool(
+        getattr(message, "reference", None)
+        and getattr(message.reference, "resolved", None)
         and getattr(message.reference.resolved, "author", None) == client.user
     )
 
@@ -7490,7 +7737,6 @@ async def on_message(message: discord.Message):
     )
 
     plain_text_name_seen = bool(re.search(r"\b(bnl|bnl-01|barcode bot)\b", clean_content.lower())) if clean_content else False
-    real_direct_target = bool(is_mention or is_reply)
     channel_allows_conversation = bool(
         channel_policy in {"public_home", "sealed_test"}
         or is_active_channel
@@ -7499,6 +7745,13 @@ async def on_message(message: discord.Message):
     logging.info(f"response_route_channel_policy policy={channel_policy}")
     logging.info(f"response_route_real_direct_target active={int(real_direct_target)}")
     logging.info(f"response_route_plain_text_name_seen seen={int(plain_text_name_seen)}")
+
+    maybe_record_member_activity_event(message, channel_policy)
+
+    if is_internal_channel_redirect_candidate(channel_policy, message):
+        if real_direct_target:
+            await maybe_send_internal_operations_redirect(message)
+        return
 
     if channel_policy == "broadcast_memory":
         member = message.author if isinstance(message.author, discord.Member) else message.guild.get_member(message.author.id)
@@ -7745,7 +7998,7 @@ async def on_message(message: discord.Message):
     else:
         logging.info("response_route_decision route=policy_blocked reason=no_conversation_route")
 
-    if clean_content and (should_handle_as_active_channel or is_mention or is_reply):
+    if clean_content and (should_handle_as_active_channel or real_direct_target):
         if not is_sealed_test_channel:
             maybe_update_broadcast_status_from_text(clean_content)
             maybe_update_restricted_status_from_text(clean_content)
@@ -7762,7 +8015,7 @@ async def on_message(message: discord.Message):
     # ---------------- PASSIVE SERVER OBSERVATION ----------------
     # BNL silently logs messages across the server so it can recall them later
     # but skips the active channel because those messages are logged below
-    if passive_memory_allowed and not client.user.mentioned_in(message) and not should_handle_as_active_channel:
+    if passive_memory_allowed and not real_direct_target and not should_handle_as_active_channel:
         if message.content and len(message.content) < 400:
             save_user_message(
                 message.author.id,
@@ -8535,6 +8788,7 @@ async def bnl_memory_check(interaction: discord.Interaction):
     latest_written_episode_date, latest_show_episode_date = get_broadcast_memory_diagnostic_dates(guild.id)
     active_override = get_active_show_state_override(guild.id)
     latest_broadcast_context_episode_date = get_latest_broadcast_episode_date(guild.id, public_only=False)
+    member_activity_events_count, recent_member_events_count_7d = get_member_activity_event_counts(guild.id)
 
     lines = [
         "**BNL Memory Diagnostic (safe)**",
@@ -8584,6 +8838,8 @@ async def bnl_memory_check(interaction: discord.Interaction):
         "- broadcast_memory_correction_scope: `broadcast_memory_channel_only`",
         "- broadcast_memory_correction_owner_authority_enabled: `yes`",
         f"- broadcast_memory_entries_active: `{broadcast_count}`",
+        f"- member_activity_events_count: `{member_activity_events_count}`",
+        f"- recent_member_events_count_7d: `{recent_member_events_count_7d}`",
         f"- broadcast_memory_latest_written_episode_date: `{latest_written_episode_date or 'none'}`",
         f"- broadcast_memory_latest_show_episode_date: `{latest_show_episode_date or 'none'}`",
         f"- latest_broadcast_context_episode_date: `{latest_broadcast_context_episode_date or 'none'}`",
@@ -8630,6 +8886,7 @@ async def bnl_status(interaction: discord.Interaction):
     latest_written_episode_date, latest_show_episode_date = get_broadcast_memory_diagnostic_dates(guild.id)
     active_override = get_active_show_state_override(guild.id)
     latest_broadcast_context_episode_date = get_latest_broadcast_episode_date(guild.id, public_only=False)
+    member_activity_events_count, recent_member_events_count_7d = get_member_activity_event_counts(guild.id)
 
     lines = [
         "**BNL Runtime Status (safe)**",
@@ -8659,6 +8916,8 @@ async def bnl_status(interaction: discord.Interaction):
         "- broadcast_memory_correction_scope: `broadcast_memory_channel_only`",
         "- broadcast_memory_correction_owner_authority_enabled: `yes`",
         f"- broadcast_memory_entries_active: `{broadcast_count}`",
+        f"- member_activity_events_count: `{member_activity_events_count}`",
+        f"- recent_member_events_count_7d: `{recent_member_events_count_7d}`",
         f"- broadcast_memory_latest_written_episode_date: `{latest_written_episode_date or 'none'}`",
         f"- broadcast_memory_latest_show_episode_date: `{latest_show_episode_date or 'none'}`",
         f"- latest_broadcast_context_episode_date: `{latest_broadcast_context_episode_date or 'none'}`",
