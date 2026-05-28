@@ -2797,11 +2797,30 @@ def _recent_friday_pacific_for_note(note_text: str, now_pacific: datetime = None
     days_since_friday = (now.weekday() - 4) % 7
     this_friday = (now - timedelta(days=days_since_friday)).date()
     previous_friday = this_friday - timedelta(days=7)
-    if "last show" in text:
+    if any(p in text for p in ("last show", "last week's episode", "last week episode", "last week’s episode")):
         return this_friday.isoformat() if now.weekday() != 4 or now >= show_start else previous_friday.isoformat()
     if now.weekday() == 4 and now < show_start and not any(p in text for p in ("tonight", "today's show", "todays show", "today show")):
         return previous_friday.isoformat()
     return this_friday.isoformat() if now.weekday() == 4 else previous_friday.isoformat()
+
+
+def _extract_exact_episode_date(note_text: str) -> str:
+    text = (note_text or "").strip()
+    patterns = [
+        r"\b(20\d{2}-\d{2}-\d{2})\b",
+        r"\b(20\d{2}/\d{2}/\d{2})\b",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, text, flags=re.IGNORECASE)
+        if not match:
+            continue
+        candidate = match.group(1).replace("/", "-")
+        try:
+            parsed = datetime.strptime(candidate, "%Y-%m-%d").date()
+            return parsed.isoformat()
+        except Exception:
+            continue
+    return ""
 
 
 def _next_friday_pacific(now_pacific: datetime = None) -> datetime:
@@ -3672,6 +3691,7 @@ async def process_broadcast_memory_note(message) -> dict:
     summary = text[:220]
     summary = re.sub(r"\b(fuck|shit|bitch)\b", "redacted", summary, flags=re.IGNORECASE)
     summary = summary.rstrip(" .") + "."
+    exact_date = _extract_exact_episode_date(text)
     result = {
         "entry_type": entry_type,
         "importance": importance,
@@ -3679,11 +3699,44 @@ async def process_broadcast_memory_note(message) -> dict:
         "affects_next_show": affects_next or entry_type == "show_state_override",
         "usage_scope": usage_scope,
         "cleaned_summary": summary,
-        "episode_date": _recent_friday_pacific_for_note(text),
+        "episode_date": exact_date or _recent_friday_pacific_for_note(text),
     }
     if entry_type == "show_state_override":
         result.update(override)
     return result
+
+
+async def process_broadcast_memory_notes(message) -> list[dict]:
+    primary = await process_broadcast_memory_note(message)
+    if primary.get("entry_type") in {"reject", "show_state_resume"}:
+        return [primary]
+    text = re.sub(r"\s+", " ", (message.content or "").strip())
+    lowered = text.lower()
+    entries = [primary]
+    previous_week_markers = ("previous week's episode", "previous week’s episode", "the week before")
+    has_previous_week_reference = any(m in lowered for m in previous_week_markers)
+    if has_previous_week_reference and primary.get("entry_type") == "notable_moment":
+        primary_date = primary.get("episode_date") or _recent_friday_pacific_for_note(text)
+        try:
+            prior_date = (datetime.strptime(primary_date, "%Y-%m-%d").date() - timedelta(days=7)).isoformat()
+        except Exception:
+            prior_date = ""
+        if prior_date and ("vanish" in lowered or "disappear" in lowered):
+            ref_summary = "Cliff vanished at the end of the episode."
+            if "cliff" not in lowered:
+                ref_summary = "A vanishing happened at the end of the episode."
+            entries.append(
+                {
+                    "entry_type": "continuity_backreference",
+                    "importance": "medium",
+                    "public_safe": primary.get("public_safe", True),
+                    "affects_next_show": False,
+                    "usage_scope": "internal",
+                    "cleaned_summary": ref_summary,
+                    "episode_date": prior_date,
+                }
+            )
+    return entries[:3]
 
 def get_conversation_history(user_id: int, guild_id: int, limit: int = 50):
     """
@@ -4284,6 +4337,19 @@ def split_message(text, limit=1900):
         text = text[split_at+1:]
     parts.append(text)
     return parts
+
+
+async def send_safe_ephemeral_chunks(interaction: discord.Interaction, text: str, limit: int = 1800):
+    chunks = split_message(text or "", limit=max(300, int(limit)))
+    if not chunks:
+        chunks = ["(no diagnostic output)"]
+    if not interaction.response.is_done():
+        await interaction.response.send_message(chunks[0], ephemeral=True)
+        for chunk in chunks[1:]:
+            await interaction.followup.send(chunk, ephemeral=True)
+        return
+    for chunk in chunks:
+        await interaction.followup.send(chunk, ephemeral=True)
 
 _last_reaction_by_channel = {}
 
@@ -6953,7 +7019,8 @@ async def on_message(message: discord.Message):
             return
         if not clean_content:
             return
-        processed = await process_broadcast_memory_note(message)
+        processed_entries = await process_broadcast_memory_notes(message)
+        processed = processed_entries[0] if processed_entries else {"entry_type": "reject", "reason": "insufficient signal"}
         if processed.get("entry_type") == "show_state_resume":
             cleared = clear_active_show_state_overrides(message.guild.id)
             await message.reply(f"Logged. Normal schedule restored; resolved overrides: {cleared}.")
@@ -6961,10 +7028,21 @@ async def on_message(message: discord.Message):
         if processed.get("entry_type") == "reject":
             await message.reply(f"Not stored: {processed.get('reason', 'insufficient signal')}")
             return
-        add_broadcast_memory_entry(message.guild.id, message, processed)
-        safe_txt = "yes" if processed.get("public_safe") else "no"
+        stored_entries = []
+        for entry in processed_entries[:3]:
+            if entry.get("entry_type") in {"reject", "show_state_resume"}:
+                continue
+            add_broadcast_memory_entry(message.guild.id, message, entry)
+            stored_entries.append(entry)
+        if not stored_entries:
+            await message.reply("Not stored: insufficient signal")
+            return
+        safe_txt = "yes" if all(e.get("public_safe") for e in stored_entries) else "mixed/no"
+        summary_bits = [f"{e.get('episode_date')} {e.get('entry_type')}" for e in stored_entries[:3]]
         await message.reply(
-            f"Logged for episode {processed.get('episode_date')}: {processed.get('entry_type')} | Public-safe: {safe_txt} | Usage: {processed.get('usage_scope')}"
+            f"Logged {len(stored_entries)} entr{'y' if len(stored_entries)==1 else 'ies'}: "
+            + "; ".join(summary_bits)
+            + f" | Public-safe: {safe_txt}"
         )
         return
 
@@ -7709,7 +7787,7 @@ async def bnl_source_check(interaction: discord.Interaction):
         f"- _bnl_control_flags_last_source_url: `{flags_source}`",
         f"- website_relay_enabled: `{BNL_WEBSITE_RELAY_ENABLED}` every `{BNL_WEBSITE_RELAY_INTERVAL_MINUTES}` min",
     ]
-    await interaction.response.send_message("\n".join(lines), ephemeral=True)
+    await send_safe_ephemeral_chunks(interaction, "\n".join(lines), limit=1700)
 
 
 @tree.command(name="bnl_context_check", description="Owner-only diagnostics for channel policy reporting.")
@@ -7842,7 +7920,7 @@ async def bnl_memory_check(interaction: discord.Interaction):
         f"- active_show_state_needs_clarification: `{active_override[8] if active_override else 0}`",
         f"- active_show_state_summary: `{(active_override[2][:120] + '...') if active_override and active_override[3] else 'hidden_or_none'}`",
     ]
-    await interaction.response.send_message("\n".join(lines), ephemeral=True)
+    await send_safe_ephemeral_chunks(interaction, "\n".join(lines), limit=1700)
 
 
 @tree.command(name="bnl_status", description="Mod-readable runtime status snapshot (safe).")
