@@ -2751,7 +2751,7 @@ def has_mod_role(member: discord.Member) -> bool:
     return any(role.id == BNL_MOD_ROLE_ID for role in getattr(member, "roles", []))
 
 
-def resolve_channel_policy(channel) -> str:
+def _resolve_channel_policy_without_parent(channel) -> str:
     if not channel:
         return "unknown"
     cid = getattr(channel, "id", 0) or 0
@@ -2783,6 +2783,19 @@ def resolve_channel_policy(channel) -> str:
     if name in AI_IMAGE_TOOL_CHANNELS:
         return "ai_image_tool"
     return "unknown"
+
+
+def resolve_channel_policy(channel) -> str:
+    if not channel:
+        return "unknown"
+
+    parent_channel = getattr(channel, "parent", None) or getattr(channel, "parent_channel", None)
+    if parent_channel and parent_channel is not channel:
+        parent_policy = _resolve_channel_policy_without_parent(parent_channel)
+        if parent_policy != "unknown":
+            return parent_policy
+
+    return _resolve_channel_policy_without_parent(channel)
 
 
 def website_relay_eligibility(policy: str) -> str:
