@@ -23,6 +23,7 @@ import uuid
 import urllib.request
 import urllib.error
 import urllib.parse
+import calendar
 from collections import defaultdict, deque
 from datetime import datetime, timedelta, timezone
 
@@ -54,6 +55,7 @@ BNL_FORCE_PULL_PORT = int(os.getenv("BNL_FORCE_PULL_PORT", "8787") or 8787)
 BNL_OWNER_USER_ID = int(os.getenv("BNL_OWNER_USER_ID", "0") or 0)
 BNL_MOD_ROLE_ID = int(os.getenv("BNL_MOD_ROLE_ID", "0") or 0)
 BNL_TESTING_CHANNEL_ID = int(os.getenv("BNL_TESTING_CHANNEL_ID", "0") or 0)
+BNL_BROADCAST_MEMORY_CHANNEL_ID = int(os.getenv("BNL_BROADCAST_MEMORY_CHANNEL_ID", "1509384896554995752") or 0)
 
 DAILY_TOKEN_LIMIT = 1_350_000
 PACIFIC_TZ = pytz.timezone("US/Pacific")
@@ -122,6 +124,7 @@ PUBLIC_SELECTIVE_CHANNELS = {"introductions", "social-links", "suggestions", "un
 REFERENCE_CANON_CHANNELS = {"announcements", "rules-and-guidelines", "faq", "resources", "roles"}
 INTERNAL_CONTROLLED_CHANNELS = {"research-and-development", "important", "planning-and-coordination", "mod-resources", "ai-avatar"}
 AI_IMAGE_TOOL_CHANNELS = {"ai-image-generator"}
+BROADCAST_MEMORY_CHANNELS = {"bnl-broadcast-memory"}
 
 # ======== ADAPTIVE RESPONSE STYLE / MEMORY ========
 RECENT_STYLE_WINDOW = 6
@@ -2034,6 +2037,35 @@ def init_db():
         )
         """
     )
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS broadcast_memory (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            guild_id INTEGER NOT NULL,
+            episode_date TEXT NOT NULL,
+            submitted_by_user_id INTEGER,
+            submitted_by_name TEXT,
+            raw_note TEXT,
+            cleaned_summary TEXT NOT NULL,
+            entry_type TEXT NOT NULL,
+            importance TEXT DEFAULT 'medium',
+            public_safe INTEGER DEFAULT 0,
+            affects_next_show INTEGER DEFAULT 0,
+            usage_scope TEXT DEFAULT 'internal',
+            target_show_date TEXT,
+            valid_until TEXT,
+            override_span_count INTEGER DEFAULT 1,
+            needs_clarification INTEGER DEFAULT 0,
+            status TEXT DEFAULT 'active',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
+    _try_alter(cursor, "ALTER TABLE broadcast_memory ADD COLUMN target_show_date TEXT")
+    _try_alter(cursor, "ALTER TABLE broadcast_memory ADD COLUMN valid_until TEXT")
+    _try_alter(cursor, "ALTER TABLE broadcast_memory ADD COLUMN override_span_count INTEGER DEFAULT 1")
+    _try_alter(cursor, "ALTER TABLE broadcast_memory ADD COLUMN needs_clarification INTEGER DEFAULT 0")
 
     cursor.execute("INSERT OR IGNORE INTO token_usage (id) VALUES (1)")
 
@@ -2699,9 +2731,13 @@ def resolve_channel_policy(channel) -> str:
 
     if BNL_TESTING_CHANNEL_ID and cid == BNL_TESTING_CHANNEL_ID:
         return "sealed_test"
+    if BNL_BROADCAST_MEMORY_CHANNEL_ID and cid == BNL_BROADCAST_MEMORY_CHANNEL_ID:
+        return "broadcast_memory"
     name = ((getattr(channel, "name", "") or "").strip().lower())
     if name == "bnl-testing":
         return "sealed_test"
+    if name in BROADCAST_MEMORY_CHANNELS:
+        return "broadcast_memory"
     if BNL_PRIMARY_GUILD_ID and guild_id and guild_id != BNL_PRIMARY_GUILD_ID:
         return "public_selective"
     if name in PROTECTED_SYSTEM_CHANNELS:
@@ -2736,6 +2772,7 @@ def context_visibility_for_policy(policy: str) -> str:
         "protected_system": "protected_existing_behavior",
         "reference_canon": "reference_only",
         "ai_image_tool": "owner_approval_required",
+        "broadcast_memory": "trusted_show_memory_inbox",
         "public_home": "public_context_allowed",
         "public_context": "public_context_allowed",
         "public_selective": "selective_public_context",
@@ -2746,6 +2783,93 @@ def context_visibility_for_policy(policy: str) -> str:
 
 def allow_passive_memory_for_policy(policy: str) -> bool:
     return policy in {"public_home", "public_context"}
+
+
+def _truncate_raw_note(note: str, limit: int = 400) -> str:
+    text = re.sub(r"\s+", " ", (note or "").strip())
+    return text[:limit]
+
+
+def _recent_friday_pacific_for_note(note_text: str, now_pacific: datetime = None) -> str:
+    now = now_pacific or datetime.now(PACIFIC_TZ)
+    text = (note_text or "").lower()
+    show_start = now.replace(hour=18, minute=40, second=0, microsecond=0)
+    days_since_friday = (now.weekday() - 4) % 7
+    this_friday = (now - timedelta(days=days_since_friday)).date()
+    previous_friday = this_friday - timedelta(days=7)
+    if "last show" in text:
+        return this_friday.isoformat() if now.weekday() != 4 or now >= show_start else previous_friday.isoformat()
+    if now.weekday() == 4 and now < show_start and not any(p in text for p in ("tonight", "today's show", "todays show", "today show")):
+        return previous_friday.isoformat()
+    return this_friday.isoformat() if now.weekday() == 4 else previous_friday.isoformat()
+
+
+def _next_friday_pacific(now_pacific: datetime = None) -> datetime:
+    now = now_pacific or datetime.now(PACIFIC_TZ)
+    days_ahead = (4 - now.weekday()) % 7
+    candidate = (now + timedelta(days=days_ahead)).replace(hour=18, minute=40, second=0, microsecond=0)
+    if days_ahead == 0 and now >= candidate:
+        candidate = (candidate + timedelta(days=7)).replace(hour=18, minute=40, second=0, microsecond=0)
+    return candidate
+
+
+def _fridays_in_month(year: int, month: int):
+    first_weekday, days_in_month = calendar.monthrange(year, month)
+    fridays = []
+    for day in range(1, days_in_month + 1):
+        if datetime(year, month, day).weekday() == 4:
+            fridays.append(day)
+    return fridays
+
+
+def _compute_override_window(note_text: str, now_pacific: datetime = None) -> dict:
+    now = now_pacific or datetime.now(PACIFIC_TZ)
+    text = (note_text or "").lower()
+    target = _next_friday_pacific(now)
+    span_count = 1
+    needs_clarification = 0
+    target_date = target.date()
+    target_list = [target_date]
+
+    nmatch = re.search(r"next\s+(\d+)\s+(?:episodes|shows|fridays)", text)
+    tmatch = re.search(r"next\s+(two|three)\s+(?:episodes|shows|fridays)", text)
+    if nmatch:
+        span_count = max(1, min(12, int(nmatch.group(1))))
+    elif tmatch:
+        span_count = 2 if tmatch.group(1) == "two" else 3
+    elif "this whole month" in text:
+        fridays = [d for d in _fridays_in_month(now.year, now.month) if d >= now.day]
+        if fridays:
+            target_list = [datetime(now.year, now.month, d).date() for d in fridays]
+            span_count = len(target_list)
+    else:
+        month_map = {m.lower(): i for i, m in enumerate(calendar.month_name) if m}
+        for mname, midx in month_map.items():
+            if f"all {mname} shows" in text:
+                year = now.year + (1 if midx < now.month else 0)
+                target_list = [datetime(year, midx, d).date() for d in _fridays_in_month(year, midx)]
+                span_count = max(1, len(target_list))
+                break
+
+    if "until further notice" in text:
+        needs_clarification = 1
+    if any(p in text for p in ("for a while", "for now", "continues until we decide", "shutting down the broadcast for now")) and span_count == 1:
+        needs_clarification = 1
+
+    if span_count > 1 and len(target_list) == 1:
+        target_list = [(target_date + timedelta(days=7 * i)) for i in range(span_count)]
+    if not target_list:
+        target_list = [target_date]
+        span_count = 1
+
+    last_target = target_list[-1]
+    valid_until_dt = PACIFIC_TZ.localize(datetime.combine(last_target, datetime.max.time().replace(microsecond=0)))
+    return {
+        "target_show_date": target_list[0].isoformat(),
+        "valid_until": valid_until_dt.isoformat(),
+        "override_span_count": span_count,
+        "needs_clarification": 1 if needs_clarification else 0,
+    }
 
 
 def _asks_about_sealed_test_recall(user_text: str) -> bool:
@@ -3418,6 +3542,148 @@ def save_model_message(user_id: int, guild_id: int, content: str, channel_name: 
     )
     if any(k in (content or "").lower() for k in ("try this", "steps", "option", "recommend")):
         add_relationship_journal(user_id, guild_id, "support_response", f"BNL provided guidance: {(content or '')[:160]}")
+
+
+def add_broadcast_memory_entry(guild_id: int, message: discord.Message, processed: dict):
+    now = datetime.now(PACIFIC_TZ).isoformat()
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        INSERT INTO broadcast_memory (
+            guild_id, episode_date, submitted_by_user_id, submitted_by_name, raw_note,
+            cleaned_summary, entry_type, importance, public_safe, affects_next_show,
+            usage_scope, target_show_date, valid_until, override_span_count, needs_clarification,
+            status, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)
+        """,
+        (
+            guild_id,
+            processed.get("episode_date") or _recent_friday_pacific_for_note(message.content),
+            message.author.id,
+            message.author.display_name,
+            _truncate_raw_note(message.content),
+            processed.get("cleaned_summary", ""),
+            processed.get("entry_type", "notable_moment"),
+            processed.get("importance", "medium"),
+            1 if processed.get("public_safe") else 0,
+            1 if processed.get("affects_next_show") else 0,
+            processed.get("usage_scope", "internal"),
+            processed.get("target_show_date"),
+            processed.get("valid_until"),
+            int(processed.get("override_span_count", 1) or 1),
+            1 if processed.get("needs_clarification") else 0,
+            now,
+            now,
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_recent_broadcast_memory(guild_id: int, public_only: bool = False, limit: int = 5):
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    if public_only:
+        cursor.execute("SELECT episode_date, cleaned_summary, entry_type, importance, public_safe, affects_next_show, usage_scope, target_show_date, valid_until, override_span_count, needs_clarification FROM broadcast_memory WHERE guild_id=? AND status='active' AND public_safe=1 ORDER BY id DESC LIMIT ?", (guild_id, limit))
+    else:
+        cursor.execute("SELECT episode_date, cleaned_summary, entry_type, importance, public_safe, affects_next_show, usage_scope, target_show_date, valid_until, override_span_count, needs_clarification FROM broadcast_memory WHERE guild_id=? AND status='active' ORDER BY id DESC LIMIT ?", (guild_id, limit))
+    rows = cursor.fetchall()
+    conn.close()
+    return rows
+
+
+def get_active_show_state_override(guild_id: int, show_date: str = None):
+    now_pt = datetime.now(PACIFIC_TZ)
+    now_iso = now_pt.isoformat()
+    target_show_date = (show_date or "").strip()
+    if not target_show_date:
+        target_show_date = _next_friday_pacific(now_pt).date().isoformat()
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        SELECT id, episode_date, cleaned_summary, public_safe, usage_scope, target_show_date, valid_until, override_span_count, needs_clarification
+        FROM broadcast_memory
+        WHERE guild_id=? AND status='active' AND affects_next_show=1 AND entry_type='show_state_override' AND importance='high'
+          AND (valid_until IS NULL OR valid_until='' OR valid_until >= ?)
+          AND (target_show_date IS NOT NULL AND target_show_date != '' AND target_show_date <= ?)
+          AND (
+                valid_until IS NULL OR valid_until='' OR substr(valid_until, 1, 10) >= ?
+              )
+        ORDER BY id DESC LIMIT 1
+        """,
+        (guild_id, now_iso, target_show_date, target_show_date),
+    )
+    row = cursor.fetchone()
+    conn.close()
+    return row
+
+
+def clear_active_show_state_overrides(guild_id: int):
+    now_iso = datetime.now(PACIFIC_TZ).isoformat()
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        UPDATE broadcast_memory
+        SET status='resolved', updated_at=?
+        WHERE guild_id=? AND status='active' AND entry_type='show_state_override'
+        """,
+        (now_iso, guild_id),
+    )
+    changed = cursor.rowcount
+    conn.commit()
+    conn.close()
+    return int(changed or 0)
+
+
+async def process_broadcast_memory_note(message) -> dict:
+    text = re.sub(r"\s+", " ", (message.content or "").strip())
+    lowered = text.lower()
+    if len(text) < 16 or len(text.split()) < 4 or lowered in {"lol", "lol yeah", "yeah", "ok", "okay"}:
+        return {"entry_type": "reject", "reason": "too vague"}
+    if any(k in lowered for k in ("doxx", "address is", "phone number", "private dm", "mod drama", "secret")):
+        return {"entry_type": "reject", "reason": "unsafe or private"}
+    if any(k in lowered for k in ("next episode is back on", "normal schedule resumed", "cancellation lifted", "maintenance cleared", "show is happening after all")):
+        return {"entry_type": "show_state_resume", "cleaned_summary": "Normal BARCODE Radio schedule restored.", "public_safe": True}
+    entry_type = "notable_moment"
+    if "running joke" in lowered:
+        entry_type = "running_joke"
+    elif any(k in lowered for k in ("queue", "audio", "latency", "crash", "bug", "technical")):
+        entry_type = "technical_issue"
+    elif any(k in lowered for k in ("mod", "timeout", "ban", "moderation")):
+        entry_type = "moderation_context"
+    elif any(k in lowered for k in ("episode arc", "storyline", "canon")):
+        entry_type = "episode_arc"
+    affects_next = any(k in lowered for k in ("next episode", "next week", "canceled", "cancelled", "paused", "maintenance"))
+    if affects_next and any(k in lowered for k in ("canceled", "cancelled", "paused", "maintenance")):
+        entry_type = "show_state_override"
+    public_safe = not any(k in lowered for k in ("private", "dm", "leak", "secret", "doxx", "attack"))
+    importance = "high" if entry_type == "show_state_override" else ("low" if entry_type == "running_joke" else "medium")
+    usage_scope = "internal"
+    if entry_type == "show_state_override":
+        usage_scope = "show_status,direct,ambient" + (",relay" if public_safe else "")
+        override = _compute_override_window(text, now_pacific=datetime.now(PACIFIC_TZ))
+        if override.get("needs_clarification"):
+            return {"entry_type": "reject", "reason": "I can log that, but I need the affected window: next episode only, next two episodes, this month, or until a specific date?"}
+    elif public_safe:
+        usage_scope = "ambient,direct"
+    summary = text[:220]
+    summary = re.sub(r"\b(fuck|shit|bitch)\b", "redacted", summary, flags=re.IGNORECASE)
+    summary = summary.rstrip(" .") + "."
+    result = {
+        "entry_type": entry_type,
+        "importance": importance,
+        "public_safe": public_safe,
+        "affects_next_show": affects_next or entry_type == "show_state_override",
+        "usage_scope": usage_scope,
+        "cleaned_summary": summary,
+        "episode_date": _recent_friday_pacific_for_note(text),
+    }
+    if entry_type == "show_state_override":
+        result.update(override)
+    return result
 
 def get_conversation_history(user_id: int, guild_id: int, limit: int = 50):
     """
@@ -4663,6 +4929,11 @@ async def barcode_radio_queue_task():
         phase_key = phase["key"]
         for guild in iter_managed_guilds():
             if already_fired_show_update(guild.id, show_date, phase_key):
+                continue
+            active_override = get_active_show_state_override(guild.id, show_date=show_date)
+            if active_override:
+                logging.warning(f"showday_update_blocked_by_override guild={guild.id} phase={phase_key} override_id={active_override[0]}")
+                mark_show_update_fired(guild.id, show_date, phase_key, "", f"Blocked by show_state_override: {active_override[2]}")
                 continue
             channel_id = get_guild_config(guild.id)
             channel = guild.get_channel(channel_id) if channel_id else None
@@ -6673,6 +6944,30 @@ async def on_message(message: discord.Message):
     logging.info(f"response_route_real_direct_target active={int(real_direct_target)}")
     logging.info(f"response_route_plain_text_name_seen seen={int(plain_text_name_seen)}")
 
+    if channel_policy == "broadcast_memory":
+        member = message.author if isinstance(message.author, discord.Member) else message.guild.get_member(message.author.id)
+        allowed = is_owner_operator(message.author) or has_mod_role(member) or is_privileged_member(member, message.guild)
+        if not allowed:
+            if clean_content:
+                await message.reply("broadcast memory intake is mod-only.")
+            return
+        if not clean_content:
+            return
+        processed = await process_broadcast_memory_note(message)
+        if processed.get("entry_type") == "show_state_resume":
+            cleared = clear_active_show_state_overrides(message.guild.id)
+            await message.reply(f"Logged. Normal schedule restored; resolved overrides: {cleared}.")
+            return
+        if processed.get("entry_type") == "reject":
+            await message.reply(f"Not stored: {processed.get('reason', 'insufficient signal')}")
+            return
+        add_broadcast_memory_entry(message.guild.id, message, processed)
+        safe_txt = "yes" if processed.get("public_safe") else "no"
+        await message.reply(
+            f"Logged for episode {processed.get('episode_date')}: {processed.get('entry_type')} | Public-safe: {safe_txt} | Usage: {processed.get('usage_scope')}"
+        )
+        return
+
     session_key = _direct_session_key(message)
     active_direct_session = _direct_payload_sessions.get(session_key)
     if active_direct_session and not getattr(message.author, "bot", False):
@@ -6754,7 +7049,7 @@ async def on_message(message: discord.Message):
 
     # ---------------- PASSIVE REACTION SYSTEM ----------------
     # BNL occasionally reacts to messages across the server
-    if random.random() < REACTION_CHANCE:
+    if channel_policy != "broadcast_memory" and random.random() < REACTION_CHANCE:
         try:
             emoji = choose_contextual_reaction(message)
             await message.add_reaction(emoji)
@@ -7494,6 +7789,9 @@ async def bnl_memory_check(interaction: discord.Interaction):
     memory_source_fields_available = memory_tiers_has_source_fields()
     memory_tier_source_policy_state = "source-gated" if memory_source_fields_available else "source fields unavailable"
     sealed_test_rows_present = policy_counts.get("sealed_test", 0) > 0
+    broadcast_entries = get_recent_broadcast_memory(guild.id, public_only=False, limit=1)
+    broadcast_count = len(get_recent_broadcast_memory(guild.id, public_only=False, limit=500))
+    active_override = get_active_show_state_override(guild.id)
 
     lines = [
         "**BNL Memory Diagnostic (safe)**",
@@ -7534,6 +7832,15 @@ async def bnl_memory_check(interaction: discord.Interaction):
         "- sealed_test_free_speak: `enabled`",
         "- raw_message_dump: `disabled`",
         "- memory_mutation: `none (read-only diagnostic)`",
+        f"- broadcast_memory_channel_configured: `{'yes' if BNL_BROADCAST_MEMORY_CHANNEL_ID else 'no'}`",
+        f"- broadcast_memory_entries_active: `{broadcast_count}`",
+        f"- broadcast_memory_latest_episode_date: `{broadcast_entries[0][0] if broadcast_entries else 'none'}`",
+        f"- active_show_state_override: `{'yes' if active_override else 'no'}`",
+        f"- active_show_state_target_show_date: `{active_override[5] if active_override else 'none'}`",
+        f"- active_show_state_valid_until: `{active_override[6] if active_override else 'none'}`",
+        f"- active_show_state_span_count: `{active_override[7] if active_override else 0}`",
+        f"- active_show_state_needs_clarification: `{active_override[8] if active_override else 0}`",
+        f"- active_show_state_summary: `{(active_override[2][:120] + '...') if active_override and active_override[3] else 'hidden_or_none'}`",
     ]
     await interaction.response.send_message("\n".join(lines), ephemeral=True)
 
@@ -7566,6 +7873,10 @@ async def bnl_status(interaction: discord.Interaction):
     context_visibility = context_visibility_for_policy(policy)
     flags_source_state = "available" if _bnl_control_flags_last_source_url else "not yet fetched"
     website_bridge_configured = bool(BNL_STATUS_URL and BNL_API_KEY)
+    broadcast_channel = guild.get_channel(BNL_BROADCAST_MEMORY_CHANNEL_ID) if BNL_BROADCAST_MEMORY_CHANNEL_ID else None
+    broadcast_entries = get_recent_broadcast_memory(guild.id, public_only=False, limit=1)
+    broadcast_count = len(get_recent_broadcast_memory(guild.id, public_only=False, limit=500))
+    active_override = get_active_show_state_override(guild.id)
 
     lines = [
         "**BNL Runtime Status (safe)**",
@@ -7586,6 +7897,15 @@ async def bnl_status(interaction: discord.Interaction):
         f"- website_relay_enabled: `{BNL_WEBSITE_RELAY_ENABLED}` (interval `{BNL_WEBSITE_RELAY_INTERVAL_MINUTES}m`)",
         f"- website_bridge_configured: `{'yes' if website_bridge_configured else 'no'}`",
         f"- control_flags_source: `{flags_source_state}`",
+        f"- broadcast_memory_channel: `{broadcast_channel.mention if broadcast_channel else 'unset/not found'}`",
+        f"- broadcast_memory_entries_active: `{broadcast_count}`",
+        f"- broadcast_memory_latest_episode_date: `{broadcast_entries[0][0] if broadcast_entries else 'none'}`",
+        f"- active_show_state_override: `{'yes' if active_override else 'no'}`",
+        f"- active_show_state_target_show_date: `{active_override[5] if active_override else 'none'}`",
+        f"- active_show_state_valid_until: `{active_override[6] if active_override else 'none'}`",
+        f"- active_show_state_span_count: `{active_override[7] if active_override else 0}`",
+        f"- active_show_state_needs_clarification: `{active_override[8] if active_override else 0}`",
+        f"- active_show_state_summary: `{(active_override[2][:120] + '...') if active_override and (is_owner or active_override[3]) else 'hidden_or_none'}`",
     ]
     force_pull_diag = _get_force_pull_state(guild.id)
     lines.extend([
