@@ -3777,10 +3777,30 @@ def get_show_state_override_direct_response(guild_id: int, user_text: str) -> st
         "the previous broadcast pushed beyond normal control-room boundaries.",
         "the last transmission stopped behaving like a manageable Network asset.",
     ]
+    safe_reason_options = [
+        "the stored broadcast-memory note marks this slot as unavailable.",
+        "the current broadcast-memory note marks this episode as paused.",
+    ]
     seed_text = f"{target_show}|{summary}|{user_text or ''}"
     seed = sum(ord(ch) for ch in seed_text) % 997 if seed_text else 0
     status_tail = status_tail_options[seed % len(status_tail_options)]
-    reason_tail = reason_tail_options[(seed // 3) % len(reason_tail_options)]
+    summary_lower = summary.lower()
+    rogue_reason_markers = (
+        "rogue",
+        "outside network control",
+        "outside normal control",
+        "6 bit",
+        "cliff",
+        "mods",
+        "viewers",
+        "control",
+        "containment",
+    )
+    reason_is_rogue_arc = any(marker in summary_lower for marker in rogue_reason_markers)
+    if reason_is_rogue_arc:
+        reason_tail = reason_tail_options[(seed // 3) % len(reason_tail_options)]
+    else:
+        reason_tail = safe_reason_options[(seed // 5) % len(safe_reason_options)]
 
     show_label = f"The {target_show} BARCODE Radio episode" if target_show else "The next BARCODE Radio episode"
     status_line = f"Negative. {show_label} is not proceeding as a normal broadcast. {status_tail}"
