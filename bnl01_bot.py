@@ -1549,6 +1549,7 @@ async def generate_dynamic_website_relay(guild_id: int) -> tuple[str, str, str, 
             f"Recent relay topics to avoid repeating unless context demands it: {recent_topics}.\n"
             f"Recent public lines to avoid mirroring: {' || '.join(recent_lines) or 'none'}.\n"
             f"Public-safe relay-eligible broadcast memory:\n{relay_broadcast_context or '- (none)'}\n"
+            f"{BROADCAST_MEMORY_LANGUAGE_LIFT_GUIDANCE}\n"
             f"Mode: {mode}.\n"
             f"Context summary: {signal_summary or 'limited Discord-side traffic'}.\n"
             f"Discord observations: {relay_context or 'No specific recent Discord observations available.'}\n"
@@ -3734,6 +3735,20 @@ def build_scoped_broadcast_memory_context(guild_id: int, scope: str, public_only
             break
     return "\n".join(selected)
 
+BROADCAST_MEMORY_LANGUAGE_LIFT_GUIDANCE = (
+    "Broadcast-memory usage guidance:\n"
+    "- Treat cleaned broadcast-memory summaries as factual source context.\n"
+    "- Do not quote raw mod notes wholesale.\n"
+    "- Never expose raw_note.\n"
+    "- Do not mechanically repeat cleaned_summary verbatim unless it already reads naturally.\n"
+    "- Translate memory facts into natural BNL/BARCODE language while preserving factual meaning.\n"
+    "- You may use stronger in-universe operational phrasing when appropriate "
+    "(for example: internal review, containment review, asset control, broadcast control, Network review, control room intervention).\n"
+    "- Do not invent new events, names, accusations, artist details, payments, moderation actions, or private facts.\n"
+    "- Do not canonize artist names, usernames, song titles, or random public phrases.\n"
+    "- Official broadcast memory remains source truth; creative wording is surface language only."
+)
+
 def get_show_state_override_direct_response(guild_id: int, user_text: str) -> str:
     if not _is_show_state_status_query(user_text):
         return ""
@@ -3752,22 +3767,25 @@ def get_show_state_override_direct_response(guild_id: int, user_text: str) -> st
         "is there a show", "is the show", "next week", "this friday", "happening", "schedule", "status"
     ))
 
-    if target_show:
-        status_line = (
-            f"Negative. The {target_show} BARCODE Radio episode is not proceeding as a normal broadcast. "
-            "BARCODE Network has pulled that slot into system maintenance."
-        )
-    else:
-        status_line = (
-            "Negative. The next BARCODE Radio episode is not proceeding as a normal broadcast. "
-            "BARCODE Network has pulled that slot into system maintenance."
-        )
+    status_tail_options = [
+        "Network control has pulled that slot into internal review.",
+        "That slot is being held for Network review.",
+        "Broadcast control has locked that slot for containment review.",
+    ]
+    reason_tail_options = [
+        "the last episode slipped outside controllable Network limits.",
+        "the previous broadcast pushed beyond normal control-room boundaries.",
+        "the last transmission stopped behaving like a manageable Network asset.",
+    ]
+    seed_text = f"{target_show}|{summary}|{user_text or ''}"
+    seed = sum(ord(ch) for ch in seed_text) % 997 if seed_text else 0
+    status_tail = status_tail_options[seed % len(status_tail_options)]
+    reason_tail = reason_tail_options[(seed // 3) % len(reason_tail_options)]
 
-    reason_line = (
-        "Because the last broadcast stopped behaving like a controllable Network transmission, "
-        "so the next slot is being used for system maintenance."
-    )
-    queue_line = "Normal queue opening does not apply while the episode is canceled for maintenance."
+    show_label = f"The {target_show} BARCODE Radio episode" if target_show else "The next BARCODE Radio episode"
+    status_line = f"Negative. {show_label} is not proceeding as a normal broadcast. {status_tail}"
+    reason_line = f"Reason: {reason_tail}"
+    queue_line = "Queue intake is paused while the next slot remains under Network review."
 
     if asks_queue and asks_why:
         return f"{queue_line} {reason_line}"
@@ -5049,6 +5067,7 @@ async def generate_dynamic_ambient(guild_id: int, channel_id: int) -> str:
         f"- Curiosity mode for this cycle: {curiosity_mode}.\n"
         f"- Ambient mode for this cycle: {ambient_mode} ({mode_guidance.get(ambient_mode, 'keep variety in rhetorical shape')}).\n"
         f"- Public-safe ambient-eligible broadcast memory:\n{ambient_broadcast_context or '- (none)'}\n"
+        f"- {BROADCAST_MEMORY_LANGUAGE_LIFT_GUIDANCE}\n"
         "- Curiosity engine should vary behavior by mode:\n"
         "  - short_to_long_bridge: connect fresh short traces to one long memory signal.\n"
         "  - medium_rumination: dwell on a medium memory pattern and infer what it means now.\n"
@@ -6828,7 +6847,10 @@ def build_user_aware_prompt(
     broadcast_context = build_broadcast_memory_context(guild_id, clean_content, channel_policy, is_owner_or_mod=privileged)
     broadcast_prompt_block = ""
     if broadcast_context:
-        broadcast_prompt_block = f"Broadcast memory context:\n{broadcast_context}\n"
+        broadcast_prompt_block = (
+            f"Broadcast memory context:\n{broadcast_context}\n"
+            f"{BROADCAST_MEMORY_LANGUAGE_LIFT_GUIDANCE}\n"
+        )
 
     prompt = (
         f"{greeting_rule}\n"
