@@ -7334,13 +7334,20 @@ async def on_message(message: discord.Message):
         lower_clean = clean_content.lower()
         is_owner = bool(is_owner_operator(message.author))
         is_mod = bool(has_mod_role(member) or is_privileged_member(member, message.guild))
+        explicit_target_id = _parse_broadcast_memory_target_id(clean_content)
         resolve_last_intent = bool(re.search(r"\bbnl\b.*\b(resolve|mark)\b.*\blast memory\b", lower_clean)) or ("last memory was wrong" in lower_clean and "resolve" in lower_clean)
         replace_last_match = re.search(r"\bbnl\b.*\b(correct|replace)\b.*\blast memory\b(?:\s*with)?\s*:\s*(.+)$", clean_content, flags=re.IGNORECASE)
         official_match = re.search(r"\bbnl\b.*\bofficial correction\s*:\s*(.+)$", clean_content, flags=re.IGNORECASE)
         resolve_by_topic = re.search(r"\bbnl\b.*\bresolve\b.*\b(memory)\b", lower_clean) and bool(_extract_exact_episode_date(clean_content))
         replace_by_topic = re.search(r"\bbnl\b.*\b(correct|replace)\b.*\b(memory)\b", lower_clean) and bool(_extract_exact_episode_date(clean_content))
-        if resolve_last_intent or replace_last_match or official_match or resolve_by_topic or replace_by_topic:
-            explicit_target_id = _parse_broadcast_memory_target_id(clean_content)
+        resolve_by_id = bool(
+            explicit_target_id
+            and re.search(r"\bbnl\b.*\b(resolve|mark)\b.*\bmemory\b", lower_clean)
+            and ("wrong" in lower_clean or "resolve" in lower_clean or "mark" in lower_clean)
+        )
+        replace_by_id_match = re.search(r"\bbnl\b.*\b(correct|replace)\b.*\bmemory\b.*\bid\b\s*#?\s*\d+\b(?:\s*with)?\s*:\s*(.+)$", clean_content, flags=re.IGNORECASE)
+        replace_by_id = bool(explicit_target_id and replace_by_id_match)
+        if resolve_last_intent or replace_last_match or official_match or resolve_by_topic or replace_by_topic or resolve_by_id or replace_by_id:
             latest = _find_latest_active_broadcast_memory(message.guild.id)
             if not latest:
                 await message.reply("Correction not applied. I could not find a matching active broadcast-memory entry.")
@@ -7373,7 +7380,7 @@ async def on_message(message: discord.Message):
             if (not is_owner) and int(target_user_id or 0) != int(message.author.id):
                 await message.reply("Correction not applied. That entry requires owner authority.")
                 return
-            if resolve_last_intent or resolve_by_topic:
+            if resolve_last_intent or resolve_by_topic or resolve_by_id:
                 changed = _set_broadcast_memory_status(target_id, "resolved", message.author.id, message.author.display_name, "explicit resolve request")
                 if not changed:
                     await message.reply("Correction not applied. I could not find a matching active broadcast-memory entry.")
@@ -7383,6 +7390,8 @@ async def on_message(message: discord.Message):
             correction_text = ""
             if replace_last_match:
                 correction_text = replace_last_match.group(2).strip()
+            elif replace_by_id_match:
+                correction_text = replace_by_id_match.group(2).strip()
             elif official_match:
                 correction_text = official_match.group(1).strip()
             else:
@@ -7410,7 +7419,7 @@ async def on_message(message: discord.Message):
                 }
             processed["episode_date"] = _extract_exact_episode_date(correction_text) or target_date
             processed["entry_type"] = processed.get("entry_type") or target_type
-            new_id = add_broadcast_memory_entry(message.guild.id, message, processed)
+            new_id = add_broadcast_memory_entry(message.guild.id, faux_message, processed)
             conn = sqlite3.connect(DB_FILE)
             cursor = conn.cursor()
             cursor.execute("UPDATE broadcast_memory SET supersedes_id=?, corrected_by_user_id=?, corrected_by_name=?, correction_reason=? WHERE id=?", (target_id, message.author.id, message.author.display_name, "replacement", new_id))
