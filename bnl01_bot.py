@@ -3664,6 +3664,31 @@ def _is_broadcast_memory_relevant(text: str) -> bool:
         "maintenance", "running joke", "status", "happening"
     ))
 
+def _is_show_state_status_query(text: str) -> bool:
+    t = (text or "").lower().strip()
+    if not t:
+        return False
+    status_patterns = [
+        r"\bis there (a )?show\b",
+        r"\bis .*show (happening|on|off)\b",
+        r"\bis .*barcode radio (happening|live|on)\b",
+        r"\b(is|are) .*next episode.*(cancel|cancelled|canceled|paused)\b",
+        r"\bwhy .*next episode.*(cancel|cancelled|canceled|paused)\b",
+        r"\bwhat time .*show\b",
+        r"\bwhen does .*queue open\b",
+        r"\bare submissions open\b",
+        r"\bis .*maintenance\b",
+        r"\bshow schedule\b",
+        r"\bshow status\b",
+        r"\b(is|are) .*this friday\b",
+    ]
+    if any(re.search(p, t) for p in status_patterns):
+        return True
+    keyword_gate = any(k in t for k in ("show", "episode", "friday", "barcode radio", "queue", "submissions"))
+    if keyword_gate and any(k in t for k in ("cancel", "cancelled", "canceled", "paused", "maintenance", "happening", "live", "status", "schedule", "open")):
+        return True
+    return False
+
 def build_broadcast_memory_context(guild_id: int, user_text: str, channel_policy: str, is_owner_or_mod: bool = False) -> str:
     if not _is_broadcast_memory_relevant(user_text):
         return ""
@@ -3703,7 +3728,7 @@ def build_scoped_broadcast_memory_context(guild_id: int, scope: str, public_only
     return "\n".join(selected)
 
 def get_show_state_override_direct_response(guild_id: int, user_text: str) -> str:
-    if not _is_broadcast_memory_relevant(user_text):
+    if not _is_show_state_status_query(user_text):
         return ""
     override = get_active_show_state_override(guild_id)
     if not override:
