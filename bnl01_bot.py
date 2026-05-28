@@ -1923,6 +1923,17 @@ def init_db():
         """
     )
 
+    _try_alter(cursor, "ALTER TABLE memory_tiers ADD COLUMN source_role TEXT DEFAULT 'legacy_unknown'")
+    _try_alter(cursor, "ALTER TABLE memory_tiers ADD COLUMN source_channel_policy TEXT DEFAULT 'legacy_unknown'")
+    _try_alter(cursor, "ALTER TABLE memory_tiers ADD COLUMN source_channel_name TEXT DEFAULT ''")
+    _try_alter(cursor, "ALTER TABLE memory_tiers ADD COLUMN source_origin TEXT DEFAULT 'legacy_unknown'")
+    _try_alter(cursor, "ALTER TABLE memory_tiers ADD COLUMN source_trust TEXT DEFAULT 'legacy_unknown'")
+    cursor.execute("UPDATE memory_tiers SET source_role='legacy_unknown' WHERE source_role IS NULL OR TRIM(source_role) = ''")
+    cursor.execute("UPDATE memory_tiers SET source_channel_policy='legacy_unknown' WHERE source_channel_policy IS NULL OR TRIM(source_channel_policy) = ''")
+    cursor.execute("UPDATE memory_tiers SET source_channel_name='' WHERE source_channel_name IS NULL")
+    cursor.execute("UPDATE memory_tiers SET source_origin='legacy_unknown' WHERE source_origin IS NULL OR TRIM(source_origin) = ''")
+    cursor.execute("UPDATE memory_tiers SET source_trust='legacy_unknown' WHERE source_trust IS NULL OR TRIM(source_trust) = ''")
+
     cursor.execute(
         """
         CREATE TABLE IF NOT EXISTS ambient_log (
@@ -2243,17 +2254,25 @@ def _compress_memory_fragments(fragments: list, tier: str) -> str:
     head = " | ".join(cleaned[:4])
     return f"Long-range memory trace: {head[:320]}"
 
-def _add_memory_tier_entry(user_id: int, guild_id: int, tier: str, summary: str, salience: float):
+def _add_memory_tier_entry(user_id: int, guild_id: int, tier: str, summary: str, salience: float, source_role: str = "legacy_unknown", source_channel_policy: str = "legacy_unknown", source_channel_name: str = "", source_origin: str = "legacy_unknown", source_trust: str = "legacy_unknown"):
     if not summary:
         return
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
     cursor.execute(
         """
-        INSERT INTO memory_tiers (user_id, guild_id, tier, summary, salience, mentions, updated_at)
-        VALUES (?, ?, ?, ?, ?, 1, ?)
+        INSERT INTO memory_tiers (
+            user_id, guild_id, tier, summary, salience, mentions, updated_at,
+            source_role, source_channel_policy, source_channel_name, source_origin, source_trust
+        )
+        VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?)
         """,
-        (user_id, guild_id, tier, summary[:340], salience, datetime.now(PACIFIC_TZ).isoformat()),
+        (user_id, guild_id, tier, summary[:340], salience, datetime.now(PACIFIC_TZ).isoformat(),
+         (source_role or "legacy_unknown")[:40],
+         (source_channel_policy or "legacy_unknown")[:40],
+         (source_channel_name or "").lower()[:80],
+         (source_origin or "legacy_unknown")[:64],
+         (source_trust or "legacy_unknown")[:64]),
     )
     conn.commit()
     conn.close()
@@ -2264,7 +2283,7 @@ def _consolidate_memory_tiers(user_id: int, guild_id: int):
 
     cursor.execute(
         """
-        SELECT id, summary, salience
+        SELECT id, summary, salience, source_trust
         FROM memory_tiers
         WHERE user_id = ? AND guild_id = ? AND tier = 'short'
         ORDER BY id DESC
@@ -2274,23 +2293,45 @@ def _consolidate_memory_tiers(user_id: int, guild_id: int):
     short_rows = cursor.fetchall()
     if len(short_rows) > SHORT_MEMORY_LIMIT:
         overflow = short_rows[SHORT_MEMORY_LIMIT:]
-        fragments = [r[1] for r in overflow[:6]]
-        sal = sum((r[2] or 0.5) for r in overflow[:6]) / max(1, min(6, len(overflow)))
+        considered = overflow[:6]
+        fragments = [r[1] for r in considered]
+        sal = sum((r[2] or 0.5) for r in considered) / max(1, min(6, len(overflow)))
+        trust_values = {(r[3] or "legacy_unknown").strip() for r in considered}
+        consolidated_trust = (
+            "source_safe_public_consolidated"
+            if trust_values and trust_values.issubset({"source_safe_public", "source_safe_public_consolidated"})
+            else "mixed_or_legacy_consolidated"
+        )
         summary = _compress_memory_fragments(fragments, "medium")
         if summary:
             cursor.execute(
                 """
-                INSERT INTO memory_tiers (user_id, guild_id, tier, summary, salience, mentions, updated_at)
-                VALUES (?, ?, 'medium', ?, ?, ?, ?)
+                INSERT INTO memory_tiers (
+                    user_id, guild_id, tier, summary, salience, mentions, updated_at,
+                    source_role, source_channel_policy, source_channel_name, source_origin, source_trust
+                )
+                VALUES (?, ?, 'medium', ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (user_id, guild_id, summary, min(1.0, sal + 0.05), len(fragments), datetime.now(PACIFIC_TZ).isoformat()),
+                (
+                    user_id,
+                    guild_id,
+                    summary,
+                    min(1.0, sal + 0.05),
+                    len(fragments),
+                    datetime.now(PACIFIC_TZ).isoformat(),
+                    "consolidation",
+                    "consolidated",
+                    "",
+                    "consolidated_short_to_medium",
+                    consolidated_trust,
+                ),
             )
         ids = [r[0] for r in overflow]
         cursor.executemany("DELETE FROM memory_tiers WHERE id = ?", [(i,) for i in ids])
 
     cursor.execute(
         """
-        SELECT id, summary, salience
+        SELECT id, summary, salience, source_trust
         FROM memory_tiers
         WHERE user_id = ? AND guild_id = ? AND tier = 'medium'
         ORDER BY id DESC
@@ -2300,16 +2341,38 @@ def _consolidate_memory_tiers(user_id: int, guild_id: int):
     med_rows = cursor.fetchall()
     if len(med_rows) > MEDIUM_MEMORY_LIMIT:
         overflow = med_rows[MEDIUM_MEMORY_LIMIT:]
-        fragments = [r[1] for r in overflow[:5]]
-        sal = sum((r[2] or 0.5) for r in overflow[:5]) / max(1, min(5, len(overflow)))
+        considered = overflow[:5]
+        fragments = [r[1] for r in considered]
+        sal = sum((r[2] or 0.5) for r in considered) / max(1, min(5, len(overflow)))
+        trust_values = {(r[3] or "legacy_unknown").strip() for r in considered}
+        consolidated_trust = (
+            "source_safe_public_consolidated"
+            if trust_values and trust_values.issubset({"source_safe_public", "source_safe_public_consolidated"})
+            else "mixed_or_legacy_consolidated"
+        )
         summary = _compress_memory_fragments(fragments, "long")
         if summary:
             cursor.execute(
                 """
-                INSERT INTO memory_tiers (user_id, guild_id, tier, summary, salience, mentions, updated_at)
-                VALUES (?, ?, 'long', ?, ?, ?, ?)
+                INSERT INTO memory_tiers (
+                    user_id, guild_id, tier, summary, salience, mentions, updated_at,
+                    source_role, source_channel_policy, source_channel_name, source_origin, source_trust
+                )
+                VALUES (?, ?, 'long', ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (user_id, guild_id, summary, min(1.0, sal + 0.04), len(fragments), datetime.now(PACIFIC_TZ).isoformat()),
+                (
+                    user_id,
+                    guild_id,
+                    summary,
+                    min(1.0, sal + 0.04),
+                    len(fragments),
+                    datetime.now(PACIFIC_TZ).isoformat(),
+                    "consolidation",
+                    "consolidated",
+                    "",
+                    "consolidated_medium_to_long",
+                    consolidated_trust,
+                ),
             )
         ids = [r[0] for r in overflow]
         cursor.executemany("DELETE FROM memory_tiers WHERE id = ?", [(i,) for i in ids])
@@ -2330,12 +2393,12 @@ def _consolidate_memory_tiers(user_id: int, guild_id: int):
     conn.commit()
     conn.close()
 
-def add_short_memory_trace(user_id: int, guild_id: int, content: str):
+def add_short_memory_trace(user_id: int, guild_id: int, content: str, source_role: str = "legacy_unknown", source_channel_policy: str = "legacy_unknown", source_channel_name: str = "", source_origin: str = "conversation", source_trust: str = "legacy_unknown"):
     text = (content or "").strip()
     if not text:
         return
     summary = text[:220]
-    _add_memory_tier_entry(user_id, guild_id, "short", summary, _memory_salience_score(text))
+    _add_memory_tier_entry(user_id, guild_id, "short", summary, _memory_salience_score(text), source_role=source_role, source_channel_policy=source_channel_policy, source_channel_name=source_channel_name, source_origin=source_origin, source_trust=source_trust)
     _consolidate_memory_tiers(user_id, guild_id)
 
 
@@ -2409,14 +2472,15 @@ def maybe_add_memory_trace(
         return
     if not is_meaningful_memory_candidate(content, normalized_role):
         return
-    add_short_memory_trace(user_id, guild_id, content)
+    source_trust = "source_safe_public" if (policy in {"public_home", "public_context"} and normalized_role == "user") else "legacy_unknown"
+    add_short_memory_trace(user_id, guild_id, content, source_role=normalized_role or "legacy_unknown", source_channel_policy=policy or "legacy_unknown", source_channel_name=channel_name or "", source_origin="conversation", source_trust=source_trust)
 
 def get_memory_tiers(user_id: int, guild_id: int):
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
     cursor.execute(
         """
-        SELECT tier, summary, salience, mentions, updated_at
+        SELECT tier, summary, salience, mentions, updated_at, source_role, source_channel_policy, source_channel_name, source_origin, source_trust
         FROM memory_tiers
         WHERE user_id = ? AND guild_id = ?
         ORDER BY
@@ -2447,6 +2511,43 @@ def get_memory_tier_counts(user_id: int, guild_id: int):
     for tier, c in rows:
         counts[tier] = c
     return counts
+
+def get_memory_source_summary(user_id: int, guild_id: int):
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        SELECT COALESCE(source_trust, 'legacy_unknown') AS source_trust, COUNT(*)
+        FROM memory_tiers
+        WHERE user_id = ? AND guild_id = ?
+        GROUP BY COALESCE(source_trust, 'legacy_unknown')
+        """,
+        (user_id, guild_id),
+    )
+    trust_rows = cursor.fetchall()
+    cursor.execute(
+        """
+        SELECT COALESCE(source_channel_policy, 'legacy_unknown') AS source_channel_policy, COUNT(*)
+        FROM memory_tiers
+        WHERE user_id = ? AND guild_id = ?
+        GROUP BY COALESCE(source_channel_policy, 'legacy_unknown')
+        """,
+        (user_id, guild_id),
+    )
+    policy_rows = cursor.fetchall()
+    conn.close()
+    trust_counts = {k: int(v) for (k, v) in trust_rows}
+    policy_counts = {k: int(v) for (k, v) in policy_rows}
+    legacy_unknown_count = trust_counts.get("legacy_unknown", 0)
+    source_safe_count = trust_counts.get("source_safe_public", 0) + trust_counts.get("source_safe_public_consolidated", 0)
+    consolidated_count = trust_counts.get("source_safe_public_consolidated", 0) + trust_counts.get("mixed_or_legacy_consolidated", 0)
+    return {
+        "trust_counts": trust_counts,
+        "policy_counts": policy_counts,
+        "legacy_unknown_count": legacy_unknown_count,
+        "source_safe_count": source_safe_count,
+        "consolidated_count": consolidated_count,
+    }
 
 def build_upgrade_status_response(user_id: int, guild_id: int) -> str:
     facts = get_user_facts(user_id, guild_id, limit=20)
@@ -2911,7 +3012,7 @@ def get_unknown_policy_model_row_count(guild_id: int) -> int:
 
 
 def memory_tiers_has_source_fields() -> bool:
-    required_fields = {"channel_name", "channel_policy", "role", "source_visibility", "source_conversation_id"}
+    required_fields = {"source_role", "source_channel_policy", "source_channel_name", "source_origin", "source_trust"}
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
     cursor.execute("PRAGMA table_info(memory_tiers)")
@@ -3330,9 +3431,12 @@ def get_guild_curiosity_snapshot(guild_id: int, limit_users: int = 3):
     for user_id, total_messages, last_topic in users:
         facts = get_user_facts(user_id, guild_id, limit=4)
         tiers = get_memory_tiers(user_id, guild_id)
-        short = next((r[1] for r in tiers if r[0] == "short"), "")
-        medium = next((r[1] for r in tiers if r[0] == "medium"), "")
-        long_t = next((r[1] for r in tiers if r[0] == "long"), "")
+        trusted = [r for r in tiers if len(r) >= 10 and r[9] in ("source_safe_public", "source_safe_public_consolidated")]
+        fallback = [r for r in tiers if len(r) >= 10 and r[9] != "legacy_unknown"]
+        pool = trusted if trusted else fallback
+        short = next((r[1] for r in pool if r[0] == "short"), "")
+        medium = next((r[1] for r in pool if r[0] == "medium"), "")
+        long_t = next((r[1] for r in pool if r[0] == "long"), "")
         core_fact = next((f"{k}:{v}" for (k, v, _c, core, _u) in facts if core), "")
         snapshot.append({
             "user_id": user_id,
@@ -3725,9 +3829,12 @@ def build_user_memory_context(user_id: int, guild_id: int) -> str:
         sections.append("Recent relationship journal:\n" + "\n".join(journal_lines))
 
     if tier_rows:
-        short = [r for r in tier_rows if r[0] == "short"][:4]
-        medium = [r for r in tier_rows if r[0] == "medium"][:3]
-        long_t = [r for r in tier_rows if r[0] == "long"][:2]
+        trusted_rows = [r for r in tier_rows if len(r) >= 10 and r[9] in ("source_safe_public", "source_safe_public_consolidated")]
+        cautious_rows = [r for r in tier_rows if len(r) >= 10 and r[9] not in ("source_safe_public", "source_safe_public_consolidated")]
+        active_rows = trusted_rows if trusted_rows else cautious_rows
+        short = [r for r in active_rows if r[0] == "short"][:4]
+        medium = [r for r in active_rows if r[0] == "medium"][:3]
+        long_t = [r for r in active_rows if r[0] == "long"][:2]
         tier_lines = []
         if short:
             tier_lines.append("Short-term traces:\n" + "\n".join([f"- {r[1]}" for r in short]))
@@ -3735,6 +3842,8 @@ def build_user_memory_context(user_id: int, guild_id: int) -> str:
             tier_lines.append("Medium summaries:\n" + "\n".join([f"- {r[1]}" for r in medium]))
         if long_t:
             tier_lines.append("Long traces:\n" + "\n".join([f"- {r[1]}" for r in long_t]))
+        if cautious_rows and trusted_rows:
+            tier_lines.append("Legacy/mixed memory present: yes (down-ranked for reply authority).")
         sections.append("\n".join(tier_lines))
 
     return "\n".join(sections) if sections else "No durable memory yet."
@@ -7309,6 +7418,7 @@ async def bnl_memory_check(interaction: discord.Interaction):
     role_counts = get_guild_role_counts(guild.id)
     unknown_policy_model_rows = get_unknown_policy_model_row_count(guild.id)
     tier_counts = get_memory_tier_counts(interaction.user.id, guild.id)
+    source_summary = get_memory_source_summary(interaction.user.id, guild.id)
     memory_source_fields_available = memory_tiers_has_source_fields()
     memory_tier_source_policy_state = "source-gated" if memory_source_fields_available else "source fields unavailable"
     sealed_test_rows_present = policy_counts.get("sealed_test", 0) > 0
@@ -7338,6 +7448,13 @@ async def bnl_memory_check(interaction: discord.Interaction):
         f"- memory_tier_count_medium: `{tier_counts.get('medium', 0)}`",
         f"- memory_tier_count_long: `{tier_counts.get('long', 0)}`",
         f"- memory_tiers_source_fields_available: `{'yes' if memory_source_fields_available else 'no'}`",
+        f"- memory_source_trust_counts: `{source_summary.get('trust_counts', {})}`",
+        f"- memory_source_policy_counts: `{source_summary.get('policy_counts', {})}`",
+        f"- memory_legacy_unknown_count: `{source_summary.get('legacy_unknown_count', 0)}`",
+        f"- memory_source_safe_count: `{source_summary.get('source_safe_count', 0)}`",
+        f"- memory_consolidated_count: `{source_summary.get('consolidated_count', 0)}`",
+        "- ambient_legacy_memory_policy: `legacy down-ranked; source-safe preferred`",
+        "- direct_legacy_memory_policy: `allowed cautiously; never overrides cleaner context`",
         "- memory_tier_future_writes_source_gated: `yes`",
         f"- memory_tiers_source_policy: `{memory_tier_source_policy_state}`",
         "- sealed_test_passive_capture: `disabled`",
