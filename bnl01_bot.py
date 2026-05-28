@@ -2798,8 +2798,10 @@ def _recent_friday_pacific_for_note(note_text: str, now_pacific: datetime = None
     this_friday = (now - timedelta(days=days_since_friday)).date()
     previous_friday = this_friday - timedelta(days=7)
     most_recent_completed_friday = this_friday if (now.weekday() != 4 or now >= show_start) else previous_friday
-    if any(p in text for p in ("last show", "last week's episode", "last week episode", "last week’s episode")):
+    if "last show" in text:
         return most_recent_completed_friday.isoformat()
+    if any(p in text for p in ("last week's episode", "last week episode", "last week’s episode")):
+        return previous_friday.isoformat() if now.weekday() == 4 and now >= show_start else most_recent_completed_friday.isoformat()
     if now.weekday() == 4 and now < show_start and not any(p in text for p in ("tonight", "today's show", "todays show", "today show")):
         return previous_friday.isoformat()
     return this_friday.isoformat() if now.weekday() == 4 else most_recent_completed_friday.isoformat()
@@ -8028,7 +8030,7 @@ async def bnl_status(interaction: discord.Interaction):
             f"- relay_last_context_reason: `{relay_diag.get('reason', 'unknown')}`",
             f"- relay_last_lane: `{relay_diag.get('relay_lane', 'unknown')}`",
         ])
-    await interaction.response.send_message("\n".join(lines), ephemeral=True)
+    await send_safe_ephemeral_chunks(interaction, "\n".join(lines), limit=1700)
 
 @tree.command(name="showtest", description="Manually test Friday show-day update behavior.")
 @app_commands.describe(phase="Show-day phase to simulate")
