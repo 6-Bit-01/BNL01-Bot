@@ -3890,6 +3890,37 @@ def _find_latest_active_broadcast_memory(guild_id: int):
     conn.close()
     return row
 
+def _parse_broadcast_memory_target_id(text: str) -> int:
+    content = (text or "").strip()
+    if not content:
+        return 0
+    match = re.search(r"(?:\bmemory\s+id\b|\bid\b)\s*#?\s*(\d+)\b", content, flags=re.IGNORECASE)
+    if not match:
+        match = re.search(r"#(\d+)\b", content)
+    if not match:
+        return 0
+    try:
+        return int(match.group(1))
+    except Exception:
+        return 0
+
+
+def _find_active_broadcast_memory_by_id(guild_id: int, memory_id: int):
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        SELECT id, episode_date, submitted_by_user_id, submitted_by_name, cleaned_summary, entry_type
+        FROM broadcast_memory
+        WHERE guild_id=? AND id=? AND status='active'
+        LIMIT 1
+        """,
+        (guild_id, memory_id),
+    )
+    row = cursor.fetchone()
+    conn.close()
+    return row
+
 
 def _set_broadcast_memory_status(memory_id: int, status: str, actor_id: int, actor_name: str, reason: str = ""):
     now_iso = datetime.now(PACIFIC_TZ).isoformat()
@@ -7309,28 +7340,35 @@ async def on_message(message: discord.Message):
         resolve_by_topic = re.search(r"\bbnl\b.*\bresolve\b.*\b(memory)\b", lower_clean) and bool(_extract_exact_episode_date(clean_content))
         replace_by_topic = re.search(r"\bbnl\b.*\b(correct|replace)\b.*\b(memory)\b", lower_clean) and bool(_extract_exact_episode_date(clean_content))
         if resolve_last_intent or replace_last_match or official_match or resolve_by_topic or replace_by_topic:
+            explicit_target_id = _parse_broadcast_memory_target_id(clean_content)
             latest = _find_latest_active_broadcast_memory(message.guild.id)
             if not latest:
                 await message.reply("Correction not applied. I could not find a matching active broadcast-memory entry.")
                 return
             target = latest
+            if explicit_target_id:
+                target = _find_active_broadcast_memory_by_id(message.guild.id, explicit_target_id)
+                if not target:
+                    await message.reply(f"Correction not applied. I could not find active broadcast-memory entry id {explicit_target_id}.")
+                    return
             if resolve_by_topic or replace_by_topic:
                 target_date = _extract_exact_episode_date(clean_content)
                 topic_text = re.sub(r"\bBNL\b|,|:|resolve|correct|replace|the|memory|with", " ", clean_content, flags=re.IGNORECASE)
                 topic_tokens = [t.lower() for t in re.findall(r"[A-Za-z][A-Za-z0-9_-]+", topic_text) if len(t) > 2][:4]
-                conn = sqlite3.connect(DB_FILE)
-                cursor = conn.cursor()
-                cursor.execute("SELECT id, episode_date, submitted_by_user_id, submitted_by_name, cleaned_summary, entry_type FROM broadcast_memory WHERE guild_id=? AND status='active' AND episode_date=? ORDER BY id DESC", (message.guild.id, target_date))
-                candidates = [r for r in cursor.fetchall() if (not topic_tokens or any(t in ((r[4] or '').lower() + ' ' + (r[5] or '').lower()) for t in topic_tokens))]
-                conn.close()
-                if len(candidates) == 0:
-                    await message.reply("Correction not applied. I could not find a matching active broadcast-memory entry.")
-                    return
-                if len(candidates) > 1:
-                    lines = [f"id {r[0]}, {r[1]}, {r[5]}, {_summary_snippet(r[4])}" for r in candidates[:4]]
-                    await message.reply("Multiple matches found; please specify one id/date/topic:\n" + "\n".join(lines))
-                    return
-                target = candidates[0]
+                if not explicit_target_id:
+                    conn = sqlite3.connect(DB_FILE)
+                    cursor = conn.cursor()
+                    cursor.execute("SELECT id, episode_date, submitted_by_user_id, submitted_by_name, cleaned_summary, entry_type FROM broadcast_memory WHERE guild_id=? AND status='active' AND episode_date=? ORDER BY id DESC", (message.guild.id, target_date))
+                    candidates = [r for r in cursor.fetchall() if (not topic_tokens or any(t in ((r[4] or '').lower() + ' ' + (r[5] or '').lower()) for t in topic_tokens))]
+                    conn.close()
+                    if len(candidates) == 0:
+                        await message.reply("Correction not applied. I could not find a matching active broadcast-memory entry.")
+                        return
+                    if len(candidates) > 1:
+                        lines = [f"id {r[0]}, {r[1]}, {r[5]}, {_summary_snippet(r[4])}" for r in candidates[:4]]
+                        await message.reply("Multiple matches found; please specify one id/date/topic:\n" + "\n".join(lines))
+                        return
+                    target = candidates[0]
             target_id, target_date, target_user_id, target_user_name, target_summary, target_type = target
             if (not is_owner) and int(target_user_id or 0) != int(message.author.id):
                 await message.reply("Correction not applied. That entry requires owner authority.")
@@ -7352,10 +7390,15 @@ async def on_message(message: discord.Message):
             if len(correction_text.split()) < 4:
                 await message.reply("Correction not applied. Please include a clearer replacement memory.")
                 return
-            _set_broadcast_memory_status(target_id, "superseded", message.author.id, message.author.display_name, "explicit correction/replace request")
-            faux_message = type("Msg", (), {"content": correction_text})()
+            faux_message = type("Msg", (), {"content": correction_text, "author": message.author})()
             processed = await process_broadcast_memory_note(faux_message)
-            if processed.get("entry_type") in {"reject", "show_state_resume"}:
+            if processed.get("entry_type") == "show_state_resume":
+                _set_broadcast_memory_status(target_id, "resolved", message.author.id, message.author.display_name, "official correction schedule resumed")
+                cleared = clear_active_show_state_overrides(message.guild.id)
+                await message.reply(f"Logged. Normal schedule restored; resolved overrides: {cleared}.")
+                return
+            _set_broadcast_memory_status(target_id, "superseded", message.author.id, message.author.display_name, "explicit correction/replace request")
+            if processed.get("entry_type") == "reject":
                 processed = {
                     "entry_type": target_type,
                     "importance": "medium",
@@ -7374,8 +7417,6 @@ async def on_message(message: discord.Message):
             cursor.execute("UPDATE broadcast_memory SET superseded_by_id=?, updated_at=? WHERE id=?", (new_id, datetime.now(PACIFIC_TZ).isoformat(), target_id))
             conn.commit()
             conn.close()
-            if processed.get("entry_type") == "show_state_resume":
-                clear_active_show_state_overrides(message.guild.id)
             await message.reply(f"Corrected broadcast memory: resolved/superseded id {target_id} and added replacement id {new_id} for {processed.get('episode_date')}.")
             return
         processed_entries = await process_broadcast_memory_notes(message)
