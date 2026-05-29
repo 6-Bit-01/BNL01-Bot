@@ -48,6 +48,8 @@ BNL_STATUS_URL = os.getenv("BNL_STATUS_URL")
 
 BNL_WEBSITE_RELAY_ENABLED = os.getenv("BNL_WEBSITE_RELAY_ENABLED", "true").strip().lower() not in {"false", "0", "off"}
 BNL_ACTIVE_BATCHING_ENABLED = os.getenv("BNL_ACTIVE_BATCHING_ENABLED", "false").strip().lower() in {"true", "1", "on"}
+BNL_TYPING_INDICATOR_ENABLED = os.getenv("BNL_TYPING_INDICATOR_ENABLED", "false").strip().lower() in {"true", "1", "on"}
+BNL_TYPING_INDICATOR_COOLDOWN_SECONDS = max(8, int(os.getenv("BNL_TYPING_INDICATOR_COOLDOWN_SECONDS", "12") or 12))
 BNL_WEBSITE_RELAY_INTERVAL_MINUTES = max(1, int(os.getenv("BNL_WEBSITE_RELAY_INTERVAL_MINUTES", "20")))
 BNL_PRIMARY_GUILD_ID = int(os.getenv("BNL_PRIMARY_GUILD_ID", "0") or 0)
 BNL_FORCE_PULL_SHARED_SECRET = os.getenv("BNL_FORCE_PULL_SHARED_SECRET", "").strip()
@@ -1883,6 +1885,7 @@ def init_db():
     _try_alter(cursor, "ALTER TABLE guild_configs ADD COLUMN next_ambient_message_at TEXT")
     _try_alter(cursor, "ALTER TABLE conversations ADD COLUMN channel_name TEXT")
     _try_alter(cursor, "ALTER TABLE conversations ADD COLUMN channel_policy TEXT")
+    _try_alter(cursor, "ALTER TABLE conversations ADD COLUMN channel_id INTEGER")
 
     cursor.execute(
         """
@@ -3735,12 +3738,12 @@ def is_active_channel_quiet(guild_id: int, minutes: int = 15) -> bool:
     conn.close()
     return int(row[0] if row else 0) == 0
 
-def save_user_message(user_id: int, user_name: str, guild_id: int, content: str, channel_name: str = "", channel_policy: str = "unknown"):
+def save_user_message(user_id: int, user_name: str, guild_id: int, content: str, channel_name: str = "", channel_policy: str = "unknown", channel_id: int = 0):
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
     cursor.execute(
-        "INSERT INTO conversations (user_id, user_name, guild_id, channel_name, channel_policy, role, content) VALUES (?, ?, ?, ?, ?, ?, ?)",
-        (user_id, user_name, guild_id, (channel_name or "").lower()[:80], (channel_policy or "unknown")[:40], "user", content),
+        "INSERT INTO conversations (user_id, user_name, guild_id, channel_name, channel_policy, channel_id, role, content) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (user_id, user_name, guild_id, (channel_name or "").lower()[:80], (channel_policy or "unknown")[:40], int(channel_id or 0), "user", content),
     )
     conn.commit()
     conn.close()
@@ -3762,12 +3765,12 @@ def save_user_message(user_id: int, user_name: str, guild_id: int, content: str,
     if any(k in (content or "").lower() for k in ("help", "issue", "stuck", "fix", "error", "problem")):
         add_relationship_journal(user_id, guild_id, "help_signal", f"User asked for help: {(content or '')[:160]}")
 
-def save_model_message(user_id: int, guild_id: int, content: str, channel_name: str = "", channel_policy: str = "unknown"):
+def save_model_message(user_id: int, guild_id: int, content: str, channel_name: str = "", channel_policy: str = "unknown", channel_id: int = 0):
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
     cursor.execute(
-        "INSERT INTO conversations (user_id, user_name, guild_id, channel_name, channel_policy, role, content) VALUES (?, ?, ?, ?, ?, ?, ?)",
-        (user_id, "BNL-01", guild_id, (channel_name or "").lower()[:80], (channel_policy or "unknown")[:40], "model", content),
+        "INSERT INTO conversations (user_id, user_name, guild_id, channel_name, channel_policy, channel_id, role, content) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (user_id, "BNL-01", guild_id, (channel_name or "").lower()[:80], (channel_policy or "unknown")[:40], int(channel_id or 0), "model", content),
     )
     conn.commit()
     conn.close()
@@ -4523,6 +4526,163 @@ def get_conversation_history(user_id: int, guild_id: int, limit: int = 50):
         history.append({"role": role, "parts": [content]})
     return history
 
+
+ROOM_CONTEXT_ALLOWED_POLICIES = {"public_home", "public_context", "sealed_test"}
+ROOM_CONTEXT_BLOCKED_POLICIES = {
+    "internal_controlled",
+    "broadcast_memory",
+    "protected_system",
+    "reference_canon",
+    "ai_image_tool",
+    "unknown",
+}
+
+
+def _safe_prompt_line(text: str, limit: int = 220) -> str:
+    cleaned = re.sub(r"\s+", " ", (text or "").strip())
+    if len(cleaned) <= limit:
+        return cleaned
+    return cleaned[: max(0, limit - 1)].rstrip() + "…"
+
+
+def get_recent_channel_context(guild_id: int, channel_id: int, limit: int = 12, minutes: int = 45, channel_name: str = "", channel_policy: str = "unknown") -> list[dict]:
+    """Return bounded same-channel conversational rows for prompt context only.
+
+    This reads only from `conversations`; it does not touch member activity,
+    website relay history, dossiers, entities, or durable memory tiers.
+    """
+    policy = (channel_policy or "unknown").strip().lower()
+    if policy not in ROOM_CONTEXT_ALLOWED_POLICIES:
+        logging.info(f"room_context_skipped reason=policy_not_allowed policy={policy or 'unknown'}")
+        return []
+
+    safe_limit = max(1, min(int(limit or 12), 12))
+    safe_minutes = max(1, min(int(minutes or 45), 180))
+    normalized_channel_name = (channel_name or "").strip().lower()[:80]
+    cutoff_sql = f"-{safe_minutes} minutes"
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    rows_by_id = {}
+
+    def _remember_rows(fetched_rows):
+        for fetched_row in fetched_rows:
+            if not fetched_row:
+                continue
+            rows_by_id[fetched_row[0]] = fetched_row
+
+    try:
+        if channel_id:
+            cursor.execute(
+                """
+                SELECT id, user_name, role, content, channel_name, channel_policy, timestamp
+                FROM conversations
+                WHERE guild_id = ?
+                  AND channel_id = ?
+                  AND channel_policy IN ('public_home', 'public_context', 'sealed_test')
+                  AND timestamp >= datetime('now', ?)
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (guild_id, int(channel_id), cutoff_sql, safe_limit),
+            )
+            _remember_rows(cursor.fetchall())
+        if normalized_channel_name:
+            cursor.execute(
+                """
+                SELECT id, user_name, role, content, channel_name, channel_policy, timestamp
+                FROM conversations
+                WHERE guild_id = ?
+                  AND LOWER(COALESCE(channel_name, '')) = ?
+                  AND channel_policy IN ('public_home', 'public_context', 'sealed_test')
+                  AND timestamp >= datetime('now', ?)
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (guild_id, normalized_channel_name, cutoff_sql, safe_limit),
+            )
+            _remember_rows(cursor.fetchall())
+        if normalized_channel_name and len(rows_by_id) < safe_limit:
+            cursor.execute(
+                """
+                SELECT id, user_name, role, content, channel_name, channel_policy, timestamp
+                FROM conversations
+                WHERE guild_id = ?
+                  AND LOWER(COALESCE(channel_name, '')) = ?
+                  AND channel_policy IN ('public_home', 'public_context', 'sealed_test')
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (guild_id, normalized_channel_name, safe_limit),
+            )
+            _remember_rows(cursor.fetchall())
+    finally:
+        conn.close()
+
+    rows = sorted(rows_by_id.values(), key=lambda row: row[0])[-safe_limit:]
+    context_rows = []
+    for row in rows:
+        row_policy = (row[5] or "unknown").strip().lower()
+        if row_policy not in ROOM_CONTEXT_ALLOWED_POLICIES:
+            continue
+        content = (row[3] or "").strip()
+        if not content:
+            continue
+        context_rows.append({
+            "id": row[0],
+            "user_name": (row[1] or "").strip(),
+            "role": (row[2] or "").strip(),
+            "content": content,
+            "channel_name": (row[4] or "").strip(),
+            "channel_policy": row_policy,
+            "timestamp": row[6],
+        })
+    logging.info(f"room_context_loaded guild={guild_id} channel={channel_id} count={len(context_rows)} policy={policy}")
+    return context_rows
+
+
+def format_room_context_for_prompt(rows: list[dict], current_user_name: str = "") -> str:
+    if not rows:
+        return ""
+    rendered = ["Recent room context from this channel:"]
+    participants = []
+    seen_participants = set()
+    for row in rows[-12:]:
+        speaker = (row.get("user_name") or "").strip()
+        if not speaker and row.get("role") == "model":
+            speaker = "BNL-01"
+        speaker = speaker or "unknown speaker"
+        content = _safe_prompt_line(row.get("content", ""), limit=240)
+        if not content:
+            continue
+        rendered.append(f"- {speaker}: {content}")
+        key = speaker.lower()
+        if key and key not in seen_participants:
+            seen_participants.add(key)
+            participants.append(speaker)
+    current_name = (current_user_name or "").strip()
+    if current_name and current_name.lower() not in seen_participants:
+        participants.append(current_name)
+    if participants:
+        rendered.append("Active participants in recent room context: " + ", ".join(participants[:12]))
+    return "\n".join(rendered)
+
+
+def build_room_first_direct_context(guild_id: int, channel_id: int, channel_name: str, channel_policy: str, current_user_name: str, route: str = "direct") -> str:
+    rows = get_recent_channel_context(
+        guild_id,
+        channel_id,
+        limit=12,
+        minutes=45,
+        channel_name=channel_name,
+        channel_policy=channel_policy,
+    )
+    if not rows:
+        return ""
+    formatted = format_room_context_for_prompt(rows, current_user_name=current_user_name)
+    if formatted:
+        logging.info(f"room_context_injected route={route} count={len(rows)}")
+    return formatted
+
 def clear_guild_history(guild_id: int):
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
@@ -5211,6 +5371,47 @@ def _generate_gemini_content_with_fallback(contents: str, route: str):
                 logging.error("direct_generation_failed reason=gemini_503")
             raise
 
+
+FAKE_LOOKUP_CLAIM_PATTERNS = (
+    r"\bno direct matches\b",
+    r"\bno prior reference\b",
+    r"\bestablished entity parameters\b",
+    r"\bknown signal patterns\b",
+    r"\barchive scan(?:ned| found)?\b",
+    r"\bscanning .*archives?\b",
+    r"\bentity lookup failed\b",
+    r"\brecords? contain(?:s)? no reference\b",
+    r"\bunknown external data stream\b",
+)
+
+
+def contains_fake_lookup_claim(text: str) -> bool:
+    lowered = (text or "").lower()
+    return any(re.search(pattern, lowered) for pattern in FAKE_LOOKUP_CLAIM_PATTERNS)
+
+
+def fake_lookup_safety_prompt_rules() -> str:
+    return (
+        "\nLookup/source safety rules:\n"
+        "- Never invent archive scans, entity database checks, dossiers, canonical profiles, or lookup failures.\n"
+        "- Do not say: no direct matches, no prior reference, established entity parameters, known signal patterns, archive scan found nothing, entity lookup failed, records contain no reference, or unknown external data stream unless an actual code path supplied that result.\n"
+        "- If recent room context mentions a name, treat it as a current-room reference even if no permanent memory exists.\n"
+        "- If context is weak, state uncertainty plainly without pretending a database was queried.\n"
+    )
+
+
+def _safe_uncertain_response_from_prompt(prompt: str) -> str:
+    room_match = re.search(r"Recent room context from this channel:\n(?P<context>.*?)(?:\nRoom-first context rules:|\nCurrent channel:|\Z)", prompt or "", flags=re.DOTALL)
+    if room_match and room_match.group("context").strip():
+        return (
+            "I can place those names in the current room context, but I won’t pretend I ran an archive or entity lookup. "
+            "What I know here comes from the recent channel conversation, not from a permanent BARCODE dossier record."
+        )
+    return (
+        "I don’t have enough current room context to answer that with confidence, and I won’t fake an archive or entity lookup. "
+        "If you give me the relevant thread, I can respond from that conversation."
+    )
+
 async def get_gemini_response(prompt: str, user_id: int, guild_id: int, route: str = "get_gemini_response"):
     try:
         if not check_quota_availability():
@@ -5263,6 +5464,7 @@ async def get_gemini_response(prompt: str, user_id: int, guild_id: int, route: s
         Conversation history:
         {conversation_context}
         {show_state_route_block}
+        {fake_lookup_safety_prompt_rules()}
 
         User: {prompt}
         BNL-01:"""
@@ -5298,6 +5500,9 @@ async def get_gemini_response(prompt: str, user_id: int, guild_id: int, route: s
         - Do NOT make the whole message unreadable.
         - Keep the result concise enough to work naturally in Discord.
         - At least part of the response must remain clearly understandable.
+        - Do not add fake archive/entity/database lookup claims, fake no-match claims, fake known-signal-pattern claims, or hard denials not present in the original.
+        - Do not override recognition from current room context.
+        - Preserve uncertainty; do not turn weak context into diagnostic certainty.
         {show_state_rewrite_guard}
 
         Original response:
@@ -5309,12 +5514,15 @@ async def get_gemini_response(prompt: str, user_id: int, guild_id: int, route: s
             glitch_text, _ = _extract_text_and_tokens(glitch_response)
 
             if glitch_text:
-                text = glitch_text
-                update_website_status_controlled(
-                    mode="SIGNAL_DEGRADATION",
-                    message="Signal degradation detected. Liaison output may fluctuate.",
-                    status="ONLINE",
-                )
+                if contains_fake_lookup_claim(glitch_text) and not contains_fake_lookup_claim(text):
+                    logging.info("glitch_rewrite_rejected reason=fake_lookup_claim")
+                else:
+                    text = glitch_text
+                    update_website_status_controlled(
+                        mode="SIGNAL_DEGRADATION",
+                        message="Signal degradation detected. Liaison output may fluctuate.",
+                        status="ONLINE",
+                    )
 
         # -------- Rare Cross-Universe Bleed --------
         if text and random.random() < CROSS_UNIVERSE_BLEED_CHANCE:
@@ -5336,6 +5544,8 @@ async def get_gemini_response(prompt: str, user_id: int, guild_id: int, route: s
         - If the topic is food, household, or recipes, you may output a short "interdimensional recipe fragment."
         - Keep it concise enough for Discord.
         - Do not claim real-world certainty for anomalous details.
+        - Do not add fake archive/entity/database lookup claims, fake no-match claims, fake known-signal-pattern claims, or hard denials not present in the original.
+        - Do not override recognition from current room context or convert uncertainty into diagnostic certainty.
         {show_state_bleed_guard}
 
         Original response:
@@ -5345,7 +5555,14 @@ async def get_gemini_response(prompt: str, user_id: int, guild_id: int, route: s
             bleed_response = _generate_gemini_content_with_fallback(bleed_prompt, "cross_universe_bleed")
             bleed_text, _ = _extract_text_and_tokens(bleed_response)
             if bleed_text:
-                text = bleed_text
+                if contains_fake_lookup_claim(bleed_text) and not contains_fake_lookup_claim(text):
+                    logging.info("glitch_rewrite_rejected reason=fake_lookup_claim route=cross_universe_bleed")
+                else:
+                    text = bleed_text
+
+        if contains_fake_lookup_claim(text):
+            logging.info("model_response_rejected reason=fake_lookup_claim")
+            return _safe_uncertain_response_from_prompt(prompt)
 
         return text
     except Exception as e:
@@ -5923,7 +6140,47 @@ _channel_pending_request_anchor = {}
 _channel_recent_typing_at = {}
 _channel_recent_typing_user_id = {}
 _channel_generation_typing_pause_used = defaultdict(bool)
+_channel_typing_indicator_last_at = {}
 _show_state_topic_context = {}
+
+
+async def get_gemini_response_with_optional_typing(channel, prompt: str, user_id: int, guild_id: int, route: str = "get_gemini_response"):
+    """Run Gemini generation with an optional, cooldown-protected Discord typing indicator."""
+    if not BNL_TYPING_INDICATOR_ENABLED or channel is None:
+        if not BNL_TYPING_INDICATOR_ENABLED:
+            logging.info("typing_indicator_skipped reason=disabled")
+        return await get_gemini_response(prompt, user_id, guild_id, route=route)
+
+    channel_id = int(getattr(channel, "id", 0) or 0)
+    now = datetime.now(timezone.utc)
+    last_at = _channel_typing_indicator_last_at.get(channel_id)
+    if last_at and (now - last_at).total_seconds() < BNL_TYPING_INDICATOR_COOLDOWN_SECONDS:
+        logging.info(f"typing_indicator_skipped reason=cooldown channel={channel_id}")
+        return await get_gemini_response(prompt, user_id, guild_id, route=route)
+
+    typing_cm = None
+    typing_started = False
+    try:
+        typing_cm = channel.typing()
+        await typing_cm.__aenter__()
+        typing_started = True
+        _channel_typing_indicator_last_at[channel_id] = now
+        logging.info(f"typing_indicator_started channel={channel_id}")
+    except discord.HTTPException as exc:
+        logging.info(f"typing_indicator_failed reason=http_exception status={getattr(exc, 'status', 'unknown')} channel={channel_id}")
+    except Exception as exc:
+        logging.info(f"typing_indicator_failed reason={type(exc).__name__} channel={channel_id}")
+
+    try:
+        return await get_gemini_response(prompt, user_id, guild_id, route=route)
+    finally:
+        if typing_started and typing_cm is not None:
+            try:
+                await typing_cm.__aexit__(None, None, None)
+            except discord.HTTPException as exc:
+                logging.info(f"typing_indicator_failed reason=exit_http_exception status={getattr(exc, 'status', 'unknown')} channel={channel_id}")
+            except Exception as exc:
+                logging.info(f"typing_indicator_failed reason=exit_{type(exc).__name__} channel={channel_id}")
 SHOW_STATE_TOPIC_TTL_SECONDS = 300
 
 TYPING_RECENT_WINDOW_SECONDS = 5
@@ -7382,6 +7639,8 @@ def build_user_aware_prompt(
     fallback_display_name: str,
     clean_content: str,
     show_state_context: str = "",
+    room_context: str = "",
+    channel_name: str = "",
     message_count: int = 1,
     privileged: bool = False,
     channel_policy: str = "unknown"
@@ -7412,7 +7671,33 @@ def build_user_aware_prompt(
     if show_state_context:
         show_state_prompt_block = f"{show_state_context}\n"
 
+    room_prompt_block = ""
+    if room_context:
+        room_prompt_block = (
+            f"{room_context}\n"
+            "Room-first context rules:\n"
+            "- Current room context outranks isolated user history when answering this turn.\n"
+            "- If the current user jumps into an active topic, answer the active room topic first.\n"
+            "- Names mentioned in recent same-channel context are active room references, not unknown archive entities.\n"
+            "- Do not claim no prior reference for a name that appears in recent room context.\n"
+            "- Recognize current-room roles cautiously; do not canonize anyone into permanent dossiers/profiles.\n"
+            "- If context is thin, say that plainly; never invent archive-scan or entity-lookup failures.\n"
+            "- Never fake an entity database lookup, canonical profile, dossier, or archive query.\n"
+            "- Never say 'no direct matches within established entity parameters' unless a real lookup system was actually queried.\n"
+        )
+
+    channel_prompt_block = ""
+    if channel_policy or channel_name:
+        channel_prompt_block = (
+            f"Current channel: #{channel_name or 'unknown'}\n"
+            f"Current channel policy: {channel_policy or 'unknown'}\n"
+            f"Current context visibility: {context_visibility_for_policy(channel_policy)}\n"
+        )
+
     prompt = (
+        f"Current user request: {clean_content}\n"
+        f"{room_prompt_block}"
+        f"{channel_prompt_block}"
         f"{greeting_rule}\n"
         f"Response style mode: {style_key}\n"
         f"{style_rule}\n"
@@ -7727,11 +8012,21 @@ async def _generate_direct_payload_session(session_key, reason: str):
             seen.add(key)
             direct_payload_items.append(line)
 
+    room_context = build_room_first_direct_context(
+        session["guild_id"],
+        session.get("channel_id", 0),
+        getattr(getattr(anchor_message, "channel", None), "name", ""),
+        session.get("channel_policy", "unknown"),
+        session["requester_display_name"],
+        route="direct_payload_session",
+    )
     prompt, allow_greeting, style_key = build_user_aware_prompt(
         session["requester_user_id"],
         session["guild_id"],
         session["requester_display_name"],
         direct_content,
+        room_context=room_context,
+        channel_name=getattr(getattr(anchor_message, "channel", None), "name", ""),
         message_count=1,
         privileged=is_privileged_member(session["requester_member"], session["guild"]),
         channel_policy=session.get("channel_policy", "unknown"),
@@ -7741,8 +8036,8 @@ async def _generate_direct_payload_session(session_key, reason: str):
     await _apply_direct_response_pacing(True, len(direct_payload_items))
     if _abort_if_invalidated("revision_changed_before_send"):
         return
-    if True:  # typing indicator disabled: Discord 429 was aborting on_message
-        response = await get_gemini_response(prompt, session["requester_user_id"], session["guild_id"])
+    if True:  # optional safe typing wrapper handles Discord 429 without aborting on_message
+        response = await get_gemini_response_with_optional_typing(getattr(anchor_message, "channel", None), prompt, session["requester_user_id"], session["guild_id"])
     if _abort_if_invalidated("revision_changed_before_send"):
         return
     if response and direct_payload_items:
@@ -7751,8 +8046,8 @@ async def _generate_direct_payload_session(session_key, reason: str):
         logging.info(f"direct_payload_completion_check missing_count={len(missing_items)}")
         if missing_items:
             correction_prompt = prompt + "\n\nCORRECTION REQUIRED: Regenerate and include every required payload item explicitly by name.\nMissing required payload items: " + ", ".join(missing_items) + "."
-            if True:  # typing indicator disabled: Discord 429 was aborting on_message
-                response = await get_gemini_response(correction_prompt, session["requester_user_id"], session["guild_id"])
+            if True:  # optional safe typing wrapper handles Discord 429 without aborting on_message
+                response = await get_gemini_response_with_optional_typing(getattr(anchor_message, "channel", None), correction_prompt, session["requester_user_id"], session["guild_id"])
             if _abort_if_invalidated("revision_changed_before_send"):
                 return
             missing_items = _missing_request_payload_items(direct_payload_items, response or "")
@@ -7782,7 +8077,7 @@ async def _generate_direct_payload_session(session_key, reason: str):
         return
     if allow_greeting:
         set_last_greeting_at(session["requester_user_id"], session["guild_id"], datetime.now(PACIFIC_TZ).isoformat())
-    save_model_message(session["requester_user_id"], session["guild_id"], response, channel_name=getattr(anchor_message.channel, "name", ""), channel_policy=session["channel_policy"])
+    save_model_message(session["requester_user_id"], session["guild_id"], response, channel_name=getattr(anchor_message.channel, "name", ""), channel_policy=session["channel_policy"], channel_id=getattr(anchor_message.channel, "id", 0))
     if _abort_if_invalidated("revision_changed_before_send"):
         return
     session["last_generation_snapshot_revision"] = generation_revision
@@ -8188,6 +8483,7 @@ async def on_message(message: discord.Message):
                 message.content.strip(),
                 channel_name=getattr(message.channel, "name", ""),
                 channel_policy=channel_policy,
+                channel_id=getattr(message.channel, "id", 0),
             )
 
     # ---------------- ACTIVE CHANNEL ----------------
@@ -8199,7 +8495,7 @@ async def on_message(message: discord.Message):
             return
 
         if not is_sealed_test_channel:
-            save_user_message(message.author.id, message.author.display_name, message.guild.id, clean_content, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy)
+            save_user_message(message.author.id, message.author.display_name, message.guild.id, clean_content, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0))
 
         # Mentions/replies -> immediate response (not batched)
         if message_should_enter_conversation:
@@ -8239,7 +8535,7 @@ async def on_message(message: discord.Message):
             repair = try_repair_response(direct_content)
             if repair:
                 if not is_sealed_test_channel:
-                    save_model_message(message.author.id, message.guild.id, repair, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy)
+                    save_model_message(message.author.id, message.guild.id, repair, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0))
                 await message.reply(repair)
                 return
 
@@ -8248,14 +8544,14 @@ async def on_message(message: discord.Message):
                 if not is_privileged_member(message.author, message.guild):
                     self_reflection = "Status reports are restricted to server owner/mod operators."
                 if not is_sealed_test_channel:
-                    save_model_message(message.author.id, message.guild.id, self_reflection, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy)
+                    save_model_message(message.author.id, message.guild.id, self_reflection, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0))
                 await message.reply(self_reflection)
                 return
 
             memory_recall = try_memory_recall_response(message.author.id, message.guild.id, direct_content)
             if memory_recall:
                 if not is_sealed_test_channel:
-                    save_model_message(message.author.id, message.guild.id, memory_recall, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy)
+                    save_model_message(message.author.id, message.guild.id, memory_recall, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0))
                 await message.reply(memory_recall)
                 return
 
@@ -8294,12 +8590,22 @@ async def on_message(message: discord.Message):
             show_state_ctx = build_show_state_override_context(message.guild.id, direct_content)
             if not show_state_ctx:
                 show_state_ctx = _get_recent_show_state_topic_context(message.guild.id, message.channel.id, message.author.id, True, direct_content)
+            room_context = build_room_first_direct_context(
+                message.guild.id,
+                message.channel.id,
+                getattr(message.channel, "name", ""),
+                channel_policy,
+                message.author.display_name,
+                route="direct_active",
+            )
             prompt, allow_greeting, style_key = build_user_aware_prompt(
                 message.author.id,
                 message.guild.id,
                 message.author.display_name,
                 direct_content,
                 show_state_context=show_state_ctx.get("context_block", ""),
+                room_context=room_context,
+                channel_name=getattr(message.channel, "name", ""),
                 message_count=1,
                 privileged=is_privileged_member(message.author, message.guild),
                 channel_policy=channel_policy,
@@ -8312,9 +8618,9 @@ async def on_message(message: discord.Message):
             show_state_route = "get_gemini_response"
             if show_state_ctx:
                 show_state_route = "show_state_followup" if show_state_ctx.get("context_source") == "followup" else "show_state_direct"
-            if True:  # typing indicator disabled: Discord 429 was aborting on_message
+            if True:  # optional safe typing wrapper handles Discord 429 without aborting on_message
                 logging.info(f"direct_payload_generation_started payload_count={len(direct_payload_items)}")
-                response = await get_gemini_response(prompt, message.author.id, message.guild.id, route=show_state_route)
+                response = await get_gemini_response_with_optional_typing(message.channel, prompt, message.author.id, message.guild.id, route=show_state_route)
             if response and direct_payload_items:
                 missing_items = _missing_request_payload_items(direct_payload_items, response)
                 logging.info(f"direct_payload_completion_check missing_count={len(missing_items)}")
@@ -8324,8 +8630,8 @@ async def on_message(message: discord.Message):
                         + "\n\nCORRECTION REQUIRED: Regenerate and include every required payload item explicitly by name.\n"
                         + "Missing required payload items: " + ", ".join(missing_items) + "."
                     )
-                    if True:  # typing indicator disabled: Discord 429 was aborting on_message
-                        response = await get_gemini_response(correction_prompt, message.author.id, message.guild.id, route=show_state_route)
+                    if True:  # optional safe typing wrapper handles Discord 429 without aborting on_message
+                        response = await get_gemini_response_with_optional_typing(message.channel, correction_prompt, message.author.id, message.guild.id, route=show_state_route)
                     missing_items = _missing_request_payload_items(direct_payload_items, response or "")
                     logging.info(f"direct_payload_completion_regenerated missing_count={len(missing_items)}")
                     if missing_items:
@@ -8344,7 +8650,7 @@ async def on_message(message: discord.Message):
                     return
 
             if not is_sealed_test_channel:
-                save_model_message(message.author.id, message.guild.id, response, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy)
+                save_model_message(message.author.id, message.guild.id, response, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0))
 
             if allow_greeting:
                 set_last_greeting_at(message.author.id, message.guild.id, datetime.now(PACIFIC_TZ).isoformat())
@@ -8423,11 +8729,11 @@ async def on_message(message: discord.Message):
             return
 
         if not is_sealed_test_channel:
-            save_user_message(message.author.id, message.author.display_name, message.guild.id, direct_content, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy)
+            save_user_message(message.author.id, message.author.display_name, message.guild.id, direct_content, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0))
 
         repair = try_repair_response(direct_content)
         if repair:
-            save_model_message(message.author.id, message.guild.id, repair)
+            save_model_message(message.author.id, message.guild.id, repair, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0))
             await message.reply(repair)
             return
 
@@ -8435,25 +8741,35 @@ async def on_message(message: discord.Message):
         if self_reflection:
             if not is_privileged_member(message.author, message.guild):
                 self_reflection = "Status reports are restricted to server owner/mod operators."
-            save_model_message(message.author.id, message.guild.id, self_reflection)
+            save_model_message(message.author.id, message.guild.id, self_reflection, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0))
             await message.reply(self_reflection)
             return
 
         memory_recall = try_memory_recall_response(message.author.id, message.guild.id, direct_content)
         if memory_recall:
-            save_model_message(message.author.id, message.guild.id, memory_recall)
+            save_model_message(message.author.id, message.guild.id, memory_recall, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0))
             await message.reply(memory_recall)
             return
 
         show_state_ctx = build_show_state_override_context(message.guild.id, direct_content)
         if not show_state_ctx:
             show_state_ctx = _get_recent_show_state_topic_context(message.guild.id, message.channel.id, message.author.id, True, direct_content)
+        room_context = build_room_first_direct_context(
+            message.guild.id,
+            message.channel.id,
+            getattr(message.channel, "name", ""),
+            channel_policy,
+            message.author.display_name,
+            route="direct",
+        )
         prompt, allow_greeting, style_key = build_user_aware_prompt(
             message.author.id,
             message.guild.id,
             message.author.display_name,
             direct_content,
             show_state_context=show_state_ctx.get("context_block", ""),
+            room_context=room_context,
+            channel_name=getattr(message.channel, "name", ""),
             message_count=1,
             privileged=is_privileged_member(message.author, message.guild),
             channel_policy=channel_policy,
@@ -8466,9 +8782,9 @@ async def on_message(message: discord.Message):
         show_state_route = "get_gemini_response"
         if show_state_ctx:
             show_state_route = "show_state_followup" if show_state_ctx.get("context_source") == "followup" else "show_state_direct"
-        if True:  # typing indicator disabled: Discord 429 was aborting on_message
+        if True:  # optional safe typing wrapper handles Discord 429 without aborting on_message
             logging.info(f"direct_payload_generation_started payload_count={len(direct_payload_items)}")
-            response = await get_gemini_response(prompt, message.author.id, message.guild.id, route=show_state_route)
+            response = await get_gemini_response_with_optional_typing(message.channel, prompt, message.author.id, message.guild.id, route=show_state_route)
         if response and direct_payload_items:
             missing_items = _missing_request_payload_items(direct_payload_items, response)
             logging.info(f"direct_payload_completion_check missing_count={len(missing_items)}")
@@ -8478,8 +8794,8 @@ async def on_message(message: discord.Message):
                     + "\n\nCORRECTION REQUIRED: Regenerate and include every required payload item explicitly by name.\n"
                     + "Missing required payload items: " + ", ".join(missing_items) + "."
                 )
-                if True:  # typing indicator disabled: Discord 429 was aborting on_message
-                    response = await get_gemini_response(correction_prompt, message.author.id, message.guild.id, route=show_state_route)
+                if True:  # optional safe typing wrapper handles Discord 429 without aborting on_message
+                    response = await get_gemini_response_with_optional_typing(message.channel, correction_prompt, message.author.id, message.guild.id, route=show_state_route)
                 missing_items = _missing_request_payload_items(direct_payload_items, response or "")
                 logging.info(f"direct_payload_completion_regenerated missing_count={len(missing_items)}")
                 if missing_items:
@@ -8497,7 +8813,7 @@ async def on_message(message: discord.Message):
                 await message.reply("[NETWORK ERROR] Temporary synchronization issue. Try again.")
                 return
 
-        save_model_message(message.author.id, message.guild.id, response)
+        save_model_message(message.author.id, message.guild.id, response, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0))
 
         if allow_greeting:
             set_last_greeting_at(message.author.id, message.guild.id, datetime.now(PACIFIC_TZ).isoformat())
@@ -8541,11 +8857,11 @@ async def on_message(message: discord.Message):
             return
 
         if not is_sealed_test_channel:
-            save_user_message(message.author.id, message.author.display_name, message.guild.id, direct_content, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy)
+            save_user_message(message.author.id, message.author.display_name, message.guild.id, direct_content, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0))
 
         repair = try_repair_response(direct_content)
         if repair:
-            save_model_message(message.author.id, message.guild.id, repair)
+            save_model_message(message.author.id, message.guild.id, repair, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0))
             await message.reply(repair if len(repair) <= 2000 else repair[:1900] + "...")
             return
 
@@ -8553,25 +8869,35 @@ async def on_message(message: discord.Message):
         if self_reflection:
             if not is_privileged_member(message.author, message.guild):
                 self_reflection = "Status reports are restricted to server owner/mod operators."
-            save_model_message(message.author.id, message.guild.id, self_reflection)
+            save_model_message(message.author.id, message.guild.id, self_reflection, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0))
             await message.reply(self_reflection if len(self_reflection) <= 2000 else self_reflection[:1900] + "...")
             return
 
         memory_recall = try_memory_recall_response(message.author.id, message.guild.id, direct_content)
         if memory_recall:
-            save_model_message(message.author.id, message.guild.id, memory_recall)
+            save_model_message(message.author.id, message.guild.id, memory_recall, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0))
             await message.reply(memory_recall if len(memory_recall) <= 2000 else memory_recall[:1900] + "...")
             return
 
         show_state_ctx = build_show_state_override_context(message.guild.id, direct_content)
         if not show_state_ctx:
             show_state_ctx = _get_recent_show_state_topic_context(message.guild.id, message.channel.id, message.author.id, True, direct_content)
+        room_context = build_room_first_direct_context(
+            message.guild.id,
+            message.channel.id,
+            getattr(message.channel, "name", ""),
+            channel_policy,
+            message.author.display_name,
+            route="direct",
+        )
         prompt, allow_greeting, style_key = build_user_aware_prompt(
             message.author.id,
             message.guild.id,
             message.author.display_name,
             direct_content,
             show_state_context=show_state_ctx.get("context_block", ""),
+            room_context=room_context,
+            channel_name=getattr(message.channel, "name", ""),
             message_count=1,
             privileged=is_privileged_member(message.author, message.guild),
             channel_policy=channel_policy,
@@ -8584,9 +8910,9 @@ async def on_message(message: discord.Message):
         show_state_route = "get_gemini_response"
         if show_state_ctx:
             show_state_route = "show_state_followup" if show_state_ctx.get("context_source") == "followup" else "show_state_direct"
-        if True:  # typing indicator disabled: Discord 429 was aborting on_message
+        if True:  # optional safe typing wrapper handles Discord 429 without aborting on_message
             logging.info(f"direct_payload_generation_started payload_count={len(direct_payload_items)}")
-            response = await get_gemini_response(prompt, message.author.id, message.guild.id, route=show_state_route)
+            response = await get_gemini_response_with_optional_typing(message.channel, prompt, message.author.id, message.guild.id, route=show_state_route)
         if response and direct_payload_items:
             missing_items = _missing_request_payload_items(direct_payload_items, response)
             logging.info(f"direct_payload_completion_check missing_count={len(missing_items)}")
@@ -8596,8 +8922,8 @@ async def on_message(message: discord.Message):
                     + "\n\nCORRECTION REQUIRED: Regenerate and include every required payload item explicitly by name.\n"
                     + "Missing required payload items: " + ", ".join(missing_items) + "."
                 )
-                if True:  # typing indicator disabled: Discord 429 was aborting on_message
-                    response = await get_gemini_response(correction_prompt, message.author.id, message.guild.id, route=show_state_route)
+                if True:  # optional safe typing wrapper handles Discord 429 without aborting on_message
+                    response = await get_gemini_response_with_optional_typing(message.channel, correction_prompt, message.author.id, message.guild.id, route=show_state_route)
                 missing_items = _missing_request_payload_items(direct_payload_items, response or "")
                 logging.info(f"direct_payload_completion_regenerated missing_count={len(missing_items)}")
                 if missing_items:
@@ -8615,7 +8941,7 @@ async def on_message(message: discord.Message):
                 await message.reply("[NETWORK ERROR] Temporary synchronization issue. Try again.")
                 return
 
-        save_model_message(message.author.id, message.guild.id, response)
+        save_model_message(message.author.id, message.guild.id, response, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0))
 
         if allow_greeting:
             set_last_greeting_at(message.author.id, message.guild.id, datetime.now(PACIFIC_TZ).isoformat())
