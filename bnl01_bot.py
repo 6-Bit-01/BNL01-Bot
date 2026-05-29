@@ -1071,31 +1071,76 @@ def build_website_read_model_classifier_response(read_model: dict, request_text:
     return "\n".join(lines)
 
 
+def _website_broadcast_memory_candidate_type(candidate_text: str) -> str:
+    text = (candidate_text or "").lower()
+    if any(word in text for word in ("arc", "storyline", "ongoing", "recurring", "antagonist", "entity event")):
+        return "episode_arc"
+    return "notable_moment"
+
+
+def _website_status_broadcast_candidate(read_model: dict) -> str:
+    queue = _website_read_model_queue(read_model)
+    if not queue:
+        return ""
+    session = _first_mapping(queue.get("session"), queue.get("currentSession"))
+    status = _first_mapping(queue.get("status"), queue.get("queueStatus"), queue)
+    interesting_values = []
+    for mapping in (session, status):
+        if not isinstance(mapping, dict):
+            continue
+        for key in ("status", "phase", "broadcastPhase", "state", "message", "notice", "reason", "summary"):
+            value = _compact_public_text(mapping.get(key), 160)
+            if value:
+                interesting_values.append(value)
+    combined = " | ".join(interesting_values)
+    lowered = combined.lower()
+    strong_terms = (
+        "cancel", "cancelled", "canceled", "paused", "restricted", "restriction", "shutdown",
+        "protocol breach", "breach", "interruption", "major status", "show state override",
+        "arc", "storyline", "official event", "technical issue", "outage",
+    )
+    if combined and any(term in lowered for term in strong_terms):
+        return f"Public show status event: {_safe_truncate_summary(combined, 220)}"
+    return ""
+
+
+def _website_dossier_broadcast_candidate(read_model: dict) -> str:
+    for dossier in _website_read_model_public_dossiers(read_model):
+        if not isinstance(dossier, dict):
+            continue
+        name = _compact_public_text(dossier.get("name") or dossier.get("title") or dossier.get("slug"), 80)
+        summary = _compact_public_text(dossier.get("summary") or dossier.get("description") or dossier.get("publicSummary"), 200)
+        combined = " ".join(part for part in (name, summary) if part)
+        lowered = combined.lower()
+        strong_terms = (
+            "update", "meaningful", "recurring", "arc", "storyline", "antagonist", "entity",
+            "protocol", "breach", "restricted", "cancel", "shutdown", "interruption", "official",
+        )
+        if name and summary and any(term in lowered for term in strong_terms):
+            return f"Meaningful public dossier/entity update: {name}: {summary}"
+    return ""
+
+
 def build_website_broadcast_memory_candidate_response(read_model: dict, request_text: str) -> str:
-    completed_tracks = _website_read_model_track_lists(read_model)[1]
-    dossiers = _website_public_dossier_lines(read_model)
-    candidate = dossiers[0] if dossiers else ""
-    if not candidate and completed_tracks:
-        label = _track_label(completed_tracks[0], include_lane=False)
-        if label:
-            candidate = f"Completed public queue item for possible recap context: {label}"
+    candidate = _website_status_broadcast_candidate(read_model) or _website_dossier_broadcast_candidate(read_model)
     if not candidate:
         return ("Broadcast-memory candidates from website read model:\n\n"
-                "No strong broadcast-memory candidate found. Normal queue status, ordinary queued artists/tracks, active counts, up-next/now-playing state, and Priority Signal enabled status should stay temporary unless operators confirm a larger public arc/event.\n\n"
+                "No strong broadcast-memory candidate found. Completed tracks may be recap candidates, but ordinary queue history should not become broadcast memory without operator confirmation.\n\n"
                 "Boundary: no memory write, broadcast-memory intake, user fact, queue/site mutation, relay mutation, or canon promotion happened.")
     today = datetime.now(PACIFIC_TZ).strftime("%Y-%m-%d")
+    note_type = _website_broadcast_memory_candidate_type(candidate)
     return (
         "Broadcast-memory candidates from website read model:\n\n"
         "Candidate 1:\n"
         "Why it may matter:\n"
         f"- {candidate}\n"
-        "- Use only if operators confirm this is more than ordinary runtime queue/site state.\n\n"
+        "- Use only if operators confirm this is a meaningful public dossier/entity update, public show status event, protocol/shutdown arc item, major interruption, official arc event, or known broadcast-memory connection.\n\n"
         "Copy-paste into #bnl-broadcast-memory if approved:\n\n"
         "```text\n"
         "Broadcast memory note\n"
         f"Title: Website public context candidate — {_safe_truncate_summary(candidate, 70)}\n"
         f"Date: {today}\n"
-        "Type: public-site-context\n"
+        f"Type: {note_type}\n"
         "Public-safe: yes\n"
         "Usage: direct, ambient\n\n"
         "Summary:\n"
