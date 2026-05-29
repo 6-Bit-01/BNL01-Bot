@@ -45,6 +45,8 @@ GEMINI_FALLBACK_MODEL = os.getenv("GEMINI_FALLBACK_MODEL", "gemini-2.5-flash-lit
 DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 BNL_API_KEY = os.getenv("BNL_API_KEY")
 BNL_STATUS_URL = os.getenv("BNL_STATUS_URL")
+BNL_READ_MODEL_URL = os.getenv("BNL_READ_MODEL_URL", "").strip()
+BNL_READ_MODEL_ENABLED = os.getenv("BNL_READ_MODEL_ENABLED", "true").strip().lower() not in {"false", "0", "off"}
 
 BNL_WEBSITE_RELAY_ENABLED = os.getenv("BNL_WEBSITE_RELAY_ENABLED", "true").strip().lower() not in {"false", "0", "off"}
 BNL_ACTIVE_BATCHING_ENABLED = os.getenv("BNL_ACTIVE_BATCHING_ENABLED", "false").strip().lower() in {"true", "1", "on"}
@@ -451,7 +453,9 @@ _bnl_control_flags_cache = None
 _bnl_control_flags_cached_at = None
 _bnl_control_flags_404_warned = False
 _bnl_control_flags_last_source_url = None
-
+BNL_READ_MODEL_TTL_SECONDS = 20
+_bnl_read_model_cache = None
+_bnl_read_model_cached_at = None
 
 
 def _build_bnl_control_flag_urls() -> list[str]:
@@ -556,6 +560,289 @@ def get_bnl_control_flags(force_refresh: bool = False) -> dict:
     _bnl_control_flags_cached_at = now
     _bnl_control_flags_last_source_url = None
     return defaults
+
+
+def fetch_bnl_read_model(force: bool = False) -> dict:
+    """
+    Fetch the public website read model as temporary prompt context only.
+    This helper never writes to SQLite, broadcast memory, website relay, or site state.
+    """
+    global _bnl_read_model_cache, _bnl_read_model_cached_at
+    if not BNL_READ_MODEL_ENABLED or not BNL_READ_MODEL_URL:
+        logging.info("bnl_read_model_fetch_skipped reason=disabled")
+        return {}
+
+    now = datetime.now(PACIFIC_TZ)
+    if not force and _bnl_read_model_cache and _bnl_read_model_cached_at:
+        age = (now - _bnl_read_model_cached_at).total_seconds()
+        if age < BNL_READ_MODEL_TTL_SECONDS:
+            return _bnl_read_model_cache
+
+    req = urllib.request.Request(BNL_READ_MODEL_URL, method="GET", headers={"Accept": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=3) as response:
+            code = getattr(response, "status", None) or response.getcode()
+            if not (200 <= code < 300):
+                logging.warning("bnl_read_model_fetch_failed reason=http_status")
+                return {}
+            body = response.read().decode("utf-8", errors="replace")
+            data = json.loads(body) if body else {}
+    except Exception as e:
+        logging.warning(f"bnl_read_model_fetch_failed reason={type(e).__name__}")
+        return {}
+
+    if not isinstance(data, dict):
+        logging.warning("bnl_read_model_invalid_shape")
+        return {}
+    if data.get("ok") is not True or data.get("version") != 1 or data.get("publicOnly") is not True or not isinstance(data.get("sections"), dict):
+        logging.warning("bnl_read_model_invalid_shape")
+        return {}
+
+    _bnl_read_model_cache = data
+    _bnl_read_model_cached_at = now
+    logging.info(f"bnl_read_model_fetch_success sections={len(data.get('sections') or {})}")
+    return data
+
+
+def is_bnl_read_model_relevant(text: str, channel_policy: str = "") -> bool:
+    """Return True only for explicit public website/queue/dossier/show-context questions."""
+    normalized = (text or "").lower()
+    if not normalized.strip():
+        return False
+
+    explicit_site_patterns = [
+        r"\b(read model|website read model|public read model)\b",
+        r"\b(public site context|website context|site context)\b",
+        r"\bwhat (?:does|do) (?:the )?(?:site|website) (?:know|say|show|expose)\b",
+        r"\bcheck (?:the )?(?:site|website|read model)\b",
+        r"\b(?:site|website) dossier",
+        r"\bpublic dossier",
+        r"\bbarcode network website\b",
+    ]
+    queue_patterns = [
+        r"\bwho(?:'s| is) playing(?: now)?\b",
+        r"\bnow playing\b",
+        r"\bwhat(?:'s| is) playing\b",
+        r"\bwho(?:'s| is) up next\b",
+        r"\bup next\b",
+        r"\bnext track\b",
+        r"\b(?:current )?queue\b",
+        r"\bqueue status\b",
+        r"\b(?:submissions?|queue) (?:open|closed)\b",
+        r"\bartists? (?:are )?(?:in|on|queued)\b",
+        r"\btracks? (?:are )?queued\b",
+        r"\bcompleted tracks?\b",
+        r"\bwho played\b",
+        r"\bpriority signal\b",
+        r"\bwheel spins? owed\b",
+        r"\bhow many wheel spins?\b",
+    ]
+    context_patterns = [
+        r"\bwhat does (?:the )?site say about\b",
+        r"\bwhat does (?:the )?website know about\b",
+        r"\b(?:barcode radio|barcode network|bnl-?01)\b.*\b(?:site|website|read model|public context)\b",
+        r"\b(?:site|website|read model|public context)\b.*\b(?:barcode radio|barcode network|bnl-?01)\b",
+    ]
+    patterns = explicit_site_patterns + queue_patterns + context_patterns
+    if any(re.search(pattern, normalized) for pattern in patterns):
+        return True
+
+    if channel_policy == "internal_controlled":
+        rd_operator_patterns = [
+            r"\bread the queue\b",
+            r"\bcheck (?:the )?(?:website|site)\b",
+            r"\bcheck (?:the )?read model\b",
+            r"\bwhat (?:public )?(?:website|site) context\b",
+        ]
+        return any(re.search(pattern, normalized) for pattern in rd_operator_patterns)
+    return False
+
+
+def _read_model_sections(read_model: dict) -> dict:
+    sections = read_model.get("sections") if isinstance(read_model, dict) else {}
+    return sections if isinstance(sections, dict) else {}
+
+
+def _first_mapping(*values):
+    for value in values:
+        if isinstance(value, dict):
+            return value
+    return {}
+
+
+def _first_list(*values):
+    for value in values:
+        if isinstance(value, list):
+            return value
+    return []
+
+
+def _compact_public_text(value, limit: int = 140) -> str:
+    if value is None:
+        return ""
+    text = str(value).replace("\n", " ").strip()
+    text = re.sub(r"\s+", " ", text)
+    return _safe_truncate_summary(text, limit)
+
+
+def _track_label(track: dict, include_lane: bool = True, include_source: bool = False) -> str:
+    if not isinstance(track, dict):
+        return ""
+    artist = _compact_public_text(track.get("artist") or track.get("artistName") or track.get("artist_name") or track.get("name"), 80)
+    title = _compact_public_text(track.get("title") or track.get("trackTitle") or track.get("track_title") or track.get("songTitle"), 90)
+    label = " — ".join(part for part in (artist, title) if part)
+    if not label:
+        label = _compact_public_text(track.get("label") or track.get("displayName"), 120)
+    extras = []
+    if include_lane:
+        lane = _compact_public_text(track.get("lane") or track.get("queueLane"), 40)
+        if lane:
+            extras.append(lane)
+    if include_source:
+        source_type = _compact_public_text(track.get("sourceType") or track.get("source"), 40)
+        if source_type:
+            extras.append(source_type)
+    if label and extras:
+        label = f"{label} ({', '.join(extras)})"
+    return label
+
+
+def build_bnl_read_model_context(read_model: dict, user_text: str, channel_policy: str) -> str:
+    """Build a compact, public-only prompt block from a validated read model."""
+    if not read_model:
+        return ""
+    sections = _read_model_sections(read_model)
+    if not sections:
+        return ""
+
+    queue = _first_mapping(sections.get("queue"), read_model.get("queue"))
+    artists_section = sections.get("artists") if sections.get("artists") is not None else read_model.get("artists")
+    dossiers_section = sections.get("dossiers") if sections.get("dossiers") is not None else read_model.get("dossiers")
+    rules_section = sections.get("rules") if sections.get("rules") is not None else read_model.get("rules")
+    source_context = _first_mapping(sections.get("sourceContext"), read_model.get("sourceContext"))
+
+    lines = [
+        "Website public read model context:",
+        f"Source: {_compact_public_text(source_context.get('source') or 'barcode-network-site', 80)} / publicOnly=true / version=1",
+    ]
+
+    if queue:
+        session = _first_mapping(queue.get("session"), queue.get("currentSession"))
+        status = _first_mapping(queue.get("status"), queue.get("queueStatus"), queue)
+        now_playing = _first_mapping(queue.get("nowPlaying"), queue.get("currentTrack"))
+        up_next = _first_mapping(queue.get("upNext"), queue.get("nextTrack"))
+        priority_signal = _first_mapping(queue.get("prioritySignal"), queue.get("priority"))
+        queued_tracks = _first_list(queue.get("queuedTracks"), queue.get("queue"), queue.get("activeTracks"), queue.get("tracks"))
+        completed_tracks = _first_list(queue.get("completedTracks"), queue.get("completed"), queue.get("playedTracks"))
+        lines.append("\nQueue:")
+        session_bits = []
+        for label, key in (("Session", "title"), ("showDate", "showDate"), ("status", "status"), ("queueOpen", "queueOpen"), ("phase", "phase")):
+            value = session.get(key) if session else status.get(key)
+            if value is not None and value != "":
+                session_bits.append(f"{label}={_compact_public_text(value, 80)}")
+        if session_bits:
+            lines.append("- " + ", ".join(session_bits))
+        status_bits = []
+        for key in ("activeCount", "capacity", "pressure"):
+            value = status.get(key)
+            if value is not None and value != "":
+                status_bits.append(f"{key}={_compact_public_text(value, 40)}")
+        if status_bits:
+            lines.append("- Status: " + ", ".join(status_bits))
+        now_label = _track_label(now_playing)
+        if now_label:
+            lines.append(f"- Now playing: {now_label}")
+        next_label = _track_label(up_next)
+        if next_label:
+            lines.append(f"- Up next: {next_label}")
+        wheel_spins = queue.get("wheelSpinsOwed") if queue.get("wheelSpinsOwed") is not None else status.get("wheelSpinsOwed")
+        if wheel_spins is not None:
+            lines.append(f"- Wheel spins owed: {_compact_public_text(wheel_spins, 30)}")
+        if priority_signal:
+            enabled = priority_signal.get("enabled")
+            label = _compact_public_text(priority_signal.get("label") or priority_signal.get("name"), 80)
+            lines.append(f"- Priority Signal: enabled={enabled if enabled is not None else 'unknown'}" + (f", label={label}" if label else ""))
+        if queued_tracks:
+            lines.append("\nQueued tracks:")
+            for track in queued_tracks[:8]:
+                label = _track_label(track, include_lane=True, include_source=True)
+                if label:
+                    lines.append(f"- {label}")
+        if completed_tracks:
+            lines.append("\nCompleted public tracks:")
+            for track in completed_tracks[:5]:
+                label = _track_label(track, include_lane=False)
+                if label:
+                    lines.append(f"- {label}")
+
+    artists_section_map = artists_section if isinstance(artists_section, dict) else {}
+    artists = _first_list(artists_section_map.get("items"), artists_section_map.get("artists"), artists_section if isinstance(artists_section, list) else [])
+    if artists:
+        lines.append("\nArtists:")
+        for artist in artists[:8]:
+            if not isinstance(artist, dict):
+                continue
+            name = _compact_public_text(artist.get("name") or artist.get("artistName"), 80)
+            tracks = _first_list(artist.get("tracks"), artist.get("trackTitles"), artist.get("queuedTracks"))
+            track_titles = []
+            for track in tracks[:4]:
+                title = _track_label(track, include_lane=False) if isinstance(track, dict) else _compact_public_text(track, 80)
+                if title:
+                    track_titles.append(title)
+            if name:
+                lines.append(f"- {name}: {', '.join(track_titles) if track_titles else 'public artist context present'}")
+
+    dossiers_section_map = dossiers_section if isinstance(dossiers_section, dict) else {}
+    dossiers = _first_list(dossiers_section_map.get("items"), dossiers_section_map.get("dossiers"), dossiers_section_map.get("publicDossiers"), dossiers_section if isinstance(dossiers_section, list) else [])
+    if dossiers:
+        lines.append("\nPublic dossiers:")
+        for dossier in dossiers[:8]:
+            if not isinstance(dossier, dict):
+                continue
+            name = _compact_public_text(dossier.get("name") or dossier.get("title") or dossier.get("slug"), 80)
+            summary = _compact_public_text(dossier.get("summary") or dossier.get("description") or dossier.get("publicSummary"), 180)
+            if name:
+                lines.append(f"- {name}: {summary or 'public dossier exists'}")
+
+    rules_section_map = rules_section if isinstance(rules_section, dict) else {}
+    read_model_rules = _first_list(rules_section_map.get("items"), rules_section_map.get("rules"), rules_section if isinstance(rules_section, list) else [])
+    lines.append("\nRead-model rules:")
+    for rule in read_model_rules[:5]:
+        rule_text = _compact_public_text(rule, 160)
+        if rule_text:
+            lines.append(f"- {rule_text}")
+    lines.extend([
+        "- This is public website context only.",
+        "- Do not treat this as durable memory.",
+        "- Do not write, merge, promote, or persist this context.",
+        "- Do not claim private account/payment/user data.",
+        "- Do not claim simulation/test tracks are present; the read model excludes them.",
+        "- Do not expose raw JSON directly; answer naturally from the compact public fields above.",
+    ])
+    logging.info(f"bnl_read_model_context_loaded reason=relevant_prompt channel_policy={channel_policy}")
+    return "\n".join(lines[:80])
+
+
+def maybe_build_bnl_read_model_context(user_text: str, channel_policy: str) -> str:
+    if not is_bnl_read_model_relevant(user_text, channel_policy):
+        return ""
+    read_model = fetch_bnl_read_model()
+    if not read_model:
+        return ""
+    return build_bnl_read_model_context(read_model, user_text, channel_policy)
+
+
+def get_bnl_read_model_diagnostic_state() -> dict:
+    cache_age = None
+    if _bnl_read_model_cached_at:
+        cache_age = int((datetime.now(PACIFIC_TZ) - _bnl_read_model_cached_at).total_seconds())
+    return {
+        "enabled": bool(BNL_READ_MODEL_ENABLED and BNL_READ_MODEL_URL),
+        "url_configured": bool(BNL_READ_MODEL_URL),
+        "cache_present": bool(_bnl_read_model_cache),
+        "cache_age_seconds": cache_age,
+        "ttl_seconds": BNL_READ_MODEL_TTL_SECONDS,
+    }
 
 def update_website_status_controlled(mode: str, message: str, status: str = "ONLINE", force: bool = False, current_directive: str = "", source: str = "relay", admin_note: str = "") -> bool:
     global _last_website_status_mode, _last_website_status_message, _last_website_directive, _last_website_status_at, _missing_status_key_warned
@@ -8615,7 +8902,8 @@ def build_user_aware_prompt(
     channel_name: str = "",
     message_count: int = 1,
     privileged: bool = False,
-    channel_policy: str = "unknown"
+    channel_policy: str = "unknown",
+    website_read_model_context: str = ""
 ) -> tuple:
     print("BNL DEBUG: build_user_aware_prompt start")
     display_name, preferred_name = get_user_profile(user_id, guild_id)
@@ -8650,6 +8938,10 @@ def build_user_aware_prompt(
     show_state_prompt_block = ""
     if show_state_context:
         show_state_prompt_block = f"{show_state_context}\n"
+
+    website_read_model_prompt_block = ""
+    if website_read_model_context:
+        website_read_model_prompt_block = f"{website_read_model_context}\n"
 
     room_prompt_block = ""
     if room_context:
@@ -8717,6 +9009,7 @@ def build_user_aware_prompt(
         f"Durable memory context:\n{memory_context}\n"
         f"{broadcast_prompt_block}"
         f"{show_state_prompt_block}"
+        f"{website_read_model_prompt_block}"
         f"User name to address (optional): {name_to_use}\n"
         f"User display name: {display_name or fallback_display_name}\n"
         f"User message: {clean_content}"
@@ -9030,6 +9323,7 @@ async def _generate_direct_payload_session(session_key, reason: str):
         session["requester_display_name"],
         route="direct_payload_session",
     )
+    website_read_model_context = maybe_build_bnl_read_model_context(direct_content, session.get("channel_policy", "unknown"))
     prompt, allow_greeting, style_key = build_user_aware_prompt(
         session["requester_user_id"],
         session["guild_id"],
@@ -9040,6 +9334,7 @@ async def _generate_direct_payload_session(session_key, reason: str):
         message_count=1,
         privileged=is_privileged_member(session["requester_member"], session["guild"]),
         channel_policy=session.get("channel_policy", "unknown"),
+        website_read_model_context=website_read_model_context,
     )
     prompt = _build_direct_payload_prompt(prompt, direct_payload_items, direct_content)
     log_response_style(session["guild_id"], session["requester_user_id"], style_key)
@@ -9087,7 +9382,8 @@ async def _generate_direct_payload_session(session_key, reason: str):
         return
     if allow_greeting:
         set_last_greeting_at(session["requester_user_id"], session["guild_id"], datetime.now(PACIFIC_TZ).isoformat())
-    save_model_message(session["requester_user_id"], session["guild_id"], response, channel_name=getattr(anchor_message.channel, "name", ""), channel_policy=session["channel_policy"], channel_id=getattr(anchor_message.channel, "id", 0))
+    if not website_read_model_context:
+        save_model_message(session["requester_user_id"], session["guild_id"], response, channel_name=getattr(anchor_message.channel, "name", ""), channel_policy=session["channel_policy"], channel_id=getattr(anchor_message.channel, "id", 0))
     if _abort_if_invalidated("revision_changed_before_send"):
         return
     session["last_generation_snapshot_revision"] = generation_revision
@@ -9375,6 +9671,7 @@ async def on_message(message: discord.Message):
         response = ""
         suggested_lane = "#research-and-development"
         source_channel_context = ""
+        rd_read_model_context = ""
         if rd_intent == "broadcast_memory_draft":
             response = build_rd_broadcast_memory_draft_response(clean_content, previous_rd_context)
             suggested_lane = "#bnl-broadcast-memory"
@@ -9414,6 +9711,7 @@ async def on_message(message: discord.Message):
             suggested_lane = "follow-up lanes"
         else:
             ops_context = build_operations_brief_context(message.guild.id, clean_content)
+            rd_read_model_context = maybe_build_bnl_read_model_context(clean_content, channel_policy)
             ops_prompt = (
                 "This is an internal BARCODE operations answer.\n"
                 "Be plain, useful, short, and action-oriented.\n"
@@ -9428,6 +9726,7 @@ async def on_message(message: discord.Message):
                 "Do not publish, relay, or write broadcast memory automatically.\n"
                 f"Detected R&D intent: {rd_intent}.\n"
                 f"{ops_context}\n"
+                f"{rd_read_model_context + chr(10) if rd_read_model_context else ''}"
                 f"Operator request: {clean_content}"
             )
             response = await get_gemini_response(ops_prompt, message.author.id, message.guild.id, route="internal_operations_brief")
@@ -9441,15 +9740,16 @@ async def on_message(message: discord.Message):
             await message.reply(chunks[0] + "...")
             for chunk in chunks[1:]:
                 await message.channel.send("..." + chunk)
-        _remember_rd_ops_context(
-            message,
-            clean_content,
-            rd_intent,
-            _extract_rd_subject(clean_content, previous_rd_context),
-            suggested_lane,
-            _rd_response_summary_for_context(response),
-            source_channel_context,
-        )
+        if not rd_read_model_context:
+            _remember_rd_ops_context(
+                message,
+                clean_content,
+                rd_intent,
+                _extract_rd_subject(clean_content, previous_rd_context),
+                suggested_lane,
+                _rd_response_summary_for_context(response),
+                source_channel_context,
+            )
         _mark_recent_direct_response(message.channel.id, message.author.id)
         return
 
@@ -9675,6 +9975,7 @@ async def on_message(message: discord.Message):
                 message.author.display_name,
                 route="direct_active",
             )
+            website_read_model_context = maybe_build_bnl_read_model_context(direct_content, channel_policy)
             prompt, allow_greeting, style_key = build_user_aware_prompt(
                 message.author.id,
                 message.guild.id,
@@ -9686,6 +9987,7 @@ async def on_message(message: discord.Message):
                 message_count=1,
                 privileged=is_privileged_member(message.author, message.guild),
                 channel_policy=channel_policy,
+                website_read_model_context=website_read_model_context,
             )
             prompt = _build_direct_payload_prompt(prompt, direct_payload_items, direct_content)
             log_response_style(message.guild.id, message.author.id, style_key)
@@ -9726,7 +10028,7 @@ async def on_message(message: discord.Message):
                     await message.reply("[NETWORK ERROR] Temporary synchronization issue. Try again.")
                     return
 
-            if not is_sealed_test_channel:
+            if not is_sealed_test_channel and not website_read_model_context:
                 save_model_message(message.author.id, message.guild.id, response, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0))
 
             if allow_greeting:
@@ -9839,6 +10141,7 @@ async def on_message(message: discord.Message):
             message.author.display_name,
             route="direct",
         )
+        website_read_model_context = maybe_build_bnl_read_model_context(direct_content, channel_policy)
         prompt, allow_greeting, style_key = build_user_aware_prompt(
             message.author.id,
             message.guild.id,
@@ -9850,6 +10153,7 @@ async def on_message(message: discord.Message):
             message_count=1,
             privileged=is_privileged_member(message.author, message.guild),
             channel_policy=channel_policy,
+            website_read_model_context=website_read_model_context,
         )
         prompt = _build_direct_payload_prompt(prompt, direct_payload_items, direct_content)
         log_response_style(message.guild.id, message.author.id, style_key)
@@ -9890,7 +10194,8 @@ async def on_message(message: discord.Message):
                 await message.reply("[NETWORK ERROR] Temporary synchronization issue. Try again.")
                 return
 
-        save_model_message(message.author.id, message.guild.id, response, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0))
+        if not website_read_model_context:
+            save_model_message(message.author.id, message.guild.id, response, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0))
 
         if allow_greeting:
             set_last_greeting_at(message.author.id, message.guild.id, datetime.now(PACIFIC_TZ).isoformat())
@@ -9967,6 +10272,7 @@ async def on_message(message: discord.Message):
             message.author.display_name,
             route="direct",
         )
+        website_read_model_context = maybe_build_bnl_read_model_context(direct_content, channel_policy)
         prompt, allow_greeting, style_key = build_user_aware_prompt(
             message.author.id,
             message.guild.id,
@@ -9978,6 +10284,7 @@ async def on_message(message: discord.Message):
             message_count=1,
             privileged=is_privileged_member(message.author, message.guild),
             channel_policy=channel_policy,
+            website_read_model_context=website_read_model_context,
         )
         prompt = _build_direct_payload_prompt(prompt, direct_payload_items, direct_content)
         log_response_style(message.guild.id, message.author.id, style_key)
@@ -10018,7 +10325,8 @@ async def on_message(message: discord.Message):
                 await message.reply("[NETWORK ERROR] Temporary synchronization issue. Try again.")
                 return
 
-        save_model_message(message.author.id, message.guild.id, response, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0))
+        if not website_read_model_context:
+            save_model_message(message.author.id, message.guild.id, response, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0))
 
         if allow_greeting:
             set_last_greeting_at(message.author.id, message.guild.id, datetime.now(PACIFIC_TZ).isoformat())
@@ -10338,6 +10646,7 @@ async def bnl_memory_check(interaction: discord.Interaction):
     policy = resolve_channel_policy(current_channel)
     context_visibility = context_visibility_for_policy(policy)
     relay_eligibility = website_relay_eligibility(policy)
+    read_model_diag = get_bnl_read_model_diagnostic_state()
 
     display_name, preferred_name = get_user_profile(interaction.user.id, guild.id)
     recent_user_rows = get_recent_conversation_count(interaction.user.id, guild.id, limit=200)
@@ -10364,6 +10673,10 @@ async def bnl_memory_check(interaction: discord.Interaction):
         f"- resolved_channel_policy: `{policy}`",
         f"- context_visibility: `{context_visibility}`",
         f"- website_relay_eligibility: `{relay_eligibility}`",
+        f"- read_model_enabled: `{'yes' if read_model_diag.get('enabled') else 'no'}`",
+        f"- read_model_url_configured: `{'yes' if read_model_diag.get('url_configured') else 'no'}`",
+        f"- read_model_cache_present: `{'yes' if read_model_diag.get('cache_present') else 'no'}`",
+        f"- read_model_cache_age_seconds: `{read_model_diag.get('cache_age_seconds') if read_model_diag.get('cache_age_seconds') is not None else 'none'}`",
         f"- speaker_profile_exists: `{'yes' if (display_name is not None or preferred_name is not None) else 'no'}`",
         f"- display_name_present: `{'yes' if bool(display_name) else 'no'}`",
         f"- preferred_name_present: `{'yes' if bool(preferred_name) else 'no'}`",
@@ -10448,6 +10761,7 @@ async def bnl_status(interaction: discord.Interaction):
     context_visibility = context_visibility_for_policy(policy)
     flags_source_state = "available" if _bnl_control_flags_last_source_url else "not yet fetched"
     website_bridge_configured = bool(BNL_STATUS_URL and BNL_API_KEY)
+    read_model_diag = get_bnl_read_model_diagnostic_state()
     broadcast_channel = guild.get_channel(BNL_BROADCAST_MEMORY_CHANNEL_ID) if BNL_BROADCAST_MEMORY_CHANNEL_ID else None
     broadcast_count = len(get_recent_broadcast_memory(guild.id, public_only=False, limit=500))
     latest_written_episode_date, latest_show_episode_date = get_broadcast_memory_diagnostic_dates(guild.id)
@@ -10473,6 +10787,10 @@ async def bnl_status(interaction: discord.Interaction):
         f"- last_ambient_skip_reason: `{ambient_runtime.get('last_skip_reason', 'unknown')}`",
         f"- website_relay_enabled: `{BNL_WEBSITE_RELAY_ENABLED}` (interval `{BNL_WEBSITE_RELAY_INTERVAL_MINUTES}m`)",
         f"- website_bridge_configured: `{'yes' if website_bridge_configured else 'no'}`",
+        f"- read_model_enabled: `{'yes' if read_model_diag.get('enabled') else 'no'}`",
+        f"- read_model_url_configured: `{'yes' if read_model_diag.get('url_configured') else 'no'}`",
+        f"- read_model_cache_present: `{'yes' if read_model_diag.get('cache_present') else 'no'}`",
+        f"- read_model_cache_age_seconds: `{read_model_diag.get('cache_age_seconds') if read_model_diag.get('cache_age_seconds') is not None else 'none'}`",
         f"- control_flags_source: `{flags_source_state}`",
         f"- broadcast_memory_channel: `{broadcast_channel.mention if broadcast_channel else 'unset/not found'}`",
         "- broadcast_memory_usage_enabled: `yes`",
