@@ -3400,6 +3400,11 @@ def is_allowed_rd_source_channel(channel: discord.TextChannel, requester_member:
     guild = getattr(current_rd_channel, "guild", None) or getattr(channel, "guild", None)
     if not _rd_requester_allowed(requester_member, guild):
         return (False, "Operations briefings are restricted to BARCODE operators and mods.")
+    if not requester_member or not hasattr(channel, "permissions_for"):
+        return (False, "I can’t summarize that source channel for you because your Discord permissions do not include access to that channel. Ask someone with access to bring the relevant notes into #research-and-development.")
+    requester_perms = channel.permissions_for(requester_member)
+    if not (getattr(requester_perms, "view_channel", False) and getattr(requester_perms, "read_message_history", False)):
+        return (False, "I can’t summarize that source channel for you because your Discord permissions do not include access to that channel. Ask someone with access to bring the relevant notes into #research-and-development.")
 
     policy = resolve_channel_policy(channel)
     normalized_name = _normalize_channel_name(getattr(channel, "name", ""))
