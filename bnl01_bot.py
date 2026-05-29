@@ -616,6 +616,8 @@ def is_bnl_read_model_relevant(text: str, channel_policy: str = "") -> bool:
         r"\bwhat (?:does|do) (?:the )?(?:site|website) (?:know|say|show|expose)\b",
         r"\bcheck (?:the )?(?:site|website|read model)\b",
         r"\b(?:site|website) dossier",
+        r"\b(?:public )?dossiers?\b.*\b(?:exist|registry|platform|interface|program|site|website)\b",
+        r"\b(?:site|website|public) dossier registry\b",
         r"\bpublic dossier",
         r"\bbarcode network website\b",
     ]
@@ -842,23 +844,38 @@ def build_bnl_read_model_context(read_model: dict, user_text: str, channel_polic
             if name:
                 lines.append(f"- {name}: {', '.join(track_titles) if track_titles else 'public artist context present'}")
 
-    dossiers_section_map = dossiers_section if isinstance(dossiers_section, dict) else {}
-    dossiers = _first_list(
-        dossiers_section_map.get("items"),
-        dossiers_section_map.get("public"),
-        dossiers_section_map.get("dossiers"),
-        dossiers_section_map.get("publicDossiers"),
-        dossiers_section if isinstance(dossiers_section, list) else [],
-    )
-    if dossiers:
+    registry_lines = _website_dossier_registry_lines(read_model)
+    dossier_items = _website_public_dossier_items(read_model)
+    dossier_text = (user_text or "").lower()
+    broad_dossier_request = bool(re.search(r"\b(?:what|which|show|list|summarize)\b.*\b(?:public )?dossiers?\b|\bdossier registry\b|\b(?:platform|interface|program) dossiers?\b", dossier_text))
+    dossier_question = broad_dossier_request or bool(re.search(r"\b(?:site|website|public) dossiers?\b|\bdossier for\b|\bknow about\b", dossier_text))
+    matched_dossiers = _match_public_dossiers(read_model, user_text, limit=5) if dossier_question else []
+    if broad_dossier_request and not re.search(r"\b(platform|interface|program|active|archived|seed|seeds)\b", dossier_text) and not _website_public_dossier_query_name(user_text):
+        matched_dossiers = []
+    if registry_lines and (broad_dossier_request or "registry" in dossier_text):
+        lines.append("\n" + registry_lines[0])
+        lines.extend(registry_lines[1:])
+    if matched_dossiers:
+        lines.append("\nMatched public website dossiers:")
+        for dossier in matched_dossiers[:5]:
+            text = _format_public_dossier_item(dossier, include_boundaries=True)
+            if text:
+                lines.append(f"- {text}")
+    elif dossier_question and _website_public_dossier_query_name(user_text):
+        query_name = _website_public_dossier_query_name(user_text)
+        lines.append(f"\nPublic dossiers: No matching public website dossier is present for {query_name}. That is separate from broadcast memory if broadcast-memory context is loaded elsewhere.")
+    elif dossier_items and broad_dossier_request:
+        lines.append("\nPublic dossiers (bounded list):")
+        for dossier in dossier_items[:8]:
+            text = _format_public_dossier_item(dossier, include_boundaries=True)
+            if text:
+                lines.append(f"- {text}")
+    elif dossier_items and not dossier_question:
         lines.append("\nPublic dossiers:")
-        for dossier in dossiers[:8]:
-            if not isinstance(dossier, dict):
-                continue
-            name = _compact_public_text(dossier.get("name") or dossier.get("title") or dossier.get("slug"), 80)
-            summary = _compact_public_text(dossier.get("summary") or dossier.get("description") or dossier.get("publicSummary"), 180)
-            if name:
-                lines.append(f"- {name}: {summary or 'public dossier exists'}")
+        for dossier in dossier_items[:4]:
+            text = _format_public_dossier_item(dossier, include_boundaries=False)
+            if text:
+                lines.append(f"- {text}")
 
     rules_section_map = rules_section if isinstance(rules_section, dict) else {}
     read_model_rules = _first_list(rules_section_map.get("items"), rules_section_map.get("rules"), rules_section if isinstance(rules_section, list) else [])
@@ -909,7 +926,7 @@ def _bnl_read_model_section_counts(read_model: dict) -> dict:
         "queued_tracks": len(queued_tracks),
         "completed_tracks": len(completed_tracks),
         "artists": len(_first_list(artists_map.get("items"), artists_map.get("artists"), artists_section if isinstance(artists_section, list) else [])),
-        "dossiers": len(_first_list(dossiers_map.get("items"), dossiers_map.get("public"), dossiers_map.get("dossiers"), dossiers_map.get("publicDossiers"), dossiers_section if isinstance(dossiers_section, list) else [])),
+        "dossiers": len(_website_public_dossier_items(read_model)),
         "rules": len(_first_list(rules_map.get("items"), rules_map.get("rules"), rules_section if isinstance(rules_section, list) else [])),
     }
 
@@ -921,6 +938,7 @@ def get_bnl_read_model_diagnostic_state() -> dict:
     section_counts = _bnl_read_model_section_counts(_bnl_read_model_cache or {}) if _bnl_read_model_cache else {}
     operator_lanes = _website_operator_lanes(_bnl_read_model_cache or {}) if _bnl_read_model_cache else {}
     operator_lane_counts = {key: len(operator_lanes.get(key, [])) for key in _OPERATOR_LANE_KEYS} if operator_lanes else {}
+    registry = _website_dossier_registry(_bnl_read_model_cache or {}) if _bnl_read_model_cache else {}
     return {
         "enabled": bool(BNL_READ_MODEL_ENABLED and BNL_READ_MODEL_URL),
         "url_configured": bool(BNL_READ_MODEL_URL),
@@ -930,6 +948,12 @@ def get_bnl_read_model_diagnostic_state() -> dict:
         "schemaRevision": (_bnl_read_model_cache or {}).get("schemaRevision") if _bnl_read_model_cache else None,
         "last_section_counts": section_counts,
         "operatorLaneCounts": operator_lane_counts,
+        "publicDossierCount": len(_website_public_dossier_items(_bnl_read_model_cache or {})) if _bnl_read_model_cache else 0,
+        "dossierRegistryKinds": _dossier_registry_count_value(registry, "kinds", "kindCounts", "countsByKind") if registry else {},
+        "dossierRegistryLifecycleCounts": _dossier_registry_count_value(registry, "lifecycleCounts", "lifecycles", "countsByLifecycle") if registry else {},
+        "dossierRegistryAuthority": _dossier_registry_count_value(registry, "authority") if registry else None,
+        "dossierAutoPromotion": _dossier_registry_count_value(registry, "autoPromotion", "automaticPromotion", "queueToDossierAutoPromotion") if registry else None,
+        "queueDerivedProfiles": _dossier_registry_count_value(registry, "queueDerivedProfiles", "queueDerivedDossiers", "queueDerivedProfileCreation") if registry else None,
         "rd_classifier_enabled": True,
     }
 
@@ -998,11 +1022,205 @@ def _website_read_model_status_bits(read_model: dict) -> list:
     return bits or ["Public queue context is present, but no compact status fields were exposed."]
 
 
+def _website_dossier_registry(read_model: dict) -> dict:
+    sections = _read_model_sections(read_model)
+    dossiers_section = sections.get("dossiers") if sections.get("dossiers") is not None else (read_model.get("dossiers") if isinstance(read_model, dict) else None)
+    if not isinstance(dossiers_section, dict):
+        return {}
+    registry = dossiers_section.get("registry")
+    return registry if isinstance(registry, dict) else {}
+
+
 def _website_read_model_public_dossiers(read_model: dict) -> list:
     sections = _read_model_sections(read_model)
     dossiers_section = sections.get("dossiers") if sections.get("dossiers") is not None else (read_model.get("dossiers") if isinstance(read_model, dict) else None)
     dossiers_map = dossiers_section if isinstance(dossiers_section, dict) else {}
     return _first_list(dossiers_map.get("items"), dossiers_map.get("public"), dossiers_map.get("dossiers"), dossiers_map.get("publicDossiers"), dossiers_section if isinstance(dossiers_section, list) else [])
+
+
+def _website_public_dossier_items(read_model: dict) -> list:
+    sections = _read_model_sections(read_model)
+    dossiers_section = sections.get("dossiers") if sections.get("dossiers") is not None else (read_model.get("dossiers") if isinstance(read_model, dict) else None)
+    dossiers_map = dossiers_section if isinstance(dossiers_section, dict) else {}
+    items = _first_list(
+        dossiers_map.get("items"),
+        dossiers_map.get("public"),
+        _website_read_model_public_dossiers(read_model),
+    )
+    return [item for item in items if isinstance(item, dict)]
+
+
+def _public_list_values(value, limit: int = 4) -> list:
+    if isinstance(value, list):
+        values = value
+    elif isinstance(value, tuple):
+        values = list(value)
+    elif isinstance(value, dict):
+        values = []
+        for key in ("items", "facts", "values", "ids", "boundaries"):
+            nested = value.get(key)
+            if isinstance(nested, list):
+                values = nested
+                break
+        if not values:
+            values = [f"{k}: {v}" for k, v in value.items() if not isinstance(v, (dict, list, tuple, set))]
+    elif value:
+        values = [value]
+    else:
+        values = []
+    compact = []
+    for item in values:
+        if len(compact) >= limit:
+            break
+        if isinstance(item, dict):
+            text = _compact_public_text(item.get("label") or item.get("value") or item.get("summary") or item.get("name"), 90)
+        elif not isinstance(item, (list, tuple, set)):
+            text = _compact_public_text(item, 90)
+        else:
+            text = ""
+        if text:
+            compact.append(text)
+    return compact
+
+
+def _format_public_dossier_item(dossier: dict, include_boundaries: bool = False) -> str:
+    if not isinstance(dossier, dict):
+        return ""
+    bnl_context = dossier.get("bnlContext") if isinstance(dossier.get("bnlContext"), dict) else {}
+    name = _compact_public_text(dossier.get("name") or dossier.get("title") or dossier.get("slug") or dossier.get("id"), 90)
+    if not name:
+        return ""
+    kind = _compact_public_text(dossier.get("kind") or dossier.get("category") or bnl_context.get("kind"), 40)
+    lifecycle = _compact_public_text(dossier.get("lifecycle") or dossier.get("status") or bnl_context.get("lifecycle"), 40)
+    summary = _compact_public_text(dossier.get("summary") or dossier.get("description") or dossier.get("publicSummary") or bnl_context.get("summary"), 180)
+    bracket = " / ".join(bit for bit in (kind, lifecycle) if bit)
+    line = f"{name}" + (f" [{bracket}]" if bracket else "") + f": {summary or 'public website dossier exists'}"
+    facts = _public_list_values(dossier.get("publicFacts"), limit=2)
+    if facts:
+        line += f" Public facts: {'; '.join(facts)}"
+    tags = _public_list_values(dossier.get("tags"), limit=4)
+    if tags:
+        line += f" Tags: {', '.join(tags)}"
+    authority = _compact_public_text(dossier.get("authority") or bnl_context.get("authority"), 70)
+    if authority:
+        line += f" Authority: {authority}."
+    if include_boundaries:
+        boundaries = _public_list_values(dossier.get("knownBoundaries"), limit=4)
+        if not boundaries:
+            boundaries = ["not Discord identity", "not payment profile", "not private account", "not automatic broadcast memory"]
+        line += f" Boundaries: {'; '.join(boundaries)}"
+    related = _public_list_values(dossier.get("relatedPublicIds"), limit=3)
+    if related:
+        line += f" Related public IDs: {', '.join(related)}"
+    link = _compact_public_text(dossier.get("link") or dossier.get("url"), 100)
+    if link:
+        line += f" Link: {link}"
+    return line
+
+
+def _website_public_dossier_query_name(text: str) -> str:
+    raw = re.sub(r"<@!?\d+>", " ", text or "")
+    raw = re.sub(r"\s+", " ", raw).strip(" ?.!:;\n\t")
+    patterns = (
+        r"(?:dossier|know|say|show|context) (?:for|about) ([^?.!]+)",
+        r"is ([^?.!]+?) (?:a |an )?(?:public )?(?:website |site )?dossier",
+        r"does (?:the )?(?:site|website) have (?:a )?(?:public )?dossier for ([^?.!]+)",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, raw, flags=re.IGNORECASE)
+        if match:
+            return _compact_public_text(match.group(1), 90)
+    return ""
+
+
+def _match_public_dossiers(read_model: dict, text: str, limit: int = 5) -> list:
+    dossiers = _website_public_dossier_items(read_model)
+    if not dossiers or not text:
+        return []
+    query_name = _website_public_dossier_query_name(text)
+    query = (query_name or text or "").lower()
+    query_tokens = set(re.findall(r"[a-z0-9][a-z0-9_-]{2,}", query))
+
+    scored = []
+    for idx, dossier in enumerate(dossiers):
+        name = str(dossier.get("name") or dossier.get("title") or dossier.get("slug") or "").strip()
+        did = str(dossier.get("id") or dossier.get("publicId") or "").strip()
+        kind = str(dossier.get("kind") or "").strip()
+        category = str(dossier.get("category") or "").strip()
+        role = str(dossier.get("role") or "").strip()
+        summary = str(dossier.get("summary") or dossier.get("description") or dossier.get("publicSummary") or "")
+        tags = [str(tag) for tag in _public_list_values(dossier.get("tags"), limit=12)]
+        haystack_parts = [name, did, kind, category, role] + tags + [summary]
+        haystack = " ".join(part.lower() for part in haystack_parts if part)
+        exact_terms = [name.lower(), did.lower()]
+        score = 0
+        if query_name and any(term and query_name.lower() == term for term in exact_terms):
+            score = 100
+        elif any(term and term in query for term in exact_terms):
+            score = 90
+        elif query_name and name and (query_name.lower() in name.lower() or name.lower() in query_name.lower()):
+            score = 80
+        elif query_tokens:
+            field_tokens = set(re.findall(r"[a-z0-9][a-z0-9_-]{2,}", " ".join([kind, category, role] + tags).lower()))
+            name_tokens = set(re.findall(r"[a-z0-9][a-z0-9_-]{2,}", name.lower()))
+            if query_tokens & name_tokens:
+                score = 70 + len(query_tokens & name_tokens)
+            elif query_tokens & field_tokens:
+                score = 50 + len(query_tokens & field_tokens)
+            elif any(token in haystack for token in query_tokens):
+                score = 30
+        if score > 0:
+            scored.append((score, idx, dossier))
+    scored.sort(key=lambda row: (-row[0], row[1]))
+    return [dossier for _, _, dossier in scored[:max(0, limit)]]
+
+
+def _dossier_registry_count_value(registry: dict, *keys):
+    for key in keys:
+        value = registry.get(key) if isinstance(registry, dict) else None
+        if value is not None and value != "":
+            return value
+    return None
+
+
+def _format_count_mapping(value, limit: int = 8) -> str:
+    if not isinstance(value, dict):
+        return ""
+    parts = []
+    for key in sorted(value.keys()):
+        if len(parts) >= limit:
+            break
+        if isinstance(value.get(key), (dict, list, tuple, set)):
+            continue
+        parts.append(f"{_compact_public_text(key, 40)}={_compact_public_text(value.get(key), 30)}")
+    return ", ".join(parts)
+
+
+def _website_dossier_registry_lines(read_model: dict) -> list:
+    registry = _website_dossier_registry(read_model)
+    if not registry:
+        return []
+    lines = ["Public dossier registry:"]
+    public_count = _dossier_registry_count_value(registry, "publicCount", "count", "totalPublic", "total")
+    if public_count is None:
+        public_count = len(_website_public_dossier_items(read_model))
+    lines.append(f"- publicCount: {_compact_public_text(public_count, 30)}")
+    kinds = _format_count_mapping(_dossier_registry_count_value(registry, "kinds", "kindCounts", "countsByKind"))
+    if kinds:
+        lines.append(f"- kinds: {kinds}")
+    lifecycle_counts = _format_count_mapping(_dossier_registry_count_value(registry, "lifecycleCounts", "lifecycles", "countsByLifecycle"))
+    if lifecycle_counts:
+        lines.append(f"- lifecycleCounts: {lifecycle_counts}")
+    authority = _compact_public_text(_dossier_registry_count_value(registry, "authority"), 80)
+    if authority:
+        lines.append(f"- authority: {authority}")
+    auto_promotion = _dossier_registry_count_value(registry, "autoPromotion", "automaticPromotion", "queueToDossierAutoPromotion")
+    if auto_promotion is not None:
+        lines.append(f"- autoPromotion: {_compact_public_text(auto_promotion, 30)}")
+    queue_derived = _dossier_registry_count_value(registry, "queueDerivedProfiles", "queueDerivedDossiers", "queueDerivedProfileCreation")
+    if queue_derived is not None:
+        lines.append(f"- queueDerivedProfiles: {_compact_public_text(queue_derived, 30)}")
+    return lines
 
 
 def _website_read_model_artists(read_model: dict) -> list:
@@ -1113,15 +1331,12 @@ def _append_items(lines: list, items: list, empty: str, limit: int = 6):
         lines.append(f"- {empty}")
 
 
-def _website_public_dossier_lines(read_model: dict, limit: int = 4) -> list:
+def _website_public_dossier_lines(read_model: dict, limit: int = 4, include_boundaries: bool = False) -> list:
     lines = []
-    for dossier in _website_read_model_public_dossiers(read_model)[:limit]:
-        if not isinstance(dossier, dict):
-            continue
-        name = _compact_public_text(dossier.get("name") or dossier.get("title") or dossier.get("slug"), 80)
-        summary = _compact_public_text(dossier.get("summary") or dossier.get("description") or dossier.get("publicSummary"), 180)
-        if name:
-            lines.append(f"{name}: {summary or 'existing website-published public dossier summary'}")
+    for dossier in _website_public_dossier_items(read_model)[:limit]:
+        text = _format_public_dossier_item(dossier, include_boundaries=include_boundaries)
+        if text:
+            lines.append(text)
     return lines
 
 
@@ -1134,6 +1349,14 @@ def build_website_read_model_classifier_response(read_model: dict, request_text:
             "Temporary runtime context:",
         ]
         _append_operator_lane_lines(lines, operator_lanes.get("temporaryRuntimeContext", []), "No site-provided temporary runtime context is present.", limit=8)
+        registry_lines = _website_dossier_registry_lines(read_model)
+        if registry_lines:
+            lines.extend(["", registry_lines[0]])
+            lines.extend(registry_lines[1:])
+            lines.extend([
+                "- existingPublicDossiersAreSeeds: false",
+                "- publicDossiersAreBroadcastMemoryByDefault: false",
+            ])
         lines.extend(["", "Recap candidates:"])
         _append_operator_lane_lines(lines, operator_lanes.get("recapCandidates", []), "No site-provided recap candidates are present.", limit=8)
         lines.extend(["", "Broadcast-memory candidates:"])
@@ -1155,11 +1378,19 @@ def build_website_read_model_classifier_response(read_model: dict, request_text:
     queued_tracks, completed_tracks = _website_read_model_track_lists(read_model)
     dossiers = _website_public_dossier_lines(read_model)
     artists = _website_read_model_artists(read_model)
+    registry_lines = _website_dossier_registry_lines(read_model)
     lines = ["Website read-model classification (fallback inference; no site-provided operator lanes were available):", "", "Temporary runtime context:"]
     for bit in _website_read_model_status_bits(read_model)[:8]:
         lines.append(f"- {bit}")
     if queued_tracks:
         lines.append(f"- {len(queued_tracks)} queued/active public track surface(s): queue-derived runtime context, not permanent artist profiles or account identity.")
+    if registry_lines:
+        lines.extend(["", registry_lines[0]])
+        lines.extend(registry_lines[1:])
+        lines.extend([
+            "- existingPublicDossiersAreSeeds: false",
+            "- publicDossiersAreBroadcastMemoryByDefault: false",
+        ])
     lines.extend(["", "Broadcast-memory candidates:"])
     if dossiers:
         lines.append("- Existing public dossier summaries may matter if they reflect a meaningful public entity update, but they are not automatically Discord broadcast memory.")
@@ -1185,7 +1416,8 @@ def build_website_read_model_classifier_response(read_model: dict, request_text:
         lines.append("- Nothing specific enough for public-safe copy beyond generic site/queue status.")
     lines.extend(["", "Do not store / do not do yet:",
         "- Do not write read-model content to memory_tiers, user facts, #bnl-broadcast-memory, website relay, or queue/site state from this classifier.",
-        "- Do not treat queued artists as permanent BNL facts, account identities, Discord identities, or TikTok-to-Discord mappings.",
+        "- Existing public dossiers are website context, not private profiles, seeds, broadcast memory, or Discord identity by default.",
+        "- Do not treat queued artists as permanent BNL facts, account identities, Discord identities, public dossiers, or TikTok-to-Discord mappings.",
         "- Do not treat Priority Signal status as payment facts, and do not expose payment/contact/upload/private data.",
         "- Website read model is temporary public site context; R&D classification is internal sorting, not public/canon.",
     ])
@@ -1248,8 +1480,9 @@ def build_website_broadcast_memory_candidate_response(read_model: dict, request_
     if operator_lanes:
         candidates = [item for item in operator_lanes.get("broadcastMemoryCandidates", []) if isinstance(item, dict)]
         if not candidates:
+            dossier_note = "The site has public dossiers, but no site-provided broadcast-memory candidate is present. Public dossiers are website context, not broadcast memory by default." if _website_public_dossier_items(read_model) else "No site-provided broadcast-memory candidate is present."
             return ("Broadcast-memory candidates from website read model:\n\n"
-                    "No site-provided broadcast-memory candidate is present. Completed tracks may be recap candidates, but ordinary queue history should not become broadcast memory without operator confirmation.\n\n"
+                    f"{dossier_note} Completed tracks may be recap candidates, but ordinary queue history should not become broadcast memory without operator confirmation.\n\n"
                     "Boundary: no memory write, broadcast-memory intake, user fact, queue/site mutation, relay mutation, or canon promotion happened.")
         today = datetime.now(PACIFIC_TZ).strftime("%Y-%m-%d")
         lines = ["Broadcast-memory candidates from website read model:", ""]
@@ -1286,10 +1519,11 @@ def build_website_broadcast_memory_candidate_response(read_model: dict, request_
             lines.append("No site-provided broadcast-memory candidate is present after public-safe formatting.")
         return "\n".join(lines).rstrip()
 
-    candidate = _website_status_broadcast_candidate(read_model) or _website_dossier_broadcast_candidate(read_model)
+    candidate = _website_status_broadcast_candidate(read_model)
     if not candidate:
+        dossier_note = "The site has public dossiers, but no site-provided broadcast-memory candidate is present. Public dossiers are website context, not broadcast memory by default. " if _website_public_dossier_items(read_model) else ""
         return ("Broadcast-memory candidates from website read model (fallback inference; no site-provided operator lanes were available):\n\n"
-                "No strong broadcast-memory candidate found. Completed tracks may be recap candidates, but ordinary queue history should not become broadcast memory without operator confirmation.\n\n"
+                f"{dossier_note}No strong public-event broadcast-memory candidate found. Completed tracks may be recap candidates, but ordinary queue history should not become broadcast memory without operator confirmation.\n\n"
                 "Boundary: no memory write, broadcast-memory intake, user fact, queue/site mutation, relay mutation, or canon promotion happened.")
     today = datetime.now(PACIFIC_TZ).strftime("%Y-%m-%d")
     note_type = _website_broadcast_memory_candidate_type(candidate)
@@ -1298,7 +1532,7 @@ def build_website_broadcast_memory_candidate_response(read_model: dict, request_
         "Candidate 1:\n"
         "Why it may matter:\n"
         f"- {candidate}\n"
-        "- Use only if operators confirm this is a meaningful public dossier/entity update, public show status event, protocol/shutdown arc item, major interruption, official arc event, or known broadcast-memory connection.\n\n"
+        "- Fallback inference is limited to strong public show-status events; public dossier summaries alone were not promoted. Use only if operators confirm a protocol/shutdown arc item, major interruption, official arc event, or known broadcast-memory connection.\n\n"
         "Copy-paste into #bnl-broadcast-memory if approved:\n\n"
         "```text\n"
         "Broadcast memory note\n"
@@ -1318,27 +1552,46 @@ def build_website_broadcast_memory_candidate_response(read_model: dict, request_
 
 def build_website_dossier_seed_candidate_response(read_model: dict, request_text: str) -> str:
     operator_lanes = _website_operator_lanes(read_model)
-    dossiers = _website_public_dossier_lines(read_model)
+    dossier_lines = _website_public_dossier_lines(read_model, limit=6, include_boundaries=True)
+    matched_dossiers = _match_public_dossiers(read_model, request_text, limit=3)
+    query_name = _website_public_dossier_query_name(request_text)
+    lines = ["Possible dossier seeds from website read model:", ""]
+    registry_lines = _website_dossier_registry_lines(read_model)
+    if registry_lines:
+        lines.extend(registry_lines)
+        lines.append("")
+    if matched_dossiers:
+        lines.append("Specific match:")
+        for dossier in matched_dossiers:
+            lines.append(f"- {_format_public_dossier_item(dossier, include_boundaries=True)}")
+        lines.append("That is already an existing public website dossier, not a seed.")
+        lines.append("")
+    elif query_name:
+        lines.append(f"No matching existing public website dossier was found for {query_name}.")
+        lines.append("")
+    if dossier_lines:
+        lines.append("Existing public dossiers (not seeds):")
+        for dossier_line in dossier_lines[:6]:
+            lines.append(f"- {dossier_line}")
+        lines.append("")
+
+    seeds = operator_lanes.get("dossierSeedCandidates", []) if operator_lanes else []
+    formatted = _format_operator_lane_items(seeds, limit=6)
+    if formatted:
+        lines.append("Site-provided possible seeds (seed only / not live dossier):")
+        for seed in formatted:
+            lines.append(f"- {seed}")
+        lines.extend(["", "Boundary:", "- Seed only / not live dossier. No profile, account merge, Discord identity mapping, payment identity, or website dossier was created."])
+        return "\n".join(lines).rstrip()
+
     if operator_lanes:
-        lines = ["Possible dossier seeds from website read model:", ""]
-        if dossiers:
-            lines.append("Existing public dossier summaries (not seeds):")
-            for d in dossiers[:4]:
-                lines.append(f"- {d}")
-            lines.append("")
-        seeds = operator_lanes.get("dossierSeedCandidates", [])
-        formatted = _format_operator_lane_items(seeds, limit=6)
-        if formatted:
-            lines.append("Site-provided possible seeds (seed only / not live dossier):")
-            for seed in formatted:
-                lines.append(f"- {seed}")
-            lines.extend(["", "Boundary:", "- Seed only / not live dossier. No profile, account merge, Discord identity mapping, payment identity, or website dossier was created."])
-        else:
-            lines.extend([
-                "No site-provided dossier seed candidate is present.",
-                "Queue-derived artist surfaces are not profiles and are not dossier seeds by default.",
-                "Existing public dossiers, if listed above, remain existing public dossiers rather than new seeds.",
-            ])
+        lines.extend([
+            "No site-provided dossier seed candidate is present.",
+            "Existing public dossiers are not seeds.",
+            "Queue-derived artist surfaces are not profiles and are not dossier seeds by default.",
+        ])
+        if query_name and not matched_dossiers:
+            lines.append("No site-provided dossier seed is present for that name. R&D can draft a seed manually, but this PR does not create one.")
         return "\n".join(lines).rstrip()
 
     artists = []
@@ -1347,34 +1600,16 @@ def build_website_dossier_seed_candidate_response(read_model: dict, request_text
             name = _compact_public_text(artist.get("name") or artist.get("artistName"), 80)
             if name:
                 artists.append(name)
-    lines = ["Possible dossier seeds from website read model (fallback inference; no site-provided operator lanes were available):", ""]
-    if dossiers:
-        lines.append("Existing public dossier summaries (not seeds):")
-        for d in dossiers[:4]:
-            lines.append(f"- {d}")
-        lines.append("")
-    if not artists:
-        lines.extend([
-            "Seed:",
-            "- Name: none identified from the read model alone",
-            "- Source: public website read model / queue-derived artist surface",
-            "- Why it may deserve tracking: no reason beyond normal site/queue appearance was visible",
-            "- Public facts: none promoted",
-            "- Needs confirmation: a recurring public arc, entity role, or operator-approved reason",
-            "- Boundary: dossier seed only; not a live website dossier, account, Discord identity, or payment identity.",
-        ])
-    else:
+    lines.append("No site-provided operator-lane dossier seed candidate is present; fallback inference stays conservative.")
+    if query_name and not matched_dossiers:
+        lines.append("No site-provided dossier seed is present for that name. R&D can draft a seed manually, but this PR does not create one.")
+    if artists:
+        lines.append("Queue-derived artist surfaces present, but not seeds by default:")
         for name in artists[:3]:
-            lines.extend([
-                "Seed:",
-                f"- Name: {name}",
-                "- Source: public website read model / queue-derived artist surface",
-                "- Why it may deserve tracking: only if operators confirm significance beyond ordinary queue appearance",
-                "- Public facts: public artist surface appeared in the site read model; do not add private/contact/payment/upload facts",
-                "- Needs confirmation: recurring relevance, public entity role, approved summary, and whether a dossier is appropriate",
-                "- Boundary: possible future profile only; not a live dossier, account, Discord identity mapping, or payment identity.",
-                "",
-            ])
+            lines.append(f"- {name}: ordinary public queue/site appearance only; needs operator-approved reason before any manual seed draft.")
+    else:
+        lines.append("No queue-derived artist surface needs a seed from the read model alone.")
+    lines.append("Boundary: no live dossier, account, Discord identity mapping, payment identity, memory write, or website mutation was created.")
     return "\n".join(lines).rstrip()
 
 
@@ -1423,10 +1658,17 @@ def build_website_public_safe_candidate_response(read_model: dict, request_text:
                 "- Draft only. Uses site-provided operatorLanes.publicSafeCopyCandidates; no internal R&D details, private data, payment facts, admin simulation data, or claim of private BNL access.",
             ])
         else:
-            lines.extend([
-                "No site-provided public-safe copy candidate is present.",
-                "Boundary: no copy was inferred from raw queue history because operator lanes are present and did not mark a copy candidate.",
-            ])
+            dossier_lines = _website_public_dossier_lines(read_model, limit=3, include_boundaries=True)
+            if dossier_lines:
+                lines.extend(["No site-provided public-safe copy candidate is present, but existing public dossiers can support public-safe site copy:", "```text"])
+                for dossier_line in dossier_lines:
+                    lines.append(f"Public site copy candidate: The website currently lists {dossier_line}")
+                lines.extend(["```", "", "Boundary: public site context only; not a private profile, Discord identity, payment/customer profile, broadcast memory, or writeback."])
+            else:
+                lines.extend([
+                    "No site-provided public-safe copy candidate is present.",
+                    "Boundary: no copy was inferred from raw queue history because operator lanes are present and did not mark a copy candidate.",
+                ])
         return "\n".join(lines)
 
     queued_tracks, completed_tracks = _website_read_model_track_lists(read_model)
@@ -1442,8 +1684,11 @@ def build_website_public_safe_candidate_response(read_model: dict, request_text:
             lines.append("- Recently completed public queue items: " + "; ".join(labels))
     if queued_tracks:
         lines.append(f"- The public queue currently shows {len(queued_tracks)} active/queued item(s).")
+    dossier_lines = _website_public_dossier_lines(read_model, limit=3, include_boundaries=False)
+    for dossier_line in dossier_lines:
+        lines.append(f"- Public site copy candidate: The website currently lists {dossier_line}")
     lines.extend(["```", "", "Boundary:",
-        "- Draft only. Uses public site/queue context; no internal R&D details, private data, payment facts, admin simulation data, or claim of private BNL access.",
+        "- Draft only. Uses public site/queue/dossier context; no internal R&D details, private data, payment facts, admin simulation data, Discord identity claim, broadcast-memory claim, or claim of private BNL access.",
     ])
     return "\n".join(lines)
 
@@ -3912,11 +4157,14 @@ def detect_rd_ops_intent(text: str) -> str:
         "broadcast memory candidate from the site",
         "broadcast memory draft from the current queue",
         "broadcast memory draft from the site",
+        "make a broadcast memory candidate from current site dossiers",
+        "make a broadcast memory candidate from the current site dossiers",
     )):
         return "website_broadcast_memory_candidate"
 
     if has_website_context and any(phrase in normalized for phrase in (
         "does the website show anything that needs a dossier seed",
+        "does anything from the site need a dossier seed",
         "does anything from the website read model need a dossier seed",
         "make a dossier seed from the website read model",
         "make a dossier seed from the public dossier",
@@ -3969,6 +4217,11 @@ def detect_rd_ops_intent(text: str) -> str:
         "what from the current queue matters",
         "sort current site context",
         "sort current queue context",
+        "summarize the public dossier registry",
+        "public dossier registry",
+        "what public dossiers exist",
+        "what platform dossiers exist",
+        "show me public interface dossiers",
     )):
         return "website_read_model_classifier"
 
