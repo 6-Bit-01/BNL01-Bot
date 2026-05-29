@@ -74,6 +74,8 @@ BATCH_REPLY_COOLDOWN_SECONDS = 2
 BATCH_REQUEST_PAYLOAD_EXTENSION_SECONDS = 6
 BATCH_REQUEST_PAYLOAD_MAX_WAIT_SECONDS = 16
 PENDING_REQUEST_INTENT_TTL_SECONDS = 20
+RD_OPS_CONTEXT_TTL_SECONDS = 30 * 60
+RD_OPS_CONTEXT_MAX_TURNS = 4
 ADAPTIVE_PAYLOAD_WAIT_NO_ITEMS_SECONDS = 4
 ADAPTIVE_PAYLOAD_WAIT_WITH_ITEMS_SECONDS = 1.5
 ADAPTIVE_PAYLOAD_MAX_WAIT_SECONDS = 9
@@ -2968,6 +2970,274 @@ def is_member_activity_request(text: str) -> bool:
     if re.search(r"\b(?:join|joins|leave|leaves|left)\b", compact) and re.search(r"\b(?:activity|members?|roster|server|carl\s+bot)\b", compact):
         return True
     return False
+
+
+def detect_rd_ops_intent(text: str) -> str:
+    """Classify R&D operator asks so concrete draft requests do not fall into generic briefs."""
+    if is_member_activity_request(text):
+        return "member_activity"
+    t = re.sub(r"\s+", " ", (text or "").strip().lower())
+    if not t:
+        return "unknown"
+    normalized = t.replace("#", "")
+    normalized = normalized.replace("broadcast-memory", "broadcast memory")
+    normalized = normalized.replace("knowledge-base", "knowledge base")
+    normalized = normalized.replace("copy/paste", "copy paste")
+
+    if any(phrase in normalized for phrase in (
+        "turn this into action items", "action items", "what should mods do", "give me next steps",
+        "next steps", "checklist", "task list",
+    )):
+        return "action_items"
+
+    concrete_draft_words = (
+        "give me the prompt", "exact prompt", "exact text", "copy paste", "copy-paste",
+        "write the", "draft", "make the", "turn this into", "what should i put",
+    )
+    broadcast_memory_terms = (
+        "bnl broadcast memory", "broadcast memory", "official show memory", "show memory note",
+        "memory entry", "memory note",
+    )
+    if any(term in normalized for term in broadcast_memory_terms) and any(word in normalized for word in concrete_draft_words):
+        return "broadcast_memory_draft"
+    if any(phrase in normalized for phrase in (
+        "write the broadcast memory note",
+        "write broadcast memory note",
+        "make the broadcast memory version",
+        "make broadcast memory version",
+        "turn this into a broadcast memory entry",
+        "record this for broadcast memory",
+        "official show memory note",
+        "prompt to introduce",
+    )):
+        return "broadcast_memory_draft"
+
+    if any(phrase in normalized for phrase in (
+        "make a dossier seed", "draft a dossier seed", "dossier seed", "dossier draft",
+        "does this sound like a dossier seed",
+    )):
+        return "dossier_seed_draft"
+
+    if any(phrase in normalized for phrase in (
+        "make this public safe", "public-safe", "public safe", "what should we tell people",
+        "write the discord post", "make a public announcement", "public announcement", "social post",
+    )):
+        return "public_safe_message"
+
+    if any(phrase in normalized for phrase in (
+        "flag this for recap", "make recap note", "recap candidate", "recap note",
+    )):
+        return "recap_candidate"
+
+    if any(phrase in normalized for phrase in (
+        "how can we implement", "how do we put this into your memory", "how do we put this in your memory",
+        "how do we get this into your knowledge base", "where does this go", "what lane does this belong in",
+        "how do we make bnl remember this", "how do we make this official", "how should this be stored",
+        "where should i put this", "put this into your memory", "implement this into your memory",
+        "implement this into your broadcast memory", "into your broadcast memory", "become official memory",
+    )):
+        return "implementation_guidance"
+
+    if any(phrase in normalized for phrase in (
+        "operations brief", "mod brief", "what should we do", "how should we handle this",
+        "what's next with this situation", "whats next with this situation",
+    )):
+        return "operations_brief"
+
+    if is_internal_operations_request(text):
+        return "operations_brief"
+    return "unknown"
+
+
+def _rd_ops_context_key(message: discord.Message):
+    guild_id = getattr(getattr(message, "guild", None), "id", 0) or 0
+    channel_id = getattr(getattr(message, "channel", None), "id", 0) or 0
+    author_id = getattr(getattr(message, "author", None), "id", 0) or 0
+    return (guild_id, channel_id, author_id)
+
+
+def _get_recent_rd_ops_context(message: discord.Message):
+    key = _rd_ops_context_key(message)
+    now = datetime.now(timezone.utc)
+    kept = deque(maxlen=RD_OPS_CONTEXT_MAX_TURNS)
+    for entry in _rd_ops_context_buffer.get(key, []):
+        ts = entry.get("timestamp")
+        if ts and (now - ts).total_seconds() <= RD_OPS_CONTEXT_TTL_SECONDS:
+            kept.append(entry)
+    if kept:
+        _rd_ops_context_buffer[key] = kept
+    else:
+        _rd_ops_context_buffer.pop(key, None)
+    return list(kept)
+
+
+def _remember_rd_ops_context(message: discord.Message, user_request: str, intent: str, main_subject: str = "", suggested_lane: str = "", response_summary: str = ""):
+    if not is_research_and_development_channel(message):
+        return
+    key = _rd_ops_context_key(message)
+    _rd_ops_context_buffer[key].append({
+        "timestamp": datetime.now(timezone.utc),
+        "user_request": (user_request or "")[:700],
+        "detected_intent": intent or "unknown",
+        "main_subject": (main_subject or "")[:120],
+        "suggested_lane": (suggested_lane or "")[:80],
+        "response_summary": (response_summary or "")[:700],
+    })
+
+
+def _rd_context_subject(previous_context) -> str:
+    for entry in reversed(previous_context or []):
+        subject = (entry.get("main_subject") or "").strip()
+        if subject:
+            return subject
+    return ""
+
+
+def _extract_rd_subject(text: str, previous_context=None) -> str:
+    raw = (text or "").strip()
+    if re.search(r"\bsignal\s+witch\b", raw, flags=re.IGNORECASE):
+        return "Signal Witch"
+    # Prefer title-case entity spans, but avoid channel names and BNL itself.
+    ignored = {"BNL", "BNL 01", "BARCODE Network", "BARCODE Radio", "Discord", "R D", "No I"}
+    candidates = re.findall(r"\b[A-Z][A-Za-z0-9]*(?:\s+[A-Z0-9][A-Za-z0-9]*){0,3}\b", raw)
+    for candidate in candidates:
+        cleaned = candidate.strip()
+        if cleaned not in ignored and not cleaned.startswith("Broadcast"):
+            return cleaned
+    prior = _rd_context_subject(previous_context)
+    return prior or "this item"
+
+
+def _rd_note_date(text: str) -> str:
+    match = re.search(r"\b(20\d{2}-\d{2}-\d{2})\b", text or "")
+    if match:
+        return match.group(1)
+    return datetime.now(PACIFIC_TZ).date().isoformat()
+
+
+def _rd_event_sentence(text: str, subject: str) -> str:
+    clean = re.sub(r"\s+", " ", (text or "").strip())
+    if subject.lower() == "signal witch" and re.search(r"\b(song|diss track|track)\b", clean, flags=re.IGNORECASE):
+        return "Signal Witch posted a song calling out 6 Bit, the mods, Cliff, and the viewers for breaking BARCODE Network protocol."
+    if clean:
+        stripped = re.sub(r"^no\s+i\s+mean\s+", "", clean, flags=re.IGNORECASE)
+        stripped = re.sub(r"^give me the prompt to (?:put into|introduce).*?(?:broadcast memory|bnl-broadcast-memory)\s*", "", stripped, flags=re.IGNORECASE).strip(" :.-")
+        if stripped and len(stripped.split()) >= 5:
+            return stripped[:260].rstrip(" .") + "."
+    return f"{subject} was raised by operators as a possible broadcast-memory item."
+
+
+def _build_broadcast_memory_note(text: str, previous_context=None) -> str:
+    previous_text = " ".join((entry.get("user_request") or "") for entry in (previous_context or [])[-2:])
+    combined = (previous_text + " " + (text or "")).strip()
+    subject = _extract_rd_subject(text, previous_context)
+    if subject == "this item":
+        subject = _extract_rd_subject(combined, previous_context)
+    note_date = _rd_note_date(combined)
+    event_sentence = _rd_event_sentence(combined, subject)
+    protocol_arc = ""
+    if re.search(r"2026-05-22|broadcast-control breach|protocol breach|breaking barcode network protocol|breaking protocol", combined, flags=re.IGNORECASE):
+        protocol_arc = " after the 2026-05-22 broadcast-control/protocol breach"
+    if subject.lower() == "signal witch":
+        body = (
+            f"Broadcast memory note — Signal Witch / {note_date}\n\n"
+            f"Signal Witch has entered the current BARCODE Radio shutdown/protocol-breach arc as an antagonistic outside voice. "
+            f"{event_sentence.rstrip('.')}{protocol_arc}.\n\n"
+            "Treat Signal Witch as a current broadcast-memory entity connected to the cancellation/protocol-breach storyline. "
+            "Do not treat this as a live website dossier, queue integration, account identity, or public relay instruction yet."
+        )
+    else:
+        body = (
+            f"Broadcast memory note — {subject} / {note_date}\n\n"
+            f"{event_sentence}\n\n"
+            "Treat this as an official broadcast-memory note only after it is posted in #bnl-broadcast-memory. "
+            "Do not treat it as a live website dossier, queue integration, account identity, or public relay instruction yet."
+        )
+    return body
+
+
+def build_rd_broadcast_memory_draft_response(text: str, previous_context=None) -> str:
+    note = _build_broadcast_memory_note(text, previous_context)
+    return (
+        "Copy-paste into #bnl-broadcast-memory:\n\n"
+        f"```text\n{note}\n```\n\n"
+        "After posting that there, BNL can treat it as official broadcast memory."
+    )
+
+
+def build_rd_implementation_guidance_response(text: str, previous_context=None) -> str:
+    note = _build_broadcast_memory_note(text, previous_context)
+    return (
+        "This belongs in `#bnl-broadcast-memory` as an official broadcast-memory note if you want BNL to remember it. "
+        "If it stays only in `#research-and-development`, it remains R&D discussion and does not become official memory.\n\n"
+        "Copy-paste this into `#bnl-broadcast-memory`:\n\n"
+        f"```text\n{note}\n```\n\n"
+        "Optional next steps:\n"
+        "- Keep a dossier seed in R&D if the entity needs tracking later.\n"
+        "- Mark it as a recap candidate if it becomes part of the public episode arc.\n\n"
+        "Do not do yet:\n"
+        "- Do not treat this as a live website dossier.\n"
+        "- Do not connect it to queue, runtime, payment, account, or Discord Radio systems.\n"
+        "- Do not make it a public relay item unless separately approved."
+    )
+
+
+def build_rd_dossier_seed_response(text: str, previous_context=None) -> str:
+    subject = _extract_rd_subject(text, previous_context)
+    event_sentence = _rd_event_sentence(text, subject)
+    return (
+        "Dossier seed only — keep this in R&D unless an operator approves a real dossier.\n\n"
+        "```text\n"
+        f"Dossier seed — {subject}\n\n"
+        "Status: seed only / not canon / not a live website dossier.\n"
+        f"Observed signal: {event_sentence}\n"
+        "Why track: possible recurring broadcast-memory entity or antagonist tied to the current show arc.\n"
+        "Source lane: R&D operator note; confirm through #bnl-broadcast-memory before treating as official broadcast memory.\n"
+        "Needs confirmation: public-safe source, exact date/context, whether this becomes recap material, and whether a dossier is approved later.\n"
+        "```"
+    )
+
+
+def build_rd_public_safe_message_response(text: str, previous_context=None) -> str:
+    subject = _extract_rd_subject(text, previous_context)
+    event_sentence = _rd_event_sentence(text, subject)
+    return (
+        "Public-safe version:\n\n"
+        "```text\n"
+        f"A new BARCODE Radio storyline beat is forming around {subject}. {event_sentence} "
+        "For now, treat it as part of the unfolding show conversation rather than a confirmed feature, profile, or public system change.\n"
+        "```"
+    )
+
+
+def build_rd_action_items_response(text: str, previous_context=None) -> str:
+    subject = _extract_rd_subject(text, previous_context)
+    return (
+        f"Action items for {subject}:\n"
+        "- If this should become official memory, paste a concise note into `#bnl-broadcast-memory`.\n"
+        "- Keep any dossier language as an R&D seed only unless separately approved.\n"
+        "- Flag a recap candidate only if it becomes relevant to the public episode arc.\n"
+        "- Do not connect it to website dossiers, queue/runtime/account systems, or public relay yet."
+    )
+
+
+def build_rd_recap_candidate_response(text: str, previous_context=None) -> str:
+    subject = _extract_rd_subject(text, previous_context)
+    event_sentence = _rd_event_sentence(text, subject)
+    return (
+        "Recap candidate — not public copy yet.\n\n"
+        f"Event: {event_sentence}\n"
+        "Why it matters: it may explain the current broadcast/protocol-breach arc for viewers.\n"
+        f"Involves: {subject}; operators/mods/viewers if confirmed by the source note.\n"
+        "Public-safe: likely yes if phrased without internal process details.\n"
+        "Approval: needed before publishing or treating as a final recap.\n"
+        "Lane: keep R&D-only until approved; use #bnl-broadcast-memory separately if it should become official memory."
+    )
+
+
+def _rd_response_summary_for_context(response: str) -> str:
+    clean = re.sub(r"```.*?```", "[draft code block]", response or "", flags=re.DOTALL)
+    return re.sub(r"\s+", " ", clean).strip()[:650]
 
 
 def build_operations_brief_context(guild_id: int, user_text: str) -> str:
@@ -7976,6 +8246,7 @@ def _direct_session_key(message: discord.Message):
 
 
 _direct_payload_sessions = {}
+_rd_ops_context_buffer = defaultdict(lambda: deque(maxlen=RD_OPS_CONTEXT_MAX_TURNS))
 _recent_direct_response_window = {}
 DIRECT_FOLLOWUP_WINDOW_SECONDS = 60
 
@@ -8466,28 +8737,58 @@ async def on_message(message: discord.Message):
         if not clean_content:
             await message.reply("Tag me with what you need: operations brief, mod actions, recap hooks, or dossier seed suggestions.")
             return
-        if is_member_activity_request(clean_content):
+        previous_rd_context = _get_recent_rd_ops_context(message)
+        rd_intent = detect_rd_ops_intent(clean_content)
+        if rd_intent == "member_activity":
             events = get_recent_member_activity_events(message.guild.id, limit=10, days=14)
-            await message.reply(format_member_activity_summary(events))
+            response = format_member_activity_summary(events)
+            await message.reply(response)
+            _remember_rd_ops_context(message, clean_content, rd_intent, "member activity", "#research-and-development", response)
             _mark_recent_direct_response(message.channel.id, message.author.id)
             return
-        ops_context = build_operations_brief_context(message.guild.id, clean_content)
-        ops_prompt = (
-            "This is an internal BARCODE operations answer.\n"
-            "Be plain, useful, short, and action-oriented.\n"
-            "Keep it usually under 8 short lines unless the user asks for depth.\n"
-            "Use this structure: Current status / What matters / Suggested next actions / Optional Do not do yet.\n"
-            "Do not write a lore monologue.\n"
-            "Do not expose raw database rows, raw notes, or restricted internal details.\n"
-            "Do not convert research-and-development operations discussion into canon.\n"
-            "Do not imply website dossier, queue, or payment integrations are live unless explicitly stated in context.\n"
-            "Do not publish or relay anything automatically.\n"
-            f"{ops_context}\n"
-            f"Operator request: {clean_content}"
-        )
-        response = await get_gemini_response(ops_prompt, message.author.id, message.guild.id, route="internal_operations_brief")
-        if not response:
-            response = "Current status: I can help with internal operations, but I hit a temporary sync issue. Please retry in a moment."
+
+        response = ""
+        suggested_lane = "#research-and-development"
+        if rd_intent == "broadcast_memory_draft":
+            response = build_rd_broadcast_memory_draft_response(clean_content, previous_rd_context)
+            suggested_lane = "#bnl-broadcast-memory"
+        elif rd_intent == "implementation_guidance":
+            response = build_rd_implementation_guidance_response(clean_content, previous_rd_context)
+            suggested_lane = "#bnl-broadcast-memory"
+        elif rd_intent == "dossier_seed_draft":
+            response = build_rd_dossier_seed_response(clean_content, previous_rd_context)
+            suggested_lane = "#research-and-development"
+        elif rd_intent == "public_safe_message":
+            response = build_rd_public_safe_message_response(clean_content, previous_rd_context)
+            suggested_lane = "public-safe announcement draft"
+        elif rd_intent == "action_items":
+            response = build_rd_action_items_response(clean_content, previous_rd_context)
+            suggested_lane = "#research-and-development"
+        elif rd_intent == "recap_candidate":
+            response = build_rd_recap_candidate_response(clean_content, previous_rd_context)
+            suggested_lane = "recap candidate"
+        else:
+            ops_context = build_operations_brief_context(message.guild.id, clean_content)
+            ops_prompt = (
+                "This is an internal BARCODE operations answer.\n"
+                "Be plain, useful, short, and action-oriented.\n"
+                "Keep it usually under 8 short lines unless the user asks for depth.\n"
+                "Use this structure only because the operator did not ask for a concrete draft: Current status / What matters / Suggested next actions / Optional Do not do yet.\n"
+                "If the request asks for exact prompt, exact note, copy-paste text, draft, public post, broadcast-memory entry, dossier seed, action items, implementation lane, or knowledge-base instructions, do not use this generic structure; provide that artifact instead.\n"
+                "Do not say you are not configured to draft a non-mutating prompt. You may draft notes operators paste manually into the correct lane.\n"
+                "Do not write a lore monologue.\n"
+                "Do not expose raw database rows, raw notes, or restricted internal details.\n"
+                "Do not convert research-and-development operations discussion into canon.\n"
+                "Do not imply website dossier, queue, or payment integrations are live unless explicitly stated in context.\n"
+                "Do not publish, relay, or write broadcast memory automatically.\n"
+                f"Detected R&D intent: {rd_intent}.\n"
+                f"{ops_context}\n"
+                f"Operator request: {clean_content}"
+            )
+            response = await get_gemini_response(ops_prompt, message.author.id, message.guild.id, route="internal_operations_brief")
+            if not response:
+                response = "Current status: I can help with internal operations, but I hit a temporary sync issue. Please retry in a moment."
+
         if len(response) <= 2000:
             await message.reply(response)
         else:
@@ -8495,8 +8796,23 @@ async def on_message(message: discord.Message):
             await message.reply(chunks[0] + "...")
             for chunk in chunks[1:]:
                 await message.channel.send("..." + chunk)
+        _remember_rd_ops_context(
+            message,
+            clean_content,
+            rd_intent,
+            _extract_rd_subject(clean_content, previous_rd_context),
+            suggested_lane,
+            _rd_response_summary_for_context(response),
+        )
         _mark_recent_direct_response(message.channel.id, message.author.id)
         return
+
+    if real_direct_target and is_public_prompt_context(channel_policy):
+        public_rd_intent = detect_rd_ops_intent(clean_content)
+        if public_rd_intent in {"broadcast_memory_draft", "implementation_guidance", "dossier_seed_draft", "recap_candidate"}:
+            await message.reply("Broadcast-memory and dossier preparation are operator workflows. Use #research-and-development to draft the note, then #bnl-broadcast-memory is the official intake lane if an operator approves it.")
+            _mark_recent_direct_response(message.channel.id, message.author.id)
+            return
 
     session_key = _direct_session_key(message)
     active_direct_session = _direct_payload_sessions.get(session_key)
