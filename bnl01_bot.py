@@ -750,6 +750,9 @@ def build_bnl_read_model_context(read_model: dict, user_text: str, channel_polic
         "Website public read model context:",
         f"Source: {_compact_public_text(source_context.get('source') or 'barcode-network-site', 80)} / publicOnly=true / version=1",
     ]
+    schema_revision = _compact_public_text(read_model.get("schemaRevision"), 40)
+    if schema_revision:
+        lines[-1] += f" / schemaRevision={schema_revision}"
 
     if queue:
         session = _first_mapping(queue.get("session"), queue.get("currentSession"))
@@ -864,6 +867,12 @@ def build_bnl_read_model_context(read_model: dict, user_text: str, channel_polic
         rule_text = _compact_public_text(rule, 160)
         if rule_text:
             lines.append(f"- {rule_text}")
+    operator_lanes = _website_operator_lanes(read_model)
+    lane_rules = _format_operator_lane_items(operator_lanes.get("doNotStore", []), limit=5) if operator_lanes else []
+    if lane_rules:
+        lines.append("\nSite lane rules:")
+        for rule in lane_rules[:5]:
+            lines.append(f"- {rule}")
     lines.extend([
         "- This is public website context only.",
         "- Do not treat this as durable memory.",
@@ -910,13 +919,17 @@ def get_bnl_read_model_diagnostic_state() -> dict:
     if _bnl_read_model_cached_at:
         cache_age = int((datetime.now(PACIFIC_TZ) - _bnl_read_model_cached_at).total_seconds())
     section_counts = _bnl_read_model_section_counts(_bnl_read_model_cache or {}) if _bnl_read_model_cache else {}
+    operator_lanes = _website_operator_lanes(_bnl_read_model_cache or {}) if _bnl_read_model_cache else {}
+    operator_lane_counts = {key: len(operator_lanes.get(key, [])) for key in _OPERATOR_LANE_KEYS} if operator_lanes else {}
     return {
         "enabled": bool(BNL_READ_MODEL_ENABLED and BNL_READ_MODEL_URL),
         "url_configured": bool(BNL_READ_MODEL_URL),
         "cache_present": bool(_bnl_read_model_cache),
         "cache_age_seconds": cache_age,
         "ttl_seconds": BNL_READ_MODEL_TTL_SECONDS,
+        "schemaRevision": (_bnl_read_model_cache or {}).get("schemaRevision") if _bnl_read_model_cache else None,
         "last_section_counts": section_counts,
+        "operatorLaneCounts": operator_lane_counts,
         "rd_classifier_enabled": True,
     }
 
@@ -999,6 +1012,88 @@ def _website_read_model_artists(read_model: dict) -> list:
     return _first_list(artists_map.get("items"), artists_map.get("artists"), artists_section if isinstance(artists_section, list) else [])
 
 
+_OPERATOR_LANE_KEYS = (
+    "temporaryRuntimeContext",
+    "recapCandidates",
+    "broadcastMemoryCandidates",
+    "dossierSeedCandidates",
+    "publicSafeCopyCandidates",
+    "doNotStore",
+)
+
+
+def _website_operator_lanes(read_model: dict) -> dict:
+    sections = _read_model_sections(read_model)
+    operator_lanes = sections.get("operatorLanes")
+    if not isinstance(operator_lanes, dict):
+        return {}
+    lanes = {}
+    for key in _OPERATOR_LANE_KEYS:
+        value = operator_lanes.get(key)
+        lanes[key] = value if isinstance(value, list) else []
+    return lanes
+
+
+def _operator_lane_public_value(item: dict, key: str):
+    if not isinstance(item, dict):
+        return None
+    value = item.get(key)
+    if value is None or value == "":
+        bnl_context = item.get("bnlContext")
+        if isinstance(bnl_context, dict):
+            value = bnl_context.get(key)
+    if isinstance(value, (dict, list, tuple, set)):
+        return None
+    return value
+
+
+def _format_operator_lane_items(items: list, limit: int = 6) -> list:
+    formatted = []
+    if not isinstance(items, list):
+        return formatted
+    for item in items:
+        if len(formatted) >= limit:
+            break
+        if not isinstance(item, dict):
+            continue
+        label = _compact_public_text(_operator_lane_public_value(item, "label"), 120)
+        value = _compact_public_text(_operator_lane_public_value(item, "value"), 140)
+        kind = _compact_public_text(_operator_lane_public_value(item, "kind"), 50)
+        status = _compact_public_text(_operator_lane_public_value(item, "status"), 50)
+        reason = _compact_public_text(_operator_lane_public_value(item, "reason"), 180)
+        subject = label or value
+        if not subject:
+            continue
+        bits = []
+        if kind:
+            bits.append(kind)
+        if status:
+            bits.append(status)
+        text = subject
+        if bits:
+            text += f" ({', '.join(bits)})"
+        if reason:
+            text += f" — {reason}"
+        elif value and value != subject:
+            text += f": {value}"
+        formatted.append(text)
+    return formatted
+
+
+def _append_operator_lane_lines(lines: list, items: list, empty: str, limit: int = 6):
+    formatted = _format_operator_lane_items(items, limit=limit)
+    if formatted:
+        for text in formatted:
+            lines.append(f"- {text}")
+    else:
+        lines.append(f"- {empty}")
+
+
+def _operator_lane_text(item: dict) -> str:
+    formatted = _format_operator_lane_items([item], limit=1)
+    return formatted[0] if formatted else ""
+
+
 def _read_model_unavailable_message() -> str:
     if not BNL_READ_MODEL_URL:
         return "Website read model is unavailable: `BNL_READ_MODEL_URL` is not configured. No website context was stored, relayed, or mutated."
@@ -1031,10 +1126,36 @@ def _website_public_dossier_lines(read_model: dict, limit: int = 4) -> list:
 
 
 def build_website_read_model_classifier_response(read_model: dict, request_text: str) -> str:
+    operator_lanes = _website_operator_lanes(read_model)
+    if operator_lanes and any(operator_lanes.get(key) for key in _OPERATOR_LANE_KEYS):
+        lines = [
+            "Website/site classification:",
+            "",
+            "Temporary runtime context:",
+        ]
+        _append_operator_lane_lines(lines, operator_lanes.get("temporaryRuntimeContext", []), "No site-provided temporary runtime context is present.", limit=8)
+        lines.extend(["", "Recap candidates:"])
+        _append_operator_lane_lines(lines, operator_lanes.get("recapCandidates", []), "No site-provided recap candidates are present.", limit=8)
+        lines.extend(["", "Broadcast-memory candidates:"])
+        _append_operator_lane_lines(lines, operator_lanes.get("broadcastMemoryCandidates", []), "No site-provided broadcast-memory candidate is present.", limit=6)
+        lines.extend(["", "Possible dossier seeds:"])
+        _append_operator_lane_lines(lines, operator_lanes.get("dossierSeedCandidates", []), "No site-provided dossier seed candidate is present.", limit=6)
+        lines.extend(["", "Public-safe copy candidates:"])
+        _append_operator_lane_lines(lines, operator_lanes.get("publicSafeCopyCandidates", []), "No site-provided public-safe copy candidate is present.", limit=6)
+        lines.extend(["", "Do not store / do not do yet:"])
+        _append_operator_lane_lines(lines, operator_lanes.get("doNotStore", []), "No site-provided do-not-store lane rules are present.", limit=8)
+        lines.extend([
+            "",
+            "Boundary:",
+            "- Used site-provided operator lanes as the primary source; no extra candidates were invented from raw queue lists.",
+            "- No memory write, dossier creation, queue/site/relay mutation, payment handling, identity merge, or canon promotion happened.",
+        ])
+        return "\n".join(lines)
+
     queued_tracks, completed_tracks = _website_read_model_track_lists(read_model)
     dossiers = _website_public_dossier_lines(read_model)
     artists = _website_read_model_artists(read_model)
-    lines = ["Website read-model classification:", "", "Temporary runtime context:"]
+    lines = ["Website read-model classification (fallback inference; no site-provided operator lanes were available):", "", "Temporary runtime context:"]
     for bit in _website_read_model_status_bits(read_model)[:8]:
         lines.append(f"- {bit}")
     if queued_tracks:
@@ -1071,9 +1192,10 @@ def build_website_read_model_classifier_response(read_model: dict, request_text:
     return "\n".join(lines)
 
 
+
 def _website_broadcast_memory_candidate_type(candidate_text: str) -> str:
     text = (candidate_text or "").lower()
-    if any(word in text for word in ("arc", "storyline", "ongoing", "recurring", "antagonist", "entity event")):
+    if any(word in text for word in ("arc", "storyline", "ongoing", "recurring", "antagonist", "entity event", "protocol breach", "shutdown", "breach")):
         return "episode_arc"
     return "notable_moment"
 
@@ -1122,15 +1244,57 @@ def _website_dossier_broadcast_candidate(read_model: dict) -> str:
 
 
 def build_website_broadcast_memory_candidate_response(read_model: dict, request_text: str) -> str:
+    operator_lanes = _website_operator_lanes(read_model)
+    if operator_lanes:
+        candidates = [item for item in operator_lanes.get("broadcastMemoryCandidates", []) if isinstance(item, dict)]
+        if not candidates:
+            return ("Broadcast-memory candidates from website read model:\n\n"
+                    "No site-provided broadcast-memory candidate is present. Completed tracks may be recap candidates, but ordinary queue history should not become broadcast memory without operator confirmation.\n\n"
+                    "Boundary: no memory write, broadcast-memory intake, user fact, queue/site mutation, relay mutation, or canon promotion happened.")
+        today = datetime.now(PACIFIC_TZ).strftime("%Y-%m-%d")
+        lines = ["Broadcast-memory candidates from website read model:", ""]
+        for idx, item in enumerate(candidates[:3], start=1):
+            candidate = _operator_lane_text(item)
+            if not candidate:
+                continue
+            note_type = _website_broadcast_memory_candidate_type(candidate)
+            lines.extend([
+                f"Candidate {idx}:",
+                "Why it may matter:",
+                f"- {candidate}",
+                "- Source: site-provided operatorLanes.broadcastMemoryCandidates; still requires operator approval.",
+                "",
+                "Copy-paste into #bnl-broadcast-memory if approved:",
+                "",
+                "```text",
+                "Broadcast memory note",
+                f"Title: Website public context candidate — {_safe_truncate_summary(candidate, 70)}",
+                f"Date: {today}",
+                f"Type: {note_type}",
+                "Public-safe: yes",
+                "Usage: direct, ambient",
+                "",
+                "Summary:",
+                candidate,
+                "",
+                "Boundaries:",
+                "This came from the public website read model operator-lane hints. It is not a private account record, payment record, Discord identity mapping, queue mutation, or website relay instruction. It remains a draft until an operator pastes it into #bnl-broadcast-memory.",
+                "```",
+                "",
+            ])
+        if len(lines) <= 2:
+            lines.append("No site-provided broadcast-memory candidate is present after public-safe formatting.")
+        return "\n".join(lines).rstrip()
+
     candidate = _website_status_broadcast_candidate(read_model) or _website_dossier_broadcast_candidate(read_model)
     if not candidate:
-        return ("Broadcast-memory candidates from website read model:\n\n"
+        return ("Broadcast-memory candidates from website read model (fallback inference; no site-provided operator lanes were available):\n\n"
                 "No strong broadcast-memory candidate found. Completed tracks may be recap candidates, but ordinary queue history should not become broadcast memory without operator confirmation.\n\n"
                 "Boundary: no memory write, broadcast-memory intake, user fact, queue/site mutation, relay mutation, or canon promotion happened.")
     today = datetime.now(PACIFIC_TZ).strftime("%Y-%m-%d")
     note_type = _website_broadcast_memory_candidate_type(candidate)
     return (
-        "Broadcast-memory candidates from website read model:\n\n"
+        "Broadcast-memory candidates from website read model (fallback inference; no site-provided operator lanes were available):\n\n"
         "Candidate 1:\n"
         "Why it may matter:\n"
         f"- {candidate}\n"
@@ -1151,15 +1315,39 @@ def build_website_broadcast_memory_candidate_response(read_model: dict, request_
     )
 
 
+
 def build_website_dossier_seed_candidate_response(read_model: dict, request_text: str) -> str:
+    operator_lanes = _website_operator_lanes(read_model)
     dossiers = _website_public_dossier_lines(read_model)
+    if operator_lanes:
+        lines = ["Possible dossier seeds from website read model:", ""]
+        if dossiers:
+            lines.append("Existing public dossier summaries (not seeds):")
+            for d in dossiers[:4]:
+                lines.append(f"- {d}")
+            lines.append("")
+        seeds = operator_lanes.get("dossierSeedCandidates", [])
+        formatted = _format_operator_lane_items(seeds, limit=6)
+        if formatted:
+            lines.append("Site-provided possible seeds (seed only / not live dossier):")
+            for seed in formatted:
+                lines.append(f"- {seed}")
+            lines.extend(["", "Boundary:", "- Seed only / not live dossier. No profile, account merge, Discord identity mapping, payment identity, or website dossier was created."])
+        else:
+            lines.extend([
+                "No site-provided dossier seed candidate is present.",
+                "Queue-derived artist surfaces are not profiles and are not dossier seeds by default.",
+                "Existing public dossiers, if listed above, remain existing public dossiers rather than new seeds.",
+            ])
+        return "\n".join(lines).rstrip()
+
     artists = []
     for artist in _website_read_model_artists(read_model)[:4]:
         if isinstance(artist, dict):
             name = _compact_public_text(artist.get("name") or artist.get("artistName"), 80)
             if name:
                 artists.append(name)
-    lines = ["Possible dossier seeds from website read model:", ""]
+    lines = ["Possible dossier seeds from website read model (fallback inference; no site-provided operator lanes were available):", ""]
     if dossiers:
         lines.append("Existing public dossier summaries (not seeds):")
         for d in dossiers[:4]:
@@ -1190,9 +1378,20 @@ def build_website_dossier_seed_candidate_response(read_model: dict, request_text
     return "\n".join(lines).rstrip()
 
 
+
 def build_website_recap_candidate_response(read_model: dict, request_text: str) -> str:
+    operator_lanes = _website_operator_lanes(read_model)
+    if operator_lanes:
+        lines = ["Website/queue recap candidates:", "", "Site-provided recap candidates:"]
+        _append_operator_lane_lines(lines, operator_lanes.get("recapCandidates", []), "No site-provided recap candidates are present.", limit=8)
+        lines.extend(["", "Boundary:",
+            "- Uses operatorLanes.recapCandidates as the source; active/up-next/queued items remain runtime only unless the site lane marks them otherwise.",
+            "- Confirm final played/completed status and any operator-approved show outcome before publishing a recap.",
+        ])
+        return "\n".join(lines)
+
     queued_tracks, completed_tracks = _website_read_model_track_lists(read_model)
-    lines = ["Website/queue recap candidates:", "", "Likely recap items:"]
+    lines = ["Website/queue recap candidates (fallback inference; no site-provided operator lanes were available):", "", "Likely recap items:"]
     _append_items(lines, completed_tracks, "No completed/played public items are exposed right now.", limit=6)
     lines.extend(["", "Maybe recap items:"])
     if _website_public_dossier_lines(read_model):
@@ -1210,10 +1409,29 @@ def build_website_recap_candidate_response(read_model: dict, request_text: str) 
     return "\n".join(lines)
 
 
+
 def build_website_public_safe_candidate_response(read_model: dict, request_text: str) -> str:
+    operator_lanes = _website_operator_lanes(read_model)
+    if operator_lanes:
+        candidates = _format_operator_lane_items(operator_lanes.get("publicSafeCopyCandidates", []), limit=6)
+        lines = ["Public-safe website/site copy candidate:", ""]
+        if candidates:
+            lines.extend(["Site-provided public-safe copy source:", "```text", "Public site/queue update:"])
+            for candidate in candidates[:5]:
+                lines.append(f"- {candidate}")
+            lines.extend(["```", "", "Boundary:",
+                "- Draft only. Uses site-provided operatorLanes.publicSafeCopyCandidates; no internal R&D details, private data, payment facts, admin simulation data, or claim of private BNL access.",
+            ])
+        else:
+            lines.extend([
+                "No site-provided public-safe copy candidate is present.",
+                "Boundary: no copy was inferred from raw queue history because operator lanes are present and did not mark a copy candidate.",
+            ])
+        return "\n".join(lines)
+
     queued_tracks, completed_tracks = _website_read_model_track_lists(read_model)
     status_bits = _website_read_model_status_bits(read_model)[:4]
-    lines = ["Public-safe website/site copy candidate:", "", "Draft:", "```text"]
+    lines = ["Public-safe website/site copy candidate (fallback inference; no site-provided operator lanes were available):", "", "Draft:", "```text"]
     lines.append("Public site/queue update:")
     if status_bits:
         lines.append("- " + "; ".join(status_bits))
@@ -1228,6 +1446,7 @@ def build_website_public_safe_candidate_response(read_model: dict, request_text:
         "- Draft only. Uses public site/queue context; no internal R&D details, private data, payment facts, admin simulation data, or claim of private BNL access.",
     ])
     return "\n".join(lines)
+
 
 
 def build_website_read_model_intent_response(intent: str, request_text: str) -> str:
