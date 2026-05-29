@@ -685,11 +685,36 @@ def _compact_public_text(value, limit: int = 140) -> str:
     return _safe_truncate_summary(text, limit)
 
 
+def _first_present_value(mapping: dict, keys) -> object:
+    if not isinstance(mapping, dict):
+        return None
+    for key in keys:
+        value = mapping.get(key)
+        if value is not None and value != "":
+            return value
+    return None
+
+
 def _track_label(track: dict, include_lane: bool = True, include_source: bool = False) -> str:
     if not isinstance(track, dict):
         return ""
-    artist = _compact_public_text(track.get("artist") or track.get("artistName") or track.get("artist_name") or track.get("name"), 80)
-    title = _compact_public_text(track.get("title") or track.get("trackTitle") or track.get("track_title") or track.get("songTitle"), 90)
+    artist = _compact_public_text(_first_present_value(track, (
+        "detectedArtistName",
+        "submittedArtistName",
+        "artist",
+        "artistName",
+        "artist_name",
+        "name",
+    )), 80)
+    title = _compact_public_text(_first_present_value(track, (
+        "detectedSongTitle",
+        "submittedSongTitle",
+        "providerTitle",
+        "title",
+        "trackTitle",
+        "track_title",
+        "songTitle",
+    )), 90)
     label = " — ".join(part for part in (artist, title) if part)
     if not label:
         label = _compact_public_text(track.get("label") or track.get("displayName"), 120)
@@ -736,15 +761,26 @@ def build_bnl_read_model_context(read_model: dict, user_text: str, channel_polic
         completed_tracks = _first_list(queue.get("completedTracks"), queue.get("completed"), queue.get("playedTracks"))
         lines.append("\nQueue:")
         session_bits = []
-        for label, key in (("Session", "title"), ("showDate", "showDate"), ("status", "status"), ("queueOpen", "queueOpen"), ("phase", "phase")):
-            value = session.get(key) if session else status.get(key)
+        session_field_specs = (
+            ("Session", ("title",)),
+            ("showDate", ("showDate",)),
+            ("status", ("status",)),
+            ("queueOpen", ("queueOpen",)),
+            ("phase", ("broadcastPhase", "phase")),
+        )
+        for label, keys in session_field_specs:
+            value = _first_present_value(session, keys)
+            if value is None:
+                value = _first_present_value(status, keys)
             if value is not None and value != "":
                 session_bits.append(f"{label}={_compact_public_text(value, 80)}")
         if session_bits:
             lines.append("- " + ", ".join(session_bits))
         status_bits = []
-        for key in ("activeCount", "capacity", "pressure"):
+        for key in ("activeCount", "completedCount", "removedCount", "capacity", "pressure"):
             value = status.get(key)
+            if value is None or value == "":
+                value = session.get(key)
             if value is not None and value != "":
                 status_bits.append(f"{key}={_compact_public_text(value, 40)}")
         if status_bits:
@@ -755,13 +791,24 @@ def build_bnl_read_model_context(read_model: dict, user_text: str, channel_polic
         next_label = _track_label(up_next)
         if next_label:
             lines.append(f"- Up next: {next_label}")
-        wheel_spins = queue.get("wheelSpinsOwed") if queue.get("wheelSpinsOwed") is not None else status.get("wheelSpinsOwed")
+        wheel_spins = _first_present_value(queue, ("wheelSpinsOwed",))
+        if wheel_spins is None:
+            wheel_spins = _first_present_value(status, ("wheelSpinsOwed",))
+        if wheel_spins is None:
+            wheel_spins = _first_present_value(session, ("wheelSpinsOwed",))
         if wheel_spins is not None:
             lines.append(f"- Wheel spins owed: {_compact_public_text(wheel_spins, 30)}")
-        if priority_signal:
-            enabled = priority_signal.get("enabled")
-            label = _compact_public_text(priority_signal.get("label") or priority_signal.get("name"), 80)
-            lines.append(f"- Priority Signal: enabled={enabled if enabled is not None else 'unknown'}" + (f", label={label}" if label else ""))
+        priority_enabled = priority_signal.get("enabled") if priority_signal else None
+        priority_label = _compact_public_text(
+            _first_present_value(priority_signal, ("label", "name")) if priority_signal else None,
+            80,
+        )
+        if priority_enabled is None:
+            priority_enabled = _first_present_value(session, ("priorityUpgradesEnabled",))
+        if not priority_label:
+            priority_label = _compact_public_text(_first_present_value(session, ("priorityUpgradeLabel",)), 80)
+        if priority_signal or priority_enabled is not None or priority_label:
+            lines.append(f"- Priority Signal: enabled={priority_enabled if priority_enabled is not None else 'unknown'}" + (f", label={priority_label}" if priority_label else ""))
         if queued_tracks:
             lines.append("\nQueued tracks:")
             for track in queued_tracks[:8]:
@@ -793,7 +840,13 @@ def build_bnl_read_model_context(read_model: dict, user_text: str, channel_polic
                 lines.append(f"- {name}: {', '.join(track_titles) if track_titles else 'public artist context present'}")
 
     dossiers_section_map = dossiers_section if isinstance(dossiers_section, dict) else {}
-    dossiers = _first_list(dossiers_section_map.get("items"), dossiers_section_map.get("dossiers"), dossiers_section_map.get("publicDossiers"), dossiers_section if isinstance(dossiers_section, list) else [])
+    dossiers = _first_list(
+        dossiers_section_map.get("items"),
+        dossiers_section_map.get("public"),
+        dossiers_section_map.get("dossiers"),
+        dossiers_section_map.get("publicDossiers"),
+        dossiers_section if isinstance(dossiers_section, list) else [],
+    )
     if dossiers:
         lines.append("\nPublic dossiers:")
         for dossier in dossiers[:8]:
