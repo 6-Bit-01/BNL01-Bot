@@ -3219,6 +3219,22 @@ def _rd_event_sentence(text: str, subject: str) -> str:
     return f"{subject} was raised by operators as a possible broadcast-memory item."
 
 
+def _infer_broadcast_memory_type(text: str, subject: str) -> str:
+    combined = (text or "").lower()
+    if subject.lower() == "signal witch" or any(k in combined for k in (
+        "shutdown arc", "protocol-breach arc", "protocol breach", "storyline",
+        "antagonistic outside voice", "episode arc", "breaking barcode network protocol",
+    )):
+        return "episode_arc"
+    if "running joke" in combined:
+        return "running_joke"
+    if any(k in combined for k in ("timeout", "ban", "moderation")):
+        return "moderation_context"
+    if any(k in combined for k in ("queue failed", "technical issue", "bug", "crash", "latency")):
+        return "technical_issue"
+    return "notable_moment"
+
+
 def _build_broadcast_memory_note(text: str, previous_context=None) -> str:
     previous_text = " ".join((entry.get("user_request") or "") for entry in (previous_context or [])[-2:])
     combined = (previous_text + " " + (text or "")).strip()
@@ -3226,26 +3242,32 @@ def _build_broadcast_memory_note(text: str, previous_context=None) -> str:
     if subject == "this item":
         subject = _extract_rd_subject(combined, previous_context)
     note_date = _rd_note_date(combined)
-    event_sentence = _rd_event_sentence(combined, subject)
-    protocol_arc = ""
-    if re.search(r"2026-05-22|broadcast-control breach|protocol breach|breaking barcode network protocol|breaking protocol", combined, flags=re.IGNORECASE):
-        protocol_arc = " after the 2026-05-22 broadcast-control/protocol breach"
+    event_sentence = _rd_event_sentence(combined, subject).rstrip(" .") + "."
+    note_type = _infer_broadcast_memory_type(combined, subject)
+    public_safe = "no" if re.search(r"\b(private|dm|doxx|secret|leak)\b", combined, flags=re.IGNORECASE) else "yes"
+    usage = "internal" if public_safe == "no" else "direct, ambient"
     if subject.lower() == "signal witch":
-        body = (
-            f"Broadcast memory note — Signal Witch / {note_date}\n\n"
-            f"Signal Witch has entered the current BARCODE Radio shutdown/protocol-breach arc as an antagonistic outside voice. "
-            f"{event_sentence.rstrip('.')}{protocol_arc}.\n\n"
-            "Treat Signal Witch as a current broadcast-memory entity connected to the cancellation/protocol-breach storyline. "
-            "Do not treat this as a live website dossier, queue integration, account identity, or public relay instruction yet."
+        summary = (
+            "Signal Witch entered the current BARCODE Radio shutdown/protocol-breach arc as an antagonistic outside voice. "
+            f"{event_sentence}"
         )
+        if re.search(r"2026-05-22|broadcast-control breach|protocol breach|breaking barcode network protocol|breaking protocol", combined, flags=re.IGNORECASE) and "2026-05-22" not in summary:
+            summary = summary.rstrip(".") + " after the 2026-05-22 broadcast-control/protocol breach."
     else:
-        body = (
-            f"Broadcast memory note — {subject} / {note_date}\n\n"
-            f"{event_sentence}\n\n"
-            "Treat this as an official broadcast-memory note only after it is posted in #bnl-broadcast-memory. "
-            "Do not treat it as a live website dossier, queue integration, account identity, or public relay instruction yet."
-        )
-    return body
+        summary = event_sentence
+    return (
+        "Broadcast memory note\n"
+        f"Title: {subject}\n"
+        f"Date: {note_date}\n"
+        f"Type: {note_type}\n"
+        f"Public-safe: {public_safe}\n"
+        f"Usage: {usage}\n\n"
+        "Summary:\n"
+        f"{summary}\n\n"
+        "Boundaries:\n"
+        "This is broadcast memory only. It is not a live website dossier, account identity, public relay instruction, "
+        "queue/runtime integration, payment integration, or Discord Radio tracking instruction."
+    )
 
 
 def build_rd_broadcast_memory_draft_response(text: str, previous_context=None) -> str:
@@ -3262,15 +3284,9 @@ def build_rd_implementation_guidance_response(text: str, previous_context=None) 
     return (
         "This belongs in `#bnl-broadcast-memory` as an official broadcast-memory note if you want BNL to remember it. "
         "If it stays only in `#research-and-development`, it remains R&D discussion and does not become official memory.\n\n"
-        "Copy-paste this into `#bnl-broadcast-memory`:\n\n"
+        "Copy-paste into #bnl-broadcast-memory:\n\n"
         f"```text\n{note}\n```\n\n"
-        "Optional next steps:\n"
-        "- Keep a dossier seed in R&D if the entity needs tracking later.\n"
-        "- Mark it as a recap candidate if it becomes part of the public episode arc.\n\n"
-        "Do not do yet:\n"
-        "- Do not treat this as a live website dossier.\n"
-        "- Do not connect it to queue, runtime, payment, account, or Discord Radio systems.\n"
-        "- Do not make it a public relay item unless separately approved."
+        "After posting that there, BNL can treat it as official broadcast memory if intake accepts it."
     )
 
 
@@ -4758,6 +4774,164 @@ def get_latest_broadcast_episode_date(guild_id: int, public_only: bool = False, 
     conn.close()
     return row[0] if row and row[0] else None
 
+
+BROADCAST_MEMORY_ALLOWED_TYPES = {
+    "episode_arc", "notable_moment", "running_joke", "technical_issue",
+    "moderation_context", "show_state_override",
+}
+BROADCAST_MEMORY_ALLOWED_USAGES = {"direct", "ambient", "show_status", "relay", "internal"}
+BROADCAST_MEMORY_COMMON_QUERY_WORDS = {
+    "show", "memory", "broadcast", "info", "anything", "who", "what", "why", "about",
+    "important", "know", "tell", "me", "any", "the", "a", "an", "is", "are", "on",
+    "barcode", "radio", "bnl", "bnl-01",
+}
+
+
+def _parse_usage_scope(value: str, public_safe: bool) -> str:
+    parts = []
+    for item in re.split(r"[,/;]+|\band\b", value or ""):
+        token = item.strip().lower().replace(" ", "_")
+        if not token or token not in BROADCAST_MEMORY_ALLOWED_USAGES:
+            continue
+        if token == "relay" and not public_safe:
+            continue
+        if token == "internal" and public_safe:
+            continue
+        if token not in parts:
+            parts.append(token)
+    if parts:
+        return ",".join(parts)
+    return "ambient,direct" if public_safe else "internal"
+
+
+def _strip_broadcast_memory_boundary_text(text: str) -> str:
+    raw = text or ""
+    without_sections = re.sub(r"\bBoundar(?:y|ies):.*?(?=(?:\n\s*\w[\w -]{0,40}:)|\Z)", " ", raw, flags=re.IGNORECASE | re.DOTALL)
+    pieces = re.split(r"(?<=[.!?])\s+|\n+", without_sections)
+    boundary_starts = (
+        "do not treat this as", "do not connect this to", "this is not", "not a live",
+        "boundary:", "boundaries:",
+    )
+    kept = []
+    ignored = False
+    for piece in pieces:
+        stripped = piece.strip()
+        if not stripped:
+            continue
+        if stripped.lower().startswith(boundary_starts):
+            ignored = True
+            continue
+        kept.append(stripped)
+    if ignored or without_sections != raw:
+        logging.info("broadcast_memory_classifier_boundary_ignored")
+    return " ".join(kept)
+
+
+def _parse_structured_broadcast_memory_note(raw_text: str) -> dict:
+    original = raw_text or ""
+    if "broadcast memory note" not in original.lower():
+        return {}
+    fields = {}
+    header_match = re.search(r"^\s*Broadcast memory note\s*$", original, flags=re.IGNORECASE | re.MULTILINE)
+    required_labels = ("title", "type", "public-safe", "usage", "summary", "boundaries")
+    if not header_match or not all(re.search(rf"^\s*{re.escape(label)}\s*:", original, flags=re.IGNORECASE | re.MULTILINE) for label in required_labels):
+        return {}
+    logging.info("broadcast_memory_structured_note_detected")
+    for label in ("Title", "Date", "Type", "Public-safe", "Usage"):
+        match = re.search(rf"^\s*{re.escape(label)}\s*:\s*(.*?)\s*$", original, flags=re.IGNORECASE | re.MULTILINE)
+        if match:
+            fields[label.lower()] = match.group(1).strip()
+    for label in ("Summary", "Boundaries"):
+        match = re.search(rf"^\s*{re.escape(label)}\s*:\s*(.*?)(?=^\s*\w[\w -]{{0,40}}\s*:|\Z)", original, flags=re.IGNORECASE | re.MULTILINE | re.DOTALL)
+        if match:
+            fields[label.lower()] = match.group(1).strip()
+    return fields
+
+
+def extract_broadcast_memory_query_terms(text: str) -> list[str]:
+    raw = re.sub(r"<@!?\d+>", " ", text or "").strip()
+    if not raw:
+        return []
+    patterns = [
+        r"\b(?:do you have any info on|any info on|info on)\s+(.+)",
+        r"\b(?:do you know anything about|what do you know about|know about|tell me about)\s+(.+)",
+        r"\b(?:who(?:\s+is|'s|’s)|what(?:\s+is|'s|’s)|why\s+is)\s+(.+?)(?:\s+important)?\s*$",
+        r"\babout\s+(.+)",
+        r"\bon\s+(.+)",
+    ]
+    candidates = []
+    for pattern in patterns:
+        match = re.search(pattern, raw, flags=re.IGNORECASE)
+        if match:
+            candidates.append(match.group(1))
+    caps = re.findall(r"\b[A-Z][A-Za-z0-9]*(?:\s+[A-Z0-9][A-Za-z0-9]*){0,4}\b", raw)
+    candidates.extend(caps)
+    terms = []
+    for candidate in candidates:
+        cleaned = re.sub(r"[?!.,;:]+$", "", candidate.strip())
+        cleaned = re.sub(r"\s+", " ", cleaned)
+        words = cleaned.split()
+        while words and words[-1].lower() in BROADCAST_MEMORY_COMMON_QUERY_WORDS.union({"please", "thanks"}):
+            words.pop()
+        while words and words[0].lower() in BROADCAST_MEMORY_COMMON_QUERY_WORDS:
+            words.pop(0)
+        cleaned = " ".join(words[:5]).strip(" '\"“”‘’")
+        if not cleaned:
+            continue
+        if cleaned.lower() in BROADCAST_MEMORY_COMMON_QUERY_WORDS:
+            continue
+        if len(cleaned) < 3:
+            continue
+        if cleaned.lower() not in [t.lower() for t in terms]:
+            terms.append(cleaned)
+        if len(terms) >= 3:
+            break
+    return terms
+
+
+def get_matching_broadcast_memory_entries(guild_id: int, terms: list[str], public_only: bool = True, limit: int = 5) -> list[dict]:
+    clean_terms = [t.strip().lower() for t in (terms or []) if t and len(t.strip()) >= 3]
+    if not clean_terms:
+        return []
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    query = """
+        SELECT id, episode_date, cleaned_summary, entry_type, importance, public_safe, usage_scope, created_at, raw_note
+        FROM broadcast_memory
+        WHERE guild_id=? AND status='active'
+    """
+    params = [guild_id]
+    if public_only:
+        query += " AND public_safe=1 AND (instr(',' || ifnull(usage_scope, '') || ',', ',direct,') > 0 OR instr(',' || ifnull(usage_scope, '') || ',', ',ambient,') > 0)"
+    query += " ORDER BY id DESC LIMIT 100"
+    cursor.execute(query, tuple(params))
+    rows = cursor.fetchall()
+    conn.close()
+    matches = []
+    seen = set()
+    for row in rows:
+        row_id, episode_date, cleaned_summary, entry_type, importance, public_safe, usage_scope, created_at, raw_note = row
+        searchable = f"{cleaned_summary or ''}\n{raw_note or ''}".lower()
+        if not any(term in searchable for term in clean_terms):
+            continue
+        if row_id in seen:
+            continue
+        seen.add(row_id)
+        matches.append({
+            "id": row_id,
+            "episode_date": episode_date,
+            "cleaned_summary": cleaned_summary or "",
+            "entry_type": entry_type or "notable_moment",
+            "importance": importance or "medium",
+            "public_safe": bool(public_safe),
+            "usage_scope": usage_scope or "",
+            "created_at": created_at,
+        })
+        if len(matches) >= limit:
+            break
+    logging.info(f"broadcast_memory_entity_match count={len(matches)} public_only={bool(public_only)}")
+    return matches
+
 def _is_broadcast_memory_relevant(text: str) -> bool:
     t = (text or "").lower()
     return any(k in t for k in (
@@ -4792,14 +4966,45 @@ def _is_show_state_status_query(text: str) -> bool:
     return False
 
 def build_broadcast_memory_context(guild_id: int, user_text: str, channel_policy: str, is_owner_or_mod: bool = False) -> str:
-    if not _is_broadcast_memory_relevant(user_text):
-        return ""
     include_internal = (channel_policy == "broadcast_memory") or bool(is_owner_or_mod)
+    relevant = _is_broadcast_memory_relevant(user_text)
+    entity_terms = extract_broadcast_memory_query_terms(user_text)
+    if entity_terms:
+        logging.info(f"broadcast_memory_entity_terms terms={len(entity_terms)}")
+    matched_entries = get_matching_broadcast_memory_entries(
+        guild_id,
+        entity_terms,
+        public_only=not include_internal,
+        limit=5,
+    ) if entity_terms else []
+    if not relevant and not matched_entries:
+        logging.info("broadcast_memory_relevance_skipped reason=no_keyword_no_entity_match")
+        return ""
+    selected = []
+    if matched_entries:
+        for entry in matched_entries[:5]:
+            summary = _safe_truncate_summary(entry.get("cleaned_summary") or "", 220)
+            if not summary:
+                continue
+            label = entity_terms[0] if entity_terms else "matched memory"
+            selected.append((entry.get("episode_date") or "unknown-date", "broadcast_memory_note", label, summary))
+        if selected:
+            logging.info(f"broadcast_memory_context_loaded reason=entity_match count={len(selected)}")
+            lines = [f"- {d} {label}: {s}" for d, _t, label, s in selected]
+            return (
+                "Broadcast memory entity match:\n"
+                + "\n".join(lines)
+                + "\nBroadcast memory entity-match rules:\n"
+                "- These are official cleaned broadcast-memory summaries.\n"
+                "- If the user asks about a matched name, answer from this memory.\n"
+                "- Do not claim no records, no matches, unknown status, archive-query failure, or incomplete records when this matched summary is present.\n"
+                "- Explain scope carefully: BNL has broadcast-memory context for this; it is not a full dossier or website profile.\n"
+                "- Do not claim a live website dossier, account identity, queue integration, payment integration, or Discord Radio tracking exists unless explicitly present."
+            )
     rows = get_recent_broadcast_memory(guild_id, public_only=not include_internal, limit=25)
     if not rows:
         return ""
     latest_episode = get_latest_broadcast_episode_date(guild_id, public_only=not include_internal)
-    selected = []
     for episode_date, cleaned_summary, entry_type, _importance, public_safe, _affects_next_show, _usage_scope, _target_show_date, _valid_until, _override_span_count, _needs_clarification in rows:
         if not cleaned_summary:
             continue
@@ -5042,7 +5247,8 @@ def _set_broadcast_memory_status(memory_id: int, status: str, actor_id: int, act
     return int(changed or 0)
 
 async def process_broadcast_memory_note(message) -> dict:
-    text = re.sub(r"\s+", " ", (message.content or "").strip())
+    raw_content = (message.content or "").strip()
+    text = re.sub(r"\s+", " ", raw_content)
     lowered = text.lower()
     if len(text) < 16 or len(text.split()) < 4 or lowered in {"lol", "lol yeah", "yeah", "ok", "okay"}:
         return {"entry_type": "reject", "reason": "too vague"}
@@ -5050,17 +5256,63 @@ async def process_broadcast_memory_note(message) -> dict:
         return {"entry_type": "reject", "reason": "unsafe or private"}
     if any(k in lowered for k in ("next episode is back on", "normal schedule resumed", "cancellation lifted", "maintenance cleared", "show is happening after all")):
         return {"entry_type": "show_state_resume", "cleaned_summary": "Normal BARCODE Radio schedule restored.", "public_safe": True}
+
+    structured = _parse_structured_broadcast_memory_note(raw_content)
+    override = {}
+    if structured:
+        explicit_type = (structured.get("type") or "").strip().lower()
+        entry_type = explicit_type if explicit_type in BROADCAST_MEMORY_ALLOWED_TYPES else ""
+        public_value = (structured.get("public-safe") or "").strip().lower()
+        public_safe = public_value in {"yes", "y", "true", "public", "public-safe", "1"}
+        summary_body = re.sub(r"\s+", " ", (structured.get("summary") or "").strip())
+        title = re.sub(r"\s+", " ", (structured.get("title") or "").strip())
+        classification_text = _strip_broadcast_memory_boundary_text(summary_body or text)
+        classification_lowered = classification_text.lower()
+        if not entry_type:
+            entry_type = "notable_moment"
+            if "running joke" in classification_lowered:
+                entry_type = "running_joke"
+            elif any(k in classification_lowered for k in ("shutdown arc", "protocol-breach arc", "storyline", "antagonistic outside voice", "episode arc", "current barcode radio shutdown")):
+                entry_type = "episode_arc"
+            elif any(k in classification_lowered for k in ("queue", "audio", "latency", "crash", "bug", "technical")):
+                entry_type = "technical_issue"
+            elif any(k in classification_lowered for k in ("mod", "timeout", "ban", "moderation")):
+                entry_type = "moderation_context"
+        usage_scope = _parse_usage_scope(structured.get("usage") or "", public_safe)
+        affects_next = any(k in classification_lowered for k in ("next episode", "next week", "canceled", "cancelled", "paused", "maintenance"))
+        cleaned = f"{title}: {summary_body}" if title and title.lower() not in summary_body.lower()[:80] else summary_body
+        cleaned = re.sub(r"\b(fuck|shit|bitch)\b", "redacted", cleaned, flags=re.IGNORECASE)
+        cleaned = _safe_truncate_summary(cleaned, 500).rstrip(" .") + "."
+        episode_date = (structured.get("date") or "").strip()
+        if not re.match(r"^20\d{2}-\d{2}-\d{2}$", episode_date):
+            episode_date = _extract_exact_episode_date(text) or _recent_friday_pacific_for_note(text)
+        importance = "high" if entry_type == "show_state_override" else ("low" if entry_type == "running_joke" else "medium")
+        logging.info(f"broadcast_memory_structured_note_parsed type={entry_type} public_safe={public_safe} usage={usage_scope}")
+        return {
+            "entry_type": entry_type,
+            "importance": importance,
+            "public_safe": public_safe,
+            "affects_next_show": affects_next or entry_type == "show_state_override",
+            "usage_scope": usage_scope,
+            "cleaned_summary": cleaned,
+            "episode_date": episode_date,
+        }
+
+    classification_text = _strip_broadcast_memory_boundary_text(raw_content)
+    classification_lowered = re.sub(r"\s+", " ", classification_text.strip()).lower()
     entry_type = "notable_moment"
-    if "running joke" in lowered:
+    if "running joke" in classification_lowered:
         entry_type = "running_joke"
-    elif any(k in lowered for k in ("queue", "audio", "latency", "crash", "bug", "technical")):
-        entry_type = "technical_issue"
-    elif any(k in lowered for k in ("mod", "timeout", "ban", "moderation")):
-        entry_type = "moderation_context"
-    elif any(k in lowered for k in ("episode arc", "storyline", "canon")):
+    elif any(k in classification_lowered for k in ("broadcast-memory entity", "shutdown arc", "protocol-breach arc", "storyline", "antagonistic outside voice", "episode arc", "current barcode radio shutdown")):
         entry_type = "episode_arc"
-    affects_next = any(k in lowered for k in ("next episode", "next week", "canceled", "cancelled", "paused", "maintenance"))
-    if affects_next and any(k in lowered for k in ("canceled", "cancelled", "paused", "maintenance")):
+    elif any(k in classification_lowered for k in ("queue", "audio", "latency", "crash", "bug", "technical")):
+        entry_type = "technical_issue"
+    elif any(k in classification_lowered for k in ("mod", "timeout", "ban", "moderation")):
+        entry_type = "moderation_context"
+    elif any(k in classification_lowered for k in ("episode arc", "storyline", "canon")):
+        entry_type = "episode_arc"
+    affects_next = any(k in classification_lowered for k in ("next episode", "next week", "canceled", "cancelled", "paused", "maintenance"))
+    if affects_next and any(k in classification_lowered for k in ("canceled", "cancelled", "paused", "maintenance")):
         entry_type = "show_state_override"
     public_safe = not any(k in lowered for k in ("private", "dm", "leak", "secret", "doxx", "attack"))
     importance = "high" if entry_type == "show_state_override" else ("low" if entry_type == "running_joke" else "medium")
@@ -5072,7 +5324,8 @@ async def process_broadcast_memory_note(message) -> dict:
             return {"entry_type": "reject", "reason": "I can log that, but I need the affected window: next episode only, next two episodes, this month, or until a specific date?"}
     elif public_safe:
         usage_scope = "ambient,direct"
-    summary = text[:220]
+    summary_source = re.sub(r"\s+", " ", classification_text.strip()) or text
+    summary = summary_source[:220]
     summary = re.sub(r"\b(fuck|shit|bitch)\b", "redacted", summary, flags=re.IGNORECASE)
     summary = summary.rstrip(" .") + "."
     exact_date = _extract_exact_episode_date(text)
@@ -6004,6 +6257,21 @@ FAKE_LOOKUP_CLAIM_PATTERNS = (
     r"\bentity lookup failed\b",
     r"\brecords? contain(?:s)? no reference\b",
     r"\bunknown external data stream\b",
+    r"\bno primary matches?\b",
+    r"\bprior queries into the network archives\b",
+    r"\bqueries into the network archives\b",
+    r"\bnetwork archives?\b.*\byield(?:s|ed)? no\b",
+    r"\barchives?\b.*\byield(?:s|ed)? no\b",
+    r"\bestablished barcode (?:network )?parameters\b",
+    r"\brecords? remain incomplete regarding\b",
+    r"\brecords? are incomplete regarding\b",
+    r"\bwithin the network'?s catalog\b",
+    r"\bwithin the network catalog\b",
+    r"\bcould assist in its identification\b",
+    r"\badditional signal data\b.*\bidentification\b",
+    r"\bentity designated\b",
+    r"\bdesignation\b.*\b(?:no match|no primary|incomplete records?|records? incomplete)\b",
+    r"\b(?:no match|no primary|incomplete records?|records? incomplete)\b.*\bdesignation\b",
 )
 
 
@@ -6061,13 +6329,36 @@ def fake_lookup_safety_prompt_rules() -> str:
     return (
         "\nLookup/source safety rules:\n"
         "- Never invent archive scans, entity database checks, dossiers, canonical profiles, or lookup failures.\n"
-        "- Do not say: no direct matches, no prior reference, established entity parameters, known signal patterns, archive scan found nothing, entity lookup failed, records contain no reference, or unknown external data stream unless an actual code path supplied that result.\n"
-        "- If recent room context mentions a name, treat it as a current-room reference even if no permanent memory exists.\n"
+        "- Do not say: no direct matches, no primary matches, no prior reference, established entity/BARCODE parameters, known signal patterns, archive scan found nothing, Network archives yielded no results, entity lookup failed, records remain incomplete, records contain no reference, or unknown external data stream unless an actual code path supplied that result.\n"
+        "- If recent room context or broadcast-memory context mentions a name, answer from that context rather than pretending a database lookup failed.\n"
         "- If context is weak, state uncertainty plainly without pretending a database was queried.\n"
     )
 
 
 def _safe_uncertain_response_from_prompt(prompt: str) -> str:
+    memory_match = re.search(r"Broadcast memory entity match:\n(?P<context>.*?)(?:\nBroadcast memory entity-match rules:|\nBroadcast-memory usage guidance:|\nCurrent BARCODE Radio scheduling context:|\nUser name to address|\Z)", prompt or "", flags=re.DOTALL)
+    if memory_match and memory_match.group("context").strip():
+        first_line = ""
+        for line in memory_match.group("context").splitlines():
+            line = line.strip(" -")
+            if line:
+                first_line = _safe_truncate_summary(line, 240)
+                break
+        if first_line:
+            return (
+                "I need to correct that. I do have relevant broadcast-memory context here: "
+                f"{first_line} That is broadcast memory, not a full dossier, account profile, or website profile."
+            )
+        return (
+            "I need to correct that. I have relevant broadcast-memory context here, so I should not claim there are no records. "
+            "I can answer from that memory, but it is not a full dossier or account profile."
+        )
+    broad_match = re.search(r"Broadcast memory context \(cleaned summaries only\):\n(?P<context>.*?)(?:\nBroadcast-memory usage guidance:|\nCurrent BARCODE Radio scheduling context:|\nUser name to address|\Z)", prompt or "", flags=re.DOTALL)
+    if broad_match and broad_match.group("context").strip():
+        return (
+            "I need to correct that. I have relevant broadcast-memory context here, so I should not claim there are no records. "
+            "I can answer from that memory, but it is not a full dossier or account profile."
+        )
     room_match = re.search(r"Recent room context from this channel:\n(?P<context>.*?)(?:\nRoom-first context rules:|\nCurrent channel:|\Z)", prompt or "", flags=re.DOTALL)
     if room_match and room_match.group("context").strip():
         return (
@@ -6237,7 +6528,8 @@ async def get_gemini_response(prompt: str, user_id: int, guild_id: int, route: s
                     text = bleed_text
 
         if contains_fake_lookup_claim(text):
-            logging.info("model_response_rejected reason=fake_lookup_claim")
+            source = "broadcast_memory_context" if "Broadcast memory" in (prompt or "") else "standard_context"
+            logging.info(f"model_response_rejected reason=fake_lookup_claim source={source}")
             return _safe_uncertain_response_from_prompt(prompt)
 
         if public_authority_guard_active and contains_operator_causality_claim(text):
