@@ -885,17 +885,364 @@ def maybe_build_bnl_read_model_context(user_text: str, channel_policy: str) -> s
     return build_bnl_read_model_context(read_model, user_text, channel_policy)
 
 
+def _bnl_read_model_section_counts(read_model: dict) -> dict:
+    sections = _read_model_sections(read_model)
+    queue = _first_mapping(sections.get("queue"), read_model.get("queue") if isinstance(read_model, dict) else None)
+    artists_section = sections.get("artists") if sections.get("artists") is not None else (read_model.get("artists") if isinstance(read_model, dict) else None)
+    dossiers_section = sections.get("dossiers") if sections.get("dossiers") is not None else (read_model.get("dossiers") if isinstance(read_model, dict) else None)
+    rules_section = sections.get("rules") if sections.get("rules") is not None else (read_model.get("rules") if isinstance(read_model, dict) else None)
+    artists_map = artists_section if isinstance(artists_section, dict) else {}
+    dossiers_map = dossiers_section if isinstance(dossiers_section, dict) else {}
+    rules_map = rules_section if isinstance(rules_section, dict) else {}
+    queued_tracks, completed_tracks = _website_read_model_track_lists(read_model)
+    return {
+        "sections": len(sections),
+        "queued_tracks": len(queued_tracks),
+        "completed_tracks": len(completed_tracks),
+        "artists": len(_first_list(artists_map.get("items"), artists_map.get("artists"), artists_section if isinstance(artists_section, list) else [])),
+        "dossiers": len(_first_list(dossiers_map.get("items"), dossiers_map.get("public"), dossiers_map.get("dossiers"), dossiers_map.get("publicDossiers"), dossiers_section if isinstance(dossiers_section, list) else [])),
+        "rules": len(_first_list(rules_map.get("items"), rules_map.get("rules"), rules_section if isinstance(rules_section, list) else [])),
+    }
+
+
 def get_bnl_read_model_diagnostic_state() -> dict:
     cache_age = None
     if _bnl_read_model_cached_at:
         cache_age = int((datetime.now(PACIFIC_TZ) - _bnl_read_model_cached_at).total_seconds())
+    section_counts = _bnl_read_model_section_counts(_bnl_read_model_cache or {}) if _bnl_read_model_cache else {}
     return {
         "enabled": bool(BNL_READ_MODEL_ENABLED and BNL_READ_MODEL_URL),
         "url_configured": bool(BNL_READ_MODEL_URL),
         "cache_present": bool(_bnl_read_model_cache),
         "cache_age_seconds": cache_age,
         "ttl_seconds": BNL_READ_MODEL_TTL_SECONDS,
+        "last_section_counts": section_counts,
+        "rd_classifier_enabled": True,
     }
+
+
+def _website_read_model_queue(read_model: dict) -> dict:
+    sections = _read_model_sections(read_model)
+    return _first_mapping(sections.get("queue"), read_model.get("queue") if isinstance(read_model, dict) else None)
+
+
+def _website_read_model_track_lists(read_model: dict):
+    queue = _website_read_model_queue(read_model)
+    if not queue:
+        return [], []
+    queued_tracks = _first_list(queue.get("queuedTracks"), queue.get("queue"), queue.get("activeTracks"), queue.get("tracks"))
+    completed_tracks = _first_list(queue.get("completedTracks"), queue.get("completed"), queue.get("playedTracks"))
+    return queued_tracks, completed_tracks
+
+
+def _website_read_model_status_bits(read_model: dict) -> list:
+    queue = _website_read_model_queue(read_model)
+    if not queue:
+        return ["No public queue section is present in the website read model."]
+    session = _first_mapping(queue.get("session"), queue.get("currentSession"))
+    status = _first_mapping(queue.get("status"), queue.get("queueStatus"), queue)
+    priority_signal = _first_mapping(queue.get("prioritySignal"), queue.get("priority"))
+    bits = []
+    for label, keys in (
+        ("Session", ("title",)),
+        ("show date", ("showDate",)),
+        ("status", ("status",)),
+        ("queue open", ("queueOpen",)),
+        ("phase", ("broadcastPhase", "phase")),
+    ):
+        value = _first_present_value(session, keys)
+        if value is None:
+            value = _first_present_value(status, keys)
+        if value is not None and value != "":
+            bits.append(f"{label}: {_compact_public_text(value, 80)}")
+    count_bits = []
+    for key in ("activeCount", "completedCount", "removedCount", "capacity", "pressure"):
+        value = status.get(key) if isinstance(status, dict) else None
+        if value is None or value == "":
+            value = session.get(key) if isinstance(session, dict) else None
+        if value is not None and value != "":
+            count_bits.append(f"{key}={_compact_public_text(value, 40)}")
+    if count_bits:
+        bits.append("queue counters: " + ", ".join(count_bits))
+    wheel_spins = _first_present_value(queue, ("wheelSpinsOwed",))
+    if wheel_spins is None:
+        wheel_spins = _first_present_value(status, ("wheelSpinsOwed",))
+    if wheel_spins is None:
+        wheel_spins = _first_present_value(session, ("wheelSpinsOwed",))
+    if wheel_spins is not None:
+        bits.append(f"wheel spins owed: {_compact_public_text(wheel_spins, 30)}")
+    priority_enabled = priority_signal.get("enabled") if priority_signal else None
+    if priority_enabled is None:
+        priority_enabled = _first_present_value(session, ("priorityUpgradesEnabled",))
+    if priority_signal or priority_enabled is not None:
+        bits.append(f"Priority Signal status: enabled={priority_enabled if priority_enabled is not None else 'unknown'}")
+    now_label = _track_label(_first_mapping(queue.get("nowPlaying"), queue.get("currentTrack")))
+    next_label = _track_label(_first_mapping(queue.get("upNext"), queue.get("nextTrack")))
+    if now_label:
+        bits.append(f"now playing: {now_label}")
+    if next_label:
+        bits.append(f"up next: {next_label}")
+    return bits or ["Public queue context is present, but no compact status fields were exposed."]
+
+
+def _website_read_model_public_dossiers(read_model: dict) -> list:
+    sections = _read_model_sections(read_model)
+    dossiers_section = sections.get("dossiers") if sections.get("dossiers") is not None else (read_model.get("dossiers") if isinstance(read_model, dict) else None)
+    dossiers_map = dossiers_section if isinstance(dossiers_section, dict) else {}
+    return _first_list(dossiers_map.get("items"), dossiers_map.get("public"), dossiers_map.get("dossiers"), dossiers_map.get("publicDossiers"), dossiers_section if isinstance(dossiers_section, list) else [])
+
+
+def _website_read_model_artists(read_model: dict) -> list:
+    sections = _read_model_sections(read_model)
+    artists_section = sections.get("artists") if sections.get("artists") is not None else (read_model.get("artists") if isinstance(read_model, dict) else None)
+    artists_map = artists_section if isinstance(artists_section, dict) else {}
+    return _first_list(artists_map.get("items"), artists_map.get("artists"), artists_section if isinstance(artists_section, list) else [])
+
+
+def _read_model_unavailable_message() -> str:
+    if not BNL_READ_MODEL_URL:
+        return "Website read model is unavailable: `BNL_READ_MODEL_URL` is not configured. No website context was stored, relayed, or mutated."
+    if not BNL_READ_MODEL_ENABLED:
+        return "Website read model is unavailable: read-model fetching is disabled. No website context was stored, relayed, or mutated."
+    return "Website read model is unavailable right now. I did not store read-model context, mutate the queue/site/relay, or create broadcast memory/dossiers."
+
+
+def _append_items(lines: list, items: list, empty: str, limit: int = 6):
+    shown = 0
+    for item in items[:limit]:
+        text = _compact_public_text(item, 220) if not isinstance(item, dict) else _compact_public_text(_track_label(item, include_lane=True, include_source=True) or item.get("name") or item.get("title") or item.get("summary") or item.get("publicSummary"), 220)
+        if text:
+            lines.append(f"- {text}")
+            shown += 1
+    if shown == 0:
+        lines.append(f"- {empty}")
+
+
+def _website_public_dossier_lines(read_model: dict, limit: int = 4) -> list:
+    lines = []
+    for dossier in _website_read_model_public_dossiers(read_model)[:limit]:
+        if not isinstance(dossier, dict):
+            continue
+        name = _compact_public_text(dossier.get("name") or dossier.get("title") or dossier.get("slug"), 80)
+        summary = _compact_public_text(dossier.get("summary") or dossier.get("description") or dossier.get("publicSummary"), 180)
+        if name:
+            lines.append(f"{name}: {summary or 'existing website-published public dossier summary'}")
+    return lines
+
+
+def build_website_read_model_classifier_response(read_model: dict, request_text: str) -> str:
+    queued_tracks, completed_tracks = _website_read_model_track_lists(read_model)
+    dossiers = _website_public_dossier_lines(read_model)
+    artists = _website_read_model_artists(read_model)
+    lines = ["Website read-model classification:", "", "Temporary runtime context:"]
+    for bit in _website_read_model_status_bits(read_model)[:8]:
+        lines.append(f"- {bit}")
+    if queued_tracks:
+        lines.append(f"- {len(queued_tracks)} queued/active public track surface(s): queue-derived runtime context, not permanent artist profiles or account identity.")
+    lines.extend(["", "Broadcast-memory candidates:"])
+    if dossiers:
+        lines.append("- Existing public dossier summaries may matter if they reflect a meaningful public entity update, but they are not automatically Discord broadcast memory.")
+    else:
+        lines.append("- No strong broadcast-memory candidate is visible from normal queue/status context alone.")
+    lines.append("- Promote only if operators confirm a major interruption, official arc event, protocol breach, cancellation, unusual public dossier update, or recurring public event.")
+    lines.extend(["", "Recap candidates:"])
+    _append_items(lines, completed_tracks, "No completed/played public tracks are exposed as recap candidates right now.", limit=5)
+    if queued_tracks:
+        lines.append("- Now playing/up next/active queue items are temporary until played or completed.")
+    lines.extend(["", "Possible dossier seeds:"])
+    if dossiers:
+        for d in dossiers[:4]:
+            lines.append(f"- Existing public dossier summary, not a seed: {d}")
+    else:
+        lines.append("- No clear seed from the read model alone. Queue artists need a reason beyond normal appearance before becoming possible seeds.")
+    if artists and not dossiers:
+        lines.append(f"- {len(artists)} public artist surface(s) are present, but queue/site appearance is not a permanent profile by itself.")
+    lines.extend(["", "Public-safe copy candidates:"])
+    if queued_tracks or completed_tracks or dossiers:
+        lines.append("- Public-safe queue/site status copy can be drafted from public site context without mentioning internal R&D or private access.")
+    else:
+        lines.append("- Nothing specific enough for public-safe copy beyond generic site/queue status.")
+    lines.extend(["", "Do not store / do not do yet:",
+        "- Do not write read-model content to memory_tiers, user facts, #bnl-broadcast-memory, website relay, or queue/site state from this classifier.",
+        "- Do not treat queued artists as permanent BNL facts, account identities, Discord identities, or TikTok-to-Discord mappings.",
+        "- Do not treat Priority Signal status as payment facts, and do not expose payment/contact/upload/private data.",
+        "- Website read model is temporary public site context; R&D classification is internal sorting, not public/canon.",
+    ])
+    return "\n".join(lines)
+
+
+def _website_broadcast_memory_candidate_type(candidate_text: str) -> str:
+    text = (candidate_text or "").lower()
+    if any(word in text for word in ("arc", "storyline", "ongoing", "recurring", "antagonist", "entity event")):
+        return "episode_arc"
+    return "notable_moment"
+
+
+def _website_status_broadcast_candidate(read_model: dict) -> str:
+    queue = _website_read_model_queue(read_model)
+    if not queue:
+        return ""
+    session = _first_mapping(queue.get("session"), queue.get("currentSession"))
+    status = _first_mapping(queue.get("status"), queue.get("queueStatus"), queue)
+    interesting_values = []
+    for mapping in (session, status):
+        if not isinstance(mapping, dict):
+            continue
+        for key in ("status", "phase", "broadcastPhase", "state", "message", "notice", "reason", "summary"):
+            value = _compact_public_text(mapping.get(key), 160)
+            if value:
+                interesting_values.append(value)
+    combined = " | ".join(interesting_values)
+    lowered = combined.lower()
+    strong_terms = (
+        "cancel", "cancelled", "canceled", "paused", "restricted", "restriction", "shutdown",
+        "protocol breach", "breach", "interruption", "major status", "show state override",
+        "arc", "storyline", "official event", "technical issue", "outage",
+    )
+    if combined and any(term in lowered for term in strong_terms):
+        return f"Public show status event: {_safe_truncate_summary(combined, 220)}"
+    return ""
+
+
+def _website_dossier_broadcast_candidate(read_model: dict) -> str:
+    for dossier in _website_read_model_public_dossiers(read_model):
+        if not isinstance(dossier, dict):
+            continue
+        name = _compact_public_text(dossier.get("name") or dossier.get("title") or dossier.get("slug"), 80)
+        summary = _compact_public_text(dossier.get("summary") or dossier.get("description") or dossier.get("publicSummary"), 200)
+        combined = " ".join(part for part in (name, summary) if part)
+        lowered = combined.lower()
+        strong_terms = (
+            "update", "meaningful", "recurring", "arc", "storyline", "antagonist", "entity",
+            "protocol", "breach", "restricted", "cancel", "shutdown", "interruption", "official",
+        )
+        if name and summary and any(term in lowered for term in strong_terms):
+            return f"Meaningful public dossier/entity update: {name}: {summary}"
+    return ""
+
+
+def build_website_broadcast_memory_candidate_response(read_model: dict, request_text: str) -> str:
+    candidate = _website_status_broadcast_candidate(read_model) or _website_dossier_broadcast_candidate(read_model)
+    if not candidate:
+        return ("Broadcast-memory candidates from website read model:\n\n"
+                "No strong broadcast-memory candidate found. Completed tracks may be recap candidates, but ordinary queue history should not become broadcast memory without operator confirmation.\n\n"
+                "Boundary: no memory write, broadcast-memory intake, user fact, queue/site mutation, relay mutation, or canon promotion happened.")
+    today = datetime.now(PACIFIC_TZ).strftime("%Y-%m-%d")
+    note_type = _website_broadcast_memory_candidate_type(candidate)
+    return (
+        "Broadcast-memory candidates from website read model:\n\n"
+        "Candidate 1:\n"
+        "Why it may matter:\n"
+        f"- {candidate}\n"
+        "- Use only if operators confirm this is a meaningful public dossier/entity update, public show status event, protocol/shutdown arc item, major interruption, official arc event, or known broadcast-memory connection.\n\n"
+        "Copy-paste into #bnl-broadcast-memory if approved:\n\n"
+        "```text\n"
+        "Broadcast memory note\n"
+        f"Title: Website public context candidate — {_safe_truncate_summary(candidate, 70)}\n"
+        f"Date: {today}\n"
+        f"Type: {note_type}\n"
+        "Public-safe: yes\n"
+        "Usage: direct, ambient\n\n"
+        "Summary:\n"
+        f"{candidate}\n\n"
+        "Boundaries:\n"
+        "This came from the public website read model. It is not a private account record, payment record, Discord identity mapping, queue mutation, or website relay instruction. It remains a draft until an operator pastes it into #bnl-broadcast-memory.\n"
+        "```"
+    )
+
+
+def build_website_dossier_seed_candidate_response(read_model: dict, request_text: str) -> str:
+    dossiers = _website_public_dossier_lines(read_model)
+    artists = []
+    for artist in _website_read_model_artists(read_model)[:4]:
+        if isinstance(artist, dict):
+            name = _compact_public_text(artist.get("name") or artist.get("artistName"), 80)
+            if name:
+                artists.append(name)
+    lines = ["Possible dossier seeds from website read model:", ""]
+    if dossiers:
+        lines.append("Existing public dossier summaries (not seeds):")
+        for d in dossiers[:4]:
+            lines.append(f"- {d}")
+        lines.append("")
+    if not artists:
+        lines.extend([
+            "Seed:",
+            "- Name: none identified from the read model alone",
+            "- Source: public website read model / queue-derived artist surface",
+            "- Why it may deserve tracking: no reason beyond normal site/queue appearance was visible",
+            "- Public facts: none promoted",
+            "- Needs confirmation: a recurring public arc, entity role, or operator-approved reason",
+            "- Boundary: dossier seed only; not a live website dossier, account, Discord identity, or payment identity.",
+        ])
+    else:
+        for name in artists[:3]:
+            lines.extend([
+                "Seed:",
+                f"- Name: {name}",
+                "- Source: public website read model / queue-derived artist surface",
+                "- Why it may deserve tracking: only if operators confirm significance beyond ordinary queue appearance",
+                "- Public facts: public artist surface appeared in the site read model; do not add private/contact/payment/upload facts",
+                "- Needs confirmation: recurring relevance, public entity role, approved summary, and whether a dossier is appropriate",
+                "- Boundary: possible future profile only; not a live dossier, account, Discord identity mapping, or payment identity.",
+                "",
+            ])
+    return "\n".join(lines).rstrip()
+
+
+def build_website_recap_candidate_response(read_model: dict, request_text: str) -> str:
+    queued_tracks, completed_tracks = _website_read_model_track_lists(read_model)
+    lines = ["Website/queue recap candidates:", "", "Likely recap items:"]
+    _append_items(lines, completed_tracks, "No completed/played public items are exposed right now.", limit=6)
+    lines.extend(["", "Maybe recap items:"])
+    if _website_public_dossier_lines(read_model):
+        lines.append("- Public dossier summaries may provide recap context if directly relevant to the show/event.")
+    if queued_tracks:
+        lines.append(f"- {len(queued_tracks)} active/queued item(s) can be monitored, but they are not final recap history yet.")
+    if not queued_tracks and not _website_public_dossier_lines(read_model):
+        lines.append("- None from active site context alone.")
+    lines.extend(["", "Do not recap from this alone:",
+        "- Now playing/up next/active queue state as final history before it is completed.",
+        "- Active counts, wheel spins owed, Priority Signal status, or ordinary queue appearance as lore/canon.",
+        "", "Needed confirmation:",
+        "- Confirm final played/completed status and any operator-approved show outcome before publishing a recap.",
+    ])
+    return "\n".join(lines)
+
+
+def build_website_public_safe_candidate_response(read_model: dict, request_text: str) -> str:
+    queued_tracks, completed_tracks = _website_read_model_track_lists(read_model)
+    status_bits = _website_read_model_status_bits(read_model)[:4]
+    lines = ["Public-safe website/site copy candidate:", "", "Draft:", "```text"]
+    lines.append("Public site/queue update:")
+    if status_bits:
+        lines.append("- " + "; ".join(status_bits))
+    if completed_tracks:
+        labels = [_track_label(t, include_lane=False) for t in completed_tracks[:3] if isinstance(t, dict)]
+        labels = [label for label in labels if label]
+        if labels:
+            lines.append("- Recently completed public queue items: " + "; ".join(labels))
+    if queued_tracks:
+        lines.append(f"- The public queue currently shows {len(queued_tracks)} active/queued item(s).")
+    lines.extend(["```", "", "Boundary:",
+        "- Draft only. Uses public site/queue context; no internal R&D details, private data, payment facts, admin simulation data, or claim of private BNL access.",
+    ])
+    return "\n".join(lines)
+
+
+def build_website_read_model_intent_response(intent: str, request_text: str) -> str:
+    read_model = fetch_bnl_read_model(force=False)
+    if not read_model:
+        return _read_model_unavailable_message()
+    if intent == "website_broadcast_memory_candidate":
+        return build_website_broadcast_memory_candidate_response(read_model, request_text)
+    if intent == "website_dossier_seed_candidate":
+        return build_website_dossier_seed_candidate_response(read_model, request_text)
+    if intent == "website_recap_candidate":
+        return build_website_recap_candidate_response(read_model, request_text)
+    if intent == "website_public_safe_candidate":
+        return build_website_public_safe_candidate_response(read_model, request_text)
+    return build_website_read_model_classifier_response(read_model, request_text)
 
 def update_website_status_controlled(mode: str, message: str, status: str = "ONLINE", force: bool = False, current_directive: str = "", source: str = "relay", admin_note: str = "") -> bool:
     global _last_website_status_mode, _last_website_status_message, _last_website_directive, _last_website_status_at, _missing_status_key_warned
@@ -3324,7 +3671,87 @@ def detect_rd_ops_intent(text: str) -> str:
     normalized = t.replace("#", "")
     normalized = normalized.replace("broadcast-memory", "broadcast memory")
     normalized = normalized.replace("knowledge-base", "knowledge base")
+    normalized = normalized.replace("public-safe", "public safe")
     normalized = normalized.replace("copy/paste", "copy paste")
+
+    website_context_terms = ("website", "site", "read model", "queue", "public dossier", "artist data", "current site")
+    has_website_context = any(term in normalized for term in website_context_terms)
+    if has_website_context and any(phrase in normalized for phrase in (
+        "what from the website should go into broadcast memory",
+        "what should go into broadcast memory from the site",
+        "what should go into broadcast memory from the website",
+        "what from the site should go into broadcast memory",
+        "what from the current queue should become broadcast memory",
+        "what from the queue should become broadcast memory",
+        "make a broadcast memory candidate from the website read model",
+        "make a broadcast memory candidate from the current website read model",
+        "turn current site state into a broadcast memory note",
+        "should anything from the queue become broadcast memory",
+        "make a broadcast memory draft from the current queue",
+        "make a broadcast memory draft from the site",
+        "broadcast memory candidate from the website",
+        "broadcast memory candidate from the site",
+        "broadcast memory draft from the current queue",
+        "broadcast memory draft from the site",
+    )):
+        return "website_broadcast_memory_candidate"
+
+    if has_website_context and any(phrase in normalized for phrase in (
+        "does the website show anything that needs a dossier seed",
+        "does anything from the website read model need a dossier seed",
+        "make a dossier seed from the website read model",
+        "make a dossier seed from the public dossier",
+        "make a dossier seed from the artist data",
+        "make a dossier seed from the queue",
+        "should this artist become a dossier seed",
+        "should this entity become a dossier seed",
+        "dossier seed from the website",
+        "dossier seed from the site",
+        "dossier seed from the public dossier",
+    )):
+        return "website_dossier_seed_candidate"
+
+    if has_website_context and any(phrase in normalized for phrase in (
+        "make recap candidates from the website read model",
+        "what from the current queue should be in the recap",
+        "what site info should we recap",
+        "what queue info should we recap",
+        "recap candidates from current queue",
+        "what from the current queue should be recap candidates",
+        "recap candidates from the website",
+        "recap candidates from the site",
+    )):
+        return "website_recap_candidate"
+
+    if has_website_context and any(phrase in normalized for phrase in (
+        "make public safe copy from the website read model",
+        "write a public safe version of the queue",
+        "write a public safe version of the site update",
+        "turn this site context into a public post",
+        "public safe version of the queue",
+        "public safe version of the site",
+        "public post from the website",
+        "public post from the site",
+    )):
+        return "website_public_safe_candidate"
+
+    if has_website_context and any(phrase in normalized for phrase in (
+        "classify the website read model",
+        "classify website read model",
+        "sort the website read model into lanes",
+        "what from the website matters",
+        "what from the site matters",
+        "what should we do with the website read model",
+        "what should stay temporary from the site",
+        "classify current site context",
+        "classify current queue context",
+        "what from the queue matters",
+        "what from the website read model matters",
+        "what from the current queue matters",
+        "sort current site context",
+        "sort current queue context",
+    )):
+        return "website_read_model_classifier"
 
     if any(phrase in normalized for phrase in (
         "turn this into action items", "action items", "what should mods do", "give me next steps",
@@ -9762,6 +10189,15 @@ async def on_message(message: discord.Message):
         elif rd_intent == "rd_followup_classifier":
             response = build_rd_followup_classifier_response(clean_content, previous_rd_context, rd_channel_context)
             suggested_lane = "follow-up lanes"
+        elif rd_intent in {
+            "website_read_model_classifier",
+            "website_broadcast_memory_candidate",
+            "website_dossier_seed_candidate",
+            "website_recap_candidate",
+            "website_public_safe_candidate",
+        }:
+            response = build_website_read_model_intent_response(rd_intent, clean_content)
+            suggested_lane = "R&D website read-model classifier"
         else:
             ops_context = build_operations_brief_context(message.guild.id, clean_content)
             rd_read_model_context = maybe_build_bnl_read_model_context(clean_content, channel_policy)
@@ -9808,8 +10244,13 @@ async def on_message(message: discord.Message):
 
     if real_direct_target and is_public_prompt_context(channel_policy):
         public_rd_intent = detect_rd_ops_intent(clean_content)
-        if public_rd_intent in {"broadcast_memory_draft", "implementation_guidance", "dossier_seed_draft", "recap_candidate", "action_items", "rd_source_channel_recap", "rd_mod_recap", "rd_followup_classifier"}:
-            await message.reply("That is an operator workflow. Use #research-and-development for R&D recap/classification. #bnl-broadcast-memory remains the official memory intake lane.")
+        if public_rd_intent in {
+            "broadcast_memory_draft", "implementation_guidance", "dossier_seed_draft", "recap_candidate",
+            "action_items", "rd_source_channel_recap", "rd_mod_recap", "rd_followup_classifier",
+            "website_read_model_classifier", "website_broadcast_memory_candidate",
+            "website_dossier_seed_candidate", "website_recap_candidate", "website_public_safe_candidate",
+        }:
+            await message.reply("That is an operator workflow. I can answer public queue/site questions here, but classification into broadcast memory, dossier seeds, or recap candidates belongs in #research-and-development.")
             _mark_recent_direct_response(message.channel.id, message.author.id)
             return
 
@@ -10730,6 +11171,8 @@ async def bnl_memory_check(interaction: discord.Interaction):
         f"- read_model_url_configured: `{'yes' if read_model_diag.get('url_configured') else 'no'}`",
         f"- read_model_cache_present: `{'yes' if read_model_diag.get('cache_present') else 'no'}`",
         f"- read_model_cache_age_seconds: `{read_model_diag.get('cache_age_seconds') if read_model_diag.get('cache_age_seconds') is not None else 'none'}`",
+        f"- read_model_last_section_counts: `{read_model_diag.get('last_section_counts') or {}}`",
+        f"- rd_read_model_classifier_enabled: `{'yes' if read_model_diag.get('rd_classifier_enabled') else 'no'}`",
         f"- speaker_profile_exists: `{'yes' if (display_name is not None or preferred_name is not None) else 'no'}`",
         f"- display_name_present: `{'yes' if bool(display_name) else 'no'}`",
         f"- preferred_name_present: `{'yes' if bool(preferred_name) else 'no'}`",
@@ -10844,6 +11287,8 @@ async def bnl_status(interaction: discord.Interaction):
         f"- read_model_url_configured: `{'yes' if read_model_diag.get('url_configured') else 'no'}`",
         f"- read_model_cache_present: `{'yes' if read_model_diag.get('cache_present') else 'no'}`",
         f"- read_model_cache_age_seconds: `{read_model_diag.get('cache_age_seconds') if read_model_diag.get('cache_age_seconds') is not None else 'none'}`",
+        f"- read_model_last_section_counts: `{read_model_diag.get('last_section_counts') or {}}`",
+        f"- rd_read_model_classifier_enabled: `{'yes' if read_model_diag.get('rd_classifier_enabled') else 'no'}`",
         f"- control_flags_source: `{flags_source_state}`",
         f"- broadcast_memory_channel: `{broadcast_channel.mention if broadcast_channel else 'unset/not found'}`",
         "- broadcast_memory_usage_enabled: `yes`",
