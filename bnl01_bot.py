@@ -3112,7 +3112,7 @@ def _rd_note_date(text: str) -> str:
     match = re.search(r"\b(20\d{2}-\d{2}-\d{2})\b", text or "")
     if match:
         return match.group(1)
-    return datetime.now(timezone.utc).date().isoformat()
+    return datetime.now(PACIFIC_TZ).date().isoformat()
 
 
 def _rd_event_sentence(text: str, subject: str) -> str:
