@@ -4562,7 +4562,14 @@ def get_recent_channel_context(guild_id: int, channel_id: int, limit: int = 12, 
     cutoff_sql = f"-{safe_minutes} minutes"
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
-    rows = []
+    rows_by_id = {}
+
+    def _remember_rows(fetched_rows):
+        for fetched_row in fetched_rows:
+            if not fetched_row:
+                continue
+            rows_by_id[fetched_row[0]] = fetched_row
+
     try:
         if channel_id:
             cursor.execute(
@@ -4578,8 +4585,8 @@ def get_recent_channel_context(guild_id: int, channel_id: int, limit: int = 12, 
                 """,
                 (guild_id, int(channel_id), cutoff_sql, safe_limit),
             )
-            rows = cursor.fetchall()
-        if not rows and normalized_channel_name:
+            _remember_rows(cursor.fetchall())
+        if normalized_channel_name:
             cursor.execute(
                 """
                 SELECT id, user_name, role, content, channel_name, channel_policy, timestamp
@@ -4593,8 +4600,8 @@ def get_recent_channel_context(guild_id: int, channel_id: int, limit: int = 12, 
                 """,
                 (guild_id, normalized_channel_name, cutoff_sql, safe_limit),
             )
-            rows = cursor.fetchall()
-        if not rows and normalized_channel_name:
+            _remember_rows(cursor.fetchall())
+        if normalized_channel_name and len(rows_by_id) < safe_limit:
             cursor.execute(
                 """
                 SELECT id, user_name, role, content, channel_name, channel_policy, timestamp
@@ -4607,12 +4614,13 @@ def get_recent_channel_context(guild_id: int, channel_id: int, limit: int = 12, 
                 """,
                 (guild_id, normalized_channel_name, safe_limit),
             )
-            rows = cursor.fetchall()
+            _remember_rows(cursor.fetchall())
     finally:
         conn.close()
 
+    rows = sorted(rows_by_id.values(), key=lambda row: row[0])[-safe_limit:]
     context_rows = []
-    for row in reversed(rows):
+    for row in rows:
         row_policy = (row[5] or "unknown").strip().lower()
         if row_policy not in ROOM_CONTEXT_ALLOWED_POLICIES:
             continue
