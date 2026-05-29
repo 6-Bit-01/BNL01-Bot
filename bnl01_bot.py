@@ -76,6 +76,8 @@ BATCH_REQUEST_PAYLOAD_MAX_WAIT_SECONDS = 16
 PENDING_REQUEST_INTENT_TTL_SECONDS = 20
 RD_OPS_CONTEXT_TTL_SECONDS = 30 * 60
 RD_OPS_CONTEXT_MAX_TURNS = 4
+RD_OPS_CHANNEL_CONTEXT_TTL_SECONDS = 60 * 60
+RD_OPS_CHANNEL_CONTEXT_MAX_TURNS = 10
 ADAPTIVE_PAYLOAD_WAIT_NO_ITEMS_SECONDS = 4
 ADAPTIVE_PAYLOAD_WAIT_WITH_ITEMS_SECONDS = 1.5
 ADAPTIVE_PAYLOAD_MAX_WAIT_SECONDS = 9
@@ -3038,6 +3040,39 @@ def detect_rd_ops_intent(text: str) -> str:
     )):
         return "implementation_guidance"
 
+
+    if any(phrase in normalized for phrase in (
+        "recap this", "recap what we just figured out", "recap what we discussed",
+        "what did we decide", "what did we figure out", "summarize this r&d thread",
+        "summarize this rd thread", "summarize where we are", "what should mods know",
+        "give me a mod recap", "give me an operator recap", "give me the r&d recap",
+        "give me the rd recap", "where are we on this", "catch me up on this",
+        "what is the current state of this", "recap what we decided", "recap what we just decided",
+    )):
+        return "rd_mod_recap"
+
+    if any(phrase in normalized for phrase in (
+        "what still needs action", "what needs to happen next", "what is left",
+        "what should go to broadcast memory", "what should become a dossier seed",
+        "what should stay r&d-only", "what should stay rd-only", "what needs public-safe copy",
+        "what needs public safe copy", "what should we not do yet", "what lane does each part belong in",
+        "sort this into lanes", "sort the follow-ups into lanes", "classify this",
+        "what are the follow-ups", "what are the follow ups", "what should i do with this",
+    )):
+        return "rd_followup_classifier"
+
+    source_channel_patterns = (
+        r"\b(?:break down|summarize|classify)\b.{0,80}\b(?:in|from)\s+#?[a-z0-9][a-z0-9 -]{2,}",
+        r"\b(?:recap|summarize)\s+#[a-z0-9][a-z0-9-]{2,}",
+        r"\b(?:recap|summarize)\s+(?!this\b|where\b|what\b)[a-z0-9][a-z0-9 -]{2,}$",
+        r"\bwhat (?:just )?happened in #?[a-z0-9][a-z0-9 -]{2,}",
+        r"\bwhat did people just talk about in #?[a-z0-9][a-z0-9 -]{2,}",
+        r"\bbreak down (?:what happened|what just happened|the thread) in #?[a-z0-9][a-z0-9 -]{2,}",
+        r"\bsummarize (?:what happened in|the last discussion in) #?[a-z0-9][a-z0-9 -]{2,}",
+    )
+    if any(re.search(pattern, normalized) or re.search(pattern, t) for pattern in source_channel_patterns) or re.search(r"<#\d+>", text or ""):
+        return "rd_source_channel_recap"
+
     if any(phrase in normalized for phrase in (
         "operations brief", "mod brief", "what should we do", "how should we handle this",
         "what's next with this situation", "whats next with this situation",
@@ -3071,7 +3106,7 @@ def _get_recent_rd_ops_context(message: discord.Message):
     return list(kept)
 
 
-def _remember_rd_ops_context(message: discord.Message, user_request: str, intent: str, main_subject: str = "", suggested_lane: str = "", response_summary: str = ""):
+def _remember_rd_ops_context(message: discord.Message, user_request: str, intent: str, main_subject: str = "", suggested_lane: str = "", response_summary: str = "", source_channel: str = ""):
     if not is_research_and_development_channel(message):
         return
     key = _rd_ops_context_key(message)
@@ -3083,7 +3118,64 @@ def _remember_rd_ops_context(message: discord.Message, user_request: str, intent
         "suggested_lane": (suggested_lane or "")[:80],
         "response_summary": (response_summary or "")[:700],
     })
+    _remember_rd_ops_channel_context(message, user_request, intent, main_subject, suggested_lane, response_summary, source_channel)
 
+
+
+def _rd_ops_channel_context_key(message: discord.Message):
+    guild_id = getattr(getattr(message, "guild", None), "id", 0) or 0
+    channel_id = getattr(getattr(message, "channel", None), "id", 0) or 0
+    return (guild_id, channel_id)
+
+
+def _get_recent_rd_ops_channel_context(message: discord.Message):
+    key = _rd_ops_channel_context_key(message)
+    now = datetime.now(timezone.utc)
+    kept = deque(maxlen=RD_OPS_CHANNEL_CONTEXT_MAX_TURNS)
+    for entry in _rd_ops_channel_context_buffer.get(key, []):
+        ts = entry.get("timestamp")
+        if ts and (now - ts).total_seconds() <= RD_OPS_CHANNEL_CONTEXT_TTL_SECONDS:
+            kept.append(entry)
+    if kept:
+        _rd_ops_channel_context_buffer[key] = kept
+    else:
+        _rd_ops_channel_context_buffer.pop(key, None)
+    return list(kept)
+
+
+def _rd_output_kind_for_intent(intent: str) -> str:
+    mapping = {
+        "broadcast_memory_draft": "broadcast-memory draft",
+        "implementation_guidance": "implementation guidance",
+        "dossier_seed_draft": "dossier seed",
+        "public_safe_message": "public-safe draft",
+        "action_items": "action items",
+        "recap_candidate": "recap candidate",
+        "rd_source_channel_recap": "source-channel recap",
+        "rd_mod_recap": "R&D recap",
+        "rd_followup_classifier": "follow-up classifier",
+        "member_activity": "member activity",
+        "operations_brief": "operations brief",
+    }
+    return mapping.get(intent or "", "operations brief")
+
+
+def _remember_rd_ops_channel_context(message: discord.Message, user_request: str, intent: str, main_subject: str = "", suggested_lane: str = "", response_summary: str = "", source_channel: str = ""):
+    if not is_research_and_development_channel(message):
+        return
+    key = _rd_ops_channel_context_key(message)
+    author = getattr(message, "author", None)
+    _rd_ops_channel_context_buffer[key].append({
+        "timestamp": datetime.now(timezone.utc),
+        "user_display_name": (getattr(author, "display_name", None) or getattr(author, "name", "operator") or "operator")[:80],
+        "detected_intent": intent or "unknown",
+        "main_subject": (main_subject or "")[:120],
+        "suggested_lane": (suggested_lane or "")[:80],
+        "response_summary": (response_summary or "")[:700],
+        "source_channel": (source_channel or "")[:80],
+        "draft_produced": bool(intent in {"broadcast_memory_draft", "dossier_seed_draft", "public_safe_message", "action_items", "recap_candidate", "implementation_guidance"}),
+        "output_kind": _rd_output_kind_for_intent(intent),
+    })
 
 def _rd_context_subject(previous_context) -> str:
     for entry in reversed(previous_context or []):
@@ -3234,6 +3326,245 @@ def build_rd_recap_candidate_response(text: str, previous_context=None) -> str:
         "Lane: keep R&D-only until approved; use #bnl-broadcast-memory separately if it should become official memory."
     )
 
+
+def _normalize_requested_channel_token(text: str) -> str:
+    token = re.sub(r"[`*_~]", "", text or "").strip().lower()
+    token = re.sub(r"^#", "", token).strip()
+    token = re.sub(r"\s+", "-", token)
+    token = re.sub(r"[^a-z0-9-]+", "-", token).strip("-")
+    return token
+
+
+def _channel_candidates_for_guild(guild: discord.Guild):
+    channels = []
+    for channel in getattr(guild, "text_channels", []) or []:
+        if isinstance(channel, discord.TextChannel):
+            channels.append(channel)
+    return channels
+
+
+def extract_requested_source_channel(text: str, guild: discord.Guild) -> discord.TextChannel:
+    if not text or not guild:
+        return None
+    mention = re.search(r"<#(\d+)>", text)
+    if mention:
+        channel = guild.get_channel(int(mention.group(1)))
+        return channel if isinstance(channel, discord.TextChannel) else None
+
+    candidates = _channel_candidates_for_guild(guild)
+    if not candidates:
+        return None
+
+    raw = text.strip()
+    tokens = []
+    tokens.extend(match.group(1) for match in re.finditer(r"#([A-Za-z0-9_-]+)", raw))
+    patterns = (
+        r"(?:break down|summarize|recap|classify)(?: what happened| what just happened| the last discussion| the thread)? (?:in|from)?\s*([A-Za-z0-9][A-Za-z0-9 _-]{2,})$",
+        r"what (?:just )?happened in\s+([A-Za-z0-9][A-Za-z0-9 _-]{2,})$",
+        r"what did people just talk about in\s+([A-Za-z0-9][A-Za-z0-9 _-]{2,})$",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, raw, flags=re.IGNORECASE)
+        if match:
+            tokens.append(match.group(1))
+
+    normalized_to_channels = defaultdict(list)
+    for channel in candidates:
+        normalized_to_channels[_normalize_requested_channel_token(getattr(channel, "name", ""))].append(channel)
+
+    matches = []
+    seen = set()
+    for token in tokens:
+        normalized = _normalize_requested_channel_token(token)
+        if not normalized:
+            continue
+        for channel in normalized_to_channels.get(normalized, []):
+            cid = getattr(channel, "id", 0)
+            if cid not in seen:
+                seen.add(cid)
+                matches.append(channel)
+
+    return matches[0] if len(matches) == 1 else None
+
+
+def _rd_requester_allowed(member: discord.Member, guild: discord.Guild) -> bool:
+    return bool(is_owner_operator(member) or has_mod_role(member) or is_privileged_member(member, guild))
+
+
+def is_allowed_rd_source_channel(channel: discord.TextChannel, requester_member: discord.Member, current_rd_channel: discord.TextChannel) -> tuple:
+    if not channel or not isinstance(channel, discord.TextChannel):
+        return (False, "I cannot inspect that source channel from R&D. It is sealed, unavailable, or outside the allowed recap policy.")
+    current_name = _normalize_channel_name(getattr(current_rd_channel, "name", ""))
+    if current_name != "research-and-development":
+        return (False, "That is an operator workflow. Use #research-and-development for R&D recap/classification. #bnl-broadcast-memory remains the official memory intake lane.")
+    guild = getattr(current_rd_channel, "guild", None) or getattr(channel, "guild", None)
+    if not _rd_requester_allowed(requester_member, guild):
+        return (False, "Operations briefings are restricted to BARCODE operators and mods.")
+    if not requester_member or not hasattr(channel, "permissions_for"):
+        return (False, "I can’t summarize that source channel for you because your Discord permissions do not include access to that channel. Ask someone with access to bring the relevant notes into #research-and-development.")
+    requester_perms = channel.permissions_for(requester_member)
+    if not (getattr(requester_perms, "view_channel", False) and getattr(requester_perms, "read_message_history", False)):
+        return (False, "I can’t summarize that source channel for you because your Discord permissions do not include access to that channel. Ask someone with access to bring the relevant notes into #research-and-development.")
+
+    policy = resolve_channel_policy(channel)
+    normalized_name = _normalize_channel_name(getattr(channel, "name", ""))
+    if policy in {"sealed_test", "unknown"} or normalized_name == "bnl-testing":
+        return (False, "I cannot inspect that source channel from R&D. It is sealed, unavailable, or outside the allowed recap policy.")
+    if policy == "broadcast_memory":
+        return (False, "Use #bnl-broadcast-memory's official intake/correction behavior for memory. I will not run a generic source recap on that lane.")
+    if normalized_name in {"welcome", "episode-tracker"}:
+        return (False, "I cannot inspect that source channel from R&D. It is sealed, unavailable, or outside the allowed recap policy.")
+    if policy == "ai_image_tool" and normalized_name != "ai-avatar":
+        return (False, "I cannot inspect that source channel from R&D. It is sealed, unavailable, or outside the allowed recap policy.")
+    if policy not in {"public_home", "public_context", "public_selective", "internal_controlled", "reference_canon"}:
+        return (False, "I cannot inspect that source channel from R&D. It is sealed, unavailable, or outside the allowed recap policy.")
+
+    guild_me = getattr(getattr(channel, "guild", None), "me", None)
+    if guild_me and hasattr(channel, "permissions_for"):
+        perms = channel.permissions_for(guild_me)
+        if not (getattr(perms, "view_channel", False) and getattr(perms, "read_message_history", False)):
+            return (False, "I can’t read that channel history from here. Check BNL’s Discord permissions or give me the relevant notes directly.")
+    return (True, policy)
+
+
+async def fetch_recent_source_channel_messages(channel: discord.TextChannel, limit: int = 25, minutes: int = 60) -> list:
+    rows = []
+    if not channel or not hasattr(channel, "history"):
+        return rows
+    policy = resolve_channel_policy(channel)
+    after = datetime.now(timezone.utc) - timedelta(minutes=max(1, int(minutes or 60)))
+    try:
+        async for msg in channel.history(limit=max(1, min(int(limit or 25), 25)), after=after, oldest_first=False):
+            content = re.sub(r"\s+", " ", getattr(msg, "clean_content", None) or getattr(msg, "content", "") or "").strip()
+            if not content or content.startswith("/"):
+                continue
+            rows.append({
+                "author_display_name": (getattr(getattr(msg, "author", None), "display_name", "") or getattr(getattr(msg, "author", None), "name", "unknown"))[:80],
+                "content": content[:500],
+                "timestamp": getattr(msg, "created_at", datetime.now(timezone.utc)),
+                "channel_name": getattr(channel, "name", ""),
+                "channel_policy": policy,
+                "author_is_bot": bool(getattr(getattr(msg, "author", None), "bot", False)),
+            })
+    except Exception as exc:
+        logging.info(f"rd_source_channel_history_failed channel={getattr(channel, 'name', '')} reason={type(exc).__name__}")
+        return []
+    rows.reverse()
+    return rows
+
+
+def _rd_entries_for_recap(previous_context=None, channel_context=None):
+    entries = []
+    for entry in (channel_context or []) + (previous_context or []):
+        if not entry or entry.get("detected_intent") in {"rd_mod_recap", "rd_followup_classifier"}:
+            continue
+        key = (entry.get("timestamp"), entry.get("detected_intent"), entry.get("response_summary"))
+        if key not in {(e.get("timestamp"), e.get("detected_intent"), e.get("response_summary")) for e in entries}:
+            entries.append(entry)
+    return entries[-RD_OPS_CHANNEL_CONTEXT_MAX_TURNS:]
+
+
+def _rd_entry_subjects(entries) -> str:
+    subjects = []
+    for entry in entries:
+        subject = (entry.get("main_subject") or "").strip()
+        if subject and subject.lower() not in {"this item", "member activity"} and subject not in subjects:
+            subjects.append(subject)
+    return ", ".join(subjects[:4]) or "recent R&D items"
+
+
+def build_rd_mod_recap_response(text: str, previous_context=None, channel_context=None) -> str:
+    entries = _rd_entries_for_recap(previous_context, channel_context)
+    if not entries:
+        return ("R&D recap:\n\nContext is thin. I do not have recent transient R&D context to recap yet. "
+                "Give me the relevant notes or ask after a concrete R&D draft/action/source recap. R&D discussion is not official memory unless posted through #bnl-broadcast-memory.")
+    subjects = _rd_entry_subjects(entries)
+    summaries = [e.get("response_summary") or e.get("user_request") or "Recent R&D item was handled." for e in entries[-3:]]
+    produced = {e.get("output_kind") for e in entries if e.get("output_kind")}
+    return (
+        "R&D recap:\n\n"
+        "Done / decided:\n"
+        f"- Operators worked through {subjects}; recent outputs: {', '.join(sorted(produced))}.\n"
+        f"- Latest safe summary: {_safe_truncate_summary(' | '.join(summaries), 260)}\n\n"
+        "Needs action:\n"
+        "- If any item should become official memory, an operator must paste the approved note into #bnl-broadcast-memory.\n\n"
+        "Broadcast-memory candidates:\n"
+        "- Draft produced / not official yet if the recent work included a broadcast-memory draft or implementation lane.\n\n"
+        "Dossier seeds:\n"
+        "- Seed only / not live dossier for any entity or policy idea that needs later tracking.\n\n"
+        "Public-safe copy needed:\n"
+        "- Public-safe draft only / not published if operators want outward wording.\n\n"
+        "Recap candidates:\n"
+        "- Recap candidate only / not final recap until approved.\n\n"
+        "Do not do yet:\n"
+        "- Do not treat R&D discussion, source recaps, seeds, or drafts as canon, public relay, website dossiers, queue/runtime/account/payment state, or Discord Radio tracking."
+    )
+
+
+def build_rd_followup_classifier_response(text: str, previous_context=None, channel_context=None) -> str:
+    entries = _rd_entries_for_recap(previous_context, channel_context)
+    if not entries:
+        return ("Follow-up lanes:\n\nNeeds confirmation:\n- Context is thin. Give me the notes or create a concrete R&D draft first.\n\n"
+                "Do not do yet:\n- Do not invent decisions, official memory, dossiers, public posts, queue/account/payment behavior, or relay state from an empty R&D window.")
+    subjects = _rd_entry_subjects(entries)
+    return (
+        "Follow-up lanes:\n\n"
+        "Put in #bnl-broadcast-memory:\n"
+        f"- Any confirmed fact about {subjects} that BNL should officially remember. Draft produced / not official yet until posted there.\n\n"
+        "Keep R&D-only:\n"
+        "- Speculation, mod reasoning, source-channel recap details, and unfinished decisions.\n\n"
+        "Possible dossier seed:\n"
+        f"- {subjects} if operators want future tracking; seed only / not live dossier.\n\n"
+        "Possible public-safe post:\n"
+        "- Only if requested and approved; public-safe draft means copy exists, not published.\n\n"
+        "Possible recap candidate:\n"
+        "- Use only for a viewer-facing episode/event recap after approval; not final recap yet.\n\n"
+        "Needs confirmation:\n"
+        "- Exact source, date, public-safe wording, and whether official memory is wanted.\n\n"
+        "Do not do yet:\n"
+        "- Do not connect this to website dossiers, queue runtime, accounts, payments, Discord Radio tracking, public relay, or automatic canon."
+    )
+
+
+def _source_rows_topic(rows) -> str:
+    words = []
+    stop = {"the", "and", "for", "that", "this", "with", "you", "are", "was", "what", "just", "have", "from", "they", "about", "into", "your", "our"}
+    for row in rows:
+        for token in re.findall(r"[A-Za-z][A-Za-z0-9'-]{2,}", row.get("content", "")):
+            low = token.lower()
+            if low not in stop and low not in words:
+                words.append(low)
+    return ", ".join(words[:6]) or "recent discussion"
+
+
+def build_rd_source_channel_recap_response(source_channel, source_policy: str, rows: list, request_text: str) -> str:
+    channel_name = getattr(source_channel, "name", "source-channel")
+    if len(rows or []) < 2:
+        return (f"Source recap: #{channel_name}\n\n"
+                f"Context is thin. I only found {len(rows or [])} recent usable message(s), so I cannot confidently classify what happened. Give me the relevant notes or expand the time window.")
+    label = "Internal-only source recap" if source_policy == "internal_controlled" else "Source recap"
+    topic = _source_rows_topic(rows)
+    human_count = sum(1 for row in rows if not row.get("author_is_bot"))
+    bot_count = len(rows) - human_count
+    latest = rows[-1]
+    latest_time = getattr(latest.get("timestamp"), "isoformat", lambda: "unknown")()
+    return (
+        f"{label}: #{channel_name}\n\n"
+        "What happened:\n"
+        f"- I found {len(rows)} bounded recent usable messages ({human_count} human, {bot_count} bot) in a {source_policy} lane. The visible discussion clusters around: {topic}.\n"
+        f"- Most recent usable message timestamp: {latest_time}. No raw message dump is stored or relayed.\n\n"
+        "Why it matters:\n"
+        "- This is a temporary operator summary for R&D, not passive memory, public relay, canon, or a broadcast-memory write.\n\n"
+        "Suggested follow-ups:\n"
+        "- Confirm the actual decision or question with the channel participants before turning it into an official note.\n"
+        "- If public wording is needed, ask for a public-safe draft separately.\n\n"
+        "Possible lanes:\n"
+        "- Broadcast memory candidate: only if an operator confirms a stable fact and posts it in #bnl-broadcast-memory.\n"
+        "- Dossier seed: possible only as seed only / not live dossier if a recurring entity or issue is emerging.\n"
+        "- Public-safe copy: draft only / not published, and only on request.\n"
+        "- R&D-only: keep internal reasoning, mod notes, and uncertainty here.\n"
+        "- Do not do yet: do not create canon, dossiers, public announcements, website relay, queue/account/payment behavior, or durable memory from this source recap."
+    )
 
 def _rd_response_summary_for_context(response: str) -> str:
     clean = re.sub(r"```.*?```", "[draft code block]", response or "", flags=re.DOTALL)
@@ -8247,6 +8578,7 @@ def _direct_session_key(message: discord.Message):
 
 _direct_payload_sessions = {}
 _rd_ops_context_buffer = defaultdict(lambda: deque(maxlen=RD_OPS_CONTEXT_MAX_TURNS))
+_rd_ops_channel_context_buffer = defaultdict(lambda: deque(maxlen=RD_OPS_CHANNEL_CONTEXT_MAX_TURNS))
 _recent_direct_response_window = {}
 DIRECT_FOLLOWUP_WINDOW_SECONDS = 60
 
@@ -8738,6 +9070,7 @@ async def on_message(message: discord.Message):
             await message.reply("Tag me with what you need: operations brief, mod actions, recap hooks, or dossier seed suggestions.")
             return
         previous_rd_context = _get_recent_rd_ops_context(message)
+        rd_channel_context = _get_recent_rd_ops_channel_context(message)
         rd_intent = detect_rd_ops_intent(clean_content)
         if rd_intent == "member_activity":
             events = get_recent_member_activity_events(message.guild.id, limit=10, days=14)
@@ -8749,6 +9082,7 @@ async def on_message(message: discord.Message):
 
         response = ""
         suggested_lane = "#research-and-development"
+        source_channel_context = ""
         if rd_intent == "broadcast_memory_draft":
             response = build_rd_broadcast_memory_draft_response(clean_content, previous_rd_context)
             suggested_lane = "#bnl-broadcast-memory"
@@ -8767,6 +9101,25 @@ async def on_message(message: discord.Message):
         elif rd_intent == "recap_candidate":
             response = build_rd_recap_candidate_response(clean_content, previous_rd_context)
             suggested_lane = "recap candidate"
+        elif rd_intent == "rd_source_channel_recap":
+            source_channel = extract_requested_source_channel(clean_content, message.guild)
+            if not source_channel:
+                response = "I need the exact source channel. Tag it like #general-chat or give the channel name exactly."
+            else:
+                allowed_source, source_policy_or_reason = is_allowed_rd_source_channel(source_channel, member, message.channel)
+                if not allowed_source:
+                    response = source_policy_or_reason
+                else:
+                    rows = await fetch_recent_source_channel_messages(source_channel, limit=25, minutes=60)
+                    response = build_rd_source_channel_recap_response(source_channel, source_policy_or_reason, rows, clean_content)
+                    source_channel_context = getattr(source_channel, 'name', '')
+                    suggested_lane = f"source recap #{source_channel_context}"
+        elif rd_intent == "rd_mod_recap":
+            response = build_rd_mod_recap_response(clean_content, previous_rd_context, rd_channel_context)
+            suggested_lane = "R&D recap"
+        elif rd_intent == "rd_followup_classifier":
+            response = build_rd_followup_classifier_response(clean_content, previous_rd_context, rd_channel_context)
+            suggested_lane = "follow-up lanes"
         else:
             ops_context = build_operations_brief_context(message.guild.id, clean_content)
             ops_prompt = (
@@ -8803,14 +9156,15 @@ async def on_message(message: discord.Message):
             _extract_rd_subject(clean_content, previous_rd_context),
             suggested_lane,
             _rd_response_summary_for_context(response),
+            source_channel_context,
         )
         _mark_recent_direct_response(message.channel.id, message.author.id)
         return
 
     if real_direct_target and is_public_prompt_context(channel_policy):
         public_rd_intent = detect_rd_ops_intent(clean_content)
-        if public_rd_intent in {"broadcast_memory_draft", "implementation_guidance", "dossier_seed_draft", "recap_candidate"}:
-            await message.reply("Broadcast-memory and dossier preparation are operator workflows. Use #research-and-development to draft the note, then #bnl-broadcast-memory is the official intake lane if an operator approves it.")
+        if public_rd_intent in {"broadcast_memory_draft", "implementation_guidance", "dossier_seed_draft", "recap_candidate", "action_items", "rd_source_channel_recap", "rd_mod_recap", "rd_followup_classifier"}:
+            await message.reply("That is an operator workflow. Use #research-and-development for R&D recap/classification. #bnl-broadcast-memory remains the official memory intake lane.")
             _mark_recent_direct_response(message.channel.id, message.author.id)
             return
 
