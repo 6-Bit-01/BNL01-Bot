@@ -13,7 +13,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
-from bnl_dossier_recommendations import build_dossier_recommendation_payload
+from bnl_dossier_recommendations import VALID_DOSSIER_CATEGORIES, build_dossier_recommendation_payload
 from bnl_dossier_source_packets import (
     APPROVED_SOURCE_LANES,
     DEFAULT_MISSING_INFO,
@@ -30,6 +30,7 @@ DEFAULT_DISCOVERY_LANES = ["rd_context", "broadcast_memory"]
 MAX_DISCOVERY_LIMIT = 25
 DEFAULT_DISCOVERY_LIMIT = 10
 MIN_CANDIDATE_SCORE = 3
+TITLE_ONLY_MIN_SCORE = 5
 MAX_REASON_LENGTH = 300
 _ALLOWED_DISCOVERY_LANES = set(DEFAULT_DISCOVERY_LANES) & set(APPROVED_SOURCE_LANES)
 _DISCORD_MENTION_PATTERN = re.compile(r"<[@#!&]?[0-9]{5,}>")
@@ -60,6 +61,41 @@ _STOP_PHRASES = {
     "Public Safe",
 }
 
+_WEAK_SUBJECT_TERMS = {
+    "next",
+    "add",
+    "origin",
+    "bit",
+    "signal",
+    "source",
+    "file",
+    "candidate",
+    "review",
+    "lane",
+    "memory",
+    "public",
+    "private",
+    "context",
+    "system",
+    "entity",
+    "recommendation",
+    "inbox",
+    "subject",
+    "name",
+    "admin",
+    "owner",
+    "operator",
+    "mod",
+    "user",
+    "channel",
+    "message",
+}
+
+_KNOWN_ONE_WORD_SUBJECTS = {"cliff", "sheila", "shadowspit"}
+_SUBJECT_WORD = r"[A-Z0-9][A-Za-z0-9'_-]*"
+_SUBJECT_PHRASE = rf"{_SUBJECT_WORD}(?:\s+{_SUBJECT_WORD}){{0,4}}"
+_EXPLICIT_SUBJECT_BOUNDARY = r"(?=$|[.?!,;:]|\s+(?:because|and|with|from|in|as|that|so|when|while|but|for review)\b)"
+
 _CATEGORY_TERMS = (
     ("identity_alias_review", re.compile(r"\b(alias|alternate name|aka|same as|duplicate|identity|connect(?:s|ed)? to)\b", re.I)),
     ("system_concept_candidate", re.compile(r"\b(system|concept|protocol|workflow|lane|interface|program)\b", re.I)),
@@ -83,6 +119,7 @@ class CandidateAccumulator:
     evidence: list[dict[str, str]] = field(default_factory=list)
     mentions: int = 0
     explicit_hits: int = 0
+    title_hits: int = 0
     score: int = 0
 
 
@@ -207,8 +244,9 @@ def collect_discovery_source_items(
 def _explicit_subjects(text: str) -> list[str]:
     subjects: list[str] = []
     patterns = (
-        r"(?:source file|dossier|candidate|review|alias review|identity review)\s+(?:for|on|about)\s+([A-Z0-9][A-Za-z0-9'_-]*(?:\s+[A-Z0-9][A-Za-z0-9'_-]*){0,4})",
-        r"([A-Z0-9][A-Za-z0-9'_-]*(?:\s+[A-Z0-9][A-Za-z0-9'_-]*){0,4})\s+(?:needs|deserves|should have|should get|may need)\s+(?:a\s+)?(?:source file|dossier|alias review|identity review)",
+        rf"\b(?:source file|dossier|alias review|identity review)\s+(?:for|on|about)\s+({_SUBJECT_PHRASE}){_EXPLICIT_SUBJECT_BOUNDARY}",
+        rf"\b({_SUBJECT_PHRASE})\s+(?:needs|deserves|should have|should get|may need)\s+(?:a\s+)?(?:source file|dossier|alias review|identity review)\b",
+        rf"\b({_SUBJECT_PHRASE})\s+is\s+(?:an?\s+)?(?:recurring|repeated|priority)\s+(?:entity|character|candidate|subject)\b",
     )
     for pattern in patterns:
         for match in re.finditer(pattern, text or "", flags=re.I):
@@ -231,15 +269,55 @@ def _clean_subject(candidate: str) -> str:
 
 def _valid_subject(candidate: str) -> bool:
     subject = _clean_subject(candidate)
+    normalized = subject.lower()
     if not subject or len(subject) < 3 or subject in _STOP_PHRASES:
         return False
-    if subject.lower() in {item.lower() for item in _STOP_PHRASES}:
+    if normalized in {item.lower() for item in _STOP_PHRASES}:
+        return False
+    if normalized in _WEAK_SUBJECT_TERMS:
+        return False
+    words = re.findall(r"[A-Za-z0-9]+", normalized)
+    if words and all(word in _WEAK_SUBJECT_TERMS for word in words):
+        return False
+    if normalized in {"barcode", "barcode radio", "barcode network"}:
         return False
     if re.fullmatch(r"\d+", subject):
         return False
-    if subject.lower().startswith(("do not", "public safe", "source lane")):
+    if subject.lower().startswith(("do not", "public safe", "source lane", "in ", "on ", "at ", "for ", "with ")):
         return False
     return bool(re.search(r"[A-Za-z]", subject))
+
+
+def _has_strong_evidence(acc: CandidateAccumulator) -> bool:
+    if acc.explicit_hits > 0:
+        return True
+    normalized = acc.subject_name.lower()
+    if len(acc.subject_name.split()) == 1 and normalized not in _KNOWN_ONE_WORD_SUBJECTS:
+        return False
+    if acc.mentions < 2 or acc.score < TITLE_ONLY_MIN_SCORE:
+        return False
+    return any(
+        re.search(r"\b(recurring|repeated|priority|source file|dossier|candidate|alias review|identity review)\b", item.get("summary") or "", flags=re.I)
+        for item in acc.evidence
+    )
+
+
+def _payload_taxonomy(acc: CandidateAccumulator) -> dict[str, Any]:
+    if acc.category == "identity_alias_review":
+        return {"type": "identity_link"}
+    if acc.category == "system_concept_candidate":
+        return {
+            "type": "new_subject",
+            "recommendedCategory": "Interface",
+            "recommendedKind": "system",
+            "recommendedEcosystemLane": "infrastructure",
+            "recommendedIdentityAuthority": "mixed_or_unclear",
+        }
+    return {
+        "type": "new_subject",
+        "recommendedCategory": "Entity",
+        "recommendedIdentityAuthority": "mixed_or_unclear",
+    }
 
 
 def _category_for_text(text: str) -> str:
@@ -287,10 +365,10 @@ def discover_candidate_recommendations(
     for item in source_items:
         text = item.text
         explicit = {_clean_subject(subject) for subject in _explicit_subjects(text) if _valid_subject(subject)}
-        candidates = list(explicit)
-        candidates.extend(_clean_subject(subject) for subject in _title_subjects(text) if _valid_subject(subject))
+        candidate_sources: list[tuple[str, bool]] = [(subject, True) for subject in explicit]
+        candidate_sources.extend((_clean_subject(subject), False) for subject in _title_subjects(text) if _valid_subject(subject))
         seen_in_item: set[str] = set()
-        for subject in candidates:
+        for subject, is_explicit in candidate_sources:
             key = subject_key(subject)
             if key in seen_in_item:
                 continue
@@ -301,21 +379,23 @@ def discover_candidate_recommendations(
                 accumulators[key] = acc
             acc.mentions += 1
             acc.lanes.add(item.lane)
-            if subject in explicit:
+            if is_explicit:
                 acc.explicit_hits += 1
+            else:
+                acc.title_hits += 1
             category = _category_for_text(text)
             if acc.category == "new_source_file_candidate" or category != "new_source_file_candidate":
                 acc.category = category
             if len(acc.evidence) < 5:
                 acc.evidence.append({"lane": item.lane, "label": item.label, "summary": _safe_snippet(text), "sourceRef": item.source_ref})
-            acc.score += item.weight + (2 if subject in explicit else 0)
+            acc.score += item.weight + (2 if is_explicit else 0)
             if re.search(r"\b(recurring|repeated|important|priority|source file|dossier|candidate|alias review|identity review)\b", text, flags=re.I):
                 acc.score += 1
 
     candidates: list[dict[str, Any]] = []
     withheld_count = 0
     for acc in accumulators.values():
-        passed = acc.score >= MIN_CANDIDATE_SCORE and acc.evidence and acc.lanes
+        passed = acc.score >= MIN_CANDIDATE_SCORE and acc.evidence and acc.lanes and _has_strong_evidence(acc)
         if not passed:
             withheld_count += 1
             continue
@@ -328,9 +408,10 @@ def discover_candidate_recommendations(
         )
         evidence_summary = _evidence_summary(acc.evidence)
         evidence_hash = hashlib.sha256(f"{reason}\n{evidence_summary}".encode("utf-8")).hexdigest()[:8]
+        taxonomy = _payload_taxonomy(acc)
         payload = build_dossier_recommendation_payload(
             {
-                "type": "new_subject",
+                **taxonomy,
                 "subjectName": acc.subject_name,
                 "subjectKey": subject_key(acc.subject_name),
                 "reason": reason,
@@ -339,15 +420,17 @@ def discover_candidate_recommendations(
                 "suggestedAction": DEFAULT_SUGGESTED_ACTION,
                 "missingInfo": list(DEFAULT_MISSING_INFO),
                 "publicSafetyNotes": list(DEFAULT_PUBLIC_SAFETY_NOTES) + [
+                    f"Internal discovery classification: {acc.category}.",
                     "BNL dynamic discovery is review-only and does not confirm identity, aliases, or publication readiness."
                 ],
-                "recommendedCategory": acc.category,
                 "confidence": confidence,
                 "createdBy": "bnl",
                 "ingestSource": DISCOVERY_INGEST_SOURCE,
                 "ingestKey": f"bnl:dossier:{DISCOVERY_INGEST_SOURCE}:{acc.category}:{subject_key(acc.subject_name)}:{'-'.join(lane_list)}:{evidence_hash}",
             }
         )
+        if payload.get("recommendedCategory") and payload.get("recommendedCategory") not in VALID_DOSSIER_CATEGORIES:
+            payload.pop("recommendedCategory", None)
         candidates.append({"subjectName": acc.subject_name, "category": acc.category, "score": acc.score, "payload": payload})
 
     candidates.sort(key=lambda row: (-int(row.get("score") or 0), str(row.get("subjectName") or "").lower()))

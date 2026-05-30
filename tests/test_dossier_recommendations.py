@@ -317,6 +317,82 @@ class DossierCandidateDiscoveryTests(unittest.TestCase):
         self.assertIn("broadcast_memory", payload["sourceLanes"])
         self.assertIn("review", payload["reason"].lower())
 
+
+    def test_dynamic_discovery_payload_uses_valid_website_taxonomy(self):
+        rows = [("2026-05-29", "Anita Cable needs a source file. Anita Cable is a recurring entity.")]
+        result = discovery.discover_candidate_recommendations(123, ["broadcast_memory"], broadcast_memory_reader=lambda *a, **k: rows)
+        payload = next(payload for payload in result["payloads"] if payload["subjectName"] == "Anita Cable")
+
+        self.assertEqual(payload["type"], "new_subject")
+        self.assertEqual(payload["ingestSource"], discovery.DISCOVERY_INGEST_SOURCE)
+        self.assertEqual(payload.get("recommendedCategory"), "Entity")
+        self.assertNotIn(payload.get("recommendedCategory"), {"new_source_file_candidate", "system_concept_candidate", "identity_alias_review"})
+        self.assertIn("Internal discovery classification: new_source_file_candidate", " ".join(payload["publicSafetyNotes"]))
+
+    def test_system_concept_candidate_uses_interface_taxonomy(self):
+        result = discovery.discover_candidate_recommendations(
+            123,
+            ["broadcast_memory"],
+            broadcast_memory_reader=lambda *a, **k: [("2026-05-29", "Source file for Mac Modem. Mac Modem is a recurring interface system concept.")],
+        )
+        payload = next(payload for payload in result["payloads"] if payload["subjectName"] == "Mac Modem")
+
+        self.assertEqual(payload["type"], "new_subject")
+        self.assertEqual(payload.get("recommendedCategory"), "Interface")
+        self.assertEqual(payload.get("recommendedKind"), "system")
+        self.assertEqual(payload.get("recommendedEcosystemLane"), "infrastructure")
+        self.assertNotIn(payload.get("recommendedCategory"), {"new_source_file_candidate", "system_concept_candidate", "identity_alias_review"})
+
+    def test_identity_alias_review_is_review_only_identity_link(self):
+        result = discovery.discover_candidate_recommendations(
+            123,
+            ["broadcast_memory"],
+            broadcast_memory_reader=lambda *a, **k: [("2026-05-29", "Identity review for Anita Cable. Anita Cable may be an alias and needs identity review.")],
+        )
+        payload = next(payload for payload in result["payloads"] if payload["subjectName"] == "Anita Cable")
+
+        self.assertEqual(payload["type"], "identity_link")
+        self.assertNotIn("recommendedCategory", payload)
+        self.assertNotIn("recommendedKind", payload)
+        self.assertIn("Internal discovery classification: identity_alias_review", " ".join(payload["publicSafetyNotes"]))
+
+    def test_payload_builder_drops_invalid_recommended_category(self):
+        payload = dossier.build_dossier_recommendation_payload(
+            {
+                "type": "new_subject",
+                "subjectName": "Signal Witch",
+                "reason": "Review.",
+                "sourceLanes": ["rd_context"],
+                "recommendedCategory": "new_source_file_candidate",
+            }
+        )
+
+        self.assertNotIn("recommendedCategory", payload)
+
+    def test_weak_generic_subjects_are_withheld(self):
+        result = discovery.discover_candidate_recommendations(
+            123,
+            ["broadcast_memory"],
+            broadcast_memory_reader=lambda *a, **k: [
+                ("2026-05-29", "Source file for next. Add needs a source file. Origin deserves a dossier. Bit needs a source file."),
+                ("2026-05-22", "Next is a recurring entity. Origin needs a source file. Bit deserves a dossier."),
+            ],
+        )
+
+        self.assertEqual(result["payloads"], [])
+        self.assertGreaterEqual(result["withheldCount"], 0)
+
+    def test_explicit_legitimate_subjects_pass_with_strong_evidence(self):
+        rows = [
+            ("2026-05-29", "Anita Cable needs a source file. Anita Cable is a recurring entity."),
+            ("2026-05-22", "Source file for Signal Witch. Signal Witch deserves a dossier."),
+        ]
+        result = discovery.discover_candidate_recommendations(123, ["broadcast_memory"], broadcast_memory_reader=lambda *a, **k: rows)
+        names = {payload["subjectName"] for payload in result["payloads"]}
+
+        self.assertIn("Anita Cable", names)
+        self.assertIn("Signal Witch", names)
+
     def test_discovery_parse_command_has_no_subject_argument(self):
         matched, options, error = discovery.parse_dossier_discovery_command(
             "!bnl dossier discover candidates | lanes=rd_context,broadcast_memory | limit=7 | dry_run=true"
@@ -458,6 +534,32 @@ class DossierDiscoveryRoutingTests(unittest.TestCase):
         send_mock.assert_called_once_with(fake_payload)
         self.assertIn("1 recommendations sent", message.replies[-1])
         self.assertIn("2 withheld", message.replies[-1])
+
+    def test_failed_dynamic_sends_are_counted_in_operator_reply(self):
+        bnl01_bot.BNL_OWNER_USER_ID = 999
+        message = self.Message(user_id=999)
+        payloads = [
+            {"type": "new_subject", "subjectName": "Anita Cable", "reason": "Review only", "sourceLanes": ["broadcast_memory"]},
+            {"type": "new_subject", "subjectName": "Signal Witch", "reason": "Review only", "sourceLanes": ["broadcast_memory"]},
+        ]
+        fake_discovery = {
+            "candidates": [{"subjectName": payload["subjectName"], "payload": payload} for payload in payloads],
+            "payloads": payloads,
+            "withheldCount": 4,
+            "duplicateCount": 0,
+        }
+        with mock.patch.object(bnl01_bot, "discover_candidate_recommendations", return_value=fake_discovery), \
+             mock.patch.object(bnl01_bot, "send_dossier_recommendation", return_value={"ok": False, "duplicate": False, "status": 400}):
+            handled = asyncio.run(bnl01_bot.maybe_handle_dossier_recommendation_command(message, "!bnl dossier discover candidates | limit=2"))
+
+        self.assertTrue(handled)
+        self.assertIn("0 recommendations sent", message.replies[-1])
+        self.assertIn("4 withheld", message.replies[-1])
+        self.assertIn("2 failed", message.replies[-1])
+        self.assertIn("First failure: HTTP 400", message.replies[-1])
+        diag = bnl01_bot.build_dossier_recommendation_diagnostics()
+        self.assertEqual(diag["candidate_discovery_last_failed_count"], 2)
+        self.assertEqual(diag["candidate_discovery_last_first_failure_status"], "HTTP 400")
 
 
 if __name__ == "__main__":

@@ -473,7 +473,10 @@ _last_candidate_discovery_run_time = "never"
 _last_candidate_discovery_sent_count = 0
 _last_candidate_discovery_duplicate_count = 0
 _last_candidate_discovery_withheld_count = 0
+_last_candidate_discovery_failed_count = 0
 _last_candidate_discovery_error_status = "none"
+_last_candidate_discovery_first_failure_status = "none"
+_last_candidate_discovery_rejected_subjects_count = 0
 _last_candidate_discovery_source_lanes = []
 _last_candidate_discovery_mode = "none"
 BNL_CONTROL_FLAGS_TTL_SECONDS = 300
@@ -3973,7 +3976,10 @@ def build_dossier_recommendation_diagnostics() -> dict:
         "candidate_discovery_last_sent_count": _last_candidate_discovery_sent_count,
         "candidate_discovery_last_duplicate_count": _last_candidate_discovery_duplicate_count,
         "candidate_discovery_last_withheld_count": _last_candidate_discovery_withheld_count,
+        "candidate_discovery_last_failed_count": _last_candidate_discovery_failed_count,
         "candidate_discovery_last_error_status": _last_candidate_discovery_error_status,
+        "candidate_discovery_last_first_failure_status": _last_candidate_discovery_first_failure_status,
+        "candidate_discovery_last_rejected_subjects_count": _last_candidate_discovery_rejected_subjects_count,
         "candidate_discovery_last_source_lanes": list(_last_candidate_discovery_source_lanes),
         "candidate_discovery_last_mode": _last_candidate_discovery_mode,
     }
@@ -4001,7 +4007,9 @@ async def maybe_handle_dossier_discovery_command(message: discord.Message, clean
     global _last_dossier_recommendation_status
     global _last_candidate_discovery_run_time, _last_candidate_discovery_sent_count
     global _last_candidate_discovery_duplicate_count, _last_candidate_discovery_withheld_count
-    global _last_candidate_discovery_error_status, _last_candidate_discovery_source_lanes, _last_candidate_discovery_mode
+    global _last_candidate_discovery_failed_count, _last_candidate_discovery_first_failure_status
+    global _last_candidate_discovery_rejected_subjects_count, _last_candidate_discovery_error_status
+    global _last_candidate_discovery_source_lanes, _last_candidate_discovery_mode
 
     matched, options, parse_error = parse_dossier_discovery_command(clean_content)
     if not matched:
@@ -4026,7 +4034,10 @@ async def maybe_handle_dossier_discovery_command(message: discord.Message, clean
     _last_candidate_discovery_run_time = datetime.now(timezone.utc).isoformat()
     _last_candidate_discovery_source_lanes = list(lanes)
     _last_candidate_discovery_mode = "dry_run" if dry_run else "command"
+    _last_candidate_discovery_failed_count = 0
     _last_candidate_discovery_error_status = "none"
+    _last_candidate_discovery_first_failure_status = "none"
+    _last_candidate_discovery_rejected_subjects_count = 0
 
     discovery = discover_candidate_recommendations(
         getattr(message.guild, "id", None),
@@ -4043,14 +4054,17 @@ async def maybe_handle_dossier_discovery_command(message: discord.Message, clean
         _last_candidate_discovery_sent_count = 0
         _last_candidate_discovery_duplicate_count = duplicate_count
         _last_candidate_discovery_withheld_count = withheld
+        _last_candidate_discovery_rejected_subjects_count = withheld
         names = [str(candidate.get("subjectName") or "subject")[:40] for candidate in candidates[:5]]
         suffix = f" Top candidates: {', '.join(names)}." if names else ""
         await message.reply(f"Dossier discovery dry run: {len(candidates)} candidates found.{suffix} Nothing sent.")
         return True
 
     sent_count = 0
+    failed_count = 0
     send_duplicates = duplicate_count
     first_error = "none"
+    first_failure_status = "none"
     for candidate in candidates:
         payload = candidate.get("payload") or {}
         result = await asyncio.to_thread(send_dossier_recommendation, payload)
@@ -4058,17 +4072,30 @@ async def maybe_handle_dossier_discovery_command(message: discord.Message, clean
             send_duplicates += 1
         elif result.get("ok"):
             sent_count += 1
-        elif first_error == "none":
-            first_error = f"failed:{result.get('status') or 'no_status'}"
+        else:
+            failed_count += 1
+            status = result.get("status") or "no_status"
+            if first_error == "none":
+                first_error = f"failed:{status}"
+                first_failure_status = f"HTTP {status}" if status != "no_status" else "no_status"
 
     _last_candidate_discovery_sent_count = sent_count
+    _last_candidate_discovery_failed_count = failed_count
     _last_candidate_discovery_duplicate_count = send_duplicates
     _last_candidate_discovery_withheld_count = withheld
+    _last_candidate_discovery_rejected_subjects_count = withheld
     _last_candidate_discovery_error_status = first_error
-    _last_dossier_recommendation_status = f"candidate_discovery_sent:{sent_count}:duplicates:{send_duplicates}:withheld:{withheld}" if first_error == "none" else first_error
+    _last_candidate_discovery_first_failure_status = first_failure_status
+    _last_dossier_recommendation_status = (
+        f"candidate_discovery_sent:{sent_count}:duplicates:{send_duplicates}:withheld:{withheld}:failed:{failed_count}"
+        if first_error == "none"
+        else first_error
+    )
+    failure_suffix = f" First failure: {first_failure_status}." if failed_count and first_failure_status != "none" else ""
     await message.reply(
         f"Dossier discovery complete: {sent_count} recommendations sent, "
-        f"{send_duplicates} duplicates skipped, {withheld} withheld for low confidence."
+        f"{send_duplicates} duplicates skipped, {withheld} withheld, {failed_count} failed."
+        f"{failure_suffix}"
     )
     return True
 
@@ -11779,7 +11806,10 @@ async def bnl_source_check(interaction: discord.Interaction):
         f"- candidate_discovery_last_sent_count: `{dossier_diag['candidate_discovery_last_sent_count']}`",
         f"- candidate_discovery_last_duplicate_count: `{dossier_diag['candidate_discovery_last_duplicate_count']}`",
         f"- candidate_discovery_last_withheld_count: `{dossier_diag['candidate_discovery_last_withheld_count']}`",
+        f"- candidate_discovery_last_failed_count: `{dossier_diag['candidate_discovery_last_failed_count']}`",
         f"- candidate_discovery_last_error_status: `{dossier_diag['candidate_discovery_last_error_status']}`",
+        f"- candidate_discovery_last_first_failure_status: `{dossier_diag['candidate_discovery_last_first_failure_status']}`",
+        f"- candidate_discovery_last_rejected_subjects_count: `{dossier_diag['candidate_discovery_last_rejected_subjects_count']}`",
         f"- candidate_discovery_last_source_lanes: `{','.join(dossier_diag['candidate_discovery_last_source_lanes']) or 'none'}`",
         f"- candidate_discovery_last_mode: `{dossier_diag['candidate_discovery_last_mode']}`",
         f"- _bnl_control_flags_last_source_url: `{flags_source}`",
@@ -12010,7 +12040,10 @@ async def bnl_status(interaction: discord.Interaction):
         f"- candidate_discovery_last_sent_count: `{dossier_diag['candidate_discovery_last_sent_count']}`",
         f"- candidate_discovery_last_duplicate_count: `{dossier_diag['candidate_discovery_last_duplicate_count']}`",
         f"- candidate_discovery_last_withheld_count: `{dossier_diag['candidate_discovery_last_withheld_count']}`",
+        f"- candidate_discovery_last_failed_count: `{dossier_diag['candidate_discovery_last_failed_count']}`",
         f"- candidate_discovery_last_error_status: `{dossier_diag['candidate_discovery_last_error_status']}`",
+        f"- candidate_discovery_last_first_failure_status: `{dossier_diag['candidate_discovery_last_first_failure_status']}`",
+        f"- candidate_discovery_last_rejected_subjects_count: `{dossier_diag['candidate_discovery_last_rejected_subjects_count']}`",
         f"- candidate_discovery_last_source_lanes: `{','.join(dossier_diag['candidate_discovery_last_source_lanes']) or 'none'}`",
         f"- candidate_discovery_last_mode: `{dossier_diag['candidate_discovery_last_mode']}`",
         f"- read_model_enabled: `{'yes' if read_model_diag.get('enabled') else 'no'}`",

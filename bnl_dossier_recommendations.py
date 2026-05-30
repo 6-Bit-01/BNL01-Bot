@@ -43,6 +43,8 @@ SUPPORTED_PAYLOAD_FIELDS = {
     "ingestSource",
 }
 _SAFE_LANE_PATTERN = re.compile(r"[^a-z0-9_-]+")
+VALID_DOSSIER_CATEGORIES = {"Entity", "Personnel", "Sponsor", "Interface", "Production"}
+
 
 
 def get_dossier_ingest_url(environ: dict[str, str] | None = None) -> str:
@@ -108,6 +110,8 @@ def build_dossier_recommendation_payload(payload: dict[str, Any]) -> dict[str, A
     cleaned["createdBy"] = str(cleaned.get("createdBy") or "bnl").strip() or "bnl"
     cleaned["confidence"] = str(cleaned.get("confidence") or "medium").strip() or "medium"
     cleaned["sourceLanes"] = _normalize_source_lanes(cleaned.get("sourceLanes"))
+    if cleaned.get("recommendedCategory") not in VALID_DOSSIER_CATEGORIES:
+        cleaned.pop("recommendedCategory", None)
 
     if cleaned.get("subjectName") is not None:
         cleaned["subjectName"] = str(cleaned.get("subjectName") or "").strip()
