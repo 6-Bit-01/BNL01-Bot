@@ -1,0 +1,140 @@
+import json
+import os
+import sqlite3
+import tempfile
+import unittest
+
+os.environ.setdefault("GEMINI_API_KEY", "test-gemini-key")
+os.environ.setdefault("DISCORD_BOT_TOKEN", "test-discord-token")
+
+import bnl_source_knowledge_bridge as bridge
+
+
+class SourceKnowledgeBridgeTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.NamedTemporaryFile(suffix=".sqlite", delete=False)
+        self.tmp.close()
+        self.db = self.tmp.name
+        self.conn = sqlite3.connect(self.db)
+        self._schema()
+
+    def tearDown(self):
+        self.conn.close()
+        os.unlink(self.db)
+
+    def _schema(self):
+        c = self.conn.cursor()
+        c.execute("CREATE TABLE user_profiles (user_id INTEGER, guild_id INTEGER, display_name TEXT, preferred_name TEXT, last_seen TEXT, last_greeting_at TEXT)")
+        c.execute("CREATE TABLE user_memory_facts (id INTEGER PRIMARY KEY, user_id INTEGER, guild_id INTEGER, fact_key TEXT, fact_value TEXT, confidence REAL, is_core INTEGER, updated_at TEXT)")
+        c.execute("CREATE TABLE user_habits (user_id INTEGER, guild_id INTEGER, total_messages INTEGER, question_messages INTEGER, humor_messages INTEGER, late_night_messages INTEGER, avg_length REAL, last_topic TEXT, updated_at TEXT)")
+        c.execute("CREATE TABLE relationship_state (user_id INTEGER, guild_id INTEGER, interaction_count INTEGER, affinity_score REAL, trust_stage TEXT, social_stance TEXT, last_topic TEXT, updated_at TEXT)")
+        c.execute("CREATE TABLE relationship_journal (id INTEGER PRIMARY KEY, user_id INTEGER, guild_id INTEGER, entry_type TEXT, summary TEXT, timestamp TEXT)")
+        c.execute("CREATE TABLE conversations (id INTEGER PRIMARY KEY, user_id INTEGER, user_name TEXT, guild_id INTEGER, channel_name TEXT, channel_policy TEXT, role TEXT, content TEXT, timestamp TEXT)")
+        c.execute("CREATE TABLE memory_tiers (id INTEGER PRIMARY KEY, user_id INTEGER, guild_id INTEGER, tier TEXT, summary TEXT, salience REAL, mentions INTEGER, updated_at TEXT)")
+        c.execute("CREATE TABLE broadcast_memory (id INTEGER PRIMARY KEY, guild_id INTEGER, episode_date TEXT, cleaned_summary TEXT, entry_type TEXT, public_safe INTEGER, usage_scope TEXT, status TEXT)")
+        c.execute("CREATE TABLE community_presence (guild_id INTEGER, subject_key TEXT, display_name TEXT, first_seen_at TEXT, last_seen_at TEXT, mention_count INTEGER, direct_interaction_count INTEGER, operator_mention_count INTEGER, connection_notes TEXT, evidence_snippets TEXT)")
+        c.execute("CREATE TABLE member_activity_events (id INTEGER PRIMARY KEY, guild_id INTEGER, member_name TEXT, raw_excerpt TEXT)")
+        self.conn.commit()
+
+    def _collect(self):
+        return bridge.collect_knowledge_bridge_candidates(self.db, 1, limit=50)
+
+    def _payload_by_name(self, result, name):
+        for payload in result["payloads"]:
+            if payload["subjectName"].lower() == name.lower():
+                return payload
+        self.fail(f"missing payload for {name}: {[p['subjectName'] for p in result['payloads']]}")
+
+    def test_extracts_candidates_from_profiles_facts_relationships_conversations_and_memory(self):
+        c = self.conn.cursor()
+        c.execute("INSERT INTO user_profiles VALUES (123456789012345678,1,'Emerald','Emerald',NULL,NULL)")
+        c.execute("INSERT INTO user_memory_facts VALUES (NULL,123456789012345678,1,'known_subject','Hellcat is a recurring artist candidate.',0.9,1,'now')")
+        c.execute("INSERT INTO relationship_state VALUES (123456789012345678,1,5,0.2,'known','warm','Crow is a known recurring community subject','now')")
+        c.execute("INSERT INTO relationship_journal VALUES (NULL,123456789012345678,1,'note','Orion via Crow came up as a possible connection, not identity.','now')")
+        c.execute("INSERT INTO conversations VALUES (NULL,123456789012345678,'raw user',1,'general','public_home','user','Mac Modem is a recurring BARCODE concept candidate.','now')")
+        c.execute("INSERT INTO conversations VALUES (NULL,123456789012345678,'raw user',1,'research-and-development','internal_controlled','user','Shadow Guest is a private internal subject candidate.','now')")
+        c.execute("INSERT INTO memory_tiers VALUES (NULL,123456789012345678,1,'long','Memory says Signal Witch is a recurring entity.',0.9,1,'now')")
+        self.conn.commit()
+
+        result = self._collect()
+        names = {p["subjectName"] for p in result["payloads"]}
+        for expected in {"Emerald", "Hellcat", "Crow", "Orion", "Mac Modem", "Shadow Guest", "Signal Witch"}:
+            self.assertIn(expected, names)
+        public_payload = self._payload_by_name(result, "Mac Modem")
+        self.assertIn("public_safe_candidate", public_payload["visibilityLabels"])
+        internal_payload = self._payload_by_name(result, "Shadow Guest")
+        self.assertIn("internal_only", internal_payload["visibilityLabels"])
+        memory_payload = self._payload_by_name(result, "Signal Witch")
+        self.assertIn("source_blind_review_required", memory_payload["visibilityLabels"])
+        self.assertIn(bridge.SOURCE_BLIND_WARNING, memory_payload["safetyWarnings"])
+        self.assertNotIn("public_safe_candidate", memory_payload["visibilityLabels"])
+        orion = self._payload_by_name(result, "Orion")
+        self.assertEqual(orion["type"], "possible_connection_review")
+        self.assertIn("not confirmed identity", orion["reason"])
+
+    def test_explicit_alias_language_maps_to_identity_link(self):
+        self.conn.execute("INSERT INTO user_memory_facts VALUES (NULL,1,1,'alias','Emerald aka Green Signal is explicit alias language for review.',0.8,1,'now')")
+        self.conn.commit()
+        payload = self._payload_by_name(self._collect(), "Emerald")
+        self.assertEqual(payload["type"], "identity_link")
+
+    def test_unknown_conversation_is_internal_review_not_public_safe(self):
+        self.conn.execute("INSERT INTO conversations VALUES (NULL,1,'User',1,'mystery',NULL,'user','Hellcat is a recurring candidate from unknown policy.','now')")
+        self.conn.commit()
+        payload = self._payload_by_name(self._collect(), "Hellcat")
+        self.assertIn("internal_only", payload["visibilityLabels"])
+        self.assertNotIn("public_safe_candidate", payload["visibilityLabels"])
+
+    def test_does_not_use_member_activity_events_by_default(self):
+        self.conn.execute("INSERT INTO member_activity_events VALUES (NULL,1,'Activity Only','Activity Phantom is a recurring candidate.')")
+        self.conn.commit()
+        result = self._collect()
+        self.assertNotIn("Activity Phantom", {p["subjectName"] for p in result["payloads"]})
+
+    def test_deterministic_ingest_keys_and_dedupe_repeated_subjects(self):
+        self.conn.execute("INSERT INTO user_profiles VALUES (1,1,'Emerald','Emerald',NULL,NULL)")
+        self.conn.execute("INSERT INTO user_memory_facts VALUES (NULL,1,1,'note','Emerald is a recurring community subject.',0.7,1,'now')")
+        self.conn.commit()
+        first = self._payload_by_name(self._collect(), "Emerald")
+        second = self._payload_by_name(self._collect(), "Emerald")
+        self.assertEqual(first["ingestKey"], second["ingestKey"])
+        names = [p["subjectName"] for p in self._collect()["payloads"] if p["subjectName"] == "Emerald"]
+        self.assertEqual(names, ["Emerald"])
+
+    def test_dry_run_does_not_send_and_failed_sends_are_counted(self):
+        self.conn.execute("INSERT INTO user_profiles VALUES (1,1,'Emerald','Emerald',NULL,NULL)")
+        self.conn.commit()
+        calls = []
+        dry = bridge.run_source_knowledge_bridge(self.db, 1, dry_run=True, sender=lambda payload: calls.append(payload) or {"ok": True})
+        self.assertEqual(calls, [])
+        self.assertEqual(dry["sentCount"], 0)
+        real = bridge.run_source_knowledge_bridge(self.db, 1, dry_run=False, sender=lambda payload: {"ok": False, "status": 500})
+        self.assertEqual(real["failedCount"], 1)
+        self.assertEqual(real["errorStatus"], "failed:500")
+
+    def test_discord_response_is_safe_summary_only(self):
+        result = {
+            "dryRun": True,
+            "sendableRecommendationCount": 1,
+            "duplicateCount": 0,
+            "withheldCount": 0,
+            "sourceCounts": {"user_profiles": 1},
+            "warningCounts": {bridge.SOURCE_BLIND_WARNING: 1},
+            "candidates": [{"subjectName": "Emerald", "payload": {"evidenceSummary": "raw 123456789012345678 transcript"}}],
+        }
+        response = bridge.format_source_knowledge_bridge_response(result)
+        self.assertIn("Emerald", response)
+        self.assertNotIn("123456789012345678", response)
+        self.assertNotIn("transcript", response.lower())
+        self.assertNotIn("payload", response.lower())
+
+    def test_parse_command_aliases(self):
+        for command in ("!bnl source bridge knowledge | limit=2 | dry_run=false", "!bnl source bridge candidates", "!bnl dossier bridge knowledge"):
+            matched, options, error = bridge.parse_source_knowledge_bridge_command(command)
+            self.assertTrue(matched)
+            self.assertFalse(error)
+            self.assertIn("limit", options)
+
+
+if __name__ == "__main__":
+    unittest.main()
