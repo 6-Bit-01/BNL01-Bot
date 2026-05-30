@@ -26,11 +26,15 @@ import urllib.parse
 import calendar
 
 from bnl_dossier_recommendations import (
-    build_dossier_recommendation_payload,
     get_dossier_ingest_url,
     is_dossier_ingest_token_configured,
     parse_manual_dossier_recommendation_command,
     send_dossier_recommendation,
+)
+from bnl_dossier_source_packets import (
+    build_dossier_recommendation_packet,
+    is_broadcast_memory_reader_available,
+    set_broadcast_memory_reader,
 )
 from collections import defaultdict, deque
 from datetime import datetime, timedelta, timezone
@@ -457,6 +461,8 @@ _last_website_directive = None
 _last_website_status_at = None
 _missing_status_key_warned = False
 _last_dossier_recommendation_status = "never_sent"
+_last_dossier_packet_lane_count = 0
+_last_dossier_packet_subject = "none"
 BNL_CONTROL_FLAGS_TTL_SECONDS = 300
 _bnl_control_flags_cache = None
 _bnl_control_flags_cached_at = None
@@ -3942,6 +3948,10 @@ def build_dossier_recommendation_diagnostics() -> dict:
         "ingest_endpoint": get_dossier_ingest_url(),
         "ingest_token_configured": is_dossier_ingest_token_configured(),
         "last_send_status": _last_dossier_recommendation_status,
+        "approved_packet_lanes_available": True,
+        "broadcast_memory_reader_available": is_broadcast_memory_reader_available(),
+        "last_packet_lane_count": _last_dossier_packet_lane_count,
+        "last_packet_subject": _last_dossier_packet_subject,
     }
 
 
@@ -3951,8 +3961,8 @@ def _safe_dossier_failure_reason(result: dict) -> str:
 
 
 async def maybe_handle_dossier_recommendation_command(message: discord.Message, clean_content: str) -> bool:
-    """Handle the v1 manual `!bnl dossier recommend` command if present."""
-    global _last_dossier_recommendation_status
+    """Handle the controlled `!bnl dossier recommend` packet/send command if present."""
+    global _last_dossier_recommendation_status, _last_dossier_packet_lane_count, _last_dossier_packet_subject
     matched, payload, parse_error = parse_manual_dossier_recommendation_command(clean_content)
     if not matched:
         return False
@@ -3969,8 +3979,19 @@ async def maybe_handle_dossier_recommendation_command(message: discord.Message, 
         await message.reply(f"Recommendation failed: {parse_error}")
         return True
 
-    safe_payload = build_dossier_recommendation_payload(payload)
+    packet_result = build_dossier_recommendation_packet(
+        payload.get("subjectName", ""),
+        payload.get("reason", ""),
+        payload.get("sourceLanes") or ["rd_context"],
+        guild_id=getattr(message.guild, "id", None),
+        options={"broadcast_memory_reader": get_recent_broadcast_memory},
+    )
+    safe_payload = packet_result["payload"]
     subject = (safe_payload.get("subjectName") or "subject").strip()[:80]
+    _last_dossier_packet_lane_count = len(safe_payload.get("sourceLanes") or [])
+    _last_dossier_packet_subject = subject
+    if "broadcast_memory" in (payload.get("sourceLanes") or []) and "broadcast_memory" not in (safe_payload.get("sourceLanes") or []):
+        logging.warning("dossier_packet_broadcast_memory_unavailable_or_no_match")
     result = await asyncio.to_thread(send_dossier_recommendation, safe_payload)
     status = result.get("status")
     if result.get("ok") and result.get("duplicate"):
@@ -3978,7 +3999,10 @@ async def maybe_handle_dossier_recommendation_command(message: discord.Message, 
         await message.reply(f"Duplicate recommendation already exists: {subject}")
     elif result.get("ok"):
         _last_dossier_recommendation_status = f"sent:{status or 'ok'}"
-        await message.reply(f"Recommendation sent: {subject}")
+        if safe_payload.get("sourceLanes") == ["rd_context"]:
+            await message.reply(f"Recommendation sent from manual/R&D context only: {subject}")
+        else:
+            await message.reply(f"Recommendation sent: {subject}")
     else:
         _last_dossier_recommendation_status = f"failed:{status or 'no_status'}"
         await message.reply(f"Recommendation failed: {_safe_dossier_failure_reason(result)}")
@@ -6073,6 +6097,10 @@ def get_recent_broadcast_memory(guild_id: int, public_only: bool = False, limit:
     rows = cursor.fetchall()
     conn.close()
     return rows
+
+
+
+set_broadcast_memory_reader(get_recent_broadcast_memory)
 
 def get_latest_broadcast_episode_date(guild_id: int, public_only: bool = False, usage_scope: str = ""):
     conn = sqlite3.connect(DB_FILE)
@@ -11625,6 +11653,10 @@ async def bnl_source_check(interaction: discord.Interaction):
         f"- dossier_ingest_url_configured: `{'yes' if dossier_diag['ingest_url_configured'] else 'no_using_default'}`",
         f"- dossier_ingest_token_configured: `{'yes' if dossier_diag['ingest_token_configured'] else 'no'}`",
         f"- dossier_last_send_status: `{dossier_diag['last_send_status']}`",
+        f"- dossier_packet_lanes_available: `{'yes' if dossier_diag['approved_packet_lanes_available'] else 'no'}`",
+        f"- dossier_broadcast_memory_reader_available: `{'yes' if dossier_diag['broadcast_memory_reader_available'] else 'no'}`",
+        f"- dossier_last_packet_lane_count: `{dossier_diag['last_packet_lane_count']}`",
+        f"- dossier_last_packet_subject: `{dossier_diag['last_packet_subject']}`",
         f"- _bnl_control_flags_last_source_url: `{flags_source}`",
         f"- website_relay_enabled: `{BNL_WEBSITE_RELAY_ENABLED}` every `{BNL_WEBSITE_RELAY_INTERVAL_MINUTES}` min",
     ]
@@ -11842,6 +11874,10 @@ async def bnl_status(interaction: discord.Interaction):
         f"- dossier_ingest_url_configured: `{'yes' if dossier_diag['ingest_url_configured'] else 'no_using_default'}`",
         f"- dossier_ingest_token_configured: `{'yes' if dossier_diag['ingest_token_configured'] else 'no'}`",
         f"- dossier_last_send_status: `{dossier_diag['last_send_status']}`",
+        f"- dossier_packet_lanes_available: `{'yes' if dossier_diag['approved_packet_lanes_available'] else 'no'}`",
+        f"- dossier_broadcast_memory_reader_available: `{'yes' if dossier_diag['broadcast_memory_reader_available'] else 'no'}`",
+        f"- dossier_last_packet_lane_count: `{dossier_diag['last_packet_lane_count']}`",
+        f"- dossier_last_packet_subject: `{dossier_diag['last_packet_subject']}`",
         f"- read_model_enabled: `{'yes' if read_model_diag.get('enabled') else 'no'}`",
         f"- read_model_url_configured: `{'yes' if read_model_diag.get('url_configured') else 'no'}`",
         f"- read_model_cache_present: `{'yes' if read_model_diag.get('cache_present') else 'no'}`",

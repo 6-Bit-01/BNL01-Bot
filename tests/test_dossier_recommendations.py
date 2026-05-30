@@ -7,6 +7,7 @@ os.environ.setdefault("GEMINI_API_KEY", "test-gemini-key")
 os.environ.setdefault("DISCORD_BOT_TOKEN", "test-discord-token")
 
 import bnl_dossier_recommendations as dossier
+import bnl_dossier_source_packets as packets
 import bnl01_bot
 
 
@@ -73,6 +74,29 @@ class DossierRecommendationPayloadTests(unittest.TestCase):
         self.assertEqual(payload["reason"], "Review for future dossier.")
         self.assertEqual(payload["sourceLanes"], ["rd_context", "broadcast_memory"])
 
+    def test_parse_command_ignores_unsupported_lanes_in_packet_builder(self):
+        matched, payload, error = dossier.parse_manual_dossier_recommendation_command(
+            "!bnl dossier recommend Signal Witch | Review. | lanes=bogus,broadcast_memory"
+        )
+        self.assertTrue(matched)
+        self.assertFalse(error)
+        packet_result = packets.build_dossier_recommendation_packet(
+            payload["subjectName"],
+            payload["reason"],
+            payload["sourceLanes"],
+            guild_id=123,
+            options={"broadcast_memory_reader": lambda *a, **k: []},
+        )
+        self.assertEqual(packet_result["payload"]["sourceLanes"], ["rd_context"])
+
+    def test_parse_command_rejects_empty_subject(self):
+        matched, payload, error = dossier.parse_manual_dossier_recommendation_command(
+            "!bnl dossier recommend   | Reason"
+        )
+        self.assertTrue(matched)
+        self.assertIsNone(payload)
+        self.assertIn("Subject", error)
+
     def test_parse_command_rejects_empty_reason(self):
         matched, payload, error = dossier.parse_manual_dossier_recommendation_command(
             "!bnl dossier recommend Signal Witch |   "
@@ -80,6 +104,83 @@ class DossierRecommendationPayloadTests(unittest.TestCase):
         self.assertTrue(matched)
         self.assertIsNone(payload)
         self.assertIn("Reason", error)
+
+
+class DossierSourcePacketTests(unittest.TestCase):
+    def test_subject_matching_is_conservative(self):
+        self.assertEqual(packets.normalize_subject_name("  Signal   Witch "), "Signal Witch")
+        self.assertTrue(packets.contains_exact_subject_mention("Signal Witch should be reviewed.", "signal witch"))
+        self.assertTrue(packets.contains_compact_subject_mention("Signal-Witch should be reviewed.", "Signal Witch"))
+        self.assertFalse(packets.contains_subject_mention("Signal is noisy but unrelated.", "Signal Witch"))
+        self.assertFalse(packets.contains_subject_mention("Witch signal is reversed.", "Signal Witch"))
+
+    def test_manual_packet_defaults_and_no_token(self):
+        result = packets.build_dossier_recommendation_packet(
+            "Signal Witch",
+            "Operator says Signal Witch should be reviewed.",
+            ["rd_context"],
+        )
+        packet = result["packet"]
+        payload = result["payload"]
+        self.assertEqual(packet["sourceLanes"], ["rd_context"])
+        self.assertEqual(packet["confidence"], "low")
+        self.assertIn("preferred display name", packet["missingInfo"])
+        self.assertIn("Verify public-safe wording before publishing.", packet["publicSafetyNotes"])
+        self.assertNotIn("BNL_DOSSIER_INGEST_TOKEN", json.dumps(packet))
+        self.assertNotIn("Authorization", json.dumps(payload))
+
+    def test_broadcast_memory_collection_matches_and_caps_snippets(self):
+        long_summary = "Signal Witch " + ("context " * 80) + "123456789012345678"
+
+        def fake_reader(guild_id, public_only=False, limit=500):
+            self.assertEqual(guild_id, 123)
+            self.assertFalse(public_only)
+            self.assertLessEqual(limit, 500)
+            return [
+                ("2026-05-29", long_summary, "notable_moment", "medium", 0, 0, "internal", None, None, 1, 0),
+                ("2026-05-22", "Unrelated artist note.", "notable_moment", "medium", 0, 0, "internal", None, None, 1, 0),
+            ]
+
+        evidence = packets.collect_broadcast_memory_evidence(123, "Signal Witch", reader=fake_reader)
+        self.assertEqual(len(evidence), 1)
+        self.assertEqual(evidence[0]["lane"], "broadcast_memory")
+        self.assertLessEqual(len(evidence[0]["summary"]), packets.MAX_SNIPPET_LENGTH)
+        self.assertNotIn("123456789012345678", evidence[0]["summary"])
+        self.assertEqual(packets.collect_broadcast_memory_evidence(None, "Signal Witch", reader=fake_reader), [])
+        self.assertEqual(packets.collect_broadcast_memory_evidence(123, "Signal Witch", reader=lambda *a, **k: (_ for _ in ()).throw(RuntimeError())), [])
+
+    def test_packet_builder_manual_plus_broadcast_and_stable_ingest_key(self):
+        def fake_reader(guild_id, public_only=False, limit=500):
+            return [("2026-05-29", "Signal-Witch came up in broadcast memory as a recurring source candidate.")]
+
+        first = packets.build_dossier_recommendation_packet(
+            "Signal Witch",
+            "Testing source packet builder.",
+            ["rd_context", "broadcast_memory", "unsupported_lane"],
+            guild_id=123,
+            options={"broadcast_memory_reader": fake_reader},
+        )
+        second = packets.build_dossier_recommendation_packet(
+            "Signal Witch",
+            "Testing source packet builder.",
+            ["rd_context", "broadcast_memory"],
+            guild_id=123,
+            options={"broadcast_memory_reader": fake_reader},
+        )
+        payload = first["payload"]
+        self.assertEqual(payload["sourceLanes"], ["rd_context", "broadcast_memory"])
+        self.assertEqual(payload["confidence"], "medium")
+        self.assertLessEqual(len(payload["evidenceSummary"]), packets.MAX_EVIDENCE_SUMMARY_LENGTH)
+        self.assertEqual(payload["ingestKey"], second["payload"]["ingestKey"])
+
+    def test_no_automatic_scanning_constructs_in_packet_module(self):
+        with open("bnl_dossier_source_packets.py", encoding="utf-8") as handle:
+            source = handle.read()
+        self.assertNotIn("@tasks.loop", source)
+        self.assertNotIn("history(", source)
+        self.assertNotIn("create_source_file", source)
+        self.assertNotIn("create_draft", source)
+        self.assertNotIn("send_dossier_recommendation", source)
 
 
 class DossierRecommendationSenderTests(unittest.TestCase):
