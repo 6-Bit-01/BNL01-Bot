@@ -24,6 +24,14 @@ import urllib.request
 import urllib.error
 import urllib.parse
 import calendar
+
+from bnl_dossier_recommendations import (
+    build_dossier_recommendation_payload,
+    get_dossier_ingest_url,
+    is_dossier_ingest_token_configured,
+    parse_manual_dossier_recommendation_command,
+    send_dossier_recommendation,
+)
 from collections import defaultdict, deque
 from datetime import datetime, timedelta, timezone
 
@@ -448,6 +456,7 @@ _last_website_status_message = None
 _last_website_directive = None
 _last_website_status_at = None
 _missing_status_key_warned = False
+_last_dossier_recommendation_status = "never_sent"
 BNL_CONTROL_FLAGS_TTL_SECONDS = 300
 _bnl_control_flags_cache = None
 _bnl_control_flags_cached_at = None
@@ -3912,6 +3921,68 @@ def has_mod_role(member: discord.Member) -> bool:
     if not member or not BNL_MOD_ROLE_ID:
         return False
     return any(role.id == BNL_MOD_ROLE_ID for role in getattr(member, "roles", []))
+
+
+def can_send_dossier_recommendation(user, member, guild) -> bool:
+    """Owner/admin/operator gate for manual dossier recommendation sends."""
+    if is_owner_operator(user):
+        return True
+    if member and has_mod_role(member):
+        return True
+    if member and guild and is_privileged_member(member, guild):
+        return True
+    return False
+
+
+def build_dossier_recommendation_diagnostics() -> dict:
+    """Safe configuration/status diagnostics for dossier recommendation ingest."""
+    return {
+        "ingest_url_configured": bool(os.getenv("BNL_DOSSIER_INGEST_URL", "").strip()),
+        "ingest_url_using_default": not bool(os.getenv("BNL_DOSSIER_INGEST_URL", "").strip()),
+        "ingest_endpoint": get_dossier_ingest_url(),
+        "ingest_token_configured": is_dossier_ingest_token_configured(),
+        "last_send_status": _last_dossier_recommendation_status,
+    }
+
+
+def _safe_dossier_failure_reason(result: dict) -> str:
+    reason = (result or {}).get("error") or "send failed"
+    return str(reason).replace("`", "'")[:140]
+
+
+async def maybe_handle_dossier_recommendation_command(message: discord.Message, clean_content: str) -> bool:
+    """Handle the v1 manual `!bnl dossier recommend` command if present."""
+    global _last_dossier_recommendation_status
+    matched, payload, parse_error = parse_manual_dossier_recommendation_command(clean_content)
+    if not matched:
+        return False
+
+    member = message.author if isinstance(message.author, discord.Member) else message.guild.get_member(message.author.id)
+    if not can_send_dossier_recommendation(message.author, member, message.guild):
+        _last_dossier_recommendation_status = "permission_denied"
+        logging.warning("dossier_recommendation_command_denied reason=permission")
+        await message.reply("Dossier recommendation sender is operator-only.")
+        return True
+
+    if not payload:
+        _last_dossier_recommendation_status = "parse_rejected"
+        await message.reply(f"Recommendation failed: {parse_error}")
+        return True
+
+    safe_payload = build_dossier_recommendation_payload(payload)
+    subject = (safe_payload.get("subjectName") or "subject").strip()[:80]
+    result = await asyncio.to_thread(send_dossier_recommendation, safe_payload)
+    status = result.get("status")
+    if result.get("ok") and result.get("duplicate"):
+        _last_dossier_recommendation_status = f"duplicate:{status or 'ok'}"
+        await message.reply(f"Duplicate recommendation already exists: {subject}")
+    elif result.get("ok"):
+        _last_dossier_recommendation_status = f"sent:{status or 'ok'}"
+        await message.reply(f"Recommendation sent: {subject}")
+    else:
+        _last_dossier_recommendation_status = f"failed:{status or 'no_status'}"
+        await message.reply(f"Recommendation failed: {_safe_dossier_failure_reason(result)}")
+    return True
 
 
 def _resolve_channel_policy_without_parent(channel) -> str:
@@ -10453,6 +10524,9 @@ async def on_message(message: discord.Message):
         .strip()
     )
 
+    if await maybe_handle_dossier_recommendation_command(message, clean_content):
+        return
+
     plain_text_name_seen = bool(re.search(r"\b(bnl|bnl-01|barcode bot)\b", clean_content.lower())) if clean_content else False
     channel_allows_conversation = bool(
         channel_policy in {"public_home", "sealed_test"}
@@ -11533,6 +11607,7 @@ async def bnl_source_check(interaction: discord.Interaction):
     relay_eligibility = website_relay_eligibility(policy)
     primary_guild_match = bool(guild and BNL_PRIMARY_GUILD_ID and guild.id == BNL_PRIMARY_GUILD_ID)
     flags_source = _bnl_control_flags_last_source_url or "none"
+    dossier_diag = build_dossier_recommendation_diagnostics()
 
     lines = [
         "**BNL Source Diagnostic**",
@@ -11547,6 +11622,9 @@ async def bnl_source_check(interaction: discord.Interaction):
         f"- primary_guild_match: `{primary_guild_match}`",
         f"- bnl_status_url_configured: `{bool(BNL_STATUS_URL)}`",
         f"- bnl_api_key_configured: `{bool(BNL_API_KEY)}`",
+        f"- dossier_ingest_url_configured: `{'yes' if dossier_diag['ingest_url_configured'] else 'no_using_default'}`",
+        f"- dossier_ingest_token_configured: `{'yes' if dossier_diag['ingest_token_configured'] else 'no'}`",
+        f"- dossier_last_send_status: `{dossier_diag['last_send_status']}`",
         f"- _bnl_control_flags_last_source_url: `{flags_source}`",
         f"- website_relay_enabled: `{BNL_WEBSITE_RELAY_ENABLED}` every `{BNL_WEBSITE_RELAY_INTERVAL_MINUTES}` min",
     ]
@@ -11735,6 +11813,7 @@ async def bnl_status(interaction: discord.Interaction):
     flags_source_state = "available" if _bnl_control_flags_last_source_url else "not yet fetched"
     website_bridge_configured = bool(BNL_STATUS_URL and BNL_API_KEY)
     read_model_diag = get_bnl_read_model_diagnostic_state()
+    dossier_diag = build_dossier_recommendation_diagnostics()
     broadcast_channel = guild.get_channel(BNL_BROADCAST_MEMORY_CHANNEL_ID) if BNL_BROADCAST_MEMORY_CHANNEL_ID else None
     broadcast_count = len(get_recent_broadcast_memory(guild.id, public_only=False, limit=500))
     latest_written_episode_date, latest_show_episode_date = get_broadcast_memory_diagnostic_dates(guild.id)
@@ -11760,6 +11839,9 @@ async def bnl_status(interaction: discord.Interaction):
         f"- last_ambient_skip_reason: `{ambient_runtime.get('last_skip_reason', 'unknown')}`",
         f"- website_relay_enabled: `{BNL_WEBSITE_RELAY_ENABLED}` (interval `{BNL_WEBSITE_RELAY_INTERVAL_MINUTES}m`)",
         f"- website_bridge_configured: `{'yes' if website_bridge_configured else 'no'}`",
+        f"- dossier_ingest_url_configured: `{'yes' if dossier_diag['ingest_url_configured'] else 'no_using_default'}`",
+        f"- dossier_ingest_token_configured: `{'yes' if dossier_diag['ingest_token_configured'] else 'no'}`",
+        f"- dossier_last_send_status: `{dossier_diag['last_send_status']}`",
         f"- read_model_enabled: `{'yes' if read_model_diag.get('enabled') else 'no'}`",
         f"- read_model_url_configured: `{'yes' if read_model_diag.get('url_configured') else 'no'}`",
         f"- read_model_cache_present: `{'yes' if read_model_diag.get('cache_present') else 'no'}`",
