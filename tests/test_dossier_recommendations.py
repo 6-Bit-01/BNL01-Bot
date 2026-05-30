@@ -318,6 +318,56 @@ class DossierCandidateDiscoveryTests(unittest.TestCase):
         self.assertIn("review", payload["reason"].lower())
 
 
+
+    def test_medium_confidence_non_generic_candidate_is_sent_review_only(self):
+        result = discovery.discover_candidate_recommendations(
+            123,
+            ["broadcast_memory"],
+            broadcast_memory_reader=lambda *a, **k: [("2026-05-29", "Anita Cable surfaced as a dossier candidate for source-file review.")],
+        )
+        payload = next(payload for payload in result["payloads"] if payload["subjectName"] == "Anita Cable")
+
+        self.assertEqual(payload["type"], "new_subject")
+        self.assertIn(payload["confidence"], {"low", "medium"})
+        self.assertEqual(payload.get("recommendedCategory"), "Entity")
+        self.assertIn("Medium-confidence BNL discovery. Review before converting, merging, aliasing, drafting, or publishing.", " ".join(payload["publicSafetyNotes"]))
+        self.assertEqual(result["mediumConfidenceCount"], 1)
+
+    def test_bare_title_case_one_off_remains_withheld_with_reason(self):
+        result = discovery.discover_candidate_recommendations(
+            123,
+            ["broadcast_memory"],
+            broadcast_memory_reader=lambda *a, **k: [("2026-05-29", "Anita Cable appeared once during a quiet recap.")],
+        )
+
+        self.assertEqual(result["payloads"], [])
+        self.assertGreaterEqual(result["withheldReasonCounts"].get("title_only_low_evidence", 0), 1)
+
+    def test_repeated_contextual_subject_passes_as_medium_confidence(self):
+        result = discovery.discover_candidate_recommendations(
+            None,
+            ["rd_context"],
+            rd_context=[
+                {"main_subject": "Signal Witch", "user_request": "Signal Witch noted in dossier context for source-lane review."},
+                {"main_subject": "Signal Witch", "user_request": "Signal Witch returned in entity context for later review."},
+            ],
+        )
+        payload = next(payload for payload in result["payloads"] if payload["subjectName"] == "Signal Witch")
+
+        self.assertEqual(payload["confidence"], "medium")
+        self.assertEqual(result["mediumConfidenceCount"], 1)
+
+    def test_weak_generic_subject_reasons_are_tracked(self):
+        result = discovery.discover_candidate_recommendations(
+            123,
+            ["broadcast_memory"],
+            broadcast_memory_reader=lambda *a, **k: [("2026-05-29", "Source file for next. Add needs a source file. Owner deserves a dossier.")],
+        )
+
+        self.assertEqual(result["payloads"], [])
+        self.assertGreaterEqual(result["withheldReasonCounts"].get("weak_generic_subject", 0), 3)
+        self.assertNotIn("evidence", json.dumps(result["withheldReasonCounts"]).lower())
+
     def test_dynamic_discovery_payload_uses_valid_website_taxonomy(self):
         rows = [("2026-05-29", "Anita Cable needs a source file. Anita Cable is a recurring entity.")]
         result = discovery.discover_candidate_recommendations(123, ["broadcast_memory"], broadcast_memory_reader=lambda *a, **k: rows)
@@ -520,7 +570,8 @@ class DossierDiscoveryRoutingTests(unittest.TestCase):
         self.assertTrue(handled)
         discover_mock.assert_called_once()
         send_mock.assert_not_called()
-        self.assertIn("Nothing sent", message.replies[-1])
+        self.assertIn("Dry run: 1 sendable, 0 withheld", message.replies[-1])
+        self.assertIn("Sendable: Signal Witch", message.replies[-1])
 
     def test_command_sends_normal_review_only_recommendations_when_threshold_met(self):
         bnl01_bot.BNL_OWNER_USER_ID = 999
@@ -534,6 +585,82 @@ class DossierDiscoveryRoutingTests(unittest.TestCase):
         send_mock.assert_called_once_with(fake_payload)
         self.assertIn("1 recommendations sent", message.replies[-1])
         self.assertIn("2 withheld", message.replies[-1])
+
+
+    def test_dry_run_reports_sendable_and_withheld_counts(self):
+        bnl01_bot.BNL_OWNER_USER_ID = 999
+        message = self.Message(user_id=999)
+        fake_discovery = {
+            "candidates": [{"subjectName": "Anita Cable", "payload": {"subjectName": "Anita Cable"}}],
+            "payloads": [{"subjectName": "Anita Cable"}],
+            "withheldCount": 6,
+            "duplicateCount": 0,
+            "sendableCandidateCount": 1,
+            "withheldReasonCounts": {"title_only_low_evidence": 6},
+            "topWithheldReason": "title_only_low_evidence",
+            "mediumConfidenceCount": 1,
+            "strongConfidenceCount": 0,
+        }
+        with mock.patch.object(bnl01_bot, "discover_candidate_recommendations", return_value=fake_discovery), \
+             mock.patch.object(bnl01_bot, "send_dossier_recommendation"):
+            handled = asyncio.run(bnl01_bot.maybe_handle_dossier_recommendation_command(message, "!bnl dossier discover candidates | dry_run=true"))
+
+        self.assertTrue(handled)
+        self.assertIn("Dry run: 1 sendable, 6 withheld", message.replies[-1])
+        self.assertIn("Sendable: Anita Cable", message.replies[-1])
+        self.assertIn("Main withheld reason: title only low evidence", message.replies[-1])
+
+    def test_command_reply_reports_withheld_reason_summary_and_diagnostics(self):
+        bnl01_bot.BNL_OWNER_USER_ID = 999
+        message = self.Message(user_id=999)
+        fake_payload = {"type": "new_subject", "subjectName": "Signal Witch", "reason": "Review only", "sourceLanes": ["broadcast_memory"]}
+        fake_discovery = {
+            "candidates": [{"subjectName": "Signal Witch", "payload": fake_payload}],
+            "payloads": [fake_payload],
+            "withheldCount": 6,
+            "duplicateCount": 0,
+            "sendableCandidateCount": 1,
+            "withheldReasonCounts": {"title_only_low_evidence": 4, "weak_generic_subject": 2},
+            "topWithheldReason": "title_only_low_evidence",
+            "mediumConfidenceCount": 1,
+            "strongConfidenceCount": 0,
+        }
+        with mock.patch.object(bnl01_bot, "discover_candidate_recommendations", return_value=fake_discovery), \
+             mock.patch.object(bnl01_bot, "send_dossier_recommendation", return_value={"ok": True, "duplicate": False, "status": 200}):
+            handled = asyncio.run(bnl01_bot.maybe_handle_dossier_recommendation_command(message, "!bnl dossier discover candidates | limit=1"))
+
+        self.assertTrue(handled)
+        self.assertIn("Withheld: 4 title only low evidence, 2 weak generic subject", message.replies[-1])
+        diag = bnl01_bot.build_dossier_recommendation_diagnostics()
+        self.assertEqual(diag["candidate_discovery_last_sendable_candidate_count"], 1)
+        self.assertEqual(diag["candidate_discovery_last_withheld_reason_counts"], {"title_only_low_evidence": 4, "weak_generic_subject": 2})
+        self.assertEqual(diag["candidate_discovery_last_medium_confidence_count"], 1)
+        self.assertEqual(diag["candidate_discovery_last_strong_confidence_count"], 0)
+        self.assertEqual(diag["candidate_discovery_last_top_withheld_reason"], "title_only_low_evidence")
+        self.assertNotIn("Anita Cable", json.dumps(diag["candidate_discovery_last_withheld_reason_counts"]))
+
+    def test_no_send_reply_uses_main_withheld_reason_guidance(self):
+        bnl01_bot.BNL_OWNER_USER_ID = 999
+        message = self.Message(user_id=999)
+        fake_discovery = {
+            "candidates": [],
+            "payloads": [],
+            "withheldCount": 9,
+            "duplicateCount": 0,
+            "sendableCandidateCount": 0,
+            "withheldReasonCounts": {"title_only_low_evidence": 9},
+            "topWithheldReason": "title_only_low_evidence",
+            "mediumConfidenceCount": 0,
+            "strongConfidenceCount": 0,
+        }
+        with mock.patch.object(bnl01_bot, "discover_candidate_recommendations", return_value=fake_discovery), \
+             mock.patch.object(bnl01_bot, "send_dossier_recommendation"):
+            handled = asyncio.run(bnl01_bot.maybe_handle_dossier_recommendation_command(message, "!bnl dossier discover candidates"))
+
+        self.assertTrue(handled)
+        self.assertIn("Dossier discovery complete: 0 sent, 0 duplicates, 9 withheld, 0 failed", message.replies[-1])
+        self.assertIn("Main withheld reason: title only low evidence", message.replies[-1])
+        self.assertIn("Try adding clearer source-file or recurring-entity notes", message.replies[-1])
 
     def test_failed_dynamic_sends_are_counted_in_operator_reply(self):
         bnl01_bot.BNL_OWNER_USER_ID = 999
@@ -553,7 +680,7 @@ class DossierDiscoveryRoutingTests(unittest.TestCase):
             handled = asyncio.run(bnl01_bot.maybe_handle_dossier_recommendation_command(message, "!bnl dossier discover candidates | limit=2"))
 
         self.assertTrue(handled)
-        self.assertIn("0 recommendations sent", message.replies[-1])
+        self.assertIn("0 sent", message.replies[-1])
         self.assertIn("4 withheld", message.replies[-1])
         self.assertIn("2 failed", message.replies[-1])
         self.assertIn("First failure: HTTP 400", message.replies[-1])

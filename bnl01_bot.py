@@ -479,6 +479,11 @@ _last_candidate_discovery_first_failure_status = "none"
 _last_candidate_discovery_rejected_subjects_count = 0
 _last_candidate_discovery_source_lanes = []
 _last_candidate_discovery_mode = "none"
+_last_candidate_discovery_sendable_candidate_count = 0
+_last_candidate_discovery_withheld_reason_counts = {}
+_last_candidate_discovery_medium_confidence_count = 0
+_last_candidate_discovery_strong_confidence_count = 0
+_last_candidate_discovery_top_withheld_reason = "none"
 BNL_CONTROL_FLAGS_TTL_SECONDS = 300
 _bnl_control_flags_cache = None
 _bnl_control_flags_cached_at = None
@@ -3982,7 +3987,28 @@ def build_dossier_recommendation_diagnostics() -> dict:
         "candidate_discovery_last_rejected_subjects_count": _last_candidate_discovery_rejected_subjects_count,
         "candidate_discovery_last_source_lanes": list(_last_candidate_discovery_source_lanes),
         "candidate_discovery_last_mode": _last_candidate_discovery_mode,
+        "candidate_discovery_last_sendable_candidate_count": _last_candidate_discovery_sendable_candidate_count,
+        "candidate_discovery_last_withheld_reason_counts": dict(_last_candidate_discovery_withheld_reason_counts),
+        "candidate_discovery_last_medium_confidence_count": _last_candidate_discovery_medium_confidence_count,
+        "candidate_discovery_last_strong_confidence_count": _last_candidate_discovery_strong_confidence_count,
+        "candidate_discovery_last_top_withheld_reason": _last_candidate_discovery_top_withheld_reason,
     }
+
+
+def _humanize_discovery_reason(reason: str) -> str:
+    return str(reason or "unknown").replace("_", " ")
+
+
+def _format_withheld_reason_summary(reason_counts: dict, *, no_sent: bool = False) -> str:
+    counts = {str(k): int(v) for k, v in (reason_counts or {}).items() if int(v or 0) > 0}
+    if not counts:
+        return ""
+    ordered = sorted(counts.items(), key=lambda item: (-item[1], item[0]))
+    if no_sent:
+        main = _humanize_discovery_reason(ordered[0][0])
+        return f" Main withheld reason: {main}. Try adding clearer source-file or recurring-entity notes to broadcast memory/R&D."
+    parts = [f"{count} {_humanize_discovery_reason(reason)}" for reason, count in ordered[:3]]
+    return f" Withheld: {', '.join(parts)}."
 
 
 def _safe_dossier_failure_reason(result: dict) -> str:
@@ -4010,6 +4036,9 @@ async def maybe_handle_dossier_discovery_command(message: discord.Message, clean
     global _last_candidate_discovery_failed_count, _last_candidate_discovery_first_failure_status
     global _last_candidate_discovery_rejected_subjects_count, _last_candidate_discovery_error_status
     global _last_candidate_discovery_source_lanes, _last_candidate_discovery_mode
+    global _last_candidate_discovery_sendable_candidate_count, _last_candidate_discovery_withheld_reason_counts
+    global _last_candidate_discovery_medium_confidence_count, _last_candidate_discovery_strong_confidence_count
+    global _last_candidate_discovery_top_withheld_reason
 
     matched, options, parse_error = parse_dossier_discovery_command(clean_content)
     if not matched:
@@ -4038,6 +4067,11 @@ async def maybe_handle_dossier_discovery_command(message: discord.Message, clean
     _last_candidate_discovery_error_status = "none"
     _last_candidate_discovery_first_failure_status = "none"
     _last_candidate_discovery_rejected_subjects_count = 0
+    _last_candidate_discovery_sendable_candidate_count = 0
+    _last_candidate_discovery_withheld_reason_counts = {}
+    _last_candidate_discovery_medium_confidence_count = 0
+    _last_candidate_discovery_strong_confidence_count = 0
+    _last_candidate_discovery_top_withheld_reason = "none"
 
     discovery = discover_candidate_recommendations(
         getattr(message.guild, "id", None),
@@ -4049,6 +4083,16 @@ async def maybe_handle_dossier_discovery_command(message: discord.Message, clean
     candidates = discovery.get("candidates") or []
     withheld = int(discovery.get("withheldCount") or 0)
     duplicate_count = int(discovery.get("duplicateCount") or 0)
+    reason_counts = dict(discovery.get("withheldReasonCounts") or {})
+    sendable_count = int(discovery.get("sendableCandidateCount") or len(candidates))
+    medium_count = int(discovery.get("mediumConfidenceCount") or 0)
+    strong_count = int(discovery.get("strongConfidenceCount") or 0)
+    top_reason = str(discovery.get("topWithheldReason") or "none")
+    _last_candidate_discovery_sendable_candidate_count = sendable_count
+    _last_candidate_discovery_withheld_reason_counts = reason_counts
+    _last_candidate_discovery_medium_confidence_count = medium_count
+    _last_candidate_discovery_strong_confidence_count = strong_count
+    _last_candidate_discovery_top_withheld_reason = top_reason
 
     if dry_run:
         _last_candidate_discovery_sent_count = 0
@@ -4056,8 +4100,9 @@ async def maybe_handle_dossier_discovery_command(message: discord.Message, clean
         _last_candidate_discovery_withheld_count = withheld
         _last_candidate_discovery_rejected_subjects_count = withheld
         names = [str(candidate.get("subjectName") or "subject")[:40] for candidate in candidates[:5]]
-        suffix = f" Top candidates: {', '.join(names)}." if names else ""
-        await message.reply(f"Dossier discovery dry run: {len(candidates)} candidates found.{suffix} Nothing sent.")
+        sendable_suffix = f" Sendable: {', '.join(names)}." if names else ""
+        main_suffix = f" Main withheld reason: {_humanize_discovery_reason(top_reason)}." if withheld and top_reason != "none" else ""
+        await message.reply(f"Dry run: {sendable_count} sendable, {withheld} withheld.{sendable_suffix}{main_suffix}")
         return True
 
     sent_count = 0
@@ -4092,11 +4137,15 @@ async def maybe_handle_dossier_discovery_command(message: discord.Message, clean
         else first_error
     )
     failure_suffix = f" First failure: {first_failure_status}." if failed_count and first_failure_status != "none" else ""
-    await message.reply(
-        f"Dossier discovery complete: {sent_count} recommendations sent, "
-        f"{send_duplicates} duplicates skipped, {withheld} withheld, {failed_count} failed."
-        f"{failure_suffix}"
-    )
+    reason_suffix = _format_withheld_reason_summary(reason_counts, no_sent=(sent_count == 0 and send_duplicates == 0))
+    if sent_count == 0 and send_duplicates == 0:
+        summary = f"Dossier discovery complete: 0 sent, 0 duplicates, {withheld} withheld, {failed_count} failed."
+    else:
+        summary = (
+            f"Dossier discovery complete: {sent_count} recommendations sent, "
+            f"{send_duplicates} duplicates skipped, {withheld} withheld, {failed_count} failed."
+        )
+    await message.reply(f"{summary}{reason_suffix}{failure_suffix}")
     return True
 
 
@@ -11812,6 +11861,11 @@ async def bnl_source_check(interaction: discord.Interaction):
         f"- candidate_discovery_last_rejected_subjects_count: `{dossier_diag['candidate_discovery_last_rejected_subjects_count']}`",
         f"- candidate_discovery_last_source_lanes: `{','.join(dossier_diag['candidate_discovery_last_source_lanes']) or 'none'}`",
         f"- candidate_discovery_last_mode: `{dossier_diag['candidate_discovery_last_mode']}`",
+        f"- candidate_discovery_last_sendable_candidate_count: `{dossier_diag['candidate_discovery_last_sendable_candidate_count']}`",
+        f"- candidate_discovery_last_withheld_reason_counts: `{json.dumps(dossier_diag['candidate_discovery_last_withheld_reason_counts'], sort_keys=True)}`",
+        f"- candidate_discovery_last_medium_confidence_count: `{dossier_diag['candidate_discovery_last_medium_confidence_count']}`",
+        f"- candidate_discovery_last_strong_confidence_count: `{dossier_diag['candidate_discovery_last_strong_confidence_count']}`",
+        f"- candidate_discovery_last_top_withheld_reason: `{dossier_diag['candidate_discovery_last_top_withheld_reason']}`",
         f"- _bnl_control_flags_last_source_url: `{flags_source}`",
         f"- website_relay_enabled: `{BNL_WEBSITE_RELAY_ENABLED}` every `{BNL_WEBSITE_RELAY_INTERVAL_MINUTES}` min",
     ]
@@ -12046,6 +12100,11 @@ async def bnl_status(interaction: discord.Interaction):
         f"- candidate_discovery_last_rejected_subjects_count: `{dossier_diag['candidate_discovery_last_rejected_subjects_count']}`",
         f"- candidate_discovery_last_source_lanes: `{','.join(dossier_diag['candidate_discovery_last_source_lanes']) or 'none'}`",
         f"- candidate_discovery_last_mode: `{dossier_diag['candidate_discovery_last_mode']}`",
+        f"- candidate_discovery_last_sendable_candidate_count: `{dossier_diag['candidate_discovery_last_sendable_candidate_count']}`",
+        f"- candidate_discovery_last_withheld_reason_counts: `{json.dumps(dossier_diag['candidate_discovery_last_withheld_reason_counts'], sort_keys=True)}`",
+        f"- candidate_discovery_last_medium_confidence_count: `{dossier_diag['candidate_discovery_last_medium_confidence_count']}`",
+        f"- candidate_discovery_last_strong_confidence_count: `{dossier_diag['candidate_discovery_last_strong_confidence_count']}`",
+        f"- candidate_discovery_last_top_withheld_reason: `{dossier_diag['candidate_discovery_last_top_withheld_reason']}`",
         f"- read_model_enabled: `{'yes' if read_model_diag.get('enabled') else 'no'}`",
         f"- read_model_url_configured: `{'yes' if read_model_diag.get('url_configured') else 'no'}`",
         f"- read_model_cache_present: `{'yes' if read_model_diag.get('cache_present') else 'no'}`",
