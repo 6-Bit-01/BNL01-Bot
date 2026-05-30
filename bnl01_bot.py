@@ -25,6 +25,12 @@ import urllib.error
 import urllib.parse
 import calendar
 
+from bnl_dossier_candidate_discovery import (
+    DEFAULT_DISCOVERY_LANES,
+    DISCOVERY_INGEST_SOURCE,
+    discover_candidate_recommendations,
+    parse_dossier_discovery_command,
+)
 from bnl_dossier_recommendations import (
     get_dossier_ingest_url,
     is_dossier_ingest_token_configured,
@@ -463,6 +469,13 @@ _missing_status_key_warned = False
 _last_dossier_recommendation_status = "never_sent"
 _last_dossier_packet_lane_count = 0
 _last_dossier_packet_subject = "none"
+_last_candidate_discovery_run_time = "never"
+_last_candidate_discovery_sent_count = 0
+_last_candidate_discovery_duplicate_count = 0
+_last_candidate_discovery_withheld_count = 0
+_last_candidate_discovery_error_status = "none"
+_last_candidate_discovery_source_lanes = []
+_last_candidate_discovery_mode = "none"
 BNL_CONTROL_FLAGS_TTL_SECONDS = 300
 _bnl_control_flags_cache = None
 _bnl_control_flags_cached_at = None
@@ -3952,6 +3965,17 @@ def build_dossier_recommendation_diagnostics() -> dict:
         "broadcast_memory_reader_available": is_broadcast_memory_reader_available(),
         "last_packet_lane_count": _last_dossier_packet_lane_count,
         "last_packet_subject": _last_dossier_packet_subject,
+        "candidate_discovery_available": True,
+        "candidate_discovery_enabled": False,
+        "candidate_discovery_ingest_source": DISCOVERY_INGEST_SOURCE,
+        "candidate_discovery_approved_lanes": list(DEFAULT_DISCOVERY_LANES),
+        "candidate_discovery_last_run_time": _last_candidate_discovery_run_time,
+        "candidate_discovery_last_sent_count": _last_candidate_discovery_sent_count,
+        "candidate_discovery_last_duplicate_count": _last_candidate_discovery_duplicate_count,
+        "candidate_discovery_last_withheld_count": _last_candidate_discovery_withheld_count,
+        "candidate_discovery_last_error_status": _last_candidate_discovery_error_status,
+        "candidate_discovery_last_source_lanes": list(_last_candidate_discovery_source_lanes),
+        "candidate_discovery_last_mode": _last_candidate_discovery_mode,
     }
 
 
@@ -3960,9 +3984,100 @@ def _safe_dossier_failure_reason(result: dict) -> str:
     return str(reason).replace("`", "'")[:140]
 
 
+def _current_rd_discovery_context(message: discord.Message) -> list[dict]:
+    """Return already-buffered R&D context for discovery without reading channel history."""
+
+    if not is_research_and_development_channel(message):
+        return []
+    combined: list[dict] = []
+    combined.extend(_get_recent_rd_ops_channel_context(message))
+    combined.extend(_get_recent_rd_ops_context(message))
+    return combined[-25:]
+
+
+async def maybe_handle_dossier_discovery_command(message: discord.Message, clean_content: str) -> bool:
+    """Handle operator-triggered dynamic dossier candidate discovery."""
+
+    global _last_dossier_recommendation_status
+    global _last_candidate_discovery_run_time, _last_candidate_discovery_sent_count
+    global _last_candidate_discovery_duplicate_count, _last_candidate_discovery_withheld_count
+    global _last_candidate_discovery_error_status, _last_candidate_discovery_source_lanes, _last_candidate_discovery_mode
+
+    matched, options, parse_error = parse_dossier_discovery_command(clean_content)
+    if not matched:
+        return False
+
+    member = message.author if isinstance(message.author, discord.Member) else message.guild.get_member(message.author.id)
+    if not can_send_dossier_recommendation(message.author, member, message.guild):
+        _last_candidate_discovery_error_status = "permission_denied"
+        _last_dossier_recommendation_status = "candidate_discovery_permission_denied"
+        logging.warning("dossier_candidate_discovery_denied reason=permission")
+        await message.reply("Dossier candidate discovery is operator-only.")
+        return True
+
+    if not options:
+        _last_candidate_discovery_error_status = "parse_rejected"
+        await message.reply(f"Dossier discovery failed: {parse_error}")
+        return True
+
+    dry_run = bool(options.get("dry_run"))
+    lanes = options.get("lanes") or list(DEFAULT_DISCOVERY_LANES)
+    limit = int(options.get("limit") or 10)
+    _last_candidate_discovery_run_time = datetime.now(timezone.utc).isoformat()
+    _last_candidate_discovery_source_lanes = list(lanes)
+    _last_candidate_discovery_mode = "dry_run" if dry_run else "command"
+    _last_candidate_discovery_error_status = "none"
+
+    discovery = discover_candidate_recommendations(
+        getattr(message.guild, "id", None),
+        lanes,
+        limit=limit,
+        broadcast_memory_reader=get_recent_broadcast_memory,
+        rd_context=_current_rd_discovery_context(message),
+    )
+    candidates = discovery.get("candidates") or []
+    withheld = int(discovery.get("withheldCount") or 0)
+    duplicate_count = int(discovery.get("duplicateCount") or 0)
+
+    if dry_run:
+        _last_candidate_discovery_sent_count = 0
+        _last_candidate_discovery_duplicate_count = duplicate_count
+        _last_candidate_discovery_withheld_count = withheld
+        names = [str(candidate.get("subjectName") or "subject")[:40] for candidate in candidates[:5]]
+        suffix = f" Top candidates: {', '.join(names)}." if names else ""
+        await message.reply(f"Dossier discovery dry run: {len(candidates)} candidates found.{suffix} Nothing sent.")
+        return True
+
+    sent_count = 0
+    send_duplicates = duplicate_count
+    first_error = "none"
+    for candidate in candidates:
+        payload = candidate.get("payload") or {}
+        result = await asyncio.to_thread(send_dossier_recommendation, payload)
+        if result.get("ok") and result.get("duplicate"):
+            send_duplicates += 1
+        elif result.get("ok"):
+            sent_count += 1
+        elif first_error == "none":
+            first_error = f"failed:{result.get('status') or 'no_status'}"
+
+    _last_candidate_discovery_sent_count = sent_count
+    _last_candidate_discovery_duplicate_count = send_duplicates
+    _last_candidate_discovery_withheld_count = withheld
+    _last_candidate_discovery_error_status = first_error
+    _last_dossier_recommendation_status = f"candidate_discovery_sent:{sent_count}:duplicates:{send_duplicates}:withheld:{withheld}" if first_error == "none" else first_error
+    await message.reply(
+        f"Dossier discovery complete: {sent_count} recommendations sent, "
+        f"{send_duplicates} duplicates skipped, {withheld} withheld for low confidence."
+    )
+    return True
+
+
 async def maybe_handle_dossier_recommendation_command(message: discord.Message, clean_content: str) -> bool:
-    """Handle the controlled `!bnl dossier recommend` packet/send command if present."""
+    """Handle controlled dossier recommendation/discovery commands if present."""
     global _last_dossier_recommendation_status, _last_dossier_packet_lane_count, _last_dossier_packet_subject
+    if await maybe_handle_dossier_discovery_command(message, clean_content):
+        return True
     matched, payload, parse_error = parse_manual_dossier_recommendation_command(clean_content)
     if not matched:
         return False
@@ -11657,6 +11772,16 @@ async def bnl_source_check(interaction: discord.Interaction):
         f"- dossier_broadcast_memory_reader_available: `{'yes' if dossier_diag['broadcast_memory_reader_available'] else 'no'}`",
         f"- dossier_last_packet_lane_count: `{dossier_diag['last_packet_lane_count']}`",
         f"- dossier_last_packet_subject: `{dossier_diag['last_packet_subject']}`",
+        f"- candidate_discovery_available: `{'yes' if dossier_diag['candidate_discovery_available'] else 'no'}`",
+        f"- candidate_discovery_enabled: `{'yes' if dossier_diag['candidate_discovery_enabled'] else 'no'}`",
+        f"- candidate_discovery_approved_lanes: `{','.join(dossier_diag['candidate_discovery_approved_lanes'])}`",
+        f"- candidate_discovery_last_run_time: `{dossier_diag['candidate_discovery_last_run_time']}`",
+        f"- candidate_discovery_last_sent_count: `{dossier_diag['candidate_discovery_last_sent_count']}`",
+        f"- candidate_discovery_last_duplicate_count: `{dossier_diag['candidate_discovery_last_duplicate_count']}`",
+        f"- candidate_discovery_last_withheld_count: `{dossier_diag['candidate_discovery_last_withheld_count']}`",
+        f"- candidate_discovery_last_error_status: `{dossier_diag['candidate_discovery_last_error_status']}`",
+        f"- candidate_discovery_last_source_lanes: `{','.join(dossier_diag['candidate_discovery_last_source_lanes']) or 'none'}`",
+        f"- candidate_discovery_last_mode: `{dossier_diag['candidate_discovery_last_mode']}`",
         f"- _bnl_control_flags_last_source_url: `{flags_source}`",
         f"- website_relay_enabled: `{BNL_WEBSITE_RELAY_ENABLED}` every `{BNL_WEBSITE_RELAY_INTERVAL_MINUTES}` min",
     ]
@@ -11878,6 +12003,16 @@ async def bnl_status(interaction: discord.Interaction):
         f"- dossier_broadcast_memory_reader_available: `{'yes' if dossier_diag['broadcast_memory_reader_available'] else 'no'}`",
         f"- dossier_last_packet_lane_count: `{dossier_diag['last_packet_lane_count']}`",
         f"- dossier_last_packet_subject: `{dossier_diag['last_packet_subject']}`",
+        f"- candidate_discovery_available: `{'yes' if dossier_diag['candidate_discovery_available'] else 'no'}`",
+        f"- candidate_discovery_enabled: `{'yes' if dossier_diag['candidate_discovery_enabled'] else 'no'}`",
+        f"- candidate_discovery_approved_lanes: `{','.join(dossier_diag['candidate_discovery_approved_lanes'])}`",
+        f"- candidate_discovery_last_run_time: `{dossier_diag['candidate_discovery_last_run_time']}`",
+        f"- candidate_discovery_last_sent_count: `{dossier_diag['candidate_discovery_last_sent_count']}`",
+        f"- candidate_discovery_last_duplicate_count: `{dossier_diag['candidate_discovery_last_duplicate_count']}`",
+        f"- candidate_discovery_last_withheld_count: `{dossier_diag['candidate_discovery_last_withheld_count']}`",
+        f"- candidate_discovery_last_error_status: `{dossier_diag['candidate_discovery_last_error_status']}`",
+        f"- candidate_discovery_last_source_lanes: `{','.join(dossier_diag['candidate_discovery_last_source_lanes']) or 'none'}`",
+        f"- candidate_discovery_last_mode: `{dossier_diag['candidate_discovery_last_mode']}`",
         f"- read_model_enabled: `{'yes' if read_model_diag.get('enabled') else 'no'}`",
         f"- read_model_url_configured: `{'yes' if read_model_diag.get('url_configured') else 'no'}`",
         f"- read_model_cache_present: `{'yes' if read_model_diag.get('cache_present') else 'no'}`",
