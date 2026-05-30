@@ -518,7 +518,7 @@ class DossierCandidateDiscoveryTests(unittest.TestCase):
         diag = bnl01_bot.build_dossier_recommendation_diagnostics()
         self.assertTrue(diag["candidate_discovery_available"])
         self.assertFalse(diag["candidate_discovery_enabled"])
-        self.assertEqual(diag["candidate_discovery_approved_lanes"], ["rd_context", "broadcast_memory"])
+        self.assertEqual(diag["candidate_discovery_approved_lanes"], ["rd_context", "broadcast_memory", "community_presence"])
         self.assertNotIn("token", json.dumps(diag.get("candidate_discovery_last_source_lanes", [])).lower())
 
 
@@ -687,6 +687,166 @@ class DossierDiscoveryRoutingTests(unittest.TestCase):
         diag = bnl01_bot.build_dossier_recommendation_diagnostics()
         self.assertEqual(diag["candidate_discovery_last_failed_count"], 2)
         self.assertEqual(diag["candidate_discovery_last_first_failure_status"], "HTTP 400")
+
+
+class CommunityCandidateScoutingTests(unittest.TestCase):
+    def community_rows(self):
+        return [
+            {
+                "subjectName": "Emerald",
+                "mentionCount": 3,
+                "directInteractionCount": 1,
+                "operatorMentionCount": 0,
+                "daysActive": 2,
+                "connectionNotes": [],
+                "category": "community_regular_candidate",
+                "signalCount": 5,
+            },
+            {
+                "subjectName": "Orion",
+                "mentionCount": 1,
+                "directInteractionCount": 0,
+                "operatorMentionCount": 1,
+                "daysActive": 1,
+                "connectionNotes": ["mentioned through Crow"],
+                "category": "introduced_subject_candidate",
+                "signalCount": 2,
+            },
+        ]
+
+    def test_community_presence_lane_is_accepted_when_requested(self):
+        matched, options, error = discovery.parse_dossier_discovery_command(
+            "!bnl dossier discover candidates | lanes=rd_context,broadcast_memory,community_presence | limit=10"
+        )
+        self.assertTrue(matched)
+        self.assertFalse(error)
+        self.assertEqual(options["lanes"], ["rd_context", "broadcast_memory", "community_presence"])
+
+    def test_community_scout_alias_wraps_discovery_pipeline(self):
+        matched, options, error = discovery.parse_dossier_discovery_command("!bnl community scout candidates | limit=5")
+        self.assertTrue(matched)
+        self.assertFalse(error)
+        self.assertEqual(options["lanes"], ["community_presence"])
+        self.assertEqual(options["limit"], 5)
+
+    def test_community_presence_ignored_when_no_reader_available(self):
+        result = discovery.discover_candidate_recommendations(123, ["community_presence"])
+        self.assertEqual(result["payloads"], [])
+        self.assertEqual(result["sourceItemCount"], 0)
+
+    def test_recurring_community_subject_becomes_review_candidate(self):
+        result = discovery.discover_candidate_recommendations(
+            123,
+            ["community_presence"],
+            community_presence_reader=lambda *a, **k: self.community_rows(),
+        )
+        payload = next(payload for payload in result["payloads"] if payload["subjectName"] == "Emerald")
+        self.assertEqual(payload["type"], "new_subject")
+        self.assertEqual(payload.get("recommendedCategory"), "Personnel")
+        self.assertEqual(payload.get("recommendedKind"), "community_member")
+        self.assertIn("community scouting found Emerald", payload["reason"])
+        self.assertIn("community_presence", payload["sourceLanes"])
+        self.assertNotRegex(json.dumps(payload), r"\b\d{15,22}\b")
+
+    def test_operator_mentioned_subject_and_direct_interaction_score(self):
+        rows = [
+            {"subjectName": "Hellcat", "mentionCount": 1, "directInteractionCount": 0, "operatorMentionCount": 1, "daysActive": 1, "category": "community_regular_candidate", "signalCount": 2},
+            {"subjectName": "Crow", "mentionCount": 1, "directInteractionCount": 1, "operatorMentionCount": 0, "daysActive": 1, "category": "community_regular_candidate", "signalCount": 2},
+        ]
+        result = discovery.discover_candidate_recommendations(123, ["community_presence"], community_presence_reader=lambda *a, **k: rows)
+        names = {payload["subjectName"] for payload in result["payloads"]}
+        self.assertIn("Hellcat", names)
+        self.assertIn("Crow", names)
+
+    def test_orion_via_crow_is_possible_connection_not_confirmed_identity(self):
+        result = discovery.discover_candidate_recommendations(
+            123,
+            ["community_presence"],
+            community_presence_reader=lambda *a, **k: self.community_rows(),
+        )
+        payload = next(payload for payload in result["payloads"] if payload["subjectName"] == "Orion")
+        self.assertEqual(payload["type"], "new_subject")
+        self.assertEqual(payload.get("recommendedCategory"), "Personnel")
+        self.assertIn("mentioned through Crow", payload["reason"])
+        self.assertIn("not confirmed identity", payload["reason"])
+        self.assertNotIn("relationship", payload.get("recommendedKind", ""))
+
+    def test_community_weak_terms_and_one_off_title_words_withheld(self):
+        rows = [
+            {"subjectName": "everyone", "mentionCount": 5, "directInteractionCount": 0, "operatorMentionCount": 0, "daysActive": 4, "category": "community_regular_candidate", "signalCount": 5},
+            {"subjectName": "today", "mentionCount": 3, "directInteractionCount": 0, "operatorMentionCount": 0, "daysActive": 2, "category": "community_regular_candidate", "signalCount": 4},
+            {"subjectName": "Signal", "mentionCount": 1, "directInteractionCount": 0, "operatorMentionCount": 0, "daysActive": 1, "category": "community_regular_candidate", "signalCount": 1},
+        ]
+        result = discovery.discover_candidate_recommendations(123, ["community_presence"], community_presence_reader=lambda *a, **k: rows)
+        self.assertEqual(result["payloads"], [])
+
+    def test_community_payload_does_not_store_raw_transcript_or_invalid_taxonomy(self):
+        rows = [{"subjectName": "Emerald", "mentionCount": 3, "directInteractionCount": 1, "operatorMentionCount": 0, "daysActive": 2, "category": "community_regular_candidate", "signalCount": 5, "evidenceSnippets": ["raw message body should not appear 123456789012345678"]}]
+        result = discovery.discover_candidate_recommendations(123, ["community_presence"], community_presence_reader=lambda *a, **k: rows)
+        payload = result["payloads"][0]
+        self.assertIn(payload.get("recommendedCategory"), {"Entity", "Personnel", "Sponsor", "Interface", "Production"})
+        self.assertNotIn("raw message body", json.dumps(payload))
+        self.assertNotRegex(json.dumps(payload), r"\b\d{15,22}\b")
+
+    def test_alias_language_maps_to_identity_link_only_when_explicit(self):
+        alias_rows = [{"subjectName": "Emerald", "mentionCount": 2, "directInteractionCount": 0, "operatorMentionCount": 1, "daysActive": 1, "category": "possible_alias_review", "signalCount": 3}]
+        regular_rows = [{"subjectName": "Hellcat", "mentionCount": 2, "directInteractionCount": 1, "operatorMentionCount": 0, "daysActive": 1, "category": "community_regular_candidate", "signalCount": 3}]
+        alias_result = discovery.discover_candidate_recommendations(123, ["community_presence"], community_presence_reader=lambda *a, **k: alias_rows)
+        regular_result = discovery.discover_candidate_recommendations(123, ["community_presence"], community_presence_reader=lambda *a, **k: regular_rows)
+        self.assertEqual(alias_result["payloads"][0]["type"], "identity_link")
+        self.assertEqual(regular_result["payloads"][0]["type"], "new_subject")
+
+
+class CommunityPresenceStoreTests(unittest.TestCase):
+    def setUp(self):
+        self.db_path = "test_community_presence.db"
+        try:
+            os.remove(self.db_path)
+        except FileNotFoundError:
+            pass
+
+    def tearDown(self):
+        try:
+            os.remove(self.db_path)
+        except FileNotFoundError:
+            pass
+
+    def test_live_store_minimal_fields_no_raw_ids(self):
+        import bnl_community_scouting as scouting
+        result = scouting.record_community_presence_event(
+            self.db_path,
+            123,
+            "Emerald",
+            "Orion via Crow should be reviewed <@123456789012345678> with https://secret.example/path",
+            channel_id=456,
+            channel_policy="public_context",
+            direct_interaction=True,
+            operator_mention=True,
+            environ={"BNL_COMMUNITY_SCOUTING_ENABLED": "true"},
+        )
+        self.assertTrue(result["ok"])
+        rows = scouting.get_community_presence_candidates(self.db_path, 123, min_signals=1)
+        names = {row["subjectName"] for row in rows}
+        self.assertIn("Emerald", names)
+        self.assertIn("Orion", names)
+        blob = json.dumps(rows)
+        self.assertNotIn("123456789012345678", blob)
+        self.assertNotIn("https://secret.example", blob)
+        self.assertIn("mentioned through Crow", blob)
+
+    def test_disabled_store_is_safely_unavailable(self):
+        import bnl_community_scouting as scouting
+        result = scouting.record_community_presence_event(
+            self.db_path,
+            123,
+            "Emerald",
+            "Emerald is around",
+            channel_id=456,
+            channel_policy="public_context",
+            environ={"BNL_COMMUNITY_SCOUTING_ENABLED": "false"},
+        )
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["status"], "disabled")
 
 
 if __name__ == "__main__":
