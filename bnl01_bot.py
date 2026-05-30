@@ -3984,7 +3984,7 @@ def can_send_dossier_recommendation(user, member, guild) -> bool:
     return False
 
 
-def build_dossier_recommendation_diagnostics(guild_id: int | None = None) -> dict:
+def build_dossier_recommendation_diagnostics(guild_id=None) -> dict:
     """Safe configuration/status diagnostics for dossier recommendation ingest."""
     source_file_diag = build_source_file_lookup_diagnostics()
     return {
@@ -4067,7 +4067,7 @@ def _current_rd_discovery_context(message: discord.Message) -> list[dict]:
     return combined[-25:]
 
 
-def read_community_presence_candidates_for_discovery(guild_id: int | None, limit: int = 500):
+def read_community_presence_candidates_for_discovery(guild_id, limit: int = 500):
     """Return sanitized community-presence rows for the discovery lane without Discord IDs or raw transcripts."""
     if not community_scouting_enabled():
         return []
