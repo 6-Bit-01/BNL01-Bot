@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import re
 from dataclasses import dataclass, field
+from collections import Counter
 from typing import Any, Callable
 
 from bnl_dossier_recommendations import VALID_DOSSIER_CATEGORIES, build_dossier_recommendation_payload
@@ -31,6 +32,7 @@ MAX_DISCOVERY_LIMIT = 25
 DEFAULT_DISCOVERY_LIMIT = 10
 MIN_CANDIDATE_SCORE = 3
 TITLE_ONLY_MIN_SCORE = 5
+MEDIUM_CONTEXT_MIN_SCORE = 2
 MAX_REASON_LENGTH = 300
 _ALLOWED_DISCOVERY_LANES = set(DEFAULT_DISCOVERY_LANES) & set(APPROVED_SOURCE_LANES)
 _DISCORD_MENTION_PATTERN = re.compile(r"<[@#!&]?[0-9]{5,}>")
@@ -120,6 +122,7 @@ class CandidateAccumulator:
     mentions: int = 0
     explicit_hits: int = 0
     title_hits: int = 0
+    contextual_hits: int = 0
     score: int = 0
 
 
@@ -267,25 +270,40 @@ def _clean_subject(candidate: str) -> str:
     return cleaned[:80]
 
 
-def _valid_subject(candidate: str) -> bool:
+def _subject_rejection_reason(candidate: str) -> str:
     subject = _clean_subject(candidate)
     normalized = subject.lower()
-    if not subject or len(subject) < 3 or subject in _STOP_PHRASES:
-        return False
-    if normalized in {item.lower() for item in _STOP_PHRASES}:
-        return False
+    if not subject or len(subject) < 3:
+        return "invalid_subject_shape"
+    if subject in _STOP_PHRASES or normalized in {item.lower() for item in _STOP_PHRASES}:
+        return "weak_generic_subject"
     if normalized in _WEAK_SUBJECT_TERMS:
-        return False
+        return "weak_generic_subject"
     words = re.findall(r"[A-Za-z0-9]+", normalized)
     if words and all(word in _WEAK_SUBJECT_TERMS for word in words):
-        return False
+        return "weak_generic_subject"
+    if words and words[0] in _WEAK_SUBJECT_TERMS and words[0] not in {"signal"}:
+        return "weak_generic_subject"
     if normalized in {"barcode", "barcode radio", "barcode network"}:
-        return False
+        return "weak_generic_subject"
     if re.fullmatch(r"\d+", subject):
-        return False
+        return "invalid_subject_shape"
     if subject.lower().startswith(("do not", "public safe", "source lane", "in ", "on ", "at ", "for ", "with ")):
-        return False
-    return bool(re.search(r"[A-Za-z]", subject))
+        return "invalid_subject_shape"
+    if not re.search(r"[A-Za-z]", subject):
+        return "invalid_subject_shape"
+    return ""
+
+
+def _valid_subject(candidate: str) -> bool:
+    return not _subject_rejection_reason(candidate)
+
+
+def _has_contextual_evidence(acc: CandidateAccumulator) -> bool:
+    return acc.contextual_hits > 0 or any(
+        re.search(r"\b(recurring|repeated|priority|source file|dossier|candidate|alias review|identity review|entity|character|lore|track|review)\b", item.get("summary") or "", flags=re.I)
+        for item in acc.evidence
+    )
 
 
 def _has_strong_evidence(acc: CandidateAccumulator) -> bool:
@@ -296,10 +314,32 @@ def _has_strong_evidence(acc: CandidateAccumulator) -> bool:
         return False
     if acc.mentions < 2 or acc.score < TITLE_ONLY_MIN_SCORE:
         return False
-    return any(
-        re.search(r"\b(recurring|repeated|priority|source file|dossier|candidate|alias review|identity review)\b", item.get("summary") or "", flags=re.I)
-        for item in acc.evidence
-    )
+    return _has_contextual_evidence(acc)
+
+
+def _has_medium_evidence(acc: CandidateAccumulator) -> bool:
+    if not acc.evidence or not acc.lanes:
+        return False
+    normalized = acc.subject_name.lower()
+    if len(acc.subject_name.split()) == 1 and normalized not in _KNOWN_ONE_WORD_SUBJECTS:
+        return False
+    if acc.score < MEDIUM_CONTEXT_MIN_SCORE:
+        return False
+    return acc.mentions >= 2 or _has_contextual_evidence(acc)
+
+
+def _withheld_reason(acc: CandidateAccumulator) -> str:
+    if not _valid_subject(acc.subject_name):
+        return _subject_rejection_reason(acc.subject_name) or "invalid_subject_shape"
+    if not acc.lanes:
+        return "unsupported_lane"
+    if not acc.evidence:
+        return "insufficient_source_context"
+    if acc.title_hits and not acc.explicit_hits and not _has_contextual_evidence(acc):
+        return "title_only_low_evidence"
+    if acc.mentions < 2 and not _has_contextual_evidence(acc):
+        return "insufficient_source_context"
+    return "below_minimum_score"
 
 
 def _payload_taxonomy(acc: CandidateAccumulator) -> dict[str, Any]:
@@ -361,12 +401,26 @@ def discover_candidate_recommendations(
         rd_context=rd_context,
     )
     accumulators: dict[str, CandidateAccumulator] = {}
+    withheld_reasons: Counter[str] = Counter()
+
+    if not requested_lanes:
+        withheld_reasons["unsupported_lane"] += 1
 
     for item in source_items:
         text = item.text
-        explicit = {_clean_subject(subject) for subject in _explicit_subjects(text) if _valid_subject(subject)}
-        candidate_sources: list[tuple[str, bool]] = [(subject, True) for subject in explicit]
-        candidate_sources.extend((_clean_subject(subject), False) for subject in _title_subjects(text) if _valid_subject(subject))
+        candidate_sources: list[tuple[str, bool]] = []
+        for subject in _explicit_subjects(text):
+            reason = _subject_rejection_reason(subject)
+            if reason:
+                withheld_reasons[reason] += 1
+                continue
+            candidate_sources.append((_clean_subject(subject), True))
+        for subject in _title_subjects(text):
+            reason = _subject_rejection_reason(subject)
+            if reason:
+                withheld_reasons[reason] += 1
+                continue
+            candidate_sources.append((_clean_subject(subject), False))
         seen_in_item: set[str] = set()
         for subject, is_explicit in candidate_sources:
             key = subject_key(subject)
@@ -389,18 +443,25 @@ def discover_candidate_recommendations(
             if len(acc.evidence) < 5:
                 acc.evidence.append({"lane": item.lane, "label": item.label, "summary": _safe_snippet(text), "sourceRef": item.source_ref})
             acc.score += item.weight + (2 if is_explicit else 0)
-            if re.search(r"\b(recurring|repeated|important|priority|source file|dossier|candidate|alias review|identity review)\b", text, flags=re.I):
+            if re.search(r"\b(recurring|repeated|important|priority|source file|dossier|candidate|alias review|identity review|entity|character|lore|track|review)\b", text, flags=re.I):
+                acc.contextual_hits += 1
                 acc.score += 1
 
     candidates: list[dict[str, Any]] = []
-    withheld_count = 0
+    strong_count = 0
+    medium_count = 0
     for acc in accumulators.values():
-        passed = acc.score >= MIN_CANDIDATE_SCORE and acc.evidence and acc.lanes and _has_strong_evidence(acc)
-        if not passed:
-            withheld_count += 1
+        is_strong = acc.score >= MIN_CANDIDATE_SCORE and _has_strong_evidence(acc)
+        is_medium = not is_strong and _has_medium_evidence(acc)
+        if not (is_strong or is_medium):
+            withheld_reasons[_withheld_reason(acc)] += 1
             continue
+        if is_strong:
+            strong_count += 1
+        else:
+            medium_count += 1
         lane_list = [lane for lane in requested_lanes if lane in acc.lanes] or sorted(acc.lanes)
-        confidence = "high" if acc.score >= 7 and len(acc.lanes) > 1 else ("medium" if acc.score >= 4 else "low")
+        confidence = "high" if is_strong and acc.score >= 7 and len(acc.lanes) > 1 else ("medium" if acc.score >= 4 else "low")
         reason = _safe_snippet(
             f"BNL dynamic candidate discovery found {acc.subject_name} in approved source-safe lanes "
             f"({', '.join(lane_list)}) as {acc.category.replace('_', ' ')}. Review only; owner/admin must decide whether this becomes a source file, alias proposal, duplicate, or nothing.",
@@ -421,8 +482,10 @@ def discover_candidate_recommendations(
                 "missingInfo": list(DEFAULT_MISSING_INFO),
                 "publicSafetyNotes": list(DEFAULT_PUBLIC_SAFETY_NOTES) + [
                     f"Internal discovery classification: {acc.category}.",
-                    "BNL dynamic discovery is review-only and does not confirm identity, aliases, or publication readiness."
-                ],
+                    "BNL dynamic discovery is review-only and does not confirm identity, aliases, or publication readiness.",
+                ] + ([
+                    "Medium-confidence BNL discovery. Review before converting, merging, aliasing, drafting, or publishing."
+                ] if is_medium else []),
                 "confidence": confidence,
                 "createdBy": "bnl",
                 "ingestSource": DISCOVERY_INGEST_SOURCE,
@@ -431,7 +494,7 @@ def discover_candidate_recommendations(
         )
         if payload.get("recommendedCategory") and payload.get("recommendedCategory") not in VALID_DOSSIER_CATEGORIES:
             payload.pop("recommendedCategory", None)
-        candidates.append({"subjectName": acc.subject_name, "category": acc.category, "score": acc.score, "payload": payload})
+        candidates.append({"subjectName": acc.subject_name, "category": acc.category, "score": acc.score, "confidenceTier": "strong" if is_strong else "medium", "payload": payload})
 
     candidates.sort(key=lambda row: (-int(row.get("score") or 0), str(row.get("subjectName") or "").lower()))
     deduped: list[dict[str, Any]] = []
@@ -441,17 +504,31 @@ def discover_candidate_recommendations(
         key = candidate["payload"]["ingestKey"]
         if key in seen_keys:
             duplicate_count += 1
+            withheld_reasons["duplicate_internal_candidate"] += 1
             continue
         seen_keys.add(key)
         deduped.append(candidate)
         if len(deduped) >= max_candidates:
             break
 
+    limited_count = max(0, len(candidates) - len(deduped) - duplicate_count)
+    if limited_count:
+        withheld_reasons["below_minimum_score"] += limited_count
+    reason_counts = dict(sorted(withheld_reasons.items()))
+    top_withheld_reason = "none"
+    if withheld_reasons:
+        top_withheld_reason = sorted(withheld_reasons.items(), key=lambda item: (-item[1], item[0]))[0][0]
+
     return {
         "lanes": requested_lanes,
         "sourceItemCount": len(source_items),
         "candidateCount": len(deduped),
-        "withheldCount": withheld_count + max(0, len(candidates) - len(deduped) - duplicate_count),
+        "sendableCandidateCount": len(deduped),
+        "withheldCount": sum(withheld_reasons.values()),
+        "withheldReasonCounts": reason_counts,
+        "topWithheldReason": top_withheld_reason,
+        "mediumConfidenceCount": sum(1 for candidate in deduped if candidate.get("confidenceTier") == "medium"),
+        "strongConfidenceCount": sum(1 for candidate in deduped if candidate.get("confidenceTier") == "strong"),
         "duplicateCount": duplicate_count,
         "candidates": deduped,
         "payloads": [candidate["payload"] for candidate in deduped],
