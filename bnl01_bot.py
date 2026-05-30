@@ -42,6 +42,12 @@ from bnl_dossier_source_packets import (
     is_broadcast_memory_reader_available,
     set_broadcast_memory_reader,
 )
+from bnl_source_file_lookup import (
+    build_source_file_lookup_diagnostics,
+    format_source_file_lookup_response,
+    lookup_source_file,
+    parse_source_file_lookup_command,
+)
 from collections import defaultdict, deque
 from datetime import datetime, timedelta, timezone
 
@@ -3963,6 +3969,7 @@ def can_send_dossier_recommendation(user, member, guild) -> bool:
 
 def build_dossier_recommendation_diagnostics() -> dict:
     """Safe configuration/status diagnostics for dossier recommendation ingest."""
+    source_file_diag = build_source_file_lookup_diagnostics()
     return {
         "ingest_url_configured": bool(os.getenv("BNL_DOSSIER_INGEST_URL", "").strip()),
         "ingest_url_using_default": not bool(os.getenv("BNL_DOSSIER_INGEST_URL", "").strip()),
@@ -3973,6 +3980,13 @@ def build_dossier_recommendation_diagnostics() -> dict:
         "broadcast_memory_reader_available": is_broadcast_memory_reader_available(),
         "last_packet_lane_count": _last_dossier_packet_lane_count,
         "last_packet_subject": _last_dossier_packet_subject,
+        "source_file_read_url_configured": source_file_diag["read_url_configured"],
+        "source_file_read_token_configured": source_file_diag["read_token_configured"],
+        "source_file_last_lookup_status": source_file_diag["last_lookup_status"],
+        "source_file_last_lookup_match_kind": source_file_diag["last_lookup_match_kind"],
+        "source_file_last_lookup_subject": source_file_diag["last_lookup_subject"],
+        "source_file_last_lookup_found": source_file_diag["last_lookup_found"],
+        "source_file_last_lookup_error_status": source_file_diag["last_lookup_error_status"],
         "candidate_discovery_available": True,
         "candidate_discovery_enabled": False,
         "candidate_discovery_ingest_source": DISCOVERY_INGEST_SOURCE,
@@ -4146,6 +4160,36 @@ async def maybe_handle_dossier_discovery_command(message: discord.Message, clean
             f"{send_duplicates} duplicates skipped, {withheld} withheld, {failed_count} failed."
         )
     await message.reply(f"{summary}{reason_suffix}{failure_suffix}")
+    return True
+
+
+async def maybe_handle_source_file_lookup_command(message: discord.Message, clean_content: str) -> bool:
+    """Handle explicit operator-only BNL Source File lookup commands."""
+
+    matched, query, parse_error = parse_source_file_lookup_command(clean_content)
+    if not matched:
+        return False
+
+    member = message.author if isinstance(message.author, discord.Member) else message.guild.get_member(message.author.id)
+    if not can_send_dossier_recommendation(message.author, member, message.guild):
+        logging.warning("source_file_lookup_command_denied reason=permission")
+        await message.reply("Source-file lookup is operator-only.")
+        return True
+
+    channel = getattr(message, "channel", None)
+    policy = resolve_channel_policy(channel)
+    channel_name = getattr(channel, "name", "") or ""
+    if is_public_prompt_context(policy) and not is_operator_authority_context(policy, channel_name):
+        await message.reply("Source-file lookup is restricted to approved internal/operator channels.")
+        return True
+
+    if not query:
+        await message.reply(f"Source-file lookup failed: {parse_error}")
+        return True
+
+    result = await asyncio.to_thread(lookup_source_file, query)
+    response = format_source_file_lookup_response(result, query.get("lookupValue", ""))
+    await message.reply(response)
     return True
 
 
@@ -10743,6 +10787,9 @@ async def on_message(message: discord.Message):
         .strip()
     )
 
+    if await maybe_handle_source_file_lookup_command(message, clean_content):
+        return
+
     if await maybe_handle_dossier_recommendation_command(message, clean_content):
         return
 
@@ -11848,6 +11895,13 @@ async def bnl_source_check(interaction: discord.Interaction):
         f"- dossier_broadcast_memory_reader_available: `{'yes' if dossier_diag['broadcast_memory_reader_available'] else 'no'}`",
         f"- dossier_last_packet_lane_count: `{dossier_diag['last_packet_lane_count']}`",
         f"- dossier_last_packet_subject: `{dossier_diag['last_packet_subject']}`",
+        f"- source_file_read_url_configured: `{'yes' if dossier_diag['source_file_read_url_configured'] else 'no_using_default'}`",
+        f"- source_file_read_token_configured: `{'yes' if dossier_diag['source_file_read_token_configured'] else 'no'}`",
+        f"- source_file_last_lookup_status: `{dossier_diag['source_file_last_lookup_status']}`",
+        f"- source_file_last_lookup_match_kind: `{dossier_diag['source_file_last_lookup_match_kind']}`",
+        f"- source_file_last_lookup_subject: `{dossier_diag['source_file_last_lookup_subject']}`",
+        f"- source_file_last_lookup_found: `{'yes' if dossier_diag['source_file_last_lookup_found'] else 'no'}`",
+        f"- source_file_last_lookup_error_status: `{dossier_diag['source_file_last_lookup_error_status']}`",
         f"- candidate_discovery_available: `{'yes' if dossier_diag['candidate_discovery_available'] else 'no'}`",
         f"- candidate_discovery_enabled: `{'yes' if dossier_diag['candidate_discovery_enabled'] else 'no'}`",
         f"- candidate_discovery_approved_lanes: `{','.join(dossier_diag['candidate_discovery_approved_lanes'])}`",
@@ -12087,6 +12141,13 @@ async def bnl_status(interaction: discord.Interaction):
         f"- dossier_broadcast_memory_reader_available: `{'yes' if dossier_diag['broadcast_memory_reader_available'] else 'no'}`",
         f"- dossier_last_packet_lane_count: `{dossier_diag['last_packet_lane_count']}`",
         f"- dossier_last_packet_subject: `{dossier_diag['last_packet_subject']}`",
+        f"- source_file_read_url_configured: `{'yes' if dossier_diag['source_file_read_url_configured'] else 'no_using_default'}`",
+        f"- source_file_read_token_configured: `{'yes' if dossier_diag['source_file_read_token_configured'] else 'no'}`",
+        f"- source_file_last_lookup_status: `{dossier_diag['source_file_last_lookup_status']}`",
+        f"- source_file_last_lookup_match_kind: `{dossier_diag['source_file_last_lookup_match_kind']}`",
+        f"- source_file_last_lookup_subject: `{dossier_diag['source_file_last_lookup_subject']}`",
+        f"- source_file_last_lookup_found: `{'yes' if dossier_diag['source_file_last_lookup_found'] else 'no'}`",
+        f"- source_file_last_lookup_error_status: `{dossier_diag['source_file_last_lookup_error_status']}`",
         f"- candidate_discovery_available: `{'yes' if dossier_diag['candidate_discovery_available'] else 'no'}`",
         f"- candidate_discovery_enabled: `{'yes' if dossier_diag['candidate_discovery_enabled'] else 'no'}`",
         f"- candidate_discovery_approved_lanes: `{','.join(dossier_diag['candidate_discovery_approved_lanes'])}`",
