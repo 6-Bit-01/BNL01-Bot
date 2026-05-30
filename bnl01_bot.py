@@ -28,8 +28,18 @@ import calendar
 from bnl_dossier_candidate_discovery import (
     DEFAULT_DISCOVERY_LANES,
     DISCOVERY_INGEST_SOURCE,
+    COMMUNITY_DISCOVERY_LANE,
     discover_candidate_recommendations,
     parse_dossier_discovery_command,
+)
+from bnl_community_scouting import (
+    build_community_presence_diagnostics,
+    community_min_signals,
+    community_scouting_enabled,
+    ensure_community_presence_schema,
+    get_community_presence_candidates,
+    is_community_presence_channel_allowed,
+    record_community_presence_event,
 )
 from bnl_dossier_recommendations import (
     get_dossier_ingest_url,
@@ -84,6 +94,8 @@ BNL_OWNER_USER_ID = int(os.getenv("BNL_OWNER_USER_ID", "0") or 0)
 BNL_MOD_ROLE_ID = int(os.getenv("BNL_MOD_ROLE_ID", "0") or 0)
 BNL_TESTING_CHANNEL_ID = int(os.getenv("BNL_TESTING_CHANNEL_ID", "0") or 0)
 BNL_BROADCAST_MEMORY_CHANNEL_ID = int(os.getenv("BNL_BROADCAST_MEMORY_CHANNEL_ID", "1509384896554995752") or 0)
+BNL_COMMUNITY_SCOUTING_ENABLED = community_scouting_enabled()
+BNL_COMMUNITY_SCOUTING_MIN_SIGNALS = community_min_signals()
 
 DAILY_TOKEN_LIMIT = 1_350_000
 PACIFIC_TZ = pytz.timezone("US/Pacific")
@@ -490,6 +502,10 @@ _last_candidate_discovery_withheld_reason_counts = {}
 _last_candidate_discovery_medium_confidence_count = 0
 _last_candidate_discovery_strong_confidence_count = 0
 _last_candidate_discovery_top_withheld_reason = "none"
+_last_community_presence_candidate_count = 0
+_last_community_presence_withheld_count = 0
+_last_community_presence_top_withheld_reason = "none"
+_last_community_presence_error_status = "none"
 BNL_CONTROL_FLAGS_TTL_SECONDS = 300
 _bnl_control_flags_cache = None
 _bnl_control_flags_cached_at = None
@@ -3304,6 +3320,7 @@ def init_db():
 
     conn.commit()
     conn.close()
+    ensure_community_presence_schema(DB_FILE)
     logging.info("✅ Database initialized successfully.")
 
 def _truncate_user_facts(user_id: int, guild_id: int, max_rows: int = MAX_FACTS_PER_USER):
@@ -3967,7 +3984,7 @@ def can_send_dossier_recommendation(user, member, guild) -> bool:
     return False
 
 
-def build_dossier_recommendation_diagnostics() -> dict:
+def build_dossier_recommendation_diagnostics(guild_id: int | None = None) -> dict:
     """Safe configuration/status diagnostics for dossier recommendation ingest."""
     source_file_diag = build_source_file_lookup_diagnostics()
     return {
@@ -3990,7 +4007,7 @@ def build_dossier_recommendation_diagnostics() -> dict:
         "candidate_discovery_available": True,
         "candidate_discovery_enabled": False,
         "candidate_discovery_ingest_source": DISCOVERY_INGEST_SOURCE,
-        "candidate_discovery_approved_lanes": list(DEFAULT_DISCOVERY_LANES),
+        "candidate_discovery_approved_lanes": list(DEFAULT_DISCOVERY_LANES) + [COMMUNITY_DISCOVERY_LANE],
         "candidate_discovery_last_run_time": _last_candidate_discovery_run_time,
         "candidate_discovery_last_sent_count": _last_candidate_discovery_sent_count,
         "candidate_discovery_last_duplicate_count": _last_candidate_discovery_duplicate_count,
@@ -4006,6 +4023,15 @@ def build_dossier_recommendation_diagnostics() -> dict:
         "candidate_discovery_last_medium_confidence_count": _last_candidate_discovery_medium_confidence_count,
         "candidate_discovery_last_strong_confidence_count": _last_candidate_discovery_strong_confidence_count,
         "candidate_discovery_last_top_withheld_reason": _last_candidate_discovery_top_withheld_reason,
+        **build_community_presence_diagnostics(
+            DB_FILE,
+            guild_id=guild_id,
+            environ=os.environ,
+            last_candidate_count=_last_community_presence_candidate_count,
+            last_withheld_count=_last_community_presence_withheld_count,
+            last_top_withheld_reason=_last_community_presence_top_withheld_reason,
+            last_error_status=_last_community_presence_error_status,
+        ),
     }
 
 
@@ -4041,6 +4067,40 @@ def _current_rd_discovery_context(message: discord.Message) -> list[dict]:
     return combined[-25:]
 
 
+def read_community_presence_candidates_for_discovery(guild_id: int | None, limit: int = 500):
+    """Return sanitized community-presence rows for the discovery lane without Discord IDs or raw transcripts."""
+    if not community_scouting_enabled():
+        return []
+    return get_community_presence_candidates(DB_FILE, guild_id, limit=limit, min_signals=community_min_signals())
+
+
+def maybe_record_live_community_presence(message: discord.Message, clean_content: str, channel_policy: str, direct_interaction: bool) -> None:
+    """Record minimal live community presence from approved channels only; never reads history."""
+    global _last_community_presence_error_status
+    if not community_scouting_enabled():
+        _last_community_presence_error_status = "disabled"
+        return
+    channel = getattr(message, "channel", None)
+    channel_id = int(getattr(channel, "id", 0) or 0)
+    if not is_community_presence_channel_allowed(channel_id, channel_policy):
+        _last_community_presence_error_status = "channel_not_approved"
+        return
+    member = message.author if isinstance(message.author, discord.Member) else message.guild.get_member(message.author.id)
+    operator_mention = bool(member and can_send_dossier_recommendation(message.author, member, message.guild))
+    result = record_community_presence_event(
+        DB_FILE,
+        getattr(message.guild, "id", 0),
+        getattr(message.author, "display_name", "") or getattr(message.author, "name", ""),
+        clean_content,
+        channel_id=channel_id,
+        channel_name=getattr(channel, "name", ""),
+        channel_policy=channel_policy,
+        direct_interaction=direct_interaction,
+        operator_mention=operator_mention,
+    )
+    _last_community_presence_error_status = str(result.get("status") or "none")[:80]
+
+
 async def maybe_handle_dossier_discovery_command(message: discord.Message, clean_content: str) -> bool:
     """Handle operator-triggered dynamic dossier candidate discovery."""
 
@@ -4053,6 +4113,8 @@ async def maybe_handle_dossier_discovery_command(message: discord.Message, clean
     global _last_candidate_discovery_sendable_candidate_count, _last_candidate_discovery_withheld_reason_counts
     global _last_candidate_discovery_medium_confidence_count, _last_candidate_discovery_strong_confidence_count
     global _last_candidate_discovery_top_withheld_reason
+    global _last_community_presence_candidate_count, _last_community_presence_withheld_count
+    global _last_community_presence_top_withheld_reason, _last_community_presence_error_status
 
     matched, options, parse_error = parse_dossier_discovery_command(clean_content)
     if not matched:
@@ -4093,6 +4155,7 @@ async def maybe_handle_dossier_discovery_command(message: discord.Message, clean
         limit=limit,
         broadcast_memory_reader=get_recent_broadcast_memory,
         rd_context=_current_rd_discovery_context(message),
+        community_presence_reader=read_community_presence_candidates_for_discovery,
     )
     candidates = discovery.get("candidates") or []
     withheld = int(discovery.get("withheldCount") or 0)
@@ -4107,6 +4170,11 @@ async def maybe_handle_dossier_discovery_command(message: discord.Message, clean
     _last_candidate_discovery_medium_confidence_count = medium_count
     _last_candidate_discovery_strong_confidence_count = strong_count
     _last_candidate_discovery_top_withheld_reason = top_reason
+    if COMMUNITY_DISCOVERY_LANE in lanes:
+        _last_community_presence_candidate_count = sendable_count
+        _last_community_presence_withheld_count = withheld
+        _last_community_presence_top_withheld_reason = top_reason
+        _last_community_presence_error_status = "none"
 
     if dry_run:
         _last_candidate_discovery_sent_count = 0
@@ -4116,7 +4184,8 @@ async def maybe_handle_dossier_discovery_command(message: discord.Message, clean
         names = [str(candidate.get("subjectName") or "subject")[:40] for candidate in candidates[:5]]
         sendable_suffix = f" Sendable: {', '.join(names)}." if names else ""
         main_suffix = f" Main withheld reason: {_humanize_discovery_reason(top_reason)}." if withheld and top_reason != "none" else ""
-        await message.reply(f"Dry run: {sendable_count} sendable, {withheld} withheld.{sendable_suffix}{main_suffix}")
+        lanes_suffix = f" Lanes: {', '.join(lanes)}."
+        await message.reply(f"Dry run: {sendable_count} sendable, {withheld} withheld.{sendable_suffix}{main_suffix}{lanes_suffix}")
         return True
 
     sent_count = 0
@@ -4159,7 +4228,8 @@ async def maybe_handle_dossier_discovery_command(message: discord.Message, clean
             f"Dossier discovery complete: {sent_count} recommendations sent, "
             f"{send_duplicates} duplicates skipped, {withheld} withheld, {failed_count} failed."
         )
-    await message.reply(f"{summary}{reason_suffix}{failure_suffix}")
+    lanes_suffix = f" Lanes: {', '.join(lanes)}."
+    await message.reply(f"{summary}{reason_suffix}{failure_suffix}{lanes_suffix}")
     return True
 
 
@@ -10793,6 +10863,8 @@ async def on_message(message: discord.Message):
     if await maybe_handle_dossier_recommendation_command(message, clean_content):
         return
 
+    maybe_record_live_community_presence(message, clean_content, channel_policy, real_direct_target)
+
     plain_text_name_seen = bool(re.search(r"\b(bnl|bnl-01|barcode bot)\b", clean_content.lower())) if clean_content else False
     channel_allows_conversation = bool(
         channel_policy in {"public_home", "sealed_test"}
@@ -11873,7 +11945,7 @@ async def bnl_source_check(interaction: discord.Interaction):
     relay_eligibility = website_relay_eligibility(policy)
     primary_guild_match = bool(guild and BNL_PRIMARY_GUILD_ID and guild.id == BNL_PRIMARY_GUILD_ID)
     flags_source = _bnl_control_flags_last_source_url or "none"
-    dossier_diag = build_dossier_recommendation_diagnostics()
+    dossier_diag = build_dossier_recommendation_diagnostics(guild.id)
 
     lines = [
         "**BNL Source Diagnostic**",
@@ -11920,6 +11992,16 @@ async def bnl_source_check(interaction: discord.Interaction):
         f"- candidate_discovery_last_medium_confidence_count: `{dossier_diag['candidate_discovery_last_medium_confidence_count']}`",
         f"- candidate_discovery_last_strong_confidence_count: `{dossier_diag['candidate_discovery_last_strong_confidence_count']}`",
         f"- candidate_discovery_last_top_withheld_reason: `{dossier_diag['candidate_discovery_last_top_withheld_reason']}`",
+        f"- community_scouting_available: `{'yes' if dossier_diag['community_scouting_available'] else 'no'}`",
+        f"- community_scouting_enabled: `{'yes' if dossier_diag['community_scouting_enabled'] else 'no'}`",
+        f"- community_scouting_allowed_channels_configured: `{'yes' if dossier_diag['community_scouting_allowed_channels_configured'] else 'no'}`",
+        f"- community_presence_item_count: `{dossier_diag['community_presence_item_count']}`",
+        f"- community_presence_last_seen_at: `{dossier_diag['community_presence_last_seen_at']}`",
+        f"- community_presence_candidate_count: `{dossier_diag['community_presence_candidate_count']}`",
+        f"- community_presence_last_candidate_count: `{dossier_diag['community_presence_last_candidate_count']}`",
+        f"- community_presence_last_withheld_count: `{dossier_diag['community_presence_last_withheld_count']}`",
+        f"- community_presence_last_top_withheld_reason: `{dossier_diag['community_presence_last_top_withheld_reason']}`",
+        f"- community_presence_last_error_status: `{dossier_diag['community_presence_last_error_status']}`",
         f"- _bnl_control_flags_last_source_url: `{flags_source}`",
         f"- website_relay_enabled: `{BNL_WEBSITE_RELAY_ENABLED}` every `{BNL_WEBSITE_RELAY_INTERVAL_MINUTES}` min",
     ]
@@ -12108,7 +12190,7 @@ async def bnl_status(interaction: discord.Interaction):
     flags_source_state = "available" if _bnl_control_flags_last_source_url else "not yet fetched"
     website_bridge_configured = bool(BNL_STATUS_URL and BNL_API_KEY)
     read_model_diag = get_bnl_read_model_diagnostic_state()
-    dossier_diag = build_dossier_recommendation_diagnostics()
+    dossier_diag = build_dossier_recommendation_diagnostics(guild.id)
     broadcast_channel = guild.get_channel(BNL_BROADCAST_MEMORY_CHANNEL_ID) if BNL_BROADCAST_MEMORY_CHANNEL_ID else None
     broadcast_count = len(get_recent_broadcast_memory(guild.id, public_only=False, limit=500))
     latest_written_episode_date, latest_show_episode_date = get_broadcast_memory_diagnostic_dates(guild.id)
@@ -12166,6 +12248,16 @@ async def bnl_status(interaction: discord.Interaction):
         f"- candidate_discovery_last_medium_confidence_count: `{dossier_diag['candidate_discovery_last_medium_confidence_count']}`",
         f"- candidate_discovery_last_strong_confidence_count: `{dossier_diag['candidate_discovery_last_strong_confidence_count']}`",
         f"- candidate_discovery_last_top_withheld_reason: `{dossier_diag['candidate_discovery_last_top_withheld_reason']}`",
+        f"- community_scouting_available: `{'yes' if dossier_diag['community_scouting_available'] else 'no'}`",
+        f"- community_scouting_enabled: `{'yes' if dossier_diag['community_scouting_enabled'] else 'no'}`",
+        f"- community_scouting_allowed_channels_configured: `{'yes' if dossier_diag['community_scouting_allowed_channels_configured'] else 'no'}`",
+        f"- community_presence_item_count: `{dossier_diag['community_presence_item_count']}`",
+        f"- community_presence_last_seen_at: `{dossier_diag['community_presence_last_seen_at']}`",
+        f"- community_presence_candidate_count: `{dossier_diag['community_presence_candidate_count']}`",
+        f"- community_presence_last_candidate_count: `{dossier_diag['community_presence_last_candidate_count']}`",
+        f"- community_presence_last_withheld_count: `{dossier_diag['community_presence_last_withheld_count']}`",
+        f"- community_presence_last_top_withheld_reason: `{dossier_diag['community_presence_last_top_withheld_reason']}`",
+        f"- community_presence_last_error_status: `{dossier_diag['community_presence_last_error_status']}`",
         f"- read_model_enabled: `{'yes' if read_model_diag.get('enabled') else 'no'}`",
         f"- read_model_url_configured: `{'yes' if read_model_diag.get('url_configured') else 'no'}`",
         f"- read_model_cache_present: `{'yes' if read_model_diag.get('cache_present') else 'no'}`",

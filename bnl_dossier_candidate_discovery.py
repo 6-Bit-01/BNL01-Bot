@@ -15,6 +15,7 @@ from collections import Counter
 from typing import Any, Callable
 
 from bnl_dossier_recommendations import VALID_DOSSIER_CATEGORIES, build_dossier_recommendation_payload
+from bnl_community_scouting import COMMUNITY_PRESENCE_LANE, community_category_taxonomy
 from bnl_dossier_source_packets import (
     APPROVED_SOURCE_LANES,
     DEFAULT_MISSING_INFO,
@@ -28,13 +29,14 @@ from bnl_dossier_source_packets import (
 
 DISCOVERY_INGEST_SOURCE = "bnl_dynamic_candidate_discovery"
 DEFAULT_DISCOVERY_LANES = ["rd_context", "broadcast_memory"]
+COMMUNITY_DISCOVERY_LANE = COMMUNITY_PRESENCE_LANE
 MAX_DISCOVERY_LIMIT = 25
 DEFAULT_DISCOVERY_LIMIT = 10
 MIN_CANDIDATE_SCORE = 3
 TITLE_ONLY_MIN_SCORE = 5
 MEDIUM_CONTEXT_MIN_SCORE = 2
 MAX_REASON_LENGTH = 300
-_ALLOWED_DISCOVERY_LANES = set(DEFAULT_DISCOVERY_LANES) & set(APPROVED_SOURCE_LANES)
+_ALLOWED_DISCOVERY_LANES = (set(DEFAULT_DISCOVERY_LANES) | {COMMUNITY_DISCOVERY_LANE}) & set(APPROVED_SOURCE_LANES)
 _DISCORD_MENTION_PATTERN = re.compile(r"<[@#!&]?[0-9]{5,}>")
 _LONG_ID_PATTERN = re.compile(r"\b\d{15,22}\b")
 _SAFE_LANE_PATTERN = re.compile(r"[^a-z0-9_-]+")
@@ -91,6 +93,25 @@ _WEAK_SUBJECT_TERMS = {
     "user",
     "channel",
     "message",
+    "everyone",
+    "somebody",
+    "someone",
+    "anyone",
+    "today",
+    "tonight",
+    "yesterday",
+    "tomorrow",
+    "chat",
+    "thread",
+    "post",
+    "comment",
+    "reply",
+    "song",
+    "track",
+    "live",
+    "show",
+    "server",
+    "discord",
 }
 
 _KNOWN_ONE_WORD_SUBJECTS = {"cliff", "sheila", "shadowspit"}
@@ -111,6 +132,7 @@ class DiscoverySourceItem:
     label: str = ""
     source_ref: str = ""
     weight: int = 1
+    metadata: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -124,6 +146,11 @@ class CandidateAccumulator:
     title_hits: int = 0
     contextual_hits: int = 0
     score: int = 0
+    community_signal_count: int = 0
+    direct_interaction_count: int = 0
+    operator_mention_count: int = 0
+    days_active: int = 0
+    connection_notes: list[str] = field(default_factory=list)
 
 
 def parse_dossier_discovery_command(content: str) -> tuple[bool, dict[str, Any] | None, str]:
@@ -131,12 +158,15 @@ def parse_dossier_discovery_command(content: str) -> tuple[bool, dict[str, Any] 
 
     text = (content or "").strip()
     match = re.match(r"^!bnl\s+dossier\s+discover\s+candidates(?:\s*(?:\|\s*)?(.*))?$", text, flags=re.I | re.S)
-    if not match:
+    alias_match = None if match else re.match(r"^!bnl\s+community\s+scout\s+candidates(?:\s*(?:\|\s*)?(.*))?$", text, flags=re.I | re.S)
+    if not match and not alias_match:
         return False, None, "not_a_dossier_discovery_command"
+    if alias_match:
+        match = alias_match
 
     options_text = (match.group(1) or "").strip()
     options: dict[str, Any] = {
-        "lanes": list(DEFAULT_DISCOVERY_LANES),
+        "lanes": [COMMUNITY_DISCOVERY_LANE] if alias_match else list(DEFAULT_DISCOVERY_LANES),
         "limit": DEFAULT_DISCOVERY_LIMIT,
         "dry_run": False,
     }
@@ -144,13 +174,13 @@ def parse_dossier_discovery_command(content: str) -> tuple[bool, dict[str, Any] 
         for part in [piece.strip() for piece in options_text.split("|") if piece.strip()]:
             key_match = re.match(r"^([a-zA-Z_]+)\s*=\s*(.+)$", part)
             if not key_match:
-                return True, None, "Use: `!bnl dossier discover candidates [| lanes=rd_context,broadcast_memory] [| limit=10] [| dry_run=true]`"
+                return True, None, "Use: `!bnl dossier discover candidates [| lanes=rd_context,broadcast_memory,community_presence] [| limit=10] [| dry_run=true]`"
             key = key_match.group(1).strip().lower()
             value = key_match.group(2).strip()
             if key in {"lane", "lanes", "sourcelanes"}:
                 lanes = normalize_discovery_lanes(value)
                 if not lanes:
-                    return True, None, "No approved discovery lanes were requested. Approved lanes: rd_context,broadcast_memory."
+                    return True, None, "No approved discovery lanes were requested. Approved lanes: rd_context,broadcast_memory,community_presence."
                 options["lanes"] = lanes
             elif key == "limit":
                 try:
@@ -213,6 +243,7 @@ def collect_discovery_source_items(
     rd_context_reader: Callable[..., Any] | None = None,
     rd_context: list[Any] | None = None,
     broadcast_limit: int = 500,
+    community_presence_reader: Callable[..., Any] | None = None,
 ) -> list[DiscoverySourceItem]:
     """Collect approved source-safe lane text from explicit readers/context only."""
 
@@ -230,6 +261,43 @@ def collect_discovery_source_items(
             text = _safe_snippet(_rd_entry_to_text(entry), 500)
             if text:
                 items.append(DiscoverySourceItem("rd_context", text, "R&D context", f"rd_context:{idx}", weight=1))
+
+    if COMMUNITY_DISCOVERY_LANE in requested and guild_id and callable(community_presence_reader):
+        try:
+            rows = community_presence_reader(guild_id, limit=max(1, min(int(broadcast_limit or 1), 500)))
+        except Exception:
+            rows = []
+        for idx, row in enumerate(rows or [], start=1):
+            if not isinstance(row, dict):
+                continue
+            subject = _clean_subject(str(row.get("subjectName") or row.get("displayName") or ""))
+            reason = _subject_rejection_reason(subject)
+            if reason:
+                continue
+            mentions = int(row.get("mentionCount") or 0)
+            direct = int(row.get("directInteractionCount") or 0)
+            operator = int(row.get("operatorMentionCount") or 0)
+            days = int(row.get("daysActive") or 0)
+            notes = [str(note) for note in (row.get("connectionNotes") or []) if str(note or "").strip()][:3]
+            category = str(row.get("category") or "community_regular_candidate")
+            context = "recurring approved-channel participant"
+            if category == "introduced_subject_candidate" and notes:
+                context = notes[0]
+            elif operator:
+                context = "operator/mod-mentioned community subject"
+            elif direct:
+                context = "direct BNL interaction in approved community context"
+            text = _safe_snippet(
+                f"Community presence candidate for {subject}: {context}. "
+                f"Signals: mentions {mentions}, direct interactions {direct}, operator mentions {operator}, active windows {days}. "
+                "Review only; no identity, alias, relationship, draft, or public dossier is confirmed.",
+                500,
+            )
+            items.append(DiscoverySourceItem(
+                COMMUNITY_DISCOVERY_LANE, text, "Community presence", f"community_presence:{idx}",
+                weight=2 + min(3, direct + operator),
+                metadata={**row, "subjectName": subject, "category": category},
+            ))
 
     if "broadcast_memory" in requested and guild_id and callable(broadcast_memory_reader):
         try:
@@ -310,7 +378,7 @@ def _has_strong_evidence(acc: CandidateAccumulator) -> bool:
     if acc.explicit_hits > 0:
         return True
     normalized = acc.subject_name.lower()
-    if len(acc.subject_name.split()) == 1 and normalized not in _KNOWN_ONE_WORD_SUBJECTS:
+    if len(acc.subject_name.split()) == 1 and normalized not in _KNOWN_ONE_WORD_SUBJECTS and not acc.community_signal_count:
         return False
     if acc.mentions < 2 or acc.score < TITLE_ONLY_MIN_SCORE:
         return False
@@ -321,11 +389,11 @@ def _has_medium_evidence(acc: CandidateAccumulator) -> bool:
     if not acc.evidence or not acc.lanes:
         return False
     normalized = acc.subject_name.lower()
-    if len(acc.subject_name.split()) == 1 and normalized not in _KNOWN_ONE_WORD_SUBJECTS:
+    if len(acc.subject_name.split()) == 1 and normalized not in _KNOWN_ONE_WORD_SUBJECTS and not acc.community_signal_count:
         return False
     if acc.score < MEDIUM_CONTEXT_MIN_SCORE:
         return False
-    return acc.mentions >= 2 or _has_contextual_evidence(acc)
+    return acc.mentions >= 2 or _has_contextual_evidence(acc) or acc.community_signal_count >= 1 or acc.direct_interaction_count or acc.operator_mention_count
 
 
 def _withheld_reason(acc: CandidateAccumulator) -> str:
@@ -343,6 +411,8 @@ def _withheld_reason(acc: CandidateAccumulator) -> str:
 
 
 def _payload_taxonomy(acc: CandidateAccumulator) -> dict[str, Any]:
+    if acc.category in {"community_regular_candidate", "artist_or_collaborator_candidate", "mod_support_candidate", "introduced_subject_candidate", "possible_connection_review", "possible_alias_review"}:
+        return community_category_taxonomy(acc.category)
     if acc.category == "identity_alias_review":
         return {"type": "identity_link"}
     if acc.category == "system_concept_candidate":
@@ -388,6 +458,7 @@ def discover_candidate_recommendations(
     broadcast_memory_reader: Callable[..., Any] | None = None,
     rd_context_reader: Callable[..., Any] | None = None,
     rd_context: list[Any] | None = None,
+    community_presence_reader: Callable[..., Any] | None = None,
 ) -> dict[str, Any]:
     """Discover review candidates and return normal recommendation payloads plus safe counts."""
 
@@ -399,6 +470,7 @@ def discover_candidate_recommendations(
         broadcast_memory_reader=broadcast_memory_reader,
         rd_context_reader=rd_context_reader,
         rd_context=rd_context,
+        community_presence_reader=community_presence_reader,
     )
     accumulators: dict[str, CandidateAccumulator] = {}
     withheld_reasons: Counter[str] = Counter()
@@ -409,13 +481,15 @@ def discover_candidate_recommendations(
     for item in source_items:
         text = item.text
         candidate_sources: list[tuple[str, bool]] = []
-        for subject in _explicit_subjects(text):
+        if item.lane == COMMUNITY_DISCOVERY_LANE and item.metadata.get("subjectName"):
+            candidate_sources.append((_clean_subject(str(item.metadata.get("subjectName") or "")), True))
+        for subject in ([] if item.lane == COMMUNITY_DISCOVERY_LANE else _explicit_subjects(text)):
             reason = _subject_rejection_reason(subject)
             if reason:
                 withheld_reasons[reason] += 1
                 continue
             candidate_sources.append((_clean_subject(subject), True))
-        for subject in _title_subjects(text):
+        for subject in ([] if item.lane == COMMUNITY_DISCOVERY_LANE else _title_subjects(text)):
             reason = _subject_rejection_reason(subject)
             if reason:
                 withheld_reasons[reason] += 1
@@ -437,12 +511,23 @@ def discover_candidate_recommendations(
                 acc.explicit_hits += 1
             else:
                 acc.title_hits += 1
-            category = _category_for_text(text)
+            category = str(item.metadata.get("category") or _category_for_text(text))
             if acc.category == "new_source_file_candidate" or category != "new_source_file_candidate":
                 acc.category = category
             if len(acc.evidence) < 5:
                 acc.evidence.append({"lane": item.lane, "label": item.label, "summary": _safe_snippet(text), "sourceRef": item.source_ref})
             acc.score += item.weight + (2 if is_explicit else 0)
+            if item.lane == COMMUNITY_DISCOVERY_LANE:
+                acc.community_signal_count += int(item.metadata.get("signalCount") or item.metadata.get("mentionCount") or 0)
+                acc.direct_interaction_count += int(item.metadata.get("directInteractionCount") or 0)
+                acc.operator_mention_count += int(item.metadata.get("operatorMentionCount") or 0)
+                acc.days_active = max(acc.days_active, int(item.metadata.get("daysActive") or 0))
+                for note in item.metadata.get("connectionNotes") or []:
+                    note_text = _safe_snippet(str(note), 120)
+                    if note_text and note_text not in acc.connection_notes:
+                        acc.connection_notes.append(note_text)
+                acc.contextual_hits += 1
+                acc.score += min(4, acc.community_signal_count + acc.direct_interaction_count + acc.operator_mention_count + max(0, acc.days_active - 1))
             if re.search(r"\b(recurring|repeated|important|priority|source file|dossier|candidate|alias review|identity review|entity|character|lore|track|review)\b", text, flags=re.I):
                 acc.contextual_hits += 1
                 acc.score += 1
@@ -462,11 +547,23 @@ def discover_candidate_recommendations(
             medium_count += 1
         lane_list = [lane for lane in requested_lanes if lane in acc.lanes] or sorted(acc.lanes)
         confidence = "high" if is_strong and acc.score >= 7 and len(acc.lanes) > 1 else ("medium" if acc.score >= 4 else "low")
-        reason = _safe_snippet(
-            f"BNL dynamic candidate discovery found {acc.subject_name} in approved source-safe lanes "
-            f"({', '.join(lane_list)}) as {acc.category.replace('_', ' ')}. Review only; owner/admin must decide whether this becomes a source file, alias proposal, duplicate, or nothing.",
-            MAX_REASON_LENGTH,
-        )
+        if COMMUNITY_DISCOVERY_LANE in acc.lanes:
+            if acc.category == "introduced_subject_candidate" and acc.connection_notes:
+                reason_text = (
+                    f"BNL community scouting found {acc.subject_name} as a subject {acc.connection_notes[0]} in approved community context. "
+                    "This is a possible connection, not confirmed identity. Review before creating relationships, aliases, drafts, or public dossiers."
+                )
+            else:
+                reason_text = (
+                    f"BNL community scouting found {acc.subject_name} as a recurring approved-channel participant with repeated community presence. "
+                    "Review only; owner/admin must decide whether this becomes a Source File, alias proposal, duplicate, or nothing. No public identity or private account claim is made."
+                )
+        else:
+            reason_text = (
+                f"BNL dynamic candidate discovery found {acc.subject_name} in approved source-safe lanes "
+                f"({', '.join(lane_list)}) as {acc.category.replace('_', ' ')}. Review only; owner/admin must decide whether this becomes a source file, alias proposal, duplicate, or nothing."
+            )
+        reason = _safe_snippet(reason_text, MAX_REASON_LENGTH)
         evidence_summary = _evidence_summary(acc.evidence)
         evidence_hash = hashlib.sha256(f"{reason}\n{evidence_summary}".encode("utf-8")).hexdigest()[:8]
         taxonomy = _payload_taxonomy(acc)

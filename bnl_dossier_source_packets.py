@@ -12,7 +12,7 @@ from typing import Any, Callable
 
 from bnl_dossier_recommendations import build_dossier_recommendation_payload
 
-APPROVED_SOURCE_LANES = {"rd_context", "broadcast_memory"}
+APPROVED_SOURCE_LANES = {"rd_context", "broadcast_memory", "community_presence"}
 FUTURE_SOURCE_LANES = {"read_model", "public_read_model", "safe_rd_notes"}
 DEFAULT_MISSING_INFO = [
     "preferred display name",
