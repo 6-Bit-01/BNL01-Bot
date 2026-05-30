@@ -58,6 +58,12 @@ from bnl_source_file_lookup import (
     lookup_source_file,
     parse_source_file_lookup_command,
 )
+from bnl_source_knowledge_bridge import (
+    KNOWLEDGE_BRIDGE_INGEST_SOURCE,
+    format_source_knowledge_bridge_response,
+    parse_source_knowledge_bridge_command,
+    run_source_knowledge_bridge,
+)
 from collections import defaultdict, deque
 from datetime import datetime, timedelta, timezone
 
@@ -506,6 +512,14 @@ _last_community_presence_candidate_count = 0
 _last_community_presence_withheld_count = 0
 _last_community_presence_top_withheld_reason = "none"
 _last_community_presence_error_status = "none"
+_last_source_knowledge_bridge_run_time = "never"
+_last_source_knowledge_bridge_sent_count = 0
+_last_source_knowledge_bridge_duplicate_count = 0
+_last_source_knowledge_bridge_withheld_count = 0
+_last_source_knowledge_bridge_failed_count = 0
+_last_source_knowledge_bridge_source_counts = {}
+_last_source_knowledge_bridge_warning_counts = {}
+_last_source_knowledge_bridge_error_status = "none"
 BNL_CONTROL_FLAGS_TTL_SECONDS = 300
 _bnl_control_flags_cache = None
 _bnl_control_flags_cached_at = None
@@ -4023,6 +4037,16 @@ def build_dossier_recommendation_diagnostics(guild_id=None) -> dict:
         "candidate_discovery_last_medium_confidence_count": _last_candidate_discovery_medium_confidence_count,
         "candidate_discovery_last_strong_confidence_count": _last_candidate_discovery_strong_confidence_count,
         "candidate_discovery_last_top_withheld_reason": _last_candidate_discovery_top_withheld_reason,
+        "source_knowledge_bridge_available": True,
+        "source_knowledge_bridge_ingest_source": KNOWLEDGE_BRIDGE_INGEST_SOURCE,
+        "source_knowledge_bridge_last_run_time": _last_source_knowledge_bridge_run_time,
+        "source_knowledge_bridge_last_sent_count": _last_source_knowledge_bridge_sent_count,
+        "source_knowledge_bridge_last_duplicate_count": _last_source_knowledge_bridge_duplicate_count,
+        "source_knowledge_bridge_last_withheld_count": _last_source_knowledge_bridge_withheld_count,
+        "source_knowledge_bridge_last_failed_count": _last_source_knowledge_bridge_failed_count,
+        "source_knowledge_bridge_last_source_counts": dict(_last_source_knowledge_bridge_source_counts),
+        "source_knowledge_bridge_last_warning_counts": dict(_last_source_knowledge_bridge_warning_counts),
+        "source_knowledge_bridge_last_error_status": _last_source_knowledge_bridge_error_status,
         **build_community_presence_diagnostics(
             DB_FILE,
             guild_id=guild_id,
@@ -4099,6 +4123,64 @@ def maybe_record_live_community_presence(message: discord.Message, clean_content
         operator_mention=operator_mention,
     )
     _last_community_presence_error_status = str(result.get("status") or "none")[:80]
+
+
+async def maybe_handle_source_knowledge_bridge_command(message: discord.Message, clean_content: str) -> bool:
+    """Handle the operator-triggered local knowledge-to-Source File bridge."""
+
+    global _last_dossier_recommendation_status
+    global _last_source_knowledge_bridge_run_time, _last_source_knowledge_bridge_sent_count
+    global _last_source_knowledge_bridge_duplicate_count, _last_source_knowledge_bridge_withheld_count
+    global _last_source_knowledge_bridge_failed_count, _last_source_knowledge_bridge_source_counts
+    global _last_source_knowledge_bridge_warning_counts, _last_source_knowledge_bridge_error_status
+
+    matched, options, parse_error = parse_source_knowledge_bridge_command(clean_content)
+    if not matched:
+        return False
+
+    member = message.author if isinstance(message.author, discord.Member) else message.guild.get_member(message.author.id)
+    if not can_send_dossier_recommendation(message.author, member, message.guild):
+        _last_source_knowledge_bridge_error_status = "permission_denied"
+        _last_dossier_recommendation_status = "source_knowledge_bridge_permission_denied"
+        logging.warning("source_knowledge_bridge_denied reason=permission")
+        await message.reply("Source knowledge bridge is operator-only.")
+        return True
+
+    channel = getattr(message, "channel", None)
+    policy = resolve_channel_policy(channel)
+    channel_name = getattr(channel, "name", "") or ""
+    if is_public_prompt_context(policy) and not is_operator_authority_context(policy, channel_name):
+        _last_source_knowledge_bridge_error_status = "channel_restricted"
+        await message.reply("Source knowledge bridge is restricted to approved internal/operator channels.")
+        return True
+
+    if not options:
+        _last_source_knowledge_bridge_error_status = "parse_rejected"
+        await message.reply(f"Knowledge bridge failed: {parse_error}")
+        return True
+
+    result = await asyncio.to_thread(
+        run_source_knowledge_bridge,
+        DB_FILE,
+        getattr(message.guild, "id", None),
+        limit=int(options.get("limit") or 20),
+        dry_run=bool(options.get("dry_run", True)),
+        rd_context=_current_rd_discovery_context(message),
+    )
+    _last_source_knowledge_bridge_run_time = str(result.get("runTime") or datetime.now(timezone.utc).isoformat())
+    _last_source_knowledge_bridge_sent_count = int(result.get("sentCount") or 0)
+    _last_source_knowledge_bridge_duplicate_count = int(result.get("duplicateCount") or 0)
+    _last_source_knowledge_bridge_withheld_count = int(result.get("withheldCount") or 0)
+    _last_source_knowledge_bridge_failed_count = int(result.get("failedCount") or 0)
+    _last_source_knowledge_bridge_source_counts = dict(result.get("sourceCounts") or {})
+    _last_source_knowledge_bridge_warning_counts = dict(result.get("warningCounts") or {})
+    _last_source_knowledge_bridge_error_status = str(result.get("errorStatus") or "none")[:80]
+    _last_dossier_recommendation_status = (
+        "source_knowledge_bridge_dry_run" if result.get("dryRun")
+        else f"source_knowledge_bridge_sent:{_last_source_knowledge_bridge_sent_count}:duplicates:{_last_source_knowledge_bridge_duplicate_count}:withheld:{_last_source_knowledge_bridge_withheld_count}:failed:{_last_source_knowledge_bridge_failed_count}"
+    )
+    await message.reply(format_source_knowledge_bridge_response(result))
+    return True
 
 
 async def maybe_handle_dossier_discovery_command(message: discord.Message, clean_content: str) -> bool:
@@ -4266,6 +4348,8 @@ async def maybe_handle_source_file_lookup_command(message: discord.Message, clea
 async def maybe_handle_dossier_recommendation_command(message: discord.Message, clean_content: str) -> bool:
     """Handle controlled dossier recommendation/discovery commands if present."""
     global _last_dossier_recommendation_status, _last_dossier_packet_lane_count, _last_dossier_packet_subject
+    if await maybe_handle_source_knowledge_bridge_command(message, clean_content):
+        return True
     if await maybe_handle_dossier_discovery_command(message, clean_content):
         return True
     matched, payload, parse_error = parse_manual_dossier_recommendation_command(clean_content)
@@ -11992,6 +12076,15 @@ async def bnl_source_check(interaction: discord.Interaction):
         f"- candidate_discovery_last_medium_confidence_count: `{dossier_diag['candidate_discovery_last_medium_confidence_count']}`",
         f"- candidate_discovery_last_strong_confidence_count: `{dossier_diag['candidate_discovery_last_strong_confidence_count']}`",
         f"- candidate_discovery_last_top_withheld_reason: `{dossier_diag['candidate_discovery_last_top_withheld_reason']}`",
+        f"- source_knowledge_bridge_available: `{'yes' if dossier_diag['source_knowledge_bridge_available'] else 'no'}`",
+        f"- source_knowledge_bridge_last_run_time: `{dossier_diag['source_knowledge_bridge_last_run_time']}`",
+        f"- source_knowledge_bridge_last_sent_count: `{dossier_diag['source_knowledge_bridge_last_sent_count']}`",
+        f"- source_knowledge_bridge_last_duplicate_count: `{dossier_diag['source_knowledge_bridge_last_duplicate_count']}`",
+        f"- source_knowledge_bridge_last_withheld_count: `{dossier_diag['source_knowledge_bridge_last_withheld_count']}`",
+        f"- source_knowledge_bridge_last_failed_count: `{dossier_diag['source_knowledge_bridge_last_failed_count']}`",
+        f"- source_knowledge_bridge_last_source_counts: `{json.dumps(dossier_diag['source_knowledge_bridge_last_source_counts'], sort_keys=True)}`",
+        f"- source_knowledge_bridge_last_warning_counts: `{json.dumps(dossier_diag['source_knowledge_bridge_last_warning_counts'], sort_keys=True)}`",
+        f"- source_knowledge_bridge_last_error_status: `{dossier_diag['source_knowledge_bridge_last_error_status']}`",
         f"- community_scouting_available: `{'yes' if dossier_diag['community_scouting_available'] else 'no'}`",
         f"- community_scouting_enabled: `{'yes' if dossier_diag['community_scouting_enabled'] else 'no'}`",
         f"- community_scouting_allowed_channels_configured: `{'yes' if dossier_diag['community_scouting_allowed_channels_configured'] else 'no'}`",
@@ -12248,6 +12341,15 @@ async def bnl_status(interaction: discord.Interaction):
         f"- candidate_discovery_last_medium_confidence_count: `{dossier_diag['candidate_discovery_last_medium_confidence_count']}`",
         f"- candidate_discovery_last_strong_confidence_count: `{dossier_diag['candidate_discovery_last_strong_confidence_count']}`",
         f"- candidate_discovery_last_top_withheld_reason: `{dossier_diag['candidate_discovery_last_top_withheld_reason']}`",
+        f"- source_knowledge_bridge_available: `{'yes' if dossier_diag['source_knowledge_bridge_available'] else 'no'}`",
+        f"- source_knowledge_bridge_last_run_time: `{dossier_diag['source_knowledge_bridge_last_run_time']}`",
+        f"- source_knowledge_bridge_last_sent_count: `{dossier_diag['source_knowledge_bridge_last_sent_count']}`",
+        f"- source_knowledge_bridge_last_duplicate_count: `{dossier_diag['source_knowledge_bridge_last_duplicate_count']}`",
+        f"- source_knowledge_bridge_last_withheld_count: `{dossier_diag['source_knowledge_bridge_last_withheld_count']}`",
+        f"- source_knowledge_bridge_last_failed_count: `{dossier_diag['source_knowledge_bridge_last_failed_count']}`",
+        f"- source_knowledge_bridge_last_source_counts: `{json.dumps(dossier_diag['source_knowledge_bridge_last_source_counts'], sort_keys=True)}`",
+        f"- source_knowledge_bridge_last_warning_counts: `{json.dumps(dossier_diag['source_knowledge_bridge_last_warning_counts'], sort_keys=True)}`",
+        f"- source_knowledge_bridge_last_error_status: `{dossier_diag['source_knowledge_bridge_last_error_status']}`",
         f"- community_scouting_available: `{'yes' if dossier_diag['community_scouting_available'] else 'no'}`",
         f"- community_scouting_enabled: `{'yes' if dossier_diag['community_scouting_enabled'] else 'no'}`",
         f"- community_scouting_allowed_channels_configured: `{'yes' if dossier_diag['community_scouting_allowed_channels_configured'] else 'no'}`",
