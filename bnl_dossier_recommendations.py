@@ -40,6 +40,7 @@ SUPPORTED_PAYLOAD_FIELDS = {
     "recommendedIdentityAuthority",
     "createdBy",
     "ingestKey",
+    "ingestSource",
 }
 _SAFE_LANE_PATTERN = re.compile(r"[^a-z0-9_-]+")
 

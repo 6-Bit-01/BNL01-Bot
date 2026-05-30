@@ -1,11 +1,14 @@
+import asyncio
 import json
 import os
 import unittest
 import urllib.error
+from unittest import mock
 
 os.environ.setdefault("GEMINI_API_KEY", "test-gemini-key")
 os.environ.setdefault("DISCORD_BOT_TOKEN", "test-discord-token")
 
+import bnl_dossier_candidate_discovery as discovery
 import bnl_dossier_recommendations as dossier
 import bnl_dossier_source_packets as packets
 import bnl01_bot
@@ -286,6 +289,175 @@ class DossierRecommendationPermissionTests(unittest.TestCase):
 
         mod = self.Member(102, roles=[self.Role(555)])
         self.assertTrue(bnl01_bot.can_send_dossier_recommendation(mod, mod, self.Guild()))
+
+
+
+class DossierCandidateDiscoveryTests(unittest.TestCase):
+    def test_discovers_candidate_subjects_from_approved_lane_text(self):
+        def broadcast_reader(guild_id, public_only=False, limit=500):
+            self.assertEqual(guild_id, 123)
+            self.assertFalse(public_only)
+            return [
+                ("2026-05-29", "Signal Witch came up as a recurring lore entity and source file candidate. Signal Witch should have a dossier review."),
+                ("2026-05-22", "Signal Witch returned as a priority signal in broadcast memory."),
+            ]
+
+        result = discovery.discover_candidate_recommendations(
+            123,
+            ["rd_context", "broadcast_memory"],
+            broadcast_memory_reader=broadcast_reader,
+            rd_context=[{"main_subject": "Priority Signal", "user_request": "Priority Signal deserves a source file."}],
+        )
+        names = [candidate["subjectName"] for candidate in result["candidates"]]
+        self.assertIn("Signal Witch", names)
+        payload = next(payload for payload in result["payloads"] if payload["subjectName"] == "Signal Witch")
+        self.assertEqual(payload["type"], "new_subject")
+        self.assertEqual(payload["createdBy"], "bnl")
+        self.assertEqual(payload["ingestSource"], discovery.DISCOVERY_INGEST_SOURCE)
+        self.assertIn("broadcast_memory", payload["sourceLanes"])
+        self.assertIn("review", payload["reason"].lower())
+
+    def test_discovery_parse_command_has_no_subject_argument(self):
+        matched, options, error = discovery.parse_dossier_discovery_command(
+            "!bnl dossier discover candidates | lanes=rd_context,broadcast_memory | limit=7 | dry_run=true"
+        )
+        self.assertTrue(matched)
+        self.assertFalse(error)
+        self.assertEqual(options["lanes"], ["rd_context", "broadcast_memory"])
+        self.assertEqual(options["limit"], 7)
+        self.assertTrue(options["dry_run"])
+
+    def test_deterministic_ingest_keys_and_dedupes_repeated_candidates(self):
+        rows = [
+            ("2026-05-29", "Signal Witch needs a source file. Signal Witch is a recurring candidate."),
+            ("2026-05-22", "Signal Witch needs a source file. Signal Witch is a recurring candidate."),
+        ]
+        first = discovery.discover_candidate_recommendations(123, ["broadcast_memory"], broadcast_memory_reader=lambda *a, **k: rows)
+        second = discovery.discover_candidate_recommendations(123, ["broadcast_memory"], broadcast_memory_reader=lambda *a, **k: rows)
+        signal_payloads = [payload for payload in first["payloads"] if payload["subjectName"] == "Signal Witch"]
+        self.assertEqual(len(signal_payloads), 1)
+        self.assertEqual(signal_payloads[0]["ingestKey"], next(payload for payload in second["payloads"] if payload["subjectName"] == "Signal Witch")["ingestKey"])
+        self.assertTrue(signal_payloads[0]["ingestKey"].startswith("bnl:dossier:bnl_dynamic_candidate_discovery:"))
+
+    def test_withholds_low_confidence_one_off_noise(self):
+        result = discovery.discover_candidate_recommendations(
+            123,
+            ["broadcast_memory"],
+            broadcast_memory_reader=lambda *a, **k: [("2026-05-29", "A one-off mention of Sheila happened once.")],
+        )
+        self.assertEqual(result["payloads"], [])
+        self.assertGreaterEqual(result["withheldCount"], 1)
+
+    def test_ignores_unsupported_lanes_and_does_not_scan_unapproved_sources(self):
+        result = discovery.discover_candidate_recommendations(
+            123,
+            ["member_activity_events", "memory_tiers", "broadcast_memory"],
+            broadcast_memory_reader=lambda *a, **k: [("2026-05-29", "ShadowsPit needs a source file. ShadowsPit is recurring.")],
+        )
+        self.assertEqual(result["lanes"], ["broadcast_memory"])
+        self.assertTrue(all(payload["sourceLanes"] == ["broadcast_memory"] for payload in result["payloads"]))
+
+    def test_evidence_snippets_are_capped_and_redacted(self):
+        raw = "Signal Witch needs a source file. " + "context " * 90 + "<@123456789012345678> 123456789012345678 https://private.example/path user@example.com"
+        result = discovery.discover_candidate_recommendations(
+            123,
+            ["broadcast_memory"],
+            broadcast_memory_reader=lambda *a, **k: [("2026-05-29", raw), ("2026-05-22", "Signal Witch recurring source file candidate.")],
+        )
+        payload = next(payload for payload in result["payloads"] if payload["subjectName"] == "Signal Witch")
+        self.assertLessEqual(len(payload["evidenceSummary"]), packets.MAX_EVIDENCE_SUMMARY_LENGTH)
+        self.assertNotIn("123456789012345678", payload["evidenceSummary"])
+        self.assertNotIn("private.example", payload["evidenceSummary"])
+        self.assertNotIn("user@example.com", payload["evidenceSummary"])
+
+    def test_discovery_module_has_no_separate_workflow_or_scanning_constructs(self):
+        with open("bnl_dossier_candidate_discovery.py", encoding="utf-8") as handle:
+            source = handle.read()
+        forbidden = [
+            "history(",
+            "member_activity_events",
+            "memory_tiers",
+            "create_source_file",
+            "create_draft",
+            "publish_dossier",
+            "auto_confirm",
+            "merge_source",
+            "send_dossier_recommendation",
+            "@tasks.loop",
+        ]
+        for token in forbidden:
+            self.assertNotIn(token, source)
+
+    def test_diagnostics_expose_safe_candidate_discovery_metadata(self):
+        diag = bnl01_bot.build_dossier_recommendation_diagnostics()
+        self.assertTrue(diag["candidate_discovery_available"])
+        self.assertFalse(diag["candidate_discovery_enabled"])
+        self.assertEqual(diag["candidate_discovery_approved_lanes"], ["rd_context", "broadcast_memory"])
+        self.assertNotIn("token", json.dumps(diag.get("candidate_discovery_last_source_lanes", [])).lower())
+
+
+class DossierDiscoveryRoutingTests(unittest.TestCase):
+    class Guild:
+        id = 123
+        owner_id = 100
+        def get_member(self, user_id):
+            return None
+
+    class Author:
+        def __init__(self, user_id):
+            self.id = user_id
+            self.guild_permissions = DossierRecommendationPermissionTests.Perms()
+            self.roles = []
+
+    class Channel:
+        id = 1369051635657084970
+        name = "research-and-development"
+
+    class Message:
+        def __init__(self, user_id=999):
+            self.author = DossierDiscoveryRoutingTests.Author(user_id)
+            self.guild = DossierDiscoveryRoutingTests.Guild()
+            self.channel = DossierDiscoveryRoutingTests.Channel()
+            self.replies = []
+        async def reply(self, text):
+            self.replies.append(text)
+
+    def test_unauthorized_users_cannot_run_discovery(self):
+        bnl01_bot.BNL_OWNER_USER_ID = 999
+        message = self.Message(user_id=101)
+        handled = asyncio.run(bnl01_bot.maybe_handle_dossier_recommendation_command(message, "!bnl dossier discover candidates"))
+        self.assertTrue(handled)
+        self.assertIn("operator-only", message.replies[-1])
+
+    def test_dry_run_operator_trigger_does_not_send_recommendations(self):
+        bnl01_bot.BNL_OWNER_USER_ID = 999
+        message = self.Message(user_id=999)
+        fake_discovery = {
+            "candidates": [{"subjectName": "Signal Witch", "category": "new_source_file_candidate", "payload": {"subjectName": "Signal Witch"}}],
+            "payloads": [{"subjectName": "Signal Witch"}],
+            "withheldCount": 0,
+            "duplicateCount": 0,
+        }
+        with mock.patch.object(bnl01_bot, "discover_candidate_recommendations", return_value=fake_discovery) as discover_mock, \
+             mock.patch.object(bnl01_bot, "send_dossier_recommendation") as send_mock:
+            handled = asyncio.run(bnl01_bot.maybe_handle_dossier_recommendation_command(message, "!bnl dossier discover candidates | dry_run=true"))
+        self.assertTrue(handled)
+        discover_mock.assert_called_once()
+        send_mock.assert_not_called()
+        self.assertIn("Nothing sent", message.replies[-1])
+
+    def test_command_sends_normal_review_only_recommendations_when_threshold_met(self):
+        bnl01_bot.BNL_OWNER_USER_ID = 999
+        message = self.Message(user_id=999)
+        fake_payload = {"type": "new_subject", "subjectName": "Signal Witch", "reason": "Review only", "sourceLanes": ["broadcast_memory"]}
+        fake_discovery = {"candidates": [{"subjectName": "Signal Witch", "payload": fake_payload}], "payloads": [fake_payload], "withheldCount": 2, "duplicateCount": 0}
+        with mock.patch.object(bnl01_bot, "discover_candidate_recommendations", return_value=fake_discovery), \
+             mock.patch.object(bnl01_bot, "send_dossier_recommendation", return_value={"ok": True, "duplicate": False, "status": 200}) as send_mock:
+            handled = asyncio.run(bnl01_bot.maybe_handle_dossier_recommendation_command(message, "!bnl dossier discover candidates | limit=1"))
+        self.assertTrue(handled)
+        send_mock.assert_called_once_with(fake_payload)
+        self.assertIn("1 recommendations sent", message.replies[-1])
+        self.assertIn("2 withheld", message.replies[-1])
 
 
 if __name__ == "__main__":
