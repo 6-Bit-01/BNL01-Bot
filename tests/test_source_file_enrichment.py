@@ -270,6 +270,102 @@ class SourceFileEnrichmentTests(unittest.TestCase):
         self.assertIn("Review-only legacy memory", internal)
         self.assertIn(enrich.SOURCE_BLIND_WARNING, result["warnings"])
 
+    def test_identity_resolution_builds_alias_variants_and_counts_profiles(self):
+        c = self.conn.cursor()
+        c.execute("INSERT INTO user_profiles VALUES (10,1,'Hellcat NZ','HellcatNZ',NULL,NULL)")
+        self.conn.commit()
+        lookup = {
+            "ok": True,
+            "found": True,
+            "matchKind": "confirmed alias",
+            "data": {
+                "matchedAlias": "Hellcat",
+                "confirmedAliases": ["Hellcat NZ"],
+                "sourceFile": {"id": "sf_hellcatnz", "name": "HellcatNZ", "status": "active", "identityLinks": ["Hellcat"]},
+            },
+        }
+        identity = enrich.resolve_enrichment_subject_identity("HellcatNZ", lookup, self.db, 1)
+        self.assertEqual(identity["matchedUserIdCount"], 1)
+        self.assertEqual(identity["matchedUserProfileCount"], 1)
+        self.assertIn("HellcatNZ", identity["aliasLabels"])
+        self.assertIn("Hellcat", identity["aliasLabels"])
+        self.assertNotIn("10", json.dumps({k: v for k, v in identity.items() if not k.startswith("_")}))
+
+    def test_author_conversation_activity_uses_identity_without_subject_text_and_excludes_private(self):
+        c = self.conn.cursor()
+        c.execute("INSERT INTO user_profiles VALUES (10,1,'HellcatNZ','HellcatNZ',NULL,NULL)")
+        c.execute("INSERT INTO conversations VALUES (NULL,10,'HellcatNZ',1,'general','public_home','user','talking about the new mix without self naming','now')")
+        c.execute("INSERT INTO conversations VALUES (NULL,10,'HellcatNZ',1,'secret','private','user','private raw transcript should not appear','now')")
+        c.execute("INSERT INTO conversations VALUES (NULL,10,'HellcatNZ',1,'dm','dm','user','dm raw transcript should not appear','now')")
+        self.conn.commit()
+        result = enrich.run_source_file_enrichment(self.db, 1, "HellcatNZ", dry_run=True, lookup_func=self._lookup("active"))
+        self.assertIn("conversations_by_author", result["sourceTypes"])
+        self.assertTrue(result["diagnostics"]["channelEvidenceFound"])
+        observed = "\n".join(result["sections"].get("Observed Patterns", []))
+        self.assertIn("internal source context, not public dossier copy", observed)
+        response = enrich.format_source_enrichment_response(result)
+        self.assertIn("conversations_by_author yes", response)
+        self.assertNotIn("talking about the new mix", response)
+        self.assertNotIn("private raw transcript", response)
+        self.assertNotIn("dm raw transcript", response)
+        self.assertNotIn("10", response)
+
+    def test_identity_linked_user_tables_contribute_to_patterns_and_history(self):
+        c = self.conn.cursor()
+        c.execute("INSERT INTO user_profiles VALUES (10,1,'HellcatNZ','HellcatNZ',NULL,NULL)")
+        c.execute("INSERT INTO user_habits VALUES (10,1,12,3,2,1,20.0,'mix planning','now')")
+        c.execute("INSERT INTO relationship_state VALUES (10,1,5,0.7,'steady','friendly','last check in','now')")
+        c.execute("INSERT INTO relationship_journal VALUES (NULL,10,1,'check_in','helped BNL test a community workflow','now')")
+        self.conn.commit()
+        result = enrich.run_source_file_enrichment(self.db, 1, "HellcatNZ", dry_run=True, lookup_func=self._lookup("active"))
+        self.assertIn("user_habits", result["sourceTypes"])
+        self.assertIn("relationship_state", result["sourceTypes"])
+        self.assertIn("relationship_journal", result["sourceTypes"])
+        self.assertIn("recurring Discord-side activity", "\n".join(result["sections"].get("Observed Patterns", [])))
+        history = "\n".join(result["sections"].get("History With BARCODE / BNL / Discord / BARCODE Radio", []))
+        self.assertIn("prior interaction history", history)
+        self.assertIn("Recent BNL relationship note", history)
+
+    def test_community_presence_display_name_and_existing_dossier_awareness(self):
+        c = self.conn.cursor()
+        c.execute("INSERT INTO community_presence VALUES (1,'hellcatnz','Hellcat NZ','now','now','[\"community_presence\"]','[\"general\"]',4,1,0,'[]','[]','[]','artist','none')")
+        self.conn.commit()
+        def lookup(query):
+            return {
+                "ok": True,
+                "found": True,
+                "data": {
+                    "existingDossierMatch": {"targetDossierId": "dossier_hellcat", "title": "HellcatNZ"},
+                    "sourceFile": {"name": "HellcatNZ", "type": "public_dossier", "targetDossierId": "dossier_hellcat"},
+                },
+            }
+        result = enrich.run_source_file_enrichment(self.db, 1, "HellcatNZ", dry_run=True, lookup_func=lookup)
+        self.assertEqual(result["matchKind"], "existing_dossier_update")
+        self.assertIn("community_presence", result["sourceTypes"])
+        self.assertTrue(result["diagnostics"]["publicDossierMatchFound"])
+        self.assertTrue(result["diagnostics"]["existingDossierUpdateLane"])
+        history = "\n".join(result["sections"].get("History With BARCODE / BNL / Discord / BARCODE Radio", []))
+        self.assertIn("proposed update material", history)
+        self.assertIn("public dossier content was not changed", history)
+        response = enrich.format_source_enrichment_response(result)
+        self.assertIn("public_dossier_match yes", response)
+        self.assertIn("existing dossier update lane: yes", response)
+
+    def test_source_coverage_diagnostics_and_review_boundaries_are_safe(self):
+        c = self.conn.cursor()
+        c.execute("INSERT INTO user_profiles VALUES (123456789012345678,1,'HellcatNZ','HellcatNZ',NULL,NULL)")
+        c.execute("INSERT INTO memory_tiers VALUES (NULL,123456789012345678,1,'long','HellcatNZ appears in source-blind memory only.',0.9,1,'now','legacy_unknown','legacy_unknown')")
+        self.conn.commit()
+        result = enrich.run_source_file_enrichment(self.db, 1, "HellcatNZ", dry_run=True, lookup_func=self._lookup("active"))
+        self.assertIn("sourceTypesChecked", result)
+        self.assertIn("sourceTypesSkipped", result)
+        self.assertIn("memory_tiers", result["sourceTypesChecked"])
+        response = enrich.format_source_enrichment_response(result)
+        self.assertIn("Source coverage:", response)
+        self.assertIn("source-blind memory", "\n".join(result["sections"].get("Internal-Only / Review-Only Notes", [])).lower())
+        self.assertNotIn("123456789012345678", response)
+        self.assertNotIn("raw transcript", response.lower())
+
     def test_missing_info_and_next_action_are_actionable(self):
         result = enrich.run_source_file_enrichment(self.db, 1, "HellcatNZ", dry_run=True, lookup_func=self._lookup("active"))
         missing = "\n".join(result["sections"].get("Missing Info", []))
