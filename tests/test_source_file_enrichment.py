@@ -303,6 +303,8 @@ class SourceFileEnrichmentTests(unittest.TestCase):
         self.assertTrue(result["diagnostics"]["channelEvidenceFound"])
         observed = "\n".join(result["sections"].get("Observed Patterns", []))
         self.assertIn("internal source context, not public dossier copy", observed)
+        self.assertIn("review-only internal context", observed)
+        self.assertIn("No meaningful repeated theme has been extracted yet", observed)
         response = enrich.format_source_enrichment_response(result)
         self.assertIn("conversations_by_author yes", response)
         self.assertNotIn("talking about the new mix", response)
@@ -350,6 +352,25 @@ class SourceFileEnrichmentTests(unittest.TestCase):
         response = enrich.format_source_enrichment_response(result)
         self.assertIn("public_dossier_match yes", response)
         self.assertIn("existing dossier update lane: yes", response)
+
+
+    def test_backfilled_channel_activity_enriches_source_evidence_without_overclaiming(self):
+        c = self.conn.cursor()
+        c.execute("INSERT INTO user_profiles VALUES (10,1,'HellcatNZ','HellcatNZ',NULL,NULL)")
+        c.execute("INSERT INTO conversations VALUES (NULL,10,'HellcatNZ',1,'hellcat-nz','public_selective','user','safe activity one','2026-05-30T01:00:00+00:00')")
+        c.execute("INSERT INTO conversations VALUES (NULL,10,'HellcatNZ',1,'hellcat-nz','public_selective','user','safe activity two','2026-05-30T02:00:00+00:00')")
+        c.execute("INSERT INTO conversations VALUES (NULL,10,'HellcatNZ',1,'hellcat-nz','public_selective','user','safe activity three','2026-05-30T03:00:00+00:00')")
+        c.execute("INSERT INTO community_presence VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (1, "hellcatnz", "HellcatNZ", "now", "now", json.dumps(["community_presence"]), json.dumps(["public_selective"]), 3, 0, 0, json.dumps([]), json.dumps([]), json.dumps(["approved-channel presence"]), "community_regular_candidate", "none"))
+        self.conn.commit()
+        result = enrich.run_source_file_enrichment(self.db, 1, "HellcatNZ", dry_run=True, lookup_func=self._lookup("active"))
+        observed = "\n".join(result["sections"].get("Observed Patterns", []))
+        self.assertIn("recurring activity in #hellcat-nz", observed)
+        self.assertIn("review-only internal context", observed)
+        self.assertIn("no specific public-safe role has been confirmed", observed)
+        response = enrich.format_source_enrichment_response(result)
+        self.assertIn("conversations_by_author yes", response)
+        self.assertIn("community_presence yes", response)
+        self.assertNotIn("safe activity one", response)
 
     def test_source_coverage_diagnostics_and_review_boundaries_are_safe(self):
         c = self.conn.cursor()

@@ -46,12 +46,28 @@ class FakeChannel:
         self.position = position
         self._perms = perms or FakePerms()
         self.sent = []
+        self._history = []
 
     def permissions_for(self, _member):
         return self._perms
 
     async def send(self, content):
         self.sent.append(content)
+
+    def history(self, limit=100, oldest_first=False, **_kwargs):
+        rows = list(self._history)[:limit]
+        if not oldest_first:
+            rows = list(reversed(rows))
+        class _History:
+            def __aiter__(self_inner):
+                self_inner._iter = iter(rows)
+                return self_inner
+            async def __anext__(self_inner):
+                try:
+                    return next(self_inner._iter)
+                except StopIteration:
+                    raise StopAsyncIteration
+        return _History()
 
 
 class FakeAuthor:
@@ -63,8 +79,15 @@ class FakeAuthor:
 
 
 class FakeMessage:
-    def __init__(self, content, channel, guild=None, author=None):
+    _next_id = 1000
+
+    def __init__(self, content, channel, guild=None, author=None, message_id=None, created_at="2026-05-31T00:00:00+00:00"):
         self.content = content
+        self.clean_content = content
+        self.id = message_id if message_id is not None else FakeMessage._next_id
+        FakeMessage._next_id += 1
+        self.created_at = created_at
+        self.type = "default"
         self.channel = channel
         self.guild = guild or channel.guild
         self.author = author or FakeAuthor()
@@ -187,6 +210,85 @@ class ChannelAuditPassiveCaptureTests(unittest.TestCase):
         count = conn.execute("SELECT COUNT(*) FROM community_presence").fetchone()[0]
         conn.close()
         self.assertGreaterEqual(count, 1)
+
+
+    def test_backfill_parse_defaults_to_dry_run_and_mentions(self):
+        matched, options, error = bnl01_bot.parse_backfill_options("!bnl backfill channel #hellcat-nz | limit=200")
+        self.assertTrue(matched)
+        self.assertFalse(error)
+        self.assertTrue(options["dry_run"])
+        self.assertEqual(options["channel"], "#hellcat-nz")
+        self.assertEqual(options["limit"], 200)
+        matched, options, error = bnl01_bot.parse_backfill_options("!bnl backfill approved | limit_per_channel=100 | dry_run=true")
+        self.assertTrue(matched)
+        self.assertEqual(options["mode"], "approved")
+
+    def test_backfill_channel_lookup_and_policy_exclusions(self):
+        guild, channel = self.make_guild_channel("hellcat-nz", 991)
+        rules = FakeChannel("rules", 992, guild=guild, category=FakeCategory("Info"), channel_type="text")
+        internal = FakeChannel("research-and-development", 993, guild=guild, category=FakeCategory("Ops"), channel_type="text")
+        guild.channels = [channel, rules, internal]
+        self.assertIs(bnl01_bot.find_guild_channel_for_backfill(guild, "#hellcat-nz"), channel)
+        self.assertIs(bnl01_bot.find_guild_channel_for_backfill(guild, "<#991>"), channel)
+        self.assertTrue(bnl01_bot.backfill_channel_eligible(channel)[0])
+        self.assertFalse(bnl01_bot.backfill_channel_eligible(rules)[0])
+        self.assertFalse(bnl01_bot.backfill_channel_eligible(internal)[0])
+        self.assertEqual([c.name for c in bnl01_bot._approved_backfill_channels(guild)], ["hellcat-nz"])
+
+    def test_backfill_dry_run_is_safe_and_real_run_dedupes_updates_state(self):
+        guild, channel = self.make_guild_channel("hellcat-nz", 991)
+        msg1 = FakeMessage("Working on a new mix lol?", channel, guild=guild, author=FakeAuthor(42, "HellcatNZ"), message_id=7001)
+        msg2 = FakeMessage("bot text", channel, guild=guild, author=FakeAuthor(9, "Bot", bot=True), message_id=7002)
+        channel._history = [msg1, msg2]
+        dry = asyncio.run(bnl01_bot.run_channel_backfill(channel, limit=50, dry_run=True))
+        self.assertEqual(dry["messagesScanned"], 2)
+        self.assertEqual(dry["messagesEligible"], 1)
+        self.assertEqual(dry["skipReasons"].get("bot_author"), 1)
+        self.assertIn("conversations", dry["tablesWouldUpdate"])
+        conn = sqlite3.connect(self.tmp.name)
+        self.assertEqual(conn.execute("SELECT COUNT(*) FROM conversations").fetchone()[0], 0)
+        conn.close()
+
+        with mock.patch.dict(os.environ, {"BNL_COMMUNITY_SCOUTING_ENABLED": "true"}, clear=False):
+            real = asyncio.run(bnl01_bot.run_channel_backfill(channel, limit=50, dry_run=False))
+        self.assertEqual(real["messagesInserted"], 1)
+        conn = sqlite3.connect(self.tmp.name)
+        conv = conn.execute("SELECT user_id,user_name,channel_name,channel_policy,channel_id,message_id,content FROM conversations").fetchone()
+        profile = conn.execute("SELECT display_name,last_seen FROM user_profiles WHERE user_id=42 AND guild_id=123").fetchone()
+        habits = conn.execute("SELECT total_messages FROM user_habits WHERE user_id=42 AND guild_id=123").fetchone()
+        rel = conn.execute("SELECT interaction_count FROM relationship_state WHERE user_id=42 AND guild_id=123").fetchone()
+        presence = conn.execute("SELECT COUNT(*) FROM community_presence").fetchone()[0]
+        conn.close()
+        self.assertEqual(conv[:6], (42, "HellcatNZ", "hellcat-nz", "public_selective", 991, 7001))
+        self.assertEqual(conv[6], "Working on a new mix lol?")
+        self.assertEqual(profile[0], "HellcatNZ")
+        self.assertEqual(habits[0], 1)
+        self.assertEqual(rel[0], 1)
+        self.assertGreaterEqual(presence, 1)
+        again = asyncio.run(bnl01_bot.run_channel_backfill(channel, limit=50, dry_run=False))
+        self.assertEqual(again["messagesInserted"], 0)
+        self.assertGreaterEqual(again["rowsAlreadyExist"], 1)
+        diag = bnl01_bot.build_dossier_recommendation_diagnostics(123)
+        self.assertTrue(diag["backfill_available"])
+        self.assertEqual(diag["backfill_last_channel"], "hellcat-nz")
+
+    def test_backfill_command_operator_only_and_no_raw_transcripts(self):
+        guild, channel = self.make_guild_channel("hellcat-nz", 991)
+        channel._history = [FakeMessage("SECRET RAW TRANSCRIPT", channel, guild=guild, author=FakeAuthor(42, "HellcatNZ"), message_id=8001)]
+        message = FakeMessage("!bnl backfill channel hellcat-nz | limit=20", channel, guild=guild)
+        with mock.patch.object(bnl01_bot, "can_send_dossier_recommendation", return_value=True):
+            handled = asyncio.run(bnl01_bot.maybe_handle_backfill_command(message, message.content))
+        self.assertTrue(handled)
+        reply = message.replies[-1]
+        self.assertIn("channel found", reply)
+        self.assertIn("dry_run: `yes`", reply)
+        self.assertNotIn("SECRET RAW TRANSCRIPT", reply)
+
+        denied = FakeMessage("!bnl backfill channel hellcat-nz | dry_run=false", channel, guild=guild)
+        with mock.patch.object(bnl01_bot, "can_send_dossier_recommendation", return_value=False):
+            handled = asyncio.run(bnl01_bot.maybe_handle_backfill_command(denied, denied.content))
+        self.assertTrue(handled)
+        self.assertIn("operator-only", denied.replies[-1])
 
     def test_audit_report_is_safe_and_command_routing_operator_only(self):
         guild, channel = self.make_guild_channel("hellcat-nz", 991)
