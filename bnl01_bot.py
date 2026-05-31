@@ -79,7 +79,7 @@ from bnl_source_file_enrichment import (
     run_source_file_enrichment,
     source_enrichment_ingest_source,
 )
-from collections import defaultdict, deque
+from collections import Counter, defaultdict, deque
 from datetime import datetime, timedelta, timezone
 
 import pytz
@@ -531,6 +531,13 @@ _passive_capture_last_channel = "none"
 _passive_capture_last_user = "none"
 _passive_capture_last_status = "never"
 _passive_capture_last_skip_reason = "none"
+_backfill_last_channel = "none"
+_backfill_last_status = "never"
+_backfill_last_scanned_count = 0
+_backfill_last_inserted_count = 0
+_backfill_last_skipped_count = 0
+_backfill_last_error = "none"
+_backfill_last_dry_run = True
 _last_source_knowledge_bridge_run_time = "never"
 _last_source_knowledge_bridge_sent_count = 0
 _last_source_knowledge_bridge_duplicate_count = 0
@@ -3151,6 +3158,7 @@ def init_db():
     _try_alter(cursor, "ALTER TABLE conversations ADD COLUMN channel_name TEXT")
     _try_alter(cursor, "ALTER TABLE conversations ADD COLUMN channel_policy TEXT")
     _try_alter(cursor, "ALTER TABLE conversations ADD COLUMN channel_id INTEGER")
+    _try_alter(cursor, "ALTER TABLE conversations ADD COLUMN message_id INTEGER")
 
     cursor.execute(
         """
@@ -4144,6 +4152,14 @@ def build_dossier_recommendation_diagnostics(guild_id=None) -> dict:
         "source_enrichment_last_suppressed_reason": _source_enrichment_last_suppressed_reason,
         "source_enrichment_last_preview_bullets_count": _source_enrichment_last_preview_bullets_count,
         "source_enrichment_last_error_status": _source_enrichment_last_error_status,
+        "backfill_available": True,
+        "backfill_last_channel": _backfill_last_channel,
+        "backfill_last_status": _backfill_last_status,
+        "backfill_last_scanned_count": _backfill_last_scanned_count,
+        "backfill_last_inserted_count": _backfill_last_inserted_count,
+        "backfill_last_skipped_count": _backfill_last_skipped_count,
+        "backfill_last_error": _backfill_last_error,
+        "backfill_last_dry_run": _backfill_last_dry_run,
         **build_community_presence_diagnostics(
             DB_FILE,
             guild_id=guild_id,
@@ -4684,6 +4700,8 @@ def _is_text_like_channel(channel) -> bool:
     except Exception:
         pass
     channel_type = str(getattr(channel, "type", "") or "").lower()
+    if "voice" in channel_type or "category" in channel_type:
+        return False
     return any(token in channel_type for token in ("text", "news", "forum", "thread")) or hasattr(channel, "send") and hasattr(channel, "history")
 
 
@@ -4858,6 +4876,359 @@ def format_channel_audit_pages(guild, rows: list[dict] | None = None, *, max_cha
     return [f"{page}\n_page {idx}/{total}_" for idx, page in enumerate(pages, start=1)]
 
 
+
+BACKFILL_DEFAULT_LIMIT = 100
+BACKFILL_HARD_LIMIT = 250
+BACKFILL_ELIGIBLE_POLICIES = {"public_home", "public_context", "public_selective"}
+BACKFILL_TEST_POLICIES = {"sealed_test"}
+
+
+def parse_backfill_options(clean_content: str) -> tuple[bool, dict, str]:
+    """Parse owner/operator approved-channel backfill commands."""
+    raw = (clean_content or "").strip()
+    low = re.sub(r"\s+", " ", raw.lower())
+    if not low.startswith("!bnl backfill "):
+        return False, {}, ""
+    parts = [part.strip() for part in raw.split("|")]
+    command = re.sub(r"\s+", " ", parts[0].strip())
+    command_low = command.lower()
+    opts: dict = {"dry_run": True}
+    for part in parts[1:]:
+        if not part:
+            continue
+        if "=" not in part:
+            return True, {}, f"Invalid backfill option: {part}"
+        key, value = [piece.strip() for piece in part.split("=", 1)]
+        key_l = key.lower()
+        if key_l in {"limit", "limit_per_channel"}:
+            try:
+                opts[key_l] = max(1, min(int(value), BACKFILL_HARD_LIMIT))
+            except ValueError:
+                return True, {}, f"Invalid numeric value for {key}."
+        elif key_l == "dry_run":
+            opts["dry_run"] = value.strip().lower() not in {"false", "0", "no", "off"}
+        elif key_l in {"include_sealed_test", "include_test"}:
+            opts["include_sealed_test"] = value.strip().lower() in {"true", "1", "yes", "on"}
+        elif key_l in {"include_internal", "owner_force_internal"}:
+            opts["include_internal"] = value.strip().lower() in {"true", "1", "yes", "on"}
+        else:
+            return True, {}, f"Unknown backfill option: {key}"
+    if command_low == "!bnl backfill approved":
+        opts["mode"] = "approved"
+        opts["limit_per_channel"] = int(opts.get("limit_per_channel") or opts.get("limit") or BACKFILL_DEFAULT_LIMIT)
+        return True, opts, ""
+    match = re.match(r"^!bnl backfill channel\s+(.+?)\s*$", command, flags=re.I)
+    if match:
+        opts["mode"] = "channel"
+        opts["channel"] = match.group(1).strip()
+        opts["limit"] = int(opts.get("limit") or BACKFILL_DEFAULT_LIMIT)
+        return True, opts, ""
+    return True, {}, "Unsupported backfill command. Use `!bnl backfill channel <name> | dry_run=true`."
+
+
+def _normalize_requested_channel_token(token: str = "") -> str:
+    token = re.sub(r"^<#(\d+)>$", r"\1", (token or "").strip())
+    token = token.lstrip("#")
+    return _normalize_channel_name(token)
+
+
+def find_guild_channel_for_backfill(guild, token: str):
+    if not guild or not token:
+        return None
+    raw = (token or "").strip()
+    mention = re.fullmatch(r"<#(\d+)>", raw)
+    wanted_id = int(mention.group(1)) if mention else (int(raw) if raw.isdigit() else 0)
+    channels = list(getattr(guild, "channels", []) or [])
+    if wanted_id:
+        for channel in channels:
+            if int(getattr(channel, "id", 0) or 0) == wanted_id:
+                return channel
+    wanted = _normalize_requested_channel_token(raw)
+    matches = [ch for ch in channels if _normalize_channel_name(getattr(ch, "name", "")) == wanted]
+    return matches[0] if len(matches) == 1 else None
+
+
+def backfill_channel_eligible(channel, *, include_sealed_test: bool = False, include_internal: bool = False) -> tuple[bool, str]:
+    if not channel:
+        return False, "channel_not_found"
+    policy = resolve_channel_policy(channel)
+    perms = _channel_permissions_snapshot(channel)
+    if not getattr(channel, "guild", None):
+        return False, "dm_or_missing_guild"
+    if not _is_text_like_channel(channel):
+        return False, "not_text_like"
+    if not perms.get("view") or not perms.get("read_history"):
+        return False, "missing_view_or_history_permission"
+    if policy in BACKFILL_ELIGIBLE_POLICIES:
+        return True, "approved_policy"
+    if policy in BACKFILL_TEST_POLICIES and include_sealed_test:
+        return True, "sealed_test_included"
+    if policy == "internal_controlled" and include_internal:
+        return True, "owner_forced_internal_only"
+    return False, f"excluded_policy:{policy}"
+
+
+def _conversations_columns() -> set[str]:
+    conn = sqlite3.connect(DB_FILE)
+    try:
+        cur = conn.cursor()
+        cur.execute("PRAGMA table_info(conversations)")
+        return {str(row[1]) for row in cur.fetchall() if len(row) > 1}
+    finally:
+        conn.close()
+
+
+def conversation_row_exists_for_message(guild_id: int, channel_id: int, message_id: int | None, user_id: int, timestamp: str, content: str) -> bool:
+    cols = _conversations_columns()
+    conn = sqlite3.connect(DB_FILE)
+    cur = conn.cursor()
+    try:
+        if message_id and "message_id" in cols:
+            cur.execute("SELECT 1 FROM conversations WHERE guild_id=? AND message_id=? LIMIT 1", (guild_id, int(message_id)))
+            if cur.fetchone():
+                return True
+        if "channel_id" in cols:
+            cur.execute(
+                """
+                SELECT 1 FROM conversations
+                WHERE guild_id=? AND channel_id=? AND user_id=? AND role='user'
+                  AND COALESCE(timestamp,'')=? AND COALESCE(content,'')=?
+                LIMIT 1
+                """,
+                (guild_id, int(channel_id or 0), int(user_id or 0), timestamp, content),
+            )
+        else:
+            cur.execute(
+                """
+                SELECT 1 FROM conversations
+                WHERE guild_id=? AND user_id=? AND role='user'
+                  AND COALESCE(timestamp,'')=? AND COALESCE(content,'')=?
+                LIMIT 1
+                """,
+                (guild_id, int(user_id or 0), timestamp, content),
+            )
+        return bool(cur.fetchone())
+    finally:
+        conn.close()
+
+
+def insert_backfilled_conversation_row(*, guild_id: int, channel_id: int, channel_name: str, channel_policy: str, user_id: int, user_name: str, content: str, timestamp: str, message_id: int | None) -> bool:
+    if conversation_row_exists_for_message(guild_id, channel_id, message_id, user_id, timestamp, content):
+        return False
+    cols = _conversations_columns()
+    conn = sqlite3.connect(DB_FILE)
+    cur = conn.cursor()
+    try:
+        if "message_id" in cols:
+            cur.execute(
+                """
+                INSERT INTO conversations (user_id, user_name, guild_id, channel_name, channel_policy, channel_id, message_id, role, content, timestamp)
+                VALUES (?, ?, ?, ?, ?, ?, ?, 'user', ?, ?)
+                """,
+                (user_id, user_name, guild_id, (channel_name or "").lower()[:80], (channel_policy or "unknown")[:40], int(channel_id or 0), int(message_id or 0) or None, content, timestamp),
+            )
+        else:
+            cur.execute(
+                """
+                INSERT INTO conversations (user_id, user_name, guild_id, channel_name, channel_policy, channel_id, role, content, timestamp)
+                VALUES (?, ?, ?, ?, ?, ?, 'user', ?, ?)
+                """,
+                (user_id, user_name, guild_id, (channel_name or "").lower()[:80], (channel_policy or "unknown")[:40], int(channel_id or 0), content, timestamp),
+            )
+        conn.commit()
+        return True
+    finally:
+        conn.close()
+
+
+def _iso_timestamp(value) -> str:
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        return value.isoformat()
+    return str(value or datetime.now(timezone.utc).isoformat())
+
+
+def _message_clean_content(msg) -> str:
+    return re.sub(r"\s+", " ", getattr(msg, "clean_content", None) or getattr(msg, "content", "") or "").strip()
+
+
+def mark_backfill_status(channel_name: str = "", status: str = "", scanned: int = 0, inserted: int = 0, skipped: int = 0, error: str = "none", dry_run: bool = True) -> None:
+    global _backfill_last_channel, _backfill_last_status, _backfill_last_scanned_count, _backfill_last_inserted_count, _backfill_last_skipped_count, _backfill_last_error, _backfill_last_dry_run
+    _backfill_last_channel = (channel_name or "none")[:80]
+    _backfill_last_status = (status or "none")[:80]
+    _backfill_last_scanned_count = int(scanned or 0)
+    _backfill_last_inserted_count = int(inserted or 0)
+    _backfill_last_skipped_count = int(skipped or 0)
+    _backfill_last_error = (error or "none")[:120]
+    _backfill_last_dry_run = bool(dry_run)
+
+
+async def run_channel_backfill(channel, *, limit: int = BACKFILL_DEFAULT_LIMIT, dry_run: bool = True, include_sealed_test: bool = False, include_internal: bool = False) -> dict:
+    limit = max(1, min(int(limit or BACKFILL_DEFAULT_LIMIT), BACKFILL_HARD_LIMIT))
+    policy = resolve_channel_policy(channel)
+    perms = _channel_permissions_snapshot(channel)
+    eligible, reason = backfill_channel_eligible(channel, include_sealed_test=include_sealed_test, include_internal=include_internal)
+    result = {
+        "channelFound": bool(channel),
+        "channelName": getattr(channel, "name", "none") if channel else "none",
+        "channelId": int(getattr(channel, "id", 0) or 0) if channel else 0,
+        "permissions": perms,
+        "channelPolicy": policy,
+        "eligible": eligible,
+        "eligibilityReason": reason,
+        "dryRun": bool(dry_run),
+        "limit": limit,
+        "messagesScanned": 0,
+        "messagesEligible": 0,
+        "messagesInserted": 0,
+        "skipReasons": defaultdict(int),
+        "uniqueUsersFound": 0,
+        "topUsers": [],
+        "rowsAlreadyExist": 0,
+        "tablesWouldUpdate": ["conversations", "user_profiles", "user_habits", "relationship_state", "community_presence"],
+        "status": "not_run",
+        "error": "none",
+    }
+    if not eligible:
+        result["status"] = "skipped"
+        result["skipReasons"][reason] += 1
+        mark_backfill_status(result["channelName"], "skipped", 0, 0, 0, reason, dry_run)
+        return result
+    per_user = Counter()
+    guild = getattr(channel, "guild", None)
+    try:
+        async for msg in channel.history(limit=limit, oldest_first=True):
+            result["messagesScanned"] += 1
+            author = getattr(msg, "author", None)
+            content = _message_clean_content(msg)
+            message_id = int(getattr(msg, "id", 0) or 0) or None
+            timestamp = _iso_timestamp(getattr(msg, "created_at", None))
+            if not guild:
+                result["skipReasons"]["dm_or_missing_guild"] += 1; continue
+            if getattr(author, "bot", False):
+                result["skipReasons"]["bot_author"] += 1; continue
+            if getattr(msg, "type", None) and str(getattr(msg, "type", "")).lower() not in {"default", "messagetype.default"}:
+                result["skipReasons"]["system_message"] += 1; continue
+            if not content:
+                result["skipReasons"]["empty_content"] += 1; continue
+            if len(content) >= 400:
+                result["skipReasons"]["content_too_long"] += 1; continue
+            user_id = int(getattr(author, "id", 0) or 0)
+            user_name = (getattr(author, "display_name", "") or getattr(author, "name", "unknown"))[:80]
+            if conversation_row_exists_for_message(getattr(guild, "id", 0), getattr(channel, "id", 0), message_id, user_id, timestamp, content):
+                result["rowsAlreadyExist"] += 1
+                result["skipReasons"]["duplicate_message"] += 1
+                continue
+            result["messagesEligible"] += 1
+            per_user[user_name] += 1
+            if not dry_run:
+                inserted = insert_backfilled_conversation_row(
+                    guild_id=getattr(guild, "id", 0), channel_id=getattr(channel, "id", 0), channel_name=getattr(channel, "name", ""),
+                    channel_policy=policy, user_id=user_id, user_name=user_name, content=content, timestamp=timestamp, message_id=message_id,
+                )
+                if inserted:
+                    result["messagesInserted"] += 1
+                    upsert_user_profile(user_id, getattr(guild, "id", 0), user_name)
+                    update_relationship_state(user_id, getattr(guild, "id", 0), content, delta_affinity=0.03)
+                    update_user_habits(user_id, getattr(guild, "id", 0), content)
+                    if community_scouting_enabled():
+                        record_community_presence_event(
+                            DB_FILE, getattr(guild, "id", 0), user_name, content,
+                            channel_id=getattr(channel, "id", 0), channel_name=getattr(channel, "name", ""), channel_policy=policy,
+                            direct_interaction=False, operator_mention=False,
+                        )
+                else:
+                    result["rowsAlreadyExist"] += 1
+                    result["skipReasons"]["duplicate_message"] += 1
+    except Exception as exc:
+        result["status"] = "error"
+        result["error"] = type(exc).__name__
+        logging.exception("approved_channel_backfill_failed channel=%s", result["channelName"])
+        mark_backfill_status(result["channelName"], "error", result["messagesScanned"], result["messagesInserted"], sum(result["skipReasons"].values()), result["error"], dry_run)
+        return result
+    result["uniqueUsersFound"] = len(per_user)
+    result["topUsers"] = per_user.most_common(5)
+    result["skipReasons"] = dict(result["skipReasons"])
+    result["status"] = "dry_run" if dry_run else "stored"
+    mark_backfill_status(result["channelName"], result["status"], result["messagesScanned"], result["messagesInserted"], sum(result["skipReasons"].values()), "none", dry_run)
+    logging.info("approved_channel_backfill channel=%s policy=%s dry_run=%s scanned=%s eligible=%s inserted=%s skipped=%s", result["channelName"], policy, dry_run, result["messagesScanned"], result["messagesEligible"], result["messagesInserted"], sum(result["skipReasons"].values()))
+    return result
+
+
+def format_channel_backfill_result(result: dict) -> str:
+    perms = result.get("permissions") or {}
+    skips = result.get("skipReasons") or {}
+    top = result.get("topUsers") or []
+    top_text = ", ".join(f"{name}:{count}" for name, count in top[:5]) or "none"
+    skip_text = ", ".join(f"{k}:{v}" for k, v in sorted(skips.items())) or "none"
+    tables = ", ".join(result.get("tablesWouldUpdate") or []) or "none"
+    return "\n".join([
+        "**BNL Approved Channel Backfill**",
+        f"channel found: `{'yes' if result.get('channelFound') else 'no'}` | channel: `#{result.get('channelName') or 'none'}`",
+        f"BNL permissions: view=`{int(bool(perms.get('view')))}` read_history=`{int(bool(perms.get('read_history')))}` send=`{int(bool(perms.get('send')))}` react=`{int(bool(perms.get('react')))}`",
+        f"channel policy: `{result.get('channelPolicy')}` | eligible: `{'yes' if result.get('eligible') else 'no'}` ({result.get('eligibilityReason')})",
+        f"dry_run: `{'yes' if result.get('dryRun') else 'no'}` | limit: `{result.get('limit')}` | status: `{result.get('status')}`",
+        f"messages scanned: `{result.get('messagesScanned')}` | eligible: `{result.get('messagesEligible')}` | inserted: `{result.get('messagesInserted')}` | already_exists: `{result.get('rowsAlreadyExist')}`",
+        f"messages skipped by reason: `{skip_text}`",
+        f"unique users found: `{result.get('uniqueUsersFound')}` | top users by eligible count: `{top_text}`",
+        f"tables {'would update' if result.get('dryRun') else 'updated'}: `{tables}`",
+        "No raw transcripts are included. Activity remains review-only internal context until owner/admin approves public wording.",
+    ])[:1900]
+
+
+def _approved_backfill_channels(guild, *, include_sealed_test: bool = False, include_internal: bool = False) -> list:
+    rows = []
+    for channel in list(getattr(guild, "channels", []) or []):
+        eligible, _reason = backfill_channel_eligible(channel, include_sealed_test=include_sealed_test, include_internal=include_internal)
+        if eligible:
+            policy = resolve_channel_policy(channel)
+            if policy in BACKFILL_ELIGIBLE_POLICIES or (include_sealed_test and policy == "sealed_test") or (include_internal and policy == "internal_controlled"):
+                rows.append(channel)
+    rows.sort(key=lambda ch: (str(resolve_channel_policy(ch)), str(getattr(ch, "name", ""))))
+    return rows
+
+
+async def maybe_handle_backfill_command(message: discord.Message, clean_content: str) -> bool:
+    matched, options, parse_error = parse_backfill_options(clean_content)
+    if not matched:
+        return False
+    member = message.author if isinstance(message.author, discord.Member) else message.guild.get_member(message.author.id)
+    if not can_send_dossier_recommendation(message.author, member, message.guild):
+        mark_backfill_status("none", "permission_denied", 0, 0, 0, "permission_denied", True)
+        await message.reply("Approved-channel backfill is operator-only.")
+        return True
+    if parse_error:
+        mark_backfill_status("none", "parse_rejected", 0, 0, 0, parse_error, True)
+        await message.reply(f"Backfill command rejected: {parse_error}")
+        return True
+    if options.get("mode") == "channel":
+        channel = find_guild_channel_for_backfill(message.guild, options.get("channel", ""))
+        result = await run_channel_backfill(
+            channel,
+            limit=options.get("limit") or BACKFILL_DEFAULT_LIMIT,
+            dry_run=options.get("dry_run", True),
+            include_sealed_test=bool(options.get("include_sealed_test")),
+            include_internal=bool(options.get("include_internal")),
+        )
+        await message.reply(format_channel_backfill_result(result))
+        return True
+    if options.get("mode") == "approved":
+        channels = _approved_backfill_channels(message.guild, include_sealed_test=bool(options.get("include_sealed_test")), include_internal=bool(options.get("include_internal")))
+        limit = int(options.get("limit_per_channel") or BACKFILL_DEFAULT_LIMIT)
+        dry_run = bool(options.get("dry_run", True))
+        results = []
+        for channel in channels[:20]:
+            results.append(await run_channel_backfill(channel, limit=limit, dry_run=dry_run, include_sealed_test=bool(options.get("include_sealed_test")), include_internal=bool(options.get("include_internal"))))
+        lines = ["**BNL Approved Channel Backfill Preview**", f"dry_run: `{'yes' if dry_run else 'no'}` | channels: `{len(results)}` | limit_per_channel: `{limit}`", "Default scope excludes protected/reference/internal channels and DMs. No raw transcripts are included."]
+        for res in results[:12]:
+            lines.append(f"#{res.get('channelName')} policy={res.get('channelPolicy')} scanned={res.get('messagesScanned')} eligible={res.get('messagesEligible')} inserted={res.get('messagesInserted')} skipped={sum((res.get('skipReasons') or {}).values())} already_exists={res.get('rowsAlreadyExist')}")
+        if not results:
+            lines.append("No approved eligible channels found.")
+        await message.reply("\n".join(lines)[:1900])
+        return True
+    return False
+
 async def maybe_handle_channel_audit_command(message: discord.Message, clean_content: str) -> bool:
     text = re.sub(r"\s+", " ", (clean_content or "").strip().lower())
     if text not in {"!bnl audit channels", "!bnl channels audit"}:
@@ -4917,6 +5288,7 @@ def record_passive_user_activity(message: discord.Message, content: str, channel
         channel_name=channel_name,
         channel_policy=channel_policy,
         channel_id=getattr(channel, "id", 0),
+        message_id=int(getattr(message, "id", 0) or 0) or None,
     )
     mark_passive_capture_status(channel_name, user_name, "stored", "none")
     return True
@@ -6531,13 +6903,20 @@ def is_active_channel_quiet(guild_id: int, minutes: int = 15) -> bool:
     conn.close()
     return int(row[0] if row else 0) == 0
 
-def save_user_message(user_id: int, user_name: str, guild_id: int, content: str, channel_name: str = "", channel_policy: str = "unknown", channel_id: int = 0):
+def save_user_message(user_id: int, user_name: str, guild_id: int, content: str, channel_name: str = "", channel_policy: str = "unknown", channel_id: int = 0, message_id: int | None = None):
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
-    cursor.execute(
-        "INSERT INTO conversations (user_id, user_name, guild_id, channel_name, channel_policy, channel_id, role, content) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        (user_id, user_name, guild_id, (channel_name or "").lower()[:80], (channel_policy or "unknown")[:40], int(channel_id or 0), "user", content),
-    )
+    has_message_id = "message_id" in _conversations_columns()
+    if has_message_id:
+        cursor.execute(
+            "INSERT INTO conversations (user_id, user_name, guild_id, channel_name, channel_policy, channel_id, message_id, role, content) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (user_id, user_name, guild_id, (channel_name or "").lower()[:80], (channel_policy or "unknown")[:40], int(channel_id or 0), int(message_id or 0) or None, "user", content),
+        )
+    else:
+        cursor.execute(
+            "INSERT INTO conversations (user_id, user_name, guild_id, channel_name, channel_policy, channel_id, role, content) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (user_id, user_name, guild_id, (channel_name or "").lower()[:80], (channel_policy or "unknown")[:40], int(channel_id or 0), "user", content),
+        )
     conn.commit()
     conn.close()
     prune_conversation_history(user_id, guild_id, MAX_CONVERSATION_ROWS_PER_USER)
@@ -11386,6 +11765,9 @@ async def on_message(message: discord.Message):
     if await maybe_handle_channel_audit_command(message, clean_content):
         return
 
+    if await maybe_handle_backfill_command(message, clean_content):
+        return
+
     if await maybe_handle_source_file_enrichment_command(message, clean_content):
         return
 
@@ -12863,6 +13245,14 @@ async def bnl_status(interaction: discord.Interaction):
         f"- community_presence_last_top_withheld_reason: `{dossier_diag['community_presence_last_top_withheld_reason']}`",
         f"- community_presence_last_error_status: `{dossier_diag['community_presence_last_error_status']}`",
         "- channel_audit_available: `yes`",
+        f"- backfill_available: `{'yes' if dossier_diag['backfill_available'] else 'no'}`",
+        f"- backfill_last_channel: `{dossier_diag['backfill_last_channel']}`",
+        f"- backfill_last_status: `{dossier_diag['backfill_last_status']}`",
+        f"- backfill_last_scanned_count: `{dossier_diag['backfill_last_scanned_count']}`",
+        f"- backfill_last_inserted_count: `{dossier_diag['backfill_last_inserted_count']}`",
+        f"- backfill_last_skipped_count: `{dossier_diag['backfill_last_skipped_count']}`",
+        f"- backfill_last_error: `{dossier_diag['backfill_last_error']}`",
+        f"- backfill_last_dry_run: `{'yes' if dossier_diag['backfill_last_dry_run'] else 'no'}`",
         f"- passive_capture_enabled: `{'yes' if allow_passive_memory_for_policy('public_selective') else 'no'}`",
         f"- passive_capture_last_channel: `{_passive_capture_last_channel}`",
         f"- passive_capture_last_user: `{_passive_capture_last_user}`",

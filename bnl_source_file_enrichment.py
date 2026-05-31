@@ -386,8 +386,13 @@ def _summarize_channel_activity(subject: str, rows: list[sqlite3.Row]) -> str:
     if internal_count:
         parts.append("internal/operator-channel activity")
     channel_text = f" Recent approved channels observed: {', '.join(channels[:4])}." if channels else ""
+    recurring = "recurring " if len(rows) >= 3 else ""
     interaction = "direct participation" if direct else ("mention context" if mention else "general participation")
-    return f"{_safe_text(subject, 90)} has prior activity in approved Discord-side channels ({' and '.join(parts) or 'approved activity'}). BNL can use this as internal source context, not public dossier copy. Pattern observed: {interaction}; text mentions: {'yes' if mention else 'no'}.{channel_text}"
+    if direct and channels:
+        lead = f"{_safe_text(subject, 90)} has {recurring}activity in #{channels[0]}"
+    else:
+        lead = f"{_safe_text(subject, 90)} has {recurring}prior activity in approved Discord-side channels"
+    return f"{lead}. review-only internal context; internal source context, not public dossier copy. no specific public-safe role has been confirmed yet. No meaningful repeated theme has been extracted yet.{channel_text}"
 
 
 def _append_section(sections: dict[str, list[str]], name: str, value: str, *, limit: int = 5) -> None:
