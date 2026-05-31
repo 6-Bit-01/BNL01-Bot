@@ -80,7 +80,7 @@ from bnl_source_file_enrichment import (
     source_enrichment_ingest_source,
 )
 from collections import Counter, defaultdict, deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 
 import pytz
@@ -271,6 +271,18 @@ PACING_BEHAVIOR_NONE = "none"
 
 
 @dataclass(frozen=True)
+class ReplyEligibility:
+    should_reply: bool
+    reply_reason: str
+    directness: str
+    policy_reply_class: str
+    batch_allowed: bool
+    pacing_required: bool
+    generation_allowed: bool
+    batching_disabled_affects_reply: bool = False
+
+
+@dataclass(frozen=True)
 class ConversationPlan:
     route_mode: str
     channel_policy: str
@@ -287,6 +299,14 @@ class ConversationPlan:
     reason: str
     direct_session_used: bool = False
     batch_bypass_reason: str = ""
+    directness: str = "unknown"
+    policy_reply_class: str = "unknown"
+    reply_reason: str = "unknown"
+    batch_allowed: bool = False
+    pacing_required: bool = False
+    generation_allowed: bool = False
+    batching_enabled: bool = False
+    batching_disabled_affects_reply: bool = False
 
 
 ROUTE_MODE_CONTRACTS = {
@@ -5013,6 +5033,120 @@ def build_simple_greeting_response(user_name: str = "") -> str:
     return template.format(name=name)
 
 
+def decide_reply_eligibility(
+    clean_content: str,
+    channel_policy: str,
+    *,
+    route_mode: str | None = None,
+    active_channel: bool = False,
+    real_direct_target: bool = False,
+    reply_to_bot: bool = False,
+    plain_text_name_seen: bool = False,
+    followup_candidate: bool = False,
+    channel_allows_conversation: bool = False,
+    batching_enabled: bool | None = None,
+    operator_command: bool = False,
+    source_command: bool = False,
+    active_direct_session: bool = False,
+) -> ReplyEligibility:
+    """Decide reply eligibility separately from batching and memory governance.
+
+    Reply classes intentionally keep direct/direct-like replies independent from
+    passive active-channel batching. `BNL_ACTIVE_BATCHING_ENABLED=false` can only
+    stop passive batching; it must not deny real mentions, replies, accepted
+    plain-name calls, recent follow-ups, commands, or sealed-test free-speak.
+    """
+    batching = BNL_ACTIVE_BATCHING_ENABLED if batching_enabled is None else bool(batching_enabled)
+    policy = channel_policy if channel_policy in CHANNEL_POLICY_CONTRACTS else "unknown"
+    contract = CHANNEL_POLICY_CONTRACTS.get(policy, CHANNEL_POLICY_CONTRACTS["unknown"])
+    mode = route_mode or ROUTE_MODE_NORMAL_CHAT
+    text_present = bool((clean_content or "").strip())
+
+    if operator_command or mode == ROUTE_MODE_OPERATOR_COMMAND:
+        return ReplyEligibility(True, "operator_command", "command", "operator_command", False, False, True)
+    if source_command or mode in SOURCE_INTERNAL_MODES:
+        return ReplyEligibility(True, "explicit_source_or_internal_route", "command", "source_command", False, False, True)
+    if active_direct_session:
+        return ReplyEligibility(True, "direct_payload_session_active", "command", "planned_direct", False, True, True)
+    if reply_to_bot:
+        return ReplyEligibility(
+            bool(contract.get("reply_when_mentioned", False)),
+            "reply_to_bot_allowed" if contract.get("reply_when_mentioned", False) else f"{policy}_reply_to_bot_blocked",
+            "reply_to_bot",
+            "planned_direct" if contract.get("reply_when_mentioned", False) else "blocked",
+            False,
+            True,
+            bool(contract.get("reply_when_mentioned", False)),
+        )
+    if real_direct_target:
+        return ReplyEligibility(
+            bool(contract.get("reply_when_mentioned", False)),
+            "real_mention_allowed" if contract.get("reply_when_mentioned", False) else f"{policy}_mention_blocked",
+            "real_mention",
+            "planned_direct" if contract.get("reply_when_mentioned", False) else "blocked",
+            False,
+            True,
+            bool(contract.get("reply_when_mentioned", False)),
+        )
+    if followup_candidate:
+        allowed = policy in CONVERSATIONAL_POLICIES and bool(contract.get("reply_when_mentioned", False))
+        return ReplyEligibility(
+            allowed,
+            "recent_direct_followup_allowed" if allowed else f"{policy}_followup_blocked",
+            "recent_followup",
+            "planned_direct" if allowed else "blocked",
+            False,
+            True,
+            allowed,
+        )
+    if plain_text_name_seen and policy in {"sealed_test", "public_home"}:
+        reply_class = "sealed_test_conversation" if policy == "sealed_test" else "public_home_conversation"
+        if mode == ROUTE_MODE_SIMPLE_GREETING:
+            reply_class = "planned_greeting"
+        return ReplyEligibility(True, f"{policy}_plain_name_call_allowed", "plain_name_call", reply_class, False, True, True)
+    if plain_text_name_seen and policy == "public_context":
+        return ReplyEligibility(False, "public_context_plain_name_call_not_direct", "plain_name_call", "blocked", False, False, False)
+    if policy == "sealed_test" and text_present and (channel_allows_conversation or active_channel or contract.get("reply_without_direct", False)):
+        return ReplyEligibility(True, "sealed_test_free_speak_allowed", "sealed_test_free_speak", "sealed_test_conversation", False, True, True)
+    if policy == "public_home" and text_present and contract.get("reply_without_direct", False):
+        batch_allowed = bool(active_channel and batching)
+        return ReplyEligibility(
+            False,
+            "public_home_passive_batch_allowed" if batch_allowed else "public_home_passive_observe_batching_disabled",
+            "public_home_free_speak" if batch_allowed else "passive_observe",
+            "batched_passive" if batch_allowed else "silent_observe",
+            batch_allowed,
+            False,
+            batch_allowed,
+        )
+    if active_channel and text_present and policy in CONVERSATIONAL_POLICIES:
+        batch_allowed = bool(batching)
+        return ReplyEligibility(
+            False,
+            "passive_batch_allowed" if batch_allowed else "passive_observe_batching_disabled",
+            "passive_observe",
+            "batched_passive" if batch_allowed else "silent_observe",
+            batch_allowed,
+            False,
+            batch_allowed,
+        )
+    return ReplyEligibility(False, f"{policy}_no_conversation_route", "passive_observe", "silent_observe" if text_present else "blocked", False, False, False)
+
+
+def _attach_reply_eligibility(plan: ConversationPlan, eligibility: ReplyEligibility, batching_enabled: bool) -> ConversationPlan:
+    return replace(
+        plan,
+        directness=eligibility.directness,
+        policy_reply_class=eligibility.policy_reply_class,
+        reply_reason=eligibility.reply_reason,
+        batch_allowed=eligibility.batch_allowed,
+        pacing_required=eligibility.pacing_required,
+        generation_allowed=eligibility.generation_allowed,
+        batching_enabled=bool(batching_enabled),
+        batching_disabled_affects_reply=eligibility.batching_disabled_affects_reply,
+    )
+
+
 def _conversation_plan_log(plan: ConversationPlan) -> None:
     logging.info(
         "conversation_plan route_mode=%s timing=%s generation=%s batch=%s pacing=%s reason=%s",
@@ -5035,6 +5169,16 @@ def _conversation_plan_log(plan: ConversationPlan) -> None:
         int(plan.direct_session_used),
         plan.response_timing,
     )
+    logging.info(
+        "conversation_reply_eligibility directness=%s reply_class=%s should_reply=%s reply_reason=%s batch_allowed=%s batching_enabled=%s batching_disabled_affects_reply=%s",
+        plan.directness,
+        plan.policy_reply_class,
+        int(plan.should_reply),
+        plan.reply_reason,
+        int(plan.batch_allowed),
+        int(plan.batching_enabled),
+        int(plan.batching_disabled_affects_reply),
+    )
 
 
 def plan_conversation_response(
@@ -5044,6 +5188,8 @@ def plan_conversation_response(
     route_mode: str | None = None,
     active_channel: bool = False,
     real_direct_target: bool = False,
+    reply_to_bot: bool = False,
+    plain_text_name_seen: bool = False,
     followup_candidate: bool = False,
     channel_allows_conversation: bool = False,
     batching_enabled: bool | None = None,
@@ -5077,6 +5223,21 @@ def plan_conversation_response(
         payload_expected=payload_expected,
         show_state=show_state,
     )
+    eligibility = decide_reply_eligibility(
+        clean_content,
+        channel_policy,
+        route_mode=mode,
+        active_channel=active_channel,
+        real_direct_target=real_direct_target,
+        reply_to_bot=reply_to_bot,
+        plain_text_name_seen=plain_text_name_seen,
+        followup_candidate=followup_candidate,
+        channel_allows_conversation=channel_allows_conversation,
+        batching_enabled=batching,
+        operator_command=operator_command,
+        source_command=source_command,
+        active_direct_session=active_direct_session,
+    )
     if operator_command or mode == ROUTE_MODE_OPERATOR_COMMAND:
         plan = ConversationPlan(
             mode,
@@ -5093,6 +5254,7 @@ def plan_conversation_response(
             True,
             "operator_command_handler",
         )
+        plan = _attach_reply_eligibility(plan, eligibility, batching)
         _conversation_plan_log(plan)
         return plan
     if source_command or mode in SOURCE_INTERNAL_MODES:
@@ -5111,10 +5273,19 @@ def plan_conversation_response(
             True,
             "explicit_source_or_internal_route",
         )
+        plan = _attach_reply_eligibility(plan, eligibility, batching)
         _conversation_plan_log(plan)
         return plan
 
-    direct_like = bool(real_direct_target or followup_candidate)
+    direct_like = bool(
+        eligibility.should_reply
+        and eligibility.policy_reply_class in {
+            "planned_direct",
+            "planned_greeting",
+            "sealed_test_conversation",
+            "public_home_conversation",
+        }
+    )
     if direct_like and payload_expected and payload_count == 0:
         plan = ConversationPlan(
             ROUTE_MODE_DIRECT_PAYLOAD,
@@ -5128,10 +5299,11 @@ def plan_conversation_response(
             get_route_mode_contract(ROUTE_MODE_DIRECT_PAYLOAD).save_behavior,
             True,
             False,
-            False,
+            True,
             "awaiting_payload_lines",
             direct_session_used=True,
         )
+        plan = _attach_reply_eligibility(plan, eligibility, batching)
         _conversation_plan_log(plan)
         return plan
     if active_direct_session:
@@ -5147,14 +5319,15 @@ def plan_conversation_response(
             get_route_mode_contract(ROUTE_MODE_DIRECT_PAYLOAD).save_behavior,
             True,
             False,
-            False,
+            True,
             "collecting_payload_lines",
             direct_session_used=True,
         )
+        plan = _attach_reply_eligibility(plan, eligibility, batching)
         _conversation_plan_log(plan)
         return plan
-    if active_channel and not real_direct_target and not followup_candidate:
-        if batching:
+    if eligibility.policy_reply_class in {"batched_passive", "silent_observe"} and active_channel and not direct_like:
+        if eligibility.batch_allowed:
             plan = ConversationPlan(
                 mode,
                 channel_policy,
@@ -5168,7 +5341,7 @@ def plan_conversation_response(
                 False,
                 False,
                 False,
-                "non_direct_active_message_batched",
+                eligibility.reply_reason,
             )
         else:
             plan = ConversationPlan(
@@ -5184,8 +5357,9 @@ def plan_conversation_response(
                 False,
                 False,
                 False,
-                "active_batching_disabled",
+                eligibility.reply_reason,
             )
+        plan = _attach_reply_eligibility(plan, eligibility, batching)
         _conversation_plan_log(plan)
         return plan
     if direct_like:
@@ -5202,7 +5376,7 @@ def plan_conversation_response(
         plan = ConversationPlan(
             mode,
             channel_policy,
-            "direct" if real_direct_target else "active_direct",
+            eligibility.policy_reply_class,
             RESPONSE_TIMING_PACED_DIRECT,
             generation,
             BATCH_BEHAVIOR_DO_NOT_BATCH if mode == ROUTE_MODE_SIMPLE_GREETING else BATCH_BEHAVIOR_PREEMPT_BATCH,
@@ -5212,9 +5386,10 @@ def plan_conversation_response(
             get_route_mode_contract(mode).subject_extraction_behavior not in {"disabled", "disabled_for_casual_questions"},
             mode not in {ROUTE_MODE_SIMPLE_GREETING, ROUTE_MODE_NORMAL_CHAT, ROUTE_MODE_SHOW_STATUS},
             True,
-            "direct_target_or_allowed_active_conversation",
+            eligibility.reply_reason,
             batch_bypass_reason="direct_reply_preempts_batch" if mode != ROUTE_MODE_SIMPLE_GREETING else "simple_greeting_keeps_existing_batch",
         )
+        plan = _attach_reply_eligibility(plan, eligibility, batching)
         _conversation_plan_log(plan)
         return plan
     plan = ConversationPlan(
@@ -5230,8 +5405,9 @@ def plan_conversation_response(
         False,
         False,
         False,
-        "no_conversation_route",
+        eligibility.reply_reason,
     )
+    plan = _attach_reply_eligibility(plan, eligibility, batching)
     _conversation_plan_log(plan)
     return plan
 
@@ -5247,9 +5423,16 @@ def format_last_route_debug() -> str:
     ordered = [
         ("route_mode", "last route mode"),
         ("channel_policy", "last channel policy"),
+        ("directness", "directness"),
+        ("reply_eligibility", "reply eligibility"),
+        ("should_reply", "should reply"),
+        ("reply_reason", "reply reason"),
         ("conversation_plan_timing", "timing plan"),
         ("conversation_plan_generation", "generation type"),
+        ("batch_allowed", "batch allowed"),
         ("conversation_plan_batch", "batching decision"),
+        ("batching_enabled", "batching enabled"),
+        ("batching_disabled_affects_reply", "batching disabled affected reply"),
         ("conversation_plan_pacing", "pacing decision"),
         ("deterministic_response", "deterministic template used"),
         ("direct_session_used", "direct session used"),
@@ -12415,6 +12598,13 @@ async def send_planned_conversation_response(
         conversation_plan_batch=plan.batch_behavior,
         conversation_plan_pacing=plan.pacing_behavior,
         conversation_plan_reason=plan.reason,
+        directness=plan.directness,
+        reply_eligibility=plan.policy_reply_class,
+        should_reply=plan.should_reply,
+        reply_reason=plan.reply_reason,
+        batch_allowed=plan.batch_allowed,
+        batching_enabled=plan.batching_enabled,
+        batching_disabled_affects_reply=plan.batching_disabled_affects_reply,
         direct_session_used=plan.direct_session_used,
         batch_bypass_reason=plan.batch_bypass_reason or "none",
         deterministic_response=(plan.response_generation == RESPONSE_GENERATION_DETERMINISTIC_TEMPLATE),
@@ -12908,6 +13098,8 @@ async def on_message(message: discord.Message):
             route_mode=route_mode,
             active_channel=should_handle_as_active_channel,
             real_direct_target=real_direct_target,
+            reply_to_bot=is_reply,
+            plain_text_name_seen=plain_text_name_seen,
             followup_candidate=followup_candidate,
             channel_allows_conversation=channel_allows_conversation,
             batching_enabled=BNL_ACTIVE_BATCHING_ENABLED,
@@ -12917,9 +13109,9 @@ async def on_message(message: discord.Message):
         )
         save_decision = save_user_message(message.author.id, message.author.display_name, message.guild.id, clean_content, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0), route_mode=conversation_plan.route_mode)
 
-        # Mentions/replies and recent follow-ups are planned direct responses;
+        # Direct/direct-like traffic is planned independently from passive batching;
         # non-direct active-channel traffic falls through to the batch planner below.
-        if real_direct_target or followup_candidate:
+        if conversation_plan.should_reply and conversation_plan.response_timing == RESPONSE_TIMING_PACED_DIRECT:
             route_mode = conversation_plan.route_mode
             if conversation_plan.response_generation == RESPONSE_GENERATION_DETERMINISTIC_TEMPLATE:
                 response = build_simple_greeting_response(message.author.display_name)
@@ -13155,7 +13347,7 @@ async def on_message(message: discord.Message):
 
     # ---------------- OTHER CHANNELS (PING-ONLY IF ACTIVE CHANNEL SET) ----------------
     if active_channel_id is not None and not should_handle_as_active_channel:
-        if not real_direct_target:
+        if not (real_direct_target or (channel_policy == "public_home" and plain_text_name_seen)):
             return
 
         if not clean_content:
@@ -13170,11 +13362,15 @@ async def on_message(message: discord.Message):
             route_mode=route_mode,
             active_channel=False,
             real_direct_target=real_direct_target,
+            reply_to_bot=is_reply,
+            plain_text_name_seen=plain_text_name_seen,
             followup_candidate=False,
             batching_enabled=BNL_ACTIVE_BATCHING_ENABLED,
             payload_expected=payload_expected_for_plan,
             payload_count=len(direct_payload_items),
         )
+        if not conversation_plan.should_reply and conversation_plan.response_timing != RESPONSE_TIMING_DEFERRED_PAYLOAD_SESSION:
+            return
         if conversation_plan.response_generation == RESPONSE_GENERATION_DETERMINISTIC_TEMPLATE:
             response = build_simple_greeting_response(message.author.display_name)
             await send_planned_conversation_response(
@@ -13241,6 +13437,8 @@ async def on_message(message: discord.Message):
                 channel_policy,
                 route_mode=route_mode,
                 real_direct_target=real_direct_target,
+                reply_to_bot=is_reply,
+                plain_text_name_seen=plain_text_name_seen,
                 batching_enabled=BNL_ACTIVE_BATCHING_ENABLED,
                 show_state=True,
                 payload_count=len(direct_payload_items),
@@ -13286,6 +13484,8 @@ async def on_message(message: discord.Message):
                 channel_policy,
                 route_mode=route_mode,
                 real_direct_target=real_direct_target,
+                reply_to_bot=is_reply,
+                plain_text_name_seen=plain_text_name_seen,
                 batching_enabled=BNL_ACTIVE_BATCHING_ENABLED,
                 payload_expected=True,
                 payload_count=len(direct_payload_items),
@@ -13354,11 +13554,15 @@ async def on_message(message: discord.Message):
             route_mode=route_mode,
             active_channel=False,
             real_direct_target=real_direct_target,
+            reply_to_bot=is_reply,
+            plain_text_name_seen=plain_text_name_seen,
             followup_candidate=False,
             batching_enabled=BNL_ACTIVE_BATCHING_ENABLED,
             payload_expected=payload_expected_for_plan,
             payload_count=len(direct_payload_items),
         )
+        if not conversation_plan.should_reply and conversation_plan.response_timing != RESPONSE_TIMING_DEFERRED_PAYLOAD_SESSION:
+            return
         if conversation_plan.response_generation == RESPONSE_GENERATION_DETERMINISTIC_TEMPLATE:
             response = build_simple_greeting_response(message.author.display_name)
             await send_planned_conversation_response(
@@ -13425,6 +13629,8 @@ async def on_message(message: discord.Message):
                 channel_policy,
                 route_mode=route_mode,
                 real_direct_target=real_direct_target,
+                reply_to_bot=is_reply,
+                plain_text_name_seen=plain_text_name_seen,
                 batching_enabled=BNL_ACTIVE_BATCHING_ENABLED,
                 show_state=True,
                 payload_count=len(direct_payload_items),
@@ -13470,6 +13676,8 @@ async def on_message(message: discord.Message):
                 channel_policy,
                 route_mode=route_mode,
                 real_direct_target=real_direct_target,
+                reply_to_bot=is_reply,
+                plain_text_name_seen=plain_text_name_seen,
                 batching_enabled=BNL_ACTIVE_BATCHING_ENABLED,
                 payload_expected=True,
                 payload_count=len(direct_payload_items),

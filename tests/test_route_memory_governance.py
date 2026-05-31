@@ -97,6 +97,138 @@ class ConversationPlannerTests(unittest.TestCase):
         self.assertEqual(plan.response_timing, bnl01_bot.RESPONSE_TIMING_SILENT_OBSERVE)
         self.assertEqual(plan.response_generation, bnl01_bot.RESPONSE_GENERATION_NONE)
 
+    def test_sealed_test_free_speak_replies_when_batching_disabled(self):
+        for text, plain_seen in (("Hi BNL", True), ("How's it going?", False), ("BNL?", True)):
+            route_mode = bnl01_bot.classify_route_mode(text, "sealed_test", active_channel=True)
+            plan = bnl01_bot.plan_conversation_response(
+                text,
+                "sealed_test",
+                route_mode=route_mode,
+                active_channel=True,
+                plain_text_name_seen=plain_seen,
+                channel_allows_conversation=True,
+                batching_enabled=False,
+            )
+            self.assertTrue(plan.should_reply, text)
+            self.assertEqual(plan.response_timing, bnl01_bot.RESPONSE_TIMING_PACED_DIRECT)
+            self.assertNotEqual(plan.reason, "active_batching_disabled")
+            self.assertFalse(plan.batching_disabled_affects_reply)
+            self.assertIn(plan.directness, {"plain_name_call", "sealed_test_free_speak"})
+
+    def test_public_home_plain_name_replies_when_batching_disabled(self):
+        for text in ("Hi BNL", "BNL how's it going?"):
+            route_mode = bnl01_bot.classify_route_mode(text, "public_home", active_channel=True)
+            plan = bnl01_bot.plan_conversation_response(
+                text,
+                "public_home",
+                route_mode=route_mode,
+                active_channel=True,
+                plain_text_name_seen=True,
+                channel_allows_conversation=True,
+                batching_enabled=False,
+            )
+            self.assertTrue(plan.should_reply, text)
+            self.assertEqual(plan.directness, "plain_name_call")
+            self.assertEqual(plan.response_timing, bnl01_bot.RESPONSE_TIMING_PACED_DIRECT)
+            self.assertNotEqual(plan.reason, "active_batching_disabled")
+
+    def test_public_home_passive_chatter_only_batches_when_enabled(self):
+        disabled = bnl01_bot.plan_conversation_response(
+            "room chatter continuing",
+            "public_home",
+            route_mode=bnl01_bot.ROUTE_MODE_NORMAL_CHAT,
+            active_channel=True,
+            batching_enabled=False,
+        )
+        self.assertFalse(disabled.should_reply)
+        self.assertFalse(disabled.batch_allowed)
+        self.assertEqual(disabled.response_timing, bnl01_bot.RESPONSE_TIMING_SILENT_OBSERVE)
+        self.assertEqual(disabled.reason, "public_home_passive_observe_batching_disabled")
+
+        enabled = bnl01_bot.plan_conversation_response(
+            "room chatter continuing",
+            "public_home",
+            route_mode=bnl01_bot.ROUTE_MODE_NORMAL_CHAT,
+            active_channel=True,
+            batching_enabled=True,
+        )
+        self.assertFalse(enabled.should_reply)
+        self.assertTrue(enabled.batch_allowed)
+        self.assertEqual(enabled.response_timing, bnl01_bot.RESPONSE_TIMING_BATCHED_CHANNEL)
+        self.assertEqual(enabled.batch_behavior, bnl01_bot.BATCH_BEHAVIOR_ENTER_BATCH)
+
+    def test_public_context_matrix(self):
+        mention = bnl01_bot.plan_conversation_response(
+            "actual mention",
+            "public_context",
+            route_mode=bnl01_bot.ROUTE_MODE_NORMAL_CHAT,
+            real_direct_target=True,
+            batching_enabled=False,
+        )
+        self.assertTrue(mention.should_reply)
+        self.assertEqual(mention.directness, "real_mention")
+
+        reply = bnl01_bot.plan_conversation_response(
+            "replying back",
+            "public_context",
+            route_mode=bnl01_bot.ROUTE_MODE_NORMAL_CHAT,
+            real_direct_target=True,
+            reply_to_bot=True,
+            batching_enabled=False,
+        )
+        self.assertTrue(reply.should_reply)
+        self.assertEqual(reply.directness, "reply_to_bot")
+
+        passive = bnl01_bot.plan_conversation_response(
+            "random public chatter",
+            "public_context",
+            route_mode=bnl01_bot.ROUTE_MODE_NORMAL_CHAT,
+            active_channel=False,
+            batching_enabled=False,
+        )
+        self.assertFalse(passive.should_reply)
+        self.assertEqual(passive.response_timing, bnl01_bot.RESPONSE_TIMING_BLOCKED)
+
+        plain_name = bnl01_bot.plan_conversation_response(
+            "Hi BNL",
+            "public_context",
+            route_mode=bnl01_bot.ROUTE_MODE_SIMPLE_GREETING,
+            plain_text_name_seen=True,
+            batching_enabled=False,
+        )
+        self.assertFalse(plain_name.should_reply)
+        self.assertEqual(plain_name.reason, "public_context_plain_name_call_not_direct")
+
+    def test_public_selective_internal_and_protected_passive_stay_quiet(self):
+        for policy in ("public_selective", "internal_controlled", "reference_canon", "unknown"):
+            plan = bnl01_bot.plan_conversation_response(
+                "passive message",
+                policy,
+                route_mode=bnl01_bot.ROUTE_MODE_NORMAL_CHAT,
+                batching_enabled=False,
+            )
+            self.assertFalse(plan.should_reply, policy)
+            self.assertEqual(plan.response_generation, bnl01_bot.RESPONSE_GENERATION_NONE)
+
+    def test_active_batching_disabled_never_denies_direct_or_allowed_free_speak(self):
+        cases = [
+            dict(text="mention", policy="public_context", real_direct_target=True),
+            dict(text="reply", policy="public_context", real_direct_target=True, reply_to_bot=True),
+            dict(text="Hi BNL", policy="public_home", plain_text_name_seen=True, active_channel=True, channel_allows_conversation=True),
+            dict(text="How's it going?", policy="sealed_test", active_channel=True, channel_allows_conversation=True),
+        ]
+        for case in cases:
+            plan = bnl01_bot.plan_conversation_response(
+                case.pop("text"),
+                case.pop("policy"),
+                route_mode=bnl01_bot.ROUTE_MODE_NORMAL_CHAT,
+                batching_enabled=False,
+                **case,
+            )
+            self.assertTrue(plan.should_reply)
+            self.assertNotEqual(plan.reason, "active_batching_disabled")
+            self.assertFalse(plan.batching_disabled_affects_reply)
+
     def test_operator_and_source_commands_remain_command_routes(self):
         operator_plan = bnl01_bot.plan_conversation_response(
             "!bnl debug last route",
