@@ -560,6 +560,12 @@ _source_enrichment_last_quality_score = 0
 _source_enrichment_last_quality_status = "none"
 _source_enrichment_last_suppressed_reason = "none"
 _source_enrichment_last_preview_bullets_count = 0
+_classification_last_subject = "none"
+_classification_last_primary_role = "unknown"
+_classification_last_activity_level = "none"
+_classification_last_dossier_use = "not_ready"
+_classification_last_confidence = "low"
+_classification_last_missing_info_count = 0
 BNL_CONTROL_FLAGS_TTL_SECONDS = 300
 _bnl_control_flags_cache = None
 _bnl_control_flags_cached_at = None
@@ -4152,6 +4158,13 @@ def build_dossier_recommendation_diagnostics(guild_id=None) -> dict:
         "source_enrichment_last_suppressed_reason": _source_enrichment_last_suppressed_reason,
         "source_enrichment_last_preview_bullets_count": _source_enrichment_last_preview_bullets_count,
         "source_enrichment_last_error_status": _source_enrichment_last_error_status,
+        "classification_available": True,
+        "classification_last_subject": _classification_last_subject,
+        "classification_last_primary_role": _classification_last_primary_role,
+        "classification_last_activity_level": _classification_last_activity_level,
+        "classification_last_dossier_use": _classification_last_dossier_use,
+        "classification_last_confidence": _classification_last_confidence,
+        "classification_last_missing_info_count": _classification_last_missing_info_count,
         "backfill_available": True,
         "backfill_last_channel": _backfill_last_channel,
         "backfill_last_status": _backfill_last_status,
@@ -4437,6 +4450,7 @@ async def maybe_handle_source_file_enrichment_command(message: discord.Message, 
     global _source_enrichment_last_source_counts, _source_enrichment_last_warning_counts, _source_enrichment_last_error_status
     global _source_enrichment_last_lookup_found, _source_enrichment_last_possible_match_count, _source_enrichment_last_possible_match_names, _source_enrichment_last_resolution_mode
     global _source_enrichment_last_quality_score, _source_enrichment_last_quality_status, _source_enrichment_last_suppressed_reason, _source_enrichment_last_preview_bullets_count
+    global _classification_last_subject, _classification_last_primary_role, _classification_last_activity_level, _classification_last_dossier_use, _classification_last_confidence, _classification_last_missing_info_count
 
     matched, options, parse_error = parse_source_enrichment_command(clean_content)
     if not matched:
@@ -4497,6 +4511,14 @@ async def maybe_handle_source_file_enrichment_command(message: discord.Message, 
     _source_enrichment_last_quality_status = str(result.get("qualityStatus") or "none")[:80]
     _source_enrichment_last_suppressed_reason = str(result.get("suppressedReason") or "none")[:160]
     _source_enrichment_last_preview_bullets_count = int(result.get("previewBulletsCount") or 0)
+    classification = result.get("classification") or {}
+    if classification:
+        _classification_last_subject = _source_enrichment_last_subject
+        _classification_last_primary_role = str(classification.get("primaryRole") or "unknown")[:80]
+        _classification_last_activity_level = str(classification.get("activityLevel") or "none")[:80]
+        _classification_last_dossier_use = str(classification.get("dossierUse") or "not_ready")[:80]
+        _classification_last_confidence = str(classification.get("sourceConfidence") or "low")[:80]
+        _classification_last_missing_info_count = int(len(classification.get("missingInfo") or []))
     _source_enrichment_last_error_status = "none" if result.get("ok") else _source_enrichment_last_status
     if dry_run:
         _last_dossier_recommendation_status = "source_enrichment_dry_run"
@@ -12950,6 +12972,13 @@ async def bnl_source_check(interaction: discord.Interaction):
         f"- source_enrichment_last_suppressed_reason: `{dossier_diag['source_enrichment_last_suppressed_reason']}`",
         f"- source_enrichment_last_preview_bullets_count: `{dossier_diag['source_enrichment_last_preview_bullets_count']}`",
         f"- source_enrichment_last_error_status: `{dossier_diag['source_enrichment_last_error_status']}`",
+        f"- classification_available: `{'yes' if dossier_diag['classification_available'] else 'no'}`",
+        f"- classification_last_subject: `{dossier_diag['classification_last_subject']}`",
+        f"- classification_last_primary_role: `{dossier_diag['classification_last_primary_role']}`",
+        f"- classification_last_activity_level: `{dossier_diag['classification_last_activity_level']}`",
+        f"- classification_last_dossier_use: `{dossier_diag['classification_last_dossier_use']}`",
+        f"- classification_last_confidence: `{dossier_diag['classification_last_confidence']}`",
+        f"- classification_last_missing_info_count: `{dossier_diag['classification_last_missing_info_count']}`",
         f"- community_scouting_available: `{'yes' if dossier_diag['community_scouting_available'] else 'no'}`",
         f"- community_scouting_enabled: `{'yes' if dossier_diag['community_scouting_enabled'] else 'no'}`",
         f"- community_scouting_allowed_channels_configured: `{'yes' if dossier_diag['community_scouting_allowed_channels_configured'] else 'no'}`",
@@ -13234,6 +13263,13 @@ async def bnl_status(interaction: discord.Interaction):
         f"- source_enrichment_last_suppressed_reason: `{dossier_diag['source_enrichment_last_suppressed_reason']}`",
         f"- source_enrichment_last_preview_bullets_count: `{dossier_diag['source_enrichment_last_preview_bullets_count']}`",
         f"- source_enrichment_last_error_status: `{dossier_diag['source_enrichment_last_error_status']}`",
+        f"- classification_available: `{'yes' if dossier_diag['classification_available'] else 'no'}`",
+        f"- classification_last_subject: `{dossier_diag['classification_last_subject']}`",
+        f"- classification_last_primary_role: `{dossier_diag['classification_last_primary_role']}`",
+        f"- classification_last_activity_level: `{dossier_diag['classification_last_activity_level']}`",
+        f"- classification_last_dossier_use: `{dossier_diag['classification_last_dossier_use']}`",
+        f"- classification_last_confidence: `{dossier_diag['classification_last_confidence']}`",
+        f"- classification_last_missing_info_count: `{dossier_diag['classification_last_missing_info_count']}`",
         f"- community_scouting_available: `{'yes' if dossier_diag['community_scouting_available'] else 'no'}`",
         f"- community_scouting_enabled: `{'yes' if dossier_diag['community_scouting_enabled'] else 'no'}`",
         f"- community_scouting_allowed_channels_configured: `{'yes' if dossier_diag['community_scouting_allowed_channels_configured'] else 'no'}`",

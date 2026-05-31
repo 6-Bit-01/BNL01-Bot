@@ -56,6 +56,329 @@ _EMAIL_RE = re.compile(r"\b[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}\b")
 _WEAK_ALIAS_RE = re.compile(r"\b(?:alias|known as|aka|connection|connected to|via|through|introduced by)\b", re.I)
 
 
+ROLE_LABELS = {
+    "artist": "Artist",
+    "submitter": "Submitter",
+    "active_community_member": "Active community member",
+    "viewer_listener": "Viewer/listener",
+    "moderator": "Moderator",
+    "barcode_team": "BARCODE team",
+    "barcode_entity": "BARCODE entity",
+    "collaborator": "Collaborator",
+    "supporter": "Supporter",
+    "sponsor": "Sponsor",
+    "system": "System",
+    "unknown": "Unknown / needs review",
+}
+ENGAGEMENT_LABELS = {
+    "welcome_back": "Welcome-back context",
+    "community_followup": "Community follow-up",
+    "artist_followup": "Artist follow-up",
+    "dossier_review": "Possible future dossier review",
+    "existing_dossier_update": "Existing dossier update",
+    "relationship_mapping": "Relationship mapping",
+    "show_history_context": "Show-history context",
+    "moderator_context": "Moderator context",
+    "do_not_engage_publicly_yet": "Do not engage publicly yet",
+    "archive_if_no_substance": "Archive if no substance",
+}
+DOSSIER_LABELS = {
+    "not_ready": "Not ready",
+    "source_file_only": "Source File only",
+    "possible_future_dossier": "Possible future dossier",
+    "existing_dossier_update": "Existing dossier update",
+    "draftable_after_review": "Draftable after owner/admin review",
+}
+RELATIONSHIP_LABELS = {
+    "none": "No relationship read yet",
+    "possible_connections": "Possible connections need owner review",
+    "known_context": "Known context for review",
+    "needs_owner_review": "Needs owner review",
+}
+TOPIC_LABELS = {
+    "music submissions": "Music submissions",
+    "production": "Production",
+    "BARCODE Radio": "BARCODE Radio",
+    "community chat": "Community chat",
+    "AI/art": "AI/art",
+    "memes/off-topic": "Memes/off-topic",
+    "moderation/admin": "Moderation/admin",
+    "sponsor/commercial": "Sponsor/commercial",
+    "lore/entity discussion": "Lore/entity discussion",
+    "unknown/no clear theme": "Unknown/no clear theme",
+}
+
+_TOPIC_KEYWORDS = {
+    "music submissions": ("submit", "submission", "song", "track", "beat", "demo", "queue"),
+    "production": ("mix", "master", "produce", "producer", "fl studio", "ableton", "sample", "vocal"),
+    "BARCODE Radio": ("barcode radio", "show", "episode", "broadcast", "live"),
+    "AI/art": ("ai", "art", "image", "visual", "generate", "model"),
+    "memes/off-topic": ("meme", "lol", "joke", "off topic", "shitpost"),
+    "moderation/admin": ("mod", "moderator", "timeout", "ban", "rules", "admin"),
+    "sponsor/commercial": ("sponsor", "ad", "commercial", "brand", "promo"),
+    "lore/entity discussion": ("lore", "entity", "canon", "character", "protocol", "glitch"),
+}
+
+_ROLE_KEYWORDS = {
+    "artist": ("artist", "musician", "rapper", "singer", "producer", "dj", "performer"),
+    "submitter": ("submitter", "submitted", "submission", "queue submission", "sent a track", "uploaded a track"),
+    "moderator": ("moderator", " mod ", "staff role", "admin role"),
+    "barcode_team": ("barcode team", "core team", "staff", "crew", "owner"),
+    "barcode_entity": ("barcode entity", "lore entity", "character", "fictional entity", "protocol", "glitch virus"),
+    "collaborator": ("collaborator", "collaboration", "featured", "worked with", "partner"),
+    "supporter": ("supporter", "show support", "community support"),
+    "sponsor": ("sponsor", "commercial partner", "brand partner"),
+    "system": ("system", "bot", "automation", "service account"),
+}
+
+
+def _contains_any(text: str, needles: tuple[str, ...]) -> bool:
+    hay = f" {re.sub(r'[^a-z0-9/+-]+', ' ', (text or '').lower())} "
+    return any(needle in hay or needle.strip() in hay for needle in needles)
+
+
+def _classification_plain_list(values: list[str], labels: dict[str, str]) -> str:
+    return ", ".join(labels.get(v, v.replace("_", " ")) for v in values) or "None"
+
+
+def _extract_topic_themes(texts: list[str], *, approved_activity_count: int = 0) -> list[str]:
+    scores: Counter[str] = Counter()
+    for text in texts:
+        cleaned = str(text or "").lower()
+        for theme, keywords in _TOPIC_KEYWORDS.items():
+            if any(keyword in cleaned for keyword in keywords):
+                scores[theme] += 1
+    themes = [theme for theme, count in scores.most_common() if count >= 1]
+    if not themes:
+        return ["unknown/no clear theme"] if approved_activity_count else []
+    # Keep v1 cautious: require repetition for chatter-only themes unless only one clear lane exists.
+    repeated = [theme for theme in themes if scores[theme] >= 2]
+    return (repeated or themes)[:3]
+
+
+def classify_entity_activity(subject_identity: dict[str, Any] | None, evidence_bundle: dict[str, Any] | None) -> dict[str, Any]:
+    """Convert approved local evidence into cautious internal role/activity intelligence.
+
+    The result is internal review context only. It does not confirm aliases,
+    publish dossier content, merge identities, or treat Discord chatter as proof
+    of artist/submission/mod/team/sponsor status.
+    """
+
+    identity = subject_identity or {}
+    bundle = evidence_bundle or {}
+    sections = bundle.get("sections") if isinstance(bundle.get("sections"), dict) else {}
+    source_counts = Counter(bundle.get("sourceCounts") or {})
+    diagnostics = bundle.get("diagnostics") if isinstance(bundle.get("diagnostics"), dict) else {}
+    source_file = bundle.get("sourceFile") if isinstance(bundle.get("sourceFile"), dict) else {}
+    match_kind = str(bundle.get("matchKind") or identity.get("workflowLane") or "none")
+    channel = bundle.get("channelActivity") if isinstance(bundle.get("channelActivity"), dict) else {}
+    community = bundle.get("communityActivity") if isinstance(bundle.get("communityActivity"), dict) else {}
+
+    source_text_parts: list[str] = []
+    for key in ("candidateType", "sourceType", "type", "kind", "recommendedCategory", "knownFacts", "facts", "evidenceSummary", "reason", "summary", "publicSafetyNotes", "safetyNotes"):
+        if source_file.get(key) not in (None, "", []):
+            source_text_parts.append(str(source_file.get(key)))
+    for name in ("Known Facts", "Public-Safe Notes", "History With BARCODE / BNL / Discord / BARCODE Radio", "Why This Subject Matters"):
+        source_text_parts.extend(str(item) for item in sections.get(name, [])[:5])
+    source_text = " ".join(source_text_parts)
+
+    roles: list[str] = []
+    role_sources: list[str] = []
+    for role in ("sponsor", "barcode_team", "barcode_entity", "moderator", "submitter", "artist", "collaborator", "system", "supporter"):
+        if _contains_any(source_text, _ROLE_KEYWORDS[role]):
+            roles.append(role)
+            role_sources.append(role)
+    # Artist can be supported by explicit source/submission/collaboration evidence, but never by chatter alone.
+    if "artist" not in roles and any(r in roles for r in ("submitter", "collaborator")) and _contains_any(source_text, _ROLE_KEYWORDS["artist"]):
+        roles.append("artist")
+
+    approved_count = int(channel.get("approvedMessageCount") or source_counts.get("conversations_by_author") or 0)
+    community_count = int(community.get("signalCount") or 0)
+    profile_count = int(diagnostics.get("matchedUserProfileCount") or identity.get("matchedUserProfileCount") or 0)
+    relationship_count = source_counts.get("relationship_state", 0) + source_counts.get("relationship_journal", 0)
+    broadcast_count = source_counts.get("broadcast_memory", 0)
+    public_safe_count = len(bundle.get("publicSafeCandidates") or []) + len(sections.get("Public-Safe Notes") or [])
+
+    if approved_count or community_count:
+        if "active_community_member" not in roles:
+            roles.append("active_community_member")
+    elif broadcast_count:
+        roles.append("viewer_listener")
+
+    if not roles:
+        roles = ["unknown"]
+    primary_order = ["sponsor", "barcode_team", "moderator", "barcode_entity", "artist", "submitter", "collaborator", "active_community_member", "viewer_listener", "supporter", "system", "unknown"]
+    primary_role = next((role for role in primary_order if role in roles), "unknown")
+    secondary_roles = [role for role in roles if role != primary_role]
+
+    non_lookup_refs = sum(v for k, v in source_counts.items() if k not in {"source_file_lookup"})
+    day_count = int(channel.get("approvedDayCount") or 0)
+    channel_count = int(channel.get("approvedChannelCount") or 0)
+    useful_role_evidence = bool(role_sources)
+    if non_lookup_refs <= 0 and profile_count <= 0:
+        activity_level = "none"
+    elif approved_count >= 3 or day_count >= 2 or channel_count >= 2 or community_count >= 3:
+        activity_level = "strong" if useful_role_evidence and (approved_count or community_count) else "recurring"
+    elif approved_count > 0:
+        activity_level = "recent"
+    elif non_lookup_refs <= 2 or profile_count:
+        activity_level = "thin"
+    else:
+        activity_level = "recent"
+
+    activity_signals: list[str] = []
+    if profile_count:
+        activity_signals.append("Local profile match exists; identity and public role still need review.")
+    if approved_count:
+        signal = "Recurring approved-channel activity found." if activity_level in {"recurring", "strong"} else "Recent approved-channel activity found."
+        activity_signals.append(signal)
+    if community_count:
+        activity_signals.append("Community presence rows support internal follow-up context.")
+    if relationship_count:
+        activity_signals.append("Relationship/history rows exist for internal context only.")
+    if broadcast_count:
+        activity_signals.append("BARCODE Radio memory references exist for show-history context.")
+    if not activity_signals:
+        activity_signals.append("No substantive activity signal found yet.")
+
+    topic_texts = list(channel.get("themeTexts") or []) + list(community.get("themeTexts") or [])
+    topic_themes = _extract_topic_themes(topic_texts, approved_activity_count=approved_count + community_count)
+    if not topic_themes:
+        topic_themes = ["unknown/no clear theme"]
+
+    engagement_use: list[str] = []
+    if approved_count or community_count:
+        engagement_use.extend(["welcome_back", "community_followup"])
+    if primary_role in {"artist", "submitter", "collaborator"}:
+        engagement_use.append("artist_followup")
+    if match_kind == "existing_dossier_update" or diagnostics.get("existingDossierUpdateLane"):
+        engagement_use.append("existing_dossier_update")
+    if relationship_count or sections.get("Possible Aliases / Connections"):
+        engagement_use.append("relationship_mapping")
+    if broadcast_count:
+        engagement_use.append("show_history_context")
+    if primary_role == "moderator":
+        engagement_use.append("moderator_context")
+    if primary_role == "unknown" and activity_level in {"none", "thin"}:
+        engagement_use.extend(["do_not_engage_publicly_yet", "archive_if_no_substance"])
+    if "dossier_review" not in engagement_use and (public_safe_count or useful_role_evidence or match_kind == "existing_dossier_update"):
+        engagement_use.append("dossier_review")
+    engagement_use = list(dict.fromkeys(engagement_use))
+
+    mostly_metadata = not useful_role_evidence and public_safe_count <= 1 and primary_role in {"unknown", "active_community_member", "viewer_listener"}
+    if match_kind == "existing_dossier_update" or diagnostics.get("existingDossierUpdateLane"):
+        dossier_use = "existing_dossier_update"
+    elif activity_level in {"none", "thin"} and mostly_metadata:
+        dossier_use = "not_ready" if primary_role == "unknown" else "source_file_only"
+    elif mostly_metadata:
+        dossier_use = "source_file_only"
+    elif public_safe_count >= 2 and useful_role_evidence:
+        dossier_use = "draftable_after_review"
+    elif public_safe_count or useful_role_evidence:
+        dossier_use = "possible_future_dossier"
+    else:
+        dossier_use = "source_file_only"
+
+    possible_connection_count = len(sections.get("Possible Aliases / Connections") or [])
+    if possible_connection_count:
+        relationship_use = "needs_owner_review" if possible_connection_count >= 2 else "possible_connections"
+    elif relationship_count:
+        relationship_use = "known_context"
+    else:
+        relationship_use = "none"
+
+    if activity_level in {"strong"} and useful_role_evidence:
+        source_confidence = "medium"
+    elif activity_level in {"recurring", "recent"} or useful_role_evidence or match_kind == "existing_dossier_update":
+        source_confidence = "low-medium"
+    else:
+        source_confidence = "low"
+
+    missing_info = []
+    if primary_role in {"unknown", "active_community_member", "viewer_listener"}:
+        missing_info.append("Confirm whether this person is an artist, submitter, collaborator, moderator, BARCODE team/entity, or community-only subject.")
+    if dossier_use in {"not_ready", "source_file_only", "possible_future_dossier"}:
+        missing_info.append("Confirm public-safe role/context before any dossier language is drafted or updated.")
+    if relationship_use != "none":
+        missing_info.append("Review possible connections through the existing owner/admin identity workflow before treating them as relationships or aliases.")
+
+    review_warnings = [
+        "Internal classification only; not public truth and not an identity merge.",
+        "Discord activity alone must not be treated as artist, submitter, moderator, sponsor, team, or collaborator proof.",
+    ]
+    if topic_themes == ["unknown/no clear theme"] and (approved_count or community_count):
+        review_warnings.append("Approved-channel activity exists, but no clear repeated topic/theme has been extracted yet.")
+    if primary_role == "supporter":
+        review_warnings.append("Supporter status must not be inferred from payment/customer data unless a future safe source explicitly provides it.")
+
+    public_safety_notes = [
+        "Do not expose raw transcripts, raw IDs, private/internal notes, or unreviewed aliases in operator-facing output.",
+        "Do not publish, auto-create dossiers, auto-confirm aliases, or mutate website content from this classification.",
+    ]
+
+    return {
+        "primaryRole": primary_role,
+        "secondaryRoles": secondary_roles,
+        "activityLevel": activity_level,
+        "activitySignals": activity_signals[:6],
+        "topicThemes": topic_themes,
+        "engagementUse": engagement_use,
+        "dossierUse": dossier_use,
+        "relationshipUse": relationship_use,
+        "sourceConfidence": source_confidence,
+        "missingInfo": missing_info[:6],
+        "reviewWarnings": review_warnings,
+        "publicSafetyNotes": public_safety_notes,
+        "roleRead": _format_role_read(primary_role, secondary_roles),
+        "activityRead": _format_activity_read(activity_level, approved_count, community_count),
+        "topicRead": _format_topic_read(topic_themes, approved_count + community_count),
+        "engagementRead": _classification_plain_list(engagement_use, ENGAGEMENT_LABELS),
+        "dossierRead": _format_dossier_read(dossier_use, primary_role),
+        "relationshipRead": RELATIONSHIP_LABELS.get(relationship_use, relationship_use),
+    }
+
+
+def _format_role_read(primary_role: str, secondary_roles: list[str]) -> str:
+    if primary_role == "active_community_member":
+        extra = "; artist status unconfirmed"
+    elif primary_role == "unknown":
+        extra = "; needs owner/admin review"
+    else:
+        extra = ""
+    secondary = f"; secondary: {_classification_plain_list(secondary_roles, ROLE_LABELS)}" if secondary_roles else ""
+    return f"{ROLE_LABELS.get(primary_role, primary_role)}{extra}{secondary}."
+
+
+def _format_activity_read(activity_level: str, approved_count: int, community_count: int) -> str:
+    if activity_level == "none":
+        return "No substantive approved activity found yet."
+    if activity_level == "thin":
+        return "Only thin review signals are present."
+    if activity_level == "recent":
+        return "Recent approved-channel activity found."
+    if activity_level == "recurring":
+        return "Recurring approved-channel activity found."
+    return "Strong activity found, with repeated activity plus useful source/role evidence."
+
+
+def _format_topic_read(topic_themes: list[str], approved_activity_count: int) -> str:
+    if topic_themes == ["unknown/no clear theme"] and approved_activity_count:
+        return "Approved-channel activity exists, but no clear repeated topic/theme has been extracted yet."
+    return _classification_plain_list(topic_themes, TOPIC_LABELS) + "."
+
+
+def _format_dossier_read(dossier_use: str, primary_role: str) -> str:
+    if dossier_use == "source_file_only":
+        return "Source File only until owner/admin confirms public-safe role."
+    if dossier_use == "not_ready":
+        return "Not ready for dossier use; keep as internal review context."
+    if dossier_use == "possible_future_dossier":
+        return "Possible future dossier review after public-safe context is confirmed."
+    if dossier_use == "existing_dossier_update":
+        return "Existing dossier update lane for owner/admin review only."
+    return "Draftable only after owner/admin review approves public-safe substance."
+
+
 _ENRICHMENT_QUERY_KEYS = {
     "alias": "alias",
     "candidateid": "candidateId",
@@ -709,6 +1032,12 @@ def collect_source_enrichment_evidence(db_path: str, guild_id: int | None, subje
     public_safe_candidates: list[str] = []
     review_only_candidates: list[str] = []
     channel_evidence_found = False
+    channel_activity_rows = 0
+    channel_activity_labels: set[str] = set()
+    channel_activity_days: set[str] = set()
+    channel_theme_texts: list[str] = []
+    community_signal_count = 0
+    community_theme_texts: list[str] = []
 
     if lookup_result:
         match_kind, match_note, sf_obj = classify_source_match(lookup_result)
@@ -848,6 +1177,16 @@ def collect_source_enrichment_evidence(db_path: str, guild_id: int | None, subje
                         review_only_candidates.append(note)
                 if matched_rows:
                     channel_evidence_found = True
+                    channel_activity_rows += len(matched_rows)
+                    for matched_row in matched_rows:
+                        label = _safe_text((matched_row["channel_name"] if "channel_name" in matched_row.keys() else "") or (matched_row["channel_policy"] if "channel_policy" in matched_row.keys() else "approved channel"), 60)
+                        if label:
+                            channel_activity_labels.add(label)
+                        ts = str(matched_row["timestamp"] if "timestamp" in matched_row.keys() else "")
+                        if ts:
+                            channel_activity_days.add(ts[:10])
+                        if "content" in matched_row.keys():
+                            channel_theme_texts.append(str(matched_row["content"] or ""))
                     source_counts["conversations_by_author"] += len(matched_rows)
                     source_types.add("conversations_by_author")
                     _append_section(sections, "Observed Patterns", _summarize_channel_activity(subject, matched_rows), limit=6)
@@ -929,6 +1268,13 @@ def collect_source_enrichment_evidence(db_path: str, guild_id: int | None, subje
                     source_types.add("community_presence")
                     _append_section(sections, "Observed Patterns", _case_community_presence(row))
                     _append_section(sections, "Known Roles / Category", _normalize_case_category(row["category"] if "category" in row.keys() else "community member", inferred=True))
+                    mention = int(row["mention_count"] if "mention_count" in row.keys() and row["mention_count"] is not None else 0)
+                    direct = int(row["direct_interaction_count"] if "direct_interaction_count" in row.keys() and row["direct_interaction_count"] is not None else 0)
+                    operator = int(row["operator_mention_count"] if "operator_mention_count" in row.keys() and row["operator_mention_count"] is not None else 0)
+                    community_signal_count += mention + direct + operator
+                    for text_col in ("connection_notes", "evidence_snippets", "category"):
+                        if text_col in row.keys() and row[text_col]:
+                            community_theme_texts.append(str(row[text_col] or ""))
                     if "connection_notes" in row.keys() and row["connection_notes"]:
                         _append_section(sections, "Possible Aliases / Connections", f"Possible community connection only; needs owner review before it is treated as an identity link: {_safe_text(row['connection_notes'], 180)}")
             _source_status(source_statuses, "community_presence", "yes" if matched else "no_match")
@@ -974,6 +1320,32 @@ def collect_source_enrichment_evidence(db_path: str, guild_id: int | None, subje
         "publicDossierMatchFound": bool(identity.get("publicDossierMatchFound")),
         "existingDossierUpdateLane": bool(identity.get("existingDossierUpdateLane")),
     }
+    classification_bundle = {
+        "sections": {name: values for name, values in sections.items() if values},
+        "sourceCounts": dict(source_counts),
+        "diagnostics": diagnostics,
+        "sourceFile": sf_obj if lookup_result else {},
+        "matchKind": match_kind,
+        "publicSafeCandidates": public_safe_candidates[:5],
+        "channelActivity": {
+            "approvedMessageCount": channel_activity_rows,
+            "approvedChannelCount": len(channel_activity_labels),
+            "approvedDayCount": len(channel_activity_days),
+            "themeTexts": channel_theme_texts[:25],
+        },
+        "communityActivity": {
+            "signalCount": community_signal_count,
+            "themeTexts": community_theme_texts[:25],
+        },
+    }
+    classification = classify_entity_activity(safe_identity, classification_bundle)
+    diagnostics.update({
+        "classificationPrimaryRole": classification["primaryRole"],
+        "classificationActivityLevel": classification["activityLevel"],
+        "classificationDossierUse": classification["dossierUse"],
+        "classificationConfidence": classification["sourceConfidence"],
+        "classificationMissingInfoCount": len(classification.get("missingInfo") or []),
+    })
     return {
         "sections": {name: values for name, values in sections.items() if values},
         "sourceCounts": dict(source_counts),
@@ -984,6 +1356,7 @@ def collect_source_enrichment_evidence(db_path: str, guild_id: int | None, subje
         "reviewOnlyCandidates": review_only_candidates[:5],
         "subjectIdentity": safe_identity,
         "diagnostics": diagnostics,
+        "classification": classification,
     }
 
 def _section_text(sections: dict[str, list[str]], name: str, *, limit: int = 4) -> str:
@@ -994,6 +1367,19 @@ def _section_text(sections: dict[str, list[str]], name: str, *, limit: int = 4) 
 def build_enrichment_markdown(packet: dict[str, Any]) -> str:
     sections = packet.get("sections") or {}
     lines: list[str] = []
+    classification = packet.get("classification") or {}
+    if classification:
+        missing = classification.get("missingInfo") or []
+        classification_lines = [
+            f"- Role read: {_safe_text(classification.get('roleRead') or ROLE_LABELS.get(classification.get('primaryRole'), 'Unknown / needs review'), 240)}",
+            f"- Activity read: {_safe_text(classification.get('activityRead') or classification.get('activityLevel') or 'unknown', 240)}",
+            f"- Topic read: {_safe_text(classification.get('topicRead') or _classification_plain_list(classification.get('topicThemes') or [], TOPIC_LABELS), 240)}",
+            f"- Engagement use: {_safe_text(classification.get('engagementRead') or _classification_plain_list(classification.get('engagementUse') or [], ENGAGEMENT_LABELS), 240)}",
+            f"- Dossier use: {_safe_text(classification.get('dossierRead') or DOSSIER_LABELS.get(classification.get('dossierUse'), 'Unknown'), 240)}",
+            f"- Relationship use: {_safe_text(classification.get('relationshipRead') or RELATIONSHIP_LABELS.get(classification.get('relationshipUse'), 'No relationship read yet'), 240)}",
+            f"- Missing info: {_safe_text('; '.join(missing) if missing else 'No additional classification gaps recorded.', 260)}",
+        ]
+        lines.append("## Internal Classification\n" + "\n".join(classification_lines))
     for name in SECTION_ORDER:
         if name in sections:
             lines.append(f"## {name}\n{_section_text(sections, name)}")
@@ -1035,6 +1421,7 @@ def build_enrichment_recommendation_payload(packet: dict[str, Any], *, environ: 
         "safetyWarnings": list(packet.get("warnings") or []),
         "sourceCoverage": dict(packet.get("sourceTypesChecked") or {}),
         "identityDiagnostics": dict(packet.get("diagnostics") or {}),
+        "internalClassification": dict(packet.get("classification") or {}),
         "visibilityLabels": ["internal_review_only", "admin_review_required"],
         "confidence": "low" if packet.get("qualityStatus") in {"too_thin", "forced_low_confidence"} else ("medium" if match_kind == "active_source_file" else "low"),
         "createdBy": "bnl",
@@ -1147,6 +1534,7 @@ def run_source_file_enrichment(
         "warnings": evidence["warnings"],
         "subjectIdentity": evidence.get("subjectIdentity") or {},
         "diagnostics": evidence.get("diagnostics") or {},
+        "classification": evidence.get("classification") or {},
         "sourceTypesChecked": (evidence.get("diagnostics") or {}).get("sourceTypesChecked", {}),
         "sourceTypesSkipped": (evidence.get("diagnostics") or {}).get("sourceTypesSkipped", {}),
         "runTime": datetime.now(timezone.utc).isoformat(),
@@ -1250,6 +1638,18 @@ def format_source_enrichment_response(result: dict[str, Any]) -> str:
             f"Channel evidence found: {'yes' if (result.get('diagnostics') or {}).get('channelEvidenceFound') else 'no'}; public dossier match found: {'yes' if (result.get('diagnostics') or {}).get('publicDossierMatchFound') else 'no'}; existing dossier update lane: {'yes' if (result.get('diagnostics') or {}).get('existingDossierUpdateLane') else 'no'}.",
             f"Warning count: {warning_text}.",
         ]
+        classification = result.get("classification") or {}
+        if classification:
+            missing = classification.get("missingInfo") or []
+            preview_lines.extend([
+                f"Role read: {_safe_text(classification.get('roleRead') or ROLE_LABELS.get(classification.get('primaryRole'), 'Unknown / needs review'), 220)}",
+                f"Activity read: {_safe_text(classification.get('activityRead') or classification.get('activityLevel') or 'unknown', 220)}",
+                f"Topic read: {_safe_text(classification.get('topicRead') or _classification_plain_list(classification.get('topicThemes') or [], TOPIC_LABELS), 220)}",
+                f"Engagement use: {_safe_text(classification.get('engagementRead') or _classification_plain_list(classification.get('engagementUse') or [], ENGAGEMENT_LABELS), 220)}",
+                f"Dossier use: {_safe_text(classification.get('dossierRead') or DOSSIER_LABELS.get(classification.get('dossierUse'), 'Unknown'), 220)}",
+                f"Relationship use: {_safe_text(classification.get('relationshipRead') or RELATIONSHIP_LABELS.get(classification.get('relationshipUse'), 'No relationship read yet'), 220)}",
+                f"Missing info: {_safe_text('; '.join(missing) if missing else 'No additional classification gaps recorded.', 260)}",
+            ])
         bullets = result.get("previewBullets") or build_preview_bullets(result)
         if bullets:
             preview_lines.append("Useful preview bullets:")

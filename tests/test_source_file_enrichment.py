@@ -441,6 +441,63 @@ class SourceFileEnrichmentTests(unittest.TestCase):
         self.assertEqual(calls[-1]["confidence"], "low")
         self.assertIn("Forced low-confidence", enrich.format_source_enrichment_response(forced))
 
+
+    def test_profile_only_classification_unknown_needs_review(self):
+        c = self.conn.cursor()
+        c.execute("INSERT INTO user_profiles VALUES (10,1,'Profile Only','Profile Only',NULL,NULL)")
+        self.conn.commit()
+        result = enrich.run_source_file_enrichment(self.db, 1, "Profile Only", dry_run=True, lookup_func=self._lookup("active"))
+        classification = result["classification"]
+        self.assertEqual(classification["primaryRole"], "unknown")
+        self.assertIn(classification["activityLevel"], {"thin", "none"})
+        self.assertIn(classification["dossierUse"], {"not_ready", "source_file_only"})
+        self.assertIn("needs owner/admin review", classification["roleRead"])
+
+    def test_backfilled_activity_classifies_active_recurring_without_artist_overclaim(self):
+        c = self.conn.cursor()
+        c.execute("INSERT INTO user_profiles VALUES (10,1,'HellcatNZ','HellcatNZ',NULL,NULL)")
+        c.execute("INSERT INTO conversations VALUES (NULL,10,'HellcatNZ',1,'hellcat-nz','public_selective','user','just hanging in community chat','2026-05-29T01:00:00+00:00')")
+        c.execute("INSERT INTO conversations VALUES (NULL,10,'HellcatNZ',1,'hellcat-nz','public_selective','user','more community chat, not a submission claim','2026-05-30T01:00:00+00:00')")
+        c.execute("INSERT INTO conversations VALUES (NULL,10,'HellcatNZ',1,'hellcat-nz','public_selective','user','community chat with no artist proof','2026-05-30T02:00:00+00:00')")
+        self.conn.commit()
+        result = enrich.run_source_file_enrichment(self.db, 1, "HellcatNZ", dry_run=True, lookup_func=self._lookup("active"))
+        classification = result["classification"]
+        self.assertEqual(classification["primaryRole"], "active_community_member")
+        self.assertEqual(classification["activityLevel"], "recurring")
+        self.assertNotIn("artist", [classification["primaryRole"]] + classification["secondaryRoles"])
+        self.assertEqual(classification["dossierUse"], "source_file_only")
+        response = enrich.format_source_enrichment_response(result)
+        self.assertIn("Role read: Active community member; artist status unconfirmed", response)
+        self.assertIn("Activity read: Recurring approved-channel activity found", response)
+        self.assertIn("Dossier use: Source File only", response)
+        self.assertIn("## Internal Classification", result["payload"]["evidenceSummary"])
+        self.assertIn("Role read: Active community member", result["payload"]["evidenceSummary"])
+        self.assertNotIn("just hanging", response)
+
+    def test_submitter_moderator_team_entity_and_sponsor_require_source_evidence(self):
+        chatter = enrich.classify_entity_activity({}, {"sourceCounts": {"conversations_by_author": 3}, "channelActivity": {"approvedMessageCount": 3, "approvedDayCount": 2, "themeTexts": ["I am an artist mod sponsor in chat"]}})
+        self.assertEqual(chatter["primaryRole"], "active_community_member")
+        self.assertNotIn("artist", [chatter["primaryRole"]] + chatter["secondaryRoles"])
+        supported = enrich.classify_entity_activity({}, {"sourceCounts": {"source_file_lookup": 1}, "sourceFile": {"summary": "BARCODE team moderator and lore entity sponsor; submitted a track as an artist collaborator."}, "sections": {"Public-Safe Notes": ["Owner-safe context confirms public role."]}})
+        roles = [supported["primaryRole"]] + supported["secondaryRoles"]
+        for role in ("sponsor", "barcode_team", "moderator", "barcode_entity", "submitter", "artist", "collaborator"):
+            self.assertIn(role, roles)
+        self.assertIn(supported["dossierUse"], {"possible_future_dossier", "draftable_after_review"})
+
+    def test_existing_dossier_and_relationship_classification_stays_cautious(self):
+        result = enrich.classify_entity_activity(
+            {"existingDossierUpdateLane": True},
+            {"matchKind": "existing_dossier_update", "sourceCounts": {"relationship_state": 1}, "diagnostics": {"existingDossierUpdateLane": True}, "sections": {"Possible Aliases / Connections": ["possible connection only"]}},
+        )
+        self.assertEqual(result["dossierUse"], "existing_dossier_update")
+        self.assertIn(result["relationshipUse"], {"possible_connections", "needs_owner_review"})
+        self.assertNotIn("confirmed", result["relationshipRead"].lower())
+
+    def test_topic_extraction_labels_without_raw_transcript_quotes(self):
+        result = enrich.classify_entity_activity({}, {"sourceCounts": {"conversations_by_author": 2}, "channelActivity": {"approvedMessageCount": 2, "themeTexts": ["working on the mix and master", "new mix needs production help"]}})
+        self.assertIn("production", result["topicThemes"])
+        self.assertNotIn("working on the mix", json.dumps(result))
+
     def test_payload_keeps_machine_metadata(self):
         result = enrich.run_source_file_enrichment(self.db, 1, "HellcatNZ", dry_run=True, lookup_func=self._lookup("active"))
         payload = result["payload"]
@@ -534,6 +591,40 @@ class SourceFileEnrichmentBotTests(unittest.TestCase):
         self.assertIn("source_enrichment_last_quality_status", diag)
         self.assertIn("source_enrichment_last_suppressed_reason", diag)
         self.assertIn("source_enrichment_last_preview_bullets_count", diag)
+
+    def test_classification_diagnostics_update_from_source_enrichment(self):
+        bnl01_bot.BNL_OWNER_USER_ID = 999
+        message = self.Message(user_id=999)
+        fake = {
+            "ok": True,
+            "dryRun": True,
+            "subject": "HellcatNZ",
+            "status": "dry_run",
+            "matchKind": "active_source_file",
+            "sections": {"Subject Overview": ["x"]},
+            "sourceCounts": {"source_file_lookup": 1, "conversations_by_author": 3},
+            "warningCounts": {},
+            "sourceTypes": ["source_file_lookup", "conversations_by_author"],
+            "warnings": [],
+            "classification": {
+                "primaryRole": "active_community_member",
+                "activityLevel": "recurring",
+                "dossierUse": "source_file_only",
+                "sourceConfidence": "low-medium",
+                "missingInfo": ["confirm public role"],
+            },
+        }
+        with mock.patch.object(bnl01_bot, "run_source_file_enrichment", return_value=fake):
+            handled = asyncio.run(bnl01_bot.maybe_handle_source_file_enrichment_command(message, "!bnl source enrich HellcatNZ | dry_run=true"))
+        self.assertTrue(handled)
+        diag = bnl01_bot.build_dossier_recommendation_diagnostics(1)
+        self.assertTrue(diag["classification_available"])
+        self.assertEqual(diag["classification_last_subject"], "HellcatNZ")
+        self.assertEqual(diag["classification_last_primary_role"], "active_community_member")
+        self.assertEqual(diag["classification_last_activity_level"], "recurring")
+        self.assertEqual(diag["classification_last_dossier_use"], "source_file_only")
+        self.assertEqual(diag["classification_last_confidence"], "low-medium")
+        self.assertEqual(diag["classification_last_missing_info_count"], 1)
 
 
 if __name__ == "__main__":
