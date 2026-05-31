@@ -80,6 +80,7 @@ from bnl_source_file_enrichment import (
     source_enrichment_ingest_source,
 )
 from collections import Counter, defaultdict, deque
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
 import pytz
@@ -175,6 +176,109 @@ GREETING_CHANCE = 0.35
 
 # ======== PASSIVE REACTION CONFIG ========
 REACTION_CHANCE = 0.24
+
+
+# ==================== ROUTE / MODE GOVERNANCE ====================
+# Conversation routing audit map (v1 hardening):
+# - on_message is the primary plain-text entry point. It resolves channel policy first,
+#   then handles explicit operator commands before any normal chat path: channel audit,
+#   approved backfill, source enrichment, source lookup, source bridge/dossier recommendation.
+# - Passive capture/community scouting run only after command handling and before chat reply,
+#   with policy gates so protected/internal/unknown lanes do not become public memory.
+# - Active/sealed-test and mention/reply routes share normal prompt helpers; those helpers
+#   therefore accept route_mode and must not import source/scouting/internal context unless
+#   the selected mode contract permits it.
+# - Slash commands remain separate @tree handlers below and are treated as operator_command
+#   or protected_system behavior by their own Discord permission checks.
+
+ROUTE_MODE_NORMAL_CHAT = "normal_chat"
+ROUTE_MODE_SIMPLE_GREETING = "simple_greeting"
+ROUTE_MODE_SHOW_STATUS = "show_status_answer"
+ROUTE_MODE_DIRECT_PAYLOAD = "direct_payload_task"
+ROUTE_MODE_OPERATOR_COMMAND = "operator_command"
+ROUTE_MODE_SOURCE_ENRICHMENT = "source_file_enrichment"
+ROUTE_MODE_SOURCE_LOOKUP = "source_file_lookup"
+ROUTE_MODE_COMMUNITY_SCOUTING = "community_scouting_internal"
+ROUTE_MODE_DOSSIER_RECOMMENDATION = "dossier_recommendation"
+ROUTE_MODE_APPROVED_BACKFILL = "approved_backfill"
+ROUTE_MODE_INTERNAL_OPS = "internal_ops"
+ROUTE_MODE_BROADCAST_MEMORY = "broadcast_memory_intake"
+ROUTE_MODE_RELAY = "relay_generation"
+ROUTE_MODE_AMBIENT = "ambient_generation"
+ROUTE_MODE_PROTECTED_WELCOME = "protected_welcome"
+ROUTE_MODE_PROTECTED_EPISODE_TRACKER = "protected_episode_tracker"
+
+PUBLIC_CHAT_POLICIES = {"public_home", "public_context", "public_selective"}
+CONVERSATIONAL_POLICIES = PUBLIC_CHAT_POLICIES | {"sealed_test"}
+SOURCE_INTERNAL_MODES = {
+    ROUTE_MODE_SOURCE_ENRICHMENT,
+    ROUTE_MODE_SOURCE_LOOKUP,
+    ROUTE_MODE_COMMUNITY_SCOUTING,
+    ROUTE_MODE_DOSSIER_RECOMMENDATION,
+    ROUTE_MODE_APPROVED_BACKFILL,
+    ROUTE_MODE_INTERNAL_OPS,
+    ROUTE_MODE_OPERATOR_COMMAND,
+}
+
+
+@dataclass(frozen=True)
+class RouteModeContract:
+    mode: str
+    allowed_channel_policies: frozenset[str]
+    allowed_context_sources: frozenset[str]
+    allowed_memory_sources: frozenset[str]
+    save_behavior: str
+    durable_memory_behavior: str
+    subject_extraction_behavior: str
+    response_boundary: str
+
+
+@dataclass(frozen=True)
+class MemoryWriteDecision:
+    save_conversation: bool
+    update_profile: bool
+    update_habits: bool
+    update_relationship: bool
+    write_memory_tier: bool
+    record_community_presence: bool
+    reason: str
+    visibility: str
+
+
+ROUTE_MODE_CONTRACTS = {
+    ROUTE_MODE_NORMAL_CHAT: RouteModeContract(ROUTE_MODE_NORMAL_CHAT, frozenset(CONVERSATIONAL_POLICIES), frozenset({"room", "public_safe_memory", "show_status_public"}), frozenset({"source_safe_public"}), "save_rows_when_policy_known", "user_value_gated_public_only", "disabled_for_casual_questions", "public_safe"),
+    ROUTE_MODE_SIMPLE_GREETING: RouteModeContract(ROUTE_MODE_SIMPLE_GREETING, frozenset(CONVERSATIONAL_POLICIES), frozenset({"display_name"}), frozenset(), "save_row_only", "disabled", "disabled", "public_safe_short"),
+    ROUTE_MODE_SHOW_STATUS: RouteModeContract(ROUTE_MODE_SHOW_STATUS, frozenset(CONVERSATIONAL_POLICIES | {"internal_controlled"}), frozenset({"show_status_public", "room", "public_safe_memory"}), frozenset({"source_safe_public"}), "save_rows_when_policy_known", "disabled_by_default", "disabled", "plain_status_no_fake_evidence"),
+    ROUTE_MODE_DIRECT_PAYLOAD: RouteModeContract(ROUTE_MODE_DIRECT_PAYLOAD, frozenset(CONVERSATIONAL_POLICIES | {"internal_controlled", "unknown"}), frozenset({"payload", "room", "public_safe_memory"}), frozenset({"source_safe_public"}), "save_rows_when_policy_known", "disabled_by_default", "payload_items_only", "task_response"),
+    ROUTE_MODE_SOURCE_ENRICHMENT: RouteModeContract(ROUTE_MODE_SOURCE_ENRICHMENT, frozenset({"sealed_test", "internal_controlled"}), frozenset({"source_files", "classification", "community_presence"}), frozenset(), "operator_audit_only", "disabled", "explicit_subject_only", "internal_technical_allowed"),
+    ROUTE_MODE_SOURCE_LOOKUP: RouteModeContract(ROUTE_MODE_SOURCE_LOOKUP, frozenset({"sealed_test", "internal_controlled"}), frozenset({"source_files"}), frozenset(), "operator_audit_only", "disabled", "explicit_subject_only", "internal_technical_allowed"),
+    ROUTE_MODE_COMMUNITY_SCOUTING: RouteModeContract(ROUTE_MODE_COMMUNITY_SCOUTING, frozenset({"public_home", "public_context", "public_selective"}), frozenset({"approved_public_presence"}), frozenset(), "presence_only", "disabled", "approved_internal_only", "internal_only"),
+    ROUTE_MODE_DOSSIER_RECOMMENDATION: RouteModeContract(ROUTE_MODE_DOSSIER_RECOMMENDATION, frozenset({"sealed_test", "internal_controlled"}), frozenset({"source_files", "recommendation_packet"}), frozenset(), "operator_audit_only", "disabled", "explicit_subject_only", "internal_technical_allowed"),
+    ROUTE_MODE_APPROVED_BACKFILL: RouteModeContract(ROUTE_MODE_APPROVED_BACKFILL, frozenset({"sealed_test", "internal_controlled"}), frozenset({"approved_channel_history"}), frozenset(), "operator_audit_only", "disabled", "approved_internal_only", "internal_technical_allowed"),
+    ROUTE_MODE_OPERATOR_COMMAND: RouteModeContract(ROUTE_MODE_OPERATOR_COMMAND, frozenset({"sealed_test", "internal_controlled", "broadcast_memory"}), frozenset({"ops"}), frozenset(), "operator_audit_only", "disabled", "explicit_only", "internal_safe"),
+    ROUTE_MODE_INTERNAL_OPS: RouteModeContract(ROUTE_MODE_INTERNAL_OPS, frozenset({"internal_controlled", "sealed_test"}), frozenset({"ops"}), frozenset(), "operator_audit_only", "disabled", "explicit_only", "internal_safe"),
+    ROUTE_MODE_BROADCAST_MEMORY: RouteModeContract(ROUTE_MODE_BROADCAST_MEMORY, frozenset({"broadcast_memory"}), frozenset({"broadcast_memory"}), frozenset(), "broadcast_memory_table", "broadcast_only", "episode_topic_only", "internal_intake"),
+    ROUTE_MODE_RELAY: RouteModeContract(ROUTE_MODE_RELAY, frozenset({"public_home", "public_context"}), frozenset({"public_show_state"}), frozenset(), "relay_log_only", "disabled", "disabled", "public_facing"),
+    ROUTE_MODE_AMBIENT: RouteModeContract(ROUTE_MODE_AMBIENT, frozenset({"public_home", "public_context"}), frozenset({"public_show_state"}), frozenset(), "ambient_log_only", "disabled", "disabled", "public_facing"),
+    ROUTE_MODE_PROTECTED_WELCOME: RouteModeContract(ROUTE_MODE_PROTECTED_WELCOME, frozenset({"protected_system"}), frozenset({"join_event"}), frozenset(), "protected_existing_behavior", "disabled", "disabled", "protected_system"),
+    ROUTE_MODE_PROTECTED_EPISODE_TRACKER: RouteModeContract(ROUTE_MODE_PROTECTED_EPISODE_TRACKER, frozenset({"protected_system"}), frozenset({"episode_tracker"}), frozenset(), "protected_existing_behavior", "disabled", "disabled", "protected_system"),
+}
+
+CHANNEL_POLICY_CONTRACTS = {
+    "public_home": {"reply_without_direct": True, "reply_when_mentioned": True, "passive_save": True, "profile": True, "habits": True, "relationship": True, "memory_tiers": True, "presence": True, "subject_signals": False, "public_context": True, "internal_context": True},
+    "public_context": {"reply_without_direct": False, "reply_when_mentioned": True, "passive_save": True, "profile": True, "habits": True, "relationship": True, "memory_tiers": True, "presence": True, "subject_signals": False, "public_context": True, "internal_context": True},
+    "public_selective": {"reply_without_direct": False, "reply_when_mentioned": True, "passive_save": True, "profile": True, "habits": True, "relationship": True, "memory_tiers": False, "presence": True, "subject_signals": False, "public_context": "selective", "internal_context": True},
+    "sealed_test": {"reply_without_direct": True, "reply_when_mentioned": True, "passive_save": True, "profile": False, "habits": False, "relationship": False, "memory_tiers": False, "presence": False, "subject_signals": False, "public_context": False, "internal_context": True},
+    "internal_controlled": {"reply_without_direct": False, "reply_when_mentioned": True, "passive_save": False, "profile": False, "habits": False, "relationship": False, "memory_tiers": False, "presence": False, "subject_signals": True, "public_context": False, "internal_context": True},
+    "reference_canon": {"reply_without_direct": False, "reply_when_mentioned": False, "passive_save": False, "profile": False, "habits": False, "relationship": False, "memory_tiers": False, "presence": False, "subject_signals": False, "public_context": False, "internal_context": True},
+    "protected_system": {"reply_without_direct": False, "reply_when_mentioned": False, "passive_save": False, "profile": False, "habits": False, "relationship": False, "memory_tiers": False, "presence": False, "subject_signals": False, "public_context": False, "internal_context": False},
+    "broadcast_memory": {"reply_without_direct": False, "reply_when_mentioned": True, "passive_save": False, "profile": False, "habits": False, "relationship": False, "memory_tiers": False, "presence": False, "subject_signals": False, "public_context": False, "internal_context": True},
+    "ai_image_tool": {"reply_without_direct": False, "reply_when_mentioned": False, "passive_save": False, "profile": False, "habits": False, "relationship": False, "memory_tiers": False, "presence": False, "subject_signals": False, "public_context": False, "internal_context": False},
+    "unknown": {"reply_without_direct": False, "reply_when_mentioned": True, "passive_save": False, "profile": False, "habits": False, "relationship": False, "memory_tiers": False, "presence": False, "subject_signals": False, "public_context": False, "internal_context": False},
+}
+
+LAST_ROUTE_DEBUG = {}
+
 
 BNL_REACTIONS_BASE = ["👁️", "📡", "⚙️", "🧠", "🛰️", "🔍", "💾", "📊", "🖥️", "📼", "🧬", "📶"]
 BNL_REACTIONS_BROADCAST = ["📻", "🎚️", "🎛️", "🔊", "🎤", "📡", "📼"]
@@ -3876,17 +3980,15 @@ def maybe_add_memory_trace(
     role: str,
     source=None,
     channel_name: str = "",
+    route_mode: str = ROUTE_MODE_NORMAL_CHAT,
 ):
-    policy = (channel_policy or "").strip().lower()
+    policy = (channel_policy or "").strip().lower() or "unknown"
     normalized_role = (role or "").strip().lower()
-    if policy not in {"public_home", "public_context"}:
+    decision = decide_memory_write_policy(route_mode, policy, normalized_role, content, normalized_role == "model")
+    if not decision.write_memory_tier:
         return
-    if normalized_role == "model":
-        return
-    if not is_meaningful_memory_candidate(content, normalized_role):
-        return
-    source_trust = "source_safe_public" if (policy in {"public_home", "public_context"} and normalized_role == "user") else "legacy_unknown"
-    add_short_memory_trace(user_id, guild_id, content, source_role=normalized_role or "legacy_unknown", source_channel_policy=policy or "legacy_unknown", source_channel_name=channel_name or "", source_origin="conversation", source_trust=source_trust)
+    source_trust = "source_safe_public"
+    add_short_memory_trace(user_id, guild_id, content, source_role=normalized_role or "legacy_unknown", source_channel_policy=policy or "legacy_unknown", source_channel_name=channel_name or "", source_origin=source or "conversation", source_trust=source_trust)
 
 def get_memory_tiers(user_id: int, guild_id: int):
     conn = sqlite3.connect(DB_FILE)
@@ -4709,6 +4811,206 @@ def allow_passive_memory_for_policy(policy: str) -> bool:
     return policy in {"public_home", "public_context", "public_selective", "sealed_test"}
 
 
+
+
+
+def classify_route_mode(clean_content: str, channel_policy: str = "unknown", *, real_direct_target: bool = False, active_channel: bool = False, payload_expected: bool = False, show_state: bool = False) -> str:
+    """Classify a message into the highest-level route/mode before prompt or memory work."""
+    text = (clean_content or "").strip()
+    lower = text.lower()
+    if parse_source_enrichment_command(text)[0]:
+        return ROUTE_MODE_SOURCE_ENRICHMENT
+    if parse_source_file_lookup_command(text)[0]:
+        return ROUTE_MODE_SOURCE_LOOKUP
+    if parse_source_knowledge_bridge_command(text)[0] or parse_manual_dossier_recommendation_command(text)[0]:
+        return ROUTE_MODE_DOSSIER_RECOMMENDATION
+    if parse_backfill_options(text)[0]:
+        return ROUTE_MODE_APPROVED_BACKFILL
+    if lower.startswith("!bnl audit channels") or lower.startswith("!bnl debug"):
+        return ROUTE_MODE_OPERATOR_COMMAND
+    if (channel_policy or "").strip().lower() == "broadcast_memory":
+        return ROUTE_MODE_BROADCAST_MEMORY
+    if payload_expected:
+        return ROUTE_MODE_DIRECT_PAYLOAD
+    if show_state:
+        return ROUTE_MODE_SHOW_STATUS
+    if is_simple_greeting_to_bnl(text):
+        return ROUTE_MODE_SIMPLE_GREETING
+    if real_direct_target or active_channel:
+        return ROUTE_MODE_NORMAL_CHAT
+    return ROUTE_MODE_NORMAL_CHAT
+
+
+def get_route_mode_contract(route_mode: str) -> RouteModeContract:
+    return ROUTE_MODE_CONTRACTS.get(route_mode or ROUTE_MODE_NORMAL_CHAT, ROUTE_MODE_CONTRACTS[ROUTE_MODE_NORMAL_CHAT])
+
+
+def is_simple_greeting_to_bnl(text: str) -> bool:
+    """Detect short greetings that must not inherit stale analytical context."""
+    raw = (text or "").strip()
+    if not raw or len(raw) > 80:
+        return False
+    cleaned = re.sub(r"<@!?\d+>", " bnl ", raw, flags=re.I)
+    cleaned = re.sub(r"[^a-z0-9?\s'-]", " ", cleaned.lower())
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    if cleaned in {"bnl", "bnl?", "bnl 01", "bnl 01?", "barcode bot", "barcode bot?"}:
+        return True
+    bot_name = r"(?:bnl|bnl-01|bnl 01|barcode bot)"
+    greeting = r"(?:hi|hey|yo|hello|hiya|howdy|good morning|good afternoon|good evening)"
+    patterns = [
+        rf"^{greeting}\s+{bot_name}\??$",
+        rf"^{bot_name}\s+{greeting}\??$",
+        rf"^{greeting}\s+there\s+{bot_name}\??$",
+    ]
+    return any(re.match(pattern, cleaned, flags=re.I) for pattern in patterns)
+
+
+def is_valid_subject_candidate_for_memory_or_scouting(text: str, mode: str, channel_policy: str) -> bool:
+    """Reject casual questions/jokes as entity subjects unless an explicit source/scouting mode requested them."""
+    candidate = (text or "").strip().strip('"“”')
+    if not candidate:
+        return False
+    normalized_mode = mode or ROUTE_MODE_NORMAL_CHAT
+    policy = (channel_policy or "unknown").strip().lower()
+    if normalized_mode not in SOURCE_INTERNAL_MODES and normalized_mode != ROUTE_MODE_COMMUNITY_SCOUTING:
+        return False
+    if policy not in {"internal_controlled", "sealed_test", "public_home", "public_context", "public_selective"}:
+        return False
+    lower = candidate.lower()
+    if candidate.endswith("?"):
+        return False
+    if re.search(r"\b(?:is|are|was|were|do|does|did|can|could|would|should|what|when|where|why|how)\b.+\?", lower):
+        return False
+    if re.search(r"\bis\s+barcode\s+back\s+this\s+week\b", lower):
+        return False
+    if len(candidate.split()) > 6:
+        return False
+    if re.search(r"\b(?:joke|like|songs? are about|baking|another dimension|this week)\b", lower):
+        return False
+    return True
+
+
+def decide_memory_write_policy(route_mode: str, channel_policy: str, author_role: str, content: str, is_model_reply: bool) -> MemoryWriteDecision:
+    """Central memory-save gate. Conversation rows are allowed more often than durable memory."""
+    mode = route_mode or ROUTE_MODE_NORMAL_CHAT
+    policy = (channel_policy or "unknown").strip().lower() or "unknown"
+    role = (author_role or ("model" if is_model_reply else "user")).strip().lower()
+    visibility = context_visibility_for_policy(policy)
+    text = (content or "").strip()
+    if not text:
+        return MemoryWriteDecision(False, False, False, False, False, False, "empty_content", visibility)
+    if policy == "unknown":
+        logging.warning("memory_write_policy_missing_channel_metadata route_mode=%s role=%s", mode, role)
+        return MemoryWriteDecision(True, False, False, False, False, False, "unknown_policy_conversation_row_only", visibility)
+    if not CHANNEL_POLICY_CONTRACTS.get(policy, CHANNEL_POLICY_CONTRACTS["unknown"]).get("passive_save", False) and mode == ROUTE_MODE_NORMAL_CHAT and not is_model_reply:
+        return MemoryWriteDecision(True, False, False, False, False, False, f"{policy}_conversation_row_only", visibility)
+    if policy in {"sealed_test", "internal_controlled", "broadcast_memory", "protected_system", "reference_canon", "ai_image_tool"}:
+        return MemoryWriteDecision(True, False, False, False, False, False, f"{policy}_no_normal_durable_memory", visibility)
+    if mode in SOURCE_INTERNAL_MODES or mode in {ROUTE_MODE_DIRECT_PAYLOAD, ROUTE_MODE_SIMPLE_GREETING, ROUTE_MODE_RELAY, ROUTE_MODE_AMBIENT}:
+        return MemoryWriteDecision(True, policy in PUBLIC_CHAT_POLICIES and not is_model_reply, False, False, False, False, f"{mode}_durable_memory_disabled", visibility)
+    profile_ok = policy in PUBLIC_CHAT_POLICIES and not is_model_reply
+    habits_ok = profile_ok and mode in {ROUTE_MODE_NORMAL_CHAT, ROUTE_MODE_SHOW_STATUS}
+    relationship_ok = policy in PUBLIC_CHAT_POLICIES and mode in {ROUTE_MODE_NORMAL_CHAT, ROUTE_MODE_SHOW_STATUS}
+    quality_ok = (not is_model_reply) and is_meaningful_memory_candidate(text, role) and len(text.split()) >= 5 and not text.endswith("?")
+    if re.search(r"\b(?:lol|lmao|haha|hi|hey|yo|hello|thanks|thank you)\b", text.lower()) and len(text.split()) <= 8:
+        quality_ok = False
+    tier_ok = policy in {"public_home", "public_context"} and mode == ROUTE_MODE_NORMAL_CHAT and quality_ok
+    presence_ok = CHANNEL_POLICY_CONTRACTS.get(policy, {}).get("presence", False) and not is_model_reply
+    reason = "durable_memory_allowed" if tier_ok else "conversation_saved_durable_memory_skipped"
+    return MemoryWriteDecision(True, profile_ok, habits_ok, relationship_ok, tier_ok, presence_ok, reason, visibility)
+
+
+def _memory_decision_for_legacy_call(channel_policy: str, role: str, content: str, route_mode: str | None = None) -> MemoryWriteDecision:
+    mode = route_mode or ROUTE_MODE_NORMAL_CHAT
+    return decide_memory_write_policy(mode, channel_policy, role, content, (role or "").lower() == "model")
+
+
+SCRIPTED_MODE_LEAK_PATTERNS = [
+    r"records are thin", r"suspicious blinking light", r"preliminary analysis",
+    r"compromised broadcast loop", r"data stream", r"archival query",
+    r"source coverage", r"classification", r"existing dossier update",
+    r"\bcandidate\b", r"^[^\n:]{1,80}:\s*records are thin",
+]
+
+
+def detect_scripted_mode_leak(text: str, route_mode: str) -> bool:
+    if route_mode not in {ROUTE_MODE_NORMAL_CHAT, ROUTE_MODE_SIMPLE_GREETING, ROUTE_MODE_SHOW_STATUS}:
+        return False
+    lowered = (text or "").lower()
+    return any(re.search(pattern, lowered, flags=re.I | re.M) for pattern in SCRIPTED_MODE_LEAK_PATTERNS)
+
+
+def safe_fallback_response_for_mode_leak(user_name: str = "") -> str:
+    name = (user_name or "").strip()
+    if name:
+        return f"Hey {name}. I’m here — ask me that normally and I’ll keep it conversational."
+    return "I’m here. Ask me that normally and I’ll keep it conversational."
+
+
+def apply_response_mode_contamination_guard(response: str, route_mode: str, user_name: str = "") -> tuple[str, bool]:
+    if not detect_scripted_mode_leak(response, route_mode):
+        return response, False
+    logging.warning("scripted_mode_leak_guard_triggered=1 route_mode=%s", route_mode)
+    return safe_fallback_response_for_mode_leak(user_name), True
+
+
+def build_simple_greeting_response(user_name: str = "") -> str:
+    name = (user_name or "").strip() or "there"
+    return f"Hey {name}. I’m here."
+
+
+def update_last_route_debug(**kwargs) -> None:
+    LAST_ROUTE_DEBUG.clear()
+    LAST_ROUTE_DEBUG.update({k: v for k, v in kwargs.items() if k != "raw_content"})
+
+
+def format_last_route_debug() -> str:
+    if not LAST_ROUTE_DEBUG:
+        return "No route debug data recorded yet."
+    ordered = [
+        ("route_mode", "last route mode"),
+        ("channel_policy", "last channel policy"),
+        ("memory_context_injected", "memory injected"),
+        ("durable_memory_write", "durable memory written"),
+        ("source_analysis_context_injected", "source/scouting/classification context injected"),
+        ("subject_extraction_ran", "subject extraction ran"),
+        ("scripted_mode_leak_guard_triggered", "leak guard fired"),
+        ("regenerated_for_mode_leak", "regeneration happened"),
+        ("save_policy_reason", "save policy reason"),
+    ]
+    lines = ["**BNL route debug (last conversational reply)**"]
+    for key, label in ordered:
+        lines.append(f"- {label}: `{LAST_ROUTE_DEBUG.get(key, 'unknown')}`")
+    return "\n".join(lines)
+
+
+async def maybe_handle_debug_last_route_command(message: discord.Message, clean_content: str) -> bool:
+    if not re.match(r"^!bnl\s+debug\s+last\s+route\s*$", (clean_content or "").strip(), flags=re.I):
+        return False
+    member = message.author if isinstance(message.author, discord.Member) else message.guild.get_member(message.author.id)
+    if not (is_owner_operator(message.author) or has_mod_role(member) or is_privileged_member(member, message.guild)):
+        await message.reply("Route debug is operator-only.")
+        return True
+    await message.reply(format_last_route_debug())
+    return True
+
+
+def normal_chat_prompt_contract(route_mode: str) -> str:
+    if route_mode == ROUTE_MODE_SIMPLE_GREETING:
+        return (
+            "Mode contract: simple_greeting. Reply with one short natural greeting. "
+            "Do not continue prior topics, analyze sources, mention archives, data streams, dossiers, classification, or evidence.\n"
+        )
+    if route_mode == ROUTE_MODE_SHOW_STATUS:
+        return (
+            "Mode contract: show_status_answer. Answer show/status questions plainly from provided show-state context only. "
+            "If status is unknown, say that plainly. Do not frame the user's wording as a subject/entity and do not invent evidence.\n"
+        )
+    return (
+        "Mode contract: normal_chat. Answer the user's actual message conversationally using only public-safe context. "
+        "Do not classify the user's phrasing as a subject/entity. Do not mention dossiers, source files, classification, candidates, source coverage, archive queries, or scouting unless explicitly asked. "
+        "Do not invent evidence or use scripted evidence-register phrasing.\n"
+    )
 
 def _is_text_like_channel(channel) -> bool:
     """Return True for guild channels that can carry normal text messages."""
@@ -6925,7 +7227,11 @@ def is_active_channel_quiet(guild_id: int, minutes: int = 15) -> bool:
     conn.close()
     return int(row[0] if row else 0) == 0
 
-def save_user_message(user_id: int, user_name: str, guild_id: int, content: str, channel_name: str = "", channel_policy: str = "unknown", channel_id: int = 0, message_id: int | None = None):
+def save_user_message(user_id: int, user_name: str, guild_id: int, content: str, channel_name: str = "", channel_policy: str = "unknown", channel_id: int = 0, message_id: int | None = None, route_mode: str = ROUTE_MODE_NORMAL_CHAT):
+    decision = decide_memory_write_policy(route_mode, channel_policy, "user", content, False)
+    if not decision.save_conversation:
+        logging.info("memory_write_policy_skip_conversation role=user route_mode=%s reason=%s", route_mode, decision.reason)
+        return decision
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
     has_message_id = "message_id" in _conversations_columns()
@@ -6942,8 +7248,10 @@ def save_user_message(user_id: int, user_name: str, guild_id: int, content: str,
     conn.commit()
     conn.close()
     prune_conversation_history(user_id, guild_id, MAX_CONVERSATION_ROWS_PER_USER)
-    update_relationship_state(user_id, guild_id, content, delta_affinity=0.06)
-    update_user_habits(user_id, guild_id, content)
+    if decision.update_relationship:
+        update_relationship_state(user_id, guild_id, content, delta_affinity=0.06)
+    if decision.update_habits:
+        update_user_habits(user_id, guild_id, content)
     maybe_add_memory_trace(
         user_id,
         guild_id,
@@ -6952,14 +7260,21 @@ def save_user_message(user_id: int, user_name: str, guild_id: int, content: str,
         role="user",
         source="conversations",
         channel_name=channel_name,
+        route_mode=route_mode,
     )
-    for key, value, conf in extract_user_facts(content):
-        upsert_user_fact(user_id, guild_id, key, value, conf)
+    if decision.update_profile:
+        for key, value, conf in extract_user_facts(content):
+            upsert_user_fact(user_id, guild_id, key, value, conf)
 
-    if any(k in (content or "").lower() for k in ("help", "issue", "stuck", "fix", "error", "problem")):
+    if decision.update_relationship and any(k in (content or "").lower() for k in ("help", "issue", "stuck", "fix", "error", "problem")):
         add_relationship_journal(user_id, guild_id, "help_signal", f"User asked for help: {(content or '')[:160]}")
+    return decision
 
-def save_model_message(user_id: int, guild_id: int, content: str, channel_name: str = "", channel_policy: str = "unknown", channel_id: int = 0):
+def save_model_message(user_id: int, guild_id: int, content: str, channel_name: str = "", channel_policy: str = "unknown", channel_id: int = 0, route_mode: str = ROUTE_MODE_NORMAL_CHAT):
+    decision = decide_memory_write_policy(route_mode, channel_policy, "model", content, True)
+    if not decision.save_conversation:
+        logging.info("memory_write_policy_skip_conversation role=model route_mode=%s reason=%s", route_mode, decision.reason)
+        return decision
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
     cursor.execute(
@@ -6969,7 +7284,8 @@ def save_model_message(user_id: int, guild_id: int, content: str, channel_name: 
     conn.commit()
     conn.close()
     prune_conversation_history(user_id, guild_id, MAX_CONVERSATION_ROWS_PER_USER)
-    update_relationship_state(user_id, guild_id, content, delta_affinity=0.04)
+    if decision.update_relationship:
+        update_relationship_state(user_id, guild_id, content, delta_affinity=0.04)
     maybe_add_memory_trace(
         user_id,
         guild_id,
@@ -6978,9 +7294,11 @@ def save_model_message(user_id: int, guild_id: int, content: str, channel_name: 
         role="model",
         source="conversations",
         channel_name=channel_name,
+        route_mode=route_mode,
     )
-    if any(k in (content or "").lower() for k in ("try this", "steps", "option", "recommend")):
+    if decision.update_relationship and any(k in (content or "").lower() for k in ("try this", "steps", "option", "recommend")):
         add_relationship_journal(user_id, guild_id, "support_response", f"BNL provided guidance: {(content or '')[:160]}")
+    return decision
 
 
 def _stringify_embed_value(value) -> list:
@@ -8541,7 +8859,12 @@ def try_memory_recall_response(user_id: int, guild_id: int, user_text: str) -> s
 
     return ""
 
-def build_user_memory_context(user_id: int, guild_id: int) -> str:
+def build_user_memory_context(user_id: int, guild_id: int, route_mode: str = ROUTE_MODE_NORMAL_CHAT, channel_policy: str = "unknown") -> str:
+    if route_mode == ROUTE_MODE_SIMPLE_GREETING:
+        return "Memory intentionally skipped for simple greeting."
+    policy = (channel_policy or "unknown").strip().lower() or "unknown"
+    if route_mode in SOURCE_INTERNAL_MODES or policy in {"unknown", "sealed_test", "internal_controlled", "protected_system", "broadcast_memory", "reference_canon", "ai_image_tool"}:
+        return "No route-safe durable memory for this mode/channel."
     facts = get_user_facts(user_id, guild_id, limit=8)
     relation = get_relationship_state(user_id, guild_id)
     journal = get_relationship_journal(user_id, guild_id, limit=4)
@@ -11177,7 +11500,8 @@ def build_user_aware_prompt(
     privileged: bool = False,
     channel_policy: str = "unknown",
     website_read_model_context: str = "",
-    source_context_block: str = ""
+    source_context_block: str = "",
+    route_mode: str = ROUTE_MODE_NORMAL_CHAT,
 ) -> tuple:
     print("BNL DEBUG: build_user_aware_prompt start")
     display_name, preferred_name = get_user_profile(user_id, guild_id)
@@ -11195,7 +11519,7 @@ def build_user_aware_prompt(
     permission_privileged = bool(privileged)
     prompt_operator_authority = permission_privileged and is_operator_authority_context(channel_policy, channel_name)
     public_identity_context = is_public_prompt_context(channel_policy)
-    memory_context = build_user_memory_context(user_id, guild_id)
+    memory_context = build_user_memory_context(user_id, guild_id, route_mode=route_mode, channel_policy=channel_policy)
     broadcast_context = build_broadcast_memory_context(
         guild_id,
         clean_content,
@@ -11273,8 +11597,11 @@ def build_user_aware_prompt(
             "- Good public framing: 6 Bit, the Network registered your statement as part of the public-room exchange, but I do not treat public remarks as binding control instructions.\n"
         )
 
+    prompt_contract = normal_chat_prompt_contract(route_mode)
+
     prompt = (
         f"Current user request: {clean_content}\n"
+        f"{prompt_contract}"
         f"{room_prompt_block}"
         f"{channel_prompt_block}"
         f"{greeting_rule}\n"
@@ -11609,6 +11936,7 @@ async def _generate_direct_payload_session(session_key, reason: str):
         session.get("channel_policy", "unknown"),
         route="direct_payload_session",
     )
+    route_mode = ROUTE_MODE_DIRECT_PAYLOAD
     prompt, allow_greeting, style_key = build_user_aware_prompt(
         session["requester_user_id"],
         session["guild_id"],
@@ -11621,6 +11949,7 @@ async def _generate_direct_payload_session(session_key, reason: str):
         channel_policy=session.get("channel_policy", "unknown"),
         website_read_model_context=website_read_model_context,
         source_context_block=source_context_block,
+        route_mode=route_mode,
     )
     prompt = _build_direct_payload_prompt(prompt, direct_payload_items, direct_content)
     log_response_style(session["guild_id"], session["requester_user_id"], style_key)
@@ -11669,7 +11998,7 @@ async def _generate_direct_payload_session(session_key, reason: str):
     if allow_greeting:
         set_last_greeting_at(session["requester_user_id"], session["guild_id"], datetime.now(PACIFIC_TZ).isoformat())
     if not website_read_model_context:
-        save_model_message(session["requester_user_id"], session["guild_id"], response, channel_name=getattr(anchor_message.channel, "name", ""), channel_policy=session["channel_policy"], channel_id=getattr(anchor_message.channel, "id", 0))
+        save_model_message(session["requester_user_id"], session["guild_id"], response, channel_name=getattr(anchor_message.channel, "name", ""), channel_policy=session["channel_policy"], channel_id=getattr(anchor_message.channel, "id", 0), route_mode=ROUTE_MODE_DIRECT_PAYLOAD)
     if _abort_if_invalidated("revision_changed_before_send"):
         return
     session["last_generation_snapshot_revision"] = generation_revision
@@ -11783,6 +12112,9 @@ async def on_message(message: discord.Message):
         .replace(f"<@{client.user.id}>", "")
         .strip()
     )
+
+    if await maybe_handle_debug_last_route_command(message, clean_content):
+        return
 
     if await maybe_handle_channel_audit_command(message, clean_content):
         return
@@ -12186,11 +12518,21 @@ async def on_message(message: discord.Message):
         if not clean_content:
             return
 
-        save_user_message(message.author.id, message.author.display_name, message.guild.id, clean_content, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0))
+        route_mode = classify_route_mode(clean_content, channel_policy, real_direct_target=real_direct_target, active_channel=should_handle_as_active_channel)
+        save_decision = save_user_message(message.author.id, message.author.display_name, message.guild.id, clean_content, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0), route_mode=route_mode)
 
         # Mentions/replies -> immediate response (not batched)
         if message_should_enter_conversation:
             direct_content, direct_payload_items = clean_content, _collect_inline_direct_payload_items(clean_content)
+            if route_mode == ROUTE_MODE_SIMPLE_GREETING:
+                response = build_simple_greeting_response(message.author.display_name)
+                response, guard_triggered = apply_response_mode_contamination_guard(response, route_mode, message.author.display_name)
+                model_decision = save_model_message(message.author.id, message.guild.id, response, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0), route_mode=route_mode)
+                update_last_route_debug(route_mode=route_mode, route_decision="simple_greeting", channel_policy=channel_policy, simple_greeting_detected=True, memory_context_injected=False, memory_context_source_count=0, source_analysis_context_injected=False, community_scouting_ran=False, entity_subjects_detected_count=0, subject_extraction_ran=False, save_policy_reason=getattr(model_decision, "reason", "unknown"), durable_memory_write=getattr(model_decision, "write_memory_tier", False), scripted_mode_leak_guard_triggered=guard_triggered, regenerated_for_mode_leak=False)
+                logging.info("conversation_route_debug route_mode=%s route_decision=simple_greeting channel_policy=%s simple_greeting_detected=1 memory_context_injected=0 source_analysis_context_injected=0 community_scouting_ran=0 entity_subjects_detected_count=0 durable_memory_write=%s scripted_mode_leak_guard_triggered=%s regenerated_for_mode_leak=0 save_policy_reason=%s", route_mode, channel_policy, int(getattr(model_decision, "write_memory_tier", False)), int(guard_triggered), getattr(model_decision, "reason", "unknown"))
+                await message.reply(response)
+                _mark_recent_direct_response(message.channel.id, message.author.id)
+                return
             sealed_recall_guard = get_sealed_test_recall_guard_response(
                 channel_policy,
                 direct_content,
@@ -12226,7 +12568,7 @@ async def on_message(message: discord.Message):
             repair = try_repair_response(direct_content)
             if repair:
                 if not is_sealed_test_channel:
-                    save_model_message(message.author.id, message.guild.id, repair, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0))
+                    save_model_message(message.author.id, message.guild.id, repair, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0), route_mode=route_mode)
                 await message.reply(repair)
                 return
 
@@ -12235,18 +12577,20 @@ async def on_message(message: discord.Message):
                 if not is_privileged_member(message.author, message.guild):
                     self_reflection = "Status reports are restricted to server owner/mod operators."
                 if not is_sealed_test_channel:
-                    save_model_message(message.author.id, message.guild.id, self_reflection, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0))
+                    save_model_message(message.author.id, message.guild.id, self_reflection, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0), route_mode=route_mode)
                 await message.reply(self_reflection)
                 return
 
             memory_recall = try_memory_recall_response(message.author.id, message.guild.id, direct_content)
             if memory_recall:
                 if not is_sealed_test_channel:
-                    save_model_message(message.author.id, message.guild.id, memory_recall, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0))
+                    save_model_message(message.author.id, message.guild.id, memory_recall, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0), route_mode=route_mode)
                 await message.reply(memory_recall)
                 return
 
             payload_expected, _ = _detect_request_payload_expectation(direct_content)
+            if payload_expected:
+                route_mode = ROUTE_MODE_DIRECT_PAYLOAD
             if payload_expected and len(direct_payload_items) == 0:
                 session = {
                     "guild_id": message.guild.id,
@@ -12281,6 +12625,8 @@ async def on_message(message: discord.Message):
             show_state_ctx = build_show_state_override_context(message.guild.id, direct_content)
             if not show_state_ctx:
                 show_state_ctx = _get_recent_show_state_topic_context(message.guild.id, message.channel.id, message.author.id, True, direct_content)
+            if show_state_ctx and route_mode == ROUTE_MODE_NORMAL_CHAT:
+                route_mode = ROUTE_MODE_SHOW_STATUS
             room_context = build_room_first_direct_context(
                 message.guild.id,
                 message.channel.id,
@@ -12309,6 +12655,7 @@ async def on_message(message: discord.Message):
                 channel_policy=channel_policy,
                 website_read_model_context=website_read_model_context,
                 source_context_block=source_context_block,
+                route_mode=route_mode,
             )
             prompt = _build_direct_payload_prompt(prompt, direct_payload_items, direct_content)
             log_response_style(message.guild.id, message.author.id, style_key)
@@ -12349,8 +12696,12 @@ async def on_message(message: discord.Message):
                     await message.reply("[NETWORK ERROR] Temporary synchronization issue. Try again.")
                     return
 
+            response, guard_triggered = apply_response_mode_contamination_guard(response, route_mode, message.author.display_name)
+            model_decision = MemoryWriteDecision(False, False, False, False, False, False, "sealed_test_model_save_skipped", context_visibility_for_policy(channel_policy))
             if not is_sealed_test_channel and not website_read_model_context:
-                save_model_message(message.author.id, message.guild.id, response, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0))
+                model_decision = save_model_message(message.author.id, message.guild.id, response, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0), route_mode=route_mode)
+            update_last_route_debug(route_mode=route_mode, route_decision="active_direct", channel_policy=channel_policy, simple_greeting_detected=(route_mode == ROUTE_MODE_SIMPLE_GREETING), memory_context_injected=(route_mode != ROUTE_MODE_SIMPLE_GREETING), memory_context_source_count=0 if route_mode == ROUTE_MODE_SIMPLE_GREETING else 1, source_analysis_context_injected=bool(source_context_block), community_scouting_ran=False, entity_subjects_detected_count=0, subject_extraction_ran=False, save_policy_reason=getattr(model_decision, "reason", "unknown"), durable_memory_write=getattr(model_decision, "write_memory_tier", False), scripted_mode_leak_guard_triggered=guard_triggered, regenerated_for_mode_leak=False)
+            logging.info("conversation_route_debug route_mode=%s route_decision=active_direct channel_policy=%s simple_greeting_detected=%s memory_context_injected=%s source_analysis_context_injected=%s community_scouting_ran=0 entity_subjects_detected_count=0 durable_memory_write=%s scripted_mode_leak_guard_triggered=%s regenerated_for_mode_leak=0 save_policy_reason=%s", route_mode, channel_policy, int(route_mode == ROUTE_MODE_SIMPLE_GREETING), int(route_mode != ROUTE_MODE_SIMPLE_GREETING), int(bool(source_context_block)), int(getattr(model_decision, "write_memory_tier", False)), int(guard_triggered), getattr(model_decision, "reason", "unknown"))
 
             if allow_greeting:
                 set_last_greeting_at(message.author.id, message.guild.id, datetime.now(PACIFIC_TZ).isoformat())
@@ -12408,6 +12759,14 @@ async def on_message(message: discord.Message):
             await message.reply("I monitor this channel passively. My active operations are in the designated liaison channel.")
             return
         direct_content, direct_payload_items = clean_content, _collect_inline_direct_payload_items(clean_content)
+        route_mode = classify_route_mode(direct_content, channel_policy, real_direct_target=real_direct_target, active_channel=False)
+        if route_mode == ROUTE_MODE_SIMPLE_GREETING:
+            response = build_simple_greeting_response(message.author.display_name)
+            response, guard_triggered = apply_response_mode_contamination_guard(response, route_mode, message.author.display_name)
+            model_decision = save_model_message(message.author.id, message.guild.id, response, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0), route_mode=route_mode)
+            update_last_route_debug(route_mode=route_mode, route_decision="direct_simple_greeting", channel_policy=channel_policy, simple_greeting_detected=True, memory_context_injected=False, memory_context_source_count=0, source_analysis_context_injected=False, community_scouting_ran=False, entity_subjects_detected_count=0, subject_extraction_ran=False, save_policy_reason=getattr(model_decision, "reason", "unknown"), durable_memory_write=getattr(model_decision, "write_memory_tier", False), scripted_mode_leak_guard_triggered=guard_triggered, regenerated_for_mode_leak=False)
+            await message.reply(response)
+            return
         sealed_recall_guard = get_sealed_test_recall_guard_response(
             channel_policy,
             direct_content,
@@ -12429,11 +12788,11 @@ async def on_message(message: discord.Message):
             return
 
         if not is_sealed_test_channel:
-            save_user_message(message.author.id, message.author.display_name, message.guild.id, direct_content, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0))
+            save_user_message(message.author.id, message.author.display_name, message.guild.id, direct_content, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0), route_mode=route_mode)
 
         repair = try_repair_response(direct_content)
         if repair:
-            save_model_message(message.author.id, message.guild.id, repair, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0))
+            save_model_message(message.author.id, message.guild.id, repair, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0), route_mode=route_mode)
             await message.reply(repair)
             return
 
@@ -12441,19 +12800,24 @@ async def on_message(message: discord.Message):
         if self_reflection:
             if not is_privileged_member(message.author, message.guild):
                 self_reflection = "Status reports are restricted to server owner/mod operators."
-            save_model_message(message.author.id, message.guild.id, self_reflection, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0))
+            save_model_message(message.author.id, message.guild.id, self_reflection, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0), route_mode=route_mode)
             await message.reply(self_reflection)
             return
 
         memory_recall = try_memory_recall_response(message.author.id, message.guild.id, direct_content)
         if memory_recall:
-            save_model_message(message.author.id, message.guild.id, memory_recall, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0))
+            save_model_message(message.author.id, message.guild.id, memory_recall, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0), route_mode=route_mode)
             await message.reply(memory_recall)
             return
 
+        payload_expected, _ = _detect_request_payload_expectation(direct_content)
+        if payload_expected:
+            route_mode = ROUTE_MODE_DIRECT_PAYLOAD
         show_state_ctx = build_show_state_override_context(message.guild.id, direct_content)
         if not show_state_ctx:
             show_state_ctx = _get_recent_show_state_topic_context(message.guild.id, message.channel.id, message.author.id, True, direct_content)
+        if show_state_ctx and route_mode == ROUTE_MODE_NORMAL_CHAT:
+            route_mode = ROUTE_MODE_SHOW_STATUS
         room_context = build_room_first_direct_context(
             message.guild.id,
             message.channel.id,
@@ -12482,11 +12846,14 @@ async def on_message(message: discord.Message):
             channel_policy=channel_policy,
             website_read_model_context=website_read_model_context,
             source_context_block=source_context_block,
+            route_mode=route_mode,
         )
         prompt = _build_direct_payload_prompt(prompt, direct_payload_items, direct_content)
         log_response_style(message.guild.id, message.author.id, style_key)
 
         payload_expected, _ = _detect_request_payload_expectation(direct_content)
+        if payload_expected:
+            route_mode = ROUTE_MODE_DIRECT_PAYLOAD
         await _apply_direct_response_pacing(payload_expected, len(direct_payload_items))
         show_state_route = "get_gemini_response"
         if show_state_ctx:
@@ -12522,8 +12889,11 @@ async def on_message(message: discord.Message):
                 await message.reply("[NETWORK ERROR] Temporary synchronization issue. Try again.")
                 return
 
+        response, guard_triggered = apply_response_mode_contamination_guard(response, route_mode, message.author.display_name)
+        model_decision = MemoryWriteDecision(False, False, False, False, False, False, "model_save_skipped", context_visibility_for_policy(channel_policy))
         if not website_read_model_context:
-            save_model_message(message.author.id, message.guild.id, response, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0))
+            model_decision = save_model_message(message.author.id, message.guild.id, response, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0), route_mode=route_mode)
+        update_last_route_debug(route_mode=route_mode, route_decision="direct", channel_policy=channel_policy, simple_greeting_detected=(route_mode == ROUTE_MODE_SIMPLE_GREETING), memory_context_injected=(route_mode != ROUTE_MODE_SIMPLE_GREETING), memory_context_source_count=0 if route_mode == ROUTE_MODE_SIMPLE_GREETING else 1, source_analysis_context_injected=bool(source_context_block), community_scouting_ran=False, entity_subjects_detected_count=0, subject_extraction_ran=False, save_policy_reason=getattr(model_decision, "reason", "unknown"), durable_memory_write=getattr(model_decision, "write_memory_tier", False), scripted_mode_leak_guard_triggered=guard_triggered, regenerated_for_mode_leak=False)
 
         if allow_greeting:
             set_last_greeting_at(message.author.id, message.guild.id, datetime.now(PACIFIC_TZ).isoformat())
@@ -12546,6 +12916,14 @@ async def on_message(message: discord.Message):
             await message.reply("You pinged me. How may I assist with BARCODE operations?")
             return
         direct_content, direct_payload_items = clean_content, _collect_inline_direct_payload_items(clean_content)
+        route_mode = classify_route_mode(direct_content, channel_policy, real_direct_target=real_direct_target, active_channel=False)
+        if route_mode == ROUTE_MODE_SIMPLE_GREETING:
+            response = build_simple_greeting_response(message.author.display_name)
+            response, guard_triggered = apply_response_mode_contamination_guard(response, route_mode, message.author.display_name)
+            model_decision = save_model_message(message.author.id, message.guild.id, response, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0), route_mode=route_mode)
+            update_last_route_debug(route_mode=route_mode, route_decision="direct_simple_greeting", channel_policy=channel_policy, simple_greeting_detected=True, memory_context_injected=False, memory_context_source_count=0, source_analysis_context_injected=False, community_scouting_ran=False, entity_subjects_detected_count=0, subject_extraction_ran=False, save_policy_reason=getattr(model_decision, "reason", "unknown"), durable_memory_write=getattr(model_decision, "write_memory_tier", False), scripted_mode_leak_guard_triggered=guard_triggered, regenerated_for_mode_leak=False)
+            await message.reply(response)
+            return
         sealed_recall_guard = get_sealed_test_recall_guard_response(
             channel_policy,
             direct_content,
@@ -12567,11 +12945,11 @@ async def on_message(message: discord.Message):
             return
 
         if not is_sealed_test_channel:
-            save_user_message(message.author.id, message.author.display_name, message.guild.id, direct_content, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0))
+            save_user_message(message.author.id, message.author.display_name, message.guild.id, direct_content, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0), route_mode=route_mode)
 
         repair = try_repair_response(direct_content)
         if repair:
-            save_model_message(message.author.id, message.guild.id, repair, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0))
+            save_model_message(message.author.id, message.guild.id, repair, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0), route_mode=route_mode)
             await message.reply(repair if len(repair) <= 2000 else repair[:1900] + "...")
             return
 
@@ -12579,19 +12957,24 @@ async def on_message(message: discord.Message):
         if self_reflection:
             if not is_privileged_member(message.author, message.guild):
                 self_reflection = "Status reports are restricted to server owner/mod operators."
-            save_model_message(message.author.id, message.guild.id, self_reflection, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0))
+            save_model_message(message.author.id, message.guild.id, self_reflection, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0), route_mode=route_mode)
             await message.reply(self_reflection if len(self_reflection) <= 2000 else self_reflection[:1900] + "...")
             return
 
         memory_recall = try_memory_recall_response(message.author.id, message.guild.id, direct_content)
         if memory_recall:
-            save_model_message(message.author.id, message.guild.id, memory_recall, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0))
+            save_model_message(message.author.id, message.guild.id, memory_recall, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0), route_mode=route_mode)
             await message.reply(memory_recall if len(memory_recall) <= 2000 else memory_recall[:1900] + "...")
             return
 
+        payload_expected, _ = _detect_request_payload_expectation(direct_content)
+        if payload_expected:
+            route_mode = ROUTE_MODE_DIRECT_PAYLOAD
         show_state_ctx = build_show_state_override_context(message.guild.id, direct_content)
         if not show_state_ctx:
             show_state_ctx = _get_recent_show_state_topic_context(message.guild.id, message.channel.id, message.author.id, True, direct_content)
+        if show_state_ctx and route_mode == ROUTE_MODE_NORMAL_CHAT:
+            route_mode = ROUTE_MODE_SHOW_STATUS
         room_context = build_room_first_direct_context(
             message.guild.id,
             message.channel.id,
@@ -12620,11 +13003,14 @@ async def on_message(message: discord.Message):
             channel_policy=channel_policy,
             website_read_model_context=website_read_model_context,
             source_context_block=source_context_block,
+            route_mode=route_mode,
         )
         prompt = _build_direct_payload_prompt(prompt, direct_payload_items, direct_content)
         log_response_style(message.guild.id, message.author.id, style_key)
 
         payload_expected, _ = _detect_request_payload_expectation(direct_content)
+        if payload_expected:
+            route_mode = ROUTE_MODE_DIRECT_PAYLOAD
         await _apply_direct_response_pacing(payload_expected, len(direct_payload_items))
         show_state_route = "get_gemini_response"
         if show_state_ctx:
@@ -12660,8 +13046,11 @@ async def on_message(message: discord.Message):
                 await message.reply("[NETWORK ERROR] Temporary synchronization issue. Try again.")
                 return
 
+        response, guard_triggered = apply_response_mode_contamination_guard(response, route_mode, message.author.display_name)
+        model_decision = MemoryWriteDecision(False, False, False, False, False, False, "model_save_skipped", context_visibility_for_policy(channel_policy))
         if not website_read_model_context:
-            save_model_message(message.author.id, message.guild.id, response, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0))
+            model_decision = save_model_message(message.author.id, message.guild.id, response, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0), route_mode=route_mode)
+        update_last_route_debug(route_mode=route_mode, route_decision="direct", channel_policy=channel_policy, simple_greeting_detected=(route_mode == ROUTE_MODE_SIMPLE_GREETING), memory_context_injected=(route_mode != ROUTE_MODE_SIMPLE_GREETING), memory_context_source_count=0 if route_mode == ROUTE_MODE_SIMPLE_GREETING else 1, source_analysis_context_injected=bool(source_context_block), community_scouting_ran=False, entity_subjects_detected_count=0, subject_extraction_ran=False, save_policy_reason=getattr(model_decision, "reason", "unknown"), durable_memory_write=getattr(model_decision, "write_memory_tier", False), scripted_mode_leak_guard_triggered=guard_triggered, regenerated_for_mode_leak=False)
 
         if allow_greeting:
             set_last_greeting_at(message.author.id, message.guild.id, datetime.now(PACIFIC_TZ).isoformat())
