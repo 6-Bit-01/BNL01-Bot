@@ -479,6 +479,36 @@ def _json_list(value: Any) -> list[str]:
     return [str(v) for v in parsed] if isinstance(parsed, list) else []
 
 
+
+def _case_bridge_evidence_summary(display_name: str, evidence: list[KnowledgeEvidence], source_types: list[str], candidate_type: str) -> str:
+    name = _safe_snippet(display_name, 80)
+    if not evidence:
+        return f"{name} needs review, but BNL did not find enough supported local context to write a useful Source File note."
+    lead = f"{name} appears in existing BNL local knowledge stores ({', '.join(source_types)})."
+    if candidate_type == "possible_connection_review":
+        connection = next((e.connected_subject for e in evidence if e.connected_subject), "another subject")
+        lead = f"{name} has a possible connection to {_safe_snippet(connection, 80)}; this is not a confirmed alias or identity match."
+    elif candidate_type == "identity_link":
+        lead = f"{name} appears in alias/same-as language, but identity changes still need owner review before any merge or public use."
+    useful = []
+    for item in evidence[:4]:
+        snippet = _safe_snippet(item.snippet, 140)
+        if not snippet:
+            continue
+        if item.source_type == "memory_tiers":
+            useful.append(f"Review-only legacy memory mentions this subject: {snippet}")
+        elif item.source_type == "broadcast_memory":
+            useful.append(f"BARCODE Radio memory gives review context: {snippet}")
+        elif item.source_type == "community_presence":
+            useful.append(f"Community-side records show recurring activity around this subject: {snippet}")
+        elif item.source_type == "relationship_state":
+            useful.append(f"BNL has prior relationship context, but the public significance still needs confirmation: {snippet}")
+        else:
+            useful.append(f"Local review evidence: {snippet}")
+    tail = " ".join(useful[:3])
+    return _safe_snippet(f"{lead} {tail} Keep this as internal Source File review material until owner-approved public wording exists.", MAX_EVIDENCE_SUMMARY_LENGTH)
+
+
 def collect_knowledge_bridge_candidates(db_path: str, guild_id: int | None = None, *, limit: int = DEFAULT_KNOWLEDGE_BRIDGE_LIMIT, rd_context: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     """Read approved local stores and return review-only recommendation payloads."""
 
@@ -522,7 +552,7 @@ def collect_knowledge_bridge_candidates(db_path: str, guild_id: int | None = Non
         score = sum(e.confidence_points for e in acc.evidence)
         confidence = "high" if score >= 7 and len(source_types) > 1 else ("medium" if score >= 3 else "low")
         candidate_type = _candidate_type(acc.evidence)
-        evidence_summary = _safe_snippet(" | ".join(f"{e.source_type}/{e.source_quality}: {e.snippet}" for e in acc.evidence), MAX_EVIDENCE_SUMMARY_LENGTH)
+        evidence_summary = _case_bridge_evidence_summary(display_name, acc.evidence, source_types, candidate_type)
         reason = _safe_snippet(
             f"Knowledge bridge found {display_name} in existing BNL local knowledge stores ({', '.join(source_types)}). "
             f"Source qualities: {', '.join(source_qualities)}. Visibility labels: {', '.join(visibility)}. Review-only Source File material; do not publish, draft, merge identities, or use publicly until owner review.",

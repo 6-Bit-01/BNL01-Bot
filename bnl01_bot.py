@@ -543,6 +543,10 @@ _source_enrichment_last_lookup_found = False
 _source_enrichment_last_possible_match_count = 0
 _source_enrichment_last_possible_match_names = []
 _source_enrichment_last_resolution_mode = "none"
+_source_enrichment_last_quality_score = 0
+_source_enrichment_last_quality_status = "none"
+_source_enrichment_last_suppressed_reason = "none"
+_source_enrichment_last_preview_bullets_count = 0
 BNL_CONTROL_FLAGS_TTL_SECONDS = 300
 _bnl_control_flags_cache = None
 _bnl_control_flags_cached_at = None
@@ -4129,6 +4133,10 @@ def build_dossier_recommendation_diagnostics(guild_id=None) -> dict:
         "source_enrichment_last_possible_match_count": _source_enrichment_last_possible_match_count,
         "source_enrichment_last_possible_match_names": list(_source_enrichment_last_possible_match_names),
         "source_enrichment_last_resolution_mode": _source_enrichment_last_resolution_mode,
+        "source_enrichment_last_quality_score": _source_enrichment_last_quality_score,
+        "source_enrichment_last_quality_status": _source_enrichment_last_quality_status,
+        "source_enrichment_last_suppressed_reason": _source_enrichment_last_suppressed_reason,
+        "source_enrichment_last_preview_bullets_count": _source_enrichment_last_preview_bullets_count,
         "source_enrichment_last_error_status": _source_enrichment_last_error_status,
         **build_community_presence_diagnostics(
             DB_FILE,
@@ -4406,6 +4414,7 @@ async def maybe_handle_source_file_enrichment_command(message: discord.Message, 
     global _source_enrichment_last_subject, _source_enrichment_last_status, _source_enrichment_last_match_kind
     global _source_enrichment_last_source_counts, _source_enrichment_last_warning_counts, _source_enrichment_last_error_status
     global _source_enrichment_last_lookup_found, _source_enrichment_last_possible_match_count, _source_enrichment_last_possible_match_names, _source_enrichment_last_resolution_mode
+    global _source_enrichment_last_quality_score, _source_enrichment_last_quality_status, _source_enrichment_last_suppressed_reason, _source_enrichment_last_preview_bullets_count
 
     matched, options, parse_error = parse_source_enrichment_command(clean_content)
     if not matched:
@@ -4438,6 +4447,7 @@ async def maybe_handle_source_file_enrichment_command(message: discord.Message, 
     lookup_key = str(options.get("lookupKey") or "subject")
     lookup_value = str(options.get("lookupValue") or subject).strip()
     dry_run = bool(options.get("dry_run"))
+    force = bool(options.get("force"))
     result = await asyncio.to_thread(
         run_source_file_enrichment,
         DB_FILE,
@@ -4450,6 +4460,7 @@ async def maybe_handle_source_file_enrichment_command(message: discord.Message, 
         environ=os.environ,
         lookup_key=lookup_key,
         lookup_value=lookup_value,
+        force=force,
     )
     _source_enrichment_last_subject = str(result.get("subject") or subject or "none")[:90]
     _source_enrichment_last_status = str(result.get("status") or "unknown")[:80]
@@ -4460,6 +4471,10 @@ async def maybe_handle_source_file_enrichment_command(message: discord.Message, 
     _source_enrichment_last_possible_match_count = int(result.get("possibleMatchCount") or 0)
     _source_enrichment_last_possible_match_names = list(result.get("possibleMatchNames") or [])[:5]
     _source_enrichment_last_resolution_mode = str(result.get("resolutionMode") or "none")[:80]
+    _source_enrichment_last_quality_score = int(result.get("qualityScore") or 0)
+    _source_enrichment_last_quality_status = str(result.get("qualityStatus") or "none")[:80]
+    _source_enrichment_last_suppressed_reason = str(result.get("suppressedReason") or "none")[:160]
+    _source_enrichment_last_preview_bullets_count = int(result.get("previewBulletsCount") or 0)
     _source_enrichment_last_error_status = "none" if result.get("ok") else _source_enrichment_last_status
     if dry_run:
         _last_dossier_recommendation_status = "source_enrichment_dry_run"
@@ -12285,6 +12300,18 @@ async def bnl_source_check(interaction: discord.Interaction):
         f"- source_knowledge_bridge_last_source_counts: `{json.dumps(dossier_diag['source_knowledge_bridge_last_source_counts'], sort_keys=True)}`",
         f"- source_knowledge_bridge_last_warning_counts: `{json.dumps(dossier_diag['source_knowledge_bridge_last_warning_counts'], sort_keys=True)}`",
         f"- source_knowledge_bridge_last_error_status: `{dossier_diag['source_knowledge_bridge_last_error_status']}`",
+        f"- source_enrichment_available: `{'yes' if dossier_diag['source_enrichment_available'] else 'no'}`",
+        f"- source_enrichment_ingest_source: `{dossier_diag['source_enrichment_ingest_source']}`",
+        f"- source_enrichment_last_status: `{dossier_diag['source_enrichment_last_status']}`",
+        f"- source_enrichment_last_subject: `{dossier_diag['source_enrichment_last_subject']}`",
+        f"- source_enrichment_last_match_kind: `{dossier_diag['source_enrichment_last_match_kind']}`",
+        f"- source_enrichment_last_source_counts: `{json.dumps(dossier_diag['source_enrichment_last_source_counts'], sort_keys=True)}`",
+        f"- source_enrichment_last_warning_counts: `{json.dumps(dossier_diag['source_enrichment_last_warning_counts'], sort_keys=True)}`",
+        f"- source_enrichment_last_quality_score: `{dossier_diag['source_enrichment_last_quality_score']}`",
+        f"- source_enrichment_last_quality_status: `{dossier_diag['source_enrichment_last_quality_status']}`",
+        f"- source_enrichment_last_suppressed_reason: `{dossier_diag['source_enrichment_last_suppressed_reason']}`",
+        f"- source_enrichment_last_preview_bullets_count: `{dossier_diag['source_enrichment_last_preview_bullets_count']}`",
+        f"- source_enrichment_last_error_status: `{dossier_diag['source_enrichment_last_error_status']}`",
         f"- community_scouting_available: `{'yes' if dossier_diag['community_scouting_available'] else 'no'}`",
         f"- community_scouting_enabled: `{'yes' if dossier_diag['community_scouting_enabled'] else 'no'}`",
         f"- community_scouting_allowed_channels_configured: `{'yes' if dossier_diag['community_scouting_allowed_channels_configured'] else 'no'}`",
@@ -12557,6 +12584,18 @@ async def bnl_status(interaction: discord.Interaction):
         f"- source_knowledge_bridge_last_source_counts: `{json.dumps(dossier_diag['source_knowledge_bridge_last_source_counts'], sort_keys=True)}`",
         f"- source_knowledge_bridge_last_warning_counts: `{json.dumps(dossier_diag['source_knowledge_bridge_last_warning_counts'], sort_keys=True)}`",
         f"- source_knowledge_bridge_last_error_status: `{dossier_diag['source_knowledge_bridge_last_error_status']}`",
+        f"- source_enrichment_available: `{'yes' if dossier_diag['source_enrichment_available'] else 'no'}`",
+        f"- source_enrichment_ingest_source: `{dossier_diag['source_enrichment_ingest_source']}`",
+        f"- source_enrichment_last_status: `{dossier_diag['source_enrichment_last_status']}`",
+        f"- source_enrichment_last_subject: `{dossier_diag['source_enrichment_last_subject']}`",
+        f"- source_enrichment_last_match_kind: `{dossier_diag['source_enrichment_last_match_kind']}`",
+        f"- source_enrichment_last_source_counts: `{json.dumps(dossier_diag['source_enrichment_last_source_counts'], sort_keys=True)}`",
+        f"- source_enrichment_last_warning_counts: `{json.dumps(dossier_diag['source_enrichment_last_warning_counts'], sort_keys=True)}`",
+        f"- source_enrichment_last_quality_score: `{dossier_diag['source_enrichment_last_quality_score']}`",
+        f"- source_enrichment_last_quality_status: `{dossier_diag['source_enrichment_last_quality_status']}`",
+        f"- source_enrichment_last_suppressed_reason: `{dossier_diag['source_enrichment_last_suppressed_reason']}`",
+        f"- source_enrichment_last_preview_bullets_count: `{dossier_diag['source_enrichment_last_preview_bullets_count']}`",
+        f"- source_enrichment_last_error_status: `{dossier_diag['source_enrichment_last_error_status']}`",
         f"- community_scouting_available: `{'yes' if dossier_diag['community_scouting_available'] else 'no'}`",
         f"- community_scouting_enabled: `{'yes' if dossier_diag['community_scouting_enabled'] else 'no'}`",
         f"- community_scouting_allowed_channels_configured: `{'yes' if dossier_diag['community_scouting_allowed_channels_configured'] else 'no'}`",
