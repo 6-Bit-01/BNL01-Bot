@@ -71,6 +71,12 @@ from bnl_source_knowledge_bridge import (
     parse_source_knowledge_bridge_command,
     run_source_knowledge_bridge,
 )
+from bnl_source_file_enrichment import (
+    format_source_enrichment_response,
+    parse_source_enrichment_command,
+    run_source_file_enrichment,
+    source_enrichment_ingest_source,
+)
 from collections import defaultdict, deque
 from datetime import datetime, timedelta, timezone
 
@@ -527,6 +533,12 @@ _last_source_knowledge_bridge_failed_count = 0
 _last_source_knowledge_bridge_source_counts = {}
 _last_source_knowledge_bridge_warning_counts = {}
 _last_source_knowledge_bridge_error_status = "none"
+_source_enrichment_last_subject = "none"
+_source_enrichment_last_status = "never"
+_source_enrichment_last_match_kind = "none"
+_source_enrichment_last_source_counts = {}
+_source_enrichment_last_warning_counts = {}
+_source_enrichment_last_error_status = "none"
 BNL_CONTROL_FLAGS_TTL_SECONDS = 300
 _bnl_control_flags_cache = None
 _bnl_control_flags_cached_at = None
@@ -4102,6 +4114,14 @@ def build_dossier_recommendation_diagnostics(guild_id=None) -> dict:
         "source_knowledge_bridge_last_source_counts": dict(_last_source_knowledge_bridge_source_counts),
         "source_knowledge_bridge_last_warning_counts": dict(_last_source_knowledge_bridge_warning_counts),
         "source_knowledge_bridge_last_error_status": _last_source_knowledge_bridge_error_status,
+        "source_enrichment_available": True,
+        "source_enrichment_ingest_source": source_enrichment_ingest_source(os.environ),
+        "source_enrichment_last_subject": _source_enrichment_last_subject,
+        "source_enrichment_last_status": _source_enrichment_last_status,
+        "source_enrichment_last_match_kind": _source_enrichment_last_match_kind,
+        "source_enrichment_last_source_counts": dict(_source_enrichment_last_source_counts),
+        "source_enrichment_last_warning_counts": dict(_source_enrichment_last_warning_counts),
+        "source_enrichment_last_error_status": _source_enrichment_last_error_status,
         **build_community_presence_diagnostics(
             DB_FILE,
             guild_id=guild_id,
@@ -4367,6 +4387,70 @@ async def maybe_handle_dossier_discovery_command(message: discord.Message, clean
         )
     lanes_suffix = f" Lanes: {', '.join(lanes)}."
     await message.reply(f"{summary}{reason_suffix}{failure_suffix}{lanes_suffix}")
+    return True
+
+
+
+async def maybe_handle_source_file_enrichment_command(message: discord.Message, clean_content: str) -> bool:
+    """Handle operator-triggered Source File enrichment commands."""
+
+    global _last_dossier_recommendation_status
+    global _source_enrichment_last_subject, _source_enrichment_last_status, _source_enrichment_last_match_kind
+    global _source_enrichment_last_source_counts, _source_enrichment_last_warning_counts, _source_enrichment_last_error_status
+
+    matched, options, parse_error = parse_source_enrichment_command(clean_content)
+    if not matched:
+        return False
+
+    member = message.author if isinstance(message.author, discord.Member) else message.guild.get_member(message.author.id)
+    if not can_send_dossier_recommendation(message.author, member, message.guild):
+        _source_enrichment_last_error_status = "permission_denied"
+        _source_enrichment_last_status = "permission_denied"
+        logging.warning("source_file_enrichment_denied reason=permission")
+        await message.reply("Source File enrichment is operator-only.")
+        return True
+
+    channel = getattr(message, "channel", None)
+    policy = resolve_channel_policy(channel)
+    channel_name = getattr(channel, "name", "") or ""
+    if is_public_prompt_context(policy) and not is_operator_authority_context(policy, channel_name):
+        _source_enrichment_last_error_status = "channel_restricted"
+        _source_enrichment_last_status = "channel_restricted"
+        await message.reply("Source File enrichment is restricted to approved internal/operator channels.")
+        return True
+
+    if not options:
+        _source_enrichment_last_error_status = "parse_rejected"
+        _source_enrichment_last_status = "parse_rejected"
+        await message.reply(f"Source enrichment failed: {parse_error}")
+        return True
+
+    subject = str(options.get("subject") or "").strip()
+    dry_run = bool(options.get("dry_run"))
+    result = await asyncio.to_thread(
+        run_source_file_enrichment,
+        DB_FILE,
+        getattr(message.guild, "id", None),
+        subject,
+        dry_run=dry_run,
+        rd_context=_current_rd_discovery_context(message),
+        lookup_func=lookup_source_file,
+        sender=send_dossier_recommendation,
+        environ=os.environ,
+    )
+    _source_enrichment_last_subject = str(result.get("subject") or subject or "none")[:90]
+    _source_enrichment_last_status = str(result.get("status") or "unknown")[:80]
+    _source_enrichment_last_match_kind = str(result.get("matchKind") or "none")[:80]
+    _source_enrichment_last_source_counts = dict(result.get("sourceCounts") or {})
+    _source_enrichment_last_warning_counts = dict(result.get("warningCounts") or {})
+    _source_enrichment_last_error_status = "none" if result.get("ok") else _source_enrichment_last_status
+    if dry_run:
+        _last_dossier_recommendation_status = "source_enrichment_dry_run"
+    elif result.get("sent"):
+        _last_dossier_recommendation_status = "source_enrichment_sent"
+    else:
+        _last_dossier_recommendation_status = f"source_enrichment_{_source_enrichment_last_status}"
+    await message.reply(format_source_enrichment_response(result))
     return True
 
 
@@ -11008,6 +11092,9 @@ async def on_message(message: discord.Message):
         .replace(f"<@{client.user.id}>", "")
         .strip()
     )
+
+    if await maybe_handle_source_file_enrichment_command(message, clean_content):
+        return
 
     if await maybe_handle_source_file_lookup_command(message, clean_content):
         return
