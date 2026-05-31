@@ -11,6 +11,8 @@
 # - Greeting cooldown: 90 minutes (greeting allowed occasionally)
 # - Length variety policy (responses won’t all be the same length)
 
+from __future__ import annotations
+
 import os
 import re
 import asyncio
