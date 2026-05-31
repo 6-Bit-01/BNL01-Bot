@@ -57,6 +57,137 @@ class SourceFileEnrichmentTests(unittest.TestCase):
             self.assertTrue(matched)
             self.assertFalse(error)
 
+
+    def test_parses_enrich_lookup_modes(self):
+        cases = (
+            ("!bnl source enrich candidateId=sf_123 | dry_run=true", "candidateId", "sf_123"),
+            ("!bnl source enrich alias=Hellcat | dry_run=true", "alias", "Hellcat"),
+            ("!bnl source enrich normalizedName=hellcatnz | dry_run=true", "normalizedName", "hellcatnz"),
+            ("!bnl source enrich subject=Hellcat | dry_run=true", "subject", "Hellcat"),
+        )
+        for command, key, value in cases:
+            matched, options, error = enrich.parse_source_enrichment_command(command)
+            self.assertTrue(matched)
+            self.assertFalse(error)
+            self.assertEqual(options["lookupKey"], key)
+            self.assertEqual(options["lookupValue"], value)
+            self.assertTrue(options["dry_run"])
+
+    def test_possible_single_match_is_review_only_and_does_not_send(self):
+        calls = []
+        result = enrich.run_source_file_enrichment(
+            self.db,
+            1,
+            "Hellcat",
+            dry_run=True,
+            lookup_func=lambda query: {
+                "ok": True,
+                "found": False,
+                "data": {"possibleMatches": [{"name": "HellcatNZ", "matchKind": "partial_name", "candidateId": "sf_hellcatnz"}]},
+            },
+            sender=lambda payload: calls.append(payload) or {"ok": True},
+        )
+        response = enrich.format_source_enrichment_response(result)
+        self.assertEqual(result["status"], "possible_match_review")
+        self.assertEqual(result["resolutionMode"], "possible_match_review")
+        self.assertEqual(result["possibleMatchCount"], 1)
+        self.assertFalse(result["sent"])
+        self.assertEqual(calls, [])
+        self.assertIn("Possible match found: HellcatNZ", response)
+        self.assertIn("Match kind: partial_name", response)
+        self.assertIn("Use candidateId=sf_hellcatnz or exact name", response)
+        self.assertIn("No notes were sent", response)
+        self.assertNotIn("no target found", response.lower())
+
+    def test_multiple_possible_matches_asks_operator_to_narrow(self):
+        result = enrich.run_source_file_enrichment(
+            self.db,
+            1,
+            "Modem",
+            dry_run=True,
+            lookup_func=lambda query: {
+                "ok": True,
+                "found": False,
+                "data": {
+                    "possibleMatches": [
+                        {"name": "Mac Modem", "matchKind": "partial_name", "candidateId": "sf_mac_modem"},
+                        {"name": "Modem Ghost", "matchKind": "compact_name", "candidateId": "sf_modem_ghost"},
+                    ]
+                },
+            },
+        )
+        response = enrich.format_source_enrichment_response(result)
+        self.assertEqual(result["status"], "possible_match_review")
+        self.assertIn("Possible matches (narrow", response)
+        self.assertIn("Mac Modem — partial_name — candidateId=sf_mac_modem", response)
+        self.assertIn("Use exact name or candidateId", response)
+        self.assertFalse(result["sent"])
+
+    def test_candidate_id_lookup_proceeds_with_enrichment(self):
+        queries = []
+        result = enrich.run_source_file_enrichment(
+            self.db,
+            1,
+            "sf_hellcatnz",
+            dry_run=True,
+            lookup_key="candidateId",
+            lookup_value="sf_hellcatnz",
+            lookup_func=lambda query: queries.append(query) or {
+                "ok": True,
+                "found": True,
+                "matchKind": "candidateId",
+                "data": {"sourceFile": {"id": "sf_hellcatnz", "name": "HellcatNZ", "status": "active"}},
+            },
+        )
+        self.assertEqual(queries[0]["lookupKey"], "candidateId")
+        self.assertEqual(result["status"], "dry_run")
+        self.assertEqual(result["resolutionMode"], "candidateId")
+        self.assertEqual(result["subject"], "HellcatNZ")
+
+    def test_alias_confirmed_proceeds_but_unconfirmed_alias_is_review_only(self):
+        confirmed = enrich.run_source_file_enrichment(
+            self.db,
+            1,
+            "Hellcat",
+            dry_run=True,
+            lookup_key="alias",
+            lookup_value="Hellcat",
+            lookup_func=lambda query: {
+                "ok": True,
+                "found": True,
+                "matchKind": "confirmed alias",
+                "data": {"matchedAlias": "Hellcat", "sourceFile": {"name": "HellcatNZ", "status": "active"}},
+            },
+        )
+        self.assertEqual(confirmed["status"], "dry_run")
+        self.assertEqual(confirmed["resolutionMode"], "alias")
+
+        calls = []
+        unconfirmed = enrich.run_source_file_enrichment(
+            self.db,
+            1,
+            "Hellcat",
+            dry_run=False,
+            lookup_key="alias",
+            lookup_value="Hellcat",
+            lookup_func=lambda query: {
+                "ok": True,
+                "found": False,
+                "data": {"possibleMatches": [{"name": "HellcatNZ", "matchKind": "unconfirmed_alias", "candidateId": "sf_hellcatnz"}]},
+            },
+            sender=lambda payload: calls.append(payload) or {"ok": True},
+        )
+        response = enrich.format_source_enrichment_response(unconfirmed)
+        self.assertEqual(unconfirmed["status"], "possible_match_review")
+        self.assertEqual(calls, [])
+        self.assertIn("Use candidateId=sf_hellcatnz", response)
+
+    def test_exact_name_lookup_still_proceeds_with_enrichment(self):
+        result = enrich.run_source_file_enrichment(self.db, 1, "HellcatNZ", dry_run=True, lookup_func=self._lookup("active"))
+        self.assertEqual(result["status"], "dry_run")
+        self.assertEqual(result["matchKind"], "active_source_file")
+        self.assertEqual(result["resolutionMode"], "exact")
+
     def test_enriches_active_source_file_with_structured_sections(self):
         c = self.conn.cursor()
         c.execute("INSERT INTO user_profiles VALUES (10,1,'Hellcat','Hellcat',NULL,NULL)")
@@ -182,6 +313,10 @@ class SourceFileEnrichmentBotTests(unittest.TestCase):
         self.assertTrue(diag["source_enrichment_available"])
         self.assertEqual(diag["source_enrichment_last_subject"], "Hellcat")
         self.assertEqual(diag["source_enrichment_last_match_kind"], "active_source_file")
+        self.assertIn("source_enrichment_last_lookup_found", diag)
+        self.assertIn("source_enrichment_last_possible_match_count", diag)
+        self.assertIn("source_enrichment_last_possible_match_names", diag)
+        self.assertIn("source_enrichment_last_resolution_mode", diag)
 
 
 if __name__ == "__main__":

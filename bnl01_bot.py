@@ -539,6 +539,10 @@ _source_enrichment_last_match_kind = "none"
 _source_enrichment_last_source_counts = {}
 _source_enrichment_last_warning_counts = {}
 _source_enrichment_last_error_status = "none"
+_source_enrichment_last_lookup_found = False
+_source_enrichment_last_possible_match_count = 0
+_source_enrichment_last_possible_match_names = []
+_source_enrichment_last_resolution_mode = "none"
 BNL_CONTROL_FLAGS_TTL_SECONDS = 300
 _bnl_control_flags_cache = None
 _bnl_control_flags_cached_at = None
@@ -4121,6 +4125,10 @@ def build_dossier_recommendation_diagnostics(guild_id=None) -> dict:
         "source_enrichment_last_match_kind": _source_enrichment_last_match_kind,
         "source_enrichment_last_source_counts": dict(_source_enrichment_last_source_counts),
         "source_enrichment_last_warning_counts": dict(_source_enrichment_last_warning_counts),
+        "source_enrichment_last_lookup_found": _source_enrichment_last_lookup_found,
+        "source_enrichment_last_possible_match_count": _source_enrichment_last_possible_match_count,
+        "source_enrichment_last_possible_match_names": list(_source_enrichment_last_possible_match_names),
+        "source_enrichment_last_resolution_mode": _source_enrichment_last_resolution_mode,
         "source_enrichment_last_error_status": _source_enrichment_last_error_status,
         **build_community_presence_diagnostics(
             DB_FILE,
@@ -4397,6 +4405,7 @@ async def maybe_handle_source_file_enrichment_command(message: discord.Message, 
     global _last_dossier_recommendation_status
     global _source_enrichment_last_subject, _source_enrichment_last_status, _source_enrichment_last_match_kind
     global _source_enrichment_last_source_counts, _source_enrichment_last_warning_counts, _source_enrichment_last_error_status
+    global _source_enrichment_last_lookup_found, _source_enrichment_last_possible_match_count, _source_enrichment_last_possible_match_names, _source_enrichment_last_resolution_mode
 
     matched, options, parse_error = parse_source_enrichment_command(clean_content)
     if not matched:
@@ -4426,6 +4435,8 @@ async def maybe_handle_source_file_enrichment_command(message: discord.Message, 
         return True
 
     subject = str(options.get("subject") or "").strip()
+    lookup_key = str(options.get("lookupKey") or "subject")
+    lookup_value = str(options.get("lookupValue") or subject).strip()
     dry_run = bool(options.get("dry_run"))
     result = await asyncio.to_thread(
         run_source_file_enrichment,
@@ -4437,12 +4448,18 @@ async def maybe_handle_source_file_enrichment_command(message: discord.Message, 
         lookup_func=lookup_source_file,
         sender=send_dossier_recommendation,
         environ=os.environ,
+        lookup_key=lookup_key,
+        lookup_value=lookup_value,
     )
     _source_enrichment_last_subject = str(result.get("subject") or subject or "none")[:90]
     _source_enrichment_last_status = str(result.get("status") or "unknown")[:80]
     _source_enrichment_last_match_kind = str(result.get("matchKind") or "none")[:80]
     _source_enrichment_last_source_counts = dict(result.get("sourceCounts") or {})
     _source_enrichment_last_warning_counts = dict(result.get("warningCounts") or {})
+    _source_enrichment_last_lookup_found = result.get("status") not in {"no_target", "possible_match_review", "lookup_failed"}
+    _source_enrichment_last_possible_match_count = int(result.get("possibleMatchCount") or 0)
+    _source_enrichment_last_possible_match_names = list(result.get("possibleMatchNames") or [])[:5]
+    _source_enrichment_last_resolution_mode = str(result.get("resolutionMode") or "none")[:80]
     _source_enrichment_last_error_status = "none" if result.get("ok") else _source_enrichment_last_status
     if dry_run:
         _last_dossier_recommendation_status = "source_enrichment_dry_run"
