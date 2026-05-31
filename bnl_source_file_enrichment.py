@@ -56,6 +56,16 @@ _EMAIL_RE = re.compile(r"\b[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}\b")
 _WEAK_ALIAS_RE = re.compile(r"\b(?:alias|known as|aka|connection|connected to|via|through|introduced by)\b", re.I)
 
 
+_ENRICHMENT_QUERY_KEYS = {
+    "alias": "alias",
+    "candidateid": "candidateId",
+    "candidate_id": "candidateId",
+    "normalizedname": "normalizedName",
+    "normalized_name": "normalizedName",
+    "subject": "subject",
+}
+
+
 def parse_source_enrichment_command(content: str) -> tuple[bool, dict[str, Any] | None, str]:
     """Parse operator Source File enrichment commands."""
 
@@ -71,10 +81,30 @@ def parse_source_enrichment_command(content: str) -> tuple[bool, dict[str, Any] 
     if not body:
         return True, None, "Use: `!bnl source enrich <subject> [| dry_run=true]`"
     parts = [part.strip() for part in body.split("|")]
-    subject = re.sub(r"\s+", " ", parts[0]).strip()
-    if not subject:
+    raw_target = re.sub(r"\s+", " ", parts[0]).strip()
+    if not raw_target:
         return True, None, "Subject is required."
-    options: dict[str, Any] = {"subject": subject, "dry_run": False}
+
+    lookup_key = "subject"
+    lookup_value = raw_target
+    key_match = re.match(r"^([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.+)$", raw_target, flags=re.S)
+    if key_match:
+        requested_key = key_match.group(1).strip().lower()
+        canonical_key = _ENRICHMENT_QUERY_KEYS.get(requested_key)
+        if not canonical_key:
+            return True, None, "Enrichment target must be subject, alias, candidateId, or normalizedName."
+        lookup_key = canonical_key
+        lookup_value = re.sub(r"\s+", " ", key_match.group(2).strip())
+        if not lookup_value:
+            return True, None, f"Lookup value for `{canonical_key}` is required."
+
+    options: dict[str, Any] = {
+        "subject": lookup_value,
+        "lookupKey": lookup_key,
+        "lookupValue": lookup_value,
+        lookup_key: lookup_value,
+        "dry_run": False,
+    }
     for extra in parts[1:]:
         if not extra:
             continue
@@ -82,9 +112,9 @@ def parse_source_enrichment_command(content: str) -> tuple[bool, dict[str, Any] 
         if not opt:
             return True, None, "Supported option: dry_run=true|false."
         key = opt.group(1).strip().lower()
-        value = opt.group(2).strip().lower()
+        value = opt.group(2).strip()
         if key in {"dry_run", "dryrun"}:
-            options["dry_run"] = value in {"true", "1", "yes", "on"}
+            options["dry_run"] = value.lower() in {"true", "1", "yes", "on"}
         else:
             return True, None, "Supported option: dry_run=true|false."
     return True, options, ""
@@ -165,6 +195,71 @@ def _first(obj: dict[str, Any], keys: tuple[str, ...]) -> Any:
         if obj.get(key) not in (None, "", []):
             return obj.get(key)
     return None
+
+
+def _possible_match_items(lookup_result: dict[str, Any]) -> list[dict[str, str]]:
+    data = lookup_result.get("data") if isinstance(lookup_result.get("data"), dict) else {}
+    raw = data.get("possibleMatches") or data.get("possible_matches") or data.get("matches") or []
+    if isinstance(raw, dict):
+        raw = [raw]
+    if not isinstance(raw, (list, tuple)):
+        return []
+    items: list[dict[str, str]] = []
+    for item in raw[:10]:
+        if isinstance(item, dict):
+            name = _safe_text(_first(item, ("name", "sourceFileName", "source_file_name", "subject", "displayName", "title", "normalizedName", "alias")), 90)
+            kind = _safe_text(_first(item, ("matchKind", "match_kind", "kind", "reason", "status")) or "possible_match", 80)
+            candidate_id = _safe_text(_first(item, ("candidateId", "candidate_id", "id", "sourceFileId", "source_file_id")), 90)
+        else:
+            name = _safe_text(item, 90)
+            kind = "possible_match"
+            candidate_id = ""
+        if name:
+            items.append({"name": name, "matchKind": kind, "candidateId": candidate_id})
+    return items
+
+
+def _is_confirmed_alias_lookup(lookup_result: dict[str, Any]) -> bool:
+    data = lookup_result.get("data") if isinstance(lookup_result.get("data"), dict) else {}
+    match_text = " ".join(str(x or "") for x in (
+        lookup_result.get("matchKind"), data.get("matchKind"), data.get("match_kind"), data.get("aliasStatus"), data.get("alias_status"),
+    )).lower()
+    return "alias" in match_text and "confirm" in match_text
+
+
+def _simple_expansion_note(subject: str, matches: list[dict[str, str]]) -> str:
+    compact_subject = re.sub(r"[^a-z0-9]", "", (subject or "").lower())
+    if not compact_subject:
+        return ""
+    for item in matches:
+        compact_name = re.sub(r"[^a-z0-9]", "", item.get("name", "").lower())
+        if compact_name and compact_name != compact_subject and (compact_name.startswith(compact_subject) or compact_name.endswith(compact_subject)):
+            return f"This looks like a simple prefix/suffix expansion of “{_safe_text(subject, 60)}”, but it still needs candidateId or exact-name targeting before notes are sent."
+    return ""
+
+
+def _possible_match_review_result(subject: str, lookup_result: dict[str, Any], *, dry_run: bool, resolution_mode: str, match_note: str = "") -> dict[str, Any]:
+    matches = _possible_match_items(lookup_result)
+    return {
+        "ok": True,
+        "dryRun": dry_run,
+        "subject": _safe_text(subject, 90),
+        "status": "possible_match_review",
+        "matchKind": "possible_match",
+        "matchNote": match_note or "Possible match found, but enrichment needs an exact active Source File target.",
+        "possibleMatches": matches,
+        "possibleMatchCount": len(matches),
+        "possibleMatchNames": [m["name"] for m in matches[:5]],
+        "resolutionMode": resolution_mode,
+        "sections": {},
+        "sourceCounts": {},
+        "warningCounts": {},
+        "sourceTypes": [],
+        "warnings": [],
+        "sent": False,
+        "sendResult": {},
+        "runTime": datetime.now(timezone.utc).isoformat(),
+    }
 
 
 def classify_source_match(lookup_result: dict[str, Any]) -> tuple[str, str, dict[str, Any]]:
@@ -427,18 +522,37 @@ def run_source_file_enrichment(
     lookup_func: Callable[[dict[str, str]], dict[str, Any]] = lookup_source_file,
     sender: Callable[[dict[str, Any]], dict[str, Any]] = send_dossier_recommendation,
     environ: dict[str, str] | None = None,
+    lookup_key: str = "subject",
+    lookup_value: str | None = None,
 ) -> dict[str, Any]:
-    query = {"lookupKey": "subject", "lookupValue": subject, "subject": subject}
+    canonical_key = lookup_key if lookup_key in {"subject", "alias", "candidateId", "normalizedName"} else "subject"
+    target_value = (lookup_value if lookup_value is not None else subject) or ""
+    query = {"lookupKey": canonical_key, "lookupValue": target_value, canonical_key: target_value}
     lookup_result = lookup_func(query)
     match_kind, match_note, source_file = classify_source_match(lookup_result)
-    if match_kind in {"none", "error"}:
+    resolution_mode = {"subject": "exact", "candidateId": "candidateId", "alias": "alias", "normalizedName": "exact"}.get(canonical_key, "exact")
+
+    if match_kind == "none":
+        possible_matches = _possible_match_items(lookup_result)
+        if possible_matches:
+            note = "Possible match found, but enrichment needs an exact active Source File target."
+            if canonical_key == "alias":
+                note = "Alias lookup only returned unconfirmed possible matches; use candidateId after review."
+            expansion_note = _simple_expansion_note(target_value, possible_matches)
+            if expansion_note:
+                note = f"{note} {expansion_note}"
+            return _possible_match_review_result(target_value, lookup_result, dry_run=dry_run, resolution_mode="possible_match_review", match_note=note)
         return {
-            "ok": match_kind != "error",
+            "ok": True,
             "dryRun": dry_run,
-            "subject": _safe_text(subject, 90),
-            "status": "no_target" if match_kind == "none" else "lookup_failed",
+            "subject": _safe_text(target_value, 90),
+            "status": "no_target",
             "matchKind": match_kind,
             "matchNote": match_note,
+            "possibleMatches": [],
+            "possibleMatchCount": 0,
+            "possibleMatchNames": [],
+            "resolutionMode": "no_target",
             "sections": {},
             "sourceCounts": {},
             "warningCounts": {},
@@ -448,15 +562,51 @@ def run_source_file_enrichment(
             "sendResult": {},
             "runTime": datetime.now(timezone.utc).isoformat(),
         }
-    evidence = collect_source_enrichment_evidence(db_path, guild_id, subject, rd_context=rd_context, lookup_result=lookup_result)
+    if match_kind == "error":
+        return {
+            "ok": False,
+            "dryRun": dry_run,
+            "subject": _safe_text(target_value, 90),
+            "status": "lookup_failed",
+            "matchKind": match_kind,
+            "matchNote": match_note,
+            "possibleMatches": [],
+            "possibleMatchCount": 0,
+            "possibleMatchNames": [],
+            "resolutionMode": "no_target",
+            "sections": {},
+            "sourceCounts": {},
+            "warningCounts": {},
+            "sourceTypes": [],
+            "warnings": [],
+            "sent": False,
+            "sendResult": {},
+            "runTime": datetime.now(timezone.utc).isoformat(),
+        }
+
+    if canonical_key == "alias" and not _is_confirmed_alias_lookup(lookup_result):
+        possible_result = dict(lookup_result)
+        data = possible_result.get("data") if isinstance(possible_result.get("data"), dict) else {}
+        source_name = _first(_source_file_obj(possible_result), ("name", "sourceFileName", "subject", "displayName", "title", "normalizedName"))
+        data = dict(data)
+        data["possibleMatches"] = data.get("possibleMatches") or [{"name": source_name or target_value, "matchKind": lookup_result.get("matchKind") or "unconfirmed_alias", "candidateId": _first(_source_file_obj(possible_result), ("candidateId", "candidate_id", "id"))}]
+        possible_result["data"] = data
+        return _possible_match_review_result(target_value, possible_result, dry_run=dry_run, resolution_mode="possible_match_review", match_note="Alias lookup was not a confirmed alias match; use candidateId after review.")
+
+    effective_subject = _first(source_file, ("name", "sourceFileName", "subject", "displayName", "title", "normalizedName")) or target_value
+    evidence = collect_source_enrichment_evidence(db_path, guild_id, str(effective_subject), rd_context=rd_context, lookup_result=lookup_result)
     packet = {
         "ok": True,
         "dryRun": dry_run,
-        "subject": _safe_text(subject, 90),
+        "subject": _safe_text(effective_subject, 90),
         "status": "dry_run" if dry_run else "ready_to_send",
         "matchKind": match_kind,
         "matchNote": match_note,
         "sourceFile": source_file,
+        "possibleMatches": [],
+        "possibleMatchCount": 0,
+        "possibleMatchNames": [],
+        "resolutionMode": resolution_mode,
         "sections": evidence["sections"],
         "sourceCounts": evidence["sourceCounts"],
         "warningCounts": evidence["warningCounts"],
@@ -482,8 +632,34 @@ def run_source_file_enrichment(
 def format_source_enrichment_response(result: dict[str, Any]) -> str:
     subject = _safe_text(result.get("subject") or "subject", 90)
     match_kind = _safe_text(result.get("matchKind") or "none", 80)
+    if result.get("status") == "possible_match_review":
+        matches = result.get("possibleMatches") or []
+        lines = [
+            f"Source enrichment: No confirmed target found for “{subject}.”",
+            "Possible match found, but enrichment needs an exact active Source File target.",
+        ]
+        if len(matches) == 1:
+            item = matches[0]
+            candidate = _safe_text(item.get("candidateId"), 90)
+            lines.append(f"Possible match found: {_safe_text(item.get('name'), 90)}")
+            lines.append(f"Match kind: {_safe_text(item.get('matchKind') or 'possible_match', 80)}")
+            target_hint = "Use " + (f"candidateId={candidate} or " if candidate else "") + "exact name to target it."
+            lines.append(target_hint)
+        elif matches:
+            lines.append("Possible matches (narrow with exact name or candidateId):")
+            for item in matches[:5]:
+                candidate = _safe_text(item.get("candidateId"), 90)
+                suffix = f" — candidateId={candidate}" if candidate else ""
+                lines.append(f"* {_safe_text(item.get('name'), 90)} — {_safe_text(item.get('matchKind') or 'possible_match', 80)}{suffix}")
+        note = _safe_text(result.get("matchNote"), 220)
+        if note and note not in lines:
+            lines.append(note)
+        lines.append("No notes were sent.")
+        if len(matches) != 1:
+            lines.append("Use exact name or candidateId=<id> to target one active Source File.")
+        return "\n".join(lines)[:1900]
     if result.get("status") == "no_target":
-        return (f"Source enrichment: no target found for “{subject}.”\n"
+        return (f"Source enrichment: No confirmed target found for “{subject}.”\n"
                 "Next: create/promote a Candidate Intake item first or run candidate bridge/discovery. No notes were sent.")
     if result.get("status") == "lookup_failed":
         return f"Source enrichment lookup failed for “{subject}”: {_safe_text(result.get('matchNote'), 140)}"
