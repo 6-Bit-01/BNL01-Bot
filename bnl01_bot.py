@@ -245,6 +245,50 @@ class MemoryWriteDecision:
     visibility: str
 
 
+RESPONSE_TIMING_IMMEDIATE_COMMAND = "immediate_command"
+RESPONSE_TIMING_PACED_DIRECT = "paced_direct"
+RESPONSE_TIMING_BATCHED_CHANNEL = "batched_channel"
+RESPONSE_TIMING_DEFERRED_PAYLOAD_SESSION = "deferred_payload_session"
+RESPONSE_TIMING_SILENT_OBSERVE = "silent_observe"
+RESPONSE_TIMING_BLOCKED = "blocked"
+
+RESPONSE_GENERATION_DETERMINISTIC_TEMPLATE = "deterministic_template"
+RESPONSE_GENERATION_GEMINI_NORMAL_CHAT = "gemini_normal_chat"
+RESPONSE_GENERATION_GEMINI_SHOW_STATUS = "gemini_show_status"
+RESPONSE_GENERATION_GEMINI_PAYLOAD_TASK = "gemini_payload_task"
+RESPONSE_GENERATION_OPERATOR_COMMAND_HANDLER = "operator_command_handler"
+RESPONSE_GENERATION_NONE = "none"
+
+BATCH_BEHAVIOR_ENTER_BATCH = "enter_batch"
+BATCH_BEHAVIOR_PREEMPT_BATCH = "preempt_batch"
+BATCH_BEHAVIOR_DO_NOT_BATCH = "do_not_batch"
+BATCH_BEHAVIOR_FLUSH_BATCH = "flush_batch"
+BATCH_BEHAVIOR_NOT_APPLICABLE = "not_applicable"
+
+PACING_BEHAVIOR_MIN_DELAY = "min_delay"
+PACING_BEHAVIOR_PAYLOAD_DELAY = "payload_delay"
+PACING_BEHAVIOR_NONE = "none"
+
+
+@dataclass(frozen=True)
+class ConversationPlan:
+    route_mode: str
+    channel_policy: str
+    route_decision: str
+    response_timing: str
+    response_generation: str
+    batch_behavior: str
+    pacing_behavior: str
+    memory_injection: str
+    memory_write_policy: str
+    subject_extraction_allowed: bool
+    source_context_allowed: bool
+    should_reply: bool
+    reason: str
+    direct_session_used: bool = False
+    batch_bypass_reason: str = ""
+
+
 ROUTE_MODE_CONTRACTS = {
     ROUTE_MODE_NORMAL_CHAT: RouteModeContract(ROUTE_MODE_NORMAL_CHAT, frozenset(CONVERSATIONAL_POLICIES), frozenset({"room", "public_safe_memory", "show_status_public"}), frozenset({"source_safe_public"}), "save_rows_when_policy_known", "user_value_gated_public_only", "disabled_for_casual_questions", "public_safe"),
     ROUTE_MODE_SIMPLE_GREETING: RouteModeContract(ROUTE_MODE_SIMPLE_GREETING, frozenset(CONVERSATIONAL_POLICIES), frozenset({"display_name"}), frozenset(), "save_row_only", "disabled", "disabled", "public_safe_short"),
@@ -4929,7 +4973,8 @@ SCRIPTED_MODE_LEAK_PATTERNS = [
     r"records are thin", r"suspicious blinking light", r"preliminary analysis",
     r"compromised broadcast loop", r"data stream", r"archival query",
     r"source coverage", r"classification", r"existing dossier update",
-    r"\bcandidate\b", r"^[^\n:]{1,80}:\s*records are thin",
+    r"\bcandidate\b", r"optimal parameters", r"ambient signal patterns",
+    r"^[^\n:]{1,80}:\s*records are thin",
 ]
 
 
@@ -4954,9 +4999,241 @@ def apply_response_mode_contamination_guard(response: str, route_mode: str, user
     return safe_fallback_response_for_mode_leak(user_name), True
 
 
+SIMPLE_GREETING_RESPONSE_POOL = (
+    "Hey {name}. I’m here.",
+    "Hi {name}. I’m here with you.",
+    "Hey {name}. Present and listening.",
+    "Hello {name}. I’m here — what are we working on?",
+)
+
+
 def build_simple_greeting_response(user_name: str = "") -> str:
     name = (user_name or "").strip() or "there"
-    return f"Hey {name}. I’m here."
+    template = random.choice(SIMPLE_GREETING_RESPONSE_POOL)
+    return template.format(name=name)
+
+
+def _conversation_plan_log(plan: ConversationPlan) -> None:
+    logging.info(
+        "conversation_plan route_mode=%s timing=%s generation=%s batch=%s pacing=%s reason=%s",
+        plan.route_mode,
+        plan.response_timing,
+        plan.response_generation,
+        plan.batch_behavior,
+        plan.pacing_behavior,
+        plan.reason,
+    )
+    logging.info(
+        "conversation_batch_decision route_mode=%s behavior=%s bypass_reason=%s",
+        plan.route_mode,
+        plan.batch_behavior,
+        plan.batch_bypass_reason or "none",
+    )
+    logging.info(
+        "conversation_direct_session_decision route_mode=%s direct_session_used=%s timing=%s",
+        plan.route_mode,
+        int(plan.direct_session_used),
+        plan.response_timing,
+    )
+
+
+def plan_conversation_response(
+    clean_content: str,
+    channel_policy: str,
+    *,
+    route_mode: str | None = None,
+    active_channel: bool = False,
+    real_direct_target: bool = False,
+    followup_candidate: bool = False,
+    channel_allows_conversation: bool = False,
+    batching_enabled: bool | None = None,
+    payload_expected: bool = False,
+    payload_count: int = 0,
+    show_state: bool = False,
+    operator_command: bool = False,
+    source_command: bool = False,
+    active_direct_session: bool = False,
+) -> ConversationPlan:
+    """Return the conversation coordinator decision before any normal reply is sent.
+
+    Pipeline audit map:
+    - Commands/protected hooks are immediate_command/operator handlers and stay outside
+      normal chat generation.
+    - Direct mentions, replies, recent direct follow-ups, and active/sealed-test free-speak
+      enter paced_direct unless they intentionally start/continue a deferred payload session.
+    - Active-channel non-direct messages enter debounce batching when batching is enabled;
+      otherwise they are observed silently.
+    - Simple greetings keep the PR #196 route/memory boundary, but are planned as paced
+      direct deterministic responses instead of replying from a hardcoded fast path.
+    - Normal Gemini chat can inject public-safe memory; simple greetings minimize memory;
+      source/scouting context is blocked unless the route contract explicitly allows it.
+    """
+    batching = BNL_ACTIVE_BATCHING_ENABLED if batching_enabled is None else bool(batching_enabled)
+    mode = route_mode or classify_route_mode(
+        clean_content,
+        channel_policy,
+        real_direct_target=real_direct_target,
+        active_channel=active_channel,
+        payload_expected=payload_expected,
+        show_state=show_state,
+    )
+    if operator_command or mode == ROUTE_MODE_OPERATOR_COMMAND:
+        plan = ConversationPlan(
+            mode,
+            channel_policy,
+            "operator_command",
+            RESPONSE_TIMING_IMMEDIATE_COMMAND,
+            RESPONSE_GENERATION_OPERATOR_COMMAND_HANDLER,
+            BATCH_BEHAVIOR_DO_NOT_BATCH,
+            PACING_BEHAVIOR_NONE,
+            "disabled",
+            "operator_audit_only",
+            False,
+            mode in SOURCE_INTERNAL_MODES,
+            True,
+            "operator_command_handler",
+        )
+        _conversation_plan_log(plan)
+        return plan
+    if source_command or mode in SOURCE_INTERNAL_MODES:
+        plan = ConversationPlan(
+            mode,
+            channel_policy,
+            "source_or_internal_command",
+            RESPONSE_TIMING_IMMEDIATE_COMMAND,
+            RESPONSE_GENERATION_OPERATOR_COMMAND_HANDLER,
+            BATCH_BEHAVIOR_DO_NOT_BATCH,
+            PACING_BEHAVIOR_NONE,
+            "disabled",
+            get_route_mode_contract(mode).save_behavior,
+            True,
+            True,
+            True,
+            "explicit_source_or_internal_route",
+        )
+        _conversation_plan_log(plan)
+        return plan
+
+    direct_like = bool(real_direct_target or followup_candidate)
+    if direct_like and payload_expected and payload_count == 0:
+        plan = ConversationPlan(
+            ROUTE_MODE_DIRECT_PAYLOAD,
+            channel_policy,
+            "direct_payload_session_start",
+            RESPONSE_TIMING_DEFERRED_PAYLOAD_SESSION,
+            RESPONSE_GENERATION_GEMINI_PAYLOAD_TASK,
+            BATCH_BEHAVIOR_DO_NOT_BATCH,
+            PACING_BEHAVIOR_PAYLOAD_DELAY,
+            "minimal_public_safe",
+            get_route_mode_contract(ROUTE_MODE_DIRECT_PAYLOAD).save_behavior,
+            True,
+            False,
+            False,
+            "awaiting_payload_lines",
+            direct_session_used=True,
+        )
+        _conversation_plan_log(plan)
+        return plan
+    if active_direct_session:
+        plan = ConversationPlan(
+            ROUTE_MODE_DIRECT_PAYLOAD,
+            channel_policy,
+            "direct_payload_session_continue",
+            RESPONSE_TIMING_DEFERRED_PAYLOAD_SESSION,
+            RESPONSE_GENERATION_GEMINI_PAYLOAD_TASK,
+            BATCH_BEHAVIOR_DO_NOT_BATCH,
+            PACING_BEHAVIOR_PAYLOAD_DELAY,
+            "minimal_public_safe",
+            get_route_mode_contract(ROUTE_MODE_DIRECT_PAYLOAD).save_behavior,
+            True,
+            False,
+            False,
+            "collecting_payload_lines",
+            direct_session_used=True,
+        )
+        _conversation_plan_log(plan)
+        return plan
+    if active_channel and not real_direct_target and not followup_candidate:
+        if batching:
+            plan = ConversationPlan(
+                mode,
+                channel_policy,
+                "active_channel_batch",
+                RESPONSE_TIMING_BATCHED_CHANNEL,
+                RESPONSE_GENERATION_GEMINI_NORMAL_CHAT,
+                BATCH_BEHAVIOR_ENTER_BATCH,
+                PACING_BEHAVIOR_NONE,
+                "batch_prompt_public_safe",
+                get_route_mode_contract(mode).save_behavior,
+                False,
+                False,
+                False,
+                "non_direct_active_message_batched",
+            )
+        else:
+            plan = ConversationPlan(
+                mode,
+                channel_policy,
+                "active_channel_batch_disabled",
+                RESPONSE_TIMING_SILENT_OBSERVE,
+                RESPONSE_GENERATION_NONE,
+                BATCH_BEHAVIOR_DO_NOT_BATCH,
+                PACING_BEHAVIOR_NONE,
+                "disabled",
+                get_route_mode_contract(mode).save_behavior,
+                False,
+                False,
+                False,
+                "active_batching_disabled",
+            )
+        _conversation_plan_log(plan)
+        return plan
+    if direct_like:
+        generation = RESPONSE_GENERATION_GEMINI_NORMAL_CHAT
+        memory_injection = "public_safe"
+        if mode == ROUTE_MODE_SIMPLE_GREETING:
+            generation = RESPONSE_GENERATION_DETERMINISTIC_TEMPLATE
+            memory_injection = "minimal_display_name_only"
+        elif show_state or mode == ROUTE_MODE_SHOW_STATUS:
+            generation = RESPONSE_GENERATION_GEMINI_SHOW_STATUS
+        elif payload_expected or payload_count:
+            mode = ROUTE_MODE_DIRECT_PAYLOAD
+            generation = RESPONSE_GENERATION_GEMINI_PAYLOAD_TASK
+        plan = ConversationPlan(
+            mode,
+            channel_policy,
+            "direct" if real_direct_target else "active_direct",
+            RESPONSE_TIMING_PACED_DIRECT,
+            generation,
+            BATCH_BEHAVIOR_DO_NOT_BATCH if mode == ROUTE_MODE_SIMPLE_GREETING else BATCH_BEHAVIOR_PREEMPT_BATCH,
+            PACING_BEHAVIOR_PAYLOAD_DELAY if mode == ROUTE_MODE_DIRECT_PAYLOAD else PACING_BEHAVIOR_MIN_DELAY,
+            memory_injection,
+            get_route_mode_contract(mode).save_behavior,
+            get_route_mode_contract(mode).subject_extraction_behavior not in {"disabled", "disabled_for_casual_questions"},
+            mode not in {ROUTE_MODE_SIMPLE_GREETING, ROUTE_MODE_NORMAL_CHAT, ROUTE_MODE_SHOW_STATUS},
+            True,
+            "direct_target_or_allowed_active_conversation",
+            batch_bypass_reason="direct_reply_preempts_batch" if mode != ROUTE_MODE_SIMPLE_GREETING else "simple_greeting_keeps_existing_batch",
+        )
+        _conversation_plan_log(plan)
+        return plan
+    plan = ConversationPlan(
+        mode,
+        channel_policy,
+        "policy_blocked",
+        RESPONSE_TIMING_BLOCKED,
+        RESPONSE_GENERATION_NONE,
+        BATCH_BEHAVIOR_NOT_APPLICABLE,
+        PACING_BEHAVIOR_NONE,
+        "disabled",
+        get_route_mode_contract(mode).save_behavior,
+        False,
+        False,
+        False,
+        "no_conversation_route",
+    )
+    _conversation_plan_log(plan)
+    return plan
 
 
 def update_last_route_debug(**kwargs) -> None:
@@ -4970,11 +5247,22 @@ def format_last_route_debug() -> str:
     ordered = [
         ("route_mode", "last route mode"),
         ("channel_policy", "last channel policy"),
+        ("conversation_plan_timing", "timing plan"),
+        ("conversation_plan_generation", "generation type"),
+        ("conversation_plan_batch", "batching decision"),
+        ("conversation_plan_pacing", "pacing decision"),
+        ("deterministic_response", "deterministic template used"),
+        ("direct_session_used", "direct session used"),
+        ("batch_bypass_reason", "batch bypass reason"),
+        ("memory_injection_decision", "memory injection decision"),
+        ("memory_write_decision", "memory write policy"),
         ("memory_context_injected", "memory injected"),
         ("durable_memory_write", "durable memory written"),
         ("source_analysis_context_injected", "source/scouting/classification context injected"),
+        ("source_context_allowed", "source context allowed"),
         ("subject_extraction_ran", "subject extraction ran"),
         ("scripted_mode_leak_guard_triggered", "leak guard fired"),
+        ("leak_guard_result", "leak guard result"),
         ("regenerated_for_mode_leak", "regeneration happened"),
         ("save_policy_reason", "save policy reason"),
     ]
@@ -5008,6 +5296,7 @@ def normal_chat_prompt_contract(route_mode: str) -> str:
         )
     return (
         "Mode contract: normal_chat. Answer the user's actual message conversationally using only public-safe context. "
+        "For casual check-ins like how are you/how's it going, answer naturally instead of with system-status boilerplate; do not say optimal parameters or ambient signal patterns. "
         "Do not classify the user's phrasing as a subject/entity. Do not mention dossiers, source files, classification, candidates, source coverage, archive queries, or scouting unless explicitly asked. "
         "Do not invent evidence or use scripted evidence-register phrasing.\n"
     )
@@ -12065,6 +12354,98 @@ async def _apply_direct_response_pacing(payload_expected: bool, payload_count: i
     await asyncio.sleep(delay_seconds)
 
 
+async def send_planned_conversation_response(
+    message: discord.Message,
+    response: str,
+    plan: ConversationPlan,
+    *,
+    website_read_model_context: str = "",
+    source_context_block: str = "",
+    community_scouting_ran: bool = False,
+    entity_subjects_detected_count: int = 0,
+    subject_extraction_ran: bool | None = None,
+    allow_model_save: bool = True,
+    mark_recent_direct: bool = True,
+    payload_expected: bool = False,
+    payload_count: int = 0,
+    regenerated_for_mode_leak: bool = False,
+) -> MemoryWriteDecision:
+    """Send a planned normal-conversation response through one governed path."""
+    logging.info(
+        "conversation_send planned=1 route_mode=%s timing=%s generation=%s",
+        plan.route_mode,
+        plan.response_timing,
+        plan.response_generation,
+    )
+    if plan.response_timing == RESPONSE_TIMING_PACED_DIRECT:
+        await _apply_direct_response_pacing(payload_expected, payload_count)
+
+    response, guard_triggered = apply_response_mode_contamination_guard(
+        response or "",
+        plan.route_mode,
+        getattr(message.author, "display_name", ""),
+    )
+    model_decision = MemoryWriteDecision(
+        False,
+        False,
+        False,
+        False,
+        False,
+        False,
+        "model_save_skipped",
+        context_visibility_for_policy(plan.channel_policy),
+    )
+    if allow_model_save and not website_read_model_context:
+        model_decision = save_model_message(
+            message.author.id,
+            message.guild.id,
+            response,
+            channel_name=getattr(message.channel, "name", ""),
+            channel_policy=plan.channel_policy,
+            channel_id=getattr(message.channel, "id", 0),
+            route_mode=plan.route_mode,
+        )
+    subject_ran = bool(subject_extraction_ran) if subject_extraction_ran is not None else bool(plan.subject_extraction_allowed)
+    update_last_route_debug(
+        route_mode=plan.route_mode,
+        route_decision=plan.route_decision,
+        channel_policy=plan.channel_policy,
+        conversation_plan_timing=plan.response_timing,
+        conversation_plan_generation=plan.response_generation,
+        conversation_plan_batch=plan.batch_behavior,
+        conversation_plan_pacing=plan.pacing_behavior,
+        conversation_plan_reason=plan.reason,
+        direct_session_used=plan.direct_session_used,
+        batch_bypass_reason=plan.batch_bypass_reason or "none",
+        deterministic_response=(plan.response_generation == RESPONSE_GENERATION_DETERMINISTIC_TEMPLATE),
+        simple_greeting_detected=(plan.route_mode == ROUTE_MODE_SIMPLE_GREETING),
+        memory_context_injected=(plan.memory_injection not in {"disabled", "minimal_display_name_only"}),
+        memory_context_source_count=0 if plan.memory_injection in {"disabled", "minimal_display_name_only"} else 1,
+        memory_injection_decision=plan.memory_injection,
+        memory_write_decision=plan.memory_write_policy,
+        source_analysis_context_injected=bool(source_context_block),
+        source_context_allowed=plan.source_context_allowed,
+        community_scouting_ran=community_scouting_ran,
+        entity_subjects_detected_count=entity_subjects_detected_count,
+        subject_extraction_ran=subject_ran,
+        save_policy_reason=getattr(model_decision, "reason", "unknown"),
+        durable_memory_write=getattr(model_decision, "write_memory_tier", False),
+        scripted_mode_leak_guard_triggered=guard_triggered,
+        leak_guard_result="triggered" if guard_triggered else "clear",
+        regenerated_for_mode_leak=regenerated_for_mode_leak,
+    )
+    if len(response) <= 2000:
+        await message.reply(response)
+    else:
+        chunks = split_message(response)
+        await message.reply(chunks[0] + "...")
+        for chunk in chunks[1:]:
+            await message.channel.send("..." + chunk)
+    if mark_recent_direct:
+        _mark_recent_direct_response(message.channel.id, message.author.id)
+    return model_decision
+
+
 def _build_direct_payload_prompt(base_prompt: str, payload_items, request_text: str) -> str:
     if not payload_items:
         return base_prompt
@@ -12519,19 +12900,36 @@ async def on_message(message: discord.Message):
             return
 
         route_mode = classify_route_mode(clean_content, channel_policy, real_direct_target=real_direct_target, active_channel=should_handle_as_active_channel)
-        save_decision = save_user_message(message.author.id, message.author.display_name, message.guild.id, clean_content, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0), route_mode=route_mode)
+        direct_content, direct_payload_items = clean_content, _collect_inline_direct_payload_items(clean_content)
+        payload_expected_for_plan, _ = _detect_request_payload_expectation(direct_content)
+        conversation_plan = plan_conversation_response(
+            clean_content,
+            channel_policy,
+            route_mode=route_mode,
+            active_channel=should_handle_as_active_channel,
+            real_direct_target=real_direct_target,
+            followup_candidate=followup_candidate,
+            channel_allows_conversation=channel_allows_conversation,
+            batching_enabled=BNL_ACTIVE_BATCHING_ENABLED,
+            payload_expected=payload_expected_for_plan,
+            payload_count=len(direct_payload_items),
+            active_direct_session=active_same_user_session,
+        )
+        save_decision = save_user_message(message.author.id, message.author.display_name, message.guild.id, clean_content, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0), route_mode=conversation_plan.route_mode)
 
-        # Mentions/replies -> immediate response (not batched)
-        if message_should_enter_conversation:
-            direct_content, direct_payload_items = clean_content, _collect_inline_direct_payload_items(clean_content)
-            if route_mode == ROUTE_MODE_SIMPLE_GREETING:
+        # Mentions/replies and recent follow-ups are planned direct responses;
+        # non-direct active-channel traffic falls through to the batch planner below.
+        if real_direct_target or followup_candidate:
+            route_mode = conversation_plan.route_mode
+            if conversation_plan.response_generation == RESPONSE_GENERATION_DETERMINISTIC_TEMPLATE:
                 response = build_simple_greeting_response(message.author.display_name)
-                response, guard_triggered = apply_response_mode_contamination_guard(response, route_mode, message.author.display_name)
-                model_decision = save_model_message(message.author.id, message.guild.id, response, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0), route_mode=route_mode)
-                update_last_route_debug(route_mode=route_mode, route_decision="simple_greeting", channel_policy=channel_policy, simple_greeting_detected=True, memory_context_injected=False, memory_context_source_count=0, source_analysis_context_injected=False, community_scouting_ran=False, entity_subjects_detected_count=0, subject_extraction_ran=False, save_policy_reason=getattr(model_decision, "reason", "unknown"), durable_memory_write=getattr(model_decision, "write_memory_tier", False), scripted_mode_leak_guard_triggered=guard_triggered, regenerated_for_mode_leak=False)
-                logging.info("conversation_route_debug route_mode=%s route_decision=simple_greeting channel_policy=%s simple_greeting_detected=1 memory_context_injected=0 source_analysis_context_injected=0 community_scouting_ran=0 entity_subjects_detected_count=0 durable_memory_write=%s scripted_mode_leak_guard_triggered=%s regenerated_for_mode_leak=0 save_policy_reason=%s", route_mode, channel_policy, int(getattr(model_decision, "write_memory_tier", False)), int(guard_triggered), getattr(model_decision, "reason", "unknown"))
-                await message.reply(response)
-                _mark_recent_direct_response(message.channel.id, message.author.id)
+                await send_planned_conversation_response(
+                    message,
+                    response,
+                    conversation_plan,
+                    payload_expected=False,
+                    payload_count=0,
+                )
                 return
             sealed_recall_guard = get_sealed_test_recall_guard_response(
                 channel_policy,
@@ -12627,6 +13025,17 @@ async def on_message(message: discord.Message):
                 show_state_ctx = _get_recent_show_state_topic_context(message.guild.id, message.channel.id, message.author.id, True, direct_content)
             if show_state_ctx and route_mode == ROUTE_MODE_NORMAL_CHAT:
                 route_mode = ROUTE_MODE_SHOW_STATUS
+                conversation_plan = plan_conversation_response(
+                    direct_content,
+                    channel_policy,
+                    route_mode=route_mode,
+                    active_channel=should_handle_as_active_channel,
+                    real_direct_target=real_direct_target,
+                    followup_candidate=followup_candidate,
+                    batching_enabled=BNL_ACTIVE_BATCHING_ENABLED,
+                    show_state=True,
+                    payload_count=len(direct_payload_items),
+                )
             room_context = build_room_first_direct_context(
                 message.guild.id,
                 message.channel.id,
@@ -12661,7 +13070,6 @@ async def on_message(message: discord.Message):
             log_response_style(message.guild.id, message.author.id, style_key)
 
             payload_expected, _ = _detect_request_payload_expectation(direct_content)
-            await _apply_direct_response_pacing(payload_expected, len(direct_payload_items))
             show_state_route = "get_gemini_response"
             if show_state_ctx:
                 show_state_route = "show_state_followup" if show_state_ctx.get("context_source") == "followup" else "show_state_direct"
@@ -12696,26 +13104,21 @@ async def on_message(message: discord.Message):
                     await message.reply("[NETWORK ERROR] Temporary synchronization issue. Try again.")
                     return
 
-            response, guard_triggered = apply_response_mode_contamination_guard(response, route_mode, message.author.display_name)
-            model_decision = MemoryWriteDecision(False, False, False, False, False, False, "sealed_test_model_save_skipped", context_visibility_for_policy(channel_policy))
-            if not is_sealed_test_channel and not website_read_model_context:
-                model_decision = save_model_message(message.author.id, message.guild.id, response, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0), route_mode=route_mode)
-            update_last_route_debug(route_mode=route_mode, route_decision="active_direct", channel_policy=channel_policy, simple_greeting_detected=(route_mode == ROUTE_MODE_SIMPLE_GREETING), memory_context_injected=(route_mode != ROUTE_MODE_SIMPLE_GREETING), memory_context_source_count=0 if route_mode == ROUTE_MODE_SIMPLE_GREETING else 1, source_analysis_context_injected=bool(source_context_block), community_scouting_ran=False, entity_subjects_detected_count=0, subject_extraction_ran=False, save_policy_reason=getattr(model_decision, "reason", "unknown"), durable_memory_write=getattr(model_decision, "write_memory_tier", False), scripted_mode_leak_guard_triggered=guard_triggered, regenerated_for_mode_leak=False)
-            logging.info("conversation_route_debug route_mode=%s route_decision=active_direct channel_policy=%s simple_greeting_detected=%s memory_context_injected=%s source_analysis_context_injected=%s community_scouting_ran=0 entity_subjects_detected_count=0 durable_memory_write=%s scripted_mode_leak_guard_triggered=%s regenerated_for_mode_leak=0 save_policy_reason=%s", route_mode, channel_policy, int(route_mode == ROUTE_MODE_SIMPLE_GREETING), int(route_mode != ROUTE_MODE_SIMPLE_GREETING), int(bool(source_context_block)), int(getattr(model_decision, "write_memory_tier", False)), int(guard_triggered), getattr(model_decision, "reason", "unknown"))
-
             if allow_greeting:
                 set_last_greeting_at(message.author.id, message.guild.id, datetime.now(PACIFIC_TZ).isoformat())
 
             if show_state_ctx:
                 _store_show_state_topic_context(message.guild.id, message.channel.id, message.author.id, show_state_ctx)
-            if len(response) <= 2000:
-                await message.reply(response)
-            else:
-                chunks = split_message(response)
-                await message.reply(chunks[0] + "...")
-                for chunk in chunks[1:]:
-                    await message.channel.send("..." + chunk)
-            _mark_recent_direct_response(message.channel.id, message.author.id)
+            await send_planned_conversation_response(
+                message,
+                response,
+                conversation_plan,
+                website_read_model_context=website_read_model_context,
+                source_context_block=source_context_block,
+                allow_model_save=not is_sealed_test_channel,
+                payload_expected=payload_expected,
+                payload_count=len(direct_payload_items),
+            )
             return
 
         # Non-mention in active channel -> batch (kill-switched by env)
@@ -12760,12 +13163,27 @@ async def on_message(message: discord.Message):
             return
         direct_content, direct_payload_items = clean_content, _collect_inline_direct_payload_items(clean_content)
         route_mode = classify_route_mode(direct_content, channel_policy, real_direct_target=real_direct_target, active_channel=False)
-        if route_mode == ROUTE_MODE_SIMPLE_GREETING:
+        payload_expected_for_plan, _ = _detect_request_payload_expectation(direct_content)
+        conversation_plan = plan_conversation_response(
+            direct_content,
+            channel_policy,
+            route_mode=route_mode,
+            active_channel=False,
+            real_direct_target=real_direct_target,
+            followup_candidate=False,
+            batching_enabled=BNL_ACTIVE_BATCHING_ENABLED,
+            payload_expected=payload_expected_for_plan,
+            payload_count=len(direct_payload_items),
+        )
+        if conversation_plan.response_generation == RESPONSE_GENERATION_DETERMINISTIC_TEMPLATE:
             response = build_simple_greeting_response(message.author.display_name)
-            response, guard_triggered = apply_response_mode_contamination_guard(response, route_mode, message.author.display_name)
-            model_decision = save_model_message(message.author.id, message.guild.id, response, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0), route_mode=route_mode)
-            update_last_route_debug(route_mode=route_mode, route_decision="direct_simple_greeting", channel_policy=channel_policy, simple_greeting_detected=True, memory_context_injected=False, memory_context_source_count=0, source_analysis_context_injected=False, community_scouting_ran=False, entity_subjects_detected_count=0, subject_extraction_ran=False, save_policy_reason=getattr(model_decision, "reason", "unknown"), durable_memory_write=getattr(model_decision, "write_memory_tier", False), scripted_mode_leak_guard_triggered=guard_triggered, regenerated_for_mode_leak=False)
-            await message.reply(response)
+            await send_planned_conversation_response(
+                message,
+                response,
+                conversation_plan,
+                payload_expected=False,
+                payload_count=0,
+            )
             return
         sealed_recall_guard = get_sealed_test_recall_guard_response(
             channel_policy,
@@ -12818,6 +13236,15 @@ async def on_message(message: discord.Message):
             show_state_ctx = _get_recent_show_state_topic_context(message.guild.id, message.channel.id, message.author.id, True, direct_content)
         if show_state_ctx and route_mode == ROUTE_MODE_NORMAL_CHAT:
             route_mode = ROUTE_MODE_SHOW_STATUS
+            conversation_plan = plan_conversation_response(
+                direct_content,
+                channel_policy,
+                route_mode=route_mode,
+                real_direct_target=real_direct_target,
+                batching_enabled=BNL_ACTIVE_BATCHING_ENABLED,
+                show_state=True,
+                payload_count=len(direct_payload_items),
+            )
         room_context = build_room_first_direct_context(
             message.guild.id,
             message.channel.id,
@@ -12854,7 +13281,15 @@ async def on_message(message: discord.Message):
         payload_expected, _ = _detect_request_payload_expectation(direct_content)
         if payload_expected:
             route_mode = ROUTE_MODE_DIRECT_PAYLOAD
-        await _apply_direct_response_pacing(payload_expected, len(direct_payload_items))
+            conversation_plan = plan_conversation_response(
+                direct_content,
+                channel_policy,
+                route_mode=route_mode,
+                real_direct_target=real_direct_target,
+                batching_enabled=BNL_ACTIVE_BATCHING_ENABLED,
+                payload_expected=True,
+                payload_count=len(direct_payload_items),
+            )
         show_state_route = "get_gemini_response"
         if show_state_ctx:
             show_state_route = "show_state_followup" if show_state_ctx.get("context_source") == "followup" else "show_state_direct"
@@ -12889,25 +13324,20 @@ async def on_message(message: discord.Message):
                 await message.reply("[NETWORK ERROR] Temporary synchronization issue. Try again.")
                 return
 
-        response, guard_triggered = apply_response_mode_contamination_guard(response, route_mode, message.author.display_name)
-        model_decision = MemoryWriteDecision(False, False, False, False, False, False, "model_save_skipped", context_visibility_for_policy(channel_policy))
-        if not website_read_model_context:
-            model_decision = save_model_message(message.author.id, message.guild.id, response, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0), route_mode=route_mode)
-        update_last_route_debug(route_mode=route_mode, route_decision="direct", channel_policy=channel_policy, simple_greeting_detected=(route_mode == ROUTE_MODE_SIMPLE_GREETING), memory_context_injected=(route_mode != ROUTE_MODE_SIMPLE_GREETING), memory_context_source_count=0 if route_mode == ROUTE_MODE_SIMPLE_GREETING else 1, source_analysis_context_injected=bool(source_context_block), community_scouting_ran=False, entity_subjects_detected_count=0, subject_extraction_ran=False, save_policy_reason=getattr(model_decision, "reason", "unknown"), durable_memory_write=getattr(model_decision, "write_memory_tier", False), scripted_mode_leak_guard_triggered=guard_triggered, regenerated_for_mode_leak=False)
-
         if allow_greeting:
             set_last_greeting_at(message.author.id, message.guild.id, datetime.now(PACIFIC_TZ).isoformat())
 
         if show_state_ctx:
             _store_show_state_topic_context(message.guild.id, message.channel.id, message.author.id, show_state_ctx)
-        if len(response) <= 2000:
-            await message.reply(response)
-        else:
-            chunks = split_message(response)
-            await message.reply(chunks[0] + "...")
-            for chunk in chunks[1:]:
-                await message.channel.send("..." + chunk)
-        _mark_recent_direct_response(message.channel.id, message.author.id)
+        await send_planned_conversation_response(
+            message,
+            response,
+            conversation_plan,
+            website_read_model_context=website_read_model_context,
+            source_context_block=source_context_block,
+            payload_expected=payload_expected,
+            payload_count=len(direct_payload_items),
+        )
         return
 
     # ---------------- NO ACTIVE CHANNEL SET (RESPOND TO MENTIONS/REPLIES ANYWHERE) ----------------
@@ -12917,12 +13347,27 @@ async def on_message(message: discord.Message):
             return
         direct_content, direct_payload_items = clean_content, _collect_inline_direct_payload_items(clean_content)
         route_mode = classify_route_mode(direct_content, channel_policy, real_direct_target=real_direct_target, active_channel=False)
-        if route_mode == ROUTE_MODE_SIMPLE_GREETING:
+        payload_expected_for_plan, _ = _detect_request_payload_expectation(direct_content)
+        conversation_plan = plan_conversation_response(
+            direct_content,
+            channel_policy,
+            route_mode=route_mode,
+            active_channel=False,
+            real_direct_target=real_direct_target,
+            followup_candidate=False,
+            batching_enabled=BNL_ACTIVE_BATCHING_ENABLED,
+            payload_expected=payload_expected_for_plan,
+            payload_count=len(direct_payload_items),
+        )
+        if conversation_plan.response_generation == RESPONSE_GENERATION_DETERMINISTIC_TEMPLATE:
             response = build_simple_greeting_response(message.author.display_name)
-            response, guard_triggered = apply_response_mode_contamination_guard(response, route_mode, message.author.display_name)
-            model_decision = save_model_message(message.author.id, message.guild.id, response, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0), route_mode=route_mode)
-            update_last_route_debug(route_mode=route_mode, route_decision="direct_simple_greeting", channel_policy=channel_policy, simple_greeting_detected=True, memory_context_injected=False, memory_context_source_count=0, source_analysis_context_injected=False, community_scouting_ran=False, entity_subjects_detected_count=0, subject_extraction_ran=False, save_policy_reason=getattr(model_decision, "reason", "unknown"), durable_memory_write=getattr(model_decision, "write_memory_tier", False), scripted_mode_leak_guard_triggered=guard_triggered, regenerated_for_mode_leak=False)
-            await message.reply(response)
+            await send_planned_conversation_response(
+                message,
+                response,
+                conversation_plan,
+                payload_expected=False,
+                payload_count=0,
+            )
             return
         sealed_recall_guard = get_sealed_test_recall_guard_response(
             channel_policy,
@@ -12975,6 +13420,15 @@ async def on_message(message: discord.Message):
             show_state_ctx = _get_recent_show_state_topic_context(message.guild.id, message.channel.id, message.author.id, True, direct_content)
         if show_state_ctx and route_mode == ROUTE_MODE_NORMAL_CHAT:
             route_mode = ROUTE_MODE_SHOW_STATUS
+            conversation_plan = plan_conversation_response(
+                direct_content,
+                channel_policy,
+                route_mode=route_mode,
+                real_direct_target=real_direct_target,
+                batching_enabled=BNL_ACTIVE_BATCHING_ENABLED,
+                show_state=True,
+                payload_count=len(direct_payload_items),
+            )
         room_context = build_room_first_direct_context(
             message.guild.id,
             message.channel.id,
@@ -13011,7 +13465,15 @@ async def on_message(message: discord.Message):
         payload_expected, _ = _detect_request_payload_expectation(direct_content)
         if payload_expected:
             route_mode = ROUTE_MODE_DIRECT_PAYLOAD
-        await _apply_direct_response_pacing(payload_expected, len(direct_payload_items))
+            conversation_plan = plan_conversation_response(
+                direct_content,
+                channel_policy,
+                route_mode=route_mode,
+                real_direct_target=real_direct_target,
+                batching_enabled=BNL_ACTIVE_BATCHING_ENABLED,
+                payload_expected=True,
+                payload_count=len(direct_payload_items),
+            )
         show_state_route = "get_gemini_response"
         if show_state_ctx:
             show_state_route = "show_state_followup" if show_state_ctx.get("context_source") == "followup" else "show_state_direct"
@@ -13046,19 +13508,20 @@ async def on_message(message: discord.Message):
                 await message.reply("[NETWORK ERROR] Temporary synchronization issue. Try again.")
                 return
 
-        response, guard_triggered = apply_response_mode_contamination_guard(response, route_mode, message.author.display_name)
-        model_decision = MemoryWriteDecision(False, False, False, False, False, False, "model_save_skipped", context_visibility_for_policy(channel_policy))
-        if not website_read_model_context:
-            model_decision = save_model_message(message.author.id, message.guild.id, response, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0), route_mode=route_mode)
-        update_last_route_debug(route_mode=route_mode, route_decision="direct", channel_policy=channel_policy, simple_greeting_detected=(route_mode == ROUTE_MODE_SIMPLE_GREETING), memory_context_injected=(route_mode != ROUTE_MODE_SIMPLE_GREETING), memory_context_source_count=0 if route_mode == ROUTE_MODE_SIMPLE_GREETING else 1, source_analysis_context_injected=bool(source_context_block), community_scouting_ran=False, entity_subjects_detected_count=0, subject_extraction_ran=False, save_policy_reason=getattr(model_decision, "reason", "unknown"), durable_memory_write=getattr(model_decision, "write_memory_tier", False), scripted_mode_leak_guard_triggered=guard_triggered, regenerated_for_mode_leak=False)
-
         if allow_greeting:
             set_last_greeting_at(message.author.id, message.guild.id, datetime.now(PACIFIC_TZ).isoformat())
 
         if show_state_ctx:
             _store_show_state_topic_context(message.guild.id, message.channel.id, message.author.id, show_state_ctx)
-        await message.reply(response if len(response) <= 2000 else response[:1900] + "...")
-        _mark_recent_direct_response(message.channel.id, message.author.id)
+        await send_planned_conversation_response(
+            message,
+            response,
+            conversation_plan,
+            website_read_model_context=website_read_model_context,
+            source_context_block=source_context_block,
+            payload_expected=payload_expected,
+            payload_count=len(direct_payload_items),
+        )
         return
 
 # ==================== SLASH COMMANDS ====================
