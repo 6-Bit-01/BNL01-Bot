@@ -40,10 +40,19 @@ _NAME_STOPWORDS = {
     "Unknown", "None", "Admin", "Operator", "Moderator", "Mod", "User", "Customer", "Account",
 }
 _WEAK_TERMS = {
-    "the", "and", "for", "with", "from", "this", "that", "source", "file", "dossier", "review",
-    "candidate", "memory", "conversation", "summary", "profile", "relationship", "community", "presence",
-    "internal", "public", "private", "unknown", "channel", "message", "discord", "operator", "admin",
-    "owner", "mod", "moderator", "someone", "somebody", "everyone", "anyone", "today", "tonight",
+    "a", "an", "the", "and", "or", "but", "if", "so", "to", "of", "in", "on", "at", "by",
+    "what", "when", "where", "why", "who", "how", "there", "here", "then", "than", "this",
+    "that", "these", "those", "such", "also", "just", "really", "very", "much", "more", "most",
+    "less", "least", "alot", "about", "into", "onto", "from", "with", "without", "because",
+    "before", "after", "again", "still", "even", "maybe", "probably", "actually", "basically",
+    "something", "anything", "nothing", "everything", "thing", "stuff", "people", "person", "anyone",
+    "someone", "somebody", "everyone", "nobody", "message", "messages", "conversation", "reply",
+    "replies", "said", "says", "say", "ask", "asked", "tell", "told", "think", "thought", "know",
+    "knew", "make", "made", "want", "need", "use", "used", "using", "channel", "server", "discord",
+    "bot", "command", "source", "file", "candidate", "candidates", "dossier", "dossiers", "memory",
+    "bridge", "public", "private", "internal", "review", "admin", "operator", "owner", "mod", "moderator",
+    "summary", "profile", "relationship", "community", "presence", "unknown", "today", "tonight", "user",
+    "customer", "account",
 }
 _SUBJECT_WORD = r"[A-Z0-9][A-Za-z0-9'_-]*"
 _SUBJECT_PHRASE = rf"{_SUBJECT_WORD}(?:\s+{_SUBJECT_WORD}){{0,4}}"
@@ -138,47 +147,169 @@ def _clean_subject_name(value: str) -> str:
     return cleaned[:80]
 
 
-def _is_weak_subject(value: str) -> bool:
-    name = _clean_subject_name(value)
-    if not name or len(name) < 3 or name in _NAME_STOPWORDS:
-        return True
+def _subject_words(value: str) -> list[str]:
+    return re.findall(r"[A-Za-z0-9]+", str(value or "").lower())
+
+
+def _is_trusted_name_source(source_type: str) -> bool:
+    return source_type in {"user_profiles", "community_presence", "trusted_name_field", "structured_identity"}
+
+
+def _has_actual_proper_noun(value: str) -> bool:
+    return any(re.match(r"^[A-Z0-9]", part) for part in re.findall(r"[A-Za-z0-9][A-Za-z0-9'_-]*", str(value or "")))
+
+
+def bridge_subject_rejection_reason(
+    subject: str,
+    evidence_context: str | dict[str, Any] | None = None,
+    source_type: str = "free_text",
+    *,
+    known_names: set[str] | None = None,
+    trusted_name_field: bool = False,
+    explicit_subject_language: bool = False,
+) -> str:
+    """Return an empty string when a subject is safe enough for bridge review."""
+
+    name = _clean_subject_name(subject)
+    known_keys = {subject_key(name) for name in (known_names or set()) if name}
+    trusted = trusted_name_field or _is_trusted_name_source(source_type)
+    if not name or len(name) < 3:
+        return "too_short"
+    if name in _NAME_STOPWORDS:
+        return "weak_generic_term"
     if re.fullmatch(r"\d+", name) or _LONG_ID_PATTERN.fullmatch(name):
-        return True
-    words = re.findall(r"[A-Za-z0-9]+", name.lower())
-    if not words or all(word in _WEAK_TERMS for word in words):
-        return True
-    if len(words) > 5:
-        return True
-    return False
+        return "numeric_or_id"
+    if not re.search(r"[A-Za-z0-9]", name):
+        return "punctuation_only"
+    words = _subject_words(name)
+    if not words:
+        return "punctuation_only"
+    compact = " ".join(words)
+    if compact in _WEAK_TERMS or compact == "a lot":
+        return "weak_generic_term"
+    if words[0] in _WEAK_TERMS or words[-1] in _WEAK_TERMS:
+        return "weak_edge_term"
+    weak_count = sum(1 for word in words if word in _WEAK_TERMS)
+    if weak_count and weak_count >= max(1, len(words) / 2):
+        return "mostly_weak_terms"
+    if len(words) > 4 and not trusted:
+        return "phrase_too_long"
+    if len(words) == 1 and name.islower() and not trusted and subject_key(name) not in known_keys:
+        return "lowercase_free_text_fragment"
+    if not trusted and subject_key(name) not in known_keys and not explicit_subject_language and not _has_actual_proper_noun(name):
+        return "lowercase_free_text_fragment"
+    return ""
 
 
-def _extract_subjects(text: str) -> list[str]:
-    subjects: list[str] = []
-    patterns = (
-        rf"\b(?:source file|dossier|profile|memory|fact|habit|relationship|journal|context|subject|candidate|regular|artist|collaborator|mod|moderator|supporter|sponsor|entity|concept|lore)\s+(?:for|on|about|named)?\s*({_SUBJECT_PHRASE})\b",
-        rf"\b({_SUBJECT_PHRASE})\s+(?:is|was|seems|appears|became|becomes|remains)\s+(?:a\s+)?(?:regular|known|recurring|artist|collaborator|mod|moderator|supporter|sponsor|entity|concept|candidate|subject)\b",
-        rf"\b(?:known as|called|named|aka)\s+({_SUBJECT_PHRASE})\b",
+def is_valid_bridge_subject(subject: str, evidence_context: str | dict[str, Any] | None = None, source_type: str = "free_text") -> bool:
+    """Strict public helper for Source Knowledge Bridge subject validation."""
+
+    return not bridge_subject_rejection_reason(subject, evidence_context, source_type)
+
+
+def _is_weak_subject(value: str) -> bool:
+    return bool(bridge_subject_rejection_reason(value, source_type="trusted_name_field", trusted_name_field=True))
+
+
+@dataclass
+class BridgeDiagnostics:
+    withheld_reasons: Counter = field(default_factory=Counter)
+    withheld_examples: dict[str, list[str]] = field(default_factory=dict)
+    rejected_source_counts: Counter = field(default_factory=Counter)
+
+    def reject(self, subject: str, source_type: str, reason: str) -> None:
+        if not reason:
+            return
+        self.withheld_reasons[reason] += 1
+        self.rejected_source_counts[source_type or "unknown"] += 1
+        examples = self.withheld_examples.setdefault(reason, [])
+        cleaned = _clean_subject_name(subject)
+        if cleaned and len(examples) < 5 and cleaned not in examples:
+            examples.append(cleaned)
+
+
+def _candidate_reason(candidate: str, source_type: str, known_names: set[str] | None, explicit: bool, trusted: bool) -> str:
+    return bridge_subject_rejection_reason(
+        candidate,
+        source_type=source_type,
+        known_names=known_names,
+        trusted_name_field=trusted,
+        explicit_subject_language=explicit,
     )
-    for pattern in patterns:
-        for match in re.finditer(pattern, text or "", flags=re.I):
-            candidate = _clean_subject_name(match.group(1))
-            if not _is_weak_subject(candidate):
-                subjects.append(candidate)
-    # Also capture explicitly capitalized short names in dense local summaries.
-    for match in re.finditer(rf"\b({_SUBJECT_PHRASE})\b", text or ""):
-        candidate = _clean_subject_name(match.group(1))
-        if candidate and not _is_weak_subject(candidate) and any(ch.isupper() for ch in candidate):
-            words = candidate.split()
-            if len(words) <= 3 and candidate not in subjects:
-                subjects.append(candidate)
-    deduped: list[str] = []
+
+
+def _add_candidate(
+    subjects: list[str],
+    seen: set[str],
+    candidate: str,
+    *,
+    source_type: str,
+    known_names: set[str] | None,
+    diagnostics: BridgeDiagnostics | None,
+    explicit: bool = False,
+    trusted: bool = False,
+) -> None:
+    cleaned = _clean_subject_name(candidate)
+    reason = _candidate_reason(cleaned, source_type, known_names, explicit, trusted)
+    if reason:
+        if diagnostics:
+            diagnostics.reject(cleaned or candidate, source_type, reason)
+        return
+    key = subject_key(cleaned)
+    if key not in seen:
+        seen.add(key)
+        subjects.append(cleaned)
+
+
+def _extract_known_name_mentions(text: str, known_names: set[str] | None) -> list[str]:
+    found: list[str] = []
+    for known in sorted(known_names or set(), key=lambda item: (-len(item), item.lower())):
+        cleaned = _clean_subject_name(known)
+        if not cleaned or bridge_subject_rejection_reason(cleaned, source_type="trusted_name_field", trusted_name_field=True):
+            continue
+        if re.search(rf"(?<![A-Za-z0-9]){re.escape(cleaned)}(?![A-Za-z0-9])", text or "", flags=re.I):
+            found.append(cleaned)
+    return found
+
+
+def _extract_subjects(
+    text: str,
+    *,
+    source_type: str = "free_text",
+    known_names: set[str] | None = None,
+    diagnostics: BridgeDiagnostics | None = None,
+    trusted_name_field: bool = False,
+) -> list[str]:
+    subjects: list[str] = []
     seen: set[str] = set()
-    for subject in subjects:
-        key = subject_key(subject)
-        if key not in seen:
-            seen.add(key)
-            deduped.append(subject)
-    return deduped[:8]
+    source = source_type or "free_text"
+    if trusted_name_field:
+        _add_candidate(subjects, seen, text, source_type=source, known_names=known_names, diagnostics=diagnostics, trusted=True)
+        return subjects[:8]
+
+    # Known display/preferred/community names are allowed to surface from broad text as corroborating evidence.
+    for known in _extract_known_name_mentions(text or "", known_names):
+        _add_candidate(subjects, seen, known, source_type=source, known_names=known_names, diagnostics=diagnostics, explicit=True)
+
+    label_patterns = (
+        rf"\b(?i:source file|dossier|profile|memory|fact|habit|relationship|journal|context|subject|candidate|regular|artist|collaborator|supporter|sponsor|entity|concept|lore)\s+(?i:for|on|about|named)?\s*({_SUBJECT_PHRASE})\b",
+        rf"\b(?i:known as|called|named|aka|artist|subject:)\s+({_SUBJECT_PHRASE})\b",
+        rf"\b(?i:source file for|source file on|dossier for|candidate named)\s+({_SUBJECT_PHRASE})\b",
+    )
+    statement_patterns = (
+        rf"\b({_SUBJECT_PHRASE})\s+(?i:is|was|seems|appears|became|becomes|remains)\s+(?i:a\s+|an\s+)?(?i:private\s+|internal\s+|public\s+|community\s+|known\s+|recurring\s+)*?(?i:regular|known|recurring|artist|collaborator|mod|moderator|supporter|sponsor|entity|concept|candidate|subject|participant)\b",
+        rf"\b({_SUBJECT_PHRASE})\s+(?i:aka|also known as|same as|same-as|alias for)\s+({_SUBJECT_PHRASE})\b",
+        rf"\b({_SUBJECT_PHRASE})\s+(?i:via|through|introduced\s+by|connected\s+to)\s+({_SUBJECT_PHRASE})\b",
+        rf"\b(?i:memory says|operator noted|manual note says)\s+({_SUBJECT_PHRASE})\s+(?i:is|was|seems|appears)?\s*(?i:a\s+|an\s+)?(?i:private\s+|internal\s+|public\s+|community\s+|known\s+|recurring\s+)*?(?i:regular|known|recurring|artist|collaborator|entity|concept|candidate|subject)\b",
+    )
+    for pattern in label_patterns + statement_patterns:
+        for match in re.finditer(pattern, text or ""):
+            _add_candidate(subjects, seen, match.group(1), source_type=source, known_names=known_names, diagnostics=diagnostics, explicit=True)
+            if len(match.groups()) > 1:
+                _add_candidate(subjects, seen, match.group(2), source_type=source, known_names=known_names, diagnostics=diagnostics, explicit=True)
+
+    # Intentionally no case-insensitive all-text subject sweep: lowercase filler must not become candidates.
+    return subjects[:8]
 
 
 def _alias_or_connection(text: str, subject: str) -> tuple[str, str]:
@@ -190,7 +321,7 @@ def _alias_or_connection(text: str, subject: str) -> tuple[str, str]:
         rf"\b({_SUBJECT_PHRASE})\s+(?:via|through|introduced\s+by|connected\s+to)\s+{re.escape(subject)}\b",
     )
     for pattern in patterns:
-        match = re.search(pattern, lowered, flags=re.I)
+        match = re.search(pattern, lowered)
         if match:
             connected = _clean_subject_name(match.group(1))
             if connected and not _is_weak_subject(connected) and subject_key(connected) != subject_key(subject):
@@ -212,7 +343,7 @@ def _add(accs: dict[str, KnowledgeAccumulator], item: KnowledgeEvidence) -> None
     accs[key].add(item)
 
 
-def _read_user_profiles(conn: sqlite3.Connection, guild_id: int | None, accs: dict[str, KnowledgeAccumulator]) -> None:
+def _read_user_profiles(conn: sqlite3.Connection, guild_id: int | None, accs: dict[str, KnowledgeAccumulator], known_names: set[str], diagnostics: BridgeDiagnostics) -> None:
     if not _table_exists(conn, "user_profiles"):
         return
     where = "WHERE guild_id=?" if guild_id else ""
@@ -220,54 +351,57 @@ def _read_user_profiles(conn: sqlite3.Connection, guild_id: int | None, accs: di
     for row in conn.execute(f"SELECT display_name, preferred_name FROM user_profiles {where} LIMIT 500", params):
         for name in (row[1], row[0]):
             subject = _clean_subject_name(name)
-            if _is_weak_subject(subject):
+            reason = bridge_subject_rejection_reason(subject, source_type="user_profiles", trusted_name_field=True)
+            if reason:
+                diagnostics.reject(subject or str(name or ""), "user_profiles", reason)
                 continue
+            known_names.add(subject)
             _add(accs, KnowledgeEvidence(subject, "user_profiles", "local_profile_observed", ["internal_only", "private_review_required", "owner_review_required", "public_use_not_allowed_until_review"], [_PRIVATE_WARNING], f"Local profile observed for {subject}.", 2))
             break
 
 
-def _read_user_memory_facts(conn: sqlite3.Connection, guild_id: int | None, accs: dict[str, KnowledgeAccumulator]) -> None:
+def _read_user_memory_facts(conn: sqlite3.Connection, guild_id: int | None, accs: dict[str, KnowledgeAccumulator], known_names: set[str], diagnostics: BridgeDiagnostics) -> None:
     if not _table_exists(conn, "user_memory_facts"):
         return
     where = "WHERE guild_id=?" if guild_id else ""
     params: tuple[Any, ...] = (guild_id,) if guild_id else ()
     for row in conn.execute(f"SELECT fact_key, fact_value, confidence FROM user_memory_facts {where} ORDER BY updated_at DESC LIMIT 800", params):
         text = f"{row[0]}: {row[1]}"
-        for subject in _extract_subjects(text):
+        for subject in _extract_subjects(text, source_type="user_memory_facts", known_names=known_names, diagnostics=diagnostics):
             ctype, connected = _alias_or_connection(text, subject)
             _add(accs, KnowledgeEvidence(subject, "user_memory_facts", "local_memory_fact", ["internal_only", "private_review_required", "owner_review_required", "public_use_not_allowed_until_review"], [_PRIVATE_WARNING], _safe_snippet(text), max(1, int(float(row[2] or 0.5) * 3)), ctype, connected))
 
 
-def _read_user_habits(conn: sqlite3.Connection, guild_id: int | None, accs: dict[str, KnowledgeAccumulator]) -> None:
+def _read_user_habits(conn: sqlite3.Connection, guild_id: int | None, accs: dict[str, KnowledgeAccumulator], known_names: set[str], diagnostics: BridgeDiagnostics) -> None:
     if not _table_exists(conn, "user_habits"):
         return
     where = "WHERE guild_id=?" if guild_id else ""
     params: tuple[Any, ...] = (guild_id,) if guild_id else ()
     for row in conn.execute(f"SELECT last_topic, total_messages FROM user_habits {where} ORDER BY updated_at DESC LIMIT 500", params):
         text = f"Habit trace topic: {row[0] or ''}; messages observed: {int(row[1] or 0)}"
-        for subject in _extract_subjects(str(row[0] or "")):
+        for subject in _extract_subjects(str(row[0] or ""), source_type="user_habits", known_names=known_names, diagnostics=diagnostics):
             _add(accs, KnowledgeEvidence(subject, "user_habits", "local_behavior_trace", ["internal_only", "private_review_required", "owner_review_required", "public_use_not_allowed_until_review"], [_PRIVATE_WARNING], _safe_snippet(text), 1))
 
 
-def _read_relationships(conn: sqlite3.Connection, guild_id: int | None, accs: dict[str, KnowledgeAccumulator]) -> None:
+def _read_relationships(conn: sqlite3.Connection, guild_id: int | None, accs: dict[str, KnowledgeAccumulator], known_names: set[str], diagnostics: BridgeDiagnostics) -> None:
     if _table_exists(conn, "relationship_state"):
         where = "WHERE guild_id=?" if guild_id else ""
         params: tuple[Any, ...] = (guild_id,) if guild_id else ()
         for row in conn.execute(f"SELECT last_topic, trust_stage, social_stance, interaction_count FROM relationship_state {where} ORDER BY updated_at DESC LIMIT 500", params):
             text = f"Relationship trace topic: {row[0] or ''}; stage {row[1] or 'unknown'}; stance {row[2] or 'unknown'}; interactions {int(row[3] or 0)}"
-            for subject in _extract_subjects(str(row[0] or "")):
+            for subject in _extract_subjects(str(row[0] or ""), source_type="relationship_state", known_names=known_names, diagnostics=diagnostics):
                 _add(accs, KnowledgeEvidence(subject, "relationship_state", "local_relationship_trace", ["internal_only", "private_review_required", "owner_review_required", "public_use_not_allowed_until_review"], [_PRIVATE_WARNING], _safe_snippet(text), 1))
     if _table_exists(conn, "relationship_journal"):
         where = "WHERE guild_id=?" if guild_id else ""
         params = (guild_id,) if guild_id else ()
         for row in conn.execute(f"SELECT entry_type, summary FROM relationship_journal {where} ORDER BY timestamp DESC LIMIT 800", params):
             text = f"{row[0]}: {row[1]}"
-            for subject in _extract_subjects(text):
+            for subject in _extract_subjects(text, source_type="relationship_journal", known_names=known_names, diagnostics=diagnostics):
                 ctype, connected = _alias_or_connection(text, subject)
                 _add(accs, KnowledgeEvidence(subject, "relationship_journal", "local_relationship_trace", ["internal_only", "private_review_required", "owner_review_required", "public_use_not_allowed_until_review"], [_PRIVATE_WARNING], _safe_snippet(text), 1, ctype, connected))
 
 
-def _read_conversations(conn: sqlite3.Connection, guild_id: int | None, accs: dict[str, KnowledgeAccumulator]) -> None:
+def _read_conversations(conn: sqlite3.Connection, guild_id: int | None, accs: dict[str, KnowledgeAccumulator], known_names: set[str], diagnostics: BridgeDiagnostics) -> None:
     if not _table_exists(conn, "conversations"):
         return
     columns = _columns(conn, "conversations")
@@ -281,24 +415,24 @@ def _read_conversations(conn: sqlite3.Connection, guild_id: int | None, accs: di
         if str(policy or "").lower() in _SKIP_POLICIES or str(channel_name or "").lower() in {"dm", "dms", "direct-message", "direct_messages"}:
             continue
         quality, labels, warnings = _labels_for_policy(str(policy or "unknown"))
-        for subject in _extract_subjects(str(content or "")):
+        for subject in _extract_subjects(str(content or ""), source_type="conversations", known_names=known_names, diagnostics=diagnostics):
             ctype, connected = _alias_or_connection(str(content or ""), subject)
             _add(accs, KnowledgeEvidence(subject, "conversations", quality, labels, warnings, _safe_snippet(f"{policy or 'unknown'} conversation {role or 'row'} mentions {subject}."), 2 if quality == "public_discord_observed" else 1, ctype, connected))
 
 
-def _read_memory_tiers(conn: sqlite3.Connection, guild_id: int | None, accs: dict[str, KnowledgeAccumulator]) -> None:
+def _read_memory_tiers(conn: sqlite3.Connection, guild_id: int | None, accs: dict[str, KnowledgeAccumulator], known_names: set[str], diagnostics: BridgeDiagnostics) -> None:
     if not _table_exists(conn, "memory_tiers"):
         return
     where = "WHERE guild_id=?" if guild_id else ""
     params = (guild_id,) if guild_id else ()
     for row in conn.execute(f"SELECT tier, summary, salience FROM memory_tiers {where} ORDER BY updated_at DESC LIMIT 800", params):
         text = f"{row[0]} memory: {row[1]}"
-        for subject in _extract_subjects(str(row[1] or "")):
+        for subject in _extract_subjects(str(row[1] or ""), source_type="memory_tiers", known_names=known_names, diagnostics=diagnostics):
             ctype, connected = _alias_or_connection(str(row[1] or ""), subject)
             _add(accs, KnowledgeEvidence(subject, "memory_tiers", "source_blind_memory_trace", ["source_blind_review_required", "internal_only", "owner_review_required", "public_use_not_allowed_until_review"], [SOURCE_BLIND_WARNING], _safe_snippet(text), max(1, int(float(row[2] or 0.5) * 2)), ctype, connected))
 
 
-def _read_broadcast_memory(conn: sqlite3.Connection, guild_id: int | None, accs: dict[str, KnowledgeAccumulator]) -> None:
+def _read_broadcast_memory(conn: sqlite3.Connection, guild_id: int | None, accs: dict[str, KnowledgeAccumulator], known_names: set[str], diagnostics: BridgeDiagnostics) -> None:
     if not _table_exists(conn, "broadcast_memory"):
         return
     where = "WHERE status='active'" + (" AND guild_id=?" if guild_id else "")
@@ -310,20 +444,23 @@ def _read_broadcast_memory(conn: sqlite3.Connection, guild_id: int | None, accs:
             labels.insert(0, "public_safe_candidate")
         else:
             labels.insert(0, "internal_only")
-        for subject in _extract_subjects(text):
+        for subject in _extract_subjects(text, source_type="broadcast_memory", known_names=known_names, diagnostics=diagnostics):
             ctype, connected = _alias_or_connection(text, subject)
             _add(accs, KnowledgeEvidence(subject, "broadcast_memory", "official_show_memory", labels, [_PUBLIC_REVIEW_WARNING], _safe_snippet(text), 3, ctype, connected))
 
 
-def _read_community_presence(conn: sqlite3.Connection, guild_id: int | None, accs: dict[str, KnowledgeAccumulator]) -> None:
+def _read_community_presence(conn: sqlite3.Connection, guild_id: int | None, accs: dict[str, KnowledgeAccumulator], known_names: set[str], diagnostics: BridgeDiagnostics) -> None:
     if not _table_exists(conn, "community_presence"):
         return
     where = "WHERE guild_id=?" if guild_id else ""
     params = (guild_id,) if guild_id else ()
     for row in conn.execute(f"SELECT display_name, mention_count, direct_interaction_count, operator_mention_count, connection_notes, evidence_snippets FROM community_presence {where} ORDER BY (mention_count + direct_interaction_count + operator_mention_count) DESC LIMIT 500", params):
         subject = _clean_subject_name(row[0])
-        if _is_weak_subject(subject):
+        reason = bridge_subject_rejection_reason(subject, source_type="community_presence", trusted_name_field=True)
+        if reason:
+            diagnostics.reject(subject or str(row[0] or ""), "community_presence", reason)
             continue
+        known_names.add(subject)
         notes = " ".join(_json_list(row[4])[:2] + _json_list(row[5])[:2])
         ctype, connected = _alias_or_connection(notes, subject)
         signals = int(row[1] or 0) + int(row[2] or 0) + int(row[3] or 0)
@@ -347,28 +484,31 @@ def collect_knowledge_bridge_candidates(db_path: str, guild_id: int | None = Non
 
     max_candidates = max(1, min(MAX_KNOWLEDGE_BRIDGE_LIMIT, int(limit or DEFAULT_KNOWLEDGE_BRIDGE_LIMIT)))
     accs: dict[str, KnowledgeAccumulator] = {}
+    known_names: set[str] = set()
+    diagnostics = BridgeDiagnostics()
     conn = sqlite3.connect(db_path)
     try:
-        _read_user_profiles(conn, guild_id, accs)
-        _read_user_memory_facts(conn, guild_id, accs)
-        _read_user_habits(conn, guild_id, accs)
-        _read_relationships(conn, guild_id, accs)
-        _read_conversations(conn, guild_id, accs)
-        _read_memory_tiers(conn, guild_id, accs)
-        _read_broadcast_memory(conn, guild_id, accs)
-        _read_community_presence(conn, guild_id, accs)
+        # Build trusted name registry first, before broad free-text stores.
+        _read_user_profiles(conn, guild_id, accs, known_names, diagnostics)
+        _read_community_presence(conn, guild_id, accs, known_names, diagnostics)
+        _read_user_memory_facts(conn, guild_id, accs, known_names, diagnostics)
+        _read_user_habits(conn, guild_id, accs, known_names, diagnostics)
+        _read_relationships(conn, guild_id, accs, known_names, diagnostics)
+        _read_conversations(conn, guild_id, accs, known_names, diagnostics)
+        _read_memory_tiers(conn, guild_id, accs, known_names, diagnostics)
+        _read_broadcast_memory(conn, guild_id, accs, known_names, diagnostics)
     finally:
         conn.close()
 
     for item in rd_context or []:
         text = " ".join(str(item.get(key) or "") for key in ("user_request", "main_subject", "response_summary", "suggested_lane")) if isinstance(item, dict) else str(item)
-        for subject in _extract_subjects(text):
+        for subject in _extract_subjects(text, source_type="rd_context", known_names=known_names, diagnostics=diagnostics):
             ctype, connected = _alias_or_connection(text, subject)
             _add(accs, KnowledgeEvidence(subject, "rd_context", "internal_operator_context", ["internal_only", "owner_review_required", "public_use_not_allowed_until_review"], [_PRIVATE_WARNING], _safe_snippet(text), 2, ctype, connected))
 
     candidates: list[dict[str, Any]] = []
     duplicate_count = 0
-    withheld_count = 0
+    withheld_count = sum(diagnostics.withheld_reasons.values())
     seen_ingest: set[str] = set()
     for key, acc in sorted(accs.items(), key=lambda item: (-sum(e.confidence_points for e in item[1].evidence), item[0])):
         if not acc.evidence:
@@ -428,6 +568,12 @@ def collect_knowledge_bridge_candidates(db_path: str, guild_id: int | None = Non
     withheld_count += limited
     source_counts = Counter(source for c in candidates for source in c["sourceTypes"])
     warning_counts = Counter(warning for c in candidates for warning in c["warnings"])
+    top_withheld_reasons = dict(diagnostics.withheld_reasons.most_common(8))
+    junk_terms_blocked = sum(
+        count
+        for reason, count in diagnostics.withheld_reasons.items()
+        if reason in {"weak_generic_term", "weak_edge_term", "mostly_weak_terms", "lowercase_free_text_fragment"}
+    )
     return {
         "totalSubjectsFound": len(accs),
         "sendableRecommendationCount": len(candidates),
@@ -435,6 +581,16 @@ def collect_knowledge_bridge_candidates(db_path: str, guild_id: int | None = Non
         "withheldCount": withheld_count,
         "sourceCounts": dict(sorted(source_counts.items())),
         "warningCounts": dict(sorted(warning_counts.items())),
+        "topWithheldReasons": top_withheld_reasons,
+        "junkTermsBlockedCount": junk_terms_blocked,
+        "rejectedSourceCounts": dict(sorted(diagnostics.rejected_source_counts.items())),
+        "withheldExamples": {reason: values for reason, values in sorted(diagnostics.withheld_examples.items())},
+        "diagnosticSummary": {
+            "knownNameCount": len(known_names),
+            "knownNamesSample": sorted(known_names, key=str.lower)[:10],
+            "sourceTablesWithCandidates": sorted(source_counts),
+            "rejectedSourceCounts": dict(sorted(diagnostics.rejected_source_counts.items())),
+        },
         "candidates": candidates,
         "payloads": [c["payload"] for c in candidates],
     }
@@ -491,14 +647,17 @@ def format_source_knowledge_bridge_response(result: dict[str, Any]) -> str:
     names = [str(c.get("subjectName") or "subject")[:40] for c in (result.get("candidates") or [])[:5]]
     sources = sorted((result.get("sourceCounts") or {}).items(), key=lambda item: (-int(item[1]), item[0]))[:3]
     warnings = sorted((result.get("warningCounts") or {}).items(), key=lambda item: (-int(item[1]), item[0]))[:2]
+    withheld_reasons = sorted((result.get("topWithheldReasons") or {}).items(), key=lambda item: (-int(item[1]), item[0]))[:3]
     source_text = ", ".join(source for source, _count in sources) or "none"
     warning_text = ", ".join(f"{count} {warning}" for warning, count in warnings) or "none"
+    withheld_text = ", ".join(f"{reason}={count}" for reason, count in withheld_reasons) or "none"
     candidate_text = ", ".join(names) or "none"
     if result.get("dryRun"):
         return (
             f"Knowledge bridge dry run: {int(result.get('sendableRecommendationCount') or 0)} sendable, "
             f"{int(result.get('duplicateCount') or 0)} duplicates, {int(result.get('withheldCount') or 0)} withheld. "
-            f"Candidates: {candidate_text}. Sources: {source_text}. Warnings: {warning_text}."
+            f"Sendable: {candidate_text}. Top withheld reasons: {withheld_text}. "
+            f"Junk terms blocked: {int(result.get('junkTermsBlockedCount') or 0)}. Sources: {source_text}. Warnings: {warning_text}."
         )
     return (
         f"Knowledge bridge complete: {int(result.get('sentCount') or 0)} recommendations sent, "
