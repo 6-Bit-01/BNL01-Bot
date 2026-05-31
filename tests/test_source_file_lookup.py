@@ -272,7 +272,19 @@ class SourceFileLookupBotTests(unittest.TestCase):
         self.assertTrue(diag["source_file_read_token_configured"])
         self.assertTrue(diag["source_file_read_url_configured"])
         self.assertIn("source_file_last_lookup_status", diag)
+        self.assertIn("source_context_injection_available", diag)
+        self.assertIn("source_context_injection_enabled", diag)
         self.assertNotIn("secret-token", json.dumps(diag))
+
+    def test_existing_source_lookup_command_still_works(self):
+        bnl01_bot.BNL_OWNER_USER_ID = 999
+        message = self.Message(999)
+        fake_result = {"ok": True, "found": True, "matchKind": "exact", "data": {"sourceFile": {"name": "Hellcat"}}}
+        with mock.patch.object(bnl01_bot, "lookup_source_file", return_value=fake_result) as lookup_mock:
+            handled = asyncio.run(bnl01_bot.maybe_handle_source_file_lookup_command(message, "!bnl source lookup Hellcat"))
+        self.assertTrue(handled)
+        lookup_mock.assert_called_once()
+        self.assertIn("Source File: Hellcat", message.replies[-1])
 
 
 if __name__ == "__main__":

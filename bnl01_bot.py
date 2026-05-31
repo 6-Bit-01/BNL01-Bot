@@ -58,6 +58,13 @@ from bnl_source_file_lookup import (
     lookup_source_file,
     parse_source_file_lookup_command,
 )
+from bnl_source_context_injection import (
+    MAX_SOURCE_CONTEXT_SUBJECTS,
+    build_source_context_diagnostics,
+    build_source_context_for_subjects,
+    parse_source_context_subjects,
+    should_inject_source_context,
+)
 from bnl_source_knowledge_bridge import (
     KNOWLEDGE_BRIDGE_INGEST_SOURCE,
     format_source_knowledge_bridge_response,
@@ -3998,9 +4005,50 @@ def can_send_dossier_recommendation(user, member, guild) -> bool:
     return False
 
 
+def can_use_source_context_injection(user, member, guild) -> bool:
+    """Owner/admin/operator gate for automatic Source File context injection."""
+    return can_send_dossier_recommendation(user, member, guild)
+
+
+async def maybe_build_source_context_for_direct_message(
+    message: discord.Message,
+    direct_content: str,
+    channel_policy: str,
+    *,
+    route: str = "direct",
+) -> str:
+    """Build Source File prompt context only for approved direct operator routes."""
+
+    channel = getattr(message, "channel", None)
+    channel_name = getattr(channel, "name", "") or ""
+    guild = getattr(message, "guild", None)
+    member = message.author if isinstance(message.author, discord.Member) else (guild.get_member(message.author.id) if guild else None)
+    privileged = can_use_source_context_injection(message.author, member, guild)
+    if not should_inject_source_context(
+        channel_policy=channel_policy,
+        channel_name=channel_name,
+        privileged=privileged,
+        direct_interaction=True,
+        route=route,
+    ):
+        return ""
+
+    subjects = parse_source_context_subjects(direct_content)
+    if not subjects:
+        return ""
+
+    context_block, _results = await asyncio.to_thread(build_source_context_for_subjects, subjects, lookup_source_file)
+    if len(subjects) > MAX_SOURCE_CONTEXT_SUBJECTS:
+        logging.info("source_context_injection_narrowing_required subjects=%s", len(subjects))
+    elif context_block:
+        logging.info("source_context_injection_loaded subjects=%s", len(subjects))
+    return context_block
+
+
 def build_dossier_recommendation_diagnostics(guild_id=None) -> dict:
     """Safe configuration/status diagnostics for dossier recommendation ingest."""
     source_file_diag = build_source_file_lookup_diagnostics()
+    source_context_diag = build_source_context_diagnostics()
     return {
         "ingest_url_configured": bool(os.getenv("BNL_DOSSIER_INGEST_URL", "").strip()),
         "ingest_url_using_default": not bool(os.getenv("BNL_DOSSIER_INGEST_URL", "").strip()),
@@ -4018,6 +4066,13 @@ def build_dossier_recommendation_diagnostics(guild_id=None) -> dict:
         "source_file_last_lookup_subject": source_file_diag["last_lookup_subject"],
         "source_file_last_lookup_found": source_file_diag["last_lookup_found"],
         "source_file_last_lookup_error_status": source_file_diag["last_lookup_error_status"],
+        "source_context_injection_available": source_context_diag["available"],
+        "source_context_injection_enabled": source_context_diag["enabled"],
+        "source_context_last_status": source_context_diag["last_status"],
+        "source_context_last_subjects": source_context_diag["last_subjects"],
+        "source_context_last_found_count": source_context_diag["last_found_count"],
+        "source_context_last_match_kinds": source_context_diag["last_match_kinds"],
+        "source_context_last_error_status": source_context_diag["last_error_status"],
         "candidate_discovery_available": True,
         "candidate_discovery_enabled": False,
         "candidate_discovery_ingest_source": DISCOVERY_INGEST_SOURCE,
@@ -10348,7 +10403,8 @@ def build_user_aware_prompt(
     message_count: int = 1,
     privileged: bool = False,
     channel_policy: str = "unknown",
-    website_read_model_context: str = ""
+    website_read_model_context: str = "",
+    source_context_block: str = ""
 ) -> tuple:
     print("BNL DEBUG: build_user_aware_prompt start")
     display_name, preferred_name = get_user_profile(user_id, guild_id)
@@ -10387,6 +10443,10 @@ def build_user_aware_prompt(
     website_read_model_prompt_block = ""
     if website_read_model_context:
         website_read_model_prompt_block = f"{website_read_model_context}\n"
+
+    source_context_prompt_block = ""
+    if source_context_block:
+        source_context_prompt_block = f"{source_context_block}\n"
 
     room_prompt_block = ""
     if room_context:
@@ -10455,6 +10515,7 @@ def build_user_aware_prompt(
         f"{broadcast_prompt_block}"
         f"{show_state_prompt_block}"
         f"{website_read_model_prompt_block}"
+        f"{source_context_prompt_block}"
         f"User name to address (optional): {name_to_use}\n"
         f"User display name: {display_name or fallback_display_name}\n"
         f"User message: {clean_content}"
@@ -10769,6 +10830,12 @@ async def _generate_direct_payload_session(session_key, reason: str):
         route="direct_payload_session",
     )
     website_read_model_context = maybe_build_bnl_read_model_context(direct_content, session.get("channel_policy", "unknown"))
+    source_context_block = await maybe_build_source_context_for_direct_message(
+        anchor_message,
+        direct_content,
+        session.get("channel_policy", "unknown"),
+        route="direct_payload_session",
+    )
     prompt, allow_greeting, style_key = build_user_aware_prompt(
         session["requester_user_id"],
         session["guild_id"],
@@ -10780,6 +10847,7 @@ async def _generate_direct_payload_session(session_key, reason: str):
         privileged=is_privileged_member(session["requester_member"], session["guild"]),
         channel_policy=session.get("channel_policy", "unknown"),
         website_read_model_context=website_read_model_context,
+        source_context_block=source_context_block,
     )
     prompt = _build_direct_payload_prompt(prompt, direct_payload_items, direct_content)
     log_response_style(session["guild_id"], session["requester_user_id"], style_key)
@@ -11443,6 +11511,12 @@ async def on_message(message: discord.Message):
                 route="direct_active",
             )
             website_read_model_context = maybe_build_bnl_read_model_context(direct_content, channel_policy)
+            source_context_block = await maybe_build_source_context_for_direct_message(
+                message,
+                direct_content,
+                channel_policy,
+                route="direct_active",
+            )
             prompt, allow_greeting, style_key = build_user_aware_prompt(
                 message.author.id,
                 message.guild.id,
@@ -11455,6 +11529,7 @@ async def on_message(message: discord.Message):
                 privileged=is_privileged_member(message.author, message.guild),
                 channel_policy=channel_policy,
                 website_read_model_context=website_read_model_context,
+                source_context_block=source_context_block,
             )
             prompt = _build_direct_payload_prompt(prompt, direct_payload_items, direct_content)
             log_response_style(message.guild.id, message.author.id, style_key)
@@ -11609,6 +11684,12 @@ async def on_message(message: discord.Message):
             route="direct",
         )
         website_read_model_context = maybe_build_bnl_read_model_context(direct_content, channel_policy)
+        source_context_block = await maybe_build_source_context_for_direct_message(
+            message,
+            direct_content,
+            channel_policy,
+            route="direct",
+        )
         prompt, allow_greeting, style_key = build_user_aware_prompt(
             message.author.id,
             message.guild.id,
@@ -11621,6 +11702,7 @@ async def on_message(message: discord.Message):
             privileged=is_privileged_member(message.author, message.guild),
             channel_policy=channel_policy,
             website_read_model_context=website_read_model_context,
+            source_context_block=source_context_block,
         )
         prompt = _build_direct_payload_prompt(prompt, direct_payload_items, direct_content)
         log_response_style(message.guild.id, message.author.id, style_key)
@@ -11740,6 +11822,12 @@ async def on_message(message: discord.Message):
             route="direct",
         )
         website_read_model_context = maybe_build_bnl_read_model_context(direct_content, channel_policy)
+        source_context_block = await maybe_build_source_context_for_direct_message(
+            message,
+            direct_content,
+            channel_policy,
+            route="direct",
+        )
         prompt, allow_greeting, style_key = build_user_aware_prompt(
             message.author.id,
             message.guild.id,
@@ -11752,6 +11840,7 @@ async def on_message(message: discord.Message):
             privileged=is_privileged_member(message.author, message.guild),
             channel_policy=channel_policy,
             website_read_model_context=website_read_model_context,
+            source_context_block=source_context_block,
         )
         prompt = _build_direct_payload_prompt(prompt, direct_payload_items, direct_content)
         log_response_style(message.guild.id, message.author.id, style_key)
@@ -12058,6 +12147,13 @@ async def bnl_source_check(interaction: discord.Interaction):
         f"- source_file_last_lookup_subject: `{dossier_diag['source_file_last_lookup_subject']}`",
         f"- source_file_last_lookup_found: `{'yes' if dossier_diag['source_file_last_lookup_found'] else 'no'}`",
         f"- source_file_last_lookup_error_status: `{dossier_diag['source_file_last_lookup_error_status']}`",
+        f"- source_context_injection_available: `{'yes' if dossier_diag['source_context_injection_available'] else 'no'}`",
+        f"- source_context_injection_enabled: `{'yes' if dossier_diag['source_context_injection_enabled'] else 'no'}`",
+        f"- source_context_last_status: `{dossier_diag['source_context_last_status']}`",
+        f"- source_context_last_subjects: `{','.join(dossier_diag['source_context_last_subjects']) or 'none'}`",
+        f"- source_context_last_found_count: `{dossier_diag['source_context_last_found_count']}`",
+        f"- source_context_last_match_kinds: `{','.join(dossier_diag['source_context_last_match_kinds']) or 'none'}`",
+        f"- source_context_last_error_status: `{dossier_diag['source_context_last_error_status']}`",
         f"- candidate_discovery_available: `{'yes' if dossier_diag['candidate_discovery_available'] else 'no'}`",
         f"- candidate_discovery_enabled: `{'yes' if dossier_diag['candidate_discovery_enabled'] else 'no'}`",
         f"- candidate_discovery_approved_lanes: `{','.join(dossier_diag['candidate_discovery_approved_lanes'])}`",
@@ -12323,6 +12419,13 @@ async def bnl_status(interaction: discord.Interaction):
         f"- source_file_last_lookup_subject: `{dossier_diag['source_file_last_lookup_subject']}`",
         f"- source_file_last_lookup_found: `{'yes' if dossier_diag['source_file_last_lookup_found'] else 'no'}`",
         f"- source_file_last_lookup_error_status: `{dossier_diag['source_file_last_lookup_error_status']}`",
+        f"- source_context_injection_available: `{'yes' if dossier_diag['source_context_injection_available'] else 'no'}`",
+        f"- source_context_injection_enabled: `{'yes' if dossier_diag['source_context_injection_enabled'] else 'no'}`",
+        f"- source_context_last_status: `{dossier_diag['source_context_last_status']}`",
+        f"- source_context_last_subjects: `{','.join(dossier_diag['source_context_last_subjects']) or 'none'}`",
+        f"- source_context_last_found_count: `{dossier_diag['source_context_last_found_count']}`",
+        f"- source_context_last_match_kinds: `{','.join(dossier_diag['source_context_last_match_kinds']) or 'none'}`",
+        f"- source_context_last_error_status: `{dossier_diag['source_context_last_error_status']}`",
         f"- candidate_discovery_available: `{'yes' if dossier_diag['candidate_discovery_available'] else 'no'}`",
         f"- candidate_discovery_enabled: `{'yes' if dossier_diag['candidate_discovery_enabled'] else 'no'}`",
         f"- candidate_discovery_approved_lanes: `{','.join(dossier_diag['candidate_discovery_approved_lanes'])}`",
