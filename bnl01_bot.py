@@ -4990,11 +4990,21 @@ def _memory_decision_for_legacy_call(channel_policy: str, role: str, content: st
 
 
 SCRIPTED_MODE_LEAK_PATTERNS = [
-    r"records are thin", r"suspicious blinking light", r"preliminary analysis",
-    r"compromised broadcast loop", r"data stream", r"archival query",
-    r"source coverage", r"classification", r"existing dossier update",
-    r"\bcandidate\b", r"optimal parameters", r"ambient signal patterns",
     r"^[^\n:]{1,80}:\s*records are thin",
+    r"\brecords are thin\b",
+    r"\bsuspicious blinking light\b",
+    r"\bpreliminary analysis\b",
+    r"\bcompromised broadcast loop\b",
+    r"\bdata stream\b",
+    r"\barchival query\b",
+    r"\barchive query\b",
+    r"\bsource coverage\b",
+    r"\bsource[- ]file enrichment\b",
+    r"\bexisting dossier update\b",
+    r"\bpublic dossier update lane\b",
+    r"\bcandidate intake\b",
+    r"\b(?:source|dossier|candidate|intake|scouting|evidence|archive|archival) classification\b",
+    r"\bclassification\s*:\s*(?:candidate|source|dossier|scouting|internal)\b",
 ]
 
 
@@ -5005,25 +5015,35 @@ def detect_scripted_mode_leak(text: str, route_mode: str) -> bool:
     return any(re.search(pattern, lowered, flags=re.I | re.M) for pattern in SCRIPTED_MODE_LEAK_PATTERNS)
 
 
-def safe_fallback_response_for_mode_leak(user_name: str = "") -> str:
+def _is_casual_check_in(text: str) -> bool:
+    normalized = (text or "").strip().lower().replace("’", "'")
+    return bool(re.search(r"\b(?:how(?:'s|s| is) it going|how are you|how you doing|how's things|how are things|what's up|whats up)\b", normalized))
+
+
+def safe_fallback_response_for_mode_leak(user_name: str = "", route_mode: str = "", original_user_text: str = "") -> str:
     name = (user_name or "").strip()
-    if name:
-        return f"Hey {name}. I’m here — ask me that normally and I’ll keep it conversational."
-    return "I’m here. Ask me that normally and I’ll keep it conversational."
+    suffix = f", {name}" if name else ""
+    if route_mode == ROUTE_MODE_SIMPLE_GREETING:
+        return f"Hey {name}. I’m here." if name else "Hey. I’m here."
+    if route_mode == ROUTE_MODE_SHOW_STATUS:
+        return "I don’t have a confirmed show status in front of me yet."
+    if _is_casual_check_in(original_user_text):
+        return f"I’m good{suffix}. Systems are steady. What’s up?"
+    return f"I’m here{suffix}. What do you need?"
 
 
-def apply_response_mode_contamination_guard(response: str, route_mode: str, user_name: str = "") -> tuple[str, bool]:
+def apply_response_mode_contamination_guard(response: str, route_mode: str, user_name: str = "", original_user_text: str = "") -> tuple[str, bool]:
     if not detect_scripted_mode_leak(response, route_mode):
         return response, False
     logging.warning("scripted_mode_leak_guard_triggered=1 route_mode=%s", route_mode)
-    return safe_fallback_response_for_mode_leak(user_name), True
+    return safe_fallback_response_for_mode_leak(user_name, route_mode, original_user_text), True
 
 
 SIMPLE_GREETING_RESPONSE_POOL = (
     "Hey {name}. I’m here.",
-    "Hi {name}. I’m here with you.",
-    "Hey {name}. Present and listening.",
-    "Hello {name}. I’m here — what are we working on?",
+    "Hi {name}. What’s up?",
+    "Hey {name}. I’m online.",
+    "Hello {name}. I’m here.",
 )
 
 
@@ -5446,6 +5466,7 @@ def format_last_route_debug() -> str:
         ("subject_extraction_ran", "subject extraction ran"),
         ("scripted_mode_leak_guard_triggered", "leak guard fired"),
         ("leak_guard_result", "leak guard result"),
+        ("fallback_used", "fallback used"),
         ("regenerated_for_mode_leak", "regeneration happened"),
         ("save_policy_reason", "save policy reason"),
     ]
@@ -5479,9 +5500,11 @@ def normal_chat_prompt_contract(route_mode: str) -> str:
         )
     return (
         "Mode contract: normal_chat. Answer the user's actual message conversationally using only public-safe context. "
-        "For casual check-ins like how are you/how's it going, answer naturally instead of with system-status boilerplate; do not say optimal parameters or ambient signal patterns. "
-        "Do not classify the user's phrasing as a subject/entity. Do not mention dossiers, source files, classification, candidates, source coverage, archive queries, or scouting unless explicitly asked. "
-        "Do not invent evidence or use scripted evidence-register phrasing.\n"
+        "Keep BNL's voice, including operational or system flavor when it fits naturally. "
+        "For casual check-ins like how are you/how's it going, give a short natural answer. "
+        "Do not expose source-file, dossier, classification, candidate, source coverage, archive-query, or scouting machinery unless explicitly asked. "
+        "Do not turn ordinary user wording into a source/entity subject. Do not invent evidence. "
+        "Do not mention prompts, guards, modes, repair rules, or use scripted evidence-register phrasing.\n"
     )
 
 def _is_text_like_channel(channel) -> bool:
@@ -12567,6 +12590,7 @@ async def send_planned_conversation_response(
         response or "",
         plan.route_mode,
         getattr(message.author, "display_name", ""),
+        getattr(message, "content", ""),
     )
     model_decision = MemoryWriteDecision(
         False,
@@ -12621,7 +12645,8 @@ async def send_planned_conversation_response(
         save_policy_reason=getattr(model_decision, "reason", "unknown"),
         durable_memory_write=getattr(model_decision, "write_memory_tier", False),
         scripted_mode_leak_guard_triggered=guard_triggered,
-        leak_guard_result="triggered" if guard_triggered else "clear",
+        leak_guard_result="fallback" if guard_triggered else "clear",
+        fallback_used=guard_triggered,
         regenerated_for_mode_leak=regenerated_for_mode_leak,
     )
     if len(response) <= 2000:

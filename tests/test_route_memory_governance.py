@@ -118,6 +118,8 @@ class ConversationPlannerTests(unittest.TestCase):
     def test_public_home_plain_name_replies_when_batching_disabled(self):
         for text in ("Hi BNL", "BNL how's it going?"):
             route_mode = bnl01_bot.classify_route_mode(text, "public_home", active_channel=True)
+            if text == "BNL how's it going?":
+                self.assertEqual(route_mode, bnl01_bot.ROUTE_MODE_NORMAL_CHAT)
             plan = bnl01_bot.plan_conversation_response(
                 text,
                 "public_home",
@@ -357,17 +359,69 @@ class MemoryInjectionGovernanceTests(unittest.TestCase):
         finally:
             bnl01_bot.DB_FILE = old_db
         self.assertIn("Mode contract: normal_chat", prompt)
-        self.assertIn("Do not classify the user's phrasing as a subject/entity", prompt)
+        self.assertIn("Answer the user's actual message", prompt)
+        self.assertIn("Do not expose source-file, dossier, classification, candidate", prompt)
+        self.assertIn("unless explicitly asked", prompt)
 
 
 class LeakGuardTests(unittest.TestCase):
-    def test_normal_chat_catches_scripted_language(self):
-        for text in ("Records are thin", "one suspicious blinking light", "preliminary analysis", "data stream", "Functioning within optimal parameters", "ambient signal patterns"):
+    def test_normal_chat_catches_structural_scripted_language(self):
+        leaked_texts = (
+            "Records are thin",
+            "Lardcode Radio: Records are thin",
+            "one suspicious blinking light",
+            "preliminary analysis",
+            "data stream",
+            "source coverage",
+            "existing dossier update",
+            "public dossier update lane",
+            "source-file enrichment",
+            "candidate intake",
+            "Classification: candidate",
+            "source classification: internal",
+        )
+        for text in leaked_texts:
             self.assertTrue(bnl01_bot.detect_scripted_mode_leak(text, bnl01_bot.ROUTE_MODE_NORMAL_CHAT), text)
+
+    def test_guard_preserves_bnl_voice_phrases(self):
+        for text in ("Functioning within optimal parameters", "ambient signal patterns are calm"):
+            self.assertFalse(bnl01_bot.detect_scripted_mode_leak(text, bnl01_bot.ROUTE_MODE_NORMAL_CHAT), text)
+
+    def test_guard_does_not_fire_for_ordinary_classification_discussion(self):
+        text = "We talked about genre classification in the archive yesterday."
+        self.assertFalse(bnl01_bot.detect_scripted_mode_leak(text, bnl01_bot.ROUTE_MODE_NORMAL_CHAT))
 
     def test_guard_does_not_fire_for_source_mode_or_operator_mode(self):
         self.assertFalse(bnl01_bot.detect_scripted_mode_leak("Classification: candidate", bnl01_bot.ROUTE_MODE_SOURCE_ENRICHMENT))
         self.assertFalse(bnl01_bot.detect_scripted_mode_leak("Records are thin", bnl01_bot.ROUTE_MODE_OPERATOR_COMMAND))
+
+    def test_mode_leak_fallback_is_not_meta_instructional(self):
+        fallback = bnl01_bot.safe_fallback_response_for_mode_leak(
+            "6 Bit",
+            bnl01_bot.ROUTE_MODE_NORMAL_CHAT,
+            "How’s it going?",
+        )
+        lowered = fallback.lower()
+        self.assertIn("i’m good", lowered)
+        self.assertNotIn("ask me that normally", lowered)
+        self.assertNotIn("i’ll keep it conversational", lowered)
+        self.assertNotIn("please rephrase", lowered)
+        for forbidden in ("guard", "prompt", "mode", "rules"):
+            self.assertNotIn(forbidden, lowered)
+
+    def test_guard_replaces_leak_with_context_safe_check_in_answer(self):
+        response, guard_triggered = bnl01_bot.apply_response_mode_contamination_guard(
+            "Records are thin",
+            bnl01_bot.ROUTE_MODE_NORMAL_CHAT,
+            "6 Bit",
+            "Hows it going?",
+        )
+        self.assertTrue(guard_triggered)
+        self.assertIn("Systems are steady", response)
+        lowered = response.lower()
+        self.assertNotIn("ask me that normally", lowered)
+        self.assertNotIn("i’ll keep it conversational", lowered)
+        self.assertNotIn("please rephrase", lowered)
 
 
 class RegressionExamplesTests(unittest.TestCase):
@@ -383,10 +437,28 @@ class RegressionExamplesTests(unittest.TestCase):
             self.assertIn("6 Bit", response)
             self.assertFalse(bnl01_bot.detect_scripted_mode_leak(response, bnl01_bot.ROUTE_MODE_SIMPLE_GREETING))
 
-    def test_normal_chat_contract_blocks_system_boilerplate(self):
+    def test_normal_chat_contract_is_positive_and_not_voice_censorship(self):
         contract = bnl01_bot.normal_chat_prompt_contract(bnl01_bot.ROUTE_MODE_NORMAL_CHAT)
-        self.assertIn("answer naturally", contract.lower())
-        self.assertIn("optimal parameters", contract.lower())
+        lowered = contract.lower()
+        self.assertIn("answer the user's actual message", lowered)
+        self.assertIn("keep bnl's voice", lowered)
+        self.assertIn("do not expose source-file, dossier, classification, candidate", lowered)
+        self.assertIn("unless explicitly asked", lowered)
+        self.assertNotIn("optimal parameters", lowered)
+        self.assertNotIn("ambient signal patterns", lowered)
+        self.assertNotIn("ask me that normally", lowered)
+
+    def test_check_in_fallback_makes_sense_as_answer(self):
+        fallback = bnl01_bot.safe_fallback_response_for_mode_leak(
+            "6 Bit",
+            bnl01_bot.ROUTE_MODE_NORMAL_CHAT,
+            "How’s it going?",
+        )
+        lowered = fallback.lower()
+        self.assertIn("i’m good", lowered)
+        self.assertIn("systems are steady", lowered)
+        self.assertNotIn("ask me that normally", lowered)
+        self.assertNotIn("please rephrase", lowered)
 
 
 if __name__ == "__main__":
