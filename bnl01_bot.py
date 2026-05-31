@@ -269,6 +269,17 @@ PACING_BEHAVIOR_MIN_DELAY = "min_delay"
 PACING_BEHAVIOR_PAYLOAD_DELAY = "payload_delay"
 PACING_BEHAVIOR_NONE = "none"
 
+CONVERSATION_SURFACE_FREE_SPEAK_PUBLIC_HOME = "free_speak_public_home"
+CONVERSATION_SURFACE_FREE_SPEAK_SEALED_MIRROR = "free_speak_sealed_mirror"
+CONVERSATION_SURFACE_MENTION_OR_REPLY = "mention_or_reply"
+CONVERSATION_SURFACE_COMMAND_ONLY = "command_only"
+CONVERSATION_SURFACE_PROTECTED_OR_SILENT = "protected_or_silent"
+
+FREE_SPEAK_CONVERSATION_SURFACES = frozenset({
+    CONVERSATION_SURFACE_FREE_SPEAK_PUBLIC_HOME,
+    CONVERSATION_SURFACE_FREE_SPEAK_SEALED_MIRROR,
+})
+
 
 @dataclass(frozen=True)
 class ReplyEligibility:
@@ -307,6 +318,7 @@ class ConversationPlan:
     generation_allowed: bool = False
     batching_enabled: bool = False
     batching_disabled_affects_reply: bool = False
+    conversation_surface: str = CONVERSATION_SURFACE_PROTECTED_OR_SILENT
 
 
 ROUTE_MODE_CONTRACTS = {
@@ -4813,6 +4825,31 @@ def _resolve_channel_policy_without_parent(channel) -> str:
     return "unknown"
 
 
+def conversation_surface_for_channel_policy(channel_policy: str, is_active_channel: bool = False) -> str:
+    """Map channel memory/visibility policy to conversation behavior surface.
+
+    Conversation surfaces intentionally stay separate from channel_policy so
+    public-home and sealed-test can share free-speak reply planning while keeping
+    different memory durability and visibility rules.
+    """
+    policy = (channel_policy or "unknown").strip().lower() or "unknown"
+    if policy == "public_home":
+        return CONVERSATION_SURFACE_FREE_SPEAK_PUBLIC_HOME
+    if policy == "sealed_test":
+        return CONVERSATION_SURFACE_FREE_SPEAK_SEALED_MIRROR
+    if policy in {"public_context", "public_selective"}:
+        return CONVERSATION_SURFACE_MENTION_OR_REPLY
+    if policy in {"internal_controlled", "broadcast_memory"}:
+        return CONVERSATION_SURFACE_COMMAND_ONLY
+    if policy in {"reference_canon", "protected_system", "ai_image_tool", "unknown", "legacy_unknown", ""}:
+        return CONVERSATION_SURFACE_PROTECTED_OR_SILENT
+    return CONVERSATION_SURFACE_PROTECTED_OR_SILENT
+
+
+def conversation_surface_allows_free_speak(conversation_surface: str) -> bool:
+    return conversation_surface in FREE_SPEAK_CONVERSATION_SURFACES
+
+
 def resolve_channel_policy(channel) -> str:
     if not channel:
         return "unknown"
@@ -5068,17 +5105,20 @@ def decide_reply_eligibility(
     operator_command: bool = False,
     source_command: bool = False,
     active_direct_session: bool = False,
+    conversation_surface: str | None = None,
 ) -> ReplyEligibility:
     """Decide reply eligibility separately from batching and memory governance.
 
     Reply classes intentionally keep direct/direct-like replies independent from
     passive active-channel batching. `BNL_ACTIVE_BATCHING_ENABLED=false` can only
     stop passive batching; it must not deny real mentions, replies, accepted
-    plain-name calls, recent follow-ups, commands, or sealed-test free-speak.
+    plain-name calls, recent follow-ups, commands, or free-speak surface fallback.
     """
     batching = BNL_ACTIVE_BATCHING_ENABLED if batching_enabled is None else bool(batching_enabled)
     policy = channel_policy if channel_policy in CHANNEL_POLICY_CONTRACTS else "unknown"
     contract = CHANNEL_POLICY_CONTRACTS.get(policy, CHANNEL_POLICY_CONTRACTS["unknown"])
+    surface = conversation_surface or conversation_surface_for_channel_policy(policy, active_channel)
+    free_speak_surface = conversation_surface_allows_free_speak(surface)
     mode = route_mode or ROUTE_MODE_NORMAL_CHAT
     text_present = bool((clean_content or "").strip())
 
@@ -5119,25 +5159,31 @@ def decide_reply_eligibility(
             True,
             allowed,
         )
-    if plain_text_name_seen and policy in {"sealed_test", "public_home"}:
-        reply_class = "sealed_test_conversation" if policy == "sealed_test" else "public_home_conversation"
-        if mode == ROUTE_MODE_SIMPLE_GREETING:
-            reply_class = "planned_greeting"
-        return ReplyEligibility(True, f"{policy}_plain_name_call_allowed", "plain_name_call", reply_class, False, True, True)
-    if plain_text_name_seen and policy == "public_context":
-        return ReplyEligibility(False, "public_context_plain_name_call_not_direct", "plain_name_call", "blocked", False, False, False)
-    if policy == "sealed_test" and text_present and (channel_allows_conversation or active_channel or contract.get("reply_without_direct", False)):
-        return ReplyEligibility(True, "sealed_test_free_speak_allowed", "sealed_test_free_speak", "sealed_test_conversation", False, True, True)
-    if policy == "public_home" and text_present and contract.get("reply_without_direct", False):
-        batch_allowed = bool(active_channel and batching)
+    if plain_text_name_seen and free_speak_surface:
+        reply_class = "planned_greeting" if mode == ROUTE_MODE_SIMPLE_GREETING else "free_speak_conversation"
+        return ReplyEligibility(True, f"{surface}_plain_name_call_allowed", "plain_name_call", reply_class, False, True, True)
+    if plain_text_name_seen and surface == CONVERSATION_SURFACE_MENTION_OR_REPLY:
+        return ReplyEligibility(False, f"{policy}_plain_name_call_not_direct", "plain_name_call", "blocked", False, False, False)
+    if free_speak_surface and text_present and (channel_allows_conversation or active_channel or contract.get("reply_without_direct", False)):
+        batch_allowed = bool(batching)
+        if batch_allowed:
+            return ReplyEligibility(
+                False,
+                f"{surface}_passive_batch_allowed",
+                "free_speak_passive",
+                "batched_passive",
+                True,
+                False,
+                True,
+            )
         return ReplyEligibility(
+            True,
+            f"{surface}_paced_direct_batching_disabled",
+            "free_speak",
+            "free_speak_conversation",
             False,
-            "public_home_passive_batch_allowed" if batch_allowed else "public_home_passive_observe_batching_disabled",
-            "public_home_free_speak" if batch_allowed else "passive_observe",
-            "batched_passive" if batch_allowed else "silent_observe",
-            batch_allowed,
-            False,
-            batch_allowed,
+            True,
+            True,
         )
     if active_channel and text_present and policy in CONVERSATIONAL_POLICIES:
         batch_allowed = bool(batching)
@@ -5153,7 +5199,12 @@ def decide_reply_eligibility(
     return ReplyEligibility(False, f"{policy}_no_conversation_route", "passive_observe", "silent_observe" if text_present else "blocked", False, False, False)
 
 
-def _attach_reply_eligibility(plan: ConversationPlan, eligibility: ReplyEligibility, batching_enabled: bool) -> ConversationPlan:
+def _attach_reply_eligibility(
+    plan: ConversationPlan,
+    eligibility: ReplyEligibility,
+    batching_enabled: bool,
+    conversation_surface: str | None = None,
+) -> ConversationPlan:
     return replace(
         plan,
         directness=eligibility.directness,
@@ -5164,13 +5215,16 @@ def _attach_reply_eligibility(plan: ConversationPlan, eligibility: ReplyEligibil
         generation_allowed=eligibility.generation_allowed,
         batching_enabled=bool(batching_enabled),
         batching_disabled_affects_reply=eligibility.batching_disabled_affects_reply,
+        conversation_surface=conversation_surface or plan.conversation_surface,
     )
 
 
 def _conversation_plan_log(plan: ConversationPlan) -> None:
     logging.info(
-        "conversation_plan route_mode=%s timing=%s generation=%s batch=%s pacing=%s reason=%s",
+        "conversation_plan route_mode=%s channel_policy=%s conversation_surface=%s timing=%s generation=%s batch=%s pacing=%s reason=%s",
         plan.route_mode,
+        plan.channel_policy,
+        plan.conversation_surface,
         plan.response_timing,
         plan.response_generation,
         plan.batch_behavior,
@@ -5219,22 +5273,25 @@ def plan_conversation_response(
     operator_command: bool = False,
     source_command: bool = False,
     active_direct_session: bool = False,
+    conversation_surface: str | None = None,
 ) -> ConversationPlan:
     """Return the conversation coordinator decision before any normal reply is sent.
 
     Pipeline audit map:
     - Commands/protected hooks are immediate_command/operator handlers and stay outside
       normal chat generation.
-    - Direct mentions, replies, recent direct follow-ups, and active/sealed-test free-speak
+    - Direct mentions, replies, recent direct follow-ups, and free-speak surface fallback
       enter paced_direct unless they intentionally start/continue a deferred payload session.
-    - Active-channel non-direct messages enter debounce batching when batching is enabled;
-      otherwise they are observed silently.
+    - Active-channel non-direct messages and free-speak passive room conversation enter
+      debounce batching when batching is enabled; non-free-speak passive channels stay quiet
+      when batching is disabled.
     - Simple greetings keep the PR #196 route/memory boundary, but are planned as paced
       direct deterministic responses instead of replying from a hardcoded fast path.
     - Normal Gemini chat can inject public-safe memory; simple greetings minimize memory;
       source/scouting context is blocked unless the route contract explicitly allows it.
     """
     batching = BNL_ACTIVE_BATCHING_ENABLED if batching_enabled is None else bool(batching_enabled)
+    surface = conversation_surface or conversation_surface_for_channel_policy(channel_policy, active_channel)
     mode = route_mode or classify_route_mode(
         clean_content,
         channel_policy,
@@ -5257,6 +5314,7 @@ def plan_conversation_response(
         operator_command=operator_command,
         source_command=source_command,
         active_direct_session=active_direct_session,
+        conversation_surface=surface,
     )
     if operator_command or mode == ROUTE_MODE_OPERATOR_COMMAND:
         plan = ConversationPlan(
@@ -5274,7 +5332,7 @@ def plan_conversation_response(
             True,
             "operator_command_handler",
         )
-        plan = _attach_reply_eligibility(plan, eligibility, batching)
+        plan = _attach_reply_eligibility(plan, eligibility, batching, surface)
         _conversation_plan_log(plan)
         return plan
     if source_command or mode in SOURCE_INTERNAL_MODES:
@@ -5293,7 +5351,7 @@ def plan_conversation_response(
             True,
             "explicit_source_or_internal_route",
         )
-        plan = _attach_reply_eligibility(plan, eligibility, batching)
+        plan = _attach_reply_eligibility(plan, eligibility, batching, surface)
         _conversation_plan_log(plan)
         return plan
 
@@ -5304,6 +5362,7 @@ def plan_conversation_response(
             "planned_greeting",
             "sealed_test_conversation",
             "public_home_conversation",
+            "free_speak_conversation",
         }
     )
     if direct_like and payload_expected and payload_count == 0:
@@ -5323,7 +5382,7 @@ def plan_conversation_response(
             "awaiting_payload_lines",
             direct_session_used=True,
         )
-        plan = _attach_reply_eligibility(plan, eligibility, batching)
+        plan = _attach_reply_eligibility(plan, eligibility, batching, surface)
         _conversation_plan_log(plan)
         return plan
     if active_direct_session:
@@ -5343,10 +5402,10 @@ def plan_conversation_response(
             "collecting_payload_lines",
             direct_session_used=True,
         )
-        plan = _attach_reply_eligibility(plan, eligibility, batching)
+        plan = _attach_reply_eligibility(plan, eligibility, batching, surface)
         _conversation_plan_log(plan)
         return plan
-    if eligibility.policy_reply_class in {"batched_passive", "silent_observe"} and active_channel and not direct_like:
+    if eligibility.policy_reply_class in {"batched_passive", "silent_observe"} and (active_channel or conversation_surface_allows_free_speak(surface)) and not direct_like:
         if eligibility.batch_allowed:
             plan = ConversationPlan(
                 mode,
@@ -5379,7 +5438,7 @@ def plan_conversation_response(
                 False,
                 eligibility.reply_reason,
             )
-        plan = _attach_reply_eligibility(plan, eligibility, batching)
+        plan = _attach_reply_eligibility(plan, eligibility, batching, surface)
         _conversation_plan_log(plan)
         return plan
     if direct_like:
@@ -5409,7 +5468,7 @@ def plan_conversation_response(
             eligibility.reply_reason,
             batch_bypass_reason="direct_reply_preempts_batch" if mode != ROUTE_MODE_SIMPLE_GREETING else "simple_greeting_keeps_existing_batch",
         )
-        plan = _attach_reply_eligibility(plan, eligibility, batching)
+        plan = _attach_reply_eligibility(plan, eligibility, batching, surface)
         _conversation_plan_log(plan)
         return plan
     plan = ConversationPlan(
@@ -5427,7 +5486,7 @@ def plan_conversation_response(
         False,
         eligibility.reply_reason,
     )
-    plan = _attach_reply_eligibility(plan, eligibility, batching)
+    plan = _attach_reply_eligibility(plan, eligibility, batching, surface)
     _conversation_plan_log(plan)
     return plan
 
@@ -5443,6 +5502,9 @@ def format_last_route_debug() -> str:
     ordered = [
         ("route_mode", "last route mode"),
         ("channel_policy", "last channel policy"),
+        ("conversation_surface", "conversation surface"),
+        ("channel_name", "channel name"),
+        ("channel_id", "channel id"),
         ("directness", "directness"),
         ("reply_eligibility", "reply eligibility"),
         ("should_reply", "should reply"),
@@ -12617,6 +12679,9 @@ async def send_planned_conversation_response(
         route_mode=plan.route_mode,
         route_decision=plan.route_decision,
         channel_policy=plan.channel_policy,
+        conversation_surface=plan.conversation_surface,
+        channel_name=getattr(message.channel, "name", ""),
+        channel_id=getattr(message.channel, "id", ""),
         conversation_plan_timing=plan.response_timing,
         conversation_plan_generation=plan.response_generation,
         conversation_plan_batch=plan.batch_behavior,
@@ -12692,8 +12757,9 @@ async def on_message(message: discord.Message):
     if channel_policy != "internal_controlled":
         upsert_user_profile(message.author.id, message.guild.id, message.author.display_name)
     is_sealed_test_channel = channel_policy == "sealed_test"
-    active_test_free_speak = is_sealed_test_channel
-    should_handle_as_active_channel = is_active_channel or active_test_free_speak
+    conversation_surface = conversation_surface_for_channel_policy(channel_policy, is_active_channel)
+    free_speak_surface = conversation_surface_allows_free_speak(conversation_surface)
+    should_handle_as_active_channel = is_active_channel or free_speak_surface
     passive_memory_allowed = allow_passive_memory_for_policy(channel_policy)
     real_direct_target = is_direct_bnl_target(message)
     is_mention = real_direct_target
@@ -12730,12 +12796,11 @@ async def on_message(message: discord.Message):
     maybe_record_live_community_presence(message, clean_content, channel_policy, real_direct_target)
 
     plain_text_name_seen = bool(re.search(r"\b(bnl|bnl-01|barcode bot)\b", clean_content.lower())) if clean_content else False
-    channel_allows_conversation = bool(
-        channel_policy in {"public_home", "sealed_test"}
-        or is_active_channel
-    )
+    channel_allows_conversation = bool(free_speak_surface or is_active_channel)
     followup_candidate = _is_recent_direct_followup(message.channel.id, message.author.id) if clean_content else False
     logging.info(f"response_route_channel_policy policy={channel_policy}")
+    logging.info(f"response_route_conversation_surface surface={conversation_surface}")
+    logging.info(f"response_route_channel channel_name={getattr(message.channel, 'name', 'unknown')} channel_id={getattr(message.channel, 'id', 'unknown')}")
     logging.info(f"response_route_real_direct_target active={int(real_direct_target)}")
     logging.info(f"response_route_plain_text_name_seen seen={int(plain_text_name_seen)}")
 
@@ -13081,7 +13146,7 @@ async def on_message(message: discord.Message):
     else:
         logging.info("response_route_decision route=policy_blocked reason=no_conversation_route")
 
-    if clean_content and (should_handle_as_active_channel or real_direct_target):
+    if clean_content and (is_active_channel or real_direct_target):
         if not is_sealed_test_channel:
             maybe_update_broadcast_status_from_text(clean_content)
             maybe_update_restricted_status_from_text(clean_content)
@@ -13131,6 +13196,7 @@ async def on_message(message: discord.Message):
             payload_expected=payload_expected_for_plan,
             payload_count=len(direct_payload_items),
             active_direct_session=active_same_user_session,
+            conversation_surface=conversation_surface,
         )
         save_decision = save_user_message(message.author.id, message.author.display_name, message.guild.id, clean_content, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0), route_mode=conversation_plan.route_mode)
 
@@ -13341,8 +13407,8 @@ async def on_message(message: discord.Message):
         # Non-mention in active channel -> batch (kill-switched by env)
         if not BNL_ACTIVE_BATCHING_ENABLED:
             return
-        if active_test_free_speak:
-            logging.info(f"[conversation] guild_id={message.guild.id} channel_id={message.channel.id} reason=sealed_test_free_speak")
+        if free_speak_surface:
+            logging.info(f"[conversation] guild_id={message.guild.id} channel_id={message.channel.id} conversation_surface={conversation_surface} reason=free_speak_surface_batch")
         if _channel_generating[message.channel.id]:
             _channel_preempted_generation_id[message.channel.id] = _channel_generation_id[message.channel.id]
             _channel_message_interrupt_generation_id[message.channel.id] = _channel_generation_id[message.channel.id]
@@ -13372,7 +13438,7 @@ async def on_message(message: discord.Message):
 
     # ---------------- OTHER CHANNELS (PING-ONLY IF ACTIVE CHANNEL SET) ----------------
     if active_channel_id is not None and not should_handle_as_active_channel:
-        if not (real_direct_target or (channel_policy == "public_home" and plain_text_name_seen)):
+        if not (real_direct_target or (free_speak_surface and clean_content)):
             return
 
         if not clean_content:
@@ -13393,6 +13459,7 @@ async def on_message(message: discord.Message):
             batching_enabled=BNL_ACTIVE_BATCHING_ENABLED,
             payload_expected=payload_expected_for_plan,
             payload_count=len(direct_payload_items),
+            conversation_surface=conversation_surface,
         )
         if not conversation_plan.should_reply and conversation_plan.response_timing != RESPONSE_TIMING_DEFERRED_PAYLOAD_SESSION:
             return
@@ -13585,6 +13652,7 @@ async def on_message(message: discord.Message):
             batching_enabled=BNL_ACTIVE_BATCHING_ENABLED,
             payload_expected=payload_expected_for_plan,
             payload_count=len(direct_payload_items),
+            conversation_surface=conversation_surface,
         )
         if not conversation_plan.should_reply and conversation_plan.response_timing != RESPONSE_TIMING_DEFERRED_PAYLOAD_SESSION:
             return
