@@ -176,6 +176,220 @@ def _matches_subject(text: str, terms: list[str]) -> bool:
     return any(term.lower() in lower for term in terms if term)
 
 
+def _normalize_identity_label(value: Any) -> str:
+    return re.sub(r"[^a-z0-9]+", "", str(value or "").strip().lower())
+
+
+def _identity_label_variants(value: Any) -> set[str]:
+    raw = str(value or "").strip()
+    if not raw:
+        return set()
+    variants = {raw, raw.lower(), _subject_key(raw), _normalize_identity_label(raw)}
+    for word in re.findall(r"[A-Za-z0-9][A-Za-z0-9_-]*", raw):
+        if len(word) >= 3:
+            variants.update({word, word.lower(), _normalize_identity_label(word)})
+    return {v for v in variants if v}
+
+
+def _iter_lookup_values(value: Any) -> list[Any]:
+    if value in (None, ""):
+        return []
+    if isinstance(value, dict):
+        out: list[Any] = []
+        for key in ("name", "label", "alias", "displayName", "display_name", "preferredName", "preferred_name", "subject", "normalizedName", "value", "id", "candidateId", "sourceFileId", "targetDossierId", "dossierId", "publicDossierId"):
+            if value.get(key) not in (None, "", []):
+                out.append(value.get(key))
+        return out
+    if isinstance(value, (list, tuple, set)):
+        out = []
+        for item in value:
+            out.extend(_iter_lookup_values(item))
+        return out
+    text = str(value).strip()
+    if not text:
+        return []
+    # JSON-encoded source-file fields often carry alias arrays or identity-link maps.
+    if text[:1] in "[{":
+        try:
+            parsed = json.loads(text)
+        except Exception:
+            parsed = None
+        if parsed is not None:
+            return _iter_lookup_values(parsed)
+    return [text]
+
+
+def _safe_lookup_metadata(obj: dict[str, Any], keys: tuple[str, ...]) -> dict[str, str]:
+    meta: dict[str, str] = {}
+    for key in keys:
+        value = obj.get(key)
+        if value not in (None, "", []):
+            meta[key] = _safe_text(value, 120)
+    return meta
+
+
+def _lookup_existing_dossier_metadata(lookup_result: dict[str, Any] | None, source_file: dict[str, Any]) -> dict[str, str]:
+    data = lookup_result.get("data") if isinstance((lookup_result or {}).get("data"), dict) else {}
+    candidates: list[dict[str, Any]] = []
+    for obj in (data.get("existingDossierMatch"), data.get("existing_dossier_match"), data.get("publicDossierMatch"), data.get("targetDossier")):
+        if isinstance(obj, dict):
+            candidates.append(obj)
+    if source_file:
+        candidates.append(source_file)
+    merged: dict[str, str] = {}
+    for obj in candidates:
+        merged.update(_safe_lookup_metadata(obj, ("existingDossierMatch", "targetDossierId", "dossierId", "publicDossierId", "publicSlug", "slug", "title", "name", "matchKind", "status", "type")))
+    return merged
+
+
+def resolve_enrichment_subject_identity(subject: str, lookup_result: dict[str, Any] | None, db_path: str, guild_id: int | None) -> dict[str, Any]:
+    """Resolve a Source File subject to local review-only identity context.
+
+    The returned object is designed for diagnostics and bounded local evidence
+    collection. Discord/user identifiers are kept in private keys and are never
+    rendered directly in Discord responses or site payload prose.
+    """
+
+    source_file = _source_file_obj(lookup_result or {}) if lookup_result else {}
+    match_kind, _match_note, _sf = classify_source_match(lookup_result or {}) if lookup_result else ("none", "", {})
+    source_name = _first(source_file, ("name", "sourceFileName", "subject", "displayName", "title", "normalizedName")) or subject
+    labels: set[str] = set()
+    display_labels: list[str] = []
+
+    def add_label(value: Any) -> None:
+        for item in _iter_lookup_values(value):
+            text = _safe_text(item, 90)
+            if not text:
+                continue
+            for variant in _identity_label_variants(text):
+                labels.add(variant)
+            if text not in display_labels and not _LONG_ID_RE.fullmatch(text):
+                display_labels.append(text)
+
+    add_label(subject)
+    add_label(source_name)
+    for key in ("aliases", "alias", "matchedAlias", "confirmedAliases", "proposedAliases", "possibleAliases", "identityLinks", "identity_links", "possibleConnections", "normalizedName", "displayName", "preferredName"):
+        if lookup_result and isinstance(lookup_result.get("data"), dict):
+            add_label(lookup_result["data"].get(key))
+        add_label(source_file.get(key))
+
+    matched_user_ids: set[int] = set()
+    matched_profile_count = 0
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        if _table_exists(conn, "user_profiles"):
+            cols = _columns(conn, "user_profiles")
+            select_cols = ["user_id", "display_name"]
+            if "preferred_name" in cols:
+                select_cols.append("preferred_name")
+            rows = conn.execute(f"SELECT {', '.join(select_cols)} FROM user_profiles WHERE guild_id=?", (guild_id,)).fetchall()
+            for row in rows:
+                haystack = set()
+                for col in row.keys():
+                    if col == "user_id":
+                        continue
+                    for variant in _identity_label_variants(row[col]):
+                        haystack.add(variant)
+                if labels & haystack:
+                    try:
+                        matched_user_ids.add(int(row["user_id"]))
+                    except (TypeError, ValueError):
+                        pass
+                    matched_profile_count += 1
+                    add_label(row["display_name"])
+                    if "preferred_name" in row.keys():
+                        add_label(row["preferred_name"])
+        if _table_exists(conn, "community_presence"):
+            cols = _columns(conn, "community_presence")
+            select_cols = [c for c in ("display_name", "subject_key", "source_lanes", "connection_notes", "user_id", "discord_user_id", "member_id") if c in cols]
+            if select_cols:
+                rows = conn.execute(f"SELECT {', '.join(select_cols)} FROM community_presence WHERE guild_id=?", (guild_id,)).fetchall()
+                for row in rows:
+                    haystack = set()
+                    for col in ("display_name", "subject_key", "connection_notes"):
+                        if col in row.keys():
+                            for variant in _identity_label_variants(row[col]):
+                                haystack.add(variant)
+                    if labels & haystack:
+                        add_label(row["display_name"] if "display_name" in row.keys() else "")
+                        for id_col in ("user_id", "discord_user_id", "member_id"):
+                            if id_col in row.keys() and row[id_col] not in (None, ""):
+                                try:
+                                    matched_user_ids.add(int(row[id_col]))
+                                except (TypeError, ValueError):
+                                    pass
+    finally:
+        conn.close()
+
+    existing_dossier = _lookup_existing_dossier_metadata(lookup_result, source_file)
+    candidate_id = _first(source_file, ("candidateId", "candidate_id", "id", "sourceFileId", "source_file_id"))
+    identity = {
+        "subjectName": _safe_text(subject, 90),
+        "normalizedSubjectName": _subject_key(subject),
+        "sourceFileName": _safe_text(source_name, 90),
+        "workflowLane": match_kind,
+        "sourceFileRecordId": _safe_text(candidate_id, 90) if candidate_id else "",
+        "existingDossierMatch": existing_dossier,
+        "aliasLabels": display_labels[:12],
+        "matchedUserProfileCount": matched_profile_count,
+        "matchedUserIdCount": len(matched_user_ids),
+        "matchedIdentityLabels": display_labels[:6],
+        "publicDossierMatchFound": bool(existing_dossier),
+        "existingDossierUpdateLane": match_kind == "existing_dossier_update",
+        "_matchedUserIds": matched_user_ids,
+        "_matchLabels": labels,
+    }
+    return identity
+
+
+def _source_status(checked: dict[str, str], source_type: str, status: str) -> None:
+    checked[source_type] = status
+
+
+def _policy_is_dm_or_private(policy: Any, channel_name: Any = "") -> bool:
+    text = f"{policy or ''} {channel_name or ''}".strip().lower()
+    return any(token in text for token in ("dm", "direct_message", "private_dm", "private"))
+
+
+def _policy_bucket(policy: Any, channel_name: Any = "") -> str:
+    text = f"{policy or ''} {channel_name or ''}".lower()
+    if any(token in text for token in ("operator", "internal", "staff", "mod")):
+        return "internal"
+    return "public"
+
+
+def _summarize_channel_activity(subject: str, rows: list[sqlite3.Row]) -> str:
+    public_count = 0
+    internal_count = 0
+    channels: list[str] = []
+    direct = mention = general = 0
+    for row in rows:
+        bucket = _policy_bucket(row["channel_policy"] if "channel_policy" in row.keys() else "", row["channel_name"] if "channel_name" in row.keys() else "")
+        if bucket == "internal":
+            internal_count += 1
+        else:
+            public_count += 1
+        label = _safe_text((row["channel_name"] if "channel_name" in row.keys() else "") or (row["channel_policy"] if "channel_policy" in row.keys() else "approved channel"), 40)
+        if label and label not in channels:
+            channels.append(label)
+        content = str(row["content"] if "content" in row.keys() else "")
+        if _matches_subject(content, _like_terms(subject)):
+            mention += 1
+        else:
+            general += 1
+        if "role" in row.keys() and str(row["role"] or "").lower() == "user":
+            direct += 1
+    parts = []
+    if public_count:
+        parts.append("public-channel activity")
+    if internal_count:
+        parts.append("internal/operator-channel activity")
+    channel_text = f" Recent approved channels observed: {', '.join(channels[:4])}." if channels else ""
+    interaction = "direct participation" if direct else ("mention context" if mention else "general participation")
+    return f"{_safe_text(subject, 90)} has prior activity in approved Discord-side channels ({' and '.join(parts) or 'approved activity'}). BNL can use this as internal source context, not public dossier copy. Pattern observed: {interaction}; text mentions: {'yes' if mention else 'no'}.{channel_text}"
+
+
 def _append_section(sections: dict[str, list[str]], name: str, value: str, *, limit: int = 5) -> None:
     clean = _safe_text(value, 240)
     if not clean:
@@ -478,112 +692,201 @@ def _add_source_file_context(sections: dict[str, list[str]], source_file: dict[s
 def collect_source_enrichment_evidence(db_path: str, guild_id: int | None, subject: str, *, rd_context: list[dict[str, Any]] | None = None, lookup_result: dict[str, Any] | None = None) -> dict[str, Any]:
     """Collect bounded evidence from approved local stores only."""
 
-    terms = _like_terms(subject)
+    identity = resolve_enrichment_subject_identity(subject, lookup_result, db_path, guild_id)
+    terms = sorted(identity.get("_matchLabels") or _like_terms(subject), key=len, reverse=True)[:20]
+    matched_user_ids = set(identity.get("_matchedUserIds") or set())
     sections: dict[str, list[str]] = {name: [] for name in SECTION_ORDER}
     source_counts: Counter[str] = Counter()
     warning_counts: Counter[str] = Counter()
     source_types: set[str] = set()
+    source_statuses: dict[str, str] = {}
+    skipped_sources: dict[str, str] = {}
     public_safe_candidates: list[str] = []
     review_only_candidates: list[str] = []
+    channel_evidence_found = False
 
     if lookup_result:
         match_kind, match_note, sf_obj = classify_source_match(lookup_result)
         source_counts["source_file_lookup"] += 1
         source_types.add("source_file_lookup")
+        _source_status(source_statuses, "source_file_lookup", "yes")
         _add_source_file_context(sections, sf_obj, subject, match_kind)
         _append_section(sections, "Internal-Only / Review-Only Notes", f"Targeting note: {match_note}")
+        if identity.get("existingDossierUpdateLane") or identity.get("publicDossierMatchFound"):
+            _source_status(source_statuses, "public_dossier_match", "yes")
+            _append_section(sections, "History With BARCODE / BNL / Discord / BARCODE Radio", f"Existing dossier awareness: {_safe_text(subject, 90)} is connected to an existing public dossier/update lane. Treat enrichment as proposed update material only; public dossier content was not changed.")
+            _append_section(sections, "Internal-Only / Review-Only Notes", "Public dossier match metadata was used only for targeting awareness; BNL did not scrape or mutate public dossier content.")
+        else:
+            _source_status(source_statuses, "public_dossier_match", "no_match")
     else:
         match_kind = "none"
+        sf_obj = {}
+        skipped_sources["source_file_lookup"] = "no_lookup_result"
+        _source_status(source_statuses, "source_file_lookup", "skipped")
+        _source_status(source_statuses, "public_dossier_match", "no_match")
 
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
     try:
         if _table_exists(conn, "user_profiles"):
-            cols = _columns(conn, "user_profiles")
-            name_expr = "COALESCE(preferred_name, display_name, '')" if "preferred_name" in cols else "COALESCE(display_name, '')"
-            rows = conn.execute(f"SELECT user_id, display_name, {name_expr} AS name FROM user_profiles WHERE guild_id=?", (guild_id,)).fetchall()
-            matched_user_ids = []
-            for row in rows:
-                if _matches_subject(f"{row['display_name']} {row['name']}", terms):
-                    matched_user_ids.append(int(row["user_id"]))
-                    source_counts["user_profiles"] += 1
-                    source_types.add("user_profiles")
-                    _append_section(sections, "Subject Overview", f"{row['name'] or row['display_name']} is already present in local BNL profile records. Treat this as a workflow match, not a public identity claim.")
-                    _append_section(sections, "Known Roles / Category", _normalize_case_category("community member", inferred=True))
-            matched_user_ids = matched_user_ids[:8]
+            if identity.get("matchedUserIdCount"):
+                source_counts["user_profiles"] += int(identity.get("matchedUserProfileCount") or identity.get("matchedUserIdCount") or 1)
+                source_types.add("user_profiles")
+                _source_status(source_statuses, "user_profiles", "yes")
+                labels = ", ".join(identity.get("matchedIdentityLabels") or [subject])
+                _append_section(sections, "Subject Overview", f"{_safe_text(labels, 120)} is already present in local BNL profile records. Treat this as a workflow identity link for review, not a public identity claim.")
+                _append_section(sections, "Known Roles / Category", _normalize_case_category("community member", inferred=True))
+            else:
+                _source_status(source_statuses, "user_profiles", "no_match")
         else:
-            matched_user_ids = []
+            skipped_sources["user_profiles"] = "table_missing"
+            _source_status(source_statuses, "user_profiles", "skipped")
 
         if _table_exists(conn, "user_memory_facts"):
             rows = conn.execute("SELECT user_id, fact_key, fact_value, confidence, is_core FROM user_memory_facts WHERE guild_id=? ORDER BY updated_at DESC LIMIT 500", (guild_id,)).fetchall()
+            matched = 0
             for row in rows:
                 text = f"{row['fact_key']}: {row['fact_value']}"
                 if int(row["user_id"] or 0) in matched_user_ids or _matches_subject(text, terms):
+                    matched += 1
                     source_counts["user_memory_facts"] += 1
                     source_types.add("user_memory_facts")
                     conf = float(row["confidence"] or 0)
                     target = "Known Facts" if conf >= 0.75 or int(row["is_core"] or 0) else "Claimed or Inferred Notes"
                     _append_section(sections, target, _case_memory_fact(row["fact_key"], row["fact_value"], conf, bool(row["is_core"])))
+            _source_status(source_statuses, "user_memory_facts", "yes" if matched else "no_match")
+        else:
+            skipped_sources["user_memory_facts"] = "table_missing"
+            _source_status(source_statuses, "user_memory_facts", "skipped")
 
         if _table_exists(conn, "user_habits"):
             rows = conn.execute("SELECT user_id, total_messages, question_messages, humor_messages, late_night_messages, last_topic FROM user_habits WHERE guild_id=?", (guild_id,)).fetchall()
+            matched = 0
             for row in rows:
                 if int(row["user_id"] or 0) in matched_user_ids or _matches_subject(row["last_topic"], terms):
+                    matched += 1
                     source_counts["user_habits"] += 1
                     source_types.add("user_habits")
                     _append_section(sections, "Observed Patterns", _case_habit_pattern(row))
+            _source_status(source_statuses, "user_habits", "yes" if matched else "no_match")
+        else:
+            skipped_sources["user_habits"] = "table_missing"
+            _source_status(source_statuses, "user_habits", "skipped")
 
         if _table_exists(conn, "relationship_state"):
             rows = conn.execute("SELECT user_id, interaction_count, trust_stage, social_stance, last_topic FROM relationship_state WHERE guild_id=?", (guild_id,)).fetchall()
+            matched = 0
             for row in rows:
                 if int(row["user_id"] or 0) in matched_user_ids or _matches_subject(row["last_topic"], terms):
+                    matched += 1
                     source_counts["relationship_state"] += 1
                     source_types.add("relationship_state")
                     _append_section(sections, "History With BARCODE / BNL / Discord / BARCODE Radio", _case_relationship_history(row))
+            _source_status(source_statuses, "relationship_state", "yes" if matched else "no_match")
+        else:
+            skipped_sources["relationship_state"] = "table_missing"
+            _source_status(source_statuses, "relationship_state", "skipped")
 
         if _table_exists(conn, "relationship_journal"):
             rows = conn.execute("SELECT user_id, entry_type, summary FROM relationship_journal WHERE guild_id=? ORDER BY timestamp DESC LIMIT 300", (guild_id,)).fetchall()
+            matched = 0
             for row in rows:
                 if int(row["user_id"] or 0) in matched_user_ids or _matches_subject(row["summary"], terms):
+                    matched += 1
                     source_counts["relationship_journal"] += 1
                     source_types.add("relationship_journal")
                     _append_section(sections, "History With BARCODE / BNL / Discord / BARCODE Radio", f"Recent BNL relationship note ({_safe_text(row['entry_type'], 40)}): {_safe_text(row['summary'], 180)}")
+            _source_status(source_statuses, "relationship_journal", "yes" if matched else "no_match")
+        else:
+            skipped_sources["relationship_journal"] = "table_missing"
+            _source_status(source_statuses, "relationship_journal", "skipped")
 
         if _table_exists(conn, "conversations"):
-            rows = conn.execute("SELECT channel_name, channel_policy, role, content FROM conversations WHERE guild_id=? AND COALESCE(channel_policy,'') NOT IN ('dm','direct_message','private_dm') ORDER BY timestamp DESC LIMIT 600", (guild_id,)).fetchall()
-            for row in rows:
-                if row["role"] == "model":
-                    continue
-                if _matches_subject(row["content"], terms):
-                    source_counts["conversations"] += 1
-                    source_types.add("conversations")
-                    label = _safe_text(row["channel_policy"] or row["channel_name"] or "approved channel", 60)
-                    note = f"Mentioned in {label} context; review the source before treating this as a fact: {_safe_text(row['content'], 150)}"
-                    if _WEAK_ALIAS_RE.search(row["content"] or ""):
-                        _append_section(sections, "Possible Aliases / Connections", f"Possible connection only; needs owner review and must not be treated as a confirmed alias: {_safe_text(row['content'], 150)}")
-                    else:
-                        _append_section(sections, "Claimed or Inferred Notes", note)
-                    review_only_candidates.append(note)
+            cols = _columns(conn, "conversations")
+            select_cols = [c for c in ("user_id", "author_id", "discord_user_id", "member_id", "user_name", "author_name", "channel_name", "channel_policy", "role", "content", "timestamp") if c in cols]
+            if select_cols:
+                order_col = "timestamp" if "timestamp" in cols else "id" if "id" in cols else "rowid"
+                rows = conn.execute(f"SELECT {', '.join(select_cols)} FROM conversations WHERE guild_id=? ORDER BY {order_col} DESC LIMIT 800", (guild_id,)).fetchall()
+                matched_rows: list[sqlite3.Row] = []
+                mention_rows = 0
+                for row in rows:
+                    role = str(row["role"] if "role" in row.keys() else "").lower()
+                    if role == "model":
+                        continue
+                    if _policy_is_dm_or_private(row["channel_policy"] if "channel_policy" in row.keys() else "", row["channel_name"] if "channel_name" in row.keys() else ""):
+                        continue
+                    author_match = False
+                    for id_col in ("user_id", "author_id", "discord_user_id", "member_id"):
+                        if id_col in row.keys() and row[id_col] not in (None, ""):
+                            try:
+                                if int(row[id_col]) in matched_user_ids:
+                                    author_match = True
+                            except (TypeError, ValueError):
+                                pass
+                    for name_col in ("user_name", "author_name"):
+                        if name_col in row.keys() and any(v in terms for v in _identity_label_variants(row[name_col])):
+                            author_match = True
+                    content_match = _matches_subject(row["content"] if "content" in row.keys() else "", terms)
+                    if author_match:
+                        matched_rows.append(row)
+                    elif content_match:
+                        mention_rows += 1
+                        source_counts["conversations"] += 1
+                        source_types.add("conversations")
+                        label = _safe_text((row["channel_policy"] if "channel_policy" in row.keys() else "") or (row["channel_name"] if "channel_name" in row.keys() else "approved channel"), 60)
+                        content = row["content"] if "content" in row.keys() else ""
+                        note = f"Mentioned in {label} context; review the source before treating this as a fact: {_safe_text(content, 150)}"
+                        if _WEAK_ALIAS_RE.search(content or ""):
+                            _append_section(sections, "Possible Aliases / Connections", f"Possible connection only; needs owner review and must not be treated as a confirmed alias: {_safe_text(content, 150)}")
+                        else:
+                            _append_section(sections, "Claimed or Inferred Notes", note)
+                        review_only_candidates.append(note)
+                if matched_rows:
+                    channel_evidence_found = True
+                    source_counts["conversations_by_author"] += len(matched_rows)
+                    source_types.add("conversations_by_author")
+                    _append_section(sections, "Observed Patterns", _summarize_channel_activity(subject, matched_rows), limit=6)
+                    review_only_candidates.append(_summarize_channel_activity(subject, matched_rows))
+                _source_status(source_statuses, "conversations_by_author", "yes" if matched_rows else ("no_identity_match" if not matched_user_ids else "no_match"))
+                if mention_rows:
+                    _source_status(source_statuses, "conversations", "yes")
+                elif "conversations" not in source_statuses:
+                    _source_status(source_statuses, "conversations", "no_match")
+            else:
+                skipped_sources["conversations"] = "no_supported_columns"
+                _source_status(source_statuses, "conversations", "skipped")
+                _source_status(source_statuses, "conversations_by_author", "skipped")
+        else:
+            skipped_sources["conversations"] = "table_missing"
+            _source_status(source_statuses, "conversations", "skipped")
+            _source_status(source_statuses, "conversations_by_author", "skipped")
 
         if _table_exists(conn, "memory_tiers"):
             cols = _columns(conn, "memory_tiers")
             trust_col = "source_trust" if "source_trust" in cols else "'legacy_unknown'"
             policy_col = "source_channel_policy" if "source_channel_policy" in cols else "'legacy_unknown'"
             rows = conn.execute(f"SELECT tier, summary, salience, {trust_col} AS source_trust, {policy_col} AS source_channel_policy FROM memory_tiers WHERE guild_id=? ORDER BY salience DESC, updated_at DESC LIMIT 500", (guild_id,)).fetchall()
+            matched = 0
             for row in rows:
                 if _matches_subject(row["summary"], terms):
+                    matched += 1
                     source_counts["memory_tiers"] += 1
                     source_types.add("memory_tiers")
-                    trust = str(row["source_trust"] or "legacy_unknown")
                     warning_counts["source_blind_memory"] += 1
                     _append_section(sections, "Internal-Only / Review-Only Notes", f"Review-only legacy memory mentions this subject, but the source is not strong enough for Known Facts: {_safe_text(row['summary'], 160)}")
                     review_only_candidates.append(_safe_text(row["summary"], 160))
+            _source_status(source_statuses, "memory_tiers", "yes" if matched else "no_match")
+        else:
+            skipped_sources["memory_tiers"] = "table_missing"
+            _source_status(source_statuses, "memory_tiers", "skipped")
 
         if _table_exists(conn, "broadcast_memory"):
             rows = conn.execute("SELECT episode_date, cleaned_summary, entry_type, public_safe, usage_scope FROM broadcast_memory WHERE guild_id=? AND status='active' ORDER BY created_at DESC LIMIT 300", (guild_id,)).fetchall()
+            matched = 0
             for row in rows:
                 text = row["cleaned_summary"]
                 if _matches_subject(text, terms):
+                    matched += 1
                     source_counts["broadcast_memory"] += 1
                     source_types.add("broadcast_memory")
                     note = f"BARCODE Radio memory from {row['episode_date']} ({row['entry_type']}) mentions this subject: {_safe_text(text, 180)}"
@@ -593,18 +896,40 @@ def collect_source_enrichment_evidence(db_path: str, guild_id: int | None, subje
                         public_safe_candidates.append(_safe_text(text, 160))
                     else:
                         _append_section(sections, "Internal-Only / Review-Only Notes", note)
+            _source_status(source_statuses, "broadcast_memory", "yes" if matched else "no_match")
+        else:
+            skipped_sources["broadcast_memory"] = "table_missing"
+            _source_status(source_statuses, "broadcast_memory", "skipped")
 
         if _table_exists(conn, "community_presence"):
-            rows = conn.execute("SELECT display_name, source_lanes, approved_channel_labels, mention_count, direct_interaction_count, operator_mention_count, connection_notes, evidence_snippets, category FROM community_presence WHERE guild_id=?", (guild_id,)).fetchall()
+            cols = _columns(conn, "community_presence")
+            select_cols = [c for c in ("display_name", "subject_key", "source_lanes", "approved_channel_labels", "mention_count", "direct_interaction_count", "operator_mention_count", "connection_notes", "evidence_snippets", "category", "user_id", "discord_user_id", "member_id") if c in cols]
+            rows = conn.execute(f"SELECT {', '.join(select_cols)} FROM community_presence WHERE guild_id=?", (guild_id,)).fetchall() if select_cols else []
+            matched = 0
             for row in rows:
-                combined = " ".join(str(row[key] or "") for key in row.keys())
-                if _matches_subject(combined, terms):
+                row_labels: set[str] = set()
+                for col in ("display_name", "subject_key", "connection_notes", "source_lanes"):
+                    if col in row.keys():
+                        row_labels.update(_identity_label_variants(row[col]))
+                identity_match = bool(set(terms) & row_labels)
+                for id_col in ("user_id", "discord_user_id", "member_id"):
+                    if id_col in row.keys() and row[id_col] not in (None, ""):
+                        try:
+                            identity_match = identity_match or int(row[id_col]) in matched_user_ids
+                        except (TypeError, ValueError):
+                            pass
+                if identity_match:
+                    matched += 1
                     source_counts["community_presence"] += 1
                     source_types.add("community_presence")
                     _append_section(sections, "Observed Patterns", _case_community_presence(row))
-                    _append_section(sections, "Known Roles / Category", _normalize_case_category(row["category"] or "community member", inferred=True))
-                    if row["connection_notes"]:
+                    _append_section(sections, "Known Roles / Category", _normalize_case_category(row["category"] if "category" in row.keys() else "community member", inferred=True))
+                    if "connection_notes" in row.keys() and row["connection_notes"]:
                         _append_section(sections, "Possible Aliases / Connections", f"Possible community connection only; needs owner review before it is treated as an identity link: {_safe_text(row['connection_notes'], 180)}")
+            _source_status(source_statuses, "community_presence", "yes" if matched else "no_match")
+        else:
+            skipped_sources["community_presence"] = "table_missing"
+            _source_status(source_statuses, "community_presence", "skipped")
     finally:
         conn.close()
 
@@ -613,8 +938,11 @@ def collect_source_enrichment_evidence(db_path: str, guild_id: int | None, subje
         if _matches_subject(text, terms):
             source_counts["rd_context"] += 1
             source_types.add("rd_context")
+            _source_status(source_statuses, "rd_context", "yes")
             _append_section(sections, "Why This Subject Matters", f"R&D context gives BNL a reason to review this subject: {_safe_text(text, 160)}")
             review_only_candidates.append(_safe_text(text, 160))
+    if "rd_context" not in source_statuses:
+        _source_status(source_statuses, "rd_context", "no_match" if rd_context else "not_provided")
 
     if not sections["Why This Subject Matters"] and (sum(source_counts.values()) > source_counts.get("source_file_lookup", 0)):
         _append_section(sections, "Why This Subject Matters", "BNL has enough local review signals to keep this subject in the working record; admins should decide what, if anything, belongs in a public-safe Source File summary.")
@@ -626,10 +954,21 @@ def collect_source_enrichment_evidence(db_path: str, guild_id: int | None, subje
         for item in _case_missing_info(match_kind):
             _append_section(sections, "Missing Info", item)
     if not sections["Do Not Say"]:
-        _append_section(sections, "Do Not Say", "Do not present review-only memory, possible aliases, private identity, or source-blind notes as confirmed public fact.")
+        _append_section(sections, "Do Not Say", "Do not present review-only memory, possible aliases, private identity, raw private transcripts, or source-blind notes as confirmed public fact.")
     if not sections["Suggested Next Action"]:
         _append_section(sections, "Suggested Next Action", _case_next_action(subject, match_kind, sf_obj if lookup_result else {}))
 
+    safe_identity = {k: v for k, v in identity.items() if not k.startswith("_")}
+    diagnostics = {
+        "sourceTypesChecked": source_statuses,
+        "sourceTypesSkipped": skipped_sources,
+        "matchedUserProfileCount": int(identity.get("matchedUserProfileCount") or 0),
+        "matchedUserIdCount": int(identity.get("matchedUserIdCount") or 0),
+        "matchedIdentityLabels": list(identity.get("matchedIdentityLabels") or [])[:6],
+        "channelEvidenceFound": channel_evidence_found,
+        "publicDossierMatchFound": bool(identity.get("publicDossierMatchFound")),
+        "existingDossierUpdateLane": bool(identity.get("existingDossierUpdateLane")),
+    }
     return {
         "sections": {name: values for name, values in sections.items() if values},
         "sourceCounts": dict(source_counts),
@@ -638,8 +977,9 @@ def collect_source_enrichment_evidence(db_path: str, guild_id: int | None, subje
         "warnings": ([SOURCE_BLIND_WARNING] if warning_counts.get("source_blind_memory") else []),
         "publicSafeCandidates": public_safe_candidates[:5],
         "reviewOnlyCandidates": review_only_candidates[:5],
+        "subjectIdentity": safe_identity,
+        "diagnostics": diagnostics,
     }
-
 
 def _section_text(sections: dict[str, list[str]], name: str, *, limit: int = 4) -> str:
     items = sections.get(name) or []
@@ -688,6 +1028,8 @@ def build_enrichment_recommendation_payload(packet: dict[str, Any], *, environ: 
         "qualityStatus": packet.get("qualityStatus"),
         "forced": bool(packet.get("forced")),
         "safetyWarnings": list(packet.get("warnings") or []),
+        "sourceCoverage": dict(packet.get("sourceTypesChecked") or {}),
+        "identityDiagnostics": dict(packet.get("diagnostics") or {}),
         "visibilityLabels": ["internal_review_only", "admin_review_required"],
         "confidence": "low" if packet.get("qualityStatus") in {"too_thin", "forced_low_confidence"} else ("medium" if match_kind == "active_source_file" else "low"),
         "createdBy": "bnl",
@@ -798,6 +1140,10 @@ def run_source_file_enrichment(
         "warningCounts": evidence["warningCounts"],
         "sourceTypes": evidence["sourceTypes"],
         "warnings": evidence["warnings"],
+        "subjectIdentity": evidence.get("subjectIdentity") or {},
+        "diagnostics": evidence.get("diagnostics") or {},
+        "sourceTypesChecked": (evidence.get("diagnostics") or {}).get("sourceTypesChecked", {}),
+        "sourceTypesSkipped": (evidence.get("diagnostics") or {}).get("sourceTypesSkipped", {}),
         "runTime": datetime.now(timezone.utc).isoformat(),
         "forced": bool(force),
     }
@@ -825,6 +1171,23 @@ def run_source_file_enrichment(
     packet["sent"] = bool((send_result or {}).get("ok"))
     packet["status"] = "sent" if packet["sent"] else "send_failed"
     return packet
+
+
+
+
+def _format_source_coverage(result: dict[str, Any]) -> str:
+    checked = result.get("sourceTypesChecked") or (result.get("diagnostics") or {}).get("sourceTypesChecked") or {}
+    if not checked:
+        used = set(result.get("sourceTypes") or [])
+        checked = {name: ("yes" if name in used else "no_match") for name in ("source_file_lookup", "user_profiles", "conversations_by_author", "community_presence", "public_dossier_match", "broadcast_memory")}
+    preferred = ["source_file_lookup", "user_profiles", "conversations_by_author", "community_presence", "public_dossier_match", "broadcast_memory", "user_habits", "relationship_state", "relationship_journal", "user_memory_facts", "memory_tiers", "rd_context"]
+    parts = []
+    for key in preferred:
+        if key in checked:
+            parts.append(f"{key} {checked[key]}")
+    for key in sorted(k for k in checked if k not in preferred):
+        parts.append(f"{key} {checked[key]}")
+    return ", ".join(parts) or "none checked"
 
 
 def format_source_enrichment_response(result: dict[str, Any]) -> str:
@@ -876,6 +1239,10 @@ def format_source_enrichment_response(result: dict[str, Any]) -> str:
             f"Target lane: {attach_label}.",
             f"Would send as BNL Source File Enrichment: {'yes' if result.get('qualityStatus') != 'too_thin' else 'no — too thin'}.",
             f"Source types used: {source_types}.",
+            f"Source coverage: {_format_source_coverage(result)}.",
+            f"Matched local profiles/users: {int((result.get('diagnostics') or {}).get('matchedUserProfileCount') or 0)}/{int((result.get('diagnostics') or {}).get('matchedUserIdCount') or 0)}.",
+            f"Matched identity labels: {_safe_text(', '.join((result.get('diagnostics') or {}).get('matchedIdentityLabels') or []) or 'none', 160)}.",
+            f"Channel evidence found: {'yes' if (result.get('diagnostics') or {}).get('channelEvidenceFound') else 'no'}; public dossier match found: {'yes' if (result.get('diagnostics') or {}).get('publicDossierMatchFound') else 'no'}; existing dossier update lane: {'yes' if (result.get('diagnostics') or {}).get('existingDossierUpdateLane') else 'no'}.",
             f"Warning count: {warning_text}.",
         ]
         bullets = result.get("previewBullets") or build_preview_bullets(result)
