@@ -128,6 +128,82 @@ class SourceKnowledgeBridgeTests(unittest.TestCase):
         self.assertNotIn("transcript", response.lower())
         self.assertNotIn("payload", response.lower())
 
+
+    def test_classifier_rejects_generic_conversational_fragments(self):
+        for term in ("what", "there", "such", "alot", "actually", "message"):
+            self.assertFalse(bridge.is_valid_bridge_subject(term, source_type="conversations"), term)
+        self.assertFalse(bridge.is_valid_bridge_subject("what Emerald", source_type="conversations"))
+        self.assertFalse(bridge.is_valid_bridge_subject("Emerald there", source_type="conversations"))
+        self.assertFalse(bridge.is_valid_bridge_subject("normal", source_type="conversations"))
+        self.assertFalse(bridge.is_valid_bridge_subject("123456789012345678", source_type="conversations"))
+        self.assertFalse(bridge.is_valid_bridge_subject("!!!", source_type="conversations"))
+
+    def test_trusted_display_names_are_accepted_and_generic_names_withheld(self):
+        c = self.conn.cursor()
+        for name in ("Hellcat", "Emerald", "Crow", "Shortbabe"):
+            c.execute("INSERT INTO community_presence VALUES (1,?,?,?,?,?,?,?,?,?)", (name.lower(), name, "now", "now", 3, 1, 1, json.dumps([]), json.dumps(["approved-channel presence"])))
+        c.execute("INSERT INTO user_profiles VALUES (2,1,'what','what',NULL,NULL)")
+        self.conn.commit()
+        result = self._collect()
+        names = {p["subjectName"] for p in result["payloads"]}
+        for expected in {"Hellcat", "Emerald", "Crow", "Shortbabe"}:
+            self.assertIn(expected, names)
+        self.assertNotIn("what", {name.lower() for name in names})
+        self.assertGreaterEqual(result["topWithheldReasons"].get("weak_generic_term", 0), 1)
+
+    def test_known_name_registry_boosts_names_found_in_conversations_and_memory_supports(self):
+        self.conn.execute("INSERT INTO community_presence VALUES (1,'emerald','Emerald','now','now',4,0,0,?,?)", (json.dumps([]), json.dumps([])))
+        self.conn.execute("INSERT INTO conversations VALUES (NULL,1,'User',1,'general','public_home','user','I was talking with emerald about art yesterday.','now')")
+        self.conn.execute("INSERT INTO memory_tiers VALUES (NULL,1,1,'long','Emerald came up in older source-blind memory notes.',0.7,1,'now')")
+        self.conn.commit()
+        payload = self._payload_by_name(self._collect(), "Emerald")
+        self.assertIn("conversations", payload["sourceTypes"])
+        self.assertIn("memory_tiers", payload["sourceTypes"])
+        self.assertIn(bridge.SOURCE_BLIND_WARNING, payload["safetyWarnings"])
+
+    def test_source_blind_memory_does_not_create_uncorroborated_junk_candidate(self):
+        self.conn.execute("INSERT INTO memory_tiers VALUES (NULL,1,1,'long','what there such alot message conversation reply',0.9,1,'now')")
+        self.conn.commit()
+        result = self._collect()
+        lower_names = {p["subjectName"].lower() for p in result["payloads"]}
+        for blocked in {"what", "there", "such", "alot"}:
+            self.assertNotIn(blocked, lower_names)
+        self.assertEqual(result["sendableRecommendationCount"], 0)
+
+    def test_modem_and_orion_connection_review_in_explicit_context(self):
+        self.conn.execute("INSERT INTO user_profiles VALUES (10,1,'Modem','Modem',NULL,NULL)")
+        self.conn.execute("INSERT INTO conversations VALUES (NULL,10,'Modem',1,'general','public_home','user','source file for Mac Modem; Orion via Crow is a possible connection review.','now')")
+        self.conn.commit()
+        result = self._collect()
+        names = {p["subjectName"] for p in result["payloads"]}
+        self.assertIn("Modem", names)
+        self.assertIn("Mac Modem", names)
+        orion = self._payload_by_name(result, "Orion")
+        self.assertEqual(orion["type"], "possible_connection_review")
+        self.assertIn("not confirmed identity", orion["reason"])
+
+    def test_dry_run_reports_withheld_reasons_and_does_not_send(self):
+        self.conn.execute("INSERT INTO user_profiles VALUES (1,1,'Emerald','Emerald',NULL,NULL)")
+        self.conn.execute("INSERT INTO conversations VALUES (NULL,1,'User',1,'general','public_home','user','source file for What. subject: There. known as Such. artist Alot.','now')")
+        self.conn.commit()
+        calls = []
+        result = bridge.run_source_knowledge_bridge(self.db, 1, dry_run=True, sender=lambda payload: calls.append(payload) or {"ok": True})
+        response = bridge.format_source_knowledge_bridge_response(result)
+        self.assertEqual(calls, [])
+        self.assertIn("topWithheldReasons", result)
+        self.assertIn("Top withheld reasons", response)
+        self.assertGreater(result["withheldCount"], 0)
+        self.assertGreater(result["junkTermsBlockedCount"], 0)
+
+    def test_real_run_sends_valid_recommendations(self):
+        self.conn.execute("INSERT INTO user_profiles VALUES (1,1,'Emerald','Emerald',NULL,NULL)")
+        self.conn.commit()
+        calls = []
+        result = bridge.run_source_knowledge_bridge(self.db, 1, dry_run=False, sender=lambda payload: calls.append(payload) or {"ok": True})
+        self.assertEqual(result["sentCount"], 1)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["subjectName"], "Emerald")
+
     def test_parse_command_aliases(self):
         for command in ("!bnl source bridge knowledge | limit=2 | dry_run=false", "!bnl source bridge candidates", "!bnl dossier bridge knowledge"):
             matched, options, error = bridge.parse_source_knowledge_bridge_command(command)
