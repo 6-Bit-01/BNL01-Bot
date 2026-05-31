@@ -182,9 +182,9 @@ BNL_REACTIONS_VIBE = ["🫡", "👀", "🔥", "💯", "😵‍💫", "🧪", "�
 
 PROTECTED_SYSTEM_CHANNELS = {"welcome", "episode-tracker"}
 PUBLIC_HOME_CHANNELS = {"barcode-bot"}
-PUBLIC_CONTEXT_CHANNELS = {"general-chat", "finished-tracks", "wips-and-demos", "collaboration-hub"}
-PUBLIC_SELECTIVE_CHANNELS = {"introductions", "social-links", "suggestions", "underground-nation", "hellcat-nz", "enter-data-ping-here", "daily-riddle"}
-REFERENCE_CANON_CHANNELS = {"announcements", "rules-and-guidelines", "faq", "resources", "roles"}
+PUBLIC_CONTEXT_CHANNELS = {"general-chat", "finished-tracks", "wips-and-demos", "collaboration-hub", "off-topic", "sponsors"}
+PUBLIC_SELECTIVE_CHANNELS = {"introductions", "social-links", "suggestions", "underground-nation", "hellcat-nz", "enter-data-ping-here", "daily-riddle", "top-viewers"}
+REFERENCE_CANON_CHANNELS = {"announcements", "rules-and-guidelines", "faq", "resources", "roles", "rules"}
 INTERNAL_CONTROLLED_CHANNELS = {"research-and-development", "important", "planning-and-coordination", "mod-resources", "ai-avatar"}
 AI_IMAGE_TOOL_CHANNELS = {"ai-image-generator"}
 BROADCAST_MEMORY_CHANNELS = {"bnl-broadcast-memory"}
@@ -525,6 +525,10 @@ _last_community_presence_candidate_count = 0
 _last_community_presence_withheld_count = 0
 _last_community_presence_top_withheld_reason = "none"
 _last_community_presence_error_status = "none"
+_passive_capture_last_channel = "none"
+_passive_capture_last_user = "none"
+_passive_capture_last_status = "never"
+_passive_capture_last_skip_reason = "none"
 _last_source_knowledge_bridge_run_time = "never"
 _last_source_knowledge_bridge_sent_count = 0
 _last_source_knowledge_bridge_duplicate_count = 0
@@ -4662,8 +4666,258 @@ def context_visibility_for_policy(policy: str) -> str:
 
 
 def allow_passive_memory_for_policy(policy: str) -> bool:
-    return policy in {"public_home", "public_context"}
+    return policy in {"public_home", "public_context", "public_selective", "sealed_test"}
 
+
+
+def _is_text_like_channel(channel) -> bool:
+    """Return True for guild channels that can carry normal text messages."""
+    if not channel:
+        return False
+    try:
+        if isinstance(channel, discord.TextChannel):
+            return True
+        if hasattr(discord, "Thread") and isinstance(channel, discord.Thread):
+            return True
+    except Exception:
+        pass
+    channel_type = str(getattr(channel, "type", "") or "").lower()
+    return any(token in channel_type for token in ("text", "news", "forum", "thread")) or hasattr(channel, "send") and hasattr(channel, "history")
+
+
+def _safe_channel_name(channel) -> str:
+    return ((getattr(channel, "name", "") or "").strip().lower())[:80]
+
+
+def _channel_permissions_snapshot(channel) -> dict:
+    guild = getattr(channel, "guild", None)
+    me = getattr(guild, "me", None)
+    if not channel or not me or not hasattr(channel, "permissions_for"):
+        return {"view": False, "read_history": False, "send": False, "react": False}
+    try:
+        perms = channel.permissions_for(me)
+    except Exception:
+        return {"view": False, "read_history": False, "send": False, "react": False}
+    return {
+        "view": bool(getattr(perms, "view_channel", False)),
+        "read_history": bool(getattr(perms, "read_message_history", False)),
+        "send": bool(getattr(perms, "send_messages", False)),
+        "react": bool(getattr(perms, "add_reactions", False)),
+    }
+
+
+def passive_capture_expected_for_channel(channel, policy: str | None = None, permissions: dict | None = None) -> bool:
+    policy = (policy or resolve_channel_policy(channel) or "unknown").strip().lower()
+    permissions = permissions or _channel_permissions_snapshot(channel)
+    if not _is_text_like_channel(channel):
+        return False
+    if not permissions.get("view") or not permissions.get("read_history"):
+        return False
+    return allow_passive_memory_for_policy(policy)
+
+
+def _conversations_has_channel_id(cursor) -> bool:
+    try:
+        cursor.execute("PRAGMA table_info(conversations)")
+        return any(str(row[1]) == "channel_id" for row in cursor.fetchall() if len(row) > 1)
+    except Exception:
+        return False
+
+
+def get_channel_capture_stats(guild_id: int, channel_id: int | None, channel_name: str = "") -> dict:
+    """Count captures by channel_id and legacy blank-id rows by channel_name."""
+    normalized_name = _safe_channel_name(type("ChannelName", (), {"name": channel_name})())
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    has_channel_id = _conversations_has_channel_id(cursor)
+    try:
+        if has_channel_id:
+            cursor.execute(
+                """
+                SELECT COUNT(*), MAX(timestamp)
+                FROM conversations
+                WHERE guild_id=? AND role='user'
+                  AND (
+                    (channel_id IS NOT NULL AND channel_id != 0 AND channel_id=?)
+                    OR ((channel_id IS NULL OR channel_id=0) AND lower(COALESCE(channel_name,''))=?)
+                  )
+                """,
+                (guild_id, int(channel_id or 0), normalized_name),
+            )
+        else:
+            cursor.execute(
+                """
+                SELECT COUNT(*), MAX(timestamp)
+                FROM conversations
+                WHERE guild_id=? AND role='user' AND lower(COALESCE(channel_name,''))=?
+                """,
+                (guild_id, normalized_name),
+            )
+        row = cursor.fetchone()
+    except sqlite3.Error:
+        row = (0, None)
+    finally:
+        conn.close()
+    return {"captured_rows": int(row[0] if row and row[0] is not None else 0), "latest_captured_at": row[1] if row else None}
+
+
+def build_channel_audit_rows(guild) -> list[dict]:
+    rows = []
+    if not guild:
+        return rows
+    channels = list(getattr(guild, "channels", []) or [])
+    channels.sort(key=lambda ch: (getattr(getattr(ch, "category", None), "position", 9999), getattr(ch, "position", 9999), str(getattr(ch, "name", ""))))
+    for channel in channels:
+        channel_type = str(getattr(channel, "type", type(channel).__name__))
+        if "category" in channel_type.lower() or channel.__class__.__name__.lower().endswith("categorychannel"):
+            continue
+        category = getattr(channel, "category", None) or getattr(channel, "parent", None)
+        category_name = getattr(category, "name", None) or "(no category)"
+        policy = resolve_channel_policy(channel)
+        perms = _channel_permissions_snapshot(channel)
+        text_like = _is_text_like_channel(channel)
+        expected = passive_capture_expected_for_channel(channel, policy, perms)
+        stats = get_channel_capture_stats(getattr(guild, "id", 0), getattr(channel, "id", 0), getattr(channel, "name", ""))
+        flags = []
+        if not perms.get("view"):
+            flags.append("cannot_view")
+        if text_like and perms.get("view") and not perms.get("read_history"):
+            flags.append("no_read_history")
+        if policy == "unknown" and text_like:
+            flags.append("unknown_policy")
+        if expected and stats["captured_rows"] == 0:
+            flags.append("expected_capture_but_zero_rows")
+        if not expected and (not text_like or policy in {"protected_system", "reference_canon", "broadcast_memory", "ai_image_tool", "unknown"}):
+            flags.append("special_no_capture")
+        if not flags:
+            flags.append("ok")
+        rows.append({
+            "category_name": category_name,
+            "channel_name": getattr(channel, "name", ""),
+            "channel_id": int(getattr(channel, "id", 0) or 0),
+            "channel_type": channel_type,
+            "permissions": perms,
+            "channel_policy": policy,
+            "passive_capture_expected": expected,
+            **stats,
+            "flags": flags,
+        })
+    return rows
+
+
+def summarize_channel_audit_rows(rows: list[dict]) -> dict:
+    return {
+        "visible_channels": sum(1 for r in rows if r.get("permissions", {}).get("view")),
+        "not_visible_channels": sum(1 for r in rows if not r.get("permissions", {}).get("view")),
+        "unknown_policy_channels": sum(1 for r in rows if "unknown_policy" in r.get("flags", [])),
+        "expected_capture_zero_channels": sum(1 for r in rows if "expected_capture_but_zero_rows" in r.get("flags", [])),
+        "channels_captured_recently": sum(1 for r in rows if r.get("latest_captured_at")),
+        "channels_skipped_intentionally": sum(1 for r in rows if "special_no_capture" in r.get("flags", [])),
+    }
+
+
+def format_channel_audit_pages(guild, rows: list[dict] | None = None, *, max_chars: int = 1850) -> list[str]:
+    rows = build_channel_audit_rows(guild) if rows is None else rows
+    summary = summarize_channel_audit_rows(rows)
+    header = [
+        "**BNL Channel Audit**",
+        f"guild_id: `{getattr(guild, 'id', 0)}`",
+        f"visible: `{summary['visible_channels']}` | not_visible: `{summary['not_visible_channels']}` | unknown_policy: `{summary['unknown_policy_channels']}`",
+        f"expected_zero: `{summary['expected_capture_zero_channels']}` | captured_recently: `{summary['channels_captured_recently']}` | intentionally_skipped: `{summary['channels_skipped_intentionally']}`",
+        "No raw transcripts are included.",
+        "",
+    ]
+    lines = []
+    for row in rows:
+        perms = row.get("permissions", {})
+        line = (
+            f"[{row.get('category_name')}] #{row.get('channel_name')} "
+            f"id={row.get('channel_id')} type={row.get('channel_type')} "
+            f"perms(v={int(perms.get('view', False))},hist={int(perms.get('read_history', False))},send={int(perms.get('send', False))},react={int(perms.get('react', False))}) "
+            f"policy={row.get('channel_policy')} capture={'yes' if row.get('passive_capture_expected') else 'no'} "
+            f"rows={row.get('captured_rows', 0)} latest={row.get('latest_captured_at') or 'none'} "
+            f"flags={','.join(row.get('flags') or ['ok'])}"
+        )
+        lines.append(line)
+    pages = []
+    current = "\n".join(header)
+    for line in lines:
+        addition = line + "\n"
+        if len(current) + len(addition) > max_chars and current.strip():
+            pages.append(current.rstrip())
+            current = addition
+        else:
+            current += addition
+    if current.strip():
+        pages.append(current.rstrip())
+    if not pages:
+        pages = ["\n".join(header).rstrip()]
+    total = len(pages)
+    return [f"{page}\n_page {idx}/{total}_" for idx, page in enumerate(pages, start=1)]
+
+
+async def maybe_handle_channel_audit_command(message: discord.Message, clean_content: str) -> bool:
+    text = re.sub(r"\s+", " ", (clean_content or "").strip().lower())
+    if text not in {"!bnl audit channels", "!bnl channels audit"}:
+        return False
+    member = message.author if isinstance(message.author, discord.Member) else message.guild.get_member(message.author.id)
+    if not can_send_dossier_recommendation(message.author, member, message.guild):
+        await message.reply("Channel audit is operator-only.")
+        return True
+    pages = format_channel_audit_pages(message.guild)
+    for idx, page in enumerate(pages):
+        if idx == 0:
+            await message.reply(page)
+        else:
+            await message.channel.send(page)
+    return True
+
+
+def mark_passive_capture_status(channel_name: str = "", user_name: str = "", status: str = "", skip_reason: str = "none") -> None:
+    global _passive_capture_last_channel, _passive_capture_last_user, _passive_capture_last_status, _passive_capture_last_skip_reason
+    _passive_capture_last_channel = (channel_name or "none")[:80]
+    _passive_capture_last_user = (user_name or "none")[:80]
+    _passive_capture_last_status = (status or "none")[:80]
+    _passive_capture_last_skip_reason = (skip_reason or "none")[:120]
+
+
+def record_passive_user_activity(message: discord.Message, content: str, channel_policy: str, *, direct_interaction: bool = False, active_handled_elsewhere: bool = False) -> bool:
+    """Persist safe activity from approved visible/readable guild text channels without causing replies."""
+    channel = getattr(message, "channel", None)
+    guild = getattr(message, "guild", None)
+    author = getattr(message, "author", None)
+    channel_name = getattr(channel, "name", "")
+    user_name = getattr(author, "display_name", "") or getattr(author, "name", "")
+    if not guild:
+        mark_passive_capture_status(channel_name, user_name, "skipped", "dm_or_missing_guild")
+        return False
+    if getattr(author, "bot", False):
+        mark_passive_capture_status(channel_name, user_name, "skipped", "bot_author")
+        return False
+    if active_handled_elsewhere:
+        mark_passive_capture_status(channel_name, user_name, "skipped", "active_flow_logs_user_message")
+        return False
+    if not (content or "").strip():
+        mark_passive_capture_status(channel_name, user_name, "skipped", "empty_content")
+        return False
+    if len(content) >= 400:
+        mark_passive_capture_status(channel_name, user_name, "skipped", "content_too_long")
+        return False
+    if not passive_capture_expected_for_channel(channel, channel_policy):
+        mark_passive_capture_status(channel_name, user_name, "skipped", f"policy_or_permission:{channel_policy}")
+        return False
+    upsert_user_profile(author.id, guild.id, user_name)
+    save_user_message(
+        author.id,
+        user_name,
+        guild.id,
+        content.strip(),
+        channel_name=channel_name,
+        channel_policy=channel_policy,
+        channel_id=getattr(channel, "id", 0),
+    )
+    mark_passive_capture_status(channel_name, user_name, "stored", "none")
+    return True
 
 def is_direct_bnl_target(message: discord.Message) -> bool:
     """Return True only for direct BNL user tags or replies to BNL messages."""
@@ -11097,6 +11351,8 @@ async def on_message(message: discord.Message):
     print("BNL DEBUG: on_message triggered")
     if message.author == client.user or not message.guild:
         return
+    if getattr(message.author, "bot", False):
+        return
 
     if message.content.startswith("/"):
         return
@@ -11124,6 +11380,9 @@ async def on_message(message: discord.Message):
         .replace(f"<@{client.user.id}>", "")
         .strip()
     )
+
+    if await maybe_handle_channel_audit_command(message, clean_content):
+        return
 
     if await maybe_handle_source_file_enrichment_command(message, clean_content):
         return
@@ -11505,17 +11764,13 @@ async def on_message(message: discord.Message):
     # ---------------- PASSIVE SERVER OBSERVATION ----------------
     # BNL silently logs messages across the server so it can recall them later
     # but skips the active channel because those messages are logged below
-    if passive_memory_allowed and not real_direct_target and not should_handle_as_active_channel:
-        if message.content and len(message.content) < 400:
-            save_user_message(
-                message.author.id,
-                message.author.display_name,
-                message.guild.id,
-                message.content.strip(),
-                channel_name=getattr(message.channel, "name", ""),
-                channel_policy=channel_policy,
-                channel_id=getattr(message.channel, "id", 0),
-            )
+    record_passive_user_activity(
+        message,
+        message.content,
+        channel_policy,
+        direct_interaction=real_direct_target,
+        active_handled_elsewhere=bool(real_direct_target or should_handle_as_active_channel),
+    )
 
     # ---------------- ACTIVE CHANNEL ----------------
     if should_handle_as_active_channel:
@@ -11525,8 +11780,7 @@ async def on_message(message: discord.Message):
         if not clean_content:
             return
 
-        if not is_sealed_test_channel:
-            save_user_message(message.author.id, message.author.display_name, message.guild.id, clean_content, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0))
+        save_user_message(message.author.id, message.author.display_name, message.guild.id, clean_content, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0))
 
         # Mentions/replies -> immediate response (not batched)
         if message_should_enter_conversation:
@@ -12411,7 +12665,6 @@ async def bnl_memory_check(interaction: discord.Interaction):
     active_override = get_active_show_state_override(guild.id)
     latest_broadcast_context_episode_date = get_latest_broadcast_episode_date(guild.id, public_only=False)
     member_activity_events_count, recent_member_events_count_7d = get_member_activity_event_counts(guild.id)
-
     lines = [
         "**BNL Memory Diagnostic (safe)**",
         f"- guild: `{guild.name}` (`{guild.id}`)",
@@ -12517,6 +12770,7 @@ async def bnl_status(interaction: discord.Interaction):
     active_override = get_active_show_state_override(guild.id)
     latest_broadcast_context_episode_date = get_latest_broadcast_episode_date(guild.id, public_only=False)
     member_activity_events_count, recent_member_events_count_7d = get_member_activity_event_counts(guild.id)
+    channel_audit_summary = summarize_channel_audit_rows(build_channel_audit_rows(guild))
 
     lines = [
         "**BNL Runtime Status (safe)**",
@@ -12606,6 +12860,14 @@ async def bnl_status(interaction: discord.Interaction):
         f"- community_presence_last_withheld_count: `{dossier_diag['community_presence_last_withheld_count']}`",
         f"- community_presence_last_top_withheld_reason: `{dossier_diag['community_presence_last_top_withheld_reason']}`",
         f"- community_presence_last_error_status: `{dossier_diag['community_presence_last_error_status']}`",
+        "- channel_audit_available: `yes`",
+        f"- passive_capture_enabled: `{'yes' if allow_passive_memory_for_policy('public_selective') else 'no'}`",
+        f"- passive_capture_last_channel: `{_passive_capture_last_channel}`",
+        f"- passive_capture_last_user: `{_passive_capture_last_user}`",
+        f"- passive_capture_last_status: `{_passive_capture_last_status}`",
+        f"- passive_capture_last_skip_reason: `{_passive_capture_last_skip_reason}`",
+        f"- passive_capture_expected_zero_count: `{channel_audit_summary['expected_capture_zero_channels']}`",
+        f"- unknown_policy_channel_count: `{channel_audit_summary['unknown_policy_channels']}`",
         f"- read_model_enabled: `{'yes' if read_model_diag.get('enabled') else 'no'}`",
         f"- read_model_url_configured: `{'yes' if read_model_diag.get('url_configured') else 'no'}`",
         f"- read_model_cache_present: `{'yes' if read_model_diag.get('cache_present') else 'no'}`",
