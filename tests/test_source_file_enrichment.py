@@ -52,6 +52,10 @@ class SourceFileEnrichmentTests(unittest.TestCase):
         self.assertFalse(error)
         self.assertEqual(options["subject"], "Hellcat")
         self.assertTrue(options["dry_run"])
+        matched, options, error = enrich.parse_source_enrichment_command("!bnl source enrich Hellcat | dry_run=false | force=true")
+        self.assertTrue(matched)
+        self.assertFalse(error)
+        self.assertTrue(options["force"])
         for command in ("!bnl enrich source Emerald", "!bnl source file enrich Mac Modem | dry_run=false"):
             matched, options, error = enrich.parse_source_enrichment_command(command)
             self.assertTrue(matched)
@@ -234,6 +238,98 @@ class SourceFileEnrichmentTests(unittest.TestCase):
         self.assertNotIn("123456789012345678", response)
         self.assertNotIn("payload", response.lower())
 
+
+    def test_case_file_language_rewrites_raw_fragments(self):
+        c = self.conn.cursor()
+        c.execute("INSERT INTO user_profiles VALUES (10,1,'HellcatNZ','HellcatNZ',NULL,NULL)")
+        c.execute("INSERT INTO relationship_state VALUES (10,1,8,0.7,'steady','friendly','HellcatNZ radio planning','now')")
+        c.execute("INSERT INTO community_presence VALUES (1,'hellcatnz','HellcatNZ','now','now','discord','general',4,2,1,'','','','artist','')")
+        self.conn.commit()
+        result = enrich.run_source_file_enrichment(self.db, 1, "HellcatNZ", dry_run=True, lookup_func=self._lookup("active"))
+        evidence = result["payload"]["evidenceSummary"]
+        self.assertIn("already known to the BARCODE Network workflow", evidence)
+        self.assertIn("prior interaction history", evidence)
+        self.assertIn("community-side activity", evidence)
+        self.assertNotIn("Local profile/display-name match", evidence)
+        self.assertNotIn("Relationship state:", evidence)
+        self.assertNotIn("interactions; stage=", evidence)
+        self.assertNotIn("mention/direct/operator signals", evidence)
+
+    def test_known_facts_exclude_weak_and_source_blind_claims(self):
+        c = self.conn.cursor()
+        c.execute("INSERT INTO user_memory_facts VALUES (NULL,10,1,'role','HellcatNZ might be a collaborator.',0.4,0,'now')")
+        c.execute("INSERT INTO memory_tiers VALUES (NULL,10,1,'long','HellcatNZ is allegedly tied to a private old note.',0.9,1,'now','legacy_unknown','legacy_unknown')")
+        self.conn.commit()
+        result = enrich.run_source_file_enrichment(self.db, 1, "HellcatNZ", dry_run=True, lookup_func=self._lookup("active"))
+        known = json.dumps(result["sections"].get("Known Facts", []))
+        inferred = json.dumps(result["sections"].get("Claimed or Inferred Notes", []))
+        internal = json.dumps(result["sections"].get("Internal-Only / Review-Only Notes", []))
+        self.assertNotIn("might be a collaborator", known)
+        self.assertNotIn("private old note", known)
+        self.assertIn("might be a collaborator", inferred)
+        self.assertIn("Review-only legacy memory", internal)
+        self.assertIn(enrich.SOURCE_BLIND_WARNING, result["warnings"])
+
+    def test_missing_info_and_next_action_are_actionable(self):
+        result = enrich.run_source_file_enrichment(self.db, 1, "HellcatNZ", dry_run=True, lookup_func=self._lookup("active"))
+        missing = "\n".join(result["sections"].get("Missing Info", []))
+        action = "\n".join(result["sections"].get("Suggested Next Action", []))
+        self.assertIn("Confirm the public role/category", missing)
+        self.assertIn("source-safe summary", missing)
+        self.assertIn("Confirm possible aliases", missing)
+        self.assertIn("approve a public-safe summary", action)
+
+    def test_dry_run_preview_has_useful_bullets_without_raw_ids(self):
+        c = self.conn.cursor()
+        c.execute("INSERT INTO user_profiles VALUES (10,1,'HellcatNZ','HellcatNZ',NULL,NULL)")
+        c.execute("INSERT INTO user_memory_facts VALUES (NULL,10,1,'role','HellcatNZ is a recurring artist candidate.',0.9,1,'now')")
+        c.execute("INSERT INTO conversations VALUES (NULL,10,'User',1,'general','public_home','user','HellcatNZ discussed without exposing 123456789012345678 as raw ID.','now')")
+        self.conn.commit()
+        result = enrich.run_source_file_enrichment(self.db, 1, "HellcatNZ", dry_run=True, lookup_func=self._lookup("active"))
+        response = enrich.format_source_enrichment_response(result)
+        self.assertIn("Target lane: active Source File", response)
+        self.assertIn("Useful preview bullets", response)
+        self.assertIn("Would send as BNL Source File Enrichment", response)
+        self.assertNotIn("123456789012345678", response)
+        self.assertGreaterEqual(result["previewBulletsCount"], 3)
+
+    def test_thin_enrichment_suppressed_unless_forced(self):
+        calls = []
+        thin = enrich.run_source_file_enrichment(
+            self.db,
+            1,
+            "HellcatNZ",
+            dry_run=False,
+            lookup_func=self._lookup("active"),
+            sender=lambda payload: calls.append(payload) or {"ok": True},
+        )
+        self.assertEqual(thin["status"], "suppressed_too_thin")
+        self.assertFalse(thin["sent"])
+        self.assertEqual(calls, [])
+        self.assertEqual(thin["qualityStatus"], "too_thin")
+        self.assertIn("too thin", enrich.format_source_enrichment_response(thin).lower())
+
+        forced = enrich.run_source_file_enrichment(
+            self.db,
+            1,
+            "HellcatNZ",
+            dry_run=False,
+            force=True,
+            lookup_func=self._lookup("active"),
+            sender=lambda payload: calls.append(payload) or {"ok": True},
+        )
+        self.assertTrue(forced["sent"])
+        self.assertEqual(forced["qualityStatus"], "forced_low_confidence")
+        self.assertTrue(calls[-1]["forced"])
+        self.assertEqual(calls[-1]["confidence"], "low")
+        self.assertIn("Forced low-confidence", enrich.format_source_enrichment_response(forced))
+
+    def test_payload_keeps_machine_metadata(self):
+        result = enrich.run_source_file_enrichment(self.db, 1, "HellcatNZ", dry_run=True, lookup_func=self._lookup("active"))
+        payload = result["payload"]
+        for key in ("sourceCounts", "warningCounts", "sourceTypes", "ingestSource", "ingestKey", "publicSafetyNotes", "missingInfo", "doNotSay"):
+            self.assertIn(key, payload)
+
     def test_dry_run_does_not_send_and_ingest_key_is_deterministic(self):
         calls = []
         first = enrich.run_source_file_enrichment(self.db, 1, "Hellcat", dry_run=True, lookup_func=self._lookup("active"), sender=lambda payload: calls.append(payload) or {"ok": True})
@@ -317,6 +413,10 @@ class SourceFileEnrichmentBotTests(unittest.TestCase):
         self.assertIn("source_enrichment_last_possible_match_count", diag)
         self.assertIn("source_enrichment_last_possible_match_names", diag)
         self.assertIn("source_enrichment_last_resolution_mode", diag)
+        self.assertIn("source_enrichment_last_quality_score", diag)
+        self.assertIn("source_enrichment_last_quality_status", diag)
+        self.assertIn("source_enrichment_last_suppressed_reason", diag)
+        self.assertIn("source_enrichment_last_preview_bullets_count", diag)
 
 
 if __name__ == "__main__":

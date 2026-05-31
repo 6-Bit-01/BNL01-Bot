@@ -104,19 +104,22 @@ def parse_source_enrichment_command(content: str) -> tuple[bool, dict[str, Any] 
         "lookupValue": lookup_value,
         lookup_key: lookup_value,
         "dry_run": False,
+        "force": False,
     }
     for extra in parts[1:]:
         if not extra:
             continue
         opt = re.match(r"^([A-Za-z_]+)\s*=\s*(.+)$", extra, flags=re.S)
         if not opt:
-            return True, None, "Supported option: dry_run=true|false."
+            return True, None, "Supported options: dry_run=true|false, force=true|false."
         key = opt.group(1).strip().lower()
         value = opt.group(2).strip()
         if key in {"dry_run", "dryrun"}:
             options["dry_run"] = value.lower() in {"true", "1", "yes", "on"}
+        elif key == "force":
+            options["force"] = value.lower() in {"true", "1", "yes", "on"}
         else:
-            return True, None, "Supported option: dry_run=true|false."
+            return True, None, "Supported options: dry_run=true|false, force=true|false."
     return True, options, ""
 
 
@@ -282,20 +285,194 @@ def classify_source_match(lookup_result: dict[str, Any]) -> tuple[str, str, dict
     return "active_source_file", "Active Source File enrichment target.", obj
 
 
-def _add_source_file_context(sections: dict[str, list[str]], source_file: dict[str, Any], subject: str) -> None:
+
+def case_file_lane_label(match_kind: str) -> str:
+    return {
+        "active_source_file": "Active Source File",
+        "candidate_intake": "Candidate Intake",
+        "existing_dossier_update": "Existing Dossier Update",
+    }.get(match_kind, "Source File review")
+
+
+def _case_file_overview(subject: str, match_kind: str, source_file: dict[str, Any]) -> str:
+    name = _safe_text(_first(source_file, ("name", "sourceFileName", "subject", "displayName", "title", "normalizedName")) or subject, 90)
+    if match_kind == "candidate_intake":
+        return f"{name} is being reviewed as a Candidate Intake subject. BNL can prepare internal notes, but the public role and whether this should become a public dossier still need owner/admin confirmation."
+    if match_kind == "existing_dossier_update":
+        return f"{name} appears to map to an existing public dossier update lane. Treat this as internal update material only until an owner approves public-facing wording."
+    return f"{name} is already known to the BARCODE Network workflow as a tracked Source File subject. The current record needs human review before any public-facing update is made."
+
+
+def _normalize_case_category(value: Any, *, inferred: bool = False) -> str:
+    raw = str(value or "").strip().lower()
+    if not raw:
+        label = "unknown"
+    elif any(x in raw for x in ("artist", "musician", "producer", "dj")):
+        label = "artist"
+    elif any(x in raw for x in ("collaborator", "partner")):
+        label = "collaborator"
+    elif any(x in raw for x in ("community", "participant", "discord", "member")):
+        label = "community member"
+    elif any(x in raw for x in ("team", "staff", "barcode")):
+        label = "BARCODE team"
+    elif "sponsor" in raw:
+        label = "sponsor"
+    elif any(x in raw for x in ("system", "interface", "bot")):
+        label = "system"
+    elif "character" in raw:
+        label = "character"
+    elif any(x in raw for x in ("dossier", "public")):
+        label = "public dossier subject"
+    else:
+        label = _safe_text(value, 80)
+    suffix = " (inferred; needs owner review)" if inferred and label != "unknown" else ""
+    return f"Category: {label}{suffix}."
+
+
+def _case_memory_fact(key: Any, value: Any, confidence: float, is_core: bool) -> str:
+    fact = _safe_text(value, 170)
+    label = _safe_text(key, 48)
+    if confidence >= 0.75 or is_core:
+        return f"Supported local fact ({label}): {fact}."
+    return f"Unconfirmed local note ({label}): {fact}. Confidence is limited, so keep this out of Known Facts until reviewed."
+
+
+def _case_habit_pattern(row: sqlite3.Row) -> str:
+    total = int(row["total_messages"] or 0)
+    questions = int(row["question_messages"] or 0)
+    humor = int(row["humor_messages"] or 0)
+    late = int(row["late_night_messages"] or 0)
+    topic = _safe_text(row["last_topic"] or "", 90)
+    parts = []
+    if total:
+        parts.append("recurring Discord-side activity" if total >= 5 else "limited Discord-side activity")
+    if questions:
+        parts.append("asks questions")
+    if humor:
+        parts.append("uses humor in community exchanges")
+    if late:
+        parts.append("has some late-night activity")
+    summary = ", ".join(parts) or "activity is present but not yet patterned"
+    tail = f" Last known topic: {topic}." if topic else ""
+    return f"BNL sees {summary}; this is a behavior pattern for review, not a public bio detail.{tail}"
+
+
+def _case_relationship_history(row: sqlite3.Row) -> str:
+    count = int(row["interaction_count"] or 0)
+    stance = _safe_text(row["social_stance"] or "", 60)
+    topic = _safe_text(row["last_topic"] or "", 90)
+    if count >= 3:
+        base = "BNL has prior interaction history with this subject"
+    else:
+        base = "BNL has only limited direct interaction history with this subject"
+    qualifiers = []
+    if stance:
+        qualifiers.append(f"current internal stance reads as {stance}")
+    if topic:
+        qualifiers.append(f"last recorded topic was {topic}")
+    detail = "; ".join(qualifiers)
+    return f"{base}, but the exact public-facing significance is not fully established from the available records" + (f" ({detail})." if detail else ".")
+
+
+def _case_community_presence(row: sqlite3.Row) -> str:
+    name = _safe_text(row["display_name"] or "This subject", 80)
+    mention = int(row["mention_count"] or 0)
+    direct = int(row["direct_interaction_count"] or 0)
+    operator = int(row["operator_mention_count"] or 0)
+    total = mention + direct + operator
+    if total >= 3:
+        return f"{name} appears in community-side activity enough to justify keeping a working record, but the role and public-safe summary still need to be confirmed."
+    return f"{name} has light community-side signals. Keep this as review context unless additional source notes establish a clearer role."
+
+
+def _case_missing_info(match_kind: str) -> list[str]:
+    items = [
+        "Confirm the public role/category before using this outside internal review.",
+        "Confirm the relationship to BARCODE, Discord, BARCODE Radio, or the public dossier lane.",
+        "Prepare a source-safe summary and owner-approved wording before any public update.",
+    ]
+    if match_kind == "existing_dossier_update":
+        items.append("Decide whether the existing public dossier should actually be updated.")
+    elif match_kind == "candidate_intake":
+        items.append("Promote only if this is not already covered by an existing dossier.")
+    items.append("Confirm possible aliases/connections before attaching them to identity fields.")
+    return items
+
+
+def _case_next_action(subject: str, match_kind: str, source_file: dict[str, Any]) -> str:
+    name = _safe_text(subject, 90)
+    if match_kind == "existing_dossier_update":
+        dossier = _safe_text(_first(source_file, ("targetDossierId", "dossierId", "publicDossierId")) or "the existing dossier", 80)
+        return f"Attach to Existing Dossier Update only after owner review confirms {name} belongs with {dossier} and approves public-safe wording."
+    if match_kind == "candidate_intake":
+        return f"Review {name} as Candidate Intake; promote only if it is not already covered by an existing dossier and the public role can be confirmed."
+    return f"Ask the owner/admin to approve a public-safe summary for {name}; archive the enrichment if no useful supported notes remain."
+
+
+def _has_public_safe_material(sections: dict[str, list[str]]) -> bool:
+    return any(item and "no public-safe" not in item.lower() for item in sections.get("Public-Safe Notes") or [])
+
+
+def evaluate_enrichment_quality(packet: dict[str, Any]) -> dict[str, Any]:
+    sections = packet.get("sections") or {}
+    counts = Counter(packet.get("sourceCounts") or {})
+    non_lookup_sources = sum(v for k, v in counts.items() if k != "source_file_lookup")
+    useful_sections = sum(1 for key in ("Known Facts", "History With BARCODE / BNL / Discord / BARCODE Radio", "Observed Patterns", "Public-Safe Notes", "Claimed or Inferred Notes") if sections.get(key))
+    score = 0
+    if non_lookup_sources:
+        score += min(3, non_lookup_sources)
+    score += min(3, useful_sections)
+    if sections.get("Known Facts"):
+        score += 2
+    if _has_public_safe_material(sections):
+        score += 1
+    if sections.get("Internal-Only / Review-Only Notes") and not non_lookup_sources:
+        score -= 1
+    score = max(0, score)
+    status = "sendable" if score >= 3 else "too_thin"
+    reason = "" if status == "sendable" else "Enrichment is too thin to send. Add more source notes or confirm the subject’s role first."
+    bullets = build_preview_bullets(packet)
+    return {"score": score, "status": status, "suppressedReason": reason, "previewBullets": bullets, "previewBulletsCount": len(bullets)}
+
+
+def build_preview_bullets(packet: dict[str, Any]) -> list[str]:
+    sections = packet.get("sections") or {}
+    preferred = ("Subject Overview", "Why This Subject Matters", "Known Facts", "History With BARCODE / BNL / Discord / BARCODE Radio", "Observed Patterns", "Suggested Next Action")
+    bullets: list[str] = []
+    for name in preferred:
+        for item in sections.get(name) or []:
+            text = _safe_text(item, 180)
+            if text and text not in bullets:
+                bullets.append(text)
+            if len(bullets) >= 3:
+                return bullets
+    return bullets
+
+def _add_source_file_context(sections: dict[str, list[str]], source_file: dict[str, Any], subject: str, match_kind: str = "active_source_file") -> None:
     if not source_file:
+        _append_section(sections, "Subject Overview", _case_file_overview(subject, match_kind, {}))
         return
-    name = _first(source_file, ("name", "sourceFileName", "subject", "displayName", "title", "normalizedName")) or subject
-    _append_section(sections, "Subject Overview", f"Existing Source File target: {name}.")
-    _append_section(sections, "Known Roles / Category", _first(source_file, ("candidateType", "sourceType", "type", "kind", "recommendedCategory")) or "")
-    _append_section(sections, "Known Facts", _first(source_file, ("knownFacts", "facts", "evidenceSummary", "reason", "summary")) or "")
-    _append_section(sections, "Public-Safe Notes", _first(source_file, ("publicSafetyNotes", "safetyNotes", "publicUseNotes")) or "")
-    _append_section(sections, "Missing Info", _first(source_file, ("missingInfo", "missing")) or "")
-    _append_section(sections, "Do Not Say", _first(source_file, ("doNotSay", "do_not_say")) or "")
-    _append_section(sections, "Suggested Next Action", _first(source_file, ("nextRecommendedAction", "suggestedAction", "nextAction")) or "")
+    _append_section(sections, "Subject Overview", _case_file_overview(subject, match_kind, source_file))
+    category = _first(source_file, ("candidateType", "sourceType", "type", "kind", "recommendedCategory"))
+    _append_section(sections, "Known Roles / Category", _normalize_case_category(category, inferred=True))
+    existing_fact = _first(source_file, ("knownFacts", "facts", "evidenceSummary", "reason", "summary"))
+    if existing_fact:
+        _append_section(sections, "Known Facts", f"Existing Source File summary says: {_safe_text(existing_fact, 180)}")
+    public_notes = _first(source_file, ("publicSafetyNotes", "safetyNotes", "publicUseNotes"))
+    if public_notes:
+        _append_section(sections, "Public-Safe Notes", f"Existing public-safe note: {_safe_text(public_notes, 180)}")
+    missing = _first(source_file, ("missingInfo", "missing"))
+    if missing:
+        _append_section(sections, "Missing Info", f"Existing record still needs: {_safe_text(missing, 180)}")
+    do_not_say = _first(source_file, ("doNotSay", "do_not_say"))
+    if do_not_say:
+        _append_section(sections, "Do Not Say", f"Existing restriction: {_safe_text(do_not_say, 180)}")
+    action = _first(source_file, ("nextRecommendedAction", "suggestedAction", "nextAction"))
+    if action:
+        _append_section(sections, "Suggested Next Action", f"Existing next action: {_safe_text(action, 180)}")
     aliases = _first(source_file, ("aliases", "identityLinks", "identity_links", "possibleConnections"))
     if aliases:
-        _append_section(sections, "Possible Aliases / Connections", f"Source File lists alias/connection material for review: {_safe_text(aliases, 180)}")
+        _append_section(sections, "Possible Aliases / Connections", f"Possible connection only; needs owner review before identity fields are changed: {_safe_text(aliases, 180)}")
 
 
 def collect_source_enrichment_evidence(db_path: str, guild_id: int | None, subject: str, *, rd_context: list[dict[str, Any]] | None = None, lookup_result: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -313,8 +490,8 @@ def collect_source_enrichment_evidence(db_path: str, guild_id: int | None, subje
         match_kind, match_note, sf_obj = classify_source_match(lookup_result)
         source_counts["source_file_lookup"] += 1
         source_types.add("source_file_lookup")
-        _add_source_file_context(sections, sf_obj, subject)
-        _append_section(sections, "Internal-Only / Review-Only Notes", match_note)
+        _add_source_file_context(sections, sf_obj, subject, match_kind)
+        _append_section(sections, "Internal-Only / Review-Only Notes", f"Targeting note: {match_note}")
     else:
         match_kind = "none"
 
@@ -331,8 +508,8 @@ def collect_source_enrichment_evidence(db_path: str, guild_id: int | None, subje
                     matched_user_ids.append(int(row["user_id"]))
                     source_counts["user_profiles"] += 1
                     source_types.add("user_profiles")
-                    _append_section(sections, "Subject Overview", f"Local profile/display-name match: {row['name'] or row['display_name']}.")
-                    _append_section(sections, "Known Roles / Category", "Discord community subject or participant (from local profile match).")
+                    _append_section(sections, "Subject Overview", f"{row['name'] or row['display_name']} is already present in local BNL profile records. Treat this as a workflow match, not a public identity claim.")
+                    _append_section(sections, "Known Roles / Category", _normalize_case_category("community member", inferred=True))
             matched_user_ids = matched_user_ids[:8]
         else:
             matched_user_ids = []
@@ -346,7 +523,7 @@ def collect_source_enrichment_evidence(db_path: str, guild_id: int | None, subje
                     source_types.add("user_memory_facts")
                     conf = float(row["confidence"] or 0)
                     target = "Known Facts" if conf >= 0.75 or int(row["is_core"] or 0) else "Claimed or Inferred Notes"
-                    _append_section(sections, target, f"{row['fact_key']}: {row['fact_value']} (confidence {conf:.2f}).")
+                    _append_section(sections, target, _case_memory_fact(row["fact_key"], row["fact_value"], conf, bool(row["is_core"])))
 
         if _table_exists(conn, "user_habits"):
             rows = conn.execute("SELECT user_id, total_messages, question_messages, humor_messages, late_night_messages, last_topic FROM user_habits WHERE guild_id=?", (guild_id,)).fetchall()
@@ -354,7 +531,7 @@ def collect_source_enrichment_evidence(db_path: str, guild_id: int | None, subje
                 if int(row["user_id"] or 0) in matched_user_ids or _matches_subject(row["last_topic"], terms):
                     source_counts["user_habits"] += 1
                     source_types.add("user_habits")
-                    _append_section(sections, "Observed Patterns", f"Local habit summary: messages={row['total_messages']}, questions={row['question_messages']}, humor={row['humor_messages']}, late-night={row['late_night_messages']}, last topic={row['last_topic'] or 'unknown'}.")
+                    _append_section(sections, "Observed Patterns", _case_habit_pattern(row))
 
         if _table_exists(conn, "relationship_state"):
             rows = conn.execute("SELECT user_id, interaction_count, trust_stage, social_stance, last_topic FROM relationship_state WHERE guild_id=?", (guild_id,)).fetchall()
@@ -362,7 +539,7 @@ def collect_source_enrichment_evidence(db_path: str, guild_id: int | None, subje
                 if int(row["user_id"] or 0) in matched_user_ids or _matches_subject(row["last_topic"], terms):
                     source_counts["relationship_state"] += 1
                     source_types.add("relationship_state")
-                    _append_section(sections, "History With BARCODE / BNL / Discord / BARCODE Radio", f"Relationship state: {row['interaction_count']} interactions; stage={row['trust_stage']}; stance={row['social_stance']}; last topic={row['last_topic'] or 'unknown'}.")
+                    _append_section(sections, "History With BARCODE / BNL / Discord / BARCODE Radio", _case_relationship_history(row))
 
         if _table_exists(conn, "relationship_journal"):
             rows = conn.execute("SELECT user_id, entry_type, summary FROM relationship_journal WHERE guild_id=? ORDER BY timestamp DESC LIMIT 300", (guild_id,)).fetchall()
@@ -370,7 +547,7 @@ def collect_source_enrichment_evidence(db_path: str, guild_id: int | None, subje
                 if int(row["user_id"] or 0) in matched_user_ids or _matches_subject(row["summary"], terms):
                     source_counts["relationship_journal"] += 1
                     source_types.add("relationship_journal")
-                    _append_section(sections, "History With BARCODE / BNL / Discord / BARCODE Radio", f"Journal {row['entry_type']}: {row['summary']}.")
+                    _append_section(sections, "History With BARCODE / BNL / Discord / BARCODE Radio", f"Recent BNL relationship note ({_safe_text(row['entry_type'], 40)}): {_safe_text(row['summary'], 180)}")
 
         if _table_exists(conn, "conversations"):
             rows = conn.execute("SELECT channel_name, channel_policy, role, content FROM conversations WHERE guild_id=? AND COALESCE(channel_policy,'') NOT IN ('dm','direct_message','private_dm') ORDER BY timestamp DESC LIMIT 600", (guild_id,)).fetchall()
@@ -381,9 +558,9 @@ def collect_source_enrichment_evidence(db_path: str, guild_id: int | None, subje
                     source_counts["conversations"] += 1
                     source_types.add("conversations")
                     label = _safe_text(row["channel_policy"] or row["channel_name"] or "approved channel", 60)
-                    note = f"Mentioned in {label} context: {_safe_text(row['content'], 150)}"
+                    note = f"Mentioned in {label} context; review the source before treating this as a fact: {_safe_text(row['content'], 150)}"
                     if _WEAK_ALIAS_RE.search(row["content"] or ""):
-                        _append_section(sections, "Possible Aliases / Connections", f"Possible connection only, not confirmed: {_safe_text(row['content'], 150)}")
+                        _append_section(sections, "Possible Aliases / Connections", f"Possible connection only; needs owner review and must not be treated as a confirmed alias: {_safe_text(row['content'], 150)}")
                     else:
                         _append_section(sections, "Claimed or Inferred Notes", note)
                     review_only_candidates.append(note)
@@ -399,7 +576,7 @@ def collect_source_enrichment_evidence(db_path: str, guild_id: int | None, subje
                     source_types.add("memory_tiers")
                     trust = str(row["source_trust"] or "legacy_unknown")
                     warning_counts["source_blind_memory"] += 1
-                    _append_section(sections, "Internal-Only / Review-Only Notes", f"Source-blind/legacy memory ({row['tier']}, trust={trust}): {_safe_text(row['summary'], 160)}")
+                    _append_section(sections, "Internal-Only / Review-Only Notes", f"Review-only legacy memory mentions this subject, but the source is not strong enough for Known Facts: {_safe_text(row['summary'], 160)}")
                     review_only_candidates.append(_safe_text(row["summary"], 160))
 
         if _table_exists(conn, "broadcast_memory"):
@@ -409,7 +586,7 @@ def collect_source_enrichment_evidence(db_path: str, guild_id: int | None, subje
                 if _matches_subject(text, terms):
                     source_counts["broadcast_memory"] += 1
                     source_types.add("broadcast_memory")
-                    note = f"Broadcast memory {row['episode_date']} ({row['entry_type']}): {text}"
+                    note = f"BARCODE Radio memory from {row['episode_date']} ({row['entry_type']}) mentions this subject: {_safe_text(text, 180)}"
                     _append_section(sections, "History With BARCODE / BNL / Discord / BARCODE Radio", note)
                     if int(row["public_safe"] or 0):
                         _append_section(sections, "Public-Safe Notes", text)
@@ -424,10 +601,10 @@ def collect_source_enrichment_evidence(db_path: str, guild_id: int | None, subje
                 if _matches_subject(combined, terms):
                     source_counts["community_presence"] += 1
                     source_types.add("community_presence")
-                    _append_section(sections, "Observed Patterns", f"Community presence: {row['display_name']} has mention/direct/operator signals {row['mention_count']}/{row['direct_interaction_count']}/{row['operator_mention_count']}.")
-                    _append_section(sections, "Known Roles / Category", row["category"] or "community presence candidate")
+                    _append_section(sections, "Observed Patterns", _case_community_presence(row))
+                    _append_section(sections, "Known Roles / Category", _normalize_case_category(row["category"] or "community member", inferred=True))
                     if row["connection_notes"]:
-                        _append_section(sections, "Possible Aliases / Connections", f"Community connection note, not confirmed identity: {row['connection_notes']}")
+                        _append_section(sections, "Possible Aliases / Connections", f"Possible community connection only; needs owner review before it is treated as an identity link: {_safe_text(row['connection_notes'], 180)}")
     finally:
         conn.close()
 
@@ -436,19 +613,22 @@ def collect_source_enrichment_evidence(db_path: str, guild_id: int | None, subje
         if _matches_subject(text, terms):
             source_counts["rd_context"] += 1
             source_types.add("rd_context")
-            _append_section(sections, "Why This Subject Matters", f"R&D context flags this subject for operator review: {_safe_text(text, 160)}")
+            _append_section(sections, "Why This Subject Matters", f"R&D context gives BNL a reason to review this subject: {_safe_text(text, 160)}")
             review_only_candidates.append(_safe_text(text, 160))
 
     if not sections["Why This Subject Matters"] and (sum(source_counts.values()) > source_counts.get("source_file_lookup", 0)):
-        _append_section(sections, "Why This Subject Matters", "BNL has local review signals for this subject; admins should decide what belongs in the Source File.")
+        _append_section(sections, "Why This Subject Matters", "BNL has enough local review signals to keep this subject in the working record; admins should decide what, if anything, belongs in a public-safe Source File summary.")
     if not sections["Subject Overview"]:
-        _append_section(sections, "Subject Overview", f"{subject} is known to this enrichment pass only through bounded local review signals; no confirmed overview is available yet.")
+        _append_section(sections, "Subject Overview", f"{subject} is currently thin. BNL can identify this as a tracked workflow subject, but the public-facing role and useful update angle still need owner/admin confirmation.")
+    if not sections["Public-Safe Notes"]:
+        _append_section(sections, "Public-Safe Notes", "No public-safe summary is ready yet; use this only as internal review material until wording is approved.")
     if not sections["Missing Info"]:
-        _append_section(sections, "Missing Info", "Confirmed public-safe summary, owner-approved role/category, and alias certainty are not fully established from supported sources.")
+        for item in _case_missing_info(match_kind):
+            _append_section(sections, "Missing Info", item)
     if not sections["Do Not Say"]:
         _append_section(sections, "Do Not Say", "Do not present review-only memory, possible aliases, private identity, or source-blind notes as confirmed public fact.")
     if not sections["Suggested Next Action"]:
-        _append_section(sections, "Suggested Next Action", "Admin should review these notes, confirm which items are public-safe, and attach only supported facts to the Source File.")
+        _append_section(sections, "Suggested Next Action", _case_next_action(subject, match_kind, sf_obj if lookup_result else {}))
 
     return {
         "sections": {name: values for name, values in sections.items() if values},
@@ -502,9 +682,14 @@ def build_enrichment_recommendation_payload(packet: dict[str, Any], *, environ: 
         "suggestedAction": _section_text(sections, "Suggested Next Action", limit=3),
         "sourceLanes": ["source_file_enrichment"] + list(packet.get("sourceTypes") or []),
         "sourceTypes": list(packet.get("sourceTypes") or []),
+        "sourceCounts": dict(packet.get("sourceCounts") or {}),
+        "warningCounts": dict(packet.get("warningCounts") or {}),
+        "qualityScore": packet.get("qualityScore"),
+        "qualityStatus": packet.get("qualityStatus"),
+        "forced": bool(packet.get("forced")),
         "safetyWarnings": list(packet.get("warnings") or []),
         "visibilityLabels": ["internal_review_only", "admin_review_required"],
-        "confidence": "medium" if match_kind == "active_source_file" else "low",
+        "confidence": "low" if packet.get("qualityStatus") in {"too_thin", "forced_low_confidence"} else ("medium" if match_kind == "active_source_file" else "low"),
         "createdBy": "bnl",
         "ingestSource": source_enrichment_ingest_source(environ),
         "ingestKey": deterministic_enrichment_ingest_key(subject, match_kind, sections),
@@ -524,6 +709,7 @@ def run_source_file_enrichment(
     environ: dict[str, str] | None = None,
     lookup_key: str = "subject",
     lookup_value: str | None = None,
+    force: bool = False,
 ) -> dict[str, Any]:
     canonical_key = lookup_key if lookup_key in {"subject", "alias", "candidateId", "normalizedName"} else "subject"
     target_value = (lookup_value if lookup_value is not None else subject) or ""
@@ -613,7 +799,14 @@ def run_source_file_enrichment(
         "sourceTypes": evidence["sourceTypes"],
         "warnings": evidence["warnings"],
         "runTime": datetime.now(timezone.utc).isoformat(),
+        "forced": bool(force),
     }
+    quality = evaluate_enrichment_quality(packet)
+    packet["qualityScore"] = quality["score"]
+    packet["qualityStatus"] = "forced_low_confidence" if force and quality["status"] != "sendable" else quality["status"]
+    packet["suppressedReason"] = quality["suppressedReason"]
+    packet["previewBullets"] = quality["previewBullets"]
+    packet["previewBulletsCount"] = quality["previewBulletsCount"]
     payload = build_enrichment_recommendation_payload(packet, environ=environ)
     packet["payload"] = payload
     packet["ingestKey"] = payload.get("ingestKey")
@@ -621,6 +814,11 @@ def run_source_file_enrichment(
     if dry_run:
         packet["sent"] = False
         packet["sendResult"] = {}
+        return packet
+    if quality["status"] != "sendable" and not force:
+        packet["sent"] = False
+        packet["sendResult"] = {"ok": False, "error": quality["suppressedReason"]}
+        packet["status"] = "suppressed_too_thin"
         return packet
     send_result = sender(payload)
     packet["sendResult"] = send_result
@@ -664,10 +862,9 @@ def format_source_enrichment_response(result: dict[str, Any]) -> str:
     if result.get("status") == "lookup_failed":
         return f"Source enrichment lookup failed for “{subject}”: {_safe_text(result.get('matchNote'), 140)}"
     sections = result.get("sections") or {}
-    names = [name for name in SECTION_ORDER if name in sections][:6]
     source_types = ", ".join(result.get("sourceTypes") or []) or "source_file_lookup"
     warnings = result.get("warnings") or []
-    warning_text = "; ".join(_safe_text(w, 120) for w in warnings) or "none"
+    warning_text = str(len(warnings))
     attach_label = {
         "active_source_file": "active Source File",
         "candidate_intake": "Candidate Intake (intake-only)",
@@ -676,15 +873,21 @@ def format_source_enrichment_response(result: dict[str, Any]) -> str:
     if result.get("dryRun"):
         preview_lines = [
             f"Dry run Source File enrichment for “{subject}.”",
-            f"Match: {match_kind} — {attach_label}.",
-            f"Would attach as: {attach_label}.",
-            f"Top sections: {', '.join(names) if names else 'none'}.",
+            f"Target lane: {attach_label}.",
+            f"Would send as BNL Source File Enrichment: {'yes' if result.get('qualityStatus') != 'too_thin' else 'no — too thin'}.",
             f"Source types used: {source_types}.",
-            f"Warnings: {warning_text}.",
-            "No raw private transcripts were included; nothing was sent to the website.",
+            f"Warning count: {warning_text}.",
         ]
+        bullets = result.get("previewBullets") or build_preview_bullets(result)
+        if bullets:
+            preview_lines.append("Useful preview bullets:")
+            preview_lines.extend(f"* {_safe_text(bullet, 180)}" for bullet in bullets[:3])
+        if result.get("qualityStatus") == "too_thin":
+            preview_lines.append(result.get("suppressedReason") or "Enrichment is too thin to send. Add more source notes or confirm the subject’s role first.")
+        preview_lines.append("No raw private transcripts were included; nothing was sent to the website.")
         return "\n".join(preview_lines)[:1900]
     if result.get("sent"):
-        return f"Source enrichment sent for admin review: {subject}. Match: {match_kind}. Ingest key: {_safe_text(result.get('ingestKey'), 120)}."
+        forced = " Forced low-confidence send." if result.get("qualityStatus") == "forced_low_confidence" else ""
+        return f"Source enrichment sent for admin review: {subject}. Match: {match_kind}.{forced} Ingest key: {_safe_text(result.get('ingestKey'), 120)}."
     err = (result.get("sendResult") or {}).get("error") or "site ingest did not accept the review-only payload"
     return f"Source enrichment was built but not sent for “{subject}”: {_safe_text(err, 150)}"

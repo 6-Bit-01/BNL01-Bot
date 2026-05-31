@@ -206,7 +206,12 @@ def _evidence_summary(evidence: list[dict[str, Any]]) -> str:
         lane = item.get("lane") or "source"
         summary = _safe_snippet(item.get("summary") or "", 180)
         if summary:
-            pieces.append(f"{lane}: {summary}")
+            if lane == "broadcast_memory":
+                pieces.append(f"BARCODE Radio context: {summary}")
+            elif lane == "rd_context":
+                pieces.append(f"Operator review context: {summary}")
+            else:
+                pieces.append(f"{lane} review context: {summary}")
     joined = " | ".join(pieces)
     if len(joined) > MAX_EVIDENCE_SUMMARY_LENGTH:
         return joined[: MAX_EVIDENCE_SUMMARY_LENGTH - 1].rstrip() + "…"
