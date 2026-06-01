@@ -330,5 +330,106 @@ class MediaGroundingRepairTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(text, "That lands like a cursed office-training plaque.")
 
 
+class MediaMemoryRecallLeakTests(unittest.IsolatedAsyncioTestCase):
+    def live_media_prompt(self, text=""):
+        request = (text + "\n" if text else "") + "[Current message media context:\n- gif link preview (host=tenor.com)\n]"
+        return (
+            "Current channel policy: sealed_test\n"
+            f"Current user request: {request}\n"
+            f"User message: {request}"
+        )
+
+    async def _run_with_generated(self, prompt, generated, repaired="That lands like confusion entering the room with a tiny red clipboard."):
+        responses = [gemini_response(generated, 10), gemini_response(repaired, 8)]
+
+        async def fake_generate(_contents, _route):
+            return responses.pop(0)
+
+        with mock.patch.object(bnl01_bot, "check_quota_availability", return_value=True), \
+             mock.patch.object(bnl01_bot, "get_conversation_history", return_value=[]), \
+             mock.patch.object(bnl01_bot, "_generate_gemini_content_with_fallback_async", side_effect=fake_generate) as generate, \
+             mock.patch.object(bnl01_bot, "increment_token_usage"), \
+             mock.patch.object(bnl01_bot.random, "random", return_value=1.0):
+            text = await bnl01_bot.get_gemini_response(prompt, user_id=123, guild_id=456, route="free_speak_media_generation")
+        return text, generate
+
+    def test_explicit_recent_media_followup_detector_ignores_media_only_post(self):
+        self.assertFalse(bnl01_bot.is_explicit_recent_media_followup("[Current message media context:\n- gif link preview (host=tenor.com)\n]"))
+        self.assertFalse(bnl01_bot.is_explicit_recent_media_followup("done to us?\n[Current message media context:\n- gif embed (provider=Tenor)\n]"))
+        self.assertTrue(bnl01_bot.is_explicit_recent_media_followup("what was my GIF?"))
+        self.assertTrue(bnl01_bot.is_explicit_recent_media_followup("what did Crow post?"))
+        self.assertTrue(bnl01_bot.is_media_visibility_or_storage_question("can you see that GIF?"))
+        self.assertTrue(bnl01_bot.is_media_visibility_or_storage_question("what do you have stored for that media?"))
+
+    async def test_live_media_recent_gif_storage_language_is_repaired(self):
+        prompt = self.live_media_prompt()
+        generated = "I saw your recent gif as gif link preview (host=tenor.com), but I do not have a detailed visual description stored for that one."
+        text, generate = await self._run_with_generated(prompt, generated)
+        self.assertEqual(text, "That lands like confusion entering the room with a tiny red clipboard.")
+        self.assertNotIn("recent gif", text.lower())
+        self.assertNotIn("link preview", text.lower())
+        self.assertEqual([call.args[1] for call in generate.await_args_list], ["free_speak_media_generation", "media_response_grounding_repair"])
+
+    async def test_live_media_provider_host_storage_variants_are_repaired(self):
+        prompt = self.live_media_prompt()
+        generated = "That link preview is provider=Tenor, host=tenor.com, and the visual description is stored for that one only as preview=yes."
+        text, _generate = await self._run_with_generated(prompt, generated, "Thin signal, but it walks in like the room just tripped over a reaction wire.")
+        lowered = text.lower()
+        self.assertNotIn("provider=", lowered)
+        self.assertNotIn("host=", lowered)
+        self.assertNotIn("stored for that one", lowered)
+
+    async def test_live_media_thin_metadata_repair_stays_conversational(self):
+        prompt = self.live_media_prompt()
+        generated = "I saw your recent gif as gif link preview (host=tenor.com), but I do not have a detailed visual description stored for that one."
+        repaired = "I can’t pull much detail from that one, but the reaction itself lands like confusion entering the room."
+        text, _generate = await self._run_with_generated(prompt, generated, repaired)
+        self.assertEqual(text, repaired)
+        self.assertNotIn("host=", text.lower())
+        self.assertNotIn("stored", text.lower())
+
+    async def test_explicit_followup_allows_limited_stored_context_language(self):
+        prompt = self.live_media_prompt("what was my GIF?")
+        generated = "I saw your recent gif as gif link preview (host=tenor.com), but I do not have a detailed visual description stored for that one."
+
+        async def fake_generate(_contents, _route):
+            return gemini_response(generated, 10)
+
+        with mock.patch.object(bnl01_bot, "check_quota_availability", return_value=True), \
+             mock.patch.object(bnl01_bot, "get_conversation_history", return_value=[]), \
+             mock.patch.object(bnl01_bot, "_generate_gemini_content_with_fallback_async", side_effect=fake_generate) as generate, \
+             mock.patch.object(bnl01_bot, "increment_token_usage"), \
+             mock.patch.object(bnl01_bot.random, "random", return_value=1.0):
+            text = await bnl01_bot.get_gemini_response(prompt, user_id=123, guild_id=456, route="free_speak_media_generation")
+
+        self.assertEqual(text, generated)
+        self.assertEqual([call.args[1] for call in generate.await_args_list], ["free_speak_media_generation"])
+
+    async def test_explicit_visibility_question_allows_limited_context_language(self):
+        prompt = self.live_media_prompt("can you see that GIF?")
+        generated = "I can see limited media context for that GIF, but the stored visual description is thin."
+
+        async def fake_generate(_contents, _route):
+            return gemini_response(generated, 10)
+
+        with mock.patch.object(bnl01_bot, "check_quota_availability", return_value=True), \
+             mock.patch.object(bnl01_bot, "get_conversation_history", return_value=[]), \
+             mock.patch.object(bnl01_bot, "_generate_gemini_content_with_fallback_async", side_effect=fake_generate) as generate, \
+             mock.patch.object(bnl01_bot, "increment_token_usage"), \
+             mock.patch.object(bnl01_bot.random, "random", return_value=1.0):
+            text = await bnl01_bot.get_gemini_response(prompt, user_id=123, guild_id=456, route="free_speak_media_generation")
+
+        self.assertEqual(text, generated)
+        self.assertEqual([call.args[1] for call in generate.await_args_list], ["free_speak_media_generation"])
+
+    async def test_current_media_plus_normal_text_does_not_allow_diagnostic_leak(self):
+        prompt = self.live_media_prompt("done to us?")
+        generated = "I saw your recent gif as gif link preview (host=tenor.com), but I do not have a detailed visual description stored for that one."
+        text, _generate = await self._run_with_generated(prompt, generated, "Done to us? Probably. The room has entered its small, blinking evidence phase.")
+        self.assertIn("done to us", text.lower())
+        self.assertNotIn("recent gif", text.lower())
+
+
+
 if __name__ == "__main__":
     unittest.main()
