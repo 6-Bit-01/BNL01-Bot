@@ -5546,6 +5546,15 @@ def format_last_route_debug() -> str:
         ("leak_guard_result", "leak guard result"),
         ("fallback_used", "fallback used"),
         ("regenerated_for_mode_leak", "regeneration happened"),
+        ("media_present", "media present"),
+        ("media_context_included", "media context included"),
+        ("media_item_count", "media item count"),
+        ("batch_ack_decision", "batch ack decision"),
+        ("batch_decision", "batch decision"),
+        ("batch_reason", "batch reason"),
+        ("canned_ack_suppressed", "canned ack suppressed"),
+        ("ack_converted_to_observe", "ack converted to observe"),
+        ("ack_escalated_to_generation", "ack escalated to generation"),
         ("save_policy_reason", "save policy reason"),
     ]
     lines = ["**BNL route debug (last conversational reply)**"]
@@ -7911,6 +7920,156 @@ def _member_activity_text_from_message(message: discord.Message, include_embeds:
             if embed_text:
                 parts.append(embed_text)
     return "\n".join(part for part in parts if part).strip()
+
+
+MEDIA_URL_EXTENSIONS = (".gif", ".gifv", ".png", ".jpg", ".jpeg", ".webp", ".mp4", ".mov", ".webm", ".m4v")
+MEDIA_CONTEXT_MARKER = "[Current message media context:"
+
+
+def _safe_media_label(value: str, limit: int = 80) -> str:
+    text = re.sub(r"\s+", " ", str(value or "")).strip()
+    text = re.sub(r"https?://\S+", "[url]", text)
+    text = text.replace("@", "@\u200b")
+    return text[:limit]
+
+
+def _classify_media_kind(filename: str = "", content_type: str = "", embed_type: str = "", sticker_format: str = "") -> str:
+    raw = " ".join([filename or "", content_type or "", embed_type or "", sticker_format or ""]).lower()
+    if "gif" in raw:
+        return "gif"
+    if "video" in raw or any(ext in raw for ext in (".mp4", ".mov", ".webm", ".m4v")):
+        return "video"
+    if "image" in raw or any(ext in raw for ext in (".png", ".jpg", ".jpeg", ".webp")):
+        return "image"
+    if "sticker" in raw:
+        return "sticker"
+    return "media"
+
+
+def build_message_media_context(message) -> dict:
+    """Return public-safe media metadata for prompt routing without logging raw media URLs."""
+    items = []
+    for attachment in getattr(message, "attachments", []) or []:
+        filename = _safe_media_label(getattr(attachment, "filename", "") or "attachment")
+        content_type = _safe_media_label(getattr(attachment, "content_type", "") or "")
+        kind = _classify_media_kind(filename=filename, content_type=content_type)
+        label = f"{kind} attachment"
+        details = []
+        if filename:
+            details.append(f"filename={filename}")
+        if content_type:
+            details.append(f"type={content_type}")
+        items.append(label + (" (" + "; ".join(details) + ")" if details else ""))
+
+    for sticker in getattr(message, "stickers", []) or []:
+        name = _safe_media_label(getattr(sticker, "name", "") or "sticker")
+        fmt = _safe_media_label(getattr(getattr(sticker, "format", None), "name", "") or getattr(sticker, "format", "") or "")
+        kind = _classify_media_kind(sticker_format=fmt) or "sticker"
+        items.append(f"{kind} sticker (name={name})")
+
+    for embed in getattr(message, "embeds", []) or []:
+        try:
+            embed_dict = embed.to_dict()
+        except Exception:
+            embed_dict = {}
+        embed_type = _safe_media_label(embed_dict.get("type") or getattr(embed, "type", "") or "embed")
+        title = _safe_media_label(embed_dict.get("title") or "")
+        desc = _safe_media_label(embed_dict.get("description") or "")
+        provider = embed_dict.get("provider") if isinstance(embed_dict.get("provider"), dict) else {}
+        provider_name = _safe_media_label(provider.get("name") or "")
+        image_present = bool(embed_dict.get("image") or embed_dict.get("thumbnail") or embed_dict.get("video"))
+        kind = _classify_media_kind(embed_type=embed_type)
+        if image_present and kind == "media":
+            kind = "media preview"
+        if embed_type or title or desc or provider_name or image_present:
+            details = []
+            if embed_type:
+                details.append(f"embed_type={embed_type}")
+            if provider_name:
+                details.append(f"provider={provider_name}")
+            if title:
+                details.append(f"title={title}")
+            if desc:
+                details.append(f"description={desc}")
+            if image_present:
+                details.append("preview=yes")
+            items.append(f"{kind} embed" + (" (" + "; ".join(details[:5]) + ")" if details else ""))
+
+    content = getattr(message, "content", "") or ""
+    for url_match in re.finditer(r"https?://\S+", content):
+        url = url_match.group(0).rstrip(")].,!?;:")
+        parsed = urllib.parse.urlparse(url)
+        path = (parsed.path or "").lower()
+        host = _safe_media_label(parsed.netloc or "linked media")
+        if any(path.endswith(ext) for ext in MEDIA_URL_EXTENSIONS) or any(token in host.lower() for token in ("tenor", "giphy", "gfycat", "imgur", "youtube", "youtu.be", "tiktok")):
+            kind = _classify_media_kind(filename=path, embed_type=host)
+            items.append(f"{kind} link preview (host={host})")
+
+    # De-duplicate while preserving order.
+    deduped = []
+    seen = set()
+    for item in items:
+        key = item.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(item)
+    return {
+        "present": bool(deduped),
+        "included": bool(deduped),
+        "count": len(deduped),
+        "items": deduped,
+        "prompt_text": "\n".join(f"- {item}" for item in deduped),
+    }
+
+
+def append_media_context_to_text(text: str, media_context: dict) -> str:
+    base = (text or "").strip()
+    if not media_context or not media_context.get("items"):
+        return base
+    media_block = MEDIA_CONTEXT_MARKER + "\n" + media_context.get("prompt_text", "") + "\n]"
+    if base:
+        return f"{base}\n{media_block}"
+    return media_block
+
+
+def _items_media_stats(items) -> dict:
+    count = 0
+    for _name, content, _uid in items or []:
+        text = content or ""
+        if MEDIA_CONTEXT_MARKER in text:
+            count += max(1, text.count("\n- "))
+    return {"present": count > 0, "included": count > 0, "count": count}
+
+
+def _free_speak_ack_resolution(decision: str, reason: str, items, channel_policy: str, payload_count: int = 0, has_structured_intent: bool = False) -> tuple[str, str, dict]:
+    media_stats = _items_media_stats(items)
+    diagnostics = {
+        "canned_ack_suppressed": False,
+        "ack_converted_to_observe": False,
+        "ack_escalated_to_generation": False,
+        "media_present": media_stats["present"],
+        "media_context_included": media_stats["included"],
+        "media_item_count": media_stats["count"],
+    }
+    if decision != "acknowledge" or channel_policy not in {"public_home", "sealed_test"}:
+        return decision, reason, diagnostics
+
+    diagnostics["canned_ack_suppressed"] = True
+    if payload_count > 0 or has_structured_intent:
+        diagnostics["ack_escalated_to_generation"] = True
+        return "answer", "free_speak_ack_structured_context_generation", diagnostics
+
+    texts = [(content or "").strip() for (_n, content, _u) in items or [] if (content or "").strip()]
+    user_count = len({uid for (_n, _c, uid) in items or [] if uid})
+    non_media_text = " ".join(re.sub(r"\[Current message media context:.*?\]", " ", t, flags=re.DOTALL).strip() for t in texts).strip()
+    token_count = len([tok for tok in re.split(r"\s+", non_media_text) if tok])
+    if media_stats["present"] and (token_count >= 4 or user_count >= 2 or len(texts) >= 2):
+        diagnostics["ack_escalated_to_generation"] = True
+        return "answer", "free_speak_media_context_generation", diagnostics
+
+    diagnostics["ack_converted_to_observe"] = True
+    return "observe", "free_speak_canned_ack_suppressed", diagnostics
 
 
 def _extract_member_activity_event_from_text(text: str, source_author: str = "") -> dict:
@@ -11093,7 +11252,9 @@ def _classify_batch_engagement(items, bot_user=None, pending_request_intent=Fals
             multiline_payload_detected = True
             break
     lowered = combined.lower()
-    token_count = len([tok for tok in re.split(r"\s+", combined) if tok])
+    media_context_present = MEDIA_CONTEXT_MARKER in combined
+    combined_without_media = re.sub(r"\[Current message media context:.*?\]", " ", combined, flags=re.DOTALL).strip()
+    token_count = len([tok for tok in re.split(r"\s+", combined_without_media if media_context_present else combined) if tok])
     question_starter = r"(?:what|why|how|when|where|who)\b"
     helper_starter = r"(?:can you|could you|would you|do you|did you|is it|are you|should i|should we)\b"
     clause_question_like = any(
@@ -11124,6 +11285,10 @@ def _classify_batch_engagement(items, bot_user=None, pending_request_intent=Fals
         if payload_expected:
             return "answer", f"request_payload_expected:{payload_reason}"
         return "answer", "question_request_or_addressed"
+    if media_context_present:
+        if token_count >= 4 or len(texts) >= 2:
+            return "answer", "media_context_with_text"
+        return "acknowledge", "light_media_reaction_cluster"
     if numeric_only_cluster:
         return "skip", "noise_fragment_cluster"
     if test_like or short_fragment_cluster:
@@ -11140,6 +11305,8 @@ def _classify_batch_engagement(items, bot_user=None, pending_request_intent=Fals
 def _build_acknowledgement_response(items):
     texts = [(content or "").strip() for (_name, content, _uid) in items if (content or "").strip()]
     if not texts:
+        return ""
+    if any(MEDIA_CONTEXT_MARKER in t for t in texts):
         return ""
     if all(bool(re.fullmatch(r"[\d\W_]+", t)) for t in texts):
         return ""
@@ -11206,6 +11373,7 @@ def _build_active_response_packet(channel_id: int, items, pending_state, pending
         payload_items = unique_payload_items
         has_request_payload = bool(payload_items)
 
+    media_stats = _items_media_stats(original_items)
     ack_text = _build_acknowledgement_response(collapsed_items) if decision == "acknowledge" else ""
     should_skip = decision in ("skip", "observe")
     should_acknowledge = decision == "acknowledge" and bool(ack_text)
@@ -11237,6 +11405,9 @@ def _build_active_response_packet(channel_id: int, items, pending_state, pending
         "should_skip": should_skip,
         "should_acknowledge": should_acknowledge,
         "ack_text": ack_text,
+        "media_present": media_stats["present"],
+        "media_context_included": media_stats["included"],
+        "media_item_count": media_stats["count"],
     }
 
 
@@ -11270,6 +11441,8 @@ def _format_batched_prompt(messages, style_key: str, style_rule: str) -> str:
         "Rules:\n"
         "- Sound like you were listening the whole time.\n"
         "- Treat this batch as one live conversational moment and respond to the latest combined state.\n"
+        "- If media/GIF/sticker/video context is listed, treat it as visible context for the moment; use it naturally when relevant.\n"
+        "- Do not say media was merely logged/detected, and do not use a canned utility acknowledgement as the whole normal-chat response.\n"
         "- Address multiple points smoothly (no bullets).\n- Consecutive fragments from the same user are one continuing thought; respond once to their combined meaning.\n- Do not answer each fragment separately or produce one paragraph per fragment.\n- Do not over-analyze simple test fragments.\n"
         "- Do not quote users verbatim.\n"
         "- No @mentions.\n"
@@ -11552,7 +11725,25 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                 _log_batch_event(logging.INFO, "request_intent_detected", guild_id, channel_id, len(collapsed_items), f"reason={reason}")
             if reason.startswith("request_payload_expected:"):
                 _log_batch_event(logging.INFO, "request_payload_phrase_detected", guild_id, channel_id, len(collapsed_items), f"reason={reason}")
-            _log_batch_event(logging.INFO, "batch_engagement_decision", guild_id, channel_id, len(collapsed_items), f"decision={decision};reason={reason}")
+            ack_original_decision = decision
+            decision, reason, ack_diag = _free_speak_ack_resolution(
+                decision,
+                reason,
+                collapsed_items,
+                channel_policy,
+                payload_count=payload_count,
+                has_structured_intent=bool(active_packet.get("has_structured_intent")),
+            )
+            if ack_diag.get("canned_ack_suppressed"):
+                _log_batch_event(
+                    logging.INFO,
+                    "free_speak_canned_ack_suppressed",
+                    guild_id,
+                    channel_id,
+                    len(collapsed_items),
+                    f"ack_converted_to_observe={int(ack_diag.get('ack_converted_to_observe'))};ack_escalated_to_generation={int(ack_diag.get('ack_escalated_to_generation'))};media_present={int(ack_diag.get('media_present'))};media_context_included={int(ack_diag.get('media_context_included'))};media_item_count={ack_diag.get('media_item_count', 0)};reason={reason}",
+                )
+            _log_batch_event(logging.INFO, "batch_engagement_decision", guild_id, channel_id, len(collapsed_items), f"decision={decision};reason={reason};batch_ack_decision={ack_original_decision};canned_ack_suppressed={int(ack_diag.get('canned_ack_suppressed', False))};media_present={int(active_packet.get('media_present', False))};media_context_included={int(active_packet.get('media_context_included', False))};media_item_count={active_packet.get('media_item_count', 0)}")
             if decision in ("skip", "observe"):
                 _log_batch_event(logging.INFO, "batch_response_skipped", guild_id, channel_id, len(collapsed_items), "no_response_needed")
                 return
@@ -11924,6 +12115,15 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
             leak_guard_result="clear",
             fallback_used=False,
             regenerated_for_mode_leak=False,
+            media_present=active_packet.get("media_present", False),
+            media_context_included=active_packet.get("media_context_included", False),
+            media_item_count=active_packet.get("media_item_count", 0),
+            batch_ack_decision=active_packet.get("decision", "unknown"),
+            batch_decision=decision,
+            batch_reason=reason,
+            canned_ack_suppressed=bool(locals().get("ack_diag", {}).get("canned_ack_suppressed", False)),
+            ack_converted_to_observe=bool(locals().get("ack_diag", {}).get("ack_converted_to_observe", False)),
+            ack_escalated_to_generation=bool(locals().get("ack_diag", {}).get("ack_escalated_to_generation", False)),
         )
 
         if len(response) <= 2000:
@@ -12218,6 +12418,7 @@ def build_user_aware_prompt(
 
     prompt = (
         f"Current user request: {clean_content}\n"
+        "Media context rule: if the current request includes media/GIF/sticker/video context, treat it as visible conversation context and respond naturally without saying it was merely detected or logged.\n"
         f"{prompt_contract}"
         f"{room_prompt_block}"
         f"{channel_prompt_block}"
@@ -12774,6 +12975,15 @@ async def send_planned_conversation_response(
         leak_guard_result="fallback" if guard_triggered else "clear",
         fallback_used=guard_triggered,
         regenerated_for_mode_leak=regenerated_for_mode_leak,
+        media_present=bool(build_message_media_context(message).get("present", False)),
+        media_context_included=bool(build_message_media_context(message).get("included", False)),
+        media_item_count=build_message_media_context(message).get("count", 0),
+        batch_ack_decision="not_applicable",
+        batch_decision="not_applicable",
+        batch_reason="not_applicable",
+        canned_ack_suppressed=False,
+        ack_converted_to_observe=False,
+        ack_escalated_to_generation=False,
     )
     if len(response) <= 2000:
         await message.reply(response)
@@ -12835,6 +13045,16 @@ async def on_message(message: discord.Message):
         .replace(f"<@{client.user.id}>", "")
         .strip()
     )
+    media_context = build_message_media_context(message)
+    conversation_content = append_media_context_to_text(clean_content, media_context)
+    logging.info(
+        "media_context_route media_present=%s media_context_included=%s media_item_count=%s conversation_surface=%s channel_policy=%s",
+        int(media_context.get("present", False)),
+        int(media_context.get("included", False)),
+        media_context.get("count", 0),
+        conversation_surface,
+        channel_policy,
+    )
 
     if await maybe_handle_debug_last_route_command(message, clean_content):
         return
@@ -12858,7 +13078,7 @@ async def on_message(message: discord.Message):
 
     plain_text_name_seen = bool(re.search(r"\b(bnl|bnl-01|barcode bot)\b", clean_content.lower())) if clean_content else False
     channel_allows_conversation = bool(free_speak_surface or is_active_channel)
-    followup_candidate = _is_recent_direct_followup(message.channel.id, message.author.id) if clean_content else False
+    followup_candidate = _is_recent_direct_followup(message.channel.id, message.author.id) if conversation_content else False
     logging.info(f"response_route_channel_policy policy={channel_policy}")
     logging.info(f"response_route_conversation_surface surface={conversation_surface}")
     logging.info(f"response_route_channel channel_name={getattr(message.channel, 'name', 'unknown')} channel_id={getattr(message.channel, 'id', 'unknown')}")
@@ -13192,7 +13412,7 @@ async def on_message(message: discord.Message):
                     return
 
     active_same_user_session = bool(_direct_payload_sessions.get(session_key))
-    message_should_enter_conversation = bool(clean_content and (channel_allows_conversation or real_direct_target or followup_candidate or active_same_user_session))
+    message_should_enter_conversation = bool(conversation_content and (channel_allows_conversation or real_direct_target or followup_candidate or active_same_user_session))
     logging.info(f"response_route_active_session active={int(active_same_user_session)}")
     if message_should_enter_conversation:
         if channel_allows_conversation and not real_direct_target:
@@ -13234,17 +13454,17 @@ async def on_message(message: discord.Message):
 
     # ---------------- ACTIVE CHANNEL ----------------
     if should_handle_as_active_channel:
-        if not clean_content and message_should_enter_conversation:
+        if not conversation_content and message_should_enter_conversation:
             await message.reply("You pinged me. How may I assist with BARCODE operations?")
             return
-        if not clean_content:
+        if not conversation_content:
             return
 
-        route_mode = classify_route_mode(clean_content, channel_policy, real_direct_target=real_direct_target, active_channel=should_handle_as_active_channel)
-        direct_content, direct_payload_items = clean_content, _collect_inline_direct_payload_items(clean_content)
+        route_mode = classify_route_mode(conversation_content, channel_policy, real_direct_target=real_direct_target, active_channel=should_handle_as_active_channel)
+        direct_content, direct_payload_items = conversation_content, _collect_inline_direct_payload_items(clean_content)
         payload_expected_for_plan, _ = _detect_request_payload_expectation(direct_content)
         conversation_plan = plan_conversation_response(
-            clean_content,
+            conversation_content,
             channel_policy,
             route_mode=route_mode,
             active_channel=should_handle_as_active_channel,
@@ -13259,7 +13479,7 @@ async def on_message(message: discord.Message):
             active_direct_session=active_same_user_session,
             conversation_surface=conversation_surface,
         )
-        save_decision = save_user_message(message.author.id, message.author.display_name, message.guild.id, clean_content, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0), route_mode=conversation_plan.route_mode)
+        save_decision = save_user_message(message.author.id, message.author.display_name, message.guild.id, conversation_content, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0), route_mode=conversation_plan.route_mode)
 
         # Direct/direct-like traffic is planned independently from passive batching;
         # non-direct active-channel traffic falls through to the batch planner below.
@@ -13489,7 +13709,7 @@ async def on_message(message: discord.Message):
                 len(_channel_buffers[message.channel.id]) + 1,
                 "new_message_while_generating",
             )
-        _channel_buffers[message.channel.id].append((message.author.display_name, clean_content, message.author.id))
+        _channel_buffers[message.channel.id].append((message.author.display_name, conversation_content, message.author.id))
         _channel_last_message_at[message.channel.id] = datetime.now(PACIFIC_TZ)
         if len(_channel_buffers[message.channel.id]) >= BATCH_MAX_MESSAGES:
             await _flush_channel_buffer(message.channel)
@@ -13502,10 +13722,10 @@ async def on_message(message: discord.Message):
         if not (real_direct_target or (free_speak_surface and clean_content)):
             return
 
-        if not clean_content:
+        if not conversation_content:
             await message.reply("I monitor this channel passively. My active operations are in the designated liaison channel.")
             return
-        direct_content, direct_payload_items = clean_content, _collect_inline_direct_payload_items(clean_content)
+        direct_content, direct_payload_items = conversation_content, _collect_inline_direct_payload_items(clean_content)
         route_mode = classify_route_mode(direct_content, channel_policy, real_direct_target=real_direct_target, active_channel=False)
         payload_expected_for_plan, _ = _detect_request_payload_expectation(direct_content)
         conversation_plan = plan_conversation_response(
@@ -13698,7 +13918,7 @@ async def on_message(message: discord.Message):
         if not clean_content:
             await message.reply("You pinged me. How may I assist with BARCODE operations?")
             return
-        direct_content, direct_payload_items = clean_content, _collect_inline_direct_payload_items(clean_content)
+        direct_content, direct_payload_items = conversation_content, _collect_inline_direct_payload_items(clean_content)
         route_mode = classify_route_mode(direct_content, channel_policy, real_direct_target=real_direct_target, active_channel=False)
         payload_expected_for_plan, _ = _detect_request_payload_expectation(direct_content)
         conversation_plan = plan_conversation_response(

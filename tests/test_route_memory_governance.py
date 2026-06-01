@@ -631,5 +631,92 @@ class RegressionExamplesTests(unittest.TestCase):
         self.assertNotIn("please rephrase", lowered)
 
 
+class MediaAwareBatchAckTests(unittest.TestCase):
+    def test_media_only_free_speak_ack_converts_to_observe_not_received(self):
+        items = [("Crow", bnl01_bot.append_media_context_to_text("", {"items": ["gif embed (provider=Tenor; preview=yes)"], "prompt_text": "- gif embed (provider=Tenor; preview=yes)"}), 101)]
+        decision, reason = bnl01_bot._classify_batch_engagement(items)
+        self.assertEqual(decision, "acknowledge")
+        self.assertEqual(bnl01_bot._build_acknowledgement_response(items), "")
+        resolved_decision, resolved_reason, diag = bnl01_bot._free_speak_ack_resolution(decision, reason, items, "sealed_test")
+        self.assertEqual(resolved_decision, "observe")
+        self.assertEqual(resolved_reason, "free_speak_canned_ack_suppressed")
+        self.assertTrue(diag["canned_ack_suppressed"])
+        self.assertTrue(diag["ack_converted_to_observe"])
+        self.assertFalse(diag["ack_escalated_to_generation"])
+
+    def test_media_reaction_after_bnl_message_does_not_build_received(self):
+        media_text = bnl01_bot.append_media_context_to_text(
+            "logical",
+            {"items": ["gif embed (provider=Tenor; title=Spock logical; preview=yes)"], "prompt_text": "- gif embed (provider=Tenor; title=Spock logical; preview=yes)"},
+        )
+        items = [("Crow", media_text, 101)]
+        decision, reason = bnl01_bot._classify_batch_engagement(items)
+        self.assertEqual(decision, "acknowledge")
+        resolved_decision, _resolved_reason, diag = bnl01_bot._free_speak_ack_resolution(decision, reason, items, "public_home")
+        self.assertEqual(resolved_decision, "observe")
+        self.assertNotEqual(bnl01_bot._build_acknowledgement_response(items), "Received.")
+        self.assertTrue(diag["media_present"])
+
+    def test_media_plus_text_cluster_escalates_to_generation_in_free_speak(self):
+        media_text = bnl01_bot.append_media_context_to_text(
+            "this is exactly the vibe",
+            {"items": ["video attachment (filename=signal.mp4; type=video/mp4)"], "prompt_text": "- video attachment (filename=signal.mp4; type=video/mp4)"},
+        )
+        items = [("Crow", media_text, 101)]
+        decision, reason = bnl01_bot._classify_batch_engagement(items)
+        self.assertEqual(decision, "answer")
+        resolved_decision, resolved_reason, diag = bnl01_bot._free_speak_ack_resolution("acknowledge", "light_media_reaction_cluster", items, "sealed_test")
+        self.assertEqual(resolved_decision, "answer")
+        self.assertEqual(resolved_reason, "free_speak_media_context_generation")
+        self.assertTrue(diag["ack_escalated_to_generation"])
+
+    def test_media_context_is_represented_in_batch_prompt_and_packet_metadata(self):
+        media_text = bnl01_bot.append_media_context_to_text(
+            "BNL what do you make of this?",
+            {"items": ["image attachment (filename=meme.png; type=image/png)"], "prompt_text": "- image attachment (filename=meme.png; type=image/png)"},
+        )
+        items = [("Crow", media_text, 101)]
+        packet = bnl01_bot._build_active_response_packet(123, items, pending_state=False)
+        prompt = bnl01_bot._format_batched_prompt([("Crow", media_text)], "steady", "")
+        self.assertTrue(packet["media_present"])
+        self.assertTrue(packet["media_context_included"])
+        self.assertGreaterEqual(packet["media_item_count"], 1)
+        self.assertIn("Current message media context", prompt)
+        self.assertIn("image attachment", prompt)
+
+    def test_direct_mention_with_media_prompt_preserves_media_context(self):
+        direct_content = bnl01_bot.append_media_context_to_text(
+            "BNL thoughts?",
+            {"items": ["gif link preview (host=tenor.com)"], "prompt_text": "- gif link preview (host=tenor.com)"},
+        )
+        old_db = bnl01_bot.DB_FILE
+        with tempfile.NamedTemporaryFile(delete=True) as tmp:
+            bnl01_bot.DB_FILE = tmp.name
+            bnl01_bot.init_db()
+            try:
+                prompt, _allow, _style = bnl01_bot.build_user_aware_prompt(
+                    1,
+                    1,
+                    "Crow",
+                    direct_content,
+                    channel_name="barcode-bot",
+                    channel_policy="public_home",
+                    route_mode=bnl01_bot.ROUTE_MODE_NORMAL_CHAT,
+                )
+            finally:
+                bnl01_bot.DB_FILE = old_db
+        self.assertIn("Current message media context", prompt)
+        self.assertIn("Media context rule", prompt)
+
+    def test_non_free_speak_command_acknowledgement_still_available(self):
+        items = [("Ops", "testing diagnostics with enough detail to require acknowledgement from the utility path", 101), ("Ops", "second testing diagnostic line with enough detail", 101)]
+        decision, reason = bnl01_bot._classify_batch_engagement(items)
+        self.assertEqual(decision, "acknowledge")
+        resolved_decision, _resolved_reason, diag = bnl01_bot._free_speak_ack_resolution(decision, reason, items, "internal_controlled")
+        self.assertEqual(resolved_decision, "acknowledge")
+        self.assertEqual(bnl01_bot._build_acknowledgement_response(items), "Received.")
+        self.assertFalse(diag["canned_ack_suppressed"])
+
+
 if __name__ == "__main__":
     unittest.main()
