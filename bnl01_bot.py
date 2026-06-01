@@ -5160,8 +5160,18 @@ def decide_reply_eligibility(
             allowed,
         )
     if plain_text_name_seen and free_speak_surface:
+        if batching:
+            return ReplyEligibility(
+                False,
+                f"{surface}_plain_name_call_entered_batch",
+                "plain_name_call",
+                "batched_plain_name",
+                True,
+                False,
+                True,
+            )
         reply_class = "planned_greeting" if mode == ROUTE_MODE_SIMPLE_GREETING else "free_speak_conversation"
-        return ReplyEligibility(True, f"{surface}_plain_name_call_allowed", "plain_name_call", reply_class, False, True, True)
+        return ReplyEligibility(True, f"{surface}_plain_name_call_paced_direct_batching_disabled", "plain_name_call", reply_class, False, True, True)
     if plain_text_name_seen and surface == CONVERSATION_SURFACE_MENTION_OR_REPLY:
         return ReplyEligibility(False, f"{policy}_plain_name_call_not_direct", "plain_name_call", "blocked", False, False, False)
     if free_speak_surface and text_present and (channel_allows_conversation or active_channel or contract.get("reply_without_direct", False)):
@@ -5221,7 +5231,7 @@ def _attach_reply_eligibility(
 
 def _conversation_plan_log(plan: ConversationPlan) -> None:
     logging.info(
-        "conversation_plan route_mode=%s channel_policy=%s conversation_surface=%s timing=%s generation=%s batch=%s pacing=%s reason=%s",
+        "conversation_plan route_mode=%s channel_policy=%s conversation_surface=%s timing=%s generation=%s batch=%s pacing=%s reason=%s directness=%s reply_reason=%s batching_enabled=%s plain_name_entered_batch=%s deterministic_template_used=%s",
         plan.route_mode,
         plan.channel_policy,
         plan.conversation_surface,
@@ -5230,6 +5240,11 @@ def _conversation_plan_log(plan: ConversationPlan) -> None:
         plan.batch_behavior,
         plan.pacing_behavior,
         plan.reason,
+        plan.directness,
+        plan.reply_reason,
+        int(plan.batching_enabled),
+        int(plan.directness == "plain_name_call" and plan.batch_behavior == BATCH_BEHAVIOR_ENTER_BATCH),
+        int(plan.response_generation == RESPONSE_GENERATION_DETERMINISTIC_TEMPLATE),
     )
     logging.info(
         "conversation_batch_decision route_mode=%s behavior=%s bypass_reason=%s",
@@ -5280,13 +5295,13 @@ def plan_conversation_response(
     Pipeline audit map:
     - Commands/protected hooks are immediate_command/operator handlers and stay outside
       normal chat generation.
-    - Direct mentions, replies, recent direct follow-ups, and free-speak surface fallback
-      enter paced_direct unless they intentionally start/continue a deferred payload session.
-    - Active-channel non-direct messages and free-speak passive room conversation enter
-      debounce batching when batching is enabled; non-free-speak passive channels stay quiet
-      when batching is disabled.
-    - Simple greetings keep the PR #196 route/memory boundary, but are planned as paced
-      direct deterministic responses instead of replying from a hardcoded fast path.
+    - Direct mentions, replies, recent direct follow-ups, and batching-disabled free-speak
+      fallbacks enter paced_direct unless they intentionally start/continue a deferred payload session.
+    - Active-channel non-direct messages, free-speak passive room conversation, and
+      free-speak plain-text name calls enter debounce batching when batching is enabled;
+      non-free-speak passive channels stay quiet when batching is disabled.
+    - Simple greetings keep the route/memory boundary, but free-speak plain-name greetings
+      only use deterministic direct templates for real direct targets or batching-disabled fallback.
     - Normal Gemini chat can inject public-safe memory; simple greetings minimize memory;
       source/scouting context is blocked unless the route contract explicitly allows it.
     """
@@ -5405,7 +5420,7 @@ def plan_conversation_response(
         plan = _attach_reply_eligibility(plan, eligibility, batching, surface)
         _conversation_plan_log(plan)
         return plan
-    if eligibility.policy_reply_class in {"batched_passive", "silent_observe"} and (active_channel or conversation_surface_allows_free_speak(surface)) and not direct_like:
+    if eligibility.policy_reply_class in {"batched_passive", "batched_plain_name", "silent_observe"} and (active_channel or conversation_surface_allows_free_speak(surface)) and not direct_like:
         if eligibility.batch_allowed:
             plan = ConversationPlan(
                 mode,
@@ -5515,6 +5530,7 @@ def format_last_route_debug() -> str:
         ("conversation_plan_batch", "batching decision"),
         ("batching_enabled", "batching enabled"),
         ("batching_disabled_affects_reply", "batching disabled affected reply"),
+        ("plain_name_entered_batch", "plain-name call entered batch"),
         ("conversation_plan_pacing", "pacing decision"),
         ("deterministic_response", "deterministic template used"),
         ("direct_session_used", "direct session used"),
@@ -11866,6 +11882,50 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
         if len(_channel_buffers[channel_id]) > 0:
             _log_batch_event(logging.INFO, "message_arrived_after_send_commit", guild_id, channel_id, len(_channel_buffers[channel_id]), f"generation_id={local_generation_id}")
 
+        batch_surface = conversation_surface_for_channel_policy(channel_policy, channel_id == get_guild_config(guild_id))
+        batch_plain_name_seen = bool(re.search(r"\b(bnl|bnl-01|barcode bot)\b", (combined_text or "").lower()))
+        batch_directness = "plain_name_call" if batch_plain_name_seen and conversation_surface_allows_free_speak(batch_surface) else "free_speak_passive"
+        update_last_route_debug(
+            route_mode=ROUTE_MODE_NORMAL_CHAT,
+            route_decision="active_channel_batch",
+            channel_policy=channel_policy,
+            conversation_surface=batch_surface,
+            channel_name=getattr(channel, "name", ""),
+            channel_id=channel_id,
+            conversation_plan_timing=RESPONSE_TIMING_BATCHED_CHANNEL,
+            conversation_plan_generation=RESPONSE_GENERATION_GEMINI_NORMAL_CHAT,
+            conversation_plan_batch=BATCH_BEHAVIOR_ENTER_BATCH,
+            conversation_plan_pacing=PACING_BEHAVIOR_NONE,
+            conversation_plan_reason=reason,
+            directness=batch_directness,
+            reply_eligibility="batched_plain_name" if batch_directness == "plain_name_call" else "batched_passive",
+            should_reply=False,
+            reply_reason=(f"{batch_surface}_plain_name_call_entered_batch" if batch_directness == "plain_name_call" else f"{batch_surface}_passive_batch_allowed"),
+            batch_allowed=True,
+            batching_enabled=BNL_ACTIVE_BATCHING_ENABLED,
+            batching_disabled_affects_reply=False,
+            plain_name_entered_batch=(batch_directness == "plain_name_call"),
+            direct_session_used=False,
+            batch_bypass_reason="none",
+            deterministic_response=False,
+            simple_greeting_detected=is_simple_greeting_to_bnl(combined_text),
+            memory_context_injected=True,
+            memory_context_source_count=1,
+            memory_injection_decision="batch_prompt_public_safe",
+            memory_write_decision=get_route_mode_contract(ROUTE_MODE_NORMAL_CHAT).save_behavior,
+            source_analysis_context_injected=False,
+            source_context_allowed=False,
+            community_scouting_ran=False,
+            entity_subjects_detected_count=0,
+            subject_extraction_ran=False,
+            save_policy_reason="batch_model_save_pending",
+            durable_memory_write=False,
+            scripted_mode_leak_guard_triggered=False,
+            leak_guard_result="clear",
+            fallback_used=False,
+            regenerated_for_mode_leak=False,
+        )
+
         if len(response) <= 2000:
             await channel.send(response, allowed_mentions=safe_mentions)
         else:
@@ -12696,6 +12756,7 @@ async def send_planned_conversation_response(
         batching_disabled_affects_reply=plan.batching_disabled_affects_reply,
         direct_session_used=plan.direct_session_used,
         batch_bypass_reason=plan.batch_bypass_reason or "none",
+        plain_name_entered_batch=(plan.directness == "plain_name_call" and plan.batch_behavior == BATCH_BEHAVIOR_ENTER_BATCH),
         deterministic_response=(plan.response_generation == RESPONSE_GENERATION_DETERMINISTIC_TEMPLATE),
         simple_greeting_detected=(plan.route_mode == ROUTE_MODE_SIMPLE_GREETING),
         memory_context_injected=(plan.memory_injection not in {"disabled", "minimal_display_name_only"}),

@@ -90,6 +90,32 @@ class ConversationPlannerTests(unittest.TestCase):
         self.assertEqual(plan.response_generation, bnl01_bot.RESPONSE_GENERATION_GEMINI_NORMAL_CHAT)
         self.assertEqual(plan.batch_behavior, bnl01_bot.BATCH_BEHAVIOR_PREEMPT_BATCH)
 
+    def test_simple_greeting_direct_exceptions_stay_paced_direct(self):
+        mention = bnl01_bot.plan_conversation_response(
+            "Hey BNL",
+            "public_home",
+            route_mode=bnl01_bot.ROUTE_MODE_SIMPLE_GREETING,
+            real_direct_target=True,
+            plain_text_name_seen=True,
+            batching_enabled=True,
+        )
+        self.assertTrue(mention.should_reply)
+        self.assertEqual(mention.directness, "real_mention")
+        self.assertEqual(mention.response_timing, bnl01_bot.RESPONSE_TIMING_PACED_DIRECT)
+        self.assertEqual(mention.response_generation, bnl01_bot.RESPONSE_GENERATION_DETERMINISTIC_TEMPLATE)
+
+        reply = bnl01_bot.plan_conversation_response(
+            "hey",
+            "sealed_test",
+            route_mode=bnl01_bot.ROUTE_MODE_SIMPLE_GREETING,
+            reply_to_bot=True,
+            batching_enabled=True,
+        )
+        self.assertTrue(reply.should_reply)
+        self.assertEqual(reply.directness, "reply_to_bot")
+        self.assertEqual(reply.response_timing, bnl01_bot.RESPONSE_TIMING_PACED_DIRECT)
+        self.assertEqual(reply.response_generation, bnl01_bot.RESPONSE_GENERATION_DETERMINISTIC_TEMPLATE)
+
     def test_non_direct_active_message_batches_when_batching_enabled(self):
         plan = bnl01_bot.plan_conversation_response(
             "room chatter continuing",
@@ -192,19 +218,60 @@ class ConversationPlannerTests(unittest.TestCase):
         self.assertEqual(plans[0].batch_behavior, plans[1].batch_behavior)
 
     def test_public_home_and_sealed_test_free_speak_parity_examples(self):
-        for text in ("Hey", "whats up", "How’s it going?"):
+        cases = [
+            ("Hey", bnl01_bot.ROUTE_MODE_NORMAL_CHAT, False),
+            ("Hey BNL", bnl01_bot.ROUTE_MODE_SIMPLE_GREETING, True),
+            ("whats up", bnl01_bot.ROUTE_MODE_NORMAL_CHAT, False),
+            ("BNL how’s it going?", bnl01_bot.ROUTE_MODE_NORMAL_CHAT, True),
+        ]
+        for text, route_mode, plain_seen in cases:
             public_plan = bnl01_bot.plan_conversation_response(
-                text, "public_home", route_mode=bnl01_bot.ROUTE_MODE_NORMAL_CHAT, channel_allows_conversation=True, batching_enabled=False
+                text,
+                "public_home",
+                route_mode=route_mode,
+                plain_text_name_seen=plain_seen,
+                channel_allows_conversation=True,
+                batching_enabled=True,
             )
             sealed_plan = bnl01_bot.plan_conversation_response(
-                text, "sealed_test", route_mode=bnl01_bot.ROUTE_MODE_NORMAL_CHAT, channel_allows_conversation=True, batching_enabled=False
+                text,
+                "sealed_test",
+                route_mode=route_mode,
+                plain_text_name_seen=plain_seen,
+                channel_allows_conversation=True,
+                batching_enabled=True,
             )
             self.assertEqual(public_plan.should_reply, sealed_plan.should_reply, text)
             self.assertEqual(public_plan.response_timing, sealed_plan.response_timing, text)
             self.assertEqual(public_plan.response_generation, sealed_plan.response_generation, text)
             self.assertEqual(public_plan.batch_behavior, sealed_plan.batch_behavior, text)
 
-    def test_plain_name_calls_work_on_both_free_speak_surfaces(self):
+    def test_plain_name_calls_batch_on_both_free_speak_surfaces_when_enabled(self):
+        cases = [
+            ("Hey BNL", bnl01_bot.ROUTE_MODE_SIMPLE_GREETING),
+            ("Hi BNL", bnl01_bot.ROUTE_MODE_SIMPLE_GREETING),
+            ("BNL?", bnl01_bot.ROUTE_MODE_SIMPLE_GREETING),
+            ("BNL how's it going?", bnl01_bot.ROUTE_MODE_NORMAL_CHAT),
+        ]
+        for policy in ("public_home", "sealed_test"):
+            for text, route_mode in cases:
+                plan = bnl01_bot.plan_conversation_response(
+                    text,
+                    policy,
+                    route_mode=route_mode,
+                    plain_text_name_seen=True,
+                    channel_allows_conversation=True,
+                    batching_enabled=True,
+                )
+                self.assertFalse(plan.should_reply, (policy, text))
+                self.assertEqual(plan.directness, "plain_name_call", (policy, text))
+                self.assertEqual(plan.policy_reply_class, "batched_plain_name", (policy, text))
+                self.assertEqual(plan.response_timing, bnl01_bot.RESPONSE_TIMING_BATCHED_CHANNEL, (policy, text))
+                self.assertEqual(plan.batch_behavior, bnl01_bot.BATCH_BEHAVIOR_ENTER_BATCH, (policy, text))
+                self.assertEqual(plan.response_generation, bnl01_bot.RESPONSE_GENERATION_GEMINI_NORMAL_CHAT, (policy, text))
+                self.assertIn("plain_name_call_entered_batch", plan.reply_reason, (policy, text))
+
+    def test_plain_name_calls_work_on_both_free_speak_surfaces_when_batching_disabled(self):
         for policy in ("public_home", "sealed_test"):
             greeting = bnl01_bot.plan_conversation_response(
                 "Hi BNL",
@@ -215,6 +282,8 @@ class ConversationPlannerTests(unittest.TestCase):
                 batching_enabled=False,
             )
             self.assertTrue(greeting.should_reply, policy)
+            self.assertEqual(greeting.directness, "plain_name_call", policy)
+            self.assertEqual(greeting.response_timing, bnl01_bot.RESPONSE_TIMING_PACED_DIRECT, policy)
             self.assertEqual(greeting.response_generation, bnl01_bot.RESPONSE_GENERATION_DETERMINISTIC_TEMPLATE, policy)
 
             normal = bnl01_bot.plan_conversation_response(
@@ -227,6 +296,7 @@ class ConversationPlannerTests(unittest.TestCase):
             )
             self.assertTrue(normal.should_reply, policy)
             self.assertEqual(normal.route_mode, bnl01_bot.ROUTE_MODE_NORMAL_CHAT, policy)
+            self.assertEqual(normal.response_timing, bnl01_bot.RESPONSE_TIMING_PACED_DIRECT, policy)
             self.assertEqual(normal.response_generation, bnl01_bot.RESPONSE_GENERATION_GEMINI_NORMAL_CHAT, policy)
 
     def test_public_context_matrix(self):
