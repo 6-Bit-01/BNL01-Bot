@@ -652,9 +652,9 @@ class MediaAwareBatchAckTests(unittest.TestCase):
         )
         items = [("Crow", media_text, 101)]
         decision, reason = bnl01_bot._classify_batch_engagement(items)
-        self.assertEqual(decision, "acknowledge")
-        resolved_decision, _resolved_reason, diag = bnl01_bot._free_speak_ack_resolution(decision, reason, items, "public_home")
-        self.assertEqual(resolved_decision, "observe")
+        self.assertEqual(decision, "answer")
+        resolved_decision, _resolved_reason, diag = bnl01_bot._free_speak_ack_resolution("acknowledge", "light_media_reaction_cluster", items, "public_home")
+        self.assertEqual(resolved_decision, "answer")
         self.assertNotEqual(bnl01_bot._build_acknowledgement_response(items), "Received.")
         self.assertTrue(diag["media_present"])
 
@@ -803,6 +803,94 @@ class MediaAwareBatchAckTests(unittest.TestCase):
         resolved_decision, _resolved_reason, diag = bnl01_bot._free_speak_ack_resolution(decision, reason, items, "internal_controlled")
         self.assertEqual(resolved_decision, "acknowledge")
         self.assertEqual(bnl01_bot._build_acknowledgement_response(items), "Received.")
+        self.assertFalse(diag["canned_ack_suppressed"])
+
+
+class RecentMediaRoomContextTests(unittest.TestCase):
+    def setUp(self):
+        bnl01_bot._recent_room_events.clear()
+
+    def test_media_message_records_short_term_room_event(self):
+        event = bnl01_bot.record_recent_media_event(
+            guild_id=1,
+            channel_id=2,
+            author_id=101,
+            author_display_name="Crow",
+            text=bnl01_bot.append_media_context_to_text("", {"items": ["gif embed (provider=Tenor; title=Spock Logical; preview=yes)"], "prompt_text": "- gif embed (provider=Tenor; title=Spock Logical; preview=yes)"}),
+            media_context={"items": ["gif embed (provider=Tenor; title=Spock Logical; preview=yes)"]},
+            channel_policy="sealed_test",
+            conversation_surface=bnl01_bot.CONVERSATION_SURFACE_FREE_SPEAK_SEALED_MIRROR,
+            response_state="observed",
+        )
+        self.assertTrue(event["media_present"])
+        self.assertEqual(event["visibility"], "sealed_private")
+        self.assertEqual(len(bnl01_bot.get_recent_room_events(1, 2, channel_policy="sealed_test", media_only=True)), 1)
+
+    def test_recent_media_followup_uses_matching_author_metadata(self):
+        bnl01_bot.record_recent_media_event(
+            guild_id=1, channel_id=2, author_id=101, author_display_name="Crow",
+            text="", media_context={"items": ["gif embed (provider=Tenor; title=Spock Logical; preview=yes)"]},
+            channel_policy="public_home", conversation_surface="free_speak_public_home", response_state="observed",
+        )
+        response = bnl01_bot.resolve_recent_media_followup(202, 1, 2, "public_home", "what did Crow post?")
+        self.assertIn("Crow", response)
+        self.assertIn("Spock Logical", response)
+
+    def test_recent_media_followup_thin_metadata_is_honest(self):
+        bnl01_bot.record_recent_media_event(
+            guild_id=1, channel_id=2, author_id=101, author_display_name="Crow",
+            text="", media_context={"items": ["gif embed (provider=Tenor; preview=yes)"]},
+            channel_policy="public_home", conversation_surface="free_speak_public_home", response_state="observed",
+        )
+        response = bnl01_bot.resolve_recent_media_followup(101, 1, 2, "public_home", "what was my GIF of?")
+        self.assertIn("Tenor", response)
+        self.assertIn("do not have a detailed visual description", response)
+
+    def test_public_home_media_context_is_transient_not_durable_memory(self):
+        event = bnl01_bot.record_recent_media_event(
+            guild_id=1, channel_id=2, author_id=101, author_display_name="Crow",
+            text="", media_context={"items": ["image attachment (filename=meme.png; type=image/png)"]},
+            channel_policy="public_home", conversation_surface="free_speak_public_home", response_state="observed",
+        )
+        self.assertEqual(event["visibility"], "public_home_transient")
+        self.assertNotIn("durable", event["visibility"])
+
+    def test_active_media_reaction_after_other_user_text_escalates(self):
+        bnl01_bot.record_recent_room_event_from_message(
+            guild_id=1, channel_id=2, author_id=202, author_display_name="Six", text="that plan is extremely logical",
+            media_context={}, channel_policy="public_home", conversation_surface="free_speak_public_home", response_state="ignored",
+        )
+        items = [("Crow", bnl01_bot.append_media_context_to_text("", {"items": ["gif embed (provider=Tenor; title=Spock Logical; preview=yes)"], "prompt_text": "- gif embed (provider=Tenor; title=Spock Logical; preview=yes)"}), 101)]
+        resolved_decision, resolved_reason, diag = bnl01_bot.resolve_batch_acknowledgement_decision(
+            "acknowledge", "light_media_reaction_cluster", items, "public_home", guild_id=1, channel_id=2, message_count=1
+        )
+        self.assertEqual(resolved_decision, "answer")
+        self.assertEqual(resolved_reason, "free_speak_active_media_reaction_generation")
+        self.assertTrue(diag["ack_escalated_to_generation"])
+        self.assertTrue(diag["recent_room_context"])
+
+    def test_media_reaction_after_recent_bnl_reply_can_escalate_when_meaningful(self):
+        items = [("Crow", bnl01_bot.append_media_context_to_text("", {"items": ["gif embed (provider=Tenor; title=Spock Logical; preview=yes)"], "prompt_text": "- gif embed (provider=Tenor; title=Spock Logical; preview=yes)"}), 101)]
+        resolved_decision, resolved_reason, diag = bnl01_bot.resolve_batch_acknowledgement_decision(
+            "acknowledge",
+            "light_media_reaction_cluster",
+            items,
+            "sealed_test",
+            guild_id=1,
+            channel_id=2,
+            message_count=1,
+            recent_bnl_reply_context=True,
+        )
+        self.assertEqual(resolved_decision, "answer")
+        self.assertEqual(resolved_reason, "free_speak_active_media_reaction_generation")
+        self.assertTrue(diag["recent_bnl_reply_context"])
+
+    def test_non_free_speak_media_does_not_become_free_speak(self):
+        items = [("Crow", bnl01_bot.append_media_context_to_text("", {"items": ["gif embed (provider=Tenor; preview=yes)"], "prompt_text": "- gif embed (provider=Tenor; preview=yes)"}), 101)]
+        resolved_decision, _reason, diag = bnl01_bot.resolve_batch_acknowledgement_decision(
+            "acknowledge", "light_media_reaction_cluster", items, "public_context", guild_id=1, channel_id=2, message_count=1
+        )
+        self.assertEqual(resolved_decision, "acknowledge")
         self.assertFalse(diag["canned_ack_suppressed"])
 
 
