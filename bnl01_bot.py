@@ -8229,9 +8229,38 @@ def build_recent_media_context_for_prompt(guild_id: int, channel_id: int, channe
     return "\n".join(lines)
 
 
+def is_media_visibility_or_storage_question(text: str) -> bool:
+    cleaned = _strip_media_context_block(text or "")
+    lowered = re.sub(r"\s+", " ", cleaned.lower()).strip()
+    if not lowered:
+        return False
+    media_terms = r"gif|image|picture|photo|video|sticker|meme|media|post|posted|reaction|preview"
+    visibility_terms = r"see|saw|seen|view|visible|visibility|stored|storage|logged|metadata|context|description|have|know|tell|identify|recognize|remember|ignore|ignored"
+    return bool(
+        re.search(rf"\b(?:can|could|do|did|what|which|how much)\b.*\b(?:you|bnl)\b.*\b(?:{visibility_terms})\b.*\b(?:{media_terms})\b", lowered)
+        or re.search(rf"\b(?:can|could|do|did)\b.*\b(?:you|bnl)\b.*\b(?:see|view|identify|recognize)\b.*\b(?:that|this|the)?\s*(?:{media_terms})\b", lowered)
+        or re.search(rf"\bwhat (?:do you|does bnl) have (?:stored|logged|saved|in context)\b.*\b(?:{media_terms})\b", lowered)
+        or re.search(rf"\bwhat .*\b(?:stored|logged|saved|metadata|context|description)\b.*\b(?:{media_terms})\b", lowered)
+    )
+
+
+def is_explicit_recent_media_followup(text: str) -> bool:
+    cleaned = _strip_media_context_block(text or "")
+    lowered = re.sub(r"\s+", " ", cleaned.lower()).strip()
+    if not lowered:
+        return False
+    media_terms = r"gif|image|picture|photo|video|sticker|meme|media|post|posted|reaction|preview"
+    direct_prior_reference = bool(
+        re.search(rf"\bwhat (?:was|is) (?:my|that|the|this|their|his|her|crow'?s|[a-z0-9_. -]{{2,40}}'?s)?\s*(?:{media_terms})\b", lowered)
+        or re.search(r"\bwhat did (?:i|we|you|he|she|they|[a-z0-9_. -]{2,40}) (?:just )?post\b", lowered)
+        or re.search(rf"\bwhat (?:did|was) .*\b(?:just posted|posted|reacting with|reaction)\b.*\b(?:{media_terms})?", lowered)
+        or re.search(rf"\b(?:which|who) .*\b(?:{media_terms})\b", lowered)
+    )
+    return direct_prior_reference or is_media_visibility_or_storage_question(cleaned)
+
+
 def _is_recent_media_followup(text: str) -> bool:
-    lowered = (text or "").lower()
-    return bool(re.search(r"\b(what|why|which|who|did you|do you)\b.*\b(gif|image|picture|photo|video|sticker|meme|media|post|posted|reacting|reaction|ignore|ignored)\b", lowered))
+    return is_explicit_recent_media_followup(text)
 
 
 def _select_recent_media_event(events: list[dict], user_id: int, user_text: str) -> tuple[dict | None, bool]:
@@ -10364,6 +10393,27 @@ MEDIA_CURRENT_ROOM_MARKERS = (
     "free_speak_media_generation",
 )
 
+MEDIA_MEMORY_RECALL_LEAK_PATTERNS = (
+    r"\byour recent gif\b",
+    r"\brecent gif\b",
+    r"\brecent media\b",
+    r"\bgif link preview\b",
+    r"\blink preview\b",
+    r"\bhost\s*=",
+    r"\bdetailed visual description stored\b",
+    r"\bvisual description stored\b",
+    r"\bstored visual description\b",
+    r"\bstored for that one\b",
+    r"\bmedia metadata\b",
+    r"\bprovider\s*=",
+    r"\bpreview\s*=\s*yes\b",
+)
+
+CURRENT_MEDIA_GENERATION_ROUTES = (
+    "free_speak_media_generation",
+    "media_response_grounding_repair",
+)
+
 BARCODE_WORLD_TOPIC_PATTERN = re.compile(
     r"\b(?:cliff|barcode radio|6 bit|six bit|broadcast|show|episode|booth|host|mods?|queue|live|show[-\s]?night|6:40)\b",
     flags=re.IGNORECASE,
@@ -10408,6 +10458,53 @@ def _extract_channel_policy_from_prompt(prompt: str) -> str:
 def _prompt_has_current_room_media_context(prompt: str, route: str = "") -> bool:
     lowered = f"{route or ''}\n{prompt or ''}".lower()
     return any(marker in lowered for marker in MEDIA_CURRENT_ROOM_MARKERS)
+
+
+def _prompt_has_current_message_media_context(prompt: str) -> bool:
+    return "[current message media context:" in (prompt or "").lower()
+
+
+def _route_is_current_media_generation(route: str) -> bool:
+    route_l = (route or "").lower()
+    return any(route_l == known or known in route_l for known in CURRENT_MEDIA_GENERATION_ROUTES)
+
+
+def contains_media_memory_recall_leak(text: str) -> bool:
+    lowered = (text or "").lower()
+    return any(re.search(pattern, lowered) for pattern in MEDIA_MEMORY_RECALL_LEAK_PATTERNS)
+
+
+def _extract_prompt_user_text_for_media_followup(prompt: str) -> str:
+    parts = []
+    for field in ("Current user request", "User message"):
+        value = _strip_media_context_block(_prompt_field_text(prompt, field))
+        if value:
+            parts.append(value)
+    messages_match = re.search(
+        r"Recent messages:\n(?P<context>.*?)(?:\nMultiline payload detected in batch:|\nRecent media context from this channel|\Z)",
+        prompt or "",
+        flags=re.DOTALL | re.IGNORECASE,
+    )
+    if messages_match:
+        for line in messages_match.group("context").splitlines():
+            content = _strip_media_context_block(_line_content_without_speaker(line))
+            if content:
+                parts.append(content)
+    return "\n".join(parts).strip()
+
+
+def prompt_has_explicit_media_followup(prompt: str) -> bool:
+    return is_explicit_recent_media_followup(_extract_prompt_user_text_for_media_followup(prompt))
+
+
+def should_repair_media_memory_recall_leak(text: str, prompt: str, route: str = "") -> bool:
+    if not contains_media_memory_recall_leak(text):
+        return False
+    if not _prompt_has_current_message_media_context(prompt):
+        return False
+    if not _route_is_current_media_generation(route):
+        return False
+    return not prompt_has_explicit_media_followup(prompt)
 
 
 def _prompt_field_text(prompt: str, field_name: str) -> str:
@@ -10575,6 +10672,8 @@ def fake_lookup_safety_prompt_rules() -> str:
         "- Do not claim archival records, source files, dossiers, scans, deployment records, system records, or broadcast memory prove/indicate/confirm something unless source, dossier, show-state, website read-model, or broadcast-memory context was actually supplied in this prompt.\n"
         "- Recent room context and media context are live conversation context, not proof that archive/source/broadcast records were checked.\n"
         "- For current-room media/GIF/sticker/video responses, anchor to the media and nearby conversation; treat memes as reactions/vibes unless text or context says the poster is the subject.\n"
+        "- Do not describe current media as recent media, link previews, host/provider metadata, stored visual descriptions, or media metadata unless the user explicitly asks what you saw or stored.\n"
+        "- If current media details are thin, answer conversationally from available context without exposing diagnostic media-buffer labels.\n"
         "- Do not drag BARCODE Radio, show status, broadcast deployments, or project-history explanations into a random meme unless the current message or nearby context is actually about those topics.\n"
         "- Archive/record/BARCODE language is allowed as supported source reporting or as clear metaphor/flavor; do not use it as fake evidence.\n"
         "- If recent room context or broadcast-memory context mentions a name, answer from that context rather than pretending a database lookup failed.\n"
@@ -10601,9 +10700,11 @@ Rules:
 - Remove unsupported memory/archive/deployment basis framing such as core memory, fragmented archive data, deployment history, weekly deployments, or operational history unless source/current-room context explicitly supports it.
 - Remove unsupported claims that the poster is the subject of the meme/GIF/media.
 - Remove unrelated BARCODE Radio/show/broadcast/deployment references unless the current message/media/context explicitly supports them.
+- Remove recent-media recall/storage diagnostics such as "recent GIF," "link preview," "host=", "provider=", "preview=yes," "stored visual description," or "media metadata" unless the user explicitly asked what you saw or stored.
 - Respond from the current message/media and nearby room context only.
+- Treat current media as a live room event, not a recalled buffer entry.
 - Do not add a refusal unless the original user request actually requires one.
-- If media metadata is thin, respond generally and honestly without pretending detailed vision.
+- If media metadata is thin, respond generally and honestly without pretending detailed vision; do not expose provider/host/storage labels.
 
 Original prompt context:
 {prompt}
@@ -10628,6 +10729,9 @@ Repaired response:"""
             return ""
         if should_repair_media_subject_drift(repaired, prompt, route):
             logging.info("media_response_grounding_repair_rejected reason=unsupported_subject_attribution route=%s", route)
+            return ""
+        if should_repair_media_memory_recall_leak(repaired, prompt, route):
+            logging.info("media_response_grounding_repair_rejected reason=media_memory_recall_leak route=%s", route)
             return ""
         return repaired
     except Exception as exc:
@@ -10793,6 +10897,8 @@ async def get_gemini_response(prompt: str, user_id: int, guild_id: int, route: s
                         logging.info("glitch_rewrite_rejected reason=unsupported_source_authority route=%s", route)
                 elif should_repair_media_subject_drift(glitch_text, prompt, route) and not should_repair_media_subject_drift(text, prompt, route):
                     logging.info("glitch_rewrite_rejected reason=unsupported_subject_attribution route=%s", route)
+                elif should_repair_media_memory_recall_leak(glitch_text, prompt, route) and not should_repair_media_memory_recall_leak(text, prompt, route):
+                    logging.info("glitch_rewrite_rejected reason=media_memory_recall_leak route=%s", route)
                 elif public_authority_guard_active and contains_operator_causality_claim(glitch_text) and not contains_operator_causality_claim(text):
                     logging.info("glitch_rewrite_rejected reason=public_operator_causality_claim")
                 else:
@@ -10848,6 +10954,8 @@ async def get_gemini_response(prompt: str, user_id: int, guild_id: int, route: s
                         logging.info("cross_universe_bleed_rejected reason=unsupported_source_authority route=cross_universe_bleed original_route=%s", route)
                 elif should_repair_media_subject_drift(bleed_text, prompt, route) and not should_repair_media_subject_drift(text, prompt, route):
                     logging.info("cross_universe_bleed_rejected reason=unsupported_subject_attribution route=cross_universe_bleed original_route=%s", route)
+                elif should_repair_media_memory_recall_leak(bleed_text, prompt, route) and not should_repair_media_memory_recall_leak(text, prompt, route):
+                    logging.info("cross_universe_bleed_rejected reason=media_memory_recall_leak route=cross_universe_bleed original_route=%s", route)
                 elif public_authority_guard_active and contains_operator_causality_claim(bleed_text) and not contains_operator_causality_claim(text):
                     logging.info("glitch_rewrite_rejected reason=public_operator_causality_claim route=cross_universe_bleed")
                 else:
@@ -10856,6 +10964,22 @@ async def get_gemini_response(prompt: str, user_id: int, guild_id: int, route: s
         unsupported_source_authority = should_reject_unsupported_source_authority(text, prompt, route)
         unsupported_media_grounding_basis = current_room_media_context_present and contains_unsupported_media_grounding_basis(text) and not source_authority_context_present
         unsupported_subject_attribution = should_repair_media_subject_drift(text, prompt, route)
+        media_memory_recall_leak = contains_media_memory_recall_leak(text)
+        explicit_media_followup = prompt_has_explicit_media_followup(prompt)
+        media_memory_recall_leak_repair = should_repair_media_memory_recall_leak(text, prompt, route)
+        if media_memory_recall_leak and explicit_media_followup:
+            logging.info(
+                "media_memory_recall_leak_allowed reason=explicit_followup route=%s channel_policy=%s current_media_context=%s explicit_media_followup=1",
+                route,
+                _extract_channel_policy_from_prompt(prompt),
+                int(_prompt_has_current_message_media_context(prompt)),
+            )
+        if media_memory_recall_leak_repair:
+            logging.info(
+                "media_memory_recall_leak_detected route=%s channel_policy=%s current_media_context=1 explicit_media_followup=0",
+                route,
+                _extract_channel_policy_from_prompt(prompt),
+            )
         if contains_unsupported_source_authority_claim(text) and source_authority_context_present:
             logging.info("unsupported_source_authority_claim_allowed reason=source_context_present route=%s channel_policy=%s source_context_present=1", route, _extract_channel_policy_from_prompt(prompt))
         if unsupported_source_authority and contains_unsupported_source_authority_claim(text):
@@ -10864,7 +10988,7 @@ async def get_gemini_response(prompt: str, user_id: int, guild_id: int, route: s
             logging.info("unsupported_media_grounding_basis_detected route=%s channel_policy=%s source_context_present=0", route, _extract_channel_policy_from_prompt(prompt))
         if unsupported_subject_attribution:
             logging.info("unsupported_subject_attribution_detected route=%s channel_policy=%s source_context_present=%s", route, _extract_channel_policy_from_prompt(prompt), int(source_authority_context_present))
-        if (unsupported_source_authority or unsupported_subject_attribution) and current_room_media_context_present:
+        if (unsupported_source_authority or unsupported_subject_attribution or media_memory_recall_leak_repair) and current_room_media_context_present:
             logging.info("media_response_grounding_repair route=%s channel_policy=%s source_context_present=%s repaired=0 hard_fallbacked=0", route, _extract_channel_policy_from_prompt(prompt), int(source_authority_context_present))
             repaired = await _repair_current_room_media_grounding_response(text, prompt, route)
             if repaired:
@@ -10874,6 +10998,8 @@ async def get_gemini_response(prompt: str, user_id: int, guild_id: int, route: s
                     logging.info("unsupported_media_grounding_basis_repaired route=%s channel_policy=%s source_context_present=0 repaired=1 hard_fallbacked=0", route, _extract_channel_policy_from_prompt(prompt))
                 if unsupported_subject_attribution:
                     logging.info("unsupported_subject_attribution_repaired route=%s channel_policy=%s source_context_present=%s repaired=1 hard_fallbacked=0", route, _extract_channel_policy_from_prompt(prompt), int(source_authority_context_present))
+                if media_memory_recall_leak_repair:
+                    logging.info("media_memory_recall_leak_repaired route=%s channel_policy=%s current_media_context=1 explicit_media_followup=0 repaired=1 hard_fallbacked=0", route, _extract_channel_policy_from_prompt(prompt))
                 return repaired
             logging.info("media_response_grounding_repair route=%s channel_policy=%s source_context_present=%s repaired=0 hard_fallbacked=1", route, _extract_channel_policy_from_prompt(prompt), int(source_authority_context_present))
             return _safe_current_room_media_grounding_response(prompt)
@@ -12274,6 +12400,7 @@ def _format_batched_prompt(messages, style_key: str, style_rule: str) -> str:
         "- Treat this batch as one live conversational moment and respond to the latest combined state.\n"
         "- If media/GIF/sticker/video context is listed, treat it as visible current-room context for the moment; use it naturally when relevant.\n"
         "- For a meme/GIF/image/video, respond to what the media appears to communicate and nearby conversation; if metadata is thin, respond generally without pretending detailed vision.\n"
+        "- Current media is a live room event, not a recent-media recall request; do not say recent GIF/media, link preview, host=, provider=, preview=yes, stored visual description, or media metadata unless the user explicitly asks what you saw/stored.\n"
         "- Do not assume the poster is the subject of a meme unless the message text, media metadata, direct self-question, or nearby room context clearly says so.\n"
         "- Do not turn a meme into an archive/source report, a poster biography, or an unrelated BARCODE Radio/show/broadcast deployment explanation.\n"
         "- BARCODE/archive flavor is welcome, but do not claim records, archives, source files, dossiers, scans, deployments, or broadcast memory prove anything unless real source context is supplied.\n"
@@ -13280,6 +13407,7 @@ def build_user_aware_prompt(
     prompt = (
         f"Current user request: {clean_content}\n"
         "Media context rule: if the current request includes media/GIF/sticker/video context, treat it as visible current-room conversation context and respond naturally without saying it was merely detected or logged.\n"
+        "Live media rule: current media is a live room event, not a recent-media recall request; do not expose link-preview/provider/host/storage/metadata labels or say a visual description is stored/missing unless the user explicitly asks what you saw or stored.\n"
         "Current-room media grounding: anchor to the media and nearby conversation; do not assume the poster is the subject of a meme unless text/metadata/context says so; do not turn a random media reaction into an archive/source report, poster biography, or unrelated BARCODE Radio/show/broadcast deployment explanation.\n"
         "Source-authority basis rule: archive/record/source/dossier/scan/deployment/broadcast-memory language may be style or honest supplied-source reporting, but do not claim those sources prove/indicate/confirm something unless source/broadcast/show-state/read-model context is actually supplied.\n"
         f"{prompt_contract}"
