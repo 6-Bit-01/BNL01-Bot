@@ -10292,6 +10292,197 @@ def contains_fake_lookup_claim(text: str) -> bool:
 
 
 
+SOURCE_AUTHORITY_CLAIM_PATTERNS = (
+    r"\barchival records? indicate\b",
+    r"\barchive records? indicate\b",
+    r"\brecords? indicate\b",
+    r"\brecords? show\b",
+    r"\bnetwork records? indicate\b",
+    r"\bsource records? indicate\b",
+    r"\bdossier indicates\b",
+    r"\bsource file indicates\b",
+    r"\bbroadcast memory indicates\b",
+    r"\bweekly broadcast deployments\b",
+    r"\bdeployment records?\b",
+    r"\barchive confirms\b",
+    r"\brecords? confirm\b",
+    r"\bscans indicate\b",
+    r"\bsystem records? indicate\b",
+)
+
+SOURCE_AUTHORITY_CONTEXT_MARKERS = (
+    "broadcast memory context:",
+    "broadcast memory context (cleaned summaries only):",
+    "broadcast memory entity match:",
+    "source file / internal case file context:",
+    "source context block",
+    "dossier/source packet",
+    "dossier source packet",
+    "current barcode radio scheduling context:",
+    "show-state route instruction:",
+    "show-state context",
+    "website read model context",
+    "website public read model context:",
+    "bnl website read-model context",
+    "source enrich",
+    "source enrichment",
+)
+
+MEDIA_CURRENT_ROOM_MARKERS = (
+    "[current message media context:",
+    "recent media context from this channel",
+    "free_speak_media_generation",
+)
+
+BARCODE_WORLD_TOPIC_PATTERN = re.compile(
+    r"\b(?:cliff|barcode radio|6 bit|six bit|broadcast|show|episode|booth|host|mods?|queue|live|show[-\s]?night|6:40)\b",
+    flags=re.IGNORECASE,
+)
+
+UNRELATED_MEDIA_TOPIC_DRIFT_PATTERNS = (
+    r"\bweekly broadcast deployments\b",
+    r"\bbroadcast deployments?\b",
+    r"\bdeployment records?\b",
+    r"\bbarcode radio\b",
+    r"\bcliff\b",
+    r"\bradio booth\b",
+    r"\bthe booth\b",
+    r"\bshow schedules?\b",
+    r"\bshow-state\b",
+    r"\bbroadcast status\b",
+)
+
+
+def contains_unsupported_source_authority_claim(text: str) -> bool:
+    lowered = (text or "").lower()
+    return any(re.search(pattern, lowered) for pattern in SOURCE_AUTHORITY_CLAIM_PATTERNS)
+
+
+def prompt_has_source_authority_context(prompt: str) -> bool:
+    lowered = (prompt or "").lower()
+    return any(marker in lowered for marker in SOURCE_AUTHORITY_CONTEXT_MARKERS)
+
+
+def _extract_channel_policy_from_prompt(prompt: str) -> str:
+    match = re.search(r"Current channel policy:\s*([^\n]+)", prompt or "", flags=re.IGNORECASE)
+    if not match:
+        return "unknown"
+    return re.sub(r"[^a-zA-Z0-9_\-]", "_", match.group(1).strip().lower())[:80] or "unknown"
+
+
+def _prompt_has_current_room_media_context(prompt: str, route: str = "") -> bool:
+    lowered = f"{route or ''}\n{prompt or ''}".lower()
+    return any(marker in lowered for marker in MEDIA_CURRENT_ROOM_MARKERS)
+
+
+def _prompt_field_text(prompt: str, field_name: str) -> str:
+    match = re.search(rf"{re.escape(field_name)}:\s*(?P<value>.*?)(?:\n[A-Z][A-Za-z -]+:|\Z)", prompt or "", flags=re.DOTALL | re.IGNORECASE)
+    return match.group("value") if match else ""
+
+
+def _line_content_without_speaker(line: str) -> str:
+    stripped = (line or "").strip()
+    match = re.match(r"^-\s*([^:\n]{1,80}):\s*(?P<content>.*)$", stripped)
+    if match:
+        return match.group("content")
+    return stripped
+
+
+def _extract_nearby_room_topic_text(prompt: str) -> str:
+    text = prompt or ""
+    parts = []
+
+    room_match = re.search(
+        r"Recent room context from this channel:\n(?P<context>.*?)(?:\nRoom-first context rules:|\nCurrent channel:|\nGreeting policy:|\nResponse style mode:|\nDurable memory context:|\nBroadcast memory context:|\nUser name to address|\Z)",
+        text,
+        flags=re.DOTALL | re.IGNORECASE,
+    )
+    if room_match:
+        parts.append(room_match.group("context"))
+
+    messages_match = re.search(
+        r"Recent messages:\n(?P<context>.*?)(?:\nMultiline payload detected in batch:|\nRecent media context from this channel|\Z)",
+        text,
+        flags=re.DOTALL | re.IGNORECASE,
+    )
+    if messages_match:
+        # Current batched messages may include only the media poster name (for example "6 Bit:").
+        # Count the message content as topic basis, not the speaker label, so a media-only post
+        # does not become about the poster by accident.
+        message_lines = [_line_content_without_speaker(line) for line in messages_match.group("context").splitlines()]
+        parts.append("\n".join(message_lines))
+
+    recent_media_match = re.search(
+        r"Recent media context from this channel \(transient, not durable memory\):\n(?P<context>.*?)(?:\nPRIMARY REQUEST ACTION:|\Z)",
+        text,
+        flags=re.DOTALL | re.IGNORECASE,
+    )
+    if recent_media_match:
+        media_lines = [_line_content_without_speaker(line) for line in recent_media_match.group("context").splitlines()]
+        parts.append("\n".join(media_lines))
+
+    return "\n".join(part for part in parts if part).strip()
+
+
+def _prompt_has_barcode_topic_basis(prompt: str) -> bool:
+    request_text = " ".join(
+        _prompt_field_text(prompt, field)
+        for field in ("Current user request", "User message")
+    )
+    nearby_text = _extract_nearby_room_topic_text(prompt)
+    return bool(BARCODE_WORLD_TOPIC_PATTERN.search(request_text) or BARCODE_WORLD_TOPIC_PATTERN.search(nearby_text)) or prompt_has_source_authority_context(prompt)
+
+
+def prompt_has_subject_basis(prompt: str) -> bool:
+    request_text = " ".join(
+        _prompt_field_text(prompt, field).lower()
+        for field in ("Current user request", "User message")
+    )
+    nearby_text = _extract_nearby_room_topic_text(prompt).lower()
+    if re.search(r"\b(i|me|my|myself|about me|am i|was i|do i|did i)\b", request_text):
+        return True
+    if re.search(r"\b(6 bit|six bit|barcode radio|host|show|broadcast|episode)\b", request_text):
+        return True
+    if re.search(r"\babout (?:him|her|them|the poster|the user|6 bit|six bit)\b", request_text):
+        return True
+    if re.search(r"\b(6 bit|six bit|the poster|the user)\b", nearby_text):
+        return True
+    return False
+
+
+def contains_unsupported_subject_attribution(text: str, prompt: str = "") -> bool:
+    if prompt_has_subject_basis(prompt):
+        return False
+    lowered = (text or "").lower()
+    if re.search(r"\b(his|her|their) weekly broadcast deployments\b", lowered):
+        return True
+    if re.search(r"\b(?:6 bit|six bit)\b.*\b(?:his|her|their)\b.*\b(?:broadcast|deployment|show|barcode radio)\b", lowered):
+        return True
+    if re.search(r"\b(?:his|her|their)\b.*\b(?:broadcast|deployment|show|barcode radio)\b", lowered) and _prompt_has_current_room_media_context(prompt):
+        return True
+    if any(re.search(pattern, lowered) for pattern in UNRELATED_MEDIA_TOPIC_DRIFT_PATTERNS) and _prompt_has_current_room_media_context(prompt) and not _prompt_has_barcode_topic_basis(prompt):
+        return True
+    return False
+
+
+def should_reject_unsupported_source_authority(text: str, prompt: str, route: str = "") -> bool:
+    if not contains_unsupported_source_authority_claim(text):
+        return False
+    return not prompt_has_source_authority_context(prompt)
+
+
+def should_repair_media_subject_drift(text: str, prompt: str, route: str = "") -> bool:
+    if not _prompt_has_current_room_media_context(prompt, route):
+        return False
+    return contains_unsupported_subject_attribution(text, prompt)
+
+
+def _should_repair_current_room_media_grounding(text: str, prompt: str, route: str = "") -> bool:
+    if not _prompt_has_current_room_media_context(prompt, route):
+        return False
+    return should_reject_unsupported_source_authority(text, prompt, route) or should_repair_media_subject_drift(text, prompt, route)
+
+
 OPERATOR_CAUSALITY_CLAIM_PATTERNS = (
     r"\boriginat(?:e|ed|ing) from you\b",
     r"\byour directive (?:established|defined|set|created)\b",
@@ -10341,9 +10532,66 @@ def fake_lookup_safety_prompt_rules() -> str:
         "\nLookup/source safety rules:\n"
         "- Never invent archive scans, entity database checks, dossiers, canonical profiles, or lookup failures.\n"
         "- Do not say: no direct matches, no primary matches, no prior reference, established entity/BARCODE parameters, known signal patterns, archive scan found nothing, Network archives yielded no results, entity lookup failed, records remain incomplete, records contain no reference, or unknown external data stream unless an actual code path supplied that result.\n"
+        "- Do not claim archival records, source files, dossiers, scans, deployment records, system records, or broadcast memory prove/indicate/confirm something unless source, dossier, show-state, website read-model, or broadcast-memory context was actually supplied in this prompt.\n"
+        "- Recent room context and media context are live conversation context, not proof that archive/source/broadcast records were checked.\n"
+        "- For current-room media/GIF/sticker/video responses, anchor to the media and nearby conversation; treat memes as reactions/vibes unless text or context says the poster is the subject.\n"
+        "- Do not drag BARCODE Radio, show status, broadcast deployments, or project-history explanations into a random meme unless the current message or nearby context is actually about those topics.\n"
+        "- Archive/record/BARCODE language is allowed as supported source reporting or as clear metaphor/flavor; do not use it as fake evidence.\n"
         "- If recent room context or broadcast-memory context mentions a name, answer from that context rather than pretending a database lookup failed.\n"
         "- If context is weak, state uncertainty plainly without pretending a database was queried.\n"
     )
+
+
+def _safe_current_room_media_grounding_response(prompt: str) -> str:
+    return (
+        "That reads like a pure room-reaction signal: the visible joke is doing the work, and the room can answer it without turning anybody into a case file. "
+        "No archive verdict needed, just a small red light blinking in agreement."
+    )
+
+
+async def _repair_current_room_media_grounding_response(text: str, prompt: str, route: str = "get_gemini_response") -> str:
+    repair_prompt = f"""{BNL01_SYSTEM_PROMPT}
+
+Repair this BNL-01 current-room media response.
+
+Rules:
+- Keep the same basic meaning and conversational intent.
+- Preserve BNL's dry, strange BARCODE-flavored voice.
+- Remove unsupported claims that records, archives, dossiers, scans, source files, deployments, system records, or broadcast memory prove/indicate/confirm anything.
+- Remove unsupported claims that the poster is the subject of the meme/GIF/media.
+- Remove unrelated BARCODE Radio/show/broadcast/deployment references unless the current message/media/context explicitly supports them.
+- Respond from the current message/media and nearby room context only.
+- Do not add a refusal unless the original user request actually requires one.
+- If media metadata is thin, respond generally and honestly without pretending detailed vision.
+
+Original prompt context:
+{prompt}
+
+Draft to repair:
+{text}
+
+Repaired response:"""
+    try:
+        response = await _generate_gemini_content_with_fallback_async(repair_prompt, "media_response_grounding_repair")
+        repaired, tokens = _extract_text_and_tokens(response)
+        if tokens:
+            increment_token_usage(tokens)
+        repaired = (repaired or "").strip()
+        if not repaired:
+            return ""
+        if contains_fake_lookup_claim(repaired):
+            logging.info("media_response_grounding_repair_rejected reason=fake_lookup_claim route=%s", route)
+            return ""
+        if should_reject_unsupported_source_authority(repaired, prompt, route):
+            logging.info("media_response_grounding_repair_rejected reason=unsupported_source_authority route=%s", route)
+            return ""
+        if should_repair_media_subject_drift(repaired, prompt, route):
+            logging.info("media_response_grounding_repair_rejected reason=unsupported_subject_attribution route=%s", route)
+            return ""
+        return repaired
+    except Exception as exc:
+        logging.error("media_response_grounding_repair_failed route=%s error=%s", route, exc)
+        return ""
 
 
 def _safe_uncertain_response_from_prompt(prompt: str) -> str:
@@ -10416,6 +10664,8 @@ async def get_gemini_response(prompt: str, user_id: int, guild_id: int, route: s
 
         is_show_state_route = (route or "").startswith("show_state")
         public_authority_guard_active = _is_public_authority_guard_prompt(prompt)
+        source_authority_context_present = prompt_has_source_authority_context(prompt)
+        current_room_media_context_present = _prompt_has_current_room_media_context(prompt, route)
         public_authority_guard_block = public_operator_causality_safety_prompt_rules() if public_authority_guard_active else ""
         show_state_route_block = ""
         if is_show_state_route:
@@ -10473,6 +10723,8 @@ async def get_gemini_response(prompt: str, user_id: int, guild_id: int, route: s
         - Keep the result concise enough to work naturally in Discord.
         - At least part of the response must remain clearly understandable.
         - Do not add fake archive/entity/database lookup claims, fake no-match claims, fake known-signal-pattern claims, or hard denials not present in the original.
+        - Do not add unsupported source-authority claims such as records/archives/source files/dossiers/scans/deployments/broadcast memory proving or indicating something unless that basis was already present in the original.
+        - For current-room media, do not turn a meme into a biography of the poster or an unrelated BARCODE Radio/broadcast report.
         - Do not override recognition from current room context.
         - Preserve uncertainty; do not turn weak context into diagnostic certainty.
         - Do not add public operator-authority/causality claims such as the user authored, commanded, or created BNL protocols.
@@ -10489,6 +10741,10 @@ async def get_gemini_response(prompt: str, user_id: int, guild_id: int, route: s
             if glitch_text:
                 if contains_fake_lookup_claim(glitch_text) and not contains_fake_lookup_claim(text):
                     logging.info("glitch_rewrite_rejected reason=fake_lookup_claim")
+                elif should_reject_unsupported_source_authority(glitch_text, prompt, route) and not should_reject_unsupported_source_authority(text, prompt, route):
+                    logging.info("glitch_rewrite_rejected reason=unsupported_source_authority route=%s", route)
+                elif should_repair_media_subject_drift(glitch_text, prompt, route) and not should_repair_media_subject_drift(text, prompt, route):
+                    logging.info("glitch_rewrite_rejected reason=unsupported_subject_attribution route=%s", route)
                 elif public_authority_guard_active and contains_operator_causality_claim(glitch_text) and not contains_operator_causality_claim(text):
                     logging.info("glitch_rewrite_rejected reason=public_operator_causality_claim")
                 else:
@@ -10533,14 +10789,42 @@ async def get_gemini_response(prompt: str, user_id: int, guild_id: int, route: s
             if bleed_text:
                 if contains_fake_lookup_claim(bleed_text) and not contains_fake_lookup_claim(text):
                     logging.info("glitch_rewrite_rejected reason=fake_lookup_claim route=cross_universe_bleed")
+                elif should_reject_unsupported_source_authority(bleed_text, prompt, route) and not should_reject_unsupported_source_authority(text, prompt, route):
+                    logging.info("glitch_rewrite_rejected reason=unsupported_source_authority route=cross_universe_bleed original_route=%s", route)
+                elif should_repair_media_subject_drift(bleed_text, prompt, route) and not should_repair_media_subject_drift(text, prompt, route):
+                    logging.info("glitch_rewrite_rejected reason=unsupported_subject_attribution route=cross_universe_bleed original_route=%s", route)
                 elif public_authority_guard_active and contains_operator_causality_claim(bleed_text) and not contains_operator_causality_claim(text):
                     logging.info("glitch_rewrite_rejected reason=public_operator_causality_claim route=cross_universe_bleed")
                 else:
                     text = bleed_text
 
+        unsupported_source_authority = should_reject_unsupported_source_authority(text, prompt, route)
+        unsupported_subject_attribution = should_repair_media_subject_drift(text, prompt, route)
+        if contains_unsupported_source_authority_claim(text) and source_authority_context_present:
+            logging.info("unsupported_source_authority_claim_allowed reason=source_context_present route=%s channel_policy=%s source_context_present=1", route, _extract_channel_policy_from_prompt(prompt))
+        if unsupported_source_authority:
+            logging.info("unsupported_source_authority_claim_detected route=%s channel_policy=%s source_context_present=0", route, _extract_channel_policy_from_prompt(prompt))
+        if unsupported_subject_attribution:
+            logging.info("unsupported_subject_attribution_detected route=%s channel_policy=%s source_context_present=%s", route, _extract_channel_policy_from_prompt(prompt), int(source_authority_context_present))
+        if (unsupported_source_authority or unsupported_subject_attribution) and current_room_media_context_present:
+            logging.info("media_response_grounding_repair route=%s channel_policy=%s source_context_present=%s repaired=0 hard_fallbacked=0", route, _extract_channel_policy_from_prompt(prompt), int(source_authority_context_present))
+            repaired = await _repair_current_room_media_grounding_response(text, prompt, route)
+            if repaired:
+                if unsupported_source_authority:
+                    logging.info("unsupported_source_authority_claim_repaired route=%s channel_policy=%s source_context_present=0 repaired=1 hard_fallbacked=0", route, _extract_channel_policy_from_prompt(prompt))
+                if unsupported_subject_attribution:
+                    logging.info("unsupported_subject_attribution_repaired route=%s channel_policy=%s source_context_present=%s repaired=1 hard_fallbacked=0", route, _extract_channel_policy_from_prompt(prompt), int(source_authority_context_present))
+                return repaired
+            logging.info("media_response_grounding_repair route=%s channel_policy=%s source_context_present=%s repaired=0 hard_fallbacked=1", route, _extract_channel_policy_from_prompt(prompt), int(source_authority_context_present))
+            return _safe_current_room_media_grounding_response(prompt)
+
         if contains_fake_lookup_claim(text):
             source = "broadcast_memory_context" if "Broadcast memory" in (prompt or "") else "standard_context"
             logging.info(f"model_response_rejected reason=fake_lookup_claim source={source}")
+            return _safe_uncertain_response_from_prompt(prompt)
+
+        if unsupported_source_authority:
+            logging.info("model_response_rejected reason=unsupported_source_authority route=%s channel_policy=%s source_context_present=0", route, _extract_channel_policy_from_prompt(prompt))
             return _safe_uncertain_response_from_prompt(prompt)
 
         if public_authority_guard_active and contains_operator_causality_claim(text):
@@ -11928,7 +12212,11 @@ def _format_batched_prompt(messages, style_key: str, style_rule: str) -> str:
         "Rules:\n"
         "- Sound like you were listening the whole time.\n"
         "- Treat this batch as one live conversational moment and respond to the latest combined state.\n"
-        "- If media/GIF/sticker/video context is listed, treat it as visible context for the moment; use it naturally when relevant.\n"
+        "- If media/GIF/sticker/video context is listed, treat it as visible current-room context for the moment; use it naturally when relevant.\n"
+        "- For a meme/GIF/image/video, respond to what the media appears to communicate and nearby conversation; if metadata is thin, respond generally without pretending detailed vision.\n"
+        "- Do not assume the poster is the subject of a meme unless the message text, media metadata, direct self-question, or nearby room context clearly says so.\n"
+        "- Do not turn a meme into an archive/source report, a poster biography, or an unrelated BARCODE Radio/show/broadcast deployment explanation.\n"
+        "- BARCODE/archive flavor is welcome, but do not claim records, archives, source files, dossiers, scans, deployments, or broadcast memory prove anything unless real source context is supplied.\n"
         "- Do not say media was merely logged/detected, and do not use a canned utility acknowledgement as the whole normal-chat response.\n"
         "- Address multiple points smoothly (no bullets).\n- Consecutive fragments from the same user are one continuing thought; respond once to their combined meaning.\n- Do not answer each fragment separately or produce one paragraph per fragment.\n- Do not over-analyze simple test fragments.\n"
         "- Do not quote users verbatim.\n"
@@ -12330,12 +12618,13 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                 )
                 post_generation_regeneration_pending = None
 
+            generation_route = "free_speak_media_generation" if reason == "free_speak_media_generation" else "get_gemini_response"
             _log_batch_event(logging.INFO, "active_packet_generation_started", guild_id, channel_id, len(collapsed_items), f"payload_count={len(active_packet['payload_items'])};decision={decision};reason={reason}")
             generation_elapsed = max(0.0, (datetime.now(PACIFIC_TZ) - batch_start).total_seconds())
             _log_batch_event(logging.INFO, "generation_started_after_wait", guild_id, channel_id, len(collapsed_items), f"payload_count={len(active_packet['payload_items'])};elapsed_seconds={generation_elapsed:.2f};selected_wait_seconds={selected_wait_seconds:.2f}")
             _log_batch_event(logging.INFO, "generation_typing_started", guild_id, channel_id, len(collapsed_items), f"payload_count={len(active_packet['payload_items'])};elapsed_seconds={generation_elapsed:.2f};selected_wait_seconds={selected_wait_seconds:.2f}")
             if True:  # typing indicator disabled: Discord 429 was aborting bot replies
-                response = await get_gemini_response(prompt, user_id=first_uid, guild_id=channel.guild.id)
+                response = await get_gemini_response(prompt, user_id=first_uid, guild_id=channel.guild.id, route=generation_route)
 
             if not response:
                 logging.warning(f"⚠️ Batch response generation failed in channel {channel_id}.")
@@ -12358,7 +12647,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                             + "Missing item count: " + str(len(missing_items)) + "."
                         )
                         if True:  # typing indicator disabled: Discord 429 was aborting bot replies
-                            regenerated = await get_gemini_response(correction_prompt, user_id=first_uid, guild_id=channel.guild.id)
+                            regenerated = await get_gemini_response(correction_prompt, user_id=first_uid, guild_id=channel.guild.id, route=generation_route)
                         if regenerated:
                             response = regenerated
                             payload_completion_regenerated = True
@@ -12930,7 +13219,9 @@ def build_user_aware_prompt(
 
     prompt = (
         f"Current user request: {clean_content}\n"
-        "Media context rule: if the current request includes media/GIF/sticker/video context, treat it as visible conversation context and respond naturally without saying it was merely detected or logged.\n"
+        "Media context rule: if the current request includes media/GIF/sticker/video context, treat it as visible current-room conversation context and respond naturally without saying it was merely detected or logged.\n"
+        "Current-room media grounding: anchor to the media and nearby conversation; do not assume the poster is the subject of a meme unless text/metadata/context says so; do not turn a random media reaction into an archive/source report, poster biography, or unrelated BARCODE Radio/show/broadcast deployment explanation.\n"
+        "Source-authority basis rule: archive/record/source/dossier/scan/deployment/broadcast-memory language may be style or honest supplied-source reporting, but do not claim those sources prove/indicate/confirm something unless source/broadcast/show-state/read-model context is actually supplied.\n"
         f"{prompt_contract}"
         f"{room_prompt_block}"
         f"{channel_prompt_block}"
