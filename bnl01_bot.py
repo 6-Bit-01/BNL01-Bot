@@ -26,6 +26,7 @@ import urllib.request
 import urllib.error
 import urllib.parse
 import calendar
+import time
 
 from bnl_dossier_candidate_discovery import (
     DEFAULT_DISCOVERY_LANES,
@@ -109,6 +110,7 @@ BNL_ACTIVE_BATCHING_ENABLED = os.getenv("BNL_ACTIVE_BATCHING_ENABLED", "false").
 BNL_TYPING_INDICATOR_ENABLED = os.getenv("BNL_TYPING_INDICATOR_ENABLED", "false").strip().lower() in {"true", "1", "on"}
 BNL_TYPING_INDICATOR_COOLDOWN_SECONDS = max(8, int(os.getenv("BNL_TYPING_INDICATOR_COOLDOWN_SECONDS", "12") or 12))
 BNL_WEBSITE_RELAY_INTERVAL_MINUTES = max(1, int(os.getenv("BNL_WEBSITE_RELAY_INTERVAL_MINUTES", "20")))
+BNL_WEBSITE_RELAY_GENERATION_TIMEOUT_SECONDS = max(1.0, float(os.getenv("BNL_WEBSITE_RELAY_GENERATION_TIMEOUT_SECONDS", "25") or 25))
 BNL_PRIMARY_GUILD_ID = int(os.getenv("BNL_PRIMARY_GUILD_ID", "0") or 0)
 BNL_FORCE_PULL_SHARED_SECRET = os.getenv("BNL_FORCE_PULL_SHARED_SECRET", "").strip()
 BNL_FORCE_PULL_PORT = int(os.getenv("BNL_FORCE_PULL_PORT", "8787") or 8787)
@@ -2011,6 +2013,20 @@ def build_website_read_model_intent_response(intent: str, request_text: str) -> 
         return build_website_public_safe_candidate_response(read_model, request_text)
     return build_website_read_model_classifier_response(read_model, request_text)
 
+async def update_website_status_controlled_async(mode: str, message: str, status: str = "ONLINE", force: bool = False, current_directive: str = "", source: str = "relay", admin_note: str = "") -> bool:
+    logging.info(f"website_status_push_offloaded source={source} mode={mode}")
+    return await asyncio.to_thread(
+        update_website_status_controlled,
+        mode=mode,
+        message=message,
+        status=status,
+        force=force,
+        current_directive=current_directive,
+        source=source,
+        admin_note=admin_note,
+    )
+
+
 def update_website_status_controlled(mode: str, message: str, status: str = "ONLINE", force: bool = False, current_directive: str = "", source: str = "relay", admin_note: str = "") -> bool:
     global _last_website_status_mode, _last_website_status_message, _last_website_directive, _last_website_status_at, _missing_status_key_warned
 
@@ -2150,6 +2166,7 @@ _recent_weak_context_modes: dict[int, list[str]] = {}
 _last_relay_lane_by_guild: dict[int, str] = {}
 _recent_relay_lanes_by_guild = defaultdict(lambda: deque(maxlen=8))
 _last_relay_metadata_by_guild: dict[int, dict] = {}
+_website_relay_generation_tasks_by_guild: dict[int, asyncio.Task] = {}
 RELAY_ANGLE_ROTATION = [
     "whisper",
     "wonder",
@@ -2207,7 +2224,7 @@ async def _run_force_pull_relay_update(guild_id: int, request_id: str = ""):
     logging.info(f"Force-pull background relay update started guild={guild_id}{tag}")
     try:
         mode, relay_message, directive, _relay_meta = await generate_dynamic_website_relay(guild_id)
-        ok = update_website_status_controlled(
+        ok = await update_website_status_controlled_async(
             mode=mode,
             message=relay_message,
             status="ONLINE",
@@ -3213,7 +3230,7 @@ async def request_fresh_website_relay(guild_id: int, *, force: bool = True) -> t
         sanitized = fit_complete_statement(relay_message, limit=360, min_chars=0, fallback=_weak_context_relay_message(target_guild_id, signal_summary="", relay_context=""))
         sanitized_directive = fit_complete_statement(directive, limit=220, min_chars=120, fallback=random.choice(RELAY_DIRECTIVE_FALLBACKS))
         admin_note = build_admin_note(mode=mode, message=sanitized, current_directive=sanitized_directive, source="relay", compact=not force) if force else ""
-        ok = update_website_status_controlled(
+        ok = await update_website_status_controlled_async(
             mode=mode,
             message=sanitized,
             status="ONLINE",
@@ -10201,6 +10218,16 @@ def _gemini_model_resource_name(model_name: str) -> str:
         return model_name
     return f"models/{model_name}"
 
+async def _generate_gemini_content_with_fallback_async(contents: str, route: str):
+    started = time.monotonic()
+    logging.info(f"gemini_generation_offloaded route={route}")
+    try:
+        return await asyncio.to_thread(_generate_gemini_content_with_fallback, contents, route)
+    finally:
+        elapsed = time.monotonic() - started
+        logging.info(f"gemini_generation_completed route={route} elapsed_seconds={elapsed:.3f}")
+
+
 def _generate_gemini_content_with_fallback(contents: str, route: str):
     logging.info(f"gemini_model_attempt model={GEMINI_MODEL} route={route}")
     try:
@@ -10413,7 +10440,7 @@ async def get_gemini_response(prompt: str, user_id: int, guild_id: int, route: s
 
         User: {prompt}
         BNL-01:"""
-        response = _generate_gemini_content_with_fallback(request_contents, route)
+        response = await _generate_gemini_content_with_fallback_async(request_contents, route)
 
         text, tokens = _extract_text_and_tokens(response)
 
@@ -10455,7 +10482,7 @@ async def get_gemini_response(prompt: str, user_id: int, guild_id: int, route: s
         {text}
         """
 
-            glitch_response = _generate_gemini_content_with_fallback(glitch_prompt, "glitch_rewrite")
+            glitch_response = await _generate_gemini_content_with_fallback_async(glitch_prompt, "glitch_rewrite")
 
             glitch_text, _ = _extract_text_and_tokens(glitch_response)
 
@@ -10466,7 +10493,7 @@ async def get_gemini_response(prompt: str, user_id: int, guild_id: int, route: s
                     logging.info("glitch_rewrite_rejected reason=public_operator_causality_claim")
                 else:
                     text = glitch_text
-                    update_website_status_controlled(
+                    await update_website_status_controlled_async(
                         mode="SIGNAL_DEGRADATION",
                         message="Signal degradation detected. Liaison output may fluctuate.",
                         status="ONLINE",
@@ -10501,7 +10528,7 @@ async def get_gemini_response(prompt: str, user_id: int, guild_id: int, route: s
         {text}
         """
 
-            bleed_response = _generate_gemini_content_with_fallback(bleed_prompt, "cross_universe_bleed")
+            bleed_response = await _generate_gemini_content_with_fallback_async(bleed_prompt, "cross_universe_bleed")
             bleed_text, _ = _extract_text_and_tokens(bleed_response)
             if bleed_text:
                 if contains_fake_lookup_claim(bleed_text) and not contains_fake_lookup_claim(text):
@@ -11026,8 +11053,92 @@ async def barcode_radio_queue_task():
                     logging.error(f"Show-day Discord update failed (guild {guild.id}, {phase_key}): {e}")
             mode = "RESTRICTED" if phase_key == "sponsor_window" else "ACTIVE_LIAISON"
             if flags.get("websiteRelayEnabled", True):
-                update_website_status_controlled(mode=mode, message=fit_complete_statement(website_msg, limit=360, min_chars=220, fallback=_pick_varied_fallback(phase_key)), status="ONLINE", force=True)
+                await update_website_status_controlled_async(mode=mode, message=fit_complete_statement(website_msg, limit=360, min_chars=220, fallback=_pick_varied_fallback(phase_key)), status="ONLINE", force=True)
             mark_show_update_fired(guild.id, show_date, phase_key, discord_sent, website_msg)
+
+def _build_website_relay_timeout_fallback(guild_id: int) -> tuple[str, str, str, dict]:
+    relay_message = fit_complete_statement(
+        _pick_varied_relay_fallback(_last_website_status_message),
+        limit=360,
+        min_chars=0,
+        fallback=RELAY_WEAK_CONTEXT_STANDBY_MESSAGE,
+    )
+    directive = fit_complete_statement(
+        RELAY_WEAK_CONTEXT_STANDBY_DIRECTIVE,
+        limit=220,
+        min_chars=120,
+        fallback=RELAY_WEAK_CONTEXT_STANDBY_DIRECTIVE,
+    )
+    metadata = {
+        "context_is_strong": False,
+        "reason": "relay_generation_timeout",
+        "has_specific_context": False,
+        "source_message_count": 0,
+        "source_speaker_count": 0,
+        "source_channel_count": 0,
+        "attribution_context_format": "timeout_fallback",
+        "eligible_policies": [],
+        "relay_lane": "network_posture",
+        "relay_lane_reason": "relay_generation_timeout",
+        "dormant_signal_enabled": False,
+        "is_weak_fallback": True,
+        "is_low_signal_dynamic": False,
+    }
+    _last_relay_metadata_by_guild[guild_id] = dict(metadata)
+    return "OBSERVATION", relay_message, directive, metadata
+
+
+async def _generate_website_relay_guarded(guild_id: int) -> tuple[str, str, str, dict] | None:
+    existing = _website_relay_generation_tasks_by_guild.get(guild_id)
+    if existing and not existing.done():
+        logging.info(f"website_relay_generation_skipped_inflight guild={guild_id}")
+        return None
+    if existing and existing.done():
+        _website_relay_generation_tasks_by_guild.pop(guild_id, None)
+
+    started = time.monotonic()
+    state = {"timed_out": False}
+    task = asyncio.create_task(generate_dynamic_website_relay(guild_id))
+    _website_relay_generation_tasks_by_guild[guild_id] = task
+    logging.info(f"website_relay_generation_started guild={guild_id}")
+
+    def _clear_inflight(done_task: asyncio.Task, done_guild_id: int = guild_id) -> None:
+        if _website_relay_generation_tasks_by_guild.get(done_guild_id) is done_task:
+            _website_relay_generation_tasks_by_guild.pop(done_guild_id, None)
+        try:
+            exc = done_task.exception()
+        except asyncio.CancelledError:
+            exc = None
+        if state["timed_out"]:
+            elapsed = time.monotonic() - started
+            if exc:
+                logging.warning(f"website_relay_generation_completed guild={done_guild_id} elapsed_seconds={elapsed:.3f} status=late_after_timeout error={exc}")
+            else:
+                logging.info(f"website_relay_generation_completed guild={done_guild_id} elapsed_seconds={elapsed:.3f} status=late_after_timeout")
+
+    task.add_done_callback(_clear_inflight)
+
+    try:
+        result = await asyncio.wait_for(
+            asyncio.shield(task),
+            timeout=BNL_WEBSITE_RELAY_GENERATION_TIMEOUT_SECONDS,
+        )
+        elapsed = time.monotonic() - started
+        logging.info(f"website_relay_generation_completed guild={guild_id} elapsed_seconds={elapsed:.3f}")
+        return result
+    except asyncio.TimeoutError:
+        state["timed_out"] = True
+        elapsed = time.monotonic() - started
+        logging.warning(
+            f"website_relay_generation_timeout guild={guild_id} elapsed_seconds={elapsed:.3f} "
+            f"timeout_seconds={BNL_WEBSITE_RELAY_GENERATION_TIMEOUT_SECONDS:.1f}"
+        )
+        return _build_website_relay_timeout_fallback(guild_id)
+    except Exception as e:
+        elapsed = time.monotonic() - started
+        logging.warning(f"website_relay_generation_completed guild={guild_id} elapsed_seconds={elapsed:.3f} status=failed error={e}")
+        return _build_website_relay_timeout_fallback(guild_id)
+
 
 @tasks.loop(minutes=1)
 async def website_relay_task():
@@ -11054,7 +11165,10 @@ async def website_relay_task():
         if relay_eligibility == "no":
             continue
         logging.info(f"⏲️ website_relay_task tick guild={guild.id} active_channel={active_channel_id}.")
-        mode, relay_message, directive, relay_meta = await generate_dynamic_website_relay(guild.id)
+        guarded_result = await _generate_website_relay_guarded(guild.id)
+        if guarded_result is None:
+            continue
+        mode, relay_message, directive, relay_meta = guarded_result
         logging.info(f"📤 website_relay_task prepared mode={mode} preview={relay_message[:120]!r}")
         elapsed = (datetime.now(PACIFIC_TZ) - _last_website_status_at).total_seconds() if _last_website_status_at else 0.0
         weak_quiet = (
@@ -11076,7 +11190,7 @@ async def website_relay_task():
                 f"source_channel_count={relay_meta.get('source_channel_count', 0)}"
             )
             continue
-        update_website_status_controlled(mode=mode, message=relay_message, status="ONLINE", current_directive=directive, source="relay")
+        await update_website_status_controlled_async(mode=mode, message=relay_message, status="ONLINE", current_directive=directive, source="relay")
 
 # ==================== BATCHED REPLY SYSTEM (ACTIVE CHANNEL ONLY) ====================
 
