@@ -167,6 +167,43 @@ class SubjectAndTopicDriftTests(unittest.TestCase):
         self.assertFalse(bnl01_bot.should_repair_media_subject_drift(text, prompt, "free_speak_media_generation"))
         self.assertFalse(bnl01_bot.should_reject_unsupported_source_authority(text, prompt, "free_speak_media_generation"))
 
+
+    def test_media_only_sender_emotional_resonance_subject_drift_repairs(self):
+        prompt = self.media_only_prompt()
+        text = "It is unusual for him to project such emotional resonance from a GIF."
+        self.assertTrue(bnl01_bot.contains_unsupported_subject_attribution(text, prompt))
+        self.assertTrue(bnl01_bot.should_repair_media_subject_drift(text, prompt, "free_speak_media_generation"))
+
+    def test_media_only_core_memory_weekly_deployments_repairs(self):
+        prompt = self.media_only_prompt()
+        text = "Perhaps a core memory from before his weekly deployments."
+        self.assertTrue(bnl01_bot.contains_unsupported_subject_attribution(text, prompt))
+        self.assertTrue(bnl01_bot.contains_unsupported_media_grounding_basis(text))
+        self.assertTrue(bnl01_bot.should_reject_unsupported_source_authority(text, prompt, "free_speak_media_generation"))
+        self.assertTrue(bnl01_bot.should_repair_media_subject_drift(text, prompt, "free_speak_media_generation"))
+
+    def test_media_only_fragmented_archive_data_explanation_repairs_without_source_context(self):
+        prompt = self.media_only_prompt()
+        text = "That GIF is probably fragmented archive data trying to explain itself."
+        self.assertTrue(bnl01_bot.contains_unsupported_media_grounding_basis(text))
+        self.assertTrue(bnl01_bot.should_reject_unsupported_source_authority(text, prompt, "free_speak_media_generation"))
+
+    def test_source_context_allows_media_grounding_basis_language(self):
+        prompt = self.media_only_prompt() + "Broadcast memory context:\n- A source note explicitly discusses fragmented archive data.\n"
+        text = "The fragmented archive data matches the supplied source note."
+        self.assertTrue(bnl01_bot.contains_unsupported_media_grounding_basis(text))
+        self.assertFalse(bnl01_bot.should_reject_unsupported_source_authority(text, prompt, "free_speak_media_generation"))
+
+    def test_explicit_user_subject_question_allows_pronoun_subject_framing(self):
+        prompt = (
+            "Current user request: is this me?\n"
+            "[Current message media context:\n- gif embed (provider=Tenor)\n]\n"
+            "User message: is this me?"
+        )
+        text = "It might be about him if he is asking whether the GIF describes him."
+        self.assertTrue(bnl01_bot.prompt_has_subject_basis(prompt))
+        self.assertFalse(bnl01_bot.should_repair_media_subject_drift(text, prompt, "free_speak_media_generation"))
+
     def test_batched_media_prompt_includes_grounding_rules(self):
         prompt = bnl01_bot._format_batched_prompt(
             [("6 Bit", "[Current message media context:\n- gif embed (provider=Tenor)\n]")], "steady", ""
@@ -223,6 +260,55 @@ class MediaGroundingRepairTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIn("not everybody knows how to do everything", text.lower())
         self.assertNotIn("weekly broadcast", text.lower())
+
+
+    async def test_free_speak_media_core_memory_deployments_regression_is_repaired(self):
+        prompt = (
+            "Current channel policy: sealed_test\n"
+            "Current user request: [Current message media context:\n- gif embed (title=not everybody knows how to do everything)\n]\n"
+        )
+        responses = [
+            gemini_response("Perhaps a core memory from before his weekly deployments.", 10),
+            gemini_response("That is the GIF doing its tiny public-service announcement. No case file required.", 8),
+        ]
+
+        async def fake_generate(_contents, _route):
+            return responses.pop(0)
+
+        with mock.patch.object(bnl01_bot, "check_quota_availability", return_value=True), \
+             mock.patch.object(bnl01_bot, "get_conversation_history", return_value=[]), \
+             mock.patch.object(bnl01_bot, "_generate_gemini_content_with_fallback_async", side_effect=fake_generate), \
+             mock.patch.object(bnl01_bot, "increment_token_usage"), \
+             mock.patch.object(bnl01_bot.random, "random", return_value=1.0):
+            text = await bnl01_bot.get_gemini_response(prompt, user_id=123, guild_id=456, route="free_speak_media_generation")
+
+        self.assertEqual(text, "That is the GIF doing its tiny public-service announcement. No case file required.")
+        self.assertNotIn("core memory", text.lower())
+        self.assertNotIn("weekly deployments", text.lower())
+
+    async def test_cross_universe_bleed_rejects_sender_subject_drift(self):
+        prompt = (
+            "Current channel policy: sealed_test\n"
+            "Current user request: [Current message media context:\n- gif embed (title=not everybody knows how to do everything)\n]\n"
+        )
+        responses = [
+            gemini_response("That lands like a cursed office-training plaque.", 10),
+            gemini_response("That lands like a cursed office-training plaque, maybe from his weekly deployments.", 8),
+        ]
+
+        async def fake_generate(_contents, _route):
+            return responses.pop(0)
+
+        with mock.patch.object(bnl01_bot, "check_quota_availability", return_value=True), \
+             mock.patch.object(bnl01_bot, "get_conversation_history", return_value=[]), \
+             mock.patch.object(bnl01_bot, "_generate_gemini_content_with_fallback_async", side_effect=fake_generate) as generate, \
+             mock.patch.object(bnl01_bot, "increment_token_usage"), \
+             mock.patch.object(bnl01_bot.random, "random", side_effect=[1.0, 0.0]):
+            text = await bnl01_bot.get_gemini_response(prompt, user_id=123, guild_id=456, route="free_speak_media_generation")
+
+        self.assertEqual(text, "That lands like a cursed office-training plaque.")
+        self.assertNotIn("weekly deployments", text.lower())
+        self.assertEqual([call.args[1] for call in generate.await_args_list], ["free_speak_media_generation", "cross_universe_bleed"])
 
     async def test_glitch_rewrite_rejects_added_source_authority(self):
         responses = [

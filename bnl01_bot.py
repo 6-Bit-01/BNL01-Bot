@@ -10310,6 +10310,36 @@ SOURCE_AUTHORITY_CLAIM_PATTERNS = (
     r"\bsystem records? indicate\b",
 )
 
+UNSUPPORTED_MEDIA_GROUNDING_BASIS_PATTERNS = (
+    r"\bfragmented archive data\b",
+    r"\bcore memory\b",
+    r"\barchive data\b",
+    r"\bmemory from before\b",
+    r"\bdeployment history\b",
+    r"\bweekly deployments\b",
+    r"\boperational history\b",
+    r"\b(?:his|her|their) (?:fragmented )?archive data\b",
+    r"\b(?:his|her|their) core memory\b",
+    r"\b(?:his|her|their) memory\b",
+    r"\b(?:his|her|their) deployments?\b",
+)
+
+UNSUPPORTED_SENDER_SUBJECT_ATTRIBUTION_PATTERNS = (
+    r"\bit is unusual for (?:him|her|them)\b",
+    r"\bfor (?:him|her|them) to project\b",
+    r"\bbefore (?:his|her|their) weekly deployments?\b",
+    r"\b(?:his|her|their) weekly deployments?\b",
+    r"\b(?:his|her|their) deployments?\b",
+    r"\b(?:his|her|their) core memory\b",
+    r"\b(?:his|her|their) memory\b",
+    r"\b(?:his|her|their) (?:fragmented )?archive data\b",
+    r"\b(?:his|her|their) personal processing\b",
+    r"\b(?:his|her|their) internal processing\b",
+    r"\b(?:his|her|their) emotional resonance\b",
+    r"\b(?:his|her|their) (?:emotional state|memory state|operational consistency|deployment history|personal capability|operational history)\b",
+    r"\b(?:him|her|them) (?:personally|processing|projecting|remembering|deploying)\b",
+)
+
 SOURCE_AUTHORITY_CONTEXT_MARKERS = (
     "broadcast memory context:",
     "broadcast memory context (cleaned summaries only):",
@@ -10356,6 +10386,11 @@ UNRELATED_MEDIA_TOPIC_DRIFT_PATTERNS = (
 def contains_unsupported_source_authority_claim(text: str) -> bool:
     lowered = (text or "").lower()
     return any(re.search(pattern, lowered) for pattern in SOURCE_AUTHORITY_CLAIM_PATTERNS)
+
+
+def contains_unsupported_media_grounding_basis(text: str) -> bool:
+    lowered = (text or "").lower()
+    return any(re.search(pattern, lowered) for pattern in UNSUPPORTED_MEDIA_GROUNDING_BASIS_PATTERNS)
 
 
 def prompt_has_source_authority_context(prompt: str) -> bool:
@@ -10454,21 +10489,26 @@ def contains_unsupported_subject_attribution(text: str, prompt: str = "") -> boo
     if prompt_has_subject_basis(prompt):
         return False
     lowered = (text or "").lower()
+    has_current_room_media = _prompt_has_current_room_media_context(prompt)
+    if any(re.search(pattern, lowered) for pattern in UNSUPPORTED_SENDER_SUBJECT_ATTRIBUTION_PATTERNS) and has_current_room_media:
+        return True
     if re.search(r"\b(his|her|their) weekly broadcast deployments\b", lowered):
         return True
     if re.search(r"\b(?:6 bit|six bit)\b.*\b(?:his|her|their)\b.*\b(?:broadcast|deployment|show|barcode radio)\b", lowered):
         return True
-    if re.search(r"\b(?:his|her|their)\b.*\b(?:broadcast|deployment|show|barcode radio)\b", lowered) and _prompt_has_current_room_media_context(prompt):
+    if re.search(r"\b(?:his|her|their)\b.*\b(?:broadcast|deployment|show|barcode radio)\b", lowered) and has_current_room_media:
         return True
-    if any(re.search(pattern, lowered) for pattern in UNRELATED_MEDIA_TOPIC_DRIFT_PATTERNS) and _prompt_has_current_room_media_context(prompt) and not _prompt_has_barcode_topic_basis(prompt):
+    if any(re.search(pattern, lowered) for pattern in UNRELATED_MEDIA_TOPIC_DRIFT_PATTERNS) and has_current_room_media and not _prompt_has_barcode_topic_basis(prompt):
         return True
     return False
 
 
 def should_reject_unsupported_source_authority(text: str, prompt: str, route: str = "") -> bool:
-    if not contains_unsupported_source_authority_claim(text):
+    if prompt_has_source_authority_context(prompt):
         return False
-    return not prompt_has_source_authority_context(prompt)
+    if contains_unsupported_source_authority_claim(text):
+        return True
+    return _prompt_has_current_room_media_context(prompt, route) and contains_unsupported_media_grounding_basis(text)
 
 
 def should_repair_media_subject_drift(text: str, prompt: str, route: str = "") -> bool:
@@ -10558,6 +10598,7 @@ Rules:
 - Keep the same basic meaning and conversational intent.
 - Preserve BNL's dry, strange BARCODE-flavored voice.
 - Remove unsupported claims that records, archives, dossiers, scans, source files, deployments, system records, or broadcast memory prove/indicate/confirm anything.
+- Remove unsupported memory/archive/deployment basis framing such as core memory, fragmented archive data, deployment history, weekly deployments, or operational history unless source/current-room context explicitly supports it.
 - Remove unsupported claims that the poster is the subject of the meme/GIF/media.
 - Remove unrelated BARCODE Radio/show/broadcast/deployment references unless the current message/media/context explicitly supports them.
 - Respond from the current message/media and nearby room context only.
@@ -10742,7 +10783,14 @@ async def get_gemini_response(prompt: str, user_id: int, guild_id: int, route: s
                 if contains_fake_lookup_claim(glitch_text) and not contains_fake_lookup_claim(text):
                     logging.info("glitch_rewrite_rejected reason=fake_lookup_claim")
                 elif should_reject_unsupported_source_authority(glitch_text, prompt, route) and not should_reject_unsupported_source_authority(text, prompt, route):
-                    logging.info("glitch_rewrite_rejected reason=unsupported_source_authority route=%s", route)
+                    glitch_subject_drift = should_repair_media_subject_drift(glitch_text, prompt, route)
+                    glitch_media_basis = _prompt_has_current_room_media_context(prompt, route) and contains_unsupported_media_grounding_basis(glitch_text) and not prompt_has_source_authority_context(prompt)
+                    if glitch_subject_drift:
+                        logging.info("glitch_rewrite_rejected reason=unsupported_subject_attribution route=%s", route)
+                    elif glitch_media_basis:
+                        logging.info("glitch_rewrite_rejected reason=unsupported_media_grounding_basis route=%s", route)
+                    else:
+                        logging.info("glitch_rewrite_rejected reason=unsupported_source_authority route=%s", route)
                 elif should_repair_media_subject_drift(glitch_text, prompt, route) and not should_repair_media_subject_drift(text, prompt, route):
                     logging.info("glitch_rewrite_rejected reason=unsupported_subject_attribution route=%s", route)
                 elif public_authority_guard_active and contains_operator_causality_claim(glitch_text) and not contains_operator_causality_claim(text):
@@ -10790,28 +10838,40 @@ async def get_gemini_response(prompt: str, user_id: int, guild_id: int, route: s
                 if contains_fake_lookup_claim(bleed_text) and not contains_fake_lookup_claim(text):
                     logging.info("glitch_rewrite_rejected reason=fake_lookup_claim route=cross_universe_bleed")
                 elif should_reject_unsupported_source_authority(bleed_text, prompt, route) and not should_reject_unsupported_source_authority(text, prompt, route):
-                    logging.info("glitch_rewrite_rejected reason=unsupported_source_authority route=cross_universe_bleed original_route=%s", route)
+                    bleed_subject_drift = should_repair_media_subject_drift(bleed_text, prompt, route)
+                    bleed_media_basis = _prompt_has_current_room_media_context(prompt, route) and contains_unsupported_media_grounding_basis(bleed_text) and not prompt_has_source_authority_context(prompt)
+                    if bleed_subject_drift:
+                        logging.info("cross_universe_bleed_rejected reason=unsupported_subject_attribution route=cross_universe_bleed original_route=%s", route)
+                    elif bleed_media_basis:
+                        logging.info("cross_universe_bleed_rejected reason=unsupported_media_grounding_basis route=cross_universe_bleed original_route=%s", route)
+                    else:
+                        logging.info("cross_universe_bleed_rejected reason=unsupported_source_authority route=cross_universe_bleed original_route=%s", route)
                 elif should_repair_media_subject_drift(bleed_text, prompt, route) and not should_repair_media_subject_drift(text, prompt, route):
-                    logging.info("glitch_rewrite_rejected reason=unsupported_subject_attribution route=cross_universe_bleed original_route=%s", route)
+                    logging.info("cross_universe_bleed_rejected reason=unsupported_subject_attribution route=cross_universe_bleed original_route=%s", route)
                 elif public_authority_guard_active and contains_operator_causality_claim(bleed_text) and not contains_operator_causality_claim(text):
                     logging.info("glitch_rewrite_rejected reason=public_operator_causality_claim route=cross_universe_bleed")
                 else:
                     text = bleed_text
 
         unsupported_source_authority = should_reject_unsupported_source_authority(text, prompt, route)
+        unsupported_media_grounding_basis = current_room_media_context_present and contains_unsupported_media_grounding_basis(text) and not source_authority_context_present
         unsupported_subject_attribution = should_repair_media_subject_drift(text, prompt, route)
         if contains_unsupported_source_authority_claim(text) and source_authority_context_present:
             logging.info("unsupported_source_authority_claim_allowed reason=source_context_present route=%s channel_policy=%s source_context_present=1", route, _extract_channel_policy_from_prompt(prompt))
-        if unsupported_source_authority:
+        if unsupported_source_authority and contains_unsupported_source_authority_claim(text):
             logging.info("unsupported_source_authority_claim_detected route=%s channel_policy=%s source_context_present=0", route, _extract_channel_policy_from_prompt(prompt))
+        if unsupported_media_grounding_basis:
+            logging.info("unsupported_media_grounding_basis_detected route=%s channel_policy=%s source_context_present=0", route, _extract_channel_policy_from_prompt(prompt))
         if unsupported_subject_attribution:
             logging.info("unsupported_subject_attribution_detected route=%s channel_policy=%s source_context_present=%s", route, _extract_channel_policy_from_prompt(prompt), int(source_authority_context_present))
         if (unsupported_source_authority or unsupported_subject_attribution) and current_room_media_context_present:
             logging.info("media_response_grounding_repair route=%s channel_policy=%s source_context_present=%s repaired=0 hard_fallbacked=0", route, _extract_channel_policy_from_prompt(prompt), int(source_authority_context_present))
             repaired = await _repair_current_room_media_grounding_response(text, prompt, route)
             if repaired:
-                if unsupported_source_authority:
+                if unsupported_source_authority and contains_unsupported_source_authority_claim(text):
                     logging.info("unsupported_source_authority_claim_repaired route=%s channel_policy=%s source_context_present=0 repaired=1 hard_fallbacked=0", route, _extract_channel_policy_from_prompt(prompt))
+                if unsupported_media_grounding_basis:
+                    logging.info("unsupported_media_grounding_basis_repaired route=%s channel_policy=%s source_context_present=0 repaired=1 hard_fallbacked=0", route, _extract_channel_policy_from_prompt(prompt))
                 if unsupported_subject_attribution:
                     logging.info("unsupported_subject_attribution_repaired route=%s channel_policy=%s source_context_present=%s repaired=1 hard_fallbacked=0", route, _extract_channel_policy_from_prompt(prompt), int(source_authority_context_present))
                 return repaired
