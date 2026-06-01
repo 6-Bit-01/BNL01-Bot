@@ -8072,6 +8072,65 @@ def _free_speak_ack_resolution(decision: str, reason: str, items, channel_policy
     return "observe", "free_speak_canned_ack_suppressed", diagnostics
 
 
+def _batch_ack_resolution_details(original_decision: str, original_reason: str, resolved_decision: str, resolved_reason: str, diagnostics: dict, channel_policy: str) -> str:
+    conversation_surface = conversation_surface_for_channel_policy(channel_policy)
+    return (
+        f"original_decision={original_decision};original_reason={original_reason};"
+        f"resolved_decision={resolved_decision};resolved_reason={resolved_reason};"
+        f"canned_ack_suppressed={int(diagnostics.get('canned_ack_suppressed', False))};"
+        f"ack_converted_to_observe={int(diagnostics.get('ack_converted_to_observe', False))};"
+        f"ack_escalated_to_generation={int(diagnostics.get('ack_escalated_to_generation', False))};"
+        f"media_present={int(diagnostics.get('media_present', False))};"
+        f"media_context_included={int(diagnostics.get('media_context_included', False))};"
+        f"media_item_count={diagnostics.get('media_item_count', 0)};"
+        f"conversation_surface={conversation_surface};channel_policy={channel_policy}"
+    )
+
+
+def resolve_batch_acknowledgement_decision(
+    decision: str,
+    reason: str,
+    items,
+    channel_policy: str,
+    *,
+    payload_count: int = 0,
+    has_structured_intent: bool = False,
+    guild_id: int | None = None,
+    channel_id: int | None = None,
+    message_count: int | None = None,
+) -> tuple[str, str, dict]:
+    original_decision = decision
+    original_reason = reason
+    resolved_decision, resolved_reason, diagnostics = _free_speak_ack_resolution(
+        decision,
+        reason,
+        items,
+        channel_policy,
+        payload_count=payload_count,
+        has_structured_intent=has_structured_intent,
+    )
+    diagnostics.update({
+        "original_decision": original_decision,
+        "original_reason": original_reason,
+        "resolved_decision": resolved_decision,
+        "resolved_reason": resolved_reason,
+        "conversation_surface": conversation_surface_for_channel_policy(channel_policy),
+        "channel_policy": channel_policy,
+    })
+    if original_decision == "acknowledge" and diagnostics.get("canned_ack_suppressed") and guild_id is not None and channel_id is not None:
+        count = len(items or []) if message_count is None else message_count
+        details = _batch_ack_resolution_details(
+            original_decision,
+            original_reason,
+            resolved_decision,
+            resolved_reason,
+            diagnostics,
+            channel_policy,
+        )
+        _log_batch_event(logging.INFO, "free_speak_ack_resolution", guild_id, channel_id, count, details)
+        _log_batch_event(logging.INFO, "free_speak_canned_ack_suppressed", guild_id, channel_id, count, details)
+    return resolved_decision, resolved_reason, diagnostics
+
 def _extract_member_activity_event_from_text(text: str, source_author: str = "") -> dict:
     if not text:
         return {}
@@ -11625,6 +11684,20 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
         _log_batch_event(logging.INFO, "active_packet_collapsed_count", guild_id, channel_id, active_packet["collapsed_count"], f"collapsed_count={active_packet['collapsed_count']}")
         _log_batch_event(logging.INFO, "active_packet_built", guild_id, channel_id, active_packet["collapsed_count"], f"original_count={active_packet['original_count']};collapsed_count={active_packet['collapsed_count']};payload_count={payload_count};decision={decision};reason={reason}")
         _log_batch_event(logging.INFO, "active_packet_payload_items", guild_id, channel_id, active_packet["collapsed_count"], f"payload_count={payload_count}")
+        if decision == "acknowledge":
+            decision, reason, ack_diag = resolve_batch_acknowledgement_decision(
+                decision,
+                reason,
+                collapsed_items,
+                channel_policy,
+                payload_count=payload_count,
+                has_structured_intent=bool(active_packet.get("has_structured_intent")),
+                guild_id=guild_id,
+                channel_id=channel_id,
+                message_count=len(collapsed_items),
+            )
+        else:
+            ack_diag = {}
         if payload_count > 0 and decision != "answer":
             _log_batch_event(logging.INFO, "payload_items_force_answer", guild_id, channel_id, len(collapsed_items), f"message_count={len(collapsed_items)};payload_count={payload_count}")
             _log_batch_event(logging.INFO, "payload_force_answer_preserved_request_action", guild_id, channel_id, len(collapsed_items), f"payload_count={payload_count};request_action={active_packet.get('request_action','generic_request')}")
@@ -11644,7 +11717,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
             _log_batch_event(logging.INFO, "request_intent_detected", guild_id, channel_id, len(collapsed_items), f"reason={reason}")
         if reason.startswith("request_payload_expected:"):
             _log_batch_event(logging.INFO, "request_payload_phrase_detected", guild_id, channel_id, len(collapsed_items), f"reason={reason}")
-        _log_batch_event(logging.INFO, "batch_engagement_decision", guild_id, channel_id, len(collapsed_items), f"decision={decision};reason={reason}")
+        _log_batch_event(logging.INFO, "batch_engagement_decision", guild_id, channel_id, len(collapsed_items), f"decision={decision};reason={reason};original_decision={ack_diag.get('original_decision', decision)};original_reason={ack_diag.get('original_reason', reason)};resolved_decision={ack_diag.get('resolved_decision', decision)};resolved_reason={ack_diag.get('resolved_reason', reason)};canned_ack_suppressed={int(ack_diag.get('canned_ack_suppressed', False))};ack_converted_to_observe={int(ack_diag.get('ack_converted_to_observe', False))};ack_escalated_to_generation={int(ack_diag.get('ack_escalated_to_generation', False))};media_present={int(ack_diag.get('media_present', active_packet.get('media_present', False)))};media_context_included={int(ack_diag.get('media_context_included', active_packet.get('media_context_included', False)))};media_item_count={ack_diag.get('media_item_count', active_packet.get('media_item_count', 0))};conversation_surface={conversation_surface_for_channel_policy(channel_policy)};channel_policy={channel_policy}")
         if decision in ("skip", "observe"):
             _log_batch_event(logging.INFO, "batch_response_skipped", guild_id, channel_id, len(collapsed_items), "no_response_needed")
             return
@@ -11704,6 +11777,20 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
             _log_batch_event(logging.INFO, "active_packet_collapsed_count", guild_id, channel_id, active_packet["collapsed_count"], f"collapsed_count={active_packet['collapsed_count']}")
             _log_batch_event(logging.INFO, "active_packet_built", guild_id, channel_id, active_packet["collapsed_count"], f"original_count={active_packet['original_count']};collapsed_count={active_packet['collapsed_count']};payload_count={payload_count};decision={decision};reason={reason}")
             _log_batch_event(logging.INFO, "active_packet_payload_items", guild_id, channel_id, active_packet["collapsed_count"], f"payload_count={payload_count}")
+            if decision == "acknowledge":
+                decision, reason, ack_diag = resolve_batch_acknowledgement_decision(
+                    decision,
+                    reason,
+                    collapsed_items,
+                    channel_policy,
+                    payload_count=payload_count,
+                    has_structured_intent=bool(active_packet.get("has_structured_intent")),
+                    guild_id=guild_id,
+                    channel_id=channel_id,
+                    message_count=len(collapsed_items),
+                )
+            else:
+                ack_diag = {}
             if payload_count > 0 and decision != "answer":
                 _log_batch_event(logging.INFO, "payload_items_force_answer", guild_id, channel_id, len(collapsed_items), f"message_count={len(collapsed_items)};payload_count={payload_count}")
                 _log_batch_event(logging.INFO, "payload_force_answer_preserved_request_action", guild_id, channel_id, len(collapsed_items), f"payload_count={payload_count};request_action={active_packet.get('request_action','generic_request')}")
@@ -11725,25 +11812,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                 _log_batch_event(logging.INFO, "request_intent_detected", guild_id, channel_id, len(collapsed_items), f"reason={reason}")
             if reason.startswith("request_payload_expected:"):
                 _log_batch_event(logging.INFO, "request_payload_phrase_detected", guild_id, channel_id, len(collapsed_items), f"reason={reason}")
-            ack_original_decision = decision
-            decision, reason, ack_diag = _free_speak_ack_resolution(
-                decision,
-                reason,
-                collapsed_items,
-                channel_policy,
-                payload_count=payload_count,
-                has_structured_intent=bool(active_packet.get("has_structured_intent")),
-            )
-            if ack_diag.get("canned_ack_suppressed"):
-                _log_batch_event(
-                    logging.INFO,
-                    "free_speak_canned_ack_suppressed",
-                    guild_id,
-                    channel_id,
-                    len(collapsed_items),
-                    f"ack_converted_to_observe={int(ack_diag.get('ack_converted_to_observe'))};ack_escalated_to_generation={int(ack_diag.get('ack_escalated_to_generation'))};media_present={int(ack_diag.get('media_present'))};media_context_included={int(ack_diag.get('media_context_included'))};media_item_count={ack_diag.get('media_item_count', 0)};reason={reason}",
-                )
-            _log_batch_event(logging.INFO, "batch_engagement_decision", guild_id, channel_id, len(collapsed_items), f"decision={decision};reason={reason};batch_ack_decision={ack_original_decision};canned_ack_suppressed={int(ack_diag.get('canned_ack_suppressed', False))};media_present={int(active_packet.get('media_present', False))};media_context_included={int(active_packet.get('media_context_included', False))};media_item_count={active_packet.get('media_item_count', 0)}")
+            _log_batch_event(logging.INFO, "batch_engagement_decision", guild_id, channel_id, len(collapsed_items), f"decision={decision};reason={reason};original_decision={ack_diag.get('original_decision', decision)};original_reason={ack_diag.get('original_reason', reason)};resolved_decision={ack_diag.get('resolved_decision', decision)};resolved_reason={ack_diag.get('resolved_reason', reason)};canned_ack_suppressed={int(ack_diag.get('canned_ack_suppressed', False))};ack_converted_to_observe={int(ack_diag.get('ack_converted_to_observe', False))};ack_escalated_to_generation={int(ack_diag.get('ack_escalated_to_generation', False))};media_present={int(ack_diag.get('media_present', active_packet.get('media_present', False)))};media_context_included={int(ack_diag.get('media_context_included', active_packet.get('media_context_included', False)))};media_item_count={ack_diag.get('media_item_count', active_packet.get('media_item_count', 0))};conversation_surface={conversation_surface_for_channel_policy(channel_policy)};channel_policy={channel_policy}")
             if decision in ("skip", "observe"):
                 _log_batch_event(logging.INFO, "batch_response_skipped", guild_id, channel_id, len(collapsed_items), "no_response_needed")
                 return

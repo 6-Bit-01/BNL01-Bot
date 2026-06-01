@@ -1,6 +1,7 @@
 import os
 import tempfile
 import unittest
+from unittest import mock
 
 os.environ.setdefault("GEMINI_API_KEY", "test-gemini-key")
 os.environ.setdefault("DISCORD_BOT_TOKEN", "test-discord-token")
@@ -669,6 +670,93 @@ class MediaAwareBatchAckTests(unittest.TestCase):
         self.assertEqual(resolved_decision, "answer")
         self.assertEqual(resolved_reason, "free_speak_media_context_generation")
         self.assertTrue(diag["ack_escalated_to_generation"])
+
+    def test_resolve_batch_acknowledgement_routes_first_free_speak_media_ack(self):
+        items = [(
+            "Crow",
+            bnl01_bot.append_media_context_to_text(
+                "",
+                {
+                    "items": ["gif embed (provider=Tenor; preview=yes)"],
+                    "prompt_text": "- gif embed (provider=Tenor; preview=yes)",
+                },
+            ),
+            101,
+        )]
+        decision, reason = bnl01_bot._classify_batch_engagement(items)
+        self.assertEqual(decision, "acknowledge")
+        with mock.patch.object(bnl01_bot, "_build_acknowledgement_response", wraps=bnl01_bot._build_acknowledgement_response) as ack_builder:
+            with mock.patch.object(bnl01_bot, "_log_batch_event") as batch_log:
+                resolved_decision, resolved_reason, diag = bnl01_bot.resolve_batch_acknowledgement_decision(
+                    decision,
+                    reason,
+                    items,
+                    "sealed_test",
+                    guild_id=1,
+                    channel_id=2,
+                    message_count=len(items),
+                )
+        self.assertEqual(resolved_decision, "observe")
+        self.assertEqual(resolved_reason, "free_speak_canned_ack_suppressed")
+        self.assertTrue(diag["canned_ack_suppressed"])
+        self.assertTrue(diag["ack_converted_to_observe"])
+        self.assertEqual(diag["original_decision"], "acknowledge")
+        self.assertEqual(diag["original_reason"], "light_media_reaction_cluster")
+        self.assertEqual(diag["resolved_decision"], "observe")
+        self.assertEqual(diag["conversation_surface"], bnl01_bot.CONVERSATION_SURFACE_FREE_SPEAK_SEALED_MIRROR)
+        ack_builder.assert_not_called()
+        logged_events = [call.args[1] for call in batch_log.call_args_list]
+        self.assertIn("free_speak_ack_resolution", logged_events)
+        self.assertIn("free_speak_canned_ack_suppressed", logged_events)
+        joined_details = " ".join(call.args[5] for call in batch_log.call_args_list)
+        self.assertIn("original_decision=acknowledge", joined_details)
+        self.assertIn("original_reason=light_media_reaction_cluster", joined_details)
+        self.assertIn("resolved_decision=observe", joined_details)
+        self.assertIn("ack_converted_to_observe=1", joined_details)
+        self.assertIn("media_present=1", joined_details)
+        self.assertIn("media_context_included=1", joined_details)
+        self.assertIn("channel_policy=sealed_test", joined_details)
+
+    def test_resolve_batch_acknowledgement_escalates_structured_free_speak_context(self):
+        items = [("Crow", "testing diagnostics with enough detail to require acknowledgement", 101)]
+        with mock.patch.object(bnl01_bot, "_log_batch_event") as batch_log:
+            resolved_decision, resolved_reason, diag = bnl01_bot.resolve_batch_acknowledgement_decision(
+                "acknowledge",
+                "light_fragment_or_test_cluster",
+                items,
+                "public_home",
+                has_structured_intent=True,
+                guild_id=1,
+                channel_id=2,
+                message_count=len(items),
+            )
+        self.assertEqual(resolved_decision, "answer")
+        self.assertEqual(resolved_reason, "free_speak_ack_structured_context_generation")
+        self.assertTrue(diag["canned_ack_suppressed"])
+        self.assertTrue(diag["ack_escalated_to_generation"])
+        self.assertFalse(diag["ack_converted_to_observe"])
+        joined_details = " ".join(call.args[5] for call in batch_log.call_args_list)
+        self.assertIn("resolved_decision=answer", joined_details)
+        self.assertIn("ack_escalated_to_generation=1", joined_details)
+        self.assertIn("conversation_surface=free_speak_public_home", joined_details)
+
+    def test_resolve_batch_acknowledgement_preserves_non_free_speak_received(self):
+        items = [("Ops", "testing diagnostics with enough detail to require acknowledgement from the utility path", 101), ("Ops", "second testing diagnostic line with enough detail", 101)]
+        with mock.patch.object(bnl01_bot, "_log_batch_event") as batch_log:
+            resolved_decision, resolved_reason, diag = bnl01_bot.resolve_batch_acknowledgement_decision(
+                "acknowledge",
+                "light_fragment_or_test_cluster",
+                items,
+                "internal_controlled",
+                guild_id=1,
+                channel_id=2,
+                message_count=len(items),
+            )
+        self.assertEqual(resolved_decision, "acknowledge")
+        self.assertEqual(resolved_reason, "light_fragment_or_test_cluster")
+        self.assertFalse(diag["canned_ack_suppressed"])
+        self.assertEqual(bnl01_bot._build_acknowledgement_response(items), "Received.")
+        batch_log.assert_not_called()
 
     def test_media_context_is_represented_in_batch_prompt_and_packet_metadata(self):
         media_text = bnl01_bot.append_media_context_to_text(
