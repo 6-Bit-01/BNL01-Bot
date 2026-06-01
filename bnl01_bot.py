@@ -10334,11 +10334,19 @@ MEDIA_CURRENT_ROOM_MARKERS = (
     "free_speak_media_generation",
 )
 
+BARCODE_WORLD_TOPIC_PATTERN = re.compile(
+    r"\b(?:cliff|barcode radio|6 bit|six bit|broadcast|show|episode|booth|host|mods?|queue|live|show[-\s]?night|6:40)\b",
+    flags=re.IGNORECASE,
+)
+
 UNRELATED_MEDIA_TOPIC_DRIFT_PATTERNS = (
     r"\bweekly broadcast deployments\b",
     r"\bbroadcast deployments?\b",
     r"\bdeployment records?\b",
     r"\bbarcode radio\b",
+    r"\bcliff\b",
+    r"\bradio booth\b",
+    r"\bthe booth\b",
     r"\bshow schedules?\b",
     r"\bshow-state\b",
     r"\bbroadcast status\b",
@@ -10367,27 +10375,77 @@ def _prompt_has_current_room_media_context(prompt: str, route: str = "") -> bool
     return any(marker in lowered for marker in MEDIA_CURRENT_ROOM_MARKERS)
 
 
+def _prompt_field_text(prompt: str, field_name: str) -> str:
+    match = re.search(rf"{re.escape(field_name)}:\s*(?P<value>.*?)(?:\n[A-Z][A-Za-z -]+:|\Z)", prompt or "", flags=re.DOTALL | re.IGNORECASE)
+    return match.group("value") if match else ""
+
+
+def _line_content_without_speaker(line: str) -> str:
+    stripped = (line or "").strip()
+    match = re.match(r"^-\s*([^:\n]{1,80}):\s*(?P<content>.*)$", stripped)
+    if match:
+        return match.group("content")
+    return stripped
+
+
+def _extract_nearby_room_topic_text(prompt: str) -> str:
+    text = prompt or ""
+    parts = []
+
+    room_match = re.search(
+        r"Recent room context from this channel:\n(?P<context>.*?)(?:\nRoom-first context rules:|\nCurrent channel:|\nGreeting policy:|\nResponse style mode:|\nDurable memory context:|\nBroadcast memory context:|\nUser name to address|\Z)",
+        text,
+        flags=re.DOTALL | re.IGNORECASE,
+    )
+    if room_match:
+        parts.append(room_match.group("context"))
+
+    messages_match = re.search(
+        r"Recent messages:\n(?P<context>.*?)(?:\nMultiline payload detected in batch:|\nRecent media context from this channel|\Z)",
+        text,
+        flags=re.DOTALL | re.IGNORECASE,
+    )
+    if messages_match:
+        # Current batched messages may include only the media poster name (for example "6 Bit:").
+        # Count the message content as topic basis, not the speaker label, so a media-only post
+        # does not become about the poster by accident.
+        message_lines = [_line_content_without_speaker(line) for line in messages_match.group("context").splitlines()]
+        parts.append("\n".join(message_lines))
+
+    recent_media_match = re.search(
+        r"Recent media context from this channel \(transient, not durable memory\):\n(?P<context>.*?)(?:\nPRIMARY REQUEST ACTION:|\Z)",
+        text,
+        flags=re.DOTALL | re.IGNORECASE,
+    )
+    if recent_media_match:
+        media_lines = [_line_content_without_speaker(line) for line in recent_media_match.group("context").splitlines()]
+        parts.append("\n".join(media_lines))
+
+    return "\n".join(part for part in parts if part).strip()
+
+
 def _prompt_has_barcode_topic_basis(prompt: str) -> bool:
-    lowered = (prompt or "").lower()
-    request_match = re.search(r"current user request:\s*(?P<request>.*?)(?:\n|$)", lowered)
-    user_msg_match = re.search(r"user message:\s*(?P<request>.*?)(?:\n|$)", lowered)
-    request_text = " ".join(m.group("request") for m in (request_match, user_msg_match) if m)
-    return bool(re.search(r"\b(6 bit|barcode radio|broadcast|show|episode|deployment|live|6:40)\b", request_text)) or prompt_has_source_authority_context(prompt)
+    request_text = " ".join(
+        _prompt_field_text(prompt, field)
+        for field in ("Current user request", "User message")
+    )
+    nearby_text = _extract_nearby_room_topic_text(prompt)
+    return bool(BARCODE_WORLD_TOPIC_PATTERN.search(request_text) or BARCODE_WORLD_TOPIC_PATTERN.search(nearby_text)) or prompt_has_source_authority_context(prompt)
 
 
 def prompt_has_subject_basis(prompt: str) -> bool:
-    lowered = (prompt or "").lower()
-    request_parts = []
-    for pattern in (r"current user request:\s*(?P<request>.*?)(?:\n|$)", r"user message:\s*(?P<request>.*?)(?:\n|$)"):
-        match = re.search(pattern, lowered)
-        if match:
-            request_parts.append(match.group("request"))
-    request_text = " ".join(request_parts)
+    request_text = " ".join(
+        _prompt_field_text(prompt, field).lower()
+        for field in ("Current user request", "User message")
+    )
+    nearby_text = _extract_nearby_room_topic_text(prompt).lower()
     if re.search(r"\b(i|me|my|myself|about me|am i|was i|do i|did i)\b", request_text):
         return True
     if re.search(r"\b(6 bit|six bit|barcode radio|host|show|broadcast|episode)\b", request_text):
         return True
     if re.search(r"\babout (?:him|her|them|the poster|the user|6 bit|six bit)\b", request_text):
+        return True
+    if re.search(r"\b(6 bit|six bit|the poster|the user)\b", nearby_text):
         return True
     return False
 

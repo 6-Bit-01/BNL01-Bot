@@ -91,6 +91,82 @@ class SubjectAndTopicDriftTests(unittest.TestCase):
             )
         )
 
+
+    def test_recent_room_context_cliff_allows_natural_cliff_riff(self):
+        prompt = (
+            self.media_only_prompt()
+            + "Recent room context from this channel:\n"
+            + "- Maze: Cliff already blamed the booth lights for that one.\n"
+            + "Room-first context rules:\n"
+        )
+        self.assertTrue(bnl01_bot._prompt_has_barcode_topic_basis(prompt))
+        self.assertFalse(
+            bnl01_bot.should_repair_media_subject_drift(
+                "Cliff would call that a booth light with commitment issues.",
+                prompt,
+                "free_speak_media_generation",
+            )
+        )
+
+    def test_recent_room_context_barcode_show_booth_allows_natural_radio_riff(self):
+        prompt = (
+            self.media_only_prompt()
+            + "Recent room context from this channel:\n"
+            + "- Nova: BARCODE Radio show-night booth energy is already leaking through the queue.\n"
+            + "Room-first context rules:\n"
+        )
+        self.assertTrue(bnl01_bot._prompt_has_barcode_topic_basis(prompt))
+        self.assertFalse(
+            bnl01_bot.should_repair_media_subject_drift(
+                "That has BARCODE Radio booth energy: one blinking light, three mods pretending it is fine.",
+                prompt,
+                "free_speak_media_generation",
+            )
+        )
+
+    def test_media_only_gif_without_nearby_barcode_context_repairs_random_show_jump(self):
+        prompt = self.media_only_prompt()
+        self.assertFalse(bnl01_bot._prompt_has_barcode_topic_basis(prompt))
+        self.assertTrue(
+            bnl01_bot.should_repair_media_subject_drift(
+                "That is obviously BARCODE Radio show-night booth energy.",
+                prompt,
+                "free_speak_media_generation",
+            )
+        )
+
+    def test_recent_media_author_name_alone_does_not_create_barcode_topic_basis(self):
+        prompt = (
+            self.media_only_prompt()
+            + "Recent media context from this channel (transient, not durable memory):\n"
+            + "- 6 Bit: gif embed (provider=Tenor; preview=yes) (BNL observed; visibility=transient)\n"
+        )
+        self.assertFalse(bnl01_bot._prompt_has_barcode_topic_basis(prompt))
+        self.assertTrue(
+            bnl01_bot.should_repair_media_subject_drift(
+                "BARCODE Radio clearly has a show-schedule problem here.",
+                prompt,
+                "free_speak_media_generation",
+            )
+        )
+
+    def test_source_evidence_plus_poster_deployment_report_still_repairs(self):
+        prompt = self.media_only_prompt()
+        text = "Archival records indicate his weekly broadcast deployments explain the GIF."
+        self.assertTrue(bnl01_bot.should_reject_unsupported_source_authority(text, prompt, "free_speak_media_generation"))
+        self.assertTrue(bnl01_bot.should_repair_media_subject_drift(text, prompt, "free_speak_media_generation"))
+
+    def test_natural_barcode_radio_joke_allowed_when_room_context_supports_it(self):
+        prompt = (
+            self.media_only_prompt()
+            + "Recent room context from this channel:\n"
+            + "- Operator: The BARCODE Radio booth and the mods are already arguing with the queue.\n"
+            + "Room-first context rules:\n"
+        )
+        text = "That is BARCODE Radio booth energy: the queue coughed once and the mods heard a prophecy."
+        self.assertFalse(bnl01_bot.should_repair_media_subject_drift(text, prompt, "free_speak_media_generation"))
+        self.assertFalse(bnl01_bot.should_reject_unsupported_source_authority(text, prompt, "free_speak_media_generation"))
+
     def test_batched_media_prompt_includes_grounding_rules(self):
         prompt = bnl01_bot._format_batched_prompt(
             [("6 Bit", "[Current message media context:\n- gif embed (provider=Tenor)\n]")], "steady", ""
