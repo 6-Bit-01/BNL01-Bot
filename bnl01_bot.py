@@ -10393,6 +10393,8 @@ MEDIA_CURRENT_ROOM_MARKERS = (
     "free_speak_media_generation",
 )
 
+RECENT_MEDIA_CONTEXT_MARKER = "recent media context from this channel"
+
 MEDIA_MEMORY_RECALL_LEAK_PATTERNS = (
     r"\byour recent gif\b",
     r"\brecent gif\b",
@@ -10464,9 +10466,17 @@ def _prompt_has_current_message_media_context(prompt: str) -> bool:
     return "[current message media context:" in (prompt or "").lower()
 
 
+def _prompt_has_recent_media_context(prompt: str) -> bool:
+    return RECENT_MEDIA_CONTEXT_MARKER in (prompt or "").lower()
+
+
 def _route_is_current_media_generation(route: str) -> bool:
     route_l = (route or "").lower()
     return any(route_l == known or known in route_l for known in CURRENT_MEDIA_GENERATION_ROUTES)
+
+
+def _is_current_message_media_repair_scope(prompt: str, route: str = "") -> bool:
+    return _route_is_current_media_generation(route) and _prompt_has_current_message_media_context(prompt)
 
 
 def contains_media_memory_recall_leak(text: str) -> bool:
@@ -10586,7 +10596,7 @@ def contains_unsupported_subject_attribution(text: str, prompt: str = "") -> boo
     if prompt_has_subject_basis(prompt):
         return False
     lowered = (text or "").lower()
-    has_current_room_media = _prompt_has_current_room_media_context(prompt)
+    has_current_room_media = _prompt_has_current_message_media_context(prompt)
     if any(re.search(pattern, lowered) for pattern in UNSUPPORTED_SENDER_SUBJECT_ATTRIBUTION_PATTERNS) and has_current_room_media:
         return True
     if re.search(r"\b(his|her|their) weekly broadcast deployments\b", lowered):
@@ -10605,19 +10615,21 @@ def should_reject_unsupported_source_authority(text: str, prompt: str, route: st
         return False
     if contains_unsupported_source_authority_claim(text):
         return True
-    return _prompt_has_current_room_media_context(prompt, route) and contains_unsupported_media_grounding_basis(text)
+    return _is_current_message_media_repair_scope(prompt, route) and contains_unsupported_media_grounding_basis(text)
 
 
 def should_repair_media_subject_drift(text: str, prompt: str, route: str = "") -> bool:
-    if not _prompt_has_current_room_media_context(prompt, route):
+    if not _is_current_message_media_repair_scope(prompt, route):
         return False
     return contains_unsupported_subject_attribution(text, prompt)
 
 
 def _should_repair_current_room_media_grounding(text: str, prompt: str, route: str = "") -> bool:
-    if not _prompt_has_current_room_media_context(prompt, route):
+    if not _is_current_message_media_repair_scope(prompt, route):
         return False
-    return should_reject_unsupported_source_authority(text, prompt, route) or should_repair_media_subject_drift(text, prompt, route)
+    if prompt_has_explicit_media_followup(prompt):
+        return False
+    return should_reject_unsupported_source_authority(text, prompt, route) or should_repair_media_subject_drift(text, prompt, route) or should_repair_media_memory_recall_leak(text, prompt, route)
 
 
 OPERATOR_CAUSALITY_CLAIM_PATTERNS = (
@@ -10682,10 +10694,14 @@ def fake_lookup_safety_prompt_rules() -> str:
 
 
 def _safe_current_room_media_grounding_response(prompt: str) -> str:
-    return (
-        "That reads like a pure room-reaction signal: the visible joke is doing the work, and the room can answer it without turning anybody into a case file. "
-        "No archive verdict needed, just a small red light blinking in agreement."
+    logging.info(
+        "canned_media_fallback_blocked route=internal channel_policy=%s current_message_media_context=%s recent_media_context=%s explicit_media_followup=%s",
+        _extract_channel_policy_from_prompt(prompt),
+        int(_prompt_has_current_message_media_context(prompt)),
+        int(_prompt_has_recent_media_context(prompt)),
+        int(prompt_has_explicit_media_followup(prompt)),
     )
+    return ""
 
 
 async def _repair_current_room_media_grounding_response(text: str, prompt: str, route: str = "get_gemini_response") -> str:
@@ -10722,20 +10738,65 @@ Repaired response:"""
         if not repaired:
             return ""
         if contains_fake_lookup_claim(repaired):
-            logging.info("media_response_grounding_repair_rejected reason=fake_lookup_claim route=%s", route)
+            logging.info("media_grounding_repair_rejected reason=fake_lookup_claim route=%s channel_policy=%s current_message_media_context=%s recent_media_context=%s explicit_media_followup=%s", route, _extract_channel_policy_from_prompt(prompt), int(_prompt_has_current_message_media_context(prompt)), int(_prompt_has_recent_media_context(prompt)), int(prompt_has_explicit_media_followup(prompt)))
             return ""
         if should_reject_unsupported_source_authority(repaired, prompt, route):
-            logging.info("media_response_grounding_repair_rejected reason=unsupported_source_authority route=%s", route)
+            logging.info("media_grounding_repair_rejected reason=unsupported_source_authority route=%s channel_policy=%s current_message_media_context=%s recent_media_context=%s explicit_media_followup=%s", route, _extract_channel_policy_from_prompt(prompt), int(_prompt_has_current_message_media_context(prompt)), int(_prompt_has_recent_media_context(prompt)), int(prompt_has_explicit_media_followup(prompt)))
             return ""
         if should_repair_media_subject_drift(repaired, prompt, route):
-            logging.info("media_response_grounding_repair_rejected reason=unsupported_subject_attribution route=%s", route)
+            logging.info("media_grounding_repair_rejected reason=unsupported_subject_attribution route=%s channel_policy=%s current_message_media_context=%s recent_media_context=%s explicit_media_followup=%s", route, _extract_channel_policy_from_prompt(prompt), int(_prompt_has_current_message_media_context(prompt)), int(_prompt_has_recent_media_context(prompt)), int(prompt_has_explicit_media_followup(prompt)))
             return ""
         if should_repair_media_memory_recall_leak(repaired, prompt, route):
-            logging.info("media_response_grounding_repair_rejected reason=media_memory_recall_leak route=%s", route)
+            logging.info("media_grounding_repair_rejected reason=media_memory_recall_leak route=%s channel_policy=%s current_message_media_context=%s recent_media_context=%s explicit_media_followup=%s", route, _extract_channel_policy_from_prompt(prompt), int(_prompt_has_current_message_media_context(prompt)), int(_prompt_has_recent_media_context(prompt)), int(prompt_has_explicit_media_followup(prompt)))
             return ""
         return repaired
     except Exception as exc:
-        logging.error("media_response_grounding_repair_failed route=%s error=%s", route, exc)
+        logging.error("media_grounding_repair_failed route=%s channel_policy=%s current_message_media_context=%s recent_media_context=%s explicit_media_followup=%s error=%s", route, _extract_channel_policy_from_prompt(prompt), int(_prompt_has_current_message_media_context(prompt)), int(_prompt_has_recent_media_context(prompt)), int(prompt_has_explicit_media_followup(prompt)), exc)
+        return ""
+
+
+async def _strict_regenerate_current_room_media_grounding_response(prompt: str, route: str = "get_gemini_response") -> str:
+    strict_prompt = f"""{BNL01_SYSTEM_PROMPT}
+
+Regenerate one BNL-01 response for the current media message only.
+
+Rules:
+- Use only the current media/text and nearby room context in the prompt below.
+- Keep BNL's dry, strange, glitch-capable BARCODE voice; do not become a safety template.
+- Do not invent archive scans, source files, records, dossiers, deployments, or broadcast-memory evidence.
+- Do not make the poster/sender the subject unless the current user text explicitly asks for that.
+- Do not expose diagnostic media labels like recent GIF, host=, provider=, preview=yes, stored visual description, or media metadata unless the user explicitly asked what was stored/seen.
+- If media detail is thin, answer conversationally from the available room signal.
+
+Current prompt context:
+{prompt}
+
+BNL-01 response:"""
+    try:
+        response = await _generate_gemini_content_with_fallback_async(strict_prompt, "media_grounding_strict_regeneration")
+        regenerated, tokens = _extract_text_and_tokens(response)
+        if tokens:
+            increment_token_usage(tokens)
+        regenerated = (regenerated or "").strip()
+        if not regenerated:
+            logging.info("media_grounding_strict_regeneration_failed reason=empty route=%s channel_policy=%s current_message_media_context=%s recent_media_context=%s explicit_media_followup=%s", route, _extract_channel_policy_from_prompt(prompt), int(_prompt_has_current_message_media_context(prompt)), int(_prompt_has_recent_media_context(prompt)), int(prompt_has_explicit_media_followup(prompt)))
+            return ""
+        if contains_fake_lookup_claim(regenerated):
+            logging.info("media_grounding_strict_regeneration_failed reason=fake_lookup_claim route=%s channel_policy=%s current_message_media_context=%s recent_media_context=%s explicit_media_followup=%s", route, _extract_channel_policy_from_prompt(prompt), int(_prompt_has_current_message_media_context(prompt)), int(_prompt_has_recent_media_context(prompt)), int(prompt_has_explicit_media_followup(prompt)))
+            return ""
+        if should_reject_unsupported_source_authority(regenerated, prompt, route):
+            logging.info("media_grounding_strict_regeneration_failed reason=unsupported_source_authority route=%s channel_policy=%s current_message_media_context=%s recent_media_context=%s explicit_media_followup=%s", route, _extract_channel_policy_from_prompt(prompt), int(_prompt_has_current_message_media_context(prompt)), int(_prompt_has_recent_media_context(prompt)), int(prompt_has_explicit_media_followup(prompt)))
+            return ""
+        if should_repair_media_subject_drift(regenerated, prompt, route):
+            logging.info("media_grounding_strict_regeneration_failed reason=unsupported_subject_attribution route=%s channel_policy=%s current_message_media_context=%s recent_media_context=%s explicit_media_followup=%s", route, _extract_channel_policy_from_prompt(prompt), int(_prompt_has_current_message_media_context(prompt)), int(_prompt_has_recent_media_context(prompt)), int(prompt_has_explicit_media_followup(prompt)))
+            return ""
+        if should_repair_media_memory_recall_leak(regenerated, prompt, route):
+            logging.info("media_grounding_strict_regeneration_failed reason=media_memory_recall_leak route=%s channel_policy=%s current_message_media_context=%s recent_media_context=%s explicit_media_followup=%s", route, _extract_channel_policy_from_prompt(prompt), int(_prompt_has_current_message_media_context(prompt)), int(_prompt_has_recent_media_context(prompt)), int(prompt_has_explicit_media_followup(prompt)))
+            return ""
+        logging.info("media_grounding_strict_regeneration_succeeded route=%s channel_policy=%s current_message_media_context=%s recent_media_context=%s explicit_media_followup=%s", route, _extract_channel_policy_from_prompt(prompt), int(_prompt_has_current_message_media_context(prompt)), int(_prompt_has_recent_media_context(prompt)), int(prompt_has_explicit_media_followup(prompt)))
+        return regenerated
+    except Exception as exc:
+        logging.error("media_grounding_strict_regeneration_failed route=%s channel_policy=%s current_message_media_context=%s recent_media_context=%s explicit_media_followup=%s error=%s", route, _extract_channel_policy_from_prompt(prompt), int(_prompt_has_current_message_media_context(prompt)), int(_prompt_has_recent_media_context(prompt)), int(prompt_has_explicit_media_followup(prompt)), exc)
         return ""
 
 
@@ -10810,7 +10871,11 @@ async def get_gemini_response(prompt: str, user_id: int, guild_id: int, route: s
         is_show_state_route = (route or "").startswith("show_state")
         public_authority_guard_active = _is_public_authority_guard_prompt(prompt)
         source_authority_context_present = prompt_has_source_authority_context(prompt)
-        current_room_media_context_present = _prompt_has_current_room_media_context(prompt, route)
+        current_message_media_context_present = _prompt_has_current_message_media_context(prompt)
+        recent_media_context_present = _prompt_has_recent_media_context(prompt)
+        explicit_media_followup_present = prompt_has_explicit_media_followup(prompt)
+        current_media_repair_scope_present = _is_current_message_media_repair_scope(prompt, route) and not explicit_media_followup_present
+        current_room_media_context_present = current_message_media_context_present
         public_authority_guard_block = public_operator_causality_safety_prompt_rules() if public_authority_guard_active else ""
         show_state_route_block = ""
         if is_show_state_route:
@@ -10888,7 +10953,7 @@ async def get_gemini_response(prompt: str, user_id: int, guild_id: int, route: s
                     logging.info("glitch_rewrite_rejected reason=fake_lookup_claim")
                 elif should_reject_unsupported_source_authority(glitch_text, prompt, route) and not should_reject_unsupported_source_authority(text, prompt, route):
                     glitch_subject_drift = should_repair_media_subject_drift(glitch_text, prompt, route)
-                    glitch_media_basis = _prompt_has_current_room_media_context(prompt, route) and contains_unsupported_media_grounding_basis(glitch_text) and not prompt_has_source_authority_context(prompt)
+                    glitch_media_basis = _is_current_message_media_repair_scope(prompt, route) and contains_unsupported_media_grounding_basis(glitch_text) and not prompt_has_source_authority_context(prompt)
                     if glitch_subject_drift:
                         logging.info("glitch_rewrite_rejected reason=unsupported_subject_attribution route=%s", route)
                     elif glitch_media_basis:
@@ -10945,7 +11010,7 @@ async def get_gemini_response(prompt: str, user_id: int, guild_id: int, route: s
                     logging.info("glitch_rewrite_rejected reason=fake_lookup_claim route=cross_universe_bleed")
                 elif should_reject_unsupported_source_authority(bleed_text, prompt, route) and not should_reject_unsupported_source_authority(text, prompt, route):
                     bleed_subject_drift = should_repair_media_subject_drift(bleed_text, prompt, route)
-                    bleed_media_basis = _prompt_has_current_room_media_context(prompt, route) and contains_unsupported_media_grounding_basis(bleed_text) and not prompt_has_source_authority_context(prompt)
+                    bleed_media_basis = _is_current_message_media_repair_scope(prompt, route) and contains_unsupported_media_grounding_basis(bleed_text) and not prompt_has_source_authority_context(prompt)
                     if bleed_subject_drift:
                         logging.info("cross_universe_bleed_rejected reason=unsupported_subject_attribution route=cross_universe_bleed original_route=%s", route)
                     elif bleed_media_basis:
@@ -10988,8 +11053,25 @@ async def get_gemini_response(prompt: str, user_id: int, guild_id: int, route: s
             logging.info("unsupported_media_grounding_basis_detected route=%s channel_policy=%s source_context_present=0", route, _extract_channel_policy_from_prompt(prompt))
         if unsupported_subject_attribution:
             logging.info("unsupported_subject_attribution_detected route=%s channel_policy=%s source_context_present=%s", route, _extract_channel_policy_from_prompt(prompt), int(source_authority_context_present))
-        if (unsupported_source_authority or unsupported_subject_attribution or media_memory_recall_leak_repair) and current_room_media_context_present:
-            logging.info("media_response_grounding_repair route=%s channel_policy=%s source_context_present=%s repaired=0 hard_fallbacked=0", route, _extract_channel_policy_from_prompt(prompt), int(source_authority_context_present))
+        needs_media_grounding_repair = unsupported_media_grounding_basis or unsupported_subject_attribution or media_memory_recall_leak_repair
+        if needs_media_grounding_repair and not current_media_repair_scope_present:
+            logging.info(
+                "media_grounding_repair_skipped reason=not_current_media route=%s channel_policy=%s current_message_media_context=%s recent_media_context=%s explicit_media_followup=%s",
+                route,
+                _extract_channel_policy_from_prompt(prompt),
+                int(current_message_media_context_present),
+                int(recent_media_context_present),
+                int(explicit_media_followup_present),
+            )
+
+        if needs_media_grounding_repair and current_media_repair_scope_present:
+            logging.info(
+                "media_grounding_repair_started route=%s channel_policy=%s source_context_present=%s current_message_media_context=1 recent_media_context=%s explicit_media_followup=0",
+                route,
+                _extract_channel_policy_from_prompt(prompt),
+                int(source_authority_context_present),
+                int(recent_media_context_present),
+            )
             repaired = await _repair_current_room_media_grounding_response(text, prompt, route)
             if repaired:
                 if unsupported_source_authority and contains_unsupported_source_authority_claim(text):
@@ -11001,8 +11083,23 @@ async def get_gemini_response(prompt: str, user_id: int, guild_id: int, route: s
                 if media_memory_recall_leak_repair:
                     logging.info("media_memory_recall_leak_repaired route=%s channel_policy=%s current_media_context=1 explicit_media_followup=0 repaired=1 hard_fallbacked=0", route, _extract_channel_policy_from_prompt(prompt))
                 return repaired
-            logging.info("media_response_grounding_repair route=%s channel_policy=%s source_context_present=%s repaired=0 hard_fallbacked=1", route, _extract_channel_policy_from_prompt(prompt), int(source_authority_context_present))
-            return _safe_current_room_media_grounding_response(prompt)
+            logging.info(
+                "media_grounding_strict_regeneration_started route=%s channel_policy=%s current_message_media_context=1 recent_media_context=%s explicit_media_followup=0",
+                route,
+                _extract_channel_policy_from_prompt(prompt),
+                int(recent_media_context_present),
+            )
+            regenerated = await _strict_regenerate_current_room_media_grounding_response(prompt, route)
+            if regenerated:
+                return regenerated
+            logging.info(
+                "media_grounding_response_suppressed route=%s channel_policy=%s current_message_media_context=1 recent_media_context=%s explicit_media_followup=0",
+                route,
+                _extract_channel_policy_from_prompt(prompt),
+                int(recent_media_context_present),
+            )
+            logging.info("canned_media_fallback_blocked route=%s channel_policy=%s", route, _extract_channel_policy_from_prompt(prompt))
+            return ""
 
         if contains_fake_lookup_claim(text):
             source = "broadcast_memory_context" if "Broadcast memory" in (prompt or "") else "standard_context"

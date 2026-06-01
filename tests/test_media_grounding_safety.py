@@ -261,6 +261,122 @@ class MediaGroundingRepairTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("not everybody knows how to do everything", text.lower())
         self.assertNotIn("weekly broadcast", text.lower())
 
+    def recent_media_only_prompt(self, request="Tell me a joke BNL"):
+        return (
+            "Current channel policy: sealed_test\n"
+            f"Current user request: {request}\n"
+            f"User message: {request}\n"
+            "Recent media context from this channel (transient, not durable memory):\n"
+            "- 6 Bit: gif embed (provider=Tenor; preview=yes) (BNL observed; visibility=transient)\n"
+        )
+
+    async def test_normal_text_after_recent_media_does_not_run_media_repair_or_canned_fallback(self):
+        prompt = self.recent_media_only_prompt()
+        generated = "Perhaps a core memory from before his weekly deployments. Anyway, the joke relay coughed."
+
+        async def fake_generate(_contents, _route):
+            return gemini_response(generated, 10)
+
+        with mock.patch.object(bnl01_bot, "check_quota_availability", return_value=True), \
+             mock.patch.object(bnl01_bot, "get_conversation_history", return_value=[]), \
+             mock.patch.object(bnl01_bot, "_generate_gemini_content_with_fallback_async", side_effect=fake_generate) as generate, \
+             mock.patch.object(bnl01_bot, "increment_token_usage"), \
+             mock.patch.object(bnl01_bot.random, "random", return_value=1.0):
+            text = await bnl01_bot.get_gemini_response(prompt, user_id=123, guild_id=456, route="get_gemini_response")
+
+        self.assertEqual(text, generated)
+        self.assertNotIn("pure room-reaction signal", text.lower())
+        self.assertEqual([call.args[1] for call in generate.await_args_list], ["get_gemini_response"])
+
+    def test_normal_text_route_without_current_media_does_not_need_current_media_repair(self):
+        prompt = self.recent_media_only_prompt("Tell me a joke BNL")
+        self.assertFalse(
+            bnl01_bot._should_repair_current_room_media_grounding(
+                "Perhaps a core memory from before his weekly deployments.",
+                prompt,
+                "get_gemini_response",
+            )
+        )
+
+    async def test_current_media_repair_failure_uses_strict_regeneration_when_valid(self):
+        prompt = (
+            "Current channel policy: sealed_test\n"
+            "Current user request: [Current message media context:\n- gif embed (title=confused office)\n]\n"
+        )
+        responses = [
+            gemini_response("Archival records indicate this is about his weekly broadcast deployments.", 10),
+            gemini_response("Still his weekly deployments inside the records.", 8),
+            gemini_response("That GIF walks in wearing a confused office badge. The red light approves; no dossier required.", 8),
+        ]
+
+        async def fake_generate(_contents, _route):
+            return responses.pop(0)
+
+        with mock.patch.object(bnl01_bot, "check_quota_availability", return_value=True), \
+             mock.patch.object(bnl01_bot, "get_conversation_history", return_value=[]), \
+             mock.patch.object(bnl01_bot, "_generate_gemini_content_with_fallback_async", side_effect=fake_generate) as generate, \
+             mock.patch.object(bnl01_bot, "increment_token_usage"), \
+             mock.patch.object(bnl01_bot.random, "random", return_value=1.0):
+            text = await bnl01_bot.get_gemini_response(prompt, user_id=123, guild_id=456, route="free_speak_media_generation")
+
+        self.assertEqual(text, "That GIF walks in wearing a confused office badge. The red light approves; no dossier required.")
+        self.assertNotIn("pure room-reaction signal", text.lower())
+        self.assertEqual(
+            [call.args[1] for call in generate.await_args_list],
+            ["free_speak_media_generation", "media_response_grounding_repair", "media_grounding_strict_regeneration"],
+        )
+
+    async def test_current_media_repair_and_strict_regeneration_failure_suppresses_response(self):
+        prompt = (
+            "Current channel policy: sealed_test\n"
+            "Current user request: [Current message media context:\n- gif embed (title=confused office)\n]\n"
+        )
+        responses = [
+            gemini_response("Archival records indicate this is about his weekly broadcast deployments.", 10),
+            gemini_response("Still his weekly deployments inside the records.", 8),
+            gemini_response("The core memory confirms his weekly deployments.", 8),
+        ]
+
+        async def fake_generate(_contents, _route):
+            return responses.pop(0)
+
+        with mock.patch.object(bnl01_bot, "check_quota_availability", return_value=True), \
+             mock.patch.object(bnl01_bot, "get_conversation_history", return_value=[]), \
+             mock.patch.object(bnl01_bot, "_generate_gemini_content_with_fallback_async", side_effect=fake_generate) as generate, \
+             mock.patch.object(bnl01_bot, "increment_token_usage"), \
+             mock.patch.object(bnl01_bot.random, "random", return_value=1.0):
+            text = await bnl01_bot.get_gemini_response(prompt, user_id=123, guild_id=456, route="free_speak_media_generation")
+
+        self.assertEqual(text, "")
+        self.assertEqual(
+            [call.args[1] for call in generate.await_args_list],
+            ["free_speak_media_generation", "media_response_grounding_repair", "media_grounding_strict_regeneration"],
+        )
+
+    def test_canned_media_fallback_string_is_not_publicly_returned(self):
+        banned_prefix = "That reads like a pure room-reaction signal"
+        self.assertNotIn(banned_prefix, bnl01_bot._safe_current_room_media_grounding_response("Current channel policy: sealed_test"))
+
+    def test_glitch_cross_universe_output_is_allowed_when_grounded_and_repaired_when_not(self):
+        prompt = (
+            "Current channel policy: sealed_test\n"
+            "Current user request: [Current message media context:\n- gif embed (title=confused office)\n]\n"
+        )
+        self.assertFalse(
+            bnl01_bot.should_repair_media_subject_drift(
+                "The red panel hiccups sideways and the room receives one cursed office memo.",
+                prompt,
+                "free_speak_media_generation",
+            )
+        )
+        self.assertTrue(
+            bnl01_bot.should_reject_unsupported_source_authority(
+                "host=tenor.com says his weekly deployments are a core memory in the fake records.",
+                prompt,
+                "free_speak_media_generation",
+            )
+        )
+
 
     async def test_free_speak_media_core_memory_deployments_regression_is_repaired(self):
         prompt = (
