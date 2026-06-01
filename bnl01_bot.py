@@ -8344,25 +8344,27 @@ def _free_speak_ack_resolution(
         "batch_item_count": live_room.get("batch_item_count", len(items or [])),
         "recent_bnl_reply_context": live_room.get("recent_bnl_reply_context", False),
         "recent_room_context": live_room.get("recent_room_context", False),
+        "recent_media_context_found": bool(
+            get_recent_room_events(guild_id or 0, channel_id or 0, channel_policy=channel_policy, limit=1, media_only=True, minutes=20)
+        ) if media_stats["present"] else False,
         "meaningful_media": live_room.get("meaningful_media", False),
     }
-    if decision != "acknowledge" or channel_policy not in {"public_home", "sealed_test"}:
+    if channel_policy not in {"public_home", "sealed_test"}:
+        return decision, reason, diagnostics
+
+    if media_stats["present"]:
+        if decision == "acknowledge":
+            diagnostics["canned_ack_suppressed"] = True
+            diagnostics["ack_escalated_to_generation"] = True
+        return "answer", "free_speak_media_generation", diagnostics
+
+    if decision != "acknowledge":
         return decision, reason, diagnostics
 
     diagnostics["canned_ack_suppressed"] = True
     if payload_count > 0 or has_structured_intent:
         diagnostics["ack_escalated_to_generation"] = True
         return "answer", "free_speak_ack_structured_context_generation", diagnostics
-
-    texts = [(content or "").strip() for (_n, content, _u) in items or [] if (content or "").strip()]
-    user_count = len({uid for (_n, _c, uid) in items or [] if uid})
-    non_media_text = " ".join(re.sub(r"\[Current message media context:.*?\]", " ", t, flags=re.DOTALL).strip() for t in texts).strip()
-    token_count = len([tok for tok in re.split(r"\s+", non_media_text) if tok])
-    if media_stats["present"] and (token_count >= 4 or user_count >= 2 or len(texts) >= 2 or live_room.get("live_room_moment") or (token_count >= 1 and live_room.get("meaningful_media"))):
-        diagnostics["ack_escalated_to_generation"] = True
-        if live_room.get("recent_bnl_reply_context") or live_room.get("recent_room_context"):
-            return "answer", "free_speak_active_media_reaction_generation", diagnostics
-        return "answer", "free_speak_media_context_generation", diagnostics
 
     diagnostics["ack_converted_to_observe"] = True
     return "observe", "free_speak_canned_ack_suppressed", diagnostics
@@ -8383,6 +8385,7 @@ def _batch_ack_resolution_details(original_decision: str, original_reason: str, 
         f"batch_item_count={diagnostics.get('batch_item_count', 0)};"
         f"recent_bnl_reply_context={int(diagnostics.get('recent_bnl_reply_context', False))};"
         f"recent_room_context={int(diagnostics.get('recent_room_context', False))};"
+        f"recent_media_context_found={int(diagnostics.get('recent_media_context_found', False))};"
         f"conversation_surface={conversation_surface};channel_policy={channel_policy}"
     )
 
@@ -8421,7 +8424,7 @@ def resolve_batch_acknowledgement_decision(
         "conversation_surface": conversation_surface_for_channel_policy(channel_policy),
         "channel_policy": channel_policy,
     })
-    if original_decision == "acknowledge" and diagnostics.get("canned_ack_suppressed") and guild_id is not None and channel_id is not None:
+    if diagnostics.get("media_present") and channel_policy in {"public_home", "sealed_test"} and guild_id is not None and channel_id is not None:
         count = len(items or []) if message_count is None else message_count
         details = _batch_ack_resolution_details(
             original_decision,
@@ -8431,8 +8434,10 @@ def resolve_batch_acknowledgement_decision(
             diagnostics,
             channel_policy,
         )
-        _log_batch_event(logging.INFO, "free_speak_ack_resolution", guild_id, channel_id, count, details)
-        _log_batch_event(logging.INFO, "free_speak_canned_ack_suppressed", guild_id, channel_id, count, details)
+        _log_batch_event(logging.INFO, "free_speak_media_resolution", guild_id, channel_id, count, details)
+        if diagnostics.get("canned_ack_suppressed"):
+            _log_batch_event(logging.INFO, "free_speak_ack_resolution", guild_id, channel_id, count, details)
+            _log_batch_event(logging.INFO, "free_speak_canned_ack_suppressed", guild_id, channel_id, count, details)
     return resolved_decision, resolved_reason, diagnostics
 
 def _extract_member_activity_event_from_text(text: str, source_author: str = "") -> dict:
@@ -11996,7 +12001,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
         _log_batch_event(logging.INFO, "active_packet_built", guild_id, channel_id, active_packet["collapsed_count"], f"original_count={active_packet['original_count']};collapsed_count={active_packet['collapsed_count']};payload_count={payload_count};decision={decision};reason={reason}")
         _log_batch_event(logging.INFO, "active_packet_payload_items", guild_id, channel_id, active_packet["collapsed_count"], f"payload_count={payload_count}")
         recent_bnl_reply_context = bool(_channel_last_reply_at.get(channel_id) and (datetime.now(PACIFIC_TZ) - _channel_last_reply_at[channel_id]).total_seconds() <= RECENT_MEDIA_LIVE_MOMENT_SECONDS)
-        if decision == "acknowledge":
+        if decision == "acknowledge" or (active_packet.get("media_present") and channel_policy in {"public_home", "sealed_test"}):
             decision, reason, ack_diag = resolve_batch_acknowledgement_decision(
                 decision,
                 reason,
@@ -12030,7 +12035,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
             _log_batch_event(logging.INFO, "request_intent_detected", guild_id, channel_id, len(collapsed_items), f"reason={reason}")
         if reason.startswith("request_payload_expected:"):
             _log_batch_event(logging.INFO, "request_payload_phrase_detected", guild_id, channel_id, len(collapsed_items), f"reason={reason}")
-        _log_batch_event(logging.INFO, "batch_engagement_decision", guild_id, channel_id, len(collapsed_items), f"decision={decision};reason={reason};original_decision={ack_diag.get('original_decision', decision)};original_reason={ack_diag.get('original_reason', reason)};resolved_decision={ack_diag.get('resolved_decision', decision)};resolved_reason={ack_diag.get('resolved_reason', reason)};canned_ack_suppressed={int(ack_diag.get('canned_ack_suppressed', False))};ack_converted_to_observe={int(ack_diag.get('ack_converted_to_observe', False))};ack_escalated_to_generation={int(ack_diag.get('ack_escalated_to_generation', False))};media_present={int(ack_diag.get('media_present', active_packet.get('media_present', False)))};media_context_included={int(ack_diag.get('media_context_included', active_packet.get('media_context_included', False)))};media_item_count={ack_diag.get('media_item_count', active_packet.get('media_item_count', 0))};distinct_user_count={ack_diag.get('distinct_user_count', 0)};batch_item_count={ack_diag.get('batch_item_count', len(collapsed_items))};recent_bnl_reply_context={int(ack_diag.get('recent_bnl_reply_context', recent_bnl_reply_context if 'recent_bnl_reply_context' in locals() else False))};recent_room_context={int(ack_diag.get('recent_room_context', False))};conversation_surface={conversation_surface_for_channel_policy(channel_policy)};channel_policy={channel_policy}")
+        _log_batch_event(logging.INFO, "batch_engagement_decision", guild_id, channel_id, len(collapsed_items), f"decision={decision};reason={reason};original_decision={ack_diag.get('original_decision', decision)};original_reason={ack_diag.get('original_reason', reason)};resolved_decision={ack_diag.get('resolved_decision', decision)};resolved_reason={ack_diag.get('resolved_reason', reason)};canned_ack_suppressed={int(ack_diag.get('canned_ack_suppressed', False))};ack_converted_to_observe={int(ack_diag.get('ack_converted_to_observe', False))};ack_escalated_to_generation={int(ack_diag.get('ack_escalated_to_generation', False))};media_present={int(ack_diag.get('media_present', active_packet.get('media_present', False)))};media_context_included={int(ack_diag.get('media_context_included', active_packet.get('media_context_included', False)))};media_item_count={ack_diag.get('media_item_count', active_packet.get('media_item_count', 0))};distinct_user_count={ack_diag.get('distinct_user_count', 0)};batch_item_count={ack_diag.get('batch_item_count', len(collapsed_items))};recent_bnl_reply_context={int(ack_diag.get('recent_bnl_reply_context', recent_bnl_reply_context if 'recent_bnl_reply_context' in locals() else False))};recent_room_context={int(ack_diag.get('recent_room_context', False))};recent_media_context_found={int(ack_diag.get('recent_media_context_found', False))};conversation_surface={conversation_surface_for_channel_policy(channel_policy)};channel_policy={channel_policy}")
         if decision in ("skip", "observe"):
             if active_packet.get("media_present"):
                 mark_recent_media_events_response_state(guild_id, channel_id, set(unique_user_ids), channel_policy, "observed")
@@ -12092,7 +12097,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
             _log_batch_event(logging.INFO, "active_packet_collapsed_count", guild_id, channel_id, active_packet["collapsed_count"], f"collapsed_count={active_packet['collapsed_count']}")
             _log_batch_event(logging.INFO, "active_packet_built", guild_id, channel_id, active_packet["collapsed_count"], f"original_count={active_packet['original_count']};collapsed_count={active_packet['collapsed_count']};payload_count={payload_count};decision={decision};reason={reason}")
             _log_batch_event(logging.INFO, "active_packet_payload_items", guild_id, channel_id, active_packet["collapsed_count"], f"payload_count={payload_count}")
-            if decision == "acknowledge":
+            if decision == "acknowledge" or (active_packet.get("media_present") and channel_policy in {"public_home", "sealed_test"}):
                 decision, reason, ack_diag = resolve_batch_acknowledgement_decision(
                     decision,
                     reason,
@@ -12128,7 +12133,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                 _log_batch_event(logging.INFO, "request_intent_detected", guild_id, channel_id, len(collapsed_items), f"reason={reason}")
             if reason.startswith("request_payload_expected:"):
                 _log_batch_event(logging.INFO, "request_payload_phrase_detected", guild_id, channel_id, len(collapsed_items), f"reason={reason}")
-            _log_batch_event(logging.INFO, "batch_engagement_decision", guild_id, channel_id, len(collapsed_items), f"decision={decision};reason={reason};original_decision={ack_diag.get('original_decision', decision)};original_reason={ack_diag.get('original_reason', reason)};resolved_decision={ack_diag.get('resolved_decision', decision)};resolved_reason={ack_diag.get('resolved_reason', reason)};canned_ack_suppressed={int(ack_diag.get('canned_ack_suppressed', False))};ack_converted_to_observe={int(ack_diag.get('ack_converted_to_observe', False))};ack_escalated_to_generation={int(ack_diag.get('ack_escalated_to_generation', False))};media_present={int(ack_diag.get('media_present', active_packet.get('media_present', False)))};media_context_included={int(ack_diag.get('media_context_included', active_packet.get('media_context_included', False)))};media_item_count={ack_diag.get('media_item_count', active_packet.get('media_item_count', 0))};distinct_user_count={ack_diag.get('distinct_user_count', 0)};batch_item_count={ack_diag.get('batch_item_count', len(collapsed_items))};recent_bnl_reply_context={int(ack_diag.get('recent_bnl_reply_context', recent_bnl_reply_context if 'recent_bnl_reply_context' in locals() else False))};recent_room_context={int(ack_diag.get('recent_room_context', False))};conversation_surface={conversation_surface_for_channel_policy(channel_policy)};channel_policy={channel_policy}")
+            _log_batch_event(logging.INFO, "batch_engagement_decision", guild_id, channel_id, len(collapsed_items), f"decision={decision};reason={reason};original_decision={ack_diag.get('original_decision', decision)};original_reason={ack_diag.get('original_reason', reason)};resolved_decision={ack_diag.get('resolved_decision', decision)};resolved_reason={ack_diag.get('resolved_reason', reason)};canned_ack_suppressed={int(ack_diag.get('canned_ack_suppressed', False))};ack_converted_to_observe={int(ack_diag.get('ack_converted_to_observe', False))};ack_escalated_to_generation={int(ack_diag.get('ack_escalated_to_generation', False))};media_present={int(ack_diag.get('media_present', active_packet.get('media_present', False)))};media_context_included={int(ack_diag.get('media_context_included', active_packet.get('media_context_included', False)))};media_item_count={ack_diag.get('media_item_count', active_packet.get('media_item_count', 0))};distinct_user_count={ack_diag.get('distinct_user_count', 0)};batch_item_count={ack_diag.get('batch_item_count', len(collapsed_items))};recent_bnl_reply_context={int(ack_diag.get('recent_bnl_reply_context', recent_bnl_reply_context if 'recent_bnl_reply_context' in locals() else False))};recent_room_context={int(ack_diag.get('recent_room_context', False))};recent_media_context_found={int(ack_diag.get('recent_media_context_found', False))};conversation_surface={conversation_surface_for_channel_policy(channel_policy)};channel_policy={channel_policy}")
             if decision in ("skip", "observe"):
                 if active_packet.get("media_present"):
                     mark_recent_media_events_response_state(guild_id, channel_id, set(unique_user_ids), channel_policy, "observed")
