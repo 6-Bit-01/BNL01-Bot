@@ -55,6 +55,11 @@ from bnl_dossier_source_packets import (
     is_broadcast_memory_reader_available,
     set_broadcast_memory_reader,
 )
+from bnl_entity_activity_summary import (
+    build_entity_activity_summary,
+    format_entity_activity_summary_response,
+    parse_entity_activity_summary_command,
+)
 from bnl_source_file_lookup import (
     build_source_file_lookup_diagnostics,
     format_source_file_lookup_response,
@@ -4446,6 +4451,59 @@ def maybe_record_live_community_presence(message: discord.Message, clean_content
     _last_community_presence_error_status = str(result.get("status") or "none")[:80]
 
 
+async def maybe_handle_entity_activity_summary_command(message: discord.Message, clean_content: str) -> bool:
+    """Handle operator-only shared entity activity summary readouts."""
+
+    matched, options, parse_error = parse_entity_activity_summary_command(clean_content)
+    if not matched:
+        return False
+
+    member = message.author if isinstance(message.author, discord.Member) else message.guild.get_member(message.author.id)
+    if not can_send_dossier_recommendation(message.author, member, message.guild):
+        logging.warning("entity_activity_summary_denied reason=permission")
+        await message.reply("Entity activity summaries are operator-only.")
+        return True
+
+    channel = getattr(message, "channel", None)
+    policy = resolve_channel_policy(channel)
+    channel_name = getattr(channel, "name", "") or ""
+    normalized_channel_name = _normalize_channel_name(channel_name)
+    allowed_internal_summary_channel = (policy == "sealed_test" and normalized_channel_name == "bnl-testing") or (
+        policy == "internal_controlled" and normalized_channel_name == "research-and-development"
+    )
+    if not allowed_internal_summary_channel:
+        logging.warning("entity_activity_summary_denied reason=channel policy=%s channel=%s", policy, channel_name)
+        await message.reply("Entity activity summaries are restricted to #research-and-development or #bnl-testing.")
+        return True
+
+    if not options:
+        await message.reply(f"Entity summary failed: {parse_error}")
+        return True
+
+    summary = await asyncio.to_thread(
+        build_entity_activity_summary,
+        DB_FILE,
+        options.get("subjectName", ""),
+        getattr(message.guild, "id", None),
+        [
+            "user_profiles",
+            "user_memory_facts",
+            "user_habits",
+            "relationship_state",
+            "relationship_journal",
+            "memory_tiers",
+            "conversations",
+            "broadcast_memory",
+            "rd_context",
+        ],
+        "admin_internal",
+        50,
+        _current_rd_discovery_context(message),
+    )
+    await message.reply(format_entity_activity_summary_response(summary))
+    return True
+
+
 async def maybe_handle_source_knowledge_bridge_command(message: discord.Message, clean_content: str) -> bool:
     """Handle the operator-triggered local knowledge-to-Source File bridge."""
 
@@ -4940,6 +4998,8 @@ def classify_route_mode(clean_content: str, channel_policy: str = "unknown", *, 
         return ROUTE_MODE_SOURCE_ENRICHMENT
     if parse_source_file_lookup_command(text)[0]:
         return ROUTE_MODE_SOURCE_LOOKUP
+    if parse_entity_activity_summary_command(text)[0]:
+        return ROUTE_MODE_OPERATOR_COMMAND
     if parse_source_knowledge_bridge_command(text)[0] or parse_manual_dossier_recommendation_command(text)[0]:
         return ROUTE_MODE_DOSSIER_RECOMMENDATION
     if parse_backfill_options(text)[0]:
@@ -14523,6 +14583,9 @@ async def on_message(message: discord.Message):
         return
 
     if await maybe_handle_source_file_lookup_command(message, clean_content):
+        return
+
+    if await maybe_handle_entity_activity_summary_command(message, clean_content):
         return
 
     if await maybe_handle_dossier_recommendation_command(message, clean_content):
