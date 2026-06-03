@@ -16,12 +16,26 @@ from datetime import datetime, timezone
 from typing import Any, Callable
 
 from bnl_dossier_recommendations import build_dossier_recommendation_payload, send_dossier_recommendation
-from bnl_entity_activity_summary import build_entity_activity_summary
+from bnl_entity_activity_summary import build_entity_activity_summary, refresh_entity_evidence_for_subject
 from bnl_source_file_lookup import lookup_source_file
 
 ENRICHMENT_INGEST_SOURCE = "bnl_source_file_enrichment"
 FALLBACK_INGEST_SOURCE = "bnl_source_knowledge_bridge"
 SOURCE_BLIND_WARNING = "source-blind memory is review-only; do not treat as confirmed fact"
+QUEUE_NOT_CONNECTED_NOTE = "Queue/submission identity is not connected yet."
+ENTITY_SUMMARY_EVIDENCE_FIELDS = {
+    "observedChannels": 6,
+    "conversationHighlights": 6,
+    "topicBreakdown": 8,
+    "bestEvidenceToReview": 6,
+    "bnlInteractionSignals": 5,
+    "musicSignals": 5,
+    "communitySignals": 5,
+    "sourceCoverage": 10,
+    "evidenceDetails": 8,
+    "publicUseCandidates": 6,
+    "reviewOnlyEvidence": 6,
+}
 SECTION_ORDER = [
     "Subject Overview",
     "Why This Subject Matters",
@@ -1046,6 +1060,69 @@ def _add_source_file_context(sections: dict[str, list[str]], source_file: dict[s
         _append_section(sections, "Possible Aliases / Connections", f"Possible connection only; needs owner review before identity fields are changed: {_safe_text(aliases, 180)}")
 
 
+def _owner_admin_review_label(value: Any) -> Any:
+    if not isinstance(value, str):
+        return value
+    return (
+        value.replace("pending owner review", "pending owner/admin review")
+        .replace("after owner review", "after owner/admin review")
+        .replace("before owner review", "before owner/admin review")
+    )
+
+
+def _is_review_only_summary_item(value: Any, review_only_evidence: list[str]) -> bool:
+    text = str(value or "")
+    lowered = text.lower()
+    if "review-only channel" in lowered:
+        return True
+    return any(item and item in text for item in review_only_evidence)
+
+
+def _bounded_entity_summary_fields(summary: dict[str, Any], *, include: bool) -> dict[str, Any]:
+    fields: dict[str, Any] = {}
+    review_only_evidence = [str(item or "") for item in (summary.get("reviewOnlyEvidence") or [])]
+    public_normal_fields = {"observedChannels", "conversationHighlights", "evidenceDetails", "bestEvidenceToReview"}
+    for key, limit in ENTITY_SUMMARY_EVIDENCE_FIELDS.items():
+        value = summary.get(key) if include else []
+        if isinstance(value, list):
+            items = list(value)
+            if key in public_normal_fields:
+                items = [item for item in items if not _is_review_only_summary_item(item, review_only_evidence)]
+            items = items[:limit]
+            if key == "publicUseCandidates":
+                items = [_owner_admin_review_label(item) for item in items]
+            fields[key] = items
+        else:
+            fields[key] = value if value else ([] if key != "sourceCoverage" else [])
+    return fields
+
+
+def _copy_evidence_fields(target: dict[str, Any], source: dict[str, Any]) -> None:
+    for key in (
+        "knownContext",
+        "relationshipSignals",
+        "publicSafePossibilities",
+        "privateOnlyNotes",
+        "notPublicYet",
+        "sourceAuthority",
+        *ENTITY_SUMMARY_EVIDENCE_FIELDS.keys(),
+    ):
+        if key in source:
+            value = source.get(key)
+            if isinstance(value, list):
+                items = list(value)
+                if key == "publicUseCandidates":
+                    items = [_owner_admin_review_label(item) for item in items]
+                target[key] = items
+            elif isinstance(value, dict):
+                target[key] = dict(value)
+            else:
+                target[key] = value
+    target["queueSubmissionStatus"] = source.get("queueSubmissionStatus") or "not_connected"
+    target["queueSubmissionNote"] = source.get("queueSubmissionNote") or QUEUE_NOT_CONNECTED_NOTE
+    target["rawProvenance"] = dict(source.get("rawProvenance") or {})
+
+
 def collect_source_enrichment_evidence(db_path: str, guild_id: int | None, subject: str, *, rd_context: list[dict[str, Any]] | None = None, lookup_result: dict[str, Any] | None = None) -> dict[str, Any]:
     """Collect bounded evidence from approved local stores only."""
 
@@ -1324,11 +1401,18 @@ def collect_source_enrichment_evidence(db_path: str, guild_id: int | None, subje
     if "rd_context" not in source_statuses:
         _source_status(source_statuses, "rd_context", "no_match" if rd_context else "not_provided")
 
+    refresh_result: dict[str, Any] = {}
+    try:
+        refresh_result = refresh_entity_evidence_for_subject(db_path, subject, guild_id=guild_id, limit=50)
+    except Exception as exc:  # pragma: no cover - defensive: enrichment should still read existing evidence.
+        refresh_result = {"ok": False, "error": _safe_text(str(exc), 180)}
+
     entity_summary = build_entity_activity_summary(
         db_path,
         subject,
         guild_id,
         [
+            "entity_evidence_events",
             "user_profiles",
             "user_memory_facts",
             "user_habits",
@@ -1337,6 +1421,7 @@ def collect_source_enrichment_evidence(db_path: str, guild_id: int | None, subje
             "memory_tiers",
             "conversations",
             "broadcast_memory",
+            "community_presence",
             "rd_context",
         ],
         "admin_internal",
@@ -1376,6 +1461,7 @@ def collect_source_enrichment_evidence(db_path: str, guild_id: int | None, subje
         "channelEvidenceFound": channel_evidence_found,
         "publicDossierMatchFound": bool(identity.get("publicDossierMatchFound")),
         "existingDossierUpdateLane": bool(identity.get("existingDossierUpdateLane")),
+        "entityEvidenceRefresh": refresh_result if isinstance(refresh_result, dict) else {},
     }
     classification_bundle = {
         "sections": {name: values for name, values in sections.items() if values},
@@ -1420,6 +1506,9 @@ def collect_source_enrichment_evidence(db_path: str, guild_id: int | None, subje
         "privateOnlyNotes": list(entity_summary.get("privateOnlyNotes") or [])[:6] if raw_provenance else [],
         "notPublicYet": list(entity_summary.get("notPublicYet") or [])[:6] if raw_provenance else [],
         "sourceAuthority": list(entity_summary.get("sourceAuthority") or [])[:5] if raw_provenance else [],
+        **_bounded_entity_summary_fields(entity_summary, include=bool(raw_provenance)),
+        "queueSubmissionStatus": str(entity_summary.get("queueSubmissionStatus") or "not_connected") if raw_provenance else "not_connected",
+        "queueSubmissionNote": str(entity_summary.get("queueSubmissionNote") or QUEUE_NOT_CONNECTED_NOTE) if raw_provenance else QUEUE_NOT_CONNECTED_NOTE,
         "rawProvenance": {
             "sourceLabels": list(raw_provenance.get("sourceLabels") or []),
             "sourceCounts": dict(raw_provenance.get("sourceCounts") or {}),
@@ -1489,7 +1578,7 @@ def build_enrichment_recommendation_payload(packet: dict[str, Any], *, environ: 
         "qualityStatus": packet.get("qualityStatus"),
         "forced": bool(packet.get("forced")),
         "safetyWarnings": list(packet.get("warnings") or []),
-        "sourceCoverage": dict(packet.get("sourceTypesChecked") or {}),
+        "sourceCoverage": list(packet.get("sourceCoverage") or []),
         "identityDiagnostics": dict(packet.get("diagnostics") or {}),
         "internalClassification": dict(packet.get("classification") or {}),
         "knownContext": list(packet.get("knownContext") or []),
@@ -1498,6 +1587,18 @@ def build_enrichment_recommendation_payload(packet: dict[str, Any], *, environ: 
         "privateOnlyNotes": list(packet.get("privateOnlyNotes") or []),
         "notPublicYet": list(packet.get("notPublicYet") or []),
         "sourceAuthority": list(packet.get("sourceAuthority") or []),
+        "observedChannels": list(packet.get("observedChannels") or []),
+        "conversationHighlights": list(packet.get("conversationHighlights") or []),
+        "topicBreakdown": list(packet.get("topicBreakdown") or []),
+        "bestEvidenceToReview": list(packet.get("bestEvidenceToReview") or []),
+        "bnlInteractionSignals": list(packet.get("bnlInteractionSignals") or []),
+        "musicSignals": list(packet.get("musicSignals") or []),
+        "communitySignals": list(packet.get("communitySignals") or []),
+        "evidenceDetails": list(packet.get("evidenceDetails") or []),
+        "publicUseCandidates": list(packet.get("publicUseCandidates") or []),
+        "reviewOnlyEvidence": list(packet.get("reviewOnlyEvidence") or []),
+        "queueSubmissionStatus": packet.get("queueSubmissionStatus") or "not_connected",
+        "queueSubmissionNote": packet.get("queueSubmissionNote") or QUEUE_NOT_CONNECTED_NOTE,
         "rawProvenance": dict(packet.get("rawProvenance") or {}),
         "visibilityLabels": ["internal_review_only", "admin_review_required"],
         "confidence": "low" if packet.get("qualityStatus") in {"too_thin", "forced_low_confidence"} else ("medium" if match_kind == "active_source_file" else "low"),
@@ -1617,6 +1718,7 @@ def run_source_file_enrichment(
         "runTime": datetime.now(timezone.utc).isoformat(),
         "forced": bool(force),
     }
+    _copy_evidence_fields(packet, evidence)
     quality = evaluate_enrichment_quality(packet)
     packet["qualityScore"] = quality["score"]
     packet["qualityStatus"] = "forced_low_confidence" if force and quality["status"] != "sendable" else quality["status"]
