@@ -25,21 +25,26 @@ DEFAULT_ALLOWED_LANES = {
     "memory_tiers",
     "conversations",
     "broadcast_memory",
+    "community_presence",
 }
 PUBLIC_CONVERSATION_POLICIES = {"public_home", "public_context", "public_selective", "broadcast_memory"}
 SOURCE_BLIND_REVIEW_NOTE = "Source-blind legacy memory exists; review source and visibility before use."
-QUEUE_NOT_CONNECTED_NOTE = "Queue/submission history is not connected to BNL entity summaries yet."
+QUEUE_NOT_CONNECTED_NOTE = "Queue/submission identity is not connected yet."
 MAX_SNIPPET_LENGTH = 180
 _DISCORD_MENTION_PATTERN = re.compile(r"<[@#!&]?[0-9]{5,}>")
 _LONG_ID_PATTERN = re.compile(r"\b\d{15,22}\b")
 _URL_PATTERN = re.compile(r"https?://\S+", re.I)
 _WORD_PATTERN = re.compile(r"[a-z0-9]+")
 _TOPIC_PATTERNS = [
-    ("music/community context", re.compile(r"\b(music|song|track|artist|radio|show|broadcast|album|playlist|dj|beat)\b", re.I)),
+    ("music/community context", re.compile(r"\b(music|song|track|artist|radio|show|broadcast|album|playlist|dj|beat|demo|performance|finished tracks?|wips?|collab(?:oration)?s?)\b", re.I)),
     ("help/support requests", re.compile(r"\b(help|support|assist|fix|issue|question|request|need)\b", re.I)),
-    ("creative/project context", re.compile(r"\b(project|design|art|write|story|video|website|source file|dossier)\b", re.I)),
-    ("community/event context", re.compile(r"\b(community|server|event|chat|room|crowd|member)\b", re.I)),
+    ("source-file/dossier planning context", re.compile(r"\b(source files?|dossiers?|draft|candidate|owner review|public copy|public-safe)\b", re.I)),
+    ("creative/project context", re.compile(r"\b(project|design|art|write|story|video|website)\b", re.I)),
+    ("community/event context", re.compile(r"\b(community|server|event|chat|room|crowd|member|barcode)\b", re.I)),
 ]
+_MUSIC_PATTERN = re.compile(r"\b(artist|track|song|submission|playlist|queue|radio|show|performance|beat|demo|finished tracks?|wips?|collab(?:oration)?s?|music)\b", re.I)
+_COMMUNITY_PATTERN = re.compile(r"\b(community|server|barcode|member|public|conversation|channel|chat|finished tracks?|wips?)\b", re.I)
+_BNL_INTERACTION_PATTERN = re.compile(r"\b(bnl|bot|source files?|dossiers?|asked|question|help|review)\b", re.I)
 
 
 
@@ -146,6 +151,51 @@ def _note_topics(counter: Counter, text: str) -> None:
             counter[label] += 1
 
 
+def _channel_display_name(channel_name: Any, policy: str) -> str:
+    name = re.sub(r"[^A-Za-z0-9 _-]+", "", str(channel_name or "")).strip().replace(" ", "-").lower()
+    if policy in PUBLIC_CONVERSATION_POLICIES and name:
+        return f"#{name[:60]}"
+    if policy in PUBLIC_CONVERSATION_POLICIES:
+        return "approved public-side channel"
+    return "review-only channel"
+
+
+def _topic_labels_for_text(text: str) -> list[str]:
+    labels = []
+    for label, pattern in _TOPIC_PATTERNS:
+        if pattern.search(text or ""):
+            labels.append(label)
+    return labels
+
+
+def _conversation_highlight(text: str, *, authored: bool, public_safe: bool) -> str:
+    prefix = "Subject authored" if authored else "Subject was mentioned in"
+    visibility = "approved public-side conversation" if public_safe else "review-only conversation"
+    lower = text or ""
+    if re.search(r"\b(source files?|dossiers?|owner review|public-safe|public copy)\b", lower, re.I):
+        action = "dossier/source-file behavior or planning"
+    elif _MUSIC_PATTERN.search(lower):
+        action = "music, track, queue, radio, or show context"
+    elif _COMMUNITY_PATTERN.search(lower):
+        action = "BARCODE/community conversation"
+    elif re.search(r"\?\s*$|\b(asked|question|help|how do|what is|can bnl)\b", lower, re.I):
+        action = "a question or help request involving BNL"
+    else:
+        action = "local context"
+    return f"{prefix} {visibility} about {action}."
+
+
+def _source_coverage_item(source: str, count: int, status: str = "found") -> dict[str, Any]:
+    return {"source": source, "count": int(count or 0), "status": status}
+
+
+def _safe_int(value: Any) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
 def _normalize_allowed_lanes(allowed_lanes: Any) -> set[str]:
     if allowed_lanes is None:
         return set(DEFAULT_ALLOWED_LANES)
@@ -157,6 +207,17 @@ def _normalize_allowed_lanes(allowed_lanes: Any) -> set[str]:
         raw = []
     lanes = {re.sub(r"[^a-z0-9_]+", "_", str(lane or "").strip().lower()).strip("_") for lane in raw}
     return {lane for lane in lanes if lane in DEFAULT_ALLOWED_LANES or lane == "rd_context"} or set(DEFAULT_ALLOWED_LANES)
+
+
+def _resolve_existing_enrichment_identity(db_path: str, subject: str, guild_id: int | None) -> dict[str, Any]:
+    """Reuse Source File enrichment identity matching when available."""
+
+    try:
+        from bnl_source_file_enrichment import resolve_enrichment_subject_identity
+
+        return resolve_enrichment_subject_identity(subject, None, db_path, guild_id) or {}
+    except Exception:
+        return {}
 
 
 def build_entity_activity_summary(
@@ -181,17 +242,29 @@ def build_entity_activity_summary(
         "identityConfidence": "none",
         "knownContext": [],
         "activitySignals": [],
+        "observedChannels": [],
         "channelActivity": [],
+        "conversationHighlights": [],
+        "topicBreakdown": [],
         "recurringTopics": [],
         "interactionSignals": [],
+        "bnlInteractionSignals": [],
+        "musicSignals": [],
+        "communitySignals": [],
+        "sourceCoverage": [],
+        "evidenceDetails": [],
         "relationshipSignals": [],
         "publicSafePossibilities": [],
+        "publicUseCandidates": [],
         "privateOnlyNotes": [],
+        "reviewOnlyEvidence": [],
         "notPublicYet": [],
         "missingInfo": ["public role", "public links", "confirmed display name", "queue/submission identity"],
         "sourceAuthority": [],
         "recommendedAction": "Keep internal and review before drafting public dossier copy.",
         "confidence": "low",
+        "queueSubmissionStatus": "not_connected",
+        "queueSubmissionNote": QUEUE_NOT_CONNECTED_NOTE,
         "rawProvenance": {"sourceLabels": [], "sourceCounts": Counter(), "rawFragments": [], "channelPolicies": Counter()},
     }
     topic_counts: Counter = Counter()
@@ -203,6 +276,17 @@ def build_entity_activity_summary(
         summary["rawProvenance"]["sourceCounts"] = {}
         summary["rawProvenance"]["channelPolicies"] = {}
         return summary
+
+    enrichment_identity = _resolve_existing_enrichment_identity(db_path, subject, guild_id)
+    for user_id in enrichment_identity.get("_matchedUserIds") or []:
+        matched_user_ids.add(user_id)
+    for label in enrichment_identity.get("matchedIdentityLabels") or enrichment_identity.get("aliasLabels") or []:
+        clean_label = normalize_subject_name(str(label or ""))
+        if clean_label:
+            aliases.append(clean_label)
+            _add_unique(summary["matchedNames"], clean_label)
+    if enrichment_identity.get("matchedUserIdCount"):
+        _add_unique(summary["evidenceDetails"], "Existing Source File enrichment identity matching linked this subject to local profile/community identity context for review.")
 
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
@@ -220,6 +304,7 @@ def build_entity_activity_summary(
                     if "user_id" in data:
                         matched_user_ids.add(data.get("user_id"))
                     _add_unique(summary["knownContext"], f"Local profile match found for {subject}.")
+                    _add_unique(summary["evidenceDetails"], f"BNL matched {subject} to an existing local profile label for internal review.")
                     _record_raw(summary["rawProvenance"], "user_profiles", "local_profile_observed", f"Local profile observed for {subject}.")
 
         aliases = list(dict.fromkeys([a for a in aliases if a and a.lower() != subject.lower()]))
@@ -236,7 +321,9 @@ def build_entity_activity_summary(
                     continue
                 text = _row_text(row, ["fact_key", "fact_value"])
                 _add_unique(summary["activitySignals"], "Local memory notes mention this subject; treat as review-only until source authority is confirmed.")
+                _add_unique(summary["evidenceDetails"], "Local memory notes mention this subject, but the original source must be reviewed before reuse.")
                 _add_unique(summary["privateOnlyNotes"], "Local memory facts require owner review before public use.")
+                _add_unique(summary["reviewOnlyEvidence"], "Local memory facts require owner review before public use.")
                 _note_topics(topic_counts, text)
                 _record_raw(summary["rawProvenance"], "user_memory_facts", "local_memory_fact", _safe_snippet(text))
 
@@ -246,6 +333,7 @@ def build_entity_activity_summary(
                     continue
                 text = _row_text(row, ["last_topic"])
                 _add_unique(summary["activitySignals"], "Habit/activity traces mention this subject; use only as observed context, not personality facts.")
+                _add_unique(summary["evidenceDetails"], "Habit/activity traces mention this subject as context only, not as a public trait or role.")
                 _note_topics(topic_counts, text)
                 _record_raw(summary["rawProvenance"], "user_habits", "local_behavior_trace", _safe_snippet(text))
 
@@ -257,8 +345,10 @@ def build_entity_activity_summary(
                 if not row_matches(row, fields):
                     continue
                 text = _row_text(row, fields)
-                _add_unique(summary["relationshipSignals"], "Review-only relationship/context signal exists for this subject.")
+                relationship_note = "BNL found prior relationship/context notes, but they are private review-only."
+                _add_unique(summary["relationshipSignals"], relationship_note)
                 _add_unique(summary["privateOnlyNotes"], "Relationship/context notes are private/internal and require owner review before any public wording.")
+                _add_unique(summary["reviewOnlyEvidence"], relationship_note)
                 _note_topics(topic_counts, text)
                 _record_raw(summary["rawProvenance"], table, "local_relationship_trace", _safe_snippet(text))
 
@@ -270,18 +360,39 @@ def build_entity_activity_summary(
                 data = dict(row)
                 policy = str(data.get("channel_policy") or "unknown").strip().lower() or "unknown"
                 text = _row_text(row, ["content"])
+                channel_name = data.get("channel_name") or ""
+                channel_display = _channel_display_name(channel_name, policy)
+                authored = data.get("user_id") in matched_user_ids or contains_subject_mention(str(data.get("user_name") or ""), subject, aliases=aliases)
+                relation = "authored" if authored else "mentioned"
+                timestamp = str(data.get("timestamp") or "")
+                topics = _topic_labels_for_text(text)
                 summary["rawProvenance"]["channelPolicies"][policy] += 1
                 _note_topics(topic_counts, text)
                 if policy in PUBLIC_CONVERSATION_POLICIES:
-                    _add_unique(summary["publicSafePossibilities"], "Public-side conversation context exists, but owner review is needed before stating it as public fact.")
-                    _add_unique(summary["channelActivity"], "Appears in public-side or broadcast-memory context.")
+                    _add_unique(summary["publicSafePossibilities"], "Public-side conversation context exists in approved Discord lanes and may support community/source-file wording after owner review.")
+                    _add_unique(summary["publicUseCandidates"], "Possible community/source-file candidate based on approved public-side context, pending owner review.")
+                    _add_unique(summary["channelActivity"], f"Appears in approved public-side conversation context in {channel_display} as {relation} context.")
+                    _add_unique(summary["observedChannels"], f"{channel_display} — approved public-side; subject {relation}.")
+                    _add_unique(summary["conversationHighlights"], _conversation_highlight(text, authored=authored, public_safe=True))
+                    _add_unique(summary["evidenceDetails"], f"Approved public-side conversation row found in {channel_display}; subject was {relation}.")
+                    if _MUSIC_PATTERN.search(text):
+                        _add_unique(summary["musicSignals"], "Approved context connects this subject to music, track, queue, radio, or show discussion; queue identity still needs review.")
+                    if _COMMUNITY_PATTERN.search(text):
+                        _add_unique(summary["communitySignals"], "Approved context places this subject in BARCODE/community conversation; owner review must confirm public wording.")
+                    if _BNL_INTERACTION_PATTERN.search(text):
+                        _add_unique(summary["bnlInteractionSignals"], f"BNL-related discussion appears in approved public-side context; subject was {relation}.")
                     quality = "public_discord_observed"
                 else:
                     _add_unique(summary["privateOnlyNotes"], "Non-public, unknown, internal, or sealed conversation context remains review-only.")
+                    _add_unique(summary["reviewOnlyEvidence"], "Internal/unknown/sealed conversation context remains review-only and cannot become a public-safe candidate.")
                     _add_unique(summary["notPublicYet"], "Conversation context from unknown/internal/sealed lanes is not public-safe evidence.")
-                    _add_unique(summary["channelActivity"], "Seen in review-only channel context.")
+                    _add_unique(summary["channelActivity"], f"Seen in review-only channel context as {relation} context.")
+                    _add_unique(summary["observedChannels"], f"review-only channel — {policy}; subject {relation}.")
+                    _add_unique(summary["conversationHighlights"], _conversation_highlight(text, authored=authored, public_safe=False))
                     quality = "internal_context_review_only"
-                _record_raw(summary["rawProvenance"], "conversations", quality, _safe_snippet(text), channelPolicy=policy)
+                for topic in topics:
+                    _add_unique(summary["topicBreakdown"], f"{topic}: observed in conversation context.")
+                _record_raw(summary["rawProvenance"], "conversations", quality, _safe_snippet(text), channelPolicy=policy, channelName=channel_name, subjectRelation=relation, timestamp=timestamp)
 
         if "memory_tiers" in lanes:
             for row in _fetch_rows(conn, "memory_tiers", guild_id, max_rows):
@@ -289,6 +400,7 @@ def build_entity_activity_summary(
                     continue
                 text = _row_text(row, ["summary", "tier"])
                 _add_unique(summary["privateOnlyNotes"], SOURCE_BLIND_REVIEW_NOTE)
+                _add_unique(summary["reviewOnlyEvidence"], SOURCE_BLIND_REVIEW_NOTE)
                 _add_unique(summary["notPublicYet"], "Source-blind memory cannot be used as a public fact without review.")
                 _add_unique(summary["channelActivity"], "Seen in source-blind legacy memory; review required.")
                 _note_topics(topic_counts, text)
@@ -304,11 +416,40 @@ def build_entity_activity_summary(
                 status = str(data.get("status") or "active")
                 if public_safe and status == "active":
                     _add_unique(summary["publicSafePossibilities"], "Broadcast-memory context may support public wording after owner review.")
+                    _add_unique(summary["publicUseCandidates"], "Active public-safe broadcast memory may support public wording after owner review.")
                     _add_unique(summary["channelActivity"], "Appears in broadcast memory.")
+                    _add_unique(summary["observedChannels"], "broadcast memory — active/public-safe; owner review still required.")
+                    if _MUSIC_PATTERN.search(text):
+                        _add_unique(summary["musicSignals"], "Broadcast memory connects this subject to radio/show/music context; owner review must confirm wording.")
                 else:
                     _add_unique(summary["privateOnlyNotes"], "Broadcast-memory context is not public-safe unless active and marked public-safe.")
+                    _add_unique(summary["reviewOnlyEvidence"], "Broadcast-memory context is review-only unless active and marked public-safe.")
                 _note_topics(topic_counts, text)
                 _record_raw(summary["rawProvenance"], "broadcast_memory", "broadcast_memory_trace", _safe_snippet(text))
+
+        if "community_presence" in lanes:
+            for row in _fetch_rows(conn, "community_presence", guild_id, max_rows):
+                if not row_matches(row, ["subject_key", "display_name", "connection_notes", "evidence_snippets"]):
+                    continue
+                data = dict(row)
+                text = _row_text(row, ["display_name", "connection_notes", "evidence_snippets"])
+                mention_count = data.get("mention_count") if "mention_count" in data else None
+                direct_count = data.get("direct_interaction_count") if "direct_interaction_count" in data else None
+                last_seen = data.get("last_seen_at") if "last_seen_at" in data else None
+                detail = "Community presence record exists for this subject"
+                if mention_count not in (None, ""):
+                    detail += f" with {_safe_int(mention_count)} observed mention(s)"
+                if direct_count not in (None, ""):
+                    detail += f" and {_safe_int(direct_count)} direct interaction marker(s)"
+                if last_seen:
+                    detail += f"; latest local presence marker {last_seen}"
+                detail += "."
+                _add_unique(summary["communitySignals"], detail)
+                _add_unique(summary["evidenceDetails"], detail)
+                _add_unique(summary["publicUseCandidates"], "Community presence can inform a possible public role only after owner review confirms identity and wording.")
+                _add_unique(summary["publicSafePossibilities"], "Community presence may support public-safe wording after owner review; it is not a confirmed public fact by itself.")
+                _note_topics(topic_counts, text)
+                _record_raw(summary["rawProvenance"], "community_presence", "community_presence_trace", _safe_snippet(text), lastSeenAt=last_seen)
 
         if "rd_context" in lanes and rd_context:
             for item in rd_context[:max_rows]:
@@ -316,6 +457,7 @@ def build_entity_activity_summary(
                 if not contains_subject_mention(text, subject, aliases=aliases):
                     continue
                 _add_unique(summary["privateOnlyNotes"], "Operator-supplied R&D context is internal until reviewed.")
+                _add_unique(summary["reviewOnlyEvidence"], "Operator-supplied R&D context is internal until reviewed.")
                 _add_unique(summary["channelActivity"], "Appears in approved R&D/operator context.")
                 _note_topics(topic_counts, text)
                 _record_raw(summary["rawProvenance"], "rd_context", "operator_supplied_context", _safe_snippet(text))
@@ -337,9 +479,20 @@ def build_entity_activity_summary(
         _add_unique(summary["notPublicYet"], "Public-safe possibilities are candidates only until owner review confirms wording.")
     if not summary["publicSafePossibilities"]:
         _add_unique(summary["publicSafePossibilities"], "No public-safe facts confirmed yet.")
+    if not summary["publicUseCandidates"] and any(item != "No public-safe facts confirmed yet." for item in summary["publicSafePossibilities"]):
+        _add_unique(summary["publicUseCandidates"], "Possible community/source-file candidate, pending owner review.")
     _add_unique(summary["notPublicYet"], QUEUE_NOT_CONNECTED_NOTE)
 
     summary["recurringTopics"] = [f"Observed topic pattern: {topic}." for topic, count in topic_counts.most_common(5) if count > 0]
+    for topic, count in topic_counts.most_common(8):
+        if count > 0:
+            _add_unique(summary["topicBreakdown"], f"{topic}: {count} approved/reviewed source row(s).")
+    if not summary["musicSignals"]:
+        _add_unique(summary["musicSignals"], "No queue/submission identity is connected yet; do not claim music submissions or counts from this summary.")
+    if not summary["communitySignals"] and summary["rawProvenance"]["rawFragments"]:
+        _add_unique(summary["communitySignals"], "Internal context exists, but community role or public identity still needs owner review.")
+    for note in summary["privateOnlyNotes"]:
+        _add_unique(summary["reviewOnlyEvidence"], note)
     source_count = len(summary["rawProvenance"]["rawFragments"])
     if source_count >= 4 and len(summary["rawProvenance"]["sourceCounts"]) >= 2:
         summary["confidence"] = "medium"
@@ -354,6 +507,12 @@ def build_entity_activity_summary(
     ]
 
     raw = summary["rawProvenance"]
+    summary["sourceCoverage"] = [
+        _source_coverage_item(source, count)
+        for source, count in Counter(raw["sourceCounts"]).most_common()
+    ]
+    if raw["channelPolicies"]:
+        summary["sourceCoverage"].append({"source": "channel_policy", "counts": dict(raw["channelPolicies"]), "status": "found"})
     raw["sourceCounts"] = dict(raw["sourceCounts"])
     raw["channelPolicies"] = dict(raw["channelPolicies"])
     if output_mode != "admin_internal":
@@ -366,26 +525,30 @@ def format_entity_activity_summary_response(summary: dict[str, Any]) -> str:
     """Format a concise operator-only Discord readout without raw provenance labels."""
 
     subject = summary.get("subjectName") or "subject"
-    known = "Internal BNL context exists." if (summary.get("rawProvenance") or {}).get("rawFragments") else "No approved local context found."
-    useful_bits = []
+    known = f"Internal BNL context exists for {subject}." if (summary.get("rawProvenance") or {}).get("rawFragments") else f"No approved local context found for {subject}."
+    useful_bits: list[str] = []
     if summary.get("matchedNames"):
-        useful_bits.append("local profile match")
+        useful_bits.append("Local profile match found.")
+    useful_bits.extend((summary.get("channelActivity") or [])[:3])
+    useful_bits.extend((summary.get("conversationHighlights") or [])[:2])
     if summary.get("relationshipSignals"):
-        useful_bits.append("relationship/context review signal")
-    if summary.get("channelActivity"):
-        useful_bits.append("channel activity signal")
-    useful = ", ".join(useful_bits) + " found." if useful_bits else "No strong reusable evidence found yet."
-    public_safe = (summary.get("publicSafePossibilities") or ["No public-safe facts confirmed yet."])[0]
-    private = (summary.get("privateOnlyNotes") or ["No private-only notes found in approved lanes."])[0]
-    missing = ", ".join((summary.get("missingInfo") or [])[:4]) or "none listed"
+        useful_bits.append((summary.get("relationshipSignals") or [])[0])
+    useful_bits = useful_bits[:6] or ["No strong reusable evidence found yet."]
+    topics = (summary.get("topicBreakdown") or summary.get("recurringTopics") or ["No clear topics yet."])[:4]
+    public_safe = (summary.get("publicUseCandidates") or summary.get("publicSafePossibilities") or ["No public-safe facts confirmed yet."])[:3]
+    private = (summary.get("reviewOnlyEvidence") or summary.get("privateOnlyNotes") or ["No private-only notes found in approved lanes."])[:4]
+    missing_items = (summary.get("missingInfo") or [])[:6]
     action = summary.get("recommendedAction") or "Keep internal and review before public use."
+    def bullets(items: list[str]) -> str:
+        return "\n".join(f"- {item}" for item in items)
     return (
         f"BNL Entity Activity Summary — {subject}\n\n"
-        f"* Current read: {known}\n"
-        f"* Useful evidence: {useful}\n"
-        f"* Public-safe: {public_safe}\n"
-        f"* Private/review-only: {private}\n"
-        f"* Missing: {missing}.\n"
-        f"* Queue/submission: {QUEUE_NOT_CONNECTED_NOTE}\n"
-        f"* Next action: {action}"
+        f"Current read:\n{known}\n\n"
+        f"Useful evidence:\n{bullets(useful_bits)}\n\n"
+        f"Topics:\n{bullets(topics)}\n\n"
+        f"Public-safe candidates:\n{bullets(public_safe)}\n\n"
+        f"Review-only:\n{bullets(private)}\n\n"
+        f"Missing:\n{bullets(missing_items or ['none listed'])}\n\n"
+        f"Queue/submission:\n{QUEUE_NOT_CONNECTED_NOTE}\n\n"
+        f"Next action:\n{action}"
     )

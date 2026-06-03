@@ -186,8 +186,10 @@ class DossierSourcePacketTests(unittest.TestCase):
         try:
             conn.execute("CREATE TABLE user_profiles (user_id INTEGER, guild_id INTEGER, display_name TEXT, preferred_name TEXT, last_seen TEXT, last_greeting_at TEXT)")
             conn.execute("CREATE TABLE relationship_journal (id INTEGER PRIMARY KEY, user_id INTEGER, guild_id INTEGER, entry_type TEXT, summary TEXT, timestamp TEXT)")
+            conn.execute("CREATE TABLE conversations (id INTEGER PRIMARY KEY, user_id INTEGER, user_name TEXT, guild_id INTEGER, channel_name TEXT, channel_policy TEXT, role TEXT, content TEXT, timestamp TEXT)")
             conn.execute("INSERT INTO user_profiles VALUES (1,123,'Signal Witch','Signal Witch',NULL,NULL)")
             conn.execute("INSERT INTO relationship_journal VALUES (NULL,1,123,'note','Signal Witch private relationship/context note for owner review.','now')")
+            conn.execute("INSERT INTO conversations VALUES (NULL,1,'Signal Witch',123,'finished-tracks','public_home','user','Signal Witch asked BNL about source-file dossier planning for a track and radio show.','now')")
             conn.commit()
 
             result = packets.build_dossier_recommendation_packet(
@@ -201,6 +203,9 @@ class DossierSourcePacketTests(unittest.TestCase):
 
             self.assertTrue(any("Local profile match found for Signal Witch" in item for item in payload["knownContext"]))
             self.assertTrue(any("relationship/context" in item for item in payload["relationshipSignals"]))
+            self.assertTrue(any("#finished-tracks" in item for item in payload["observedChannels"]))
+            self.assertTrue(any("dossier/source-file" in item for item in payload["conversationHighlights"]))
+            self.assertTrue(any("music" in item.lower() for item in payload["musicSignals"]))
             self.assertFalse(any("relationship" in item.lower() for item in payload["publicSafePossibilities"]))
             self.assertIn("queue/submission identity is not connected yet", payload["recommendedAction"])
             normal_text = json.dumps({
@@ -209,6 +214,9 @@ class DossierSourcePacketTests(unittest.TestCase):
                 "publicSafePossibilities": payload.get("publicSafePossibilities"),
                 "privateOnlyNotes": payload.get("privateOnlyNotes"),
                 "notPublicYet": payload.get("notPublicYet"),
+                "observedChannels": payload.get("observedChannels"),
+                "conversationHighlights": payload.get("conversationHighlights"),
+                "musicSignals": payload.get("musicSignals"),
             })
             self.assertNotIn("user_profiles/local_profile_observed", normal_text)
             self.assertIn("rd_context/R&D/operator note", payload["rawProvenance"]["sourceLabels"])
