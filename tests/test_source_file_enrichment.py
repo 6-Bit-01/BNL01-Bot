@@ -623,6 +623,108 @@ class SourceFileEnrichmentTests(unittest.TestCase):
         normal.pop("rawProvenance")
         self.assertNotIn("raw transcript", json.dumps(normal))
 
+    def test_enrichment_payload_is_compacted_to_site_limits(self):
+        long_item = "approved evidence " + ("x" * 3000) + " 123456789012345678"
+        packet = {
+            "subject": "HellcatNZ",
+            "matchKind": "active_source_file",
+            "sourceFile": {"id": "sf_1", "name": "HellcatNZ"},
+            "sections": {
+                "Subject Overview": [long_item for _ in range(20)],
+                "History With BARCODE / BNL / Discord / BARCODE Radio": ["prior history", "prior interaction history with review context"],
+                "Observed Patterns": ["community-side activity"],
+                "Missing Info": ["public links"],
+                "Suggested Next Action": ["owner review"],
+            },
+            "classification": {"primaryRole": "active_community_member", "activityLevel": "recurring", "dossierUse": "source_file_only"},
+            "bestEvidenceToReview": [long_item for _ in range(40)],
+            "observedChannels": ["#research-and-development 123456789012345678 " + ("x" * 2000) for _ in range(40)],
+            "conversationHighlights": ["highlight " + ("x" * 2000) for _ in range(40)],
+            "musicSignals": ["music signal"],
+            "communitySignals": ["community signal"],
+            "reviewOnlyEvidence": ["review-only note"],
+            "sourceCoverage": [
+                "entity_evidence_events checked",
+                {"source": "conversations", "count": 30, "counts": {"public": 20, "review": 10}, "status": "found", "notes": long_item},
+            ],
+            "queueSubmissionStatus": "not_connected",
+            "queueSubmissionNote": enrich.QUEUE_NOT_CONNECTED_NOTE,
+            "rawProvenance": {
+                "sourceLabels": ["entity_evidence_events/structured"],
+                "sourceCounts": {"entity_evidence_events": 40},
+                "channelPolicyCounts": {"public_safe": 20},
+                "sourceAuthority": ["local_observed"],
+                "rawFragments": [
+                    {"table": "conversations", "snippet": "full raw transcript " + ("x" * 10000), "rawRefJson": {"content": "full raw transcript " + ("y" * 10000), "channel_name": "research-and-development"}}
+                    for _ in range(20)
+                ],
+            },
+        }
+        payload = enrich.build_enrichment_recommendation_payload(packet, environ={})
+        self.assertLessEqual(len(payload["evidenceSummary"]), 2000)
+        self.assertLess(len(json.dumps(payload["rawProvenance"], sort_keys=True)), 20000)
+        self.assertLessEqual(len(payload["rawProvenance"].get("rawFragments", [])), 4)
+        for key in ("bestEvidenceToReview", "observedChannels", "conversationHighlights", "musicSignals", "communitySignals", "reviewOnlyEvidence", "sourceCoverage"):
+            self.assertIn(key, payload)
+            self.assertLessEqual(len(payload[key]), 25)
+        self.assertEqual(payload["sourceCoverage"][0], "entity_evidence_events checked")
+        self.assertEqual(payload["sourceCoverage"][1]["source"], "conversations")
+        self.assertEqual(payload["sourceCoverage"][1]["count"], 30)
+        self.assertEqual(payload["sourceCoverage"][1]["counts"], {"public": 20, "review": 10})
+        self.assertEqual(payload["sourceCoverage"][1]["status"], "found")
+        self.assertNotIn("notes", payload["sourceCoverage"][1])
+        self.assertEqual(payload["queueSubmissionStatus"], "not_connected")
+        self.assertEqual(payload["queueSubmissionNote"], enrich.QUEUE_NOT_CONNECTED_NOTE)
+        normal = dict(payload)
+        normal.pop("rawProvenance", None)
+        normal_text = json.dumps(normal)
+        self.assertNotIn("123456789012345678", normal_text)
+        self.assertNotIn("research-and-development", normal_text)
+        self.assertNotIn("[object Object]", normal_text)
+        self.assertFalse(enrich.validate_enrichment_payload_for_site(payload))
+
+    def test_source_coverage_compactor_matches_site_contract(self):
+        payload = {
+            "evidenceSummary": "compact",
+            "sourceCoverage": [
+                "source_file_lookup checked",
+                {"source": "conversations", "count": 3, "status": "found", "notes": "drop me"},
+                {"source": "entity_evidence_events", "counts": {"public": 2, "review_only": 1}, "status": "found", "rawTranscript": "drop me too"},
+            ],
+            "rawProvenance": {},
+        }
+        compact = enrich.compact_enrichment_payload_for_site(payload)
+        self.assertEqual(compact["sourceCoverage"][0], "source_file_lookup checked")
+        self.assertEqual(compact["sourceCoverage"][1], {"source": "conversations", "count": 3, "status": "found"})
+        self.assertEqual(compact["sourceCoverage"][2], {"source": "entity_evidence_events", "counts": {"public": 2, "review_only": 1}, "status": "found"})
+        self.assertNotIn("notes", compact["sourceCoverage"][1])
+        self.assertNotIn("rawTranscript", compact["sourceCoverage"][2])
+        for item in compact["sourceCoverage"]:
+            if isinstance(item, dict):
+                self.assertLessEqual(set(item), {"source", "count", "counts", "status"})
+        self.assertFalse(enrich.validate_enrichment_payload_for_site(compact))
+        self.assertNotIn("[object Object]", json.dumps(compact))
+
+    def test_source_coverage_validation_flags_uncompacted_contract_violations(self):
+        payload = {
+            "evidenceSummary": "compact",
+            "sourceCoverage": [
+                {"source": "conversations", "count": 3, "status": "found", "notes": "unsupported"},
+                {"source": "bad", "counts": {"private": float("inf")}, "status": "found"},
+            ],
+            "rawProvenance": {},
+        }
+        issues = enrich.validate_enrichment_payload_for_site(payload)
+        self.assertTrue(any("unsupported object keys" in issue for issue in issues))
+        count_issues = enrich.validate_enrichment_payload_for_site({"evidenceSummary": "compact", "sourceCoverage": [{"source": "bad", "count": float("inf"), "status": "found"}], "rawProvenance": {}})
+        self.assertTrue(any("count must be finite" in issue for issue in count_issues))
+        counts_issues = enrich.validate_enrichment_payload_for_site({"evidenceSummary": "compact", "sourceCoverage": [{"source": "bad", "counts": {"private": float("inf")}, "status": "found"}], "rawProvenance": {}})
+        self.assertTrue(any("counts values must be finite" in issue for issue in counts_issues))
+        compact = enrich.compact_enrichment_payload_for_site(payload)
+        self.assertFalse(enrich.validate_enrichment_payload_for_site(compact))
+        self.assertNotIn("notes", compact["sourceCoverage"][0])
+        self.assertNotIn("counts", compact["sourceCoverage"][1])
+
     def test_payload_keeps_machine_metadata(self):
         result = enrich.run_source_file_enrichment(self.db, 1, "HellcatNZ", dry_run=True, lookup_func=self._lookup("active"))
         payload = result["payload"]

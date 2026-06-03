@@ -1,4 +1,5 @@
 import asyncio
+import io
 import json
 import os
 import sqlite3
@@ -292,6 +293,23 @@ class DossierRecommendationSenderTests(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertIsNone(result["status"])
         self.assertIn("unreachable", result["error"])
+
+
+    def test_400_response_includes_safe_endpoint_error_text(self):
+        body = b'{"error":"Text field is too long","token":"secret-token","payload":"rawProvenance should not be copied"}'
+        http_error = urllib.error.HTTPError("https://example.test", 400, "Bad Request", hdrs=None, fp=io.BytesIO(body))
+        opener = FakeOpener(error=http_error)
+        result = dossier.send_dossier_recommendation(
+            {"subjectName": "Signal Witch", "reason": "Review", "sourceLanes": ["rd_context"]},
+            environ={"BNL_DOSSIER_INGEST_TOKEN": "secret-token"},
+            opener=opener,
+        )
+        result_text = json.dumps(result)
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["status"], 400)
+        self.assertIn("Text field is too long", result["error"])
+        self.assertNotIn("secret-token", result_text)
+        self.assertNotIn("rawProvenance should not be copied", result_text)
 
 
 class DossierRecommendationPermissionTests(unittest.TestCase):
