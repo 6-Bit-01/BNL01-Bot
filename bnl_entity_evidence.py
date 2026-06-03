@@ -297,7 +297,7 @@ def derive_entity_evidence_from_conversation_row(
     relation = "authored" if authored else "mentioned"
     kind = f"{relation}_{'public' if public else 'review_only'}_conversation"
     if public:
-        safe_summary = f"Subject {relation} approved public-side conversation about {_topic(text)}."
+        safe_summary = (f"Subject authored approved public-side conversation about {_topic(text)}." if authored else f"Subject was mentioned in approved public-side conversation about {_topic(text)}.")
         channel_name = safe_text(data.get("channel_name") or "", 80) or None
     else:
         safe_summary = f"Subject {relation} review-only conversation context; private/internal channel details require owner review."
@@ -541,7 +541,80 @@ def derive_entity_evidence_for_subject(db_path: str, subject_name: str, guild_id
     return result
 
 
-def get_entity_evidence_for_subject(conn: sqlite3.Connection, subject_name: str, guild_id: int | None = None, limit: int = 200) -> list[sqlite3.Row]:
+def _row_value(row: sqlite3.Row | dict[str, Any], key: str, default: Any = None) -> Any:
+    data = dict(row) if not isinstance(row, dict) else row
+    return data.get(key, default)
+
+
+def evidence_event_priority(row: sqlite3.Row | dict[str, Any]) -> int:
+    """Return a usefulness priority for entity evidence rows; lower is stronger."""
+
+    kind = str(_row_value(row, "evidence_kind", "") or "")
+    source_type = str(_row_value(row, "source_type", "") or "")
+    public_candidate = bool(_row_value(row, "public_safe_candidate", False))
+    if kind == "profile_match":
+        return 10
+    if kind == "authored_public_conversation":
+        return 20
+    if kind == "mentioned_public_conversation":
+        return 30
+    if kind == "broadcast_memory_signal" and public_candidate:
+        return 40
+    if kind == "music_or_show_signal" or bool(_row_value(row, "music_signal", False)):
+        return 50
+    if bool(_row_value(row, "bnl_interaction", False)):
+        return 60
+    if kind == "community_presence_signal":
+        return 70
+    if kind == "relationship_context_review_only":
+        return 80
+    if kind == "source_blind_memory_review_only" or source_type == "source_blind_memory":
+        return 90
+    if bool(_row_value(row, "review_only", True)):
+        return 100
+    return 110
+
+
+def _timestamp_rank(value: str) -> float:
+    text = str(value or "").strip()
+    if not text:
+        return 0.0
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return float(sum((idx + 1) * ord(ch) for idx, ch in enumerate(text[:80])))
+
+
+def _entity_evidence_sort_key(row: sqlite3.Row | dict[str, Any]) -> tuple[Any, ...]:
+    kind = str(_row_value(row, "evidence_kind", "") or "")
+    source_type = str(_row_value(row, "source_type", "") or "")
+    relation = str(_row_value(row, "relation_to_subject", "") or "")
+    topic = str(_row_value(row, "topic", "") or "")
+    safe_summary = str(_row_value(row, "safe_summary", "") or "")
+    confidence = float(_row_value(row, "confidence", 0) or 0)
+    observed = str(_row_value(row, "observed_at", "") or "")
+    updated = str(_row_value(row, "updated_at", "") or "")
+    row_id = int(_row_value(row, "id", 0) or 0)
+    source_rank = {"conversation": 0, "broadcast_memory": 1, "community_presence": 2, "user_profiles": 3, "relationship_context": 4, "source_blind_memory": 9}.get(source_type, 5)
+    return (
+        evidence_event_priority(row),
+        0 if bool(_row_value(row, "public_safe_candidate", False)) else 1,
+        0 if relation == "authored" or kind.startswith("authored_") else 1,
+        -confidence,
+        0 if topic and safe_summary else 1,
+        source_rank,
+        -_timestamp_rank(observed or updated),
+        -row_id,
+    )
+
+
+def sort_entity_evidence_rows(rows: list[sqlite3.Row]) -> list[sqlite3.Row]:
+    """Sort structured evidence by operator usefulness instead of insertion recency."""
+
+    return sorted(rows, key=_entity_evidence_sort_key)
+
+
+def get_ranked_entity_evidence_for_subject(conn: sqlite3.Connection, subject_name: str, guild_id: int | None = None, limit: int = 200) -> list[sqlite3.Row]:
     if not table_exists(conn, ENTITY_EVIDENCE_TABLE):
         return []
     key = subject_key(normalize_subject_name(subject_name))
@@ -550,4 +623,17 @@ def get_entity_evidence_for_subject(conn: sqlite3.Connection, subject_name: str,
     if guild_id is not None:
         where += " AND guild_id=?"
         params.append(guild_id)
-    return list(conn.execute(f"SELECT * FROM {ENTITY_EVIDENCE_TABLE} WHERE {where} ORDER BY updated_at DESC, id DESC LIMIT ?", [*params, max(1, limit)]))
+    cur = conn.cursor()
+    cur.row_factory = sqlite3.Row
+    rows = list(cur.execute(f"SELECT * FROM {ENTITY_EVIDENCE_TABLE} WHERE {where}", params))
+    return sort_entity_evidence_rows(rows)[: max(1, limit)]
+
+
+def get_entity_evidence_for_subject(conn: sqlite3.Connection, subject_name: str, guild_id: int | None = None, limit: int = 200) -> list[sqlite3.Row]:
+    """Return ranked entity evidence for summaries/readouts.
+
+    This deliberately does not simply read newest rows because bulk legacy/source-blind
+    refreshes can otherwise bury stronger public-side conversation evidence.
+    """
+
+    return get_ranked_entity_evidence_for_subject(conn, subject_name, guild_id=guild_id, limit=limit)

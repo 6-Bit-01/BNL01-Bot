@@ -255,9 +255,42 @@ def refresh_entity_evidence_for_subject(db_path: str, subject_name: str, guild_i
     return derive_entity_evidence_for_subject(db_path, subject_name, guild_id=guild_id, limit=limit)
 
 
-def _apply_structured_evidence(summary: dict[str, Any], rows: list[sqlite3.Row], topic_counts: Counter) -> None:
-    """Populate summary fields from entity_evidence_events rows."""
+def _evidence_review_label(data: dict[str, Any], channel_display: str, safe_summary: str) -> str:
+    kind = str(data.get("evidence_kind") or "structured_evidence")
+    source_type = str(data.get("source_type") or "structured")
+    relation = str(data.get("relation_to_subject") or "mentioned")
+    topic = str(data.get("topic") or "local context")
+    public_candidate = bool(data.get("public_safe_candidate"))
+    channel_part = f" in {channel_display}" if public_candidate and channel_display and channel_display != "review-only channel" else ""
+    return _safe_snippet(f"{source_type}: {kind} ({relation}, {topic}){channel_part} — {safe_summary}", 220)
 
+
+def _append_best_evidence(summary: dict[str, Any], data: dict[str, Any], channel_display: str, safe_summary: str) -> None:
+    if len(summary.setdefault("bestEvidenceToReview", [])) >= 8:
+        return
+    # Raw refs/transcripts/IDs stay in rawProvenance; this queue uses only sanitized labels and summaries.
+    _add_unique(summary["bestEvidenceToReview"], _evidence_review_label(data, channel_display, safe_summary))
+
+
+def _cap_review_only_evidence(summary: dict[str, Any], source_blind_limit: int = 2, total_limit: int = 8) -> None:
+    capped: list[str] = []
+    source_blind_seen = 0
+    for item in summary.get("reviewOnlyEvidence") or []:
+        is_source_blind = "source-blind" in item.lower() or "source blind" in item.lower()
+        if is_source_blind:
+            source_blind_seen += 1
+            if source_blind_seen > source_blind_limit:
+                continue
+        _add_unique(capped, item)
+        if len(capped) >= total_limit:
+            break
+    summary["reviewOnlyEvidence"] = capped
+
+
+def _apply_structured_evidence(summary: dict[str, Any], rows: list[sqlite3.Row], topic_counts: Counter) -> None:
+    """Populate summary fields from ranked entity_evidence_events rows."""
+
+    source_blind_review_added = 0
     for row in rows:
         data = dict(row)
         source_table = str(data.get("source_table") or "entity_evidence_events")
@@ -286,6 +319,8 @@ def _apply_structured_evidence(summary: dict[str, Any], rows: list[sqlite3.Row],
         if topic:
             topic_counts[topic] += 1
         _add_unique(summary["evidenceDetails"], safe_summary)
+        if kind != "source_blind_memory_review_only":
+            _append_best_evidence(summary, data, channel_display, safe_summary)
 
         if kind == "profile_match":
             _add_unique(summary["matchedNames"], normalize_subject_name(data.get("subject_name") or summary.get("subjectName") or ""))
@@ -311,7 +346,9 @@ def _apply_structured_evidence(summary: dict[str, Any], rows: list[sqlite3.Row],
             _add_unique(summary["reviewOnlyEvidence"], safe_summary)
         elif kind == "source_blind_memory_review_only":
             _add_unique(summary["privateOnlyNotes"], SOURCE_BLIND_REVIEW_NOTE)
-            _add_unique(summary["reviewOnlyEvidence"], safe_summary)
+            if source_blind_review_added < 2:
+                _add_unique(summary["reviewOnlyEvidence"], safe_summary)
+                source_blind_review_added += 1
             _add_unique(summary["notPublicYet"], "Source-blind memory cannot be used as a public fact without review.")
         elif kind == "broadcast_memory_signal":
             if public_candidate:
@@ -375,6 +412,7 @@ def build_entity_activity_summary(
         "communitySignals": [],
         "sourceCoverage": [],
         "evidenceDetails": [],
+        "bestEvidenceToReview": [],
         "relationshipSignals": [],
         "publicSafePossibilities": [],
         "publicUseCandidates": [],
@@ -383,7 +421,7 @@ def build_entity_activity_summary(
         "notPublicYet": [],
         "missingInfo": ["public role", "public links", "confirmed display name", "queue/submission identity"],
         "sourceAuthority": [],
-        "recommendedAction": "Keep internal and review before drafting public dossier copy.",
+        "recommendedAction": "Review the best public-side conversation and community/music signals before drafting public dossier copy.",
         "confidence": "low",
         "queueSubmissionStatus": "not_connected",
         "queueSubmissionNote": QUEUE_NOT_CONNECTED_NOTE,
@@ -619,7 +657,8 @@ def build_entity_activity_summary(
     if summary["rawProvenance"]["rawFragments"] and not summary["knownContext"]:
         _add_unique(summary["knownContext"], f"Internal BNL context exists for {subject}.")
     if summary["publicSafePossibilities"]:
-        _add_unique(summary["notPublicYet"], "Public-safe possibilities are candidates only until owner review confirms wording.")
+        _add_unique(summary["notPublicYet"], "Public-safe possibilities are review candidates, not confirmed public facts or ready dossier copy.")
+        _add_unique(summary["notPublicYet"], "Owner/admin review is still required; many candidate rows may only be supporting evidence.")
     if not summary["publicSafePossibilities"]:
         _add_unique(summary["publicSafePossibilities"], "No public-safe facts confirmed yet.")
     if not summary["publicUseCandidates"] and any(item != "No public-safe facts confirmed yet." for item in summary["publicSafePossibilities"]):
@@ -636,6 +675,7 @@ def build_entity_activity_summary(
         _add_unique(summary["communitySignals"], "Internal context exists, but community role or public identity still needs owner review.")
     for note in summary["privateOnlyNotes"]:
         _add_unique(summary["reviewOnlyEvidence"], note)
+    _cap_review_only_evidence(summary)
     source_count = len(summary["rawProvenance"]["rawFragments"])
     if source_count >= 4 and len(summary["rawProvenance"]["sourceCounts"]) >= 2:
         summary["confidence"] = "medium"
@@ -668,27 +708,44 @@ def format_entity_activity_summary_response(summary: dict[str, Any]) -> str:
     """Format a concise operator-only Discord readout without raw provenance labels."""
 
     subject = summary.get("subjectName") or "subject"
-    known = f"Internal BNL context exists for {subject}." if (summary.get("rawProvenance") or {}).get("rawFragments") else f"No approved local context found for {subject}."
+    has_context = bool((summary.get("rawProvenance") or {}).get("rawFragments"))
+    if has_context:
+        if summary.get("publicSafePossibilities") and summary.get("publicSafePossibilities") != ["No public-safe facts confirmed yet."]:
+            known = f"Internal BNL context exists for {subject}. Structured evidence exists, but public role and queue/submission identity are not confirmed."
+        else:
+            known = f"Internal BNL context exists for {subject}. Public role and queue/submission identity are not confirmed."
+    else:
+        known = f"No approved local context found for {subject}."
+
     useful_bits: list[str] = []
     if summary.get("matchedNames"):
         useful_bits.append("Local profile match found.")
-    useful_bits.extend((summary.get("channelActivity") or [])[:3])
-    useful_bits.extend((summary.get("conversationHighlights") or [])[:2])
+    useful_bits.extend((summary.get("conversationHighlights") or [])[:3])
+    useful_bits.extend([item for item in (summary.get("observedChannels") or []) if "#" in item][:2])
+    useful_bits.extend((summary.get("musicSignals") or [])[:1])
+    useful_bits.extend((summary.get("communitySignals") or [])[:2])
+    useful_bits.extend((summary.get("bnlInteractionSignals") or [])[:1])
     if summary.get("relationshipSignals"):
-        useful_bits.append((summary.get("relationshipSignals") or [])[0])
-    useful_bits = useful_bits[:6] or ["No strong reusable evidence found yet."]
-    topics = (summary.get("topicBreakdown") or summary.get("recurringTopics") or ["No clear topics yet."])[:4]
+        useful_bits.append("Relationship/context notes exist but are private review-only.")
+    useful_bits = useful_bits[:7] or ["No strong reusable evidence found yet."]
+
+    best_review = (summary.get("bestEvidenceToReview") or summary.get("topicBreakdown") or summary.get("recurringTopics") or ["No clear evidence review queue yet."])[:6]
     public_safe = (summary.get("publicUseCandidates") or summary.get("publicSafePossibilities") or ["No public-safe facts confirmed yet."])[:3]
-    private = (summary.get("reviewOnlyEvidence") or summary.get("privateOnlyNotes") or ["No private-only notes found in approved lanes."])[:4]
+    candidate_note = "Public-safe candidate events are review candidates, not confirmed public facts; owner/admin review is required before reuse."
+    if candidate_note not in public_safe:
+        public_safe.append(candidate_note)
+    private = (summary.get("reviewOnlyEvidence") or summary.get("privateOnlyNotes") or ["No private-only notes found in approved lanes."])[:6]
     missing_items = (summary.get("missingInfo") or [])[:6]
     action = summary.get("recommendedAction") or "Keep internal and review before public use."
+
     def bullets(items: list[str]) -> str:
         return "\n".join(f"- {item}" for item in items)
+
     return (
         f"BNL Entity Activity Summary — {subject}\n\n"
         f"Current read:\n{known}\n\n"
         f"Useful evidence:\n{bullets(useful_bits)}\n\n"
-        f"Topics:\n{bullets(topics)}\n\n"
+        f"Best evidence to review:\n{bullets(best_review)}\n\n"
         f"Public-safe candidates:\n{bullets(public_safe)}\n\n"
         f"Review-only:\n{bullets(private)}\n\n"
         f"Missing:\n{bullets(missing_items or ['none listed'])}\n\n"
