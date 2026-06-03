@@ -480,33 +480,205 @@ def _json_list(value: Any) -> list[str]:
 
 
 
+def _source_meaning(item: KnowledgeEvidence, display_name: str) -> tuple[str, str, str]:
+    """Return meaning-first source title, observation, and privacy boundary."""
+
+    name = _safe_snippet(display_name or item.subject_name, 80)
+    if item.source_type == "user_profiles":
+        return (
+            "Internal local profile",
+            f"BNL found an internal local profile match for {name}.",
+            "internal_only_owner_review_required",
+        )
+    if item.source_type in {"relationship_state", "relationship_journal"}:
+        return (
+            "Prior relationship/context notes",
+            f"BNL found prior relationship/context notes connected to {name}.",
+            "private_review_required_do_not_use_publicly",
+        )
+    if item.source_type == "conversations":
+        if "public_safe_candidate" in item.visibility_labels:
+            return (
+                "Approved public-side conversation context",
+                f"BNL found approved public-side conversation context connected to {name}.",
+                "public_safe_candidate_owner_review_required",
+            )
+        return (
+            "Internal conversation context",
+            f"BNL found conversation context connected to {name}, but its visibility is not public-safe without review.",
+            "internal_only_owner_review_required",
+        )
+    if item.source_type == "community_presence":
+        return (
+            "Community presence signal",
+            f"BNL found approved community presence signals connected to {name}.",
+            "public_safe_candidate_owner_review_required",
+        )
+    if item.source_type == "broadcast_memory":
+        return (
+            "BARCODE Radio memory",
+            f"BNL found BARCODE Radio/show-history context connected to {name}.",
+            "owner_review_required_before_public_use",
+        )
+    if item.source_type == "memory_tiers":
+        return (
+            "Source-blind memory trace",
+            f"BNL found older source-blind memory context connected to {name}.",
+            "source_blind_private_review_required",
+        )
+    if item.source_type == "user_memory_facts":
+        return (
+            "Internal memory fact",
+            f"BNL found an internal memory fact connected to {name}.",
+            "internal_only_owner_review_required",
+        )
+    if item.source_type == "user_habits":
+        return (
+            "Internal habit/topic signal",
+            f"BNL found internal topic/habit context connected to {name}.",
+            "internal_only_owner_review_required",
+        )
+    if item.source_type == "rd_context":
+        return (
+            "Operator R&D context",
+            f"BNL found operator-provided R&D context connected to {name}.",
+            "internal_only_owner_review_required",
+        )
+    return ("Internal review context", f"BNL found review-only context connected to {name}.", "owner_review_required")
+
+
+def _unique_preserve(values: list[str]) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for value in values:
+        clean = _safe_snippet(value, 240)
+        if not clean or clean in seen:
+            continue
+        seen.add(clean)
+        out.append(clean)
+    return out
+
+
+def _build_meaning_first_source_packet(
+    display_name: str,
+    evidence: list[KnowledgeEvidence],
+    source_types: list[str],
+    source_qualities: list[str],
+    visibility: list[str],
+    warnings: list[str],
+    confidence: str,
+    candidate_type: str,
+) -> dict[str, Any]:
+    """Build structured review context while keeping raw labels in rawProvenance."""
+
+    source_counts = Counter(item.source_type for item in evidence)
+    known_context: list[str] = []
+    useful_evidence: list[str] = []
+    relationship_signals: list[str] = []
+    public_safe: list[str] = []
+    private_notes: list[str] = []
+    not_public_yet: list[str] = []
+    source_authority: list[dict[str, str]] = []
+
+    for item in evidence:
+        title, observation, boundary = _source_meaning(item, display_name)
+        known_context.append(observation)
+        useful_evidence.append(observation)
+        source_authority.append({"source": title, "boundary": boundary, "confidence": confidence})
+        if item.source_type in {"relationship_state", "relationship_journal"}:
+            relationship_signals.append(observation + " Treat this as private relationship context, not a public fact.")
+            private_notes.append(observation + " Owner review must decide if any wording can be reused.")
+        if "public_safe_candidate" in item.visibility_labels:
+            public_safe.append(observation + " It may inform public wording only after owner review.")
+        else:
+            private_notes.append(observation + " Keep this internal until reviewed.")
+        if "owner_review_required" in item.visibility_labels or "public_use_not_allowed_until_review" in item.visibility_labels:
+            not_public_yet.append(observation + " Not public until owner review confirms safe use.")
+        if "source_blind_review_required" in item.visibility_labels:
+            private_notes.append("Source-blind memory requires source/visibility review before use.")
+
+    if candidate_type == "possible_connection_review":
+        connection = next((e.connected_subject for e in evidence if e.connected_subject), "another subject")
+        relationship_signals.insert(0, f"Possible connection to {_safe_snippet(connection, 80)} needs review; this is not an alias or identity match.")
+        not_public_yet.insert(0, "Do not present possible connections as confirmed identity, alias, or public fact.")
+    elif candidate_type == "identity_link":
+        private_notes.insert(0, "Alias/same-as language was found, but BNL must not merge aliases or identities without owner review.")
+        not_public_yet.insert(0, "Do not publish identity-link claims until owner review confirms them.")
+
+    if not public_safe:
+        public_safe.append("No public-safe fact is confirmed by this packet; owner review is required before any public use.")
+
+    return {
+        "knownContext": _unique_preserve(known_context)[:6],
+        "usefulEvidence": _unique_preserve(useful_evidence)[:6],
+        "relationshipSignals": _unique_preserve(relationship_signals)[:4],
+        "publicSafePossibilities": _unique_preserve(public_safe)[:4],
+        "privateOnlyNotes": _unique_preserve(private_notes)[:6],
+        "missingInfo": list(DEFAULT_MISSING_INFO),
+        "notPublicYet": _unique_preserve(not_public_yet)[:6],
+        "recommendedAction": "Keep as internal Source File review material until owner review decides what, if anything, can be public-safe.",
+        "confidence": confidence,
+        "sourceAuthority": source_authority[:8],
+        "rawProvenance": {
+            "sourceLabels": [f"{item.source_type}/{item.source_quality}" for item in evidence],
+            "sourceLaneMapping": {source: "unknown" for source in source_types},
+            "rawFragments": [
+                {
+                    "sourceLabel": f"{item.source_type}/{item.source_quality}",
+                    "visibilityLabels": list(item.visibility_labels),
+                    "warnings": list(item.warnings),
+                    "snippet": item.snippet,
+                }
+                for item in evidence
+            ],
+            "sourceCounts": dict(sorted(source_counts.items())),
+            "sourceTypes": list(source_types),
+            "sourceQualities": list(source_qualities),
+            "visibilityLabels": list(visibility),
+        },
+    }
+
+
+def _meaning_first_reason(display_name: str, packet: dict[str, Any], candidate_type: str) -> str:
+    contexts = list(packet.get("knownContext") or [])
+    relationship = list(packet.get("relationshipSignals") or [])
+    name = _safe_snippet(display_name, 80)
+    if candidate_type == "possible_connection_review":
+        prefix = f"BNL found review-only context for {name}, including a possible relationship/connection signal; this is not confirmed identity or alias."
+    elif candidate_type == "identity_link":
+        prefix = f"BNL found review-only identity/alias language for {name}."
+    else:
+        prefix = f"BNL found existing internal context for {name}."
+    details = []
+    for item in contexts + relationship:
+        if "local profile match" in item or "relationship/context notes" in item or "public-side conversation" in item or "community presence" in item or "BARCODE Radio" in item:
+            details.append(item)
+        if len(details) >= 2:
+            break
+    middle = " " + " ".join(details) if details else ""
+    return _safe_snippet(prefix + middle + " Keep this internal until owner review confirms what can be used publicly.", MAX_REASON_LENGTH)
+
+
 def _case_bridge_evidence_summary(display_name: str, evidence: list[KnowledgeEvidence], source_types: list[str], candidate_type: str) -> str:
     name = _safe_snippet(display_name, 80)
     if not evidence:
-        return f"{name} needs review, but BNL did not find enough supported local context to write a useful Source File note."
-    lead = f"{name} appears in existing BNL local knowledge stores ({', '.join(source_types)})."
+        return f"{name} needs owner review before BNL can write a useful Source File note."
+
+    observations = []
+    for item in evidence:
+        _title, observation, _boundary = _source_meaning(item, display_name)
+        observations.append(observation)
+
     if candidate_type == "possible_connection_review":
         connection = next((e.connected_subject for e in evidence if e.connected_subject), "another subject")
-        lead = f"{name} has a possible connection to {_safe_snippet(connection, 80)}; this is not a confirmed alias or identity match."
+        lead = f"BNL found review-only context for {name}, including a possible connection to {_safe_snippet(connection, 80)}; this is not a confirmed alias or identity match."
     elif candidate_type == "identity_link":
-        lead = f"{name} appears in alias/same-as language, but identity changes still need owner review before any merge or public use."
-    useful = []
-    for item in evidence[:4]:
-        snippet = _safe_snippet(item.snippet, 140)
-        if not snippet:
-            continue
-        if item.source_type == "memory_tiers":
-            useful.append(f"Review-only legacy memory mentions this subject: {snippet}")
-        elif item.source_type == "broadcast_memory":
-            useful.append(f"BARCODE Radio memory gives review context: {snippet}")
-        elif item.source_type == "community_presence":
-            useful.append(f"Community-side records show recurring activity around this subject: {snippet}")
-        elif item.source_type == "relationship_state":
-            useful.append(f"BNL has prior relationship context, but the public significance still needs confirmation: {snippet}")
-        else:
-            useful.append(f"Local review evidence: {snippet}")
-    tail = " ".join(useful[:3])
-    return _safe_snippet(f"{lead} {tail} Keep this as internal Source File review material until owner-approved public wording exists.", MAX_EVIDENCE_SUMMARY_LENGTH)
+        lead = f"BNL found review-only alias/same-as language for {name}; identity changes still need owner review before any merge or public use."
+    else:
+        lead = f"BNL found existing internal context for {name}."
+
+    detail = " ".join(_unique_preserve(observations)[:3])
+    return _safe_snippet(f"{lead} {detail} Keep this as internal Source File review material until owner-approved public wording exists.", MAX_EVIDENCE_SUMMARY_LENGTH)
 
 
 def collect_knowledge_bridge_candidates(db_path: str, guild_id: int | None = None, *, limit: int = DEFAULT_KNOWLEDGE_BRIDGE_LIMIT, rd_context: list[dict[str, Any]] | None = None) -> dict[str, Any]:
@@ -552,17 +724,18 @@ def collect_knowledge_bridge_candidates(db_path: str, guild_id: int | None = Non
         score = sum(e.confidence_points for e in acc.evidence)
         confidence = "high" if score >= 7 and len(source_types) > 1 else ("medium" if score >= 3 else "low")
         candidate_type = _candidate_type(acc.evidence)
-        evidence_summary = _case_bridge_evidence_summary(display_name, acc.evidence, source_types, candidate_type)
-        reason = _safe_snippet(
-            f"Knowledge bridge found {display_name} in existing BNL local knowledge stores ({', '.join(source_types)}). "
-            f"Source qualities: {', '.join(source_qualities)}. Visibility labels: {', '.join(visibility)}. Review-only Source File material; do not publish, draft, merge identities, or use publicly until owner review.",
-            MAX_REASON_LENGTH,
+        source_packet = _build_meaning_first_source_packet(
+            display_name,
+            acc.evidence,
+            source_types,
+            source_qualities,
+            visibility,
+            warnings,
+            confidence,
+            candidate_type,
         )
-        if candidate_type == "possible_connection_review":
-            connection = next((e.connected_subject for e in acc.evidence if e.connected_subject), "another subject")
-            reason = _safe_snippet(f"Knowledge bridge found {display_name} connected to {connection}. This is a possible connection review, not confirmed identity or alias. " + reason, MAX_REASON_LENGTH)
-        elif candidate_type == "identity_link":
-            reason = _safe_snippet(f"Knowledge bridge found explicit alias/same-as language for {display_name}. Review identity link before merging or public use. " + reason, MAX_REASON_LENGTH)
+        evidence_summary = _case_bridge_evidence_summary(display_name, acc.evidence, source_types, candidate_type)
+        reason = _meaning_first_reason(display_name, source_packet, candidate_type)
         evidence_hash = hashlib.sha256(f"{key}\n{candidate_type}\n{','.join(source_types)}".encode("utf-8")).hexdigest()[:10]
         payload = build_dossier_recommendation_payload(
             {
@@ -577,8 +750,17 @@ def collect_knowledge_bridge_candidates(db_path: str, guild_id: int | None = Non
                 "sourceQuality": source_qualities,
                 "visibilityLabels": visibility,
                 "safetyWarnings": warnings,
-                "suggestedAction": DEFAULT_SUGGESTED_ACTION,
-                "missingInfo": list(DEFAULT_MISSING_INFO),
+                "suggestedAction": source_packet["recommendedAction"],
+                "knownContext": source_packet["knownContext"],
+                "usefulEvidence": source_packet["usefulEvidence"],
+                "relationshipSignals": source_packet["relationshipSignals"],
+                "publicSafePossibilities": source_packet["publicSafePossibilities"],
+                "privateOnlyNotes": source_packet["privateOnlyNotes"],
+                "missingInfo": source_packet["missingInfo"],
+                "notPublicYet": source_packet["notPublicYet"],
+                "recommendedAction": source_packet["recommendedAction"],
+                "sourceAuthority": source_packet["sourceAuthority"],
+                "rawProvenance": source_packet["rawProvenance"],
                 "publicSafetyNotes": warnings + ["Internal BNL Source File recommendation only; proposed/public dossiers require separate owner review."],
                 "doNotSay": ["Do not expose raw private/internal notes, raw Discord IDs, or full transcripts publicly.", "Do not claim identity certainty or confirmed aliases unless owner review confirms it."],
                 "createdBy": "bnl",
