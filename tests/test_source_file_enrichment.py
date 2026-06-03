@@ -699,6 +699,9 @@ class SourceFileEnrichmentTests(unittest.TestCase):
         self.assertEqual(compact["sourceCoverage"][2], {"source": "entity_evidence_events", "counts": {"public": 2, "review_only": 1}, "status": "found"})
         self.assertNotIn("notes", compact["sourceCoverage"][1])
         self.assertNotIn("rawTranscript", compact["sourceCoverage"][2])
+        for item in compact["sourceCoverage"]:
+            if isinstance(item, dict):
+                self.assertLessEqual(set(item), {"source", "count", "counts", "status"})
         self.assertFalse(enrich.validate_enrichment_payload_for_site(compact))
         self.assertNotIn("[object Object]", json.dumps(compact))
 

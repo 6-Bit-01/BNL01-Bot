@@ -1750,6 +1750,59 @@ def compact_enrichment_payload_for_site(payload: dict[str, Any]) -> dict[str, An
     return compact
 
 
+def _validate_source_coverage_for_site(source_coverage: Any) -> list[str]:
+    issues: list[str] = []
+    if not isinstance(source_coverage, list):
+        return ["sourceCoverage must be a list"]
+    if len(source_coverage) > SITE_LIST_MAX_ITEMS:
+        issues.append("sourceCoverage has too many items")
+    for item in source_coverage:
+        if isinstance(item, str):
+            if len(item) > 1000 or _LONG_ID_RE.search(item) or _PRIVATE_CHANNEL_NAME_RE.search(item) or "[object Object]" in item:
+                issues.append("sourceCoverage contains unsafe text")
+                break
+            continue
+        if not isinstance(item, dict):
+            issues.append("sourceCoverage contains unsupported item type")
+            break
+        unsupported = set(item) - SITE_SOURCE_COVERAGE_ALLOWED_KEYS
+        if unsupported:
+            issues.append("sourceCoverage contains unsupported object keys")
+            break
+        text = json.dumps(item, sort_keys=True, default=str)
+        if len(text) > 1000 or _LONG_ID_RE.search(text) or _PRIVATE_CHANNEL_NAME_RE.search(text) or "[object Object]" in text:
+            issues.append("sourceCoverage contains unsafe text")
+            break
+        for text_key in ("source", "status"):
+            if text_key in item and (not isinstance(item.get(text_key), str) or len(item.get(text_key) or "") > 1000):
+                issues.append(f"sourceCoverage {text_key} must be a bounded string")
+                break
+        if issues and issues[-1].startswith("sourceCoverage "):
+            break
+        if "count" in item and not _is_finite_number(item.get("count")):
+            issues.append("sourceCoverage count must be finite")
+            break
+        if "counts" in item:
+            counts = item.get("counts")
+            if not isinstance(counts, dict):
+                issues.append("sourceCoverage counts must be an object")
+                break
+            if len(counts) > SITE_SOURCE_COVERAGE_COUNTS_MAX_KEYS:
+                issues.append("sourceCoverage counts has too many keys")
+                break
+            for count_key, count_value in counts.items():
+                count_key_text = str(count_key or "")
+                if len(count_key_text) > 1000 or _LONG_ID_RE.search(count_key_text) or _PRIVATE_CHANNEL_NAME_RE.search(count_key_text) or "[object Object]" in count_key_text:
+                    issues.append("sourceCoverage counts contains unsafe keys")
+                    break
+                if not _is_finite_number(count_value):
+                    issues.append("sourceCoverage counts values must be finite")
+                    break
+            if issues and issues[-1].startswith("sourceCoverage counts"):
+                break
+    return issues
+
+
 def validate_enrichment_payload_for_site(payload: dict[str, Any]) -> list[str]:
     issues: list[str] = []
     if len(str(payload.get("evidenceSummary") or "")) > SITE_EVIDENCE_SUMMARY_LIMIT:
@@ -1758,56 +1811,7 @@ def validate_enrichment_payload_for_site(payload: dict[str, Any]) -> list[str]:
     if raw_len > SITE_RAW_PROVENANCE_JSON_LIMIT:
         issues.append("rawProvenance exceeds site JSON limit")
     if "sourceCoverage" in payload:
-        source_coverage = payload.get("sourceCoverage")
-        if not isinstance(source_coverage, list):
-            issues.append("sourceCoverage must be a list")
-        else:
-            if len(source_coverage) > SITE_LIST_MAX_ITEMS:
-                issues.append("sourceCoverage has too many items")
-            for item in source_coverage:
-                if isinstance(item, str):
-                    if len(item) > 1000 or _LONG_ID_RE.search(item) or _PRIVATE_CHANNEL_NAME_RE.search(item) or "[object Object]" in item:
-                        issues.append("sourceCoverage contains unsafe text")
-                        break
-                    continue
-                if not isinstance(item, dict):
-                    issues.append("sourceCoverage contains unsupported item type")
-                    break
-                unsupported = set(item) - SITE_SOURCE_COVERAGE_ALLOWED_KEYS
-                if unsupported:
-                    issues.append("sourceCoverage contains unsupported object keys")
-                    break
-                text = json.dumps(item, sort_keys=True, default=str)
-                if len(text) > 1000 or _LONG_ID_RE.search(text) or _PRIVATE_CHANNEL_NAME_RE.search(text) or "[object Object]" in text:
-                    issues.append("sourceCoverage contains unsafe text")
-                    break
-                for text_key in ("source", "status"):
-                    if text_key in item and (not isinstance(item.get(text_key), str) or len(item.get(text_key) or "") > 1000):
-                        issues.append(f"sourceCoverage {text_key} must be a bounded string")
-                        break
-                if issues and issues[-1].startswith("sourceCoverage "):
-                    break
-                if "count" in item and not _is_finite_number(item.get("count")):
-                    issues.append("sourceCoverage count must be finite")
-                    break
-                if "counts" in item:
-                    counts = item.get("counts")
-                    if not isinstance(counts, dict):
-                        issues.append("sourceCoverage counts must be an object")
-                        break
-                    if len(counts) > SITE_SOURCE_COVERAGE_COUNTS_MAX_KEYS:
-                        issues.append("sourceCoverage counts has too many keys")
-                        break
-                    for count_key, count_value in counts.items():
-                        count_key_text = str(count_key or "")
-                        if len(count_key_text) > 1000 or _LONG_ID_RE.search(count_key_text) or _PRIVATE_CHANNEL_NAME_RE.search(count_key_text) or "[object Object]" in count_key_text:
-                            issues.append("sourceCoverage counts contains unsafe keys")
-                            break
-                        if not _is_finite_number(count_value):
-                            issues.append("sourceCoverage counts values must be finite")
-                            break
-                    if issues and issues[-1].startswith("sourceCoverage counts"):
-                        break
+        issues.extend(_validate_source_coverage_for_site(payload.get("sourceCoverage")))
     for key in SITE_BOUND_LIST_FIELDS:
         if key not in payload:
             continue
