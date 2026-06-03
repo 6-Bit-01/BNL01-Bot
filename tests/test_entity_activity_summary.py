@@ -299,6 +299,42 @@ class EntityActivitySummaryBuilderTests(unittest.TestCase):
         self.assertEqual(raw["sourceCounts"]["user_profiles"], 1)
         self.assertTrue(any(fragment.get("snippet") for fragment in raw["rawFragments"]))
 
+
+    def test_detail_extraction_frequency_recency_and_safe_paraphrases(self):
+        c = self.conn.cursor()
+        c.execute("INSERT INTO user_profiles VALUES (42,1,'Crow','Crow',NULL,NULL)")
+        c.execute("INSERT INTO conversations VALUES (NULL,42,'Crow',1,'finished-tracks','public_home','user','Crow shared a finished track demo and asked for listens. RAW TRACK TITLE SHOULD NOT LEAK','2026-06-01T10:00:00')")
+        c.execute("INSERT INTO conversations VALUES (NULL,42,'Crow',1,'barcode-bot','public_context','user','Crow asked how BNL source files and dossier review work. RAW SOURCE QUESTION SHOULD NOT LEAK','2026-06-02T10:00:00')")
+        c.execute("INSERT INTO conversations VALUES (NULL,42,'Crow',1,'barcode-bot','public_context','user','Crow needs help because the bot command has an issue. RAW HELP TEXT SHOULD NOT LEAK','2026-06-03T10:00:00')")
+        c.execute("INSERT INTO conversations VALUES (NULL,7,'Other',1,'general-chat','public_home','user','Crow joined the BARCODE community chat and people welcomed them. RAW WELCOME SHOULD NOT LEAK','2026-06-04T10:00:00')")
+        c.execute("INSERT INTO conversations VALUES (NULL,7,'Other',1,'research-and-development','internal_controlled','user','Crow private internal operator review note in research-and-development.','2026-06-05T10:00:00')")
+        c.execute("INSERT INTO memory_tiers VALUES (NULL,42,1,'long','Crow source-blind memory says EDGE_SESSION private raw memory should not dominate.',0.9,1,'2026-06-06T10:00:00')")
+        self.conn.commit()
+
+        summary = self._summary()
+        normal = dict(summary)
+        normal.pop("rawProvenance")
+        normal_text = json.dumps(normal)
+
+        self.assertEqual(summary["activityFrequencySummary"]["approvedPublicAuthoredRows"], 3)
+        self.assertEqual(summary["activityFrequencySummary"]["approvedPublicMentionedRows"], 1)
+        self.assertEqual(summary["activityFrequencySummary"]["reviewOnlyEvidenceCount"], 1)
+        self.assertIn("2026-06-05T10:00:00", summary["recentActivitySummary"])
+        self.assertTrue(any(item.get("channel") == "#barcode-bot" and item.get("count") == 2 for item in summary["topChannels"]))
+        topic_text = json.dumps(summary["topTopicDetails"] + summary["topicBreakdown"])
+        self.assertIn("Music/track-sharing discussion", topic_text)
+        self.assertIn("BNL/source-file/dossier discussion", topic_text)
+        self.assertIn("Help/support requests", topic_text)
+        self.assertIn("Community/server participation", topic_text)
+        self.assertIn("#finished-tracks", json.dumps(summary["representativeEvidence"]))
+        self.assertIn("#barcode-bot", json.dumps(summary["representativeEvidence"]))
+        self.assertNotIn("research-and-development", normal_text)
+        self.assertNotIn("RAW TRACK TITLE SHOULD NOT LEAK", normal_text)
+        self.assertNotIn("RAW SOURCE QUESTION SHOULD NOT LEAK", normal_text)
+        self.assertNotIn("EDGE_SESSION", normal_text)
+        self.assertEqual(summary["queueSubmissionStatus"], "not_connected")
+        self.assertNotRegex(normal_text, r"submitted\s+\d+|\d+\s+songs|Priority|payment")
+
     def test_no_queue_submission_counts_are_invented(self):
         self.conn.execute("INSERT INTO user_profiles VALUES (42,1,'Crow','Crow',NULL,NULL)")
         self.conn.commit()

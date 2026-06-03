@@ -15,8 +15,11 @@ from typing import Any
 from bnl_dossier_source_packets import normalize_subject_name, subject_key
 from bnl_entity_evidence import (
     ENTITY_EVIDENCE_TABLE,
+    build_conversation_safe_summary,
     derive_entity_evidence_for_subject,
+    extract_conversation_topic_details,
     get_entity_evidence_for_subject,
+    group_entity_evidence_details,
     table_exists as _evidence_table_exists,
 )
 
@@ -188,30 +191,18 @@ def _channel_display_name(channel_name: Any, policy: str) -> str:
     return "review-only channel"
 
 
-def _topic_labels_for_text(text: str) -> list[str]:
-    labels = []
-    for label, pattern in _TOPIC_PATTERNS:
-        if pattern.search(text or ""):
-            labels.append(label)
-    return labels
+def _topic_labels_for_text(text: str, *, review_only: bool = False) -> list[str]:
+    return extract_conversation_topic_details(text, review_only=review_only)
 
 
-def _conversation_highlight(text: str, *, authored: bool, public_safe: bool) -> str:
-    prefix = "Subject authored" if authored else "Subject was mentioned in"
-    visibility = "approved public-side conversation" if public_safe else "review-only conversation"
-    lower = text or ""
-    if re.search(r"\b(source files?|dossiers?|owner review|public-safe|public copy)\b", lower, re.I):
-        action = "dossier/source-file behavior or planning"
-    elif _MUSIC_PATTERN.search(lower):
-        action = "music, track, queue, radio, or show context"
-    elif _COMMUNITY_PATTERN.search(lower):
-        action = "BARCODE/community conversation"
-    elif re.search(r"\?\s*$|\b(asked|question|help|how do|what is|can bnl)\b", lower, re.I):
-        action = "a question or help request involving BNL"
-    else:
-        action = "local context"
-    return f"{prefix} {visibility} about {action}."
-
+def _conversation_highlight(text: str, *, authored: bool, public_safe: bool, channel_name: Any = None, channel_policy: str = "unknown") -> str:
+    return build_conversation_safe_summary(
+        text=text,
+        authored=authored,
+        public_safe=public_safe,
+        channel_name=channel_name,
+        channel_policy=channel_policy,
+    )
 
 def _source_coverage_item(source: str, count: int, status: str = "found") -> dict[str, Any]:
     return {"source": source, "count": int(count or 0), "status": status}
@@ -256,13 +247,11 @@ def refresh_entity_evidence_for_subject(db_path: str, subject_name: str, guild_i
 
 
 def _evidence_review_label(data: dict[str, Any], channel_display: str, safe_summary: str) -> str:
-    kind = str(data.get("evidence_kind") or "structured_evidence")
-    source_type = str(data.get("source_type") or "structured")
     relation = str(data.get("relation_to_subject") or "mentioned")
     topic = str(data.get("topic") or "local context")
     public_candidate = bool(data.get("public_safe_candidate"))
     channel_part = f" in {channel_display}" if public_candidate and channel_display and channel_display != "review-only channel" else ""
-    return _safe_snippet(f"{source_type}: {kind} ({relation}, {topic}){channel_part} — {safe_summary}", 220)
+    return _safe_snippet(f"Review candidate ({relation}, {topic}){channel_part} — {safe_summary}", 220)
 
 
 def _append_best_evidence(summary: dict[str, Any], data: dict[str, Any], channel_display: str, safe_summary: str) -> None:
@@ -404,6 +393,12 @@ def build_entity_activity_summary(
         "observedChannels": [],
         "channelActivity": [],
         "conversationHighlights": [],
+        "representativeEvidence": [],
+        "activityFrequencySummary": {},
+        "topChannels": [],
+        "topTopicDetails": [],
+        "recentActivitySummary": "",
+        "authoredVsMentionedSummary": "",
         "topicBreakdown": [],
         "recurringTopics": [],
         "interactionSignals": [],
@@ -430,6 +425,7 @@ def build_entity_activity_summary(
     topic_counts: Counter = Counter()
     matched_user_ids: set[Any] = set()
     aliases: list[str] = []
+    fallback_activity_rows: list[dict[str, Any]] = []
 
     if not subject:
         summary["privateOnlyNotes"].append("No subject supplied for summary.")
@@ -454,6 +450,18 @@ def build_entity_activity_summary(
         structured_rows = _structured_evidence_rows(conn, subject, guild_id, lanes, max_rows)
         if structured_rows:
             _apply_structured_evidence(summary, structured_rows, topic_counts)
+            grouped_details = group_entity_evidence_details(structured_rows)
+            for item in grouped_details.get("topicBreakdown") or []:
+                _add_unique(summary["topicBreakdown"], item)
+            for item in grouped_details.get("representativeEvidence") or []:
+                _add_unique(summary["representativeEvidence"], item)
+                _add_unique(summary["conversationHighlights"], item)
+                _add_unique(summary["evidenceDetails"], item)
+            summary["activityFrequencySummary"] = grouped_details.get("activityFrequencySummary") or {}
+            summary["topChannels"] = grouped_details.get("topChannels") or []
+            summary["topTopicDetails"] = grouped_details.get("topTopicDetails") or []
+            summary["recentActivitySummary"] = grouped_details.get("recentActivitySummary") or ""
+            summary["authoredVsMentionedSummary"] = grouped_details.get("authoredVsMentionedSummary") or ""
             matched_user_ids.update(row["matched_user_id"] for row in structured_rows if "matched_user_id" in row.keys() and row["matched_user_id"] not in (None, ""))
             for row in structured_rows:
                 if row["evidence_kind"] == "profile_match":
@@ -546,16 +554,27 @@ def build_entity_activity_summary(
                 authored = data.get("user_id") in matched_user_ids or contains_subject_mention(str(data.get("user_name") or ""), subject, aliases=aliases)
                 relation = "authored" if authored else "mentioned"
                 timestamp = str(data.get("timestamp") or "")
-                topics = _topic_labels_for_text(text)
+                topics = _topic_labels_for_text(text, review_only=policy not in PUBLIC_CONVERSATION_POLICIES)
                 summary["rawProvenance"]["channelPolicies"][policy] += 1
                 _note_topics(topic_counts, text)
                 if policy in PUBLIC_CONVERSATION_POLICIES:
+                    fallback_activity_rows.append({
+                        "public_safe_candidate": True,
+                        "review_only": False,
+                        "relation_to_subject": relation,
+                        "topic": topics[0] if topics else "Community/server participation",
+                        "channel_name": channel_name,
+                        "channel_policy": policy,
+                        "safe_summary": _conversation_highlight(text, authored=authored, public_safe=True, channel_name=channel_name, channel_policy=policy),
+                        "observed_at": timestamp,
+                        "evidence_kind": f"{relation}_public_conversation",
+                    })
                     _add_unique(summary["publicSafePossibilities"], "Public-side conversation context exists in approved Discord lanes and may support community/source-file wording after owner review.")
                     _add_unique(summary["publicUseCandidates"], "Possible community/source-file candidate based on approved public-side context, pending owner review.")
                     _add_unique(summary["channelActivity"], f"Appears in approved public-side conversation context in {channel_display} as {relation} context.")
                     _add_unique(summary["observedChannels"], f"{channel_display} — approved public-side; subject {relation}.")
-                    _add_unique(summary["conversationHighlights"], _conversation_highlight(text, authored=authored, public_safe=True))
-                    _add_unique(summary["evidenceDetails"], f"Approved public-side conversation row found in {channel_display}; subject was {relation}.")
+                    _add_unique(summary["conversationHighlights"], _conversation_highlight(text, authored=authored, public_safe=True, channel_name=channel_name, channel_policy=policy))
+                    _add_unique(summary["evidenceDetails"], f"{channel_display}: subject {relation} approved public-side {topics[0].replace(' discussion', '').lower()} discussion.")
                     if _MUSIC_PATTERN.search(text):
                         _add_unique(summary["musicSignals"], "Approved context connects this subject to music, track, queue, radio, or show discussion; queue identity still needs review.")
                     if _COMMUNITY_PATTERN.search(text):
@@ -564,12 +583,23 @@ def build_entity_activity_summary(
                         _add_unique(summary["bnlInteractionSignals"], f"BNL-related discussion appears in approved public-side context; subject was {relation}.")
                     quality = "public_discord_observed"
                 else:
+                    fallback_activity_rows.append({
+                        "public_safe_candidate": False,
+                        "review_only": True,
+                        "relation_to_subject": relation,
+                        "topic": topics[0] if topics else "Local context",
+                        "channel_name": None,
+                        "channel_policy": policy,
+                        "safe_summary": _conversation_highlight(text, authored=authored, public_safe=False, channel_name=channel_name, channel_policy=policy),
+                        "observed_at": timestamp,
+                        "evidence_kind": f"{relation}_review_only_conversation",
+                    })
                     _add_unique(summary["privateOnlyNotes"], "Non-public, unknown, internal, or sealed conversation context remains review-only.")
                     _add_unique(summary["reviewOnlyEvidence"], "Internal/unknown/sealed conversation context remains review-only and cannot become a public-safe candidate.")
                     _add_unique(summary["notPublicYet"], "Conversation context from unknown/internal/sealed lanes is not public-safe evidence.")
                     _add_unique(summary["channelActivity"], f"Seen in review-only channel context as {relation} context.")
                     _add_unique(summary["observedChannels"], f"review-only channel — {policy}; subject {relation}.")
-                    _add_unique(summary["conversationHighlights"], _conversation_highlight(text, authored=authored, public_safe=False))
+                    _add_unique(summary["conversationHighlights"], _conversation_highlight(text, authored=authored, public_safe=False, channel_name=channel_name, channel_policy=policy))
                     quality = "internal_context_review_only"
                 for topic in topics:
                     _add_unique(summary["topicBreakdown"], f"{topic}: observed in conversation context.")
@@ -646,6 +676,20 @@ def build_entity_activity_summary(
     finally:
         conn.close()
 
+    if fallback_activity_rows and not summary.get("activityFrequencySummary"):
+        grouped_details = group_entity_evidence_details(fallback_activity_rows)
+        for item in grouped_details.get("topicBreakdown") or []:
+            _add_unique(summary["topicBreakdown"], item)
+        for item in grouped_details.get("representativeEvidence") or []:
+            _add_unique(summary["representativeEvidence"], item)
+            _add_unique(summary["conversationHighlights"], item)
+            _add_unique(summary["evidenceDetails"], item)
+        summary["activityFrequencySummary"] = grouped_details.get("activityFrequencySummary") or {}
+        summary["topChannels"] = grouped_details.get("topChannels") or []
+        summary["topTopicDetails"] = grouped_details.get("topTopicDetails") or []
+        summary["recentActivitySummary"] = grouped_details.get("recentActivitySummary") or ""
+        summary["authoredVsMentionedSummary"] = grouped_details.get("authoredVsMentionedSummary") or ""
+
     if summary["matchedNames"]:
         summary["identityConfidence"] = "medium"
     elif summary["rawProvenance"]["rawFragments"]:
@@ -666,9 +710,11 @@ def build_entity_activity_summary(
     _add_unique(summary["notPublicYet"], QUEUE_NOT_CONNECTED_NOTE)
 
     summary["recurringTopics"] = [f"Observed topic pattern: {topic}." for topic, count in topic_counts.most_common(5) if count > 0]
-    for topic, count in topic_counts.most_common(8):
-        if count > 0:
-            _add_unique(summary["topicBreakdown"], f"{topic}: {count} approved/reviewed source row(s).")
+    has_detail_breakdown = any("public-side authored" in item or "public-side mentioned" in item for item in summary["topicBreakdown"])
+    if not has_detail_breakdown:
+        for topic, count in topic_counts.most_common(8):
+            if count > 0:
+                _add_unique(summary["topicBreakdown"], f"{topic}: {count} approved/reviewed source row(s).")
     if not summary["musicSignals"]:
         _add_unique(summary["musicSignals"], "No queue/submission identity is connected yet; do not claim music submissions or counts from this summary.")
     if not summary["communitySignals"] and summary["rawProvenance"]["rawFragments"]:
@@ -720,7 +766,9 @@ def format_entity_activity_summary_response(summary: dict[str, Any]) -> str:
     useful_bits: list[str] = []
     if summary.get("matchedNames"):
         useful_bits.append("Local profile match found.")
-    useful_bits.extend((summary.get("conversationHighlights") or [])[:3])
+    useful_bits.extend((summary.get("representativeEvidence") or summary.get("conversationHighlights") or [])[:3])
+    if summary.get("authoredVsMentionedSummary"):
+        useful_bits.append(summary["authoredVsMentionedSummary"])
     useful_bits.extend([item for item in (summary.get("observedChannels") or []) if "#" in item][:2])
     useful_bits.extend((summary.get("musicSignals") or [])[:1])
     useful_bits.extend((summary.get("communitySignals") or [])[:2])

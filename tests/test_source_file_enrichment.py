@@ -572,7 +572,7 @@ class SourceFileEnrichmentTests(unittest.TestCase):
         with mock.patch.object(enrich, "refresh_entity_evidence_for_subject", return_value={"ok": True}):
             result = enrich.run_source_file_enrichment(self.db, 1, "HellcatNZ", dry_run=True, lookup_func=self._lookup("active"))
         payload = result["payload"]
-        for key in ("observedChannels", "conversationHighlights", "topicBreakdown", "bestEvidenceToReview", "bnlInteractionSignals", "musicSignals", "communitySignals", "sourceCoverage", "evidenceDetails", "publicUseCandidates", "reviewOnlyEvidence", "queueSubmissionStatus", "queueSubmissionNote"):
+        for key in ("observedChannels", "conversationHighlights", "representativeEvidence", "topicBreakdown", "topChannels", "topTopicDetails", "activityFrequencySummary", "recentActivitySummary", "authoredVsMentionedSummary", "bestEvidenceToReview", "bnlInteractionSignals", "musicSignals", "communitySignals", "sourceCoverage", "evidenceDetails", "publicUseCandidates", "reviewOnlyEvidence", "queueSubmissionStatus", "queueSubmissionNote"):
             self.assertIn(key, result)
             self.assertIn(key, payload)
         self.assertIsInstance(payload["sourceCoverage"], list)
@@ -581,7 +581,7 @@ class SourceFileEnrichmentTests(unittest.TestCase):
         self.assertEqual(payload["queueSubmissionNote"], enrich.QUEUE_NOT_CONNECTED_NOTE)
         self.assertTrue(any("pending owner/admin review" in item for item in payload["publicUseCandidates"]))
         self.assertTrue(any("Review-only planning context" in item for item in payload["reviewOnlyEvidence"]))
-        public_normal_text = json.dumps({key: payload.get(key) for key in ("observedChannels", "conversationHighlights", "evidenceDetails", "bestEvidenceToReview", "publicUseCandidates")})
+        public_normal_text = json.dumps({key: payload.get(key) for key in ("observedChannels", "conversationHighlights", "representativeEvidence", "evidenceDetails", "bestEvidenceToReview", "publicUseCandidates")})
         self.assertNotIn("Review-only planning context", public_normal_text)
         normal = dict(payload)
         raw = normal.pop("rawProvenance")
@@ -603,7 +603,13 @@ class SourceFileEnrichmentTests(unittest.TestCase):
             "knownContext": ["Structured context exists."],
             "observedChannels": ["#finished-tracks — approved public-side; subject authored."],
             "conversationHighlights": ["Sanitized highlight."],
-            "topicBreakdown": ["music/community context: 1 approved/reviewed source row(s)."],
+            "topicBreakdown": ["Music/track-sharing discussion: 1 public-side authored row(s), mostly in #finished-tracks."],
+            "representativeEvidence": ["#finished-tracks: authored music/track-sharing discussion."],
+            "topChannels": [{"channel": "#finished-tracks", "count": 1}],
+            "topTopicDetails": [{"topic": "Music/track-sharing discussion", "count": 1}],
+            "activityFrequencySummary": {"approvedPublicAuthoredRows": 1, "approvedPublicMentionedRows": 0, "reviewOnlyEvidenceCount": 1, "mostRecentObservedAt": "2026-06-01"},
+            "recentActivitySummary": "Most recent observed evidence timestamp: 2026-06-01.",
+            "authoredVsMentionedSummary": "1 approved public-side authored row(s); 0 approved public-side mentioned row(s).",
             "bestEvidenceToReview": ["discord: authored_public_conversation — Sanitized highlight."],
             "bnlInteractionSignals": ["BNL-related interaction context exists."],
             "musicSignals": ["Music/radio/show context exists; queue identity still needs review."],
@@ -616,7 +622,7 @@ class SourceFileEnrichmentTests(unittest.TestCase):
             "rawProvenance": {"rawFragments": [{"rawRefJson": "raw transcript"}]},
         }
         payload = enrich.build_enrichment_recommendation_payload(packet, environ={})
-        for key in ("observedChannels", "conversationHighlights", "topicBreakdown", "bestEvidenceToReview", "bnlInteractionSignals", "musicSignals", "communitySignals", "sourceCoverage", "evidenceDetails", "publicUseCandidates", "reviewOnlyEvidence", "queueSubmissionStatus", "queueSubmissionNote"):
+        for key in ("observedChannels", "conversationHighlights", "representativeEvidence", "topicBreakdown", "topChannels", "topTopicDetails", "activityFrequencySummary", "recentActivitySummary", "authoredVsMentionedSummary", "bestEvidenceToReview", "bnlInteractionSignals", "musicSignals", "communitySignals", "sourceCoverage", "evidenceDetails", "publicUseCandidates", "reviewOnlyEvidence", "queueSubmissionStatus", "queueSubmissionNote"):
             self.assertEqual(payload[key], packet[key])
         self.assertEqual(payload["rawProvenance"], packet["rawProvenance"])
         normal = dict(payload)

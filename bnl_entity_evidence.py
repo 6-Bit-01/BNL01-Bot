@@ -46,10 +46,16 @@ _MUSIC_PATTERN = re.compile(r"\b(artist|track|song|playlist|radio|show|performan
 _COMMUNITY_PATTERN = re.compile(r"\b(community|server|barcode|member|public|conversation|channel|chat|finished tracks?|wips?)\b", re.I)
 _BNL_PATTERN = re.compile(r"\b(bnl|bot|source files?|dossiers?|owner review|public-safe|asked|question|help|review)\b", re.I)
 _TOPIC_PATTERNS = [
-    ("music/community context", _MUSIC_PATTERN),
-    ("source-file/dossier planning context", re.compile(r"\b(source files?|dossiers?|draft|candidate|owner review|public copy|public-safe)\b", re.I)),
-    ("community/event context", _COMMUNITY_PATTERN),
-    ("help/support requests", re.compile(r"\b(help|support|assist|fix|issue|question|request|need)\b", re.I)),
+    ("BNL/source-file/dossier discussion", re.compile(r"\b(bnl|source files?|dossiers?|draft|candidate|owner review|public copy|public-safe|source packet)\b", re.I)),
+    ("Music/track-sharing discussion", re.compile(r"\b(finished tracks?|share(?:d|ing)?\s+(?:a\s+)?(?:track|song|music)|new track|track|song|beat|music)\b", re.I)),
+    ("WIP/demo discussion", re.compile(r"\b(wips?|work in progress|demo|rough mix|preview|snippet)\b", re.I)),
+    ("Collaboration discussion", re.compile(r"\b(collab(?:oration)?s?|feature|work together|producer|vocalist|remix)\b", re.I)),
+    ("BARCODE Radio/show discussion", re.compile(r"\b(barcode radio|radio|show|episode|broadcast|live set|performance|playlist)\b", re.I)),
+    ("Help/support requests", re.compile(r"\b(help|support|assist|fix|issue|question|request|need|how do|can bnl|explain)\b|\?\s*$", re.I)),
+    ("Community/server participation", re.compile(r"\b(community|server|barcode|member|public|conversation|channel|chat|general chat)\b", re.I)),
+    ("Introductions/social links", re.compile(r"\b(intro(?:duce|duction)?|hello|hi everyone|socials?|linktree|instagram|soundcloud|spotify|youtube)\b", re.I)),
+    ("Event/riddle/engagement activity", re.compile(r"\b(event|riddle|game|contest|challenge|engagement|poll|vote)\b", re.I)),
+    ("Admin/operator review context", re.compile(r"\b(admin|operator|moderation|mod|staff|review-only|internal|private)\b", re.I)),
 ]
 
 
@@ -269,6 +275,136 @@ def _topic(text: str) -> str:
     return labels[0] if labels else "local context"
 
 
+
+def extract_conversation_topic_details(text: str, *, review_only: bool = False) -> list[str]:
+    """Return specific, review-safe conversation detail labels without raw quotes."""
+
+    labels: list[str] = []
+    for label, pattern in _TOPIC_PATTERNS:
+        if pattern.search(text or ""):
+            if label == "Admin/operator review context" and not review_only:
+                continue
+            if label not in labels:
+                labels.append(label)
+    if not labels:
+        labels.append("Community/server participation" if _COMMUNITY_PATTERN.search(text or "") else "Local context")
+    return labels[:4]
+
+
+def _safe_channel_label(channel_name: Any, policy: str) -> str:
+    if policy not in PUBLIC_CONVERSATION_POLICIES:
+        return "approved public-side channel"
+    name = re.sub(r"[^A-Za-z0-9 _-]+", "", str(channel_name or "")).strip().replace(" ", "-").lower()
+    return f"#{name[:60]}" if name else "approved public-side channel"
+
+
+def build_conversation_safe_summary(*, text: str, authored: bool, public_safe: bool, channel_name: Any = None, channel_policy: str = "unknown") -> str:
+    """Build a short paraphrase for conversation evidence; never include raw text."""
+
+    relation = "Subject authored" if authored else "Subject was mentioned in"
+    if not public_safe:
+        role = "authored" if authored else "was mentioned in"
+        return f"Subject {role} review-only conversation context; private/internal channel details require owner review."
+    labels = extract_conversation_topic_details(text, review_only=False)
+    primary = labels[0].replace(" discussion", "").replace("BNL/source-file/dossier", "dossier/source-file")
+    if primary == "Help/support requests":
+        action = "help/support request"
+    elif primary == "Community/server participation":
+        action = "community discussion"
+    else:
+        action = f"discussion about {primary}"
+    channel = _safe_channel_label(channel_name, channel_policy)
+    return f"{relation} approved public-side {action} in {channel}."
+
+
+def extract_entity_activity_details(row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
+    data = dict(row) if not isinstance(row, dict) else dict(row)
+    public_candidate = bool(data.get("public_safe_candidate")) and not bool(data.get("review_only"))
+    policy = str(data.get("channel_policy") or "unknown").lower()
+    relation = str(data.get("relation_to_subject") or "mentioned")
+    topic = str(data.get("topic") or "Local context")
+    channel = _safe_channel_label(data.get("channel_name"), policy) if public_candidate else "review-only channel"
+    summary = safe_text(data.get("safe_summary") or "Structured entity evidence exists for owner review.", MAX_SAFE_SUMMARY_LENGTH)
+    return {
+        "topic": topic,
+        "relation": relation,
+        "publicSafe": public_candidate,
+        "reviewOnly": bool(data.get("review_only")),
+        "channel": channel,
+        "safeSummary": summary,
+        "observedAt": data.get("observed_at") or data.get("updated_at"),
+        "evidenceKind": data.get("evidence_kind"),
+    }
+
+
+def _representative_evidence_line(detail: dict[str, Any]) -> str:
+    if not detail.get("publicSafe"):
+        return "Review-only evidence exists; private/internal details require owner review."
+    relation = "authored" if detail.get("relation") == "authored" else "mentioned"
+    topic = str(detail.get("topic") or "community/server participation").replace(" discussion", "").lower()
+    return f"{detail.get('channel')}: {relation} {topic} discussion."
+
+
+def group_entity_evidence_details(rows: list[sqlite3.Row | dict[str, Any]]) -> dict[str, Any]:
+    """Aggregate structured evidence into website-friendly counts and paraphrases."""
+
+    details = [extract_entity_activity_details(row) for row in rows]
+    public_details = [item for item in details if item["publicSafe"]]
+    topic_counts = Counter(item["topic"] for item in public_details)
+    channel_counts = Counter(item["channel"] for item in public_details if str(item.get("channel") or "").startswith("#"))
+    topic_channel_counts: dict[str, Counter] = {}
+    topic_relation_counts: dict[str, Counter] = {}
+    for item in public_details:
+        topic_channel_counts.setdefault(item["topic"], Counter())[item["channel"]] += 1
+        topic_relation_counts.setdefault(item["topic"], Counter())[item["relation"]] += 1
+    authored_count = sum(1 for item in public_details if item["relation"] == "authored")
+    mentioned_count = sum(1 for item in public_details if item["relation"] != "authored")
+    review_only_count = sum(1 for item in details if item["reviewOnly"] or not item["publicSafe"])
+    observed_values = [str(item.get("observedAt") or "") for item in details if item.get("observedAt")]
+    most_recent = max(observed_values) if observed_values else ""
+
+    topic_breakdown: list[str] = []
+    for topic, count in topic_counts.most_common(8):
+        relations = topic_relation_counts.get(topic, Counter())
+        rel_bits = []
+        if relations.get("authored"):
+            rel_bits.append(f"{relations['authored']} public-side authored row(s)")
+        mentioned = count - relations.get("authored", 0)
+        if mentioned:
+            rel_bits.append(f"{mentioned} public-side mentioned row(s)")
+        line = f"{topic}: {', '.join(rel_bits) or f'{count} public-side row(s)'}"
+        channel, channel_count = (topic_channel_counts.get(topic, Counter()).most_common(1) or [("", 0)])[0]
+        if channel.startswith("#") and channel_count >= max(1, count // 2):
+            line += f", mostly in {channel}"
+        topic_breakdown.append(line + ".")
+
+    representative: list[str] = []
+    seen_topics: set[str] = set()
+    for item in public_details:
+        if item["topic"] in seen_topics:
+            continue
+        representative.append(_representative_evidence_line(item))
+        seen_topics.add(item["topic"])
+        if len(representative) >= 5:
+            break
+    if len(public_details) >= 3 and len(channel_counts) >= 2:
+        representative.append("Community activity appears repeated across approved public-side channels.")
+
+    return {
+        "activityFrequencySummary": {
+            "approvedPublicAuthoredRows": authored_count,
+            "approvedPublicMentionedRows": mentioned_count,
+            "reviewOnlyEvidenceCount": review_only_count,
+            "mostRecentObservedAt": most_recent,
+        },
+        "authoredVsMentionedSummary": f"{authored_count} approved public-side authored row(s); {mentioned_count} approved public-side mentioned row(s).",
+        "recentActivitySummary": f"Most recent observed evidence timestamp: {most_recent}." if most_recent else "No observed timestamp available in structured evidence.",
+        "topChannels": [{"channel": channel, "count": count} for channel, count in channel_counts.most_common(5)],
+        "topTopicDetails": [{"topic": topic, "count": count} for topic, count in topic_counts.most_common(8)],
+        "topicBreakdown": topic_breakdown,
+        "representativeEvidence": representative[:6],
+    }
+
 def _source_row_id(data: dict[str, Any]) -> str | None:
     value = data.get("id")
     return None if value in (None, "") else str(value)
@@ -297,7 +433,7 @@ def derive_entity_evidence_from_conversation_row(
     relation = "authored" if authored else "mentioned"
     kind = f"{relation}_{'public' if public else 'review_only'}_conversation"
     if public:
-        safe_summary = (f"Subject authored approved public-side conversation about {_topic(text)}." if authored else f"Subject was mentioned in approved public-side conversation about {_topic(text)}.")
+        safe_summary = build_conversation_safe_summary(text=text, authored=authored, public_safe=True, channel_name=data.get("channel_name"), channel_policy=policy)
         channel_name = safe_text(data.get("channel_name") or "", 80) or None
     else:
         safe_summary = f"Subject {relation} review-only conversation context; private/internal channel details require owner review."
@@ -317,7 +453,7 @@ def derive_entity_evidence_from_conversation_row(
         authority="channel_policy_observed" if public else "internal_review_only",
         confidence=0.72 if public else 0.5,
         relation_to_subject=relation,
-        topic=_topic(text),
+        topic=(extract_conversation_topic_details(text, review_only=not public) or [_topic(text)])[0],
         evidence_kind=kind,
         safe_summary=safe_summary,
         public_safe_candidate=public,
