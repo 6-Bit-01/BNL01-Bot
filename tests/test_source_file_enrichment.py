@@ -576,7 +576,7 @@ class SourceFileEnrichmentTests(unittest.TestCase):
             self.assertIn(key, result)
             self.assertIn(key, payload)
         self.assertIsInstance(payload["sourceCoverage"], list)
-        self.assertTrue(any(item.get("source") == "conversations" for item in payload["sourceCoverage"] if isinstance(item, dict)))
+        self.assertTrue(any(item.get("source") == "conversation evidence" for item in payload["sourceCoverage"] if isinstance(item, dict)))
         self.assertEqual(payload["queueSubmissionStatus"], "not_connected")
         self.assertEqual(payload["queueSubmissionNote"], enrich.QUEUE_NOT_CONNECTED_NOTE)
         self.assertTrue(any("pending owner and admin review" in item for item in payload["publicUseCandidates"]))
@@ -622,9 +622,16 @@ class SourceFileEnrichmentTests(unittest.TestCase):
             "rawProvenance": {"rawFragments": [{"rawRefJson": "raw transcript"}]},
         }
         payload = enrich.build_enrichment_recommendation_payload(packet, environ={})
-        passthrough_keys = ("observedChannels", "conversationHighlights", "topChannels", "activityFrequencySummary", "recentActivitySummary", "authoredVsMentionedSummary", "bnlInteractionSignals", "communitySignals", "sourceCoverage", "evidenceDetails", "reviewOnlyEvidence", "queueSubmissionStatus", "queueSubmissionNote")
+        passthrough_keys = ("observedChannels", "conversationHighlights", "topChannels", "recentActivitySummary", "bnlInteractionSignals", "communitySignals", "evidenceDetails", "reviewOnlyEvidence", "queueSubmissionStatus", "queueSubmissionNote")
         for key in passthrough_keys:
             self.assertEqual(payload[key], packet[key])
+        self.assertEqual(payload["activityFrequencySummary"]["postedCount"], 1)
+        self.assertEqual(payload["activityFrequencySummary"]["mentionedCount"], 0)
+        self.assertIn("2026-06-01", payload["activityFrequencySummary"]["recency"])
+        self.assertIn("Review-only evidence count: 1", payload["activityFrequencySummary"]["context"])
+        self.assertNotIn("approvedPublicAuthoredRows", json.dumps(payload))
+        self.assertEqual(payload["authoredVsMentionedSummary"], "1 approved public-side posted item(s); 0 approved public-side mentioned item(s).")
+        self.assertEqual(payload["sourceCoverage"], [{"source": "entity evidence events", "count": 2, "status": "found"}])
         self.assertEqual(payload["topicBreakdown"], ["music and track-sharing classification: 1 public-side authored item(s), mostly in #finished-tracks."])
         self.assertEqual(payload["representativeEvidence"], ["#finished-tracks: approved public-context item classified under music and track-sharing; review before using as a subject claim."])
         self.assertEqual(payload["topTopicDetails"], [{"topic": "music and track-sharing classification", "count": 1}])
@@ -697,7 +704,7 @@ class SourceFileEnrichmentTests(unittest.TestCase):
             "communitySignals": ["community signal"],
             "reviewOnlyEvidence": ["review-only note"],
             "sourceCoverage": [
-                "entity_evidence_events checked",
+                "entity evidence events checked",
                 {"source": "conversations", "count": 30, "counts": {"public": 20, "review": 10}, "status": "found", "notes": long_item},
             ],
             "queueSubmissionStatus": "not_connected",
@@ -720,8 +727,8 @@ class SourceFileEnrichmentTests(unittest.TestCase):
         for key in ("bestEvidenceToReview", "observedChannels", "conversationHighlights", "musicSignals", "communitySignals", "reviewOnlyEvidence", "sourceCoverage"):
             self.assertIn(key, payload)
             self.assertLessEqual(len(payload[key]), 25)
-        self.assertEqual(payload["sourceCoverage"][0], "entity_evidence_events checked")
-        self.assertEqual(payload["sourceCoverage"][1]["source"], "conversations")
+        self.assertEqual(payload["sourceCoverage"][0], "entity evidence events checked")
+        self.assertEqual(payload["sourceCoverage"][1]["source"], "conversation evidence")
         self.assertEqual(payload["sourceCoverage"][1]["count"], 30)
         self.assertEqual(payload["sourceCoverage"][1]["counts"], {"public": 20, "review": 10})
         self.assertEqual(payload["sourceCoverage"][1]["status"], "found")
@@ -736,20 +743,81 @@ class SourceFileEnrichmentTests(unittest.TestCase):
         self.assertNotIn("[object Object]", normal_text)
         self.assertFalse(enrich.validate_enrichment_payload_for_site(payload))
 
+    def test_all_structured_readout_fields_normalize_to_website_contract(self):
+        payload = {
+            "evidenceSummary": "summary",
+            "representativeEvidence": ["#barcode-bot: authored music/track-sharing discussion."],
+            "activityFrequencySummary": {
+                "approvedPublicAuthoredRows": 12,
+                "approvedPublicMentionedRows": 3,
+                "reviewOnlyEvidenceCount": 7,
+                "mostRecentObservedAt": "2026-06-03T21:24:00",
+            },
+            "topChannels": [
+                {"channel": "#barcode-bot", "channelId": "123456789012345678", "count": 6},
+                {"channel": "research-and-development", "count": 2},
+            ],
+            "topTopicDetails": [{"topic": "Music/track-sharing discussion", "rawTaxonomy": "Music/track-sharing", "count": 4}],
+            "recentActivitySummary": {"mostRecentObservedAt": "2026-06-03T21:24:00", "sourceTable": "entity_evidence_events"},
+            "authoredVsMentionedSummary": {"approvedPublicAuthoredRows": 12, "approvedPublicMentionedRows": 3},
+            "conversationHighlights": [{"summary": "Highlight only.", "sourceRowId": "123456789012345678"}],
+            "topicBreakdown": ["BNL/source-file/dossier discussion: 4 items."],
+            "evidenceDetails": [{"detail": "Safe detail.", "sourceLabel": "entity_evidence_events/structured"}],
+            "bestEvidenceToReview": [{"summary": "Safe review detail.", "source_table": "conversations"}],
+            "musicSignals": [{"summary": "Music/radio/show context exists."}],
+            "communitySignals": [{"summary": "Community/server participation exists."}],
+            "bnlInteractionSignals": [{"summary": "BNL/source-file/dossier context exists."}],
+            "sourceCoverage": ["entity_evidence_events checked", {"source": "conversations", "count": 2, "status": "found"}],
+            "queueSubmissionStatus": "not_connected",
+            "rawProvenance": {"sourceLabels": ["entity_evidence_events/structured"], "rawFragments": [{"sourceRowId": "123456789012345678", "channel_name": "research-and-development"}]},
+        }
+        compact = enrich.compact_enrichment_payload_for_site(payload)
+        normal = dict(compact)
+        raw = normal.pop("rawProvenance")
+        normal_text = json.dumps(normal)
+        for raw_key in ("approvedPublicAuthoredRows", "approvedPublicMentionedRows", "reviewOnlyEvidenceCount", "mostRecentObservedAt", "sourceRowId", "sourceLabel", "sourceTable", "channelId"):
+            self.assertNotIn(raw_key, normal_text)
+        self.assertEqual(compact["activityFrequencySummary"]["postedCount"], 12)
+        self.assertEqual(compact["activityFrequencySummary"]["mentionedCount"], 3)
+        self.assertIn("Review-only evidence count: 7", compact["activityFrequencySummary"]["context"])
+        self.assertIn("2026-06-03T21:24:00", compact["activityFrequencySummary"]["recency"])
+        self.assertEqual(compact["authoredVsMentionedSummary"], {"summary": "Posted and mentioned balance.", "postedCount": 12, "mentionedCount": 3})
+        self.assertTrue(all(set(item) <= enrich.SITE_READOUT_ALLOWED_OBJECT_KEYS for item in compact["topChannels"] if isinstance(item, dict)))
+        self.assertTrue(all(set(item) <= enrich.SITE_READOUT_ALLOWED_OBJECT_KEYS for item in compact["topTopicDetails"] if isinstance(item, dict)))
+        self.assertNotIn("Music/track-sharing", normal_text)
+        self.assertNotIn("BNL/source-file/dossier", normal_text)
+        self.assertNotIn("research-and-development", normal_text)
+        self.assertNotIn("entity_evidence_events", normal_text)
+        self.assertNotIn("conversations", normal_text)
+        self.assertFalse(enrich.validate_enrichment_payload_for_site(compact))
+        self.assertIn("rawFragments", raw)
+        self.assertEqual(compact["queueSubmissionStatus"], "not_connected")
+
+    def test_readout_validation_flags_unsupported_keys_across_contract_fields(self):
+        for field in enrich.SITE_CONTRACT_READOUT_FIELDS:
+            if field == "sourceCoverage":
+                payload = {"evidenceSummary": "summary", "rawProvenance": {}, field: [{"source": "conversation evidence", "count": 1, "unsupported": "x"}]}
+            elif field in {"activityFrequencySummary", "recentActivitySummary", "authoredVsMentionedSummary"}:
+                payload = {"evidenceSummary": "summary", "rawProvenance": {}, field: {"summary": "safe", "unsupported": "x"}}
+            else:
+                payload = {"evidenceSummary": "summary", "rawProvenance": {}, field: [{"summary": "safe", "unsupported": "x"}]}
+            issues = enrich.validate_enrichment_payload_for_site(payload)
+            self.assertTrue(any("unsupported object keys" in issue for issue in issues), field)
+
     def test_source_coverage_compactor_matches_site_contract(self):
         payload = {
             "evidenceSummary": "compact",
             "sourceCoverage": [
-                "source_file_lookup checked",
+                "source file lookup evidence checked",
                 {"source": "conversations", "count": 3, "status": "found", "notes": "drop me"},
                 {"source": "entity_evidence_events", "counts": {"public": 2, "review_only": 1}, "status": "found", "rawTranscript": "drop me too"},
             ],
             "rawProvenance": {},
         }
         compact = enrich.compact_enrichment_payload_for_site(payload)
-        self.assertEqual(compact["sourceCoverage"][0], "source_file_lookup checked")
-        self.assertEqual(compact["sourceCoverage"][1], {"source": "conversations", "count": 3, "status": "found"})
-        self.assertEqual(compact["sourceCoverage"][2], {"source": "entity_evidence_events", "counts": {"public": 2, "review_only": 1}, "status": "found"})
+        self.assertEqual(compact["sourceCoverage"][0], "source file lookup evidence checked")
+        self.assertEqual(compact["sourceCoverage"][1], {"source": "conversation evidence", "count": 3, "status": "found"})
+        self.assertEqual(compact["sourceCoverage"][2], {"source": "entity evidence events", "counts": {"public": 2, "review only": 1}, "status": "found"})
         self.assertNotIn("notes", compact["sourceCoverage"][1])
         self.assertNotIn("rawTranscript", compact["sourceCoverage"][2])
         for item in compact["sourceCoverage"]:

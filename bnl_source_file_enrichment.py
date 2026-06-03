@@ -34,6 +34,48 @@ SITE_RAW_FRAGMENT_MAX_ITEMS = 4
 SITE_RAW_FRAGMENT_TEXT_LIMIT = 500
 SITE_SOURCE_COVERAGE_ALLOWED_KEYS = {"source", "count", "counts", "status"}
 SITE_SOURCE_COVERAGE_COUNTS_MAX_KEYS = 25
+SITE_READOUT_ALLOWED_OBJECT_KEYS = {
+    "summary",
+    "label",
+    "detail",
+    "topic",
+    "channel",
+    "channels",
+    "context",
+    "status",
+    "kind",
+    "type",
+    "activityType",
+    "relationship",
+    "visibility",
+    "window",
+    "recency",
+    "frequency",
+    "count",
+    "counts",
+    "postedCount",
+    "mentionedCount",
+    "publicCount",
+    "recentCount",
+    "firstSeen",
+    "lastSeen",
+}
+SITE_CONTRACT_READOUT_FIELDS = (
+    "representativeEvidence",
+    "activityFrequencySummary",
+    "topChannels",
+    "topTopicDetails",
+    "recentActivitySummary",
+    "authoredVsMentionedSummary",
+    "conversationHighlights",
+    "topicBreakdown",
+    "evidenceDetails",
+    "bestEvidenceToReview",
+    "musicSignals",
+    "communitySignals",
+    "bnlInteractionSignals",
+    "sourceCoverage",
+)
 SITE_BOUND_LIST_FIELDS = (
     "knownContext",
     "usefulEvidence",
@@ -66,6 +108,9 @@ _RAW_REPRESENTATIVE_EVIDENCE_RE = re.compile(
     re.I,
 )
 _UNSAFE_REPRESENTATIVE_EVIDENCE_TOKENS = ("authored_public_conversation", "profile_match", "[object Object]")
+_SOURCE_TABLE_NAME_RE = re.compile(r"\b(?:entity_evidence_events|conversations|user_profiles|user_memory_facts|user_habits|relationship_state|relationship_journal|memory_tiers|broadcast_memory|community_presence|rd_context|source_file_lookup)\b", re.I)
+_RAW_SOURCE_LABEL_RE = re.compile(r"\b(?:sourceLabel|source_label|rawRefJson|sourceRowId|source_row_id|channel_id|user_id)\b|\b[a-z_]+/[A-Za-z0-9_-]+", re.I)
+_PATH_LOOKING_RE = re.compile(r"(?:^|\s)(?:[/~]|[A-Za-z]:\\|[\w.-]+[/\\][\w.-]+)")
 
 ENTITY_SUMMARY_EVIDENCE_FIELDS = {
     "observedChannels": 6,
@@ -1654,6 +1699,202 @@ def _compact_list_for_site(value: Any, *, max_items: int = SITE_LIST_MAX_ITEMS, 
     return compact
 
 
+def _safe_count(value: Any) -> int | float | None:
+    if _is_finite_number(value):
+        return value
+    try:
+        if value in (None, ""):
+            return None
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    if parsed != parsed or parsed in (float("inf"), float("-inf")):
+        return None
+    return int(parsed) if parsed.is_integer() else parsed
+
+
+def _first_present(mapping: dict[str, Any], keys: tuple[str, ...]) -> Any:
+    for key in keys:
+        if key in mapping and mapping.get(key) not in (None, ""):
+            return mapping.get(key)
+    return None
+
+
+def _normalize_channel_label_for_site(value: Any) -> str:
+    text = _site_safe_text(value, 160).strip()
+    if not text or _PRIVATE_CHANNEL_NAME_RE.search(text) or _LONG_ID_RE.search(text) or text.startswith("<#"):
+        return "approved public-side channel"
+    if text.startswith("#"):
+        return text.split()[0]
+    return text
+
+
+def _normalize_source_name_for_site(value: Any) -> str:
+    text = _site_safe_text(value, 160).strip()
+    mapping = {
+        "entity_evidence_events": "entity evidence events",
+        "conversations": "conversation evidence",
+        "user_profiles": "profile evidence",
+        "user_memory_facts": "memory-fact evidence",
+        "user_habits": "habit evidence",
+        "relationship_state": "relationship-state evidence",
+        "relationship_journal": "relationship-journal evidence",
+        "memory_tiers": "memory-tier evidence",
+        "broadcast_memory": "broadcast memory evidence",
+        "community_presence": "community presence evidence",
+        "rd_context": "review context evidence",
+        "source_file_lookup": "source file lookup evidence",
+    }
+    if text in mapping:
+        return mapping[text]
+    for raw_name, safe_name in mapping.items():
+        text = re.sub(rf"\b{re.escape(raw_name)}\b", safe_name, text, flags=re.I)
+    return text.replace("_", " ")
+
+
+def _normalize_topic_label_for_site(value: Any) -> str:
+    text = _website_safe_payload_text(_site_safe_text(value, 180))
+    text = re.sub(r"\s+", " ", text).strip()
+    return text or "local context classification"
+
+
+def _normalize_allowed_readout_object_for_site(item: dict[str, Any], *, field_name: str) -> dict[str, Any]:
+    compact: dict[str, Any] = {}
+    for key in SITE_READOUT_ALLOWED_OBJECT_KEYS:
+        if key not in item:
+            continue
+        raw = item.get(key)
+        if key in {"count", "postedCount", "mentionedCount", "publicCount", "recentCount"}:
+            count = _safe_count(raw)
+            if count is not None:
+                compact[key] = count
+        elif key == "counts" and isinstance(raw, dict):
+            counts: dict[str, int | float] = {}
+            for count_key, count_value in list(raw.items())[:SITE_SOURCE_COVERAGE_COUNTS_MAX_KEYS]:
+                count = _safe_count(count_value)
+                if count is None:
+                    continue
+                safe_key = _site_safe_text(count_key, 80).replace("/", " and ").replace("_", " ")
+                if safe_key:
+                    counts[safe_key] = count
+            if counts:
+                compact[key] = counts
+        elif key == "channel":
+            compact[key] = _normalize_channel_label_for_site(raw)
+        elif key == "channels":
+            channels = [_normalize_channel_label_for_site(value) for value in (raw if isinstance(raw, list) else [raw])]
+            compact[key] = [channel for channel in channels if channel]
+        elif key == "topic":
+            compact[key] = _normalize_topic_label_for_site(raw)
+        else:
+            compact[key] = _site_safe_text(raw, SITE_LIST_ITEM_LIMIT)
+    if field_name == "topChannels" and "channel" not in compact:
+        channel = _first_present(item, ("channelName", "channel_name", "name", "label"))
+        compact["channel"] = _normalize_channel_label_for_site(channel)
+    if field_name == "topTopicDetails" and "topic" not in compact:
+        topic = _first_present(item, ("topicLabel", "topic_name", "label", "summary"))
+        compact["topic"] = _normalize_topic_label_for_site(topic)
+    if field_name == "topChannels" and "count" not in compact:
+        count = _safe_count(_first_present(item, ("count", "publicCount", "approvedPublicCount", "approvedPublicRows")))
+        if count is not None:
+            compact["count"] = count
+    if field_name == "topTopicDetails" and "count" not in compact:
+        count = _safe_count(_first_present(item, ("count", "publicCount", "approvedPublicCount", "approvedPublicRows")))
+        if count is not None:
+            compact["count"] = count
+    return {key: value for key, value in compact.items() if value not in (None, "", [], {})}
+
+
+def _normalize_activity_frequency_summary_for_site(value: Any) -> Any:
+    if not isinstance(value, dict):
+        return _site_safe_text(value, SITE_LIST_ITEM_LIMIT) if value not in (None, "") else ""
+    posted = _safe_count(_first_present(value, ("postedCount", "approvedPublicAuthoredRows", "approvedPublicPostedRows", "publicPostedCount")))
+    mentioned = _safe_count(_first_present(value, ("mentionedCount", "approvedPublicMentionedRows", "publicMentionedCount")))
+    review_only = _safe_count(_first_present(value, ("reviewOnlyEvidenceCount", "reviewOnlyCount")))
+    recent = _first_present(value, ("lastSeen", "mostRecentObservedAt", "recentAt", "recency"))
+    summary_parts: list[str] = []
+    if posted is not None:
+        summary_parts.append(f"{posted:g} approved public posted items")
+    if mentioned is not None:
+        summary_parts.append(f"{mentioned:g} approved public mentions")
+    if review_only is not None:
+        summary_parts.append(f"{review_only:g} review-only evidence items")
+    entry: dict[str, Any] = {"summary": "Activity frequency: " + (", ".join(summary_parts) if summary_parts else "approved public activity was summarized") + "."}
+    if posted is not None:
+        entry["postedCount"] = posted
+    if mentioned is not None:
+        entry["mentionedCount"] = mentioned
+    if recent:
+        entry["recentCount"] = 1
+        entry["recency"] = f"Most recent observed evidence: {_site_safe_text(recent, 120)}."
+    if review_only is not None:
+        entry["context"] = f"Review-only evidence count: {review_only:g}."
+    return entry
+
+
+def _normalize_recent_activity_summary_for_site(value: Any) -> str:
+    if isinstance(value, dict):
+        recent = _first_present(value, ("lastSeen", "mostRecentObservedAt", "recentAt", "recency"))
+        if recent:
+            return f"Recent activity: most recent observed evidence timestamp is {_site_safe_text(recent, 120)}."
+        return _site_safe_text(json.dumps(_normalize_allowed_readout_object_for_site(value, field_name="recentActivitySummary"), sort_keys=True, default=str), SITE_LIST_ITEM_LIMIT)
+    return _site_safe_text(value, SITE_LIST_ITEM_LIMIT)
+
+
+def _normalize_authored_vs_mentioned_summary_for_site(value: Any) -> Any:
+    if isinstance(value, dict):
+        posted = _safe_count(_first_present(value, ("postedCount", "approvedPublicAuthoredRows", "approvedPublicPostedRows")))
+        mentioned = _safe_count(_first_present(value, ("mentionedCount", "approvedPublicMentionedRows")))
+        entry: dict[str, Any] = {"summary": "Posted and mentioned balance."}
+        if posted is not None:
+            entry["postedCount"] = posted
+        if mentioned is not None:
+            entry["mentionedCount"] = mentioned
+        return entry
+    text = _site_safe_text(value, SITE_LIST_ITEM_LIMIT)
+    text = re.sub(r"\bauthored\b", "posted", text, flags=re.I)
+    return text
+
+
+def _normalize_readout_field_for_site(field_name: str, value: Any) -> Any:
+    if field_name == "activityFrequencySummary":
+        return _normalize_activity_frequency_summary_for_site(value)
+    if field_name == "recentActivitySummary":
+        return _normalize_recent_activity_summary_for_site(value)
+    if field_name == "authoredVsMentionedSummary":
+        return _normalize_authored_vs_mentioned_summary_for_site(value)
+    if field_name == "sourceCoverage":
+        return _compact_source_coverage_for_site(value)
+    if field_name == "representativeEvidence":
+        compact_items: list[str] = []
+        seen_rep: set[str] = set()
+        for item in _compact_list_for_site(value, max_items=SITE_LIST_MAX_ITEMS, item_limit=SITE_LIST_ITEM_LIMIT):
+            rep_item = _compact_representative_evidence_item_for_site(item)
+            if rep_item and rep_item not in seen_rep:
+                compact_items.append(rep_item)
+                seen_rep.add(rep_item)
+        return compact_items
+    raw_items = value if isinstance(value, (list, tuple, set)) else ([value] if value not in (None, "") else [])
+    compact_items: list[Any] = []
+    seen: set[str] = set()
+    for item in list(raw_items)[:SITE_LIST_MAX_ITEMS]:
+        compact_item: Any
+        if isinstance(item, dict):
+            compact_item = _normalize_allowed_readout_object_for_site(item, field_name=field_name)
+            if not compact_item:
+                compact_item = _site_safe_text(json.dumps(item, sort_keys=True, default=str), SITE_LIST_ITEM_LIMIT)
+        else:
+            compact_item = _site_safe_text(item, SITE_LIST_ITEM_LIMIT)
+        if compact_item in (None, "", [], {}):
+            continue
+        fingerprint = json.dumps(compact_item, sort_keys=True, default=str) if isinstance(compact_item, (dict, list)) else str(compact_item)
+        if fingerprint in seen:
+            continue
+        seen.add(fingerprint)
+        compact_items.append(compact_item)
+    return compact_items
+
+
 def _is_finite_number(value: Any) -> bool:
     return isinstance(value, (int, float)) and not isinstance(value, bool) and value == value and value not in (float("inf"), float("-inf"))
 
@@ -1665,7 +1906,7 @@ def _compact_source_coverage_counts_for_site(value: Any) -> dict[str, int | floa
     for key, raw_count in list(value.items())[:SITE_SOURCE_COVERAGE_COUNTS_MAX_KEYS]:
         if not _is_finite_number(raw_count):
             continue
-        safe_key = _site_safe_text(key, 120)
+        safe_key = _site_safe_text(key, 120).replace("_", " ")
         if not safe_key:
             continue
         compact[safe_key] = raw_count
@@ -1679,11 +1920,11 @@ def _compact_source_coverage_for_site(value: Any) -> list[Any]:
     for item in list(raw_items)[:SITE_LIST_MAX_ITEMS]:
         compact_item: Any = None
         if isinstance(item, str):
-            compact_item = _site_safe_text(item, SITE_LIST_ITEM_LIMIT)
+            compact_item = _normalize_source_name_for_site(item)
         elif isinstance(item, dict):
             entry: dict[str, Any] = {}
             if item.get("source") not in (None, ""):
-                entry["source"] = _site_safe_text(item.get("source"), 160)
+                entry["source"] = _normalize_source_name_for_site(item.get("source"))
             if _is_finite_number(item.get("count")):
                 entry["count"] = item.get("count")
             counts = _compact_source_coverage_counts_for_site(item.get("counts"))
@@ -1792,18 +2033,13 @@ def compact_enrichment_payload_for_site(payload: dict[str, Any]) -> dict[str, An
     compact["evidenceSummary"] = _site_safe_text(compact.get("evidenceSummary"), SITE_EVIDENCE_SUMMARY_TARGET)
     for key in SITE_BOUND_LIST_FIELDS:
         if key in compact:
-            if key == "representativeEvidence":
-                compact[key] = []
-                seen_rep: set[str] = set()
-                for item in _compact_list_for_site(compact.get(key) or payload.get(key), max_items=SITE_LIST_MAX_ITEMS, item_limit=SITE_LIST_ITEM_LIMIT):
-                    rep_item = _compact_representative_evidence_item_for_site(item)
-                    if rep_item and rep_item not in seen_rep:
-                        compact[key].append(rep_item)
-                        seen_rep.add(rep_item)
+            if key in SITE_CONTRACT_READOUT_FIELDS:
+                compact[key] = _normalize_readout_field_for_site(key, compact.get(key))
             else:
                 compact[key] = _compact_list_for_site(compact.get(key), max_items=SITE_LIST_MAX_ITEMS, item_limit=SITE_LIST_ITEM_LIMIT)
-    if "sourceCoverage" in compact:
-        compact["sourceCoverage"] = _compact_source_coverage_for_site(compact.get("sourceCoverage"))
+    for key in ("activityFrequencySummary", "recentActivitySummary", "authoredVsMentionedSummary", "sourceCoverage"):
+        if key in compact:
+            compact[key] = _normalize_readout_field_for_site(key, compact.get(key))
     compact["rawProvenance"] = _compact_raw_provenance_for_site(compact.get("rawProvenance"))
     return compact
 
@@ -1816,7 +2052,7 @@ def _validate_source_coverage_for_site(source_coverage: Any) -> list[str]:
         issues.append("sourceCoverage has too many items")
     for item in source_coverage:
         if isinstance(item, str):
-            if len(item) > 1000 or _LONG_ID_RE.search(item) or _PRIVATE_CHANNEL_NAME_RE.search(item) or "[object Object]" in item:
+            if _readout_text_validation_issue("sourceCoverage", item):
                 issues.append("sourceCoverage contains unsafe text")
                 break
             continue
@@ -1828,7 +2064,7 @@ def _validate_source_coverage_for_site(source_coverage: Any) -> list[str]:
             issues.append("sourceCoverage contains unsupported object keys")
             break
         text = json.dumps(item, sort_keys=True, default=str)
-        if len(text) > 1000 or _LONG_ID_RE.search(text) or _PRIVATE_CHANNEL_NAME_RE.search(text) or "[object Object]" in text:
+        if _readout_text_validation_issue("sourceCoverage", text):
             issues.append("sourceCoverage contains unsafe text")
             break
         for text_key in ("source", "status"):
@@ -1850,7 +2086,7 @@ def _validate_source_coverage_for_site(source_coverage: Any) -> list[str]:
                 break
             for count_key, count_value in counts.items():
                 count_key_text = str(count_key or "")
-                if len(count_key_text) > 1000 or _LONG_ID_RE.search(count_key_text) or _PRIVATE_CHANNEL_NAME_RE.search(count_key_text) or "[object Object]" in count_key_text:
+                if _readout_text_validation_issue("sourceCoverage counts", count_key_text):
                     issues.append("sourceCoverage counts contains unsafe keys")
                     break
                 if not _is_finite_number(count_value):
@@ -1860,6 +2096,64 @@ def _validate_source_coverage_for_site(source_coverage: Any) -> list[str]:
                 break
     return issues
 
+
+
+def _readout_text_validation_issue(field_name: str, text: str) -> str | None:
+    if len(text) > 1000:
+        return f"{field_name} contains an oversized item"
+    if "[object Object]" in text:
+        return f"{field_name} contains [object Object]"
+    if "/" in text:
+        return f"{field_name} contains slash taxonomy or raw path text"
+    if _LONG_ID_RE.search(text):
+        return f"{field_name} contains raw IDs"
+    if _PRIVATE_CHANNEL_NAME_RE.search(text):
+        return f"{field_name} contains private channel names"
+    if _RAW_SOURCE_LABEL_RE.search(text):
+        return f"{field_name} contains raw source labels"
+    if _SOURCE_TABLE_NAME_RE.search(text):
+        return f"{field_name} contains source table names"
+    if _PATH_LOOKING_RE.search(text):
+        return f"{field_name} contains raw path-looking strings"
+    return None
+
+
+def _validate_readout_value_for_site(field_name: str, value: Any) -> list[str]:
+    issues: list[str] = []
+    if field_name in {"activityFrequencySummary", "recentActivitySummary", "authoredVsMentionedSummary"}:
+        values = [value]
+    else:
+        if not isinstance(value, list):
+            return [f"{field_name} must be a list"]
+        if len(value) > SITE_LIST_MAX_ITEMS:
+            issues.append(f"{field_name} has too many items")
+        values = list(value)
+    for item in values:
+        if isinstance(item, dict):
+            unsupported = set(item) - SITE_READOUT_ALLOWED_OBJECT_KEYS
+            if unsupported:
+                issues.append(f"{field_name} contains unsupported object keys: {', '.join(sorted(unsupported))}")
+                break
+            for count_key in ("count", "postedCount", "mentionedCount", "publicCount", "recentCount"):
+                if count_key in item and not _is_finite_number(item.get(count_key)):
+                    issues.append(f"{field_name} {count_key} must be finite")
+                    break
+            if issues and issues[-1].startswith(f"{field_name} "):
+                break
+            if "counts" in item:
+                counts = item.get("counts")
+                if not isinstance(counts, dict):
+                    issues.append(f"{field_name} counts must be an object")
+                    break
+                if any(not _is_finite_number(v) for v in counts.values()):
+                    issues.append(f"{field_name} counts values must be finite")
+                    break
+        text = json.dumps(item, sort_keys=True, default=str) if isinstance(item, (dict, list)) else str(item)
+        issue = _readout_text_validation_issue(field_name, text)
+        if issue:
+            issues.append(issue)
+            break
+    return issues
 
 
 def _validate_representative_evidence_for_site(value: Any) -> list[str]:
@@ -1889,10 +2183,13 @@ def validate_enrichment_payload_for_site(payload: dict[str, Any]) -> list[str]:
         issues.append("rawProvenance exceeds site JSON limit")
     if "sourceCoverage" in payload:
         issues.extend(_validate_source_coverage_for_site(payload.get("sourceCoverage")))
+    for key in SITE_CONTRACT_READOUT_FIELDS:
+        if key in payload and key != "sourceCoverage":
+            issues.extend(_validate_readout_value_for_site(key, payload.get(key)))
     if "representativeEvidence" in payload:
         issues.extend(_validate_representative_evidence_for_site(payload.get("representativeEvidence")))
     for key in SITE_BOUND_LIST_FIELDS:
-        if key not in payload:
+        if key not in payload or key in SITE_CONTRACT_READOUT_FIELDS:
             continue
         value = payload.get(key)
         if not isinstance(value, list):
@@ -1905,8 +2202,9 @@ def validate_enrichment_payload_for_site(payload: dict[str, Any]) -> list[str]:
             if len(text) > 1000:
                 issues.append(f"{key} contains an oversized item")
                 break
-            if _LONG_ID_RE.search(text) or _PRIVATE_CHANNEL_NAME_RE.search(text) or "[object Object]" in text:
-                issues.append(f"{key} contains unsafe text")
+            issue = _readout_text_validation_issue(key, text)
+            if issue:
+                issues.append(issue)
                 break
     return issues
 
