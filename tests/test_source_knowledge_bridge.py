@@ -127,6 +127,59 @@ class SourceKnowledgeBridgeTests(unittest.TestCase):
         self.assertEqual(provenance["sourceLaneMapping"].get("relationship_journal"), "unknown")
         self.assertTrue(any("help_signal:" in fragment["snippet"] for fragment in provenance["rawFragments"]))
 
+
+    def test_entity_summary_enriches_bridge_packet_with_privacy_boundaries_and_provenance(self):
+        c = self.conn.cursor()
+        c.execute("INSERT INTO user_profiles VALUES (1,1,'Crow','Crow',NULL,NULL)")
+        c.execute("INSERT INTO relationship_journal VALUES (NULL,1,1,'note','help_signal: EDGE_SESSION Crow relationship_journal/local_relationship_trace private note','now')")
+        c.execute("INSERT INTO conversations VALUES (NULL,1,'Crow',1,'general','public_home','user','Crow is a recurring community subject candidate.','now')")
+        c.execute("INSERT INTO memory_tiers VALUES (NULL,1,1,'long','Crow source-blind legacy memory trace.',0.9,1,'now')")
+        self.conn.commit()
+
+        payload = self._payload_by_name(self._collect(), "Crow")
+
+        self.assertIn("BNL found an internal local profile match for Crow.", payload["knownContext"])
+        self.assertEqual(payload["knownContext"].count("BNL found an internal local profile match for Crow."), 1)
+        self.assertTrue(any("relationship/context" in item for item in payload["relationshipSignals"]))
+        self.assertTrue(any("prior relationship/context notes" in item for item in payload["privateOnlyNotes"]))
+        self.assertEqual(sum(1 for item in payload["privateOnlyNotes"] if "prior relationship/context notes" in item), 1)
+        self.assertFalse(any("relationship" in item.lower() for item in payload["publicSafePossibilities"]))
+        self.assertTrue(any("Public-side conversation context exists" in item for item in payload["publicSafePossibilities"]))
+        self.assertTrue(any("Source-blind legacy memory exists" in item for item in payload["privateOnlyNotes"]))
+        self.assertTrue(any("Source-blind memory cannot" in item for item in payload["notPublicYet"]))
+        self.assertNotEqual(payload["recommendedAction"], "Review source context.")
+        self.assertIn("queue/submission identity is not connected yet", payload["recommendedAction"])
+
+        normal_text = json.dumps({
+            "knownContext": payload.get("knownContext"),
+            "usefulEvidence": payload.get("usefulEvidence"),
+            "relationshipSignals": payload.get("relationshipSignals"),
+            "publicSafePossibilities": payload.get("publicSafePossibilities"),
+            "privateOnlyNotes": payload.get("privateOnlyNotes"),
+            "notPublicYet": payload.get("notPublicYet"),
+            "recommendedAction": payload.get("recommendedAction"),
+            "sourceAuthority": payload.get("sourceAuthority"),
+        })
+        for raw in (
+            "user_profiles/local_profile_observed",
+            "relationship_journal/local_relationship_trace",
+            "conversations/public_discord_observed",
+            "memory_tiers/source_blind_memory_trace",
+            "help_signal",
+            "EDGE_SESSION",
+            "unknown -> unknown",
+        ):
+            self.assertNotIn(raw, normal_text)
+
+        provenance = payload["rawProvenance"]
+        self.assertIn("user_profiles/local_profile_observed", provenance["sourceLabels"])
+        self.assertIn("conversations/public_discord_observed", provenance["sourceLabels"])
+        self.assertIn("memory_tiers/source_blind_memory_trace", provenance["sourceLabels"])
+        self.assertIn("relationship_journal", provenance["sourceCounts"])
+        self.assertIn("relationship_journal", provenance["entitySourceCounts"])
+        self.assertEqual(provenance["channelPolicyCounts"].get("public_home"), 1)
+        self.assertTrue(any(fragment.get("origin") == "entity_activity_summary" for fragment in provenance["rawFragments"] if isinstance(fragment, dict)))
+
     def test_unknown_conversation_is_internal_review_not_public_safe(self):
         self.conn.execute("INSERT INTO conversations VALUES (NULL,1,'User',1,'mystery',NULL,'user','Hellcat is a recurring candidate from unknown policy.','now')")
         self.conn.commit()

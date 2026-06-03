@@ -18,7 +18,8 @@ from datetime import datetime, timezone
 from typing import Any, Callable
 
 from bnl_dossier_recommendations import build_dossier_recommendation_payload, send_dossier_recommendation
-from bnl_dossier_source_packets import DEFAULT_MISSING_INFO, DEFAULT_SUGGESTED_ACTION, subject_key
+from bnl_entity_activity_summary import build_entity_activity_summary
+from bnl_dossier_source_packets import DEFAULT_MISSING_INFO, DEFAULT_SUGGESTED_ACTION, merge_entity_activity_summary_into_packet, subject_key
 
 KNOWLEDGE_BRIDGE_INGEST_SOURCE = "bnl_source_knowledge_bridge"
 DEFAULT_KNOWLEDGE_BRIDGE_LIMIT = 20
@@ -734,6 +735,27 @@ def collect_knowledge_bridge_candidates(db_path: str, guild_id: int | None = Non
             confidence,
             candidate_type,
         )
+        entity_summary = build_entity_activity_summary(
+            db_path,
+            display_name,
+            guild_id,
+            [
+                "user_profiles",
+                "user_memory_facts",
+                "user_habits",
+                "relationship_state",
+                "relationship_journal",
+                "memory_tiers",
+                "conversations",
+                "broadcast_memory",
+                "rd_context",
+            ],
+            "admin_internal",
+            50,
+            rd_context,
+        )
+        merge_entity_activity_summary_into_packet(source_packet, entity_summary)
+        confidence = str(source_packet.get("confidence") or confidence)
         evidence_summary = _case_bridge_evidence_summary(display_name, acc.evidence, source_types, candidate_type)
         reason = _meaning_first_reason(display_name, source_packet, candidate_type)
         evidence_hash = hashlib.sha256(f"{key}\n{candidate_type}\n{','.join(source_types)}".encode("utf-8")).hexdigest()[:10]
