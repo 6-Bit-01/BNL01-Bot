@@ -31,6 +31,8 @@ SITE_LIST_ITEM_LIMIT = 500
 SITE_LIST_MAX_ITEMS = 25
 SITE_RAW_FRAGMENT_MAX_ITEMS = 4
 SITE_RAW_FRAGMENT_TEXT_LIMIT = 500
+SITE_SOURCE_COVERAGE_ALLOWED_KEYS = {"source", "count", "counts", "status"}
+SITE_SOURCE_COVERAGE_COUNTS_MAX_KEYS = 25
 SITE_BOUND_LIST_FIELDS = (
     "knownContext",
     "usefulEvidence",
@@ -42,7 +44,6 @@ SITE_BOUND_LIST_FIELDS = (
     "bnlInteractionSignals",
     "musicSignals",
     "communitySignals",
-    "sourceCoverage",
     "evidenceDetails",
     "publicSafePossibilities",
     "publicUseCandidates",
@@ -1604,6 +1605,56 @@ def _compact_list_for_site(value: Any, *, max_items: int = SITE_LIST_MAX_ITEMS, 
     return compact
 
 
+def _is_finite_number(value: Any) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and value == value and value not in (float("inf"), float("-inf"))
+
+
+def _compact_source_coverage_counts_for_site(value: Any) -> dict[str, int | float]:
+    if not isinstance(value, dict):
+        return {}
+    compact: dict[str, int | float] = {}
+    for key, raw_count in list(value.items())[:SITE_SOURCE_COVERAGE_COUNTS_MAX_KEYS]:
+        if not _is_finite_number(raw_count):
+            continue
+        safe_key = _site_safe_text(key, 120)
+        if not safe_key:
+            continue
+        compact[safe_key] = raw_count
+    return compact
+
+
+def _compact_source_coverage_for_site(value: Any) -> list[Any]:
+    raw_items = value if isinstance(value, (list, tuple, set)) else ([value] if value not in (None, "") else [])
+    compact: list[Any] = []
+    seen: set[str] = set()
+    for item in list(raw_items)[:SITE_LIST_MAX_ITEMS]:
+        compact_item: Any = None
+        if isinstance(item, str):
+            compact_item = _site_safe_text(item, SITE_LIST_ITEM_LIMIT)
+        elif isinstance(item, dict):
+            entry: dict[str, Any] = {}
+            if item.get("source") not in (None, ""):
+                entry["source"] = _site_safe_text(item.get("source"), 160)
+            if _is_finite_number(item.get("count")):
+                entry["count"] = item.get("count")
+            counts = _compact_source_coverage_counts_for_site(item.get("counts"))
+            if counts:
+                entry["counts"] = counts
+            if item.get("status") not in (None, ""):
+                entry["status"] = _site_safe_text(item.get("status"), 160)
+            compact_item = entry
+        else:
+            compact_item = _site_safe_text(item, SITE_LIST_ITEM_LIMIT)
+        if compact_item in (None, "", {}, []):
+            continue
+        fingerprint = json.dumps(compact_item, sort_keys=True, default=str) if isinstance(compact_item, (dict, list)) else str(compact_item)
+        if fingerprint in seen:
+            continue
+        seen.add(fingerprint)
+        compact.append(compact_item)
+    return compact
+
+
 def _compact_raw_provenance_for_site(raw: Any) -> dict[str, Any]:
     if not isinstance(raw, dict):
         return {}
@@ -1693,6 +1744,8 @@ def compact_enrichment_payload_for_site(payload: dict[str, Any]) -> dict[str, An
     for key in SITE_BOUND_LIST_FIELDS:
         if key in compact:
             compact[key] = _compact_list_for_site(compact.get(key), max_items=SITE_LIST_MAX_ITEMS, item_limit=SITE_LIST_ITEM_LIMIT)
+    if "sourceCoverage" in compact:
+        compact["sourceCoverage"] = _compact_source_coverage_for_site(compact.get("sourceCoverage"))
     compact["rawProvenance"] = _compact_raw_provenance_for_site(compact.get("rawProvenance"))
     return compact
 
@@ -1704,6 +1757,57 @@ def validate_enrichment_payload_for_site(payload: dict[str, Any]) -> list[str]:
     raw_len = len(json.dumps(payload.get("rawProvenance") or {}, sort_keys=True, default=str))
     if raw_len > SITE_RAW_PROVENANCE_JSON_LIMIT:
         issues.append("rawProvenance exceeds site JSON limit")
+    if "sourceCoverage" in payload:
+        source_coverage = payload.get("sourceCoverage")
+        if not isinstance(source_coverage, list):
+            issues.append("sourceCoverage must be a list")
+        else:
+            if len(source_coverage) > SITE_LIST_MAX_ITEMS:
+                issues.append("sourceCoverage has too many items")
+            for item in source_coverage:
+                if isinstance(item, str):
+                    if len(item) > 1000 or _LONG_ID_RE.search(item) or _PRIVATE_CHANNEL_NAME_RE.search(item) or "[object Object]" in item:
+                        issues.append("sourceCoverage contains unsafe text")
+                        break
+                    continue
+                if not isinstance(item, dict):
+                    issues.append("sourceCoverage contains unsupported item type")
+                    break
+                unsupported = set(item) - SITE_SOURCE_COVERAGE_ALLOWED_KEYS
+                if unsupported:
+                    issues.append("sourceCoverage contains unsupported object keys")
+                    break
+                text = json.dumps(item, sort_keys=True, default=str)
+                if len(text) > 1000 or _LONG_ID_RE.search(text) or _PRIVATE_CHANNEL_NAME_RE.search(text) or "[object Object]" in text:
+                    issues.append("sourceCoverage contains unsafe text")
+                    break
+                for text_key in ("source", "status"):
+                    if text_key in item and (not isinstance(item.get(text_key), str) or len(item.get(text_key) or "") > 1000):
+                        issues.append(f"sourceCoverage {text_key} must be a bounded string")
+                        break
+                if issues and issues[-1].startswith("sourceCoverage "):
+                    break
+                if "count" in item and not _is_finite_number(item.get("count")):
+                    issues.append("sourceCoverage count must be finite")
+                    break
+                if "counts" in item:
+                    counts = item.get("counts")
+                    if not isinstance(counts, dict):
+                        issues.append("sourceCoverage counts must be an object")
+                        break
+                    if len(counts) > SITE_SOURCE_COVERAGE_COUNTS_MAX_KEYS:
+                        issues.append("sourceCoverage counts has too many keys")
+                        break
+                    for count_key, count_value in counts.items():
+                        count_key_text = str(count_key or "")
+                        if len(count_key_text) > 1000 or _LONG_ID_RE.search(count_key_text) or _PRIVATE_CHANNEL_NAME_RE.search(count_key_text) or "[object Object]" in count_key_text:
+                            issues.append("sourceCoverage counts contains unsafe keys")
+                            break
+                        if not _is_finite_number(count_value):
+                            issues.append("sourceCoverage counts values must be finite")
+                            break
+                    if issues and issues[-1].startswith("sourceCoverage counts"):
+                        break
     for key in SITE_BOUND_LIST_FIELDS:
         if key not in payload:
             continue
