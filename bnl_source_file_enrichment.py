@@ -45,6 +45,9 @@ SITE_BOUND_LIST_FIELDS = (
     "musicSignals",
     "communitySignals",
     "evidenceDetails",
+    "representativeEvidence",
+    "topChannels",
+    "topTopicDetails",
     "publicSafePossibilities",
     "publicUseCandidates",
     "privateOnlyNotes",
@@ -67,6 +70,12 @@ ENTITY_SUMMARY_EVIDENCE_FIELDS = {
     "communitySignals": 5,
     "sourceCoverage": 10,
     "evidenceDetails": 8,
+    "representativeEvidence": 6,
+    "topChannels": 5,
+    "topTopicDetails": 8,
+    "activityFrequencySummary": 1,
+    "recentActivitySummary": 1,
+    "authoredVsMentionedSummary": 1,
     "publicUseCandidates": 6,
     "reviewOnlyEvidence": 6,
 }
@@ -1126,6 +1135,10 @@ def _bounded_entity_summary_fields(summary: dict[str, Any], *, include: bool) ->
             if key == "publicUseCandidates":
                 items = [_owner_admin_review_label(item) for item in items]
             fields[key] = items
+        elif isinstance(value, dict):
+            fields[key] = dict(value)
+        elif key in {"recentActivitySummary", "authoredVsMentionedSummary"}:
+            fields[key] = str(value or "")
         else:
             fields[key] = value if value else ([] if key != "sourceCoverage" else [])
     return fields
@@ -1905,6 +1918,12 @@ def build_enrichment_recommendation_payload(packet: dict[str, Any], *, environ: 
         "musicSignals": list(packet.get("musicSignals") or []),
         "communitySignals": list(packet.get("communitySignals") or []),
         "evidenceDetails": list(packet.get("evidenceDetails") or []),
+        "representativeEvidence": list(packet.get("representativeEvidence") or []),
+        "topChannels": list(packet.get("topChannels") or []),
+        "topTopicDetails": list(packet.get("topTopicDetails") or []),
+        "activityFrequencySummary": dict(packet.get("activityFrequencySummary") or {}),
+        "recentActivitySummary": packet.get("recentActivitySummary") or "",
+        "authoredVsMentionedSummary": packet.get("authoredVsMentionedSummary") or "",
         "publicUseCandidates": list(packet.get("publicUseCandidates") or []),
         "reviewOnlyEvidence": list(packet.get("reviewOnlyEvidence") or []),
         "queueSubmissionStatus": packet.get("queueSubmissionStatus") or "not_connected",
