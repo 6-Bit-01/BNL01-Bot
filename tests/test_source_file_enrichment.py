@@ -498,6 +498,131 @@ class SourceFileEnrichmentTests(unittest.TestCase):
         self.assertIn("production", result["topicThemes"])
         self.assertNotIn("working on the mix", json.dumps(result))
 
+
+    def test_entity_summary_called_with_structured_evidence_lane(self):
+        fake_summary = {
+            "knownContext": ["Structured context exists."],
+            "rawProvenance": {"sourceLabels": ["entity_evidence_events/structured"], "sourceCounts": {"entity_evidence_events": 1}, "rawFragments": [{"table": "entity_evidence_events"}], "channelPolicies": {}},
+            "missingInfo": [],
+            "sourceAuthority": [],
+        }
+        with mock.patch.object(enrich, "refresh_entity_evidence_for_subject", return_value={"ok": True}) as refresh_mock, \
+             mock.patch.object(enrich, "build_entity_activity_summary", return_value=fake_summary) as builder:
+            result = enrich.collect_source_enrichment_evidence(self.db, 1, "HellcatNZ", lookup_result=self._lookup("active")({"lookupValue": "HellcatNZ"}))
+        self.assertIn("entity_activity_summary", result["sourceTypes"])
+        refresh_mock.assert_called_once_with(self.db, "HellcatNZ", guild_id=1, limit=50)
+        lanes = builder.call_args.args[3]
+        for lane in ("entity_evidence_events", "user_profiles", "user_memory_facts", "user_habits", "relationship_state", "relationship_journal", "memory_tiers", "conversations", "broadcast_memory", "community_presence", "rd_context"):
+            self.assertIn(lane, lanes)
+
+    def test_structured_entity_evidence_fields_flow_to_result_and_payload_privately(self):
+        import bnl_entity_evidence as entity_evidence
+        conn = sqlite3.connect(self.db)
+        try:
+            entity_evidence.ensure_entity_evidence_schema(conn)
+            entity_evidence.upsert_entity_evidence_event(
+                conn,
+                guild_id=1,
+                subject_name="HellcatNZ",
+                matched_user_id=123456789012345678,
+                source_type="discord",
+                source_table="conversations",
+                source_row_id="42",
+                source_label="conversations/public_selective",
+                channel_name="finished-tracks",
+                channel_policy="public_selective",
+                visibility="approved_public_side",
+                authority="local_observed",
+                confidence=0.8,
+                relation_to_subject="authored",
+                topic="music/community context",
+                evidence_kind="authored_public_conversation",
+                safe_summary="Approved public-side activity indicates music/community context for review.",
+                public_safe_candidate=True,
+                review_only=False,
+                music_signal=True,
+                community_signal=True,
+                bnl_interaction=True,
+                raw_ref_json={"content": "raw transcript with 123456789012345678 should stay provenance-only", "channel_name": "finished-tracks"},
+            )
+            entity_evidence.upsert_entity_evidence_event(
+                conn,
+                guild_id=1,
+                subject_name="HellcatNZ",
+                source_type="discord",
+                source_table="conversations",
+                source_row_id="43",
+                source_label="conversations/private",
+                channel_name="research-and-development",
+                channel_policy="private_internal",
+                visibility="review_only",
+                authority="local_observed",
+                confidence=0.6,
+                relation_to_subject="mentioned",
+                topic="source-file/dossier planning context",
+                evidence_kind="mentioned_review_only_conversation",
+                safe_summary="Review-only planning context exists for owner review.",
+                public_safe_candidate=False,
+                review_only=True,
+                raw_ref_json={"content": "private raw transcript", "channel_name": "research-and-development"},
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        with mock.patch.object(enrich, "refresh_entity_evidence_for_subject", return_value={"ok": True}):
+            result = enrich.run_source_file_enrichment(self.db, 1, "HellcatNZ", dry_run=True, lookup_func=self._lookup("active"))
+        payload = result["payload"]
+        for key in ("observedChannels", "conversationHighlights", "topicBreakdown", "bestEvidenceToReview", "bnlInteractionSignals", "musicSignals", "communitySignals", "sourceCoverage", "evidenceDetails", "publicUseCandidates", "reviewOnlyEvidence", "queueSubmissionStatus", "queueSubmissionNote"):
+            self.assertIn(key, result)
+            self.assertIn(key, payload)
+        self.assertIsInstance(payload["sourceCoverage"], list)
+        self.assertTrue(any(item.get("source") == "conversations" for item in payload["sourceCoverage"] if isinstance(item, dict)))
+        self.assertEqual(payload["queueSubmissionStatus"], "not_connected")
+        self.assertEqual(payload["queueSubmissionNote"], enrich.QUEUE_NOT_CONNECTED_NOTE)
+        self.assertTrue(any("pending owner/admin review" in item for item in payload["publicUseCandidates"]))
+        self.assertTrue(any("Review-only planning context" in item for item in payload["reviewOnlyEvidence"]))
+        public_normal_text = json.dumps({key: payload.get(key) for key in ("observedChannels", "conversationHighlights", "evidenceDetails", "bestEvidenceToReview", "publicUseCandidates")})
+        self.assertNotIn("Review-only planning context", public_normal_text)
+        normal = dict(payload)
+        raw = normal.pop("rawProvenance")
+        normal_text = json.dumps(normal)
+        self.assertNotIn("private raw transcript", normal_text)
+        self.assertNotIn("123456789012345678", normal_text)
+        self.assertNotIn("research-and-development", normal_text)
+        self.assertIn("rawFragments", raw)
+
+    def test_build_enrichment_payload_includes_new_fields_and_keeps_raw_provenance_separate(self):
+        packet = {
+            "subject": "HellcatNZ",
+            "matchKind": "active_source_file",
+            "sourceFile": {"id": "sf_1", "name": "HellcatNZ"},
+            "sections": {"Public-Safe Notes": ["No public copy yet."], "Do Not Say": ["Do not publish raw notes."], "Missing Info": ["public links"], "Suggested Next Action": ["owner review"]},
+            "sourceTypes": ["entity_activity_summary"],
+            "sourceCounts": {"entity_activity_summary": 2},
+            "sourceCoverage": [{"source": "entity_evidence_events", "count": 2, "status": "found"}],
+            "knownContext": ["Structured context exists."],
+            "observedChannels": ["#finished-tracks — approved public-side; subject authored."],
+            "conversationHighlights": ["Sanitized highlight."],
+            "topicBreakdown": ["music/community context: 1 approved/reviewed source row(s)."],
+            "bestEvidenceToReview": ["discord: authored_public_conversation — Sanitized highlight."],
+            "bnlInteractionSignals": ["BNL-related interaction context exists."],
+            "musicSignals": ["Music/radio/show context exists; queue identity still needs review."],
+            "communitySignals": ["Community context exists; owner review must confirm wording."],
+            "evidenceDetails": ["Sanitized detail."],
+            "publicUseCandidates": ["Possible community/source-file candidate, pending owner/admin review."],
+            "reviewOnlyEvidence": ["Review-only note."],
+            "queueSubmissionStatus": "not_connected",
+            "queueSubmissionNote": enrich.QUEUE_NOT_CONNECTED_NOTE,
+            "rawProvenance": {"rawFragments": [{"rawRefJson": "raw transcript"}]},
+        }
+        payload = enrich.build_enrichment_recommendation_payload(packet, environ={})
+        for key in ("observedChannels", "conversationHighlights", "topicBreakdown", "bestEvidenceToReview", "bnlInteractionSignals", "musicSignals", "communitySignals", "sourceCoverage", "evidenceDetails", "publicUseCandidates", "reviewOnlyEvidence", "queueSubmissionStatus", "queueSubmissionNote"):
+            self.assertEqual(payload[key], packet[key])
+        self.assertEqual(payload["rawProvenance"], packet["rawProvenance"])
+        normal = dict(payload)
+        normal.pop("rawProvenance")
+        self.assertNotIn("raw transcript", json.dumps(normal))
+
     def test_payload_keeps_machine_metadata(self):
         result = enrich.run_source_file_enrichment(self.db, 1, "HellcatNZ", dry_run=True, lookup_func=self._lookup("active"))
         payload = result["payload"]
