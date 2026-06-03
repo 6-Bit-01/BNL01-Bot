@@ -59,6 +59,7 @@ from bnl_entity_activity_summary import (
     build_entity_activity_summary,
     format_entity_activity_summary_response,
     parse_entity_activity_summary_command,
+    refresh_entity_evidence_for_subject,
 )
 from bnl_source_file_lookup import (
     build_source_file_lookup_diagnostics,
@@ -3584,6 +3585,13 @@ def init_db():
     conn.commit()
     conn.close()
     ensure_community_presence_schema(DB_FILE)
+    from bnl_entity_evidence import ensure_entity_evidence_schema
+    evidence_conn = sqlite3.connect(DB_FILE)
+    try:
+        ensure_entity_evidence_schema(evidence_conn)
+        evidence_conn.commit()
+    finally:
+        evidence_conn.close()
     logging.info("✅ Database initialized successfully.")
 
 def _truncate_user_facts(user_id: int, guild_id: int, max_rows: int = MAX_FACTS_PER_USER):
@@ -4480,12 +4488,23 @@ async def maybe_handle_entity_activity_summary_command(message: discord.Message,
         await message.reply(f"Entity summary failed: {parse_error}")
         return True
 
+    refresh_result = None
+    if options.get("refreshEvidence"):
+        refresh_result = await asyncio.to_thread(
+            refresh_entity_evidence_for_subject,
+            DB_FILE,
+            options.get("subjectName", ""),
+            getattr(message.guild, "id", None),
+            200,
+        )
+
     summary = await asyncio.to_thread(
         build_entity_activity_summary,
         DB_FILE,
         options.get("subjectName", ""),
         getattr(message.guild, "id", None),
         [
+            "entity_evidence_events",
             "user_profiles",
             "user_memory_facts",
             "user_habits",
@@ -4494,13 +4513,27 @@ async def maybe_handle_entity_activity_summary_command(message: discord.Message,
             "memory_tiers",
             "conversations",
             "broadcast_memory",
+            "community_presence",
             "rd_context",
         ],
         "admin_internal",
         50,
         _current_rd_discovery_context(message),
     )
-    await message.reply(format_entity_activity_summary_response(summary))
+    response = format_entity_activity_summary_response(summary)
+    if refresh_result:
+        source_types = ", ".join(sorted((refresh_result.get("sourceTypes") or {}).keys())) or "none"
+        response = (
+            f"BNL Entity Evidence Refresh — {refresh_result.get('subjectName') or options.get('subjectName', '')}\n"
+            f"- created: `{int(refresh_result.get('createdCount') or 0)}`\n"
+            f"- updated: `{int(refresh_result.get('updatedCount') or 0)}`\n"
+            f"- unchanged: `{int(refresh_result.get('unchangedCount') or 0)}`\n"
+            f"- source types covered: `{source_types}`\n"
+            f"- review-only events touched: `{int(refresh_result.get('reviewOnlyCount') or 0)}`\n"
+            f"- public-safe candidates touched: `{int(refresh_result.get('publicSafeCandidateCount') or 0)}`\n\n"
+            f"{response}"
+        )
+    await message.reply(response)
     return True
 
 
