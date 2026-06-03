@@ -114,6 +114,84 @@ class EntityActivitySummaryBuilderTests(unittest.TestCase):
         self.assertTrue(any(fragment.get("rawRefJson") for fragment in summary["rawProvenance"]["rawFragments"]))
         self.assertIn(entity.QUEUE_NOT_CONNECTED_NOTE, summary["notPublicYet"])
 
+    def test_ranked_evidence_prioritizes_public_conversation_over_bulk_source_blind(self):
+        evidence.ensure_entity_evidence_schema(self.conn)
+        for idx in range(12):
+            evidence.upsert_entity_evidence_event(
+                self.conn, guild_id=1, subject_name="Crow", source_type="source_blind_memory", source_table="memory_tiers",
+                source_row_id=f"legacy-{idx}", source_label="memory_tiers/source_blind_memory_trace", channel_policy="source_blind",
+                visibility="review_only", authority="source_blind_legacy_memory", confidence=0.35,
+                relation_to_subject="source_blind_memory", topic="local context", evidence_kind="source_blind_memory_review_only",
+                safe_summary="Source-blind legacy memory exists and requires review.",
+                public_safe_candidate=False, review_only=True, raw_ref_json={"snippet": f"legacy raw {idx}"}, observed_at=f"2026-06-03T00:{idx:02d}:00",
+            )
+        evidence.upsert_entity_evidence_event(
+            self.conn, guild_id=1, subject_name="Crow", source_type="conversation", source_table="conversations",
+            source_row_id="older-public", source_label="conversations/public_discord_observed", channel_name="barcode-bot",
+            channel_policy="public_context", visibility="public_side", authority="channel_policy_observed", confidence=0.72,
+            relation_to_subject="authored", topic="source-file/dossier planning context", evidence_kind="authored_public_conversation",
+            safe_summary="Subject authored approved public-side conversation about BNL/source-file/dossier handling.",
+            public_safe_candidate=True, review_only=False, bnl_interaction=True, raw_ref_json={"content": "raw transcript 123456789012345678"}, observed_at="2026-06-01T00:00:00",
+        )
+        self.conn.commit()
+
+        ranked = evidence.get_ranked_entity_evidence_for_subject(self.conn, "Crow", guild_id=1, limit=3)
+
+        self.assertEqual(ranked[0]["evidence_kind"], "authored_public_conversation")
+        self.assertEqual(ranked[0]["source_row_id"], "older-public")
+
+    def test_source_blind_is_capped_deduped_and_best_review_uses_safe_summaries(self):
+        evidence.ensure_entity_evidence_schema(self.conn)
+        evidence.upsert_entity_evidence_event(
+            self.conn, guild_id=1, subject_name="Crow", source_type="conversation", source_table="conversations",
+            source_row_id="public-1", source_label="conversations/public_discord_observed", channel_name="barcode-bot",
+            channel_policy="public_context", visibility="public_side", authority="channel_policy_observed", confidence=0.8,
+            relation_to_subject="mentioned", topic="source-file/dossier planning context", evidence_kind="mentioned_public_conversation",
+            safe_summary="Subject was mentioned in approved public-side conversation as a possible source-file candidate.",
+            public_safe_candidate=True, review_only=False, community_signal=True, raw_ref_json={"content": "VERY RAW TRANSCRIPT 123456789012345678"}, observed_at="2026-06-02",
+        )
+        for idx in range(6):
+            evidence.upsert_entity_evidence_event(
+                self.conn, guild_id=1, subject_name="Crow", source_type="source_blind_memory", source_table="memory_tiers",
+                source_row_id=f"blind-{idx}", source_label="memory_tiers/source_blind_memory_trace", channel_policy="source_blind",
+                visibility="review_only", authority="source_blind_legacy_memory", confidence=0.35,
+                relation_to_subject="source_blind_memory", topic="local context", evidence_kind="source_blind_memory_review_only",
+                safe_summary="Source-blind legacy memory exists and requires review.",
+                public_safe_candidate=False, review_only=True, raw_ref_json={"snippet": f"VERY RAW MEMORY {idx} 123456789012345678"}, observed_at=f"2026-06-03-{idx}",
+            )
+        self.conn.commit()
+
+        summary = self._summary()
+        formatted = entity.format_entity_activity_summary_response(summary)
+        normal_text = json.dumps({k: v for k, v in summary.items() if k != "rawProvenance"}) + formatted
+
+        self.assertLessEqual(sum(1 for item in summary["reviewOnlyEvidence"] if "Source-blind" in item), 2)
+        self.assertIn("Best evidence to review:", formatted)
+        self.assertTrue(any("possible source-file candidate" in item for item in summary["bestEvidenceToReview"]))
+        self.assertNotIn("VERY RAW TRANSCRIPT", normal_text)
+        self.assertNotIn("123456789012345678", normal_text)
+        self.assertIn("Public-safe candidate events are review candidates, not confirmed public facts", formatted)
+        self.assertNotRegex(formatted, r"\b6 public-safe candidates\b|\b6 usable dossier facts\b")
+        raw_text = json.dumps(summary["rawProvenance"])
+        self.assertIn("rawRefJson", raw_text)
+
+    def test_normal_readout_excludes_private_channel_names_and_queue_stays_unconnected(self):
+        c = self.conn.cursor()
+        c.execute("INSERT INTO conversations VALUES (NULL,7,'User',1,'research-and-development','internal_controlled','user','Crow private mod note with 123456789012345678 raw transcript.','now')")
+        c.execute("INSERT INTO conversations VALUES (NULL,7,'User',1,'barcode-bot','public_context','user','Crow was mentioned in BARCODE community source-file discussion.','now')")
+        self.conn.commit()
+
+        summary = self._summary()
+        formatted = entity.format_entity_activity_summary_response(summary)
+
+        self.assertNotIn("research-and-development", formatted)
+        self.assertNotIn("123456789012345678", formatted)
+        self.assertIn("#barcode-bot", formatted)
+        self.assertEqual(summary["queueSubmissionStatus"], "not_connected")
+        self.assertIn(entity.QUEUE_NOT_CONNECTED_NOTE, formatted)
+        for forbidden in ("websiteIngest", "dossierCreated", "published", "payment", "artistAccount", "ambient", "publicDiscordPost"):
+            self.assertNotIn(forbidden, json.dumps(summary))
+
     def test_entity_summary_finds_local_profile_match(self):
         self.conn.execute("INSERT INTO user_profiles VALUES (42,1,'Crow','Crow',NULL,NULL)")
         self.conn.commit()
