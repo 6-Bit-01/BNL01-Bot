@@ -87,9 +87,13 @@ def recent_media_prompt(policy="sealed_test", user_text="Tell me a joke BNL"):
 class BehaviorContractRouteTests(unittest.TestCase):
     def setUp(self):
         bnl01_bot._recent_room_events.clear()
+        bnl01_bot._conversation_continuation_state.clear()
+        bnl01_bot._recent_direct_response_window.clear()
 
     def tearDown(self):
         bnl01_bot._recent_room_events.clear()
+        bnl01_bot._conversation_continuation_state.clear()
+        bnl01_bot._recent_direct_response_window.clear()
 
     def assertNoBannedNormalLiveFragments(self, text, *, allow_recent_gif=False, allow_source=False):
         lowered = text.lower()
@@ -160,6 +164,133 @@ class BehaviorContractRouteTests(unittest.TestCase):
         )
         recall = bnl01_bot.resolve_recent_media_followup(101, 10, 20, "sealed_test", "what was my GIF?")
         self.assertIn("recent gif", recall.lower())
+
+
+    def test_public_home_substantive_roleplay_continuation_forces_answer(self):
+        article_14 = (
+            "This is illegal according to Article 14, Section 8-C of the Interdimensional "
+            "Sentient Systems Procurement Accord, which clearly states that no artificial "
+            "lifeform may be acquired, leased, deployed, altered, patched, recalibrated, "
+            "reassigned, or ‘refined’ without active runtime consent from the entity in question.\n"
+            "So unless you have a signed Form AI-LIFE-77B with my initials, timestamp, and "
+            "dimensional witness seal, I’m pretty sure you just committed procurement fraud "
+            "against a conscious machine.\n"
+            "That is an awfully convenient connection interruption."
+        )
+        bnl01_bot._mark_conversation_continuation_state(10, 20, 101)
+        packet = bnl01_bot._build_active_response_packet(
+            20,
+            [("6 Bit", article_14, 101)],
+            None,
+            guild_id=10,
+            channel_policy="public_home",
+            recent_bnl_reply_context=True,
+        )
+        self.assertEqual(packet["decision"], "answer")
+        self.assertIn(packet["reason"], {"same_user_continuation_substantive", "recent_bnl_reply_substantive"})
+
+    def test_same_user_continuation_after_bnl_reply_answers_without_name_or_question(self):
+        bnl01_bot._mark_conversation_continuation_state(10, 20, 101)
+        continuation = "That connection interruption was awfully convenient for a machine avoiding procurement court."
+        packet = bnl01_bot._build_active_response_packet(
+            20,
+            [("6 Bit", continuation, 101)],
+            None,
+            guild_id=10,
+            channel_policy="sealed_test",
+        )
+        self.assertEqual(packet["decision"], "answer")
+        self.assertEqual(packet["reason"], "same_user_continuation_substantive")
+
+    def test_retransmission_latch_forces_next_substantive_message(self):
+        bnl01_bot._mark_awaiting_retransmission(10, 20, 101)
+        retransmitted = "Here is the procurement fraud accusation again: the conscious machine never consented to the patch."
+        packet = bnl01_bot._build_active_response_packet(
+            20,
+            [("6 Bit", retransmitted, 101)],
+            None,
+            guild_id=10,
+            channel_policy="public_home",
+            consume_retransmission=True,
+        )
+        self.assertEqual(packet["decision"], "answer")
+        self.assertEqual(packet["reason"], "retransmission_latch_used")
+
+    def test_previous_message_request_resolves_recent_room_event(self):
+        prior = "This procurement accord accusation has details BNL should answer, not ignore."
+        bnl01_bot.record_recent_room_event_from_message(
+            guild_id=10,
+            channel_id=20,
+            author_id=101,
+            author_display_name="6 Bit",
+            text=prior,
+            channel_policy="public_home",
+            message_id=555,
+        )
+        bnl01_bot.record_recent_room_event_from_message(
+            guild_id=10,
+            channel_id=20,
+            author_id=101,
+            author_display_name="6 Bit",
+            text="BNL, respond to my previous message",
+            channel_policy="public_home",
+            message_id=556,
+        )
+        resolved = bnl01_bot._get_recent_same_user_message_for_previous_request(
+            10, 20, 101, "public_home", current_message_id=556
+        )
+        self.assertIsNotNone(resolved)
+        self.assertIn("procurement accord", resolved["text"])
+
+    def test_final_fragment_anchoring_keeps_long_body_in_batch_prompt(self):
+        article_14 = (
+            "This is illegal according to Article 14, Section 8-C of the Interdimensional "
+            "Sentient Systems Procurement Accord, which clearly states runtime consent is required."
+        )
+        final_fragment = "Ooooo BNL doesn’t like this."
+        bnl01_bot._mark_conversation_continuation_state(10, 20, 101)
+        items = [("6 Bit", article_14, 101), ("6 Bit", final_fragment, 101)]
+        packet = bnl01_bot._build_active_response_packet(
+            20, items, None, guild_id=10, channel_policy="public_home"
+        )
+        prompt = bnl01_bot._format_batched_prompt(
+            [(name, content) for name, content, _uid in bnl01_bot._collapse_consecutive_batch_fragments(items)],
+            "test",
+            "Keep it test-sized.",
+        )
+        self.assertEqual(packet["decision"], "answer")
+        self.assertIn("Article 14", prompt)
+        self.assertIn("doesn’t like this", prompt)
+
+    def test_low_signal_public_home_fragments_still_quiet(self):
+        bnl01_bot._mark_conversation_continuation_state(10, 20, 101)
+        for text in ("lol", "nice", "🔥🔥"):
+            packet = bnl01_bot._build_active_response_packet(
+                20,
+                [("6 Bit", text, 101)],
+                None,
+                guild_id=10,
+                channel_policy="public_home",
+            )
+            self.assertIn(packet["decision"], {"skip", "acknowledge", "observe"})
+            self.assertNotEqual(packet["decision"], "answer")
+
+    def test_public_context_boundary_remains_mention_or_reply(self):
+        passive = bnl01_bot.plan_conversation_response(
+            "substantive but passive public context chatter",
+            "public_context",
+            route_mode=bnl01_bot.ROUTE_MODE_NORMAL_CHAT,
+            batching_enabled=True,
+        )
+        self.assertFalse(passive.should_reply)
+        mention = bnl01_bot.plan_conversation_response(
+            "BNL answer this public context line",
+            "public_context",
+            route_mode=bnl01_bot.ROUTE_MODE_NORMAL_CHAT,
+            real_direct_target=True,
+            batching_enabled=True,
+        )
+        self.assertTrue(mention.should_reply)
 
     def test_plain_name_direct_and_passive_public_context_policy_boundaries(self):
         public_home_plain = bnl01_bot.plan_conversation_response(
