@@ -329,11 +329,24 @@ def merge_entity_activity_summary_into_packet(packet: dict[str, Any], entity_sum
     useful_from_summary: list[str] = []
     useful_from_summary.extend(summary.get("activitySignals") or [])
     useful_from_summary.extend(summary.get("channelActivity") or [])
+    useful_from_summary.extend(summary.get("conversationHighlights") or [])
+    useful_from_summary.extend(summary.get("musicSignals") or [])
+    useful_from_summary.extend(summary.get("communitySignals") or [])
     useful_from_summary.extend(summary.get("recurringTopics") or [])
     if summary.get("matchedNames"):
         useful_from_summary.insert(0, f"BNL found an internal local profile match for {packet.get('subjectName') or summary.get('subjectName') or 'this subject'}.")
     _merge_unique(packet.setdefault("usefulEvidence", []), useful_from_summary, limit=8)
     _merge_unique(packet.setdefault("relationshipSignals", []), summary.get("relationshipSignals"), limit=6)
+    for field in ("observedChannels", "conversationHighlights", "topicBreakdown", "bnlInteractionSignals", "musicSignals", "communitySignals", "sourceCoverage", "evidenceDetails"):
+        existing = packet.setdefault(field, [])
+        values = summary.get(field) or []
+        if field == "sourceCoverage":
+            for value in values:
+                if value not in existing and not _looks_like_raw_label(str(value)):
+                    existing.append(value)
+            packet[field] = existing[:8]
+        else:
+            _merge_unique(existing, values, limit=8)
 
     current_public = packet.setdefault("publicSafePossibilities", [])
     summary_public = [
@@ -343,10 +356,12 @@ def merge_entity_activity_summary_into_packet(packet: dict[str, Any], entity_sum
     if any(item != "No public-safe facts confirmed yet." for item in summary_public):
         current_public[:] = [item for item in current_public if item != "No public-safe fact is confirmed by this packet; owner review is required before public use."]
     _merge_unique(current_public, summary_public, limit=6)
+    _merge_unique(packet.setdefault("publicUseCandidates", []), summary.get("publicUseCandidates"), limit=6)
     if not current_public:
         current_public.append("No public-safe fact is confirmed by this packet; owner review is required before public use.")
 
     _merge_unique(packet.setdefault("privateOnlyNotes", []), summary.get("privateOnlyNotes"), limit=8)
+    _merge_unique(packet.setdefault("reviewOnlyEvidence", []), summary.get("reviewOnlyEvidence"), limit=8)
     packet["privateOnlyNotes"] = _dedupe_same_observation(packet.get("privateOnlyNotes") or [])[:8]
     _merge_unique(packet.setdefault("notPublicYet", []), summary.get("notPublicYet"), limit=8)
     packet["notPublicYet"] = _dedupe_same_observation(packet.get("notPublicYet") or [])[:8]
@@ -501,8 +516,18 @@ def build_dossier_recommendation_packet(
             "knownContext": packet["knownContext"],
             "usefulEvidence": packet["usefulEvidence"],
             "relationshipSignals": packet["relationshipSignals"],
+            "observedChannels": packet.get("observedChannels", []),
+            "conversationHighlights": packet.get("conversationHighlights", []),
+            "topicBreakdown": packet.get("topicBreakdown", []),
+            "bnlInteractionSignals": packet.get("bnlInteractionSignals", []),
+            "musicSignals": packet.get("musicSignals", []),
+            "communitySignals": packet.get("communitySignals", []),
+            "sourceCoverage": packet.get("sourceCoverage", []),
+            "evidenceDetails": packet.get("evidenceDetails", []),
             "publicSafePossibilities": packet["publicSafePossibilities"],
+            "publicUseCandidates": packet.get("publicUseCandidates", []),
             "privateOnlyNotes": packet["privateOnlyNotes"],
+            "reviewOnlyEvidence": packet.get("reviewOnlyEvidence", []),
             "missingInfo": packet["missingInfo"],
             "notPublicYet": packet["notPublicYet"],
             "publicSafetyNotes": packet["publicSafetyNotes"],

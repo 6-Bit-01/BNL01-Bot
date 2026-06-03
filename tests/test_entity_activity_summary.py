@@ -76,6 +76,36 @@ class EntityActivitySummaryBuilderTests(unittest.TestCase):
         self.assertTrue(any("Public-side conversation context exists" in item for item in summary["publicSafePossibilities"]))
         self.assertTrue(any("public-side" in item for item in summary["channelActivity"]))
 
+    def test_public_conversation_rows_produce_concrete_channels_highlights_and_topics(self):
+        c = self.conn.cursor()
+        c.execute("INSERT INTO user_profiles VALUES (42,1,'Crow','Crow',NULL,NULL)")
+        c.execute("INSERT INTO conversations VALUES (NULL,42,'Crow',1,'finished-tracks','public_home','user','Can BNL explain dossier source-file behavior for my new track and radio show context?','2026-06-01')")
+        c.execute("INSERT INTO conversations VALUES (NULL,7,'Other',1,'barcode-bot','public_context','user','Crow was mentioned as a possible source-file candidate in community discussion.','2026-06-02')")
+        self.conn.commit()
+
+        summary = self._summary()
+
+        self.assertTrue(any("#finished-tracks" in item and "authored" in item for item in summary["observedChannels"]))
+        self.assertTrue(any("#barcode-bot" in item and "mentioned" in item for item in summary["observedChannels"]))
+        self.assertTrue(any("Subject authored" in item and "dossier/source-file" in item for item in summary["conversationHighlights"]))
+        self.assertTrue(any("Subject was mentioned" in item for item in summary["conversationHighlights"]))
+        self.assertTrue(any("music" in item.lower() for item in summary["topicBreakdown"]))
+        self.assertTrue(any("source-file/dossier" in item.lower() for item in summary["topicBreakdown"]))
+        self.assertTrue(any("music" in item.lower() for item in summary["musicSignals"]))
+        self.assertTrue(any("community" in item.lower() for item in summary["communitySignals"]))
+        self.assertTrue(any("BNL-related" in item for item in summary["bnlInteractionSignals"]))
+
+    def test_internal_rows_keep_highlights_review_only_without_private_channel_names(self):
+        self.conn.execute("INSERT INTO conversations VALUES (NULL,7,'User',1,'research-and-development','internal_controlled','user','Crow asked about a private source file review.','now')")
+        self.conn.commit()
+
+        summary = self._summary()
+
+        self.assertTrue(any("review-only" in item for item in summary["observedChannels"]))
+        self.assertFalse(any("research-and-development" in item for item in summary["observedChannels"]))
+        self.assertTrue(any("review-only" in item for item in summary["conversationHighlights"]))
+        self.assertTrue(summary["reviewOnlyEvidence"])
+
     def test_unknown_sealed_internal_and_source_blind_remain_review_only(self):
         c = self.conn.cursor()
         c.execute("INSERT INTO conversations VALUES (NULL,7,'User',1,'mystery',NULL,'user','Crow appears in unknown legacy chatter.','now')")
