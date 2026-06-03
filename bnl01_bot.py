@@ -4841,7 +4841,11 @@ async def maybe_handle_dossier_recommendation_command(message: discord.Message, 
         payload.get("reason", ""),
         payload.get("sourceLanes") or ["rd_context"],
         guild_id=getattr(message.guild, "id", None),
-        options={"broadcast_memory_reader": get_recent_broadcast_memory},
+        options={
+            "broadcast_memory_reader": get_recent_broadcast_memory,
+            "db_path": DB_FILE,
+            "rd_context": _current_rd_discovery_context(message),
+        },
     )
     safe_payload = packet_result["payload"]
     subject = (safe_payload.get("subjectName") or "subject").strip()[:80]

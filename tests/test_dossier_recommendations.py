@@ -1,6 +1,8 @@
 import asyncio
 import json
 import os
+import sqlite3
+import tempfile
 import unittest
 import urllib.error
 from unittest import mock
@@ -175,6 +177,46 @@ class DossierSourcePacketTests(unittest.TestCase):
         self.assertEqual(payload["confidence"], "medium")
         self.assertLessEqual(len(payload["evidenceSummary"]), packets.MAX_EVIDENCE_SUMMARY_LENGTH)
         self.assertEqual(payload["ingestKey"], second["payload"]["ingestKey"])
+
+
+    def test_manual_packet_can_include_entity_summary_context_when_local_memory_exists(self):
+        tmp = tempfile.NamedTemporaryFile(suffix=".sqlite", delete=False)
+        tmp.close()
+        conn = sqlite3.connect(tmp.name)
+        try:
+            conn.execute("CREATE TABLE user_profiles (user_id INTEGER, guild_id INTEGER, display_name TEXT, preferred_name TEXT, last_seen TEXT, last_greeting_at TEXT)")
+            conn.execute("CREATE TABLE relationship_journal (id INTEGER PRIMARY KEY, user_id INTEGER, guild_id INTEGER, entry_type TEXT, summary TEXT, timestamp TEXT)")
+            conn.execute("INSERT INTO user_profiles VALUES (1,123,'Signal Witch','Signal Witch',NULL,NULL)")
+            conn.execute("INSERT INTO relationship_journal VALUES (NULL,1,123,'note','Signal Witch private relationship/context note for owner review.','now')")
+            conn.commit()
+
+            result = packets.build_dossier_recommendation_packet(
+                "Signal Witch",
+                "Operator says Signal Witch should be reviewed.",
+                ["rd_context"],
+                guild_id=123,
+                options={"db_path": tmp.name},
+            )
+            payload = result["payload"]
+
+            self.assertTrue(any("Local profile match found for Signal Witch" in item for item in payload["knownContext"]))
+            self.assertTrue(any("relationship/context" in item for item in payload["relationshipSignals"]))
+            self.assertFalse(any("relationship" in item.lower() for item in payload["publicSafePossibilities"]))
+            self.assertIn("queue/submission identity is not connected yet", payload["recommendedAction"])
+            normal_text = json.dumps({
+                "knownContext": payload.get("knownContext"),
+                "relationshipSignals": payload.get("relationshipSignals"),
+                "publicSafePossibilities": payload.get("publicSafePossibilities"),
+                "privateOnlyNotes": payload.get("privateOnlyNotes"),
+                "notPublicYet": payload.get("notPublicYet"),
+            })
+            self.assertNotIn("user_profiles/local_profile_observed", normal_text)
+            self.assertIn("rd_context/R&D/operator note", payload["rawProvenance"]["sourceLabels"])
+            self.assertIn("user_profiles/local_profile_observed", payload["rawProvenance"]["sourceLabels"])
+            self.assertIn("relationship_journal/local_relationship_trace", payload["rawProvenance"]["sourceLabels"])
+        finally:
+            conn.close()
+            os.unlink(tmp.name)
 
     def test_no_automatic_scanning_constructs_in_packet_module(self):
         with open("bnl_dossier_source_packets.py", encoding="utf-8") as handle:

@@ -33,6 +33,19 @@ _DISCORD_MENTION_PATTERN = re.compile(r"<[@#!&]?[0-9]{5,}>")
 _LONG_ID_PATTERN = re.compile(r"\b\d{15,22}\b")
 _broadcast_memory_reader: Callable[..., Any] | None = None
 
+_RAW_NORMAL_FIELD_MARKERS = (
+    "user_profiles/local_profile_observed",
+    "relationship_journal/local_relationship_trace",
+    "relationship_state/local_relationship_trace",
+    "conversations/public_discord_observed",
+    "memory_tiers/source_blind_memory_trace",
+    "source lane mapping",
+    "unknown -> unknown",
+    "help_signal",
+    "EDGE_SESSION",
+)
+MAX_ENTITY_RAW_FRAGMENTS = 8
+
 
 def set_broadcast_memory_reader(reader: Callable[..., Any] | None) -> None:
     """Register the existing bot broadcast-memory reader, if available."""
@@ -227,6 +240,153 @@ def _confidence_for_evidence(actual_lanes: list[str], evidence: list[dict[str, A
     return "low"
 
 
+def _normal_text_key(value: Any) -> str:
+    text = re.sub(r"[^a-z0-9]+", " ", str(value or "").lower()).strip()
+    replacements = {
+        "local profile match found for": "bnl found an internal local profile match for",
+        "review only relationship context signal exists for this subject": "bnl found prior relationship context notes connected to subject",
+        "public side conversation context exists but owner review is needed before stating it as public fact": "bnl found approved public side conversation context connected to subject",
+    }
+    for old, new in replacements.items():
+        text = text.replace(old, new)
+    return re.sub(r"\s+", " ", text)
+
+
+def _looks_like_raw_label(value: Any) -> bool:
+    text = str(value or "")
+    lowered = text.lower()
+    if any(marker.lower() in lowered for marker in _RAW_NORMAL_FIELD_MARKERS):
+        return True
+    if re.search(r"\b[a-z]+(?:_[a-z]+)+/[a-z]+(?:_[a-z]+)+\b", text):
+        return True
+    if re.search(r"\b\d{15,22}\b", text):
+        return True
+    return False
+
+
+def _merge_unique(target: list[Any], values: Any, *, limit: int | None = None) -> None:
+    if not isinstance(values, list):
+        return
+    seen = {_normal_text_key(item) for item in target}
+    for value in values:
+        if isinstance(value, dict):
+            marker = _normal_text_key(value)
+            if marker and marker not in seen:
+                target.append(value)
+                seen.add(marker)
+        else:
+            clean = _safe_snippet(str(value or ""), 260)
+            key = _normal_text_key(clean)
+            if not clean or _looks_like_raw_label(clean) or key in seen:
+                continue
+            target.append(clean)
+            seen.add(key)
+        if limit and len(target) >= limit:
+            break
+
+
+def _dedupe_same_observation(values: list[Any]) -> list[Any]:
+    seen: set[str] = set()
+    out: list[Any] = []
+    for value in values:
+        if isinstance(value, dict):
+            key = _normal_text_key(value)
+        else:
+            text = str(value or "")
+            observation = re.split(r"\b(?:Keep this internal|Owner review|Not public|Treat this as|It may inform|Source-blind memory requires)\b", text, maxsplit=1)[0]
+            key = _normal_text_key(observation or text)
+        if key and key in seen:
+            continue
+        if key:
+            seen.add(key)
+        out.append(value)
+    return out
+
+
+def _has_entity_evidence(entity_summary: dict[str, Any] | None) -> bool:
+    raw = (entity_summary or {}).get("rawProvenance") or {}
+    return bool(raw.get("rawFragments"))
+
+
+def _entity_source_authority_items(entity_summary: dict[str, Any], confidence: str) -> list[dict[str, str]]:
+    items: list[dict[str, str]] = []
+    for value in entity_summary.get("sourceAuthority") or []:
+        if not value or _looks_like_raw_label(value):
+            continue
+        items.append({"source": "Entity Activity Summary", "boundary": _safe_snippet(str(value), 160), "confidence": confidence})
+    return items
+
+
+def merge_entity_activity_summary_into_packet(packet: dict[str, Any], entity_summary: dict[str, Any] | None) -> dict[str, Any]:
+    """Merge shared entity-summary context into a source packet without changing privacy boundaries."""
+
+    if not _has_entity_evidence(entity_summary):
+        return packet
+
+    summary = entity_summary or {}
+    confidence = str(packet.get("confidence") or summary.get("confidence") or "low")
+    _merge_unique(packet.setdefault("knownContext", []), summary.get("knownContext"), limit=8)
+    useful_from_summary: list[str] = []
+    useful_from_summary.extend(summary.get("activitySignals") or [])
+    useful_from_summary.extend(summary.get("channelActivity") or [])
+    useful_from_summary.extend(summary.get("recurringTopics") or [])
+    if summary.get("matchedNames"):
+        useful_from_summary.insert(0, f"BNL found an internal local profile match for {packet.get('subjectName') or summary.get('subjectName') or 'this subject'}.")
+    _merge_unique(packet.setdefault("usefulEvidence", []), useful_from_summary, limit=8)
+    _merge_unique(packet.setdefault("relationshipSignals", []), summary.get("relationshipSignals"), limit=6)
+
+    current_public = packet.setdefault("publicSafePossibilities", [])
+    summary_public = [
+        item for item in (summary.get("publicSafePossibilities") or [])
+        if item != "No public-safe facts confirmed yet." or not any("public-safe" not in str(existing).lower() for existing in current_public)
+    ]
+    if any(item != "No public-safe facts confirmed yet." for item in summary_public):
+        current_public[:] = [item for item in current_public if item != "No public-safe fact is confirmed by this packet; owner review is required before public use."]
+    _merge_unique(current_public, summary_public, limit=6)
+    if not current_public:
+        current_public.append("No public-safe fact is confirmed by this packet; owner review is required before public use.")
+
+    _merge_unique(packet.setdefault("privateOnlyNotes", []), summary.get("privateOnlyNotes"), limit=8)
+    packet["privateOnlyNotes"] = _dedupe_same_observation(packet.get("privateOnlyNotes") or [])[:8]
+    _merge_unique(packet.setdefault("notPublicYet", []), summary.get("notPublicYet"), limit=8)
+    packet["notPublicYet"] = _dedupe_same_observation(packet.get("notPublicYet") or [])[:8]
+    _merge_unique(packet.setdefault("missingInfo", []), summary.get("missingInfo"), limit=8)
+    _merge_unique(packet.setdefault("sourceAuthority", []), _entity_source_authority_items(summary, confidence), limit=10)
+
+    summary_confidence = str(summary.get("confidence") or "none")
+    if packet.get("confidence") == "low" and summary_confidence in {"medium", "high"}:
+        packet["confidence"] = "medium" if summary_confidence == "medium" else "high"
+
+    if packet.get("relationshipSignals") or any("relationship" in str(item).lower() for item in packet.get("privateOnlyNotes") or []):
+        action = "Separate private relationship/context notes from any public-safe community description before drafting; queue/submission identity is not connected yet."
+    elif any(item != "No public-safe facts confirmed yet." and "no public-safe fact" not in str(item).lower() for item in packet.get("publicSafePossibilities") or []):
+        action = "Review this subject as a possible community/source-file candidate; owner review must confirm public-safe identity, role, and wording before any public use."
+    else:
+        action = "Keep this as internal Source File review material until an owner confirms public-safe identity, role, and wording; queue/submission identity is not connected yet."
+    packet["recommendedAction"] = action
+    packet["suggestedAction"] = action
+
+    raw = packet.setdefault("rawProvenance", {})
+    entity_raw = summary.get("rawProvenance") or {}
+    direct_labels = list(raw.get("sourceLabels") or [])
+    entity_labels = list(entity_raw.get("sourceLabels") or [])
+    raw["sourceLabels"] = list(dict.fromkeys(direct_labels + entity_labels))
+    raw["sourceCounts"] = dict(raw.get("sourceCounts") or {})
+    raw["entitySourceCounts"] = dict(entity_raw.get("sourceCounts") or {})
+    if entity_raw.get("channelPolicies"):
+        raw["channelPolicyCounts"] = dict(entity_raw.get("channelPolicies") or {})
+    raw["entitySourceAuthority"] = list(summary.get("sourceAuthority") or [])[:5]
+    fragments = list(raw.get("rawFragments") or [])
+    for fragment in list(entity_raw.get("rawFragments") or [])[:MAX_ENTITY_RAW_FRAGMENTS]:
+        if isinstance(fragment, dict):
+            merged = {"origin": "entity_activity_summary", **fragment}
+        else:
+            merged = {"origin": "entity_activity_summary", "snippet": _safe_snippet(str(fragment))}
+        fragments.append(merged)
+    raw["rawFragments"] = fragments[: MAX_EVIDENCE_MATCHES + MAX_ENTITY_RAW_FRAGMENTS]
+    packet["entityActivitySummaryIncluded"] = True
+    return packet
+
 def build_dossier_recommendation_packet(
     subject: str,
     reason: str,
@@ -251,6 +411,34 @@ def build_dossier_recommendation_packet(
                 aliases=aliases,
             )
         )
+
+    entity_summary = opts.get("entity_activity_summary") if isinstance(opts.get("entity_activity_summary"), dict) else None
+    db_path = opts.get("db_path") or opts.get("entity_db_path")
+    if entity_summary is None and db_path:
+        try:
+            from bnl_entity_activity_summary import build_entity_activity_summary
+
+            entity_summary = build_entity_activity_summary(
+                str(db_path),
+                subject_name,
+                guild_id,
+                [
+                    "user_profiles",
+                    "user_memory_facts",
+                    "user_habits",
+                    "relationship_state",
+                    "relationship_journal",
+                    "memory_tiers",
+                    "conversations",
+                    "broadcast_memory",
+                    "rd_context",
+                ],
+                "admin_internal",
+                50,
+                opts.get("rd_context"),
+            )
+        except Exception:
+            entity_summary = None
 
     actual_lanes: list[str] = []
     for item in evidence:
@@ -302,6 +490,7 @@ def build_dossier_recommendation_packet(
         "recommendedAction": DEFAULT_SUGGESTED_ACTION,
         "evidence": evidence,
     }
+    merge_entity_activity_summary_into_packet(packet, entity_summary)
     payload = build_dossier_recommendation_payload(
         {
             "type": "new_subject",

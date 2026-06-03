@@ -16,6 +16,7 @@ from datetime import datetime, timezone
 from typing import Any, Callable
 
 from bnl_dossier_recommendations import build_dossier_recommendation_payload, send_dossier_recommendation
+from bnl_entity_activity_summary import build_entity_activity_summary
 from bnl_source_file_lookup import lookup_source_file
 
 ENRICHMENT_INGEST_SOURCE = "bnl_source_file_enrichment"
@@ -718,6 +719,34 @@ def _summarize_channel_activity(subject: str, rows: list[sqlite3.Row]) -> str:
     return f"{lead}. review-only internal context; internal source context, not public dossier copy. no specific public-safe role has been confirmed yet. No meaningful repeated theme has been extracted yet.{channel_text}"
 
 
+def _entity_summary_has_evidence(summary: dict[str, Any] | None) -> bool:
+    return bool(((summary or {}).get("rawProvenance") or {}).get("rawFragments"))
+
+
+def _append_entity_summary_sections(sections: dict[str, list[str]], summary: dict[str, Any]) -> None:
+    for item in (summary.get("knownContext") or [])[:2]:
+        if "No approved local" not in str(item):
+            _append_section(sections, "Subject Overview", str(item), limit=5)
+    for item in (summary.get("activitySignals") or [])[:2] + (summary.get("channelActivity") or [])[:2] + (summary.get("recurringTopics") or [])[:2]:
+        _append_section(sections, "Observed Patterns", str(item), limit=8)
+    for item in (summary.get("publicSafePossibilities") or [])[:3]:
+        if str(item) != "No public-safe facts confirmed yet.":
+            safe_item = re.sub(r"owner review", "human review", str(item), flags=re.I)
+            _append_section(sections, "Public-Safe Notes", safe_item, limit=6)
+    review_items = list(summary.get("relationshipSignals") or []) + list(summary.get("privateOnlyNotes") or []) + list(summary.get("notPublicYet") or [])
+    for item in review_items[:5]:
+        _append_section(sections, "Internal-Only / Review-Only Notes", str(item), limit=10)
+    for item in (summary.get("missingInfo") or [])[:4]:
+        _append_section(sections, "Missing Info", str(item), limit=8)
+    if summary.get("recommendedAction"):
+        _append_section(
+            sections,
+            "Suggested Next Action",
+            "Keep this as internal Source File review material until an owner confirms public-safe identity, role, and wording; queue/submission identity is not connected yet.",
+            limit=4,
+        )
+
+
 def _append_section(sections: dict[str, list[str]], name: str, value: str, *, limit: int = 5) -> None:
     clean = _safe_text(value, 240)
     if not clean:
@@ -1295,6 +1324,34 @@ def collect_source_enrichment_evidence(db_path: str, guild_id: int | None, subje
     if "rd_context" not in source_statuses:
         _source_status(source_statuses, "rd_context", "no_match" if rd_context else "not_provided")
 
+    entity_summary = build_entity_activity_summary(
+        db_path,
+        subject,
+        guild_id,
+        [
+            "user_profiles",
+            "user_memory_facts",
+            "user_habits",
+            "relationship_state",
+            "relationship_journal",
+            "memory_tiers",
+            "conversations",
+            "broadcast_memory",
+            "rd_context",
+        ],
+        "admin_internal",
+        50,
+        rd_context,
+    )
+    raw_provenance = entity_summary.get("rawProvenance") if _entity_summary_has_evidence(entity_summary) else {}
+    if raw_provenance:
+        _append_entity_summary_sections(sections, entity_summary)
+        source_counts["entity_activity_summary"] += len(raw_provenance.get("rawFragments") or [])
+        source_types.add("entity_activity_summary")
+        _source_status(source_statuses, "entity_activity_summary", "yes")
+    else:
+        _source_status(source_statuses, "entity_activity_summary", "no_match")
+
     if not sections["Why This Subject Matters"] and (sum(source_counts.values()) > source_counts.get("source_file_lookup", 0)):
         _append_section(sections, "Why This Subject Matters", "BNL has enough local review signals to keep this subject in the working record; admins should decide what, if anything, belongs in a public-safe Source File summary.")
     if not sections["Subject Overview"]:
@@ -1357,6 +1414,19 @@ def collect_source_enrichment_evidence(db_path: str, guild_id: int | None, subje
         "subjectIdentity": safe_identity,
         "diagnostics": diagnostics,
         "classification": classification,
+        "knownContext": list(entity_summary.get("knownContext") or [])[:6] if raw_provenance else [],
+        "relationshipSignals": list(entity_summary.get("relationshipSignals") or [])[:4] if raw_provenance else [],
+        "publicSafePossibilities": list(entity_summary.get("publicSafePossibilities") or [])[:4] if raw_provenance else [],
+        "privateOnlyNotes": list(entity_summary.get("privateOnlyNotes") or [])[:6] if raw_provenance else [],
+        "notPublicYet": list(entity_summary.get("notPublicYet") or [])[:6] if raw_provenance else [],
+        "sourceAuthority": list(entity_summary.get("sourceAuthority") or [])[:5] if raw_provenance else [],
+        "rawProvenance": {
+            "sourceLabels": list(raw_provenance.get("sourceLabels") or []),
+            "sourceCounts": dict(raw_provenance.get("sourceCounts") or {}),
+            "rawFragments": list(raw_provenance.get("rawFragments") or [])[:8],
+            "channelPolicyCounts": dict(raw_provenance.get("channelPolicies") or {}),
+            "sourceAuthority": list(entity_summary.get("sourceAuthority") or [])[:5],
+        } if raw_provenance else {},
     }
 
 def _section_text(sections: dict[str, list[str]], name: str, *, limit: int = 4) -> str:
@@ -1422,6 +1492,13 @@ def build_enrichment_recommendation_payload(packet: dict[str, Any], *, environ: 
         "sourceCoverage": dict(packet.get("sourceTypesChecked") or {}),
         "identityDiagnostics": dict(packet.get("diagnostics") or {}),
         "internalClassification": dict(packet.get("classification") or {}),
+        "knownContext": list(packet.get("knownContext") or []),
+        "relationshipSignals": list(packet.get("relationshipSignals") or []),
+        "publicSafePossibilities": list(packet.get("publicSafePossibilities") or []),
+        "privateOnlyNotes": list(packet.get("privateOnlyNotes") or []),
+        "notPublicYet": list(packet.get("notPublicYet") or []),
+        "sourceAuthority": list(packet.get("sourceAuthority") or []),
+        "rawProvenance": dict(packet.get("rawProvenance") or {}),
         "visibilityLabels": ["internal_review_only", "admin_review_required"],
         "confidence": "low" if packet.get("qualityStatus") in {"too_thin", "forced_low_confidence"} else ("medium" if match_kind == "active_source_file" else "low"),
         "createdBy": "bnl",
