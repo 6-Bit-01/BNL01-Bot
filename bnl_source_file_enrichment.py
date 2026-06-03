@@ -17,6 +17,7 @@ from typing import Any, Callable
 
 from bnl_dossier_recommendations import build_dossier_recommendation_payload, send_dossier_recommendation
 from bnl_entity_activity_summary import build_entity_activity_summary, refresh_entity_evidence_for_subject
+from bnl_entity_evidence import _website_safe_payload_text
 from bnl_source_file_lookup import lookup_source_file
 
 ENRICHMENT_INGEST_SOURCE = "bnl_source_file_enrichment"
@@ -59,6 +60,12 @@ SITE_BOUND_LIST_FIELDS = (
     "doNotSay",
 )
 _PRIVATE_CHANNEL_NAME_RE = re.compile(r"(?i)(?:#?(?:research-and-development|private[-_ ]?internal|private[-_ ]?chat|staff[-_ ]?only|mod[-_ ]?chat|direct[-_ ]?message)s?|\bdm\b)")
+
+_RAW_REPRESENTATIVE_EVIDENCE_RE = re.compile(
+    r"(?:\b(?:source(?:_file)?_?lookup|entity_evidence_events|conversations|user_profiles|memory_tiers|broadcast_memory|rd_context|rawRefJson|sourceTable|sourceRowId|sourceLabel)\b|\b(?:row|id)[:=]\s*[A-Za-z0-9_-]+|\b[a-z_]+/[A-Za-z0-9_-]+)",
+    re.I,
+)
+_UNSAFE_REPRESENTATIVE_EVIDENCE_TOKENS = ("authored_public_conversation", "profile_match", "[object Object]")
 
 ENTITY_SUMMARY_EVIDENCE_FIELDS = {
     "observedChannels": 6,
@@ -1572,8 +1579,37 @@ def _section_text(sections: dict[str, list[str]], name: str, *, limit: int = 4) 
 
 def _site_safe_text(value: Any, limit: int = SITE_LIST_ITEM_LIMIT) -> str:
     text = _safe_text(value, limit)
+    text = _website_safe_payload_text(text)
+    text = text.replace("authored_public_conversation", "authored public conversation classification")
+    text = text.replace("mentioned_public_conversation", "mentioned public conversation classification")
+    text = text.replace("profile_match", "local profile match classification")
+    text = re.sub(r"\brow\(s\)", "item(s)", text, flags=re.I)
+    text = re.sub(r"\brows\b", "items", text, flags=re.I)
     text = _PRIVATE_CHANNEL_NAME_RE.sub("[private-channel]", text)
     return text.replace("[object Object]", "[unsupported-object]")
+
+
+def _compact_representative_evidence_item_for_site(value: Any) -> str:
+    text = _site_safe_text(value, SITE_LIST_ITEM_LIMIT)
+    channel = "approved public-side channel"
+    body = text
+    if ":" in text:
+        maybe_channel, body = text.split(":", 1)
+        if maybe_channel.strip().startswith("#"):
+            channel = maybe_channel.strip()
+    body = body.strip().rstrip(".")
+    lowered = body.lower()
+    if "classified under" in lowered and "review before" in lowered and "/" not in body:
+        return f"{channel}: {body}." if channel not in text[: len(channel) + 1] else text
+    match = re.search(r"(?:authored|mentioned)?\s*([A-Za-z0-9 -]+(?: and |, or )[A-Za-z0-9 ,or-]+)(?: classification)?(?: discussion)?", body, flags=re.I)
+    if match:
+        topic = _website_safe_payload_text(match.group(1)).removesuffix(" classification")
+        if topic.lower().startswith("bnl source-file and dossier"):
+            return f"{channel}: BNL classified this approved public-context item under {topic} context; review before treating it as a subject claim."
+        return f"{channel}: approved public-context item classified under {topic}; review before using as a subject claim."
+    if "/" in text or "authored" in lowered or "mentioned" in lowered or _RAW_REPRESENTATIVE_EVIDENCE_RE.search(text):
+        return f"{channel}: approved public-context item has a BNL classification; review before using as a subject claim."
+    return text
 
 
 def _compact_value_for_site(value: Any, *, text_limit: int = SITE_LIST_ITEM_LIMIT, depth: int = 0) -> Any:
@@ -1756,7 +1792,16 @@ def compact_enrichment_payload_for_site(payload: dict[str, Any]) -> dict[str, An
     compact["evidenceSummary"] = _site_safe_text(compact.get("evidenceSummary"), SITE_EVIDENCE_SUMMARY_TARGET)
     for key in SITE_BOUND_LIST_FIELDS:
         if key in compact:
-            compact[key] = _compact_list_for_site(compact.get(key), max_items=SITE_LIST_MAX_ITEMS, item_limit=SITE_LIST_ITEM_LIMIT)
+            if key == "representativeEvidence":
+                compact[key] = []
+                seen_rep: set[str] = set()
+                for item in _compact_list_for_site(compact.get(key) or payload.get(key), max_items=SITE_LIST_MAX_ITEMS, item_limit=SITE_LIST_ITEM_LIMIT):
+                    rep_item = _compact_representative_evidence_item_for_site(item)
+                    if rep_item and rep_item not in seen_rep:
+                        compact[key].append(rep_item)
+                        seen_rep.add(rep_item)
+            else:
+                compact[key] = _compact_list_for_site(compact.get(key), max_items=SITE_LIST_MAX_ITEMS, item_limit=SITE_LIST_ITEM_LIMIT)
     if "sourceCoverage" in compact:
         compact["sourceCoverage"] = _compact_source_coverage_for_site(compact.get("sourceCoverage"))
     compact["rawProvenance"] = _compact_raw_provenance_for_site(compact.get("rawProvenance"))
@@ -1816,6 +1861,25 @@ def _validate_source_coverage_for_site(source_coverage: Any) -> list[str]:
     return issues
 
 
+
+def _validate_representative_evidence_for_site(value: Any) -> list[str]:
+    issues: list[str] = []
+    if not isinstance(value, list):
+        return ["representativeEvidence must be a list"]
+    for item in value:
+        text = json.dumps(item, sort_keys=True, default=str) if isinstance(item, (dict, list)) else str(item)
+        lowered = text.lower()
+        if "/" in text:
+            issues.append("representativeEvidence contains slash taxonomy")
+            break
+        if any(token.lower() in lowered for token in _UNSAFE_REPRESENTATIVE_EVIDENCE_TOKENS):
+            issues.append("representativeEvidence contains unsupported raw metadata")
+            break
+        if _LONG_ID_RE.search(text) or _RAW_REPRESENTATIVE_EVIDENCE_RE.search(text):
+            issues.append("representativeEvidence contains unsupported raw metadata")
+            break
+    return issues
+
 def validate_enrichment_payload_for_site(payload: dict[str, Any]) -> list[str]:
     issues: list[str] = []
     if len(str(payload.get("evidenceSummary") or "")) > SITE_EVIDENCE_SUMMARY_LIMIT:
@@ -1825,6 +1889,8 @@ def validate_enrichment_payload_for_site(payload: dict[str, Any]) -> list[str]:
         issues.append("rawProvenance exceeds site JSON limit")
     if "sourceCoverage" in payload:
         issues.extend(_validate_source_coverage_for_site(payload.get("sourceCoverage")))
+    if "representativeEvidence" in payload:
+        issues.extend(_validate_representative_evidence_for_site(payload.get("representativeEvidence")))
     for key in SITE_BOUND_LIST_FIELDS:
         if key not in payload:
             continue

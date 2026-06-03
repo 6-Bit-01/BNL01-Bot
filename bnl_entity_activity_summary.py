@@ -21,6 +21,7 @@ from bnl_entity_evidence import (
     get_entity_evidence_for_subject,
     group_entity_evidence_details,
     table_exists as _evidence_table_exists,
+    _website_safe_topic_label,
 )
 
 DEFAULT_ENTITY_SUMMARY_LIMIT = 50
@@ -574,7 +575,8 @@ def build_entity_activity_summary(
                     _add_unique(summary["channelActivity"], f"Appears in approved public-side conversation context in {channel_display} as {relation} context.")
                     _add_unique(summary["observedChannels"], f"{channel_display} — approved public-side; subject {relation}.")
                     _add_unique(summary["conversationHighlights"], _conversation_highlight(text, authored=authored, public_safe=True, channel_name=channel_name, channel_policy=policy))
-                    _add_unique(summary["evidenceDetails"], f"{channel_display}: subject {relation} approved public-side {topics[0].replace(' discussion', '').lower()} discussion.")
+                    safe_topic = _website_safe_topic_label(topics[0])
+                    _add_unique(summary["evidenceDetails"], f"{channel_display}: approved public-side item classified under {safe_topic}; review before treating it as a subject claim.")
                     if _MUSIC_PATTERN.search(text):
                         _add_unique(summary["musicSignals"], "Approved context connects this subject to music, track, queue, radio, or show discussion; queue identity still needs review.")
                     if _COMMUNITY_PATTERN.search(text):
@@ -602,7 +604,7 @@ def build_entity_activity_summary(
                     _add_unique(summary["conversationHighlights"], _conversation_highlight(text, authored=authored, public_safe=False, channel_name=channel_name, channel_policy=policy))
                     quality = "internal_context_review_only"
                 for topic in topics:
-                    _add_unique(summary["topicBreakdown"], f"{topic}: observed in conversation context.")
+                    _add_unique(summary["topicBreakdown"], f"{_website_safe_topic_label(topic)}: observed in conversation context.")
                 _record_raw(summary["rawProvenance"], "conversations", quality, _safe_snippet(text), channelPolicy=policy, channelName=channel_name, subjectRelation=relation, timestamp=timestamp)
 
         if "memory_tiers" in lanes:
@@ -709,12 +711,12 @@ def build_entity_activity_summary(
         _add_unique(summary["publicUseCandidates"], "Possible community/source-file candidate, pending owner review.")
     _add_unique(summary["notPublicYet"], QUEUE_NOT_CONNECTED_NOTE)
 
-    summary["recurringTopics"] = [f"Observed topic pattern: {topic}." for topic, count in topic_counts.most_common(5) if count > 0]
+    summary["recurringTopics"] = [f"Observed topic classification: {_website_safe_topic_label(topic)}." for topic, count in topic_counts.most_common(5) if count > 0]
     has_detail_breakdown = any("public-side authored" in item or "public-side mentioned" in item for item in summary["topicBreakdown"])
     if not has_detail_breakdown:
         for topic, count in topic_counts.most_common(8):
             if count > 0:
-                _add_unique(summary["topicBreakdown"], f"{topic}: {count} approved/reviewed source row(s).")
+                _add_unique(summary["topicBreakdown"], f"{_website_safe_topic_label(topic)}: {count} approved/reviewed source item(s).")
     if not summary["musicSignals"]:
         _add_unique(summary["musicSignals"], "No queue/submission identity is connected yet; do not claim music submissions or counts from this summary.")
     if not summary["communitySignals"] and summary["rawProvenance"]["rawFragments"]:

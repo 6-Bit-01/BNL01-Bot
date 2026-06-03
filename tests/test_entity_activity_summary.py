@@ -238,10 +238,10 @@ class EntityActivitySummaryBuilderTests(unittest.TestCase):
 
         self.assertTrue(any("#finished-tracks" in item and "authored" in item for item in summary["observedChannels"]))
         self.assertTrue(any("#barcode-bot" in item and "mentioned" in item for item in summary["observedChannels"]))
-        self.assertTrue(any("Subject authored" in item and "dossier/source-file" in item for item in summary["conversationHighlights"]))
+        self.assertTrue(any("Subject authored" in item and "BNL source-file and dossier" in item for item in summary["conversationHighlights"]))
         self.assertTrue(any("Subject was mentioned" in item for item in summary["conversationHighlights"]))
         self.assertTrue(any("music" in item.lower() for item in summary["topicBreakdown"]))
-        self.assertTrue(any("source-file/dossier" in item.lower() for item in summary["topicBreakdown"]))
+        self.assertTrue(any("source-file and dossier" in item.lower() for item in summary["topicBreakdown"]))
         self.assertTrue(any("music" in item.lower() for item in summary["musicSignals"]))
         self.assertTrue(any("community" in item.lower() for item in summary["communitySignals"]))
         self.assertTrue(any("BNL-related" in item for item in summary["bnlInteractionSignals"]))
@@ -322,10 +322,12 @@ class EntityActivitySummaryBuilderTests(unittest.TestCase):
         self.assertIn("2026-06-05T10:00:00", summary["recentActivitySummary"])
         self.assertTrue(any(item.get("channel") == "#barcode-bot" and item.get("count") == 2 for item in summary["topChannels"]))
         topic_text = json.dumps(summary["topTopicDetails"] + summary["topicBreakdown"])
-        self.assertIn("Music/track-sharing discussion", topic_text)
-        self.assertIn("BNL/source-file/dossier discussion", topic_text)
-        self.assertIn("Help/support requests", topic_text)
-        self.assertIn("Community/server participation", topic_text)
+        self.assertIn("music and track-sharing classification", topic_text)
+        self.assertIn("BNL source-file and dossier classification", topic_text)
+        self.assertIn("help and support classification", topic_text)
+        self.assertIn("community and server participation classification", topic_text)
+        self.assertNotIn("Music/track-sharing", topic_text)
+        self.assertNotIn("BNL/source-file/dossier", topic_text)
         self.assertIn("#finished-tracks", json.dumps(summary["representativeEvidence"]))
         self.assertIn("#barcode-bot", json.dumps(summary["representativeEvidence"]))
         self.assertNotIn("research-and-development", normal_text)
@@ -334,6 +336,32 @@ class EntityActivitySummaryBuilderTests(unittest.TestCase):
         self.assertNotIn("EDGE_SESSION", normal_text)
         self.assertEqual(summary["queueSubmissionStatus"], "not_connected")
         self.assertNotRegex(normal_text, r"submitted\s+\d+|\d+\s+songs|Priority|payment")
+
+    def test_website_safe_topic_labels_cover_slash_taxonomy(self):
+        cases = {
+            "BNL/source-file/dossier discussion": "BNL source-file and dossier classification",
+            "Music/track-sharing discussion": "music and track-sharing classification",
+            "WIP/demo discussion": "WIP and demo classification",
+            "Community/server participation": "community and server participation classification",
+            "Event/riddle/engagement activity": "event, riddle, or engagement classification",
+            "Help/support requests": "help and support classification",
+        }
+        for raw, safe in cases.items():
+            with self.subTest(raw=raw):
+                self.assertEqual(evidence._website_safe_topic_label(raw), safe)
+                self.assertNotIn("/", safe)
+
+    def test_representative_evidence_line_is_website_safe_and_not_subject_claim(self):
+        line = evidence._representative_evidence_line({
+            "publicSafe": True,
+            "relation": "authored",
+            "topic": "BNL/source-file/dossier discussion",
+            "channel": "#barcode-bot",
+        })
+        self.assertNotIn("/", line)
+        self.assertNotIn("authored", line.lower())
+        self.assertIn("BNL classified this approved public-context item", line)
+        self.assertIn("review before treating it as a subject claim", line)
 
     def test_no_queue_submission_counts_are_invented(self):
         self.conn.execute("INSERT INTO user_profiles VALUES (42,1,'Crow','Crow',NULL,NULL)")
