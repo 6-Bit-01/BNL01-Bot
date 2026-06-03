@@ -260,18 +260,46 @@ def build_dossier_recommendation_packet(
     if not actual_lanes:
         actual_lanes = ["rd_context"]
 
+    confidence = _confidence_for_evidence(actual_lanes, evidence)
+    known_context = [f"BNL has operator-provided review context for {subject_name}."]
+    useful_evidence = ["Operator supplied R&D context for review."]
+    public_safe_possibilities: list[str] = []
+    private_only_notes = ["Treat operator/R&D context as internal until owner review confirms public-safe wording."]
+    if any(item.get("lane") == "broadcast_memory" for item in evidence):
+        known_context.append(f"BNL found BARCODE Radio/show-history context connected to {subject_name}.")
+        useful_evidence.append("BARCODE Radio memory can support show-history review after owner approval.")
+        public_safe_possibilities.append("BARCODE Radio context may inform public wording only after owner review.")
+    if not public_safe_possibilities:
+        public_safe_possibilities.append("No public-safe fact is confirmed by this packet; owner review is required before public use.")
+    not_public_yet = ["Do not publish, merge identities, or expose private Discord identity from this packet without owner approval."]
+    raw_provenance = {
+        "sourceLabels": [f"{item.get('lane') or 'source'}/{item.get('label') or 'review'}" for item in evidence],
+        "sourceLaneMapping": {lane: lane for lane in actual_lanes},
+        "rawFragments": evidence,
+        "sourceCounts": {lane: sum(1 for item in evidence if item.get("lane") == lane) for lane in actual_lanes},
+    }
+
     packet = {
         "subjectName": subject_name,
         "subjectKey": subject_key(subject_name),
         "sourceLanes": actual_lanes,
         "reason": _safe_snippet(reason, 300),
         "evidenceSummary": _evidence_summary(evidence),
+        "knownContext": known_context,
+        "usefulEvidence": useful_evidence,
+        "relationshipSignals": [],
+        "publicSafePossibilities": public_safe_possibilities,
+        "privateOnlyNotes": private_only_notes,
         "missingInfo": list(DEFAULT_MISSING_INFO),
+        "notPublicYet": not_public_yet,
         "publicSafetyNotes": list(DEFAULT_PUBLIC_SAFETY_NOTES),
         "doNotSay": [],
         "recommendedTags": [],
-        "confidence": _confidence_for_evidence(actual_lanes, evidence),
+        "confidence": confidence,
+        "sourceAuthority": [{"source": "Operator R&D context", "boundary": "owner_review_required", "confidence": confidence}],
+        "rawProvenance": raw_provenance,
         "suggestedAction": DEFAULT_SUGGESTED_ACTION,
+        "recommendedAction": DEFAULT_SUGGESTED_ACTION,
         "evidence": evidence,
     }
     payload = build_dossier_recommendation_payload(
@@ -281,13 +309,22 @@ def build_dossier_recommendation_packet(
             "subjectKey": packet["subjectKey"],
             "reason": packet["reason"],
             "evidenceSummary": packet["evidenceSummary"],
+            "knownContext": packet["knownContext"],
+            "usefulEvidence": packet["usefulEvidence"],
+            "relationshipSignals": packet["relationshipSignals"],
+            "publicSafePossibilities": packet["publicSafePossibilities"],
+            "privateOnlyNotes": packet["privateOnlyNotes"],
             "missingInfo": packet["missingInfo"],
+            "notPublicYet": packet["notPublicYet"],
             "publicSafetyNotes": packet["publicSafetyNotes"],
             "doNotSay": packet["doNotSay"],
             "recommendedTags": packet["recommendedTags"],
             "confidence": packet["confidence"],
             "sourceLanes": packet["sourceLanes"],
+            "sourceAuthority": packet["sourceAuthority"],
+            "rawProvenance": packet["rawProvenance"],
             "suggestedAction": packet["suggestedAction"],
+            "recommendedAction": packet["recommendedAction"],
             "createdBy": "bnl",
         }
     )

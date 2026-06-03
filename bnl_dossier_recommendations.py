@@ -50,6 +50,15 @@ SUPPORTED_PAYLOAD_FIELDS = {
     "createdBy",
     "ingestKey",
     "ingestSource",
+    "knownContext",
+    "usefulEvidence",
+    "relationshipSignals",
+    "publicSafePossibilities",
+    "privateOnlyNotes",
+    "notPublicYet",
+    "recommendedAction",
+    "sourceAuthority",
+    "rawProvenance",
 }
 _SAFE_LANE_PATTERN = re.compile(r"[^a-z0-9_-]+")
 VALID_DOSSIER_CATEGORIES = {"Entity", "Personnel", "Sponsor", "Interface", "Production"}

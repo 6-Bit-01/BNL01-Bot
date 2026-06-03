@@ -78,6 +78,55 @@ class SourceKnowledgeBridgeTests(unittest.TestCase):
         payload = self._payload_by_name(self._collect(), "Emerald")
         self.assertEqual(payload["type"], "identity_link")
 
+
+    def test_meaning_first_source_packet_separates_raw_provenance(self):
+        c = self.conn.cursor()
+        c.execute("INSERT INTO user_profiles VALUES (1,1,'Crow','Crow',NULL,NULL)")
+        c.execute("INSERT INTO relationship_journal VALUES (NULL,1,1,'note','help_signal: EDGE_SESSION Crow relationship_journal/local_relationship_trace raw detail','now')")
+        c.execute("INSERT INTO conversations VALUES (NULL,1,'Crow',1,'general','public_home','user','Crow is a recurring community subject candidate.','now')")
+        self.conn.commit()
+
+        payload = self._payload_by_name(self._collect(), "Crow")
+
+        self.assertIn("BNL found an internal local profile match for Crow.", payload["knownContext"])
+        self.assertTrue(any("prior relationship/context notes" in item for item in payload["relationshipSignals"]))
+        self.assertTrue(any("private relationship context" in item for item in payload["relationshipSignals"]))
+        self.assertTrue(any("approved public-side conversation context" in item for item in payload["publicSafePossibilities"]))
+        self.assertTrue(any("Keep this internal" in item or "Owner review" in item for item in payload["privateOnlyNotes"]))
+        self.assertEqual(payload["recommendedAction"], payload["suggestedAction"])
+        self.assertIn("sourceAuthority", payload)
+
+        normal_text = json.dumps({
+            "reason": payload.get("reason"),
+            "evidenceSummary": payload.get("evidenceSummary"),
+            "knownContext": payload.get("knownContext"),
+            "usefulEvidence": payload.get("usefulEvidence"),
+            "relationshipSignals": payload.get("relationshipSignals"),
+            "publicSafePossibilities": payload.get("publicSafePossibilities"),
+            "privateOnlyNotes": payload.get("privateOnlyNotes"),
+            "notPublicYet": payload.get("notPublicYet"),
+            "sourceAuthority": payload.get("sourceAuthority"),
+        })
+        for raw in (
+            "user_profiles/local_profile_observed",
+            "relationship_journal/local_relationship_trace",
+            "conversations/public_discord_observed",
+            "source lane mapping",
+            "Source lanes: unknown",
+            "unknown -> unknown",
+            "help_signal:",
+            "EDGE_SESSION",
+            "memory_tiers",
+        ):
+            self.assertNotIn(raw, normal_text)
+
+        provenance = payload["rawProvenance"]
+        self.assertIn("user_profiles/local_profile_observed", provenance["sourceLabels"])
+        self.assertIn("relationship_journal/local_relationship_trace", provenance["sourceLabels"])
+        self.assertIn("conversations/public_discord_observed", provenance["sourceLabels"])
+        self.assertEqual(provenance["sourceLaneMapping"].get("relationship_journal"), "unknown")
+        self.assertTrue(any("help_signal:" in fragment["snippet"] for fragment in provenance["rawFragments"]))
+
     def test_unknown_conversation_is_internal_review_not_public_safe(self):
         self.conn.execute("INSERT INTO conversations VALUES (NULL,1,'User',1,'mystery',NULL,'user','Hellcat is a recurring candidate from unknown policy.','now')")
         self.conn.commit()
