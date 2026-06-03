@@ -23,6 +23,39 @@ ENRICHMENT_INGEST_SOURCE = "bnl_source_file_enrichment"
 FALLBACK_INGEST_SOURCE = "bnl_source_knowledge_bridge"
 SOURCE_BLIND_WARNING = "source-blind memory is review-only; do not treat as confirmed fact"
 QUEUE_NOT_CONNECTED_NOTE = "Queue/submission identity is not connected yet."
+SITE_EVIDENCE_SUMMARY_LIMIT = 2000
+SITE_EVIDENCE_SUMMARY_TARGET = 1800
+SITE_RAW_PROVENANCE_JSON_LIMIT = 20000
+SITE_RAW_PROVENANCE_JSON_TARGET = 18000
+SITE_LIST_ITEM_LIMIT = 500
+SITE_LIST_MAX_ITEMS = 25
+SITE_RAW_FRAGMENT_MAX_ITEMS = 4
+SITE_RAW_FRAGMENT_TEXT_LIMIT = 500
+SITE_BOUND_LIST_FIELDS = (
+    "knownContext",
+    "usefulEvidence",
+    "relationshipSignals",
+    "observedChannels",
+    "conversationHighlights",
+    "topicBreakdown",
+    "bestEvidenceToReview",
+    "bnlInteractionSignals",
+    "musicSignals",
+    "communitySignals",
+    "sourceCoverage",
+    "evidenceDetails",
+    "publicSafePossibilities",
+    "publicUseCandidates",
+    "privateOnlyNotes",
+    "reviewOnlyEvidence",
+    "notPublicYet",
+    "sourceAuthority",
+    "missingInfo",
+    "publicSafetyNotes",
+    "doNotSay",
+)
+_PRIVATE_CHANNEL_NAME_RE = re.compile(r"(?i)(?:#?(?:research-and-development|private[-_ ]?internal|private[-_ ]?chat|staff[-_ ]?only|mod[-_ ]?chat|direct[-_ ]?message)s?|\bdm\b)")
+
 ENTITY_SUMMARY_EVIDENCE_FIELDS = {
     "observedChannels": 6,
     "conversationHighlights": 6,
@@ -1523,6 +1556,174 @@ def _section_text(sections: dict[str, list[str]], name: str, *, limit: int = 4) 
     return "\n".join(f"- {_safe_text(item, 240)}" for item in items[:limit]) or "- currently unknown."
 
 
+def _site_safe_text(value: Any, limit: int = SITE_LIST_ITEM_LIMIT) -> str:
+    text = _safe_text(value, limit)
+    text = _PRIVATE_CHANNEL_NAME_RE.sub("[private-channel]", text)
+    return text.replace("[object Object]", "[unsupported-object]")
+
+
+def _compact_value_for_site(value: Any, *, text_limit: int = SITE_LIST_ITEM_LIMIT, depth: int = 0) -> Any:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return _site_safe_text(value, text_limit)
+    if isinstance(value, (int, float, bool)):
+        return value
+    if isinstance(value, dict):
+        if depth >= 3:
+            return _site_safe_text(json.dumps(value, sort_keys=True, default=str), text_limit)
+        compact: dict[str, Any] = {}
+        for key, raw in value.items():
+            safe_key = _site_safe_text(key, 80)
+            nested_limit = min(text_limit, SITE_RAW_FRAGMENT_TEXT_LIMIT) if key in {"content", "message", "raw", "transcript", "snippet", "rawRefJson", "channel_name", "channelName"} else text_limit
+            compact[safe_key] = _compact_value_for_site(raw, text_limit=nested_limit, depth=depth + 1)
+        return compact
+    if isinstance(value, (list, tuple, set)):
+        out = []
+        for item in list(value)[:SITE_LIST_MAX_ITEMS]:
+            compact_item = _compact_value_for_site(item, text_limit=text_limit, depth=depth + 1)
+            if compact_item not in (None, "", [], {}):
+                out.append(compact_item)
+        return out
+    return _site_safe_text(value, text_limit)
+
+
+def _compact_list_for_site(value: Any, *, max_items: int = SITE_LIST_MAX_ITEMS, item_limit: int = SITE_LIST_ITEM_LIMIT) -> list[Any]:
+    raw_items = value if isinstance(value, (list, tuple, set)) else ([value] if value not in (None, "") else [])
+    compact: list[Any] = []
+    seen: set[str] = set()
+    for item in list(raw_items)[:max_items]:
+        compact_item = _compact_value_for_site(item, text_limit=item_limit)
+        if compact_item in (None, "", [], {}):
+            continue
+        fingerprint = json.dumps(compact_item, sort_keys=True, default=str) if isinstance(compact_item, (dict, list)) else str(compact_item)
+        if fingerprint in seen:
+            continue
+        seen.add(fingerprint)
+        compact.append(compact_item)
+    return compact
+
+
+def _compact_raw_provenance_for_site(raw: Any) -> dict[str, Any]:
+    if not isinstance(raw, dict):
+        return {}
+    compact: dict[str, Any] = {}
+    source_labels = _compact_list_for_site(raw.get("sourceLabels"), max_items=25, item_limit=160)
+    if source_labels:
+        compact["sourceLabels"] = source_labels
+    source_counts = dict(raw.get("sourceCounts") or {})
+    if source_counts:
+        compact["sourceCounts"] = source_counts
+    channel_counts = dict(raw.get("channelPolicyCounts") or raw.get("channelPolicies") or {})
+    if channel_counts:
+        compact["channelPolicyCounts"] = channel_counts
+    source_authority = _compact_list_for_site(raw.get("sourceAuthority"), max_items=10, item_limit=240)
+    if source_authority:
+        compact["sourceAuthority"] = source_authority
+    fragments = []
+    for fragment in list(raw.get("rawFragments") or [])[:SITE_RAW_FRAGMENT_MAX_ITEMS]:
+        if isinstance(fragment, dict):
+            kept = {}
+            for key in ("table", "sourceTable", "sourceLabel", "sourceRowId", "visibility", "authority", "confidence", "relationToSubject", "topic", "evidenceKind", "safeSummary", "snippet", "rawRefJson", "channelPolicy"):
+                if key in fragment and fragment.get(key) not in (None, ""):
+                    limit = SITE_RAW_FRAGMENT_TEXT_LIMIT if key in {"safeSummary", "snippet", "rawRefJson"} else 180
+                    kept[key] = _compact_value_for_site(fragment.get(key), text_limit=limit)
+            if kept:
+                fragments.append(kept)
+        else:
+            fragments.append(_site_safe_text(fragment, SITE_RAW_FRAGMENT_TEXT_LIMIT))
+    if fragments:
+        compact["rawFragments"] = fragments
+    # Last-resort trim to stay below the website's rawProvenance JSON limit.
+    while len(json.dumps(compact, sort_keys=True, default=str)) > SITE_RAW_PROVENANCE_JSON_TARGET and compact.get("rawFragments"):
+        compact["rawFragments"] = compact["rawFragments"][:-1]
+    if len(json.dumps(compact, sort_keys=True, default=str)) > SITE_RAW_PROVENANCE_JSON_TARGET:
+        compact.pop("sourceAuthority", None)
+    return compact
+
+
+def build_compact_enrichment_evidence_summary(packet: dict[str, Any]) -> str:
+    classification = packet.get("classification") or {}
+    sections = packet.get("sections") or {}
+    lines: list[str] = ["Source File enrichment review summary."]
+    if classification:
+        lines.append("## Internal Classification")
+        lines.append(
+            f"- Role read: {_site_safe_text(classification.get('roleRead') or ROLE_LABELS.get(classification.get('primaryRole'), 'Unknown / needs review'), 120)}"
+        )
+        lines.append(
+            f"- Activity read: {_site_safe_text(classification.get('activityRead') or classification.get('activityLevel') or 'unknown', 120)}; "
+            f"dossier={_site_safe_text(classification.get('dossierRead') or DOSSIER_LABELS.get(classification.get('dossierUse'), 'Unknown'), 120)}."
+        )
+    section_useful: list[Any] = []
+    useful_sources = (
+        ("Subject Overview", 0),
+        ("History With BARCODE / BNL / Discord / BARCODE Radio", 1),
+        ("Observed Patterns", 0),
+        ("Why This Subject Matters", 0),
+        ("Known Facts", 0),
+    )
+    for section_name, item_index in useful_sources:
+        section_items = sections.get(section_name) or []
+        if len(section_items) > item_index:
+            section_useful.append(section_items[item_index])
+    useful = _compact_list_for_site(packet.get("usefulEvidence") or section_useful or packet.get("knownContext") or packet.get("evidenceDetails"), max_items=3, item_limit=220)
+    if useful:
+        lines.append("Useful evidence:")
+        lines.extend(f"- {item if isinstance(item, str) else _site_safe_text(json.dumps(item, sort_keys=True, default=str), 220)}" for item in useful[:3])
+    best = _compact_list_for_site(packet.get("bestEvidenceToReview"), max_items=3, item_limit=240)
+    if best:
+        lines.append("Best evidence to review:")
+        lines.extend(f"- {item if isinstance(item, str) else _site_safe_text(json.dumps(item, sort_keys=True, default=str), 240)}" for item in best[:3])
+    missing = _compact_list_for_site(packet.get("missingInfo") or sections.get("Missing Info"), max_items=3, item_limit=180)
+    action = _section_text(sections, "Suggested Next Action", limit=1)
+    lines.append("Missing info / next action:")
+    if missing:
+        lines.extend(f"- {item if isinstance(item, str) else _site_safe_text(json.dumps(item, sort_keys=True, default=str), 180)}" for item in missing[:3])
+    lines.append(_site_safe_text(action, 240))
+    summary = "\n".join(lines).strip()
+    if len(summary) > SITE_EVIDENCE_SUMMARY_TARGET:
+        summary = summary[: SITE_EVIDENCE_SUMMARY_TARGET - 1].rstrip() + "…"
+    return summary
+
+
+def compact_enrichment_payload_for_site(payload: dict[str, Any]) -> dict[str, Any]:
+    compact = dict(payload or {})
+    compact["evidenceSummary"] = _site_safe_text(compact.get("evidenceSummary"), SITE_EVIDENCE_SUMMARY_TARGET)
+    for key in SITE_BOUND_LIST_FIELDS:
+        if key in compact:
+            compact[key] = _compact_list_for_site(compact.get(key), max_items=SITE_LIST_MAX_ITEMS, item_limit=SITE_LIST_ITEM_LIMIT)
+    compact["rawProvenance"] = _compact_raw_provenance_for_site(compact.get("rawProvenance"))
+    return compact
+
+
+def validate_enrichment_payload_for_site(payload: dict[str, Any]) -> list[str]:
+    issues: list[str] = []
+    if len(str(payload.get("evidenceSummary") or "")) > SITE_EVIDENCE_SUMMARY_LIMIT:
+        issues.append("evidenceSummary exceeds site limit")
+    raw_len = len(json.dumps(payload.get("rawProvenance") or {}, sort_keys=True, default=str))
+    if raw_len > SITE_RAW_PROVENANCE_JSON_LIMIT:
+        issues.append("rawProvenance exceeds site JSON limit")
+    for key in SITE_BOUND_LIST_FIELDS:
+        if key not in payload:
+            continue
+        value = payload.get(key)
+        if not isinstance(value, list):
+            issues.append(f"{key} must be a list")
+            continue
+        if len(value) > SITE_LIST_MAX_ITEMS:
+            issues.append(f"{key} has too many items")
+        for item in value:
+            text = json.dumps(item, sort_keys=True, default=str) if isinstance(item, (dict, list)) else str(item)
+            if len(text) > 1000:
+                issues.append(f"{key} contains an oversized item")
+                break
+            if _LONG_ID_RE.search(text) or _PRIVATE_CHANNEL_NAME_RE.search(text) or "[object Object]" in text:
+                issues.append(f"{key} contains unsafe text")
+                break
+    return issues
+
+
 def build_enrichment_markdown(packet: dict[str, Any]) -> str:
     sections = packet.get("sections") or {}
     lines: list[str] = []
@@ -1558,7 +1759,7 @@ def build_enrichment_recommendation_payload(packet: dict[str, Any], *, environ: 
     source_file = packet.get("sourceFile") if isinstance(packet.get("sourceFile"), dict) else {}
     target_candidate_id = _first(source_file, ("candidateId", "targetCandidateId", "id")) if match_kind in {"candidate_intake", "active_source_file"} else None
     target_dossier_id = _first(source_file, ("targetDossierId", "dossierId", "publicDossierId")) if match_kind == "existing_dossier_update" else None
-    evidence = build_enrichment_markdown(packet)
+    evidence = build_compact_enrichment_evidence_summary(packet)
     payload = {
         "type": "modify_existing_dossier" if match_kind in {"active_source_file", "existing_dossier_update", "candidate_intake"} else "new_subject",
         "targetCandidateId": target_candidate_id,
@@ -1582,6 +1783,7 @@ def build_enrichment_recommendation_payload(packet: dict[str, Any], *, environ: 
         "identityDiagnostics": dict(packet.get("diagnostics") or {}),
         "internalClassification": dict(packet.get("classification") or {}),
         "knownContext": list(packet.get("knownContext") or []),
+        "usefulEvidence": list(packet.get("usefulEvidence") or packet.get("evidenceDetails") or []),
         "relationshipSignals": list(packet.get("relationshipSignals") or []),
         "publicSafePossibilities": list(packet.get("publicSafePossibilities") or []),
         "privateOnlyNotes": list(packet.get("privateOnlyNotes") or []),
@@ -1606,7 +1808,11 @@ def build_enrichment_recommendation_payload(packet: dict[str, Any], *, environ: 
         "ingestSource": source_enrichment_ingest_source(environ),
         "ingestKey": deterministic_enrichment_ingest_key(subject, match_kind, sections),
     }
-    return build_dossier_recommendation_payload(payload)
+    compact_payload = compact_enrichment_payload_for_site(build_dossier_recommendation_payload(payload))
+    compact_payload["siteValidationIssues"] = validate_enrichment_payload_for_site(compact_payload)
+    if not compact_payload["siteValidationIssues"]:
+        compact_payload.pop("siteValidationIssues", None)
+    return compact_payload
 
 
 def run_source_file_enrichment(

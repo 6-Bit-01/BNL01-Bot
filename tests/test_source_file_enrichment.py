@@ -623,6 +623,57 @@ class SourceFileEnrichmentTests(unittest.TestCase):
         normal.pop("rawProvenance")
         self.assertNotIn("raw transcript", json.dumps(normal))
 
+    def test_enrichment_payload_is_compacted_to_site_limits(self):
+        long_item = "approved evidence " + ("x" * 3000) + " 123456789012345678"
+        packet = {
+            "subject": "HellcatNZ",
+            "matchKind": "active_source_file",
+            "sourceFile": {"id": "sf_1", "name": "HellcatNZ"},
+            "sections": {
+                "Subject Overview": [long_item for _ in range(20)],
+                "History With BARCODE / BNL / Discord / BARCODE Radio": ["prior history", "prior interaction history with review context"],
+                "Observed Patterns": ["community-side activity"],
+                "Missing Info": ["public links"],
+                "Suggested Next Action": ["owner review"],
+            },
+            "classification": {"primaryRole": "active_community_member", "activityLevel": "recurring", "dossierUse": "source_file_only"},
+            "bestEvidenceToReview": [long_item for _ in range(40)],
+            "observedChannels": ["#research-and-development 123456789012345678 " + ("x" * 2000) for _ in range(40)],
+            "conversationHighlights": ["highlight " + ("x" * 2000) for _ in range(40)],
+            "musicSignals": ["music signal"],
+            "communitySignals": ["community signal"],
+            "reviewOnlyEvidence": ["review-only note"],
+            "sourceCoverage": [{"source": "conversations", "count": 30, "status": "found", "notes": long_item}],
+            "queueSubmissionStatus": "not_connected",
+            "queueSubmissionNote": enrich.QUEUE_NOT_CONNECTED_NOTE,
+            "rawProvenance": {
+                "sourceLabels": ["entity_evidence_events/structured"],
+                "sourceCounts": {"entity_evidence_events": 40},
+                "channelPolicyCounts": {"public_safe": 20},
+                "sourceAuthority": ["local_observed"],
+                "rawFragments": [
+                    {"table": "conversations", "snippet": "full raw transcript " + ("x" * 10000), "rawRefJson": {"content": "full raw transcript " + ("y" * 10000), "channel_name": "research-and-development"}}
+                    for _ in range(20)
+                ],
+            },
+        }
+        payload = enrich.build_enrichment_recommendation_payload(packet, environ={})
+        self.assertLessEqual(len(payload["evidenceSummary"]), 2000)
+        self.assertLess(len(json.dumps(payload["rawProvenance"], sort_keys=True)), 20000)
+        self.assertLessEqual(len(payload["rawProvenance"].get("rawFragments", [])), 4)
+        for key in ("bestEvidenceToReview", "observedChannels", "conversationHighlights", "musicSignals", "communitySignals", "reviewOnlyEvidence", "sourceCoverage"):
+            self.assertIn(key, payload)
+            self.assertLessEqual(len(payload[key]), 25)
+        self.assertEqual(payload["queueSubmissionStatus"], "not_connected")
+        self.assertEqual(payload["queueSubmissionNote"], enrich.QUEUE_NOT_CONNECTED_NOTE)
+        normal = dict(payload)
+        normal.pop("rawProvenance", None)
+        normal_text = json.dumps(normal)
+        self.assertNotIn("123456789012345678", normal_text)
+        self.assertNotIn("research-and-development", normal_text)
+        self.assertNotIn("[object Object]", normal_text)
+        self.assertFalse(enrich.validate_enrichment_payload_for_site(payload))
+
     def test_payload_keeps_machine_metadata(self):
         result = enrich.run_source_file_enrichment(self.db, 1, "HellcatNZ", dry_run=True, lookup_func=self._lookup("active"))
         payload = result["payload"]

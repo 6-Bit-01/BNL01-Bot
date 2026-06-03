@@ -210,6 +210,32 @@ def _extract_recommendation_id(response_json: dict[str, Any]) -> Any:
     return None
 
 
+
+def _safe_response_error_text(raw: Any, limit: int = 280) -> str:
+    """Return compact endpoint error text without secrets or payload material."""
+
+    text = ""
+    try:
+        if isinstance(raw, (bytes, bytearray)):
+            text = raw.decode("utf-8", errors="replace")
+        else:
+            text = str(raw or "")
+        parsed = json.loads(text) if text.strip().startswith(("{", "[")) else None
+        if isinstance(parsed, dict):
+            for key in ("error", "message", "detail", "reason"):
+                if parsed.get(key):
+                    text = str(parsed.get(key))
+                    break
+    except Exception:
+        text = str(raw or "")
+    text = re.sub(r"Bearer\s+[A-Za-z0-9._~+/-]+", "Bearer [redacted]", text, flags=re.I)
+    text = re.sub(r"(?i)(token|secret|authorization)\s*[:=]\s*[^\s,;}]+", r"\1=[redacted]", text)
+    text = re.sub(r"\b\d{15,22}\b", "[redacted-id]", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    if len(text) > limit:
+        text = text[: max(0, limit - 1)].rstrip() + "…"
+    return text
+
 def _safe_failure(error: str, status: int | None = None, duplicate: bool = False) -> dict[str, Any]:
     return {
         "ok": False,
@@ -254,8 +280,16 @@ def send_dossier_recommendation(payload: dict[str, Any], *, environ: dict[str, s
             raw = response.read().decode("utf-8")
     except urllib.error.HTTPError as exc:
         status = exc.code
-        logging.warning(f"dossier_recommendation_send_failed status={status}")
-        return _safe_failure("Dossier recommendation endpoint rejected the request.", status=status)
+        body_text = ""
+        try:
+            body_text = _safe_response_error_text(exc.read())
+        except Exception:
+            body_text = _safe_response_error_text(getattr(exc, "reason", ""))
+        error = "Dossier recommendation endpoint rejected the request."
+        if body_text:
+            error = f"{error} {body_text}"
+        logging.warning(f"dossier_recommendation_send_failed status={status} endpoint_error={body_text or 'unavailable'}")
+        return _safe_failure(error, status=status)
     except (urllib.error.URLError, TimeoutError, socket.timeout):
         logging.warning("dossier_recommendation_send_failed reason=network_or_timeout")
         return _safe_failure("Dossier recommendation endpoint was unreachable or timed out.")
