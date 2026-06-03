@@ -591,6 +591,35 @@ class SourceFileEnrichmentTests(unittest.TestCase):
         self.assertNotIn("research-and-development", normal_text)
         self.assertIn("rawFragments", raw)
 
+
+    def test_source_enrich_payload_includes_real_review_safe_fact_extraction(self):
+        self.conn.execute("INSERT INTO user_profiles VALUES (42,1,'Crow','Crow',NULL,NULL)")
+        rows = [
+            (42, 'Crow', 1, 'barcode-bot', 'public_home', 'user', 'Crow asks BNL for help with Orion and Suno song language; queue is not confirmed.', '2026-06-01'),
+            (42, 'Crow', 1, 'barcode-bot', 'public_home', 'user', 'Crow follows up with BNL support around Orion and Suno track ideas in BARCODE community context.', '2026-06-02'),
+            (42, 'Crow', 1, 'research-and-development', 'private_internal', 'user', 'Crow private relationship note mentions Orion and raw id 123456789012345678.', '2026-06-03'),
+        ]
+        self.conn.executemany("INSERT INTO conversations (user_id,user_name,guild_id,channel_name,channel_policy,role,content,timestamp) VALUES (?,?,?,?,?,?,?,?)", rows)
+        self.conn.commit()
+
+        with mock.patch.object(enrich, "refresh_entity_evidence_for_subject", return_value={"ok": True}):
+            result = enrich.run_source_file_enrichment(self.db, 1, "Crow", dry_run=True, lookup_func=self._lookup("active"), force=True)
+        payload = result["payload"]
+        normal = dict(payload)
+        raw = normal.pop("rawProvenance")
+        normal_text = json.dumps(normal)
+
+        self.assertIn("Recurring named topic", json.dumps(payload["topicBreakdown"] + payload["evidenceDetails"] + payload["bestEvidenceToReview"]))
+        self.assertIn("Orion", normal_text)
+        self.assertIn("Tool and platform mention: Suno", normal_text)
+        self.assertIn("BNL interaction pattern", json.dumps(payload["bnlInteractionSignals"] + payload["conversationHighlights"]))
+        self.assertEqual(payload["queueSubmissionStatus"], "not_connected")
+        self.assertIn(enrich.QUEUE_NOT_CONNECTED_NOTE, payload["queueSubmissionNote"])
+        self.assertNotRegex(normal_text, r"submitted\s+\d+|played\s+\d+|Priority|payment|submitted songs from Suno")
+        self.assertNotIn("123456789012345678", normal_text)
+        self.assertNotIn("research-and-development", normal_text)
+        self.assertIn("rawFragments", raw)
+
     def test_build_enrichment_payload_includes_new_fields_and_keeps_raw_provenance_separate(self):
         packet = {
             "subject": "HellcatNZ",

@@ -59,6 +59,165 @@ _BNL_INTERACTION_PATTERN = re.compile(r"\b(bnl|bot|source files?|dossiers?|asked
 
 
 
+
+_TOOL_OR_PLATFORM_TERMS = {
+    "suno": "Suno",
+    "udio": "Udio",
+    "ableton": "Ableton",
+    "fl studio": "FL Studio",
+    "bandcamp": "Bandcamp",
+    "soundcloud": "SoundCloud",
+    "spotify": "Spotify",
+    "youtube": "YouTube",
+    "discord": "Discord",
+}
+_NAMED_TOPIC_ALLOWLIST = {
+    "orion": "Orion",
+    "barcode radio": "BARCODE Radio",
+    "barcode": "BARCODE",
+    "bnl": "BNL",
+}
+_NAMED_TOPIC_STOPWORDS = {
+    "approved", "subject", "review", "context", "community", "source", "file", "dossier", "music",
+    "conversation", "public", "internal", "private", "unknown", "queue", "submission", "identity",
+    "owner", "admin", "discord", "channel", "support", "help", "possible", "recurring", "tool",
+}
+_ENTITY_NAME_PATTERN = re.compile(r"(?<![A-Za-z0-9])(?:[A-Z][A-Za-z0-9]*(?:[-'’][A-Za-z0-9]+)?)(?:\s+(?:[A-Z][A-Za-z0-9]*(?:[-'’][A-Za-z0-9]+)?))*")
+_MUSIC_SUBMISSION_LANGUAGE_PATTERN = re.compile(r"\b(song|songs|track|tracks|submitted|submission|queue|played|priority|payment|paid|suno|udio|music)\b", re.I)
+
+
+def _clean_fact_text(text: Any) -> str:
+    return _safe_snippet(text, 500)
+
+
+def _count_term_mentions(texts: list[str], terms: dict[str, str]) -> Counter:
+    counts: Counter = Counter()
+    for text in texts:
+        lowered = f" {str(text or '').lower()} "
+        for raw, label in terms.items():
+            if re.search(rf"(?<![a-z0-9]){re.escape(raw)}(?![a-z0-9])", lowered, flags=re.I):
+                counts[label] += 1
+    return counts
+
+
+def extract_tool_or_platform_mentions(texts: list[str]) -> Counter:
+    """Count known creative/community tools or platforms in already-selected evidence text."""
+
+    return _count_term_mentions(texts, _TOOL_OR_PLATFORM_TERMS)
+
+
+def extract_named_topic_facts(texts: list[str], subject: str = "") -> Counter:
+    """Extract bounded named recurring subjects from safe/public or reviewable snippets."""
+
+    counts = _count_term_mentions(texts, _NAMED_TOPIC_ALLOWLIST)
+    subject_norm = normalize_subject_name(subject).lower()
+    for text in texts:
+        for match in _ENTITY_NAME_PATTERN.finditer(str(text or "")):
+            label = re.sub(r"\s+", " ", match.group(0)).strip(" -:.,;!?()[]{}")
+            if not label or len(label) < 3:
+                continue
+            lowered = label.lower()
+            words = set(re.findall(r"[a-z0-9]+", lowered))
+            if lowered == subject_norm or lowered in _TOOL_OR_PLATFORM_TERMS or lowered in _NAMED_TOPIC_ALLOWLIST:
+                continue
+            if words & _NAMED_TOPIC_STOPWORDS:
+                continue
+            if len(label.split()) > 3:
+                continue
+            counts[label] += 1
+    return counts
+
+
+def extract_bnl_interaction_facts(texts: list[str]) -> dict[str, int]:
+    """Return repeated BNL/help interaction counts from already-approved evidence text."""
+
+    bnl_count = 0
+    help_count = 0
+    for text in texts:
+        if re.search(r"\b(BNL|bot|source files?|dossiers?)\b", str(text or ""), flags=re.I):
+            bnl_count += 1
+        if re.search(r"\b(help|support|question|request|fix|how do I|bot-use|bot use)\b", str(text or ""), flags=re.I):
+            help_count += 1
+    return {"bnl": bnl_count, "help": help_count}
+
+
+def extract_recurring_people_mentions(texts: list[str], subject: str = "") -> Counter:
+    """Alias for named person/community-member style recurring topic extraction."""
+
+    return extract_named_topic_facts(texts, subject=subject)
+
+
+def extract_public_conversation_patterns(texts: list[str]) -> dict[str, int]:
+    """Count broad but review-safe patterns in approved public-context evidence text."""
+
+    return {
+        "music_or_submission_language": sum(1 for text in texts if _MUSIC_SUBMISSION_LANGUAGE_PATTERN.search(str(text or ""))),
+        "community_context": sum(1 for text in texts if _COMMUNITY_PATTERN.search(str(text or ""))),
+        "bnl_interaction": extract_bnl_interaction_facts(texts).get("bnl", 0),
+    }
+
+
+def extract_review_safe_entity_facts(public_texts: list[str], review_only_texts: list[str], subject: str) -> dict[str, Any]:
+    """Build review-safe fact readouts without exposing raw transcripts or source IDs."""
+
+    public_clean = [_clean_fact_text(text) for text in public_texts if _clean_fact_text(text)]
+    review_clean = [_clean_fact_text(text) for text in review_only_texts if _clean_fact_text(text)]
+    return {
+        "publicNamedTopics": extract_named_topic_facts(public_clean, subject=subject),
+        "reviewOnlyNamedTopics": extract_named_topic_facts(review_clean, subject=subject),
+        "publicTools": extract_tool_or_platform_mentions(public_clean),
+        "reviewOnlyTools": extract_tool_or_platform_mentions(review_clean),
+        "publicBnlInteraction": extract_bnl_interaction_facts(public_clean),
+        "reviewOnlyBnlInteraction": extract_bnl_interaction_facts(review_clean),
+        "publicPatterns": extract_public_conversation_patterns(public_clean),
+        "hasPublicMusicSubmissionLanguage": any(_MUSIC_SUBMISSION_LANGUAGE_PATTERN.search(text) for text in public_clean),
+        "hasReviewOnlyRelationshipContext": bool(review_clean),
+    }
+
+
+def _append_review_safe_fact_readouts(summary: dict[str, Any], facts: dict[str, Any]) -> None:
+    subject = summary.get("subjectName") or "This subject"
+    public_topics: Counter = facts.get("publicNamedTopics") or Counter()
+    review_topics: Counter = facts.get("reviewOnlyNamedTopics") or Counter()
+    public_tools: Counter = facts.get("publicTools") or Counter()
+    review_tools: Counter = facts.get("reviewOnlyTools") or Counter()
+
+    for topic, count in public_topics.most_common(6):
+        if count >= 2 or topic in {"Orion", "BARCODE Radio", "BNL", "BARCODE"}:
+            line = f"Recurring named topic: {topic} appears in reviewed evidence connected to {subject}. Review before using publicly."
+            _add_unique(summary["topicBreakdown"], line)
+            _add_unique(summary["evidenceDetails"], f"Recurring named topic found: {topic}. Review before using publicly.")
+            _add_unique(summary["bestEvidenceToReview"], f"Recurring named topic — {topic}: review approved public-context evidence before public use.")
+            _add_unique(summary["publicUseCandidates"], f"Recurring named topic {topic} may inform public-safe wording only after owner/admin review.")
+    for topic, count in review_topics.most_common(6):
+        if count >= 1 and topic not in public_topics:
+            _add_unique(summary["reviewOnlyEvidence"], f"Review-only recurring topic: {topic} appears in internal context connected to {subject}. Do not use publicly without owner/admin review.")
+
+    for tool, count in public_tools.most_common(5):
+        line = f"Tool/platform mention: {tool} appears in reviewed evidence connected to {subject}. Confirm whether it relates to submissions before using as public copy."
+        _add_unique(summary["musicSignals"], line)
+        _add_unique(summary["evidenceDetails"], line)
+        _add_unique(summary["topicBreakdown"], f"Tool/platform mention: {tool} appears in reviewed evidence; queue/submission status remains not connected.")
+    for tool, count in review_tools.most_common(5):
+        if tool not in public_tools:
+            _add_unique(summary["reviewOnlyEvidence"], f"Review-only tool/platform mention: {tool} appears in internal context connected to {subject}. Do not use publicly without owner/admin review.")
+
+    public_bnl = facts.get("publicBnlInteraction") or {}
+    if int(public_bnl.get("bnl") or 0) >= 2:
+        _add_unique(summary["bnlInteractionSignals"], f"BNL interaction pattern: {subject} appears in repeated approved public-context exchanges involving BNL.")
+        _add_unique(summary["conversationHighlights"], f"{subject} has repeated BNL interaction evidence in approved public context.")
+        _add_unique(summary["evidenceDetails"], f"Confirmed internal evidence: repeated approved public-context BNL interaction pattern found for {subject}.")
+    if int(public_bnl.get("help") or 0) >= 2:
+        _add_unique(summary["bnlInteractionSignals"], f"BNL/help pattern: {subject} has recurring help/support or bot-use context in approved public evidence.")
+
+    patterns = facts.get("publicPatterns") or {}
+    if int(patterns.get("music_or_submission_language") or 0) > 0:
+        _add_unique(summary["musicSignals"], "Possible music/submission-related language appears in reviewed evidence, but queue/submission identity is not connected yet.")
+    if int(patterns.get("community_context") or 0) >= 2:
+        _add_unique(summary["communitySignals"], f"Public-context activity: {subject} appears in repeated approved BARCODE/community conversation patterns; owner/admin review must confirm wording.")
+    if facts.get("hasReviewOnlyRelationshipContext"):
+        _add_unique(summary["reviewOnlyEvidence"], "Review-only relationship/context evidence exists and must stay internal.")
+
 def parse_entity_activity_summary_command(content: str) -> tuple[bool, dict[str, Any] | None, str]:
     """Parse operator entity summary/evidence refresh readout commands."""
 
@@ -424,6 +583,8 @@ def build_entity_activity_summary(
         "rawProvenance": {"sourceLabels": [], "sourceCounts": Counter(), "rawFragments": [], "channelPolicies": Counter()},
     }
     topic_counts: Counter = Counter()
+    public_fact_texts: list[str] = []
+    review_only_fact_texts: list[str] = []
     matched_user_ids: set[Any] = set()
     aliases: list[str] = []
     fallback_activity_rows: list[dict[str, Any]] = []
@@ -451,6 +612,18 @@ def build_entity_activity_summary(
         structured_rows = _structured_evidence_rows(conn, subject, guild_id, lanes, max_rows)
         if structured_rows:
             _apply_structured_evidence(summary, structured_rows, topic_counts)
+            for row in structured_rows:
+                data = dict(row)
+                text = str(data.get("safe_summary") or "")
+                topic = str(data.get("topic") or "")
+                if topic:
+                    text = f"{text} {topic}".strip()
+                if not text:
+                    continue
+                if bool(data.get("public_safe_candidate")) and not bool(data.get("review_only")):
+                    public_fact_texts.append(text)
+                else:
+                    review_only_fact_texts.append(text)
             grouped_details = group_entity_evidence_details(structured_rows)
             for item in grouped_details.get("topicBreakdown") or []:
                 _add_unique(summary["topicBreakdown"], item)
@@ -515,6 +688,7 @@ def build_entity_activity_summary(
                 _add_unique(summary["privateOnlyNotes"], "Local memory facts require owner review before public use.")
                 _add_unique(summary["reviewOnlyEvidence"], "Local memory facts require owner review before public use.")
                 _note_topics(topic_counts, text)
+                review_only_fact_texts.append(text)
                 _record_raw(summary["rawProvenance"], "user_memory_facts", "local_memory_fact", _safe_snippet(text))
 
         if "user_habits" in lanes:
@@ -525,6 +699,7 @@ def build_entity_activity_summary(
                 _add_unique(summary["activitySignals"], "Habit/activity traces mention this subject; use only as observed context, not personality facts.")
                 _add_unique(summary["evidenceDetails"], "Habit/activity traces mention this subject as context only, not as a public trait or role.")
                 _note_topics(topic_counts, text)
+                review_only_fact_texts.append(text)
                 _record_raw(summary["rawProvenance"], "user_habits", "local_behavior_trace", _safe_snippet(text))
 
         for table in ("relationship_state", "relationship_journal"):
@@ -540,6 +715,7 @@ def build_entity_activity_summary(
                 _add_unique(summary["privateOnlyNotes"], "Relationship/context notes are private/internal and require owner review before any public wording.")
                 _add_unique(summary["reviewOnlyEvidence"], relationship_note)
                 _note_topics(topic_counts, text)
+                review_only_fact_texts.append(text)
                 _record_raw(summary["rawProvenance"], table, "local_relationship_trace", _safe_snippet(text))
 
         if "conversations" in lanes:
@@ -583,6 +759,7 @@ def build_entity_activity_summary(
                         _add_unique(summary["communitySignals"], "Approved context places this subject in BARCODE/community conversation; owner review must confirm public wording.")
                     if _BNL_INTERACTION_PATTERN.search(text):
                         _add_unique(summary["bnlInteractionSignals"], f"BNL-related discussion appears in approved public-side context; subject was {relation}.")
+                    public_fact_texts.append(text)
                     quality = "public_discord_observed"
                 else:
                     fallback_activity_rows.append({
@@ -602,6 +779,7 @@ def build_entity_activity_summary(
                     _add_unique(summary["channelActivity"], f"Seen in review-only channel context as {relation} context.")
                     _add_unique(summary["observedChannels"], f"review-only channel — {policy}; subject {relation}.")
                     _add_unique(summary["conversationHighlights"], _conversation_highlight(text, authored=authored, public_safe=False, channel_name=channel_name, channel_policy=policy))
+                    review_only_fact_texts.append(text)
                     quality = "internal_context_review_only"
                 for topic in topics:
                     _add_unique(summary["topicBreakdown"], f"{_website_safe_topic_label(topic)}: observed in conversation context.")
@@ -617,6 +795,7 @@ def build_entity_activity_summary(
                 _add_unique(summary["notPublicYet"], "Source-blind memory cannot be used as a public fact without review.")
                 _add_unique(summary["channelActivity"], "Seen in source-blind legacy memory; review required.")
                 _note_topics(topic_counts, text)
+                review_only_fact_texts.append(text)
                 _record_raw(summary["rawProvenance"], "memory_tiers", "source_blind_memory_trace", _safe_snippet(text))
 
         if "broadcast_memory" in lanes:
@@ -638,6 +817,10 @@ def build_entity_activity_summary(
                     _add_unique(summary["privateOnlyNotes"], "Broadcast-memory context is not public-safe unless active and marked public-safe.")
                     _add_unique(summary["reviewOnlyEvidence"], "Broadcast-memory context is review-only unless active and marked public-safe.")
                 _note_topics(topic_counts, text)
+                if public_safe and status == "active":
+                    public_fact_texts.append(text)
+                else:
+                    review_only_fact_texts.append(text)
                 _record_raw(summary["rawProvenance"], "broadcast_memory", "broadcast_memory_trace", _safe_snippet(text))
 
         if "community_presence" in lanes:
@@ -662,6 +845,7 @@ def build_entity_activity_summary(
                 _add_unique(summary["publicUseCandidates"], "Community presence can inform a possible public role only after owner review confirms identity and wording.")
                 _add_unique(summary["publicSafePossibilities"], "Community presence may support public-safe wording after owner review; it is not a confirmed public fact by itself.")
                 _note_topics(topic_counts, text)
+                public_fact_texts.append(text)
                 _record_raw(summary["rawProvenance"], "community_presence", "community_presence_trace", _safe_snippet(text), lastSeenAt=last_seen)
 
         if "rd_context" in lanes and rd_context:
@@ -673,6 +857,7 @@ def build_entity_activity_summary(
                 _add_unique(summary["reviewOnlyEvidence"], "Operator-supplied R&D context is internal until reviewed.")
                 _add_unique(summary["channelActivity"], "Appears in approved R&D/operator context.")
                 _note_topics(topic_counts, text)
+                review_only_fact_texts.append(text)
                 _record_raw(summary["rawProvenance"], "rd_context", "operator_supplied_context", _safe_snippet(text))
 
     finally:
@@ -692,6 +877,9 @@ def build_entity_activity_summary(
         summary["recentActivitySummary"] = grouped_details.get("recentActivitySummary") or ""
         summary["authoredVsMentionedSummary"] = grouped_details.get("authoredVsMentionedSummary") or ""
 
+    fact_readouts = extract_review_safe_entity_facts(public_fact_texts, review_only_fact_texts, subject)
+    _append_review_safe_fact_readouts(summary, fact_readouts)
+
     if summary["matchedNames"]:
         summary["identityConfidence"] = "medium"
     elif summary["rawProvenance"]["rawFragments"]:
@@ -710,6 +898,8 @@ def build_entity_activity_summary(
     if not summary["publicUseCandidates"] and any(item != "No public-safe facts confirmed yet." for item in summary["publicSafePossibilities"]):
         _add_unique(summary["publicUseCandidates"], "Possible community/source-file candidate, pending owner review.")
     _add_unique(summary["notPublicYet"], QUEUE_NOT_CONNECTED_NOTE)
+    _add_unique(summary["missingInfo"], "Queue/submission history is not connected yet; source-file memory cannot confirm submitted songs, source type, play status, or priority history.")
+    _add_unique(summary["missingInfo"], "Reception and co-participant analysis is not available from the current evidence packet.")
 
     summary["recurringTopics"] = [f"Observed topic classification: {_website_safe_topic_label(topic)}." for topic, count in topic_counts.most_common(5) if count > 0]
     has_detail_breakdown = any("public-side authored" in item or "public-side mentioned" in item for item in summary["topicBreakdown"])

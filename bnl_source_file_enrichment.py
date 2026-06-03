@@ -1170,6 +1170,10 @@ def _is_review_only_summary_item(value: Any, review_only_evidence: list[str]) ->
     lowered = text.lower()
     if "review-only channel" in lowered:
         return True
+    if "review-only conversation context" in lowered or "private and internal channel details" in lowered:
+        return True
+    if "internal/unknown/sealed" in lowered or "internal and unknown and sealed" in lowered:
+        return True
     return any(item and item in text for item in review_only_evidence)
 
 

@@ -363,6 +363,52 @@ class EntityActivitySummaryBuilderTests(unittest.TestCase):
         self.assertIn("BNL classified this approved public-context item", line)
         self.assertIn("review before treating it as a subject claim", line)
 
+
+    def test_review_safe_fact_extraction_surfaces_named_topics_tools_and_bnl_patterns(self):
+        self.conn.execute("INSERT INTO user_profiles VALUES (42,1,'Crow','Crow',NULL,NULL)")
+        rows = [
+            (42, 'Crow', 1, 'barcode-bot', 'public_home', 'user', 'Crow asks BNL for help reviewing Orion and mentions Suno song ideas without confirmed queue data.', '2026-06-01'),
+            (42, 'Crow', 1, 'barcode-bot', 'public_home', 'user', 'Crow follows up with BNL about Orion support and Suno track language in community context.', '2026-06-02'),
+        ]
+        self.conn.executemany("INSERT INTO conversations (user_id,user_name,guild_id,channel_name,channel_policy,role,content,timestamp) VALUES (?,?,?,?,?,?,?,?)", rows)
+        self.conn.commit()
+
+        summary = self._summary()
+        text = json.dumps({k: v for k, v in summary.items() if k != "rawProvenance"})
+
+        self.assertIn("Recurring named topic: Orion", text)
+        self.assertIn("Tool/platform mention: Suno", text)
+        self.assertIn("BNL interaction pattern: Crow appears in repeated approved public-context exchanges involving BNL.", text)
+        self.assertIn("Possible music/submission-related language appears in reviewed evidence, but queue/submission identity is not connected yet.", text)
+        self.assertEqual(summary["queueSubmissionStatus"], "not_connected")
+        self.assertIn("Queue/submission history is not connected yet; source-file memory cannot confirm submitted songs, source type, play status, or priority history.", summary["missingInfo"])
+        self.assertNotRegex(text, r"submitted\s+\d+|played\s+\d+|Priority|payment|submitted songs from Suno")
+
+    def test_review_only_named_topics_stay_in_review_only_evidence(self):
+        self.conn.execute("INSERT INTO user_profiles VALUES (42,1,'Crow','Crow',NULL,NULL)")
+        self.conn.execute("INSERT INTO relationship_journal VALUES (NULL,42,1,'note','Crow has internal relationship context repeatedly mentioning Orion and private planning notes.','now')")
+        self.conn.commit()
+
+        summary = self._summary()
+        public_text = json.dumps({key: summary.get(key) for key in ("conversationHighlights", "topicBreakdown", "evidenceDetails", "bestEvidenceToReview", "publicUseCandidates")})
+        review_text = json.dumps(summary["reviewOnlyEvidence"])
+
+        self.assertNotIn("Review-only recurring topic: Orion", public_text)
+        self.assertIn("Review-only recurring topic: Orion appears in internal context connected to Crow.", review_text)
+        self.assertIn("Review-only relationship/context evidence exists and must stay internal.", review_text)
+
+    def test_normal_fact_fields_do_not_expose_raw_ids_or_private_channels(self):
+        self.conn.execute("INSERT INTO user_profiles VALUES (42,1,'Crow','Crow',NULL,NULL)")
+        self.conn.execute("INSERT INTO conversations VALUES (NULL,42,'Crow',1,'research-and-development','private_internal','user','Crow internal note about Orion with 123456789012345678 and private transcript.','now')")
+        self.conn.commit()
+
+        summary = self._summary()
+        normal_text = json.dumps({k: v for k, v in summary.items() if k != "rawProvenance"})
+
+        self.assertNotIn("research-and-development", normal_text)
+        self.assertNotIn("123456789012345678", normal_text)
+        self.assertIn("Review-only recurring topic: Orion", normal_text)
+
     def test_no_queue_submission_counts_are_invented(self):
         self.conn.execute("INSERT INTO user_profiles VALUES (42,1,'Crow','Crow',NULL,NULL)")
         self.conn.commit()
