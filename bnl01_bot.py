@@ -8137,7 +8137,8 @@ def record_recent_room_event_from_message(
 ) -> dict:
     media_context = media_context or {}
     media_items = list(media_context.get("items") or _media_items_from_text(text))
-    text_summary = _safe_prompt_line(re.sub(r"https?://\S+", "[link]", _strip_media_context_block(text)), limit=180)
+    context_text = _safe_prompt_line(re.sub(r"https?://\S+", "[link]", _strip_media_context_block(text)), limit=1400)
+    text_summary = _safe_prompt_line(context_text, limit=180)
     if not text_summary and media_items:
         text_summary = "media-only reaction"
     event = {
@@ -8148,6 +8149,7 @@ def record_recent_room_event_from_message(
         "timestamp": datetime.now(PACIFIC_TZ),
         "message_id": int(message_id or 0) or None,
         "text_summary": text_summary,
+        "text_for_context": context_text,
         "media_present": bool(media_items),
         "media_item_count": len(media_items),
         "media_kinds": sorted({_media_kind_from_label(item) for item in media_items}),
@@ -8227,6 +8229,45 @@ def build_recent_media_context_for_prompt(guild_id: int, channel_id: int, channe
         state = event.get("response_state") or "observed"
         lines.append(f"- {author}: {labels} (BNL {state}; visibility={event.get('visibility','transient')})")
     return "\n".join(lines)
+
+
+def build_recent_text_room_context_for_prompt(
+    guild_id: int,
+    channel_id: int,
+    channel_policy: str,
+    *,
+    current_message_ids: set[int] | None = None,
+    current_texts: set[str] | None = None,
+    limit: int = 5,
+) -> str:
+    if (channel_policy or "").strip().lower() not in {"public_home", "sealed_test"}:
+        return ""
+    current_message_ids = {int(mid or 0) for mid in (current_message_ids or set()) if mid}
+    current_texts = {_normalize_payload_item_key(text) for text in (current_texts or set()) if text}
+    events = get_recent_room_events(guild_id, channel_id, channel_policy=channel_policy, limit=12, media_only=False, minutes=10)
+    lines = []
+    for event in events:
+        if event.get("media_present"):
+            continue
+        if int(event.get("message_id") or 0) in current_message_ids:
+            continue
+        text = (event.get("text_for_context") or event.get("text_summary") or "").strip()
+        if not text or _is_low_signal_conversation_fragment(text):
+            continue
+        if _normalize_payload_item_key(text) in current_texts:
+            continue
+        author = event.get("author_display_name") or "someone"
+        lines.append(f"- {author}: {text}")
+    if not lines:
+        return ""
+    logging.info(
+        "recent_room_context_used guild_id=%s channel_id=%s count=%s channel_policy=%s",
+        guild_id,
+        channel_id,
+        min(len(lines), limit),
+        channel_policy,
+    )
+    return "Recent room context from this channel (transient, for conversational continuity only):\n" + "\n".join(lines[-limit:])
 
 
 def is_media_visibility_or_storage_question(text: str) -> bool:
@@ -12283,6 +12324,176 @@ def _missing_request_payload_items(payload_items, response: str):
         if not _response_mentions_payload_item(response, item):
             missing.append(item)
     return missing
+
+
+_LOW_SIGNAL_NORMALIZED = {
+    "lol", "lmao", "lmfao", "rofl", "haha", "ha", "nice", "cool", "ok", "okay", "k",
+    "yep", "yeah", "yes", "no", "true", "same", "fair", "sure", "thanks", "thank you",
+}
+
+
+def _conversation_text_without_media(text: str) -> str:
+    return _strip_media_context_block(text or "").strip()
+
+
+def _is_emoji_only_or_symbol_fragment(text: str) -> bool:
+    cleaned = _conversation_text_without_media(text)
+    if not cleaned:
+        return True
+    return not bool(re.search(r"[A-Za-z0-9]", cleaned))
+
+
+def _is_low_signal_conversation_fragment(text: str) -> bool:
+    cleaned = _conversation_text_without_media(text)
+    normalized = re.sub(r"[^a-z0-9\s']+", " ", cleaned.lower())
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    if not normalized:
+        return True
+    if normalized in _LOW_SIGNAL_NORMALIZED:
+        return True
+    tokens = [tok for tok in normalized.split() if tok]
+    if len(tokens) <= 2 and all(tok in _LOW_SIGNAL_NORMALIZED for tok in tokens):
+        return True
+    if _is_emoji_only_or_symbol_fragment(cleaned):
+        return True
+    return False
+
+
+def _is_substantive_conversation_fragment(text: str) -> bool:
+    cleaned = _conversation_text_without_media(text)
+    if not cleaned or _is_low_signal_conversation_fragment(cleaned):
+        return False
+    tokens = [tok for tok in re.split(r"\s+", cleaned) if tok]
+    if len(tokens) >= 18:
+        return True
+    if len(cleaned) >= 120:
+        return True
+    lowered = cleaned.lower()
+    if re.search(r"\b(article|section|accord|procurement|fraud|consent|illegal|runtime|conscious|machine|signed form|witness seal)\b", lowered):
+        return True
+    if len(tokens) >= 8 and re.search(r"\b(you|your|you're|youre|bnl|bot|machine|lifeform|system|connection|interruption)\b", lowered):
+        return True
+    if len(tokens) >= 10 and re.search(r"\b(is|are|was|were|because|unless|therefore|according|clearly|pretty sure)\b", lowered):
+        return True
+    return False
+
+
+def _is_bnl_second_person_continuation(text: str) -> bool:
+    cleaned = _conversation_text_without_media(text).lower()
+    if not cleaned or _is_low_signal_conversation_fragment(cleaned):
+        return False
+    if re.search(r"\b(bnl|bnl-01|barcode bot)\b", cleaned) and re.search(r"\b(you|your|youre|you're|doesn'?t|dont|don't|respond|answer|like|heard|saw)\b", cleaned):
+        return True
+    if re.search(r"\b(you|your|youre|you're)\b", cleaned) and re.search(r"\b(machine|bot|artificial|runtime|connection|interruption|consent|like this|answer)\b", cleaned):
+        return True
+    return False
+
+
+def _items_have_substantive_conversation(items) -> bool:
+    texts = [(content or "").strip() for (_name, content, _uid) in (items or []) if (content or "").strip()]
+    if not texts:
+        return False
+    combined = "\n".join(texts)
+    return _is_substantive_conversation_fragment(combined) or any(_is_bnl_second_person_continuation(t) for t in texts)
+
+
+def _should_force_free_speak_continuation_answer(
+    *,
+    guild_id: int,
+    channel_id: int,
+    channel_policy: str,
+    items,
+    recent_bnl_reply_context: bool = False,
+    consume_retransmission: bool = False,
+):
+    policy = (channel_policy or "unknown").strip().lower()
+    if policy not in {"public_home", "sealed_test"}:
+        return False, "policy_blocked"
+    texts = [(content or "").strip() for (_name, content, _uid) in (items or []) if (content or "").strip()]
+    if not texts:
+        return False, "empty"
+    combined = "\n".join(texts)
+    user_ids = [int(uid or 0) for (_n, _c, uid) in (items or []) if uid]
+    distinct_user_ids = sorted(set(user_ids))
+    low_signal = all(_is_low_signal_conversation_fragment(t) for t in texts)
+    if low_signal:
+        if all(_is_emoji_only_or_symbol_fragment(t) for t in texts):
+            return False, "emoji_only"
+        return False, "low_signal_fragment"
+    latch_user_ids = []
+    continuation_user_ids = []
+    for uid in distinct_user_ids:
+        if consume_retransmission and _consume_awaiting_retransmission(guild_id, channel_id, uid):
+            latch_user_ids.append(uid)
+        elif (not consume_retransmission):
+            state = _get_conversation_continuation_state(guild_id, channel_id, uid)
+            awaiting_until = state.get("awaiting_retransmission_until") if state else None
+            if awaiting_until and datetime.now(timezone.utc) <= awaiting_until:
+                latch_user_ids.append(uid)
+        if _is_recent_conversation_continuation(guild_id, channel_id, uid) or _is_recent_direct_followup(channel_id, uid):
+            continuation_user_ids.append(uid)
+    if latch_user_ids and _items_have_substantive_conversation(items):
+        return True, "retransmission_latch_used"
+    if continuation_user_ids and _items_have_substantive_conversation(items):
+        return True, "same_user_continuation_substantive"
+    if recent_bnl_reply_context and _items_have_substantive_conversation(items):
+        return True, "recent_bnl_reply_substantive"
+    if _is_bnl_second_person_continuation(combined) and _items_have_substantive_conversation(items):
+        return True, "bnl_second_person_continuation"
+    return False, "no_continuation_evidence"
+
+
+def _is_previous_message_request(text: str) -> bool:
+    cleaned = re.sub(r"\s+", " ", _conversation_text_without_media(text).lower()).strip()
+    if not cleaned:
+        return False
+    return bool(
+        re.search(r"\b(respond|answer|reply)\s+to\s+my\s+(?:last|previous|prior)\s+message\b", cleaned)
+        or re.search(r"\bwhat\s+about\s+my\s+(?:last|previous|prior)\s+message\b", cleaned)
+        or re.search(r"\b(?:last|previous|prior)\s+message\b.*\b(?:respond|answer|reply)\b", cleaned)
+    )
+
+
+def _response_requests_retransmission(text: str) -> bool:
+    cleaned = re.sub(r"\s+", " ", (text or "").lower()).strip()
+    return bool(re.search(r"\b(retransmit|send (?:it|that|the message) again|repeat (?:it|that|the message)|paste (?:it|that) again)\b", cleaned))
+
+
+def _get_recent_same_user_message_for_previous_request(
+    guild_id: int,
+    channel_id: int,
+    user_id: int,
+    channel_policy: str,
+    *,
+    current_message_id: int | None = None,
+    minutes: int = 20,
+):
+    events = get_recent_room_events(guild_id, channel_id, channel_policy=channel_policy, limit=20, media_only=False, minutes=minutes)
+    for event in reversed(events):
+        if int(event.get("author_id") or 0) != int(user_id or 0):
+            continue
+        if current_message_id and int(event.get("message_id") or 0) == int(current_message_id or 0):
+            continue
+        text = (event.get("text_for_context") or event.get("text_summary") or "").strip()
+        if not text or _is_previous_message_request(text) or _is_low_signal_conversation_fragment(text):
+            continue
+        logging.info(
+            "previous_message_resolved source=recent_room_event guild_id=%s channel_id=%s user_id=%s message_id=%s",
+            guild_id,
+            channel_id,
+            user_id,
+            event.get("message_id") or 0,
+        )
+        return {
+            "text": text,
+            "author_display_name": event.get("author_display_name") or "user",
+            "message_id": event.get("message_id"),
+            "source": "recent_room_event",
+        }
+    logging.info("previous_message_resolved source=none guild_id=%s channel_id=%s user_id=%s", guild_id, channel_id, user_id)
+    return None
+
+
 def _classify_batch_engagement(items, bot_user=None, pending_request_intent=False):
     if not items:
         return "skip", "empty_batch"
@@ -12398,7 +12609,7 @@ def _detect_request_action(text: str):
         return "generic_request"
     return "generic_request"
 
-def _build_active_response_packet(channel_id: int, items, pending_state, pending_anchor=None, bot_user=None):
+def _build_active_response_packet(channel_id: int, items, pending_state, pending_anchor=None, bot_user=None, *, guild_id: int = 0, channel_policy: str = "unknown", recent_bnl_reply_context: bool = False, consume_retransmission: bool = False):
     original_items = list(items or [])
     payload_items = _collect_batch_request_payload_items(original_items, pending_state=bool(pending_state), pending_anchor=pending_anchor)
     collapsed_items = _collapse_consecutive_batch_fragments(original_items)
@@ -12408,6 +12619,26 @@ def _build_active_response_packet(channel_id: int, items, pending_state, pending
         bot_user,
         pending_request_intent=pending_request,
     )
+    force_answer, force_reason = _should_force_free_speak_continuation_answer(
+        guild_id=guild_id,
+        channel_id=channel_id,
+        channel_policy=channel_policy,
+        items=collapsed_items,
+        recent_bnl_reply_context=recent_bnl_reply_context,
+        consume_retransmission=consume_retransmission,
+    )
+    if force_answer and decision != "answer":
+        logging.info(
+            "skip_blocked_by_substantive_continuation guild_id=%s channel_id=%s decision=%s reason=%s force_reason=%s",
+            guild_id,
+            channel_id,
+            decision,
+            reason,
+            force_reason,
+        )
+        decision, reason = "answer", force_reason
+    elif force_reason in {"low_signal_fragment", "emoji_only", "policy_blocked"}:
+        logging.info("skip_allowed reason=%s guild_id=%s channel_id=%s channel_policy=%s", force_reason, guild_id, channel_id, channel_policy)
     is_single_payload_continuation = reason == "pending_request_single_payload_continuation"
     has_request_payload = bool(payload_items)
     if (not has_request_payload) and pending_request and decision == "answer":
@@ -12462,6 +12693,8 @@ def _build_active_response_packet(channel_id: int, items, pending_state, pending
         "media_present": media_stats["present"],
         "media_context_included": media_stats["included"],
         "media_item_count": media_stats["count"],
+        "continuation_force_answer": force_answer,
+        "continuation_force_reason": force_reason,
     }
 
 
@@ -12679,14 +12912,14 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                     save_model_message(unique_user_ids[0], channel.guild.id, memory_recall, channel_name=getattr(channel, "name", ""), channel_policy=channel_policy)
                 _channel_last_reply_at[channel_id] = datetime.now(PACIFIC_TZ)
                 return
-        active_packet = _build_active_response_packet(channel_id, items, pending_state, pending_anchor=pending_anchor, bot_user=client.user)
+        recent_bnl_reply_context = bool(_channel_last_reply_at.get(channel_id) and (datetime.now(PACIFIC_TZ) - _channel_last_reply_at[channel_id]).total_seconds() <= RECENT_MEDIA_LIVE_MOMENT_SECONDS)
+        active_packet = _build_active_response_packet(channel_id, items, pending_state, pending_anchor=pending_anchor, bot_user=client.user, guild_id=guild_id, channel_policy=channel_policy, recent_bnl_reply_context=recent_bnl_reply_context, consume_retransmission=True)
         decision, reason = active_packet["decision"], active_packet["reason"]
         payload_count = len(active_packet["payload_items"])
         _log_batch_event(logging.INFO, "active_packet_original_count", guild_id, channel_id, active_packet["original_count"], f"original_count={active_packet['original_count']}")
         _log_batch_event(logging.INFO, "active_packet_collapsed_count", guild_id, channel_id, active_packet["collapsed_count"], f"collapsed_count={active_packet['collapsed_count']}")
         _log_batch_event(logging.INFO, "active_packet_built", guild_id, channel_id, active_packet["collapsed_count"], f"original_count={active_packet['original_count']};collapsed_count={active_packet['collapsed_count']};payload_count={payload_count};decision={decision};reason={reason}")
         _log_batch_event(logging.INFO, "active_packet_payload_items", guild_id, channel_id, active_packet["collapsed_count"], f"payload_count={payload_count}")
-        recent_bnl_reply_context = bool(_channel_last_reply_at.get(channel_id) and (datetime.now(PACIFIC_TZ) - _channel_last_reply_at[channel_id]).total_seconds() <= RECENT_MEDIA_LIVE_MOMENT_SECONDS)
         if decision == "acknowledge" or (active_packet.get("media_present") and channel_policy in {"public_home", "sealed_test"}):
             decision, reason, ack_diag = resolve_batch_acknowledgement_decision(
                 decision,
@@ -12751,9 +12984,11 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                         return
                     _log_batch_event(logging.INFO, "generic_ack_suppressed", guild_id, channel_id, len(collapsed_items), f"reason={reason}")
                     return
-                await channel.send(ack)
+                await channel.send(ack, allowed_mentions=safe_mentions)
                 _log_batch_event(logging.INFO, "batch_response_acknowledge", guild_id, channel_id, len(collapsed_items), f"reason={reason}")
                 _channel_last_reply_at[channel_id] = datetime.now(PACIFIC_TZ)
+                for uid in unique_user_ids:
+                    _mark_conversation_continuation_state(guild_id, channel_id, uid)
                 return
 
         regenerated_once = False
@@ -12776,7 +13011,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
             combined_text = " ".join([c for (_n, c, _u) in collapsed_items])
             first_uid = collapsed_items[0][2] if collapsed_items and collapsed_items[0][2] else 0
             unique_user_ids = sorted({uid for (_n, _c, uid) in collapsed_items if uid})
-            active_packet = _build_active_response_packet(channel_id, items, pending_state, pending_anchor=pending_anchor, bot_user=client.user)
+            active_packet = _build_active_response_packet(channel_id, items, pending_state, pending_anchor=pending_anchor, bot_user=client.user, guild_id=guild_id, channel_policy=channel_policy, recent_bnl_reply_context=recent_bnl_reply_context if 'recent_bnl_reply_context' in locals() else False, consume_retransmission=True)
             decision, reason = active_packet["decision"], active_packet["reason"]
             payload_count = len(active_packet["payload_items"])
             _log_batch_event(logging.INFO, "active_packet_original_count", guild_id, channel_id, active_packet["original_count"], f"original_count={active_packet['original_count']}")
@@ -12855,10 +13090,21 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                 await channel.send(ack, allowed_mentions=safe_mentions)
                 _log_batch_event(logging.INFO, "batch_response_acknowledge", guild_id, channel_id, len(collapsed_items), f"reason={reason}")
                 _channel_last_reply_at[channel_id] = datetime.now(PACIFIC_TZ)
+                for uid in unique_user_ids:
+                    _mark_conversation_continuation_state(guild_id, channel_id, uid)
                 return
             style_key, style_rule = choose_response_style(channel.guild.id, first_uid, len(collapsed_items), combined_text)
             log_response_style(channel.guild.id, first_uid, style_key)
             prompt = _format_batched_prompt(msg_list, style_key, style_rule)
+            recent_room_prompt = build_recent_text_room_context_for_prompt(
+                guild_id,
+                channel_id,
+                channel_policy,
+                current_texts={content for (_name, content, _uid) in collapsed_items},
+                limit=5,
+            )
+            if recent_room_prompt:
+                prompt += "\n\n" + recent_room_prompt + "\n"
             recent_media_prompt = build_recent_media_context_for_prompt(guild_id, channel_id, channel_policy, limit=5)
             if recent_media_prompt:
                 prompt += "\n\n" + recent_media_prompt + "\n"
@@ -13010,7 +13256,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                     _channel_preempted_generation_id[channel_id] = local_generation_id
                     _channel_message_interrupt_generation_id[channel_id] = local_generation_id
                     rebuilt_payload_count = len(
-                        _build_active_response_packet(channel_id, items, pending_state, pending_anchor=pending_anchor, bot_user=client.user)["payload_items"]
+                        _build_active_response_packet(channel_id, items, pending_state, pending_anchor=pending_anchor, bot_user=client.user, guild_id=guild_id, channel_policy=channel_policy, recent_bnl_reply_context=recent_bnl_reply_context if 'recent_bnl_reply_context' in locals() else False)["payload_items"]
                     )
                     _log_batch_event(
                         logging.INFO,
@@ -13217,6 +13463,10 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
             for chunk in chunks[1:]:
                 await channel.send("..." + chunk, allowed_mentions=safe_mentions)
         _log_batch_event(logging.INFO, "response_send_commit_complete", guild_id, channel_id, len(items), f"generation_id={local_generation_id}")
+        for uid in unique_user_ids:
+            _mark_conversation_continuation_state(guild_id, channel_id, uid)
+            if _response_requests_retransmission(response):
+                _mark_awaiting_retransmission(guild_id, channel_id, uid)
         if active_packet.get("media_present"):
             mark_recent_media_events_response_state(guild_id, channel_id, set(unique_user_ids), channel_policy, "responded")
 
@@ -13678,9 +13928,81 @@ _rd_ops_context_buffer = defaultdict(lambda: deque(maxlen=RD_OPS_CONTEXT_MAX_TUR
 _rd_ops_channel_context_buffer = defaultdict(lambda: deque(maxlen=RD_OPS_CHANNEL_CONTEXT_MAX_TURNS))
 _recent_direct_response_window = {}
 DIRECT_FOLLOWUP_WINDOW_SECONDS = 60
+CONVERSATION_CONTINUATION_TTL_SECONDS = max(60, int(os.getenv("BNL_CONVERSATION_CONTINUATION_TTL_SECONDS", "180") or 180))
+CONVERSATION_RETRANSMISSION_TTL_SECONDS = max(60, int(os.getenv("BNL_RETRANSMISSION_LATCH_TTL_SECONDS", "180") or 180))
+_conversation_continuation_state = {}
+
+
+def _conversation_state_key(guild_id: int, channel_id: int, user_id: int):
+    return (int(guild_id or 0), int(channel_id or 0), int(user_id or 0))
+
 
 def _mark_recent_direct_response(channel_id: int, user_id: int):
     _recent_direct_response_window[(channel_id, user_id)] = datetime.now(timezone.utc)
+
+
+def _mark_conversation_continuation_state(guild_id: int, channel_id: int, user_id: int, *, awaiting_retransmission: bool = False):
+    if not channel_id or not user_id:
+        return
+    now = datetime.now(timezone.utc)
+    key = _conversation_state_key(guild_id, channel_id, user_id)
+    state = _conversation_continuation_state.get(key, {})
+    state.update({
+        "last_bnl_reply_at": now,
+        "live_exchange_until": now + timedelta(seconds=CONVERSATION_CONTINUATION_TTL_SECONDS),
+    })
+    if awaiting_retransmission:
+        state["awaiting_retransmission_until"] = now + timedelta(seconds=CONVERSATION_RETRANSMISSION_TTL_SECONDS)
+    _conversation_continuation_state[key] = state
+    _mark_recent_direct_response(channel_id, user_id)
+
+
+def _mark_awaiting_retransmission(guild_id: int, channel_id: int, user_id: int):
+    _mark_conversation_continuation_state(guild_id, channel_id, user_id, awaiting_retransmission=True)
+    logging.info(
+        "retransmission_latch_set guild_id=%s channel_id=%s user_id=%s ttl_seconds=%s",
+        guild_id,
+        channel_id,
+        user_id,
+        CONVERSATION_RETRANSMISSION_TTL_SECONDS,
+    )
+
+
+def _get_conversation_continuation_state(guild_id: int, channel_id: int, user_id: int):
+    key = _conversation_state_key(guild_id, channel_id, user_id)
+    state = _conversation_continuation_state.get(key)
+    if not state:
+        return None
+    now = datetime.now(timezone.utc)
+    live_until = state.get("live_exchange_until")
+    awaiting_until = state.get("awaiting_retransmission_until")
+    if (not live_until or now > live_until) and (not awaiting_until or now > awaiting_until):
+        _conversation_continuation_state.pop(key, None)
+        return None
+    if awaiting_until and now > awaiting_until:
+        state.pop("awaiting_retransmission_until", None)
+    return state
+
+
+def _is_recent_conversation_continuation(guild_id: int, channel_id: int, user_id: int) -> bool:
+    state = _get_conversation_continuation_state(guild_id, channel_id, user_id)
+    if not state:
+        return False
+    live_until = state.get("live_exchange_until")
+    return bool(live_until and datetime.now(timezone.utc) <= live_until)
+
+
+def _consume_awaiting_retransmission(guild_id: int, channel_id: int, user_id: int) -> bool:
+    state = _get_conversation_continuation_state(guild_id, channel_id, user_id)
+    if not state:
+        return False
+    awaiting_until = state.get("awaiting_retransmission_until")
+    if awaiting_until and datetime.now(timezone.utc) <= awaiting_until:
+        state.pop("awaiting_retransmission_until", None)
+        logging.info("retransmission_latch_used guild_id=%s channel_id=%s user_id=%s", guild_id, channel_id, user_id)
+        return True
+    return False
+
 
 def _is_recent_direct_followup(channel_id: int, user_id: int) -> bool:
     ts = _recent_direct_response_window.get((channel_id, user_id))
@@ -14081,7 +14403,9 @@ async def send_planned_conversation_response(
         for chunk in chunks[1:]:
             await message.channel.send("..." + chunk)
     if mark_recent_direct:
-        _mark_recent_direct_response(message.channel.id, message.author.id)
+        _mark_conversation_continuation_state(message.guild.id, message.channel.id, message.author.id)
+        if _response_requests_retransmission(response):
+            _mark_awaiting_retransmission(message.guild.id, message.channel.id, message.author.id)
     return model_decision
 
 
@@ -14157,6 +14481,35 @@ async def on_message(message: discord.Message):
             response_state="observed" if media_context.get("present") else "ignored",
         )
 
+    if _is_previous_message_request(clean_content):
+        previous = _get_recent_same_user_message_for_previous_request(
+            message.guild.id,
+            message.channel.id,
+            message.author.id,
+            channel_policy,
+            current_message_id=getattr(message, "id", None),
+        )
+        if previous:
+            previous_text = previous.get("text", "")
+            clean_content = (
+                f"{clean_content}\n\n"
+                "Previous same-user message to answer now (transient room context):\n"
+                f"{previous_text}"
+            ).strip()
+            conversation_content = append_media_context_to_text(clean_content, media_context)
+            logging.info(
+                "previous_message_resolved action=inject_into_current_request guild_id=%s channel_id=%s user_id=%s source=%s",
+                message.guild.id,
+                message.channel.id,
+                message.author.id,
+                previous.get("source", "unknown"),
+            )
+        elif real_direct_target or free_speak_surface:
+            _mark_awaiting_retransmission(message.guild.id, message.channel.id, message.author.id)
+            reply = "I can’t safely resolve the prior message from here. Send it again and I’ll answer that payload directly."
+            await message.reply(reply)
+            return
+
     if await maybe_handle_debug_last_route_command(message, clean_content):
         return
 
@@ -14179,7 +14532,20 @@ async def on_message(message: discord.Message):
 
     plain_text_name_seen = bool(re.search(r"\b(bnl|bnl-01|barcode bot)\b", clean_content.lower())) if clean_content else False
     channel_allows_conversation = bool(free_speak_surface or is_active_channel)
-    followup_candidate = _is_recent_direct_followup(message.channel.id, message.author.id) if conversation_content else False
+    followup_candidate = (
+        bool(conversation_content)
+        and (
+            _is_recent_direct_followup(message.channel.id, message.author.id)
+            or _is_recent_conversation_continuation(message.guild.id, message.channel.id, message.author.id)
+        )
+    )
+    if followup_candidate and _is_substantive_conversation_fragment(conversation_content):
+        logging.info(
+            "conversation_continuation_detected guild_id=%s channel_id=%s user_id=%s substantive=1",
+            message.guild.id,
+            message.channel.id,
+            message.author.id,
+        )
     logging.info(f"response_route_channel_policy policy={channel_policy}")
     logging.info(f"response_route_conversation_surface surface={conversation_surface}")
     logging.info(f"response_route_channel channel_name={getattr(message.channel, 'name', 'unknown')} channel_id={getattr(message.channel, 'id', 'unknown')}")
