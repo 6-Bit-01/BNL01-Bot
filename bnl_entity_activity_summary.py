@@ -13,10 +13,17 @@ from collections import Counter
 from typing import Any
 
 from bnl_dossier_source_packets import normalize_subject_name, subject_key
+from bnl_entity_evidence import (
+    ENTITY_EVIDENCE_TABLE,
+    derive_entity_evidence_for_subject,
+    get_entity_evidence_for_subject,
+    table_exists as _evidence_table_exists,
+)
 
 DEFAULT_ENTITY_SUMMARY_LIMIT = 50
 MAX_ENTITY_SUMMARY_LIMIT = 200
 DEFAULT_ALLOWED_LANES = {
+    "entity_evidence_events",
     "user_profiles",
     "user_memory_facts",
     "user_habits",
@@ -49,16 +56,37 @@ _BNL_INTERACTION_PATTERN = re.compile(r"\b(bnl|bot|source files?|dossiers?|asked
 
 
 def parse_entity_activity_summary_command(content: str) -> tuple[bool, dict[str, Any] | None, str]:
-    """Parse `!bnl entity summary <subject>` operator readout commands."""
+    """Parse operator entity summary/evidence refresh readout commands."""
 
     text = (content or "").strip()
+    refresh_match = re.match(r"^!bnl\s+entity\s+evidence\s+refresh\s+(.+?)\s*$", text, flags=re.I | re.S)
+    if refresh_match:
+        subject = normalize_subject_name(refresh_match.group(1))
+        if not subject:
+            return True, None, "Use: `!bnl entity evidence refresh <subject>`"
+        return True, {"subjectName": subject, "refreshEvidence": True}, ""
     match = re.match(r"^!bnl\s+(?:entity\s+summary|source\s+summary)\s+(.+?)\s*$", text, flags=re.I | re.S)
     if not match:
         return False, None, "not_an_entity_activity_summary_command"
-    subject = normalize_subject_name(match.group(1))
+    subject_text = match.group(1)
+    refresh = False
+    parts = [piece.strip() for piece in subject_text.split("|") if piece.strip()]
+    if len(parts) > 1:
+        subject_text = parts[0]
+        for part in parts[1:]:
+            key_match = re.match(r"^([a-zA-Z_]+)\s*=\s*(.+)$", part)
+            if not key_match:
+                return True, None, "Use: `!bnl entity summary <subject> [| refresh=true]`"
+            key = key_match.group(1).strip().lower()
+            value = key_match.group(2).strip().lower()
+            if key == "refresh":
+                refresh = value in {"true", "1", "yes", "on"}
+            else:
+                return True, None, "Supported option: refresh."
+    subject = normalize_subject_name(subject_text)
     if not subject:
         return True, None, "Use: `!bnl entity summary <subject>`"
-    return True, {"subjectName": subject}, ""
+    return True, {"subjectName": subject, "refreshEvidence": refresh}, ""
 
 
 def compact_subject_text(value: str) -> str:
@@ -220,6 +248,100 @@ def _resolve_existing_enrichment_identity(db_path: str, subject: str, guild_id: 
         return {}
 
 
+
+def refresh_entity_evidence_for_subject(db_path: str, subject_name: str, guild_id: int | None = None, limit: int = MAX_ENTITY_SUMMARY_LIMIT) -> dict[str, Any]:
+    """Operator/source-path helper to derive structured evidence for one subject."""
+
+    return derive_entity_evidence_for_subject(db_path, subject_name, guild_id=guild_id, limit=limit)
+
+
+def _apply_structured_evidence(summary: dict[str, Any], rows: list[sqlite3.Row], topic_counts: Counter) -> None:
+    """Populate summary fields from entity_evidence_events rows."""
+
+    for row in rows:
+        data = dict(row)
+        source_table = str(data.get("source_table") or "entity_evidence_events")
+        source_label = str(data.get("source_label") or f"{source_table}/structured_evidence")
+        kind = str(data.get("evidence_kind") or "")
+        safe_summary = _safe_snippet(data.get("safe_summary") or "Structured entity evidence exists for owner review.")
+        relation = str(data.get("relation_to_subject") or "mentioned")
+        policy = str(data.get("channel_policy") or "unknown")
+        topic = str(data.get("topic") or "local context")
+        public_candidate = bool(data.get("public_safe_candidate"))
+        review_only = bool(data.get("review_only"))
+        channel_name = data.get("channel_name") if not review_only else None
+        channel_display = _channel_display_name(channel_name, policy) if channel_name else ("approved public-side channel" if public_candidate else "review-only channel")
+
+        summary["rawProvenance"]["sourceLabels"].append(source_label)
+        summary["rawProvenance"]["sourceCounts"][source_table] += 1
+        summary["rawProvenance"]["channelPolicies"][policy] += 1
+        summary["rawProvenance"]["rawFragments"].append({
+            "table": source_table,
+            "sourceLabel": source_label,
+            "sourceQuality": "structured_entity_evidence",
+            "evidenceKind": kind,
+            "rowId": data.get("source_row_id"),
+            "rawRefJson": data.get("raw_ref_json"),
+        })
+        if topic:
+            topic_counts[topic] += 1
+        _add_unique(summary["evidenceDetails"], safe_summary)
+
+        if kind == "profile_match":
+            _add_unique(summary["matchedNames"], normalize_subject_name(data.get("subject_name") or summary.get("subjectName") or ""))
+            _add_unique(summary["knownContext"], f"Local profile match found for {summary.get('subjectName')}." )
+            continue
+
+        if kind in {"authored_public_conversation", "mentioned_public_conversation"}:
+            _add_unique(summary["publicSafePossibilities"], "Public-side conversation context exists in approved Discord lanes and may support community/source-file wording after owner review.")
+            _add_unique(summary["publicUseCandidates"], "Possible community/source-file candidate based on approved public-side structured evidence, pending owner review.")
+            _add_unique(summary["observedChannels"], f"{channel_display} — approved public-side; subject {relation}.")
+            _add_unique(summary["channelActivity"], f"Appears in approved public-side structured conversation evidence as {relation} context.")
+            _add_unique(summary["conversationHighlights"], safe_summary)
+        elif "conversation" in kind:
+            _add_unique(summary["privateOnlyNotes"], "Non-public, unknown, internal, or sealed conversation context remains review-only.")
+            _add_unique(summary["reviewOnlyEvidence"], safe_summary)
+            _add_unique(summary["notPublicYet"], "Conversation context from unknown/internal/sealed lanes is not public-safe evidence.")
+            _add_unique(summary["observedChannels"], f"review-only channel — {policy}; subject {relation}.")
+            _add_unique(summary["channelActivity"], f"Seen in review-only structured conversation evidence as {relation} context.")
+            _add_unique(summary["conversationHighlights"], safe_summary)
+        elif kind == "relationship_context_review_only":
+            _add_unique(summary["relationshipSignals"], safe_summary)
+            _add_unique(summary["privateOnlyNotes"], "Relationship/context notes are private/internal and require owner review before any public wording.")
+            _add_unique(summary["reviewOnlyEvidence"], safe_summary)
+        elif kind == "source_blind_memory_review_only":
+            _add_unique(summary["privateOnlyNotes"], SOURCE_BLIND_REVIEW_NOTE)
+            _add_unique(summary["reviewOnlyEvidence"], safe_summary)
+            _add_unique(summary["notPublicYet"], "Source-blind memory cannot be used as a public fact without review.")
+        elif kind == "broadcast_memory_signal":
+            if public_candidate:
+                _add_unique(summary["publicSafePossibilities"], "Broadcast-memory context may support public wording after owner review.")
+                _add_unique(summary["publicUseCandidates"], "Active public-safe broadcast memory may support public wording after owner review.")
+                _add_unique(summary["observedChannels"], "broadcast memory — active/public-safe; owner review still required.")
+            else:
+                _add_unique(summary["privateOnlyNotes"], "Broadcast-memory context is not public-safe unless active and marked public-safe.")
+                _add_unique(summary["reviewOnlyEvidence"], safe_summary)
+        elif kind == "community_presence_signal":
+            _add_unique(summary["communitySignals"], safe_summary)
+            _add_unique(summary["publicUseCandidates"], "Community presence can inform a possible public role only after owner review confirms identity and wording.")
+            _add_unique(summary["publicSafePossibilities"], "Community presence may support public-safe wording after owner review; it is not a confirmed public fact by itself.")
+        elif review_only:
+            _add_unique(summary["reviewOnlyEvidence"], safe_summary)
+            _add_unique(summary["privateOnlyNotes"], safe_summary)
+
+        if data.get("music_signal"):
+            _add_unique(summary["musicSignals"], "Structured evidence connects this subject to music/radio/show context; queue identity still needs review.")
+        if data.get("community_signal"):
+            _add_unique(summary["communitySignals"], "Structured evidence places this subject in BARCODE/community context; owner review must confirm public wording.")
+        if data.get("bnl_interaction"):
+            _add_unique(summary["bnlInteractionSignals"], f"Structured evidence shows BNL-related interaction context; subject was {relation}.")
+
+
+def _structured_evidence_rows(conn: sqlite3.Connection, subject: str, guild_id: int | None, lanes: set[str], max_rows: int) -> list[sqlite3.Row]:
+    if "entity_evidence_events" not in lanes or not _evidence_table_exists(conn, ENTITY_EVIDENCE_TABLE):
+        return []
+    return get_entity_evidence_for_subject(conn, subject, guild_id=guild_id, limit=max_rows)
+
 def build_entity_activity_summary(
     db_path: str,
     subject_name: str,
@@ -291,6 +413,27 @@ def build_entity_activity_summary(
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
     try:
+        structured_rows = _structured_evidence_rows(conn, subject, guild_id, lanes, max_rows)
+        if structured_rows:
+            _apply_structured_evidence(summary, structured_rows, topic_counts)
+            matched_user_ids.update(row["matched_user_id"] for row in structured_rows if "matched_user_id" in row.keys() and row["matched_user_id"] not in (None, ""))
+            for row in structured_rows:
+                if row["evidence_kind"] == "profile_match":
+                    clean_name = normalize_subject_name(row["subject_name"] or subject)
+                    _add_unique(summary["matchedNames"], clean_name)
+                    aliases.append(clean_name)
+            lanes = set(lanes) - {
+                "user_profiles",
+                "user_memory_facts",
+                "user_habits",
+                "relationship_state",
+                "relationship_journal",
+                "memory_tiers",
+                "conversations",
+                "broadcast_memory",
+                "community_presence",
+            }
+
         if "user_profiles" in lanes:
             for row in _fetch_rows(conn, "user_profiles", guild_id, max_rows):
                 data = dict(row)

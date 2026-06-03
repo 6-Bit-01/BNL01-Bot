@@ -1,0 +1,553 @@
+"""Structured entity/source evidence events for BNL internal source workflows.
+
+This is a conservative evidence layer over existing local memory/source stores. It
+stores short review-safe summaries and provenance pointers; it does not create
+canonical profiles, website dossiers, Source Files, queue links, or public output.
+"""
+
+from __future__ import annotations
+
+import json
+import re
+import sqlite3
+from collections import Counter
+from datetime import datetime, timezone
+from typing import Any
+
+from bnl_dossier_source_packets import normalize_subject_name, subject_key
+
+ENTITY_EVIDENCE_TABLE = "entity_evidence_events"
+PUBLIC_CONVERSATION_POLICIES = {"public_home", "public_context", "public_selective", "broadcast_memory"}
+QUEUE_NOT_CONNECTED_NOTE = "Queue/submission identity is not connected yet."
+MAX_SAFE_SUMMARY_LENGTH = 220
+MAX_REF_SNIPPET_LENGTH = 160
+
+ALLOWED_EVIDENCE_KINDS = {
+    "profile_match",
+    "authored_public_conversation",
+    "mentioned_public_conversation",
+    "authored_review_only_conversation",
+    "mentioned_review_only_conversation",
+    "music_or_show_signal",
+    "community_signal",
+    "bnl_interaction",
+    "relationship_context_review_only",
+    "source_blind_memory_review_only",
+    "broadcast_memory_signal",
+    "r_and_d_context_review_only",
+    "community_presence_signal",
+}
+
+_DISCORD_MENTION_PATTERN = re.compile(r"<[@#!&]?[0-9]{5,}>")
+_LONG_ID_PATTERN = re.compile(r"\b\d{15,22}\b")
+_URL_PATTERN = re.compile(r"https?://\S+", re.I)
+_WORD_PATTERN = re.compile(r"[a-z0-9]+")
+_MUSIC_PATTERN = re.compile(r"\b(artist|track|song|playlist|radio|show|performance|beat|demo|finished tracks?|wips?|collab(?:oration)?s?|music)\b", re.I)
+_COMMUNITY_PATTERN = re.compile(r"\b(community|server|barcode|member|public|conversation|channel|chat|finished tracks?|wips?)\b", re.I)
+_BNL_PATTERN = re.compile(r"\b(bnl|bot|source files?|dossiers?|owner review|public-safe|asked|question|help|review)\b", re.I)
+_TOPIC_PATTERNS = [
+    ("music/community context", _MUSIC_PATTERN),
+    ("source-file/dossier planning context", re.compile(r"\b(source files?|dossiers?|draft|candidate|owner review|public copy|public-safe)\b", re.I)),
+    ("community/event context", _COMMUNITY_PATTERN),
+    ("help/support requests", re.compile(r"\b(help|support|assist|fix|issue|question|request|need)\b", re.I)),
+]
+
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def safe_text(value: Any, max_length: int = MAX_REF_SNIPPET_LENGTH) -> str:
+    cleaned = _URL_PATTERN.sub("[redacted-url]", str(value or ""))
+    cleaned = _DISCORD_MENTION_PATTERN.sub("[redacted-mention]", cleaned)
+    cleaned = _LONG_ID_PATTERN.sub("[redacted-id]", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    if len(cleaned) <= max_length:
+        return cleaned
+    return cleaned[: max(0, max_length - 1)].rstrip() + "…"
+
+
+def compact_subject_text(value: str) -> str:
+    return "".join(_WORD_PATTERN.findall((value or "").lower()))
+
+
+def contains_subject_mention(text: str, subject: str, aliases: list[str] | None = None) -> bool:
+    candidates = [subject] + [alias for alias in (aliases or []) if alias]
+    haystack = text or ""
+    compact_haystack = compact_subject_text(haystack)
+    for candidate in candidates:
+        name = normalize_subject_name(candidate)
+        if not name:
+            continue
+        if re.search(rf"(?<![A-Za-z0-9]){re.escape(name)}(?![A-Za-z0-9])", haystack, flags=re.I):
+            return True
+        compact = compact_subject_text(name)
+        if compact and len(compact) >= 3 and compact in compact_haystack:
+            return True
+    return False
+
+
+def table_exists(conn: sqlite3.Connection, table: str) -> bool:
+    return conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone() is not None
+
+
+def columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    if not table_exists(conn, table):
+        return set()
+    return {str(row[1]) for row in conn.execute(f"PRAGMA table_info({table})")}
+
+
+def ensure_entity_evidence_schema(conn: sqlite3.Connection) -> None:
+    """Create the v1 structured entity/source evidence table and indexes."""
+
+    conn.execute(
+        f"""
+        CREATE TABLE IF NOT EXISTS {ENTITY_EVIDENCE_TABLE} (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            guild_id INTEGER,
+            subject_key TEXT NOT NULL,
+            subject_name TEXT NOT NULL,
+            matched_user_id INTEGER,
+            source_type TEXT NOT NULL,
+            source_table TEXT NOT NULL,
+            source_row_id TEXT,
+            source_label TEXT NOT NULL,
+            channel_name TEXT,
+            channel_policy TEXT,
+            visibility TEXT NOT NULL,
+            authority TEXT NOT NULL,
+            confidence REAL NOT NULL DEFAULT 0.5,
+            relation_to_subject TEXT NOT NULL DEFAULT 'mentioned',
+            topic TEXT,
+            evidence_kind TEXT NOT NULL,
+            safe_summary TEXT NOT NULL,
+            public_safe_candidate INTEGER NOT NULL DEFAULT 0,
+            review_only INTEGER NOT NULL DEFAULT 1,
+            music_signal INTEGER NOT NULL DEFAULT 0,
+            community_signal INTEGER NOT NULL DEFAULT 0,
+            bnl_interaction INTEGER NOT NULL DEFAULT 0,
+            dossier_relevance TEXT,
+            raw_ref_json TEXT,
+            created_at TEXT NOT NULL,
+            observed_at TEXT,
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        f"""
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_entity_evidence_unique_source
+        ON {ENTITY_EVIDENCE_TABLE} (
+            guild_id,
+            subject_key,
+            source_type,
+            source_table,
+            coalesce(source_row_id, ''),
+            evidence_kind,
+            relation_to_subject
+        )
+        """
+    )
+    conn.execute(f"CREATE INDEX IF NOT EXISTS idx_entity_evidence_subject ON {ENTITY_EVIDENCE_TABLE} (guild_id, subject_key, updated_at)")
+    conn.execute(f"CREATE INDEX IF NOT EXISTS idx_entity_evidence_kind ON {ENTITY_EVIDENCE_TABLE} (evidence_kind, review_only, public_safe_candidate)")
+
+
+def _coerce_bool(value: Any) -> int:
+    return 1 if bool(value) else 0
+
+
+def _clean_safe_summary(summary: str) -> str:
+    cleaned = safe_text(summary, MAX_SAFE_SUMMARY_LENGTH)
+    # Evidence summaries are labels, not transcript excerpts; remove accidental IDs.
+    return cleaned or "Structured entity evidence exists for owner review."
+
+
+def _raw_ref_json(raw_ref: dict[str, Any] | None) -> str:
+    safe_ref: dict[str, Any] = {}
+    for key, value in (raw_ref or {}).items():
+        if value is None:
+            continue
+        if key in {"snippet", "content", "summary", "raw_excerpt", "channel_name", "source_label"}:
+            safe_ref[key] = safe_text(value)
+        else:
+            safe_ref[key] = value
+    return json.dumps(safe_ref, sort_keys=True)
+
+
+def upsert_entity_evidence_event(conn: sqlite3.Connection, **event: Any) -> str:
+    """Insert/update one evidence event. Returns created, updated, or unchanged."""
+
+    ensure_entity_evidence_schema(conn)
+    subject = normalize_subject_name(event.get("subject_name") or event.get("subjectName") or "")
+    key = event.get("subject_key") or subject_key(subject)
+    evidence_kind = str(event.get("evidence_kind") or "").strip()
+    if evidence_kind not in ALLOWED_EVIDENCE_KINDS:
+        raise ValueError(f"Unsupported entity evidence kind: {evidence_kind}")
+    source_type = str(event.get("source_type") or event.get("source_table") or "unknown")[:80]
+    source_table = str(event.get("source_table") or source_type)[:80]
+    source_row_id = None if event.get("source_row_id") in (None, "") else str(event.get("source_row_id"))[:80]
+    relation = str(event.get("relation_to_subject") or "mentioned")[:80]
+    guild_id = event.get("guild_id")
+    now = now_iso()
+    values = {
+        "guild_id": guild_id,
+        "subject_key": key,
+        "subject_name": subject,
+        "matched_user_id": event.get("matched_user_id"),
+        "source_type": source_type,
+        "source_table": source_table,
+        "source_row_id": source_row_id,
+        "source_label": str(event.get("source_label") or f"{source_table}/structured_evidence")[:120],
+        "channel_name": event.get("channel_name") if event.get("channel_name") else None,
+        "channel_policy": str(event.get("channel_policy") or "unknown")[:80],
+        "visibility": str(event.get("visibility") or "review_only")[:80],
+        "authority": str(event.get("authority") or "local_observed")[:80],
+        "confidence": float(event.get("confidence") if event.get("confidence") is not None else 0.5),
+        "relation_to_subject": relation,
+        "topic": safe_text(event.get("topic") or "", 120) or None,
+        "evidence_kind": evidence_kind,
+        "safe_summary": _clean_safe_summary(str(event.get("safe_summary") or "")),
+        "public_safe_candidate": _coerce_bool(event.get("public_safe_candidate")),
+        "review_only": _coerce_bool(event.get("review_only", True)),
+        "music_signal": _coerce_bool(event.get("music_signal")),
+        "community_signal": _coerce_bool(event.get("community_signal")),
+        "bnl_interaction": _coerce_bool(event.get("bnl_interaction")),
+        "dossier_relevance": safe_text(event.get("dossier_relevance") or "", 120) or None,
+        "raw_ref_json": _raw_ref_json(event.get("raw_ref_json") or {}),
+        "observed_at": str(event.get("observed_at") or now)[:80],
+        "updated_at": now,
+    }
+    existing = conn.execute(
+        f"""
+        SELECT * FROM {ENTITY_EVIDENCE_TABLE}
+        WHERE (guild_id IS ? OR guild_id=?) AND subject_key=? AND source_type=? AND source_table=?
+          AND coalesce(source_row_id, '')=coalesce(?, '') AND evidence_kind=? AND relation_to_subject=?
+        LIMIT 1
+        """,
+        (guild_id, guild_id, key, source_type, source_table, source_row_id, evidence_kind, relation),
+    ).fetchone()
+    if existing is None:
+        insert_values = dict(values)
+        insert_values["created_at"] = now
+        columns_sql = ", ".join(insert_values.keys())
+        placeholders = ", ".join(["?"] * len(insert_values))
+        conn.execute(f"INSERT INTO {ENTITY_EVIDENCE_TABLE} ({columns_sql}) VALUES ({placeholders})", list(insert_values.values()))
+        return "created"
+    current = dict(existing) if isinstance(existing, sqlite3.Row) else {desc[0]: existing[idx] for idx, desc in enumerate(conn.execute(f"SELECT * FROM {ENTITY_EVIDENCE_TABLE} LIMIT 0").description or [])}
+    comparable = {k: v for k, v in values.items() if k != "updated_at"}
+    if all(str(current.get(k) or "") == str(v or "") for k, v in comparable.items()):
+        return "unchanged"
+    assignments = ", ".join(f"{k}=?" for k in values.keys())
+    conn.execute(f"UPDATE {ENTITY_EVIDENCE_TABLE} SET {assignments} WHERE id=?", [*values.values(), current["id"]])
+    return "updated"
+
+
+def _fetch_rows(conn: sqlite3.Connection, table: str, guild_id: int | None, limit: int) -> list[sqlite3.Row]:
+    cols = columns(conn, table)
+    if not cols:
+        return []
+    where = ""
+    params: list[Any] = []
+    if guild_id is not None and "guild_id" in cols:
+        where = " WHERE guild_id=?"
+        params.append(guild_id)
+    order = ""
+    for candidate in ("updated_at", "timestamp", "last_seen_at", "created_at", "id"):
+        if candidate in cols:
+            order = f" ORDER BY {candidate} DESC"
+            break
+    return list(conn.execute(f"SELECT * FROM {table}{where}{order} LIMIT ?", [*params, max(1, limit)]))
+
+
+def _row_text(row: sqlite3.Row, fields: list[str]) -> str:
+    data = dict(row)
+    return " ".join(str(data.get(field) or "") for field in fields if field in data)
+
+
+def _topic(text: str) -> str:
+    labels = [label for label, pattern in _TOPIC_PATTERNS if pattern.search(text or "")]
+    return labels[0] if labels else "local context"
+
+
+def _source_row_id(data: dict[str, Any]) -> str | None:
+    value = data.get("id")
+    return None if value in (None, "") else str(value)
+
+
+def derive_entity_evidence_from_conversation_row(
+    conn: sqlite3.Connection,
+    row: sqlite3.Row,
+    subject_name: str,
+    *,
+    guild_id: int | None = None,
+    matched_user_ids: set[Any] | None = None,
+    aliases: list[str] | None = None,
+) -> str | None:
+    """Derive one conservative conversation evidence event for a matched row."""
+
+    data = dict(row)
+    subject = normalize_subject_name(subject_name)
+    text = _row_text(row, ["content"])
+    haystack = _row_text(row, ["user_name", "content", "channel_name", "channel_policy"])
+    authored = data.get("user_id") in (matched_user_ids or set()) or contains_subject_mention(str(data.get("user_name") or ""), subject, aliases)
+    if not authored and not contains_subject_mention(haystack, subject, aliases):
+        return None
+    policy = str(data.get("channel_policy") or "unknown").strip().lower() or "unknown"
+    public = policy in PUBLIC_CONVERSATION_POLICIES
+    relation = "authored" if authored else "mentioned"
+    kind = f"{relation}_{'public' if public else 'review_only'}_conversation"
+    if public:
+        safe_summary = f"Subject {relation} approved public-side conversation about {_topic(text)}."
+        channel_name = safe_text(data.get("channel_name") or "", 80) or None
+    else:
+        safe_summary = f"Subject {relation} review-only conversation context; private/internal channel details require owner review."
+        channel_name = None
+    return upsert_entity_evidence_event(
+        conn,
+        guild_id=guild_id if guild_id is not None else data.get("guild_id"),
+        subject_name=subject,
+        matched_user_id=data.get("user_id") if authored else None,
+        source_type="conversation",
+        source_table="conversations",
+        source_row_id=_source_row_id(data),
+        source_label="conversations/public_discord_observed" if public else "conversations/internal_context_review_only",
+        channel_name=channel_name,
+        channel_policy=policy,
+        visibility="public_side" if public else "review_only",
+        authority="channel_policy_observed" if public else "internal_review_only",
+        confidence=0.72 if public else 0.5,
+        relation_to_subject=relation,
+        topic=_topic(text),
+        evidence_kind=kind,
+        safe_summary=safe_summary,
+        public_safe_candidate=public,
+        review_only=not public,
+        music_signal=bool(_MUSIC_PATTERN.search(text)),
+        community_signal=bool(_COMMUNITY_PATTERN.search(text)),
+        bnl_interaction=bool(_BNL_PATTERN.search(text)),
+        dossier_relevance="candidate_after_owner_review" if public else "review_only_context",
+        raw_ref_json={"table": "conversations", "row_id": data.get("id"), "channel_policy": policy, "channel_name": data.get("channel_name"), "snippet": text},
+        observed_at=data.get("timestamp"),
+    )
+
+
+def derive_entity_evidence_for_subject(db_path: str, subject_name: str, guild_id: int | None = None, limit: int = 200) -> dict[str, Any]:
+    """Derive/update evidence events for one subject from existing local stores only."""
+
+    subject = normalize_subject_name(subject_name)
+    key = subject_key(subject)
+    result = {"subjectName": subject, "subjectKey": key, "createdCount": 0, "updatedCount": 0, "unchangedCount": 0, "sourceTypes": Counter(), "reviewOnlyCount": 0, "publicSafeCandidateCount": 0, "status": "ok"}
+    if not subject:
+        result["status"] = "missing_subject"
+        result["sourceTypes"] = {}
+        return result
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        ensure_entity_evidence_schema(conn)
+        matched_user_ids: set[Any] = set()
+        aliases: list[str] = []
+
+        def note(status: str | None, source_type: str, review_only: bool, public_candidate: bool) -> None:
+            if not status:
+                return
+            result[f"{status}Count"] += 1
+            result["sourceTypes"][source_type] += 1
+            if review_only:
+                result["reviewOnlyCount"] += 1
+            if public_candidate:
+                result["publicSafeCandidateCount"] += 1
+
+        for row in _fetch_rows(conn, "user_profiles", guild_id, limit):
+            data = dict(row)
+            names = [data.get("display_name"), data.get("preferred_name")]
+            if not any(contains_subject_mention(str(name or ""), subject) or contains_subject_mention(subject, str(name or "")) for name in names if name):
+                continue
+            for name in names:
+                clean = normalize_subject_name(str(name or ""))
+                if clean:
+                    aliases.append(clean)
+            matched_user_ids.add(data.get("user_id"))
+            status = upsert_entity_evidence_event(
+                conn,
+                guild_id=data.get("guild_id", guild_id),
+                subject_name=subject,
+                matched_user_id=data.get("user_id"),
+                source_type="profile",
+                source_table="user_profiles",
+                source_row_id=str(data.get("user_id") or ""),
+                source_label="user_profiles/local_profile_observed",
+                channel_policy="none",
+                visibility="internal_identity_match",
+                authority="local_profile_label",
+                confidence=0.8,
+                relation_to_subject="profile_match",
+                topic="identity matching context",
+                evidence_kind="profile_match",
+                safe_summary="Local profile label matches this subject for internal identity review.",
+                public_safe_candidate=False,
+                review_only=True,
+                dossier_relevance="identity_match_review",
+                raw_ref_json={"table": "user_profiles", "user_id": data.get("user_id"), "display_name": data.get("display_name"), "preferred_name": data.get("preferred_name")},
+                observed_at=data.get("last_seen") or data.get("last_greeting_at"),
+            )
+            note(status, "profile", True, False)
+
+        aliases = list(dict.fromkeys([a for a in aliases if a and a.lower() != subject.lower()]))
+
+        def row_matches(row: sqlite3.Row, fields: list[str]) -> bool:
+            data = dict(row)
+            if data.get("user_id") in matched_user_ids:
+                return True
+            return contains_subject_mention(_row_text(row, fields), subject, aliases=aliases)
+
+        for row in _fetch_rows(conn, "conversations", guild_id, limit):
+            if not row_matches(row, ["user_name", "content", "channel_name", "channel_policy"]):
+                continue
+            data = dict(row)
+            status = derive_entity_evidence_from_conversation_row(conn, row, subject, guild_id=guild_id, matched_user_ids=matched_user_ids, aliases=aliases)
+            policy = str(data.get("channel_policy") or "unknown").strip().lower() or "unknown"
+            note(status, "conversation", policy not in PUBLIC_CONVERSATION_POLICIES, policy in PUBLIC_CONVERSATION_POLICIES)
+
+        for table in ("relationship_state", "relationship_journal"):
+            for row in _fetch_rows(conn, table, guild_id, limit):
+                if not row_matches(row, ["last_topic", "trust_stage", "social_stance", "summary", "entry_type"]):
+                    continue
+                data = dict(row)
+                text = _row_text(row, ["last_topic", "summary", "entry_type"])
+                status = upsert_entity_evidence_event(
+                    conn,
+                    guild_id=data.get("guild_id", guild_id),
+                    subject_name=subject,
+                    matched_user_id=data.get("user_id"),
+                    source_type="relationship_context",
+                    source_table=table,
+                    source_row_id=_source_row_id(data) or str(data.get("user_id") or ""),
+                    source_label=f"{table}/local_relationship_trace",
+                    channel_policy="source_blind_private",
+                    visibility="review_only",
+                    authority="private_relationship_context",
+                    confidence=0.45,
+                    relation_to_subject="relationship_context",
+                    topic=_topic(text),
+                    evidence_kind="relationship_context_review_only",
+                    safe_summary="Relationship/context notes exist but are private review-only.",
+                    public_safe_candidate=False,
+                    review_only=True,
+                    dossier_relevance="review_only_context",
+                    raw_ref_json={"table": table, "row_id": data.get("id"), "user_id": data.get("user_id"), "snippet": text},
+                    observed_at=data.get("updated_at") or data.get("timestamp"),
+                )
+                note(status, "relationship_context", True, False)
+
+        for row in _fetch_rows(conn, "memory_tiers", guild_id, limit):
+            if not row_matches(row, ["summary", "tier"]):
+                continue
+            data = dict(row)
+            text = _row_text(row, ["summary", "tier"])
+            status = upsert_entity_evidence_event(
+                conn,
+                guild_id=data.get("guild_id", guild_id),
+                subject_name=subject,
+                matched_user_id=data.get("user_id"),
+                source_type="source_blind_memory",
+                source_table="memory_tiers",
+                source_row_id=_source_row_id(data),
+                source_label="memory_tiers/source_blind_memory_trace",
+                channel_policy=str(data.get("source_channel_policy") or "source_blind"),
+                visibility="review_only",
+                authority="source_blind_legacy_memory",
+                confidence=0.35,
+                relation_to_subject="source_blind_memory",
+                topic=_topic(text),
+                evidence_kind="source_blind_memory_review_only",
+                safe_summary="Source-blind legacy memory exists and requires review.",
+                public_safe_candidate=False,
+                review_only=True,
+                music_signal=bool(_MUSIC_PATTERN.search(text)),
+                community_signal=bool(_COMMUNITY_PATTERN.search(text)),
+                dossier_relevance="requires_source_review",
+                raw_ref_json={"table": "memory_tiers", "row_id": data.get("id"), "snippet": text},
+                observed_at=data.get("updated_at"),
+            )
+            note(status, "source_blind_memory", True, False)
+
+        for row in _fetch_rows(conn, "broadcast_memory", guild_id, limit):
+            if not row_matches(row, ["cleaned_summary", "summary", "raw_note", "entry_type"]):
+                continue
+            data = dict(row)
+            text = _row_text(row, ["cleaned_summary", "summary", "raw_note", "entry_type"])
+            public_candidate = bool(data.get("public_safe")) and str(data.get("status") or "active") == "active"
+            status = upsert_entity_evidence_event(
+                conn,
+                guild_id=data.get("guild_id", guild_id),
+                subject_name=subject,
+                source_type="broadcast_memory",
+                source_table="broadcast_memory",
+                source_row_id=_source_row_id(data),
+                source_label="broadcast_memory/broadcast_memory_trace",
+                channel_policy="broadcast_memory",
+                visibility="public_safe_candidate" if public_candidate else "review_only",
+                authority="broadcast_memory_public_safe" if public_candidate else "broadcast_memory_review_only",
+                confidence=0.68 if public_candidate else 0.45,
+                relation_to_subject="broadcast_memory_context",
+                topic=_topic(text),
+                evidence_kind="broadcast_memory_signal",
+                safe_summary="Broadcast-memory context may support public wording after owner review." if public_candidate else "Broadcast-memory context exists but is review-only unless active and public-safe.",
+                public_safe_candidate=public_candidate,
+                review_only=not public_candidate,
+                music_signal=bool(_MUSIC_PATTERN.search(text)),
+                community_signal=True,
+                dossier_relevance="candidate_after_owner_review" if public_candidate else "review_only_context",
+                raw_ref_json={"table": "broadcast_memory", "row_id": data.get("id"), "status": data.get("status"), "public_safe": data.get("public_safe"), "snippet": text},
+                observed_at=data.get("episode_date"),
+            )
+            note(status, "broadcast_memory", not public_candidate, public_candidate)
+
+        for row in _fetch_rows(conn, "community_presence", guild_id, limit):
+            if not row_matches(row, ["subject_key", "display_name", "connection_notes", "evidence_snippets"]):
+                continue
+            data = dict(row)
+            text = _row_text(row, ["display_name", "connection_notes", "evidence_snippets"])
+            status = upsert_entity_evidence_event(
+                conn,
+                guild_id=data.get("guild_id", guild_id),
+                subject_name=subject,
+                source_type="community_presence",
+                source_table="community_presence",
+                source_row_id=str(data.get("subject_key") or key),
+                source_label="community_presence/community_presence_trace",
+                channel_policy="community_presence_approved_sources",
+                visibility="review_only",
+                authority="community_presence_trace",
+                confidence=0.62,
+                relation_to_subject="community_presence",
+                topic=_topic(text),
+                evidence_kind="community_presence_signal",
+                safe_summary="Community presence record exists and can inform public wording only after owner review.",
+                public_safe_candidate=False,
+                review_only=True,
+                community_signal=True,
+                dossier_relevance="candidate_after_owner_review",
+                raw_ref_json={"table": "community_presence", "subject_key": data.get("subject_key"), "mention_count": data.get("mention_count"), "direct_interaction_count": data.get("direct_interaction_count"), "snippet": text},
+                observed_at=data.get("last_seen_at"),
+            )
+            note(status, "community_presence", True, False)
+
+        conn.commit()
+    finally:
+        conn.close()
+    result["sourceTypes"] = dict(result["sourceTypes"])
+    return result
+
+
+def get_entity_evidence_for_subject(conn: sqlite3.Connection, subject_name: str, guild_id: int | None = None, limit: int = 200) -> list[sqlite3.Row]:
+    if not table_exists(conn, ENTITY_EVIDENCE_TABLE):
+        return []
+    key = subject_key(normalize_subject_name(subject_name))
+    where = "subject_key=?"
+    params: list[Any] = [key]
+    if guild_id is not None:
+        where += " AND guild_id=?"
+        params.append(guild_id)
+    return list(conn.execute(f"SELECT * FROM {ENTITY_EVIDENCE_TABLE} WHERE {where} ORDER BY updated_at DESC, id DESC LIMIT ?", [*params, max(1, limit)]))
