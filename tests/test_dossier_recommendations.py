@@ -205,7 +205,7 @@ class DossierSourcePacketTests(unittest.TestCase):
             self.assertTrue(any("Local profile match found for Signal Witch" in item for item in payload["knownContext"]))
             self.assertTrue(any("relationship/context" in item for item in payload["relationshipSignals"]))
             self.assertTrue(any("#finished-tracks" in item for item in payload["observedChannels"]))
-            self.assertTrue(any("dossier/source-file" in item for item in payload["conversationHighlights"]))
+            self.assertTrue(any("BNL source-file and dossier" in item for item in payload["conversationHighlights"]))
             self.assertTrue(any("music" in item.lower() for item in payload["musicSignals"]))
             self.assertFalse(any("relationship" in item.lower() for item in payload["publicSafePossibilities"]))
             self.assertIn("queue/submission identity is not connected yet", payload["recommendedAction"])

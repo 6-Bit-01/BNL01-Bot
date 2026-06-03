@@ -58,6 +58,76 @@ _TOPIC_PATTERNS = [
     ("Admin/operator review context", re.compile(r"\b(admin|operator|moderation|mod|staff|review-only|internal|private)\b", re.I)),
 ]
 
+_SLASH_TOPIC_LABEL_REPLACEMENTS = {
+    "bnl/source-file/dossier discussion": "BNL source-file and dossier classification",
+    "bnl/source-file/dossier": "BNL source-file and dossier classification",
+    "music/track-sharing discussion": "music and track-sharing classification",
+    "music/track-sharing": "music and track-sharing classification",
+    "wip/demo discussion": "WIP and demo classification",
+    "wip/demo": "WIP and demo classification",
+    "community/server participation": "community and server participation classification",
+    "community/server": "community and server classification",
+    "event/riddle/engagement activity": "event, riddle, or engagement classification",
+    "event/riddle/engagement": "event, riddle, or engagement classification",
+    "help/support requests": "help and support classification",
+    "help/support": "help and support classification",
+}
+_CLASSIFICATION_SUFFIX_RE = re.compile(r"\s+(?:discussion|activity|requests?|context)\s*$", re.I)
+
+
+def _join_topic_parts_for_payload(parts: list[str]) -> str:
+    cleaned = [part.strip() for part in parts if part and part.strip()]
+    if not cleaned:
+        return "local context"
+    if len(cleaned) == 1:
+        return cleaned[0]
+    if len(cleaned) == 2:
+        return f"{cleaned[0]} and {cleaned[1]}"
+    return f"{', '.join(cleaned[:-1])}, or {cleaned[-1]}"
+
+
+def _website_safe_topic_label(value: Any) -> str:
+    """Convert internal slash taxonomy into website-safe classification wording."""
+
+    raw = re.sub(r"\s+", " ", str(value or "")).strip()
+    if not raw:
+        return "local context classification"
+    lowered = raw.lower()
+    if lowered in _SLASH_TOPIC_LABEL_REPLACEMENTS:
+        return _SLASH_TOPIC_LABEL_REPLACEMENTS[lowered]
+    if "/" not in raw:
+        return raw
+    first, *tail = raw.split(" ")
+    taxonomy = first if "/" in first else raw
+    suffix = " ".join(tail) if taxonomy == first else ""
+    if taxonomy != first:
+        taxonomy = _CLASSIFICATION_SUFFIX_RE.sub("", taxonomy)
+    pieces = taxonomy.split("/")
+    normalized_parts: list[str] = []
+    for piece in pieces:
+        cleaned = re.sub(r"[^A-Za-z0-9 -]+", " ", piece).strip()
+        if cleaned.upper() in {"BNL", "WIP"}:
+            cleaned = cleaned.upper()
+        elif cleaned:
+            cleaned = cleaned[:1].lower() + cleaned[1:]
+        if cleaned:
+            normalized_parts.append(cleaned)
+    suffix = _CLASSIFICATION_SUFFIX_RE.sub("", suffix).strip()
+    if suffix and suffix.lower() == "participation":
+        normalized_parts.append("participation")
+    label = _join_topic_parts_for_payload(normalized_parts)
+    return f"{label} classification"
+
+
+def _website_safe_payload_text(value: Any) -> str:
+    """Sanitize known internal topic taxonomy embedded in normal website fields."""
+
+    text = str(value or "")
+    for raw_label in sorted(_SLASH_TOPIC_LABEL_REPLACEMENTS, key=len, reverse=True):
+        safe_label = _SLASH_TOPIC_LABEL_REPLACEMENTS[raw_label]
+        text = re.sub(re.escape(raw_label), safe_label, text, flags=re.I)
+    return text.replace("/", " and ")
+
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -306,7 +376,7 @@ def build_conversation_safe_summary(*, text: str, authored: bool, public_safe: b
         role = "authored" if authored else "was mentioned in"
         return f"Subject {role} review-only conversation context; private/internal channel details require owner review."
     labels = extract_conversation_topic_details(text, review_only=False)
-    primary = labels[0].replace(" discussion", "").replace("BNL/source-file/dossier", "dossier/source-file")
+    primary = _website_safe_topic_label(labels[0]).removesuffix(" classification")
     if primary == "Help/support requests":
         action = "help/support request"
     elif primary == "Community/server participation":
@@ -340,9 +410,12 @@ def extract_entity_activity_details(row: sqlite3.Row | dict[str, Any]) -> dict[s
 def _representative_evidence_line(detail: dict[str, Any]) -> str:
     if not detail.get("publicSafe"):
         return "Review-only evidence exists; private/internal details require owner review."
-    relation = "authored" if detail.get("relation") == "authored" else "mentioned"
-    topic = str(detail.get("topic") or "community/server participation").replace(" discussion", "").lower()
-    return f"{detail.get('channel')}: {relation} {topic} discussion."
+    channel = _website_safe_payload_text(detail.get("channel") or "approved public-side channel")
+    topic = _website_safe_topic_label(detail.get("topic") or "Community/server participation")
+    topic_context = topic.removesuffix(" classification")
+    if topic_context.lower().startswith("bnl source-file and dossier"):
+        return f"{channel}: BNL classified this approved public-context item under {topic_context} context; review before treating it as a subject claim."
+    return f"{channel}: approved public-context item classified under {topic_context}; review before using as a subject claim."
 
 
 def group_entity_evidence_details(rows: list[sqlite3.Row | dict[str, Any]]) -> dict[str, Any]:
@@ -368,11 +441,12 @@ def group_entity_evidence_details(rows: list[sqlite3.Row | dict[str, Any]]) -> d
         relations = topic_relation_counts.get(topic, Counter())
         rel_bits = []
         if relations.get("authored"):
-            rel_bits.append(f"{relations['authored']} public-side authored row(s)")
+            rel_bits.append(f"{relations['authored']} public-side authored item(s)")
         mentioned = count - relations.get("authored", 0)
         if mentioned:
-            rel_bits.append(f"{mentioned} public-side mentioned row(s)")
-        line = f"{topic}: {', '.join(rel_bits) or f'{count} public-side row(s)'}"
+            rel_bits.append(f"{mentioned} public-side mentioned item(s)")
+        safe_topic = _website_safe_topic_label(topic)
+        line = f"{safe_topic}: {', '.join(rel_bits) or f'{count} public-side item(s)'}"
         channel, channel_count = (topic_channel_counts.get(topic, Counter()).most_common(1) or [("", 0)])[0]
         if channel.startswith("#") and channel_count >= max(1, count // 2):
             line += f", mostly in {channel}"
@@ -397,10 +471,10 @@ def group_entity_evidence_details(rows: list[sqlite3.Row | dict[str, Any]]) -> d
             "reviewOnlyEvidenceCount": review_only_count,
             "mostRecentObservedAt": most_recent,
         },
-        "authoredVsMentionedSummary": f"{authored_count} approved public-side authored row(s); {mentioned_count} approved public-side mentioned row(s).",
+        "authoredVsMentionedSummary": f"{authored_count} approved public-side authored item(s); {mentioned_count} approved public-side mentioned item(s).",
         "recentActivitySummary": f"Most recent observed evidence timestamp: {most_recent}." if most_recent else "No observed timestamp available in structured evidence.",
         "topChannels": [{"channel": channel, "count": count} for channel, count in channel_counts.most_common(5)],
-        "topTopicDetails": [{"topic": topic, "count": count} for topic, count in topic_counts.most_common(8)],
+        "topTopicDetails": [{"topic": _website_safe_topic_label(topic), "count": count} for topic, count in topic_counts.most_common(8)],
         "topicBreakdown": topic_breakdown,
         "representativeEvidence": representative[:6],
     }

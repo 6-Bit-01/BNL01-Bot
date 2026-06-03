@@ -579,7 +579,7 @@ class SourceFileEnrichmentTests(unittest.TestCase):
         self.assertTrue(any(item.get("source") == "conversations" for item in payload["sourceCoverage"] if isinstance(item, dict)))
         self.assertEqual(payload["queueSubmissionStatus"], "not_connected")
         self.assertEqual(payload["queueSubmissionNote"], enrich.QUEUE_NOT_CONNECTED_NOTE)
-        self.assertTrue(any("pending owner/admin review" in item for item in payload["publicUseCandidates"]))
+        self.assertTrue(any("pending owner and admin review" in item for item in payload["publicUseCandidates"]))
         self.assertTrue(any("Review-only planning context" in item for item in payload["reviewOnlyEvidence"]))
         public_normal_text = json.dumps({key: payload.get(key) for key in ("observedChannels", "conversationHighlights", "representativeEvidence", "evidenceDetails", "bestEvidenceToReview", "publicUseCandidates")})
         self.assertNotIn("Review-only planning context", public_normal_text)
@@ -622,12 +622,59 @@ class SourceFileEnrichmentTests(unittest.TestCase):
             "rawProvenance": {"rawFragments": [{"rawRefJson": "raw transcript"}]},
         }
         payload = enrich.build_enrichment_recommendation_payload(packet, environ={})
-        for key in ("observedChannels", "conversationHighlights", "representativeEvidence", "topicBreakdown", "topChannels", "topTopicDetails", "activityFrequencySummary", "recentActivitySummary", "authoredVsMentionedSummary", "bestEvidenceToReview", "bnlInteractionSignals", "musicSignals", "communitySignals", "sourceCoverage", "evidenceDetails", "publicUseCandidates", "reviewOnlyEvidence", "queueSubmissionStatus", "queueSubmissionNote"):
+        passthrough_keys = ("observedChannels", "conversationHighlights", "topChannels", "activityFrequencySummary", "recentActivitySummary", "authoredVsMentionedSummary", "bnlInteractionSignals", "communitySignals", "sourceCoverage", "evidenceDetails", "reviewOnlyEvidence", "queueSubmissionStatus", "queueSubmissionNote")
+        for key in passthrough_keys:
             self.assertEqual(payload[key], packet[key])
+        self.assertEqual(payload["topicBreakdown"], ["music and track-sharing classification: 1 public-side authored item(s), mostly in #finished-tracks."])
+        self.assertEqual(payload["representativeEvidence"], ["#finished-tracks: approved public-context item classified under music and track-sharing; review before using as a subject claim."])
+        self.assertEqual(payload["topTopicDetails"], [{"topic": "music and track-sharing classification", "count": 1}])
+        self.assertEqual(payload["bestEvidenceToReview"], ["discord: authored public conversation classification — Sanitized highlight."])
+        self.assertEqual(payload["musicSignals"], ["Music and radio and show context exists; queue identity still needs review."])
+        self.assertEqual(payload["publicUseCandidates"], ["Possible community and source-file candidate, pending owner and admin review."])
         self.assertEqual(payload["rawProvenance"], packet["rawProvenance"])
         normal = dict(payload)
         normal.pop("rawProvenance")
         self.assertNotIn("raw transcript", json.dumps(normal))
+
+    def test_representative_evidence_payload_validation_catches_raw_metadata(self):
+        issues = enrich.validate_enrichment_payload_for_site({
+            "evidenceSummary": "summary",
+            "rawProvenance": {},
+            "representativeEvidence": [
+                "#barcode-bot: authored_public_conversation row id=123456789012345678 BNL/source-file/dossier [object Object] profile_match"
+            ],
+        })
+        self.assertTrue(any("representativeEvidence contains" in issue for issue in issues))
+
+    def test_representative_evidence_and_topic_fields_are_sanitized_before_send(self):
+        packet = {
+            "subject": "Crow",
+            "matchKind": "active_source_file",
+            "sourceFile": {"id": "sf_1", "name": "Crow"},
+            "sections": {"Public-Safe Notes": ["No public copy yet."], "Do Not Say": ["Do not publish raw notes."], "Missing Info": ["public links"], "Suggested Next Action": ["owner review"]},
+            "topicBreakdown": ["BNL/source-file/dossier discussion: 1 public-side authored row(s), mostly in #barcode-bot."],
+            "representativeEvidence": ["#barcode-bot: authored bnl/source-file/dossier discussion."],
+            "topTopicDetails": [{"topic": "Event/riddle/engagement activity", "count": 2}],
+            "queueSubmissionStatus": "not_connected",
+            "queueSubmissionNote": enrich.QUEUE_NOT_CONNECTED_NOTE,
+            "rawProvenance": {"sourceLabels": ["entity_evidence_events/structured"], "rawFragments": [{"rawRefJson": "raw BNL/source-file/dossier transcript", "sourceRowId": "99"}]},
+        }
+        payload = enrich.build_enrichment_recommendation_payload(packet, environ={})
+        normal = dict(payload)
+        raw = normal.pop("rawProvenance")
+        normal_text = json.dumps(normal)
+        rep_text = json.dumps(payload["representativeEvidence"])
+        self.assertNotIn("/", rep_text)
+        self.assertNotIn("authored", rep_text.lower())
+        self.assertIn("BNL classified this approved public-context item", rep_text)
+        self.assertIn("BNL source-file and dossier classification", json.dumps(payload["topicBreakdown"]))
+        self.assertIn("event, riddle, or engagement classification", json.dumps(payload["topTopicDetails"]))
+        self.assertNotIn("BNL/source-file/dossier", normal_text)
+        self.assertNotIn("row(s)", normal_text)
+        self.assertNotIn("sourceRowId", normal_text)
+        self.assertIn("rawFragments", raw)
+        self.assertEqual(payload["queueSubmissionStatus"], "not_connected")
+        self.assertNotIn("siteValidationIssues", payload)
 
     def test_enrichment_payload_is_compacted_to_site_limits(self):
         long_item = "approved evidence " + ("x" * 3000) + " 123456789012345678"
