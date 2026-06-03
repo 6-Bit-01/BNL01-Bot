@@ -500,6 +500,92 @@ def sanitize_website_status_message(message: str, limit: int = 240, min_chars: i
 
 
 
+DISCORD_SAFE_REPLY_FALLBACK = (
+    "Command completed, but the response was too long to display safely. "
+    "Check logs or rerun with a narrower subject."
+)
+
+
+def _discord_safe_cut_position(text: str, limit: int) -> int:
+    """Return the highest-priority safe split offset no later than ``limit``."""
+    window = text[: limit + 1]
+
+    boundary_groups: list[list[int]] = []
+    boundary_groups.append([match.end() for match in re.finditer(r"\n[ \t]*\n+", window)])
+
+    # Prefer splitting before visible section headers and bullet/list items when possible.
+    line_boundary_re = re.compile(
+        r"(?m)^(?=(?:#{1,6}\s+|[A-Z][A-Za-z0-9 /&()'’.-]{0,80}:\s*$|[-*•]\s+|\d+[.)]\s+))"
+    )
+    boundary_groups.append([match.start() for match in line_boundary_re.finditer(window) if match.start() > 0])
+
+    # Then fall back to ordinary line, sentence, and word boundaries.
+    boundary_groups.append([match.end() for match in re.finditer(r"\n+", window)])
+    boundary_groups.append([match.end() for match in re.finditer(r"(?<=[.!?])\s+", window)])
+    boundary_groups.append([match.end() for match in re.finditer(r"\s+", window)])
+
+    for positions in boundary_groups:
+        usable = [position for position in positions if 0 < position <= limit]
+        if usable:
+            return max(usable)
+    return limit
+
+
+def discord_safe_chunks(text: str, limit: int = 1900) -> list[str]:
+    """Split Discord output into non-empty chunks that stay under Discord's message cap.
+
+    The helper intentionally uses a default below Discord's 2000-character hard cap so command
+    replies have room for Discord/client-side bookkeeping while preserving operator summaries.
+    """
+    safe_limit = max(1, min(int(limit or 1900), 1900))
+    remaining = str(text or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+    chunks: list[str] = []
+
+    while remaining:
+        if len(remaining) <= safe_limit:
+            chunk = remaining.strip()
+            if chunk:
+                chunks.append(chunk)
+            break
+
+        cut_at = _discord_safe_cut_position(remaining, safe_limit)
+        chunk = remaining[:cut_at].strip()
+        if not chunk:
+            chunk = remaining[:safe_limit].strip()
+            cut_at = safe_limit
+        if chunk:
+            chunks.append(chunk)
+        remaining = remaining[cut_at:].strip()
+
+    return chunks
+
+
+async def reply_with_discord_safe_chunks(message: discord.Message, text: str, limit: int = 1900) -> None:
+    """Reply to a Discord message using safe chunks and a short fallback on send failure."""
+    chunks = discord_safe_chunks(text, limit=limit)
+    if not chunks:
+        chunks = [DISCORD_SAFE_REPLY_FALLBACK]
+
+    try:
+        await message.reply(chunks[0])
+        for chunk in chunks[1:]:
+            await message.channel.send(chunk)
+    except Exception as exc:  # noqa: BLE001 - Discord send failures must not escape on_message.
+        logging.warning(
+            "discord_safe_reply_failed chunk_count=%s max_chunk_length=%s error_type=%s",
+            len(chunks),
+            max((len(chunk) for chunk in chunks), default=0),
+            type(exc).__name__,
+        )
+        try:
+            await message.reply(DISCORD_SAFE_REPLY_FALLBACK)
+        except Exception as fallback_exc:  # noqa: BLE001 - best-effort operator notification only.
+            logging.warning(
+                "discord_safe_reply_fallback_failed error_type=%s",
+                type(fallback_exc).__name__,
+            )
+
+
 
 def build_admin_note(mode: str, message: str, current_directive: str = "", source: str = "relay", compact: bool = False) -> str:
     """Build a compact admin-only operator note for website relay payloads."""
@@ -4533,7 +4619,7 @@ async def maybe_handle_entity_activity_summary_command(message: discord.Message,
             f"- public-safe candidates touched: `{int(refresh_result.get('publicSafeCandidateCount') or 0)}`\n\n"
             f"{response}"
         )
-    await message.reply(response)
+    await reply_with_discord_safe_chunks(message, response)
     return True
 
 
@@ -4591,7 +4677,7 @@ async def maybe_handle_source_knowledge_bridge_command(message: discord.Message,
         "source_knowledge_bridge_dry_run" if result.get("dryRun")
         else f"source_knowledge_bridge_sent:{_last_source_knowledge_bridge_sent_count}:duplicates:{_last_source_knowledge_bridge_duplicate_count}:withheld:{_last_source_knowledge_bridge_withheld_count}:failed:{_last_source_knowledge_bridge_failed_count}"
     )
-    await message.reply(format_source_knowledge_bridge_response(result))
+    await reply_with_discord_safe_chunks(message, format_source_knowledge_bridge_response(result))
     return True
 
 
@@ -4679,7 +4765,7 @@ async def maybe_handle_dossier_discovery_command(message: discord.Message, clean
         sendable_suffix = f" Sendable: {', '.join(names)}." if names else ""
         main_suffix = f" Main withheld reason: {_humanize_discovery_reason(top_reason)}." if withheld and top_reason != "none" else ""
         lanes_suffix = f" Lanes: {', '.join(lanes)}."
-        await message.reply(f"Dry run: {sendable_count} sendable, {withheld} withheld.{sendable_suffix}{main_suffix}{lanes_suffix}")
+        await reply_with_discord_safe_chunks(message, f"Dry run: {sendable_count} sendable, {withheld} withheld.{sendable_suffix}{main_suffix}{lanes_suffix}")
         return True
 
     sent_count = 0
@@ -4723,7 +4809,7 @@ async def maybe_handle_dossier_discovery_command(message: discord.Message, clean
             f"{send_duplicates} duplicates skipped, {withheld} withheld, {failed_count} failed."
         )
     lanes_suffix = f" Lanes: {', '.join(lanes)}."
-    await message.reply(f"{summary}{reason_suffix}{failure_suffix}{lanes_suffix}")
+    await reply_with_discord_safe_chunks(message, f"{summary}{reason_suffix}{failure_suffix}{lanes_suffix}")
     return True
 
 
@@ -4812,7 +4898,7 @@ async def maybe_handle_source_file_enrichment_command(message: discord.Message, 
         _last_dossier_recommendation_status = "source_enrichment_sent"
     else:
         _last_dossier_recommendation_status = f"source_enrichment_{_source_enrichment_last_status}"
-    await message.reply(format_source_enrichment_response(result))
+    await reply_with_discord_safe_chunks(message, format_source_enrichment_response(result))
     return True
 
 
@@ -4842,7 +4928,7 @@ async def maybe_handle_source_file_lookup_command(message: discord.Message, clea
 
     result = await asyncio.to_thread(lookup_source_file, query)
     response = format_source_file_lookup_response(result, query.get("lookupValue", ""))
-    await message.reply(response)
+    await reply_with_discord_safe_chunks(message, response)
     return True
 
 
