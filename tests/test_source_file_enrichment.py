@@ -414,6 +414,20 @@ class SourceFileEnrichmentTests(unittest.TestCase):
         self.assertIn("Top domains/tools:", formatted)
         self.assertIn("suno.com", formatted)
         self.assertIn("Public-safe vs review-only intelligence rows:", formatted)
+        payload = result["payload"]
+        payload_text = json.dumps({
+            key: payload.get(key)
+            for key in ("knownContext", "usefulEvidence", "topicBreakdown", "conversationHighlights", "bestEvidenceToReview", "publicUseCandidates", "bnlInteractionSignals", "musicSignals", "evidenceDetails")
+        })
+        self.assertIn("Recurring named topic: Orion appears in reviewed evidence connected to Crow", payload_text)
+        self.assertTrue(any("Recurring named topic: Orion" in item for item in payload["topicBreakdown"][:8]))
+        self.assertTrue(any("Recurring named topic: Orion" in item for item in payload["conversationHighlights"][:6]))
+        self.assertTrue(any("Recurring named topic: Orion" in item for item in payload["bestEvidenceToReview"][:6]))
+        self.assertIn("Recurring conversation pattern: messages are repeatedly framed as", payload_text)
+        self.assertIn("BNL interaction pattern: Crow has repeated reviewed exchanges involving BNL", payload_text)
+        self.assertIn("Tool/platform mention: Suno appears in reviewed evidence connected to Crow", payload_text)
+        self.assertEqual(payload["queueSubmissionStatus"], "not_connected")
+        self.assertNotRegex(payload_text, r"submitted\s+\d+|play count|source type:|Priority|payment|rawRefJson|sourceRowId|research-and-development")
         self.assertLessEqual(len(formatted), 1900)
 
     def test_dry_run_preview_has_useful_bullets_without_raw_ids(self):
@@ -631,7 +645,7 @@ class SourceFileEnrichmentTests(unittest.TestCase):
 
         self.assertIn("Recurring named topic", json.dumps(payload["topicBreakdown"] + payload["evidenceDetails"] + payload["bestEvidenceToReview"]))
         self.assertIn("Orion", normal_text)
-        self.assertIn("Tool and platform mention: Suno", normal_text)
+        self.assertIn("Tool/platform mention: Suno", normal_text)
         self.assertIn("BNL interaction pattern", json.dumps(payload["bnlInteractionSignals"] + payload["conversationHighlights"]))
         self.assertEqual(payload["queueSubmissionStatus"], "not_connected")
         self.assertIn(enrich.QUEUE_NOT_CONNECTED_NOTE, payload["queueSubmissionNote"])

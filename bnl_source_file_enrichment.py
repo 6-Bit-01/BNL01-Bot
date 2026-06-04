@@ -1203,6 +1203,7 @@ def _bounded_entity_summary_fields(summary: dict[str, Any], *, include: bool) ->
 def _copy_evidence_fields(target: dict[str, Any], source: dict[str, Any]) -> None:
     for key in (
         "knownContext",
+        "usefulEvidence",
         "relationshipSignals",
         "publicSafePossibilities",
         "privateOnlyNotes",
@@ -1604,6 +1605,7 @@ def collect_source_enrichment_evidence(db_path: str, guild_id: int | None, subje
         "diagnostics": diagnostics,
         "classification": classification,
         "knownContext": list(entity_summary.get("knownContext") or [])[:6] if raw_provenance else [],
+        "usefulEvidence": list(entity_summary.get("usefulEvidence") or [])[:6] if raw_provenance else [],
         "relationshipSignals": list(entity_summary.get("relationshipSignals") or [])[:4] if raw_provenance else [],
         "publicSafePossibilities": list(entity_summary.get("publicSafePossibilities") or [])[:4] if raw_provenance else [],
         "privateOnlyNotes": list(entity_summary.get("privateOnlyNotes") or [])[:6] if raw_provenance else [],
@@ -2104,11 +2106,18 @@ def _validate_source_coverage_for_site(source_coverage: Any) -> list[str]:
 
 
 def _readout_text_validation_issue(field_name: str, text: str) -> str | None:
+    validation_text = (
+        (text or "")
+        .replace("Tool/platform", "Tool platform")
+        .replace("tool/platform", "tool platform")
+        .replace("Queue/submission", "Queue submission")
+        .replace("queue/submission", "queue submission")
+    )
     if len(text) > 1000:
         return f"{field_name} contains an oversized item"
     if "[object Object]" in text:
         return f"{field_name} contains [object Object]"
-    if "/" in text:
+    if "/" in validation_text:
         return f"{field_name} contains slash taxonomy or raw path text"
     if _LONG_ID_RE.search(text):
         return f"{field_name} contains raw IDs"
@@ -2118,7 +2127,7 @@ def _readout_text_validation_issue(field_name: str, text: str) -> str | None:
         return f"{field_name} contains raw source labels"
     if _SOURCE_TABLE_NAME_RE.search(text):
         return f"{field_name} contains source table names"
-    if _PATH_LOOKING_RE.search(text):
+    if _PATH_LOOKING_RE.search(validation_text):
         return f"{field_name} contains raw path-looking strings"
     return None
 

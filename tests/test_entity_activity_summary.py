@@ -434,14 +434,36 @@ class EntityActivitySummaryBuilderTests(unittest.TestCase):
         summary = self._summary()
         normal_text = json.dumps({k: v for k, v in summary.items() if k != "rawProvenance"})
 
-        self.assertIn("Recurring subject: Orion appears repeatedly", normal_text)
-        self.assertIn("Recurring pattern", normal_text)
+        self.assertIn("Recurring named topic: Orion appears in reviewed evidence connected to Crow", normal_text)
+        for key in ("topicBreakdown", "conversationHighlights", "bestEvidenceToReview"):
+            self.assertTrue(any("Recurring named topic: Orion" in item for item in summary[key]), key)
+        self.assertTrue(any("Recurring named topic: Orion" in item for item in summary["knownContext"] + summary["usefulEvidence"]))
+        self.assertIn("Recurring conversation pattern", normal_text)
         self.assertIn("Orion through Crow", normal_text)
         self.assertIn("BNL interaction pattern", normal_text)
-        self.assertIn("Suno links appear in reviewed evidence connected to this subject", normal_text)
+        self.assertIn("Tool/platform mention: Suno appears in reviewed evidence connected to Crow", normal_text)
         self.assertIn("Queue/submission history is not connected yet", normal_text)
         self.assertEqual(summary["queueSubmissionStatus"], "not_connected")
         self.assertGreaterEqual(summary["subjectIntelligenceDiagnostics"]["rowsScanned"], 2)
+
+
+    def test_subject_intelligence_priority_survives_generic_field_caps(self):
+        self.conn.execute("INSERT INTO user_profiles VALUES (42,1,'Crow','Crow',NULL,NULL)")
+        for idx in range(12):
+            self.conn.execute("INSERT INTO conversations VALUES (NULL,42,'Crow',1,'general','public_home','user',?, ?)", (
+                f"Crow generic source-file and BARCODE context filler {idx} before the recurring intelligence.",
+                f"2026-05-{idx + 1:02d}",
+            ))
+        self.conn.execute("INSERT INTO conversations VALUES (NULL,42,'Crow',1,'general','public_home','user','Orion through Crow asks BNL about Suno links: https://suno.com/song/cap-a', '2026-06-01')")
+        self.conn.execute("INSERT INTO conversations VALUES (NULL,42,'Crow',1,'general','public_home','user','Orion through Crow repeats BNL Suno link context: https://suno.com/song/cap-b', '2026-06-02')")
+        self.conn.commit()
+
+        summary = self._summary()
+
+        self.assertTrue(any("Recurring named topic: Orion" in item for item in summary["conversationHighlights"][:6]))
+        self.assertTrue(any("Recurring named topic: Orion" in item for item in summary["topicBreakdown"][:8]))
+        self.assertTrue(any("Recurring named topic: Orion" in item for item in summary["bestEvidenceToReview"][:6]))
+        self.assertTrue(any("Tool/platform mention: Suno" in item for item in summary["musicSignals"][:5]))
 
     def test_raw_ref_json_conversation_pointer_rehydrates_full_row_for_intelligence(self):
         self.conn.execute("INSERT INTO user_profiles VALUES (42,1,'Crow','Crow',NULL,NULL)")
@@ -482,8 +504,8 @@ class EntityActivitySummaryBuilderTests(unittest.TestCase):
         normal_text = json.dumps({k: v for k, v in summary.items() if k != "rawProvenance"})
 
         self.assertIn("Atlas Bloom", normal_text)
-        self.assertIn("Recurring subject", normal_text)
-        self.assertNotIn("Orion appears repeatedly", normal_text)
+        self.assertIn("Recurring named topic: Atlas Bloom appears in reviewed evidence connected to Mira", normal_text)
+        self.assertNotIn("Orion appears", normal_text)
 
     def test_review_only_and_mixed_subject_intelligence_split(self):
         self.conn.execute("INSERT INTO user_profiles VALUES (42,1,'Crow','Crow',NULL,NULL)")
@@ -494,7 +516,7 @@ class EntityActivitySummaryBuilderTests(unittest.TestCase):
         review_only_summary = self._summary()
         public_text = json.dumps({key: review_only_summary.get(key) for key in ("conversationHighlights", "topicBreakdown", "bestEvidenceToReview", "publicUseCandidates")})
         review_text = json.dumps(review_only_summary["reviewOnlyEvidence"])
-        self.assertNotIn("Recurring subject: Vega Signal", public_text)
+        self.assertNotIn("Recurring named topic: Vega Signal", public_text)
         self.assertIn("Review-only recurring subject: Vega Signal", review_text)
 
         self.conn.execute("INSERT INTO conversations VALUES (NULL,42,'Crow',1,'general','public_home','user','Crow public note repeats Vega Signal through Crow with BNL interaction.', '2026-06-03')")
@@ -503,7 +525,7 @@ class EntityActivitySummaryBuilderTests(unittest.TestCase):
 
         mixed_summary = self._summary()
         mixed_text = json.dumps({k: v for k, v in mixed_summary.items() if k != "rawProvenance"})
-        self.assertIn("Recurring subject: Vega Signal appears repeatedly", mixed_text)
+        self.assertIn("Recurring named topic: Vega Signal appears in reviewed evidence connected to Crow", mixed_text)
         self.assertIn("Additional review-only context also exists", mixed_text)
 
     def test_normal_payload_fields_do_not_expose_full_transcripts_private_names_or_internal_provenance(self):

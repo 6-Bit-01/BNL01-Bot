@@ -93,6 +93,12 @@ _SUBJECT_INTELLIGENCE_STOPWORDS = {
     "activity", "signal", "history", "this", "subject", "channel", "conversation", "dossier", "file",
     "approved", "internal", "candidate", "notes", "known", "facts", "relationship", "memory", "recent",
 }
+_SUBJECT_INTELLIGENCE_PRIORITY_PREFIXES = (
+    "Recurring named topic:",
+    "Recurring conversation pattern:",
+    "BNL interaction pattern:",
+    "Tool/platform mention:",
+)
 _RECURRING_PHRASE_STOPWORDS = _SUBJECT_INTELLIGENCE_STOPWORDS | {"appears", "mentioned", "connected", "review", "before", "after", "with", "from", "about"}
 _DOMAIN_PATTERN = re.compile(r"(?:https?://)?(?:www\.)?([a-z0-9][a-z0-9-]*(?:\.[a-z0-9][a-z0-9-]*)+)(?:/[^\s<>()\[\]{}]*)?", re.I)
 _CODE_MARKER_PATTERN = re.compile(r"\b(?:0x[A-Fa-f0-9]{2,}|[A-Z][A-Z0-9]{2,}(?:-[A-Z0-9]+)*)\b")
@@ -271,6 +277,10 @@ def _clean_intelligence_label(label: str, subject: str = "") -> str:
         return ""
     if lowered in _SUBJECT_INTELLIGENCE_STOPWORDS or (len(words) == 1 and words[0] in _SUBJECT_INTELLIGENCE_STOPWORDS):
         return ""
+    if words and all(word in _SUBJECT_INTELLIGENCE_STOPWORDS for word in words):
+        return ""
+    if words and words[0] in _SUBJECT_INTELLIGENCE_STOPWORDS:
+        return ""
     if lowered == "bnl":
         return ""
     return label
@@ -365,10 +375,6 @@ def extract_recurring_subject_intelligence(rows: list[dict[str, Any]], subject: 
             target_subjects[label] += 1
         for domain in _extract_domains(text):
             target_domains[domain] += 1
-            name = domain.split(".")[0]
-            clean = _clean_intelligence_label(name.capitalize(), subject)
-            if clean:
-                target_subjects[clean] += 1
         for match in _THROUGH_PATTERN.finditer(text):
             left = _clean_intelligence_label(match.group(1), subject)
             right = _clean_intelligence_label(match.group(2), subject) or normalize_subject_name(subject)
@@ -406,7 +412,44 @@ def _domain_tool_label(domain: str) -> str:
     return known.get(base, base)
 
 
-def _append_subject_intelligence_readouts(summary: dict[str, Any], intelligence: dict[str, Any]) -> None:
+def _prepend_unique(target: list[str], value: str) -> None:
+    clean = re.sub(r"\s+", " ", str(value or "")).strip()
+    if not clean:
+        return
+    try:
+        target.remove(clean)
+    except ValueError:
+        pass
+    target.insert(0, clean)
+
+
+def _add_priority_unique(summary: dict[str, Any], key: str, value: str) -> None:
+    target = summary.setdefault(key, [])
+    if isinstance(target, list):
+        _prepend_unique(target, value)
+
+
+def _subject_intelligence_priority_rank(value: Any) -> int:
+    text = str(value or "")
+    for index, prefix in enumerate(_SUBJECT_INTELLIGENCE_PRIORITY_PREFIXES):
+        if text.startswith(prefix):
+            return index
+    return len(_SUBJECT_INTELLIGENCE_PRIORITY_PREFIXES)
+
+
+def _compact_subject_intelligence_priorities(summary: dict[str, Any]) -> None:
+    for key, value in list(summary.items()):
+        if not isinstance(value, list):
+            continue
+        priority = [item for item in value if _subject_intelligence_priority_rank(item) < len(_SUBJECT_INTELLIGENCE_PRIORITY_PREFIXES)]
+        if not priority:
+            continue
+        rest = [item for item in value if item not in priority]
+        priority.sort(key=_subject_intelligence_priority_rank)
+        summary[key] = priority + rest
+
+
+def _promote_subject_intelligence_readouts(summary: dict[str, Any], intelligence: dict[str, Any]) -> None:
     subject = summary.get("subjectName") or "this subject"
     public_subjects: Counter = intelligence.get("publicSubjects") or Counter()
     review_subjects: Counter = intelligence.get("reviewOnlySubjects") or Counter()
@@ -416,45 +459,50 @@ def _append_subject_intelligence_readouts(summary: dict[str, Any], intelligence:
     review_domains: Counter = intelligence.get("reviewOnlyDomains") or Counter()
     public_phrases: Counter = intelligence.get("publicPhrases") or Counter()
 
-    for label, count in public_subjects.most_common(5):
-        if count < 2:
+    for label, count in reversed(public_subjects.most_common(5)):
+        if count < 2 or not re.search(r"[A-Za-z]", str(label or "")):
             continue
         caution = " Additional review-only context also exists." if review_subjects.get(label) else ""
-        line = f"Recurring subject: {label} appears repeatedly in evidence connected to {subject}. Review before public use.{caution}"
-        _add_unique(summary["topicBreakdown"], line)
-        _add_unique(summary["conversationHighlights"], line)
-        _add_unique(summary["bestEvidenceToReview"], f"Recurring subject — {label}: review selected public-context evidence before using this in Source File copy.")
-        _add_unique(summary["publicUseCandidates"], f"Recurring subject {label} may inform public-safe wording only after owner/admin review.")
+        normalized_line = f"Recurring named topic: {label} appears in reviewed evidence connected to {subject}. Review before public use.{caution}"
+        review_line = f"Recurring named topic: {label}. Review selected evidence before using this publicly."
+        candidate_line = f"Recurring named topic: {label} may inform public-safe wording only after owner/admin review."
+        for key in ("knownContext", "usefulEvidence", "topicBreakdown", "conversationHighlights", "publicUseCandidates"):
+            _add_priority_unique(summary, key, normalized_line if key != "publicUseCandidates" else candidate_line)
+        _add_priority_unique(summary, "bestEvidenceToReview", review_line)
     for label, count in review_subjects.most_common(5):
         if count >= 1 and label not in public_subjects:
             _add_unique(summary["reviewOnlyEvidence"], f"Review-only recurring subject: {label} appears in internal context connected to {subject}. Do not use publicly without owner/admin review.")
 
     if public_phrases:
         for phrase, count in public_phrases.most_common(3):
+            phrase_text = _safe_snippet(phrase, 80)
             if count >= 2 and (" through " in phrase.lower() or " via " in phrase.lower()):
-                _add_unique(summary["conversationHighlights"], f"Recurring pattern: messages are repeatedly framed as “{_safe_snippet(phrase, 80)}.”")
-                _add_unique(summary["bnlInteractionSignals"], f"BNL interaction pattern: reviewed public-context exchanges include repeated “{_safe_snippet(phrase, 80)}” framing.")
+                line = f"Recurring conversation pattern: messages are repeatedly framed as “{phrase_text}.” Review before public use."
+                for key in ("conversationHighlights", "bnlInteractionSignals", "evidenceDetails"):
+                    _add_priority_unique(summary, key, line)
                 break
 
     theme_labels = [theme for theme, count in public_themes.most_common(8) if count >= 2]
     if theme_labels:
         _add_unique(summary["topicBreakdown"], "Recurring discussion themes: " + ", ".join(theme_labels[:6]) + ".")
         if "BNL interaction" in theme_labels:
-            _add_unique(summary["bnlInteractionSignals"], f"BNL interaction pattern: {subject} has repeated reviewed exchanges involving " + ", ".join(t for t in theme_labels if t != "BNL interaction")[:180] + ".")
+            line = f"BNL interaction pattern: {subject} has repeated reviewed exchanges involving BNL. Review before public use."
+            for key in ("bnlInteractionSignals", "conversationHighlights", "evidenceDetails"):
+                _add_priority_unique(summary, key, line)
     for theme, count in review_themes.most_common(5):
         if count >= 1 and theme not in public_themes:
             _add_unique(summary["reviewOnlyEvidence"], f"Review-only recurring theme: {theme} appears in internal context; do not use publicly without owner/admin review.")
 
-    for domain, count in public_domains.most_common(6):
+    for domain, count in reversed(public_domains.most_common(6)):
         if count < 1:
             continue
         tool = _domain_tool_label(domain)
         if tool == "Suno":
-            line = "Tool/link signal: Suno links appear in reviewed evidence connected to this subject. Confirm through queue/submission data before claiming submitted songs or source type."
+            line = f"Tool/platform mention: Suno appears in reviewed evidence connected to {subject}. Confirm through queue/submission data before claiming submitted songs or source type."
         else:
-            line = f"Tool/link signal: {tool} links or domains appear in reviewed evidence connected to this subject; confirm source type before public use."
-        _add_unique(summary["musicSignals"], line)
-        _add_unique(summary["topicBreakdown"], line)
+            line = f"Tool/platform mention: {tool} appears in reviewed evidence connected to {subject}. Confirm platform context before public use."
+        for key in ("musicSignals", "usefulEvidence", "topicBreakdown", "evidenceDetails"):
+            _add_priority_unique(summary, key, line)
     for domain, count in review_domains.most_common(6):
         tool = _domain_tool_label(domain)
         if domain not in public_domains:
@@ -469,6 +517,7 @@ def _append_subject_intelligence_readouts(summary: dict[str, Any], intelligence:
         "publicSafeRows": int(intelligence.get("publicRows") or 0),
         "reviewOnlyRows": int(intelligence.get("reviewOnlyRows") or 0),
     }
+
 
 def _clean_fact_text(text: Any) -> str:
     return _safe_snippet(text, 500)
@@ -933,6 +982,7 @@ def build_entity_activity_summary(
         "matchedNames": [],
         "identityConfidence": "none",
         "knownContext": [],
+        "usefulEvidence": [],
         "activitySignals": [],
         "observedChannels": [],
         "channelActivity": [],
@@ -1067,7 +1117,7 @@ def build_entity_activity_summary(
         )
         if intelligence_rows:
             intelligence = extract_recurring_subject_intelligence(intelligence_rows, subject)
-            _append_subject_intelligence_readouts(summary, intelligence)
+            _promote_subject_intelligence_readouts(summary, intelligence)
 
         def row_matches(row: sqlite3.Row, fields: list[str]) -> bool:
             data = dict(row)
@@ -1323,6 +1373,8 @@ def build_entity_activity_summary(
         "Public-safe claims require public/broadcast source policy plus owner review.",
         "Relationship, internal, sealed, unknown, and source-blind lanes are review-only.",
     ]
+
+    _compact_subject_intelligence_priorities(summary)
 
     raw = summary["rawProvenance"]
     summary["sourceCoverage"] = [
