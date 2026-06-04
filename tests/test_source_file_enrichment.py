@@ -416,7 +416,7 @@ class SourceFileEnrichmentTests(unittest.TestCase):
                 "rejectedGarbageCandidates": ["BNL", "Discord"],
                 "topRecurringThemes": ["liaison interface"],
                 "topConversationClusters": ["repeated BNL questions", "music tool links"],
-                "topActivityPatterns": ["asks about source thresholds", "shares Suno links"],
+                "topActivityPatterns": ["asks about source thresholds", "actual music platform links"],
                 "topDomains": ["suno.com"],
                 "publicSafeRows": 2,
                 "reviewOnlyRows": 2,
@@ -465,7 +465,7 @@ class SourceFileEnrichmentTests(unittest.TestCase):
         self.assertNotIn("Recurring named topic:", payload_text)
         self.assertIn("Orion: speaks_through", payload_text)
         self.assertIn("Conversation theme:", payload_text)
-        self.assertIn("shares Suno", payload_text)
+        self.assertIn("Actual music platform links", payload_text)
         self.assertEqual(payload["queueSubmissionStatus"], "not_connected")
         self.assertNotRegex(payload_text, r"submitted\s+\d+|play count|source type:|Priority|payment|rawRefJson|sourceRowId|research-and-development")
         self.assertLessEqual(len(formatted), 1900)
@@ -685,7 +685,7 @@ class SourceFileEnrichmentTests(unittest.TestCase):
 
         self.assertNotIn("Recurring named topic", json.dumps(payload["topicBreakdown"] + payload["evidenceDetails"] + payload["bestEvidenceToReview"]))
         self.assertNotIn("Recurring named topic", normal_text)
-        self.assertIn("shares music links", normal_text)
+        self.assertIn("Music discussion only", normal_text)
         self.assertIn("Conversation theme", json.dumps(payload["conversationHighlights"]))
         self.assertEqual(payload["queueSubmissionStatus"], "not_connected")
         self.assertIn(enrich.QUEUE_NOT_CONNECTED_NOTE, payload["queueSubmissionNote"])
@@ -968,6 +968,37 @@ class SourceFileEnrichmentTests(unittest.TestCase):
         self.assertNotIn("Observed Patterns", result["sections"])
         self.assertIn("Missing Info", result["sections"])
 
+    def test_source_file_payload_dedupes_link_signal_categories_without_queue_claims(self):
+        self.conn.execute("INSERT INTO user_profiles VALUES (77,1,'Antigrain','Antigrain',NULL,NULL)")
+        links = [
+            "https://youtu.be/8C4lK41SX-Q?si=one",
+            "https://youtu.be/PBwAxmrE194?si=two",
+            "https://youtu.be/rrbFQEcpJ3A?si=three",
+        ]
+        for link in links:
+            self.conn.execute(
+                "INSERT INTO conversations VALUES (NULL,77,'Antigrain',1,'barcode-bot','public_home','user',?,'now')",
+                (f"Antigrain shared a YouTube link {link}",),
+            )
+            self.conn.execute(
+                "INSERT INTO memory_tiers VALUES (NULL,77,1,'long',?,0.9,1,'now','public_discord_observed','public_home')",
+                (f"Antigrain local stored context repeats {link}",),
+            )
+        self.conn.commit()
+        with mock.patch.object(enrich, "refresh_entity_evidence_for_subject", return_value={"ok": True}):
+            result = enrich.run_source_file_enrichment(self.db, 1, "Antigrain", dry_run=True, lookup_func=self._lookup("active"), force=True)
+        payload = result["payload"]
+        diagnostics = result.get("linkSignalDiagnostics") or {}
+        text = json.dumps({key: payload.get(key) for key in ("musicSignals", "communitySignals", "usefulEvidence", "evidenceDetails", "reviewOnlyEvidence", "recommendedAction", "queueSubmissionStatus")})
+        self.assertEqual(diagnostics.get("videoPlatformLinkCount"), 3)
+        self.assertEqual(diagnostics.get("musicPlatformLinkCount"), 0)
+        self.assertEqual(diagnostics.get("derivedDuplicateLinkCount"), 3)
+        self.assertIn("Video platform links: 3", text)
+        self.assertIn("Derived duplicate references suppressed: 3", text)
+        self.assertNotIn("shares music links", text)
+        self.assertNotIn("submitted songs", text.lower())
+        self.assertEqual(payload.get("queueSubmissionStatus"), "not_connected")
+
 
 class SourceFileEnrichmentBotTests(unittest.TestCase):
     class Perms:
@@ -1126,6 +1157,7 @@ class SourceFileEnrichmentBotTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
 
 class SourceFileEntityIntelligenceIntegrationTests(unittest.TestCase):
     def setUp(self):

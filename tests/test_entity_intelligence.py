@@ -65,7 +65,7 @@ class EntityIntelligenceTests(unittest.TestCase):
         rels = {(e["objectLabel"], e["relationType"]) for e in p["relationships"]}
         self.assertIn(("Orion", "speaks_through"), rels)
         self.assertIn(("Orion", "created"), rels)
-        self.assertIn("shares Suno/Udio/YouTube/SoundCloud/Spotify/Bandcamp links", self.labels(p["creativeMusic"]))
+        self.assertIn("actual music platform links", self.labels(p["creativeMusic"]))
         self.assertIn("frequent BNL-facing conversation", self.labels(p["bnlInteraction"]))
         self.assertIn("AI/persona/project interaction", self.labels(p["conversationThemes"]))
         self.assertIn("Confirm whether Orion relationship/context can be public", self.labels(p["actionItems"]))
@@ -76,8 +76,8 @@ class EntityIntelligenceTests(unittest.TestCase):
         self.add_msg(11, "Lost Marbles", "collaboration-hub", "public_music", "As a mod and staff helper, Lost Marbles can collab with artists and share SoundCloud music demos.")
         p = self.profile_for("Lost Marbles")
         self.assertIn("moderator", self.labels(p["roles"]))
-        self.assertIn("shares Suno/Udio/YouTube/SoundCloud/Spotify/Bandcamp links", self.labels(p["creativeMusic"]))
-        self.assertIn("offers collaboration", self.labels(p["creativeMusic"]))
+        self.assertIn("platform references", self.labels(p["creativeMusic"]))
+        self.assertIn("collaboration offers", self.labels(p["creativeMusic"]))
         self.assertIn("Confirm public-safe mod/staff role wording", self.labels(p["actionItems"]))
         self.assertIn("Confirm public artist links", self.labels(p["actionItems"]))
         self.assertEqual(p["diagnostics"]["queueSubmissionStatus"], "not_connected")
@@ -118,7 +118,7 @@ class EntityIntelligenceTests(unittest.TestCase):
         self.add_msg(15, "Nova Finch", "collaboration-hub", "public_music", "Nova Finch is an artist asking for feedback on a demo and wants to collaborate with Blue Kite.")
         p = self.profile_for("Nova Finch")
         self.assertIn("artist", self.labels(p["roles"]))
-        self.assertIn("offers collaboration", self.labels(p["creativeMusic"]))
+        self.assertIn("collaboration offers", self.labels(p["creativeMusic"]))
         self.assertIn("collaboration", self.labels(p["conversationThemes"]))
 
     def test_surface_filters(self):
@@ -163,7 +163,7 @@ class EntityIntelligenceTests(unittest.TestCase):
         self.conn.execute("INSERT INTO memory_tiers VALUES (NULL,NULL,1,'long','Orion through Crow appears near Lost Marbles in a source-blind global memory bundle.',0.9,1,'now',NULL,NULL)")
         p = self.profile_for("Lost Marbles")
         labels = self.labels(p["relationships"] + p["conversationThemes"] + p["creativeMusic"] + p["dossierUsefulness"])
-        self.assertIn("offers collaboration", self.labels(p["creativeMusic"]))
+        self.assertIn("collaboration offers", self.labels(p["creativeMusic"]))
         self.assertNotIn("Orion", labels)
         self.assertNotIn("Crow", labels)
         scopes = p["diagnostics"]["rowScopeCounts"]
@@ -264,8 +264,8 @@ class EntityIntelligenceTests(unittest.TestCase):
         self.add_msg(23, "LostMarbles", "collaboration-hub", "public_music", "Hey B, Friday 7 PM Pacific Time User says LostMarbles can collab with artists and share SoundCloud music demos.")
         p = self.profile_for("LostMarbles")
         text = self.labels(p["roles"] + p["creativeMusic"] + p["relationships"] + p["conversationThemes"])
-        self.assertIn("offers collaboration", text)
-        self.assertIn("shares Suno/Udio/YouTube/SoundCloud/Spotify/Bandcamp links", text)
+        self.assertIn("collaboration offers", text)
+        self.assertIn("platform references", text)
         for bad in ("Orion", "Friday", "PM Pacific Time", "Hey B", "User"):
             self.assertNotIn(bad, text)
 
@@ -312,6 +312,81 @@ class EntityIntelligenceTests(unittest.TestCase):
                 for child in value:
                     walk(child)
         walk(p)
+
+
+    def test_antigrain_youtube_links_dedupe_derived_memory(self):
+        self.add_profile(31, "Antigrain")
+        links = [
+            "https://youtu.be/8C4lK41SX-Q?si=one",
+            "https://youtu.be/PBwAxmrE194?si=two",
+            "https://youtu.be/rrbFQEcpJ3A?si=three",
+        ]
+        for link in links:
+            self.add_msg(31, "Antigrain", "barcode-bot", "public_home", f"Antigrain shared this YouTube link {link}")
+            self.conn.execute(
+                "INSERT INTO memory_tiers VALUES (NULL,31,1,'long',?,0.9,1,'now','public_discord_observed','public_home')",
+                (f"Antigrain consolidated local stored context repeats {link}",),
+            )
+        p = self.profile_for("Antigrain")
+        diagnostics = p["diagnostics"]
+        text = self.labels(p["creativeMusic"])
+        self.assertEqual(diagnostics["videoPlatformLinkCount"], 3)
+        self.assertEqual(diagnostics["distinctActualLinkCount"], 3)
+        self.assertEqual(diagnostics["derivedDuplicateLinkCount"], 3)
+        self.assertIn("video platform links", text)
+        self.assertIn("derived duplicate link references suppressed", text)
+        self.assertNotIn("shares music links", text)
+        self.assertNotIn("shares Suno/Udio/YouTube/SoundCloud/Spotify/Bandcamp links", text)
+        self.assertEqual(diagnostics["musicPlatformLinkCount"], 0)
+        self.assertEqual(diagnostics["queueSubmissionStatus"], "not_connected")
+
+    def test_hellcat_discord_event_links_are_event_not_music(self):
+        self.add_profile(32, "HellcatNZ")
+        for idx in range(3):
+            self.add_msg(32, "HellcatNZ", "hellcat-nz", "public_home", f"HellcatNZ event contest link https://discord.gg/hellcatnz?event={idx}")
+        p = self.profile_for("HellcatNZ")
+        self.assertEqual(p["diagnostics"]["eventContestLinkCount"], 3)
+        self.assertEqual(p["diagnostics"]["musicPlatformLinkCount"], 0)
+        self.assertIn("event/contest link evidence", self.labels(p["eventContest"]))
+        self.assertIn("contest/event activity", self.labels(p["eventContest"]))
+        self.assertNotIn("actual music platform links", self.labels(p["creativeMusic"]))
+
+    def test_music_words_and_platform_mentions_without_urls_are_not_link_claims(self):
+        self.add_profile(33, "NoLinkArtist")
+        self.add_msg(33, "NoLinkArtist", "wips-and-demos", "public_music", "This song track demo wip music idea was made in Suno, no link yet.")
+        p = self.profile_for("NoLinkArtist")
+        text = self.labels(p["creativeMusic"])
+        self.assertIn("music discussion", text)
+        self.assertIn("song/track/demo/WIP mentions", text)
+        self.assertIn("platform references", text)
+        self.assertEqual(p["diagnostics"]["distinctActualLinkCount"], 0)
+        self.assertNotIn("actual music platform links", text)
+        self.assertNotIn("video platform links", text)
+
+    def test_crow_suno_links_dedupe_and_queue_boundary(self):
+        self.add_profile(34, "Crow")
+        for link in ("https://suno.com/song/a", "https://suno.com/song/b"):
+            self.add_msg(34, "Crow", "finished-tracks", "public_music", f"Crow music link {link}")
+            self.conn.execute(
+                "INSERT INTO memory_tiers VALUES (NULL,34,1,'long',?,0.9,1,'now','public_discord_observed','public_music')",
+                (f"Crow consolidated memory repeats {link}",),
+            )
+        p = self.profile_for("Crow")
+        self.assertEqual(p["diagnostics"]["musicPlatformLinkCount"], 2)
+        self.assertEqual(p["diagnostics"]["derivedDuplicateLinkCount"], 2)
+        self.assertEqual(p["diagnostics"]["queueSubmissionStatus"], "not_connected")
+        self.assertIn("actual music platform links", self.labels(p["creativeMusic"]))
+
+    def test_lost_marbles_collab_music_without_actual_link_claim(self):
+        self.add_profile(35, "LostMarbles")
+        self.add_msg(35, "LostMarbles", "collaboration-hub", "public_music", "LostMarbles can collab, asks for feedback on music demos, and wants to work together.")
+        p = self.profile_for("LostMarbles")
+        text = self.labels(p["creativeMusic"])
+        self.assertIn("collaboration offers", text)
+        self.assertIn("music discussion", text)
+        self.assertIn("feedback requests", text)
+        self.assertEqual(p["diagnostics"]["distinctActualLinkCount"], 0)
+        self.assertNotIn("actual music platform links", text)
 
 
 if __name__ == "__main__":

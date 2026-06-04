@@ -14,6 +14,14 @@ from collections import Counter
 from typing import Any
 
 from bnl_dossier_source_packets import normalize_subject_name, subject_key
+from bnl_entity_intelligence import (
+    _classify_url_domain,
+    _extract_urls,
+    _has_music_discussion_terms,
+    _has_song_track_demo_terms,
+    _normalized_url_fingerprint,
+    _platform_mentions_without_urls,
+)
 from bnl_entity_evidence import (
     ENTITY_EVIDENCE_TABLE,
     build_conversation_safe_summary,
@@ -1129,6 +1137,74 @@ def _row_text(row: sqlite3.Row, fields: list[str]) -> str:
     return " ".join(str(data.get(field) or "") for field in fields if field in data)
 
 
+
+
+def _record_link_signal(summary: dict[str, Any], text: str, *, source_kind: str = "primary") -> None:
+    diagnostics = summary.setdefault("linkSignalDiagnostics", {
+        "distinctActualLinkCount": 0,
+        "musicPlatformLinkCount": 0,
+        "videoPlatformLinkCount": 0,
+        "eventContestLinkCount": 0,
+        "communityServerLinkCount": 0,
+        "genericLinkCount": 0,
+        "platformReferenceCount": 0,
+        "musicDiscussionCount": 0,
+        "derivedDuplicateLinkCount": 0,
+    })
+    seen = summary.setdefault("_linkSignalFingerprints", set())
+    primary_seen = summary.setdefault("_primaryLinkSignalFingerprints", set())
+    derived = source_kind != "primary"
+    for url in _extract_urls(text):
+        signal_type = _classify_url_domain(url)
+        fp = f"{signal_type}:{_normalized_url_fingerprint(url)}"
+        if fp in seen:
+            if derived and fp in primary_seen:
+                diagnostics["derivedDuplicateLinkCount"] = int(diagnostics.get("derivedDuplicateLinkCount") or 0) + 1
+            continue
+        seen.add(fp)
+        if not derived:
+            primary_seen.add(fp)
+        diagnostics["distinctActualLinkCount"] = int(diagnostics.get("distinctActualLinkCount") or 0) + 1
+        if signal_type == "music_platform_link":
+            diagnostics["musicPlatformLinkCount"] = int(diagnostics.get("musicPlatformLinkCount") or 0) + 1
+        elif signal_type == "video_platform_link":
+            diagnostics["videoPlatformLinkCount"] = int(diagnostics.get("videoPlatformLinkCount") or 0) + 1
+        elif signal_type == "event_contest_link":
+            diagnostics["eventContestLinkCount"] = int(diagnostics.get("eventContestLinkCount") or 0) + 1
+        elif signal_type == "community_server_link":
+            diagnostics["communityServerLinkCount"] = int(diagnostics.get("communityServerLinkCount") or 0) + 1
+        elif signal_type == "generic_link":
+            diagnostics["genericLinkCount"] = int(diagnostics.get("genericLinkCount") or 0) + 1
+    for platform in _platform_mentions_without_urls(text):
+        fp = f"platform_reference:{platform.lower()}"
+        if fp not in seen:
+            seen.add(fp)
+            diagnostics["platformReferenceCount"] = int(diagnostics.get("platformReferenceCount") or 0) + 1
+    if _has_music_discussion_terms(text) or _has_song_track_demo_terms(text):
+        diagnostics["musicDiscussionCount"] = int(diagnostics.get("musicDiscussionCount") or 0) + 1
+
+
+def _apply_link_signal_readouts(summary: dict[str, Any]) -> None:
+    diagnostics = summary.get("linkSignalDiagnostics") or {}
+    lines: list[tuple[str, str]] = []
+    if diagnostics.get("musicPlatformLinkCount"):
+        lines.append(("musicSignals", f"Actual music platform links: {int(diagnostics['musicPlatformLinkCount'])}"))
+    if diagnostics.get("videoPlatformLinkCount"):
+        lines.append(("musicSignals", f"Video platform links: {int(diagnostics['videoPlatformLinkCount'])}"))
+    if diagnostics.get("eventContestLinkCount"):
+        lines.append(("communitySignals", f"Event/contest links: {int(diagnostics['eventContestLinkCount'])}"))
+    if diagnostics.get("communityServerLinkCount"):
+        lines.append(("communitySignals", f"Community/server links: {int(diagnostics['communityServerLinkCount'])}"))
+    if diagnostics.get("musicDiscussionCount") and not diagnostics.get("musicPlatformLinkCount"):
+        lines.append(("musicSignals", f"Music discussion only: {int(diagnostics['musicDiscussionCount'])}"))
+    if diagnostics.get("derivedDuplicateLinkCount"):
+        lines.append(("reviewOnlyEvidence", f"Derived duplicate references suppressed: {int(diagnostics['derivedDuplicateLinkCount'])}"))
+    for key, line in lines:
+        _add_unique(summary[key], line)
+        if key != "reviewOnlyEvidence":
+            _add_unique(summary["evidenceDetails"], line)
+            _add_unique(summary["usefulEvidence"], line)
+
 def _add_unique(target: list[str], value: str) -> None:
     clean = re.sub(r"\s+", " ", str(value or "")).strip()
     if clean and clean not in target:
@@ -1280,6 +1356,7 @@ def _apply_structured_evidence(summary: dict[str, Any], rows: list[sqlite3.Row],
         if topic:
             topic_counts[topic] += 1
         _add_unique(summary["evidenceDetails"], safe_summary)
+        _record_link_signal(summary, safe_summary, source_kind="derived")
         if kind != "source_blind_memory_review_only":
             _append_best_evidence(summary, data, channel_display, safe_summary)
 
@@ -1394,6 +1471,17 @@ def build_entity_activity_summary(
         "queueSubmissionStatus": "not_connected",
         "queueSubmissionNote": QUEUE_NOT_CONNECTED_NOTE,
         "rawProvenance": {"sourceLabels": [], "sourceCounts": Counter(), "rawFragments": [], "channelPolicies": Counter()},
+        "linkSignalDiagnostics": {
+            "distinctActualLinkCount": 0,
+            "musicPlatformLinkCount": 0,
+            "videoPlatformLinkCount": 0,
+            "eventContestLinkCount": 0,
+            "communityServerLinkCount": 0,
+            "genericLinkCount": 0,
+            "platformReferenceCount": 0,
+            "musicDiscussionCount": 0,
+            "derivedDuplicateLinkCount": 0,
+        },
     }
     topic_counts: Counter = Counter()
     public_fact_texts: list[str] = []
@@ -1586,6 +1674,7 @@ def build_entity_activity_summary(
                 channel_name = data.get("channel_name") or ""
                 channel_display = _channel_display_name(channel_name, policy)
                 authored = data.get("user_id") in matched_user_ids or contains_subject_mention(str(data.get("user_name") or ""), subject, aliases=aliases)
+                _record_link_signal(summary, text, source_kind="primary" if authored else "derived")
                 relation = "authored" if authored else "mentioned"
                 timestamp = str(data.get("timestamp") or "")
                 topics = _topic_labels_for_text(text, review_only=policy not in PUBLIC_CONVERSATION_POLICIES)
@@ -1647,6 +1736,7 @@ def build_entity_activity_summary(
                 if not row_matches(row, ["summary", "tier"]):
                     continue
                 text = _row_text(row, ["summary", "tier"])
+                _record_link_signal(summary, text, source_kind="derived")
                 _add_unique(summary["privateOnlyNotes"], SOURCE_BLIND_REVIEW_NOTE)
                 _add_unique(summary["reviewOnlyEvidence"], SOURCE_BLIND_REVIEW_NOTE)
                 _add_unique(summary["notPublicYet"], "Source-blind memory cannot be used as a public fact without review.")
@@ -1764,6 +1854,7 @@ def build_entity_activity_summary(
         for topic, count in topic_counts.most_common(8):
             if count > 0:
                 _add_unique(summary["topicBreakdown"], f"{_website_safe_topic_label(topic)}: {count} approved/reviewed source item(s).")
+    _apply_link_signal_readouts(summary)
     if not summary["musicSignals"]:
         _add_unique(summary["musicSignals"], "No queue/submission identity is connected yet; do not claim music submissions or counts from this summary.")
     if not summary["communitySignals"] and summary["rawProvenance"]["rawFragments"]:
@@ -1795,6 +1886,8 @@ def build_entity_activity_summary(
         summary["sourceCoverage"].append({"source": "channel_policy", "counts": dict(raw["channelPolicies"]), "status": "found"})
     raw["sourceCounts"] = dict(raw["sourceCounts"])
     raw["channelPolicies"] = dict(raw["channelPolicies"])
+    summary.pop("_linkSignalFingerprints", None)
+    summary.pop("_primaryLinkSignalFingerprints", None)
     if output_mode != "admin_internal":
         # Raw provenance remains separate, but public-facing callers should not receive snippets.
         raw["rawFragments"] = [{k: v for k, v in frag.items() if k != "snippet"} for frag in raw["rawFragments"]]

@@ -1655,6 +1655,7 @@ def collect_source_enrichment_evidence(db_path: str, guild_id: int | None, subje
         "notPublicYet": list(entity_summary.get("notPublicYet") or [])[:6] if raw_provenance else [],
         "sourceAuthority": list(entity_summary.get("sourceAuthority") or [])[:5] if raw_provenance else [],
         "subjectIntelligenceDiagnostics": entity_summary.get("subjectIntelligenceDiagnostics") or {},
+        "linkSignalDiagnostics": entity_summary.get("linkSignalDiagnostics") or {},
         **_bounded_entity_summary_fields(entity_summary, include=bool(raw_provenance)),
         "queueSubmissionStatus": str(entity_summary.get("queueSubmissionStatus") or "not_connected") if raw_provenance else "not_connected",
         "queueSubmissionNote": str(entity_summary.get("queueSubmissionNote") or QUEUE_NOT_CONNECTED_NOTE) if raw_provenance else QUEUE_NOT_CONNECTED_NOTE,
@@ -2471,6 +2472,7 @@ def build_enrichment_recommendation_payload(packet: dict[str, Any], *, environ: 
         "queueSubmissionStatus": packet.get("queueSubmissionStatus") or "not_connected",
         "queueSubmissionNote": packet.get("queueSubmissionNote") or QUEUE_NOT_CONNECTED_NOTE,
         "entityIntelligenceProfile": dict(packet.get("entityIntelligenceProfile") or {}),
+        "linkSignalDiagnostics": dict(packet.get("linkSignalDiagnostics") or {}),
         "rawProvenance": dict(packet.get("rawProvenance") or {}),
         "visibilityLabels": ["internal_review_only", "admin_review_required"],
         "confidence": "low" if packet.get("qualityStatus") in {"too_thin", "forced_low_confidence"} else ("medium" if match_kind == "active_source_file" else "low"),
@@ -2611,6 +2613,7 @@ def run_source_file_enrichment(
     }
     _copy_evidence_fields(packet, evidence)
     packet["subjectIntelligenceDiagnostics"] = evidence.get("subjectIntelligenceDiagnostics") or {}
+    packet["linkSignalDiagnostics"] = evidence.get("linkSignalDiagnostics") or {}
     packet["diagnosticsRequested"] = bool(diagnostics)
     quality = evaluate_enrichment_quality(packet)
     packet["qualityScore"] = quality["score"]
