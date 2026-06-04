@@ -74,8 +74,6 @@ _TOOL_OR_PLATFORM_TERMS = {
 }
 _NAMED_TOPIC_ALLOWLIST = {
     "orion": "Orion",
-    "barcode radio": "BARCODE Radio",
-    "barcode": "BARCODE",
 }
 _NAMED_TOPIC_STOPWORDS = {
     "approved", "subject", "review", "context", "community", "source", "file", "dossier", "music",
@@ -93,6 +91,10 @@ _SUBJECT_INTELLIGENCE_STOPWORDS = {
     "confirm", "public", "private", "review", "owner", "admin", "music", "community", "pattern",
     "activity", "signal", "history", "this", "subject", "channel", "conversation", "dossier", "file",
     "approved", "internal", "candidate", "notes", "known", "facts", "relationship", "memory", "recent",
+    "user", "users", "member", "members", "someone", "something", "anyone", "everyone", "everything",
+    "hey", "hi", "hello", "still", "speaking", "transmitted", "directly", "operating", "continuity",
+    "pm", "am", "pacific", "friday", "saturday", "sunday", "monday", "tuesday", "wednesday", "thursday",
+    "tonight", "today", "tomorrow", "yesterday", "morning", "afternoon", "evening", "night", "bit", "bits",
     # Title-case sentence starters / filler words that should never become named topics by repetition.
     "the", "a", "an", "and", "or", "but", "if", "then", "there", "that", "these", "those",
     "with", "without", "from", "to", "for", "of", "in", "on", "at", "by", "as",
@@ -102,26 +104,28 @@ _SUBJECT_INTELLIGENCE_STOPWORDS = {
 _PRONOUN_OR_ADDRESS_TERMS = {
     "i", "me", "my", "mine", "we", "us", "our", "ours", "you", "your", "yours",
     "he", "him", "his", "she", "her", "hers", "they", "them", "their", "theirs",
-    "it", "its", "this", "that", "these", "those", "someone", "something", "everyone", "everything",
+    "it", "its", "this", "that", "these", "those", "someone", "something", "anyone", "everyone", "everything",
+    "user", "users", "member", "members", "hey", "hi", "hello",
 }
 _SYSTEM_OR_PERSONA_TERMS = {
-    "bnl", "bnl-01", "bot", "network", "barcode network", "discord", "server", "channel",
-    "source file", "dossier", "admin", "owner", "public", "private", "review", "barcode",
+    "bnl", "bnl-01", "bot", "network", "barcode network", "barcode radio", "discord", "server", "channel",
+    "source file", "dossier", "admin", "owner", "public", "private", "review", "barcode", "6 bit", "six bit", "bit", "bit's",
 }
 _GRAMMAR_OR_FILLER_TERMS = {
     "the", "a", "an", "and", "or", "but", "if", "then", "there", "with", "without",
     "from", "to", "for", "of", "in", "on", "at", "by", "as", "is", "are", "was", "were",
     "be", "been", "being", "not", "no", "yes", "good", "bad", "still", "just", "now", "also",
+    "speaking", "transmitted", "directly", "operating", "continuity", "pm", "am", "pacific",
     "because", "before", "after", "again", "maybe", "possible", "reviewed", "evidence", "context",
     "conversation", "community", "activity", "pattern", "candidate", "known", "facts", "source", "file",
 }
 _SUBJECT_INTELLIGENCE_STOPWORDS.update(_PRONOUN_OR_ADDRESS_TERMS | _SYSTEM_OR_PERSONA_TERMS | _GRAMMAR_OR_FILLER_TERMS)
 _NAMED_TOPIC_BLOCKED_TERMS = _PRONOUN_OR_ADDRESS_TERMS | _SYSTEM_OR_PERSONA_TERMS | _GRAMMAR_OR_FILLER_TERMS | _SUBJECT_INTELLIGENCE_STOPWORDS | _NAMED_TOPIC_STOPWORDS
 _SUBJECT_INTELLIGENCE_PRIORITY_PREFIXES = (
+    "Recurring named topic:",
     "Conversation theme:",
     "Activity pattern:",
     "Evidence digest:",
-    "Recurring named topic:",
     "Recurring conversation pattern:",
     "BNL interaction pattern:",
     "Tool/platform mention:",
@@ -129,8 +133,9 @@ _SUBJECT_INTELLIGENCE_PRIORITY_PREFIXES = (
 _RECURRING_PHRASE_STOPWORDS = _SUBJECT_INTELLIGENCE_STOPWORDS | {"appears", "mentioned", "connected", "review", "before", "after", "with", "from", "about"}
 _DOMAIN_PATTERN = re.compile(r"(?:https?://)?(?:www\.)?([a-z0-9][a-z0-9-]*(?:\.[a-z0-9][a-z0-9-]*)+)(?:/[^\s<>()\[\]{}]*)?", re.I)
 _CODE_MARKER_PATTERN = re.compile(r"\b(?:0x[A-Fa-f0-9]{2,}|[A-Z][A-Z0-9]{2,}(?:-[A-Z0-9]+)*)\b")
-_THROUGH_PATTERN = re.compile(r"\b([A-Z][A-Za-z0-9_-]{2,}(?:\s+[A-Z][A-Za-z0-9_-]{2,}){0,2})\s+(?:through|via|speaking\s+through|relayed\s+through)\s+([A-Z][A-Za-z0-9_-]{2,}(?:\s+[A-Z][A-Za-z0-9_-]{2,}){0,2})\b")
-_HERE_PATTERN = re.compile(r"\b([A-Z][A-Za-z0-9_-]{2,})\s+here\b")
+_THROUGH_PATTERN = re.compile(r"\b([A-Z][A-Za-z0-9_-]{2,}(?:\s+[A-Z][A-Za-z0-9_-]{2,}){0,3})\s+(?:through|via|speaking\s+through|relayed\s+through)\s+([A-Z][A-Za-z0-9_-]{2,}(?:\s+[A-Z][A-Za-z0-9_-]{2,}){0,2})\b", re.I)
+_HERE_PATTERN = re.compile(r"\b([A-Z][A-Za-z0-9_-]{2,}(?:\s+[A-Z][A-Za-z0-9_-]{2,}){0,1})\s+here\b", re.I)
+_THROUGH_TRAILING_ACTION_PATTERN = re.compile(r"(?:\s+(?:speaking(?:\s+directly)?|talking|transmitted|transmitting|relayed|operating|active))+$", re.I)
 _SAID_PATTERN = re.compile(r"\b([A-Z][A-Za-z0-9_-]{2,})\s+(?:said|says|asks|asked)\b")
 
 
@@ -314,6 +319,7 @@ def build_subject_intelligence_corpus(rows: list[dict[str, Any]]) -> dict[str, A
 
 def _clean_intelligence_label(label: str, subject: str = "") -> str:
     label = re.sub(r"\s+", " ", str(label or "")).strip(" -:.,;!?()[]{}\"'“”‘’")
+    label = _THROUGH_TRAILING_ACTION_PATTERN.sub("", label).strip()
     if not label or len(label) < 3 or len(label) > 60:
         return ""
     lowered = label.lower()
@@ -361,7 +367,7 @@ def _subject_candidate_reasons_from_text(text: str, subject: str) -> tuple[dict[
                     _add_candidate_reason(candidates, clean, reason, subject)
                 raw_parts = re.findall(r"[A-Z][A-Za-z0-9_-]{2,}", str(group or ""))
                 for suffix_len in (1, 2):
-                    if len(raw_parts) >= suffix_len + 1:
+                    if len(raw_parts) >= suffix_len:
                         _add_candidate_reason(candidates, " ".join(raw_parts[-suffix_len:]), reason, subject)
 
     for match in _ENTITY_NAME_PATTERN.finditer(text):
@@ -490,6 +496,8 @@ def _candidate_entity_type(label: str, reasons: set[str] | None = None) -> str:
         return "rejected"
     if key in _PRONOUN_OR_ADDRESS_TERMS or (len(words) == 1 and words[0] in _PRONOUN_OR_ADDRESS_TERMS):
         return "pronoun_or_address"
+    if key.replace("'", " ") in {"bit", "bit s", "hey b", "pm pacific time", "pacific time", "continuity structure", "continuity structure speaking", "continuity structure operating", "speaking directly"}:
+        return "rejected"
     if key in _SYSTEM_OR_PERSONA_TERMS or (len(words) == 1 and words[0] in _SYSTEM_OR_PERSONA_TERMS):
         return "system_label"
     if key in _TOOL_OR_PLATFORM_TERMS or "domain_tool" in reasons:
@@ -502,13 +510,18 @@ def _candidate_entity_type(label: str, reasons: set[str] | None = None) -> str:
             return "code_marker"
     if words and all(word in _GRAMMAR_OR_FILLER_TERMS for word in words):
         return "grammar_or_filler"
+    if any(word in {"speaking", "transmitted", "directly", "operating", "still"} for word in words):
+        return "rejected"
     if words[0] in (_PRONOUN_OR_ADDRESS_TERMS | _GRAMMAR_OR_FILLER_TERMS | _SYSTEM_OR_PERSONA_TERMS):
         return "rejected"
     blocked_count = sum(1 for word in words if word in _NAMED_TOPIC_BLOCKED_TERMS)
-    if len(words) > 1 and blocked_count >= len(words):
-        return "rejected"
-    if key in {"bnl 01", "barcode network", "the network", "source file", "public context", "for review"}:
+    if len(words) > 1 and blocked_count > 0:
+        if key not in {"vega signal", "signal witch"}:
+            return "rejected"
+    if key in {"bnl 01", "barcode network", "barcode radio", "the network", "source file", "public context", "for review", "hey b", "pm pacific time", "pacific time", "continuity structure", "continuity structure speaking", "continuity structure operating", "6 bit", "six bit", "bit s"}:
         return "system_label"
+    if re.fullmatch(r"(?:\d{1,2}\s*)?(?:am|pm)(?:\s+pacific(?:\s+time)?)?", key) or key in {"monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday", "tonight", "today", "tomorrow", "yesterday", "morning", "afternoon", "evening", "night"}:
+        return "schedule_or_time"
     if any(word in {"presence", "threshold", "liaison", "interface", "sync", "convergence", "boundaries", "operational"} for word in words):
         return "conversation_theme"
     return "person_or_project"
@@ -635,6 +648,23 @@ def build_subject_topic_clusters(subject: str, intelligence: dict[str, Any]) -> 
     return {"clusters": clusters, "activityPatterns": activity[:5], "conversationThemeLine": theme_line, "evidenceDigestLine": digest}
 
 
+
+def _clean_through_left_intelligence_label(label: str, subject: str = "") -> str:
+    clean = _clean_intelligence_label(label, subject)
+    if not clean:
+        return ""
+    accepted, _ = _acceptable_recurring_subject(clean, 1, {"explicit_through_pattern"}, 0, 1)
+    if accepted:
+        return clean
+    raw_parts = re.findall(r"[A-Z][A-Za-z0-9_-]{2,}", str(label or ""))
+    for suffix_len in (2, 1):
+        if len(raw_parts) >= suffix_len:
+            suffix = _clean_intelligence_label(" ".join(raw_parts[-suffix_len:]), subject)
+            accepted, _ = _acceptable_recurring_subject(suffix, 1, {"explicit_through_pattern"}, 0, 1)
+            if accepted:
+                return suffix
+    return ""
+
 def extract_recurring_subject_intelligence(rows: list[dict[str, Any]], subject: str) -> dict[str, Any]:
     """Score recurring names/themes/domains from fuller local rows, split by public-safe vs review-only."""
 
@@ -664,12 +694,13 @@ def extract_recurring_subject_intelligence(rows: list[dict[str, Any]], subject: 
         for domain in _extract_domains(text):
             target_domains[domain] += 1
         for match in _THROUGH_PATTERN.finditer(text):
-            left = _clean_intelligence_label(match.group(1), subject)
+            left = _clean_through_left_intelligence_label(match.group(1), subject)
             right = _clean_intelligence_label(match.group(2), subject) or normalize_subject_name(subject)
+            subject_display = normalize_subject_name(subject)
+            if right.lower().startswith(subject_display.lower() + " "):
+                right = subject_display
             if left and right:
-                parts = left.split()
-                concise_left = _clean_intelligence_label(parts[-1], subject) if len(parts) > 1 else left
-                target_phrases[f"{concise_left or left} through {right}"] += 1
+                target_phrases[f"{left} through {right}"] += 1
         for theme in _theme_labels_for_text(text):
             target_themes[theme] += 1
         for phrase in _recurring_phrases(text):
@@ -956,7 +987,7 @@ def _append_review_safe_fact_readouts(summary: dict[str, Any], facts: dict[str, 
     review_tools: Counter = facts.get("reviewOnlyTools") or Counter()
 
     for topic, count in public_topics.most_common(6):
-        if count >= 2 or topic in {"Orion", "BARCODE Radio", "BNL", "BARCODE"}:
+        if count >= 2 or topic in {"Orion"}:
             line = f"Recurring named topic: {topic} appears in reviewed evidence connected to {subject}. Review before using publicly."
             _add_unique(summary["topicBreakdown"], line)
             _add_unique(summary["evidenceDetails"], f"Recurring named topic found: {topic}. Review before using publicly.")

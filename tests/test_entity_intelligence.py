@@ -191,6 +191,100 @@ class EntityIntelligenceTests(unittest.TestCase):
         self.assertNotIn("Orion", self.labels(p["conversationThemes"] + p["bnlInteraction"]))
         self.assertGreaterEqual(p["diagnostics"].get("sourceBlindRows", 0), 1)
 
+    def test_label_quality_through_context_cleanup(self):
+        self.add_profile(20, "Crow")
+        for content in [
+            "Orion through Crow",
+            "Orion speaking through Crow",
+            "Orion speaking directly through Crow",
+            "Orion transmitted through Crow",
+            "continuity structure speaking through Crow",
+            "speaking through Crow",
+            "transmitted through Crow",
+            "Still here",
+        ]:
+            self.add_msg(20, "Crow", "general", "public_home", content)
+        p = self.profile_for("Crow")
+        labels = [e["objectLabel"] for e in p["relationships"]]
+        self.assertIn("Orion", labels)
+        bad = {"speaking", "transmitted", "continuity structure speaking", "continuity structure operating", "speaking directly", "Still"}
+        self.assertFalse(bad & set(labels))
+        self.assertTrue(all(e["evidenceCount"] > 0 for e in p["relationships"]))
+
+    def test_core_barcode_aliases_do_not_become_relationship_entities(self):
+        self.add_profile(21, "Crow")
+        for content in ["6 Bit", "Six Bit", "Bit", "Bit's"]:
+            self.add_msg(21, "Crow", "general", "public_home", content)
+        p = self.profile_for("Crow")
+        text = self.labels(p["relationships"] + p["conversationThemes"] + p["actionItems"])
+        self.assertNotIn("Bit ", text)
+        self.assertNotIn("Bit's", text)
+        self.assertFalse(p["relationships"])
+
+    def test_greeting_schedule_and_generic_labels_are_blocked(self):
+        self.add_profile(22, "Lost Marbles")
+        for content in ["Hey B", "Friday", "PM Pacific Time", "7 PM Pacific Time", "User"]:
+            self.add_msg(22, "Lost Marbles", "general", "public_home", content)
+        p = self.profile_for("Lost Marbles")
+        text = self.labels(p["relationships"] + p["conversationThemes"] + p["actionItems"])
+        for bad in ("Hey B", "Friday", "PM Pacific Time", "User"):
+            self.assertNotIn(bad, text)
+        self.assertFalse(p["relationships"])
+
+    def test_lost_marbles_realistic_profile_preserves_music_collab_without_noise(self):
+        self.add_profile(23, "LostMarbles")
+        self.add_msg(23, "LostMarbles", "collaboration-hub", "public_music", "Hey B, Friday 7 PM Pacific Time User says LostMarbles can collab with artists and share SoundCloud music demos.")
+        p = self.profile_for("LostMarbles")
+        text = self.labels(p["roles"] + p["creativeMusic"] + p["relationships"] + p["conversationThemes"])
+        self.assertIn("offers collaboration", text)
+        self.assertIn("shares Suno/Udio/YouTube/SoundCloud/Spotify/Bandcamp links", text)
+        for bad in ("Orion", "Friday", "PM Pacific Time", "Hey B", "User"):
+            self.assertNotIn(bad, text)
+
+    def test_antigrain_generic_challenge_is_not_contest_or_zero_evidence(self):
+        self.add_profile(24, "Antigrain")
+        self.add_msg(24, "Antigrain", "general", "public_home", "Antigrain asks BNL about a strange anomaly and weird glitch signal lore, then says challenge BNL on behavior.")
+        p = self.profile_for("Antigrain")
+        text = self.labels(p["roles"] + p["eventContest"] + p["bnlInteraction"] + p["conversationThemes"])
+        self.assertIn("strange/anomaly conversations", text)
+        self.assertIn("frequent BNL-facing conversation", text)
+        self.assertNotIn("contest operator", text)
+        self.assertNotIn("contest/event activity", text)
+        self.assertNotIn("Signal Witch", text)
+        self.assertNotIn("evidenceCount': 0", str(p))
+
+    def test_contest_precision_challenge_requires_event_language(self):
+        self.add_profile(25, "Challenger")
+        self.add_msg(25, "Challenger", "general", "public_home", "challenge BNL on the conversation")
+        generic = self.profile_for("Challenger")
+        self.assertNotIn("contest/event activity", self.labels(generic["eventContest"]))
+
+        self.add_profile(26, "Contest Host")
+        self.add_msg(26, "Contest Host", "contest-room", "public_home", "contest entries winner prize deadline")
+        real = self.profile_for("Contest Host")
+        self.assertIn("contest/event activity", self.labels(real["eventContest"]))
+
+        self.add_profile(27, "Entry Host")
+        self.add_msg(27, "Entry Host", "contest-room", "public_home", "challenge entries are due soon")
+        challenge_entries = self.profile_for("Entry Host")
+        self.assertIn("contest/event activity", self.labels(challenge_entries["eventContest"]))
+
+    def test_no_output_facets_have_zero_evidence_count(self):
+        self.add_profile(28, "Zero Guard")
+        self.add_msg(28, "Zero Guard", "general", "public_home", "challenge BNL without contest terms, but BNL source-file behavior is discussed.")
+        p = self.profile_for("Zero Guard")
+
+        def walk(value):
+            if isinstance(value, dict):
+                if "evidenceCount" in value:
+                    self.assertGreater(value["evidenceCount"], 0, value)
+                for child in value.values():
+                    walk(child)
+            elif isinstance(value, list):
+                for child in value:
+                    walk(child)
+        walk(p)
+
 
 if __name__ == "__main__":
     unittest.main()
