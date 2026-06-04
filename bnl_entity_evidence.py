@@ -123,10 +123,21 @@ def _website_safe_payload_text(value: Any) -> str:
     """Sanitize known internal topic taxonomy embedded in normal website fields."""
 
     text = str(value or "")
+    protected_slashes = {
+        "Tool/platform": "Tool__BNL_SLASH__platform",
+        "tool/platform": "tool__BNL_SLASH__platform",
+        "queue/submission": "queue__BNL_SLASH__submission",
+        "Queue/submission": "Queue__BNL_SLASH__submission",
+    }
+    for raw, placeholder in protected_slashes.items():
+        text = text.replace(raw, placeholder)
     for raw_label in sorted(_SLASH_TOPIC_LABEL_REPLACEMENTS, key=len, reverse=True):
         safe_label = _SLASH_TOPIC_LABEL_REPLACEMENTS[raw_label]
         text = re.sub(re.escape(raw_label), safe_label, text, flags=re.I)
-    return text.replace("/", " and ")
+    text = text.replace("/", " and ")
+    for raw, placeholder in protected_slashes.items():
+        text = text.replace(placeholder, raw)
+    return text
 
 
 def now_iso() -> str:
