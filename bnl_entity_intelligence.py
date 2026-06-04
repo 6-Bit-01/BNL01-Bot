@@ -62,9 +62,9 @@ ROLE_PATTERNS = [
     ("moderator", re.compile(r"\b(?:mod|mods|moderator|staff|admin|operator)\b", re.I), "mod/staff language observed"),
     ("artist", re.compile(r"\b(?:artist|producer|musician|songwriter|music maker|track|song|album|suno|udio|soundcloud|spotify|bandcamp)\b", re.I), "creative/music language observed"),
     ("collaborator", re.compile(r"\b(?:collab\w*|collaborat\w*|feature\s+with|work\s+with|team\s+up)\b", re.I), "collaboration language observed"),
-    ("contest operator", re.compile(r"\b(?:contest|competition|event|rules|deadline|submit entries|winner|prize|challenge)\b", re.I), "contest/event language observed"),
+    ("contest operator", re.compile(r"\b(?:contest|competition|event|rules|deadline|submit entries|winner|prize|competition challenge|contest challenge|challenge entries)\b", re.I), "contest/event language observed"),
     ("support/helper", re.compile(r"\b(?:helping|helper|support|answers?|guides?|welcome|onboard)\b", re.I), "community support language observed"),
-    ("lore/entity/persona/project creator", re.compile(r"\b(?:created|made|built|my ai|my bot|persona|character|entity|project|speaking through|through)\b", re.I), "entity/persona/project language observed"),
+    ("lore/entity/persona/project creator", re.compile(r"\b(?:created|made|built|my ai|my bot|my project|my persona|my character|my entity)\b", re.I), "entity/persona/project creation language observed"),
     ("antagonist/challenger", re.compile(r"\b(?:challenge|challenging|argue|arguing|bait|teas|hostile|antagonistic|fight me|prove it|you can't)\b", re.I), "challenging language observed"),
 ]
 THEME_PATTERNS = [
@@ -72,11 +72,11 @@ THEME_PATTERNS = [
     ("source files/dossiers", re.compile(r"\b(?:source files?|dossiers?|case file|public dossier)\b", re.I)),
     ("music/track sharing", re.compile(r"\b(?:music|track|song|suno|udio|youtube|soundcloud|spotify|bandcamp|listen|demo|wip)\b", re.I)),
     ("collaboration", re.compile(r"\b(?:collab\w*|collaborat\w*|feature|work together|open verse)\b", re.I)),
-    ("contests/events", re.compile(r"\b(?:contest|competition|event|rules|deadline|winner|prize|challenge)\b", re.I)),
+    ("contests/events", re.compile(r"\b(?:contest|competition|event|rules|deadline|entries|winner|prize|submission window|bracket|round|judge|competition challenge|contest challenge|challenge entries)\b", re.I)),
     ("show operations", re.compile(r"\b(?:BARCODE Radio|show|episode|broadcast|queue)\b", re.I)),
     ("moderation/community support", re.compile(r"\b(?:mod|moderator|staff|admin|help|support|welcome|community)\b", re.I)),
     ("strange/anomaly conversations", re.compile(r"\b(?:anomaly|strange|weird|theory|signal|glitch|lore|cipher|riddle)\b", re.I)),
-    ("AI/persona/project interaction", re.compile(r"\b(?:AI|bot|persona|entity|project|created|speaking through|through)\b", re.I)),
+    ("AI/persona/project interaction", re.compile(r"\b(?:AI|bot|persona|entity|project|created|speaking through|relayed through|my ai|my bot|my persona|my character|my entity)\b", re.I)),
     ("public links/socials", re.compile(r"\b(?:https?://|youtube|suno|udio|soundcloud|spotify|bandcamp|instagram|tiktok)\b", re.I)),
     ("BARCODE Network behavior", re.compile(r"\b(?:BARCODE|BNL|Barcode Network)\b", re.I)),
 ]
@@ -84,12 +84,13 @@ MUSIC_RE = re.compile(r"\b(?:suno|udio|youtube|youtu\.be|soundcloud|spotify|band
 BNL_RE = re.compile(r"\b(?:BNL|bot|source files?|dossiers?|BARCODE)\b", re.I)
 ANTAGONISTIC_RE = re.compile(r"\b(?:challenge|challenging|argu|bait|teas|hostile|antagon|prove it|wrong|you can't|fight me)\b", re.I)
 ANOMALY_RE = re.compile(r"\b(?:anomaly|strange|weird|theory|signal|glitch|lore|cipher|riddle)\b", re.I)
-CONTEST_RE = re.compile(r"\b(?:contest|competition|event|rules|deadline|entries|winner|prize|challenge)\b", re.I)
+CONTEST_RE = re.compile(r"\b(?:contest|competition|event|rules|deadline|entries|winner|prize|submission\s+window|bracket|round|judge|competition\s+challenge|contest\s+challenge|challenge\s+entries)\b", re.I)
+CHALLENGE_CONTEST_RE = re.compile(r"\b(?:competition|contest)\s+challenge\b|\bchallenge\s+(?:entries|round|bracket|deadline|prize|winner|submission)\b", re.I)
 COLLAB_RE = re.compile(r"\b(?:collab\w*|collaborat\w*|feature|work together|open verse|team up)\b", re.I)
 CREATED_RE = re.compile(r"\b([A-Z][A-Za-z0-9_-]{2,}(?:\s+[A-Z][A-Za-z0-9_-]{2,}){0,2})\s+(?:created|made|built)\s+([A-Z][A-Za-z0-9_-]{2,}(?:\s+[A-Z][A-Za-z0-9_-]{2,}){0,2})\b")
 CREATED_MY_RE = re.compile(r"\b([A-Z][A-Za-z0-9_-]{2,}(?:\s+[A-Z][A-Za-z0-9_-]{2,}){0,2})\s+is\s+my\s+(?:AI|bot|project|persona|character|entity)\b", re.I)
-THROUGH_RE = re.compile(r"\b([A-Z][A-Za-z0-9_-]{2,}(?:\s+[A-Z][A-Za-z0-9_-]{2,}){0,2})\s+(?:through|via|speaking\s+through|relayed\s+through)\s+([A-Z][A-Za-z0-9_-]{2,}(?:\s+[A-Z][A-Za-z0-9_-]{2,}){0,2})\b", re.I)
-HERE_RE = re.compile(r"\b([A-Z][A-Za-z0-9_-]{2,})\s+here\b")
+THROUGH_RE = re.compile(r"\b([A-Z][A-Za-z0-9_-]{2,}(?:\s+[A-Z][A-Za-z0-9_-]{2,}){0,3})\s+(?:through|via|speaking\s+through|relayed\s+through)\s+([A-Z][A-Za-z0-9_-]{2,}(?:\s+[A-Z][A-Za-z0-9_-]{2,}){0,2})\b", re.I)
+HERE_RE = re.compile(r"\b([A-Z][A-Za-z0-9_-]{2,}(?:\s+[A-Z][A-Za-z0-9_-]{2,}){0,1})\s+here\b", re.I)
 
 
 SUBJECT_SCOPE_VALUES = {
@@ -108,7 +109,129 @@ EXTRA_ENTITY_NAME_STOPWORDS = {
     "BNL", "BARCODE", "Barcode Network", "BARCODE Radio", "Discord", "Suno", "Udio", "YouTube", "SoundCloud",
     "Spotify", "Bandcamp", "Source File", "Source Files", "Candidate Intake", "Dossier", "Dossiers", "Owner", "Admin",
     "Moderator", "Staff", "Public", "Review", "Unknown", "Entity", "AI", "Bot", "Crowd",
+    "User", "Users", "Member", "Members", "Someone", "Something", "Anyone", "Everyone", "Everything",
+    "Hey", "Hey B", "Hi", "Hello", "Still", "Speaking", "Transmitted", "Directly", "Operating",
+    "Continuity", "Continuity Structure", "Continuity Structure Speaking", "Continuity Structure Operating",
+    "PM", "AM", "Pacific", "Pacific Time", "PM Pacific Time", "Friday", "Saturday", "Sunday", "Monday",
+    "Tuesday", "Wednesday", "Thursday", "Tonight", "Today", "Tomorrow", "Yesterday", "Morning", "Afternoon",
+    "Evening", "Night", "Bit", "Bit's", "Bits",
 }
+_LABEL_BLOCKED_KEYS = {re.sub(r"[^a-z0-9]+", " ", label.lower()).strip() for label in EXTRA_ENTITY_NAME_STOPWORDS}
+_SCHEDULE_OR_TIME_RE = re.compile(r"\b(?:(?:\d{1,2}(?::\d{2})?\s*)?(?:am|pm)(?:\s+pacific(?:\s+time)?)?|pacific(?:\s+time)?|monday|tuesday|wednesday|thursday|friday|saturday|sunday|tonight|today|tomorrow|yesterday|morning|afternoon|evening|night)\b", re.I)
+_GREETING_OR_ADDRESS_RE = re.compile(r"\b(?:hey(?:\s+b)?|hi|hello|yo|dear|user|users|member|members|someone|something|anyone|everyone|everything)\b", re.I)
+_ACTION_OR_VERB_FRAGMENT_RE = re.compile(r"\b(?:speaking(?:\s+directly)?|talking|transmitted|transmitting|relayed|operating|active|directly|still)\b", re.I)
+_THROUGH_LEFT_TRAILING_ACTION_RE = re.compile(r"(?:\s+(?:speaking(?:\s+directly)?|talking|transmitted|transmitting|relayed|operating|active))+$", re.I)
+_PLATFORM_OR_TOOL_KEYS = {"discord", "suno", "udio", "youtube", "soundcloud", "spotify", "bandcamp", "instagram", "tiktok"}
+_SYSTEM_OR_CHANNEL_KEYS = {"source file", "source files", "candidate intake", "dossier", "dossiers", "owner", "admin", "moderator", "staff", "public", "review", "unknown", "entity", "ai", "bot", "server", "channel", "welcome", "episode tracker"}
+_THEME_ONLY_KEYS = {"continuity", "continuity structure", "conversation", "community", "source", "file", "dossier", "anomaly", "lore", "signal", "challenge", "rules language"}
+_CORE_BARCODE_ALIASES = {
+    "6 bit": "6 Bit", "six bit": "6 Bit", "bit": "6 Bit", "bit s": "6 Bit", "bits": "6 Bit",
+    "bnl": "BNL", "bnl 01": "BNL-01", "barcode": "BARCODE", "barcode network": "BARCODE Network", "barcode radio": "BARCODE Radio",
+}
+
+
+def _label_key(label: str) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", str(label or "").lower()).strip()
+
+
+def _normalize_entity_label(label: str) -> str:
+    text = str(label or "")[:90].strip(" .,:;!?'\"“”‘’()[]{}")
+    text = MENTION_RE.sub(" ", text)
+    text = LONG_ID_RE.sub(" ", text)
+    text = EMAIL_RE.sub(" ", text)
+    text = URL_RE.sub(" ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def _canonical_entity_label(label: str) -> str:
+    normalized = _normalize_entity_label(label)
+    key = _label_key(normalized)
+    if key in _CORE_BARCODE_ALIASES:
+        return _CORE_BARCODE_ALIASES[key]
+    return normalized
+
+
+def _is_core_barcode_alias(label: str) -> bool:
+    return _label_key(label) in _CORE_BARCODE_ALIASES
+
+
+def _is_schedule_or_time_label(label: str) -> bool:
+    key = _label_key(label)
+    return bool(key and (_SCHEDULE_OR_TIME_RE.fullmatch(str(label or "").strip()) or _SCHEDULE_OR_TIME_RE.fullmatch(key)))
+
+
+def _is_greeting_or_address_label(label: str) -> bool:
+    key = _label_key(label)
+    return bool(key and (_GREETING_OR_ADDRESS_RE.fullmatch(str(label or "").strip()) or key in _LABEL_BLOCKED_KEYS and any(word in key.split() for word in {"hey", "hi", "hello", "user", "users", "member", "members"})))
+
+
+def _is_noise_entity_label(label: str) -> bool:
+    normalized = _normalize_entity_label(label)
+    key = _label_key(normalized)
+    if not key or key in _LABEL_BLOCKED_KEYS:
+        return True
+    words = key.split()
+    if all(word in _LABEL_BLOCKED_KEYS for word in words):
+        return True
+    return bool(_ACTION_OR_VERB_FRAGMENT_RE.fullmatch(normalized) or _ACTION_OR_VERB_FRAGMENT_RE.fullmatch(key))
+
+
+def _route_label_kind(label: str) -> str:
+    normalized = _normalize_entity_label(label)
+    key = _label_key(normalized)
+    if not key:
+        return "rejected"
+    if _is_greeting_or_address_label(normalized):
+        return "greeting_or_address"
+    if _is_schedule_or_time_label(normalized):
+        return "schedule_or_time"
+    if _ACTION_OR_VERB_FRAGMENT_RE.fullmatch(normalized) or _ACTION_OR_VERB_FRAGMENT_RE.fullmatch(key):
+        return "action_or_verb_fragment"
+    if key in {"user", "users", "member", "members", "someone", "something", "anyone", "everyone", "everything"}:
+        return "generic_speaker_label"
+    if _is_core_barcode_alias(normalized):
+        return "core_barcode_entity"
+    if key in _PLATFORM_OR_TOOL_KEYS:
+        return "platform_or_tool"
+    if key in _SYSTEM_OR_CHANNEL_KEYS:
+        return "system_or_channel_label"
+    if key in _THEME_ONLY_KEYS or key.startswith("continuity structure"):
+        return "theme_only"
+    if _is_noise_entity_label(normalized):
+        return "rejected"
+    if len(key) <= 2 and key not in {"ai"}:
+        return "rejected"
+    return "person_or_project"
+
+
+def _is_valid_entity_label(label: str) -> bool:
+    return _route_label_kind(label) == "person_or_project"
+
+
+def _is_valid_relationship_object_label(label: str) -> bool:
+    return _route_label_kind(label) == "person_or_project"
+
+
+def _clean_through_left_label(label: str) -> str:
+    cleaned = _normalize_entity_label(label)
+    previous = None
+    while previous != cleaned:
+        previous = cleaned
+        cleaned = _THROUGH_LEFT_TRAILING_ACTION_RE.sub("", cleaned).strip()
+    return _canonical_entity_label(cleaned) if cleaned else ""
+
+
+def _has_contest_event_signal(text: str) -> bool:
+    if not CONTEST_RE.search(text):
+        return False
+    if re.search(r"\b(?:contest|competition|event|rules|deadline|entries|winner|prize|submission\s+window|bracket|round|judge)\b", text, re.I):
+        return True
+    return bool(CHALLENGE_CONTEST_RE.search(text))
+
+
+def _positive_counter_items(counter: Counter[str]):
+    return ((k, v) for k, v in counter.items() if int(v) > 0)
 
 
 def now_iso() -> str:
@@ -317,8 +440,8 @@ def _known_entity_names(conn: sqlite3.Connection, guild_id: int | None, subject:
             for row in conn.execute(f"SELECT {', '.join(select)} FROM {table}{where} LIMIT ?", (*params, min(limit, 200))):
                 text = " ".join(str(row[col] or "") for col in select)
                 for match in re.finditer(r"\b[A-Z][A-Za-z0-9_-]{2,}(?:\s+[A-Z][A-Za-z0-9_-]{2,}){0,2}\b", text):
-                    candidate = safe_text(match.group(0), 90).strip()
-                    if candidate and candidate not in EXTRA_ENTITY_NAME_STOPWORDS:
+                    candidate = _canonical_entity_label(match.group(0))
+                    if candidate and _route_label_kind(candidate) in {"person_or_project", "core_barcode_entity"}:
                         names.add(candidate)
         except sqlite3.Error:
             continue
@@ -553,8 +676,10 @@ def _classify(subject: str, rows: list[dict[str, Any]]) -> dict[str, Any]:
     extraction_rows = [r for r in rows if _should_extract_named_topics_from_row(r)]
 
     def add_edge(obj: str, rel: str, row: dict[str, Any], confidence: float = 0.62) -> None:
-        obj = safe_text(obj, 80).strip()
-        if not obj or subject_key(obj) == skey or obj.lower() in {"BNL".lower(), "BARCODE".lower()}:
+        obj = _canonical_entity_label(obj)
+        if not obj or subject_key(obj) == skey:
+            return
+        if not _is_valid_relationship_object_label(obj):
             return
         key = (subject_key(obj), rel)
         existing = edges.get(key)
@@ -578,6 +703,8 @@ def _classify(subject: str, rows: list[dict[str, Any]]) -> dict[str, Any]:
         text = str(row.get("text") or "")
         low = text.lower()
         for role, pat, reason in ROLE_PATTERNS:
+            if role == "contest operator" and not _has_contest_event_signal(text):
+                continue
             if pat.search(text):
                 role_counts[role] += 1
                 role_reasons.setdefault(role, reason)
@@ -607,13 +734,14 @@ def _classify(subject: str, rows: list[dict[str, Any]]) -> dict[str, Any]:
             music["asks for feedback"] += 1
         if ANTAGONISTIC_RE.search(text):
             behaviors["antagonistic/challenging"] += 1
-            activity["challenges BNL"] += 1 if BNL_RE.search(text) else 0
+            if BNL_RE.search(text):
+                activity["challenges BNL"] += 1
         if ANOMALY_RE.search(text):
             behaviors["theory/anomaly-heavy"] += 1
-        if CONTEST_RE.search(text):
+        if _has_contest_event_signal(text):
             behaviors["contest-focused"] += 1
             events["contest/event activity"] += 1
-            if re.search(r"\b(?:rules|instructions|deadline|entries)\b", text, re.I):
+            if re.search(r"\b(?:rules|instructions|deadline|entries|submission\s+window|bracket|round|judge)\b", text, re.I):
                 events["rules/instructions poster"] += 1
             if re.search(r"\b(?:organize|run|host|operator|promote)\b", text, re.I):
                 events["contest organizer"] += 1
@@ -627,26 +755,32 @@ def _classify(subject: str, rows: list[dict[str, Any]]) -> dict[str, Any]:
         if not _should_extract_relationships_from_row(row):
             continue
         for m in THROUGH_RE.finditer(text):
-            a, b = m.group(1), m.group(2)
+            a, b = _clean_through_left_label(m.group(1)), _canonical_entity_label(m.group(2))
+            if subject_key(b).startswith(f"{skey}-"):
+                b = subject
+            if not a or not _is_valid_relationship_object_label(a):
+                continue
             if subject_key(b) == skey:
                 add_edge(a, "speaks_through", row, 0.72)
-            elif subject_key(a) == skey:
+            elif subject_key(a) == skey and _is_valid_relationship_object_label(b):
                 add_edge(b, "relayed_through", row, 0.66)
         for m in CREATED_RE.finditer(text):
-            a, b = m.group(1), m.group(2)
-            if subject_key(a) == skey:
+            a, b = _canonical_entity_label(m.group(1)), _canonical_entity_label(m.group(2))
+            if subject_key(a) == skey and _is_valid_relationship_object_label(b):
                 add_edge(b, "created", row, 0.78)
-            elif subject_key(b) == skey:
+            elif subject_key(b) == skey and _is_valid_relationship_object_label(a):
                 add_edge(a, "created_by", row, 0.78)
         for m in CREATED_MY_RE.finditer(text):
-            add_edge(m.group(1), "created", row, 0.70)
+            obj = _canonical_entity_label(m.group(1))
+            if row.get("scope") in {"subject_authored", "subject_keyed", "subject_direct_evidence"} and _is_valid_relationship_object_label(obj):
+                add_edge(obj, "created", row, 0.70)
         for m in HERE_RE.finditer(text):
-            obj = m.group(1)
-            if subject_key(obj) != skey:
+            obj = _canonical_entity_label(m.group(1))
+            if subject_key(obj) != skey and _is_valid_relationship_object_label(obj):
                 add_edge(obj, "associated_with", row, 0.50)
         cm = re.search(r"\bcollab(?:orate)?\s+with\s+([A-Z][A-Za-z0-9_-]{2,}(?:\s+[A-Z][A-Za-z0-9_-]{2,}){0,2})", text, re.I)
         if cm:
-            add_edge(cm.group(1), "offers_collaboration", row, 0.68)
+            add_edge(_canonical_entity_label(cm.group(1)), "offers_collaboration", row, 0.68)
 
     source_blind_count = sum(1 for row in rows if row.get("authority") == "source_blind_memory" or row.get("visibility") == "source_blind")
     global_mixed_count = sum(1 for row in rows if row.get("scope") == "global_mixed_memory")
@@ -660,16 +794,16 @@ def _classify(subject: str, rows: list[dict[str, Any]]) -> dict[str, Any]:
         behaviors["frequent poster"] += len(extraction_rows)
     elif extraction_rows:
         behaviors["occasional/low activity"] += len(extraction_rows)
-    for label, count in role_counts.items():
+    for label, count in _positive_counter_items(role_counts):
         # moderator/contest roles are review-needed until public role is confirmed.
         review_needed = label in {"moderator", "contest operator", "lore/entity/persona/project creator", "antagonist/challenger"}
         facts.append(_item(label, role_reasons.get(label, label), visibility="review_only" if review_needed else "public_safe_candidate", authority="bnl_inferred", confidence=min(0.9, 0.55 + count * 0.08), public_safe=not review_needed and label != "unknown", review_only=review_needed or label == "unknown", needs_owner_review=review_needed, evidence_count=count) | {"type": "role"})
     roles = facts[:]
-    creative = [_item(k, k, visibility="public_safe_candidate", authority="public_discord_observed", confidence=min(0.9, .55 + v*.08), public_safe=True, review_only=False, needs_owner_review=k.startswith("shares") and "links" in k, evidence_count=v) | {"type": "creative_music"} for k, v in music.items()]
-    bnl = [_item(k, k, visibility="review_only" if "challenges" in k else "public_safe_candidate", authority="bnl_inferred", confidence=min(.9,.55+v*.08), public_safe="challenges" not in k, review_only="challenges" in k, needs_owner_review="challenges" in k, evidence_count=v) | {"type": "bnl_interaction"} for k, v in activity.items() if "BNL" in k or "source-file" in k or "boundaries" in k or "challenges" in k]
-    behavior = [_item(k, k, visibility="review_only" if k in {"antagonistic/challenging", "theory/anomaly-heavy", "lore-heavy"} else "public_safe_candidate", authority="bnl_inferred", confidence=min(.9,.55+v*.06), public_safe=k not in {"antagonistic/challenging", "theory/anomaly-heavy", "lore-heavy"}, review_only=k in {"antagonistic/challenging", "theory/anomaly-heavy", "lore-heavy"}, needs_owner_review=k in {"antagonistic/challenging", "theory/anomaly-heavy", "lore-heavy"}, evidence_count=v) | {"type": "behavior_posture"} for k, v in behaviors.items()]
-    theme_items = [_item(k, k, visibility="review_only" if k in {"strange/anomaly conversations", "AI/persona/project interaction"} else "public_safe_candidate", authority="bnl_inferred", confidence=min(.9,.55+v*.06), public_safe=k not in {"strange/anomaly conversations", "AI/persona/project interaction"}, review_only=k in {"strange/anomaly conversations", "AI/persona/project interaction"}, needs_owner_review=k in {"strange/anomaly conversations", "AI/persona/project interaction"}, evidence_count=v) | {"type": "conversation_theme"} for k, v in themes.items()]
-    event_items = [_item(k, k, visibility="review_only" if k != "contest/event activity" else "public_safe_candidate", authority="bnl_inferred", confidence=min(.9,.55+v*.08), public_safe=k == "contest/event activity", review_only=k != "contest/event activity", needs_owner_review=True, evidence_count=v) | {"type": "event_contest"} for k, v in events.items()]
+    creative = [_item(k, k, visibility="public_safe_candidate", authority="public_discord_observed", confidence=min(0.9, .55 + v*.08), public_safe=True, review_only=False, needs_owner_review=k.startswith("shares") and "links" in k, evidence_count=v) | {"type": "creative_music"} for k, v in _positive_counter_items(music)]
+    bnl = [_item(k, k, visibility="review_only" if "challenges" in k else "public_safe_candidate", authority="bnl_inferred", confidence=min(.9,.55+v*.08), public_safe="challenges" not in k, review_only="challenges" in k, needs_owner_review="challenges" in k, evidence_count=v) | {"type": "bnl_interaction"} for k, v in _positive_counter_items(activity) if "BNL" in k or "source-file" in k or "boundaries" in k or "challenges" in k]
+    behavior = [_item(k, k, visibility="review_only" if k in {"antagonistic/challenging", "theory/anomaly-heavy", "lore-heavy"} else "public_safe_candidate", authority="bnl_inferred", confidence=min(.9,.55+v*.06), public_safe=k not in {"antagonistic/challenging", "theory/anomaly-heavy", "lore-heavy"}, review_only=k in {"antagonistic/challenging", "theory/anomaly-heavy", "lore-heavy"}, needs_owner_review=k in {"antagonistic/challenging", "theory/anomaly-heavy", "lore-heavy"}, evidence_count=v) | {"type": "behavior_posture"} for k, v in _positive_counter_items(behaviors)]
+    theme_items = [_item(k, k, visibility="review_only" if k in {"strange/anomaly conversations", "AI/persona/project interaction"} else "public_safe_candidate", authority="bnl_inferred", confidence=min(.9,.55+v*.06), public_safe=k not in {"strange/anomaly conversations", "AI/persona/project interaction"}, review_only=k in {"strange/anomaly conversations", "AI/persona/project interaction"}, needs_owner_review=k in {"strange/anomaly conversations", "AI/persona/project interaction"}, evidence_count=v) | {"type": "conversation_theme"} for k, v in _positive_counter_items(themes)]
+    event_items = [_item(k, k, visibility="review_only" if k != "contest/event activity" else "public_safe_candidate", authority="bnl_inferred", confidence=min(.9,.55+v*.08), public_safe=k == "contest/event activity", review_only=k != "contest/event activity", needs_owner_review=True, evidence_count=v) | {"type": "event_contest"} for k, v in _positive_counter_items(events)]
     action_items = []
     missing = []
     if edges:
