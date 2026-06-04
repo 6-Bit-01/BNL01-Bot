@@ -119,15 +119,26 @@ EXTRA_ENTITY_NAME_STOPWORDS = {
 _LABEL_BLOCKED_KEYS = {re.sub(r"[^a-z0-9]+", " ", label.lower()).strip() for label in EXTRA_ENTITY_NAME_STOPWORDS}
 _SCHEDULE_OR_TIME_RE = re.compile(r"\b(?:(?:\d{1,2}(?::\d{2})?\s*)?(?:am|pm)(?:\s+pacific(?:\s+time)?)?|pacific(?:\s+time)?|monday|tuesday|wednesday|thursday|friday|saturday|sunday|tonight|today|tomorrow|yesterday|morning|afternoon|evening|night)\b", re.I)
 _GREETING_OR_ADDRESS_RE = re.compile(r"\b(?:hey(?:\s+b)?|hi|hello|yo|dear|user|users|member|members|someone|something|anyone|everyone|everything)\b", re.I)
-_ACTION_OR_VERB_FRAGMENT_RE = re.compile(r"\b(?:speaking(?:\s+directly)?|talking|transmitted|transmitting|relayed|operating|active|directly|still)\b", re.I)
+_ACTION_OR_VERB_FRAGMENT_RE = re.compile(r"\b(?:speaking(?:\s+directly)?|talking|transmitted|transmitting|relayed|operating|active|directly|still|communicate|communicates|communicating)\b", re.I)
 _THROUGH_LEFT_TRAILING_ACTION_RE = re.compile(r"(?:\s+(?:speaking(?:\s+directly)?|talking|transmitted|transmitting|relayed|operating|active))+$", re.I)
+_RELATIONSHIP_LABEL_BLOCKED_PREFIXES = {
+    "the", "a", "an", "not", "are", "is", "was", "were", "can", "could", "would", "should",
+    "entire", "precision", "tradeoff", "value", "still", "anyone", "user", "users",
+}
+_COMMON_PROSE_WORDS = _LABEL_BLOCKED_KEYS | {
+    "entire", "civilizations", "communicate", "purely", "language", "sustained", "analytical", "input",
+    "tradeoff", "precision", "matters", "value", "trap", "incidental", "here", "through", "speaking",
+    "operating", "structure", "continuity", "still", "anyone", "directly", "transmitted",
+}
 _PLATFORM_OR_TOOL_KEYS = {"discord", "suno", "udio", "youtube", "soundcloud", "spotify", "bandcamp", "instagram", "tiktok"}
 _SYSTEM_OR_CHANNEL_KEYS = {"source file", "source files", "candidate intake", "dossier", "dossiers", "owner", "admin", "moderator", "staff", "public", "review", "unknown", "entity", "ai", "bot", "server", "channel", "welcome", "episode tracker"}
 _THEME_ONLY_KEYS = {"continuity", "continuity structure", "conversation", "community", "source", "file", "dossier", "anomaly", "lore", "signal", "challenge", "rules language"}
+_COMMON_PROSE_WORDS.update(_THEME_ONLY_KEYS)
 _CORE_BARCODE_ALIASES = {
     "6 bit": "6 Bit", "six bit": "6 Bit", "bit": "6 Bit", "bit s": "6 Bit", "bits": "6 Bit",
     "bnl": "BNL", "bnl 01": "BNL-01", "barcode": "BARCODE", "barcode network": "BARCODE Network", "barcode radio": "BARCODE Radio",
 }
+_NAMED_ENTITY_ALLOWLIST_KEYS = {"orion", "signal witch", "vega signal"}
 
 
 def _label_key(label: str) -> str:
@@ -177,11 +188,52 @@ def _is_noise_entity_label(label: str) -> bool:
     return bool(_ACTION_OR_VERB_FRAGMENT_RE.fullmatch(normalized) or _ACTION_OR_VERB_FRAGMENT_RE.fullmatch(key))
 
 
+def _looks_like_entity_marker(label: str) -> bool:
+    raw = str(label or "").strip()
+    normalized = _normalize_entity_label(raw)
+    key = _label_key(normalized)
+    if not key:
+        return False
+    if key in _NAMED_ENTITY_ALLOWLIST_KEYS or _is_core_barcode_alias(normalized):
+        return True
+    if re.search(r"\b0x[A-Fa-f0-9]{2,}\b|[A-Z0-9]{3,}-[A-Z0-9-]+", raw):
+        return True
+    if raw[:1] in {'"', "'", "“", "‘"} and raw[-1:] in {'"', "'", "”", "’"}:
+        return True
+    words = normalized.split()
+    if not words:
+        return False
+    title_words = [w for w in words if re.match(r"^[A-Z][A-Za-z0-9_-]{2,}$", w)]
+    return bool(title_words) and len(title_words) == len(words)
+
+
+def _strict_relationship_label_rejection_reason(label: str) -> str:
+    normalized = _normalize_entity_label(label)
+    key = _label_key(normalized)
+    if not key:
+        return "empty"
+    words = key.split()
+    if words and words[0] in _RELATIONSHIP_LABEL_BLOCKED_PREFIXES:
+        return "blocked_prefix"
+    if key in {"trap", "speaking", "transmitted", "directly", "operating", "not incidental", "are still", "sustained analytical input", "entire civilizations communicate purely"}:
+        return "blocked_fragment"
+    if any(word in {"speaking", "transmitted", "directly", "operating", "communicate", "communicates", "communicating"} for word in words) and not _looks_like_entity_marker(normalized):
+        return "verb_fragment"
+    if len(words) > 1 and all(word in _COMMON_PROSE_WORDS for word in words) and not _looks_like_entity_marker(normalized):
+        return "common_prose"
+    if len(words) == 1 and words[0] in _COMMON_PROSE_WORDS and key not in _NAMED_ENTITY_ALLOWLIST_KEYS:
+        return "common_word"
+    return ""
+
+
 def _route_label_kind(label: str) -> str:
     normalized = _normalize_entity_label(label)
     key = _label_key(normalized)
     if not key:
         return "rejected"
+    strict_reason = _strict_relationship_label_rejection_reason(normalized)
+    if strict_reason:
+        return strict_reason
     if _is_greeting_or_address_label(normalized):
         return "greeting_or_address"
     if _is_schedule_or_time_label(normalized):
@@ -209,8 +261,12 @@ def _is_valid_entity_label(label: str) -> bool:
     return _route_label_kind(label) == "person_or_project"
 
 
-def _is_valid_relationship_object_label(label: str) -> bool:
-    return _route_label_kind(label) == "person_or_project"
+def _is_valid_relationship_object_label(label: str, *, extraction: str = "") -> bool:
+    if _route_label_kind(label) != "person_or_project":
+        return False
+    if extraction in {"here", "through"} and not _looks_like_entity_marker(label):
+        return False
+    return True
 
 
 def _clean_through_left_label(label: str) -> str:
@@ -665,6 +721,7 @@ def _classify(subject: str, rows: list[dict[str, Any]]) -> dict[str, Any]:
     events = Counter()
     activity = Counter()
     edges: dict[tuple[str, str], dict[str, Any]] = {}
+    label_traces: list[dict[str, Any]] = []
     facts: list[dict[str, Any]] = []
     skey = subject_key(subject)
     source_counts = Counter(r["source"] for r in rows)
@@ -675,11 +732,23 @@ def _classify(subject: str, rows: list[dict[str, Any]]) -> dict[str, Any]:
     review_rows = len(rows) - public_rows
     extraction_rows = [r for r in rows if _should_extract_named_topics_from_row(r)]
 
-    def add_edge(obj: str, rel: str, row: dict[str, Any], confidence: float = 0.62) -> None:
+    def trace_label(label: str, kind: str, accepted: bool, reason: str, row: dict[str, Any]) -> None:
+        label_traces.append({
+            "label": safe_text(label, 90),
+            "kind": kind,
+            "accepted": bool(accepted),
+            "reason": reason,
+            "sourceScope": row.get("scope") or "unknown",
+            "sourceTable": row.get("source") or "unknown",
+            "evidenceCount": 1,
+        })
+
+    def add_edge(obj: str, rel: str, row: dict[str, Any], confidence: float = 0.62, extraction: str = "") -> None:
         obj = _canonical_entity_label(obj)
         if not obj or subject_key(obj) == skey:
             return
-        if not _is_valid_relationship_object_label(obj):
+        if not _is_valid_relationship_object_label(obj, extraction=extraction):
+            trace_label(obj, f"relationship:{rel}", False, _route_label_kind(obj), row)
             return
         key = (subject_key(obj), rel)
         existing = edges.get(key)
@@ -688,7 +757,9 @@ def _classify(subject: str, rows: list[dict[str, Any]]) -> dict[str, Any]:
             existing["confidence"] = min(0.95, max(existing["confidence"], confidence) + 0.05)
             existing["publicSafe"] = existing["publicSafe"] and bool(row.get("public_safe"))
             existing["reviewOnly"] = existing["reviewOnly"] or bool(row.get("review_only"))
+            trace_label(obj, f"relationship:{rel}", True, "merged_existing_edge", row)
             return
+        trace_label(obj, f"relationship:{rel}", True, "validated_entity_label", row)
         edges[key] = {
             "objectKey": subject_key(obj), "objectLabel": obj, "relationType": rel,
             "visibility": "review_only" if row.get("review_only") else "public_safe_candidate",
@@ -758,12 +829,14 @@ def _classify(subject: str, rows: list[dict[str, Any]]) -> dict[str, Any]:
             a, b = _clean_through_left_label(m.group(1)), _canonical_entity_label(m.group(2))
             if subject_key(b).startswith(f"{skey}-"):
                 b = subject
-            if not a or not _is_valid_relationship_object_label(a):
+            if not a or not _is_valid_relationship_object_label(a, extraction="through"):
+                if a:
+                    trace_label(a, "relationship:speaks_through", False, _route_label_kind(a), row)
                 continue
             if subject_key(b) == skey:
-                add_edge(a, "speaks_through", row, 0.72)
-            elif subject_key(a) == skey and _is_valid_relationship_object_label(b):
-                add_edge(b, "relayed_through", row, 0.66)
+                add_edge(a, "speaks_through", row, 0.72, extraction="through")
+            elif subject_key(a) == skey and _is_valid_relationship_object_label(b, extraction="through"):
+                add_edge(b, "relayed_through", row, 0.66, extraction="through")
         for m in CREATED_RE.finditer(text):
             a, b = _canonical_entity_label(m.group(1)), _canonical_entity_label(m.group(2))
             if subject_key(a) == skey and _is_valid_relationship_object_label(b):
@@ -776,8 +849,10 @@ def _classify(subject: str, rows: list[dict[str, Any]]) -> dict[str, Any]:
                 add_edge(obj, "created", row, 0.70)
         for m in HERE_RE.finditer(text):
             obj = _canonical_entity_label(m.group(1))
-            if subject_key(obj) != skey and _is_valid_relationship_object_label(obj):
-                add_edge(obj, "associated_with", row, 0.50)
+            if subject_key(obj) != skey and _is_valid_relationship_object_label(obj, extraction="here"):
+                add_edge(obj, "associated_with", row, 0.50, extraction="here")
+            elif subject_key(obj) != skey:
+                trace_label(obj, "relationship:associated_with", False, _route_label_kind(obj), row)
         cm = re.search(r"\bcollab(?:orate)?\s+with\s+([A-Z][A-Za-z0-9_-]{2,}(?:\s+[A-Z][A-Za-z0-9_-]{2,}){0,2})", text, re.I)
         if cm:
             add_edge(_canonical_entity_label(cm.group(1)), "offers_collaboration", row, 0.68)
@@ -844,6 +919,7 @@ def _classify(subject: str, rows: list[dict[str, Any]]) -> dict[str, Any]:
         "dossierUsefulness": dossier,
         "actionItems": action_items,
         "missingInfo": sorted(set(missing)),
+        "labelEvidenceTraces": label_traces[:80],
         "warnings": [i for i in action_items if i.get("type") == "warning"],
         "sourceCounts": dict(source_counts),
         "scopeCounts": dict(scope_counts),
@@ -953,6 +1029,7 @@ def build_entity_intelligence_profile(db_path: str, guild_id: int | None, subjec
             "officialPublicDossierConnected": False,
             "officialPublicDossierNote": "official_public_dossier source not connected yet",
             "queueSubmissionStatus": "not_connected",
+            "labelEvidenceTraces": classified.get("labelEvidenceTraces") or [],
         }
         profile = {
             "subjectKey": skey,

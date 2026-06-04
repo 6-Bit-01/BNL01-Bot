@@ -540,21 +540,24 @@ def parse_source_enrichment_command(content: str) -> tuple[bool, dict[str, Any] 
         lookup_key: lookup_value,
         "dry_run": False,
         "force": False,
+        "diagnostics": False,
     }
     for extra in parts[1:]:
         if not extra:
             continue
         opt = re.match(r"^([A-Za-z_]+)\s*=\s*(.+)$", extra, flags=re.S)
         if not opt:
-            return True, None, "Supported options: dry_run=true|false, force=true|false."
+            return True, None, "Supported options: dry_run=true|false, force=true|false, diagnostics=true|false."
         key = opt.group(1).strip().lower()
         value = opt.group(2).strip()
         if key in {"dry_run", "dryrun"}:
             options["dry_run"] = value.lower() in {"true", "1", "yes", "on"}
         elif key == "force":
             options["force"] = value.lower() in {"true", "1", "yes", "on"}
+        elif key in {"diagnostics", "verbose", "debug"}:
+            options["diagnostics"] = value.lower() in {"true", "1", "yes", "on"}
         else:
-            return True, None, "Supported options: dry_run=true|false, force=true|false."
+            return True, None, "Supported options: dry_run=true|false, force=true|false, diagnostics=true|false."
     return True, options, ""
 
 
@@ -1202,6 +1205,42 @@ def _bounded_entity_summary_fields(summary: dict[str, Any], *, include: bool) ->
     return fields
 
 
+_BLOCKED_SOURCE_PAYLOAD_LABELS = {
+    "entire civilizations communicate purely", "not", "the tradeoff", "precision matters", "the value",
+    "trap", "hey b", "friday", "pm pacific time", "user", "bit", "bit s", "bit's",
+    "sustained analytical input", "not incidental", "are still",
+}
+_BLOCKED_SOURCE_PAYLOAD_RE = re.compile(r"(?i)(?:\bentire civilizations communicate purely\b|\bsustained analytical input\b|\bnot incidental\b|\bare still\b|\bthe tradeoff\b|\bprecision matters\b|\bthe value\b|\bhey b\b|\bpm pacific time\b|(?:^|[:\s])(?:not|trap|friday|user|bit|bit['’]?s?)(?:$|[.!,;:\s]))")
+
+
+def _source_payload_item_has_blocked_label(value: Any) -> bool:
+    text = json.dumps(value, sort_keys=True, default=str) if isinstance(value, (dict, list)) else str(value or "")
+    lowered = re.sub(r"[^a-z0-9']+", " ", text.lower()).strip()
+    if lowered in _BLOCKED_SOURCE_PAYLOAD_LABELS:
+        return True
+    return bool(_BLOCKED_SOURCE_PAYLOAD_RE.search(text))
+
+
+def _validate_source_payload_fields(container: dict[str, Any]) -> list[dict[str, Any]]:
+    rejected: list[dict[str, Any]] = []
+    fields = ("topicBreakdown", "bestEvidenceToReview", "relationshipSignals", "publicUseCandidates", "reviewOnlyEvidence", "conversationHighlights", "evidenceDetails", "knownContext", "usefulEvidence")
+    for key in fields:
+        value = container.get(key)
+        if not isinstance(value, list):
+            continue
+        kept = []
+        for item in value:
+            if _source_payload_item_has_blocked_label(item):
+                rejected.append({"label": _safe_text(item, 120), "kind": key, "accepted": False, "reason": "blocked_source_payload_label", "sourceScope": "payload_validation", "sourceTable": "source_file_enrichment", "evidenceCount": 1})
+            else:
+                kept.append(item)
+        container[key] = kept
+    diagnostics = container.setdefault("diagnostics", {}) if isinstance(container.get("diagnostics"), dict) or "diagnostics" not in container else {}
+    if rejected and isinstance(diagnostics, dict):
+        diagnostics.setdefault("rejectedLabelTraces", []).extend(rejected[:50])
+    return rejected
+
+
 def _copy_evidence_fields(target: dict[str, Any], source: dict[str, Any]) -> None:
     for key in (
         "knownContext",
@@ -1228,6 +1267,7 @@ def _copy_evidence_fields(target: dict[str, Any], source: dict[str, Any]) -> Non
     target["queueSubmissionStatus"] = source.get("queueSubmissionStatus") or "not_connected"
     target["queueSubmissionNote"] = source.get("queueSubmissionNote") or QUEUE_NOT_CONNECTED_NOTE
     target["rawProvenance"] = dict(source.get("rawProvenance") or {})
+    _validate_source_payload_fields(target)
 
 
 def collect_source_enrichment_evidence(db_path: str, guild_id: int | None, subject: str, *, rd_context: list[dict[str, Any]] | None = None, lookup_result: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -2381,6 +2421,7 @@ def build_enrichment_recommendation_payload(packet: dict[str, Any], *, environ: 
     source_file = packet.get("sourceFile") if isinstance(packet.get("sourceFile"), dict) else {}
     target_candidate_id = _first(source_file, ("candidateId", "targetCandidateId", "id")) if match_kind in {"candidate_intake", "active_source_file"} else None
     target_dossier_id = _first(source_file, ("targetDossierId", "dossierId", "publicDossierId")) if match_kind == "existing_dossier_update" else None
+    _validate_source_payload_fields(packet)
     evidence = build_compact_enrichment_evidence_summary(packet)
     payload = {
         "type": "modify_existing_dossier" if match_kind in {"active_source_file", "existing_dossier_update", "candidate_intake"} else "new_subject",
@@ -2437,7 +2478,9 @@ def build_enrichment_recommendation_payload(packet: dict[str, Any], *, environ: 
         "ingestSource": source_enrichment_ingest_source(environ),
         "ingestKey": deterministic_enrichment_ingest_key(subject, match_kind, sections),
     }
+    _validate_source_payload_fields(payload)
     compact_payload = compact_enrichment_payload_for_site(build_dossier_recommendation_payload(payload))
+    _validate_source_payload_fields(compact_payload)
     compact_payload["siteValidationIssues"] = validate_enrichment_payload_for_site(compact_payload)
     if not compact_payload["siteValidationIssues"]:
         compact_payload.pop("siteValidationIssues", None)
@@ -2457,6 +2500,7 @@ def run_source_file_enrichment(
     lookup_key: str = "subject",
     lookup_value: str | None = None,
     force: bool = False,
+    diagnostics: bool = False,
 ) -> dict[str, Any]:
     canonical_key = lookup_key if lookup_key in {"subject", "alias", "candidateId", "normalizedName"} else "subject"
     target_value = (lookup_value if lookup_value is not None else subject) or ""
@@ -2563,9 +2607,11 @@ def run_source_file_enrichment(
         "sourceTypesSkipped": (evidence.get("diagnostics") or {}).get("sourceTypesSkipped", {}),
         "runTime": datetime.now(timezone.utc).isoformat(),
         "forced": bool(force),
+        "diagnosticsRequested": bool(diagnostics),
     }
     _copy_evidence_fields(packet, evidence)
     packet["subjectIntelligenceDiagnostics"] = evidence.get("subjectIntelligenceDiagnostics") or {}
+    packet["diagnosticsRequested"] = bool(diagnostics)
     quality = evaluate_enrichment_quality(packet)
     packet["qualityScore"] = quality["score"]
     packet["qualityStatus"] = "forced_low_confidence" if force and quality["status"] != "sendable" else quality["status"]
@@ -2658,65 +2704,81 @@ def format_source_enrichment_response(result: dict[str, Any]) -> str:
             f"Target lane: {attach_label}.",
             f"Would send as BNL Source File Enrichment: {'yes' if result.get('qualityStatus') != 'too_thin' else 'no — too thin'}.",
             f"Source types used: {source_types}.",
-            f"Source coverage: {_safe_text(_format_source_coverage(result), 220)}.",
+            f"Source coverage: {_safe_text(_format_source_coverage(result), 120)}.",
             f"Matched local profiles/users: {int((result.get('diagnostics') or {}).get('matchedUserProfileCount') or 0)}/{int((result.get('diagnostics') or {}).get('matchedUserIdCount') or 0)}.",
             f"Matched identity labels: {_safe_text(', '.join((result.get('diagnostics') or {}).get('matchedIdentityLabels') or []) or 'none', 160)}.",
             f"Channel evidence found: {'yes' if (result.get('diagnostics') or {}).get('channelEvidenceFound') else 'no'}; public dossier match found: {'yes' if (result.get('diagnostics') or {}).get('publicDossierMatchFound') else 'no'}; existing dossier update lane: {'yes' if (result.get('diagnostics') or {}).get('existingDossierUpdateLane') else 'no'}.",
+            f"public_dossier_match {'yes' if (result.get('diagnostics') or {}).get('publicDossierMatchFound') else 'no'}.",
             f"Warning count: {warning_text}.",
         ]
         early_entity_diag = ((result.get("diagnostics") or {}).get("entityIntelligence") or {})
         if early_entity_diag:
-            preview_lines.append(f"Entity intelligence ledger/profile: {_safe_text(early_entity_diag.get('ledgerStatus') or 'unknown', 40)} / {_safe_text(early_entity_diag.get('profileStatus') or 'unknown', 40)}; Resolver surface: {_safe_text(early_entity_diag.get('resolverSurface') or 'source_file', 40)}.")
+            scope_counts = early_entity_diag.get("rowScopeCounts") or {}
+            preview_lines.extend([
+                f"Entity intelligence ledger/profile: {_safe_text(early_entity_diag.get('ledgerStatus') or 'unknown', 40)} / {_safe_text(early_entity_diag.get('profileStatus') or 'unknown', 40)}; Resolver surface: {_safe_text(early_entity_diag.get('resolverSurface') or 'source_file', 40)}.",
+                f"Entity ledger roles: {_safe_text(', '.join(early_entity_diag.get('detectedRoleFacets') or []) or 'none', 140)}.",
+                f"Entity ledger relationships: {_safe_text(', '.join(early_entity_diag.get('detectedRelationshipFacets') or []) or 'none', 140)}.",
+                f"Entity ledger creative/music activity: {_safe_text(', '.join(early_entity_diag.get('creativeMusicFacets') or []) or 'none', 120)}.",
+                f"Entity ledger BNL interaction/themes: {_safe_text(', '.join((early_entity_diag.get('bnlInteractionFacets') or []) + (early_entity_diag.get('conversationThemes') or [])) or 'none', 170)}.",
+                f"Entity ledger action items/missing info: {_safe_text('; '.join((early_entity_diag.get('modActionItems') or []) + (early_entity_diag.get('missingInfo') or [])) or 'none', 100)}.",
+                f"Entity ledger scope/rejection counts: owned={int(scope_counts.get('subject_owned') or 0)} keyed={int(scope_counts.get('subject_keyed') or 0)} authored={int(scope_counts.get('subject_authored') or 0)} rejected={int(scope_counts.get('rejected') or 0)}.",
+            ])
         subject_intel = (result.get("diagnostics") or {}).get("subjectIntelligence") or result.get("subjectIntelligenceDiagnostics") or {}
         if subject_intel:
-            rows_by_source = subject_intel.get("rowsBySource") or {}
-
+            rows_by_source = subject_intel.get("rowsBySource") or subject_intel.get("sourceCounts") or {}
             accepted_subjects = subject_intel.get("acceptedRecurringSubjects") or []
-            accepted_subject_parts = []
-            for item in accepted_subjects:
-                if not isinstance(item, dict):
-                    continue
-                label = _safe_text(item.get("label") or "", 80)
-                reason = _safe_text(item.get("reason") or "", 80)
-                if label:
-                    accepted_subject_parts.append(f"{label}: {reason}" if reason else label)
-            accepted_subject_text = ", ".join(accepted_subject_parts) or "none"
-
             rejected_candidates = [_safe_text(item, 80) for item in (subject_intel.get("rejectedGarbageCandidates") or [])]
-            rejected_candidate_text = ", ".join(item for item in rejected_candidates if item) or "none"
-            conversation_clusters = [_safe_text(item, 100) for item in (subject_intel.get("topConversationClusters") or [])]
-            conversation_cluster_text = ", ".join(item for item in conversation_clusters if item) or "none"
-            activity_patterns = [_safe_text(item, 120) for item in (subject_intel.get("topActivityPatterns") or [])]
-            activity_pattern_text = " | ".join(item for item in activity_patterns if item) or "none"
-
+            rejected_count = int(subject_intel.get("rejectedRecurringSubjectCount") or len(rejected_candidates) or 0)
+            advisory_count = int(subject_intel.get("acceptedRecurringSubjectCount") or len(accepted_subjects) or len(subject_intel.get("topRecurringSubjects") or []) or 0)
             preview_lines.extend([
                 f"Subject intelligence rows scanned: {int(subject_intel.get('rowsScanned') or 0)}.",
                 f"Subject intelligence rows by source: {_safe_text(', '.join(f'{k} {v}' for k, v in rows_by_source.items()) or 'none', 220)}.",
-                f"Top recurring subjects: {_safe_text(', '.join(subject_intel.get('topRecurringSubjects') or []) or 'none', 180)}.",
-                f"Accepted recurring subjects with reason: {_safe_text(accepted_subject_text, 220)}.",
-                f"Rejected top garbage candidates: {_safe_text(rejected_candidate_text, 100)}.",
-                f"Top recurring themes: {_safe_text(', '.join(subject_intel.get('topRecurringThemes') or []) or 'none', 140)}.",
-                f"Top conversation clusters: {_safe_text(conversation_cluster_text, 150)}.",
-                f"Top activity patterns: {_safe_text(activity_pattern_text, 150)}.",
-                f"Top domains/tools: {_safe_text(', '.join(subject_intel.get('topDomains') or []) or 'none', 180)}.",
-                f"Public-safe vs review-only intelligence rows: {int(subject_intel.get('publicSafeRows') or 0)} public-safe / {int(subject_intel.get('reviewOnlyRows') or 0)} review-only.",
+                f"Legacy recurring-subject diagnostics: {rejected_count} rejected / {advisory_count} advisory only; hidden in normal dry-run. Use diagnostics=true for candidate details.",
+                f"Public-safe vs review-only intelligence rows: {int(subject_intel.get('publicSafeRows') or subject_intel.get('publicRows') or 0)} public-safe / {int(subject_intel.get('reviewOnlyRows') or 0)} review-only.",
             ])
+            if result.get("diagnosticsRequested"):
+                preview_lines.append("Legacy recurring-subject diagnostics only. These are not Source File claims.")
+                accepted_subject_parts = []
+                for item in accepted_subjects:
+                    if not isinstance(item, dict):
+                        continue
+                    label = _safe_text(item.get("label") or "", 80)
+                    reason = _safe_text(item.get("reason") or "", 80)
+                    if label:
+                        accepted_subject_parts.append(f"{label}: {reason}" if reason else label)
+                accepted_subject_text = ", ".join(accepted_subject_parts) or "none"
+                rejected_candidate_text = ", ".join(item for item in rejected_candidates if item) or "none"
+                conversation_clusters = [_safe_text(item, 100) for item in (subject_intel.get("topConversationClusters") or [])]
+                activity_patterns = [_safe_text(item, 120) for item in (subject_intel.get("topActivityPatterns") or [])]
+                preview_lines.extend([
+                    f"Legacy top recurring subjects (diagnostic only): {_safe_text(', '.join(subject_intel.get('topRecurringSubjects') or []) or 'none', 180)}.",
+                    f"Accepted recurring subjects with reason (diagnostic only): {_safe_text(accepted_subject_text, 220)}.",
+                    f"Rejected legacy candidates: {_safe_text(rejected_candidate_text, 120)}.",
+                    f"Top recurring themes (diagnostic only): {_safe_text(', '.join(subject_intel.get('topRecurringThemes') or []) or 'none', 140)}.",
+                    f"Top conversation clusters (diagnostic only): {_safe_text(', '.join(item for item in conversation_clusters if item) or 'none', 150)}.",
+                    f"Top activity patterns (diagnostic only): {_safe_text(' | '.join(item for item in activity_patterns if item) or 'none', 150)}.",
+                    f"Top domains/tools (diagnostic only): {_safe_text(', '.join(subject_intel.get('topDomains') or []) or 'none', 180)}.",
+                ])
+
+        bullets = result.get("previewBullets") or build_preview_bullets(result)
+        if bullets:
+            preview_lines.append("Useful preview bullets: available after entity-ledger and classification readout.")
         classification = result.get("classification") or {}
         if classification:
             missing = classification.get("missingInfo") or []
             preview_lines.extend([
-                f"Role read: {_safe_text(classification.get('roleRead') or ROLE_LABELS.get(classification.get('primaryRole'), 'Unknown / needs review'), 220)}",
-                f"Activity read: {_safe_text(classification.get('activityRead') or classification.get('activityLevel') or 'unknown', 220)}",
-                f"Topic read: {_safe_text(classification.get('topicRead') or _classification_plain_list(classification.get('topicThemes') or [], TOPIC_LABELS), 220)}",
-                f"Engagement use: {_safe_text(classification.get('engagementRead') or _classification_plain_list(classification.get('engagementUse') or [], ENGAGEMENT_LABELS), 220)}",
-                f"Dossier use: {_safe_text(classification.get('dossierRead') or DOSSIER_LABELS.get(classification.get('dossierUse'), 'Unknown'), 220)}",
-                f"Relationship use: {_safe_text(classification.get('relationshipRead') or RELATIONSHIP_LABELS.get(classification.get('relationshipUse'), 'No relationship read yet'), 220)}",
-                f"Missing info: {_safe_text('; '.join(missing) if missing else 'No additional classification gaps recorded.', 260)}",
+                f"Role read: {_safe_text(classification.get('roleRead') or ROLE_LABELS.get(classification.get('primaryRole'), 'Unknown / needs review'), 180)}",
+                f"Activity read: {_safe_text(classification.get('activityRead') or classification.get('activityLevel') or 'unknown', 160)}",
+                f"Topic read: {_safe_text(classification.get('topicRead') or _classification_plain_list(classification.get('topicThemes') or [], TOPIC_LABELS), 170)}",
+                f"Engagement use: {_safe_text(classification.get('engagementRead') or _classification_plain_list(classification.get('engagementUse') or [], ENGAGEMENT_LABELS), 170)}",
+                f"Dossier use: {_safe_text(classification.get('dossierRead') or DOSSIER_LABELS.get(classification.get('dossierUse'), 'Unknown'), 170)}",
+                f"Relationship use: {_safe_text(classification.get('relationshipRead') or RELATIONSHIP_LABELS.get(classification.get('relationshipUse'), 'No relationship read yet'), 140)}",
+                f"Missing info: {_safe_text('; '.join(missing) if missing else 'No additional classification gaps recorded.', 180)}",
             ])
         bullets = result.get("previewBullets") or build_preview_bullets(result)
         if bullets:
             preview_lines.append("Useful preview bullets:")
-            preview_lines.extend(f"* {_safe_text(bullet, 180)}" for bullet in bullets[:3])
+            preview_lines.extend(f"* {_safe_text(bullet, 100)}" for bullet in bullets[:1])
         if result.get("qualityStatus") == "too_thin":
             preview_lines.append(result.get("suppressedReason") or "Enrichment is too thin to send. Add more source notes or confirm the subject’s role first.")
         entity_diag = ((result.get("diagnostics") or {}).get("entityIntelligence") or {})

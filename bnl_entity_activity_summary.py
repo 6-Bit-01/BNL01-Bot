@@ -95,6 +95,8 @@ _SUBJECT_INTELLIGENCE_STOPWORDS = {
     "hey", "hi", "hello", "still", "speaking", "transmitted", "directly", "operating", "continuity",
     "pm", "am", "pacific", "friday", "saturday", "sunday", "monday", "tuesday", "wednesday", "thursday",
     "tonight", "today", "tomorrow", "yesterday", "morning", "afternoon", "evening", "night", "bit", "bits",
+    "entire", "civilizations", "communicate", "purely", "language", "sustained", "analytical", "input",
+    "precision", "matters", "tradeoff", "value", "trap", "incidental",
     # Title-case sentence starters / filler words that should never become named topics by repetition.
     "the", "a", "an", "and", "or", "but", "if", "then", "there", "that", "these", "those",
     "with", "without", "from", "to", "for", "of", "in", "on", "at", "by", "as",
@@ -118,6 +120,8 @@ _GRAMMAR_OR_FILLER_TERMS = {
     "speaking", "transmitted", "directly", "operating", "continuity", "pm", "am", "pacific",
     "because", "before", "after", "again", "maybe", "possible", "reviewed", "evidence", "context",
     "conversation", "community", "activity", "pattern", "candidate", "known", "facts", "source", "file",
+    "entire", "civilizations", "communicate", "purely", "language", "sustained", "analytical", "input",
+    "precision", "matters", "tradeoff", "value", "trap", "incidental",
 }
 _SUBJECT_INTELLIGENCE_STOPWORDS.update(_PRONOUN_OR_ADDRESS_TERMS | _SYSTEM_OR_PERSONA_TERMS | _GRAMMAR_OR_FILLER_TERMS)
 _NAMED_TOPIC_BLOCKED_TERMS = _PRONOUN_OR_ADDRESS_TERMS | _SYSTEM_OR_PERSONA_TERMS | _GRAMMAR_OR_FILLER_TERMS | _SUBJECT_INTELLIGENCE_STOPWORDS | _NAMED_TOPIC_STOPWORDS
@@ -510,9 +514,9 @@ def _candidate_entity_type(label: str, reasons: set[str] | None = None) -> str:
             return "code_marker"
     if words and all(word in _GRAMMAR_OR_FILLER_TERMS for word in words):
         return "grammar_or_filler"
-    if any(word in {"speaking", "transmitted", "directly", "operating", "still"} for word in words):
+    if any(word in {"speaking", "transmitted", "directly", "operating", "still", "communicate", "communicates", "communicating"} for word in words):
         return "rejected"
-    if words[0] in (_PRONOUN_OR_ADDRESS_TERMS | _GRAMMAR_OR_FILLER_TERMS | _SYSTEM_OR_PERSONA_TERMS):
+    if words[0] in (_PRONOUN_OR_ADDRESS_TERMS | _GRAMMAR_OR_FILLER_TERMS | _SYSTEM_OR_PERSONA_TERMS | {"the", "a", "an", "not", "are", "is", "was", "were", "can", "could", "would", "should", "entire", "precision", "tradeoff", "value"}):
         return "rejected"
     blocked_count = sum(1 for word in words if word in _NAMED_TOPIC_BLOCKED_TERMS)
     if len(words) > 1 and blocked_count > 0:
@@ -546,6 +550,10 @@ def _should_promote_named_topic(label: str, count: int, reasons: set[str], sente
         return False, "blocked_term"
     explicit_reasons = {"explicit_through_pattern", "explicit_here_pattern", "explicit_said_pattern", "quoted_title"}
     if reasons & explicit_reasons:
+        raw = str(label or "")
+        title_or_known = key in _NAMED_TOPIC_ALLOWLIST or bool(re.fullmatch(r"[A-Z][A-Za-z0-9_-]{2,}(?:\s+[A-Z][A-Za-z0-9_-]{2,}){0,2}", raw)) or bool(re.fullmatch(r"0x[A-Fa-f0-9]{2,}", raw))
+        if not title_or_known:
+            return False, "explicit_sentence_fragment"
         return True, next(reason for reason in ("explicit_through_pattern", "explicit_here_pattern", "explicit_said_pattern", "quoted_title") if reason in reasons)
     if len(words) > 1:
         lowered_words = [word.lower() for word in words]
@@ -986,16 +994,16 @@ def _append_review_safe_fact_readouts(summary: dict[str, Any], facts: dict[str, 
     public_tools: Counter = facts.get("publicTools") or Counter()
     review_tools: Counter = facts.get("reviewOnlyTools") or Counter()
 
+    # PR #237: legacy named-topic facts are advisory diagnostics only. Do not promote
+    # them into Source File readout/payload fields; entity-ledger facets are authoritative.
+    diagnostics = summary.setdefault("subjectIntelligenceDiagnostics", {})
+    legacy_topics = diagnostics.setdefault("legacyNamedTopicDiagnostics", [])
     for topic, count in public_topics.most_common(6):
         if count >= 2 or topic in {"Orion"}:
-            line = f"Recurring named topic: {topic} appears in reviewed evidence connected to {subject}. Review before using publicly."
-            _add_unique(summary["topicBreakdown"], line)
-            _add_unique(summary["evidenceDetails"], f"Recurring named topic found: {topic}. Review before using publicly.")
-            _add_unique(summary["bestEvidenceToReview"], f"Recurring named topic — {topic}: review approved public-context evidence before public use.")
-            _add_unique(summary["publicUseCandidates"], f"Recurring named topic {topic} may inform public-safe wording only after owner/admin review.")
+            legacy_topics.append({"label": topic, "kind": "public_named_topic", "accepted": False, "reason": "legacy_named_topic_advisory_only", "sourceScope": "reviewed_public", "sourceTable": "activity_summary", "evidenceCount": int(count)})
     for topic, count in review_topics.most_common(6):
         if count >= 1 and topic not in public_topics:
-            _add_unique(summary["reviewOnlyEvidence"], f"Review-only recurring topic: {topic} appears in internal context connected to {subject}. Do not use publicly without owner/admin review.")
+            legacy_topics.append({"label": topic, "kind": "review_only_named_topic", "accepted": False, "reason": "legacy_named_topic_advisory_only", "sourceScope": "review_only", "sourceTable": "activity_summary", "evidenceCount": int(count)})
 
     for tool, count in public_tools.most_common(5):
         line = f"Tool/platform mention: {tool} appears in reviewed evidence connected to {subject}. Confirm whether it relates to submissions before using as public copy."
@@ -1488,7 +1496,38 @@ def build_entity_activity_summary(
         )
         if intelligence_rows:
             intelligence = extract_recurring_subject_intelligence(intelligence_rows, subject)
-            _promote_subject_intelligence_readouts(summary, intelligence)
+            # PR #237: legacy recurring-subject extraction is diagnostic/advisory only.
+            # Entity Intelligence Ledger facets are authoritative for Source File claims/readouts.
+            existing_legacy = (summary.get("subjectIntelligenceDiagnostics") or {}).get("legacyNamedTopicDiagnostics") or []
+            accepted_reason_map = intelligence.get("acceptedSubjectReasons") or {}
+            public_subjects = intelligence.get("publicSubjects") or Counter()
+            review_subjects = intelligence.get("reviewOnlySubjects") or Counter()
+            public_themes = intelligence.get("publicThemes") or Counter()
+            review_themes = intelligence.get("reviewOnlyThemes") or Counter()
+            public_domains = intelligence.get("publicDomains") or Counter()
+            review_domains = intelligence.get("reviewOnlyDomains") or Counter()
+            topic_clusters = intelligence.get("topicClusters") or {}
+            summary["subjectIntelligenceDiagnostics"] = {
+                "rowsScanned": int(intelligence.get("rowsScanned") or 0),
+                "rowsBySource": dict((intelligence.get("sourceCounts") or Counter()).most_common()),
+                "topRecurringSubjects": [label for label, count in (public_subjects + review_subjects).most_common(6) if count >= 1],
+                "acceptedRecurringSubjects": [
+                    {"label": label, "reason": accepted_reason_map.get(label, ""), "advisoryOnly": True}
+                    for label, count in (public_subjects + review_subjects).most_common(8) if count >= 1
+                ],
+                "rejectedGarbageCandidates": [label for label, count in (intelligence.get("rejectedSubjectCandidates") or Counter()).most_common(8)],
+                "topRecurringThemes": [label for label, count in (public_themes + review_themes).most_common(6) if count >= 1],
+                "topConversationClusters": list((topic_clusters.get("clusters") or [])[:8]),
+                "topActivityPatterns": list((topic_clusters.get("activityPatterns") or [])[:5]),
+                "topDomains": [domain for domain, count in (public_domains + review_domains).most_common(6) if count >= 1],
+                "publicSafeRows": int(intelligence.get("publicRows") or 0),
+                "reviewOnlyRows": int(intelligence.get("reviewOnlyRows") or 0),
+                "legacyAdvisoryOnly": True,
+                "legacyDiagnosticNote": "Legacy recurring-subject diagnostics only. These are not Source File claims.",
+                "acceptedRecurringSubjectCount": len(accepted_reason_map),
+                "rejectedRecurringSubjectCount": sum((intelligence.get("rejectedSubjectCandidates") or Counter()).values()),
+                "legacyNamedTopicDiagnostics": existing_legacy,
+            }
 
         def row_matches(row: sqlite3.Row, fields: list[str]) -> bool:
             data = dict(row)

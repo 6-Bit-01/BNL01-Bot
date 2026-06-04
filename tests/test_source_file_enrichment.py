@@ -52,10 +52,11 @@ class SourceFileEnrichmentTests(unittest.TestCase):
         self.assertFalse(error)
         self.assertEqual(options["subject"], "Hellcat")
         self.assertTrue(options["dry_run"])
-        matched, options, error = enrich.parse_source_enrichment_command("!bnl source enrich Hellcat | dry_run=false | force=true")
+        matched, options, error = enrich.parse_source_enrichment_command("!bnl source enrich Hellcat | dry_run=false | force=true | diagnostics=true")
         self.assertTrue(matched)
         self.assertFalse(error)
         self.assertTrue(options["force"])
+        self.assertTrue(options["diagnostics"])
         for command in ("!bnl enrich source Emerald", "!bnl source file enrich Mac Modem | dry_run=false"):
             matched, options, error = enrich.parse_source_enrichment_command(command)
             self.assertTrue(matched)
@@ -397,7 +398,7 @@ class SourceFileEnrichmentTests(unittest.TestCase):
         self.assertIn("approve a public-safe summary", action)
 
 
-    def test_dry_run_preview_formats_subject_intelligence_diagnostic_lists(self):
+    def test_dry_run_preview_quarantines_subject_intelligence_diagnostic_lists(self):
         result = {
             "subject": "Crow",
             "matchKind": "active_source_file",
@@ -424,14 +425,17 @@ class SourceFileEnrichmentTests(unittest.TestCase):
 
         formatted = enrich.format_source_enrichment_response(result)
 
-        self.assertIn("Accepted recurring subjects with reason", formatted)
-        self.assertIn("Orion: repeated liaison context", formatted)
-        self.assertIn("Rejected top garbage candidates", formatted)
-        self.assertIn("BNL, Discord", formatted)
-        self.assertIn("Top conversation clusters", formatted)
-        self.assertIn("repeated BNL questions", formatted)
-        self.assertIn("Top activity patterns", formatted)
-        self.assertIn("asks about source thresholds", formatted)
+        self.assertIn("Legacy recurring-subject diagnostics:", formatted)
+        self.assertIn("advisory only", formatted)
+        self.assertNotIn("Top recurring subjects:", formatted)
+        self.assertNotIn("Accepted recurring subjects with reason:", formatted)
+        result["diagnosticsRequested"] = True
+        diagnostic_formatted = enrich.format_source_enrichment_response(result)
+        self.assertIn("Legacy recurring-subject diagnostics only. These are not Source File claims.", diagnostic_formatted)
+        self.assertIn("Accepted recurring subjects with reason (diagnostic only)", diagnostic_formatted)
+        self.assertIn("Orion: repeated liaison context", diagnostic_formatted)
+        self.assertIn("Rejected legacy candidates", diagnostic_formatted)
+        self.assertIn("BNL, Discord", diagnostic_formatted)
 
     def test_dry_run_preview_includes_subject_intelligence_diagnostics(self):
         self.conn.execute("INSERT INTO user_profiles VALUES (42,1,'Crow','Crow',NULL,NULL)")
@@ -444,32 +448,24 @@ class SourceFileEnrichmentTests(unittest.TestCase):
 
         self.assertIn("Subject intelligence rows scanned:", formatted)
         self.assertIn("Subject intelligence rows by source:", formatted)
-        self.assertIn("Top recurring subjects:", formatted)
-        self.assertIn("Accepted recurring subjects with reason:", formatted)
-        self.assertIn("Rejected top garbage candidates:", formatted)
+        self.assertIn("Legacy recurring-subject diagnostics:", formatted)
+        self.assertNotIn("Top recurring subjects:", formatted)
+        self.assertNotIn("Accepted recurring subjects with reason:", formatted)
         self.assertIn("Orion", formatted)
-        self.assertIn("You", formatted)
-        self.assertIn("BNL-01", formatted)
-        self.assertIn("Top recurring themes:", formatted)
-        self.assertIn("Top domains/tools:", formatted)
-        self.assertIn("suno.com", formatted)
+        self.assertNotIn("Recurring named topic: You", formatted)
+        self.assertNotIn("Recurring named topic: BNL-01", formatted)
         self.assertIn("Public-safe vs review-only intelligence rows:", formatted)
         payload = result["payload"]
         payload_text = json.dumps({
             key: payload.get(key)
             for key in ("knownContext", "usefulEvidence", "topicBreakdown", "conversationHighlights", "bestEvidenceToReview", "publicUseCandidates", "bnlInteractionSignals", "musicSignals", "evidenceDetails")
         })
-        self.assertIn("Recurring named topic: Orion appears in reviewed evidence connected to Crow", payload_text)
         for garbage in ("You", "Your", "Network", "BNL-01"):
             self.assertNotIn(f"Recurring named topic: {garbage}", payload_text)
-        self.assertIn("Evidence digest:", payload_text)
-        self.assertIn("Activity pattern: Crow repeatedly relays messages framed as", payload_text)
-        self.assertTrue(any("Recurring named topic: Orion" in item for item in payload["topicBreakdown"][:8]))
-        self.assertTrue(any("Recurring named topic: Orion" in item for item in payload["conversationHighlights"][:6]))
-        self.assertTrue(any("Recurring named topic: Orion" in item for item in payload["bestEvidenceToReview"][:6]))
-        self.assertIn("Recurring conversation pattern: messages are repeatedly framed as", payload_text)
-        self.assertIn("BNL interaction pattern: Crow has repeated reviewed exchanges involving BNL", payload_text)
-        self.assertIn("Tool/platform mention: Suno appears in reviewed evidence connected to Crow", payload_text)
+        self.assertNotIn("Recurring named topic:", payload_text)
+        self.assertIn("Orion: speaks_through", payload_text)
+        self.assertIn("Conversation theme:", payload_text)
+        self.assertIn("shares Suno", payload_text)
         self.assertEqual(payload["queueSubmissionStatus"], "not_connected")
         self.assertNotRegex(payload_text, r"submitted\s+\d+|play count|source type:|Priority|payment|rawRefJson|sourceRowId|research-and-development")
         self.assertLessEqual(len(formatted), 1900)
@@ -687,10 +683,10 @@ class SourceFileEnrichmentTests(unittest.TestCase):
         raw = normal.pop("rawProvenance")
         normal_text = json.dumps(normal)
 
-        self.assertIn("Recurring named topic", json.dumps(payload["topicBreakdown"] + payload["evidenceDetails"] + payload["bestEvidenceToReview"]))
-        self.assertIn("Orion", normal_text)
-        self.assertIn("Tool/platform mention: Suno", normal_text)
-        self.assertIn("BNL interaction pattern", json.dumps(payload["bnlInteractionSignals"] + payload["conversationHighlights"]))
+        self.assertNotIn("Recurring named topic", json.dumps(payload["topicBreakdown"] + payload["evidenceDetails"] + payload["bestEvidenceToReview"]))
+        self.assertNotIn("Recurring named topic", normal_text)
+        self.assertIn("shares music links", normal_text)
+        self.assertIn("Conversation theme", json.dumps(payload["conversationHighlights"]))
         self.assertEqual(payload["queueSubmissionStatus"], "not_connected")
         self.assertIn(enrich.QUEUE_NOT_CONNECTED_NOTE, payload["queueSubmissionNote"])
         self.assertNotRegex(normal_text, r"submitted\s+\d+|played\s+\d+|Priority|payment|submitted songs from Suno")
@@ -1097,6 +1093,36 @@ class SourceFileEnrichmentBotTests(unittest.TestCase):
         self.assertIn("Entity context resolver", response)
         self.assertIn("Orion: speaks_through", response)
         self.assertNotIn("suspicious blinking light", response.lower())
+
+    def test_source_payload_validation_removes_blocked_bad_labels(self):
+        packet = {
+            "subject": "Crow",
+            "matchKind": "active_source_file",
+            "sourceFile": {"id": "sf_1", "name": "Crow"},
+            "sections": {"Public-Safe Notes": ["review only"], "Do Not Say": ["bad labels"], "Missing Info": ["missing"], "Suggested Next Action": ["review"]},
+            "sourceTypes": ["entity_activity_summary"],
+            "sourceCounts": {},
+            "warningCounts": {},
+            "warnings": [],
+            "qualityScore": 80,
+            "qualityStatus": "sendable",
+            "relationshipSignals": ["Detected relationship facet: Orion: speaks_through", "Detected relationship facet: not: speaks_through"],
+            "topicBreakdown": ["entire civilizations communicate purely"],
+            "bestEvidenceToReview": ["Confirm whether The tradeoff relationship/context can be public."],
+            "publicUseCandidates": ["Precision matters"],
+            "reviewOnlyEvidence": ["trap"],
+            "conversationHighlights": ["Conversation theme: safe music"],
+            "evidenceDetails": ["The value"],
+            "knownContext": ["Detected role facet: artist"],
+            "usefulEvidence": ["sustained analytical input"],
+        }
+        payload = enrich.build_enrichment_recommendation_payload(packet)
+        blocked = ("entire civilizations communicate purely", "not: speaks_through", "The tradeoff", "Precision matters", "The value", "trap", "sustained analytical input")
+        payload_text = json.dumps({key: payload.get(key) for key in ("topicBreakdown", "bestEvidenceToReview", "relationshipSignals", "publicUseCandidates", "reviewOnlyEvidence", "conversationHighlights", "evidenceDetails", "knownContext", "usefulEvidence")})
+        for label in blocked:
+            self.assertNotIn(label, payload_text)
+        self.assertIn("Orion: speaks_through", payload_text)
+
 
 if __name__ == "__main__":
     unittest.main()
