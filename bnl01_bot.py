@@ -55,6 +55,11 @@ from bnl_dossier_source_packets import (
     is_broadcast_memory_reader_available,
     set_broadcast_memory_reader,
 )
+from bnl_entity_intelligence import (
+    build_entity_context_for_rd_mod_ops,
+    build_entity_intelligence_profile,
+    resolve_entity_context_for_surface,
+)
 from bnl_entity_activity_summary import (
     build_entity_activity_summary,
     format_entity_activity_summary_response,
@@ -4815,7 +4820,8 @@ async def maybe_handle_dossier_discovery_command(message: discord.Message, clean
 
 
 def _parse_rd_entity_context_subject(text: str) -> str:
-    match = re.search(r"(?i)\b(?:entity intelligence|context resolver|source context|dossier context)\s+(?:for\s+|on\s+|about\s+)?([A-Za-z0-9 _.-]{2,80})", text or "")
+    cleaned = re.sub(r"(?i)^\s*!bnl\s+", "", text or "").strip()
+    match = re.search(r"(?i)\b(?:entity intelligence|entity context|context resolver|source context|dossier context)\s+(?:for\s+|on\s+|about\s+)?([A-Za-z0-9 _.-]{2,80})", cleaned)
     if not match:
         return ""
     subject = re.sub(r"\s+", " ", match.group(1)).strip(" .,:;|!?\n\t")
@@ -4848,6 +4854,46 @@ def _format_rd_entity_context_response(subject: str, context: dict) -> str:
     lines.append("Missing info: " + ("; ".join(missing) or "none"))
     lines.append("Review-only/internal context is labeled by the resolver; no raw transcripts are included.")
     return "\n".join(lines)[:1900]
+
+
+def _is_bnl_testing_channel(message: discord.Message) -> bool:
+    channel = getattr(message, "channel", None)
+    if not channel:
+        return False
+    if BNL_TESTING_CHANNEL_ID and int(getattr(channel, "id", 0) or 0) == BNL_TESTING_CHANNEL_ID:
+        return True
+    normalized = re.sub(r"[^a-z0-9-]+", "-", (getattr(channel, "name", "") or "").strip().lower()).strip("-")
+    return normalized == "bnl-testing" or resolve_channel_policy(channel) == "sealed_test"
+
+
+async def maybe_handle_entity_context_resolver_command(message: discord.Message, clean_content: str) -> bool:
+    subject = _parse_rd_entity_context_subject(clean_content)
+    if not subject:
+        return False
+    channel = getattr(message, "channel", None)
+    policy = resolve_channel_policy(channel)
+    allowed_channel = is_research_and_development_channel(message) or _is_bnl_testing_channel(message)
+    if not allowed_channel:
+        return False
+    member = message.author if isinstance(message.author, discord.Member) else message.guild.get_member(message.author.id)
+    if not can_send_dossier_recommendation(message.author, member, message.guild):
+        logging.warning("entity_context_resolver_command_denied reason=permission channel_policy=%s", policy)
+        await message.reply("Entity context resolver is operator-only.")
+        return True
+    surface = "rd_mod_ops" if is_research_and_development_channel(message) else "source_file"
+    if surface == "rd_mod_ops":
+        context = await asyncio.to_thread(build_entity_context_for_rd_mod_ops, DB_FILE, message.guild.id, subject)
+    else:
+        profile = await asyncio.to_thread(build_entity_intelligence_profile, DB_FILE, message.guild.id, subject, refresh=True)
+        context = resolve_entity_context_for_surface(profile, "source_file", max_items=8)
+    subject_key_value = str((context.get("profile") or {}).get("subjectKey") or re.sub(r"[^a-z0-9]+", "-", subject.lower()).strip("-") or "unknown")
+    logging.info("entity_context_resolver_command surface=%s subject_key=%s channel_policy=%s", surface, subject_key_value, policy)
+    response = _format_rd_entity_context_response(subject, context).replace("R&D/mod ops", "source-file preview" if surface == "source_file" else "R&D/mod ops")
+    await message.reply(response)
+    if surface == "rd_mod_ops":
+        _remember_rd_ops_context(message, clean_content, "entity_context_resolver", subject, "#research-and-development", response)
+    _mark_recent_direct_response(message.channel.id, message.author.id)
+    return True
 
 
 async def maybe_handle_source_file_enrichment_command(message: discord.Message, clean_content: str) -> bool:
@@ -14736,6 +14782,9 @@ async def on_message(message: discord.Message):
         return
 
     if await maybe_handle_backfill_command(message, clean_content):
+        return
+
+    if await maybe_handle_entity_context_resolver_command(message, clean_content):
         return
 
     if await maybe_handle_source_file_enrichment_command(message, clean_content):

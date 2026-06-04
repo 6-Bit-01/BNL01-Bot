@@ -145,6 +145,32 @@ class EntityIntelligenceTests(unittest.TestCase):
         self.assertNotIn("private internal note", str(diag))
         self.assertLessEqual(len(build_entity_context_for_public_conversation(p)), 4)
 
+    def test_subject_scope_firewall_blocks_source_blind_cross_subject_leakage(self):
+        self.add_profile(10, "Crow")
+        self.add_profile(11, "Lost Marbles")
+        self.add_profile(13, "Antigrain")
+        self.add_msg(10, "Crow", "general", "public_home", "Orion through Crow is a subject-owned persona note for BNL.")
+        self.conn.execute("INSERT INTO memory_tiers VALUES (NULL,NULL,1,'long','Orion through Crow appeared while Lost Marbles and Antigrain were mentioned in source-blind global memory with Signal Witch and Lardcode.',0.9,1,'now','legacy_unknown','legacy_unknown')")
+
+        crow = self.profile_for("Crow")
+        lost = self.profile_for("Lost Marbles")
+        antigrain = self.profile_for("Antigrain")
+
+        self.assertIn(("Orion", "speaks_through"), {(e["objectLabel"], e["relationType"]) for e in crow["relationships"]})
+        self.assertNotIn("Orion", self.labels(lost["relationships"]) + self.labels(lost["conversationThemes"]) + self.labels(lost["creativeMusic"]))
+        self.assertNotIn("Orion", self.labels(antigrain["relationships"]) + self.labels(antigrain["conversationThemes"]) + self.labels(antigrain["creativeMusic"]))
+        self.assertNotIn("Signal Witch", str(antigrain["relationships"]) + str(antigrain["conversationThemes"]))
+        self.assertIn("Source-blind or mixed memory mentions this subject; review original source before use.", self.labels(lost["dossierUsefulness"]))
+
+    def test_text_only_co_mentions_do_not_create_activity_or_relationships(self):
+        self.add_profile(20, "Shortybabe")
+        self.add_profile(21, "Orion")
+        self.add_msg(21, "Orion", "general", "public_home", "Orion through Crow was discussed when Shortybabe asked about BNL boundaries.")
+        p = self.profile_for("Shortybabe")
+        self.assertNotIn("Orion", self.labels(p["relationships"]))
+        self.assertNotIn("discusses BNL boundaries/behavior", self.labels(p["bnlInteraction"]))
+        self.assertEqual(p["diagnostics"]["rowsByScope"].get("subject_co_mention", 0), 1)
+
     def test_authority_winner_and_conflict_action(self):
         facts = [
             {"label": "role", "value": "public Discord says artist", "authority": "public_discord_observed", "confidence": .8},

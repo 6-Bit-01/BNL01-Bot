@@ -2280,7 +2280,7 @@ def _merge_entity_intelligence_into_evidence(evidence: dict[str, Any], profile: 
     add_list("reviewOnlyEvidence", action_items + warnings)
     add_list("missingInfo", missing)
     add_list("usefulEvidence", roles + relationships + themes + activity[:8])
-    add_list("evidenceDetails", [f"Entity intelligence surface {resolver.get('surface')}: {item}" for item in (roles + relationships + themes + activity[:8])])
+    add_list("evidenceDetails", [f"Entity ledger subject-owned facets ({resolver.get('surface')}): {item}" for item in (roles + relationships + themes + activity[:8])])
     sections = evidence.setdefault("sections", {})
     if missing:
         section_missing = sections.setdefault("Missing Info", [])
@@ -2676,17 +2676,20 @@ def format_source_enrichment_response(result: dict[str, Any]) -> str:
             activity_pattern_text = " | ".join(item for item in activity_patterns if item) or "none"
 
             preview_lines.extend([
-                f"Subject intelligence rows scanned: {int(subject_intel.get('rowsScanned') or 0)}.",
-                f"Subject intelligence rows by source: {_safe_text(', '.join(f'{k} {v}' for k, v in rows_by_source.items()) or 'none', 220)}.",
-                f"Top recurring subjects: {_safe_text(', '.join(subject_intel.get('topRecurringSubjects') or []) or 'none', 180)}.",
-                f"Accepted recurring subjects with reason: {_safe_text(accepted_subject_text, 220)}.",
-                f"Rejected top garbage candidates: {_safe_text(rejected_candidate_text, 100)}.",
-                f"Top recurring themes: {_safe_text(', '.join(subject_intel.get('topRecurringThemes') or []) or 'none', 140)}.",
-                f"Top conversation clusters: {_safe_text(conversation_cluster_text, 150)}.",
-                f"Top activity patterns: {_safe_text(activity_pattern_text, 150)}.",
-                f"Top domains/tools: {_safe_text(', '.join(subject_intel.get('topDomains') or []) or 'none', 180)}.",
+                f"Subject intelligence rows scanned: {int(subject_intel.get('rowsScanned') or 0)}. Legacy recurring-subject diagnostics only.",
+                f"Subject intelligence rows by source: {_safe_text(', '.join(f'{k} {v}' for k, v in rows_by_source.items()) or 'none', 140)}.",
+                f"Top recurring subjects: {_safe_text(', '.join(subject_intel.get('topRecurringSubjects') or []) or 'none', 100)}.",
+                f"Accepted recurring subjects with reason: {_safe_text(accepted_subject_text, 150)}.",
+                f"Rejected top garbage candidates: {_safe_text(rejected_candidate_text, 80)}.",
+                f"Top recurring themes: {_safe_text(', '.join(subject_intel.get('topRecurringThemes') or []) or 'none', 100)}.",
+                f"Top conversation clusters: {_safe_text(conversation_cluster_text, 80)}. Top activity patterns: {_safe_text(activity_pattern_text, 80)}.",
+                f"Top domains/tools: {_safe_text(', '.join(subject_intel.get('topDomains') or []) or 'none', 100)}.",
                 f"Public-safe vs review-only intelligence rows: {int(subject_intel.get('publicSafeRows') or 0)} public-safe / {int(subject_intel.get('reviewOnlyRows') or 0)} review-only.",
             ])
+        bullets = result.get("previewBullets") or build_preview_bullets(result)
+        if bullets:
+            preview_lines.append("Useful preview bullets:")
+            preview_lines.extend(f"* {_safe_text(bullet, 180)}" for bullet in bullets[:3])
         classification = result.get("classification") or {}
         if classification:
             missing = classification.get("missingInfo") or []
@@ -2699,10 +2702,6 @@ def format_source_enrichment_response(result: dict[str, Any]) -> str:
                 f"Relationship use: {_safe_text(classification.get('relationshipRead') or RELATIONSHIP_LABELS.get(classification.get('relationshipUse'), 'No relationship read yet'), 220)}",
                 f"Missing info: {_safe_text('; '.join(missing) if missing else 'No additional classification gaps recorded.', 260)}",
             ])
-        bullets = result.get("previewBullets") or build_preview_bullets(result)
-        if bullets:
-            preview_lines.append("Useful preview bullets:")
-            preview_lines.extend(f"* {_safe_text(bullet, 180)}" for bullet in bullets[:3])
         if result.get("qualityStatus") == "too_thin":
             preview_lines.append(result.get("suppressedReason") or "Enrichment is too thin to send. Add more source notes or confirm the subject’s role first.")
         entity_diag = ((result.get("diagnostics") or {}).get("entityIntelligence") or {})

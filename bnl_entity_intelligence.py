@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import re
 import sqlite3
 from collections import Counter, defaultdict
@@ -89,6 +90,211 @@ CREATED_RE = re.compile(r"\b([A-Z][A-Za-z0-9_-]{2,}(?:\s+[A-Z][A-Za-z0-9_-]{2,})
 CREATED_MY_RE = re.compile(r"\b([A-Z][A-Za-z0-9_-]{2,}(?:\s+[A-Z][A-Za-z0-9_-]{2,}){0,2})\s+is\s+my\s+(?:AI|bot|project|persona|character|entity)\b", re.I)
 THROUGH_RE = re.compile(r"\b([A-Z][A-Za-z0-9_-]{2,}(?:\s+[A-Z][A-Za-z0-9_-]{2,}){0,2})\s+(?:through|via|speaking\s+through|relayed\s+through)\s+([A-Z][A-Za-z0-9_-]{2,}(?:\s+[A-Z][A-Za-z0-9_-]{2,}){0,2})\b", re.I)
 HERE_RE = re.compile(r"\b([A-Z][A-Za-z0-9_-]{2,})\s+here\b")
+
+SUBJECT_STRONG_SCOPES = {"subject_owned", "subject_keyed", "subject_authored", "subject_profile_matched", "subject_direct_evidence"}
+SUBJECT_REVIEW_ONLY_SCOPES = {"subject_co_mention", "global_mixed_memory", "source_blind_global"}
+SUBJECT_REJECT_SCOPES = {"rejected"}
+
+
+def _norm_identity(value: Any) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", str(value or "").strip().lower()).strip()
+
+
+def _subject_terms(subject: str, aliases: list[str] | None = None) -> set[str]:
+    terms = {_norm_identity(subject), _norm_identity(subject_key(subject).replace("-", " "))}
+    for alias in aliases or []:
+        terms.add(_norm_identity(alias))
+    return {t for t in terms if t}
+
+
+def _contains_subject_term(text: Any, subject: str, aliases: list[str] | None = None) -> bool:
+    normalized = f" {_norm_identity(text)} "
+    return any(f" {term} " in normalized for term in _subject_terms(subject, aliases))
+
+
+def _exact_identity_match(value: Any, subject: str, aliases: list[str] | None = None) -> bool:
+    normalized = _norm_identity(value)
+    return bool(normalized and normalized in _subject_terms(subject, aliases))
+
+
+def _known_entity_names(conn: sqlite3.Connection, guild_id: int | None = None, *, limit: int = 1200) -> set[str]:
+    names: set[str] = set()
+
+    def add(value: Any) -> None:
+        text = re.sub(r"\s+", " ", str(value or "")).strip(" .,:;|!?\n\t")
+        if 2 <= len(text) <= 80 and re.search(r"[A-Za-z]", text):
+            names.add(text)
+
+    sources = {
+        "user_profiles": ("display_name", "preferred_name"),
+        "community_presence": ("display_name", "subject_key"),
+        "entity_evidence_events": ("subject_name", "subject_key"),
+    }
+    for table, wanted in sources.items():
+        if not table_exists(conn, table):
+            continue
+        cols = columns(conn, table)
+        select = [c for c in wanted if c in cols]
+        if not select:
+            continue
+        where = " WHERE guild_id=?" if guild_id is not None and "guild_id" in cols else ""
+        params = (guild_id,) if where else ()
+        try:
+            for row in conn.execute(f"SELECT {', '.join(select)} FROM {table}{where} LIMIT ?", (*params, limit)):
+                for col in select:
+                    value = row[col]
+                    if col == "subject_key":
+                        value = str(value or "").replace("-", " ").title()
+                    add(value)
+        except sqlite3.Error:
+            continue
+    return names
+
+
+def _mentioned_known_entities(text: Any, known_names: set[str]) -> set[str]:
+    normalized = f" {_norm_identity(text)} "
+    found: set[str] = set()
+    for name in known_names:
+        term = _norm_identity(name)
+        if term and f" {term} " in normalized:
+            found.add(term)
+    return found
+
+
+def _is_subject_owned_row(scope: str) -> bool:
+    return scope in SUBJECT_STRONG_SCOPES
+
+
+def _is_subject_co_mention_row(scope: str) -> bool:
+    return scope == "subject_co_mention"
+
+
+def _is_global_or_mixed_memory_row(scope: str) -> bool:
+    return scope in {"global_mixed_memory", "source_blind_global"}
+
+
+def _should_extract_relationships_from_row(row: dict[str, Any]) -> bool:
+    return _is_subject_owned_row(str(row.get("scope") or ""))
+
+
+def _should_extract_named_topics_from_row(row: dict[str, Any]) -> bool:
+    return _is_subject_owned_row(str(row.get("scope") or ""))
+
+
+def _should_extract_activity_from_row(row: dict[str, Any]) -> bool:
+    return _is_subject_owned_row(str(row.get("scope") or ""))
+
+
+def _is_global_or_mixed_memory_row_for_text(source: str, row: dict[str, Any], text: str, known_names: set[str], subject: str) -> bool:
+    if source in {"memory_tiers", "relationship_journal"}:
+        mentioned = _mentioned_known_entities(text, known_names | {subject})
+        if len(mentioned) >= 2:
+            return True
+    return False
+
+
+def _subject_row_scope(
+    source: str,
+    row: dict[str, Any],
+    subject: str,
+    matched_ids: set[int],
+    known_names: set[str] | None = None,
+    aliases: list[str] | None = None,
+    *,
+    conn: sqlite3.Connection | None = None,
+) -> str:
+    skey = subject_key(subject)
+    known_names = known_names or set()
+    text = _row_text(source, row)
+    text_mentions_subject = _contains_subject_term(text, subject, aliases)
+    id_match = any(str(row.get(c) or "").isdigit() and int(row.get(c)) in matched_ids for c in ("user_id", "author_id", "discord_user_id", "member_id"))
+    author_name_match = any(_exact_identity_match(row.get(c), subject, aliases) for c in ("user_name", "author_name"))
+    keyed = str(row.get("subject_key") or "").strip().lower() == skey
+    exact_subject_name = _exact_identity_match(row.get("subject_name"), subject, aliases)
+    exact_display_name = _exact_identity_match(row.get("display_name"), subject, aliases)
+    mixed = len(_mentioned_known_entities(text, known_names | {subject})) >= 2
+
+    if source == "conversations":
+        if id_match or author_name_match:
+            return "subject_authored"
+        return "subject_co_mention" if text_mentions_subject else "rejected"
+
+    if source == "entity_evidence_events":
+        if keyed:
+            return "subject_keyed"
+        if exact_subject_name:
+            return "subject_direct_evidence"
+        if text_mentions_subject and conn is not None:
+            upgraded = _rehydrated_conversation_scope(conn, row, subject, matched_ids, aliases)
+            if upgraded:
+                return upgraded
+        return "global_mixed_memory" if text_mentions_subject and mixed else "subject_co_mention" if text_mentions_subject else "rejected"
+
+    if source == "memory_tiers":
+        trust = str(row.get("source_trust") or "").strip().lower()
+        policy = str(row.get("source_channel_policy") or "").strip().lower()
+        source_linked = bool(trust and trust not in {"legacy_unknown", "unknown", "source_blind"} and policy and policy not in {"legacy_unknown", "unknown"})
+        if mixed and not id_match:
+            return "global_mixed_memory"
+        if not source_linked:
+            return "source_blind_global" if text_mentions_subject or id_match else "rejected"
+        if id_match:
+            return "subject_profile_matched"
+        return "subject_co_mention" if text_mentions_subject else "rejected"
+
+    if source == "relationship_journal":
+        if id_match:
+            return "subject_profile_matched"
+        return "global_mixed_memory" if text_mentions_subject and mixed else "subject_co_mention" if text_mentions_subject else "rejected"
+
+    if source in {"user_memory_facts", "user_habits", "relationship_state"}:
+        if id_match:
+            return "subject_profile_matched"
+        return "rejected"
+
+    if source == "broadcast_memory":
+        public_active = bool(row.get("public_safe")) and str(row.get("status") or "active").lower() == "active"
+        if text_mentions_subject and public_active and not mixed:
+            return "subject_direct_evidence"
+        return "global_mixed_memory" if text_mentions_subject and mixed else "subject_co_mention" if text_mentions_subject else "rejected"
+
+    if source == "community_presence":
+        if keyed:
+            return "subject_keyed"
+        if exact_display_name:
+            return "subject_profile_matched"
+        return "rejected"
+
+    if id_match:
+        return "subject_owned"
+    if keyed:
+        return "subject_keyed"
+    if exact_display_name or exact_subject_name or author_name_match:
+        return "subject_profile_matched"
+    return "subject_co_mention" if text_mentions_subject else "rejected"
+
+
+def _rehydrated_conversation_scope(conn: sqlite3.Connection, row: dict[str, Any], subject: str, matched_ids: set[int], aliases: list[str] | None = None) -> str:
+    raw = row.get("raw_ref_json")
+    try:
+        ref = json.loads(raw) if isinstance(raw, str) else dict(raw or {})
+    except (TypeError, ValueError):
+        return ""
+    table = str(ref.get("table") or ref.get("source_table") or row.get("source_table") or "").lower()
+    row_id = ref.get("row_id") or ref.get("id") or row.get("source_row_id")
+    if table != "conversations" or row_id in {None, ""} or not table_exists(conn, "conversations"):
+        return ""
+    cols = columns(conn, "conversations")
+    select = [c for c in ("id", "rowid", "user_id", "author_id", "discord_user_id", "member_id", "user_name", "author_name", "content") if c in cols or c == "rowid"]
+    id_col = "id" if "id" in cols else "rowid"
+    try:
+        found = conn.execute(f"SELECT {', '.join('rowid AS rowid' if c == 'rowid' else c for c in select)} FROM conversations WHERE {id_col}=? LIMIT 1", (row_id,)).fetchone()
+    except sqlite3.Error:
+        return ""
+    if not found:
+        return ""
+    data = dict(found)
+    return "subject_authored" if _subject_row_scope("conversations", data, subject, matched_ids, set(), aliases) == "subject_authored" else ""
 
 
 def now_iso() -> str:
@@ -230,13 +436,11 @@ def _row_text(source: str, row: dict[str, Any]) -> str:
 
 def _collect_rows(conn: sqlite3.Connection, subject: str, guild_id: int | None, max_rows: int) -> list[dict[str, Any]]:
     skey = subject_key(subject)
-    terms = {subject.lower(), skey.replace("-", " ").lower()}
+    aliases: list[str] = []
     rows: list[dict[str, Any]] = []
     matched_ids: set[int] = set()
-
-    def has_subject(text: Any) -> bool:
-        lowered = str(text or "").lower()
-        return any(term and term in lowered for term in terms)
+    known_names = _known_entity_names(conn, guild_id)
+    scope_counts: Counter[str] = Counter()
 
     if table_exists(conn, "user_profiles"):
         cols = columns(conn, "user_profiles")
@@ -245,13 +449,17 @@ def _collect_rows(conn: sqlite3.Connection, subject: str, guild_id: int | None, 
         params = (guild_id,) if where else ()
         for r in conn.execute(f"SELECT {', '.join(select)} FROM user_profiles{where} LIMIT ?", (*params, max_rows * 3)):
             d = dict(r)
-            if has_subject(" ".join(str(d.get(k) or "") for k in ("display_name", "preferred_name"))):
+            profile_names = [str(d.get(k) or "") for k in ("display_name", "preferred_name")]
+            if any(_exact_identity_match(name, subject) for name in profile_names):
                 uid = d.get("user_id")
                 if uid is not None:
                     try:
                         matched_ids.add(int(uid))
                     except (TypeError, ValueError):
                         pass
+                for name in profile_names:
+                    if name and name not in aliases:
+                        aliases.append(name)
     table_cols = {
         "conversations": ["id", "rowid", "user_id", "author_id", "discord_user_id", "member_id", "user_name", "author_name", "guild_id", "channel_name", "channel_policy", "role", "content", "timestamp"],
         "entity_evidence_events": ["id", "guild_id", "subject_key", "subject_name", "source_type", "source_table", "source_row_id", "channel_name", "channel_policy", "visibility", "authority", "safe_summary", "topic", "dossier_relevance", "public_safe_candidate", "review_only", "raw_ref_json", "created_at", "observed_at"],
@@ -276,26 +484,33 @@ def _collect_rows(conn: sqlite3.Connection, subject: str, guild_id: int | None, 
         for r in conn.execute(f"SELECT {select_sql} FROM {table}{where}{order} LIMIT ?", (*params, max_rows * 6)):
             d = dict(r)
             text = _row_text(table, d)
-            id_match = any(str(d.get(c) or "").isdigit() and int(d.get(c)) in matched_ids for c in ("user_id", "author_id", "discord_user_id", "member_id"))
-            key_match = table in {"entity_evidence_events", "community_presence"} and str(d.get("subject_key") or "") == skey
-            name_match = has_subject(" ".join(str(d.get(k) or "") for k in ("user_name", "author_name", "display_name", "subject_name")))
-            if id_match or key_match or name_match or has_subject(text):
-                visibility, authority, public_safe, review_only = _visibility_for_source(table, d)
-                rows.append({
-                    "source": table,
-                    "row_id": d.get("id") or d.get("rowid"),
-                    "text": text,
-                    "channel_name": d.get("channel_name"),
-                    "channel_policy": d.get("channel_policy") or d.get("source_channel_policy"),
-                    "observed_at": d.get("timestamp") or d.get("updated_at") or d.get("created_at") or d.get("last_seen_at") or now_iso(),
-                    "relation": "authored" if id_match or name_match else "mentioned",
-                    "visibility": visibility,
-                    "authority": authority,
-                    "public_safe": public_safe,
-                    "review_only": review_only,
-                })
+            scope = _subject_row_scope(table, d, subject, matched_ids, known_names, aliases, conn=conn)
+            scope_counts[scope] += 1
+            if scope == "rejected":
+                continue
+            visibility, authority, public_safe, review_only = _visibility_for_source(table, d)
+            if _is_global_or_mixed_memory_row(scope):
+                visibility, authority, public_safe, review_only = ("source_blind" if scope == "source_blind_global" else "review_only", "source_blind_memory", False, True)
+            relation = "authored" if scope == "subject_authored" else "matched" if _is_subject_owned_row(scope) else "review_only_mention"
+            rows.append({
+                "source": table,
+                "row_id": d.get("id") or d.get("rowid"),
+                "text": text,
+                "channel_name": d.get("channel_name"),
+                "channel_policy": d.get("channel_policy") or d.get("source_channel_policy"),
+                "observed_at": d.get("timestamp") or d.get("updated_at") or d.get("created_at") or d.get("last_seen_at") or now_iso(),
+                "relation": relation,
+                "scope": scope,
+                "visibility": visibility,
+                "authority": authority,
+                "public_safe": public_safe if _is_subject_owned_row(scope) else False,
+                "review_only": True if not _is_subject_owned_row(scope) else review_only,
+            })
             if len(rows) >= max_rows:
+                rows[0].setdefault("_scope_counts", dict(scope_counts))
                 return rows
+    if rows:
+        rows[0].setdefault("_scope_counts", dict(scope_counts))
     return rows[:max_rows]
 
 
@@ -353,53 +568,60 @@ def _classify(subject: str, rows: list[dict[str, Any]]) -> dict[str, Any]:
     for row in rows:
         text = str(row.get("text") or "")
         low = text.lower()
-        for role, pat, reason in ROLE_PATTERNS:
-            if pat.search(text):
-                role_counts[role] += 1
-                role_reasons.setdefault(role, reason)
-        for theme, pat in THEME_PATTERNS:
-            if pat.search(text):
-                themes[theme] += 1
-        if BNL_RE.search(text):
+        allow_activity = _should_extract_activity_from_row(row)
+        allow_topics = _should_extract_named_topics_from_row(row)
+        allow_relationships = _should_extract_relationships_from_row(row)
+        if allow_activity:
+            for role, pat, reason in ROLE_PATTERNS:
+                if pat.search(text):
+                    role_counts[role] += 1
+                    role_reasons.setdefault(role, reason)
+        if allow_topics:
+            for theme, pat in THEME_PATTERNS:
+                if pat.search(text):
+                    themes[theme] += 1
+        if allow_activity and BNL_RE.search(text):
             activity["frequent BNL-facing conversation"] += 1
-        if re.search(r"\bsource files?|dossiers?\b", text, re.I):
+        if allow_activity and re.search(r"\bsource files?|dossiers?\b", text, re.I):
             activity["asks BNL Source File questions"] += 1
-        if re.search(r"\bboundar|behavior|what can you say|liaison|interface\b", text, re.I):
+        if allow_activity and re.search(r"\bboundar|behavior|what can you say|liaison|interface\b", text, re.I):
             activity["discusses BNL boundaries/behavior"] += 1
-        if MUSIC_RE.search(text):
+        if allow_activity and MUSIC_RE.search(text):
             music["shares music links"] += 1
             if re.search(r"\b(?:suno|udio|youtube|youtu\.be|soundcloud|spotify|bandcamp)\b|https?://", text, re.I):
                 music["shares Suno/Udio/YouTube/SoundCloud/Spotify/Bandcamp links"] += 1
-        if "finished-tracks" in low:
+        if allow_activity and "finished-tracks" in low:
             music["posts in finished-tracks"] += 1
-        if "wips-and-demos" in low or "wip" in low or "demo" in low:
+        if allow_activity and ("wips-and-demos" in low or "wip" in low or "demo" in low):
             music["posts in wips-and-demos"] += 1
-        if "collaboration-hub" in low:
+        if allow_activity and "collaboration-hub" in low:
             music["posts in collaboration-hub"] += 1
-        if COLLAB_RE.search(text):
+        if allow_activity and COLLAB_RE.search(text):
             music["offers collaboration"] += 1
             activity["collaboration-offer facet"] += 1
-        if re.search(r"\bfeedback\b", text, re.I):
+        if allow_activity and re.search(r"\bfeedback\b", text, re.I):
             music["asks for feedback"] += 1
-        if ANTAGONISTIC_RE.search(text):
+        if allow_activity and ANTAGONISTIC_RE.search(text):
             behaviors["antagonistic/challenging"] += 1
             activity["challenges BNL"] += 1 if BNL_RE.search(text) else 0
-        if ANOMALY_RE.search(text):
+        if allow_activity and ANOMALY_RE.search(text):
             behaviors["theory/anomaly-heavy"] += 1
-        if CONTEST_RE.search(text):
+        if allow_activity and CONTEST_RE.search(text):
             behaviors["contest-focused"] += 1
             events["contest/event activity"] += 1
             if re.search(r"\b(?:rules|instructions|deadline|entries)\b", text, re.I):
                 events["rules/instructions poster"] += 1
             if re.search(r"\b(?:organize|run|host|operator|promote)\b", text, re.I):
                 events["contest organizer"] += 1
-        if re.search(r"\b(?:help|support|welcome|community)\b", text, re.I):
+        if allow_activity and re.search(r"\b(?:help|support|welcome|community)\b", text, re.I):
             behaviors["helpful/supportive"] += 1
-        if re.search(r"\b(?:playful|chaotic|teas)\b", text, re.I):
+        if allow_activity and re.search(r"\b(?:playful|chaotic|teas)\b", text, re.I):
             behaviors["playful/chaotic"] += 1
-        if re.search(r"\b(?:lore|persona|entity|cipher|riddle)\b", text, re.I):
+        if allow_activity and re.search(r"\b(?:lore|persona|entity|cipher|riddle)\b", text, re.I):
             behaviors["lore-heavy"] += 1
         # relationship semantics
+        if not allow_relationships:
+            continue
         for m in THROUGH_RE.finditer(text):
             a, b = m.group(1), m.group(2)
             if subject_key(b) == skey:
@@ -423,16 +645,18 @@ def _classify(subject: str, rows: list[dict[str, Any]]) -> dict[str, Any]:
             add_edge(cm.group(1), "offers_collaboration", row, 0.68)
 
     source_blind_count = sum(1 for row in rows if row.get("authority") == "source_blind_memory" or row.get("visibility") == "source_blind")
+    mixed_count = sum(1 for row in rows if row.get("scope") == "global_mixed_memory")
     source_blind_facts = []
-    if source_blind_count:
-        source_blind_facts.append(_item("source-blind memory present", "review-only; do not use publicly without owner/admin review", visibility="source_blind", authority="source_blind_memory", confidence=0.4, public_safe=False, review_only=True, needs_owner_review=True, evidence_count=source_blind_count) | {"type": "source_warning"})
+    if source_blind_count or mixed_count:
+        source_blind_facts.append(_item("Source-blind or mixed memory mentions this subject; review original source before use.", "review-only warning; do not use publicly without owner/admin review", visibility="source_blind", authority="source_blind_memory", confidence=0.4, public_safe=False, review_only=True, needs_owner_review=True, evidence_count=source_blind_count + mixed_count) | {"type": "source_warning"})
     if not role_counts:
         role_counts["unknown"] = 1
         role_reasons["unknown"] = "not enough structured role evidence yet"
-    if len(rows) >= 8:
-        behaviors["frequent poster"] += len(rows)
-    elif rows:
-        behaviors["occasional/low activity"] += len(rows)
+    strong_row_count = sum(1 for row in rows if _should_extract_activity_from_row(row))
+    if strong_row_count >= 8:
+        behaviors["frequent poster"] += strong_row_count
+    elif strong_row_count:
+        behaviors["occasional/low activity"] += strong_row_count
     for label, count in role_counts.items():
         # moderator/contest roles are review-needed until public role is confirmed.
         review_needed = label in {"moderator", "contest operator", "lore/entity/persona/project creator", "antagonist/challenger"}
@@ -468,7 +692,7 @@ def _classify(subject: str, rows: list[dict[str, Any]]) -> dict[str, Any]:
     if rows:
         dossier.append(_item("active community source file candidate", "local stored evidence exists", visibility="review_only", authority="bnl_inferred", public_safe=False, review_only=True, needs_owner_review=True, evidence_count=len(rows)) | {"type": "dossier_usefulness"})
     if source_blind_count:
-        dossier.append(_item("source-blind memory present", "source_blind_memory review-only; do not use publicly without owner/admin review", visibility="source_blind", authority="source_blind_memory", confidence=0.4, public_safe=False, review_only=True, needs_owner_review=True, evidence_count=source_blind_count) | {"type": "dossier_usefulness"})
+        dossier.append(_item("Source-blind or mixed memory mentions this subject; review original source before use.", "source_blind_memory review-only; do not use publicly without owner/admin review", visibility="source_blind", authority="source_blind_memory", confidence=0.4, public_safe=False, review_only=True, needs_owner_review=True, evidence_count=source_blind_count) | {"type": "dossier_usefulness"})
     if missing:
         dossier.append(_item("needs owner approval", "; ".join(sorted(set(missing))[:4]), visibility="review_only", authority="bnl_inferred", public_safe=False, review_only=True, needs_owner_review=True) | {"type": "dossier_usefulness"})
     return {
@@ -485,6 +709,7 @@ def _classify(subject: str, rows: list[dict[str, Any]]) -> dict[str, Any]:
         "missingInfo": sorted(set(missing)),
         "warnings": [i for i in action_items if i.get("type") == "warning"],
         "sourceCounts": dict(source_counts),
+        "scopeCounts": dict(Counter(str(r.get("scope") or "unknown") for r in rows)),
         "publicSafeRows": public_rows,
         "reviewOnlyRows": review_rows,
     }
@@ -526,8 +751,23 @@ def build_entity_intelligence_profile(db_path: str, guild_id: int | None, subjec
     conn.row_factory = sqlite3.Row
     try:
         ensure_entity_intelligence_schema(conn)
+        logging.info("entity_intelligence_profile_started subject_key=%s", skey)
         rows = _collect_rows(conn, subject, guild_id, max_rows)
         classified = _classify(subject, rows)
+        scope_counts = Counter((rows[0].get("_scope_counts") if rows else {}) or Counter(str(r.get("scope") or "unknown") for r in rows))
+        logging.info(
+            "entity_intelligence_rows_collected subject_key=%s owned=%s co_mention=%s global_mixed=%s source_blind=%s rejected=%s",
+            skey,
+            sum(scope_counts.get(scope, 0) for scope in SUBJECT_STRONG_SCOPES),
+            scope_counts.get("subject_co_mention", 0),
+            scope_counts.get("global_mixed_memory", 0),
+            scope_counts.get("source_blind_global", 0),
+            scope_counts.get("rejected", 0),
+        )
+        logging.info(
+            "entity_intelligence_scope_filtered subject_key=%s rejected_global=%s rejected_source_blind=%s",
+            skey, scope_counts.get("global_mixed_memory", 0), scope_counts.get("source_blind_global", 0)
+        )
         for fact in classified["facts"]:
             _upsert_fact(conn, guild_id, skey, subject, fact.get("type") or "fact", fact)
         for edge in classified["relationships"]:
@@ -560,6 +800,7 @@ def build_entity_intelligence_profile(db_path: str, guild_id: int | None, subjec
             "profileStatus": "refreshed" if refresh else "built",
             "rowsScanned": len(rows),
             "rowsBySource": classified["sourceCounts"],
+            "rowsByScope": classified.get("scopeCounts") or {},
             "publicSafeRows": classified["publicSafeRows"],
             "reviewOnlyRows": classified["reviewOnlyRows"],
             "officialPublicDossierConnected": False,
@@ -591,6 +832,10 @@ def build_entity_intelligence_profile(db_path: str, guild_id: int | None, subjec
             VALUES (?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(guild_id, subject_key) DO UPDATE SET subject_name=excluded.subject_name, summary_json=excluded.summary_json, source_hash=excluded.source_hash, updated_at=excluded.updated_at
         """, (guild_id, skey, subject, json.dumps(profile, sort_keys=True, default=str), source_hash, ts, ts))
+        logging.info(
+            "entity_intelligence_profile_completed subject_key=%s roles=%s relationships=%s themes=%s",
+            skey, len(profile.get("roles") or []), len(profile.get("relationships") or []), len(profile.get("conversationThemes") or [])
+        )
         conn.commit()
         return profile
     finally:

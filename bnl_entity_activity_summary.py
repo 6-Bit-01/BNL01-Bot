@@ -14,6 +14,11 @@ from collections import Counter
 from typing import Any
 
 from bnl_dossier_source_packets import normalize_subject_name, subject_key
+from bnl_entity_intelligence import (
+    SUBJECT_STRONG_SCOPES,
+    _known_entity_names,
+    _subject_row_scope,
+)
 from bnl_entity_evidence import (
     ENTITY_EVIDENCE_TABLE,
     build_conversation_safe_summary,
@@ -228,6 +233,7 @@ def collect_subject_intelligence_rows(
     rows: list[dict[str, Any]] = []
     matched_ids = {_safe_int_value(v) for v in (matched_user_ids or set())}
     matched_ids.discard(None)
+    known_names = _known_entity_names(conn, guild_id)
 
     def matches_text(text: str) -> bool:
         return contains_subject_mention(text, subject, aliases=aliases)
@@ -237,7 +243,16 @@ def collect_subject_intelligence_rows(
         text = extract_full_text_from_source_row(conn, source, data)
         if not text:
             return
-        rows.append({"source": source, "text": text, "publicSafe": _is_public_intelligence_row(source, data), "relation": relation})
+        scope = _subject_row_scope(source, data, subject, {int(v) for v in matched_ids if v is not None}, known_names, aliases, conn=conn)
+        if scope == "rejected":
+            return
+        rows.append({
+            "source": source,
+            "text": text,
+            "publicSafe": _is_public_intelligence_row(source, data) and scope in SUBJECT_STRONG_SCOPES,
+            "relation": relation if scope in SUBJECT_STRONG_SCOPES else "review_only_mention",
+            "scope": scope,
+        })
 
     for row in structured_rows or []:
         add("entity_evidence_events", row, str(_row_value(row, "relation_to_subject", "matched")))
@@ -628,6 +643,9 @@ def extract_recurring_subject_intelligence(rows: list[dict[str, Any]], subject: 
     sentence_starts: Counter = Counter(); non_sentence_starts: Counter = Counter()
     provisional_public: Counter = Counter(); provisional_review: Counter = Counter()
     for row in rows:
+        row_scope = str(row.get("scope") or "")
+        if row_scope and row_scope not in SUBJECT_STRONG_SCOPES:
+            continue
         text = str(row.get("text") or "")
         candidates, sentence_counts, non_sentence_counts = _subject_candidate_reasons_from_text(text, subject)
         for label, count in sentence_counts.items():
@@ -682,6 +700,7 @@ def extract_recurring_subject_intelligence(rows: list[dict[str, Any]], subject: 
         "reviewOnlyPhrases": review_phrases,
         "publicRows": sum(1 for row in rows if row.get("publicSafe")),
         "reviewOnlyRows": sum(1 for row in rows if not row.get("publicSafe")),
+        "weakRows": sum(1 for row in rows if str(row.get("scope") or "") not in SUBJECT_STRONG_SCOPES),
         "acceptedSubjectReasons": accepted_reasons,
         "rejectedSubjectCandidates": rejected_candidates,
     }
@@ -744,6 +763,8 @@ def _promote_subject_intelligence_readouts(summary: dict[str, Any], intelligence
     review_domains: Counter = intelligence.get("reviewOnlyDomains") or Counter()
     public_phrases: Counter = intelligence.get("publicPhrases") or Counter()
     topic_clusters: dict[str, Any] = intelligence.get("topicClusters") or {}
+    if (intelligence.get("weakRows") or 0) > 0:
+        _add_unique(summary["reviewOnlyEvidence"], "Legacy recurring-subject diagnostics: weak co-mention/source-blind rows were review-only and not promoted into Source File fields.")
 
     conversation_theme_line = str(topic_clusters.get("conversationThemeLine") or "")
     if conversation_theme_line:
