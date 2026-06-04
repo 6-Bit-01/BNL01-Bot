@@ -2532,15 +2532,34 @@ def format_source_enrichment_response(result: dict[str, Any]) -> str:
         subject_intel = (result.get("diagnostics") or {}).get("subjectIntelligence") or result.get("subjectIntelligenceDiagnostics") or {}
         if subject_intel:
             rows_by_source = subject_intel.get("rowsBySource") or {}
+
+            accepted_subjects = subject_intel.get("acceptedRecurringSubjects") or []
+            accepted_subject_parts = []
+            for item in accepted_subjects:
+                if not isinstance(item, dict):
+                    continue
+                label = _safe_text(item.get("label") or "", 80)
+                reason = _safe_text(item.get("reason") or "", 80)
+                if label:
+                    accepted_subject_parts.append(f"{label}: {reason}" if reason else label)
+            accepted_subject_text = ", ".join(accepted_subject_parts) or "none"
+
+            rejected_candidates = [_safe_text(item, 80) for item in (subject_intel.get("rejectedGarbageCandidates") or [])]
+            rejected_candidate_text = ", ".join(item for item in rejected_candidates if item) or "none"
+            conversation_clusters = [_safe_text(item, 100) for item in (subject_intel.get("topConversationClusters") or [])]
+            conversation_cluster_text = ", ".join(item for item in conversation_clusters if item) or "none"
+            activity_patterns = [_safe_text(item, 120) for item in (subject_intel.get("topActivityPatterns") or [])]
+            activity_pattern_text = " | ".join(item for item in activity_patterns if item) or "none"
+
             preview_lines.extend([
                 f"Subject intelligence rows scanned: {int(subject_intel.get('rowsScanned') or 0)}.",
                 f"Subject intelligence rows by source: {_safe_text(', '.join(f'{k} {v}' for k, v in rows_by_source.items()) or 'none', 220)}.",
                 f"Top recurring subjects: {_safe_text(', '.join(subject_intel.get('topRecurringSubjects') or []) or 'none', 180)}.",
-                f"Accepted recurring subjects with reason: {_safe_text(', '.join(f"{(item or {}).get('label')}: {(item or {}).get('reason')}" for item in (subject_intel.get('acceptedRecurringSubjects') or [])) or 'none', 220)}.",
-                f"Rejected top garbage candidates: {_safe_text(', '.join(subject_intel.get('rejectedGarbageCandidates') or []) or 'none', 180)}.",
+                f"Accepted recurring subjects with reason: {_safe_text(accepted_subject_text, 220)}.",
+                f"Rejected top garbage candidates: {_safe_text(rejected_candidate_text, 180)}.",
                 f"Top recurring themes: {_safe_text(', '.join(subject_intel.get('topRecurringThemes') or []) or 'none', 220)}.",
-                f"Top conversation clusters: {_safe_text(', '.join(subject_intel.get('topConversationClusters') or []) or 'none', 240)}.",
-                f"Top activity patterns: {_safe_text(' | '.join(subject_intel.get('topActivityPatterns') or []) or 'none', 260)}.",
+                f"Top conversation clusters: {_safe_text(conversation_cluster_text, 240)}.",
+                f"Top activity patterns: {_safe_text(activity_pattern_text, 260)}.",
                 f"Top domains/tools: {_safe_text(', '.join(subject_intel.get('topDomains') or []) or 'none', 180)}.",
                 f"Public-safe vs review-only intelligence rows: {int(subject_intel.get('publicSafeRows') or 0)} public-safe / {int(subject_intel.get('reviewOnlyRows') or 0)} review-only.",
             ])
