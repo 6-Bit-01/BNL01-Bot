@@ -435,8 +435,8 @@ class SourceFileEnrichmentTests(unittest.TestCase):
 
     def test_dry_run_preview_includes_subject_intelligence_diagnostics(self):
         self.conn.execute("INSERT INTO user_profiles VALUES (42,1,'Crow','Crow',NULL,NULL)")
-        self.conn.execute("INSERT INTO conversations VALUES (NULL,42,'Crow',1,'general','public_home','user','Orion through Crow asks BNL about Suno links and presence threshold behavior: https://suno.com/song/a', '2026-06-01')")
-        self.conn.execute("INSERT INTO conversations VALUES (NULL,42,'Crow',1,'general','public_home','user','Orion through Crow repeats BNL liaison interface language and Suno links: https://suno.com/song/b', '2026-06-02')")
+        self.conn.execute("INSERT INTO conversations VALUES (NULL,42,'Crow',1,'general','public_home','user','You and Your Network BNL-01 language should not become topics. Orion through Crow asks BNL about Suno links, BARCODE Network behavior, BNL presence, and threshold behavior: https://suno.com/song/a', '2026-06-01')")
+        self.conn.execute("INSERT INTO conversations VALUES (NULL,42,'Crow',1,'general','public_home','user','Your Network and BNL-01 repeat as system context while Orion through Crow repeats BNL liaison interface language, sync convergence markers, operational boundaries, and Suno links: https://suno.com/song/b', '2026-06-02')")
         self.conn.commit()
 
         result = enrich.run_source_file_enrichment(self.db, 1, "Crow", dry_run=True, lookup_func=self._lookup("active"))
@@ -445,7 +445,11 @@ class SourceFileEnrichmentTests(unittest.TestCase):
         self.assertIn("Subject intelligence rows scanned:", formatted)
         self.assertIn("Subject intelligence rows by source:", formatted)
         self.assertIn("Top recurring subjects:", formatted)
+        self.assertIn("Accepted recurring subjects with reason:", formatted)
+        self.assertIn("Rejected top garbage candidates:", formatted)
         self.assertIn("Orion", formatted)
+        self.assertIn("You", formatted)
+        self.assertIn("BNL-01", formatted)
         self.assertIn("Top recurring themes:", formatted)
         self.assertIn("Top domains/tools:", formatted)
         self.assertIn("suno.com", formatted)
@@ -456,6 +460,10 @@ class SourceFileEnrichmentTests(unittest.TestCase):
             for key in ("knownContext", "usefulEvidence", "topicBreakdown", "conversationHighlights", "bestEvidenceToReview", "publicUseCandidates", "bnlInteractionSignals", "musicSignals", "evidenceDetails")
         })
         self.assertIn("Recurring named topic: Orion appears in reviewed evidence connected to Crow", payload_text)
+        for garbage in ("You", "Your", "Network", "BNL-01"):
+            self.assertNotIn(f"Recurring named topic: {garbage}", payload_text)
+        self.assertIn("Evidence digest:", payload_text)
+        self.assertIn("Activity pattern: Crow repeatedly relays messages framed as", payload_text)
         self.assertTrue(any("Recurring named topic: Orion" in item for item in payload["topicBreakdown"][:8]))
         self.assertTrue(any("Recurring named topic: Orion" in item for item in payload["conversationHighlights"][:6]))
         self.assertTrue(any("Recurring named topic: Orion" in item for item in payload["bestEvidenceToReview"][:6]))
