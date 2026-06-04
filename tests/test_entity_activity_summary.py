@@ -387,6 +387,7 @@ class EntityActivitySummaryBuilderTests(unittest.TestCase):
     def test_review_only_named_topics_stay_in_review_only_evidence(self):
         self.conn.execute("INSERT INTO user_profiles VALUES (42,1,'Crow','Crow',NULL,NULL)")
         self.conn.execute("INSERT INTO relationship_journal VALUES (NULL,42,1,'note','Crow has internal relationship context repeatedly mentioning Orion and private planning notes.','now')")
+        self.conn.execute("INSERT INTO relationship_journal VALUES (NULL,42,1,'note','Crow repeats private planning notes around Orion for owner review.','now')")
         self.conn.commit()
 
         summary = self._summary()
@@ -400,6 +401,7 @@ class EntityActivitySummaryBuilderTests(unittest.TestCase):
     def test_normal_fact_fields_do_not_expose_raw_ids_or_private_channels(self):
         self.conn.execute("INSERT INTO user_profiles VALUES (42,1,'Crow','Crow',NULL,NULL)")
         self.conn.execute("INSERT INTO conversations VALUES (NULL,42,'Crow',1,'research-and-development','private_internal','user','Crow internal note about Orion with 123456789012345678 and private transcript.','now')")
+        self.conn.execute("INSERT INTO conversations VALUES (NULL,42,'Crow',1,'research-and-development','private_internal','user','Crow second internal note around Orion without public-safe context.','now')")
         self.conn.commit()
 
         summary = self._summary()
@@ -437,6 +439,35 @@ class EntityActivitySummaryBuilderTests(unittest.TestCase):
             self.assertNotIn(word, extracted)
         self.assertFalse(any(word in extracted for word in ("The", "For", "And", "Maybe")))
 
+    def test_pronouns_and_system_labels_are_gated_out_of_named_topics_but_feed_themes(self):
+        rows = []
+        for idx in range(4):
+            rows.append({
+                "text": (
+                    "You and Your Network BNL-01 source file review language repeats around BARCODE Network "
+                    "behavior, BNL presence, threshold behavior, liaison interface language, sync convergence "
+                    "markers, and operational boundaries. Orion through Crow keeps the subject framing. "
+                    f"https://suno.com/song/gated-{idx}"
+                ),
+                "publicSafe": True,
+                "source": "conversations",
+            })
+        intel = entity.extract_recurring_subject_intelligence(rows, "Crow")
+        extracted = set(intel["publicSubjects"].keys())
+
+        for garbage in ("You", "Your", "Network", "BNL-01"):
+            self.assertNotIn(garbage, extracted)
+            self.assertIn(garbage, intel["rejectedSubjectCandidates"])
+        self.assertIn("Orion", extracted)
+        clusters = intel["topicClusters"]["clusters"]
+        self.assertIn("BNL presence", clusters)
+        self.assertIn("threshold behavior", clusters)
+        self.assertIn("liaison/interface language", clusters)
+        self.assertIn("sync/convergence markers", clusters)
+        self.assertIn("operational boundaries", clusters)
+        self.assertIn("BARCODE Network/community behavior", clusters)
+        self.assertTrue(any("Orion-through-Crow framing" == item for item in clusters))
+
     def test_explicit_one_word_names_multiword_names_and_code_markers_survive_filtering(self):
         rows = [
             {"text": "Orion through Crow notes Atlas Bloom project marker 0x9A for BNL.", "publicSafe": True, "source": "conversations"},
@@ -470,13 +501,17 @@ class EntityActivitySummaryBuilderTests(unittest.TestCase):
             self.assertTrue(any("Recurring named topic: Orion" in item for item in summary[key]), key)
         self.assertTrue(any("Recurring named topic: Orion" in item for item in summary["knownContext"] + summary["usefulEvidence"]))
         self.assertIn("Recurring conversation pattern", normal_text)
-        self.assertIn("Conversation theme: Crow repeatedly discusses BNL presence, threshold behavior, liaison/interface/node language, sync/convergence markers, operational boundaries", normal_text)
+        self.assertIn("Conversation theme: Crow repeatedly discusses", normal_text)
+        for cluster in ("BNL presence", "threshold behavior", "liaison/interface language", "sync/convergence markers", "operational boundaries"):
+            self.assertIn(cluster, normal_text)
         self.assertIn("Activity pattern: Crow repeatedly relays messages framed as", normal_text)
         self.assertIn("Orion through Crow", normal_text)
         self.assertIn("Evidence digest: 2 Crow-linked evidence items were scanned", normal_text)
         self.assertIn("BNL interaction pattern", normal_text)
         self.assertIn("Tool/platform mention: Suno appears in reviewed evidence connected to Crow", normal_text)
         self.assertIn("Queue/submission history is not connected yet", normal_text)
+        for garbage in ("You", "Your", "Network", "BNL-01"):
+            self.assertNotIn(f"Recurring named topic: {garbage}", normal_text)
         self.assertEqual(summary["queueSubmissionStatus"], "not_connected")
         self.assertGreaterEqual(summary["subjectIntelligenceDiagnostics"]["rowsScanned"], 2)
 

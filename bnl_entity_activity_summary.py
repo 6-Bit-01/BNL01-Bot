@@ -82,6 +82,7 @@ _NAMED_TOPIC_STOPWORDS = {
     "conversation", "public", "internal", "private", "unknown", "queue", "submission", "identity",
     "owner", "admin", "discord", "channel", "support", "help", "possible", "recurring", "tool", "bnl",
 }
+
 _ENTITY_NAME_PATTERN = re.compile(r"(?<![A-Za-z0-9])(?:[A-Z][A-Za-z0-9]*(?:[-'’][A-Za-z0-9]+)?)(?:\s+(?:[A-Z][A-Za-z0-9]*(?:[-'’][A-Za-z0-9]+)?))*")
 _MUSIC_SUBMISSION_LANGUAGE_PATTERN = re.compile(r"\b(song|songs|track|tracks|submitted|submission|queue|played|priority|payment|paid|suno|udio|music)\b", re.I)
 
@@ -98,6 +99,24 @@ _SUBJECT_INTELLIGENCE_STOPWORDS = {
     "is", "are", "was", "were", "be", "been", "being", "not", "no", "yes",
     "good", "bad", "still", "just", "now", "also", "because", "before", "after", "again", "maybe",
 }
+_PRONOUN_OR_ADDRESS_TERMS = {
+    "i", "me", "my", "mine", "we", "us", "our", "ours", "you", "your", "yours",
+    "he", "him", "his", "she", "her", "hers", "they", "them", "their", "theirs",
+    "it", "its", "this", "that", "these", "those", "someone", "something", "everyone", "everything",
+}
+_SYSTEM_OR_PERSONA_TERMS = {
+    "bnl", "bnl-01", "bot", "network", "barcode network", "discord", "server", "channel",
+    "source file", "dossier", "admin", "owner", "public", "private", "review", "barcode",
+}
+_GRAMMAR_OR_FILLER_TERMS = {
+    "the", "a", "an", "and", "or", "but", "if", "then", "there", "with", "without",
+    "from", "to", "for", "of", "in", "on", "at", "by", "as", "is", "are", "was", "were",
+    "be", "been", "being", "not", "no", "yes", "good", "bad", "still", "just", "now", "also",
+    "because", "before", "after", "again", "maybe", "possible", "reviewed", "evidence", "context",
+    "conversation", "community", "activity", "pattern", "candidate", "known", "facts", "source", "file",
+}
+_SUBJECT_INTELLIGENCE_STOPWORDS.update(_PRONOUN_OR_ADDRESS_TERMS | _SYSTEM_OR_PERSONA_TERMS | _GRAMMAR_OR_FILLER_TERMS)
+_NAMED_TOPIC_BLOCKED_TERMS = _PRONOUN_OR_ADDRESS_TERMS | _SYSTEM_OR_PERSONA_TERMS | _GRAMMAR_OR_FILLER_TERMS | _SUBJECT_INTELLIGENCE_STOPWORDS | _NAMED_TOPIC_STOPWORDS
 _SUBJECT_INTELLIGENCE_PRIORITY_PREFIXES = (
     "Conversation theme:",
     "Activity pattern:",
@@ -283,14 +302,6 @@ def _clean_intelligence_label(label: str, subject: str = "") -> str:
     words = re.findall(r"[a-z0-9]+", lowered)
     if not words:
         return ""
-    if lowered in _SUBJECT_INTELLIGENCE_STOPWORDS or (len(words) == 1 and words[0] in _SUBJECT_INTELLIGENCE_STOPWORDS):
-        return ""
-    if words and all(word in _SUBJECT_INTELLIGENCE_STOPWORDS for word in words):
-        return ""
-    if words and words[0] in _SUBJECT_INTELLIGENCE_STOPWORDS:
-        return ""
-    if lowered == "bnl":
-        return ""
     return label
 
 
@@ -345,6 +356,14 @@ def _subject_candidate_reasons_from_text(text: str, subject: str) -> tuple[dict[
                 sentence_start_counts[clean] += 1
             else:
                 non_sentence_start_counts[clean] += 1
+            for token in re.findall(r"[A-Z][A-Za-z0-9_-]{0,}", raw):
+                token_clean = _clean_intelligence_label(token, subject)
+                if token_clean and _candidate_entity_type(token_clean, {"observed_capitalized"}) in {"pronoun_or_address", "system_label", "grammar_or_filler", "rejected"}:
+                    _add_candidate_reason(candidates, token_clean, "component_blocked_candidate", subject)
+                    if _is_sentence_start_match(text, match.start()):
+                        sentence_start_counts[token_clean] += 1
+                    else:
+                        non_sentence_start_counts[token_clean] += 1
             if raw[:1] in {'"', "'", '“', '‘'} or text[max(0, match.start()-1):match.start()] in {'"', "'", '“', '‘'}:
                 _add_candidate_reason(candidates, clean, "quoted_title", subject)
 
@@ -388,7 +407,7 @@ def _theme_labels_for_text(text: str) -> set[str]:
     if re.search(r"\bbnl\b|\bsource files?\b|\bdossiers?\b|\bbot\b", lowered):
         labels.add("BNL interaction")
     if re.search(r"\bliaison\b|\binterface\b|\bnode\b", lowered):
-        labels.add("liaison/interface/node language")
+        labels.add("liaison/interface language")
     if re.search(r"\bbnl\b", lowered) and re.search(r"\bpresence\b", lowered):
         labels.add("BNL presence")
     elif re.search(r"\bpresence\b", lowered):
@@ -421,28 +440,101 @@ def _recurring_phrases(text: str) -> set[str]:
     return phrases
 
 
-def _acceptable_recurring_subject(label: str, count: int, reasons: set[str], sentence_starts: int, non_sentence_starts: int) -> tuple[bool, str]:
-    words = re.findall(r"[A-Za-z0-9]+", str(label or ""))
-    strong_order = (
-        "explicit_through_pattern", "explicit_here_pattern", "explicit_said_pattern",
-        "domain_tool", "code_marker", "quoted_title", "phrase_cluster",
-    )
-    for reason in strong_order:
-        if reason in reasons:
-            if len(words) == 1 and words[0].lower() in _SUBJECT_INTELLIGENCE_STOPWORDS:
-                return False, "stopword"
-            return True, reason
-    if len(words) > 1 and count >= 2:
-        return True, "phrase_cluster"
-    if len(words) == 1 and count >= 2 and non_sentence_starts > 0 and sentence_starts < count:
+def _candidate_words(label: str) -> list[str]:
+    return re.findall(r"[A-Za-z0-9]+", str(label or ""))
+
+
+def _candidate_key(label: str) -> str:
+    return re.sub(r"\s+", " ", str(label or "").strip().lower())
+
+
+def _is_system_or_pronoun_candidate(label: str) -> bool:
+    """Return True for pronouns/address words and BNL/system/persona labels."""
+
+    key = _candidate_key(label)
+    words = [word.lower() for word in _candidate_words(label)]
+    if not key or key in _PRONOUN_OR_ADDRESS_TERMS or key in _SYSTEM_OR_PERSONA_TERMS:
+        return True
+    if len(words) == 1 and words[0] in (_PRONOUN_OR_ADDRESS_TERMS | _SYSTEM_OR_PERSONA_TERMS):
+        return True
+    return bool(words) and all(word in (_PRONOUN_OR_ADDRESS_TERMS | _SYSTEM_OR_PERSONA_TERMS) for word in words)
+
+
+def _candidate_entity_type(label: str, reasons: set[str] | None = None) -> str:
+    """Classify a weak extracted string before it can become a recurring named topic."""
+
+    reasons = reasons or set()
+    key = _candidate_key(label)
+    words = [word.lower() for word in _candidate_words(label)]
+    if not key or not words:
+        return "rejected"
+    if key in _PRONOUN_OR_ADDRESS_TERMS or (len(words) == 1 and words[0] in _PRONOUN_OR_ADDRESS_TERMS):
+        return "pronoun_or_address"
+    if key in _SYSTEM_OR_PERSONA_TERMS or (len(words) == 1 and words[0] in _SYSTEM_OR_PERSONA_TERMS):
+        return "system_label"
+    if key in _TOOL_OR_PLATFORM_TERMS or "domain_tool" in reasons:
+        return "tool_or_platform"
+    if re.fullmatch(r"0x[A-Fa-f0-9]{2,}", str(label or "")):
+        return "code_marker"
+    if "code_marker" in reasons and not _is_system_or_pronoun_candidate(label):
+        raw = str(label or "")
+        if re.search(r"\d", raw) or "-" in raw:
+            return "code_marker"
+    if words and all(word in _GRAMMAR_OR_FILLER_TERMS for word in words):
+        return "grammar_or_filler"
+    if words[0] in (_PRONOUN_OR_ADDRESS_TERMS | _GRAMMAR_OR_FILLER_TERMS | _SYSTEM_OR_PERSONA_TERMS):
+        return "rejected"
+    blocked_count = sum(1 for word in words if word in _NAMED_TOPIC_BLOCKED_TERMS)
+    if len(words) > 1 and blocked_count >= len(words):
+        return "rejected"
+    if key in {"bnl 01", "barcode network", "the network", "source file", "public context", "for review"}:
+        return "system_label"
+    if any(word in {"presence", "threshold", "liaison", "interface", "sync", "convergence", "boundaries", "operational"} for word in words):
+        return "conversation_theme"
+    return "person_or_project"
+
+
+def _is_valid_named_topic_candidate(label: str, reasons: set[str] | None = None) -> bool:
+    return _candidate_entity_type(label, reasons) in {"person_or_project", "code_marker"}
+
+
+def _should_promote_named_topic(label: str, count: int, reasons: set[str], sentence_starts: int, non_sentence_starts: int) -> tuple[bool, str]:
+    """Apply the entity-quality gate for recurring named topics."""
+
+    words = _candidate_words(label)
+    entity_type = _candidate_entity_type(label, reasons)
+    if entity_type not in {"person_or_project", "code_marker"}:
+        return False, entity_type
+    if entity_type == "code_marker":
+        return True, "code_marker"
+
+    key = _candidate_key(label)
+    if key in _NAMED_TOPIC_BLOCKED_TERMS or any(word.lower() in _PRONOUN_OR_ADDRESS_TERMS for word in words):
+        return False, "blocked_term"
+    explicit_reasons = {"explicit_through_pattern", "explicit_here_pattern", "explicit_said_pattern", "quoted_title"}
+    if reasons & explicit_reasons:
+        return True, next(reason for reason in ("explicit_through_pattern", "explicit_here_pattern", "explicit_said_pattern", "quoted_title") if reason in reasons)
+    if len(words) > 1:
+        lowered_words = [word.lower() for word in words]
+        if lowered_words[0] in _NAMED_TOPIC_BLOCKED_TERMS:
+            return False, "blocked_prefix"
+        if sum(1 for word in lowered_words if word in _NAMED_TOPIC_BLOCKED_TERMS) >= len(lowered_words):
+            return False, "mostly_blocked_words"
+        if count >= 2:
+            return True, "phrase_cluster"
+        return False, "single_phrase_without_explicit_pattern"
+    if len(words) == 1 and count >= 2 and non_sentence_starts >= 2:
         return True, "repeated_non_sentence_start"
     return False, "sentence_start_or_weak_signal"
 
 
+def _acceptable_recurring_subject(label: str, count: int, reasons: set[str], sentence_starts: int, non_sentence_starts: int) -> tuple[bool, str]:
+    return _should_promote_named_topic(label, count, reasons, sentence_starts, non_sentence_starts)
+
 def _theme_sort_key(item: tuple[str, int]) -> tuple[int, int, str]:
     label, count = item
     preferred = [
-        "BNL presence", "threshold behavior", "liaison/interface/node language",
+        "BNL presence", "threshold behavior", "liaison/interface language",
         "sync/convergence markers", "operational boundaries", "BNL interaction",
         "music-sharing or link language", "BARCODE Network/community behavior",
     ]
@@ -462,21 +554,27 @@ def extract_conversation_theme_clusters(intelligence: dict[str, Any], *, public_
         phrases = phrases + (intelligence.get("reviewOnlyPhrases") or Counter())
         domains = domains + (intelligence.get("reviewOnlyDomains") or Counter())
     clusters: list[str] = []
+    for phrase, count in phrases.most_common(10):
+        phrase_text = str(phrase or "")
+        if count < 2:
+            continue
+        if " through " in phrase_text.lower():
+            if not re.fullmatch(r"[A-Z][A-Za-z0-9_-]*(?:\s+[A-Z][A-Za-z0-9_-]*)?\s+through\s+[A-Z][A-Za-z0-9_-]*(?:\s+[A-Z][A-Za-z0-9_-]*)?", phrase_text):
+                continue
+            clusters.append(phrase_text.replace(" through ", "-through-") + " framing")
+        elif re.fullmatch(r"0x[A-Fa-f0-9]{2,}", phrase_text):
+            clusters.append(f"{phrase_text} marker")
     for label, count in sorted(themes.items(), key=_theme_sort_key):
         if count >= 2:
             clusters.append(label)
     if any(count >= 1 and _domain_tool_label(domain) == "Suno" for domain, count in domains.items()):
         clusters.append("Suno links")
-    for phrase, count in phrases.most_common(6):
-        if count >= 2 and (" through " in phrase.lower() or re.search(r"\b0x[a-f0-9]{2,}\b", phrase, re.I)):
-            normalized = phrase.replace(" through ", "-through-") + (" framing" if " through " in phrase.lower() else " marker")
-            clusters.append(normalized)
     deduped: list[str] = []
     for cluster in clusters:
         clean = _safe_snippet(cluster, 80)
         if clean and clean not in deduped:
             deduped.append(clean)
-    return deduped[:8]
+    return deduped[:12]
 
 
 def score_recurring_conversation_phrases(intelligence: dict[str, Any]) -> list[tuple[str, int]]:
@@ -510,10 +608,10 @@ def build_subject_topic_clusters(subject: str, intelligence: dict[str, Any]) -> 
         activity.append(f"Activity pattern: {subject} repeatedly asks BNL/source-file related questions.")
     theme_line = ""
     if clusters:
-        theme_line = f"Conversation theme: {subject} repeatedly discusses {', '.join(clusters[:6])}. Review before public use."
+        theme_line = f"Conversation theme: {subject} repeatedly discusses {', '.join(clusters[:10])}. Review before public use."
     digest = ""
     if rows_scanned and clusters:
-        digest = f"Evidence digest: {rows_scanned} {subject}-linked evidence items were scanned. The strongest recurring clusters were {', '.join(clusters[:6])}."
+        digest = f"Evidence digest: {rows_scanned} {subject}-linked evidence items were scanned. The strongest recurring clusters were {', '.join(clusters[:10])}."
     return {"clusters": clusters, "activityPatterns": activity[:5], "conversationThemeLine": theme_line, "evidenceDigestLine": digest}
 
 
@@ -726,7 +824,7 @@ def _promote_subject_intelligence_readouts(summary: dict[str, Any], intelligence
         "rowsBySource": dict((intelligence.get("sourceCounts") or Counter()).most_common()),
         "topRecurringSubjects": [label for label, count in (public_subjects + review_subjects).most_common(6) if count >= 1],
         "acceptedRecurringSubjects": [
-            {"label": label, "reason": accepted_reason_map.get(label, "") }
+            {"label": label, "reason": accepted_reason_map.get(label, "")}
             for label, count in (public_subjects + review_subjects).most_common(8) if count >= 1
         ],
         "rejectedGarbageCandidates": [label for label, count in (intelligence.get("rejectedSubjectCandidates") or Counter()).most_common(8)],
@@ -762,24 +860,26 @@ def extract_tool_or_platform_mentions(texts: list[str]) -> Counter:
 def extract_named_topic_facts(texts: list[str], subject: str = "") -> Counter:
     """Extract bounded named recurring subjects from safe/public or reviewable snippets."""
 
-    counts = _count_term_mentions(texts, _NAMED_TOPIC_ALLOWLIST)
-    subject_norm = normalize_subject_name(subject).lower()
+    provisional: Counter = Counter()
+    reasons_by_label: dict[str, set[str]] = {}
+    sentence_starts: Counter = Counter()
+    non_sentence_starts: Counter = Counter()
     for text in texts:
-        for match in _ENTITY_NAME_PATTERN.finditer(str(text or "")):
-            label = re.sub(r"\s+", " ", match.group(0)).strip(" -:.,;!?()[]{}")
-            if not label or len(label) < 3:
+        candidates, sentence_counts, non_sentence_counts = _subject_candidate_reasons_from_text(str(text or ""), subject)
+        for label, reasons in candidates.items():
+            if _candidate_entity_type(label, reasons) == "tool_or_platform":
                 continue
-            lowered = label.lower()
-            words = set(re.findall(r"[a-z0-9]+", lowered))
-            if lowered == subject_norm or lowered in _TOOL_OR_PLATFORM_TERMS or lowered in _NAMED_TOPIC_ALLOWLIST:
-                continue
-            if words & _NAMED_TOPIC_STOPWORDS:
-                continue
-            if len(label.split()) > 3:
-                continue
-            counts[label] += 1
-    return counts
+            provisional[label] += 1
+            reasons_by_label.setdefault(label, set()).update(reasons)
+        sentence_starts.update(sentence_counts)
+        non_sentence_starts.update(non_sentence_counts)
 
+    counts: Counter = Counter()
+    for label, count in provisional.items():
+        accepted, _reason = _should_promote_named_topic(label, count, reasons_by_label.get(label, set()), sentence_starts[label], non_sentence_starts[label])
+        if accepted:
+            counts[label] = count
+    return counts
 
 def extract_bnl_interaction_facts(texts: list[str]) -> dict[str, int]:
     """Return repeated BNL/help interaction counts from already-approved evidence text."""
