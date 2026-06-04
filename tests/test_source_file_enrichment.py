@@ -397,6 +397,42 @@ class SourceFileEnrichmentTests(unittest.TestCase):
         self.assertIn("approve a public-safe summary", action)
 
 
+    def test_dry_run_preview_formats_subject_intelligence_diagnostic_lists(self):
+        result = {
+            "subject": "Crow",
+            "matchKind": "active_source_file",
+            "dryRun": True,
+            "qualityStatus": "ok",
+            "sourceTypes": ["source_file_lookup", "conversations_by_author"],
+            "subjectIntelligenceDiagnostics": {
+                "rowsScanned": 4,
+                "rowsBySource": {"conversations_by_author": 3, "community_presence": 1},
+                "topRecurringSubjects": ["Orion"],
+                "acceptedRecurringSubjects": [
+                    {"label": "Orion", "reason": "repeated liaison context"},
+                    {"label": "Suno", "reason": "recurring tool mention"},
+                ],
+                "rejectedGarbageCandidates": ["BNL", "Discord"],
+                "topRecurringThemes": ["liaison interface"],
+                "topConversationClusters": ["repeated BNL questions", "music tool links"],
+                "topActivityPatterns": ["asks about source thresholds", "shares Suno links"],
+                "topDomains": ["suno.com"],
+                "publicSafeRows": 2,
+                "reviewOnlyRows": 2,
+            },
+        }
+
+        formatted = enrich.format_source_enrichment_response(result)
+
+        self.assertIn("Accepted recurring subjects with reason", formatted)
+        self.assertIn("Orion: repeated liaison context", formatted)
+        self.assertIn("Rejected top garbage candidates", formatted)
+        self.assertIn("BNL, Discord", formatted)
+        self.assertIn("Top conversation clusters", formatted)
+        self.assertIn("repeated BNL questions", formatted)
+        self.assertIn("Top activity patterns", formatted)
+        self.assertIn("asks about source thresholds", formatted)
+
     def test_dry_run_preview_includes_subject_intelligence_diagnostics(self):
         self.conn.execute("INSERT INTO user_profiles VALUES (42,1,'Crow','Crow',NULL,NULL)")
         self.conn.execute("INSERT INTO conversations VALUES (NULL,42,'Crow',1,'general','public_home','user','Orion through Crow asks BNL about Suno links and presence threshold behavior: https://suno.com/song/a', '2026-06-01')")
