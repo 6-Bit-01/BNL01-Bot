@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import re
 import sqlite3
 from collections import Counter, defaultdict
@@ -2332,6 +2333,11 @@ def _merge_entity_intelligence_into_evidence(evidence: dict[str, Any], profile: 
         "modActionItems": action_items,
         "missingInfo": missing,
         "sourceRowsBySource": (profile.get("diagnostics") or {}).get("rowsBySource") or {},
+        "rowScopeCounts": (profile.get("diagnostics") or {}).get("rowScopeCounts") or {},
+        "extractableRows": int((profile.get("diagnostics") or {}).get("extractableRows") or 0),
+        "globalMixedRows": int((profile.get("diagnostics") or {}).get("globalMixedRows") or 0),
+        "sourceBlindRows": int((profile.get("diagnostics") or {}).get("sourceBlindRows") or 0),
+        "queueSubmissionStatus": (profile.get("diagnostics") or {}).get("queueSubmissionStatus") or "not_connected",
         "publicSafeRows": int((profile.get("diagnostics") or {}).get("publicSafeRows") or 0),
         "reviewOnlyRows": int((profile.get("diagnostics") or {}).get("reviewOnlyRows") or 0),
         "officialPublicDossierConnected": bool((profile.get("diagnostics") or {}).get("officialPublicDossierConnected")),
@@ -2524,6 +2530,14 @@ def run_source_file_enrichment(
     evidence = collect_source_enrichment_evidence(db_path, guild_id, str(effective_subject), rd_context=rd_context, lookup_result=lookup_result)
     entity_profile = build_entity_intelligence_profile(db_path, guild_id, str(effective_subject), refresh=True)
     entity_resolver = resolve_entity_context_for_surface(entity_profile, "source_file", max_items=16)
+    entity_diag_for_log = entity_profile.get("diagnostics") or {}
+    scope_for_log = entity_diag_for_log.get("rowScopeCounts") or {}
+    logging.info(
+        "source_enrichment entity_intelligence_rows_collected subject_key=%s owned=%s keyed=%s authored=%s co_mention=%s global_mixed=%s source_blind=%s rejected=%s",
+        entity_profile.get("subjectKey") or "unknown",
+        int(scope_for_log.get("subject_owned") or 0), int(scope_for_log.get("subject_keyed") or 0), int(scope_for_log.get("subject_authored") or 0),
+        int(scope_for_log.get("subject_co_mention") or 0), int(scope_for_log.get("global_mixed_memory") or 0), int(scope_for_log.get("source_blind_global") or 0), int(scope_for_log.get("rejected") or 0),
+    )
     _merge_entity_intelligence_into_evidence(evidence, entity_profile, entity_resolver)
     packet = {
         "ok": True,
@@ -2708,11 +2722,14 @@ def format_source_enrichment_response(result: dict[str, Any]) -> str:
         entity_diag = ((result.get("diagnostics") or {}).get("entityIntelligence") or {})
         if entity_diag:
             rows_by_source = entity_diag.get("sourceRowsBySource") or {}
+            scope_counts = entity_diag.get("rowScopeCounts") or {}
             preview_lines.extend([
-                f"Entity intelligence ledger/profile: {_safe_text(entity_diag.get('ledgerStatus') or 'unknown', 40)} / {_safe_text(entity_diag.get('profileStatus') or 'unknown', 40)}; resolver surface: {_safe_text(entity_diag.get('resolverSurface') or 'source_file', 40)}.",
-                f"Entity facets: roles={_safe_text(', '.join(entity_diag.get('detectedRoleFacets') or []) or 'none', 120)}; relationships={_safe_text(', '.join(entity_diag.get('detectedRelationshipFacets') or []) or 'none', 120)}; music={_safe_text(', '.join(entity_diag.get('creativeMusicFacets') or []) or 'none', 120)}.",
-                f"Entity themes/actions: themes={_safe_text(', '.join(entity_diag.get('conversationThemes') or []) or 'none', 140)}; actions={_safe_text('; '.join(entity_diag.get('modActionItems') or []) or 'none', 140)}.",
-                f"Entity source split: {_safe_text(', '.join(f'{k} {v}' for k, v in rows_by_source.items()) or 'none', 140)}; {int(entity_diag.get('publicSafeRows') or 0)} public-safe / {int(entity_diag.get('reviewOnlyRows') or 0)} review-only; official public dossier source connected: {'yes' if entity_diag.get('officialPublicDossierConnected') else 'no'}.",
+                f"Entity ledger subject-owned facets: roles={_safe_text(', '.join(entity_diag.get('detectedRoleFacets') or []) or 'none', 105)}; relationships={_safe_text(', '.join(entity_diag.get('detectedRelationshipFacets') or []) or 'none', 105)}; music={_safe_text(', '.join(entity_diag.get('creativeMusicFacets') or []) or 'none', 95)}.",
+                f"Entity themes/activity: themes={_safe_text(', '.join(entity_diag.get('conversationThemes') or []) or 'none', 120)}; actions={_safe_text('; '.join(entity_diag.get('modActionItems') or []) or 'none', 110)}.",
+                f"Scoped row split: owned={int(scope_counts.get('subject_owned') or 0)} keyed={int(scope_counts.get('subject_keyed') or 0)} authored={int(scope_counts.get('subject_authored') or 0)} profile={int(scope_counts.get('subject_profile_matched') or 0)} direct={int(scope_counts.get('subject_direct_evidence') or 0)} co-mention={int(scope_counts.get('subject_co_mention') or 0)}.",
+                f"Excluded review-only rows: global_mixed={int(entity_diag.get('globalMixedRows') or 0)} source_blind={int(entity_diag.get('sourceBlindRows') or 0)} rejected={int(scope_counts.get('rejected') or 0)}; extractable={int(entity_diag.get('extractableRows') or 0)}.",
+                f"Source split: {_safe_text(', '.join(f'{k} {v}' for k, v in rows_by_source.items()) or 'none', 105)}; official public dossier source connected: {'yes' if entity_diag.get('officialPublicDossierConnected') else 'no'}; queue submission connected: {'yes' if entity_diag.get('queueSubmissionStatus') != 'not_connected' else 'no'}.",
+                "Legacy recurring-subject diagnostics are subordinate; scoped entity ledger facets are shown first.",
             ])
         preview_lines.append("No raw private transcripts were included; nothing was sent to the website.")
         return "\n".join(preview_lines)[:1900]

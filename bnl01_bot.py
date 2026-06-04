@@ -61,6 +61,12 @@ from bnl_entity_activity_summary import (
     parse_entity_activity_summary_command,
     refresh_entity_evidence_for_subject,
 )
+from bnl_entity_intelligence import (
+    build_entity_context_for_rd_mod_ops,
+    build_entity_intelligence_profile,
+    resolve_entity_context_for_surface,
+    subject_key as entity_subject_key,
+)
 from bnl_source_file_lookup import (
     build_source_file_lookup_diagnostics,
     format_source_file_lookup_response,
@@ -4815,11 +4821,63 @@ async def maybe_handle_dossier_discovery_command(message: discord.Message, clean
 
 
 def _parse_rd_entity_context_subject(text: str) -> str:
-    match = re.search(r"(?i)\b(?:entity intelligence|context resolver|source context|dossier context)\s+(?:for\s+|on\s+|about\s+)?([A-Za-z0-9 _.-]{2,80})", text or "")
+    match = re.search(r"(?i)\b(?:entity intelligence|entity context|context resolver|source context|dossier context)\s+(?:for\s+|on\s+|about\s+)?([A-Za-z0-9 _.-]{2,80})", text or "")
     if not match:
         return ""
     subject = re.sub(r"\s+", " ", match.group(1)).strip(" .,:;|!?\n\t")
     return subject[:80]
+
+
+
+
+async def maybe_handle_entity_context_resolver_command(message: discord.Message, clean_content: str, *, real_direct_target: bool = False, is_reply: bool = False) -> bool:
+    """Route explicit operator entity-intelligence resolver tests before Gemini/free-speak."""
+
+    text = clean_content or ""
+    explicit_bang = bool(re.match(r"(?is)^\s*!bnl\s+(?:entity\s+(?:intelligence|context)|context\s+resolver)\b", text))
+    subject = _parse_rd_entity_context_subject(text)
+    if not subject or not (explicit_bang or real_direct_target or is_reply):
+        return False
+
+    channel = getattr(message, "channel", None)
+    policy = resolve_channel_policy(channel)
+    channel_name = getattr(channel, "name", "") or ""
+    normalized_channel_name = _normalize_channel_name(channel_name)
+    allowed_channel = (
+        policy == "internal_controlled" and normalized_channel_name == "research-and-development"
+    ) or (
+        policy == "sealed_test" and normalized_channel_name == "bnl-testing"
+    )
+    if not allowed_channel:
+        if explicit_bang or real_direct_target:
+            await message.reply("Entity context resolver is restricted to #research-and-development or #bnl-testing.")
+            return True
+        return False
+
+    member = message.author if isinstance(message.author, discord.Member) else message.guild.get_member(message.author.id)
+    if not can_send_dossier_recommendation(message.author, member, message.guild):
+        logging.warning("entity_context_resolver_command_denied reason=permission channel_policy=%s", policy)
+        await message.reply("Entity context resolver is operator-only.")
+        return True
+
+    surface = "rd_mod_ops" if normalized_channel_name == "research-and-development" else "source_file"
+    if surface == "rd_mod_ops":
+        context = await asyncio.to_thread(build_entity_context_for_rd_mod_ops, DB_FILE, message.guild.id, subject)
+    else:
+        profile = await asyncio.to_thread(build_entity_intelligence_profile, DB_FILE, message.guild.id, subject, refresh=True)
+        context = resolve_entity_context_for_surface(profile, "source_file", max_items=8)
+    logging.info(
+        "entity_context_resolver_command surface=%s subject_key=%s channel_policy=%s",
+        surface,
+        entity_subject_key(subject),
+        policy,
+    )
+    response = _format_rd_entity_context_response(subject, context).replace("(R&D/mod ops)", f"({surface})")
+    await message.reply(response)
+    if surface == "rd_mod_ops":
+        _remember_rd_ops_context(message, clean_content, "entity_context_resolver", subject, "#research-and-development", response)
+    _mark_recent_direct_response(message.channel.id, message.author.id)
+    return True
 
 
 def _format_rd_entity_context_response(subject: str, context: dict) -> str:
@@ -14744,6 +14802,9 @@ async def on_message(message: discord.Message):
     if await maybe_handle_source_file_lookup_command(message, clean_content):
         return
 
+    if await maybe_handle_entity_context_resolver_command(message, clean_content, real_direct_target=real_direct_target, is_reply=is_reply):
+        return
+
     if await maybe_handle_entity_activity_summary_command(message, clean_content):
         return
 
@@ -14931,6 +14992,7 @@ async def on_message(message: discord.Message):
         rd_entity_subject = _parse_rd_entity_context_subject(clean_content)
         if rd_entity_subject:
             context = await asyncio.to_thread(build_entity_context_for_rd_mod_ops, DB_FILE, message.guild.id, rd_entity_subject)
+            logging.info("entity_context_resolver_command surface=rd_mod_ops subject_key=%s channel_policy=%s", entity_subject_key(rd_entity_subject), channel_policy)
             response = _format_rd_entity_context_response(rd_entity_subject, context)
             await message.reply(response)
             _remember_rd_ops_context(message, clean_content, "entity_context_resolver", rd_entity_subject, "#research-and-development", response)
