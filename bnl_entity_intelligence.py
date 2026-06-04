@@ -81,6 +81,16 @@ THEME_PATTERNS = [
     ("BARCODE Network behavior", re.compile(r"\b(?:BARCODE|BNL|Barcode Network)\b", re.I)),
 ]
 MUSIC_RE = re.compile(r"\b(?:suno|udio|youtube|youtu\.be|soundcloud|spotify|bandcamp|track|song|demo|wip|finished[- ]tracks?)\b|https?://", re.I)
+
+MUSIC_PLATFORM_DOMAINS = {"suno.com", "udio.com", "soundcloud.com", "spotify.com", "bandcamp.com"}
+VIDEO_PLATFORM_DOMAINS = {"youtube.com", "youtu.be"}
+SOCIAL_PLATFORM_DOMAINS = {"instagram.com", "tiktok.com"}
+COMMUNITY_DOMAINS = {"discord.gg", "discord.com"}
+PLATFORM_NAME_RE = re.compile(r"\b(?:suno|udio|soundcloud|spotify|bandcamp|youtube|youtu\.be|instagram|tiktok|discord)\b", re.I)
+MUSIC_DISCUSSION_RE = re.compile(r"\b(?:music|artist|producer|musician|songwriter|album|playlist|mix|master|beat|radio|show)\b", re.I)
+SONG_TRACK_DEMO_RE = re.compile(r"\b(?:song|track|demo|wip|finished[- ]tracks?|wips[- ]and[- ]demos|wips?)\b", re.I)
+FEEDBACK_RE = re.compile(r"\bfeedback\b", re.I)
+_TRACKING_QUERY_KEYS = {"utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content", "si", "feature"}
 BNL_RE = re.compile(r"\b(?:BNL|bot|source files?|dossiers?|BARCODE)\b", re.I)
 ANTAGONISTIC_RE = re.compile(r"\b(?:challenge|challenging|argu|bait|teas|hostile|antagon|prove it|wrong|you can't|fight me)\b", re.I)
 ANOMALY_RE = re.compile(r"\b(?:anomaly|strange|weird|theory|signal|glitch|lore|cipher|riddle)\b", re.I)
@@ -277,6 +287,147 @@ def _clean_through_left_label(label: str) -> str:
         cleaned = _THROUGH_LEFT_TRAILING_ACTION_RE.sub("", cleaned).strip()
     return _canonical_entity_label(cleaned) if cleaned else ""
 
+
+
+def _strip_url_punctuation(value: str) -> str:
+    return str(value or "").rstrip(").,!?;:'\"”’]")
+
+
+def _extract_urls(text: str) -> list[str]:
+    return [_strip_url_punctuation(m.group(0)) for m in URL_RE.finditer(str(text or ""))]
+
+
+def _url_parts(url: str):
+    from urllib.parse import parse_qsl, urlencode, urlparse
+
+    parsed = urlparse(_strip_url_punctuation(url))
+    domain = (parsed.netloc or "").lower().removeprefix("www.")
+    path = re.sub(r"/+$", "", parsed.path or "/") or "/"
+    pairs = [(k, v) for k, v in parse_qsl(parsed.query, keep_blank_values=True) if k.lower() not in _TRACKING_QUERY_KEYS]
+    query = urlencode(sorted(pairs))
+    return domain, path, query
+
+
+def _normalized_url_fingerprint(url: str) -> str:
+    domain, path, query = _url_parts(url)
+    return f"{domain}{path}" + (f"?{query}" if query else "")
+
+
+def _classify_url_domain(url: str) -> str:
+    domain, path, query = _url_parts(url)
+    if domain in COMMUNITY_DOMAINS:
+        combined = f"{path}?{query}".lower()
+        if "event=" in combined or "/events/" in combined:
+            return "event_contest_link"
+        return "community_server_link"
+    if domain in MUSIC_PLATFORM_DOMAINS or any(domain.endswith("." + d) for d in MUSIC_PLATFORM_DOMAINS):
+        return "music_platform_link"
+    if domain in VIDEO_PLATFORM_DOMAINS or any(domain.endswith("." + d) for d in VIDEO_PLATFORM_DOMAINS):
+        return "video_platform_link"
+    if domain in SOCIAL_PLATFORM_DOMAINS or any(domain.endswith("." + d) for d in SOCIAL_PLATFORM_DOMAINS):
+        return "social_platform_link"
+    return "generic_link"
+
+
+def _platform_label_from_domain(domain: str) -> str:
+    domain = (domain or "").lower().removeprefix("www.")
+    if domain.endswith("suno.com"):
+        return "Suno"
+    if domain.endswith("udio.com"):
+        return "Udio"
+    if domain.endswith("soundcloud.com"):
+        return "SoundCloud"
+    if domain.endswith("spotify.com"):
+        return "Spotify"
+    if domain.endswith("bandcamp.com"):
+        return "Bandcamp"
+    if domain.endswith("youtube.com") or domain == "youtu.be":
+        return "YouTube/youtu.be"
+    if domain.endswith("discord.gg") or domain.endswith("discord.com"):
+        return "Discord"
+    if domain.endswith("instagram.com"):
+        return "Instagram"
+    if domain.endswith("tiktok.com"):
+        return "TikTok"
+    return domain or "unknown platform"
+
+
+def _extract_platform_domains(text: str) -> set[str]:
+    domains: set[str] = set()
+    for url in _extract_urls(text):
+        domain, _path, _query = _url_parts(url)
+        if domain:
+            domains.add(domain)
+    return domains
+
+
+def _has_actual_url(text: str) -> bool:
+    return bool(_extract_urls(text))
+
+
+def _has_music_platform_url(text: str) -> bool:
+    return any(_classify_url_domain(url) == "music_platform_link" for url in _extract_urls(text))
+
+
+def _has_video_platform_url(text: str) -> bool:
+    return any(_classify_url_domain(url) == "video_platform_link" for url in _extract_urls(text))
+
+
+def _has_event_or_community_url(text: str) -> bool:
+    return any(_classify_url_domain(url) in {"event_contest_link", "community_server_link"} for url in _extract_urls(text))
+
+
+def _has_music_discussion_terms(text: str) -> bool:
+    return bool(MUSIC_DISCUSSION_RE.search(str(text or "")))
+
+
+def _has_song_track_demo_terms(text: str) -> bool:
+    return bool(SONG_TRACK_DEMO_RE.search(str(text or "")))
+
+
+def _platform_mentions_without_urls(text: str) -> set[str]:
+    no_urls = URL_RE.sub(" ", str(text or ""))
+    labels: set[str] = set()
+    for match in PLATFORM_NAME_RE.finditer(no_urls):
+        raw = match.group(0).lower()
+        if raw in {"youtu.be", "youtube"}:
+            labels.add("YouTube/youtu.be")
+        elif raw == "soundcloud":
+            labels.add("SoundCloud")
+        elif raw == "bandcamp":
+            labels.add("Bandcamp")
+        elif raw == "discord":
+            labels.add("Discord")
+        elif raw == "instagram":
+            labels.add("Instagram")
+        elif raw == "tiktok":
+            labels.add("TikTok")
+        else:
+            labels.add(raw.capitalize())
+    return labels
+
+
+def _is_primary_evidence_row(row: dict[str, Any]) -> bool:
+    if row.get("source") == "conversations" and row.get("scope") == "subject_authored":
+        return True
+    if row.get("source") == "entity_evidence_events" and row.get("scope") in {"subject_keyed", "subject_direct_evidence"}:
+        return True
+    return row.get("scope") in {"subject_owned", "subject_keyed", "subject_authored", "subject_direct_evidence"} and row.get("source") not in {"memory_tiers", "relationship_journal", "community_presence"}
+
+
+def _primary_evidence_fingerprint(subject_skey: str, signal_type: str, *, url: str = "", platform: str = "", row: dict[str, Any] | None = None, text: str = "") -> str:
+    if url:
+        core = _normalized_url_fingerprint(url)
+    elif platform:
+        core = re.sub(r"[^a-z0-9]+", "-", platform.lower()).strip("-")
+    else:
+        excerpt = re.sub(r"\s+", " ", str(text or "").lower()).strip()[:240]
+        core = hashlib.sha1(excerpt.encode("utf-8")).hexdigest()[:16]
+    return f"{subject_skey}:{signal_type}:{core}"
+
+
+def _is_derived_evidence_row(row: dict[str, Any]) -> bool:
+    return not _is_primary_evidence_row(row) or row.get("source") in {"memory_tiers", "relationship_journal", "community_presence", "broadcast_memory"} or row.get("authority") == "source_blind_memory"
 
 def _has_contest_event_signal(text: str) -> bool:
     if not CONTEST_RE.search(text):
@@ -720,6 +871,10 @@ def _classify(subject: str, rows: list[dict[str, Any]]) -> dict[str, Any]:
     music = Counter()
     events = Counter()
     activity = Counter()
+    signal_counts = Counter()
+    signal_domains: dict[str, Counter[str]] = defaultdict(Counter)
+    seen_signal_fingerprints: set[str] = set()
+    primary_signal_fingerprints: set[str] = set()
     edges: dict[tuple[str, str], dict[str, Any]] = {}
     label_traces: list[dict[str, Any]] = []
     facts: list[dict[str, Any]] = []
@@ -770,7 +925,8 @@ def _classify(subject: str, rows: list[dict[str, Any]]) -> dict[str, Any]:
             "evidenceCount": 1,
         }
 
-    for row in extraction_rows:
+    ordered_extraction_rows = sorted(extraction_rows, key=lambda r: 0 if _is_primary_evidence_row(r) else 1)
+    for row in ordered_extraction_rows:
         text = str(row.get("text") or "")
         low = text.lower()
         for role, pat, reason in ROLE_PATTERNS:
@@ -788,10 +944,59 @@ def _classify(subject: str, rows: list[dict[str, Any]]) -> dict[str, Any]:
             activity["asks BNL Source File questions"] += 1
         if re.search(r"\bboundar|behavior|what can you say|liaison|interface\b", text, re.I):
             activity["discusses BNL boundaries/behavior"] += 1
-        if MUSIC_RE.search(text):
-            music["shares music links"] += 1
-            if re.search(r"\b(?:suno|udio|youtube|youtu\.be|soundcloud|spotify|bandcamp)\b|https?://", text, re.I):
-                music["shares Suno/Udio/YouTube/SoundCloud/Spotify/Bandcamp links"] += 1
+        row_is_primary = _is_primary_evidence_row(row)
+        for url in _extract_urls(text):
+            signal_type = _classify_url_domain(url)
+            fp = _primary_evidence_fingerprint(skey, signal_type, url=url, row=row, text=text)
+            domain, _path, _query = _url_parts(url)
+            if fp in seen_signal_fingerprints:
+                if _is_derived_evidence_row(row) and fp in primary_signal_fingerprints:
+                    signal_counts["derivedDuplicateLinkCount"] += 1
+                continue
+            seen_signal_fingerprints.add(fp)
+            if row_is_primary:
+                primary_signal_fingerprints.add(fp)
+            signal_counts["distinctActualLinkCount"] += 1
+            signal_domains[signal_type][_platform_label_from_domain(domain)] += 1
+            if signal_type == "music_platform_link":
+                signal_counts["musicPlatformLinkCount"] += 1
+                music["actual music platform links"] += 1
+            elif signal_type == "video_platform_link":
+                signal_counts["videoPlatformLinkCount"] += 1
+                music["video platform links"] += 1
+            elif signal_type == "event_contest_link":
+                signal_counts["eventContestLinkCount"] += 1
+                events["event/contest link evidence"] += 1
+            elif signal_type == "community_server_link":
+                signal_counts["communityServerLinkCount"] += 1
+                events["community/server link evidence"] += 1
+            elif signal_type == "generic_link":
+                signal_counts["genericLinkCount"] += 1
+                music["generic links"] += 1
+            elif signal_type == "social_platform_link":
+                signal_counts["socialPlatformLinkCount"] += 1
+                music["social/platform links"] += 1
+        for platform in _platform_mentions_without_urls(text):
+            fp = _primary_evidence_fingerprint(skey, "platform_reference", platform=platform, row=row, text=text)
+            if fp not in seen_signal_fingerprints:
+                seen_signal_fingerprints.add(fp)
+                if row_is_primary:
+                    primary_signal_fingerprints.add(fp)
+                signal_counts["platformReferenceCount"] += 1
+                signal_domains["platform_reference"][platform] += 1
+                music["platform references"] += 1
+        if _has_music_discussion_terms(text):
+            fp = _primary_evidence_fingerprint(skey, "music_discussion", row=row, text=text)
+            if fp not in seen_signal_fingerprints:
+                seen_signal_fingerprints.add(fp)
+                signal_counts["musicDiscussionCount"] += 1
+                music["music discussion"] += 1
+        if _has_song_track_demo_terms(text):
+            fp = _primary_evidence_fingerprint(skey, "song_track_demo_mention", row=row, text=text)
+            if fp not in seen_signal_fingerprints:
+                seen_signal_fingerprints.add(fp)
+                signal_counts["songTrackDemoMentionCount"] += 1
+                music["song/track/demo/WIP mentions"] += 1
         if "finished-tracks" in low:
             music["posts in finished-tracks"] += 1
         if "wips-and-demos" in low or "wip" in low or "demo" in low:
@@ -799,10 +1004,10 @@ def _classify(subject: str, rows: list[dict[str, Any]]) -> dict[str, Any]:
         if "collaboration-hub" in low:
             music["posts in collaboration-hub"] += 1
         if COLLAB_RE.search(text):
-            music["offers collaboration"] += 1
+            music["collaboration offers"] += 1
             activity["collaboration-offer facet"] += 1
-        if re.search(r"\bfeedback\b", text, re.I):
-            music["asks for feedback"] += 1
+        if FEEDBACK_RE.search(text):
+            music["feedback requests"] += 1
         if ANTAGONISTIC_RE.search(text):
             behaviors["antagonistic/challenging"] += 1
             if BNL_RE.search(text):
@@ -874,11 +1079,48 @@ def _classify(subject: str, rows: list[dict[str, Any]]) -> dict[str, Any]:
         review_needed = label in {"moderator", "contest operator", "lore/entity/persona/project creator", "antagonist/challenger"}
         facts.append(_item(label, role_reasons.get(label, label), visibility="review_only" if review_needed else "public_safe_candidate", authority="bnl_inferred", confidence=min(0.9, 0.55 + count * 0.08), public_safe=not review_needed and label != "unknown", review_only=review_needed or label == "unknown", needs_owner_review=review_needed, evidence_count=count) | {"type": "role"})
     roles = facts[:]
-    creative = [_item(k, k, visibility="public_safe_candidate", authority="public_discord_observed", confidence=min(0.9, .55 + v*.08), public_safe=True, review_only=False, needs_owner_review=k.startswith("shares") and "links" in k, evidence_count=v) | {"type": "creative_music"} for k, v in _positive_counter_items(music)]
+
+    def creative_value(label: str, count: int) -> str:
+        if label == "actual music platform links":
+            platforms = ", ".join(f"{name} ({num})" for name, num in signal_domains["music_platform_link"].most_common())
+            return f"Actual music platform links: {count}" + (f" — {platforms}" if platforms else "")
+        if label == "video platform links":
+            platforms = ", ".join(f"{name} ({num})" for name, num in signal_domains["video_platform_link"].most_common())
+            return f"Video platform links: {count}" + (f" — {platforms}" if platforms else "")
+        if label == "generic links":
+            return f"Generic links: {count}; generic URLs are not treated as music links."
+        if label == "social/platform links":
+            platforms = ", ".join(f"{name} ({num})" for name, num in signal_domains["social_platform_link"].most_common())
+            return f"Social/platform links: {count}" + (f" — {platforms}" if platforms else "")
+        if label == "platform references":
+            platforms = ", ".join(f"{name} ({num})" for name, num in signal_domains["platform_reference"].most_common())
+            return f"Platform references without URLs: {count}" + (f" — {platforms}" if platforms else "")
+        if label == "music discussion":
+            return f"Music discussion only: {count}"
+        if label == "song/track/demo/WIP mentions":
+            return f"Song/track/demo/WIP mentions without link claims: {count}"
+        if label == "collaboration offers":
+            return f"Collaboration offers: {count}"
+        if label == "feedback requests":
+            return f"Feedback requests: {count}"
+        return label
+
+    creative = [_item(k, creative_value(k, v), visibility="public_safe_candidate", authority="public_discord_observed", confidence=min(0.9, .55 + v*.08), public_safe=True, review_only=False, needs_owner_review=k in {"actual music platform links", "video platform links", "generic links", "social/platform links"}, evidence_count=v) | {"type": "creative_music"} for k, v in _positive_counter_items(music)]
+    if signal_counts.get("derivedDuplicateLinkCount"):
+        creative.append(_item("derived duplicate link references suppressed", f"Derived duplicate references suppressed: {int(signal_counts['derivedDuplicateLinkCount'])}", visibility="review_only", authority="bnl_inferred", confidence=0.75, public_safe=False, review_only=True, needs_owner_review=True, evidence_count=int(signal_counts["derivedDuplicateLinkCount"])) | {"type": "creative_music"})
     bnl = [_item(k, k, visibility="review_only" if "challenges" in k else "public_safe_candidate", authority="bnl_inferred", confidence=min(.9,.55+v*.08), public_safe="challenges" not in k, review_only="challenges" in k, needs_owner_review="challenges" in k, evidence_count=v) | {"type": "bnl_interaction"} for k, v in _positive_counter_items(activity) if "BNL" in k or "source-file" in k or "boundaries" in k or "challenges" in k]
     behavior = [_item(k, k, visibility="review_only" if k in {"antagonistic/challenging", "theory/anomaly-heavy", "lore-heavy"} else "public_safe_candidate", authority="bnl_inferred", confidence=min(.9,.55+v*.06), public_safe=k not in {"antagonistic/challenging", "theory/anomaly-heavy", "lore-heavy"}, review_only=k in {"antagonistic/challenging", "theory/anomaly-heavy", "lore-heavy"}, needs_owner_review=k in {"antagonistic/challenging", "theory/anomaly-heavy", "lore-heavy"}, evidence_count=v) | {"type": "behavior_posture"} for k, v in _positive_counter_items(behaviors)]
     theme_items = [_item(k, k, visibility="review_only" if k in {"strange/anomaly conversations", "AI/persona/project interaction"} else "public_safe_candidate", authority="bnl_inferred", confidence=min(.9,.55+v*.06), public_safe=k not in {"strange/anomaly conversations", "AI/persona/project interaction"}, review_only=k in {"strange/anomaly conversations", "AI/persona/project interaction"}, needs_owner_review=k in {"strange/anomaly conversations", "AI/persona/project interaction"}, evidence_count=v) | {"type": "conversation_theme"} for k, v in _positive_counter_items(themes)]
-    event_items = [_item(k, k, visibility="review_only" if k != "contest/event activity" else "public_safe_candidate", authority="bnl_inferred", confidence=min(.9,.55+v*.08), public_safe=k == "contest/event activity", review_only=k != "contest/event activity", needs_owner_review=True, evidence_count=v) | {"type": "event_contest"} for k, v in _positive_counter_items(events)]
+    def event_value(label: str, count: int) -> str:
+        if label == "event/contest link evidence":
+            platforms = ", ".join(f"{name} ({num})" for name, num in signal_domains["event_contest_link"].most_common())
+            return f"Event/contest links: {count}" + (f" — {platforms}" if platforms else "")
+        if label == "community/server link evidence":
+            platforms = ", ".join(f"{name} ({num})" for name, num in signal_domains["community_server_link"].most_common())
+            return f"Community/server links: {count}" + (f" — {platforms}" if platforms else "")
+        return label
+
+    event_items = [_item(k, event_value(k, v), visibility="review_only" if k != "contest/event activity" else "public_safe_candidate", authority="bnl_inferred", confidence=min(.9,.55+v*.08), public_safe=k == "contest/event activity", review_only=k != "contest/event activity", needs_owner_review=True, evidence_count=v) | {"type": "event_contest"} for k, v in _positive_counter_items(events)]
     action_items = []
     missing = []
     if edges:
@@ -928,6 +1170,19 @@ def _classify(subject: str, rows: list[dict[str, Any]]) -> dict[str, Any]:
         "reviewOnlyRows": review_rows,
         "globalMixedRows": global_mixed_count,
         "sourceBlindRows": source_blind_count,
+        "signalDiagnostics": {
+            "distinctActualLinkCount": int(signal_counts.get("distinctActualLinkCount") or 0),
+            "musicPlatformLinkCount": int(signal_counts.get("musicPlatformLinkCount") or 0),
+            "videoPlatformLinkCount": int(signal_counts.get("videoPlatformLinkCount") or 0),
+            "eventContestLinkCount": int(signal_counts.get("eventContestLinkCount") or 0),
+            "communityServerLinkCount": int(signal_counts.get("communityServerLinkCount") or 0),
+            "genericLinkCount": int(signal_counts.get("genericLinkCount") or 0),
+            "socialPlatformLinkCount": int(signal_counts.get("socialPlatformLinkCount") or 0),
+            "platformReferenceCount": int(signal_counts.get("platformReferenceCount") or 0),
+            "musicDiscussionCount": int(signal_counts.get("musicDiscussionCount") or 0),
+            "songTrackDemoMentionCount": int(signal_counts.get("songTrackDemoMentionCount") or 0),
+            "derivedDuplicateLinkCount": int(signal_counts.get("derivedDuplicateLinkCount") or 0),
+        },
     }
 
 
@@ -1002,9 +1257,10 @@ def build_entity_intelligence_profile(db_path: str, guild_id: int | None, subjec
             key = (chan, pol)
             if row.get("relation") == "authored": roll[key]["authored"] += 1
             else: roll[key]["mentioned"] += 1
-            if URL_RE.search(str(row.get("text") or "")): roll[key]["links"] += 1
-            if BNL_RE.search(str(row.get("text") or "")): roll[key]["bnl"] += 1
-            if MUSIC_RE.search(str(row.get("text") or "")): roll[key]["music"] += 1
+            row_text = str(row.get("text") or "")
+            if _has_actual_url(row_text): roll[key]["links"] += len(_extract_urls(row_text))
+            if BNL_RE.search(row_text): roll[key]["bnl"] += 1
+            if _has_music_platform_url(row_text) or _has_music_discussion_terms(row_text) or _has_song_track_demo_terms(row_text) or _platform_mentions_without_urls(row_text): roll[key]["music"] += 1
             if CONTEST_RE.search(str(row.get("text") or "")): roll[key]["contest"] += 1
             if COLLAB_RE.search(str(row.get("text") or "")): roll[key]["collab"] += 1
         ts = now_iso()
@@ -1030,7 +1286,9 @@ def build_entity_intelligence_profile(db_path: str, guild_id: int | None, subjec
             "officialPublicDossierNote": "official_public_dossier source not connected yet",
             "queueSubmissionStatus": "not_connected",
             "labelEvidenceTraces": classified.get("labelEvidenceTraces") or [],
+            "signalDiagnostics": classified.get("signalDiagnostics") or {},
         }
+        diagnostics.update(classified.get("signalDiagnostics") or {})
         profile = {
             "subjectKey": skey,
             "subjectName": subject,
