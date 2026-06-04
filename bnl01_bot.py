@@ -4963,6 +4963,7 @@ async def maybe_handle_source_file_enrichment_command(message: discord.Message, 
         lookup_key=lookup_key,
         lookup_value=lookup_value,
         force=force,
+        diagnostics=bool(options.get("diagnostics")),
     )
     _source_enrichment_last_subject = str(result.get("subject") or subject or "none")[:90]
     _source_enrichment_last_status = str(result.get("status") or "unknown")[:80]

@@ -202,14 +202,42 @@ class EntityIntelligenceTests(unittest.TestCase):
             "speaking through Crow",
             "transmitted through Crow",
             "Still here",
+            "entire civilizations communicate purely through language",
+            "sustained analytical input through Crow",
+            "The tradeoff here",
+            "Precision matters here",
+            "The value here",
+            "trap here",
+            "not here",
+            "are still here",
         ]:
             self.add_msg(20, "Crow", "general", "public_home", content)
         p = self.profile_for("Crow")
         labels = [e["objectLabel"] for e in p["relationships"]]
         self.assertIn("Orion", labels)
-        bad = {"speaking", "transmitted", "continuity structure speaking", "continuity structure operating", "speaking directly", "Still"}
+        bad = {"speaking", "transmitted", "continuity structure speaking", "continuity structure operating", "speaking directly", "Still", "entire civilizations communicate purely", "sustained analytical input", "The tradeoff", "Precision matters", "The value", "trap", "not", "are still"}
         self.assertFalse(bad & set(labels))
+        action_text = self.labels(p["actionItems"])
+        self.assertIn("Confirm whether Orion relationship/context can be public", action_text)
+        for bad_label in bad:
+            self.assertNotIn(f"Confirm whether {bad_label} relationship/context", action_text)
         self.assertTrue(all(e["evidenceCount"] > 0 for e in p["relationships"]))
+
+    def test_here_strictness_only_known_entity_survives(self):
+        self.add_profile(25, "Crow")
+        for content in ["Still here", "The value here", "Precision matters here", "Orion here", "not here", "user here"]:
+            self.add_msg(25, "Crow", "general", "public_home", content)
+        p = self.profile_for("Crow")
+        labels = [e["objectLabel"] for e in p["relationships"]]
+        self.assertEqual(["Orion"], labels)
+
+    def test_through_strictness_rejects_sentence_fragments(self):
+        self.add_profile(26, "Crow")
+        for content in ["entire civilizations communicate purely through language", "sustained analytical input through Crow", "Orion through Crow"]:
+            self.add_msg(26, "Crow", "general", "public_home", content)
+        p = self.profile_for("Crow")
+        labels = [e["objectLabel"] for e in p["relationships"]]
+        self.assertEqual(["Orion"], labels)
 
     def test_core_barcode_aliases_do_not_become_relationship_entities(self):
         self.add_profile(21, "Crow")
