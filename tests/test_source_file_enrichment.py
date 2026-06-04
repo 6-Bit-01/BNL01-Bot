@@ -1084,3 +1084,65 @@ class SourceFileEnrichmentBotTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class SourceFileEntityIntelligenceIntegrationTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.NamedTemporaryFile(suffix=".sqlite", delete=False)
+        self.tmp.close()
+        self.db = self.tmp.name
+        self.conn = sqlite3.connect(self.db)
+        c = self.conn.cursor()
+        c.execute("CREATE TABLE user_profiles (user_id INTEGER, guild_id INTEGER, display_name TEXT, preferred_name TEXT, last_seen TEXT, last_greeting_at TEXT)")
+        c.execute("CREATE TABLE user_memory_facts (id INTEGER PRIMARY KEY, user_id INTEGER, guild_id INTEGER, fact_key TEXT, fact_value TEXT, confidence REAL, is_core INTEGER, updated_at TEXT)")
+        c.execute("CREATE TABLE user_habits (user_id INTEGER, guild_id INTEGER, total_messages INTEGER, question_messages INTEGER, humor_messages INTEGER, late_night_messages INTEGER, avg_length REAL, last_topic TEXT, updated_at TEXT)")
+        c.execute("CREATE TABLE relationship_state (user_id INTEGER, guild_id INTEGER, interaction_count INTEGER, affinity_score REAL, trust_stage TEXT, social_stance TEXT, last_topic TEXT, updated_at TEXT)")
+        c.execute("CREATE TABLE relationship_journal (id INTEGER PRIMARY KEY, user_id INTEGER, guild_id INTEGER, entry_type TEXT, summary TEXT, timestamp TEXT)")
+        c.execute("CREATE TABLE conversations (id INTEGER PRIMARY KEY, user_id INTEGER, user_name TEXT, guild_id INTEGER, channel_name TEXT, channel_policy TEXT, role TEXT, content TEXT, timestamp TEXT)")
+        c.execute("CREATE TABLE memory_tiers (id INTEGER PRIMARY KEY, user_id INTEGER, guild_id INTEGER, tier TEXT, summary TEXT, salience REAL, mentions INTEGER, updated_at TEXT, source_trust TEXT, source_channel_policy TEXT)")
+        c.execute("CREATE TABLE broadcast_memory (id INTEGER PRIMARY KEY, guild_id INTEGER, episode_date TEXT, cleaned_summary TEXT, entry_type TEXT, public_safe INTEGER, usage_scope TEXT, status TEXT, created_at TEXT)")
+        c.execute("CREATE TABLE community_presence (guild_id INTEGER, subject_key TEXT, display_name TEXT, first_seen_at TEXT, last_seen_at TEXT, source_lanes TEXT, approved_channel_labels TEXT, mention_count INTEGER, direct_interaction_count INTEGER, operator_mention_count INTEGER, active_windows TEXT, connection_notes TEXT, evidence_snippets TEXT, category TEXT, last_error_status TEXT)")
+        self.conn.commit()
+
+    def tearDown(self):
+        self.conn.close()
+        os.unlink(self.db)
+
+    def lookup(self, query):
+        return {"ok": True, "found": True, "matchKind": "exact", "data": {"sourceFile": {"id": "sf_1", "name": query["lookupValue"], "status": "active", "candidateType": "entity"}}}
+
+    def test_source_file_payload_includes_entity_intelligence_without_raw_material_or_queue_claims(self):
+        c = self.conn.cursor()
+        c.execute("INSERT INTO user_profiles VALUES (21,1,'Crow','Crow',NULL,NULL)")
+        c.execute("INSERT INTO conversations VALUES (NULL,21,'Crow',1,'finished-tracks','public_music','user','Orion through Crow. Crow created Orion. BNL source-file boundaries and Suno music link https://suno.com/song/raw-path should be reviewed, not a submitted song. 123456789012345678','now')")
+        c.execute("INSERT INTO conversations VALUES (NULL,21,'Crow',1,'contest-room','public_home','user','Crow helps with community event contest rules and asks for feedback on a track.','now')")
+        self.conn.commit()
+        result = enrich.run_source_file_enrichment(self.db, 1, "Crow", dry_run=True, lookup_func=self.lookup)
+        payload = result["payload"]
+        profile = payload.get("entityIntelligenceProfile") or {}
+        public_payload = dict(payload)
+        public_payload.pop("rawProvenance", None)
+        joined = json.dumps(public_payload, sort_keys=True)
+        self.assertTrue(profile)
+        self.assertIn("Detected role facet", json.dumps(payload.get("knownContext", [])))
+        self.assertIn("Orion", json.dumps(payload.get("relationshipSignals", [])))
+        self.assertIn("Suno", json.dumps(payload.get("musicSignals", [])))
+        self.assertIn("BNL", json.dumps(payload.get("bnlInteractionSignals", [])))
+        self.assertIn("Conversation theme", json.dumps(payload.get("conversationHighlights", [])))
+        self.assertIn("contest", json.dumps(profile.get("eventContest", [])).lower())
+        self.assertIn("Confirm", json.dumps(payload.get("bestEvidenceToReview", [])))
+        self.assertIn("official_public_dossier source not connected yet", json.dumps(payload.get("missingInfo", [])))
+        self.assertEqual(payload.get("queueSubmissionStatus"), "not_connected")
+        self.assertNotIn("123456789012345678", joined)
+        self.assertNotIn("rawRefJson", joined)
+        self.assertNotIn("sourceRowId", joined)
+        self.assertNotIn("entity_evidence_events", joined)
+        self.assertNotIn("/song/raw-path", joined)
+        self.assertNotIn("[object Object]", joined)
+        self.assertNotIn("payment", joined.lower())
+        self.assertNotIn("priority", joined.lower())
+        self.assertNotIn("confirmed submission", joined.lower())
+        self.assertTrue(result.get("subjectIntelligenceDiagnostics", {}).get("entityIntelligence"))
+        response = enrich.format_source_enrichment_response(result)
+        self.assertIn("Entity intelligence ledger/profile", response)
+        self.assertIn("Resolver surface: source_file", response)
+        self.assertLessEqual(len(response), 1900)

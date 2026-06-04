@@ -4814,6 +4814,42 @@ async def maybe_handle_dossier_discovery_command(message: discord.Message, clean
 
 
 
+def _parse_rd_entity_context_subject(text: str) -> str:
+    match = re.search(r"(?i)\b(?:entity intelligence|context resolver|source context|dossier context)\s+(?:for\s+|on\s+|about\s+)?([A-Za-z0-9 _.-]{2,80})", text or "")
+    if not match:
+        return ""
+    subject = re.sub(r"\s+", " ", match.group(1)).strip(" .,:;|!?\n\t")
+    return subject[:80]
+
+
+def _format_rd_entity_context_response(subject: str, context: dict) -> str:
+    def labels(items, key="label", limit=4):
+        out = []
+        for item in items or []:
+            label = str(item.get(key) or item.get("label") or item.get("objectLabel") or "").strip()
+            rel = str(item.get("relationType") or "").strip()
+            if key == "objectLabel" and rel:
+                label = f"{label}: {rel}"
+            if label and label not in out:
+                out.append(label[:120])
+            if len(out) >= limit:
+                break
+        return out
+    roles = labels(context.get("allowedRoles"))
+    rels = labels(context.get("allowedRelationships"), "objectLabel")
+    activity = labels(context.get("allowedActivity"), limit=5)
+    actions = labels(context.get("allowedActionItems"), limit=4)
+    missing = [str(x)[:120] for x in (context.get("missingInfo") or [])[:4]]
+    lines = [f"Entity context resolver (R&D/mod ops) for {subject}:"]
+    lines.append("Roles: " + (", ".join(roles) or "none detected"))
+    lines.append("Relationships: " + (", ".join(rels) or "none detected"))
+    lines.append("Activity/themes: " + (", ".join(activity) or "none detected"))
+    lines.append("Mod action items: " + ("; ".join(actions) or "none"))
+    lines.append("Missing info: " + ("; ".join(missing) or "none"))
+    lines.append("Review-only/internal context is labeled by the resolver; no raw transcripts are included.")
+    return "\n".join(lines)[:1900]
+
+
 async def maybe_handle_source_file_enrichment_command(message: discord.Message, clean_content: str) -> bool:
     """Handle operator-triggered Source File enrichment commands."""
 
@@ -14892,6 +14928,14 @@ async def on_message(message: discord.Message):
         previous_rd_context = _get_recent_rd_ops_context(message)
         rd_channel_context = _get_recent_rd_ops_channel_context(message)
         rd_intent = detect_rd_ops_intent(clean_content)
+        rd_entity_subject = _parse_rd_entity_context_subject(clean_content)
+        if rd_entity_subject:
+            context = await asyncio.to_thread(build_entity_context_for_rd_mod_ops, DB_FILE, message.guild.id, rd_entity_subject)
+            response = _format_rd_entity_context_response(rd_entity_subject, context)
+            await message.reply(response)
+            _remember_rd_ops_context(message, clean_content, "entity_context_resolver", rd_entity_subject, "#research-and-development", response)
+            _mark_recent_direct_response(message.channel.id, message.author.id)
+            return
         if rd_intent == "member_activity":
             events = get_recent_member_activity_events(message.guild.id, limit=10, days=14)
             response = format_member_activity_summary(events)

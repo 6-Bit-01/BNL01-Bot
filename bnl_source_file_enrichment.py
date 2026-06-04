@@ -18,6 +18,7 @@ from typing import Any, Callable
 from bnl_dossier_recommendations import build_dossier_recommendation_payload, send_dossier_recommendation
 from bnl_entity_activity_summary import build_entity_activity_summary, refresh_entity_evidence_for_subject
 from bnl_entity_evidence import _website_safe_payload_text
+from bnl_entity_intelligence import build_entity_intelligence_profile, resolve_entity_context_for_surface, safe_text as _entity_safe_text
 from bnl_source_file_lookup import lookup_source_file
 
 ENRICHMENT_INGEST_SOURCE = "bnl_source_file_enrichment"
@@ -1209,6 +1210,7 @@ def _copy_evidence_fields(target: dict[str, Any], source: dict[str, Any]) -> Non
         "privateOnlyNotes",
         "notPublicYet",
         "sourceAuthority",
+        "entityIntelligenceProfile",
         *ENTITY_SUMMARY_EVIDENCE_FIELDS.keys(),
     ):
         if key in source:
@@ -2015,7 +2017,7 @@ def build_compact_enrichment_evidence_summary(packet: dict[str, Any]) -> str:
         section_items = sections.get(section_name) or []
         if len(section_items) > item_index:
             section_useful.append(section_items[item_index])
-    useful = _compact_list_for_site(packet.get("usefulEvidence") or section_useful or packet.get("knownContext") or packet.get("evidenceDetails"), max_items=3, item_limit=220)
+    useful = _compact_list_for_site(section_useful or packet.get("usefulEvidence") or packet.get("knownContext") or packet.get("evidenceDetails"), max_items=3, item_limit=220)
     if useful:
         lines.append("Useful evidence:")
         lines.extend(f"- {item if isinstance(item, str) else _site_safe_text(json.dumps(item, sort_keys=True, default=str), 220)}" for item in useful[:3])
@@ -2123,7 +2125,7 @@ def _readout_text_validation_issue(field_name: str, text: str) -> str | None:
         return f"{field_name} contains raw IDs"
     if _PRIVATE_CHANNEL_NAME_RE.search(text):
         return f"{field_name} contains private channel names"
-    if _RAW_SOURCE_LABEL_RE.search(text):
+    if _RAW_SOURCE_LABEL_RE.search(validation_text):
         return f"{field_name} contains raw source labels"
     if _SOURCE_TABLE_NAME_RE.search(text):
         return f"{field_name} contains source table names"
@@ -2223,6 +2225,121 @@ def validate_enrichment_payload_for_site(payload: dict[str, Any]) -> list[str]:
     return issues
 
 
+
+
+def _entity_context_labels(items: list[dict[str, Any]], *, label_key: str = "label", limit: int = 8) -> list[str]:
+    labels: list[str] = []
+    for item in items or []:
+        label = _safe_text(item.get(label_key) or item.get("label") or item.get("objectLabel") or "", 180)
+        value = _safe_text(item.get("value") or "", 180)
+        if label and value and value != label and label_key != "objectLabel":
+            text = f"{label}: {value}"
+        else:
+            text = label
+        if text and text not in labels:
+            labels.append(text)
+        if len(labels) >= limit:
+            break
+    return labels
+
+
+def _merge_entity_intelligence_into_evidence(evidence: dict[str, Any], profile: dict[str, Any], resolver: dict[str, Any]) -> None:
+    """Map the Entity Intelligence Resolver's source_file surface into existing website-safe fields."""
+
+    roles = _entity_context_labels(resolver.get("allowedRoles") or [], limit=8)
+    relationships = []
+    for rel in resolver.get("allowedRelationships") or []:
+        obj = _safe_text(rel.get("objectLabel") or rel.get("label"), 120)
+        relation = _safe_text(rel.get("relationType") or rel.get("value"), 80)
+        if obj and relation:
+            relationships.append(f"{obj}: {relation}")
+    themes = _entity_context_labels(resolver.get("allowedThemes") or [], limit=8)
+    activity = _entity_context_labels(resolver.get("allowedActivity") or [], limit=12)
+    action_items = _entity_context_labels(resolver.get("allowedActionItems") or [], limit=8)
+    warnings = _entity_context_labels(resolver.get("allowedWarnings") or [], limit=6)
+    missing = [_safe_text(item, 180) for item in (resolver.get("missingInfo") or []) if _safe_text(item, 180)]
+
+    def add_list(key: str, values: list[str]) -> None:
+        bucket = evidence.setdefault(key, [])
+        for value in values:
+            clean = _safe_text(value, 220)
+            if clean and clean not in bucket:
+                bucket.append(clean)
+
+    add_list("knownContext", [f"Detected role facet: {r}" for r in roles])
+    add_list("relationshipSignals", [f"Detected relationship facet: {r}" for r in relationships])
+    add_list("conversationHighlights", [f"Conversation theme: {t}" for t in themes])
+    add_list("topicBreakdown", themes)
+    music = [a for a in activity if re.search(r"music|suno|udio|youtube|soundcloud|spotify|bandcamp|track|song|demo|wip|collab", a, re.I)]
+    bnl = [a for a in activity if re.search(r"BNL|source-file|boundary|challenge", a, re.I)]
+    community = [a for a in activity if re.search(r"community|mod|contest|event|dossier|source file", a, re.I)]
+    add_list("musicSignals", music)
+    add_list("bnlInteractionSignals", bnl)
+    add_list("communitySignals", community)
+    add_list("bestEvidenceToReview", action_items + warnings)
+    add_list("reviewOnlyEvidence", action_items + warnings)
+    add_list("missingInfo", missing)
+    add_list("usefulEvidence", roles + relationships + themes + activity[:8])
+    add_list("evidenceDetails", [f"Entity intelligence surface {resolver.get('surface')}: {item}" for item in (roles + relationships + themes + activity[:8])])
+    sections = evidence.setdefault("sections", {})
+    if missing:
+        section_missing = sections.setdefault("Missing Info", [])
+        for item in reversed(missing[:8]):
+            if item in section_missing:
+                section_missing.remove(item)
+            section_missing.insert(0, item)
+    if action_items:
+        evidence["recommendedAction"] = action_items[0]
+        suggested = sections.setdefault("Suggested Next Action", [])
+        if action_items[0] not in suggested:
+            suggested.insert(0, action_items[0])
+    elif missing:
+        evidence["recommendedAction"] = f"Confirm missing info: {missing[0]}"
+    evidence["queueSubmissionStatus"] = resolver.get("queueSubmissionStatus") or "not_connected"
+    evidence["queueSubmissionNote"] = QUEUE_NOT_CONNECTED_NOTE
+    coverage = evidence.setdefault("sourceCoverage", [])
+    for item in profile.get("sourceCoverage") or []:
+        safe_item = {"source": _safe_text(item.get("source"), 80), "count": int(item.get("count") or 0), "status": _safe_text(item.get("status") or "used", 40)}
+        if safe_item not in coverage:
+            coverage.append(safe_item)
+    evidence["entityIntelligenceProfile"] = {
+        "subjectKey": _safe_text(profile.get("subjectKey"), 120),
+        "subjectName": _safe_text(profile.get("subjectName"), 120),
+        "roles": roles[:8],
+        "relationships": relationships[:8],
+        "creativeMusic": music[:8],
+        "bnlInteraction": bnl[:8],
+        "behaviorPosture": [a for a in activity if re.search(r"challenging|lore|anomaly|supportive|frequent|occasional", a, re.I)][:8],
+        "conversationThemes": themes[:8],
+        "eventContest": [a for a in activity if re.search(r"contest|event|rules", a, re.I)][:8],
+        "dossierUsefulness": [a for a in activity if re.search(r"dossier|source file|approval|candidate", a, re.I)][:8],
+        "missingInfo": missing[:8],
+        "officialPublicDossierConnected": bool(resolver.get("officialPublicDossierConnected")),
+        "queueSubmissionStatus": resolver.get("queueSubmissionStatus") or "not_connected",
+    }
+    diagnostics = evidence.setdefault("diagnostics", {})
+    diagnostics["entityIntelligence"] = {
+        "ledgerStatus": (profile.get("diagnostics") or {}).get("ledgerStatus") or "unknown",
+        "profileStatus": (profile.get("diagnostics") or {}).get("profileStatus") or "unknown",
+        "resolverSurface": resolver.get("surface") or "source_file",
+        "detectedRoleFacets": roles,
+        "detectedRelationshipFacets": relationships,
+        "creativeMusicFacets": music,
+        "behaviorPostureFacets": evidence["entityIntelligenceProfile"]["behaviorPosture"],
+        "conversationThemes": themes,
+        "eventContestActivity": evidence["entityIntelligenceProfile"]["eventContest"],
+        "dossierUsefulness": evidence["entityIntelligenceProfile"]["dossierUsefulness"],
+        "modActionItems": action_items,
+        "missingInfo": missing,
+        "sourceRowsBySource": (profile.get("diagnostics") or {}).get("rowsBySource") or {},
+        "publicSafeRows": int((profile.get("diagnostics") or {}).get("publicSafeRows") or 0),
+        "reviewOnlyRows": int((profile.get("diagnostics") or {}).get("reviewOnlyRows") or 0),
+        "officialPublicDossierConnected": bool((profile.get("diagnostics") or {}).get("officialPublicDossierConnected")),
+        "officialPublicDossierNote": (profile.get("diagnostics") or {}).get("officialPublicDossierNote") or "official_public_dossier source not connected yet",
+    }
+    evidence["subjectIntelligenceDiagnostics"] = dict(evidence.get("subjectIntelligenceDiagnostics") or {})
+    evidence["subjectIntelligenceDiagnostics"]["entityIntelligence"] = diagnostics["entityIntelligence"]
+
 def build_enrichment_markdown(packet: dict[str, Any]) -> str:
     sections = packet.get("sections") or {}
     lines: list[str] = []
@@ -2306,6 +2423,7 @@ def build_enrichment_recommendation_payload(packet: dict[str, Any], *, environ: 
         "reviewOnlyEvidence": list(packet.get("reviewOnlyEvidence") or []),
         "queueSubmissionStatus": packet.get("queueSubmissionStatus") or "not_connected",
         "queueSubmissionNote": packet.get("queueSubmissionNote") or QUEUE_NOT_CONNECTED_NOTE,
+        "entityIntelligenceProfile": dict(packet.get("entityIntelligenceProfile") or {}),
         "rawProvenance": dict(packet.get("rawProvenance") or {}),
         "visibilityLabels": ["internal_review_only", "admin_review_required"],
         "confidence": "low" if packet.get("qualityStatus") in {"too_thin", "forced_low_confidence"} else ("medium" if match_kind == "active_source_file" else "low"),
@@ -2404,6 +2522,9 @@ def run_source_file_enrichment(
 
     effective_subject = _first(source_file, ("name", "sourceFileName", "subject", "displayName", "title", "normalizedName")) or target_value
     evidence = collect_source_enrichment_evidence(db_path, guild_id, str(effective_subject), rd_context=rd_context, lookup_result=lookup_result)
+    entity_profile = build_entity_intelligence_profile(db_path, guild_id, str(effective_subject), refresh=True)
+    entity_resolver = resolve_entity_context_for_surface(entity_profile, "source_file", max_items=16)
+    _merge_entity_intelligence_into_evidence(evidence, entity_profile, entity_resolver)
     packet = {
         "ok": True,
         "dryRun": dry_run,
@@ -2523,12 +2644,15 @@ def format_source_enrichment_response(result: dict[str, Any]) -> str:
             f"Target lane: {attach_label}.",
             f"Would send as BNL Source File Enrichment: {'yes' if result.get('qualityStatus') != 'too_thin' else 'no — too thin'}.",
             f"Source types used: {source_types}.",
-            f"Source coverage: {_format_source_coverage(result)}.",
+            f"Source coverage: {_safe_text(_format_source_coverage(result), 220)}.",
             f"Matched local profiles/users: {int((result.get('diagnostics') or {}).get('matchedUserProfileCount') or 0)}/{int((result.get('diagnostics') or {}).get('matchedUserIdCount') or 0)}.",
             f"Matched identity labels: {_safe_text(', '.join((result.get('diagnostics') or {}).get('matchedIdentityLabels') or []) or 'none', 160)}.",
             f"Channel evidence found: {'yes' if (result.get('diagnostics') or {}).get('channelEvidenceFound') else 'no'}; public dossier match found: {'yes' if (result.get('diagnostics') or {}).get('publicDossierMatchFound') else 'no'}; existing dossier update lane: {'yes' if (result.get('diagnostics') or {}).get('existingDossierUpdateLane') else 'no'}.",
             f"Warning count: {warning_text}.",
         ]
+        early_entity_diag = ((result.get("diagnostics") or {}).get("entityIntelligence") or {})
+        if early_entity_diag:
+            preview_lines.append(f"Entity intelligence ledger/profile: {_safe_text(early_entity_diag.get('ledgerStatus') or 'unknown', 40)} / {_safe_text(early_entity_diag.get('profileStatus') or 'unknown', 40)}; Resolver surface: {_safe_text(early_entity_diag.get('resolverSurface') or 'source_file', 40)}.")
         subject_intel = (result.get("diagnostics") or {}).get("subjectIntelligence") or result.get("subjectIntelligenceDiagnostics") or {}
         if subject_intel:
             rows_by_source = subject_intel.get("rowsBySource") or {}
@@ -2556,10 +2680,10 @@ def format_source_enrichment_response(result: dict[str, Any]) -> str:
                 f"Subject intelligence rows by source: {_safe_text(', '.join(f'{k} {v}' for k, v in rows_by_source.items()) or 'none', 220)}.",
                 f"Top recurring subjects: {_safe_text(', '.join(subject_intel.get('topRecurringSubjects') or []) or 'none', 180)}.",
                 f"Accepted recurring subjects with reason: {_safe_text(accepted_subject_text, 220)}.",
-                f"Rejected top garbage candidates: {_safe_text(rejected_candidate_text, 180)}.",
-                f"Top recurring themes: {_safe_text(', '.join(subject_intel.get('topRecurringThemes') or []) or 'none', 220)}.",
-                f"Top conversation clusters: {_safe_text(conversation_cluster_text, 240)}.",
-                f"Top activity patterns: {_safe_text(activity_pattern_text, 260)}.",
+                f"Rejected top garbage candidates: {_safe_text(rejected_candidate_text, 100)}.",
+                f"Top recurring themes: {_safe_text(', '.join(subject_intel.get('topRecurringThemes') or []) or 'none', 140)}.",
+                f"Top conversation clusters: {_safe_text(conversation_cluster_text, 150)}.",
+                f"Top activity patterns: {_safe_text(activity_pattern_text, 150)}.",
                 f"Top domains/tools: {_safe_text(', '.join(subject_intel.get('topDomains') or []) or 'none', 180)}.",
                 f"Public-safe vs review-only intelligence rows: {int(subject_intel.get('publicSafeRows') or 0)} public-safe / {int(subject_intel.get('reviewOnlyRows') or 0)} review-only.",
             ])
@@ -2581,6 +2705,15 @@ def format_source_enrichment_response(result: dict[str, Any]) -> str:
             preview_lines.extend(f"* {_safe_text(bullet, 180)}" for bullet in bullets[:3])
         if result.get("qualityStatus") == "too_thin":
             preview_lines.append(result.get("suppressedReason") or "Enrichment is too thin to send. Add more source notes or confirm the subject’s role first.")
+        entity_diag = ((result.get("diagnostics") or {}).get("entityIntelligence") or {})
+        if entity_diag:
+            rows_by_source = entity_diag.get("sourceRowsBySource") or {}
+            preview_lines.extend([
+                f"Entity intelligence ledger/profile: {_safe_text(entity_diag.get('ledgerStatus') or 'unknown', 40)} / {_safe_text(entity_diag.get('profileStatus') or 'unknown', 40)}; resolver surface: {_safe_text(entity_diag.get('resolverSurface') or 'source_file', 40)}.",
+                f"Entity facets: roles={_safe_text(', '.join(entity_diag.get('detectedRoleFacets') or []) or 'none', 120)}; relationships={_safe_text(', '.join(entity_diag.get('detectedRelationshipFacets') or []) or 'none', 120)}; music={_safe_text(', '.join(entity_diag.get('creativeMusicFacets') or []) or 'none', 120)}.",
+                f"Entity themes/actions: themes={_safe_text(', '.join(entity_diag.get('conversationThemes') or []) or 'none', 140)}; actions={_safe_text('; '.join(entity_diag.get('modActionItems') or []) or 'none', 140)}.",
+                f"Entity source split: {_safe_text(', '.join(f'{k} {v}' for k, v in rows_by_source.items()) or 'none', 140)}; {int(entity_diag.get('publicSafeRows') or 0)} public-safe / {int(entity_diag.get('reviewOnlyRows') or 0)} review-only; official public dossier source connected: {'yes' if entity_diag.get('officialPublicDossierConnected') else 'no'}.",
+            ])
         preview_lines.append("No raw private transcripts were included; nothing was sent to the website.")
         return "\n".join(preview_lines)[:1900]
     if result.get("sent"):
