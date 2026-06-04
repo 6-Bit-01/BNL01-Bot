@@ -156,5 +156,41 @@ class EntityIntelligenceTests(unittest.TestCase):
         self.assertIn("Owner review needed", conflicts[0]["label"])
 
 
+    def test_lost_marbles_global_memory_does_not_import_crow_or_orion(self):
+        self.add_profile(11, "Lost Marbles")
+        self.add_profile(10, "Crow")
+        self.add_msg(11, "Lost Marbles", "collaboration-hub", "public_music", "Lost Marbles is a mod sharing SoundCloud music demos and offering to collab with artists.")
+        self.conn.execute("INSERT INTO memory_tiers VALUES (NULL,NULL,1,'long','Orion through Crow appears near Lost Marbles in a source-blind global memory bundle.',0.9,1,'now',NULL,NULL)")
+        p = self.profile_for("Lost Marbles")
+        labels = self.labels(p["relationships"] + p["conversationThemes"] + p["creativeMusic"] + p["dossierUsefulness"])
+        self.assertIn("offers collaboration", self.labels(p["creativeMusic"]))
+        self.assertNotIn("Orion", labels)
+        self.assertNotIn("Crow", labels)
+        scopes = p["diagnostics"]["rowScopeCounts"]
+        self.assertGreaterEqual(scopes.get("global_mixed_memory", 0) + scopes.get("source_blind_global", 0), 1)
+
+    def test_antigrain_mixed_memory_does_not_import_signal_witch_or_orion(self):
+        self.add_profile(13, "Antigrain")
+        self.add_msg(13, "Antigrain", "general", "public_home", "Antigrain asks BNL about this strange anomaly and weird glitch signal lore.")
+        self.conn.execute("INSERT INTO memory_tiers VALUES (NULL,NULL,1,'long','Signal Witch, Orion, Lardcode, and Antigrain were bundled in one source-blind global memory row.',0.9,1,'now',NULL,NULL)")
+        p = self.profile_for("Antigrain")
+        text = self.labels(p["relationships"] + p["conversationThemes"] + p["dossierUsefulness"])
+        self.assertIn("strange/anomaly conversations", text)
+        self.assertNotIn("Signal Witch", text)
+        self.assertNotIn("Orion", text)
+        self.assertGreaterEqual(p["diagnostics"].get("sourceBlindRows", 0), 1)
+
+    def test_source_blind_memory_and_relationship_journal_do_not_create_edges(self):
+        self.add_profile(20, "Shortybabe")
+        self.add_profile(10, "Crow")
+        self.conn.execute("CREATE TABLE relationship_journal (id INTEGER PRIMARY KEY, user_id INTEGER, guild_id INTEGER, entry_type TEXT, summary TEXT, timestamp TEXT)")
+        self.conn.execute("INSERT INTO memory_tiers VALUES (NULL,NULL,1,'long','Orion through Crow and Shortybabe asked BNL in mixed source-blind memory.',0.9,1,'now',NULL,NULL)")
+        self.conn.execute("INSERT INTO relationship_journal VALUES (NULL,NULL,1,'note','Shortybabe, Crow, and Orion were mentioned together in one relationship journal note.','now')")
+        p = self.profile_for("Shortybabe")
+        self.assertEqual([], p["relationships"])
+        self.assertNotIn("Orion", self.labels(p["conversationThemes"] + p["bnlInteraction"]))
+        self.assertGreaterEqual(p["diagnostics"].get("sourceBlindRows", 0), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

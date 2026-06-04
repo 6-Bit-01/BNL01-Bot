@@ -228,6 +228,21 @@ def collect_subject_intelligence_rows(
     rows: list[dict[str, Any]] = []
     matched_ids = {_safe_int_value(v) for v in (matched_user_ids or set())}
     matched_ids.discard(None)
+    try:
+        from bnl_entity_intelligence import _known_entity_names, _subject_row_scope, subject_key as _ei_subject_key
+        scoped_known_names = _known_entity_names(conn, guild_id, subject)
+        scoped_subject_key = _ei_subject_key(subject)
+    except Exception:
+        _subject_row_scope = None
+        scoped_known_names = set()
+        scoped_subject_key = ""
+
+    def scoped_accept(source: str, data: dict[str, Any], text: str, *, authored: bool = False) -> tuple[bool, str]:
+        if _subject_row_scope is None:
+            return authored or contains_subject_mention(text, subject, aliases=aliases), "legacy_unscoped"
+        scope, _reason = _subject_row_scope(source, data, subject, scoped_subject_key, {int(v) for v in matched_ids if v is not None}, scoped_known_names)
+        # Legacy recurring subjects are diagnostic-only unless the row is strongly subject-owned/keyed/authored.
+        return scope in {"subject_owned", "subject_keyed", "subject_authored", "subject_direct_evidence"}, scope
 
     def matches_text(text: str) -> bool:
         return contains_subject_mention(text, subject, aliases=aliases)
@@ -237,7 +252,8 @@ def collect_subject_intelligence_rows(
         text = extract_full_text_from_source_row(conn, source, data)
         if not text:
             return
-        rows.append({"source": source, "text": text, "publicSafe": _is_public_intelligence_row(source, data), "relation": relation})
+        accepted, scope = scoped_accept(source, data, text, authored=relation in {"authored", "matched"})
+        rows.append({"source": source, "text": text, "publicSafe": _is_public_intelligence_row(source, data) and accepted, "relation": relation, "scope": scope, "legacyDiagnosticOnly": not accepted})
 
     for row in structured_rows or []:
         add("entity_evidence_events", row, str(_row_value(row, "relation_to_subject", "matched")))
@@ -254,7 +270,9 @@ def collect_subject_intelligence_rows(
                 author_name_match = any(contains_subject_mention(str(data.get(col) or ""), subject, aliases=aliases) for col in ("user_name", "author_name"))
                 content_match = matches_text(str(data.get("content") or ""))
                 if author_id_match or author_name_match or content_match:
-                    add("conversations", data, "authored" if author_id_match or author_name_match else "mentioned")
+                    relation = "authored" if author_id_match or author_name_match else "mentioned"
+                    if relation == "authored" or scoped_accept("conversations", data, str(data.get("content") or ""), authored=False)[0]:
+                        add("conversations", data, relation)
                 if len(rows) >= max_rows:
                     break
 
@@ -279,7 +297,9 @@ def collect_subject_intelligence_rows(
             id_match = any(_safe_int_value(data.get(col)) in matched_ids for col in ("user_id", "discord_user_id", "member_id"))
             text = extract_full_text_from_source_row(conn, table, data)
             if id_match or matches_text(text):
-                add(table, data, "matched" if id_match else "mentioned")
+                relation = "matched" if id_match else "mentioned"
+                if id_match or scoped_accept(table, data, text, authored=False)[0]:
+                    add(table, data, relation)
             if len(rows) >= max_rows * 2:
                 break
     return rows[: max_rows * 2]

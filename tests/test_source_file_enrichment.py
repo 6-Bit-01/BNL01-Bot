@@ -1082,6 +1082,22 @@ class SourceFileEnrichmentBotTests(unittest.TestCase):
         self.assertEqual(diag["classification_last_missing_info_count"], 1)
 
 
+
+    def test_entity_context_resolver_parser_accepts_testing_forms(self):
+        self.assertEqual(bnl01_bot._parse_rd_entity_context_subject("entity intelligence for Crow"), "Crow")
+        self.assertEqual(bnl01_bot._parse_rd_entity_context_subject("entity context Lost Marbles"), "Lost Marbles")
+        self.assertEqual(bnl01_bot._parse_rd_entity_context_subject("context resolver for Antigrain"), "Antigrain")
+        response = bnl01_bot._format_rd_entity_context_response("Crow", {
+            "allowedRoles": [{"label": "artist"}],
+            "allowedRelationships": [{"objectLabel": "Orion", "relationType": "speaks_through"}],
+            "allowedActivity": [{"label": "frequent BNL-facing conversation"}],
+            "allowedActionItems": [],
+            "missingInfo": ["queue submission bridge not_connected"],
+        })
+        self.assertIn("Entity context resolver", response)
+        self.assertIn("Orion: speaks_through", response)
+        self.assertNotIn("suspicious blinking light", response.lower())
+
 if __name__ == "__main__":
     unittest.main()
 
