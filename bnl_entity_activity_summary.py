@@ -14,6 +14,7 @@ from collections import Counter
 from typing import Any
 
 from bnl_dossier_source_packets import normalize_subject_name, subject_key
+from bnl_entity_intelligence import build_entity_intelligence_profile
 from bnl_entity_evidence import (
     ENTITY_EVIDENCE_TABLE,
     build_conversation_safe_summary,
@@ -1320,6 +1321,8 @@ def build_entity_activity_summary(
         "musicSignals": [],
         "communitySignals": [],
         "sourceCoverage": [],
+        "entityIntelligenceProfile": {},
+        "subjectIntelligenceDiagnostics": {},
         "evidenceDetails": [],
         "bestEvidenceToReview": [],
         "relationshipSignals": [],
@@ -1438,6 +1441,35 @@ def build_entity_activity_summary(
         if intelligence_rows:
             intelligence = extract_recurring_subject_intelligence(intelligence_rows, subject)
             _promote_subject_intelligence_readouts(summary, intelligence)
+            entity_profile = build_entity_intelligence_profile(intelligence_rows, subject)
+            summary["entityIntelligenceProfile"] = entity_profile
+            diagnostics = dict(summary.get("subjectIntelligenceDiagnostics") or {})
+            diagnostics.update({
+                "publicRows": int(intelligence.get("publicRows") or 0),
+                "reviewOnlyRows": int(intelligence.get("reviewOnlyRows") or 0),
+                "sourceCounts": dict(intelligence.get("sourceCounts") or {}),
+                "recurringRowsScanned": int(intelligence.get("rowsScanned") or 0),
+                "recurringPublicRows": int(intelligence.get("publicRows") or 0),
+                "recurringReviewOnlyRows": int(intelligence.get("reviewOnlyRows") or 0),
+                "recurringSourceCounts": dict(intelligence.get("sourceCounts") or {}),
+                "acceptedRecurringSubjectCount": len(intelligence.get("acceptedSubjectReasons") or {}),
+                "rejectedRecurringSubjectCount": len(intelligence.get("rejectedSubjectCandidates") or {}),
+                "facetRowsScanned": int((entity_profile.get("diagnostics") or {}).get("rowsScanned") or 0),
+                "facetVisibilityCounts": dict((entity_profile.get("diagnostics") or {}).get("visibilityCounts") or {}),
+                "facetSourceCounts": dict((entity_profile.get("diagnostics") or {}).get("sourceCounts") or {}),
+            })
+            summary["subjectIntelligenceDiagnostics"] = diagnostics
+            for item in entity_profile.get("publicSafeReadouts") or []:
+                _add_unique(summary["bestEvidenceToReview"], item)
+                _add_unique(summary["evidenceDetails"], item)
+                if item.startswith("Music/link signal"):
+                    _add_unique(summary["musicSignals"], item)
+                elif item.startswith("Moderation signal") or item.startswith("Contest signal") or item.startswith("Lore"):
+                    _add_unique(summary["communitySignals"], item)
+            for item in entity_profile.get("reviewOnlyReadouts") or []:
+                _add_unique(summary["reviewOnlyEvidence"], item)
+            for item in entity_profile.get("recommendedConfirmations") or []:
+                _add_unique(summary["missingInfo"], item)
 
         def row_matches(row: sqlite3.Row, fields: list[str]) -> bool:
             data = dict(row)

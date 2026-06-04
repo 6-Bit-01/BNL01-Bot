@@ -218,6 +218,32 @@ class EntityActivitySummaryBuilderTests(unittest.TestCase):
         self.assertEqual(summary["publicSafePossibilities"], ["No public-safe facts confirmed yet."])
         self.assertNotIn("relationship", " ".join(summary["publicSafePossibilities"]).lower())
 
+    def test_generic_entity_intelligence_profile_detects_facets_without_hardcoded_subjects(self):
+        c = self.conn.cursor()
+        c.execute("INSERT INTO user_profiles VALUES (88,1,'Nova','Nova',NULL,NULL)")
+        c.execute("INSERT INTO conversations VALUES (NULL,88,'Nova',1,'finished-tracks','public_home','user','I made a new track and shared a SoundCloud link for the Moon Garden collab with Atlas.','2026-06-01')")
+        c.execute("INSERT INTO conversations VALUES (NULL,88,'Nova',1,'contest-room','public_context','user','Nova is running a remix contest challenge and asks BNL to review source-file wording.','2026-06-02')")
+        c.execute("INSERT INTO conversations VALUES (NULL,7,'Other',1,'mod-chat','internal_controlled','user','Nova may be a moderator who warned a troll during strange lore conversation.','2026-06-03')")
+        self.conn.commit()
+
+        summary = self._summary("Nova")
+        profile = summary["entityIntelligenceProfile"]
+        normal_text = json.dumps({k: v for k, v in summary.items() if k != "rawProvenance"})
+
+        self.assertTrue(any(item["label"] == "Possible artist/music-maker role" for item in profile["roles"]))
+        self.assertTrue(profile["musicLinkActivity"])
+        self.assertTrue(profile["contestActivity"])
+        self.assertTrue(profile["moderationSignals"])
+        self.assertTrue(profile["loreSignals"])
+        self.assertTrue(any("Atlas" in item["label"] for item in profile["connections"]))
+        self.assertTrue(any("Moon Garden" in item["label"] for item in profile["createdEntities"]))
+        self.assertIn("public_safe_candidate", profile["diagnostics"]["visibilityCounts"])
+        self.assertIn("review_only", profile["diagnostics"]["visibilityCounts"])
+        self.assertTrue(summary["subjectIntelligenceDiagnostics"]["facetRowsScanned"])
+        self.assertTrue(any("Confirm" in item for item in profile["recommendedConfirmations"]))
+        self.assertNotIn("mod-chat", normal_text)
+
+
     def test_public_safe_conversation_requires_public_channel_policy(self):
         self.conn.execute("INSERT INTO conversations VALUES (NULL,7,'User',1,'general','public_home','user','Crow appears in music community context.','now')")
         self.conn.commit()

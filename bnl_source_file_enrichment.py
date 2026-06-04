@@ -1210,6 +1210,7 @@ def _copy_evidence_fields(target: dict[str, Any], source: dict[str, Any]) -> Non
         "notPublicYet",
         "sourceAuthority",
         *ENTITY_SUMMARY_EVIDENCE_FIELDS.keys(),
+        "entityIntelligenceProfile",
     ):
         if key in source:
             value = source.get(key)
@@ -1612,6 +1613,7 @@ def collect_source_enrichment_evidence(db_path: str, guild_id: int | None, subje
         "notPublicYet": list(entity_summary.get("notPublicYet") or [])[:6] if raw_provenance else [],
         "sourceAuthority": list(entity_summary.get("sourceAuthority") or [])[:5] if raw_provenance else [],
         "subjectIntelligenceDiagnostics": entity_summary.get("subjectIntelligenceDiagnostics") or {},
+        "entityIntelligenceProfile": entity_summary.get("entityIntelligenceProfile") or {},
         **_bounded_entity_summary_fields(entity_summary, include=bool(raw_provenance)),
         "queueSubmissionStatus": str(entity_summary.get("queueSubmissionStatus") or "not_connected") if raw_provenance else "not_connected",
         "queueSubmissionNote": str(entity_summary.get("queueSubmissionNote") or QUEUE_NOT_CONNECTED_NOTE) if raw_provenance else QUEUE_NOT_CONNECTED_NOTE,
@@ -2288,6 +2290,7 @@ def build_enrichment_recommendation_payload(packet: dict[str, Any], *, environ: 
         "privateOnlyNotes": list(packet.get("privateOnlyNotes") or []),
         "notPublicYet": list(packet.get("notPublicYet") or []),
         "sourceAuthority": list(packet.get("sourceAuthority") or []),
+        "entityIntelligenceProfile": dict(packet.get("entityIntelligenceProfile") or {}),
         "observedChannels": list(packet.get("observedChannels") or []),
         "conversationHighlights": list(packet.get("conversationHighlights") or []),
         "topicBreakdown": list(packet.get("topicBreakdown") or []),
@@ -2431,6 +2434,7 @@ def run_source_file_enrichment(
     }
     _copy_evidence_fields(packet, evidence)
     packet["subjectIntelligenceDiagnostics"] = evidence.get("subjectIntelligenceDiagnostics") or {}
+    packet["entityIntelligenceProfile"] = evidence.get("entityIntelligenceProfile") or {}
     quality = evaluate_enrichment_quality(packet)
     packet["qualityScore"] = quality["score"]
     packet["qualityStatus"] = "forced_low_confidence" if force and quality["status"] != "sendable" else quality["status"]
