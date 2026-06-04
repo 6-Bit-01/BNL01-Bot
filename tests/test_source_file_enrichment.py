@@ -396,6 +396,26 @@ class SourceFileEnrichmentTests(unittest.TestCase):
         self.assertIn("Confirm possible aliases", missing)
         self.assertIn("approve a public-safe summary", action)
 
+
+    def test_dry_run_preview_includes_subject_intelligence_diagnostics(self):
+        self.conn.execute("INSERT INTO user_profiles VALUES (42,1,'Crow','Crow',NULL,NULL)")
+        self.conn.execute("INSERT INTO conversations VALUES (NULL,42,'Crow',1,'general','public_home','user','Orion through Crow asks BNL about Suno links and presence threshold behavior: https://suno.com/song/a', '2026-06-01')")
+        self.conn.execute("INSERT INTO conversations VALUES (NULL,42,'Crow',1,'general','public_home','user','Orion through Crow repeats BNL liaison interface language and Suno links: https://suno.com/song/b', '2026-06-02')")
+        self.conn.commit()
+
+        result = enrich.run_source_file_enrichment(self.db, 1, "Crow", dry_run=True, lookup_func=self._lookup("active"))
+        formatted = enrich.format_source_enrichment_response(result)
+
+        self.assertIn("Subject intelligence rows scanned:", formatted)
+        self.assertIn("Subject intelligence rows by source:", formatted)
+        self.assertIn("Top recurring subjects:", formatted)
+        self.assertIn("Orion", formatted)
+        self.assertIn("Top recurring themes:", formatted)
+        self.assertIn("Top domains/tools:", formatted)
+        self.assertIn("suno.com", formatted)
+        self.assertIn("Public-safe vs review-only intelligence rows:", formatted)
+        self.assertLessEqual(len(formatted), 1900)
+
     def test_dry_run_preview_has_useful_bullets_without_raw_ids(self):
         c = self.conn.cursor()
         c.execute("INSERT INTO user_profiles VALUES (10,1,'HellcatNZ','HellcatNZ',NULL,NULL)")
