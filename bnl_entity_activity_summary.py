@@ -92,8 +92,16 @@ _SUBJECT_INTELLIGENCE_STOPWORDS = {
     "confirm", "public", "private", "review", "owner", "admin", "music", "community", "pattern",
     "activity", "signal", "history", "this", "subject", "channel", "conversation", "dossier", "file",
     "approved", "internal", "candidate", "notes", "known", "facts", "relationship", "memory", "recent",
+    # Title-case sentence starters / filler words that should never become named topics by repetition.
+    "the", "a", "an", "and", "or", "but", "if", "then", "there", "that", "these", "those",
+    "with", "without", "from", "to", "for", "of", "in", "on", "at", "by", "as",
+    "is", "are", "was", "were", "be", "been", "being", "not", "no", "yes",
+    "good", "bad", "still", "just", "now", "also", "because", "before", "after", "again", "maybe",
 }
 _SUBJECT_INTELLIGENCE_PRIORITY_PREFIXES = (
+    "Conversation theme:",
+    "Activity pattern:",
+    "Evidence digest:",
     "Recurring named topic:",
     "Recurring conversation pattern:",
     "BNL interaction pattern:",
@@ -286,30 +294,81 @@ def _clean_intelligence_label(label: str, subject: str = "") -> str:
     return label
 
 
-def _subject_candidates_from_text(text: str, subject: str) -> set[str]:
-    candidates: set[str] = set()
-    for pattern in (_THROUGH_PATTERN, _HERE_PATTERN, _SAID_PATTERN):
+def _is_sentence_start_match(text: str, start: int) -> bool:
+    prefix = text[:start].rstrip()
+    return not prefix or prefix[-1] in ".!?\n"
+
+
+def _has_relationship_context(text: str, start: int, end: int) -> bool:
+    window = text[max(0, start - 60): min(len(text), end + 60)].lower()
+    return bool(re.search(r"\b(through|with|from|asks?|asked|says?|said|project|song|artist|tool|link|topic|via)\b", window))
+
+
+def _add_candidate_reason(candidates: dict[str, set[str]], label: str, reason: str, subject: str) -> None:
+    clean = _clean_intelligence_label(label, subject)
+    if clean:
+        candidates.setdefault(clean, set()).add(reason)
+
+
+def _subject_candidate_reasons_from_text(text: str, subject: str) -> tuple[dict[str, set[str]], Counter, Counter]:
+    candidates: dict[str, set[str]] = {}
+    sentence_start_counts: Counter = Counter()
+    non_sentence_start_counts: Counter = Counter()
+
+    explicit_patterns = (
+        (_THROUGH_PATTERN, "explicit_through_pattern"),
+        (_HERE_PATTERN, "explicit_here_pattern"),
+        (_SAID_PATTERN, "explicit_said_pattern"),
+        (re.compile(r"\btopic\s*:\s*([A-Z][A-Za-z0-9_-]{2,}(?:\s+[A-Z][A-Za-z0-9_-]{2,}){0,3})\b"), "explicit_said_pattern"),
+        (re.compile(r"\bRecurring\s+named\s+topic\s*:\s*([A-Z][A-Za-z0-9_-]{2,}(?:\s+[A-Z][A-Za-z0-9_-]{2,}){0,3})\b"), "explicit_said_pattern"),
+    )
+    for pattern, reason in explicit_patterns:
         for match in pattern.finditer(text):
             for group in match.groups():
                 clean = _clean_intelligence_label(group, subject)
                 if clean:
-                    candidates.add(clean)
-                    parts = clean.split()
-                    for suffix_len in (1, 2):
-                        if len(parts) > suffix_len:
-                            suffix = _clean_intelligence_label(" ".join(parts[-suffix_len:]), subject)
-                            if suffix:
-                                candidates.add(suffix)
+                    _add_candidate_reason(candidates, clean, reason, subject)
+                raw_parts = re.findall(r"[A-Z][A-Za-z0-9_-]{2,}", str(group or ""))
+                for suffix_len in (1, 2):
+                    if len(raw_parts) >= suffix_len + 1:
+                        _add_candidate_reason(candidates, " ".join(raw_parts[-suffix_len:]), reason, subject)
+
     for match in _ENTITY_NAME_PATTERN.finditer(text):
-        clean = _clean_intelligence_label(match.group(0), subject)
+        raw = match.group(0)
+        clean = _clean_intelligence_label(raw, subject)
         if clean and len(clean.split()) <= 4:
-            candidates.add(clean)
+            reason = "phrase_cluster" if len(clean.split()) > 1 else "observed_capitalized"
+            if _has_relationship_context(text, match.start(), match.end()):
+                reason = "repeated_non_sentence_start" if reason == "observed_capitalized" else reason
+            _add_candidate_reason(candidates, clean, reason, subject)
+            if _is_sentence_start_match(text, match.start()):
+                sentence_start_counts[clean] += 1
+            else:
+                non_sentence_start_counts[clean] += 1
+            if raw[:1] in {'"', "'", '“', '‘'} or text[max(0, match.start()-1):match.start()] in {'"', "'", '“', '‘'}:
+                _add_candidate_reason(candidates, clean, "quoted_title", subject)
+
     for match in _CODE_MARKER_PATTERN.finditer(text):
         clean = _clean_intelligence_label(match.group(0), subject)
         if clean:
-            candidates.add(clean)
-    return candidates
+            _add_candidate_reason(candidates, clean, "code_marker", subject)
+            non_sentence_start_counts[clean] += 1
 
+    lowered = text.lower()
+    for raw, label in _TOOL_OR_PLATFORM_TERMS.items():
+        if re.search(rf"(?<![a-z0-9]){re.escape(raw)}(?![a-z0-9])", lowered):
+            _add_candidate_reason(candidates, label, "domain_tool", subject)
+            non_sentence_start_counts[label] += 1
+    for domain in _extract_domains(text):
+        _add_candidate_reason(candidates, _domain_tool_label(domain), "domain_tool", subject)
+    return candidates, sentence_start_counts, non_sentence_start_counts
+
+
+def _subject_candidates_from_text(text: str, subject: str) -> set[str]:
+    """Backward-compatible candidate set; acceptance filtering happens in extract_recurring_subject_intelligence."""
+
+    candidates, _sentence_start, _non_sentence_start = _subject_candidate_reasons_from_text(text, subject)
+    return set(candidates)
 
 def _extract_domains(text: str) -> set[str]:
     domains: set[str] = set()
@@ -330,10 +389,14 @@ def _theme_labels_for_text(text: str) -> set[str]:
         labels.add("BNL interaction")
     if re.search(r"\bliaison\b|\binterface\b|\bnode\b", lowered):
         labels.add("liaison/interface/node language")
-    if re.search(r"\bpresence\b|\bthreshold\b", lowered):
-        labels.add("presence/threshold behavior")
+    if re.search(r"\bbnl\b", lowered) and re.search(r"\bpresence\b", lowered):
+        labels.add("BNL presence")
+    elif re.search(r"\bpresence\b", lowered):
+        labels.add("presence language")
+    if re.search(r"\bthreshold\b", lowered):
+        labels.add("threshold behavior")
     if re.search(r"\bsync\b|\bconvergence\b|\b0x[a-f0-9]{2,}\b", lowered):
-        labels.add("sync/convergence or code-marker language")
+        labels.add("sync/convergence markers")
     if re.search(r"\bboundar(?:y|ies)\b|\boperational\b", lowered):
         labels.add("operational boundaries")
     if re.search(r"\bbarcode\b", lowered):
@@ -358,6 +421,102 @@ def _recurring_phrases(text: str) -> set[str]:
     return phrases
 
 
+def _acceptable_recurring_subject(label: str, count: int, reasons: set[str], sentence_starts: int, non_sentence_starts: int) -> tuple[bool, str]:
+    words = re.findall(r"[A-Za-z0-9]+", str(label or ""))
+    strong_order = (
+        "explicit_through_pattern", "explicit_here_pattern", "explicit_said_pattern",
+        "domain_tool", "code_marker", "quoted_title", "phrase_cluster",
+    )
+    for reason in strong_order:
+        if reason in reasons:
+            if len(words) == 1 and words[0].lower() in _SUBJECT_INTELLIGENCE_STOPWORDS:
+                return False, "stopword"
+            return True, reason
+    if len(words) > 1 and count >= 2:
+        return True, "phrase_cluster"
+    if len(words) == 1 and count >= 2 and non_sentence_starts > 0 and sentence_starts < count:
+        return True, "repeated_non_sentence_start"
+    return False, "sentence_start_or_weak_signal"
+
+
+def _theme_sort_key(item: tuple[str, int]) -> tuple[int, int, str]:
+    label, count = item
+    preferred = [
+        "BNL presence", "threshold behavior", "liaison/interface/node language",
+        "sync/convergence markers", "operational boundaries", "BNL interaction",
+        "music-sharing or link language", "BARCODE Network/community behavior",
+    ]
+    try:
+        rank = preferred.index(label)
+    except ValueError:
+        rank = len(preferred)
+    return (rank, -count, label)
+
+
+def extract_conversation_theme_clusters(intelligence: dict[str, Any], *, public_only: bool = True) -> list[str]:
+    themes: Counter = intelligence.get("publicThemes") or Counter()
+    phrases: Counter = intelligence.get("publicPhrases") or Counter()
+    domains: Counter = intelligence.get("publicDomains") or Counter()
+    if not public_only:
+        themes = themes + (intelligence.get("reviewOnlyThemes") or Counter())
+        phrases = phrases + (intelligence.get("reviewOnlyPhrases") or Counter())
+        domains = domains + (intelligence.get("reviewOnlyDomains") or Counter())
+    clusters: list[str] = []
+    for label, count in sorted(themes.items(), key=_theme_sort_key):
+        if count >= 2:
+            clusters.append(label)
+    if any(count >= 1 and _domain_tool_label(domain) == "Suno" for domain, count in domains.items()):
+        clusters.append("Suno links")
+    for phrase, count in phrases.most_common(6):
+        if count >= 2 and (" through " in phrase.lower() or re.search(r"\b0x[a-f0-9]{2,}\b", phrase, re.I)):
+            normalized = phrase.replace(" through ", "-through-") + (" framing" if " through " in phrase.lower() else " marker")
+            clusters.append(normalized)
+    deduped: list[str] = []
+    for cluster in clusters:
+        clean = _safe_snippet(cluster, 80)
+        if clean and clean not in deduped:
+            deduped.append(clean)
+    return deduped[:8]
+
+
+def score_recurring_conversation_phrases(intelligence: dict[str, Any]) -> list[tuple[str, int]]:
+    phrases: Counter = (intelligence.get("publicPhrases") or Counter()) + (intelligence.get("reviewOnlyPhrases") or Counter())
+    return [(phrase, count) for phrase, count in phrases.most_common(8) if count >= 2]
+
+
+def build_subject_topic_clusters(subject: str, intelligence: dict[str, Any]) -> dict[str, Any]:
+    clusters = extract_conversation_theme_clusters(intelligence, public_only=True)
+    phrase_scores = score_recurring_conversation_phrases(intelligence)
+    public_domains: Counter = intelligence.get("publicDomains") or Counter()
+    rows_scanned = int(intelligence.get("rowsScanned") or 0)
+    activity: list[str] = []
+    through_phrase = next((phrase for phrase, count in phrase_scores if " through " in phrase.lower()), "")
+    if through_phrase:
+        activity.append(f"Activity pattern: {subject} repeatedly relays messages framed as “{_safe_snippet(through_phrase, 90)}” in approved public context.")
+    if public_domains:
+        tools = [_domain_tool_label(domain) for domain, count in public_domains.most_common(4)]
+        if any(tool == "Suno" for tool in tools):
+            activity.append(f"Activity pattern: {subject} shares Suno links in reviewed evidence; queue/submission history is still not connected.")
+        elif tools:
+            activity.append(f"Activity pattern: {subject} repeatedly shares links in reviewed evidence.")
+    public_themes: Counter = intelligence.get("publicThemes") or Counter()
+    if public_themes.get("BNL interaction", 0) >= 2:
+        activity.append(f"Activity pattern: {subject} has repeated BNL-facing exchanges in approved review context.")
+    if public_themes.get("music-sharing or link language", 0) >= 2 and not any("shares" in line for line in activity):
+        activity.append(f"Activity pattern: {subject} appears mainly in music-sharing context.")
+    if public_themes.get("BARCODE Network/community behavior", 0) >= 2:
+        activity.append(f"Activity pattern: {subject} appears mainly in community conversation context.")
+    if public_themes.get("BNL interaction", 0) >= 2 and not any("BNL-facing" in line for line in activity):
+        activity.append(f"Activity pattern: {subject} repeatedly asks BNL/source-file related questions.")
+    theme_line = ""
+    if clusters:
+        theme_line = f"Conversation theme: {subject} repeatedly discusses {', '.join(clusters[:6])}. Review before public use."
+    digest = ""
+    if rows_scanned and clusters:
+        digest = f"Evidence digest: {rows_scanned} {subject}-linked evidence items were scanned. The strongest recurring clusters were {', '.join(clusters[:6])}."
+    return {"clusters": clusters, "activityPatterns": activity[:5], "conversationThemeLine": theme_line, "evidenceDigestLine": digest}
+
+
 def extract_recurring_subject_intelligence(rows: list[dict[str, Any]], subject: str) -> dict[str, Any]:
     """Score recurring names/themes/domains from fuller local rows, split by public-safe vs review-only."""
 
@@ -365,14 +524,25 @@ def extract_recurring_subject_intelligence(rows: list[dict[str, Any]], subject: 
     public_themes: Counter = Counter(); review_themes: Counter = Counter()
     public_domains: Counter = Counter(); review_domains: Counter = Counter()
     public_phrases: Counter = Counter(); review_phrases: Counter = Counter()
+    reason_map: dict[str, set[str]] = {}
+    accepted_reasons: dict[str, str] = {}
+    rejected_candidates: Counter = Counter()
+    sentence_starts: Counter = Counter(); non_sentence_starts: Counter = Counter()
+    provisional_public: Counter = Counter(); provisional_review: Counter = Counter()
     for row in rows:
         text = str(row.get("text") or "")
-        target_subjects = public_subjects if row.get("publicSafe") else review_subjects
+        candidates, sentence_counts, non_sentence_counts = _subject_candidate_reasons_from_text(text, subject)
+        for label, count in sentence_counts.items():
+            sentence_starts[label] += count
+        for label, count in non_sentence_counts.items():
+            non_sentence_starts[label] += count
+        target_subjects = provisional_public if row.get("publicSafe") else provisional_review
         target_themes = public_themes if row.get("publicSafe") else review_themes
         target_domains = public_domains if row.get("publicSafe") else review_domains
         target_phrases = public_phrases if row.get("publicSafe") else review_phrases
-        for label in _subject_candidates_from_text(text, subject):
+        for label, reasons in candidates.items():
             target_subjects[label] += 1
+            reason_map.setdefault(label, set()).update(reasons)
         for domain in _extract_domains(text):
             target_domains[domain] += 1
         for match in _THROUGH_PATTERN.finditer(text):
@@ -386,8 +556,22 @@ def extract_recurring_subject_intelligence(rows: list[dict[str, Any]], subject: 
             target_themes[theme] += 1
         for phrase in _recurring_phrases(text):
             target_phrases[phrase] += 1
+
+    for label, count in (provisional_public + provisional_review).items():
+        accepted, reason = _acceptable_recurring_subject(label, count, reason_map.get(label, set()), sentence_starts[label], non_sentence_starts[label])
+        if accepted:
+            accepted_reasons[label] = reason
+        else:
+            rejected_candidates[label] += count
+    for label, count in provisional_public.items():
+        if label in accepted_reasons:
+            public_subjects[label] = count
+    for label, count in provisional_review.items():
+        if label in accepted_reasons:
+            review_subjects[label] = count
+
     source_counts = Counter(str(row.get("source") or "unknown") for row in rows)
-    return {
+    intelligence = {
         "rowsScanned": len(rows),
         "sourceCounts": source_counts,
         "publicSubjects": public_subjects,
@@ -400,8 +584,11 @@ def extract_recurring_subject_intelligence(rows: list[dict[str, Any]], subject: 
         "reviewOnlyPhrases": review_phrases,
         "publicRows": sum(1 for row in rows if row.get("publicSafe")),
         "reviewOnlyRows": sum(1 for row in rows if not row.get("publicSafe")),
+        "acceptedSubjectReasons": accepted_reasons,
+        "rejectedSubjectCandidates": rejected_candidates,
     }
-
+    intelligence["topicClusters"] = build_subject_topic_clusters(subject, intelligence)
+    return intelligence
 
 def _domain_tool_label(domain: str) -> str:
     base = domain.lower().removeprefix("www.")
@@ -458,9 +645,35 @@ def _promote_subject_intelligence_readouts(summary: dict[str, Any], intelligence
     public_domains: Counter = intelligence.get("publicDomains") or Counter()
     review_domains: Counter = intelligence.get("reviewOnlyDomains") or Counter()
     public_phrases: Counter = intelligence.get("publicPhrases") or Counter()
+    topic_clusters: dict[str, Any] = intelligence.get("topicClusters") or {}
 
-    for label, count in reversed(public_subjects.most_common(5)):
+    conversation_theme_line = str(topic_clusters.get("conversationThemeLine") or "")
+    if conversation_theme_line:
+        for key in ("conversationHighlights", "topicBreakdown", "evidenceDetails"):
+            _add_priority_unique(summary, key, conversation_theme_line)
+        if len(topic_clusters.get("clusters") or []) >= 3:
+            _add_priority_unique(summary, "bestEvidenceToReview", conversation_theme_line)
+
+    evidence_digest_line = str(topic_clusters.get("evidenceDigestLine") or "")
+    if evidence_digest_line:
+        _add_priority_unique(summary, "evidenceDetails", evidence_digest_line)
+
+    for activity_line in topic_clusters.get("activityPatterns") or []:
+        for key in ("conversationHighlights", "usefulEvidence"):
+            _add_priority_unique(summary, key, activity_line)
+        lowered = activity_line.lower()
+        if "bnl" in lowered:
+            _add_priority_unique(summary, "bnlInteractionSignals", activity_line)
+        if "suno" in lowered or "music" in lowered or "links" in lowered:
+            _add_priority_unique(summary, "musicSignals", activity_line)
+        if "community" in lowered:
+            _add_priority_unique(summary, "communitySignals", activity_line)
+
+    accepted_reason_map = intelligence.get("acceptedSubjectReasons") or {}
+    for label, count in public_subjects.most_common(5):
         if count < 2 or not re.search(r"[A-Za-z]", str(label or "")):
+            continue
+        if accepted_reason_map.get(label) == "domain_tool":
             continue
         caution = " Additional review-only context also exists." if review_subjects.get(label) else ""
         normalized_line = f"Recurring named topic: {label} appears in reviewed evidence connected to {subject}. Review before public use.{caution}"
@@ -512,7 +725,14 @@ def _promote_subject_intelligence_readouts(summary: dict[str, Any], intelligence
         "rowsScanned": int(intelligence.get("rowsScanned") or 0),
         "rowsBySource": dict((intelligence.get("sourceCounts") or Counter()).most_common()),
         "topRecurringSubjects": [label for label, count in (public_subjects + review_subjects).most_common(6) if count >= 1],
+        "acceptedRecurringSubjects": [
+            {"label": label, "reason": accepted_reason_map.get(label, "") }
+            for label, count in (public_subjects + review_subjects).most_common(8) if count >= 1
+        ],
+        "rejectedGarbageCandidates": [label for label, count in (intelligence.get("rejectedSubjectCandidates") or Counter()).most_common(8)],
         "topRecurringThemes": [label for label, count in (public_themes + review_themes).most_common(6) if count >= 1],
+        "topConversationClusters": list((topic_clusters.get("clusters") or [])[:8]),
+        "topActivityPatterns": list((topic_clusters.get("activityPatterns") or [])[:5]),
         "topDomains": [domain for domain, count in (public_domains + review_domains).most_common(6) if count >= 1],
         "publicSafeRows": int(intelligence.get("publicRows") or 0),
         "reviewOnlyRows": int(intelligence.get("reviewOnlyRows") or 0),
