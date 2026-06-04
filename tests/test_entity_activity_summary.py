@@ -421,6 +421,37 @@ class EntityActivitySummaryBuilderTests(unittest.TestCase):
         self.assertNotRegex(json.dumps(summary), r"submitted\s+\d+|\d+\s+songs")
 
 
+    def test_titlecase_sentence_starters_and_fillers_are_not_named_topics(self):
+        filler_rows = []
+        fillers = ["The", "For", "And", "There", "This", "With", "From", "Good", "Maybe"]
+        for idx in range(6):
+            filler_rows.append({
+                "text": " ".join(f"{word} sentence starter repeats as grammar." for word in fillers),
+                "publicSafe": True,
+                "source": "conversations",
+            })
+        intel = entity.extract_recurring_subject_intelligence(filler_rows, "Crow")
+        extracted = set((intel["publicSubjects"] + intel["reviewOnlySubjects"]).keys())
+
+        for word in fillers:
+            self.assertNotIn(word, extracted)
+        self.assertFalse(any(word in extracted for word in ("The", "For", "And", "Maybe")))
+
+    def test_explicit_one_word_names_multiword_names_and_code_markers_survive_filtering(self):
+        rows = [
+            {"text": "Orion through Crow notes Atlas Bloom project marker 0x9A for BNL.", "publicSafe": True, "source": "conversations"},
+            {"text": "Again Orion through Crow repeats Atlas Bloom project marker 0x9A with BNL.", "publicSafe": True, "source": "conversations"},
+        ]
+        intel = entity.extract_recurring_subject_intelligence(rows, "Crow")
+        extracted = set(intel["publicSubjects"].keys())
+
+        self.assertIn("Orion", extracted)
+        self.assertIn("Atlas Bloom", extracted)
+        self.assertIn("0x9A", extracted)
+        reasons = intel["acceptedSubjectReasons"]
+        self.assertEqual(reasons["Orion"], "explicit_through_pattern")
+        self.assertEqual(reasons["0x9A"], "code_marker")
+
     def test_full_conversation_content_powers_recurring_intelligence_not_short_snippet(self):
         self.conn.execute("INSERT INTO user_profiles VALUES (42,1,'Crow','Crow',NULL,NULL)")
         self.conn.execute("INSERT INTO conversations VALUES (NULL,42,'Crow',1,'general','public_home','user',?, '2026-06-01')", (
@@ -439,7 +470,10 @@ class EntityActivitySummaryBuilderTests(unittest.TestCase):
             self.assertTrue(any("Recurring named topic: Orion" in item for item in summary[key]), key)
         self.assertTrue(any("Recurring named topic: Orion" in item for item in summary["knownContext"] + summary["usefulEvidence"]))
         self.assertIn("Recurring conversation pattern", normal_text)
+        self.assertIn("Conversation theme: Crow repeatedly discusses BNL presence, threshold behavior, liaison/interface/node language, sync/convergence markers, operational boundaries", normal_text)
+        self.assertIn("Activity pattern: Crow repeatedly relays messages framed as", normal_text)
         self.assertIn("Orion through Crow", normal_text)
+        self.assertIn("Evidence digest: 2 Crow-linked evidence items were scanned", normal_text)
         self.assertIn("BNL interaction pattern", normal_text)
         self.assertIn("Tool/platform mention: Suno appears in reviewed evidence connected to Crow", normal_text)
         self.assertIn("Queue/submission history is not connected yet", normal_text)

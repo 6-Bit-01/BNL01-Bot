@@ -2536,7 +2536,11 @@ def format_source_enrichment_response(result: dict[str, Any]) -> str:
                 f"Subject intelligence rows scanned: {int(subject_intel.get('rowsScanned') or 0)}.",
                 f"Subject intelligence rows by source: {_safe_text(', '.join(f'{k} {v}' for k, v in rows_by_source.items()) or 'none', 220)}.",
                 f"Top recurring subjects: {_safe_text(', '.join(subject_intel.get('topRecurringSubjects') or []) or 'none', 180)}.",
+                f"Accepted recurring subjects with reason: {_safe_text(', '.join(f"{(item or {}).get('label')}: {(item or {}).get('reason')}" for item in (subject_intel.get('acceptedRecurringSubjects') or [])) or 'none', 220)}.",
+                f"Rejected top garbage candidates: {_safe_text(', '.join(subject_intel.get('rejectedGarbageCandidates') or []) or 'none', 180)}.",
                 f"Top recurring themes: {_safe_text(', '.join(subject_intel.get('topRecurringThemes') or []) or 'none', 220)}.",
+                f"Top conversation clusters: {_safe_text(', '.join(subject_intel.get('topConversationClusters') or []) or 'none', 240)}.",
+                f"Top activity patterns: {_safe_text(' | '.join(subject_intel.get('topActivityPatterns') or []) or 'none', 260)}.",
                 f"Top domains/tools: {_safe_text(', '.join(subject_intel.get('topDomains') or []) or 'none', 180)}.",
                 f"Public-safe vs review-only intelligence rows: {int(subject_intel.get('publicSafeRows') or 0)} public-safe / {int(subject_intel.get('reviewOnlyRows') or 0)} review-only.",
             ])
