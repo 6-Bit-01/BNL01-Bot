@@ -1609,6 +1609,7 @@ def collect_source_enrichment_evidence(db_path: str, guild_id: int | None, subje
         "privateOnlyNotes": list(entity_summary.get("privateOnlyNotes") or [])[:6] if raw_provenance else [],
         "notPublicYet": list(entity_summary.get("notPublicYet") or [])[:6] if raw_provenance else [],
         "sourceAuthority": list(entity_summary.get("sourceAuthority") or [])[:5] if raw_provenance else [],
+        "subjectIntelligenceDiagnostics": entity_summary.get("subjectIntelligenceDiagnostics") or {},
         **_bounded_entity_summary_fields(entity_summary, include=bool(raw_provenance)),
         "queueSubmissionStatus": str(entity_summary.get("queueSubmissionStatus") or "not_connected") if raw_provenance else "not_connected",
         "queueSubmissionNote": str(entity_summary.get("queueSubmissionNote") or QUEUE_NOT_CONNECTED_NOTE) if raw_provenance else QUEUE_NOT_CONNECTED_NOTE,
@@ -2420,6 +2421,7 @@ def run_source_file_enrichment(
         "forced": bool(force),
     }
     _copy_evidence_fields(packet, evidence)
+    packet["subjectIntelligenceDiagnostics"] = evidence.get("subjectIntelligenceDiagnostics") or {}
     quality = evaluate_enrichment_quality(packet)
     packet["qualityScore"] = quality["score"]
     packet["qualityStatus"] = "forced_low_confidence" if force and quality["status"] != "sendable" else quality["status"]
@@ -2518,6 +2520,17 @@ def format_source_enrichment_response(result: dict[str, Any]) -> str:
             f"Channel evidence found: {'yes' if (result.get('diagnostics') or {}).get('channelEvidenceFound') else 'no'}; public dossier match found: {'yes' if (result.get('diagnostics') or {}).get('publicDossierMatchFound') else 'no'}; existing dossier update lane: {'yes' if (result.get('diagnostics') or {}).get('existingDossierUpdateLane') else 'no'}.",
             f"Warning count: {warning_text}.",
         ]
+        subject_intel = (result.get("diagnostics") or {}).get("subjectIntelligence") or result.get("subjectIntelligenceDiagnostics") or {}
+        if subject_intel:
+            rows_by_source = subject_intel.get("rowsBySource") or {}
+            preview_lines.extend([
+                f"Subject intelligence rows scanned: {int(subject_intel.get('rowsScanned') or 0)}.",
+                f"Subject intelligence rows by source: {_safe_text(', '.join(f'{k} {v}' for k, v in rows_by_source.items()) or 'none', 220)}.",
+                f"Top recurring subjects: {_safe_text(', '.join(subject_intel.get('topRecurringSubjects') or []) or 'none', 180)}.",
+                f"Top recurring themes: {_safe_text(', '.join(subject_intel.get('topRecurringThemes') or []) or 'none', 220)}.",
+                f"Top domains/tools: {_safe_text(', '.join(subject_intel.get('topDomains') or []) or 'none', 180)}.",
+                f"Public-safe vs review-only intelligence rows: {int(subject_intel.get('publicSafeRows') or 0)} public-safe / {int(subject_intel.get('reviewOnlyRows') or 0)} review-only.",
+            ])
         classification = result.get("classification") or {}
         if classification:
             missing = classification.get("missingInfo") or []

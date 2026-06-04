@@ -7,6 +7,7 @@ Source Files/dossiers, call website ingest, publish, or fetch Discord history.
 
 from __future__ import annotations
 
+import json
 import re
 import sqlite3
 from collections import Counter
@@ -75,16 +76,399 @@ _NAMED_TOPIC_ALLOWLIST = {
     "orion": "Orion",
     "barcode radio": "BARCODE Radio",
     "barcode": "BARCODE",
-    "bnl": "BNL",
 }
 _NAMED_TOPIC_STOPWORDS = {
     "approved", "subject", "review", "context", "community", "source", "file", "dossier", "music",
     "conversation", "public", "internal", "private", "unknown", "queue", "submission", "identity",
-    "owner", "admin", "discord", "channel", "support", "help", "possible", "recurring", "tool",
+    "owner", "admin", "discord", "channel", "support", "help", "possible", "recurring", "tool", "bnl",
 }
 _ENTITY_NAME_PATTERN = re.compile(r"(?<![A-Za-z0-9])(?:[A-Z][A-Za-z0-9]*(?:[-'’][A-Za-z0-9]+)?)(?:\s+(?:[A-Z][A-Za-z0-9]*(?:[-'’][A-Za-z0-9]+)?))*")
 _MUSIC_SUBMISSION_LANGUAGE_PATTERN = re.compile(r"\b(song|songs|track|tracks|submitted|submission|queue|played|priority|payment|paid|suno|udio|music)\b", re.I)
 
+
+
+_SUBJECT_INTELLIGENCE_STOPWORDS = {
+    "possible", "reviewed", "evidence", "tool", "platform", "queue", "submission", "source", "context",
+    "confirm", "public", "private", "review", "owner", "admin", "music", "community", "pattern",
+    "activity", "signal", "history", "this", "subject", "channel", "conversation", "dossier", "file",
+    "approved", "internal", "candidate", "notes", "known", "facts", "relationship", "memory", "recent",
+}
+_RECURRING_PHRASE_STOPWORDS = _SUBJECT_INTELLIGENCE_STOPWORDS | {"appears", "mentioned", "connected", "review", "before", "after", "with", "from", "about"}
+_DOMAIN_PATTERN = re.compile(r"(?:https?://)?(?:www\.)?([a-z0-9][a-z0-9-]*(?:\.[a-z0-9][a-z0-9-]*)+)(?:/[^\s<>()\[\]{}]*)?", re.I)
+_CODE_MARKER_PATTERN = re.compile(r"\b(?:0x[A-Fa-f0-9]{2,}|[A-Z][A-Z0-9]{2,}(?:-[A-Z0-9]+)*)\b")
+_THROUGH_PATTERN = re.compile(r"\b([A-Z][A-Za-z0-9_-]{2,}(?:\s+[A-Z][A-Za-z0-9_-]{2,}){0,2})\s+(?:through|via|speaking\s+through|relayed\s+through)\s+([A-Z][A-Za-z0-9_-]{2,}(?:\s+[A-Z][A-Za-z0-9_-]{2,}){0,2})\b")
+_HERE_PATTERN = re.compile(r"\b([A-Z][A-Za-z0-9_-]{2,})\s+here\b")
+_SAID_PATTERN = re.compile(r"\b([A-Z][A-Za-z0-9_-]{2,})\s+(?:said|says|asks|asked)\b")
+
+
+def _safe_int_value(value: Any) -> int | None:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _row_value(row: sqlite3.Row | dict[str, Any], key: str, default: Any = None) -> Any:
+    if isinstance(row, sqlite3.Row):
+        return row[key] if key in row.keys() else default
+    return row.get(key, default)
+
+
+def _select_existing_columns(conn: sqlite3.Connection, table: str, wanted: list[str]) -> list[str]:
+    cols = _columns(conn, table)
+    return [col for col in wanted if col in cols]
+
+
+def _safe_table_row_text(conn: sqlite3.Connection, table: str, row_id: Any) -> str:
+    """Rehydrate local source-row text for extraction only; never expose it directly."""
+
+    if table != "conversations" or not _table_exists(conn, table):
+        return ""
+    row_int = _safe_int_value(row_id)
+    if row_int is None:
+        return ""
+    cols = _select_existing_columns(conn, table, ["content"])
+    if not cols:
+        return ""
+    row = conn.execute("SELECT content FROM conversations WHERE rowid=? OR id=? LIMIT 1", (row_int, row_int)).fetchone()
+    return str(row["content"] or "") if row else ""
+
+
+def _parse_raw_ref(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    try:
+        parsed = json.loads(str(value or "{}"))
+        return parsed if isinstance(parsed, dict) else {}
+    except Exception:
+        return {}
+
+
+def _is_public_intelligence_row(source: str, data: dict[str, Any]) -> bool:
+    if source == "conversations":
+        return str(data.get("channel_policy") or "").lower() in PUBLIC_CONVERSATION_POLICIES
+    if source == "entity_evidence_events":
+        return bool(data.get("public_safe_candidate")) and not bool(data.get("review_only"))
+    if source == "broadcast_memory":
+        return bool(data.get("public_safe")) and str(data.get("status") or "active").lower() == "active"
+    if source == "community_presence":
+        return True
+    return False
+
+
+def extract_full_text_from_source_row(conn: sqlite3.Connection, source: str, row: sqlite3.Row | dict[str, Any]) -> str:
+    """Return fuller local text for internal scoring, preferring rehydrated conversation content."""
+
+    data = dict(row) if isinstance(row, sqlite3.Row) else dict(row or {})
+    if source == "entity_evidence_events":
+        raw_ref = _parse_raw_ref(data.get("raw_ref_json"))
+        table = str(raw_ref.get("table") or raw_ref.get("sourceTable") or "")
+        row_id = raw_ref.get("row_id", raw_ref.get("sourceRowId"))
+        rehydrated = _safe_table_row_text(conn, table, row_id)
+        if rehydrated:
+            return rehydrated
+        return " ".join(str(v or "") for v in (data.get("safe_summary"), raw_ref.get("snippet"), raw_ref.get("summary"), data.get("topic"))).strip()
+    fields_by_source = {
+        "conversations": ["content"],
+        "relationship_journal": ["entry_type", "summary"],
+        "relationship_state": ["trust_stage", "social_stance", "last_topic"],
+        "user_memory_facts": ["fact_key", "fact_value"],
+        "memory_tiers": ["tier", "summary"],
+        "broadcast_memory": ["entry_type", "cleaned_summary", "summary", "raw_note"],
+        "community_presence": ["display_name", "connection_notes", "evidence_snippets", "category"],
+    }
+    return " ".join(str(data.get(field) or "") for field in fields_by_source.get(source, [])).strip()
+
+
+def collect_subject_intelligence_rows(
+    conn: sqlite3.Connection,
+    subject: str,
+    guild_id: int | None,
+    *,
+    aliases: list[str] | None = None,
+    matched_user_ids: set[Any] | None = None,
+    structured_rows: list[sqlite3.Row] | None = None,
+    max_rows: int = 200,
+) -> list[dict[str, Any]]:
+    """Collect selected subject-linked local rows for internal recurring-subject scoring."""
+
+    rows: list[dict[str, Any]] = []
+    matched_ids = {_safe_int_value(v) for v in (matched_user_ids or set())}
+    matched_ids.discard(None)
+
+    def matches_text(text: str) -> bool:
+        return contains_subject_mention(text, subject, aliases=aliases)
+
+    def add(source: str, row: sqlite3.Row | dict[str, Any], relation: str = "mentioned") -> None:
+        data = dict(row) if isinstance(row, sqlite3.Row) else dict(row or {})
+        text = extract_full_text_from_source_row(conn, source, data)
+        if not text:
+            return
+        rows.append({"source": source, "text": text, "publicSafe": _is_public_intelligence_row(source, data), "relation": relation})
+
+    for row in structured_rows or []:
+        add("entity_evidence_events", row, str(_row_value(row, "relation_to_subject", "matched")))
+
+    if _table_exists(conn, "conversations"):
+        select_cols = _select_existing_columns(conn, "conversations", ["id", "user_id", "author_id", "discord_user_id", "member_id", "user_name", "author_name", "channel_policy", "content", "timestamp"])
+        if select_cols:
+            order_col = "timestamp" if "timestamp" in _columns(conn, "conversations") else "id" if "id" in _columns(conn, "conversations") else "rowid"
+            query = f"SELECT rowid AS _rowid, {', '.join(select_cols)} FROM conversations WHERE guild_id=? ORDER BY {order_col} DESC LIMIT ?" if guild_id is not None else f"SELECT rowid AS _rowid, {', '.join(select_cols)} FROM conversations ORDER BY {order_col} DESC LIMIT ?"
+            params = (guild_id, max_rows * 8) if guild_id is not None else (max_rows * 8,)
+            for row in conn.execute(query, params):
+                data = dict(row)
+                author_id_match = any(_safe_int_value(data.get(col)) in matched_ids for col in ("user_id", "author_id", "discord_user_id", "member_id"))
+                author_name_match = any(contains_subject_mention(str(data.get(col) or ""), subject, aliases=aliases) for col in ("user_name", "author_name"))
+                content_match = matches_text(str(data.get("content") or ""))
+                if author_id_match or author_name_match or content_match:
+                    add("conversations", data, "authored" if author_id_match or author_name_match else "mentioned")
+                if len(rows) >= max_rows:
+                    break
+
+    table_fields = {
+        "relationship_journal": ["user_id", "entry_type", "summary"],
+        "relationship_state": ["user_id", "trust_stage", "social_stance", "last_topic"],
+        "user_memory_facts": ["user_id", "fact_key", "fact_value"],
+        "memory_tiers": ["user_id", "tier", "summary"],
+        "broadcast_memory": ["cleaned_summary", "summary", "raw_note", "entry_type", "public_safe", "status"],
+        "community_presence": ["subject_key", "display_name", "connection_notes", "evidence_snippets", "category", "user_id", "discord_user_id", "member_id"],
+    }
+    for table, wanted in table_fields.items():
+        if not _table_exists(conn, table):
+            continue
+        select_cols = _select_existing_columns(conn, table, wanted)
+        if not select_cols:
+            continue
+        where = " WHERE guild_id=?" if guild_id is not None and "guild_id" in _columns(conn, table) else ""
+        params: tuple[Any, ...] = (guild_id,) if where else ()
+        for row in conn.execute(f"SELECT {', '.join(select_cols)} FROM {table}{where} LIMIT ?", (*params, max_rows * 4)):
+            data = dict(row)
+            id_match = any(_safe_int_value(data.get(col)) in matched_ids for col in ("user_id", "discord_user_id", "member_id"))
+            text = extract_full_text_from_source_row(conn, table, data)
+            if id_match or matches_text(text):
+                add(table, data, "matched" if id_match else "mentioned")
+            if len(rows) >= max_rows * 2:
+                break
+    return rows[: max_rows * 2]
+
+
+def build_subject_intelligence_corpus(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    public = [str(row.get("text") or "") for row in rows if row.get("publicSafe")]
+    review = [str(row.get("text") or "") for row in rows if not row.get("publicSafe")]
+    counts = Counter(str(row.get("source") or "unknown") for row in rows)
+    return {"publicTexts": public, "reviewOnlyTexts": review, "sourceCounts": counts, "rowCount": len(rows)}
+
+
+def _clean_intelligence_label(label: str, subject: str = "") -> str:
+    label = re.sub(r"\s+", " ", str(label or "")).strip(" -:.,;!?()[]{}\"'“”‘’")
+    if not label or len(label) < 3 or len(label) > 60:
+        return ""
+    lowered = label.lower()
+    if lowered == normalize_subject_name(subject).lower():
+        return ""
+    words = re.findall(r"[a-z0-9]+", lowered)
+    if not words:
+        return ""
+    if lowered in _SUBJECT_INTELLIGENCE_STOPWORDS or (len(words) == 1 and words[0] in _SUBJECT_INTELLIGENCE_STOPWORDS):
+        return ""
+    if lowered == "bnl":
+        return ""
+    return label
+
+
+def _subject_candidates_from_text(text: str, subject: str) -> set[str]:
+    candidates: set[str] = set()
+    for pattern in (_THROUGH_PATTERN, _HERE_PATTERN, _SAID_PATTERN):
+        for match in pattern.finditer(text):
+            for group in match.groups():
+                clean = _clean_intelligence_label(group, subject)
+                if clean:
+                    candidates.add(clean)
+                    parts = clean.split()
+                    for suffix_len in (1, 2):
+                        if len(parts) > suffix_len:
+                            suffix = _clean_intelligence_label(" ".join(parts[-suffix_len:]), subject)
+                            if suffix:
+                                candidates.add(suffix)
+    for match in _ENTITY_NAME_PATTERN.finditer(text):
+        clean = _clean_intelligence_label(match.group(0), subject)
+        if clean and len(clean.split()) <= 4:
+            candidates.add(clean)
+    for match in _CODE_MARKER_PATTERN.finditer(text):
+        clean = _clean_intelligence_label(match.group(0), subject)
+        if clean:
+            candidates.add(clean)
+    return candidates
+
+
+def _extract_domains(text: str) -> set[str]:
+    domains: set[str] = set()
+    for match in _DOMAIN_PATTERN.finditer(text):
+        domain = match.group(1).lower().strip("./")
+        if domain and "." in domain and not domain.endswith((".png", ".jpg", ".gif")):
+            domains.add(domain.removeprefix("www."))
+    return domains
+
+
+def _theme_labels_for_text(text: str) -> set[str]:
+    t = str(text or "")
+    lowered = t.lower()
+    labels: set[str] = set()
+    if re.search(r"\b[A-Z][A-Za-z0-9_-]{2,}(?:\s+[A-Z][A-Za-z0-9_-]{2,}){0,2}\s+(?:through|via|speaking\s+through|relayed\s+through)\s+[A-Z][A-Za-z0-9_-]{2,}(?:\s+[A-Z][A-Za-z0-9_-]{2,}){0,2}\b", t):
+        labels.add("messages framed through another named participant")
+    if re.search(r"\bbnl\b|\bsource files?\b|\bdossiers?\b|\bbot\b", lowered):
+        labels.add("BNL interaction")
+    if re.search(r"\bliaison\b|\binterface\b|\bnode\b", lowered):
+        labels.add("liaison/interface/node language")
+    if re.search(r"\bpresence\b|\bthreshold\b", lowered):
+        labels.add("presence/threshold behavior")
+    if re.search(r"\bsync\b|\bconvergence\b|\b0x[a-f0-9]{2,}\b", lowered):
+        labels.add("sync/convergence or code-marker language")
+    if re.search(r"\bboundar(?:y|ies)\b|\boperational\b", lowered):
+        labels.add("operational boundaries")
+    if re.search(r"\bbarcode\b", lowered):
+        labels.add("BARCODE Network/community behavior")
+    if re.search(r"\bsuno\b|\bmusic\b|\bsong\b|\btrack\b|\blink\b|\bshared?\b", lowered):
+        labels.add("music-sharing or link language")
+    return labels
+
+
+def _recurring_phrases(text: str) -> set[str]:
+    tokens = re.findall(r"[A-Za-z0-9][A-Za-z0-9'-]*", text)
+    phrases: set[str] = set()
+    for n in range(2, 6):
+        for i in range(0, max(0, len(tokens) - n + 1)):
+            phrase = " ".join(tokens[i:i+n])
+            lower_words = [w.lower() for w in tokens[i:i+n]]
+            if any(w in _RECURRING_PHRASE_STOPWORDS for w in lower_words):
+                continue
+            if not any(w[:1].isupper() or re.match(r"0x", w, re.I) for w in tokens[i:i+n]):
+                continue
+            phrases.add(phrase[:80])
+    return phrases
+
+
+def extract_recurring_subject_intelligence(rows: list[dict[str, Any]], subject: str) -> dict[str, Any]:
+    """Score recurring names/themes/domains from fuller local rows, split by public-safe vs review-only."""
+
+    public_subjects: Counter = Counter(); review_subjects: Counter = Counter()
+    public_themes: Counter = Counter(); review_themes: Counter = Counter()
+    public_domains: Counter = Counter(); review_domains: Counter = Counter()
+    public_phrases: Counter = Counter(); review_phrases: Counter = Counter()
+    for row in rows:
+        text = str(row.get("text") or "")
+        target_subjects = public_subjects if row.get("publicSafe") else review_subjects
+        target_themes = public_themes if row.get("publicSafe") else review_themes
+        target_domains = public_domains if row.get("publicSafe") else review_domains
+        target_phrases = public_phrases if row.get("publicSafe") else review_phrases
+        for label in _subject_candidates_from_text(text, subject):
+            target_subjects[label] += 1
+        for domain in _extract_domains(text):
+            target_domains[domain] += 1
+            name = domain.split(".")[0]
+            clean = _clean_intelligence_label(name.capitalize(), subject)
+            if clean:
+                target_subjects[clean] += 1
+        for match in _THROUGH_PATTERN.finditer(text):
+            left = _clean_intelligence_label(match.group(1), subject)
+            right = _clean_intelligence_label(match.group(2), subject) or normalize_subject_name(subject)
+            if left and right:
+                parts = left.split()
+                concise_left = _clean_intelligence_label(parts[-1], subject) if len(parts) > 1 else left
+                target_phrases[f"{concise_left or left} through {right}"] += 1
+        for theme in _theme_labels_for_text(text):
+            target_themes[theme] += 1
+        for phrase in _recurring_phrases(text):
+            target_phrases[phrase] += 1
+    source_counts = Counter(str(row.get("source") or "unknown") for row in rows)
+    return {
+        "rowsScanned": len(rows),
+        "sourceCounts": source_counts,
+        "publicSubjects": public_subjects,
+        "reviewOnlySubjects": review_subjects,
+        "publicThemes": public_themes,
+        "reviewOnlyThemes": review_themes,
+        "publicDomains": public_domains,
+        "reviewOnlyDomains": review_domains,
+        "publicPhrases": public_phrases,
+        "reviewOnlyPhrases": review_phrases,
+        "publicRows": sum(1 for row in rows if row.get("publicSafe")),
+        "reviewOnlyRows": sum(1 for row in rows if not row.get("publicSafe")),
+    }
+
+
+def _domain_tool_label(domain: str) -> str:
+    base = domain.lower().removeprefix("www.")
+    known = {
+        "suno.com": "Suno", "youtube.com": "YouTube", "youtu.be": "YouTube", "soundcloud.com": "SoundCloud",
+        "spotify.com": "Spotify", "bandcamp.com": "Bandcamp", "tiktok.com": "TikTok", "instagram.com": "Instagram",
+    }
+    return known.get(base, base)
+
+
+def _append_subject_intelligence_readouts(summary: dict[str, Any], intelligence: dict[str, Any]) -> None:
+    subject = summary.get("subjectName") or "this subject"
+    public_subjects: Counter = intelligence.get("publicSubjects") or Counter()
+    review_subjects: Counter = intelligence.get("reviewOnlySubjects") or Counter()
+    public_themes: Counter = intelligence.get("publicThemes") or Counter()
+    review_themes: Counter = intelligence.get("reviewOnlyThemes") or Counter()
+    public_domains: Counter = intelligence.get("publicDomains") or Counter()
+    review_domains: Counter = intelligence.get("reviewOnlyDomains") or Counter()
+    public_phrases: Counter = intelligence.get("publicPhrases") or Counter()
+
+    for label, count in public_subjects.most_common(5):
+        if count < 2:
+            continue
+        caution = " Additional review-only context also exists." if review_subjects.get(label) else ""
+        line = f"Recurring subject: {label} appears repeatedly in evidence connected to {subject}. Review before public use.{caution}"
+        _add_unique(summary["topicBreakdown"], line)
+        _add_unique(summary["conversationHighlights"], line)
+        _add_unique(summary["bestEvidenceToReview"], f"Recurring subject — {label}: review selected public-context evidence before using this in Source File copy.")
+        _add_unique(summary["publicUseCandidates"], f"Recurring subject {label} may inform public-safe wording only after owner/admin review.")
+    for label, count in review_subjects.most_common(5):
+        if count >= 1 and label not in public_subjects:
+            _add_unique(summary["reviewOnlyEvidence"], f"Review-only recurring subject: {label} appears in internal context connected to {subject}. Do not use publicly without owner/admin review.")
+
+    if public_phrases:
+        for phrase, count in public_phrases.most_common(3):
+            if count >= 2 and (" through " in phrase.lower() or " via " in phrase.lower()):
+                _add_unique(summary["conversationHighlights"], f"Recurring pattern: messages are repeatedly framed as “{_safe_snippet(phrase, 80)}.”")
+                _add_unique(summary["bnlInteractionSignals"], f"BNL interaction pattern: reviewed public-context exchanges include repeated “{_safe_snippet(phrase, 80)}” framing.")
+                break
+
+    theme_labels = [theme for theme, count in public_themes.most_common(8) if count >= 2]
+    if theme_labels:
+        _add_unique(summary["topicBreakdown"], "Recurring discussion themes: " + ", ".join(theme_labels[:6]) + ".")
+        if "BNL interaction" in theme_labels:
+            _add_unique(summary["bnlInteractionSignals"], f"BNL interaction pattern: {subject} has repeated reviewed exchanges involving " + ", ".join(t for t in theme_labels if t != "BNL interaction")[:180] + ".")
+    for theme, count in review_themes.most_common(5):
+        if count >= 1 and theme not in public_themes:
+            _add_unique(summary["reviewOnlyEvidence"], f"Review-only recurring theme: {theme} appears in internal context; do not use publicly without owner/admin review.")
+
+    for domain, count in public_domains.most_common(6):
+        if count < 1:
+            continue
+        tool = _domain_tool_label(domain)
+        if tool == "Suno":
+            line = "Tool/link signal: Suno links appear in reviewed evidence connected to this subject. Confirm through queue/submission data before claiming submitted songs or source type."
+        else:
+            line = f"Tool/link signal: {tool} links or domains appear in reviewed evidence connected to this subject; confirm source type before public use."
+        _add_unique(summary["musicSignals"], line)
+        _add_unique(summary["topicBreakdown"], line)
+    for domain, count in review_domains.most_common(6):
+        tool = _domain_tool_label(domain)
+        if domain not in public_domains:
+            _add_unique(summary["reviewOnlyEvidence"], f"Review-only tool/link signal: {tool} appears in internal context; do not use publicly without owner/admin review.")
+
+    summary["subjectIntelligenceDiagnostics"] = {
+        "rowsScanned": int(intelligence.get("rowsScanned") or 0),
+        "rowsBySource": dict((intelligence.get("sourceCounts") or Counter()).most_common()),
+        "topRecurringSubjects": [label for label, count in (public_subjects + review_subjects).most_common(6) if count >= 1],
+        "topRecurringThemes": [label for label, count in (public_themes + review_themes).most_common(6) if count >= 1],
+        "topDomains": [domain for domain, count in (public_domains + review_domains).most_common(6) if count >= 1],
+        "publicSafeRows": int(intelligence.get("publicRows") or 0),
+        "reviewOnlyRows": int(intelligence.get("reviewOnlyRows") or 0),
+    }
 
 def _clean_fact_text(text: Any) -> str:
     return _safe_snippet(text, 500)
@@ -671,6 +1055,19 @@ def build_entity_activity_summary(
                     _record_raw(summary["rawProvenance"], "user_profiles", "local_profile_observed", f"Local profile observed for {subject}.")
 
         aliases = list(dict.fromkeys([a for a in aliases if a and a.lower() != subject.lower()]))
+
+        intelligence_rows = collect_subject_intelligence_rows(
+            conn,
+            subject,
+            guild_id,
+            aliases=aliases,
+            matched_user_ids=matched_user_ids,
+            structured_rows=structured_rows,
+            max_rows=max_rows,
+        )
+        if intelligence_rows:
+            intelligence = extract_recurring_subject_intelligence(intelligence_rows, subject)
+            _append_subject_intelligence_readouts(summary, intelligence)
 
         def row_matches(row: sqlite3.Row, fields: list[str]) -> bool:
             data = dict(row)

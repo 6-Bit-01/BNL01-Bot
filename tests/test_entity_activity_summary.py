@@ -421,6 +421,108 @@ class EntityActivitySummaryBuilderTests(unittest.TestCase):
         self.assertNotRegex(json.dumps(summary), r"submitted\s+\d+|\d+\s+songs")
 
 
+    def test_full_conversation_content_powers_recurring_intelligence_not_short_snippet(self):
+        self.conn.execute("INSERT INTO user_profiles VALUES (42,1,'Crow','Crow',NULL,NULL)")
+        self.conn.execute("INSERT INTO conversations VALUES (NULL,42,'Crow',1,'general','public_home','user',?, '2026-06-01')", (
+            "Crow short opener. Deep in the full row Orion through Crow discusses BNL presence threshold behavior, liaison interface node language, sync convergence 0x9A, operational boundaries, and https://suno.com/song/alpha.",
+        ))
+        self.conn.execute("INSERT INTO conversations VALUES (NULL,42,'Crow',1,'general','public_home','user',?, '2026-06-02')", (
+            "Crow second opener. Again Orion through Crow discusses BNL presence threshold behavior, liaison interface node language, sync convergence 0x9A, operational boundaries, and https://suno.com/song/beta.",
+        ))
+        self.conn.commit()
+
+        summary = self._summary()
+        normal_text = json.dumps({k: v for k, v in summary.items() if k != "rawProvenance"})
+
+        self.assertIn("Recurring subject: Orion appears repeatedly", normal_text)
+        self.assertIn("Recurring pattern", normal_text)
+        self.assertIn("Orion through Crow", normal_text)
+        self.assertIn("BNL interaction pattern", normal_text)
+        self.assertIn("Suno links appear in reviewed evidence connected to this subject", normal_text)
+        self.assertIn("Queue/submission history is not connected yet", normal_text)
+        self.assertEqual(summary["queueSubmissionStatus"], "not_connected")
+        self.assertGreaterEqual(summary["subjectIntelligenceDiagnostics"]["rowsScanned"], 2)
+
+    def test_raw_ref_json_conversation_pointer_rehydrates_full_row_for_intelligence(self):
+        self.conn.execute("INSERT INTO user_profiles VALUES (42,1,'Crow','Crow',NULL,NULL)")
+        self.conn.execute("INSERT INTO conversations VALUES (576,42,'Crow',1,'general','public_home','user',?, '2026-06-01')", (
+            "Crow says tiny snippet is not enough. Orion through Crow repeats the full-row-only Nebula Forge project with BNL liaison interface language and https://suno.com/song/rehydrated.",
+        ))
+        evidence.ensure_entity_evidence_schema(self.conn)
+        evidence.upsert_entity_evidence_event(
+            self.conn, guild_id=1, subject_name="Crow", source_type="conversation", source_table="conversations",
+            source_row_id="576", source_label="conversations/public_discord_observed", channel_name="general",
+            channel_policy="public_home", visibility="public_side", authority="channel_policy_observed", confidence=0.7,
+            relation_to_subject="authored", topic="community context", evidence_kind="authored_public_conversation",
+            safe_summary="Subject authored approved public-side conversation. Possible Reviewed Evidence Tool Platform Source Context.",
+            public_safe_candidate=True, review_only=False, music_signal=False, community_signal=True, bnl_interaction=True,
+            dossier_relevance="candidate_after_owner_review", raw_ref_json={"table": "conversations", "row_id": 576, "snippet": "Orion here"},
+            observed_at="now",
+        )
+        self.conn.commit()
+
+        summary = self._summary()
+        normal_text = json.dumps({k: v for k, v in summary.items() if k != "rawProvenance"})
+
+        self.assertIn("Orion", normal_text)
+        self.assertIn("Nebula Forge", normal_text)
+        for garbage in ("Possible appears", "Reviewed appears", "Evidence appears", "Tool appears", "Platform appears", "Source appears", "Context appears"):
+            self.assertNotIn(garbage, normal_text)
+        self.assertNotIn("raw_ref_json", normal_text)
+        self.assertNotIn("source_row_id", normal_text)
+        self.assertNotIn("576", normal_text)
+
+    def test_generic_non_orion_recurring_subjects_without_hardcoding(self):
+        self.conn.execute("INSERT INTO user_profiles VALUES (88,1,'Mira','Mira',NULL,NULL)")
+        self.conn.execute("INSERT INTO conversations VALUES (NULL,88,'Mira',1,'general','public_home','user','Mira says Atlas Bloom through Mira is the project name for BNL review and public context.', '2026-06-01')")
+        self.conn.execute("INSERT INTO conversations VALUES (NULL,88,'Mira',1,'general','public_home','user','Mira repeats Atlas Bloom through Mira with interface language for BNL review and public context.', '2026-06-02')")
+        self.conn.commit()
+
+        summary = self._summary("Mira")
+        normal_text = json.dumps({k: v for k, v in summary.items() if k != "rawProvenance"})
+
+        self.assertIn("Atlas Bloom", normal_text)
+        self.assertIn("Recurring subject", normal_text)
+        self.assertNotIn("Orion appears repeatedly", normal_text)
+
+    def test_review_only_and_mixed_subject_intelligence_split(self):
+        self.conn.execute("INSERT INTO user_profiles VALUES (42,1,'Crow','Crow',NULL,NULL)")
+        self.conn.execute("INSERT INTO relationship_journal VALUES (NULL,42,1,'note','Crow internal note repeats Vega Signal through Crow in relationship memory.', 'now')")
+        self.conn.execute("INSERT INTO memory_tiers VALUES (NULL,42,1,'long','Crow source-blind note repeats Vega Signal through Crow in memory.',0.9,1,'now')")
+        self.conn.commit()
+
+        review_only_summary = self._summary()
+        public_text = json.dumps({key: review_only_summary.get(key) for key in ("conversationHighlights", "topicBreakdown", "bestEvidenceToReview", "publicUseCandidates")})
+        review_text = json.dumps(review_only_summary["reviewOnlyEvidence"])
+        self.assertNotIn("Recurring subject: Vega Signal", public_text)
+        self.assertIn("Review-only recurring subject: Vega Signal", review_text)
+
+        self.conn.execute("INSERT INTO conversations VALUES (NULL,42,'Crow',1,'general','public_home','user','Crow public note repeats Vega Signal through Crow with BNL interaction.', '2026-06-03')")
+        self.conn.execute("INSERT INTO conversations VALUES (NULL,42,'Crow',1,'general','public_home','user','Crow public note again repeats Vega Signal through Crow with BNL interaction.', '2026-06-04')")
+        self.conn.commit()
+
+        mixed_summary = self._summary()
+        mixed_text = json.dumps({k: v for k, v in mixed_summary.items() if k != "rawProvenance"})
+        self.assertIn("Recurring subject: Vega Signal appears repeatedly", mixed_text)
+        self.assertIn("Additional review-only context also exists", mixed_text)
+
+    def test_normal_payload_fields_do_not_expose_full_transcripts_private_names_or_internal_provenance(self):
+        self.conn.execute("INSERT INTO user_profiles VALUES (42,1,'Crow','Crow',NULL,NULL)")
+        secret = "PRIVATE_CHANNEL_ALPHA raw transcript 123456789012345678 raw_ref_json conversations rowid should not leak"
+        self.conn.execute("INSERT INTO conversations VALUES (NULL,42,'Crow',1,'PRIVATE_CHANNEL_ALPHA','private_internal','user',?, 'now')", (f"Crow internal Orion through Crow note. {secret}",))
+        self.conn.commit()
+
+        summary = self._summary()
+        normal_text = json.dumps({k: v for k, v in summary.items() if k not in {"rawProvenance", "subjectIntelligenceDiagnostics"}})
+
+        self.assertNotIn("PRIVATE_CHANNEL_ALPHA", normal_text)
+        self.assertNotIn("123456789012345678", normal_text)
+        self.assertNotIn("raw_ref_json", normal_text)
+        self.assertNotIn("raw transcript", normal_text)
+        self.assertNotIn("conversations rowid", normal_text)
+        self.assertNotIn("source_table", normal_text)
+
+
 class FakeAuthor:
     def __init__(self, user_id=99):
         self.id = user_id
