@@ -8,6 +8,7 @@ canonical profiles, website dossiers, Source Files, queue links, or public outpu
 from __future__ import annotations
 
 import json
+import logging
 import re
 import sqlite3
 from collections import Counter
@@ -319,6 +320,7 @@ def upsert_entity_evidence_event(conn: sqlite3.Connection, **event: Any) -> str:
         columns_sql = ", ".join(insert_values.keys())
         placeholders = ", ".join(["?"] * len(insert_values))
         conn.execute(f"INSERT INTO {ENTITY_EVIDENCE_TABLE} ({columns_sql}) VALUES ({placeholders})", list(insert_values.values()))
+        _maybe_mark_source_refresh_dirty(conn, insert_values)
         return "created"
     current = dict(existing) if isinstance(existing, sqlite3.Row) else {desc[0]: existing[idx] for idx, desc in enumerate(conn.execute(f"SELECT * FROM {ENTITY_EVIDENCE_TABLE} LIMIT 0").description or [])}
     comparable = {k: v for k, v in values.items() if k != "updated_at"}
@@ -326,8 +328,69 @@ def upsert_entity_evidence_event(conn: sqlite3.Connection, **event: Any) -> str:
         return "unchanged"
     assignments = ", ".join(f"{k}=?" for k in values.keys())
     conn.execute(f"UPDATE {ENTITY_EVIDENCE_TABLE} SET {assignments} WHERE id=?", [*values.values(), current["id"]])
+    _maybe_mark_source_refresh_dirty(conn, values)
     return "updated"
 
+
+
+def _maybe_mark_source_refresh_dirty(conn: sqlite3.Connection, values: dict[str, Any]) -> None:
+    """Best-effort bridge from durable entity evidence to Source File freshness.
+
+    This deliberately uses only scoped evidence metadata and safe summaries; no raw
+    transcripts are logged or sent by the dirty marker. It writes through the
+    existing connection so evidence creation and dirty marking stay atomic.
+    """
+
+    try:
+        from bnl_source_file_refresh import (
+            QUEUE_TABLE,
+            classify_refresh_evidence,
+            ensure_source_file_refresh_schema,
+            source_refresh_subject_key,
+            utc_now,
+        )
+
+        subject = str(values.get("subject_name") or "").strip()
+        skey = source_refresh_subject_key(subject)
+        decision = classify_refresh_evidence(
+            subject_name=subject,
+            evidence_source="entity_evidence_events",
+            content=str(values.get("safe_summary") or values.get("topic") or ""),
+            channel_policy=str(values.get("channel_policy") or "unknown"),
+            source_scope="subject_keyed",
+            authority=str(values.get("authority") or "local_observed"),
+            visibility=str(values.get("visibility") or "review_only"),
+            evidence_type=str(values.get("evidence_kind") or "structured_evidence"),
+            relation_to_subject=str(values.get("relation_to_subject") or "subject_keyed"),
+        )
+        if not decision.get("meaningful"):
+            logging.info("source_refresh_skipped subject_key=%s reason=%s", skey, decision.get("reason"))
+            return
+        ensure_source_file_refresh_schema(conn)
+        now = utc_now()
+        existing = conn.execute(
+            f"SELECT * FROM {QUEUE_TABLE} WHERE (guild_id IS ? OR guild_id=?) AND subject_key=? AND status IN ('queued','deferred','cooldown','failed','running') ORDER BY id DESC LIMIT 1",
+            (values.get("guild_id"), values.get("guild_id"), skey),
+        ).fetchone()
+        reason = str(decision.get("reason") or "entity_evidence")[:260]
+        priority = int(decision.get("priority") or 80)
+        logging.info("source_refresh_mark_dirty subject_key=%s reason=%s", skey, reason)
+        if existing:
+            row_id = existing["id"] if isinstance(existing, sqlite3.Row) else existing[0]
+            evidence_count = int((existing["evidence_count"] if isinstance(existing, sqlite3.Row) else existing[6]) or 0) + 1
+            old_reason = (existing["reason"] if isinstance(existing, sqlite3.Row) else existing[4]) or ""
+            conn.execute(
+                f"UPDATE {QUEUE_TABLE} SET reason=?, evidence_source='entity_evidence_events', evidence_count=?, priority=max(priority, ?), status='queued', updated_at=?, refresh_mode='automatic', created_by='entity_evidence_events' WHERE id=?",
+                ((old_reason + '; ' + reason)[:260], evidence_count, priority, now, row_id),
+            )
+        else:
+            conn.execute(
+                f"INSERT INTO {QUEUE_TABLE} (guild_id, subject_key, subject_name, reason, evidence_source, evidence_count, priority, status, queued_at, updated_at, attempts, refresh_mode, created_by) VALUES (?, ?, ?, ?, 'entity_evidence_events', 1, ?, 'queued', ?, ?, 0, 'automatic', 'entity_evidence_events')",
+                (values.get("guild_id"), skey, subject[:90], reason, priority, now, now),
+            )
+        logging.info("source_refresh_queued subject_key=%s priority=%s", skey, priority)
+    except Exception as exc:
+        logging.debug("source_refresh_dirty_hook_failed source=entity_evidence_events error=%s", exc)
 
 def _fetch_rows(conn: sqlite3.Connection, table: str, guild_id: int | None, limit: int) -> list[sqlite3.Row]:
     cols = columns(conn, table)

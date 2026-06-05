@@ -92,6 +92,20 @@ from bnl_source_file_enrichment import (
     run_source_file_enrichment,
     source_enrichment_ingest_source,
 )
+from bnl_source_file_refresh import (
+    DEFAULT_MAX_AUTOMATIC_PER_CYCLE,
+    DEFAULT_PROCESS_INTERVAL_MINUTES,
+    build_refresh_diagnostics,
+    clear_source_file_refresh,
+    ensure_source_file_refresh_db,
+    format_source_refresh_process_response,
+    format_source_refresh_queue_response,
+    list_source_file_refresh_queue,
+    mark_subject_dirty_for_evidence,
+    parse_source_refresh_command,
+    process_single_source_file_refresh,
+    process_source_file_refresh_queue,
+)
 from collections import Counter, defaultdict, deque
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
@@ -3677,6 +3691,7 @@ def init_db():
     conn.commit()
     conn.close()
     ensure_community_presence_schema(DB_FILE)
+    ensure_source_file_refresh_db(DB_FILE)
     from bnl_entity_evidence import ensure_entity_evidence_schema
     evidence_conn = sqlite3.connect(DB_FILE)
     try:
@@ -4549,6 +4564,24 @@ def maybe_record_live_community_presence(message: discord.Message, clean_content
         operator_mention=operator_mention,
     )
     _last_community_presence_error_status = str(result.get("status") or "none")[:80]
+    if result.get("ok") and int(result.get("stored") or 0) > 0:
+        try:
+            mark_subject_dirty_for_evidence(
+                DB_FILE,
+                guild_id=getattr(message.guild, "id", 0),
+                subject_name=getattr(message.author, "display_name", "") or getattr(message.author, "name", ""),
+                evidence_source="community_presence",
+                content=clean_content,
+                channel_policy=channel_policy,
+                source_scope="subject_authored",
+                authority="local_observed",
+                visibility="public_safe",
+                evidence_type="community_presence",
+                relation_to_subject="authored",
+                created_by="community_presence",
+            )
+        except Exception as exc:
+            logging.debug("source_refresh_dirty_hook_failed source=community_presence error=%s", exc)
 
 
 async def maybe_handle_entity_activity_summary_command(message: discord.Message, clean_content: str) -> bool:
@@ -4908,6 +4941,75 @@ def _format_rd_entity_context_response(subject: str, context: dict) -> str:
     return "\n".join(lines)[:1900]
 
 
+
+async def maybe_handle_source_file_refresh_command(message: discord.Message, clean_content: str) -> bool:
+    """Handle operator Source File refresh queue/process commands."""
+
+    matched, options, parse_error = parse_source_refresh_command(clean_content)
+    if not matched:
+        return False
+
+    member = message.author if isinstance(message.author, discord.Member) else message.guild.get_member(message.author.id)
+    if not can_send_dossier_recommendation(message.author, member, message.guild):
+        logging.warning("source_refresh_skipped subject_key=unknown reason=permission_denied")
+        await message.reply("Source File refresh controls are operator-only.")
+        return True
+
+    channel = getattr(message, "channel", None)
+    policy = resolve_channel_policy(channel)
+    channel_name = getattr(channel, "name", "") or ""
+    if is_public_prompt_context(policy) and not is_operator_authority_context(policy, channel_name):
+        await message.reply("Source File refresh controls are restricted to approved internal/operator channels.")
+        return True
+
+    if not options:
+        await message.reply(f"Source refresh failed: {parse_error}")
+        return True
+
+    guild_id = getattr(message.guild, "id", None)
+    action = str(options.get("action") or "")
+    dry_run = bool(options.get("dry_run"))
+    if action == "queue":
+        rows = await asyncio.to_thread(list_source_file_refresh_queue, DB_FILE, guild_id=guild_id, limit=20)
+        await reply_with_discord_safe_chunks(message, format_source_refresh_queue_response(rows))
+        return True
+    if action == "process":
+        summary = await asyncio.to_thread(
+            process_source_file_refresh_queue,
+            DB_FILE,
+            guild_id=guild_id,
+            dry_run=dry_run,
+            max_items=DEFAULT_MAX_AUTOMATIC_PER_CYCLE,
+            lookup_func=lookup_source_file,
+            sender=send_dossier_recommendation,
+            environ=os.environ,
+            refresh_mode="operator_requested",
+        )
+        await reply_with_discord_safe_chunks(message, format_source_refresh_process_response(summary))
+        return True
+    subject = str(options.get("subject") or "").strip()
+    if action == "clear":
+        cleared = await asyncio.to_thread(clear_source_file_refresh, DB_FILE, guild_id=guild_id, subject_name=subject)
+        await message.reply(f"Source refresh queue cleared for {subject}: {cleared} active row(s) marked skipped.")
+        return True
+    if action == "subject":
+        summary = await asyncio.to_thread(
+            process_single_source_file_refresh,
+            DB_FILE,
+            guild_id=guild_id,
+            subject_name=subject,
+            dry_run=dry_run,
+            lookup_func=lookup_source_file,
+            sender=send_dossier_recommendation,
+            environ=os.environ,
+        )
+        diagnostics = await asyncio.to_thread(build_refresh_diagnostics, DB_FILE, guild_id=guild_id, subject_name=subject, mode=("dry_run" if dry_run else "operator_requested"))
+        response = format_source_refresh_process_response(summary) + "\n" + "\n".join(diagnostics)
+        await reply_with_discord_safe_chunks(message, response[:1900])
+        return True
+    await message.reply(f"Source refresh failed: {parse_error or 'unknown action'}")
+    return True
+
 async def maybe_handle_source_file_enrichment_command(message: discord.Message, clean_content: str) -> bool:
     """Handle operator-triggered Source File enrichment commands."""
 
@@ -4986,6 +5088,10 @@ async def maybe_handle_source_file_enrichment_command(message: discord.Message, 
         _classification_last_dossier_use = str(classification.get("dossierUse") or "not_ready")[:80]
         _classification_last_confidence = str(classification.get("sourceConfidence") or "low")[:80]
         _classification_last_missing_info_count = int(len(classification.get("missingInfo") or []))
+    try:
+        result["refreshDiagnostics"] = build_refresh_diagnostics(DB_FILE, guild_id=getattr(message.guild, "id", None), subject_name=str(result.get("subject") or subject), mode=("manual_dry_run" if dry_run else "manual_enrich"))
+    except Exception as exc:
+        logging.debug("source_refresh_diagnostics_failed error=%s", exc)
     _source_enrichment_last_error_status = "none" if result.get("ok") else _source_enrichment_last_status
     if dry_run:
         _last_dossier_recommendation_status = "source_enrichment_dry_run"
@@ -8124,6 +8230,23 @@ def save_user_message(user_id: int, user_name: str, guild_id: int, content: str,
         )
     conn.commit()
     conn.close()
+    try:
+        mark_subject_dirty_for_evidence(
+            DB_FILE,
+            guild_id=guild_id,
+            subject_name=user_name,
+            evidence_source="conversations",
+            content=content,
+            channel_policy=channel_policy,
+            source_scope="subject_authored",
+            authority="local_observed",
+            visibility="public_safe" if channel_policy in {"public_home", "public_context", "public_selective", "broadcast_memory"} else "review_only",
+            evidence_type="subject_authored_message",
+            relation_to_subject="authored",
+            created_by="save_user_message",
+        )
+    except Exception as exc:
+        logging.debug("source_refresh_dirty_hook_failed source=conversations error=%s", exc)
     prune_conversation_history(user_id, guild_id, MAX_CONVERSATION_ROWS_PER_USER)
     if decision.update_relationship:
         update_relationship_state(user_id, guild_id, content, delta_affinity=0.06)
@@ -11704,6 +11827,34 @@ client = discord.Client(intents=intents)
 tree = app_commands.CommandTree(client)
 _ambient_post_locks = {}
 
+
+
+@tasks.loop(minutes=DEFAULT_PROCESS_INTERVAL_MINUTES)
+async def source_file_refresh_worker_task():
+    """Process a small number of queued Source File refreshes without blocking chat."""
+
+    try:
+        logging.info("source_refresh_worker_started")
+        summary = await asyncio.to_thread(
+            process_source_file_refresh_queue,
+            DB_FILE,
+            guild_id=None,
+            dry_run=False,
+            max_items=DEFAULT_MAX_AUTOMATIC_PER_CYCLE,
+            lookup_func=lookup_source_file,
+            sender=send_dossier_recommendation,
+            environ=os.environ,
+            refresh_mode="automatic",
+        )
+        logging.info(
+            "source_refresh_worker_cycle processed=%s skipped=%s failed=%s",
+            int(summary.get("processed") or 0),
+            int(summary.get("skipped") or 0),
+            int(summary.get("failed") or 0),
+        )
+    except Exception as exc:
+        logging.warning("source_refresh_worker_cycle processed=0 skipped=0 failed=1 error=%s", exc)
+
 # ==================== AMBIENT MESSAGE TASK ====================
 
 @tasks.loop(minutes=5)
@@ -13890,6 +14041,9 @@ async def on_ready():
     if BNL_WEBSITE_RELAY_ENABLED and not website_relay_task.is_running():
         website_relay_task.start()
 
+    if not source_file_refresh_worker_task.is_running():
+        source_file_refresh_worker_task.start()
+
     logging.info(f"🎯 BNL-01 online as {client.user.name} ({client.user.id})")
     logging.info(f"📡 Monitoring {len(client.guilds)} server(s)")
     log_admin_controls_connection_check()
@@ -14795,6 +14949,9 @@ async def on_message(message: discord.Message):
         return
 
     if await maybe_handle_backfill_command(message, clean_content):
+        return
+
+    if await maybe_handle_source_file_refresh_command(message, clean_content):
         return
 
     if await maybe_handle_source_file_enrichment_command(message, clean_content):
