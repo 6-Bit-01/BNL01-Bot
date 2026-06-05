@@ -94,6 +94,7 @@ from bnl_source_file_enrichment import (
 )
 from bnl_source_file_refresh import (
     DEFAULT_MAX_AUTOMATIC_PER_CYCLE,
+    DEFAULT_MAX_SITE_REQUESTS_PER_CYCLE,
     DEFAULT_PROCESS_INTERVAL_MINUTES,
     build_refresh_diagnostics,
     clear_source_file_refresh,
@@ -104,6 +105,7 @@ from bnl_source_file_refresh import (
     mark_subject_dirty_for_evidence,
     parse_source_refresh_command,
     process_single_source_file_refresh,
+    process_site_refresh_requests,
     process_source_file_refresh_queue,
 )
 from collections import Counter, defaultdict, deque
@@ -4984,6 +4986,19 @@ async def maybe_handle_source_file_refresh_command(message: discord.Message, cle
             sender=send_dossier_recommendation,
             environ=os.environ,
             refresh_mode="operator_requested",
+        )
+        await reply_with_discord_safe_chunks(message, format_source_refresh_process_response(summary))
+        return True
+    if action == "site":
+        summary = await asyncio.to_thread(
+            process_site_refresh_requests,
+            DB_FILE,
+            guild_id=guild_id,
+            dry_run=dry_run,
+            max_requests=DEFAULT_MAX_SITE_REQUESTS_PER_CYCLE,
+            lookup_func=lookup_source_file,
+            sender=send_dossier_recommendation,
+            environ=os.environ,
         )
         await reply_with_discord_safe_chunks(message, format_source_refresh_process_response(summary))
         return True
@@ -11846,11 +11861,24 @@ async def source_file_refresh_worker_task():
             environ=os.environ,
             refresh_mode="automatic",
         )
+        site_summary = await asyncio.to_thread(
+            process_site_refresh_requests,
+            DB_FILE,
+            guild_id=None,
+            dry_run=False,
+            max_requests=DEFAULT_MAX_SITE_REQUESTS_PER_CYCLE,
+            lookup_func=lookup_source_file,
+            sender=send_dossier_recommendation,
+            environ=os.environ,
+        )
         logging.info(
-            "source_refresh_worker_cycle processed=%s skipped=%s failed=%s",
+            "source_refresh_worker_cycle processed=%s skipped=%s failed=%s site_processed=%s site_skipped=%s site_failed=%s",
             int(summary.get("processed") or 0),
             int(summary.get("skipped") or 0),
             int(summary.get("failed") or 0),
+            int(site_summary.get("processed") or 0),
+            int(site_summary.get("skipped") or 0),
+            int(site_summary.get("failed") or 0),
         )
     except Exception as exc:
         logging.warning("source_refresh_worker_cycle processed=0 skipped=0 failed=1 error=%s", exc)

@@ -14,7 +14,11 @@ import json
 import logging
 import os
 import re
+import socket
 import sqlite3
+import urllib.error
+import urllib.parse
+import urllib.request
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
 
@@ -27,10 +31,13 @@ STATE_TABLE = "source_file_refresh_state"
 ACTIVE_QUEUE_STATUSES = {"queued", "deferred", "cooldown", "running", "failed"}
 TERMINAL_QUEUE_STATUSES = {"succeeded", "skipped"}
 VALID_STATUSES = ACTIVE_QUEUE_STATUSES | TERMINAL_QUEUE_STATUSES
-VALID_REFRESH_MODES = {"automatic", "manual", "dry_run", "operator_requested"}
+VALID_REFRESH_MODES = {"automatic", "manual", "dry_run", "operator_requested", "site_open_request", "site_manual_request"}
 DEFAULT_COOLDOWN_MINUTES = 30
 DEFAULT_PROCESS_INTERVAL_MINUTES = 15
 DEFAULT_MAX_AUTOMATIC_PER_CYCLE = 3
+DEFAULT_MAX_SITE_REQUESTS_PER_CYCLE = 3
+SITE_REFRESH_REQUEST_TIMEOUT_SECONDS = 8
+SITE_REFRESH_REQUEST_PATH = "/api/bnl/source-files/refresh-requests"
 MEANINGFUL_MIN_TEXT_LENGTH = 16
 
 _URL_RE = re.compile(r"https?://\S+|\b(?:soundcloud|spotify|bandcamp|youtube|youtu\.be|instagram|tiktok|linktree|discord\.gg)/", re.I)
@@ -278,6 +285,131 @@ def clear_source_file_refresh(db_path: str, *, guild_id: int | None, subject_nam
         conn.close()
 
 
+
+def _configured_site_refresh_requests_url(environ: dict[str, str] | None = None) -> str:
+    """Return the configured site refresh-request endpoint, or an empty string.
+
+    Polling is intentionally opt-in: unlike read-only lookup, the worker does
+    not fall back to the production website unless a site endpoint/base URL is
+    configured in the environment.
+    """
+
+    env = environ if environ is not None else os.environ
+    explicit = (env.get("BNL_SOURCE_FILE_REFRESH_REQUESTS_URL") or "").strip()
+    if explicit:
+        return explicit
+    base = (env.get("BNL_WEBSITE_BASE_URL") or env.get("BNL_SITE_BASE_URL") or "").strip()
+    if base:
+        return urllib.parse.urljoin(base.rstrip("/") + "/", SITE_REFRESH_REQUEST_PATH.lstrip("/"))
+    read_url = (env.get("BNL_SOURCE_FILE_READ_URL") or "").strip()
+    if read_url:
+        parsed = urllib.parse.urlparse(read_url)
+        root = urllib.parse.urlunparse((parsed.scheme, parsed.netloc, "", "", "", ""))
+        return urllib.parse.urljoin(root.rstrip("/") + "/", SITE_REFRESH_REQUEST_PATH.lstrip("/"))
+    return ""
+
+
+def _site_refresh_request_id(request: dict[str, Any]) -> str:
+    return _safe_text(request.get("id") or request.get("requestId") or request.get("request_id") or "", 120)
+
+
+def _site_refresh_subject_name(request: dict[str, Any]) -> str:
+    return _safe_text(request.get("subjectName") or request.get("subject_name") or request.get("subject") or request.get("normalizedSubjectKey") or request.get("subjectKey") or "", 90)
+
+
+def _site_refresh_subject_key(request: dict[str, Any]) -> str:
+    key = _safe_text(request.get("normalizedSubjectKey") or request.get("subjectKey") or request.get("subject_key") or "", 120)
+    return source_refresh_subject_key(key or _site_refresh_subject_name(request))
+
+
+def _site_refresh_mode(request: dict[str, Any]) -> str:
+    raw = str(request.get("refreshMode") or request.get("refresh_mode") or request.get("requestType") or request.get("type") or "").lower()
+    high_priority = bool(request.get("highPriority") or request.get("manual") or request.get("force"))
+    return "site_manual_request" if high_priority or "manual" in raw or "button" in raw else "site_open_request"
+
+
+def fetch_site_refresh_requests(*, environ: dict[str, str] | None = None, opener=None, limit: int = DEFAULT_MAX_SITE_REQUESTS_PER_CYCLE) -> dict[str, Any]:
+    """Fetch pending Source File refresh requests from the website."""
+
+    env = environ if environ is not None else os.environ
+    url = _configured_site_refresh_requests_url(env)
+    token = (env.get("BNL_SOURCE_FILE_READ_TOKEN") or "").strip()
+    if not url or not token:
+        reason = "not_configured" if not url else "missing_read_token"
+        logging.info("source_refresh_site_poll_skipped reason=%s", reason)
+        return {"ok": False, "configured": False, "reason": reason, "requests": []}
+    logging.info("source_refresh_site_poll_started")
+    separator = "&" if urllib.parse.urlparse(url).query else "?"
+    poll_url = f"{url}{separator}{urllib.parse.urlencode({'status': 'pending', 'limit': max(1, int(limit or DEFAULT_MAX_SITE_REQUESTS_PER_CYCLE))})}"
+    request = urllib.request.Request(
+        poll_url,
+        headers={"Accept": "application/json", "x-bnl-source-file-read-token": token},
+        method="GET",
+    )
+    urlopen = opener.open if opener is not None else urllib.request.urlopen
+    try:
+        with urlopen(request, timeout=SITE_REFRESH_REQUEST_TIMEOUT_SECONDS) as response:
+            status = getattr(response, "status", None) or response.getcode()
+            raw = response.read().decode("utf-8")
+    except (urllib.error.URLError, TimeoutError, socket.timeout) as exc:
+        logging.warning("source_refresh_site_poll_skipped reason=network_or_timeout")
+        return {"ok": False, "configured": True, "reason": "network_or_timeout", "error": _safe_text(exc, 160), "requests": []}
+    except Exception as exc:
+        logging.warning("source_refresh_site_poll_skipped reason=unexpected_error")
+        return {"ok": False, "configured": True, "reason": "unexpected_error", "error": _safe_text(exc, 160), "requests": []}
+    try:
+        parsed = json.loads(raw) if raw.strip() else {}
+    except json.JSONDecodeError:
+        logging.warning("source_refresh_site_poll_skipped reason=invalid_json")
+        return {"ok": False, "configured": True, "reason": "invalid_json", "status": status, "requests": []}
+    requests = parsed.get("requests") if isinstance(parsed, dict) else parsed
+    if not isinstance(requests, list):
+        requests = []
+    pending = [r for r in requests if isinstance(r, dict) and str(r.get("status") or "pending").lower() in {"pending", "queued"}]
+    limited = pending[: max(1, int(limit or DEFAULT_MAX_SITE_REQUESTS_PER_CYCLE))]
+    logging.info("source_refresh_site_poll_received count=%s", len(limited))
+    return {"ok": True, "configured": True, "status": status, "requests": limited}
+
+
+def update_site_refresh_request_status(request_id: str, status: str, *, environ: dict[str, str] | None = None, opener=None, completed_by_recommendation_id: str | None = None, failure_reason: str | None = None) -> dict[str, Any]:
+    """POST a safe status update for a site-side refresh request."""
+
+    env = environ if environ is not None else os.environ
+    url = _configured_site_refresh_requests_url(env)
+    token = (env.get("BNL_SOURCE_FILE_READ_TOKEN") or "").strip()
+    rid = _safe_text(request_id, 120)
+    safe_status = _safe_text(status, 40)
+    if not url or not token or not rid:
+        logging.info("source_refresh_site_poll_skipped reason=not_configured")
+        return {"ok": False, "reason": "not_configured"}
+    payload: dict[str, Any] = {"id": rid, "requestId": rid, "status": safe_status}
+    if completed_by_recommendation_id:
+        payload["completedByRecommendationId"] = _safe_text(completed_by_recommendation_id, 120)
+    if failure_reason:
+        payload["failureReason"] = _safe_text(failure_reason, 240)
+    body = json.dumps(payload).encode("utf-8")
+    request = urllib.request.Request(
+        url,
+        data=body,
+        headers={"Accept": "application/json", "Content-Type": "application/json", "x-bnl-source-file-read-token": token},
+        method="POST",
+    )
+    urlopen = opener.open if opener is not None else urllib.request.urlopen
+    try:
+        with urlopen(request, timeout=SITE_REFRESH_REQUEST_TIMEOUT_SECONDS) as response:
+            http_status = getattr(response, "status", None) or response.getcode()
+            raw = response.read().decode("utf-8")
+    except (urllib.error.URLError, TimeoutError, socket.timeout) as exc:
+        return {"ok": False, "reason": "network_or_timeout", "error": _safe_text(exc, 160)}
+    except Exception as exc:
+        return {"ok": False, "reason": "unexpected_error", "error": _safe_text(exc, 160)}
+    try:
+        parsed = json.loads(raw) if raw.strip() else {}
+    except json.JSONDecodeError:
+        parsed = {}
+    ok = 200 <= int(http_status or 0) < 300 and (not isinstance(parsed, dict) or parsed.get("ok", True) is not False)
+    return {"ok": ok, "status": http_status, "response": parsed}
+
 def _evidence_hash_for_result(result: dict[str, Any]) -> str:
     material = json.dumps({"sourceCounts": result.get("sourceCounts"), "sourceTypes": result.get("sourceTypes"), "qualityScore": result.get("qualityScore"), "subject": result.get("subject")}, sort_keys=True, default=str)
     return hashlib.sha256(material.encode("utf-8")).hexdigest()[:16]
@@ -302,7 +434,7 @@ def _state_upsert(conn: sqlite3.Connection, *, guild_id: int | None, subject_key
         conn.execute(f"INSERT INTO {STATE_TABLE} ({cols}) VALUES ({placeholders})", list(base.values()))
 
 
-def process_source_file_refresh_queue(db_path: str, *, guild_id: int | None = None, dry_run: bool = False, max_items: int = DEFAULT_MAX_AUTOMATIC_PER_CYCLE, cooldown_minutes: int = DEFAULT_COOLDOWN_MINUTES, lookup_func: Callable[[dict[str, str]], dict[str, Any]] = lookup_source_file, sender: Callable[[dict[str, Any]], dict[str, Any]] = send_dossier_recommendation, environ: dict[str, str] | None = None, force: bool = False, bypass_cooldown: bool = False, refresh_mode: str = "automatic") -> dict[str, Any]:
+def process_source_file_refresh_queue(db_path: str, *, guild_id: int | None = None, dry_run: bool = False, max_items: int = DEFAULT_MAX_AUTOMATIC_PER_CYCLE, cooldown_minutes: int = DEFAULT_COOLDOWN_MINUTES, lookup_func: Callable[[dict[str, str]], dict[str, Any]] = lookup_source_file, sender: Callable[[dict[str, Any]], dict[str, Any]] = send_dossier_recommendation, environ: dict[str, str] | None = None, force: bool = False, bypass_cooldown: bool = False, refresh_mode: str = "automatic", subject_key: str | None = None) -> dict[str, Any]:
     now_dt = datetime.now(timezone.utc).replace(microsecond=0)
     now = now_dt.isoformat()
     env = environ if environ is not None else os.environ
@@ -317,6 +449,9 @@ def process_source_file_refresh_queue(db_path: str, *, guild_id: int | None = No
         if guild_id is not None:
             where += " AND guild_id=?"
             params.append(guild_id)
+        if subject_key:
+            where += " AND subject_key=?"
+            params.append(source_refresh_subject_key(subject_key))
         rows = conn.execute(f"SELECT * FROM {QUEUE_TABLE} WHERE {where} ORDER BY priority DESC, queued_at ASC LIMIT ?", [*params, max(1, int(max_items or 1))]).fetchall()
         if not rows:
             return summary
@@ -329,18 +464,18 @@ def process_source_file_refresh_queue(db_path: str, *, guild_id: int | None = No
             conn.commit()
             return summary
         for row in rows:
+            if dry_run:
+                summary["processed"] += 1
+                summary["items"].append({"subject": row["subject_name"], "status": "dry_run", "reason": row["reason"], "evidenceCount": row["evidence_count"], "wouldSend": True})
+                continue
             state = conn.execute(f"SELECT * FROM {STATE_TABLE} WHERE (guild_id IS ? OR guild_id=?) AND subject_key=? LIMIT 1", (row["guild_id"], row["guild_id"], row["subject_key"])).fetchone()
             cooldown_until = parse_iso(state["cooldown_until"] if state else None)
-            if cooldown_until and cooldown_until > now_dt and not (bypass_cooldown or row["refresh_mode"] in {"manual", "operator_requested"}):
+            if cooldown_until and cooldown_until > now_dt and not (bypass_cooldown or row["refresh_mode"] in {"manual", "operator_requested", "site_manual_request"}):
                 conn.execute(f"UPDATE {QUEUE_TABLE} SET status='cooldown', updated_at=?, not_before_at=?, last_error='cooldown' WHERE id=?", (now, cooldown_until.isoformat(), row["id"]))
                 conn.commit()
                 logging.info("source_refresh_deferred subject_key=%s reason=cooldown", row["subject_key"])
                 summary["skipped"] += 1
                 summary["items"].append({"subject": row["subject_name"], "status": "cooldown", "reason": "cooldown", "cooldownUntil": cooldown_until.isoformat()})
-                continue
-            if dry_run:
-                summary["processed"] += 1
-                summary["items"].append({"subject": row["subject_name"], "status": "dry_run", "reason": row["reason"], "evidenceCount": row["evidence_count"], "wouldSend": True})
                 continue
             conn.execute(f"UPDATE {QUEUE_TABLE} SET status='running', updated_at=?, last_attempt_at=?, attempts=attempts+1, last_error=NULL WHERE id=?", (now, now, row["id"]))
             _state_upsert(conn, guild_id=row["guild_id"], subject_key=row["subject_key"], subject_name=row["subject_name"], fields={"last_refresh_started_at": now, "last_refresh_status": "running"})
@@ -392,9 +527,106 @@ def process_source_file_refresh_queue(db_path: str, *, guild_id: int | None = No
 
 
 def process_single_source_file_refresh(db_path: str, *, guild_id: int | None, subject_name: str, dry_run: bool = False, lookup_func: Callable[[dict[str, str]], dict[str, Any]] = lookup_source_file, sender: Callable[[dict[str, Any]], dict[str, Any]] = send_dossier_recommendation, environ: dict[str, str] | None = None) -> dict[str, Any]:
-    enqueue_source_file_refresh(db_path, guild_id=guild_id, subject_name=subject_name, reason="operator_requested_refresh", evidence_source="operator_command", priority=100, refresh_mode="dry_run" if dry_run else "operator_requested", created_by="operator", evidence_count=1)
-    return process_source_file_refresh_queue(db_path, guild_id=guild_id, dry_run=dry_run, max_items=1, lookup_func=lookup_func, sender=sender, environ=environ, bypass_cooldown=not dry_run, refresh_mode="operator_requested")
+    subject = _safe_text(subject_name, 90)
+    skey = source_refresh_subject_key(subject)
+    if dry_run:
+        return {"ok": True, "dryRun": True, "processed": 1, "skipped": 0, "failed": 0, "items": [{"subject": subject, "status": "dry_run", "reason": "operator_requested_refresh", "evidenceCount": 1, "wouldSend": True}]}
+    enqueue_source_file_refresh(db_path, guild_id=guild_id, subject_name=subject, reason="operator_requested_refresh", evidence_source="operator_command", priority=100, refresh_mode="operator_requested", created_by="operator", evidence_count=1)
+    return process_source_file_refresh_queue(db_path, guild_id=guild_id, dry_run=False, max_items=1, lookup_func=lookup_func, sender=sender, environ=environ, bypass_cooldown=True, refresh_mode="operator_requested", subject_key=skey)
 
+
+
+def process_site_refresh_requests(db_path: str, *, guild_id: int | None = None, dry_run: bool = False, max_requests: int = DEFAULT_MAX_SITE_REQUESTS_PER_CYCLE, lookup_func: Callable[[dict[str, str]], dict[str, Any]] = lookup_source_file, sender: Callable[[dict[str, Any]], dict[str, Any]] = send_dossier_recommendation, environ: dict[str, str] | None = None, opener=None) -> dict[str, Any]:
+    """Poll, claim, and process pending website Source File refresh requests."""
+
+    env = environ if environ is not None else os.environ
+    fetched = fetch_site_refresh_requests(environ=env, opener=opener, limit=max_requests)
+    summary: dict[str, Any] = {"ok": bool(fetched.get("ok")), "dryRun": dry_run, "processed": 0, "skipped": 0, "failed": 0, "items": [], "sitePoll": fetched}
+    requests = list(fetched.get("requests") or [])
+    if not requests:
+        return summary
+    for site_request in requests[: max(1, int(max_requests or DEFAULT_MAX_SITE_REQUESTS_PER_CYCLE))]:
+        request_id = _site_refresh_request_id(site_request)
+        subject = _site_refresh_subject_name(site_request)
+        skey = _site_refresh_subject_key(site_request)
+        mode = _site_refresh_mode(site_request)
+        if dry_run:
+            summary["processed"] += 1
+            summary["items"].append({"subject": subject or skey, "subjectKey": skey, "requestId": request_id, "status": "dry_run", "wouldClaim": True, "wouldEnqueue": True, "wouldSend": True})
+            continue
+        if not request_id:
+            summary["failed"] += 1
+            summary["items"].append({"subject": subject or skey, "subjectKey": skey, "status": "failed", "error": "missing_request_id"})
+            continue
+        claim = update_site_refresh_request_status(request_id, "claimed", environ=env, opener=opener)
+        if not claim.get("ok"):
+            reason = _safe_text(claim.get("reason") or claim.get("error") or "claim_failed", 160)
+            logging.warning("source_refresh_site_request_failed request_id=%s reason=%s", request_id, reason)
+            summary["failed"] += 1
+            summary["items"].append({"subject": subject or skey, "subjectKey": skey, "requestId": request_id, "status": "failed", "error": reason})
+            continue
+        logging.info("source_refresh_site_request_claimed request_id=%s", request_id)
+        lookup_key = "normalizedName" if (site_request.get("normalizedSubjectKey") or site_request.get("subjectKey")) and not site_request.get("subjectName") else "subject"
+        lookup_value = str(site_request.get("normalizedSubjectKey") or site_request.get("subjectKey") or subject or skey)
+        try:
+            target_check = lookup_func({"lookupKey": lookup_key, "lookupValue": lookup_value, lookup_key: lookup_value})
+            found = bool(target_check.get("found") or target_check.get("sourceFile") or target_check.get("source_file") or target_check.get("candidate") or target_check.get("dossier"))
+            if target_check.get("ok") is False or not found:
+                reason = "no_matching_source_file_target" if target_check.get("ok") is not False else "lookup_failed"
+                update_site_refresh_request_status(request_id, "failed", environ=env, opener=opener, failure_reason=reason)
+                logging.warning("source_refresh_site_request_failed request_id=%s reason=%s", request_id, reason)
+                summary["failed"] += 1
+                summary["items"].append({"subject": subject or lookup_value, "subjectKey": skey, "requestId": request_id, "status": "failed", "error": reason})
+                continue
+        except Exception as exc:
+            reason = _safe_text(exc, 160) or "lookup_failed"
+            update_site_refresh_request_status(request_id, "failed", environ=env, opener=opener, failure_reason=reason)
+            logging.warning("source_refresh_site_request_failed request_id=%s reason=%s", request_id, reason)
+            summary["failed"] += 1
+            summary["items"].append({"subject": subject or skey, "subjectKey": skey, "requestId": request_id, "status": "failed", "error": reason})
+            continue
+        enqueue_source_file_refresh(
+            db_path,
+            guild_id=guild_id,
+            subject_name=subject or lookup_value,
+            reason=f"site_refresh_request:{request_id}",
+            evidence_source="site_refresh_request",
+            priority=95 if mode == "site_manual_request" else 70,
+            refresh_mode=mode,
+            created_by="site_refresh_request",
+            evidence_count=1,
+        )
+        local = process_source_file_refresh_queue(
+            db_path,
+            guild_id=guild_id,
+            dry_run=False,
+            max_items=1,
+            lookup_func=lookup_func,
+            sender=sender,
+            environ=env,
+            bypass_cooldown=(mode == "site_manual_request"),
+            refresh_mode=mode,
+            subject_key=skey,
+        )
+        item = (local.get("items") or [{}])[0]
+        status = item.get("status")
+        if status == "succeeded":
+            rec_id = _safe_text(item.get("recommendationId") or "", 120)
+            update_site_refresh_request_status(request_id, "completed", environ=env, opener=opener, completed_by_recommendation_id=rec_id)
+            logging.info("source_refresh_site_request_completed request_id=%s recommendation_id=%s", request_id, rec_id or "none")
+            summary["processed"] += 1
+            summary["items"].append({"subject": subject or item.get("subject") or skey, "subjectKey": skey, "requestId": request_id, "status": "succeeded", "recommendationId": rec_id})
+        elif status == "cooldown":
+            logging.info("source_refresh_site_request_failed request_id=%s reason=cooldown_deferred", request_id)
+            summary["skipped"] += 1
+            summary["items"].append({"subject": subject or item.get("subject") or skey, "subjectKey": skey, "requestId": request_id, "status": "deferred", "reason": "cooldown"})
+        else:
+            reason = _safe_text(item.get("error") or item.get("reason") or "send_failed", 240)
+            update_site_refresh_request_status(request_id, "failed", environ=env, opener=opener, failure_reason=reason)
+            logging.warning("source_refresh_site_request_failed request_id=%s reason=%s", request_id, reason)
+            summary["failed"] += 1
+            summary["items"].append({"subject": subject or item.get("subject") or skey, "subjectKey": skey, "requestId": request_id, "status": "failed", "error": reason})
+    return summary
 
 def format_source_refresh_queue_response(rows: list[dict[str, Any]]) -> str:
     if not rows:
@@ -421,7 +653,7 @@ def parse_source_refresh_command(content: str) -> tuple[bool, dict[str, Any] | N
         return False, None, "not_a_source_refresh_command"
     body = (match.group(1) or "").strip()
     if not body:
-        return True, None, "Use: `!bnl source refresh queue|process|clear <subject>|<subject> [| dry_run=true]`."
+        return True, None, "Use: `!bnl source refresh queue|process|site|clear <subject>|<subject> [| dry_run=true]`."
     parts = [p.strip() for p in body.split("|")]
     head = re.sub(r"\s+", " ", parts[0]).strip()
     opts = {"dry_run": False}
@@ -440,6 +672,8 @@ def parse_source_refresh_command(content: str) -> tuple[bool, dict[str, Any] | N
         return True, {"action": "queue", **opts}, ""
     if low == "process":
         return True, {"action": "process", **opts}, ""
+    if low == "site":
+        return True, {"action": "site", **opts}, ""
     if low.startswith("clear "):
         subject = head[6:].strip()
         if not subject:
