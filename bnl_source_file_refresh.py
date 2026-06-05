@@ -25,6 +25,7 @@ from typing import Any, Callable
 from bnl_dossier_recommendations import is_dossier_ingest_token_configured, send_dossier_recommendation
 from bnl_source_file_enrichment import run_source_file_enrichment
 from bnl_source_file_lookup import lookup_source_file
+from bnl_source_refresh_context import is_refresh_generation_subject, refresh_generation_context
 
 QUEUE_TABLE = "source_file_refresh_queue"
 STATE_TABLE = "source_file_refresh_state"
@@ -69,7 +70,9 @@ def parse_iso(value: Any) -> datetime | None:
 
 
 def source_refresh_subject_key(value: str) -> str:
-    return re.sub(r"[^a-z0-9]+", "-", (value or "").strip().lower()).strip("-") or "unknown-subject"
+    from bnl_source_refresh_context import source_refresh_subject_key as _context_subject_key
+
+    return _context_subject_key(value)
 
 
 def _safe_text(value: Any, limit: int = 180) -> str:
@@ -189,6 +192,9 @@ def mark_subject_dirty_for_evidence(db_path: str, *, guild_id: int | None, subje
         relation_to_subject=relation_to_subject,
     )
     skey = source_refresh_subject_key(subject_name)
+    if is_refresh_generation_subject(skey):
+        logging.info("source_refresh_skipped subject_key=%s reason=refresh_self_generated_evidence", skey)
+        return {"ok": False, "queued": False, "status": "skipped", "reason": "refresh_self_generated_evidence", "subject_key": skey}
     if not decision.get("meaningful"):
         logging.info("source_refresh_skipped subject_key=%s reason=%s", skey, decision.get("reason"))
         return {"ok": False, "queued": False, "status": "skipped", "reason": decision.get("reason"), "subject_key": skey}
@@ -482,18 +488,26 @@ def process_source_file_refresh_queue(db_path: str, *, guild_id: int | None = No
             conn.commit()
             logging.info("source_refresh_started subject_key=%s mode=%s", row["subject_key"], mode)
             try:
-                result = run_source_file_enrichment(
-                    db_path,
-                    row["guild_id"],
-                    row["subject_name"],
-                    dry_run=False,
-                    lookup_func=lookup_func,
-                    sender=sender,
-                    environ=env,
-                    force=force,
-                    diagnostics=False,
-                )
-                if result.get("sent"):
+                with refresh_generation_context(row["subject_key"]):
+                    result = run_source_file_enrichment(
+                        db_path,
+                        row["guild_id"],
+                        row["subject_name"],
+                        dry_run=False,
+                        lookup_func=lookup_func,
+                        sender=sender,
+                        environ=env,
+                        force=force,
+                        diagnostics=False,
+                    )
+                if result.get("status") == "no_target":
+                    conn.execute(f"UPDATE {QUEUE_TABLE} SET status='skipped', updated_at=?, last_error='no_target' WHERE id=?", (utc_now(), row["id"]))
+                    _state_upsert(conn, guild_id=row["guild_id"], subject_key=row["subject_key"], subject_name=row["subject_name"], fields={"last_refresh_completed_at": utc_now(), "last_refresh_status": "no_target", "last_failure_at": utc_now(), "last_error": "no_target"})
+                    conn.commit()
+                    logging.info("source_refresh_skipped subject_key=%s reason=no_target", row["subject_key"])
+                    summary["skipped"] += 1
+                    summary["items"].append({"subject": row["subject_name"], "status": "skipped", "reason": "no_target", "error": "no_target"})
+                elif result.get("sent"):
                     send_result = result.get("sendResult") or {}
                     recommendation_id = str(send_result.get("recommendationId") or send_result.get("recommendation_id") or send_result.get("id") or "")[:120]
                     cooldown_until_text = _cooldown_until_from(now_dt, cooldown_minutes)
@@ -572,7 +586,16 @@ def process_site_refresh_requests(db_path: str, *, guild_id: int | None = None, 
             target_check = lookup_func({"lookupKey": lookup_key, "lookupValue": lookup_value, lookup_key: lookup_value})
             found = bool(target_check.get("found") or target_check.get("sourceFile") or target_check.get("source_file") or target_check.get("candidate") or target_check.get("dossier"))
             if target_check.get("ok") is False or not found:
-                reason = "no_matching_source_file_target" if target_check.get("ok") is not False else "lookup_failed"
+                reason = "no_target" if target_check.get("ok") is not False else "lookup_failed"
+                if reason == "no_target":
+                    conn = sqlite3.connect(db_path)
+                    try:
+                        ensure_source_file_refresh_schema(conn)
+                        _state_upsert(conn, guild_id=guild_id, subject_key=skey, subject_name=subject or lookup_value, fields={"last_refresh_completed_at": utc_now(), "last_refresh_status": "no_target", "last_failure_at": utc_now(), "last_error": "no_target"})
+                        conn.commit()
+                    finally:
+                        conn.close()
+                    logging.info("source_refresh_skipped subject_key=%s reason=no_target", skey)
                 update_site_refresh_request_status(request_id, "failed", environ=env, opener=opener, failure_reason=reason)
                 logging.warning("source_refresh_site_request_failed request_id=%s reason=%s", request_id, reason)
                 summary["failed"] += 1
