@@ -21,6 +21,7 @@ from bnl_entity_activity_summary import build_entity_activity_summary, refresh_e
 from bnl_entity_evidence import _website_safe_payload_text
 from bnl_entity_intelligence import build_entity_intelligence_profile, resolve_entity_context_for_surface, safe_text as _entity_safe_text
 from bnl_source_file_lookup import lookup_source_file
+from bnl_source_refresh_context import refresh_generation_context
 
 ENRICHMENT_INGEST_SOURCE = "bnl_source_file_enrichment"
 FALLBACK_INGEST_SOURCE = "bnl_source_knowledge_bridge"
@@ -2573,8 +2574,9 @@ def run_source_file_enrichment(
         return _possible_match_review_result(target_value, possible_result, dry_run=dry_run, resolution_mode="possible_match_review", match_note="Alias lookup was not a confirmed alias match; use candidateId after review.")
 
     effective_subject = _first(source_file, ("name", "sourceFileName", "subject", "displayName", "title", "normalizedName")) or target_value
-    evidence = collect_source_enrichment_evidence(db_path, guild_id, str(effective_subject), rd_context=rd_context, lookup_result=lookup_result)
-    entity_profile = build_entity_intelligence_profile(db_path, guild_id, str(effective_subject), refresh=True)
+    with refresh_generation_context(str(effective_subject)):
+        evidence = collect_source_enrichment_evidence(db_path, guild_id, str(effective_subject), rd_context=rd_context, lookup_result=lookup_result)
+        entity_profile = build_entity_intelligence_profile(db_path, guild_id, str(effective_subject), refresh=True)
     entity_resolver = resolve_entity_context_for_surface(entity_profile, "source_file", max_items=16)
     entity_diag_for_log = entity_profile.get("diagnostics") or {}
     scope_for_log = entity_diag_for_log.get("rowScopeCounts") or {}

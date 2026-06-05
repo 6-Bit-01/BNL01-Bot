@@ -56,6 +56,15 @@ class SourceFileRefreshTests(unittest.TestCase):
     def rows(self):
         return refresh.list_source_file_refresh_queue(self.db, guild_id=1, limit=20)
 
+    def all_queue_rows(self):
+        conn = sqlite3.connect(self.db)
+        conn.row_factory = sqlite3.Row
+        try:
+            refresh.ensure_source_file_refresh_schema(conn)
+            return [dict(row) for row in conn.execute(f"SELECT * FROM {refresh.QUEUE_TABLE} ORDER BY id").fetchall()]
+        finally:
+            conn.close()
+
     def test_meaningful_subject_authored_evidence_creates_queue_row(self):
         result = refresh.mark_subject_dirty_for_evidence(
             self.db,
@@ -139,6 +148,99 @@ class SourceFileRefreshTests(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["evidence_source"], "entity_evidence_events")
 
+    def test_refresh_context_skips_self_generated_dirty_mark(self):
+        with refresh.refresh_generation_context("Signal Fox"):
+            result = refresh.mark_subject_dirty_for_evidence(
+                self.db,
+                guild_id=1,
+                subject_name="Signal Fox",
+                evidence_source="conversations",
+                content="New project link https://example.com/track from the subject",
+                channel_policy="public_home",
+                source_scope="subject_authored",
+                visibility="public_safe",
+                evidence_type="music",
+                relation_to_subject="authored",
+            )
+        self.assertFalse(result["queued"])
+        self.assertEqual(result["reason"], "refresh_self_generated_evidence")
+        self.assertEqual(self.rows(), [])
+
+    def test_refresh_context_does_not_suppress_different_subject(self):
+        with refresh.refresh_generation_context("Signal Fox"):
+            result = refresh.mark_subject_dirty_for_evidence(
+                self.db,
+                guild_id=1,
+                subject_name="Other Artist",
+                evidence_source="conversations",
+                content="Other artist shared a new project link https://example.com/track",
+                channel_policy="public_home",
+                source_scope="subject_authored",
+                visibility="public_safe",
+                evidence_type="music",
+                relation_to_subject="authored",
+            )
+        self.assertTrue(result["queued"])
+        rows = self.rows()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["subject_key"], "other-artist")
+
+    def test_future_evidence_after_refresh_context_queues_normally(self):
+        with refresh.refresh_generation_context("Signal Fox"):
+            skipped = refresh.mark_subject_dirty_for_evidence(
+                self.db,
+                guild_id=1,
+                subject_name="Signal Fox",
+                evidence_source="conversations",
+                content="Self generated project link https://example.com/generated",
+                channel_policy="public_home",
+                source_scope="subject_authored",
+                visibility="public_safe",
+                evidence_type="music",
+                relation_to_subject="authored",
+            )
+        self.assertFalse(skipped["queued"])
+        result = refresh.mark_subject_dirty_for_evidence(
+            self.db,
+            guild_id=1,
+            subject_name="Signal Fox",
+            evidence_source="conversations",
+            content="Later real user activity with project link https://example.com/later",
+            channel_policy="public_home",
+            source_scope="subject_authored",
+            visibility="public_safe",
+            evidence_type="music",
+            relation_to_subject="authored",
+        )
+        self.assertTrue(result["queued"])
+        self.assertEqual(self.rows()[0]["subject_key"], "signal-fox")
+
+    def test_entity_evidence_self_generated_does_not_queue_same_subject(self):
+        conn = sqlite3.connect(self.db)
+        conn.row_factory = sqlite3.Row
+        try:
+            with refresh.refresh_generation_context("Signal Fox"):
+                status = upsert_entity_evidence_event(
+                    conn,
+                    guild_id=1,
+                    subject_name="Signal Fox",
+                    source_type="entity_intelligence",
+                    source_table="entity_intelligence",
+                    source_row_id="refresh-1",
+                    source_label="refresh evidence",
+                    channel_policy="public_home",
+                    visibility="review_only",
+                    authority="local_observed",
+                    relation_to_subject="subject_keyed",
+                    evidence_kind="community_signal",
+                    safe_summary="Refresh summarized a project/collaboration signal.",
+                )
+            conn.commit()
+        finally:
+            conn.close()
+        self.assertEqual(status, "created")
+        self.assertEqual(self.rows(), [])
+
     def test_cooldown_defers_automatic_refresh(self):
         refresh.enqueue_source_file_refresh(self.db, guild_id=1, subject_name="Signal Fox", reason="test", evidence_source="test")
         conn = sqlite3.connect(self.db)
@@ -162,6 +264,25 @@ class SourceFileRefreshTests(unittest.TestCase):
         state = refresh.get_refresh_state(self.db, 1, "signal-fox")
         self.assertEqual(state["last_refresh_status"], "succeeded")
         self.assertEqual(state["last_recommendation_id"], "rec_1")
+
+    def test_no_target_local_queue_is_terminal_and_not_retried(self):
+        refresh.enqueue_source_file_refresh(self.db, guild_id=1, subject_name="Signal Fox", reason="test", evidence_source="test")
+        no_target = {"sent": False, "status": "no_target", "subject": "Signal Fox", "sendResult": {}, "sourceCounts": {}, "sourceTypes": []}
+        with mock.patch.object(refresh, "run_source_file_enrichment", return_value=no_target) as mocked:
+            first = refresh.process_source_file_refresh_queue(self.db, guild_id=1, environ={"BNL_DOSSIER_INGEST_TOKEN": "x"})
+            second = refresh.process_source_file_refresh_queue(self.db, guild_id=1, environ={"BNL_DOSSIER_INGEST_TOKEN": "x"})
+        self.assertEqual(first["skipped"], 1)
+        self.assertEqual(first["items"][0]["reason"], "no_target")
+        self.assertEqual(second["processed"], 0)
+        self.assertEqual(second["skipped"], 0)
+        self.assertEqual(mocked.call_count, 1)
+        self.assertEqual(self.rows(), [])
+        terminal = self.all_queue_rows()[0]
+        self.assertEqual(terminal["status"], "skipped")
+        self.assertEqual(terminal["last_error"], "no_target")
+        state = refresh.get_refresh_state(self.db, 1, "signal-fox")
+        self.assertEqual(state["last_refresh_status"], "no_target")
+        self.assertEqual(state["last_error"], "no_target")
 
     def test_dry_run_process_does_not_send_to_site(self):
         refresh.enqueue_source_file_refresh(self.db, guild_id=1, subject_name="Signal Fox", reason="test", evidence_source="test")
@@ -232,6 +353,7 @@ class SourceFileRefreshTests(unittest.TestCase):
         self.assertEqual(opener.posts[-1]["completedByRecommendationId"], "rec_1")
         state = refresh.get_refresh_state(self.db, 1, "signal-fox")
         self.assertEqual(state["last_refresh_status"], "succeeded")
+        self.assertEqual(self.rows(), [])
 
     def test_site_polling_failure_marks_failed(self):
         opener = FakeOpener({"ok": True, "requests": [{"id": "req_1", "subjectName": "Signal Fox", "status": "pending"}]})
@@ -262,7 +384,10 @@ class SourceFileRefreshTests(unittest.TestCase):
         mocked.assert_not_called()
         self.assertEqual(summary["failed"], 1)
         self.assertEqual([p["status"] for p in opener.posts], ["claimed", "failed"])
-        self.assertEqual(opener.posts[-1]["failureReason"], "no_matching_source_file_target")
+        self.assertEqual(opener.posts[-1]["failureReason"], "no_target")
+        state = refresh.get_refresh_state(self.db, 1, "signal-fox")
+        self.assertEqual(state["last_refresh_status"], "no_target")
+        self.assertEqual(state["last_error"], "no_target")
         self.assertEqual(self.rows(), [])
 
     def test_subject_dry_run_does_not_mutate_existing_queue_or_state(self):

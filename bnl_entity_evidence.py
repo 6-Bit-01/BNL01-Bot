@@ -349,9 +349,13 @@ def _maybe_mark_source_refresh_dirty(conn: sqlite3.Connection, values: dict[str,
             source_refresh_subject_key,
             utc_now,
         )
+        from bnl_source_refresh_context import is_refresh_generation_subject
 
         subject = str(values.get("subject_name") or "").strip()
         skey = source_refresh_subject_key(subject)
+        if is_refresh_generation_subject(skey):
+            logging.info("source_refresh_skipped subject_key=%s reason=refresh_self_generated_evidence", skey)
+            return
         decision = classify_refresh_evidence(
             subject_name=subject,
             evidence_source="entity_evidence_events",
