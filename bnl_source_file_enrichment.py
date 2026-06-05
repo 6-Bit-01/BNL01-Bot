@@ -2706,6 +2706,9 @@ def format_source_enrichment_response(result: dict[str, Any]) -> str:
             f"Dry run Source File enrichment for “{subject}.”",
             f"Target lane: {attach_label}.",
             f"Would send as BNL Source File Enrichment: {'yes' if result.get('qualityStatus') != 'too_thin' else 'no — too thin'}.",
+        ]
+        preview_lines.extend(_safe_text(line, 180) for line in (result.get("refreshDiagnostics") or [])[:5])
+        preview_lines.extend([
             f"Source types used: {source_types}.",
             f"Source coverage: {_safe_text(_format_source_coverage(result), 120)}.",
             f"Matched local profiles/users: {int((result.get('diagnostics') or {}).get('matchedUserProfileCount') or 0)}/{int((result.get('diagnostics') or {}).get('matchedUserIdCount') or 0)}.",
@@ -2713,7 +2716,7 @@ def format_source_enrichment_response(result: dict[str, Any]) -> str:
             f"Channel evidence found: {'yes' if (result.get('diagnostics') or {}).get('channelEvidenceFound') else 'no'}; public dossier match found: {'yes' if (result.get('diagnostics') or {}).get('publicDossierMatchFound') else 'no'}; existing dossier update lane: {'yes' if (result.get('diagnostics') or {}).get('existingDossierUpdateLane') else 'no'}.",
             f"public_dossier_match {'yes' if (result.get('diagnostics') or {}).get('publicDossierMatchFound') else 'no'}.",
             f"Warning count: {warning_text}.",
-        ]
+        ])
         early_entity_diag = ((result.get("diagnostics") or {}).get("entityIntelligence") or {})
         if early_entity_diag:
             scope_counts = early_entity_diag.get("rowScopeCounts") or {}
@@ -2800,6 +2803,8 @@ def format_source_enrichment_response(result: dict[str, Any]) -> str:
         return "\n".join(preview_lines)[:1900]
     if result.get("sent"):
         forced = " Forced low-confidence send." if result.get("qualityStatus") == "forced_low_confidence" else ""
-        return f"Source enrichment sent for admin review: {subject}. Match: {match_kind}.{forced} Ingest key: {_safe_text(result.get('ingestKey'), 120)}."
+        diag = " ".join(_safe_text(line, 140) for line in (result.get("refreshDiagnostics") or [])[:2])
+        suffix = f" {diag}" if diag else ""
+        return f"Source enrichment sent for admin review: {subject}. Match: {match_kind}.{forced} Ingest key: {_safe_text(result.get('ingestKey'), 120)}.{suffix}"[:1900]
     err = (result.get("sendResult") or {}).get("error") or "site ingest did not accept the review-only payload"
     return f"Source enrichment was built but not sent for “{subject}”: {_safe_text(err, 150)}"
