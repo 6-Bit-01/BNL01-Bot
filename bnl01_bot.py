@@ -140,6 +140,50 @@ BNL_TYPING_INDICATOR_COOLDOWN_SECONDS = max(8, int(os.getenv("BNL_TYPING_INDICAT
 BNL_WEBSITE_RELAY_INTERVAL_MINUTES = max(1, int(os.getenv("BNL_WEBSITE_RELAY_INTERVAL_MINUTES", "20")))
 BNL_WEBSITE_RELAY_GENERATION_TIMEOUT_SECONDS = max(1.0, float(os.getenv("BNL_WEBSITE_RELAY_GENERATION_TIMEOUT_SECONDS", "25") or 25))
 BNL_PRIMARY_GUILD_ID = int(os.getenv("BNL_PRIMARY_GUILD_ID", "0") or 0)
+
+
+GENERATION_ERROR_PROVIDER_PERMISSION_DENIED = "provider_permission_denied"
+GENERATION_ERROR_PROVIDER_RATE_LIMITED = "provider_rate_limited"
+GENERATION_ERROR_PROVIDER_TIMEOUT = "provider_timeout"
+GENERATION_ERROR_PROVIDER_NETWORK = "provider_network_error"
+GENERATION_ERROR_PROVIDER_SERVER = "provider_server_error"
+GENERATION_ERROR_PROVIDER_EMPTY = "provider_empty_response"
+GENERATION_ERROR_PROVIDER_UNKNOWN = "provider_unknown_error"
+
+PUBLIC_GENERATION_FALLBACK = (
+    "BNL-01 received the message, but the upper processing layer is refusing clean output right now. "
+    "I’m holding the channel open until the connection stabilizes."
+)
+PRIVATE_GENERATION_FALLBACK = (
+    "I received that, but my generation provider is failing right now. "
+    "I can’t give a full response until the model connection is restored."
+)
+INTERNAL_GENERATION_FALLBACK = (
+    "I received the internal request, but the generation provider is failing right now. "
+    "The request was not lost; retry after the model connection is restored."
+)
+
+_FORBIDDEN_PUBLIC_FALLBACK_TERMS = ("gemini", "google", "api key", "billing", "quota", "project id")
+
+@dataclass
+class GenerationResult:
+    success: bool
+    text: str = ""
+    error_category: str = ""
+    provider_error_code: str = ""
+    provider_error_message_safe: str = ""
+    route: str = "get_gemini_response"
+    elapsed_seconds: float = 0.0
+    model: str = ""
+
+
+_last_generation_status = {
+    "status": "never",
+    "error_category": "",
+    "provider_error_code": "",
+    "last_successful_generation_time": "",
+}
+
 BNL_FORCE_PULL_SHARED_SECRET = os.getenv("BNL_FORCE_PULL_SHARED_SECRET", "").strip()
 BNL_FORCE_PULL_PORT = int(os.getenv("BNL_FORCE_PULL_PORT", "8787") or 8787)
 BNL_OWNER_USER_ID = int(os.getenv("BNL_OWNER_USER_ID", "0") or 0)
@@ -5298,6 +5342,125 @@ def is_operator_authority_context(channel_policy: str, channel_name: str = "") -
 def is_public_prompt_context(channel_policy: str) -> bool:
     return (channel_policy or "").strip().lower() in {"public_home", "public_context", "public_selective"}
 
+def generation_fallback_kind(channel_policy: str = "", conversation_surface: str = "", route: str = "", directness: str = "") -> str:
+    policy = (channel_policy or "unknown").strip().lower()
+    surface = (conversation_surface or "").strip().lower()
+    route_l = (route or "").strip().lower()
+    if route_l in {"internal_operations_brief", "internal_ops", "rd_ops"} or surface == CONVERSATION_SURFACE_COMMAND_ONLY:
+        return "internal_plain"
+    if policy in {"internal_controlled", "broadcast_memory"}:
+        return "internal_plain"
+    if policy == "sealed_test" or "sealed" in surface or "test" in surface:
+        return "test_plain"
+    if policy in {"public_home", "public_context", "public_selective"} or "public" in surface:
+        return "public_lore"
+    return "private_plain"
+
+
+def generation_fallback_text(fallback_kind: str) -> str:
+    kind = (fallback_kind or "private_plain").strip().lower()
+    if kind == "public_lore":
+        return PUBLIC_GENERATION_FALLBACK
+    if kind == "internal_plain":
+        return INTERNAL_GENERATION_FALLBACK
+    return PRIVATE_GENERATION_FALLBACK
+
+
+def should_send_generation_fallback(route: str = "", decision: str = "", reason: str = "", directness: str = "", request_intent: bool = False) -> bool:
+    route_l = (route or "").strip().lower()
+    decision_l = (decision or "").strip().lower()
+    reason_l = (reason or "").strip().lower()
+    directness_l = (directness or "").strip().lower()
+    if decision_l in {"observe", "no_response_needed", "passive_room_observation"}:
+        return False
+    if reason_l in {"observe", "no_response_needed", "passive_room_observation", "canned_ack_suppressed_into_observe"}:
+        return False
+    if decision_l in {"answer", "reply", "respond"}:
+        return True
+    if route_l in {"internal_operations_brief", "command_only", "show_state_direct", "show_state_followup", "get_gemini_response"}:
+        return True
+    if directness_l in {"real_direct_target", "plain_text_name_seen", "plain_name_call", "request_intent", "command_only"}:
+        return True
+    return bool(request_intent)
+
+
+def _safe_provider_message(exc: Exception) -> str:
+    msg = re.sub(r"\s+", " ", str(exc or "")).strip()
+    msg = re.sub(r"(?i)(api[_ -]?key|key|token)=[^\s]+", r"\1=[redacted]", msg)
+    return msg[:300]
+
+
+def classify_generation_error(exc: Exception | None = None, *, empty_response: bool = False) -> tuple[str, str, str]:
+    if empty_response:
+        return GENERATION_ERROR_PROVIDER_EMPTY, "", ""
+    msg = str(exc or "")
+    msg_l = msg.lower()
+    code = ""
+    status = getattr(exc, "status", None) or getattr(exc, "code", None)
+    if status:
+        code = str(status)
+    else:
+        match = re.search(r"\b(403|429|408|500|502|503|504)\b", msg)
+        if match:
+            code = match.group(1)
+    if "permission_denied" in msg_l or "permission denied" in msg_l or code == "403":
+        cat = GENERATION_ERROR_PROVIDER_PERMISSION_DENIED
+    elif "rate" in msg_l or "quota" in msg_l or code == "429":
+        cat = GENERATION_ERROR_PROVIDER_RATE_LIMITED
+    elif "timeout" in msg_l or "timed out" in msg_l or code in {"408", "504"}:
+        cat = GENERATION_ERROR_PROVIDER_TIMEOUT
+    elif isinstance(exc, (TimeoutError, asyncio.TimeoutError)):
+        cat = GENERATION_ERROR_PROVIDER_TIMEOUT
+    elif any(term in msg_l for term in ("connection", "network", "dns", "ssl", "socket")):
+        cat = GENERATION_ERROR_PROVIDER_NETWORK
+    elif code in {"500", "502", "503", "504"} or "server error" in msg_l or "service unavailable" in msg_l:
+        cat = GENERATION_ERROR_PROVIDER_SERVER
+    else:
+        cat = GENERATION_ERROR_PROVIDER_UNKNOWN
+    return cat, code, _safe_provider_message(exc)
+
+
+def record_generation_result_status(result: GenerationResult) -> None:
+    _last_generation_status["status"] = "success" if result.success else "failure"
+    _last_generation_status["error_category"] = result.error_category or ""
+    _last_generation_status["provider_error_code"] = str(result.provider_error_code or "")
+    if result.success:
+        _last_generation_status["last_successful_generation_time"] = datetime.now(timezone.utc).isoformat()
+
+
+def log_response_generation_failed(*, route: str, channel=None, channel_policy: str = "", conversation_surface: str = "", directness: str = "", result: GenerationResult | None = None) -> None:
+    logging.warning(
+        "response_generation_failed route=%s channel_id=%s channel_name=%s channel_policy=%s conversation_surface=%s directness=%s provider_error_code=%s error_category=%s",
+        route,
+        getattr(channel, "id", 0) if channel is not None else 0,
+        getattr(channel, "name", "") if channel is not None else "",
+        channel_policy,
+        conversation_surface,
+        directness,
+        getattr(result, "provider_error_code", "") if result else "",
+        getattr(result, "error_category", "") if result else GENERATION_ERROR_PROVIDER_UNKNOWN,
+    )
+
+
+async def send_generation_fallback(channel, *, route: str, channel_policy: str = "", conversation_surface: str = "", directness: str = "", reply_to=None, allowed_mentions=None, internal: bool = False) -> bool:
+    kind = generation_fallback_kind(channel_policy, conversation_surface, "internal_operations_brief" if internal else route, directness)
+    text = generation_fallback_text(kind)
+    if kind == "public_lore" and any(term in text.lower() for term in _FORBIDDEN_PUBLIC_FALLBACK_TERMS):
+        logging.error("response_fallback_skipped route=%s reason=public_fallback_forbidden_term", route)
+        return False
+    try:
+        if reply_to is not None and hasattr(reply_to, "reply"):
+            await reply_to.reply(text)
+        else:
+            kwargs = {"allowed_mentions": allowed_mentions} if allowed_mentions is not None else {}
+            await channel.send(text, **kwargs)
+        logging.info("response_fallback_sent route=%s channel_id=%s fallback_kind=%s", route, getattr(channel, "id", 0), kind)
+        logging.info("response_send_succeeded route=%s channel_id=%s message_length=%s", route, getattr(channel, "id", 0), len(text))
+        return True
+    except Exception as exc:
+        logging.error("response_send_failed route=%s channel_id=%s discord_error_type=%s", route, getattr(channel, "id", 0), type(exc).__name__)
+        return False
+
 def website_relay_eligibility(policy: str) -> str:
     if policy in {"public_home", "public_context"}:
         return "yes"
@@ -5977,6 +6140,26 @@ def format_last_route_debug() -> str:
     for key, label in ordered:
         lines.append(f"- {label}: `{LAST_ROUTE_DEBUG.get(key, 'unknown')}`")
     return "\n".join(lines)
+
+
+async def maybe_handle_provider_status_command(message: discord.Message, clean_content: str) -> bool:
+    if not re.match(r"^!bnl\s+provider\s+status\s*$", (clean_content or "").strip(), flags=re.I):
+        return False
+    member = message.author if isinstance(message.author, discord.Member) else message.guild.get_member(message.author.id)
+    if not (is_owner_operator(message.author) or has_mod_role(member) or is_privileged_member(member, message.guild)):
+        await message.reply("Provider diagnostics are restricted to server owner/mod operators.")
+        return True
+    provider_configured = "yes" if bool(GEMINI_API_KEY) else "no"
+    lines = [
+        "**BNL provider status**",
+        f"- provider configured: `{provider_configured}`",
+        f"- last generation status: `{_last_generation_status.get('status', 'never')}`",
+        f"- last error category: `{_last_generation_status.get('error_category') or 'none'}`",
+        f"- last provider error code: `{_last_generation_status.get('provider_error_code') or 'none'}`",
+        f"- last successful generation time: `{_last_generation_status.get('last_successful_generation_time') or 'none'}`",
+    ]
+    await message.reply("\n".join(lines))
+    return True
 
 
 async def maybe_handle_debug_last_route_command(message: discord.Message, clean_content: str) -> bool:
@@ -10714,6 +10897,33 @@ async def _generate_gemini_content_with_fallback_async(contents: str, route: str
         logging.info(f"gemini_generation_completed route={route} elapsed_seconds={elapsed:.3f}")
 
 
+async def _generate_gemini_content_result_async(contents: str, route: str) -> GenerationResult:
+    started = time.monotonic()
+    model = GEMINI_MODEL
+    try:
+        response = await _generate_gemini_content_with_fallback_async(contents, route)
+        text, tokens = _extract_text_and_tokens(response)
+        elapsed = time.monotonic() - started
+        if not text:
+            cat, code, safe_msg = classify_generation_error(empty_response=True)
+            result = GenerationResult(False, "", cat, code, safe_msg, route, elapsed, model)
+            record_generation_result_status(result)
+            return result
+        if tokens:
+            increment_token_usage(tokens)
+            logging.info(f"📊 Tokens used: {tokens}")
+        result = GenerationResult(True, text.strip(), "", "", "", route, elapsed, model)
+        record_generation_result_status(result)
+        return result
+    except Exception as exc:
+        elapsed = time.monotonic() - started
+        cat, code, safe_msg = classify_generation_error(exc)
+        result = GenerationResult(False, "", cat, code, safe_msg, route, elapsed, model)
+        record_generation_result_status(result)
+        logging.error("Gemini API error route=%s error_category=%s provider_error_code=%s error=%s", route, cat, code, safe_msg)
+        return result
+
+
 def _generate_gemini_content_with_fallback(contents: str, route: str):
     logging.info(f"gemini_model_attempt model={GEMINI_MODEL} route={route}")
     try:
@@ -11292,6 +11502,61 @@ def _safe_uncertain_response_from_prompt(prompt: str) -> str:
         "If you give me the relevant thread, I can respond from that conversation."
     )
 
+async def get_gemini_generation_result(prompt: str, user_id: int, guild_id: int, route: str = "get_gemini_response") -> GenerationResult:
+    started = time.monotonic()
+    try:
+        if not check_quota_availability():
+            tokens_used, _ = get_usage_stats()
+            pct = (tokens_used / DAILY_TOKEN_LIMIT) * 100
+            text = (
+                f"🚫 **Daily quota exhausted!** Used {tokens_used:,}/{DAILY_TOKEN_LIMIT:,} tokens "
+                f"({pct:.1f}%). Quota resets at midnight Pacific Time."
+            )
+            result = GenerationResult(True, text, "", "", "", route, time.monotonic() - started, "local_quota_guard")
+            record_generation_result_status(result)
+            return result
+
+        history = await asyncio.to_thread(get_conversation_history, user_id, guild_id) if user_id else []
+        conversation_context = ""
+        prompt_l = prompt.lower()
+        show_related_now = any(x in prompt_l for x in ("show", "barcode radio", "broadcast", "radio", "6:40", "friday", "live"))
+        if history and not show_related_now:
+            for msg in history[-8:]:
+                if msg["role"] == "user":
+                    text = msg["parts"][0] if msg.get("parts") else ""
+                    conversation_context += f"User: {text}\n"
+        is_show_state_route = (route or "").startswith("show_state")
+        show_state_route_block = ""
+        if is_show_state_route:
+            show_state_route_block = (
+                "\nShow-state route instruction:\n"
+                "- This is a factual BARCODE Radio scheduling/status answer.\n"
+                "- Apply the Direct Answer Rule.\n"
+                "- First sentence must clearly answer using the active source summary.\n"
+                "- If the user asks why, first sentence must explain the stored reason.\n"
+                "- Use BARCODE Network as the parent organization in the factual part.\n"
+                "- BNL-style weirdness may appear only after the factual reason is clear.\n"
+                "- Do not let glitch/adjacent-reality language become the cause.\n"
+            )
+        public_authority_guard_block = public_operator_causality_safety_prompt_rules() if _is_public_authority_guard_prompt(prompt) else ""
+        request_contents = f"""{BNL01_SYSTEM_PROMPT}
+
+        Conversation history:
+        {conversation_context}
+        {show_state_route_block}
+        {fake_lookup_safety_prompt_rules()}
+        {public_authority_guard_block}
+
+        User: {prompt}
+        BNL-01:"""
+        return await _generate_gemini_content_result_async(request_contents, route)
+    except Exception as exc:
+        cat, code, safe_msg = classify_generation_error(exc)
+        result = GenerationResult(False, "", cat, code, safe_msg, route, time.monotonic() - started, GEMINI_MODEL)
+        record_generation_result_status(result)
+        return result
+
+
 async def get_gemini_response(prompt: str, user_id: int, guild_id: int, route: str = "get_gemini_response"):
     try:
         if not check_quota_availability():
@@ -11357,13 +11622,10 @@ async def get_gemini_response(prompt: str, user_id: int, guild_id: int, route: s
 
         User: {prompt}
         BNL-01:"""
-        response = await _generate_gemini_content_with_fallback_async(request_contents, route)
-
-        text, tokens = _extract_text_and_tokens(response)
-
-        if tokens:
-            increment_token_usage(tokens)
-            logging.info(f"📊 Tokens used: {tokens}")
+        generation_result = await _generate_gemini_content_result_async(request_contents, route)
+        if not generation_result.success:
+            return ""
+        text = generation_result.text
 
         # -------- AI Generated Glitch Event --------
         if text and random.random() < 0.08:
@@ -13614,7 +13876,38 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                 response = await get_gemini_response(prompt, user_id=first_uid, guild_id=channel.guild.id, route=generation_route)
 
             if not response:
+                latest_result = GenerationResult(
+                    False,
+                    "",
+                    _last_generation_status.get("error_category") or GENERATION_ERROR_PROVIDER_UNKNOWN,
+                    _last_generation_status.get("provider_error_code") or "",
+                    "",
+                    generation_route,
+                    0.0,
+                    GEMINI_MODEL,
+                )
                 logging.warning(f"⚠️ Batch response generation failed in channel {channel_id}.")
+                log_response_generation_failed(
+                    route=generation_route,
+                    channel=channel,
+                    channel_policy=channel_policy,
+                    conversation_surface=conversation_surface_for_channel_policy(channel_policy, channel_id == get_guild_config(guild_id)),
+                    directness="request_intent" if reason.startswith("request_intent:") else ("plain_name_call" if active_packet.get("addressed_to_bot") else "batch_answer"),
+                    result=latest_result,
+                )
+                if should_send_generation_fallback(generation_route, decision, reason, request_intent=reason.startswith("request_intent:")):
+                    sent = await send_generation_fallback(
+                        channel,
+                        route=generation_route,
+                        channel_policy=channel_policy,
+                        conversation_surface=conversation_surface_for_channel_policy(channel_policy, channel_id == get_guild_config(guild_id)),
+                        directness="request_intent" if reason.startswith("request_intent:") else "batch_answer",
+                        allowed_mentions=safe_mentions,
+                    )
+                    if sent:
+                        _channel_last_reply_at[channel_id] = datetime.now(PACIFIC_TZ)
+                else:
+                    logging.info("response_fallback_skipped route=%s reason=%s", generation_route, reason or "no_response_needed")
                 return
 
             payload_items = list(active_packet["payload_items"])
@@ -13912,13 +14205,18 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
             ack_escalated_to_generation=bool(locals().get("ack_diag", {}).get("ack_escalated_to_generation", False)),
         )
 
-        if len(response) <= 2000:
-            await channel.send(response, allowed_mentions=safe_mentions)
-        else:
-            chunks = split_message(response)
-            await channel.send(chunks[0] + "...", allowed_mentions=safe_mentions)
-            for chunk in chunks[1:]:
-                await channel.send("..." + chunk, allowed_mentions=safe_mentions)
+        try:
+            if len(response) <= 2000:
+                await channel.send(response, allowed_mentions=safe_mentions)
+            else:
+                chunks = split_message(response)
+                await channel.send(chunks[0] + "...", allowed_mentions=safe_mentions)
+                for chunk in chunks[1:]:
+                    await channel.send("..." + chunk, allowed_mentions=safe_mentions)
+            logging.info("response_send_succeeded route=%s channel_id=%s message_length=%s", generation_route if 'generation_route' in locals() else "get_gemini_response", channel_id, len(response or ""))
+        except Exception as exc:
+            logging.error("response_send_failed route=%s channel_id=%s discord_error_type=%s", generation_route if 'generation_route' in locals() else "get_gemini_response", channel_id, type(exc).__name__)
+            return
         _log_batch_event(logging.INFO, "response_send_commit_complete", guild_id, channel_id, len(items), f"generation_id={local_generation_id}")
         for uid in unique_user_ids:
             _mark_conversation_continuation_state(guild_id, channel_id, uid)
@@ -14667,20 +14965,35 @@ async def _generate_direct_payload_session(session_key, reason: str):
                     response = ((response or "").strip() + "\n\n" + fallback_lines).strip()
                     logging.info(f"direct_payload_completion_fallback_appended missing_count={len(missing_items)}")
 
+    fallback_response_sent = False
     if not response:
-        response = "[NETWORK ERROR] Temporary synchronization issue. Try again."
+        result = GenerationResult(False, "", _last_generation_status.get("error_category") or GENERATION_ERROR_PROVIDER_UNKNOWN, _last_generation_status.get("provider_error_code") or "", "", "direct_payload_session", 0.0, GEMINI_MODEL)
+        channel = getattr(anchor_message, "channel", None)
+        channel_policy_for_fallback = session.get("channel_policy", "unknown")
+        surface = conversation_surface_for_channel_policy(channel_policy_for_fallback, False)
+        log_response_generation_failed(route="direct_payload_session", channel=channel, channel_policy=channel_policy_for_fallback, conversation_surface=surface, directness="request_intent", result=result)
+        fallback_response_sent = await send_generation_fallback(channel, route="direct_payload_session", channel_policy=channel_policy_for_fallback, conversation_surface=surface, directness="request_intent", reply_to=anchor_message)
+        if not fallback_response_sent:
+            session["generating"] = False
+        return
     logging.info(f"direct_session_pre_send_grace_started revision={generation_revision} payload_count={payload_count}")
     await asyncio.sleep(DIRECT_PRE_SEND_GRACE_SECONDS)
     if _abort_if_invalidated("revision_changed_before_send"):
         logging.info("direct_session_pre_send_abort reason=revision_changed_before_send")
         return
-    if len(response) <= 2000:
-        await anchor_message.reply(response)
-    else:
-        chunks = split_message(response)
-        await anchor_message.reply(chunks[0] + "...")
-        for chunk in chunks[1:]:
-            await anchor_message.channel.send("..." + chunk)
+    try:
+        if len(response) <= 2000:
+            await anchor_message.reply(response)
+        else:
+            chunks = split_message(response)
+            await anchor_message.reply(chunks[0] + "...")
+            for chunk in chunks[1:]:
+                await anchor_message.channel.send("..." + chunk)
+        logging.info("response_send_succeeded route=%s channel_id=%s message_length=%s", "direct_payload_session", getattr(getattr(anchor_message, "channel", None), "id", 0), len(response or ""))
+    except Exception as exc:
+        logging.error("response_send_failed route=%s channel_id=%s discord_error_type=%s", "direct_payload_session", getattr(getattr(anchor_message, "channel", None), "id", 0), type(exc).__name__)
+        session["generating"] = False
+        return
     if _abort_if_invalidated("revision_changed_before_send"):
         return
     if allow_greeting:
@@ -14855,13 +15168,18 @@ async def send_planned_conversation_response(
         ack_converted_to_observe=False,
         ack_escalated_to_generation=False,
     )
-    if len(response) <= 2000:
-        await message.reply(response)
-    else:
-        chunks = split_message(response)
-        await message.reply(chunks[0] + "...")
-        for chunk in chunks[1:]:
-            await message.channel.send("..." + chunk)
+    try:
+        if len(response) <= 2000:
+            await message.reply(response)
+        else:
+            chunks = split_message(response)
+            await message.reply(chunks[0] + "...")
+            for chunk in chunks[1:]:
+                await message.channel.send("..." + chunk)
+        logging.info("response_send_succeeded route=%s channel_id=%s message_length=%s", plan.route_mode, getattr(message.channel, "id", 0), len(response or ""))
+    except Exception as exc:
+        logging.error("response_send_failed route=%s channel_id=%s discord_error_type=%s", plan.route_mode, getattr(message.channel, "id", 0), type(exc).__name__)
+        return model_decision
     if mark_recent_direct:
         _mark_conversation_continuation_state(message.guild.id, message.channel.id, message.author.id)
         if _response_requests_retransmission(response):
@@ -14969,6 +15287,9 @@ async def on_message(message: discord.Message):
             reply = "I can’t safely resolve the prior message from here. Send it again and I’ll answer that payload directly."
             await message.reply(reply)
             return
+
+    if await maybe_handle_provider_status_command(message, clean_content):
+        return
 
     if await maybe_handle_debug_last_route_command(message, clean_content):
         return
@@ -15264,15 +15585,23 @@ async def on_message(message: discord.Message):
             )
             response = await get_gemini_response(ops_prompt, message.author.id, message.guild.id, route="internal_operations_brief")
             if not response:
-                response = "Current status: I can help with internal operations, but I hit a temporary sync issue. Please retry in a moment."
+                result = GenerationResult(False, "", _last_generation_status.get("error_category") or GENERATION_ERROR_PROVIDER_UNKNOWN, _last_generation_status.get("provider_error_code") or "", "", "internal_operations_brief", 0.0, GEMINI_MODEL)
+                log_response_generation_failed(route="internal_operations_brief", channel=message.channel, channel_policy=channel_policy, conversation_surface=conversation_surface, directness="command_only", result=result)
+                await send_generation_fallback(message.channel, route="internal_operations_brief", channel_policy=channel_policy, conversation_surface=conversation_surface, directness="command_only", reply_to=message, internal=True)
+                return
 
-        if len(response) <= 2000:
-            await message.reply(response)
-        else:
-            chunks = split_message(response)
-            await message.reply(chunks[0] + "...")
-            for chunk in chunks[1:]:
-                await message.channel.send("..." + chunk)
+        try:
+            if len(response) <= 2000:
+                await message.reply(response)
+            else:
+                chunks = split_message(response)
+                await message.reply(chunks[0] + "...")
+                for chunk in chunks[1:]:
+                    await message.channel.send("..." + chunk)
+            logging.info("response_send_succeeded route=%s channel_id=%s message_length=%s", "internal_operations_brief", getattr(message.channel, "id", 0), len(response or ""))
+        except Exception as exc:
+            logging.error("response_send_failed route=%s channel_id=%s discord_error_type=%s", "internal_operations_brief", getattr(message.channel, "id", 0), type(exc).__name__)
+            return
         if not rd_read_model_context:
             _remember_rd_ops_context(
                 message,
@@ -15843,7 +16172,9 @@ async def on_message(message: discord.Message):
             if show_state_ctx:
                 response = "The current broadcast-memory note marks that BARCODE Radio slot as unavailable."
             else:
-                await message.reply("[NETWORK ERROR] Temporary synchronization issue. Try again.")
+                result = GenerationResult(False, "", _last_generation_status.get("error_category") or GENERATION_ERROR_PROVIDER_UNKNOWN, _last_generation_status.get("provider_error_code") or "", "", show_state_route, 0.0, GEMINI_MODEL)
+                log_response_generation_failed(route=show_state_route, channel=message.channel, channel_policy=channel_policy, conversation_surface=conversation_surface, directness="real_direct_target" if real_direct_target else ("plain_text_name_seen" if plain_text_name_seen else "request_intent"), result=result)
+                await send_generation_fallback(message.channel, route=show_state_route, channel_policy=channel_policy, conversation_surface=conversation_surface, directness="real_direct_target" if real_direct_target else "request_intent", reply_to=message)
                 return
 
         if allow_greeting:
@@ -16038,7 +16369,9 @@ async def on_message(message: discord.Message):
             if show_state_ctx:
                 response = "The current broadcast-memory note marks that BARCODE Radio slot as unavailable."
             else:
-                await message.reply("[NETWORK ERROR] Temporary synchronization issue. Try again.")
+                result = GenerationResult(False, "", _last_generation_status.get("error_category") or GENERATION_ERROR_PROVIDER_UNKNOWN, _last_generation_status.get("provider_error_code") or "", "", show_state_route, 0.0, GEMINI_MODEL)
+                log_response_generation_failed(route=show_state_route, channel=message.channel, channel_policy=channel_policy, conversation_surface=conversation_surface, directness="real_direct_target" if real_direct_target else ("plain_text_name_seen" if plain_text_name_seen else "request_intent"), result=result)
+                await send_generation_fallback(message.channel, route=show_state_route, channel_policy=channel_policy, conversation_surface=conversation_surface, directness="real_direct_target" if real_direct_target else "request_intent", reply_to=message)
                 return
 
         if allow_greeting:
