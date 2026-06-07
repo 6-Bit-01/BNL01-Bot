@@ -10,6 +10,7 @@ accounts.
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import logging
 import os
@@ -38,6 +39,8 @@ DEFAULT_PROCESS_INTERVAL_MINUTES = 15
 DEFAULT_MAX_AUTOMATIC_PER_CYCLE = 3
 DEFAULT_MAX_SITE_REQUESTS_PER_CYCLE = 3
 SITE_REFRESH_REQUEST_TIMEOUT_SECONDS = 8
+SOURCE_REFRESH_NOW_PATH = "/internal/source-files/refresh-now"
+SOURCE_REFRESH_NOW_TOKEN_HEADER = "X-BNL-REFRESH-TOKEN"
 SITE_REFRESH_REQUEST_PATH = "/api/bnl/source-files/refresh-requests"
 MEANINGFUL_MIN_TEXT_LENGTH = 16
 
@@ -330,8 +333,166 @@ def _site_refresh_subject_key(request: dict[str, Any]) -> str:
 
 def _site_refresh_mode(request: dict[str, Any]) -> str:
     raw = str(request.get("refreshMode") or request.get("refresh_mode") or request.get("requestType") or request.get("type") or "").lower()
+    source = str(request.get("source") or "").lower()
+    reason = str(request.get("reason") or "").lower()
     high_priority = bool(request.get("highPriority") or request.get("manual") or request.get("force"))
+    if source in {"admin_manual_retry", "admin_source_file_open"} or reason in {"manual_retry", "opened_source_file", "file_not_updated"}:
+        high_priority = True
     return "site_manual_request" if high_priority or "manual" in raw or "button" in raw else "site_open_request"
+
+
+
+def is_source_refresh_now_token_valid(provided_token: str | None, *, environ: dict[str, str] | None = None) -> bool:
+    """Return True only when the internal immediate-refresh token matches env config."""
+
+    env = environ if environ is not None else os.environ
+    expected = (env.get("BNL_SOURCE_FILE_REFRESH_TOKEN") or "").strip()
+    provided = (provided_token or "").strip()
+    if not expected or not provided:
+        return False
+    return hmac.compare_digest(provided, expected)
+
+
+def _site_refresh_lookup_parts(site_request: dict[str, Any]) -> tuple[str, str]:
+    candidate_id = _safe_text(site_request.get("candidateId") or site_request.get("candidate_id") or "", 120)
+    subject = _site_refresh_subject_name(site_request)
+    skey = _site_refresh_subject_key(site_request)
+    if candidate_id:
+        return "candidateId", candidate_id
+    if (site_request.get("normalizedSubjectKey") or site_request.get("subjectKey")) and not site_request.get("subjectName"):
+        return "normalizedName", str(site_request.get("normalizedSubjectKey") or site_request.get("subjectKey") or skey)
+    return "subject", str(subject or skey)
+
+
+def _site_status_for_local_item(item: dict[str, Any]) -> tuple[str, str]:
+    status = str(item.get("status") or "").lower()
+    if status == "succeeded":
+        return "completed", ""
+    if status in {"skipped", "cooldown", "deferred", "no_target", "dry_run"}:
+        return "skipped", _safe_text(item.get("reason") or item.get("error") or status, 240)
+    return "failed", _safe_text(item.get("error") or item.get("reason") or status or "send_failed", 240)
+
+
+def _mark_site_request_terminal(request_id: str, item: dict[str, Any], *, environ: dict[str, str], opener=None) -> dict[str, Any]:
+    site_status, reason = _site_status_for_local_item(item)
+    rec_id = _safe_text(item.get("recommendationId") or "", 120)
+    result = update_site_refresh_request_status(
+        request_id,
+        site_status,
+        environ=environ,
+        opener=opener,
+        completed_by_recommendation_id=rec_id if site_status == "completed" else None,
+        failure_reason=reason if site_status != "completed" else None,
+    )
+    logging.info("source_refresh_now_site_status_updated request_id=%s status=%s ok=%s", _safe_text(request_id, 120), site_status, bool(result.get("ok")))
+    return result
+
+
+def process_source_file_refresh_now(db_path: str, payload: dict[str, Any], *, guild_id: int | None = None, dry_run: bool = False, lookup_func: Callable[[dict[str, str]], dict[str, Any]] = lookup_source_file, sender: Callable[[dict[str, Any]], dict[str, Any]] = send_dossier_recommendation, environ: dict[str, str] | None = None, opener=None) -> dict[str, Any]:
+    """Process one immediate website Source File refresh request.
+
+    This is the bot-side wake-up path for admin Source File opens/retries. The
+    existing polling worker remains independent fallback; this helper only
+    processes the supplied request and makes any claimed site request terminal or
+    retry-safe on no_target, cooldown, deferred, or send failures.
+    """
+
+    env = environ if environ is not None else os.environ
+    site_request = dict(payload or {})
+    request_id = _site_refresh_request_id(site_request)
+    subject = _site_refresh_subject_name(site_request)
+    skey = _site_refresh_subject_key(site_request)
+    candidate_id = _safe_text(site_request.get("candidateId") or site_request.get("candidate_id") or "", 120)
+    mode = _site_refresh_mode(site_request)
+    source = _safe_text(site_request.get("source") or "", 80)
+    reason = _safe_text(site_request.get("reason") or "", 80)
+    logging.info("source_refresh_now_started request_id=%s subject_key=%s source=%s reason=%s", request_id or "none", skey or "none", source or "none", reason or "none")
+
+    summary: dict[str, Any] = {"ok": True, "dryRun": dry_run, "requestId": request_id, "candidateId": candidate_id, "subject": subject or skey, "subjectKey": skey, "status": "skipped", "recommendationId": "", "failureReason": ""}
+    if dry_run:
+        summary.update({"status": "dry_run", "processed": 1})
+        return summary
+    if not (candidate_id or subject or skey):
+        summary.update({"ok": False, "status": "failed", "failureReason": "missing_target"})
+        return summary
+
+    if request_id:
+        claim = update_site_refresh_request_status(request_id, "claimed", environ=env, opener=opener)
+        if not claim.get("ok"):
+            failure = _safe_text(claim.get("reason") or claim.get("error") or "claim_failed", 160)
+            logging.warning("source_refresh_now_failed request_id=%s reason=%s", request_id, failure)
+            summary.update({"ok": False, "status": "failed", "failureReason": failure})
+            return summary
+
+    lookup_key, lookup_value = _site_refresh_lookup_parts(site_request)
+    try:
+        target_check = lookup_func({"lookupKey": lookup_key, "lookupValue": lookup_value, lookup_key: lookup_value})
+        found = bool(target_check.get("found") or target_check.get("sourceFile") or target_check.get("source_file") or target_check.get("candidate") or target_check.get("dossier"))
+        if target_check.get("ok") is False or not found:
+            failure = "lookup_failed" if target_check.get("ok") is False else "no_target"
+            if failure == "no_target":
+                conn = sqlite3.connect(db_path)
+                try:
+                    ensure_source_file_refresh_schema(conn)
+                    _state_upsert(conn, guild_id=guild_id, subject_key=skey, subject_name=subject or lookup_value, fields={"last_refresh_completed_at": utc_now(), "last_refresh_status": "no_target", "last_failure_at": utc_now(), "last_error": "no_target"})
+                    conn.commit()
+                finally:
+                    conn.close()
+            item = {"subject": subject or lookup_value, "status": "skipped" if failure == "no_target" else "failed", "reason": failure, "error": failure}
+            if request_id:
+                _mark_site_request_terminal(request_id, item, environ=env, opener=opener)
+            summary.update({"ok": failure == "no_target", "status": "skipped" if failure == "no_target" else "failed", "failureReason": failure})
+            logging.warning("source_refresh_now_failed request_id=%s reason=%s", request_id or "none", failure)
+            return summary
+    except Exception as exc:
+        failure = _safe_text(exc, 160) or "lookup_failed"
+        item = {"subject": subject or skey, "status": "failed", "error": failure}
+        if request_id:
+            _mark_site_request_terminal(request_id, item, environ=env, opener=opener)
+        summary.update({"ok": False, "status": "failed", "failureReason": failure})
+        logging.warning("source_refresh_now_failed request_id=%s reason=%s", request_id or "none", failure)
+        return summary
+
+    enqueue_source_file_refresh(
+        db_path,
+        guild_id=guild_id,
+        subject_name=subject or lookup_value,
+        reason=f"source_refresh_now:{request_id or candidate_id or skey}",
+        evidence_source="source_refresh_now",
+        priority=100,
+        refresh_mode=mode,
+        created_by=source or "source_refresh_now",
+        evidence_count=1,
+    )
+    local = process_source_file_refresh_queue(
+        db_path,
+        guild_id=guild_id,
+        dry_run=False,
+        max_items=1,
+        lookup_func=lookup_func,
+        sender=sender,
+        environ=env,
+        bypass_cooldown=source in {"admin_source_file_open", "admin_manual_retry"} or reason in {"opened_source_file", "manual_retry", "file_not_updated"},
+        refresh_mode=mode,
+        subject_key=skey,
+    )
+    item = (local.get("items") or [{}])[0]
+    site_status, terminal_reason = _site_status_for_local_item(item)
+    if request_id:
+        _mark_site_request_terminal(request_id, item, environ=env, opener=opener)
+    rec_id = _safe_text(item.get("recommendationId") or "", 120)
+    summary.update({
+        "ok": site_status in {"completed", "skipped"},
+        "status": "success" if site_status == "completed" else site_status,
+        "recommendationId": rec_id,
+        "failureReason": terminal_reason,
+        "local": local,
+    })
+    if site_status == "completed":
+        logging.info("source_refresh_now_completed request_id=%s recommendation_id=%s", request_id or "none", rec_id or "none")
+    else:
+        logging.warning("source_refresh_now_failed request_id=%s reason=%s", request_id or "none", terminal_reason or site_status)
+    return summary
 
 
 def fetch_site_refresh_requests(*, environ: dict[str, str] | None = None, opener=None, limit: int = DEFAULT_MAX_SITE_REQUESTS_PER_CYCLE) -> dict[str, Any]:
@@ -640,6 +801,7 @@ def process_site_refresh_requests(db_path: str, *, guild_id: int | None = None, 
             summary["processed"] += 1
             summary["items"].append({"subject": subject or item.get("subject") or skey, "subjectKey": skey, "requestId": request_id, "status": "succeeded", "recommendationId": rec_id})
         elif status == "cooldown":
+            update_site_refresh_request_status(request_id, "skipped", environ=env, opener=opener, failure_reason="cooldown_deferred")
             logging.info("source_refresh_site_request_failed request_id=%s reason=cooldown_deferred", request_id)
             summary["skipped"] += 1
             summary["items"].append({"subject": subject or item.get("subject") or skey, "subjectKey": skey, "requestId": request_id, "status": "deferred", "reason": "cooldown"})
