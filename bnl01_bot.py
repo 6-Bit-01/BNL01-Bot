@@ -104,8 +104,12 @@ from bnl_source_file_refresh import (
     list_source_file_refresh_queue,
     mark_subject_dirty_for_evidence,
     parse_source_refresh_command,
+    SOURCE_REFRESH_NOW_PATH,
+    SOURCE_REFRESH_NOW_TOKEN_HEADER,
+    is_source_refresh_now_token_valid,
     process_single_source_file_refresh,
     process_site_refresh_requests,
+    process_source_file_refresh_now,
     process_source_file_refresh_queue,
 )
 from collections import Counter, defaultdict, deque
@@ -3454,12 +3458,66 @@ async def _handle_force_pull(request: web.Request) -> web.Response:
     }, status=202)
 
 
+async def _handle_source_file_refresh_now(request: web.Request) -> web.Response:
+    provided_token = request.headers.get(SOURCE_REFRESH_NOW_TOKEN_HEADER) or request.headers.get(
+        SOURCE_REFRESH_NOW_TOKEN_HEADER.lower()
+    )
+    if not is_source_refresh_now_token_valid(provided_token):
+        logging.warning("source_refresh_now_auth_failed reason=missing_or_invalid_token")
+        return web.json_response({"ok": False, "error": "unauthorized"}, status=401)
+
+    try:
+        payload = await request.json()
+    except Exception:
+        logging.warning("source_refresh_now_failed reason=invalid_json")
+        return web.json_response({"ok": False, "status": "failed", "failureReason": "invalid_json"}, status=400)
+    if not isinstance(payload, dict):
+        logging.warning("source_refresh_now_failed reason=invalid_payload")
+        return web.json_response({"ok": False, "status": "failed", "failureReason": "invalid_payload"}, status=400)
+
+    request_id = str(payload.get("requestId") or payload.get("id") or "")[:120]
+    candidate_id = str(payload.get("candidateId") or "")[:120]
+    subject_key = str(
+        payload.get("normalizedSubjectKey") or payload.get("subjectKey") or payload.get("subjectName") or ""
+    )[:120]
+    source = str(payload.get("source") or "")[:80]
+    reason = str(payload.get("reason") or "")[:80]
+    logging.info(
+        "source_refresh_now_received request_id=%s candidate_id=%s subject_key=%s source=%s reason=%s",
+        request_id or "none",
+        candidate_id or "none",
+        subject_key or "none",
+        source or "none",
+        reason or "none",
+    )
+
+    guild_id = _resolve_force_pull_guild()
+    if not guild_id:
+        logging.warning("source_refresh_now_failed reason=no_guild_available")
+        return web.json_response(
+            {"ok": False, "status": "failed", "failureReason": "no_guild_available"}, status=503
+        )
+
+    try:
+        result = await asyncio.to_thread(
+            process_source_file_refresh_now, DB_FILE, payload, guild_id=guild_id
+        )
+    except Exception as exc:
+        safe_error = _safe_force_pull_error(exc)
+        logging.warning("source_refresh_now_failed request_id=%s reason=%s", request_id or "none", safe_error)
+        return web.json_response({"ok": False, "status": "failed", "failureReason": safe_error}, status=500)
+
+    status = result.get("status") or ("success" if result.get("ok") else "failed")
+    http_status = 200 if status in {"success", "skipped", "dry_run"} else 500
+    return web.json_response(result, status=http_status)
+
 async def start_force_pull_listener():
     global force_pull_runner
     if force_pull_runner is not None:
         return
     app = web.Application()
     app.router.add_post("/force-pull", _handle_force_pull)
+    app.router.add_post(SOURCE_REFRESH_NOW_PATH, _handle_source_file_refresh_now)
     force_pull_runner = web.AppRunner(app)
     await force_pull_runner.setup()
     site = web.TCPSite(force_pull_runner, host="0.0.0.0", port=BNL_FORCE_PULL_PORT)

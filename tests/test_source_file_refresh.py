@@ -419,6 +419,137 @@ class SourceFileRefreshTests(unittest.TestCase):
         self.assertEqual(summary["items"][0]["status"], "dry_run")
         self.assertEqual(self.rows(), before_rows)
 
+    def test_refresh_now_missing_token_rejected(self):
+        self.assertFalse(refresh.is_source_refresh_now_token_valid(None, environ={"BNL_SOURCE_FILE_REFRESH_TOKEN": "secret"}))
+
+    def test_refresh_now_invalid_token_rejected(self):
+        self.assertFalse(refresh.is_source_refresh_now_token_valid("wrong", environ={"BNL_SOURCE_FILE_REFRESH_TOKEN": "secret"}))
+        self.assertTrue(refresh.is_source_refresh_now_token_valid("secret", environ={"BNL_SOURCE_FILE_REFRESH_TOKEN": "secret"}))
+
+    def test_refresh_now_valid_request_processes_immediately_and_completes(self):
+        opener = FakeOpener({"ok": True, "requests": []})
+        lookup = lambda query: {"ok": True, "found": True, "sourceFile": {"subjectName": "Signal Fox"}}
+        with mock.patch.object(refresh, "run_source_file_enrichment", return_value={"sent": True, "sendResult": {"recommendationId": "rec_now"}, "sourceCounts": {"conversations": 1}, "sourceTypes": ["conversations"], "subject": "Signal Fox", "qualityScore": 88}) as mocked:
+            result = refresh.process_source_file_refresh_now(
+                self.db,
+                {"requestId": "req_now", "candidateId": "cand_1", "subjectName": "Signal Fox", "normalizedSubjectKey": "signal-fox", "reason": "opened_source_file", "source": "admin_source_file_open"},
+                guild_id=1,
+                environ={"BNL_SOURCE_FILE_READ_TOKEN": "read", "BNL_WEBSITE_BASE_URL": "https://site.test", "BNL_DOSSIER_INGEST_TOKEN": "ingest"},
+                opener=opener,
+                lookup_func=lookup,
+            )
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["recommendationId"], "rec_now")
+        self.assertEqual(mocked.call_count, 1)
+        self.assertEqual([p["status"] for p in opener.posts], ["claimed", "completed"])
+        self.assertEqual(opener.posts[-1]["completedByRecommendationId"], "rec_now")
+
+    def test_refresh_now_failed_refresh_marks_site_failed(self):
+        opener = FakeOpener({"ok": True, "requests": []})
+        lookup = lambda query: {"ok": True, "found": True, "sourceFile": {"subjectName": "Signal Fox"}}
+        with mock.patch.object(refresh, "run_source_file_enrichment", return_value={"sent": False, "sendResult": {"error": "site rejected"}, "status": "send_failed"}):
+            result = refresh.process_source_file_refresh_now(
+                self.db,
+                {"requestId": "req_now", "subjectName": "Signal Fox", "normalizedSubjectKey": "signal-fox", "reason": "manual_retry", "source": "admin_manual_retry"},
+                guild_id=1,
+                environ={"BNL_SOURCE_FILE_READ_TOKEN": "read", "BNL_WEBSITE_BASE_URL": "https://site.test", "BNL_DOSSIER_INGEST_TOKEN": "ingest"},
+                opener=opener,
+                lookup_func=lookup,
+            )
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual([p["status"] for p in opener.posts], ["claimed", "failed"])
+        self.assertIn("site rejected", opener.posts[-1]["failureReason"])
+
+    def test_refresh_now_no_target_does_not_stay_claimed(self):
+        opener = FakeOpener({"ok": True, "requests": []})
+        lookup = lambda query: {"ok": True, "found": False}
+        with mock.patch.object(refresh, "run_source_file_enrichment") as mocked:
+            result = refresh.process_source_file_refresh_now(
+                self.db,
+                {"requestId": "req_now", "subjectName": "Signal Fox", "normalizedSubjectKey": "signal-fox", "reason": "opened_source_file", "source": "admin_source_file_open"},
+                guild_id=1,
+                environ={"BNL_SOURCE_FILE_READ_TOKEN": "read", "BNL_WEBSITE_BASE_URL": "https://site.test", "BNL_DOSSIER_INGEST_TOKEN": "ingest"},
+                opener=opener,
+                lookup_func=lookup,
+            )
+        mocked.assert_not_called()
+        self.assertEqual(result["status"], "skipped")
+        self.assertEqual(result["failureReason"], "no_target")
+        self.assertEqual([p["status"] for p in opener.posts], ["claimed", "skipped"])
+        self.assertEqual(opener.posts[-1]["failureReason"], "no_target")
+        self.assertEqual(self.rows(), [])
+
+    def test_refresh_now_cooldown_bypassed_for_admin_open(self):
+        conn = sqlite3.connect(self.db)
+        try:
+            refresh.ensure_source_file_refresh_schema(conn)
+            conn.execute(
+                f"INSERT OR REPLACE INTO {refresh.STATE_TABLE} (guild_id, subject_key, subject_name, cooldown_until, updated_at) VALUES (1, 'signal-fox', 'Signal Fox', '2999-01-01T00:00:00+00:00', 'now')"
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        opener = FakeOpener({"ok": True, "requests": []})
+        lookup = lambda query: {"ok": True, "found": True, "sourceFile": {"subjectName": "Signal Fox"}}
+        with mock.patch.object(refresh, "run_source_file_enrichment", return_value={"sent": True, "sendResult": {"recommendationId": "rec_fresh"}, "sourceCounts": {"conversations": 1}, "sourceTypes": ["conversations"], "subject": "Signal Fox", "qualityScore": 88}):
+            result = refresh.process_source_file_refresh_now(
+                self.db,
+                {"requestId": "req_now", "subjectName": "Signal Fox", "normalizedSubjectKey": "signal-fox", "reason": "opened_source_file", "source": "admin_source_file_open"},
+                guild_id=1,
+                environ={"BNL_SOURCE_FILE_READ_TOKEN": "read", "BNL_WEBSITE_BASE_URL": "https://site.test", "BNL_DOSSIER_INGEST_TOKEN": "ingest"},
+                opener=opener,
+                lookup_func=lookup,
+            )
+        self.assertEqual(result["status"], "success")
+        self.assertEqual([p["status"] for p in opener.posts], ["claimed", "completed"])
+
+    def test_site_polling_cooldown_does_not_leave_request_claimed(self):
+        conn = sqlite3.connect(self.db)
+        try:
+            refresh.ensure_source_file_refresh_schema(conn)
+            conn.execute(
+                f"INSERT OR REPLACE INTO {refresh.STATE_TABLE} (guild_id, subject_key, subject_name, cooldown_until, updated_at) VALUES (1, 'signal-fox', 'Signal Fox', '2999-01-01T00:00:00+00:00', 'now')"
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        opener = FakeOpener({"ok": True, "requests": [{"id": "req_1", "subjectName": "Signal Fox", "status": "pending", "reason": "stale_file", "source": "background"}]})
+        lookup = lambda query: {"ok": True, "found": True, "sourceFile": {"subjectName": "Signal Fox"}}
+        with mock.patch.object(refresh, "run_source_file_enrichment") as mocked:
+            summary = refresh.process_site_refresh_requests(
+                self.db,
+                guild_id=1,
+                environ={"BNL_SOURCE_FILE_READ_TOKEN": "read", "BNL_WEBSITE_BASE_URL": "https://site.test", "BNL_DOSSIER_INGEST_TOKEN": "ingest"},
+                opener=opener,
+                lookup_func=lookup,
+            )
+        mocked.assert_not_called()
+        self.assertEqual(summary["skipped"], 1)
+        self.assertEqual([p["status"] for p in opener.posts], ["claimed", "skipped"])
+        self.assertEqual(opener.posts[-1]["failureReason"], "cooldown_deferred")
+
+    def test_refresh_now_dry_run_behavior_unchanged(self):
+        opener = FakeOpener({"ok": True, "requests": []})
+        with mock.patch.object(refresh, "run_source_file_enrichment") as mocked:
+            result = refresh.process_source_file_refresh_now(
+                self.db,
+                {"requestId": "req_now", "subjectName": "Signal Fox", "normalizedSubjectKey": "signal-fox", "reason": "opened_source_file", "source": "admin_source_file_open"},
+                guild_id=1,
+                dry_run=True,
+                environ={"BNL_SOURCE_FILE_READ_TOKEN": "read", "BNL_WEBSITE_BASE_URL": "https://site.test"},
+                opener=opener,
+            )
+        mocked.assert_not_called()
+        self.assertEqual(result["status"], "dry_run")
+        self.assertEqual(opener.posts, [])
+        self.assertEqual(self.rows(), [])
+
+    def test_refresh_now_does_not_add_public_publishing_queue_payment_or_identity_flags(self):
+        with open("bnl_source_file_refresh.py", encoding="utf-8") as handle:
+            source = handle.read()
+        for forbidden in ("publish_public", "queue_payment", "artist_account", "canonical_profile_merge", "identity_alias"):
+            self.assertNotIn(forbidden, source)
+
 
 if __name__ == "__main__":
     unittest.main()
