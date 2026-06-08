@@ -605,6 +605,91 @@ class SourceFileRefreshTests(unittest.TestCase):
         self.assertEqual([p["status"] for p in opener.posts], ["claimed", "skipped"])
         self.assertEqual(opener.posts[-1]["failureReason"], "cooldown_deferred")
 
+
+    def test_refresh_now_existing_future_not_before_recent_success_returns_current(self):
+        conn = sqlite3.connect(self.db)
+        try:
+            refresh.ensure_source_file_refresh_schema(conn)
+            conn.execute(
+                f"INSERT INTO {refresh.QUEUE_TABLE} (guild_id, subject_key, subject_name, reason, evidence_source, evidence_count, priority, status, queued_at, updated_at, not_before_at, attempts, refresh_mode, created_by) VALUES (1, 'signal-fox', 'Signal Fox', 'old cooldown', 'source_refresh_now', 1, 10, 'cooldown', 'now', 'now', '2999-01-01T00:00:00+00:00', 0, 'site_open_request', 'test')"
+            )
+            conn.execute(
+                f"INSERT OR REPLACE INTO {refresh.STATE_TABLE} (guild_id, subject_key, subject_name, last_refresh_completed_at, last_refresh_status, last_recommendation_id, cooldown_until, updated_at) VALUES (1, 'signal-fox', 'Signal Fox', '2026-01-01T00:00:00+00:00', 'succeeded', 'rec_recent', '2999-01-01T00:00:00+00:00', 'now')"
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        opener = FakeOpener({"ok": True, "requests": []})
+        lookup = lambda query: {"ok": True, "found": True, "sourceFile": {"subjectName": "Signal Fox"}}
+        with mock.patch.object(refresh, "run_source_file_enrichment") as mocked, mock.patch.object(refresh.logging, "warning") as warning_mock:
+            result = refresh.process_source_file_refresh_now(
+                self.db,
+                {"requestId": "req_recent", "subjectName": "Signal Fox", "normalizedSubjectKey": "signal-fox", "reason": "opened_source_file", "source": "admin_source_file_open"},
+                guild_id=1,
+                environ={"BNL_SOURCE_FILE_READ_TOKEN": "read", "BNL_WEBSITE_BASE_URL": "https://site.test", "BNL_DOSSIER_INGEST_TOKEN": "ingest"},
+                opener=opener,
+                lookup_func=lookup,
+            )
+        mocked.assert_not_called()
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["recommendationId"], "rec_recent")
+        self.assertEqual(result["local"]["items"][0]["reason"], "cooldown_current")
+        self.assertEqual([p["status"] for p in opener.posts], ["claimed", "completed"])
+        warning_text = " ".join(str(call) for call in warning_mock.call_args_list)
+        self.assertNotIn("source_refresh_now_failed", warning_text)
+
+    def test_refresh_now_existing_future_not_before_without_recent_success_attempts_or_fails_truthfully(self):
+        conn = sqlite3.connect(self.db)
+        try:
+            refresh.ensure_source_file_refresh_schema(conn)
+            conn.execute(
+                f"INSERT INTO {refresh.QUEUE_TABLE} (guild_id, subject_key, subject_name, reason, evidence_source, evidence_count, priority, status, queued_at, updated_at, not_before_at, attempts, refresh_mode, created_by) VALUES (1, 'signal-fox', 'Signal Fox', 'old cooldown', 'source_refresh_now', 1, 10, 'cooldown', 'now', 'now', '2999-01-01T00:00:00+00:00', 0, 'site_open_request', 'test')"
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        opener = FakeOpener({"ok": True, "requests": []})
+        lookup = lambda query: {"ok": True, "found": True, "sourceFile": {"subjectName": "Signal Fox"}}
+        with mock.patch.object(refresh, "run_source_file_enrichment", return_value={"sent": False, "sendResult": {"error": "compact rejected"}, "status": "recommendation_send_failed"}) as mocked:
+            result = refresh.process_source_file_refresh_now(
+                self.db,
+                {"requestId": "req_fail", "subjectName": "Signal Fox", "normalizedSubjectKey": "signal-fox", "reason": "opened_source_file", "source": "admin_source_file_open"},
+                guild_id=1,
+                environ={"BNL_SOURCE_FILE_READ_TOKEN": "read", "BNL_WEBSITE_BASE_URL": "https://site.test", "BNL_DOSSIER_INGEST_TOKEN": "ingest"},
+                opener=opener,
+                lookup_func=lookup,
+            )
+        self.assertEqual(mocked.call_count, 1)
+        self.assertEqual(result["status"], "failed")
+        self.assertIn("compact rejected", result["failureReason"])
+        self.assertEqual([p["status"] for p in opener.posts], ["claimed", "failed"])
+
+    def test_refresh_now_manual_retry_existing_future_not_before_bypasses_and_attempts(self):
+        conn = sqlite3.connect(self.db)
+        try:
+            refresh.ensure_source_file_refresh_schema(conn)
+            conn.execute(
+                f"INSERT INTO {refresh.QUEUE_TABLE} (guild_id, subject_key, subject_name, reason, evidence_source, evidence_count, priority, status, queued_at, updated_at, not_before_at, attempts, refresh_mode, created_by) VALUES (1, 'signal-fox', 'Signal Fox', 'old cooldown', 'source_refresh_now', 1, 10, 'cooldown', 'now', 'now', '2999-01-01T00:00:00+00:00', 0, 'site_open_request', 'test')"
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        opener = FakeOpener({"ok": True, "requests": []})
+        lookup = lambda query: {"ok": True, "found": True, "sourceFile": {"subjectName": "Signal Fox"}}
+        with mock.patch.object(refresh, "run_source_file_enrichment", return_value={"sent": True, "recommendationSent": True, "archiveSent": True, "sendResult": {"recommendationId": "rec_retry", "ok": True}, "archiveResult": {"archiveId": "arc_retry", "ok": True, "status": 200}, "sourceCounts": {"conversations": 1}, "subject": "Signal Fox"}) as mocked:
+            result = refresh.process_source_file_refresh_now(
+                self.db,
+                {"requestId": "req_retry", "subjectName": "Signal Fox", "normalizedSubjectKey": "signal-fox", "reason": "manual_retry", "source": "admin_manual_retry"},
+                guild_id=1,
+                environ={"BNL_SOURCE_FILE_READ_TOKEN": "read", "BNL_WEBSITE_BASE_URL": "https://site.test", "BNL_DOSSIER_INGEST_TOKEN": "ingest"},
+                opener=opener,
+                lookup_func=lookup,
+            )
+        self.assertEqual(mocked.call_count, 1)
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["recommendationId"], "rec_retry")
+        self.assertEqual([p["status"] for p in opener.posts], ["claimed", "completed"])
+
     def test_refresh_now_dry_run_behavior_unchanged(self):
         opener = FakeOpener({"ok": True, "requests": []})
         with mock.patch.object(refresh, "run_source_file_enrichment") as mocked:

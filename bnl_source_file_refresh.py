@@ -483,6 +483,7 @@ def process_source_file_refresh_now(db_path: str, payload: dict[str, Any], *, gu
         logging.warning("source_refresh_now_failed request_id=%s reason=%s", request_id or "none", failure)
         return summary
 
+    immediate_not_before = utc_now()
     enqueue_source_file_refresh(
         db_path,
         guild_id=guild_id,
@@ -492,6 +493,7 @@ def process_source_file_refresh_now(db_path: str, payload: dict[str, Any], *, gu
         priority=100,
         refresh_mode=mode,
         created_by=source or "source_refresh_now",
+        not_before_at=immediate_not_before,
         evidence_count=1,
     )
     local = process_source_file_refresh_queue(
@@ -507,6 +509,22 @@ def process_source_file_refresh_now(db_path: str, payload: dict[str, Any], *, gu
         subject_key=skey,
     )
     item = (local.get("items") or [{}])[0]
+    if not item:
+        state = get_refresh_state(db_path, guild_id, skey)
+        if _state_has_current_success(state):
+            _mark_current_cooldown_terminal(db_path, guild_id=guild_id, subject_key=skey, reason="cooldown_current_no_item")
+            item = {
+                "subject": subject or lookup_value,
+                "status": "current",
+                "reason": "cooldown_current_no_item",
+                "recommendationId": _safe_text(state.get("last_recommendation_id") or "", 120),
+                "recommendationSent": bool(state.get("last_recommendation_id")),
+            }
+            local["items"] = [item]
+            logging.info("source_refresh_now_current request_id=%s subject_key=%s reason=cooldown_current_no_item", request_id or "none", skey or "none")
+        else:
+            item = {"subject": subject or lookup_value, "status": "failed", "error": "refresh_not_processed"}
+            local["items"] = [item]
     if str(item.get("status") or "").lower() == "cooldown":
         state = get_refresh_state(db_path, guild_id, skey)
         if _state_has_current_success(state):
