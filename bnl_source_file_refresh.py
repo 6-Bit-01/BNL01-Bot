@@ -23,7 +23,7 @@ import urllib.request
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
 
-from bnl_dossier_recommendations import is_dossier_ingest_token_configured, send_dossier_recommendation
+from bnl_dossier_recommendations import is_dossier_ingest_token_configured, is_source_file_archive_token_configured, send_dossier_recommendation
 from bnl_source_file_enrichment import run_source_file_enrichment
 from bnl_source_file_lookup import lookup_source_file
 from bnl_source_refresh_context import is_refresh_generation_subject, refresh_generation_context
@@ -408,7 +408,7 @@ def process_source_file_refresh_now(db_path: str, payload: dict[str, Any], *, gu
     reason = _safe_text(site_request.get("reason") or "", 80)
     logging.info("source_refresh_now_started request_id=%s subject_key=%s source=%s reason=%s", request_id or "none", skey or "none", source or "none", reason or "none")
 
-    summary: dict[str, Any] = {"ok": True, "dryRun": dry_run, "requestId": request_id, "candidateId": candidate_id, "subject": subject or skey, "subjectKey": skey, "status": "skipped", "recommendationId": "", "failureReason": ""}
+    summary: dict[str, Any] = {"ok": True, "dryRun": dry_run, "requestId": request_id, "candidateId": candidate_id, "subject": subject or skey, "subjectKey": skey, "status": "skipped", "recommendationId": "", "recommendationSent": False, "archiveSent": False, "archiveStatus": None, "archiveId": "", "archiveError": "", "failureReason": ""}
     if dry_run:
         summary.update({"status": "dry_run", "processed": 1})
         return summary
@@ -481,10 +481,16 @@ def process_source_file_refresh_now(db_path: str, payload: dict[str, Any], *, gu
     if request_id:
         _mark_site_request_terminal(request_id, item, environ=env, opener=opener)
     rec_id = _safe_text(item.get("recommendationId") or "", 120)
+    archive_id = _safe_text(item.get("archiveId") or "", 120)
     summary.update({
         "ok": site_status in {"completed", "skipped"},
         "status": "success" if site_status == "completed" else site_status,
         "recommendationId": rec_id,
+        "recommendationSent": bool(item.get("recommendationSent") or rec_id),
+        "archiveSent": bool(item.get("archiveSent")),
+        "archiveStatus": item.get("archiveStatus"),
+        "archiveId": archive_id,
+        "archiveError": _safe_text(item.get("archiveError") or "", 180),
         "failureReason": terminal_reason,
         "local": local,
     })
@@ -622,12 +628,12 @@ def process_source_file_refresh_queue(db_path: str, *, guild_id: int | None = No
         rows = conn.execute(f"SELECT * FROM {QUEUE_TABLE} WHERE {where} ORDER BY priority DESC, queued_at ASC LIMIT ?", [*params, max(1, int(max_items or 1))]).fetchall()
         if not rows:
             return summary
-        if not dry_run and not is_dossier_ingest_token_configured(env):
+        if not dry_run and not (is_dossier_ingest_token_configured(env) or is_source_file_archive_token_configured(env)):
             for row in rows:
-                conn.execute(f"UPDATE {QUEUE_TABLE} SET status='deferred', updated_at=?, last_error='missing_ingest_token' WHERE id=?", (now, row["id"]))
-                logging.info("source_refresh_skipped subject_key=%s reason=missing_ingest_token", row["subject_key"])
+                conn.execute(f"UPDATE {QUEUE_TABLE} SET status='deferred', updated_at=?, last_error='missing_source_refresh_token' WHERE id=?", (now, row["id"]))
+                logging.info("source_refresh_skipped subject_key=%s reason=missing_source_refresh_token", row["subject_key"])
                 summary["skipped"] += 1
-                summary["items"].append({"subject": row["subject_name"], "status": "deferred", "reason": "missing_ingest_token"})
+                summary["items"].append({"subject": row["subject_name"], "status": "deferred", "reason": "missing_source_refresh_token"})
             conn.commit()
             return summary
         for row in rows:
@@ -670,23 +676,32 @@ def process_source_file_refresh_queue(db_path: str, *, guild_id: int | None = No
                     summary["items"].append({"subject": row["subject_name"], "status": "skipped", "reason": "no_target", "error": "no_target"})
                 elif result.get("sent"):
                     send_result = result.get("sendResult") or {}
-                    recommendation_id = str(send_result.get("recommendationId") or send_result.get("recommendation_id") or send_result.get("id") or "")[:120]
+                    recommendation_id = str(send_result.get("recommendationId") or send_result.get("recommendation_id") or result.get("recommendationId") or send_result.get("id") or "")[:120]
+                    archive_result = result.get("archiveResult") or {}
+                    archive_id = str(archive_result.get("archiveId") or result.get("archiveId") or "")[:120]
                     cooldown_until_text = _cooldown_until_from(now_dt, cooldown_minutes)
                     evidence_count = sum(int(v or 0) for v in (result.get("sourceCounts") or {}).values()) if isinstance(result.get("sourceCounts"), dict) else int(row["evidence_count"] or 0)
                     conn.execute(f"UPDATE {QUEUE_TABLE} SET status='succeeded', updated_at=?, last_error=NULL WHERE id=?", (utc_now(), row["id"]))
                     _state_upsert(conn, guild_id=row["guild_id"], subject_key=row["subject_key"], subject_name=row["subject_name"], fields={"last_refresh_completed_at": utc_now(), "last_refresh_status": "succeeded", "last_recommendation_id": recommendation_id, "last_evidence_hash": _evidence_hash_for_result(result), "last_evidence_count": evidence_count, "last_error": None, "cooldown_until": cooldown_until_text})
                     conn.commit()
-                    logging.info("source_refresh_succeeded subject_key=%s recommendation_id=%s", row["subject_key"], recommendation_id or "none")
+                    logging.info("source_refresh_succeeded subject_key=%s recommendation_id=%s archive_id=%s", row["subject_key"], recommendation_id or "none", archive_id or "none")
                     summary["processed"] += 1
-                    summary["items"].append({"subject": row["subject_name"], "status": "succeeded", "recommendationId": recommendation_id})
+                    summary["items"].append({"subject": row["subject_name"], "status": "succeeded", "recommendationId": recommendation_id, "recommendationSent": bool(result.get("recommendationSent", bool(send_result.get("ok")))), "archiveSent": bool(result.get("archiveSent", bool(archive_result.get("ok")))), "archiveStatus": result.get("archiveStatus") or archive_result.get("status"), "archiveId": archive_id, "archiveError": _safe_text(result.get("archiveError") or archive_result.get("error") or "", 180)})
                 else:
-                    err = _safe_text((result.get("sendResult") or {}).get("error") or result.get("suppressedReason") or result.get("status") or "send_failed", 240)
+                    archive_result = result.get("archiveResult") or {}
+                    send_result = result.get("sendResult") or {}
+                    if result.get("recommendationSent") and not result.get("archiveSent"):
+                        err = _safe_text(result.get("archiveError") or archive_result.get("error") or "archive_send_failed", 240)
+                    elif result.get("archiveSent") and not result.get("recommendationSent"):
+                        err = _safe_text(send_result.get("error") or "recommendation_send_failed", 240)
+                    else:
+                        err = _safe_text(send_result.get("error") or archive_result.get("error") or result.get("suppressedReason") or result.get("status") or "send_failed", 240)
                     conn.execute(f"UPDATE {QUEUE_TABLE} SET status='failed', updated_at=?, last_error=? WHERE id=?", (utc_now(), err, row["id"]))
                     _state_upsert(conn, guild_id=row["guild_id"], subject_key=row["subject_key"], subject_name=row["subject_name"], fields={"last_refresh_status": "failed", "last_failure_at": utc_now(), "last_error": err})
                     conn.commit()
                     logging.warning("source_refresh_failed subject_key=%s error=%s", row["subject_key"], err)
                     summary["failed"] += 1
-                    summary["items"].append({"subject": row["subject_name"], "status": "failed", "error": err})
+                    summary["items"].append({"subject": row["subject_name"], "status": "failed", "error": err, "recommendationSent": bool(result.get("recommendationSent")), "archiveSent": bool(result.get("archiveSent")), "archiveStatus": result.get("archiveStatus") or archive_result.get("status"), "archiveId": str(archive_result.get("archiveId") or result.get("archiveId") or "")[:120], "archiveError": _safe_text(result.get("archiveError") or archive_result.get("error") or "", 180), "recommendationId": str(send_result.get("recommendationId") or result.get("recommendationId") or "")[:120]})
             except Exception as exc:
                 err = _safe_text(exc, 240)
                 conn.execute(f"UPDATE {QUEUE_TABLE} SET status='failed', updated_at=?, last_error=? WHERE id=?", (utc_now(), err, row["id"]))

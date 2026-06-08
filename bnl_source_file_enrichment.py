@@ -16,7 +16,7 @@ from collections import Counter, defaultdict
 from datetime import datetime, timezone
 from typing import Any, Callable
 
-from bnl_dossier_recommendations import build_dossier_recommendation_payload, send_dossier_recommendation
+from bnl_dossier_recommendations import build_dossier_recommendation_payload, is_source_file_archive_token_configured, send_dossier_recommendation, send_source_file_archive_enrichment
 from bnl_entity_activity_summary import build_entity_activity_summary, refresh_entity_evidence_for_subject
 from bnl_entity_evidence import _website_safe_payload_text
 from bnl_entity_intelligence import build_entity_intelligence_profile, resolve_entity_context_for_surface, safe_text as _entity_safe_text
@@ -2416,6 +2416,87 @@ def deterministic_enrichment_ingest_key(subject: str, match_kind: str, sections:
     return f"bnl:source-enrichment:{_subject_key(subject)}:{match_kind}:{digest}"
 
 
+
+_ARCHIVE_REDACT_KEY_RE = re.compile(r"(?i)(token|secret|authorization|api[_-]?key|password|customer[_-]?id|payment[_-]?id|stripe|raw[_-]?discord[_-]?id|discord[_-]?user[_-]?id|user[_-]?id|member[_-]?id|channel[_-]?id|private.*transcript|raw.*transcript)")
+_ARCHIVE_ALLOWED_KEYS_TO_KEEP_AS_REDACTED = {"channelPolicy", "visibility", "authority", "sourceScope", "sourceTable", "sourceLabel", "sourceRowId"}
+
+
+def _archive_safe_scalar(value: Any, limit: int = 5000) -> Any:
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    text = str(value)
+    text = _DISCORD_MENTION_RE.sub("[redacted-mention]", text)
+    text = _LONG_ID_RE.sub("[redacted-id]", text)
+    text = _EMAIL_RE.sub("[redacted-email]", text)
+    text = re.sub(r"(?i)(Bearer\s+)[A-Za-z0-9._~+/-]+", r"\1[redacted]", text)
+    text = re.sub(r"(?i)(token|secret|authorization|api[_-]?key|password)\s*[:=]\s*[^\s,;}]+", r"\1=[redacted]", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    if len(text) > limit:
+        text = text[: max(0, limit - 1)].rstrip() + "…"
+    return text
+
+
+def _sanitize_archive_value(value: Any, *, key: str = "", depth: int = 0) -> Any:
+    if depth > 12:
+        return "[redacted-depth]"
+    if key and _ARCHIVE_REDACT_KEY_RE.search(key) and key not in _ARCHIVE_ALLOWED_KEYS_TO_KEEP_AS_REDACTED:
+        return "[redacted]"
+    if isinstance(value, dict):
+        cleaned: dict[str, Any] = {}
+        for raw_key, raw_value in value.items():
+            safe_key = _archive_safe_scalar(raw_key, 120)
+            if not safe_key:
+                continue
+            cleaned[str(safe_key)] = _sanitize_archive_value(raw_value, key=str(safe_key), depth=depth + 1)
+        return cleaned
+    if isinstance(value, (list, tuple, set)):
+        return [_sanitize_archive_value(item, key=key, depth=depth + 1) for item in list(value)]
+    return _archive_safe_scalar(value)
+
+
+def _source_package_from_packet(packet: dict[str, Any]) -> dict[str, Any]:
+    """Build the full review-only archive package without compact-card trimming."""
+
+    excluded = {"payload", "sendResult", "archiveResult", "sourcePackage"}
+    package = {key: value for key, value in (packet or {}).items() if key not in excluded}
+    package["archiveNotice"] = "Internal/review-only Source File archive package. No public publishing, draft creation, tag creation, queue/payment action, identity merge, or alias confirmation is requested."
+    return _sanitize_archive_value(package)
+
+
+def build_source_file_archive_payload(packet: dict[str, Any], *, environ: dict[str, str] | None = None) -> dict[str, Any]:
+    """Build the full Source File archive envelope for the site archive endpoint."""
+
+    source_file = packet.get("sourceFile") if isinstance(packet.get("sourceFile"), dict) else {}
+    compact_summary = build_compact_enrichment_evidence_summary(packet)
+    subject = _safe_text(packet.get("subject") or _first(source_file, ("name", "sourceFileName", "subject", "displayName", "title", "normalizedName")), 140)
+    subject_key = _subject_key(subject or _first(source_file, ("normalizedName", "subjectKey", "slug")))
+    candidate_id = _first(source_file, ("candidateId", "targetCandidateId", "candidate_id", "id"))
+    sections = packet.get("sections") or {}
+    receipt = {
+        "qualityScore": packet.get("qualityScore"),
+        "qualityStatus": packet.get("qualityStatus"),
+        "sourceCounts": dict(packet.get("sourceCounts") or {}),
+        "sourceTypes": list(packet.get("sourceTypes") or []),
+        "warningCounts": dict(packet.get("warningCounts") or {}),
+        "warnings": list(packet.get("warnings") or []),
+        "matchKind": packet.get("matchKind"),
+        "runTime": packet.get("runTime"),
+    }
+    envelope = {
+        "candidateId": _sanitize_archive_value(candidate_id) if candidate_id else None,
+        "subjectName": subject,
+        "subjectKey": subject_key,
+        "ingestKey": packet.get("ingestKey") or deterministic_enrichment_ingest_key(subject, str(packet.get("matchKind") or "none"), sections),
+        "compactSummary": compact_summary,
+        "publicSafePossibilities": _sanitize_archive_value(list(packet.get("publicSafePossibilities") or [])),
+        "missingInfo": _sanitize_archive_value(_section_text(sections, "Missing Info", limit=10) or packet.get("missingInfo") or ""),
+        "publicSafetyNotes": _sanitize_archive_value(_section_text(sections, "Public-Safe Notes", limit=10) or packet.get("publicSafetyNotes") or ""),
+        "doNotSay": _sanitize_archive_value(_section_text(sections, "Do Not Say", limit=10) or packet.get("doNotSay") or ""),
+        "evidenceReceiptSummary": _sanitize_archive_value(receipt),
+        "sourcePackage": _source_package_from_packet(packet),
+    }
+    return envelope
+
 def build_enrichment_recommendation_payload(packet: dict[str, Any], *, environ: dict[str, str] | None = None) -> dict[str, Any]:
     sections = packet.get("sections") or {}
     subject = str(packet.get("subject") or "").strip()
@@ -2499,6 +2580,7 @@ def run_source_file_enrichment(
     rd_context: list[dict[str, Any]] | None = None,
     lookup_func: Callable[[dict[str, str]], dict[str, Any]] = lookup_source_file,
     sender: Callable[[dict[str, Any]], dict[str, Any]] = send_dossier_recommendation,
+    archive_sender: Callable[[dict[str, Any]], dict[str, Any]] = send_source_file_archive_enrichment,
     environ: dict[str, str] | None = None,
     lookup_key: str = "subject",
     lookup_value: str | None = None,
@@ -2636,10 +2718,35 @@ def run_source_file_enrichment(
         packet["sendResult"] = {"ok": False, "error": quality["suppressedReason"]}
         packet["status"] = "suppressed_too_thin"
         return packet
+    archive_payload = build_source_file_archive_payload(packet, environ=environ)
+    packet["archivePayload"] = archive_payload
+    archive_required = is_source_file_archive_token_configured(environ)
+    if archive_required:
+        archive_result = archive_sender(archive_payload)
+    else:
+        archive_result = {"ok": True, "archiveId": None, "error": "", "status": "not_configured_skipped"}
+        logging.info("source_file_archive_send_skipped reason=archive_token_not_configured subject_key=%s", _subject_key(subject))
+    packet["archiveResult"] = archive_result
+    packet["archiveSent"] = bool(archive_required and (archive_result or {}).get("ok"))
+    packet["archiveStatus"] = (archive_result or {}).get("status")
+    packet["archiveId"] = (archive_result or {}).get("archiveId") or ""
+    packet["archiveError"] = _safe_text((archive_result or {}).get("error") or "", 240)
+
     send_result = sender(payload)
     packet["sendResult"] = send_result
-    packet["sent"] = bool((send_result or {}).get("ok"))
-    packet["status"] = "sent" if packet["sent"] else "send_failed"
+    packet["recommendationSent"] = bool((send_result or {}).get("ok"))
+    packet["recommendationId"] = (send_result or {}).get("recommendationId") or (send_result or {}).get("id") or ""
+    packet["sent"] = bool(packet["recommendationSent"] and ((not archive_required) or packet["archiveSent"]))
+    if packet["sent"]:
+        packet["status"] = "sent"
+    elif (packet["archiveSent"] or not archive_required) and not packet["recommendationSent"]:
+        packet["status"] = "recommendation_send_failed"
+        logging.warning("source_enrichment_compact_recommendation_failed archive_ok=true subject_key=%s", _subject_key(subject))
+    elif packet["recommendationSent"] and not packet["archiveSent"]:
+        packet["status"] = "archive_send_failed"
+        logging.warning("source_enrichment_archive_failed recommendation_ok=true subject_key=%s", _subject_key(subject))
+    else:
+        packet["status"] = "send_failed"
     return packet
 
 
