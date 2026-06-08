@@ -336,7 +336,7 @@ def _site_refresh_mode(request: dict[str, Any]) -> str:
     source = str(request.get("source") or "").lower()
     reason = str(request.get("reason") or "").lower()
     high_priority = bool(request.get("highPriority") or request.get("manual") or request.get("force"))
-    if source in {"admin_manual_retry", "admin_source_file_open"} or reason in {"manual_retry", "opened_source_file", "file_not_updated"}:
+    if source in {"admin_manual_retry"} or reason in {"manual_retry", "file_not_updated"}:
         high_priority = True
     return "site_manual_request" if high_priority or "manual" in raw or "button" in raw else "site_open_request"
 
@@ -366,7 +366,7 @@ def _site_refresh_lookup_parts(site_request: dict[str, Any]) -> tuple[str, str]:
 
 def _site_status_for_local_item(item: dict[str, Any]) -> tuple[str, str]:
     status = str(item.get("status") or "").lower()
-    if status == "succeeded":
+    if status in {"succeeded", "current", "already_current"}:
         return "completed", ""
     if status in {"skipped", "cooldown", "deferred", "no_target", "dry_run"}:
         return "skipped", _safe_text(item.get("reason") or item.get("error") or status, 240)
@@ -387,6 +387,36 @@ def _mark_site_request_terminal(request_id: str, item: dict[str, Any], *, enviro
     logging.info("source_refresh_now_site_status_updated request_id=%s status=%s ok=%s", _safe_text(request_id, 120), site_status, bool(result.get("ok")))
     return result
 
+
+def _state_has_current_success(state: dict[str, Any] | sqlite3.Row | None) -> bool:
+    if not state:
+        return False
+    if isinstance(state, sqlite3.Row):
+        status_value = state["last_refresh_status"]
+        completed_value = state["last_refresh_completed_at"]
+        cooldown_value = state["cooldown_until"]
+    else:
+        status_value = state.get("last_refresh_status")
+        completed_value = state.get("last_refresh_completed_at")
+        cooldown_value = state.get("cooldown_until")
+    status = str(status_value or "").lower()
+    completed = parse_iso(completed_value)
+    cooldown_until = parse_iso(cooldown_value)
+    now_dt = datetime.now(timezone.utc).replace(microsecond=0)
+    return status == "succeeded" and completed is not None and cooldown_until is not None and cooldown_until > now_dt
+
+
+def _mark_current_cooldown_terminal(db_path: str, *, guild_id: int | None, subject_key: str, reason: str = "cooldown_current") -> None:
+    conn = sqlite3.connect(db_path)
+    try:
+        ensure_source_file_refresh_schema(conn)
+        conn.execute(
+            f"UPDATE {QUEUE_TABLE} SET status='skipped', updated_at=?, last_error=? WHERE (guild_id IS ? OR guild_id=?) AND subject_key=? AND status IN ('queued','deferred','cooldown','failed') AND evidence_source='source_refresh_now'",
+            (utc_now(), reason, guild_id, guild_id, source_refresh_subject_key(subject_key)),
+        )
+        conn.commit()
+    finally:
+        conn.close()
 
 def process_source_file_refresh_now(db_path: str, payload: dict[str, Any], *, guild_id: int | None = None, dry_run: bool = False, lookup_func: Callable[[dict[str, str]], dict[str, Any]] = lookup_source_file, sender: Callable[[dict[str, Any]], dict[str, Any]] = send_dossier_recommendation, environ: dict[str, str] | None = None, opener=None) -> dict[str, Any]:
     """Process one immediate website Source File refresh request.
@@ -472,11 +502,24 @@ def process_source_file_refresh_now(db_path: str, payload: dict[str, Any], *, gu
         lookup_func=lookup_func,
         sender=sender,
         environ=env,
-        bypass_cooldown=source in {"admin_source_file_open", "admin_manual_retry"} or reason in {"opened_source_file", "manual_retry", "file_not_updated"},
+        bypass_cooldown=source in {"admin_manual_retry"} or reason in {"manual_retry", "file_not_updated"},
         refresh_mode=mode,
         subject_key=skey,
     )
     item = (local.get("items") or [{}])[0]
+    if str(item.get("status") or "").lower() == "cooldown":
+        state = get_refresh_state(db_path, guild_id, skey)
+        if _state_has_current_success(state):
+            _mark_current_cooldown_terminal(db_path, guild_id=guild_id, subject_key=skey, reason="cooldown_current")
+            item = {
+                **item,
+                "status": "current",
+                "reason": "cooldown_current",
+                "recommendationId": _safe_text(state.get("last_recommendation_id") or "", 120),
+                "recommendationSent": bool(state.get("last_recommendation_id")),
+            }
+            local["items"] = [item, *(local.get("items") or [])[1:]]
+            logging.info("source_refresh_now_current request_id=%s subject_key=%s reason=cooldown_current", request_id or "none", skey or "none")
     site_status, terminal_reason = _site_status_for_local_item(item)
     if request_id:
         _mark_site_request_terminal(request_id, item, environ=env, opener=opener)

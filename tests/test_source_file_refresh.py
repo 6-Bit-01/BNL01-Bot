@@ -429,7 +429,7 @@ class SourceFileRefreshTests(unittest.TestCase):
     def test_refresh_now_valid_request_processes_immediately_and_completes(self):
         opener = FakeOpener({"ok": True, "requests": []})
         lookup = lambda query: {"ok": True, "found": True, "sourceFile": {"subjectName": "Signal Fox"}}
-        with mock.patch.object(refresh, "run_source_file_enrichment", return_value={"sent": True, "sendResult": {"recommendationId": "rec_now"}, "sourceCounts": {"conversations": 1}, "sourceTypes": ["conversations"], "subject": "Signal Fox", "qualityScore": 88}) as mocked:
+        with mock.patch.object(refresh, "run_source_file_enrichment", return_value={"sent": True, "recommendationSent": True, "archiveSent": True, "sendResult": {"recommendationId": "rec_now", "ok": True}, "archiveResult": {"archiveId": "arc_now", "ok": True, "status": 200}, "sourceCounts": {"conversations": 1}, "sourceTypes": ["conversations"], "subject": "Signal Fox", "qualityScore": 88}) as mocked:
             result = refresh.process_source_file_refresh_now(
                 self.db,
                 {"requestId": "req_now", "candidateId": "cand_1", "subjectName": "Signal Fox", "normalizedSubjectKey": "signal-fox", "reason": "opened_source_file", "source": "admin_source_file_open"},
@@ -440,6 +440,8 @@ class SourceFileRefreshTests(unittest.TestCase):
             )
         self.assertEqual(result["status"], "success")
         self.assertEqual(result["recommendationId"], "rec_now")
+        self.assertTrue(result["archiveSent"])
+        self.assertEqual(result["archiveId"], "arc_now")
         self.assertEqual(mocked.call_count, 1)
         self.assertEqual([p["status"] for p in opener.posts], ["claimed", "completed"])
         self.assertEqual(opener.posts[-1]["completedByRecommendationId"], "rec_now")
@@ -460,6 +462,43 @@ class SourceFileRefreshTests(unittest.TestCase):
         self.assertEqual([p["status"] for p in opener.posts], ["claimed", "failed"])
         self.assertIn("site rejected", opener.posts[-1]["failureReason"])
 
+    def test_refresh_now_archive_failure_still_reports_failure(self):
+        opener = FakeOpener({"ok": True, "requests": []})
+        lookup = lambda query: {"ok": True, "found": True, "sourceFile": {"subjectName": "Signal Fox"}}
+        with mock.patch.object(refresh, "run_source_file_enrichment", return_value={"sent": False, "recommendationSent": True, "archiveSent": False, "sendResult": {"recommendationId": "rec_partial", "ok": True}, "archiveResult": {"ok": False, "error": "archive rejected", "status": 500}, "archiveError": "archive rejected", "status": "archive_send_failed"}):
+            result = refresh.process_source_file_refresh_now(
+                self.db,
+                {"requestId": "req_archive", "subjectName": "Signal Fox", "normalizedSubjectKey": "signal-fox", "reason": "manual_retry", "source": "admin_manual_retry"},
+                guild_id=1,
+                environ={"BNL_SOURCE_FILE_READ_TOKEN": "read", "BNL_WEBSITE_BASE_URL": "https://site.test", "BNL_DOSSIER_INGEST_TOKEN": "ingest"},
+                opener=opener,
+                lookup_func=lookup,
+            )
+        self.assertEqual(result["status"], "failed")
+        self.assertFalse(result["archiveSent"])
+        self.assertIn("archive rejected", result["archiveError"])
+        self.assertEqual([p["status"] for p in opener.posts], ["claimed", "failed"])
+        self.assertIn("archive rejected", opener.posts[-1]["failureReason"])
+
+    def test_refresh_now_compact_recommendation_failure_still_reports_failure(self):
+        opener = FakeOpener({"ok": True, "requests": []})
+        lookup = lambda query: {"ok": True, "found": True, "sourceFile": {"subjectName": "Signal Fox"}}
+        with mock.patch.object(refresh, "run_source_file_enrichment", return_value={"sent": False, "recommendationSent": False, "archiveSent": True, "sendResult": {"ok": False, "error": "compact rejected"}, "archiveResult": {"ok": True, "archiveId": "arc_partial", "status": 200}, "status": "recommendation_send_failed"}):
+            result = refresh.process_source_file_refresh_now(
+                self.db,
+                {"requestId": "req_compact", "subjectName": "Signal Fox", "normalizedSubjectKey": "signal-fox", "reason": "manual_retry", "source": "admin_manual_retry"},
+                guild_id=1,
+                environ={"BNL_SOURCE_FILE_READ_TOKEN": "read", "BNL_WEBSITE_BASE_URL": "https://site.test", "BNL_DOSSIER_INGEST_TOKEN": "ingest"},
+                opener=opener,
+                lookup_func=lookup,
+            )
+        self.assertEqual(result["status"], "failed")
+        self.assertTrue(result["archiveSent"])
+        self.assertEqual(result["archiveId"], "arc_partial")
+        self.assertIn("compact rejected", result["failureReason"])
+        self.assertEqual([p["status"] for p in opener.posts], ["claimed", "failed"])
+        self.assertIn("compact rejected", opener.posts[-1]["failureReason"])
+
     def test_refresh_now_no_target_does_not_stay_claimed(self):
         opener = FakeOpener({"ok": True, "requests": []})
         lookup = lambda query: {"ok": True, "found": False}
@@ -479,19 +518,54 @@ class SourceFileRefreshTests(unittest.TestCase):
         self.assertEqual(opener.posts[-1]["failureReason"], "no_target")
         self.assertEqual(self.rows(), [])
 
-    def test_refresh_now_cooldown_bypassed_for_admin_open(self):
+    def test_refresh_now_fresh_cooldown_is_current_not_failed_for_admin_open(self):
+        opener = FakeOpener({"ok": True, "requests": []})
+        lookup = lambda query: {"ok": True, "found": True, "sourceFile": {"subjectName": "Signal Fox"}}
+        with mock.patch.object(refresh, "run_source_file_enrichment", return_value={"sent": True, "recommendationSent": True, "archiveSent": True, "sendResult": {"recommendationId": "rec_first", "ok": True}, "archiveResult": {"archiveId": "arc_first", "ok": True, "status": 200}, "sourceCounts": {"conversations": 1}, "sourceTypes": ["conversations"], "subject": "Signal Fox", "qualityScore": 88}) as mocked:
+            first = refresh.process_source_file_refresh_now(
+                self.db,
+                {"requestId": "req_first", "subjectName": "Signal Fox", "normalizedSubjectKey": "signal-fox", "reason": "opened_source_file", "source": "admin_source_file_open"},
+                guild_id=1,
+                environ={"BNL_SOURCE_FILE_READ_TOKEN": "read", "BNL_WEBSITE_BASE_URL": "https://site.test", "BNL_DOSSIER_INGEST_TOKEN": "ingest"},
+                opener=opener,
+                lookup_func=lookup,
+            )
+            with mock.patch.object(refresh.logging, "warning") as warning_mock:
+                second = refresh.process_source_file_refresh_now(
+                    self.db,
+                    {"requestId": "req_second", "subjectName": "Signal Fox", "normalizedSubjectKey": "signal-fox", "reason": "opened_source_file", "source": "admin_source_file_open"},
+                    guild_id=1,
+                    environ={"BNL_SOURCE_FILE_READ_TOKEN": "read", "BNL_WEBSITE_BASE_URL": "https://site.test", "BNL_DOSSIER_INGEST_TOKEN": "ingest"},
+                    opener=opener,
+                    lookup_func=lookup,
+                )
+        self.assertEqual(first["status"], "success")
+        self.assertEqual(first["recommendationId"], "rec_first")
+        self.assertTrue(first["archiveSent"])
+        self.assertEqual(first["archiveId"], "arc_first")
+        self.assertEqual(second["status"], "success")
+        self.assertEqual(second["failureReason"], "")
+        self.assertEqual(second["local"]["items"][0]["reason"], "cooldown_current")
+        self.assertEqual(second["recommendationId"], "rec_first")
+        self.assertEqual(mocked.call_count, 1)
+        self.assertEqual([p["status"] for p in opener.posts], ["claimed", "completed", "claimed", "completed"])
+        warning_text = " ".join(str(call) for call in warning_mock.call_args_list)
+        self.assertNotIn("source_refresh_now_failed", warning_text)
+        self.assertEqual(self.rows(), [])
+
+    def test_refresh_now_cooldown_after_failure_is_not_reported_current(self):
         conn = sqlite3.connect(self.db)
         try:
             refresh.ensure_source_file_refresh_schema(conn)
             conn.execute(
-                f"INSERT OR REPLACE INTO {refresh.STATE_TABLE} (guild_id, subject_key, subject_name, cooldown_until, updated_at) VALUES (1, 'signal-fox', 'Signal Fox', '2999-01-01T00:00:00+00:00', 'now')"
+                f"INSERT OR REPLACE INTO {refresh.STATE_TABLE} (guild_id, subject_key, subject_name, last_refresh_status, last_failure_at, last_error, cooldown_until, updated_at) VALUES (1, 'signal-fox', 'Signal Fox', 'failed', 'now', 'site rejected', '2999-01-01T00:00:00+00:00', 'now')"
             )
             conn.commit()
         finally:
             conn.close()
         opener = FakeOpener({"ok": True, "requests": []})
         lookup = lambda query: {"ok": True, "found": True, "sourceFile": {"subjectName": "Signal Fox"}}
-        with mock.patch.object(refresh, "run_source_file_enrichment", return_value={"sent": True, "sendResult": {"recommendationId": "rec_fresh"}, "sourceCounts": {"conversations": 1}, "sourceTypes": ["conversations"], "subject": "Signal Fox", "qualityScore": 88}):
+        with mock.patch.object(refresh, "run_source_file_enrichment") as mocked:
             result = refresh.process_source_file_refresh_now(
                 self.db,
                 {"requestId": "req_now", "subjectName": "Signal Fox", "normalizedSubjectKey": "signal-fox", "reason": "opened_source_file", "source": "admin_source_file_open"},
@@ -500,8 +574,11 @@ class SourceFileRefreshTests(unittest.TestCase):
                 opener=opener,
                 lookup_func=lookup,
             )
-        self.assertEqual(result["status"], "success")
-        self.assertEqual([p["status"] for p in opener.posts], ["claimed", "completed"])
+        mocked.assert_not_called()
+        self.assertEqual(result["status"], "skipped")
+        self.assertEqual(result["failureReason"], "cooldown")
+        self.assertEqual([p["status"] for p in opener.posts], ["claimed", "skipped"])
+        self.assertEqual(opener.posts[-1]["failureReason"], "cooldown")
 
     def test_site_polling_cooldown_does_not_leave_request_claimed(self):
         conn = sqlite3.connect(self.db)
