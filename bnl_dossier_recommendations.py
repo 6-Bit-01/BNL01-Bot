@@ -18,7 +18,9 @@ import urllib.request
 from typing import Any
 
 DEFAULT_DOSSIER_INGEST_URL = "https://www.barcode-network.com/api/bnl/dossier-recommendations"
+DEFAULT_SOURCE_FILE_ARCHIVE_URL = "https://www.barcode-network.com/api/bnl/source-file-enrichments"
 DOSSIER_INGEST_TIMEOUT_SECONDS = 10
+SOURCE_FILE_ARCHIVE_TIMEOUT_SECONDS = 15
 SUPPORTED_PAYLOAD_FIELDS = {
     "type",
     "subjectName",
@@ -100,6 +102,30 @@ def is_dossier_ingest_token_configured(environ: dict[str, str] | None = None) ->
 
     env = environ if environ is not None else os.environ
     return bool((env.get("BNL_DOSSIER_INGEST_TOKEN") or "").strip())
+
+
+def get_source_file_archive_url(environ: dict[str, str] | None = None) -> str:
+    """Return configured Source File archive URL or production fallback."""
+
+    env = environ if environ is not None else os.environ
+    configured = (env.get("BNL_SOURCE_FILE_ARCHIVE_URL") or "").strip()
+    return configured or DEFAULT_SOURCE_FILE_ARCHIVE_URL
+
+
+def get_source_file_archive_token(environ: dict[str, str] | None = None) -> str:
+    """Return archive token, falling back to dossier ingest token when needed."""
+
+    env = environ if environ is not None else os.environ
+    archive_token = (env.get("BNL_SOURCE_FILE_ARCHIVE_TOKEN") or "").strip()
+    if archive_token:
+        return archive_token
+    return (env.get("BNL_DOSSIER_INGEST_TOKEN") or "").strip()
+
+
+def is_source_file_archive_token_configured(environ: dict[str, str] | None = None) -> bool:
+    """Return whether the Source File archive sender has a usable token."""
+
+    return bool(get_source_file_archive_token(environ))
 
 
 def _normalize_subject_key(subject_name: str) -> str:
@@ -328,3 +354,86 @@ def send_dossier_recommendation(payload: dict[str, Any], *, environ: dict[str, s
 
     logging.warning(f"dossier_recommendation_send_failed status={status}")
     return _safe_failure("Dossier recommendation endpoint returned a failure.", status=status, duplicate=duplicate)
+
+
+def _extract_archive_id(parsed: dict[str, Any]) -> str | None:
+    for key in ("archiveId", "archive_id", "sourceFileEnrichmentId", "source_file_enrichment_id", "id"):
+        value = parsed.get(key)
+        if value:
+            return str(value)[:160]
+    data = parsed.get("data")
+    if isinstance(data, dict):
+        return _extract_archive_id(data)
+    archive = parsed.get("archive") or parsed.get("enrichment")
+    if isinstance(archive, dict):
+        return _extract_archive_id(archive)
+    return None
+
+
+def _safe_archive_failure(error: str, status: int | None = None) -> dict[str, Any]:
+    return {"ok": False, "archiveId": None, "error": error, "status": status}
+
+
+def send_source_file_archive_enrichment(payload: dict[str, Any], *, environ: dict[str, str] | None = None, opener=None) -> dict[str, Any]:
+    """POST a full Source File enrichment envelope to the review-only archive endpoint.
+
+    This sender is intentionally separate from send_dossier_recommendation() so
+    large case-file packages never have to fit through compact recommendation
+    card fields. Logs include only routing/status metadata, never tokens or the
+    archive payload body.
+    """
+
+    env = environ if environ is not None else os.environ
+    token = get_source_file_archive_token(env)
+    if not token:
+        logging.warning("source_file_archive_send_failed reason=missing_archive_token")
+        return _safe_archive_failure("Source File archive token is not configured.")
+
+    url = get_source_file_archive_url(env)
+    safe_payload = dict(payload or {})
+    subject_key = _normalize_subject_key(str(safe_payload.get("subjectKey") or safe_payload.get("subjectName") or ""))
+    logging.info("source_file_archive_send_attempted endpoint_configured=%s subject_key=%s", bool(url), subject_key)
+
+    body = json.dumps(safe_payload).encode("utf-8")
+    request = urllib.request.Request(
+        url,
+        data=body,
+        headers={"Content-Type": "application/json", "Authorization": f"Bearer {token}"},
+        method="POST",
+    )
+    urlopen = opener.open if opener is not None else urllib.request.urlopen
+    try:
+        with urlopen(request, timeout=SOURCE_FILE_ARCHIVE_TIMEOUT_SECONDS) as response:
+            status = getattr(response, "status", None) or response.getcode()
+            raw = response.read().decode("utf-8")
+    except urllib.error.HTTPError as exc:
+        status = exc.code
+        try:
+            body_text = _safe_response_error_text(exc.read())
+        except Exception:
+            body_text = _safe_response_error_text(getattr(exc, "reason", ""))
+        error = "Source File archive endpoint rejected the request."
+        if body_text:
+            error = f"{error} {body_text}"
+        logging.warning("source_file_archive_send_failed status=%s endpoint_error=%s", status, body_text or "unavailable")
+        return _safe_archive_failure(error, status=status)
+    except (urllib.error.URLError, TimeoutError, socket.timeout):
+        logging.warning("source_file_archive_send_failed reason=network_or_timeout")
+        return _safe_archive_failure("Source File archive endpoint was unreachable or timed out.")
+    except Exception:
+        logging.warning("source_file_archive_send_failed reason=unexpected_error")
+        return _safe_archive_failure("Source File archive send failed unexpectedly.")
+
+    try:
+        parsed = json.loads(raw) if raw.strip() else {}
+    except json.JSONDecodeError:
+        logging.warning("source_file_archive_send_failed status=%s reason=invalid_json", status)
+        return _safe_archive_failure("Source File archive endpoint returned invalid JSON.", status=status)
+
+    ok = bool(parsed.get("ok", True)) and 200 <= int(status or 0) < 300
+    archive_id = _extract_archive_id(parsed) if isinstance(parsed, dict) else None
+    if ok:
+        logging.info("source_file_archive_send_succeeded status=%s archive_id=%s", status, archive_id or "none")
+        return {"ok": True, "archiveId": archive_id, "error": "", "status": status}
+    logging.warning("source_file_archive_send_failed status=%s", status)
+    return _safe_archive_failure("Source File archive endpoint returned a failure.", status=status)
