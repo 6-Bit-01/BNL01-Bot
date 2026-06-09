@@ -92,6 +92,12 @@ from bnl_source_file_enrichment import (
     run_source_file_enrichment,
     source_enrichment_ingest_source,
 )
+from bnl_memory_snapshot import (
+    DEFAULT_LIMIT as MEMORY_SNAPSHOT_DEFAULT_LIMIT,
+    build_bnl_memory_snapshot,
+    clamp_limit as clamp_memory_snapshot_limit,
+    parse_bool as parse_memory_snapshot_bool,
+)
 from bnl_source_file_refresh import (
     DEFAULT_MAX_AUTOMATIC_PER_CYCLE,
     DEFAULT_MAX_SITE_REQUESTS_PER_CYCLE,
@@ -189,6 +195,8 @@ _last_generation_status = {
 }
 
 BNL_FORCE_PULL_SHARED_SECRET = os.getenv("BNL_FORCE_PULL_SHARED_SECRET", "").strip()
+BNL_MEMORY_SNAPSHOT_TOKEN_HEADER = "x-bnl-memory-snapshot-token"
+BNL_MEMORY_SNAPSHOT_PATH = "/internal/bnl/memory-snapshot"
 BNL_FORCE_PULL_PORT = int(os.getenv("BNL_FORCE_PULL_PORT", "8787") or 8787)
 BNL_OWNER_USER_ID = int(os.getenv("BNL_OWNER_USER_ID", "0") or 0)
 BNL_MOD_ROLE_ID = int(os.getenv("BNL_MOD_ROLE_ID", "0") or 0)
@@ -3511,6 +3519,71 @@ async def _handle_source_file_refresh_now(request: web.Request) -> web.Response:
     http_status = 200 if status in {"success", "skipped", "dry_run"} else 500
     return web.json_response(result, status=http_status)
 
+
+def _memory_snapshot_configured_token() -> str:
+    return (os.getenv("BNL_MEMORY_SNAPSHOT_TOKEN") or "").strip()
+
+
+def is_memory_snapshot_token_valid(provided_token: str | None) -> bool:
+    expected = _memory_snapshot_configured_token()
+    return bool(expected and provided_token and str(provided_token).strip() == expected)
+
+
+def _memory_snapshot_auth_token_from_request(request: web.Request) -> str:
+    header_value = request.headers.get(BNL_MEMORY_SNAPSHOT_TOKEN_HEADER) or request.headers.get(
+        BNL_MEMORY_SNAPSHOT_TOKEN_HEADER.lower()
+    )
+    if header_value:
+        return str(header_value).strip()
+    auth_value = str(request.headers.get("Authorization") or "").strip()
+    if auth_value.lower().startswith("bearer "):
+        return auth_value[7:].strip()
+    return ""
+
+
+async def _handle_bnl_memory_snapshot(request: web.Request) -> web.Response:
+    if not _memory_snapshot_configured_token():
+        logging.warning("memory_snapshot_auth_failed reason=token_not_configured")
+        return web.json_response({"ok": False, "error": "unavailable"}, status=503)
+
+    provided_token = _memory_snapshot_auth_token_from_request(request)
+    if not is_memory_snapshot_token_valid(provided_token):
+        logging.warning("memory_snapshot_auth_failed reason=missing_or_invalid_token")
+        return web.json_response({"ok": False, "error": "unauthorized"}, status=401)
+
+    query = request.rel_url.query
+    limit = clamp_memory_snapshot_limit(query.get("limit", MEMORY_SNAPSHOT_DEFAULT_LIMIT))
+    subject_key = str(query.get("subject_key") or "").strip()[:120] or None
+    include_samples = parse_memory_snapshot_bool(query.get("include_samples"), default=True)
+    include_raw_refs = parse_memory_snapshot_bool(query.get("include_raw_refs"), default=False)
+
+    logging.info(
+        "memory_snapshot_requested subject_key=%s limit=%s include_samples=%s include_raw_refs=%s",
+        subject_key or "none",
+        limit,
+        include_samples,
+        include_raw_refs,
+    )
+    try:
+        snapshot = await asyncio.to_thread(
+            build_bnl_memory_snapshot,
+            DB_FILE,
+            limit=limit,
+            subject_key=subject_key,
+            include_samples=include_samples,
+            include_raw_refs=include_raw_refs,
+        )
+    except FileNotFoundError:
+        logging.warning("memory_snapshot_failed reason=database_missing")
+        return web.json_response({"ok": False, "error": "database_missing"}, status=404)
+    except sqlite3.OperationalError as exc:
+        logging.warning("memory_snapshot_failed reason=sqlite_operational_error detail=%s", str(exc)[:120])
+        return web.json_response({"ok": False, "error": "database_unavailable"}, status=503)
+    except Exception as exc:
+        logging.warning("memory_snapshot_failed reason=unexpected detail=%s", str(exc)[:120])
+        return web.json_response({"ok": False, "error": "snapshot_failed"}, status=500)
+    return web.json_response(snapshot, status=200)
+
 async def start_force_pull_listener():
     global force_pull_runner
     if force_pull_runner is not None:
@@ -3518,6 +3591,7 @@ async def start_force_pull_listener():
     app = web.Application()
     app.router.add_post("/force-pull", _handle_force_pull)
     app.router.add_post(SOURCE_REFRESH_NOW_PATH, _handle_source_file_refresh_now)
+    app.router.add_get(BNL_MEMORY_SNAPSHOT_PATH, _handle_bnl_memory_snapshot)
     force_pull_runner = web.AppRunner(app)
     await force_pull_runner.setup()
     site = web.TCPSite(force_pull_runner, host="0.0.0.0", port=BNL_FORCE_PULL_PORT)
