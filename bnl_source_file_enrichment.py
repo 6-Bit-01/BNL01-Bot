@@ -3039,6 +3039,369 @@ def _relationship_review_items(packet: dict[str, Any], subject: str) -> list[str
     return out
 
 
+_ANCHOR_NOISE_WORDS = {
+    "a", "an", "and", "are", "as", "at", "be", "but", "by", "for", "from", "has", "have", "how", "if", "in", "is", "it", "its", "of", "on", "or", "our", "the", "this", "to", "was", "we", "with", "you", "your",
+}
+_MEANINGFUL_ANCHOR_TYPES = {
+    "orion": "person",
+    "bnl": "system",
+    "bnl-01": "system",
+    "network": "lore",
+    "barcode": "project",
+    "edge": "lore",
+    "bit": "person",
+    "bits": "person",
+    "bit's": "person",
+    "lardcode": "project",
+    "suno": "platform",
+    "discord": "platform",
+    "source file": "system",
+    "source files": "system",
+}
+
+
+def _case_flatten_text_values(value: Any, *, max_items: int = 80, item_limit: int = 260) -> list[str]:
+    out: list[str] = []
+
+    def walk(node: Any) -> None:
+        if len(out) >= max_items:
+            return
+        if isinstance(node, dict):
+            preferred = (
+                "summary", "safeSummary", "detail", "evidenceSummary", "claim", "label", "topic", "theme",
+                "name", "title", "note", "explanation", "snippet", "channel", "channelName", "latestObservedAt",
+                "recentActivitySummary", "authoredVsMentionedSummary",
+            )
+            for key in preferred:
+                if key in node:
+                    walk(node.get(key))
+            for key, raw in node.items():
+                if key not in preferred and key not in {"id", "rowId", "sourceRowId", "rawRefJson", "userId", "channelId"}:
+                    walk(raw)
+        elif isinstance(node, (list, tuple, set)):
+            for item in node:
+                walk(item)
+        elif node not in (None, ""):
+            text = _case_text(node, item_limit)
+            if text:
+                out.append(text)
+
+    walk(value)
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for item in out:
+        key = re.sub(r"[^a-z0-9]+", " ", item.lower()).strip()[:180]
+        if key and key not in seen:
+            seen.add(key)
+            deduped.append(item)
+        if len(deduped) >= max_items:
+            break
+    return deduped
+
+
+def _build_subject_intelligence_context(packet: dict[str, Any]) -> dict[str, Any]:
+    fields = (
+        "conversationThemes", "topicThemes", "topTopicDetails", "topicBreakdown", "knownContext", "usefulEvidence",
+        "bestEvidenceToReview", "bnlInteractionSignals", "musicSignals", "communitySignals", "relationshipSignals",
+        "evidenceDetails", "representativeEvidence", "sourceCoverage", "topChannels", "activityFrequencySummary",
+        "recentActivitySummary", "authoredVsMentionedSummary", "publicUseCandidates", "reviewOnlyEvidence", "missingInfo",
+        "sourceAuthority", "conversationHighlights",
+    )
+    context = {field: _sanitize_archive_value(packet.get(field)) for field in fields if packet.get(field) not in (None, "", [], {})}
+    context["queueSubmissionStatus"] = _case_text(packet.get("queueSubmissionStatus") or "not_connected", 80)
+    context["queueSubmissionNote"] = _case_text(packet.get("queueSubmissionNote") or QUEUE_NOT_CONNECTED_NOTE, 260)
+    source_counts = packet.get("sourceCounts") if isinstance(packet.get("sourceCounts"), dict) else {}
+    if source_counts:
+        context["sourceCounts"] = _sanitize_archive_value(source_counts)
+    raw = packet.get("rawProvenance") if isinstance(packet.get("rawProvenance"), dict) else {}
+    if raw:
+        meta: dict[str, Any] = {}
+        for key in ("sourceLabels", "sourceTypes", "fragmentCount", "latestObservedAt"):
+            if raw.get(key) not in (None, "", [], {}):
+                meta[key] = _sanitize_archive_value(raw.get(key))
+        if raw.get("rawFragments"):
+            meta["representativeFragments"] = _sanitize_archive_value(list(raw.get("rawFragments") or [])[:6])
+        if meta:
+            context["archivePayloadMetadata"] = meta
+    return context
+
+
+def _brief_context(memory: dict[str, Any]) -> dict[str, Any]:
+    return memory.get("sourceIntelligenceContext") if isinstance(memory.get("sourceIntelligenceContext"), dict) else {}
+
+
+def _as_int(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)) and value >= 0:
+        return int(value)
+    if isinstance(value, str) and value.strip().isdigit():
+        return int(value.strip())
+    return None
+
+
+def _latest_observed_from_texts(texts: list[str]) -> str:
+    latest = ""
+    for text in texts:
+        for match in re.findall(r"\b20\d{2}-\d{2}-\d{2}(?:[T ][0-9:.+-]+Z?)?", text):
+            if match > latest:
+                latest = match
+    return _case_text(latest, 80)
+
+
+def _subject_activity_profile(memory: dict[str, Any]) -> dict[str, Any]:
+    context = _brief_context(memory)
+    freq = context.get("activityFrequencySummary") if isinstance(context.get("activityFrequencySummary"), dict) else {}
+    counts = context.get("sourceCounts") if isinstance(context.get("sourceCounts"), dict) else {}
+    all_texts = _case_flatten_text_values(context, max_items=80) + _case_flatten_text_values(memory.get("representativeMoments"), max_items=20)
+    total_scanned = sum(v for v in (_as_int(v) for v in counts.values()) if v is not None) or None
+    authored = _as_int(freq.get("approvedPublicAuthoredRows") or freq.get("totalApprovedPublicAuthoredItems"))
+    mentioned = _as_int(freq.get("approvedPublicMentionedRows") or freq.get("totalApprovedPublicMentions"))
+    review = _as_int(freq.get("reviewOnlyEvidenceCount"))
+    latest = _case_text(freq.get("latestObservedAt") or context.get("recentActivitySummary") or _latest_observed_from_texts(all_texts), 140)
+    observed_total = sum(v for v in (authored, mentioned, review) if v is not None) or total_scanned or len(memory.get("representativeMoments") or [])
+    if observed_total >= 10:
+        level = "high / recurring"
+    elif observed_total >= 4:
+        level = "moderate / repeated"
+    elif observed_total > 0:
+        level = "low / limited"
+    else:
+        level = "unknown / insufficient extracted evidence"
+    profile: dict[str, Any] = {"activityLevel": level}
+    if authored is not None:
+        profile["totalApprovedPublicAuthoredItems"] = authored
+    if mentioned is not None:
+        profile["totalApprovedPublicMentions"] = mentioned
+    if review is not None:
+        profile["reviewOnlyEvidenceCount"] = review
+    if total_scanned is not None:
+        profile["totalEvidenceScanned"] = total_scanned
+    if latest:
+        profile["latestObservedAt"] = latest
+    return profile
+
+
+def _safe_channel_name(value: Any, note_text: str = "") -> str:
+    text = _case_text(value, 80)
+    lowered = f"{text} {note_text}".lower()
+    if not text:
+        return "unknown channel"
+    if any(token in lowered for token in ("private", "internal_controlled", "review-only", "internal review", "dm")) and not text.startswith("#"):
+        return "review-only channel"
+    if re.search(r"\b(?:channel_id|discord|user_id|rowid|sourcerowid)\b", lowered):
+        return "review-only channel"
+    if not text.startswith("#") and re.search(r"(?:research|internal|admin|mod|ops|control)", lowered):
+        return "review-only channel"
+    return text
+
+
+def _channel_breakdown(memory: dict[str, Any]) -> list[dict[str, Any]]:
+    context = _brief_context(memory)
+    raw_channels = context.get("topChannels") if isinstance(context.get("topChannels"), list) else []
+    rows: list[dict[str, Any]] = []
+    for item in raw_channels[:8]:
+        if isinstance(item, dict):
+            count = _as_int(item.get("count") or item.get("total"))
+            name = _safe_channel_name(item.get("channelName") or item.get("channel") or item.get("name"), json.dumps(item, default=str))
+            note = _case_text(item.get("note") or item.get("summary") or (f"{count} observed item(s)" if count is not None else "Observed in extracted source coverage."), 180)
+        else:
+            count = None
+            name = _safe_channel_name(item)
+            note = "Observed in extracted source coverage."
+        role = "unknown"
+        if count is not None:
+            role = "primary" if count >= 3 else ("secondary" if count == 2 else "minor")
+        rows.append({"channelName": name, **({"count": count} if count is not None else {}), "role": role, "note": note})
+    if not rows:
+        for moment in (memory.get("representativeMoments") or [])[:5]:
+            if not isinstance(moment, dict):
+                continue
+            name = _safe_channel_name(moment.get("channelName"), json.dumps(moment, default=str))
+            if name and name != "unknown channel":
+                rows.append({"channelName": name, "role": "unknown", "note": _case_text(moment.get("summary") or "Representative evidence appears here.", 180)})
+    return rows or [{"channelName": "unknown channel", "role": "unknown", "note": "The current packet does not expose a safe channel breakdown."}]
+
+
+def _clean_topic_label(value: Any) -> str:
+    text = _case_text(value, 120)
+    text = re.sub(r"\bclassification\b", "", text, flags=re.I)
+    text = re.sub(r"\s+", " ", text).strip(" -:/")
+    return text[:1].upper() + text[1:] if text else "Unlabeled recurring topic"
+
+
+def _topic_buckets(memory: dict[str, Any]) -> list[dict[str, Any]]:
+    context = _brief_context(memory)
+    candidates: list[Any] = []
+    for field in ("topTopicDetails", "topicBreakdown", "topicThemes", "conversationThemes"):
+        value = context.get(field)
+        if isinstance(value, list):
+            candidates.extend(value)
+    buckets: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    evidence_texts = _case_flatten_text_values([context.get("knownContext"), context.get("usefulEvidence"), context.get("bestEvidenceToReview"), context.get("evidenceDetails"), memory.get("representativeMoments")], max_items=40)
+    for item in candidates:
+        if isinstance(item, dict):
+            topic = _clean_topic_label(item.get("topic") or item.get("label") or item.get("theme") or item.get("name"))
+            count = _as_int(item.get("count") or item.get("evidenceCount") or item.get("mentions"))
+            detail = _case_text(item.get("summary") or item.get("explanation") or item.get("detail") or item.get("note") or "", 260)
+        else:
+            topic = _clean_topic_label(item)
+            count = None
+            detail = ""
+        key = topic.lower()
+        if not topic or key in seen:
+            continue
+        seen.add(key)
+        signals = [text for text in evidence_texts if key.split(" ")[0] and key.split(" ")[0] in text.lower()][:3]
+        if count is None:
+            count = len(signals) or None
+        strength = "weak"
+        if count is not None and count >= 5:
+            strength = "strong"
+        elif count is not None and count >= 2:
+            strength = "moderate"
+        elif re.search(r"\bnoise|generic|unclear\b", topic, re.I):
+            strength = "noise"
+        explanation = detail or (f"Recurring extracted evidence points at {topic.lower()} as a subject pattern." if signals else f"Extracted topic/theme label appears for {topic.lower()}, but the packet has limited detail behind it.")
+        buckets.append({"topic": topic, "strength": strength, **({"evidenceCount": count} if count is not None else {}), "explanation": explanation, **({"exampleSignals": signals[:3]} if signals else {})})
+        if len(buckets) >= 10:
+            break
+    if not buckets:
+        for text in _case_list(memory.get("repeatedTopics"), limit=4):
+            buckets.append({"topic": _clean_topic_label(text), "strength": "weak", "explanation": text})
+    return buckets or [{"topic": "Insufficient topic extraction", "strength": "weak", "explanation": "The current packet does not expose enough topic detail to summarize recurring subject themes."}]
+
+
+def _anchor_type(name: str) -> str:
+    return _MEANINGFUL_ANCHOR_TYPES.get(name.lower(), "unknown")
+
+
+def _named_anchors(memory: dict[str, Any]) -> list[dict[str, Any]]:
+    context = _brief_context(memory)
+    texts = _case_flatten_text_values([context, memory.get("representativeMoments"), memory.get("communityContext"), memory.get("relationshipContext")], max_items=100)
+    counts: dict[str, int] = {}
+    canonical: dict[str, str] = {}
+    joined = "\n".join(texts)
+    for known in _MEANINGFUL_ANCHOR_TYPES:
+        pattern = re.escape(known).replace("\\ ", r"\s+")
+        found = re.findall(rf"(?<![-A-Za-z0-9]){pattern}(?![-A-Za-z0-9])", joined, flags=re.I)
+        if found:
+            key = known.lower()
+            canonical[key] = "BNL-01" if key == "bnl-01" else ("BNL" if key == "bnl" else ("BARCODE" if key == "barcode" else ("EDGE" if key == "edge" else ("Bit's" if key == "bit's" else known[:1].upper() + known[1:]))))
+            counts[key] = counts.get(key, 0) + len(found)
+    for match in re.findall(r"(?<![-A-Za-z0-9])[A-Z][A-Za-z0-9'’-]{2,}\b", joined):
+        key = match.lower().strip("'’")
+        if key in _ANCHOR_NOISE_WORDS or key in {"raw", "source", "file", "queue", "submission", "identity", "review"}:
+            continue
+        canonical.setdefault(key, match)
+        counts[key] = counts.get(key, 0) + 1
+    anchors: list[dict[str, Any]] = []
+    subject_key = str(memory.get("subjectName") or "").lower()
+    for key, count in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))[:12]:
+        name = canonical.get(key, key)
+        if key in _ANCHOR_NOISE_WORDS or name.lower() == subject_key:
+            continue
+        strength = "strong" if count >= 4 else ("moderate" if count >= 2 else "weak")
+        anchor_type = _anchor_type(name)
+        note = f"Appears across extracted evidence {count} time{'s' if count != 1 else ''}; treat meaning as review-only unless separately confirmed."
+        if key == "orion":
+            note = "Recurring Orion-linked context appears, but the report does not confirm what that connection means."
+        elif key in {"suno", "spotify", "soundcloud", "youtube"}:
+            note = "Platform/link signal appears; do not assume ownership or queue submission without connected queue/source data."
+        anchors.append({"name": name, "type": anchor_type, "strength": strength, "note": note})
+    return anchors
+
+
+def _signals_from(memory: dict[str, Any], fields: tuple[str, ...], fallback: str, *, limit: int = 6) -> list[str]:
+    context = _brief_context(memory)
+    items: list[str] = []
+    for field in fields:
+        items.extend(_case_flatten_text_values(context.get(field), max_items=limit, item_limit=260))
+    if not items and fields == ("relationshipSignals",):
+        items.extend(_case_list(memory.get("relationshipContext"), limit=limit))
+    deduped = _case_list(items, limit=limit, item_limit=260)
+    return deduped or [fallback]
+
+
+def _build_subject_read(subject: str, profile: dict[str, Any], topics: list[dict[str, Any]], channels: list[dict[str, Any]]) -> str:
+    topic_names = ", ".join(bucket.get("topic", "") for bucket in topics[:4] if bucket.get("topic")) or "not enough extracted topic detail"
+    primary = next((ch for ch in channels if ch.get("role") == "primary"), channels[0] if channels else {})
+    where = primary.get("channelName") or "unknown channel coverage"
+    return _case_text(f"BNL reads {subject} through {profile.get('activityLevel', 'unknown activity')} Source File evidence. The clearest extracted topics are {topic_names}. The most visible safe channel read is {where}; channel names are omitted when the packet only exposes private/internal context.", 700)
+
+
+def _build_bnl_take(subject: str, memory: dict[str, Any], topics: list[dict[str, Any]], anchors: list[dict[str, Any]]) -> str:
+    body = json.dumps([topics, anchors, _brief_context(memory), memory.get("communityContext"), memory.get("musicCreativeContext")], default=str).lower()
+    traits: list[str] = []
+    if any(term in body for term in ("bnl", "source-file", "source file", "dossier", "threshold", "sync", "convergence", "interface", "lore")):
+        traits.append("heavily BNL-facing / source-file-facing")
+    if any(term in body for term in ("barcode", "network", "edge", "orion", "lore")):
+        traits.append("community/lore/interface-adjacent")
+    if any(term in body for term in ("suno", "music", "track", "song", "link")):
+        traits.append("music/link-adjacent")
+    if not traits:
+        traits.append("not yet clearly typed")
+    queue_connected = str(memory.get("sourceIntelligenceContext", {}).get("queueSubmissionStatus") or "not_connected") not in {"", "not_connected", "unknown"}
+    queue_line = "Queue/submission data appears connected, so admins can review those facts before drafting." if queue_connected else "Queue/submission data is not connected, so BNL should not call them an artist, submitter, played-track subject, paid user, or Priority subject from this report alone."
+    return _case_text(f"BNL currently reads {subject} as {', '.join(traits)}. The strongest pattern is what recurs across extracted topics, channel activity, named anchors, and representative evidence rather than any single category label. {queue_line} Identity, role, and public alias certainty remain unconfirmed until admin review connects public-safe sources.", 900)
+
+
+def _source_file_gaps(memory: dict[str, Any], anchors: list[dict[str, Any]]) -> list[str]:
+    gaps = _case_list(memory.get("openQuestions"), limit=6, item_limit=220)
+    base = [
+        "Decide the public display name to use, if any, and whether it is safe to use publicly.",
+        "Clarify whether the subject is an artist, community member, lore/interface figure, collaborator, supporter, or something else.",
+        "Explain what the Orion connection means before using it in public language." if any(a.get("name", "").lower() == "orion" for a in anchors) else "Check whether named anchors have any confirmed public meaning.",
+        "Verify whether music links such as Suno are the subject's own work or links the subject shared.",
+        "Connect actual queue submissions or played tracks before claiming submission/play history.",
+        "Add public links/socials and mark which pieces are safe to say publicly.",
+    ]
+    return _case_list([*gaps, *base], limit=10, item_limit=240)
+
+
+def build_subject_intelligence_brief_v1(memory: dict[str, Any]) -> dict[str, Any]:
+    subject = _case_text(memory.get("subjectName") or "this subject", 140)
+    profile = _subject_activity_profile(memory)
+    channels = _channel_breakdown(memory)
+    topics = _topic_buckets(memory)
+    anchors = _named_anchors(memory)
+    music = _signals_from(memory, ("musicSignals", "bestEvidenceToReview", "representativeEvidence"), "No specific music/link signal is confirmed in the current packet; do not infer submissions or ownership.")
+    relationship = _signals_from(memory, ("relationshipSignals",), "No relationship signal is confirmed; keep any relationship interpretation review-only.")
+    queue_connected = str(_brief_context(memory).get("queueSubmissionStatus") or "not_connected") not in {"", "not_connected", "unknown"}
+    queue_read = _case_text(_brief_context(memory).get("queueSubmissionNote") or _join_case_items(memory.get("queueSubmissionContext"), QUEUE_NOT_CONNECTED_NOTE), 360)
+    if not queue_connected and "not connected" not in queue_read.lower():
+        queue_read = f"Queue/submission data is not connected. {queue_read}"
+    confidence = _case_text("Medium internal confidence when multiple public-safe extracted signals agree; low confidence for identity, public role, relationship meaning, and queue/submission claims until source links are connected. This brief is admin-facing and review-only.", 420)
+    gaps = _source_file_gaps(memory, anchors)
+    return _sanitize_archive_value({
+        "subjectRead": _build_subject_read(subject, profile, topics, channels),
+        "bnlTake": _build_bnl_take(subject, memory, topics, anchors),
+        "activityProfile": profile,
+        "channelBreakdown": channels,
+        "topicBuckets": topics,
+        "namedAnchors": anchors,
+        "interactionPatterns": _signals_from(memory, ("bnlInteractionSignals", "communitySignals", "conversationThemes"), "No specific interaction pattern is exposed beyond the representative evidence."),
+        "musicAndLinkSignals": music,
+        "relationshipSignals": [item if any(term in item.lower() for term in ("review-only", "unconfirmed", "not confirm", "uncertain")) else f"{item}. Treat as review-only until confirmed." for item in relationship],
+        "queueSubmissionRead": queue_read,
+        "confidenceRead": confidence,
+        "sourceFileGaps": gaps,
+        "recommendedAdminActions": _case_list([
+            "Review the top topic buckets and representative evidence before drafting any public dossier language.",
+            "Use Identity Check/public links to confirm display name, role, aliases, and socials without auto-confirming identity.",
+            "If music links appear, separate owned tracks, shared links, queue submissions, and played tracks.",
+            "Promote only public-safe facts; keep relationship/lore/interface interpretation internal until confirmed.",
+        ], limit=8, item_limit=240),
+        "doNotSayPubliclyYet": _case_list([
+            "Do not claim queue submissions, played tracks, payment, or Priority status without connected queue data.",
+            "Do not claim public identity, public role, alias certainty, or relationship meaning from review-only evidence.",
+            "Do not publish raw channel context, raw IDs, internal table/debug labels, or private-source detail.",
+            "Do not present Orion/Network/EDGE/BARCODE/BNL-01 anchors as confirmed public facts until admin review marks them safe.",
+        ], limit=8, item_limit=240),
+    })
+
+
 def build_subject_memory_packet_v1(packet: dict[str, Any]) -> dict[str, Any]:
     """Build evidence-grounded working memory for the BNL-authored case report."""
 
@@ -3076,6 +3439,7 @@ def build_subject_memory_packet_v1(packet: dict[str, Any]) -> dict[str, Any]:
         "relationshipContext": _relationship_review_items(packet, subject),
         "communityContext": _generic_label_gap(packet, "communitySignals", "community context"),
         "repeatedTopics": _generic_label_gap(packet, "topicBreakdown", "repeated topics"),
+        "sourceIntelligenceContext": _build_subject_intelligence_context(packet),
         "representativeMoments": moments,
         "publicSafeCandidateFacts": _case_list(packet.get("publicSafePossibilities") or packet.get("publicUseCandidates"), limit=6) or ["No public-safe fact is confirmed by this packet; owner review is required before public use."],
         "reviewOnlyFacts": _case_list(packet.get("reviewOnlyEvidence") or packet.get("privateOnlyNotes") or packet.get("notPublicYet"), limit=8),
@@ -3141,6 +3505,7 @@ def build_source_file_case_report_v1(subject_memory_packet: dict[str, Any]) -> d
         ],
         "confidenceNotes": _case_list(memory.get("evidenceGaps"), limit=8) or ["Confidence is limited to the visible subject memory packet; no raw private transcripts are included."],
         "memoryCoverage": memory.get("memoryCoverage") or {},
+        "subjectIntelligenceBriefV1": build_subject_intelligence_brief_v1(memory),
     }
     return _sanitize_archive_value(report)
 
