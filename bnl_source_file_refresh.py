@@ -34,6 +34,8 @@ ACTIVE_QUEUE_STATUSES = {"queued", "deferred", "cooldown", "running", "failed"}
 TERMINAL_QUEUE_STATUSES = {"succeeded", "skipped"}
 VALID_STATUSES = ACTIVE_QUEUE_STATUSES | TERMINAL_QUEUE_STATUSES
 VALID_REFRESH_MODES = {"automatic", "manual", "dry_run", "operator_requested", "site_open_request", "site_manual_request"}
+CASE_REPORT_MISSING_REASON = "case_report_missing"
+CASE_REPORT_BACKFILL_REASON = "case_report_backfill"
 DEFAULT_COOLDOWN_MINUTES = 30
 DEFAULT_PROCESS_INTERVAL_MINUTES = 15
 DEFAULT_MAX_AUTOMATIC_PER_CYCLE = 3
@@ -407,6 +409,96 @@ def _state_has_current_success(state: dict[str, Any] | sqlite3.Row | None) -> bo
     return status in {"succeeded", "partial_success"} and completed is not None and cooldown_until is not None and cooldown_until > now_dt
 
 
+def _archive_candidate_dicts(value: Any) -> list[dict[str, Any]]:
+    """Return archive/source-package dictionaries that are rich enough to test.
+
+    Plain Source File identity objects are intentionally ignored. The backfill
+    trigger is only for existing archive/source-package evidence that predates
+    the case-report fields; a bare lookup match must not pretend report evidence
+    exists or force regeneration by itself.
+    """
+
+    candidates: list[dict[str, Any]] = []
+    seen: set[int] = set()
+    archive_keys = {
+        "archive",
+        "latestArchive",
+        "latest_archive",
+        "archivePayload",
+        "archive_payload",
+        "sourcePackage",
+        "source_package",
+        "package",
+        "enrichmentArchive",
+        "sourceFileArchive",
+    }
+    archive_markers = {
+        "compactSummary",
+        "evidenceReceiptSummary",
+        "sourceFileBriefV2",
+        "sourceCounts",
+        "sourceTypes",
+        "qualityScore",
+        "archiveNotice",
+    }
+
+    def add(candidate: dict[str, Any]) -> None:
+        ident = id(candidate)
+        if ident not in seen:
+            seen.add(ident)
+            candidates.append(candidate)
+
+    def walk(node: Any, *, forced: bool = False) -> None:
+        if isinstance(node, dict):
+            if forced or archive_markers.intersection(node.keys()) or {"subjectMemoryPacketV1", "sourceFileCaseReportV1"}.intersection(node.keys()):
+                add(node)
+            for key, child in node.items():
+                walk(child, forced=forced or str(key) in archive_keys)
+        elif isinstance(node, list):
+            for child in node:
+                walk(child, forced=forced)
+
+    walk(value)
+    return candidates
+
+
+def source_file_report_missing(latest_archive_or_lookup: Any) -> bool:
+    """Detect an existing Source File archive/package missing report fields."""
+
+    candidates = _archive_candidate_dicts(latest_archive_or_lookup)
+    if not candidates:
+        return False
+    newest = candidates[0]
+    missing = not isinstance(newest.get("subjectMemoryPacketV1"), dict) or not isinstance(newest.get("sourceFileCaseReportV1"), dict)
+    return bool(missing)
+
+
+def archive_missing_case_report(latest_archive_or_lookup: Any) -> bool:
+    """Compatibility alias for tests/callers that name the archive helper."""
+
+    return source_file_report_missing(latest_archive_or_lookup)
+
+
+def _lookup_source_file_report_missing(
+    row: sqlite3.Row,
+    *,
+    lookup_func: Callable[[dict[str, str]], dict[str, Any]],
+) -> bool:
+    try:
+        lookup_result = lookup_func({"lookupKey": "subject", "lookupValue": row["subject_name"], "subject": row["subject_name"]})
+    except Exception as exc:
+        logging.warning("source_case_report_backfill_failed subject_key=%s error=%s", row["subject_key"], _safe_text(exc, 160))
+        return False
+    missing = source_file_report_missing(lookup_result)
+    if missing:
+        logging.info("source_case_report_missing subject_key=%s reason=%s", row["subject_key"], CASE_REPORT_MISSING_REASON)
+    return missing
+
+
+def _queue_reason_has_case_report_missing(reason: Any) -> bool:
+    return CASE_REPORT_MISSING_REASON in str(reason or "") or CASE_REPORT_BACKFILL_REASON in str(reason or "")
+
+
 def _mark_current_cooldown_terminal(db_path: str, *, guild_id: int | None, subject_key: str, reason: str = "cooldown_current") -> None:
     conn = sqlite3.connect(db_path)
     try:
@@ -456,8 +548,12 @@ def process_source_file_refresh_now(db_path: str, payload: dict[str, Any], *, gu
             return summary
 
     lookup_key, lookup_value = _site_refresh_lookup_parts(site_request)
+    report_missing = False
     try:
         target_check = lookup_func({"lookupKey": lookup_key, "lookupValue": lookup_value, lookup_key: lookup_value})
+        report_missing = source_file_report_missing(target_check)
+        if report_missing:
+            logging.info("source_case_report_missing subject_key=%s reason=%s", skey or "none", CASE_REPORT_MISSING_REASON)
         found = bool(target_check.get("found") or target_check.get("sourceFile") or target_check.get("source_file") or target_check.get("candidate") or target_check.get("dossier"))
         if target_check.get("ok") is False or not found:
             failure = "lookup_failed" if target_check.get("ok") is False else "no_target"
@@ -489,7 +585,7 @@ def process_source_file_refresh_now(db_path: str, payload: dict[str, Any], *, gu
         db_path,
         guild_id=guild_id,
         subject_name=subject or lookup_value,
-        reason=f"source_refresh_now:{request_id or candidate_id or skey}",
+        reason=CASE_REPORT_MISSING_REASON if report_missing else f"source_refresh_now:{request_id or candidate_id or skey}",
         evidence_source="source_refresh_now",
         priority=100,
         refresh_mode=mode,
@@ -505,7 +601,7 @@ def process_source_file_refresh_now(db_path: str, payload: dict[str, Any], *, gu
         lookup_func=lookup_func,
         sender=sender,
         environ=env,
-        bypass_cooldown=source in {"admin_manual_retry"} or reason in {"manual_retry", "file_not_updated"},
+        bypass_cooldown=report_missing or source in {"admin_manual_retry"} or reason in {"manual_retry", "file_not_updated"},
         refresh_mode=mode,
         subject_key=skey,
     )
@@ -705,7 +801,14 @@ def process_source_file_refresh_queue(db_path: str, *, guild_id: int | None = No
                 continue
             state = conn.execute(f"SELECT * FROM {STATE_TABLE} WHERE (guild_id IS ? OR guild_id=?) AND subject_key=? LIMIT 1", (row["guild_id"], row["guild_id"], row["subject_key"])).fetchone()
             cooldown_until = parse_iso(state["cooldown_until"] if state else None)
-            if cooldown_until and cooldown_until > now_dt and not (bypass_cooldown or row["refresh_mode"] in {"manual", "operator_requested", "site_manual_request"}):
+            report_missing = _queue_reason_has_case_report_missing(row["reason"])
+            if not report_missing:
+                report_missing = _lookup_source_file_report_missing(row, lookup_func=lookup_func)
+                if report_missing:
+                    merged_reason = _safe_text(f"{row['reason']}; {CASE_REPORT_MISSING_REASON}", 260)
+                    conn.execute(f"UPDATE {QUEUE_TABLE} SET reason=?, updated_at=? WHERE id=?", (merged_reason, now, row["id"]))
+                    conn.commit()
+            if cooldown_until and cooldown_until > now_dt and not (report_missing or bypass_cooldown or row["refresh_mode"] in {"manual", "operator_requested", "site_manual_request"}):
                 conn.execute(f"UPDATE {QUEUE_TABLE} SET status='cooldown', updated_at=?, not_before_at=?, last_error='cooldown' WHERE id=?", (now, cooldown_until.isoformat(), row["id"]))
                 conn.commit()
                 logging.info("source_refresh_deferred subject_key=%s reason=cooldown", row["subject_key"])
@@ -716,6 +819,8 @@ def process_source_file_refresh_queue(db_path: str, *, guild_id: int | None = No
             _state_upsert(conn, guild_id=row["guild_id"], subject_key=row["subject_key"], subject_name=row["subject_name"], fields={"last_refresh_started_at": now, "last_refresh_status": "running"})
             conn.commit()
             logging.info("source_refresh_started subject_key=%s mode=%s", row["subject_key"], mode)
+            if report_missing:
+                logging.info("source_case_report_backfill_started subject_key=%s reason=%s", row["subject_key"], CASE_REPORT_BACKFILL_REASON)
             try:
                 with refresh_generation_context(row["subject_key"]):
                     result = run_source_file_enrichment(
@@ -746,6 +851,7 @@ def process_source_file_refresh_queue(db_path: str, *, guild_id: int | None = No
                     partial_success = bool(result.get("archiveSent") and not result.get("recommendationSent") and result.get("status") == "partial_success")
                     item_status = "partial_success" if partial_success else "succeeded"
                     partial_reason = "compact_recommendation_rejected" if partial_success else ""
+                    item_reason = CASE_REPORT_BACKFILL_REASON if report_missing and not partial_reason else partial_reason
                     conn.execute(f"UPDATE {QUEUE_TABLE} SET status='succeeded', updated_at=?, last_error=NULL WHERE id=?", (utc_now(), row["id"]))
                     _state_upsert(conn, guild_id=row["guild_id"], subject_key=row["subject_key"], subject_name=row["subject_name"], fields={"last_refresh_completed_at": utc_now(), "last_refresh_status": item_status, "last_recommendation_id": recommendation_id, "last_evidence_hash": _evidence_hash_for_result(result), "last_evidence_count": evidence_count, "last_error": partial_reason or None, "cooldown_until": cooldown_until_text})
                     conn.commit()
@@ -753,8 +859,10 @@ def process_source_file_refresh_queue(db_path: str, *, guild_id: int | None = No
                         logging.warning("source_refresh_partial_success subject_key=%s archive_ok=true compact_recommendation_ok=false reason=compact_recommendation_rejected archive_id=%s", row["subject_key"], archive_id or "none")
                     else:
                         logging.info("source_refresh_succeeded subject_key=%s recommendation_id=%s archive_id=%s", row["subject_key"], recommendation_id or "none", archive_id or "none")
+                    if report_missing:
+                        logging.info("source_case_report_backfill_succeeded subject_key=%s status=%s archive_id=%s", row["subject_key"], item_status, archive_id or "none")
                     summary["processed"] += 1
-                    summary["items"].append({"subject": row["subject_name"], "status": item_status, "reason": partial_reason, "error": partial_reason, "partialSuccess": partial_success, "recommendationId": recommendation_id, "recommendationSent": bool(result.get("recommendationSent", bool(send_result.get("ok")))), "archiveSent": bool(result.get("archiveSent", bool(archive_result.get("ok")))), "archiveStatus": result.get("archiveStatus") or archive_result.get("status"), "archiveId": archive_id, "archiveError": _safe_text(result.get("archiveError") or archive_result.get("error") or "", 180)})
+                    summary["items"].append({"subject": row["subject_name"], "status": item_status, "reason": item_reason, "error": partial_reason, "partialSuccess": partial_success, "recommendationId": recommendation_id, "recommendationSent": bool(result.get("recommendationSent", bool(send_result.get("ok")))), "archiveSent": bool(result.get("archiveSent", bool(archive_result.get("ok")))), "archiveStatus": result.get("archiveStatus") or archive_result.get("status"), "archiveId": archive_id, "archiveError": _safe_text(result.get("archiveError") or archive_result.get("error") or "", 180), "caseReportBackfill": bool(report_missing)})
                 else:
                     archive_result = result.get("archiveResult") or {}
                     send_result = result.get("sendResult") or {}
@@ -768,16 +876,20 @@ def process_source_file_refresh_queue(db_path: str, *, guild_id: int | None = No
                     _state_upsert(conn, guild_id=row["guild_id"], subject_key=row["subject_key"], subject_name=row["subject_name"], fields={"last_refresh_status": "failed", "last_failure_at": utc_now(), "last_error": err})
                     conn.commit()
                     logging.warning("source_refresh_failed subject_key=%s error=%s", row["subject_key"], err)
+                    if report_missing:
+                        logging.warning("source_case_report_backfill_failed subject_key=%s error=%s", row["subject_key"], err)
                     summary["failed"] += 1
-                    summary["items"].append({"subject": row["subject_name"], "status": "failed", "error": err, "recommendationSent": bool(result.get("recommendationSent")), "archiveSent": bool(result.get("archiveSent")), "archiveStatus": result.get("archiveStatus") or archive_result.get("status"), "archiveId": str(archive_result.get("archiveId") or result.get("archiveId") or "")[:120], "archiveError": _safe_text(result.get("archiveError") or archive_result.get("error") or "", 180), "recommendationId": str(send_result.get("recommendationId") or result.get("recommendationId") or "")[:120]})
+                    summary["items"].append({"subject": row["subject_name"], "status": "failed", "reason": CASE_REPORT_BACKFILL_REASON if report_missing else "", "error": err, "recommendationSent": bool(result.get("recommendationSent")), "archiveSent": bool(result.get("archiveSent")), "archiveStatus": result.get("archiveStatus") or archive_result.get("status"), "archiveId": str(archive_result.get("archiveId") or result.get("archiveId") or "")[:120], "archiveError": _safe_text(result.get("archiveError") or archive_result.get("error") or "", 180), "recommendationId": str(send_result.get("recommendationId") or result.get("recommendationId") or "")[:120], "caseReportBackfill": bool(report_missing)})
             except Exception as exc:
                 err = _safe_text(exc, 240)
                 conn.execute(f"UPDATE {QUEUE_TABLE} SET status='failed', updated_at=?, last_error=? WHERE id=?", (utc_now(), err, row["id"]))
                 _state_upsert(conn, guild_id=row["guild_id"], subject_key=row["subject_key"], subject_name=row["subject_name"], fields={"last_refresh_status": "failed", "last_failure_at": utc_now(), "last_error": err})
                 conn.commit()
                 logging.warning("source_refresh_failed subject_key=%s error=%s", row["subject_key"], err)
+                if report_missing:
+                    logging.warning("source_case_report_backfill_failed subject_key=%s error=%s", row["subject_key"], err)
                 summary["failed"] += 1
-                summary["items"].append({"subject": row["subject_name"], "status": "failed", "error": err})
+                summary["items"].append({"subject": row["subject_name"], "status": "failed", "reason": CASE_REPORT_BACKFILL_REASON if report_missing else "", "error": err, "caseReportBackfill": bool(report_missing)})
     finally:
         conn.close()
     logging.info("source_refresh_worker_cycle processed=%s skipped=%s failed=%s", summary["processed"], summary["skipped"], summary["failed"])
@@ -826,8 +938,12 @@ def process_site_refresh_requests(db_path: str, *, guild_id: int | None = None, 
         logging.info("source_refresh_site_request_claimed request_id=%s", request_id)
         lookup_key = "normalizedName" if (site_request.get("normalizedSubjectKey") or site_request.get("subjectKey")) and not site_request.get("subjectName") else "subject"
         lookup_value = str(site_request.get("normalizedSubjectKey") or site_request.get("subjectKey") or subject or skey)
+        report_missing = False
         try:
             target_check = lookup_func({"lookupKey": lookup_key, "lookupValue": lookup_value, lookup_key: lookup_value})
+            report_missing = source_file_report_missing(target_check)
+            if report_missing:
+                logging.info("source_case_report_missing subject_key=%s reason=%s", skey or "none", CASE_REPORT_MISSING_REASON)
             found = bool(target_check.get("found") or target_check.get("sourceFile") or target_check.get("source_file") or target_check.get("candidate") or target_check.get("dossier"))
             if target_check.get("ok") is False or not found:
                 reason = "no_target" if target_check.get("ok") is not False else "lookup_failed"
@@ -856,7 +972,7 @@ def process_site_refresh_requests(db_path: str, *, guild_id: int | None = None, 
             db_path,
             guild_id=guild_id,
             subject_name=subject or lookup_value,
-            reason=f"site_refresh_request:{request_id}",
+            reason=CASE_REPORT_MISSING_REASON if report_missing else f"site_refresh_request:{request_id}",
             evidence_source="site_refresh_request",
             priority=95 if mode == "site_manual_request" else 70,
             refresh_mode=mode,
@@ -871,18 +987,18 @@ def process_site_refresh_requests(db_path: str, *, guild_id: int | None = None, 
             lookup_func=lookup_func,
             sender=sender,
             environ=env,
-            bypass_cooldown=(mode == "site_manual_request"),
+            bypass_cooldown=report_missing or (mode == "site_manual_request"),
             refresh_mode=mode,
             subject_key=skey,
         )
         item = (local.get("items") or [{}])[0]
         status = item.get("status")
-        if status == "succeeded":
+        if status in {"succeeded", "partial_success"}:
             rec_id = _safe_text(item.get("recommendationId") or "", 120)
             update_site_refresh_request_status(request_id, "completed", environ=env, opener=opener, completed_by_recommendation_id=rec_id)
             logging.info("source_refresh_site_request_completed request_id=%s recommendation_id=%s", request_id, rec_id or "none")
             summary["processed"] += 1
-            summary["items"].append({"subject": subject or item.get("subject") or skey, "subjectKey": skey, "requestId": request_id, "status": "succeeded", "recommendationId": rec_id})
+            summary["items"].append({"subject": subject or item.get("subject") or skey, "subjectKey": skey, "requestId": request_id, "status": status, "reason": item.get("reason") or "", "recommendationId": rec_id, "caseReportBackfill": bool(item.get("caseReportBackfill"))})
         elif status == "cooldown":
             update_site_refresh_request_status(request_id, "skipped", environ=env, opener=opener, failure_reason="cooldown_deferred")
             logging.info("source_refresh_site_request_failed request_id=%s reason=cooldown_deferred", request_id)
