@@ -2595,6 +2595,221 @@ def _sanitize_archive_value(value: Any, *, key: str = "", depth: int = 0) -> Any
     return _archive_safe_scalar(value)
 
 
+BRIEF_V2_LIST_MAX_ITEMS = 6
+BRIEF_V2_TEXT_ITEM_LIMIT = 300
+BRIEF_V2_VERSION = "2"
+
+
+def _brief_text(value: Any, limit: int = BRIEF_V2_TEXT_ITEM_LIMIT) -> str:
+    """Human-readable brief text sanitizer for admin readouts."""
+
+    text = _site_safe_text(value, limit)
+    text = re.sub(r"\b(?:source[-_ ]?blind|global[-_ ]?mixed|rejected)\b", "review-only", text, flags=re.I)
+    text = re.sub(r"\b(?:sourceTable|sourceRowId|rawRefJson|sourceLabel|channel_id|user_id|discord_user_id)\b\s*[:=]?\s*[^,; ]*", "", text, flags=re.I)
+    text = re.sub(r"\b(?:entity_evidence_events|conversations|user_profiles|memory_tiers|broadcast_memory|source_file_lookup)\b", "local evidence", text, flags=re.I)
+    text = text.replace("{", "").replace("}", "")
+    text = re.sub(r"\s+", " ", text).strip(" -:;,.")
+    if len(text) > limit:
+        text = text[: max(0, limit - 1)].rstrip() + "…"
+    return text
+
+
+def _brief_fingerprint(value: Any) -> str:
+    text = json.dumps(value, sort_keys=True, default=str) if isinstance(value, (dict, list)) else str(value or "")
+    text = re.sub(r"https?://\S+", "[url]", text.lower())
+    text = re.sub(r"[^a-z0-9]+", " ", text).strip()
+    return text[:240]
+
+
+def _brief_dedupe_texts(values: Any, *, max_items: int = BRIEF_V2_LIST_MAX_ITEMS, limit: int = BRIEF_V2_TEXT_ITEM_LIMIT) -> list[str]:
+    raw_items = values if isinstance(values, (list, tuple, set)) else ([values] if values not in (None, "") else [])
+    items: list[str] = []
+    seen: set[str] = set()
+    for raw in raw_items:
+        if isinstance(raw, dict):
+            raw = raw.get("summary") or raw.get("claim") or raw.get("detail") or raw.get("safeSummary") or raw.get("evidenceSummary") or raw.get("label") or raw.get("topic") or raw.get("source") or ""
+        text = _brief_text(raw, limit)
+        if not text or text.lower() in {"currently unknown", "none", "unknown", "n/a"}:
+            continue
+        fp = _brief_fingerprint(text)
+        if not fp or fp in seen:
+            continue
+        if any(fp in existing or existing in fp for existing in seen if len(fp) > 36 and len(existing) > 36):
+            continue
+        seen.add(fp)
+        items.append(text)
+        if len(items) >= max_items:
+            break
+    return items
+
+
+def _brief_evidence_item(raw: Any) -> dict[str, Any] | None:
+    if isinstance(raw, dict):
+        claim = raw.get("claim") or raw.get("summary") or raw.get("safeSummary") or raw.get("detail") or raw.get("label") or raw.get("topic") or raw.get("evidenceKind")
+        evidence_summary = raw.get("evidenceSummary") or raw.get("safeSummary") or raw.get("snippet") or raw.get("detail") or raw.get("summary") or claim
+        item: dict[str, Any] = {
+            "claim": _brief_text(claim or evidence_summary, 220),
+            "evidenceSummary": _brief_text(evidence_summary or claim, 260),
+        }
+        source_type = raw.get("sourceType") or raw.get("sourceLane") or raw.get("source") or raw.get("sourceLabel") or raw.get("sourceTable") or raw.get("table")
+        if source_type:
+            item["sourceType"] = _brief_text(source_type, 80)
+        confidence = raw.get("confidence") or raw.get("strength") or raw.get("authority") or raw.get("visibility")
+        if confidence:
+            item["confidence"] = _brief_text(confidence, 80)
+        public_safe = raw.get("publicSafe")
+        if public_safe is not None:
+            item["publicSafe"] = str(public_safe).strip().lower() not in {"0", "false", "no", "off", "internal", "private"}
+        elif str(raw.get("visibility") or raw.get("authority") or "").lower() in {"public", "public_safe", "public-safe"}:
+            item["publicSafe"] = True
+        return item if item["claim"] or item["evidenceSummary"] else None
+    text = _brief_text(raw, 260)
+    if not text:
+        return None
+    return {"claim": text, "evidenceSummary": text}
+
+
+def _brief_best_evidence(packet: dict[str, Any]) -> list[dict[str, Any]]:
+    sources: list[Any] = []
+    for key in ("bestEvidenceToReview", "representativeEvidence", "evidenceDetails", "conversationHighlights", "usefulEvidence"):
+        value = packet.get(key)
+        if isinstance(value, list):
+            sources.extend(value)
+    raw = packet.get("rawProvenance") if isinstance(packet.get("rawProvenance"), dict) else {}
+    for fragment in list(raw.get("rawFragments") or []):
+        if isinstance(fragment, dict) and (fragment.get("safeSummary") or fragment.get("summary")):
+            sources.append(fragment)
+    items: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for raw_item in sources:
+        item = _brief_evidence_item(raw_item)
+        if not item:
+            continue
+        fp = _brief_fingerprint(item.get("claim") or item.get("evidenceSummary"))
+        if not fp or fp in seen:
+            continue
+        if any(fp in existing or existing in fp for existing in seen if len(fp) > 36 and len(existing) > 36):
+            continue
+        seen.add(fp)
+        items.append(item)
+        if len(items) >= BRIEF_V2_LIST_MAX_ITEMS:
+            break
+    return items
+
+
+def _brief_identity_context(packet: dict[str, Any], subject_name: str, subject_key: str) -> dict[str, Any]:
+    identity = packet.get("subjectIdentity") if isinstance(packet.get("subjectIdentity"), dict) else {}
+    alias_labels = _brief_dedupe_texts(identity.get("aliasLabels") or identity.get("matchedIdentityLabels"), max_items=6, limit=100)
+    notes: list[str] = []
+    if identity:
+        if identity.get("existingDossierMatch") or identity.get("publicDossierMatchFound"):
+            notes.append("This subject may connect to an existing dossier/update lane; review before using it publicly.")
+        if identity.get("matchedUserProfileCount") or identity.get("matchedUserIdCount"):
+            notes.append("Local profile-matched identity signals exist, but this brief does not confirm identity or aliases.")
+        if alias_labels:
+            notes.append("Possible aliases or labels are present for admin review.")
+    if not notes:
+        notes.append("Identity links are reviewed on the admin Source File page.")
+    return {
+        "subjectName": subject_name,
+        "subjectKey": subject_key,
+        "workflowLane": _brief_text(identity.get("workflowLane") or packet.get("matchKind") or "source file review", 80),
+        "aliasLabels": alias_labels,
+        "confirmed": False,
+        "notes": notes[:BRIEF_V2_LIST_MAX_ITEMS],
+    }
+
+
+def _brief_quality_warnings(packet: dict[str, Any]) -> list[str]:
+    warnings: list[str] = []
+    quality = str(packet.get("qualityStatus") or "").lower()
+    score = packet.get("qualityScore")
+    if quality in {"too_thin", "forced_low_confidence", "low", "suppressed_too_thin"} or (_is_finite_number(score) and float(score) < 50):
+        warnings.append("Evidence is thin.")
+    if packet.get("warningCounts") or packet.get("warnings"):
+        warnings.extend(_brief_dedupe_texts(packet.get("warnings"), max_items=3, limit=160))
+    identity = packet.get("subjectIdentity") if isinstance(packet.get("subjectIdentity"), dict) else {}
+    if identity.get("aliasLabels") or identity.get("matchedIdentityLabels"):
+        warnings.append("Possible alias or identity uncertainty needs admin review.")
+    warnings.append("Full archive exists, but compact recommendation only contains a pointer.")
+    return _brief_dedupe_texts(warnings, max_items=BRIEF_V2_LIST_MAX_ITEMS, limit=180)
+
+
+def build_source_file_brief_v2(packet: dict[str, Any], *, archive_id: str | None = None) -> dict[str, Any]:
+    """Build a compact, human-readable admin brief for the full Source File archive."""
+
+    source_file = packet.get("sourceFile") if isinstance(packet.get("sourceFile"), dict) else {}
+    sections = packet.get("sections") if isinstance(packet.get("sections"), dict) else {}
+    subject_name = _brief_text(packet.get("subject") or _first(source_file, ("name", "sourceFileName", "subject", "displayName", "title", "normalizedName")) or "Unknown subject", 140)
+    subject_key = _subject_key(subject_name or _first(source_file, ("normalizedName", "subjectKey", "slug")))
+    match_kind = str(packet.get("matchKind") or "source file review").replace("_", " ")
+    evidence_items = _brief_best_evidence(packet)
+    public_notes = _brief_dedupe_texts(packet.get("publicSafePossibilities") or sections.get("Public-Safe Notes"), max_items=BRIEF_V2_LIST_MAX_ITEMS, limit=220)
+    internal_notes = _brief_dedupe_texts((packet.get("privateOnlyNotes") or []) + (packet.get("notPublicYet") or []) + sections.get("Internal-Only / Review-Only Notes", []) + sections.get("Do Not Say", []), max_items=BRIEF_V2_LIST_MAX_ITEMS, limit=220)
+    dossier_questions = _brief_dedupe_texts(packet.get("missingInfo") or sections.get("Missing Info"), max_items=BRIEF_V2_LIST_MAX_ITEMS, limit=220)
+    if not dossier_questions:
+        dossier_questions = [
+            "Is there enough public-safe evidence to draft a public dossier?",
+            "Does this subject connect to an existing dossier under another name?",
+        ]
+    what = _brief_dedupe_texts(
+        (packet.get("knownContext") or [])
+        + sections.get("Subject Overview", [])
+        + sections.get("History With BARCODE / BNL / Discord / BARCODE Radio", [])
+        + sections.get("Known Facts", [])
+        + sections.get("Observed Patterns", []),
+        max_items=BRIEF_V2_LIST_MAX_ITEMS,
+        limit=240,
+    )
+    if not what and evidence_items:
+        what = [item["claim"] for item in evidence_items[:3] if item.get("claim")]
+    source_counts = packet.get("sourceCounts") if isinstance(packet.get("sourceCounts"), dict) else {}
+    if source_counts and len(what) < BRIEF_V2_LIST_MAX_ITEMS:
+        what.append("BNL has enough local evidence to preserve this Source File for review.")
+    why = _brief_dedupe_texts(
+        sections.get("Why This Subject Matters", [])
+        + [
+            "Possible dossier seed or update material." if match_kind != "none" else "Possible dossier seed if public-safe evidence improves.",
+            "Identity context may need admin review." if (packet.get("subjectIdentity") or {}).get("aliasLabels") else "Evidence preservation for future Source File review.",
+            "Review can decide what, if anything, is safe for dossier drafting.",
+        ],
+        max_items=BRIEF_V2_LIST_MAX_ITEMS,
+        limit=220,
+    )
+    if public_notes:
+        action = "Review public-safe notes and decide whether a short Proposed Dossier is justified."
+    elif packet.get("qualityStatus") in {"too_thin", "forced_low_confidence"}:
+        action = "Keep as Source File only; not ready for Proposed Dossier."
+    else:
+        action = "Review Identity Check before drafting."
+    one_line = _brief_text(f"{subject_name} is a Source File subject in the {match_kind} lane with {len(evidence_items)} concise evidence item{'s' if len(evidence_items) != 1 else ''} ready for admin review.", 220)
+    admin_summary = _brief_text(
+        f"BNL has a review-only Source File for {subject_name}. The packet preserves the underlying evidence, while this brief pulls out the useful admin read: what appears supported, what may be safe to draft from, and what still needs human review. Treat this as internal guidance, not a public claim or identity decision.",
+        900,
+    )
+    archive_refs = {
+        "archiveId": _brief_text(archive_id or packet.get("archiveId") or "pending/not returned", 120),
+        "ingestKey": _brief_text(packet.get("ingestKey") or "", 180),
+        "compactPointerNote": COMPACT_RECOMMENDATION_ARCHIVE_NOTICE,
+    }
+    return {
+        "version": BRIEF_V2_VERSION,
+        "subjectName": subject_name,
+        "subjectKey": subject_key,
+        "oneLineSummary": one_line,
+        "adminSummary": admin_summary,
+        "whatBnlKnows": what[:BRIEF_V2_LIST_MAX_ITEMS],
+        "whyThisMatters": why[:BRIEF_V2_LIST_MAX_ITEMS],
+        "evidenceToReview": evidence_items[:BRIEF_V2_LIST_MAX_ITEMS],
+        "identityContext": _brief_identity_context(packet, subject_name, subject_key),
+        "publicSafeDraftingNotes": public_notes[:BRIEF_V2_LIST_MAX_ITEMS] or ["No public-safe drafting notes are confirmed yet."],
+        "internalOnlyNotes": internal_notes[:BRIEF_V2_LIST_MAX_ITEMS] or ["Keep this Source File internal until owner/admin review decides what is usable."],
+        "dossierQuestions": dossier_questions[:BRIEF_V2_LIST_MAX_ITEMS],
+        "recommendedNextAction": _brief_text(action, 220),
+        "qualityWarnings": _brief_quality_warnings(packet),
+        "archiveReferences": archive_refs,
+    }
+
 def _source_package_from_packet(packet: dict[str, Any]) -> dict[str, Any]:
     """Build the full review-only archive package without compact-card trimming."""
 
@@ -2634,6 +2849,7 @@ def build_source_file_archive_payload(packet: dict[str, Any], *, environ: dict[s
         "publicSafetyNotes": _sanitize_archive_value(_section_text(sections, "Public-Safe Notes", limit=10) or packet.get("publicSafetyNotes") or ""),
         "doNotSay": _sanitize_archive_value(_section_text(sections, "Do Not Say", limit=10) or packet.get("doNotSay") or ""),
         "evidenceReceiptSummary": _sanitize_archive_value(receipt),
+        "sourceFileBriefV2": _sanitize_archive_value(build_source_file_brief_v2(packet, archive_id=packet.get("archiveId") or "")),
         "sourcePackage": _source_package_from_packet(packet),
     }
     return envelope

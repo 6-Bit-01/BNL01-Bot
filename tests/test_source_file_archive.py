@@ -109,6 +109,67 @@ class SourceFileArchiveTests(unittest.TestCase):
         self.assertNotIn("6-bit recurring source intelligence item 79", compact_body)
         self.assertLess(len(compact_payload["evidenceSummary"]), 2000)
 
+    def test_archive_payload_includes_readable_source_file_brief_v2(self):
+        packet = self.large_packet()
+        packet["subjectIdentity"] = {"aliasLabels": ["6 Bit", "6 Bit"], "matchedUserProfileCount": 1, "workflowLane": "active_source_file"}
+        packet["bestEvidenceToReview"] = [
+            "BNL has seen this subject connected to BARCODE community activity.",
+            "BNL has seen this subject connected to BARCODE community activity.",
+            {"claim": "Profile matched identity signal exists", "evidenceSummary": "A local profile match needs admin review.", "sourceLane": "identity", "confidence": "medium", "publicSafe": False},
+        ]
+        payload = enrichment.build_source_file_archive_payload(packet)
+        brief = payload["sourceFileBriefV2"]
+        expected_keys = {
+            "version", "subjectName", "subjectKey", "oneLineSummary", "adminSummary", "whatBnlKnows", "whyThisMatters",
+            "evidenceToReview", "identityContext", "publicSafeDraftingNotes", "internalOnlyNotes", "dossierQuestions",
+            "recommendedNextAction", "qualityWarnings", "archiveReferences",
+        }
+        self.assertEqual(set(brief), expected_keys)
+        self.assertEqual(brief["version"], "2")
+        self.assertEqual(brief["subjectName"], "6-bit")
+        self.assertEqual(brief["subjectKey"], "6-bit")
+        self.assertIn("sourcePackage", payload)
+        self.assertIn("rawProvenance", payload["sourcePackage"])
+        self.assertLessEqual(len(brief["oneLineSummary"]), 220)
+        self.assertLessEqual(len(brief["adminSummary"]), 900)
+        for list_key in ("whatBnlKnows", "whyThisMatters", "evidenceToReview", "publicSafeDraftingNotes", "internalOnlyNotes", "dossierQuestions", "qualityWarnings"):
+            self.assertLessEqual(len(brief[list_key]), 6)
+        self.assertEqual(
+            sum(1 for item in brief["evidenceToReview"] if item.get("claim") == "BNL has seen this subject connected to BARCODE community activity"),
+            1,
+        )
+
+    def test_source_file_brief_v2_readable_fields_avoid_raw_json_and_giant_arrays(self):
+        packet = self.large_packet()
+        raw_dump = '{"sourceTable":"entity_evidence_events","sourceRowId":"row_123","rawRefJson":{"message":"x"}}'
+        packet["bestEvidenceToReview"] = [raw_dump for _ in range(30)]
+        packet["conversationHighlights"] = [raw_dump for _ in range(30)]
+        payload = enrichment.build_source_file_archive_payload(packet)
+        brief = payload["sourceFileBriefV2"]
+        brief_body = json.dumps(brief, sort_keys=True)
+        self.assertNotIn("sourceTable", brief_body)
+        self.assertNotIn("sourceRowId", brief_body)
+        self.assertNotIn("rawRefJson", brief_body)
+        self.assertNotIn("entity_evidence_events", brief_body)
+        self.assertLessEqual(len(brief["evidenceToReview"]), 6)
+        self.assertLess(len(brief_body), 8000)
+
+    def test_compact_recommendation_does_not_receive_full_brief_body(self):
+        packet = self.large_packet()
+        archive_payload = enrichment.build_source_file_archive_payload(packet)
+        compact_payload = enrichment.build_enrichment_recommendation_payload(packet)
+        self.assertIn("sourceFileBriefV2", archive_payload)
+        self.assertNotIn("sourceFileBriefV2", compact_payload)
+        self.assertNotIn("adminSummary", json.dumps(compact_payload, sort_keys=True))
+
+    def test_archive_preserves_full_evidence_when_brief_is_concise(self):
+        packet = self.large_packet()
+        payload = enrichment.build_source_file_archive_payload(packet)
+        body = json.dumps(payload, sort_keys=True)
+        self.assertIn("6-bit recurring source intelligence item 79", body)
+        self.assertNotIn("6-bit recurring source intelligence item 79", json.dumps(payload["sourceFileBriefV2"], sort_keys=True))
+        self.assertLessEqual(len(payload["sourceFileBriefV2"]["evidenceToReview"]), 6)
+
     def test_archive_payload_redacts_discord_payment_and_secret_material(self):
         packet = self.large_packet()
         packet["sourceFile"]["payment_customer_id"] = "cus_123"
