@@ -33,6 +33,24 @@ SITE_RAW_PROVENANCE_JSON_LIMIT = 20000
 SITE_RAW_PROVENANCE_JSON_TARGET = 18000
 SITE_LIST_ITEM_LIMIT = 500
 SITE_LIST_MAX_ITEMS = 25
+COMPACT_RECOMMENDATION_LIST_MAX_ITEMS = 8
+COMPACT_RECOMMENDATION_LIST_ITEM_LIMIT = 220
+COMPACT_RECOMMENDATION_TEXT_FIELD_LIMITS = {
+    "reason": 700,
+    "evidenceSummary": SITE_EVIDENCE_SUMMARY_TARGET,
+    "publicSafetyNotes": 500,
+    "doNotSay": 500,
+    "missingInfo": 500,
+    "suggestedAction": 500,
+    "queueSubmissionNote": 500,
+    "recentActivitySummary": 500,
+    "authoredVsMentionedSummary": 500,
+}
+COMPACT_RECOMMENDATION_JSON_FIELD_LIMITS = {
+    "entityIntelligenceProfile": 3000,
+    "rawProvenance": 3000,
+}
+COMPACT_RECOMMENDATION_ARCHIVE_NOTICE = "Full Source File archive available internally."
 SITE_RAW_FRAGMENT_MAX_ITEMS = 4
 SITE_RAW_FRAGMENT_TEXT_LIMIT = 500
 SITE_SOURCE_COVERAGE_ALLOWED_KEYS = {"source", "count", "counts", "status"}
@@ -2035,6 +2053,129 @@ def _compact_raw_provenance_for_site(raw: Any) -> dict[str, Any]:
     return compact
 
 
+def truncate_compact_text_field(value: Any, max_length: int, *, field_name: str = "compact_field") -> str:
+    """Deterministically cap compact recommendation text while preserving useful boundaries."""
+
+    text = _site_safe_text(value, max(max_length * 4, max_length))
+    original_length = len(text)
+    if original_length <= max_length:
+        logging.info("compact_recommendation_field_length field=%s original=%s capped=%s truncated=false", field_name, original_length, original_length)
+        return text
+    suffix = "… [truncated; full Source File archive available internally]"
+    budget = max(0, max_length - len(suffix))
+    candidate = text[:budget].rstrip()
+    boundary = max(candidate.rfind("\n- "), candidate.rfind(". "), candidate.rfind("; "), candidate.rfind("\n"))
+    if boundary >= max(80, int(budget * 0.55)):
+        candidate = candidate[: boundary + (1 if candidate[boundary:boundary + 1] == "." else 0)].rstrip()
+    capped = f"{candidate}{suffix}" if candidate else suffix[-max_length:]
+    logging.info("compact_recommendation_field_length field=%s original=%s capped=%s truncated=true", field_name, original_length, len(capped))
+    return capped
+
+
+def _compact_json_value_for_recommendation(value: Any, *, field_name: str, max_json_length: int) -> Any:
+    compact = _compact_value_for_site(value, text_limit=COMPACT_RECOMMENDATION_LIST_ITEM_LIMIT)
+    original_length = len(json.dumps(value, sort_keys=True, default=str)) if value not in (None, "") else 0
+    capped_length = len(json.dumps(compact, sort_keys=True, default=str))
+    if capped_length <= max_json_length:
+        logging.info("compact_recommendation_field_length field=%s original=%s capped=%s truncated=%s", field_name, original_length, capped_length, str(original_length != capped_length).lower())
+        return compact
+    if isinstance(compact, dict):
+        reduced: dict[str, Any] = {}
+        for key in ("subjectKey", "qualityScore", "qualityStatus", "diagnostics", "rowScopeCounts", "sourceCounts", "warningCounts", "summary"):
+            if key in compact:
+                reduced[key] = compact[key]
+        reduced.setdefault("summary", COMPACT_RECOMMENDATION_ARCHIVE_NOTICE)
+        compact = reduced
+    elif isinstance(compact, list):
+        compact = compact[:2]
+    capped_length = len(json.dumps(compact, sort_keys=True, default=str))
+    if capped_length > max_json_length:
+        compact = {"summary": COMPACT_RECOMMENDATION_ARCHIVE_NOTICE}
+        capped_length = len(json.dumps(compact, sort_keys=True, default=str))
+    logging.info("compact_recommendation_field_length field=%s original=%s capped=%s truncated=true", field_name, original_length, capped_length)
+    return compact
+
+
+def build_compact_source_file_recommendation_summary(packet: dict[str, Any], payload: dict[str, Any] | None = None, *, archive_id: str | None = None) -> str:
+    """Build a short pointer-style card for compact dossier recommendations."""
+
+    source = payload or {}
+    subject = str(source.get("subjectName") or packet.get("subject") or "").strip()
+    subject_key = _subject_key(subject or source.get("subjectKey") or packet.get("subjectKey") or "unknown-subject")
+    recommendation_type = str(source.get("type") or "source_file_review").strip() or "source_file_review"
+    confidence = str(source.get("confidence") or "unknown").strip() or "unknown"
+    quality_score = packet.get("qualityScore", source.get("qualityScore"))
+    quality_status = str(packet.get("qualityStatus") or source.get("qualityStatus") or "unknown").strip() or "unknown"
+    match_kind = str(packet.get("matchKind") or "none").strip() or "none"
+    source_counts = packet.get("sourceCounts") or source.get("sourceCounts") or {}
+    if isinstance(source_counts, dict) and source_counts:
+        count_text = ", ".join(f"{_site_safe_text(k, 40)}={int(v or 0) if isinstance(v, (int, float)) else _site_safe_text(v, 20)}" for k, v in list(source_counts.items())[:4])
+    else:
+        count_text = "no compact counts"
+    archive_ref = archive_id or packet.get("archiveId") or source.get("archiveId") or "pending/not returned"
+    lines = [
+        "Source File compact review pointer.",
+        f"- Subject key: {subject_key}",
+        f"- Recommendation type: {recommendation_type}",
+        f"- Confidence: {confidence}; priority/quality: {quality_status} ({quality_score if quality_score is not None else 'n/a'}).",
+        f"- Why review: BNL refreshed Source File intelligence for match target {match_kind}; admin review may update dossier context without publishing or identity-link changes.",
+        f"- Compact source counts: {count_text}.",
+        f"- Archive id: {_site_safe_text(archive_ref, 160)}.",
+        f"- {COMPACT_RECOMMENDATION_ARCHIVE_NOTICE}",
+    ]
+    return truncate_compact_text_field("\n".join(lines), COMPACT_RECOMMENDATION_TEXT_FIELD_LIMITS["evidenceSummary"], field_name="evidenceSummary")
+
+
+def sanitize_compact_recommendation_payload(payload: dict[str, Any], *, packet: dict[str, Any] | None = None, archive_id: str | None = None) -> dict[str, Any]:
+    """Apply centralized Source File compact recommendation caps before site send."""
+
+    compact = dict(payload or {})
+    packet = packet or {}
+    existing_summary = str(compact.get("evidenceSummary") or "")
+    pointer_summary = build_compact_source_file_recommendation_summary(packet, compact, archive_id=archive_id)
+    if len(existing_summary) <= COMPACT_RECOMMENDATION_TEXT_FIELD_LIMITS["evidenceSummary"] and not archive_id:
+        compact["evidenceSummary"] = existing_summary
+    else:
+        compact["evidenceSummary"] = pointer_summary
+    match_kind = str(packet.get("matchKind") or "none")
+    compact["reason"] = truncate_compact_text_field(
+        f"Review-only Source File compact pointer for subject_key={_subject_key(compact.get('subjectName') or packet.get('subject') or '')}; match target={match_kind}. {COMPACT_RECOMMENDATION_ARCHIVE_NOTICE} No publishing, promotion, merge, or alias confirmation is requested.",
+        COMPACT_RECOMMENDATION_TEXT_FIELD_LIMITS["reason"],
+        field_name="reason",
+    )
+    for key, limit in COMPACT_RECOMMENDATION_TEXT_FIELD_LIMITS.items():
+        if key in {"reason", "evidenceSummary"}:
+            continue
+        if key in compact:
+            compact[key] = truncate_compact_text_field(compact.get(key), limit, field_name=key)
+    for key in SITE_BOUND_LIST_FIELDS:
+        if key in compact:
+            if key in SITE_CONTRACT_READOUT_FIELDS:
+                compact[key] = _normalize_readout_field_for_site(key, compact.get(key))
+                if isinstance(compact[key], list):
+                    compact[key] = _compact_list_for_site(compact[key], max_items=COMPACT_RECOMMENDATION_LIST_MAX_ITEMS, item_limit=COMPACT_RECOMMENDATION_LIST_ITEM_LIMIT)
+                elif isinstance(compact[key], str):
+                    compact[key] = truncate_compact_text_field(compact[key], COMPACT_RECOMMENDATION_LIST_ITEM_LIMIT, field_name=key)
+            else:
+                compact[key] = _compact_list_for_site(compact.get(key), max_items=COMPACT_RECOMMENDATION_LIST_MAX_ITEMS, item_limit=COMPACT_RECOMMENDATION_LIST_ITEM_LIMIT)
+    if "entityIntelligenceProfile" in compact:
+        profile = compact.get("entityIntelligenceProfile") if isinstance(compact.get("entityIntelligenceProfile"), dict) else {}
+        diagnostics = profile.get("diagnostics") if isinstance(profile, dict) else {}
+        profile_pointer = {"summary": COMPACT_RECOMMENDATION_ARCHIVE_NOTICE, "subjectKey": profile.get("subjectKey") or _subject_key(compact.get("subjectName") or packet.get("subject") or ""), "diagnostics": diagnostics}
+        for keep_key in ("roles", "relationships", "themes", "behaviorPosture", "eventContest", "dossierUsefulness"):
+            if keep_key in profile:
+                profile_pointer[keep_key] = _compact_list_for_site(profile.get(keep_key), max_items=4, item_limit=120)
+        compact["entityIntelligenceProfile"] = _compact_json_value_for_recommendation(
+            profile_pointer,
+            field_name="entityIntelligenceProfile",
+            max_json_length=COMPACT_RECOMMENDATION_JSON_FIELD_LIMITS["entityIntelligenceProfile"],
+        )
+    if "rawProvenance" in compact:
+        compact["rawProvenance"] = _compact_json_value_for_recommendation(compact.get("rawProvenance"), field_name="rawProvenance", max_json_length=COMPACT_RECOMMENDATION_JSON_FIELD_LIMITS["rawProvenance"])
+    compact["compactRecommendationNotice"] = COMPACT_RECOMMENDATION_ARCHIVE_NOTICE
+    return compact
+
+
 def build_compact_enrichment_evidence_summary(packet: dict[str, Any]) -> str:
     classification = packet.get("classification") or {}
     sections = packet.get("sections") or {}
@@ -2564,6 +2705,7 @@ def build_enrichment_recommendation_payload(packet: dict[str, Any], *, environ: 
     }
     _validate_source_payload_fields(payload)
     compact_payload = compact_enrichment_payload_for_site(build_dossier_recommendation_payload(payload))
+    compact_payload = sanitize_compact_recommendation_payload(compact_payload, packet=packet)
     _validate_source_payload_fields(compact_payload)
     compact_payload["siteValidationIssues"] = validate_enrichment_payload_for_site(compact_payload)
     if not compact_payload["siteValidationIssues"]:
@@ -2732,6 +2874,8 @@ def run_source_file_enrichment(
     packet["archiveId"] = (archive_result or {}).get("archiveId") or ""
     packet["archiveError"] = _safe_text((archive_result or {}).get("error") or "", 240)
 
+    payload = sanitize_compact_recommendation_payload(payload, packet=packet, archive_id=packet.get("archiveId") or "")
+    packet["payload"] = payload
     send_result = sender(payload)
     packet["sendResult"] = send_result
     packet["recommendationSent"] = bool((send_result or {}).get("ok"))
@@ -2740,8 +2884,10 @@ def run_source_file_enrichment(
     if packet["sent"]:
         packet["status"] = "sent"
     elif (packet["archiveSent"] or not archive_required) and not packet["recommendationSent"]:
-        packet["status"] = "recommendation_send_failed"
-        logging.warning("source_enrichment_compact_recommendation_failed archive_ok=true subject_key=%s", _subject_key(subject))
+        packet["status"] = "partial_success" if packet["archiveSent"] else "recommendation_send_failed"
+        packet["partialSuccess"] = bool(packet["archiveSent"])
+        packet["partialSuccessReason"] = "compact_recommendation_rejected"
+        logging.warning("source_enrichment_compact_recommendation_failed archive_ok=%s compact_recommendation_ok=false reason=compact_recommendation_rejected subject_key=%s", str(bool(packet["archiveSent"])).lower(), _subject_key(subject))
     elif packet["recommendationSent"] and not packet["archiveSent"]:
         packet["status"] = "archive_send_failed"
         logging.warning("source_enrichment_archive_failed recommendation_ok=true subject_key=%s", _subject_key(subject))

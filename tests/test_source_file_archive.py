@@ -142,7 +142,9 @@ class SourceFileArchiveTests(unittest.TestCase):
         self.assertTrue(result["archiveSent"])
         self.assertFalse(result["recommendationSent"])
         self.assertFalse(result["sent"])
-        self.assertEqual(result["status"], "recommendation_send_failed")
+        self.assertEqual(result["status"], "partial_success")
+        self.assertTrue(result["partialSuccess"])
+        self.assertEqual(result["partialSuccessReason"], "compact_recommendation_rejected")
         self.assertIn("sourcePackage", archive_calls[0])
         self.assertNotIn("sourcePackage", rec_calls[0])
 
@@ -163,3 +165,25 @@ class SourceFileArchiveTests(unittest.TestCase):
         body = json.dumps(archive_payload, sort_keys=True).lower()
         for forbidden in ("publish_public", "draft_create", "tag_create", "identity_merge", "queue_payment", "alias_confirm"):
             self.assertNotIn(forbidden, body)
+
+    def test_oversized_compact_recommendation_fields_are_capped_with_archive_preserved(self):
+        packet = self.large_packet()
+        huge = "\n".join(f"full evidence dump row {i} " + ("x" * 200) for i in range(200))
+        packet["entityIntelligenceProfile"] = {"subjectKey": "6-bit", "body": huge, "diagnostics": {"rowScopeCounts": {"subject_owned": 200}}}
+        packet["bestEvidenceToReview"] = [huge for _ in range(20)]
+        packet["conversationHighlights"] = [huge for _ in range(20)]
+        archive_payload = enrichment.build_source_file_archive_payload(packet)
+        compact_payload = enrichment.build_enrichment_recommendation_payload(packet)
+        archive_body = json.dumps(archive_payload, sort_keys=True)
+        compact_body = json.dumps(compact_payload, sort_keys=True)
+        self.assertIn("full evidence dump row 13", archive_body)
+        self.assertNotIn("full evidence dump row 199", compact_body)
+        self.assertLessEqual(len(compact_payload["evidenceSummary"]), enrichment.COMPACT_RECOMMENDATION_TEXT_FIELD_LIMITS["evidenceSummary"])
+        self.assertLessEqual(len(json.dumps(compact_payload["entityIntelligenceProfile"], sort_keys=True)), enrichment.COMPACT_RECOMMENDATION_JSON_FIELD_LIMITS["entityIntelligenceProfile"])
+        self.assertIn("Full Source File archive available internally", compact_payload["compactRecommendationNotice"])
+
+    def test_compact_summary_can_include_archive_id_after_archive_send(self):
+        packet = self.large_packet()
+        payload = enrichment.build_enrichment_recommendation_payload(packet)
+        compact = enrichment.sanitize_compact_recommendation_payload(payload, packet=packet, archive_id="arc_6bit")
+        self.assertIn("arc_6bit", compact["evidenceSummary"])
