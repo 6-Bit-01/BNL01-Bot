@@ -261,6 +261,40 @@ class DossierRecommendationSenderTests(unittest.TestCase):
         self.assertEqual(request.get_header("Authorization"), "Bearer secret-token")
         self.assertNotIn("secret-token", json.dumps(result))
 
+    def test_trusted_site_callback_base_overrides_archive_and_recommendation_urls(self):
+        base = "https://barcode-network-site-git-case-report-6-bit-01.vercel.app/source-files/x"
+        self.assertTrue(dossier.is_trusted_site_callback_base_url(base))
+        self.assertEqual(
+            dossier.get_source_file_archive_url({"BNL_SOURCE_FILE_ARCHIVE_URL": "https://prod.test/archive"}, callback_base_url=base),
+            "https://barcode-network-site-git-case-report-6-bit-01.vercel.app/api/bnl/source-file-enrichments",
+        )
+        self.assertEqual(
+            dossier.get_dossier_ingest_url({"BNL_DOSSIER_INGEST_URL": "https://prod.test/recommend"}, callback_base_url=base),
+            "https://barcode-network-site-git-case-report-6-bit-01.vercel.app/api/bnl/dossier-recommendations",
+        )
+
+    def test_untrusted_site_callback_base_is_ignored(self):
+        self.assertFalse(dossier.is_trusted_site_callback_base_url("https://evil.example.test"))
+        self.assertFalse(dossier.is_trusted_site_callback_base_url("http://localhost:3000"))
+        self.assertEqual(
+            dossier.get_source_file_archive_url({"BNL_SOURCE_FILE_ARCHIVE_URL": "https://prod.test/archive"}, callback_base_url="https://evil.example.test"),
+            "https://prod.test/archive",
+        )
+
+    def test_archive_send_posts_to_selected_callback_base_url(self):
+        opener = FakeOpener(FakeResponse(200, '{"ok": true, "archiveId": "arc_preview"}'))
+        result = dossier.send_source_file_archive_enrichment(
+            {"subjectName": "Signal Fox", "subjectKey": "signal-fox"},
+            environ={"BNL_SOURCE_FILE_ARCHIVE_TOKEN": "archive-token", "BNL_SOURCE_FILE_ARCHIVE_URL": "https://prod.test/archive"},
+            opener=opener,
+            callback_base_url="https://barcode-network-site-git-case-report-6-bit-01.vercel.app/admin/source-files",
+        )
+        request, timeout = opener.requests[0]
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["archiveId"], "arc_preview")
+        self.assertEqual(timeout, dossier.SOURCE_FILE_ARCHIVE_TIMEOUT_SECONDS)
+        self.assertEqual(request.full_url, "https://barcode-network-site-git-case-report-6-bit-01.vercel.app/api/bnl/source-file-enrichments")
+
     def test_duplicate_response_returns_duplicate_true(self):
         opener = FakeOpener(FakeResponse(200, '{"ok": true, "duplicate": true, "id": "rec_1"}'))
         result = dossier.send_dossier_recommendation(

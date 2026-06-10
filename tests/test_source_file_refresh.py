@@ -310,6 +310,59 @@ class SourceFileRefreshTests(unittest.TestCase):
         self.assertTrue(refresh.site_request_requires_case_report_backfill({"reason": "operator_case_report_backfill_retry"}))
         self.assertFalse(refresh.site_request_requires_case_report_backfill({"caseReportMissing": False, "reason": "opened_source_file"}))
 
+    def test_refresh_now_passes_trusted_callback_base_url_to_enrichment(self):
+        opener = FakeOpener({"ok": True, "requests": []})
+        lookup = lambda query: {"ok": True, "found": True, "sourceFile": {"subjectName": "Signal Fox"}, "latestArchive": {"sourceCounts": {"conversations": 1}}}
+        result_packet = {
+            "sent": True,
+            "recommendationSent": True,
+            "archiveSent": True,
+            "sendResult": {"recommendationId": "rec_preview", "ok": True},
+            "archiveResult": {"archiveId": "arc_preview", "ok": True, "status": 200},
+            "archivePayload": {"subjectMemoryPacketV1": {"subjectName": "Signal Fox"}, "sourceFileCaseReportV1": {"subjectName": "Signal Fox"}},
+            "sourceCounts": {"conversations": 1},
+            "subject": "Signal Fox",
+        }
+        with mock.patch.object(refresh, "run_source_file_enrichment", return_value=result_packet) as mocked:
+            result = refresh.process_source_file_refresh_now(
+                self.db,
+                {
+                    "requestId": "req_preview",
+                    "subjectName": "Signal Fox",
+                    "normalizedSubjectKey": "signal-fox",
+                    "caseReportMissing": True,
+                    "source": "admin_source_file_open",
+                    "requestingSiteOrigin": "https://barcode-network-site-git-case-report-6-bit-01.vercel.app",
+                },
+                guild_id=1,
+                environ={"BNL_SOURCE_FILE_READ_TOKEN": "read", "BNL_WEBSITE_BASE_URL": "https://www.barcode-network.com", "BNL_DOSSIER_INGEST_TOKEN": "ingest"},
+                opener=opener,
+                lookup_func=lookup,
+            )
+        self.assertEqual(mocked.call_args.kwargs.get("callback_base_url"), "https://barcode-network-site-git-case-report-6-bit-01.vercel.app")
+        self.assertEqual(result["callbackBaseSource"], "requesting_site_origin")
+        self.assertEqual(result["callbackBaseHost"], "barcode-network-site-git-case-report-6-bit-01.vercel.app")
+        self.assertTrue(result["caseReportGenerated"])
+        self.assertTrue(result["subjectMemoryPacketGenerated"])
+        self.assertTrue(result["caseReportBackfill"])
+        self.assertEqual(result["caseReportBackfillTrigger"], "explicit_site_request")
+
+    def test_refresh_now_ignores_untrusted_callback_base_url(self):
+        opener = FakeOpener({"ok": True, "requests": []})
+        lookup = lambda query: {"ok": True, "found": True, "sourceFile": {"subjectName": "Signal Fox"}, "latestArchive": {"sourceCounts": {"conversations": 1}}}
+        with mock.patch.object(refresh, "run_source_file_enrichment", return_value={"sent": True, "recommendationSent": True, "archiveSent": True, "sendResult": {"recommendationId": "rec_default", "ok": True}, "archiveResult": {"archiveId": "arc_default", "ok": True, "status": 200}, "sourceCounts": {"conversations": 1}, "subject": "Signal Fox"}) as mocked:
+            result = refresh.process_source_file_refresh_now(
+                self.db,
+                {"requestId": "req_bad", "subjectName": "Signal Fox", "normalizedSubjectKey": "signal-fox", "caseReportMissing": True, "requestingSiteOrigin": "https://evil.example.test"},
+                guild_id=1,
+                environ={"BNL_SOURCE_FILE_READ_TOKEN": "read", "BNL_WEBSITE_BASE_URL": "https://www.barcode-network.com", "BNL_DOSSIER_INGEST_TOKEN": "ingest"},
+                opener=opener,
+                lookup_func=lookup,
+            )
+        self.assertIsNone(mocked.call_args.kwargs.get("callback_base_url"))
+        self.assertEqual(result["callbackBaseSource"], "env_default")
+        self.assertEqual(result["callbackBaseHost"], "www.barcode-network.com")
+
     def test_refresh_now_explicit_case_report_missing_forces_backfill_without_archive_fields(self):
         opener = FakeOpener({"ok": True, "requests": []})
         lookup = lambda query: {"ok": True, "found": True, "sourceFile": {"subjectName": "Signal Fox"}}
