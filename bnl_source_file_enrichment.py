@@ -2130,6 +2130,8 @@ def sanitize_compact_recommendation_payload(payload: dict[str, Any], *, packet: 
     """Apply centralized Source File compact recommendation caps before site send."""
 
     compact = dict(payload or {})
+    compact.pop("subjectMemoryPacketV1", None)
+    compact.pop("sourceFileCaseReportV1", None)
     packet = packet or {}
     existing_summary = str(compact.get("evidenceSummary") or "")
     pointer_summary = build_compact_source_file_recommendation_summary(packet, compact, archive_id=archive_id)
@@ -2223,6 +2225,8 @@ def build_compact_enrichment_evidence_summary(packet: dict[str, Any]) -> str:
 
 def compact_enrichment_payload_for_site(payload: dict[str, Any]) -> dict[str, Any]:
     compact = dict(payload or {})
+    compact.pop("subjectMemoryPacketV1", None)
+    compact.pop("sourceFileCaseReportV1", None)
     compact["evidenceSummary"] = _site_safe_text(compact.get("evidenceSummary"), SITE_EVIDENCE_SUMMARY_TARGET)
     for key in SITE_BOUND_LIST_FIELDS:
         if key in compact:
@@ -2810,10 +2814,339 @@ def build_source_file_brief_v2(packet: dict[str, Any], *, archive_id: str | None
         "archiveReferences": archive_refs,
     }
 
+
+SUBJECT_MEMORY_PACKET_VERSION = "1"
+SOURCE_FILE_CASE_REPORT_VERSION = "1"
+SUBJECT_MEMORY_MAX_MOMENTS = 8
+_CASE_REPORT_FORBIDDEN_LABEL_RE = re.compile(
+    r"\b(?:global_mixed|source_blind|source\s+rows?|internal\s+classification|automated\s+topic\s+label|approved\s+approved|relationship\s+facet)\b",
+    re.I,
+)
+_CASE_REPORT_CATEGORY_ONLY_RE = re.compile(
+    r"\b(?:music\s+discussion\s+exists|creative\s+language\s+observed|relationship\s+signals\s+found|community\s+activity\s+detected)\b",
+    re.I,
+)
+
+
+def _case_text(value: Any, limit: int = 320) -> str:
+    """Safe internal-report text: concise, redacted, and stripped of debug labels."""
+
+    text = _archive_safe_scalar(value, limit)
+    text = str(text or "")
+    text = _CASE_REPORT_FORBIDDEN_LABEL_RE.sub("review-only evidence", text)
+    text = _CASE_REPORT_CATEGORY_ONLY_RE.sub("the current evidence packet exposes a category but not the underlying detail", text)
+    text = re.sub(r"\b(?:sourceTable|sourceRowId|rawRefJson|sourceLabel|channel_id|user_id|discord_user_id)\b\s*[:=]?\s*[^,; ]*", "", text, flags=re.I)
+    text = re.sub(r"\b(?:entity_evidence_events|conversations|user_profiles|user_memory_facts|user_habits|relationship_state|relationship_journal|memory_tiers|broadcast_memory|source_file_lookup)\b", "archive evidence", text, flags=re.I)
+    text = text.replace("{", "").replace("}", "")
+    text = re.sub(r"\s+", " ", text).strip(" -:;,")
+    if len(text) > limit:
+        text = text[: max(0, limit - 1)].rstrip() + "…"
+    return text
+
+
+def _case_list(values: Any, *, limit: int = 6, item_limit: int = 260) -> list[str]:
+    raw_items = values if isinstance(values, (list, tuple, set)) else ([values] if values not in (None, "") else [])
+    out: list[str] = []
+    seen: set[str] = set()
+    for raw in raw_items:
+        if isinstance(raw, dict):
+            raw = raw.get("summary") or raw.get("safeSummary") or raw.get("detail") or raw.get("evidenceSummary") or raw.get("claim") or raw.get("label") or raw.get("topic") or ""
+        text = _case_text(raw, item_limit)
+        key = re.sub(r"[^a-z0-9]+", " ", text.lower()).strip()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        out.append(text)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _packet_generated_at(packet: dict[str, Any]) -> str:
+    return _case_text(packet.get("runTime") or datetime.now(timezone.utc).isoformat(), 80)
+
+
+def _extract_channel_name(raw: Any) -> str:
+    if isinstance(raw, dict):
+        for key in ("channelName", "channel", "channel_name", "context", "sourceContext"):
+            value = raw.get(key)
+            if value:
+                text = _case_text(value, 80)
+                if text and not _PRIVATE_CHANNEL_NAME_RE.search(text):
+                    return text if text.startswith("#") or " " in text else (f"#{text}" if re.match(r"^[A-Za-z0-9_-]+$", text) else text)
+    text = _case_text(raw, 180)
+    m = re.search(r"#[A-Za-z0-9][A-Za-z0-9_-]{1,80}", text)
+    if m and not _PRIVATE_CHANNEL_NAME_RE.search(m.group(0)):
+        return m.group(0)
+    return ""
+
+
+def _extract_occurred_at(raw: Any) -> str:
+    if isinstance(raw, dict):
+        for key in ("occurredAt", "createdAt", "created_at", "timestamp", "episodeDate", "date", "lastSeen", "firstSeen"):
+            if raw.get(key):
+                return _case_text(raw.get(key), 80)
+    text = _case_text(raw, 260)
+    m = re.search(r"\b20\d{2}[-/]\d{1,2}[-/]\d{1,2}(?:[ T]\d{1,2}:\d{2}(?::\d{2})?)?", text)
+    return m.group(0) if m else ""
+
+
+def _extract_visibility(raw: Any, fallback: str = "internal_review_only") -> str:
+    if isinstance(raw, dict):
+        for key in ("visibility", "channelPolicy", "policy", "authority"):
+            value = str(raw.get(key) or "").lower().strip()
+            if value:
+                if "public" in value and "private" not in value:
+                    return "public_reviewable"
+                if "private" in value or "review" in value or "internal" in value:
+                    return "internal_review_only"
+                return _case_text(value, 60)
+    return fallback
+
+
+def _extract_source_type(raw: Any, fallback: str = "archive evidence") -> str:
+    if isinstance(raw, dict):
+        for key in ("sourceType", "sourceLane", "source", "lane", "table", "sourceTable", "origin", "label"):
+            value = raw.get(key)
+            if value:
+                text = _case_text(value, 90)
+                if text:
+                    lowered = text.lower()
+                    if "conversation" in lowered or "discord" in lowered:
+                        return "Discord conversation"
+                    if "broadcast" in lowered:
+                        return "BARCODE Radio memory"
+                    if "profile" in lowered or "identity" in lowered:
+                        return "identity/profile signal"
+                    if "relationship" in lowered:
+                        return "relationship/context evidence"
+                    if "source" in lowered and "file" in lowered:
+                        return "Source File archive"
+                    return text
+    return fallback
+
+
+def _moment_from_raw(raw: Any, subject: str, default_why: str = "It gives admin review at least one concrete source/context detail instead of a category label.") -> dict[str, Any] | None:
+    summary = ""
+    if isinstance(raw, dict):
+        summary = _case_text(raw.get("summary") or raw.get("safeSummary") or raw.get("evidenceSummary") or raw.get("claim") or raw.get("detail") or raw.get("snippet") or raw.get("label") or raw.get("topic"), 260)
+    else:
+        summary = _case_text(raw, 260)
+    if not summary:
+        return None
+    if _CASE_REPORT_FORBIDDEN_LABEL_RE.search(summary):
+        return None
+    channel = _extract_channel_name(raw)
+    source_type = _extract_source_type(raw)
+    visibility = _extract_visibility(raw)
+    occurred = _extract_occurred_at(raw)
+    dossier_use = "Review as supporting internal Source File context; do not convert into a public claim without admin confirmation."
+    public_safe = visibility == "public_reviewable" and not _PRIVATE_CHANNEL_NAME_RE.search(channel or summary)
+    return {
+        "summary": summary,
+        "sourceType": source_type,
+        **({"channelName": channel} if channel else {}),
+        "visibility": visibility,
+        **({"occurredAt": occurred} if occurred else {}),
+        "whyItMatters": _case_text(default_why, 220),
+        "dossierUse": dossier_use,
+        "publicSafe": bool(public_safe),
+    }
+
+
+def _collect_representative_moments(packet: dict[str, Any], subject: str) -> list[dict[str, Any]]:
+    candidates: list[Any] = []
+    for field in ("representativeEvidence", "bestEvidenceToReview", "evidenceDetails", "conversationHighlights", "bnlInteractionSignals", "musicSignals", "communitySignals"):
+        value = packet.get(field)
+        if isinstance(value, list):
+            candidates.extend(value)
+    raw = packet.get("rawProvenance") if isinstance(packet.get("rawProvenance"), dict) else {}
+    candidates.extend(list(raw.get("rawFragments") or [])[:12])
+    moments: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for raw_item in candidates:
+        moment = _moment_from_raw(raw_item, subject)
+        if not moment:
+            continue
+        fp = re.sub(r"[^a-z0-9]+", " ", moment["summary"].lower()).strip()[:220]
+        if not fp or fp in seen:
+            continue
+        seen.add(fp)
+        moments.append(moment)
+        if len(moments) >= SUBJECT_MEMORY_MAX_MOMENTS:
+            break
+    return moments
+
+
+def _infer_subject_memory_coverage(packet: dict[str, Any]) -> dict[str, Any]:
+    source_counts = dict(packet.get("sourceCounts") or {})
+    source_types = [str(item) for item in (packet.get("sourceTypes") or [])]
+    raw = packet.get("rawProvenance") if isinstance(packet.get("rawProvenance"), dict) else {}
+    source_labels = [str(item) for item in (raw.get("sourceLabels") or [])]
+    haystack = " ".join([*source_types, *source_counts.keys(), *source_labels]).lower()
+
+    def lane(name: str, used: bool, detail: str) -> dict[str, Any]:
+        return {"lane": name, "status": "used" if used else "unavailable", "detail": _case_text(detail, 260)}
+
+    queue_connected = str(packet.get("queueSubmissionStatus") or "not_connected") not in {"", "not_connected", "unknown"}
+    identity_used = bool(packet.get("subjectIdentity") or packet.get("linkSignalDiagnostics") or packet.get("entityIntelligenceProfile"))
+    coverage = [
+        lane("recent Discord conversation memory", "conversation" in haystack or bool(packet.get("conversationHighlights")), "Conversation highlights or raw archive fragments were available." if "conversation" in haystack or packet.get("conversationHighlights") else "Recent Discord conversation memory is not separately exposed to this report."),
+        lane("historical Discord conversation memory", "broadcast" in haystack or bool(packet.get("bestEvidenceToReview")), "Historical/BARCODE memory or best evidence items were available for review." if "broadcast" in haystack or packet.get("bestEvidenceToReview") else "Historical Discord memory is not separately exposed to this report."),
+        lane("entity intelligence / Entity Ledger", bool(packet.get("entityIntelligenceProfile") or (packet.get("diagnostics") or {}).get("entityIntelligence")), "Entity Intelligence diagnostics/profile were included." if packet.get("entityIntelligenceProfile") or (packet.get("diagnostics") or {}).get("entityIntelligence") else "Entity Ledger details were not available to this report."),
+        lane("Source File archive", True, "The full Source File archive envelope and sourcePackage are preserved for admin review."),
+        lane("Source File notes", bool(packet.get("sections")), "Source File enrichment sections/notes were included." if packet.get("sections") else "No Source File note sections were exposed."),
+        lane("identity links / aliases", identity_used, "Identity/link signals are review-only inputs; identity is not auto-confirmed." if identity_used else "Identity review is handled through the site Identity Check when links are available."),
+        lane("website/source file state", bool(packet.get("sourceFile") or packet.get("matchKind")), f"Website lookup match target: {packet.get('matchKind') or 'unknown'}."),
+        lane("queue/submission data", queue_connected, "Queue/submission data is connected to this report." if queue_connected else "Queue/submission memory is not connected to this report. Do not claim submissions, song counts, play history, payment, or Priority status."),
+        lane("public/private channel policy", bool(packet.get("warningCounts") or packet.get("sourceAuthority")), "Visibility/channel-policy warnings were carried into review context." if packet.get("warningCounts") or packet.get("sourceAuthority") else "Public/private channel policy is not fully exposed per item."),
+        lane("short-term subject context", False, "Short/mid/long-term subject memory lanes are not exposed separately to this report yet; this report uses available conversation, entity, and Source File archive data."),
+        lane("mid-term subject patterns", False, "Short/mid/long-term subject memory lanes are not exposed separately to this report yet; this report uses available conversation, entity, and Source File archive data."),
+        lane("long-term subject profile", False, "Short/mid/long-term subject memory lanes are not exposed separately to this report yet; this report uses available conversation, entity, and Source File archive data."),
+    ]
+    return {"lanes": coverage, "summary": "Short/mid/long-term subject memory lanes are not exposed separately to this report yet; this report uses available conversation, entity, and Source File archive data."}
+
+
+def _has_concrete_case_detail(text: str) -> bool:
+    lowered = str(text or "").lower()
+    if any(token in lowered for token in ("#", "http://", "https://", "suno", "spotify", "soundcloud", "youtube", "demo", "wip", "beat", "track", "song", "artist", "profile", "link", "queue", "submission", "barcode", "bnl")):
+        return True
+    if re.search(r"\b20\d{2}[-/]\d{1,2}[-/]\d{1,2}\b", lowered):
+        return True
+    return False
+
+
+def _generic_label_gap(packet: dict[str, Any], field: str, readable: str) -> list[str]:
+    values = packet.get(field)
+    if values:
+        detailed = _case_list(values, limit=4)
+        if detailed and any(_has_concrete_case_detail(item) for item in detailed):
+            return detailed
+        return [f"The archive flags {readable}, but the current evidence packet does not expose the specific songs, collaborators, messages, channels, platforms, or links behind that label."]
+    return [f"No specific {readable} detail is confirmed in the current report packet."]
+
+
+def _relationship_review_items(packet: dict[str, Any], subject: str) -> list[str]:
+    values = _case_list(packet.get("relationshipSignals") or packet.get("reviewOnlyEvidence"), limit=5)
+    if not values:
+        return ["No specific relationship/context connection is confirmed in the current report packet; keep relationship interpretation review-only."]
+    out = []
+    for text in values:
+        if "review-only" not in text.lower() and "not confirm" not in text.lower() and "uncertain" not in text.lower():
+            text = f"{text}. Treat the relationship/context meaning as review-only and unconfirmed."
+        out.append(text)
+    return out
+
+
+def build_subject_memory_packet_v1(packet: dict[str, Any]) -> dict[str, Any]:
+    """Build evidence-grounded working memory for the BNL-authored case report."""
+
+    source_file = packet.get("sourceFile") if isinstance(packet.get("sourceFile"), dict) else {}
+    subject = _case_text(packet.get("subject") or _first(source_file, ("name", "sourceFileName", "subject", "displayName", "title", "normalizedName")), 140)
+    subject_key = _subject_key(subject or _first(source_file, ("normalizedName", "subjectKey", "slug")))
+    generated_at = _packet_generated_at(packet)
+    moments = _collect_representative_moments(packet, subject)
+    music_items = _generic_label_gap(packet, "musicSignals", "music/creative context")
+    if music_items and all("No specific" in item for item in music_items):
+        music_items.append("When music/creative details are unavailable, BNL must not claim a submitted song, artist profile, platform ownership, collaborator, or public link.")
+    queue_connected = str(packet.get("queueSubmissionStatus") or "not_connected") not in {"", "not_connected", "unknown"}
+    queue_context = [
+        _case_text(packet.get("queueSubmissionNote") or ("Queue/submission data is connected to this report." if queue_connected else "Queue/submission memory is not connected to this report. Do not claim submissions, song counts, play history, payment, or Priority status."), 320)
+    ]
+    if queue_connected:
+        queue_context.extend(_case_list(packet.get("queueSubmissionFacts") or packet.get("queueSubmissions"), limit=4))
+    identity_signals = _case_list(packet.get("subjectIdentity") or packet.get("linkSignalDiagnostics") or packet.get("publicUseCandidates"), limit=5)
+    if not identity_signals:
+        identity_signals = ["Identity review is handled through the site Identity Check when links are available. No identity is auto-confirmed by this report."]
+    elif not any("not auto" in item.lower() or "review" in item.lower() for item in identity_signals):
+        identity_signals.append("Identity signals are review inputs only; this report does not auto-confirm identity or merge aliases.")
+
+    packet_v1 = {
+        "version": SUBJECT_MEMORY_PACKET_VERSION,
+        "generatedAt": generated_at,
+        "subjectName": subject,
+        "subjectKey": subject_key,
+        "memoryCoverage": _infer_subject_memory_coverage(packet),
+        "identitySignals": identity_signals,
+        "discordActivity": _case_list(packet.get("conversationHighlights") or packet.get("bestEvidenceToReview"), limit=6) or ["Discord activity is only represented by archive evidence; no raw transcript is exposed to this report."],
+        "websiteContext": _case_list([f"Website/Source File match target is {packet.get('matchKind') or 'unknown'}.", *(_case_list(source_file, limit=3) if source_file else [])], limit=5),
+        "queueSubmissionContext": queue_context,
+        "musicCreativeContext": music_items,
+        "relationshipContext": _relationship_review_items(packet, subject),
+        "communityContext": _generic_label_gap(packet, "communitySignals", "community context"),
+        "repeatedTopics": _generic_label_gap(packet, "topicBreakdown", "repeated topics"),
+        "representativeMoments": moments,
+        "publicSafeCandidateFacts": _case_list(packet.get("publicSafePossibilities") or packet.get("publicUseCandidates"), limit=6) or ["No public-safe fact is confirmed by this packet; owner review is required before public use."],
+        "reviewOnlyFacts": _case_list(packet.get("reviewOnlyEvidence") or packet.get("privateOnlyNotes") or packet.get("notPublicYet"), limit=8),
+        "openQuestions": _case_list(packet.get("missingInfo") or _section_text(packet.get("sections") or {}, "Missing Info", limit=8), limit=8) or ["Which identity/display name, public role, public links, and queue/submission facts are safe to use?"],
+        "internalWarnings": _case_list(packet.get("warnings") or packet.get("privateOnlyNotes") or packet.get("notPublicYet"), limit=8) or ["Do not publish, merge identities, auto-confirm aliases, or infer public facts from review-only evidence."],
+        "evidenceGaps": [],
+    }
+    if not moments:
+        packet_v1["evidenceGaps"].append("The current memory path did not expose representative event details; the report must state evidence limitations instead of inventing specifics.")
+    if not packet.get("musicSignals"):
+        packet_v1["evidenceGaps"].append("The current memory path exposes no specific music/creative details to the report generator; do not pretend songs, platforms, collaborators, or links are confirmed.")
+    if packet.get("musicSignals") and not any(any(term in item.lower() for term in ("#", "http", "suno", "demo", "wip", "beat", "track", "song", "platform", "link")) for item in music_items):
+        packet_v1["evidenceGaps"].append("The current memory path exposes only category labels for music discussion; raw representative music details are not available to the report generator yet.")
+    if not queue_connected:
+        packet_v1["evidenceGaps"].append("Queue/submission memory is not connected to this report. Do not claim submissions, song counts, play history, payment, or Priority status.")
+    return _sanitize_archive_value(packet_v1)
+
+
+def _join_case_items(items: Any, fallback: str, limit: int = 3) -> str:
+    values = _case_list(items, limit=limit, item_limit=260)
+    if not values:
+        return fallback
+    return " ".join(f"{item}." if item and item[-1] not in ".!?" else item for item in values)
+
+
+def build_source_file_case_report_v1(subject_memory_packet: dict[str, Any]) -> dict[str, Any]:
+    """Build BNL's internal analyst report from subjectMemoryPacketV1 only."""
+
+    memory = subject_memory_packet or {}
+    subject = _case_text(memory.get("subjectName") or "this subject", 140)
+    subject_key = _case_text(memory.get("subjectKey") or _subject_key(subject), 140)
+    moments = memory.get("representativeMoments") if isinstance(memory.get("representativeMoments"), list) else []
+    has_moments = bool(moments)
+    evidence_summary_bits = []
+    for moment in moments[:3]:
+        if isinstance(moment, dict):
+            channel = f" in {moment.get('channelName')}" if moment.get("channelName") else ""
+            when = f" around {moment.get('occurredAt')}" if moment.get("occurredAt") else ""
+            evidence_summary_bits.append(_case_text(f"{moment.get('summary')} ({moment.get('sourceType')}{channel}{when}; {moment.get('visibility')})", 320))
+    if not evidence_summary_bits:
+        evidence_summary_bits.append("The current archive does not expose representative event details to the case report; use the packet's evidence gaps before making claims.")
+    report = {
+        "version": SOURCE_FILE_CASE_REPORT_VERSION,
+        "generatedAt": _case_text(memory.get("generatedAt") or datetime.now(timezone.utc).isoformat(), 80),
+        "subjectName": subject,
+        "subjectKey": subject_key,
+        "reportStatus": "internal_review_only_evidence_grounded" if has_moments else "internal_review_only_evidence_limited",
+        "caseSummary": _case_text(f"{subject} is being reviewed as an internal Source File subject. The strongest usable read comes from the subject memory packet: {evidence_summary_bits[0]} This report does not publish, merge identities, or convert review-only evidence into public fact.", 650),
+        "dossierUse": _case_text("Use this as an internal case-file readout for admin review. Draft public dossier language only after identity, public-safe role, public links, relationship meaning, and queue/submission status are reviewed.", 420),
+        "publicSafeClaims": _case_list(memory.get("publicSafeCandidateFacts"), limit=6) or ["No public-safe claim is confirmed yet; owner/admin review is required before public use."],
+        "evidenceSummary": evidence_summary_bits,
+        "communityContext": _join_case_items(memory.get("communityContext"), "Community context is not specifically detailed in the current packet; do not claim more than the available evidence supports."),
+        "creativeMusicContext": _join_case_items(memory.get("musicCreativeContext"), "No specific collaborator, track title, platform ownership, submitted queue track, or public link is confirmed in the current report packet."),
+        "relationshipContext": _join_case_items(memory.get("relationshipContext"), "No specific relationship/context connection is confirmed; keep relationship interpretation review-only."),
+        "queueSubmissionContext": _join_case_items(memory.get("queueSubmissionContext"), "Queue/submission memory is not connected to this report. Do not claim submissions, song counts, play history, payment, or Priority status."),
+        "identityContext": _case_text(_join_case_items(memory.get("identitySignals"), "Identity review is handled through the site Identity Check when links are available. This report does not auto-confirm identity.") + " This report does not auto-confirm identity.", 520),
+        "reviewBlockers": _case_list(memory.get("openQuestions"), limit=8),
+        "internalOnlyNotes": _case_list(memory.get("internalWarnings") or memory.get("reviewOnlyFacts"), limit=8) or ["Keep review-only evidence internal; do not publish or merge identities from this report."],
+        "recommendedNextSteps": [
+            "Review the representative moments and evidence gaps before drafting a public dossier.",
+            "Confirm public-safe display name, role, public links, identity links, and queue/submission status through the existing admin workflows.",
+            "Keep this as Source File material unless an admin decides the evidence is sufficient for public-safe drafting.",
+        ],
+        "confidenceNotes": _case_list(memory.get("evidenceGaps"), limit=8) or ["Confidence is limited to the visible subject memory packet; no raw private transcripts are included."],
+        "memoryCoverage": memory.get("memoryCoverage") or {},
+    }
+    return _sanitize_archive_value(report)
+
 def _source_package_from_packet(packet: dict[str, Any]) -> dict[str, Any]:
     """Build the full review-only archive package without compact-card trimming."""
 
-    excluded = {"payload", "sendResult", "archiveResult", "sourcePackage"}
+    excluded = {"payload", "sendResult", "archiveResult", "sourcePackage", "subjectMemoryPacketV1", "sourceFileCaseReportV1"}
     package = {key: value for key, value in (packet or {}).items() if key not in excluded}
     package["archiveNotice"] = "Internal/review-only Source File archive package. No public publishing, draft creation, tag creation, queue/payment action, identity merge, or alias confirmation is requested."
     return _sanitize_archive_value(package)
@@ -2838,6 +3171,8 @@ def build_source_file_archive_payload(packet: dict[str, Any], *, environ: dict[s
         "matchKind": packet.get("matchKind"),
         "runTime": packet.get("runTime"),
     }
+    subject_memory_packet = build_subject_memory_packet_v1(packet)
+    case_report = build_source_file_case_report_v1(subject_memory_packet)
     envelope = {
         "candidateId": _sanitize_archive_value(candidate_id) if candidate_id else None,
         "subjectName": subject,
@@ -2850,6 +3185,8 @@ def build_source_file_archive_payload(packet: dict[str, Any], *, environ: dict[s
         "doNotSay": _sanitize_archive_value(_section_text(sections, "Do Not Say", limit=10) or packet.get("doNotSay") or ""),
         "evidenceReceiptSummary": _sanitize_archive_value(receipt),
         "sourceFileBriefV2": _sanitize_archive_value(build_source_file_brief_v2(packet, archive_id=packet.get("archiveId") or "")),
+        "subjectMemoryPacketV1": subject_memory_packet,
+        "sourceFileCaseReportV1": case_report,
         "sourcePackage": _source_package_from_packet(packet),
     }
     return envelope
