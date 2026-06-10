@@ -495,8 +495,31 @@ def _lookup_source_file_report_missing(
     return missing
 
 
+def site_request_requires_case_report_backfill(site_request: dict[str, Any] | None) -> bool:
+    """Return True when the website explicitly asks BNL to backfill a case report."""
+
+    request = site_request if isinstance(site_request, dict) else {}
+    if request.get("caseReportMissing") is True or request.get("requiresCaseReportBackfill") is True:
+        return True
+    reason = str(request.get("reason") or "").lower()
+    return CASE_REPORT_MISSING_REASON in reason or CASE_REPORT_BACKFILL_REASON in reason
+
+
 def _queue_reason_has_case_report_missing(reason: Any) -> bool:
     return CASE_REPORT_MISSING_REASON in str(reason or "") or CASE_REPORT_BACKFILL_REASON in str(reason or "")
+
+
+def _case_report_backfill_trigger(*, explicit_site_request: bool = False, archive_lookup_missing: bool = False, queue_reason: Any = None, evidence_source: Any = None) -> str:
+    if explicit_site_request:
+        return "explicit_site_request"
+    if archive_lookup_missing:
+        return "archive_lookup_missing"
+    reason = str(queue_reason or "")
+    if CASE_REPORT_BACKFILL_REASON in reason and str(evidence_source or "") in {"source_refresh_now", "site_refresh_request"}:
+        return "explicit_site_request"
+    if _queue_reason_has_case_report_missing(reason):
+        return "queue_reason"
+    return "none"
 
 
 def _mark_current_cooldown_terminal(db_path: str, *, guild_id: int | None, subject_key: str, reason: str = "cooldown_current") -> None:
@@ -529,7 +552,10 @@ def process_source_file_refresh_now(db_path: str, payload: dict[str, Any], *, gu
     mode = _site_refresh_mode(site_request)
     source = _safe_text(site_request.get("source") or "", 80)
     reason = _safe_text(site_request.get("reason") or "", 80)
+    explicit_case_report_backfill = site_request_requires_case_report_backfill(site_request)
     logging.info("source_refresh_now_started request_id=%s subject_key=%s source=%s reason=%s", request_id or "none", skey or "none", source or "none", reason or "none")
+    if explicit_case_report_backfill:
+        logging.info("source_case_report_backfill_requested subject_key=%s trigger=%s reason=%s", skey or "none", "explicit_site_request", reason or CASE_REPORT_BACKFILL_REASON)
 
     summary: dict[str, Any] = {"ok": True, "dryRun": dry_run, "requestId": request_id, "candidateId": candidate_id, "subject": subject or skey, "subjectKey": skey, "status": "skipped", "recommendationId": "", "recommendationSent": False, "archiveSent": False, "archiveStatus": None, "archiveId": "", "archiveError": "", "failureReason": ""}
     if dry_run:
@@ -548,12 +574,13 @@ def process_source_file_refresh_now(db_path: str, payload: dict[str, Any], *, gu
             return summary
 
     lookup_key, lookup_value = _site_refresh_lookup_parts(site_request)
-    report_missing = False
+    report_missing = bool(explicit_case_report_backfill)
     try:
         target_check = lookup_func({"lookupKey": lookup_key, "lookupValue": lookup_value, lookup_key: lookup_value})
-        report_missing = source_file_report_missing(target_check)
-        if report_missing:
-            logging.info("source_case_report_missing subject_key=%s reason=%s", skey or "none", CASE_REPORT_MISSING_REASON)
+        lookup_report_missing = source_file_report_missing(target_check)
+        report_missing = bool(explicit_case_report_backfill or lookup_report_missing)
+        if lookup_report_missing:
+            logging.info("source_case_report_missing subject_key=%s reason=%s trigger=%s", skey or "none", CASE_REPORT_MISSING_REASON, "archive_lookup_missing")
         found = bool(target_check.get("found") or target_check.get("sourceFile") or target_check.get("source_file") or target_check.get("candidate") or target_check.get("dossier"))
         if target_check.get("ok") is False or not found:
             failure = "lookup_failed" if target_check.get("ok") is False else "no_target"
@@ -585,7 +612,7 @@ def process_source_file_refresh_now(db_path: str, payload: dict[str, Any], *, gu
         db_path,
         guild_id=guild_id,
         subject_name=subject or lookup_value,
-        reason=CASE_REPORT_MISSING_REASON if report_missing else f"source_refresh_now:{request_id or candidate_id or skey}",
+        reason=CASE_REPORT_BACKFILL_REASON if explicit_case_report_backfill else (CASE_REPORT_MISSING_REASON if report_missing else f"source_refresh_now:{request_id or candidate_id or skey}"),
         evidence_source="source_refresh_now",
         priority=100,
         refresh_mode=mode,
@@ -601,7 +628,7 @@ def process_source_file_refresh_now(db_path: str, payload: dict[str, Any], *, gu
         lookup_func=lookup_func,
         sender=sender,
         environ=env,
-        bypass_cooldown=report_missing or source in {"admin_manual_retry"} or reason in {"manual_retry", "file_not_updated"},
+        bypass_cooldown=explicit_case_report_backfill or report_missing or source in {"admin_manual_retry"} or reason in {"manual_retry", "file_not_updated"},
         refresh_mode=mode,
         subject_key=skey,
     )
@@ -801,13 +828,19 @@ def process_source_file_refresh_queue(db_path: str, *, guild_id: int | None = No
                 continue
             state = conn.execute(f"SELECT * FROM {STATE_TABLE} WHERE (guild_id IS ? OR guild_id=?) AND subject_key=? LIMIT 1", (row["guild_id"], row["guild_id"], row["subject_key"])).fetchone()
             cooldown_until = parse_iso(state["cooldown_until"] if state else None)
-            report_missing = _queue_reason_has_case_report_missing(row["reason"])
+            queue_reason_missing = _queue_reason_has_case_report_missing(row["reason"])
+            report_missing = queue_reason_missing
+            backfill_trigger = _case_report_backfill_trigger(queue_reason=row["reason"], evidence_source=row["evidence_source"])
             if not report_missing:
-                report_missing = _lookup_source_file_report_missing(row, lookup_func=lookup_func)
-                if report_missing:
+                lookup_report_missing = _lookup_source_file_report_missing(row, lookup_func=lookup_func)
+                report_missing = lookup_report_missing
+                if lookup_report_missing:
+                    backfill_trigger = _case_report_backfill_trigger(archive_lookup_missing=True)
                     merged_reason = _safe_text(f"{row['reason']}; {CASE_REPORT_MISSING_REASON}", 260)
                     conn.execute(f"UPDATE {QUEUE_TABLE} SET reason=?, updated_at=? WHERE id=?", (merged_reason, now, row["id"]))
                     conn.commit()
+            if report_missing:
+                logging.info("source_case_report_backfill_requested subject_key=%s trigger=%s reason=%s", row["subject_key"], backfill_trigger, CASE_REPORT_BACKFILL_REASON if queue_reason_missing else CASE_REPORT_MISSING_REASON)
             if cooldown_until and cooldown_until > now_dt and not (report_missing or bypass_cooldown or row["refresh_mode"] in {"manual", "operator_requested", "site_manual_request"}):
                 conn.execute(f"UPDATE {QUEUE_TABLE} SET status='cooldown', updated_at=?, not_before_at=?, last_error='cooldown' WHERE id=?", (now, cooldown_until.isoformat(), row["id"]))
                 conn.commit()
@@ -820,7 +853,7 @@ def process_source_file_refresh_queue(db_path: str, *, guild_id: int | None = No
             conn.commit()
             logging.info("source_refresh_started subject_key=%s mode=%s", row["subject_key"], mode)
             if report_missing:
-                logging.info("source_case_report_backfill_started subject_key=%s reason=%s", row["subject_key"], CASE_REPORT_BACKFILL_REASON)
+                logging.info("source_case_report_backfill_started subject_key=%s reason=%s trigger=%s", row["subject_key"], CASE_REPORT_BACKFILL_REASON, backfill_trigger)
             try:
                 with refresh_generation_context(row["subject_key"]):
                     result = run_source_file_enrichment(
@@ -860,7 +893,7 @@ def process_source_file_refresh_queue(db_path: str, *, guild_id: int | None = No
                     else:
                         logging.info("source_refresh_succeeded subject_key=%s recommendation_id=%s archive_id=%s", row["subject_key"], recommendation_id or "none", archive_id or "none")
                     if report_missing:
-                        logging.info("source_case_report_backfill_succeeded subject_key=%s status=%s archive_id=%s", row["subject_key"], item_status, archive_id or "none")
+                        logging.info("source_case_report_backfill_succeeded subject_key=%s status=%s archive_id=%s trigger=%s", row["subject_key"], item_status, archive_id or "none", backfill_trigger)
                     summary["processed"] += 1
                     summary["items"].append({"subject": row["subject_name"], "status": item_status, "reason": item_reason, "error": partial_reason, "partialSuccess": partial_success, "recommendationId": recommendation_id, "recommendationSent": bool(result.get("recommendationSent", bool(send_result.get("ok")))), "archiveSent": bool(result.get("archiveSent", bool(archive_result.get("ok")))), "archiveStatus": result.get("archiveStatus") or archive_result.get("status"), "archiveId": archive_id, "archiveError": _safe_text(result.get("archiveError") or archive_result.get("error") or "", 180), "caseReportBackfill": bool(report_missing)})
                 else:
@@ -877,7 +910,7 @@ def process_source_file_refresh_queue(db_path: str, *, guild_id: int | None = No
                     conn.commit()
                     logging.warning("source_refresh_failed subject_key=%s error=%s", row["subject_key"], err)
                     if report_missing:
-                        logging.warning("source_case_report_backfill_failed subject_key=%s error=%s", row["subject_key"], err)
+                        logging.warning("source_case_report_backfill_failed subject_key=%s error=%s trigger=%s", row["subject_key"], err, backfill_trigger)
                     summary["failed"] += 1
                     summary["items"].append({"subject": row["subject_name"], "status": "failed", "reason": CASE_REPORT_BACKFILL_REASON if report_missing else "", "error": err, "recommendationSent": bool(result.get("recommendationSent")), "archiveSent": bool(result.get("archiveSent")), "archiveStatus": result.get("archiveStatus") or archive_result.get("status"), "archiveId": str(archive_result.get("archiveId") or result.get("archiveId") or "")[:120], "archiveError": _safe_text(result.get("archiveError") or archive_result.get("error") or "", 180), "recommendationId": str(send_result.get("recommendationId") or result.get("recommendationId") or "")[:120], "caseReportBackfill": bool(report_missing)})
             except Exception as exc:
@@ -887,7 +920,7 @@ def process_source_file_refresh_queue(db_path: str, *, guild_id: int | None = No
                 conn.commit()
                 logging.warning("source_refresh_failed subject_key=%s error=%s", row["subject_key"], err)
                 if report_missing:
-                    logging.warning("source_case_report_backfill_failed subject_key=%s error=%s", row["subject_key"], err)
+                    logging.warning("source_case_report_backfill_failed subject_key=%s error=%s trigger=%s", row["subject_key"], err, backfill_trigger)
                 summary["failed"] += 1
                 summary["items"].append({"subject": row["subject_name"], "status": "failed", "reason": CASE_REPORT_BACKFILL_REASON if report_missing else "", "error": err, "caseReportBackfill": bool(report_missing)})
     finally:
@@ -920,6 +953,9 @@ def process_site_refresh_requests(db_path: str, *, guild_id: int | None = None, 
         subject = _site_refresh_subject_name(site_request)
         skey = _site_refresh_subject_key(site_request)
         mode = _site_refresh_mode(site_request)
+        explicit_case_report_backfill = site_request_requires_case_report_backfill(site_request)
+        if explicit_case_report_backfill:
+            logging.info("source_case_report_backfill_requested subject_key=%s trigger=%s reason=%s", skey or "none", "explicit_site_request", _safe_text(site_request.get("reason") or CASE_REPORT_BACKFILL_REASON, 120))
         if dry_run:
             summary["processed"] += 1
             summary["items"].append({"subject": subject or skey, "subjectKey": skey, "requestId": request_id, "status": "dry_run", "wouldClaim": True, "wouldEnqueue": True, "wouldSend": True})
@@ -938,12 +974,13 @@ def process_site_refresh_requests(db_path: str, *, guild_id: int | None = None, 
         logging.info("source_refresh_site_request_claimed request_id=%s", request_id)
         lookup_key = "normalizedName" if (site_request.get("normalizedSubjectKey") or site_request.get("subjectKey")) and not site_request.get("subjectName") else "subject"
         lookup_value = str(site_request.get("normalizedSubjectKey") or site_request.get("subjectKey") or subject or skey)
-        report_missing = False
+        report_missing = bool(explicit_case_report_backfill)
         try:
             target_check = lookup_func({"lookupKey": lookup_key, "lookupValue": lookup_value, lookup_key: lookup_value})
-            report_missing = source_file_report_missing(target_check)
-            if report_missing:
-                logging.info("source_case_report_missing subject_key=%s reason=%s", skey or "none", CASE_REPORT_MISSING_REASON)
+            lookup_report_missing = source_file_report_missing(target_check)
+            report_missing = bool(explicit_case_report_backfill or lookup_report_missing)
+            if lookup_report_missing:
+                logging.info("source_case_report_missing subject_key=%s reason=%s trigger=%s", skey or "none", CASE_REPORT_MISSING_REASON, "archive_lookup_missing")
             found = bool(target_check.get("found") or target_check.get("sourceFile") or target_check.get("source_file") or target_check.get("candidate") or target_check.get("dossier"))
             if target_check.get("ok") is False or not found:
                 reason = "no_target" if target_check.get("ok") is not False else "lookup_failed"
@@ -972,7 +1009,7 @@ def process_site_refresh_requests(db_path: str, *, guild_id: int | None = None, 
             db_path,
             guild_id=guild_id,
             subject_name=subject or lookup_value,
-            reason=CASE_REPORT_MISSING_REASON if report_missing else f"site_refresh_request:{request_id}",
+            reason=CASE_REPORT_BACKFILL_REASON if explicit_case_report_backfill else (CASE_REPORT_MISSING_REASON if report_missing else f"site_refresh_request:{request_id}"),
             evidence_source="site_refresh_request",
             priority=95 if mode == "site_manual_request" else 70,
             refresh_mode=mode,
@@ -987,7 +1024,7 @@ def process_site_refresh_requests(db_path: str, *, guild_id: int | None = None, 
             lookup_func=lookup_func,
             sender=sender,
             environ=env,
-            bypass_cooldown=report_missing or (mode == "site_manual_request"),
+            bypass_cooldown=explicit_case_report_backfill or report_missing or (mode == "site_manual_request"),
             refresh_mode=mode,
             subject_key=skey,
         )

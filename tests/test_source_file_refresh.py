@@ -302,6 +302,81 @@ class SourceFileRefreshTests(unittest.TestCase):
         self.assertEqual(summary["items"][0]["reason"], "compact_recommendation_rejected")
         self.assertTrue(summary["items"][0]["caseReportBackfill"])
 
+
+    def test_site_request_requires_case_report_backfill_flags_and_reason(self):
+        self.assertTrue(refresh.site_request_requires_case_report_backfill({"caseReportMissing": True}))
+        self.assertTrue(refresh.site_request_requires_case_report_backfill({"requiresCaseReportBackfill": True}))
+        self.assertTrue(refresh.site_request_requires_case_report_backfill({"reason": "case_report_missing_after_refresh"}))
+        self.assertTrue(refresh.site_request_requires_case_report_backfill({"reason": "operator_case_report_backfill_retry"}))
+        self.assertFalse(refresh.site_request_requires_case_report_backfill({"caseReportMissing": False, "reason": "opened_source_file"}))
+
+    def test_refresh_now_explicit_case_report_missing_forces_backfill_without_archive_fields(self):
+        opener = FakeOpener({"ok": True, "requests": []})
+        lookup = lambda query: {"ok": True, "found": True, "sourceFile": {"subjectName": "Signal Fox"}}
+        result_packet = {"sent": True, "recommendationSent": True, "archiveSent": True, "sendResult": {"recommendationId": "rec_explicit", "ok": True}, "archiveResult": {"archiveId": "arc_explicit", "ok": True, "status": 200}, "sourceCounts": {"conversations": 1}, "sourceTypes": ["conversations"], "subject": "Signal Fox", "qualityScore": 88}
+        with self.assertLogs(level="INFO") as logs, mock.patch.object(refresh, "run_source_file_enrichment", return_value=result_packet) as mocked:
+            result = refresh.process_source_file_refresh_now(
+                self.db,
+                {"requestId": "req_explicit", "subjectName": "Signal Fox", "normalizedSubjectKey": "signal-fox", "caseReportMissing": True, "reason": "case_report_missing_after_refresh", "source": "admin_source_file_open"},
+                guild_id=1,
+                environ={"BNL_SOURCE_FILE_READ_TOKEN": "read", "BNL_WEBSITE_BASE_URL": "https://site.test", "BNL_DOSSIER_INGEST_TOKEN": "ingest"},
+                opener=opener,
+                lookup_func=lookup,
+            )
+        self.assertEqual(mocked.call_count, 1)
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["local"]["items"][0]["reason"], "case_report_backfill")
+        self.assertTrue(result["local"]["items"][0]["caseReportBackfill"])
+        info_text = "\n".join(logs.output)
+        self.assertIn("source_case_report_backfill_requested", info_text)
+        self.assertIn("trigger=explicit_site_request", info_text)
+        self.assertIn("source_case_report_backfill_started", info_text)
+        self.assertIn("source_case_report_backfill_succeeded", info_text)
+
+    def test_refresh_now_explicit_case_report_backfill_bypasses_current_cooldown(self):
+        conn = sqlite3.connect(self.db)
+        try:
+            refresh.ensure_source_file_refresh_schema(conn)
+            conn.execute(
+                f"INSERT OR REPLACE INTO {refresh.STATE_TABLE} (guild_id, subject_key, subject_name, last_refresh_completed_at, last_refresh_status, last_recommendation_id, cooldown_until, updated_at) VALUES (1, 'signal-fox', 'Signal Fox', '2026-01-01T00:00:00+00:00', 'succeeded', 'rec_old', '2999-01-01T00:00:00+00:00', 'now')"
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        opener = FakeOpener({"ok": True, "requests": []})
+        lookup = lambda query: {"ok": True, "found": True, "sourceFile": {"subjectName": "Signal Fox"}}
+        result_packet = {"sent": True, "recommendationSent": True, "archiveSent": True, "sendResult": {"recommendationId": "rec_new", "ok": True}, "archiveResult": {"archiveId": "arc_new", "ok": True, "status": 200}, "sourceCounts": {"conversations": 1}, "sourceTypes": ["conversations"], "subject": "Signal Fox", "qualityScore": 88}
+        with mock.patch.object(refresh, "run_source_file_enrichment", return_value=result_packet) as mocked:
+            result = refresh.process_source_file_refresh_now(
+                self.db,
+                {"requestId": "req_backfill", "subjectName": "Signal Fox", "normalizedSubjectKey": "signal-fox", "requiresCaseReportBackfill": True, "reason": "case_report_backfill", "source": "admin_source_file_open"},
+                guild_id=1,
+                environ={"BNL_SOURCE_FILE_READ_TOKEN": "read", "BNL_WEBSITE_BASE_URL": "https://site.test", "BNL_DOSSIER_INGEST_TOKEN": "ingest"},
+                opener=opener,
+                lookup_func=lookup,
+            )
+        self.assertEqual(mocked.call_count, 1)
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["recommendationId"], "rec_new")
+        self.assertNotEqual(result["local"]["items"][0]["reason"], "cooldown_current")
+
+    def test_site_polling_explicit_case_report_backfill_without_archive_fields(self):
+        opener = FakeOpener({"ok": True, "requests": [{"id": "req_explicit_poll", "subjectName": "Signal Fox", "normalizedSubjectKey": "signal-fox", "status": "pending", "requiresCaseReportBackfill": True, "reason": "case_report_backfill"}]})
+        lookup = lambda query: {"ok": True, "found": True, "sourceFile": {"subjectName": "Signal Fox"}}
+        result_packet = {"sent": True, "recommendationSent": True, "archiveSent": True, "sendResult": {"recommendationId": "rec_poll", "ok": True}, "archiveResult": {"archiveId": "arc_poll", "ok": True, "status": 200}, "sourceCounts": {"conversations": 1}, "sourceTypes": ["conversations"], "subject": "Signal Fox", "qualityScore": 88}
+        with mock.patch.object(refresh, "run_source_file_enrichment", return_value=result_packet) as mocked:
+            summary = refresh.process_site_refresh_requests(
+                self.db,
+                guild_id=1,
+                environ={"BNL_SOURCE_FILE_READ_TOKEN": "read", "BNL_WEBSITE_BASE_URL": "https://site.test", "BNL_DOSSIER_INGEST_TOKEN": "ingest"},
+                opener=opener,
+                lookup_func=lookup,
+            )
+        self.assertEqual(mocked.call_count, 1)
+        self.assertEqual(summary["processed"], 1)
+        self.assertEqual(summary["items"][0]["reason"], "case_report_backfill")
+        self.assertTrue(summary["items"][0]["caseReportBackfill"])
+
     def test_manual_refresh_can_queue_and_process_subject(self):
         with mock.patch.object(refresh, "run_source_file_enrichment", return_value={"sent": True, "sendResult": {"recommendationId": "rec_1"}, "sourceCounts": {"conversations": 1}, "sourceTypes": ["conversations"], "subject": "Signal Fox", "qualityScore": 80}):
             summary = refresh.process_single_source_file_refresh(self.db, guild_id=1, subject_name="Signal Fox", environ={"BNL_DOSSIER_INGEST_TOKEN": "x"})
