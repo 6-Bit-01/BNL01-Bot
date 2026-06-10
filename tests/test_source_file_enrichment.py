@@ -1220,3 +1220,34 @@ class SourceFileEntityIntelligenceIntegrationTests(unittest.TestCase):
         self.assertIn("Entity intelligence ledger/profile", response)
         self.assertIn("Resolver surface: source_file", response)
         self.assertLessEqual(len(response), 1900)
+
+    def test_source_file_archive_payload_includes_memory_packet_and_case_report(self):
+        packet = {
+            "subject": "Signal Fox",
+            "sourceFile": {"name": "Signal Fox", "candidateId": "sf_signal_fox"},
+            "sections": {"Subject Overview": ["Signal Fox has review-only source evidence."]},
+            "sourceCounts": {"conversations": 1},
+            "sourceTypes": ["conversations"],
+            "warningCounts": {},
+            "warnings": [],
+            "qualityScore": 88,
+            "qualityStatus": "sendable",
+            "matchKind": "exact",
+            "runTime": "2026-06-10T00:00:00+00:00",
+        }
+        archive = enrich.build_source_file_archive_payload(packet)
+        self.assertIsInstance(archive.get("subjectMemoryPacketV1"), dict)
+        self.assertIsInstance(archive.get("sourceFileCaseReportV1"), dict)
+        self.assertEqual(archive["subjectMemoryPacketV1"].get("subjectName"), "Signal Fox")
+
+    def test_compact_recommendation_payload_excludes_full_memory_packet_and_case_report(self):
+        payload = {
+            "subjectName": "Signal Fox",
+            "evidenceSummary": "short summary",
+            "subjectMemoryPacketV1": {"full": "memory"},
+            "sourceFileCaseReportV1": {"full": "case report"},
+        }
+        compact = enrich.sanitize_compact_recommendation_payload(payload, packet={"subject": "Signal Fox", "matchKind": "exact"}, archive_id="arc_1")
+        self.assertNotIn("subjectMemoryPacketV1", compact)
+        self.assertNotIn("sourceFileCaseReportV1", compact)
+        self.assertIn("compactRecommendationNotice", compact)
