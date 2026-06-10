@@ -877,6 +877,110 @@ class RecentMediaRoomContextTests(unittest.TestCase):
         self.assertEqual(event["visibility"], "public_home_transient")
         self.assertNotIn("durable", event["visibility"])
 
+
+    def test_bare_media_fallback_detection_and_suppression_without_current_media(self):
+        fallback = "I saw your recent gif as gif embed (embed_type=gifv; provider=Tenor; preview=yes); gif link preview (host=tenor.com), but I do not have a detailed visual description stored for that one."
+        self.assertTrue(bnl01_bot.is_bare_media_fallback_text(fallback))
+        self.assertEqual(
+            bnl01_bot.suppress_stale_media_fallback(
+                fallback,
+                current_text="what is BARCODE Radio doing next?",
+                current_has_media=False,
+            ),
+            "",
+        )
+
+    def test_current_media_reference_can_acknowledge_once_but_not_repeat(self):
+        fallback = "I saw your recent gif as gif embed (provider=Tenor; preview=yes), but I do not have a detailed visual description stored for that one."
+        old_db = bnl01_bot.DB_FILE
+        with tempfile.NamedTemporaryFile(delete=True) as tmp:
+            bnl01_bot.DB_FILE = tmp.name
+            bnl01_bot.init_db()
+            try:
+                self.assertEqual(
+                    bnl01_bot.suppress_stale_media_fallback(
+                        fallback,
+                        current_text="what was that gif?",
+                        current_has_media=False,
+                        user_id=101,
+                        guild_id=1,
+                        channel_id=2,
+                    ),
+                    fallback,
+                )
+                with bnl01_bot.sqlite3.connect(bnl01_bot.DB_FILE) as conn:
+                    conn.execute(
+                        "INSERT INTO conversations (user_id, user_name, guild_id, channel_id, role, content) VALUES (?, ?, ?, ?, ?, ?)",
+                        (101, "BNL-01", 1, 2, "model", fallback),
+                    )
+                self.assertEqual(
+                    bnl01_bot.suppress_stale_media_fallback(
+                        fallback,
+                        current_text="what was that gif?",
+                        current_has_media=False,
+                        user_id=101,
+                        guild_id=1,
+                        channel_id=2,
+                    ),
+                    "",
+                )
+            finally:
+                bnl01_bot.DB_FILE = old_db
+
+    def test_bare_media_fallback_model_rows_excluded_from_history_and_room_context(self):
+        fallback = "I saw your recent gif as gif embed (provider=Tenor; preview=yes), but I do not have a detailed visual description stored for that one."
+        old_db = bnl01_bot.DB_FILE
+        with tempfile.NamedTemporaryFile(delete=True) as tmp:
+            bnl01_bot.DB_FILE = tmp.name
+            bnl01_bot.init_db()
+            try:
+                bnl01_bot.save_user_message(101, "Crow", 1, "what is the current signal?", channel_name="general", channel_policy="public_home", channel_id=2)
+                bnl01_bot.save_model_message(101, 1, fallback, channel_name="general", channel_policy="public_home", channel_id=2)
+                history_text = "\n".join(part for msg in bnl01_bot.get_conversation_history(101, 1) for part in msg.get("parts", []))
+                room_rows = bnl01_bot.get_recent_channel_context(1, 2, channel_name="general", channel_policy="public_home")
+                self.assertNotIn("recent gif", history_text.lower())
+                self.assertFalse(any("recent gif" in row["content"].lower() for row in room_rows))
+            finally:
+                bnl01_bot.DB_FILE = old_db
+
+    def test_recent_media_prompt_context_requires_current_media_or_reference(self):
+        bnl01_bot.record_recent_media_event(
+            guild_id=1, channel_id=2, author_id=101, author_display_name="Crow",
+            text="", media_context={"items": ["gif embed (provider=Tenor; preview=yes)"]},
+            channel_policy="public_home", conversation_surface="free_speak_public_home", response_state="observed",
+        )
+        self.assertFalse(bnl01_bot.current_batch_references_recent_media("what time is the show?"))
+        self.assertTrue(bnl01_bot.current_batch_references_recent_media("what was that gif?"))
+        old_db = bnl01_bot.DB_FILE
+        with tempfile.NamedTemporaryFile(delete=True) as tmp:
+            bnl01_bot.DB_FILE = tmp.name
+            bnl01_bot.init_db()
+            try:
+                no_ref = bnl01_bot.build_room_first_direct_context(1, 2, "general", "public_home", "Crow", current_text="what time is the show?")
+                with_ref = bnl01_bot.build_room_first_direct_context(1, 2, "general", "public_home", "Crow", current_text="what was that gif?")
+            finally:
+                bnl01_bot.DB_FILE = old_db
+        self.assertNotIn("Recent media context", no_ref)
+        self.assertIn("Recent media context", with_ref)
+
+    def test_repeat_guard_replaces_non_media_duplicate(self):
+        old_db = bnl01_bot.DB_FILE
+        with tempfile.NamedTemporaryFile(delete=True) as tmp:
+            bnl01_bot.DB_FILE = tmp.name
+            bnl01_bot.init_db()
+            try:
+                previous = "The relay is stable; answer the text normally."
+                with bnl01_bot.sqlite3.connect(bnl01_bot.DB_FILE) as conn:
+                    conn.execute(
+                        "INSERT INTO conversations (user_id, user_name, guild_id, channel_id, role, content) VALUES (?, ?, ?, ?, ?, ?)",
+                        (101, "BNL-01", 1, 2, "model", previous),
+                    )
+                replacement = bnl01_bot.suppress_stale_media_fallback(previous, current_text="repeat?", user_id=101, guild_id=1, channel_id=2)
+                self.assertNotEqual(replacement, previous)
+                self.assertNotIn("gif", replacement.lower())
+            finally:
+                bnl01_bot.DB_FILE = old_db
+
     def test_active_media_reaction_after_other_user_text_escalates(self):
         bnl01_bot.record_recent_room_event_from_message(
             guild_id=1, channel_id=2, author_id=202, author_display_name="Six", text="that plan is extremely logical",

@@ -8527,6 +8527,9 @@ def save_user_message(user_id: int, user_name: str, guild_id: int, content: str,
     return decision
 
 def save_model_message(user_id: int, guild_id: int, content: str, channel_name: str = "", channel_policy: str = "unknown", channel_id: int = 0, route_mode: str = ROUTE_MODE_NORMAL_CHAT):
+    if should_exclude_from_prompt_history("model", content):
+        logging.info("memory_write_policy_skip_conversation role=model route_mode=%s reason=bare_media_fallback_transient", route_mode)
+        return MemoryWriteDecision(False, False, False, False, False, False, "bare_media_fallback_transient", context_visibility_for_policy(channel_policy))
     decision = decide_memory_write_policy(route_mode, channel_policy, "model", content, True)
     if not decision.save_conversation:
         logging.info("memory_write_policy_skip_conversation role=model route_mode=%s reason=%s", route_mode, decision.reason)
@@ -8556,6 +8559,106 @@ def save_model_message(user_id: int, guild_id: int, content: str, channel_name: 
         add_relationship_journal(user_id, guild_id, "support_response", f"BNL provided guidance: {(content or '')[:160]}")
     return decision
 
+
+
+BARE_MEDIA_FALLBACK_PATTERNS = (
+    r"\bi saw (?:your|[a-z0-9_. '\-]{1,80}'?s|someone'?s|their|his|her)?\s*recent\s+(?:gif|image|picture|photo|video|sticker|meme|media)\b.*\b(?:do not have|don['’]t have|lack)\b.*\bdetailed visual description\b",
+    r"\bi saw .*\bas\s+(?:gif|image|video|sticker|media).*(?:embed|preview|provider=|host=|preview=yes).*\bdetailed visual description\b",
+)
+
+def _normalize_response_for_repeat(text: str) -> str:
+    lowered = (text or "").lower()
+    lowered = re.sub(r"https?://\S+", " url ", lowered)
+    lowered = re.sub(r"[^a-z0-9]+", " ", lowered)
+    return re.sub(r"\s+", " ", lowered).strip()
+
+
+def is_bare_media_fallback_text(text: str) -> bool:
+    lowered = re.sub(r"\s+", " ", (text or "").strip().lower())
+    if not lowered:
+        return False
+    if any(re.search(pattern, lowered) for pattern in BARE_MEDIA_FALLBACK_PATTERNS):
+        return True
+    media_bits = ("recent gif" in lowered or "recent media" in lowered or "recent image" in lowered or "gif embed" in lowered or "link preview" in lowered)
+    thin_bits = "detailed visual description" in lowered and ("do not have" in lowered or "don't have" in lowered or "dont have" in lowered)
+    metadata_bits = any(token in lowered for token in ("provider=", "host=", "preview=yes", "embed_type=", "tenor", "giphy"))
+    return bool(media_bits and thin_bits and metadata_bits)
+
+
+def should_exclude_from_prompt_history(role: str, content: str) -> bool:
+    return (role or "").strip().lower() == "model" and is_bare_media_fallback_text(content)
+
+
+def current_batch_references_recent_media(text: str) -> bool:
+    return is_explicit_recent_media_followup(text)
+
+
+def _responses_near_duplicate(candidate: str, previous: str, *, threshold: float = 0.82) -> bool:
+    cand = _normalize_response_for_repeat(candidate)
+    prev = _normalize_response_for_repeat(previous)
+    if not cand or not prev:
+        return False
+    if cand == prev or cand in prev or prev in cand:
+        return True
+    cand_tokens = set(cand.split())
+    prev_tokens = set(prev.split())
+    if not cand_tokens or not prev_tokens:
+        return False
+    return (len(cand_tokens & prev_tokens) / max(1, len(cand_tokens | prev_tokens))) >= threshold
+
+
+def get_recent_model_responses(user_id: int, guild_id: int, channel_id: int = 0, limit: int = 6) -> list[str]:
+    if not user_id or not guild_id:
+        return []
+    safe_limit = max(1, min(int(limit or 6), 20))
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    try:
+        if channel_id:
+            cursor.execute(
+                """
+                SELECT content FROM conversations
+                WHERE guild_id = ? AND user_id = ? AND role = 'model' AND (channel_id = ? OR COALESCE(channel_id, 0) = 0)
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (guild_id, user_id, int(channel_id), safe_limit),
+            )
+        else:
+            cursor.execute(
+                """
+                SELECT content FROM conversations
+                WHERE guild_id = ? AND user_id = ? AND role = 'model'
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (guild_id, user_id, safe_limit),
+            )
+        return [(row[0] or "") for row in cursor.fetchall() if row and (row[0] or "").strip()]
+    finally:
+        conn.close()
+
+
+def recent_model_response_repeated(candidate: str, user_id: int, guild_id: int, channel_id: int = 0, limit: int = 6) -> bool:
+    return any(_responses_near_duplicate(candidate, previous) for previous in get_recent_model_responses(user_id, guild_id, channel_id=channel_id, limit=limit))
+
+
+def suppress_stale_media_fallback(candidate: str, *, current_text: str = "", current_has_media: bool = False, user_id: int = 0, guild_id: int = 0, channel_id: int = 0) -> str:
+    if not candidate:
+        return ""
+    references_media = current_batch_references_recent_media(current_text)
+    bare_media = is_bare_media_fallback_text(candidate)
+    repeated = recent_model_response_repeated(candidate, user_id, guild_id, channel_id=channel_id) if user_id and guild_id else False
+    if bare_media and (repeated or (not current_has_media and not references_media)):
+        logging.info(
+            "stale_media_fallback_suppressed guild_id=%s channel_id=%s user_id=%s current_has_media=%s current_references_media=%s repeated=%s",
+            guild_id, channel_id, user_id, int(current_has_media), int(references_media), int(repeated),
+        )
+        return ""
+    if repeated:
+        logging.info("repeat_response_suppressed guild_id=%s channel_id=%s user_id=%s", guild_id, channel_id, user_id)
+        return "The relay caught that twice. I’m holding the duplicate instead of echoing it again."
+    return candidate
 
 def _stringify_embed_value(value) -> list:
     parts = []
@@ -10120,6 +10223,8 @@ def get_conversation_history(user_id: int, guild_id: int, limit: int = 50):
     history = []
     for role_db, content in reversed(rows):
         role = "user" if role_db == "user" else "model"
+        if should_exclude_from_prompt_history(role, content):
+            continue
         history.append({"role": role, "parts": [content]})
     return history
 
@@ -10224,6 +10329,8 @@ def get_recent_channel_context(guild_id: int, channel_id: int, limit: int = 12, 
         content = (row[3] or "").strip()
         if not content:
             continue
+        if should_exclude_from_prompt_history((row[2] or "").strip(), content):
+            continue
         context_rows.append({
             "id": row[0],
             "user_name": (row[1] or "").strip(),
@@ -10264,7 +10371,7 @@ def format_room_context_for_prompt(rows: list[dict], current_user_name: str = ""
     return "\n".join(rendered)
 
 
-def build_room_first_direct_context(guild_id: int, channel_id: int, channel_name: str, channel_policy: str, current_user_name: str, route: str = "direct") -> str:
+def build_room_first_direct_context(guild_id: int, channel_id: int, channel_name: str, channel_policy: str, current_user_name: str, route: str = "direct", current_text: str = "", current_has_media: bool = False) -> str:
     rows = get_recent_channel_context(
         guild_id,
         channel_id,
@@ -10274,7 +10381,9 @@ def build_room_first_direct_context(guild_id: int, channel_id: int, channel_name
         channel_policy=channel_policy,
     )
     formatted = format_room_context_for_prompt(rows, current_user_name=current_user_name) if rows else ""
-    recent_media = build_recent_media_context_for_prompt(guild_id, channel_id, channel_policy, current_user_name=current_user_name, limit=5)
+    recent_media = ""
+    if current_has_media or current_batch_references_recent_media(current_text):
+        recent_media = build_recent_media_context_for_prompt(guild_id, channel_id, channel_policy, current_user_name=current_user_name, limit=5)
     if recent_media:
         formatted = (formatted + "\n" + recent_media).strip() if formatted else recent_media
     if formatted:
@@ -13882,7 +13991,9 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
             )
             if recent_room_prompt:
                 prompt += "\n\n" + recent_room_prompt + "\n"
-            recent_media_prompt = build_recent_media_context_for_prompt(guild_id, channel_id, channel_policy, limit=5)
+            recent_media_prompt = ""
+            if active_packet.get("media_present") or current_batch_references_recent_media(combined_text):
+                recent_media_prompt = build_recent_media_context_for_prompt(guild_id, channel_id, channel_policy, limit=5)
             if recent_media_prompt:
                 prompt += "\n\n" + recent_media_prompt + "\n"
                 _log_batch_event(logging.INFO, "recent_media_context_used", guild_id, channel_id, len(collapsed_items), f"recent_media_context_found=1;recent_media_used_in_prompt=1;channel_policy={channel_policy}")
@@ -13932,6 +14043,15 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
             _log_batch_event(logging.INFO, "generation_typing_started", guild_id, channel_id, len(collapsed_items), f"payload_count={len(active_packet['payload_items'])};elapsed_seconds={generation_elapsed:.2f};selected_wait_seconds={selected_wait_seconds:.2f}")
             if True:  # typing indicator disabled: Discord 429 was aborting bot replies
                 response = await get_gemini_response(prompt, user_id=first_uid, guild_id=channel.guild.id, route=generation_route)
+
+            response = suppress_stale_media_fallback(
+                response,
+                current_text=combined_text,
+                current_has_media=bool(active_packet.get("media_present")),
+                user_id=first_uid,
+                guild_id=guild_id,
+                channel_id=channel_id,
+            )
 
             if not response:
                 latest_result = GenerationResult(
@@ -14972,6 +15092,7 @@ async def _generate_direct_payload_session(session_key, reason: str):
         session.get("channel_policy", "unknown"),
         session["requester_display_name"],
         route="direct_payload_session",
+        current_text=direct_content,
     )
     website_read_model_context = maybe_build_bnl_read_model_context(direct_content, session.get("channel_policy", "unknown"))
     source_context_block = await maybe_build_source_context_for_direct_message(
@@ -15022,6 +15143,15 @@ async def _generate_direct_payload_session(session_key, reason: str):
                 if fallback_lines:
                     response = ((response or "").strip() + "\n\n" + fallback_lines).strip()
                     logging.info(f"direct_payload_completion_fallback_appended missing_count={len(missing_items)}")
+
+    response = suppress_stale_media_fallback(
+        response,
+        current_text=direct_content,
+        current_has_media=False,
+        user_id=session["requester_user_id"],
+        guild_id=session["guild_id"],
+        channel_id=session.get("channel_id", 0),
+    )
 
     fallback_response_sent = False
     if not response:
@@ -15642,6 +15772,15 @@ async def on_message(message: discord.Message):
                 f"Operator request: {clean_content}"
             )
             response = await get_gemini_response(ops_prompt, message.author.id, message.guild.id, route="internal_operations_brief")
+            response = suppress_stale_media_fallback(
+                response,
+                current_text=clean_content,
+                current_has_media=bool(build_message_media_context(message).get("present", False)),
+                user_id=message.author.id,
+                guild_id=message.guild.id,
+                channel_id=message.channel.id,
+            )
+
             if not response:
                 result = GenerationResult(False, "", _last_generation_status.get("error_category") or GENERATION_ERROR_PROVIDER_UNKNOWN, _last_generation_status.get("provider_error_code") or "", "", "internal_operations_brief", 0.0, GEMINI_MODEL)
                 log_response_generation_failed(route="internal_operations_brief", channel=message.channel, channel_policy=channel_policy, conversation_surface=conversation_surface, directness="command_only", result=result)
@@ -15941,6 +16080,8 @@ async def on_message(message: discord.Message):
                 channel_policy,
                 message.author.display_name,
                 route="direct_active",
+                current_text=direct_content,
+                current_has_media=bool(build_message_media_context(message).get("present", False)),
             )
             website_read_model_context = maybe_build_bnl_read_model_context(direct_content, channel_policy)
             source_context_block = await maybe_build_source_context_for_direct_message(
@@ -15994,6 +16135,15 @@ async def on_message(message: discord.Message):
                             response = (response + "\n\n" + fallback_lines).strip() if response else fallback_lines
                             logging.info(f"direct_payload_completion_fallback_appended missing_count={len(missing_items)}")
             logging.info(f"direct_payload_generation_complete payload_count={len(direct_payload_items)}")
+
+            response = suppress_stale_media_fallback(
+                response,
+                current_text=direct_content,
+                current_has_media=bool(build_message_media_context(message).get("present", False)),
+                user_id=message.author.id,
+                guild_id=message.guild.id,
+                channel_id=message.channel.id,
+            )
 
             if not response:
                 if show_state_ctx:
@@ -16159,6 +16309,8 @@ async def on_message(message: discord.Message):
             channel_policy,
             message.author.display_name,
             route="direct",
+            current_text=direct_content,
+            current_has_media=bool(build_message_media_context(message).get("present", False)),
         )
         website_read_model_context = maybe_build_bnl_read_model_context(direct_content, channel_policy)
         source_context_block = await maybe_build_source_context_for_direct_message(
@@ -16225,6 +16377,15 @@ async def on_message(message: discord.Message):
                         response = (response + "\n\n" + fallback_lines).strip() if response else fallback_lines
                         logging.info(f"direct_payload_completion_fallback_appended missing_count={len(missing_items)}")
         logging.info(f"direct_payload_generation_complete payload_count={len(direct_payload_items)}")
+
+        response = suppress_stale_media_fallback(
+            response,
+            current_text=direct_content,
+            current_has_media=bool(build_message_media_context(message).get("present", False)),
+            user_id=message.author.id,
+            guild_id=message.guild.id,
+            channel_id=message.channel.id,
+        )
 
         if not response:
             if show_state_ctx:
@@ -16356,6 +16517,8 @@ async def on_message(message: discord.Message):
             channel_policy,
             message.author.display_name,
             route="direct",
+            current_text=direct_content,
+            current_has_media=bool(build_message_media_context(message).get("present", False)),
         )
         website_read_model_context = maybe_build_bnl_read_model_context(direct_content, channel_policy)
         source_context_block = await maybe_build_source_context_for_direct_message(
@@ -16422,6 +16585,15 @@ async def on_message(message: discord.Message):
                         response = (response + "\n\n" + fallback_lines).strip() if response else fallback_lines
                         logging.info(f"direct_payload_completion_fallback_appended missing_count={len(missing_items)}")
         logging.info(f"direct_payload_generation_complete payload_count={len(direct_payload_items)}")
+
+        response = suppress_stale_media_fallback(
+            response,
+            current_text=direct_content,
+            current_has_media=bool(build_message_media_context(message).get("present", False)),
+            user_id=message.author.id,
+            guild_id=message.guild.id,
+            channel_id=message.channel.id,
+        )
 
         if not response:
             if show_state_ctx:
