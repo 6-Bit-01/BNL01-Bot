@@ -257,6 +257,51 @@ class SourceFileRefreshTests(unittest.TestCase):
         self.assertEqual(summary["skipped"], 1)
         self.assertEqual(self.rows()[0]["status"], "cooldown")
 
+    def test_current_archive_missing_case_report_is_refreshable(self):
+        self.assertTrue(refresh.source_file_report_missing({"ok": True, "found": True, "latestArchive": {"sourceCounts": {"conversations": 1}}}))
+        self.assertFalse(refresh.source_file_report_missing({"ok": True, "found": True, "latestArchive": {"sourceCounts": {"conversations": 1}, "subjectMemoryPacketV1": {"subjectName": "Signal Fox"}, "sourceFileCaseReportV1": {"subjectName": "Signal Fox"}}}))
+
+    def test_cooldown_does_not_block_case_report_missing_backfill(self):
+        refresh.enqueue_source_file_refresh(self.db, guild_id=1, subject_name="Signal Fox", reason="test", evidence_source="test")
+        conn = sqlite3.connect(self.db)
+        try:
+            refresh.ensure_source_file_refresh_schema(conn)
+            conn.execute(
+                f"INSERT OR REPLACE INTO {refresh.STATE_TABLE} (guild_id, subject_key, subject_name, last_refresh_completed_at, last_refresh_status, cooldown_until, updated_at) VALUES (1, 'signal-fox', 'Signal Fox', '2026-01-01T00:00:00+00:00', 'succeeded', '2999-01-01T00:00:00+00:00', 'now')"
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        lookup = lambda query: {"ok": True, "found": True, "sourceFile": {"subjectName": "Signal Fox"}, "latestArchive": {"sourceCounts": {"conversations": 1}}}
+        result_packet = {"sent": True, "recommendationSent": True, "archiveSent": True, "sendResult": {"recommendationId": "rec_backfill", "ok": True}, "archiveResult": {"archiveId": "arc_backfill", "ok": True, "status": 200}, "sourceCounts": {"conversations": 1}, "sourceTypes": ["conversations"], "subject": "Signal Fox", "qualityScore": 88}
+        with mock.patch.object(refresh, "run_source_file_enrichment", return_value=result_packet) as mocked:
+            summary = refresh.process_source_file_refresh_queue(self.db, guild_id=1, lookup_func=lookup, environ={"BNL_DOSSIER_INGEST_TOKEN": "x"})
+        self.assertEqual(mocked.call_count, 1)
+        self.assertEqual(summary["processed"], 1)
+        self.assertEqual(summary["skipped"], 0)
+        self.assertEqual(summary["items"][0]["status"], "succeeded")
+        self.assertEqual(summary["items"][0]["reason"], "case_report_backfill")
+        self.assertTrue(summary["items"][0]["caseReportBackfill"])
+
+    def test_queue_refresh_proceeds_when_case_report_missing(self):
+        refresh.enqueue_source_file_refresh(self.db, guild_id=1, subject_name="Signal Fox", reason="background", evidence_source="test")
+        lookup = lambda query: {"ok": True, "found": True, "sourceFile": {"subjectName": "Signal Fox"}, "archivePayload": {"sourceCounts": {"conversations": 1}, "subjectMemoryPacketV1": {"subjectName": "Signal Fox"}}}
+        result_packet = {"sent": True, "recommendationSent": True, "archiveSent": True, "sendResult": {"recommendationId": "rec_queue", "ok": True}, "archiveResult": {"archiveId": "arc_queue", "ok": True, "status": 200}, "sourceCounts": {"conversations": 1}, "sourceTypes": ["conversations"], "subject": "Signal Fox", "qualityScore": 88}
+        with mock.patch.object(refresh, "run_source_file_enrichment", return_value=result_packet) as mocked:
+            summary = refresh.process_source_file_refresh_queue(self.db, guild_id=1, lookup_func=lookup, environ={"BNL_DOSSIER_INGEST_TOKEN": "x"})
+        self.assertEqual(mocked.call_count, 1)
+        self.assertEqual(summary["items"][0]["reason"], "case_report_backfill")
+
+    def test_archive_success_compact_failure_remains_partial_success_for_backfill(self):
+        refresh.enqueue_source_file_refresh(self.db, guild_id=1, subject_name="Signal Fox", reason="test", evidence_source="test")
+        lookup = lambda query: {"ok": True, "found": True, "sourceFile": {"subjectName": "Signal Fox"}, "latestArchive": {"sourceCounts": {"conversations": 1}}}
+        result_packet = {"sent": False, "recommendationSent": False, "archiveSent": True, "sendResult": {"ok": False, "error": "compact rejected"}, "archiveResult": {"archiveId": "arc_partial", "ok": True, "status": 200}, "status": "partial_success", "sourceCounts": {"conversations": 1}, "subject": "Signal Fox"}
+        with mock.patch.object(refresh, "run_source_file_enrichment", return_value=result_packet):
+            summary = refresh.process_source_file_refresh_queue(self.db, guild_id=1, lookup_func=lookup, environ={"BNL_DOSSIER_INGEST_TOKEN": "x"})
+        self.assertEqual(summary["items"][0]["status"], "partial_success")
+        self.assertEqual(summary["items"][0]["reason"], "compact_recommendation_rejected")
+        self.assertTrue(summary["items"][0]["caseReportBackfill"])
+
     def test_manual_refresh_can_queue_and_process_subject(self):
         with mock.patch.object(refresh, "run_source_file_enrichment", return_value={"sent": True, "sendResult": {"recommendationId": "rec_1"}, "sourceCounts": {"conversations": 1}, "sourceTypes": ["conversations"], "subject": "Signal Fox", "qualityScore": 80}):
             summary = refresh.process_single_source_file_refresh(self.db, guild_id=1, subject_name="Signal Fox", environ={"BNL_DOSSIER_INGEST_TOKEN": "x"})
@@ -637,6 +682,63 @@ class SourceFileRefreshTests(unittest.TestCase):
         self.assertEqual([p["status"] for p in opener.posts], ["claimed", "completed"])
         warning_text = " ".join(str(call) for call in warning_mock.call_args_list)
         self.assertNotIn("source_refresh_now_failed", warning_text)
+
+    def test_manual_refresh_now_proceeds_when_case_report_missing_despite_current_cooldown(self):
+        conn = sqlite3.connect(self.db)
+        try:
+            refresh.ensure_source_file_refresh_schema(conn)
+            conn.execute(
+                f"INSERT OR REPLACE INTO {refresh.STATE_TABLE} (guild_id, subject_key, subject_name, last_refresh_completed_at, last_refresh_status, last_recommendation_id, cooldown_until, updated_at) VALUES (1, 'signal-fox', 'Signal Fox', '2026-01-01T00:00:00+00:00', 'succeeded', 'rec_old', '2999-01-01T00:00:00+00:00', 'now')"
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        opener = FakeOpener({"ok": True, "requests": []})
+        lookup = lambda query: {"ok": True, "found": True, "sourceFile": {"subjectName": "Signal Fox"}, "latestArchive": {"sourceCounts": {"conversations": 1}}}
+        result_packet = {"sent": True, "recommendationSent": True, "archiveSent": True, "sendResult": {"recommendationId": "rec_new", "ok": True}, "archiveResult": {"archiveId": "arc_new", "ok": True, "status": 200}, "sourceCounts": {"conversations": 1}, "sourceTypes": ["conversations"], "subject": "Signal Fox", "qualityScore": 88}
+        with mock.patch.object(refresh, "run_source_file_enrichment", return_value=result_packet) as mocked, mock.patch.object(refresh.logging, "info") as info_mock:
+            result = refresh.process_source_file_refresh_now(
+                self.db,
+                {"requestId": "req_missing", "subjectName": "Signal Fox", "normalizedSubjectKey": "signal-fox", "reason": "opened_source_file", "source": "admin_source_file_open"},
+                guild_id=1,
+                environ={"BNL_SOURCE_FILE_READ_TOKEN": "read", "BNL_WEBSITE_BASE_URL": "https://site.test", "BNL_DOSSIER_INGEST_TOKEN": "ingest"},
+                opener=opener,
+                lookup_func=lookup,
+            )
+        self.assertEqual(mocked.call_count, 1)
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["recommendationId"], "rec_new")
+        self.assertEqual(result["local"]["items"][0]["reason"], "case_report_backfill")
+        self.assertEqual([p["status"] for p in opener.posts], ["claimed", "completed"])
+        info_text = " ".join(str(call) for call in info_mock.call_args_list)
+        self.assertIn("source_case_report_missing", info_text)
+        self.assertIn("source_case_report_backfill_started", info_text)
+        self.assertIn("source_case_report_backfill_succeeded", info_text)
+
+    def test_existing_archive_with_case_report_present_remains_current(self):
+        conn = sqlite3.connect(self.db)
+        try:
+            refresh.ensure_source_file_refresh_schema(conn)
+            conn.execute(
+                f"INSERT OR REPLACE INTO {refresh.STATE_TABLE} (guild_id, subject_key, subject_name, last_refresh_completed_at, last_refresh_status, last_recommendation_id, cooldown_until, updated_at) VALUES (1, 'signal-fox', 'Signal Fox', '2026-01-01T00:00:00+00:00', 'succeeded', 'rec_recent', '2999-01-01T00:00:00+00:00', 'now')"
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        opener = FakeOpener({"ok": True, "requests": []})
+        lookup = lambda query: {"ok": True, "found": True, "sourceFile": {"subjectName": "Signal Fox"}, "latestArchive": {"sourceCounts": {"conversations": 1}, "subjectMemoryPacketV1": {"subjectName": "Signal Fox"}, "sourceFileCaseReportV1": {"subjectName": "Signal Fox"}}}
+        with mock.patch.object(refresh, "run_source_file_enrichment") as mocked:
+            result = refresh.process_source_file_refresh_now(
+                self.db,
+                {"requestId": "req_current", "subjectName": "Signal Fox", "normalizedSubjectKey": "signal-fox", "reason": "opened_source_file", "source": "admin_source_file_open"},
+                guild_id=1,
+                environ={"BNL_SOURCE_FILE_READ_TOKEN": "read", "BNL_WEBSITE_BASE_URL": "https://site.test", "BNL_DOSSIER_INGEST_TOKEN": "ingest"},
+                opener=opener,
+                lookup_func=lookup,
+            )
+        mocked.assert_not_called()
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["local"]["items"][0]["reason"], "cooldown_current")
 
     def test_refresh_now_existing_future_not_before_without_recent_success_attempts_or_fails_truthfully(self):
         conn = sqlite3.connect(self.db)
