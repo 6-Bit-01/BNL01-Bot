@@ -248,3 +248,98 @@ class SourceFileArchiveTests(unittest.TestCase):
         payload = enrichment.build_enrichment_recommendation_payload(packet)
         compact = enrichment.sanitize_compact_recommendation_payload(payload, packet=packet, archive_id="arc_6bit")
         self.assertIn("arc_6bit", compact["evidenceSummary"])
+    def test_archive_includes_subject_memory_packet_and_case_report_only_in_full_archive(self):
+        packet = self.large_packet()
+        packet.update({
+            "subject": "Crow",
+            "matchKind": "active_source_file",
+            "musicSignals": ["music discussion only: 22"],
+            "communitySignals": ["Crow asked BNL Source File questions in #barcode-bot during admin review."],
+            "relationshipSignals": ["Orion appears in relationship/context evidence for Crow"],
+            "queueSubmissionStatus": "not_connected",
+            "queueSubmissionNote": "Queue/submission memory is not connected to this report. Do not claim submissions, song counts, play history, payment, or Priority status.",
+            "subjectIdentity": {"aliasLabels": ["Crow"], "workflowLane": "identity_check_review"},
+            "representativeEvidence": [
+                {
+                    "summary": "Crow asked BNL Source File questions in #barcode-bot, supporting BNL/source-file workflow activity.",
+                    "sourceType": "Discord conversation",
+                    "channelName": "#barcode-bot",
+                    "visibility": "internal_review_only",
+                    "occurredAt": "2026-06-08T00:00:00+00:00",
+                }
+            ],
+        })
+        archive_payload = enrichment.build_source_file_archive_payload(packet)
+        compact_payload = enrichment.build_enrichment_recommendation_payload(packet)
+
+        self.assertIn("subjectMemoryPacketV1", archive_payload)
+        self.assertIn("sourceFileCaseReportV1", archive_payload)
+        self.assertNotIn("subjectMemoryPacketV1", compact_payload)
+        self.assertNotIn("sourceFileCaseReportV1", compact_payload)
+        self.assertIn("sourcePackage", archive_payload)
+        self.assertIn("rawProvenance", archive_payload["sourcePackage"])
+
+        memory = archive_payload["subjectMemoryPacketV1"]
+        report = archive_payload["sourceFileCaseReportV1"]
+        self.assertEqual(memory["version"], "1")
+        self.assertEqual(report["version"], "1")
+        self.assertEqual(report["subjectKey"], memory["subjectKey"])
+        self.assertEqual(report["generatedAt"], memory["generatedAt"])
+        self.assertEqual(report["memoryCoverage"], memory["memoryCoverage"])
+        self.assertLessEqual(len(memory["representativeMoments"]), 8)
+        moment = memory["representativeMoments"][0]
+        self.assertEqual(moment["channelName"], "#barcode-bot")
+        self.assertEqual(moment["sourceType"], "Discord conversation")
+        self.assertIn("source-file workflow", moment["summary"])
+
+        report_body = json.dumps(report, sort_keys=True).lower()
+        for forbidden in (
+            "global_mixed",
+            "source_blind",
+            "source rows",
+            "internal classification",
+            "automated topic label",
+            "approved approved",
+            "relationship facet",
+            "music discussion exists",
+            "creative language observed",
+            "relationship signals found",
+            "community activity detected",
+        ):
+            self.assertNotIn(forbidden, report_body)
+        self.assertIn("does not expose the specific songs", report_body)
+        self.assertIn("orion", report_body)
+        self.assertIn("review-only", report_body)
+        self.assertIn("queue/submission memory is not connected", report_body)
+        self.assertIn("does not auto-confirm identity", report_body)
+        coverage = json.dumps(memory["memoryCoverage"], sort_keys=True).lower()
+        self.assertIn("queue/submission data", coverage)
+        self.assertIn("short/mid/long-term subject memory lanes are not exposed separately", coverage)
+
+    def test_case_report_is_built_from_subject_memory_packet_not_raw_packet_labels(self):
+        memory = {
+            "version": "1",
+            "generatedAt": "2026-06-08T00:00:00+00:00",
+            "subjectName": "Signal Fox",
+            "subjectKey": "signal-fox",
+            "memoryCoverage": {"summary": "Short/mid/long-term subject memory lanes are not exposed separately to this report yet; this report uses available conversation, entity, and Source File archive data.", "lanes": []},
+            "identitySignals": ["Identity review is handled through the site Identity Check when links are available. No identity is auto-confirmed by this report."],
+            "communityContext": ["Signal Fox discussed source-file review in #barcode-bot."],
+            "musicCreativeContext": ["The archive flags music/creative context, but the current evidence packet does not expose the specific songs, collaborators, messages, channels, platforms, or links behind that label."],
+            "relationshipContext": ["Orion appears in relationship/context evidence for Signal Fox. Treat the relationship/context meaning as review-only and unconfirmed."],
+            "queueSubmissionContext": ["Queue/submission memory is not connected to this report. Do not claim submissions, song counts, play history, payment, or Priority status."],
+            "publicSafeCandidateFacts": ["No public-safe fact is confirmed by this packet; owner review is required before public use."],
+            "representativeMoments": [{"summary": "Signal Fox asked Source File questions in #barcode-bot.", "sourceType": "Discord conversation", "channelName": "#barcode-bot", "visibility": "internal_review_only", "publicSafe": False}],
+            "openQuestions": ["Confirm public-safe display name."],
+            "internalWarnings": ["Do not publish or merge identities."],
+            "evidenceGaps": ["The current memory path exposes only category labels for music discussion; raw representative music details are not available to the report generator yet."],
+        }
+        report = enrichment.build_source_file_case_report_v1(memory)
+        body = json.dumps(report, sort_keys=True).lower()
+        self.assertIn("signal fox asked source file questions", body)
+        self.assertIn("does not expose the specific songs", body)
+        self.assertNotIn("music discussion exists", body)
+        self.assertNotIn("relationship facet", body)
+        self.assertIn("queue/submission memory is not connected", body)
+        self.assertIn("does not auto-confirm identity", body)
+
