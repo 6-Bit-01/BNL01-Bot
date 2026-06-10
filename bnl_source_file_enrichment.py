@@ -8,6 +8,7 @@ endpoint. It never publishes, promotes, merges, or overwrites Source Files.
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 import logging
 import re
@@ -3266,6 +3267,24 @@ def build_enrichment_recommendation_payload(packet: dict[str, Any], *, environ: 
     return compact_payload
 
 
+
+def _call_site_sender(sender: Callable[..., dict[str, Any]], payload: dict[str, Any], *, environ: dict[str, str] | None = None, callback_base_url: str | None = None) -> dict[str, Any]:
+    """Call a site sender with routing kwargs when its signature supports them."""
+
+    kwargs: dict[str, Any] = {}
+    try:
+        sig = inspect.signature(sender)
+        params = sig.parameters
+        accepts_kwargs = any(param.kind == inspect.Parameter.VAR_KEYWORD for param in params.values())
+        if accepts_kwargs or "environ" in params:
+            kwargs["environ"] = environ
+        if callback_base_url and (accepts_kwargs or "callback_base_url" in params):
+            kwargs["callback_base_url"] = callback_base_url
+    except (TypeError, ValueError):
+        kwargs = {}
+    return sender(payload, **kwargs) if kwargs else sender(payload)
+
+
 def run_source_file_enrichment(
     db_path: str,
     guild_id: int | None,
@@ -3281,6 +3300,7 @@ def run_source_file_enrichment(
     lookup_value: str | None = None,
     force: bool = False,
     diagnostics: bool = False,
+    callback_base_url: str | None = None,
 ) -> dict[str, Any]:
     canonical_key = lookup_key if lookup_key in {"subject", "alias", "candidateId", "normalizedName"} else "subject"
     target_value = (lookup_value if lookup_value is not None else subject) or ""
@@ -3415,9 +3435,11 @@ def run_source_file_enrichment(
         return packet
     archive_payload = build_source_file_archive_payload(packet, environ=environ)
     packet["archivePayload"] = archive_payload
+    packet["subjectMemoryPacketGenerated"] = bool((archive_payload or {}).get("subjectMemoryPacketV1"))
+    packet["caseReportGenerated"] = bool((archive_payload or {}).get("sourceFileCaseReportV1"))
     archive_required = is_source_file_archive_token_configured(environ)
     if archive_required:
-        archive_result = archive_sender(archive_payload)
+        archive_result = _call_site_sender(archive_sender, archive_payload, environ=environ, callback_base_url=callback_base_url)
     else:
         archive_result = {"ok": True, "archiveId": None, "error": "", "status": "not_configured_skipped"}
         logging.info("source_file_archive_send_skipped reason=archive_token_not_configured subject_key=%s", _subject_key(subject))
@@ -3429,7 +3451,7 @@ def run_source_file_enrichment(
 
     payload = sanitize_compact_recommendation_payload(payload, packet=packet, archive_id=packet.get("archiveId") or "")
     packet["payload"] = payload
-    send_result = sender(payload)
+    send_result = _call_site_sender(sender, payload, environ=environ, callback_base_url=callback_base_url)
     packet["sendResult"] = send_result
     packet["recommendationSent"] = bool((send_result or {}).get("ok"))
     packet["recommendationId"] = (send_result or {}).get("recommendationId") or (send_result or {}).get("id") or ""

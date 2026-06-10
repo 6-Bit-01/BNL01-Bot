@@ -14,11 +14,14 @@ import os
 import re
 import socket
 import urllib.error
+import urllib.parse
 import urllib.request
 from typing import Any
 
 DEFAULT_DOSSIER_INGEST_URL = "https://www.barcode-network.com/api/bnl/dossier-recommendations"
 DEFAULT_SOURCE_FILE_ARCHIVE_URL = "https://www.barcode-network.com/api/bnl/source-file-enrichments"
+DOSSIER_INGEST_PATH = "/api/bnl/dossier-recommendations"
+SOURCE_FILE_ARCHIVE_PATH = "/api/bnl/source-file-enrichments"
 DOSSIER_INGEST_TIMEOUT_SECONDS = 10
 SOURCE_FILE_ARCHIVE_TIMEOUT_SECONDS = 15
 SUPPORTED_PAYLOAD_FIELDS = {
@@ -89,12 +92,99 @@ VALID_DOSSIER_CATEGORIES = {"Entity", "Personnel", "Sponsor", "Interface", "Prod
 
 
 
-def get_dossier_ingest_url(environ: dict[str, str] | None = None) -> str:
-    """Return configured ingest URL or the production endpoint fallback."""
+def _safe_url_host(value: str) -> str:
+    try:
+        parsed = urllib.parse.urlparse(str(value or "").strip())
+        return (parsed.hostname or "").lower()[:180]
+    except Exception:
+        return ""
+
+
+def _configured_callback_hosts(environ: dict[str, str] | None = None) -> set[str]:
+    env = environ if environ is not None else os.environ
+    raw = env.get("BNL_TRUSTED_SITE_CALLBACK_HOSTS") or env.get("BNL_SITE_CALLBACK_ALLOWED_HOSTS") or ""
+    return {part.strip().lower() for part in re.split(r"[,\s]+", raw) if part.strip()}
+
+
+def is_trusted_site_callback_base_url(value: str | None, *, environ: dict[str, str] | None = None) -> bool:
+    """Return whether a site callback base URL is safe for BNL archive posts.
+
+    The callback target must be HTTPS and belong to the production BARCODE site,
+    a configured allowlist host, or a BARCODE Network Vercel preview host. This
+    intentionally rejects localhost and arbitrary external hosts by default.
+    """
+
+    text = str(value or "").strip()
+    if not text:
+        return False
+    try:
+        parsed = urllib.parse.urlparse(text)
+    except Exception:
+        return False
+    host = (parsed.hostname or "").lower()
+    if parsed.scheme != "https" or not host:
+        return False
+    if host == "www.barcode-network.com":
+        return True
+    for allowed in _configured_callback_hosts(environ):
+        if allowed.startswith("*.") and host.endswith(allowed[1:]):
+            return True
+        if host == allowed:
+            return True
+    # Vercel preview deployments for this project are allowed, while generic
+    # arbitrary Vercel/external hosts remain rejected.
+    if host.endswith(".vercel.app") and "barcode-network" in host:
+        return True
+    return False
+
+
+def normalize_trusted_site_callback_base_url(value: str | None, *, environ: dict[str, str] | None = None) -> str:
+    """Return a normalized trusted origin/base URL, or an empty string."""
+
+    if not is_trusted_site_callback_base_url(value, environ=environ):
+        return ""
+    parsed = urllib.parse.urlparse(str(value or "").strip())
+    return urllib.parse.urlunparse((parsed.scheme, parsed.netloc, "", "", "", "")).rstrip("/")
+
+
+def site_endpoint_url_from_callback_base(callback_base_url: str | None, path: str, *, environ: dict[str, str] | None = None) -> str:
+    """Build a site endpoint URL from a trusted callback base URL."""
+
+    base = normalize_trusted_site_callback_base_url(callback_base_url, environ=environ)
+    if not base:
+        return ""
+    return urllib.parse.urljoin(base.rstrip("/") + "/", path.lstrip("/"))
+
+
+def select_trusted_site_callback_base_url(payload: dict[str, Any] | None, *, environ: dict[str, str] | None = None) -> tuple[str, str]:
+    """Pick a trusted requesting-site callback base from a refresh payload.
+
+    Returns (base_url, source), where source is requesting_site_origin when a
+    trusted payload value is honored, otherwise env_default.
+    """
+
+    request = payload if isinstance(payload, dict) else {}
+    for key in ("sourceFileArchiveCallbackBaseUrl", "siteCallbackBaseUrl", "requestingSiteOrigin"):
+        base = normalize_trusted_site_callback_base_url(request.get(key), environ=environ)
+        if base:
+            return base, "requesting_site_origin"
+    return "", "env_default"
+
+
+def get_dossier_ingest_url(environ: dict[str, str] | None = None, *, callback_base_url: str | None = None) -> str:
+    """Return the selected ingest URL, honoring a trusted callback base first."""
 
     env = environ if environ is not None else os.environ
+    callback_url = site_endpoint_url_from_callback_base(callback_base_url, DOSSIER_INGEST_PATH, environ=env)
+    if callback_url:
+        return callback_url
     configured = (env.get("BNL_DOSSIER_INGEST_URL") or "").strip()
-    return configured or DEFAULT_DOSSIER_INGEST_URL
+    if configured:
+        return configured
+    base = normalize_trusted_site_callback_base_url(env.get("BNL_WEBSITE_BASE_URL") or env.get("BNL_SITE_BASE_URL"), environ=env)
+    if base:
+        return urllib.parse.urljoin(base.rstrip("/") + "/", DOSSIER_INGEST_PATH.lstrip("/"))
+    return DEFAULT_DOSSIER_INGEST_URL
 
 
 def is_dossier_ingest_token_configured(environ: dict[str, str] | None = None) -> bool:
@@ -104,12 +194,20 @@ def is_dossier_ingest_token_configured(environ: dict[str, str] | None = None) ->
     return bool((env.get("BNL_DOSSIER_INGEST_TOKEN") or "").strip())
 
 
-def get_source_file_archive_url(environ: dict[str, str] | None = None) -> str:
-    """Return configured Source File archive URL or production fallback."""
+def get_source_file_archive_url(environ: dict[str, str] | None = None, *, callback_base_url: str | None = None) -> str:
+    """Return the selected Source File archive URL, honoring a trusted callback base first."""
 
     env = environ if environ is not None else os.environ
+    callback_url = site_endpoint_url_from_callback_base(callback_base_url, SOURCE_FILE_ARCHIVE_PATH, environ=env)
+    if callback_url:
+        return callback_url
     configured = (env.get("BNL_SOURCE_FILE_ARCHIVE_URL") or "").strip()
-    return configured or DEFAULT_SOURCE_FILE_ARCHIVE_URL
+    if configured:
+        return configured
+    base = normalize_trusted_site_callback_base_url(env.get("BNL_WEBSITE_BASE_URL") or env.get("BNL_SITE_BASE_URL"), environ=env)
+    if base:
+        return urllib.parse.urljoin(base.rstrip("/") + "/", SOURCE_FILE_ARCHIVE_PATH.lstrip("/"))
+    return DEFAULT_SOURCE_FILE_ARCHIVE_URL
 
 
 def get_source_file_archive_token(environ: dict[str, str] | None = None) -> str:
@@ -279,7 +377,7 @@ def _safe_failure(error: str, status: int | None = None, duplicate: bool = False
     }
 
 
-def send_dossier_recommendation(payload: dict[str, Any], *, environ: dict[str, str] | None = None, opener=None) -> dict[str, Any]:
+def send_dossier_recommendation(payload: dict[str, Any], *, environ: dict[str, str] | None = None, opener=None, callback_base_url: str | None = None) -> dict[str, Any]:
     """POST a dossier recommendation to the configured site ingest endpoint."""
 
     env = environ if environ is not None else os.environ
@@ -288,7 +386,7 @@ def send_dossier_recommendation(payload: dict[str, Any], *, environ: dict[str, s
         logging.warning("dossier_recommendation_send_failed reason=missing_ingest_token")
         return _safe_failure("Dossier ingest token is not configured.")
 
-    url = get_dossier_ingest_url(env)
+    url = get_dossier_ingest_url(env, callback_base_url=callback_base_url)
     safe_payload = build_dossier_recommendation_payload(payload or {})
     logging.info(
         "dossier_recommendation_send_attempted "
@@ -374,7 +472,7 @@ def _safe_archive_failure(error: str, status: int | None = None) -> dict[str, An
     return {"ok": False, "archiveId": None, "error": error, "status": status}
 
 
-def send_source_file_archive_enrichment(payload: dict[str, Any], *, environ: dict[str, str] | None = None, opener=None) -> dict[str, Any]:
+def send_source_file_archive_enrichment(payload: dict[str, Any], *, environ: dict[str, str] | None = None, opener=None, callback_base_url: str | None = None) -> dict[str, Any]:
     """POST a full Source File enrichment envelope to the review-only archive endpoint.
 
     This sender is intentionally separate from send_dossier_recommendation() so
@@ -389,7 +487,7 @@ def send_source_file_archive_enrichment(payload: dict[str, Any], *, environ: dic
         logging.warning("source_file_archive_send_failed reason=missing_archive_token")
         return _safe_archive_failure("Source File archive token is not configured.")
 
-    url = get_source_file_archive_url(env)
+    url = get_source_file_archive_url(env, callback_base_url=callback_base_url)
     safe_payload = dict(payload or {})
     subject_key = _normalize_subject_key(str(safe_payload.get("subjectKey") or safe_payload.get("subjectName") or ""))
     logging.info("source_file_archive_send_attempted endpoint_configured=%s subject_key=%s", bool(url), subject_key)

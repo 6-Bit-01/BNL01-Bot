@@ -23,7 +23,15 @@ import urllib.request
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
 
-from bnl_dossier_recommendations import is_dossier_ingest_token_configured, is_source_file_archive_token_configured, send_dossier_recommendation
+from bnl_dossier_recommendations import (
+    get_dossier_ingest_url,
+    get_source_file_archive_url,
+    is_dossier_ingest_token_configured,
+    is_source_file_archive_token_configured,
+    select_trusted_site_callback_base_url,
+    send_dossier_recommendation,
+    _safe_url_host as _safe_callback_host,
+)
 from bnl_source_file_enrichment import run_source_file_enrichment
 from bnl_source_file_lookup import lookup_source_file
 from bnl_source_refresh_context import is_refresh_generation_subject, refresh_generation_context
@@ -522,6 +530,43 @@ def _case_report_backfill_trigger(*, explicit_site_request: bool = False, archiv
     return "none"
 
 
+def _select_and_log_source_refresh_callback_base(site_request: dict[str, Any], *, environ: dict[str, str]) -> tuple[str, str]:
+    """Select and log the safe site callback target for Source File sends."""
+
+    callback_base_url, source = select_trusted_site_callback_base_url(site_request, environ=environ)
+    selected = callback_base_url or get_source_file_archive_url(environ)
+    logging.info(
+        "source_refresh_callback_base_selected source=%s host=%s",
+        source,
+        _safe_callback_host(selected) or "none",
+    )
+    return callback_base_url, source
+
+
+
+def _result_case_report_generated(result: dict[str, Any]) -> bool:
+    if "caseReportGenerated" in result:
+        return bool(result.get("caseReportGenerated"))
+    archive_payload = result.get("archivePayload") if isinstance(result.get("archivePayload"), dict) else {}
+    return bool(result.get("sourceFileCaseReportV1") or archive_payload.get("sourceFileCaseReportV1"))
+
+
+def _result_subject_memory_packet_generated(result: dict[str, Any]) -> bool:
+    if "subjectMemoryPacketGenerated" in result:
+        return bool(result.get("subjectMemoryPacketGenerated"))
+    archive_payload = result.get("archivePayload") if isinstance(result.get("archivePayload"), dict) else {}
+    return bool(result.get("subjectMemoryPacketV1") or archive_payload.get("subjectMemoryPacketV1"))
+
+
+def _item_generation_status(item: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "caseReportGenerated": bool(item.get("caseReportGenerated")),
+        "subjectMemoryPacketGenerated": bool(item.get("subjectMemoryPacketGenerated")),
+        "caseReportBackfill": bool(item.get("caseReportBackfill")),
+        "caseReportBackfillTrigger": _safe_text(item.get("caseReportBackfillTrigger") or "none", 80),
+    }
+
+
 def _mark_current_cooldown_terminal(db_path: str, *, guild_id: int | None, subject_key: str, reason: str = "cooldown_current") -> None:
     conn = sqlite3.connect(db_path)
     try:
@@ -553,11 +598,12 @@ def process_source_file_refresh_now(db_path: str, payload: dict[str, Any], *, gu
     source = _safe_text(site_request.get("source") or "", 80)
     reason = _safe_text(site_request.get("reason") or "", 80)
     explicit_case_report_backfill = site_request_requires_case_report_backfill(site_request)
+    callback_base_url, callback_source = _select_and_log_source_refresh_callback_base(site_request, environ=env)
     logging.info("source_refresh_now_started request_id=%s subject_key=%s source=%s reason=%s", request_id or "none", skey or "none", source or "none", reason or "none")
     if explicit_case_report_backfill:
         logging.info("source_case_report_backfill_requested subject_key=%s trigger=%s reason=%s", skey or "none", "explicit_site_request", reason or CASE_REPORT_BACKFILL_REASON)
 
-    summary: dict[str, Any] = {"ok": True, "dryRun": dry_run, "requestId": request_id, "candidateId": candidate_id, "subject": subject or skey, "subjectKey": skey, "status": "skipped", "recommendationId": "", "recommendationSent": False, "archiveSent": False, "archiveStatus": None, "archiveId": "", "archiveError": "", "failureReason": ""}
+    summary: dict[str, Any] = {"ok": True, "dryRun": dry_run, "requestId": request_id, "candidateId": candidate_id, "subject": subject or skey, "subjectKey": skey, "status": "skipped", "recommendationId": "", "recommendationSent": False, "archiveSent": False, "archiveStatus": None, "archiveId": "", "archiveError": "", "failureReason": "", "callbackBaseSource": callback_source, "callbackBaseHost": _safe_callback_host(callback_base_url or get_source_file_archive_url(env))}
     if dry_run:
         summary.update({"status": "dry_run", "processed": 1})
         return summary
@@ -631,6 +677,7 @@ def process_source_file_refresh_now(db_path: str, payload: dict[str, Any], *, gu
         bypass_cooldown=explicit_case_report_backfill or report_missing or source in {"admin_manual_retry"} or reason in {"manual_retry", "file_not_updated"},
         refresh_mode=mode,
         subject_key=skey,
+        callback_base_url=callback_base_url or None,
     )
     item = (local.get("items") or [{}])[0]
     if not item:
@@ -676,6 +723,10 @@ def process_source_file_refresh_now(db_path: str, payload: dict[str, Any], *, gu
         "archiveStatus": item.get("archiveStatus"),
         "archiveId": archive_id,
         "archiveError": _safe_text(item.get("archiveError") or "", 180),
+        "caseReportGenerated": bool(item.get("caseReportGenerated")),
+        "subjectMemoryPacketGenerated": bool(item.get("subjectMemoryPacketGenerated")),
+        "caseReportBackfill": bool(item.get("caseReportBackfill")),
+        "caseReportBackfillTrigger": _safe_text(item.get("caseReportBackfillTrigger") or "none", 80),
         "failureReason": terminal_reason,
         "local": local,
     })
@@ -792,7 +843,7 @@ def _state_upsert(conn: sqlite3.Connection, *, guild_id: int | None, subject_key
         conn.execute(f"INSERT INTO {STATE_TABLE} ({cols}) VALUES ({placeholders})", list(base.values()))
 
 
-def process_source_file_refresh_queue(db_path: str, *, guild_id: int | None = None, dry_run: bool = False, max_items: int = DEFAULT_MAX_AUTOMATIC_PER_CYCLE, cooldown_minutes: int = DEFAULT_COOLDOWN_MINUTES, lookup_func: Callable[[dict[str, str]], dict[str, Any]] = lookup_source_file, sender: Callable[[dict[str, Any]], dict[str, Any]] = send_dossier_recommendation, environ: dict[str, str] | None = None, force: bool = False, bypass_cooldown: bool = False, refresh_mode: str = "automatic", subject_key: str | None = None) -> dict[str, Any]:
+def process_source_file_refresh_queue(db_path: str, *, guild_id: int | None = None, dry_run: bool = False, max_items: int = DEFAULT_MAX_AUTOMATIC_PER_CYCLE, cooldown_minutes: int = DEFAULT_COOLDOWN_MINUTES, lookup_func: Callable[[dict[str, str]], dict[str, Any]] = lookup_source_file, sender: Callable[[dict[str, Any]], dict[str, Any]] = send_dossier_recommendation, environ: dict[str, str] | None = None, force: bool = False, bypass_cooldown: bool = False, refresh_mode: str = "automatic", subject_key: str | None = None, callback_base_url: str | None = None) -> dict[str, Any]:
     now_dt = datetime.now(timezone.utc).replace(microsecond=0)
     now = now_dt.isoformat()
     env = environ if environ is not None else os.environ
@@ -866,6 +917,7 @@ def process_source_file_refresh_queue(db_path: str, *, guild_id: int | None = No
                         environ=env,
                         force=force,
                         diagnostics=False,
+                        callback_base_url=callback_base_url or None,
                     )
                 if result.get("status") == "no_target":
                     conn.execute(f"UPDATE {QUEUE_TABLE} SET status='skipped', updated_at=?, last_error='no_target' WHERE id=?", (utc_now(), row["id"]))
@@ -895,7 +947,7 @@ def process_source_file_refresh_queue(db_path: str, *, guild_id: int | None = No
                     if report_missing:
                         logging.info("source_case_report_backfill_succeeded subject_key=%s status=%s archive_id=%s trigger=%s", row["subject_key"], item_status, archive_id or "none", backfill_trigger)
                     summary["processed"] += 1
-                    summary["items"].append({"subject": row["subject_name"], "status": item_status, "reason": item_reason, "error": partial_reason, "partialSuccess": partial_success, "recommendationId": recommendation_id, "recommendationSent": bool(result.get("recommendationSent", bool(send_result.get("ok")))), "archiveSent": bool(result.get("archiveSent", bool(archive_result.get("ok")))), "archiveStatus": result.get("archiveStatus") or archive_result.get("status"), "archiveId": archive_id, "archiveError": _safe_text(result.get("archiveError") or archive_result.get("error") or "", 180), "caseReportBackfill": bool(report_missing)})
+                    summary["items"].append({"subject": row["subject_name"], "status": item_status, "reason": item_reason, "error": partial_reason, "partialSuccess": partial_success, "recommendationId": recommendation_id, "recommendationSent": bool(result.get("recommendationSent", bool(send_result.get("ok")))), "archiveSent": bool(result.get("archiveSent", bool(archive_result.get("ok")))), "archiveStatus": result.get("archiveStatus") or archive_result.get("status"), "archiveId": archive_id, "archiveError": _safe_text(result.get("archiveError") or archive_result.get("error") or "", 180), "caseReportBackfill": bool(report_missing), "caseReportBackfillTrigger": backfill_trigger, "caseReportGenerated": _result_case_report_generated(result), "subjectMemoryPacketGenerated": _result_subject_memory_packet_generated(result)})
                 else:
                     archive_result = result.get("archiveResult") or {}
                     send_result = result.get("sendResult") or {}
@@ -912,7 +964,7 @@ def process_source_file_refresh_queue(db_path: str, *, guild_id: int | None = No
                     if report_missing:
                         logging.warning("source_case_report_backfill_failed subject_key=%s error=%s trigger=%s", row["subject_key"], err, backfill_trigger)
                     summary["failed"] += 1
-                    summary["items"].append({"subject": row["subject_name"], "status": "failed", "reason": CASE_REPORT_BACKFILL_REASON if report_missing else "", "error": err, "recommendationSent": bool(result.get("recommendationSent")), "archiveSent": bool(result.get("archiveSent")), "archiveStatus": result.get("archiveStatus") or archive_result.get("status"), "archiveId": str(archive_result.get("archiveId") or result.get("archiveId") or "")[:120], "archiveError": _safe_text(result.get("archiveError") or archive_result.get("error") or "", 180), "recommendationId": str(send_result.get("recommendationId") or result.get("recommendationId") or "")[:120], "caseReportBackfill": bool(report_missing)})
+                    summary["items"].append({"subject": row["subject_name"], "status": "failed", "reason": CASE_REPORT_BACKFILL_REASON if report_missing else "", "error": err, "recommendationSent": bool(result.get("recommendationSent")), "archiveSent": bool(result.get("archiveSent")), "archiveStatus": result.get("archiveStatus") or archive_result.get("status"), "archiveId": str(archive_result.get("archiveId") or result.get("archiveId") or "")[:120], "archiveError": _safe_text(result.get("archiveError") or archive_result.get("error") or "", 180), "recommendationId": str(send_result.get("recommendationId") or result.get("recommendationId") or "")[:120], "caseReportBackfill": bool(report_missing), "caseReportBackfillTrigger": backfill_trigger, "caseReportGenerated": _result_case_report_generated(result), "subjectMemoryPacketGenerated": _result_subject_memory_packet_generated(result)})
             except Exception as exc:
                 err = _safe_text(exc, 240)
                 conn.execute(f"UPDATE {QUEUE_TABLE} SET status='failed', updated_at=?, last_error=? WHERE id=?", (utc_now(), err, row["id"]))
@@ -1005,6 +1057,7 @@ def process_site_refresh_requests(db_path: str, *, guild_id: int | None = None, 
             summary["failed"] += 1
             summary["items"].append({"subject": subject or skey, "subjectKey": skey, "requestId": request_id, "status": "failed", "error": reason})
             continue
+        callback_base_url, callback_source = _select_and_log_source_refresh_callback_base(site_request, environ=env)
         enqueue_source_file_refresh(
             db_path,
             guild_id=guild_id,
@@ -1027,6 +1080,7 @@ def process_site_refresh_requests(db_path: str, *, guild_id: int | None = None, 
             bypass_cooldown=explicit_case_report_backfill or report_missing or (mode == "site_manual_request"),
             refresh_mode=mode,
             subject_key=skey,
+            callback_base_url=callback_base_url or None,
         )
         item = (local.get("items") or [{}])[0]
         status = item.get("status")
