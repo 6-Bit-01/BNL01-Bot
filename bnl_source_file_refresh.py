@@ -366,8 +366,9 @@ def _site_refresh_lookup_parts(site_request: dict[str, Any]) -> tuple[str, str]:
 
 def _site_status_for_local_item(item: dict[str, Any]) -> tuple[str, str]:
     status = str(item.get("status") or "").lower()
-    if status in {"succeeded", "current", "already_current"}:
-        return "completed", ""
+    if status in {"succeeded", "current", "already_current", "partial_success"}:
+        reason = _safe_text(item.get("reason") or "", 240) if status == "partial_success" else ""
+        return "completed", reason
     if status in {"skipped", "cooldown", "deferred", "no_target", "dry_run"}:
         return "skipped", _safe_text(item.get("reason") or item.get("error") or status, 240)
     return "failed", _safe_text(item.get("error") or item.get("reason") or status or "send_failed", 240)
@@ -403,7 +404,7 @@ def _state_has_current_success(state: dict[str, Any] | sqlite3.Row | None) -> bo
     completed = parse_iso(completed_value)
     cooldown_until = parse_iso(cooldown_value)
     now_dt = datetime.now(timezone.utc).replace(microsecond=0)
-    return status == "succeeded" and completed is not None and cooldown_until is not None and cooldown_until > now_dt
+    return status in {"succeeded", "partial_success"} and completed is not None and cooldown_until is not None and cooldown_until > now_dt
 
 
 def _mark_current_cooldown_terminal(db_path: str, *, guild_id: int | None, subject_key: str, reason: str = "cooldown_current") -> None:
@@ -545,7 +546,7 @@ def process_source_file_refresh_now(db_path: str, payload: dict[str, Any], *, gu
     archive_id = _safe_text(item.get("archiveId") or "", 120)
     summary.update({
         "ok": site_status in {"completed", "skipped"},
-        "status": "success" if site_status == "completed" else site_status,
+        "status": "partial_success" if str(item.get("status") or "").lower() == "partial_success" else ("success" if site_status == "completed" else site_status),
         "recommendationId": rec_id,
         "recommendationSent": bool(item.get("recommendationSent") or rec_id),
         "archiveSent": bool(item.get("archiveSent")),
@@ -735,19 +736,25 @@ def process_source_file_refresh_queue(db_path: str, *, guild_id: int | None = No
                     logging.info("source_refresh_skipped subject_key=%s reason=no_target", row["subject_key"])
                     summary["skipped"] += 1
                     summary["items"].append({"subject": row["subject_name"], "status": "skipped", "reason": "no_target", "error": "no_target"})
-                elif result.get("sent"):
+                elif result.get("sent") or (result.get("archiveSent") and not result.get("recommendationSent") and result.get("status") == "partial_success"):
                     send_result = result.get("sendResult") or {}
                     recommendation_id = str(send_result.get("recommendationId") or send_result.get("recommendation_id") or result.get("recommendationId") or send_result.get("id") or "")[:120]
                     archive_result = result.get("archiveResult") or {}
                     archive_id = str(archive_result.get("archiveId") or result.get("archiveId") or "")[:120]
                     cooldown_until_text = _cooldown_until_from(now_dt, cooldown_minutes)
                     evidence_count = sum(int(v or 0) for v in (result.get("sourceCounts") or {}).values()) if isinstance(result.get("sourceCounts"), dict) else int(row["evidence_count"] or 0)
+                    partial_success = bool(result.get("archiveSent") and not result.get("recommendationSent") and result.get("status") == "partial_success")
+                    item_status = "partial_success" if partial_success else "succeeded"
+                    partial_reason = "compact_recommendation_rejected" if partial_success else ""
                     conn.execute(f"UPDATE {QUEUE_TABLE} SET status='succeeded', updated_at=?, last_error=NULL WHERE id=?", (utc_now(), row["id"]))
-                    _state_upsert(conn, guild_id=row["guild_id"], subject_key=row["subject_key"], subject_name=row["subject_name"], fields={"last_refresh_completed_at": utc_now(), "last_refresh_status": "succeeded", "last_recommendation_id": recommendation_id, "last_evidence_hash": _evidence_hash_for_result(result), "last_evidence_count": evidence_count, "last_error": None, "cooldown_until": cooldown_until_text})
+                    _state_upsert(conn, guild_id=row["guild_id"], subject_key=row["subject_key"], subject_name=row["subject_name"], fields={"last_refresh_completed_at": utc_now(), "last_refresh_status": item_status, "last_recommendation_id": recommendation_id, "last_evidence_hash": _evidence_hash_for_result(result), "last_evidence_count": evidence_count, "last_error": partial_reason or None, "cooldown_until": cooldown_until_text})
                     conn.commit()
-                    logging.info("source_refresh_succeeded subject_key=%s recommendation_id=%s archive_id=%s", row["subject_key"], recommendation_id or "none", archive_id or "none")
+                    if partial_success:
+                        logging.warning("source_refresh_partial_success subject_key=%s archive_ok=true compact_recommendation_ok=false reason=compact_recommendation_rejected archive_id=%s", row["subject_key"], archive_id or "none")
+                    else:
+                        logging.info("source_refresh_succeeded subject_key=%s recommendation_id=%s archive_id=%s", row["subject_key"], recommendation_id or "none", archive_id or "none")
                     summary["processed"] += 1
-                    summary["items"].append({"subject": row["subject_name"], "status": "succeeded", "recommendationId": recommendation_id, "recommendationSent": bool(result.get("recommendationSent", bool(send_result.get("ok")))), "archiveSent": bool(result.get("archiveSent", bool(archive_result.get("ok")))), "archiveStatus": result.get("archiveStatus") or archive_result.get("status"), "archiveId": archive_id, "archiveError": _safe_text(result.get("archiveError") or archive_result.get("error") or "", 180)})
+                    summary["items"].append({"subject": row["subject_name"], "status": item_status, "reason": partial_reason, "error": partial_reason, "partialSuccess": partial_success, "recommendationId": recommendation_id, "recommendationSent": bool(result.get("recommendationSent", bool(send_result.get("ok")))), "archiveSent": bool(result.get("archiveSent", bool(archive_result.get("ok")))), "archiveStatus": result.get("archiveStatus") or archive_result.get("status"), "archiveId": archive_id, "archiveError": _safe_text(result.get("archiveError") or archive_result.get("error") or "", 180)})
                 else:
                     archive_result = result.get("archiveResult") or {}
                     send_result = result.get("sendResult") or {}

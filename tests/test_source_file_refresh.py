@@ -480,10 +480,10 @@ class SourceFileRefreshTests(unittest.TestCase):
         self.assertEqual([p["status"] for p in opener.posts], ["claimed", "failed"])
         self.assertIn("archive rejected", opener.posts[-1]["failureReason"])
 
-    def test_refresh_now_compact_recommendation_failure_still_reports_failure(self):
+    def test_refresh_now_compact_recommendation_failure_reports_partial_success(self):
         opener = FakeOpener({"ok": True, "requests": []})
         lookup = lambda query: {"ok": True, "found": True, "sourceFile": {"subjectName": "Signal Fox"}}
-        with mock.patch.object(refresh, "run_source_file_enrichment", return_value={"sent": False, "recommendationSent": False, "archiveSent": True, "sendResult": {"ok": False, "error": "compact rejected"}, "archiveResult": {"ok": True, "archiveId": "arc_partial", "status": 200}, "status": "recommendation_send_failed"}):
+        with mock.patch.object(refresh, "run_source_file_enrichment", return_value={"sent": False, "recommendationSent": False, "archiveSent": True, "sendResult": {"ok": False, "error": "compact rejected"}, "archiveResult": {"ok": True, "archiveId": "arc_partial", "status": 200}, "status": "partial_success", "partialSuccess": True, "partialSuccessReason": "compact_recommendation_rejected"}):
             result = refresh.process_source_file_refresh_now(
                 self.db,
                 {"requestId": "req_compact", "subjectName": "Signal Fox", "normalizedSubjectKey": "signal-fox", "reason": "manual_retry", "source": "admin_manual_retry"},
@@ -492,12 +492,12 @@ class SourceFileRefreshTests(unittest.TestCase):
                 opener=opener,
                 lookup_func=lookup,
             )
-        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["status"], "partial_success")
+        self.assertTrue(result["ok"])
         self.assertTrue(result["archiveSent"])
         self.assertEqual(result["archiveId"], "arc_partial")
-        self.assertIn("compact rejected", result["failureReason"])
-        self.assertEqual([p["status"] for p in opener.posts], ["claimed", "failed"])
-        self.assertIn("compact rejected", opener.posts[-1]["failureReason"])
+        self.assertEqual(result["failureReason"], "compact_recommendation_rejected")
+        self.assertEqual([p["status"] for p in opener.posts], ["claimed", "completed"])
 
     def test_refresh_now_no_target_does_not_stay_claimed(self):
         opener = FakeOpener({"ok": True, "requests": []})
