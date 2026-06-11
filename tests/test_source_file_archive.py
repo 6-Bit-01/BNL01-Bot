@@ -365,7 +365,11 @@ class SourceFileArchiveTests(unittest.TestCase):
         brief = report.get("subjectIntelligenceBriefV1")
         self.assertIsInstance(brief, dict)
         self.assertIn("BNL-facing", brief["subjectRead"])
-        self.assertIn("BNL currently reads Crow", brief["bnlTake"])
+        archetype = brief["subjectArchetypeRead"]
+        self.assertTrue("BNL-facing" in archetype["archetype"] or "lore/interface" in archetype["archetype"])
+        self.assertRegex(brief["distinguishingRead"], r"BNL-facing|Orion|interface")
+        self.assertIn("BNL reads Crow", brief["bnlTake"])
+        self.assertNotIn("internal Source File subject", brief["bnlTake"])
         self.assertIn("not connected", brief["queueSubmissionRead"].lower())
         self.assertEqual(brief["activityProfile"]["totalApprovedPublicAuthoredItems"], 6)
         self.assertTrue(any(item.get("channelName") == "#barcode-bot" and item.get("count") == 5 for item in brief["channelBreakdown"]))
@@ -391,6 +395,125 @@ class SourceFileArchiveTests(unittest.TestCase):
         for forbidden in ("entity_evidence_events", "rawRefJson", "sourceRowId", "user_id", "channel_id", "research-and-development"):
             self.assertNotIn(forbidden, body)
         self.assertNotIn("confirmed submission", body.lower())
+
+    def _subject_brief_for(self, subject, **overrides):
+        packet = self.large_packet()
+        packet.update({
+            "subject": subject,
+            "matchKind": "active_source_file",
+            "sourceCounts": {"conversations": 4},
+            "rawProvenance": {},
+            "conversationHighlights": [],
+            "bestEvidenceToReview": [],
+            "representativeEvidence": [],
+            "topChannels": [],
+            "topTopicDetails": [],
+            "topicBreakdown": [],
+            "conversationThemes": [],
+            "knownContext": [],
+            "usefulEvidence": [],
+            "bnlInteractionSignals": [],
+            "musicSignals": [],
+            "communitySignals": [],
+            "relationshipSignals": [],
+            "queueSubmissionStatus": "not_connected",
+            "queueSubmissionNote": "Queue/submission memory is not connected to this report. Do not claim submissions, song counts, play history, payment, or Priority status.",
+        })
+        packet.update(overrides)
+        return enrichment.build_source_file_archive_payload(packet)["sourceFileCaseReportV1"]["subjectIntelligenceBriefV1"]
+
+    def test_subject_intelligence_brief_music_link_fixture_is_not_crow_framed(self):
+        brief = self._subject_brief_for(
+            "ShortyBabe",
+            sourceCounts={"conversations": 6},
+            topChannels=[{"channel": "#finished-tracks", "count": 4, "summary": "Recurring Suno, Spotify, SoundCloud, YouTube and finished-track link sharing."}],
+            topTopicDetails=[{"topic": "music link sharing", "count": 5, "summary": "ShortyBabe shares Suno and Spotify links around tracks and demos."}],
+            topicBreakdown=["music link sharing", "finished tracks"],
+            bestEvidenceToReview=["ShortyBabe posted Suno and Spotify links for a track/demo discussion; ownership is not stated."],
+            musicSignals=["Recurring Suno, Spotify, SoundCloud, YouTube, song, track, demo, and link-sharing signals; ownership unconfirmed."],
+            communitySignals=["Appears around #finished-tracks music discussion."],
+            representativeEvidence=[{"summary": "ShortyBabe shared a Suno link and Spotify track link in #finished-tracks without connected queue data.", "channelName": "#finished-tracks", "sourceType": "Discord conversation", "visibility": "public_context"}],
+        )
+        archetype = brief["subjectArchetypeRead"]["archetype"]
+        self.assertTrue(archetype in {"music-link sharer", "artist / music submitter"} or "artist" in archetype)
+        body = json.dumps(brief, sort_keys=True).lower()
+        self.assertIn("ownership", body)
+        self.assertIn("unconfirmed", body)
+        subject_shape_text = " ".join([brief["bnlTake"], brief["subjectRead"], brief["subjectArchetypeRead"]["archetype"], " ".join(brief["subjectArchetypeRead"]["distinguishingSignals"])]).lower()
+        self.assertNotIn("orion", subject_shape_text)
+        self.assertNotIn("interface/lore-style", brief["bnlTake"].lower())
+
+    def test_subject_intelligence_brief_community_chatter_fixture(self):
+        crow = self._subject_brief_for(
+            "Crow",
+            topTopicDetails=[{"topic": "BNL source-file threshold", "count": 5}],
+            knownContext=["Crow talks with BNL-01 about Source Files, thresholds, Orion, and interface behavior."],
+            bnlInteractionSignals=["Crow addresses BNL-01 directly."],
+            relationshipSignals=["Orion appears in Crow context; meaning unconfirmed."],
+            representativeEvidence=[{"summary": "Crow asked BNL-01 Source File threshold questions with Orion language.", "channelName": "#barcode-bot"}],
+        )
+        music = self._subject_brief_for(
+            "ShortyBabe",
+            topTopicDetails=[{"topic": "music link sharing", "count": 4}],
+            musicSignals=["Suno song link and track/demo language; ownership unconfirmed."],
+            representativeEvidence=[{"summary": "ShortyBabe shared a Suno song link.", "channelName": "#finished-tracks"}],
+        )
+        brief = self._subject_brief_for(
+            "Antigrain",
+            sourceCounts={"conversations": 7},
+            topChannels=[{"channel": "#general", "count": 5, "summary": "Recurring general chat and support chatter."}],
+            topTopicDetails=[{"topic": "community support chatter", "count": 5, "summary": "Antigrain appears in ordinary community chat and support replies."}],
+            topicBreakdown=["community support chatter"],
+            communitySignals=["Mostly general-chat/social/support chatter with recurring community presence."],
+            representativeEvidence=[{"summary": "Antigrain replied in #general with community support chatter and social conversation.", "channelName": "#general", "sourceType": "Discord conversation", "visibility": "public_context"}],
+        )
+        self.assertEqual("active community participant", brief["subjectArchetypeRead"]["archetype"])
+        body = json.dumps(brief, sort_keys=True).lower()
+        self.assertNotIn("as a confirmed artist", body)
+        self.assertNotIn("as a confirmed submission", body)
+        self.assertNotIn("as a lore identity", body)
+        self.assertNotEqual(brief["bnlTake"], crow["bnlTake"])
+        self.assertNotEqual(brief["bnlTake"], music["bnlTake"])
+
+    def test_subject_intelligence_brief_weak_evidence_fixture(self):
+        brief = self._subject_brief_for(
+            "Thin Signal",
+            sourceCounts={},
+            topChannels=[],
+            topTopicDetails=[],
+            topicBreakdown=[],
+            bestEvidenceToReview=[],
+            musicSignals=[],
+            communitySignals=[],
+            representativeEvidence=[],
+        )
+        self.assertEqual("weak/unknown subject", brief["subjectArchetypeRead"]["archetype"])
+        self.assertTrue(any("specific recurring activity" in item.lower() or "display name" in item.lower() for item in brief["sourceFileGaps"] + brief["subjectArchetypeRead"]["notEnoughEvidenceFor"]))
+        self.assertIn("does not have enough distinctive evidence", brief["bnlTake"])
+        self.assertIn("Not distinctive yet", brief["distinguishingRead"])
+
+    def test_subject_intelligence_brief_anchor_and_topic_boilerplate_is_specific(self):
+        brief = self._subject_brief_for(
+            "Crow",
+            topChannels=[{"channel": "#barcode-bot", "count": 5, "summary": "BNL and Orion context."}],
+            topTopicDetails=[
+                {"topic": "BNL source-file threshold", "count": 5},
+                {"topic": "music link sharing", "count": 2},
+            ],
+            knownContext=["Crow talks with BNL-01 about BARCODE, Orion, and Source Files."],
+            bestEvidenceToReview=["Crow shared a Suno link from suno.com."],
+            bnlInteractionSignals=["Crow addresses BNL-01 directly."],
+            musicSignals=["Suno link signal; ownership and queue status unconfirmed."],
+            relationshipSignals=["Orion appears in Crow context; meaning unconfirmed."],
+            representativeEvidence=[{"summary": "Crow asked BNL-01 about BARCODE and Orion, then shared a Suno link from suno.com.", "channelName": "#barcode-bot"}],
+        )
+        visible_body = json.dumps({k: v for k, v in brief.items() if k not in {"ignoredExtractionNoise"}}, sort_keys=True).lower()
+        self.assertLessEqual(visible_body.count("treat meaning as review-only unless separately confirmed"), 2)
+        notes = {item["name"]: item["note"] for item in brief["namedAnchors"]}
+        self.assertEqual("Recurring Orion-linked context; relationship/meaning not confirmed.", notes.get("Orion"))
+        self.assertEqual("Network/project context appears; not enough by itself to define role.", notes.get("BARCODE"))
+        self.assertEqual("BNL-facing interaction pattern; suggests the subject interacts with BNL as a system/persona.", notes.get("BNL-01"))
+        self.assertTrue(any("ownership" in item.get("explanation", "").lower() or "interface" in item.get("explanation", "").lower() or "bnl-facing" in item.get("explanation", "").lower() for item in brief["topicBuckets"]))
 
     def test_case_report_is_built_from_subject_memory_packet_not_raw_packet_labels(self):
         memory = {
