@@ -333,6 +333,8 @@ class SourceFileArchiveTests(unittest.TestCase):
                 {"channel": "#barcode-bot", "count": 5, "summary": "Crow repeatedly addresses BNL/source-file workflow."},
                 {"channel": "#finished-tracks", "count": 1, "summary": "One music/link-adjacent public signal."},
             ],
+            "sourceCoverage": ["ENTITY", "LOCAL", "SOURCE FILE", "CONVERSATION", "RELATIONSHIP", "INTERNAL", "EXISTING", "DETERMINE", "MOST"],
+            "bnlTake": "Generated report text mentions Nova Artifact, relationship context, queue submission, and identity review, but that text is not source evidence.",
             "topTopicDetails": [
                 {"topic": "BNL source-file and dossier classification", "count": 5, "summary": "Crow asks about BNL, Source Files, dossier review, thresholds, and operational boundaries."},
                 {"topic": "interface / lore convergence", "count": 3, "summary": "Crow uses sync, convergence, Network, EDGE, and Orion-linked framing."},
@@ -342,7 +344,7 @@ class SourceFileArchiveTests(unittest.TestCase):
             "conversationThemes": ["BNL-facing interaction", "threshold behavior", "Orion-linked framing"],
             "knownContext": ["Crow talks with BNL-01 about Source Files, thresholds, sync, convergence, BARCODE, EDGE, Network, and Orion."],
             "usefulEvidence": ["Crow repeatedly asks BNL-01 how a Source File becomes safe for dossier work."],
-            "bestEvidenceToReview": ["Crow shared a Suno link while discussing BNL boundaries; this does not prove it was Crow's submission."],
+            "bestEvidenceToReview": ["Crow shared a Suno link from suno.com while discussing BNL boundaries; this does not prove it was Crow's submission."],
             "bnlInteractionSignals": ["Crow addresses BNL-01 directly and tests operational boundaries around Source File review."],
             "musicSignals": ["Suno link surfaced near Crow; treat as a link signal, not a confirmed owned track or queue submission."],
             "communitySignals": ["Crow appears in BARCODE-facing public context and talks about the Network and Lardcode."],
@@ -367,12 +369,20 @@ class SourceFileArchiveTests(unittest.TestCase):
         self.assertIn("not connected", brief["queueSubmissionRead"].lower())
         self.assertEqual(brief["activityProfile"]["totalApprovedPublicAuthoredItems"], 6)
         self.assertTrue(any(item.get("channelName") == "#barcode-bot" and item.get("count") == 5 for item in brief["channelBreakdown"]))
-        self.assertTrue(any("BNL source-file and dossier" in item.get("topic", "") and item.get("strength") == "strong" for item in brief["topicBuckets"]))
+        self.assertTrue(any(item.get("topic") == "BNL-facing behavior" and item.get("strength") == "strong" for item in brief["topicBuckets"]))
         anchors = {item.get("name") for item in brief["namedAnchors"]}
+        anchor_names_lower = {str(item).lower() for item in anchors}
         self.assertIn("Orion", anchors)
         self.assertIn("BNL-01", anchors)
         self.assertIn("BARCODE", anchors)
+        self.assertIn("Suno", anchors)
+        self.assertIn("suno.com", anchors)
         self.assertFalse({"You", "Your", "The", "For"}.intersection(anchors))
+        self.assertFalse({"entity", "local", "source file", "conversation", "relationship", "internal", "existing", "determine", "most", "queue", "submission", "identity", "bnl-facing"}.intersection(anchor_names_lower))
+        noise_terms = {item.get("term") for item in brief.get("ignoredExtractionNoise", [])}
+        self.assertTrue({"entity", "local", "source file", "conversation", "relationship", "internal", "existing", "determine", "most"}.issubset(noise_terms))
+        self.assertTrue(any(item.get("topic") == "BNL-facing behavior" for item in brief["topicBuckets"]))
+        self.assertNotIn("Nova Artifact", anchors)
         self.assertTrue(any("Suno" in item for item in brief["musicAndLinkSignals"]))
         self.assertTrue(all("review-only" in item.lower() or "unconfirmed" in item.lower() for item in brief["relationshipSignals"]))
         self.assertTrue(any("display name" in item.lower() for item in brief["sourceFileGaps"]))

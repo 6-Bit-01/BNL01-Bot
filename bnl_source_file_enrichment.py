@@ -3041,6 +3041,10 @@ def _relationship_review_items(packet: dict[str, Any], subject: str) -> list[str
 
 _ANCHOR_NOISE_WORDS = {
     "a", "an", "and", "are", "as", "at", "be", "but", "by", "for", "from", "has", "have", "how", "if", "in", "is", "it", "its", "of", "on", "or", "our", "the", "this", "to", "was", "we", "with", "you", "your",
+    "entity", "local", "source", "source file", "source files", "conversation", "relationship", "internal", "existing", "determine", "most", "review", "reviewed", "public", "private",
+    "context", "evidence", "classification", "subject", "report", "dossier", "queue", "submission", "identity", "bnl-facing", "known facts", "public-safe", "case summary",
+    "dossier use", "review blockers", "raw", "file", "generated", "summary", "label", "labels", "status", "packet", "archive", "coverage", "candidate",
+    "facing", "barcode-facing",
 }
 _MEANINGFUL_ANCHOR_TYPES = {
     "orion": "person",
@@ -3055,9 +3059,29 @@ _MEANINGFUL_ANCHOR_TYPES = {
     "lardcode": "project",
     "suno": "platform",
     "discord": "platform",
-    "source file": "system",
-    "source files": "system",
+    "spotify": "platform",
+    "soundcloud": "platform",
+    "youtube": "platform",
 }
+_ANCHOR_EVIDENCE_FIELDS = (
+    "representativeEvidence", "evidenceDetails", "bestEvidenceToReview", "usefulEvidence", "conversationHighlights",
+    "bnlInteractionSignals", "musicSignals", "communitySignals", "relationshipSignals",
+)
+_ANCHOR_GENERATED_FIELDS = (
+    "subjectRead", "bnlTake", "confidenceRead", "queueSubmissionRead", "queueSubmissionNote", "sourceFileGaps",
+    "recommendedAdminActions", "doNotSayPubliclyYet", "sourceCoverage", "topTopicDetails", "topicBreakdown",
+    "topicThemes", "conversationThemes", "knownContext", "publicUseCandidates", "reviewOnlyEvidence",
+    "missingInfo", "sourceAuthority", "sourceCounts", "sourceTypes", "archivePayloadMetadata",
+)
+
+_ANCHOR_NOISE_KEYS = {re.sub(r"[^a-z0-9]+", " ", term.lower()).strip() for term in _ANCHOR_NOISE_WORDS}
+_ANCHOR_COMMON_STOP_NOISE = {
+    "a", "an", "and", "are", "as", "at", "be", "but", "by", "for", "from", "has", "have", "how", "if", "in", "is", "it", "its", "of", "on", "or", "our", "the", "this", "to", "was", "we", "with", "you", "your",
+}
+
+
+def _is_anchor_noise_key(key: str) -> bool:
+    return key in _ANCHOR_NOISE_WORDS or key in _ANCHOR_NOISE_KEYS
 
 
 def _case_flatten_text_values(value: Any, *, max_items: int = 80, item_limit: int = 260) -> list[str]:
@@ -3225,6 +3249,19 @@ def _channel_breakdown(memory: dict[str, Any]) -> list[dict[str, Any]]:
 
 def _clean_topic_label(value: Any) -> str:
     text = _case_text(value, 120)
+    lowered = text.lower()
+    if "bnl" in lowered and re.search(r"source[- ]file|dossier|threshold|boundary|operation", lowered):
+        return "BNL-facing behavior"
+    if re.search(r"source[- ]file|dossier", lowered):
+        return "Source File / dossier discussion"
+    if re.search(r"suno|music|song|track|link-sharing|link sharing", lowered):
+        return "Music or Suno link sharing"
+    if re.search(r"interface|lore|orion|sync|convergence|node|liaison", lowered):
+        return "Interface / lore language"
+    if re.search(r"barcode.*(?:radio|show)|(?:radio|show).*barcode", lowered):
+        return "BARCODE Radio / show talk"
+    if re.search(r"community|collaboration|collaborator", lowered):
+        return "Community / collaboration context"
     text = re.sub(r"\bclassification\b", "", text, flags=re.I)
     text = re.sub(r"\s+", " ", text).strip(" -:/")
     return text[:1].upper() + text[1:] if text else "Unlabeled recurring topic"
@@ -3277,39 +3314,121 @@ def _anchor_type(name: str) -> str:
     return _MEANINGFUL_ANCHOR_TYPES.get(name.lower(), "unknown")
 
 
-def _named_anchors(memory: dict[str, Any]) -> list[dict[str, Any]]:
+def _anchor_noise_key(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", value.lower()).strip()
+
+
+def _record_anchor_noise(noise: dict[str, dict[str, Any]], term: str, reason: str, *, count: int = 1) -> None:
+    key = _anchor_noise_key(term)
+    if not key or not _is_anchor_noise_key(key):
+        return
+    item = noise.setdefault(key, {"term": key, "reason": reason, "count": 0})
+    item["count"] = int(item.get("count") or 0) + max(1, count)
+    if reason not in str(item.get("reason") or ""):
+        item["reason"] = reason if not item.get("reason") else f"{item['reason']}; {reason}"
+
+
+def _anchor_text_fragments(memory: dict[str, Any]) -> tuple[list[str], list[str]]:
     context = _brief_context(memory)
-    texts = _case_flatten_text_values([context, memory.get("representativeMoments"), memory.get("communityContext"), memory.get("relationshipContext")], max_items=100)
+    evidence_values: list[Any] = [context.get(field) for field in _ANCHOR_EVIDENCE_FIELDS]
+    raw_meta = context.get("archivePayloadMetadata") if isinstance(context.get("archivePayloadMetadata"), dict) else {}
+    evidence_values.append(raw_meta.get("representativeFragments"))
+    evidence_values.append(memory.get("representativeMoments"))
+    evidence_texts = _case_flatten_text_values(evidence_values, max_items=120)
+    generated_texts = _case_flatten_text_values([context.get(field) for field in _ANCHOR_GENERATED_FIELDS], max_items=120)
+    return evidence_texts, generated_texts
+
+
+def _extract_ignored_anchor_noise(evidence_texts: list[str], generated_texts: list[str]) -> list[dict[str, Any]]:
+    noise: dict[str, dict[str, Any]] = {}
+    all_texts = [(text, "taxonomy/system/report wording is not a named anchor") for text in generated_texts]
+    all_texts.extend((text, "taxonomy word was filtered from evidence-bearing text") for text in evidence_texts)
+    diagnostic_terms = [term for term in _ANCHOR_NOISE_WORDS if _anchor_noise_key(term) not in _ANCHOR_COMMON_STOP_NOISE]
+    sorted_noise = sorted(diagnostic_terms, key=len, reverse=True)
+    for text, reason in all_texts:
+        lowered = text.lower()
+        for term in sorted_noise:
+            if len(term) <= 2:
+                continue
+            pattern = re.escape(term).replace("\\ ", r"\s+")
+            found = re.findall(rf"(?<![-A-Za-z0-9]){pattern}(?![-A-Za-z0-9])", lowered, flags=re.I)
+            if found:
+                _record_anchor_noise(noise, term, reason, count=len(found))
+    return sorted(noise.values(), key=lambda item: (-int(item.get("count") or 0), item.get("term", "")))[:40]
+
+
+def _domain_anchor_type(name: str) -> str:
+    if re.match(r"https?://", name, flags=re.I):
+        return "url"
+    if re.search(r"\.[a-z]{2,}(?:/|$)", name, flags=re.I):
+        return "domain"
+    return _anchor_type(name)
+
+
+def _named_anchor_extraction(memory: dict[str, Any]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    evidence_texts, generated_texts = _anchor_text_fragments(memory)
+    ignored_noise = _extract_ignored_anchor_noise(evidence_texts, generated_texts)
     counts: dict[str, int] = {}
+    fragments: dict[str, set[int]] = {}
     canonical: dict[str, str] = {}
-    joined = "\n".join(texts)
-    for known in _MEANINGFUL_ANCHOR_TYPES:
-        pattern = re.escape(known).replace("\\ ", r"\s+")
-        found = re.findall(rf"(?<![-A-Za-z0-9]){pattern}(?![-A-Za-z0-9])", joined, flags=re.I)
-        if found:
-            key = known.lower()
-            canonical[key] = "BNL-01" if key == "bnl-01" else ("BNL" if key == "bnl" else ("BARCODE" if key == "barcode" else ("EDGE" if key == "edge" else ("Bit's" if key == "bit's" else known[:1].upper() + known[1:]))))
-            counts[key] = counts.get(key, 0) + len(found)
-    for match in re.findall(r"(?<![-A-Za-z0-9])[A-Z][A-Za-z0-9'’-]{2,}\b", joined):
-        key = match.lower().strip("'’")
-        if key in _ANCHOR_NOISE_WORDS or key in {"raw", "source", "file", "queue", "submission", "identity", "review"}:
-            continue
-        canonical.setdefault(key, match)
-        counts[key] = counts.get(key, 0) + 1
+    qualifiers: dict[str, set[str]] = {}
+
+    def add_candidate(name: str, fragment_index: int, qualifier: str, count: int = 1) -> None:
+        clean = _case_text(name, 120).strip(".,;:()[]{}<>\"'")
+        key = _anchor_noise_key(clean)
+        if not key or _is_anchor_noise_key(key):
+            return
+        canonical.setdefault(key, clean)
+        counts[key] = counts.get(key, 0) + max(1, count)
+        fragments.setdefault(key, set()).add(fragment_index)
+        qualifiers.setdefault(key, set()).add(qualifier)
+
+    for idx, text in enumerate(evidence_texts):
+        for match in re.findall(r"https?://[^\s)\]}>]+", text, flags=re.I):
+            add_candidate(match.rstrip(".,;:"), idx, "url/domain/tool")
+        for match in re.findall(r"(?<!@)\b(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,}(?:/[A-Za-z0-9._~:/?#\[\]@!$&'()*+,;=%-]*)?", text, flags=re.I):
+            add_candidate(match.rstrip(".,;:"), idx, "url/domain/tool")
+        for known, anchor_type in _MEANINGFUL_ANCHOR_TYPES.items():
+            pattern = re.escape(known).replace("\\ ", r"\s+")
+            found = re.findall(rf"(?<![-A-Za-z0-9]){pattern}(?![-A-Za-z0-9])", text, flags=re.I)
+            if found:
+                display = "BNL-01" if known == "bnl-01" else ("BNL" if known == "bnl" else ("BARCODE" if known == "barcode" else ("EDGE" if known == "edge" else ("Bit's" if known == "bit's" else known[:1].upper() + known[1:]))))
+                add_candidate(display, idx, f"known {anchor_type} term in evidence", len(found))
+        for match in re.findall(r"(?<![-A-Za-z0-9])[A-Z][A-Za-z0-9'’-]{2,}(?:-[A-Za-z0-9'’-]+)*\b", text):
+            add_candidate(match, idx, "proper noun in evidence")
+
     anchors: list[dict[str, Any]] = []
-    subject_key = str(memory.get("subjectName") or "").lower()
-    for key, count in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))[:12]:
-        name = canonical.get(key, key)
-        if key in _ANCHOR_NOISE_WORDS or name.lower() == subject_key:
+    subject_key = _anchor_noise_key(str(memory.get("subjectName") or ""))
+    for key, count in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0])):
+        if _is_anchor_noise_key(key) or key == subject_key or key == f"{subject_key} s":
             continue
-        strength = "strong" if count >= 4 else ("moderate" if count >= 2 else "weak")
-        anchor_type = _anchor_type(name)
-        note = f"Appears across extracted evidence {count} time{'s' if count != 1 else ''}; treat meaning as review-only unless separately confirmed."
+        qs = qualifiers.get(key, set())
+        distinct = len(fragments.get(key, set()))
+        qualifies = (
+            any(q.startswith("proper noun") for q in qs)
+            or any(q.startswith("known") for q in qs)
+            or "url/domain/tool" in qs
+            or distinct > 1
+            or ("relationship" in key and distinct > 0)
+        )
+        if not qualifies:
+            continue
+        name = canonical.get(key, key)
+        strength = "strong" if count >= 4 or distinct >= 3 else ("moderate" if count >= 2 or distinct >= 2 else "weak")
+        anchor_type = _domain_anchor_type(name)
+        note = f"Appears in evidence-bearing source fragments {count} time{'s' if count != 1 else ''}; treat meaning as review-only unless separately confirmed."
         if key == "orion":
-            note = "Recurring Orion-linked context appears, but the report does not confirm what that connection means."
-        elif key in {"suno", "spotify", "soundcloud", "youtube"}:
-            note = "Platform/link signal appears; do not assume ownership or queue submission without connected queue/source data."
+            note = "Recurring Orion-linked context appears in evidence, but the report does not confirm what that connection means."
+        elif key in {"suno", "spotify", "soundcloud", "youtube"} or anchor_type in {"url", "domain"}:
+            note = "Platform/link signal appears in evidence; do not assume ownership or queue submission without connected queue/source data."
         anchors.append({"name": name, "type": anchor_type, "strength": strength, "note": note})
+        if len(anchors) >= 12:
+            break
+    return anchors, ignored_noise
+
+
+def _named_anchors(memory: dict[str, Any]) -> list[dict[str, Any]]:
+    anchors, _ignored_noise = _named_anchor_extraction(memory)
     return anchors
 
 
@@ -3365,7 +3484,7 @@ def build_subject_intelligence_brief_v1(memory: dict[str, Any]) -> dict[str, Any
     profile = _subject_activity_profile(memory)
     channels = _channel_breakdown(memory)
     topics = _topic_buckets(memory)
-    anchors = _named_anchors(memory)
+    anchors, ignored_noise = _named_anchor_extraction(memory)
     music = _signals_from(memory, ("musicSignals", "bestEvidenceToReview", "representativeEvidence"), "No specific music/link signal is confirmed in the current packet; do not infer submissions or ownership.")
     relationship = _signals_from(memory, ("relationshipSignals",), "No relationship signal is confirmed; keep any relationship interpretation review-only.")
     queue_connected = str(_brief_context(memory).get("queueSubmissionStatus") or "not_connected") not in {"", "not_connected", "unknown"}
@@ -3381,6 +3500,7 @@ def build_subject_intelligence_brief_v1(memory: dict[str, Any]) -> dict[str, Any
         "channelBreakdown": channels,
         "topicBuckets": topics,
         "namedAnchors": anchors,
+        "ignoredExtractionNoise": ignored_noise,
         "interactionPatterns": _signals_from(memory, ("bnlInteractionSignals", "communitySignals", "conversationThemes"), "No specific interaction pattern is exposed beyond the representative evidence."),
         "musicAndLinkSignals": music,
         "relationshipSignals": [item if any(term in item.lower() for term in ("review-only", "unconfirmed", "not confirm", "uncertain")) else f"{item}. Treat as review-only until confirmed." for item in relationship],
