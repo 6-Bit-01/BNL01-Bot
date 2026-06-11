@@ -1571,7 +1571,11 @@ def collect_source_enrichment_evidence(db_path: str, guild_id: int | None, subje
 
     refresh_result: dict[str, Any] = {}
     try:
-        refresh_result = refresh_entity_evidence_for_subject(db_path, subject, guild_id=guild_id, limit=50)
+        alias_labels = [label for label in list(identity.get("aliasLabels") or []) if _subject_key(label) != _subject_key(subject)]
+        if alias_labels:
+            refresh_result = refresh_entity_evidence_for_subject(db_path, subject, guild_id=guild_id, limit=50, confirmed_aliases=alias_labels)
+        else:
+            refresh_result = refresh_entity_evidence_for_subject(db_path, subject, guild_id=guild_id, limit=50)
     except Exception as exc:  # pragma: no cover - defensive: enrichment should still read existing evidence.
         refresh_result = {"ok": False, "error": _safe_text(str(exc), 180)}
 
@@ -3138,6 +3142,9 @@ def _build_subject_intelligence_context(packet: dict[str, Any]) -> dict[str, Any
     source_counts = packet.get("sourceCounts") if isinstance(packet.get("sourceCounts"), dict) else {}
     if source_counts:
         context["sourceCounts"] = _sanitize_archive_value(source_counts)
+    diagnostics = packet.get("diagnostics") if isinstance(packet.get("diagnostics"), dict) else {}
+    if diagnostics:
+        context["diagnostics"] = _sanitize_archive_value(diagnostics)
     raw = packet.get("rawProvenance") if isinstance(packet.get("rawProvenance"), dict) else {}
     if raw:
         meta: dict[str, Any] = {}
@@ -3916,6 +3923,9 @@ def build_subject_authored_evidence_v1(memory: dict[str, Any], subject: str, sub
             if key not in excluded_seen:
                 excluded_seen.add(key)
                 excluded.append({"summary": _case_text(_website_safe_payload_text(summary), 220), "reason": reason, **({"sourceType": source_type} if source_type else {})})
+    diagnostics = _brief_context(memory).get("diagnostics") if isinstance(_brief_context(memory).get("diagnostics"), dict) else {}
+    refresh_diag = diagnostics.get("entityEvidenceRefresh") if isinstance(diagnostics.get("entityEvidenceRefresh"), dict) else {}
+    conversation_backfill = refresh_diag.get("conversationBackfill") if isinstance(refresh_diag.get("conversationBackfill"), dict) else {"attempted": False, "matchedRows": 0, "createdEvents": 0, "updatedEvents": 0, "skippedRows": 0, "skippedReasons": []}
     if not owned:
         warnings.append("No digest-eligible subject-authored or subject-attached source rows were found before generated summaries.")
     if excluded:
@@ -3925,6 +3935,14 @@ def build_subject_authored_evidence_v1(memory: dict[str, Any], subject: str, sub
         "ownedAuthoredItems": owned[:40],
         "excludedItems": excluded[:30],
         "extractionWarnings": warnings,
+        "conversationBackfill": {
+            "attempted": bool(conversation_backfill.get("attempted")),
+            "matchedRows": _as_int(conversation_backfill.get("matchedRows")) or 0,
+            "createdEvents": _as_int(conversation_backfill.get("createdEvents")) or 0,
+            "updatedEvents": _as_int(conversation_backfill.get("updatedEvents")) or 0,
+            "skippedRows": _as_int(conversation_backfill.get("skippedRows")) or 0,
+            "skippedReasons": _case_list(conversation_backfill.get("skippedReasons"), limit=8, item_limit=80),
+        },
     }
 
 

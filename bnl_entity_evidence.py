@@ -42,6 +42,7 @@ ALLOWED_EVIDENCE_KINDS = {
 _DISCORD_MENTION_PATTERN = re.compile(r"<[@#!&]?[0-9]{5,}>")
 _LONG_ID_PATTERN = re.compile(r"\b\d{15,22}\b")
 _URL_PATTERN = re.compile(r"https?://\S+", re.I)
+_DOMAIN_PATTERN = re.compile(r"https?://(?:www\.)?([^/\s?#]+)", re.I)
 _WORD_PATTERN = re.compile(r"[a-z0-9]+")
 _MUSIC_PATTERN = re.compile(r"\b(artist|track|song|playlist|radio|show|performance|beat|demo|finished tracks?|wips?|collab(?:oration)?s?|music)\b", re.I)
 _COMMUNITY_PATTERN = re.compile(r"\b(community|server|barcode|member|public|conversation|channel|chat|finished tracks?|wips?)\b", re.I)
@@ -423,6 +424,160 @@ def _topic(text: str) -> str:
     return labels[0] if labels else "local context"
 
 
+def _conversation_match_labels(subject_name: str, subject_key_value: str = "", confirmed_aliases: list[Any] | None = None) -> set[str]:
+    """Return compact labels that may identify the subject as conversation author."""
+
+    labels: set[str] = set()
+
+    def add(value: Any) -> None:
+        if value in (None, ""):
+            return
+        raw = str(value).strip()
+        if not raw:
+            return
+        labels.add(compact_subject_text(raw))
+        labels.add(compact_subject_text(normalize_subject_name(raw)))
+        labels.add(compact_subject_text(raw.replace("-", " ").replace("_", " ")))
+
+    add(subject_name)
+    add(subject_key_value)
+    for alias in confirmed_aliases or []:
+        if isinstance(alias, dict):
+            use = alias.get("useForMatching")
+            if use is False or str(use).lower() == "false":
+                continue
+            add(alias.get("name") or alias.get("alias") or alias.get("label") or alias.get("value"))
+        else:
+            add(alias)
+    return {label for label in labels if len(label) >= 3}
+
+
+def _conversation_author_values(data: dict[str, Any]) -> list[str]:
+    values: list[str] = []
+    for key in ("user_name", "author_name", "display_name", "preferred_name", "username", "global_name"):
+        value = data.get(key)
+        if value not in (None, ""):
+            values.append(str(value))
+    return values
+
+
+def _authored_conversation_music_signal(text: str) -> bool:
+    lowered = str(text or "").lower()
+    if re.search(r"\b(?:no|not|without|lacks?)\b.{0,40}\b(?:artist|submission|music|track|song|proof|claim)\b", lowered):
+        return bool(_DOMAIN_PATTERN.search(text or ""))
+    return bool(_MUSIC_PATTERN.search(text or "") or _DOMAIN_PATTERN.search(text or ""))
+
+
+def _is_bnl_conversation_author(data: dict[str, Any]) -> bool:
+    role = str(data.get("role") or "").strip().lower()
+    if role in {"assistant", "model", "bot", "system"}:
+        return True
+    for value in _conversation_author_values(data):
+        compact = compact_subject_text(value)
+        if compact in {"bnl", "bnl01", "bnlbot", "barcodebot", "barcodebnl", "bnl01bot"}:
+            return True
+    return False
+
+
+def _conversation_author_matches_subject(data: dict[str, Any], match_labels: set[str], matched_user_ids: set[Any] | None = None) -> bool:
+    for key in ("user_id", "author_id", "discord_user_id", "member_id"):
+        if data.get(key) in (matched_user_ids or set()):
+            return True
+        if str(data.get(key) or "") in {str(v) for v in (matched_user_ids or set()) if v not in (None, "")}:
+            return True
+    for value in _conversation_author_values(data):
+        compact = compact_subject_text(value)
+        if compact and compact in match_labels:
+            return True
+    return False
+
+
+def extract_authored_conversation_topic(text: str) -> str:
+    """Extract a concrete website-safe topic from a subject-authored public row."""
+
+    raw = str(text or "")
+    bits: list[str] = []
+    domains = []
+    for match in _DOMAIN_PATTERN.finditer(raw):
+        domain = match.group(1).lower().removeprefix("www.")
+        if domain and domain not in domains:
+            domains.append(domain)
+    platform_map = {
+        "youtube.com": "YouTube link",
+        "youtu.be": "YouTube link",
+        "soundcloud.com": "SoundCloud link",
+        "spotify.com": "Spotify link",
+        "suno.com": "Suno link",
+        "bandcamp.com": "Bandcamp link",
+    }
+    for domain in domains[:2]:
+        label = next((name for suffix, name in platform_map.items() if domain == suffix or domain.endswith("." + suffix)), None)
+        bits.append(label or f"{domain} link")
+    lowered = raw.lower()
+    negated_music = bool(re.search(r"\b(?:no|not|without|lacks?)\b.{0,40}\b(?:artist|submission|music|track|song|proof|claim)\b", lowered))
+    if not negated_music and re.search(r"\b(?:track|song|music|artist|cream|playlist|album|video)\b", lowered):
+        bits.append("music/video reference")
+    if re.search(r"\b(?:wip|demo|rough mix|preview|finished track|finished tracks|snippet)\b", lowered):
+        bits.append("WIP/demo or finished-track reference")
+    if re.search(r"\b(?:bnl|bnl-01|bot)\b", lowered) and "?" in raw:
+        bits.append("BNL-facing question")
+    elif re.search(r"\b(?:bnl|bnl-01|bot)\b", lowered):
+        bits.append("BNL-facing exchange")
+    weird_matches = []
+    for phrase in ("vibrating beds", "electric sheep"):
+        if phrase in lowered:
+            weird_matches.append(phrase)
+    if weird_matches:
+        bits.append("weird concrete subject: " + ", ".join(weird_matches[:2]))
+    if re.search(r"\b(?:orion|cliff|network|barcode|lore|archive|edge)\b", lowered):
+        found = []
+        for term in ("Orion", "Cliff", "Network", "BARCODE", "lore", "archive", "EDGE"):
+            if re.search(rf"\b{re.escape(term)}\b", raw, flags=re.I):
+                found.append(term)
+        if found:
+            bits.append("show/lore terms: " + ", ".join(found[:3]))
+    if "?" in raw or re.search(r"\b(?:how do|how to|can you|could you|help|support|fix|bring back)\b", lowered):
+        bits.append("question or support request")
+    # Preserve one distinctive noun phrase when available, without exposing URLs/IDs.
+    clean = safe_text(raw, 120)
+    candidates = re.findall(r"\b[A-Z][A-Za-z0-9_-]{2,}(?:\s+[A-Z][A-Za-z0-9_-]{2,}){0,2}\b", clean)
+    for candidate in candidates:
+        if candidate.lower() not in {"http", "https", "bnl"} and candidate not in bits:
+            bits.append(candidate)
+            break
+    if not bits:
+        details = extract_conversation_topic_details(raw, review_only=False)
+        bits.extend(details[:1])
+    seen: set[str] = set()
+    out: list[str] = []
+    for bit in bits:
+        safe = _website_safe_payload_text(safe_text(bit, 80))
+        key = safe.lower()
+        if safe and key not in seen:
+            seen.add(key)
+            out.append(safe)
+    return "; ".join(out[:4]) or "Community/server participation"
+
+
+def build_authored_conversation_safe_summary(*, text: str, channel_name: Any = None, channel_policy: str = "unknown") -> str:
+    """Build a concrete paraphrase for subject-authored public conversation evidence."""
+
+    topic = extract_authored_conversation_topic(text)
+    channel = _safe_channel_label(channel_name, channel_policy)
+    lowered = str(text or "").lower()
+    if "youtube" in topic.lower() or "youtu.be" in lowered:
+        action = "shared a YouTube link"
+    elif " link" in topic.lower():
+        action = "shared a public link"
+    elif "bnl-facing question" in topic.lower() or "?" in str(text or ""):
+        action = "asked a public question"
+    elif "wip" in topic.lower() or "demo" in topic.lower() or "finished-track" in topic.lower():
+        action = "discussed a WIP, demo, or finished-track reference"
+    else:
+        action = "authored public conversation context"
+    return _clean_safe_summary(f"Subject {action} about {topic} in {channel}.")
+
+
 
 def extract_conversation_topic_details(text: str, *, review_only: bool = False) -> list[str]:
     """Return specific, review-safe conversation detail labels without raw quotes."""
@@ -562,6 +717,123 @@ def _source_row_id(data: dict[str, Any]) -> str | None:
     return None if value in (None, "") else str(value)
 
 
+def backfill_subject_authored_conversation_evidence(
+    conn,
+    *,
+    guild_id: int,
+    subject_name: str,
+    subject_key: str,
+    confirmed_aliases: list[str] | None = None,
+    limit: int = 75,
+) -> dict[str, Any]:
+    """Backfill subject-authored public conversation rows into entity evidence events.
+
+    This only accepts rows authored by the subject in approved public-side policies.
+    It does not infer ownership from content mentions or from model/BNL rows.
+    """
+
+    ensure_entity_evidence_schema(conn)
+    diagnostics: dict[str, Any] = {
+        "attempted": True,
+        "matchedRows": 0,
+        "createdEvents": 0,
+        "updatedEvents": 0,
+        "skippedRows": 0,
+        "skippedReasons": [],
+    }
+
+    def skip(reason: str) -> None:
+        diagnostics["skippedRows"] += 1
+        if reason not in diagnostics["skippedReasons"]:
+            diagnostics["skippedReasons"].append(reason)
+
+    if not table_exists(conn, "conversations"):
+        skip("conversations_table_missing")
+        return diagnostics
+    cols = columns(conn, "conversations")
+    required = {"role", "guild_id", "channel_policy"}
+    if not required.issubset(cols):
+        skip("conversations_required_columns_missing")
+        return diagnostics
+
+    subject = normalize_subject_name(subject_name)
+    skey = subject_key or globals()["subject_key"](subject)
+    match_labels = _conversation_match_labels(subject, skey, confirmed_aliases)
+    if not match_labels:
+        skip("missing_subject_match_labels")
+        return diagnostics
+
+    select_cols = ["rowid"] + sorted(cols)
+    order_col = "timestamp" if "timestamp" in cols else "created_at" if "created_at" in cols else "id" if "id" in cols else "rowid"
+    rows = conn.execute(
+        f"SELECT {', '.join('rowid AS _rowid' if c == 'rowid' else c for c in select_cols)} FROM conversations WHERE guild_id=? ORDER BY {order_col} DESC LIMIT ?",
+        (guild_id, max(1, limit)),
+    ).fetchall()
+    for row in rows:
+        data = dict(row)
+        role = str(data.get("role") or "").strip().lower()
+        if role != "user":
+            skip("non_user_role")
+            continue
+        if _is_bnl_conversation_author(data):
+            skip("bnl_or_model_author")
+            continue
+        policy = str(data.get("channel_policy") or "unknown").strip().lower() or "unknown"
+        if policy not in PUBLIC_CONVERSATION_POLICIES:
+            skip("non_public_channel_policy")
+            continue
+        if not _conversation_author_matches_subject(data, match_labels):
+            skip("author_identity_not_subject")
+            continue
+        text = _row_text(row, ["content"])
+        if not text.strip():
+            skip("empty_content")
+            continue
+        diagnostics["matchedRows"] += 1
+        source_id = _source_row_id(data) or str(data.get("_rowid") or "")
+        topic = extract_authored_conversation_topic(text)
+        safe_summary = build_authored_conversation_safe_summary(text=text, channel_name=data.get("channel_name"), channel_policy=policy)
+        status = upsert_entity_evidence_event(
+            conn,
+            guild_id=data.get("guild_id", guild_id),
+            subject_key=skey,
+            subject_name=subject,
+            matched_user_id=data.get("user_id") or data.get("author_id") or data.get("discord_user_id") or data.get("member_id"),
+            source_type="conversation",
+            source_table="conversations",
+            source_row_id=source_id,
+            source_label="conversations/public_discord_observed",
+            channel_name=safe_text(data.get("channel_name") or "", 80) or None,
+            channel_policy=policy,
+            visibility="public_side",
+            authority="public_discord_observed",
+            confidence=0.72,
+            relation_to_subject="authored",
+            topic=topic,
+            evidence_kind="authored_public_conversation",
+            safe_summary=safe_summary,
+            public_safe_candidate=True,
+            review_only=False,
+            music_signal=_authored_conversation_music_signal(text),
+            community_signal=True,
+            bnl_interaction=bool(_BNL_PATTERN.search(text)),
+            dossier_relevance="candidate_after_owner_review",
+            raw_ref_json={
+                "table": "conversations",
+                "row_id": source_id,
+                "safe_snippet": safe_text(text),
+                "channel_name": data.get("channel_name"),
+                "channel_policy": policy,
+            },
+            observed_at=data.get("timestamp") or data.get("created_at"),
+        )
+        if status == "created":
+            diagnostics["createdEvents"] += 1
+        elif status == "updated":
+            diagnostics["updatedEvents"] += 1
+    return diagnostics
+
+
 def derive_entity_evidence_from_conversation_row(
     conn: sqlite3.Connection,
     row: sqlite3.Row,
@@ -585,7 +857,7 @@ def derive_entity_evidence_from_conversation_row(
     relation = "authored" if authored else "mentioned"
     kind = f"{relation}_{'public' if public else 'review_only'}_conversation"
     if public:
-        safe_summary = build_conversation_safe_summary(text=text, authored=authored, public_safe=True, channel_name=data.get("channel_name"), channel_policy=policy)
+        safe_summary = build_authored_conversation_safe_summary(text=text, channel_name=data.get("channel_name"), channel_policy=policy) if authored else build_conversation_safe_summary(text=text, authored=authored, public_safe=True, channel_name=data.get("channel_name"), channel_policy=policy)
         channel_name = safe_text(data.get("channel_name") or "", 80) or None
     else:
         safe_summary = f"Subject {relation} review-only conversation context; private/internal channel details require owner review."
@@ -602,15 +874,15 @@ def derive_entity_evidence_from_conversation_row(
         channel_name=channel_name,
         channel_policy=policy,
         visibility="public_side" if public else "review_only",
-        authority="channel_policy_observed" if public else "internal_review_only",
+        authority="public_discord_observed" if public and authored else ("channel_policy_observed" if public else "internal_review_only"),
         confidence=0.72 if public else 0.5,
         relation_to_subject=relation,
-        topic=(extract_conversation_topic_details(text, review_only=not public) or [_topic(text)])[0],
+        topic=extract_authored_conversation_topic(text) if authored and public else (extract_conversation_topic_details(text, review_only=not public) or [_topic(text)])[0],
         evidence_kind=kind,
         safe_summary=safe_summary,
         public_safe_candidate=public,
         review_only=not public,
-        music_signal=bool(_MUSIC_PATTERN.search(text)),
+        music_signal=_authored_conversation_music_signal(text) if authored and public else bool(_MUSIC_PATTERN.search(text)),
         community_signal=bool(_COMMUNITY_PATTERN.search(text)),
         bnl_interaction=bool(_BNL_PATTERN.search(text)),
         dossier_relevance="candidate_after_owner_review" if public else "review_only_context",
@@ -619,12 +891,12 @@ def derive_entity_evidence_from_conversation_row(
     )
 
 
-def derive_entity_evidence_for_subject(db_path: str, subject_name: str, guild_id: int | None = None, limit: int = 200) -> dict[str, Any]:
+def derive_entity_evidence_for_subject(db_path: str, subject_name: str, guild_id: int | None = None, limit: int = 200, confirmed_aliases: list[str] | None = None) -> dict[str, Any]:
     """Derive/update evidence events for one subject from existing local stores only."""
 
     subject = normalize_subject_name(subject_name)
     key = subject_key(subject)
-    result = {"subjectName": subject, "subjectKey": key, "createdCount": 0, "updatedCount": 0, "unchangedCount": 0, "sourceTypes": Counter(), "reviewOnlyCount": 0, "publicSafeCandidateCount": 0, "status": "ok"}
+    result = {"subjectName": subject, "subjectKey": key, "createdCount": 0, "updatedCount": 0, "unchangedCount": 0, "sourceTypes": Counter(), "reviewOnlyCount": 0, "publicSafeCandidateCount": 0, "status": "ok", "conversationBackfill": {"attempted": False, "matchedRows": 0, "createdEvents": 0, "updatedEvents": 0, "skippedRows": 0, "skippedReasons": []}}
     if not subject:
         result["status"] = "missing_subject"
         result["sourceTypes"] = {}
@@ -681,7 +953,24 @@ def derive_entity_evidence_for_subject(db_path: str, subject_name: str, guild_id
             )
             note(status, "profile", True, False)
 
-        aliases = list(dict.fromkeys([a for a in aliases if a and a.lower() != subject.lower()]))
+        aliases = list(dict.fromkeys([a for a in [*(confirmed_aliases or []), *aliases] if a and str(a).lower() != subject.lower()]))
+
+        if guild_id is not None:
+            backfill = backfill_subject_authored_conversation_evidence(
+                conn,
+                guild_id=int(guild_id),
+                subject_name=subject,
+                subject_key=key,
+                confirmed_aliases=aliases,
+                limit=min(max(1, limit), 75),
+            )
+            result["conversationBackfill"] = backfill
+            for status_name, count_key in (("created", "createdEvents"), ("updated", "updatedEvents")):
+                count = int(backfill.get(count_key) or 0)
+                if count:
+                    result[f"{status_name}Count"] += count
+                    result["sourceTypes"]["conversation"] += count
+                    result["publicSafeCandidateCount"] += count
 
         def row_matches(row: sqlite3.Row, fields: list[str]) -> bool:
             data = dict(row)
