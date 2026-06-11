@@ -422,6 +422,27 @@ class SourceFileArchiveTests(unittest.TestCase):
         packet.update(overrides)
         return enrichment.build_source_file_archive_payload(packet)["sourceFileCaseReportV1"]["subjectIntelligenceBriefV1"]
 
+    def _visible_primary_copy_text(self, brief):
+        visible = {
+            "subjectRead": brief.get("subjectRead"),
+            "bnlTake": brief.get("bnlTake"),
+            "subjectArchetypeRead": {"rationale": (brief.get("subjectArchetypeRead") or {}).get("rationale")},
+            "distinguishingRead": brief.get("distinguishingRead"),
+            "topicBucketExplanations": [item.get("explanation") for item in brief.get("topicBuckets", []) if isinstance(item, dict)],
+            "behavioralSignatureV1": brief.get("behavioralSignatureV1"),
+            "namedAnchors": brief.get("namedAnchors"),
+            "interactionPatterns": brief.get("interactionPatterns"),
+            "musicLinkSignals": brief.get("musicLinkSignals") or brief.get("musicAndLinkSignals"),
+            "relationshipContextSignals": brief.get("relationshipContextSignals") or brief.get("relationshipSignals"),
+            "confidenceRead": brief.get("confidenceRead"),
+            "queueSubmissionRead": brief.get("queueSubmissionRead"),
+        }
+        return json.dumps(visible, sort_keys=True)
+
+    def assertVisiblePrimaryCopyExcludes(self, brief, term):
+        self.assertNotIn(term, self._visible_primary_copy_text(brief))
+
+
     def test_subject_intelligence_brief_music_link_fixture_is_not_crow_framed(self):
         brief = self._subject_brief_for(
             "ShortyBabe",
@@ -573,6 +594,9 @@ class SourceFileArchiveTests(unittest.TestCase):
         self.assertFalse(lore_bucket["mainReadEligible"])
         self.assertIn(lore_bucket["ownershipBasis"], {"nearby_context", "generated_or_taxonomy", "unknown"})
         self.assertTrue(any("Orion/interface/lore" in item["signal"] for item in brief["mainReadRoutingDiagnostics"]["excludedShapeSignals"]))
+        self.assertVisiblePrimaryCopyExcludes(brief, "Orion")
+        self.assertIn("vibrating", self._visible_primary_copy_text(brief).lower())
+        self.assertIn("network skepticism", self._visible_primary_copy_text(brief).lower())
 
     def test_topic_label_self_contamination_does_not_create_lore_read(self):
         brief = self._subject_brief_for(
@@ -617,6 +641,7 @@ class SourceFileArchiveTests(unittest.TestCase):
         self.assertIn("ai", body)
         self.assertIn("orion/archive-facing", brief["bnlTake"].lower())
         self.assertIn("review-only", brief["bnlTake"].lower())
+        self.assertIn("Orion", self._visible_primary_copy_text(brief))
 
 
     def test_evidence_ownership_shortybabe_nearby_orion_not_promoted(self):
@@ -641,6 +666,9 @@ class SourceFileArchiveTests(unittest.TestCase):
         diagnostics = brief["ownershipRoutingDiagnostics"]
         self.assertTrue(any(item.get("term") == "Orion" and item.get("routedAs") in {"co_mention", "shared_topic"} for item in diagnostics["overpromotedCandidatesBlocked"]))
         self.assertTrue(any("Orion/interface/lore" in item["signal"] or item["signal"] == "Orion" for item in brief["mainReadRoutingDiagnostics"]["excludedShapeSignals"]))
+        self.assertVisiblePrimaryCopyExcludes(brief, "Orion")
+        visible_text = self._visible_primary_copy_text(brief).lower()
+        self.assertTrue("playful challenger" in visible_text or "antagonis" in visible_text)
 
     def test_evidence_ownership_shortybabe_bnl_challenger_signature(self):
         brief = self._subject_brief_for(
@@ -666,6 +694,43 @@ class SourceFileArchiveTests(unittest.TestCase):
         )
         self.assertNotIn("Nova", {item.get("name") for item in brief["namedAnchors"]})
         self.assertTrue(any(item.get("name") in {"Nova", "Artifact"} for item in brief["nearbyContextSignals"]))
+        self.assertVisiblePrimaryCopyExcludes(brief, "Nova")
+
+
+    def test_lostmarbles_nearby_orion_stays_diagnostic_only(self):
+        brief = self._subject_brief_for(
+            "LostMarbles",
+            sourceCounts={"conversations": 2},
+            topTopicDetails=[{"topic": "community chatter", "count": 2}],
+            knownContext=["Orion appears in nearby archive context around the conversation, not as LostMarbles-owned evidence."],
+            relationshipSignals=["Orion appears near LostMarbles in relationship/context evidence only; meaning unconfirmed."],
+            representativeEvidence=[{"summary": "LostMarbles made a limited public community chat reply.", "authorName": "LostMarbles", "sourceType": "Discord conversation", "visibility": "public_context"}],
+        )
+        self.assertVisiblePrimaryCopyExcludes(brief, "Orion")
+        self.assertIn("Orion", json.dumps(brief["nearbyContextSignals"], sort_keys=True))
+        self.assertIn("Orion", json.dumps(brief["ownershipRoutingDiagnostics"], sort_keys=True))
+        self.assertTrue("limited" in self._visible_primary_copy_text(brief).lower() or "active community participant" in self._visible_primary_copy_text(brief).lower())
+
+    def test_visible_main_read_text_does_not_explain_non_owned_orion_exclusions(self):
+        brief = self._subject_brief_for(
+            "LostMarbles",
+            sourceCounts={"conversations": 2},
+            knownContext=["Orion appears in nearby archive context only."],
+            relationshipSignals=["Orion appears near LostMarbles in relationship/context evidence only; meaning unconfirmed."],
+            representativeEvidence=[{"summary": "LostMarbles made a limited public community chat reply.", "authorName": "LostMarbles", "sourceType": "Discord conversation", "visibility": "public_context"}],
+        )
+        visible = self._visible_primary_copy_text(brief).lower()
+        forbidden = [
+            "nearby orion",
+            "orion is quarantined",
+            "not orion-linked",
+            "does not have subject-owned evidence to treat orion",
+            "orion was excluded",
+            "without orion evidence",
+        ]
+        for phrase in forbidden:
+            self.assertNotIn(phrase, visible)
+        self.assertNotIn("Orion", self._visible_primary_copy_text(brief))
 
     def test_source_blind_legacy_is_quarantined_from_owned_claims(self):
         packet = self.large_packet()
