@@ -1288,10 +1288,10 @@ def _resolve_existing_enrichment_identity(db_path: str, subject: str, guild_id: 
 
 
 
-def refresh_entity_evidence_for_subject(db_path: str, subject_name: str, guild_id: int | None = None, limit: int = MAX_ENTITY_SUMMARY_LIMIT) -> dict[str, Any]:
+def refresh_entity_evidence_for_subject(db_path: str, subject_name: str, guild_id: int | None = None, limit: int = MAX_ENTITY_SUMMARY_LIMIT, confirmed_aliases: list[str] | None = None) -> dict[str, Any]:
     """Operator/source-path helper to derive structured evidence for one subject."""
 
-    return derive_entity_evidence_for_subject(db_path, subject_name, guild_id=guild_id, limit=limit)
+    return derive_entity_evidence_for_subject(db_path, subject_name, guild_id=guild_id, limit=limit, confirmed_aliases=confirmed_aliases)
 
 
 def _evidence_review_label(data: dict[str, Any], channel_display: str, safe_summary: str) -> str:
@@ -1347,9 +1347,22 @@ def _apply_structured_evidence(summary: dict[str, Any], rows: list[sqlite3.Row],
         summary["rawProvenance"]["channelPolicies"][policy] += 1
         summary["rawProvenance"]["rawFragments"].append({
             "table": source_table,
+            "sourceTable": source_table,
+            "sourceType": "entity_evidence_events",
             "sourceLabel": source_label,
             "sourceQuality": "structured_entity_evidence",
             "evidenceKind": kind,
+            "subjectName": data.get("subject_name") or summary.get("subjectName"),
+            "subjectKey": data.get("subject_key"),
+            "relationToSubject": relation,
+            "safeSummary": safe_summary,
+            "summary": safe_summary,
+            "topic": topic,
+            "channelName": channel_display if public_candidate else None,
+            "channelPolicy": policy,
+            "visibility": "public_context" if public_candidate and not review_only else "review_only",
+            "reviewOnly": bool(review_only),
+            "publicSafe": bool(public_candidate and not review_only),
             "rowId": data.get("source_row_id"),
             "rawRefJson": data.get("raw_ref_json"),
         })
