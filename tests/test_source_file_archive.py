@@ -548,7 +548,10 @@ class SourceFileArchiveTests(unittest.TestCase):
             "Antigrain",
             sourceCounts={"conversations": 8},
             topChannels=[{"channel": "#general", "count": 5, "summary": "Antigrain asks odd concrete questions and talks about the Network."}],
-            topTopicDetails=[{"topic": "vibrating beds and Network motives", "count": 3, "summary": "Owned evidence includes vibrating beds and questioning Network motives."}],
+            topTopicDetails=[
+                {"topic": "vibrating beds and Network motives", "count": 3, "summary": "Owned evidence includes vibrating beds and questioning Network motives."},
+                {"topic": "Interface / lore language", "count": 2, "summary": "Orion/interface/lore appears only around nearby context."},
+            ],
             usefulEvidence=[
                 {"summary": "Antigrain asks why the BARCODE Network wants vibrating beds in the room.", "authorName": "Antigrain", "sourceType": "Discord conversation", "visibility": "public_context"},
                 {"summary": "Antigrain questions the Network's motives and intent around weird physical objects.", "authorName": "Antigrain", "sourceType": "Discord conversation", "visibility": "public_context"},
@@ -556,6 +559,9 @@ class SourceFileArchiveTests(unittest.TestCase):
             relationshipSignals=["Orion appears near Antigrain in broader community context; meaning unconfirmed."],
             representativeEvidence=[{"summary": "Antigrain asked about vibrating beds and questioned Network motives in #general.", "authorName": "Antigrain", "channelName": "#general", "sourceType": "Discord conversation", "visibility": "public_context"}],
         )
+        shape_text = " ".join([brief["subjectRead"], brief["bnlTake"], brief["subjectArchetypeRead"]["archetype"], " ".join(brief["subjectArchetypeRead"]["distinguishingSignals"])]).lower()
+        self.assertNotIn("bnl-facing lore/interface", shape_text)
+        self.assertNotIn("interface/lore-style", brief["bnlTake"].lower())
         self.assertTrue(any("vibrating" in item.get("subject", "").lower() for item in brief["behavioralSignatureV1"]["unusualRecurringSubjects"]))
         self.assertIn(brief["behavioralSignatureV1"]["stanceTowardNetwork"]["stance"], {"questioning", "skeptical"})
         self.assertIn("unusual recurring subjects", brief["bnlTake"].lower())
@@ -563,6 +569,34 @@ class SourceFileArchiveTests(unittest.TestCase):
         self.assertNotIn("Orion", {item.get("name") for item in brief["namedAnchors"]})
         self.assertIn("Orion", {item.get("name") for item in brief["nearbyContextSignals"]})
         self.assertTrue(any("warning" in item and "not treat" in item["warning"].lower() for item in brief["nearbyContextSignals"]))
+        lore_bucket = next(item for item in brief["topicBuckets"] if item["topic"] == "Interface / lore language")
+        self.assertFalse(lore_bucket["mainReadEligible"])
+        self.assertIn(lore_bucket["ownershipBasis"], {"nearby_context", "generated_or_taxonomy", "unknown"})
+        self.assertTrue(any("Orion/interface/lore" in item["signal"] for item in brief["mainReadRoutingDiagnostics"]["excludedShapeSignals"]))
+
+    def test_topic_label_self_contamination_does_not_create_lore_read(self):
+        brief = self._subject_brief_for(
+            "Label Only",
+            sourceCounts={"conversations": 3},
+            topTopicDetails=[{"topic": "Interface / lore language", "count": 5, "summary": "Generated taxonomy label only."}],
+            representativeEvidence=[{"summary": "Label Only made a generic public chat reply about community scheduling.", "authorName": "Label Only", "sourceType": "Discord conversation", "visibility": "public_context"}],
+        )
+        self.assertNotIn("lore/interface", brief["subjectArchetypeRead"]["archetype"].lower())
+        self.assertNotIn("interface/lore-style", brief["bnlTake"].lower())
+        self.assertFalse(next(item for item in brief["topicBuckets"] if item["topic"] == "Interface / lore language")["mainReadEligible"])
+
+    def test_generic_channel_and_barcode_topic_do_not_create_interface_read(self):
+        brief = self._subject_brief_for(
+            "Channel Only",
+            sourceCounts={"conversations": 3},
+            topChannels=[{"channel": "#barcode-bot", "count": 3, "summary": "Generic BARCODE bot channel coverage."}],
+            topTopicDetails=[{"topic": "BARCODE bot topic labels", "count": 3}],
+            communitySignals=["Generic BARCODE topic label only."],
+        )
+        shape_text = " ".join([brief["subjectRead"], brief["bnlTake"], brief["subjectArchetypeRead"]["archetype"]]).lower()
+        self.assertNotIn("lore/interface", shape_text)
+        self.assertNotIn("interface-linked", shape_text)
+        self.assertFalse(brief["topicBuckets"][0]["mainReadEligible"])
 
     def test_evidence_ownership_crow_owned_orion_archive_ai_can_anchor(self):
         brief = self._subject_brief_for(
@@ -602,9 +636,11 @@ class SourceFileArchiveTests(unittest.TestCase):
         self.assertNotIn("Orion", {item.get("name") for item in brief["namedAnchors"]})
         self.assertNotIn("orion-linked", brief["bnlTake"].lower())
         self.assertNotIn("orion/archive-facing", brief["bnlTake"].lower())
+        self.assertIn("playful challenger", brief["bnlTake"].lower())
         self.assertTrue(any(item.get("name") == "Orion" for item in brief["nearbyContextSignals"]))
         diagnostics = brief["ownershipRoutingDiagnostics"]
         self.assertTrue(any(item.get("term") == "Orion" and item.get("routedAs") in {"co_mention", "shared_topic"} for item in diagnostics["overpromotedCandidatesBlocked"]))
+        self.assertTrue(any("Orion/interface/lore" in item["signal"] or item["signal"] == "Orion" for item in brief["mainReadRoutingDiagnostics"]["excludedShapeSignals"]))
 
     def test_evidence_ownership_shortybabe_bnl_challenger_signature(self):
         brief = self._subject_brief_for(
