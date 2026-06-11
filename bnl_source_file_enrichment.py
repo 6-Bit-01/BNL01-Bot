@@ -3711,122 +3711,408 @@ def _distinguishing_read(archetype: dict[str, Any]) -> str:
     return "Distinctive mainly by recurring community participation; current evidence does not support a narrower artist, lore, or submitter read."
 
 
-def _build_subject_read(subject: str, profile: dict[str, Any], topics: list[dict[str, Any]], channels: list[dict[str, Any]], archetype: dict[str, Any], behavioral_signature: dict[str, Any] | None = None) -> str:
-    eligible_topics = [bucket.get("topic", "") for bucket in topics if bucket.get("mainReadEligible") and bucket.get("topic")]
-    topic_names = ", ".join(eligible_topics[:4]) or "not enough main-read-eligible topic detail"
+def _digest_pattern_text(digest: dict[str, Any] | None) -> str:
+    if not isinstance(digest, dict):
+        return ""
+    parts: list[str] = []
+    topics = [item.get("topic") for item in digest.get("concreteTopics") or [] if isinstance(item, dict) and item.get("topic")]
+    phrases = [item.get("phrase") for item in digest.get("recurringPhrases") or [] if isinstance(item, dict) and item.get("phrase")]
+    behaviors = [item.get("behavior") for item in digest.get("distinctiveBehaviors") or [] if isinstance(item, dict) and item.get("behavior")]
+    challenges = [item.get("pattern") for item in digest.get("questionsOrChallenges") or [] if isinstance(item, dict) and item.get("pattern")]
+    moments = [item.get("moment") for item in digest.get("representativeMoments") or [] if isinstance(item, dict) and item.get("moment")]
+    if topics:
+        parts.append("concrete topics: " + ", ".join(topics[:4]))
+    if phrases:
+        parts.append("recurring phrases/terms: " + ", ".join(phrases[:3]))
+    if behaviors:
+        parts.append("behavior: " + ", ".join(behaviors[:3]))
+    if challenges:
+        parts.append("questions/challenges: " + ", ".join(challenges[:2]))
+    if moments:
+        parts.append("representative moment: " + moments[0])
+    return _case_text("; ".join(parts), 620)
+
+
+def _build_subject_read(subject: str, profile: dict[str, Any], topics: list[dict[str, Any]], channels: list[dict[str, Any]], archetype: dict[str, Any], behavioral_signature: dict[str, Any] | None = None, subject_owned_digest: dict[str, Any] | None = None) -> str:
     missing = "; ".join((archetype.get("notEnoughEvidenceFor") or [])[:2])
+    digest = subject_owned_digest or {}
+    quality = str(digest.get("evidenceQuality") or "insufficient")
+    if quality in {"thin", "insufficient"} and not (digest.get("concreteTopics") or digest.get("distinctiveBehaviors") or digest.get("representativeMoments")):
+        return _case_text(f"BNL has limited subject-owned evidence. The file needs concrete source notes before a stronger dossier read is possible. Do not invent topics from nearby context, topic labels, or generic channel names. BNL is not allowed to assume {missing or 'public identity, role, relationship meaning, or queue history'} yet.", 780)
+    pattern = _digest_pattern_text(digest) or "limited subject-owned detail"
     signature = behavioral_signature.get("signatureRead") if isinstance(behavioral_signature, dict) else ""
     signature_note = f" Subject-owned behavior note: {signature}" if signature else ""
-    return _case_text(f"BNL reads {subject} as {archetype.get('archetype')} ({archetype.get('confidence')} confidence) based on {profile.get('activityLevel', 'unknown activity')} evidence. What makes this file different is: {_distinguishing_read(archetype)} The main-read-eligible evidence pattern runs through {topic_names}; nearby/review-only topic labels and generic channel names are not allowed to create the type.{signature_note} BNL is not allowed to assume {missing or 'public identity, role, relationship meaning, or queue history'} yet.", 1100)
+    return _case_text(f"BNL reads {subject} as {archetype.get('archetype')} ({archetype.get('confidence')} confidence) from subject-owned evidence. The useful owned pattern is {pattern}.{signature_note} Nearby/review-only topic labels and generic channel names are not allowed to create the type. BNL is not allowed to assume {missing or 'public identity, role, relationship meaning, or queue history'} yet.", 1100)
 
 
-def _build_bnl_take(subject: str, memory: dict[str, Any], topics: list[dict[str, Any]], anchors: list[dict[str, Any]], archetype: dict[str, Any], behavioral_signature: dict[str, Any] | None = None, nearby_context: list[dict[str, Any]] | None = None) -> str:
+def _build_bnl_take(subject: str, memory: dict[str, Any], topics: list[dict[str, Any]], anchors: list[dict[str, Any]], archetype: dict[str, Any], behavioral_signature: dict[str, Any] | None = None, nearby_context: list[dict[str, Any]] | None = None, subject_owned_digest: dict[str, Any] | None = None) -> str:
     name = str(archetype.get("archetype") or "weak/unknown subject")
     missing = "; ".join((archetype.get("notEnoughEvidenceFor") or [])[:3])
-    signals = ", ".join((archetype.get("distinguishingSignals") or [])[:3])
-    sig = behavioral_signature or {}
-    sig_read = str(sig.get("signatureRead") or "")
-    bnl_stance = (sig.get("stanceTowardBNL") or {}).get("stance") if isinstance(sig.get("stanceTowardBNL"), dict) else ""
-    network_stance = (sig.get("stanceTowardNetwork") or {}).get("stance") if isinstance(sig.get("stanceTowardNetwork"), dict) else ""
-    unusual_subjects = [item.get("subject") for item in (sig.get("unusualRecurringSubjects") or []) if isinstance(item, dict)]
-    if "orion" in sig_read.lower() and ("archive" in sig_read.lower() or "ai" in sig_read.lower()):
-        text = f"BNL reads {subject} as an Orion/archive-facing subject when the owned evidence frames Orion as an AI, speaker, archive, or connected intelligence. This is review-only: relationship meaning and canon status still need explicit confirmation."
-    elif bnl_stance in {"antagonistic", "playful_challenger"}:
+    digest = subject_owned_digest or {}
+    digest_read = str(digest.get("digestRead") or "")
+    pattern = _digest_pattern_text(digest)
+    body = json.dumps(digest, sort_keys=True, default=str).lower() if digest else ""
+    quality = str(digest.get("evidenceQuality") or "insufficient")
+    if quality in {"thin", "insufficient"} and not pattern:
+        text = f"BNL does not have enough distinctive evidence to type {subject} yet. BNL has limited subject-owned evidence. The file needs concrete source notes before a stronger dossier read is possible."
+    elif "orion" in body and ("archive" in body or "ai" in body or "speaking" in body or "speaks" in body):
+        text = f"BNL reads {subject} as an Orion/archive-facing community subject. The useful owned pattern is that {subject} frames Orion as an AI, speaking presence, archive, or connected intelligence. This is useful for a lore/interface Source File, but public meaning remains review-only unless confirmed and it is not enough to claim artist or queue history."
+    elif any(term in body for term in ("bnl challenge", "playful challenger", "antagon", "pushback", "push back", "provocation")):
         text = f"BNL reads {subject} as a BNL-facing antagonist or playful challenger because subject-owned evidence shows repeated challenge, pushback, teasing, or provocation toward BNL. That distinguishes the file from generic community chatter, but tone and public wording need review."
-    elif unusual_subjects or network_stance in {"questioning", "skeptical"}:
-        text = f"BNL reads {subject} as a weird-topic community participant whose owned evidence includes unusual recurring subjects{(': ' + ', '.join(unusual_subjects[:3])) if unusual_subjects else ''} and Network skepticism/questioning when supported by the cited fragments. Nearby/shared context is not used for this subject's main read."
-    elif "BNL-facing lore/interface" in name:
-        text = f"BNL reads {subject} as a recurring BARCODE-side participant whose activity is unusually BNL-facing. The strongest pattern is not ordinary artist submission behavior; it is interface/lore-style interaction around {signals}. That makes {subject} more useful as a community/lore/interface subject than as a confirmed artist profile until queue history, public music ownership, and anchor meaning are confirmed."
-    elif "music-link" in name:
-        text = f"BNL reads {subject} as a music-link sharer: the useful signal is the presence of music platforms, tracks, songs, or link-sharing language. The packet should not turn those links into owned music, queue submissions, played tracks, or an artist profile unless connected queue data or public ownership evidence is added."
-    elif "artist / music submitter" in name:
-        text = f"BNL reads {subject} as an artist/music submitter candidate because music evidence and connected queue/submission status appear together. Admin should still verify which links are owned, which tracks were submitted or played, and what can be said publicly."
-    elif "collaborator" in name:
-        text = f"BNL reads {subject} as a collaboration/network-helper subject. The shape is less about standalone identity and more about WIP, finished-track, helper, or project-adjacent contexts; confirm owned work and public role before drafting."
-    elif "active community" in name:
-        text = f"BNL reads {subject} primarily as an active community participant. The evidence supports recurring conversation or support presence, not a confirmed artist, submitter, lore identity, or public relationship claim."
-    elif "weak/unknown" in name:
-        text = f"BNL does not have enough distinctive evidence to type {subject} beyond a weak Source File candidate. Add recurring activity, channel pattern, music/link details, relationship context, or queue/public-source confirmation before making a sharper read."
+    elif any(term in body for term in ("vibrating bed", "weird concrete", "unusual concrete", "network skepticism", "network motive", "network questioning")):
+        text = f"BNL reads {subject} as a weird-topic community participant whose owned evidence centers on unusual recurring subjects, weird concrete topics, and Network skepticism/questioning. This is useful for a personality/community-pattern dossier, not an artist profile unless music or queue evidence is later connected."
+    elif pattern:
+        text = f"BNL reads {subject} as {name}. The useful owned pattern is {pattern}. The packet still cannot support {missing or 'public identity, role, relationship meaning, or queue history'} without admin confirmation."
     else:
-        text = f"BNL reads {subject} as {name}. The useful pattern is {signals or 'the available subject evidence'}, but the packet still cannot support {missing or 'public identity, role, relationship meaning, or queue history'} without admin confirmation."
+        text = digest_read or f"BNL does not have enough distinctive evidence to type {subject} beyond a weak Source File candidate. Add recurring activity, concrete source notes, music/link details, relationship context, or queue/public-source confirmation before making a sharper read."
     return _case_text(text, 980)
 
 
-def _behavioral_signature_v1(subject: str, ownership: dict[str, Any]) -> dict[str, Any]:
-    owned_texts = _case_list([item.get("text") for item in ownership.get("owned", [])], limit=80, item_limit=260)
-    body = "\n".join(owned_texts).lower()
 
-    def matches(pattern: str) -> list[str]:
-        return [text for text in owned_texts if re.search(pattern, text, flags=re.I)][:4]
+_DIGEST_STOPWORDS = {
+    "about", "after", "again", "against", "also", "and", "around", "because", "before", "being", "between", "channel", "claim", "claims", "community", "context", "conversation", "current", "discord", "evidence", "file", "from", "generated", "internal", "label", "labels", "nearby", "owned", "packet", "public", "queue", "report", "review", "review-only", "safe", "source", "subject", "summary", "that", "the", "their", "there", "this", "through", "topic", "topics", "with", "without",
+}
+_DIGEST_TAXONOMY_PHRASES = {
+    "active community", "active community participant", "approved public context", "bnl facing behavior", "community context", "generic community chatter", "local context", "main read eligible", "nearby context", "nearby entities", "relationship context", "source file", "source file discussion", "shared context",
+}
+_DIGEST_CONCRETE_PATTERNS: list[tuple[str, str, str]] = [
+    ("vibrating beds", r"\bvibrating beds?\b", "Subject-owned evidence specifically mentions vibrating beds."),
+    ("weird concrete topics", r"\b(weird|strange|odd|unusual)\b.{0,60}\b(topic|object|physical|concrete|bed|device|room|mattress)s?\b|\b(vibrating|mattress|physical object|strange object|odd object)s?\b", "Subject-owned evidence centers on unusual concrete objects or physical subjects."),
+    ("Network motive questioning", r"\b(network|barcode network|barcode)\b.{0,80}\b(why|motive|motives|intent|intentions|trust|skeptic|question|doing|what are they|what is it)\b|\b(why|motive|motives|intent|trust|skeptic|question|doing)\b.{0,80}\b(network|barcode network|barcode)\b", "Subject-owned evidence questions Network/BARCODE motives or intent."),
+    ("Orion/archive/AI framing", r"\b(orion)\b.{0,90}\b(archive|ai|speaks?|speaking|interface|connected intelligence)\b|\b(archive|ai|speaks?|speaking|interface|connected intelligence)\b.{0,90}\b(orion)\b", "Subject-owned evidence frames Orion with archive, AI, speaking, or interface language."),
+    ("archive language", r"\b(archive|archival|interface|record|records)\b", "Subject-owned evidence repeats archive/interface language."),
+    ("Suno links", r"\b(suno\.com|suno)\b", "Subject-owned evidence includes Suno/platform link-sharing language."),
+    ("posts in WIPs/demos", r"\b(wip|wips|demo|demos|finished[- ]tracks?|track|song)\b", "Subject-owned evidence appears around WIP, demo, song, or finished-track language."),
+    ("BNL challenge/pushback language", r"\b(bnl|bnl-01)\b.{0,80}\b(challenge|push(?:es|ed)? back|teas(?:e|es|ed)?|antagoniz|provok|argu|call(?:s|ed)? out|rules?|boundary)\b|\b(challenge|push(?:es|ed)? back|teas(?:e|es|ed)?|antagoniz|provok|argu|call(?:s|ed)? out)\b.{0,80}\b(bnl|bnl-01)\b", "Subject-owned evidence shows BNL-facing challenge, teasing, or pushback."),
+]
+_DIGEST_LINK_RE = re.compile(r"\b(?:https?://)?(?:www\.)?([a-z0-9.-]+\.[a-z]{2,})(?:/\S*)?", re.I)
 
-    recurring: list[dict[str, Any]] = []
-    unusual: list[dict[str, Any]] = []
 
-    def add_behavior(label: str, evidence: list[str], note: str) -> None:
+def _digest_owned_items(ownership: dict[str, Any]) -> list[dict[str, Any]]:
+    if not isinstance(ownership, dict):
+        return []
+    by_ownership = ownership.get("byOwnership") if isinstance(ownership.get("byOwnership"), dict) else {}
+    items: list[dict[str, Any]] = []
+    for scope in _MAIN_READ_ELIGIBLE_SCOPES:
+        for item in by_ownership.get(scope) or []:
+            if isinstance(item, dict) and _ownership_item_scope(item) in _MAIN_READ_ELIGIBLE_SCOPES:
+                items.append(item)
+    for item in ownership.get("owned") or []:
+        if isinstance(item, dict) and _ownership_item_scope(item) in _MAIN_READ_ELIGIBLE_SCOPES:
+            items.append(item)
+    seen: set[str] = set()
+    out: list[dict[str, Any]] = []
+    for item in items:
+        text = _case_text(item.get("text"), 360)
+        key = text.lower()
+        if text and key not in seen:
+            out.append(item)
+            seen.add(key)
+    return out
+
+
+def _digest_texts(items: list[dict[str, Any]]) -> list[str]:
+    return _case_list([item.get("text") for item in items], limit=120, item_limit=300)
+
+
+def _digest_strength(count: int) -> str:
+    return "strong" if count >= 3 else ("moderate" if count >= 2 else "weak")
+
+
+def _digest_examples(evidence: list[str], limit: int = 3) -> list[str]:
+    return _case_list(evidence, limit=limit, item_limit=180)
+
+
+def _extract_concrete_digest_topics(texts: list[str]) -> list[dict[str, Any]]:
+    topics: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for topic, pattern, note in _DIGEST_CONCRETE_PATTERNS:
+        evidence = [text for text in texts if re.search(pattern, text, flags=re.I)]
         if not evidence:
-            return
-        recurring.append({
-            "behavior": label,
-            "strength": "strong" if len(evidence) >= 3 else ("moderate" if len(evidence) >= 2 else "weak"),
-            "evidenceCount": len(evidence),
-            "exampleSignals": evidence[:3],
-            "note": note,
-        })
+            continue
+        key = topic.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        topics.append({"topic": topic, "strength": _digest_strength(len(evidence)), "evidenceCount": len(evidence), "exampleSignals": _digest_examples(evidence), "note": note})
+    # Add a few concrete noun-ish phrases from evidence when they are not generic labels.
+    candidates: Counter[str] = Counter()
+    examples: dict[str, list[str]] = {}
+    for text in texts:
+        cleaned = re.sub(r"https?://\S+", " ", text.lower())
+        for match in re.finditer(r"\b(?:weird|strange|odd|unusual|vibrating|archive|network|orion|suno|wip|demo|challenge|pushback|teasing)[a-z0-9' -]{0,42}\b", cleaned):
+            phrase = re.sub(r"[^a-z0-9' -]+", " ", match.group(0)).strip(" -")
+            words = [w for w in phrase.split() if w and w not in _DIGEST_STOPWORDS]
+            if not (1 <= len(words) <= 6):
+                continue
+            phrase = " ".join(words)
+            if phrase in _DIGEST_TAXONOMY_PHRASES or len(phrase) < 4:
+                continue
+            candidates[phrase] += 1
+            examples.setdefault(phrase, []).append(text)
+    for phrase, count in candidates.most_common(4):
+        if len(topics) >= 8:
+            break
+        if phrase.lower() in seen or any(phrase in str(t.get("topic", "")).lower() for t in topics):
+            continue
+        topics.append({"topic": phrase, "strength": _digest_strength(count), "evidenceCount": count, "exampleSignals": _digest_examples(examples.get(phrase, [])), "note": "Concrete detail extracted from subject-owned evidence, not from generated topic labels."})
+    return topics[:8]
 
-    add_behavior("BNL challenge / pushback", matches(r"\b(antagoniz|challenge|push(?:es|ed)? back|teas(?:e|es|ed)|provok|argu(?:e|es|ed)|calls? out|tests? bnl)\b"), "Subject-owned evidence shows repeated BNL-facing challenge/pushback; keep tone review-only.")
-    add_behavior("Orion/archive/AI framing", matches(r"\b(orion|archive|my ai|his ai|her ai|speaks? (?:for|through)|ai[- ]proxy|interface)\b"), "Subject-owned evidence uses Orion/archive/AI or interface language; relationship meaning remains review-only unless explicitly confirmed.")
-    add_behavior("Network motive questioning", matches(r"\b(network|barcode network|barcode)\b.*\b(why|motive|intent|trust|skeptic|question|what does|what are they)\b|\b(question|skeptic|doubt|trust)\w*\b.*\b(network|barcode network)\b"), "Subject-owned evidence questions Network/BARCODE motives or intent.")
 
-    concrete_patterns = [
-        ("vibrating beds", r"\bvibrating beds?\b"),
-        ("unusual physical/object/environment references", r"\b(vibrating|bed|mattress|object|physical|weird concrete|environment|room|device)\b"),
+def _extract_recurring_phrases(texts: list[str]) -> list[dict[str, Any]]:
+    counts: Counter[str] = Counter()
+    examples: dict[str, list[str]] = {}
+    for text in texts:
+        lowered = re.sub(r"https?://\S+", " ", text.lower())
+        lowered = re.sub(r"\b\d{5,}\b|[\w.+-]+@[\w.-]+", " ", lowered)
+        tokens = [tok.strip("' -") for tok in re.findall(r"[a-z][a-z0-9'-]*", lowered)]
+        tokens = [tok for tok in tokens if len(tok) > 1 and tok not in _DIGEST_STOPWORDS]
+        seen_in_text: set[str] = set()
+        for n in range(2, 7):
+            for i in range(0, max(0, len(tokens) - n + 1)):
+                phrase = " ".join(tokens[i:i+n]).strip()
+                if not phrase or phrase in seen_in_text or phrase in _DIGEST_TAXONOMY_PHRASES:
+                    continue
+                if any(word in _DIGEST_STOPWORDS for word in phrase.split()[:1] + phrase.split()[-1:]):
+                    continue
+                if re.search(r"\b(?:source|file|report|review|evidence|context|subject|community)\b", phrase):
+                    continue
+                # Prefer phrases with a distinctive anchor/term, or phrases repeated across evidence.
+                distinctive = re.search(r"\b(orion|archive|ai|vibrating|beds?|network|suno|bnl|challenge|pushback|speaks?|weird|strange|motives?)\b", phrase)
+                if not distinctive and n < 3:
+                    continue
+                seen_in_text.add(phrase)
+                counts[phrase] += 1
+                examples.setdefault(phrase, []).append(text)
+    rows: list[dict[str, Any]] = []
+    for phrase, count in counts.most_common(20):
+        distinctive = re.search(r"\b(orion|archive|ai|vibrating|beds?|network|suno|bnl|challenge|pushback|speaks?|weird|strange|motives?)\b", phrase)
+        if count < 2 and not distinctive:
+            continue
+        rows.append({"phrase": _case_text(phrase, 80), "evidenceCount": count, "exampleSignals": _digest_examples(examples.get(phrase, []), 2), "note": "Repeated or distinctive phrase sampled only from subject-owned evidence."})
+        if len(rows) >= 8:
+            break
+    return rows
+
+
+def _extract_digest_behaviors(texts: list[str], concrete_topics: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    patterns = [
+        ("BNL challenge / playful antagonism", r"\b(challenge|push(?:es|ed)? back|teas(?:e|es|ed)?|antagoniz|provok|argu|call(?:s|ed)? out|tests? bnl)\b", "Owned evidence shows challenge, teasing, provocation, or pushback toward BNL."),
+        ("Orion/archive speaking or AI framing", r"\b(orion|archive|ai|speaks? (?:for|through)|speaking through|connected intelligence|interface)\b", "Owned evidence frames Orion/archive/interface as an AI or speaking presence."),
+        ("unusual concrete subject recurrence", r"\b(vibrating beds?|weird|strange|odd|unusual|physical|object|mattress|device)\b", "Owned evidence repeatedly centers concrete or strange physical subjects."),
+        ("music/platform link sharing", r"\b(suno|spotify|soundcloud|youtube|track|song|demo|wip|finished[- ]tracks?)\b", "Owned evidence includes music/platform/link-sharing language; ownership still needs confirmation."),
     ]
-    for label, pattern in concrete_patterns:
-        ev = matches(pattern)
-        if ev:
-            unusual.append({"subject": label, "evidenceCount": len(ev), "exampleSignals": ev[:3], "note": "Unusual concrete recurring subject appears in subject-owned evidence."})
+    rows: list[dict[str, Any]] = []
+    for behavior, pattern, note in patterns:
+        evidence = [text for text in texts if re.search(pattern, text, flags=re.I)]
+        if evidence:
+            rows.append({"behavior": behavior, "strength": _digest_strength(len(evidence)), "exampleSignals": _digest_examples(evidence), "note": note})
+    if not rows and concrete_topics:
+        rows.append({"behavior": "concrete subject recurrence", "strength": concrete_topics[0].get("strength", "weak"), "exampleSignals": concrete_topics[0].get("exampleSignals", []), "note": "Behavior inferred from repeated subject-owned concrete topics."})
+    return rows[:8]
 
-    bnl_ev = matches(r"\b(bnl|bnl-01)\b")
-    challenger_ev = matches(r"\b(antagoniz|challenge|push(?:es|ed)? back|teas(?:e|es|ed)|provok|argu(?:e|es|ed)|calls? out)\b")
-    supportive_ev = matches(r"\b(support|thanks|help(?:s|ed)?|appreciat|boost)\b.*\b(bnl|bnl-01)\b")
-    if challenger_ev:
-        bnl_stance = "playful_challenger" if matches(r"\b(teas(?:e|es|ed)|playful|joke|provok)\b") else "antagonistic"
-        bnl_conf = "strong" if len(challenger_ev) >= 3 else "moderate"
-        bnl_note = "Subject-owned evidence shows direct challenge, antagonism, teasing, or pushback toward BNL."
-        bnl_evidence = challenger_ev
-    elif supportive_ev:
-        bnl_stance, bnl_conf, bnl_note, bnl_evidence = "supportive", "moderate", "Subject-owned evidence has supportive BNL-facing language.", supportive_ev
-    elif bnl_ev:
-        bnl_stance, bnl_conf, bnl_note, bnl_evidence = "BNL-facing", "moderate", "Subject-owned evidence addresses or references BNL.", bnl_ev
+
+def _extract_questions_or_challenges(texts: list[str]) -> list[dict[str, Any]]:
+    specs = [
+        ("Network", r"\b(network|barcode network|barcode)\b.{0,90}\b(why|motive|motives|intent|trust|skeptic|question|doing|what are they)\b|\b(why|motive|motives|intent|trust|skeptic|question|doing)\b.{0,90}\b(network|barcode network|barcode)\b", "Network skepticism/questioning"),
+        ("BNL", r"\b(bnl|bnl-01)\b.{0,90}\b(challenge|push(?:es|ed)? back|teas(?:e|es|ed)?|antagoniz|provok|argu|call(?:s|ed)? out|rules?|boundary)\b|\b(challenge|push(?:es|ed)? back|teas(?:e|es|ed)?|antagoniz|provok|argu|call(?:s|ed)? out)\b.{0,90}\b(bnl|bnl-01)\b", "BNL-facing challenge/pushback"),
+        ("community", r"\b(why|question|challenge|push(?:es|ed)? back|argu|call(?:s|ed)? out)\b.{0,90}\b(community|chat|people|everyone)\b", "community-facing questioning/challenge"),
+    ]
+    rows: list[dict[str, Any]] = []
+    for target, pattern, label in specs:
+        evidence = [text for text in texts if re.search(pattern, text, flags=re.I)]
+        if evidence:
+            rows.append({"target": target, "pattern": label, "exampleSignals": _digest_examples(evidence), "note": "Question/challenge pattern appears in subject-owned evidence."})
+    return rows[:6]
+
+
+def _extract_links_or_platforms(texts: list[str]) -> list[dict[str, Any]]:
+    counts: Counter[str] = Counter()
+    examples: dict[str, list[str]] = {}
+    platform_terms = ("suno", "spotify", "soundcloud", "youtube", "bandcamp", "discord")
+    for text in texts:
+        lowered = text.lower()
+        found: set[str] = set()
+        for match in _DIGEST_LINK_RE.finditer(lowered):
+            domain = match.group(1).lower().strip(".")
+            found.add(domain)
+        for term in platform_terms:
+            if re.search(rf"\b{re.escape(term)}\b", lowered):
+                found.add(term)
+        for key in found:
+            counts[key] += 1
+            examples.setdefault(key, []).append(text)
+    return [{"platformOrDomain": _case_text(key, 90), "evidenceCount": count, "exampleSignals": _digest_examples(examples.get(key, []), 2), "ownershipStatus": "owned", "note": "Platform/link language appears in subject-owned evidence; confirm whether the linked work is owned before public claims."} for key, count in counts.most_common(8)]
+
+
+def _representative_digest_moments(subject: str, texts: list[str], concrete_topics: list[dict[str, Any]], behaviors: list[dict[str, Any]], questions: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    body = "\n".join(texts).lower()
+    rows: list[dict[str, Any]] = []
+    if "orion" in body and ("archive" in body or "ai" in body or "speak" in body):
+        rows.append({"moment": f"{subject} repeatedly frames Orion with archive, AI, speaking, or interface language.", "whyItMatters": "This gives admins a concrete lore/interface angle while keeping public meaning review-only."})
+    if "vibrating" in body or ("network" in body and re.search(r"motive|why|skeptic|question|doing", body)):
+        rows.append({"moment": f"{subject} brings up unusual concrete subjects and questions what the Network is doing.", "whyItMatters": "This supports a personality/community-pattern dossier angle rather than a generic activity label."})
+    if any("challenge" in str(item.get("behavior", "")).lower() or "antagon" in str(item.get("behavior", "")).lower() for item in behaviors):
+        rows.append({"moment": f"{subject} repeatedly pushes back at BNL in a challenger or antagonistic tone.", "whyItMatters": "This distinguishes the subject from generic community chatter."})
+    for topic in concrete_topics[:3]:
+        if len(rows) >= 6:
+            break
+        rows.append({"moment": f"{subject} has owned evidence around {topic.get('topic')}.", "whyItMatters": _case_text(topic.get("note") or "Concrete subject-owned detail helps admins draft a stronger Source File.", 180)})
+    if not rows and texts:
+        rows.append({"moment": f"{subject} has limited subject-owned evidence, but it does not yet form a concrete recurring pattern.", "whyItMatters": "Admin should add concrete source notes before drafting a stronger dossier."})
+    return rows[:6]
+
+
+def _digest_quality(texts: list[str], concrete_topics: list[dict[str, Any]], phrases: list[dict[str, Any]], behaviors: list[dict[str, Any]], questions: list[dict[str, Any]]) -> str:
+    if not texts:
+        return "insufficient"
+    signal_score = len(concrete_topics) + len(phrases) + len(behaviors) + len(questions)
+    if len(texts) >= 5 and signal_score >= 4:
+        return "strong"
+    if len(texts) >= 2 and signal_score >= 2:
+        return "moderate"
+    return "thin"
+
+
+def _digest_dossier_usefulness(subject: str, quality: str, concrete_topics: list[dict[str, Any]], behaviors: list[dict[str, Any]], questions: list[dict[str, Any]], links: list[dict[str, Any]]) -> dict[str, Any]:
+    body = json.dumps({"topics": concrete_topics, "behaviors": behaviors, "questions": questions, "links": links}, sort_keys=True, default=str).lower()
+    useful: list[str] = []
+    not_enough = ["public identity, alias certainty, or relationship meaning", "queue submissions, played tracks, payment, or Priority status"]
+    next_questions = ["Which subject-owned examples are public-safe enough to quote or paraphrase?", "Is the subject an artist, community participant, lore/interface figure, challenger, collaborator, or something else?"]
+    if quality in {"thin", "insufficient"}:
+        likely = "Not enough for a strong dossier yet. Add concrete subject-owned source notes first."
+        useful.append("Evidence triage / source-note collection")
+    elif "orion" in body and ("archive" in body or "ai" in body):
+        likely = "Lore/interface Source File candidate with review-only public meaning."
+        useful.extend(["Orion/archive/interface framing", "community-lore behavior read"])
+        next_questions.append("What does the Orion/archive language mean, and is any of it safe to say publicly?")
+    elif "vibrating" in body or "weird concrete" in body or "network skepticism" in body:
+        likely = "Personality/community-pattern dossier candidate."
+        useful.extend(["weird concrete topics", "Network skepticism/questioning"])
+        next_questions.append("Are the unusual topics one-off jokes or repeated subject-defining patterns?")
+    elif "challenge" in body or "antagon" in body or "pushback" in body:
+        likely = "BNL-facing challenger/community dynamics dossier candidate."
+        useful.extend(["BNL challenge/pushback tone", "how the subject tests BNL boundaries"])
+        next_questions.append("Is the challenger tone playful, adversarial, or context-dependent?")
+    elif links:
+        likely = "Music/link-sharing review candidate; ownership must be confirmed."
+        useful.extend(["shared platforms/links", "possible music/community angle"])
+        next_questions.append("Are the shared links owned work, references, or other people's tracks?")
+    else:
+        likely = "Limited community-pattern Source File candidate."
+        useful.append("subject-owned evidence triage")
+    return {"likelyUse": _case_text(likely, 220), "usefulAngles": _case_list(useful, limit=6, item_limit=120), "notEnoughFor": _case_list(not_enough, limit=6, item_limit=180), "nextQuestions": _case_list(next_questions, limit=6, item_limit=180)}
+
+
+def build_subject_owned_evidence_digest_v1(subject: str, ownership: dict[str, Any], profile: dict[str, Any], channels: list[dict[str, Any]]) -> dict[str, Any]:
+    items = _digest_owned_items(ownership)
+    texts = _digest_texts(items)
+    concrete_topics = _extract_concrete_digest_topics(texts)
+    phrases = _extract_recurring_phrases(texts)
+    behaviors = _extract_digest_behaviors(texts, concrete_topics)
+    questions = _extract_questions_or_challenges(texts)
+    links = _extract_links_or_platforms(texts)
+    moments = _representative_digest_moments(subject, texts, concrete_topics, behaviors, questions)
+    quality = _digest_quality(texts, concrete_topics, phrases, behaviors, questions)
+    summary = ownership.get("summary", {}) if isinstance(ownership, dict) else {}
+    top_channels = []
+    for channel in channels[:6]:
+        if not isinstance(channel, dict):
+            continue
+        name = _safe_channel_name(channel.get("channelName") or channel.get("channel") or "unknown channel", str(channel.get("note") or ""))
+        count = _as_int(channel.get("count"))
+        top_channels.append({"channelName": name, **({"count": count} if count is not None else {}), "note": _case_text(channel.get("note") or "Observed as a channel/source lane for subject evidence; verify before public use.", 180)})
+    if quality in {"thin", "insufficient"} and not (concrete_topics or behaviors or moments):
+        digest_read = "BNL has limited subject-owned evidence. The file needs concrete source notes before a stronger dossier read is possible."
+    else:
+        digest_read = _case_text(f"Subject-owned digest for {subject}: {_digest_pattern_text({'concreteTopics': concrete_topics, 'recurringPhrases': phrases, 'distinctiveBehaviors': behaviors, 'questionsOrChallenges': questions, 'representativeMoments': moments}) or 'limited concrete subject-owned detail'}.", 620)
+    return {
+        "digestRead": digest_read,
+        "evidenceQuality": quality,
+        "ownedMessageCount": _as_int(summary.get("ownedEvidenceCount")) or len(texts),
+        "directAddressCount": _as_int(summary.get("directAddressEvidenceCount")) or 0,
+        "explicitRelationshipCount": _as_int(summary.get("explicitRelationshipEvidenceCount")) or 0,
+        **({"latestObservedAt": profile.get("latestObservedAt")} if profile.get("latestObservedAt") else {}),
+        "topChannels": top_channels,
+        "concreteTopics": concrete_topics,
+        "recurringPhrases": phrases,
+        "distinctiveBehaviors": behaviors,
+        "questionsOrChallenges": questions,
+        "sharedLinksOrPlatforms": links,
+        "representativeMoments": moments,
+        "dossierUsefulness": _digest_dossier_usefulness(subject, quality, concrete_topics, behaviors, questions, links),
+    }
+
+def _behavioral_signature_v1(subject: str, ownership: dict[str, Any], digest: dict[str, Any] | None = None) -> dict[str, Any]:
+    digest = digest or {}
+    owned_texts = _digest_texts(_digest_owned_items(ownership))
+    body = json.dumps(digest, sort_keys=True, default=str).lower() if digest else "\n".join(owned_texts).lower()
+
+    recurring_rows: list[dict[str, Any]] = []
+    for item in digest.get("distinctiveBehaviors") or []:
+        if isinstance(item, dict):
+            recurring_rows.append({
+                "behavior": _case_text(item.get("behavior"), 120),
+                "strength": item.get("strength") if item.get("strength") in {"strong", "moderate", "weak"} else "weak",
+                **({"evidenceCount": item.get("evidenceCount")} if item.get("evidenceCount") is not None else {}),
+                "exampleSignals": _case_list(item.get("exampleSignals"), limit=3, item_limit=180),
+                "note": _case_text(item.get("note") or "Behavior is derived from the subject-owned evidence digest.", 180),
+            })
+    for phrase in digest.get("recurringPhrases") or []:
+        if isinstance(phrase, dict) and len(recurring_rows) < 6:
+            recurring_rows.append({
+                "behavior": f"recurs around phrase: {_case_text(phrase.get('phrase'), 80)}",
+                "strength": "moderate" if (_as_int(phrase.get("evidenceCount")) or 0) >= 2 else "weak",
+                "evidenceCount": _as_int(phrase.get("evidenceCount")) or 1,
+                "exampleSignals": _case_list(phrase.get("exampleSignals"), limit=2, item_limit=180),
+                "note": "Phrase recurrence comes from subject-owned evidence, not generated labels.",
+            })
+
+    unusual = []
+    for item in digest.get("concreteTopics") or []:
+        if not isinstance(item, dict):
+            continue
+        topic = str(item.get("topic") or "")
+        if re.search(r"\b(vibrating|weird|strange|odd|unusual|concrete|physical|object|bed|mattress|device)\b", topic, flags=re.I):
+            unusual.append({"subject": _case_text(topic, 120), "evidenceCount": item.get("evidenceCount"), "exampleSignals": _case_list(item.get("exampleSignals"), limit=3, item_limit=180), "note": _case_text(item.get("note") or "Unusual concrete subject appears in subject-owned evidence.", 180)})
+
+    bnl_question = next((item for item in digest.get("questionsOrChallenges") or [] if isinstance(item, dict) and item.get("target") == "BNL"), None)
+    bnl_behavior = next((item for item in digest.get("distinctiveBehaviors") or [] if isinstance(item, dict) and re.search(r"bnl|challenge|antagon|pushback|push back", str(item.get("behavior") or ""), flags=re.I)), None)
+    if bnl_question or bnl_behavior:
+        ev = _case_list((bnl_question or bnl_behavior or {}).get("exampleSignals"), limit=4, item_limit=180)
+        behavior_text = json.dumps(bnl_question or bnl_behavior, default=str).lower()
+        bnl_stance = "playful_challenger" if re.search(r"teas|playful|joke|provok", behavior_text) else "antagonistic"
+        bnl_conf = (bnl_behavior or {}).get("strength") if isinstance(bnl_behavior, dict) else "moderate"
+        bnl_note = "Subject-owned digest shows direct challenge, antagonism, teasing, or pushback toward BNL."
+        bnl_evidence = ev
+    elif re.search(r"\bbnl(?:-01)?\b", body):
+        bnl_stance, bnl_conf, bnl_note, bnl_evidence = "BNL-facing", "moderate", "Subject-owned digest references BNL without a clear challenge/support stance.", []
     else:
         bnl_stance, bnl_conf, bnl_note, bnl_evidence = "unknown", "weak", "No subject-owned BNL stance is clear.", []
 
-    network_question_ev = matches(r"\b(network|barcode network|barcode)\b.*\b(why|motive|intent|trust|skeptic|question|what does|what are they)\b|\b(question|skeptic|doubt|trust)\w*\b.*\b(network|barcode network)\b")
-    network_lore_ev = matches(r"\b(network|barcode|edge|lardcode)\b")
-    if network_question_ev:
-        stance = "skeptical" if matches(r"\b(skeptic|doubt|trust)\w*\b") else "questioning"
-        network = {"stance": stance, "confidence": "strong" if len(network_question_ev) >= 3 else "moderate", "evidence": network_question_ev, "note": "Subject-owned evidence questions Network/BARCODE motives or intent."}
-    elif network_lore_ev:
-        network = {"stance": "lore-engaged", "confidence": "moderate", "evidence": network_lore_ev[:3], "note": "Subject-owned evidence engages Network/BARCODE lore without a clear trust/skepticism stance."}
+    net_question = next((item for item in digest.get("questionsOrChallenges") or [] if isinstance(item, dict) and item.get("target") == "Network"), None)
+    if net_question:
+        ev = _case_list(net_question.get("exampleSignals"), limit=4, item_limit=180)
+        stance = "skeptical" if re.search(r"skeptic|doubt|trust|motive", json.dumps(net_question, default=str), flags=re.I) else "questioning"
+        network = {"stance": stance, "confidence": "strong" if len(ev) >= 3 else "moderate", "evidence": ev, "note": "Subject-owned digest questions Network/BARCODE motives or intent."}
+    elif re.search(r"\b(network|barcode|edge|lardcode)\b", body):
+        network = {"stance": "lore-engaged", "confidence": "moderate", "evidence": [], "note": "Subject-owned digest engages Network/BARCODE language without a clear trust/skepticism stance."}
     else:
         network = {"stance": "unknown", "confidence": "weak", "evidence": [], "note": "No subject-owned Network stance is clear."}
 
-    if not recurring and unusual:
-        add_behavior("unusual concrete topic recurrence", [sig for item in unusual for sig in item.get("exampleSignals", [])], "Subject-owned evidence includes unusual concrete recurring topics.")
-    if not recurring:
-        add_behavior("general subject-owned participation", owned_texts[:2], "Subject-owned evidence exists but does not yet form a sharper behavioral pattern.")
-
     if "orion" in body and ("archive" in body or "ai" in body):
-        read = f"BNL reads {subject}'s owned evidence as Orion/archive/AI-facing; relationship meaning remains review-only unless confirmed."
-    elif challenger_ev:
-        read = f"BNL reads {subject}'s owned evidence as BNL-facing challenge or playful antagonism rather than generic community chatter."
-    elif unusual or network_question_ev:
-        read = f"BNL reads {subject}'s owned evidence as unusual concrete-topic participation with Network skepticism/questioning when supported by the cited fragments."
+        read = f"BNL reads {subject}'s owned evidence digest as Orion/archive/AI-facing; relationship meaning remains review-only unless confirmed."
+    elif bnl_stance in {"antagonistic", "playful_challenger"}:
+        read = f"BNL reads {subject}'s owned evidence digest as BNL-facing challenge or playful antagonism rather than generic community chatter."
+    elif unusual or network.get("stance") in {"questioning", "skeptical"}:
+        read = f"BNL reads {subject}'s owned evidence digest as unusual concrete-topic participation with Network skepticism/questioning when supported by the cited fragments."
     elif owned_texts:
         read = f"BNL has subject-owned evidence for {subject}, but the behavioral signature is still limited and review-only."
     else:
         read = f"BNL does not have enough subject-owned evidence to form a behavioral signature for {subject}."
-    return {"signatureRead": _case_text(read, 420), "recurringBehaviors": recurring[:6], "stanceTowardBNL": {"stance": bnl_stance, "confidence": bnl_conf, "evidence": bnl_evidence[:4], "note": bnl_note}, "stanceTowardNetwork": network, "unusualRecurringSubjects": unusual[:6]}
+    if not recurring_rows and owned_texts:
+        recurring_rows.append({"behavior": "general subject-owned participation", "strength": "weak", "evidenceCount": len(owned_texts), "exampleSignals": owned_texts[:2], "note": "Subject-owned evidence exists but does not yet form a sharper behavioral pattern."})
+    return {"signatureRead": _case_text(read, 420), "recurringBehaviors": recurring_rows[:6], "stanceTowardBNL": {"stance": bnl_stance, "confidence": bnl_conf or "weak", "evidence": bnl_evidence[:4], "note": bnl_note}, "stanceTowardNetwork": network, "unusualRecurringSubjects": unusual[:6]}
 
 
 
@@ -3864,6 +4150,8 @@ def _visible_disallowed_entity_terms(brief_or_context: dict[str, Any]) -> set[st
     def add(value: Any) -> None:
         text = _case_text(value, 160).strip(".,;:()[]{}<>\"'")
         if not text:
+            return
+        if text.lower() in {"bnl", "bnl-01", "when", "treat", "owned", "possible", "priority", "queue"}:
             return
         parts = [text]
         if "/" in text:
@@ -3924,6 +4212,7 @@ _VISIBLE_PRIMARY_COPY_FIELDS = {
     "relationshipSignals",
     "confidenceRead",
     "queueSubmissionRead",
+    "subjectOwnedEvidenceDigestV1",
 }
 
 
@@ -4046,7 +4335,8 @@ def build_subject_intelligence_brief_v1(memory: dict[str, Any]) -> dict[str, Any
     channels = _channel_breakdown(memory)
     topics = _topic_buckets(memory, ownership)
     anchors, ignored_noise, nearby_context = _named_anchor_extraction(memory, ownership)
-    behavioral_signature = _behavioral_signature_v1(subject, ownership)
+    subject_owned_digest = build_subject_owned_evidence_digest_v1(subject, ownership, profile, channels)
+    behavioral_signature = _behavioral_signature_v1(subject, ownership, subject_owned_digest)
     archetype = _subject_archetype_read(subject, memory, profile, topics, anchors, channels, ownership)
     distinguishing = _distinguishing_read(archetype)
     music = _signals_from(memory, ("musicSignals", "bestEvidenceToReview", "representativeEvidence"), "No specific music/link signal is confirmed in the current packet; do not infer submissions or ownership.")
@@ -4058,8 +4348,8 @@ def build_subject_intelligence_brief_v1(memory: dict[str, Any]) -> dict[str, Any
     confidence = _case_text(f"Archetype confidence is {archetype.get('confidence')} for the internal shape read. Safety remains strict: identity, public role, relationship meaning, queue/submission claims, payment/Priority status, and public-safe anchor meaning stay unconfirmed until admin review connects source links. This brief is admin-facing and review-only.", 520)
     gaps = _source_file_gaps(memory, anchors)
     brief = {
-        "subjectRead": _build_subject_read(subject, profile, topics, channels, archetype, behavioral_signature),
-        "bnlTake": _build_bnl_take(subject, memory, topics, anchors, archetype, behavioral_signature, nearby_context),
+        "subjectRead": _build_subject_read(subject, profile, topics, channels, archetype, behavioral_signature, subject_owned_digest),
+        "bnlTake": _build_bnl_take(subject, memory, topics, anchors, archetype, behavioral_signature, nearby_context, subject_owned_digest),
         "subjectArchetypeRead": archetype,
         "distinguishingRead": distinguishing,
         "activityProfile": profile,
@@ -4071,6 +4361,7 @@ def build_subject_intelligence_brief_v1(memory: dict[str, Any]) -> dict[str, Any
         "ownershipRoutingDiagnostics": _brief_ownership_routing_diagnostics(ownership, nearby_context),
         "mainReadRoutingDiagnostics": _main_read_routing_diagnostics(ownership, topics, nearby_context),
         "behavioralSignatureV1": behavioral_signature,
+        "subjectOwnedEvidenceDigestV1": subject_owned_digest,
         "ignoredExtractionNoise": ignored_noise,
         "interactionPatterns": _signals_from(memory, ("bnlInteractionSignals", "communitySignals", "conversationThemes"), "No specific interaction pattern is exposed beyond the representative evidence."),
         "musicAndLinkSignals": music,

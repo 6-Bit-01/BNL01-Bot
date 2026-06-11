@@ -430,6 +430,7 @@ class SourceFileArchiveTests(unittest.TestCase):
             "distinguishingRead": brief.get("distinguishingRead"),
             "topicBucketExplanations": [item.get("explanation") for item in brief.get("topicBuckets", []) if isinstance(item, dict)],
             "behavioralSignatureV1": brief.get("behavioralSignatureV1"),
+            "subjectOwnedEvidenceDigestV1": brief.get("subjectOwnedEvidenceDigestV1"),
             "namedAnchors": brief.get("namedAnchors"),
             "interactionPatterns": brief.get("interactionPatterns"),
             "musicLinkSignals": brief.get("musicLinkSignals") or brief.get("musicAndLinkSignals"),
@@ -753,3 +754,90 @@ class SourceFileArchiveTests(unittest.TestCase):
         self.assertNotIn("Internal", anchors)
         noise_terms = {item.get("term") for item in brief["ignoredExtractionNoise"]}
         self.assertTrue({"internal", "source file", "relationship"} & noise_terms)
+
+
+    def test_subject_owned_digest_antigrain_concrete_topics_and_network_questions(self):
+        brief = self._subject_brief_for(
+            "Antigrain",
+            sourceCounts={"conversations": 8},
+            topChannels=[{"channel": "#general", "count": 5, "summary": "Antigrain asks odd concrete questions and talks about the Network."}],
+            topTopicDetails=[{"topic": "generated community label", "count": 9}],
+            usefulEvidence=[
+                {"summary": "Antigrain asks why the BARCODE Network wants vibrating beds in the room.", "authorName": "Antigrain", "sourceType": "Discord conversation", "visibility": "public_context"},
+                {"summary": "Antigrain questions the Network's motives and intent around weird physical objects.", "authorName": "Antigrain", "sourceType": "Discord conversation", "visibility": "public_context"},
+                {"summary": "Antigrain returns to vibrating beds as a strange concrete subject.", "authorName": "Antigrain", "sourceType": "Discord conversation", "visibility": "public_context"},
+            ],
+            relationshipSignals=["Orion appears near Antigrain in broader community context; meaning unconfirmed."],
+        )
+        digest = brief["subjectOwnedEvidenceDigestV1"]
+        digest_body = json.dumps(digest, sort_keys=True).lower()
+        self.assertIn(digest["evidenceQuality"], {"strong", "moderate"})
+        self.assertIn("vibrating", digest_body)
+        self.assertTrue(any(item.get("target") == "Network" for item in digest["questionsOrChallenges"]))
+        self.assertIn("weird concrete", brief["bnlTake"].lower())
+        self.assertIn("network skepticism", brief["bnlTake"].lower())
+        self.assertVisiblePrimaryCopyExcludes(brief, "Orion")
+        self.assertNotIn("nearby entities reads", self._visible_primary_copy_text(brief).lower())
+
+    def test_subject_owned_digest_crow_orion_archive_ai_representative_moments(self):
+        brief = self._subject_brief_for(
+            "Crow",
+            sourceCounts={"conversations": 7},
+            topChannels=[{"channel": "#barcode-bot", "count": 5, "summary": "Crow addresses BNL with Orion archive language."}],
+            usefulEvidence=[
+                {"summary": "Crow says Orion is my AI and speaks through the archive interface.", "authorName": "Crow", "sourceType": "Discord conversation", "visibility": "public_context"},
+                {"summary": "Crow frames the archive as Orion speaking through a connected intelligence.", "authorName": "Crow", "sourceType": "Discord conversation", "visibility": "public_context"},
+                {"summary": "Crow repeats archive interface language for Orion as an AI presence.", "authorName": "Crow", "sourceType": "Discord conversation", "visibility": "public_context"},
+            ],
+        )
+        digest = brief["subjectOwnedEvidenceDigestV1"]
+        body = json.dumps(digest, sort_keys=True).lower()
+        self.assertTrue(any(term in body for term in ("orion/archive/ai", "archive language", "orion")))
+        self.assertTrue(any("orion" in item.get("moment", "").lower() and "archive" in item.get("moment", "").lower() for item in digest["representativeMoments"]))
+        self.assertIn("orion/archive-facing", brief["bnlTake"].lower())
+        self.assertIn("review-only", brief["bnlTake"].lower())
+        self.assertIn("Orion", self._visible_primary_copy_text(brief))
+
+    def test_subject_owned_digest_shortybabe_challenger_not_generic(self):
+        brief = self._subject_brief_for(
+            "ShortyBabe",
+            sourceCounts={"conversations": 6},
+            usefulEvidence=[
+                {"summary": "ShortyBabe challenges BNL-01 and pushes back on the Source File boundary.", "authorName": "ShortyBabe", "sourceType": "Discord conversation", "visibility": "public_context"},
+                {"summary": "ShortyBabe teases BNL and provokes BNL-01 about the rules.", "authorName": "ShortyBabe", "sourceType": "Discord conversation", "visibility": "public_context"},
+                {"summary": "ShortyBabe calls out BNL in a playful challenger exchange.", "authorName": "ShortyBabe", "sourceType": "Discord conversation", "visibility": "public_context"},
+            ],
+            relationshipSignals=["Orion appears near ShortyBabe in relationship/context evidence only; meaning unconfirmed."],
+        )
+        digest = brief["subjectOwnedEvidenceDigestV1"]
+        self.assertTrue(any("challenge" in item.get("behavior", "").lower() or "antagon" in item.get("behavior", "").lower() for item in digest["distinctiveBehaviors"]))
+        self.assertIn("generic community chatter", brief["bnlTake"].lower())
+        self.assertVisiblePrimaryCopyExcludes(brief, "Orion")
+
+    def test_subject_owned_digest_thin_evidence_does_not_invent_topics(self):
+        brief = self._subject_brief_for(
+            "Thin Signal",
+            sourceCounts={},
+            topTopicDetails=[{"topic": "Orion archive AI relationship context", "count": 5, "summary": "Generated label only."}],
+            knownContext=["Orion appears in nearby context only."],
+            representativeEvidence=[],
+        )
+        digest = brief["subjectOwnedEvidenceDigestV1"]
+        self.assertIn(digest["evidenceQuality"], {"thin", "insufficient"})
+        self.assertIn("limited subject-owned evidence", digest["digestRead"].lower())
+        visible = self._visible_primary_copy_text(brief).lower()
+        self.assertNotIn("orion/archive-facing", visible)
+        self.assertNotIn("nearby entities reads", visible)
+
+    def test_subject_owned_digest_phrase_extraction_uses_owned_evidence_not_labels(self):
+        brief = self._subject_brief_for(
+            "Phrase Fox",
+            topTopicDetails=[{"topic": "source file relationship taxonomy repeating generated label", "count": 12}],
+            usefulEvidence=[
+                {"summary": "Phrase Fox repeats silver hallway ritual before posting demos.", "authorName": "Phrase Fox", "sourceType": "Discord conversation", "visibility": "public_context"},
+                {"summary": "Phrase Fox mentions silver hallway ritual again while sharing WIP notes.", "authorName": "Phrase Fox", "sourceType": "Discord conversation", "visibility": "public_context"},
+            ],
+        )
+        phrases = [item.get("phrase", "").lower() for item in brief["subjectOwnedEvidenceDigestV1"]["recurringPhrases"]]
+        self.assertTrue(any("silver hallway ritual" in phrase for phrase in phrases))
+        self.assertFalse(any("source file relationship taxonomy" in phrase for phrase in phrases))
