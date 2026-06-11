@@ -21,7 +21,7 @@ from bnl_dossier_recommendations import build_dossier_recommendation_payload, is
 from bnl_entity_activity_summary import build_entity_activity_summary, refresh_entity_evidence_for_subject
 from bnl_entity_evidence import _website_safe_payload_text
 from bnl_entity_intelligence import build_entity_intelligence_profile, resolve_entity_context_for_surface, safe_text as _entity_safe_text
-from bnl_evidence_ownership import subject_owned_text_fragments
+from bnl_evidence_ownership import classify_evidence_ownership, subject_owned_text_fragments
 from bnl_source_file_lookup import lookup_source_file
 from bnl_source_refresh_context import refresh_generation_context
 
@@ -1827,7 +1827,7 @@ def _normalize_source_name_for_site(value: Any) -> str:
 def _normalize_topic_label_for_site(value: Any) -> str:
     text = _website_safe_payload_text(_site_safe_text(value, 180))
     text = re.sub(r"\s+", " ", text).strip()
-    return text or "local context classification"
+    return text or "context classification"
 
 
 def _normalize_allowed_readout_object_for_site(item: dict[str, Any], *, field_name: str) -> dict[str, Any]:
@@ -3208,7 +3208,7 @@ def _main_read_eligible_texts(ownership: dict[str, Any]) -> list[str]:
 
 
 def _review_only_shape_texts(ownership: dict[str, Any]) -> list[str]:
-    """Return nearby/review-only/generated fragments for diagnostics, never main read shape."""
+    """Return non-owned/review-only/generated fragments for diagnostics, never main read shape."""
     if not isinstance(ownership, dict):
         return []
     items: list[Any] = []
@@ -3390,15 +3390,17 @@ def _topic_buckets(memory: dict[str, Any], ownership: dict[str, Any] | None = No
             strength = "moderate"
         elif re.search(r"\bnoise|generic|unclear\b", topic, re.I):
             strength = "noise"
-        ownership_basis = "owned" if main_read_eligible else ("nearby_context" if review_signals else ("generated_or_taxonomy" if ownership else "unknown"))
-        explanation = _topic_explanation(topic, detail, signals) if main_read_eligible else _case_text(f"Review-only / nearby context only; do not treat this topic label as subject-owned shape evidence. {_topic_explanation(topic, detail, review_signals)}", 360)
+        ownership_basis = "owned" if main_read_eligible else ("non_owned_context" if review_signals else ("generated_or_taxonomy" if ownership else "unknown"))
+        if not main_read_eligible and ownership:
+            continue
+        explanation = _topic_explanation(topic, detail, signals)
         buckets.append({"topic": topic, "strength": strength, "mainReadEligible": main_read_eligible, "ownershipBasis": ownership_basis, **({"evidenceCount": count} if count is not None else {}), "explanation": explanation, **({"exampleSignals": signals[:3] or review_signals[:2]} if (signals or review_signals) else {})})
         if len(buckets) >= 10:
             break
-    if not buckets:
+    if not buckets and not ownership:
         for text in _case_list(memory.get("repeatedTopics"), limit=4):
             buckets.append({"topic": _clean_topic_label(text), "strength": "weak", "mainReadEligible": False, "ownershipBasis": "unknown", "explanation": text})
-    return buckets or [{"topic": "Insufficient topic extraction", "strength": "weak", "mainReadEligible": False, "ownershipBasis": "unknown", "explanation": "The current packet does not expose enough topic detail to summarize recurring subject themes."}]
+    return buckets if ownership else (buckets or [{"topic": "Insufficient topic extraction", "strength": "weak", "mainReadEligible": False, "ownershipBasis": "unknown", "explanation": "The current packet does not expose enough topic detail to summarize recurring subject themes."}])
 
 
 def _anchor_type(name: str) -> str:
@@ -3582,7 +3584,7 @@ def _brief_signal_text(memory: dict[str, Any], topics: list[dict[str, Any]], anc
     context = _brief_context(memory)
     if ownership:
         # Main-read shape is allowed to see only explicitly subject-owned or subject-attached authoritative text.
-        # Topic labels, topic explanations, nearby context, review-only text, diagnostics, generated report
+        # Topic labels, topic explanations, non-owned context, review-only text, diagnostics, generated report
         # wording, and generic channel names are intentionally excluded here.
         values = [_main_read_eligible_texts(ownership)]
     else:
@@ -3698,10 +3700,10 @@ def _distinguishing_read(archetype: dict[str, Any]) -> str:
         return "Distinctive because main-read-eligible subject-owned evidence is Orion/interface-linked rather than generic community chatter."
     if "bnl" in signals:
         return "Distinctive because main-read-eligible subject-owned evidence is BNL-facing rather than generic community chatter."
-    if any("nearby/shared context" in str(item).lower() or "not used for this subject" in str(item).lower() for item in archetype.get("excludedShapeSignals") or []):
-        return "Not distinctive enough from owned evidence; nearby/shared context is not used for this subject's main read."
+    if any("non-owned/shared context" in str(item).lower() or "not used for this subject" in str(item).lower() for item in archetype.get("excludedShapeSignals") or []):
+        return "Not distinctive enough from owned evidence; non-owned/shared context is not used for this subject's main read."
     if "weird concrete" in signals or "network skepticism" in signals:
-        return "Distinctive because subject-owned evidence includes weird concrete topics and/or Network skepticism rather than nearby lore context."
+        return "Distinctive because subject-owned evidence includes weird concrete topics and/or Network skepticism rather than non-owned lore context."
     if "music" in signals or "platform" in signals or "track" in signals:
         return "Distinctive because the strongest evidence is music/link sharing, not conversation volume or confirmed queue history."
     if "collaboration" in signals or "wip" in signals or "helper" in signals:
@@ -3738,11 +3740,11 @@ def _build_subject_read(subject: str, profile: dict[str, Any], topics: list[dict
     digest = subject_owned_digest or {}
     quality = str(digest.get("evidenceQuality") or "insufficient")
     if quality in {"thin", "insufficient"} and not (digest.get("concreteTopics") or digest.get("distinctiveBehaviors") or digest.get("representativeMoments")):
-        return _case_text(f"BNL has limited subject-owned evidence. The file needs concrete source notes before a stronger dossier read is possible. Do not invent topics from nearby context, topic labels, or generic channel names. BNL is not allowed to assume {missing or 'public identity, role, relationship meaning, or queue history'} yet.", 780)
+        return _case_text(f"BNL has limited subject-owned evidence. Add concrete source notes or confirmed authored examples before drafting. BNL is not allowed to assume {missing or 'public identity, role, relationship meaning, or queue history'} yet.", 780)
     pattern = _digest_pattern_text(digest) or "limited subject-owned detail"
     signature = behavioral_signature.get("signatureRead") if isinstance(behavioral_signature, dict) else ""
     signature_note = f" Subject-owned behavior note: {signature}" if signature else ""
-    return _case_text(f"BNL reads {subject} as {archetype.get('archetype')} ({archetype.get('confidence')} confidence) from subject-owned evidence. The useful owned pattern is {pattern}.{signature_note} Nearby/review-only topic labels and generic channel names are not allowed to create the type. BNL is not allowed to assume {missing or 'public identity, role, relationship meaning, or queue history'} yet.", 1100)
+    return _case_text(f"BNL reads {subject} as {archetype.get('archetype')} ({archetype.get('confidence')} confidence) from subject-owned evidence. The useful owned pattern is {pattern}.{signature_note} Non-owned/review-only labels are not used to create the type. BNL is not allowed to assume {missing or 'public identity, role, relationship meaning, or queue history'} yet.", 1100)
 
 
 def _build_bnl_take(subject: str, memory: dict[str, Any], topics: list[dict[str, Any]], anchors: list[dict[str, Any]], archetype: dict[str, Any], behavioral_signature: dict[str, Any] | None = None, nearby_context: list[dict[str, Any]] | None = None, subject_owned_digest: dict[str, Any] | None = None) -> str:
@@ -3773,7 +3775,7 @@ _DIGEST_STOPWORDS = {
     "about", "after", "again", "against", "also", "and", "around", "because", "before", "being", "between", "channel", "claim", "claims", "community", "context", "conversation", "current", "discord", "evidence", "file", "from", "generated", "internal", "label", "labels", "nearby", "owned", "packet", "public", "queue", "report", "review", "review-only", "safe", "source", "subject", "summary", "that", "the", "their", "there", "this", "through", "topic", "topics", "with", "without",
 }
 _DIGEST_TAXONOMY_PHRASES = {
-    "active community", "active community participant", "approved public context", "bnl facing behavior", "community context", "generic community chatter", "local context", "main read eligible", "nearby context", "nearby entities", "relationship context", "source file", "source file discussion", "shared context",
+    "active community", "active community participant", "approved public context", "bnl facing behavior", "community context", "generic community chatter", "local context", "main read eligible", "non-owned context", "other entities", "relationship context", "source file", "source file discussion", "shared context",
 }
 _DIGEST_CONCRETE_PATTERNS: list[tuple[str, str, str]] = [
     ("vibrating beds", r"\bvibrating beds?\b", "Subject-owned evidence specifically mentions vibrating beds."),
@@ -3786,6 +3788,144 @@ _DIGEST_CONCRETE_PATTERNS: list[tuple[str, str, str]] = [
     ("BNL challenge/pushback language", r"\b(bnl|bnl-01)\b.{0,80}\b(challenge|push(?:es|ed)? back|teas(?:e|es|ed)?|antagoniz|provok|argu|call(?:s|ed)? out|rules?|boundary)\b|\b(challenge|push(?:es|ed)? back|teas(?:e|es|ed)?|antagoniz|provok|argu|call(?:s|ed)? out)\b.{0,80}\b(bnl|bnl-01)\b", "Subject-owned evidence shows BNL-facing challenge, teasing, or pushback."),
 ]
 _DIGEST_LINK_RE = re.compile(r"\b(?:https?://)?(?:www\.)?([a-z0-9.-]+\.[a-z]{2,})(?:/\S*)?", re.I)
+
+
+
+_SUBJECT_AUTHORED_EVIDENCE_FIELDS = (
+    "representativeEvidence",
+    "evidenceDetails",
+    "bestEvidenceToReview",
+    "usefulEvidence",
+    "conversationHighlights",
+    "bnlInteractionSignals",
+    "musicSignals",
+    "communitySignals",
+    "relationshipSignals",
+)
+_SUBJECT_AUTHORED_GENERATED_FIELDS = {
+    "topicBreakdown",
+    "topTopicDetails",
+    "topicThemes",
+    "conversationThemes",
+    "knownContext",
+    "sourceCoverage",
+    "subjectRead",
+    "bnlTake",
+}
+
+
+def _iter_subject_authored_source_candidates(memory: dict[str, Any]):
+    """Yield best-available original-ish evidence before generated report summaries."""
+    context = _brief_context(memory)
+    for field in _SUBJECT_AUTHORED_EVIDENCE_FIELDS:
+        yield from _wrap_subject_authored_candidate(context.get(field), field, generated=False)
+    raw_meta = context.get("archivePayloadMetadata") if isinstance(context.get("archivePayloadMetadata"), dict) else {}
+    yield from _wrap_subject_authored_candidate(raw_meta.get("representativeFragments"), "representativeFragments", generated=False)
+    yield from _wrap_subject_authored_candidate(memory.get("representativeMoments"), "representativeMoments", generated=False)
+    for field in ("queueSubmissionContext", "websiteContext", "publicSafeCandidateFacts", "reviewOnlyFacts"):
+        yield from _wrap_subject_authored_candidate(memory.get(field), field, generated=field in {"websiteContext", "reviewOnlyFacts"})
+    for field in _SUBJECT_AUTHORED_GENERATED_FIELDS:
+        yield from _wrap_subject_authored_candidate(context.get(field), field, generated=True)
+
+
+def _wrap_subject_authored_candidate(value: Any, lane: str, *, generated: bool = False):
+    if value in (None, "", [], {}):
+        return
+    if isinstance(value, list):
+        for item in value:
+            yield from _wrap_subject_authored_candidate(item, lane, generated=generated)
+    elif isinstance(value, dict):
+        item = dict(value)
+        item.setdefault("sourceLane", lane)
+        if generated:
+            item.setdefault("generatedReportField", True)
+        yield item
+    else:
+        yield {"summary": str(value), "sourceLane": lane, **({"generatedReportField": True} if generated else {})}
+
+
+def _subject_authored_kind(raw: dict[str, Any], ownership_scope: str) -> str:
+    source = " ".join(str(raw.get(k) or "") for k in ("sourceType", "sourceLane", "source", "sourceTable", "table", "type")).lower()
+    if ownership_scope == "direct_address":
+        return "direct_address"
+    if ownership_scope == "explicit_relationship":
+        return "explicit_relationship"
+    if ownership_scope == "broadcast_memory_authoritative" or "broadcast" in source:
+        return "broadcast_memory"
+    if ownership_scope == "site_authoritative" or "site" in source or "source file note" in source:
+        return "site_note"
+    if ownership_scope == "queue_authoritative" or "queue" in source or "submission" in source:
+        return "queue_record"
+    if ownership_scope in {"owned", "confirmed_alias"}:
+        return "authored_message"
+    return "unknown"
+
+
+def _subject_authored_quality(count: int, excluded_count: int = 0) -> str:
+    if count >= 6:
+        return "strong"
+    if count >= 2:
+        return "moderate"
+    if count == 1:
+        return "thin"
+    return "insufficient"
+
+
+def build_subject_authored_evidence_v1(memory: dict[str, Any], subject: str, subject_key: str, confirmed_aliases: list[str] | None = None) -> dict[str, Any]:
+    """Rehydrate subject-authored/attached evidence before digesting generated Source File text."""
+    confirmed_aliases = confirmed_aliases or []
+    owned: list[dict[str, Any]] = []
+    excluded: list[dict[str, Any]] = []
+    warnings: list[str] = []
+    seen: set[tuple[str, str]] = set()
+    excluded_seen: set[tuple[str, str]] = set()
+    for raw in _iter_subject_authored_source_candidates(memory):
+        if not isinstance(raw, dict):
+            continue
+        classified = classify_evidence_ownership(raw, subject, subject_key, confirmed_aliases)
+        summary = _case_text(classified.get("safeSummary") or raw.get("summary") or raw.get("safeSummary") or raw.get("text") or raw.get("content") or raw.get("note"), 360)
+        if not summary:
+            continue
+        source_type = _case_text(raw.get("sourceType") or raw.get("source") or raw.get("sourceTable") or classified.get("sourceType") or classified.get("sourceLane") or raw.get("sourceLane"), 90)
+        channel_name = _safe_channel_name(raw.get("channelName") or raw.get("channel_name") or raw.get("channel") or "", summary)
+        channel_policy = _case_text(raw.get("channelPolicy") or raw.get("channel_policy") or raw.get("policy") or classified.get("visibility"), 80)
+        observed_at = _case_text(raw.get("observedAt") or raw.get("observed_at") or raw.get("timestamp") or raw.get("createdAt") or raw.get("created_at") or raw.get("occurredAt"), 80)
+        scope = str(classified.get("ownership") or "unknown")
+        generated = bool(raw.get("generatedReportField")) or str(raw.get("sourceLane") or "") in _SUBJECT_AUTHORED_GENERATED_FIELDS
+        public_safe = not re.search(r"\b(private|internal_controlled|dm|source_blind)\b", json.dumps(raw, default=str), flags=re.I) and not bool(raw.get("reviewOnly") is True or raw.get("review_only") is True)
+        use_for_digest = scope in _MAIN_READ_ELIGIBLE_SCOPES and not generated and bool(summary)
+        if use_for_digest:
+            item = {
+                "summary": _case_text(_website_safe_payload_text(summary), 360),
+                **({"sourceType": source_type} if source_type else {}),
+                **({"channelName": channel_name} if channel_name and channel_name != "unknown channel" else {}),
+                **({"channelPolicy": channel_policy} if channel_policy else {}),
+                **({"observedAt": observed_at} if observed_at else {}),
+                "evidenceKind": _subject_authored_kind(raw, scope),
+                "ownershipBasis": _case_text(classified.get("reason") or scope, 220),
+                "publicSafe": bool(public_safe),
+                "useForDigest": True,
+            }
+            key = (item["summary"].lower(), item.get("sourceType", ""))
+            if key not in seen:
+                seen.add(key)
+                owned.append(item)
+        else:
+            reason = "generated or broad report label, not original subject-authored evidence" if generated else _case_text(classified.get("reason") or "source lacks author/subject metadata", 220)
+            key = (summary.lower(), reason.lower())
+            if key not in excluded_seen:
+                excluded_seen.add(key)
+                excluded.append({"summary": _case_text(_website_safe_payload_text(summary), 220), "reason": reason, **({"sourceType": source_type} if source_type else {})})
+    if not owned:
+        warnings.append("No digest-eligible subject-authored or subject-attached source rows were found before generated summaries.")
+    if excluded:
+        warnings.append("Some candidate evidence was kept out of the digest because it lacked subject ownership metadata or came from generated/broad labels.")
+    return {
+        "evidenceQuality": _subject_authored_quality(len(owned), len(excluded)),
+        "ownedAuthoredItems": owned[:40],
+        "excludedItems": excluded[:30],
+        "extractionWarnings": warnings,
+    }
 
 
 def _digest_owned_items(ownership: dict[str, Any]) -> list[dict[str, Any]]:
@@ -4004,9 +4144,15 @@ def _digest_dossier_usefulness(subject: str, quality: str, concrete_topics: list
     return {"likelyUse": _case_text(likely, 220), "usefulAngles": _case_list(useful, limit=6, item_limit=120), "notEnoughFor": _case_list(not_enough, limit=6, item_limit=180), "nextQuestions": _case_list(next_questions, limit=6, item_limit=180)}
 
 
-def build_subject_owned_evidence_digest_v1(subject: str, ownership: dict[str, Any], profile: dict[str, Any], channels: list[dict[str, Any]]) -> dict[str, Any]:
-    items = _digest_owned_items(ownership)
-    texts = _digest_texts(items)
+def build_subject_owned_evidence_digest_v1(subject: str, ownership: dict[str, Any], profile: dict[str, Any], channels: list[dict[str, Any]], subject_authored_evidence: dict[str, Any] | None = None) -> dict[str, Any]:
+    authored_items = []
+    if isinstance(subject_authored_evidence, dict):
+        authored_items = [item for item in subject_authored_evidence.get("ownedAuthoredItems") or [] if isinstance(item, dict) and item.get("useForDigest") and item.get("summary")]
+    if authored_items:
+        texts = _case_list([item.get("summary") for item in authored_items], limit=120, item_limit=300)
+    else:
+        items = _digest_owned_items(ownership)
+        texts = _digest_texts(items)
     concrete_topics = _extract_concrete_digest_topics(texts)
     phrases = _extract_recurring_phrases(texts)
     behaviors = _extract_digest_behaviors(texts, concrete_topics)
@@ -4014,6 +4160,8 @@ def build_subject_owned_evidence_digest_v1(subject: str, ownership: dict[str, An
     links = _extract_links_or_platforms(texts)
     moments = _representative_digest_moments(subject, texts, concrete_topics, behaviors, questions)
     quality = _digest_quality(texts, concrete_topics, phrases, behaviors, questions)
+    if isinstance(subject_authored_evidence, dict) and subject_authored_evidence.get("evidenceQuality") == "insufficient" and not texts:
+        quality = "insufficient"
     summary = ownership.get("summary", {}) if isinstance(ownership, dict) else {}
     top_channels = []
     for channel in channels[:6]:
@@ -4029,7 +4177,7 @@ def build_subject_owned_evidence_digest_v1(subject: str, ownership: dict[str, An
     return {
         "digestRead": digest_read,
         "evidenceQuality": quality,
-        "ownedMessageCount": _as_int(summary.get("ownedEvidenceCount")) or len(texts),
+        "ownedMessageCount": len(authored_items) if authored_items else (_as_int(summary.get("ownedEvidenceCount")) or len(texts)),
         "directAddressCount": _as_int(summary.get("directAddressEvidenceCount")) or 0,
         "explicitRelationshipCount": _as_int(summary.get("explicitRelationshipEvidenceCount")) or 0,
         **({"latestObservedAt": profile.get("latestObservedAt")} if profile.get("latestObservedAt") else {}),
@@ -4185,18 +4333,18 @@ def _strip_non_applicable_visible_entities(text: str, disallowed_terms: set[str]
         if not term or len(term) < 2:
             continue
         pat = re.compile(rf"(?<![-A-Za-z0-9]){re.escape(term)}(?![-A-Za-z0-9])", flags=re.I)
-        cleaned = pat.sub("nearby entities" if term[:1].isupper() else "nearby context", cleaned)
+        cleaned = pat.sub("other entities" if term[:1].isupper() else "non-owned context", cleaned)
     replacements = [
-        (r"nearby nearby entities(?:/interface)? context is quarantined for review", "nearby non-owned context is not used for this subject's main read"),
-        (r"Nearby context references nearby entities(?:, but)?", "Nearby context references other entities,"),
-        (r"does not have subject-owned evidence to treat nearby entities as part of this subject[’']s profile", "does not have subject-owned evidence to treat nearby entities as part of this subject's profile"),
-        (r"nearby entities is quarantined", "nearby/shared context is not used"),
-        (r"not nearby entities-linked", "not linked to nearby entities"),
-        (r"without nearby entities evidence", "without enough subject-owned evidence"),
+        (r"nearby other entities(?:/interface)? context is quarantined for review", "nearby non-owned context is not used for this subject's main read"),
+        (r"Non-owned context references other entities(?:, but)?", "Non-owned context references other entities,"),
+        (r"does not have subject-owned evidence to treat other entities as part of this subject[’']s profile", "does not have subject-owned evidence to treat other entities as part of this subject's profile"),
+        (r"other entities is quarantined", "non-owned/shared context is not used"),
+        (r"not other entities-linked", "not linked to other entities"),
+        (r"without other entities evidence", "without enough subject-owned evidence"),
     ]
     for pattern, repl in replacements:
         cleaned = re.sub(pattern, repl, cleaned, flags=re.I)
-    cleaned = re.sub(r"\bnearby entities(?:/nearby context)+\b", "nearby entities", cleaned, flags=re.I)
+    cleaned = re.sub(r"\bother entities(?:/non-owned context)+\b", "other entities", cleaned, flags=re.I)
     cleaned = re.sub(r"\s+", " ", cleaned).strip()
     return cleaned
 
@@ -4282,7 +4430,7 @@ def _brief_ownership_routing_diagnostics(ownership: dict[str, Any], nearby_conte
             "sourceLane": "nearbyContextSignals",
             "attemptedScope": "namedAnchors/subject-owned intelligence",
             "routedAs": "co_mention",
-            "reason": str(item.get("warning") or item.get("reason") or "nearby context only; not subject-owned evidence"),
+            "reason": str(item.get("warning") or item.get("reason") or "non-owned context only; not subject-owned evidence"),
         })
         seen.add(key)
         if len(blocked) >= 20:
@@ -4310,7 +4458,7 @@ def _main_read_routing_diagnostics(ownership: dict[str, Any], topics: list[dict[
     for text in _review_only_shape_texts(ownership):
         lowered = text.lower()
         if any(term in lowered for term in ("orion", "interface", "lore")):
-            add("Orion/interface/lore", "Review-only or nearby context lacks main-read-eligible subject ownership/explicit relationship evidence.", "nearbyContextSignals")
+            add("Orion/interface/lore", "Review-only or non-owned context lacks main-read-eligible subject ownership/explicit relationship evidence.", "nearbyContextSignals")
         elif len(excluded) < 8:
             add(text, "Review-only evidence is available for diagnostics only and cannot shape subjectRead, bnlTake, or archetype.", "ownershipRoutingDiagnostics")
         if len(excluded) >= 16:
@@ -4323,7 +4471,7 @@ def _main_read_routing_diagnostics(ownership: dict[str, Any], topics: list[dict[
             add(topic, "Topic bucket has no main-read-eligible owned signal; it remains review-only.", "reviewOnlyTopic")
     for item in nearby_context or []:
         if isinstance(item, dict) and item.get("name"):
-            add(str(item.get("name")), str(item.get("warning") or "Nearby context only; not subject-owned shape evidence."), "nearbyContextSignals")
+            add(str(item.get("name")), str(item.get("warning") or "Non-owned context only; not subject-owned shape evidence."), "nearbyContextSignals")
     return {"excludedShapeSignals": excluded[:24]}
 
 def build_subject_intelligence_brief_v1(memory: dict[str, Any]) -> dict[str, Any]:
@@ -4335,7 +4483,8 @@ def build_subject_intelligence_brief_v1(memory: dict[str, Any]) -> dict[str, Any
     channels = _channel_breakdown(memory)
     topics = _topic_buckets(memory, ownership)
     anchors, ignored_noise, nearby_context = _named_anchor_extraction(memory, ownership)
-    subject_owned_digest = build_subject_owned_evidence_digest_v1(subject, ownership, profile, channels)
+    subject_authored_evidence = build_subject_authored_evidence_v1(memory, subject, subject_key, confirmed_aliases)
+    subject_owned_digest = build_subject_owned_evidence_digest_v1(subject, ownership, profile, channels, subject_authored_evidence)
     behavioral_signature = _behavioral_signature_v1(subject, ownership, subject_owned_digest)
     archetype = _subject_archetype_read(subject, memory, profile, topics, anchors, channels, ownership)
     distinguishing = _distinguishing_read(archetype)
@@ -4361,6 +4510,8 @@ def build_subject_intelligence_brief_v1(memory: dict[str, Any]) -> dict[str, Any
         "ownershipRoutingDiagnostics": _brief_ownership_routing_diagnostics(ownership, nearby_context),
         "mainReadRoutingDiagnostics": _main_read_routing_diagnostics(ownership, topics, nearby_context),
         "behavioralSignatureV1": behavioral_signature,
+        "subjectAuthoredEvidenceV1": subject_authored_evidence,
+        "subjectAttachedEvidenceV1": subject_authored_evidence,
         "subjectOwnedEvidenceDigestV1": subject_owned_digest,
         "ignoredExtractionNoise": ignored_noise,
         "interactionPatterns": _signals_from(memory, ("bnlInteractionSignals", "communitySignals", "conversationThemes"), "No specific interaction pattern is exposed beyond the representative evidence."),

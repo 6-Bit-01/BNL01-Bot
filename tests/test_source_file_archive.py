@@ -443,6 +443,17 @@ class SourceFileArchiveTests(unittest.TestCase):
     def assertVisiblePrimaryCopyExcludes(self, brief, term):
         self.assertNotIn(term, self._visible_primary_copy_text(brief))
 
+    def assertNoNearbyVisibleRegression(self, brief):
+        visible = self._visible_primary_copy_text(brief).lower()
+        for forbidden in (
+            "nearby entities",
+            "approved nearby entities",
+            "nearby/nearby",
+            "review-only / nearby context only",
+            "nearby context",
+        ):
+            self.assertNotIn(forbidden, visible)
+
 
     def test_subject_intelligence_brief_music_link_fixture_is_not_crow_framed(self):
         brief = self._subject_brief_for(
@@ -591,11 +602,10 @@ class SourceFileArchiveTests(unittest.TestCase):
         self.assertNotIn("Orion", {item.get("name") for item in brief["namedAnchors"]})
         self.assertIn("Orion", {item.get("name") for item in brief["nearbyContextSignals"]})
         self.assertTrue(any("warning" in item and "not treat" in item["warning"].lower() for item in brief["nearbyContextSignals"]))
-        lore_bucket = next(item for item in brief["topicBuckets"] if item["topic"] == "Interface / lore language")
-        self.assertFalse(lore_bucket["mainReadEligible"])
-        self.assertIn(lore_bucket["ownershipBasis"], {"nearby_context", "generated_or_taxonomy", "unknown"})
+        self.assertFalse(any(item["topic"] == "Interface / lore language" for item in brief["topicBuckets"]))
         self.assertTrue(any("Orion/interface/lore" in item["signal"] for item in brief["mainReadRoutingDiagnostics"]["excludedShapeSignals"]))
         self.assertVisiblePrimaryCopyExcludes(brief, "Orion")
+        self.assertNoNearbyVisibleRegression(brief)
         self.assertIn("vibrating", self._visible_primary_copy_text(brief).lower())
         self.assertIn("network skepticism", self._visible_primary_copy_text(brief).lower())
 
@@ -608,7 +618,7 @@ class SourceFileArchiveTests(unittest.TestCase):
         )
         self.assertNotIn("lore/interface", brief["subjectArchetypeRead"]["archetype"].lower())
         self.assertNotIn("interface/lore-style", brief["bnlTake"].lower())
-        self.assertFalse(next(item for item in brief["topicBuckets"] if item["topic"] == "Interface / lore language")["mainReadEligible"])
+        self.assertFalse(any(item["topic"] == "Interface / lore language" for item in brief["topicBuckets"]))
 
     def test_generic_channel_and_barcode_topic_do_not_create_interface_read(self):
         brief = self._subject_brief_for(
@@ -621,7 +631,7 @@ class SourceFileArchiveTests(unittest.TestCase):
         shape_text = " ".join([brief["subjectRead"], brief["bnlTake"], brief["subjectArchetypeRead"]["archetype"]]).lower()
         self.assertNotIn("lore/interface", shape_text)
         self.assertNotIn("interface-linked", shape_text)
-        self.assertFalse(brief["topicBuckets"][0]["mainReadEligible"])
+        self.assertFalse(brief["topicBuckets"])
 
     def test_evidence_ownership_crow_owned_orion_archive_ai_can_anchor(self):
         brief = self._subject_brief_for(
@@ -643,6 +653,8 @@ class SourceFileArchiveTests(unittest.TestCase):
         self.assertIn("orion/archive-facing", brief["bnlTake"].lower())
         self.assertIn("review-only", brief["bnlTake"].lower())
         self.assertIn("Orion", self._visible_primary_copy_text(brief))
+        self.assertTrue(any(item.get("name") == "Orion" for item in brief["namedAnchors"]))
+        self.assertNoNearbyVisibleRegression(brief)
 
 
     def test_evidence_ownership_shortybabe_nearby_orion_not_promoted(self):
@@ -769,15 +781,20 @@ class SourceFileArchiveTests(unittest.TestCase):
             ],
             relationshipSignals=["Orion appears near Antigrain in broader community context; meaning unconfirmed."],
         )
+        authored = brief["subjectAuthoredEvidenceV1"]
         digest = brief["subjectOwnedEvidenceDigestV1"]
         digest_body = json.dumps(digest, sort_keys=True).lower()
+        self.assertTrue(authored["ownedAuthoredItems"])
+        self.assertIn(authored["evidenceQuality"], {"strong", "moderate"})
         self.assertIn(digest["evidenceQuality"], {"strong", "moderate"})
         self.assertIn("vibrating", digest_body)
         self.assertTrue(any(item.get("target") == "Network" for item in digest["questionsOrChallenges"]))
         self.assertIn("weird concrete", brief["bnlTake"].lower())
         self.assertIn("network skepticism", brief["bnlTake"].lower())
         self.assertVisiblePrimaryCopyExcludes(brief, "Orion")
-        self.assertNotIn("nearby entities reads", self._visible_primary_copy_text(brief).lower())
+        self.assertNotIn("limited subject-owned evidence", brief["subjectRead"].lower())
+        self.assertNotIn("limited subject-owned evidence", brief["bnlTake"].lower())
+        self.assertNoNearbyVisibleRegression(brief)
 
     def test_subject_owned_digest_crow_orion_archive_ai_representative_moments(self):
         brief = self._subject_brief_for(
@@ -790,13 +807,16 @@ class SourceFileArchiveTests(unittest.TestCase):
                 {"summary": "Crow repeats archive interface language for Orion as an AI presence.", "authorName": "Crow", "sourceType": "Discord conversation", "visibility": "public_context"},
             ],
         )
+        authored = brief["subjectAuthoredEvidenceV1"]
         digest = brief["subjectOwnedEvidenceDigestV1"]
         body = json.dumps(digest, sort_keys=True).lower()
+        self.assertTrue(authored["ownedAuthoredItems"])
         self.assertTrue(any(term in body for term in ("orion/archive/ai", "archive language", "orion")))
         self.assertTrue(any("orion" in item.get("moment", "").lower() and "archive" in item.get("moment", "").lower() for item in digest["representativeMoments"]))
         self.assertIn("orion/archive-facing", brief["bnlTake"].lower())
         self.assertIn("review-only", brief["bnlTake"].lower())
         self.assertIn("Orion", self._visible_primary_copy_text(brief))
+        self.assertNoNearbyVisibleRegression(brief)
 
     def test_subject_owned_digest_shortybabe_challenger_not_generic(self):
         brief = self._subject_brief_for(
@@ -809,10 +829,13 @@ class SourceFileArchiveTests(unittest.TestCase):
             ],
             relationshipSignals=["Orion appears near ShortyBabe in relationship/context evidence only; meaning unconfirmed."],
         )
+        authored = brief["subjectAuthoredEvidenceV1"]
         digest = brief["subjectOwnedEvidenceDigestV1"]
+        self.assertTrue(authored["ownedAuthoredItems"])
         self.assertTrue(any("challenge" in item.get("behavior", "").lower() or "antagon" in item.get("behavior", "").lower() for item in digest["distinctiveBehaviors"]))
         self.assertIn("generic community chatter", brief["bnlTake"].lower())
         self.assertVisiblePrimaryCopyExcludes(brief, "Orion")
+        self.assertNoNearbyVisibleRegression(brief)
 
     def test_subject_owned_digest_thin_evidence_does_not_invent_topics(self):
         brief = self._subject_brief_for(
@@ -822,12 +845,17 @@ class SourceFileArchiveTests(unittest.TestCase):
             knownContext=["Orion appears in nearby context only."],
             representativeEvidence=[],
         )
+        authored = brief["subjectAuthoredEvidenceV1"]
         digest = brief["subjectOwnedEvidenceDigestV1"]
+        self.assertFalse(authored["ownedAuthoredItems"])
+        self.assertEqual(authored["evidenceQuality"], "insufficient")
         self.assertIn(digest["evidenceQuality"], {"thin", "insufficient"})
         self.assertIn("limited subject-owned evidence", digest["digestRead"].lower())
         visible = self._visible_primary_copy_text(brief).lower()
         self.assertNotIn("orion/archive-facing", visible)
-        self.assertNotIn("nearby entities reads", visible)
+        self.assertFalse([bucket for bucket in brief["topicBuckets"] if bucket.get("mainReadEligible") is False])
+        self.assertIn("concrete source notes", visible)
+        self.assertNoNearbyVisibleRegression(brief)
 
     def test_subject_owned_digest_phrase_extraction_uses_owned_evidence_not_labels(self):
         brief = self._subject_brief_for(
