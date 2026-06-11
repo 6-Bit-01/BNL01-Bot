@@ -587,8 +587,22 @@ class SourceFileArchiveTests(unittest.TestCase):
             self.assertNotIn(forbidden, visible)
         self.assertIn("confirmed:", brief["bnlTake"].lower())
         self.assertIn("likely / emerging pattern:", brief["bnlTake"].lower())
-        self.assertIn("not confirmed yet:", brief["bnlTake"].lower())
+        self.assertIn("not confirmed:", brief["bnlTake"].lower())
         self.assertIn("recommended admin action:", brief["bnlTake"].lower())
+        subject_read = brief["subjectRead"].lower()
+        bnl_take = brief["bnlTake"].lower()
+        for phrase in (
+            "best evidence appears",
+            "status, ownership, and identity details",
+            "community/support role or music-sharing participant",
+            "queue, payment, or priority status",
+        ):
+            self.assertFalse(phrase in subject_read and phrase in bnl_take, phrase)
+        for repeated_phrase in ("public barcode discord", "admin should confirm"):
+            self.assertLessEqual((brief["subjectRead"] + " " + brief["bnlTake"]).lower().count(repeated_phrase), 1)
+        not_confirmed_section = bnl_take.split("not confirmed:", 1)[1].split("recommended admin action:", 1)[0]
+        self.assertIn("queue, payment, or priority status", not_confirmed_section)
+        self.assertEqual(bnl_take.count("queue, payment, or priority status"), 1)
         self.assertIn("No confirmed queue or submission history is connected to this Source File yet.", brief["queueSubmissionRead"])
         self.assertTrue(brief["topicBuckets"])
         for bucket in brief["topicBuckets"]:
