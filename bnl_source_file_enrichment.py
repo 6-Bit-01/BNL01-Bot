@@ -3761,44 +3761,128 @@ def _digest_pattern_text(digest: dict[str, Any] | None) -> str:
     return _case_text("; ".join(parts), 620)
 
 
+def _source_brief_channel_names(channels: list[dict[str, Any]]) -> list[str]:
+    names: list[str] = []
+    for item in channels or []:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("channelName") or item.get("channel") or "").strip()
+        if name and name != "unknown channel" and name not in names:
+            names.append(name)
+        if len(names) >= 3:
+            break
+    return names
+
+
+def _source_brief_pattern_label(digest: dict[str, Any] | None, topics: list[dict[str, Any]] | None = None, archetype: dict[str, Any] | None = None) -> str:
+    digest = digest or {}
+    body = json.dumps(digest, sort_keys=True, default=str).lower() if digest else ""
+    topic_text = " ".join(str((item or {}).get("topic") or "") for item in (topics or []) if isinstance(item, dict)).lower()
+    archetype_name = str((archetype or {}).get("archetype") or "").lower()
+    if "weird-topic" in archetype_name or "network skeptic" in archetype_name:
+        return "weird concrete topics and Network questioning"
+    if "music-link" in archetype_name or "artist / music" in archetype_name:
+        return "music/link-sharing activity"
+    if "lore/interface" in archetype_name or "orion" in archetype_name:
+        return "Orion/archive-facing discussion"
+    if "bnl-facing" in archetype_name:
+        return "BNL-facing challenge or playful pushback"
+    if any(term in body for term in ("vibrating bed", "weird concrete", "unusual concrete", "network skepticism", "network motive", "network questioning")):
+        return "weird concrete topics and Network questioning"
+    if any(term in body for term in ("bnl challenge", "playful challenger", "antagon", "pushback", "push back", "provocation")):
+        return "BNL-facing challenge or playful pushback"
+    if any(term in body or term in topic_text for term in ("music", "soundcloud", "suno", "spotify", "youtube", "demo", "wip", "track", "song")) or "link sharing" in body or "link-sharing" in body or "link sharing" in topic_text or "link-sharing" in topic_text:
+        return "music/link-sharing activity"
+    if any(term in body for term in ("orion", "archive", "ai", "interface")):
+        return "Orion/archive-facing discussion"
+    if digest.get("distinctiveBehaviors"):
+        behavior = next((item.get("behavior") for item in digest.get("distinctiveBehaviors") or [] if isinstance(item, dict) and item.get("behavior")), "")
+        if behavior:
+            return _case_text(behavior, 120)
+    if digest.get("concreteTopics"):
+        topic = next((item.get("topic") for item in digest.get("concreteTopics") or [] if isinstance(item, dict) and item.get("topic")), "")
+        if topic:
+            return _case_text(topic, 120)
+    return "recurring public activity"
+
+
+def _source_brief_not_confirmed_items(archetype: dict[str, Any]) -> list[str]:
+    raw = " ".join(_case_list(archetype.get("notEnoughEvidenceFor") or [], limit=8, item_limit=220)).lower()
+    items: list[str] = []
+
+    def add(label: str) -> None:
+        if label not in items:
+            items.append(label)
+
+    if "artist" in raw or "submitter" in raw or "submission" in raw:
+        add("Artist or submitter status")
+    if "owned" in raw or "ownership" in raw or "link" in raw:
+        add("Ownership of shared links")
+    if "queue" in raw or "played" in raw or "payment" in raw or "priority" in raw:
+        add("Queue, payment, or Priority status")
+    if "alias" in raw or "identity" in raw or "relationship" in raw:
+        add("Alias, identity, or relationship meaning")
+    if not items:
+        add("Public role, ownership, queue status, and identity links")
+    return items[:4]
+
+
+def _source_brief_confirmed_items(pattern_label: str, channels: list[dict[str, Any]], digest: dict[str, Any]) -> list[str]:
+    items = ["Direct public Discord participation"]
+    if pattern_label and pattern_label != "recurring public activity":
+        items.append(pattern_label[:1].upper() + pattern_label[1:])
+    elif (digest or {}).get("representativeMoments") or (digest or {}).get("distinctiveBehaviors"):
+        items.append("Recurring subject activity in the available archive")
+    channel_names = _source_brief_channel_names(channels)
+    if channel_names:
+        items.append("Activity around " + ", ".join(channel_names[:2]))
+    return _case_list(items, limit=4, item_limit=160)
+
+
+def _source_brief_likely_text(subject: str, archetype: dict[str, Any], digest: dict[str, Any], pattern_label: str) -> str:
+    name = str(archetype.get("archetype") or "weak/unknown subject")
+    body = json.dumps(digest, sort_keys=True, default=str).lower() if digest else ""
+    quality = str(digest.get("evidenceQuality") or "insufficient")
+    if quality in {"thin", "insufficient"} and not _digest_pattern_text(digest):
+        return "BNL does not have enough distinctive evidence to type this subject yet; this looks like a review prompt rather than a dossier-ready profile."
+    if "orion" in body and ("archive" in body or "ai" in body or "speaking" in body or "speaks" in body):
+        return f"{subject} may be an Orion/archive-facing community subject; public meaning remains review-only until admin confirms it."
+    if any(term in body for term in ("bnl challenge", "playful challenger", "antagon", "pushback", "push back", "provocation")):
+        return f"{subject} looks like a BNL-facing playful challenger rather than generic community chatter."
+    if any(term in body for term in ("vibrating bed", "weird concrete", "unusual concrete", "network skepticism", "network motive", "network questioning")):
+        return f"{subject} looks like a weird-topic community participant with unusual recurring subjects and Network skepticism."
+    if pattern_label == "music/link-sharing activity":
+        return "Community/support role or music-sharing participant."
+    if name and name != "weak/unknown subject":
+        return f"Provisional role: {name}."
+    return "The file is still too thin for a confident role read."
+
+
 def _build_subject_read(subject: str, profile: dict[str, Any], topics: list[dict[str, Any]], channels: list[dict[str, Any]], archetype: dict[str, Any], behavioral_signature: dict[str, Any] | None = None, subject_owned_digest: dict[str, Any] | None = None) -> str:
-    missing = "; ".join((archetype.get("notEnoughEvidenceFor") or [])[:2]) or "artist ownership, submitted tracks, queue history, payment status, confirmed aliases, or relationship meaning"
     digest = subject_owned_digest or {}
     quality = str(digest.get("evidenceQuality") or "insufficient")
-    pattern = _digest_pattern_text(digest)
-    channel_names = [str(item.get("channelName") or item.get("channel") or "").strip() for item in channels if isinstance(item, dict)]
-    channel_names = [name for name in channel_names if name and name != "unknown channel"]
+    pattern_label = _source_brief_pattern_label(digest, topics, archetype)
+    channel_names = _source_brief_channel_names(channels)
     where = ", ".join(channel_names[:3]) if channel_names else "the available public BARCODE archive"
-    confirmed = pattern or "community participation is present, but the current archive has not exposed a sharper pattern yet"
+    role = str(archetype.get("archetype") or "early Source File candidate")
     if quality in {"thin", "insufficient"} and not (digest.get("concreteTopics") or digest.get("distinctiveBehaviors") or digest.get("representativeMoments")):
-        return _case_text(f"BNL currently reads {subject} as an early Source File candidate with limited direct evidence. The archive shows only light participation so far, mostly in {where}. Confirmed: BNL has some safe archive context to review. Not confirmed: {missing}. Admin should add concrete examples or confirmed authored activity before drafting public dossier language.", 980)
-    signature = behavioral_signature.get("signatureRead") if isinstance(behavioral_signature, dict) else ""
-    signature_note = f" {signature}" if signature else ""
-    return _case_text(f"BNL currently reads {subject} as {archetype.get('archetype')} ({archetype.get('confidence')} confidence). The strongest observed pattern is {confirmed}. This showed up mostly in {where}.{signature_note} Confirmed: the read is based on evidence tied directly to the subject. Not confirmed: {missing}. Admin should treat the role as provisional until identity, ownership, links, and queue/submission facts are checked.", 1200)
+        return _case_text(f"BNL currently reads {subject} as an early Source File candidate with limited direct evidence. Best evidence appears in {where}. Treat any role as provisional; status, ownership, and identity details still need admin confirmation before public use.", 760)
+    return _case_text(f"BNL currently reads {subject} as a provisional {role} with a {pattern_label} pattern. Best evidence appears in {where}. The file is useful for recurring community context, but status, ownership, and identity details should not be assumed yet.", 760)
 
 
 def _build_bnl_take(subject: str, memory: dict[str, Any], topics: list[dict[str, Any]], anchors: list[dict[str, Any]], archetype: dict[str, Any], behavioral_signature: dict[str, Any] | None = None, nearby_context: list[dict[str, Any]] | None = None, subject_owned_digest: dict[str, Any] | None = None) -> str:
-    name = str(archetype.get("archetype") or "weak/unknown subject")
-    missing = "; ".join((archetype.get("notEnoughEvidenceFor") or [])[:3]) or "artist ownership, owned links, submitted tracks, queue/play history, payment status, confirmed aliases, and relationship meaning"
     digest = subject_owned_digest or {}
-    pattern = _digest_pattern_text(digest)
-    body = json.dumps(digest, sort_keys=True, default=str).lower() if digest else ""
-    quality = str(digest.get("evidenceQuality") or "insufficient")
-    if quality in {"thin", "insufficient"} and not pattern:
-        likely = "BNL does not have enough distinctive evidence to type this subject yet; this looks like a review prompt rather than a dossier-ready profile."
-    elif "orion" in body and ("archive" in body or "ai" in body or "speaking" in body or "speaks" in body):
-        likely = f"{subject} may be an Orion/archive-facing community subject, but public meaning remains review-only until admin confirms it."
-    elif any(term in body for term in ("bnl challenge", "playful challenger", "antagon", "pushback", "push back", "provocation")):
-        likely = f"{subject} looks like a BNL-facing playful challenger or playful antagonist because direct evidence shows challenge, teasing, or pushback toward BNL rather than generic community chatter."
-    elif any(term in body for term in ("vibrating bed", "weird concrete", "unusual concrete", "network skepticism", "network motive", "network questioning")):
-        likely = f"{subject} looks like a weird-topic community participant: the strongest pattern is unusual recurring subjects, unusual concrete subjects, and Network questioning."
-    elif pattern:
-        likely = f"{subject} currently reads as {name}. The strongest observed pattern is {pattern}."
-    else:
-        likely = "The file is still too thin for a confident role read."
-    confirmed = pattern or "BNL has archive evidence to review, but not enough detail for a sharper public-safe claim."
-    recommended = "Admin should confirm whether this subject is an artist, supporter, collaborator, or recurring community member before drafting a public dossier."
-    return _case_text(f"BNL reads {subject} with this current take. Confirmed: {confirmed} Likely / emerging pattern: {likely} Not confirmed yet: {missing}. Recommended admin action: {recommended}", 1200)
+    pattern_label = _source_brief_pattern_label(digest, topics, archetype)
+    confirmed = _source_brief_confirmed_items(pattern_label, _channel_breakdown(memory), digest)
+    likely = _source_brief_likely_text(subject, archetype, digest, pattern_label)
+    not_confirmed = _source_brief_not_confirmed_items(archetype)
+    recommended = "Confirm whether this subject is an artist, supporter, collaborator, or repeat community participant before drafting public copy."
+    return _case_text(" ".join([
+        f"BNL reads {subject}: Confirmed: " + "; ".join(confirmed) + ".",
+        "Likely / Emerging pattern: " + likely,
+        "Not confirmed: " + "; ".join(not_confirmed) + ".",
+        "Recommended admin action: " + recommended,
+    ]), 1200)
 
 
 _DIGEST_STOPWORDS = {
