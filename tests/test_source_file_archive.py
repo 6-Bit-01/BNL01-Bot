@@ -542,3 +542,91 @@ class SourceFileArchiveTests(unittest.TestCase):
         self.assertIn("queue/submission memory is not connected", body)
         self.assertIn("does not auto-confirm identity", body)
 
+
+    def test_evidence_ownership_antigrain_quarantines_nearby_orion(self):
+        brief = self._subject_brief_for(
+            "Antigrain",
+            sourceCounts={"conversations": 8},
+            topChannels=[{"channel": "#general", "count": 5, "summary": "Antigrain asks odd concrete questions and talks about the Network."}],
+            topTopicDetails=[{"topic": "vibrating beds and Network motives", "count": 3, "summary": "Owned evidence includes vibrating beds and questioning Network motives."}],
+            usefulEvidence=[
+                {"summary": "Antigrain asks why the BARCODE Network wants vibrating beds in the room.", "authorName": "Antigrain", "sourceType": "Discord conversation", "visibility": "public_context"},
+                {"summary": "Antigrain questions the Network's motives and intent around weird physical objects.", "authorName": "Antigrain", "sourceType": "Discord conversation", "visibility": "public_context"},
+            ],
+            relationshipSignals=["Orion appears near Antigrain in broader community context; meaning unconfirmed."],
+            representativeEvidence=[{"summary": "Antigrain asked about vibrating beds and questioned Network motives in #general.", "authorName": "Antigrain", "channelName": "#general", "sourceType": "Discord conversation", "visibility": "public_context"}],
+        )
+        self.assertTrue(any("vibrating" in item.get("subject", "").lower() for item in brief["behavioralSignatureV1"]["unusualRecurringSubjects"]))
+        self.assertIn(brief["behavioralSignatureV1"]["stanceTowardNetwork"]["stance"], {"questioning", "skeptical"})
+        self.assertIn("unusual recurring subjects", brief["bnlTake"].lower())
+        self.assertIn("network skepticism", brief["bnlTake"].lower())
+        self.assertNotIn("Orion", {item.get("name") for item in brief["namedAnchors"]})
+        self.assertIn("Orion", {item.get("name") for item in brief["nearbyContextSignals"]})
+        self.assertTrue(any("warning" in item and "not treat" in item["warning"].lower() for item in brief["nearbyContextSignals"]))
+
+    def test_evidence_ownership_crow_owned_orion_archive_ai_can_anchor(self):
+        brief = self._subject_brief_for(
+            "Crow",
+            sourceCounts={"conversations": 7},
+            topChannels=[{"channel": "#barcode-bot", "count": 5, "summary": "Crow addresses BNL with Orion archive language."}],
+            topTopicDetails=[{"topic": "Orion archive AI language", "count": 4}],
+            usefulEvidence=[
+                {"summary": "Crow says Orion is my AI and speaks through the archive interface.", "authorName": "Crow", "sourceType": "Discord conversation", "visibility": "public_context"},
+                {"summary": "Crow frames the archive as Orion speaking through a connected intelligence.", "authorName": "Crow", "sourceType": "Discord conversation", "visibility": "public_context"},
+            ],
+            representativeEvidence=[{"summary": "Crow told BNL-01 that Orion is my AI and the archive speaks through Orion.", "authorName": "Crow", "channelName": "#barcode-bot", "sourceType": "Discord conversation", "visibility": "public_context"}],
+        )
+        self.assertIn("Orion", {item.get("name") for item in brief["namedAnchors"]})
+        body = json.dumps(brief["behavioralSignatureV1"], sort_keys=True).lower()
+        self.assertIn("archive", body)
+        self.assertIn("orion", body)
+        self.assertIn("ai", body)
+        self.assertIn("orion/archive-facing", brief["bnlTake"].lower())
+        self.assertIn("review-only", brief["bnlTake"].lower())
+
+    def test_evidence_ownership_shortybabe_bnl_challenger_signature(self):
+        brief = self._subject_brief_for(
+            "ShortyBabe",
+            sourceCounts={"conversations": 6},
+            topChannels=[{"channel": "#barcode-bot", "count": 4, "summary": "ShortyBabe challenges BNL repeatedly."}],
+            topTopicDetails=[{"topic": "BNL challenge and pushback", "count": 4}],
+            usefulEvidence=[
+                {"summary": "ShortyBabe challenges BNL-01 and pushes back on the Source File boundary.", "authorName": "ShortyBabe", "sourceType": "Discord conversation", "visibility": "public_context"},
+                {"summary": "ShortyBabe teases BNL and provokes BNL-01 about the rules.", "authorName": "ShortyBabe", "sourceType": "Discord conversation", "visibility": "public_context"},
+            ],
+            representativeEvidence=[{"summary": "ShortyBabe challenged BNL-01 and pushed back at the rules.", "authorName": "ShortyBabe", "channelName": "#barcode-bot", "sourceType": "Discord conversation", "visibility": "public_context"}],
+        )
+        self.assertIn(brief["behavioralSignatureV1"]["stanceTowardBNL"]["stance"], {"antagonistic", "playful_challenger"})
+        self.assertIn("challenge", json.dumps(brief["behavioralSignatureV1"], sort_keys=True).lower())
+        self.assertIn("generic community chatter", brief["bnlTake"].lower())
+
+    def test_co_mention_only_named_entity_routes_to_nearby_context(self):
+        brief = self._subject_brief_for(
+            "Signal Fox",
+            relationshipSignals=["Nova Artifact appears near Signal Fox in co-mentioned archive context only."],
+            representativeEvidence=[{"summary": "Signal Fox discussed community topics without adding the nearby entity as owned evidence.", "authorName": "Signal Fox", "sourceType": "Discord conversation", "visibility": "public_context"}],
+        )
+        self.assertNotIn("Nova", {item.get("name") for item in brief["namedAnchors"]})
+        self.assertTrue(any(item.get("name") in {"Nova", "Artifact"} for item in brief["nearbyContextSignals"]))
+
+    def test_source_blind_legacy_is_quarantined_from_owned_claims(self):
+        packet = self.large_packet()
+        packet.update({"subject": "Legacy Fox", "representativeEvidence": [], "memory_tiers": {"source_blind_memory_trace": ["Legacy Fox may be tied to Orion from old memory_tiers/source_blind_memory_trace."]}})
+        memory = enrichment.build_subject_memory_packet_v1(packet)
+        memory["memory_tiers"] = packet["memory_tiers"]
+        brief = enrichment.build_subject_intelligence_brief_v1(memory)
+        self.assertGreaterEqual(brief["evidenceOwnershipSummary"]["sourceBlindLegacyEvidenceCount"], 1)
+        self.assertTrue(brief["evidenceOwnershipSummary"]["sourceBlindWarnings"])
+        self.assertNotIn("Orion", {item.get("name") for item in brief["namedAnchors"]})
+
+    def test_generated_taxonomy_labels_remain_ignored_noise_not_anchors(self):
+        brief = self._subject_brief_for(
+            "Taxonomy Fox",
+            topTopicDetails=[{"topic": "internal classification source file relationship taxonomy", "count": 5}],
+            sourceCoverage=["ENTITY", "LOCAL", "SOURCE FILE", "RELATIONSHIP", "INTERNAL"],
+            representativeEvidence=[{"summary": "Taxonomy Fox had one generic public chat item.", "authorName": "Taxonomy Fox", "sourceType": "Discord conversation", "visibility": "public_context"}],
+        )
+        anchors = {item.get("name") for item in brief["namedAnchors"]}
+        self.assertNotIn("Internal", anchors)
+        noise_terms = {item.get("term") for item in brief["ignoredExtractionNoise"]}
+        self.assertTrue({"internal", "source file", "relationship"} & noise_terms)
