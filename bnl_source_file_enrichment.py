@@ -3684,7 +3684,7 @@ def _subject_archetype_read(subject: str, memory: dict[str, Any], profile: dict[
     review_body = " ".join(_review_only_shape_texts(ownership or {})).lower()
     excluded_shape = []
     if any(term in review_body for term in ("orion", "interface", "lore")) and not has_lore:
-        excluded_shape.append("nearby Orion/interface/lore context is quarantined for review")
+        excluded_shape.append("Nearby/shared context is not used for this subject's main read.")
     rationale = _case_text(f"BNL classifies {subject} this way because the strongest main-read-eligible pattern is {', '.join(signals[:4]) if signals else 'too thin or generic to type safely'}. This is a shape read for internal review, not a public identity confirmation.", 520)
     return {"archetype": archetype, "confidence": confidence, "rationale": rationale, "distinguishingSignals": _case_list(signals or ["Evidence is too thin/generic to separate this subject from a generic Source File."], limit=6), "notEnoughEvidenceFor": _case_list(missing, limit=6), "excludedShapeSignals": excluded_shape}
 
@@ -3698,8 +3698,8 @@ def _distinguishing_read(archetype: dict[str, Any]) -> str:
         return "Distinctive because main-read-eligible subject-owned evidence is Orion/interface-linked rather than generic community chatter."
     if "bnl" in signals:
         return "Distinctive because main-read-eligible subject-owned evidence is BNL-facing rather than generic community chatter."
-    if any("orion/interface" in str(item).lower() for item in archetype.get("excludedShapeSignals") or []):
-        return "Not distinctive enough from owned evidence; nearby Orion/interface context is quarantined for review."
+    if any("nearby/shared context" in str(item).lower() or "not used for this subject" in str(item).lower() for item in archetype.get("excludedShapeSignals") or []):
+        return "Not distinctive enough from owned evidence; nearby/shared context is not used for this subject's main read."
     if "weird concrete" in signals or "network skepticism" in signals:
         return "Distinctive because subject-owned evidence includes weird concrete topics and/or Network skepticism rather than nearby lore context."
     if "music" in signals or "platform" in signals or "track" in signals:
@@ -3729,14 +3729,12 @@ def _build_bnl_take(subject: str, memory: dict[str, Any], topics: list[dict[str,
     bnl_stance = (sig.get("stanceTowardBNL") or {}).get("stance") if isinstance(sig.get("stanceTowardBNL"), dict) else ""
     network_stance = (sig.get("stanceTowardNetwork") or {}).get("stance") if isinstance(sig.get("stanceTowardNetwork"), dict) else ""
     unusual_subjects = [item.get("subject") for item in (sig.get("unusualRecurringSubjects") or []) if isinstance(item, dict)]
-    nearby_names = [item.get("name") for item in (nearby_context or []) if isinstance(item, dict)]
-    has_nearby_orion = any(str(name).lower() in {"orion", "interface", "lore"} for name in nearby_names)
     if "orion" in sig_read.lower() and ("archive" in sig_read.lower() or "ai" in sig_read.lower()):
         text = f"BNL reads {subject} as an Orion/archive-facing subject when the owned evidence frames Orion as an AI, speaker, archive, or connected intelligence. This is review-only: relationship meaning and canon status still need explicit confirmation."
     elif bnl_stance in {"antagonistic", "playful_challenger"}:
         text = f"BNL reads {subject} as a BNL-facing antagonist or playful challenger because subject-owned evidence shows repeated challenge, pushback, teasing, or provocation toward BNL. That distinguishes the file from generic community chatter, but tone and public wording need review."
     elif unusual_subjects or network_stance in {"questioning", "skeptical"}:
-        text = f"BNL reads {subject} as a weird-topic community participant whose owned evidence includes unusual recurring subjects{(': ' + ', '.join(unusual_subjects[:3])) if unusual_subjects else ''} and Network skepticism/questioning when supported by the cited fragments. Nearby context stays quarantined unless owned evidence supports it."
+        text = f"BNL reads {subject} as a weird-topic community participant whose owned evidence includes unusual recurring subjects{(': ' + ', '.join(unusual_subjects[:3])) if unusual_subjects else ''} and Network skepticism/questioning when supported by the cited fragments. Nearby/shared context is not used for this subject's main read."
     elif "BNL-facing lore/interface" in name:
         text = f"BNL reads {subject} as a recurring BARCODE-side participant whose activity is unusually BNL-facing. The strongest pattern is not ordinary artist submission behavior; it is interface/lore-style interaction around {signals}. That makes {subject} more useful as a community/lore/interface subject than as a confirmed artist profile until queue history, public music ownership, and anchor meaning are confirmed."
     elif "music-link" in name:
@@ -3751,8 +3749,6 @@ def _build_bnl_take(subject: str, memory: dict[str, Any], topics: list[dict[str,
         text = f"BNL does not have enough distinctive evidence to type {subject} beyond a weak Source File candidate. Add recurring activity, channel pattern, music/link details, relationship context, or queue/public-source confirmation before making a sharper read."
     else:
         text = f"BNL reads {subject} as {name}. The useful pattern is {signals or 'the available subject evidence'}, but the packet still cannot support {missing or 'public identity, role, relationship meaning, or queue history'} without admin confirmation."
-    if has_nearby_orion and "orion/archive-facing" not in text.lower():
-        text = f"{text} Nearby context references Orion, but BNL does not have subject-owned evidence to treat Orion as part of this subject’s profile."
     return _case_text(text, 980)
 
 
@@ -3832,6 +3828,138 @@ def _behavioral_signature_v1(subject: str, ownership: dict[str, Any]) -> dict[st
         read = f"BNL does not have enough subject-owned evidence to form a behavioral signature for {subject}."
     return {"signatureRead": _case_text(read, 420), "recurringBehaviors": recurring[:6], "stanceTowardBNL": {"stance": bnl_stance, "confidence": bnl_conf, "evidence": bnl_evidence[:4], "note": bnl_note}, "stanceTowardNetwork": network, "unusualRecurringSubjects": unusual[:6]}
 
+
+
+def _visible_allowed_entity_terms(brief_or_context: dict[str, Any]) -> set[str]:
+    """Entity terms allowed in visible Source File copy for this specific subject."""
+    allowed: set[str] = set()
+
+    def add(value: Any) -> None:
+        text = _case_text(value, 120).strip(".,;:()[]{}<>\"'")
+        if text:
+            allowed.add(text.lower())
+
+    add(brief_or_context.get("subjectName") or brief_or_context.get("subject"))
+    for alias in brief_or_context.get("confirmedAliases") or brief_or_context.get("aliases") or []:
+        add(alias)
+    for item in brief_or_context.get("namedAnchors") or []:
+        if isinstance(item, dict):
+            add(item.get("name"))
+    ownership = brief_or_context.get("ownership") if isinstance(brief_or_context.get("ownership"), dict) else {}
+    for text in _main_read_eligible_texts(ownership):
+        for known in _MEANINGFUL_ANCHOR_TYPES:
+            pattern = re.escape(known).replace("\\ ", r"\s+")
+            if re.search(rf"(?<![-A-Za-z0-9]){pattern}(?![-A-Za-z0-9])", text, flags=re.I):
+                add("BNL-01" if known == "bnl-01" else ("BNL" if known == "bnl" else ("BARCODE" if known == "barcode" else ("EDGE" if known == "edge" else known[:1].upper() + known[1:]))))
+        for match in re.findall(r"(?<![-A-Za-z0-9])[A-Z][A-Za-z0-9'’-]{2,}(?:-[A-Za-z0-9'’-]+)*\b", text):
+            add(match)
+    return allowed
+
+
+def _visible_disallowed_entity_terms(brief_or_context: dict[str, Any]) -> set[str]:
+    """Entity terms present only in nearby/review diagnostics and not allowed visibly."""
+    allowed = _visible_allowed_entity_terms(brief_or_context)
+    terms: set[str] = set()
+
+    def add(value: Any) -> None:
+        text = _case_text(value, 160).strip(".,;:()[]{}<>\"'")
+        if not text:
+            return
+        parts = [text]
+        if "/" in text:
+            parts.extend(part.strip() for part in text.split("/"))
+        for part in parts:
+            clean = _case_text(part, 80).strip(".,;:()[]{}<>\"'")
+            key = clean.lower()
+            if clean and key not in allowed and not _is_anchor_noise_key(_anchor_noise_key(clean)):
+                terms.add(clean)
+
+    for item in brief_or_context.get("nearbyContextSignals") or []:
+        if isinstance(item, dict):
+            add(item.get("name"))
+    diagnostics = brief_or_context.get("ownershipRoutingDiagnostics") if isinstance(brief_or_context.get("ownershipRoutingDiagnostics"), dict) else {}
+    for item in diagnostics.get("overpromotedCandidatesBlocked") or []:
+        if isinstance(item, dict):
+            add(item.get("term"))
+    main = brief_or_context.get("mainReadRoutingDiagnostics") if isinstance(brief_or_context.get("mainReadRoutingDiagnostics"), dict) else {}
+    for item in main.get("excludedShapeSignals") or []:
+        if isinstance(item, dict):
+            add(item.get("signal"))
+    return {term for term in terms if term.lower() not in allowed}
+
+
+def _strip_non_applicable_visible_entities(text: str, disallowed_terms: set[str]) -> str:
+    """Remove non-applicable entity names from visible prose without exposing exclusion labels."""
+    if not isinstance(text, str) or not text or not disallowed_terms:
+        return text
+    cleaned = text
+    for term in sorted(disallowed_terms, key=len, reverse=True):
+        if not term or len(term) < 2:
+            continue
+        pat = re.compile(rf"(?<![-A-Za-z0-9]){re.escape(term)}(?![-A-Za-z0-9])", flags=re.I)
+        cleaned = pat.sub("nearby entities" if term[:1].isupper() else "nearby context", cleaned)
+    replacements = [
+        (r"nearby nearby entities(?:/interface)? context is quarantined for review", "nearby non-owned context is not used for this subject's main read"),
+        (r"Nearby context references nearby entities(?:, but)?", "Nearby context references other entities,"),
+        (r"does not have subject-owned evidence to treat nearby entities as part of this subject[’']s profile", "does not have subject-owned evidence to treat nearby entities as part of this subject's profile"),
+        (r"nearby entities is quarantined", "nearby/shared context is not used"),
+        (r"not nearby entities-linked", "not linked to nearby entities"),
+        (r"without nearby entities evidence", "without enough subject-owned evidence"),
+    ]
+    for pattern, repl in replacements:
+        cleaned = re.sub(pattern, repl, cleaned, flags=re.I)
+    cleaned = re.sub(r"\bnearby entities(?:/nearby context)+\b", "nearby entities", cleaned, flags=re.I)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned
+
+
+_VISIBLE_PRIMARY_COPY_FIELDS = {
+    "subjectRead",
+    "bnlTake",
+    "distinguishingRead",
+    "interactionPatterns",
+    "musicLinkSignals",
+    "musicAndLinkSignals",
+    "relationshipContextSignals",
+    "relationshipSignals",
+    "confidenceRead",
+    "queueSubmissionRead",
+}
+
+
+def _scrub_visible_source_file_copy(brief: dict[str, Any], ownership: dict[str, Any], subject: str, confirmed_aliases: list[str]) -> dict[str, Any]:
+    context = {**brief, "ownership": ownership, "subjectName": subject, "confirmedAliases": confirmed_aliases}
+    disallowed = _visible_disallowed_entity_terms(context)
+    if not disallowed:
+        return brief
+
+    def scrub_value(value: Any) -> Any:
+        if isinstance(value, str):
+            return _strip_non_applicable_visible_entities(value, disallowed)
+        if isinstance(value, list):
+            return [scrub_value(item) for item in value]
+        if isinstance(value, dict):
+            return {key: scrub_value(val) for key, val in value.items()}
+        return value
+
+    for field in _VISIBLE_PRIMARY_COPY_FIELDS:
+        if field in brief:
+            brief[field] = scrub_value(brief[field])
+    if isinstance(brief.get("subjectArchetypeRead"), dict):
+        for key in ("rationale", "distinguishingSignals", "notEnoughEvidenceFor", "excludedShapeSignals"):
+            if key in brief["subjectArchetypeRead"]:
+                brief["subjectArchetypeRead"][key] = scrub_value(brief["subjectArchetypeRead"][key])
+    if isinstance(brief.get("topicBuckets"), list):
+        for bucket in brief["topicBuckets"]:
+            if isinstance(bucket, dict):
+                for key in ("explanation", "exampleSignals"):
+                    if key in bucket:
+                        bucket[key] = scrub_value(bucket[key])
+    if isinstance(brief.get("behavioralSignatureV1"), dict):
+        brief["behavioralSignatureV1"] = scrub_value(brief["behavioralSignatureV1"])
+    if isinstance(brief.get("namedAnchors"), list):
+        brief["namedAnchors"] = [item for item in brief["namedAnchors"] if not (isinstance(item, dict) and str(item.get("name") or "").lower() in {term.lower() for term in disallowed})]
+    return brief
 
 def _source_file_gaps(memory: dict[str, Any], anchors: list[dict[str, Any]]) -> list[str]:
     gaps = _case_list(memory.get("openQuestions"), limit=6, item_limit=220)
@@ -3929,7 +4057,7 @@ def build_subject_intelligence_brief_v1(memory: dict[str, Any]) -> dict[str, Any
         queue_read = f"Queue/submission data is not connected. {queue_read}"
     confidence = _case_text(f"Archetype confidence is {archetype.get('confidence')} for the internal shape read. Safety remains strict: identity, public role, relationship meaning, queue/submission claims, payment/Priority status, and public-safe anchor meaning stay unconfirmed until admin review connects source links. This brief is admin-facing and review-only.", 520)
     gaps = _source_file_gaps(memory, anchors)
-    return _sanitize_archive_value({
+    brief = {
         "subjectRead": _build_subject_read(subject, profile, topics, channels, archetype, behavioral_signature),
         "bnlTake": _build_bnl_take(subject, memory, topics, anchors, archetype, behavioral_signature, nearby_context),
         "subjectArchetypeRead": archetype,
@@ -3962,7 +4090,8 @@ def build_subject_intelligence_brief_v1(memory: dict[str, Any]) -> dict[str, Any
             "Do not publish raw channel context, raw IDs, internal table/debug labels, or private-source detail.",
             "Do not present Orion/Network/EDGE/BARCODE/BNL-01 anchors as confirmed public facts until admin review marks them safe.",
         ], limit=8, item_limit=240),
-    })
+    }
+    return _sanitize_archive_value(_scrub_visible_source_file_copy(brief, ownership, subject, confirmed_aliases))
 
 
 def build_subject_memory_packet_v1(packet: dict[str, Any]) -> dict[str, Any]:
