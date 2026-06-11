@@ -3267,6 +3267,22 @@ def _clean_topic_label(value: Any) -> str:
     return text[:1].upper() + text[1:] if text else "Unlabeled recurring topic"
 
 
+def _topic_explanation(topic: str, detail: str, signals: list[str]) -> str:
+    lowered = f"{topic} {detail} {' '.join(signals)}".lower()
+    if "music" in lowered or "suno" in lowered or "spotify" in lowered or "soundcloud" in lowered or "youtube" in lowered or "link" in lowered:
+        return _case_text(detail or "Music/link sharing appears in the evidence, but the packet does not prove the links are the subject's own music. Treat this as a prompt to confirm artist role, link ownership, queue status, and public music links.", 320)
+    if "interface" in lowered or "lore" in lowered or "orion" in lowered or "sync" in lowered or "convergence" in lowered or "node" in lowered:
+        return _case_text(detail or "Interface/lore language suggests the subject may be participating as a BARCODE/BNL-facing or character-adjacent presence, not merely ordinary chat; meaning still needs admin confirmation.", 320)
+    if "bnl" in lowered or "source file" in lowered or "source-file" in lowered or "dossier" in lowered or "threshold" in lowered:
+        return _case_text(detail or "BNL-facing Source File behavior is prominent for this subject; the useful read is about how they interact with BNL review boundaries, not a public identity claim.", 320)
+    if "collab" in lowered or "wip" in lowered or "finished" in lowered:
+        return _case_text(detail or "Collaboration/WIP context makes this subject useful for network mapping, but the packet still needs confirmation of owned work versus helping, sharing, or appearing around projects.", 320)
+    if "radio" in lowered or "show" in lowered:
+        return _case_text(detail or "Show/radio context appears as a participation signal; confirm whether this is hosting, guesting, playlist/play-history, or ordinary discussion before public wording.", 320)
+    if "community" in lowered or "chat" in lowered or "social" in lowered or "support" in lowered:
+        return _case_text(detail or "The subject reads primarily through community presence and conversation/support patterns; do not upgrade that into artist, submitter, or lore identity without stronger evidence.", 320)
+    return _case_text(detail or f"Extracted evidence points at {topic.lower()}, but the packet has limited subject-specific detail behind that label.", 320)
+
 def _topic_buckets(memory: dict[str, Any]) -> list[dict[str, Any]]:
     context = _brief_context(memory)
     candidates: list[Any] = []
@@ -3300,7 +3316,7 @@ def _topic_buckets(memory: dict[str, Any]) -> list[dict[str, Any]]:
             strength = "moderate"
         elif re.search(r"\bnoise|generic|unclear\b", topic, re.I):
             strength = "noise"
-        explanation = detail or (f"Recurring extracted evidence points at {topic.lower()} as a subject pattern." if signals else f"Extracted topic/theme label appears for {topic.lower()}, but the packet has limited detail behind it.")
+        explanation = _topic_explanation(topic, detail, signals)
         buckets.append({"topic": topic, "strength": strength, **({"evidenceCount": count} if count is not None else {}), "explanation": explanation, **({"exampleSignals": signals[:3]} if signals else {})})
         if len(buckets) >= 10:
             break
@@ -3416,11 +3432,17 @@ def _named_anchor_extraction(memory: dict[str, Any]) -> tuple[list[dict[str, Any
         name = canonical.get(key, key)
         strength = "strong" if count >= 4 or distinct >= 3 else ("moderate" if count >= 2 or distinct >= 2 else "weak")
         anchor_type = _domain_anchor_type(name)
-        note = f"Appears in evidence-bearing source fragments {count} time{'s' if count != 1 else ''}; treat meaning as review-only unless separately confirmed."
+        note = f"Appears in {count} evidence-bearing source fragment{'s' if count != 1 else ''}; admin should decide whether it has subject-specific public meaning."
         if key == "orion":
-            note = "Recurring Orion-linked context appears in evidence, but the report does not confirm what that connection means."
+            note = "Recurring Orion-linked context; relationship/meaning not confirmed."
+        elif key == "barcode":
+            note = "Network/project context appears; not enough by itself to define role."
+        elif key in {"bnl", "bnl-01", "bnl 01"}:
+            note = "BNL-facing interaction pattern; suggests the subject interacts with BNL as a system/persona."
         elif key in {"suno", "spotify", "soundcloud", "youtube"} or anchor_type in {"url", "domain"}:
-            note = "Platform/link signal appears in evidence; do not assume ownership or queue submission without connected queue/source data."
+            note = "Music-platform/link signal; ownership and submission status not confirmed."
+        elif key in {"network", "edge", "lardcode"}:
+            note = "BARCODE/lore-adjacent context appears; do not treat role or canon meaning as confirmed."
         anchors.append({"name": name, "type": anchor_type, "strength": strength, "note": note})
         if len(anchors) >= 12:
             break
@@ -3443,27 +3465,143 @@ def _signals_from(memory: dict[str, Any], fields: tuple[str, ...], fallback: str
     return deduped or [fallback]
 
 
-def _build_subject_read(subject: str, profile: dict[str, Any], topics: list[dict[str, Any]], channels: list[dict[str, Any]]) -> str:
+def _brief_signal_text(memory: dict[str, Any], topics: list[dict[str, Any]], anchors: list[dict[str, Any]], channels: list[dict[str, Any]] | None = None) -> str:
+    context = _brief_context(memory)
+    shape_fields = (
+        "conversationThemes", "topicThemes", "topTopicDetails", "topicBreakdown", "knownContext", "usefulEvidence",
+        "bestEvidenceToReview", "bnlInteractionSignals", "musicSignals", "communitySignals", "relationshipSignals",
+        "evidenceDetails", "representativeEvidence", "topChannels", "recentActivitySummary", "authoredVsMentionedSummary",
+    )
+    values = [topics, anchors, channels or [], memory.get("representativeMoments")]
+    values.extend(context.get(field) for field in shape_fields)
+    fragments = []
+    for text in _case_flatten_text_values(values, max_items=160, item_limit=300):
+        lowered = text.lower()
+        if any(generic in lowered for generic in ("no specific", "current report packet", "current evidence packet does not expose", "not connected to this report")):
+            continue
+        fragments.append(text)
+    return json.dumps(fragments, default=str).lower()
+
+
+def _queue_connected(memory: dict[str, Any]) -> bool:
+    return str(_brief_context(memory).get("queueSubmissionStatus") or "not_connected").lower() not in {"", "not_connected", "unknown", "none"}
+
+
+def _subject_archetype_read(subject: str, memory: dict[str, Any], profile: dict[str, Any], topics: list[dict[str, Any]], anchors: list[dict[str, Any]], channels: list[dict[str, Any]]) -> dict[str, Any]:
+    body = _brief_signal_text(memory, topics, anchors, channels)
+    total = _as_int(profile.get("totalEvidenceScanned")) or _as_int(profile.get("totalApprovedPublicAuthoredItems")) or len(memory.get("representativeMoments") or [])
+    queue_connected = _queue_connected(memory)
+    has_bnl = any(term in body for term in ("bnl-01", "bnl", "threshold", "boundary", "operational"))
+    has_lore = any(term in body for term in ("orion", "interface", "lore", "sync", "convergence", "network", "edge", "node", "liaison"))
+    has_music = any(term in body for term in ("suno", "spotify", "soundcloud", "youtube", "music", "song", "track", "demo", "beat", "link"))
+    has_collab = any(term in body for term in ("collab", "wip", "helper", "network helper"))
+    has_show = any(term in body for term in ("radio", "show", "broadcast"))
+    has_sponsor = any(term in body for term in ("sponsor", "ad entity", "advertiser", "promo"))
+    has_operator = any(term in body for term in ("operator", "moderator", "mod/support", "admin support", "support subject"))
+    has_chat = any(term in body for term in ("general-chat", "chat", "social", "community", "support chatter"))
+    anchor_names = {str(a.get("name") or "").lower() for a in anchors}
+    signals: list[str] = []
+    if has_bnl:
+        signals.append("BNL/source-file interaction appears repeatedly")
+    if has_lore or "orion" in anchor_names:
+        signals.append("Orion/interface/lore language appears in the subject evidence")
+    if has_music:
+        signals.append("music platforms, music links, tracks, or song language appear")
+    if has_collab:
+        signals.append("collaboration, WIP, finished-track, or helper context appears")
+    if has_show:
+        signals.append("show/radio/broadcast context appears")
+    if has_chat:
+        signals.append("community conversation or social/support chatter appears")
+    if queue_connected:
+        signals.append("connected queue/submission status is present")
+
+    if total <= 1 and len(signals) <= 1:
+        archetype = "weak/unknown subject"
+    elif has_sponsor and not (has_bnl or has_music or has_chat):
+        archetype = "sponsor/ad entity"
+    elif has_operator and not has_music:
+        archetype = "operator/mod/support subject"
+    elif queue_connected and has_music:
+        archetype = "artist / music submitter"
+    elif has_bnl and has_lore:
+        archetype = "BNL-facing lore/interface subject"
+    elif has_bnl:
+        archetype = "BNL-facing interaction subject"
+    elif has_music and has_collab:
+        archetype = "collaborator / network helper"
+    elif has_music:
+        archetype = "music-link sharer"
+    elif has_show:
+        archetype = "show/radio participant"
+    elif has_lore:
+        archetype = "lore/interface subject"
+    elif has_chat or total >= 4:
+        archetype = "active community participant"
+    else:
+        archetype = "weak/unknown subject"
+
+    if archetype != "weak/unknown subject" and sum(bool(x) for x in (has_bnl or has_lore, has_music, has_collab, has_show, has_sponsor, has_operator, has_chat)) >= 3:
+        if not (queue_connected and has_music):
+            archetype = "mixed subject / needs admin classification" if not (has_bnl and has_lore) else "BNL-facing lore/interface subject"
+    confidence = "weak" if archetype == "weak/unknown subject" or total <= 1 else ("strong" if total >= 8 and len(signals) >= 2 else "moderate")
+    missing: list[str] = []
+    if has_music and not queue_connected:
+        missing.append("confirmed owned music links or connected queue/submission history")
+    if has_bnl or has_lore:
+        missing.append("confirmed public-safe meaning for BNL/Orion/interface/lore anchors")
+    if not queue_connected:
+        missing.append("artist, submitter, played-track, payment, or Priority status")
+    missing.append("public identity, alias certainty, and relationship meaning")
+    if archetype == "weak/unknown subject":
+        missing.insert(0, "specific recurring activity, channels, links, relationships, or public-safe role")
+    rationale = _case_text(f"BNL classifies {subject} this way because the strongest visible pattern is {', '.join(signals[:4]) if signals else 'too thin or generic to type safely'}. This is a shape read for internal review, not a public identity confirmation.", 520)
+    return {"archetype": archetype, "confidence": confidence, "rationale": rationale, "distinguishingSignals": _case_list(signals or ["Evidence is too thin/generic to separate this subject from a generic Source File."], limit=6), "notEnoughEvidenceFor": _case_list(missing, limit=6)}
+
+
+def _distinguishing_read(archetype: dict[str, Any]) -> str:
+    signals = " ".join(archetype.get("distinguishingSignals") or []).lower()
+    name = str(archetype.get("archetype") or "")
+    if "weak/unknown" in name:
+        return "Not distinctive yet; current evidence is too thin or too generic."
+    if "bnl" in signals or "orion" in signals or "interface" in signals:
+        return "Distinctive because the strongest activity is BNL-facing and/or Orion/interface-linked rather than generic community chatter."
+    if "music" in signals or "platform" in signals or "track" in signals:
+        return "Distinctive because the strongest evidence is music/link sharing, not conversation volume or confirmed queue history."
+    if "collaboration" in signals or "wip" in signals or "helper" in signals:
+        return "Distinctive because the subject appears mainly through collaboration, WIP, finished-track, or network-helper contexts."
+    if "radio" in signals or "show" in signals:
+        return "Distinctive because show/radio participation is the clearest pattern."
+    return "Distinctive mainly by recurring community participation; current evidence does not support a narrower artist, lore, or submitter read."
+
+
+def _build_subject_read(subject: str, profile: dict[str, Any], topics: list[dict[str, Any]], channels: list[dict[str, Any]], archetype: dict[str, Any]) -> str:
     topic_names = ", ".join(bucket.get("topic", "") for bucket in topics[:4] if bucket.get("topic")) or "not enough extracted topic detail"
     primary = next((ch for ch in channels if ch.get("role") == "primary"), channels[0] if channels else {})
     where = primary.get("channelName") or "unknown channel coverage"
-    return _case_text(f"BNL reads {subject} through {profile.get('activityLevel', 'unknown activity')} Source File evidence. The clearest extracted topics are {topic_names}. The most visible safe channel read is {where}; channel names are omitted when the packet only exposes private/internal context.", 700)
+    missing = "; ".join((archetype.get("notEnoughEvidenceFor") or [])[:2])
+    return _case_text(f"BNL reads {subject} as {archetype.get('archetype')} ({archetype.get('confidence')} confidence) based on {profile.get('activityLevel', 'unknown activity')} evidence. What makes this file different is: {_distinguishing_read(archetype)} The evidence pattern runs through {topic_names}, with the clearest safe channel read at {where}. BNL is not allowed to assume {missing or 'public identity, role, relationship meaning, or queue history'} yet.", 900)
 
 
-def _build_bnl_take(subject: str, memory: dict[str, Any], topics: list[dict[str, Any]], anchors: list[dict[str, Any]]) -> str:
-    body = json.dumps([topics, anchors, _brief_context(memory), memory.get("communityContext"), memory.get("musicCreativeContext")], default=str).lower()
-    traits: list[str] = []
-    if any(term in body for term in ("bnl", "source-file", "source file", "dossier", "threshold", "sync", "convergence", "interface", "lore")):
-        traits.append("heavily BNL-facing / source-file-facing")
-    if any(term in body for term in ("barcode", "network", "edge", "orion", "lore")):
-        traits.append("community/lore/interface-adjacent")
-    if any(term in body for term in ("suno", "music", "track", "song", "link")):
-        traits.append("music/link-adjacent")
-    if not traits:
-        traits.append("not yet clearly typed")
-    queue_connected = str(memory.get("sourceIntelligenceContext", {}).get("queueSubmissionStatus") or "not_connected") not in {"", "not_connected", "unknown"}
-    queue_line = "Queue/submission data appears connected, so admins can review those facts before drafting." if queue_connected else "Queue/submission data is not connected, so BNL should not call them an artist, submitter, played-track subject, paid user, or Priority subject from this report alone."
-    return _case_text(f"BNL currently reads {subject} as {', '.join(traits)}. The strongest pattern is what recurs across extracted topics, channel activity, named anchors, and representative evidence rather than any single category label. {queue_line} Identity, role, and public alias certainty remain unconfirmed until admin review connects public-safe sources.", 900)
+def _build_bnl_take(subject: str, memory: dict[str, Any], topics: list[dict[str, Any]], anchors: list[dict[str, Any]], archetype: dict[str, Any]) -> str:
+    name = str(archetype.get("archetype") or "weak/unknown subject")
+    missing = "; ".join((archetype.get("notEnoughEvidenceFor") or [])[:3])
+    signals = ", ".join((archetype.get("distinguishingSignals") or [])[:3])
+    if "BNL-facing lore/interface" in name:
+        text = f"BNL reads {subject} as a recurring BARCODE-side participant whose activity is unusually BNL-facing. The strongest pattern is not ordinary artist submission behavior; it is interface/lore-style interaction around {signals}. That makes {subject} more useful as a community/lore/interface subject than as a confirmed artist profile until queue history, public music ownership, and anchor meaning are confirmed."
+    elif "music-link" in name:
+        text = f"BNL reads {subject} as a music-link sharer: the useful signal is the presence of music platforms, tracks, songs, or link-sharing language. The packet should not turn those links into owned music, queue submissions, played tracks, or an artist profile unless connected queue data or public ownership evidence is added."
+    elif "artist / music submitter" in name:
+        text = f"BNL reads {subject} as an artist/music submitter candidate because music evidence and connected queue/submission status appear together. Admin should still verify which links are owned, which tracks were submitted or played, and what can be said publicly."
+    elif "collaborator" in name:
+        text = f"BNL reads {subject} as a collaboration/network-helper subject. The shape is less about standalone identity and more about WIP, finished-track, helper, or project-adjacent contexts; confirm owned work and public role before drafting."
+    elif "active community" in name:
+        text = f"BNL reads {subject} primarily as an active community participant. The evidence supports recurring conversation or support presence, not a confirmed artist, submitter, lore identity, or public relationship claim."
+    elif "weak/unknown" in name:
+        text = f"BNL does not have enough distinctive evidence to type {subject} beyond a weak Source File candidate. Add recurring activity, channel pattern, music/link details, relationship context, or queue/public-source confirmation before making a sharper read."
+    else:
+        text = f"BNL reads {subject} as {name}. The useful pattern is {signals or 'the available subject evidence'}, but the packet still cannot support {missing or 'public identity, role, relationship meaning, or queue history'} without admin confirmation."
+    return _case_text(text, 980)
 
 
 def _source_file_gaps(memory: dict[str, Any], anchors: list[dict[str, Any]]) -> list[str]:
@@ -3485,17 +3623,21 @@ def build_subject_intelligence_brief_v1(memory: dict[str, Any]) -> dict[str, Any
     channels = _channel_breakdown(memory)
     topics = _topic_buckets(memory)
     anchors, ignored_noise = _named_anchor_extraction(memory)
+    archetype = _subject_archetype_read(subject, memory, profile, topics, anchors, channels)
+    distinguishing = _distinguishing_read(archetype)
     music = _signals_from(memory, ("musicSignals", "bestEvidenceToReview", "representativeEvidence"), "No specific music/link signal is confirmed in the current packet; do not infer submissions or ownership.")
     relationship = _signals_from(memory, ("relationshipSignals",), "No relationship signal is confirmed; keep any relationship interpretation review-only.")
     queue_connected = str(_brief_context(memory).get("queueSubmissionStatus") or "not_connected") not in {"", "not_connected", "unknown"}
     queue_read = _case_text(_brief_context(memory).get("queueSubmissionNote") or _join_case_items(memory.get("queueSubmissionContext"), QUEUE_NOT_CONNECTED_NOTE), 360)
     if not queue_connected and "not connected" not in queue_read.lower():
         queue_read = f"Queue/submission data is not connected. {queue_read}"
-    confidence = _case_text("Medium internal confidence when multiple public-safe extracted signals agree; low confidence for identity, public role, relationship meaning, and queue/submission claims until source links are connected. This brief is admin-facing and review-only.", 420)
+    confidence = _case_text(f"Archetype confidence is {archetype.get('confidence')} for the internal shape read. Safety remains strict: identity, public role, relationship meaning, queue/submission claims, payment/Priority status, and public-safe anchor meaning stay unconfirmed until admin review connects source links. This brief is admin-facing and review-only.", 520)
     gaps = _source_file_gaps(memory, anchors)
     return _sanitize_archive_value({
-        "subjectRead": _build_subject_read(subject, profile, topics, channels),
-        "bnlTake": _build_bnl_take(subject, memory, topics, anchors),
+        "subjectRead": _build_subject_read(subject, profile, topics, channels, archetype),
+        "bnlTake": _build_bnl_take(subject, memory, topics, anchors, archetype),
+        "subjectArchetypeRead": archetype,
+        "distinguishingRead": distinguishing,
         "activityProfile": profile,
         "channelBreakdown": channels,
         "topicBuckets": topics,
