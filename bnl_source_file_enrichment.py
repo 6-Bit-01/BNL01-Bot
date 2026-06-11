@@ -28,7 +28,7 @@ from bnl_source_refresh_context import refresh_generation_context
 ENRICHMENT_INGEST_SOURCE = "bnl_source_file_enrichment"
 FALLBACK_INGEST_SOURCE = "bnl_source_knowledge_bridge"
 SOURCE_BLIND_WARNING = "source-blind memory is review-only; do not treat as confirmed fact"
-QUEUE_NOT_CONNECTED_NOTE = "Queue/submission identity is not connected yet."
+QUEUE_NOT_CONNECTED_NOTE = "No confirmed queue or submission history is connected to this Source File yet. Queue/submission data is not connected."
 SITE_EVIDENCE_SUMMARY_LIMIT = 2000
 SITE_EVIDENCE_SUMMARY_TARGET = 1800
 SITE_RAW_PROVENANCE_JSON_LIMIT = 20000
@@ -3004,7 +3004,7 @@ def _infer_subject_memory_coverage(packet: dict[str, Any]) -> dict[str, Any]:
         lane("Source File notes", bool(packet.get("sections")), "Source File enrichment sections/notes were included." if packet.get("sections") else "No Source File note sections were exposed."),
         lane("identity links / aliases", identity_used, "Identity/link signals are review-only inputs; identity is not auto-confirmed." if identity_used else "Identity review is handled through the site Identity Check when links are available."),
         lane("website/source file state", bool(packet.get("sourceFile") or packet.get("matchKind")), f"Website lookup match target: {packet.get('matchKind') or 'unknown'}."),
-        lane("queue/submission data", queue_connected, "Queue/submission data is connected to this report." if queue_connected else "Queue/submission memory is not connected to this report. Do not claim submissions, song counts, play history, payment, or Priority status."),
+        lane("queue/submission data", queue_connected, "Queue/submission data is connected to this report." if queue_connected else "No confirmed queue or submission history is connected to this Source File yet. Queue/submission data is not connected."),
         lane("public/private channel policy", bool(packet.get("warningCounts") or packet.get("sourceAuthority")), "Visibility/channel-policy warnings were carried into review context." if packet.get("warningCounts") or packet.get("sourceAuthority") else "Public/private channel policy is not fully exposed per item."),
         lane("short-term subject context", False, "Short/mid/long-term subject memory lanes are not exposed separately to this report yet; this report uses available conversation, entity, and Source File archive data."),
         lane("mid-term subject patterns", False, "Short/mid/long-term subject memory lanes are not exposed separately to this report yet; this report uses available conversation, entity, and Source File archive data."),
@@ -3341,18 +3341,37 @@ def _clean_topic_label(value: Any) -> str:
 def _topic_explanation(topic: str, detail: str, signals: list[str]) -> str:
     lowered = f"{topic} {detail} {' '.join(signals)}".lower()
     if "music" in lowered or "suno" in lowered or "spotify" in lowered or "soundcloud" in lowered or "youtube" in lowered or "link" in lowered:
-        return _case_text(detail or "Music/link sharing appears in the evidence, but the packet does not prove the links are the subject's own music. Treat this as a prompt to confirm artist role, link ownership, queue status, and public music links.", 320)
+        return _case_text(detail or "Music or link sharing appears in the archive, but BNL has not confirmed that those links are the subject's own music. Treat this as a prompt to confirm artist role, link ownership, queue status, and public music links.", 320)
     if "interface" in lowered or "lore" in lowered or "orion" in lowered or "sync" in lowered or "convergence" in lowered or "node" in lowered:
         return _case_text(detail or "Interface/lore language suggests the subject may be participating as a BARCODE/BNL-facing or character-adjacent presence, not merely ordinary chat; meaning still needs admin confirmation.", 320)
     if "bnl" in lowered or "source file" in lowered or "source-file" in lowered or "dossier" in lowered or "threshold" in lowered:
         return _case_text(detail or "BNL-facing Source File behavior is prominent for this subject; the useful read is about how they interact with BNL review boundaries, not a public identity claim.", 320)
     if "collab" in lowered or "wip" in lowered or "finished" in lowered:
-        return _case_text(detail or "Collaboration/WIP context makes this subject useful for network mapping, but the packet still needs confirmation of owned work versus helping, sharing, or appearing around projects.", 320)
+        return _case_text(detail or "Collaboration or WIP context may help admins map community activity, but BNL still needs to confirm whether this is owned work, helping, sharing, or simply appearing around projects.", 320)
     if "radio" in lowered or "show" in lowered:
         return _case_text(detail or "Show/radio context appears as a participation signal; confirm whether this is hosting, guesting, playlist/play-history, or ordinary discussion before public wording.", 320)
     if "community" in lowered or "chat" in lowered or "social" in lowered or "support" in lowered:
         return _case_text(detail or "The subject reads primarily through community presence and conversation/support patterns; do not upgrade that into artist, submitter, or lore identity without stronger evidence.", 320)
-    return _case_text(detail or f"Extracted evidence points at {topic.lower()}, but the packet has limited subject-specific detail behind that label.", 320)
+    return _case_text(detail or f"Extracted evidence points at {topic.lower()}, but the current archive has limited subject-specific detail behind that label.", 320)
+
+
+def _topic_where_seen(memory: dict[str, Any], topic: str) -> str:
+    context = _brief_context(memory)
+    channel_names: list[str] = []
+    for item in context.get("topChannels") or memory.get("observedChannels") or []:
+        if isinstance(item, dict):
+            name = _safe_channel_name(item.get("channelName") or item.get("channel") or item.get("name") or "", str(item.get("summary") or item.get("note") or ""))
+            if name and name != "unknown channel" and name not in channel_names:
+                channel_names.append(name)
+        elif isinstance(item, str) and item.strip():
+            name = _case_text(item, 80)
+            if name not in channel_names:
+                channel_names.append(name)
+        if len(channel_names) >= 3:
+            break
+    if channel_names:
+        return "Seen mostly in " + ", ".join(channel_names[:3]) + "."
+    return "BNL does not have a specific public channel breakdown for this topic yet."
 
 def _topic_buckets(memory: dict[str, Any], ownership: dict[str, Any] | None = None) -> list[dict[str, Any]]:
     context = _brief_context(memory)
@@ -3401,13 +3420,13 @@ def _topic_buckets(memory: dict[str, Any], ownership: dict[str, Any] | None = No
         if not main_read_eligible and ownership:
             continue
         explanation = _topic_explanation(topic, detail, signals)
-        buckets.append({"topic": topic, "strength": strength, "mainReadEligible": main_read_eligible, "ownershipBasis": ownership_basis, **({"evidenceCount": count} if count is not None else {}), "explanation": explanation, **({"exampleSignals": signals[:3] or review_signals[:2]} if (signals or review_signals) else {})})
+        buckets.append({"topic": topic, "strength": strength, "mainReadEligible": main_read_eligible, "ownershipBasis": ownership_basis, **({"evidenceCount": count} if count is not None else {}), "explanation": explanation, "whereSeen": _topic_where_seen(memory, topic), "exampleSignals": signals[:3] or review_signals[:2] or ["BNL detected this topic, but the current archive does not expose enough safe examples yet."]})
         if len(buckets) >= 10:
             break
     if not buckets and not ownership:
         for text in _case_list(memory.get("repeatedTopics"), limit=4):
             buckets.append({"topic": _clean_topic_label(text), "strength": "weak", "mainReadEligible": False, "ownershipBasis": "unknown", "explanation": text})
-    return buckets if ownership else (buckets or [{"topic": "Insufficient topic extraction", "strength": "weak", "mainReadEligible": False, "ownershipBasis": "unknown", "explanation": "The current packet does not expose enough topic detail to summarize recurring subject themes."}])
+    return buckets if ownership else (buckets or [{"topic": "Insufficient topic extraction", "strength": "weak", "mainReadEligible": False, "ownershipBasis": "unknown", "explanation": "The current archive does not expose enough topic detail to summarize recurring subject themes."}])
 
 
 def _anchor_type(name: str) -> str:
@@ -3590,7 +3609,7 @@ def _signals_from(memory: dict[str, Any], fields: tuple[str, ...], fallback: str
 def _brief_signal_text(memory: dict[str, Any], topics: list[dict[str, Any]], anchors: list[dict[str, Any]], channels: list[dict[str, Any]] | None = None, ownership: dict[str, Any] | None = None) -> str:
     context = _brief_context(memory)
     if ownership:
-        # Main-read shape is allowed to see only explicitly subject-owned or subject-attached authoritative text.
+        # Main admin read shape is allowed to see only explicitly subject-owned or subject-attached authoritative text.
         # Topic labels, topic explanations, non-owned context, review-only text, diagnostics, generated report
         # wording, and generic channel names are intentionally excluded here.
         values = [_main_read_eligible_texts(ownership)]
@@ -3633,11 +3652,11 @@ def _subject_archetype_read(subject: str, memory: dict[str, Any], profile: dict[
     if has_bnl:
         signals.append("BNL/source-file interaction appears repeatedly")
     if has_lore or "orion" in anchor_names:
-        signals.append("Orion/interface/lore language appears in the subject-owned evidence")
+        signals.append("Orion/interface/lore language appears in the direct subject evidence")
     if has_weird_concrete:
-        signals.append("weird concrete subjects appear in subject-owned evidence")
+        signals.append("weird concrete subjects appear in direct subject evidence")
     if has_network_skeptic:
-        signals.append("Network skepticism/questioning appears in subject-owned evidence")
+        signals.append("Network skepticism/questioning appears in direct subject evidence")
     if has_music:
         signals.append("music platforms, music links, tracks, or song language appear")
     if has_collab:
@@ -3694,7 +3713,7 @@ def _subject_archetype_read(subject: str, memory: dict[str, Any], profile: dict[
     excluded_shape = []
     if any(term in review_body for term in ("orion", "interface", "lore")) and not has_lore:
         excluded_shape.append("Nearby/shared context is not used for this subject's main read.")
-    rationale = _case_text(f"BNL classifies {subject} this way because the strongest main-read-eligible pattern is {', '.join(signals[:4]) if signals else 'too thin or generic to type safely'}. This is a shape read for internal review, not a public identity confirmation.", 520)
+    rationale = _case_text(f"BNL classifies {subject} this way because the strongest usable for the main admin read pattern is {', '.join(signals[:4]) if signals else 'too thin or generic to type safely'}. This is a shape read for internal review, not a public identity confirmation.", 520)
     return {"archetype": archetype, "confidence": confidence, "rationale": rationale, "distinguishingSignals": _case_list(signals or ["Evidence is too thin/generic to separate this subject from a generic Source File."], limit=6), "notEnoughEvidenceFor": _case_list(missing, limit=6), "excludedShapeSignals": excluded_shape}
 
 
@@ -3704,13 +3723,13 @@ def _distinguishing_read(archetype: dict[str, Any]) -> str:
     if "weak/unknown" in name:
         return "Not distinctive yet; current evidence is too thin or too generic."
     if "orion" in signals or "interface" in signals:
-        return "Distinctive because main-read-eligible subject-owned evidence is Orion/interface-linked rather than generic community chatter."
+        return "Distinctive because usable for the main admin read direct subject evidence is Orion/interface-linked rather than generic community chatter."
     if "bnl" in signals:
-        return "Distinctive because main-read-eligible subject-owned evidence is BNL-facing rather than generic community chatter."
+        return "Distinctive because usable for the main admin read direct subject evidence is BNL-facing rather than generic community chatter."
     if any("non-owned/shared context" in str(item).lower() or "not used for this subject" in str(item).lower() for item in archetype.get("excludedShapeSignals") or []):
         return "Not distinctive enough from owned evidence; non-owned/shared context is not used for this subject's main read."
     if "weird concrete" in signals or "network skepticism" in signals:
-        return "Distinctive because subject-owned evidence includes weird concrete topics and/or Network skepticism rather than non-owned lore context."
+        return "Distinctive because direct subject evidence includes weird concrete topics and/or Network skepticism rather than non-owned lore context."
     if "music" in signals or "platform" in signals or "track" in signals:
         return "Distinctive because the strongest evidence is music/link sharing, not conversation volume or confirmed queue history."
     if "collaboration" in signals or "wip" in signals or "helper" in signals:
@@ -3743,56 +3762,60 @@ def _digest_pattern_text(digest: dict[str, Any] | None) -> str:
 
 
 def _build_subject_read(subject: str, profile: dict[str, Any], topics: list[dict[str, Any]], channels: list[dict[str, Any]], archetype: dict[str, Any], behavioral_signature: dict[str, Any] | None = None, subject_owned_digest: dict[str, Any] | None = None) -> str:
-    missing = "; ".join((archetype.get("notEnoughEvidenceFor") or [])[:2])
+    missing = "; ".join((archetype.get("notEnoughEvidenceFor") or [])[:2]) or "artist ownership, submitted tracks, queue history, payment status, confirmed aliases, or relationship meaning"
     digest = subject_owned_digest or {}
     quality = str(digest.get("evidenceQuality") or "insufficient")
+    pattern = _digest_pattern_text(digest)
+    channel_names = [str(item.get("channelName") or item.get("channel") or "").strip() for item in channels if isinstance(item, dict)]
+    channel_names = [name for name in channel_names if name and name != "unknown channel"]
+    where = ", ".join(channel_names[:3]) if channel_names else "the available public BARCODE archive"
+    confirmed = pattern or "community participation is present, but the current archive has not exposed a sharper pattern yet"
     if quality in {"thin", "insufficient"} and not (digest.get("concreteTopics") or digest.get("distinctiveBehaviors") or digest.get("representativeMoments")):
-        return _case_text(f"BNL has limited subject-owned evidence. Add concrete source notes or confirmed authored examples before drafting. BNL is not allowed to assume {missing or 'public identity, role, relationship meaning, or queue history'} yet.", 780)
-    pattern = _digest_pattern_text(digest) or "limited subject-owned detail"
+        return _case_text(f"BNL currently reads {subject} as an early Source File candidate with limited direct evidence. The archive shows only light participation so far, mostly in {where}. Confirmed: BNL has some safe archive context to review. Not confirmed: {missing}. Admin should add concrete examples or confirmed authored activity before drafting public dossier language.", 980)
     signature = behavioral_signature.get("signatureRead") if isinstance(behavioral_signature, dict) else ""
-    signature_note = f" Subject-owned behavior note: {signature}" if signature else ""
-    return _case_text(f"BNL reads {subject} as {archetype.get('archetype')} ({archetype.get('confidence')} confidence) from subject-owned evidence. The useful owned pattern is {pattern}.{signature_note} Non-owned/review-only labels are not used to create the type. BNL is not allowed to assume {missing or 'public identity, role, relationship meaning, or queue history'} yet.", 1100)
+    signature_note = f" {signature}" if signature else ""
+    return _case_text(f"BNL currently reads {subject} as {archetype.get('archetype')} ({archetype.get('confidence')} confidence). The strongest observed pattern is {confirmed}. This showed up mostly in {where}.{signature_note} Confirmed: the read is based on evidence tied directly to the subject. Not confirmed: {missing}. Admin should treat the role as provisional until identity, ownership, links, and queue/submission facts are checked.", 1200)
 
 
 def _build_bnl_take(subject: str, memory: dict[str, Any], topics: list[dict[str, Any]], anchors: list[dict[str, Any]], archetype: dict[str, Any], behavioral_signature: dict[str, Any] | None = None, nearby_context: list[dict[str, Any]] | None = None, subject_owned_digest: dict[str, Any] | None = None) -> str:
     name = str(archetype.get("archetype") or "weak/unknown subject")
-    missing = "; ".join((archetype.get("notEnoughEvidenceFor") or [])[:3])
+    missing = "; ".join((archetype.get("notEnoughEvidenceFor") or [])[:3]) or "artist ownership, owned links, submitted tracks, queue/play history, payment status, confirmed aliases, and relationship meaning"
     digest = subject_owned_digest or {}
-    digest_read = str(digest.get("digestRead") or "")
     pattern = _digest_pattern_text(digest)
     body = json.dumps(digest, sort_keys=True, default=str).lower() if digest else ""
     quality = str(digest.get("evidenceQuality") or "insufficient")
     if quality in {"thin", "insufficient"} and not pattern:
-        text = f"BNL does not have enough distinctive evidence to type {subject} yet. BNL has limited subject-owned evidence. The file needs concrete source notes before a stronger dossier read is possible."
+        likely = "BNL does not have enough distinctive evidence to type this subject yet; this looks like a review prompt rather than a dossier-ready profile."
     elif "orion" in body and ("archive" in body or "ai" in body or "speaking" in body or "speaks" in body):
-        text = f"BNL reads {subject} as an Orion/archive-facing community subject. The useful owned pattern is that {subject} frames Orion as an AI, speaking presence, archive, or connected intelligence. This is useful for a lore/interface Source File, but public meaning remains review-only unless confirmed and it is not enough to claim artist or queue history."
+        likely = f"{subject} may be an Orion/archive-facing community subject, but public meaning remains review-only until admin confirms it."
     elif any(term in body for term in ("bnl challenge", "playful challenger", "antagon", "pushback", "push back", "provocation")):
-        text = f"BNL reads {subject} as a BNL-facing antagonist or playful challenger because subject-owned evidence shows repeated challenge, pushback, teasing, or provocation toward BNL. That distinguishes the file from generic community chatter, but tone and public wording need review."
+        likely = f"{subject} looks like a BNL-facing playful challenger or playful antagonist because direct evidence shows challenge, teasing, or pushback toward BNL rather than generic community chatter."
     elif any(term in body for term in ("vibrating bed", "weird concrete", "unusual concrete", "network skepticism", "network motive", "network questioning")):
-        text = f"BNL reads {subject} as a weird-topic community participant whose owned evidence centers on unusual recurring subjects, weird concrete topics, and Network skepticism/questioning. This is useful for a personality/community-pattern dossier, not an artist profile unless music or queue evidence is later connected."
+        likely = f"{subject} looks like a weird-topic community participant: the strongest pattern is unusual recurring subjects, unusual concrete subjects, and Network questioning."
     elif pattern:
-        text = f"BNL reads {subject} as {name}. The useful owned pattern is {pattern}. The packet still cannot support {missing or 'public identity, role, relationship meaning, or queue history'} without admin confirmation."
+        likely = f"{subject} currently reads as {name}. The strongest observed pattern is {pattern}."
     else:
-        text = digest_read or f"BNL does not have enough distinctive evidence to type {subject} beyond a weak Source File candidate. Add recurring activity, concrete source notes, music/link details, relationship context, or queue/public-source confirmation before making a sharper read."
-    return _case_text(text, 980)
-
+        likely = "The file is still too thin for a confident role read."
+    confirmed = pattern or "BNL has archive evidence to review, but not enough detail for a sharper public-safe claim."
+    recommended = "Admin should confirm whether this subject is an artist, supporter, collaborator, or recurring community member before drafting a public dossier."
+    return _case_text(f"BNL reads {subject} with this current take. Confirmed: {confirmed} Likely / emerging pattern: {likely} Not confirmed yet: {missing}. Recommended admin action: {recommended}", 1200)
 
 
 _DIGEST_STOPWORDS = {
     "about", "after", "again", "against", "also", "and", "around", "because", "before", "being", "between", "channel", "claim", "claims", "community", "context", "conversation", "current", "discord", "evidence", "file", "from", "generated", "internal", "label", "labels", "nearby", "owned", "packet", "public", "queue", "report", "review", "review-only", "safe", "source", "subject", "summary", "that", "the", "their", "there", "this", "through", "topic", "topics", "with", "without",
 }
 _DIGEST_TAXONOMY_PHRASES = {
-    "active community", "active community participant", "approved public context", "bnl facing behavior", "community context", "generic community chatter", "local context", "main read eligible", "non-owned context", "other entities", "relationship context", "source file", "source file discussion", "shared context",
+    "active community", "active community participant", "approved public context", "bnl facing behavior", "community context", "generic community chatter", "available archive context", "usable for the main admin read", "non-owned context", "other entities", "relationship context", "source file", "source file discussion", "shared context",
 }
 _DIGEST_CONCRETE_PATTERNS: list[tuple[str, str, str]] = [
-    ("vibrating beds", r"\bvibrating beds?\b", "Subject-owned evidence specifically mentions vibrating beds."),
-    ("weird concrete topics", r"\b(weird|strange|odd|unusual)\b.{0,60}\b(topic|object|physical|concrete|bed|device|room|mattress)s?\b|\b(vibrating|mattress|physical object|strange object|odd object)s?\b", "Subject-owned evidence centers on unusual concrete objects or physical subjects."),
-    ("Network motive questioning", r"\b(network|barcode network|barcode)\b.{0,80}\b(why|motive|motives|intent|intentions|trust|skeptic|question|doing|what are they|what is it)\b|\b(why|motive|motives|intent|trust|skeptic|question|doing)\b.{0,80}\b(network|barcode network|barcode)\b", "Subject-owned evidence questions Network/BARCODE motives or intent."),
-    ("Orion/archive/AI framing", r"\b(orion)\b.{0,90}\b(archive|ai|speaks?|speaking|interface|connected intelligence)\b|\b(archive|ai|speaks?|speaking|interface|connected intelligence)\b.{0,90}\b(orion)\b", "Subject-owned evidence frames Orion with archive, AI, speaking, or interface language."),
-    ("archive language", r"\b(archive|archival|interface|record|records)\b", "Subject-owned evidence repeats archive/interface language."),
-    ("Suno links", r"\b(suno\.com|suno)\b", "Subject-owned evidence includes Suno/platform link-sharing language."),
-    ("posts in WIPs/demos", r"\b(wip|wips|demo|demos|finished[- ]tracks?|track|song)\b", "Subject-owned evidence appears around WIP, demo, song, or finished-track language."),
-    ("BNL challenge/pushback language", r"\b(bnl|bnl-01)\b.{0,80}\b(challenge|push(?:es|ed)? back|teas(?:e|es|ed)?|antagoniz|provok|argu|call(?:s|ed)? out|rules?|boundary)\b|\b(challenge|push(?:es|ed)? back|teas(?:e|es|ed)?|antagoniz|provok|argu|call(?:s|ed)? out)\b.{0,80}\b(bnl|bnl-01)\b", "Subject-owned evidence shows BNL-facing challenge, teasing, or pushback."),
+    ("vibrating beds", r"\bvibrating beds?\b", "Direct subject evidence specifically mentions vibrating beds."),
+    ("weird concrete topics", r"\b(weird|strange|odd|unusual)\b.{0,60}\b(topic|object|physical|concrete|bed|device|room|mattress)s?\b|\b(vibrating|mattress|physical object|strange object|odd object)s?\b", "Direct subject evidence centers on unusual concrete objects or physical subjects."),
+    ("Network motive questioning", r"\b(network|barcode network|barcode)\b.{0,80}\b(why|motive|motives|intent|intentions|trust|skeptic|question|doing|what are they|what is it)\b|\b(why|motive|motives|intent|trust|skeptic|question|doing)\b.{0,80}\b(network|barcode network|barcode)\b", "Direct subject evidence questions Network/BARCODE motives or intent."),
+    ("Orion/archive/AI framing", r"\b(orion)\b.{0,90}\b(archive|ai|speaks?|speaking|interface|connected intelligence)\b|\b(archive|ai|speaks?|speaking|interface|connected intelligence)\b.{0,90}\b(orion)\b", "Direct subject evidence frames Orion with archive, AI, speaking, or interface language."),
+    ("archive language", r"\b(archive|archival|interface|record|records)\b", "Direct subject evidence repeats archive/interface language."),
+    ("Suno links", r"\b(suno\.com|suno)\b", "Direct subject evidence includes Suno/platform link-sharing language."),
+    ("posts in WIPs/demos", r"\b(wip|wips|demo|demos|finished[- ]tracks?|track|song)\b", "Direct subject evidence appears around WIP, demo, song, or finished-track language."),
+    ("BNL challenge/pushback language", r"\b(bnl|bnl-01)\b.{0,80}\b(challenge|push(?:es|ed)? back|teas(?:e|es|ed)?|antagoniz|provok|argu|call(?:s|ed)? out|rules?|boundary)\b|\b(challenge|push(?:es|ed)? back|teas(?:e|es|ed)?|antagoniz|provok|argu|call(?:s|ed)? out)\b.{0,80}\b(bnl|bnl-01)\b", "Direct subject evidence shows BNL-facing challenge, teasing, or pushback."),
 ]
 _DIGEST_LINK_RE = re.compile(r"\b(?:https?://)?(?:www\.)?([a-z0-9.-]+\.[a-z]{2,})(?:/\S*)?", re.I)
 
@@ -4013,7 +4036,7 @@ def _extract_concrete_digest_topics(texts: list[str]) -> list[dict[str, Any]]:
             break
         if phrase.lower() in seen or any(phrase in str(t.get("topic", "")).lower() for t in topics):
             continue
-        topics.append({"topic": phrase, "strength": _digest_strength(count), "evidenceCount": count, "exampleSignals": _digest_examples(examples.get(phrase, [])), "note": "Concrete detail extracted from subject-owned evidence, not from generated topic labels."})
+        topics.append({"topic": phrase, "strength": _digest_strength(count), "evidenceCount": count, "exampleSignals": _digest_examples(examples.get(phrase, [])), "note": "Concrete detail extracted from evidence directly tied to this subject, not from generated topic labels."})
     return topics[:8]
 
 
@@ -4047,7 +4070,7 @@ def _extract_recurring_phrases(texts: list[str]) -> list[dict[str, Any]]:
         distinctive = re.search(r"\b(orion|archive|ai|vibrating|beds?|network|suno|bnl|challenge|pushback|speaks?|weird|strange|motives?)\b", phrase)
         if count < 2 and not distinctive:
             continue
-        rows.append({"phrase": _case_text(phrase, 80), "evidenceCount": count, "exampleSignals": _digest_examples(examples.get(phrase, []), 2), "note": "Repeated or distinctive phrase sampled only from subject-owned evidence."})
+        rows.append({"phrase": _case_text(phrase, 80), "evidenceCount": count, "exampleSignals": _digest_examples(examples.get(phrase, []), 2), "note": "Repeated or distinctive phrase sampled only from evidence directly tied to this subject."})
         if len(rows) >= 8:
             break
     return rows
@@ -4066,7 +4089,7 @@ def _extract_digest_behaviors(texts: list[str], concrete_topics: list[dict[str, 
         if evidence:
             rows.append({"behavior": behavior, "strength": _digest_strength(len(evidence)), "exampleSignals": _digest_examples(evidence), "note": note})
     if not rows and concrete_topics:
-        rows.append({"behavior": "concrete subject recurrence", "strength": concrete_topics[0].get("strength", "weak"), "exampleSignals": concrete_topics[0].get("exampleSignals", []), "note": "Behavior inferred from repeated subject-owned concrete topics."})
+        rows.append({"behavior": "concrete subject recurrence", "strength": concrete_topics[0].get("strength", "weak"), "exampleSignals": concrete_topics[0].get("exampleSignals", []), "note": "Behavior inferred from repeated directly tied concrete topics."})
     return rows[:8]
 
 
@@ -4080,7 +4103,7 @@ def _extract_questions_or_challenges(texts: list[str]) -> list[dict[str, Any]]:
     for target, pattern, label in specs:
         evidence = [text for text in texts if re.search(pattern, text, flags=re.I)]
         if evidence:
-            rows.append({"target": target, "pattern": label, "exampleSignals": _digest_examples(evidence), "note": "Question/challenge pattern appears in subject-owned evidence."})
+            rows.append({"target": target, "pattern": label, "exampleSignals": _digest_examples(evidence), "note": "Question/challenge pattern appears in direct subject evidence."})
     return rows[:6]
 
 
@@ -4100,7 +4123,7 @@ def _extract_links_or_platforms(texts: list[str]) -> list[dict[str, Any]]:
         for key in found:
             counts[key] += 1
             examples.setdefault(key, []).append(text)
-    return [{"platformOrDomain": _case_text(key, 90), "evidenceCount": count, "exampleSignals": _digest_examples(examples.get(key, []), 2), "ownershipStatus": "owned", "note": "Platform/link language appears in subject-owned evidence; confirm whether the linked work is owned before public claims."} for key, count in counts.most_common(8)]
+    return [{"platformOrDomain": _case_text(key, 90), "evidenceCount": count, "exampleSignals": _digest_examples(examples.get(key, []), 2), "ownershipStatus": "owned", "note": "Platform/link language appears in direct subject evidence; confirm whether the linked work is owned before public claims."} for key, count in counts.most_common(8)]
 
 
 def _representative_digest_moments(subject: str, texts: list[str], concrete_topics: list[dict[str, Any]], behaviors: list[dict[str, Any]], questions: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -4115,9 +4138,9 @@ def _representative_digest_moments(subject: str, texts: list[str], concrete_topi
     for topic in concrete_topics[:3]:
         if len(rows) >= 6:
             break
-        rows.append({"moment": f"{subject} has owned evidence around {topic.get('topic')}.", "whyItMatters": _case_text(topic.get("note") or "Concrete subject-owned detail helps admins draft a stronger Source File.", 180)})
+        rows.append({"moment": f"{subject} has owned evidence around {topic.get('topic')}.", "whyItMatters": _case_text(topic.get("note") or "Concrete direct subject detail helps admins draft a stronger Source File.", 180)})
     if not rows and texts:
-        rows.append({"moment": f"{subject} has limited subject-owned evidence, but it does not yet form a concrete recurring pattern.", "whyItMatters": "Admin should add concrete source notes before drafting a stronger dossier."})
+        rows.append({"moment": f"{subject} has limited direct subject evidence, but it does not yet form a concrete recurring pattern.", "whyItMatters": "Admin should add concrete source notes before drafting a stronger dossier."})
     return rows[:6]
 
 
@@ -4136,9 +4159,9 @@ def _digest_dossier_usefulness(subject: str, quality: str, concrete_topics: list
     body = json.dumps({"topics": concrete_topics, "behaviors": behaviors, "questions": questions, "links": links}, sort_keys=True, default=str).lower()
     useful: list[str] = []
     not_enough = ["public identity, alias certainty, or relationship meaning", "queue submissions, played tracks, payment, or Priority status"]
-    next_questions = ["Which subject-owned examples are public-safe enough to quote or paraphrase?", "Is the subject an artist, community participant, lore/interface figure, challenger, collaborator, or something else?"]
+    next_questions = ["Which direct subject examples are public-safe enough to quote or paraphrase?", "Is the subject an artist, community participant, lore/interface figure, challenger, collaborator, or something else?"]
     if quality in {"thin", "insufficient"}:
-        likely = "Not enough for a strong dossier yet. Add concrete subject-owned source notes first."
+        likely = "Not enough for a strong dossier yet. Add concrete direct source notes first."
         useful.append("Evidence triage / source-note collection")
     elif "orion" in body and ("archive" in body or "ai" in body):
         likely = "Lore/interface Source File candidate with review-only public meaning."
@@ -4158,7 +4181,7 @@ def _digest_dossier_usefulness(subject: str, quality: str, concrete_topics: list
         next_questions.append("Are the shared links owned work, references, or other people's tracks?")
     else:
         likely = "Limited community-pattern Source File candidate."
-        useful.append("subject-owned evidence triage")
+        useful.append("direct subject evidence triage")
     return {"likelyUse": _case_text(likely, 220), "usefulAngles": _case_list(useful, limit=6, item_limit=120), "notEnoughFor": _case_list(not_enough, limit=6, item_limit=180), "nextQuestions": _case_list(next_questions, limit=6, item_limit=180)}
 
 
@@ -4189,9 +4212,9 @@ def build_subject_owned_evidence_digest_v1(subject: str, ownership: dict[str, An
         count = _as_int(channel.get("count"))
         top_channels.append({"channelName": name, **({"count": count} if count is not None else {}), "note": _case_text(channel.get("note") or "Observed as a channel/source lane for subject evidence; verify before public use.", 180)})
     if quality in {"thin", "insufficient"} and not (concrete_topics or behaviors or moments):
-        digest_read = "BNL has limited subject-owned evidence. The file needs concrete source notes before a stronger dossier read is possible."
+        digest_read = "BNL has limited direct subject evidence. The file needs concrete source notes before a stronger dossier read is possible."
     else:
-        digest_read = _case_text(f"Subject-owned digest for {subject}: {_digest_pattern_text({'concreteTopics': concrete_topics, 'recurringPhrases': phrases, 'distinctiveBehaviors': behaviors, 'questionsOrChallenges': questions, 'representativeMoments': moments}) or 'limited concrete subject-owned detail'}.", 620)
+        digest_read = _case_text(f"Evidence digest for {subject}: {_digest_pattern_text({'concreteTopics': concrete_topics, 'recurringPhrases': phrases, 'distinctiveBehaviors': behaviors, 'questionsOrChallenges': questions, 'representativeMoments': moments}) or 'limited concrete detail tied to the subject'}.", 620)
     return {
         "digestRead": digest_read,
         "evidenceQuality": quality,
@@ -4222,7 +4245,7 @@ def _behavioral_signature_v1(subject: str, ownership: dict[str, Any], digest: di
                 "strength": item.get("strength") if item.get("strength") in {"strong", "moderate", "weak"} else "weak",
                 **({"evidenceCount": item.get("evidenceCount")} if item.get("evidenceCount") is not None else {}),
                 "exampleSignals": _case_list(item.get("exampleSignals"), limit=3, item_limit=180),
-                "note": _case_text(item.get("note") or "Behavior is derived from the subject-owned evidence digest.", 180),
+                "note": _case_text(item.get("note") or "Behavior is derived from the direct subject evidence digest.", 180),
             })
     for phrase in digest.get("recurringPhrases") or []:
         if isinstance(phrase, dict) and len(recurring_rows) < 6:
@@ -4231,7 +4254,7 @@ def _behavioral_signature_v1(subject: str, ownership: dict[str, Any], digest: di
                 "strength": "moderate" if (_as_int(phrase.get("evidenceCount")) or 0) >= 2 else "weak",
                 "evidenceCount": _as_int(phrase.get("evidenceCount")) or 1,
                 "exampleSignals": _case_list(phrase.get("exampleSignals"), limit=2, item_limit=180),
-                "note": "Phrase recurrence comes from subject-owned evidence, not generated labels.",
+                "note": "Phrase recurrence comes from evidence directly tied to this subject, not generated labels.",
             })
 
     unusual = []
@@ -4240,7 +4263,7 @@ def _behavioral_signature_v1(subject: str, ownership: dict[str, Any], digest: di
             continue
         topic = str(item.get("topic") or "")
         if re.search(r"\b(vibrating|weird|strange|odd|unusual|concrete|physical|object|bed|mattress|device)\b", topic, flags=re.I):
-            unusual.append({"subject": _case_text(topic, 120), "evidenceCount": item.get("evidenceCount"), "exampleSignals": _case_list(item.get("exampleSignals"), limit=3, item_limit=180), "note": _case_text(item.get("note") or "Unusual concrete subject appears in subject-owned evidence.", 180)})
+            unusual.append({"subject": _case_text(topic, 120), "evidenceCount": item.get("evidenceCount"), "exampleSignals": _case_list(item.get("exampleSignals"), limit=3, item_limit=180), "note": _case_text(item.get("note") or "Unusual concrete subject appears in direct subject evidence.", 180)})
 
     bnl_question = next((item for item in digest.get("questionsOrChallenges") or [] if isinstance(item, dict) and item.get("target") == "BNL"), None)
     bnl_behavior = next((item for item in digest.get("distinctiveBehaviors") or [] if isinstance(item, dict) and re.search(r"bnl|challenge|antagon|pushback|push back", str(item.get("behavior") or ""), flags=re.I)), None)
@@ -4249,35 +4272,35 @@ def _behavioral_signature_v1(subject: str, ownership: dict[str, Any], digest: di
         behavior_text = json.dumps(bnl_question or bnl_behavior, default=str).lower()
         bnl_stance = "playful_challenger" if re.search(r"teas|playful|joke|provok", behavior_text) else "antagonistic"
         bnl_conf = (bnl_behavior or {}).get("strength") if isinstance(bnl_behavior, dict) else "moderate"
-        bnl_note = "Subject-owned digest shows direct challenge, antagonism, teasing, or pushback toward BNL."
+        bnl_note = "Direct evidence shows challenge, antagonism, teasing, or pushback toward BNL."
         bnl_evidence = ev
     elif re.search(r"\bbnl(?:-01)?\b", body):
-        bnl_stance, bnl_conf, bnl_note, bnl_evidence = "BNL-facing", "moderate", "Subject-owned digest references BNL without a clear challenge/support stance.", []
+        bnl_stance, bnl_conf, bnl_note, bnl_evidence = "BNL-facing", "moderate", "Direct evidence references BNL without a clear challenge/support stance.", []
     else:
-        bnl_stance, bnl_conf, bnl_note, bnl_evidence = "unknown", "weak", "No subject-owned BNL stance is clear.", []
+        bnl_stance, bnl_conf, bnl_note, bnl_evidence = "unknown", "weak", "No BNL stance from direct subject evidence is clear.", []
 
     net_question = next((item for item in digest.get("questionsOrChallenges") or [] if isinstance(item, dict) and item.get("target") == "Network"), None)
     if net_question:
         ev = _case_list(net_question.get("exampleSignals"), limit=4, item_limit=180)
         stance = "skeptical" if re.search(r"skeptic|doubt|trust|motive", json.dumps(net_question, default=str), flags=re.I) else "questioning"
-        network = {"stance": stance, "confidence": "strong" if len(ev) >= 3 else "moderate", "evidence": ev, "note": "Subject-owned digest questions Network/BARCODE motives or intent."}
+        network = {"stance": stance, "confidence": "strong" if len(ev) >= 3 else "moderate", "evidence": ev, "note": "Direct evidence questions Network/BARCODE motives or intent."}
     elif re.search(r"\b(network|barcode|edge|lardcode)\b", body):
-        network = {"stance": "lore-engaged", "confidence": "moderate", "evidence": [], "note": "Subject-owned digest engages Network/BARCODE language without a clear trust/skepticism stance."}
+        network = {"stance": "lore-engaged", "confidence": "moderate", "evidence": [], "note": "Direct evidence engages Network/BARCODE language without a clear trust/skepticism stance."}
     else:
-        network = {"stance": "unknown", "confidence": "weak", "evidence": [], "note": "No subject-owned Network stance is clear."}
+        network = {"stance": "unknown", "confidence": "weak", "evidence": [], "note": "No Network stance from direct subject evidence is clear."}
 
     if "orion" in body and ("archive" in body or "ai" in body):
-        read = f"BNL reads {subject}'s owned evidence digest as Orion/archive/AI-facing; relationship meaning remains review-only unless confirmed."
+        read = f"BNL reads {subject}'s direct evidence as Orion/archive/AI-facing; relationship meaning remains review-only unless confirmed."
     elif bnl_stance in {"antagonistic", "playful_challenger"}:
-        read = f"BNL reads {subject}'s owned evidence digest as BNL-facing challenge or playful antagonism rather than generic community chatter."
+        read = f"BNL reads {subject}'s direct evidence as BNL-facing challenge or playful antagonism rather than generic community chatter."
     elif unusual or network.get("stance") in {"questioning", "skeptical"}:
-        read = f"BNL reads {subject}'s owned evidence digest as unusual concrete-topic participation with Network skepticism/questioning when supported by the cited fragments."
+        read = f"BNL reads {subject}'s direct evidence as unusual concrete-topic participation with Network skepticism/questioning when supported by the cited fragments."
     elif owned_texts:
-        read = f"BNL has subject-owned evidence for {subject}, but the behavioral signature is still limited and review-only."
+        read = f"BNL has direct subject evidence for {subject}, but the behavioral signature is still limited and review-only."
     else:
-        read = f"BNL does not have enough subject-owned evidence to form a behavioral signature for {subject}."
+        read = f"BNL does not have enough direct subject evidence to form a behavioral signature for {subject}."
     if not recurring_rows and owned_texts:
-        recurring_rows.append({"behavior": "general subject-owned participation", "strength": "weak", "evidenceCount": len(owned_texts), "exampleSignals": owned_texts[:2], "note": "Subject-owned evidence exists but does not yet form a sharper behavioral pattern."})
+        recurring_rows.append({"behavior": "general direct participation", "strength": "weak", "evidenceCount": len(owned_texts), "exampleSignals": owned_texts[:2], "note": "Direct subject evidence exists but does not yet form a sharper behavioral pattern."})
     return {"signatureRead": _case_text(read, 420), "recurringBehaviors": recurring_rows[:6], "stanceTowardBNL": {"stance": bnl_stance, "confidence": bnl_conf or "weak", "evidence": bnl_evidence[:4], "note": bnl_note}, "stanceTowardNetwork": network, "unusualRecurringSubjects": unusual[:6]}
 
 
@@ -4355,10 +4378,10 @@ def _strip_non_applicable_visible_entities(text: str, disallowed_terms: set[str]
     replacements = [
         (r"nearby other entities(?:/interface)? context is quarantined for review", "nearby non-owned context is not used for this subject's main read"),
         (r"Non-owned context references other entities(?:, but)?", "Non-owned context references other entities,"),
-        (r"does not have subject-owned evidence to treat other entities as part of this subject[’']s profile", "does not have subject-owned evidence to treat other entities as part of this subject's profile"),
+        (r"does not have direct subject evidence to treat other entities as part of this subject[’']s profile", "does not have direct subject evidence to treat other entities as part of this subject's profile"),
         (r"other entities is quarantined", "non-owned/shared context is not used"),
         (r"not other entities-linked", "not linked to other entities"),
-        (r"without other entities evidence", "without enough subject-owned evidence"),
+        (r"without other entities evidence", "without enough direct subject evidence"),
     ]
     for pattern, repl in replacements:
         cleaned = re.sub(pattern, repl, cleaned, flags=re.I)
@@ -4382,11 +4405,46 @@ _VISIBLE_PRIMARY_COPY_FIELDS = {
 }
 
 
+_VISIBLE_JARGON_REPLACEMENTS = [
+    (re.compile(r"\bsubject-owned evidence\b", re.I), "evidence tied directly to the subject"),
+    (re.compile(r"\bsubject-owned\b", re.I), "directly tied to the subject"),
+    (re.compile(r"\bauthored approved public-side\b", re.I), "directly participating in public BARCODE Discord"),
+    (re.compile(r"\bapproved public-side discussion\b", re.I), "public BARCODE Discord conversation"),
+    (re.compile(r"\bpublic-side authored item\b", re.I), "public message from the subject"),
+    (re.compile(r"\bmain-read eligible\b", re.I), "usable for the main admin read"),
+    (re.compile(r"\bother entities/link sharing\b", re.I), "link or relationship signals"),
+    (re.compile(r"\blocal context\b", re.I), "available archive context"),
+    (re.compile(r"\bthe packet cannot support\b", re.I), "BNL cannot confirm"),
+    (re.compile(r"\bthe packet still cannot support\b", re.I), "BNL still cannot confirm"),
+    (re.compile(r"\bSubject owned behavior note\b", re.I), "Behavior note"),
+]
+
+
+def _humanize_visible_source_file_text(value: str) -> str:
+    text = value
+    legacy_queue = "Queue/submission memory is not connected to this report. Do not claim submissions, song counts, play history, payment, or Priority status."
+    plain_queue = "No confirmed queue or submission history is connected to this Source File yet. Queue/submission data is not connected."
+    text = text.replace(legacy_queue, plain_queue)
+    if text.strip() == "Queue/submission data is not connected.":
+        text = plain_queue
+    for pattern, replacement in _VISIBLE_JARGON_REPLACEMENTS:
+        text = pattern.sub(replacement, text)
+    text = re.sub(r"(?:No confirmed queue or submission history is connected to this Source File yet\.\s*){2,}", "No confirmed queue or submission history is connected to this Source File yet. ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _humanize_visible_source_file_value(value: Any) -> Any:
+    if isinstance(value, str):
+        return _humanize_visible_source_file_text(value)
+    if isinstance(value, list):
+        return [_humanize_visible_source_file_value(item) for item in value]
+    if isinstance(value, dict):
+        return {key: _humanize_visible_source_file_value(val) for key, val in value.items()}
+    return value
+
 def _scrub_visible_source_file_copy(brief: dict[str, Any], ownership: dict[str, Any], subject: str, confirmed_aliases: list[str]) -> dict[str, Any]:
     context = {**brief, "ownership": ownership, "subjectName": subject, "confirmedAliases": confirmed_aliases}
     disallowed = _visible_disallowed_entity_terms(context)
-    if not disallowed:
-        return brief
 
     def scrub_value(value: Any) -> Any:
         if isinstance(value, str):
@@ -4397,23 +4455,43 @@ def _scrub_visible_source_file_copy(brief: dict[str, Any], ownership: dict[str, 
             return {key: scrub_value(val) for key, val in value.items()}
         return value
 
+    if disallowed:
+        for field in _VISIBLE_PRIMARY_COPY_FIELDS:
+            if field == "queueSubmissionRead":
+                continue
+            if field in brief:
+                brief[field] = scrub_value(brief[field])
+        if isinstance(brief.get("subjectArchetypeRead"), dict):
+            for key in ("rationale", "distinguishingSignals", "notEnoughEvidenceFor", "excludedShapeSignals"):
+                if key in brief["subjectArchetypeRead"]:
+                    brief["subjectArchetypeRead"][key] = scrub_value(brief["subjectArchetypeRead"][key])
+        if isinstance(brief.get("topicBuckets"), list):
+            for bucket in brief["topicBuckets"]:
+                if isinstance(bucket, dict):
+                    for key in ("explanation", "exampleSignals", "whereSeen"):
+                        if key in bucket:
+                            bucket[key] = scrub_value(bucket[key])
+        if isinstance(brief.get("behavioralSignatureV1"), dict):
+            brief["behavioralSignatureV1"] = scrub_value(brief["behavioralSignatureV1"])
+        if isinstance(brief.get("namedAnchors"), list):
+            brief["namedAnchors"] = [item for item in brief["namedAnchors"] if not (isinstance(item, dict) and str(item.get("name") or "").lower() in {term.lower() for term in disallowed})]
+
     for field in _VISIBLE_PRIMARY_COPY_FIELDS:
         if field in brief:
-            brief[field] = scrub_value(brief[field])
-    if isinstance(brief.get("subjectArchetypeRead"), dict):
-        for key in ("rationale", "distinguishingSignals", "notEnoughEvidenceFor", "excludedShapeSignals"):
-            if key in brief["subjectArchetypeRead"]:
-                brief["subjectArchetypeRead"][key] = scrub_value(brief["subjectArchetypeRead"][key])
-    if isinstance(brief.get("topicBuckets"), list):
-        for bucket in brief["topicBuckets"]:
-            if isinstance(bucket, dict):
-                for key in ("explanation", "exampleSignals"):
-                    if key in bucket:
-                        bucket[key] = scrub_value(bucket[key])
-    if isinstance(brief.get("behavioralSignatureV1"), dict):
-        brief["behavioralSignatureV1"] = scrub_value(brief["behavioralSignatureV1"])
-    if isinstance(brief.get("namedAnchors"), list):
-        brief["namedAnchors"] = [item for item in brief["namedAnchors"] if not (isinstance(item, dict) and str(item.get("name") or "").lower() in {term.lower() for term in disallowed})]
+            brief[field] = _humanize_visible_source_file_value(brief[field])
+    for field in ("topicBuckets", "subjectArchetypeRead"):
+        if field in brief:
+            brief[field] = _humanize_visible_source_file_value(brief[field])
+    if isinstance(brief.get("relationshipSignals"), list):
+        fixed_relationships = []
+        for item in brief["relationshipSignals"]:
+            text = _case_text(item, 260)
+            if text.lower().strip(" .") in {"other entities", "non-owned context", "shared context"}:
+                text = "BNL saw this subject appear near another name/entity, but this is not enough to confirm a relationship. Treat this as a review prompt, not a fact."
+            elif not any(term in text.lower() for term in ("review", "unconfirmed", "not confirm", "uncertain")):
+                text = f"{text} Treat this as a review prompt, not a fact."
+            fixed_relationships.append(text)
+        brief["relationshipSignals"] = fixed_relationships
     return brief
 
 def _source_file_gaps(memory: dict[str, Any], anchors: list[dict[str, Any]]) -> list[str]:
@@ -4448,7 +4526,7 @@ def _brief_ownership_routing_diagnostics(ownership: dict[str, Any], nearby_conte
             "sourceLane": "nearbyContextSignals",
             "attemptedScope": "namedAnchors/subject-owned intelligence",
             "routedAs": "co_mention",
-            "reason": str(item.get("warning") or item.get("reason") or "non-owned context only; not subject-owned evidence"),
+            "reason": str(item.get("warning") or item.get("reason") or "non-owned context only; not direct subject evidence"),
         })
         seen.add(key)
         if len(blocked) >= 20:
@@ -4476,7 +4554,7 @@ def _main_read_routing_diagnostics(ownership: dict[str, Any], topics: list[dict[
     for text in _review_only_shape_texts(ownership):
         lowered = text.lower()
         if any(term in lowered for term in ("orion", "interface", "lore")):
-            add("Orion/interface/lore", "Review-only or non-owned context lacks main-read-eligible subject ownership/explicit relationship evidence.", "nearbyContextSignals")
+            add("Orion/interface/lore", "Review-only or non-owned context lacks usable for the main admin read subject ownership/explicit relationship evidence.", "nearbyContextSignals")
         elif len(excluded) < 8:
             add(text, "Review-only evidence is available for diagnostics only and cannot shape subjectRead, bnlTake, or archetype.", "ownershipRoutingDiagnostics")
         if len(excluded) >= 16:
@@ -4486,7 +4564,7 @@ def _main_read_routing_diagnostics(ownership: dict[str, Any], topics: list[dict[
             continue
         topic = str(bucket.get("topic") or "")
         if topic:
-            add(topic, "Topic bucket has no main-read-eligible owned signal; it remains review-only.", "reviewOnlyTopic")
+            add(topic, "Topic bucket has no usable for the main admin read owned signal; it remains review-only.", "reviewOnlyTopic")
     for item in nearby_context or []:
         if isinstance(item, dict) and item.get("name"):
             add(str(item.get("name")), str(item.get("warning") or "Non-owned context only; not subject-owned shape evidence."), "nearbyContextSignals")
@@ -4511,7 +4589,7 @@ def build_subject_intelligence_brief_v1(memory: dict[str, Any]) -> dict[str, Any
     queue_connected = str(_brief_context(memory).get("queueSubmissionStatus") or "not_connected") not in {"", "not_connected", "unknown"}
     queue_read = _case_text(_brief_context(memory).get("queueSubmissionNote") or _join_case_items(memory.get("queueSubmissionContext"), QUEUE_NOT_CONNECTED_NOTE), 360)
     if not queue_connected and "not connected" not in queue_read.lower():
-        queue_read = f"Queue/submission data is not connected. {queue_read}"
+        queue_read = f"No confirmed queue or submission history is connected to this Source File yet. {queue_read}"
     confidence = _case_text(f"Archetype confidence is {archetype.get('confidence')} for the internal shape read. Safety remains strict: identity, public role, relationship meaning, queue/submission claims, payment/Priority status, and public-safe anchor meaning stay unconfirmed until admin review connects source links. This brief is admin-facing and review-only.", 520)
     gaps = _source_file_gaps(memory, anchors)
     brief = {
@@ -4545,8 +4623,10 @@ def build_subject_intelligence_brief_v1(memory: dict[str, Any]) -> dict[str, Any
             "Promote only public-safe facts; keep relationship/lore/interface interpretation internal until confirmed.",
         ], limit=8, item_limit=240),
         "doNotSayPubliclyYet": _case_list([
+            "Do not publicly call this subject an artist until admin confirms ownership.",
+            "Do not claim this subject owns shared links until admin confirms link ownership.",
+            "Do not connect this subject to another identity unless an alias/identity link is confirmed.",
             "Do not claim queue submissions, played tracks, payment, or Priority status without connected queue data.",
-            "Do not claim public identity, public role, alias certainty, or relationship meaning from review-only evidence.",
             "Do not publish raw channel context, raw IDs, internal table/debug labels, or private-source detail.",
             "Do not present Orion/Network/EDGE/BARCODE/BNL-01 anchors as confirmed public facts until admin review marks them safe.",
         ], limit=8, item_limit=240),
@@ -4567,7 +4647,7 @@ def build_subject_memory_packet_v1(packet: dict[str, Any]) -> dict[str, Any]:
         music_items.append("When music/creative details are unavailable, BNL must not claim a submitted song, artist profile, platform ownership, collaborator, or public link.")
     queue_connected = str(packet.get("queueSubmissionStatus") or "not_connected") not in {"", "not_connected", "unknown"}
     queue_context = [
-        _case_text(packet.get("queueSubmissionNote") or ("Queue/submission data is connected to this report." if queue_connected else "Queue/submission memory is not connected to this report. Do not claim submissions, song counts, play history, payment, or Priority status."), 320)
+        _case_text(packet.get("queueSubmissionNote") or ("Queue/submission data is connected to this report." if queue_connected else "No confirmed queue or submission history is connected to this Source File yet. Queue/submission data is not connected."), 320)
     ]
     if queue_connected:
         queue_context.extend(_case_list(packet.get("queueSubmissionFacts") or packet.get("queueSubmissions"), limit=4))
@@ -4606,7 +4686,7 @@ def build_subject_memory_packet_v1(packet: dict[str, Any]) -> dict[str, Any]:
     if packet.get("musicSignals") and not any(any(term in item.lower() for term in ("#", "http", "suno", "demo", "wip", "beat", "track", "song", "platform", "link")) for item in music_items):
         packet_v1["evidenceGaps"].append("The current memory path exposes only category labels for music discussion; raw representative music details are not available to the report generator yet.")
     if not queue_connected:
-        packet_v1["evidenceGaps"].append("Queue/submission memory is not connected to this report. Do not claim submissions, song counts, play history, payment, or Priority status.")
+        packet_v1["evidenceGaps"].append("No confirmed queue or submission history is connected to this Source File yet. Queue/submission data is not connected.")
     return _sanitize_archive_value(packet_v1)
 
 
@@ -4646,7 +4726,7 @@ def build_source_file_case_report_v1(subject_memory_packet: dict[str, Any]) -> d
         "communityContext": _join_case_items(memory.get("communityContext"), "Community context is not specifically detailed in the current packet; do not claim more than the available evidence supports."),
         "creativeMusicContext": _join_case_items(memory.get("musicCreativeContext"), "No specific collaborator, track title, platform ownership, submitted queue track, or public link is confirmed in the current report packet."),
         "relationshipContext": _join_case_items(memory.get("relationshipContext"), "No specific relationship/context connection is confirmed; keep relationship interpretation review-only."),
-        "queueSubmissionContext": _join_case_items(memory.get("queueSubmissionContext"), "Queue/submission memory is not connected to this report. Do not claim submissions, song counts, play history, payment, or Priority status."),
+        "queueSubmissionContext": _join_case_items(memory.get("queueSubmissionContext"), "No confirmed queue or submission history is connected to this Source File yet. Queue/submission data is not connected."),
         "identityContext": _case_text(_join_case_items(memory.get("identitySignals"), "Identity review is handled through the site Identity Check when links are available. This report does not auto-confirm identity.") + " This report does not auto-confirm identity.", 520),
         "reviewBlockers": _case_list(memory.get("openQuestions"), limit=8),
         "internalOnlyNotes": _case_list(memory.get("internalWarnings") or memory.get("reviewOnlyFacts"), limit=8) or ["Keep review-only evidence internal; do not publish or merge identities from this report."],

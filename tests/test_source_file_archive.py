@@ -548,6 +548,59 @@ class SourceFileArchiveTests(unittest.TestCase):
         self.assertEqual("BNL-facing interaction pattern; suggests the subject interacts with BNL as a system/persona.", notes.get("BNL-01"))
         self.assertTrue(any("ownership" in item.get("explanation", "").lower() or "interface" in item.get("explanation", "").lower() or "bnl-facing" in item.get("explanation", "").lower() for item in brief["topicBuckets"]))
 
+
+    def test_subject_intelligence_brief_antigrain_plain_admin_language(self):
+        brief = self._subject_brief_for(
+            "Antigrain",
+            sourceCounts={"conversations": 6, "entity_evidence_events": 3},
+            topChannels=[
+                {"channel": "#barcode-bot", "count": 3, "summary": "Antigrain participates in BARCODE bot conversations."},
+                {"channel": "#wips-and-demos", "count": 2, "summary": "Antigrain appears around WIP/demo and link sharing."},
+            ],
+            topTopicDetails=[
+                {"topic": "music link sharing", "count": 3, "summary": "Antigrain shares music links and talks around demos; ownership is not confirmed."},
+                {"topic": "community support", "count": 2, "summary": "Antigrain participates in community/support conversations."},
+            ],
+            usefulEvidence=[
+                {"summary": "Antigrain shared a SoundCloud link while discussing a demo in #wips-and-demos; ownership was not stated.", "authorName": "Antigrain", "sourceType": "Discord conversation", "visibility": "public_context"},
+                {"summary": "Antigrain asked BNL for help finding where WIP demos should be posted.", "authorName": "Antigrain", "sourceType": "Discord conversation", "visibility": "public_home"},
+                {"summary": "Antigrain talked with members in #barcode-bot about BARCODE community activity.", "authorName": "Antigrain", "sourceType": "Discord conversation", "visibility": "public_context"},
+            ],
+            bestEvidenceToReview=["Antigrain shared a SoundCloud link near demo discussion; BNL cannot confirm the link is owned by Antigrain yet."],
+            musicSignals=["SoundCloud/demo link sharing appears; link ownership and queue status are unconfirmed."],
+            relationshipSignals=["Another name appears near Antigrain in broader discussion; meaning unconfirmed."],
+            queueSubmissionStatus="not_connected",
+            queueSubmissionNote="No confirmed queue or submission history is connected to this Source File yet.",
+            representativeEvidence=[{"summary": "Antigrain shared a SoundCloud demo link in #wips-and-demos without confirmed ownership.", "authorName": "Antigrain", "channelName": "#wips-and-demos", "sourceType": "Discord conversation", "visibility": "public_context"}],
+        )
+        visible = self._visible_primary_copy_text(brief).lower()
+        for forbidden in (
+            "subject-owned evidence",
+            "authored approved public-side",
+            "approved public-side discussion",
+            "main-read eligible",
+            "public-side authored item",
+            "other entities/link sharing",
+            "local context",
+            "the packet cannot support",
+        ):
+            self.assertNotIn(forbidden, visible)
+        self.assertIn("confirmed:", brief["bnlTake"].lower())
+        self.assertIn("likely / emerging pattern:", brief["bnlTake"].lower())
+        self.assertIn("not confirmed yet:", brief["bnlTake"].lower())
+        self.assertIn("recommended admin action:", brief["bnlTake"].lower())
+        self.assertIn("No confirmed queue or submission history is connected to this Source File yet.", brief["queueSubmissionRead"])
+        self.assertTrue(brief["topicBuckets"])
+        for bucket in brief["topicBuckets"]:
+            self.assertTrue(bucket.get("exampleSignals"), bucket)
+            examples = " ".join(bucket.get("exampleSignals") or [])
+            self.assertTrue(examples.strip() or "not expose enough safe examples yet" in examples.lower())
+        recurring = brief["subjectOwnedEvidenceDigestV1"].get("recurringPhrases") or []
+        for phrase in recurring:
+            self.assertTrue(phrase.get("exampleSignals"), phrase)
+        relationship_text = " ".join(brief["relationshipSignals"]).lower()
+        self.assertTrue("review" in relationship_text or "unconfirmed" in relationship_text or "not confirm" in relationship_text)
+
     def test_case_report_is_built_from_subject_memory_packet_not_raw_packet_labels(self):
         memory = {
             "version": "1",
@@ -850,7 +903,7 @@ class SourceFileArchiveTests(unittest.TestCase):
         self.assertFalse(authored["ownedAuthoredItems"])
         self.assertEqual(authored["evidenceQuality"], "insufficient")
         self.assertIn(digest["evidenceQuality"], {"thin", "insufficient"})
-        self.assertIn("limited subject-owned evidence", digest["digestRead"].lower())
+        self.assertIn("limited direct subject evidence", digest["digestRead"].lower())
         visible = self._visible_primary_copy_text(brief).lower()
         self.assertNotIn("orion/archive-facing", visible)
         self.assertFalse([bucket for bucket in brief["topicBuckets"] if bucket.get("mainReadEligible") is False])
