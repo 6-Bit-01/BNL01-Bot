@@ -3315,6 +3315,9 @@ def _topic_buckets(memory: dict[str, Any], ownership: dict[str, Any] | None = No
         topic_tokens = [part for part in re.split(r"[^a-z0-9]+", key) if len(part) >= 3]
         signals = [text for text in evidence_texts if any(token in text.lower() for token in topic_tokens[:3])][:3]
         review_signals = [text for text in review_only_texts if any(token in text.lower() for token in topic_tokens[:3])][:2]
+        if ownership and evidence_texts and not signals and any(term in key for term in ("orion", "interface", "lore", "source file", "dossier", "relationship", "bnl")):
+            # Keep broad/derived labels from becoming subject-owned shape evidence.
+            continue
         if count is None:
             count = len(signals) or None
         strength = "weak"
@@ -3513,15 +3516,19 @@ def _signals_from(memory: dict[str, Any], fields: tuple[str, ...], fallback: str
     return deduped or [fallback]
 
 
-def _brief_signal_text(memory: dict[str, Any], topics: list[dict[str, Any]], anchors: list[dict[str, Any]], channels: list[dict[str, Any]] | None = None) -> str:
+def _brief_signal_text(memory: dict[str, Any], topics: list[dict[str, Any]], anchors: list[dict[str, Any]], channels: list[dict[str, Any]] | None = None, ownership: dict[str, Any] | None = None) -> str:
     context = _brief_context(memory)
-    shape_fields = (
-        "conversationThemes", "topicThemes", "topTopicDetails", "topicBreakdown", "knownContext", "usefulEvidence",
-        "bestEvidenceToReview", "bnlInteractionSignals", "musicSignals", "communitySignals", "relationshipSignals",
-        "evidenceDetails", "representativeEvidence", "topChannels", "recentActivitySummary", "authoredVsMentionedSummary",
-    )
-    values = [topics, anchors, channels or [], memory.get("representativeMoments")]
-    values.extend(context.get(field) for field in shape_fields)
+    if ownership:
+        owned_texts = [item.get("text") for item in ownership.get("owned", [])]
+        values = [topics, anchors, channels or [], owned_texts]
+    else:
+        shape_fields = (
+            "conversationThemes", "topicThemes", "topTopicDetails", "topicBreakdown", "knownContext", "usefulEvidence",
+            "bestEvidenceToReview", "bnlInteractionSignals", "musicSignals", "communitySignals", "relationshipSignals",
+            "evidenceDetails", "representativeEvidence", "topChannels", "recentActivitySummary", "authoredVsMentionedSummary",
+        )
+        values = [topics, anchors, channels or [], memory.get("representativeMoments")]
+        values.extend(context.get(field) for field in shape_fields)
     fragments = []
     for text in _case_flatten_text_values(values, max_items=160, item_limit=300):
         lowered = text.lower()
@@ -3535,8 +3542,8 @@ def _queue_connected(memory: dict[str, Any]) -> bool:
     return str(_brief_context(memory).get("queueSubmissionStatus") or "not_connected").lower() not in {"", "not_connected", "unknown", "none"}
 
 
-def _subject_archetype_read(subject: str, memory: dict[str, Any], profile: dict[str, Any], topics: list[dict[str, Any]], anchors: list[dict[str, Any]], channels: list[dict[str, Any]]) -> dict[str, Any]:
-    body = _brief_signal_text(memory, topics, anchors, channels)
+def _subject_archetype_read(subject: str, memory: dict[str, Any], profile: dict[str, Any], topics: list[dict[str, Any]], anchors: list[dict[str, Any]], channels: list[dict[str, Any]], ownership: dict[str, Any] | None = None) -> dict[str, Any]:
+    body = _brief_signal_text(memory, topics, anchors, channels, ownership)
     total = _as_int(profile.get("totalEvidenceScanned")) or _as_int(profile.get("totalApprovedPublicAuthoredItems")) or len(memory.get("representativeMoments") or [])
     queue_connected = _queue_connected(memory)
     has_bnl = any(term in body for term in ("bnl-01", "bnl", "threshold", "boundary", "operational"))
@@ -3756,6 +3763,35 @@ def _source_file_gaps(memory: dict[str, Any], anchors: list[dict[str, Any]]) -> 
     return _case_list([*gaps, *base], limit=10, item_limit=240)
 
 
+
+def _brief_ownership_routing_diagnostics(ownership: dict[str, Any], nearby_context: list[dict[str, Any]]) -> dict[str, Any]:
+    summary = ownership.get("summary", {}) if isinstance(ownership, dict) else {}
+    diagnostics = summary.get("ownershipRoutingDiagnostics") if isinstance(summary, dict) else None
+    if not isinstance(diagnostics, dict):
+        diagnostics = {"overpromotedCandidatesBlocked": [], "strictAuthorityWarnings": []}
+    blocked = list(diagnostics.get("overpromotedCandidatesBlocked") or [])
+    seen = {(str(item.get("term") or "").lower(), str(item.get("sourceLane") or "")) for item in blocked if isinstance(item, dict)}
+    for item in nearby_context or []:
+        if not isinstance(item, dict) or not item.get("name"):
+            continue
+        key = (str(item.get("name")).lower(), "nearbyContextSignals")
+        if key in seen:
+            continue
+        blocked.append({
+            "term": str(item.get("name")),
+            "sourceLane": "nearbyContextSignals",
+            "attemptedScope": "namedAnchors/subject-owned intelligence",
+            "routedAs": "co_mention",
+            "reason": str(item.get("warning") or item.get("reason") or "nearby context only; not subject-owned evidence"),
+        })
+        seen.add(key)
+        if len(blocked) >= 20:
+            break
+    return {
+        "overpromotedCandidatesBlocked": blocked[:20],
+        "strictAuthorityWarnings": _case_list(diagnostics.get("strictAuthorityWarnings") or [], limit=12, item_limit=240),
+    }
+
 def build_subject_intelligence_brief_v1(memory: dict[str, Any]) -> dict[str, Any]:
     subject = _case_text(memory.get("subjectName") or "this subject", 140)
     subject_key = _case_text(memory.get("subjectKey") or _subject_key(subject), 140)
@@ -3766,7 +3802,7 @@ def build_subject_intelligence_brief_v1(memory: dict[str, Any]) -> dict[str, Any
     topics = _topic_buckets(memory, ownership)
     anchors, ignored_noise, nearby_context = _named_anchor_extraction(memory, ownership)
     behavioral_signature = _behavioral_signature_v1(subject, ownership)
-    archetype = _subject_archetype_read(subject, memory, profile, topics, anchors, channels)
+    archetype = _subject_archetype_read(subject, memory, profile, topics, anchors, channels, ownership)
     distinguishing = _distinguishing_read(archetype)
     music = _signals_from(memory, ("musicSignals", "bestEvidenceToReview", "representativeEvidence"), "No specific music/link signal is confirmed in the current packet; do not infer submissions or ownership.")
     relationship = _signals_from(memory, ("relationshipSignals",), "No relationship signal is confirmed; keep any relationship interpretation review-only.")
@@ -3787,6 +3823,7 @@ def build_subject_intelligence_brief_v1(memory: dict[str, Any]) -> dict[str, Any
         "namedAnchors": anchors,
         "nearbyContextSignals": nearby_context,
         "evidenceOwnershipSummary": ownership.get("summary", {}),
+        "ownershipRoutingDiagnostics": _brief_ownership_routing_diagnostics(ownership, nearby_context),
         "behavioralSignatureV1": behavioral_signature,
         "ignoredExtractionNoise": ignored_noise,
         "interactionPatterns": _signals_from(memory, ("bnlInteractionSignals", "communitySignals", "conversationThemes"), "No specific interaction pattern is exposed beyond the representative evidence."),
