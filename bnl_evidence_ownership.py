@@ -25,6 +25,29 @@ REVIEW_ONLY_SCOPES = {
 }
 OWNERSHIP_SCOPES = (*OWNED_SCOPES, *REVIEW_ONLY_SCOPES)
 
+_DERIVED_OR_BROAD_LANES = {
+    "knowncontext",
+    "relationshipsignals",
+    "communitycontext",
+    "relationshipcontext",
+    "publicsafecandidatefacts",
+    "sourcecoverage",
+    "topicbreakdown",
+    "toptopicdetails",
+    "conversationthemes",
+    "topicthemes",
+    "missinginfo",
+    "sourceauthority",
+}
+_EXPLICIT_SUBJECT_FIELD_KEYS = (
+    "subject", "subjectName", "subject_name", "subjectKey", "subject_key", "entity", "entityName",
+    "normalizedName", "sourceFileName", "source_file_name", "profileSubject", "profileName", "publicProfileSubject",
+)
+_QUEUE_SUBJECT_FIELD_KEYS = (
+    "queueSubject", "queueSubjectName", "queue_subject", "queue_subject_name", "submitter", "submitterName",
+    "artist", "artistName", "queueArtistName", "submissionSubject",
+)
+
 # This ownership classifier is the shared gate for BNL memory.
 # Source File intelligence, Discord memory retrieval, website/dossier context,
 # queue/submission context, and future canonical entity profiles should all pass
@@ -40,8 +63,17 @@ def classify_evidence_ownership(raw_item: Any, subject_name: str, subject_key: s
     subject_tokens = _subject_tokens(subject_name, subject_key, confirmed_aliases)
     subject_hit = _any_token(haystack, subject_tokens)
     author_tokens = _field_values(raw_item, ("author", "authorName", "author_name", "username", "userName", "displayName", "memberName", "sender", "speaker", "createdBy", "owner", "ownerName"))
-    subject_field_tokens = _field_values(raw_item, ("subject", "subjectName", "subject_name", "subjectKey", "subject_key", "entity", "entityName", "normalizedName"))
+    subject_field_tokens = _field_values(raw_item, _EXPLICIT_SUBJECT_FIELD_KEYS)
+    queue_subject_tokens = _field_values(raw_item, _QUEUE_SUBJECT_FIELD_KEYS)
     relationship_tokens = _field_values(raw_item, ("from", "to", "source", "target", "subjectA", "subjectB", "endpointA", "endpointB", "relatedName", "relatedSubject"))
+    explicit_subject_match = _field_matches(subject_field_tokens, subject_tokens)
+    queue_subject_match = _field_matches(queue_subject_tokens, subject_tokens)
+    author_match = _field_matches(author_tokens, subject_tokens)
+    alias_match = _field_matches(author_tokens, [_norm(a) for a in confirmed_aliases if a])
+    relationship_match = bool(relationship_tokens and _field_matches(relationship_tokens, subject_tokens))
+    direct_match = _direct_address_to_subject(raw_item, haystack, subject_tokens)
+    text_subject_match = _text_starts_as_subject(text, subject_tokens)
+    derived_or_broad = _is_derived_or_broad_lane(raw_item)
 
     def result(ownership: str, confidence: str, reason: str) -> dict[str, str]:
         return {
@@ -52,30 +84,49 @@ def classify_evidence_ownership(raw_item: Any, subject_name: str, subject_key: s
             "sourceType": source_type,
             "visibility": visibility,
             "authority": authority,
+            "sourceLane": _source_lane(raw_item),
         }
 
     if _has_source_blind_marker(raw_item, haystack):
         return result("source_blind_legacy", "weak", "source-blind or legacy memory trace lacks item-level ownership metadata")
     if _has_generated_marker(raw_item, haystack):
         return result("generated_or_taxonomy", "weak", "generated report/taxonomy/system wording is not source evidence")
-    if _has_queue_marker(raw_item, haystack) and _visibility_safe(haystack, visibility):
-        return result("queue_authoritative", "strong" if subject_hit else "moderate", "queue/submission authority marker is present and visibility-safe")
-    if _has_site_marker(raw_item, haystack) and _visibility_safe(haystack, visibility):
-        return result("site_authoritative", "strong" if subject_hit else "moderate", "site/source-file authority marker is present and visibility-safe")
-    if _has_broadcast_marker(raw_item, haystack) and _visibility_safe(haystack, visibility):
-        return result("broadcast_memory_authoritative", "strong" if subject_hit else "moderate", "broadcast memory authority marker is present and visibility-safe")
-    if _field_matches(author_tokens, subject_tokens):
+
+    # Subject ownership outranks generic authority. Authority markers are only
+    # allowed after explicit author/subject/endpoint/direct evidence has been
+    # checked so broad Source File context cannot over-promote nearby entities.
+    if author_match:
         return result("owned", "strong", "author/user metadata matches the subject or confirmed alias")
-    if _field_matches(subject_field_tokens, subject_tokens):
+    if explicit_subject_match:
         return result("owned", "strong", "subject metadata matches the requested subject")
-    if _field_matches(author_tokens, [_norm(a) for a in confirmed_aliases if a]):
+    if alias_match:
         return result("confirmed_alias", "strong", "author/user metadata matches a confirmed subject alias")
-    if relationship_tokens and _field_matches(relationship_tokens, subject_tokens):
+    if relationship_match:
         return result("explicit_relationship", "moderate", "relationship endpoint metadata includes the subject")
-    if _direct_address_to_subject(raw_item, haystack, subject_tokens):
+    if direct_match:
         return result("direct_address", "moderate", "item is addressed directly to the subject")
-    if _text_starts_as_subject(text, subject_tokens):
+    if text_subject_match and not derived_or_broad:
         return result("owned", "moderate", "text is written as subject-authored/action evidence")
+
+    if derived_or_broad:
+        if _has_generated_marker(raw_item, haystack):
+            return result("generated_or_taxonomy", "weak", "derived/generated lane is not source-owned evidence")
+        if subject_hit or _co_mention_marker(raw_item, haystack):
+            return result("co_mention", "weak", "derived/broad context lane lacks explicit subject ownership metadata")
+        return result("shared_topic", "weak", "derived/broad context lane is review-only without explicit subject ownership metadata")
+
+    if _has_queue_marker(raw_item, haystack) and _visibility_safe(haystack, visibility):
+        if explicit_subject_match or queue_subject_match:
+            return result("queue_authoritative", "strong", "queue/submission authority marker has an explicit matching subject field")
+        return result("shared_topic", "weak", "queue/submission authority marker lacks explicit matching subject metadata")
+    if _has_site_marker(raw_item, haystack) and _visibility_safe(haystack, visibility):
+        if explicit_subject_match and (_has_strict_site_authority_marker(raw_item, haystack) or _has_subject_attached_source_note(raw_item, haystack)):
+            return result("site_authoritative", "strong", "site/source-file authority marker is explicitly attached to the requested subject")
+        return result("shared_topic", "weak", "generic site/source-file/profile wording lacks explicit matching subject authority")
+    if _has_broadcast_marker(raw_item, haystack) and _visibility_public_safe(haystack, visibility):
+        if explicit_subject_match:
+            return result("broadcast_memory_authoritative", "strong", "public-safe broadcast memory is explicitly attached to the requested subject")
+        return result("shared_topic", "weak", "broadcast/show/BARCODE wording lacks explicit matching subject metadata")
     if subject_hit and _shared_topic_marker(raw_item, haystack):
         return result("shared_topic", "weak", "subject appears in topic/community context without ownership metadata")
     if subject_hit or _co_mention_marker(raw_item, haystack):
@@ -112,6 +163,7 @@ def subject_owned_text_fragments(memory: dict[str, Any], subject_name: str, subj
         "coMentionExamples": _texts(fragments.get("co_mention", []), 5),
         "sourceBlindWarnings": [f"Source-blind legacy memory was quarantined: {t}" for t in _texts(fragments.get("source_blind_legacy", []), 4)],
         "routingWarnings": [],
+        "ownershipRoutingDiagnostics": _ownership_routing_diagnostics(review_items),
     }
     if counts["co_mention"] or counts["shared_topic"]:
         summary["routingWarnings"].append("Co-mentioned/shared-topic evidence is review context only and must not become subject facts.")
@@ -199,6 +251,14 @@ def _source_type(raw: Any) -> str:
     return "unknown"
 
 
+
+def _source_lane(raw: Any) -> str:
+    if isinstance(raw, dict):
+        for key in ("sourceLane", "lane", "field", "contextLane"):
+            if raw.get(key):
+                return _clean(str(raw.get(key)), 90)
+    return "unknown"
+
 def _visibility(raw: Any) -> str:
     if isinstance(raw, dict):
         for key in ("visibility", "channelPolicy", "policy", "publicSafe", "privacy"):
@@ -246,6 +306,77 @@ def _field_values(raw: Any, keys: tuple[str, ...]) -> list[str]:
 def _field_matches(values: list[str], tokens: list[str]) -> bool:
     return any(v == token or _any_token(v, [token]) for v in values for token in tokens if v and token)
 
+
+
+def _is_derived_or_broad_lane(raw_item: Any) -> bool:
+    if not isinstance(raw_item, dict):
+        return False
+    lane_values = [str(raw_item.get(key) or "") for key in ("sourceLane", "lane", "field", "contextLane", "sourceType", "type")]
+    normalized = {_norm(value).replace(" ", "") for value in lane_values if value}
+    return any(value in _DERIVED_OR_BROAD_LANES for value in normalized)
+
+
+def _visibility_public_safe(haystack: str, visibility: str) -> bool:
+    lowered = f"{haystack} {visibility}".lower()
+    unsafe = ("private" in lowered or "internal_review_only" in lowered or "publicsafe false" in _norm(lowered) or "public safe false" in _norm(lowered))
+    return not unsafe and ("public" in lowered or "approved" in lowered or "broadcast" in lowered)
+
+
+def _has_strict_site_authority_marker(raw: Any, haystack: str) -> bool:
+    if isinstance(raw, dict):
+        authority = _norm(str(raw.get("authority") or raw.get("sourceAuthority") or raw.get("authorityType") or raw.get("sourceAuthorityType") or ""))
+        source_type = _norm(str(raw.get("sourceType") or raw.get("type") or raw.get("origin") or ""))
+        if any(marker in authority for marker in ("site authoritative", "site_authoritative", "source file authoritative", "public profile")):
+            return True
+        if any(marker in source_type for marker in ("site authoritative", "public profile record", "source file note")):
+            return True
+    return any(t in haystack for t in ("site_authoritative", "site authoritative"))
+
+
+def _has_subject_attached_source_note(raw: Any, haystack: str) -> bool:
+    if not isinstance(raw, dict):
+        return False
+    lane = _norm(str(raw.get("sourceLane") or raw.get("sourceType") or raw.get("type") or ""))
+    if any(marker in lane for marker in ("source file note", "source note", "public profile record")):
+        return True
+    return bool(raw.get("sourceFileNote") or raw.get("sourceNote") or raw.get("publicProfileRecord"))
+
+
+def _ownership_routing_diagnostics(review_items: list[dict[str, Any]]) -> dict[str, Any]:
+    blocked: list[dict[str, str]] = []
+    warnings: list[str] = []
+    seen: set[tuple[str, str]] = set()
+    authority_warning_terms = ("source file", "identity check", "public profile", "dossier", "queue", "submission", "broadcast", "radio", "barcode")
+    for item in review_items:
+        classification = item.get("classification", {}) if isinstance(item, dict) else {}
+        text = str(item.get("text") or classification.get("safeSummary") or "")
+        lowered = text.lower()
+        reason = str(classification.get("reason") or "review-only evidence lacks explicit subject ownership metadata")
+        routed_as = str(classification.get("ownership") or "unknown")
+        source_lane = str(classification.get("sourceLane") or classification.get("sourceType") or "unknown")
+        attempted = "namedAnchors/subject-owned intelligence" if any(term in lowered for term in ("orion", "bnl", "barcode", "network", "edge", "interface", "archive", "ai")) else "subject-owned intelligence"
+        terms = []
+        for term in ("Orion", "BNL", "BNL-01", "BARCODE", "Network", "EDGE", "Interface", "Archive", "AI"):
+            pattern = re.escape(term).replace("\\ ", r"\s+")
+            if re.search(rf"(?<![-A-Za-z0-9]){pattern}(?![-A-Za-z0-9])", text, flags=re.I):
+                terms.append(term)
+        if not terms:
+            terms = re.findall(r"(?<![-A-Za-z0-9])[A-Z][A-Za-z0-9'’-]{2,}(?:-[A-Za-z0-9'’-]+)*\b", text)[:3]
+        for term in terms[:4]:
+            key = (term.lower(), source_lane)
+            if key in seen:
+                continue
+            seen.add(key)
+            blocked.append({"term": term, "sourceLane": source_lane, "attemptedScope": attempted, "routedAs": routed_as, "reason": reason})
+            if len(blocked) >= 20:
+                break
+        if any(term in lowered for term in authority_warning_terms) and routed_as not in OWNED_SCOPES:
+            warning = f"Strict authority gate kept {source_lane} as {routed_as}: {reason}"
+            if warning not in warnings:
+                warnings.append(warning)
+        if len(blocked) >= 20:
+            break
+    return {"overpromotedCandidatesBlocked": blocked[:20], "strictAuthorityWarnings": warnings[:12]}
 
 def _visibility_safe(haystack: str, visibility: str) -> bool:
     lowered = f"{haystack} {visibility}".lower()

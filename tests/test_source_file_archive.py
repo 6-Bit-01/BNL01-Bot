@@ -584,6 +584,28 @@ class SourceFileArchiveTests(unittest.TestCase):
         self.assertIn("orion/archive-facing", brief["bnlTake"].lower())
         self.assertIn("review-only", brief["bnlTake"].lower())
 
+
+    def test_evidence_ownership_shortybabe_nearby_orion_not_promoted(self):
+        brief = self._subject_brief_for(
+            "ShortyBabe",
+            sourceCounts={"conversations": 6},
+            topChannels=[{"channel": "#barcode-bot", "count": 4, "summary": "ShortyBabe challenges BNL repeatedly."}],
+            topTopicDetails=[{"topic": "BNL challenge and pushback", "count": 4}],
+            usefulEvidence=[
+                {"summary": "ShortyBabe challenges BNL-01 and pushes back on the Source File boundary.", "authorName": "ShortyBabe", "sourceType": "Discord conversation", "visibility": "public_context"},
+                {"summary": "ShortyBabe teases BNL and provokes BNL-01 about the rules.", "authorName": "ShortyBabe", "sourceType": "Discord conversation", "visibility": "public_context"},
+            ],
+            knownContext=["Orion appears in broad nearby context around ShortyBabe but is not attached to ShortyBabe evidence."],
+            relationshipSignals=["Orion appears near ShortyBabe in relationship/context evidence only; meaning unconfirmed."],
+            representativeEvidence=[{"summary": "ShortyBabe challenged BNL-01 and pushed back at the rules.", "authorName": "ShortyBabe", "channelName": "#barcode-bot", "sourceType": "Discord conversation", "visibility": "public_context"}],
+        )
+        self.assertNotIn("Orion", {item.get("name") for item in brief["namedAnchors"]})
+        self.assertNotIn("orion-linked", brief["bnlTake"].lower())
+        self.assertNotIn("orion/archive-facing", brief["bnlTake"].lower())
+        self.assertTrue(any(item.get("name") == "Orion" for item in brief["nearbyContextSignals"]))
+        diagnostics = brief["ownershipRoutingDiagnostics"]
+        self.assertTrue(any(item.get("term") == "Orion" and item.get("routedAs") in {"co_mention", "shared_topic"} for item in diagnostics["overpromotedCandidatesBlocked"]))
+
     def test_evidence_ownership_shortybabe_bnl_challenger_signature(self):
         brief = self._subject_brief_for(
             "ShortyBabe",
