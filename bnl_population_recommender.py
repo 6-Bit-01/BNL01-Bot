@@ -574,58 +574,307 @@ def group_memory_records(records: list[dict[str, Any]], *, source_lanes: list[st
     return list(grouped.values())
 
 
-def collect_shared_memory_population_records(db_path: str, guild_id: int | None, *, max_items: int = 200, source_lanes: list[str] | None = None, subject_filter: str | None = None) -> list[dict[str, Any]]:
+def _safe_error_message(exc: Exception, limit: int = 220) -> str:
+    """Return a short operator-safe error reason for Discord/log summaries."""
+
+    message = _safe_text(str(exc) or exc.__class__.__name__, limit)
+    message = re.sub(r"(?i)(token|secret|password|authorization|api[_-]?key)\s*[=:]\s*\S+", r"\1=[redacted]", message)
+    return message or exc.__class__.__name__
+
+
+def _quote_ident(identifier: str) -> str:
+    return '"' + str(identifier).replace('"', '""') + '"'
+
+
+def _row_get(row: sqlite3.Row, column: str, default: Any = None) -> Any:
+    try:
+        return row[column]
+    except Exception:
+        return default
+
+
+def _first_existing(cols: set[str], candidates: list[str]) -> str | None:
+    for candidate in candidates:
+        if candidate in cols:
+            return candidate
+    return None
+
+
+def _memory_tier_from_timestamp(value: Any) -> str:
+    if not value:
+        return "short_term"
+    text = str(value)
+    try:
+        dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        age_days = (datetime.now(timezone.utc) - dt.astimezone(timezone.utc)).days
+        return "live" if age_days <= 7 else "short_term"
+    except Exception:
+        return "short_term"
+
+
+def _build_user_name_map(conn: sqlite3.Connection, tables: set[str], guild_id: int | None) -> dict[str, str]:
+    if "user_profiles" not in tables:
+        return {}
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(user_profiles)").fetchall()}
+    user_col = _first_existing(cols, ["user_id", "id"])
+    name_col = _first_existing(cols, ["preferred_name", "display_name", "user_name", "name"])
+    if not user_col or not name_col:
+        return {}
+    where = ""
+    params: list[Any] = []
+    if "guild_id" in cols and guild_id is not None:
+        where = "WHERE guild_id=?"
+        params.append(guild_id)
+    query = f"SELECT {_quote_ident(user_col)} AS user_id,{_quote_ident(name_col)} AS name FROM user_profiles {where}"
+    names: dict[str, str] = {}
+    try:
+        for row in conn.execute(query, params).fetchall():
+            if _row_get(row, "user_id") is not None and _row_get(row, "name"):
+                names[str(_row_get(row, "user_id"))] = _safe_text(_row_get(row, "name"), 120)
+    except Exception as exc:
+        logging.warning("population_scan_table_skipped table=user_profiles reason=%s", _safe_error_message(exc))
+    return names
+
+
+def collect_shared_memory_population_records(
+    db_path: str,
+    guild_id: int | None,
+    *,
+    max_items: int = 200,
+    source_lanes: list[str] | None = None,
+    subject_filter: str | None = None,
+    allow_sealed_test: bool = False,
+    diagnostics: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
     """Collect approved existing BNL memory/evidence rows for population scan.
 
     This uses already-existing local evidence tables when present. It creates no
-    new memory database and stores nothing.
+    new memory database and stores nothing. Tables/columns are optional by
+    design; unexpected table schemas are skipped with table-level warnings.
     """
 
     lane_filter = {_lane(l) for l in source_lanes or []}
     subject_filter_key = normalize_subject_key(subject_filter) if subject_filter else ""
     records: list[dict[str, Any]] = []
+    table_counts: Counter[str] = Counter()
+    filter_decisions: Counter[str] = Counter()
+    safe_policies = {"public_home", "public_context", "broadcast_memory", "rd_context"}
+    if allow_sealed_test or "sealed_test" in lane_filter:
+        safe_policies.add("sealed_test")
+    excluded_policies = {"protected_system", "private_admin", "internal_controlled", "unknown"}
 
-    def add(record: dict[str, Any]) -> None:
+    diag = diagnostics if diagnostics is not None else None
+    if diag is not None:
+        diag.setdefault("db_path_exists", False)
+        diag.setdefault("tables", {})
+        diag.setdefault("filter_decisions", {})
+
+    def diag_table(table: str, *, exists: bool, cols: set[str] | None = None, rows: int | None = None, collected: int | None = None, skipped_reason: str | None = None) -> None:
+        logging.info("population_scan_table_checked table=%s exists=%s", table, 1 if exists else 0)
+        if diag is not None:
+            info = diag.setdefault("tables", {}).setdefault(table, {})
+            info["exists"] = bool(exists)
+            if cols is not None:
+                info["columns"] = sorted(cols)
+            if rows is not None:
+                info["row_count"] = rows
+            if collected is not None:
+                info["records_collected"] = collected
+            if skipped_reason:
+                info["skipped_reason"] = skipped_reason
+
+    def skip_table(table: str, reason: str) -> None:
+        logging.warning("population_scan_table_skipped table=%s reason=%s", table, reason)
+        if diag is not None:
+            diag.setdefault("tables", {}).setdefault(table, {})["skipped_reason"] = reason
+
+    def add(table: str, record: dict[str, Any]) -> None:
         if len(records) >= max_items:
+            filter_decisions["max_items_reached"] += 1
             return
         lane = _record_lane(record)
         if lane_filter and lane not in lane_filter:
+            filter_decisions[f"lane_filtered:{lane}"] += 1
             return
         if subject_filter_key and subject_filter_key not in _record_subject_key(record):
+            filter_decisions["subject_filtered"] += 1
             return
         records.append(record)
+        table_counts[table] += 1
+        filter_decisions["included"] += 1
+
+    def table_cols(conn: sqlite3.Connection, table: str, tables: set[str]) -> set[str] | None:
+        exists = table in tables
+        if not exists:
+            diag_table(table, exists=False, collected=0)
+            skip_table(table, "missing")
+            return None
+        cols = {row[1] for row in conn.execute(f"PRAGMA table_info({_quote_ident(table)})").fetchall()}
+        try:
+            row_count = conn.execute(f"SELECT COUNT(*) FROM {_quote_ident(table)}").fetchone()[0]
+        except Exception:
+            row_count = None
+        diag_table(table, exists=True, cols=cols, rows=row_count)
+        return cols
+
+    def select_rows(conn: sqlite3.Connection, table: str, cols: set[str], order_candidates: list[str] | None = None) -> list[sqlite3.Row]:
+        where_parts: list[str] = []
+        params: list[Any] = []
+        if "guild_id" in cols and guild_id is not None:
+            where_parts.append("guild_id=?")
+            params.append(guild_id)
+        where = "WHERE " + " AND ".join(where_parts) if where_parts else ""
+        order_col = _first_existing(cols, order_candidates or ["updated_at", "timestamp", "created_at", "id"])
+        order = f"ORDER BY {_quote_ident(order_col)} DESC" if order_col else "ORDER BY rowid DESC"
+        return conn.execute(f"SELECT rowid,* FROM {_quote_ident(table)} {where} {order} LIMIT ?", (*params, max_items)).fetchall()
+
+    import os
+    if diag is not None:
+        diag["db_path_exists"] = bool(db_path and os.path.exists(db_path))
+        diag["source_lanes"] = sorted(lane_filter)
+        diag["subject_filter"] = bool(subject_filter)
 
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
     try:
         tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
-        if "memory_tiers" in tables:
-            cols = {row[1] for row in conn.execute("PRAGMA table_info(memory_tiers)").fetchall()}
-            if {"tier", "summary"}.issubset(cols):
-                subject_col = "subject_name" if "subject_name" in cols else ("subject" if "subject" in cols else "summary")
-                updated_col = "updated_at" if "updated_at" in cols else "rowid"
-                gid_clause = "WHERE guild_id=?" if "guild_id" in cols and guild_id is not None else ""
-                params = (guild_id,) if gid_clause else ()
-                for row in conn.execute(f"SELECT rowid,* FROM memory_tiers {gid_clause} ORDER BY {updated_col} DESC LIMIT ?", (*params, max_items)).fetchall():
-                    add({"subjectName": row[subject_col], "memoryTier": row["tier"], "sourceLane": "memory_tiers", "summary": row["summary"], "sourceEvidenceRef": f"memory_tiers:{row['rowid']}", "rawEvidenceRef": f"memory_tiers:{row['rowid']}", "visibility": row["source_channel_policy"] if "source_channel_policy" in cols else "admin_only"})
-        if "broadcast_memory" in tables:
-            cols = {row[1] for row in conn.execute("PRAGMA table_info(broadcast_memory)").fetchall()}
-            text_col = "cleaned_summary" if "cleaned_summary" in cols else ("summary" if "summary" in cols else "content")
-            if text_col in cols:
-                gid_clause = "WHERE guild_id=?" if "guild_id" in cols and guild_id is not None else ""
-                params = (guild_id,) if gid_clause else ()
-                for row in conn.execute(f"SELECT rowid,* FROM broadcast_memory {gid_clause} ORDER BY rowid DESC LIMIT ?", (*params, max_items)).fetchall():
-                    add({"subjectName": row[text_col], "memoryTier": "dormant_archive", "sourceLane": "broadcast_memory", "summary": row[text_col], "sourceEvidenceRef": f"broadcast_memory:{row['rowid']}", "rawEvidenceRef": f"broadcast_memory:{row['rowid']}", "visibility": "review_only"})
-        if "community_presence" in tables:
-            cols = {row[1] for row in conn.execute("PRAGMA table_info(community_presence)").fetchall()}
-            subject_col = "display_name" if "display_name" in cols else ("subject_name" if "subject_name" in cols else "user_id")
-            gid_clause = "WHERE guild_id=?" if "guild_id" in cols and guild_id is not None else ""
-            params = (guild_id,) if gid_clause else ()
-            for row in conn.execute(f"SELECT rowid,* FROM community_presence {gid_clause} ORDER BY rowid DESC LIMIT ?", (*params, max_items)).fetchall():
-                summary = row["last_topic"] if "last_topic" in cols else "community presence signal"
-                add({"subjectName": row[subject_col], "memoryTier": "short_term", "sourceLane": "community_presence", "summary": summary, "sourceEvidenceRef": f"community_presence:{row['rowid']}", "rawEvidenceRef": f"community_presence:{row['rowid']}", "visibility": "review_only"})
+        user_names = _build_user_name_map(conn, tables, guild_id)
+
+        def user_name(user_id: Any, fallback: Any = None) -> str:
+            if fallback:
+                return _safe_text(fallback, 120)
+            return user_names.get(str(user_id), _safe_text(user_id, 80) or "unknown")
+
+        # conversations
+        table = "conversations"
+        cols = table_cols(conn, table, tables)
+        if cols is not None:
+            text_col = _first_existing(cols, ["content", "message", "text"])
+            if not text_col:
+                skip_table(table, "missing content column")
+            else:
+                for row in select_rows(conn, table, cols, ["timestamp", "created_at", "id"]):
+                    policy = str(_row_get(row, "channel_policy", "unknown") or "unknown")
+                    if policy in excluded_policies or policy not in safe_policies:
+                        filter_decisions[f"policy_filtered:{policy}"] += 1
+                        continue
+                    role = str(_row_get(row, "role", "") or "").lower()
+                    subject = user_name(_row_get(row, "user_id"), _row_get(row, "user_name") if role == "user" else None)
+                    add(table, {"subjectName": subject, "memoryTier": _memory_tier_from_timestamp(_row_get(row, "timestamp")), "sourceLane": policy if policy in {"broadcast_memory", "rd_context"} else "conversations", "summary": _row_get(row, text_col), "content": _row_get(row, text_col), "sourceEvidenceRef": f"conversations:{_row_get(row, 'id', _row_get(row, 'rowid'))}", "rawEvidenceRef": f"conversations:{_row_get(row, 'id', _row_get(row, 'rowid'))}", "visibility": policy})
+            logging.info("population_scan_table_collected table=%s count=%s", table, table_counts[table])
+
+        # user_memory_facts
+        table = "user_memory_facts"
+        cols = table_cols(conn, table, tables)
+        if cols is not None:
+            if not {"user_id", "fact_key", "fact_value"}.issubset(cols):
+                skip_table(table, "missing required fact columns")
+            else:
+                for row in select_rows(conn, table, cols, ["updated_at", "id"]):
+                    key = _safe_text(_row_get(row, "fact_key"), 80)
+                    val = _safe_text(_row_get(row, "fact_value"), 220)
+                    add(table, {"subjectName": user_name(_row_get(row, "user_id")), "memoryTier": "long_term" if _row_get(row, "is_core") else "mid_term", "sourceLane": table, "summary": f"{key}: {val}".strip(": "), "sourceEvidenceRef": f"user_memory_facts:{_row_get(row, 'id', _row_get(row, 'rowid'))}", "rawEvidenceRef": f"user_memory_facts:{_row_get(row, 'id', _row_get(row, 'rowid'))}", "visibility": "review_only"})
+            logging.info("population_scan_table_collected table=%s count=%s", table, table_counts[table])
+
+        # relationship_journal
+        table = "relationship_journal"
+        cols = table_cols(conn, table, tables)
+        if cols is not None:
+            if not {"user_id", "summary"}.issubset(cols):
+                skip_table(table, "missing required journal columns")
+            else:
+                for row in select_rows(conn, table, cols, ["timestamp", "updated_at", "id"]):
+                    safe_summary = _safe_text(_row_get(row, "summary"), 180)
+                    add(table, {"subjectName": user_name(_row_get(row, "user_id")), "memoryTier": "mid_term", "sourceLane": table, "summary": safe_summary, "sourceEvidenceRef": f"relationship_journal:{_row_get(row, 'id', _row_get(row, 'rowid'))}", "rawEvidenceRef": f"relationship_journal:{_row_get(row, 'id', _row_get(row, 'rowid'))}", "visibility": "internal_only"})
+            logging.info("population_scan_table_collected table=%s count=%s", table, table_counts[table])
+
+        # relationship_state
+        table = "relationship_state"
+        cols = table_cols(conn, table, tables)
+        if cols is not None:
+            if "user_id" not in cols:
+                skip_table(table, "missing user_id column")
+            else:
+                for row in select_rows(conn, table, cols, ["updated_at", "user_id"]):
+                    parts = ["stable relationship/activity signal"]
+                    for c in ["interaction_count", "affinity_score", "trust_stage", "social_stance", "last_topic"]:
+                        if c in cols and _row_get(row, c) not in (None, ""):
+                            parts.append(f"{c}={_safe_text(_row_get(row, c), 60)}")
+                    uid = _row_get(row, "user_id")
+                    add(table, {"subjectName": user_name(uid), "memoryTier": "mid_term", "sourceLane": table, "summary": "; ".join(parts), "sourceEvidenceRef": f"relationship_state:{uid}", "rawEvidenceRef": f"relationship_state:{uid}", "visibility": "internal_only"})
+            logging.info("population_scan_table_collected table=%s count=%s", table, table_counts[table])
+
+        # broadcast_memory
+        table = "broadcast_memory"
+        cols = table_cols(conn, table, tables)
+        if cols is not None:
+            text_col = _first_existing(cols, ["cleaned_summary", "summary", "content", "text"])
+            if not text_col:
+                skip_table(table, "missing text column")
+            else:
+                for row in select_rows(conn, table, cols, ["updated_at", "created_at", "id"]):
+                    status = str(_row_get(row, "status", "") or "").lower()
+                    public_safe = _row_get(row, "public_safe", None)
+                    visibility = _safe_text(_row_get(row, "usage_scope", None), 80) or "review_only"
+                    if status in {"blocked", "rejected", "private"} or public_safe in (0, "0", False):
+                        filter_decisions["broadcast_memory_safety_filtered"] += 1
+                        continue
+                    add(table, {"subjectName": _row_get(row, text_col), "memoryTier": "dormant_archive", "sourceLane": table, "summary": _row_get(row, text_col), "sourceEvidenceRef": f"broadcast_memory:{_row_get(row, 'id', _row_get(row, 'rowid'))}", "rawEvidenceRef": f"broadcast_memory:{_row_get(row, 'id', _row_get(row, 'rowid'))}", "visibility": visibility})
+            logging.info("population_scan_table_collected table=%s count=%s", table, table_counts[table])
+
+        # memory_tiers
+        table = "memory_tiers"
+        cols = table_cols(conn, table, tables)
+        if cols is not None:
+            text_col = _first_existing(cols, ["summary", "content", "text"])
+            tier_col = _first_existing(cols, ["tier", "memory_tier"])
+            if not text_col:
+                skip_table(table, "missing summary column")
+            else:
+                subject_col = _first_existing(cols, ["subject_name", "subject", "display_name", "user_id"])
+                for row in select_rows(conn, table, cols, ["updated_at", "created_at", "id"]):
+                    add(table, {"subjectName": _row_get(row, subject_col) if subject_col else _row_get(row, text_col), "memoryTier": _row_get(row, tier_col, "mid_term") if tier_col else "mid_term", "sourceLane": table, "summary": _row_get(row, text_col), "sourceEvidenceRef": f"memory_tiers:{_row_get(row, 'id', _row_get(row, 'rowid'))}", "rawEvidenceRef": f"memory_tiers:{_row_get(row, 'id', _row_get(row, 'rowid'))}", "visibility": _row_get(row, "source_channel_policy", None) if "source_channel_policy" in cols else "review_only"})
+            logging.info("population_scan_table_collected table=%s count=%s", table, table_counts[table])
+
+        # community_presence
+        table = "community_presence"
+        cols = table_cols(conn, table, tables)
+        if cols is not None:
+            subject_col = _first_existing(cols, ["display_name", "subject_name", "subject_key", "user_id"])
+            if not subject_col:
+                skip_table(table, "missing subject column")
+            else:
+                for row in select_rows(conn, table, cols, ["last_seen_at", "updated_at", "rowid"]):
+                    summary = _row_get(row, "last_topic", None) if "last_topic" in cols else None
+                    summary = summary or _row_get(row, "connection_notes", None) if "connection_notes" in cols else summary
+                    add(table, {"subjectName": _row_get(row, subject_col), "memoryTier": "short_term", "sourceLane": table, "summary": summary or "community presence signal", "sourceEvidenceRef": f"community_presence:{_row_get(row, 'id', _row_get(row, 'rowid'))}", "rawEvidenceRef": f"community_presence:{_row_get(row, 'id', _row_get(row, 'rowid'))}", "visibility": "review_only"})
+            logging.info("population_scan_table_collected table=%s count=%s", table, table_counts[table])
+
+        optional_tables = ["entity_evidence_events", "source_file_notes", "source_file_archive", "source_file_archives", "dossier_recommendations", "source_file_refresh_requests"]
+        for table in optional_tables:
+            cols = table_cols(conn, table, tables)
+            if cols is None:
+                continue
+            text_col = _first_existing(cols, ["summary", "note", "content", "evidence_summary", "reason", "status", "last_error"])
+            subject_col = _first_existing(cols, ["subject_name", "subject", "display_name", "subject_key", "target_name", "candidate_name"])
+            if not text_col:
+                skip_table(table, "missing text/summary column")
+                logging.info("population_scan_table_collected table=%s count=%s", table, table_counts[table])
+                continue
+            for row in select_rows(conn, table, cols, ["updated_at", "created_at", "timestamp", "id"]):
+                subject = _row_get(row, subject_col) if subject_col else table.replace("_", " ")
+                add(table, {"subjectName": subject, "memoryTier": "mid_term", "sourceLane": table, "summary": _safe_text(_row_get(row, text_col), 220), "sourceEvidenceRef": f"{table}:{_row_get(row, 'id', _row_get(row, 'rowid'))}", "rawEvidenceRef": f"{table}:{_row_get(row, 'id', _row_get(row, 'rowid'))}", "visibility": "review_only"})
+            logging.info("population_scan_table_collected table=%s count=%s", table, table_counts[table])
     finally:
         conn.close()
+
+    if diag is not None:
+        for table, count in table_counts.items():
+            diag.setdefault("tables", {}).setdefault(table, {})["records_collected"] = count
+        diag["filter_decisions"] = dict(filter_decisions)
+        diag["final_collected_count"] = len(records[:max_items])
     return records[:max_items]
 
 
@@ -645,19 +894,50 @@ def run_population_scan(
     confirmed_aliases: dict[str, Any] | None = None,
     sender: Callable[..., dict[str, Any]] | None = None,
     environ: dict[str, str] | None = None,
+    diagnostics: bool = False,
+    allow_sealed_test: bool = False,
 ) -> dict[str, Any]:
     """Run an owner/admin population scan with safe dry-run defaults."""
 
     counts = {"scanned": 0, "generated": 0, "sent_to_site": 0, "dry_run": 0, "skipped": 0, "blocked": 0, "errors": 0}
     logging.info("population_scan_started dry_run=%s max_items=%s min_confidence=%s", dry_run, max_items, min_confidence)
+    diagnostic_info: dict[str, Any] = {} if diagnostics else {}
     try:
-        records = list(memory_records) if memory_records is not None else collect_shared_memory_population_records(db_path or "", guild_id, max_items=max_items, source_lanes=source_lanes, subject_filter=subject_filter)
-    except Exception:
+        records = list(memory_records) if memory_records is not None else collect_shared_memory_population_records(
+            db_path or "",
+            guild_id,
+            max_items=max_items,
+            source_lanes=source_lanes,
+            subject_filter=subject_filter,
+            allow_sealed_test=allow_sealed_test,
+            diagnostics=diagnostic_info if diagnostics else None,
+        )
+    except Exception as exc:
+        safe_reason = _safe_error_message(exc)
+        logging.exception(
+            "population_scan_collect_failed exception_type=%s exception_message=%s db_path=%s guild_id=%s source_lanes=%s subject_filter=%s",
+            exc.__class__.__name__,
+            safe_reason,
+            _safe_text(db_path or "", 220),
+            guild_id,
+            sorted({_lane(l) for l in source_lanes or []}),
+            bool(subject_filter),
+        )
         logging.warning("population_scan_completed scanned=0 generated=0 sent_to_site=0 dry_run=0 skipped=0 blocked=0 errors=1")
-        return {"ok": False, "dryRun": bool(dry_run), "recommendations": [], "payloads": [], "counts": {**counts, "errors": 1}, "error": "population_scan_collect_failed"}
+        return {"ok": False, "dryRun": bool(dry_run), "recommendations": [], "payloads": [], "counts": {**counts, "errors": 1}, "error": "population_scan_collect_failed", "reason": safe_reason, "diagnostics": diagnostic_info if diagnostics else None}
+
+    if diagnostics:
+        diagnostic_info.setdefault("final_collected_count", len(records))
 
     grouped = group_memory_records(records, source_lanes=source_lanes, subject_filter=subject_filter, max_items=max_items)
     counts["scanned"] = sum(len(g) for g in grouped)
+    if not records and not grouped:
+        warning = "no eligible memory records found"
+        logging.info("population_scan_completed scanned=0 generated=0 sent_to_site=0 dry_run=0 skipped=0 blocked=0 errors=0 warning=%s", warning)
+        result = {"ok": True, "dryRun": bool(dry_run), "recommendations": [], "payloads": [], "counts": counts, "warning": warning}
+        if diagnostics:
+            result["diagnostics"] = diagnostic_info
+        return result
     recommendations: list[dict[str, Any]] = []
     payloads: list[dict[str, Any]] = []
     send_func = sender or send_dossier_recommendation
@@ -698,7 +978,11 @@ def run_population_scan(
         "population_scan_completed scanned=%s generated=%s sent_to_site=%s dry_run=%s skipped=%s blocked=%s errors=%s",
         counts["scanned"], counts["generated"], counts["sent_to_site"], counts["dry_run"], counts["skipped"], counts["blocked"], counts["errors"],
     )
-    return {"ok": counts["errors"] == 0, "dryRun": bool(dry_run), "recommendations": recommendations, "payloads": payloads, "counts": counts}
+    result = {"ok": counts["errors"] == 0, "dryRun": bool(dry_run), "recommendations": recommendations, "payloads": payloads, "counts": counts}
+    if diagnostics:
+        diagnostic_info["final_collected_count"] = len(records)
+        result["diagnostics"] = diagnostic_info
+    return result
 
 
 def parse_population_scan_command(content: str) -> tuple[bool, dict[str, Any] | None, str]:
@@ -707,7 +991,7 @@ def parse_population_scan_command(content: str) -> tuple[bool, dict[str, Any] | 
     text = (content or "").strip()
     if not re.match(r"^!bnl\s+(?:population|source_population)\s+scan(?:\s+now)?\b", text, flags=re.I):
         return False, None, "not_population_scan_command"
-    options: dict[str, Any] = {"dry_run": True, "max_items": 25, "source_lanes": None, "min_confidence": "low", "subject_filter": None}
+    options: dict[str, Any] = {"dry_run": True, "max_items": 25, "source_lanes": None, "min_confidence": "low", "subject_filter": None, "diagnostics": False, "allow_sealed_test": False}
     tail = re.sub(r"^!bnl\s+(?:population|source_population)\s+scan(?:\s+now)?\b", "", text, flags=re.I).strip()
     if not tail:
         return True, options, ""
@@ -715,7 +999,11 @@ def parse_population_scan_command(content: str) -> tuple[bool, dict[str, Any] | 
         if not part:
             continue
         low = part.lower()
-        if low in {"--send", "send", "dry_run=false", "dry=false"}:
+        if low in {"diagnostics", "debug", "--diagnostics", "--debug"}:
+            options["diagnostics"] = True
+        elif low in {"allow_sealed_test=true", "sealed_test=true", "--allow-sealed-test"}:
+            options["allow_sealed_test"] = True
+        elif low in {"--send", "send", "dry_run=false", "dry=false"}:
             options["dry_run"] = False
         elif low in {"--dry-run", "dry_run=true", "dry=true"}:
             options["dry_run"] = True
@@ -736,14 +1024,42 @@ def parse_population_scan_command(content: str) -> tuple[bool, dict[str, Any] | 
     return True, options, ""
 
 
+def _format_population_scan_diagnostics(diagnostics: dict[str, Any]) -> list[str]:
+    lines = ["Diagnostics (metadata only):"]
+    lines.append(f"- db_path exists: {bool((diagnostics or {}).get('db_path_exists'))}")
+    tables = (diagnostics or {}).get("tables") or {}
+    for table in sorted(tables):
+        info = tables.get(table) or {}
+        cols = ",".join(info.get("columns") or []) or "none"
+        lines.append(f"- {table}: exists={int(bool(info.get('exists')))} rows={info.get('row_count', 0)} collected={info.get('records_collected', 0)} columns={cols}")
+        if info.get("skipped_reason"):
+            lines.append(f"  skipped={_safe_text(info.get('skipped_reason'), 120)}")
+    decisions = (diagnostics or {}).get("filter_decisions") or {}
+    if decisions:
+        lines.append("- filter decisions: " + ", ".join(f"{k}={v}" for k, v in sorted(decisions.items())))
+    lines.append(f"- final collected count: {(diagnostics or {}).get('final_collected_count', 0)}")
+    return lines
+
+
 def format_population_scan_response(summary: dict[str, Any]) -> str:
     counts = summary.get("counts") or {}
-    lines = [
-        f"Population scan {'dry-run' if summary.get('dryRun', True) else 'send'} complete.",
-        "Counts: " + ", ".join(f"{key}={counts.get(key, 0)}" for key in ("scanned", "generated", "sent_to_site", "dry_run", "skipped", "blocked", "errors")),
-    ]
-    for rec in (summary.get("recommendations") or [])[:8]:
-        lines.append(f"- {rec.get('subjectName')} → {rec.get('recommendedLane')} / {rec.get('recommendedAction')} ({rec.get('confidence')})")
-    if summary.get("dryRun", True):
-        lines.append("Dry-run only: no public pages were published and no public dossier text was edited.")
+    count_line = "Counts: " + ", ".join(f"{key}={counts.get(key, 0)}" for key in ("scanned", "generated", "sent_to_site", "dry_run", "skipped", "blocked", "errors"))
+    if not summary.get("ok", True) or counts.get("errors", 0) > 0:
+        lines = [
+            "Population scan failed during memory collection.",
+            f"Reason: {_safe_text(summary.get('reason') or summary.get('error') or 'unknown error', 220)}",
+            "No site records were created and no public pages were edited.",
+            count_line,
+        ]
+    else:
+        lines = [f"Population scan {'dry-run' if summary.get('dryRun', True) else 'send'} complete."]
+        if summary.get("warning") == "no eligible memory records found" or counts.get("scanned", 0) == 0:
+            lines.append("No eligible memory records found for the selected filters.")
+        lines.append(count_line)
+        for rec in (summary.get("recommendations") or [])[:8]:
+            lines.append(f"- {rec.get('subjectName')} → {rec.get('recommendedLane')} / {rec.get('recommendedAction')} ({rec.get('confidence')})")
+        if summary.get("dryRun", True):
+            lines.append("Dry-run only: no public pages were published and no public dossier text was edited.")
+    if summary.get("diagnostics"):
+        lines.extend(_format_population_scan_diagnostics(summary.get("diagnostics") or {}))
     return "\n".join(lines)[:1900]

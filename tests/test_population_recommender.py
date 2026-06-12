@@ -1,11 +1,16 @@
 import json
 import logging
+import os
+import sqlite3
+import tempfile
 import unittest
 
 from bnl_population_recommender import (
     POPULATION_RECOMMENDATION_SCHEMA_FIELDS,
     build_population_recommendation,
     build_population_recommendation_payload,
+    collect_shared_memory_population_records,
+    format_population_scan_response,
     parse_population_scan_command,
     run_population_scan,
 )
@@ -144,6 +149,110 @@ class PopulationRecommenderTests(unittest.TestCase):
         self.assertTrue(options["dry_run"])
         self.assertEqual(options["max_items"], 10)
         self.assertEqual(options["min_confidence"], "medium")
+
+    def _temp_db(self):
+        tmp = tempfile.NamedTemporaryFile(suffix=".sqlite", delete=False)
+        tmp.close()
+        self.addCleanup(lambda: os.path.exists(tmp.name) and os.unlink(tmp.name))
+        return tmp.name
+
+    def test_collection_failure_logs_and_returns_failed_summary(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with self.assertLogs(level="ERROR") as cm:
+                result = run_population_scan(db_path=tmpdir, dry_run=True)
+        logs = "\n".join(cm.output)
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error"], "population_scan_collect_failed")
+        self.assertIn("population_scan_collect_failed", logs)
+        self.assertIn("exception_type=", logs)
+        self.assertIn("exception_message=", logs)
+        self.assertIn("db_path=", logs)
+        self.assertIn("guild_id=", logs)
+        self.assertIn("source_lanes=", logs)
+        self.assertIn("subject_filter=", logs)
+        response = format_population_scan_response(result)
+        self.assertIn("failed during memory collection", response)
+        self.assertIn("No site records were created", response)
+        self.assertNotIn("complete", response.splitlines()[0].lower())
+
+    def test_empty_collection_returns_ok_warning(self):
+        db = self._temp_db()
+        result = run_population_scan(db_path=db, dry_run=True)
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["counts"]["errors"], 0)
+        self.assertEqual(result["warning"], "no eligible memory records found")
+        self.assertIn("No eligible memory records found", format_population_scan_response(result))
+
+    def test_missing_optional_tables_and_columns_do_not_fail(self):
+        db = self._temp_db()
+        conn = sqlite3.connect(db)
+        conn.execute("CREATE TABLE broadcast_memory (id INTEGER PRIMARY KEY, guild_id INTEGER, status TEXT)")
+        conn.execute("INSERT INTO broadcast_memory VALUES (1,1,'approved')")
+        conn.commit(); conn.close()
+        with self.assertLogs(level="INFO") as cm:
+            result = run_population_scan(db_path=db, guild_id=1, dry_run=True, diagnostics=True)
+        self.assertTrue(result["ok"])
+        logs = "\n".join(cm.output)
+        self.assertIn("population_scan_table_checked table=source_file_notes exists=0", logs)
+        self.assertIn("population_scan_table_checked table=broadcast_memory exists=1", logs)
+
+    def test_collects_real_memory_source_tables(self):
+        db = self._temp_db()
+        conn = sqlite3.connect(db)
+        conn.execute("CREATE TABLE user_profiles (user_id INTEGER, guild_id INTEGER, display_name TEXT, preferred_name TEXT)")
+        conn.execute("INSERT INTO user_profiles VALUES (42,1,'Crow','Crow')")
+        conn.execute("CREATE TABLE conversations (id INTEGER, guild_id INTEGER, channel_id INTEGER, channel_name TEXT, channel_policy TEXT, user_id INTEGER, user_name TEXT, role TEXT, content TEXT, timestamp TEXT)")
+        conn.execute("INSERT INTO conversations VALUES (1,1,10,'home','public_home',42,'Crow','user','helpful public context','2026-06-01T00:00:00+00:00')")
+        conn.execute("INSERT INTO conversations VALUES (2,1,10,'admin','private_admin',42,'Crow','user','private admin text','2026-06-01T00:00:00+00:00')")
+        conn.execute("INSERT INTO conversations VALUES (3,1,10,'sealed','sealed_test',42,'Crow','user','sealed text','2026-06-01T00:00:00+00:00')")
+        conn.execute("CREATE TABLE user_memory_facts (id INTEGER, user_id INTEGER, guild_id INTEGER, fact_key TEXT, fact_value TEXT, confidence TEXT, is_core INTEGER, updated_at TEXT)")
+        conn.execute("INSERT INTO user_memory_facts VALUES (4,42,1,'skill','maps','high',1,'2026-06-01')")
+        conn.execute("CREATE TABLE relationship_journal (id INTEGER, user_id INTEGER, guild_id INTEGER, entry_type TEXT, summary TEXT, timestamp TEXT)")
+        conn.execute("INSERT INTO relationship_journal VALUES (5,42,1,'note','relationship_journal rawRefJson alias: secret-name unknown -> unknown', '2026-06-01')")
+        conn.execute("CREATE TABLE relationship_state (user_id INTEGER, guild_id INTEGER, interaction_count INTEGER, affinity_score REAL, trust_stage TEXT, social_stance TEXT, last_topic TEXT, updated_at TEXT)")
+        conn.execute("INSERT INTO relationship_state VALUES (42,1,3,0.5,'known','friendly','maps','2026-06-01')")
+        conn.execute("CREATE TABLE broadcast_memory (id INTEGER, guild_id INTEGER, cleaned_summary TEXT, status TEXT, public_safe INTEGER, usage_scope TEXT)")
+        conn.execute("INSERT INTO broadcast_memory VALUES (6,1,'broadcast signal','approved',1,'review_only')")
+        conn.execute("CREATE TABLE memory_tiers (id INTEGER, guild_id INTEGER, subject_name TEXT, tier TEXT, summary TEXT)")
+        conn.execute("INSERT INTO memory_tiers VALUES (7,1,'Crow','mid_term','tier signal')")
+        conn.execute("CREATE TABLE community_presence (guild_id INTEGER, subject_key TEXT, display_name TEXT, last_topic TEXT)")
+        conn.execute("INSERT INTO community_presence VALUES (1,'crow','Crow','presence signal')")
+        conn.commit(); conn.close()
+
+        records = collect_shared_memory_population_records(db, 1, max_items=50)
+        lanes = [r["sourceLane"] for r in records]
+        self.assertIn("conversations", lanes)
+        self.assertIn("user_memory_facts", lanes)
+        self.assertIn("relationship_journal", lanes)
+        self.assertIn("relationship_state", lanes)
+        self.assertIn("broadcast_memory", lanes)
+        self.assertIn("memory_tiers", lanes)
+        self.assertIn("community_presence", lanes)
+        self.assertNotIn("private admin text", json.dumps(records))
+        self.assertNotIn("sealed text", json.dumps(records))
+        rec = build_population_recommendation([r for r in records if r["sourceLane"] == "relationship_journal"] + self.mid_records("Crow"))
+        self.assertNotIn("secret-name", json.dumps(rec["adminSummary"]))
+        self.assertNotIn("unknown -> unknown", json.dumps(rec["adminSummary"]).lower())
+
+        sealed = collect_shared_memory_population_records(db, 1, max_items=50, allow_sealed_test=True)
+        self.assertIn("sealed text", json.dumps(sealed))
+
+    def test_dry_run_counts_and_send_mode_pathway(self):
+        calls = []
+        result = run_population_scan(memory_records=self.mid_records(), dry_run=True, sender=lambda payload, **kw: calls.append(payload) or {"ok": True})
+        self.assertEqual(result["counts"]["scanned"], 2)
+        self.assertEqual(result["counts"]["dry_run"], 1)
+        self.assertEqual(result["counts"]["sent_to_site"], 0)
+        self.assertEqual(calls, [])
+        sent = run_population_scan(memory_records=self.mid_records(), dry_run=False, sender=lambda payload, **kw: calls.append(payload) or {"ok": True})
+        self.assertEqual(sent["counts"]["sent_to_site"], 1)
+
+    def test_parse_diagnostics_command(self):
+        matched, options, error = parse_population_scan_command("!bnl population scan now diagnostics")
+        self.assertTrue(matched)
+        self.assertEqual(error, "")
+        self.assertTrue(options["diagnostics"])
+        self.assertTrue(options["dry_run"])
 
 
 if __name__ == "__main__":

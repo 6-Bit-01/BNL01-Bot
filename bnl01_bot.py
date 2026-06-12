@@ -5085,6 +5085,8 @@ async def maybe_handle_population_scan_command(message: discord.Message, clean_c
         source_lanes=options.get("source_lanes"),
         min_confidence=str(options.get("min_confidence") or "low"),
         subject_filter=options.get("subject_filter"),
+        diagnostics=bool(options.get("diagnostics", False)),
+        allow_sealed_test=bool(options.get("allow_sealed_test", False) or options.get("diagnostics", False)),
         sender=send_dossier_recommendation,
         environ=os.environ,
     )
