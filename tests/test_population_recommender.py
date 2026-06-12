@@ -4,11 +4,14 @@ import os
 import sqlite3
 import tempfile
 import unittest
+from unittest import mock
 
 from bnl_population_recommender import (
     POPULATION_RECOMMENDATION_SCHEMA_FIELDS,
     build_population_recommendation,
     build_population_recommendation_payload,
+    extract_population_context,
+    fetch_bnl_population_context,
     collect_shared_memory_population_records,
     format_population_scan_response,
     parse_population_scan_command,
@@ -57,8 +60,8 @@ class PopulationRecommenderTests(unittest.TestCase):
 
     def test_confirmed_alias_avoids_duplicate_source_file(self):
         rec = build_population_recommendation(self.mid_records("Internal Alias"), existing_candidates=[{"id": "sf-2", "subjectKey": "canonical-subject", "name": "Canonical Subject"}], confirmed_aliases={"internal-alias": {"candidateId": "sf-2", "canonicalName": "Canonical Subject"}})
-        self.assertEqual(rec["recommendedLane"], "identity_review")
-        self.assertEqual(rec["recommendedAction"], "suggest_identity_link")
+        self.assertEqual(rec["recommendedLane"], "active_source_file")
+        self.assertEqual(rec["recommendedAction"], "attach_to_existing_source_file")
         self.assertNotEqual(rec["recommendedAction"], "create_source_file_candidate")
 
     def test_similar_name_needs_review_not_auto_merge(self):
@@ -341,8 +344,137 @@ class PopulationRecommenderTests(unittest.TestCase):
     def test_diagnostics_response_includes_context_and_skips(self):
         result = run_population_scan(memory_records=self.mid_records("6 Bit"), dry_run=True, diagnostics=True, public_dossiers=[{"id": "pd-6", "name": "6 Bit"}])
         response = format_population_scan_response(result)
-        self.assertIn("Context: site_context_loaded=False, public_dossiers=1", response)
-        self.assertIn("site_context_loaded", response)
+        self.assertIn("population_context_loaded", response)
+        self.assertIn("public_dossiers=1", response)
+        self.assertNotIn("private alias", response.lower())
+
+    def population_context(self):
+        return {
+            "ok": True,
+            "version": "population_context_v1",
+            "publicDossiers": [{"id": "pd-6", "name": "6 Bit", "slug": "6-bit"}],
+            "sourceFiles": [{"id": "sf-6", "name": "6 Bit", "subjectKey": "6-bit"}, {"id": "sf-mac", "name": "Mac Modem", "subjectKey": "mac-modem"}],
+            "candidates": [{"id": "cand-mind", "name": "Mind Fanatic", "subjectKey": "mind-fanatic"}],
+            "dossierUpdateWorkspaces": [{"id": "du-6", "publicDossierId": "pd-6", "candidateId": "sf-6", "name": "6 Bit"}],
+            "identityLinks": [{"alias": "private alias", "candidateId": "sf-mac", "canonicalName": "Mac Modem", "status": "confirmed"}],
+            "resolvedRecords": [{"subjectKey": "already-done", "targetCandidateId": "sf-done"}],
+        }
+
+    def test_fetch_population_context_uses_configured_url_and_auth_header(self):
+        class Resp:
+            status = 200
+            def __enter__(self): return self
+            def __exit__(self, *args): pass
+            def read(self): return json.dumps({"ok": True, "version": "population_context_v1"}).encode()
+        captured = {}
+        def fake_urlopen(req, timeout=0):
+            captured["url"] = req.full_url
+            captured["headers"] = dict(req.header_items())
+            return Resp()
+        env = {"BNL_POPULATION_CONTEXT_URL": "https://site.test/custom-context", "BNL_API_KEY": "secret-token"}
+        with mock.patch("bnl_population_recommender.urllib.request.urlopen", fake_urlopen):
+            ctx = fetch_bnl_population_context(env)
+        self.assertEqual(captured["url"], "https://site.test/custom-context")
+        self.assertEqual(captured["headers"].get("Authorization"), "Bearer secret-token")
+        self.assertTrue(ctx["ok"])
+
+    def test_fetch_population_context_derives_endpoint_from_base_url(self):
+        class Resp:
+            status = 200
+            def __enter__(self): return self
+            def __exit__(self, *args): pass
+            def read(self): return json.dumps({"ok": True, "version": "population_context_v1"}).encode()
+        captured = {}
+        def fake_urlopen(req, timeout=0):
+            captured["url"] = req.full_url
+            return Resp()
+        with mock.patch("bnl_population_recommender.urllib.request.urlopen", fake_urlopen):
+            fetch_bnl_population_context({"BNL_SITE_BASE_URL": "https://www.barcode-network.com", "BNL_TOKEN": "tok"})
+        self.assertEqual(captured["url"], "https://www.barcode-network.com/api/bnl/population-context")
+
+    def test_missing_population_context_config_does_not_fail_scan(self):
+        result = run_population_scan(memory_records=self.mid_records("Memory Only"), dry_run=True, diagnostics=True, environ={})
+        self.assertTrue(result["ok"])
+        self.assertFalse(result["diagnostics"]["population_context_loaded"])
+        self.assertEqual(result["diagnostics"]["fallback_used"], "memory_only")
+
+    def test_failed_population_context_fetch_does_not_fail_scan(self):
+        def boom(env):
+            raise RuntimeError("network down")
+        result = run_population_scan(memory_records=self.mid_records("Memory Only"), dry_run=True, diagnostics=True, population_context_fetcher=boom)
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["recommendations"][0]["recommendedLane"], "candidate_intake")
+
+    def test_invalid_population_context_shape_falls_back_to_read_model(self):
+        read_model = {"ok": True, "version": 1, "publicOnly": True, "sections": {"dossiers": {"items": [{"id": "pd-read", "name": "Fallback Subject"}]}}}
+        result = run_population_scan(memory_records=self.mid_records("Fallback Subject"), dry_run=True, diagnostics=True, population_context_fetcher=lambda env: {"ok": True, "version": "wrong"}, read_model_loader=lambda: read_model)
+        self.assertTrue(result["diagnostics"]["site_context_loaded"])
+        self.assertEqual(result["diagnostics"]["fallback_used"], "public_read_model")
+
+    def test_successful_population_context_populates_all_routing_inputs(self):
+        extracted = extract_population_context(self.population_context())
+        self.assertEqual(len(extracted["public_dossiers"]), 1)
+        self.assertEqual(extracted["source_files_count"], 2)
+        self.assertEqual(extracted["candidates_count"], 1)
+        self.assertEqual(len(extracted["existing_candidates"]), 3)
+        self.assertEqual(len(extracted["dossier_update_workspaces"]), 1)
+        self.assertIn("private-alias", extracted["confirmed_aliases"])
+        self.assertIn("already-done", extracted["resolved_records"])
+
+    def test_population_context_has_priority_over_public_read_model_context(self):
+        read_model = {"ok": True, "version": 1, "publicOnly": True, "sections": {"sourceContext": {"sourceFiles": [{"id": "sf-read", "name": "6 Bit", "subjectKey": "6-bit"}]}}}
+        result = run_population_scan(memory_records=self.mid_records("6 Bit"), dry_run=True, diagnostics=True, population_context_fetcher=lambda env: self.population_context(), read_model_loader=lambda: read_model)
+        self.assertEqual(result["diagnostics"]["fallback_used"], "population_context")
+        self.assertEqual(result["recommendations"][0]["matchedExistingCandidateId"], "sf-6")
+
+    def test_context_source_file_workspace_public_dossier_and_resolved_routing(self):
+        context = self.population_context()
+        sf = run_population_scan(memory_records=self.mid_records("Mac Modem"), dry_run=True, diagnostics=True, population_context_fetcher=lambda env: context)
+        self.assertEqual(sf["recommendations"][0]["recommendedAction"], "attach_to_existing_source_file")
+        ws = run_population_scan(memory_records=self.mid_records("6 Bit"), dry_run=True, diagnostics=True, population_context_fetcher=lambda env: context)
+        self.assertEqual(ws["recommendations"][0]["recommendedAction"], "attach_to_existing_dossier_update")
+        public_only = dict(context, sourceFiles=[], dossierUpdateWorkspaces=[])
+        pd = run_population_scan(memory_records=self.mid_records("6 Bit"), dry_run=True, diagnostics=True, population_context_fetcher=lambda env: public_only)
+        self.assertEqual(pd["recommendations"][0]["recommendedAction"], "create_dossier_update_workspace")
+        resolved = run_population_scan(memory_records=self.mid_records("Already Done"), dry_run=True, diagnostics=True, population_context_fetcher=lambda env: context)
+        self.assertEqual(resolved["recommendations"], [])
+        self.assertEqual(resolved["diagnostics"]["skipped_already_represented"], 1)
+
+    def test_confirmed_identity_link_routes_without_exposing_raw_alias(self):
+        result = run_population_scan(memory_records=self.mid_records("private alias"), dry_run=True, diagnostics=True, population_context_fetcher=lambda env: self.population_context())
+        rec = result["recommendations"][0]
+        self.assertEqual(rec["matchedExistingCandidateId"], "sf-mac")
+        self.assertNotIn("private alias", json.dumps(rec["adminSummary"]).lower())
+
+    def test_known_subject_fixtures_do_not_fall_to_low_confidence_when_context_matches(self):
+        for name in ("6 Bit", "Mac Modem", "Mind Fanatic"):
+            result = run_population_scan(memory_records=self.mid_records(name), dry_run=True, diagnostics=True, population_context_fetcher=lambda env: self.population_context())
+            self.assertNotEqual(result["recommendations"][0]["recommendedLane"], "needs_population_review")
+            self.assertIn(result["recommendations"][0]["confidence"], {"medium", "high"})
+
+    def test_broadcast_and_show_status_notes_are_skipped(self):
+        examples = [
+            "Everybody kept saying Boof during the show last night",
+            "We can resume normal broadcast schedule",
+            "Normal broadcast schedule restored",
+            "Show is back on",
+            "This is a running joke",
+            "This is an episode arc",
+        ]
+        for note in examples:
+            result = run_population_scan(memory_records=[{"subjectName": note, "memoryTier": "mid_term", "sourceLane": "broadcast_memory", "summary": note, "sourceEvidenceRef": "b:1", "rawEvidenceRef": "broadcast_memory:1"}], dry_run=True, diagnostics=True, population_context_fetcher=lambda env: self.population_context())
+            self.assertEqual(result["recommendations"], [])
+            self.assertEqual(result["diagnostics"]["skipped_not_population_subject"], 1)
+
+    def test_diagnostics_no_tokens_or_private_alias_text_and_dry_run_sends_nothing(self):
+        calls = []
+        result = run_population_scan(memory_records=self.mid_records("6 Bit"), dry_run=True, diagnostics=True, environ={"BNL_API_KEY": "secret-token"}, population_context_fetcher=lambda env: self.population_context(), sender=lambda payload, **kw: calls.append(payload) or {"ok": True})
+        response = format_population_scan_response(result)
+        self.assertIn("population_context_loaded", response)
+        self.assertIn("source_files=2", response)
+        self.assertNotIn("secret-token", response)
+        self.assertNotIn("private alias", response.lower())
+        self.assertEqual(calls, [])
 
 
 if __name__ == "__main__":
