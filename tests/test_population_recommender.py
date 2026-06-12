@@ -255,5 +255,95 @@ class PopulationRecommenderTests(unittest.TestCase):
         self.assertTrue(options["dry_run"])
 
 
+    def _quota_db(self):
+        db = self._temp_db()
+        conn = sqlite3.connect(db)
+        conn.execute("CREATE TABLE user_profiles (user_id INTEGER, guild_id INTEGER, display_name TEXT)")
+        conn.execute("INSERT INTO user_profiles VALUES (42,1,'Profile Crow')")
+        conn.execute("CREATE TABLE conversations (id INTEGER, guild_id INTEGER, channel_policy TEXT, user_id INTEGER, user_name TEXT, role TEXT, content TEXT, timestamp TEXT)")
+        for i in range(20):
+            conn.execute("INSERT INTO conversations VALUES (?,?,?,?,?,?,?,?)", (i + 1, 1, 'public_home', 42, 'Profile Crow', 'user', f'conversation {i}', '2026-06-01T00:00:00+00:00'))
+        conn.execute("CREATE TABLE entity_evidence_events (id INTEGER, guild_id INTEGER, channel_name TEXT, channel_policy TEXT, author TEXT, matched_user_id INTEGER, evidence_kind TEXT, dossier_relevance TEXT, confidence TEXT, community_signal TEXT, music_signal TEXT, relation_type TEXT, observed_at TEXT, created_at TEXT, public_safe_candidate INTEGER, raw_ref_json TEXT)")
+        for i in range(8):
+            conn.execute("INSERT INTO entity_evidence_events VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (100 + i, 1, 'signals', 'public_home', 'Fallback Author', 42, 'community', 'high', 'high', 'present', 'none', 'member', '2026-06-02', '2026-06-02', 1, json.dumps({'displayLabel': 'Raw Label'})))
+        conn.commit(); conn.close()
+        return db
+
+    def test_scan_uses_read_model_public_dossiers_when_available(self):
+        read_model = {"ok": True, "version": 1, "publicOnly": True, "sections": {"dossiers": {"items": [{"id": "pd-6", "name": "6 Bit", "slug": "6-bit"}]}}}
+        result = run_population_scan(memory_records=self.mid_records("6 Bit"), dry_run=True, diagnostics=True, read_model_loader=lambda: read_model)
+        self.assertTrue(result["diagnostics"]["site_context_loaded"])
+        self.assertEqual(result["diagnostics"]["public_dossiers"], 1)
+        rec = result["recommendations"][0]
+        self.assertEqual(rec["recommendedLane"], "public_dossier_update_signal")
+        self.assertEqual(rec["recommendedAction"], "create_dossier_update_workspace")
+        self.assertEqual(rec["matchedPublicDossierId"], "pd-6")
+
+    def test_site_context_unavailable_continues_memory_only(self):
+        result = run_population_scan(memory_records=self.mid_records("Memory Only"), dry_run=True, diagnostics=True, read_model_loader=lambda: {})
+        self.assertTrue(result["ok"])
+        self.assertFalse(result["diagnostics"]["site_context_loaded"])
+        self.assertEqual(result["recommendations"][0]["recommendedLane"], "candidate_intake")
+
+    def test_existing_source_file_candidate_from_read_model_attaches(self):
+        read_model = {"ok": True, "version": 1, "publicOnly": True, "sections": {"sourceContext": {"sourceFiles": [{"id": "sf-known", "name": "Known Subject", "subjectKey": "known-subject"}]}}}
+        result = run_population_scan(memory_records=self.mid_records("Known Subject"), dry_run=True, read_model_loader=lambda: read_model)
+        rec = result["recommendations"][0]
+        self.assertEqual(rec["recommendedAction"], "attach_to_existing_source_file")
+        self.assertEqual(rec["matchedExistingCandidateId"], "sf-known")
+
+    def test_repeated_evidence_without_target_creates_candidate(self):
+        rec = build_population_recommendation(self.mid_records("New Repeated"), public_dossiers=[], existing_candidates=[])
+        self.assertEqual(rec["recommendedLane"], "candidate_intake")
+        self.assertEqual(rec["recommendedAction"], "create_source_file_candidate")
+
+    def test_balanced_quotas_include_entity_events_when_conversations_are_many(self):
+        db = self._quota_db()
+        diagnostics = {}
+        records = collect_shared_memory_population_records(db, 1, max_items=10, diagnostics=diagnostics)
+        counts = {lane: sum(1 for r in records if r["sourceLane"] == lane) for lane in {r["sourceLane"] for r in records}}
+        self.assertLessEqual(counts.get("conversations", 0), 6)
+        self.assertGreater(counts.get("entity_evidence_events", 0), 0)
+        self.assertGreater(diagnostics["tables"]["conversations"]["skipped_due_to_quota"], 0)
+        self.assertGreater(diagnostics["tables"]["entity_evidence_events"]["attempted_collection"], 0)
+
+    def test_entity_evidence_uses_user_profile_display_name(self):
+        db = self._quota_db()
+        records = collect_shared_memory_population_records(db, 1, max_items=10)
+        entity = [r for r in records if r["sourceLane"] == "entity_evidence_events"][0]
+        self.assertEqual(entity["subjectName"], "Profile Crow")
+        self.assertEqual(entity["sourceEvidenceRef"], "entity_evidence_events:100")
+        self.assertEqual(entity["memoryTier"], "long_term")
+
+    def test_entity_evidence_skips_numeric_and_redacted_subjects(self):
+        db = self._temp_db()
+        conn = sqlite3.connect(db)
+        conn.execute("CREATE TABLE entity_evidence_events (id INTEGER, guild_id INTEGER, author TEXT, evidence_kind TEXT, confidence TEXT, created_at TEXT, raw_ref_json TEXT)")
+        conn.execute("INSERT INTO entity_evidence_events VALUES (1,1,'123456789012345678','community','high','2026-06-01',?)", (json.dumps({'displayLabel': '[redacted-id]'}),))
+        conn.execute("INSERT INTO entity_evidence_events VALUES (2,1,'[redacted-id]','community','high','2026-06-01',?)", (json.dumps({'displayLabel': '7890'}),))
+        conn.commit(); conn.close()
+        diagnostics = {}
+        records = collect_shared_memory_population_records(db, 1, max_items=10, diagnostics=diagnostics)
+        self.assertEqual(records, [])
+        self.assertEqual(diagnostics["tables"]["entity_evidence_events"]["skipped_due_to_missing_subject_name"], 2)
+
+    def test_redacted_id_not_emitted_as_recommendation_subject(self):
+        result = run_population_scan(memory_records=[{"subjectName": "[redacted-id]", "memoryTier": "mid_term", "sourceLane": "entity_evidence_events", "summary": "diagnostic fixture", "sourceEvidenceRef": "x", "rawEvidenceRef": "x"}], dry_run=True)
+        self.assertEqual(result["recommendations"], [])
+        self.assertEqual(result["counts"]["skipped"], 1)
+
+    def test_diagnostic_requires_strong_evidence_not_test_channel_alone(self):
+        rec = build_population_recommendation([{"subjectName": "Crow", "memoryTier": "short_term", "sourceLane": "conversations", "visibility": "sealed_test", "summary": "human-readable community note", "sourceEvidenceRef": "c:1", "rawEvidenceRef": "c:1"}])
+        self.assertNotEqual(rec["recommendedLane"], "diagnostic_artifact")
+        strong = build_population_recommendation([{"subjectName": "Fixture Subject", "memoryTier": "short_term", "sourceLane": "conversations", "visibility": "sealed_test", "summary": "diagnostic fixture marker", "sourceEvidenceRef": "c:2", "rawEvidenceRef": "c:2"}])
+        self.assertEqual(strong["recommendedLane"], "diagnostic_artifact")
+
+    def test_diagnostics_response_includes_context_and_skips(self):
+        result = run_population_scan(memory_records=self.mid_records("6 Bit"), dry_run=True, diagnostics=True, public_dossiers=[{"id": "pd-6", "name": "6 Bit"}])
+        response = format_population_scan_response(result)
+        self.assertIn("Context: site_context_loaded=False, public_dossiers=1", response)
+        self.assertIn("site_context_loaded", response)
+
+
 if __name__ == "__main__":
     unittest.main()

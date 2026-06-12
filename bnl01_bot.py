@@ -5087,6 +5087,7 @@ async def maybe_handle_population_scan_command(message: discord.Message, clean_c
         subject_filter=options.get("subject_filter"),
         diagnostics=bool(options.get("diagnostics", False)),
         allow_sealed_test=bool(options.get("allow_sealed_test", False) or options.get("diagnostics", False)),
+        read_model_loader=fetch_bnl_read_model,
         sender=send_dossier_recommendation,
         environ=os.environ,
     )

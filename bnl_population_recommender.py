@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import re
 import sqlite3
 from collections import Counter, defaultdict
@@ -93,6 +94,7 @@ APPROVED_SOURCE_LANES = {
     "site_refresh_request",
     "memory_tiers",
     "community_presence",
+    "entity_evidence_events",
 }
 PRIVATE_LANES = {"admin_private", "private_admin", "sealed_test", "diagnostic_test", "test_memory"}
 ADMIN_ONLY_POLICIES = {"admin_private", "private", "sealed_test", "internal_only", "admin_only", "protected_system"}
@@ -102,6 +104,20 @@ _RAW_BLOB_RE = re.compile(r"\b(?:relationship_journal|local_profile_observed|raw
 _UNKNOWN_CHAIN_RE = re.compile(r"\bunknown\s*(?:->|→)\s*unknown\b", re.I)
 _ALIAS_RE = re.compile(r"\b(?:alias(?:es)?|aka|known as|identity link)\s*[:=]\s*[^.;,|]+", re.I)
 _DIAGNOSTIC_RE = re.compile(r"\b(?:diagnostic|test junk|fixture|synthetic|sandbox|heartbeat|ping test|dummy subject|lorem ipsum)\b", re.I)
+_STRONG_DIAGNOSTIC_RE = re.compile(r"\b(?:diagnostic[_ -]?(?:test|artifact|fixture)|test[_ -]?(?:artifact|fixture)|fixture[_ -]?(?:subject|row|marker)|synthetic[_ -]?(?:fixture|artifact)|dummy subject|lorem ipsum)\b", re.I)
+_RAW_ID_ONLY_RE = re.compile(r"^(?:\[?redacted[-_ ]?id\]?|unknown|none|null|n/?a|\d+|rowid:?\d+|id:?\d+|https?://\S+|<@!?\d+>|<#\d+>)$", re.I)
+_SOURCE_QUOTAS = {
+    "conversations": 6,
+    "entity_evidence_events": 6,
+    "user_memory_facts": 4,
+    "relationship_journal": 3,
+    "relationship_state": 3,
+    "broadcast_memory": 2,
+    "community_presence": 3,
+    "memory_tiers": 2,
+}
+_SOURCE_FILE_TABLES = {"source_file_notes", "source_file_archive", "source_file_archives", "dossier_recommendations", "source_file_refresh_requests"}
+_SOURCE_FILE_COMBINED_QUOTA = 4
 
 
 def utc_now() -> str:
@@ -132,6 +148,46 @@ def _safe_text(value: Any, limit: int = 240) -> str:
     text = _ALIAS_RE.sub("alias/identity signal kept internal", text)
     return text[:limit].strip(" -|;,.")
 
+
+def _is_insufficient_subject_identity(value: Any) -> bool:
+    """Return True for raw IDs/redacted placeholders that must not become subjects."""
+
+    text = _safe_text(value, 160)
+    if not text:
+        return True
+    low = text.strip().lower()
+    if _RAW_ID_ONLY_RE.match(low):
+        return True
+    if low in {"[redacted-id]", "[redacted-mention]", "[redacted-url]", "redacted id", "redacted-id"}:
+        return True
+    if re.fullmatch(r"[a-f0-9]{16,64}", low):
+        return True
+    return False
+
+
+def _safe_subject_name(value: Any) -> str:
+    text = _safe_text(value, 140)
+    return "" if _is_insufficient_subject_identity(text) else text
+
+
+def _json_mapping(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    if not value:
+        return {}
+    try:
+        parsed = json.loads(str(value))
+        return parsed if isinstance(parsed, dict) else {}
+    except Exception:
+        return {}
+
+
+def _first_mapping_value(mapping: dict[str, Any], keys: list[str]) -> Any:
+    for key in keys:
+        value = mapping.get(key)
+        if value not in (None, "", [], {}):
+            return value
+    return None
 
 def _list(value: Any, *, limit: int = 12, item_limit: int = 180) -> list[str]:
     if value is None:
@@ -199,11 +255,14 @@ def _stable_id(subject_key: str, input_hash: str) -> str:
 
 
 def _extract_name(record: dict[str, Any]) -> str:
-    return _safe_text(record.get("subjectName") or record.get("subject") or record.get("name") or record.get("displayName") or "Unknown subject", 140) or "Unknown subject"
+    return _safe_subject_name(record.get("subjectName") or record.get("subject") or record.get("name") or record.get("displayName"))
 
 
 def _record_subject_key(record: dict[str, Any]) -> str:
-    return normalize_subject_key(record.get("normalizedSubjectKey") or record.get("subjectKey") or _extract_name(record))
+    subject = _extract_name(record)
+    if not subject:
+        return "insufficient-subject-identity"
+    return normalize_subject_key(record.get("normalizedSubjectKey") or record.get("subjectKey") or subject)
 
 
 def _record_lane(record: dict[str, Any]) -> str:
@@ -226,8 +285,18 @@ def _is_diagnostic(record: dict[str, Any]) -> bool:
     if record.get("diagnostic") or record.get("testArtifact"):
         return True
     lane = _record_lane(record)
-    text = " ".join(str(record.get(k) or "") for k in ("subjectName", "summary", "content", "reason", "evidenceSummary", "sourceLane"))
-    return lane in {"diagnostic_test", "sealed_test", "test_memory"} or bool(_DIAGNOSTIC_RE.search(text))
+    policy = str(record.get("channelPolicy") or record.get("channel_policy") or record.get("visibility") or "").strip().lower()
+    evidence_kind = str(record.get("evidenceKind") or record.get("evidence_kind") or "").strip().lower()
+    text = " ".join(str(record.get(k) or "") for k in ("summary", "content", "reason", "evidenceSummary", "sourceLane"))
+    if lane in {"diagnostic_test", "test_memory"}:
+        return True
+    if evidence_kind in {"diagnostic", "diagnostic_test", "test", "test_fixture", "fixture"}:
+        return True
+    if policy == "sealed_test" and _STRONG_DIAGNOSTIC_RE.search(text):
+        return True
+    if _STRONG_DIAGNOSTIC_RE.search(text):
+        return True
+    return False
 
 
 def _public_dossier_id(record: dict[str, Any]) -> str:
@@ -305,6 +374,8 @@ def build_population_recommendation(
         return None
     generated = generated_at or utc_now()
     subject_name = _extract_name(usable[0])
+    if _is_insufficient_subject_identity(subject_name):
+        return None
     subject_key = _record_subject_key(usable[0])
     lanes = sorted({_record_lane(r) for r in usable}) or ["unknown"]
     tiers = [_record_tier(r) for r in usable]
@@ -638,6 +709,130 @@ def _build_user_name_map(conn: sqlite3.Connection, tables: set[str], guild_id: i
     return names
 
 
+def _as_list(value: Any) -> list[Any]:
+    if isinstance(value, list):
+        return value
+    if isinstance(value, dict):
+        for key in ("items", "dossiers", "publicDossiers", "candidates", "sourceFiles", "workspaces", "aliases"):
+            if isinstance(value.get(key), list):
+                return value.get(key) or []
+    return []
+
+
+def _read_model_sections(read_model: dict[str, Any]) -> dict[str, Any]:
+    sections = read_model.get("sections") if isinstance(read_model, dict) else {}
+    return sections if isinstance(sections, dict) else {}
+
+
+def _compact_site_item(item: Any, *, kind: str) -> dict[str, Any] | None:
+    if not isinstance(item, dict):
+        return None
+    name = _safe_subject_name(_first_mapping_value(item, ["name", "subjectName", "title", "displayName", "candidateName"]))
+    slug = _safe_text(item.get("slug"), 120)
+    subject_key = _safe_text(item.get("subjectKey") or item.get("normalizedSubjectKey") or (normalize_subject_key(name) if name else slug), 140)
+    compact = {
+        "id": _safe_text(_first_mapping_value(item, ["id", "publicDossierId", "dossierId", "candidateId", "sourceFileCandidateId"]), 140),
+        "name": name,
+        "subjectName": name,
+        "subjectKey": subject_key,
+        "slug": slug,
+        "kind": kind,
+    }
+    return {k: v for k, v in compact.items() if v not in (None, "", [], {})}
+
+
+def extract_population_site_context(read_model: dict[str, Any] | None) -> dict[str, Any]:
+    """Extract compact public-safe site context from the existing read model shape."""
+
+    if not isinstance(read_model, dict) or not read_model:
+        return {"site_context_loaded": False, "public_dossiers": [], "existing_candidates": [], "dossier_update_workspaces": [], "confirmed_aliases": {}}
+    sections = _read_model_sections(read_model)
+    public_dossiers: list[dict[str, Any]] = []
+    existing_candidates: list[dict[str, Any]] = []
+    workspaces: list[dict[str, Any]] = []
+
+    dossier_sources = [read_model.get("publicDossiers"), read_model.get("dossiers"), sections.get("dossiers"), sections.get("publicDossiers"), sections.get("artists")]
+    for source in dossier_sources:
+        for item in _as_list(source):
+            compact = _compact_site_item(item, kind="public_dossier")
+            if compact and (compact.get("name") or compact.get("slug")):
+                public_dossiers.append(compact)
+
+    source_context = sections.get("sourceContext") if isinstance(sections.get("sourceContext"), dict) else read_model.get("sourceContext")
+    candidate_sources = [read_model.get("existingCandidates"), read_model.get("candidates"), read_model.get("sourceFiles"), sections.get("candidates"), sections.get("sourceFiles")]
+    if isinstance(source_context, dict):
+        candidate_sources.extend([source_context.get("existingCandidates"), source_context.get("candidates"), source_context.get("sourceFiles")])
+    for source in candidate_sources:
+        for item in _as_list(source):
+            compact = _compact_site_item(item, kind="source_file_candidate")
+            if compact and (compact.get("id") or compact.get("name")):
+                existing_candidates.append(compact)
+
+    workspace_sources = [read_model.get("dossierUpdateWorkspaces"), sections.get("dossierUpdateWorkspaces")]
+    if isinstance(source_context, dict):
+        workspace_sources.append(source_context.get("dossierUpdateWorkspaces"))
+    for source in workspace_sources:
+        for item in _as_list(source):
+            compact = _compact_site_item(item, kind="dossier_update_workspace")
+            if compact:
+                public_id = _safe_text(_first_mapping_value(item, ["publicDossierId", "targetDossierId", "dossierId"]), 140)
+                if public_id:
+                    compact["publicDossierId"] = public_id
+                workspaces.append(compact)
+
+    # Only consume alias maps explicitly exposed by the public-safe read model. Internal alias labels are not copied.
+    confirmed_aliases: dict[str, Any] = {}
+    aliases = read_model.get("confirmedAliases") or sections.get("confirmedAliases")
+    if isinstance(aliases, dict):
+        for alias_key, target in aliases.items():
+            safe_key = normalize_subject_key(alias_key)
+            if isinstance(target, dict):
+                confirmed_aliases[safe_key] = {k: _safe_text(v, 140) for k, v in target.items() if k in {"candidateId", "sourceFileCandidateId", "id", "canonicalName", "subjectName"}}
+            else:
+                confirmed_aliases[safe_key] = _safe_text(target, 140)
+
+    def dedupe(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        seen: set[tuple[str, str, str]] = set()
+        out: list[dict[str, Any]] = []
+        for item in items:
+            key = (str(item.get("kind") or ""), str(item.get("id") or ""), str(item.get("subjectKey") or item.get("name") or item.get("slug") or ""))
+            if key in seen:
+                continue
+            seen.add(key); out.append(item)
+        return out
+
+    return {
+        "site_context_loaded": True,
+        "public_dossiers": dedupe(public_dossiers),
+        "existing_candidates": dedupe(existing_candidates),
+        "dossier_update_workspaces": dedupe(workspaces),
+        "confirmed_aliases": confirmed_aliases,
+    }
+
+
+def load_population_site_context(read_model_loader: Callable[..., dict[str, Any]] | None = None) -> dict[str, Any]:
+    if not read_model_loader:
+        logging.info("population_site_context_unavailable reason=no_read_model_loader")
+        return extract_population_site_context(None)
+    try:
+        read_model = read_model_loader()
+    except TypeError:
+        read_model = read_model_loader(False)
+    except Exception as exc:
+        logging.warning("population_site_context_unavailable reason=%s", _safe_error_message(exc))
+        return extract_population_site_context(None)
+    if not read_model:
+        logging.info("population_site_context_unavailable reason=empty_read_model")
+        return extract_population_site_context(None)
+    context = extract_population_site_context(read_model)
+    logging.info(
+        "population_site_context_loaded public_dossiers=%s candidates=%s source_files=%s",
+        len(context.get("public_dossiers") or []),
+        len(context.get("existing_candidates") or []),
+        len(context.get("existing_candidates") or []),
+    )
+    return context
+
 def collect_shared_memory_population_records(
     db_path: str,
     guild_id: int | None,
@@ -659,6 +854,11 @@ def collect_shared_memory_population_records(
     subject_filter_key = normalize_subject_key(subject_filter) if subject_filter else ""
     records: list[dict[str, Any]] = []
     table_counts: Counter[str] = Counter()
+    attempted_counts: Counter[str] = Counter()
+    quota_skips: Counter[str] = Counter()
+    policy_skips: Counter[str] = Counter()
+    schema_skips: Counter[str] = Counter()
+    missing_subject_skips: Counter[str] = Counter()
     filter_decisions: Counter[str] = Counter()
     safe_policies = {"public_home", "public_context", "broadcast_memory", "rd_context"}
     if allow_sealed_test or "sealed_test" in lane_filter:
@@ -684,19 +884,47 @@ def collect_shared_memory_population_records(
                 info["records_collected"] = collected
             if skipped_reason:
                 info["skipped_reason"] = skipped_reason
+                info["skipped_due_to_schema"] = info.get("skipped_due_to_schema", 0) + 1
 
     def skip_table(table: str, reason: str) -> None:
         logging.warning("population_scan_table_skipped table=%s reason=%s", table, reason)
+        schema_skips[table] += 1
         if diag is not None:
-            diag.setdefault("tables", {}).setdefault(table, {})["skipped_reason"] = reason
+            info = diag.setdefault("tables", {}).setdefault(table, {})
+            info["skipped_reason"] = reason
+            info["skipped_due_to_schema"] = info.get("skipped_due_to_schema", 0) + 1
+
+    def quota_for(table: str) -> int:
+        if table in _SOURCE_FILE_TABLES:
+            return _SOURCE_FILE_COMBINED_QUOTA
+        return _SOURCE_QUOTAS.get(table, max_items)
+
+    def source_file_collected() -> int:
+        return sum(table_counts[t] for t in _SOURCE_FILE_TABLES)
 
     def add(table: str, record: dict[str, Any]) -> None:
+        attempted_counts[table] += 1
         if len(records) >= max_items:
             filter_decisions["max_items_reached"] += 1
+            quota_skips[table] += 1
+            return
+        if table in _SOURCE_FILE_TABLES:
+            if source_file_collected() >= quota_for(table):
+                filter_decisions[f"quota_filtered:{table}"] += 1
+                quota_skips[table] += 1
+                return
+        elif table_counts[table] >= quota_for(table):
+            filter_decisions[f"quota_filtered:{table}"] += 1
+            quota_skips[table] += 1
             return
         lane = _record_lane(record)
         if lane_filter and lane not in lane_filter:
             filter_decisions[f"lane_filtered:{lane}"] += 1
+            policy_skips[table] += 1
+            return
+        if _is_insufficient_subject_identity(record.get("subjectName") or record.get("subject") or record.get("name") or record.get("displayName")):
+            filter_decisions[f"missing_subject_identity:{table}"] += 1
+            missing_subject_skips[table] += 1
             return
         if subject_filter_key and subject_filter_key not in _record_subject_key(record):
             filter_decisions["subject_filtered"] += 1
@@ -728,9 +956,9 @@ def collect_shared_memory_population_records(
         where = "WHERE " + " AND ".join(where_parts) if where_parts else ""
         order_col = _first_existing(cols, order_candidates or ["updated_at", "timestamp", "created_at", "id"])
         order = f"ORDER BY {_quote_ident(order_col)} DESC" if order_col else "ORDER BY rowid DESC"
-        return conn.execute(f"SELECT rowid,* FROM {_quote_ident(table)} {where} {order} LIMIT ?", (*params, max_items)).fetchall()
+        limit = max(max_items, quota_for(table) * 3)
+        return conn.execute(f"SELECT rowid,* FROM {_quote_ident(table)} {where} {order} LIMIT ?", (*params, limit)).fetchall()
 
-    import os
     if diag is not None:
         diag["db_path_exists"] = bool(db_path and os.path.exists(db_path))
         diag["source_lanes"] = sorted(lane_filter)
@@ -759,6 +987,7 @@ def collect_shared_memory_population_records(
                     policy = str(_row_get(row, "channel_policy", "unknown") or "unknown")
                     if policy in excluded_policies or policy not in safe_policies:
                         filter_decisions[f"policy_filtered:{policy}"] += 1
+                        policy_skips[table] += 1
                         continue
                     role = str(_row_get(row, "role", "") or "").lower()
                     subject = user_name(_row_get(row, "user_id"), _row_get(row, "user_name") if role == "user" else None)
@@ -820,6 +1049,7 @@ def collect_shared_memory_population_records(
                     visibility = _safe_text(_row_get(row, "usage_scope", None), 80) or "review_only"
                     if status in {"blocked", "rejected", "private"} or public_safe in (0, "0", False):
                         filter_decisions["broadcast_memory_safety_filtered"] += 1
+                        policy_skips[table] += 1
                         continue
                     add(table, {"subjectName": _row_get(row, text_col), "memoryTier": "dormant_archive", "sourceLane": table, "summary": _row_get(row, text_col), "sourceEvidenceRef": f"broadcast_memory:{_row_get(row, 'id', _row_get(row, 'rowid'))}", "rawEvidenceRef": f"broadcast_memory:{_row_get(row, 'id', _row_get(row, 'rowid'))}", "visibility": visibility})
             logging.info("population_scan_table_collected table=%s count=%s", table, table_counts[table])
@@ -852,7 +1082,66 @@ def collect_shared_memory_population_records(
                     add(table, {"subjectName": _row_get(row, subject_col), "memoryTier": "short_term", "sourceLane": table, "summary": summary or "community presence signal", "sourceEvidenceRef": f"community_presence:{_row_get(row, 'id', _row_get(row, 'rowid'))}", "rawEvidenceRef": f"community_presence:{_row_get(row, 'id', _row_get(row, 'rowid'))}", "visibility": "review_only"})
             logging.info("population_scan_table_collected table=%s count=%s", table, table_counts[table])
 
-        optional_tables = ["entity_evidence_events", "source_file_notes", "source_file_archive", "source_file_archives", "dossier_recommendations", "source_file_refresh_requests"]
+        # entity_evidence_events: schema-tolerant evidence lane with safe subject resolution.
+        table = "entity_evidence_events"
+        cols = table_cols(conn, table, tables)
+        if cols is not None:
+            id_col = _first_existing(cols, ["id"])
+            author_col = _first_existing(cols, ["author", "author_name", "display_name"])
+            matched_user_col = _first_existing(cols, ["matched_user_id", "user_id"])
+            kind_col = _first_existing(cols, ["evidence_kind", "kind", "event_type"])
+            relevance_col = _first_existing(cols, ["dossier_relevance", "relevance"])
+            confidence_col = _first_existing(cols, ["confidence", "confidence_score"])
+            public_safe_col = _first_existing(cols, ["public_safe_candidate", "public_safe"])
+            raw_ref_col = _first_existing(cols, ["raw_ref_json", "rawRefJson", "raw_ref"])
+            channel_policy_col = _first_existing(cols, ["channel_policy", "source_channel_policy", "policy"])
+            channel_name_col = _first_existing(cols, ["channel_name", "source_channel_name"])
+            summary_cols = [c for c in [kind_col, relevance_col, _first_existing(cols, ["community_signal"]), _first_existing(cols, ["music_signal"]), _first_existing(cols, ["relation_type"])] if c]
+            for row in select_rows(conn, table, cols, ["observed_at", "created_at", "id"]):
+                raw_ref = _json_mapping(_row_get(row, raw_ref_col)) if raw_ref_col else {}
+                subject = ""
+                if matched_user_col and _row_get(row, matched_user_col) is not None:
+                    subject = user_names.get(str(_row_get(row, matched_user_col)), "")
+                if not subject and author_col:
+                    subject = _safe_subject_name(_row_get(row, author_col))
+                if not subject and raw_ref:
+                    subject = _safe_subject_name(_first_mapping_value(raw_ref, ["displayLabel", "display_name", "safeDisplayLabel", "safe_label", "subjectName", "name", "authorName"]))
+                if not subject:
+                    attempted_counts[table] += 1
+                    missing_subject_skips[table] += 1
+                    filter_decisions[f"missing_subject_identity:{table}"] += 1
+                    continue
+                row_id = _row_get(row, id_col) if id_col else _row_get(row, "rowid")
+                policy = _safe_text(_row_get(row, channel_policy_col), 80) if channel_policy_col else "review_only"
+                evidence_kind = _safe_text(_row_get(row, kind_col), 80) if kind_col else "evidence"
+                confidence_value = _safe_text(_row_get(row, confidence_col), 40) if confidence_col else "medium"
+                relevance = _safe_text(_row_get(row, relevance_col), 80) if relevance_col else ""
+                parts = [f"evidence_kind={evidence_kind}" if evidence_kind else "entity evidence signal"]
+                for c in summary_cols:
+                    value = _safe_text(_row_get(row, c), 80)
+                    if value and value not in parts:
+                        parts.append(f"{c}={value}")
+                if channel_name_col and _row_get(row, channel_name_col):
+                    parts.append(f"channel={_safe_text(_row_get(row, channel_name_col), 80)}")
+                public_safe = _row_get(row, public_safe_col) if public_safe_col else None
+                memory_tier = "long_term" if str(confidence_value).lower() == "high" or str(relevance).lower() in {"high", "strong"} else "mid_term"
+                safety_level = "public_candidate" if public_safe in (1, "1", True, "true", "yes") and policy not in ADMIN_ONLY_POLICIES else "admin_review_only"
+                add(table, {
+                    "subjectName": subject,
+                    "memoryTier": memory_tier,
+                    "sourceLane": table,
+                    "summary": "; ".join(parts),
+                    "sourceEvidenceRef": f"entity_evidence_events:{row_id}",
+                    "rawEvidenceRef": f"entity_evidence_events:{row_id}",
+                    "visibility": policy or "review_only",
+                    "channelPolicy": policy,
+                    "evidenceKind": evidence_kind,
+                    "confidence": confidence_value,
+                    "publicSafetyLevel": safety_level,
+                })
+            logging.info("population_scan_table_collected table=%s count=%s", table, table_counts[table])
+
+        optional_tables = ["source_file_notes", "source_file_archive", "source_file_archives", "dossier_recommendations", "source_file_refresh_requests"]
         for table in optional_tables:
             cols = table_cols(conn, table, tables)
             if cols is None:
@@ -871,8 +1160,15 @@ def collect_shared_memory_population_records(
         conn.close()
 
     if diag is not None:
-        for table, count in table_counts.items():
-            diag.setdefault("tables", {}).setdefault(table, {})["records_collected"] = count
+        all_diag_tables = set(diag.setdefault("tables", {}).keys()) | set(attempted_counts) | set(table_counts) | set(quota_skips) | set(policy_skips) | set(schema_skips) | set(missing_subject_skips)
+        for table in all_diag_tables:
+            info = diag.setdefault("tables", {}).setdefault(table, {})
+            info["attempted_collection"] = attempted_counts[table]
+            info["records_collected"] = table_counts[table]
+            info["skipped_due_to_quota"] = quota_skips[table]
+            info["skipped_due_to_policy"] = policy_skips[table]
+            info["skipped_due_to_schema"] = max(info.get("skipped_due_to_schema", 0), schema_skips[table])
+            info["skipped_due_to_missing_subject_name"] = missing_subject_skips[table]
         diag["filter_decisions"] = dict(filter_decisions)
         diag["final_collected_count"] = len(records[:max_items])
     return records[:max_items]
@@ -892,6 +1188,7 @@ def run_population_scan(
     public_dossiers: list[dict[str, Any]] | None = None,
     dossier_update_workspaces: list[dict[str, Any]] | None = None,
     confirmed_aliases: dict[str, Any] | None = None,
+    read_model_loader: Callable[..., dict[str, Any]] | None = None,
     sender: Callable[..., dict[str, Any]] | None = None,
     environ: dict[str, str] | None = None,
     diagnostics: bool = False,
@@ -902,6 +1199,22 @@ def run_population_scan(
     counts = {"scanned": 0, "generated": 0, "sent_to_site": 0, "dry_run": 0, "skipped": 0, "blocked": 0, "errors": 0}
     logging.info("population_scan_started dry_run=%s max_items=%s min_confidence=%s", dry_run, max_items, min_confidence)
     diagnostic_info: dict[str, Any] = {} if diagnostics else {}
+    site_context = load_population_site_context(read_model_loader) if read_model_loader else extract_population_site_context(None)
+    if site_context.get("site_context_loaded"):
+        public_dossiers = list(public_dossiers or []) + list(site_context.get("public_dossiers") or [])
+        existing_candidates = list(existing_candidates or []) + list(site_context.get("existing_candidates") or [])
+        dossier_update_workspaces = list(dossier_update_workspaces or []) + list(site_context.get("dossier_update_workspaces") or [])
+        merged_aliases = dict(site_context.get("confirmed_aliases") or {})
+        merged_aliases.update(confirmed_aliases or {})
+        confirmed_aliases = merged_aliases
+    else:
+        logging.info("population_site_context_unavailable")
+    diagnostic_info.update({
+        "site_context_loaded": bool(site_context.get("site_context_loaded")),
+        "public_dossiers": len(public_dossiers or []),
+        "existing_candidates": len(existing_candidates or []),
+        "source_files": len(existing_candidates or []),
+    })
     try:
         records = list(memory_records) if memory_records is not None else collect_shared_memory_population_records(
             db_path or "",
@@ -1027,11 +1340,12 @@ def parse_population_scan_command(content: str) -> tuple[bool, dict[str, Any] | 
 def _format_population_scan_diagnostics(diagnostics: dict[str, Any]) -> list[str]:
     lines = ["Diagnostics (metadata only):"]
     lines.append(f"- db_path exists: {bool((diagnostics or {}).get('db_path_exists'))}")
+    lines.append(f"- site_context_loaded: {bool((diagnostics or {}).get('site_context_loaded'))} public_dossiers={(diagnostics or {}).get('public_dossiers', 0)} candidates={(diagnostics or {}).get('existing_candidates', 0)} source_files={(diagnostics or {}).get('source_files', 0)}")
     tables = (diagnostics or {}).get("tables") or {}
     for table in sorted(tables):
         info = tables.get(table) or {}
         cols = ",".join(info.get("columns") or []) or "none"
-        lines.append(f"- {table}: exists={int(bool(info.get('exists')))} rows={info.get('row_count', 0)} collected={info.get('records_collected', 0)} columns={cols}")
+        lines.append(f"- {table}: exists={int(bool(info.get('exists')))} rows={info.get('row_count', 0)} attempted={info.get('attempted_collection', 0)} collected={info.get('records_collected', 0)} quota_skipped={info.get('skipped_due_to_quota', 0)} policy_skipped={info.get('skipped_due_to_policy', 0)} schema_skipped={info.get('skipped_due_to_schema', 0)} missing_subject={info.get('skipped_due_to_missing_subject_name', 0)} columns={cols}")
         if info.get("skipped_reason"):
             lines.append(f"  skipped={_safe_text(info.get('skipped_reason'), 120)}")
     decisions = (diagnostics or {}).get("filter_decisions") or {}
@@ -1056,6 +1370,14 @@ def format_population_scan_response(summary: dict[str, Any]) -> str:
         if summary.get("warning") == "no eligible memory records found" or counts.get("scanned", 0) == 0:
             lines.append("No eligible memory records found for the selected filters.")
         lines.append(count_line)
+        diag = summary.get("diagnostics") or {}
+        if diag:
+            lines.append(f"Context: site_context_loaded={bool(diag.get('site_context_loaded'))}, public_dossiers={diag.get('public_dossiers', 0)}")
+            decisions = diag.get("filter_decisions") or {}
+            missing = sum(v for k, v in decisions.items() if str(k).startswith("missing_subject_identity"))
+            policy = sum(v for k, v in decisions.items() if "policy_filtered" in str(k) or "safety_filtered" in str(k))
+            if missing or policy:
+                lines.append(f"Skipped: missing_subject_identity={missing}, source_policy={policy}")
         for rec in (summary.get("recommendations") or [])[:8]:
             lines.append(f"- {rec.get('subjectName')} → {rec.get('recommendedLane')} / {rec.get('recommendedAction')} ({rec.get('confidence')})")
         if summary.get("dryRun", True):
