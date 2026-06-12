@@ -92,6 +92,11 @@ from bnl_source_file_enrichment import (
     run_source_file_enrichment,
     source_enrichment_ingest_source,
 )
+from bnl_population_recommender import (
+    format_population_scan_response,
+    parse_population_scan_command,
+    run_population_scan,
+)
 from bnl_source_file_refresh import (
     DEFAULT_MAX_AUTOMATIC_PER_CYCLE,
     DEFAULT_MAX_SITE_REQUESTS_PER_CYCLE,
@@ -5045,6 +5050,46 @@ def _format_rd_entity_context_response(subject: str, context: dict) -> str:
     return "\n".join(lines)[:1900]
 
 
+
+
+async def maybe_handle_population_scan_command(message: discord.Message, clean_content: str) -> bool:
+    """Handle owner/operator BNL shared-memory population scan commands."""
+
+    matched, options, parse_error = parse_population_scan_command(clean_content)
+    if not matched:
+        return False
+
+    member = message.author if isinstance(message.author, discord.Member) else message.guild.get_member(message.author.id)
+    if not can_send_dossier_recommendation(message.author, member, message.guild):
+        logging.warning("population_scan_denied reason=permission")
+        await message.reply("Population scan controls are operator-only.")
+        return True
+
+    channel = getattr(message, "channel", None)
+    policy = resolve_channel_policy(channel)
+    channel_name = getattr(channel, "name", "") or ""
+    if is_public_prompt_context(policy) and not is_operator_authority_context(policy, channel_name):
+        await message.reply("Population scan controls are restricted to approved internal/operator channels.")
+        return True
+
+    if not options:
+        await message.reply(f"Population scan failed: {parse_error}")
+        return True
+
+    summary = await asyncio.to_thread(
+        run_population_scan,
+        DB_FILE,
+        guild_id=getattr(message.guild, "id", None),
+        dry_run=bool(options.get("dry_run", True)),
+        max_items=int(options.get("max_items") or 25),
+        source_lanes=options.get("source_lanes"),
+        min_confidence=str(options.get("min_confidence") or "low"),
+        subject_filter=options.get("subject_filter"),
+        sender=send_dossier_recommendation,
+        environ=os.environ,
+    )
+    await reply_with_discord_safe_chunks(message, format_population_scan_response(summary))
+    return True
 
 async def maybe_handle_source_file_refresh_command(message: discord.Message, clean_content: str) -> bool:
     """Handle operator Source File refresh queue/process commands."""
@@ -15486,6 +15531,9 @@ async def on_message(message: discord.Message):
         return
 
     if await maybe_handle_backfill_command(message, clean_content):
+        return
+
+    if await maybe_handle_population_scan_command(message, clean_content):
         return
 
     if await maybe_handle_source_file_refresh_command(message, clean_content):
