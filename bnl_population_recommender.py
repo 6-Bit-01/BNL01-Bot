@@ -14,12 +14,15 @@ import logging
 import os
 import re
 import sqlite3
+import urllib.error
+import urllib.parse
+import urllib.request
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
 from typing import Any, Callable
 
 from bnl_admin_summaries import build_admin_summary, build_dossier_update_summary
-from bnl_dossier_recommendations import build_dossier_recommendation_payload, send_dossier_recommendation
+from bnl_dossier_recommendations import build_dossier_recommendation_payload, normalize_trusted_site_callback_base_url, send_dossier_recommendation
 
 GENERATED_BY = "BNL"
 POPULATION_RECOMMENDATION_VERSION = "population_recommendation_v1"
@@ -118,6 +121,8 @@ _SOURCE_QUOTAS = {
 }
 _SOURCE_FILE_TABLES = {"source_file_notes", "source_file_archive", "source_file_archives", "dossier_recommendations", "source_file_refresh_requests"}
 _SOURCE_FILE_COMBINED_QUOTA = 4
+POPULATION_CONTEXT_PATH = "/api/bnl/population-context"
+POPULATION_CONTEXT_TIMEOUT_SECONDS = 8
 
 
 def utc_now() -> str:
@@ -421,6 +426,15 @@ def build_population_recommendation(
             possible_targets.extend({"targetType": "public_dossier", "id": _safe_text(t.get("id") or t.get("publicDossierId"), 120), "name": _safe_text(t.get("name") or t.get("subjectName") or t.get("title"), 120), "matchReason": "conflicting_exact_subject_key"} for t in dossier_by_key[subject_key])
     if not matched_workspace and workspace_by_key.get(subject_key):
         matched_workspace = workspace_by_key[subject_key][0]
+    if matched_workspace and not matched_dossier:
+        workspace_dossier_id = _safe_text(matched_workspace.get("publicDossierId") or matched_workspace.get("targetDossierId") or matched_workspace.get("dossierId"), 120)
+        matched_dossier = dossier_by_id.get(workspace_dossier_id) if workspace_dossier_id else None
+        if not matched_dossier:
+            matched_dossier = {"id": workspace_dossier_id, "name": _safe_text(matched_workspace.get("name") or matched_workspace.get("subjectName") or subject_name, 120)} if workspace_dossier_id else {"name": _safe_text(matched_workspace.get("name") or matched_workspace.get("subjectName") or subject_name, 120)}
+    if matched_workspace and not matched_candidate:
+        workspace_candidate_id = _safe_text(matched_workspace.get("candidateId") or matched_workspace.get("sourceFileCandidateId") or matched_workspace.get("targetCandidateId"), 120)
+        if workspace_candidate_id:
+            matched_candidate = candidate_by_id.get(workspace_candidate_id) or {"id": workspace_candidate_id, "name": _safe_text(matched_workspace.get("name") or matched_workspace.get("subjectName") or subject_name, 120)}
 
     alias = _alias_target(subject_key, confirmed_aliases or {})
     if alias and not matched_candidate:
@@ -468,21 +482,28 @@ def build_population_recommendation(
         confidence_reason = "Evidence was marked as duplicate or no-new-info."
         duplicate_risk = "high"
         next_step = "Mark as duplicate/no-new-info unless an admin identifies new evidence."
+    elif matched_workspace:
+        recommended_lane = "existing_dossier_update"
+        recommended_action = "attach_to_existing_dossier_update"
+        confidence = "high"
+        confidence_reason = "Exact Dossier Update workspace ID/name/subject key matched an existing workspace."
+        duplicate_risk = "low"
+        next_step = "Attach evidence to the existing Dossier Update workspace; keep public copy unchanged until reviewed."
+    elif matched_candidate:
+        recommended_lane = "active_source_file"
+        recommended_action = "attach_to_existing_source_file"
+        confidence = "high"
+        confidence_reason = "Exact Source File candidate ID/subject key or confirmed identity link matched an existing Source File."
+        duplicate_risk = "low"
+        identity_risk = "medium" if alias else "low"
+        next_step = "Attach evidence to the existing Source File; do not create a duplicate candidate."
     elif matched_dossier:
-        recommended_lane = "existing_dossier_update" if matched_workspace else "public_dossier_update_signal"
-        recommended_action = "attach_to_existing_dossier_update" if matched_workspace else "create_dossier_update_workspace"
+        recommended_lane = "public_dossier_update_signal"
+        recommended_action = "create_dossier_update_workspace"
         confidence = "high"
         confidence_reason = "Exact public dossier ID/name/subject key matched an existing public dossier."
         duplicate_risk = "low"
         next_step = "Route as a Dossier Update workspace signal; keep public copy unchanged until reviewed."
-    elif matched_candidate:
-        recommended_lane = "identity_review" if alias else "active_source_file"
-        recommended_action = "suggest_identity_link" if alias else "attach_to_existing_source_file"
-        confidence = "high"
-        confidence_reason = "Exact Source File candidate ID/subject key or confirmed alias matched an existing Source File."
-        duplicate_risk = "low"
-        identity_risk = "medium" if alias else "low"
-        next_step = "Attach evidence to the existing Source File; do not create a duplicate candidate."
     elif public_update_signal:
         recommended_lane = "public_dossier_update_signal"
         recommended_action = "create_dossier_update_workspace"
@@ -524,9 +545,10 @@ def build_population_recommendation(
     matched_candidate_name = _safe_text((matched_candidate or {}).get("name") or (matched_candidate or {}).get("subjectName") or (matched_candidate or {}).get("title"), 140)
     matched_dossier_id = _safe_text((matched_dossier or {}).get("id") or (matched_dossier or {}).get("publicDossierId") or (matched_dossier or {}).get("dossierId"), 120)
     matched_dossier_name = _safe_text((matched_dossier or {}).get("name") or (matched_dossier or {}).get("subjectName") or (matched_dossier or {}).get("title"), 140)
+    public_subject_name = matched_candidate_name if alias and matched_candidate_name else subject_name
 
     summary_record = {
-        "subjectName": subject_name,
+        "subjectName": public_subject_name,
         "subjectKey": subject_key,
         "confidence": "low" if confidence == "blocked" else confidence,
         "sourceLanes": lanes,
@@ -556,7 +578,7 @@ def build_population_recommendation(
         "recommendationId": _stable_id(subject_key, input_hash),
         "generatedAt": generated,
         "generatedBy": GENERATED_BY,
-        "subjectName": subject_name,
+        "subjectName": public_subject_name,
         "normalizedSubjectKey": subject_key,
         "candidateType": _safe_text(usable[0].get("candidateType") or "shared_memory_subject", 80),
         "recommendedLane": recommended_lane,
@@ -832,6 +854,208 @@ def load_population_site_context(read_model_loader: Callable[..., dict[str, Any]
         len(context.get("existing_candidates") or []),
     )
     return context
+
+
+def _dedupe_context_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    seen: set[tuple[str, str, str]] = set()
+    out: list[dict[str, Any]] = []
+    for item in items or []:
+        if not isinstance(item, dict):
+            continue
+        key = (str(item.get("kind") or ""), str(item.get("id") or item.get("candidateId") or item.get("publicDossierId") or ""), str(item.get("subjectKey") or item.get("name") or item.get("slug") or ""))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(item)
+    return out
+
+
+def _population_context_url(environ: dict[str, str] | None = None) -> str:
+    env = environ if environ is not None else os.environ
+    configured = (env.get("BNL_POPULATION_CONTEXT_URL") or "").strip()
+    if configured:
+        return configured
+    base = normalize_trusted_site_callback_base_url(env.get("BNL_WEBSITE_BASE_URL") or env.get("BNL_SITE_BASE_URL"), environ=env)
+    if base:
+        return urllib.parse.urljoin(base.rstrip("/") + "/", POPULATION_CONTEXT_PATH.lstrip("/"))
+    read_model_url = (env.get("BNL_READ_MODEL_URL") or "").strip()
+    if read_model_url:
+        parsed = urllib.parse.urlparse(read_model_url)
+        if parsed.scheme in {"https", "http"} and parsed.netloc:
+            return urllib.parse.urlunparse((parsed.scheme, parsed.netloc, POPULATION_CONTEXT_PATH, "", "", ""))
+    return ""
+
+
+def _population_context_token(environ: dict[str, str] | None = None) -> str:
+    env = environ if environ is not None else os.environ
+    for key in ("BNL_API_KEY", "BNL_TOKEN", "BNL_SOURCE_FILE_READ_TOKEN", "BNL_DOSSIER_INGEST_TOKEN", "BNL_SOURCE_FILE_ARCHIVE_TOKEN"):
+        token = (env.get(key) or "").strip()
+        if token:
+            return token
+    return ""
+
+
+def is_population_context_url_configured(environ: dict[str, str] | None = None) -> bool:
+    return bool(_population_context_url(environ))
+
+
+def is_population_context_auth_configured(environ: dict[str, str] | None = None) -> bool:
+    return bool(_population_context_token(environ))
+
+
+def extract_population_context(context: dict[str, Any] | None) -> dict[str, Any]:
+    """Extract admin-only routing context from authenticated population-context v1."""
+
+    if not isinstance(context, dict) or context.get("ok") is not True or context.get("version") != "population_context_v1":
+        return {
+            "population_context_loaded": False,
+            "public_dossiers": [],
+            "existing_candidates": [],
+            "dossier_update_workspaces": [],
+            "confirmed_aliases": {},
+            "resolved_records": {},
+            "source_files_count": 0,
+            "candidates_count": 0,
+            "identity_links_count": 0,
+            "resolved_records_count": 0,
+        }
+
+    public_dossiers: list[dict[str, Any]] = []
+    existing_candidates: list[dict[str, Any]] = []
+    workspaces: list[dict[str, Any]] = []
+    confirmed_aliases: dict[str, Any] = {}
+    resolved_records: dict[str, dict[str, Any]] = {}
+
+    for item in _as_list(context.get("publicDossiers")):
+        compact = _compact_site_item(item, kind="public_dossier")
+        if compact:
+            public_dossiers.append(compact)
+
+    source_files = _as_list(context.get("sourceFiles"))
+    for item in source_files:
+        compact = _compact_site_item(item, kind="source_file")
+        if compact:
+            existing_candidates.append(compact)
+
+    candidates = _as_list(context.get("candidates") or context.get("candidateIntakeRecords"))
+    for item in candidates:
+        compact = _compact_site_item(item, kind="candidate_intake")
+        if compact:
+            existing_candidates.append(compact)
+
+    for item in _as_list(context.get("dossierUpdateWorkspaces")):
+        compact = _compact_site_item(item, kind="dossier_update_workspace")
+        if compact:
+            public_id = _safe_text(_first_mapping_value(item, ["publicDossierId", "targetDossierId", "dossierId"]), 140)
+            candidate_id = _safe_text(_first_mapping_value(item, ["candidateId", "sourceFileCandidateId", "targetCandidateId"]), 140)
+            if public_id:
+                compact["publicDossierId"] = public_id
+            if candidate_id:
+                compact["candidateId"] = candidate_id
+            workspaces.append(compact)
+
+    for link in _as_list(context.get("identityLinks")):
+        if not isinstance(link, dict):
+            continue
+        status = str(link.get("status") or link.get("state") or "confirmed").strip().lower()
+        if status not in {"confirmed", "active", "resolved", "approved"}:
+            continue
+        aliases = []
+        for key in ("alias", "aliasName", "sourceName", "fromName", "subjectName"):
+            if link.get(key):
+                aliases.append(link.get(key))
+        aliases.extend(_as_list(link.get("aliases")))
+        target = {
+            "candidateId": _safe_text(_first_mapping_value(link, ["candidateId", "sourceFileCandidateId", "targetCandidateId", "sourceFileId", "targetSourceFileId", "id"]), 140),
+            "sourceFileCandidateId": _safe_text(_first_mapping_value(link, ["sourceFileCandidateId", "sourceFileId", "targetSourceFileId"]), 140),
+            "canonicalName": _safe_text(_first_mapping_value(link, ["canonicalName", "targetName", "subjectName", "displayName"]), 140),
+            "subjectName": _safe_text(_first_mapping_value(link, ["canonicalName", "targetName", "displayName"]), 140),
+        }
+        target = {k: v for k, v in target.items() if v}
+        for alias in aliases:
+            alias_key = normalize_subject_key(alias)
+            if alias_key and alias_key != "unknown-subject":
+                confirmed_aliases[alias_key] = dict(target)
+
+    for item in _as_list(context.get("resolvedRecords")):
+        if not isinstance(item, dict):
+            continue
+        subject_key = normalize_subject_key(_first_mapping_value(item, ["subjectKey", "normalizedSubjectKey", "name", "subjectName", "alias", "sourceName"]))
+        if subject_key and subject_key != "unknown-subject":
+            resolved_records[subject_key] = {
+                "id": _safe_text(_first_mapping_value(item, ["id", "recordId", "sourceId"]), 140),
+                "targetCandidateId": _safe_text(_first_mapping_value(item, ["targetCandidateId", "candidateId", "sourceFileCandidateId"]), 140),
+                "targetDossierId": _safe_text(_first_mapping_value(item, ["targetDossierId", "publicDossierId", "dossierId"]), 140),
+                "status": _safe_text(item.get("status") or "resolved", 80),
+            }
+
+    return {
+        "population_context_loaded": True,
+        "public_dossiers": _dedupe_context_items(public_dossiers),
+        "existing_candidates": _dedupe_context_items(existing_candidates),
+        "dossier_update_workspaces": _dedupe_context_items(workspaces),
+        "confirmed_aliases": confirmed_aliases,
+        "resolved_records": resolved_records,
+        "source_files_count": len(source_files),
+        "candidates_count": len(candidates),
+        "identity_links_count": len(_as_list(context.get("identityLinks"))),
+        "resolved_records_count": len(_as_list(context.get("resolvedRecords"))),
+    }
+
+
+def fetch_bnl_population_context(environ: dict[str, str] | None = None) -> dict[str, Any]:
+    """Fetch authenticated site population-context as transient routing input only."""
+
+    env = environ if environ is not None else os.environ
+    url = _population_context_url(env)
+    token = _population_context_token(env)
+    if not url or not token:
+        logging.info("population_context_fetch_skipped reason=missing_config url_configured=%s auth_configured=%s", bool(url), bool(token))
+        return {}
+    logging.info("population_context_fetch_started url_configured=%s auth_configured=%s", bool(url), bool(token))
+    request = urllib.request.Request(
+        url,
+        method="GET",
+        headers={
+            "Accept": "application/json",
+            "Authorization": f"Bearer {token}",
+            "x-api-key": token,
+            "X-BNL-API-Key": token,
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=POPULATION_CONTEXT_TIMEOUT_SECONDS) as response:
+            status = getattr(response, "status", None) or response.getcode()
+            raw = response.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as exc:
+        logging.warning("population_context_fetch_failed status=%s", getattr(exc, "code", "unknown"))
+        return {}
+    except Exception as exc:
+        logging.warning("population_context_fetch_failed error=%s", _safe_error_message(exc))
+        return {}
+    if not (200 <= int(status or 0) < 300):
+        logging.warning("population_context_fetch_failed status=%s", status)
+        return {}
+    try:
+        data = json.loads(raw) if raw else {}
+    except Exception as exc:
+        logging.warning("population_context_invalid_shape error=%s", _safe_error_message(exc))
+        return {}
+    extracted = extract_population_context(data if isinstance(data, dict) else {})
+    if not extracted.get("population_context_loaded"):
+        logging.warning("population_context_invalid_shape")
+        return {}
+    logging.info(
+        "population_context_fetch_success public_dossiers=%s source_files=%s candidates=%s dossier_update_workspaces=%s identity_links=%s resolved_records=%s",
+        len(extracted.get("public_dossiers") or []),
+        extracted.get("source_files_count", 0),
+        extracted.get("candidates_count", 0),
+        len(extracted.get("dossier_update_workspaces") or []),
+        extracted.get("identity_links_count", 0),
+        extracted.get("resolved_records_count", 0),
+    )
+    return data
+
 
 def collect_shared_memory_population_records(
     db_path: str,
@@ -1174,6 +1398,27 @@ def collect_shared_memory_population_records(
     return records[:max_items]
 
 
+
+_NOT_POPULATION_SUBJECT_RE = re.compile(
+    r"\b(?:everybody kept saying|normal broadcast schedule|broadcast schedule|show is back on|resume normal broadcast|running joke|episode arc)\b",
+    re.I,
+)
+_SHOW_STATE_RE = re.compile(r"\b(?:show is back on|normal broadcast schedule restored|resume normal broadcast schedule|broadcast schedule)\b", re.I)
+
+
+def classify_non_population_subject(records: list[dict[str, Any]]) -> str:
+    """Classify broadcast/show-status notes that must not enter dossier population."""
+
+    text = " ".join(str(r.get(k) or "") for r in records or [] for k in ("subjectName", "summary", "content", "reason", "evidenceSummary"))
+    if not text.strip():
+        return ""
+    if _SHOW_STATE_RE.search(text):
+        return "show_state_note"
+    if _NOT_POPULATION_SUBJECT_RE.search(text):
+        return "broadcast_memory_note"
+    return ""
+
+
 def run_population_scan(
     db_path: str | None = None,
     *,
@@ -1189,6 +1434,7 @@ def run_population_scan(
     dossier_update_workspaces: list[dict[str, Any]] | None = None,
     confirmed_aliases: dict[str, Any] | None = None,
     read_model_loader: Callable[..., dict[str, Any]] | None = None,
+    population_context_fetcher: Callable[..., dict[str, Any]] | None = None,
     sender: Callable[..., dict[str, Any]] | None = None,
     environ: dict[str, str] | None = None,
     diagnostics: bool = False,
@@ -1199,21 +1445,62 @@ def run_population_scan(
     counts = {"scanned": 0, "generated": 0, "sent_to_site": 0, "dry_run": 0, "skipped": 0, "blocked": 0, "errors": 0}
     logging.info("population_scan_started dry_run=%s max_items=%s min_confidence=%s", dry_run, max_items, min_confidence)
     diagnostic_info: dict[str, Any] = {} if diagnostics else {}
-    site_context = load_population_site_context(read_model_loader) if read_model_loader else extract_population_site_context(None)
-    if site_context.get("site_context_loaded"):
-        public_dossiers = list(public_dossiers or []) + list(site_context.get("public_dossiers") or [])
-        existing_candidates = list(existing_candidates or []) + list(site_context.get("existing_candidates") or [])
-        dossier_update_workspaces = list(dossier_update_workspaces or []) + list(site_context.get("dossier_update_workspaces") or [])
-        merged_aliases = dict(site_context.get("confirmed_aliases") or {})
+    env_for_context = environ if environ is not None else os.environ
+    diagnostic_info.update({
+        "population_context_url_configured": is_population_context_url_configured(env_for_context),
+        "population_context_auth_configured": is_population_context_auth_configured(env_for_context),
+    })
+    fetcher = population_context_fetcher or fetch_bnl_population_context
+    raw_population_context: dict[str, Any] = {}
+    try:
+        raw_population_context = fetcher(env_for_context)
+    except TypeError:
+        raw_population_context = fetcher()
+    except Exception as exc:
+        logging.warning("population_context_fetch_failed error=%s", _safe_error_message(exc))
+        raw_population_context = {}
+    population_context = extract_population_context(raw_population_context)
+    if raw_population_context and not population_context.get("population_context_loaded"):
+        logging.warning("population_context_invalid_shape")
+    site_context = extract_population_site_context(None)
+    fallback_used = "memory_only"
+    resolved_records: dict[str, dict[str, Any]] = {}
+    if population_context.get("population_context_loaded"):
+        public_dossiers = list(public_dossiers or []) + list(population_context.get("public_dossiers") or [])
+        existing_candidates = list(existing_candidates or []) + list(population_context.get("existing_candidates") or [])
+        dossier_update_workspaces = list(dossier_update_workspaces or []) + list(population_context.get("dossier_update_workspaces") or [])
+        merged_aliases = dict(population_context.get("confirmed_aliases") or {})
         merged_aliases.update(confirmed_aliases or {})
         confirmed_aliases = merged_aliases
+        resolved_records = dict(population_context.get("resolved_records") or {})
+        fallback_used = "population_context"
+        logging.info("population_context_applied public_dossiers=%s source_files=%s candidates=%s dossier_update_workspaces=%s identity_links=%s resolved_records=%s", len(population_context.get("public_dossiers") or []), population_context.get("source_files_count", 0), population_context.get("candidates_count", 0), len(population_context.get("dossier_update_workspaces") or []), population_context.get("identity_links_count", 0), population_context.get("resolved_records_count", 0))
     else:
-        logging.info("population_site_context_unavailable")
+        site_context = load_population_site_context(read_model_loader) if read_model_loader else extract_population_site_context(None)
+        if site_context.get("site_context_loaded"):
+            public_dossiers = list(public_dossiers or []) + list(site_context.get("public_dossiers") or [])
+            existing_candidates = list(existing_candidates or []) + list(site_context.get("existing_candidates") or [])
+            dossier_update_workspaces = list(dossier_update_workspaces or []) + list(site_context.get("dossier_update_workspaces") or [])
+            merged_aliases = dict(site_context.get("confirmed_aliases") or {})
+            merged_aliases.update(confirmed_aliases or {})
+            confirmed_aliases = merged_aliases
+            fallback_used = "public_read_model"
+        else:
+            logging.info("population_site_context_unavailable")
     diagnostic_info.update({
+        "population_context_loaded": bool(population_context.get("population_context_loaded")),
         "site_context_loaded": bool(site_context.get("site_context_loaded")),
         "public_dossiers": len(public_dossiers or []),
         "existing_candidates": len(existing_candidates or []),
-        "source_files": len(existing_candidates or []),
+        "source_files": int(population_context.get("source_files_count") or len(existing_candidates or [])),
+        "candidates": int(population_context.get("candidates_count") or 0),
+        "dossier_update_workspaces": len(dossier_update_workspaces or []),
+        "identity_links": int(population_context.get("identity_links_count") or len(confirmed_aliases or {})),
+        "resolved_records": int(population_context.get("resolved_records_count") or len(resolved_records or {})),
+        "fallback_used": fallback_used,
+        "recommendations_using_population_context": 0,
+        "skipped_not_population_subject": 0,
+        "skipped_already_represented": 0,
     })
     try:
         records = list(memory_records) if memory_records is not None else collect_shared_memory_population_records(
@@ -1256,11 +1543,26 @@ def run_population_scan(
     send_func = sender or send_dossier_recommendation
     for group in grouped:
         try:
+            non_subject_reason = classify_non_population_subject(group)
+            if non_subject_reason:
+                counts["skipped"] += 1
+                diagnostic_info["skipped_not_population_subject"] = diagnostic_info.get("skipped_not_population_subject", 0) + 1
+                logging.info("population_recommendation_skipped reason=not_population_subject classification=%s", non_subject_reason)
+                continue
+            group_subject_key = _record_subject_key(group[0]) if group else ""
+            if group_subject_key in resolved_records:
+                counts["skipped"] += 1
+                diagnostic_info["skipped_already_represented"] = diagnostic_info.get("skipped_already_represented", 0) + 1
+                logging.info("population_recommendation_skipped subject_key=%s reason=already_represented", group_subject_key)
+                continue
             rec = build_population_recommendation(group, existing_candidates=existing_candidates, public_dossiers=public_dossiers, dossier_update_workspaces=dossier_update_workspaces, confirmed_aliases=confirmed_aliases)
             if not rec:
                 counts["skipped"] += 1
                 logging.info("population_recommendation_skipped reason=no_recommendation")
                 continue
+            if population_context.get("population_context_loaded") and rec.get("recommendedAction") in {"attach_to_existing_source_file", "attach_to_existing_dossier_update", "create_dossier_update_workspace"} and (rec.get("matchedExistingCandidateId") or rec.get("matchedPublicDossierId")):
+                diagnostic_info["recommendations_using_population_context"] = diagnostic_info.get("recommendations_using_population_context", 0) + 1
+                logging.info("population_context_match_found subject_key=%s lane=%s action=%s", rec.get("normalizedSubjectKey"), rec.get("recommendedLane"), rec.get("recommendedAction"))
             if not _passes_min_confidence(str(rec.get("confidence") or "low"), _confidence_allowed(min_confidence)):
                 counts["skipped"] += 1
                 logging.info("population_recommendation_skipped subject_key=%s reason=min_confidence", rec.get("normalizedSubjectKey"))
@@ -1340,6 +1642,9 @@ def parse_population_scan_command(content: str) -> tuple[bool, dict[str, Any] | 
 def _format_population_scan_diagnostics(diagnostics: dict[str, Any]) -> list[str]:
     lines = ["Diagnostics (metadata only):"]
     lines.append(f"- db_path exists: {bool((diagnostics or {}).get('db_path_exists'))}")
+    lines.append(f"- population_context_loaded: {bool((diagnostics or {}).get('population_context_loaded'))} url_configured={bool((diagnostics or {}).get('population_context_url_configured'))} auth_configured={bool((diagnostics or {}).get('population_context_auth_configured'))} fallback_used={(diagnostics or {}).get('fallback_used', 'memory_only')}")
+    lines.append(f"- context_counts: public_dossiers={(diagnostics or {}).get('public_dossiers', 0)} source_files={(diagnostics or {}).get('source_files', 0)} candidates={(diagnostics or {}).get('candidates', (diagnostics or {}).get('existing_candidates', 0))} dossier_update_workspaces={(diagnostics or {}).get('dossier_update_workspaces', 0)} identity_links={(diagnostics or {}).get('identity_links', 0)} resolved_records={(diagnostics or {}).get('resolved_records', 0)}")
+    lines.append(f"- recommendation_context_usage: recommendations_using_population_context={(diagnostics or {}).get('recommendations_using_population_context', 0)} skipped_not_population_subject={(diagnostics or {}).get('skipped_not_population_subject', 0)} skipped_already_represented={(diagnostics or {}).get('skipped_already_represented', 0)}")
     lines.append(f"- site_context_loaded: {bool((diagnostics or {}).get('site_context_loaded'))} public_dossiers={(diagnostics or {}).get('public_dossiers', 0)} candidates={(diagnostics or {}).get('existing_candidates', 0)} source_files={(diagnostics or {}).get('source_files', 0)}")
     tables = (diagnostics or {}).get("tables") or {}
     for table in sorted(tables):
@@ -1372,7 +1677,7 @@ def format_population_scan_response(summary: dict[str, Any]) -> str:
         lines.append(count_line)
         diag = summary.get("diagnostics") or {}
         if diag:
-            lines.append(f"Context: site_context_loaded={bool(diag.get('site_context_loaded'))}, public_dossiers={diag.get('public_dossiers', 0)}")
+            lines.append(f"Context: population_context_loaded={bool(diag.get('population_context_loaded'))}, fallback_used={diag.get('fallback_used', 'memory_only')}, public_dossiers={diag.get('public_dossiers', 0)}")
             decisions = diag.get("filter_decisions") or {}
             missing = sum(v for k, v in decisions.items() if str(k).startswith("missing_subject_identity"))
             policy = sum(v for k, v in decisions.items() if "policy_filtered" in str(k) or "safety_filtered" in str(k))
