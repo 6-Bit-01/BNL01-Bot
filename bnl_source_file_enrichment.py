@@ -17,6 +17,7 @@ from collections import Counter, defaultdict
 from datetime import datetime, timezone
 from typing import Any, Callable
 
+from bnl_admin_summaries import build_admin_summary, build_dossier_update_summary
 from bnl_dossier_recommendations import build_dossier_recommendation_payload, is_source_file_archive_token_configured, send_dossier_recommendation, send_source_file_archive_enrichment
 from bnl_entity_activity_summary import build_entity_activity_summary, refresh_entity_evidence_for_subject
 from bnl_entity_evidence import _website_safe_payload_text
@@ -2138,6 +2139,8 @@ def sanitize_compact_recommendation_payload(payload: dict[str, Any], *, packet: 
     compact = dict(payload or {})
     compact.pop("subjectMemoryPacketV1", None)
     compact.pop("sourceFileCaseReportV1", None)
+    compact.pop("adminSummary", None)
+    compact.pop("updateSummary", None)
     packet = packet or {}
     existing_summary = str(compact.get("evidenceSummary") or "")
     pointer_summary = build_compact_source_file_recommendation_summary(packet, compact, archive_id=archive_id)
@@ -2233,6 +2236,8 @@ def compact_enrichment_payload_for_site(payload: dict[str, Any]) -> dict[str, An
     compact = dict(payload or {})
     compact.pop("subjectMemoryPacketV1", None)
     compact.pop("sourceFileCaseReportV1", None)
+    compact.pop("adminSummary", None)
+    compact.pop("updateSummary", None)
     compact["evidenceSummary"] = _site_safe_text(compact.get("evidenceSummary"), SITE_EVIDENCE_SUMMARY_TARGET)
     for key in SITE_BOUND_LIST_FIELDS:
         if key in compact:
@@ -4771,6 +4776,7 @@ def build_source_file_archive_payload(packet: dict[str, Any], *, environ: dict[s
     }
     subject_memory_packet = build_subject_memory_packet_v1(packet)
     case_report = build_source_file_case_report_v1(subject_memory_packet)
+    admin_summary = build_admin_summary({**packet, "subjectName": subject, "subjectKey": subject_key, "sourceLanes": ["source_file_enrichment"] + list(packet.get("sourceTypes") or [])})
     envelope = {
         "candidateId": _sanitize_archive_value(candidate_id) if candidate_id else None,
         "subjectName": subject,
@@ -4785,6 +4791,8 @@ def build_source_file_archive_payload(packet: dict[str, Any], *, environ: dict[s
         "sourceFileBriefV2": _sanitize_archive_value(build_source_file_brief_v2(packet, archive_id=packet.get("archiveId") or "")),
         "subjectMemoryPacketV1": subject_memory_packet,
         "sourceFileCaseReportV1": case_report,
+        "adminSummary": admin_summary,
+        "updateSummary": build_dossier_update_summary({**packet, "subjectName": subject, "subjectKey": subject_key, "sourceLanes": ["source_file_enrichment"] + list(packet.get("sourceTypes") or [])}) if str(packet.get("matchKind") or "") in {"active_source_file", "existing_dossier_update", "candidate_intake"} else None,
         "sourcePackage": _source_package_from_packet(packet),
     }
     return envelope
@@ -4846,6 +4854,8 @@ def build_enrichment_recommendation_payload(packet: dict[str, Any], *, environ: 
         "queueSubmissionStatus": packet.get("queueSubmissionStatus") or "not_connected",
         "queueSubmissionNote": packet.get("queueSubmissionNote") or QUEUE_NOT_CONNECTED_NOTE,
         "entityIntelligenceProfile": dict(packet.get("entityIntelligenceProfile") or {}),
+        "adminSummary": build_admin_summary(packet),
+        "updateSummary": build_dossier_update_summary(packet) if match_kind in {"active_source_file", "existing_dossier_update", "candidate_intake"} else None,
         "linkSignalDiagnostics": dict(packet.get("linkSignalDiagnostics") or {}),
         "rawProvenance": dict(packet.get("rawProvenance") or {}),
         "visibilityLabels": ["internal_review_only", "admin_review_required"],
