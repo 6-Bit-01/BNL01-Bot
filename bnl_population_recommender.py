@@ -615,30 +615,158 @@ def build_population_recommendation_payload(recommendation: dict[str, Any]) -> d
     """Wrap a populationRecommendation for the existing dossier ingest pathway."""
 
     rec = dict(recommendation or {})
-    return build_dossier_recommendation_payload(
-        {
-            "type": "population_recommendation",
-            "subjectName": rec.get("subjectName"),
-            "subjectKey": rec.get("normalizedSubjectKey"),
-            "targetCandidateId": rec.get("matchedExistingCandidateId"),
-            "targetDossierId": rec.get("matchedPublicDossierId"),
-            "reason": rec.get("confidenceReason"),
-            "evidenceSummary": rec.get("recommendedNextStep"),
-            "confidence": "low" if rec.get("confidence") == "blocked" else rec.get("confidence"),
-            "sourceLanes": rec.get("sourceLanes"),
-            "suggestedAction": rec.get("recommendedAction"),
-            "recommendedAction": rec.get("recommendedAction"),
-            "missingInfo": rec.get("missingInfo"),
-            "publicSafetyNotes": rec.get("doNotPublishReason"),
-            "doNotSay": ["Do not publish pages or edit public dossier text from this recommendation.", "Do not expose internal aliases publicly."],
-            "createdBy": "bnl_population_recommender",
-            "ingestSource": "bnl_population_recommender",
-            "rawProvenance": {"populationRecommendationId": rec.get("recommendationId"), "rawEvidenceRefs": rec.get("rawEvidenceRefs")},
-            "adminSummary": rec.get("adminSummary"),
-            "populationRecommendation": rec,
-        }
-    )
+    raw_refs = _raw_ref_list(rec.get("rawEvidenceRefs"), limit=24)
+    source_lane_values = rec.get("sourceLanes") if isinstance(rec.get("sourceLanes"), (list, tuple, set)) else [rec.get("sourceLanes")]
+    source_lanes = [_lane(lane) for lane in source_lane_values if _lane(lane)] or ["unknown"]
+    do_not_publish = _payload_text(rec.get("doNotPublishReason"), fallback="Review-only population recommendation; do not publish without admin approval.", limit=600)
+    do_not_say = _list(rec.get("doNotSay"), limit=12, item_limit=220) or [
+        "Do not publish pages or edit public dossier text from this recommendation.",
+        "Do not expose internal aliases publicly.",
+    ]
+    for required in (
+        "Do not publish pages or edit public dossier text from this recommendation.",
+        "Do not expose internal aliases publicly.",
+    ):
+        if required.lower() not in {item.lower() for item in do_not_say}:
+            do_not_say.append(required)
+    payload = {
+        "type": "population_recommendation",
+        "subjectName": _payload_text(rec.get("subjectName"), limit=180),
+        "subjectKey": normalize_subject_key(rec.get("normalizedSubjectKey") or rec.get("subjectKey") or rec.get("subjectName")),
+        "targetCandidateId": _payload_text(rec.get("matchedExistingCandidateId"), limit=160),
+        "targetDossierId": _payload_text(rec.get("matchedPublicDossierId"), limit=160),
+        "reason": _payload_text(rec.get("confidenceReason"), fallback="Population recommendation requires admin review.", limit=600),
+        "evidenceSummary": _payload_text(rec.get("recommendedNextStep"), fallback="Open the Population Review Queue for routing.", limit=900),
+        "confidence": _payload_text("low" if rec.get("confidence") == "blocked" else rec.get("confidence"), fallback="low", limit=40),
+        "sourceLanes": source_lanes,
+        "suggestedAction": _payload_text(rec.get("recommendedAction"), fallback="admin_review_required", limit=120),
+        "recommendedAction": _payload_text(rec.get("recommendedAction"), fallback="admin_review_required", limit=120),
+        "missingInfo": _list(rec.get("missingInfo"), limit=12, item_limit=220),
+        "publicSafetyNotes": _list(rec.get("publicSafetyNotes"), limit=12, item_limit=220) or _list(do_not_publish, limit=12, item_limit=220),
+        "doNotSay": do_not_say,
+        "createdBy": "bnl_population_recommender",
+        "ingestSource": "bnl_population_recommender",
+        "rawProvenance": {"populationRecommendationId": _payload_text(rec.get("recommendationId"), limit=160), "rawEvidenceRefs": raw_refs},
+        "adminSummary": flatten_admin_summary_for_ingest(rec.get("adminSummary")),
+        "recommendedNextStep": _payload_text(rec.get("recommendedNextStep"), fallback="Open the Population Review Queue for routing.", limit=900),
+        "doNotPublishReason": do_not_publish,
+        "rawEvidenceRefs": raw_refs,
+        "populationRecommendation": _compact_population_recommendation_for_ingest(rec),
+    }
+    return build_dossier_recommendation_payload(payload)
 
+
+
+_ADMIN_SUMMARY_FALLBACK = "BNL generated a population review summary. Open the Population Review Queue for routing."
+_ADMIN_SUMMARY_SAFE_KEYS = (
+    "summary",
+    "title",
+    "subject",
+    "subjectName",
+    "recommendedNextStep",
+    "recommendedAction",
+    "keyFindings",
+    "actionItems",
+    "confidenceReason",
+    "publicSafetyNotes",
+    "missingInfo",
+    "generatedAt",
+)
+_ADMIN_SUMMARY_BLOCKED_KEYS = {
+    "rawEvidenceRefs",
+    "rawEvidenceRef",
+    "rawProvenance",
+    "relationship_journal",
+    "relationshipJournal",
+    "aliases",
+    "alias",
+    "internalAlias",
+    "privateAliases",
+    "confirmedAliases",
+    "adminSummary",
+}
+
+
+def _compact_join(parts: list[str], limit: int) -> str:
+    out = " ".join(part.strip() for part in parts if part and part.strip())
+    out = re.sub(r"\s+", " ", out).strip(" -|;,.{}[]")
+    if not out:
+        return ""
+    return out[:limit].rstrip(" -|;,.{}[]")
+
+
+def flatten_admin_summary_for_ingest(value: Any, limit: int = 1200) -> str:
+    """Return compact safe admin-summary text for the site ingest text field."""
+
+    def flatten(value: Any, depth: int = 0) -> list[str]:
+        if depth > 3 or value in (None, "", [], {}):
+            return []
+        if isinstance(value, str):
+            text = _safe_text(value, min(limit, 600))
+            return [text] if text else []
+        if isinstance(value, (int, float, bool)):
+            text = _safe_text(value, min(limit, 120))
+            return [text] if text else []
+        if isinstance(value, dict):
+            parts: list[str] = []
+            for key in _ADMIN_SUMMARY_SAFE_KEYS:
+                if key in _ADMIN_SUMMARY_BLOCKED_KEYS or key not in value:
+                    continue
+                item = value.get(key)
+                if item in (None, "", [], {}):
+                    continue
+                nested = flatten(item, depth + 1)
+                if not nested:
+                    continue
+                label = re.sub(r"(?<!^)([A-Z])", r" \1", key).replace("_", " ").strip().title()
+                parts.append(f"{label}: {_compact_join(nested, min(limit, 600))}")
+            return parts
+        if isinstance(value, (list, tuple, set)):
+            parts: list[str] = []
+            for item in value:
+                if isinstance(item, dict):
+                    # Only recurse into safe summary-like objects; blocked/raw keys are ignored above.
+                    parts.extend(flatten(item, depth + 1))
+                elif isinstance(item, (list, tuple, set)):
+                    parts.extend(flatten(item, depth + 1))
+                else:
+                    text = _safe_text(item, min(limit, 300))
+                    if text:
+                        parts.append(text)
+                if len(_compact_join(parts, limit)) >= limit:
+                    break
+            return parts
+        text = _safe_text(value, min(limit, 300))
+        return [text] if text else []
+
+    if isinstance(value, str):
+        text = _safe_text(value, limit)
+        return text or _ADMIN_SUMMARY_FALLBACK
+    text = _compact_join(flatten(value), limit)
+    if not text or "{" in text or "}" in text:
+        return _ADMIN_SUMMARY_FALLBACK[:limit]
+    return text[:limit] or _ADMIN_SUMMARY_FALLBACK[:limit]
+
+
+def _payload_text(value: Any, *, fallback: str = "", limit: int = 600) -> str:
+    text = _safe_text(value, limit)
+    return text or fallback
+
+
+def _compact_population_recommendation_for_ingest(rec: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "recommendationId": _payload_text(rec.get("recommendationId"), limit=160),
+        "subjectName": _payload_text(rec.get("subjectName"), limit=180),
+        "normalizedSubjectKey": normalize_subject_key(rec.get("normalizedSubjectKey") or rec.get("subjectKey") or rec.get("subjectName")),
+        "recommendedLane": _lane(rec.get("recommendedLane")),
+        "recommendedAction": _payload_text(rec.get("recommendedAction"), limit=120),
+        "confidence": _payload_text("low" if rec.get("confidence") == "blocked" else rec.get("confidence"), fallback="low", limit=40),
+        "duplicateRisk": _payload_text(rec.get("duplicateRisk"), fallback="low", limit=40),
+        "identityRisk": _payload_text(rec.get("identityRisk"), fallback="low", limit=40),
+        "publicSafetyLevel": _payload_text(rec.get("publicSafetyLevel"), fallback="review_only", limit=80),
+        "inputHash": _payload_text(rec.get("inputHash"), limit=80),
+        "rawEvidenceRefCount": len(_raw_ref_list(rec.get("rawEvidenceRefs"), limit=200)),
+    }
 
 def _passes_min_confidence(confidence: str, minimum: str) -> bool:
     if confidence == "blocked":
@@ -1573,27 +1701,55 @@ def run_population_scan(
             if rec.get("confidence") == "blocked":
                 counts["blocked"] += 1
                 logging.warning("population_recommendation_blocked subject_key=%s reason=%s", rec.get("normalizedSubjectKey"), rec.get("confidenceReason"))
+            admin_summary_type = type(rec.get("adminSummary")).__name__
+            public_safety_notes_type = type(rec.get("publicSafetyNotes", rec.get("doNotPublishReason"))).__name__
+            missing_info_type = type(rec.get("missingInfo")).__name__
             payload = build_population_recommendation_payload(rec)
             payloads.append(payload)
             if dry_run or rec.get("confidence") == "blocked":
                 counts["dry_run"] += 1
                 logging.info("population_recommendation_dry_run subject_key=%s lane=%s action=%s", rec.get("normalizedSubjectKey"), rec.get("recommendedLane"), rec.get("recommendedAction"))
                 continue
+            compact_shape = "compact" if isinstance(payload.get("populationRecommendation"), dict) else "omitted"
+            logging.info(
+                "population_recommendation_payload_shape subject_key=%s type=%s sourceLanes_count=%s has_adminSummary_text=%s adminSummary_type=%s publicSafetyNotes_type=%s missingInfo_type=%s rawEvidenceRefs_count=%s populationRecommendation_shape=%s",
+                payload.get("subjectKey") or rec.get("normalizedSubjectKey"),
+                payload.get("type"),
+                len(payload.get("sourceLanes") or []),
+                isinstance(payload.get("adminSummary"), str) and bool(payload.get("adminSummary")),
+                admin_summary_type,
+                public_safety_notes_type,
+                missing_info_type,
+                len(payload.get("rawEvidenceRefs") or []),
+                compact_shape,
+            )
             result = send_func(payload, environ=environ) if environ is not None else send_func(payload)
             if result.get("ok"):
                 counts["sent_to_site"] += 1
                 logging.info("population_recommendation_sent_to_site subject_key=%s recommendation_id=%s", rec.get("normalizedSubjectKey"), result.get("recommendationId") or "none")
             else:
                 counts["errors"] += 1
-                logging.warning("population_recommendation_skipped subject_key=%s reason=send_failed", rec.get("normalizedSubjectKey"))
+                safe_reason = _safe_text(result.get("endpoint_error") or result.get("error") or result.get("reason") or "site send failed", 220)
+                counts.setdefault("send_errors", 0)
+                counts["send_errors"] += 1
+                logging.warning("population_recommendation_skipped subject_key=%s reason=send_failed endpoint_reason=%s", rec.get("normalizedSubjectKey"), safe_reason)
+                diagnostic_info["last_send_error"] = safe_reason
         except Exception:
             counts["errors"] += 1
+            counts.setdefault("generation_errors", 0)
+            counts["generation_errors"] += 1
             logging.warning("population_recommendation_skipped reason=unexpected_error")
     logging.info(
         "population_scan_completed scanned=%s generated=%s sent_to_site=%s dry_run=%s skipped=%s blocked=%s errors=%s",
         counts["scanned"], counts["generated"], counts["sent_to_site"], counts["dry_run"], counts["skipped"], counts["blocked"], counts["errors"],
     )
     result = {"ok": counts["errors"] == 0, "dryRun": bool(dry_run), "recommendations": recommendations, "payloads": payloads, "counts": counts}
+    if counts.get("send_errors"):
+        result["error"] = "population_scan_send_failed"
+        result["reason"] = diagnostic_info.get("last_send_error") or "site send failed"
+    elif counts.get("generation_errors"):
+        result["error"] = "population_scan_generation_failed"
+        result["reason"] = "recommendation generation failed"
     if diagnostics:
         diagnostic_info["final_collected_count"] = len(records)
         result["diagnostics"] = diagnostic_info
@@ -1664,10 +1820,17 @@ def format_population_scan_response(summary: dict[str, Any]) -> str:
     counts = summary.get("counts") or {}
     count_line = "Counts: " + ", ".join(f"{key}={counts.get(key, 0)}" for key in ("scanned", "generated", "sent_to_site", "dry_run", "skipped", "blocked", "errors"))
     if not summary.get("ok", True) or counts.get("errors", 0) > 0:
+        error_code = str(summary.get("error") or "")
+        if error_code == "population_scan_collect_failed":
+            heading = "Population scan failed during memory collection."
+        elif error_code == "population_scan_send_failed" or counts.get("send_errors"):
+            heading = "Population scan completed, but site send failed."
+        else:
+            heading = "Population scan failed during recommendation generation."
         lines = [
-            "Population scan failed during memory collection.",
+            heading,
             f"Reason: {_safe_text(summary.get('reason') or summary.get('error') or 'unknown error', 220)}",
-            "No site records were created and no public pages were edited.",
+            "No public pages were published and no public dossier text was edited.",
             count_line,
         ]
     else:

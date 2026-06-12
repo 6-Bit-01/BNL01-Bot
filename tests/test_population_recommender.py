@@ -10,6 +10,7 @@ from bnl_population_recommender import (
     POPULATION_RECOMMENDATION_SCHEMA_FIELDS,
     build_population_recommendation,
     build_population_recommendation_payload,
+    flatten_admin_summary_for_ingest,
     extract_population_context,
     fetch_bnl_population_context,
     collect_shared_memory_population_records,
@@ -116,6 +117,59 @@ class PopulationRecommenderTests(unittest.TestCase):
         self.assertIn("populationRecommendation", payload)
         self.assertIn("Do not publish", json.dumps(payload))
 
+    def test_structured_admin_summary_flattens_to_ingest_text(self):
+        rec = build_population_recommendation(self.mid_records())
+        self.assertIsInstance(rec["adminSummary"], dict)
+        payload = build_population_recommendation_payload(rec)
+        self.assertIsInstance(payload["adminSummary"], str)
+        self.assertLessEqual(len(payload["adminSummary"]), 1200)
+        self.assertNotIn("{", payload["adminSummary"])
+        self.assertNotIn("}", payload["adminSummary"])
+
+    def test_list_and_object_summary_fields_flatten_safely(self):
+        summary = {
+            "summary": ["Needs review", {"recommendedNextStep": "Route to queue", "rawEvidenceRefs": ["secret:1"]}],
+            "keyFindings": [{"title": "Finding", "relationship_journal": "raw private text"}],
+            "aliases": ["private alias"],
+            "generatedAt": "2026-06-12T00:00:00+00:00",
+        }
+        text = flatten_admin_summary_for_ingest(summary)
+        self.assertIn("Needs review", text)
+        self.assertIn("Route to queue", text)
+        self.assertNotIn("secret:1", text)
+        self.assertNotIn("private alias", text.lower())
+        self.assertNotIn("relationship_journal", text)
+        self.assertNotIn("{", text)
+
+    def test_population_payload_field_shapes_match_site_schema(self):
+        rec = build_population_recommendation(self.mid_records("Shape Subject"))
+        rec["adminSummary"] = {"summary": "Review this subject", "recommendedNextStep": ["Queue review"]}
+        rec["publicSafetyNotes"] = "Keep private until reviewed"
+        rec["missingInfo"] = {"needed": "human confirmation"}
+        rec["doNotSay"] = "Do not expose internal aliases publicly."
+        rec["rawEvidenceRefs"] = ["raw:1", {"bad": "object"}]
+        payload = build_population_recommendation_payload(rec)
+        for key in ("reason", "evidenceSummary", "suggestedAction", "recommendedAction", "adminSummary", "recommendedNextStep", "doNotPublishReason"):
+            self.assertIsInstance(payload[key], str, key)
+            self.assertNotIsInstance(payload[key], dict, key)
+        for key in ("publicSafetyNotes", "missingInfo", "doNotSay", "rawEvidenceRefs", "sourceLanes"):
+            self.assertIsInstance(payload[key], list, key)
+            self.assertTrue(all(isinstance(item, str) for item in payload[key]), key)
+        self.assertIsInstance(payload["populationRecommendation"], dict)
+        self.assertNotIn("adminSummary", payload["populationRecommendation"])
+
+    def test_mind_fanatic_low_confidence_payload_schema_and_lanes(self):
+        rec = build_population_recommendation([
+            {"subjectName": "Mind Fanatic", "memoryTier": "live", "sourceLane": "broadcast_memory", "summary": "One weak mention", "sourceEvidenceRef": "broadcast:mf", "rawEvidenceRef": "broadcast_memory:mf"}
+        ])
+        payload = build_population_recommendation_payload(rec)
+        self.assertEqual(payload["subjectKey"], "mind-fanatic")
+        self.assertEqual(payload["confidence"], "low")
+        self.assertEqual(payload["sourceLanes"], ["broadcast_memory"])
+        self.assertIsInstance(payload["adminSummary"], str)
+        self.assertIsInstance(payload["publicSafetyNotes"], list)
+        self.assertNotIn("adminSummary", payload["populationRecommendation"])
+
     def test_dry_run_logs_and_does_not_send(self):
         calls = []
         def sender(payload, **kwargs):
@@ -175,7 +229,7 @@ class PopulationRecommenderTests(unittest.TestCase):
         self.assertIn("subject_filter=", logs)
         response = format_population_scan_response(result)
         self.assertIn("failed during memory collection", response)
-        self.assertIn("No site records were created", response)
+        self.assertIn("No public pages were published", response)
         self.assertNotIn("complete", response.splitlines()[0].lower())
 
     def test_empty_collection_returns_ok_warning(self):
@@ -249,6 +303,19 @@ class PopulationRecommenderTests(unittest.TestCase):
         self.assertEqual(calls, [])
         sent = run_population_scan(memory_records=self.mid_records(), dry_run=False, sender=lambda payload, **kw: calls.append(payload) or {"ok": True})
         self.assertEqual(sent["counts"]["sent_to_site"], 1)
+
+    def test_send_failure_response_distinguishes_site_send_failure(self):
+        result = run_population_scan(
+            memory_records=self.mid_records(),
+            dry_run=False,
+            sender=lambda payload, **kw: {"ok": False, "error": "Expected text field"},
+        )
+        response = format_population_scan_response(result)
+        self.assertFalse(result["ok"])
+        self.assertIn("Population scan completed, but site send failed.", response)
+        self.assertIn("Reason: Expected text field", response)
+        self.assertNotIn("failed during memory collection", response)
+        self.assertIn("No public pages were published and no public dossier text was edited.", response)
 
     def test_parse_diagnostics_command(self):
         matched, options, error = parse_population_scan_command("!bnl population scan now diagnostics")
