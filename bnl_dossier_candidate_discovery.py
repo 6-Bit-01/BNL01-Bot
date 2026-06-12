@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 from collections import Counter
 from typing import Any, Callable
 
+from bnl_admin_summaries import build_recommendation_cluster_summary
 from bnl_dossier_recommendations import VALID_DOSSIER_CATEGORIES, build_dossier_recommendation_payload
 from bnl_community_scouting import COMMUNITY_PRESENCE_LANE, community_category_taxonomy
 from bnl_dossier_source_packets import (
@@ -567,6 +568,17 @@ def discover_candidate_recommendations(
         evidence_summary = _evidence_summary(acc.evidence)
         evidence_hash = hashlib.sha256(f"{reason}\n{evidence_summary}".encode("utf-8")).hexdigest()[:8]
         taxonomy = _payload_taxonomy(acc)
+        cluster_summary = build_recommendation_cluster_summary({
+            **taxonomy,
+            "subjectName": acc.subject_name,
+            "subjectKey": subject_key(acc.subject_name),
+            "reason": reason,
+            "evidenceSummary": evidence_summary,
+            "sourceLanes": lane_list,
+            "suggestedAction": DEFAULT_SUGGESTED_ACTION,
+            "confidence": confidence,
+            "rawEvidenceRefs": [item.get("sourceRef") or item.get("source") or item.get("summary") for item in acc.evidence],
+        })
         payload = build_dossier_recommendation_payload(
             {
                 **taxonomy,
@@ -586,6 +598,7 @@ def discover_candidate_recommendations(
                 "confidence": confidence,
                 "createdBy": "bnl",
                 "ingestSource": DISCOVERY_INGEST_SOURCE,
+                "recommendationClusterSummary": cluster_summary,
                 "ingestKey": f"bnl:dossier:{DISCOVERY_INGEST_SOURCE}:{acc.category}:{subject_key(acc.subject_name)}:{'-'.join(lane_list)}:{evidence_hash}",
             }
         )

@@ -86,6 +86,9 @@ SUPPORTED_PAYLOAD_FIELDS = {
     "queueSubmissionStatus",
     "queueSubmissionNote",
     "entityIntelligenceProfile",
+    "adminSummary",
+    "updateSummary",
+    "recommendationClusterSummary",
 }
 _SAFE_LANE_PATTERN = re.compile(r"[^a-z0-9_-]+")
 VALID_DOSSIER_CATEGORIES = {"Entity", "Personnel", "Sponsor", "Interface", "Production"}
