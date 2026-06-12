@@ -437,6 +437,9 @@ CHANNEL_POLICY_CONTRACTS = {
 }
 
 LAST_ROUTE_DEBUG = {}
+LAST_MEMORY_LIFECYCLE_RESULT = {}
+LAST_MEMORY_PROMPT_DIAGNOSTICS = {}
+LAST_MEMORY_SKIP_REASONS = defaultdict(int)
 
 
 BNL_REACTIONS_BASE = ["👁️", "📡", "⚙️", "🧠", "🛰️", "🔍", "💾", "📊", "🖥️", "📼", "🧬", "📶"]
@@ -459,10 +462,35 @@ RECENT_STYLE_WINDOW = 6
 MAX_FACTS_PER_USER = 15
 CROSS_UNIVERSE_BLEED_CHANCE = 0.05
 CORE_MEMORY_CONFIDENCE = 0.88
-SHORT_MEMORY_LIMIT = 28
-MEDIUM_MEMORY_LIMIT = 16
-LONG_MEMORY_LIMIT = 10
-MAX_CONVERSATION_ROWS_PER_USER = 260
+def _env_int(name: str, default: int, minimum: int = 1) -> int:
+    try:
+        return max(minimum, int(os.getenv(name, str(default)) or default))
+    except Exception:
+        return max(minimum, int(default))
+
+
+# Conversation/memory lifecycle limits. Base values are used for new/low-activity users;
+# max values are reached only through adaptive budget signals. These defaults intentionally
+# raise the old tiny windows while keeping bounded retention.
+CONVERSATION_ROWS_PER_USER_BASE = _env_int("BNL_CONVERSATION_ROWS_PER_USER_BASE", 420, 50)
+CONVERSATION_ROWS_PER_USER_MAX = _env_int("BNL_CONVERSATION_ROWS_PER_USER_MAX", 1200, CONVERSATION_ROWS_PER_USER_BASE)
+SHORT_MEMORY_LIMIT_BASE = _env_int("BNL_SHORT_MEMORY_LIMIT_BASE", 72, 12)
+SHORT_MEMORY_LIMIT_MAX = _env_int("BNL_SHORT_MEMORY_LIMIT_MAX", 220, SHORT_MEMORY_LIMIT_BASE)
+MEDIUM_MEMORY_LIMIT_BASE = _env_int("BNL_MEDIUM_MEMORY_LIMIT_BASE", 42, 8)
+MEDIUM_MEMORY_LIMIT_MAX = _env_int("BNL_MEDIUM_MEMORY_LIMIT_MAX", 140, MEDIUM_MEMORY_LIMIT_BASE)
+LONG_MEMORY_LIMIT_BASE = _env_int("BNL_LONG_MEMORY_LIMIT_BASE", 18, 4)
+LONG_MEMORY_LIMIT_MAX = _env_int("BNL_LONG_MEMORY_LIMIT_MAX", 60, LONG_MEMORY_LIMIT_BASE)
+SHORT_MEMORY_SUMMARY_CHARS = _env_int("BNL_SHORT_MEMORY_SUMMARY_CHARS", 520, 120)
+MEMORY_TIER_ENTRY_CHARS = _env_int("BNL_MEMORY_TIER_ENTRY_CHARS", 900, 240)
+MEMORY_PROMPT_BUDGET_PUBLIC = _env_int("BNL_MEMORY_PROMPT_BUDGET_PUBLIC", 900, 200)
+MEMORY_PROMPT_BUDGET_INTERNAL = _env_int("BNL_MEMORY_PROMPT_BUDGET_INTERNAL", 1800, MEMORY_PROMPT_BUDGET_PUBLIC)
+MEMORY_PROMPT_BUDGET_OPERATOR = _env_int("BNL_MEMORY_PROMPT_BUDGET_OPERATOR", 2600, MEMORY_PROMPT_BUDGET_INTERNAL)
+
+# Backward-compatible names for tests/extensions that import the old constants.
+SHORT_MEMORY_LIMIT = SHORT_MEMORY_LIMIT_BASE
+MEDIUM_MEMORY_LIMIT = MEDIUM_MEMORY_LIMIT_BASE
+LONG_MEMORY_LIMIT = LONG_MEMORY_LIMIT_BASE
+MAX_CONVERSATION_ROWS_PER_USER = CONVERSATION_ROWS_PER_USER_BASE
 
 # ==================== LOGGING SETUP ====================
 
@@ -3704,11 +3732,23 @@ def init_db():
     _try_alter(cursor, "ALTER TABLE memory_tiers ADD COLUMN source_channel_name TEXT DEFAULT ''")
     _try_alter(cursor, "ALTER TABLE memory_tiers ADD COLUMN source_origin TEXT DEFAULT 'legacy_unknown'")
     _try_alter(cursor, "ALTER TABLE memory_tiers ADD COLUMN source_trust TEXT DEFAULT 'legacy_unknown'")
+    _try_alter(cursor, "ALTER TABLE memory_tiers ADD COLUMN topic_key TEXT DEFAULT ''")
+    _try_alter(cursor, "ALTER TABLE memory_tiers ADD COLUMN subject_key TEXT DEFAULT ''")
+    _try_alter(cursor, "ALTER TABLE memory_tiers ADD COLUMN project_key TEXT DEFAULT ''")
+    _try_alter(cursor, "ALTER TABLE memory_tiers ADD COLUMN first_seen TEXT DEFAULT ''")
+    _try_alter(cursor, "ALTER TABLE memory_tiers ADD COLUMN last_seen TEXT DEFAULT ''")
+    _try_alter(cursor, "ALTER TABLE memory_tiers ADD COLUMN lifecycle_note TEXT DEFAULT ''")
     cursor.execute("UPDATE memory_tiers SET source_role='legacy_unknown' WHERE source_role IS NULL OR TRIM(source_role) = ''")
     cursor.execute("UPDATE memory_tiers SET source_channel_policy='legacy_unknown' WHERE source_channel_policy IS NULL OR TRIM(source_channel_policy) = ''")
     cursor.execute("UPDATE memory_tiers SET source_channel_name='' WHERE source_channel_name IS NULL")
     cursor.execute("UPDATE memory_tiers SET source_origin='legacy_unknown' WHERE source_origin IS NULL OR TRIM(source_origin) = ''")
     cursor.execute("UPDATE memory_tiers SET source_trust='legacy_unknown' WHERE source_trust IS NULL OR TRIM(source_trust) = ''")
+    cursor.execute("UPDATE memory_tiers SET topic_key='' WHERE topic_key IS NULL")
+    cursor.execute("UPDATE memory_tiers SET subject_key='' WHERE subject_key IS NULL")
+    cursor.execute("UPDATE memory_tiers SET project_key='' WHERE project_key IS NULL")
+    cursor.execute("UPDATE memory_tiers SET first_seen=COALESCE(NULLIF(first_seen, ''), updated_at, '') WHERE first_seen IS NULL OR TRIM(first_seen) = ''")
+    cursor.execute("UPDATE memory_tiers SET last_seen=COALESCE(NULLIF(last_seen, ''), updated_at, '') WHERE last_seen IS NULL OR TRIM(last_seen) = ''")
+    cursor.execute("UPDATE memory_tiers SET lifecycle_note='' WHERE lifecycle_note IS NULL")
 
     cursor.execute(
         """
@@ -4069,176 +4109,289 @@ def get_user_habits(user_id: int, guild_id: int):
     conn.close()
     return row
 
+def _memory_lifecycle_config() -> dict:
+    return {
+        "conversation_rows_base": CONVERSATION_ROWS_PER_USER_BASE,
+        "conversation_rows_max": CONVERSATION_ROWS_PER_USER_MAX,
+        "short_base": SHORT_MEMORY_LIMIT_BASE,
+        "short_max": SHORT_MEMORY_LIMIT_MAX,
+        "medium_base": MEDIUM_MEMORY_LIMIT_BASE,
+        "medium_max": MEDIUM_MEMORY_LIMIT_MAX,
+        "long_base": LONG_MEMORY_LIMIT_BASE,
+        "long_max": LONG_MEMORY_LIMIT_MAX,
+        "short_summary_chars": SHORT_MEMORY_SUMMARY_CHARS,
+        "entry_chars": MEMORY_TIER_ENTRY_CHARS,
+        "prompt_public": MEMORY_PROMPT_BUDGET_PUBLIC,
+        "prompt_internal": MEMORY_PROMPT_BUDGET_INTERNAL,
+        "prompt_operator": MEMORY_PROMPT_BUDGET_OPERATOR,
+    }
+
+
+def _memory_topic_key(text: str) -> str:
+    t = re.sub(r"https?://\S+", " ", (text or "").lower())
+    topic_markers = [
+        ("source_file", ("source file", "source-file", "archive", "evidence", "canon")),
+        ("dossier", ("dossier", "candidate", "recommendation")),
+        ("queue", ("queue", "next in line", "priority", "free pointer", "wheel")),
+        ("website", ("website", "relay", "dashboard", "site")),
+        ("memory", ("remember", "memory", "keep this", "this matters", "forget")),
+        ("project_plan", ("project plan", "next pr", "pr #", "roadmap", "workstream")),
+        ("conversation_style", ("style", "tone", "generic", "direct answer", "contextual")),
+        ("issue_support", ("bug", "issue", "error", "stuck", "fix", "broken")),
+    ]
+    hits = [key for key, terms in topic_markers if any(term in t for term in terms)]
+    if hits:
+        return hits[0]
+    tokens = [x for x in re.findall(r"[a-z0-9]{4,}", t) if x not in {"that", "this", "with", "from", "have", "about", "message", "discord", "please", "should", "would", "could"}]
+    return "topic_" + "_".join(tokens[:3]) if tokens else "general"
+
+
+def _memory_subject_key(text: str) -> str:
+    names = re.findall(r"\b[A-Z][A-Za-z0-9_-]{2,}\b", text or "")
+    ignored = {"BNL", "Discord", "Source", "File", "PR"}
+    names = [n for n in names if n not in ignored]
+    return names[0].lower()[:64] if names else ""
+
+
+def _memory_project_key(text: str) -> str:
+    t = (text or "").lower()
+    for key, terms in (("source_files", ("source file", "archive", "evidence")), ("dossiers", ("dossier",)), ("queue", ("queue", "priority", "next in line")), ("website", ("website", "relay", "dashboard")), ("bot_memory", ("memory", "remember"))):
+        if any(term in t for term in terms):
+            return key
+    return ""
+
+
 def _memory_salience_score(text: str) -> float:
     t = (text or "").lower()
     score = 0.45
     if "?" in t:
         score += 0.08
-    if any(k in t for k in ("always", "never", "favorite", "remember", "important", "hate", "love")):
-        score += 0.20
-    if any(k in t for k in ("help", "issue", "error", "problem", "stuck")):
+    if any(k in t for k in ("always", "never", "favorite", "remember", "important", "this matters", "keep this", "hate", "love")):
+        score += 0.22
+    if any(k in t for k in ("source file", "dossier", "project plan", "next pr", "owner-confirmed", "operator-confirmed")):
+        score += 0.18
+    if any(k in t for k in ("help", "issue", "error", "problem", "stuck", "unresolved")):
         score += 0.12
     if len(t) > 180:
         score += 0.06
     return min(1.0, score)
 
-def _compress_memory_fragments(fragments: list, tier: str) -> str:
-    cleaned = [f.strip() for f in fragments if f and f.strip()]
+
+def _memory_tiers_columns(cursor) -> set:
+    try:
+        cursor.execute("PRAGMA table_info(memory_tiers)")
+        return {str(r[1]) for r in cursor.fetchall()}
+    except Exception:
+        return set()
+
+
+def _memory_visibility_group(source_trust: str, source_policy: str = "") -> str:
+    trust = (source_trust or "legacy_unknown").strip()
+    policy = (source_policy or "").strip()
+    if trust in {"source_safe_public", "source_safe_public_consolidated"} and policy not in {"internal_controlled", "sealed_test", "protected_system", "unknown"}:
+        return "public_safe"
+    if policy in {"internal_controlled", "protected_system"}:
+        return "internal"
+    if policy == "sealed_test":
+        return "sealed_test"
+    return "legacy_mixed"
+
+
+def _consolidated_trust_for(rows: list[dict]) -> str:
+    trusts = {(r.get("source_trust") or "legacy_unknown").strip() for r in rows}
+    policies = {(r.get("source_channel_policy") or "legacy_unknown").strip() for r in rows}
+    if trusts and trusts.issubset({"source_safe_public", "source_safe_public_consolidated"}) and not (policies & {"internal_controlled", "sealed_test", "protected_system", "unknown"}):
+        return "source_safe_public_consolidated"
+    return "mixed_or_legacy_consolidated"
+
+
+def _compress_memory_fragments(fragments: list, tier: str, topic_key: str = "general") -> str:
+    cleaned = [_safe_boundary_truncate(f.strip(), 180, use_ellipsis=False) for f in fragments if f and f.strip()]
     if not cleaned:
         return ""
-
+    label = (topic_key or "general").replace("_", " ").title()
+    unique = []
+    seen = set()
+    for item in cleaned:
+        norm = re.sub(r"\W+", " ", item.lower()).strip()[:120]
+        if norm and norm not in seen:
+            seen.add(norm)
+            unique.append(item)
     if tier == "medium":
-        head = " | ".join(cleaned[:3])
-        return f"Merged short-term pattern: {head[:280]}"
-    head = " | ".join(cleaned[:4])
-    return f"Long-range memory trace: {head[:320]}"
+        body = "; ".join(unique[:4])
+        return _safe_boundary_truncate(f"{label} thread: {body}", MEMORY_TIER_ENTRY_CHARS, use_ellipsis=True)
+    body = "; ".join(unique[:3])
+    return _safe_boundary_truncate(f"Durable {label} memory: {body}", MEMORY_TIER_ENTRY_CHARS, use_ellipsis=True)
+
+
+def calculate_adaptive_memory_limits(user_id: int, guild_id: int, route_mode: str = ROUTE_MODE_NORMAL_CHAT, channel_policy: str = "unknown", user_text: str = "", is_owner_or_mod: bool = False) -> dict:
+    relation = get_relationship_state(user_id, guild_id)
+    habits = get_user_habits(user_id, guild_id)
+    recent_rows = get_recent_conversation_count(user_id, guild_id, limit=CONVERSATION_ROWS_PER_USER_MAX)
+    interactions = int(relation[0]) if relation else 0
+    stage = str(relation[2]) if relation and len(relation) > 2 else "new"
+    habit_total = int(habits[0]) if habits else 0
+    topic = _memory_topic_key(user_text or (habits[5] if habits and len(habits) > 5 else ""))
+    multiplier = 1.0
+    reasons = []
+    if interactions >= 25 or habit_total >= 25 or stage in {"familiar", "trusted", "close"}:
+        multiplier += 0.35; reasons.append("familiar_or_active")
+    if interactions >= 100 or habit_total >= 100:
+        multiplier += 0.30; reasons.append("high_interaction_count")
+    if recent_rows >= 40:
+        multiplier += 0.20; reasons.append("recent_activity")
+    if user_text and _memory_salience_score(user_text) >= 0.75:
+        multiplier += 0.20; reasons.append("high_salience_or_explicit_memory_language")
+    if route_mode in SOURCE_INTERNAL_MODES or (channel_policy or "") in {"internal_controlled", "broadcast_memory"}:
+        multiplier += 0.15; reasons.append("internal_route")
+    if is_owner_or_mod:
+        multiplier += 0.25; reasons.append("operator")
+    if (channel_policy or "") in {"public_selective", "sealed_test", "unknown", "protected_system"}:
+        multiplier = min(multiplier, 1.15); reasons.append("restricted_surface_cap")
+    def scale(base, maxv):
+        return min(maxv, max(base, int(round(base * multiplier))))
+    prompt_budget = MEMORY_PROMPT_BUDGET_PUBLIC
+    visibility = "public_safe"
+    if is_owner_or_mod:
+        prompt_budget = MEMORY_PROMPT_BUDGET_OPERATOR; visibility = "operator_only"
+    elif route_mode in SOURCE_INTERNAL_MODES or (channel_policy or "") in {"internal_controlled", "broadcast_memory"}:
+        prompt_budget = MEMORY_PROMPT_BUDGET_INTERNAL; visibility = "internal"
+    return {
+        "conversation_rows": scale(CONVERSATION_ROWS_PER_USER_BASE, CONVERSATION_ROWS_PER_USER_MAX),
+        "short": scale(SHORT_MEMORY_LIMIT_BASE, SHORT_MEMORY_LIMIT_MAX),
+        "medium": scale(MEDIUM_MEMORY_LIMIT_BASE, MEDIUM_MEMORY_LIMIT_MAX),
+        "long": scale(LONG_MEMORY_LIMIT_BASE, LONG_MEMORY_LIMIT_MAX),
+        "prompt_budget": prompt_budget,
+        "multiplier": round(multiplier, 2),
+        "reasons": reasons or ["base"],
+        "topic_key": topic,
+        "visibility": visibility,
+    }
+
+
+def _insert_memory_tier(cursor, user_id: int, guild_id: int, tier: str, summary: str, salience: float, mentions: int = 1, source_role: str = "legacy_unknown", source_channel_policy: str = "legacy_unknown", source_channel_name: str = "", source_origin: str = "legacy_unknown", source_trust: str = "legacy_unknown", topic_key: str = "", subject_key: str = "", project_key: str = "", lifecycle_note: str = ""):
+    if not summary:
+        return
+    now = datetime.now(PACIFIC_TZ).isoformat()
+    cols = _memory_tiers_columns(cursor)
+    data = {
+        "user_id": user_id, "guild_id": guild_id, "tier": tier, "summary": _safe_boundary_truncate(summary, MEMORY_TIER_ENTRY_CHARS),
+        "salience": float(min(1.0, max(0.0, salience))), "mentions": max(1, int(mentions)), "updated_at": now,
+        "source_role": (source_role or "legacy_unknown")[:40], "source_channel_policy": (source_channel_policy or "legacy_unknown")[:40],
+        "source_channel_name": (source_channel_name or "").lower()[:80], "source_origin": (source_origin or "legacy_unknown")[:64],
+        "source_trust": (source_trust or "legacy_unknown")[:64], "topic_key": (topic_key or "")[:80],
+        "subject_key": (subject_key or "")[:80], "project_key": (project_key or "")[:80], "first_seen": now, "last_seen": now,
+        "lifecycle_note": (lifecycle_note or "")[:160],
+    }
+    ordered = [c for c in ("user_id","guild_id","tier","summary","salience","mentions","updated_at","source_role","source_channel_policy","source_channel_name","source_origin","source_trust","topic_key","subject_key","project_key","first_seen","last_seen","lifecycle_note") if c in data and (c in cols or c in {"user_id","guild_id","tier","summary","salience","mentions","updated_at"})]
+    cursor.execute(f"INSERT INTO memory_tiers ({', '.join(ordered)}) VALUES ({', '.join(['?']*len(ordered))})", [data[c] for c in ordered])
+
 
 def _add_memory_tier_entry(user_id: int, guild_id: int, tier: str, summary: str, salience: float, source_role: str = "legacy_unknown", source_channel_policy: str = "legacy_unknown", source_channel_name: str = "", source_origin: str = "legacy_unknown", source_trust: str = "legacy_unknown"):
     if not summary:
         return
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
-    cursor.execute(
-        """
-        INSERT INTO memory_tiers (
-            user_id, guild_id, tier, summary, salience, mentions, updated_at,
-            source_role, source_channel_policy, source_channel_name, source_origin, source_trust
-        )
-        VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?)
-        """,
-        (user_id, guild_id, tier, summary[:340], salience, datetime.now(PACIFIC_TZ).isoformat(),
-         (source_role or "legacy_unknown")[:40],
-         (source_channel_policy or "legacy_unknown")[:40],
-         (source_channel_name or "").lower()[:80],
-         (source_origin or "legacy_unknown")[:64],
-         (source_trust or "legacy_unknown")[:64]),
-    )
+    _insert_memory_tier(cursor, user_id, guild_id, tier, summary, salience, source_role=source_role, source_channel_policy=source_channel_policy, source_channel_name=source_channel_name, source_origin=source_origin, source_trust=source_trust, topic_key=_memory_topic_key(summary), subject_key=_memory_subject_key(summary), project_key=_memory_project_key(summary), lifecycle_note="direct_entry")
     conn.commit()
     conn.close()
 
-def _consolidate_memory_tiers(user_id: int, guild_id: int):
+
+def _fetch_tier_rows(cursor, user_id: int, guild_id: int, tier: str) -> list[dict]:
+    cols = _memory_tiers_columns(cursor)
+    wanted = ["id", "summary", "salience", "mentions", "updated_at"] + [c for c in ("source_role", "source_channel_policy", "source_channel_name", "source_origin", "source_trust", "topic_key", "subject_key", "project_key", "first_seen", "last_seen") if c in cols]
+    cursor.execute(f"SELECT {', '.join(wanted)} FROM memory_tiers WHERE user_id=? AND guild_id=? AND tier=? ORDER BY id DESC", (user_id, guild_id, tier))
+    return [dict(zip(wanted, row)) for row in cursor.fetchall()]
+
+
+def _merge_or_insert_cluster(cursor, user_id: int, guild_id: int, tier: str, rows: list[dict], topic_key: str, source_trust: str, lifecycle_note: str):
+    if not rows:
+        return
+    group = _memory_visibility_group(source_trust, rows[0].get("source_channel_policy", ""))
+    compatible = []
+    for r in _fetch_tier_rows(cursor, user_id, guild_id, tier):
+        if (r.get("topic_key") or _memory_topic_key(r.get("summary", ""))) == topic_key and _memory_visibility_group(r.get("source_trust", ""), r.get("source_channel_policy", "")) == group:
+            compatible.append(r)
+    summary = _compress_memory_fragments([r.get("summary", "") for r in rows] + [r.get("summary", "") for r in compatible[:1]], tier, topic_key)
+    sal = min(1.0, (sum(float(r.get("salience") or 0.5) for r in rows) / max(1, len(rows))) + (0.08 if len(rows) >= 2 else 0.03))
+    mentions = sum(int(r.get("mentions") or 1) for r in rows)
+    now = datetime.now(PACIFIC_TZ).isoformat()
+    if compatible:
+        target = compatible[0]
+        cursor.execute("UPDATE memory_tiers SET summary=?, salience=MAX(salience, ?), mentions=mentions + ?, updated_at=?, last_seen=?, lifecycle_note=? WHERE id=?", (summary, sal, mentions, now, now, lifecycle_note, target["id"]))
+    else:
+        first = rows[0]
+        _insert_memory_tier(cursor, user_id, guild_id, tier, summary, sal, mentions=mentions, source_role="consolidation", source_channel_policy=first.get("source_channel_policy") or "consolidated", source_channel_name="", source_origin=lifecycle_note, source_trust=source_trust, topic_key=topic_key, subject_key=first.get("subject_key") or "", project_key=first.get("project_key") or "", lifecycle_note=lifecycle_note)
+
+
+def _consolidate_memory_tiers(user_id: int, guild_id: int, limits: dict | None = None) -> dict:
+    limits = limits or calculate_adaptive_memory_limits(user_id, guild_id)
+    result = {"short_to_medium": 0, "medium_to_long": 0, "aged_out": 0, "merged_topics": [], "limits": limits}
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
+    cols = _memory_tiers_columns(cursor)
 
-    cursor.execute(
-        """
-        SELECT id, summary, salience, source_trust
-        FROM memory_tiers
-        WHERE user_id = ? AND guild_id = ? AND tier = 'short'
-        ORDER BY id DESC
-        """,
-        (user_id, guild_id),
-    )
-    short_rows = cursor.fetchall()
-    if len(short_rows) > SHORT_MEMORY_LIMIT:
-        overflow = short_rows[SHORT_MEMORY_LIMIT:]
-        considered = overflow[:6]
-        fragments = [r[1] for r in considered]
-        sal = sum((r[2] or 0.5) for r in considered) / max(1, min(6, len(overflow)))
-        trust_values = {(r[3] or "legacy_unknown").strip() for r in considered}
-        consolidated_trust = (
-            "source_safe_public_consolidated"
-            if trust_values and trust_values.issubset({"source_safe_public", "source_safe_public_consolidated"})
-            else "mixed_or_legacy_consolidated"
-        )
-        summary = _compress_memory_fragments(fragments, "medium")
-        if summary:
-            cursor.execute(
-                """
-                INSERT INTO memory_tiers (
-                    user_id, guild_id, tier, summary, salience, mentions, updated_at,
-                    source_role, source_channel_policy, source_channel_name, source_origin, source_trust
-                )
-                VALUES (?, ?, 'medium', ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    user_id,
-                    guild_id,
-                    summary,
-                    min(1.0, sal + 0.05),
-                    len(fragments),
-                    datetime.now(PACIFIC_TZ).isoformat(),
-                    "consolidation",
-                    "consolidated",
-                    "",
-                    "consolidated_short_to_medium",
-                    consolidated_trust,
-                ),
-            )
-        ids = [r[0] for r in overflow]
-        cursor.executemany("DELETE FROM memory_tiers WHERE id = ?", [(i,) for i in ids])
+    short_rows = _fetch_tier_rows(cursor, user_id, guild_id, "short")
+    if len(short_rows) > limits["short"]:
+        overflow = short_rows[limits["short"]:]
+        buckets = defaultdict(list)
+        for r in overflow:
+            topic = (r.get("topic_key") or _memory_topic_key(r.get("summary", "")))
+            group = _memory_visibility_group(r.get("source_trust", ""), r.get("source_channel_policy", ""))
+            buckets[(topic, group)].append(r)
+        for (topic, _group), rows in buckets.items():
+            trust = _consolidated_trust_for(rows)
+            _merge_or_insert_cluster(cursor, user_id, guild_id, "medium", rows, topic, trust, "consolidated_short_to_medium")
+            result["short_to_medium"] += len(rows); result["merged_topics"].append(topic)
+        cursor.executemany("DELETE FROM memory_tiers WHERE id=?", [(r["id"],) for r in overflow])
 
-    cursor.execute(
-        """
-        SELECT id, summary, salience, source_trust
-        FROM memory_tiers
-        WHERE user_id = ? AND guild_id = ? AND tier = 'medium'
-        ORDER BY id DESC
-        """,
-        (user_id, guild_id),
-    )
-    med_rows = cursor.fetchall()
-    if len(med_rows) > MEDIUM_MEMORY_LIMIT:
-        overflow = med_rows[MEDIUM_MEMORY_LIMIT:]
-        considered = overflow[:5]
-        fragments = [r[1] for r in considered]
-        sal = sum((r[2] or 0.5) for r in considered) / max(1, min(5, len(overflow)))
-        trust_values = {(r[3] or "legacy_unknown").strip() for r in considered}
-        consolidated_trust = (
-            "source_safe_public_consolidated"
-            if trust_values and trust_values.issubset({"source_safe_public", "source_safe_public_consolidated"})
-            else "mixed_or_legacy_consolidated"
-        )
-        summary = _compress_memory_fragments(fragments, "long")
-        if summary:
-            cursor.execute(
-                """
-                INSERT INTO memory_tiers (
-                    user_id, guild_id, tier, summary, salience, mentions, updated_at,
-                    source_role, source_channel_policy, source_channel_name, source_origin, source_trust
-                )
-                VALUES (?, ?, 'long', ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    user_id,
-                    guild_id,
-                    summary,
-                    min(1.0, sal + 0.04),
-                    len(fragments),
-                    datetime.now(PACIFIC_TZ).isoformat(),
-                    "consolidation",
-                    "consolidated",
-                    "",
-                    "consolidated_medium_to_long",
-                    consolidated_trust,
-                ),
-            )
-        ids = [r[0] for r in overflow]
-        cursor.executemany("DELETE FROM memory_tiers WHERE id = ?", [(i,) for i in ids])
+    med_rows = _fetch_tier_rows(cursor, user_id, guild_id, "medium")
+    if len(med_rows) > limits["medium"]:
+        overflow = med_rows[limits["medium"]:]
+        buckets = defaultdict(list)
+        for r in overflow:
+            topic = (r.get("topic_key") or _memory_topic_key(r.get("summary", "")))
+            group = _memory_visibility_group(r.get("source_trust", ""), r.get("source_channel_policy", ""))
+            buckets[(topic, group)].append(r)
+        promoted_ids = set()
+        stale_ids = set()
+        for (topic, _group), rows in buckets.items():
+            repeated = sum(int(r.get("mentions") or 1) for r in rows) >= 3 or len(rows) >= 2
+            high_salience = max(float(r.get("salience") or 0.0) for r in rows) >= 0.78
+            confirmed = any(any(k in (r.get("summary") or "").lower() for k in ("remember", "confirmed", "owner-confirmed", "this matters", "keep this")) for r in rows)
+            safe = _memory_visibility_group(rows[0].get("source_trust", ""), rows[0].get("source_channel_policy", "")) != "sealed_test"
+            if safe and (repeated or high_salience or confirmed):
+                _merge_or_insert_cluster(cursor, user_id, guild_id, "long", rows, topic, _consolidated_trust_for(rows), "crystallized_medium_to_long")
+                result["medium_to_long"] += len(rows); result["merged_topics"].append(topic)
+                promoted_ids.update(r["id"] for r in rows)
+            elif not safe or max(float(r.get("salience") or 0.0) for r in rows) < 0.55:
+                result["aged_out"] += len(rows)
+                stale_ids.update(r["id"] for r in rows)
+            else:
+                # Preserve unresolved but not-yet-durable mid-term notes by bumping them current.
+                cursor.executemany("UPDATE memory_tiers SET updated_at=?, lifecycle_note=? WHERE id=?", [(datetime.now(PACIFIC_TZ).isoformat(), "kept_mid_unpromoted", r["id"]) for r in rows])
+        # Delete promoted source rows after their cluster is crystallized; stale/sealed rows age out.
+        delete_ids = sorted(promoted_ids | stale_ids)
+        if delete_ids:
+            cursor.executemany("DELETE FROM memory_tiers WHERE id=?", [(i,) for i in delete_ids])
 
-    cursor.execute(
-        """
-        DELETE FROM memory_tiers
-        WHERE id IN (
-            SELECT id FROM memory_tiers
-            WHERE user_id = ? AND guild_id = ? AND tier = 'long'
-            ORDER BY salience DESC, id DESC
-            LIMIT -1 OFFSET ?
-        )
-        """,
-        (user_id, guild_id, LONG_MEMORY_LIMIT),
-    )
-
+    cursor.execute("DELETE FROM memory_tiers WHERE id IN (SELECT id FROM memory_tiers WHERE user_id=? AND guild_id=? AND tier='long' ORDER BY salience DESC, mentions DESC, id DESC LIMIT -1 OFFSET ?)", (user_id, guild_id, limits["long"]))
+    result["aged_out"] += max(0, len(_fetch_tier_rows(cursor, user_id, guild_id, "long")) - limits["long"])
     conn.commit()
     conn.close()
+    LAST_MEMORY_LIFECYCLE_RESULT[(user_id, guild_id)] = result
+    return result
+
 
 def add_short_memory_trace(user_id: int, guild_id: int, content: str, source_role: str = "legacy_unknown", source_channel_policy: str = "legacy_unknown", source_channel_name: str = "", source_origin: str = "conversation", source_trust: str = "legacy_unknown"):
     text = (content or "").strip()
     if not text:
         return
-    summary = text[:220]
+    summary = _safe_boundary_truncate(text, SHORT_MEMORY_SUMMARY_CHARS)
+    limits = calculate_adaptive_memory_limits(user_id, guild_id, channel_policy=source_channel_policy, user_text=text)
     _add_memory_tier_entry(user_id, guild_id, "short", summary, _memory_salience_score(text), source_role=source_role, source_channel_policy=source_channel_policy, source_channel_name=source_channel_name, source_origin=source_origin, source_trust=source_trust)
-    _consolidate_memory_tiers(user_id, guild_id)
+    _consolidate_memory_tiers(user_id, guild_id, limits=limits)
+
 
 
 def _is_low_value_acknowledgement(text: str) -> bool:
@@ -4246,50 +4399,22 @@ def _is_low_value_acknowledgement(text: str) -> bool:
     if not t:
         return True
     blocked_exact = {
-        "received.",
-        "received",
-        "acknowledged.",
-        "acknowledged",
-        "no response needed.",
-        "no response needed",
-        "ok",
-        "okay",
-        "thanks",
-        "thank you",
-        "lol",
-        "lmao",
+        "received.", "received", "acknowledged.", "acknowledged", "no response needed.",
+        "no response needed", "ok", "okay", "thanks", "thank you", "lol", "lmao",
     }
     if t in blocked_exact:
         return True
-    blocked_fragments = (
-        "no response needed",
-        "testing normal public channel behavior",
-        "diagnostic",
-        "diagnostics",
-    )
+    blocked_fragments = ("no response needed", "testing normal public channel behavior", "diagnostic", "diagnostics")
     return any(fragment in t for fragment in blocked_fragments)
 
 
 def is_meaningful_memory_candidate(content: str, role: str) -> bool:
     text = (content or "").strip()
-    if not text:
-        return False
-    if len(text) < 16:
-        return False
-    if len(text.split()) <= 2:
-        return False
-    if _is_low_value_acknowledgement(text):
+    if not text or len(text) < 16 or len(text.split()) <= 2 or _is_low_value_acknowledgement(text):
         return False
     if role == "model":
-        model_low_value_markers = (
-            "copy that",
-            "acknowledged",
-            "no response needed",
-            "status pulse",
-            "diagnostic",
-        )
         lowered = text.lower()
-        if any(marker in lowered for marker in model_low_value_markers):
+        if any(marker in lowered for marker in ("copy that", "acknowledged", "no response needed", "status pulse", "diagnostic")):
             return False
     return True
 
@@ -4308,16 +4433,29 @@ def maybe_add_memory_trace(
     normalized_role = (role or "").strip().lower()
     decision = decide_memory_write_policy(route_mode, policy, normalized_role, content, normalized_role == "model")
     if not decision.write_memory_tier:
+        LAST_MEMORY_SKIP_REASONS[decision.reason or "write_memory_tier_disabled"] += 1
         return
-    source_trust = "source_safe_public"
-    add_short_memory_trace(user_id, guild_id, content, source_role=normalized_role or "legacy_unknown", source_channel_policy=policy or "legacy_unknown", source_channel_name=channel_name or "", source_origin=source or "conversation", source_trust=source_trust)
+    add_short_memory_trace(
+        user_id,
+        guild_id,
+        content,
+        source_role=normalized_role or "legacy_unknown",
+        source_channel_policy=policy or "legacy_unknown",
+        source_channel_name=channel_name or "",
+        source_origin=source or "conversation",
+        source_trust="source_safe_public",
+    )
+
 
 def get_memory_tiers(user_id: int, guild_id: int):
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
+    cols = _memory_tiers_columns(cursor)
+    wanted = ["tier", "summary", "salience", "mentions", "updated_at", "source_role", "source_channel_policy", "source_channel_name", "source_origin", "source_trust"]
+    wanted += [c for c in ("topic_key", "subject_key", "project_key", "first_seen", "last_seen", "lifecycle_note") if c in cols]
     cursor.execute(
-        """
-        SELECT tier, summary, salience, mentions, updated_at, source_role, source_channel_policy, source_channel_name, source_origin, source_trust
+        f"""
+        SELECT {', '.join(wanted)}
         FROM memory_tiers
         WHERE user_id = ? AND guild_id = ?
         ORDER BY
@@ -8551,7 +8689,7 @@ def save_user_message(user_id: int, user_name: str, guild_id: int, content: str,
         )
     except Exception as exc:
         logging.debug("source_refresh_dirty_hook_failed source=conversations error=%s", exc)
-    prune_conversation_history(user_id, guild_id, MAX_CONVERSATION_ROWS_PER_USER)
+    prune_conversation_history(user_id, guild_id, calculate_adaptive_memory_limits(user_id, guild_id, route_mode=route_mode, channel_policy=channel_policy, user_text=content).get("conversation_rows", MAX_CONVERSATION_ROWS_PER_USER))
     if decision.update_relationship:
         update_relationship_state(user_id, guild_id, content, delta_affinity=0.06)
     if decision.update_habits:
@@ -8590,7 +8728,7 @@ def save_model_message(user_id: int, guild_id: int, content: str, channel_name: 
     )
     conn.commit()
     conn.close()
-    prune_conversation_history(user_id, guild_id, MAX_CONVERSATION_ROWS_PER_USER)
+    prune_conversation_history(user_id, guild_id, calculate_adaptive_memory_limits(user_id, guild_id, route_mode=route_mode, channel_policy=channel_policy, user_text=content).get("conversation_rows", MAX_CONVERSATION_ROWS_PER_USER))
     if decision.update_relationship:
         update_relationship_state(user_id, guild_id, content, delta_affinity=0.04)
     maybe_add_memory_trace(
@@ -10861,12 +10999,35 @@ def try_memory_recall_response(user_id: int, guild_id: int, user_text: str) -> s
 
     return ""
 
-def build_user_memory_context(user_id: int, guild_id: int, route_mode: str = ROUTE_MODE_NORMAL_CHAT, channel_policy: str = "unknown") -> str:
+def _memory_row_relevance(row, topic_key: str, user_text: str) -> float:
+    summary = (row[1] or "") if len(row) > 1 else ""
+    row_topic = row[10] if len(row) > 10 else _memory_topic_key(summary)
+    score = float(row[2] or 0.5) + min(0.2, float(row[3] or 1) * 0.02)
+    if row_topic and row_topic == topic_key:
+        score += 0.35
+    terms = set(re.findall(r"[a-z0-9]{4,}", (user_text or "").lower()))
+    if terms:
+        row_terms = set(re.findall(r"[a-z0-9]{4,}", summary.lower()))
+        score += min(0.25, 0.04 * len(terms & row_terms))
+    return score
+
+
+def _memory_row_public_safe(row) -> bool:
+    trust = row[9] if len(row) > 9 else "legacy_unknown"
+    policy = row[6] if len(row) > 6 else "legacy_unknown"
+    return _memory_visibility_group(trust, policy) == "public_safe"
+
+
+def build_user_memory_context(user_id: int, guild_id: int, route_mode: str = ROUTE_MODE_NORMAL_CHAT, channel_policy: str = "unknown", user_text: str = "", is_owner_or_mod: bool = False) -> str:
     if route_mode == ROUTE_MODE_SIMPLE_GREETING:
+        LAST_MEMORY_PROMPT_DIAGNOSTICS[(user_id, guild_id)] = {"skipped_reason": "simple_greeting", "included": {"short": 0, "medium": 0, "long": 0}}
         return "Memory intentionally skipped for simple greeting."
     policy = (channel_policy or "unknown").strip().lower() or "unknown"
-    if route_mode in SOURCE_INTERNAL_MODES or policy in {"unknown", "sealed_test", "internal_controlled", "protected_system", "broadcast_memory", "reference_canon", "ai_image_tool"}:
+    if route_mode in SOURCE_INTERNAL_MODES or policy in {"unknown", "sealed_test", "protected_system", "broadcast_memory", "reference_canon", "ai_image_tool"}:
+        LAST_MEMORY_PROMPT_DIAGNOSTICS[(user_id, guild_id)] = {"skipped_reason": f"route_or_policy_{policy}", "included": {"short": 0, "medium": 0, "long": 0}}
         return "No route-safe durable memory for this mode/channel."
+
+    limits = calculate_adaptive_memory_limits(user_id, guild_id, route_mode=route_mode, channel_policy=policy, user_text=user_text, is_owner_or_mod=is_owner_or_mod)
     facts = get_user_facts(user_id, guild_id, limit=8)
     relation = get_relationship_state(user_id, guild_id)
     journal = get_relationship_journal(user_id, guild_id, limit=4)
@@ -10892,31 +11053,75 @@ def build_user_memory_context(user_id: int, guild_id: int, route_mode: str = ROU
             f"messages={total}, question_ratio={q_ratio:.2f}, humor_ratio={humor_ratio:.2f}, "
             f"late_night_ratio={late_ratio:.2f}, avg_len={avg_len:.1f}, last_topic={last_topic or 'general'}."
         )
-    if journal:
+    if journal and limits["visibility"] != "public_safe":
         journal_lines = [f"- [{etype}] {summary}" for (etype, summary, _ts) in journal]
         sections.append("Recent relationship journal:\n" + "\n".join(journal_lines))
 
-    if tier_rows:
-        trusted_rows = [r for r in tier_rows if len(r) >= 10 and r[9] in ("source_safe_public", "source_safe_public_consolidated")]
-        cautious_rows = [r for r in tier_rows if len(r) >= 10 and r[9] not in ("source_safe_public", "source_safe_public_consolidated")]
-        active_rows = trusted_rows if trusted_rows else cautious_rows
-        short = [r for r in active_rows if r[0] == "short"][:4]
-        medium = [r for r in active_rows if r[0] == "medium"][:3]
-        long_t = [r for r in active_rows if r[0] == "long"][:2]
-        tier_lines = []
-        if short:
-            tier_lines.append("Short-term traces:\n" + "\n".join([f"- {r[1]}" for r in short]))
-        if medium:
-            tier_lines.append("Medium summaries:\n" + "\n".join([f"- {r[1]}" for r in medium]))
-        if long_t:
-            tier_lines.append("Long traces:\n" + "\n".join([f"- {r[1]}" for r in long_t]))
-        if cautious_rows and not trusted_rows:
-            tier_lines.append("Legacy/mixed memory only: yes (allowed cautiously; lower authority than source-safe memory).")
-        elif cautious_rows and trusted_rows:
-            tier_lines.append("Legacy/mixed memory present: yes (down-ranked for reply authority).")
-        sections.append("\n".join(tier_lines))
+    diagnostics = {
+        "tier_counts": get_memory_tier_counts(user_id, guild_id),
+        "effective_prompt_budget": limits["prompt_budget"],
+        "adaptive_multiplier": limits["multiplier"],
+        "adaptive_reasons": limits["reasons"],
+        "route_surface": {"route_mode": route_mode, "channel_policy": policy},
+        "visibility": limits["visibility"],
+        "included": {"short": 0, "medium": 0, "long": 0},
+        "skipped": defaultdict(int),
+    }
 
+    if tier_rows:
+        allow_private = limits["visibility"] in {"internal", "operator_only"}
+        visible_rows = []
+        for r in tier_rows:
+            if _memory_row_public_safe(r) or allow_private:
+                visible_rows.append(r)
+            else:
+                diagnostics["skipped"]["visibility_boundary"] += 1
+        topic = limits["topic_key"]
+        if user_text and topic == "general" and not any(k in (user_text or "").lower() for k in ("remember", "source file", "dossier", "project", "queue", "memory")):
+            visible_rows = [r for r in visible_rows if r[0] == "long" and float(r[2] or 0) >= 0.8]
+            diagnostics["skipped"]["simple_or_new_topic_relevance"] += max(0, len(tier_rows) - len(visible_rows))
+        ranked = sorted(visible_rows, key=lambda r: (_memory_row_relevance(r, topic, user_text), r[0] == "short"), reverse=True)
+        tier_limits = {"short": 6 if limits["visibility"] == "public_safe" else 10, "medium": 4 if limits["visibility"] == "public_safe" else 8, "long": 3 if limits["visibility"] == "public_safe" else 6}
+        selected = {"short": [], "medium": [], "long": []}
+        used = 0
+        for r in ranked:
+            tier = r[0]
+            if tier not in selected or len(selected[tier]) >= tier_limits[tier]:
+                diagnostics["skipped"]["tier_count_or_budget"] += 1
+                continue
+            line = f"- {r[1]}"
+            if used + len(line) > limits["prompt_budget"]:
+                diagnostics["skipped"]["prompt_budget"] += 1
+                continue
+            selected[tier].append(r); used += len(line)
+        tier_lines = []
+        labels = {"short": "Relevant short-term traces", "medium": "Relevant medium topic summaries", "long": "Relevant long-term memory"}
+        for tier in ("short", "medium", "long"):
+            if selected[tier]:
+                diagnostics["included"][tier] = len(selected[tier])
+                tier_lines.append(labels[tier] + ":\n" + "\n".join([f"- {r[1]}" for r in selected[tier]]))
+        if any(not _memory_row_public_safe(r) for r in tier_rows):
+            tier_lines.append("Private/legacy memory boundary: non-public-safe rows were not injected into public context." if limits["visibility"] == "public_safe" else "Private/legacy memory available only on internal/operator-safe routes.")
+        if tier_lines:
+            sections.append("\n".join(tier_lines))
+    diagnostics["skipped"] = dict(diagnostics["skipped"])
+    LAST_MEMORY_PROMPT_DIAGNOSTICS[(user_id, guild_id)] = diagnostics
     return "\n".join(sections) if sections else "No durable memory yet."
+
+
+def build_memory_diagnostic_snapshot(user_id: int, guild_id: int, route_mode: str = ROUTE_MODE_NORMAL_CHAT, channel_policy: str = "unknown", user_text: str = "", is_owner_or_mod: bool = False) -> dict:
+    limits = calculate_adaptive_memory_limits(user_id, guild_id, route_mode=route_mode, channel_policy=channel_policy, user_text=user_text, is_owner_or_mod=is_owner_or_mod)
+    return {
+        "configured_limits": _memory_lifecycle_config(),
+        "effective_limits": limits,
+        "conversation_rows_retained": get_recent_conversation_count(user_id, guild_id, limit=CONVERSATION_ROWS_PER_USER_MAX),
+        "tier_counts": get_memory_tier_counts(user_id, guild_id),
+        "source_summary": get_memory_source_summary(user_id, guild_id),
+        "last_consolidation_result": LAST_MEMORY_LIFECYCLE_RESULT.get((user_id, guild_id), {}),
+        "recent_skip_reasons": dict(LAST_MEMORY_SKIP_REASONS),
+        "prompt_diagnostics": LAST_MEMORY_PROMPT_DIAGNOSTICS.get((user_id, guild_id), {}),
+    }
+
 
 def log_response_style(guild_id: int, user_id: int, style_key: str):
     conn = sqlite3.connect(DB_FILE)
@@ -14655,7 +14860,7 @@ def build_user_aware_prompt(
     permission_privileged = bool(privileged)
     prompt_operator_authority = permission_privileged and is_operator_authority_context(channel_policy, channel_name)
     public_identity_context = is_public_prompt_context(channel_policy)
-    memory_context = build_user_memory_context(user_id, guild_id, route_mode=route_mode, channel_policy=channel_policy)
+    memory_context = build_user_memory_context(user_id, guild_id, route_mode=route_mode, channel_policy=channel_policy, user_text=clean_content, is_owner_or_mod=prompt_operator_authority)
     broadcast_context = build_broadcast_memory_context(
         guild_id,
         clean_content,
@@ -17068,6 +17273,7 @@ async def bnl_memory_check(interaction: discord.Interaction):
     role_counts = get_guild_role_counts(guild.id)
     unknown_policy_model_rows = get_unknown_policy_model_row_count(guild.id)
     tier_counts = get_memory_tier_counts(interaction.user.id, guild.id)
+    adaptive_memory = build_memory_diagnostic_snapshot(interaction.user.id, guild.id, route_mode=ROUTE_MODE_NORMAL_CHAT, channel_policy=policy, user_text="", is_owner_or_mod=True)
     source_summary = get_memory_source_summary(interaction.user.id, guild.id)
     memory_source_fields_available = memory_tiers_has_source_fields()
     memory_tier_source_policy_state = "source-gated" if memory_source_fields_available else "source fields unavailable"
@@ -17104,9 +17310,15 @@ async def bnl_memory_check(interaction: discord.Interaction):
         f"- role_count_user: `{role_counts.get('user', 0)}`",
         f"- role_count_model: `{role_counts.get('model', 0)}`",
         f"- unknown_policy_model_rows: `{unknown_policy_model_rows}`",
+        f"- memory_configured_limits: `{adaptive_memory.get('configured_limits', {})}`",
+        f"- memory_effective_limits: `{adaptive_memory.get('effective_limits', {})}`",
+        f"- memory_conversation_rows_retained: `{adaptive_memory.get('conversation_rows_retained', 0)}`",
         f"- memory_tier_count_short: `{tier_counts.get('short', 0)}`",
         f"- memory_tier_count_medium: `{tier_counts.get('medium', 0)}`",
         f"- memory_tier_count_long: `{tier_counts.get('long', 0)}`",
+        f"- memory_last_consolidation_result: `{adaptive_memory.get('last_consolidation_result', {})}`",
+        f"- memory_prompt_diagnostics: `{adaptive_memory.get('prompt_diagnostics', {})}`",
+        f"- memory_recent_skip_reasons: `{adaptive_memory.get('recent_skip_reasons', {})}`",
         f"- memory_tiers_source_fields_available: `{'yes' if memory_source_fields_available else 'no'}`",
         f"- memory_source_trust_counts: `{source_summary.get('trust_counts', {})}`",
         f"- memory_source_policy_counts: `{source_summary.get('policy_counts', {})}`",
