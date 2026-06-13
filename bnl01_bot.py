@@ -7162,6 +7162,22 @@ def is_member_activity_request(text: str) -> bool:
     return False
 
 
+
+
+def is_explicit_public_operator_command(text: str) -> bool:
+    normalized = re.sub(r"\s+", " ", (text or "").lower().replace("broadcast-memory", "broadcast memory")).strip()
+    if not normalized:
+        return False
+    explicit_patterns = (
+        r"\bclassify this\b", r"\bfile this\b", r"\bsort this into lanes\b",
+        r"\bmake this (?:a |an )?(?:broadcast memory|dossier seed|recap candidate)\b",
+        r"\bmake (?:a |an )?(?:broadcast memory|dossier seed|recap candidate)\b",
+        r"\bturn this into (?:a |an )?(?:broadcast memory entry|dossier seed|recap candidate)\b",
+        r"\brecord this for broadcast memory\b", r"\bflag this for recap\b",
+        r"\bwhat lane does this belong in\b", r"\bwhat should go to broadcast memory\b",
+    )
+    return any(re.search(pattern, normalized) for pattern in explicit_patterns)
+
 def detect_rd_ops_intent(text: str) -> str:
     """Classify R&D operator asks so concrete draft requests do not fall into generic briefs."""
     if is_member_activity_request(text):
@@ -11426,6 +11442,33 @@ SOURCE_AUTHORITY_CLAIM_PATTERNS = (
     r"\bsystem records? indicate\b",
 )
 
+
+
+def _source_authority_context_available(*contexts) -> bool:
+    return any(bool((ctx or "").strip()) for ctx in contexts)
+
+def _contains_unsupported_source_authority_claim(text: str) -> bool:
+    lowered = (text or "").lower()
+    extra_patterns = (
+        r"\bnetwork confirms\b", r"\barchive confirms\b", r"\brecords? confirms?\b",
+        r"\brecords? (?:show|indicate)\b", r"\barchive (?:shows|indicates|confirms)\b",
+        r"\bverified logs?\b", r"\barchive scans?\b",
+    )
+    return any(re.search(pattern, lowered) for pattern in tuple(SOURCE_AUTHORITY_CLAIM_PATTERNS) + extra_patterns)
+
+def apply_fake_archive_certainty_guard(response: str, *, source_context_available: bool) -> tuple[str, bool]:
+    if source_context_available or not _contains_unsupported_source_authority_claim(response or ""):
+        return response or "", False
+    logging.info("fake_archive_certainty_guard_triggered source_context_available=0")
+    return "I do not have a reliable record for that.", True
+
+def _response_contains_direct_question_to_user(text: str) -> bool:
+    cleaned = (text or "").strip()
+    if not cleaned:
+        return False
+    if cleaned.rstrip().endswith("?"):
+        return True
+    return bool(re.search(r"\b(?:what|which|how|why|where|when|who)\b[^.?!]{0,120}\b(?:you|your|you'd|you would|do you|are you|can you)\b[^.?!]*\?", cleaned, re.IGNORECASE))
 UNSUPPORTED_MEDIA_GROUNDING_BASIS_PATTERNS = (
     r"\bfragmented archive data\b",
     r"\bcore memory\b",
@@ -13192,20 +13235,23 @@ def _detect_request_payload_expectation(text: str):
     t = (text or "").strip().lower()
     if not t:
         return False, "empty"
+    # Payload completion is only for clear list-shaped requests. Do not treat
+    # ordinary conversation using "about"/"for" as a payload task.
     patterns = [
-        r"\bremember these\b", r"\bthese names\b", r"\btell me a joke about them\b",
-        r"\btell me a joke about each\b", r"\babout each\b", r"\bfor each\b",
-        r"\blist\b", r"\bnames\b", r"\beach of these\b", r"\bfollowing\b",
-        r"\bbelow\b", r"\bhere are\b", r"\bgive me one for each\b", r"\bmake one for each\b",
-        r"\bthese people\b", r"\bthose people\b", r"\bthese characters\b", r"\bthose characters\b",
-        r"\bthese folks\b", r"\bthose folks\b", r"\bjoke about these people\b", r"\bjoke about them\b",
-        r"\bjoke about these\b", r"\babout these people\b", r"\babout those people\b", r"\babout them\b",
-        r"\babout these\b", r"\bthis list\b", r"\bthese entries\b", r"\bthese items\b",
+        r"\bremember these\b", r"\bthese (?:names|items|people|characters|folks|entries)\b",
+        r"\bthose (?:names|items|people|characters|folks|entries)\b",
+        r"\b(?:for|about) each\b", r"\beach of these\b", r"\beach of the following\b",
+        r"\b(?:the )?following(?: names| items| people| list| entries)?\b",
+        r"\b(?:this|the) list\b", r"\bmultiline request payload\b",
+        r"\bgive me one for each\b", r"\bmake one for each\b",
+        r"\bjoke about (?:each|these people|these names|these items)\b",
+        r"\bhere are (?:the )?(?:names|items|people|entries)\b",
     ]
     for pat in patterns:
         if re.search(pat, t):
             return True, pat
-    return False, "none"
+    logging.debug("payload_extraction_skipped_normal_conversation reason=no_list_shape")
+    return False, "normal_conversation"
 
 
 def _is_split_request_anchor(previous_text: str, current_text: str):
@@ -13569,7 +13615,12 @@ def _should_force_free_speak_continuation_answer(
             awaiting_until = state.get("awaiting_retransmission_until") if state else None
             if awaiting_until and datetime.now(timezone.utc) <= awaiting_until:
                 latch_user_ids.append(uid)
-        if _is_recent_conversation_continuation(guild_id, channel_id, uid) or _is_recent_direct_followup(channel_id, uid):
+        state = _get_conversation_continuation_state(guild_id, channel_id, uid)
+        answer_until = state.get("awaiting_answer_until") if state else None
+        if answer_until and datetime.now(timezone.utc) <= answer_until:
+            continuation_user_ids.append(uid)
+            logging.info("conversational_continuation_detected reason=bnl_question_answer_window guild_id=%s channel_id=%s user_id=%s", guild_id, channel_id, uid)
+        elif _is_recent_conversation_continuation(guild_id, channel_id, uid) or _is_recent_direct_followup(channel_id, uid):
             continuation_user_ids.append(uid)
     if latch_user_ids and _items_have_substantive_conversation(items):
         return True, "retransmission_latch_used"
@@ -13901,22 +13952,13 @@ def _is_simple_humor_or_list_request(combined_text: str, payload_count: int) -> 
     return humor_cues or list_cues
 
 
-def _build_payload_fallback_lines(missing_items):
-    def _sanitize_fallback_item(text: str):
-        # Prevent @everyone/@here/user/role mention expansion in fallback lines.
-        return (text or "").replace("@", "@\u200b")
+def _sanitize_payload_item_for_log(text: str):
+    # Prevent @everyone/@here/user/role mention expansion in diagnostic text.
+    return (text or "").replace("@", "@\u200b")
 
-    lines = []
-    for item in missing_items:
-        cleaned = (item or "").strip()
-        if not cleaned:
-            continue
-        safe_item = _sanitize_fallback_item(cleaned)
-        lines.append(
-            safe_item + ": Records are thin, but the Network confirms one thing: "
-            + safe_item + " has already caused at least one suspicious blinking light."
-        )
-    return "\n".join(lines)
+def _build_payload_fallback_lines(missing_items):
+    # Deprecated for conversational routes: never synthesize missing payload content.
+    return ""
 
 async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_state=None):
     channel_id = channel.id
@@ -14326,19 +14368,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                     directness="request_intent" if reason.startswith("request_intent:") else ("plain_name_call" if active_packet.get("addressed_to_bot") else "batch_answer"),
                     result=latest_result,
                 )
-                if should_send_generation_fallback(generation_route, decision, reason, request_intent=reason.startswith("request_intent:")):
-                    sent = await send_generation_fallback(
-                        channel,
-                        route=generation_route,
-                        channel_policy=channel_policy,
-                        conversation_surface=conversation_surface_for_channel_policy(channel_policy, channel_id == get_guild_config(guild_id)),
-                        directness="request_intent" if reason.startswith("request_intent:") else "batch_answer",
-                        allowed_mentions=safe_mentions,
-                    )
-                    if sent:
-                        _channel_last_reply_at[channel_id] = datetime.now(PACIFIC_TZ)
-                else:
-                    logging.info("response_fallback_skipped route=%s reason=%s", generation_route, reason or "no_response_needed")
+                logging.info("response_suppressed_no_fallback route=%s reason=%s", generation_route, reason or "generation_failed")
                 return
 
             payload_items = list(active_packet["payload_items"])
@@ -14367,10 +14397,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                     if not missing_items:
                         _log_batch_event(logging.INFO, "active_packet_completion_passed", guild_id, channel_id, len(payload_items), "after_regeneration")
                     else:
-                        fallback_lines = _build_payload_fallback_lines(missing_items)
-                        if fallback_lines:
-                            response = response.rstrip() + "\n\n" + fallback_lines
-                            _log_batch_event(logging.INFO, "active_packet_completion_fallback_appended", guild_id, channel_id, len(collapsed_items), f"payload_count={len(payload_items)};missing_count={len(missing_items)}")
+                        _log_batch_event(logging.INFO, "payload_completion_incomplete_unpatched", guild_id, channel_id, len(collapsed_items), f"payload_count={len(payload_items)};missing_count={len(missing_items)};decision={decision};reason={reason}")
                         _log_batch_event(logging.INFO, "active_packet_completion_incomplete_after_retry", guild_id, channel_id, len(collapsed_items), f"payload_count={len(payload_items)};decision={decision};reason={reason}")
                 else:
                     _log_batch_event(logging.INFO, "active_packet_completion_passed", guild_id, channel_id, len(payload_items), "initial")
@@ -14636,6 +14663,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
             ack_escalated_to_generation=bool(locals().get("ack_diag", {}).get("ack_escalated_to_generation", False)),
         )
 
+        response, archive_guard_triggered = apply_fake_archive_certainty_guard(response or "", source_context_available=bool(active_packet.get("media_context_included")))
         try:
             if len(response) <= 2000:
                 await channel.send(response, allowed_mentions=safe_mentions)
@@ -14650,7 +14678,9 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
             return
         _log_batch_event(logging.INFO, "response_send_commit_complete", guild_id, channel_id, len(items), f"generation_id={local_generation_id}")
         for uid in unique_user_ids:
-            _mark_conversation_continuation_state(guild_id, channel_id, uid)
+            _mark_conversation_continuation_state(guild_id, channel_id, uid, awaiting_answer=_response_contains_direct_question_to_user(response))
+            if _response_contains_direct_question_to_user(response):
+                logging.info("bnl_question_answer_window_set guild_id=%s channel_id=%s user_id=%s ttl_seconds=%s", guild_id, channel_id, uid, BNL_QUESTION_ANSWER_TTL_SECONDS)
             if _response_requests_retransmission(response):
                 _mark_awaiting_retransmission(guild_id, channel_id, uid)
         if active_packet.get("media_present"):
@@ -15033,7 +15063,8 @@ def _collect_inline_direct_payload_items(clean_content: str):
     if multiline:
         payload_items.extend(multiline.get("payload_items", []))
     if not payload_items:
-        inline_match = re.search(r"\b(?:about|for)\s+(.+)$", clean_content, re.IGNORECASE)
+        payload_expected, _payload_reason = _detect_request_payload_expectation(clean_content)
+        inline_match = re.search(r"\b(?:about|for)\s+(.+)$", clean_content, re.IGNORECASE) if payload_expected else None
         if inline_match:
             candidate_text = inline_match.group(1).strip().rstrip(".!?")
             candidate_text = re.sub(r"^\b(?:these|the|those)\s+(?:people|names|items)\b\s*", "", candidate_text, flags=re.IGNORECASE).strip()
@@ -15118,6 +15149,7 @@ _rd_ops_channel_context_buffer = defaultdict(lambda: deque(maxlen=RD_OPS_CHANNEL
 _recent_direct_response_window = {}
 DIRECT_FOLLOWUP_WINDOW_SECONDS = 60
 CONVERSATION_CONTINUATION_TTL_SECONDS = max(60, int(os.getenv("BNL_CONVERSATION_CONTINUATION_TTL_SECONDS", "180") or 180))
+BNL_QUESTION_ANSWER_TTL_SECONDS = max(60, int(os.getenv("BNL_QUESTION_ANSWER_TTL_SECONDS", "1200") or 1200))
 CONVERSATION_RETRANSMISSION_TTL_SECONDS = max(60, int(os.getenv("BNL_RETRANSMISSION_LATCH_TTL_SECONDS", "180") or 180))
 _conversation_continuation_state = {}
 
@@ -15130,7 +15162,7 @@ def _mark_recent_direct_response(channel_id: int, user_id: int):
     _recent_direct_response_window[(channel_id, user_id)] = datetime.now(timezone.utc)
 
 
-def _mark_conversation_continuation_state(guild_id: int, channel_id: int, user_id: int, *, awaiting_retransmission: bool = False):
+def _mark_conversation_continuation_state(guild_id: int, channel_id: int, user_id: int, *, awaiting_retransmission: bool = False, awaiting_answer: bool = False):
     if not channel_id or not user_id:
         return
     now = datetime.now(timezone.utc)
@@ -15142,6 +15174,8 @@ def _mark_conversation_continuation_state(guild_id: int, channel_id: int, user_i
     })
     if awaiting_retransmission:
         state["awaiting_retransmission_until"] = now + timedelta(seconds=CONVERSATION_RETRANSMISSION_TTL_SECONDS)
+    if awaiting_answer:
+        state["awaiting_answer_until"] = now + timedelta(seconds=BNL_QUESTION_ANSWER_TTL_SECONDS)
     _conversation_continuation_state[key] = state
     _mark_recent_direct_response(channel_id, user_id)
 
@@ -15165,11 +15199,14 @@ def _get_conversation_continuation_state(guild_id: int, channel_id: int, user_id
     now = datetime.now(timezone.utc)
     live_until = state.get("live_exchange_until")
     awaiting_until = state.get("awaiting_retransmission_until")
-    if (not live_until or now > live_until) and (not awaiting_until or now > awaiting_until):
+    answer_until = state.get("awaiting_answer_until")
+    if (not live_until or now > live_until) and (not awaiting_until or now > awaiting_until) and (not answer_until or now > answer_until):
         _conversation_continuation_state.pop(key, None)
         return None
     if awaiting_until and now > awaiting_until:
         state.pop("awaiting_retransmission_until", None)
+    if answer_until and now > answer_until:
+        state.pop("awaiting_answer_until", None)
     return state
 
 
@@ -15392,10 +15429,7 @@ async def _generate_direct_payload_session(session_key, reason: str):
             logging.info(f"direct_payload_completion_missing_strict missing_count={len(missing_items)}")
             logging.info(f"direct_payload_completion_regenerated missing_count={len(missing_items)}")
             if missing_items:
-                fallback_lines = _build_payload_fallback_lines(missing_items)
-                if fallback_lines:
-                    response = ((response or "").strip() + "\n\n" + fallback_lines).strip()
-                    logging.info(f"direct_payload_completion_fallback_appended missing_count={len(missing_items)}")
+                logging.info(f"payload_completion_incomplete_unpatched missing_count={len(missing_items)} route=direct_payload_session")
 
     response = suppress_stale_media_fallback(
         response,
@@ -15413,9 +15447,8 @@ async def _generate_direct_payload_session(session_key, reason: str):
         channel_policy_for_fallback = session.get("channel_policy", "unknown")
         surface = conversation_surface_for_channel_policy(channel_policy_for_fallback, False)
         log_response_generation_failed(route="direct_payload_session", channel=channel, channel_policy=channel_policy_for_fallback, conversation_surface=surface, directness="request_intent", result=result)
-        fallback_response_sent = await send_generation_fallback(channel, route="direct_payload_session", channel_policy=channel_policy_for_fallback, conversation_surface=surface, directness="request_intent", reply_to=anchor_message)
-        if not fallback_response_sent:
-            session["generating"] = False
+        logging.info("response_suppressed_no_fallback route=%s reason=generation_failed", "direct_payload_session")
+        session["generating"] = False
         return
     logging.info(f"direct_session_pre_send_grace_started revision={generation_revision} payload_count={payload_count}")
     await asyncio.sleep(DIRECT_PRE_SEND_GRACE_SECONDS)
@@ -15533,12 +15566,17 @@ async def send_planned_conversation_response(
     if plan.response_timing == RESPONSE_TIMING_PACED_DIRECT:
         await _apply_direct_response_pacing(payload_expected, payload_count)
 
+    response, archive_guard_triggered = apply_fake_archive_certainty_guard(
+        response or "",
+        source_context_available=_source_authority_context_available(website_read_model_context, source_context_block),
+    )
     response, guard_triggered = apply_response_mode_contamination_guard(
         response or "",
         plan.route_mode,
         getattr(message.author, "display_name", ""),
         getattr(message, "content", ""),
     )
+    guard_triggered = bool(guard_triggered or archive_guard_triggered)
     model_decision = MemoryWriteDecision(
         False,
         False,
@@ -15622,7 +15660,14 @@ async def send_planned_conversation_response(
         logging.error("response_send_failed route=%s channel_id=%s discord_error_type=%s", plan.route_mode, getattr(message.channel, "id", 0), type(exc).__name__)
         return model_decision
     if mark_recent_direct:
-        _mark_conversation_continuation_state(message.guild.id, message.channel.id, message.author.id)
+        _mark_conversation_continuation_state(
+            message.guild.id,
+            message.channel.id,
+            message.author.id,
+            awaiting_answer=_response_contains_direct_question_to_user(response),
+        )
+        if _response_contains_direct_question_to_user(response):
+            logging.info("bnl_question_answer_window_set guild_id=%s channel_id=%s user_id=%s ttl_seconds=%s", message.guild.id, message.channel.id, message.author.id, BNL_QUESTION_ANSWER_TTL_SECONDS)
         if _response_requests_retransmission(response):
             _mark_awaiting_retransmission(message.guild.id, message.channel.id, message.author.id)
     return model_decision
@@ -15935,7 +15980,7 @@ async def on_message(message: discord.Message):
             await message.reply("Operations briefings are restricted to BARCODE operators and mods.")
             return
         if not clean_content:
-            await message.reply("Tag me with what you need: operations brief, mod actions, recap hooks, or dossier seed suggestions.")
+            logging.info("empty_direct_target_suppressed guild_id=%s channel_id=%s user_id=%s route=rd_ops", message.guild.id, message.channel.id, message.author.id)
             return
         previous_rd_context = _get_recent_rd_ops_context(message)
         rd_channel_context = _get_recent_rd_ops_channel_context(message)
@@ -16070,14 +16115,13 @@ async def on_message(message: discord.Message):
 
     if real_direct_target and is_public_prompt_context(channel_policy):
         public_rd_intent = detect_rd_ops_intent(clean_content)
-        if public_rd_intent in {
+        if is_explicit_public_operator_command(clean_content) and public_rd_intent in {
             "broadcast_memory_draft", "implementation_guidance", "dossier_seed_draft", "recap_candidate",
             "action_items", "rd_source_channel_recap", "rd_mod_recap", "rd_followup_classifier",
             "website_read_model_classifier", "website_broadcast_memory_candidate",
             "website_dossier_seed_candidate", "website_recap_candidate", "website_public_safe_candidate",
         }:
-            await message.reply("That is an operator workflow. I can answer public queue/site questions here, but classification into broadcast memory, dossier seeds, or recap candidates belongs in #research-and-development.")
-            _mark_recent_direct_response(message.channel.id, message.author.id)
+            logging.info("public_operator_workflow_suppressed guild_id=%s channel_id=%s user_id=%s intent=%s", message.guild.id, message.channel.id, message.author.id, public_rd_intent)
             return
 
     session_key = _direct_session_key(message)
@@ -16182,7 +16226,7 @@ async def on_message(message: discord.Message):
     # ---------------- ACTIVE CHANNEL ----------------
     if should_handle_as_active_channel:
         if not conversation_content and message_should_enter_conversation:
-            await message.reply("You pinged me. How may I assist with BARCODE operations?")
+            logging.info("empty_direct_target_suppressed guild_id=%s channel_id=%s user_id=%s route=active_channel", message.guild.id, message.channel.id, message.author.id)
             return
         if not conversation_content:
             return
@@ -16386,10 +16430,7 @@ async def on_message(message: discord.Message):
                     logging.info(f"direct_payload_completion_regenerated missing_count={len(missing_items)}")
                     if missing_items:
                         response = (response or "").strip()
-                        fallback_lines = _build_payload_fallback_lines(missing_items)
-                        if fallback_lines:
-                            response = (response + "\n\n" + fallback_lines).strip() if response else fallback_lines
-                            logging.info(f"direct_payload_completion_fallback_appended missing_count={len(missing_items)}")
+                        logging.info(f"payload_completion_incomplete_unpatched missing_count={len(missing_items)} route=direct_conversation")
             logging.info(f"direct_payload_generation_complete payload_count={len(direct_payload_items)}")
 
             response = suppress_stale_media_fallback(
@@ -16405,7 +16446,9 @@ async def on_message(message: discord.Message):
                 if show_state_ctx:
                     response = "The current broadcast-memory note marks that BARCODE Radio slot as unavailable."
                 else:
-                    await message.reply("[NETWORK ERROR] Temporary synchronization issue. Try again.")
+                    result = GenerationResult(False, "", _last_generation_status.get("error_category") or GENERATION_ERROR_PROVIDER_UNKNOWN, _last_generation_status.get("provider_error_code") or "", "", show_state_route, 0.0, GEMINI_MODEL)
+                    log_response_generation_failed(route=show_state_route, channel=message.channel, channel_policy=channel_policy, conversation_surface=conversation_surface, directness="real_direct_target" if real_direct_target else "request_intent", result=result)
+                    logging.info("response_suppressed_no_fallback route=%s reason=generation_failed", show_state_route)
                     return
 
             if allow_greeting:
@@ -16628,10 +16671,7 @@ async def on_message(message: discord.Message):
                 logging.info(f"direct_payload_completion_regenerated missing_count={len(missing_items)}")
                 if missing_items:
                     response = (response or "").strip()
-                    fallback_lines = _build_payload_fallback_lines(missing_items)
-                    if fallback_lines:
-                        response = (response + "\n\n" + fallback_lines).strip() if response else fallback_lines
-                        logging.info(f"direct_payload_completion_fallback_appended missing_count={len(missing_items)}")
+                    logging.info(f"payload_completion_incomplete_unpatched missing_count={len(missing_items)} route=direct_conversation")
         logging.info(f"direct_payload_generation_complete payload_count={len(direct_payload_items)}")
 
         response = suppress_stale_media_fallback(
@@ -16649,7 +16689,7 @@ async def on_message(message: discord.Message):
             else:
                 result = GenerationResult(False, "", _last_generation_status.get("error_category") or GENERATION_ERROR_PROVIDER_UNKNOWN, _last_generation_status.get("provider_error_code") or "", "", show_state_route, 0.0, GEMINI_MODEL)
                 log_response_generation_failed(route=show_state_route, channel=message.channel, channel_policy=channel_policy, conversation_surface=conversation_surface, directness="real_direct_target" if real_direct_target else ("plain_text_name_seen" if plain_text_name_seen else "request_intent"), result=result)
-                await send_generation_fallback(message.channel, route=show_state_route, channel_policy=channel_policy, conversation_surface=conversation_surface, directness="real_direct_target" if real_direct_target else "request_intent", reply_to=message)
+                logging.info("response_suppressed_no_fallback route=%s reason=generation_failed", show_state_route)
                 return
 
         if allow_greeting:
@@ -16671,7 +16711,7 @@ async def on_message(message: discord.Message):
     # ---------------- NO ACTIVE CHANNEL SET (RESPOND TO MENTIONS/REPLIES ANYWHERE) ----------------
     if active_channel_id is None and message_should_enter_conversation:
         if not clean_content:
-            await message.reply("You pinged me. How may I assist with BARCODE operations?")
+            logging.info("empty_direct_target_suppressed guild_id=%s channel_id=%s user_id=%s route=direct_message", message.guild.id, message.channel.id, message.author.id)
             return
         direct_content, direct_payload_items = conversation_content, _collect_inline_direct_payload_items(clean_content)
         route_mode = classify_route_mode(direct_content, channel_policy, real_direct_target=real_direct_target, active_channel=False)
@@ -16836,10 +16876,7 @@ async def on_message(message: discord.Message):
                 logging.info(f"direct_payload_completion_regenerated missing_count={len(missing_items)}")
                 if missing_items:
                     response = (response or "").strip()
-                    fallback_lines = _build_payload_fallback_lines(missing_items)
-                    if fallback_lines:
-                        response = (response + "\n\n" + fallback_lines).strip() if response else fallback_lines
-                        logging.info(f"direct_payload_completion_fallback_appended missing_count={len(missing_items)}")
+                    logging.info(f"payload_completion_incomplete_unpatched missing_count={len(missing_items)} route=direct_conversation")
         logging.info(f"direct_payload_generation_complete payload_count={len(direct_payload_items)}")
 
         response = suppress_stale_media_fallback(
@@ -16857,7 +16894,7 @@ async def on_message(message: discord.Message):
             else:
                 result = GenerationResult(False, "", _last_generation_status.get("error_category") or GENERATION_ERROR_PROVIDER_UNKNOWN, _last_generation_status.get("provider_error_code") or "", "", show_state_route, 0.0, GEMINI_MODEL)
                 log_response_generation_failed(route=show_state_route, channel=message.channel, channel_policy=channel_policy, conversation_surface=conversation_surface, directness="real_direct_target" if real_direct_target else ("plain_text_name_seen" if plain_text_name_seen else "request_intent"), result=result)
-                await send_generation_fallback(message.channel, route=show_state_route, channel_policy=channel_policy, conversation_surface=conversation_surface, directness="real_direct_target" if real_direct_target else "request_intent", reply_to=message)
+                logging.info("response_suppressed_no_fallback route=%s reason=generation_failed", show_state_route)
                 return
 
         if allow_greeting:
