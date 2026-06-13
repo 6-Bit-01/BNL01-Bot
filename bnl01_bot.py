@@ -7284,6 +7284,18 @@ def detect_rd_ops_intent(text: str) -> str:
     )):
         return "action_items"
 
+    broadcast_memory_assessment_phrases = (
+        "is this appropriate for broadcast memory",
+        "does this belong in broadcast memory",
+        "should this be broadcast memory",
+        "is this worth remembering for the show",
+        "is this worth show memory",
+        "should this become show memory",
+        "does this belong in show memory",
+    )
+    if any(phrase in normalized for phrase in broadcast_memory_assessment_phrases):
+        return "broadcast_memory_assessment"
+
     concrete_draft_words = (
         "give me the prompt", "exact prompt", "exact text", "copy paste", "copy-paste",
         "write the", "draft", "make the", "turn this into", "what should i put",
@@ -7437,6 +7449,7 @@ def _get_recent_rd_ops_channel_context(message: discord.Message):
 
 def _rd_output_kind_for_intent(intent: str) -> str:
     mapping = {
+        "broadcast_memory_assessment": "broadcast-memory assessment",
         "broadcast_memory_draft": "broadcast-memory draft",
         "implementation_guidance": "implementation guidance",
         "dossier_seed_draft": "dossier seed",
@@ -7478,15 +7491,15 @@ def _rd_context_subject(previous_context) -> str:
 
 
 def _extract_rd_subject(text: str, previous_context=None) -> str:
-    raw = (text or "").strip()
+    raw = _extract_broadcast_memory_candidate_text(text, previous_context) or (text or "").strip()
     if re.search(r"\bsignal\s+witch\b", raw, flags=re.IGNORECASE):
         return "Signal Witch"
     # Prefer title-case entity spans, but avoid channel names and BNL itself.
-    ignored = {"BNL", "BNL 01", "BARCODE Network", "BARCODE Radio", "Discord", "R D", "No I"}
+    ignored = {"BNL", "BNL 01", "BARCODE Network", "BARCODE Radio", "Discord", "R D", "No I", "Does", "Is", "Should", "Copy", "Broadcast Memory"}
     candidates = re.findall(r"\b[A-Z][A-Za-z0-9]*(?:\s+[A-Z0-9][A-Za-z0-9]*){0,3}\b", raw)
     for candidate in candidates:
         cleaned = candidate.strip()
-        if cleaned not in ignored and not cleaned.startswith("Broadcast"):
+        if cleaned not in ignored and not cleaned.startswith("Broadcast") and cleaned.lower() not in {"does this", "is this", "should this"}:
             return cleaned
     prior = _rd_context_subject(previous_context)
     return prior or "this item"
@@ -7496,17 +7509,68 @@ def _rd_note_date(text: str) -> str:
     match = re.search(r"\b(20\d{2}-\d{2}-\d{2})\b", text or "")
     if match:
         return match.group(1)
-    return datetime.now(PACIFIC_TZ).date().isoformat()
+    return _recent_friday_pacific_for_note(text or "")
+
+
+_BROADCAST_MEMORY_META_PATTERNS = (
+    r"@?BNL(?:-?01)?",
+    r"<@!?\d+>",
+    r"\bis this appropriate for broadcast memory\??",
+    r"\bdoes this belong in broadcast memory\??",
+    r"\bshould this be broadcast memory\??",
+    r"\bis this worth remembering for the show\??",
+    r"\bshould this become show memory\??",
+    r"\bdoes this belong in show memory\??",
+    r"\bcopy[- ]paste (?:this )?(?:into|in) #?bnl-broadcast-memory\b",
+    r"\bcopy[- ]paste (?:note|text|entry)\b",
+    r"\bafter posting (?:this|that|it) there\b",
+    r"\bafter posting that there,?\s*BNL can treat it.*$",
+    r"\bBNL can treat it.*$",
+    r"\bwrite the broadcast memory note\s*:?",
+    r"\bgive me the copy[- ]paste note\s*:?",
+    r"\bturn this into a broadcast memory entry\s*:?",
+    r"\bbroadcast memory note\s*:?",
+)
+
+
+def _contains_broadcast_memory_meta_scaffold(text: str) -> bool:
+    lowered = (text or "").lower().replace("broadcast-memory", "broadcast memory")
+    return any(p in lowered for p in (
+        "does this belong", "is this appropriate", "should this be", "copy-paste", "copy paste",
+        "after posting", "bnl can treat", "broadcast memory?",
+    ))
+
+
+def _remove_broadcast_memory_meta_scaffold(text: str) -> str:
+    cleaned = text or ""
+    for pattern in _BROADCAST_MEMORY_META_PATTERNS:
+        cleaned = re.sub(pattern, " ", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" :;,.!?-")
+    return cleaned
+
+
+def _extract_broadcast_memory_candidate_text(text: str, previous_context=None) -> str:
+    current = re.sub(r"\s+", " ", (text or "").strip())
+    refers_back = bool(re.search(r"\b(this|that|the above|that note|that item|it)\b", current, flags=re.IGNORECASE))
+    cleaned_current = _remove_broadcast_memory_meta_scaffold(current)
+    if len(cleaned_current.split()) >= 4:
+        return cleaned_current
+    if refers_back:
+        previous = " ".join((entry.get("user_request") or "") for entry in (previous_context or [])[-2:])
+        cleaned_previous = _remove_broadcast_memory_meta_scaffold(previous)
+        if len(cleaned_previous.split()) >= 4:
+            return cleaned_previous
+    return cleaned_current
 
 
 def _rd_event_sentence(text: str, subject: str) -> str:
-    clean = re.sub(r"\s+", " ", (text or "").strip())
+    clean = _extract_broadcast_memory_candidate_text(text) or re.sub(r"\s+", " ", (text or "").strip())
     if subject.lower() == "signal witch" and re.search(r"\b(song|diss track|track)\b", clean, flags=re.IGNORECASE):
         return "Signal Witch posted a song calling out 6 Bit, the mods, Cliff, and the viewers for breaking BARCODE Network protocol."
     if clean:
         stripped = re.sub(r"^no\s+i\s+mean\s+", "", clean, flags=re.IGNORECASE)
         stripped = re.sub(r"^give me the prompt to (?:put into|introduce).*?(?:broadcast memory|bnl-broadcast-memory)\s*", "", stripped, flags=re.IGNORECASE).strip(" :.-")
-        if stripped and len(stripped.split()) >= 5:
+        if stripped and len(stripped.split()) >= 5 and not _contains_broadcast_memory_meta_scaffold(stripped):
             return stripped[:260].rstrip(" .") + "."
     return f"{subject} was raised by operators as a possible broadcast-memory item."
 
@@ -7518,7 +7582,7 @@ def _infer_broadcast_memory_type(text: str, subject: str) -> str:
         "antagonistic outside voice", "episode arc", "breaking barcode network protocol",
     )):
         return "episode_arc"
-    if "running joke" in combined:
+    if "running joke" in combined or any(k in combined for k in ("keeps trying", "keeps asking", "recurring joke", "bit keeps")):
         return "running_joke"
     if any(k in combined for k in ("timeout", "ban", "moderation")):
         return "moderation_context"
@@ -7528,9 +7592,10 @@ def _infer_broadcast_memory_type(text: str, subject: str) -> str:
 
 
 def _build_broadcast_memory_note(text: str, previous_context=None) -> str:
-    previous_text = " ".join((entry.get("user_request") or "") for entry in (previous_context or [])[-2:])
-    combined = (previous_text + " " + (text or "")).strip()
-    subject = _extract_rd_subject(text, previous_context)
+    combined = _extract_broadcast_memory_candidate_text(text, previous_context)
+    if len((combined or "").split()) < 4:
+        return ""
+    subject = _extract_rd_subject(combined, previous_context)
     if subject == "this item":
         subject = _extract_rd_subject(combined, previous_context)
     note_date = _rd_note_date(combined)
@@ -7562,13 +7627,59 @@ def _build_broadcast_memory_note(text: str, previous_context=None) -> str:
     )
 
 
-def build_rd_broadcast_memory_draft_response(text: str, previous_context=None) -> str:
+def build_rd_broadcast_memory_draft_response(text: str, previous_context=None, existing_memory_context: str = "") -> str:
+    candidate = _extract_broadcast_memory_candidate_text(text, previous_context)
+    if _broadcast_memory_candidate_matches_existing(candidate, existing_memory_context):
+        return build_rd_broadcast_memory_assessment_response(text, previous_context, existing_memory_context)
     note = _build_broadcast_memory_note(text, previous_context)
+    if not note:
+        return build_rd_broadcast_memory_assessment_response(text, previous_context)
     return (
         "Copy-paste into #bnl-broadcast-memory:\n\n"
         f"```text\n{note}\n```\n\n"
         "After posting that there, BNL can treat it as official broadcast memory."
     )
+
+
+def _broadcast_memory_candidate_matches_existing(candidate: str, existing_memory_context: str = "") -> bool:
+    if not existing_memory_context or not candidate:
+        return False
+    key_terms = [t.lower() for t in re.findall(r"[A-Za-z][A-Za-z0-9_-]{3,}", candidate)[:8]]
+    return sum(1 for term in key_terms if term in existing_memory_context.lower()) >= 3
+
+
+def build_rd_broadcast_memory_assessment_response(text: str, previous_context=None, existing_memory_context: str = "") -> str:
+    candidate = _extract_broadcast_memory_candidate_text(text, previous_context)
+    subject = _extract_rd_subject(candidate, previous_context) if candidate else "this item"
+    note_type = _infer_broadcast_memory_type(candidate, subject) if candidate else "needs confirmation"
+    strong = bool(candidate and len(candidate.split()) >= 8 and not _contains_broadcast_memory_meta_scaffold(candidate))
+    duplicate = _broadcast_memory_candidate_matches_existing(candidate, existing_memory_context)
+    decision = "needs confirmation"
+    reason = "No clean show-memory payload remained after removing the R&D/broadcast-memory question."
+    next_action = "Add the actual show memory, then ask for assessment or a draft again."
+    if strong:
+        decision = "needs cleanup" if duplicate else "yes"
+        reason = "The cleaned text describes a stable show-running joke/event without relying on the operator's question."
+        next_action = "If approved, an operator can paste the clean note into #bnl-broadcast-memory."
+    if duplicate:
+        reason = "Possible duplicate/update. Use correction/update instead of new memory."
+        next_action = "Check the existing official memory and post a correction/update only if this changes it."
+    date_line = _extract_exact_episode_date(candidate) or _recent_friday_pacific_for_note(candidate) if candidate else "needs confirmation"
+    lines = [
+        f"Decision: {decision}",
+        f"Reason: {reason}",
+        f"Suggested type: {note_type}",
+        f"Clean memory candidate: {candidate or 'needs confirmation'}",
+        "Do not include: the R&D question, copy-paste instructions, #bnl-broadcast-memory meta text, or “BNL can treat it” language.",
+        f"Next action: {next_action}",
+    ]
+    if strong:
+        note = _build_broadcast_memory_note(candidate, previous_context)
+        if note:
+            if "Date: " not in note and date_line == "needs confirmation":
+                note = note.replace("Type:", "Date: needs confirmation\nType:", 1)
+            lines.extend(["", "Clean note draft, if operators approve:", "", f"```text\n{note}\n```"])
+    return "\n".join(lines)
 
 
 def build_rd_implementation_guidance_response(text: str, previous_context=None) -> str:
@@ -9834,6 +9945,10 @@ def _parse_usage_scope(value: str, public_safe: bool) -> str:
 def _strip_broadcast_memory_boundary_text(text: str) -> str:
     raw = text or ""
     without_sections = re.sub(r"\bBoundar(?:y|ies):.*?(?=(?:\n\s*\w[\w -]{0,40}:)|\Z)", " ", raw, flags=re.IGNORECASE | re.DOTALL)
+    before_meta = without_sections
+    without_sections = _remove_broadcast_memory_meta_scaffold(without_sections)
+    if without_sections != before_meta:
+        logging.info("broadcast_memory_summary_meta_scaffold_removed")
     pieces = re.split(r"(?<=[.!?])\s+|\n+", without_sections)
     boundary_starts = (
         "do not treat this as", "do not connect this to", "this is not", "not a live",
@@ -10292,6 +10407,13 @@ async def process_broadcast_memory_note(message) -> dict:
         public_value = (structured.get("public-safe") or "").strip().lower()
         public_safe = public_value in {"yes", "y", "true", "public", "public-safe", "1"}
         summary_body = re.sub(r"\s+", " ", (structured.get("summary") or "").strip())
+        if _contains_broadcast_memory_meta_scaffold(summary_body):
+            cleaned_summary_body = _remove_broadcast_memory_meta_scaffold(summary_body)
+            if len(cleaned_summary_body.split()) < 4:
+                logging.info("broadcast_memory_summary_meta_scaffold_rejected")
+                return {"entry_type": "reject", "reason": "summary is meta/R&D scaffold; include the actual show memory."}
+            logging.info("broadcast_memory_summary_meta_scaffold_removed")
+            summary_body = cleaned_summary_body
         title = re.sub(r"\s+", " ", (structured.get("title") or "").strip())
         classification_text = _strip_broadcast_memory_boundary_text(summary_body or text)
         classification_lowered = classification_text.lower()
@@ -10326,6 +10448,13 @@ async def process_broadcast_memory_note(message) -> dict:
         }
 
     classification_text = _strip_broadcast_memory_boundary_text(raw_content)
+    if _contains_broadcast_memory_meta_scaffold(classification_text):
+        cleaned_classification_text = _remove_broadcast_memory_meta_scaffold(classification_text)
+        if len(cleaned_classification_text.split()) < 4:
+            logging.info("broadcast_memory_summary_meta_scaffold_rejected")
+            return {"entry_type": "reject", "reason": "summary is meta/R&D scaffold; include the actual show memory."}
+        logging.info("broadcast_memory_summary_meta_scaffold_removed")
+        classification_text = cleaned_classification_text
     classification_lowered = re.sub(r"\s+", " ", classification_text.strip()).lower()
     entry_type = "notable_moment"
     if "running joke" in classification_lowered:
@@ -15146,6 +15275,8 @@ def _direct_session_key(message: discord.Message):
 _direct_payload_sessions = {}
 _rd_ops_context_buffer = defaultdict(lambda: deque(maxlen=RD_OPS_CONTEXT_MAX_TURNS))
 _rd_ops_channel_context_buffer = defaultdict(lambda: deque(maxlen=RD_OPS_CHANNEL_CONTEXT_MAX_TURNS))
+_broadcast_memory_denial_last_at = {}
+BROADCAST_MEMORY_DENIAL_COOLDOWN_SECONDS = 120
 _recent_direct_response_window = {}
 DIRECT_FOLLOWUP_WINDOW_SECONDS = 60
 CONVERSATION_CONTINUATION_TTL_SECONDS = max(60, int(os.getenv("BNL_CONVERSATION_CONTINUATION_TTL_SECONDS", "180") or 180))
@@ -15842,8 +15973,14 @@ async def on_message(message: discord.Message):
         member = message.author if isinstance(message.author, discord.Member) else message.guild.get_member(message.author.id)
         allowed = is_owner_operator(message.author) or has_mod_role(member) or is_privileged_member(member, message.guild)
         if not allowed:
+            logging.info("broadcast_memory_intake_denied user_id=%s channel_id=%s reason=permission", message.author.id, message.channel.id)
             if clean_content:
-                await message.reply("broadcast memory intake is mod-only.")
+                key = (getattr(message.guild, "id", 0) or 0, message.channel.id, message.author.id)
+                now = datetime.now(timezone.utc)
+                last = _broadcast_memory_denial_last_at.get(key)
+                if not last or (now - last).total_seconds() >= BROADCAST_MEMORY_DENIAL_COOLDOWN_SECONDS:
+                    _broadcast_memory_denial_last_at[key] = now
+                    await message.reply("Not stored. Broadcast memory is operator-only. Ask a mod/operator to repost this as an official note, or discuss it in the public/R&D lane first.")
             return
         if not clean_content:
             return
@@ -16006,8 +16143,13 @@ async def on_message(message: discord.Message):
         suggested_lane = "#research-and-development"
         source_channel_context = ""
         rd_read_model_context = ""
-        if rd_intent == "broadcast_memory_draft":
-            response = build_rd_broadcast_memory_draft_response(clean_content, previous_rd_context)
+        if rd_intent == "broadcast_memory_assessment":
+            existing_memory_context = build_broadcast_memory_context(message.guild.id, _extract_broadcast_memory_candidate_text(clean_content, previous_rd_context), channel_policy, is_owner_or_mod=True)
+            response = build_rd_broadcast_memory_assessment_response(clean_content, previous_rd_context, existing_memory_context)
+            suggested_lane = "#research-and-development"
+        elif rd_intent == "broadcast_memory_draft":
+            existing_memory_context = build_broadcast_memory_context(message.guild.id, _extract_broadcast_memory_candidate_text(clean_content, previous_rd_context), channel_policy, is_owner_or_mod=True)
+            response = build_rd_broadcast_memory_draft_response(clean_content, previous_rd_context, existing_memory_context)
             suggested_lane = "#bnl-broadcast-memory"
         elif rd_intent == "implementation_guidance":
             response = build_rd_implementation_guidance_response(clean_content, previous_rd_context)
