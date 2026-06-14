@@ -11,6 +11,8 @@ import re
 import sqlite3
 from typing import Any
 
+from bnl_subject_memory_resolver import resolve_subject_memory
+
 DRAFT_ENDPOINT_PATH = "/internal/dossiers/draft"
 DRAFT_TOKEN_HEADER = "X-BNL-DOSSIER-DRAFT-TOKEN"
 DRAFT_TOKEN_ENV = "BNL_DOSSIER_DRAFT_GENERATOR_TOKEN"
@@ -699,12 +701,12 @@ def _role_from_context(facts: list[str], notes: list[str], category: str, kind: 
         return "Sponsor record"
     if any(term in haystack for term in ("interface", "system", "tool", "tech")):
         return "Systems interface"
-    if any(term in haystack for term in ("producer", "production", "broadcast", "radio")):
-        if any(term in evidence_haystack for term in ("producer", "production", "broadcast", "radio")) or any(term in classification_haystack for term in ("producer", "production", "broadcast", "radio")):
-            return "Production collaborator"
     if any(term in haystack for term in ("artist", "music", "musician", "track", "album", "song", "dj")):
         if any(term in evidence_haystack for term in ("artist", "music", "musician", "track", "album", "song", "dj")) or any(term in classification_haystack for term in ("artist", "music")):
             return "Music artist"
+    if any(term in haystack for term in ("producer", "production", "broadcast", "radio")):
+        if any(term in evidence_haystack for term in ("producer", "production", "broadcast", "radio")) or any(term in classification_haystack for term in ("producer", "production", "broadcast", "radio")):
+            return "Production collaborator"
     if "collaborator" in haystack:
         return "Community collaborator"
     if any(term in haystack for term in ("community", "server", "participant", "member")):
@@ -859,6 +861,7 @@ def generate_dossier_draft(packet: dict[str, Any], db_path: str | None = None, p
             clean_public_notes.append(note)
     public_notes = clean_public_notes
     evidence: dict[str, Any] | None = None
+    resolver: dict[str, Any] | None = None
     try:
         evidence = build_public_dossier_draft_evidence(packet, db_path, public_read_model=public_read_model)
         evidence_texts: list[str] = []
@@ -880,12 +883,38 @@ def generate_dossier_draft(packet: dict[str, Any], db_path: str | None = None, p
         rejected_facts.extend(evidence_rejected)
     except Exception:
         evidence = None
+    if db_path:
+        try:
+            _, resolver_aliases = _subject_terms(packet)
+            resolver = resolve_subject_memory(name, db_path, aliases=resolver_aliases)
+            resolver_texts: list[str] = []
+            for key in (
+                "publicSafeFacts",
+                "publicSafeNotes",
+                "publicRoleSignals",
+                "publicCreativeMusicSignals",
+                "publicCommunitySignals",
+                "publicLinkSignals",
+                "relationshipOrContextSignals",
+            ):
+                resolver_texts.extend(_strings(resolver.get(key), max_items=8))
+            resolver_safe, resolver_rejected = _reject_unsafe_public(resolver_texts)
+            for item in resolver_safe:
+                if item not in public_facts:
+                    public_facts.append(item)
+            rejected_facts.extend(resolver_rejected)
+        except Exception:
+            resolver = None
     role = _role_from_context(public_facts, public_notes, category, kind, lane)[:_ROLE_LIMIT]
     thin = len(public_facts) + len(public_notes) < 2
 
     missing = _strings(packet.get("missingInfo"), max_items=8)
     if evidence:
         for item in _strings(evidence.get("missingInfoQuestions"), max_items=4):
+            if item not in missing:
+                missing.append(item)
+    if resolver:
+        for item in _strings(resolver.get("missingInfoQuestions"), max_items=4):
             if item not in missing:
                 missing.append(item)
     if thin:
@@ -904,6 +933,16 @@ def generate_dossier_draft(packet: dict[str, Any], db_path: str | None = None, p
             owner_warnings.append(item)
         for item in _strings(evidence.get("thinReasons"), max_items=3):
             owner_warnings.append(item)
+    if resolver:
+        counts = _dict(resolver.get("evidenceCounts"))
+        if counts:
+            owner_warnings.append(
+                f"BNL subject memory resolver scanned {int(counts.get('totalScanned') or 0)} candidate memories: "
+                f"{int(counts.get('publicSafe') or 0)} public-safe, {int(counts.get('reviewOnly') or 0)} review-needed, "
+                f"{int(counts.get('privateOrInternal') or 0) + int(counts.get('sourceBlind') or 0)} withheld."
+            )
+        for item in _strings(resolver.get("sourceSafetyWarnings"), max_items=3):
+            owner_warnings.append(item)
 
     rejected = rejected_facts + rejected_notes
     for unsafe_key in ("doNotSayNotes", "reviewOnlyWarnings", "forbiddenPublicCopyPatterns"):
@@ -918,6 +957,12 @@ def generate_dossier_draft(packet: dict[str, Any], db_path: str | None = None, p
         rejected.append("No unsafe supplied material was needed for public-facing fields.")
     if evidence and evidence.get("matchedAliasesUsedPrivately"):
         rejected.append("Used approved identity labels only as private matching hints; did not expose alias text in public fields.")
+    if resolver and resolver.get("matchedAliasesUsedPrivately"):
+        rejected.append("Used probable subject aliases only as private matching hints for BNL memory resolution; did not expose alias text in public fields.")
+    if resolver and _dict(resolver.get("evidenceCounts")).get("reviewOnly"):
+        rejected.append("BNL memory needing review was used only for owner-review metadata, not public dossier copy.")
+    if resolver and _dict(resolver.get("evidenceCounts")).get("sourceBlind"):
+        rejected.append("BNL memory without public-safe provenance was counted but not used as public dossier copy.")
     if evidence and evidence.get("publicDossierStyleGuidanceUsed"):
         rejected.append("Used public dossier examples for style and field shape only; unrelated example facts were not copied.")
 
@@ -952,6 +997,10 @@ def generate_dossier_draft(packet: dict[str, Any], db_path: str | None = None, p
                     item
                     for item in (_strings(evidence.get("sourceSummariesUsed"), max_items=4) if evidence else [])
                     if not _SOURCE_USAGE_FORBIDDEN_RE.search(item)
+                ),
+                (
+                    f"Used {int(_dict(resolver.get('evidenceCounts')).get('publicSafe') or 0)} public-safe subject memory resolver items."
+                    if resolver and int(_dict(resolver.get('evidenceCounts')).get('publicSafe') or 0) else ""
                 ),
             ]
             if part
