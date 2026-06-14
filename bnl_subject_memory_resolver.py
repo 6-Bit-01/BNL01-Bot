@@ -213,6 +213,124 @@ def resolve_subject_memory(subject_name: str, db_path: str, aliases: list[str] |
     return result
 
 
+
+def _dedupe_by_pattern(items: list[str], subject: str, limit: int = 9) -> list[str]:
+    """Collapse repetitive subject evidence into a small public-safe ingredient set."""
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in items:
+        clean = _sanitize_public(item, subject, [])
+        if not clean:
+            continue
+        key = re.sub(re.escape(subject), "subject", clean.lower(), flags=re.I)
+        key = re.sub(r"\b\d+\b", "#", key)
+        key = re.sub(r"\b(public[-_\s]*safe|public|barcode|bnl|community|subject|memory|context|recurring|regularly|appears|mentioned)\b", "", key)
+        words = sorted(set(re.findall(r"[a-z]{4,}", key)))[:8]
+        pattern = " ".join(words) or clean.lower()[:80]
+        if pattern in seen:
+            continue
+        seen.add(pattern)
+        out.append(clean)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def build_subject_analyst_read(subject_name: str, resolved_memory: dict[str, Any], packet: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Synthesize resolver output into internal/read-review/public-draft buckets.
+
+    The analyst read may reason from non-private review/source-blind counts, but
+    public draft ingredients only come from sanitized public-safe resolver text.
+    """
+    subject = _text(subject_name, 120) or _text(resolved_memory.get("subjectName"), 120) or "Unnamed subject"
+    counts = resolved_memory.get("evidenceCounts") if isinstance(resolved_memory.get("evidenceCounts"), dict) else {}
+    public_items: list[str] = []
+    for key in ("publicSafeFacts", "publicSafeNotes", "publicCommunitySignals", "relationshipOrContextSignals", "publicCreativeMusicSignals", "publicRoleSignals", "publicLinkSignals"):
+        for item in resolved_memory.get(key) or []:
+            clean = _sanitize_public(str(item), subject, resolved_memory.get("matchedAliasesUsedPrivately") or [])
+            if clean and clean not in public_items:
+                public_items.append(clean)
+    draft_ingredients = _dedupe_by_pattern(public_items, subject, limit=9)
+    hay = " ".join(draft_ingredients).lower()
+    has_music = bool(re.search(r"\b(music|artist|musician|track|song|album|producer|dj)\b", hay))
+    has_community = bool(re.search(r"\b(barcode|bnl|community|dossier|source file|public interaction|public context|radio)\b", hay))
+    if has_music:
+        likely_type = "artist"
+    elif has_community:
+        likely_type = "community_participant"
+    else:
+        likely_type = "unknown"
+    ps = int(counts.get("publicSafe") or 0)
+    review = int(counts.get("reviewOnly") or 0)
+    blind = int(counts.get("sourceBlind") or 0)
+    private = int(counts.get("privateOrInternal") or 0)
+    scanned = int(counts.get("totalScanned") or 0)
+    confidence = "high" if len(draft_ingredients) >= 5 else ("medium" if len(draft_ingredients) >= 2 or ps >= 2 else "low")
+    posture = "confident" if confidence == "high" and not (review or blind) else ("conservative" if draft_ingredients else "placeholder_only")
+    if private and not draft_ingredients:
+        posture = "do_not_draft_publicly_yet"
+    strongest = []
+    if has_community:
+        strongest.append(f"Repeated public BARCODE/BNL/community context for {subject}.")
+    if has_music:
+        strongest.append(f"Clean public-safe music or artist wording is present for {subject}.")
+    if review:
+        strongest.append("Review-needed evidence suggests additional role, link, queue, or relationship context that needs confirmation.")
+    if blind:
+        strongest.append("Source-blind memory contributes internal pattern context but lacks public provenance.")
+    if not strongest and scanned:
+        strongest.append("Subject memory exists, but public-safe patterns are thin.")
+    if likely_type == "artist":
+        internal = f"{subject} appears to be an artist-facing BARCODE subject with public-safe music context."
+    elif likely_type == "community_participant":
+        internal = f"{subject} appears to be a recurring BARCODE-facing community subject with repeated public interaction/context around BNL or BARCODE."
+    elif scanned:
+        internal = f"{subject} has subject-memory matches, but BNL lacks enough clean public-safe evidence to make a specific public role claim."
+    else:
+        internal = f"{subject} has little or no usable subject-memory evidence for a public dossier read."
+    if review or blind:
+        internal += " Inferred role, link, queue, relationship, or source-blind claims should stay in owner/admin review rather than public copy."
+    public_claims = draft_ingredients[:6]
+    review_claims = []
+    if review:
+        review_claims.append("Possible role, queue/submission, link, or relationship claims require owner/admin confirmation before public use.")
+    blind_insights = ["Source-blind memory indicates possible additional subject context, but it is not public-copy provenance."] if blind else []
+    exclusions = []
+    if private:
+        exclusions.append(f"Excluded {private} private/internal/payment/customer/raw-ID memory item(s) from public and provenance text.")
+    do_not = ["Do not state artist/music role, owned links, formal BARCODE role, queue/submission history, or relationships unless confirmed public-safe evidence supports it."]
+    if private:
+        do_not.append("Do not expose private, payment, customer, DM, raw ID, token, database-row, or internal operational details.")
+    missing = ["Confirm the subject's preferred public display name and identity boundary.", "Confirm the public role/title that may be stated.", "Confirm which public links, if any, are owned or approved for the dossier."]
+    if review or re.search(r"queue|submission", " ".join(str(x) for x in resolved_memory.get("queueOrSubmissionSignals") or []), re.I):
+        missing.append("Confirm whether queue/submission history may be referenced publicly.")
+    actions = ["Promote only confirmed public-safe facts into the Source File before expanding public copy.", "Attach owner-approved provenance for any role, link, music, queue, or relationship claim."]
+    prov = [f"BNL subject memory resolver reviewed {scanned} subject-memory matches and reduced them to {len(draft_ingredients)} public-safe draft ingredients."]
+    if review:
+        prov.append("BNL held inferred role/link/music/queue/relationship claims out of public copy.")
+    if ps > len(draft_ingredients):
+        prov.append("BNL treated repetitive public context as internal pattern evidence, not public dossier prose.")
+    if private or blind:
+        prov.append(f"BNL withheld {private + blind} private/internal or source-unproven item(s) from public draft copy.")
+    return {
+        "subjectName": subject,
+        "internalRead": internal,
+        "likelySubjectType": likely_type,
+        "confidence": confidence,
+        "publicDraftPosture": posture,
+        "strongestSignals": strongest[:6],
+        "publicSafeClaims": public_claims,
+        "reviewNeededClaims": review_claims,
+        "sourceBlindInsights": blind_insights,
+        "privateOrInternalExclusions": exclusions,
+        "doNotSayPublicly": do_not,
+        "missingInfoQuestions": missing,
+        "recommendedAdminActions": actions,
+        "draftIngredients": draft_ingredients,
+        "provenanceSummary": prov,
+    }
+
+
 def build_subject_memory_diagnostic(subject_name: str, db_path: str) -> dict[str, Any]:
     resolved = resolve_subject_memory(subject_name, db_path)
     counts = resolved["evidenceCounts"]
