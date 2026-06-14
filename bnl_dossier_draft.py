@@ -476,7 +476,7 @@ def build_public_dossier_draft_evidence(packet: dict[str, Any], db_path: str | N
                 if alias not in bundle["matchedAliasesUsedPrivately"]:
                     bundle["matchedAliasesUsedPrivately"].append(alias)
         if used:
-            bundle["sourceSummariesUsed"].append("Used matching current public dossier context as official public dossier authority.")
+            bundle["sourceSummariesUsed"].append(f"Used matching current public dossier context as official public dossier authority for {name}.")
     else:
         bundle["publicDossierContextWarnings"].append("No matching current public dossier/read-model facts were available as a direct official source; style examples were used only for structure and tone.")
     if not db_path:

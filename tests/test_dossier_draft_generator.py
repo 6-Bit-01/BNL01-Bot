@@ -308,7 +308,8 @@ class DossierDraftGeneratorTests(unittest.TestCase):
         result = draft.generate_dossier_draft(pr217_packet(publicSafeFacts=[], publicSafeNotes=[]), public_read_model=read_model)["draft"]
         combined = " ".join(str(result[k]) for k in ("summary", "notes", "sourceUsageSummary"))
         self.assertIn("public dossier registry", combined)
-        self.assertIn("official public dossier authority", combined)
+        self.assertIn("official public dossier authority for Signal Fox", combined)
+        self.assertIn("Signal Fox", result["sourceUsageSummary"])
         self.assertNotIn("Nebula Choir", combined)
 
     def test_public_read_model_alias_match_redacts_alias_from_public_fields(self):
@@ -331,7 +332,36 @@ class DossierDraftGeneratorTests(unittest.TestCase):
         public = " ".join(str(result[k]) for k in ("role", "summary", "notes", "sourceUsageSummary", "ownerReviewWarnings", "publicSafetyWarnings", "unsupportedClaimsRejected", "tags", "proposedTags"))
         self.assertIn("Signal Fox", public)
         self.assertIn("BARCODE listening", public)
+        self.assertIn("official public dossier authority for Signal Fox", result["sourceUsageSummary"])
         self.assertNotIn("Secret Fox", public)
+        self.assertNotIn("Secret Fox", result["sourceUsageSummary"])
+        for forbidden in ("private", "source-blind", "review-only", "internal", "admin-only", "payment", "priority", "stripe", "checkout", "customer"):
+            self.assertNotIn(forbidden, result["sourceUsageSummary"].lower())
+
+
+    def test_music_role_from_matching_public_dossier_has_subject_authority_source_usage(self):
+        read_model = {
+            "sections": {
+                "dossiers": {
+                    "items": [
+                        {
+                            "name": "Signal Fox",
+                            "role": "Music artist",
+                            "summary": "Signal Fox is listed in public dossier context as an electronic music artist for BARCODE collaborations.",
+                            "publicFacts": ["Signal Fox appears in public dossier context as a music artist."],
+                        }
+                    ]
+                }
+            }
+        }
+        result = draft.generate_dossier_draft(
+            pr217_packet(publicSafeFacts=[], publicSafeNotes=[], safeClassification={"category": "Unknown", "kind": "Person", "ecosystemLane": "Unknown"}),
+            public_read_model=read_model,
+        )["draft"]
+        self.assertEqual(result["role"], "Music artist")
+        self.assertIn("Used matching current public dossier context as official public dossier authority for Signal Fox.", result["sourceUsageSummary"])
+        for forbidden in ("private", "source-blind", "review-only", "internal", "admin-only", "payment", "priority", "stripe", "checkout", "customer"):
+            self.assertNotIn(forbidden, result["sourceUsageSummary"].lower())
 
     def test_no_public_read_model_context_warns_without_failing(self):
         result = draft.generate_dossier_draft(pr217_packet(publicSafeFacts=[], publicSafeNotes=[]))["draft"]
