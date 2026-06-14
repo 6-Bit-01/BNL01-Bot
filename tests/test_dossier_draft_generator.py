@@ -1,4 +1,6 @@
 import os
+import sqlite3
+import tempfile
 import unittest
 
 os.environ.setdefault("DISCORD_BOT_TOKEN", "test-discord-token")
@@ -179,6 +181,84 @@ class DossierDraftGeneratorTests(unittest.TestCase):
         self.assertEqual(draft.DRAFT_ENDPOINT_PATH, bnl01_bot.DRAFT_ENDPOINT_PATH)
         result = draft.generate_dossier_draft(pr217_packet())
         self.assertIn("draft", result)
+
+    def test_public_safe_evidence_retrieval_enriches_subject_specific_draft(self):
+        with tempfile.NamedTemporaryFile(suffix=".db") as tmp:
+            conn = sqlite3.connect(tmp.name)
+            conn.execute(
+                "CREATE TABLE entity_evidence_events (subject_name TEXT, safe_summary TEXT, topic TEXT, relation_to_subject TEXT, channel_policy TEXT, visibility TEXT, authority TEXT, public_safe_candidate INTEGER, review_only INTEGER, updated_at TEXT, created_at TEXT)"
+            )
+            conn.execute(
+                "INSERT INTO entity_evidence_events VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    "Signal Fox",
+                    "Signal Fox regularly shares experimental electronic tracks with the BARCODE community.",
+                    "Music/track-sharing discussion",
+                    "subject_direct_evidence",
+                    "public_home",
+                    "public",
+                    "public_safe",
+                    1,
+                    0,
+                    "2026-06-14",
+                    "2026-06-14",
+                ),
+            )
+            conn.execute(
+                "CREATE TABLE broadcast_memory (cleaned_summary TEXT, public_safe INTEGER, usage_scope TEXT, status TEXT)"
+            )
+            conn.execute(
+                "INSERT INTO broadcast_memory VALUES (?,?,?,?)",
+                ("Signal Fox appears in active public BARCODE Radio notes as a recurring music collaborator.", 1, "public", "active"),
+            )
+            conn.commit()
+            conn.close()
+            result = draft.generate_dossier_draft(pr217_packet(publicSafeFacts=[], publicSafeNotes=[]), tmp.name)["draft"]
+            combined = " ".join(str(result[k]) for k in ("role", "summary", "notes", "sourceUsageSummary"))
+            self.assertIn("experimental electronic tracks", combined)
+            self.assertIn("public-safe structured entity evidence", combined)
+            self.assertNotIn("awaiting owner review", result["summary"])
+
+    def test_private_alias_payment_and_source_blind_evidence_are_excluded(self):
+        with tempfile.NamedTemporaryFile(suffix=".db") as tmp:
+            conn = sqlite3.connect(tmp.name)
+            conn.execute(
+                "CREATE TABLE entity_evidence_events (subject_name TEXT, safe_summary TEXT, topic TEXT, relation_to_subject TEXT, channel_policy TEXT, visibility TEXT, authority TEXT, public_safe_candidate INTEGER, review_only INTEGER, updated_at TEXT, created_at TEXT)"
+            )
+            rows = [
+                ("Secret Fox", "Secret Fox is a private alias that must never appear.", "alias", "matched", "public_home", "public", "public_safe", 1, 0, "now", "now"),
+                ("Signal Fox", "Signal Fox paid through Stripe checkout for Priority customer handling.", "payment", "matched", "public_home", "public", "public_safe", 1, 0, "now", "now"),
+                ("Signal Fox", "Signal Fox source-blind unknown-policy memory says private lore.", "memory", "matched", "source_blind", "review_only", "source_blind_memory", 0, 1, "now", "now"),
+                ("Signal Fox", "Signal Fox is publicly known for BARCODE community music discussions.", "community", "matched", "public_context", "public", "public_safe", 1, 0, "now", "now"),
+            ]
+            conn.executemany("INSERT INTO entity_evidence_events VALUES (?,?,?,?,?,?,?,?,?,?,?)", rows)
+            conn.execute("CREATE TABLE memory_tiers (summary TEXT)")
+            conn.execute("INSERT INTO memory_tiers VALUES (?)", ("Signal Fox private source-blind detail.",))
+            conn.commit()
+            conn.close()
+            packet = pr217_packet(
+                publicSafeFacts=[],
+                publicSafeNotes=[],
+                identityAliasStatus={"publicSafeIdentityLabels": ["Secret Fox"], "needsConfirmation": True},
+            )
+            evidence = draft.build_public_dossier_draft_evidence(packet, tmp.name)
+            result = draft.generate_dossier_draft(packet, tmp.name)["draft"]
+            public = " ".join(str(result[k]) for k in ("role", "summary", "notes"))
+            self.assertIn("Secret Fox", evidence["matchedAliasesUsedPrivately"])
+            for forbidden in ("Secret Fox", "Stripe", "checkout", "Priority", "private lore", "source-blind unknown-policy"):
+                self.assertNotIn(forbidden, public)
+            self.assertTrue(any("Excluded review-only" in x for x in evidence["excludedSourceWarnings"]))
+            self.assertTrue(any("memory_tiers" in x for x in evidence["excludedSourceWarnings"]))
+
+    def test_thin_retrieved_evidence_adds_missing_questions_and_review_warnings(self):
+        with tempfile.NamedTemporaryFile(suffix=".db") as tmp:
+            conn = sqlite3.connect(tmp.name)
+            conn.execute("CREATE TABLE memory_tiers (summary TEXT)")
+            conn.commit()
+            conn.close()
+            result = draft.generate_dossier_draft(pr217_packet(publicSafeFacts=[], publicSafeNotes=[]), tmp.name)["draft"]
+            self.assertTrue(any("Add approved public-safe subject evidence" in x for x in result["missingInfoQuestions"]))
+            self.assertTrue(any("Fewer than two public-safe evidence" in x for x in result["ownerReviewWarnings"]))
 
     def test_validation_requires_candidate_and_style_packet(self):
         errors = draft.validate_dossier_draft_packet({"requestType": "bad", "fieldRequirements": ["summary"]})

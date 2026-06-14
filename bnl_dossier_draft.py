@@ -8,6 +8,7 @@ from __future__ import annotations
 import hmac
 import os
 import re
+import sqlite3
 from typing import Any
 
 DRAFT_ENDPOINT_PATH = "/internal/dossiers/draft"
@@ -34,6 +35,10 @@ _FINAL_RE = re.compile(r"\b(approved|published|live|final|complete|official)\b",
 _ROLE_LIMIT = 80
 _SUMMARY_LIMIT = 700
 _NOTES_LIMIT = 900
+_PUBLIC_EVIDENCE_LIMIT = 8
+_PUBLIC_POLICIES = {"public_home", "public_context", "public_selective", "broadcast_memory", "public"}
+_PUBLIC_VISIBILITIES = {"public", "public_safe", "dossier_safe", "public_candidate", "public_use"}
+_PUBLIC_AUTHORITIES = {"public", "public_safe", "dossier_safe", "broadcast_memory", "public_conversation"}
 
 
 def _as_list(value: Any) -> list[Any]:
@@ -149,6 +154,176 @@ def _sentences(texts: list[str], *, max_count: int = 4) -> list[str]:
 
 def _candidate_name(candidate: dict[str, Any]) -> str:
     return _text(candidate.get("subjectName") or candidate.get("name"), 120) or "Unnamed Source File subject"
+
+
+def _subject_terms(packet: dict[str, Any]) -> tuple[str, list[str]]:
+    candidate = _dict(packet.get("candidate"))
+    name = _candidate_name(candidate)
+    labels = _strings(_dict(packet.get("identityAliasStatus")).get("publicSafeIdentityLabels"), limit_each=100, max_items=8)
+    labels += _strings(packet.get("publicSafeIdentityLabels"), limit_each=100, max_items=8)
+    current = _dict(packet.get("currentDraft"))
+    labels += _strings(current.get("name"), limit_each=100, max_items=1)
+    aliases: list[str] = []
+    for label in labels:
+        if label and label.lower() != name.lower() and label not in aliases and not _unsafe_reasons(label):
+            aliases.append(label)
+    return name, aliases[:8]
+
+
+def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    try:
+        return {str(row[1]) for row in conn.execute(f"PRAGMA table_info({table})")}
+    except sqlite3.Error:
+        return set()
+
+
+def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
+    try:
+        row = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone()
+        return bool(row)
+    except sqlite3.Error:
+        return False
+
+
+def _matches_subject(text: str, terms: list[str]) -> bool:
+    low = (text or "").lower()
+    return any(term and term.lower() in low for term in terms)
+
+
+def _add_bundle_item(bundle: dict[str, Any], key: str, value: str, *, max_items: int = _PUBLIC_EVIDENCE_LIMIT) -> None:
+    clean = _text(value, 260)
+    if not clean or _unsafe_reasons(clean):
+        return
+    items = bundle.setdefault(key, [])
+    if clean not in items and len(items) < max_items:
+        items.append(clean)
+
+
+def _classify_public_evidence(bundle: dict[str, Any], text: str) -> None:
+    _add_bundle_item(bundle, "publicFacts", text)
+    low = text.lower()
+    if any(x in low for x in ("artist", "music", "track", "song", "radio", "show", "producer", "dj", "beat")):
+        _add_bundle_item(bundle, "publicCreativeMusicContext", text)
+    if any(x in low for x in ("barcode", "bnl", "dossier", "source file", "community")):
+        _add_bundle_item(bundle, "publicCommunityContext", text)
+    if any(x in low for x in ("bnl", "barcode", "community", "interact", "asked", "helps", "collaborat")):
+        _add_bundle_item(bundle, "publicRelationshipToBarcode", text)
+    if any(x in low for x in ("repeat", "recurring", "often", "regular", "again", "pattern")):
+        _add_bundle_item(bundle, "publicInteractionPatterns", text)
+    if any(x in low for x in ("role", "represents", "known for", "moderator", "artist", "collaborator", "member")):
+        _add_bundle_item(bundle, "publicRoleSignals", text)
+    _add_bundle_item(bundle, "notablePublicSignals", text, max_items=5)
+
+
+def build_public_dossier_draft_evidence(packet: dict[str, Any], db_path: str | None) -> dict[str, Any]:
+    """Build a temporary public-safe evidence bundle for draft authoring.
+
+    This is read-only and intentionally narrow: the Source File packet provides
+    subject/boundary/classification, while only explicitly public/dossier-safe
+    local lanes can add draft evidence.
+    """
+    name, aliases = _subject_terms(packet)
+    terms = [name] + aliases
+    bundle: dict[str, Any] = {
+        "subjectName": name,
+        "matchedAliasesUsedPrivately": [],
+        "publicFacts": [],
+        "publicRoleSignals": [],
+        "publicInteractionPatterns": [],
+        "publicCommunityContext": [],
+        "publicCreativeMusicContext": [],
+        "publicRelationshipToBarcode": [],
+        "recurringPublicTopics": [],
+        "notablePublicSignals": [],
+        "sourceSummariesUsed": [],
+        "excludedSourceWarnings": [],
+        "missingInfoQuestions": [],
+        "confidence": "low",
+        "thinReasons": [],
+    }
+    for fact in _strings(packet.get("publicSafeFacts"), max_items=8):
+        _classify_public_evidence(bundle, fact)
+    for note in _strings(packet.get("publicSafeNotes"), max_items=6):
+        _classify_public_evidence(bundle, note)
+    if not db_path:
+        bundle["excludedSourceWarnings"].append("Local BNL evidence database was not available; used the packet boundary only.")
+    else:
+        try:
+            conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        except sqlite3.Error:
+            bundle["excludedSourceWarnings"].append("Local BNL evidence database could not be opened read-only; used the packet boundary only.")
+            conn = None
+        if conn is not None:
+            conn.row_factory = sqlite3.Row
+            try:
+                if _table_exists(conn, "entity_evidence_events"):
+                    cols = _table_columns(conn, "entity_evidence_events")
+                    rows = conn.execute("SELECT * FROM entity_evidence_events ORDER BY COALESCE(updated_at, created_at, '') DESC LIMIT 250").fetchall()
+                    used = 0
+                    excluded = 0
+                    for row in rows:
+                        data = dict(row)
+                        hay = " ".join(str(data.get(c) or "") for c in ("subject_name", "safe_summary", "topic", "relation_to_subject"))
+                        matched = [t for t in terms[1:] if _matches_subject(hay, [t])]
+                        if not _matches_subject(hay, terms):
+                            continue
+                        policy = str(data.get("channel_policy") or "").lower()
+                        visibility = str(data.get("visibility") or "").lower()
+                        authority = str(data.get("authority") or "").lower()
+                        safe_flag = bool(data.get("public_safe_candidate"))
+                        review_only = bool(data.get("review_only"))
+                        if review_only or not (safe_flag or policy in _PUBLIC_POLICIES or visibility in _PUBLIC_VISIBILITIES or authority in _PUBLIC_AUTHORITIES):
+                            excluded += 1
+                            continue
+                        text = _text(data.get("safe_summary"), 260)
+                        for alias in matched:
+                            if alias not in bundle["matchedAliasesUsedPrivately"]:
+                                bundle["matchedAliasesUsedPrivately"].append(alias)
+                        if text and not _unsafe_reasons(text):
+                            _classify_public_evidence(bundle, text)
+                            topic = _text(data.get("topic"), 120)
+                            if topic and not _unsafe_reasons(topic):
+                                _add_bundle_item(bundle, "recurringPublicTopics", topic, max_items=6)
+                            used += 1
+                    if used:
+                        bundle["sourceSummariesUsed"].append(f"Used {used} public-safe structured entity evidence summarie(s).")
+                    if excluded:
+                        bundle["excludedSourceWarnings"].append("Excluded review-only or non-public structured entity evidence.")
+                if _table_exists(conn, "broadcast_memory"):
+                    rows = conn.execute("SELECT * FROM broadcast_memory ORDER BY rowid DESC LIMIT 250").fetchall()
+                    used = 0
+                    excluded = 0
+                    for row in rows:
+                        data = dict(row)
+                        text = _text(data.get("cleaned_summary") or data.get("summary") or data.get("raw_note"), 260)
+                        if not _matches_subject(text, terms):
+                            continue
+                        status = str(data.get("status") or "active").lower()
+                        scope = str(data.get("usage_scope") or data.get("visibility") or "").lower()
+                        if not bool(data.get("public_safe")) or status != "active" or scope not in {"public", "public_safe", "broadcast_memory", "dossier_safe"}:
+                            excluded += 1
+                            continue
+                        if text and not _unsafe_reasons(text):
+                            _classify_public_evidence(bundle, text)
+                            used += 1
+                    if used:
+                        bundle["sourceSummariesUsed"].append(f"Used {used} active public-safe broadcast memory summarie(s).")
+                    if excluded:
+                        bundle["excludedSourceWarnings"].append("Excluded inactive, internal, or non-public broadcast memory.")
+                for unsafe in ("memory_tiers", "user_memory_facts", "relationship_journal", "member_activity_events"):
+                    if _table_exists(conn, unsafe):
+                        bundle["excludedSourceWarnings"].append(f"Excluded {unsafe} because it is private, source-blind, or review-only for this draft.")
+            finally:
+                conn.close()
+    total = len(bundle["publicFacts"])
+    if total >= 5:
+        bundle["confidence"] = "high"
+    elif total >= 2:
+        bundle["confidence"] = "medium"
+    else:
+        bundle["thinReasons"].append("Fewer than two public-safe evidence items were available after filtering.")
+        bundle["missingInfoQuestions"].append("Add approved public-safe subject evidence before treating this as a rich dossier.")
+    return bundle
 
 
 def _classification_value(safe_classification: dict[str, Any], key: str, default: str) -> str:
@@ -358,7 +533,7 @@ def _source_usage_summary(packet: dict[str, Any]) -> str:
     return " ".join(parts)
 
 
-def generate_dossier_draft(packet: dict[str, Any]) -> dict[str, Any]:
+def generate_dossier_draft(packet: dict[str, Any], db_path: str | None = None) -> dict[str, Any]:
     candidate = _dict(packet.get("candidate"))
     safe_classification = _dict(packet.get("safeClassification"))
     style_packet = _dict(packet.get("stylePacket"))
@@ -366,10 +541,35 @@ def generate_dossier_draft(packet: dict[str, Any]) -> dict[str, Any]:
     category, kind, lane = _category_kind_lane(safe_classification)
     public_facts, rejected_facts = _reject_unsafe_public(_strings(packet.get("publicSafeFacts"), max_items=16))
     public_notes, rejected_notes = _reject_unsafe_public(_strings(packet.get("publicSafeNotes"), max_items=12))
+    evidence: dict[str, Any] | None = None
+    try:
+        evidence = build_public_dossier_draft_evidence(packet, db_path)
+        evidence_texts: list[str] = []
+        for key in (
+            "publicFacts",
+            "publicRoleSignals",
+            "publicInteractionPatterns",
+            "publicCommunityContext",
+            "publicCreativeMusicContext",
+            "publicRelationshipToBarcode",
+            "notablePublicSignals",
+        ):
+            evidence_texts.extend(_strings(evidence.get(key), max_items=8))
+        evidence_safe, evidence_rejected = _reject_unsafe_public(evidence_texts)
+        for item in evidence_safe:
+            if item not in public_facts:
+                public_facts.append(item)
+        rejected_facts.extend(evidence_rejected)
+    except Exception:
+        evidence = None
     role = _role_from_context(public_facts, public_notes, category, kind, lane)[:_ROLE_LIMIT]
     thin = len(public_facts) + len(public_notes) < 2
 
     missing = _strings(packet.get("missingInfo"), max_items=8)
+    if evidence:
+        for item in _strings(evidence.get("missingInfoQuestions"), max_items=4):
+            if item not in missing:
+                missing.append(item)
     if thin:
         missing.insert(0, "Add more public-safe facts before this draft is treated as rich dossier copy.")
     if _dict(packet.get("identityAliasStatus")).get("needsConfirmation") is not False:
@@ -378,7 +578,12 @@ def generate_dossier_draft(packet: dict[str, Any]) -> dict[str, Any]:
     owner_warnings = _strings(packet.get("ownerReviewRules"), max_items=8) + _strings(packet.get("reviewOnlyWarnings"), max_items=8)
     owner_warnings.append("Owner Review must approve identity, role, category, links, and public wording before publication.")
     public_warnings = _strings(packet.get("sourceBoundaryRules"), max_items=8)
-    public_warnings.append("Public fields use only publicSafeFacts, publicSafeNotes, safeClassification, stylePacket, and fieldRequirements.")
+    public_warnings.append("Public fields use the Source File packet as the subject boundary plus approved public-safe BNL evidence.")
+    if evidence:
+        for item in _strings(evidence.get("excludedSourceWarnings"), max_items=5):
+            owner_warnings.append(item)
+        for item in _strings(evidence.get("thinReasons"), max_items=3):
+            owner_warnings.append(item)
 
     rejected = rejected_facts + rejected_notes
     for unsafe_key in ("doNotSayNotes", "reviewOnlyWarnings", "forbiddenPublicCopyPatterns"):
@@ -391,6 +596,8 @@ def generate_dossier_draft(packet: dict[str, Any]) -> dict[str, Any]:
         rejected.append("Used existing public dossier examples only for structure, tone, field shape, length, and tag style; did not copy their facts.")
     if not rejected:
         rejected.append("No unsafe supplied material was needed for public-facing fields.")
+    if evidence and evidence.get("matchedAliasesUsedPrivately"):
+        rejected.append("Used approved identity labels only as private matching hints; did not expose alias text in public fields.")
 
     tags, proposed_tags = _split_tags(packet, style_packet, category, kind, lane, public_facts, public_notes)
 
@@ -415,6 +622,7 @@ def generate_dossier_draft(packet: dict[str, Any]) -> dict[str, Any]:
         "ownerReviewWarnings": owner_warnings[:12],
         "publicSafetyWarnings": public_warnings[:12],
         "unsupportedClaimsRejected": rejected[:14],
-        "sourceUsageSummary": _source_usage_summary(packet),
+        "sourceUsageSummary": _source_usage_summary(packet)
+        + (" " + " ".join(_strings(evidence.get("sourceSummariesUsed"), max_items=4)) if evidence else ""),
     }
     return {"draft": draft}

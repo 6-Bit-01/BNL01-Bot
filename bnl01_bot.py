@@ -3516,13 +3516,13 @@ async def _handle_dossier_draft(request: web.Request) -> web.Response:
         return web.json_response({"ok": False, "error": "validation_error", "details": errors}, status=400)
 
     try:
-        result = await asyncio.to_thread(generate_dossier_draft, payload)
+        result = await asyncio.to_thread(generate_dossier_draft, payload, DB_FILE)
     except Exception as exc:
         logging.warning("dossier_draft_generation_fallback reason=%s", _safe_force_pull_error(exc))
         fallback_payload = dict(payload) if isinstance(payload, dict) else {}
         fallback_payload["publicSafeFacts"] = []
         fallback_payload["publicSafeNotes"] = []
-        result = generate_dossier_draft(fallback_payload)
+        result = generate_dossier_draft(fallback_payload, DB_FILE)
         result["draft"]["ownerReviewWarnings"].insert(0, "BNL could not generate a rich draft and returned a deterministic fallback for admin review.")
         result["draft"]["missingInfoQuestions"].insert(0, "Retry draft generation or add more public-safe source detail.")
     return web.json_response(result, status=200)
