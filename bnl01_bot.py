@@ -97,6 +97,13 @@ from bnl_population_recommender import (
     parse_population_scan_command,
     run_population_scan,
 )
+from bnl_dossier_draft import (
+    DRAFT_ENDPOINT_PATH,
+    DRAFT_TOKEN_HEADER,
+    generate_dossier_draft,
+    is_dossier_draft_token_valid,
+    validate_dossier_draft_packet,
+)
 from bnl_source_file_refresh import (
     DEFAULT_MAX_AUTOMATIC_PER_CYCLE,
     DEFAULT_MAX_SITE_REQUESTS_PER_CYCLE,
@@ -3491,6 +3498,36 @@ async def _handle_force_pull(request: web.Request) -> web.Response:
     }, status=202)
 
 
+async def _handle_dossier_draft(request: web.Request) -> web.Response:
+    provided_token = request.headers.get(DRAFT_TOKEN_HEADER) or request.headers.get(DRAFT_TOKEN_HEADER.lower())
+    if not is_dossier_draft_token_valid(provided_token):
+        logging.warning("dossier_draft_auth_failed reason=missing_or_invalid_token")
+        return web.json_response({"ok": False, "error": "unauthorized"}, status=401)
+
+    try:
+        payload = await request.json()
+    except Exception:
+        logging.warning("dossier_draft_failed reason=invalid_json")
+        return web.json_response({"ok": False, "error": "invalid_json"}, status=400)
+
+    errors = validate_dossier_draft_packet(payload)
+    if errors:
+        logging.warning("dossier_draft_failed reason=validation_error errors=%s", ",".join(errors))
+        return web.json_response({"ok": False, "error": "validation_error", "details": errors}, status=400)
+
+    try:
+        result = await asyncio.to_thread(generate_dossier_draft, payload)
+    except Exception as exc:
+        logging.warning("dossier_draft_generation_fallback reason=%s", _safe_force_pull_error(exc))
+        fallback_payload = dict(payload) if isinstance(payload, dict) else {}
+        fallback_payload["publicSafeFacts"] = []
+        fallback_payload["publicSafeNotes"] = []
+        result = generate_dossier_draft(fallback_payload)
+        result["draft"]["ownerReviewWarnings"].insert(0, "BNL could not generate a rich draft and returned a deterministic fallback for admin review.")
+        result["draft"]["missingInfoQuestions"].insert(0, "Retry draft generation or add more public-safe source detail.")
+    return web.json_response(result, status=200)
+
+
 async def _handle_source_file_refresh_now(request: web.Request) -> web.Response:
     provided_token = request.headers.get(SOURCE_REFRESH_NOW_TOKEN_HEADER) or request.headers.get(
         SOURCE_REFRESH_NOW_TOKEN_HEADER.lower()
@@ -3551,6 +3588,7 @@ async def start_force_pull_listener():
     app = web.Application()
     app.router.add_post("/force-pull", _handle_force_pull)
     app.router.add_post(SOURCE_REFRESH_NOW_PATH, _handle_source_file_refresh_now)
+    app.router.add_post(DRAFT_ENDPOINT_PATH, _handle_dossier_draft)
     force_pull_runner = web.AppRunner(app)
     await force_pull_runner.setup()
     site = web.TCPSite(force_pull_runner, host="0.0.0.0", port=BNL_FORCE_PULL_PORT)
