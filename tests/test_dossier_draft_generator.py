@@ -354,6 +354,23 @@ class DossierDraftGeneratorTests(unittest.TestCase):
                 self.assertFalse(draft._is_probable_subject_alias(label))
         self.assertTrue(draft._is_probable_subject_alias("Signal Fox Alt"))
 
+    def test_p1_review_thread_alias_rules_are_covered_directly(self):
+        packet = pr217_packet(
+            publicSafeFacts=[],
+            publicSafeNotes=[],
+            identityAliasStatus={"publicSafeIdentityLabels": ["artist", "Signal Fox Alt"], "needsConfirmation": True},
+        )
+        subject_name, aliases = draft._subject_terms(packet)
+        self.assertEqual(subject_name, "Signal Fox")
+        self.assertNotIn("artist", aliases)
+        self.assertIn("Signal Fox Alt", aliases)
+        redacted = draft._redact_private_match_terms(
+            "Signal Fox Alt appears in public BARCODE music context.",
+            aliases,
+            subject_name,
+        )
+        self.assertEqual(redacted, "Signal Fox appears in public BARCODE music context.")
+
     def test_name_like_alias_matches_and_is_redacted_from_public_fields(self):
         with tempfile.NamedTemporaryFile(suffix=".db") as tmp:
             conn = sqlite3.connect(tmp.name)
