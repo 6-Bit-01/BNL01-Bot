@@ -5881,6 +5881,11 @@ def _is_casual_check_in(text: str) -> bool:
 
 
 def safe_fallback_response_for_mode_leak(user_name: str = "", route_mode: str = "", original_user_text: str = "") -> str:
+    """Legacy deterministic fallback retained for simple/status routes only.
+
+    Normal chat mode-leak failures must be regenerated or suppressed; they must
+    never become an acknowledgement-only "what do you need" response.
+    """
     name = (user_name or "").strip()
     suffix = f", {name}" if name else ""
     if route_mode == ROUTE_MODE_SIMPLE_GREETING:
@@ -5888,15 +5893,78 @@ def safe_fallback_response_for_mode_leak(user_name: str = "", route_mode: str = 
     if route_mode == ROUTE_MODE_SHOW_STATUS:
         return "I don’t have a confirmed show status in front of me yet."
     if _is_casual_check_in(original_user_text):
-        return f"I’m good{suffix}. Systems are steady. What’s up?"
-    return f"I’m here{suffix}. What do you need?"
+        return f"I’m good{suffix}. Systems are steady."
+    return ""
+
+
+def _normalize_guard_text(text: str) -> str:
+    return re.sub(r"\s+", " ", (text or "").strip().lower().replace("’", "'"))
+
+
+def is_substantive_current_request(text: str, has_media: bool = False, is_reply: bool = False) -> bool:
+    usable = _strip_media_context_block(text or "").strip()
+    if not usable:
+        return False
+    lowered = usable.lower()
+    words = re.findall(r"[a-z0-9][a-z0-9'’-]*", lowered)
+    meaningful = [w for w in words if w not in {"bnl", "bnl01", "bnl-01", "barcode", "bot", "hey", "hi", "yo", "please", "pls"}]
+    if "?" in usable:
+        return True
+    if len(meaningful) >= 8:
+        return True
+    if re.search(r"\b(?:how|why|what|when|where|does|do|did|is|are|can|could|should|would)\b", lowered):
+        return True
+    return bool(is_reply and len(meaningful) >= 4)
+
+
+def is_generic_non_answer_response(response: str, user_display_name: str = "") -> bool:
+    text = _normalize_guard_text(response)
+    if not text:
+        return False
+    name = re.escape(_normalize_guard_text(user_display_name))
+    name_part = rf"(?:,?\s*{name})?" if name else r"(?:,?\s*[a-z0-9_. -]{1,32})?"
+    generic_patterns = [
+        rf"^i['’]?m here{name_part}\.?(?: what do you need\??| what can i help with\??)?$",
+        r"^you pinged me\.?(?: what do you need\??| what can i help with\??)?$",
+        r"^what do you need\??$",
+        r"^what can i help with\??$",
+        r"^how may i assist\??$",
+        r"^how can i help\??$",
+        r"^i['’]?m listening\.?(?: what do you need\??)?$",
+        r"^go ahead\.?(?: what do you need\??)?$",
+    ]
+    if any(re.match(pattern, text, flags=re.I) for pattern in generic_patterns):
+        return True
+    words = re.findall(r"[a-z0-9][a-z0-9'’-]*", text)
+    if len(words) <= 8 and re.search(r"\b(?:here|listening|pinged|assist|help)\b", text) and not re.search(r"\b(?:because|means|should|can use|the answer|barcode|show|track|issue)\b", text):
+        return True
+    return False
 
 
 def apply_response_mode_contamination_guard(response: str, route_mode: str, user_name: str = "", original_user_text: str = "") -> tuple[str, bool]:
     if not detect_scripted_mode_leak(response, route_mode):
         return response, False
     logging.warning("scripted_mode_leak_guard_triggered=1 route_mode=%s", route_mode)
-    return safe_fallback_response_for_mode_leak(user_name, route_mode, original_user_text), True
+    if route_mode in {ROUTE_MODE_SIMPLE_GREETING, ROUTE_MODE_SHOW_STATUS}:
+        return safe_fallback_response_for_mode_leak(user_name, route_mode, original_user_text), True
+    return "", True
+
+
+def build_mode_leak_correction_prompt(prompt: str) -> str:
+    return (
+        (prompt or "")
+        + "\n\nCORRECTION REQUIRED: Your previous draft tripped the mode-leak guard. "
+        + "Answer the user’s current message directly. Do not include internal mode labels, scripted fallback language, diagnostics, or ‘I’m here / what do you need’ phrasing. "
+        + "Preserve BNL’s public BARCODE voice. If you cannot answer safely, give a short direct uncertainty statement instead of asking what the user needs."
+    )
+
+
+def build_generic_non_answer_correction_prompt(prompt: str) -> str:
+    return (
+        (prompt or "")
+        + "\n\nCORRECTION REQUIRED: You failed to answer the current user message. "
+        + "Answer the actual question directly. Do not say you are here. Do not ask what they need."
+    )
 
 
 SIMPLE_GREETING_RESPONSE_POOL = (
@@ -14793,6 +14861,26 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
         )
 
         response, archive_guard_triggered = apply_fake_archive_certainty_guard(response or "", source_context_available=bool(active_packet.get("media_context_included")))
+        response, guard_diagnostics = await apply_guarded_response_regeneration(
+            response or "",
+            prompt=prompt,
+            user_id=first_uid,
+            guild_id=guild_id,
+            route_mode=ROUTE_MODE_NORMAL_CHAT,
+            channel_policy=channel_policy,
+            directness=batch_directness,
+            user_display_name=collapsed_items[-1][0] if collapsed_items else "",
+            current_user_text=combined_text,
+            has_media=bool(active_packet.get("media_present", False)),
+            is_reply=False,
+            generation_route=generation_route if 'generation_route' in locals() else "get_gemini_response",
+            channel=channel,
+        )
+        guard_triggered = bool(archive_guard_triggered or guard_diagnostics.get("scripted_mode_leak_guard_triggered"))
+        regenerated_for_mode_leak = bool(guard_diagnostics.get("regenerated_for_mode_leak"))
+        if guard_diagnostics.get("suppressed"):
+            logging.info("continuation_mark_skipped reason=guard_fallback_or_generic_non_answer route=%s channel_policy=%s", ROUTE_MODE_NORMAL_CHAT, channel_policy)
+            return
         try:
             if len(response) <= 2000:
                 await channel.send(response, allowed_mentions=safe_mentions)
@@ -14807,9 +14895,12 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
             return
         _log_batch_event(logging.INFO, "response_send_commit_complete", guild_id, channel_id, len(items), f"generation_id={local_generation_id}")
         for uid in unique_user_ids:
-            _mark_conversation_continuation_state(guild_id, channel_id, uid, awaiting_answer=_response_contains_direct_question_to_user(response))
-            if _response_contains_direct_question_to_user(response):
+            meaningful_followup_question = _response_contains_direct_question_to_user(response) and not is_generic_non_answer_response(response)
+            _mark_conversation_continuation_state(guild_id, channel_id, uid, awaiting_answer=meaningful_followup_question)
+            if meaningful_followup_question:
                 logging.info("bnl_question_answer_window_set guild_id=%s channel_id=%s user_id=%s ttl_seconds=%s", guild_id, channel_id, uid, BNL_QUESTION_ANSWER_TTL_SECONDS)
+            elif _response_contains_direct_question_to_user(response):
+                logging.info("continuation_mark_skipped reason=guard_fallback_or_generic_non_answer route=%s channel_policy=%s", ROUTE_MODE_NORMAL_CHAT, channel_policy)
             if _response_requests_retransmission(response):
                 _mark_awaiting_retransmission(guild_id, channel_id, uid)
         if active_packet.get("media_present"):
@@ -15571,6 +15662,26 @@ async def _generate_direct_payload_session(session_key, reason: str):
         channel_id=session.get("channel_id", 0),
     )
 
+    response, guard_diagnostics = await apply_guarded_response_regeneration(
+        response or "",
+        prompt=prompt,
+        user_id=session["requester_user_id"],
+        guild_id=session["guild_id"],
+        route_mode=ROUTE_MODE_NORMAL_CHAT if route_mode == ROUTE_MODE_DIRECT_PAYLOAD else route_mode,
+        channel_policy=session.get("channel_policy", "unknown"),
+        directness="request_intent",
+        user_display_name=session.get("requester_display_name", ""),
+        current_user_text=direct_content,
+        has_media=False,
+        is_reply=True,
+        generation_route="direct_payload_session",
+        channel=getattr(anchor_message, "channel", None),
+    )
+    if guard_diagnostics.get("suppressed"):
+        logging.info("continuation_mark_skipped reason=guard_fallback_or_generic_non_answer route=%s channel_policy=%s", "direct_payload_session", session.get("channel_policy", "unknown"))
+        session["generating"] = False
+        return
+
     fallback_response_sent = False
     if not response:
         result = GenerationResult(False, "", _last_generation_status.get("error_category") or GENERATION_ERROR_PROVIDER_UNKNOWN, _last_generation_status.get("provider_error_code") or "", "", "direct_payload_session", 0.0, GEMINI_MODEL)
@@ -15671,6 +15782,78 @@ async def _apply_direct_response_pacing(payload_expected: bool, payload_count: i
     await asyncio.sleep(delay_seconds)
 
 
+async def apply_guarded_response_regeneration(
+    response: str,
+    *,
+    prompt: str,
+    user_id: int,
+    guild_id: int,
+    route_mode: str,
+    channel_policy: str,
+    directness: str = "",
+    user_display_name: str = "",
+    current_user_text: str = "",
+    has_media: bool = False,
+    is_reply: bool = False,
+    generation_route: str = "get_gemini_response",
+    channel=None,
+) -> tuple[str, dict]:
+    diagnostics = {
+        "scripted_mode_leak_guard_triggered": False,
+        "regenerated_for_mode_leak": False,
+        "generic_non_answer_triggered": False,
+        "generic_non_answer_regenerated": False,
+        "suppressed": False,
+        "suppression_reason": "",
+        "guard_fallback_or_generic_non_answer": False,
+    }
+    response = (response or "").strip()
+    logging.info("response_pre_guard_length route=%s channel_policy=%s length=%s", route_mode, channel_policy, len(response))
+    substantive = is_substantive_current_request(current_user_text, has_media=has_media, is_reply=is_reply)
+    if has_media and not _strip_media_context_block(current_user_text or "").strip():
+        if is_generic_non_answer_response(response, user_display_name) or not response:
+            logging.info("media_only_no_text_response_suppressed route=%s channel_policy=%s", route_mode, channel_policy)
+            diagnostics.update({"suppressed": True, "suppression_reason": "media_only_no_text", "guard_fallback_or_generic_non_answer": True})
+            return "", diagnostics
+    if detect_scripted_mode_leak(response, route_mode):
+        diagnostics["scripted_mode_leak_guard_triggered"] = True
+        logging.warning("scripted_mode_leak_guard_triggered=1 route_mode=%s", route_mode)
+        if route_mode == ROUTE_MODE_NORMAL_CHAT and substantive:
+            logging.info("scripted_mode_leak_regeneration_started route_mode=%s channel_policy=%s", route_mode, channel_policy)
+            correction_prompt = build_mode_leak_correction_prompt(prompt)
+            regenerated = await get_gemini_response_with_optional_typing(channel, correction_prompt, user_id, guild_id, route=generation_route)
+            diagnostics["regenerated_for_mode_leak"] = True
+            regenerated = (regenerated or "").strip()
+            if regenerated and not detect_scripted_mode_leak(regenerated, route_mode) and not is_generic_non_answer_response(regenerated, user_display_name):
+                response = regenerated
+            else:
+                logging.warning("scripted_mode_leak_response_suppressed_after_retry route_mode=%s channel_policy=%s", route_mode, channel_policy)
+                diagnostics.update({"suppressed": True, "suppression_reason": "scripted_mode_leak_after_retry", "guard_fallback_or_generic_non_answer": True})
+                return "", diagnostics
+        else:
+            fallback = safe_fallback_response_for_mode_leak(user_display_name, route_mode, current_user_text)
+            if fallback and not is_generic_non_answer_response(fallback, user_display_name):
+                response = fallback
+            else:
+                logging.warning("scripted_mode_leak_response_suppressed_after_retry route_mode=%s channel_policy=%s", route_mode, channel_policy)
+                diagnostics.update({"suppressed": True, "suppression_reason": "scripted_mode_leak_no_safe_fallback", "guard_fallback_or_generic_non_answer": True})
+                return "", diagnostics
+    if substantive and is_generic_non_answer_response(response, user_display_name):
+        logging.info("response_generic_non_answer route=%s channel_policy=%s directness=%s", route_mode, channel_policy, directness)
+        logging.warning("generic_non_answer_guard_triggered route=%s channel_policy=%s directness=%s", route_mode, channel_policy, directness)
+        diagnostics["generic_non_answer_triggered"] = True
+        regenerated = await get_gemini_response_with_optional_typing(channel, build_generic_non_answer_correction_prompt(prompt), user_id, guild_id, route=generation_route)
+        diagnostics["generic_non_answer_regenerated"] = True
+        regenerated = (regenerated or "").strip()
+        if regenerated and not is_generic_non_answer_response(regenerated, user_display_name) and not detect_scripted_mode_leak(regenerated, route_mode):
+            response = regenerated
+        else:
+            logging.warning("generic_non_answer_suppressed_after_retry route=%s channel_policy=%s directness=%s", route_mode, channel_policy, directness)
+            diagnostics.update({"suppressed": True, "suppression_reason": "generic_non_answer_after_retry", "guard_fallback_or_generic_non_answer": True})
+            return "", diagnostics
+    return response, diagnostics
+
+
 async def send_planned_conversation_response(
     message: discord.Message,
     response: str,
@@ -15686,6 +15869,9 @@ async def send_planned_conversation_response(
     payload_expected: bool = False,
     payload_count: int = 0,
     regenerated_for_mode_leak: bool = False,
+    prompt: str = "",
+    generation_route: str = "get_gemini_response",
+    is_reply: bool = False,
 ) -> MemoryWriteDecision:
     """Send a planned normal-conversation response through one governed path."""
     logging.info(
@@ -15697,17 +15883,6 @@ async def send_planned_conversation_response(
     if plan.response_timing == RESPONSE_TIMING_PACED_DIRECT:
         await _apply_direct_response_pacing(payload_expected, payload_count)
 
-    response, archive_guard_triggered = apply_fake_archive_certainty_guard(
-        response or "",
-        source_context_available=_source_authority_context_available(website_read_model_context, source_context_block),
-    )
-    response, guard_triggered = apply_response_mode_contamination_guard(
-        response or "",
-        plan.route_mode,
-        getattr(message.author, "display_name", ""),
-        getattr(message, "content", ""),
-    )
-    guard_triggered = bool(guard_triggered or archive_guard_triggered)
     model_decision = MemoryWriteDecision(
         False,
         False,
@@ -15718,6 +15893,32 @@ async def send_planned_conversation_response(
         "model_save_skipped",
         context_visibility_for_policy(plan.channel_policy),
     )
+
+    response, archive_guard_triggered = apply_fake_archive_certainty_guard(
+        response or "",
+        source_context_available=_source_authority_context_available(website_read_model_context, source_context_block),
+    )
+    media_context = build_message_media_context(message)
+    response, guard_diagnostics = await apply_guarded_response_regeneration(
+        response or "",
+        prompt=prompt,
+        user_id=message.author.id,
+        guild_id=message.guild.id,
+        route_mode=plan.route_mode,
+        channel_policy=plan.channel_policy,
+        directness=plan.directness,
+        user_display_name=getattr(message.author, "display_name", ""),
+        current_user_text=getattr(message, "content", ""),
+        has_media=bool(media_context.get("present", False)),
+        is_reply=is_reply,
+        generation_route=generation_route,
+        channel=getattr(message, "channel", None),
+    )
+    guard_triggered = bool(guard_diagnostics.get("scripted_mode_leak_guard_triggered") or archive_guard_triggered)
+    regenerated_for_mode_leak = bool(regenerated_for_mode_leak or guard_diagnostics.get("regenerated_for_mode_leak"))
+    if guard_diagnostics.get("suppressed"):
+        logging.info("continuation_mark_skipped reason=guard_fallback_or_generic_non_answer route=%s channel_policy=%s", plan.route_mode, plan.channel_policy)
+        return model_decision
     if allow_model_save and not website_read_model_context:
         model_decision = save_model_message(
             message.author.id,
@@ -15765,12 +15966,12 @@ async def send_planned_conversation_response(
         save_policy_reason=getattr(model_decision, "reason", "unknown"),
         durable_memory_write=getattr(model_decision, "write_memory_tier", False),
         scripted_mode_leak_guard_triggered=guard_triggered,
-        leak_guard_result="fallback" if guard_triggered else "clear",
-        fallback_used=guard_triggered,
+        leak_guard_result="regenerated" if regenerated_for_mode_leak else ("suppressed" if guard_diagnostics.get("suppressed") else "clear"),
+        fallback_used=False,
         regenerated_for_mode_leak=regenerated_for_mode_leak,
-        media_present=bool(build_message_media_context(message).get("present", False)),
-        media_context_included=bool(build_message_media_context(message).get("included", False)),
-        media_item_count=build_message_media_context(message).get("count", 0),
+        media_present=bool(media_context.get("present", False)),
+        media_context_included=bool(media_context.get("included", False)),
+        media_item_count=media_context.get("count", 0),
         batch_ack_decision="not_applicable",
         batch_decision="not_applicable",
         batch_reason="not_applicable",
@@ -15791,14 +15992,17 @@ async def send_planned_conversation_response(
         logging.error("response_send_failed route=%s channel_id=%s discord_error_type=%s", plan.route_mode, getattr(message.channel, "id", 0), type(exc).__name__)
         return model_decision
     if mark_recent_direct:
+        meaningful_followup_question = _response_contains_direct_question_to_user(response) and not is_generic_non_answer_response(response, getattr(message.author, "display_name", ""))
         _mark_conversation_continuation_state(
             message.guild.id,
             message.channel.id,
             message.author.id,
-            awaiting_answer=_response_contains_direct_question_to_user(response),
+            awaiting_answer=meaningful_followup_question,
         )
-        if _response_contains_direct_question_to_user(response):
+        if meaningful_followup_question:
             logging.info("bnl_question_answer_window_set guild_id=%s channel_id=%s user_id=%s ttl_seconds=%s", message.guild.id, message.channel.id, message.author.id, BNL_QUESTION_ANSWER_TTL_SECONDS)
+        elif _response_contains_direct_question_to_user(response):
+            logging.info("continuation_mark_skipped reason=guard_fallback_or_generic_non_answer route=%s channel_policy=%s", plan.route_mode, plan.channel_policy)
         if _response_requests_retransmission(response):
             _mark_awaiting_retransmission(message.guild.id, message.channel.id, message.author.id)
     return model_decision
@@ -16607,6 +16811,9 @@ async def on_message(message: discord.Message):
                 allow_model_save=not is_sealed_test_channel,
                 payload_expected=payload_expected,
                 payload_count=len(direct_payload_items),
+                prompt=prompt,
+                generation_route=show_state_route,
+                is_reply=is_reply,
             )
             return
 
@@ -16847,6 +17054,9 @@ async def on_message(message: discord.Message):
             source_context_block=source_context_block,
             payload_expected=payload_expected,
             payload_count=len(direct_payload_items),
+            prompt=prompt,
+            generation_route=show_state_route,
+            is_reply=is_reply,
         )
         return
 
@@ -17052,6 +17262,9 @@ async def on_message(message: discord.Message):
             source_context_block=source_context_block,
             payload_expected=payload_expected,
             payload_count=len(direct_payload_items),
+            prompt=prompt,
+            generation_route=show_state_route,
+            is_reply=is_reply,
         )
         return
 

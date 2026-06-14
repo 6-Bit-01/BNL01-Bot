@@ -580,19 +580,25 @@ class LeakGuardTests(unittest.TestCase):
         for forbidden in ("guard", "prompt", "mode", "rules"):
             self.assertNotIn(forbidden, lowered)
 
-    def test_guard_replaces_leak_with_context_safe_check_in_answer(self):
+    def test_guard_suppresses_normal_chat_leak_instead_of_generic_fallback(self):
         response, guard_triggered = bnl01_bot.apply_response_mode_contamination_guard(
             "Records are thin",
             bnl01_bot.ROUTE_MODE_NORMAL_CHAT,
-            "6 Bit",
-            "Hows it going?",
+            "Crow",
+            "What does this mean for the show?",
         )
         self.assertTrue(guard_triggered)
-        self.assertIn("Systems are steady", response)
-        lowered = response.lower()
-        self.assertNotIn("ask me that normally", lowered)
-        self.assertNotIn("i’ll keep it conversational", lowered)
-        self.assertNotIn("please rephrase", lowered)
+        self.assertEqual("", response)
+
+    def test_substantive_request_and_generic_non_answer_detection(self):
+        self.assertTrue(bnl01_bot.is_substantive_current_request("Crow asks: what happened with BARCODE this week?"))
+        self.assertTrue(bnl01_bot.is_generic_non_answer_response("I’m here, Crow. What do you need?", "Crow"))
+        self.assertTrue(bnl01_bot.is_generic_non_answer_response("What can I help with?"))
+        self.assertFalse(bnl01_bot.is_generic_non_answer_response("Yeah — BARCODE is back this week, but the slot still needs confirmation."))
+
+    def test_media_only_text_is_not_substantive(self):
+        text = bnl01_bot.append_media_context_to_text("", {"items": ["gif embed"], "prompt_text": "- gif embed"})
+        self.assertFalse(bnl01_bot.is_substantive_current_request(text, has_media=True))
 
 
 class RegressionExamplesTests(unittest.TestCase):
@@ -1018,6 +1024,86 @@ class RecentMediaRoomContextTests(unittest.TestCase):
         )
         self.assertEqual(resolved_decision, "acknowledge")
         self.assertFalse(diag["canned_ack_suppressed"])
+
+
+class GuardedResponseRegenerationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_mode_leak_substantive_request_regenerates_without_generic_fallback(self):
+        async def fake_regen(channel, prompt, user_id, guild_id, route="get_gemini_response"):
+            self.assertIn("previous draft tripped the mode-leak guard", prompt)
+            return "Crow, the show note points to a normal BARCODE answer instead of an internal classification."
+
+        with mock.patch.object(bnl01_bot, "get_gemini_response_with_optional_typing", side_effect=fake_regen):
+            response, diagnostics = await bnl01_bot.apply_guarded_response_regeneration(
+                "Classification: candidate",
+                prompt="CURRENT USER MESSAGE: What happened with BARCODE?",
+                user_id=101,
+                guild_id=1,
+                route_mode=bnl01_bot.ROUTE_MODE_NORMAL_CHAT,
+                channel_policy="public_home",
+                directness="real_direct_target",
+                user_display_name="Crow",
+                current_user_text="What happened with BARCODE?",
+            )
+        self.assertFalse(diagnostics["suppressed"])
+        self.assertTrue(diagnostics["regenerated_for_mode_leak"])
+        self.assertNotEqual("I’m here, Crow. What do you need?", response)
+        self.assertFalse(bnl01_bot.is_generic_non_answer_response(response, "Crow"))
+
+    async def test_mode_leak_retry_failure_suppresses(self):
+        async def fake_regen(channel, prompt, user_id, guild_id, route="get_gemini_response"):
+            return "I’m here, Crow. What do you need?"
+
+        with mock.patch.object(bnl01_bot, "get_gemini_response_with_optional_typing", side_effect=fake_regen):
+            response, diagnostics = await bnl01_bot.apply_guarded_response_regeneration(
+                "Records are thin",
+                prompt="CURRENT USER MESSAGE: What happened with BARCODE?",
+                user_id=101,
+                guild_id=1,
+                route_mode=bnl01_bot.ROUTE_MODE_NORMAL_CHAT,
+                channel_policy="public_home",
+                user_display_name="Crow",
+                current_user_text="What happened with BARCODE?",
+            )
+        self.assertEqual("", response)
+        self.assertTrue(diagnostics["suppressed"])
+        self.assertEqual("scripted_mode_leak_after_retry", diagnostics["suppression_reason"])
+
+    async def test_generic_non_answer_to_substantive_request_regenerates(self):
+        async def fake_regen(channel, prompt, user_id, guild_id, route="get_gemini_response"):
+            self.assertIn("failed to answer the current user message", prompt)
+            return "The schedule is uncertain; I can only confirm the public room has no locked broadcast status yet."
+
+        with mock.patch.object(bnl01_bot, "get_gemini_response_with_optional_typing", side_effect=fake_regen):
+            response, diagnostics = await bnl01_bot.apply_guarded_response_regeneration(
+                "I’m here, Crow. What do you need?",
+                prompt="CURRENT USER MESSAGE: Is BARCODE back this week?",
+                user_id=101,
+                guild_id=1,
+                route_mode=bnl01_bot.ROUTE_MODE_NORMAL_CHAT,
+                channel_policy="public_home",
+                user_display_name="Crow",
+                current_user_text="Is BARCODE back this week?",
+            )
+        self.assertFalse(diagnostics["suppressed"])
+        self.assertTrue(diagnostics["generic_non_answer_triggered"])
+        self.assertFalse(bnl01_bot.is_generic_non_answer_response(response, "Crow"))
+
+    async def test_media_only_generic_response_suppresses(self):
+        media_text = bnl01_bot.append_media_context_to_text("", {"items": ["gif embed"], "prompt_text": "- gif embed"})
+        response, diagnostics = await bnl01_bot.apply_guarded_response_regeneration(
+            "I’m here, Crow. What do you need?",
+            prompt="CURRENT USER MESSAGE: [media]",
+            user_id=101,
+            guild_id=1,
+            route_mode=bnl01_bot.ROUTE_MODE_NORMAL_CHAT,
+            channel_policy="public_home",
+            user_display_name="Crow",
+            current_user_text=media_text,
+            has_media=True,
+        )
+        self.assertEqual("", response)
+        self.assertTrue(diagnostics["suppressed"])
+        self.assertEqual("media_only_no_text", diagnostics["suppression_reason"])
 
 
 if __name__ == "__main__":
