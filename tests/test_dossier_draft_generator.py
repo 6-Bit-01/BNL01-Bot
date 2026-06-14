@@ -320,6 +320,33 @@ class DossierDraftGeneratorTests(unittest.TestCase):
             self.assertNotIn("Other Person", public)
             self.assertNotIn("unrelated BARCODE activity", public)
 
+    def test_role_identity_labels_do_not_match_broadcast_or_entity_intelligence_text(self):
+        with tempfile.NamedTemporaryFile(suffix=".db") as tmp:
+            conn = sqlite3.connect(tmp.name)
+            conn.execute(
+                "CREATE TABLE entity_intelligence_facts (subject_key TEXT, subject_name TEXT, fact_label TEXT, fact_value TEXT, visibility TEXT, authority TEXT, public_safe INTEGER, review_only INTEGER, status TEXT, last_seen_at TEXT)"
+            )
+            conn.execute("CREATE TABLE broadcast_memory (cleaned_summary TEXT, public_safe INTEGER, status TEXT)")
+            conn.execute(
+                "INSERT INTO entity_intelligence_facts VALUES (?,?,?,?,?,?,?,?,?,?)",
+                ("other_artist", "Other Artist", "artist", "Other Artist is a public community collaborator.", "public_safe", "owner_confirmed", 1, 0, "active", "now"),
+            )
+            conn.execute(
+                "INSERT INTO broadcast_memory VALUES (?,?,?)",
+                ("Other Artist appears in public radio broadcast memory as a community collaborator.", 1, "active"),
+            )
+            conn.commit()
+            conn.close()
+            packet = pr217_packet(
+                publicSafeFacts=[],
+                publicSafeNotes=[],
+                identityAliasStatus={"publicSafeIdentityLabels": ["artist", "community", "collaborator", "radio"], "needsConfirmation": True},
+            )
+            result = draft.generate_dossier_draft(packet, tmp.name)["draft"]
+            public = " ".join(str(result[k]) for k in ("role", "summary", "notes", "sourceUsageSummary"))
+            self.assertNotIn("Other Artist", public)
+            self.assertNotIn("public community collaborator", public)
+
     def test_common_role_labels_are_all_excluded_from_alias_terms(self):
         labels = ["artist", "member", "community", "collaborator", "mod", "system", "radio", "producer", "ai", "human", "active", "pending"]
         for label in labels:
@@ -344,6 +371,33 @@ class DossierDraftGeneratorTests(unittest.TestCase):
             combined = " ".join(str(result[k]) for k in ("role", "summary", "notes", "sourceUsageSummary", "ownerReviewWarnings", "publicSafetyWarnings", "unsupportedClaimsRejected", "tags", "proposedTags"))
             self.assertIn("Signal Fox regularly hosts public BARCODE listening-room sessions", combined)
             self.assertNotIn("Secret Fox", combined)
+
+    def test_alias_redaction_applies_to_broadcast_and_entity_intelligence_evidence(self):
+        with tempfile.NamedTemporaryFile(suffix=".db") as tmp:
+            conn = sqlite3.connect(tmp.name)
+            conn.execute(
+                "CREATE TABLE entity_intelligence_facts (subject_key TEXT, subject_name TEXT, fact_label TEXT, fact_value TEXT, visibility TEXT, authority TEXT, public_safe INTEGER, review_only INTEGER, status TEXT, last_seen_at TEXT)"
+            )
+            conn.execute("CREATE TABLE broadcast_memory (cleaned_summary TEXT, public_safe INTEGER, status TEXT)")
+            conn.execute(
+                "INSERT INTO entity_intelligence_facts VALUES (?,?,?,?,?,?,?,?,?,?)",
+                ("secret_fox", "Secret Fox", "role", "Secret Fox hosts public BARCODE collaboration reviews.", "public_safe", "owner_confirmed", 1, 0, "active", "now"),
+            )
+            conn.execute(
+                "INSERT INTO broadcast_memory VALUES (?,?,?)",
+                ("Secret Fox appears in public-safe BARCODE Radio notes.", 1, "active"),
+            )
+            conn.commit()
+            conn.close()
+            packet = pr217_packet(publicSafeFacts=[], publicSafeNotes=[], identityAliasStatus={"publicSafeIdentityLabels": ["Secret Fox"], "needsConfirmation": True})
+            evidence = draft.build_public_dossier_draft_evidence(packet, tmp.name)
+            result = draft.generate_dossier_draft(packet, tmp.name)["draft"]
+            public = " ".join(str(result[k]) for k in ("role", "summary", "notes", "sourceUsageSummary", "ownerReviewWarnings", "publicSafetyWarnings", "unsupportedClaimsRejected", "tags", "proposedTags"))
+            evidence_text = " ".join(evidence["publicFacts"] + evidence["notablePublicSignals"])
+            self.assertIn("Signal Fox hosts public BARCODE collaboration reviews", public)
+            self.assertIn("Signal Fox appears in public-safe BARCODE Radio notes", public)
+            self.assertNotIn("Secret Fox", public)
+            self.assertNotIn("Secret Fox", evidence_text)
 
     def test_entity_intelligence_public_safe_active_facts_enrich_and_private_excluded(self):
         with tempfile.NamedTemporaryFile(suffix=".db") as tmp:
