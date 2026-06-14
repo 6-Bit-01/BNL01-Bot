@@ -219,6 +219,36 @@ class DossierDraftGeneratorTests(unittest.TestCase):
             self.assertIn("public-safe structured entity evidence", combined)
             self.assertNotIn("awaiting owner review", result["summary"])
 
+    def test_matching_official_public_dossier_context_enriches_draft(self):
+        read_model = {
+            "sections": {
+                "dossiers": {
+                    "items": [
+                        {
+                            "name": "Signal Fox",
+                            "role": "Experimental electronic artist",
+                            "summary": "Signal Fox is an official public BARCODE dossier subject known for glitchy electronic collaborations.",
+                            "publicFacts": ["Signal Fox appears in the public dossier registry as a music collaborator."],
+                        },
+                        {
+                            "name": "Unrelated Star",
+                            "summary": "Unrelated Star founded the Nebula Choir.",
+                        },
+                    ]
+                }
+            }
+        }
+        result = draft.generate_dossier_draft(pr217_packet(publicSafeFacts=[], publicSafeNotes=[]), public_read_model=read_model)["draft"]
+        combined = " ".join(str(result[k]) for k in ("summary", "notes", "sourceUsageSummary"))
+        self.assertIn("public dossier registry", combined)
+        self.assertIn("official public dossier authority", combined)
+        self.assertNotIn("Nebula Choir", combined)
+
+    def test_no_public_read_model_context_warns_without_failing(self):
+        result = draft.generate_dossier_draft(pr217_packet(publicSafeFacts=[], publicSafeNotes=[]))["draft"]
+        self.assertTrue(any("No matching current public dossier/read-model facts" in x for x in result["ownerReviewWarnings"]))
+        self.assertIn("style examples were used only", result["sourceUsageSummary"])
+
     def test_private_alias_payment_and_source_blind_evidence_are_excluded(self):
         with tempfile.NamedTemporaryFile(suffix=".db") as tmp:
             conn = sqlite3.connect(tmp.name)
@@ -249,6 +279,40 @@ class DossierDraftGeneratorTests(unittest.TestCase):
                 self.assertNotIn(forbidden, public)
             self.assertTrue(any("Excluded review-only" in x for x in evidence["excludedSourceWarnings"]))
             self.assertTrue(any("memory_tiers" in x for x in evidence["excludedSourceWarnings"]))
+
+    def test_entity_intelligence_public_safe_active_facts_enrich_and_private_excluded(self):
+        with tempfile.NamedTemporaryFile(suffix=".db") as tmp:
+            conn = sqlite3.connect(tmp.name)
+            conn.execute(
+                "CREATE TABLE entity_intelligence_facts (subject_key TEXT, subject_name TEXT, fact_label TEXT, fact_value TEXT, visibility TEXT, authority TEXT, public_safe INTEGER, review_only INTEGER, status TEXT, last_seen_at TEXT)"
+            )
+            rows = [
+                ("signal_fox", "Signal Fox", "role", "Signal Fox runs public BARCODE listening-room collaborations.", "public_safe", "owner_confirmed", 1, 0, "active", "now"),
+                ("signal_fox", "Signal Fox", "private", "Signal Fox source_blind_memory private detail.", "review_only", "source_blind_memory", 0, 1, "active", "now"),
+                ("signal_fox", "Signal Fox", "payment", "Signal Fox Stripe checkout customer note.", "public_safe", "owner_confirmed", 1, 0, "active", "now"),
+            ]
+            conn.executemany("INSERT INTO entity_intelligence_facts VALUES (?,?,?,?,?,?,?,?,?,?)", rows)
+            conn.commit()
+            conn.close()
+            result = draft.generate_dossier_draft(pr217_packet(publicSafeFacts=[], publicSafeNotes=[]), tmp.name)["draft"]
+            public = " ".join(str(result[k]) for k in ("role", "summary", "notes", "sourceUsageSummary"))
+            self.assertIn("listening-room collaborations", public)
+            self.assertIn("public-safe entity intelligence fact", public)
+            self.assertNotIn("source_blind_memory", public)
+            self.assertNotIn("Stripe", public)
+
+    def test_broadcast_memory_active_public_safe_without_scope_columns_is_usable(self):
+        with tempfile.NamedTemporaryFile(suffix=".db") as tmp:
+            conn = sqlite3.connect(tmp.name)
+            conn.execute("CREATE TABLE broadcast_memory (cleaned_summary TEXT, public_safe INTEGER, status TEXT)")
+            conn.execute(
+                "INSERT INTO broadcast_memory VALUES (?,?,?)",
+                ("Signal Fox is mentioned in active public-safe BARCODE Radio broadcast memory.", 1, "active"),
+            )
+            conn.commit()
+            conn.close()
+            result = draft.generate_dossier_draft(pr217_packet(publicSafeFacts=[], publicSafeNotes=[]), tmp.name)["draft"]
+            self.assertIn("BARCODE Radio broadcast memory", " ".join(str(result[k]) for k in ("summary", "sourceUsageSummary")))
 
     def test_thin_retrieved_evidence_adds_missing_questions_and_review_warnings(self):
         with tempfile.NamedTemporaryFile(suffix=".db") as tmp:

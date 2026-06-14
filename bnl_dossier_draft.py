@@ -38,7 +38,7 @@ _NOTES_LIMIT = 900
 _PUBLIC_EVIDENCE_LIMIT = 8
 _PUBLIC_POLICIES = {"public_home", "public_context", "public_selective", "broadcast_memory", "public"}
 _PUBLIC_VISIBILITIES = {"public", "public_safe", "dossier_safe", "public_candidate", "public_use"}
-_PUBLIC_AUTHORITIES = {"public", "public_safe", "dossier_safe", "broadcast_memory", "public_conversation"}
+_PUBLIC_AUTHORITIES = {"public", "public_safe", "dossier_safe", "broadcast_memory", "public_conversation", "owner_confirmed", "official_public_dossier", "public_discord_observed", "queue_submission_confirmed"}
 
 
 def _as_list(value: Any) -> list[Any]:
@@ -190,6 +190,10 @@ def _matches_subject(text: str, terms: list[str]) -> bool:
     return any(term and term.lower() in low for term in terms)
 
 
+def _subject_key(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", (value or "").lower()).strip("_")
+
+
 def _add_bundle_item(bundle: dict[str, Any], key: str, value: str, *, max_items: int = _PUBLIC_EVIDENCE_LIMIT) -> None:
     clean = _text(value, 260)
     if not clean or _unsafe_reasons(clean):
@@ -215,7 +219,94 @@ def _classify_public_evidence(bundle: dict[str, Any], text: str) -> None:
     _add_bundle_item(bundle, "notablePublicSignals", text, max_items=5)
 
 
-def build_public_dossier_draft_evidence(packet: dict[str, Any], db_path: str | None) -> dict[str, Any]:
+def _style_guidance_used(style_packet: dict[str, Any]) -> list[str]:
+    fields = (
+        "representativePublicDossierExamples",
+        "categorySpecificExamples",
+        "goodRoleLineExamples",
+        "goodSummaryExamples",
+        "goodNotesExamples",
+        "authoringGuideSummary",
+        "taxonomyGuide",
+        "tagRegistryGuidance",
+    )
+    used = [field for field in fields if style_packet.get(field)]
+    if not used:
+        return []
+    return [f"Used site public dossier style guidance for structure, tone, length, taxonomy, and tag style only ({', '.join(used[:8])})."]
+
+
+def _read_model_public_dossier_items(read_model: dict[str, Any] | None) -> list[dict[str, Any]]:
+    if not isinstance(read_model, dict):
+        return []
+    sections = read_model.get("sections") if isinstance(read_model.get("sections"), dict) else {}
+    dossiers_section = sections.get("dossiers") if sections.get("dossiers") is not None else read_model.get("dossiers")
+    candidates: list[Any] = []
+    if isinstance(dossiers_section, dict):
+        for key in ("items", "public", "dossiers", "publicDossiers"):
+            if isinstance(dossiers_section.get(key), list):
+                candidates.extend(dossiers_section[key])
+    elif isinstance(dossiers_section, list):
+        candidates.extend(dossiers_section)
+    for key in ("publicDossiers", "dossiers"):
+        if isinstance(read_model.get(key), list):
+            candidates.extend(read_model[key])
+    out: list[dict[str, Any]] = []
+    for item in candidates:
+        if isinstance(item, dict) and item not in out:
+            out.append(item)
+    return out
+
+
+def _dossier_public_texts(dossier: dict[str, Any]) -> list[str]:
+    bnl_context = _dict(dossier.get("bnlContext"))
+    texts = _strings(
+        [
+            dossier.get("role"),
+            dossier.get("summary") or dossier.get("description") or dossier.get("publicSummary"),
+            dossier.get("notes") or bnl_context.get("notes"),
+        ],
+        max_items=5,
+    )
+    texts += _strings(dossier.get("publicFacts"), max_items=6)
+    return [text for text in texts if not _unsafe_reasons(text)]
+
+
+def _matching_public_dossiers(packet: dict[str, Any], read_model: dict[str, Any] | None) -> list[dict[str, Any]]:
+    name, aliases = _subject_terms(packet)
+    candidate = _dict(packet.get("candidate"))
+    source_file_id = _text(candidate.get("sourceFileId"), 160)
+    terms = {name.lower(), _subject_key(name)}
+    terms.update(alias.lower() for alias in aliases)
+    terms.update(_subject_key(alias) for alias in aliases)
+    if source_file_id:
+        terms.add(source_file_id.lower())
+    matches: list[dict[str, Any]] = []
+    packet_contexts = []
+    for key in ("officialPublicDossierContext", "currentPublicDossierContext", "matchingPublicDossier", "publicDossierContext"):
+        value = packet.get(key)
+        if isinstance(value, dict):
+            packet_contexts.append(value)
+        elif isinstance(value, list):
+            packet_contexts.extend(item for item in value if isinstance(item, dict))
+    for dossier in packet_contexts + _read_model_public_dossier_items(read_model):
+        fields = [
+            dossier.get("name"),
+            dossier.get("title"),
+            dossier.get("slug"),
+            dossier.get("id"),
+            dossier.get("publicId"),
+            dossier.get("sourceFileId"),
+            dossier.get("subjectName"),
+        ]
+        keys = {str(field).strip().lower() for field in fields if field}
+        keys.update(_subject_key(str(field)) for field in fields if field)
+        if terms & keys:
+            matches.append(dossier)
+    return matches[:3]
+
+
+def build_public_dossier_draft_evidence(packet: dict[str, Any], db_path: str | None, public_read_model: dict[str, Any] | None = None) -> dict[str, Any]:
     """Build a temporary public-safe evidence bundle for draft authoring.
 
     This is read-only and intentionally narrow: the Source File packet provides
@@ -235,6 +326,9 @@ def build_public_dossier_draft_evidence(packet: dict[str, Any], db_path: str | N
         "publicRelationshipToBarcode": [],
         "recurringPublicTopics": [],
         "notablePublicSignals": [],
+        "officialPublicDossierContext": [],
+        "publicDossierStyleGuidanceUsed": _style_guidance_used(_dict(packet.get("stylePacket"))),
+        "publicDossierContextWarnings": [],
         "sourceSummariesUsed": [],
         "excludedSourceWarnings": [],
         "missingInfoQuestions": [],
@@ -245,6 +339,18 @@ def build_public_dossier_draft_evidence(packet: dict[str, Any], db_path: str | N
         _classify_public_evidence(bundle, fact)
     for note in _strings(packet.get("publicSafeNotes"), max_items=6):
         _classify_public_evidence(bundle, note)
+    matching_dossiers = _matching_public_dossiers(packet, public_read_model)
+    if matching_dossiers:
+        used = 0
+        for dossier in matching_dossiers:
+            for text in _dossier_public_texts(dossier):
+                _add_bundle_item(bundle, "officialPublicDossierContext", text, max_items=8)
+                _classify_public_evidence(bundle, text)
+                used += 1
+        if used:
+            bundle["sourceSummariesUsed"].append("Used matching current public dossier context as official public dossier authority.")
+    else:
+        bundle["publicDossierContextWarnings"].append("No matching current public dossier/read-model facts were available as a direct official source; style examples were used only for structure and tone.")
     if not db_path:
         bundle["excludedSourceWarnings"].append("Local BNL evidence database was not available; used the packet boundary only.")
     else:
@@ -257,7 +363,6 @@ def build_public_dossier_draft_evidence(packet: dict[str, Any], db_path: str | N
             conn.row_factory = sqlite3.Row
             try:
                 if _table_exists(conn, "entity_evidence_events"):
-                    cols = _table_columns(conn, "entity_evidence_events")
                     rows = conn.execute("SELECT * FROM entity_evidence_events ORDER BY COALESCE(updated_at, created_at, '') DESC LIMIT 250").fetchall()
                     used = 0
                     excluded = 0
@@ -289,7 +394,37 @@ def build_public_dossier_draft_evidence(packet: dict[str, Any], db_path: str | N
                         bundle["sourceSummariesUsed"].append(f"Used {used} public-safe structured entity evidence summarie(s).")
                     if excluded:
                         bundle["excludedSourceWarnings"].append("Excluded review-only or non-public structured entity evidence.")
+                if _table_exists(conn, "entity_intelligence_facts"):
+                    cols = _table_columns(conn, "entity_intelligence_facts")
+                    order_col = "last_seen_at" if "last_seen_at" in cols else ("updated_at" if "updated_at" in cols else "rowid")
+                    rows = conn.execute(f"SELECT * FROM entity_intelligence_facts ORDER BY {order_col} DESC LIMIT 250").fetchall()
+                    used = 0
+                    excluded = 0
+                    wanted_key = _subject_key(name)
+                    for row in rows:
+                        data = dict(row)
+                        row_subject_key = _subject_key(str(data.get("subject_key") or data.get("subject_name") or ""))
+                        subject_name = str(data.get("subject_name") or "")
+                        if row_subject_key != wanted_key and subject_name.lower() != name.lower():
+                            continue
+                        status = str(data.get("status") or "active").lower()
+                        visibility = str(data.get("visibility") or "").lower()
+                        authority = str(data.get("authority") or "").lower()
+                        public_safe = bool(data.get("public_safe"))
+                        review_only = bool(data.get("review_only"))
+                        if status != "active" or not public_safe or review_only or visibility not in _PUBLIC_VISIBILITIES or authority not in _PUBLIC_AUTHORITIES:
+                            excluded += 1
+                            continue
+                        text = _text(data.get("fact_value") or data.get("fact_label"), 260)
+                        if text and not _unsafe_reasons(text):
+                            _classify_public_evidence(bundle, text)
+                            used += 1
+                    if used:
+                        bundle["sourceSummariesUsed"].append(f"Used {used} public-safe entity intelligence fact(s).")
+                    if excluded:
+                        bundle["excludedSourceWarnings"].append("Excluded private, review-only, inactive, or non-public entity intelligence facts.")
                 if _table_exists(conn, "broadcast_memory"):
+                    bcols = _table_columns(conn, "broadcast_memory")
                     rows = conn.execute("SELECT * FROM broadcast_memory ORDER BY rowid DESC LIMIT 250").fetchall()
                     used = 0
                     excluded = 0
@@ -300,7 +435,8 @@ def build_public_dossier_draft_evidence(packet: dict[str, Any], db_path: str | N
                             continue
                         status = str(data.get("status") or "active").lower()
                         scope = str(data.get("usage_scope") or data.get("visibility") or "").lower()
-                        if not bool(data.get("public_safe")) or status != "active" or scope not in {"public", "public_safe", "broadcast_memory", "dossier_safe"}:
+                        has_scope = "usage_scope" in bcols or "visibility" in bcols
+                        if not bool(data.get("public_safe")) or status != "active" or (has_scope and scope not in {"public", "public_safe", "broadcast_memory", "dossier_safe"}):
                             excluded += 1
                             continue
                         if text and not _unsafe_reasons(text):
@@ -533,7 +669,7 @@ def _source_usage_summary(packet: dict[str, Any]) -> str:
     return " ".join(parts)
 
 
-def generate_dossier_draft(packet: dict[str, Any], db_path: str | None = None) -> dict[str, Any]:
+def generate_dossier_draft(packet: dict[str, Any], db_path: str | None = None, public_read_model: dict[str, Any] | None = None) -> dict[str, Any]:
     candidate = _dict(packet.get("candidate"))
     safe_classification = _dict(packet.get("safeClassification"))
     style_packet = _dict(packet.get("stylePacket"))
@@ -543,7 +679,7 @@ def generate_dossier_draft(packet: dict[str, Any], db_path: str | None = None) -
     public_notes, rejected_notes = _reject_unsafe_public(_strings(packet.get("publicSafeNotes"), max_items=12))
     evidence: dict[str, Any] | None = None
     try:
-        evidence = build_public_dossier_draft_evidence(packet, db_path)
+        evidence = build_public_dossier_draft_evidence(packet, db_path, public_read_model=public_read_model)
         evidence_texts: list[str] = []
         for key in (
             "publicFacts",
@@ -553,6 +689,7 @@ def generate_dossier_draft(packet: dict[str, Any], db_path: str | None = None) -
             "publicCreativeMusicContext",
             "publicRelationshipToBarcode",
             "notablePublicSignals",
+            "officialPublicDossierContext",
         ):
             evidence_texts.extend(_strings(evidence.get(key), max_items=8))
         evidence_safe, evidence_rejected = _reject_unsafe_public(evidence_texts)
@@ -582,6 +719,8 @@ def generate_dossier_draft(packet: dict[str, Any], db_path: str | None = None) -
     if evidence:
         for item in _strings(evidence.get("excludedSourceWarnings"), max_items=5):
             owner_warnings.append(item)
+        for item in _strings(evidence.get("publicDossierContextWarnings"), max_items=3):
+            owner_warnings.append(item)
         for item in _strings(evidence.get("thinReasons"), max_items=3):
             owner_warnings.append(item)
 
@@ -598,6 +737,8 @@ def generate_dossier_draft(packet: dict[str, Any], db_path: str | None = None) -
         rejected.append("No unsafe supplied material was needed for public-facing fields.")
     if evidence and evidence.get("matchedAliasesUsedPrivately"):
         rejected.append("Used approved identity labels only as private matching hints; did not expose alias text in public fields.")
+    if evidence and evidence.get("publicDossierStyleGuidanceUsed"):
+        rejected.append("Used public dossier examples for style and field shape only; unrelated example facts were not copied.")
 
     tags, proposed_tags = _split_tags(packet, style_packet, category, kind, lane, public_facts, public_notes)
 
@@ -623,6 +764,8 @@ def generate_dossier_draft(packet: dict[str, Any], db_path: str | None = None) -
         "publicSafetyWarnings": public_warnings[:12],
         "unsupportedClaimsRejected": rejected[:14],
         "sourceUsageSummary": _source_usage_summary(packet)
-        + (" " + " ".join(_strings(evidence.get("sourceSummariesUsed"), max_items=4)) if evidence else ""),
+        + (" " + " ".join(_strings(evidence.get("sourceSummariesUsed"), max_items=4)) if evidence else "")
+        + (" " + " ".join(_strings(evidence.get("publicDossierStyleGuidanceUsed"), max_items=2)) if evidence else "")
+        + (" " + " ".join(_strings(evidence.get("publicDossierContextWarnings"), max_items=2)) if evidence else ""),
     }
     return {"draft": draft}
