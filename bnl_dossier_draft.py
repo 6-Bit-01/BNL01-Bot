@@ -11,7 +11,7 @@ import re
 import sqlite3
 from typing import Any
 
-from bnl_subject_memory_resolver import resolve_subject_memory
+from bnl_subject_memory_resolver import build_subject_analyst_read, resolve_subject_memory
 
 DRAFT_ENDPOINT_PATH = "/internal/dossiers/draft"
 DRAFT_TOKEN_HEADER = "X-BNL-DOSSIER-DRAFT-TOKEN"
@@ -862,6 +862,7 @@ def generate_dossier_draft(packet: dict[str, Any], db_path: str | None = None, p
     public_notes = clean_public_notes
     evidence: dict[str, Any] | None = None
     resolver: dict[str, Any] | None = None
+    analyst: dict[str, Any] | None = None
     try:
         evidence = build_public_dossier_draft_evidence(packet, db_path, public_read_model=public_read_model)
         evidence_texts: list[str] = []
@@ -887,17 +888,8 @@ def generate_dossier_draft(packet: dict[str, Any], db_path: str | None = None, p
         try:
             _, resolver_aliases = _subject_terms(packet)
             resolver = resolve_subject_memory(name, db_path, aliases=resolver_aliases)
-            resolver_texts: list[str] = []
-            for key in (
-                "publicSafeFacts",
-                "publicSafeNotes",
-                "publicRoleSignals",
-                "publicCreativeMusicSignals",
-                "publicCommunitySignals",
-                "publicLinkSignals",
-                "relationshipOrContextSignals",
-            ):
-                resolver_texts.extend(_strings(resolver.get(key), max_items=8))
+            analyst = build_subject_analyst_read(name, resolver, packet)
+            resolver_texts = _strings(analyst.get("draftIngredients"), max_items=9) + _strings(analyst.get("publicSafeClaims"), max_items=6)
             resolver_safe, resolver_rejected = _reject_unsafe_public(resolver_texts)
             for item in resolver_safe:
                 if item not in public_facts:
@@ -906,6 +898,14 @@ def generate_dossier_draft(packet: dict[str, Any], db_path: str | None = None, p
         except Exception:
             resolver = None
     role = _role_from_context(public_facts, public_notes, category, kind, lane)[:_ROLE_LIMIT]
+    if analyst:
+        analyst_public = " ".join(_strings(analyst.get("draftIngredients"), max_items=9) + _strings(analyst.get("publicSafeClaims"), max_items=6)).lower()
+        if re.search(r"\b(music|artist|musician|track|song|album|producer|dj)\b", analyst_public):
+            role = "Music artist"
+        elif analyst.get("likelySubjectType") == "community_participant" and analyst.get("publicDraftPosture") in {"confident", "conservative"}:
+            role = "Community participant"
+        elif analyst.get("confidence") == "low" and role == "Review pending":
+            role = "Dossier subject"
     thin = len(public_facts) + len(public_notes) < 2
 
     missing = _strings(packet.get("missingInfo"), max_items=8)
@@ -915,6 +915,10 @@ def generate_dossier_draft(packet: dict[str, Any], db_path: str | None = None, p
                 missing.append(item)
     if resolver:
         for item in _strings(resolver.get("missingInfoQuestions"), max_items=4):
+            if item not in missing:
+                missing.append(item)
+    if analyst:
+        for item in _strings(analyst.get("missingInfoQuestions"), max_items=5):
             if item not in missing:
                 missing.append(item)
     if thin:
@@ -943,6 +947,13 @@ def generate_dossier_draft(packet: dict[str, Any], db_path: str | None = None, p
             )
         for item in _strings(resolver.get("sourceSafetyWarnings"), max_items=3):
             owner_warnings.append(item)
+    if analyst:
+        if _text(analyst.get("internalRead"), 500):
+            owner_warnings.append(f"BNL internal subject read: {_text(analyst.get('internalRead'), 460)}")
+        for item in _strings(analyst.get("recommendedAdminActions"), max_items=3):
+            owner_warnings.append(f"BNL analyst recommended action: {item}")
+        for item in _strings(analyst.get("doNotSayPublicly"), max_items=3):
+            public_warnings.append(item)
 
     rejected = rejected_facts + rejected_notes
     for unsafe_key in ("doNotSayNotes", "reviewOnlyWarnings", "forbiddenPublicCopyPatterns"):
@@ -963,6 +974,11 @@ def generate_dossier_draft(packet: dict[str, Any], db_path: str | None = None, p
         rejected.append("BNL memory needing review was used only for owner-review metadata, not public dossier copy.")
     if resolver and _dict(resolver.get("evidenceCounts")).get("sourceBlind"):
         rejected.append("BNL memory without public-safe provenance was counted but not used as public dossier copy.")
+    if analyst:
+        for item in _strings(analyst.get("reviewNeededClaims"), max_items=4):
+            rejected.append(item)
+        for item in _strings(analyst.get("sourceBlindInsights"), max_items=2):
+            rejected.append(item)
     if evidence and evidence.get("publicDossierStyleGuidanceUsed"):
         rejected.append("Used public dossier examples for style and field shape only; unrelated example facts were not copied.")
 
@@ -998,9 +1014,10 @@ def generate_dossier_draft(packet: dict[str, Any], db_path: str | None = None, p
                     for item in (_strings(evidence.get("sourceSummariesUsed"), max_items=4) if evidence else [])
                     if not _SOURCE_USAGE_FORBIDDEN_RE.search(item)
                 ),
-                (
-                    f"Used {int(_dict(resolver.get('evidenceCounts')).get('publicSafe') or 0)} public-safe subject memory resolver items."
-                    if resolver and int(_dict(resolver.get('evidenceCounts')).get('publicSafe') or 0) else ""
+                *(
+                    item
+                    for item in (_strings(analyst.get("provenanceSummary"), max_items=3) if analyst else [])
+                    if not _SOURCE_USAGE_FORBIDDEN_RE.search(item)
                 ),
             ]
             if part

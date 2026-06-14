@@ -616,6 +616,41 @@ class DossierDraftGeneratorTests(unittest.TestCase):
             self.assertTrue(any("Add approved public-safe subject evidence" in x for x in result["missingInfoQuestions"]))
             self.assertTrue(any("Fewer than two public-safe evidence" in x for x in result["ownerReviewWarnings"]))
 
+    def test_crow_like_memory_uses_analyst_metadata_and_conservative_public_copy(self):
+        with tempfile.NamedTemporaryFile(suffix=".db") as tmp:
+            conn = sqlite3.connect(tmp.name)
+            conn.execute("CREATE TABLE entity_evidence_events (subject_name TEXT, safe_summary TEXT, channel_policy TEXT, visibility TEXT, authority TEXT, public_safe_candidate INTEGER, review_only INTEGER)")
+            conn.execute("CREATE TABLE broadcast_memory (cleaned_summary TEXT, public_safe INTEGER, status TEXT)")
+            conn.execute("CREATE TABLE message_memory (subject_name TEXT, summary TEXT, visibility TEXT, public_safe INTEGER)")
+            for idx in range(14):
+                conn.execute("INSERT INTO entity_evidence_events VALUES (?,?,?,?,?,?,?)", ("Crow", f"Crow has recurring public BARCODE community interaction pattern {idx}.", "public_home", "public", "public_safe", 1, 0))
+            conn.execute("INSERT INTO entity_evidence_events VALUES (?,?,?,?,?,?,?)", ("Crow", "Crow may be a music artist with queue and public link relationship needing confirmation.", "", "review_only", "", 0, 1))
+            conn.execute("INSERT INTO broadcast_memory VALUES (?,?,?)", ("Crow source-blind music link clue without provenance.", 0, "active"))
+            conn.execute("INSERT INTO message_memory VALUES (?,?,?,?)", ("Crow", "Crow Stripe Priority customer raw Discord ID 123456 note.", "public_safe", 1))
+            conn.commit(); conn.close()
+            packet = pr217_packet(candidate={"sourceFileId":"sf_crow", "subjectName":"Crow"}, publicSafeFacts=[], publicSafeNotes=[], safeClassification={"category":"Unknown", "kind":"Person", "ecosystemLane":"Unknown"}, identityAliasStatus={"needsConfirmation": True})
+            result = draft.generate_dossier_draft(packet, tmp.name)["draft"]
+            self.assertIn(result["role"], {"Community participant", "Community member"})
+            public = " ".join(str(result[k]) for k in ("role", "summary", "notes", "sourceUsageSummary")).lower()
+            for forbidden in ("owner", "admin", "review-only", "source-blind", "private", "internal", "stripe", "priority", "customer", "discord id"):
+                self.assertNotIn(forbidden, public)
+            self.assertIn("reduced them to", result["sourceUsageSummary"])
+            self.assertTrue(any("BNL internal subject read" in x and "recurring BARCODE-facing community subject" in x for x in result["ownerReviewWarnings"]))
+            self.assertTrue(any("display name" in x.lower() for x in result["missingInfoQuestions"]))
+            self.assertTrue(any("public links" in x.lower() for x in result["missingInfoQuestions"]))
+            self.assertTrue(any("role" in x.lower() or "music" in x.lower() or "link" in x.lower() for x in result["unsupportedClaimsRejected"]))
+
+    def test_analyst_music_role_requires_clean_public_music_evidence(self):
+        with tempfile.NamedTemporaryFile(suffix=".db") as tmp:
+            conn = sqlite3.connect(tmp.name)
+            conn.execute("CREATE TABLE entity_evidence_events (subject_name TEXT, safe_summary TEXT, channel_policy TEXT, visibility TEXT, authority TEXT, public_safe_candidate INTEGER, review_only INTEGER)")
+            conn.execute("INSERT INTO entity_evidence_events VALUES (?,?,?,?,?,?,?)", ("Crow", "Crow is a confirmed public-safe music artist connected to BARCODE Radio.", "public_home", "public", "public_safe", 1, 0))
+            conn.commit(); conn.close()
+            packet = pr217_packet(candidate={"sourceFileId":"sf_crow", "subjectName":"Crow"}, publicSafeFacts=[], publicSafeNotes=[], safeClassification={"category":"Unknown", "kind":"Person", "ecosystemLane":"Unknown"})
+            result = draft.generate_dossier_draft(packet, tmp.name)["draft"]
+            self.assertEqual(result["role"], "Music artist")
+            self.assertIn("music artist", result["summary"].lower())
+
     def test_validation_requires_candidate_and_style_packet(self):
         errors = draft.validate_dossier_draft_packet({"requestType": "bad", "fieldRequirements": ["summary"]})
         self.assertIn("invalid_requestType", errors)
