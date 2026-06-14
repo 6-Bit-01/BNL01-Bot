@@ -39,6 +39,12 @@ _PUBLIC_EVIDENCE_LIMIT = 8
 _PUBLIC_POLICIES = {"public_home", "public_context", "public_selective", "broadcast_memory", "public"}
 _PUBLIC_VISIBILITIES = {"public", "public_safe", "dossier_safe", "public_candidate", "public_use"}
 _PUBLIC_AUTHORITIES = {"public", "public_safe", "dossier_safe", "broadcast_memory", "public_conversation", "owner_confirmed", "official_public_dossier", "public_discord_observed", "queue_submission_confirmed"}
+_ROLE_OR_TAXONOMY_LABELS = {
+    "artist", "member", "community", "collaborator", "mod", "moderator", "personnel", "staff",
+    "sponsor", "system", "interface", "production", "radio", "producer", "ai", "human", "hybrid",
+    "unknown", "public", "internal", "restricted", "active", "pending", "person", "music",
+    "tech", "systems", "broadcast", "participant", "dossier", "source", "source file",
+}
 
 
 def _as_list(value: Any) -> list[Any]:
@@ -156,6 +162,27 @@ def _candidate_name(candidate: dict[str, Any]) -> str:
     return _text(candidate.get("subjectName") or candidate.get("name"), 120) or "Unnamed Source File subject"
 
 
+def _identity_label_kind(label: str) -> str:
+    clean = _text(label, 100)
+    low = clean.lower().strip()
+    if not clean:
+        return "empty"
+    if low in _ROLE_OR_TAXONOMY_LABELS:
+        return "role_label"
+    if len(clean) < 3 or len(clean) > 80:
+        return "role_label"
+    words = re.findall(r"[A-Za-z0-9]+", clean)
+    if not words:
+        return "role_label"
+    if len(words) == 1 and clean.islower() and not any(ch.isdigit() for ch in clean):
+        return "role_label"
+    return "subject_alias"
+
+
+def _is_probable_subject_alias(label: str) -> bool:
+    return _identity_label_kind(label) == "subject_alias"
+
+
 def _subject_terms(packet: dict[str, Any]) -> tuple[str, list[str]]:
     candidate = _dict(packet.get("candidate"))
     name = _candidate_name(candidate)
@@ -165,7 +192,7 @@ def _subject_terms(packet: dict[str, Any]) -> tuple[str, list[str]]:
     labels += _strings(current.get("name"), limit_each=100, max_items=1)
     aliases: list[str] = []
     for label in labels:
-        if label and label.lower() != name.lower() and label not in aliases and not _unsafe_reasons(label):
+        if label and label.lower() != name.lower() and label not in aliases and not _unsafe_reasons(label) and _is_probable_subject_alias(label):
             aliases.append(label)
     return name, aliases[:8]
 
@@ -192,6 +219,54 @@ def _matches_subject(text: str, terms: list[str]) -> bool:
 
 def _subject_key(value: str) -> str:
     return re.sub(r"[^a-z0-9]+", "_", (value or "").lower()).strip("_")
+
+
+def _redact_private_match_terms(text: str, private_terms: list[str], public_subject_name: str) -> str:
+    clean = _text(text, 500)
+    replacement = _text(public_subject_name, 120) or "the subject"
+    for term in sorted({t for t in private_terms if t}, key=len, reverse=True):
+        if term.lower() == replacement.lower():
+            continue
+        clean = re.sub(re.escape(term), replacement, clean, flags=re.I)
+    return clean
+
+
+def _sql_subject_filter(cols: set[str], text_cols: list[str], name: str, aliases: list[str]) -> tuple[str, list[Any]]:
+    clauses: list[str] = []
+    params: list[Any] = []
+    key_terms = [_subject_key(name)] + [_subject_key(alias) for alias in aliases if alias]
+    exact_terms = [name] + aliases
+    if "subject_key" in cols:
+        placeholders = ",".join("?" for _ in key_terms)
+        clauses.append(f"LOWER(subject_key) IN ({placeholders})")
+        params.extend(key_terms)
+    if "subject_name" in cols:
+        placeholders = ",".join("?" for _ in exact_terms)
+        clauses.append(f"LOWER(subject_name) IN ({placeholders})")
+        params.extend(term.lower() for term in exact_terms)
+    for col in text_cols:
+        if col in cols:
+            for term in exact_terms:
+                clauses.append(f"{col} LIKE ?")
+                params.append(f"%{term}%")
+    return (" OR ".join(f"({clause})" for clause in clauses), params)
+
+
+def _fetch_subject_rows(
+    conn: sqlite3.Connection,
+    table: str,
+    *,
+    cols: set[str],
+    text_cols: list[str],
+    name: str,
+    aliases: list[str],
+    order_expr: str = "rowid DESC",
+    limit: int = 250,
+) -> list[sqlite3.Row]:
+    where, params = _sql_subject_filter(cols, text_cols, name, aliases)
+    if where:
+        return conn.execute(f"SELECT * FROM {table} WHERE {where} ORDER BY {order_expr} LIMIT ?", [*params, limit]).fetchall()
+    return conn.execute(f"SELECT * FROM {table} ORDER BY {order_expr} LIMIT ?", (limit,)).fetchall()
 
 
 def _add_bundle_item(bundle: dict[str, Any], key: str, value: str, *, max_items: int = _PUBLIC_EVIDENCE_LIMIT) -> None:
@@ -363,7 +438,25 @@ def build_public_dossier_draft_evidence(packet: dict[str, Any], db_path: str | N
             conn.row_factory = sqlite3.Row
             try:
                 if _table_exists(conn, "entity_evidence_events"):
-                    rows = conn.execute("SELECT * FROM entity_evidence_events ORDER BY COALESCE(updated_at, created_at, '') DESC LIMIT 250").fetchall()
+                    ecols = _table_columns(conn, "entity_evidence_events")
+                    if {"updated_at", "created_at"} <= ecols:
+                        order_expr = "COALESCE(updated_at, created_at, '') DESC"
+                    elif "updated_at" in ecols:
+                        order_expr = "updated_at DESC"
+                    elif "created_at" in ecols:
+                        order_expr = "created_at DESC"
+                    else:
+                        order_expr = "rowid DESC"
+                    rows = _fetch_subject_rows(
+                        conn,
+                        "entity_evidence_events",
+                        cols=ecols,
+                        text_cols=["safe_summary", "topic"],
+                        name=name,
+                        aliases=aliases,
+                        order_expr=order_expr,
+                        limit=250,
+                    )
                     used = 0
                     excluded = 0
                     for row in rows:
@@ -380,7 +473,7 @@ def build_public_dossier_draft_evidence(packet: dict[str, Any], db_path: str | N
                         if review_only or not (safe_flag or policy in _PUBLIC_POLICIES or visibility in _PUBLIC_VISIBILITIES or authority in _PUBLIC_AUTHORITIES):
                             excluded += 1
                             continue
-                        text = _text(data.get("safe_summary"), 260)
+                        text = _redact_private_match_terms(_text(data.get("safe_summary"), 260), matched, name)
                         for alias in matched:
                             if alias not in bundle["matchedAliasesUsedPrivately"]:
                                 bundle["matchedAliasesUsedPrivately"].append(alias)
@@ -397,15 +490,25 @@ def build_public_dossier_draft_evidence(packet: dict[str, Any], db_path: str | N
                 if _table_exists(conn, "entity_intelligence_facts"):
                     cols = _table_columns(conn, "entity_intelligence_facts")
                     order_col = "last_seen_at" if "last_seen_at" in cols else ("updated_at" if "updated_at" in cols else "rowid")
-                    rows = conn.execute(f"SELECT * FROM entity_intelligence_facts ORDER BY {order_col} DESC LIMIT 250").fetchall()
+                    rows = _fetch_subject_rows(
+                        conn,
+                        "entity_intelligence_facts",
+                        cols=cols,
+                        text_cols=["fact_value", "fact_label"],
+                        name=name,
+                        aliases=aliases,
+                        order_expr=f"{order_col} DESC",
+                        limit=250,
+                    )
                     used = 0
                     excluded = 0
-                    wanted_key = _subject_key(name)
+                    wanted_keys = {_subject_key(name), *(_subject_key(alias) for alias in aliases)}
+                    wanted_names = {name.lower(), *(alias.lower() for alias in aliases)}
                     for row in rows:
                         data = dict(row)
                         row_subject_key = _subject_key(str(data.get("subject_key") or data.get("subject_name") or ""))
                         subject_name = str(data.get("subject_name") or "")
-                        if row_subject_key != wanted_key and subject_name.lower() != name.lower():
+                        if row_subject_key not in wanted_keys and subject_name.lower() not in wanted_names:
                             continue
                         status = str(data.get("status") or "active").lower()
                         visibility = str(data.get("visibility") or "").lower()
@@ -415,7 +518,12 @@ def build_public_dossier_draft_evidence(packet: dict[str, Any], db_path: str | N
                         if status != "active" or not public_safe or review_only or visibility not in _PUBLIC_VISIBILITIES or authority not in _PUBLIC_AUTHORITIES:
                             excluded += 1
                             continue
-                        text = _text(data.get("fact_value") or data.get("fact_label"), 260)
+                        hay = " ".join(str(data.get(c) or "") for c in ("subject_name", "fact_value", "fact_label"))
+                        matched = [t for t in terms[1:] if _matches_subject(hay, [t])]
+                        text = _redact_private_match_terms(_text(data.get("fact_value") or data.get("fact_label"), 260), matched, name)
+                        for alias in matched:
+                            if alias not in bundle["matchedAliasesUsedPrivately"]:
+                                bundle["matchedAliasesUsedPrivately"].append(alias)
                         if text and not _unsafe_reasons(text):
                             _classify_public_evidence(bundle, text)
                             used += 1
@@ -425,14 +533,28 @@ def build_public_dossier_draft_evidence(packet: dict[str, Any], db_path: str | N
                         bundle["excludedSourceWarnings"].append("Excluded private, review-only, inactive, or non-public entity intelligence facts.")
                 if _table_exists(conn, "broadcast_memory"):
                     bcols = _table_columns(conn, "broadcast_memory")
-                    rows = conn.execute("SELECT * FROM broadcast_memory ORDER BY rowid DESC LIMIT 250").fetchall()
+                    rows = _fetch_subject_rows(
+                        conn,
+                        "broadcast_memory",
+                        cols=bcols,
+                        text_cols=["cleaned_summary", "summary", "raw_note"],
+                        name=name,
+                        aliases=aliases,
+                        order_expr="rowid DESC",
+                        limit=250,
+                    )
                     used = 0
                     excluded = 0
                     for row in rows:
                         data = dict(row)
-                        text = _text(data.get("cleaned_summary") or data.get("summary") or data.get("raw_note"), 260)
+                        raw_text = _text(data.get("cleaned_summary") or data.get("summary") or data.get("raw_note"), 260)
+                        matched = [t for t in terms[1:] if _matches_subject(raw_text, [t])]
+                        text = _redact_private_match_terms(raw_text, matched, name)
                         if not _matches_subject(text, terms):
                             continue
+                        for alias in matched:
+                            if alias not in bundle["matchedAliasesUsedPrivately"]:
+                                bundle["matchedAliasesUsedPrivately"].append(alias)
                         status = str(data.get("status") or "active").lower()
                         scope = str(data.get("usage_scope") or data.get("visibility") or "").lower()
                         has_scope = "usage_scope" in bcols or "visibility" in bcols

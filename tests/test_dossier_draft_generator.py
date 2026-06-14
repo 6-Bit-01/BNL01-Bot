@@ -280,6 +280,42 @@ class DossierDraftGeneratorTests(unittest.TestCase):
             self.assertTrue(any("Excluded review-only" in x for x in evidence["excludedSourceWarnings"]))
             self.assertTrue(any("memory_tiers" in x for x in evidence["excludedSourceWarnings"]))
 
+    def test_role_identity_label_is_not_used_as_subject_alias(self):
+        with tempfile.NamedTemporaryFile(suffix=".db") as tmp:
+            conn = sqlite3.connect(tmp.name)
+            conn.execute(
+                "CREATE TABLE entity_evidence_events (subject_name TEXT, safe_summary TEXT, topic TEXT, relation_to_subject TEXT, channel_policy TEXT, visibility TEXT, authority TEXT, public_safe_candidate INTEGER, review_only INTEGER, updated_at TEXT, created_at TEXT)"
+            )
+            conn.execute(
+                "INSERT INTO entity_evidence_events VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                ("Other Person", "Other Person is a public artist with unrelated BARCODE activity.", "artist", "matched", "public_home", "public", "public_safe", 1, 0, "2026-06-14", "2026-06-14"),
+            )
+            conn.commit()
+            conn.close()
+            packet = pr217_packet(publicSafeFacts=[], publicSafeNotes=[], identityAliasStatus={"publicSafeIdentityLabels": ["artist"], "needsConfirmation": True})
+            result = draft.generate_dossier_draft(packet, tmp.name)["draft"]
+            public = " ".join(str(result[k]) for k in ("role", "summary", "notes"))
+            self.assertNotIn("Other Person", public)
+            self.assertNotIn("unrelated BARCODE activity", public)
+
+    def test_name_like_alias_matches_and_is_redacted_from_public_fields(self):
+        with tempfile.NamedTemporaryFile(suffix=".db") as tmp:
+            conn = sqlite3.connect(tmp.name)
+            conn.execute(
+                "CREATE TABLE entity_evidence_events (subject_name TEXT, safe_summary TEXT, topic TEXT, relation_to_subject TEXT, channel_policy TEXT, visibility TEXT, authority TEXT, public_safe_candidate INTEGER, review_only INTEGER, updated_at TEXT, created_at TEXT)"
+            )
+            conn.execute(
+                "INSERT INTO entity_evidence_events VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                ("Secret Fox", "Secret Fox regularly hosts public BARCODE listening-room sessions.", "community", "matched", "public_home", "public", "public_safe", 1, 0, "2026-06-14", "2026-06-14"),
+            )
+            conn.commit()
+            conn.close()
+            packet = pr217_packet(publicSafeFacts=[], publicSafeNotes=[], identityAliasStatus={"publicSafeIdentityLabels": ["Secret Fox"], "needsConfirmation": True})
+            result = draft.generate_dossier_draft(packet, tmp.name)["draft"]
+            combined = " ".join(str(result[k]) for k in ("role", "summary", "notes", "sourceUsageSummary", "ownerReviewWarnings", "publicSafetyWarnings", "unsupportedClaimsRejected", "tags", "proposedTags"))
+            self.assertIn("Signal Fox regularly hosts public BARCODE listening-room sessions", combined)
+            self.assertNotIn("Secret Fox", combined)
+
     def test_entity_intelligence_public_safe_active_facts_enrich_and_private_excluded(self):
         with tempfile.NamedTemporaryFile(suffix=".db") as tmp:
             conn = sqlite3.connect(tmp.name)
@@ -301,6 +337,46 @@ class DossierDraftGeneratorTests(unittest.TestCase):
             self.assertNotIn("source_blind_memory", public)
             self.assertNotIn("Stripe", public)
 
+    def test_subject_filtering_happens_before_entity_evidence_row_limit(self):
+        with tempfile.NamedTemporaryFile(suffix=".db") as tmp:
+            conn = sqlite3.connect(tmp.name)
+            conn.execute(
+                "CREATE TABLE entity_evidence_events (subject_key TEXT, subject_name TEXT, safe_summary TEXT, topic TEXT, relation_to_subject TEXT, channel_policy TEXT, visibility TEXT, authority TEXT, public_safe_candidate INTEGER, review_only INTEGER, updated_at TEXT, created_at TEXT)"
+            )
+            conn.execute(
+                "INSERT INTO entity_evidence_events VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                ("signal_fox", "Signal Fox", "Signal Fox has older public-safe dossier-worthy source evidence.", "community", "matched", "public_home", "public", "public_safe", 1, 0, "2026-01-01", "2026-01-01"),
+            )
+            for idx in range(300):
+                conn.execute(
+                    "INSERT INTO entity_evidence_events VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (f"other_{idx}", f"Other {idx}", f"Other {idx} public artist note.", "artist", "matched", "public_home", "public", "public_safe", 1, 0, f"2026-06-{idx % 28 + 1:02d}", f"2026-06-{idx % 28 + 1:02d}"),
+                )
+            conn.commit()
+            conn.close()
+            result = draft.generate_dossier_draft(pr217_packet(publicSafeFacts=[], publicSafeNotes=[]), tmp.name)["draft"]
+            self.assertIn("older public-safe dossier-worthy", " ".join(str(result[k]) for k in ("summary", "sourceUsageSummary")))
+
+    def test_subject_filtering_happens_before_entity_intelligence_row_limit(self):
+        with tempfile.NamedTemporaryFile(suffix=".db") as tmp:
+            conn = sqlite3.connect(tmp.name)
+            conn.execute(
+                "CREATE TABLE entity_intelligence_facts (subject_key TEXT, subject_name TEXT, fact_label TEXT, fact_value TEXT, visibility TEXT, authority TEXT, public_safe INTEGER, review_only INTEGER, status TEXT, last_seen_at TEXT)"
+            )
+            conn.execute(
+                "INSERT INTO entity_intelligence_facts VALUES (?,?,?,?,?,?,?,?,?,?)",
+                ("signal_fox", "Signal Fox", "older", "Signal Fox has older public-safe entity intelligence evidence.", "public_safe", "owner_confirmed", 1, 0, "active", "2026-01-01"),
+            )
+            for idx in range(300):
+                conn.execute(
+                    "INSERT INTO entity_intelligence_facts VALUES (?,?,?,?,?,?,?,?,?,?)",
+                    (f"other_{idx}", f"Other {idx}", "newer", f"Other {idx} public artist intelligence.", "public_safe", "owner_confirmed", 1, 0, "active", f"2026-06-{idx % 28 + 1:02d}"),
+                )
+            conn.commit()
+            conn.close()
+            result = draft.generate_dossier_draft(pr217_packet(publicSafeFacts=[], publicSafeNotes=[]), tmp.name)["draft"]
+            self.assertIn("older public-safe entity intelligence", " ".join(str(result[k]) for k in ("summary", "sourceUsageSummary")))
+
     def test_broadcast_memory_active_public_safe_without_scope_columns_is_usable(self):
         with tempfile.NamedTemporaryFile(suffix=".db") as tmp:
             conn = sqlite3.connect(tmp.name)
@@ -313,6 +389,24 @@ class DossierDraftGeneratorTests(unittest.TestCase):
             conn.close()
             result = draft.generate_dossier_draft(pr217_packet(publicSafeFacts=[], publicSafeNotes=[]), tmp.name)["draft"]
             self.assertIn("BARCODE Radio broadcast memory", " ".join(str(result[k]) for k in ("summary", "sourceUsageSummary")))
+
+    def test_subject_filtering_happens_before_broadcast_memory_row_limit(self):
+        with tempfile.NamedTemporaryFile(suffix=".db") as tmp:
+            conn = sqlite3.connect(tmp.name)
+            conn.execute("CREATE TABLE broadcast_memory (cleaned_summary TEXT, public_safe INTEGER, status TEXT)")
+            conn.execute(
+                "INSERT INTO broadcast_memory VALUES (?,?,?)",
+                ("Signal Fox has older active public-safe broadcast memory.", 1, "active"),
+            )
+            for idx in range(300):
+                conn.execute(
+                    "INSERT INTO broadcast_memory VALUES (?,?,?)",
+                    (f"Other {idx} has newer active public-safe broadcast memory.", 1, "active"),
+                )
+            conn.commit()
+            conn.close()
+            result = draft.generate_dossier_draft(pr217_packet(publicSafeFacts=[], publicSafeNotes=[]), tmp.name)["draft"]
+            self.assertIn("older active public-safe broadcast memory", " ".join(str(result[k]) for k in ("summary", "sourceUsageSummary")))
 
     def test_thin_retrieved_evidence_adds_missing_questions_and_review_warnings(self):
         with tempfile.NamedTemporaryFile(suffix=".db") as tmp:
