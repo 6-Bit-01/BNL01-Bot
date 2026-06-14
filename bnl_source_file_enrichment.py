@@ -25,6 +25,7 @@ from bnl_entity_intelligence import build_entity_intelligence_profile, resolve_e
 from bnl_evidence_ownership import classify_evidence_ownership, subject_owned_text_fragments
 from bnl_source_file_lookup import lookup_source_file
 from bnl_source_refresh_context import refresh_generation_context
+from bnl_subject_memory_resolver import build_subject_analyst_read, resolve_subject_memory
 
 ENRICHMENT_INGEST_SOURCE = "bnl_source_file_enrichment"
 FALLBACK_INGEST_SOURCE = "bnl_source_knowledge_bridge"
@@ -4746,10 +4747,98 @@ def build_source_file_case_report_v1(subject_memory_packet: dict[str, Any]) -> d
     }
     return _sanitize_archive_value(report)
 
+
+_SUBJECT_ANALYST_READ_KEYS = (
+    "subjectName",
+    "internalRead",
+    "likelySubjectType",
+    "confidence",
+    "publicDraftPosture",
+    "strongestSignals",
+    "publicSafeClaims",
+    "sourceFileReviewClaims",
+    "sourceBlindInsights",
+    "privateOrInternalExclusions",
+    "doNotSayPublicly",
+    "missingInfoQuestions",
+    "recommendedAdminActions",
+    "draftIngredients",
+    "sourceFileIngredients",
+    "provenanceSummary",
+)
+
+
+def _subject_analyst_aliases(packet: dict[str, Any]) -> list[str]:
+    source_file = packet.get("sourceFile") if isinstance(packet.get("sourceFile"), dict) else {}
+    identity = packet.get("subjectIdentity") if isinstance(packet.get("subjectIdentity"), dict) else {}
+    aliases: list[str] = []
+
+    def add(value: Any) -> None:
+        if isinstance(value, str):
+            for part in re.split(r"[,|;/]+", value):
+                clean = _safe_text(part, 120)
+                if clean and clean not in aliases:
+                    aliases.append(clean)
+        elif isinstance(value, (list, tuple, set)):
+            for item in value:
+                add(item)
+        elif isinstance(value, dict):
+            for key in ("name", "label", "alias", "displayName", "preferredName", "normalizedName", "value"):
+                add(value.get(key))
+
+    for key in ("aliases", "alias", "matchedAlias", "confirmedAliases", "proposedAliases", "possibleAliases", "identityLinks", "identity_links", "possibleConnections", "displayName", "preferredName", "normalizedName"):
+        add(source_file.get(key))
+    for key in ("aliasLabels", "matchedIdentityLabels", "confirmedAliases", "aliases"):
+        add(identity.get(key))
+    return aliases[:12]
+
+
+def _normalize_subject_analyst_read_v1(analyst: dict[str, Any]) -> dict[str, Any]:
+    review_claims = analyst.get("sourceFileReviewClaims")
+    if review_claims is None:
+        review_claims = analyst.get("reviewNeededClaims")
+    source_file_ingredients = analyst.get("sourceFileIngredients")
+    if not source_file_ingredients:
+        source_file_ingredients = _case_list([
+            analyst.get("internalRead"),
+            *(analyst.get("strongestSignals") or []),
+            *(analyst.get("publicSafeClaims") or []),
+            *(review_claims or []),
+            *(analyst.get("sourceBlindInsights") or []),
+            *(analyst.get("recommendedAdminActions") or []),
+            *(analyst.get("missingInfoQuestions") or []),
+        ], limit=18, item_limit=320)
+    normalized = {key: analyst.get(key) for key in _SUBJECT_ANALYST_READ_KEYS}
+    normalized["sourceFileReviewClaims"] = _case_list(review_claims, limit=10, item_limit=320)
+    normalized["sourceFileIngredients"] = _case_list(source_file_ingredients, limit=18, item_limit=320)
+    for key in ("strongestSignals", "publicSafeClaims", "sourceBlindInsights", "privateOrInternalExclusions", "doNotSayPublicly", "missingInfoQuestions", "recommendedAdminActions", "draftIngredients", "provenanceSummary"):
+        normalized[key] = _case_list(normalized.get(key), limit=12 if key != "draftIngredients" else 9, item_limit=360)
+    normalized["subjectName"] = _case_text(normalized.get("subjectName"), 140)
+    normalized["internalRead"] = _case_text(normalized.get("internalRead"), 700)
+    normalized["likelySubjectType"] = _case_text(normalized.get("likelySubjectType"), 80)
+    normalized["confidence"] = _case_text(normalized.get("confidence"), 40)
+    normalized["publicDraftPosture"] = _case_text(normalized.get("publicDraftPosture"), 80)
+    return _sanitize_archive_value(normalized)
+
+
+def build_source_file_subject_analyst_read_v1(packet: dict[str, Any], db_path: str | None = None) -> dict[str, Any]:
+    """Resolve subject memory and return the Source File-ready analyst read."""
+
+    source_file = packet.get("sourceFile") if isinstance(packet.get("sourceFile"), dict) else {}
+    subject = _safe_text(packet.get("subject") or _first(source_file, ("name", "sourceFileName", "subject", "displayName", "title", "normalizedName")), 140)
+    existing = packet.get("subjectAnalystReadV1") if isinstance(packet.get("subjectAnalystReadV1"), dict) else {}
+    if existing:
+        return _normalize_subject_analyst_read_v1(existing)
+    resolved = packet.get("resolvedSubjectMemoryV1") if isinstance(packet.get("resolvedSubjectMemoryV1"), dict) else None
+    if resolved is None:
+        resolved = resolve_subject_memory(subject, db_path or "", aliases=_subject_analyst_aliases(packet))
+    return _normalize_subject_analyst_read_v1(build_subject_analyst_read(subject, resolved, packet))
+
+
 def _source_package_from_packet(packet: dict[str, Any]) -> dict[str, Any]:
     """Build the full review-only archive package without compact-card trimming."""
 
-    excluded = {"payload", "sendResult", "archiveResult", "sourcePackage", "subjectMemoryPacketV1", "sourceFileCaseReportV1"}
+    excluded = {"payload", "sendResult", "archiveResult", "sourcePackage", "subjectMemoryPacketV1", "sourceFileCaseReportV1", "resolvedSubjectMemoryV1", "dbPath"}
     package = {key: value for key, value in (packet or {}).items() if key not in excluded}
     package["archiveNotice"] = "Internal/review-only Source File archive package. No public publishing, draft creation, tag creation, queue/payment action, identity merge, or alias confirmation is requested."
     return _sanitize_archive_value(package)
@@ -4776,6 +4865,16 @@ def build_source_file_archive_payload(packet: dict[str, Any], *, environ: dict[s
     }
     subject_memory_packet = build_subject_memory_packet_v1(packet)
     case_report = build_source_file_case_report_v1(subject_memory_packet)
+    subject_analyst_read = build_source_file_subject_analyst_read_v1(packet, (environ or {}).get("BNL_DB_PATH") or packet.get("dbPath") or "")
+    if subject_analyst_read:
+        case_report["subjectAnalystReadV1"] = subject_analyst_read
+        if subject_analyst_read.get("internalRead"):
+            case_report["caseSummary"] = _case_text(f"{case_report.get('caseSummary')} BNL analyst read: {subject_analyst_read.get('internalRead')}", 900)
+        case_report["recommendedNextSteps"] = _case_list([*(subject_analyst_read.get("recommendedAdminActions") or []), *(case_report.get("recommendedNextSteps") or [])], limit=10, item_limit=280)
+        case_report["reviewBlockers"] = _case_list([*(subject_analyst_read.get("missingInfoQuestions") or []), *(subject_analyst_read.get("doNotSayPublicly") or []), *(case_report.get("reviewBlockers") or [])], limit=12, item_limit=280)
+        case_report["confidenceNotes"] = _case_list([*(subject_analyst_read.get("provenanceSummary") or []), *(case_report.get("confidenceNotes") or [])], limit=12, item_limit=320)
+        case_report["publicSafeClaims"] = _case_list([*(subject_analyst_read.get("publicSafeClaims") or []), *(case_report.get("publicSafeClaims") or [])], limit=10, item_limit=280)
+        case_report["evidenceSummary"] = _case_list([*(subject_analyst_read.get("strongestSignals") or []), *(subject_analyst_read.get("provenanceSummary") or []), *(case_report.get("evidenceSummary") or [])], limit=12, item_limit=320)
     admin_summary = build_admin_summary({**packet, "subjectName": subject, "subjectKey": subject_key, "sourceLanes": ["source_file_enrichment"] + list(packet.get("sourceTypes") or [])})
     envelope = {
         "candidateId": _sanitize_archive_value(candidate_id) if candidate_id else None,
@@ -4789,6 +4888,7 @@ def build_source_file_archive_payload(packet: dict[str, Any], *, environ: dict[s
         "doNotSay": _sanitize_archive_value(_section_text(sections, "Do Not Say", limit=10) or packet.get("doNotSay") or ""),
         "evidenceReceiptSummary": _sanitize_archive_value(receipt),
         "sourceFileBriefV2": _sanitize_archive_value(build_source_file_brief_v2(packet, archive_id=packet.get("archiveId") or "")),
+        "subjectAnalystReadV1": subject_analyst_read,
         "subjectMemoryPacketV1": subject_memory_packet,
         "sourceFileCaseReportV1": case_report,
         "adminSummary": admin_summary,
@@ -4981,6 +5081,16 @@ def run_source_file_enrichment(
     with refresh_generation_context(str(effective_subject)):
         evidence = collect_source_enrichment_evidence(db_path, guild_id, str(effective_subject), rd_context=rd_context, lookup_result=lookup_result)
         entity_profile = build_entity_intelligence_profile(db_path, guild_id, str(effective_subject), refresh=True)
+        resolved_subject_memory = resolve_subject_memory(str(effective_subject), db_path, aliases=list((evidence.get("subjectIdentity") or {}).get("aliasLabels") or []))
+        subject_analyst_read = build_source_file_subject_analyst_read_v1(
+            {
+                "subject": str(effective_subject),
+                "sourceFile": source_file,
+                "subjectIdentity": evidence.get("subjectIdentity") or {},
+                "resolvedSubjectMemoryV1": resolved_subject_memory,
+            },
+            db_path,
+        )
     entity_resolver = resolve_entity_context_for_surface(entity_profile, "source_file", max_items=16)
     entity_diag_for_log = entity_profile.get("diagnostics") or {}
     scope_for_log = entity_diag_for_log.get("rowScopeCounts") or {}
@@ -5016,6 +5126,9 @@ def run_source_file_enrichment(
         "runTime": datetime.now(timezone.utc).isoformat(),
         "forced": bool(force),
         "diagnosticsRequested": bool(diagnostics),
+        "dbPath": db_path,
+        "resolvedSubjectMemoryV1": resolved_subject_memory,
+        "subjectAnalystReadV1": subject_analyst_read,
     }
     _copy_evidence_fields(packet, evidence)
     packet["subjectIntelligenceDiagnostics"] = evidence.get("subjectIntelligenceDiagnostics") or {}

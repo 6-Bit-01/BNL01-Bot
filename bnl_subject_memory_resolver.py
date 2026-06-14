@@ -305,6 +305,11 @@ def build_subject_analyst_read(subject_name: str, resolved_memory: dict[str, Any
     if review or re.search(r"queue|submission", " ".join(str(x) for x in resolved_memory.get("queueOrSubmissionSignals") or []), re.I):
         missing.append("Confirm whether queue/submission history may be referenced publicly.")
     actions = ["Promote only confirmed public-safe facts into the Source File before expanding public copy.", "Attach owner-approved provenance for any role, link, music, queue, or relationship claim."]
+    source_file_ingredients = []
+    for item in [internal, *strongest[:6], *public_claims, *review_claims, *blind_insights, *actions, *missing]:
+        clean = _text(item, 320)
+        if clean and clean not in source_file_ingredients:
+            source_file_ingredients.append(clean)
     prov = [f"BNL subject memory resolver reviewed {scanned} subject-memory matches and reduced them to {len(draft_ingredients)} public-safe draft ingredients."]
     if review:
         prov.append("BNL held inferred role/link/music/queue/relationship claims out of public copy.")
@@ -327,6 +332,7 @@ def build_subject_analyst_read(subject_name: str, resolved_memory: dict[str, Any
         "missingInfoQuestions": missing,
         "recommendedAdminActions": actions,
         "draftIngredients": draft_ingredients,
+        "sourceFileIngredients": source_file_ingredients[:18],
         "provenanceSummary": prov,
     }
 

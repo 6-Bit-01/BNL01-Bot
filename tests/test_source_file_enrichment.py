@@ -1240,6 +1240,72 @@ class SourceFileEntityIntelligenceIntegrationTests(unittest.TestCase):
         self.assertIsInstance(archive.get("sourceFileCaseReportV1"), dict)
         self.assertEqual(archive["subjectMemoryPacketV1"].get("subjectName"), "Signal Fox")
 
+    def test_source_file_archive_payload_includes_subject_analyst_read(self):
+        packet = {
+            "subject": "Crow",
+            "sourceFile": {"name": "Crow", "candidateId": "sf_crow"},
+            "sections": {"Subject Overview": ["Crow has review-only source evidence."]},
+            "sourceCounts": {"conversations": 1},
+            "sourceTypes": ["conversations"],
+            "warningCounts": {},
+            "warnings": [],
+            "qualityScore": 88,
+            "qualityStatus": "sendable",
+            "matchKind": "exact",
+            "runTime": "2026-06-10T00:00:00+00:00",
+            "subjectAnalystReadV1": {
+                "subjectName": "Crow",
+                "internalRead": "Crow appears to be a recurring BARCODE-facing community subject.",
+                "likelySubjectType": "community_participant",
+                "confidence": "medium",
+                "publicDraftPosture": "conservative",
+                "strongestSignals": ["Repeated public BARCODE/BNL/community context for Crow."],
+                "publicSafeClaims": ["Crow is mentioned in public BARCODE community context."],
+                "reviewNeededClaims": ["Possible role, queue/submission, link, or relationship claims require owner/admin confirmation before public use."],
+                "sourceBlindInsights": ["Source-blind memory indicates possible additional subject context, but it is not public-copy provenance."],
+                "privateOrInternalExclusions": ["Excluded 1 private/internal/payment/customer/raw-ID memory item(s) from public and provenance text."],
+                "doNotSayPublicly": ["Do not state artist/music role, owned links, formal BARCODE role, queue/submission history, or relationships unless confirmed public-safe evidence supports it."],
+                "missingInfoQuestions": ["Confirm the subject's preferred public display name and identity boundary."],
+                "recommendedAdminActions": ["Promote only confirmed public-safe facts into the Source File before expanding public copy."],
+                "draftIngredients": ["Crow is mentioned in public BARCODE community context."],
+                "provenanceSummary": ["BNL reviewed subject-memory matches and reduced them to public-safe draft ingredients."],
+            },
+        }
+        archive = enrich.build_source_file_archive_payload(packet)
+        analyst = archive["subjectAnalystReadV1"]
+        report = archive["sourceFileCaseReportV1"]
+        self.assertEqual(analyst["subjectName"], "Crow")
+        self.assertIn("subjectAnalystReadV1", report)
+        self.assertIn("sourceFileReviewClaims", analyst)
+        self.assertIn("sourceFileIngredients", analyst)
+        self.assertEqual(analyst["publicSafeClaims"], ["Crow is mentioned in public BARCODE community context."])
+        self.assertTrue(any("queue/submission" in item for item in analyst["sourceFileReviewClaims"]))
+        self.assertTrue(any("Source-blind" in item for item in analyst["sourceBlindInsights"]))
+        self.assertIn("Crow appears", report["caseSummary"])
+
+    def test_run_source_file_enrichment_builds_crow_like_subject_analyst_read(self):
+        c = self.conn.cursor()
+        c.execute("INSERT INTO broadcast_memory (guild_id, episode_date, cleaned_summary, entry_type, public_safe, usage_scope, status, created_at) VALUES (?,?,?,?,?,?,?,?)", (1, "2026-06-01", "Crow is a public-safe recurring BARCODE community subject discussed around BNL.", "recap", 1, "public_context", "active", "2026-06-01"))
+        c.execute("INSERT INTO memory_tiers (user_id, guild_id, tier, summary, salience, mentions, updated_at, source_trust, source_channel_policy) VALUES (?,?,?,?,?,?,?,?,?)", (1, 1, "review", "Crow may have an unconfirmed artist role, music link, queue submission, and relationship context.", 1.0, 1, "2026-06-01", "review_only", "public_context"))
+        c.execute("INSERT INTO memory_tiers (user_id, guild_id, tier, summary, salience, mentions, updated_at, source_trust, source_channel_policy) VALUES (?,?,?,?,?,?,?,?,?)", (1, 1, "legacy", "Crow has source-blind context that should remain internal review context.", 1.0, 1, "2026-06-01", "source-blind", "unknown"))
+        c.execute("INSERT INTO memory_tiers (user_id, guild_id, tier, summary, salience, mentions, updated_at, source_trust, source_channel_policy) VALUES (?,?,?,?,?,?,?,?,?)", (1, 1, "private", "Crow Stripe customer cus_123 paid Priority signal with raw Discord ID 123456789012345678.", 1.0, 1, "2026-06-01", "internal", "private"))
+        self.conn.commit()
+        with mock.patch.object(enrich, "build_subject_analyst_read", wraps=enrich.build_subject_analyst_read) as analyst_mock:
+            result = enrich.run_source_file_enrichment(self.db, 1, "Crow", dry_run=True, lookup_func=lambda query: {"ok": True, "found": True, "matchKind": "exact", "data": {"sourceFile": {"id": "sf_1", "name": query["lookupValue"], "status": "active", "candidateType": "entity"}}})
+        analyst = result["subjectAnalystReadV1"]
+        self.assertTrue(analyst_mock.called)
+        self.assertIn("Crow", analyst["internalRead"])
+        self.assertIn(analyst["likelySubjectType"], {"community_participant", "artist"})
+        self.assertTrue(analyst["publicSafeClaims"])
+        self.assertTrue(analyst["sourceFileReviewClaims"])
+        self.assertTrue(analyst["missingInfoQuestions"])
+        self.assertTrue(analyst["recommendedAdminActions"])
+        self.assertTrue(analyst["sourceBlindInsights"])
+        self.assertNotIn("artist role", json.dumps(analyst["publicSafeClaims"]).lower())
+        self.assertNotIn("stripe", json.dumps(analyst).lower())
+        self.assertNotIn("cus_123", json.dumps(analyst).lower())
+        self.assertNotIn("123456789012345678", json.dumps(analyst))
+
     def test_compact_recommendation_payload_excludes_full_memory_packet_and_case_report(self):
         payload = {
             "subjectName": "Signal Fox",
