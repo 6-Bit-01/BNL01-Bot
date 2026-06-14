@@ -418,10 +418,19 @@ def build_public_dossier_draft_evidence(packet: dict[str, Any], db_path: str | N
     if matching_dossiers:
         used = 0
         for dossier in matching_dossiers:
+            dossier_haystack = " ".join(
+                _text(dossier.get(key), 180)
+                for key in ("name", "title", "slug", "id", "publicId", "sourceFileId", "subjectName", "role", "summary", "description", "publicSummary")
+            )
+            matched_aliases = [alias for alias in aliases if _matches_subject(dossier_haystack, [alias])]
             for text in _dossier_public_texts(dossier):
+                text = _redact_private_match_terms(text, matched_aliases, name)
                 _add_bundle_item(bundle, "officialPublicDossierContext", text, max_items=8)
                 _classify_public_evidence(bundle, text)
                 used += 1
+            for alias in matched_aliases:
+                if alias not in bundle["matchedAliasesUsedPrivately"]:
+                    bundle["matchedAliasesUsedPrivately"].append(alias)
         if used:
             bundle["sourceSummariesUsed"].append("Used matching current public dossier context as official public dossier authority.")
     else:

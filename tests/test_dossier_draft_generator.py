@@ -244,6 +244,28 @@ class DossierDraftGeneratorTests(unittest.TestCase):
         self.assertIn("official public dossier authority", combined)
         self.assertNotIn("Nebula Choir", combined)
 
+    def test_public_read_model_alias_match_redacts_alias_from_public_fields(self):
+        read_model = {
+            "sections": {
+                "dossiers": {
+                    "items": [
+                        {
+                            "name": "Secret Fox",
+                            "role": "Secret Fox listening-room host",
+                            "summary": "Secret Fox appears in official public dossier context for BARCODE listening sessions.",
+                            "publicFacts": ["Secret Fox is connected to public BARCODE listening-room sessions."],
+                        }
+                    ]
+                }
+            }
+        }
+        packet = pr217_packet(publicSafeFacts=[], publicSafeNotes=[], identityAliasStatus={"publicSafeIdentityLabels": ["Secret Fox"], "needsConfirmation": True})
+        result = draft.generate_dossier_draft(packet, public_read_model=read_model)["draft"]
+        public = " ".join(str(result[k]) for k in ("role", "summary", "notes", "sourceUsageSummary", "ownerReviewWarnings", "publicSafetyWarnings", "unsupportedClaimsRejected", "tags", "proposedTags"))
+        self.assertIn("Signal Fox", public)
+        self.assertIn("BARCODE listening", public)
+        self.assertNotIn("Secret Fox", public)
+
     def test_no_public_read_model_context_warns_without_failing(self):
         result = draft.generate_dossier_draft(pr217_packet(publicSafeFacts=[], publicSafeNotes=[]))["draft"]
         self.assertTrue(any("No matching current public dossier/read-model facts" in x for x in result["ownerReviewWarnings"]))
@@ -297,6 +319,13 @@ class DossierDraftGeneratorTests(unittest.TestCase):
             public = " ".join(str(result[k]) for k in ("role", "summary", "notes"))
             self.assertNotIn("Other Person", public)
             self.assertNotIn("unrelated BARCODE activity", public)
+
+    def test_common_role_labels_are_all_excluded_from_alias_terms(self):
+        labels = ["artist", "member", "community", "collaborator", "mod", "system", "radio", "producer", "ai", "human", "active", "pending"]
+        for label in labels:
+            with self.subTest(label=label):
+                self.assertFalse(draft._is_probable_subject_alias(label))
+        self.assertTrue(draft._is_probable_subject_alias("Signal Fox Alt"))
 
     def test_name_like_alias_matches_and_is_redacted_from_public_fields(self):
         with tempfile.NamedTemporaryFile(suffix=".db") as tmp:
