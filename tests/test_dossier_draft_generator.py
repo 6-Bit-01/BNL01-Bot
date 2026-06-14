@@ -143,7 +143,8 @@ class DossierDraftGeneratorTests(unittest.TestCase):
 
     def test_thin_packet_returns_conservative_summary_and_missing_info(self):
         result = draft.generate_dossier_draft(pr217_packet(publicSafeFacts=[], publicSafeNotes=[]))["draft"]
-        self.assertIn("awaiting owner review", result["summary"])
+        self.assertIn("limited public-safe source detail", result["summary"])
+        self.assertNotIn("owner review", result["summary"].lower())
         self.assertTrue(result["missingInfoQuestions"])
         self.assertIn("Add more public-safe facts", result["missingInfoQuestions"][0])
 
@@ -151,6 +152,72 @@ class DossierDraftGeneratorTests(unittest.TestCase):
         result = draft.generate_dossier_draft(pr217_packet())["draft"]
         self.assertEqual(result["role"], "Music artist")
         self.assertIn("music artist", result["summary"].lower())
+
+
+    def test_public_notes_filter_review_admin_missing_info_warning_text(self):
+        packet = pr217_packet(
+            publicSafeFacts=["Signal Fox is connected to public BARCODE community context."],
+            publicSafeNotes=[
+                {"text": "Owner Review: needs review before claiming preferred display name / public link / role confirmation / owner approval."},
+                {"text": "Admin-only source-blind missing info must not be copied into public text."},
+                {"text": "Dossier Blueprint readiness: Boundaries / what not to claim."},
+                {"text": "Signal Fox appears in public community context with concise source-backed wording."},
+            ],
+        )
+        result = draft.generate_dossier_draft(packet)["draft"]
+        public = " ".join(str(result[k]) for k in ("role", "summary", "notes", "sourceUsageSummary", "tags", "proposedTags")).lower()
+        for forbidden in (
+            "owner review",
+            "admin-only",
+            "review-only",
+            "source-blind",
+            "missing info",
+            "needs review before claiming",
+            "dossier blueprint readiness",
+            "boundaries",
+            "what not to claim",
+            "must not be copied into public text",
+        ):
+            self.assertNotIn(forbidden, public)
+        self.assertIn("public community context", result["notes"])
+        metadata = " ".join(result["ownerReviewWarnings"] + result["publicSafetyWarnings"] + result["missingInfoQuestions"] + result["unsupportedClaimsRejected"]).lower()
+        self.assertIn("review/admin/missing-info note text", metadata)
+
+    def test_source_usage_summary_uses_clean_plural_approved_wording(self):
+        with tempfile.NamedTemporaryFile(suffix=".db") as tmp:
+            conn = sqlite3.connect(tmp.name)
+            conn.execute("CREATE TABLE entity_evidence_events (subject_name TEXT, safe_summary TEXT, topic TEXT, relation_to_subject TEXT, channel_policy TEXT, visibility TEXT, authority TEXT, public_safe_candidate INTEGER, review_only INTEGER, updated_at TEXT, created_at TEXT)")
+            conn.executemany(
+                "INSERT INTO entity_evidence_events VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                [
+                    ("Signal Fox", "Signal Fox has one public-safe community evidence summary.", "community", "direct", "public_home", "public", "public_safe", 1, 0, "now", "now"),
+                    ("Signal Fox", "Signal Fox has another public-safe community evidence summary.", "community", "direct", "public_home", "public", "public_safe", 1, 0, "now", "now"),
+                ],
+            )
+            conn.execute("CREATE TABLE entity_intelligence_facts (subject_key TEXT, subject_name TEXT, fact_label TEXT, fact_value TEXT, visibility TEXT, authority TEXT, public_safe INTEGER, review_only INTEGER, status TEXT, last_seen_at TEXT)")
+            conn.execute("INSERT INTO entity_intelligence_facts VALUES (?,?,?,?,?,?,?,?,?,?)", ("signal_fox", "Signal Fox", "role", "Signal Fox has one public-safe entity intelligence fact.", "public_safe", "owner_confirmed", 1, 0, "active", "now"))
+            conn.execute("CREATE TABLE broadcast_memory (cleaned_summary TEXT, public_safe INTEGER, status TEXT)")
+            conn.executemany("INSERT INTO broadcast_memory VALUES (?,?,?)", [("Signal Fox has active public-safe broadcast memory one.", 1, "active"), ("Signal Fox has active public-safe broadcast memory two.", 1, "active")])
+            conn.commit(); conn.close()
+            result = draft.generate_dossier_draft(pr217_packet(publicSafeFacts=[], publicSafeNotes=[]), tmp.name)["draft"]
+        usage = result["sourceUsageSummary"]
+        self.assertIn("Used 2 public-safe structured entity evidence summaries.", usage)
+        self.assertIn("Used 1 public-safe entity intelligence fact.", usage)
+        self.assertIn("Used 2 active public-safe broadcast memory summaries.", usage)
+        self.assertNotIn("summarie(s)", usage)
+        self.assertNotIn("fact(s)", usage)
+        for forbidden in ("private", "source-blind", "review-only", "internal", "admin-only", "payment", "priority", "stripe", "checkout", "customer"):
+            self.assertNotIn(forbidden, usage.lower())
+
+    def test_music_role_from_public_safe_entity_has_approved_source_phrase(self):
+        with tempfile.NamedTemporaryFile(suffix=".db") as tmp:
+            conn = sqlite3.connect(tmp.name)
+            conn.execute("CREATE TABLE entity_evidence_events (subject_name TEXT, safe_summary TEXT, topic TEXT, relation_to_subject TEXT, channel_policy TEXT, visibility TEXT, authority TEXT, public_safe_candidate INTEGER, review_only INTEGER, updated_at TEXT, created_at TEXT)")
+            conn.execute("INSERT INTO entity_evidence_events VALUES (?,?,?,?,?,?,?,?,?,?,?)", ("Signal Fox", "Signal Fox shares public electronic music tracks with the BARCODE community.", "music", "direct", "public_home", "public", "public_safe", 1, 0, "now", "now"))
+            conn.commit(); conn.close()
+            result = draft.generate_dossier_draft(pr217_packet(publicSafeFacts=[], publicSafeNotes=[], safeClassification={"category": "Unknown", "kind": "Person", "ecosystemLane": "Unknown"}), tmp.name)["draft"]
+        self.assertEqual(result["role"], "Music artist")
+        self.assertIn("Used 1 public-safe structured entity evidence summary.", result["sourceUsageSummary"])
 
     def test_style_examples_used_for_shape_not_copied_facts(self):
         result = draft.generate_dossier_draft(pr217_packet())["draft"]
@@ -241,7 +308,8 @@ class DossierDraftGeneratorTests(unittest.TestCase):
         result = draft.generate_dossier_draft(pr217_packet(publicSafeFacts=[], publicSafeNotes=[]), public_read_model=read_model)["draft"]
         combined = " ".join(str(result[k]) for k in ("summary", "notes", "sourceUsageSummary"))
         self.assertIn("public dossier registry", combined)
-        self.assertIn("official public dossier authority", combined)
+        self.assertIn("official public dossier authority for Signal Fox", combined)
+        self.assertIn("Signal Fox", result["sourceUsageSummary"])
         self.assertNotIn("Nebula Choir", combined)
 
     def test_public_read_model_alias_match_redacts_alias_from_public_fields(self):
@@ -264,12 +332,42 @@ class DossierDraftGeneratorTests(unittest.TestCase):
         public = " ".join(str(result[k]) for k in ("role", "summary", "notes", "sourceUsageSummary", "ownerReviewWarnings", "publicSafetyWarnings", "unsupportedClaimsRejected", "tags", "proposedTags"))
         self.assertIn("Signal Fox", public)
         self.assertIn("BARCODE listening", public)
+        self.assertIn("official public dossier authority for Signal Fox", result["sourceUsageSummary"])
         self.assertNotIn("Secret Fox", public)
+        self.assertNotIn("Secret Fox", result["sourceUsageSummary"])
+        for forbidden in ("private", "source-blind", "review-only", "internal", "admin-only", "payment", "priority", "stripe", "checkout", "customer"):
+            self.assertNotIn(forbidden, result["sourceUsageSummary"].lower())
+
+
+    def test_music_role_from_matching_public_dossier_has_subject_authority_source_usage(self):
+        read_model = {
+            "sections": {
+                "dossiers": {
+                    "items": [
+                        {
+                            "name": "Signal Fox",
+                            "role": "Music artist",
+                            "summary": "Signal Fox is listed in public dossier context as an electronic music artist for BARCODE collaborations.",
+                            "publicFacts": ["Signal Fox appears in public dossier context as a music artist."],
+                        }
+                    ]
+                }
+            }
+        }
+        result = draft.generate_dossier_draft(
+            pr217_packet(publicSafeFacts=[], publicSafeNotes=[], safeClassification={"category": "Unknown", "kind": "Person", "ecosystemLane": "Unknown"}),
+            public_read_model=read_model,
+        )["draft"]
+        self.assertEqual(result["role"], "Music artist")
+        self.assertIn("Used matching current public dossier context as official public dossier authority for Signal Fox.", result["sourceUsageSummary"])
+        for forbidden in ("private", "source-blind", "review-only", "internal", "admin-only", "payment", "priority", "stripe", "checkout", "customer"):
+            self.assertNotIn(forbidden, result["sourceUsageSummary"].lower())
 
     def test_no_public_read_model_context_warns_without_failing(self):
         result = draft.generate_dossier_draft(pr217_packet(publicSafeFacts=[], publicSafeNotes=[]))["draft"]
         self.assertTrue(any("No matching current public dossier/read-model facts" in x for x in result["ownerReviewWarnings"]))
-        self.assertIn("style examples were used only", result["sourceUsageSummary"])
+        self.assertNotIn("style examples were used only", result["sourceUsageSummary"])
+        self.assertIn("style examples were used only", " ".join(result["ownerReviewWarnings"]))
 
     def test_private_alias_payment_and_source_blind_evidence_are_excluded(self):
         with tempfile.NamedTemporaryFile(suffix=".db") as tmp:

@@ -32,6 +32,19 @@ _PAYMENT_RE = re.compile(r"\b(stripe|checkout|payment|paid|purchase|purchased|cu
 _INTERNAL_RE = re.compile(r"\b(memory_tiers|rd_context|broadcast_memory|relationship_state|redis|database|table|json|diagnostic|diagnostics|evidence\s*id|recommendation\s*id|source\s*row|raw\s*source\s*lane|sourceFileSummary|source\s*lane)\b", re.I)
 _ALIAS_RE = re.compile(r"\b(internal\s+alias|alias\s+count|confirmed\s+alias|private\s+alias)\b", re.I)
 _FINAL_RE = re.compile(r"\b(approved|published|live|final|complete|official)\b", re.I)
+_PUBLIC_NOTE_META_RE = re.compile(
+    r"\b("
+    r"owner\s+review|admin(?:-only|\s+only)?|review-only|review\s+only|"
+    r"must\s+not\s+be\s+copied\s+into\s+public\s+text|not\s+public|"
+    r"source[-_\s]*blind|missing[-_\s]*info|missing\s+info|"
+    r"needs?\s+review\s+before\s+claiming|"
+    r"preferred\s+display\s+name|public\s+link|role\s+confirmation|owner\s+approval|"
+    r"dossier\s+blueprint\s+readiness|boundaries|what\s+not\s+to\s+claim|"
+    r"internal\s+diagnostic|diagnostic\s+wording"
+    r")\b",
+    re.I,
+)
+_SOURCE_USAGE_FORBIDDEN_RE = re.compile(r"\b(private|source[-_\s]*blind|review-only|review\s+only|internal|admin-only|admin\s+only|payment|priority|stripe|checkout|customer)\b", re.I)
 _ROLE_LIMIT = 80
 _SUMMARY_LIMIT = 700
 _NOTES_LIMIT = 900
@@ -141,6 +154,32 @@ def _reject_unsafe_public(texts: list[str]) -> tuple[list[str], list[str]]:
             safe.append(s)
     return safe, rejected
 
+
+
+def _is_public_dossier_note_text(text: str) -> bool:
+    clean = _text(text, 500)
+    if not clean:
+        return False
+    if _unsafe_reasons(clean) or _PUBLIC_NOTE_META_RE.search(clean):
+        return False
+    return True
+
+
+def _public_note_rejection_reason(text: str) -> str | None:
+    clean = _text(text, 500)
+    if not clean:
+        return None
+    reasons = _unsafe_reasons(clean)
+    if _PUBLIC_NOTE_META_RE.search(clean):
+        reasons.append("review/admin/missing-info note text")
+    if reasons:
+        return f"Moved {', '.join(dict.fromkeys(reasons))} out of public notes metadata."
+    return None
+
+
+
+def _source_usage_line(count: int, singular: str, plural: str) -> str:
+    return f"Used {count} {singular if count == 1 else plural}."
 
 def _strip_unsafe_sentence(sentence: str) -> str:
     return "" if _unsafe_reasons(sentence) else sentence
@@ -413,7 +452,12 @@ def build_public_dossier_draft_evidence(packet: dict[str, Any], db_path: str | N
     for fact in _strings(packet.get("publicSafeFacts"), max_items=8):
         _classify_public_evidence(bundle, fact)
     for note in _strings(packet.get("publicSafeNotes"), max_items=6):
-        _classify_public_evidence(bundle, note)
+        if _is_public_dossier_note_text(note):
+            _classify_public_evidence(bundle, note)
+        else:
+            reason = _public_note_rejection_reason(note)
+            if reason:
+                bundle["excludedSourceWarnings"].append(reason)
     matching_dossiers = _matching_public_dossiers(packet, public_read_model)
     if matching_dossiers:
         used = 0
@@ -432,7 +476,7 @@ def build_public_dossier_draft_evidence(packet: dict[str, Any], db_path: str | N
                 if alias not in bundle["matchedAliasesUsedPrivately"]:
                     bundle["matchedAliasesUsedPrivately"].append(alias)
         if used:
-            bundle["sourceSummariesUsed"].append("Used matching current public dossier context as official public dossier authority.")
+            bundle["sourceSummariesUsed"].append(f"Used matching current public dossier context as official public dossier authority for {name}.")
     else:
         bundle["publicDossierContextWarnings"].append("No matching current public dossier/read-model facts were available as a direct official source; style examples were used only for structure and tone.")
     if not db_path:
@@ -493,7 +537,7 @@ def build_public_dossier_draft_evidence(packet: dict[str, Any], db_path: str | N
                                 _add_bundle_item(bundle, "recurringPublicTopics", topic, max_items=6)
                             used += 1
                     if used:
-                        bundle["sourceSummariesUsed"].append(f"Used {used} public-safe structured entity evidence summarie(s).")
+                        bundle["sourceSummariesUsed"].append(_source_usage_line(used, "public-safe structured entity evidence summary", "public-safe structured entity evidence summaries"))
                     if excluded:
                         bundle["excludedSourceWarnings"].append("Excluded review-only or non-public structured entity evidence.")
                 if _table_exists(conn, "entity_intelligence_facts"):
@@ -537,7 +581,7 @@ def build_public_dossier_draft_evidence(packet: dict[str, Any], db_path: str | N
                             _classify_public_evidence(bundle, text)
                             used += 1
                     if used:
-                        bundle["sourceSummariesUsed"].append(f"Used {used} public-safe entity intelligence fact(s).")
+                        bundle["sourceSummariesUsed"].append(_source_usage_line(used, "public-safe entity intelligence fact", "public-safe entity intelligence facts"))
                     if excluded:
                         bundle["excludedSourceWarnings"].append("Excluded private, review-only, inactive, or non-public entity intelligence facts.")
                 if _table_exists(conn, "broadcast_memory"):
@@ -574,7 +618,7 @@ def build_public_dossier_draft_evidence(packet: dict[str, Any], db_path: str | N
                             _classify_public_evidence(bundle, text)
                             used += 1
                     if used:
-                        bundle["sourceSummariesUsed"].append(f"Used {used} active public-safe broadcast memory summarie(s).")
+                        bundle["sourceSummariesUsed"].append(_source_usage_line(used, "active public-safe broadcast memory summary", "active public-safe broadcast memory summaries"))
                     if excluded:
                         bundle["excludedSourceWarnings"].append("Excluded inactive, internal, or non-public broadcast memory.")
                 for unsafe in ("memory_tiers", "user_memory_facts", "relationship_journal", "member_activity_events"):
@@ -647,6 +691,8 @@ def _category_kind_lane(safe_classification: dict[str, Any]) -> tuple[str, str, 
 
 def _role_from_context(facts: list[str], notes: list[str], category: str, kind: str, lane: str) -> str:
     haystack = " ".join(facts + notes + [category, kind, lane]).lower()
+    evidence_haystack = " ".join(facts + notes).lower()
+    classification_haystack = " ".join([category, kind, lane]).lower()
     if any(term in haystack for term in ("moderator", "mod", "personnel", "staff")):
         return "Community moderator"
     if "sponsor" in haystack:
@@ -654,9 +700,11 @@ def _role_from_context(facts: list[str], notes: list[str], category: str, kind: 
     if any(term in haystack for term in ("interface", "system", "tool", "tech")):
         return "Systems interface"
     if any(term in haystack for term in ("producer", "production", "broadcast", "radio")):
-        return "Production collaborator"
+        if any(term in evidence_haystack for term in ("producer", "production", "broadcast", "radio")) or any(term in classification_haystack for term in ("producer", "production", "broadcast", "radio")):
+            return "Production collaborator"
     if any(term in haystack for term in ("artist", "music", "musician", "track", "album", "song", "dj")):
-        return "Music artist"
+        if any(term in evidence_haystack for term in ("artist", "music", "musician", "track", "album", "song", "dj")) or any(term in classification_haystack for term in ("artist", "music")):
+            return "Music artist"
     if "collaborator" in haystack:
         return "Community collaborator"
     if any(term in haystack for term in ("community", "server", "participant", "member")):
@@ -688,23 +736,24 @@ def _summary(name: str, role: str, facts: list[str], notes: list[str], style_pac
             if extra:
                 summary = f"{summary} {extra[0]}"
     else:
-        summary = f"{name} is a proposed dossier subject awaiting owner review and stronger public-safe source detail."
+        summary = f"{name} is a proposed dossier subject with limited public-safe source detail."
     if _word_count(summary) > 85:
         words = summary.split()
         summary = " ".join(words[:80]).rstrip(" ,;:") + "."
     if guide["length"] and _word_count(summary) < 25 and source_sentences:
-        summary = f"{summary} This draft keeps the public copy compact while owner review confirms the remaining dossier fields."
+        summary = f"{summary} Public-facing context stays concise and source-backed."
     return summary[:_SUMMARY_LIMIT].strip()
 
 
 def _notes(public_notes: list[str], facts: list[str]) -> str:
-    note_sentences = _sentences(public_notes, max_count=2)
+    clean_notes = [note for note in public_notes if _is_public_dossier_note_text(note)]
+    note_sentences = [s for s in _sentences(clean_notes, max_count=2) if _is_public_dossier_note_text(s)]
     if note_sentences:
         notes = " ".join(note_sentences[:2])
     elif len(facts) < 2:
-        notes = "Public-safe notes are limited; admin review should confirm wording before use."
+        notes = "Public-safe context is limited; add stronger confirmed public details before publication."
     else:
-        notes = "Owner Review should verify the public framing before this draft moves forward."
+        notes = "Public-facing context is limited; keep the wording concise and source-backed."
     return notes[:_NOTES_LIMIT].strip()
 
 
@@ -788,16 +837,8 @@ def _first_link(packet: dict[str, Any]) -> dict[str, Any] | None:
 
 
 def _source_usage_summary(packet: dict[str, Any]) -> str:
-    usage = _dict(packet.get("sourceUsageSummary"))
-    note_count = len(_as_list(usage.get("sourceFileNoteIds")))
-    recommendation_count = len(_as_list(usage.get("recommendationIds")))
-    lane_count = len(_as_list(usage.get("sourceLanes")))
-    parts = ["BNL drafted from public-safe facts, public-safe notes, safe classification, style guidance, field requirements, and boundary rules only."]
-    if note_count or recommendation_count:
-        parts.append(f"The packet referenced {note_count} source note(s) and {recommendation_count} recommendation reference(s) for admin traceability; raw IDs and lanes were not copied into public fields.")
-    if lane_count:
-        parts.append("Source lane details were treated as boundary context, not public copy.")
-    return " ".join(parts)
+    parts = ["Used supplied public-safe packet facts, notes, safe classification, and site style guidance as draft boundary context."]
+    return " ".join(part for part in parts if not _SOURCE_USAGE_FORBIDDEN_RE.search(part))
 
 
 def generate_dossier_draft(packet: dict[str, Any], db_path: str | None = None, public_read_model: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -807,7 +848,16 @@ def generate_dossier_draft(packet: dict[str, Any], db_path: str | None = None, p
     name = _candidate_name(candidate)
     category, kind, lane = _category_kind_lane(safe_classification)
     public_facts, rejected_facts = _reject_unsafe_public(_strings(packet.get("publicSafeFacts"), max_items=16))
-    public_notes, rejected_notes = _reject_unsafe_public(_strings(packet.get("publicSafeNotes"), max_items=12))
+    raw_public_notes = _strings(packet.get("publicSafeNotes"), max_items=12)
+    public_notes, rejected_notes = _reject_unsafe_public(raw_public_notes)
+    clean_public_notes: list[str] = []
+    for note in public_notes:
+        reason = _public_note_rejection_reason(note)
+        if reason:
+            rejected_notes.append(reason)
+        elif note not in clean_public_notes:
+            clean_public_notes.append(note)
+    public_notes = clean_public_notes
     evidence: dict[str, Any] | None = None
     try:
         evidence = build_public_dossier_draft_evidence(packet, db_path, public_read_model=public_read_model)
@@ -894,9 +944,17 @@ def generate_dossier_draft(packet: dict[str, Any], db_path: str | None = None, p
         "ownerReviewWarnings": owner_warnings[:12],
         "publicSafetyWarnings": public_warnings[:12],
         "unsupportedClaimsRejected": rejected[:14],
-        "sourceUsageSummary": _source_usage_summary(packet)
-        + (" " + " ".join(_strings(evidence.get("sourceSummariesUsed"), max_items=4)) if evidence else "")
-        + (" " + " ".join(_strings(evidence.get("publicDossierStyleGuidanceUsed"), max_items=2)) if evidence else "")
-        + (" " + " ".join(_strings(evidence.get("publicDossierContextWarnings"), max_items=2)) if evidence else ""),
+        "sourceUsageSummary": " ".join(
+            part
+            for part in [
+                _source_usage_summary(packet),
+                *(
+                    item
+                    for item in (_strings(evidence.get("sourceSummariesUsed"), max_items=4) if evidence else [])
+                    if not _SOURCE_USAGE_FORBIDDEN_RE.search(item)
+                ),
+            ]
+            if part
+        ),
     }
     return {"draft": draft}
