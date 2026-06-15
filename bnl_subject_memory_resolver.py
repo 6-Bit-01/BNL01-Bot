@@ -19,6 +19,13 @@ _SOURCE_BLIND_RE = re.compile(r"\b(source[-_\s]*blind|unknown[-_\s]*policy|no\s+
 _REVIEW_RE = re.compile(r"\b(review[-\s]*only|needs?\s+confirmation|unconfirmed|uncertain|inferred|ambiguous|maybe|appears\s+to|queue|submission|relationship)\b", re.I)
 _PUBLIC_RE = re.compile(r"\b(public[-_\s]*safe|dossier[-_\s]*safe|public\s+context|public\s+home|public\s+discord|owner[-_\s]*confirmed|official\s+public|broadcast\s+memory)\b", re.I)
 _LINK_RE = re.compile(r"https?://\S+", re.I)
+_EMAIL_RE = re.compile(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", re.I)
+_PHONE_RE = re.compile(r"(?<!\w)(?:\+?1[\s.-]?)?(?:\(?\d{3}\)?[\s.-]?)\d{3}[\s.-]?\d{4}(?!\w)")
+_RAW_ID_RE = re.compile(r"\b\d{15,22}\b|\b(?:discord|user|channel|message|guild|member)[-_\s]*(?:id)?\s*[:=#]?\s*\d+\b", re.I)
+_SECRET_RE = re.compile(r"\b(?:api[_-]?key|token|secret|authorization|bearer|password)\b\s*[:=]?\s*[A-Za-z0-9_./+\-=]{8,}|\b[A-Za-z0-9_-]{24,}\.[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{20,}\b", re.I)
+_CONTACT_RE = re.compile(r"\b(?:email|e-mail|phone|telephone|contact me|contact info|address|sms|text me)\b", re.I)
+_PRIVATE_ALIAS_RE = re.compile(r"\b(?:private alias|alias privately|known privately as|legal name|real name)\b", re.I)
+_DB_ROW_RE = re.compile(r"\b(?:rowid|source row|database row|raw json|raw payload|table row|memory_tiers|entity_evidence_events)\b", re.I)
 _ROLE_OR_TAXONOMY_LABELS = {
     "artist", "member", "community", "collaborator", "mod", "moderator", "personnel", "staff", "sponsor", "system", "interface", "production", "radio", "producer", "ai", "human", "hybrid", "unknown", "public", "internal", "restricted", "active", "pending", "person", "music", "tech", "systems", "broadcast", "participant", "dossier", "source", "source file",
 }
@@ -70,10 +77,63 @@ def _sanitize_public(text: str, subject: str, aliases: list[str]) -> str:
     clean = _text(text, 260)
     for alias in sorted([a for a in aliases if a.lower() != subject.lower()], key=len, reverse=True):
         clean = re.sub(re.escape(alias), subject, clean, flags=re.I)
-    if _PAYMENT_RE.search(clean) or _INTERNAL_RE.search(clean):
+    if (_PAYMENT_RE.search(clean) or _INTERNAL_RE.search(clean) or _EMAIL_RE.search(clean) or _PHONE_RE.search(clean) or _RAW_ID_RE.search(clean) or _SECRET_RE.search(clean) or _CONTACT_RE.search(clean) or _PRIVATE_ALIAS_RE.search(clean) or _DB_ROW_RE.search(clean)):
         return ""
     return clean
 
+
+
+def _redact_review_evidence_summary(text: str, subject: str) -> str:
+    """Return a privacy-safe review/source-blind evidence summary.
+
+    Unlike _sanitize_public, this is for non-public metadata: it may preserve
+    coarse claim category (Orion/context, queue/submission, music/link) but must
+    not preserve raw contact details, private aliases, IDs, URLs, tokens, payment
+    details, or database-row wording.
+    """
+    original = _text(text, 360)
+    low = original.lower()
+    if not original:
+        return f"Review-needed evidence exists for {subject}, but the raw detail was withheld for privacy."
+    payment = bool(_PAYMENT_RE.search(original))
+    unsafe = bool(
+        payment
+        or _EMAIL_RE.search(original)
+        or _PHONE_RE.search(original)
+        or _RAW_ID_RE.search(original)
+        or _SECRET_RE.search(original)
+        or _CONTACT_RE.search(original)
+        or _INTERNAL_RE.search(original)
+        or _PRIVATE_ALIAS_RE.search(original)
+        or _DB_ROW_RE.search(original)
+        or _LINK_RE.search(original)
+    )
+    if unsafe:
+        if payment:
+            return "Private/payment-related evidence was counted but withheld."
+        if "source-blind" in low or "source blind" in low or "unknown-policy" in low or "no provenance" in low:
+            if "orion" in low:
+                return f"Source-blind Orion/context evidence exists for {subject}, but raw details were withheld."
+            return "Source-blind context exists, but raw details were withheld."
+        if "orion" in low:
+            return f"{subject} has recurring Orion-related context. Raw supporting detail withheld for privacy/source safety."
+        if "queue" in low or "submission" in low:
+            return f"{subject} has possible queue/submission context. Raw supporting detail withheld for privacy/source safety."
+        if "suno" in low or "music" in low or "link" in low or "url" in low:
+            return f"{subject} has possible music/link context. Raw supporting detail withheld for privacy/source safety."
+        if "relationship" in low or "relay" in low or "context" in low:
+            return f"{subject} has possible relationship/context evidence. Raw supporting detail withheld for privacy/source safety."
+        return "Review-needed evidence exists, but the raw detail was withheld for privacy."
+    clean = original
+    clean = _EMAIL_RE.sub("[redacted email]", clean)
+    clean = _PHONE_RE.sub("[redacted phone]", clean)
+    clean = _RAW_ID_RE.sub("[redacted id]", clean)
+    clean = _SECRET_RE.sub("[redacted secret]", clean)
+    clean = _LINK_RE.sub("[redacted link]", clean)
+    clean = re.sub(r"\s+", " ", clean).strip()
+    if _EMAIL_RE.search(clean) or _PHONE_RE.search(clean) or _RAW_ID_RE.search(clean) or _SECRET_RE.search(clean) or _LINK_RE.search(clean):
+        return "Review-needed evidence exists, but the raw detail was withheld for privacy."
+    return clean[:240].rstrip()
 
 def _blank_result(subject: str, aliases: list[str]) -> dict[str, Any]:
     return {
@@ -192,7 +252,7 @@ def resolve_subject_memory(subject_name: str, db_path: str, aliases: list[str] |
                     if safe:
                         _add_public_sections(result, safe); result["evidenceCounts"]["publicSafe"] += 1
                 elif klass == "review_only":
-                    safe_review = _sanitize_public(raw, subject, clean_aliases) or "Subject memory needs owner/admin confirmation before public use."
+                    safe_review = _redact_review_evidence_summary(raw, subject) or "Subject memory needs owner/admin confirmation before public use."
                     result["reviewOnlyEvidence"].append({"table": table, "summary": safe_review, "reason": reason})
                     result["evidenceCounts"]["reviewOnly"] += 1
                     if re.search(r"queue|submission", str(raw), re.I): result["queueOrSubmissionSignals"].append(safe_review if safe_review else "Queue or submission context needs admin confirmation before public use.")
@@ -202,7 +262,7 @@ def resolve_subject_memory(subject_name: str, db_path: str, aliases: list[str] |
                     result["privateOrInternalEvidence"].append({"table": table, "summary": "Private/internal memory was excluded from public copy.", "reason": reason})
                     result["evidenceCounts"]["privateOrInternal"] += 1
                 elif klass == "source_blind":
-                    safe_blind = _sanitize_public(raw, subject, clean_aliases)
+                    safe_blind = _redact_review_evidence_summary(raw, subject)
                     warning = "Some subject memory lacked public-safe provenance and was not used as public copy."
                     if safe_blind and re.search(r"relationship|context|orion|relay|references|through|music|link|queue|submission|barcode|community", safe_blind, re.I):
                         warning = f"Source-blind/internal context for review only: {safe_blind}"
@@ -276,11 +336,9 @@ def _claim_prefix(claim_type: str) -> str:
 
 
 def _safe_evidence_example(text: str, subject: str) -> str:
-    clean = _text(text, 180)
-    clean = _LINK_RE.sub("[redacted public link]", clean)
-    clean = re.sub(r"\b\d{6,}\b", "[redacted id]", clean)
+    clean = _redact_review_evidence_summary(text, subject)
     clean = re.sub(r"\b(cus|sub|pi|ch|tok)_[A-Za-z0-9_\-]+\b", "[redacted token]", clean, flags=re.I)
-    clean = re.sub(r"\b(stripe|checkout|payment|paid|purchase|purchased|customer|priority\s*signal|priority)\b", "[redacted protected category]", clean, flags=re.I)
+    clean = re.sub(r"\b\d{6,}\b", "[redacted id]", clean)
     return clean or f"Redacted protected memory about {subject}."
 
 
@@ -373,11 +431,11 @@ def build_subject_analyst_read(subject_name: str, resolved_memory: dict[str, Any
     review_sources: list[str] = []
     for ev in resolved_memory.get("reviewOnlyEvidence") or []:
         if isinstance(ev, dict):
-            txt = _sanitize_public(str(ev.get("summary") or ""), subject, resolved_memory.get("matchedAliasesUsedPrivately") or [])
+            txt = _redact_review_evidence_summary(str(ev.get("summary") or ""), subject)
             if txt and txt not in review_sources:
                 review_sources.append(txt)
     for item in (resolved_memory.get("queueOrSubmissionSignals") or []) + (resolved_memory.get("relationshipOrContextSignals") or []):
-        txt = _sanitize_public(str(item), subject, resolved_memory.get("matchedAliasesUsedPrivately") or [])
+        txt = _redact_review_evidence_summary(str(item), subject)
         if txt and txt not in review_sources and txt not in draft_ingredients:
             review_sources.append(txt)
     if review and not review_sources:
@@ -403,7 +461,7 @@ def build_subject_analyst_read(subject_name: str, resolved_memory: dict[str, Any
     blind_insights = []
     if blind:
         for warn in resolved_memory.get("sourceSafetyWarnings") or []:
-            clean = _text(str(warn), 260)
+            clean = _redact_review_evidence_summary(str(warn), subject)
             if clean and clean not in blind_insights:
                 blind_insights.append(clean if clean.startswith("Source-blind") else f"Source-blind/internal context: {clean}")
     if blind and not blind_insights:

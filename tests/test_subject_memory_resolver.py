@@ -80,6 +80,36 @@ class SubjectMemoryResolverTests(unittest.TestCase):
             self.assertNotIn("queue", public_blob)
             self.assertNotIn("stripe", public_blob)
 
+
+    def test_review_and_source_blind_contact_details_are_redacted(self):
+        with tempfile.NamedTemporaryFile(suffix='.db') as tmp:
+            conn = sqlite3.connect(tmp.name)
+            conn.execute("CREATE TABLE entity_evidence_events (subject_name TEXT, safe_summary TEXT, channel_policy TEXT, visibility TEXT, authority TEXT, public_safe_candidate INTEGER, review_only INTEGER)")
+            conn.execute("CREATE TABLE broadcast_memory (cleaned_summary TEXT, public_safe INTEGER, status TEXT)")
+            conn.execute("CREATE TABLE message_memory (subject_name TEXT, summary TEXT, visibility TEXT, public_safe INTEGER)")
+            conn.execute("INSERT INTO entity_evidence_events VALUES (?,?,?,?,?,?,?)", ("Crow", "Crow relationship context: Orion relay details at crow.private@example.com and phone 555-123-4567 need confirmation.", "", "review_only", "", 0, 1))
+            conn.execute("INSERT INTO broadcast_memory VALUES (?,?,?)", ("Crow source-blind Orion context mentions private contact crow.blind@example.com and Discord ID 123456789012345678.", 0, "active"))
+            conn.execute("INSERT INTO message_memory VALUES (?,?,?,?)", ("Crow", "Crow Stripe customer cus_123 paid Priority signal contact crow.pay@example.com raw Discord ID 123456789012345678.", "public_safe", 1))
+            conn.commit(); conn.close()
+            resolved = resolve_subject_memory("Crow", tmp.name)
+            analyst = build_subject_analyst_read("Crow", resolved)
+            combined = " ".join([
+                str(resolved["sourceSafetyWarnings"]),
+                str(analyst["reviewNeededClaims"]),
+                str(analyst["reviewableClaims"]),
+                str(analyst["sourceBlindInsights"]),
+                str(analyst["withheldEvidenceAudit"]),
+            ]).lower()
+            for leaked in ("crow.private@example.com", "crow.blind@example.com", "crow.pay@example.com", "555-123-4567", "123456789012345678", "cus_123"):
+                self.assertNotIn(leaked, combined)
+            self.assertTrue(any("Orion" in claim for claim in analyst["reviewNeededClaims"]))
+            self.assertTrue(any("withheld" in c.get("safeEvidenceSummary", "").lower() for c in analyst["reviewableClaims"]))
+            audit = analyst["withheldEvidenceAudit"]
+            self.assertGreaterEqual(audit["categories"]["payment_customer_priority"]["count"], 1)
+            public_blob = " ".join(analyst["publicSafeClaims"] + analyst["draftIngredients"]).lower()
+            self.assertNotIn("example.com", public_blob)
+            self.assertNotIn("orion", public_blob)
+
     def test_private_payment_rejected_and_missing_tables_do_not_crash(self):
         with tempfile.NamedTemporaryFile(suffix='.db') as tmp:
             conn = sqlite3.connect(tmp.name)
