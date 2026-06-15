@@ -25,7 +25,7 @@ from bnl_entity_intelligence import build_entity_intelligence_profile, resolve_e
 from bnl_evidence_ownership import classify_evidence_ownership, subject_owned_text_fragments
 from bnl_source_file_lookup import lookup_source_file
 from bnl_source_refresh_context import refresh_generation_context
-from bnl_subject_memory_resolver import build_subject_analyst_read, resolve_subject_memory
+from bnl_subject_memory_resolver import build_subject_analyst_read, resolve_subject_memory, _review_guidance
 
 ENRICHMENT_INGEST_SOURCE = "bnl_source_file_enrichment"
 FALLBACK_INGEST_SOURCE = "bnl_source_knowledge_bridge"
@@ -4815,12 +4815,29 @@ def _normalize_subject_analyst_read_v1(analyst: dict[str, Any]) -> dict[str, Any
     normalized = {key: analyst.get(key) for key in _SUBJECT_ANALYST_READ_KEYS}
     normalized["sourceFileReviewClaims"] = _case_list(review_claims, limit=10, item_limit=320)
     normalized["sourceFileIngredients"] = _case_list(source_file_ingredients, limit=18, item_limit=320)
-    normalized["reviewableClaims"] = _sanitize_archive_value((analyst.get("reviewableClaims") or [])[:14]) if isinstance(analyst.get("reviewableClaims"), list) else []
+    subject = _case_text(analyst.get("subjectName") or "Unnamed subject", 140)
+    normalized_claims: list[dict[str, Any]] = []
+    if isinstance(analyst.get("reviewableClaims"), list):
+        for raw in (analyst.get("reviewableClaims") or [])[:14]:
+            if not isinstance(raw, dict):
+                continue
+            item = dict(raw)
+            claim_text = _case_text(item.get("claimText") or item.get("claim") or item.get("summary"), 300)
+            if not claim_text:
+                continue
+            item["claimText"] = claim_text
+            claim_type = _case_text(item.get("claimType") or "missing_confirmation", 80)
+            lane = _case_text(item.get("reviewLane") or "needs_confirmation", 80)
+            public_safe = bool(item.get("publicSafe") is True)
+            for key, value in _review_guidance(subject, claim_text, claim_type, lane, public_safe).items():
+                item.setdefault(key, value)
+            normalized_claims.append(item)
+    normalized["reviewableClaims"] = _sanitize_archive_value(normalized_claims)
     normalized["withheldEvidenceAudit"] = _sanitize_archive_value(analyst.get("withheldEvidenceAudit") or {}) if isinstance(analyst.get("withheldEvidenceAudit"), dict) else {}
     normalized["missingConfirmations"] = _sanitize_archive_value((analyst.get("missingConfirmations") or [])[:12]) if isinstance(analyst.get("missingConfirmations"), list) else []
     for key in ("strongestSignals", "publicSafeClaims", "publicReadyClaims", "sourceBlindInsights", "privateOrInternalExclusions", "doNotSayPublicly", "missingInfoQuestions", "recommendedAdminActions", "draftIngredients", "provenanceSummary"):
         normalized[key] = _case_list(normalized.get(key), limit=12 if key != "draftIngredients" else 9, item_limit=360)
-    normalized["subjectName"] = _case_text(normalized.get("subjectName"), 140)
+    normalized["subjectName"] = subject
     normalized["internalRead"] = _case_text(normalized.get("internalRead"), 700)
     normalized["likelySubjectType"] = _case_text(normalized.get("likelySubjectType"), 80)
     normalized["confidence"] = _case_text(normalized.get("confidence"), 40)
