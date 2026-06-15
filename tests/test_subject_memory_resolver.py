@@ -110,6 +110,24 @@ class SubjectMemoryResolverTests(unittest.TestCase):
             self.assertNotIn("example.com", public_blob)
             self.assertNotIn("orion", public_blob)
 
+
+    def test_source_blind_warnings_are_category_only_for_sensitive_fragments(self):
+        with tempfile.NamedTemporaryFile(suffix='.db') as tmp:
+            conn = sqlite3.connect(tmp.name)
+            conn.execute("CREATE TABLE broadcast_memory (cleaned_summary TEXT, public_safe INTEGER, status TEXT)")
+            conn.execute("INSERT INTO broadcast_memory VALUES (?,?,?)", ("Crow source-blind Orion context email crow.orion@example.com Discord ID 123456789012345678.", 0, "active"))
+            conn.execute("INSERT INTO broadcast_memory VALUES (?,?,?)", ("Crow source-blind music link context at https://private.example/song and phone 555-222-3333.", 0, "active"))
+            conn.execute("INSERT INTO broadcast_memory VALUES (?,?,?)", ("Crow source-blind queue submission context for user ID 987654321098765432.", 0, "active"))
+            conn.commit(); conn.close()
+            resolved = resolve_subject_memory("Crow", tmp.name)
+            warnings = "\n".join(resolved["sourceSafetyWarnings"])
+            warning_blob = warnings.lower()
+            for leaked in ("crow.orion@example.com", "https://private.example/song", "555-222-3333", "123456789012345678", "987654321098765432"):
+                self.assertNotIn(leaked, warning_blob)
+            self.assertIn("Source-blind Orion/context evidence exists for Crow, but raw details were withheld.", warnings)
+            self.assertIn("Source-blind music/link context exists for Crow, but raw details were withheld.", warnings)
+            self.assertIn("Source-blind queue/submission context exists for Crow, but raw details were withheld.", warnings)
+
     def test_private_payment_rejected_and_missing_tables_do_not_crash(self):
         with tempfile.NamedTemporaryFile(suffix='.db') as tmp:
             conn = sqlite3.connect(tmp.name)

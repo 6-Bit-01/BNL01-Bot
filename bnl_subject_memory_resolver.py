@@ -135,6 +135,22 @@ def _redact_review_evidence_summary(text: str, subject: str) -> str:
         return "Review-needed evidence exists, but the raw detail was withheld for privacy."
     return clean[:240].rstrip()
 
+
+def _source_blind_warning_from_summary(summary: str, subject: str) -> str:
+    """Return only category-level safe wording for source-blind warnings."""
+    low = _text(summary, 360).lower()
+    if "orion" in low or "relay" in low:
+        return f"Source-blind Orion/context evidence exists for {subject}, but raw details were withheld."
+    if "queue" in low or "submission" in low:
+        return f"Source-blind queue/submission context exists for {subject}, but raw details were withheld."
+    if "suno" in low or "music" in low or "song" in low or "track" in low or "link" in low or "url" in low or _LINK_RE.search(summary or ""):
+        return f"Source-blind music/link context exists for {subject}, but raw details were withheld."
+    if "relationship" in low or "context" in low:
+        return f"Source-blind Orion/context evidence exists for {subject}, but raw details were withheld."
+    if "barcode" in low or "bnl" in low or "community" in low:
+        return f"Source-blind community context exists for {subject}, but raw details were withheld."
+    return "Some subject memory lacked public-safe provenance and was not used as public copy."
+
 def _blank_result(subject: str, aliases: list[str]) -> dict[str, Any]:
     return {
         "subjectName": subject,
@@ -157,10 +173,12 @@ def _classify(data: dict[str, Any], text: str) -> tuple[str, str]:
     blob = " ".join(str(data.get(k) or "") for k in data)
     if not text:
         return "unusable", "empty_text"
-    if _PAYMENT_RE.search(blob) or _INTERNAL_RE.search(blob):
+    if _PAYMENT_RE.search(blob):
         return "private_internal", "private_or_internal_terms"
     if _SOURCE_BLIND_RE.search(blob):
         return "source_blind", "missing_public_provenance"
+    if _INTERNAL_RE.search(blob):
+        return "private_internal", "private_or_internal_terms"
     if _REVIEW_RE.search(blob) or bool(data.get("review_only")):
         return "review_only", "needs_review_or_confirmation"
     if _public_ready(data, text):
@@ -262,12 +280,9 @@ def resolve_subject_memory(subject_name: str, db_path: str, aliases: list[str] |
                     result["privateOrInternalEvidence"].append({"table": table, "summary": "Private/internal memory was excluded from public copy.", "reason": reason})
                     result["evidenceCounts"]["privateOrInternal"] += 1
                 elif klass == "source_blind":
-                    safe_blind = _redact_review_evidence_summary(raw, subject)
-                    warning = "Some subject memory lacked public-safe provenance and was not used as public copy."
-                    if safe_blind and re.search(r"relationship|context|orion|relay|references|through|music|link|queue|submission|barcode|community", safe_blind, re.I):
-                        warning = f"Source-blind/internal context for review only: {safe_blind}"
-                        if re.search(r"relationship|context|orion|relay|references|through", safe_blind, re.I):
-                            result["relationshipOrContextSignals"].append(safe_blind)
+                    warning = _source_blind_warning_from_summary(raw, subject)
+                    if re.search(r"relationship|context|orion|relay|references|through", str(raw), re.I):
+                        result["relationshipOrContextSignals"].append(warning)
                     result["sourceSafetyWarnings"].append(warning)
                     result["evidenceCounts"]["sourceBlind"] += 1
         ps = result["evidenceCounts"]["publicSafe"]
