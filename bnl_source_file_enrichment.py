@@ -4756,11 +4756,15 @@ _SUBJECT_ANALYST_READ_KEYS = (
     "publicDraftPosture",
     "strongestSignals",
     "publicSafeClaims",
+    "publicReadyClaims",
     "sourceFileReviewClaims",
+    "reviewableClaims",
     "sourceBlindInsights",
     "privateOrInternalExclusions",
+    "withheldEvidenceAudit",
     "doNotSayPublicly",
     "missingInfoQuestions",
+    "missingConfirmations",
     "recommendedAdminActions",
     "draftIngredients",
     "sourceFileIngredients",
@@ -4811,7 +4815,10 @@ def _normalize_subject_analyst_read_v1(analyst: dict[str, Any]) -> dict[str, Any
     normalized = {key: analyst.get(key) for key in _SUBJECT_ANALYST_READ_KEYS}
     normalized["sourceFileReviewClaims"] = _case_list(review_claims, limit=10, item_limit=320)
     normalized["sourceFileIngredients"] = _case_list(source_file_ingredients, limit=18, item_limit=320)
-    for key in ("strongestSignals", "publicSafeClaims", "sourceBlindInsights", "privateOrInternalExclusions", "doNotSayPublicly", "missingInfoQuestions", "recommendedAdminActions", "draftIngredients", "provenanceSummary"):
+    normalized["reviewableClaims"] = _sanitize_archive_value((analyst.get("reviewableClaims") or [])[:14]) if isinstance(analyst.get("reviewableClaims"), list) else []
+    normalized["withheldEvidenceAudit"] = _sanitize_archive_value(analyst.get("withheldEvidenceAudit") or {}) if isinstance(analyst.get("withheldEvidenceAudit"), dict) else {}
+    normalized["missingConfirmations"] = _sanitize_archive_value((analyst.get("missingConfirmations") or [])[:12]) if isinstance(analyst.get("missingConfirmations"), list) else []
+    for key in ("strongestSignals", "publicSafeClaims", "publicReadyClaims", "sourceBlindInsights", "privateOrInternalExclusions", "doNotSayPublicly", "missingInfoQuestions", "recommendedAdminActions", "draftIngredients", "provenanceSummary"):
         normalized[key] = _case_list(normalized.get(key), limit=12 if key != "draftIngredients" else 9, item_limit=360)
     normalized["subjectName"] = _case_text(normalized.get("subjectName"), 140)
     normalized["internalRead"] = _case_text(normalized.get("internalRead"), 700)

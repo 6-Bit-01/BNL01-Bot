@@ -50,6 +50,84 @@ class SubjectMemoryResolverTests(unittest.TestCase):
                 self.assertNotIn(forbidden, public_blob)
             self.assertTrue(any("role" in x.lower() or "queue" in x.lower() for x in analyst["reviewNeededClaims"] + analyst["doNotSayPublicly"]))
 
+
+    def test_analyst_outputs_specific_claims_orion_and_safe_withheld_audit(self):
+        with tempfile.NamedTemporaryFile(suffix='.db') as tmp:
+            conn = sqlite3.connect(tmp.name)
+            conn.execute("CREATE TABLE entity_evidence_events (subject_name TEXT, safe_summary TEXT, channel_policy TEXT, visibility TEXT, authority TEXT, public_safe_candidate INTEGER, review_only INTEGER)")
+            conn.execute("CREATE TABLE message_memory (subject_name TEXT, summary TEXT, visibility TEXT, public_safe INTEGER)")
+            conn.execute("INSERT INTO entity_evidence_events VALUES (?,?,?,?,?,?,?)", ("Crow", "Crow may be a recurring BARCODE community participant who references Orion as an AI/message relay context.", "", "review_only", "", 0, 1))
+            conn.execute("INSERT INTO entity_evidence_events VALUES (?,?,?,?,?,?,?)", ("Crow", "Crow may have public Suno/music links and queue submission history needing confirmation.", "", "review_only", "", 0, 1))
+            conn.execute("INSERT INTO message_memory VALUES (?,?,?,?)", ("Crow", "Crow Stripe customer cus_123 paid Priority signal with raw Discord ID 123456789012345678.", "public_safe", 1))
+            conn.commit(); conn.close()
+            analyst = build_subject_analyst_read("Crow", resolve_subject_memory("Crow", tmp.name))
+            review_blob = "\n".join(analyst["reviewNeededClaims"])
+            self.assertIn("Possible relationship/context claim", review_blob)
+            self.assertIn("Orion", review_blob)
+            self.assertIn("Possible queue/submission claim", review_blob)
+            self.assertNotIn("Possible role, queue/submission, link, or relationship claims require", review_blob)
+            self.assertTrue(analyst["reviewableClaims"])
+            self.assertTrue(any(c["claimType"] in {"relationship", "queue_submission", "music_link"} for c in analyst["reviewableClaims"]))
+            self.assertTrue(any("Confirm Orion context" in q for q in analyst["missingInfoQuestions"]))
+            audit = analyst["withheldEvidenceAudit"]
+            self.assertGreaterEqual(audit["totalWithheld"], 1)
+            self.assertGreaterEqual(audit["categories"]["private_internal"]["count"], 1)
+            audit_blob = str(audit).lower()
+            self.assertNotIn("cus_123", audit_blob)
+            self.assertNotIn("123456789012345678", audit_blob)
+            public_blob = " ".join(analyst["publicSafeClaims"] + analyst["draftIngredients"]).lower()
+            self.assertNotIn("orion", public_blob)
+            self.assertNotIn("queue", public_blob)
+            self.assertNotIn("stripe", public_blob)
+
+
+    def test_review_and_source_blind_contact_details_are_redacted(self):
+        with tempfile.NamedTemporaryFile(suffix='.db') as tmp:
+            conn = sqlite3.connect(tmp.name)
+            conn.execute("CREATE TABLE entity_evidence_events (subject_name TEXT, safe_summary TEXT, channel_policy TEXT, visibility TEXT, authority TEXT, public_safe_candidate INTEGER, review_only INTEGER)")
+            conn.execute("CREATE TABLE broadcast_memory (cleaned_summary TEXT, public_safe INTEGER, status TEXT)")
+            conn.execute("CREATE TABLE message_memory (subject_name TEXT, summary TEXT, visibility TEXT, public_safe INTEGER)")
+            conn.execute("INSERT INTO entity_evidence_events VALUES (?,?,?,?,?,?,?)", ("Crow", "Crow relationship context: Orion relay details at crow.private@example.com and phone 555-123-4567 need confirmation.", "", "review_only", "", 0, 1))
+            conn.execute("INSERT INTO broadcast_memory VALUES (?,?,?)", ("Crow source-blind Orion context mentions private contact crow.blind@example.com and Discord ID 123456789012345678.", 0, "active"))
+            conn.execute("INSERT INTO message_memory VALUES (?,?,?,?)", ("Crow", "Crow Stripe customer cus_123 paid Priority signal contact crow.pay@example.com raw Discord ID 123456789012345678.", "public_safe", 1))
+            conn.commit(); conn.close()
+            resolved = resolve_subject_memory("Crow", tmp.name)
+            analyst = build_subject_analyst_read("Crow", resolved)
+            combined = " ".join([
+                str(resolved["sourceSafetyWarnings"]),
+                str(analyst["reviewNeededClaims"]),
+                str(analyst["reviewableClaims"]),
+                str(analyst["sourceBlindInsights"]),
+                str(analyst["withheldEvidenceAudit"]),
+            ]).lower()
+            for leaked in ("crow.private@example.com", "crow.blind@example.com", "crow.pay@example.com", "555-123-4567", "123456789012345678", "cus_123"):
+                self.assertNotIn(leaked, combined)
+            self.assertTrue(any("Orion" in claim for claim in analyst["reviewNeededClaims"]))
+            self.assertTrue(any("withheld" in c.get("safeEvidenceSummary", "").lower() for c in analyst["reviewableClaims"]))
+            audit = analyst["withheldEvidenceAudit"]
+            self.assertGreaterEqual(audit["categories"]["payment_customer_priority"]["count"], 1)
+            public_blob = " ".join(analyst["publicSafeClaims"] + analyst["draftIngredients"]).lower()
+            self.assertNotIn("example.com", public_blob)
+            self.assertNotIn("orion", public_blob)
+
+
+    def test_source_blind_warnings_are_category_only_for_sensitive_fragments(self):
+        with tempfile.NamedTemporaryFile(suffix='.db') as tmp:
+            conn = sqlite3.connect(tmp.name)
+            conn.execute("CREATE TABLE broadcast_memory (cleaned_summary TEXT, public_safe INTEGER, status TEXT)")
+            conn.execute("INSERT INTO broadcast_memory VALUES (?,?,?)", ("Crow source-blind Orion context email crow.orion@example.com Discord ID 123456789012345678.", 0, "active"))
+            conn.execute("INSERT INTO broadcast_memory VALUES (?,?,?)", ("Crow source-blind music link context at https://private.example/song and phone 555-222-3333.", 0, "active"))
+            conn.execute("INSERT INTO broadcast_memory VALUES (?,?,?)", ("Crow source-blind queue submission context for user ID 987654321098765432.", 0, "active"))
+            conn.commit(); conn.close()
+            resolved = resolve_subject_memory("Crow", tmp.name)
+            warnings = "\n".join(resolved["sourceSafetyWarnings"])
+            warning_blob = warnings.lower()
+            for leaked in ("crow.orion@example.com", "https://private.example/song", "555-222-3333", "123456789012345678", "987654321098765432"):
+                self.assertNotIn(leaked, warning_blob)
+            self.assertIn("Source-blind Orion/context evidence exists for Crow, but raw details were withheld.", warnings)
+            self.assertIn("Source-blind music/link context exists for Crow, but raw details were withheld.", warnings)
+            self.assertIn("Source-blind queue/submission context exists for Crow, but raw details were withheld.", warnings)
+
     def test_private_payment_rejected_and_missing_tables_do_not_crash(self):
         with tempfile.NamedTemporaryFile(suffix='.db') as tmp:
             conn = sqlite3.connect(tmp.name)
