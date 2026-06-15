@@ -350,6 +350,114 @@ def _claim_prefix(claim_type: str) -> str:
     }.get(claim_type, "Possible review claim")
 
 
+def _claim_actionability(claim_text: str, claim_type: str, lane: str, public_safe: bool) -> str:
+    low = (claim_text or "").lower()
+    if "subject-owned/keyed local evidence exists" in low or "local/keyed evidence" in low:
+        return "non_actionable_artifact"
+    if "lacked public-safe provenance" in low or "source-blind" in low or lane == "source_blind":
+        return "source_blind_warning"
+    if claim_text.strip().lower() in {"contest organizer", "organizer", "participant", "artist", "member"} or "contest organizer" in low:
+        return "weak_label"
+    if "?" in claim_text or "confirm" in low or "can bnl" in low:
+        return "missing_confirmation"
+    if public_safe:
+        return "actionable_claim"
+    if claim_type in {"relationship", "music_link", "public_link", "queue_submission", "role", "community_context"}:
+        return "actionable_claim"
+    return "evidence_signal"
+
+
+def _suggested_public_wording(subject: str, claim_text: str, claim_type: str, public_safe: bool) -> str:
+    if not public_safe:
+        return ""
+    text = _sanitize_public(claim_text, subject, [])
+    low = text.lower()
+    if not text:
+        return ""
+    if claim_type == "identity":
+        return subject
+    if claim_type in {"role", "community_context"}:
+        if "radio" in low:
+            return f"{subject} is a BARCODE Radio viewer/community participant."
+        if re.search(r"\b(member|community|barcode|bnl|participant)\b", low):
+            return f"{subject} is a BARCODE Network community member."
+    if claim_type in {"music_link", "public_link"} and _LINK_RE.search(text):
+        return f"{subject} has an approved public music link: {_LINK_RE.search(text).group(0)}."
+    if claim_type == "relationship" and "orion" in low:
+        return f"{subject} has recurring Orion-related BARCODE lore/context."
+    if claim_type == "queue_submission":
+        return f"{subject} has submitted music to BARCODE Radio."
+    return text if not re.search(r"\b(may|possible|unconfirmed|needs confirmation|source-blind|internal)\b", low) else ""
+
+
+def _review_guidance(subject: str, claim_text: str, claim_type: str, lane: str, public_safe: bool) -> dict[str, str]:
+    actionability = _claim_actionability(claim_text, claim_type, lane, public_safe)
+    low = (claim_text or "").lower()
+    guidance: dict[str, str] = {"actionability": actionability}
+    public_wording = _suggested_public_wording(subject, claim_text, claim_type, public_safe)
+    if public_wording:
+        guidance.update({
+            "suggestedPublicWording": public_wording,
+            "recommendedAction": "approve_public",
+            "recommendedActionReason": "BNL found public-safe or owner/admin-confirmed support for exact public wording.",
+        })
+        return guidance
+    if actionability == "non_actionable_artifact":
+        guidance.update({
+            "recommendedAction": "reject",
+            "suggestedRejectionReason": "This is a technical evidence artifact, not a reviewable Source File fact.",
+            "suggestedInternalNote": f"BNL found local/keyed evidence for {subject}, but it is not specific enough to become a public or internal claim without more context.",
+            "cannotSuggestPublicReason": "No concrete public-safe claim was identified.",
+            "recommendedActionReason": "The item is audit metadata rather than a subject fact.",
+        })
+        return guidance
+    if actionability == "weak_label":
+        label = _text(claim_text, 80)
+        if "contest organizer" in low:
+            label = "contest organizer"
+        guidance.update({
+            "recommendedAction": "keep_internal",
+            "suggestedInternalNote": f"BNL found a weak pattern label: \"{label}\". Keep internal only if useful; reject it if inaccurate.",
+            "suggestedMissingInfoQuestion": f"Is the label \"{label}\" accurate and useful for {subject}, or should it be rejected?",
+            "suggestedRejectionReason": "This label is too thin to approve without supporting public-safe context.",
+            "cannotSuggestPublicReason": "The label is not specific enough to become public copy.",
+            "recommendedActionReason": "Weak labels need supporting context before approval.",
+        })
+        return guidance
+    if actionability == "source_blind_warning":
+        guidance.update({
+            "recommendedAction": "needs_public_source",
+            "suggestedInternalNote": f"BNL found source-blind context for {subject}. Keep this internal until a public source or owner-approved wording is provided.",
+            "suggestedMissingInfoQuestion": "What public-safe source or owner-approved wording supports this source-blind context?",
+            "cannotSuggestPublicReason": "Source-blind memory cannot become public copy by itself.",
+            "recommendedActionReason": "Source-blind context needs separate public-safe provenance or owner/admin confirmation.",
+        })
+        return guidance
+    if claim_type in {"music_link", "public_link"}:
+        note = f"BNL found repeated music/link context for {subject}, but public ownership/use is not confirmed. Keep this internal until owner/admin approves links or wording."
+        question = f"Which {subject} links are owned or approved for public reference?"
+    elif claim_type == "relationship" and "orion" in low:
+        note = f"BNL found Orion-related context for {subject}. Keep this internal unless owner/admin confirms it may be referenced publicly."
+        question = f"Can BNL mention Orion in public {subject} context, or should Orion stay internal?"
+    elif claim_type == "queue_submission":
+        note = f"BNL found possible queue/submission context for {subject}. Keep this internal unless admin confirms it may be referenced publicly."
+        question = f"Can {subject}'s queue/submission history be referenced publicly, or should it stay internal?"
+    elif claim_type in {"role", "community_context"}:
+        note = f"BNL found possible role/community context for {subject}. Keep this internal until public wording is confirmed."
+        question = f"What public role/title may BNL use for {subject}, if any?"
+    else:
+        note = f"BNL found review-only context for {subject}. Keep this internal until a public source or owner-approved wording is provided."
+        question = "What public-safe source or owner-approved wording supports this claim?"
+    guidance.update({
+        "recommendedAction": "needs_more_info",
+        "recommendedActionReason": "BNL cannot safely suggest public wording until the missing confirmation is resolved.",
+        "suggestedInternalNote": note,
+        "suggestedMissingInfoQuestion": question,
+        "cannotSuggestPublicReason": "No confirmed public-safe wording or provenance was identified.",
+    })
+    return guidance
+
+
 def _safe_evidence_example(text: str, subject: str) -> str:
     clean = _redact_review_evidence_summary(text, subject)
     clean = re.sub(r"\b(cus|sub|pi|ch|tok)_[A-Za-z0-9_\-]+\b", "[redacted token]", clean, flags=re.I)
@@ -358,7 +466,7 @@ def _safe_evidence_example(text: str, subject: str) -> str:
 
 
 def _make_reviewable_claim(subject: str, claim_text: str, claim_type: str, lane: str, why: str, public_safe: bool, confidence: str, evidence: str = "", blocked: list[str] | None = None) -> dict[str, Any]:
-    return {
+    item = {
         "claimText": _text(claim_text, 300),
         "claimType": claim_type,
         "reviewLane": lane,
@@ -369,6 +477,8 @@ def _make_reviewable_claim(subject: str, claim_text: str, claim_type: str, lane:
         "safeEvidenceSummary": _text(evidence or why, 240),
         "blockedBy": blocked or ([] if public_safe else ["missing owner/admin confirmation", "missing public-safe provenance"]),
     }
+    item.update(_review_guidance(subject, item["claimText"], claim_type, lane, public_safe))
+    return item
 
 
 def _withheld_audit(subject: str, resolved_memory: dict[str, Any], private: int, blind: int, review: int) -> dict[str, Any]:
@@ -443,6 +553,11 @@ def build_subject_analyst_read(subject_name: str, resolved_memory: dict[str, Any
     public_claims = draft_ingredients[:6]
     reviewable_claims: list[dict[str, Any]] = []
     review_claims: list[str] = []
+    for txt in public_claims[:6]:
+        ctype = _claim_type_from_text(txt)
+        if ctype == "missing_confirmation":
+            ctype = "community_context" if re.search(r"\b(barcode|bnl|community|radio)\b", txt, re.I) else "role"
+        reviewable_claims.append(_make_reviewable_claim(subject, txt, ctype, "public_safe", "Public-safe subject memory supports this Source File fact.", True, confidence, _safe_evidence_example(txt, subject), []))
     review_sources: list[str] = []
     for ev in resolved_memory.get("reviewOnlyEvidence") or []:
         if isinstance(ev, dict):

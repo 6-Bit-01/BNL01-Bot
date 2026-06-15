@@ -110,6 +110,49 @@ class SubjectMemoryResolverTests(unittest.TestCase):
             self.assertNotIn("example.com", public_blob)
             self.assertNotIn("orion", public_blob)
 
+    def test_reviewable_claim_suggestions_cover_public_internal_source_blind_artifacts_and_weak_labels(self):
+        public_claim = build_subject_analyst_read("Crow", {
+            "subjectName": "Crow",
+            "matchedAliasesUsedPrivately": [],
+            "publicSafeFacts": ["Crow is a public-safe recurring BARCODE community member."],
+            "publicSafeNotes": [],
+            "publicCommunitySignals": [],
+            "publicCreativeMusicSignals": [],
+            "publicRoleSignals": [],
+            "publicLinkSignals": [],
+            "reviewOnlyEvidence": [
+                {"summary": "Crow may have public Suno/music links and repeated music link context needing confirmation."},
+                {"summary": "Crow may reference Orion as AI/message relay context needing confirmation."},
+                {"summary": "subject-owned/keyed local evidence exists"},
+                {"summary": "contest organizer"},
+            ],
+            "queueOrSubmissionSignals": ["Crow queue submission history needs confirmation."],
+            "relationshipOrContextSignals": [],
+            "sourceSafetyWarnings": ["Some subject memory lacked public-safe provenance"],
+            "privateOrInternalEvidence": [],
+            "evidenceCounts": {"publicSafe": 1, "reviewOnly": 4, "privateOrInternal": 0, "sourceBlind": 1, "totalScanned": 6},
+        })
+        claims = public_claim["reviewableClaims"]
+        self.assertTrue(any(c.get("suggestedPublicWording") == "Crow is a BARCODE Network community member." for c in claims))
+        music = next(c for c in claims if c["claimType"] == "music_link")
+        self.assertIn("repeated music/link context", music["suggestedInternalNote"])
+        self.assertIn("Which Crow links are owned", music["suggestedMissingInfoQuestion"])
+        self.assertNotIn("suggestedPublicWording", music)
+        orion = next(c for c in claims if c["claimType"] == "relationship")
+        self.assertIn("Orion-related context", orion["suggestedInternalNote"])
+        self.assertIn("Can BNL mention Orion", orion["suggestedMissingInfoQuestion"])
+        blind = next(c for c in claims if c.get("actionability") == "source_blind_warning")
+        self.assertEqual(blind["recommendedAction"], "needs_public_source")
+        self.assertIn("Source-blind memory cannot become public copy", blind["cannotSuggestPublicReason"])
+        artifact = next(c for c in claims if c.get("actionability") == "non_actionable_artifact")
+        self.assertEqual(artifact["recommendedAction"], "reject")
+        self.assertIn("technical evidence artifact", artifact["suggestedRejectionReason"])
+        self.assertNotIn("suggestedPublicWording", artifact)
+        weak = next(c for c in claims if c.get("actionability") == "weak_label")
+        self.assertIn(weak["recommendedAction"], {"keep_internal", "reject"})
+        self.assertIn('weak pattern label: "contest organizer"', weak["suggestedInternalNote"])
+        self.assertTrue(any("Can Crow's queue/submission history" in c.get("suggestedMissingInfoQuestion", "") for c in claims))
+
 
     def test_source_blind_warnings_are_category_only_for_sensitive_fragments(self):
         with tempfile.NamedTemporaryFile(suffix='.db') as tmp:

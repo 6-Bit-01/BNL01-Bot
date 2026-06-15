@@ -1,4 +1,5 @@
 import os
+import json
 import sqlite3
 import tempfile
 import unittest
@@ -140,6 +141,24 @@ class DossierDraftGeneratorTests(unittest.TestCase):
         for forbidden in ("Stripe", "checkout", "Priority", "payment"):
             self.assertNotIn(forbidden, public)
         self.assertTrue(any("payment/Priority" in x for x in result["unsupportedClaimsRejected"]))
+
+    def test_public_draft_does_not_emit_review_helper_fields_or_source_blind_terms(self):
+        packet = pr217_packet(
+            publicSafeFacts=["Signal Fox is a BARCODE Network community member."],
+            publicSafeNotes=[],
+            reviewableClaims=[{
+                "claimText": "Some subject memory lacked public-safe provenance",
+                "suggestedInternalNote": "BNL found source-blind context for Signal Fox.",
+                "suggestedMissingInfoQuestion": "What public-safe source or owner-approved wording supports this source-blind context?",
+                "recommendedAction": "needs_public_source",
+                "actionability": "source_blind_warning",
+            }],
+            withheldEvidenceAudit={"source_blind": {"count": 1}},
+        )
+        result = draft.generate_dossier_draft(packet)["draft"]
+        public = json.dumps(result).lower()
+        for forbidden in ("reviewableclaims", "suggestedinternalnote", "suggestedmissinginfoquestion", "recommendedaction", "actionability", "withheldevidenceaudit", "source-blind", "source_blind"):
+            self.assertNotIn(forbidden, public)
 
     def test_thin_packet_returns_conservative_summary_and_missing_info(self):
         result = draft.generate_dossier_draft(pr217_packet(publicSafeFacts=[], publicSafeNotes=[]))["draft"]
