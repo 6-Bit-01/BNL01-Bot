@@ -6,6 +6,7 @@ only returns sanitized text in public-safe sections.
 """
 from __future__ import annotations
 
+import json
 import logging
 import re
 import sqlite3
@@ -26,6 +27,59 @@ _SECRET_RE = re.compile(r"\b(?:api[_-]?key|token|secret|authorization|bearer|pas
 _CONTACT_RE = re.compile(r"\b(?:email|e-mail|phone|telephone|contact me|contact info|address|sms|text me)\b", re.I)
 _PRIVATE_ALIAS_RE = re.compile(r"\b(?:private alias|alias privately|known privately as|legal name|real name)\b", re.I)
 _DB_ROW_RE = re.compile(r"\b(?:rowid|source row|database row|raw json|raw payload|table row|memory_tiers|entity_evidence_events)\b", re.I)
+
+
+_CONTEST_HOST_RE = re.compile(r"\b(?:hosts? the contest|organizes? the contest|runs? the contest|created the contest|contest organizer|owner of the contest|official host)\b", re.I)
+_CONTEST_JUDGE_RE = re.compile(r"\b(?:judg(?:e|es|ing) the contest|contest judge|judge for the contest)\b", re.I)
+_CONTEST_SUBMIT_RE = re.compile(r"\b(?:submitted? (?:to|an? entry|for)|contest entr(?:y|ant)|submission link|submitter)\b", re.I)
+_CONTEST_RULES_RE = re.compile(r"\b(?:rules? (?:posted|mention(?:ed)?|for)|posted rules|contest rules|rules)\b", re.I)
+_CONTEST_DATE_RE = re.compile(r"\b(?:date|dates|deadline|starts?|ends?|schedule)\b", re.I)
+_CONTEST_CHANNEL_RE = re.compile(r"\b(?:channel|where contest happened)\b", re.I)
+_CONTEST_LINK_RE = re.compile(r"\b(?:public link|submission link|link|url|https?://)\b", re.I)
+_CONTEST_MUSIC_RE = re.compile(r"\b(?:suno|music|song|track|artist)\b", re.I)
+_CONTEST_REJECTION_RE = re.compile(r"\b(?:not a contest organizer|is not a contest organizer|reject(?:ed)? contest organizer|contest organizer rejected|rejected weak label ['\"]?contest organizer|do not infer contest organizer)\b", re.I)
+
+def humanize_internal_label(value: str) -> str:
+    text = _text(value, 300)
+    replacements = {"official_public_dossier": "official public dossier", "public_safe": "public-safe", "source_blind": "source-blind", "review_only": "review-only", "public_music_role": "public music role"}
+    for raw, friendly in replacements.items():
+        text = re.sub(re.escape(raw), friendly, text, flags=re.I)
+    return re.sub(r"\b([a-z]+(?:_[a-z]+)+)\b", lambda m: m.group(1).replace("_", " "), text)
+
+def classify_contest_event_context(text: str) -> tuple[str, dict[str, bool]]:
+    value = _text(text, 1000)
+    has_contest = bool(re.search(r"\bcontest\b", value, re.I))
+    hints = {
+        "contestName": has_contest and bool(re.search(r"\b(?:contest name|suno contest|[A-Z][A-Za-z0-9 ]+ contest)\b", value)),
+        "rulesMentioned": bool(_CONTEST_RULES_RE.search(value)),
+        "channelMentioned": has_contest and bool(_CONTEST_CHANNEL_RE.search(value)),
+        "dateMentioned": has_contest and bool(_CONTEST_DATE_RE.search(value)),
+        "publicLinkMentioned": has_contest and bool(_CONTEST_LINK_RE.search(value)),
+        "submissionMentioned": has_contest and bool(_CONTEST_SUBMIT_RE.search(value)),
+        "participantMentioned": has_contest and bool(re.search(r"\b(?:participant|entered|entry|submitted|submitter)\b", value, re.I)),
+        "hostMentioned": bool(_CONTEST_HOST_RE.search(value)),
+        "organizerMentioned": bool(re.search(r"\b(?:organizes? the contest|contest organizer|owner of the contest|created the contest|runs? the contest)\b", value, re.I)),
+        "judgeMentioned": bool(_CONTEST_JUDGE_RE.search(value)),
+        "musicContextMentioned": has_contest and bool(_CONTEST_MUSIC_RE.search(value)),
+        "publicSourceMissing": bool(re.search(r"\b(?:source[-_ ]blind|official_public_dossier source not connected|source not connected|no provenance)\b", value, re.I)),
+        "loreOrAnomalyContext": bool(re.search(r"\b(?:lore|anomaly|orion|relay)\b", value, re.I)),
+    }
+    if not has_contest: return "contest_unknown", hints
+    if hints["hostMentioned"]: return "contest_host", hints
+    if hints["organizerMentioned"]: return "contest_organizer", hints
+    if hints["judgeMentioned"]: return "contest_judge", hints
+    if hints["submissionMentioned"]: return "contest_submitter", hints
+    if hints["participantMentioned"]: return "contest_participant", hints
+    if hints["musicContextMentioned"]: return "contest_music_context", hints
+    if hints["rulesMentioned"]: return "contest_rules_poster", hints
+    if hints["publicLinkMentioned"]: return "contest_public_link_context", hints
+    if hints["dateMentioned"]: return "contest_date_context", hints
+    if hints["channelMentioned"]: return "contest_channel_context", hints
+    return "contest_mention_only", hints
+
+def _has_admin_contest_organizer_rejection(resolved_memory: dict[str, Any], packet: dict[str, Any] | None = None) -> bool:
+    blob = json.dumps(packet or {}, default=str) + " " + " ".join(json.dumps(resolved_memory.get(k) or [], default=str) for k in ("reviewOnlyEvidence", "privateOrInternalEvidence", "sourceSafetyWarnings", "missingInfoQuestions"))
+    return bool(_CONTEST_REJECTION_RE.search(blob))
 _ROLE_OR_TAXONOMY_LABELS = {
     "artist", "member", "community", "collaborator", "mod", "moderator", "personnel", "staff", "sponsor", "system", "interface", "production", "radio", "producer", "ai", "human", "hybrid", "unknown", "public", "internal", "restricted", "active", "pending", "person", "music", "tech", "systems", "broadcast", "participant", "dossier", "source", "source file",
 }
@@ -325,6 +379,10 @@ def _claim_type_from_text(text: str) -> str:
     low = (text or "").lower()
     if any(w in low for w in ("do not", "never state", "must not")):
         return "do_not_say"
+    if "contest" in low and any(w in low for w in ("music", "suno", "song", "track", "artist", "link", "url")):
+        return "contest_music_context"
+    if "contest" in low and any(w in low for w in ("submit", "submission", "entry")):
+        return "contest_submitter"
     if any(w in low for w in ("queue", "submission")):
         return "queue_submission"
     if any(w in low for w in ("suno", "music link", "social link", "http", "link")):
@@ -343,6 +401,11 @@ def _claim_prefix(claim_type: str) -> str:
         "role": "Possible role claim",
         "relationship": "Possible relationship/context claim",
         "music_link": "Possible music/link claim",
+        "contest_music_context": "Possible public music/link context",
+        "contest_submitter": "Possible contest submitter context",
+        "contest_rules_poster": "Possible contest rules context",
+        "contest_host": "Possible contest host claim",
+        "contest_organizer": "Possible contest organizer claim",
         "public_link": "Possible public-link claim",
         "queue_submission": "Possible queue/submission claim",
         "community_context": "Possible community/context claim",
@@ -358,6 +421,8 @@ def _claim_actionability(claim_text: str, claim_type: str, lane: str, public_saf
         return "source_blind_warning"
     if claim_text.strip().lower() in {"contest organizer", "organizer", "participant", "artist", "member"} or "contest organizer" in low:
         return "weak_label"
+    if claim_type in {"contest_music_context", "contest_submitter", "contest_rules_poster", "contest_public_link_context", "contest_channel_context", "contest_date_context", "contest_mention_only"}:
+        return "actionable_claim"
     if "?" in claim_text or "confirm" in low or "can bnl" in low:
         return "missing_confirmation"
     if public_safe:
@@ -433,7 +498,13 @@ def _review_guidance(subject: str, claim_text: str, claim_type: str, lane: str, 
             "recommendedActionReason": "Source-blind context needs separate public-safe provenance or owner/admin confirmation.",
         })
         return guidance
-    if claim_type in {"music_link", "public_link"}:
+    if claim_type == "contest_music_context":
+        note = f"BNL found contest-related music/link context for {subject}. This does not prove {subject} hosted or organized a contest. Keep internal until links and role are confirmed."
+        question = f"Which {subject} music or contest-related links are owned or approved for public reference?"
+    elif claim_type in {"contest_submitter", "contest_rules_poster", "contest_public_link_context", "contest_channel_context", "contest_date_context", "contest_mention_only"}:
+        note = f"BNL found contest-related context for {subject}, but the evidence does not establish that {subject} hosted or organized a contest."
+        question = f"What was {subject}’s relationship to this contest context: participant, submitter, rules poster, link source, host, organizer, or unrelated mention?"
+    elif claim_type in {"music_link", "public_link"}:
         note = f"BNL found repeated music/link context for {subject}, but public ownership/use is not confirmed. Keep this internal until owner/admin approves links or wording."
         question = f"Which {subject} links are owned or approved for public reference?"
     elif claim_type == "relationship" and "orion" in low:
@@ -453,7 +524,7 @@ def _review_guidance(subject: str, claim_text: str, claim_type: str, lane: str, 
         "recommendedActionReason": "BNL cannot safely suggest public wording until the missing confirmation is resolved.",
         "suggestedInternalNote": note,
         "suggestedMissingInfoQuestion": question,
-        "cannotSuggestPublicReason": "No confirmed public-safe wording or provenance was identified.",
+        "cannotSuggestPublicReason": "Contest role is ambiguous and needs owner/admin confirmation." if claim_type.startswith("contest_") and claim_type not in {"contest_host", "contest_organizer"} else "No confirmed public-safe wording or provenance was identified.",
     })
     return guidance
 
@@ -514,6 +585,7 @@ def build_subject_analyst_read(subject_name: str, resolved_memory: dict[str, Any
     hay = " ".join(draft_ingredients).lower()
     has_music = bool(re.search(r"\b(music|artist|musician|track|song|album|producer|dj)\b", hay))
     has_community = bool(re.search(r"\b(barcode|bnl|community|dossier|source file|public interaction|public context|radio)\b", hay))
+    admin_contest_organizer_rejected = _has_admin_contest_organizer_rejection(resolved_memory, packet)
     if has_music:
         likely_type = "artist"
     elif has_community:
@@ -561,23 +633,55 @@ def build_subject_analyst_read(subject_name: str, resolved_memory: dict[str, Any
     review_sources: list[str] = []
     for ev in resolved_memory.get("reviewOnlyEvidence") or []:
         if isinstance(ev, dict):
-            txt = _redact_review_evidence_summary(str(ev.get("summary") or ""), subject)
+            txt = humanize_internal_label(_redact_review_evidence_summary(str(ev.get("summary") or ""), subject))
             if txt and txt not in review_sources:
                 review_sources.append(txt)
     for item in (resolved_memory.get("queueOrSubmissionSignals") or []) + (resolved_memory.get("relationshipOrContextSignals") or []):
-        txt = _redact_review_evidence_summary(str(item), subject)
+        txt = humanize_internal_label(_redact_review_evidence_summary(str(item), subject))
         if txt and txt not in review_sources and txt not in draft_ingredients:
             review_sources.append(txt)
     if review and not review_sources:
         review_sources.append(f"{subject} may have role, link, queue/submission, music, or relationship context, but BNL needs confirmation before public use.")
+    if admin_contest_organizer_rejected:
+        reviewable_claims.append({
+            "claimText": f"Contest organizer label for {subject} is blocked by admin correction.",
+            "claimType": "contest_organizer",
+            "reviewLane": "admin_correction",
+            "suggestedDecision": "reject",
+            "why": "Admin/source-file correction rejected this weak contest organizer inference.",
+            "publicSafe": False,
+            "confidence": "high",
+            "safeEvidenceSummary": "Admin has rejected the contest organizer label.",
+            "blockedBy": ["admin correction"],
+            "recommendedAction": "reject",
+            "suggestedRejectionReason": f"Admin has rejected the contest organizer label for {subject}.",
+            "cannotSuggestPublicReason": "Admin correction blocks this inference.",
+            "recommendedActionReason": "Rejected Source File labels are authoritative until owner/admin reverses them.",
+            "adminCorrectionApplied": True,
+            "adminCorrectionSummary": f"{subject} is not a contest organizer unless later owner/admin confirmation reverses this correction.",
+            "rejectedLabel": "contest organizer",
+            "blockedInference": "Do not infer contest organizer from contest/link/rules context.",
+        })
     for txt in review_sources[:10]:
         ctype = _claim_type_from_text(txt)
+        contest_role, event_hints = classify_contest_event_context(txt)
+        if "contest" in txt.lower():
+            if txt.strip().lower() == "contest organizer":
+                ctype = "role"
+            else:
+                ctype = contest_role if contest_role != "contest_unknown" else ctype
+            if ctype in {"contest_host", "contest_organizer"} and admin_contest_organizer_rejected:
+                ctype = "contest_mention_only"
         if ctype == "community_context" and not ps:
             ctype = "role"
         if ctype == "relationship" and "orion" in txt.lower():
             line = f"Possible relationship/context claim: {subject} references Orion as an AI or message relay context. Confirm whether this may be used publicly or should remain internal community context."
         elif ctype == "queue_submission":
             line = f"Possible queue/submission claim: {subject} may have queue/submission history, but public use needs confirmation. Evidence context: {txt}"
+        elif ctype == "contest_music_context":
+            line = f"Possible public music/link context: BNL found contest-related music/link signals for {subject}, but it does not know which links are {subject}-owned or approved for public reference."
+        elif ctype.startswith("contest_"):
+            line = f"{_claim_prefix(ctype)}: BNL found contest-related context for {subject}, but the evidence does not establish that {subject} hosted or organized a contest."
         elif ctype in {"music_link", "public_link"}:
             line = f"Possible music/link claim: {subject} may have public music or link context, but ownership/use needs confirmation. Evidence context: {txt}"
         elif ctype == "role":
@@ -587,7 +691,12 @@ def build_subject_analyst_read(subject_name: str, resolved_memory: dict[str, Any
             line = f"{_claim_prefix(ctype)}: {txt} Confirm the exact public-safe wording before use."
         if line not in review_claims:
             review_claims.append(line)
-            reviewable_claims.append(_make_reviewable_claim(subject, line, ctype, "needs_confirmation", f"Review-only subject memory mentions {ctype.replace('_', ' ')} context.", False, "low", _safe_evidence_example(txt, subject)))
+            claim = _make_reviewable_claim(subject, line, ctype, "needs_confirmation", f"Review-only subject memory mentions {ctype.replace('_', ' ')} context.", False, "low", humanize_internal_label(_safe_evidence_example(txt, subject)))
+            if ctype.startswith("contest_"):
+                claim["eventEvidenceHints"] = {k: v for k, v in event_hints.items() if v}
+                if ctype in {"contest_host", "contest_organizer"}:
+                    claim["recommendedActionReason"] = "Strong host/organizer wording was detected; still require public-safe confirmation before public use."
+            reviewable_claims.append(claim)
     blind_insights = []
     if blind:
         for warn in resolved_memory.get("sourceSafetyWarnings") or []:
@@ -615,6 +724,8 @@ def build_subject_analyst_read(subject_name: str, resolved_memory: dict[str, Any
         {"question": f"Confirm public role/title: Is {subject} a community participant, artist, collaborator, or something else?", "confirmationType": "needs_admin_confirmation", "suggestedReviewer": "admin", "why": "Role wording is only public when backed by clean public evidence or admin-confirmed Source File fact.", "canAutoResolve": bool(has_community or has_music), "relatedClaimType": "role"},
         {"question": f"Confirm public links: Which {subject}/Suno/music/social links are owned or approved for public reference?", "confirmationType": "needs_owner_confirmation", "suggestedReviewer": "owner_or_admin", "why": "Link ownership/use must be explicit before public dossier use.", "canAutoResolve": False, "relatedClaimType": "music_link"},
     ]
+    if any("contest" in x.lower() for x in review_claims + review_sources):
+        missing.append({"question": f"What was {subject}’s relationship to this contest context: participant, submitter, rules poster, link source, host, organizer, or unrelated mention?", "confirmationType": "needs_admin_confirmation", "suggestedReviewer": "admin", "why": "Contest names/rules/channels/dates/links do not prove host or organizer role.", "canAutoResolve": False, "relatedClaimType": "contest_music_context"})
     if any("orion" in x.lower() or "relay" in x.lower() for x in review_claims + blind_insights):
         missing.append({"question": f"Confirm Orion context: Can BNL mention Orion as {subject}'s AI/message relay context, or keep it internal?", "confirmationType": "needs_admin_confirmation", "suggestedReviewer": "admin", "why": "Named relationship/context should not become public copy without permission and provenance.", "canAutoResolve": False, "relatedClaimType": "relationship"})
     if review or re.search(r"queue|submission", " ".join(str(x) for x in resolved_memory.get("queueOrSubmissionSignals") or []), re.I):

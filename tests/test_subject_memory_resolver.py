@@ -210,6 +210,39 @@ class SubjectMemoryResolverTests(unittest.TestCase):
             self.assertEqual(result["role"], "Music artist")
             self.assertIn("subject memory resolver", result["sourceUsageSummary"])
 
+    def test_contest_context_lanes_do_not_infer_organizer_and_humanize_labels(self):
+        analyst = build_subject_analyst_read("Crow", {
+            "subjectName": "Crow", "matchedAliasesUsedPrivately": [],
+            "publicSafeFacts": [], "publicSafeNotes": [], "publicCommunitySignals": [], "publicCreativeMusicSignals": [], "publicRoleSignals": [], "publicLinkSignals": [],
+            "reviewOnlyEvidence": [{"summary": "Crow Suno contest name/rules/channel/dates/public link; lore/anomaly public_safe status; official_public_dossier source not connected yet; public artist links / public_music_role"}],
+            "queueOrSubmissionSignals": [], "relationshipOrContextSignals": [], "sourceSafetyWarnings": [], "privateOrInternalEvidence": [],
+            "evidenceCounts": {"publicSafe": 0, "reviewOnly": 1, "privateOrInternal": 0, "sourceBlind": 0, "totalScanned": 1},
+        })
+        claim = next(c for c in analyst["reviewableClaims"] if c["claimType"] == "contest_music_context")
+        self.assertIn("Possible public music/link context", claim["claimText"])
+        self.assertNotIn("organizer", claim["claimType"])
+        self.assertEqual(claim["recommendedAction"], "needs_more_info")
+        self.assertIn("which links are Crow-owned", claim["claimText"])
+        self.assertIn("official public dossier", str(claim))
+        self.assertNotIn("official_public_dossier", str(claim))
+        self.assertNotIn("public_music_role", str(claim))
+        self.assertTrue(claim["eventEvidenceHints"]["rulesMentioned"])
+        self.assertTrue(any("relationship to this contest context" in q for q in analyst["missingInfoQuestions"]))
+
+    def test_contest_strong_host_submitter_rules_and_admin_rejection(self):
+        host = build_subject_analyst_read("Crow", {"subjectName":"Crow","matchedAliasesUsedPrivately":[],"publicSafeFacts":[],"publicSafeNotes":[],"publicCommunitySignals":[],"publicCreativeMusicSignals":[],"publicRoleSignals":[],"publicLinkSignals":[],"reviewOnlyEvidence":[{"summary":"Crow hosts the contest with public-safe confirmation."}],"queueOrSubmissionSignals":[],"relationshipOrContextSignals":[],"sourceSafetyWarnings":[],"privateOrInternalEvidence":[],"evidenceCounts":{"publicSafe":0,"reviewOnly":1,"privateOrInternal":0,"sourceBlind":0,"totalScanned":1}})
+        self.assertTrue(any(c["claimType"] == "contest_host" for c in host["reviewableClaims"]))
+        submitted = build_subject_analyst_read("Crow", {"subjectName":"Crow","matchedAliasesUsedPrivately":[],"publicSafeFacts":[],"publicSafeNotes":[],"publicCommunitySignals":[],"publicCreativeMusicSignals":[],"publicRoleSignals":[],"publicLinkSignals":[],"reviewOnlyEvidence":[{"summary":"Crow submitted to the contest as a contest entry."},{"summary":"Crow posted rules for the contest."}],"queueOrSubmissionSignals":[],"relationshipOrContextSignals":[],"sourceSafetyWarnings":[],"privateOrInternalEvidence":[],"evidenceCounts":{"publicSafe":0,"reviewOnly":2,"privateOrInternal":0,"sourceBlind":0,"totalScanned":2}})
+        types = {c["claimType"] for c in submitted["reviewableClaims"]}
+        self.assertIn("contest_submitter", types)
+        self.assertIn("contest_rules_poster", types)
+        self.assertNotIn("contest_organizer", types)
+        rejected = build_subject_analyst_read("Crow", {"subjectName":"Crow","matchedAliasesUsedPrivately":[],"publicSafeFacts":[],"publicSafeNotes":[],"publicCommunitySignals":[],"publicCreativeMusicSignals":[],"publicRoleSignals":[],"publicLinkSignals":[],"reviewOnlyEvidence":[{"summary":"Admin note: Crow is not a contest organizer."},{"summary":"Crow contest organizer"}],"queueOrSubmissionSignals":[],"relationshipOrContextSignals":[],"sourceSafetyWarnings":[],"privateOrInternalEvidence":[],"evidenceCounts":{"publicSafe":0,"reviewOnly":2,"privateOrInternal":0,"sourceBlind":0,"totalScanned":2}})
+        correction = next(c for c in rejected["reviewableClaims"] if c.get("adminCorrectionApplied"))
+        self.assertEqual(correction["recommendedAction"], "reject")
+        self.assertEqual(correction["rejectedLabel"], "contest organizer")
+        self.assertIn("Do not infer contest organizer", correction["blockedInference"])
+
 
 if __name__ == '__main__':
     unittest.main()
