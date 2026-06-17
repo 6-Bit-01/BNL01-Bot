@@ -1841,14 +1841,17 @@ def _evidence_anchor_for_claim(subject: str, claim: dict[str, Any], resolved_mem
     if protected:
         dimension = "source_protected_context"
     safe = _text(_redact_review_evidence_summary(raw, subject), 260)
-    has_specific_text = bool(safe and not _is_raw_review_label(safe) and not re.search(r"BNL found (?:a Source File signal|dossier-relevant context|unknown context)", safe, re.I) and len(safe.split()) >= 6)
+    generic_context_re = r"^(?:contest/event activity|show operations|collaboration(?: interest)?|contest/music/link context)(?: near .+| for .+)?(?:; .*?)?$"
+    has_specific_text = bool(safe and not _is_raw_review_label(safe) and not re.search(r"BNL found (?:a Source File signal|dossier-relevant context|unknown context)", safe, re.I) and not re.match(generic_context_re, safe, re.I) and len(safe.split()) >= 6)
     anchor_type, fallback = _EVIDENCE_ANCHOR_LABELS.get(dimension, (dimension, ""))
     if protected:
         safe_text = _EVIDENCE_ANCHOR_LABELS["source_protected_context"][1]
         has_anchor = True
     elif dimension in _EVIDENCE_ANCHOR_LABELS:
-        safe_text = fallback.format(subject=subject)
-        has_anchor = has_specific_text or bool(re.search(r"contest|event|rules|show[- ]operations?|collaborat|link|music|song|social", raw, re.I))
+        # Regex/category matches may classify the lane, but they are not evidence anchors.
+        # Only concrete safe text from the claim/evidence payload can anchor a normal review card.
+        safe_text = safe if has_specific_text else ""
+        has_anchor = has_specific_text
     elif has_specific_text and dimension == "public_role_title" and re.search(r"\b(role|title|moderator|staff|artist|musician|producer|dj)\b", raw, re.I):
         safe_text = safe
         anchor_type = "public_role_title"
@@ -1888,6 +1891,96 @@ def _evidence_anchor_for_claim(subject: str, claim: dict[str, Any], resolved_mem
         "answerable": answerability, "notAnswerableReason": reason,
     }
 
+
+def _is_protected_review_detail(raw: str) -> bool:
+    return bool(re.search(r"\b(source[-_ ]blind|protected|private|internal[- ]only|dm|token|raw id|customer|payment|stripe|secret|discord id)\b", raw or "", re.I))
+
+
+def _detail_is_fallback_or_label(text: str, subject: str) -> bool:
+    clean = re.sub(r"\s+", " ", (text or "").strip())
+    if not clean or _is_raw_review_label(clean):
+        return True
+    fallback_texts = {v[1].format(subject=subject) for v in _EVIDENCE_ANCHOR_LABELS.values()}
+    if clean in fallback_texts:
+        return True
+    if re.fullmatch(r"BNL (?:found|detected|saw) (?:contest/event|show-operations|collaboration(?:-related)?|contest/rules/link) context (?:near|for) .+", clean, re.I):
+        return True
+    if re.fullmatch(r"(?:contest/event activity|show operations|collaboration(?: interest)?|contest/music/link context)(?: near .+| for .+)?", clean, re.I):
+        return True
+    return False
+
+
+def _extract_safe_evidence_details_for_review(subject: str, claim: dict[str, Any], resolved_memory: dict[str, Any] | None = None, packet: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+    """Return concrete admin-safe evidence details with lane/id provenance.
+
+    This is intentionally stricter than classifier regexes: labels and template
+    fallback text classify a possible dimension, but they do not count as a
+    visible evidence detail for a human review card.
+    """
+    dimension = str(claim.get("dossierDimension") or claim.get("claimType") or "unknown_context")
+    details: list[dict[str, Any]] = []
+
+    def add(raw: Any, lane: str, source_type: str, source_id: str, public_safe: bool = False, admin_safe: bool = True) -> None:
+        raw_text = str(raw or "").strip()
+        if not raw_text:
+            return
+        protected = _is_protected_review_detail(raw_text) or lane in {"source_blind", "private_internal_withheld"} or dimension == "source_protected_context"
+        if protected:
+            safe_text = f"Protected source-blind detail exists in {source_id}, but raw details are withheld."
+            public = False
+            admin = True
+        else:
+            safe_text = _text(_redact_review_evidence_summary(humanize_internal_label(raw_text), subject), 260)
+            public = bool(public_safe)
+            admin = bool(admin_safe and safe_text)
+        if not safe_text or (not protected and _detail_is_fallback_or_label(safe_text, subject)):
+            return
+        if any(d.get("safeText") == safe_text and d.get("sourceId") == source_id for d in details):
+            return
+        why = {
+            "contest_event_activity": "This is why BNL thinks it relates to contest/event, rules, link, or submission context.",
+            "show_operations": "This is why BNL thinks it relates to show-operations context.",
+            "collaboration_interest": "This is why BNL thinks it relates to collaboration interest, planning, or project context.",
+            "collaboration_status": "This is why BNL thinks it relates to possible collaboration status or public collaboration context.",
+        }.get(dimension, "This is the safe source detail BNL can show for admin review.")
+        details.append({
+            "sourceLane": lane or "review_only",
+            "sourceType": source_type or dimension,
+            "sourceId": source_id,
+            "safeText": safe_text,
+            "whyItMatters": why,
+            "publicSafe": public,
+            "adminSafe": admin,
+            "protectedContextWithheld": protected,
+        })
+
+    for key in ("safeEvidenceSummary", "displayEvidenceSummary", "claimText", "why"):
+        add(claim.get(key), str(claim.get("reviewLane") or "review_claim"), dimension, f"sourceFileReviewClaims.{key}", bool(claim.get("publicSafe")))
+    if isinstance(resolved_memory, dict):
+        for key, lane, public in (
+            ("reviewOnlyEvidence", "reviewOnlyEvidence", False),
+            ("relationshipOrContextSignals", "relationshipOrContextSignals", False),
+            ("queueOrSubmissionSignals", "queueOrSubmissionSignals", False),
+            ("publicSafeFacts", "publicSafeFacts", True),
+            ("knownFacts", "knownFacts", True),
+            ("knownSourceFileFacts", "knownSourceFileFacts", True),
+            ("sourceNotes", "sourceNotes", False),
+            ("evidenceReceipts", "evidenceReceipts", False),
+        ):
+            vals = resolved_memory.get(key) or []
+            if isinstance(vals, list):
+                for i, item in enumerate(vals):
+                    raw = item.get("summary") if isinstance(item, dict) else item
+                    add(raw, lane, dimension, f"{lane}[{i}]", public)
+    if isinstance(packet, dict):
+        for key in ("knownFacts", "knownSourceFileFacts", "sourceNotes", "evidenceReceipts", "internalNotes", "notes", "bnlNotes"):
+            vals = packet.get(key) or []
+            if isinstance(vals, list):
+                for i, item in enumerate(vals):
+                    raw = item.get("summary") if isinstance(item, dict) else item
+                    add(raw, key, dimension, f"{key}[{i}]", key in {"knownFacts", "knownSourceFileFacts"})
+    return details[:8]
+
 def _safe_review_context_note(note: Any, subject: str) -> str:
     raw = str(note or "")
     if not raw.strip():
@@ -1899,6 +1992,9 @@ def _safe_review_context_note(note: Any, subject: str) -> str:
 def _build_review_context(subject: str, claim_text: str, claim_type: str, lane: str, public_safe: bool, dimension: str, intent: str, evidence: str = "", resolved_memory: dict[str, Any] | None = None, packet: dict[str, Any] | None = None) -> dict[str, Any]:
     safe_summary = _text(_redact_review_evidence_summary(evidence or claim_text, subject), 240)
     protected = lane == "source_blind" or dimension == "source_protected_context" or "source-blind" in f"{claim_text} {evidence}".lower()
+    if protected:
+        claim_text = f"Protected source-blind context for {subject}"
+        evidence = "Protected source-blind context exists, but raw details are withheld."
     if protected:
         safe_summary = "Protected context exists, but details are withheld from this card."
     signals = []
@@ -1945,7 +2041,21 @@ def _build_review_context(subject: str, claim_text: str, claim_type: str, lane: 
         what_not.append("BNL does not have enough confirmed public-safe context to write dossier text yet.")
         cannot.append("Do not infer a public fact from this signal alone.")
     claim_for_anchor = {"claimText": claim_text, "claimType": claim_type, "reviewLane": lane, "publicSafe": public_safe, "safeEvidenceSummary": safe_summary, "dossierDimension": dimension, "why": evidence}
+    evidence_details = _extract_safe_evidence_details_for_review(subject, claim_for_anchor, resolved_memory, packet)
+    admin_safe_details = [d for d in evidence_details if d.get("adminSafe")]
+    public_safe_details = [d for d in evidence_details if d.get("publicSafe") and not d.get("protectedContextWithheld")]
     anchor = _evidence_anchor_for_claim(subject, claim_for_anchor, resolved_memory, packet)
+    if admin_safe_details:
+        concrete = [d for d in admin_safe_details if not d.get("protectedContextWithheld")]
+        anchor["hasAnchor"] = bool(concrete or public_safe_details)
+        anchor["evidenceAnchorDetails"] = admin_safe_details
+        anchor["adminSafeEvidenceDetails"] = admin_safe_details
+        anchor["publicSafeEvidenceDetails"] = public_safe_details
+        if concrete:
+            joined = "; ".join(d["safeText"] for d in concrete[:3])
+            anchor["safeAnchorText"] = joined
+            anchor["whatBnlKnows"] = joined
+            anchor["answerable"] = "answerable" if public_safe_details else "partially_answerable"
     if anchor.get("hasAnchor"):
         what_knows = [str(anchor.get("whatBnlKnows") or anchor.get("safeAnchorText") or "")]
         safe_summary = str(anchor.get("safeAnchorText") or safe_summary)
@@ -1982,6 +2092,8 @@ def _build_review_context(subject: str, claim_text: str, claim_type: str, lane: 
         "relatedSignals": signals, "whatBnlKnows": what_knows, "whatBnlDoesNotKnow": what_not,
         "whatCannotBeInferred": cannot, "safePublicCandidates": public_facts[:4], "blockedReasons": [] if public_safe else ["missing owner/admin confirmation", "missing public-safe provenance"],
         "evidenceAnchor": anchor, "answerability": anchor.get("answerable"), "notAnswerableReason": anchor.get("notAnswerableReason", ""),
+        "safeEvidenceDetails": admin_safe_details, "evidenceAnchorDetails": admin_safe_details,
+        "adminSafeEvidenceDetails": admin_safe_details, "publicSafeEvidenceDetails": public_safe_details,
     }
 
 def _specificity_level(ctx: dict[str, Any]) -> str:
@@ -2025,8 +2137,14 @@ def _compose_source_file_review_card(subject: str, claim: dict[str, Any], dossie
     knows = context.get("whatBnlKnows") or []
     not_knows = context.get("whatBnlDoesNotKnow") or []
     cannot = context.get("whatCannotBeInferred") or []
+    details = context.get("adminSafeEvidenceDetails") or context.get("safeEvidenceDetails") or []
+    concrete_details = [d for d in details if isinstance(d, dict) and d.get("safeText") and not d.get("protectedContextWithheld")]
+    public_details = context.get("publicSafeEvidenceDetails") or []
+    detail_text = "; ".join(str(d.get("safeText")) for d in concrete_details[:3])
     summary = knows[0] if knows else (context.get("safeEvidenceSummary") or f"BNL found {topic.lower()}, but does not have enough safe context to describe it yet.")
-    if anchor.get("safeAnchorText"):
+    if detail_text:
+        summary = detail_text
+    elif anchor.get("safeAnchorText"):
         summary = str(anchor.get("safeAnchorText"))
     elif _is_raw_review_label(str(summary)):
         summary = "BNL only has a raw label or generic category, so this is not answerable as a normal review card."
@@ -2035,8 +2153,10 @@ def _compose_source_file_review_card(subject: str, claim: dict[str, Any], dossie
     public_wording = _clean_suggested_public_wording(str(claim.get("suggestedPublicWording") or ""))
     if _is_raw_review_label(public_wording) or protected:
         public_wording = ""
+    if public_wording and not (claim.get("publicSafe") is True or public_details):
+        public_wording = ""
     has_valid_public_wording = bool(public_wording)
-    has_public_safe_anchor = bool(claim.get("publicSafe") is True and anchor.get("hasAnchor"))
+    has_public_safe_anchor = bool((claim.get("publicSafe") is True or public_details) and anchor.get("hasAnchor"))
     has_existing_public_approval = bool(claim.get("recommendedAction") == "approve_public")
     public_approval_ready = bool(
         not protected
@@ -2047,6 +2167,8 @@ def _compose_source_file_review_card(subject: str, claim: dict[str, Any], dossie
     )
     if public_approval_ready:
         answerability = "answerable"
+    elif dossier_dimension in target_dimensions and not concrete_details and not public_wording and not protected:
+        answerability = "not_answerable"
     if dossier_dimension not in target_dimensions:
         out = {
             "displayTopic": topic,
@@ -2086,13 +2208,13 @@ def _compose_source_file_review_card(subject: str, claim: dict[str, Any], dossie
         }
     if dossier_dimension == "contest_event_activity":
         decision = f"Was {subject} involved in this contest or event, or was he only mentioned nearby?"
-        note = f"BNL found contest/event context near {subject}, but the available context does not confirm whether {subject} participated, submitted something, posted rules, shared a link, helped organize, hosted, or was only mentioned nearby."
+        note = f"BNL found these contest/rules/link details: {summary}. It cannot tell whether {subject} was a participant, submitter, rules poster, link source, host, organizer, or only mentioned nearby."
     elif dossier_dimension == "show_operations":
         decision = f"Is {subject} involved in show operations? If yes, what does he help with, and can BNL mention it publicly?"
-        note = f"BNL found show-operations context near {subject}, but the available context does not confirm whether {subject} actually helps with show operations or was only discussed near that topic."
+        note = f"BNL found these show-operations details: {summary}. It cannot tell whether {subject} actually helps with operations or was only discussed near that topic."
     elif dossier_dimension in {"collaboration_interest", "collaboration_status"}:
         decision = f"Did {subject} only show interest in collaborating, or is there an actual public collaboration BNL can mention publicly? If public, is it with BARCODE or another project, song, show, or context?"
-        note = f"BNL found collaboration-related context for {subject}, but it needs to distinguish interest in collaborating from an actual approved collaboration before this can become dossier text."
+        note = f"BNL found these collaboration-related details: {summary}. It needs to distinguish interest only, planning, actual collaboration, public collaboration, BARCODE vs non-BARCODE, and song/project/show context."
     elif dossier_dimension == "source_protected_context" or protected:
         decision = "Should this protected context stay internal, or is there approved public wording BNL can use?"
         note = f"Protected context exists for {subject}. Keep it internal unless an owner/admin provides public wording or a separate public source."
@@ -2121,15 +2243,15 @@ def _compose_source_file_review_card(subject: str, claim: dict[str, Any], dossie
         "displayTopic": topic,
         "displayTitle": f"Need approved public wording for {subject}" if protected else f"Clarify {topic}",
         "displayDecision": decision,
-        "displayWhatIsBeingChecked": f"{summary} Admins are checking the exact meaning, missing confirmation, and public/internal boundary.",
-        "displayWhyItExists": summary,
+        "displayWhatIsBeingChecked": f"Evidence detail(s): {summary}. Admins are checking the exact meaning, missing confirmation, and public/internal boundary.",
+        "displayWhyItExists": f"BNL has visible admin-safe evidence detail(s): {summary}",
         "displayBNLRecommendation": "BNL recommends answering the clarification question before approving public copy.",
         "evidenceSummary": summary,
         "displaySafetyDefault": "Keep internal until the exact meaning and public-safe wording are confirmed." if not protected else "Keep internal. Do not use protected context publicly.",
         "displayApprovalInstruction": "Approve only the exact confirmed public-safe wording, or choose keep internal/reject.",
         "displayWhatYouAreApproving": f"A decision about {topic}, not the raw label \"{context.get('rawLabel') or dossier_dimension}\" and not a general role/title.",
         "recommendedFollowUpQuestion": decision,
-        "recommendedFollowUpReason": "BNL needs the admin/owner to confirm what the evidence means, what remains unknown, and what should not be inferred.",
+        "recommendedFollowUpReason": f"BNL needs the admin/owner to interpret these evidence detail(s): {summary}",
         "suggestedConfirmationAnswerType": str(claim.get("suggestedConfirmationAnswerType") or "plain-language confirmation, correction, public-safe wording, or keep-internal decision"),
         "suggestedInternalNote": note,
         "suggestedPublicWording": public_wording,
@@ -2325,6 +2447,10 @@ def _safe_evidence_example(text: str, subject: str) -> str:
 def _make_reviewable_claim(subject: str, claim_text: str, claim_type: str, lane: str, why: str, public_safe: bool, confidence: str, evidence: str = "", blocked: list[str] | None = None) -> dict[str, Any]:
     actionability = _claim_actionability(claim_text, claim_type, lane, public_safe)
     display_claim_text = "Weak internal signal — not a public fact" if actionability == "non_actionable_artifact" else claim_text
+    if actionability == "source_blind_warning" or lane in {"source_blind", "private_internal_withheld"}:
+        display_claim_text = f"Protected source-blind context for {subject}"
+        evidence = "Protected source-blind context exists, but raw details are withheld."
+        why = "Protected source-blind context exists, but raw details are withheld."
     item = {
         "claimText": _text(display_claim_text, 300),
         "claimType": claim_type,
