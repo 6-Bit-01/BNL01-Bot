@@ -4,7 +4,7 @@ import unittest
 import json
 
 import bnl_dossier_draft as draft
-from bnl_subject_memory_resolver import build_subject_analyst_read, build_subject_memory_diagnostic, resolve_subject_memory, _review_guidance, _make_reviewable_claim, _cluster_clarification_needs, _build_dossier_readiness, _build_dossier_readiness_from_clarifications
+from bnl_subject_memory_resolver import build_subject_analyst_read, build_subject_memory_diagnostic, resolve_subject_memory, _review_guidance, _make_reviewable_claim, _cluster_clarification_needs, _build_dossier_readiness, _build_dossier_readiness_from_clarifications, _public_role_candidate_for_subject
 
 
 class SubjectMemoryResolverTests(unittest.TestCase):
@@ -443,6 +443,59 @@ class SubjectMemoryResolverTests(unittest.TestCase):
         public_blob = " ".join(analyst["publicReadyClaims"] + analyst["draftIngredients"]).lower()
         for forbidden in ("admincorrections", "admincorrectionapplied", "rejectedlabel", "blockedinference", "conflictingevidencesummary", "source-blind", "payment", "crow@example.com", "123456789012345678"):
             self.assertNotIn(forbidden.lower(), public_blob)
+
+
+class RoleVsActivitySemanticsTests(unittest.TestCase):
+    def test_activity_labels_are_not_public_roles(self):
+        cases = [
+            ("contest/event activity near Crow", "contest_event_activity"),
+            ("Crow has queue submission history", "queue_submission_activity"),
+            ("Crow has lore/context around Orion", "lore_context"),
+            ("Crow has theory/anomaly context", "theory_anomaly_context"),
+            ("Crow discussed rules/instructions", "rules_instruction_context"),
+            ("Crow talked about systems and network behavior", "systems_context"),
+        ]
+        for text, activity_type in cases:
+            role = _public_role_candidate_for_subject("Crow", text, {})
+            self.assertFalse(role["isPublicRole"], text)
+            self.assertNotEqual("contest/event activity", role["roleLabel"])
+            self.assertEqual(activity_type, role["activityContextType"])
+
+    def test_collaboration_interest_is_not_collaborator_role_without_confirmation(self):
+        interest = _public_role_candidate_for_subject("Crow", "Crow wants to collaborate and may work together on a song", {})
+        self.assertFalse(interest["isPublicRole"])
+        self.assertEqual("collaboration_interest", interest["roleEvidenceType"])
+        self.assertEqual("collaboration_interest", interest["activityContextType"])
+
+        confirmed = _public_role_candidate_for_subject("Crow", "Owner-confirmed public-safe collaborator credited on a released project", {})
+        self.assertTrue(confirmed["isPublicRole"])
+        self.assertEqual("collaborator", confirmed["roleLabel"])
+
+    def test_activity_only_role_card_uses_not_confirmed_copy(self):
+        card = _review_guidance("Crow", "contest/event activity near Crow", "role", "needs_confirmation", False)
+        self.assertEqual("Public role/title not confirmed", card["displayTitle"])
+        self.assertEqual("Should BNL state a public role for this subject, or avoid role/title wording for now?", card["displayDecision"])
+        blob = json.dumps(card).lower()
+        self.assertNotIn("public role: contest/event activity", blob)
+        self.assertIn("do not turn activity signals into public role/title wording", blob)
+
+    def test_universal_follow_up_separates_collaboration_interest(self):
+        card = _review_guidance("Crow", "Crow wants to collaborate on a song", "collaboration_interest", "needs_confirmation", False)
+        self.assertEqual("collaboration_interest", card["followUpCategory"])
+        self.assertIn("only collaboration interest", card["recommendedFollowUpQuestion"])
+        self.assertIn("actual public collaboration", card["recommendedFollowUpQuestion"])
+        self.assertIn("collaboration status, project/context", card["suggestedConfirmationAnswerType"])
+
+    def test_dossier_readiness_separates_role_from_activity_context(self):
+        role_card = _make_reviewable_claim("Crow", "contest/event activity near Crow", "role", "needs_confirmation", "activity only", False, "low", "contest/event activity")
+        contest_card = _make_reviewable_claim("Crow", "Crow appeared near contest rules", "contest_rules_poster", "needs_confirmation", "contest context", False, "low", "contest rules")
+        collab_card = _make_reviewable_claim("Crow", "Crow wants to collaborate on a song", "collaboration_interest", "needs_confirmation", "collaboration interest", False, "low", "wants to collaborate")
+        readiness = _build_dossier_readiness("Crow", [role_card, contest_card, collab_card], [], [])
+        joined = " ".join(q["question"] for q in readiness["questions"])
+        self.assertIn("What public role/title may BNL use for Crow, if any?", joined)
+        self.assertIn("contest or event", joined)
+        self.assertIn("collaboration interest", joined.lower())
+        self.assertNotIn("role is contest/event activity", joined.lower())
 
 
 if __name__ == '__main__':

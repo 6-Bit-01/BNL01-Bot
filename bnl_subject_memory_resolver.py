@@ -237,7 +237,8 @@ GENERIC_FOLLOW_UP_FALLBACK = "What proof or approved wording should BNL use befo
 _FOLLOW_UP_CATEGORY_PATTERNS: list[tuple[str, str]] = [
     ("source_blind", r"\b(source[-_\s]*blind|private|withheld|internal[-\s]*only|no provenance|unknown[-_\s]*policy)\b"),
     ("orion_context", r"\b(orion|relay)\b"),
-    ("ai_persona_project", r"\b(ai|persona|project|character|bot|agent|universe|collaboration|crossover|interaction|model)\b"),
+    ("collaboration_interest", r"\b(collaboration interest|interested in collaborating|wants? to collab|wants? to collaborate|could collab|can collab|work together)\b"),
+    ("ai_persona_project", r"\b(ai|persona|project|character|bot|agent|universe|crossover|interaction|model)\b"),
     ("theory_anomaly", r"\b(theory|theories|anomal(?:y|ies)|glitch|technical issue)\b"),
     ("lore_context", r"\b(lore|canon|recurring (?:bit|topic)|barcode|null tv)\b"),
     ("public_boundary", r"\b(boundar(?:y|ies)|do[-\s]*not[-\s]*say|avoid saying|should not mention|keep private|public boundary)\b"),
@@ -275,7 +276,7 @@ def _scope_label_from_text(subject: str, text: str, category: str, scope: dict[s
         return _text(m.group(1), 90), True
     labels = {
         "role_title": "role/title", "identity_name": "identity/name", "links_music_socials": "links/music/socials",
-        "relationship_affiliation": "relationship/affiliation", "public_boundary": "public boundary", "queue_submission": "queue/submission",
+        "relationship_affiliation": "relationship/affiliation", "collaboration_interest": "collaboration interest", "public_boundary": "public boundary", "queue_submission": "queue/submission",
         "orion_context": "Orion/context", "public_summary": "public summary", "source_blind": "source-blind/private context",
     }
     return labels.get(category, ""), category in labels
@@ -298,6 +299,8 @@ def _infer_follow_up_category(subject: str, claim_text: str, claim_type: str, la
     for category, pattern in _FOLLOW_UP_CATEGORY_PATTERNS:
         if re.search(pattern, low, re.I):
             return category
+    if claim_type == "collaboration_interest":
+        return "collaboration_interest"
     if claim_type == "relationship":
         return "relationship_affiliation"
     if claim_type == "unknown" and re.search(r"\b(unclear|ambiguous|something|item)\b", low, re.I):
@@ -333,6 +336,10 @@ def _universal_follow_up_for_claim(subject: str, claim_text: str, claim_type: st
         question = f"What exact public role or title may BNL use for {subject}, if any? Should BNL avoid giving {subject} a public role/title for now?"
         audience = "subject"; answer_type = "exact public role/title or confirmation not to state one"; scope_label = "role/title"; scope_known = True
         reason = "BNL needs exact approved role/title wording and must not infer a role from weak labels or context."
+    elif category == "collaboration_interest":
+        question = f"Is this only collaboration interest, or is there an actual public collaboration BNL should reference? If public, what project/song/context should it reference?"
+        audience = "admin"; answer_type = "collaboration status, project/context, and whether it can be public"; scope_label = "collaboration interest"; scope_known = True
+        reason = "BNL found possible collaboration interest, but interest is not the same as an approved public collaborator role."
     elif category == "relationship_affiliation":
         question = f"What public relationship, affiliation, or connection may BNL state for {subject}, if any?"
         audience = "subject"; answer_type = "approved relationship/affiliation wording or confirmation none should be stated"; scope_label = scope_label or "relationship/affiliation"; scope_known = True
@@ -919,6 +926,77 @@ def _claim_type_from_text(text: str) -> str:
 
 
 
+
+_ACTIVITY_CONTEXT_TYPES = {
+    "community_context", "systems_context", "collaboration_interest", "contest_event_activity",
+    "queue_submission_activity", "music_discussion", "link_reference", "lore_context",
+    "theory_anomaly_context", "rules_instruction_context", "source_blind_context", "unknown_context",
+}
+_NON_ROLE_LABEL_RE = re.compile(r"\b(contest/event activity|collaboration interest|queue/submission history|link ownership|lore/context|theory/anomaly|rules/instructions|evidence signal|source-blind context|activity signal|conversation topic)\b", re.I)
+_CONFIRMED_COLLAB_RE = re.compile(r"\b(?:approved|confirmed|official|public[- ]safe|released|published|credited)\b.{0,60}\b(?:collaborator|collaboration|worked with|featured)\b|\b(?:collaborator|collaboration|worked with|featured)\b.{0,60}\b(?:approved|confirmed|official|public[- ]safe|released|published|credited)\b", re.I)
+_COLLAB_INTEREST_RE = re.compile(r"\b(?:wants? to|interested in|asked to|hopes? to|would like to|can|could|may)\b.{0,50}\b(?:collab|collaborat|work together)\b|\b(?:collaboration interest|interested in collaborating)\b", re.I)
+
+def _activity_context_type_for_text(claim_text: str, claim_type: str = "", lane: str = "") -> str:
+    low = f"{claim_type} {lane} {claim_text}".lower()
+    if "source_blind" in low or "source-blind" in low:
+        return "source_blind_context"
+    if re.search(r"\b(contest|challenge|tournament|battle|competition|event)\b", low):
+        return "contest_event_activity"
+    if re.search(r"\b(queue|submission|submitted|submitter|entry)\b", low):
+        return "queue_submission_activity"
+    if _COLLAB_INTEREST_RE.search(low) or ("collaboration" in low and not _CONFIRMED_COLLAB_RE.search(low)):
+        return "collaboration_interest"
+    if re.search(r"\b(system|systems|technical|operator|network)\b", low):
+        return "systems_context"
+    if re.search(r"\b(community|barcode radio|viewer|participant|member)\b", low):
+        return "community_context"
+    if re.search(r"\b(music|song|track|demo|artist page|soundcloud|spotify|suno)\b", low):
+        return "music_discussion"
+    if re.search(r"https?://|\b(link|url|social)\b", low):
+        return "link_reference"
+    if re.search(r"\b(lore|canon|recurring bit|recurring topic)\b", low):
+        return "lore_context"
+    if re.search(r"\b(theory|theories|anomal|glitch)\b", low):
+        return "theory_anomaly_context"
+    if re.search(r"\b(rules?|instructions?|guidelines?)\b", low):
+        return "rules_instruction_context"
+    return "unknown_context"
+
+def _public_role_candidate_for_subject(subject: str, evidence: str, signals: Any = None) -> dict[str, Any]:
+    """Classify whether evidence supports a public role/title versus activity/context only."""
+    text = " ".join([_text(evidence, 1000), json.dumps(signals or {}, default=str)[:1000]]).strip()
+    low = text.lower()
+    activity_type = _activity_context_type_for_text(text)
+    base = {
+        "roleCandidate": False, "roleLabel": "", "roleConfidence": "none", "roleEvidenceType": "none",
+        "isPublicRole": False, "needsClarification": True, "reason": "No public role/title evidence was found.",
+        "notRoleReason": "No public role/title should be stated from this evidence.", "activityContextType": activity_type,
+    }
+    if not low:
+        base.update({"roleEvidenceType": "insufficient_context", "notRoleReason": "Insufficient context to identify a public role/title."}); return base
+    if _NON_ROLE_LABEL_RE.search(low) or activity_type in {"contest_event_activity", "queue_submission_activity", "lore_context", "theory_anomaly_context", "rules_instruction_context", "source_blind_context"}:
+        base.update({"roleEvidenceType": "activity_only", "reason": f"BNL found {activity_type.replace('_', ' ')}, not a public role/title.", "notRoleReason": "Activity/context signals must not be turned into public role/title wording."}); return base
+    if _COLLAB_INTEREST_RE.search(low):
+        base.update({"roleEvidenceType": "collaboration_interest", "reason": "BNL found collaboration interest, not confirmed collaborator status.", "notRoleReason": "Interest in collaborating is not the same as an approved public collaborator role."}); return base
+    if _CONFIRMED_COLLAB_RE.search(low):
+        base.update({"roleCandidate": True, "roleLabel": "collaborator", "roleConfidence": "high", "roleEvidenceType": "collaboration_confirmed", "isPublicRole": True, "needsClarification": False, "reason": "Evidence indicates confirmed/approved collaborator status.", "notRoleReason": ""}); return base
+    explicit = [(r"\b(?:is|as|public role|title)\b.{0,40}\b(artist|moderator|host|sponsor|guest|technical operator|team member|network operator|community support)\b", "explicit_role"), (r"\b(artist|moderator|host|sponsor|guest|technical operator|team member|network operator|community support)\b", "explicit_role")]
+    for pat, etype in explicit:
+        m = re.search(pat, low)
+        if m:
+            label = next((g for g in m.groups() if g), m.group(0))
+            base.update({"roleCandidate": True, "roleLabel": label, "roleConfidence": "medium", "roleEvidenceType": etype, "isPublicRole": True, "needsClarification": True, "reason": "Role-like wording exists and needs exact public wording confirmation.", "notRoleReason": ""}); return base
+    if re.search(r"\b(artist|producer|moderator|host|sponsor|guest|technical operator|team member|network operator|community support)\s+(?:role|title)\b", low):
+        label = re.search(r"\b(artist|producer|moderator|host|sponsor|guest|technical operator|team member|network operator|community support)\s+(?:role|title)\b", low).group(1)
+        base.update({"roleCandidate": True, "roleLabel": label, "roleConfidence": "medium", "roleEvidenceType": "explicit_role", "isPublicRole": True, "needsClarification": True, "reason": "Role/title wording exists and needs exact public wording confirmation.", "notRoleReason": ""}); return base
+    if activity_type == "community_context":
+        base.update({"roleCandidate": True, "roleLabel": "community member / BARCODE Radio viewer / community participant", "roleConfidence": "low", "roleEvidenceType": "community_pattern", "isPublicRole": False, "needsClarification": True, "reason": "Repeated community conversation may support a role clarification question, but not an assertion.", "notRoleReason": "Community activity needs admin confirmation before becoming a public role/title."}); return base
+    if activity_type == "systems_context":
+        base.update({"roleEvidenceType": "activity_only", "reason": "Systems-related conversation is context, not a systems role.", "notRoleReason": "Do not create a systems role unless a public role is confirmed."}); return base
+    base.update({"roleEvidenceType": "insufficient_context", "activityContextType": activity_type, "notRoleReason": "Evidence is too thin or contextual to state a public role/title."})
+    return base
+
+
 def _display_clean(text: str) -> str:
     text = _text(text, 500)
     replacements = {
@@ -1077,16 +1155,29 @@ def _review_display_copy(subject: str, claim_text: str, claim_type: str, lane: s
         target = "owner_approved_wording"; audience = "subject"; primary = "Keep as internal note"; secondary = ["Ask for approved wording", "Reject / not needed"]
         question = "Can BNL mention this AI/persona/project connection publicly? If yes, what exact wording should it use?"
     elif claim_type in {"role", "community_context"}:
-        title = "Confirm public role"
-        decision = f"What public role/title may BNL use for {subject}, if any?"
-        checked = "You are checking whether the role is true and approved for public use."
-        why = "BNL found role-like context, but role wording needs owner/admin approval before public use."
-        rec = "BNL recommends confirming the exact public role/title before using it."
-        evidence_summary = "BNL saw role-like context, but exact public title is not approved."
-        safe = "Do not use a role/title publicly until it is confirmed."
-        approval = "Only approve the exact role/title that is confirmed for public use."
-        target = "subject"; audience = "subject"; primary = "Keep as internal note"; secondary = ["Ask for public role/title", "Reject / not needed"]
-        question = "What public role/title should BNL use for you, if any?"
+        role_read = _public_role_candidate_for_subject(subject, claim_text, {"lane": lane, "publicSafe": public_safe})
+        if not role_read.get("isPublicRole"):
+            title = "Public role/title not confirmed"
+            decision = "Should BNL state a public role for this subject, or avoid role/title wording for now?"
+            checked = "BNL found activity/context signals, but those do not prove a public role or title."
+            why = "This card exists because a public dossier may need a short role/title, but BNL cannot infer one from activity alone."
+            rec = "BNL recommends not stating a public role unless an admin confirms one."
+            evidence_summary = f"BNL found {role_read.get('activityContextType', 'activity/context').replace('_', ' ')}; this is not a confirmed public role/title."
+            safe = "Do not turn activity signals into public role/title wording."
+            approval = "Approve only an exact public role/title, or mark that no public role should be stated yet."
+            target = "subject"; audience = "subject"; primary = "Mark no public role yet"; secondary = ["Approve exact role/title", "Keep as internal context"]
+            question = f"BNL found activity/context near {subject}, but this does not prove a public role. Should BNL describe {subject} with an approved public role/title, leave role/title blank, or use some other approved wording?"
+        else:
+            title = "Confirm public role"
+            decision = f"What public role/title may BNL use for {subject}, if any?"
+            checked = "You are checking whether the role is true and approved for public use."
+            why = "BNL found role-like context, but role wording needs owner/admin approval before public use."
+            rec = "BNL recommends confirming the exact public role/title before using it."
+            evidence_summary = "BNL saw role-like context, but exact public title is not approved."
+            safe = "Do not use a role/title publicly until it is confirmed."
+            approval = "Only approve the exact role/title that is confirmed for public use."
+            target = "subject"; audience = "subject"; primary = "Keep as internal note"; secondary = ["Ask for public role/title", "Reject / not needed"]
+            question = "What public role/title should BNL use for you, if any?"
     elif claim_type == "queue_submission":
         title = "Confirm queue/submission history"
         decision = "May BNL mention this queue or submission history publicly?"
@@ -1151,7 +1242,9 @@ def _dossier_section_for_claim_type(claim_type: str, text: str) -> str:
         return "orion"
     if "lore" in low or "context" in low and "contest" not in low:
         return "lore"
-    if claim_type.startswith("contest_") or "contest" in low:
+    if claim_type == "collaboration_interest" or "collaboration interest" in low:
+        return "collaboration_interest"
+    if claim_type.startswith("contest_") or claim_type == "contest_event_activity" or "contest" in low:
         return "contest"
     if claim_type in {"music_link", "public_link"} or re.search(r"\b(suno|music|song|track|link|social|url)\b", low):
         return "links" if "music" not in low and "suno" not in low else "music"
@@ -1175,6 +1268,8 @@ def _readiness_question_for_section(subject: str, section: str) -> tuple[str, st
         return ("subject", f"What public role/title may BNL use for {subject}, if any?", "A public dossier needs a precise approved role instead of inferred labels.", "high", "needs_confirmation")
     if section in {"links", "music"}:
         return ("subject", f"Which links are {subject}’s and approved for BNL to mention publicly?", "BNL found possible link/music context but does not know ownership or approval.", "high", "needs_confirmation")
+    if section == "collaboration_interest":
+        return ("admin", f"BNL found possible collaboration interest. Is there an actual public collaboration to mention for {subject}, or should this stay internal?", "BNL must separate interest in collaborating from an approved public collaborator role or project reference.", "high", "needs_confirmation")
     if section == "contest":
         return ("subject", f"What contest or event is this referring to, and was {subject} actually involved?", "BNL found contest/rules context but cannot safely infer the subject’s role, host, organizer, or event from proximity.", "high", "needs_confirmation")
     if section == "rules":
@@ -1217,6 +1312,8 @@ def _build_dossier_readiness(subject: str, reviewable_claims: list[dict[str, Any
         if c.get("decisionState") == "needs_clarification":
             clar_q = str(c.get("recommendedFollowUpQuestion") or c.get("verificationPacketQuestion") or "Clarification needed before BNL can draft this part of the dossier")
         add(section, f"reviewableClaims[{idx}]", clar_q)
+        if c.get("publicRoleCandidate", {}).get("isPublicRole") is False and c.get("publicRoleCandidate", {}).get("roleEvidenceType") in {"activity_only", "collaboration_interest", "insufficient_context"}:
+            add("role", f"reviewableClaims[{idx}]")
     for txt in blind_insights:
         if "orion" in txt.lower() or "relay" in txt.lower():
             add("orion")
@@ -1515,6 +1612,13 @@ def _claim_prefix(claim_type: str) -> str:
         "queue_submission": "Possible queue/submission claim",
         "community_context": "Possible community/context claim",
         "source_blind_context": "Source-blind context claim",
+        "collaboration_interest": "Possible collaboration-interest context",
+        "contest_event_activity": "Possible contest/event activity context",
+        "queue_submission_activity": "Possible queue/submission activity context",
+        "lore_context": "Possible lore/context",
+        "theory_anomaly_context": "Possible theory/anomaly context",
+        "rules_instruction_context": "Possible rules/instructions context",
+        "systems_context": "Possible systems context",
     }.get(claim_type, "Possible review claim")
 
 
@@ -1630,8 +1734,13 @@ def _review_guidance(subject: str, claim_text: str, claim_type: str, lane: str, 
         note = f"BNL found possible queue/submission context for {subject}. Keep this internal unless admin confirms it may be referenced publicly."
         question = f"Can {subject}'s queue/submission history be referenced publicly, or should it stay internal?"
     elif claim_type in {"role", "community_context"}:
-        note = f"BNL found possible role/community context for {subject}. Keep this internal until public wording is confirmed."
-        question = f"What public role/title may BNL use for {subject}, if any?"
+        role_read = _public_role_candidate_for_subject(subject, claim_text)
+        if role_read.get("isPublicRole") or role_read.get("roleCandidate"):
+            note = f"BNL found possible role/community context for {subject}. Keep this internal until public wording is confirmed."
+            question = f"What public role/title may BNL use for {subject}, if any?"
+        else:
+            note = f"BNL found {role_read.get('activityContextType', 'activity/context').replace('_', ' ')} for {subject}, but this does not prove a public role/title."
+            question = f"Should BNL mention this activity/context publicly, keep it internal, or ignore it?"
     else:
         note = f"BNL found review-only context for {subject}. Keep this internal until a public source or owner-approved wording is provided."
         question = "What proof or approved wording should BNL use before saying this publicly?"
@@ -1669,6 +1778,11 @@ def _make_reviewable_claim(subject: str, claim_text: str, claim_type: str, lane:
         "safeEvidenceSummary": _text(evidence or why, 240),
         "blockedBy": blocked or ([] if public_safe else ["missing owner/admin confirmation", "missing public-safe provenance"]),
     }
+    role_candidate = _public_role_candidate_for_subject(subject, claim_text, {"claimType": claim_type, "lane": lane})
+    item["publicRoleCandidate"] = role_candidate
+    item["activityContextType"] = role_candidate.get("activityContextType") or _activity_context_type_for_text(claim_text, claim_type, lane)
+    if (not public_safe) and actionability != "weak_label" and item.get("claimType") == "role" and not role_candidate.get("isPublicRole") and item["activityContextType"] in _ACTIVITY_CONTEXT_TYPES:
+        item["claimType"] = item["activityContextType"]
     item.update(_review_guidance(subject, claim_text, claim_type, lane, public_safe))
     return item
 
