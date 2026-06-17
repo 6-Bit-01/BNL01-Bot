@@ -884,6 +884,9 @@ def generate_dossier_draft(packet: dict[str, Any], db_path: str | None = None, p
         rejected_facts.extend(evidence_rejected)
     except Exception:
         evidence = None
+    supplied_analyst = _dict(packet.get("subjectAnalystReadV1") or packet.get("subjectAnalystRead") or packet.get("analystRead"))
+    if supplied_analyst and not analyst:
+        analyst = supplied_analyst
     if db_path:
         try:
             _, resolver_aliases = _subject_terms(packet)
@@ -1023,4 +1026,13 @@ def generate_dossier_draft(packet: dict[str, Any], db_path: str | None = None, p
             if part
         ),
     }
-    return {"draft": draft}
+    readiness = {}
+    if analyst:
+        readiness = {
+            "dossierReadinessQuestions": analyst.get("dossierReadinessQuestions") or [],
+            "dossierReadinessSummary": _text(analyst.get("dossierReadinessSummary"), 500),
+            "dossierBlockedBy": _strings(analyst.get("dossierBlockedBy"), max_items=7),
+            "readyForDraft": bool(analyst.get("readyForDraft")),
+            "draftReadinessReason": _text(analyst.get("draftReadinessReason"), 500),
+        }
+    return {"draft": draft, "draftReadiness": readiness}

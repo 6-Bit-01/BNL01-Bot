@@ -567,6 +567,18 @@ def _review_display_copy(subject: str, claim_text: str, claim_type: str, lane: s
         approval = ""
         target = "none"; audience = "none"; question = ""
         primary = "Keep as internal note"; secondary = ["Dismiss artifact"]
+    elif (not is_orion) and re.search(r"\blore[-\s]*heavy|\blore\b", low):
+        title = "Decide lore/public boundary"
+        decision = "Should this be used as public lore/context, kept internal, or rejected for this dossier?"
+        checked = "You are deciding whether lore-heavy context belongs in a concrete public dossier."
+        why = "BNL found lore-heavy context but needs a public/internal/reject decision, not a generic source request."
+        rec = "BNL recommends keeping this internal unless an admin approves it as public context."
+        evidence_summary = "Lore-heavy context exists without a specific public factual claim."
+        safe = "Keep as internal lore/context unless approved for public use."
+        approval = "Approve only public lore/context wording, keep internal, or reject as not useful."
+        target = "admin"; audience = "admin"
+        primary = "Decide public/internal/reject"; secondary = ["Keep internal", "Reject / not needed"]
+        question = "Should BNL describe this as public lore/context, keep it internal, or reject it for this dossier?"
     elif actionability == "source_blind_warning" or lane == "source_blind":
         title = "Needs public source"
         decision = "What public-safe source or owner-approved replacement wording supports this item?"
@@ -671,7 +683,80 @@ def _review_display_copy(subject: str, claim_text: str, claim_type: str, lane: s
         "secondaryActionLabels": secondary,
         "verificationPacketQuestion": question,
         "verificationPacketAudience": audience,
+        "recommendedFollowUpQuestion": question,
+        "recommendedFollowUpAudience": audience if audience in {"subject", "admin", "owner", "public_source"} else ("subject" if audience == "link_ownership" else ("admin" if audience == "none" else audience)),
+        "recommendedFollowUpReason": why,
+        "bestGuessConfidence": "low" if not public_safe else "medium",
     }.items()}
+
+
+def _dossier_question_id(section: str, audience: str, index: int) -> str:
+    return f"dossier-readiness-{section}-{audience}-{index}"
+
+
+def _dossier_section_for_claim_type(claim_type: str, text: str) -> str:
+    low = (text or "").lower()
+    if "orion" in low or "relay" in low:
+        return "orion"
+    if "lore" in low or "context" in low and "contest" not in low:
+        return "lore"
+    if claim_type in {"music_link", "public_link"} or re.search(r"\b(suno|music|song|track|link|social|url)\b", low):
+        return "links" if "music" not in low and "suno" not in low else "music"
+    if claim_type.startswith("contest_") or "contest" in low or "rules" in low:
+        return "contest"
+    if claim_type in {"role", "community_context"} or re.search(r"\b(role|title|artist|collaborator|participant|moderator)\b", low):
+        return "role"
+    if claim_type == "relationship" or "relationship" in low:
+        return "relationships"
+    if "display name" in low or "identity" in low:
+        return "identity"
+    return "unknown"
+
+
+def _readiness_question_for_section(subject: str, section: str) -> tuple[str, str, str, str, str]:
+    if section == "identity":
+        return ("subject", f"What exact public name may BNL use for {subject}?", "A public dossier needs an approved identity label before BNL writes summary copy.", "high", "needs_confirmation")
+    if section == "role":
+        return ("subject", f"What public role/title may BNL use for {subject}, if any?", "A public dossier needs a precise approved role instead of inferred labels.", "high", "needs_confirmation")
+    if section in {"links", "music"}:
+        return ("subject", f"Which links are {subject}’s and approved for BNL to mention publicly?", "BNL found possible link/music context but does not know ownership or approval.", "high", "needs_confirmation")
+    if section == "contest":
+        return ("subject", f"What was {subject}’s relationship to this contest: participant, submitter, rules poster, link source, host, organizer, or unrelated mention?", "BNL found contest/rules context but cannot safely infer the subject’s role.", "high", "needs_confirmation")
+    if section == "orion":
+        return ("admin", f"Can BNL mention Orion in {subject}’s public dossier, or should that stay internal?", "Orion/context references require an explicit public/internal boundary decision.", "high", "needs_confirmation")
+    if section == "lore":
+        return ("admin", "Should BNL describe this as public lore/context, keep it internal, or reject it for this dossier?", "BNL found lore-heavy context and needs a dossier decision, not a generic source request.", "medium", "internal_only")
+    if section == "relationships":
+        return ("subject", f"What public relationship to BARCODE/BNL, if any, is approved for BNL to state for {subject}?", "A public dossier needs approved relationship wording and public boundaries.", "high", "needs_confirmation")
+    return ("admin", f"What is still needed before BNL can write a complete public summary for {subject}?", "BNL has unresolved dossier-readiness context that does not fit a more specific section.", "low", "needs_confirmation")
+
+
+def _build_dossier_readiness(subject: str, reviewable_claims: list[dict[str, Any]], missing: list[dict[str, Any]], blind_insights: list[str]) -> dict[str, Any]:
+    buckets: dict[tuple[str, str], dict[str, Any]] = {}
+    def add(section: str, claim_id: str = "") -> None:
+        audience, question, why, priority, safety = _readiness_question_for_section(subject, section)
+        key = (section, audience)
+        item = buckets.setdefault(key, {"audience": audience, "question": question, "whyItMatters": why, "dossierSection": section, "priority": priority, "relatedReviewClaimIds": [], "sourceSafety": safety})
+        if claim_id and claim_id not in item["relatedReviewClaimIds"]:
+            item["relatedReviewClaimIds"].append(claim_id)
+    add("identity")
+    for m in missing:
+        add(_dossier_section_for_claim_type(str(m.get("relatedClaimType") or ""), str(m.get("question") or "")))
+    for idx, c in enumerate(reviewable_claims):
+        section = _dossier_section_for_claim_type(str(c.get("claimType") or ""), " ".join(str(c.get(k) or "") for k in ("claimText", "displayTitle", "displayDecision")))
+        if c.get("reviewLane") == "source_blind" and section == "unknown":
+            continue
+        add(section, f"reviewableClaims[{idx}]")
+    for txt in blind_insights:
+        if "orion" in txt.lower() or "relay" in txt.lower():
+            add("orion")
+    priority_rank = {"high": 0, "medium": 1, "low": 2}
+    questions = sorted(buckets.values(), key=lambda x: (priority_rank.get(x["priority"], 9), x["dossierSection"]) )[:7]
+    for i, q in enumerate(questions, 1):
+        q["id"] = _dossier_question_id(q["dossierSection"], q["audience"], i)
+    blocked = [q["dossierSection"] for q in questions if q["priority"] == "high"]
+    ready = not blocked
+    return {"questions": questions, "summary": f"BNL has {len(questions)} prioritized dossier-readiness question(s); {len(blocked)} block a complete public draft.", "blockedBy": blocked, "readyForDraft": ready, "reason": "Ready for draft with current public-safe facts." if ready else "Resolve high-priority identity, role, link/music, relationship, contest, or boundary questions before generating a concrete public dossier."}
 
 
 def _admin_action_card(action: str) -> dict[str, Any]:
@@ -1132,11 +1217,8 @@ def build_subject_analyst_read(subject_name: str, resolved_memory: dict[str, Any
     resolved_types = _resolved_missing_info_types(admin_corrections)
     missing = [m for m in missing if m.get("relatedClaimType") not in resolved_types]
     missing_lines = [m["question"] + f" ({m['confirmationType'].replace('_', ' ')}.)" for m in missing]
-    actions = [
-        "Review each sourceFileReviewClaims line as an individual approve/reject/edit item; do not approve a whole bucket.",
-        "Promote only confirmed public-safe facts into the Source File before expanding public copy.",
-        "Attach owner-approved provenance for any role, link, music, queue, Orion/context, or relationship claim.",
-    ]
+    readiness = _build_dossier_readiness(subject, reviewable_claims, missing, blind_insights)
+    actions = [q["question"] for q in readiness["questions"] if q.get("priority") == "high"]
     withheld_audit = _withheld_audit(subject, resolved_memory, private, blind, review) if (private or blind or review) else {}
     source_file_ingredients = []
     for item in [internal, *strongest[:6], *public_claims, *review_claims, *blind_insights, *actions, *missing_lines]:
@@ -1170,6 +1252,11 @@ def build_subject_analyst_read(subject_name: str, resolved_memory: dict[str, Any
         "missingConfirmations": missing,
         "recommendedAdminActions": actions,
         "recommendedAdminActionCards": [_admin_action_card(a) for a in actions],
+        "dossierReadinessQuestions": readiness["questions"],
+        "dossierReadinessSummary": readiness["summary"],
+        "dossierBlockedBy": readiness["blockedBy"],
+        "readyForDraft": readiness["readyForDraft"],
+        "draftReadinessReason": readiness["reason"],
         "draftIngredients": draft_ingredients,
         "sourceFileIngredients": source_file_ingredients[:18],
         "provenanceSummary": prov,

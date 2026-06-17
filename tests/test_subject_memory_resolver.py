@@ -57,9 +57,8 @@ class SubjectMemoryResolverTests(unittest.TestCase):
         role = next(c for c in claims if c["claimType"] == "role")
         self.assertEqual(role["confirmationTarget"], "subject")
         cards = analyst["recommendedAdminActionCards"]
-        self.assertEqual(cards[0]["displayBNLRecommendation"], "Review each BNL claim separately.")
-        self.assertEqual(cards[1]["displayBNLRecommendation"], "Only say what we know is true.")
-        self.assertEqual(cards[2]["displayBNLRecommendation"], "Get proof or approval first.")
+        self.assertNotIn("sourceFileReviewClaims", " ".join(c["displayBNLRecommendation"] for c in cards))
+        self.assertTrue(any("public name" in c["displayBNLRecommendation"] or "public role" in c["displayBNLRecommendation"] for c in cards))
         display_keys = ("displayTitle", "displayDecision", "displayWhatIsBeingChecked", "displayWhyBNLFlaggedIt", "displayBNLRecommendation", "displayEvidenceSummary", "displaySafeDefault", "displayApprovalInstruction", "primaryActionLabel", "secondaryActionLabels", "verificationPacketQuestion")
         human_blob = json.dumps([{k: c.get(k) for k in display_keys} for c in [*claims, *cards]])
         for forbidden in ("sourceFileReviewClaims", "official_public_dossier", "public_safe", "source_blind", "review_only", "public_music_role", "queue_submission"):
@@ -370,3 +369,40 @@ class SubjectMemoryResolverTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+class DossierReadinessPacketTests(unittest.TestCase):
+    def test_dossier_readiness_packet_collapses_generic_review_questions(self):
+        packet = {
+            "reviewOnlyEvidence": [
+                {"summary": "Crow has Suno music link context needing public-safe provenance."},
+                {"summary": "Crow shared another music link that needs owner-approved wording."},
+                {"summary": "Crow appears near contest rules and submission link context."},
+                {"summary": "Crow may have artist role/title context needing confirmation."},
+                {"summary": "Crow has Orion relay context needing confirmation."},
+                {"summary": "Crow has lore-heavy context without a specific public fact."},
+                {"summary": "subject-owned/keyed local evidence exists"},
+            ],
+            "relationshipOrContextSignals": [{"summary": "Crow may reference Orion as AI/message relay context needing confirmation."}],
+            "sourceSafetyWarnings": ["Some subject memory lacked public-safe provenance"],
+            "evidenceCounts": {"publicSafe": 0, "reviewOnly": 7, "privateOrInternal": 0, "sourceBlind": 1, "totalScanned": 8},
+        }
+        analyst = build_subject_analyst_read("Crow", packet)
+        questions = analyst["dossierReadinessQuestions"]
+        self.assertLessEqual(len(questions), 7)
+        joined = " ".join(q["question"] for q in questions)
+        self.assertIn("Which links are Crow", joined)
+        self.assertIn("relationship to this contest", joined)
+        self.assertIn("public role/title", joined)
+        self.assertIn("Orion", joined)
+        self.assertIn("public lore/context, keep it internal, or reject", joined)
+        self.assertNotIn("What public-safe source or owner-approved wording supports this claim", joined)
+        self.assertIn("readyForDraft", analyst)
+        self.assertIn("draftReadinessReason", analyst)
+        self.assertFalse(analyst["readyForDraft"])
+        self.assertNotIn("sourceFileReviewClaims", " ".join(analyst["recommendedAdminActions"]))
+
+    def test_lore_heavy_card_uses_decision_copy_not_public_source(self):
+        card = _review_guidance("Crow", "Crow lore-heavy context only", "relationship", "needs_confirmation", False)
+        self.assertEqual(card["displayTitle"], "Decide lore/public boundary")
+        self.assertIn("public lore/context, keep it internal, or reject", card["verificationPacketQuestion"])
+        self.assertNotIn("public-safe source", card["verificationPacketQuestion"].lower())
