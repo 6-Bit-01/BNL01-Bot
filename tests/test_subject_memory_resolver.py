@@ -243,6 +243,41 @@ class SubjectMemoryResolverTests(unittest.TestCase):
         self.assertEqual(correction["rejectedLabel"], "contest organizer")
         self.assertIn("Do not infer contest organizer", correction["blockedInference"])
 
+    def test_admin_corrections_block_roles_reuse_facts_and_resolve_missing_info(self):
+        packet = {
+            "adminDecisions": [
+                {"type": "rejected weak label", "label": "moderator", "note": "Admin rejected moderator for Crow."},
+                {"type": "approved_public_fact", "text": "Crow is a BARCODE Network community member."},
+                {"type": "missing_info_answer", "question": "What was Crow’s relationship to this contest context?", "answer": "Crow was mentioned around a contest link, but was not the organizer."},
+            ]
+        }
+        analyst = build_subject_analyst_read("Crow", {
+            "subjectName":"Crow","matchedAliasesUsedPrivately":[],"publicSafeFacts":[],"publicSafeNotes":[],"publicCommunitySignals":[],"publicCreativeMusicSignals":[],"publicRoleSignals":[],"publicLinkSignals":[],
+            "reviewOnlyEvidence":[{"summary":"Crow may be a moderator."},{"summary":"Crow hosts the contest link roundup."}],
+            "queueOrSubmissionSignals":[],"relationshipOrContextSignals":[],"sourceSafetyWarnings":[],"privateOrInternalEvidence":[],
+            "evidenceCounts":{"publicSafe":0,"reviewOnly":2,"privateOrInternal":0,"sourceBlind":0,"totalScanned":2},
+        }, packet)
+        self.assertIn("Crow is a BARCODE Network community member.", analyst["publicReadyClaims"])
+        self.assertFalse(any("relationship to this contest context" in q for q in analyst["missingInfoQuestions"]))
+        blocked = [c for c in analyst["reviewableClaims"] if c.get("adminCorrectionApplied")]
+        self.assertTrue(any(c.get("rejectedLabel") == "moderator" and c.get("recommendedAction") == "reject" for c in blocked))
+        self.assertTrue(any(c.get("rejectedLabel") == "contest organizer" for c in blocked))
+
+    def test_admin_conflict_review_card_and_public_boundary(self):
+        packet = {"adminCorrectionNotes": [{"kind": "rejected_label", "text": "Admin rejected artist for Crow."}]}
+        analyst = build_subject_analyst_read("Crow", {
+            "subjectName":"Crow","matchedAliasesUsedPrivately":[],"publicSafeFacts":[],"publicSafeNotes":[],"publicCommunitySignals":[],"publicCreativeMusicSignals":[],"publicRoleSignals":[],"publicLinkSignals":[],
+            "reviewOnlyEvidence":[{"summary":"New public-looking evidence says Crow is an artist with music context."}],
+            "queueOrSubmissionSignals":[],"relationshipOrContextSignals":[],"sourceSafetyWarnings":["Crow source-blind payment customer contact crow@example.com raw Discord ID 123456789012345678"],"privateOrInternalEvidence":[],
+            "evidenceCounts":{"publicSafe":0,"reviewOnly":1,"privateOrInternal":0,"sourceBlind":1,"totalScanned":2},
+        }, packet)
+        conflict = next(c for c in analyst["reviewableClaims"] if c.get("reviewLane") == "admin_correction_conflict")
+        self.assertEqual(conflict["recommendedAction"], "needs_more_info")
+        self.assertIn("Admin previously rejected this label", conflict["suggestedMissingInfoQuestion"])
+        public_blob = " ".join(analyst["publicReadyClaims"] + analyst["draftIngredients"]).lower()
+        for forbidden in ("admincorrections", "admincorrectionapplied", "rejectedlabel", "blockedinference", "conflictingevidencesummary", "source-blind", "payment", "crow@example.com", "123456789012345678"):
+            self.assertNotIn(forbidden.lower(), public_blob)
+
 
 if __name__ == '__main__':
     unittest.main()

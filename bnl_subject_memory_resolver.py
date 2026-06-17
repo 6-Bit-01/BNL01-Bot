@@ -80,6 +80,127 @@ def classify_contest_event_context(text: str) -> tuple[str, dict[str, bool]]:
 def _has_admin_contest_organizer_rejection(resolved_memory: dict[str, Any], packet: dict[str, Any] | None = None) -> bool:
     blob = json.dumps(packet or {}, default=str) + " " + " ".join(json.dumps(resolved_memory.get(k) or [], default=str) for k in ("reviewOnlyEvidence", "privateOrInternalEvidence", "sourceSafetyWarnings", "missingInfoQuestions"))
     return bool(_CONTEST_REJECTION_RE.search(blob))
+
+_BLOCKED_LABEL_ALIASES = {
+    "artist": {"artist", "music artist"},
+    "producer": {"producer", "music producer"},
+    "moderator": {"moderator", "mod"},
+    "core team": {"core team", "staff", "team member"},
+    "barcode team": {"barcode team", "barcode_team", "barcodeteam"},
+    "contest organizer": {"contest organizer", "contest_organizer", "organizer", "contest host", "contest_host", "host"},
+    "contest host": {"contest host", "contest_host", "host", "contest organizer", "contest_organizer"},
+    "judge": {"judge", "contest judge", "contest_judge"},
+    "participant": {"participant", "contest participant", "contest_participant"},
+    "owner": {"owner"},
+    "public link owner": {"public link owner", "link owner", "owned link", "owns link", "public_link_owner"},
+    "alias": {"alias", "aka", "known as"},
+    "relationship": {"relationship", "connected to", "associated with"},
+    "queue submitter": {"queue submitter", "submitter", "queue_submission", "submission history"},
+}
+_ADMIN_APPROVED_RE = re.compile(r"\b(?:approved public fact|public fact approved|admin approved|approved_public_fact|approve_public|admin approved public|owner[-_ ]confirmed|public-safe approved)\b", re.I)
+_ADMIN_INTERNAL_RE = re.compile(r"\b(?:confirmed internal note|internal correction|admin internal note|saved internal note|confirmed_internal_note)\b", re.I)
+_ADMIN_REJECT_RE = re.compile(r"\b(?:rejected claim|rejected weak label|rejected label|admin rejected|reject(?:ed)?|not an? |is not an? |do not infer|blocked decision|source-blind blocked|source_blind_blocked)\b", re.I)
+_ADMIN_MISSING_RE = re.compile(r"\b(?:missing[-_ ]info answer|answered missing info|admin answer|missing_info_answer|question answered)\b", re.I)
+
+def _label_key(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", (value or "").lower()).strip()
+
+def _detect_blocked_label(text: str) -> str:
+    low = _label_key(text)
+    for canonical, aliases in _BLOCKED_LABEL_ALIASES.items():
+        if any(_label_key(alias) and _label_key(alias) in low for alias in aliases):
+            return canonical
+    return ""
+
+def _admin_text_items(value: Any, path: str = "") -> list[tuple[str, str, Any]]:
+    items: list[tuple[str, str, Any]] = []
+    if isinstance(value, dict):
+        keys = " ".join(str(k) for k in value.keys())
+        text_bits = []
+        for k, v in value.items():
+            if isinstance(v, (str, int, float, bool)) or v is None:
+                text_bits.append(f"{k}: {v}")
+            elif isinstance(v, (dict, list)):
+                items.extend(_admin_text_items(v, f"{path}.{k}" if path else str(k)))
+        combined = " ".join(text_bits)
+        if combined:
+            items.append((combined, f"{path} {keys}", value))
+    elif isinstance(value, list):
+        for idx, item in enumerate(value):
+            items.extend(_admin_text_items(item, f"{path}[{idx}]"))
+    elif value is not None:
+        items.append((str(value), path, value))
+    return items
+
+def extract_admin_corrections(subject: str, resolved_memory: dict[str, Any] | None = None, packet: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+    """Normalize admin decisions/corrections from Source File packet and resolver context.
+
+    The returned structure is internal review metadata only; public dossier code must
+    use only approved public facts from these rows.
+    """
+    sources: list[Any] = [packet or {}]
+    if resolved_memory:
+        for key in ("reviewOnlyEvidence", "privateOrInternalEvidence", "sourceSafetyWarnings", "missingInfoQuestions", "publicSafeFacts", "publicSafeNotes"):
+            sources.append({key: resolved_memory.get(key)})
+    corrections: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str]] = set()
+    for source in sources:
+        for text, path, raw in _admin_text_items(source):
+            hay = f"{path} {text}"
+            label = _detect_blocked_label(hay)
+            kind = ""
+            blocks = False
+            public_safe = False
+            if _ADMIN_APPROVED_RE.search(hay):
+                kind = "approved_public_fact"; public_safe = True
+            elif _ADMIN_INTERNAL_RE.search(hay):
+                kind = "confirmed_internal_note"; blocks = bool(label)
+            elif _ADMIN_MISSING_RE.search(hay):
+                kind = "missing_info_answer"; blocks = bool(label) or bool(re.search(r"not (?:the )?(?:organizer|host|artist|moderator|owner|submitter)", hay, re.I))
+                if not label: label = _detect_blocked_label(hay)
+            elif _ADMIN_REJECT_RE.search(hay) and label:
+                kind = "rejected_label"; blocks = True
+            if not kind:
+                continue
+            if kind == "approved_public_fact" and isinstance(raw, dict):
+                clean = _text(raw.get("text") or raw.get("fact") or raw.get("value") or raw.get("wording") or text, 260)
+            elif kind in {"confirmed_internal_note", "missing_info_answer"} and isinstance(raw, dict):
+                clean = _text(raw.get("answer") or raw.get("note") or raw.get("text") or raw.get("value") or text, 260)
+            else:
+                clean = _text(text, 260)
+            if not label and kind in {"approved_public_fact", "confirmed_internal_note", "missing_info_answer"}:
+                label = _detect_blocked_label(clean)
+            norm = clean
+            if blocks and label:
+                norm = f"{subject} is not a {label}." if label[0] not in "aeiou" else f"{subject} is not an {label}."
+            rec = {"subject": subject, "kind": kind, "label": label, "normalizedMeaning": norm, "authority": "admin", "publicSafe": public_safe, "blocksInference": bool(blocks), "sourcePath": path[:120]}
+            key = (rec["kind"], rec["label"], rec["normalizedMeaning"].lower())
+            if key not in seen:
+                seen.add(key); corrections.append(rec)
+    return corrections[:24]
+
+def _correction_blocks_claim(corrections: list[dict[str, Any]], claim_text: str, claim_type: str) -> dict[str, Any] | None:
+    hay = f"{claim_type} {claim_text}"
+    for corr in corrections:
+        if not corr.get("blocksInference"):
+            continue
+        label = str(corr.get("label") or "")
+        if not label:
+            continue
+        aliases = _BLOCKED_LABEL_ALIASES.get(label, {label})
+        if any(_label_key(alias) and _label_key(alias) in _label_key(hay) for alias in aliases):
+            return corr
+    return None
+
+def _approved_public_correction_facts(corrections: list[dict[str, Any]], subject: str) -> list[str]:
+    facts = []
+    for corr in corrections:
+        if corr.get("kind") == "approved_public_fact" and corr.get("publicSafe"):
+            clean = _sanitize_public(str(corr.get("normalizedMeaning") or ""), subject, [])
+            if clean and clean not in facts:
+                facts.append(clean)
+    return facts
+
 _ROLE_OR_TAXONOMY_LABELS = {
     "artist", "member", "community", "collaborator", "mod", "moderator", "personnel", "staff", "sponsor", "system", "interface", "production", "radio", "producer", "ai", "human", "hybrid", "unknown", "public", "internal", "restricted", "active", "pending", "person", "music", "tech", "systems", "broadcast", "participant", "dossier", "source", "source file",
 }
@@ -552,6 +673,60 @@ def _make_reviewable_claim(subject: str, claim_text: str, claim_type: str, lane:
     return item
 
 
+
+def _admin_blocked_claim(subject: str, claim_text: str, claim_type: str, correction: dict[str, Any]) -> dict[str, Any]:
+    label = str(correction.get("label") or _detect_blocked_label(claim_text) or claim_type.replace("_", " "))
+    return {
+        "claimText": _text(claim_text, 300),
+        "claimType": claim_type,
+        "reviewLane": "admin_correction",
+        "suggestedDecision": "reject",
+        "why": "Admin/source-file correction rejected or corrected this inference.",
+        "publicSafe": False,
+        "confidence": "high",
+        "safeEvidenceSummary": f"Admin has already rejected or corrected the {label} label.",
+        "blockedBy": ["admin correction"],
+        "recommendedAction": "reject",
+        "suggestedRejectionReason": f"Admin has already rejected the {label} label for {subject}.",
+        "cannotSuggestPublicReason": "Admin correction blocks this inference.",
+        "recommendedActionReason": "Rejected Source File labels are authoritative until later owner/admin confirmation reverses them.",
+        "adminCorrectionApplied": True,
+        "adminCorrectionSummary": _text(correction.get("normalizedMeaning") or f"{subject} is not a {label}.", 220),
+        "rejectedLabel": label,
+        "blockedInference": f"Admin rejected {label} for {subject}.",
+    }
+
+def _admin_conflict_fields(subject: str, evidence: str, correction: dict[str, Any]) -> dict[str, Any]:
+    label = str(correction.get("label") or _detect_blocked_label(evidence) or "this label")
+    return {
+        "reviewLane": "admin_correction_conflict",
+        "recommendedAction": "needs_more_info",
+        "suggestedDecision": "needs_more_info",
+        "claimText": f"Possible conflict with admin correction: {subject} / {label}",
+        "conflictingEvidenceSummary": _safe_evidence_example(evidence, subject),
+        "adminCorrectionSummary": _text(correction.get("normalizedMeaning") or f"Admin previously rejected {label} for {subject}.", 220),
+        "suggestedMissingInfoQuestion": "Admin previously rejected this label. Is there new owner-approved evidence that changes it?",
+        "recommendedActionReason": "New evidence appears to conflict with an admin correction; do not override silently.",
+    }
+
+def _resolved_missing_info_types(corrections: list[dict[str, Any]]) -> set[str]:
+    resolved: set[str] = set()
+    for corr in corrections:
+        if corr.get("kind") not in {"missing_info_answer", "confirmed_internal_note", "approved_public_fact"}:
+            continue
+        text = f"{corr.get('label','')} {corr.get('normalizedMeaning','')}".lower()
+        if re.search(r"role|title|artist|producer|moderator|team|community member", text):
+            resolved.add("role")
+        if re.search(r"contest|organizer|host|judge|participant|submitter|rules", text):
+            resolved.add("contest_music_context")
+        if re.search(r"link|url|suno|social", text):
+            resolved.add("music_link")
+        if re.search(r"queue|submission|submitter", text):
+            resolved.add("queue_submission")
+        if re.search(r"relationship|orion|relay|alias", text):
+            resolved.add("relationship")
+    return resolved
+
 def _withheld_audit(subject: str, resolved_memory: dict[str, Any], private: int, blind: int, review: int) -> dict[str, Any]:
     private_examples = [_safe_evidence_example(x.get("summary", ""), subject) for x in (resolved_memory.get("privateOrInternalEvidence") or [])[:2] if isinstance(x, dict)]
     blind_examples = [_safe_evidence_example(x, subject) for x in (resolved_memory.get("sourceSafetyWarnings") or [])[:2] if isinstance(x, str)]
@@ -576,6 +751,10 @@ def build_subject_analyst_read(subject_name: str, resolved_memory: dict[str, Any
     subject = _text(subject_name, 120) or _text(resolved_memory.get("subjectName"), 120) or "Unnamed subject"
     counts = resolved_memory.get("evidenceCounts") if isinstance(resolved_memory.get("evidenceCounts"), dict) else {}
     public_items: list[str] = []
+    admin_corrections = extract_admin_corrections(subject, resolved_memory, packet)
+    for fact in _approved_public_correction_facts(admin_corrections, subject):
+        if fact not in public_items:
+            public_items.append(fact)
     for key in ("publicSafeFacts", "publicSafeNotes", "publicCommunitySignals", "publicCreativeMusicSignals", "publicRoleSignals", "publicLinkSignals"):
         for item in resolved_memory.get(key) or []:
             clean = _sanitize_public(str(item), subject, resolved_memory.get("matchedAliasesUsedPrivately") or [])
@@ -585,7 +764,7 @@ def build_subject_analyst_read(subject_name: str, resolved_memory: dict[str, Any
     hay = " ".join(draft_ingredients).lower()
     has_music = bool(re.search(r"\b(music|artist|musician|track|song|album|producer|dj)\b", hay))
     has_community = bool(re.search(r"\b(barcode|bnl|community|dossier|source file|public interaction|public context|radio)\b", hay))
-    admin_contest_organizer_rejected = _has_admin_contest_organizer_rejection(resolved_memory, packet)
+    admin_contest_organizer_rejected = _has_admin_contest_organizer_rejection(resolved_memory, packet) or any(c.get("blocksInference") and c.get("label") in {"contest organizer", "contest host"} for c in admin_corrections)
     if has_music:
         likely_type = "artist"
     elif has_community:
@@ -629,6 +808,10 @@ def build_subject_analyst_read(subject_name: str, resolved_memory: dict[str, Any
         ctype = _claim_type_from_text(txt)
         if ctype == "missing_confirmation":
             ctype = "community_context" if re.search(r"\b(barcode|bnl|community|radio)\b", txt, re.I) else "role"
+        blocked_corr = _correction_blocks_claim(admin_corrections, txt, ctype)
+        if blocked_corr:
+            reviewable_claims.append(_admin_blocked_claim(subject, txt, ctype, blocked_corr))
+            continue
         reviewable_claims.append(_make_reviewable_claim(subject, txt, ctype, "public_safe", "Public-safe subject memory supports this Source File fact.", True, confidence, _safe_evidence_example(txt, subject), []))
     review_sources: list[str] = []
     for ev in resolved_memory.get("reviewOnlyEvidence") or []:
@@ -663,6 +846,7 @@ def build_subject_analyst_read(subject_name: str, resolved_memory: dict[str, Any
             "blockedInference": "Do not infer contest organizer from contest/link/rules context.",
         })
     for txt in review_sources[:10]:
+        conflict_corr = None
         ctype = _claim_type_from_text(txt)
         contest_role, event_hints = classify_contest_event_context(txt)
         if "contest" in txt.lower():
@@ -670,10 +854,19 @@ def build_subject_analyst_read(subject_name: str, resolved_memory: dict[str, Any
                 ctype = "role"
             else:
                 ctype = contest_role if contest_role != "contest_unknown" else ctype
+            conflict_corr = _correction_blocks_claim(admin_corrections, txt, ctype)
             if ctype in {"contest_host", "contest_organizer"} and admin_contest_organizer_rejected:
+                conflict_corr = conflict_corr or next((c for c in admin_corrections if c.get("label") in {"contest organizer", "contest host"}), None)
                 ctype = "contest_mention_only"
         if ctype == "community_context" and not ps:
             ctype = "role"
+        conflict_corr = conflict_corr or _correction_blocks_claim(admin_corrections, txt, ctype)
+        if conflict_corr and re.search(r"\b(?:may|possible|weak label|label)\b", txt, re.I):
+            blocked_claim = _admin_blocked_claim(subject, txt, ctype, conflict_corr)
+            if blocked_claim["claimText"] not in review_claims:
+                review_claims.append(blocked_claim["claimText"])
+                reviewable_claims.append(blocked_claim)
+            continue
         if ctype == "relationship" and "orion" in txt.lower():
             line = f"Possible relationship/context claim: {subject} references Orion as an AI or message relay context. Confirm whether this may be used publicly or should remain internal community context."
         elif ctype == "queue_submission":
@@ -692,6 +885,8 @@ def build_subject_analyst_read(subject_name: str, resolved_memory: dict[str, Any
         if line not in review_claims:
             review_claims.append(line)
             claim = _make_reviewable_claim(subject, line, ctype, "needs_confirmation", f"Review-only subject memory mentions {ctype.replace('_', ' ')} context.", False, "low", humanize_internal_label(_safe_evidence_example(txt, subject)))
+            if conflict_corr:
+                claim.update(_admin_conflict_fields(subject, txt, conflict_corr))
             if ctype.startswith("contest_"):
                 claim["eventEvidenceHints"] = {k: v for k, v in event_hints.items() if v}
                 if ctype in {"contest_host", "contest_organizer"}:
@@ -730,6 +925,8 @@ def build_subject_analyst_read(subject_name: str, resolved_memory: dict[str, Any
         missing.append({"question": f"Confirm Orion context: Can BNL mention Orion as {subject}'s AI/message relay context, or keep it internal?", "confirmationType": "needs_admin_confirmation", "suggestedReviewer": "admin", "why": "Named relationship/context should not become public copy without permission and provenance.", "canAutoResolve": False, "relatedClaimType": "relationship"})
     if review or re.search(r"queue|submission", " ".join(str(x) for x in resolved_memory.get("queueOrSubmissionSignals") or []), re.I):
         missing.append({"question": f"Confirm queue/submission history: Can {subject}'s queue or submission history be referenced publicly?", "confirmationType": "needs_admin_confirmation", "suggestedReviewer": "admin", "why": "Queue/submission evidence is review-only unless explicitly confirmed public-safe.", "canAutoResolve": False, "relatedClaimType": "queue_submission"})
+    resolved_types = _resolved_missing_info_types(admin_corrections)
+    missing = [m for m in missing if m.get("relatedClaimType") not in resolved_types]
     missing_lines = [m["question"] + f" ({m['confirmationType'].replace('_', ' ')}.)" for m in missing]
     actions = [
         "Review each sourceFileReviewClaims line as an individual approve/reject/edit item; do not approve a whole bucket.",
@@ -760,6 +957,7 @@ def build_subject_analyst_read(subject_name: str, resolved_memory: dict[str, Any
         "publicReadyClaims": public_claims,
         "reviewNeededClaims": review_claims,
         "reviewableClaims": reviewable_claims[:14],
+        "adminCorrections": admin_corrections,
         "sourceBlindInsights": blind_insights,
         "privateOrInternalExclusions": exclusions,
         "withheldEvidenceAudit": withheld_audit,
