@@ -148,6 +148,9 @@ class DossierDraftGeneratorTests(unittest.TestCase):
             publicSafeNotes=[],
             reviewableClaims=[{
                 "claimText": "Some subject memory lacked public-safe provenance",
+                "displayTitle": "Needs public source",
+                "displayDecision": "What public-safe source or owner-approved wording supports this claim?",
+                "verificationPacketQuestion": "What public-safe source supports this claim?",
                 "suggestedInternalNote": "BNL found source-blind context for Signal Fox.",
                 "suggestedMissingInfoQuestion": "What public-safe source or owner-approved wording supports this source-blind context?",
                 "recommendedAction": "needs_public_source",
@@ -157,7 +160,7 @@ class DossierDraftGeneratorTests(unittest.TestCase):
         )
         result = draft.generate_dossier_draft(packet)["draft"]
         public = json.dumps(result).lower()
-        for forbidden in ("reviewableclaims", "suggestedinternalnote", "suggestedmissinginfoquestion", "recommendedaction", "actionability", "withheldevidenceaudit", "source-blind", "source_blind"):
+        for forbidden in ("reviewableclaims", "displaytitle", "displaydecision", "verificationpacketquestion", "suggestedinternalnote", "suggestedmissinginfoquestion", "recommendedaction", "actionability", "withheldevidenceaudit", "source-blind", "source_blind"):
             self.assertNotIn(forbidden, public)
 
     def test_thin_packet_returns_conservative_summary_and_missing_info(self):

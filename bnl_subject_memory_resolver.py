@@ -517,6 +517,161 @@ def _claim_type_from_text(text: str) -> str:
     return "missing_confirmation"
 
 
+
+
+def _display_clean(text: str) -> str:
+    text = _text(text, 500)
+    replacements = {
+        "sourceFileReviewClaims": "BNL claims",
+        "official_public_dossier": "public dossier",
+        "public_safe": "approved for public use",
+        "source_blind": "without a public source",
+        "source-blind": "without a public source",
+        "review_only": "for review only",
+        "review-only": "for review only",
+        "public_music_role": "public music role",
+        "queue_submission": "queue or submission",
+    }
+    for old, new in replacements.items():
+        text = re.sub(re.escape(old), new, text, flags=re.I)
+    text = re.sub(r"\b[A-Za-z]+(?:[A-Z][a-z0-9]+)+\b", lambda m: "BNL item" if m.group(0) != "BNL" else m.group(0), text)
+    return text
+
+
+def _review_display_copy(subject: str, claim_text: str, claim_type: str, lane: str, public_safe: bool, actionability: str) -> dict[str, Any]:
+    low = (claim_text or "").lower()
+    title = "Review BNL claim"
+    decision = f"Is this claim approved for public use, internal use only, or should it be rejected?"
+    checked = "You are checking whether this claim is true and approved for public use."
+    why = "BNL found context that needs a human decision before it can be used publicly."
+    rec = "BNL recommends asking for confirmation before using this in public copy."
+    safe = "Keep this out of public copy until approved."
+    approval = "Approve only the exact wording that can be safely used publicly."
+    target = "admin"
+    audience = "admin"
+    primary = "Add to admin follow-up"
+    secondary = ["Reject / not needed"]
+    question = "Is this claim approved for public use, internal use only, or should it be rejected?"
+
+    if actionability == "non_actionable_artifact":
+        title = "Internal evidence artifact"
+        decision = "Should this vague evidence marker be kept internally or dismissed?"
+        checked = "This is not a public-ready claim. It only shows that BNL found subject-linked evidence that was not specific enough to approve."
+        why = "BNL flagged this because it is audit context, not a fact about the subject."
+        rec = "BNL recommends keeping this only as internal audit context or dismissing it."
+        safe = "Do not turn this into public wording."
+        approval = "Do not approve public wording from this artifact."
+        target = "none"; audience = "none"; question = ""
+        primary = "Keep as internal audit note"; secondary = ["Dismiss artifact"]
+    elif actionability == "source_blind_warning" or lane == "source_blind":
+        title = "Needs public source"
+        decision = "What public-safe source or owner-approved wording supports this claim?"
+        checked = "BNL found context, but it cannot be used publicly until it has a public source or owner-approved wording."
+        why = "BNL flagged this because the available context is not enough public proof by itself."
+        rec = "BNL recommends requesting a public source or owner-approved wording before approval."
+        target = "public_source"; audience = "public_source"
+        primary = "Request public source"; secondary = ["Ask for owner-approved wording", "Reject / not needed"]
+        question = "What public-safe source supports this claim?"
+    elif actionability == "weak_label":
+        title = "Check weak label"
+        label = "contest organizer" if "contest organizer" in low else _text(claim_text, 80)
+        decision = f"Is the label \"{label}\" accurate and useful for {subject}, or should it be rejected?"
+        checked = "You are checking whether a thin label has enough support to keep internally or approve later."
+        why = "BNL flagged this because the label was too vague to approve as public copy."
+        rec = "BNL recommends keeping this internal only if it helps review, otherwise reject it."
+        target = "admin"; audience = "admin"; primary = "Save BNL internal note"; secondary = ["Reject weak label"]
+        question = decision
+    elif claim_type in {"music_link", "public_link", "contest_music_context"}:
+        title = "Confirm approved public links"
+        decision = f"Which links, if any, may BNL publicly associate with {subject}?"
+        checked = f"You are checking whether these links belong to {subject} and whether BNL may mention them publicly."
+        why = "BNL found repeated link or music context but does not yet have approval to use it publicly."
+        rec = "BNL recommends asking who owns the links and which ones are approved for public reference."
+        target = "link_ownership"; audience = "subject"; primary = "Ask who owns these links"; secondary = ["Add to subject verification packet", "Reject / not needed"]
+        question = "Which music or contest-related links are yours and approved for public reference?"
+    elif claim_type.startswith("contest_"):
+        title = "Confirm contest relationship"
+        decision = f"What was {subject}’s relationship to this contest context?"
+        checked = f"You are checking whether {subject} was a participant, submitter, rules poster, link source, host, organizer, or only mentioned near the contest."
+        why = "BNL found contest context, but context alone does not prove a specific role."
+        rec = "BNL recommends confirming the exact relationship before writing public copy."
+        target = "subject"; audience = "subject"; primary = "Add to subject verification packet"; secondary = ["Use BNL suggested question", "Reject / not needed"]
+        question = "What was your relationship to this contest context: participant, submitter, rules poster, link source, host, organizer, or unrelated mention?"
+    elif claim_type in {"role", "community_context"}:
+        title = "Confirm public role"
+        decision = f"What public role/title may BNL use for {subject}, if any?"
+        checked = "You are checking whether this role is true and approved for public use."
+        why = "BNL found possible role context but does not have approved public wording yet."
+        rec = "BNL recommends asking for the exact approved public role or title."
+        target = "subject"; audience = "subject"; primary = "Add to subject verification packet"; secondary = ["Use BNL suggested question", "Reject / not needed"]
+        question = "What public role/title should BNL use for you, if any?"
+    elif claim_type == "relationship" and "orion" in low:
+        title = "Confirm relationship context"
+        decision = f"Can BNL mention Orion in public {subject} context?"
+        checked = f"You are checking whether Orion/context may be mentioned publicly for {subject}, or should stay internal."
+        why = "BNL found relationship or context language that needs approval before public use."
+        rec = "BNL recommends subject or owner confirmation before public wording."
+        target = "subject"; audience = "subject"; primary = "Add to subject verification packet"; secondary = ["Ask for owner-approved wording", "Reject / not needed"]
+        question = f"Can BNL mention Orion in public {subject} context, or should that stay internal?"
+    elif claim_type == "queue_submission":
+        title = "Confirm queue or submission history"
+        decision = f"May BNL publicly mention {subject}’s queue or submission history?"
+        checked = "You are checking whether queue or submission history is approved for public use."
+        why = "BNL found queue or submission context that needs approval before public wording."
+        rec = "BNL recommends admin confirmation before public use."
+        target = "admin"; audience = "admin"; primary = "Add to admin follow-up"; secondary = ["Reject / not needed"]
+        question = "Is this claim approved for public use, internal use only, or should it be rejected?"
+    return {k: _display_clean(v) if isinstance(v, str) else v for k, v in {
+        "displayTitle": title,
+        "displayDecision": decision,
+        "displayWhatIsBeingChecked": checked,
+        "displayWhyBNLFlaggedIt": why,
+        "displayBNLRecommendation": rec,
+        "displayEvidenceSummary": "No public approval has been provided yet." if not public_safe else "BNL found approved public wording for this item.",
+        "displaySafeDefault": safe,
+        "displayApprovalInstruction": approval,
+        "confirmationTarget": target,
+        "primaryActionLabel": primary,
+        "secondaryActionLabels": secondary,
+        "verificationPacketQuestion": question,
+        "verificationPacketAudience": audience,
+    }.items()}
+
+
+def _admin_action_card(action: str) -> dict[str, Any]:
+    raw = str(action or "")
+    title = "Admin follow-up task"
+    display = _display_clean(raw)
+    explanation = "This is an admin workflow task, not a public claim approval."
+    if "sourceFileReviewClaims" in raw:
+        display = "Review each BNL claim separately."
+        explanation = "Do not approve a whole group of claims at once. Each claim needs its own approve, edit, reject, or confirmation decision."
+    elif "Promote only confirmed" in raw:
+        display = "Only say what we know is true."
+        explanation = "BNL should not use guesses in public text. Approve the fact first, then BNL can use it."
+    elif "Attach owner-approved provenance" in raw:
+        display = "Get proof or approval first."
+        explanation = "If the claim involves someone’s role, links, music, queue history, Orion/context, or relationships, BNL needs a public source or owner-approved wording before using it publicly."
+    return {
+        "claimText": raw,
+        "claimType": "admin_task",
+        "reviewLane": "admin_follow_up",
+        "displayTitle": title,
+        "displayDecision": "What follow-up should happen before this Source File is used for public copy?",
+        "displayWhatIsBeingChecked": "This is an admin workflow task, not a public claim approval.",
+        "displayWhyBNLFlaggedIt": explanation,
+        "displayBNLRecommendation": display,
+        "displayEvidenceSummary": explanation,
+        "displaySafeDefault": "Do not use this task as public copy.",
+        "displayApprovalInstruction": "Complete this follow-up before approving related public wording.",
+        "confirmationTarget": "admin",
+        "primaryActionLabel": "Add to admin follow-up",
+        "secondaryActionLabels": ["Reject / not needed"],
+        "verificationPacketQuestion": "Is this follow-up complete, still needed, or not needed?",
+        "verificationPacketAudience": "admin",
+    }
+
+
 def _claim_prefix(claim_type: str) -> str:
     return {
         "role": "Possible role claim",
@@ -587,6 +742,7 @@ def _review_guidance(subject: str, claim_text: str, claim_type: str, lane: str, 
             "recommendedAction": "approve_public",
             "recommendedActionReason": "BNL found public-safe or owner/admin-confirmed support for exact public wording.",
         })
+        guidance.update(_review_display_copy(subject, claim_text, claim_type, lane, public_safe, actionability))
         return guidance
     if actionability == "non_actionable_artifact":
         guidance.update({
@@ -596,6 +752,7 @@ def _review_guidance(subject: str, claim_text: str, claim_type: str, lane: str, 
             "cannotSuggestPublicReason": "No concrete public-safe claim was identified.",
             "recommendedActionReason": "The item is audit metadata rather than a subject fact.",
         })
+        guidance.update(_review_display_copy(subject, claim_text, claim_type, lane, public_safe, actionability))
         return guidance
     if actionability == "weak_label":
         label = _text(claim_text, 80)
@@ -609,6 +766,7 @@ def _review_guidance(subject: str, claim_text: str, claim_type: str, lane: str, 
             "cannotSuggestPublicReason": "The label is not specific enough to become public copy.",
             "recommendedActionReason": "Weak labels need supporting context before approval.",
         })
+        guidance.update(_review_display_copy(subject, claim_text, claim_type, lane, public_safe, actionability))
         return guidance
     if actionability == "source_blind_warning":
         guidance.update({
@@ -618,6 +776,7 @@ def _review_guidance(subject: str, claim_text: str, claim_type: str, lane: str, 
             "cannotSuggestPublicReason": "Source-blind memory cannot become public copy by itself.",
             "recommendedActionReason": "Source-blind context needs separate public-safe provenance or owner/admin confirmation.",
         })
+        guidance.update(_review_display_copy(subject, claim_text, claim_type, lane, public_safe, actionability))
         return guidance
     if claim_type == "contest_music_context":
         note = f"BNL found contest-related music/link context for {subject}. This does not prove {subject} hosted or organized a contest. Keep internal until links and role are confirmed."
@@ -647,6 +806,7 @@ def _review_guidance(subject: str, claim_text: str, claim_type: str, lane: str, 
         "suggestedMissingInfoQuestion": question,
         "cannotSuggestPublicReason": "Contest role is ambiguous and needs owner/admin confirmation." if claim_type.startswith("contest_") and claim_type not in {"contest_host", "contest_organizer"} else "No confirmed public-safe wording or provenance was identified.",
     })
+    guidance.update(_review_display_copy(subject, claim_text, claim_type, lane, public_safe, actionability))
     return guidance
 
 
@@ -658,8 +818,10 @@ def _safe_evidence_example(text: str, subject: str) -> str:
 
 
 def _make_reviewable_claim(subject: str, claim_text: str, claim_type: str, lane: str, why: str, public_safe: bool, confidence: str, evidence: str = "", blocked: list[str] | None = None) -> dict[str, Any]:
+    actionability = _claim_actionability(claim_text, claim_type, lane, public_safe)
+    display_claim_text = "Vague internal evidence marker" if actionability == "non_actionable_artifact" else claim_text
     item = {
-        "claimText": _text(claim_text, 300),
+        "claimText": _text(display_claim_text, 300),
         "claimType": claim_type,
         "reviewLane": lane,
         "suggestedDecision": "confirm_public" if public_safe else ("keep_boundary" if lane in {"source_blind", "private_internal_withheld"} else "needs_more_info"),
@@ -669,14 +831,14 @@ def _make_reviewable_claim(subject: str, claim_text: str, claim_type: str, lane:
         "safeEvidenceSummary": _text(evidence or why, 240),
         "blockedBy": blocked or ([] if public_safe else ["missing owner/admin confirmation", "missing public-safe provenance"]),
     }
-    item.update(_review_guidance(subject, item["claimText"], claim_type, lane, public_safe))
+    item.update(_review_guidance(subject, claim_text, claim_type, lane, public_safe))
     return item
 
 
 
 def _admin_blocked_claim(subject: str, claim_text: str, claim_type: str, correction: dict[str, Any]) -> dict[str, Any]:
     label = str(correction.get("label") or _detect_blocked_label(claim_text) or claim_type.replace("_", " "))
-    return {
+    item = {
         "claimText": _text(claim_text, 300),
         "claimType": claim_type,
         "reviewLane": "admin_correction",
@@ -695,10 +857,14 @@ def _admin_blocked_claim(subject: str, claim_text: str, claim_type: str, correct
         "rejectedLabel": label,
         "blockedInference": f"Admin rejected {label} for {subject}.",
     }
+    item.update(_review_display_copy(subject, item["claimText"], claim_type, item["reviewLane"], False, "weak_label"))
+    item["displayTitle"] = "Check weak label"
+    item["primaryActionLabel"] = "Reject weak label"
+    return item
 
 def _admin_conflict_fields(subject: str, evidence: str, correction: dict[str, Any]) -> dict[str, Any]:
     label = str(correction.get("label") or _detect_blocked_label(evidence) or "this label")
-    return {
+    fields = {
         "reviewLane": "admin_correction_conflict",
         "recommendedAction": "needs_more_info",
         "suggestedDecision": "needs_more_info",
@@ -708,6 +874,8 @@ def _admin_conflict_fields(subject: str, evidence: str, correction: dict[str, An
         "suggestedMissingInfoQuestion": "Admin previously rejected this label. Is there new owner-approved evidence that changes it?",
         "recommendedActionReason": "New evidence appears to conflict with an admin correction; do not override silently.",
     }
+    fields.update(_review_display_copy(subject, fields["claimText"], "role", fields["reviewLane"], False, "missing_confirmation"))
+    return fields
 
 def _resolved_missing_info_types(corrections: list[dict[str, Any]]) -> set[str]:
     resolved: set[str] = set()
@@ -965,6 +1133,7 @@ def build_subject_analyst_read(subject_name: str, resolved_memory: dict[str, Any
         "missingInfoQuestions": missing_lines,
         "missingConfirmations": missing,
         "recommendedAdminActions": actions,
+        "recommendedAdminActionCards": [_admin_action_card(a) for a in actions],
         "draftIngredients": draft_ingredients,
         "sourceFileIngredients": source_file_ingredients[:18],
         "provenanceSummary": prov,

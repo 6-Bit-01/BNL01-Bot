@@ -1,12 +1,67 @@
 import sqlite3
 import tempfile
 import unittest
+import json
 
 import bnl_dossier_draft as draft
 from bnl_subject_memory_resolver import build_subject_analyst_read, build_subject_memory_diagnostic, resolve_subject_memory
 
 
 class SubjectMemoryResolverTests(unittest.TestCase):
+
+    def test_review_cards_include_human_display_copy_and_clean_questions(self):
+        packet = {
+            "publicSafeFacts": ["Crow is a BARCODE Network community member."],
+            "publicCreativeMusicSignals": [],
+            "publicRoleSignals": [],
+            "publicLinkSignals": [],
+            "reviewOnlyEvidence": [
+                {"summary": "Crow may have public Suno/music links and repeated music link context needing confirmation."},
+                {"summary": "Crow has contest-related music/link context and contest rules links but the relationship is unclear."},
+                {"summary": "Crow may be an artist role/title but needs confirmation."},
+                {"summary": "subject-owned/keyed local evidence exists"},
+            ],
+            "queueOrSubmissionSignals": ["Crow queue submission history needs confirmation."],
+            "relationshipOrContextSignals": [{"summary": "Crow may reference Orion as AI/message relay context needing confirmation."}],
+            "sourceSafetyWarnings": ["Some subject memory lacked public-safe provenance"],
+            "privateOrInternalEvidence": [],
+            "evidenceCounts": {"publicSafe": 1, "reviewOnly": 5, "privateOrInternal": 0, "sourceBlind": 1, "totalScanned": 7},
+        }
+        analyst = build_subject_analyst_read("Crow", packet)
+        claims = analyst["reviewableClaims"]
+        music = next(c for c in claims if c["claimType"] == "music_link")
+        self.assertEqual(music["displayTitle"], "Confirm approved public links")
+        self.assertEqual(music["displayDecision"], "Which links, if any, may BNL publicly associate with Crow?")
+        self.assertEqual(music["confirmationTarget"], "link_ownership")
+        self.assertEqual(music["primaryActionLabel"], "Ask who owns these links")
+        self.assertEqual(music["verificationPacketQuestion"], "Which music or contest-related links are yours and approved for public reference?")
+        contest = next(c for c in claims if c["claimType"] == "contest_music_context")
+        self.assertEqual(contest["displayTitle"], "Confirm approved public links")
+        self.assertEqual(contest["verificationPacketAudience"], "subject")
+        self.assertIn("Which music or contest-related links", contest["verificationPacketQuestion"])
+        blind = next(c for c in claims if c.get("actionability") == "source_blind_warning")
+        self.assertEqual(blind["displayTitle"], "Needs public source")
+        self.assertEqual(blind["confirmationTarget"], "public_source")
+        self.assertEqual(blind["primaryActionLabel"], "Request public source")
+        artifact = next(c for c in claims if c.get("actionability") == "non_actionable_artifact")
+        self.assertEqual(artifact["claimText"], "Vague internal evidence marker")
+        self.assertEqual(artifact["displayTitle"], "Internal evidence artifact")
+        self.assertEqual(artifact["primaryActionLabel"], "Keep as internal audit note")
+        self.assertEqual(artifact["secondaryActionLabels"], ["Dismiss artifact"])
+        self.assertNotIn("suggestedPublicWording", artifact)
+        queue = next(c for c in claims if c["claimType"] == "queue_submission")
+        self.assertEqual(queue["confirmationTarget"], "admin")
+        role = next(c for c in claims if c["claimType"] == "role")
+        self.assertEqual(role["confirmationTarget"], "subject")
+        cards = analyst["recommendedAdminActionCards"]
+        self.assertEqual(cards[0]["displayBNLRecommendation"], "Review each BNL claim separately.")
+        self.assertEqual(cards[1]["displayBNLRecommendation"], "Only say what we know is true.")
+        self.assertEqual(cards[2]["displayBNLRecommendation"], "Get proof or approval first.")
+        display_keys = ("displayTitle", "displayDecision", "displayWhatIsBeingChecked", "displayWhyBNLFlaggedIt", "displayBNLRecommendation", "displayEvidenceSummary", "displaySafeDefault", "displayApprovalInstruction", "primaryActionLabel", "secondaryActionLabels", "verificationPacketQuestion")
+        human_blob = json.dumps([{k: c.get(k) for k in display_keys} for c in [*claims, *cards]])
+        for forbidden in ("sourceFileReviewClaims", "official_public_dossier", "public_safe", "source_blind", "review_only", "public_music_role", "queue_submission"):
+            self.assertNotIn(forbidden, human_blob)
+
     def test_resolver_finds_and_classifies_crow_memory_across_tables(self):
         with tempfile.NamedTemporaryFile(suffix='.db') as tmp:
             conn = sqlite3.connect(tmp.name)
