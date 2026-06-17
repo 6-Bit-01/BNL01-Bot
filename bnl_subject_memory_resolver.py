@@ -2061,6 +2061,8 @@ def _compose_source_file_review_card(subject: str, claim: dict[str, Any], dossie
         if public_wording:
             out["suggestedPublicWording"] = public_wording
         if public_approval_ready:
+            if public_wording:
+                out["hasSafePublicSuggestion"] = True
             existing_actions = claim.get("allowedReviewActions") or []
             if not any(a.get("action") == "approve_public_wording" for a in existing_actions if isinstance(a, dict)):
                 existing_actions = _actions(("approve_public_wording", "Approve public wording")) + existing_actions
@@ -2099,6 +2101,8 @@ def _compose_source_file_review_card(subject: str, claim: dict[str, Any], dossie
     if public_approval_ready:
         claim["decisionState"] = "decidable"
         claim["recommendedAction"] = "approve_public"
+        if public_wording:
+            claim["hasSafePublicSuggestion"] = True
         existing_actions = claim.get("allowedReviewActions") or []
         if not any(a.get("action") == "approve_public_wording" for a in existing_actions if isinstance(a, dict)):
             existing_actions = _actions(("approve_public_wording", "Approve public wording")) + existing_actions
@@ -2143,6 +2147,8 @@ def _compose_source_file_review_card(subject: str, claim: dict[str, Any], dossie
     if public_approval_ready:
         out["decisionState"] = claim.get("decisionState")
         out["recommendedAction"] = claim.get("recommendedAction")
+        if claim.get("hasSafePublicSuggestion"):
+            out["hasSafePublicSuggestion"] = True
     if answerability == "not_answerable":
         out["displayDecision"] = "Internal audit only — BNL needs a concrete safe evidence anchor before review."
         out["displayApprovalInstruction"] = "Do not approve public wording from this item; ask for context, keep internal, or reject."
@@ -2179,6 +2185,8 @@ def _restore_public_approval_if_safe(guidance: dict[str, Any], context: dict[str
     if not approval_ready:
         return
     guidance["answerability"] = "answerable"
+    if public_wording:
+        guidance["hasSafePublicSuggestion"] = True
     if isinstance(guidance.get("evidenceAnchor"), dict):
         guidance["evidenceAnchor"]["answerable"] = "answerable"
     if isinstance(guidance.get("reviewContext"), dict):

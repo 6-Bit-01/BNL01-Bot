@@ -209,6 +209,7 @@ class SubjectMemoryResolverTests(unittest.TestCase):
         self.assertEqual("decidable", finalized["decisionState"])
         self.assertEqual("approve_public", finalized["recommendedAction"])
         self.assertEqual("answerable", finalized["answerability"])
+        self.assertTrue(finalized["hasSafePublicSuggestion"])
         self.assertIn("approve_public_wording", {a["action"] for a in finalized["allowedReviewActions"]})
 
         collab = _make_reviewable_claim("Crow", "Owner-confirmed public-safe collaborator credited on a released project", "role", "public_home", "confirmed collaborator", True, "high", "Owner-confirmed public-safe collaborator credited on a released project")
@@ -228,6 +229,7 @@ class SubjectMemoryResolverTests(unittest.TestCase):
         restored_collab = _compose_source_file_review_card("Crow", stale_collab, "collaboration_status", "approve_public_fact", stale_collab_context)
         self.assertEqual("decidable", restored_collab["decisionState"])
         self.assertEqual("approve_public", restored_collab["recommendedAction"])
+        self.assertTrue(restored_collab["hasSafePublicSuggestion"])
         self.assertIn("approve_public_wording", {a["action"] for a in restored_collab["allowedReviewActions"]})
 
         generic_cases = [
