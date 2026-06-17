@@ -34,7 +34,7 @@ class SubjectMemoryResolverTests(unittest.TestCase):
         self.assertEqual(music["displayDecision"], "Which links, if any, may BNL publicly associate with Crow?")
         self.assertEqual(music["confirmationTarget"], "link_ownership")
         self.assertEqual(music["primaryActionLabel"], "Keep as internal note")
-        self.assertEqual(music["verificationPacketQuestion"], "Which links are yours and approved for BNL to mention publicly?")
+        self.assertIn("Which Crow links, music links, or social links", music["verificationPacketQuestion"])
         contest = next(c for c in claims if c["claimType"] == "contest_music_context")
         self.assertEqual(contest["displayTitle"], "Confirm contest relationship")
         self.assertEqual(contest["verificationPacketAudience"], "subject")
@@ -43,14 +43,7 @@ class SubjectMemoryResolverTests(unittest.TestCase):
         self.assertEqual(blind["displayTitle"], "Needs public source")
         self.assertEqual(blind["confirmationTarget"], "public_source")
         self.assertEqual(blind["primaryActionLabel"], "Request public source")
-        artifact = next(c for c in claims if c.get("actionability") == "non_actionable_artifact")
-        self.assertEqual(artifact["claimText"], "Weak internal signal — not a public fact")
-        self.assertEqual(artifact["displayTitle"], "Internal audit item")
-        self.assertEqual(artifact["displayApprovalInstruction"], "")
-        self.assertEqual(artifact["verificationPacketQuestion"], "")
-        self.assertEqual(artifact["primaryActionLabel"], "Keep as internal note")
-        self.assertEqual(artifact["secondaryActionLabels"], ["Dismiss artifact"])
-        self.assertNotIn("suggestedPublicWording", artifact)
+        self.assertFalse(any(c.get("actionability") == "non_actionable_artifact" for c in claims))
         queue = next(c for c in claims if c["claimType"] == "queue_submission")
         self.assertEqual(queue["displayTitle"], "Confirm queue/submission history")
         self.assertEqual(queue["confirmationTarget"], "admin")
@@ -85,7 +78,7 @@ class SubjectMemoryResolverTests(unittest.TestCase):
         questions = {name: item["verificationPacketQuestion"] for name, item in cases.items()}
         self.assertEqual(len(set(summaries.values())), len(summaries))
         self.assertEqual(len(set(safe_defaults.values())), len(safe_defaults))
-        self.assertIn("Which links are yours", questions["link"])
+        self.assertIn("Which Crow links, music links, or social links", questions["link"])
         self.assertIn("participant, submitter, rules poster, link source, host, organizer", questions["contest"])
         self.assertIn("AI/persona/project connection", questions["ai"])
         self.assertIn("public role/title", questions["role"])
@@ -93,7 +86,7 @@ class SubjectMemoryResolverTests(unittest.TestCase):
         generic = "What public-safe source or owner-approved wording supports this claim?"
         self.assertFalse(any(generic in item.get("verificationPacketQuestion", "") for item in cases.values()))
         fallback = _review_guidance("Crow", "unclassified context", "unknown", "needs_confirmation", False)
-        self.assertEqual(fallback["verificationPacketQuestion"], generic)
+        self.assertEqual(fallback["verificationPacketQuestion"], "What proof or approved wording should BNL use before saying this publicly?")
 
     def test_resolver_finds_and_classifies_crow_memory_across_tables(self):
         with tempfile.NamedTemporaryFile(suffix='.db') as tmp:
@@ -232,10 +225,7 @@ class SubjectMemoryResolverTests(unittest.TestCase):
         blind = next(c for c in claims if c.get("actionability") == "source_blind_warning")
         self.assertEqual(blind["recommendedAction"], "needs_public_source")
         self.assertIn("Source-blind memory cannot become public copy", blind["cannotSuggestPublicReason"])
-        artifact = next(c for c in claims if c.get("actionability") == "non_actionable_artifact")
-        self.assertEqual(artifact["recommendedAction"], "reject")
-        self.assertIn("technical evidence artifact", artifact["suggestedRejectionReason"])
-        self.assertNotIn("suggestedPublicWording", artifact)
+        self.assertFalse(any(c.get("actionability") == "non_actionable_artifact" for c in claims))
         weak = next(c for c in claims if c.get("actionability") == "weak_label")
         self.assertIn(weak["recommendedAction"], {"keep_internal", "reject"})
         self.assertIn('weak pattern label: "contest organizer"', weak["suggestedInternalNote"])
@@ -394,7 +384,7 @@ class DossierReadinessPacketTests(unittest.TestCase):
         self.assertIn("relationship to this contest", joined)
         self.assertIn("public role/title", joined)
         self.assertIn("Orion", joined)
-        self.assertIn("public lore/context, keep it internal, or reject", joined)
+        self.assertIn("public lore/context for Crow, keep it internal, or ignore", joined)
         self.assertNotIn("What public-safe source or owner-approved wording supports this claim", joined)
         self.assertIn("readyForDraft", analyst)
         self.assertIn("draftReadinessReason", analyst)
@@ -403,6 +393,6 @@ class DossierReadinessPacketTests(unittest.TestCase):
 
     def test_lore_heavy_card_uses_decision_copy_not_public_source(self):
         card = _review_guidance("Crow", "Crow lore-heavy context only", "relationship", "needs_confirmation", False)
-        self.assertEqual(card["displayTitle"], "Decide lore/public boundary")
-        self.assertIn("public lore/context, keep it internal, or reject", card["verificationPacketQuestion"])
+        self.assertEqual(card["displayTitle"], "Confirm lore/public context")
+        self.assertIn("public lore/context for Crow, keep it internal, or ignore", card["verificationPacketQuestion"])
         self.assertNotIn("public-safe source", card["verificationPacketQuestion"].lower())
