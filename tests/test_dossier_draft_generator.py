@@ -682,3 +682,19 @@ class DossierDraftGeneratorTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class DossierDraftReadinessMemoryTests(unittest.TestCase):
+    def test_readiness_memory_is_top_level_not_public_draft(self):
+        packet = pr217_packet(subjectAnalystReadV1={
+            "dossierReadinessQuestions": [{"id": "q1", "audience": "subject", "question": "Which links are Signal Fox’s and approved for BNL to mention publicly?", "whyItMatters": "Needed for links.", "dossierSection": "links", "priority": "high", "relatedReviewClaimIds": [], "sourceSafety": "needs_confirmation"}],
+            "dossierReadinessSummary": "One blocker remains.",
+            "dossierBlockedBy": ["links"],
+            "readyForDraft": False,
+            "draftReadinessReason": "Resolve link ownership first.",
+        })
+        result = draft.generate_dossier_draft(packet)
+        self.assertIn("draftReadiness", result)
+        self.assertEqual(result["draftReadiness"]["dossierBlockedBy"], ["links"])
+        public = json.dumps(result["draft"]).lower()
+        for forbidden in ("dossierreadinessquestions", "draftreadinessreason", "readyfordraft", "which links are signal fox"):
+            self.assertNotIn(forbidden, public)

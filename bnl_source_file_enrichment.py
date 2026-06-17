@@ -4767,6 +4767,11 @@ _SUBJECT_ANALYST_READ_KEYS = (
     "missingConfirmations",
     "recommendedAdminActions",
     "recommendedAdminActionCards",
+    "dossierReadinessQuestions",
+    "dossierReadinessSummary",
+    "dossierBlockedBy",
+    "readyForDraft",
+    "draftReadinessReason",
     "draftIngredients",
     "sourceFileIngredients",
     "provenanceSummary",
@@ -4837,6 +4842,11 @@ def _normalize_subject_analyst_read_v1(analyst: dict[str, Any]) -> dict[str, Any
     normalized["withheldEvidenceAudit"] = _sanitize_archive_value(analyst.get("withheldEvidenceAudit") or {}) if isinstance(analyst.get("withheldEvidenceAudit"), dict) else {}
     normalized["missingConfirmations"] = _sanitize_archive_value((analyst.get("missingConfirmations") or [])[:12]) if isinstance(analyst.get("missingConfirmations"), list) else []
     normalized["recommendedAdminActionCards"] = _sanitize_archive_value((analyst.get("recommendedAdminActionCards") or [])[:8]) if isinstance(analyst.get("recommendedAdminActionCards"), list) else []
+    normalized["dossierReadinessQuestions"] = _sanitize_archive_value((analyst.get("dossierReadinessQuestions") or [])[:7]) if isinstance(analyst.get("dossierReadinessQuestions"), list) else []
+    normalized["dossierBlockedBy"] = _case_list(analyst.get("dossierBlockedBy"), limit=7, item_limit=80)
+    normalized["readyForDraft"] = bool(analyst.get("readyForDraft"))
+    normalized["dossierReadinessSummary"] = _case_text(analyst.get("dossierReadinessSummary"), 500)
+    normalized["draftReadinessReason"] = _case_text(analyst.get("draftReadinessReason"), 500)
     for key in ("strongestSignals", "publicSafeClaims", "publicReadyClaims", "sourceBlindInsights", "privateOrInternalExclusions", "doNotSayPublicly", "missingInfoQuestions", "recommendedAdminActions", "draftIngredients", "provenanceSummary"):
         normalized[key] = _case_list(normalized.get(key), limit=12 if key != "draftIngredients" else 9, item_limit=360)
     normalized["subjectName"] = subject
