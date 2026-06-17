@@ -4,7 +4,7 @@ import unittest
 import json
 
 import bnl_dossier_draft as draft
-from bnl_subject_memory_resolver import build_subject_analyst_read, build_subject_memory_diagnostic, resolve_subject_memory
+from bnl_subject_memory_resolver import build_subject_analyst_read, build_subject_memory_diagnostic, resolve_subject_memory, _review_guidance
 
 
 class SubjectMemoryResolverTests(unittest.TestCase):
@@ -33,23 +33,26 @@ class SubjectMemoryResolverTests(unittest.TestCase):
         self.assertEqual(music["displayTitle"], "Confirm approved public links")
         self.assertEqual(music["displayDecision"], "Which links, if any, may BNL publicly associate with Crow?")
         self.assertEqual(music["confirmationTarget"], "link_ownership")
-        self.assertEqual(music["primaryActionLabel"], "Ask who owns these links")
-        self.assertEqual(music["verificationPacketQuestion"], "Which music or contest-related links are yours and approved for public reference?")
+        self.assertEqual(music["primaryActionLabel"], "Keep as internal note")
+        self.assertEqual(music["verificationPacketQuestion"], "Which links are yours and approved for BNL to mention publicly?")
         contest = next(c for c in claims if c["claimType"] == "contest_music_context")
-        self.assertEqual(contest["displayTitle"], "Confirm approved public links")
+        self.assertEqual(contest["displayTitle"], "Confirm contest relationship")
         self.assertEqual(contest["verificationPacketAudience"], "subject")
-        self.assertIn("Which music or contest-related links", contest["verificationPacketQuestion"])
+        self.assertIn("participant, submitter, rules poster, link source, host, organizer", contest["verificationPacketQuestion"])
         blind = next(c for c in claims if c.get("actionability") == "source_blind_warning")
         self.assertEqual(blind["displayTitle"], "Needs public source")
         self.assertEqual(blind["confirmationTarget"], "public_source")
         self.assertEqual(blind["primaryActionLabel"], "Request public source")
         artifact = next(c for c in claims if c.get("actionability") == "non_actionable_artifact")
-        self.assertEqual(artifact["claimText"], "Vague internal evidence marker")
-        self.assertEqual(artifact["displayTitle"], "Internal evidence artifact")
-        self.assertEqual(artifact["primaryActionLabel"], "Keep as internal audit note")
+        self.assertEqual(artifact["claimText"], "Weak internal signal — not a public fact")
+        self.assertEqual(artifact["displayTitle"], "Internal audit item")
+        self.assertEqual(artifact["displayApprovalInstruction"], "")
+        self.assertEqual(artifact["verificationPacketQuestion"], "")
+        self.assertEqual(artifact["primaryActionLabel"], "Keep as internal note")
         self.assertEqual(artifact["secondaryActionLabels"], ["Dismiss artifact"])
         self.assertNotIn("suggestedPublicWording", artifact)
         queue = next(c for c in claims if c["claimType"] == "queue_submission")
+        self.assertEqual(queue["displayTitle"], "Confirm queue/submission history")
         self.assertEqual(queue["confirmationTarget"], "admin")
         role = next(c for c in claims if c["claimType"] == "role")
         self.assertEqual(role["confirmationTarget"], "subject")
@@ -61,6 +64,37 @@ class SubjectMemoryResolverTests(unittest.TestCase):
         human_blob = json.dumps([{k: c.get(k) for k in display_keys} for c in [*claims, *cards]])
         for forbidden in ("sourceFileReviewClaims", "official_public_dossier", "public_safe", "source_blind", "review_only", "public_music_role", "queue_submission"):
             self.assertNotIn(forbidden, human_blob)
+
+
+    def test_lane_specific_review_guidance_copy_and_questions(self):
+        cases = {
+            "link": _review_guidance("Crow", "Crow shared Suno/music links", "music_link", "owner_approval", False),
+            "contest": _review_guidance("Crow", "Crow appeared near contest rules", "contest_rules_poster", "owner_approval", False),
+            "ai": _review_guidance("Crow", "Crow appears near AI persona project context", "relationship", "owner_approval", False),
+            "role": _review_guidance("Crow", "Crow may be a producer role", "role", "owner_approval", False),
+            "orion": _review_guidance("Crow", "Crow appears near Orion lore context", "relationship", "owner_approval", False),
+            "queue": _review_guidance("Crow", "Crow queue submission history needs confirmation", "queue_submission", "admin", False),
+        }
+        self.assertEqual(cases["link"]["displayTitle"], "Confirm approved public links")
+        self.assertEqual(cases["contest"]["displayTitle"], "Confirm contest relationship")
+        self.assertEqual(cases["ai"]["displayTitle"], "Confirm project relationship")
+        self.assertEqual(cases["role"]["displayTitle"], "Confirm public role")
+        self.assertEqual(cases["orion"]["displayTitle"], "Confirm Orion/context use")
+        self.assertEqual(cases["queue"]["displayTitle"], "Confirm queue/submission history")
+        summaries = {name: item["displayEvidenceSummary"] for name, item in cases.items()}
+        safe_defaults = {name: item["displaySafeDefault"] for name, item in cases.items()}
+        questions = {name: item["verificationPacketQuestion"] for name, item in cases.items()}
+        self.assertEqual(len(set(summaries.values())), len(summaries))
+        self.assertEqual(len(set(safe_defaults.values())), len(safe_defaults))
+        self.assertIn("Which links are yours", questions["link"])
+        self.assertIn("participant, submitter, rules poster, link source, host, organizer", questions["contest"])
+        self.assertIn("AI/persona/project connection", questions["ai"])
+        self.assertIn("public role/title", questions["role"])
+        self.assertIn("Can BNL mention Orion", questions["orion"])
+        generic = "What public-safe source or owner-approved wording supports this claim?"
+        self.assertFalse(any(generic in item.get("verificationPacketQuestion", "") for item in cases.values()))
+        fallback = _review_guidance("Crow", "unclassified context", "unknown", "needs_confirmation", False)
+        self.assertEqual(fallback["verificationPacketQuestion"], generic)
 
     def test_resolver_finds_and_classifies_crow_memory_across_tables(self):
         with tempfile.NamedTemporaryFile(suffix='.db') as tmp:
