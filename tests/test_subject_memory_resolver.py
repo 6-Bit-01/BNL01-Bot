@@ -35,10 +35,8 @@ class SubjectMemoryResolverTests(unittest.TestCase):
         self.assertEqual(music["confirmationTarget"], "link_ownership")
         self.assertEqual(music["primaryActionLabel"], "Keep as internal note")
         self.assertIn("Which Crow links, music links, or social links", music["verificationPacketQuestion"])
-        contest = next(c for c in claims if c["claimType"] == "contest_music_context")
-        self.assertEqual(contest["displayTitle"], "Confirm contest relationship")
-        self.assertEqual(contest["verificationPacketAudience"], "subject")
-        self.assertIn("participant, submitter, rules poster, link source, host, organizer", contest["verificationPacketQuestion"])
+        self.assertFalse(any(c["claimType"] == "contest_music_context" for c in claims))
+        self.assertTrue(any("unclear contest/rules wording" in q for q in analyst["missingInfoQuestions"]))
         blind = next(c for c in claims if c.get("actionability") == "source_blind_warning")
         self.assertEqual(blind["displayTitle"], "Needs public source")
         self.assertEqual(blind["confirmationTarget"], "public_source")
@@ -79,7 +77,7 @@ class SubjectMemoryResolverTests(unittest.TestCase):
         self.assertEqual(len(set(summaries.values())), len(summaries))
         self.assertEqual(len(set(safe_defaults.values())), len(safe_defaults))
         self.assertIn("Which Crow links, music links, or social links", questions["link"])
-        self.assertIn("participant, submitter, rules poster, link source, host, organizer", questions["contest"])
+        self.assertIn("What contest or event is this referring", questions["contest"])
         self.assertIn("AI/persona/project connection", questions["ai"])
         self.assertIn("public role/title", questions["role"])
         self.assertIn("Can BNL mention Orion", questions["orion"])
@@ -305,7 +303,7 @@ class SubjectMemoryResolverTests(unittest.TestCase):
         self.assertNotIn("official_public_dossier", str(claim))
         self.assertNotIn("public_music_role", str(claim))
         self.assertTrue(claim["eventEvidenceHints"]["rulesMentioned"])
-        self.assertTrue(any("relationship to this contest context" in q for q in analyst["missingInfoQuestions"]))
+        self.assertTrue(any("contest context involving" in q for q in analyst["missingInfoQuestions"]))
 
     def test_contest_strong_host_submitter_rules_and_admin_rejection(self):
         host = build_subject_analyst_read("Crow", {"subjectName":"Crow","matchedAliasesUsedPrivately":[],"publicSafeFacts":[],"publicSafeNotes":[],"publicCommunitySignals":[],"publicCreativeMusicSignals":[],"publicRoleSignals":[],"publicLinkSignals":[],"reviewOnlyEvidence":[{"summary":"Crow hosts the contest with public-safe confirmation."}],"queueOrSubmissionSignals":[],"relationshipOrContextSignals":[],"sourceSafetyWarnings":[],"privateOrInternalEvidence":[],"evidenceCounts":{"publicSafe":0,"reviewOnly":1,"privateOrInternal":0,"sourceBlind":0,"totalScanned":1}})
@@ -321,12 +319,41 @@ class SubjectMemoryResolverTests(unittest.TestCase):
         self.assertEqual(correction["rejectedLabel"], "contest organizer")
         self.assertIn("Do not infer contest organizer", correction["blockedInference"])
 
+    def test_evidence_scoped_contest_hosts_and_vague_suppression(self):
+        vague = build_subject_analyst_read("Crow", {"subjectName":"Crow","matchedAliasesUsedPrivately":[],"publicSafeFacts":[],"publicSafeNotes":[],"publicCommunitySignals":[],"publicCreativeMusicSignals":[],"publicRoleSignals":[],"publicLinkSignals":[],"reviewOnlyEvidence":[{"summary":"Crow was chatting when someone said contest rules are confusing."}],"queueOrSubmissionSignals":[],"relationshipOrContextSignals":[],"sourceSafetyWarnings":[],"privateOrInternalEvidence":[],"evidenceCounts":{"publicSafe":0,"reviewOnly":1,"privateOrInternal":0,"sourceBlind":0,"totalScanned":1}})
+        self.assertFalse(any(c["claimType"].startswith("contest_") for c in vague["reviewableClaims"]))
+        self.assertTrue(any("What contest or event is this referring to" in q for q in vague["missingInfoQuestions"]))
+
+        hellcat = build_subject_analyst_read("Crow", {"subjectName":"Crow","matchedAliasesUsedPrivately":[],"publicSafeFacts":[],"publicSafeNotes":[],"publicCommunitySignals":[],"publicCreativeMusicSignals":[],"publicRoleSignals":[],"publicLinkSignals":[],"reviewOnlyEvidence":[{"summary":"Hellcat hosted the Moon Jam contest on Discord and Crow shared the submission link."}],"queueOrSubmissionSignals":[],"relationshipOrContextSignals":[],"sourceSafetyWarnings":[],"privateOrInternalEvidence":[],"evidenceCounts":{"publicSafe":0,"reviewOnly":1,"privateOrInternal":0,"sourceBlind":0,"totalScanned":1}})
+        hclaim = next(c for c in hellcat["reviewableClaims"] if c["claimType"].startswith("contest_"))
+        self.assertEqual(hclaim["contestScope"]["host"], "Hellcat")
+        self.assertIn("Hellcat", hclaim["verificationPacketQuestion"])
+
+        other = build_subject_analyst_read("Crow", {"subjectName":"Crow","matchedAliasesUsedPrivately":[],"publicSafeFacts":[],"publicSafeNotes":[],"publicCommunitySignals":[],"publicCreativeMusicSignals":[],"publicRoleSignals":[],"publicLinkSignals":[],"reviewOnlyEvidence":[{"summary":"Raven hosted the Signal Battle competition on Twitch; Crow was mentioned nearby."}],"queueOrSubmissionSignals":[],"relationshipOrContextSignals":[],"sourceSafetyWarnings":[],"privateOrInternalEvidence":[],"evidenceCounts":{"publicSafe":0,"reviewOnly":1,"privateOrInternal":0,"sourceBlind":0,"totalScanned":1}})
+        oclaim = next(c for c in other["reviewableClaims"] if c["claimType"].startswith("contest_"))
+        self.assertEqual(oclaim["contestScope"]["host"], "Raven")
+        self.assertNotEqual(oclaim["contestScope"]["host"], "Hellcat")
+        self.assertNotIn("Crow-hosted", json.dumps(oclaim))
+
+    def test_rules_lore_theory_scoped_questions(self):
+        rules = _review_guidance("Crow", "Crow saw instructions for queue submitters", "rules_instructions_context", "needs_confirmation", False)
+        self.assertEqual(rules["displayTitle"], "Clarify rules/instructions context")
+        self.assertIn("who were they for", rules["verificationPacketQuestion"])
+        self.assertNotIn("rules/instructions poster", json.dumps(rules).lower())
+        lore = _review_guidance("Crow", "Orion lore context near Crow", "relationship", "needs_confirmation", False)
+        self.assertIn("Orion", lore["verificationPacketQuestion"])
+        unknown_lore = _review_guidance("Crow", "lore-heavy context only", "relationship", "needs_confirmation", False)
+        self.assertIn("BARCODE Network lore", unknown_lore["verificationPacketQuestion"])
+        theory = _review_guidance("Crow", "theory/anomaly-heavy context", "relationship", "needs_confirmation", False)
+        self.assertEqual(theory["displayTitle"], "Clarify theory/anomaly context")
+        self.assertIn("What theory or anomaly", theory["verificationPacketQuestion"])
+
     def test_admin_corrections_block_roles_reuse_facts_and_resolve_missing_info(self):
         packet = {
             "adminDecisions": [
                 {"type": "rejected weak label", "label": "moderator", "note": "Admin rejected moderator for Crow."},
                 {"type": "approved_public_fact", "text": "Crow is a BARCODE Network community member."},
-                {"type": "missing_info_answer", "question": "What was Crow’s relationship to this contest context?", "answer": "Crow was mentioned around a contest link, but was not the organizer."},
+                {"type": "missing_info_answer", "question": "What was Crow’s unclear contest/rules wording?", "answer": "Crow was mentioned around a contest link, but was not the organizer."},
             ]
         }
         analyst = build_subject_analyst_read("Crow", {
@@ -336,7 +363,7 @@ class SubjectMemoryResolverTests(unittest.TestCase):
             "evidenceCounts":{"publicSafe":0,"reviewOnly":2,"privateOrInternal":0,"sourceBlind":0,"totalScanned":2},
         }, packet)
         self.assertIn("Crow is a BARCODE Network community member.", analyst["publicReadyClaims"])
-        self.assertFalse(any("relationship to this contest context" in q for q in analyst["missingInfoQuestions"]))
+        self.assertFalse(any("unclear contest/rules wording" in q for q in analyst["missingInfoQuestions"]))
         blocked = [c for c in analyst["reviewableClaims"] if c.get("adminCorrectionApplied")]
         self.assertTrue(any(c.get("rejectedLabel") == "moderator" and c.get("recommendedAction") == "reject" for c in blocked))
         self.assertTrue(any(c.get("rejectedLabel") == "contest organizer" for c in blocked))
@@ -381,10 +408,10 @@ class DossierReadinessPacketTests(unittest.TestCase):
         self.assertLessEqual(len(questions), 7)
         joined = " ".join(q["question"] for q in questions)
         self.assertIn("Which links are Crow", joined)
-        self.assertIn("relationship to this contest", joined)
+        self.assertIn("contest or event is this referring", joined)
         self.assertIn("public role/title", joined)
         self.assertIn("Orion", joined)
-        self.assertIn("public lore/context for Crow, keep it internal, or ignore", joined)
+        self.assertIn("Crow's lore, BARCODE lore, Orion lore, Null TV lore, or a recurring topic", joined)
         self.assertNotIn("What public-safe source or owner-approved wording supports this claim", joined)
         self.assertIn("readyForDraft", analyst)
         self.assertIn("draftReadinessReason", analyst)
@@ -393,6 +420,6 @@ class DossierReadinessPacketTests(unittest.TestCase):
 
     def test_lore_heavy_card_uses_decision_copy_not_public_source(self):
         card = _review_guidance("Crow", "Crow lore-heavy context only", "relationship", "needs_confirmation", False)
-        self.assertEqual(card["displayTitle"], "Confirm lore/public context")
-        self.assertIn("public lore/context for Crow, keep it internal, or ignore", card["verificationPacketQuestion"])
+        self.assertEqual(card["displayTitle"], "Confirm Crow's lore use")
+        self.assertIn("Crow's lore", card["verificationPacketQuestion"])
         self.assertNotIn("public-safe source", card["verificationPacketQuestion"].lower())
