@@ -66,16 +66,16 @@ class SubjectMemoryResolverTests(unittest.TestCase):
             "queue": _review_guidance("Crow", "Crow queue submission history needs confirmation", "queue_submission", "admin", False),
         }
         self.assertEqual(cases["link"]["displayTitle"], "Confirm approved public links")
-        self.assertEqual(cases["contest"]["displayTitle"], "Confirm contest relationship")
-        self.assertEqual(cases["ai"]["displayTitle"], "Confirm project relationship")
+        self.assertEqual(cases["contest"]["displayTitle"], "Needs clarification before review")
+        self.assertEqual(cases["ai"]["displayTitle"], "Needs clarification before review")
         self.assertEqual(cases["role"]["displayTitle"], "Confirm public role")
         self.assertEqual(cases["orion"]["displayTitle"], "Confirm Orion/context use")
         self.assertEqual(cases["queue"]["displayTitle"], "Confirm queue/submission history")
         summaries = {name: item["displayEvidenceSummary"] for name, item in cases.items()}
         safe_defaults = {name: item["displaySafeDefault"] for name, item in cases.items()}
         questions = {name: item["verificationPacketQuestion"] for name, item in cases.items()}
-        self.assertEqual(len(set(summaries.values())), len(summaries))
-        self.assertEqual(len(set(safe_defaults.values())), len(safe_defaults))
+        self.assertGreaterEqual(len(set(summaries.values())), 5)
+        self.assertGreaterEqual(len(set(safe_defaults.values())), 5)
         self.assertIn("Which Crow links, music links, or social links", questions["link"])
         self.assertIn("What contest or event is this referring", questions["contest"])
         self.assertIn("AI/persona/project connection", questions["ai"])
@@ -345,7 +345,7 @@ class SubjectMemoryResolverTests(unittest.TestCase):
         unknown_lore = _review_guidance("Crow", "lore-heavy context only", "relationship", "needs_confirmation", False)
         self.assertIn("BARCODE Network lore", unknown_lore["verificationPacketQuestion"])
         theory = _review_guidance("Crow", "theory/anomaly-heavy context", "relationship", "needs_confirmation", False)
-        self.assertEqual(theory["displayTitle"], "Clarify theory/anomaly context")
+        self.assertEqual(theory["displayTitle"], "Needs clarification before review")
         self.assertIn("What theory or anomaly", theory["verificationPacketQuestion"])
 
     def test_admin_corrections_block_roles_reuse_facts_and_resolve_missing_info(self):
@@ -427,11 +427,11 @@ class DossierReadinessPacketTests(unittest.TestCase):
     def test_scoped_follow_up_populates_current_and_legacy_fields(self):
         generic = "What proof or approved wording should BNL use before saying this publicly?"
         cases = [
-            ("ai", _review_guidance("Crow", "Crow appears near AI persona project context", "relationship", "needs_confirmation", False), "AI/persona/project connection", "plain-language explanation of the interaction"),
-            ("lore", _review_guidance("Crow", "lore-heavy context only", "relationship", "needs_confirmation", False), "BARCODE Network lore", "classification of the lore/context"),
-            ("theory", _review_guidance("Crow", "unknown theory anomaly near Crow", "relationship", "needs_confirmation", False), "What theory or anomaly", "scope of the theory/anomaly"),
-            ("rules", _review_guidance("Crow", "unclear rules and instructions near Crow", "rules_instructions_context", "needs_confirmation", False), "What rules or instructions", "what the instructions were"),
-            ("contest", _review_guidance("Crow", "Crow appeared near contest rules", "contest_rules_poster", "needs_confirmation", False), "What contest or event", "contest/event name plus subject role"),
+            ("ai", _review_guidance("Crow", "Crow appears near AI persona project context", "relationship", "needs_confirmation", False), "AI/persona/project connection", "clarification of the AI/persona/project"),
+            ("lore", _review_guidance("Crow", "lore-heavy context only", "relationship", "needs_confirmation", False), "BARCODE Network lore", "clarification of the lore/context"),
+            ("theory", _review_guidance("Crow", "unknown theory anomaly near Crow", "relationship", "needs_confirmation", False), "What theory or anomaly", "clarification of the theory/anomaly"),
+            ("rules", _review_guidance("Crow", "unclear rules and instructions near Crow", "rules_instructions_context", "needs_confirmation", False), "What rules or instructions", "clarification of the instruction source"),
+            ("contest", _review_guidance("Crow", "Crow appeared near contest rules", "contest_rules_poster", "needs_confirmation", False), "What contest or event", "clarification of the contest/event"),
         ]
         for _name, card, expected, answer_type in cases:
             question = card["recommendedFollowUpQuestion"]
@@ -450,6 +450,14 @@ class DossierReadinessPacketTests(unittest.TestCase):
         self.assertEqual(blind["suggestedConfirmationQuestion"], "Can an owner/admin provide public-safe replacement wording for this context, or should BNL keep it internal?")
         self.assertIn("public-safe replacement wording", blind["suggestedConfirmationAnswerType"])
         self.assertNotIn("secret room", blind["suggestedConfirmationQuestion"].lower())
+
+        for _name, card, _expected, _answer_type in cases:
+            self.assertEqual(card["decisionState"], "needs_clarification")
+            self.assertFalse(card["publicSafe"])
+            self.assertFalse(card["hasSafePublicSuggestion"])
+            self.assertEqual(card["primaryActionLabel"], "Add clarification question")
+            self.assertNotIn("Confirm exact public-safe wording before use", json.dumps(card))
+            self.assertNotIn("approve_public", json.dumps(card))
 
         fallback = _review_guidance("Crow", "unclassified possible claim", "missing_confirmation", "needs_confirmation", False)
         self.assertEqual(fallback["suggestedMissingInfoQuestion"], generic)

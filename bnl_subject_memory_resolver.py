@@ -327,7 +327,7 @@ def _universal_follow_up_for_claim(subject: str, claim_text: str, claim_type: st
             scope_label = obj; scope_known = True; confidence = "medium"
         else:
             question = "What AI/persona/project connection is this referring to? What AI, persona, project, character, bot, or universe is this referring to, and what was the subject’s actual connection to it? Should BNL mention it publicly, keep it internal, or ignore it?"
-        answer_type = "plain-language explanation of the interaction, AI/persona/project object, public/internal/ignore decision, and exact approved wording if public"
+        answer_type = "clarification of the AI/persona/project object, interaction, and subject role" if not obj else "plain-language explanation of the interaction, AI/persona/project object, public/internal/ignore decision, and exact approved wording if public"
         reason = "BNL found AI/persona/project wording but must not infer the object, interaction, or public permission from nearby context."
     elif category == "role_title":
         question = f"What exact public role or title may BNL use for {subject}, if any? Should BNL avoid giving {subject} a public role/title for now?"
@@ -355,15 +355,15 @@ def _universal_follow_up_for_claim(subject: str, claim_text: str, claim_type: st
         reason = "BNL must not turn queue/submission context into public dossier wording without admin/owner approval."
     elif category == "contest_event":
         question = f"What contest or event is this referring to? BNL found {scope_label or 'contest/event'} context near {subject}. Was {subject} a participant, submitter, link source, rules source, organizer, host, or just mentioned nearby? Should BNL mention it publicly, keep it internal, or ignore it?"
-        answer_type = "contest/event name plus subject role and public/internal/ignore decision"
+        answer_type = "clarification of the contest/event object, subject role, and whether it belongs in the dossier" if not scope_known else "contest/event name plus subject role and public/internal/ignore decision"
         reason = "BNL cannot infer contest/event role, host, organizer, or participation from proximity."
     elif category == "rules_instructions":
         question = f"What rules or instructions is this referring to, who were they for, and what was {subject}'s actual role with them? Should BNL mention this publicly, keep it internal, or ignore it?"
-        answer_type = "what the instructions were, who they were for, subject role, and public/internal/ignore decision"
+        answer_type = "clarification of the instruction source, audience, purpose, and subject role" if not scope_known else "what the instructions were, who they were for, subject role, and public/internal/ignore decision"
         reason = "BNL needs the instruction source, audience, purpose, and subject role before treating rules/instructions as dossier context."
     elif category == "theory_anomaly":
         question = f"What theory or anomaly is this referring to, and is it about {subject}, BARCODE lore, Orion, a recurring topic, a technical issue, or something unrelated? Should BNL use it publicly, keep it internal, or ignore it?"
-        answer_type = "scope of the theory/anomaly plus public/internal/ignore decision"
+        answer_type = "clarification of the theory/anomaly scope and whether it belongs in the dossier" if not scope_known else "scope of the theory/anomaly plus public/internal/ignore decision"
         reason = "BNL needs the theory/anomaly scope before deciding whether it belongs in a public dossier."
     elif category == "orion_context":
         question = f"Can BNL mention Orion in public {subject} context, or should Orion stay internal? If public, what exact wording is approved?"
@@ -371,7 +371,7 @@ def _universal_follow_up_for_claim(subject: str, claim_text: str, claim_type: st
         reason = "BNL needs an explicit public/internal boundary for Orion/context references."
     elif category == "lore_context":
         question = f"Is this {subject}'s own lore, BARCODE Network lore, Orion lore, Null TV lore, broadcast lore, recurring community context, or something else? Should BNL mention {subject}'s lore publicly, keep it internal, or ignore it?"
-        answer_type = "classification of the lore/context plus public/internal/ignore decision"
+        answer_type = "clarification of the lore/context scope and whether it belongs in the dossier" if not scope_known else "classification of the lore/context plus public/internal/ignore decision"
         reason = "BNL needs to classify lore/context before it can decide whether it belongs in the subject's public dossier."
     elif category == "public_summary":
         question = f"What short public summary is approved for {subject}, and what should BNL avoid inferring beyond that wording?"
@@ -379,7 +379,7 @@ def _universal_follow_up_for_claim(subject: str, claim_text: str, claim_type: st
         reason = "BNL needs owner/admin-approved summary direction and must not infer unsupported public copy."
     elif category == "unknown_context":
         question = "What is this item referring to, and should BNL use it publicly, keep it internal, or ignore it?"
-        answer_type = "plain-language context clarification and public/internal/ignore decision"
+        answer_type = "clarification of what this item refers to and whether it belongs in the dossier"
         reason = "BNL can tell the item is unclear context, so it needs classification before asking for proof or public wording."
         scope_label = "unclear context"; scope_known = False
     elif category == "admin_action":
@@ -390,13 +390,86 @@ def _universal_follow_up_for_claim(subject: str, claim_text: str, claim_type: st
         fallback = True
         not_enough = "BNL could not identify whether this is a role, link, lore, contest, relationship, queue, identity, AI/persona/project, source-blind, or public-boundary issue, so it needs proof or approved wording before using it publicly."
         question = GENERIC_FOLLOW_UP_FALLBACK
-        answer_type = "proof, correction, or approved public-safe wording"
+        answer_type = "clarification of what this item refers to and whether it belongs in the dossier"
         reason = not_enough
         scope_label = ""; scope_known = False; confidence = "low"
     return {
         "question": question, "audience": audience, "reason": reason, "answerType": answer_type,
         "confidence": confidence, "scopeKnown": bool(scope_known), "scopeLabel": scope_label,
         "category": category, "fallbackUsed": fallback, "notEnoughContextReason": not_enough,
+    }
+
+
+def _is_clarification_follow_up(follow_up: dict[str, Any] | None, actionability: str = "") -> bool:
+    if not follow_up:
+        return False
+    if follow_up.get("category") == "source_blind" or actionability == "source_blind_warning":
+        return False
+    question = str(follow_up.get("question") or "").lower()
+    answer_type = str(follow_up.get("answerType") or "").lower()
+    asks_scope = bool(re.search(r"\b(what|which|who|is this about|referring to|belongs? in|actual role|what .* role|scope)\b", question, re.I))
+    return (not bool(follow_up.get("scopeKnown"))) and ("clarification" in answer_type or asks_scope or bool(follow_up.get("fallbackUsed")))
+
+def _clarification_copy(subject: str, follow_up: dict[str, Any], fallback_question: str = "") -> dict[str, Any]:
+    question = str(follow_up.get("question") or fallback_question or "What is this item referring to?")
+    category = str(follow_up.get("category") or "")
+    reason = str(follow_up.get("reason") or follow_up.get("notEnoughContextReason") or "BNL cannot decide whether this belongs in the dossier until the missing context is provided.")
+    answer_type = str(follow_up.get("answerType") or "clarification of the item scope and whether it belongs in the dossier")
+    if "clarification" not in answer_type.lower():
+        if category == "rules_instructions":
+            answer_type = "clarification of the instruction source, audience, purpose, and subject role"
+            reason = "BNL cannot decide whether this belongs in the dossier until it knows what instructions are being referenced."
+        elif category == "theory_anomaly":
+            answer_type = "clarification of the theory/anomaly scope and whether it belongs in the dossier"
+            reason = "BNL cannot decide whether this is public, internal, or irrelevant until the theory/anomaly is identified."
+        elif category == "lore_context":
+            answer_type = "clarification of the lore/context scope and whether it belongs in the dossier"
+        elif category == "ai_persona_project":
+            answer_type = "clarification of the AI/persona/project object, interaction, and subject role"
+        elif category == "contest_event":
+            answer_type = "clarification of the contest/event object, subject role, and whether it belongs in the dossier"
+        else:
+            answer_type = "clarification of what this item refers to and whether it belongs in the dossier"
+    return {
+        "decisionState": "needs_clarification",
+        "actionability": "needs_clarification",
+        "suggestedDecision": "needs_clarification",
+        "publicSafe": False,
+        "hasSafePublicSuggestion": False,
+        "suggestedPublicWording": "",
+        "recommendedAction": "needs_clarification",
+        "recommendedActionReason": "BNL must clarify the item scope before any public/internal/reject Source File decision.",
+        "cannotSuggestPublicReason": "BNL does not know what this item refers to yet.",
+        "displayTitle": "Needs clarification before review",
+        "displayDecision": "What is this item referring to?",
+        "displayWhatIsBeingChecked": "You are not approving this as a fact yet. BNL needs the missing context before this can become a Source File decision.",
+        "displayWhyItExists": "BNL found a possible signal, but it does not know enough about the source, subject role, audience, or context to make a public/internal/reject decision.",
+        "displayWhyBNLFlaggedIt": "BNL found a possible signal, but it does not know enough about the source, subject role, audience, or context to make a public/internal/reject decision.",
+        "displayBNLRecommendation": "Ask for clarification or dismiss it as unusable. Do not approve public wording yet.",
+        "displayEvidenceSummary": "Possible signal only; the referenced source, subject role, audience, or context is not clear enough to review as a fact.",
+        "displaySafetyDefault": "Do not use this in public wording until the missing context is clear.",
+        "displaySafeDefault": "Do not use this in public wording until the missing context is clear.",
+        "displayApprovalInstruction": "Do not approve public wording from this card. First clarify what this refers to.",
+        "confirmationTarget": "admin",
+        "primaryActionLabel": "Add clarification question",
+        "secondaryActionLabels": ["Keep as internal note", "Reject / not useful"],
+        "verificationPacketQuestion": question,
+        "verificationPacketQuestions": [question],
+        "verificationPacketAudience": str(follow_up.get("audience") or "admin"),
+        "recommendedFollowUpQuestion": question,
+        "recommendedFollowUpAudience": str(follow_up.get("audience") or "admin"),
+        "recommendedFollowUpReason": reason,
+        "bestGuessConfidence": str(follow_up.get("confidence") or "low"),
+        "suggestedConfirmationQuestion": question,
+        "suggestedConfirmationAudience": str(follow_up.get("audience") or "admin"),
+        "suggestedConfirmationReason": reason,
+        "suggestedConfirmationAnswerType": answer_type,
+        "suggestedMissingInfoQuestion": question,
+        "followUpCategory": category,
+        "fallbackUsed": bool(follow_up.get("fallbackUsed")),
+        "notEnoughContextReason": str(follow_up.get("notEnoughContextReason") or reason),
+        "followUpScopeKnown": False,
+        "followUpScopeLabel": str(follow_up.get("scopeLabel") or ""),
     }
 
 def _scoped_follow_up_for_claim(subject: str, claim_text: str, claim_type: str, lane: str, actionability: str, scope: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -1032,6 +1105,8 @@ def _review_display_copy(subject: str, claim_text: str, claim_type: str, lane: s
             question = str(follow_up.get("question") or question)
             audience = str(follow_up.get("audience") or audience)
             why = str(follow_up.get("reason") or why)
+    if _is_clarification_follow_up(follow_up, actionability):
+        return {k: _display_clean(v) if isinstance(v, str) else v for k, v in _clarification_copy(subject, follow_up, question).items()}
     answer_type = str((follow_up or {}).get("answerType") or "plain-language approval, correction, or public-safe wording")
     confidence = str((follow_up or {}).get("confidence") or ("medium" if public_safe else ("low" if actionability in {"source_blind_warning", "weak_label"} else "medium")))
     return {k: _display_clean(v) if isinstance(v, str) else v for k, v in {
@@ -1121,8 +1196,13 @@ def _readiness_question_for_section(subject: str, section: str) -> tuple[str, st
 
 def _build_dossier_readiness(subject: str, reviewable_claims: list[dict[str, Any]], missing: list[dict[str, Any]], blind_insights: list[str]) -> dict[str, Any]:
     buckets: dict[tuple[str, str], dict[str, Any]] = {}
-    def add(section: str, claim_id: str = "") -> None:
+    def add(section: str, claim_id: str = "", clarification_question: str = "") -> None:
         audience, question, why, priority, safety = _readiness_question_for_section(subject, section)
+        if clarification_question:
+            question = clarification_question
+            why = "Clarification needed before BNL can draft this part of the dossier."
+            safety = "needs_clarification"
+            priority = "high"
         key = (section, audience)
         item = buckets.setdefault(key, {"audience": audience, "question": question, "whyItMatters": why, "dossierSection": section, "priority": priority, "relatedReviewClaimIds": [], "sourceSafety": safety})
         if claim_id and claim_id not in item["relatedReviewClaimIds"]:
@@ -1133,7 +1213,10 @@ def _build_dossier_readiness(subject: str, reviewable_claims: list[dict[str, Any
         section = _dossier_section_for_claim_type(str(c.get("claimType") or ""), " ".join(str(c.get(k) or "") for k in ("claimText", "displayTitle", "displayDecision")))
         if c.get("reviewLane") == "source_blind" and section == "unknown":
             continue
-        add(section, f"reviewableClaims[{idx}]")
+        clar_q = ""
+        if c.get("decisionState") == "needs_clarification":
+            clar_q = str(c.get("recommendedFollowUpQuestion") or c.get("verificationPacketQuestion") or "Clarification needed before BNL can draft this part of the dossier")
+        add(section, f"reviewableClaims[{idx}]", clar_q)
     for txt in blind_insights:
         if "orion" in txt.lower() or "relay" in txt.lower():
             add("orion")
@@ -1299,6 +1382,8 @@ def _review_guidance(subject: str, claim_text: str, claim_type: str, lane: str, 
         return guidance
     if actionability == "source_blind_warning":
         guidance.update({
+            "decisionState": "source_blind_blocked",
+            "hasSafePublicSuggestion": False,
             "recommendedAction": "needs_public_source",
             "suggestedInternalNote": f"BNL found source-blind context for {subject}. Keep this internal until a public source or owner-approved wording is provided.",
             "suggestedMissingInfoQuestion": "Can an owner/admin provide public-safe replacement wording for this context, or should BNL keep it internal?",
@@ -1361,6 +1446,8 @@ def _make_reviewable_claim(subject: str, claim_text: str, claim_type: str, lane:
         "suggestedDecision": "confirm_public" if public_safe else ("keep_boundary" if lane in {"source_blind", "private_internal_withheld"} else "needs_more_info"),
         "why": _text(why, 220),
         "publicSafe": bool(public_safe),
+        "hasSafePublicSuggestion": bool(public_safe),
+        "decisionState": "decidable" if public_safe else ("source_blind_blocked" if lane == "source_blind" else "decidable"),
         "confidence": confidence,
         "safeEvidenceSummary": _text(evidence or why, 240),
         "blockedBy": blocked or ([] if public_safe else ["missing owner/admin confirmation", "missing public-safe provenance"]),
@@ -1613,6 +1700,8 @@ def build_subject_analyst_read(subject_name: str, resolved_memory: dict[str, Any
         if line not in review_claims:
             review_claims.append(line)
             claim = _make_reviewable_claim(subject, line, ctype, "needs_confirmation", f"Review-only subject memory mentions {ctype.replace('_', ' ')} context.", False, "low", humanize_internal_label(_safe_evidence_example(txt, subject)))
+            if claim.get("decisionState") == "needs_clarification" and not re.search(r"\b(what|which|who|referring to|about)\b", str(claim.get("recommendedFollowUpQuestion") or ""), re.I):
+                continue
             if conflict_corr:
                 claim.update(_admin_conflict_fields(subject, txt, conflict_corr))
             if ctype.startswith("contest_"):
