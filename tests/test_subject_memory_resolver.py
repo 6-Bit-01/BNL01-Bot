@@ -128,7 +128,7 @@ class SubjectMemoryResolverTests(unittest.TestCase):
             "queue": _review_guidance("Crow", "Crow queue submission history needs confirmation", "queue_submission", "admin", False),
         }
         self.assertEqual(cases["link"]["displayTitle"], "Confirm approved public links")
-        self.assertEqual(cases["contest"]["displayTitle"], "Clarify contest/event activity")
+        self.assertEqual(cases["contest"]["displayTitle"], "Clarify Crow's possible contest/event connection")
         self.assertEqual(cases["ai"]["displayTitle"], "Needs clarification before review")
         self.assertEqual(cases["role"]["displayTitle"], "Confirm public role")
         self.assertEqual(cases["orion"]["displayTitle"], "Confirm Orion/context use")
@@ -475,8 +475,8 @@ class RoleVsActivitySemanticsTests(unittest.TestCase):
     def test_activity_only_role_card_uses_not_confirmed_copy(self):
         card = _review_guidance("Crow", "contest/event activity near Crow", "role", "needs_confirmation", False)
         self.assertEqual("contest_event_activity", card["dossierDimension"])
-        self.assertEqual("Clarify contest/event activity", card["displayTitle"])
-        self.assertEqual("Was Crow involved in this contest or event?", card["displayDecision"])
+        self.assertEqual("Clarify Crow's possible contest/event connection", card["displayTitle"])
+        self.assertEqual("Was Crow involved in this contest or event, or was he only mentioned nearby?", card["displayDecision"])
         blob = json.dumps(card).lower()
         self.assertNotIn("public role: contest/event activity", blob)
         self.assertIn("not a general role/title", blob)
@@ -503,13 +503,13 @@ class RoleVsActivitySemanticsTests(unittest.TestCase):
         contest = _make_reviewable_claim("Crow", "contest/event activity near Crow", "role", "needs_confirmation", "activity", False, "low", "contest/event activity")
         self.assertEqual("contest_event_activity", contest["dossierDimension"])
         self.assertNotEqual("public_role_title", contest["dossierDimension"])
-        self.assertEqual("Was Crow involved in this contest or event?", contest["displayDecision"])
+        self.assertEqual("Was Crow involved in this contest or event, or was he only mentioned nearby?", contest["displayDecision"])
         self.assertFalse(contest.get("suggestedPublicWording"))
 
         show = _make_reviewable_claim("Crow", "show operations", "role", "needs_confirmation", "show ops", False, "low", "show operations")
         self.assertEqual("show_operations", show["dossierDimension"])
         self.assertEqual("confirm_yes_no", show["cardIntent"])
-        self.assertEqual("Is Crow involved in show operations?", show["displayDecision"])
+        self.assertEqual("Is Crow involved in show operations? If yes, what does he help with, and can BNL mention it publicly?", show["displayDecision"])
         self.assertEqual(["confirm_show_operations", "not_involved", "keep_internal", "ask_follow_up", "reject"], [a["action"] for a in show["allowedReviewActions"]])
         self.assertFalse(show.get("suggestedPublicWording"))
 
@@ -553,6 +553,37 @@ class RoleVsActivitySemanticsTests(unittest.TestCase):
         self.assertNotEqual("public_role_title", link["dossierDimension"])
         self.assertNotEqual("public_role_title", ident["dossierDimension"])
         self.assertEqual("public_role_title", role["dossierDimension"])
+
+    def test_evidence_grounded_card_composer_replaces_template_notes(self):
+        contest = _make_reviewable_claim("Crow", "contest/event activity near Crow", "role", "needs_confirmation", "activity", False, "low", "contest/music/link context near Crow")
+        self.assertNotEqual("BNL found contest event activity for Crow; keep internal until reviewed.", contest["suggestedInternalNote"])
+        self.assertIn("available context does not confirm", contest["suggestedInternalNote"])
+        self.assertIn("participated", contest["suggestedInternalNote"])
+        self.assertNotIn(contest["displayTopic"], {"contest/event activity", "contests/events"})
+        self.assertFalse(contest.get("suggestedPublicWording"))
+        self.assertIn(contest["specificityLevel"], {"specific", "partially_specific"})
+        self.assertEqual("contest_event_activity", contest["dossierDimension"])
+        self.assertEqual("classify_context", contest["cardIntent"])
+
+        show = _make_reviewable_claim("Crow", "show operations", "role", "needs_confirmation", "show ops", False, "low", "show operations context near Crow")
+        self.assertNotEqual("BNL found show operations for Crow; keep internal until reviewed.", show["suggestedInternalNote"])
+        self.assertIn("actually helps with show operations", show["suggestedInternalNote"])
+        self.assertEqual("Crow's possible show-operations involvement", show["displayTopic"])
+
+        collab = _make_reviewable_claim("Crow", "Crow wants to collaborate on a song", "relationship", "needs_confirmation", "collab", False, "low", "collaboration interest around a song")
+        self.assertIn("distinguish interest in collaborating from an actual approved collaboration", collab["suggestedInternalNote"])
+
+        protected = _make_reviewable_claim("Crow", "source-blind private Orion detail", "relationship", "source_blind", "protected", False, "low", "SECRET PRIVATE SOURCE-BLIND DETAIL")
+        self.assertIn("Protected context exists for Crow", protected["suggestedInternalNote"])
+        self.assertEqual("Protected Crow context that needs public-safe wording", protected["displayTopic"])
+        self.assertNotIn("SECRET", json.dumps(protected))
+
+    def test_raw_label_only_card_is_clarification_not_normal_review(self):
+        card = _make_reviewable_claim("Crow", "contest/event activity", "role", "needs_confirmation", "activity", False, "low", "contest/event activity")
+        self.assertEqual("generic", card["specificityLevel"])
+        self.assertEqual("needs_clarification", card["decisionState"])
+        self.assertEqual("needs_more_info", card["recommendedAction"])
+        self.assertNotEqual("contest/event activity", card["evidenceSummary"])
 
 
 if __name__ == '__main__':
