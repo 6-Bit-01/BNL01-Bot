@@ -153,13 +153,16 @@ class SubjectMemoryResolverTests(unittest.TestCase):
         contest = _make_reviewable_claim("Crow", "Crow appeared near contest rules and a public link", "contest_rules_poster", "needs_confirmation", "contest", False, "low", "Crow appeared near contest rules and a public link")
         show = _make_reviewable_claim("Crow", "Crow appeared near show-operations planning", "role", "needs_confirmation", "show", False, "low", "Crow appeared near show-operations planning")
         collab = _make_reviewable_claim("Crow", "Crow is interested in collaborating on a song", "relationship", "needs_confirmation", "collab", False, "low", "Crow is interested in collaborating on a song")
-        for card, phrase in ((contest, "contest/rules/link context"), (show, "show-operations wording"), (collab, "collaboration-interest wording")):
+        for card, phrase in ((contest, "Crow appeared near contest rules"), (show, "Crow appeared near show-operations planning"), (collab, "Crow is interested in collaborating on a song")):
             blob = json.dumps(card)
             self.assertNotIn("Confirm public role", blob)
             self.assertNotIn("Clarify role/title context", blob)
             self.assertNotIn("What public role/title may BNL use", blob)
             anchor = card.get("evidenceAnchor") or card.get("reviewContext", {}).get("evidenceAnchor", {})
             self.assertIn(phrase, anchor["safeAnchorText"])
+            self.assertIn(phrase, card["evidenceSummary"])
+            self.assertIn(phrase, card["displayWhyItExists"])
+            self.assertTrue(card["reviewContext"]["adminSafeEvidenceDetails"])
             self.assertIn(card.get("answerability") or card.get("reviewContext", {}).get("answerability"), {"partially_answerable", "answerable"})
             self.assertNotIn("BNL found a Source File signal that may matter", blob)
             self.assertNotIn("BNL found dossier-relevant context", blob)
@@ -175,6 +178,33 @@ class SubjectMemoryResolverTests(unittest.TestCase):
         self.assertTrue(ctx["existingInternalNotes"])
         self.assertIn("Which contest was this?", ctx["dossierReadinessNeeds"])
 
+
+
+    def test_label_only_context_cards_do_not_get_evidence_anchors(self):
+        for text, claim_type in (
+            ("contest/event activity", "role"),
+            ("show operations", "role"),
+            ("collaboration", "relationship"),
+        ):
+            card = _make_reviewable_claim("Crow", text, claim_type, "needs_confirmation", text, False, "low", text)
+            self.assertFalse(card["evidenceAnchor"]["hasAnchor"], text)
+            self.assertEqual("internal_audit", card["decisionState"], text)
+            self.assertNotIn("approve_public_wording", {a["action"] for a in card["allowedReviewActions"]}, text)
+
+    def test_admin_safe_not_public_safe_details_stay_admin_only(self):
+        card = _make_reviewable_claim("Crow", "Crow shared the Moon Jam rules link in Discord", "contest_rules_poster", "needs_confirmation", "review only", False, "low", "Crow shared the Moon Jam rules link in Discord")
+        self.assertIn("Moon Jam rules link", card["evidenceSummary"])
+        self.assertTrue(card["reviewContext"]["adminSafeEvidenceDetails"])
+        self.assertFalse(card["reviewContext"]["publicSafeEvidenceDetails"])
+        self.assertEqual("", card.get("suggestedPublicWording", ""))
+
+    def test_source_blind_details_are_withheld_placeholders_only(self):
+        card = _make_reviewable_claim("Crow", "source-blind private Discord ID 123456789 Crow won Secret Jam", "relationship", "source_blind", "protected", False, "low", "source-blind private Discord ID 123456789 Crow won Secret Jam")
+        blob = json.dumps(card)
+        self.assertIn("Protected source-blind detail exists", blob)
+        self.assertNotIn("123456789", blob)
+        self.assertNotIn("Secret Jam", blob)
+        self.assertEqual("source_protected", card["reviewContext"]["sourceSafety"])
 
     def test_public_safe_anchored_claims_and_generic_dimensions_keep_approval_actions(self):
         contest = _make_reviewable_claim("Crow", "Crow publicly submitted to the Moon Jam contest", "contest_submitter", "public_home", "public contest submission", True, "high", "Crow publicly submitted to the Moon Jam contest")
@@ -479,7 +509,7 @@ class SubjectMemoryResolverTests(unittest.TestCase):
         claim = next(c for c in analyst["reviewableClaims"] if c.get("dossierDimension") == "contest_event_activity")
         self.assertNotIn("organizer", claim["claimType"])
         self.assertEqual(claim["recommendedAction"], "needs_more_info")
-        self.assertIn("contest/rules/link context", claim["evidenceAnchor"]["safeAnchorText"])
+        self.assertIn("Crow Suno contest name/rules/channel/dates/public link", claim["evidenceAnchor"]["safeAnchorText"])
         self.assertIn("official public dossier", str(claim))
         self.assertNotIn("official_public_dossier", str(claim))
         self.assertNotIn("public_music_role", str(claim))
@@ -593,7 +623,7 @@ class RoleVsActivitySemanticsTests(unittest.TestCase):
         card = _review_guidance("Crow", "contest/event activity near Crow", "role", "needs_confirmation", False)
         self.assertEqual("contest_event_activity", card["dossierDimension"])
         self.assertEqual("Clarify Crow's possible contest/event connection", card["displayTitle"])
-        self.assertEqual("Was Crow involved in this contest or event, or was he only mentioned nearby?", card["displayDecision"])
+        self.assertEqual("Internal audit only — BNL needs a concrete safe evidence anchor before review.", card["displayDecision"])
         blob = json.dumps(card).lower()
         self.assertNotIn("public role: contest/event activity", blob)
         self.assertIn("not a general role/title", blob)
@@ -674,8 +704,8 @@ class RoleVsActivitySemanticsTests(unittest.TestCase):
     def test_evidence_grounded_card_composer_replaces_template_notes(self):
         contest = _make_reviewable_claim("Crow", "contest/event activity near Crow", "role", "needs_confirmation", "activity", False, "low", "contest/music/link context near Crow")
         self.assertNotEqual("BNL found contest event activity for Crow; keep internal until reviewed.", contest["suggestedInternalNote"])
-        self.assertIn("available context does not confirm", contest["suggestedInternalNote"])
-        self.assertIn("participated", contest["suggestedInternalNote"])
+        self.assertIn("contest/rules/link details", contest["suggestedInternalNote"])
+        self.assertIn("participant", contest["suggestedInternalNote"])
         self.assertNotIn(contest["displayTopic"], {"contest/event activity", "contests/events"})
         self.assertFalse(contest.get("suggestedPublicWording"))
         self.assertIn(contest["specificityLevel"], {"specific", "partially_specific"})
@@ -684,11 +714,11 @@ class RoleVsActivitySemanticsTests(unittest.TestCase):
 
         show = _make_reviewable_claim("Crow", "show operations", "role", "needs_confirmation", "show ops", False, "low", "show operations context near Crow")
         self.assertNotEqual("BNL found show operations for Crow; keep internal until reviewed.", show["suggestedInternalNote"])
-        self.assertIn("actually helps with show operations", show["suggestedInternalNote"])
+        self.assertIn("actually helps with operations", show["suggestedInternalNote"])
         self.assertEqual("Crow's possible show-operations involvement", show["displayTopic"])
 
         collab = _make_reviewable_claim("Crow", "Crow wants to collaborate on a song", "relationship", "needs_confirmation", "collab", False, "low", "collaboration interest around a song")
-        self.assertIn("distinguish interest in collaborating from an actual approved collaboration", collab["suggestedInternalNote"])
+        self.assertIn("distinguish interest only, planning, actual collaboration", collab["suggestedInternalNote"])
 
         protected = _make_reviewable_claim("Crow", "source-blind private Orion detail", "relationship", "source_blind", "protected", False, "low", "SECRET PRIVATE SOURCE-BLIND DETAIL")
         self.assertIn("Protected context exists for Crow", protected["suggestedInternalNote"])
