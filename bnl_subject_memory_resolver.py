@@ -232,51 +232,175 @@ def _ai_persona_project_scope_for_text(subject: str, text: str) -> dict[str, Any
     })
     return scope
 
-def _scoped_follow_up_for_claim(subject: str, claim_text: str, claim_type: str, lane: str, actionability: str, scope: dict[str, Any] | None = None) -> dict[str, Any]:
-    low = (claim_text or "").lower()
-    source_blind = actionability == "source_blind_warning" or lane == "source_blind" or bool(re.search(r"\b(source[-_\s]*blind|private|withheld|internal[-\s]*only)\b", low))
-    if source_blind:
-        return {"question": "Can an owner/admin provide public-safe replacement wording for this context, or should BNL keep it internal?", "audience": "public_source", "reason": "BNL cannot expose or rely on source-blind/private context in public copy without public-safe replacement wording.", "answerType": "public-safe replacement wording or confirmation to keep internal", "confidence": "low", "scopeLabel": "source-blind/private context", "scopeKnown": False}
+GENERIC_FOLLOW_UP_FALLBACK = "What proof or approved wording should BNL use before saying this publicly?"
 
-    if claim_type.startswith("contest_") or re.search(r"\b(contest|challenge|tournament|battle|competition)\b", low):
-        s = scope or _contest_scope_for_text(subject, claim_text)
-        known = bool(s.get("scopeKnown"))
-        question = (f"BNL found {s.get('scopeLabel') or 'contest/event'} context near {subject}. Was {subject} a participant, submitter, link source, rules source, organizer, host, or just mentioned nearby?"
-                    if known else f"What contest or event is this referring to, and was {subject} actually involved?")
-        return {"question": question, "audience": "admin", "reason": "BNL cannot infer contest role from nearby contest wording.", "answerType": "contest/event name plus subject role", "confidence": s.get("confidence") or "low", "scopeLabel": s.get("scopeLabel") or "", "scopeKnown": known}
-    if claim_type == "rules_instructions_context" or re.search(r"\b(rules?|instructions?|guidelines?)\b", low):
-        s = scope or _rules_instructions_scope_for_text(subject, claim_text)
-        known = bool(s.get("scopeKnown"))
-        question = (f"BNL found {s.get('scopeLabel')} near {subject}. What rules or instructions is this referring to, who were they for, and was {subject} the person posting them, following them, being mentioned near them, or unrelated?"
-                    if known else f"What rules or instructions is this referring to, who were they for, and what was {subject}'s actual role with them?")
-        return {"question": question, "audience": "admin", "reason": "BNL needs the instruction source, audience, purpose, and subject role before treating it as a dossier fact.", "answerType": "what the instructions were, who they were for, and subject role", "confidence": s.get("confidence") or "low", "scopeLabel": s.get("scopeLabel") or "", "scopeKnown": known}
-    if re.search(r"\b(theory|theories|anomal(?:y|ies)|glitch|technical issue)\b", low):
-        s = scope or _theory_anomaly_scope_for_text(subject, claim_text)
-        known = bool(s.get("scopeKnown"))
-        question = (f"Should BNL include this {s.get('scopeLabel')} in {subject}'s public dossier, keep it internal, or ignore it?"
-                    if known else f"What theory or anomaly is this referring to, and is it about {subject}, BARCODE lore, Orion, a recurring topic, a technical issue, or something unrelated?")
-        return {"question": question, "audience": "admin", "reason": "BNL needs to know what the theory/anomaly refers to before it can decide whether to draft around it.", "answerType": "scope of the theory/anomaly plus public/internal decision", "confidence": s.get("confidence") or "low", "scopeLabel": s.get("scopeLabel") or "", "scopeKnown": known}
-    if "orion" in low:
-        return {"question": f"Can BNL mention Orion in public {subject} context, or should it stay internal?", "audience": "admin", "reason": "BNL needs to know whether Orion/context references are public-safe before drafting around them.", "answerType": "public/internal decision for Orion/context wording", "confidence": "medium", "scopeLabel": "Orion/context", "scopeKnown": True}
-    if re.search(r"\blore[-\s]*heavy|\b(lore|canon|recurring (?:bit|topic))\b", low):
-        s = scope or _lore_scope_for_text(subject, claim_text)
-        known = bool(s.get("scopeKnown"))
-        question = (f"Should BNL mention this {s.get('scopeLabel')} in {subject}'s public dossier, or keep it internal?"
-                    if known else f"Is this {subject}'s own lore, BARCODE Network lore, Orion lore, Null TV lore, broadcast lore, recurring community context, or something else? Should BNL use it publicly or keep it internal?")
-        return {"question": question, "audience": "admin", "reason": "BNL needs this before deciding whether the lore belongs in a concrete public dossier.", "answerType": "classification of the lore/context plus public/internal decision", "confidence": s.get("confidence") or "low", "scopeLabel": s.get("scopeLabel") or "", "scopeKnown": known}
-    if re.search(r"\b(ai|persona|project|bot|model|character)\b", low) and claim_type in {"relationship", "community_context"}:
+_FOLLOW_UP_CATEGORY_PATTERNS: list[tuple[str, str]] = [
+    ("source_blind", r"\b(source[-_\s]*blind|private|withheld|internal[-\s]*only|no provenance|unknown[-_\s]*policy)\b"),
+    ("orion_context", r"\b(orion|relay)\b"),
+    ("ai_persona_project", r"\b(ai|persona|project|character|bot|agent|universe|collaboration|crossover|interaction|model)\b"),
+    ("theory_anomaly", r"\b(theory|theories|anomal(?:y|ies)|glitch|technical issue)\b"),
+    ("lore_context", r"\b(lore|canon|recurring (?:bit|topic)|barcode|null tv)\b"),
+    ("public_boundary", r"\b(boundar(?:y|ies)|do[-\s]*not[-\s]*say|avoid saying|should not mention|keep private|public boundary)\b"),
+    ("identity_name", r"\b(identity|display name|public name|alias|aka|known as|legal name|real name)\b"),
+    ("links_music_socials", r"\b(link|links|url|social|suno|music|song|track|artist page|spotify|youtube|soundcloud|bandcamp)\b"),
+    ("queue_submission", r"\b(queue|submission|submitted|submitter|entry)\b"),
+    ("contest_event", r"\b(contest|challenge|tournament|battle|competition|event)\b"),
+    ("rules_instructions", r"\b(rules?|instructions?|guidelines?)\b"),
+    ("role_title", r"\b(role|title|artist|producer|moderator|mod|host|organizer|participant|member|staff|core team)\b"),
+    ("relationship_affiliation", r"\b(relationship|affiliation|connected to|connection|associated with|collaborat(?:e|ion|or)|partner|member of|team)\b"),
+    ("public_summary", r"\b(summary|bio|dossier|public copy|public wording|public-ready|public ready)\b"),
+]
+
+def _scope_label_from_text(subject: str, text: str, category: str, scope: dict[str, Any] | None = None) -> tuple[str, bool]:
+    if scope and _text(scope.get("scopeLabel"), 100):
+        return _text(scope.get("scopeLabel"), 100), bool(scope.get("scopeKnown"))
+    value = _text(text, 500)
+    if category == "ai_persona_project":
+        s = _ai_persona_project_scope_for_text(subject, value)
+        return _text(s.get("scopeLabel"), 100) or "AI/persona/project interaction", bool(s.get("scopeKnown"))
+    if category == "contest_event":
+        s = _contest_scope_for_text(subject, value)
+        return _text(s.get("scopeLabel"), 100) or "contest/event context", bool(s.get("scopeKnown"))
+    if category == "rules_instructions":
+        s = _rules_instructions_scope_for_text(subject, value)
+        return _text(s.get("scopeLabel"), 100) or "rules/instructions context", bool(s.get("scopeKnown"))
+    if category == "lore_context":
+        s = _lore_scope_for_text(subject, value)
+        return _text(s.get("scopeLabel"), 100) or "lore/context", bool(s.get("scopeKnown"))
+    if category == "theory_anomaly":
+        s = _theory_anomaly_scope_for_text(subject, value)
+        return _text(s.get("scopeLabel"), 100) or "theory/anomaly", bool(s.get("scopeKnown"))
+    m = re.search(r"\b(?:about|for|with|to|mention(?:ing)?)\s+([A-Z][A-Za-z0-9' _/-]{2,70})", value)
+    if m:
+        return _text(m.group(1), 90), True
+    labels = {
+        "role_title": "role/title", "identity_name": "identity/name", "links_music_socials": "links/music/socials",
+        "relationship_affiliation": "relationship/affiliation", "public_boundary": "public boundary", "queue_submission": "queue/submission",
+        "orion_context": "Orion/context", "public_summary": "public summary", "source_blind": "source-blind/private context",
+    }
+    return labels.get(category, ""), category in labels
+
+def _infer_follow_up_category(subject: str, claim_text: str, claim_type: str, lane: str, actionability: str) -> str:
+    low = f"{claim_type} {lane} {actionability} {claim_text}".lower()
+    if actionability == "source_blind_warning" or lane == "source_blind":
+        return "source_blind"
+    type_map = {
+        "music_link": "links_music_socials", "public_link": "links_music_socials", "queue_submission": "queue_submission",
+        "identity": "identity_name", "role": "role_title",
+        "admin_task": "admin_action", "source_blind_context": "source_blind",
+    }
+    if claim_type in type_map:
+        return type_map[claim_type]
+    if claim_type.startswith("contest_"):
+        return "contest_event"
+    if claim_type == "rules_instructions_context":
+        return "rules_instructions"
+    for category, pattern in _FOLLOW_UP_CATEGORY_PATTERNS:
+        if re.search(pattern, low, re.I):
+            return category
+    if claim_type == "relationship":
+        return "relationship_affiliation"
+    if claim_type == "unknown" and re.search(r"\b(unclear|ambiguous|something|item)\b", low, re.I):
+        return "unknown_context"
+    return "fallback"
+
+def _universal_follow_up_for_claim(subject: str, claim_text: str, claim_type: str, lane: str, actionability: str, scope: dict[str, Any] | None = None, display_copy: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Return the canonical BNL-authored follow-up question metadata for any actionable review card."""
+    category = _infer_follow_up_category(subject, claim_text, claim_type, lane, actionability)
+    scope_label, scope_known = _scope_label_from_text(subject, claim_text, category, scope)
+    fallback = False
+    not_enough = ""
+    audience = "admin"
+    confidence = "medium" if scope_known else "low"
+    answer_type = "public/internal/ignore decision plus exact approved wording where public use is allowed"
+    reason = "BNL needs a scoped human decision before this can shape public dossier wording; do not infer facts from proximity, labels, or private/source-blind evidence."
+
+    if category == "source_blind":
+        question = "Can an owner/admin provide public-safe replacement wording for this context, or should BNL keep it internal?"
+        audience = "public_source"; answer_type = "public-safe replacement wording or confirmation to keep internal"; confidence = "low"; scope_known = False; scope_label = "source-blind/private context"
+        reason = "BNL cannot expose source-blind/private evidence or approve it directly for public copy; it needs separate public-safe replacement wording or an internal-only decision."
+    elif category == "ai_persona_project":
         s = scope or _ai_persona_project_scope_for_text(subject, claim_text)
-        obj = _text(s.get("objectName") or "", 80)
-        question = (f"Can BNL mention {subject}'s interaction with {obj} publicly? If yes, what exact wording should it use?"
-                    if obj else f"BNL found an AI/persona/project connection or interaction near {subject}, but not enough context. What interaction is this referring to, and should it be public, internal, or ignored?")
-        return {"question": question, "audience": "admin", "reason": "BNL needs to know whether this AI/persona/project interaction is public, internal, or irrelevant.", "answerType": "plain-language explanation of the interaction and whether it can be public", "confidence": s.get("confidence") or "low", "scopeLabel": s.get("scopeLabel") or "", "scopeKnown": bool(s.get("scopeKnown"))}
-    if claim_type in {"music_link", "public_link"}:
-        return {"question": f"Which {subject} links are owned or approved for public reference? Which {subject} links, music links, or social links may BNL mention publicly?", "audience": "subject", "reason": "BNL needs owner-approved links before associating them with the subject publicly.", "answerType": "owned/approved links or confirmation that no links are public", "confidence": "medium", "scopeLabel": "links/music/socials", "scopeKnown": True}
-    if claim_type == "queue_submission":
-        return {"question": f"Can {subject}'s queue/submission history be referenced publicly, or should it stay internal?", "audience": "admin", "reason": "BNL needs confirmation before turning queue/submission context into public dossier wording.", "answerType": "public/internal decision and approved queue/submission wording", "confidence": "medium", "scopeLabel": "queue/submission", "scopeKnown": True}
-    if claim_type in {"role", "community_context"}:
-        return {"question": f"What public role/title should BNL use for {subject}, if any?", "audience": "subject", "reason": "BNL needs exact public role/title wording before it can state a role.", "answerType": "exact public role/title wording or confirmation not to state one", "confidence": "medium", "scopeLabel": "role/title", "scopeKnown": True}
-    return {"question": "What proof or approved wording should BNL use before saying this publicly?", "audience": "admin", "reason": "BNL found context that needs a human decision before it can be used publicly.", "answerType": "plain-language approval, correction, or public-safe wording", "confidence": "low", "scopeLabel": "", "scopeKnown": False}
+        obj = _text(s.get("objectName") or (scope_label if scope_known and scope_label != "AI/persona/project interaction" else ""), 90)
+        if obj:
+            question = f"Can BNL mention the subject’s connection to {obj} publicly? If yes, what exact wording should it use?"
+            scope_label = obj; scope_known = True; confidence = "medium"
+        else:
+            question = "What AI/persona/project connection is this referring to? What AI, persona, project, character, bot, or universe is this referring to, and what was the subject’s actual connection to it? Should BNL mention it publicly, keep it internal, or ignore it?"
+        answer_type = "plain-language explanation of the interaction, AI/persona/project object, public/internal/ignore decision, and exact approved wording if public"
+        reason = "BNL found AI/persona/project wording but must not infer the object, interaction, or public permission from nearby context."
+    elif category == "role_title":
+        question = f"What exact public role or title may BNL use for {subject}, if any? Should BNL avoid giving {subject} a public role/title for now?"
+        audience = "subject"; answer_type = "exact public role/title or confirmation not to state one"; scope_label = "role/title"; scope_known = True
+        reason = "BNL needs exact approved role/title wording and must not infer a role from weak labels or context."
+    elif category == "relationship_affiliation":
+        question = f"What public relationship, affiliation, or connection may BNL state for {subject}, if any?"
+        audience = "subject"; answer_type = "approved relationship/affiliation wording or confirmation none should be stated"; scope_label = scope_label or "relationship/affiliation"; scope_known = True
+        reason = "BNL found possible relationship context but must not state a connection until the approved public relationship is confirmed."
+    elif category == "links_music_socials":
+        question = f"Which {subject} links are owned or approved for public reference? Which {subject} links, music links, or social links are owned by {subject} and approved for BNL to mention publicly? Which links, music links, social links, or artist pages are owned by {subject} and approved for BNL to mention publicly? Should BNL avoid public links for {subject} for now?"
+        audience = "subject"; answer_type = "owned approved links or confirmation to avoid public links"; scope_label = "links/music/socials"; scope_known = True
+        reason = "BNL needs ownership and public-use approval before associating links, music, socials, or artist pages with the subject."
+    elif category == "identity_name":
+        question = "What exact public display name should BNL use for this subject? Which aliases, if any, are approved for public use, and which should stay internal?"
+        audience = "subject"; answer_type = "public display name and alias boundary"; scope_label = "identity/name"; scope_known = True
+        reason = "BNL needs an approved public name and alias boundary; it must not expose private aliases or infer identity wording."
+    elif category == "public_boundary":
+        question = f"What should BNL avoid saying publicly about {subject}?" if not scope_label or scope_label == "public boundary" else f"Should BNL avoid mentioning {scope_label} in {subject}’s public dossier?"
+        audience = "subject"; answer_type = "public boundary or do-not-say instruction"; scope_label = scope_label or "public boundary"; scope_known = True
+        reason = "BNL needs explicit public boundaries so it does not overstate private, internal, unwanted, or source-blind context."
+    elif category == "queue_submission":
+        question = f"Can {subject}'s queue/submission history be referenced publicly, or should it stay internal? Should BNL mention {subject}'s queue or submission context publicly, keep it internal, or ignore it? If public, what exact wording is approved?"
+        answer_type = "queue/submission public/internal/ignore decision and approved wording"; scope_label = "queue/submission"; scope_known = True
+        reason = "BNL must not turn queue/submission context into public dossier wording without admin/owner approval."
+    elif category == "contest_event":
+        question = f"What contest or event is this referring to? BNL found {scope_label or 'contest/event'} context near {subject}. Was {subject} a participant, submitter, link source, rules source, organizer, host, or just mentioned nearby? Should BNL mention it publicly, keep it internal, or ignore it?"
+        answer_type = "contest/event name plus subject role and public/internal/ignore decision"
+        reason = "BNL cannot infer contest/event role, host, organizer, or participation from proximity."
+    elif category == "rules_instructions":
+        question = f"What rules or instructions is this referring to, who were they for, and what was {subject}'s actual role with them? Should BNL mention this publicly, keep it internal, or ignore it?"
+        answer_type = "what the instructions were, who they were for, subject role, and public/internal/ignore decision"
+        reason = "BNL needs the instruction source, audience, purpose, and subject role before treating rules/instructions as dossier context."
+    elif category == "theory_anomaly":
+        question = f"What theory or anomaly is this referring to, and is it about {subject}, BARCODE lore, Orion, a recurring topic, a technical issue, or something unrelated? Should BNL use it publicly, keep it internal, or ignore it?"
+        answer_type = "scope of the theory/anomaly plus public/internal/ignore decision"
+        reason = "BNL needs the theory/anomaly scope before deciding whether it belongs in a public dossier."
+    elif category == "orion_context":
+        question = f"Can BNL mention Orion in public {subject} context, or should Orion stay internal? If public, what exact wording is approved?"
+        answer_type = "Orion/context public/internal decision and approved wording"; scope_label = "Orion/context"; scope_known = True
+        reason = "BNL needs an explicit public/internal boundary for Orion/context references."
+    elif category == "lore_context":
+        question = f"Is this {subject}'s own lore, BARCODE Network lore, Orion lore, Null TV lore, broadcast lore, recurring community context, or something else? Should BNL mention {subject}'s lore publicly, keep it internal, or ignore it?"
+        answer_type = "classification of the lore/context plus public/internal/ignore decision"
+        reason = "BNL needs to classify lore/context before it can decide whether it belongs in the subject's public dossier."
+    elif category == "public_summary":
+        question = f"What short public summary is approved for {subject}, and what should BNL avoid inferring beyond that wording?"
+        audience = "subject"; answer_type = "approved public summary plus do-not-infer boundary"; scope_label = "public summary"; scope_known = True
+        reason = "BNL needs owner/admin-approved summary direction and must not infer unsupported public copy."
+    elif category == "unknown_context":
+        question = "What is this item referring to, and should BNL use it publicly, keep it internal, or ignore it?"
+        answer_type = "plain-language context clarification and public/internal/ignore decision"
+        reason = "BNL can tell the item is unclear context, so it needs classification before asking for proof or public wording."
+        scope_label = "unclear context"; scope_known = False
+    elif category == "admin_action":
+        question = f"Should BNL mention {scope_label or 'this context'} in {subject}'s public dossier, keep it internal, or ignore it?"
+        answer_type = "admin public/internal/ignore decision and approved wording if public"
+        reason = "Actionable admin follow-up must resolve the same dossier question rather than become a vague workflow reminder."
+    else:
+        fallback = True
+        not_enough = "BNL could not identify whether this is a role, link, lore, contest, relationship, queue, identity, AI/persona/project, source-blind, or public-boundary issue, so it needs proof or approved wording before using it publicly."
+        question = GENERIC_FOLLOW_UP_FALLBACK
+        answer_type = "proof, correction, or approved public-safe wording"
+        reason = not_enough
+        scope_label = ""; scope_known = False; confidence = "low"
+    return {
+        "question": question, "audience": audience, "reason": reason, "answerType": answer_type,
+        "confidence": confidence, "scopeKnown": bool(scope_known), "scopeLabel": scope_label,
+        "category": category, "fallbackUsed": fallback, "notEnoughContextReason": not_enough,
+    }
+
+def _scoped_follow_up_for_claim(subject: str, claim_text: str, claim_type: str, lane: str, actionability: str, scope: dict[str, Any] | None = None) -> dict[str, Any]:
+    return _universal_follow_up_for_claim(subject, claim_text, claim_type, lane, actionability, scope)
 
 def _has_admin_contest_organizer_rejection(resolved_memory: dict[str, Any], packet: dict[str, Any] | None = None) -> bool:
     blob = json.dumps(packet or {}, default=str) + " " + " ".join(json.dumps(resolved_memory.get(k) or [], default=str) for k in ("reviewOnlyEvidence", "privateOrInternalEvidence", "sourceSafetyWarnings", "missingInfoQuestions"))
@@ -934,6 +1058,11 @@ def _review_display_copy(subject: str, claim_text: str, claim_type: str, lane: s
         "suggestedConfirmationReason": why,
         "suggestedConfirmationAnswerType": answer_type,
         "suggestedMissingInfoQuestion": question,
+        "followUpCategory": (follow_up or {}).get("category", ""),
+        "fallbackUsed": bool((follow_up or {}).get("fallbackUsed")),
+        "notEnoughContextReason": (follow_up or {}).get("notEnoughContextReason", ""),
+        "followUpScopeKnown": bool((follow_up or {}).get("scopeKnown")),
+        "followUpScopeLabel": (follow_up or {}).get("scopeLabel", ""),
     }.items()}
 
 
@@ -1035,6 +1164,7 @@ def _admin_action_card(action: str) -> dict[str, Any]:
     elif "Attach owner-approved provenance" in raw:
         display = "Get proof or approval first."
         explanation = "If the claim involves someone’s role, links, music, queue history, Orion/context, or relationships, BNL needs a public source or owner-approved wording before using it publicly."
+    follow_up = _universal_follow_up_for_claim("the subject", raw, "admin_task", "admin_follow_up", "actionable_claim")
     return {
         "claimText": raw,
         "claimType": "admin_task",
@@ -1050,8 +1180,23 @@ def _admin_action_card(action: str) -> dict[str, Any]:
         "confirmationTarget": "admin",
         "primaryActionLabel": "Add to admin follow-up",
         "secondaryActionLabels": ["Reject / not needed"],
-        "verificationPacketQuestion": "Is this follow-up complete, still needed, or not needed?",
-        "verificationPacketAudience": "admin",
+        "verificationPacketQuestion": follow_up["question"],
+        "verificationPacketQuestions": [follow_up["question"]],
+        "verificationPacketAudience": follow_up["audience"],
+        "recommendedFollowUpQuestion": follow_up["question"],
+        "recommendedFollowUpAudience": follow_up["audience"],
+        "recommendedFollowUpReason": follow_up["reason"],
+        "bestGuessConfidence": follow_up["confidence"],
+        "suggestedConfirmationQuestion": follow_up["question"],
+        "suggestedConfirmationAudience": follow_up["audience"],
+        "suggestedConfirmationReason": follow_up["reason"],
+        "suggestedConfirmationAnswerType": follow_up["answerType"],
+        "suggestedMissingInfoQuestion": follow_up["question"],
+        "followUpCategory": follow_up["category"],
+        "fallbackUsed": follow_up["fallbackUsed"],
+        "notEnoughContextReason": follow_up["notEnoughContextReason"],
+        "followUpScopeKnown": follow_up["scopeKnown"],
+        "followUpScopeLabel": follow_up["scopeLabel"],
     }
 
 
@@ -1156,7 +1301,7 @@ def _review_guidance(subject: str, claim_text: str, claim_type: str, lane: str, 
         guidance.update({
             "recommendedAction": "needs_public_source",
             "suggestedInternalNote": f"BNL found source-blind context for {subject}. Keep this internal until a public source or owner-approved wording is provided.",
-            "suggestedMissingInfoQuestion": "What proof or approved wording should BNL use before saying this publicly?",
+            "suggestedMissingInfoQuestion": "Can an owner/admin provide public-safe replacement wording for this context, or should BNL keep it internal?",
             "cannotSuggestPublicReason": "Source-blind memory cannot become public copy by itself.",
             "recommendedActionReason": "Source-blind context needs separate public-safe provenance or owner/admin confirmation.",
         })
