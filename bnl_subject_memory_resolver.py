@@ -1245,14 +1245,14 @@ def _dossier_section_for_claim_type(claim_type: str, text: str) -> str:
     low = (text or "").lower()
     if "orion" in low or "relay" in low:
         return "orion"
-    if "lore" in low or "context" in low and "contest" not in low:
-        return "lore"
     if claim_type == "collaboration_interest" or "collaboration interest" in low:
         return "collaboration_interest"
     if claim_type == "collaboration_status" or "collaboration status" in low:
         return "collaboration_status"
     if claim_type == "show_operations" or "show operations" in low:
         return "show_operations"
+    if "lore" in low or "context" in low and "contest" not in low:
+        return "lore"
     if claim_type.startswith("contest_") or claim_type == "contest_event_activity" or "contest" in low or "event" in low:
         return "contest"
     if claim_type == "queue_submission_activity" or "queue/submission" in low:
@@ -1802,7 +1802,206 @@ def _apply_dimension_card_copy(guidance: dict[str, Any], dimension_copy: dict[st
     guidance["displayWhyBNLFlaggedIt"] = guidance.get("displayWhyItExists", guidance.get("displayWhyBNLFlaggedIt", ""))
     guidance["displaySafeDefault"] = guidance.get("displaySafetyDefault", guidance.get("displaySafeDefault", ""))
 
-def _review_guidance(subject: str, claim_text: str, claim_type: str, lane: str, public_safe: bool) -> dict[str, str]:
+_RAW_REVIEW_LABELS = {
+    "contest/event activity", "contests/events", "show operations", "collaboration",
+    "source_protected_context", "contest event activity", "unknown context",
+}
+
+def _is_raw_review_label(text: str) -> bool:
+    clean = re.sub(r"[_\s]+", " ", (text or "").strip().lower())
+    return clean in _RAW_REVIEW_LABELS or clean in {x.replace("/", " ") for x in _RAW_REVIEW_LABELS}
+
+def _build_review_context(subject: str, claim_text: str, claim_type: str, lane: str, public_safe: bool, dimension: str, intent: str, evidence: str = "") -> dict[str, Any]:
+    safe_summary = _text(_redact_review_evidence_summary(evidence or claim_text, subject), 240)
+    protected = lane == "source_blind" or dimension == "source_protected_context" or "source-blind" in f"{claim_text} {evidence}".lower()
+    if protected:
+        safe_summary = "Protected context exists, but details are withheld from this card."
+    signals = []
+    hay = f"{claim_type} {claim_text} {evidence}".lower()
+    for label, pattern in (
+        ("contest/event", r"\b(contest|event|rules|submission|submitter)\b"),
+        ("show operations", r"\b(show operations?|show[- ]ops|broadcast operations?|run of show|production)\b"),
+        ("collaboration", r"\b(collaborat|work together|featured|credited)\b"),
+        ("links/music", r"\b(link|social|music|song|artist|suno|soundcloud|youtube|spotify)\b"),
+        ("community presence", r"\b(community|viewer|participant|member|chat)\b"),
+        ("protected context", r"\b(source[-_ ]blind|protected|private|withheld)\b"),
+    ):
+        if re.search(pattern, hay):
+            signals.append(label)
+    raw_label = claim_type.replace("_", " ")
+    if _is_raw_review_label(claim_text):
+        raw_label = claim_text
+    what_knows = []
+    if safe_summary and not _is_raw_review_label(safe_summary):
+        what_knows.append(safe_summary)
+    elif signals:
+        what_knows.append(f"BNL detected {', '.join(signals[:3])} context near {subject}.")
+    what_not = []
+    cannot = []
+    if dimension == "contest_event_activity":
+        what_not.append(f"BNL does not know whether {subject} participated, submitted something, posted rules, shared a link, helped organize, hosted, or was only mentioned nearby.")
+        cannot.append("Do not infer a contest/event role, host status, organizer status, or public title from proximity alone.")
+    elif dimension == "show_operations":
+        what_not.append(f"BNL does not know whether {subject} actually helps with show operations or was only discussed near that topic.")
+        cannot.append("Do not infer a show-operations role/title without explicit confirmation.")
+    elif dimension in {"collaboration_interest", "collaboration_status"}:
+        what_not.append("BNL needs to distinguish collaboration interest from an actual approved public collaboration.")
+        cannot.append("Do not call interest, planning, or nearby discussion an approved collaboration.")
+    elif dimension in {"links_socials", "music_artist_context"}:
+        what_not.append(f"BNL does not know which links/music/socials are {subject}-owned or approved for public use.")
+        cannot.append("Do not publish or attribute links/music until ownership and public use are confirmed.")
+    elif dimension == "community_presence":
+        what_not.append(f"BNL does not know whether to describe {subject} as a participant/viewer/member or avoid public role wording.")
+        cannot.append("Do not turn community presence into a formal role/title without approval.")
+    elif dimension == "source_protected_context":
+        what_not.append("BNL does not have approved public replacement wording or a separate public source for this protected context.")
+        cannot.append("Do not expose, quote, or infer public facts from protected/source-blind context.")
+    else:
+        what_not.append("BNL does not have enough confirmed public-safe context to write dossier text yet.")
+        cannot.append("Do not infer a public fact from this signal alone.")
+    return {
+        "subjectName": subject, "claimText": claim_text, "claimType": claim_type,
+        "dossierDimension": dimension, "cardIntent": intent, "sourceSafety": "source_protected" if protected else ("public_safe" if public_safe else "review_only"),
+        "confirmationTarget": "admin", "rawLabel": raw_label, "safeEvidenceSummary": safe_summary,
+        "specificEvidenceSignals": signals, "knownSourceFileFacts": [], "missingConfirmations": what_not,
+        "existingInternalNotes": [], "existingPublicFacts": [], "dossierReadinessNeeds": [],
+        "relatedSignals": signals, "whatBnlKnows": what_knows, "whatBnlDoesNotKnow": what_not,
+        "whatCannotBeInferred": cannot, "safePublicCandidates": [], "blockedReasons": [] if public_safe else ["missing owner/admin confirmation", "missing public-safe provenance"],
+    }
+
+def _specificity_level(ctx: dict[str, Any]) -> str:
+    if ctx.get("sourceSafety") == "source_protected":
+        return "partially_specific"
+    summary = str(ctx.get("safeEvidenceSummary") or "")
+    signals = ctx.get("specificEvidenceSignals") or []
+    if not summary and not signals:
+        return "not_reviewable"
+    if _is_raw_review_label(summary) and len(signals) <= 1:
+        return "generic"
+    if len(summary.split()) >= 7 or len(signals) >= 2:
+        return "specific"
+    return "partially_specific" if signals else "generic"
+
+def _human_review_topic(subject: str, dimension: str, ctx: dict[str, Any]) -> str:
+    if dimension == "contest_event_activity":
+        return f"{subject}'s possible contest/event connection"
+    if dimension == "show_operations":
+        return f"{subject}'s possible show-operations involvement"
+    if dimension in {"collaboration_interest", "collaboration_status"}:
+        return f"{subject}'s possible collaboration status"
+    if dimension in {"links_socials", "music_artist_context"}:
+        return f"{subject}'s public links/music approval"
+    if dimension == "source_protected_context":
+        return f"Protected {subject} context that needs public-safe wording"
+    if dimension == "public_role_title":
+        return f"{subject}'s possible community role/title"
+    if dimension == "queue_submission_activity":
+        return f"{subject}'s queue/submission context"
+    if dimension == "lore_context":
+        return f"{subject}'s lore/context boundary"
+    return f"{subject}'s Source File context needing review"
+
+def _compose_source_file_review_card(subject: str, claim: dict[str, Any], dossier_dimension: str, card_intent: str, context: dict[str, Any]) -> dict[str, Any]:
+    level = _specificity_level(context)
+    topic = _human_review_topic(subject, dossier_dimension, context)
+    protected = context.get("sourceSafety") == "source_protected"
+    knows = context.get("whatBnlKnows") or []
+    not_knows = context.get("whatBnlDoesNotKnow") or []
+    cannot = context.get("whatCannotBeInferred") or []
+    summary = knows[0] if knows else (context.get("safeEvidenceSummary") or f"BNL found {topic.lower()}, but does not have enough safe context to describe it yet.")
+    if _is_raw_review_label(str(summary)):
+        summary = f"BNL detected a possible {dossier_dimension.replace('_', ' ')} signal near {subject}, but needs more context before review."
+    decision = str(claim.get("displayDecision") or claim.get("recommendedFollowUpQuestion") or "")
+    target_dimensions = {"contest_event_activity", "show_operations", "collaboration_interest", "collaboration_status", "source_protected_context"}
+    public_wording = _clean_suggested_public_wording(str(claim.get("suggestedPublicWording") or ""))
+    if _is_raw_review_label(public_wording) or protected:
+        public_wording = ""
+    if dossier_dimension not in target_dimensions:
+        out = {
+            "displayTopic": topic,
+            "evidenceSummary": summary,
+            "specificityLevel": level,
+            "reviewContext": context,
+            "whatBnlKnows": knows,
+            "whatBnlDoesNotKnow": not_knows,
+            "whatCannotBeInferred": cannot,
+        }
+        if public_wording:
+            out["suggestedPublicWording"] = public_wording
+        if not public_wording:
+            out["cannotSuggestPublicReason"] = claim.get("cannotSuggestPublicReason") or "No public wording yet — BNL needs confirmation first."
+        return out
+    if claim.get("actionability") == "weak_label":
+        return {
+            "displayTopic": topic,
+            "evidenceSummary": summary,
+            "specificityLevel": level,
+            "reviewContext": context,
+            "whatBnlKnows": knows,
+            "whatBnlDoesNotKnow": not_knows,
+            "whatCannotBeInferred": cannot,
+        }
+    if dossier_dimension == "contest_event_activity":
+        decision = f"Was {subject} involved in this contest or event, or was he only mentioned nearby?"
+        note = f"BNL found contest/event context near {subject}, but the available context does not confirm whether {subject} participated, submitted something, posted rules, shared a link, helped organize, hosted, or was only mentioned nearby."
+    elif dossier_dimension == "show_operations":
+        decision = f"Is {subject} involved in show operations? If yes, what does he help with, and can BNL mention it publicly?"
+        note = f"BNL found show-operations context near {subject}, but the available context does not confirm whether {subject} actually helps with show operations or was only discussed near that topic."
+    elif dossier_dimension in {"collaboration_interest", "collaboration_status"}:
+        decision = f"Did {subject} only show interest in collaborating, or is there an actual public collaboration BNL can mention publicly? If public, is it with BARCODE or another project, song, show, or context?"
+        note = f"BNL found collaboration-related context for {subject}, but it needs to distinguish interest in collaborating from an actual approved collaboration before this can become dossier text."
+    elif dossier_dimension == "source_protected_context" or protected:
+        decision = "Should this protected context stay internal, or is there approved public wording BNL can use?"
+        note = f"Protected context exists for {subject}. Keep it internal unless an owner/admin provides public wording or a separate public source."
+    else:
+        note = str(claim.get("suggestedInternalNote") or f"Possible {dossier_dimension.replace('_', ' ')} signal exists, but BNL does not have enough safe context to describe it yet.")
+    if level == "generic":
+        claim["decisionState"] = "needs_clarification"
+        claim["recommendedAction"] = "needs_more_info"
+    if level == "not_reviewable":
+        claim["decisionState"] = "internal_audit"
+        claim["recommendedAction"] = "keep_internal"
+    out = {
+        "displayTopic": topic,
+        "displayTitle": f"Need approved public wording for {subject}" if protected else f"Clarify {topic}",
+        "displayDecision": decision,
+        "displayWhatIsBeingChecked": f"{summary} Admins are checking the exact meaning, missing confirmation, and public/internal boundary.",
+        "displayWhyItExists": "BNL found a Source File signal that may matter for dossier readiness, but it should be reviewed from evidence context rather than a dimension label.",
+        "displayBNLRecommendation": "BNL recommends answering the clarification question before approving public copy.",
+        "evidenceSummary": summary,
+        "displaySafetyDefault": "Keep internal until the exact meaning and public-safe wording are confirmed." if not protected else "Keep internal. Do not use protected context publicly.",
+        "displayApprovalInstruction": "Approve only the exact confirmed public-safe wording, or choose keep internal/reject.",
+        "displayWhatYouAreApproving": f"A decision about {topic}, not the raw label \"{context.get('rawLabel') or dossier_dimension}\" and not a general role/title.",
+        "recommendedFollowUpQuestion": decision,
+        "recommendedFollowUpReason": "BNL needs the admin/owner to confirm what the evidence means, what remains unknown, and what should not be inferred.",
+        "suggestedConfirmationAnswerType": str(claim.get("suggestedConfirmationAnswerType") or "plain-language confirmation, correction, public-safe wording, or keep-internal decision"),
+        "suggestedInternalNote": note,
+        "suggestedPublicWording": public_wording,
+        "exampleApprovedText": public_wording if public_wording else "",
+        "specificityLevel": level,
+        "reviewContext": context,
+        "whatBnlKnows": knows,
+        "whatBnlDoesNotKnow": not_knows,
+        "whatCannotBeInferred": cannot,
+    }
+    if not public_wording:
+        out["cannotSuggestPublicReason"] = "Source-blind memory cannot become public copy by itself." if protected else "No public wording yet — BNL needs confirmation first."
+    return out
+
+def _finalize_review_guidance(subject: str, claim_text: str, claim_type: str, lane: str, public_safe: bool, guidance: dict[str, Any], dimension: str, intent: str, evidence: str = "") -> dict[str, Any]:
+    ctx = _build_review_context(subject, claim_text, claim_type, lane, public_safe, dimension, intent, evidence)
+    guidance.update(_compose_source_file_review_card(subject, guidance, dimension, intent, ctx))
+    if guidance.get("recommendedFollowUpQuestion"):
+        guidance["suggestedConfirmationReason"] = guidance.get("recommendedFollowUpReason", guidance.get("suggestedConfirmationReason", ""))
+        guidance["suggestedConfirmationQuestion"] = guidance["recommendedFollowUpQuestion"]
+        guidance["suggestedMissingInfoQuestion"] = guidance["recommendedFollowUpQuestion"]
+        guidance["verificationPacketQuestion"] = guidance["recommendedFollowUpQuestion"]
+        guidance["verificationPacketQuestions"] = [guidance["recommendedFollowUpQuestion"]]
+    guidance["displayWhyBNLFlaggedIt"] = guidance.get("displayWhyItExists", guidance.get("displayWhyBNLFlaggedIt", ""))
+    guidance["displaySafeDefault"] = guidance.get("displaySafetyDefault", guidance.get("displaySafeDefault", ""))
+    return guidance
+
+def _review_guidance(subject: str, claim_text: str, claim_type: str, lane: str, public_safe: bool, evidence: str = "") -> dict[str, str]:
     actionability = _claim_actionability(claim_text, claim_type, lane, public_safe)
     low = (claim_text or "").lower()
     role_read_for_dimension = _public_role_candidate_for_subject(subject, claim_text, {"claimType": claim_type, "lane": lane})
@@ -1819,7 +2018,7 @@ def _review_guidance(subject: str, claim_text: str, claim_type: str, lane: str, 
         })
         guidance.update(_review_display_copy(subject, claim_text, claim_type, lane, public_safe, actionability))
         _apply_dimension_card_copy(guidance, dimension_copy, dimension)
-        return guidance
+        return _finalize_review_guidance(subject, claim_text, claim_type, lane, public_safe, guidance, dimension, intent, evidence)
     if actionability == "non_actionable_artifact":
         guidance.update({
             "recommendedAction": "reject",
@@ -1830,7 +2029,7 @@ def _review_guidance(subject: str, claim_text: str, claim_type: str, lane: str, 
         })
         guidance.update(_review_display_copy(subject, claim_text, claim_type, lane, public_safe, actionability))
         _apply_dimension_card_copy(guidance, dimension_copy, dimension)
-        return guidance
+        return _finalize_review_guidance(subject, claim_text, claim_type, lane, public_safe, guidance, dimension, intent, evidence)
     if actionability == "weak_label":
         label = _text(claim_text, 80)
         if "contest organizer" in low:
@@ -1845,7 +2044,7 @@ def _review_guidance(subject: str, claim_text: str, claim_type: str, lane: str, 
         })
         guidance.update(_review_display_copy(subject, claim_text, claim_type, lane, public_safe, actionability))
         _apply_dimension_card_copy(guidance, dimension_copy, dimension)
-        return guidance
+        return _finalize_review_guidance(subject, claim_text, claim_type, lane, public_safe, guidance, dimension, intent, evidence)
     if actionability == "source_blind_warning":
         guidance.update({
             "decisionState": "source_blind_blocked",
@@ -1858,7 +2057,7 @@ def _review_guidance(subject: str, claim_text: str, claim_type: str, lane: str, 
         })
         guidance.update(_review_display_copy(subject, claim_text, claim_type, lane, public_safe, actionability))
         _apply_dimension_card_copy(guidance, dimension_copy, dimension)
-        return guidance
+        return _finalize_review_guidance(subject, claim_text, claim_type, lane, public_safe, guidance, dimension, intent, evidence)
     if claim_type == "contest_music_context":
         note = f"BNL found contest-related music/link context for {subject}. This does not prove {subject} hosted or organized a contest. Keep internal until links and role are confirmed."
         question = f"Which {subject} music or contest-related links are owned or approved for public reference?"
@@ -1899,7 +2098,7 @@ def _review_guidance(subject: str, claim_text: str, claim_type: str, lane: str, 
     })
     guidance.update(_review_display_copy(subject, claim_text, claim_type, lane, public_safe, actionability))
     _apply_dimension_card_copy(guidance, dimension_copy, dimension)
-    return guidance
+    return _finalize_review_guidance(subject, claim_text, claim_type, lane, public_safe, guidance, dimension, intent, evidence)
 
 
 def _safe_evidence_example(text: str, subject: str) -> str:
@@ -1930,7 +2129,7 @@ def _make_reviewable_claim(subject: str, claim_text: str, claim_type: str, lane:
     item["activityContextType"] = role_candidate.get("activityContextType") or _activity_context_type_for_text(claim_text, claim_type, lane)
     if (not public_safe) and actionability != "weak_label" and item.get("claimType") == "role" and not role_candidate.get("isPublicRole") and item["activityContextType"] in _ACTIVITY_CONTEXT_TYPES:
         item["claimType"] = item["activityContextType"]
-    item.update(_review_guidance(subject, claim_text, item.get("claimType", claim_type), lane, public_safe))
+    item.update(_review_guidance(subject, claim_text, item.get("claimType", claim_type), lane, public_safe, evidence or why))
     if item.get("dossierDimension") == "source_protected_context":
         item["safeEvidenceSummary"] = "Protected context exists, but details are withheld from this card."
     return item
