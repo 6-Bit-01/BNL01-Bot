@@ -2150,9 +2150,53 @@ def _compose_source_file_review_card(subject: str, claim: dict[str, Any], dossie
         out["cannotSuggestPublicReason"] = "Source-blind memory cannot become public copy by itself." if protected else "No public wording yet — BNL needs confirmation first."
     return out
 
+def _restore_public_approval_if_safe(guidance: dict[str, Any], context: dict[str, Any]) -> None:
+    anchor = context.get("evidenceAnchor") if isinstance(context.get("evidenceAnchor"), dict) else {}
+    public_wording = _clean_suggested_public_wording(str(guidance.get("suggestedPublicWording") or ""))
+    protected = (
+        context.get("sourceSafety") == "source_protected"
+        or guidance.get("reviewLane") == "source_blind"
+        or guidance.get("dossierDimension") == "source_protected_context"
+        or guidance.get("decisionState") == "source_blind_blocked"
+    )
+    raw_label_only = (
+        str(guidance.get("answerability") or context.get("answerability") or anchor.get("answerable") or "") == "not_answerable"
+        or (not anchor.get("hasAnchor") and (
+            _is_raw_review_label(str(guidance.get("claimText") or ""))
+            or _is_raw_review_label(str(context.get("safeEvidenceSummary") or ""))
+            or _is_raw_review_label(str(context.get("rawLabel") or ""))
+        ))
+    )
+    approval_ready = bool(
+        not protected
+        and not raw_label_only
+        and (
+            guidance.get("publicSafe") is True
+            or bool(public_wording)
+            or guidance.get("recommendedAction") == "approve_public"
+        )
+    )
+    if not approval_ready:
+        return
+    guidance["answerability"] = "answerable"
+    if isinstance(guidance.get("evidenceAnchor"), dict):
+        guidance["evidenceAnchor"]["answerable"] = "answerable"
+    if isinstance(guidance.get("reviewContext"), dict):
+        guidance["reviewContext"]["answerability"] = "answerable"
+        if isinstance(guidance["reviewContext"].get("evidenceAnchor"), dict):
+            guidance["reviewContext"]["evidenceAnchor"]["answerable"] = "answerable"
+    guidance["decisionState"] = "decidable"
+    if public_wording or guidance.get("recommendedAction") == "approve_public" or guidance.get("publicSafe") is True:
+        guidance["recommendedAction"] = "approve_public"
+    actions = guidance.get("allowedReviewActions") or []
+    if not any(isinstance(a, dict) and a.get("action") == "approve_public_wording" for a in actions):
+        actions = _actions(("approve_public_wording", "Approve public wording")) + actions
+    guidance["allowedReviewActions"] = actions or _public_approval_actions()
+
 def _finalize_review_guidance(subject: str, claim_text: str, claim_type: str, lane: str, public_safe: bool, guidance: dict[str, Any], dimension: str, intent: str, evidence: str = "") -> dict[str, Any]:
     ctx = _build_review_context(subject, claim_text, claim_type, lane, public_safe, dimension, intent, evidence)
     guidance.update(_compose_source_file_review_card(subject, guidance, dimension, intent, ctx))
+    _restore_public_approval_if_safe(guidance, ctx)
     if guidance.get("recommendedFollowUpQuestion"):
         guidance["suggestedConfirmationReason"] = guidance.get("recommendedFollowUpReason", guidance.get("suggestedConfirmationReason", ""))
         guidance["suggestedConfirmationQuestion"] = guidance["recommendedFollowUpQuestion"]

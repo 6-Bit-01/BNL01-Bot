@@ -4,7 +4,7 @@ import unittest
 import json
 
 import bnl_dossier_draft as draft
-from bnl_subject_memory_resolver import build_subject_analyst_read, build_subject_memory_diagnostic, resolve_subject_memory, _review_guidance, _make_reviewable_claim, _cluster_clarification_needs, _build_dossier_readiness, _build_dossier_readiness_from_clarifications, _public_role_candidate_for_subject, _build_review_context, _compose_source_file_review_card
+from bnl_subject_memory_resolver import build_subject_analyst_read, build_subject_memory_diagnostic, resolve_subject_memory, _review_guidance, _make_reviewable_claim, _cluster_clarification_needs, _build_dossier_readiness, _build_dossier_readiness_from_clarifications, _public_role_candidate_for_subject, _build_review_context, _compose_source_file_review_card, _finalize_review_guidance
 
 
 class SubjectMemoryResolverTests(unittest.TestCase):
@@ -198,6 +198,18 @@ class SubjectMemoryResolverTests(unittest.TestCase):
         self.assertEqual("approve_public", restored["recommendedAction"])
         self.assertEqual("answerable", restored["answerability"])
         self.assertIn("approve_public_wording", {a["action"] for a in restored["allowedReviewActions"]})
+
+        finalized = _finalize_review_guidance("Crow", "Crow publicly submitted to the Moon Jam contest", "contest_submitter", "public_home", True, {
+            "publicSafe": True,
+            "decisionState": "needs_clarification",
+            "recommendedAction": "approve_public",
+            "allowedReviewActions": [{"action": "ask_follow_up", "label": "Ask follow-up"}],
+            "suggestedPublicWording": "Crow submitted to the Moon Jam contest.",
+        }, "contest_event_activity", "approve_public_fact", "Crow publicly submitted to the Moon Jam contest")
+        self.assertEqual("decidable", finalized["decisionState"])
+        self.assertEqual("approve_public", finalized["recommendedAction"])
+        self.assertEqual("answerable", finalized["answerability"])
+        self.assertIn("approve_public_wording", {a["action"] for a in finalized["allowedReviewActions"]})
 
         collab = _make_reviewable_claim("Crow", "Owner-confirmed public-safe collaborator credited on a released project", "role", "public_home", "confirmed collaborator", True, "high", "Owner-confirmed public-safe collaborator credited on a released project")
         self.assertEqual("collaboration_status", collab["dossierDimension"])
