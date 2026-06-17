@@ -1751,6 +1751,9 @@ def _card_intent_for_dimension(dimension: str, public_safe: bool) -> str:
 def _actions(*pairs: tuple[str, str]) -> list[dict[str, str]]:
     return [{"action": a, "label": b} for a, b in pairs]
 
+def _public_approval_actions() -> list[dict[str, str]]:
+    return _actions(("approve_public_wording", "Approve public wording"), ("keep_internal", "Keep internal"), ("ask_follow_up", "Ask follow-up"), ("reject", "Reject / not useful"))
+
 def _dimension_template(subject: str, dimension: str) -> dict[str, Any]:
     common = {
         "recommendedFollowUpAudience": "admin", "recommendedFollowUpReason": "BNL needs a human decision before using this in public copy.",
@@ -1782,7 +1785,7 @@ def _dimension_template(subject: str, dimension: str) -> dict[str, Any]:
         out = {**common, **templates[dimension]}
     else:
         title, question, ans = generic.get(dimension, generic["unknown_context"])
-        out = {**common, "displayTitle": title, "displayDecision": question, "displayWhatIsBeingChecked": "BNL needs a concrete safe evidence anchor before this can become a normal Source File review card.", "displayWhyItExists": "BNL should classify the dossier dimension from evidence context and suppress raw-label-only cards.", "displayBNLRecommendation": "BNL recommends asking for the missing context before approving public copy.", "displaySafetyDefault": "Keep internal until confirmed and approved for public use.", "displayApprovalInstruction": "Approve only exact public-safe wording or choose keep internal/reject.", "displayWhatYouAreApproving": ans, "recommendedFollowUpQuestion": question, "suggestedConfirmationAnswerType": ans, "allowedReviewActions": _actions(("ask_follow_up","Ask follow-up"),("keep_internal","Keep internal"),("reject","Reject / not useful"))}
+        out = {**common, "displayTitle": title, "displayDecision": question, "displayWhatIsBeingChecked": "BNL needs a concrete safe evidence anchor before this can become a normal Source File review card.", "displayWhyItExists": "BNL should classify the dossier dimension from evidence context and suppress raw-label-only cards.", "displayBNLRecommendation": "BNL recommends asking for the missing context before approving public copy.", "displaySafetyDefault": "Keep internal until confirmed and approved for public use.", "displayApprovalInstruction": "Approve only exact public-safe wording or choose keep internal/reject.", "displayWhatYouAreApproving": ans, "recommendedFollowUpQuestion": question, "suggestedConfirmationAnswerType": ans, "allowedReviewActions": _public_approval_actions()}
     out.setdefault("evidenceSummary", "BNL found context that needs review; no public wording is ready yet.")
     out.setdefault("recommendedFollowUpReason", common["recommendedFollowUpReason"])
     return out
@@ -1834,7 +1837,7 @@ def _evidence_anchor_for_claim(subject: str, claim: dict[str, Any], resolved_mem
     dimension = str(claim.get("dossierDimension") or claim.get("claimType") or "unknown_context")
     lane = str(claim.get("reviewLane") or "")
     raw = " ".join(str(claim.get(k) or "") for k in ("safeEvidenceSummary", "claimText", "why", "displayEvidenceSummary"))
-    protected = lane == "source_blind" or dimension == "source_protected_context" or re.search(r"source[-_ ]blind|protected|withheld", raw, re.I)
+    protected = lane == "source_blind" or dimension == "source_protected_context" or (claim.get("publicSafe") is not True and re.search(r"source[-_ ]blind|protected|withheld", raw, re.I))
     if protected:
         dimension = "source_protected_context"
     safe = _text(_redact_review_evidence_summary(raw, subject), 260)
@@ -1859,6 +1862,9 @@ def _evidence_anchor_for_claim(subject: str, claim: dict[str, Any], resolved_mem
     if not has_anchor:
         answerability = "not_answerable"
         reason = "Only a raw label or generic Source File category is available."
+    elif claim.get("publicSafe") is True:
+        answerability = "answerable"
+        reason = "Public-safe evidence supports an approval decision."
     elif dimension == "show_operations" and re.search(r"confirmed|yes|involved|helps with|responsib", safe, re.I):
         answerability = "answerable"
         reason = ""
@@ -1881,6 +1887,14 @@ def _evidence_anchor_for_claim(subject: str, claim: dict[str, Any], resolved_mem
         "whatBnlKnows": safe_text if has_anchor else "BNL only has a raw label or generic category.", "whatBnlDoesNotKnow": not_know, "whatCannotBeInferred": cannot,
         "answerable": answerability, "notAnswerableReason": reason,
     }
+
+def _safe_review_context_note(note: Any, subject: str) -> str:
+    raw = str(note or "")
+    if not raw.strip():
+        return ""
+    if re.search(r"\b(source[-_ ]blind|protected|private|internal[- ]only|dm|token|raw id|customer|payment|stripe|secret)\b", raw, re.I):
+        return "Protected internal note exists, but details are withheld from this card."
+    return _text(_redact_review_evidence_summary(raw, subject), 180)
 
 def _build_review_context(subject: str, claim_text: str, claim_type: str, lane: str, public_safe: bool, dimension: str, intent: str, evidence: str = "", resolved_memory: dict[str, Any] | None = None, packet: dict[str, Any] | None = None) -> dict[str, Any]:
     safe_summary = _text(_redact_review_evidence_summary(evidence or claim_text, subject), 240)
@@ -1952,7 +1966,11 @@ def _build_review_context(subject: str, claim_text: str, claim_type: str, lane: 
         for key in ("knownFacts", "sourceFileFacts", "facts"):
             known_facts.extend([_text(x, 180) for x in (packet.get(key) or []) if _text(x, 180)] if isinstance(packet.get(key), list) else [])
         for key in ("internalNotes", "notes", "bnlNotes"):
-            internal_notes.extend([_text(x, 180) for x in (packet.get(key) or []) if _text(x, 180)] if isinstance(packet.get(key), list) else [])
+            if isinstance(packet.get(key), list):
+                for x in packet.get(key) or []:
+                    safe_note = _safe_review_context_note(x, subject)
+                    if safe_note:
+                        internal_notes.append(safe_note)
         readiness = packet.get("dossierReadiness") if isinstance(packet.get("dossierReadiness"), dict) else {}
         readiness_needs.extend([_text(q.get("question"), 180) for q in (readiness.get("questions") or []) if isinstance(q, dict) and _text(q.get("question"), 180)])
     return {
@@ -1960,7 +1978,7 @@ def _build_review_context(subject: str, claim_text: str, claim_type: str, lane: 
         "dossierDimension": dimension, "cardIntent": intent, "sourceSafety": anchor.get("sourceSafety") or ("source_protected" if protected else ("public_safe" if public_safe else "review_only")),
         "confirmationTarget": "admin", "rawLabel": raw_label, "safeEvidenceSummary": safe_summary,
         "specificEvidenceSignals": signals, "knownSourceFileFacts": _dedupe_by_pattern(known_facts + public_facts, subject, 6), "missingConfirmations": what_not,
-        "existingInternalNotes": _dedupe_by_pattern(internal_notes, subject, 6), "existingPublicFacts": _dedupe_by_pattern(public_facts, subject, 6), "dossierReadinessNeeds": _dedupe_by_pattern(readiness_needs, subject, 6),
+        "existingInternalNotes": list(dict.fromkeys(internal_notes))[:6], "existingPublicFacts": _dedupe_by_pattern(public_facts, subject, 6), "dossierReadinessNeeds": _dedupe_by_pattern(readiness_needs, subject, 6),
         "relatedSignals": signals, "whatBnlKnows": what_knows, "whatBnlDoesNotKnow": what_not,
         "whatCannotBeInferred": cannot, "safePublicCandidates": public_facts[:4], "blockedReasons": [] if public_safe else ["missing owner/admin confirmation", "missing public-safe provenance"],
         "evidenceAnchor": anchor, "answerability": anchor.get("answerable"), "notAnswerableReason": anchor.get("notAnswerableReason", ""),
@@ -2017,6 +2035,9 @@ def _compose_source_file_review_card(subject: str, claim: dict[str, Any], dossie
     public_wording = _clean_suggested_public_wording(str(claim.get("suggestedPublicWording") or ""))
     if _is_raw_review_label(public_wording) or protected:
         public_wording = ""
+    public_approval_ready = bool((claim.get("publicSafe") is True and (public_wording or anchor.get("hasAnchor"))) or (public_wording and claim.get("recommendedAction") == "approve_public") or (claim.get("recommendedAction") == "approve_public" and not protected))
+    if public_approval_ready:
+        answerability = "answerable"
     if dossier_dimension not in target_dimensions:
         out = {
             "displayTopic": topic,
@@ -2027,8 +2048,18 @@ def _compose_source_file_review_card(subject: str, claim: dict[str, Any], dossie
             "whatBnlDoesNotKnow": not_knows,
             "whatCannotBeInferred": cannot,
         }
+        out["answerability"] = answerability
         if public_wording:
             out["suggestedPublicWording"] = public_wording
+        if public_approval_ready:
+            existing_actions = claim.get("allowedReviewActions") or []
+            if not any(a.get("action") == "approve_public_wording" for a in existing_actions if isinstance(a, dict)):
+                existing_actions = _actions(("approve_public_wording", "Approve public wording")) + existing_actions
+            out["allowedReviewActions"] = existing_actions or _public_approval_actions()
+            out["decisionState"] = claim.get("decisionState") or "decidable"
+            out["recommendedAction"] = claim.get("recommendedAction") or "approve_public"
+        elif answerability == "not_answerable" or protected:
+            out["allowedReviewActions"] = _actions(("keep_internal", "Keep internal"), ("ask_follow_up", "Ask follow-up"), ("reject", "Reject / not useful"))
         if not public_wording:
             out["cannotSuggestPublicReason"] = claim.get("cannotSuggestPublicReason") or "No public wording yet — BNL needs confirmation first."
         return out
@@ -2056,7 +2087,14 @@ def _compose_source_file_review_card(subject: str, claim: dict[str, Any], dossie
         note = f"Protected context exists for {subject}. Keep it internal unless an owner/admin provides public wording or a separate public source."
     else:
         note = str(claim.get("suggestedInternalNote") or f"Possible {dossier_dimension.replace('_', ' ')} signal exists, but BNL does not have enough safe context to describe it yet.")
-    if answerability == "not_answerable":
+    if public_approval_ready:
+        claim.setdefault("decisionState", "decidable")
+        claim.setdefault("recommendedAction", "approve_public")
+        existing_actions = claim.get("allowedReviewActions") or []
+        if not any(a.get("action") == "approve_public_wording" for a in existing_actions if isinstance(a, dict)):
+            existing_actions = _actions(("approve_public_wording", "Approve public wording")) + existing_actions
+        claim["allowedReviewActions"] = existing_actions or _public_approval_actions()
+    elif answerability == "not_answerable":
         claim["decisionState"] = "internal_audit"
         claim["recommendedAction"] = "keep_internal"
         claim["allowedReviewActions"] = _actions(("keep_internal", "Keep internal"), ("ask_follow_up", "Ask follow-up"), ("reject", "Reject / not useful"))

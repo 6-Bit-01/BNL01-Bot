@@ -175,6 +175,58 @@ class SubjectMemoryResolverTests(unittest.TestCase):
         self.assertTrue(ctx["existingInternalNotes"])
         self.assertIn("Which contest was this?", ctx["dossierReadinessNeeds"])
 
+
+    def test_public_safe_anchored_claims_and_generic_dimensions_keep_approval_actions(self):
+        contest = _make_reviewable_claim("Crow", "Crow publicly submitted to the Moon Jam contest", "contest_submitter", "public_home", "public contest submission", True, "high", "Crow publicly submitted to the Moon Jam contest")
+        contest["suggestedPublicWording"] = "Crow submitted to the Moon Jam contest."
+        contest.update(_review_guidance("Crow", contest["claimText"], contest["claimType"], contest["reviewLane"], True, contest["safeEvidenceSummary"]))
+        self.assertEqual("decidable", contest["decisionState"])
+        self.assertEqual("approve_public", contest["recommendedAction"])
+        self.assertEqual("answerable", contest["answerability"])
+        self.assertIn("approve_public_wording", {a["action"] for a in contest["allowedReviewActions"]})
+
+        collab = _make_reviewable_claim("Crow", "Owner-confirmed public-safe collaborator credited on a released project", "role", "public_home", "confirmed collaborator", True, "high", "Owner-confirmed public-safe collaborator credited on a released project")
+        self.assertEqual("collaboration_status", collab["dossierDimension"])
+        self.assertEqual("decidable", collab["decisionState"])
+        self.assertEqual("approve_public", collab["recommendedAction"])
+        self.assertIn("approve_public_wording", {a["action"] for a in collab["allowedReviewActions"]})
+
+        generic_cases = [
+            ("Crow public profile link https://example.com/crow", "public_link", "links_socials"),
+            ("Crow public music artist profile", "music_link", "music_artist_context"),
+            ("Crow is a public producer role", "role", "public_role_title"),
+            ("Crow display name is public", "identity", "public_identity"),
+        ]
+        for text, claim_type, dimension in generic_cases:
+            card = _make_reviewable_claim("Crow", text, claim_type, "public_home", "public-safe", True, "high", text)
+            self.assertEqual(dimension, card["dossierDimension"], text)
+            self.assertIn("approve_public_wording", {a["action"] for a in card["allowedReviewActions"]}, text)
+
+        raw = _make_reviewable_claim("Crow", "contest/event activity", "role", "needs_confirmation", "activity", False, "low", "contest/event activity")
+        self.assertNotIn("approve_public_wording", {a["action"] for a in raw["allowedReviewActions"]})
+        protected = _make_reviewable_claim("Crow", "source-blind private Orion detail", "relationship", "source_blind", "protected", False, "low", "source-blind private protected note")
+        self.assertNotIn("approve_public_wording", {a["action"] for a in protected["allowedReviewActions"]})
+
+    def test_packet_internal_notes_are_redacted_before_review_context_hydration(self):
+        ctx = _build_review_context(
+            "Crow",
+            "Crow appeared near contest rules",
+            "contest_rules_poster",
+            "needs_confirmation",
+            False,
+            "contest_event_activity",
+            "classify_context",
+            "Crow appeared near contest rules",
+            {},
+            {"internalNotes": ["source-blind private token secret room detail", "Safe admin note about contest context."], "notes": ["protected DM note with raw id 123456"], "bnlNotes": []},
+        )
+        notes = ctx["existingInternalNotes"]
+        self.assertIn("Protected internal note exists, but details are withheld from this card.", notes)
+        self.assertIn("Safe admin note about contest context.", notes)
+        blob = json.dumps(notes).lower()
+        for forbidden in ("secret room", "token", "raw id", "123456", "dm note"):
+            self.assertNotIn(forbidden, blob)
+
     def test_resolver_finds_and_classifies_crow_memory_across_tables(self):
         with tempfile.NamedTemporaryFile(suffix='.db') as tmp:
             conn = sqlite3.connect(tmp.name)
