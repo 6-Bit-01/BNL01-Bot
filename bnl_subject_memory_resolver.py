@@ -540,38 +540,45 @@ def _display_clean(text: str) -> str:
 
 def _review_display_copy(subject: str, claim_text: str, claim_type: str, lane: str, public_safe: bool, actionability: str) -> dict[str, Any]:
     low = (claim_text or "").lower()
+    is_ai_project = bool(re.search(r"\b(ai|persona|project|bot|model|character|lore)\b", low)) and claim_type in {"relationship", "community_context"}
+    is_orion = "orion" in low and claim_type in {"relationship", "community_context"}
     title = "Review BNL claim"
-    decision = f"Is this claim approved for public use, internal use only, or should it be rejected?"
+    decision = "Is this claim approved for public use, internal use only, or should it be rejected?"
     checked = "You are checking whether this claim is true and approved for public use."
     why = "BNL found context that needs a human decision before it can be used publicly."
     rec = "BNL recommends asking for confirmation before using this in public copy."
+    evidence_summary = "No public approval has been provided yet." if not public_safe else "BNL found approved public wording for this item."
     safe = "Keep this out of public copy until approved."
     approval = "Approve only the exact wording that can be safely used publicly."
     target = "admin"
     audience = "admin"
     primary = "Add to admin follow-up"
     secondary = ["Reject / not needed"]
-    question = "Is this claim approved for public use, internal use only, or should it be rejected?"
+    question = "What public-safe source or owner-approved wording supports this claim?"
 
     if actionability == "non_actionable_artifact":
-        title = "Internal evidence artifact"
-        decision = "Should this vague evidence marker be kept internally or dismissed?"
-        checked = "This is not a public-ready claim. It only shows that BNL found subject-linked evidence that was not specific enough to approve."
+        title = "Internal audit item"
+        decision = "Keep this internal or dismiss it."
+        checked = "BNL found a weak internal signal, but it is not specific enough to become a Source File fact."
         why = "BNL flagged this because it is audit context, not a fact about the subject."
-        rec = "BNL recommends keeping this only as internal audit context or dismissing it."
-        safe = "Do not turn this into public wording."
-        approval = "Do not approve public wording from this artifact."
+        rec = "Keep it only if it helps explain why BNL flagged the subject. Otherwise dismiss it."
+        evidence_summary = "Internal signal only. No public fact is ready."
+        safe = "Do not use this in public wording."
+        approval = ""
         target = "none"; audience = "none"; question = ""
-        primary = "Keep as internal audit note"; secondary = ["Dismiss artifact"]
+        primary = "Keep as internal note"; secondary = ["Dismiss artifact"]
     elif actionability == "source_blind_warning" or lane == "source_blind":
         title = "Needs public source"
-        decision = "What public-safe source or owner-approved wording supports this claim?"
-        checked = "BNL found context, but it cannot be used publicly until it has a public source or owner-approved wording."
+        decision = "What public-safe source or owner-approved replacement wording supports this item?"
+        checked = "BNL found context, but it cannot be used publicly until it has a public source or owner-approved replacement."
         why = "BNL flagged this because the available context is not enough public proof by itself."
-        rec = "BNL recommends requesting a public source or owner-approved wording before approval."
+        rec = "BNL recommends requesting a public source or owner-approved replacement wording before approval."
+        evidence_summary = "Source-blind context exists, but it cannot be used publicly by itself."
+        safe = "Use only a public source or owner-approved replacement wording."
+        approval = "Only approve a public-source-backed replacement, not the source-blind note itself."
         target = "public_source"; audience = "public_source"
         primary = "Request public source"; secondary = ["Ask for owner-approved wording", "Reject / not needed"]
-        question = "What public-safe source supports this claim?"
+        question = "What public-safe source supports this source-blind context?"
     elif actionability == "weak_label":
         title = "Check weak label"
         label = "contest organizer" if "contest organizer" in low else _text(claim_text, 80)
@@ -579,55 +586,84 @@ def _review_display_copy(subject: str, claim_text: str, claim_type: str, lane: s
         checked = "You are checking whether a thin label has enough support to keep internally or approve later."
         why = "BNL flagged this because the label was too vague to approve as public copy."
         rec = "BNL recommends keeping this internal only if it helps review, otherwise reject it."
+        evidence_summary = "BNL saw a weak internal signal, but no Source File fact is ready."
+        safe = "Do not use this in public wording."
+        approval = "Only keep this as an internal note if the label is useful and accurate."
         target = "admin"; audience = "admin"; primary = "Save BNL internal note"; secondary = ["Reject weak label"]
         question = decision
-    elif claim_type in {"music_link", "public_link", "contest_music_context"}:
+    elif claim_type in {"music_link", "public_link"}:
         title = "Confirm approved public links"
         decision = f"Which links, if any, may BNL publicly associate with {subject}?"
         checked = f"You are checking whether these links belong to {subject} and whether BNL may mention them publicly."
-        why = "BNL found repeated link or music context but does not yet have approval to use it publicly."
-        rec = "BNL recommends asking who owns the links and which ones are approved for public reference."
-        target = "link_ownership"; audience = "subject"; primary = "Ask who owns these links"; secondary = ["Add to subject verification packet", "Reject / not needed"]
-        question = "Which music or contest-related links are yours and approved for public reference?"
+        why = "BNL found repeated link or music context, but it does not yet know which links are approved for public reference."
+        rec = "BNL recommends asking who owns the links and which ones are approved for public use."
+        evidence_summary = f"BNL saw music/link context connected to {subject}, but no owner-approved public link list has been confirmed."
+        safe = "Keep the links out of public copy until approved."
+        approval = f"Only approve links that are confirmed as {subject}'s and approved for public reference."
+        target = "link_ownership"; audience = "link_ownership"; primary = "Keep as internal note"; secondary = ["Ask who owns these links", "Reject / not needed"]
+        question = "Which links are yours and approved for BNL to mention publicly?"
     elif claim_type.startswith("contest_"):
         title = "Confirm contest relationship"
-        decision = f"What was {subject}’s relationship to this contest context?"
+        decision = f"What was {subject}'s relationship to this contest or rules context?"
         checked = f"You are checking whether {subject} was a participant, submitter, rules poster, link source, host, organizer, or only mentioned near the contest."
-        why = "BNL found contest context, but context alone does not prove a specific role."
-        rec = "BNL recommends confirming the exact relationship before writing public copy."
-        target = "subject"; audience = "subject"; primary = "Add to subject verification packet"; secondary = ["Use BNL suggested question", "Reject / not needed"]
+        why = f"BNL found contest/rules context, but it does not have enough proof to label {subject} as host or organizer."
+        rec = "BNL recommends asking for the exact relationship before using this publicly."
+        evidence_summary = "BNL saw contest/rules context, but the subject's role is not confirmed."
+        safe = f"Do not call {subject} a host or organizer unless that role is confirmed."
+        approval = "Only approve exact wording that matches the confirmed relationship."
+        target = "subject"; audience = "subject"; primary = "Keep as internal note"; secondary = ["Ask about contest relationship", "Reject / not needed"]
         question = "What was your relationship to this contest context: participant, submitter, rules poster, link source, host, organizer, or unrelated mention?"
+    elif is_orion:
+        title = "Confirm Orion/context use"
+        decision = f"Can BNL mention Orion in public {subject} context, or should it stay internal?"
+        checked = "You are checking whether this is public-safe story/context, internal continuity, or a private/source-blind reference."
+        why = "BNL found Orion/context references, but public use needs confirmation."
+        rec = "BNL recommends keeping this internal unless public wording is approved."
+        evidence_summary = "Orion/context reference exists, but public-safe wording is not confirmed."
+        safe = "Keep Orion/context internal until approved."
+        approval = "Only approve public wording if Orion/context is allowed for this subject."
+        target = "subject"; audience = "subject"; primary = "Keep as internal note"; secondary = ["Ask about Orion/context use", "Reject / not needed"]
+        question = f"Can BNL mention Orion in public {subject} context, or should that stay internal?"
+    elif is_ai_project:
+        title = "Confirm project relationship"
+        decision = f"How may BNL describe {subject}'s connection to this AI/persona/project context?"
+        checked = "You are checking whether this is a real public relationship, an internal/lore reference, or just nearby context that should not be used publicly."
+        why = f"BNL found {subject} near AI/persona/project context, but the public-safe relationship is not confirmed."
+        rec = "BNL recommends asking what wording is approved before using this in public copy."
+        evidence_summary = "BNL found AI/persona/project context, but no approved public relationship wording yet."
+        safe = "Keep this internal until the relationship and wording are confirmed."
+        approval = "Only approve the exact public wording that the subject or admin confirms."
+        target = "owner_approved_wording"; audience = "subject"; primary = "Keep as internal note"; secondary = ["Ask for approved wording", "Reject / not needed"]
+        question = "Can BNL mention this AI/persona/project connection publicly? If yes, what exact wording should it use?"
     elif claim_type in {"role", "community_context"}:
         title = "Confirm public role"
         decision = f"What public role/title may BNL use for {subject}, if any?"
-        checked = "You are checking whether this role is true and approved for public use."
-        why = "BNL found possible role context but does not have approved public wording yet."
-        rec = "BNL recommends asking for the exact approved public role or title."
-        target = "subject"; audience = "subject"; primary = "Add to subject verification packet"; secondary = ["Use BNL suggested question", "Reject / not needed"]
+        checked = "You are checking whether the role is true and approved for public use."
+        why = "BNL found role-like context, but role wording needs owner/admin approval before public use."
+        rec = "BNL recommends confirming the exact public role/title before using it."
+        evidence_summary = "BNL saw role-like context, but exact public title is not approved."
+        safe = "Do not use a role/title publicly until it is confirmed."
+        approval = "Only approve the exact role/title that is confirmed for public use."
+        target = "subject"; audience = "subject"; primary = "Keep as internal note"; secondary = ["Ask for public role/title", "Reject / not needed"]
         question = "What public role/title should BNL use for you, if any?"
-    elif claim_type == "relationship" and "orion" in low:
-        title = "Confirm relationship context"
-        decision = f"Can BNL mention Orion in public {subject} context?"
-        checked = f"You are checking whether Orion/context may be mentioned publicly for {subject}, or should stay internal."
-        why = "BNL found relationship or context language that needs approval before public use."
-        rec = "BNL recommends subject or owner confirmation before public wording."
-        target = "subject"; audience = "subject"; primary = "Add to subject verification packet"; secondary = ["Ask for owner-approved wording", "Reject / not needed"]
-        question = f"Can BNL mention Orion in public {subject} context, or should that stay internal?"
     elif claim_type == "queue_submission":
-        title = "Confirm queue or submission history"
-        decision = f"May BNL publicly mention {subject}’s queue or submission history?"
-        checked = "You are checking whether queue or submission history is approved for public use."
-        why = "BNL found queue or submission context that needs approval before public wording."
-        rec = "BNL recommends admin confirmation before public use."
-        target = "admin"; audience = "admin"; primary = "Add to admin follow-up"; secondary = ["Reject / not needed"]
-        question = "Is this claim approved for public use, internal use only, or should it be rejected?"
+        title = "Confirm queue/submission history"
+        decision = "May BNL mention this queue or submission history publicly?"
+        checked = "You are checking whether this history is public-safe, useful, and approved for mention."
+        why = "BNL found queue/submission context, but it needs confirmation before public use."
+        rec = "BNL recommends keeping it internal unless the subject/admin approves public wording."
+        evidence_summary = "Queue/submission context exists, but public-safe wording is not confirmed."
+        safe = "Keep queue/submission history internal unless approved."
+        approval = "Only approve exact public wording that does not expose private queue or admin context."
+        target = "admin"; audience = "admin"; primary = "Keep as internal note"; secondary = ["Ask admin about queue/submission history", "Reject / not needed"]
+        question = "May BNL mention this queue or submission history publicly, and what exact wording is approved?"
     return {k: _display_clean(v) if isinstance(v, str) else v for k, v in {
         "displayTitle": title,
         "displayDecision": decision,
         "displayWhatIsBeingChecked": checked,
         "displayWhyBNLFlaggedIt": why,
         "displayBNLRecommendation": rec,
-        "displayEvidenceSummary": "No public approval has been provided yet." if not public_safe else "BNL found approved public wording for this item.",
+        "displayEvidenceSummary": evidence_summary,
         "displaySafeDefault": safe,
         "displayApprovalInstruction": approval,
         "confirmationTarget": target,
@@ -819,7 +855,7 @@ def _safe_evidence_example(text: str, subject: str) -> str:
 
 def _make_reviewable_claim(subject: str, claim_text: str, claim_type: str, lane: str, why: str, public_safe: bool, confidence: str, evidence: str = "", blocked: list[str] | None = None) -> dict[str, Any]:
     actionability = _claim_actionability(claim_text, claim_type, lane, public_safe)
-    display_claim_text = "Vague internal evidence marker" if actionability == "non_actionable_artifact" else claim_text
+    display_claim_text = "Weak internal signal — not a public fact" if actionability == "non_actionable_artifact" else claim_text
     item = {
         "claimText": _text(display_claim_text, 300),
         "claimType": claim_type,
