@@ -2035,7 +2035,16 @@ def _compose_source_file_review_card(subject: str, claim: dict[str, Any], dossie
     public_wording = _clean_suggested_public_wording(str(claim.get("suggestedPublicWording") or ""))
     if _is_raw_review_label(public_wording) or protected:
         public_wording = ""
-    public_approval_ready = bool((claim.get("publicSafe") is True and (public_wording or anchor.get("hasAnchor"))) or (public_wording and claim.get("recommendedAction") == "approve_public") or (claim.get("recommendedAction") == "approve_public" and not protected))
+    has_valid_public_wording = bool(public_wording)
+    has_public_safe_anchor = bool(claim.get("publicSafe") is True and anchor.get("hasAnchor"))
+    has_existing_public_approval = bool(claim.get("recommendedAction") == "approve_public")
+    public_approval_ready = bool(
+        not protected
+        and (
+            has_valid_public_wording
+            or (answerability != "not_answerable" and (has_public_safe_anchor or has_existing_public_approval))
+        )
+    )
     if public_approval_ready:
         answerability = "answerable"
     if dossier_dimension not in target_dimensions:

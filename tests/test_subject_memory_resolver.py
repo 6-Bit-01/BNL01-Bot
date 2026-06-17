@@ -192,7 +192,7 @@ class SubjectMemoryResolverTests(unittest.TestCase):
             "allowedReviewActions": [{"action": "ask_follow_up", "label": "Ask follow-up"}],
             "suggestedPublicWording": "Crow submitted to the Moon Jam contest.",
         }
-        stale_context = _build_review_context("Crow", "Crow publicly submitted to the Moon Jam contest", "contest_submitter", "public_home", True, "contest_event_activity", "approve_public_fact", "Crow publicly submitted to the Moon Jam contest")
+        stale_context = _build_review_context("Crow", "Crow publicly submitted to the Moon Jam contest", "contest_submitter", "public_home", False, "contest_event_activity", "approve_public_fact", "Crow publicly submitted to the Moon Jam contest")
         restored = _compose_source_file_review_card("Crow", stale_claim, "contest_event_activity", "approve_public_fact", stale_context)
         self.assertEqual("decidable", restored["decisionState"])
         self.assertEqual("approve_public", restored["recommendedAction"])
@@ -204,6 +204,19 @@ class SubjectMemoryResolverTests(unittest.TestCase):
         self.assertEqual("decidable", collab["decisionState"])
         self.assertEqual("approve_public", collab["recommendedAction"])
         self.assertIn("approve_public_wording", {a["action"] for a in collab["allowedReviewActions"]})
+
+        stale_collab = {
+            "publicSafe": True,
+            "decisionState": "needs_clarification",
+            "recommendedAction": "needs_more_info",
+            "allowedReviewActions": [{"action": "ask_follow_up", "label": "Ask follow-up"}],
+            "suggestedPublicWording": "Crow is credited as a collaborator on the released project.",
+        }
+        stale_collab_context = _build_review_context("Crow", "Owner-confirmed public-safe collaborator credited on a released project", "role", "public_home", False, "collaboration_status", "approve_public_fact", "Owner-confirmed public-safe collaborator credited on a released project")
+        restored_collab = _compose_source_file_review_card("Crow", stale_collab, "collaboration_status", "approve_public_fact", stale_collab_context)
+        self.assertEqual("decidable", restored_collab["decisionState"])
+        self.assertEqual("approve_public", restored_collab["recommendedAction"])
+        self.assertIn("approve_public_wording", {a["action"] for a in restored_collab["allowedReviewActions"]})
 
         generic_cases = [
             ("Crow public profile link https://example.com/crow", "public_link", "links_socials"),
