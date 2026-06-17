@@ -178,12 +178,12 @@ def _lore_scope_for_text(subject: str, text: str) -> dict[str, Any]:
         return scope
     pairs = [("orion_lore", "Orion-related lore", "orion"), ("null_tv_lore", "Null TV lore", "null tv"), ("barcode_network_lore", "BARCODE Network lore", "barcode"), ("six_bit_bnl_lore", "Six Bit/BNL lore", "bnl"), ("discord_community_lore", "Discord community lore", "discord"), ("broadcast_radio_lore", "broadcast/radio lore", "broadcast radio show"), ("recurring_bit_or_topic", "recurring stream topic", "recurring bit topic")]
     st, label = "unknown_lore_context", "unknown lore/context"
-    if re.search(rf"\b{re.escape(subject)}(?:'s|’s)?\s+lore\b|\blore\b.*\b{re.escape(subject)}\b", value, re.I):
-        st, label = "subject_lore", f"{subject}'s lore"
+    for a, b, keys in pairs:
+        if any(k in low for k in keys.split()):
+            st, label = a, b; break
     else:
-        for a, b, keys in pairs:
-            if any(k in low for k in keys.split()):
-                st, label = a, b; break
+        if re.search(rf"\b{re.escape(subject)}(?:'s|’s)?\s+lore\b|\blore\b.*\b{re.escape(subject)}\b", value, re.I):
+            st, label = "subject_lore", f"{subject}'s lore"
     scope.update({"hasSignal": True, "scopeKnown": st != "unknown_lore_context", "scopeType": st, "scopeLabel": label, "confidence": "medium" if st != "unknown_lore_context" else "low", "shouldEmitReviewCard": True, "shouldEmitReadinessQuestion": True, "reason": "Lore/context scope identified." if st != "unknown_lore_context" else "Lore/context wording is unscoped and needs classification."})
     return scope
 
@@ -209,6 +209,74 @@ def _theory_anomaly_scope_for_text(subject: str, text: str) -> dict[str, Any]:
         st, label = "unknown_theory_anomaly", "unknown theory/anomaly"
     scope.update({"hasSignal": True, "scopeKnown": st != "unknown_theory_anomaly", "scopeType": st, "scopeLabel": label, "confidence": "medium" if st != "unknown_theory_anomaly" else "low", "shouldEmitReviewCard": True, "shouldEmitReadinessQuestion": True, "reason": "Theory/anomaly scope identified." if st != "unknown_theory_anomaly" else "Theory/anomaly wording is unscoped and needs classification."})
     return scope
+
+def _ai_persona_project_scope_for_text(subject: str, text: str) -> dict[str, Any]:
+    value = _text(text, 1000)
+    scope = dict(_BROAD_SCOPE_DEFAULT)
+    if not re.search(r"\b(ai|persona|project|bot|model|character)\b", value, re.I):
+        return scope
+    label = ""
+    m = re.search(r"\b(?:AI|persona|project|bot|model|character)\s+(?:named|called|with)\s+([A-Z][A-Za-z0-9 _-]{2,60})\b", value)
+    if m:
+        label = _text(m.group(1), 80)
+    scope.update({
+        "hasSignal": True,
+        "scopeKnown": bool(label),
+        "scopeType": "named_ai_persona_project" if label else "unknown_ai_persona_project",
+        "scopeLabel": label or "AI/persona/project interaction",
+        "objectName": label,
+        "confidence": "medium" if label else "low",
+        "shouldEmitReviewCard": True,
+        "shouldEmitReadinessQuestion": True,
+        "reason": "AI/persona/project object identified." if label else "AI/persona/project wording needs interaction scope before any public claim.",
+    })
+    return scope
+
+def _scoped_follow_up_for_claim(subject: str, claim_text: str, claim_type: str, lane: str, actionability: str, scope: dict[str, Any] | None = None) -> dict[str, Any]:
+    low = (claim_text or "").lower()
+    source_blind = actionability == "source_blind_warning" or lane == "source_blind" or bool(re.search(r"\b(source[-_\s]*blind|private|withheld|internal[-\s]*only)\b", low))
+    if source_blind:
+        return {"question": "Can an owner/admin provide public-safe replacement wording for this context, or should BNL keep it internal?", "audience": "public_source", "reason": "BNL cannot expose or rely on source-blind/private context in public copy without public-safe replacement wording.", "answerType": "public-safe replacement wording or confirmation to keep internal", "confidence": "low", "scopeLabel": "source-blind/private context", "scopeKnown": False}
+
+    if claim_type.startswith("contest_") or re.search(r"\b(contest|challenge|tournament|battle|competition)\b", low):
+        s = scope or _contest_scope_for_text(subject, claim_text)
+        known = bool(s.get("scopeKnown"))
+        question = (f"BNL found {s.get('scopeLabel') or 'contest/event'} context near {subject}. Was {subject} a participant, submitter, link source, rules source, organizer, host, or just mentioned nearby?"
+                    if known else f"What contest or event is this referring to, and was {subject} actually involved?")
+        return {"question": question, "audience": "admin", "reason": "BNL cannot infer contest role from nearby contest wording.", "answerType": "contest/event name plus subject role", "confidence": s.get("confidence") or "low", "scopeLabel": s.get("scopeLabel") or "", "scopeKnown": known}
+    if claim_type == "rules_instructions_context" or re.search(r"\b(rules?|instructions?|guidelines?)\b", low):
+        s = scope or _rules_instructions_scope_for_text(subject, claim_text)
+        known = bool(s.get("scopeKnown"))
+        question = (f"BNL found {s.get('scopeLabel')} near {subject}. What rules or instructions is this referring to, who were they for, and was {subject} the person posting them, following them, being mentioned near them, or unrelated?"
+                    if known else f"What rules or instructions is this referring to, who were they for, and what was {subject}'s actual role with them?")
+        return {"question": question, "audience": "admin", "reason": "BNL needs the instruction source, audience, purpose, and subject role before treating it as a dossier fact.", "answerType": "what the instructions were, who they were for, and subject role", "confidence": s.get("confidence") or "low", "scopeLabel": s.get("scopeLabel") or "", "scopeKnown": known}
+    if re.search(r"\b(theory|theories|anomal(?:y|ies)|glitch|technical issue)\b", low):
+        s = scope or _theory_anomaly_scope_for_text(subject, claim_text)
+        known = bool(s.get("scopeKnown"))
+        question = (f"Should BNL include this {s.get('scopeLabel')} in {subject}'s public dossier, keep it internal, or ignore it?"
+                    if known else f"What theory or anomaly is this referring to, and is it about {subject}, BARCODE lore, Orion, a recurring topic, a technical issue, or something unrelated?")
+        return {"question": question, "audience": "admin", "reason": "BNL needs to know what the theory/anomaly refers to before it can decide whether to draft around it.", "answerType": "scope of the theory/anomaly plus public/internal decision", "confidence": s.get("confidence") or "low", "scopeLabel": s.get("scopeLabel") or "", "scopeKnown": known}
+    if "orion" in low:
+        return {"question": f"Can BNL mention Orion in public {subject} context, or should it stay internal?", "audience": "admin", "reason": "BNL needs to know whether Orion/context references are public-safe before drafting around them.", "answerType": "public/internal decision for Orion/context wording", "confidence": "medium", "scopeLabel": "Orion/context", "scopeKnown": True}
+    if re.search(r"\blore[-\s]*heavy|\b(lore|canon|recurring (?:bit|topic))\b", low):
+        s = scope or _lore_scope_for_text(subject, claim_text)
+        known = bool(s.get("scopeKnown"))
+        question = (f"Should BNL mention this {s.get('scopeLabel')} in {subject}'s public dossier, or keep it internal?"
+                    if known else f"Is this {subject}'s own lore, BARCODE Network lore, Orion lore, Null TV lore, broadcast lore, recurring community context, or something else? Should BNL use it publicly or keep it internal?")
+        return {"question": question, "audience": "admin", "reason": "BNL needs this before deciding whether the lore belongs in a concrete public dossier.", "answerType": "classification of the lore/context plus public/internal decision", "confidence": s.get("confidence") or "low", "scopeLabel": s.get("scopeLabel") or "", "scopeKnown": known}
+    if re.search(r"\b(ai|persona|project|bot|model|character)\b", low) and claim_type in {"relationship", "community_context"}:
+        s = scope or _ai_persona_project_scope_for_text(subject, claim_text)
+        obj = _text(s.get("objectName") or "", 80)
+        question = (f"Can BNL mention {subject}'s interaction with {obj} publicly? If yes, what exact wording should it use?"
+                    if obj else f"BNL found an AI/persona/project connection or interaction near {subject}, but not enough context. What interaction is this referring to, and should it be public, internal, or ignored?")
+        return {"question": question, "audience": "admin", "reason": "BNL needs to know whether this AI/persona/project interaction is public, internal, or irrelevant.", "answerType": "plain-language explanation of the interaction and whether it can be public", "confidence": s.get("confidence") or "low", "scopeLabel": s.get("scopeLabel") or "", "scopeKnown": bool(s.get("scopeKnown"))}
+    if claim_type in {"music_link", "public_link"}:
+        return {"question": f"Which {subject} links are owned or approved for public reference? Which {subject} links, music links, or social links may BNL mention publicly?", "audience": "subject", "reason": "BNL needs owner-approved links before associating them with the subject publicly.", "answerType": "owned/approved links or confirmation that no links are public", "confidence": "medium", "scopeLabel": "links/music/socials", "scopeKnown": True}
+    if claim_type == "queue_submission":
+        return {"question": f"Can {subject}'s queue/submission history be referenced publicly, or should it stay internal?", "audience": "admin", "reason": "BNL needs confirmation before turning queue/submission context into public dossier wording.", "answerType": "public/internal decision and approved queue/submission wording", "confidence": "medium", "scopeLabel": "queue/submission", "scopeKnown": True}
+    if claim_type in {"role", "community_context"}:
+        return {"question": f"What public role/title should BNL use for {subject}, if any?", "audience": "subject", "reason": "BNL needs exact public role/title wording before it can state a role.", "answerType": "exact public role/title wording or confirmation not to state one", "confidence": "medium", "scopeLabel": "role/title", "scopeKnown": True}
+    return {"question": "What proof or approved wording should BNL use before saying this publicly?", "audience": "admin", "reason": "BNL found context that needs a human decision before it can be used publicly.", "answerType": "plain-language approval, correction, or public-safe wording", "confidence": "low", "scopeLabel": "", "scopeKnown": False}
 
 def _has_admin_contest_organizer_rejection(resolved_memory: dict[str, Any], packet: dict[str, Any] | None = None) -> bool:
     blob = json.dumps(packet or {}, default=str) + " " + " ".join(json.dumps(resolved_memory.get(k) or [], default=str) for k in ("reviewOnlyEvidence", "privateOrInternalEvidence", "sourceSafetyWarnings", "missingInfoQuestions"))
@@ -833,6 +901,15 @@ def _review_display_copy(subject: str, claim_text: str, claim_type: str, lane: s
         approval = "Only approve exact public wording that does not expose private queue or admin context."
         target = "admin"; audience = "admin"; primary = "Keep as internal note"; secondary = ["Ask admin about queue/submission history", "Reject / not needed"]
         question = "May BNL mention this queue or submission history publicly, and what exact wording is approved?"
+    follow_up = None
+    if actionability != "non_actionable_artifact" and lane != "admin_correction_conflict":
+        follow_up = _scoped_follow_up_for_claim(subject, claim_text, claim_type, lane, actionability)
+        if actionability != "weak_label" or follow_up.get("question") != "What proof or approved wording should BNL use before saying this publicly?":
+            question = str(follow_up.get("question") or question)
+            audience = str(follow_up.get("audience") or audience)
+            why = str(follow_up.get("reason") or why)
+    answer_type = str((follow_up or {}).get("answerType") or "plain-language approval, correction, or public-safe wording")
+    confidence = str((follow_up or {}).get("confidence") or ("medium" if public_safe else ("low" if actionability in {"source_blind_warning", "weak_label"} else "medium")))
     return {k: _display_clean(v) if isinstance(v, str) else v for k, v in {
         "displayTitle": title,
         "displayDecision": decision,
@@ -846,15 +923,17 @@ def _review_display_copy(subject: str, claim_text: str, claim_type: str, lane: s
         "primaryActionLabel": primary,
         "secondaryActionLabels": secondary,
         "verificationPacketQuestion": question,
+        "verificationPacketQuestions": [question] if question else [],
         "verificationPacketAudience": audience,
         "recommendedFollowUpQuestion": question,
         "recommendedFollowUpAudience": audience if audience in {"subject", "admin", "owner", "public_source"} else ("subject" if audience == "link_ownership" else ("admin" if audience == "none" else audience)),
         "recommendedFollowUpReason": why,
-        "bestGuessConfidence": "medium" if public_safe else ("low" if actionability in {"source_blind_warning", "weak_label"} else "medium"),
+        "bestGuessConfidence": confidence,
         "suggestedConfirmationAudience": audience if audience in {"subject", "admin", "owner", "public_source"} else ("subject" if audience == "link_ownership" else "admin"),
         "suggestedConfirmationQuestion": question,
         "suggestedConfirmationReason": why,
-        "suggestedConfirmationAnswerType": "plain-language approval, correction, or public-safe wording",
+        "suggestedConfirmationAnswerType": answer_type,
+        "suggestedMissingInfoQuestion": question,
     }.items()}
 
 
@@ -1203,6 +1282,11 @@ def _admin_conflict_fields(subject: str, evidence: str, correction: dict[str, An
         "recommendedActionReason": "New evidence appears to conflict with an admin correction; do not override silently.",
     }
     fields.update(_review_display_copy(subject, fields["claimText"], "role", fields["reviewLane"], False, "missing_confirmation"))
+    fields["suggestedMissingInfoQuestion"] = "Admin previously rejected this label. Is there new owner-approved evidence that changes it?"
+    fields["suggestedConfirmationQuestion"] = fields["suggestedMissingInfoQuestion"]
+    fields["recommendedFollowUpQuestion"] = fields["suggestedMissingInfoQuestion"]
+    fields["verificationPacketQuestion"] = fields["suggestedMissingInfoQuestion"]
+    fields["verificationPacketQuestions"] = [fields["suggestedMissingInfoQuestion"]]
     return fields
 
 def _resolved_missing_info_types(corrections: list[dict[str, Any]]) -> set[str]:
