@@ -2056,8 +2056,8 @@ def _compose_source_file_review_card(subject: str, claim: dict[str, Any], dossie
             if not any(a.get("action") == "approve_public_wording" for a in existing_actions if isinstance(a, dict)):
                 existing_actions = _actions(("approve_public_wording", "Approve public wording")) + existing_actions
             out["allowedReviewActions"] = existing_actions or _public_approval_actions()
-            out["decisionState"] = claim.get("decisionState") or "decidable"
-            out["recommendedAction"] = claim.get("recommendedAction") or "approve_public"
+            out["decisionState"] = "decidable"
+            out["recommendedAction"] = "approve_public"
         elif answerability == "not_answerable" or protected:
             out["allowedReviewActions"] = _actions(("keep_internal", "Keep internal"), ("ask_follow_up", "Ask follow-up"), ("reject", "Reject / not useful"))
         if not public_wording:
@@ -2088,8 +2088,8 @@ def _compose_source_file_review_card(subject: str, claim: dict[str, Any], dossie
     else:
         note = str(claim.get("suggestedInternalNote") or f"Possible {dossier_dimension.replace('_', ' ')} signal exists, but BNL does not have enough safe context to describe it yet.")
     if public_approval_ready:
-        claim.setdefault("decisionState", "decidable")
-        claim.setdefault("recommendedAction", "approve_public")
+        claim["decisionState"] = "decidable"
+        claim["recommendedAction"] = "approve_public"
         existing_actions = claim.get("allowedReviewActions") or []
         if not any(a.get("action") == "approve_public_wording" for a in existing_actions if isinstance(a, dict)):
             existing_actions = _actions(("approve_public_wording", "Approve public wording")) + existing_actions
@@ -2131,6 +2131,9 @@ def _compose_source_file_review_card(subject: str, claim: dict[str, Any], dossie
     }
     if claim.get("allowedReviewActions"):
         out["allowedReviewActions"] = claim.get("allowedReviewActions")
+    if public_approval_ready:
+        out["decisionState"] = claim.get("decisionState")
+        out["recommendedAction"] = claim.get("recommendedAction")
     if answerability == "not_answerable":
         out["displayDecision"] = "Internal audit only — BNL needs a concrete safe evidence anchor before review."
         out["displayApprovalInstruction"] = "Do not approve public wording from this item; ask for context, keep internal, or reject."
