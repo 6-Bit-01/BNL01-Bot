@@ -423,3 +423,33 @@ class DossierReadinessPacketTests(unittest.TestCase):
         self.assertEqual(card["displayTitle"], "Confirm Crow's lore use")
         self.assertIn("Crow's lore", card["verificationPacketQuestion"])
         self.assertNotIn("public-safe source", card["verificationPacketQuestion"].lower())
+
+    def test_scoped_follow_up_populates_current_and_legacy_fields(self):
+        generic = "What proof or approved wording should BNL use before saying this publicly?"
+        cases = [
+            ("ai", _review_guidance("Crow", "Crow appears near AI persona project context", "relationship", "needs_confirmation", False), "AI/persona/project connection", "plain-language explanation of the interaction"),
+            ("lore", _review_guidance("Crow", "lore-heavy context only", "relationship", "needs_confirmation", False), "BARCODE Network lore", "classification of the lore/context"),
+            ("theory", _review_guidance("Crow", "unknown theory anomaly near Crow", "relationship", "needs_confirmation", False), "What theory or anomaly", "scope of the theory/anomaly"),
+            ("rules", _review_guidance("Crow", "unclear rules and instructions near Crow", "rules_instructions_context", "needs_confirmation", False), "What rules or instructions", "what the instructions were"),
+            ("contest", _review_guidance("Crow", "Crow appeared near contest rules", "contest_rules_poster", "needs_confirmation", False), "What contest or event", "contest/event name plus subject role"),
+        ]
+        for _name, card, expected, answer_type in cases:
+            question = card["recommendedFollowUpQuestion"]
+            self.assertIn(expected, question)
+            self.assertNotEqual(generic, question)
+            self.assertEqual(card["suggestedConfirmationQuestion"], question)
+            self.assertEqual(card["suggestedMissingInfoQuestion"], question)
+            self.assertEqual(card["verificationPacketQuestions"], [question])
+            self.assertEqual(card["verificationPacketQuestion"], question)
+            self.assertEqual(card["suggestedConfirmationAudience"], card["recommendedFollowUpAudience"])
+            self.assertIn(answer_type, card["suggestedConfirmationAnswerType"])
+            self.assertNotEqual("BNL found context that needs a human decision before it can be used publicly.", card["suggestedConfirmationReason"])
+            self.assertEqual(card["suggestedConfirmationReason"], card["recommendedFollowUpReason"])
+
+        blind = _review_guidance("Crow", "source-blind lore theory anomaly private evidence says secret room", "relationship", "source_blind", False)
+        self.assertEqual(blind["suggestedConfirmationQuestion"], "Can an owner/admin provide public-safe replacement wording for this context, or should BNL keep it internal?")
+        self.assertIn("public-safe replacement wording", blind["suggestedConfirmationAnswerType"])
+        self.assertNotIn("secret room", blind["suggestedConfirmationQuestion"].lower())
+
+        fallback = _review_guidance("Crow", "unclassified possible claim", "missing_confirmation", "needs_confirmation", False)
+        self.assertEqual(fallback["suggestedMissingInfoQuestion"], generic)
