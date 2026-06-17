@@ -48,7 +48,7 @@ def humanize_internal_label(value: str) -> str:
 
 def classify_contest_event_context(text: str) -> tuple[str, dict[str, bool]]:
     value = _text(text, 1000)
-    has_contest = bool(re.search(r"\bcontest\b", value, re.I))
+    has_contest = bool(re.search(r"\b(contest|challenge|tournament|battle|competition)\b", value, re.I))
     hints = {
         "contestName": has_contest and bool(re.search(r"\b(?:contest name|suno contest|[A-Z][A-Za-z0-9 ]+ contest)\b", value)),
         "rulesMentioned": bool(_CONTEST_RULES_RE.search(value)),
@@ -76,6 +76,139 @@ def classify_contest_event_context(text: str) -> tuple[str, dict[str, bool]]:
     if hints["dateMentioned"]: return "contest_date_context", hints
     if hints["channelMentioned"]: return "contest_channel_context", hints
     return "contest_mention_only", hints
+
+_BROAD_SCOPE_DEFAULT = {
+    "hasSignal": False, "scopeKnown": False, "scopeLabel": "", "scopeType": "",
+    "subjectRoleHint": "unknown", "objectName": "", "host": "", "platform": "",
+    "targetAudience": "", "confidence": "low", "shouldEmitReviewCard": False,
+    "shouldEmitReadinessQuestion": False, "reason": "",
+}
+
+def _named_actor_before_verb(text: str, verbs: str) -> str:
+    m = re.search(rf"\b([A-Z][A-Za-z0-9_-]{{2,40}})\s+(?:is\s+|was\s+)?(?:the\s+)?(?:{verbs})\b", text)
+    return m.group(1) if m else ""
+
+def _contest_scope_for_text(subject: str, text: str) -> dict[str, Any]:
+    value = _text(text, 1000)
+    low = value.lower()
+    scope = dict(_BROAD_SCOPE_DEFAULT)
+    has_signal = bool(re.search(r"\b(contest|challenge|tournament|battle|competition)\b", value, re.I))
+    scope.update({"hasSignal": has_signal, "scopeType": "unknown_contest_context"})
+    if not has_signal:
+        return scope
+    obj = ""
+    m = re.search(r"\b(?:the\s+)?([A-Z][A-Za-z0-9' -]{2,70}?\s+(?:contest|challenge|tournament|battle|competition))\b", value)
+    if m and not m.group(1).lower().startswith(subject.lower() + " "):
+        obj = _text(m.group(1), 90)
+    host = _named_actor_before_verb(value, r"host(?:ed|s|ing)?|organize(?:d|s|r|rs|ing)?|run(?:s|ning)?|ran|created")
+    if not host:
+        hm = re.search(r"\b([A-Z][A-Za-z0-9_-]{2,40})[- ]hosted\s+(?:contest|challenge|tournament|battle|competition)\b", value)
+        if hm:
+            host = hm.group(1)
+    if not host:
+        hm = re.search(r"\binvolving\s+([A-Z][A-Za-z0-9_-]{2,40})[- ]hosted\s+(?:contest|challenge|tournament|battle|competition)\b", value)
+        if hm:
+            host = hm.group(1)
+    if re.search(rf"\b{re.escape(subject)}\s+(?:host(?:ed|s|ing)?|organize(?:d|s|ing)?|runs?|ran|created)\b.*\b(contest|challenge|tournament|battle|competition)\b", value, re.I):
+        scope["subjectRoleHint"] = "host_or_organizer"
+        if not host:
+            host = subject
+    elif re.search(rf"\b{re.escape(subject)}\b.*\b(submitted|submitter|entry|entered|participant)\b|\b(submitted|entered)\b.*\b{re.escape(subject)}\b", value, re.I):
+        scope["subjectRoleHint"] = "submitter_or_participant"
+    elif re.search(rf"\b{re.escape(subject)}\b.*\b(posted|shared|linked|reposted)\b.*\b(rules|link|url)\b", value, re.I):
+        scope["subjectRoleHint"] = "rules_or_link_source"
+    elif re.search(rf"\b{re.escape(subject)}\b", value, re.I):
+        scope["subjectRoleHint"] = "mentioned_near_context"
+    platform = ""
+    pm = re.search(r"\b(?:on|in|via|at)\s+([A-Z][A-Za-z0-9 _-]{2,40}|Discord|Suno|YouTube|Twitch|Null TV|BARCODE Radio)\b", value)
+    if pm:
+        platform = _text(pm.group(1), 60)
+    role_clue = scope["subjectRoleHint"] != "unknown" and scope["subjectRoleHint"] != "mentioned_near_context"
+    known = bool(obj or host or platform or role_clue or re.search(r"\b(contest name|submission|entry|deadline|dates?|channel|public link)\b", value, re.I))
+    scope.update({
+        "scopeKnown": known,
+        "scopeLabel": (f"{host}-hosted contest" if host else (obj or (f"{platform} contest context" if platform else "contest/rules context"))),
+        "objectName": obj,
+        "host": host,
+        "platform": platform,
+        "confidence": "high" if (obj and role_clue) or (host and role_clue) else ("medium" if known else "low"),
+        "shouldEmitReviewCard": bool(known),
+        "shouldEmitReadinessQuestion": True,
+        "reason": ("Contest object identified — subject appears as " + scope["subjectRoleHint"]) if (known and role_clue) else ("Contest context identified — subject relationship unclear" if known else "Unscoped contest wording — no host, event, platform, source, or role identified"),
+    })
+    if host:
+        scope["scopeType"] = "contest_with_evidence_host"
+    elif obj:
+        scope["scopeType"] = "named_contest"
+    elif platform:
+        scope["scopeType"] = "platform_contest_context"
+    return scope
+
+def _rules_instructions_scope_for_text(subject: str, text: str) -> dict[str, Any]:
+    value = _text(text, 1000)
+    low = value.lower()
+    scope = dict(_BROAD_SCOPE_DEFAULT)
+    has_signal = bool(re.search(r"\b(rules?|instructions?|guidelines?)\b", value, re.I))
+    if not has_signal:
+        return scope
+    if "contest" in low or "challenge" in low:
+        st = "contest_rules"
+    elif "queue" in low or "submission" in low:
+        st = "queue_submission_instructions"
+    elif "discord" in low or "admin" in low or "mod" in low:
+        st = "discord_admin_instructions"
+    elif "broadcast" in low or "show" in low or "radio" in low:
+        st = "broadcast_show_instructions"
+    elif "site" in low or "workflow" in low or "source file" in low:
+        st = "site_workflow_instructions"
+    elif "prompt" in low or "system instruction" in low:
+        st = "prompt_or_system_instructions"
+    else:
+        st = "unknown_instructions"
+    target = ""
+    tm = re.search(r"\b(?:for|to)\s+([A-Z][A-Za-z0-9 _-]{2,50}|artists|submitters|admins|mods|viewers|participants)\b", value)
+    if tm:
+        target = _text(tm.group(1), 70)
+    scope.update({"hasSignal": True, "scopeKnown": st != "unknown_instructions", "scopeType": st, "scopeLabel": st.replace("_", " "), "targetAudience": target, "confidence": "medium" if st != "unknown_instructions" else "low", "shouldEmitReviewCard": True, "shouldEmitReadinessQuestion": True, "reason": "Scoped rules/instructions context identified." if st != "unknown_instructions" else "Unclear rules/instructions wording needs classification before any role claim."})
+    return scope
+
+def _lore_scope_for_text(subject: str, text: str) -> dict[str, Any]:
+    value = _text(text, 1000); low = value.lower(); scope = dict(_BROAD_SCOPE_DEFAULT)
+    if not re.search(r"\b(lore|canon|context|recurring (?:bit|topic))\b", value, re.I):
+        return scope
+    pairs = [("orion_lore", "Orion-related lore", "orion"), ("null_tv_lore", "Null TV lore", "null tv"), ("barcode_network_lore", "BARCODE Network lore", "barcode"), ("six_bit_bnl_lore", "Six Bit/BNL lore", "bnl"), ("discord_community_lore", "Discord community lore", "discord"), ("broadcast_radio_lore", "broadcast/radio lore", "broadcast radio show"), ("recurring_bit_or_topic", "recurring stream topic", "recurring bit topic")]
+    st, label = "unknown_lore_context", "unknown lore/context"
+    if re.search(rf"\b{re.escape(subject)}(?:'s|’s)?\s+lore\b|\blore\b.*\b{re.escape(subject)}\b", value, re.I):
+        st, label = "subject_lore", f"{subject}'s lore"
+    else:
+        for a, b, keys in pairs:
+            if any(k in low for k in keys.split()):
+                st, label = a, b; break
+    scope.update({"hasSignal": True, "scopeKnown": st != "unknown_lore_context", "scopeType": st, "scopeLabel": label, "confidence": "medium" if st != "unknown_lore_context" else "low", "shouldEmitReviewCard": True, "shouldEmitReadinessQuestion": True, "reason": "Lore/context scope identified." if st != "unknown_lore_context" else "Lore/context wording is unscoped and needs classification."})
+    return scope
+
+def _theory_anomaly_scope_for_text(subject: str, text: str) -> dict[str, Any]:
+    value = _text(text, 1000); low = value.lower(); scope = dict(_BROAD_SCOPE_DEFAULT)
+    if not re.search(r"\b(theory|theories|anomal(?:y|ies)|glitch|technical issue)\b", value, re.I):
+        return scope
+    if re.search(rf"\b{re.escape(subject)}\b.*\b(theory|anomal)", value, re.I):
+        st, label = "subject_theory", f"{subject}-related theory/anomaly"
+    elif "orion" in low:
+        st, label = "orion_anomaly", "Orion anomaly"
+    elif "barcode" in low:
+        st, label = "barcode_theory", "BARCODE theory"
+    elif "bnl" in low or "system" in low:
+        st, label = "bnl_system_anomaly", "BNL/system anomaly"
+    elif "broadcast" in low or "radio" in low:
+        st, label = "broadcast_anomaly", "broadcast anomaly"
+    elif "recurring" in low:
+        st, label = "recurring_topic", "recurring topic"
+    elif "technical" in low or "glitch" in low:
+        st, label = "technical_issue", "technical issue"
+    else:
+        st, label = "unknown_theory_anomaly", "unknown theory/anomaly"
+    scope.update({"hasSignal": True, "scopeKnown": st != "unknown_theory_anomaly", "scopeType": st, "scopeLabel": label, "confidence": "medium" if st != "unknown_theory_anomaly" else "low", "shouldEmitReviewCard": True, "shouldEmitReadinessQuestion": True, "reason": "Theory/anomaly scope identified." if st != "unknown_theory_anomaly" else "Theory/anomaly wording is unscoped and needs classification."})
+    return scope
 
 def _has_admin_contest_organizer_rejection(resolved_memory: dict[str, Any], packet: dict[str, Any] | None = None) -> bool:
     blob = json.dumps(packet or {}, default=str) + " " + " ".join(json.dumps(resolved_memory.get(k) or [], default=str) for k in ("reviewOnlyEvidence", "privateOrInternalEvidence", "sourceSafetyWarnings", "missingInfoQuestions"))
@@ -504,6 +637,8 @@ def _claim_type_from_text(text: str) -> str:
         return "contest_music_context"
     if "contest" in low and any(w in low for w in ("submit", "submission", "entry")):
         return "contest_submitter"
+    if re.search(r"\b(rules?|instructions?|guidelines?)\b", low):
+        return "rules_instructions_context"
     if any(w in low for w in ("queue", "submission")):
         return "queue_submission"
     if any(w in low for w in ("suno", "music link", "social link", "http", "link")):
@@ -580,17 +715,44 @@ def _review_display_copy(subject: str, claim_text: str, claim_type: str, lane: s
         primary = "Request public source"; secondary = ["Ask for owner-approved wording", "Reject / not needed"]
         question = "What proof or approved wording should BNL use before saying this publicly?"
     elif (not is_orion) and re.search(r"\blore[-\s]*heavy|\blore\b", low):
-        title = "Confirm lore/public context"
-        decision = "Should this be public lore/context, internal context, or left out of the dossier?"
+        scope = _lore_scope_for_text(subject, claim_text)
+        title = "Clarify lore/context scope" if not scope["scopeKnown"] else f"Confirm {scope['scopeLabel']} use"
+        decision = (f"Should BNL mention this {scope['scopeLabel']} in {subject}'s public dossier, or keep it internal?"
+                    if scope["scopeKnown"] else f"Is this {subject}'s own lore, BARCODE Network lore, Orion lore, Null TV lore, or a recurring stream topic? Should it be public or internal?")
         checked = "You are deciding whether this context belongs in a concrete public dossier or should stay internal."
-        why = "BNL found lore-heavy context but needs a public/internal/reject decision, not a generic source request."
+        why = f"BNL found lore/context wording, but it needs to know whether this is {subject}'s lore, BARCODE lore, Orion lore, Null TV lore, recurring show context, or something that should stay internal."
         rec = "BNL recommends keeping it internal unless an admin confirms it belongs in the public dossier."
         evidence_summary = "Lore-heavy context exists without a specific public factual claim."
         safe = "Keep as internal lore/context unless approved for public use."
         approval = "Approve only public lore/context wording, keep internal, or reject as not useful."
         target = "admin"; audience = "admin"
         primary = "Decide public/internal/reject"; secondary = ["Keep internal", "Reject / not needed"]
-        question = f"Should BNL use this as public lore/context for {subject}, keep it internal, or ignore it?"
+        question = decision
+    elif re.search(r"\b(theory|theories|anomal(?:y|ies)|glitch)\b", low):
+        scope = _theory_anomaly_scope_for_text(subject, claim_text)
+        title = "Clarify theory/anomaly context"
+        decision = (f"Should BNL mention this {scope['scopeLabel']} in {subject}'s public dossier, or keep it internal?"
+                    if scope["scopeKnown"] else "What theory or anomaly is this referring to, and does it belong in the public dossier?")
+        checked = "You are identifying the theory/anomaly scope before any public dossier decision."
+        why = "BNL found theory/anomaly wording, but it needs to know what the theory/anomaly refers to before it can decide whether it belongs in the dossier."
+        rec = "BNL recommends asking what the theory/anomaly is about before requesting public wording."
+        evidence_summary = "Theory/anomaly context exists without enough scoped dossier meaning."
+        safe = "Keep as internal context unless scope and public use are approved."
+        approval = "Classify the theory/anomaly first; only then approve public/internal use."
+        target = "admin"; audience = "admin"; primary = "Clarify scope"; secondary = ["Keep internal", "Reject / not needed"]
+        question = decision if not scope["scopeKnown"] else f"BNL found {scope['scopeLabel']} context near {subject}. Does it belong in the public dossier?"
+    elif claim_type == "rules_instructions_context":
+        scope = _rules_instructions_scope_for_text(subject, claim_text)
+        title = "Clarify rules/instructions context"
+        decision = f"What rules or instructions is this referring to, who were they for, and what was {subject}'s actual role with them?"
+        checked = "You are identifying which instructions are meant before treating them as a role or dossier fact."
+        why = "BNL found rules/instructions wording, but it cannot tell whether these were contest rules, queue instructions, Discord/admin instructions, broadcast instructions, site workflow instructions, or unrelated text."
+        rec = "BNL recommends clarifying the instruction source, audience, purpose, and subject role before any public claim."
+        evidence_summary = f"Rules/instructions signal: {scope['scopeLabel'] or 'unknown instructions'}."
+        safe = "Do not create a public role/title claim from rules/instructions wording alone."
+        approval = "Clarify what the instructions were and the subject's role before approving wording."
+        target = "admin"; audience = "admin"; primary = "Clarify scope"; secondary = ["Keep internal", "Reject / not needed"]
+        question = decision
     elif actionability == "weak_label":
         title = "Check weak label"
         label = "contest organizer" if "contest organizer" in low else _text(claim_text, 80)
@@ -615,16 +777,18 @@ def _review_display_copy(subject: str, claim_text: str, claim_type: str, lane: s
         target = "link_ownership"; audience = "link_ownership"; primary = "Keep as internal note"; secondary = ["Ask who owns these links", "Reject / not needed"]
         question = f"Which {subject} links, music links, or social links are yours and approved for BNL to mention publicly?"
     elif claim_type.startswith("contest_"):
+        scope = _contest_scope_for_text(subject, claim_text)
         title = "Confirm contest relationship"
-        decision = f"What was {subject}'s relationship to this contest or rules context?"
+        decision = (f"BNL found contest context involving {scope['scopeLabel']} near {subject}. Was {subject} a participant, submitter, rules/link source, organizer, host, or just mentioned nearby?"
+                    if scope["scopeKnown"] else f"BNL found unclear contest/rules wording near {subject}. What contest or event is this referring to, if any, and was {subject} actually involved?")
         checked = f"You are checking whether {subject} was a participant, submitter, rules poster, link source, host, organizer, or only mentioned near the contest."
-        why = f"BNL found contest/rules context, but it does not have enough proof to label {subject} as host or organizer."
+        why = f"BNL found contest-related wording, but it cannot tell whether {subject} participated, submitted, reposted rules, shared a link, hosted anything, organized anything, or was only mentioned nearby. The host/organizer must come from direct evidence, not proximity."
         rec = "BNL recommends asking for the exact relationship before using this publicly."
         evidence_summary = "BNL saw contest/rules context, but the subject's role is not confirmed."
         safe = f"Do not call {subject} a host or organizer unless that role is confirmed."
         approval = "Only approve exact wording that matches the confirmed relationship."
         target = "subject"; audience = "subject"; primary = "Keep as internal note"; secondary = ["Ask about contest relationship", "Reject / not needed"]
-        question = "What was your relationship to this contest context: participant, submitter, rules poster, link source, host, organizer, or unrelated mention?"
+        question = decision
     elif is_orion:
         title = "Confirm Orion/context use"
         decision = f"Can BNL mention Orion in public {subject} context, or should it stay internal?"
@@ -704,10 +868,14 @@ def _dossier_section_for_claim_type(claim_type: str, text: str) -> str:
         return "orion"
     if "lore" in low or "context" in low and "contest" not in low:
         return "lore"
+    if claim_type.startswith("contest_") or "contest" in low:
+        return "contest"
     if claim_type in {"music_link", "public_link"} or re.search(r"\b(suno|music|song|track|link|social|url)\b", low):
         return "links" if "music" not in low and "suno" not in low else "music"
-    if claim_type.startswith("contest_") or "contest" in low or "rules" in low:
-        return "contest"
+    if claim_type == "rules_instructions_context" or re.search(r"\b(rules?|instructions?)\b", low):
+        return "rules"
+    if re.search(r"\b(theory|theories|anomal(?:y|ies)|glitch|technical issue)\b", low):
+        return "theory_anomaly"
     if claim_type in {"role", "community_context"} or re.search(r"\b(role|title|artist|collaborator|participant|moderator)\b", low):
         return "role"
     if claim_type == "relationship" or "relationship" in low:
@@ -725,11 +893,15 @@ def _readiness_question_for_section(subject: str, section: str) -> tuple[str, st
     if section in {"links", "music"}:
         return ("subject", f"Which links are {subject}’s and approved for BNL to mention publicly?", "BNL found possible link/music context but does not know ownership or approval.", "high", "needs_confirmation")
     if section == "contest":
-        return ("subject", f"What was {subject}’s relationship to this contest: participant, submitter, rules poster, link source, host, organizer, or unrelated mention?", "BNL found contest/rules context but cannot safely infer the subject’s role.", "high", "needs_confirmation")
+        return ("subject", f"What contest or event is this referring to, and was {subject} actually involved?", "BNL found contest/rules context but cannot safely infer the subject’s role, host, organizer, or event from proximity.", "high", "needs_confirmation")
+    if section == "rules":
+        return ("admin", f"BNL found unclear rules/instructions context near {subject}. Were these contest rules, queue instructions, Discord/admin instructions, broadcast instructions, or something else? What was {subject}'s role?", "BNL must know which instructions, from who, to who, and about what before creating any role or public claim.", "high", "needs_confirmation")
     if section == "orion":
         return ("admin", f"Can BNL mention Orion in {subject}’s public dossier, or should that stay internal?", "Orion/context references require an explicit public/internal boundary decision.", "high", "needs_confirmation")
     if section == "lore":
-        return ("admin", f"Should BNL use this as public lore/context for {subject}, keep it internal, or ignore it?", "BNL found lore-heavy context and needs a dossier decision, not a generic source request.", "medium", "internal_only")
+        return ("admin", f"Is this {subject}'s lore, BARCODE lore, Orion lore, Null TV lore, or a recurring topic? Should BNL use it publicly or keep it internal?", "BNL found lore-heavy context and needs a scoped dossier decision, not a generic source request.", "medium", "internal_only")
+    if section == "theory_anomaly":
+        return ("admin", f"BNL found theory/anomaly context near {subject}. Is this about {subject}, BARCODE lore, Orion, a recurring topic, or something unrelated?", "BNL needs to know what the theory/anomaly refers to before it can decide whether it belongs in the dossier.", "medium", "internal_only")
     if section == "boundaries":
         return ("subject", f"What should BNL absolutely avoid saying publicly about {subject}?", "A concrete public dossier needs explicit boundaries so BNL does not overstate private, internal, or unwanted context.", "medium", "needs_confirmation")
     if section == "summary":
@@ -814,6 +986,7 @@ def _claim_prefix(claim_type: str) -> str:
         "contest_rules_poster": "Possible contest rules context",
         "contest_host": "Possible contest host claim",
         "contest_organizer": "Possible contest organizer claim",
+        "rules_instructions_context": "Possible rules/instructions context",
         "public_link": "Possible public-link claim",
         "queue_submission": "Possible queue/submission claim",
         "community_context": "Possible community/context claim",
@@ -829,7 +1002,7 @@ def _claim_actionability(claim_text: str, claim_type: str, lane: str, public_saf
         return "source_blind_warning"
     if claim_text.strip().lower() in {"contest organizer", "organizer", "participant", "artist", "member"} or "contest organizer" in low:
         return "weak_label"
-    if claim_type in {"contest_music_context", "contest_submitter", "contest_rules_poster", "contest_public_link_context", "contest_channel_context", "contest_date_context", "contest_mention_only"}:
+    if claim_type in {"contest_music_context", "contest_submitter", "contest_rules_poster", "contest_public_link_context", "contest_channel_context", "contest_date_context", "contest_mention_only", "rules_instructions_context"}:
         return "actionable_claim"
     if "?" in claim_text or "confirm" in low or "can bnl" in low:
         return "missing_confirmation"
@@ -914,8 +1087,13 @@ def _review_guidance(subject: str, claim_text: str, claim_type: str, lane: str, 
         note = f"BNL found contest-related music/link context for {subject}. This does not prove {subject} hosted or organized a contest. Keep internal until links and role are confirmed."
         question = f"Which {subject} music or contest-related links are owned or approved for public reference?"
     elif claim_type in {"contest_submitter", "contest_rules_poster", "contest_public_link_context", "contest_channel_context", "contest_date_context", "contest_mention_only"}:
+        scope = _contest_scope_for_text(subject, claim_text)
         note = f"BNL found contest-related context for {subject}, but the evidence does not establish that {subject} hosted or organized a contest."
-        question = f"What was {subject}’s relationship to this contest context: participant, submitter, rules poster, link source, host, organizer, or unrelated mention?"
+        question = (f"BNL found contest context involving {scope['scopeLabel']} near {subject}. Was {subject} a participant, submitter, rules/link source, organizer, host, or just mentioned nearby?"
+                    if scope["scopeKnown"] else f"BNL found unclear contest/rules wording near {subject}. What contest or event is this referring to, if any, and was {subject} actually involved?")
+    elif claim_type == "rules_instructions_context":
+        note = f"BNL found rules/instructions wording near {subject}, but it does not know which instructions, who they were for, or what role {subject} had."
+        question = f"What rules or instructions is this referring to, who were they for, and what was {subject}'s actual role with them?"
     elif claim_type in {"music_link", "public_link"}:
         note = f"BNL found repeated music/link context for {subject}, but public ownership/use is not confirmed. Keep this internal until owner/admin approves links or wording."
         question = f"Which {subject} links are owned or approved for public reference?"
@@ -1167,7 +1345,8 @@ def build_subject_analyst_read(subject_name: str, resolved_memory: dict[str, Any
         conflict_corr = None
         ctype = _claim_type_from_text(txt)
         contest_role, event_hints = classify_contest_event_context(txt)
-        if "contest" in txt.lower():
+        contest_scope = _contest_scope_for_text(subject, txt)
+        if re.search(r"\b(contest|challenge|tournament|battle|competition)\b", txt, re.I):
             if txt.strip().lower() == "contest organizer":
                 ctype = "role"
             else:
@@ -1176,6 +1355,8 @@ def build_subject_analyst_read(subject_name: str, resolved_memory: dict[str, Any
             if ctype in {"contest_host", "contest_organizer"} and admin_contest_organizer_rejected:
                 conflict_corr = conflict_corr or next((c for c in admin_corrections if c.get("label") in {"contest organizer", "contest host"}), None)
                 ctype = "contest_mention_only"
+        if ctype.startswith("contest_") and not contest_scope.get("shouldEmitReviewCard"):
+            continue
         if ctype == "community_context" and not ps:
             ctype = "role"
         conflict_corr = conflict_corr or _correction_blocks_claim(admin_corrections, txt, ctype)
@@ -1192,7 +1373,7 @@ def build_subject_analyst_read(subject_name: str, resolved_memory: dict[str, Any
         elif ctype == "contest_music_context":
             line = f"Possible public music/link context: BNL found contest-related music/link signals for {subject}, but it does not know which links are {subject}-owned or approved for public reference."
         elif ctype.startswith("contest_"):
-            line = f"{_claim_prefix(ctype)}: BNL found contest-related context for {subject}, but the evidence does not establish that {subject} hosted or organized a contest."
+            line = f"{_claim_prefix(ctype)}: BNL found contest context involving {contest_scope.get('scopeLabel') or 'an unclear contest/event'} near {subject}, but the evidence does not establish {subject}'s role. Host/organizer must come from direct evidence, not proximity."
         elif ctype in {"music_link", "public_link"}:
             line = f"Possible music/link claim: {subject} may have public music or link context, but ownership/use needs confirmation. Evidence context: {txt}"
         elif ctype == "role":
@@ -1207,6 +1388,7 @@ def build_subject_analyst_read(subject_name: str, resolved_memory: dict[str, Any
                 claim.update(_admin_conflict_fields(subject, txt, conflict_corr))
             if ctype.startswith("contest_"):
                 claim["eventEvidenceHints"] = {k: v for k, v in event_hints.items() if v}
+                claim["contestScope"] = contest_scope
                 if ctype in {"contest_host", "contest_organizer"}:
                     claim["recommendedActionReason"] = "Strong host/organizer wording was detected; still require public-safe confirmation before public use."
             reviewable_claims.append(claim)
@@ -1245,8 +1427,15 @@ def build_subject_analyst_read(subject_name: str, resolved_memory: dict[str, Any
         missing.append({"question": f"Confirm public role/title: Is {subject} a community participant, artist, collaborator, or something else?", "confirmationType": "needs_admin_confirmation", "suggestedReviewer": "admin", "why": "Role wording is only public when backed by clean public evidence or admin-confirmed Source File fact.", "canAutoResolve": bool(has_community or has_music), "relatedClaimType": "role"})
     if has_music or any(re.search(r"\b(suno|music|song|track|link|social|url)\b", x, re.I) for x in review_sources):
         missing.append({"question": f"Confirm public links: Which {subject}/Suno/music/social links are owned or approved for public reference?", "confirmationType": "needs_owner_confirmation", "suggestedReviewer": "owner_or_admin", "why": "Link ownership/use must be explicit before public dossier use.", "canAutoResolve": False, "relatedClaimType": "music_link"})
-    if any("contest" in x.lower() for x in review_claims + review_sources):
-        missing.append({"question": f"What was {subject}’s relationship to this contest context: participant, submitter, rules poster, link source, host, organizer, or unrelated mention?", "confirmationType": "needs_admin_confirmation", "suggestedReviewer": "admin", "why": "Contest names/rules/channels/dates/links do not prove host or organizer role.", "canAutoResolve": False, "relatedClaimType": "contest_music_context"})
+    contest_scopes = [_contest_scope_for_text(subject, x) for x in review_claims + review_sources if "contest" in x.lower()]
+    if contest_scopes:
+        scoped = next((s for s in contest_scopes if s.get("scopeKnown")), contest_scopes[0])
+        q = (f"BNL found contest context involving {scoped.get('scopeLabel')} near {subject}. Was {subject} a participant, submitter, rules/link source, organizer, host, or just mentioned nearby?"
+             if scoped.get("scopeKnown") else f"BNL found unclear contest/rules wording near {subject}. What contest or event is this referring to, if any, and was {subject} actually involved?")
+        missing.append({"question": q, "confirmationType": "needs_admin_confirmation", "suggestedReviewer": "admin", "why": "Contest names/rules/channels/dates/links do not prove host or organizer role; host/organizer must come from direct evidence.", "canAutoResolve": False, "relatedClaimType": "contest_music_context"})
+    rules_scopes = [_rules_instructions_scope_for_text(subject, x) for x in review_claims + review_sources if re.search(r"\b(rules?|instructions?)\b", x, re.I)]
+    if rules_scopes and not contest_scopes:
+        missing.append({"question": f"BNL found unclear rules/instructions context near {subject}. Were these contest rules, queue instructions, Discord/admin instructions, broadcast instructions, or something else? What was {subject}'s role?", "confirmationType": "needs_admin_confirmation", "suggestedReviewer": "admin", "why": "Rules/instructions wording needs source, audience, purpose, and subject role before becoming a claim.", "canAutoResolve": False, "relatedClaimType": "rules_instructions_context"})
     if any("orion" in x.lower() or "relay" in x.lower() for x in review_claims + blind_insights):
         missing.append({"question": f"Confirm Orion context: Can BNL mention Orion as {subject}'s AI/message relay context, or keep it internal?", "confirmationType": "needs_admin_confirmation", "suggestedReviewer": "admin", "why": "Named relationship/context should not become public copy without permission and provenance.", "canAutoResolve": False, "relatedClaimType": "relationship"})
     if review or re.search(r"queue|submission", " ".join(str(x) for x in resolved_memory.get("queueOrSubmissionSignals") or []), re.I):
