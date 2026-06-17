@@ -1233,6 +1233,223 @@ def _build_dossier_readiness(subject: str, reviewable_claims: list[dict[str, Any
     return {"questions": questions, "summary": f"BNL has {len(questions)} prioritized dossier-readiness question(s); {len(blocked)} block a complete public draft.", "blockedBy": blocked, "readyForDraft": ready, "reason": "Ready for draft with current public-safe facts." if ready else "Resolve high-priority identity, role, link/music, relationship, contest, or boundary questions before generating a concrete public dossier."}
 
 
+def _clarification_source_safety(claim: dict[str, Any]) -> str:
+    if claim.get("reviewLane") == "source_blind" or claim.get("decisionState") == "source_blind_blocked" or claim.get("actionability") == "source_blind_warning":
+        return "source_blind_blocked"
+    if claim.get("publicSafe") is True:
+        return "public_safe"
+    return "internal_safe"
+
+
+def _clarification_intent(question: str, category: str) -> str:
+    q = re.sub(r"\b(?:crow|subject|bnl|publicly|public|internal|ignore|keep|mention|use|dossier|source file)\b", " ", (question or "").lower())
+    if category in {"theory_anomaly", "rules_instructions", "contest_event", "lore_context", "source_blind"}:
+        return category
+    if "link" in q or "music" in q:
+        return "links_music_socials"
+    if "role" in q or "title" in q:
+        return "role_title"
+    return re.sub(r"[^a-z0-9]+", " ", q).strip()[:80] or category or "clarification"
+
+
+def _is_clarification_claim(claim: dict[str, Any]) -> bool:
+    return claim.get("decisionState") == "needs_clarification" or claim.get("actionability") == "needs_clarification" or claim.get("decisionState") == "source_blind_blocked" or claim.get("actionability") == "source_blind_warning"
+
+
+def _meaningful_signal_summary(claim: dict[str, Any]) -> str:
+    summary = _text(claim.get("safeEvidenceSummary") or claim.get("claimText") or claim.get("displayEvidenceSummary"), 240)
+    if not summary:
+        return ""
+    vague = re.sub(r"\s+", " ", summary).strip().lower()
+    if vague in {"possible signal only", "possible signal only.", "what is this referring to?", "unclear context"}:
+        return ""
+    if re.fullmatch(r"(possible\s+)?(signal|item|context|claim)(\s+only)?\.?", vague):
+        return ""
+    return summary
+
+
+def _clarification_label(claim: dict[str, Any]) -> str:
+    label = _text(claim.get("followUpScopeLabel") or claim.get("displayTitle") or claim.get("claimType") or "Unresolved signal", 90)
+    text = _text(claim.get("claimText"), 120)
+    if text and text.lower() not in label.lower() and len(text) <= 80:
+        label = text
+    return humanize_internal_label(label).strip() or "Unresolved signal"
+
+
+def _signal_kind(label: str, summary: str, category: str) -> str:
+    low = f"{label} {summary}".lower()
+    if category == "theory_anomaly":
+        if "archive" in low or "evidence" in low:
+            return "archive/evidence wording suggesting something unusual"
+        if "theory" in low or "pattern" in low or "interpret" in low:
+            return "theory, interpretation, or pattern wording"
+        return "theory/anomaly wording"
+    if category == "rules_instructions":
+        if "contest" in low:
+            return "contest rules wording"
+        if "queue" in low or "submission" in low:
+            return "queue/submission instruction wording"
+        if "admin" in low or "discord" in low or "mod" in low:
+            return "Discord/admin instruction wording"
+        return "rules/instructions wording"
+    return f"{category.replace('_', '/')} wording" if category else "unclear wording"
+
+
+def _clarification_signal(claim: dict[str, Any], category: str, safety: str) -> dict[str, Any]:
+    label = _clarification_label(claim)
+    summary = _meaningful_signal_summary(claim)
+    if safety == "source_blind_blocked":
+        label = "Source-blind/internal context withheld"
+        summary = "Source-blind context exists, but raw details were withheld."
+    kind = _signal_kind(label, summary, category)
+    signal = {
+        "label": label,
+        "claimType": _text(claim.get("claimType") or "missing_confirmation", 80),
+        "summary": summary,
+        "whatBnlKnows": f"BNL saw {kind}, but has not identified enough context to turn it into a dossier fact.",
+        "whatBnlDoesNotKnow": _text(claim.get("recommendedFollowUpReason") or claim.get("cannotSuggestPublicReason") or "BNL does not know the exact scope, subject role, or whether it belongs in the dossier.", 240),
+        "whyThisMayBeRelated": f"It asks the same broad {category.replace('_', '/')} clarification question." if category else "It asks the same broad clarification question.",
+        "differenceFromOtherSignals": f"This signal is labeled/summarized as {label}: {kind}.",
+    }
+    if safety != "source_blind_blocked":
+        excerpt = _safe_evidence_example(summary or str(claim.get("claimText") or ""), "")
+        if excerpt and not re.search(r"\b(private|source[-_\s]*blind|internal[-\s]*only|dm|raw id|token)\b", excerpt, re.I):
+            signal["safeExcerpt"] = _text(excerpt, 220)
+    return signal
+
+
+def _cluster_clarification_needs(subject: str, reviewable_claims: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[str]]:
+    groups: dict[tuple[Any, ...], list[tuple[int, dict[str, Any]]]] = {}
+    audit: list[str] = []
+    passthrough: list[dict[str, Any]] = []
+    for idx, claim in enumerate(reviewable_claims):
+        if not _is_clarification_claim(claim):
+            passthrough.append(claim)
+            continue
+        category = str(claim.get("followUpCategory") or _infer_follow_up_category(subject, str(claim.get("claimText") or ""), str(claim.get("claimType") or ""), str(claim.get("reviewLane") or ""), str(claim.get("actionability") or "")))
+        question = str(claim.get("recommendedFollowUpQuestion") or claim.get("suggestedConfirmationQuestion") or claim.get("verificationPacketQuestion") or "")
+        summary = _meaningful_signal_summary(claim)
+        if not question or not summary or (claim.get("fallbackUsed") and question == GENERIC_FOLLOW_UP_FALLBACK):
+            audit.append(f"BNL found vague {category.replace('_', '/')} wording, but there is not enough context to review or use it.")
+            continue
+        safety = _clarification_source_safety(claim)
+        section = _dossier_section_for_claim_type(str(claim.get("claimType") or ""), " ".join(str(claim.get(k) or "") for k in ("claimText", "displayTitle", "displayDecision", "recommendedFollowUpQuestion")))
+        if safety == "source_blind_blocked":
+            section = "source_blind"
+        if category == "theory_anomaly":
+            section = "theory_anomaly"
+        elif category == "rules_instructions":
+            section = "rules"
+        key = (
+            category,
+            section,
+            str(claim.get("suggestedConfirmationAudience") or claim.get("recommendedFollowUpAudience") or "admin"),
+            str(claim.get("suggestedConfirmationAnswerType") or ""),
+            _clarification_intent(question, category),
+            safety,
+            bool(claim.get("followUpScopeKnown")),
+        )
+        groups.setdefault(key, []).append((idx, claim))
+
+    needs: list[dict[str, Any]] = []
+    for n, (key, entries) in enumerate(groups.items(), 1):
+        category, section, audience, answer_type, _intent, safety, _scope_known = key
+        labels = [_clarification_label(c) for _, c in entries]
+        summaries = [_meaningful_signal_summary(c).lower() for _, c in entries]
+        label_norms = {re.sub(r"[^a-z0-9]+", " ", x.lower()).strip() for x in labels}
+        summary_norms = {re.sub(r"[^a-z0-9]+", " ", x).strip() for x in summaries}
+        relationship = "duplicate" if len(label_norms) <= 1 and len(summary_norms) <= 1 else ("distinct" if len(entries) == 1 else "related")
+        title_topic = category.replace("_", "/")
+        if category == "theory_anomaly":
+            title = f"Clarify anomaly/theory context for {subject}"
+        elif category == "rules_instructions":
+            title = f"Clarify rules/instructions context for {subject}"
+        elif safety == "source_blind_blocked":
+            title = f"Clarify source-blind replacement wording for {subject}"
+        else:
+            title = f"Clarify {title_topic} context for {subject}"
+        base_question = str(entries[0][1].get("recommendedFollowUpQuestion") or entries[0][1].get("suggestedConfirmationQuestion") or "")
+        if relationship == "related":
+            joined = " and ".join(labels[:2]) if len(labels) == 2 else ", ".join(labels[:3])
+            question = f"Are these signals referring to the same thing? If yes, what {title_topic} context are they about? If not, what does each signal refer to, and should either belong in {subject}'s public dossier? Signals: {joined}."
+        elif relationship == "duplicate":
+            question = base_question
+        else:
+            question = base_question
+        reason = (f"BNL found {len(entries)} {relationship} {title_topic} signal(s). "
+                  f"{'They may refer to the same unresolved context, but labels or summaries differ, so BNL needs clarification before treating them as one dossier fact.' if relationship == 'related' else 'BNL cannot decide whether this belongs in the dossier until the missing context is identified.'}")
+        signals = [_clarification_signal(c, str(category), str(safety)) for _, c in entries]
+        needs.append({
+            "id": f"dossier-clarification-{section}-{n}",
+            "title": title,
+            "question": question,
+            "audience": audience,
+            "reason": reason,
+            "answerType": answer_type or "clarification of what this signal refers to and whether it belongs in the dossier",
+            "dossierSection": section,
+            "priority": "medium" if safety == "source_blind_blocked" else "high",
+            "sourceCount": len(entries),
+            "relatedReviewClaimIds": [f"reviewableClaims[{idx}]" for idx, _ in entries],
+            "relationshipType": relationship,
+            "contributingSignals": signals,
+            "sourceSafety": safety,
+            "canBecomeReviewCardAfterAnswer": True,
+        })
+        card = dict(entries[0][1])
+        if safety == "source_blind_blocked" and len(entries) == 1:
+            passthrough.append(card)
+            continue
+        card.update({
+            "claimText": title,
+            "displayTitle": title,
+            "displayDecision": "Clarification question only — not a public claim approval",
+            "displayWhatIsBeingChecked": "This is a question BNL needs answered before it can make a dossier fact or Source File review item.",
+            "displayBNLRecommendation": "Answering may create later reviewable Source File facts; rejecting means BNL should ignore or suppress the vague signal.",
+            "recommendedFollowUpQuestion": question,
+            "suggestedConfirmationQuestion": question,
+            "verificationPacketQuestion": question,
+            "verificationPacketQuestions": [question],
+            "clarificationNeedId": needs[-1]["id"],
+            "clarificationRelationshipType": relationship,
+            "relatedReviewClaimIds": needs[-1]["relatedReviewClaimIds"],
+        })
+        passthrough.append(card)
+    return passthrough[:14], needs, audit
+
+
+def _build_dossier_readiness_from_clarifications(readiness: dict[str, Any], needs: list[dict[str, Any]]) -> dict[str, Any]:
+    existing = [q for q in readiness.get("questions", []) if isinstance(q, dict)]
+    clar_questions: list[dict[str, Any]] = []
+    for need in needs[:7]:
+        used = f" Used by {need.get('sourceCount', 1)} {need.get('relationshipType', 'distinct')} signal{'s' if int(need.get('sourceCount') or 1) != 1 else ''}."
+        clar_questions.append({
+            "id": f"readiness-{need.get('id')}",
+            "audience": need.get("audience") or "admin",
+            "question": f"{need.get('title')}: {need.get('question')}{used}",
+            "whyItMatters": need.get("reason") or "Clarification needed before BNL can draft this part of the dossier.",
+            "dossierSection": need.get("dossierSection") or "unknown",
+            "priority": need.get("priority") or "high",
+            "relatedReviewClaimIds": need.get("relatedReviewClaimIds") or [],
+            "sourceSafety": need.get("sourceSafety") or "needs_clarification",
+            "relationshipType": need.get("relationshipType") or "distinct",
+            "sourceCount": need.get("sourceCount") or 1,
+        })
+    seen_sections = {q.get("dossierSection") for q in clar_questions}
+    merged = clar_questions + [q for q in existing if q.get("dossierSection") not in seen_sections]
+    priority_rank = {"high": 0, "medium": 1, "low": 2}
+    merged = sorted(merged, key=lambda x: (priority_rank.get(x.get("priority"), 9), str(x.get("dossierSection") or "")))[:7]
+    blocked = [q["dossierSection"] for q in merged if q.get("priority") == "high"]
+    out = dict(readiness)
+    out.update({
+        "questions": merged,
+        "blockedBy": blocked,
+        "readyForDraft": not blocked,
+        "summary": f"BNL has {len(merged)} prioritized dossier-readiness question(s), including {len(clar_questions)} consolidated clarification need(s); {len(blocked)} block a complete public draft.",
+        "reason": "Ready for draft with current public-safe facts." if not blocked else "Resolve high-priority consolidated clarification, identity, role, link/music, relationship, contest, or boundary questions before generating a concrete public dossier.",
+    })
+    return out
+
+
 def _admin_action_card(action: str) -> dict[str, Any]:
     raw = str(action or "")
     title = "Admin follow-up task"
@@ -1761,8 +1978,11 @@ def build_subject_analyst_read(subject_name: str, resolved_memory: dict[str, Any
     resolved_types = _resolved_missing_info_types(admin_corrections)
     missing = [m for m in missing if m.get("relatedClaimType") not in resolved_types]
     reviewable_claims = [c for c in reviewable_claims if _is_human_visible_review_claim(c)]
+    reviewable_claims, dossier_clarification_needs, clarification_audit = _cluster_clarification_needs(subject, reviewable_claims)
     missing_lines = [m["question"] + f" ({m['confirmationType'].replace('_', ' ')}.)" for m in missing]
     readiness = _build_dossier_readiness(subject, reviewable_claims, missing, blind_insights)
+    if dossier_clarification_needs:
+        readiness = _build_dossier_readiness_from_clarifications(readiness, dossier_clarification_needs)
     actions = [q["question"] for q in readiness["questions"] if q.get("priority") == "high"]
     withheld_audit = _withheld_audit(subject, resolved_memory, private, blind, review) if (private or blind or review) else {}
     source_file_ingredients = []
@@ -1788,10 +2008,12 @@ def build_subject_analyst_read(subject_name: str, resolved_memory: dict[str, Any
         "publicReadyClaims": public_claims,
         "reviewNeededClaims": review_claims,
         "reviewableClaims": reviewable_claims[:14],
+        "dossierClarificationNeeds": dossier_clarification_needs[:10],
         "adminCorrections": admin_corrections,
         "sourceBlindInsights": blind_insights,
         "privateOrInternalExclusions": exclusions,
         "withheldEvidenceAudit": withheld_audit,
+        "internalClarificationAudit": clarification_audit,
         "doNotSayPublicly": do_not,
         "missingInfoQuestions": missing_lines,
         "missingConfirmations": missing,
