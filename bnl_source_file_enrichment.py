@@ -4759,9 +4759,11 @@ _SUBJECT_ANALYST_READ_KEYS = (
     "publicReadyClaims",
     "sourceFileReviewClaims",
     "reviewableClaims",
+    "dossierClarificationNeeds",
     "sourceBlindInsights",
     "privateOrInternalExclusions",
     "withheldEvidenceAudit",
+    "internalClarificationAudit",
     "doNotSayPublicly",
     "missingInfoQuestions",
     "missingConfirmations",
@@ -4839,7 +4841,9 @@ def _normalize_subject_analyst_read_v1(analyst: dict[str, Any]) -> dict[str, Any
                 item.setdefault(key, value)
             normalized_claims.append(item)
     normalized["reviewableClaims"] = _sanitize_archive_value(normalized_claims)
+    normalized["dossierClarificationNeeds"] = _sanitize_archive_value((analyst.get("dossierClarificationNeeds") or [])[:10]) if isinstance(analyst.get("dossierClarificationNeeds"), list) else []
     normalized["withheldEvidenceAudit"] = _sanitize_archive_value(analyst.get("withheldEvidenceAudit") or {}) if isinstance(analyst.get("withheldEvidenceAudit"), dict) else {}
+    normalized["internalClarificationAudit"] = _case_list(analyst.get("internalClarificationAudit"), limit=10, item_limit=320)
     normalized["missingConfirmations"] = _sanitize_archive_value((analyst.get("missingConfirmations") or [])[:12]) if isinstance(analyst.get("missingConfirmations"), list) else []
     normalized["recommendedAdminActionCards"] = _sanitize_archive_value((analyst.get("recommendedAdminActionCards") or [])[:8]) if isinstance(analyst.get("recommendedAdminActionCards"), list) else []
     normalized["dossierReadinessQuestions"] = _sanitize_archive_value((analyst.get("dossierReadinessQuestions") or [])[:7]) if isinstance(analyst.get("dossierReadinessQuestions"), list) else []

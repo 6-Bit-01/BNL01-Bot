@@ -4,10 +4,71 @@ import unittest
 import json
 
 import bnl_dossier_draft as draft
-from bnl_subject_memory_resolver import build_subject_analyst_read, build_subject_memory_diagnostic, resolve_subject_memory, _review_guidance
+from bnl_subject_memory_resolver import build_subject_analyst_read, build_subject_memory_diagnostic, resolve_subject_memory, _review_guidance, _make_reviewable_claim, _cluster_clarification_needs, _build_dossier_readiness, _build_dossier_readiness_from_clarifications
 
 
 class SubjectMemoryResolverTests(unittest.TestCase):
+
+    def test_clarification_clustering_duplicates_related_source_blind_and_audit(self):
+        duplicate_a = _make_reviewable_claim("Crow", "theory/anomaly-heavy", "relationship", "needs_confirmation", "Review-only theory anomaly signal.", False, "low", "theory/anomaly-heavy")
+        duplicate_b = _make_reviewable_claim("Crow", "theory/anomaly-heavy", "relationship", "needs_confirmation", "Review-only theory anomaly signal.", False, "low", "theory/anomaly-heavy")
+        normal = _make_reviewable_claim("Crow", "Crow is publicly listed as a BARCODE participant.", "role", "public_home", "public-safe fact", True, "high", "public BARCODE participant")
+        clustered, needs, audit = _cluster_clarification_needs("Crow", [duplicate_a, duplicate_b, normal])
+        self.assertEqual(len(needs), 1)
+        self.assertEqual(needs[0]["relationshipType"], "duplicate")
+        self.assertEqual(needs[0]["sourceCount"], 2)
+        self.assertEqual(needs[0]["relatedReviewClaimIds"], ["reviewableClaims[0]", "reviewableClaims[1]"])
+        self.assertTrue(any(c.get("claimType") == "role" and c.get("decisionState") == "decidable" for c in clustered))
+        self.assertEqual(len([c for c in clustered if c.get("decisionState") == "needs_clarification"]), 1)
+        self.assertFalse(audit)
+
+        theory = _make_reviewable_claim("Crow", "theory/anomaly-heavy", "relationship", "needs_confirmation", "Review-only theory anomaly signal.", False, "low", "theory/anomaly-heavy")
+        strange = _make_reviewable_claim("Crow", "strange/anomaly archive evidence", "relationship", "needs_confirmation", "Review-only strange archive evidence signal.", False, "low", "strange/anomaly archive evidence")
+        _, related_needs, _ = _cluster_clarification_needs("Crow", [theory, strange])
+        need = related_needs[0]
+        self.assertEqual(need["relationshipType"], "related")
+        self.assertIn("same thing", need["question"])
+        self.assertIn("If not", need["question"])
+        diffs = " ".join(s["differenceFromOtherSignals"] for s in need["contributingSignals"])
+        self.assertIn("theory/anomaly-heavy", diffs)
+        self.assertIn("strange/anomaly archive evidence", diffs)
+        self.assertIn("theory, interpretation, or pattern", need["contributingSignals"][0]["whatBnlKnows"])
+        self.assertIn("archive/evidence", need["contributingSignals"][1]["whatBnlKnows"])
+
+        rules_a = _make_reviewable_claim("Crow", "unclear rules and instructions near Crow", "rules_instructions_context", "needs_confirmation", "rules signal", False, "low", "unclear rules and instructions near Crow")
+        rules_b = _make_reviewable_claim("Crow", "unclear rules and instructions near Crow", "rules_instructions_context", "needs_confirmation", "rules signal", False, "low", "unclear rules and instructions near Crow")
+        _, rules_needs, _ = _cluster_clarification_needs("Crow", [rules_a, rules_b])
+        self.assertEqual(rules_needs[0]["relationshipType"], "duplicate")
+
+        contest_rules = _make_reviewable_claim("Crow", "mysterious contest rules mention Crow", "rules_instructions_context", "needs_confirmation", "rules signal", False, "low", "mysterious contest rules mention Crow")
+        admin_rules = _make_reviewable_claim("Crow", "mysterious Discord admin instructions mention Crow", "rules_instructions_context", "needs_confirmation", "rules signal", False, "low", "mysterious Discord admin instructions mention Crow")
+        contest_rules["decisionState"] = admin_rules["decisionState"] = "needs_clarification"
+        contest_rules["actionability"] = admin_rules["actionability"] = "needs_clarification"
+        _, rules_related, _ = _cluster_clarification_needs("Crow", [contest_rules, admin_rules])
+        self.assertEqual(rules_related[0]["relationshipType"], "related")
+        self.assertIn("contest rules", rules_related[0]["contributingSignals"][0]["whatBnlKnows"])
+        self.assertIn("Discord/admin", rules_related[0]["contributingSignals"][1]["whatBnlKnows"])
+
+        blind = _make_reviewable_claim("Crow", "source-blind lore theory anomaly private evidence says secret room", "relationship", "source_blind", "source blind", False, "low", "source-blind private raw evidence says secret room")
+        _, blind_needs, _ = _cluster_clarification_needs("Crow", [theory, blind])
+        self.assertEqual({n["sourceSafety"] for n in blind_needs}, {"internal_safe", "source_blind_blocked"})
+        self.assertNotIn("secret room", json.dumps(blind_needs))
+
+        vague = _make_reviewable_claim("Crow", "unclassified possible claim", "missing_confirmation", "needs_confirmation", "vague", False, "low", "possible signal only")
+        _, vague_needs, vague_audit = _cluster_clarification_needs("Crow", [vague])
+        self.assertFalse(vague_needs)
+        self.assertTrue(any("not enough context" in a for a in vague_audit))
+
+    def test_readiness_uses_consolidated_clarification_questions(self):
+        theory = _make_reviewable_claim("Crow", "theory/anomaly-heavy", "relationship", "needs_confirmation", "Review-only theory anomaly signal.", False, "low", "theory/anomaly-heavy")
+        strange = _make_reviewable_claim("Crow", "strange/anomaly archive evidence", "relationship", "needs_confirmation", "Review-only strange archive evidence signal.", False, "low", "strange/anomaly archive evidence")
+        clustered, needs, _ = _cluster_clarification_needs("Crow", [theory, strange])
+        readiness = _build_dossier_readiness("Crow", clustered, [], [])
+        readiness = _build_dossier_readiness_from_clarifications(readiness, needs)
+        questions = " ".join(q["question"] for q in readiness["questions"])
+        self.assertIn("Clarify anomaly/theory context for Crow", questions)
+        self.assertIn("Used by 2 related signals", questions)
+        self.assertNotEqual(questions.count("What theory or anomaly is this referring"), 2)
 
     def test_review_cards_include_human_display_copy_and_clean_questions(self):
         packet = {
