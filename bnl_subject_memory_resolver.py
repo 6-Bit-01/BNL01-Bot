@@ -2967,6 +2967,93 @@ def _withheld_audit(subject: str, resolved_memory: dict[str, Any], private: int,
     }
     return {"totalWithheld": private + blind + review, "categories": cats}
 
+
+def _memory_first_dossier_fit(subject: str, resolved_memory: dict[str, Any], public_claims: list[str], review_sources: list[str], blind_insights: list[str], counts: dict[str, Any]) -> dict[str, Any]:
+    """Form BNL's internal dossier-fit opinion before field output.
+
+    This is intentionally a compact readout helper, not a workflow/checklist. It
+    can count internal/review-only signals as fit evidence, but it only treats
+    sanitized public claims as public copy.
+    """
+
+    signal_texts = []
+    for key in (
+        "publicSafeFacts",
+        "publicCommunitySignals",
+        "publicCreativeMusicSignals",
+        "publicRoleSignals",
+        "queueOrSubmissionSignals",
+        "relationshipOrContextSignals",
+        "sourceLanes",
+        "broadcastMemorySignals",
+        "communityContext",
+        "musicCreativeContext",
+        "relationshipContext",
+        "queueSubmissionContext",
+    ):
+        value = resolved_memory.get(key)
+        if isinstance(value, list):
+            signal_texts.extend(str(v.get("summary") if isinstance(v, dict) else v) for v in value)
+        elif value:
+            signal_texts.append(str(value))
+    signal_texts.extend(review_sources)
+    signal_texts.extend(blind_insights)
+    hay = " ".join(signal_texts).lower()
+    ps = int(counts.get("publicSafe") or 0)
+    review = int(counts.get("reviewOnly") or 0)
+    blind = int(counts.get("sourceBlind") or 0)
+    scanned = int(counts.get("totalScanned") or 0)
+    public_count = len(public_claims)
+    has_engagement = bool(re.search(r"\b(repeated|recurring|active|engagement|interaction|community|discord|barcode|bnl|radio|broadcast|show)\b", hay))
+    has_queue = bool(re.search(r"\b(queue|submission|submitted|submitter|track)\b", hay))
+    has_relationship = bool(re.search(r"\b(relationship|collab|collaboration|orion|relay|introduced|connection)\b", hay))
+    has_music = bool(re.search(r"\b(music|artist|producer|song|track|suno|album|dj)\b", hay))
+    has_internal_only = bool(re.search(r"\b(internal only|do not say|private|source[-_ ]blind|orion|lore|relay)\b", hay)) or bool(blind)
+    score = public_count * 3 + min(ps, 5) + min(review, 4) + min(blind, 2)
+    for flag in (has_engagement, has_queue, has_relationship, has_music):
+        if flag:
+            score += 2
+    if public_count == 0 and ps == 0 and review == 0:
+        worthiness = "internal_only_for_now" if (blind or has_internal_only) else "not_a_dossier_fit_yet"
+    elif public_count >= 2 and (has_engagement or has_music or has_queue):
+        worthiness = "strong_fit"
+    elif public_count >= 1 and score >= 5:
+        worthiness = "possible_fit"
+    elif score >= 4 and has_internal_only:
+        worthiness = "internal_only_for_now"
+    elif scanned or score:
+        worthiness = "weak_fit_needs_more_signal"
+    else:
+        worthiness = "not_a_dossier_fit_yet"
+    signals = []
+    if public_count:
+        signals.append(f"{public_count} public-safe claim(s) can support cautious dossier copy.")
+    if has_engagement:
+        signals.append("Engagement/Discord/BARCODE context supports BNL's internal fit read.")
+    if has_queue:
+        signals.append("Queue/submission signals contribute to internal dossier fit, but need a public boundary before copy.")
+    if has_relationship:
+        signals.append("Relationship/collaboration/lore context matters internally and needs careful public-safe wording or omission.")
+    if blind:
+        signals.append("Source-blind memory can guide internal judgment but cannot prove public claims.")
+    if not signals:
+        signals.append("BNL has little signal beyond the subject name.")
+    can_draft = public_count >= 1 and worthiness in {"strong_fit", "possible_fit", "weak_fit_needs_more_signal"}
+    if worthiness == "not_a_dossier_fit_yet":
+        reason = "BNL does not have a safe identity/fit reason yet, so a public dossier draft would be mostly guesses."
+    elif worthiness == "internal_only_for_now" and not public_count:
+        reason = "BNL sees internal pattern signal, but no public-safe dossier claim is available yet."
+    elif can_draft:
+        reason = "BNL can draft a cautious public-safe dossier now using available claims and omitting unresolved links, role labels, collaboration, queue, or lore details."
+    else:
+        reason = "BNL needs one public-safe identity or dossier reason before drafting."
+    return {
+        "dossierWorthiness": worthiness,
+        "signals": signals[:6],
+        "canDraftCautiously": can_draft,
+        "reason": reason,
+    }
+
 def build_subject_analyst_read(subject_name: str, resolved_memory: dict[str, Any], packet: dict[str, Any] | None = None) -> dict[str, Any]:
     """Synthesize resolver output into internal/read-review/public-draft buckets.
 
@@ -3139,6 +3226,9 @@ def build_subject_analyst_read(subject_name: str, resolved_memory: dict[str, Any
             if line not in review_claims:
                 review_claims.append(line)
         reviewable_claims.append(_make_reviewable_claim(subject, txt, ctype, "source_blind", "Context lacks public-safe provenance and must not be public copy.", False, "low", _safe_evidence_example(txt, subject), ["source-blind provenance", "missing public source"]))
+    memory_fit = _memory_first_dossier_fit(subject, resolved_memory, public_claims, review_sources, blind_insights, counts)
+    internal = f"BNL memory-first dossier fit: {memory_fit['dossierWorthiness']}. {internal} {memory_fit['reason']}"
+    current_read = f"{subject} Source File readout: BNL currently sees {memory_fit['dossierWorthiness'].replace('_', ' ')}. " + " ".join(memory_fit["signals"][:3])
     exclusions = []
     if private:
         exclusions.append(f"Excluded {private} protected/private memory item(s) from public and provenance text; see withheldEvidenceAudit category counts for safe details.")
@@ -3189,6 +3279,22 @@ def build_subject_analyst_read(subject_name: str, resolved_memory: dict[str, Any
     readiness = _build_dossier_readiness(subject, reviewable_claims, missing, blind_insights)
     if dossier_clarification_needs:
         readiness = _build_dossier_readiness_from_clarifications(readiness, dossier_clarification_needs)
+    true_blockers = []
+    if identity_needs_review and not public_claims:
+        true_blockers.append("identity")
+    if not public_claims and memory_fit["dossierWorthiness"] in {"internal_only_for_now", "not_a_dossier_fit_yet"}:
+        true_blockers.append("public_dossier_reason")
+    if memory_fit["canDraftCautiously"] and public_claims:
+        readiness["blockedBy"] = []
+        readiness["readyForDraft"] = True
+        readiness["reason"] = memory_fit["reason"]
+        readiness["summary"] = f"BNL formed a memory-first {memory_fit['dossierWorthiness']} read and can draft cautiously from public-safe claims while omitting unresolved details."
+        readiness["questions"] = [q for q in readiness.get("questions", []) if q.get("dossierSection") in set(true_blockers)][:3]
+    else:
+        readiness["blockedBy"] = list(dict.fromkeys(true_blockers or readiness.get("blockedBy") or []))[:3]
+        readiness["readyForDraft"] = not readiness["blockedBy"]
+        readiness["reason"] = memory_fit["reason"]
+        readiness["summary"] = f"BNL formed a memory-first {memory_fit['dossierWorthiness']} read. {memory_fit['reason']}"
     resolution_context = normalize_source_file_resolution_context(packet)
     resolution_audit: dict[str, Any] = {}
     if resolution_context.get("hasContext"):
@@ -3230,6 +3336,8 @@ def build_subject_analyst_read(subject_name: str, resolved_memory: dict[str, Any
             "unresolvedAfterResolutionCount": unresolved_count,
         }
     actions = [q["question"] for q in readiness["questions"] if q.get("priority") == "high"]
+    if not actions and readiness.get("readyForDraft") and missing:
+        actions = [m["question"] for m in missing[:3]]
     withheld_audit = _withheld_audit(subject, resolved_memory, private, blind, review) if (private or blind or review) else {}
     source_file_ingredients = []
     for item in [internal, *strongest[:6], *public_claims, *review_claims, *blind_insights, *actions, *missing_lines]:
@@ -3246,6 +3354,8 @@ def build_subject_analyst_read(subject_name: str, resolved_memory: dict[str, Any
     analyst_read = {
         "subjectName": subject,
         "internalRead": internal,
+        "currentRead": current_read,
+        "dossierWorthiness": memory_fit["dossierWorthiness"],
         "likelySubjectType": likely_type,
         "confidence": confidence,
         "publicDraftPosture": posture,

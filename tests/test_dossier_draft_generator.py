@@ -718,3 +718,26 @@ class DossierDraftReadinessMemoryTests(unittest.TestCase):
         public = json.dumps(result["draft"]).lower()
         for forbidden in ("dossierreadinessquestions", "draftreadinessreason", "readyfordraft", "which links are signal fox"):
             self.assertNotIn(forbidden, public)
+
+class DossierDraftMemoryFirstTests(unittest.TestCase):
+    def test_draft_uses_public_safe_claims_not_internal_judgment(self):
+        packet = pr217_packet(
+            publicSafeFacts=["Signal Fox is connected to BARCODE public community context."],
+            publicSafeNotes=[],
+            subjectAnalystReadV1={
+                "readyForDraft": True,
+                "dossierWorthiness": "possible_fit",
+                "internalRead": "Strong Discord queue engagement and Orion lore make this internally interesting.",
+                "publicSafeClaims": ["Signal Fox is connected to BARCODE public community context."],
+                "draftIngredients": ["Signal Fox is connected to BARCODE public community context."],
+                "missingInfoQuestions": ["Confirm public links", "Confirm Orion lore use"],
+                "dossierBlockedBy": [],
+                "draftReadinessReason": "Draft cautiously and omit unresolved links/lore.",
+            },
+        )
+        result = draft.generate_dossier_draft(packet)["draft"]
+        public = " ".join(str(result[k]) for k in PUBLIC_FIELD_KEYS)
+        self.assertIn("BARCODE", public)
+        self.assertNotIn("Orion", public)
+        self.assertNotIn("Discord queue", public)
+        self.assertNotIn("Confirm Orion", json.dumps(result["missingInfoQuestions"]))

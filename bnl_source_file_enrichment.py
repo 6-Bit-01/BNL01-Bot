@@ -2973,6 +2973,7 @@ def build_source_file_brief_v2(packet: dict[str, Any], *, archive_id: str | None
     """Build a compact, human-readable admin brief for the full Source File archive."""
 
     source_file = packet.get("sourceFile") if isinstance(packet.get("sourceFile"), dict) else {}
+    analyst = packet.get("subjectAnalystReadV1") if isinstance(packet.get("subjectAnalystReadV1"), dict) else {}
     sections = packet.get("sections") if isinstance(packet.get("sections"), dict) else {}
     subject_name = _brief_text(packet.get("subject") or _first(source_file, ("name", "sourceFileName", "subject", "displayName", "title", "normalizedName")) or "Unknown subject", 140)
     subject_key = _subject_key(subject_name or _first(source_file, ("normalizedName", "subjectKey", "slug")))
@@ -3010,15 +3011,29 @@ def build_source_file_brief_v2(packet: dict[str, Any], *, archive_id: str | None
         max_items=BRIEF_V2_LIST_MAX_ITEMS,
         limit=220,
     )
-    if public_notes:
+    if analyst.get("readyForDraft") is True:
+        action = _brief_text(analyst.get("draftReadinessReason") or "BNL can prepare a cautious Proposed Dossier from public-safe claims and omit unresolved/internal details.", 220)
+    elif analyst.get("dossierBlockedBy"):
+        action = _brief_text(analyst.get("draftReadinessReason") or "Resolve the true draft blocker(s) before drafting.", 220)
+    elif public_notes:
         action = "Review public-safe notes and decide whether a short Proposed Dossier is justified."
     elif packet.get("qualityStatus") in {"too_thin", "forced_low_confidence"}:
         action = "Keep as Source File only; not ready for Proposed Dossier."
     else:
         action = "Review Identity Check before drafting."
-    one_line = _brief_text(f"{subject_name} is a Source File subject in the {match_kind} lane with {len(evidence_items)} concise evidence item{'s' if len(evidence_items) != 1 else ''} ready for admin review.", 220)
+    worthiness = analyst.get("dossierWorthiness")
+    one_line = _brief_text(
+        analyst.get("currentRead")
+        or f"{subject_name} is a Source File subject in the {match_kind} lane with {len(evidence_items)} concise evidence item{'s' if len(evidence_items) != 1 else ''} ready for admin review.",
+        220,
+    )
     admin_summary = _brief_text(
-        f"BNL has a review-only Source File for {subject_name}. The packet preserves the underlying evidence, while this brief pulls out the useful admin read: what appears supported, what may be safe to draft from, and what still needs human review. Treat this as internal guidance, not a public claim or identity decision.",
+        (
+            f"BNL memory-first read: {worthiness}. {analyst.get('internalRead')} "
+            f"{analyst.get('dossierReadinessSummary')}"
+            if analyst
+            else f"BNL has a review-only Source File for {subject_name}. The packet preserves the underlying evidence, while this brief pulls out the useful admin read: what appears supported, what may be safe to draft from, and what still needs human review. Treat this as internal guidance, not a public claim or identity decision."
+        ),
         900,
     )
     archive_refs = {
@@ -4969,6 +4984,8 @@ def build_source_file_case_report_v1(subject_memory_packet: dict[str, Any]) -> d
 _SUBJECT_ANALYST_READ_KEYS = (
     "subjectName",
     "internalRead",
+    "currentRead",
+    "dossierWorthiness",
     "likelySubjectType",
     "confidence",
     "publicDraftPosture",
@@ -5142,11 +5159,20 @@ def build_source_file_archive_payload(packet: dict[str, Any], *, environ: dict[s
         case_report["subjectAnalystReadV1"] = subject_analyst_read
         if subject_analyst_read.get("internalRead"):
             case_report["caseSummary"] = _case_text(f"{case_report.get('caseSummary')} BNL analyst read: {subject_analyst_read.get('internalRead')}", 900)
+        if subject_analyst_read.get("dossierWorthiness") or subject_analyst_read.get("dossierReadinessSummary"):
+            case_report["dossierUse"] = _case_text(
+                f"Use this Source File as BNL's admin/mod readout, not as a checklist. Fit read: {subject_analyst_read.get('dossierWorthiness') or 'unknown'}. {subject_analyst_read.get('dossierReadinessSummary') or ''} {subject_analyst_read.get('draftReadinessReason') or ''}",
+                700,
+            )
         case_report["recommendedNextSteps"] = _case_list([*(subject_analyst_read.get("recommendedAdminActions") or []), *(case_report.get("recommendedNextSteps") or [])], limit=10, item_limit=280)
-        case_report["reviewBlockers"] = _case_list([*(subject_analyst_read.get("missingInfoQuestions") or []), *(subject_analyst_read.get("doNotSayPublicly") or []), *(case_report.get("reviewBlockers") or [])], limit=12, item_limit=280)
+        if subject_analyst_read.get("readyForDraft") is True and not subject_analyst_read.get("dossierBlockedBy"):
+            case_report["reviewBlockers"] = []
+        else:
+            case_report["reviewBlockers"] = _case_list([*(subject_analyst_read.get("dossierBlockedBy") or []), *(case_report.get("reviewBlockers") or [])], limit=5, item_limit=220)
         case_report["confidenceNotes"] = _case_list([*(subject_analyst_read.get("provenanceSummary") or []), *(case_report.get("confidenceNotes") or [])], limit=12, item_limit=320)
         case_report["publicSafeClaims"] = _case_list([*(subject_analyst_read.get("publicSafeClaims") or []), *(case_report.get("publicSafeClaims") or [])], limit=10, item_limit=280)
         case_report["evidenceSummary"] = _case_list([*(subject_analyst_read.get("strongestSignals") or []), *(subject_analyst_read.get("provenanceSummary") or []), *(case_report.get("evidenceSummary") or [])], limit=12, item_limit=320)
+        case_report["internalOnlyNotes"] = _case_list([*(subject_analyst_read.get("privateOrInternalExclusions") or []), *(subject_analyst_read.get("sourceBlindInsights") or []), *(subject_analyst_read.get("doNotSayPublicly") or []), *(case_report.get("internalOnlyNotes") or [])], limit=10, item_limit=280)
     admin_summary = build_admin_summary({**packet, "subjectName": subject, "subjectKey": subject_key, "sourceLanes": ["source_file_enrichment"] + list(packet.get("sourceTypes") or [])})
     envelope = {
         "candidateId": _sanitize_archive_value(candidate_id) if candidate_id else None,
@@ -5159,7 +5185,7 @@ def build_source_file_archive_payload(packet: dict[str, Any], *, environ: dict[s
         "publicSafetyNotes": _sanitize_archive_value(_section_text(sections, "Public-Safe Notes", limit=10) or packet.get("publicSafetyNotes") or ""),
         "doNotSay": _sanitize_archive_value(_section_text(sections, "Do Not Say", limit=10) or packet.get("doNotSay") or ""),
         "evidenceReceiptSummary": _sanitize_archive_value(receipt),
-        "sourceFileBriefV2": _sanitize_archive_value(build_source_file_brief_v2(packet, archive_id=packet.get("archiveId") or "")),
+        "sourceFileBriefV2": _sanitize_archive_value(build_source_file_brief_v2({**packet, "subjectAnalystReadV1": subject_analyst_read}, archive_id=packet.get("archiveId") or "")),
         "subjectAnalystReadV1": subject_analyst_read,
         "sourceFileClassificationV1": _sanitize_archive_value(source_file_classification),
         "subjectMemoryPacketV1": subject_memory_packet,
