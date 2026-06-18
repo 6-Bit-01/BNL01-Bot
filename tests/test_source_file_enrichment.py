@@ -1624,3 +1624,58 @@ class SourceFileMemoryFirstReadoutTests(unittest.TestCase):
         self.assertEqual(report["reviewBlockers"], [])
         self.assertIn("possible_fit", brief["adminSummary"])
         self.assertIn("omit", brief["recommendedNextAction"].lower())
+
+class SourceFilePagePlanV1Tests(unittest.TestCase):
+    def test_archive_emits_complete_page_plan_everywhere_and_keeps_legacy_outputs(self):
+        packet = {
+            "subject": "Page Plan Fox",
+            "matchKind": "candidate_intake",
+            "runTime": "2026-06-18T00:00:00Z",
+            "sourceFile": {"id": "sf_page", "name": "Page Plan Fox"},
+            "sections": {},
+            "subjectAnalystReadV1": {
+                "subjectName": "Page Plan Fox",
+                "currentRead": "Full read: public music context, owner wording need, vague contest note, and internal queue boundary.",
+                "publicSafeClaims": ["Page Plan Fox has public BARCODE music context."],
+                "missingInfoQuestions": ["What owner-approved public role may BNL use?"],
+                "readyForDraft": False,
+                "dossierBlockedBy": [],
+                "privateOrInternalExclusions": ["Queue note contains private context."],
+                "reviewableClaims": [
+                    {"id": "contest", "claimText": "Possible contest/event connection.", "claimType": "contest", "publicSafe": False},
+                    {"id": "public", "claimText": "Page Plan Fox has public BARCODE music context.", "publicSafe": True},
+                ],
+            },
+        }
+        archive = enrich.build_source_file_archive_payload(packet)
+        plan = archive["sourceFilePagePlanV1"]
+        self.assertIn("sourceFilePagePlanV1", archive["subjectAnalystReadV1"])
+        self.assertIn("sourceFilePagePlanV1", archive["sourceFileCaseReportV1"])
+        for key in ("dossierCompletionReadV1", "reviewActionabilityV1", "subjectDossierStateV1", "sourceFileSurfaceV1"):
+            self.assertIn(key, archive)
+        self.assertNotIn("mainAction", plan)
+        self.assertNotIn("primaryAction", plan)
+        self.assertLess(list(plan.keys()).index("questionsToAsk"), list(plan.keys()).index("dossierWorthItDecision"))
+        for key in ("header", "bnlAnalystRead", "whatBnlNeeds", "publicSafeMaterial", "bnlReviewGuidance", "questionsToAsk", "dossierWorthItDecision", "internalOmitHold", "draftOrUpdatePlan", "diagnosticsSummary"):
+            self.assertTrue(plan[key])
+        for key in ("subject", "sourceFileStatus", "bnlState", "currentLane", "lastRefresh", "existingPublicDossier"):
+            self.assertTrue(plan["header"][key])
+        self.assertIsInstance(plan["whatBnlNeeds"], list)
+        text = json.dumps(plan).lower()
+        self.assertIn("full read", text)
+        self.assertIn("contest/event", text)
+        self.assertTrue(any(i["bnlDecision"] in {"ignore_for_now", "omit"} for i in plan["bnlReviewGuidance"] if "contest" in i["reviewIssue"].lower()))
+        self.assertIn("public barcode music context", text)
+        self.assertIn("owner-approved public role", text)
+        self.assertNotIn("private context", json.dumps(plan["publicSafeMaterial"]).lower())
+        self.assertIn("internal/review-only material withheld", json.dumps(plan["internalOmitHold"]).lower())
+
+    def test_page_plan_fills_not_needed_and_not_ready_fallbacks(self):
+        archive = enrich.build_source_file_archive_payload({"subject": "Quiet Fox", "sourceFile": {"name": "Quiet Fox"}, "sections": {}, "subjectAnalystReadV1": {"subjectName": "Quiet Fox", "publicSafeClaims": [], "readyForDraft": False, "dossierBlockedBy": []}})
+        plan = archive["sourceFilePagePlanV1"]
+        self.assertEqual(plan["whatBnlNeeds"][0]["requiredOrOptional"], "not_needed")
+        self.assertEqual(plan["whatBnlNeeds"][0]["suggestedControl"]["kind"], "none")
+        self.assertEqual(plan["publicSafeMaterial"][0]["confidence"], "none")
+        self.assertEqual(plan["questionsToAsk"][0]["requiredOrOptional"], "not_needed")
+        self.assertFalse(plan["draftOrUpdatePlan"]["canDraft"])
+        self.assertEqual(plan["draftOrUpdatePlan"]["draftType"], "none_yet")
