@@ -783,3 +783,26 @@ class DossierDraftMemoryFirstTests(unittest.TestCase):
         self.assertNotIn("Orion", public)
         self.assertNotIn("Discord queue", public)
         self.assertNotIn("Confirm Orion", json.dumps(result["missingInfoQuestions"]))
+
+class DossierDraftSourceFilePagePlanTests(unittest.TestCase):
+    def test_draft_consumes_source_file_page_plan_safely(self):
+        packet = pr217_packet(
+            publicSafeFacts=[],
+            sourceFilePagePlanV1={
+                "draftOrUpdatePlan": {
+                    "canDraft": False,
+                    "useTheseMaterials": ["Signal Fox has public BARCODE music context."],
+                    "omitTheseMaterials": ["Private queue note"],
+                    "ownerReviewWarnings": ["Drafting is not recommended yet."],
+                },
+                "internalOmitHold": {"keepInternal": [{"material": "Internal/source-blind material withheld"}], "omitFromPublicDraft": []},
+                "dossierWorthItDecision": {"decision": "not_worth_it_yet", "draftReadiness": "not_ready"},
+            },
+        )
+        result = draft.generate_dossier_draft(packet)["draft"]
+        public = " ".join(str(result[k]) for k in PUBLIC_FIELD_KEYS)
+        self.assertIn("BARCODE", public)
+        self.assertNotIn("Private queue note", public)
+        self.assertIn("Source File page plan says drafting is not recommended yet.", result["missingInfoQuestions"])
+        self.assertTrue(any("page plan warning" in x.lower() for x in result["ownerReviewWarnings"]))
+        self.assertTrue(any("Private queue note" in x for x in result["unsupportedClaimsRejected"]))
