@@ -7,6 +7,7 @@ only returns sanitized text in public-safe sections.
 from __future__ import annotations
 
 import json
+import hashlib
 import logging
 import re
 import sqlite3
@@ -411,11 +412,12 @@ def _universal_follow_up_for_claim(subject: str, claim_text: str, claim_type: st
         answer_type = "clarification of what this item refers to and whether it belongs in the dossier"
         reason = not_enough
         scope_label = ""; scope_known = False; confidence = "low"
-    return {
+    out = {
         "question": question, "audience": audience, "reason": reason, "answerType": answer_type,
         "confidence": confidence, "scopeKnown": bool(scope_known), "scopeLabel": scope_label,
         "category": category, "fallbackUsed": fallback, "notEnoughContextReason": not_enough,
     }
+    return out
 
 
 def _is_clarification_follow_up(follow_up: dict[str, Any] | None, actionability: str = "") -> bool:
@@ -448,7 +450,7 @@ def _clarification_copy(subject: str, follow_up: dict[str, Any], fallback_questi
             answer_type = "clarification of the contest/event object, subject role, and whether it belongs in the dossier"
         else:
             answer_type = "clarification of what this item refers to and whether it belongs in the dossier"
-    return {
+    out = {
         "decisionState": "needs_clarification",
         "actionability": "needs_clarification",
         "suggestedDecision": "needs_clarification",
@@ -489,6 +491,7 @@ def _clarification_copy(subject: str, follow_up: dict[str, Any], fallback_questi
         "followUpScopeKnown": False,
         "followUpScopeLabel": str(follow_up.get("scopeLabel") or ""),
     }
+    return _apply_canonical_question_identity(subject, out, section=_dossier_section_for_claim_type(category, question), category=category, scope_label=str(follow_up.get("scopeLabel") or ""))
 
 def _scoped_follow_up_for_claim(subject: str, claim_text: str, claim_type: str, lane: str, actionability: str, scope: dict[str, Any] | None = None) -> dict[str, Any]:
     return _universal_follow_up_for_claim(subject, claim_text, claim_type, lane, actionability, scope)
@@ -633,6 +636,137 @@ def _text(value: Any, limit: int = 320) -> str:
 
 def _subject_key(value: str) -> str:
     return re.sub(r"[^a-z0-9]+", "_", (value or "").lower()).strip("_")
+
+
+QUESTION_VERSION = "1.0"
+
+
+def _canonical_safe_slug(value: Any, *, limit: int = 90) -> str:
+    """Normalize public-safe question concepts for deterministic identifiers."""
+    clean = _text(value, 240).lower()
+    clean = _LINK_RE.sub(" ", clean)
+    clean = _EMAIL_RE.sub(" ", clean)
+    clean = _PHONE_RE.sub(" ", clean)
+    clean = _RAW_ID_RE.sub(" ", clean)
+    clean = _SECRET_RE.sub(" ", clean)
+    clean = re.sub(r"\b(?:rowid|source row|database|table|raw json|raw payload|memory_tiers|entity_evidence_events|discord id|user id|dm|direct message)\b", " ", clean, flags=re.I)
+    clean = re.sub(r"[^a-z0-9]+", "_", clean).strip("_")
+    return clean[:limit].strip("_")
+
+
+def _question_family_for_category(category: str) -> str:
+    if category in {"contest_event", "rules_instructions", "lore_context", "theory_anomaly", "orion_context", "links_music_socials"}:
+        return "dossier_context"
+    if category in {"role_title", "identity_name", "relationship_affiliation", "collaboration_interest", "ai_persona_project"}:
+        return "dossier_identity_relationship"
+    if category in {"source_blind", "public_boundary", "queue_submission"}:
+        return "dossier_public_safety"
+    return "dossier_readiness"
+
+
+def _question_category_from_text(section: str, text: str, fallback: str = "") -> str:
+    low = f"{section} {text} {fallback}".lower()
+    if "source-blind" in low or "protected context" in low:
+        return "source_blind"
+    if "orion" in low or "relay" in low:
+        return "orion_context"
+    if re.search(r"\bcontest|event|challenge|tournament|battle|competition\b", low):
+        return "contest_event"
+    if re.search(r"\brules?|instructions?|guidelines?\b", low):
+        return "rules_instructions"
+    if re.search(r"\blore|canon|null tv|barcode network lore|recurring topic\b", low):
+        return "lore_context"
+    if re.search(r"\btheory|anomal(?:y|ies)|glitch|technical issue\b", low):
+        return "theory_anomaly"
+    if re.search(r"\blink|url|social|suno|music|song|track\b", low):
+        return "links_music_socials"
+    if re.search(r"\brole|title|artist|producer|moderator|participant|host|organizer\b", low):
+        return "role_title"
+    if re.search(r"\bpublic name|display name|identity|alias\b", low):
+        return "identity_name"
+    if re.search(r"\brelationship|affiliation|connected|barcode/bnl\b", low):
+        return "relationship_affiliation"
+    if re.search(r"\bcollaborat|collab\b", low):
+        return "collaboration_interest"
+    if re.search(r"\bai|persona|project|bot|character\b", low):
+        return "ai_persona_project"
+    if re.search(r"\bqueue|submission|submitter|entry\b", low):
+        return "queue_submission"
+    if re.search(r"\bavoid|boundary|boundaries|do not say\b", low):
+        return "public_boundary"
+    return _canonical_safe_slug(fallback or section or "general", limit=50) or "general"
+
+
+def _canonical_question_metadata(
+    subject: str,
+    question: str,
+    *,
+    section: str = "",
+    audience: str = "",
+    answer_type: str = "",
+    source_safety: str = "",
+    blocked_by: list[str] | None = None,
+    scope_label: str = "",
+    category: str = "",
+    supersedes: list[str] | None = None,
+    narrows: list[str] | None = None,
+    replaced_by: str = "",
+) -> dict[str, Any]:
+    safe_question = _canonical_safe_slug(question, limit=120)
+    safe_subject = _canonical_safe_slug(subject, limit=60)
+    safe_section = _canonical_safe_slug(section or "unknown", limit=50)
+    safe_audience = _canonical_safe_slug(audience or "admin", limit=35)
+    safe_scope = _canonical_safe_slug(scope_label, limit=70)
+    cat = category or _question_category_from_text(safe_section, question, answer_type)
+    cat = _canonical_safe_slug(cat, limit=50) or "general"
+    family = _question_family_for_category(cat)
+    key_parts = [family, cat, safe_section, safe_audience, safe_subject, safe_question]
+    if safe_scope:
+        key_parts.append(safe_scope)
+    digest = hashlib.sha256("|".join(key_parts).encode("utf-8")).hexdigest()[:16]
+    meta: dict[str, Any] = {
+        "questionKey": f"bnlq_{cat}_{digest}",
+        "questionFamily": family,
+        "questionCategory": cat,
+        "dossierSection": section or safe_section or "unknown",
+        "audience": audience or "admin",
+        "answerType": answer_type or "plain-language approval, correction, or public-safe wording",
+        "sourceSafety": source_safety or "needs_confirmation",
+        "blockedBy": blocked_by or [],
+        "questionVersion": QUESTION_VERSION,
+        "supersedesQuestionKeys": supersedes or [],
+        "narrowsQuestionKeys": narrows or [],
+    }
+    if safe_scope:
+        meta["scopeKey"] = f"scope_{safe_scope}"
+    if safe_subject:
+        meta["subjectKey"] = f"subject_{safe_subject}"
+    if replaced_by:
+        meta["replacedByQuestionKey"] = replaced_by
+    return meta
+
+
+def _apply_canonical_question_identity(subject: str, item: dict[str, Any], *, section: str = "", category: str = "", scope_label: str = "", narrows: list[str] | None = None) -> dict[str, Any]:
+    question = _text(item.get("question") or item.get("recommendedFollowUpQuestion") or item.get("suggestedConfirmationQuestion") or item.get("verificationPacketQuestion") or item.get("text"), 500)
+    if not question:
+        return item
+    blocked = item.get("blockedBy") if isinstance(item.get("blockedBy"), list) else []
+    meta = _canonical_question_metadata(
+        subject,
+        question,
+        section=section or str(item.get("dossierSection") or ""),
+        audience=str(item.get("audience") or item.get("recommendedFollowUpAudience") or item.get("suggestedConfirmationAudience") or item.get("verificationPacketAudience") or "admin"),
+        answer_type=str(item.get("answerType") or item.get("suggestedConfirmationAnswerType") or ""),
+        source_safety=str(item.get("sourceSafety") or ""),
+        blocked_by=blocked,
+        scope_label=scope_label or str(item.get("followUpScopeLabel") or ""),
+        category=category or str(item.get("followUpCategory") or ""),
+        supersedes=item.get("supersedesQuestionKeys") if isinstance(item.get("supersedesQuestionKeys"), list) else None,
+        narrows=narrows if narrows is not None else (item.get("narrowsQuestionKeys") if isinstance(item.get("narrowsQuestionKeys"), list) else None),
+        replaced_by=str(item.get("replacedByQuestionKey") or ""),
+    )
+    item.update(meta)
+    return item
 
 
 def _is_probable_subject_alias(label: str) -> bool:
@@ -1245,7 +1379,7 @@ def _review_display_copy(subject: str, claim_text: str, claim_type: str, lane: s
         "followUpScopeKnown": bool((follow_up or {}).get("scopeKnown")),
         "followUpScopeLabel": (follow_up or {}).get("scopeLabel", ""),
     }
-    return {k: _display_clean(v) if isinstance(v, str) else v for k, v in base_display.items()}
+    return _apply_canonical_question_identity(subject, {k: _display_clean(v) if isinstance(v, str) else v for k, v in base_display.items()}, section=_dossier_section_for_claim_type(claim_type, question), category=str((follow_up or {}).get("category") or ""), scope_label=str((follow_up or {}).get("scopeLabel") or ""))
 
 
 def _dossier_question_id(section: str, audience: str, index: int) -> str:
@@ -1361,6 +1495,7 @@ def _build_dossier_readiness(subject: str, reviewable_claims: list[dict[str, Any
     questions = sorted(buckets.values(), key=lambda x: (priority_rank.get(x["priority"], 9), x["dossierSection"]) )[:7]
     for i, q in enumerate(questions, 1):
         q["id"] = _dossier_question_id(q["dossierSection"], q["audience"], i)
+        _apply_canonical_question_identity(subject, q, section=str(q.get("dossierSection") or ""))
     blocked = [q["dossierSection"] for q in questions if q["priority"] == "high"]
     ready = not blocked
     return {"questions": questions, "summary": f"BNL has {len(questions)} prioritized dossier-readiness question(s); {len(blocked)} block a complete public draft.", "blockedBy": blocked, "readyForDraft": ready, "reason": "Ready for draft with current public-safe facts." if ready else "Resolve high-priority identity, role, link/music, relationship, contest, or boundary questions before generating a concrete public dossier."}
@@ -1512,10 +1647,11 @@ def _cluster_clarification_needs(subject: str, reviewable_claims: list[dict[str,
         reason = (f"BNL found {len(entries)} {relationship} {title_topic} signal(s). "
                   f"{'They may refer to the same unresolved context, but labels or summaries differ, so BNL needs clarification before treating them as one dossier fact.' if relationship == 'related' else 'BNL cannot decide whether this belongs in the dossier until the missing context is identified.'}")
         signals = [_clarification_signal(c, str(category), str(safety)) for _, c in entries]
-        needs.append({
+        need = {
             "id": f"dossier-clarification-{section}-{n}",
             "title": title,
             "question": question,
+            "text": question,
             "audience": audience,
             "reason": reason,
             "answerType": answer_type or "clarification of what this signal refers to and whether it belongs in the dossier",
@@ -1527,7 +1663,9 @@ def _cluster_clarification_needs(subject: str, reviewable_claims: list[dict[str,
             "contributingSignals": signals,
             "sourceSafety": safety,
             "canBecomeReviewCardAfterAnswer": True,
-        })
+        }
+        _apply_canonical_question_identity(subject, need, section=str(section), category=str(category))
+        needs.append(need)
         card = dict(entries[0][1])
         if safety == "source_blind_blocked" and len(entries) == 1:
             passthrough.append(card)
@@ -1546,6 +1684,7 @@ def _cluster_clarification_needs(subject: str, reviewable_claims: list[dict[str,
             "clarificationRelationshipType": relationship,
             "relatedReviewClaimIds": needs[-1]["relatedReviewClaimIds"],
         })
+        _apply_canonical_question_identity(subject, card, section=str(section), category=str(category))
         passthrough.append(card)
     return passthrough[:14], needs, audit
 
@@ -1555,10 +1694,20 @@ def _build_dossier_readiness_from_clarifications(readiness: dict[str, Any], need
     clar_questions: list[dict[str, Any]] = []
     for need in needs[:7]:
         used = f" Used by {need.get('sourceCount', 1)} {need.get('relationshipType', 'distinct')} signal{'s' if int(need.get('sourceCount') or 1) != 1 else ''}."
-        clar_questions.append({
+        broad_key = _canonical_question_metadata(
+            "the subject",
+            str(need.get("question") or ""),
+            section=str(need.get("dossierSection") or "unknown"),
+            audience=str(need.get("audience") or "admin"),
+            answer_type=str(need.get("answerType") or ""),
+            source_safety=str(need.get("sourceSafety") or "needs_clarification"),
+            category=str(need.get("questionCategory") or ""),
+        )["questionKey"]
+        clar = {
             "id": f"readiness-{need.get('id')}",
             "audience": need.get("audience") or "admin",
             "question": f"{need.get('title')}: {need.get('question')}{used}",
+            "text": f"{need.get('title')}: {need.get('question')}{used}",
             "whyItMatters": need.get("reason") or "Clarification needed before BNL can draft this part of the dossier.",
             "dossierSection": need.get("dossierSection") or "unknown",
             "priority": need.get("priority") or "high",
@@ -1566,7 +1715,15 @@ def _build_dossier_readiness_from_clarifications(readiness: dict[str, Any], need
             "sourceSafety": need.get("sourceSafety") or "needs_clarification",
             "relationshipType": need.get("relationshipType") or "distinct",
             "sourceCount": need.get("sourceCount") or 1,
-        })
+        }
+        _apply_canonical_question_identity(
+            str(need.get("subjectName") or "the subject"),
+            clar,
+            section=str(need.get("dossierSection") or "unknown"),
+            category=str(need.get("questionCategory") or ""),
+            narrows=[broad_key],
+        )
+        clar_questions.append(clar)
     seen_sections = {q.get("dossierSection") for q in clar_questions}
     merged = clar_questions + [q for q in existing if q.get("dossierSection") not in seen_sections]
     priority_rank = {"high": 0, "medium": 1, "low": 2}
@@ -2414,6 +2571,13 @@ def _finalize_review_guidance(subject: str, claim_text: str, claim_type: str, la
         guidance["suggestedMissingInfoQuestion"] = guidance["recommendedFollowUpQuestion"]
         guidance["verificationPacketQuestion"] = guidance["recommendedFollowUpQuestion"]
         guidance["verificationPacketQuestions"] = [guidance["recommendedFollowUpQuestion"]]
+        _apply_canonical_question_identity(
+            subject,
+            guidance,
+            section=_dossier_section_for_claim_type(str(claim_type or dimension), str(guidance.get("recommendedFollowUpQuestion") or claim_text)),
+            category=str(guidance.get("followUpCategory") or ""),
+            scope_label=str(guidance.get("followUpScopeLabel") or ""),
+        )
     guidance["displayWhyBNLFlaggedIt"] = guidance.get("displayWhyItExists", guidance.get("displayWhyBNLFlaggedIt", ""))
     guidance["displaySafeDefault"] = guidance.get("displaySafetyDefault", guidance.get("displaySafeDefault", ""))
     return _humanize_visible_copy(subject, guidance)
@@ -2865,6 +3029,11 @@ def build_subject_analyst_read(subject_name: str, resolved_memory: dict[str, Any
         missing.append({"question": f"Confirm queue/submission history: Can {subject}'s queue or submission history be referenced publicly?", "confirmationType": "needs_admin_confirmation", "suggestedReviewer": "admin", "why": "Queue/submission evidence is review-only unless explicitly confirmed public-safe.", "canAutoResolve": False, "relatedClaimType": "queue_submission"})
     resolved_types = _resolved_missing_info_types(admin_corrections)
     missing = [m for m in missing if m.get("relatedClaimType") not in resolved_types]
+    for m in missing:
+        m.setdefault("audience", m.get("suggestedReviewer") or "admin")
+        m.setdefault("answerType", "confirmation of whether this can become a dossier question or public-safe wording")
+        m.setdefault("sourceSafety", "needs_confirmation")
+        _apply_canonical_question_identity(subject, m, section=_dossier_section_for_claim_type(str(m.get("relatedClaimType") or ""), str(m.get("question") or "")))
     reviewable_claims = [c for c in reviewable_claims if _is_human_visible_review_claim(c)]
     reviewable_claims, dossier_clarification_needs, clarification_audit = _cluster_clarification_needs(subject, reviewable_claims)
     missing_lines = [m["question"] + f" ({m['confirmationType'].replace('_', ' ')}.)" for m in missing]

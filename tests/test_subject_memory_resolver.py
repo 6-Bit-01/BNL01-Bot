@@ -4,10 +4,16 @@ import unittest
 import json
 
 import bnl_dossier_draft as draft
-from bnl_subject_memory_resolver import build_subject_analyst_read, build_subject_memory_diagnostic, resolve_subject_memory, _review_guidance, _make_reviewable_claim, _cluster_clarification_needs, _build_dossier_readiness, _build_dossier_readiness_from_clarifications, _public_role_candidate_for_subject, _build_review_context, _compose_source_file_review_card, _finalize_review_guidance
+from bnl_subject_memory_resolver import build_subject_analyst_read, build_subject_memory_diagnostic, resolve_subject_memory, _review_guidance, _make_reviewable_claim, _cluster_clarification_needs, _build_dossier_readiness, _build_dossier_readiness_from_clarifications, _public_role_candidate_for_subject, _build_review_context, _compose_source_file_review_card, _finalize_review_guidance, _canonical_question_metadata
 
 
 class SubjectMemoryResolverTests(unittest.TestCase):
+
+    def assertCanonicalQuestion(self, item):
+        for key in ("questionKey", "questionFamily", "questionCategory", "dossierSection", "audience", "answerType", "sourceSafety", "blockedBy", "questionVersion", "supersedesQuestionKeys", "narrowsQuestionKeys"):
+            self.assertIn(key, item)
+        self.assertTrue(item["questionKey"].startswith("bnlq_"))
+        self.assertEqual(item["questionVersion"], "1.0")
 
     def test_clarification_clustering_duplicates_related_source_blind_and_audit(self):
         duplicate_a = _make_reviewable_claim("Crow", "theory/anomaly-heavy", "relationship", "needs_confirmation", "Review-only theory anomaly signal.", False, "low", "theory/anomaly-heavy")
@@ -15,6 +21,7 @@ class SubjectMemoryResolverTests(unittest.TestCase):
         normal = _make_reviewable_claim("Crow", "Crow is publicly listed as a BARCODE participant.", "role", "public_home", "public-safe fact", True, "high", "public BARCODE participant")
         clustered, needs, audit = _cluster_clarification_needs("Crow", [duplicate_a, duplicate_b, normal])
         self.assertEqual(len(needs), 1)
+        self.assertCanonicalQuestion(needs[0])
         self.assertEqual(needs[0]["relationshipType"], "duplicate")
         self.assertEqual(needs[0]["sourceCount"], 2)
         self.assertEqual(needs[0]["relatedReviewClaimIds"], ["reviewableClaims[0]", "reviewableClaims[1]"])
@@ -59,6 +66,47 @@ class SubjectMemoryResolverTests(unittest.TestCase):
         _, vague_needs, vague_audit = _cluster_clarification_needs("Crow", [vague])
         self.assertFalse(vague_needs)
         self.assertTrue(any("not enough context" in a for a in vague_audit))
+
+    def test_canonical_question_identity_is_stable_scoped_and_private_safe(self):
+        q = "Which Crow links, music links, or social links are owned or approved for public reference?"
+        a = _canonical_question_metadata("Crow", q, section="music", audience="subject", answer_type="approved links")
+        b = _canonical_question_metadata("Crow", q, section="music", audience="subject", answer_type="approved links")
+        self.assertEqual(a["questionKey"], b["questionKey"])
+
+        broad = _canonical_question_metadata("Crow", "Was Crow involved in this contest or event, or was he only mentioned nearby?", section="contest", audience="subject")
+        narrow = _canonical_question_metadata("Crow", "Was Crow a submitter in the Hellcat-hosted contest, or was he only mentioned nearby?", section="contest", audience="subject", scope_label="Hellcat-hosted contest", narrows=[broad["questionKey"]])
+        self.assertNotEqual(broad["questionKey"], narrow["questionKey"])
+        self.assertEqual(narrow["narrowsQuestionKeys"], [broad["questionKey"]])
+        self.assertIn("scopeKey", narrow)
+
+        private = _canonical_question_metadata("Crow", "source-blind private evidence says secret room rowid 123456789012345678 discord id 999999999999999999", section="source_blind", audience="admin")
+        self.assertNotIn("secret", private["questionKey"])
+        self.assertNotIn("999999", private["questionKey"])
+
+    def test_readiness_clarification_and_followups_carry_canonical_metadata(self):
+        packet = {
+            "reviewOnlyEvidence": [
+                {"summary": "Crow has Suno music link context needing public-safe provenance."},
+                {"summary": "Crow appears near contest rules and submission link context."},
+                {"summary": "Crow has Orion relay context needing confirmation."},
+                {"summary": "Crow has lore-heavy context without a specific public fact."},
+                {"summary": "unclear rules and instructions near Crow"},
+            ],
+            "sourceSafetyWarnings": ["Some subject memory lacked public-safe provenance"],
+            "evidenceCounts": {"publicSafe": 0, "reviewOnly": 5, "privateOrInternal": 0, "sourceBlind": 1, "totalScanned": 6},
+        }
+        analyst = build_subject_analyst_read("Crow", packet)
+        self.assertTrue(analyst["dossierReadinessQuestions"])
+        self.assertTrue(analyst["dossierClarificationNeeds"])
+        for item in analyst["dossierReadinessQuestions"] + analyst["dossierClarificationNeeds"]:
+            self.assertCanonicalQuestion(item)
+        followups = [c for c in analyst["reviewableClaims"] if c.get("recommendedFollowUpQuestion")]
+        self.assertTrue(followups)
+        for card in followups:
+            self.assertCanonicalQuestion(card)
+            self.assertEqual(card["recommendedFollowUpQuestion"], card["verificationPacketQuestion"])
+        categories = {c["questionCategory"] for c in followups + analyst["dossierReadinessQuestions"] + analyst["dossierClarificationNeeds"]}
+        self.assertTrue({"contest_event", "rules_instructions", "lore_context", "orion_context", "links_music_socials"} & categories)
 
     def test_readiness_uses_consolidated_clarification_questions(self):
         theory = _make_reviewable_claim("Crow", "theory/anomaly-heavy", "relationship", "needs_confirmation", "Review-only theory anomaly signal.", False, "low", "theory/anomaly-heavy")
