@@ -215,6 +215,9 @@ def _ai_persona_project_scope_for_text(subject: str, text: str) -> dict[str, Any
     scope = dict(_BROAD_SCOPE_DEFAULT)
     if not re.search(r"\b(ai|persona|project|bot|model|character)\b", value, re.I):
         return scope
+    if "orion" in value.lower():
+        scope.update({"hasSignal": True, "scopeKnown": True, "scopeType": "orion_ai_persona_project", "scopeLabel": "Orion", "objectName": "Orion", "confidence": "medium", "shouldEmitReviewCard": True, "shouldEmitReadinessQuestion": True, "reason": "Orion context identified."})
+        return scope
     label = ""
     m = re.search(r"\b(?:AI|persona|project|bot|model|character)\s+(?:named|called|with)\s+([A-Z][A-Za-z0-9 _-]{2,60})\b", value)
     if m:
@@ -325,8 +328,11 @@ def _universal_follow_up_for_claim(subject: str, claim_text: str, claim_type: st
     elif category == "ai_persona_project":
         s = scope or _ai_persona_project_scope_for_text(subject, claim_text)
         obj = _text(s.get("objectName") or (scope_label if scope_known and scope_label != "AI/persona/project interaction" else ""), 90)
-        if obj:
-            question = f"Can BNL mention the subject’s connection to {obj} publicly? If yes, what exact wording should it use?"
+        if obj and obj.lower() == "orion":
+            question = f"This appears to point at Orion context around {subject}. Can BNL mention {subject}'s Orion connection publicly, keep it as internal lore/context, or leave it out of the dossier?"
+            scope_label = "Orion"; scope_known = True; confidence = "medium"
+        elif obj:
+            question = f"Can BNL mention {subject}'s connection to {obj} publicly? If yes, what exact wording should it use?"
             scope_label = obj; scope_known = True; confidence = "medium"
         else:
             question = "What AI/persona/project connection is this referring to? What AI, persona, project, character, bot, or universe is this referring to, and what was the subject’s actual connection to it? Should BNL mention it publicly, keep it internal, or ignore it?"
@@ -369,11 +375,16 @@ def _universal_follow_up_for_claim(subject: str, claim_text: str, claim_type: st
         answer_type = "clarification of the instruction source, audience, purpose, and subject role" if not scope_known else "what the instructions were, who they were for, subject role, and public/internal/ignore decision"
         reason = "BNL needs the instruction source, audience, purpose, and subject role before treating rules/instructions as dossier context."
     elif category == "theory_anomaly":
-        question = f"What theory or anomaly is this referring to, and is it about {subject}, BARCODE lore, Orion, a recurring topic, a technical issue, or something unrelated? Should BNL use it publicly, keep it internal, or ignore it?"
+        if "orion" in (claim_text or "").lower():
+            question = f"I see an Orion-related thread around {subject}. Should this become public lore/context in {subject}'s dossier, stay internal, or be ignored?"
+        elif re.search(r"\b(technical issue|glitch|bug|error|system issue)\b", claim_text or "", re.I):
+            question = f"This looks like a technical/system issue, not {subject} dossier material. Should I ignore it for {subject}'s Source File?"
+        else:
+            question = f"I found a vague anomaly/lore marker around {subject}, but not enough to use it. Should I ignore this unless we find a real source?"
         answer_type = "clarification of the theory/anomaly scope and whether it belongs in the dossier" if not scope_known else "scope of the theory/anomaly plus public/internal/ignore decision"
         reason = "BNL needs the theory/anomaly scope before deciding whether it belongs in a public dossier."
     elif category == "orion_context":
-        question = f"Can BNL mention Orion in public {subject} context, or should Orion stay internal? If public, what exact wording is approved?"
+        question = f"I see an Orion-related thread around {subject}. Should this become public lore/context in {subject}'s dossier, stay internal, or be ignored?"
         answer_type = "Orion/context public/internal decision and approved wording"; scope_label = "Orion/context"; scope_known = True
         reason = "BNL needs an explicit public/internal boundary for Orion/context references."
     elif category == "lore_context":
@@ -1761,10 +1772,10 @@ def _dimension_template(subject: str, dimension: str) -> dict[str, Any]:
     }
     templates = {
         "show_operations": dict(displayTitle="Confirm show-operations involvement", displayDecision=f"Is {subject} involved in show operations?", displayWhatIsBeingChecked=f"BNL found show-operations context, but it does not know whether {subject} is actually involved.", displayWhyItExists=f"Show-operations involvement could matter for {subject}’s Source File or dossier, but BNL should not infer it from weak context.", displayBNLRecommendation="BNL recommends asking a direct yes/no question before using this publicly.", displaySafetyDefault="Do not mention show-operations involvement publicly unless confirmed.", displayApprovalInstruction=f"Confirm involvement only if {subject} actually helps with show operations and the wording is safe to use.", displayWhatYouAreApproving="A show-operations involvement fact, not a general role/title.", recommendedFollowUpQuestion=f"Is {subject} involved in show operations? If yes, what does he help with, and can BNL mention it publicly?", suggestedConfirmationAnswerType="yes/no involvement, what he helps with, and whether it can be public", allowedReviewActions=_actions(("confirm_show_operations","Yes — involved in show operations"),("not_involved","No — not involved"),("keep_internal","Keep internal"),("ask_follow_up","Ask follow-up"),("reject","Reject / not useful"))),
-        "contest_event_activity": dict(displayTitle="Clarify contest/event activity", displayDecision=f"Was {subject} involved in this contest or event?", displayWhatIsBeingChecked=f"BNL found contest/event activity near {subject}, but this does not prove a public role or title.", displayWhyItExists="Contest/event context can matter, but proximity is not proof of participation, hosting, organizing, or public role.", displayBNLRecommendation="BNL recommends clarifying the exact relationship before using this publicly.", displaySafetyDefault="Do not turn contest/event activity into a role/title unless confirmed.", displayApprovalInstruction="Approve only the exact event relationship and public-safe wording.", displayWhatYouAreApproving="Contest/event involvement or mention-only status, not a general role/title.", recommendedFollowUpQuestion=f"Was {subject} involved in this contest or event? If yes, was he a participant, submitter, host, organizer, rules poster, link source, or just mentioned nearby?", suggestedConfirmationAnswerType="event name, subject relationship to the event, and whether it can be public", allowedReviewActions=_actions(("confirm_event_involvement","Confirm event involvement"),("mentioned_only","Mentioned only"),("keep_internal","Keep internal"),("ask_follow_up","Ask follow-up"),("reject","Reject / not useful"))),
+        "contest_event_activity": dict(displayTitle="Clarify contest/event activity", displayDecision=f"Was {subject} involved in this contest or event?", displayWhatIsBeingChecked=f"BNL found contest/event activity near {subject}, but this does not prove a public role or title.", displayWhyItExists="Contest/event context can matter, but proximity is not proof of participation, hosting, organizing, or public role.", displayBNLRecommendation="BNL recommends clarifying the exact relationship before using this publicly.", displaySafetyDefault="Do not turn contest/event activity into a role/title unless confirmed.", displayApprovalInstruction="Approve only the exact event relationship and public-safe wording.", displayWhatYouAreApproving="Contest/event involvement or mention-only status, not a general role/title.", recommendedFollowUpQuestion=f"I see contest/rules/link traces around {subject}, but I do not have the actual event role locked down. Was {subject} submitting, posting rules, sharing a link, hosting, organizing, or just mentioned nearby?", suggestedConfirmationAnswerType="event name, subject relationship to the event, and whether it can be public", allowedReviewActions=_actions(("confirm_event_involvement","Confirm event involvement"),("mentioned_only","Mentioned only"),("keep_internal","Keep internal"),("ask_follow_up","Ask follow-up"),("reject","Reject / not useful"))),
         "collaboration_interest": dict(displayTitle="Clarify collaboration interest", displayDecision=f"Did {subject} only show interest in collaborating, or is there an actual public collaboration BNL can mention?", displayWhatIsBeingChecked="BNL found possible collaboration interest, but interest is not the same as an approved public collaboration.", displayWhyItExists="Collaboration interest should not become collaborator status without confirmation.", displayBNLRecommendation="BNL recommends separating interest-only context from confirmed public collaboration.", displaySafetyDefault="Do not call this an actual collaboration unless confirmed and approved for public use.", displayApprovalInstruction="Classify interest-only vs actual collaboration before approving wording.", displayWhatYouAreApproving="A collaboration-interest classification or confirmed collaboration path, not a role/title.", recommendedFollowUpQuestion=f"Did {subject} only show interest in collaborating, or is there an actual public collaboration BNL can mention publicly? If public, is it with BARCODE or another project, song, show, or context?", suggestedConfirmationAnswerType="interest-only vs actual collaboration, project/context, and public permission", allowedReviewActions=_actions(("interest_only","Interest only"),("confirm_actual_collaboration","Confirm actual collaboration"),("keep_internal","Keep internal"),("ask_subject","Ask subject"),("reject","Reject / not useful"))),
         "collaboration_status": dict(displayTitle="Confirm public collaboration", displayDecision="Can BNL mention this collaboration publicly?", displayWhatIsBeingChecked="BNL found possible collaboration status and needs exact public-safe project/context wording.", displayWhyItExists="Actual collaboration can be dossier-relevant only when public permission and context are clear.", displayBNLRecommendation="BNL recommends confirming the exact project/context before public use.", displaySafetyDefault="Do not mention collaboration publicly without approved wording.", displayApprovalInstruction="Approve only the confirmed public collaboration wording.", displayWhatYouAreApproving="A public collaboration fact with exact project/context.", recommendedFollowUpQuestion="Can BNL mention this collaboration publicly? If yes, what exact project, song, show, or workflow should it reference?", suggestedConfirmationAnswerType="confirmed collaboration, exact project/context, and public wording", allowedReviewActions=_actions(("confirm_public_collaboration","Confirm public collaboration"),("needs_project_context","Ask for exact project/context"),("keep_internal","Keep internal"),("reject","Reject / not useful"))),
-        "source_protected_context": dict(displayTitle=f"Need approved public wording for {subject}", displayDecision="Should this stay internal, or is there approved public wording BNL can use?", displayWhatIsBeingChecked="BNL has protected context it cannot show or quote here. It needs a separate public source or owner-approved wording before anything can be used publicly.", displayWhyItExists="BNL may know something internally, but protected context cannot become public dossier copy by itself.", displayBNLRecommendation="Keep this internal unless an owner/admin provides public-safe wording or a public source.", displaySafetyDefault="Keep internal. Do not use protected context publicly.", displayApprovalInstruction="Only approve separately confirmed wording. Do not approve the protected context itself.", displayWhatYouAreApproving="A separately approved public wording or public source, not the protected context.", evidenceSummary="Protected context exists, but details are withheld from this card.", suggestedInternalNote=f"BNL has protected context for {subject}; keep internal unless approved public wording or a public source is provided.", recommendedFollowUpQuestion="Should this protected context stay internal, or is there approved public wording BNL can use?", suggestedConfirmationAnswerType="keep internal, approved public wording, or public source", allowedReviewActions=_actions(("keep_internal","Keep internal"),("add_approved_public_wording","Add approved public wording"),("attach_public_source","Attach public source"),("ask_owner_admin","Ask owner/admin"),("reject","Reject / not useful"))),
+        "source_protected_context": dict(displayTitle=f"Need approved public wording for {subject}", displayDecision=f"I can see something around {subject} here, but this part is not safe to quote. I should keep it out of the public dossier unless you give me approved wording or a separate public source.", displayWhatIsBeingChecked="BNL has protected context it cannot show or quote here. It needs a separate public source or owner-approved wording before anything can be used publicly.", displayWhyItExists="BNL may know something internally, but protected context cannot become public dossier copy by itself.", displayBNLRecommendation="Keep this internal unless an owner/admin provides public-safe wording or a public source.", displaySafetyDefault="Keep internal. Do not use protected context publicly.", displayApprovalInstruction="Only approve separately confirmed wording. Do not approve the protected context itself.", displayWhatYouAreApproving="A separately approved public wording or public source, not the protected context.", evidenceSummary="Protected context exists, but details are withheld from this card.", suggestedInternalNote=f"I can see something around {subject} here, but this part is not safe to quote. I should keep it out of the public dossier unless you give me approved wording or a separate public source.", recommendedFollowUpQuestion=f"I can see something around {subject} here, but this part is not safe to quote. Should I keep it internal, or do you have approved wording/public source I can use?", suggestedConfirmationAnswerType="keep internal, approved public wording, or public source", allowedReviewActions=_actions(("keep_internal","Keep internal"),("add_approved_public_wording","Add approved public wording"),("attach_public_source","Attach public source"),("ask_owner_admin","Ask owner/admin"),("reject","Reject / not useful"))),
     }
     generic = {
         "public_identity": ("Confirm public identity", f"What exact public name may BNL use for {subject}?", "approved public identity/name"),
@@ -1805,14 +1816,6 @@ def _apply_dimension_card_copy(guidance: dict[str, Any], dimension_copy: dict[st
             if key == "suggestedPublicWording" and guidance.get("suggestedPublicWording"):
                 continue
             guidance[key] = value
-    if guidance.get("recommendedFollowUpQuestion"):
-        guidance["suggestedConfirmationReason"] = guidance.get("recommendedFollowUpReason", guidance.get("suggestedConfirmationReason", ""))
-        guidance["suggestedConfirmationQuestion"] = guidance["recommendedFollowUpQuestion"]
-        guidance["suggestedMissingInfoQuestion"] = guidance["recommendedFollowUpQuestion"]
-        guidance["verificationPacketQuestion"] = guidance["recommendedFollowUpQuestion"]
-        guidance["verificationPacketQuestions"] = [guidance["recommendedFollowUpQuestion"]]
-    guidance["displayWhyBNLFlaggedIt"] = guidance.get("displayWhyItExists", guidance.get("displayWhyBNLFlaggedIt", ""))
-    guidance["displaySafeDefault"] = guidance.get("displaySafetyDefault", guidance.get("displaySafeDefault", ""))
 
 _RAW_REVIEW_LABELS = {
     "contest/event activity", "contests/events", "show operations", "collaboration",
@@ -1910,6 +1913,78 @@ def _detail_is_fallback_or_label(text: str, subject: str) -> bool:
     return False
 
 
+_BNL_VISIBLE_FIELDS = {
+    "displayTitle", "displayTopic", "displayDecision", "displayWhatIsBeingChecked",
+    "displayWhyItExists", "displayBNLRecommendation", "displaySafetyDefault",
+    "displayApprovalInstruction", "displayWhatYouAreApproving", "evidenceSummary",
+    "suggestedInternalNote", "recommendedFollowUpQuestion", "recommendedFollowUpReason",
+    "verificationPacketQuestion", "cannotSuggestPublicReason", "exampleApprovedText",
+}
+_BNL_BANNED_VISIBLE_RE = re.compile(r"\b(source[-_ ]blind|source_protected|provenance|raw label|taxonomy|dimension|resolver|reviewContext|admin-safe|public-safe provenance|public dossier source not connected yet)\b", re.I)
+_KEYWORD_CLUSTER_RE = re.compile(r"(?:contest name/rules/channel/dates/public link|lore/anomaly public-safety status|official public dossier source not connected yet|public artist links / public music role)", re.I)
+
+def _looks_like_keyword_cluster(text: str) -> bool:
+    clean = re.sub(r"\s+", " ", str(text or "").strip())
+    if not clean:
+        return False
+    if _KEYWORD_CLUSTER_RE.search(clean):
+        return True
+    if clean.count(";") >= 1:
+        parts = [p.strip() for p in clean.split(";") if p.strip()]
+        checklistish = 0
+        for part in parts:
+            if re.search(r"\b(status|source not connected|links? /|name/rules|channel/dates|public[- ]safety|missing|needs? confirmation|context)$", part, re.I) or "/" in part:
+                checklistish += 1
+        if len(parts) >= 2 and checklistish >= max(1, len(parts) - 1):
+            return True
+    return False
+
+def _plain_protected_copy(subject: str, orion: bool = False) -> str:
+    if orion:
+        return f"I can see there is an Orion thread around {subject}, but this part is not safe to quote. Do you want me to keep Orion out of {subject}'s public dossier, or give me approved wording I can use?"
+    return f"I can see something around {subject} here, but this part is not safe to quote. I should keep it out of the public dossier unless you give me approved wording or a separate public source."
+
+def _humanize_visible_copy(subject: str, guidance: dict[str, Any]) -> dict[str, Any]:
+    protected = guidance.get("dossierDimension") == "source_protected_context" or guidance.get("reviewLane") == "source_blind" or guidance.get("sourceSafety") == "source_protected"
+    blob = json.dumps(guidance, default=str).lower()
+    orion = "orion" in blob
+    vague = guidance.get("recommendedAction") == "ignore_or_suppress" or guidance.get("answerability") == "not_answerable"
+    replacements = [
+        (re.compile(r"Protected context exists for ([^.]+)\. Keep it internal unless an owner/admin provides public wording or a separate public source\.?", re.I), _plain_protected_copy(subject, orion)),
+        (re.compile(r"Source-blind memory cannot become public copy by itself\.?", re.I), "I can’t turn this hidden thread into public copy on my own. Give me approved wording or a public source, otherwise I keep it internal."),
+        (re.compile(r"No confirmed public-safe wording or provenance was identified\.?", re.I), "I do not have approved public wording or a public source yet."),
+        (re.compile(r"missing public-safe provenance", re.I), "missing a public source"),
+        (re.compile(r"admin-safe evidence detail\(s\)", re.I), "details I can show you"),
+        (re.compile(r"raw label", re.I), "thin label"),
+        (re.compile(r"source[-_ ]blind", re.I), "hidden"),
+    ]
+    for key in list(_BNL_VISIBLE_FIELDS):
+        val = guidance.get(key)
+        if isinstance(val, str):
+            text = val
+            if _looks_like_keyword_cluster(text):
+                text = f"I only found checklist-style traces around {subject}, not a real source detail."
+            for rx, repl in replacements:
+                text = rx.sub(repl, text)
+            if _BNL_BANNED_VISIBLE_RE.search(text):
+                if protected:
+                    text = _plain_protected_copy(subject, orion)
+                elif vague:
+                    text = "I do not have enough here to make a useful Source File decision. I recommend ignoring this unless a better source appears."
+                else:
+                    text = f"I need one thing clarified before I can use this for {subject}."
+            guidance[key] = text
+        elif isinstance(val, list) and key in {"verificationPacketQuestions", "dossierReadinessQuestions"}:
+            cleaned=[]
+            for item in val:
+                if isinstance(item, str):
+                    tmp={"recommendedFollowUpQuestion": item, "dossierDimension": guidance.get("dossierDimension"), "reviewLane": guidance.get("reviewLane"), "answerability": guidance.get("answerability"), "recommendedAction": guidance.get("recommendedAction")}
+                    cleaned.append(_humanize_visible_copy(subject, tmp)["recommendedFollowUpQuestion"])
+                else:
+                    cleaned.append(item)
+            guidance[key]=cleaned
+    return guidance
+
 def _extract_safe_evidence_details_for_review(subject: str, claim: dict[str, Any], resolved_memory: dict[str, Any] | None = None, packet: dict[str, Any] | None = None) -> list[dict[str, Any]]:
     """Return concrete admin-safe evidence details with lane/id provenance.
 
@@ -1922,11 +1997,11 @@ def _extract_safe_evidence_details_for_review(subject: str, claim: dict[str, Any
 
     def add(raw: Any, lane: str, source_type: str, source_id: str, public_safe: bool = False, admin_safe: bool = True) -> None:
         raw_text = str(raw or "").strip()
-        if not raw_text:
+        if not raw_text or _looks_like_keyword_cluster(raw_text):
             return
         protected = _is_protected_review_detail(raw_text) or lane in {"source_blind", "private_internal_withheld"} or dimension == "source_protected_context"
         if protected:
-            safe_text = f"Protected source-blind detail exists in {source_id}, but raw details are withheld."
+            safe_text = f"I can see something around {subject} here, but this part is not safe to quote."
             public = False
             admin = True
         else:
@@ -1993,10 +2068,10 @@ def _build_review_context(subject: str, claim_text: str, claim_type: str, lane: 
     safe_summary = _text(_redact_review_evidence_summary(evidence or claim_text, subject), 240)
     protected = lane == "source_blind" or dimension == "source_protected_context" or "source-blind" in f"{claim_text} {evidence}".lower()
     if protected:
-        claim_text = f"Protected source-blind context for {subject}"
-        evidence = "Protected source-blind context exists, but raw details are withheld."
+        claim_text = f"Hidden context for {subject}"
+        evidence = "I can see something here, but this part is not safe to quote."
     if protected:
-        safe_summary = "Protected context exists, but details are withheld from this card."
+        safe_summary = f"I can see something around {subject} here, but this part is not safe to quote."
     signals = []
     hay = f"{claim_type} {claim_text} {evidence}".lower()
     for label, pattern in (
@@ -2036,7 +2111,7 @@ def _build_review_context(subject: str, claim_text: str, claim_type: str, lane: 
         cannot.append("Do not turn community presence into a formal role/title without approval.")
     elif dimension == "source_protected_context":
         what_not.append("BNL does not have approved public replacement wording or a separate public source for this protected context.")
-        cannot.append("Do not expose, quote, or infer public facts from protected/source-blind context.")
+        cannot.append("Do not quote or infer public facts from hidden context.")
     else:
         what_not.append("BNL does not have enough confirmed public-safe context to write dossier text yet.")
         cannot.append("Do not infer a public fact from this signal alone.")
@@ -2231,7 +2306,7 @@ def _compose_source_file_review_card(subject: str, claim: dict[str, Any], dossie
         claim["allowedReviewActions"] = existing_actions or _public_approval_actions()
     elif answerability == "not_answerable":
         claim["decisionState"] = "internal_audit"
-        claim["recommendedAction"] = "keep_internal"
+        claim["recommendedAction"] = "ignore_or_suppress"
         claim["allowedReviewActions"] = _actions(("keep_internal", "Keep internal"), ("ask_follow_up", "Ask follow-up"), ("reject", "Reject / not useful"))
     elif answerability == "partially_answerable" and not protected:
         claim["decisionState"] = "needs_clarification"
@@ -2272,8 +2347,11 @@ def _compose_source_file_review_card(subject: str, claim: dict[str, Any], dossie
         if claim.get("hasSafePublicSuggestion"):
             out["hasSafePublicSuggestion"] = True
     if answerability == "not_answerable":
-        out["displayDecision"] = "Internal audit only — BNL needs a concrete safe evidence anchor before review."
-        out["displayApprovalInstruction"] = "Do not approve public wording from this item; ask for context, keep internal, or reject."
+        out["displayDecision"] = "I do not have enough here to make a useful Source File decision. I recommend ignoring this unless a better source appears."
+        out["displayBNLRecommendation"] = "This looks too vague to use. I recommend ignoring it unless better evidence appears."
+        out["displayApprovalInstruction"] = "Do not approve public wording from this item; reject it or keep a brief internal audit note."
+        out["recommendedFollowUpQuestion"] = ""
+        out.pop("verificationPacketQuestions", None); out.pop("verificationPacketQuestion", None)
     if not public_wording:
         out["cannotSuggestPublicReason"] = "Source-blind memory cannot become public copy by itself." if protected else "No public wording yet — BNL needs confirmation first."
     return out
@@ -2327,7 +2405,10 @@ def _finalize_review_guidance(subject: str, claim_text: str, claim_type: str, la
     ctx = _build_review_context(subject, claim_text, claim_type, lane, public_safe, dimension, intent, evidence)
     guidance.update(_compose_source_file_review_card(subject, guidance, dimension, intent, ctx))
     _restore_public_approval_if_safe(guidance, ctx)
-    if guidance.get("recommendedFollowUpQuestion"):
+    guidance = _humanize_visible_copy(subject, guidance)
+    if guidance.get("recommendedAction") == "ignore_or_suppress":
+        guidance.pop("verificationPacketQuestion", None); guidance.pop("verificationPacketQuestions", None)
+    if guidance.get("recommendedFollowUpQuestion") and guidance.get("recommendedAction") != "ignore_or_suppress":
         guidance["suggestedConfirmationReason"] = guidance.get("recommendedFollowUpReason", guidance.get("suggestedConfirmationReason", ""))
         guidance["suggestedConfirmationQuestion"] = guidance["recommendedFollowUpQuestion"]
         guidance["suggestedMissingInfoQuestion"] = guidance["recommendedFollowUpQuestion"]
@@ -2335,7 +2416,7 @@ def _finalize_review_guidance(subject: str, claim_text: str, claim_type: str, la
         guidance["verificationPacketQuestions"] = [guidance["recommendedFollowUpQuestion"]]
     guidance["displayWhyBNLFlaggedIt"] = guidance.get("displayWhyItExists", guidance.get("displayWhyBNLFlaggedIt", ""))
     guidance["displaySafeDefault"] = guidance.get("displaySafetyDefault", guidance.get("displaySafeDefault", ""))
-    return guidance
+    return _humanize_visible_copy(subject, guidance)
 
 def _review_guidance(subject: str, claim_text: str, claim_type: str, lane: str, public_safe: bool, evidence: str = "") -> dict[str, str]:
     actionability = _claim_actionability(claim_text, claim_type, lane, public_safe)
@@ -2448,8 +2529,8 @@ def _make_reviewable_claim(subject: str, claim_text: str, claim_type: str, lane:
     actionability = _claim_actionability(claim_text, claim_type, lane, public_safe)
     display_claim_text = "Weak internal signal — not a public fact" if actionability == "non_actionable_artifact" else claim_text
     if actionability == "source_blind_warning" or lane in {"source_blind", "private_internal_withheld"}:
-        display_claim_text = f"Protected source-blind context for {subject}"
-        evidence = "Protected source-blind context exists, but raw details are withheld."
+        display_claim_text = f"Hidden context for {subject}"
+        evidence = "I can see something here, but this part is not safe to quote."
         why = "Protected source-blind context exists, but raw details are withheld."
     item = {
         "claimText": _text(display_claim_text, 300),

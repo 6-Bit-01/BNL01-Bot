@@ -142,7 +142,7 @@ class SubjectMemoryResolverTests(unittest.TestCase):
         self.assertIn("contest or event", questions["contest"])
         self.assertIn("AI/persona/project connection", questions["ai"])
         self.assertIn("public role/title", questions["role"])
-        self.assertIn("Can BNL mention Orion", questions["orion"])
+        self.assertIn("Orion-related thread around Crow", questions["orion"])
         generic = "What public-safe source or owner-approved wording supports this claim?"
         self.assertFalse(any(generic in item.get("verificationPacketQuestion", "") for item in cases.values()))
         fallback = _review_guidance("Crow", "unclassified context", "unknown", "needs_confirmation", False)
@@ -201,7 +201,7 @@ class SubjectMemoryResolverTests(unittest.TestCase):
     def test_source_blind_details_are_withheld_placeholders_only(self):
         card = _make_reviewable_claim("Crow", "source-blind private Discord ID 123456789 Crow won Secret Jam", "relationship", "source_blind", "protected", False, "low", "source-blind private Discord ID 123456789 Crow won Secret Jam")
         blob = json.dumps(card)
-        self.assertIn("Protected source-blind detail exists", blob)
+        self.assertIn("not safe to quote", blob)
         self.assertNotIn("123456789", blob)
         self.assertNotIn("Secret Jam", blob)
         self.assertEqual("source_protected", card["reviewContext"]["sourceSafety"])
@@ -431,10 +431,10 @@ class SubjectMemoryResolverTests(unittest.TestCase):
         self.assertNotIn("suggestedPublicWording", music)
         orion = next(c for c in claims if c["claimType"] == "relationship")
         self.assertIn("Orion-related context", orion["suggestedInternalNote"])
-        self.assertIn("Can BNL mention Orion", orion["suggestedMissingInfoQuestion"])
+        self.assertIn("Orion-related thread around Crow", orion["suggestedMissingInfoQuestion"])
         blind = next(c for c in claims if c.get("actionability") == "source_blind_warning")
         self.assertEqual(blind["recommendedAction"], "needs_public_source")
-        self.assertIn("Source-blind memory cannot become public copy", blind["cannotSuggestPublicReason"])
+        self.assertIn("hidden thread", blind["cannotSuggestPublicReason"])
         self.assertFalse(any(c.get("actionability") == "non_actionable_artifact" for c in claims))
         weak = next(c for c in claims if c.get("actionability") == "weak_label")
         self.assertIn(weak["recommendedAction"], {"keep_internal", "reject"})
@@ -509,7 +509,7 @@ class SubjectMemoryResolverTests(unittest.TestCase):
         claim = next(c for c in analyst["reviewableClaims"] if c.get("dossierDimension") == "contest_event_activity")
         self.assertNotIn("organizer", claim["claimType"])
         self.assertEqual(claim["recommendedAction"], "needs_more_info")
-        self.assertIn("Crow Suno contest name/rules/channel/dates/public link", claim["evidenceAnchor"]["safeAnchorText"])
+        self.assertNotIn("contest name/rules/channel/dates/public link", claim["evidenceSummary"])
         self.assertIn("official public dossier", str(claim))
         self.assertNotIn("official_public_dossier", str(claim))
         self.assertNotIn("public_music_role", str(claim))
@@ -555,7 +555,7 @@ class SubjectMemoryResolverTests(unittest.TestCase):
         self.assertIn("BARCODE Network lore", unknown_lore["verificationPacketQuestion"])
         theory = _review_guidance("Crow", "theory/anomaly-heavy context", "relationship", "needs_confirmation", False)
         self.assertEqual(theory["displayTitle"], "Needs clarification before review")
-        self.assertIn("What theory or anomaly", theory["verificationPacketQuestion"])
+        self.assertIn("vague anomaly/lore marker around Crow", theory["verificationPacketQuestion"])
 
     def test_admin_corrections_block_roles_reuse_facts_and_resolve_missing_info(self):
         packet = {
@@ -623,7 +623,7 @@ class RoleVsActivitySemanticsTests(unittest.TestCase):
         card = _review_guidance("Crow", "contest/event activity near Crow", "role", "needs_confirmation", False)
         self.assertEqual("contest_event_activity", card["dossierDimension"])
         self.assertEqual("Clarify Crow's possible contest/event connection", card["displayTitle"])
-        self.assertEqual("Internal audit only — BNL needs a concrete safe evidence anchor before review.", card["displayDecision"])
+        self.assertIn("recommend ignoring", card["displayDecision"])
         blob = json.dumps(card).lower()
         self.assertNotIn("public role: contest/event activity", blob)
         self.assertIn("not a general role/title", blob)
@@ -650,13 +650,13 @@ class RoleVsActivitySemanticsTests(unittest.TestCase):
         contest = _make_reviewable_claim("Crow", "contest/event activity near Crow", "role", "needs_confirmation", "activity", False, "low", "contest/event activity")
         self.assertEqual("contest_event_activity", contest["dossierDimension"])
         self.assertNotEqual("public_role_title", contest["dossierDimension"])
-        self.assertEqual("Internal audit only — BNL needs a concrete safe evidence anchor before review.", contest["displayDecision"])
+        self.assertIn("recommend ignoring", contest["displayDecision"])
         self.assertFalse(contest.get("suggestedPublicWording"))
 
         show = _make_reviewable_claim("Crow", "show operations", "role", "needs_confirmation", "show ops", False, "low", "show operations")
         self.assertEqual("show_operations", show["dossierDimension"])
         self.assertEqual("confirm_yes_no", show["cardIntent"])
-        self.assertEqual("Internal audit only — BNL needs a concrete safe evidence anchor before review.", show["displayDecision"])
+        self.assertIn("recommend ignoring", show["displayDecision"])
         self.assertEqual({"ask_follow_up", "keep_internal", "reject"}, {a["action"] for a in show["allowedReviewActions"]})
         self.assertFalse(show.get("suggestedPublicWording"))
 
@@ -721,7 +721,7 @@ class RoleVsActivitySemanticsTests(unittest.TestCase):
         self.assertIn("distinguish interest only, planning, actual collaboration", collab["suggestedInternalNote"])
 
         protected = _make_reviewable_claim("Crow", "source-blind private Orion detail", "relationship", "source_blind", "protected", False, "low", "SECRET PRIVATE SOURCE-BLIND DETAIL")
-        self.assertIn("Protected context exists for Crow", protected["suggestedInternalNote"])
+        self.assertIn("not safe to quote", protected["suggestedInternalNote"])
         self.assertEqual("Protected Crow context that needs public-safe wording", protected["displayTopic"])
         self.assertNotIn("SECRET", json.dumps(protected))
 
@@ -729,9 +729,34 @@ class RoleVsActivitySemanticsTests(unittest.TestCase):
         card = _make_reviewable_claim("Crow", "contest/event activity", "role", "needs_confirmation", "activity", False, "low", "contest/event activity")
         self.assertEqual("generic", card["specificityLevel"])
         self.assertEqual("internal_audit", card["decisionState"])
-        self.assertEqual("keep_internal", card["recommendedAction"])
+        self.assertEqual("ignore_or_suppress", card["recommendedAction"])
         self.assertEqual("not_answerable", card["answerability"])
         self.assertNotEqual("contest/event activity", card["evidenceSummary"])
+
+    def test_visible_source_file_copy_is_humanized_and_orion_specific(self):
+        banned = ["source-blind", "source_protected", "provenance", "raw label", "taxonomy", "dimension", "resolver", "reviewContext", "admin-safe", "public-safe provenance", "public dossier source not connected yet"]
+        cards = [
+            _review_guidance("Crow", "Crow appears near Orion AI persona project context", "relationship", "needs_confirmation", False),
+            _make_reviewable_claim("Crow", "source-blind private Orion detail", "relationship", "source_blind", "protected", False, "low", "SECRET PRIVATE SOURCE-BLIND DETAIL"),
+            _make_reviewable_claim("Crow", "contest name/rules/channel/dates/public link; lore/anomaly public-safety status; official public dossier source not connected yet", "contest_rules_poster", "needs_confirmation", "checklist", False, "low", "contest name/rules/channel/dates/public link; lore/anomaly public-safety status; official public dossier source not connected yet"),
+        ]
+        visible_keys = ["displayTitle", "displayTopic", "displayDecision", "displayWhatIsBeingChecked", "displayWhyItExists", "displayBNLRecommendation", "displaySafetyDefault", "displayApprovalInstruction", "displayWhatYouAreApproving", "evidenceSummary", "suggestedInternalNote", "recommendedFollowUpQuestion", "recommendedFollowUpReason", "verificationPacketQuestion", "cannotSuggestPublicReason", "exampleApprovedText"]
+        self.assertIn("Orion", cards[0]["recommendedFollowUpQuestion"])
+        self.assertNotIn("What AI/persona/project connection", cards[0]["recommendedFollowUpQuestion"])
+        self.assertIn("not safe to quote", cards[1]["suggestedInternalNote"])
+        self.assertEqual("ignore_or_suppress", cards[2]["recommendedAction"])
+        self.assertIn("recommend ignoring", cards[2]["displayBNLRecommendation"])
+        self.assertNotIn("contest name/rules/channel/dates/public link", cards[2]["evidenceSummary"])
+        for card in cards:
+            for key in visible_keys:
+                value = card.get(key)
+                values = value if isinstance(value, list) else [value]
+                for item in values:
+                    if isinstance(item, str):
+                        low = item.lower()
+                        for term in banned:
+                            self.assertNotIn(term.lower(), low, f"{key}: {item}")
+        self.assertNotIn("SECRET", json.dumps(cards[1]))
 
 
 if __name__ == '__main__':
@@ -779,7 +804,7 @@ class DossierReadinessPacketTests(unittest.TestCase):
         cases = [
             ("ai", _review_guidance("Crow", "Crow appears near AI persona project context", "relationship", "needs_confirmation", False), "AI/persona/project connection", "clarification of the AI/persona/project"),
             ("lore", _review_guidance("Crow", "lore-heavy context only", "relationship", "needs_confirmation", False), "BARCODE Network lore", "clarification of the lore/context"),
-            ("theory", _review_guidance("Crow", "unknown theory anomaly near Crow", "relationship", "needs_confirmation", False), "What theory or anomaly", "clarification of the theory/anomaly"),
+            ("theory", _review_guidance("Crow", "unknown theory anomaly near Crow", "relationship", "needs_confirmation", False), "vague anomaly/lore marker around Crow", "clarification of the theory/anomaly"),
             ("rules", _review_guidance("Crow", "unclear rules and instructions near Crow", "rules_instructions_context", "needs_confirmation", False), "What rules or instructions", "clarification of the instruction source"),
             ("contest", _review_guidance("Crow", "Crow appeared near contest rules", "contest_rules_poster", "needs_confirmation", False), "contest or event", "event name, subject relationship"),
         ]
