@@ -1423,6 +1423,75 @@ class SourceFileEntityIntelligenceIntegrationTests(unittest.TestCase):
         self.assertNotIn("private owner draft", json.dumps(completion).lower())
         self.assertIn("dossierCompletionReadV1", archive["sourceFileCaseReportV1"])
 
+    def test_archive_emits_dynamic_review_actionability_from_completion_read(self):
+        packet = {
+            "subject": "Crow",
+            "sourceFile": {"id": "sf_crow", "name": "Crow", "status": "active"},
+            "sections": {},
+            "sourceFileClassificationV1": {"routeTags": ["source_file_route:community"]},
+            "subjectAnalystReadV1": {
+                "subjectName": "Crow",
+                "publicSafeClaims": ["Crow is connected to BARCODE public community context."],
+                "missingInfoQuestions": [
+                    "What public role/title may BNL use, if any?",
+                    "Is there an approved public link?",
+                    "Was Crow part of the contest collaboration?",
+                ],
+                "readyForDraft": True,
+                "dossierBlockedBy": [],
+                "privateOrInternalExclusions": ["Keep queue submission history internal."],
+                "sourceBlindInsights": ["Source-blind Orion lore context stays internal."],
+                "doNotSayPublicly": ["Rejected label: do not state formal BARCODE staff role."],
+                "reviewableClaims": [
+                    {"id": "card_public", "claimText": "Crow is connected to BARCODE public community context.", "claimType": "community", "reviewLane": "public_home", "publicSafe": True},
+                    {"id": "card_queue", "claimText": "Crow queue submission history may exist.", "claimType": "queue_submission", "reviewLane": "needs_confirmation", "publicSafe": False},
+                    {"id": "card_lore", "claimText": "Crow has source-blind Orion lore context.", "claimType": "relationship", "reviewLane": "source_blind", "publicSafe": False},
+                    {"id": "card_rejected", "claimText": "Rejected claim: Crow is official staff.", "claimType": "role", "reviewLane": "needs_confirmation", "publicSafe": False},
+                    {"id": "card_classification", "claimText": "route classification tag community_candidate", "claimType": "classification", "reviewLane": "admin", "publicSafe": False},
+                ],
+            },
+        }
+        archive = enrich.build_source_file_archive_payload(packet)
+        actionability = archive["reviewActionabilityV1"]
+        self.assertEqual(actionability["version"], "1")
+        self.assertTrue(actionability["readyForDraft"])
+        self.assertIn("reviewActionabilityV1", archive["subjectAnalystReadV1"])
+        self.assertIn("reviewActionabilityV1", archive["sourceFileCaseReportV1"])
+        by_id = {item["id"]: item for item in actionability["items"]}
+        self.assertEqual(by_id["card_public"]["actionability"], "approve_public_claim")
+        self.assertEqual(by_id["card_queue"]["actionability"], "keep_internal")
+        self.assertFalse(by_id["card_queue"]["blocksDraft"])
+        self.assertEqual(by_id["card_lore"]["actionability"], "keep_internal")
+        self.assertEqual(by_id["card_rejected"]["actionability"], "already_resolved")
+        self.assertEqual(by_id["card_classification"]["actionability"], "diagnostic_only")
+        actions = {item["actionability"] for item in actionability["items"]}
+        self.assertIn("optional_improvement", actions)
+        self.assertIn("omit_from_public", actions)
+        packet_q = json.dumps(actionability["verificationPacketQuestions"]).lower()
+        self.assertNotIn("queue", packet_q)
+        self.assertNotIn("orion", packet_q)
+        self.assertNotIn("classification", packet_q)
+
+    def test_review_actionability_marks_missing_public_name_as_true_blocker(self):
+        packet = {
+            "subject": "Unknown",
+            "sourceFile": {"id": "sf_unknown", "name": "Unknown"},
+            "sections": {},
+            "subjectAnalystReadV1": {
+                "subjectName": "Unknown",
+                "publicSafeClaims": [],
+                "missingInfoQuestions": ["Confirm preferred public display name and identity boundary."],
+                "readyForDraft": False,
+                "dossierBlockedBy": ["Missing safe public identity/display name."],
+            },
+        }
+        archive = enrich.build_source_file_archive_payload(packet)
+        items = archive["reviewActionabilityV1"]["items"]
+        blocker = next(item for item in items if item["id"] == "required_missing:display_name")
+        self.assertEqual(blocker["actionability"], "true_blocker")
+        self.assertTrue(blocker["blocksDraft"])
+        self.assertTrue(blocker["blocksPublishing"])
+
     def test_compact_recommendation_payload_excludes_full_memory_packet_and_case_report(self):
         payload = {
             "subjectName": "Signal Fox",
