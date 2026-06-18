@@ -654,6 +654,155 @@ def _canonical_safe_slug(value: Any, *, limit: int = 90) -> str:
     return clean[:limit].strip("_")
 
 
+_RESOLUTION_CONTEXT_TOP_LEVEL_KEYS = (
+    "sourceFileQuestionResolutions",
+    "resolvedBnlQuestions",
+    "resolvedQuestions",
+    "bnlResolvedQuestions",
+)
+_RESOLUTION_CONTEXT_WORKFLOW_KEYS = (
+    "resolvedQuestions",
+    "claimReviews",
+    "sourceFileNotes",
+    "identityLinks",
+    "suppressedPacketItems",
+)
+_PUBLIC_RESOLUTION_STATES = {"confirmed_public", "public_safe", "approved_public", "approved", "edited_public_safe", "edited"}
+_INTERNAL_RESOLUTION_STATES = {"confirmed_internal", "internal", "internal_only", "keep_internal"}
+_BOUNDARY_RESOLUTION_STATES = {"rejected", "do_not_say", "public_safety", "boundary", "not_public", "unsafe_public"}
+_PENDING_RESOLUTION_STATES = {"needs_more_info", "pending", "open", "unresolved", "needs_review"}
+
+
+def _safe_resolution_text(value: Any, limit: int = 220) -> str:
+    """Return a short admin-safe summary fragment from workflow context."""
+    text = _text(value, limit)
+    if not text:
+        return ""
+    text = _LINK_RE.sub("[link redacted]", text)
+    text = _EMAIL_RE.sub("[email redacted]", text)
+    text = _PHONE_RE.sub("[phone redacted]", text)
+    text = _RAW_ID_RE.sub("[id redacted]", text)
+    text = _SECRET_RE.sub("[secret redacted]", text)
+    text = re.sub(r"\b(?:cus|acct|pi|pm|sub|cs)_[A-Za-z0-9_]+\b", "[account redacted]", text)
+    return re.sub(r"\s+", " ", text).strip()[:limit].rstrip()
+
+
+def _as_resolution_items(value: Any) -> list[dict[str, Any]]:
+    if isinstance(value, dict):
+        if isinstance(value.get("items"), list):
+            return [x for x in value.get("items") or [] if isinstance(x, dict)]
+        return [value]
+    if isinstance(value, list):
+        return [x for x in value if isinstance(x, dict)]
+    return []
+
+
+def _resolution_decision(item: dict[str, Any]) -> str:
+    state = _canonical_safe_slug(item.get("resolutionState") or item.get("decision") or item.get("status") or item.get("visibility") or item.get("type"), limit=50)
+    if item.get("resolved") is True and not state:
+        state = "confirmed_public" if item.get("publicSafe") is True or item.get("useInPublicDossier") is True else "resolved"
+    if item.get("publicSafe") is True and state in {"edited", "confirmed", "resolved", "approved"}:
+        state = "confirmed_public"
+    if item.get("useInPublicDossier") is False and state in {"resolved", "confirmed", ""}:
+        state = "confirmed_internal"
+    return state or ""
+
+
+def _resolution_text_key(item: dict[str, Any]) -> str:
+    text = _safe_resolution_text(
+        item.get("question") or item.get("recommendedFollowUpQuestion") or item.get("verificationPacketQuestion")
+        or item.get("confirmationTarget") or item.get("claimText") or item.get("editedText") or item.get("text"),
+        260,
+    )
+    section = _canonical_safe_slug(item.get("dossierSection") or item.get("sourceSection"), limit=50)
+    audience = _canonical_safe_slug(item.get("audience") or item.get("verificationPacketAudience"), limit=35)
+    answer_type = _canonical_safe_slug(item.get("answerType"), limit=60)
+    if not text:
+        return ""
+    return "|".join([_canonical_safe_slug(text, limit=140), section, audience, answer_type])
+
+
+def normalize_source_file_resolution_context(packet: dict[str, Any] | None) -> dict[str, Any]:
+    """Normalize optional Source File workflow context without retaining raw site payloads."""
+    packet = packet or {}
+    items: list[dict[str, Any]] = []
+    for key in _RESOLUTION_CONTEXT_TOP_LEVEL_KEYS:
+        items.extend(_as_resolution_items(packet.get(key)))
+    workflow = packet.get("sourceFileWorkflowContext") if isinstance(packet.get("sourceFileWorkflowContext"), dict) else {}
+    for key in _RESOLUTION_CONTEXT_WORKFLOW_KEYS:
+        items.extend(_as_resolution_items(workflow.get(key)))
+    out: dict[str, Any] = {
+        "hasContext": bool(items),
+        "resolvedQuestionKeys": set(),
+        "resolvedQuestionCategories": set(),
+        "rejectedQuestionKeys": set(),
+        "boundaryQuestionKeys": set(),
+        "internalOnlyQuestionKeys": set(),
+        "publicSafeApprovedQuestionKeys": set(),
+        "safeToSuppressQuestionKeys": set(),
+        "resolvedByQuestionKey": {},
+        "fallbackResolvedQuestionMatches": set(),
+        "sourceFileResolvedFacts": [],
+        "suppressedPacketTexts": [],
+    }
+    for item in items:
+        qkeys = []
+        for raw in [item.get("questionKey"), *(item.get("relatedQuestionKeys") or [] if isinstance(item.get("relatedQuestionKeys"), list) else [])]:
+            key = _canonical_safe_slug(raw, limit=120)
+            if key and key.startswith("bnlq_") and key not in qkeys:
+                qkeys.append(key)
+        category = _canonical_safe_slug(item.get("questionCategory"), limit=50)
+        decision = _resolution_decision(item)
+        pending = decision in _PENDING_RESOLUTION_STATES or item.get("stillNeedsHuman") is True
+        boundary = decision in _BOUNDARY_RESOLUTION_STATES or re.search(r"\b(do not|don't|keep .*internal|not public|boundary|public safety|rejected)\b", " ".join(_safe_resolution_text(item.get(k), 160) for k in ("resolutionSummary", "claimText", "editedText", "text", "note")), re.I)
+        internal = decision in _INTERNAL_RESOLUTION_STATES or item.get("publicSafe") is False or item.get("useInPublicDossier") is False
+        public_ok = decision in _PUBLIC_RESOLUTION_STATES or item.get("publicSafe") is True or item.get("useInPublicDossier") is True
+        resolved = (item.get("resolved") is True or public_ok or internal or boundary or decision == "resolved") and not pending
+        safe_to_suppress = resolved and item.get("safeToSuppressFromActivePacket") is not False
+        fallback_key = _resolution_text_key(item)
+        summary = _safe_resolution_text(item.get("resolutionSummary") or item.get("editedText") or item.get("claimText") or item.get("text") or item.get("note"), 220)
+        if summary and (public_ok or internal or boundary):
+            target = out["suppressedPacketTexts"] if boundary or internal or str(item.get("type") or "").lower().startswith("suppressed") else out["sourceFileResolvedFacts"]
+            if summary not in target:
+                target.append(summary)
+        if resolved and category:
+            out["resolvedQuestionCategories"].add(category)
+        if safe_to_suppress and fallback_key:
+            out["fallbackResolvedQuestionMatches"].add(fallback_key)
+        for key in qkeys:
+            if not resolved:
+                continue
+            out["resolvedQuestionKeys"].add(key)
+            if safe_to_suppress:
+                out["safeToSuppressQuestionKeys"].add(key)
+            if boundary:
+                out["boundaryQuestionKeys"].add(key); out["rejectedQuestionKeys"].add(key)
+            if internal:
+                out["internalOnlyQuestionKeys"].add(key)
+            if public_ok:
+                out["publicSafeApprovedQuestionKeys"].add(key)
+            out["resolvedByQuestionKey"][key] = {
+                "questionKey": key,
+                "questionCategory": category,
+                "decision": decision or ("boundary" if boundary else "confirmed_internal" if internal else "confirmed_public" if public_ok else "resolved"),
+                "safeToSuppressFromActivePacket": safe_to_suppress,
+            }
+    return out
+
+
+def _question_matches_resolution(item: dict[str, Any], context: dict[str, Any], *, public_question: bool = False) -> tuple[bool, str]:
+    key = _canonical_safe_slug(item.get("questionKey"), limit=120)
+    if key and key in context.get("safeToSuppressQuestionKeys", set()):
+        if public_question and key in context.get("internalOnlyQuestionKeys", set()) and key not in context.get("boundaryQuestionKeys", set()):
+            return False, ""
+        return True, "boundary" if key in context.get("boundaryQuestionKeys", set()) else "resolved"
+    if not key:
+        fallback = _resolution_text_key(item)
+        if fallback and fallback in context.get("fallbackResolvedQuestionMatches", set()):
+            return True, "fallback"
+    return False, ""
+
+
 def _question_family_for_category(category: str) -> str:
     if category in {"contest_event", "rules_instructions", "lore_context", "theory_anomaly", "orion_context", "links_music_socials"}:
         return "dossier_context"
@@ -3040,6 +3189,46 @@ def build_subject_analyst_read(subject_name: str, resolved_memory: dict[str, Any
     readiness = _build_dossier_readiness(subject, reviewable_claims, missing, blind_insights)
     if dossier_clarification_needs:
         readiness = _build_dossier_readiness_from_clarifications(readiness, dossier_clarification_needs)
+    resolution_context = normalize_source_file_resolution_context(packet)
+    resolution_audit: dict[str, Any] = {}
+    if resolution_context.get("hasContext"):
+        suppressed_resolved = 0
+        suppressed_boundary = 0
+        kept_public_internal = 0
+
+        def keep_question(item: dict[str, Any], *, public_question: bool = False) -> bool:
+            nonlocal suppressed_resolved, suppressed_boundary, kept_public_internal
+            matched, reason = _question_matches_resolution(item, resolution_context, public_question=public_question)
+            if not matched:
+                key = _canonical_safe_slug(item.get("questionKey"), limit=120)
+                if public_question and key and key in resolution_context.get("internalOnlyQuestionKeys", set()):
+                    kept_public_internal += 1
+                return True
+            if reason == "boundary":
+                suppressed_boundary += 1
+            else:
+                suppressed_resolved += 1
+            return False
+
+        reviewable_claims = [
+            c for c in reviewable_claims
+            if not c.get("recommendedFollowUpQuestion") or keep_question(c, public_question=str(c.get("audience") or c.get("recommendedFollowUpAudience") or "").lower() in {"public", "subject", "owner"})
+        ]
+        dossier_clarification_needs = [q for q in dossier_clarification_needs if keep_question(q, public_question=str(q.get("audience") or "").lower() in {"public", "subject", "owner"})]
+        readiness["questions"] = [q for q in readiness.get("questions", []) if keep_question(q, public_question=str(q.get("audience") or "").lower() in {"public", "subject", "owner"})]
+        missing = [q for q in missing if keep_question(q, public_question=str(q.get("audience") or "").lower() in {"public", "subject", "owner"})]
+        missing_lines = [m["question"] + f" ({m['confirmationType'].replace('_', ' ')}.)" for m in missing]
+        actions = [q["question"] for q in readiness["questions"] if q.get("priority") == "high"]
+        unresolved_count = len(readiness.get("questions") or []) + len(dossier_clarification_needs or []) + len([c for c in reviewable_claims if c.get("recommendedFollowUpQuestion")])
+        resolution_audit = {
+            "inputContextPresent": True,
+            "resolvedQuestionKeyCount": len(resolution_context.get("resolvedQuestionKeys") or []),
+            "resolvedQuestionCategories": sorted(resolution_context.get("resolvedQuestionCategories") or [])[:20],
+            "suppressedByExistingReviewCount": suppressed_resolved,
+            "suppressedByBoundaryCount": suppressed_boundary,
+            "publicQuestionsKeptBecauseInternalOnlyCount": kept_public_internal,
+            "unresolvedAfterResolutionCount": unresolved_count,
+        }
     actions = [q["question"] for q in readiness["questions"] if q.get("priority") == "high"]
     withheld_audit = _withheld_audit(subject, resolved_memory, private, blind, review) if (private or blind or review) else {}
     source_file_ingredients = []
@@ -3054,7 +3243,7 @@ def build_subject_analyst_read(subject_name: str, resolved_memory: dict[str, Any
         prov.append("BNL treated repetitive public context as internal pattern evidence, not public dossier prose.")
     if private or blind:
         prov.append(f"BNL withheld {private + blind} private/internal or source-unproven item(s) from public draft copy; audit categories contain only redacted summaries.")
-    return {
+    analyst_read = {
         "subjectName": subject,
         "internalRead": internal,
         "likelySubjectType": likely_type,
@@ -3085,6 +3274,13 @@ def build_subject_analyst_read(subject_name: str, resolved_memory: dict[str, Any
         "sourceFileIngredients": source_file_ingredients[:18],
         "provenanceSummary": prov,
     }
+    if resolution_audit:
+        analyst_read["sourceFileResolutionAudit"] = resolution_audit
+        analyst_read["resolvedQuestionAudit"] = resolution_audit
+        analyst_read["suppressedByExistingReviewCount"] = resolution_audit["suppressedByExistingReviewCount"]
+        analyst_read["suppressedByBoundaryCount"] = resolution_audit["suppressedByBoundaryCount"]
+        analyst_read["unresolvedAfterResolutionCount"] = resolution_audit["unresolvedAfterResolutionCount"]
+    return analyst_read
 
 
 def build_subject_memory_diagnostic(subject_name: str, db_path: str) -> dict[str, Any]:
