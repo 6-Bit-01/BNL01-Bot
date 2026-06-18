@@ -5223,6 +5223,231 @@ def build_dossier_completion_read_v1(packet: dict[str, Any], analyst: dict[str, 
         "publicDossierComparisonSummary": _case_text(f"Compared against {len(public_items)} supplied current public dossier style/context item(s). Closest pattern: {pattern}.", 320),
     })
 
+def _review_actionability_item(
+    item_id: str,
+    source: str,
+    *,
+    claim_text: str = "",
+    question: str = "",
+    actionability: str,
+    priority: str,
+    public_use: str,
+    blocks_draft: bool = False,
+    blocks_publishing: bool = False,
+    recommended_action: str,
+    reason: str,
+    audience: str = "admin",
+    dossier_impact: str = "optional",
+    safe_default: str = "omit",
+) -> dict[str, Any]:
+    return {
+        "id": _case_text(item_id, 120),
+        "source": source,
+        "claimText": _case_text(claim_text, 320),
+        "question": _case_text(question, 260),
+        "actionability": actionability,
+        "priority": priority,
+        "publicUse": public_use,
+        "blocksDraft": bool(blocks_draft),
+        "blocksPublishing": bool(blocks_publishing),
+        "recommendedAction": _case_text(recommended_action, 220),
+        "reason": _case_text(reason, 280),
+        "audience": audience,
+        "dossierImpact": dossier_impact,
+        "safeDefault": safe_default,
+    }
+
+
+def _stable_review_actionability_id(prefix: str, text: Any) -> str:
+    body = _case_text(text, 500).lower()
+    body = re.sub(r"\s+", " ", body).strip()
+    return f"{prefix}:{hashlib.sha1(body.encode('utf-8')).hexdigest()[:12]}"
+
+
+def _actionability_kind(text: str, claim_type: str = "") -> str:
+    low = f"{text} {claim_type}".lower()
+    if re.search(r"\b(reject|rejected|do not say|do not state|unsupported|forbidden)\b", low):
+        return "rejected"
+    if re.search(r"\b(display name|preferred name|public name|identity boundary|safe public identity|identity)\b", low):
+        return "display_name"
+    if re.search(r"\b(role|title|artist|producer|music artist|formal barcode role)\b", low):
+        return "role_title"
+    if re.search(r"\b(link|url|social|suno|spotify|website|profile)\b", low):
+        return "public_link"
+    if re.search(r"\b(queue|submission|submitter|priority)\b", low):
+        return "queue_submission"
+    if re.search(r"\b(orion|lore|source[-_ ]blind|archive-facing|ai|relay|interface)\b", low):
+        return "internal_lore"
+    if re.search(r"\b(collab|collaboration|collaborator|contest|challenge|jam)\b", low):
+        return "collaboration_contest"
+    if re.search(r"\b(classification|route|tag|taxonomy|category|lane)\b", low):
+        return "classification"
+    return "generic"
+
+
+def build_review_actionability_v1(packet: dict[str, Any], analyst: dict[str, Any], dossier_completion_read: dict[str, Any], case_report: dict[str, Any] | None = None, source_file_classification: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Translate BNL's dossier-completion read into Source File review-card actionability."""
+
+    subject = _case_text(dossier_completion_read.get("subjectName") or analyst.get("subjectName") or packet.get("subject") or "this subject", 140)
+    ready = bool(analyst.get("readyForDraft") if "readyForDraft" in analyst else dossier_completion_read.get("completionStatus") in {"ready now", "ready with omissions"})
+    angle = _case_text(dossier_completion_read.get("likelyDossierAngle") or "community/music-adjacent dossier", 120)
+    items: list[dict[str, Any]] = []
+    seen: set[str] = set()
+
+    def add(item: dict[str, Any]) -> None:
+        if not item.get("id") or item["id"] in seen:
+            return
+        seen.add(item["id"])
+        items.append(item)
+
+    blocked_text = " ".join(_case_list([*(analyst.get("dossierBlockedBy") or []), *(dossier_completion_read.get("blockedByPublicSafety") or [])], limit=10, item_limit=220)).lower()
+    actual_public_claims = [
+        x for x in _case_list(analyst.get("publicReadyClaims") or analyst.get("publicSafeClaims") or dossier_completion_read.get("publicSafeToUseNow"), limit=4)
+        if not re.search(r"\b(no public-safe claim|not confirmed|confirmed yet)\b", x, re.I)
+    ]
+    no_public_claims = not actual_public_claims
+    if no_public_claims and re.search(r"\b(name|identity|display)\b", blocked_text):
+        add(_review_actionability_item(
+            "required_missing:display_name",
+            "required_missing",
+            question=f"What owner-approved public display name and identity boundary may BNL use for {subject}?",
+            actionability="true_blocker",
+            priority="high",
+            public_use="needs_owner_approval",
+            blocks_draft=True,
+            blocks_publishing=True,
+            recommended_action="Confirm owner-approved display name before drafting or publishing.",
+            reason="BNL has no safe public identity/name to anchor the dossier.",
+            audience="owner",
+            dossier_impact="required",
+            safe_default="ask_owner",
+        ))
+
+    for raw in _case_list(dossier_completion_read.get("requiredToDraft") or analyst.get("dossierBlockedBy") or [], limit=10, item_limit=260):
+        kind = _actionability_kind(raw)
+        is_identity = kind == "display_name"
+        add(_review_actionability_item(
+            _stable_review_actionability_id("required", raw),
+            "required_missing",
+            question=raw if raw.endswith("?") else "",
+            claim_text="" if raw.endswith("?") else raw,
+            actionability="true_blocker" if is_identity and no_public_claims else "required_to_finish",
+            priority="high",
+            public_use="needs_owner_approval" if is_identity else "needs_source",
+            blocks_draft=bool(is_identity and no_public_claims),
+            blocks_publishing=True,
+            recommended_action="Confirm owner-approved display name." if is_identity else "Resolve this required dossier decision before publication.",
+            reason="BNL marked this as required by the dossier-completion read.",
+            audience="owner" if is_identity else "admin",
+            dossier_impact="required",
+            safe_default="ask_owner" if is_identity else "ask_admin",
+        ))
+
+    for raw in _case_list(dossier_completion_read.get("helpfulButOptional") or analyst.get("missingInfoQuestions") or analyst.get("missingConfirmations") or [], limit=12, item_limit=260):
+        kind = _actionability_kind(raw)
+        if kind == "display_name":
+            action, public_use, rec, default = "optional_improvement", "needs_owner_approval", "Confirm owner-approved display name if it would improve the draft.", "ask_owner"
+        elif kind == "role_title":
+            action, public_use, rec, default = "optional_improvement", "public_safe_with_edits", "Confirm optional public role/title or omit it for now.", "omit"
+        elif kind == "public_link":
+            action, public_use, rec, default = ("required_to_finish", "needs_source", "Confirm approved identity link before use.", "ask_admin") if re.search(r"\b(identity depends|depends on link)\b", raw, re.I) else ("optional_improvement", "omit", "Confirm approved link or omit links for now.", "omit")
+        elif kind == "collaboration_contest":
+            action, public_use, rec, default = "omit_from_public", "omit", "Confirm only if this claim should appear publicly; otherwise omit.", "omit"
+        else:
+            action, public_use, rec, default = "optional_improvement", "needs_owner_approval", "Ask only if it materially improves the draft; otherwise omit.", "omit"
+        add(_review_actionability_item(
+            _stable_review_actionability_id("optional", raw),
+            "optional_missing",
+            question=raw if raw.endswith("?") else "",
+            claim_text="" if raw.endswith("?") else raw,
+            actionability=action,
+            priority="medium" if action == "required_to_finish" else "low",
+            public_use=public_use,
+            blocks_draft=False,
+            blocks_publishing=action == "required_to_finish",
+            recommended_action=rec,
+            reason="BNL can draft cautiously without this unless admin chooses to enrich the public copy.",
+            dossier_impact="improves_draft" if action == "optional_improvement" else "safety_boundary",
+            safe_default=default,
+        ))
+
+    for raw in _case_list(analyst.get("publicReadyClaims") or analyst.get("publicSafeClaims") or dossier_completion_read.get("publicSafeToUseNow") or [], limit=10, item_limit=260):
+        if re.search(r"\b(no public-safe claim|not confirmed)\b", raw, re.I):
+            continue
+        add(_review_actionability_item(
+            _stable_review_actionability_id("public", raw),
+            "public_safe_claim",
+            claim_text=raw,
+            actionability="approve_public_claim",
+            priority="medium",
+            public_use="public_safe",
+            recommended_action="Approve with edited public wording; do not auto-publish without Owner Review.",
+            reason="BNL's dossier-completion read treats this as currently public-safe material.",
+            dossier_impact="improves_draft",
+            safe_default="use_cautious_wording",
+        ))
+
+    internal_sources = [
+        ("keep_internal", analyst.get("privateOrInternalExclusions")),
+        ("keep_internal", analyst.get("sourceBlindInsights")),
+        ("keep_internal", dossier_completion_read.get("keepInternal")),
+        ("keep_internal", dossier_completion_read.get("omitForNow")),
+        ("keep_internal", analyst.get("doNotSayPublicly")),
+    ]
+    for source, values in internal_sources:
+        for raw in _case_list(values, limit=12, item_limit=260):
+            kind = _actionability_kind(raw)
+            action = "diagnostic_only" if kind == "classification" else ("already_resolved" if kind == "rejected" else "keep_internal")
+            add(_review_actionability_item(
+                _stable_review_actionability_id("internal", raw),
+                source,
+                claim_text=raw,
+                actionability=action,
+                priority="diagnostic" if action != "keep_internal" else "low",
+                public_use="not_public" if action != "keep_internal" else "internal_only",
+                recommended_action="No public action." if action == "diagnostic_only" else ("Keep rejected unless new owner-approved evidence exists." if action == "already_resolved" else "Keep internal / omit from public copy."),
+                reason="BNL marked this as internal, source-blind, rejected, or unsafe for public dossier wording.",
+                audience="internal",
+                dossier_impact="none" if action != "keep_internal" else "safety_boundary",
+                safe_default="keep_internal" if action == "keep_internal" else "none",
+            ))
+
+    for raw in _case_list((source_file_classification or {}).get("routeTags") or (source_file_classification or {}).get("engagementUse") or [], limit=8, item_limit=160):
+        add(_review_actionability_item(_stable_review_actionability_id("classification", raw), "classification", claim_text=raw, actionability="diagnostic_only", priority="diagnostic", public_use="not_public", recommended_action="No public action.", reason="Route/classification tags are diagnostics, not public claims.", audience="internal", dossier_impact="none", safe_default="none"))
+
+    for card in (analyst.get("reviewableClaims") or [])[:14] if isinstance(analyst.get("reviewableClaims"), list) else []:
+        if not isinstance(card, dict):
+            continue
+        text = _case_text(card.get("claimText") or card.get("summary") or card.get("question"), 260)
+        if not text:
+            continue
+        kind = _actionability_kind(text, str(card.get("claimType") or ""))
+        if card.get("publicSafe") is True:
+            action, public_use, rec, priority, default, impact = "approve_public_claim", "public_safe", "Approve with edited public wording; do not auto-publish.", "medium", "use_cautious_wording", "improves_draft"
+        elif kind in {"queue_submission", "internal_lore"} or str(card.get("reviewLane") or "") == "source_blind":
+            action, public_use, rec, priority, default, impact = "keep_internal", "internal_only", "Keep internal / omit from public copy.", "low", "keep_internal", "safety_boundary"
+        elif kind == "classification":
+            action, public_use, rec, priority, default, impact = "diagnostic_only", "not_public", "No public action.", "diagnostic", "none", "none"
+        elif kind == "rejected":
+            action, public_use, rec, priority, default, impact = "already_resolved", "not_public", "Keep rejected unless new owner-approved evidence exists.", "diagnostic", "none", "none"
+        elif kind == "collaboration_contest":
+            action, public_use, rec, priority, default, impact = "omit_from_public", "omit", "Confirm only if this claim should appear publicly, otherwise omit.", "low", "omit", "optional"
+        else:
+            action, public_use, rec, priority, default, impact = "needs_owner_wording", "needs_owner_approval", "Confirm owner-approved public wording before use.", "medium", "ask_owner", "improves_draft"
+        add(_review_actionability_item(_case_text(card.get("id") or card.get("questionKey") or _stable_review_actionability_id("review", text), 120), "review_card", claim_text=text, question=_case_text(card.get("recommendedFollowUpQuestion") or card.get("question"), 260), actionability=action, priority=priority, public_use=public_use, recommended_action=rec, reason="Existing review card translated through the current dossier-completion assessment.", dossier_impact=impact, safe_default=default))
+
+    active_actions = {"required_to_finish", "true_blocker", "needs_owner_wording", "needs_admin_confirmation", "approve_public_claim"}
+    active_ids = [i["id"] for i in items if i.get("actionability") in active_actions]
+    suppressed_ids = [i["id"] for i in items if i.get("actionability") in {"keep_internal", "omit_from_public", "diagnostic_only", "already_resolved"}]
+    packet_questions = []
+    for item in items:
+        if item.get("actionability") in {"required_to_finish", "true_blocker", "needs_owner_wording"} or (item.get("actionability") == "needs_admin_confirmation" and item.get("publicUse") in {"public_safe", "public_safe_with_edits", "needs_owner_approval"}):
+            q = item.get("question") or item.get("claimText")
+            if q:
+                packet_questions.append({"id": item["id"], "question": _case_text(q, 260), "actionability": item["actionability"], "recommendedAction": item["recommendedAction"]})
+    summary = f"BNL can draft cautiously from available public-safe claims while omitting unapproved role/link/queue/lore/collaboration context." if ready else f"BNL needs required owner/admin decisions before this dossier can be drafted responsibly."
+    return _sanitize_archive_value({"version": "1", "subjectName": subject, "dossierAngle": angle, "readyForDraft": ready, "summary": _case_text(summary, 360), "items": items[:40], "activeReviewItemIds": active_ids[:40], "suppressedReviewItemIds": suppressed_ids[:40], "verificationPacketQuestions": packet_questions[:12]})
+
 def _source_package_from_packet(packet: dict[str, Any]) -> dict[str, Any]:
     """Build the full review-only archive package without compact-card trimming."""
 
@@ -5258,8 +5483,11 @@ def build_source_file_archive_payload(packet: dict[str, Any], *, environ: dict[s
     if subject_analyst_read and source_file_classification:
         subject_analyst_read["sourceFileClassificationSummaryV1"] = _classification_summary_for_analyst(source_file_classification)
     dossier_completion_read = build_dossier_completion_read_v1(packet, subject_analyst_read, case_report) if subject_analyst_read else {}
+    review_actionability = build_review_actionability_v1(packet, subject_analyst_read, dossier_completion_read, case_report, source_file_classification) if subject_analyst_read and dossier_completion_read else {}
     if subject_analyst_read and dossier_completion_read:
         subject_analyst_read["dossierCompletionReadV1"] = dossier_completion_read
+        if review_actionability:
+            subject_analyst_read["reviewActionabilityV1"] = review_actionability
         for key, target in (("publicReadyClaims", "publicSafeClaims"), ("draftIngredients", "publicSafeToUseNow"), ("sourceFileIngredients", "whatBnlHas")):
             merged = _case_list([*(subject_analyst_read.get(key) or []), *(dossier_completion_read.get(target) or [])], limit=12, item_limit=300)
             subject_analyst_read[key] = merged
@@ -5270,6 +5498,8 @@ def build_source_file_archive_payload(packet: dict[str, Any], *, environ: dict[s
         case_report["subjectAnalystReadV1"] = subject_analyst_read
         if dossier_completion_read:
             case_report["dossierCompletionReadV1"] = dossier_completion_read
+        if review_actionability:
+            case_report["reviewActionabilityV1"] = review_actionability
         if subject_analyst_read.get("internalRead"):
             case_report["caseSummary"] = _case_text(f"{case_report.get('caseSummary')} BNL analyst read: {subject_analyst_read.get('internalRead')}", 900)
         if subject_analyst_read.get("dossierWorthiness") or subject_analyst_read.get("dossierReadinessSummary"):
@@ -5301,6 +5531,7 @@ def build_source_file_archive_payload(packet: dict[str, Any], *, environ: dict[s
         "sourceFileBriefV2": _sanitize_archive_value(build_source_file_brief_v2({**packet, "subjectAnalystReadV1": subject_analyst_read}, archive_id=packet.get("archiveId") or "")),
         "subjectAnalystReadV1": subject_analyst_read,
         "dossierCompletionReadV1": dossier_completion_read,
+        "reviewActionabilityV1": review_actionability,
         "sourceFileClassificationV1": _sanitize_archive_value(source_file_classification),
         "subjectMemoryPacketV1": subject_memory_packet,
         "sourceFileCaseReportV1": case_report,

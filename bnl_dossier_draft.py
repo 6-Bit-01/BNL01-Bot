@@ -980,6 +980,24 @@ def generate_dossier_draft(packet: dict[str, Any], db_path: str | None = None, p
             rejected_facts.extend(resolver_rejected)
         except Exception:
             resolver = None
+    review_actionability = _dict(packet.get("reviewActionabilityV1") or (analyst or {}).get("reviewActionabilityV1"))
+    if review_actionability:
+        rejected_review_texts: list[str] = []
+        for item in review_actionability.get("items") or []:
+            if not isinstance(item, dict):
+                continue
+            action = str(item.get("actionability") or "")
+            public_use = str(item.get("publicUse") or "")
+            text = _text(item.get("claimText") or item.get("question") or item.get("recommendedAction"), 260)
+            if action in {"keep_internal", "omit_from_public", "diagnostic_only", "already_resolved"} or public_use in {"not_public", "internal_only", "omit"}:
+                if text:
+                    rejected_facts.append(text)
+                continue
+            if action in {"required_to_finish", "true_blocker", "needs_owner_wording", "needs_admin_confirmation"}:
+                if text:
+                    rejected_review_texts.append(text)
+        if rejected_review_texts:
+            rejected_facts.extend(rejected_review_texts[:6])
     role = _role_from_context(public_facts, public_notes, category, kind, lane)[:_ROLE_LIMIT]
     if analyst:
         analyst_public = " ".join(_strings(analyst.get("draftIngredients"), max_items=9) + _strings(analyst.get("publicSafeClaims"), max_items=6)).lower()

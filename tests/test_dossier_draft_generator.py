@@ -711,6 +711,30 @@ class DossierDraftGeneratorTests(unittest.TestCase):
             self.assertEqual(result["role"], "Music artist")
             self.assertIn("music artist", result["summary"].lower())
 
+    def test_review_actionability_keeps_optional_internal_details_out_of_public_draft(self):
+        packet = pr217_packet(
+            candidate={"sourceFileId": "sf_crow", "subjectName": "Crow"},
+            publicSafeFacts=["Crow is connected to BARCODE public community context."],
+            publicSafeNotes=[],
+            safeClassification={"category": "Community", "kind": "Person", "ecosystemLane": "BARCODE"},
+        )
+        packet["reviewActionabilityV1"] = {
+            "version": "1",
+            "items": [
+                {"id": "internal:queue", "claimText": "Crow queue submission history may exist.", "actionability": "keep_internal", "publicUse": "internal_only"},
+                {"id": "omit:link", "claimText": "Crow unapproved private music link.", "actionability": "omit_from_public", "publicUse": "omit"},
+                {"id": "diagnostic:route", "claimText": "route classification tag community_candidate", "actionability": "diagnostic_only", "publicUse": "not_public"},
+            ],
+        }
+        result = draft.generate_dossier_draft(packet)["draft"]
+        public = " ".join(str(result[k]) for k in ("role", "summary", "notes", "tags", "proposedTags")).lower()
+        self.assertNotIn("queue", public)
+        self.assertNotIn("private music link", public)
+        self.assertNotIn("classification", public)
+        rejected = " ".join(result["unsupportedClaimsRejected"]).lower()
+        self.assertIn("queue submission", rejected)
+        self.assertIn("private music link", rejected)
+
     def test_validation_requires_candidate_and_style_packet(self):
         errors = draft.validate_dossier_draft_packet({"requestType": "bad", "fieldRequirements": ["summary"]})
         self.assertIn("invalid_requestType", errors)
