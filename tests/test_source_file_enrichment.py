@@ -1240,6 +1240,86 @@ class SourceFileEntityIntelligenceIntegrationTests(unittest.TestCase):
         self.assertIsInstance(archive.get("sourceFileCaseReportV1"), dict)
         self.assertEqual(archive["subjectMemoryPacketV1"].get("subjectName"), "Signal Fox")
 
+    def test_source_file_classification_v1_separates_public_internal_and_rejected_tags(self):
+        packet = {
+            "sections": {
+                "Public-Safe Notes": ["Public-safe wording says Signal Fox is a music artist and producer."],
+                "Known Facts": ["Internal queue submission and moderator status are admin-only context."],
+            },
+            "sourceFile": {"name": "Signal Fox", "candidateType": "person"},
+            "sourceCounts": {"source_file_lookup": 1},
+            "warningCounts": {},
+            "publicSafeCandidates": ["Signal Fox is a public-safe music artist."],
+            "classification": {"primaryRole": "artist", "secondaryRoles": ["moderator", "submitter"], "sourceConfidence": "medium"},
+            "sourceFileWorkflowContext": {
+                "resolvedQuestions": [
+                    {"questionKey": "bnlq_role_title_moderator", "questionCategory": "role_title", "decision": "confirmed_internal", "claimText": "Moderator role is internal only.", "useInPublicDossier": False},
+                    {"questionKey": "bnlq_role_title_contest", "questionCategory": "role_title", "decision": "rejected", "claimText": "Contest organizer rejected.", "publicSafe": False},
+                ]
+            },
+        }
+        profile = enrich.build_source_file_classification_v1({}, packet)
+        self.assertEqual(profile["version"], "1.0")
+        self.assertEqual(profile["subjectType"], "artist")
+        self.assertIn("artist", profile["publicSafeTagCandidates"])
+        self.assertIn("producer", profile["publicSafeTagCandidates"])
+        self.assertIn("moderator", profile["internalTags"])
+        self.assertIn("queue", profile["internalTags"])
+        self.assertIn("moderator", profile["doNotPubliclyTagAs"])
+        self.assertTrue(profile["blockedPublicTags"])
+        self.assertNotIn("moderator", profile["publicSafeTagCandidates"])
+        self.assertNotRegex(json.dumps(profile).lower(), r"stripe|cus_123|token|123456789012345678|@")
+
+    def test_source_file_classification_v1_low_confidence_unknown_and_source_blind(self):
+        profile = enrich.build_source_file_classification_v1({}, {
+            "sections": {"Known Facts": ["Source-blind memory mentions a possible role but no public proof."]},
+            "warningCounts": {"source_blind_memory": 1},
+            "classification": {"primaryRole": "unknown", "secondaryRoles": [], "sourceConfidence": "low"},
+        })
+        self.assertEqual(profile["subjectType"], "unknown")
+        self.assertEqual(profile["confidence"], "low")
+        self.assertIn("source-blind", profile["internalTags"])
+        self.assertIn(profile["sourceSafety"], {"source_blind", "mixed"})
+        self.assertEqual(profile["publicSafeTagCandidates"], [])
+
+    def test_source_file_classification_v1_project_event_platform_and_crow_lore_routing(self):
+        profile = enrich.build_source_file_classification_v1({}, {
+            "sections": {"Public-Safe Notes": ["Public-safe context describes a Discord platform project, contest event, lore entity, and BARCODE Radio music collaboration."]},
+            "publicSafeCandidates": ["Owner-approved public wording exists for the project/event/platform context."],
+            "classification": {"primaryRole": "barcode_entity", "secondaryRoles": [], "sourceConfidence": "medium"},
+        })
+        for tag in ("project", "event", "platform", "lore-entity", "discord", "barcode-radio", "music", "collaboration"):
+            self.assertIn(tag, profile["publicSafeTagCandidates"])
+        self.assertTrue(all("source-blind" not in item.lower() for item in profile["evidenceSignals"]))
+
+    def test_source_file_archive_payload_includes_classification_and_compact_analyst_summary(self):
+        packet = {
+            "subject": "Crow",
+            "sourceFile": {"name": "Crow", "candidateId": "sf_crow"},
+            "sections": {"Public-Safe Notes": ["Crow is a public-safe BARCODE community subject."]},
+            "sourceCounts": {"conversations": 1},
+            "sourceTypes": ["conversations"],
+            "warningCounts": {},
+            "warnings": [],
+            "qualityScore": 88,
+            "qualityStatus": "sendable",
+            "matchKind": "exact",
+            "runTime": "2026-06-10T00:00:00+00:00",
+            "sourceFileClassificationV1": {
+                "version": "1.0", "subjectType": "community_member", "publicDossierType": "internal_only", "confidence": "low",
+                "primaryTags": ["community-member"], "secondaryTags": [], "internalTags": ["community-member"], "doNotPubliclyTagAs": ["community-member"],
+                "routingTags": ["needs-public-proof"], "evidenceSignals": ["Community signal present."], "publicSafeTagCandidates": [],
+                "needsReviewTagCandidates": ["community-member"], "rejectedTagCandidates": [], "classificationReasons": ["Separated internal context."],
+                "blockedPublicTags": [], "sourceSafety": "internal_only", "classificationBlockedBy": [],
+            },
+            "subjectAnalystReadV1": {"subjectName": "Crow", "internalRead": "Crow appears in community context.", "publicSafeClaims": [], "reviewNeededClaims": []},
+        }
+        archive = enrich.build_source_file_archive_payload(packet)
+        self.assertIn("sourceFileClassificationV1", archive)
+        summary = archive["subjectAnalystReadV1"]["sourceFileClassificationSummaryV1"]
+        self.assertLessEqual(len(json.dumps(summary)), 900)
+        self.assertNotIn("internalTags", summary)
+
     def test_source_file_archive_payload_includes_subject_analyst_read(self):
         packet = {
             "subject": "Crow",

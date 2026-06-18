@@ -805,8 +805,28 @@ def _tag_candidates(category: str, kind: str, lane: str, facts: list[str], notes
     for needles, tag in mapping:
         if any(needle in haystack for needle in needles) and tag not in candidates:
             candidates.append(tag)
+    source_classification = _dict(packet.get("sourceFileClassificationV1"))
+    blocked_classification_tags = {
+        tag.lower().replace(" ", "-")
+        for tag in _strings(source_classification.get("internalTags"), limit_each=80, max_items=20)
+        + _strings(source_classification.get("rejectedTagCandidates"), limit_each=80, max_items=20)
+        + _strings(source_classification.get("doNotPubliclyTagAs"), limit_each=80, max_items=20)
+    }
+    blocked_classification_tags.update(
+        _text(item.get("tag"), 80).lower().replace(" ", "-")
+        for item in _as_list(source_classification.get("blockedPublicTags"))
+        if isinstance(item, dict)
+    )
     for tag in _strings(packet.get("proposedTags"), limit_each=60, max_items=10):
         normalized = tag.lower().replace(" ", "-")
+        if normalized in blocked_classification_tags:
+            continue
+        if not _unsafe_reasons(normalized) and normalized not in candidates:
+            candidates.append(normalized)
+    for tag in _strings(source_classification.get("publicSafeTagCandidates"), limit_each=60, max_items=10):
+        normalized = tag.lower().replace(" ", "-")
+        if normalized in blocked_classification_tags:
+            continue
         if not _unsafe_reasons(normalized) and normalized not in candidates:
             candidates.append(normalized)
     return candidates
