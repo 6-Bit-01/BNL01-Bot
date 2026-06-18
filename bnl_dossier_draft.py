@@ -944,10 +944,22 @@ def generate_dossier_draft(packet: dict[str, Any], db_path: str | None = None, p
         for item in _strings(analyst.get("missingInfoQuestions"), max_items=5):
             if item not in missing:
                 missing.append(item)
+        if analyst.get("readyForDraft") is True:
+            blocked_sections = {str(x).lower() for x in _strings(analyst.get("dossierBlockedBy"), max_items=5)}
+            if blocked_sections:
+                missing = [
+                    item for item in missing
+                    if any(section in item.lower() for section in blocked_sections)
+                ][:3]
+            else:
+                missing = [
+                    item for item in missing
+                    if not re.search(r"\b(orion|lore|source[-_ ]blind|internal)\b", item, re.I)
+                ][:5]
     if thin:
         missing.insert(0, "Add more public-safe facts before this draft is treated as rich dossier copy.")
     if _dict(packet.get("identityAliasStatus")).get("needsConfirmation") is not False:
-        missing.append("Confirm what identity authority, if any, may be stated publicly.")
+        missing.append("Confirm preferred public display name and what identity authority, if any, may be stated publicly.")
 
     owner_warnings = _strings(packet.get("ownerReviewRules"), max_items=8) + _strings(packet.get("reviewOnlyWarnings"), max_items=8)
     owner_warnings.append("Owner Review must approve identity, role, category, links, and public wording before publication.")

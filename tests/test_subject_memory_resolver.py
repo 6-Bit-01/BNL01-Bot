@@ -882,9 +882,39 @@ class RoleVsActivitySemanticsTests(unittest.TestCase):
                             self.assertNotIn(term.lower(), low, f"{key}: {item}")
         self.assertNotIn("SECRET", json.dumps(cards[1]))
 
+    def test_memory_first_fit_allows_cautious_draft_with_internal_signals_and_omissions(self):
+        memory = {
+            "publicSafeFacts": ["Crow is connected to BARCODE public community context."],
+            "reviewOnlyEvidence": [
+                {"summary": "Crow has repeated Discord engagement and queue submission history needing public boundary."},
+                {"summary": "Crow has Orion lore/internal relay context that should stay internal."},
+                {"summary": "Crow may have a public link but ownership is unclear."},
+            ],
+            "queueOrSubmissionSignals": ["Crow queue submission history exists but is review-only."],
+            "relationshipOrContextSignals": ["Crow references Orion relay context internally."],
+            "sourceSafetyWarnings": ["source-blind internal lore exists"],
+            "evidenceCounts": {"publicSafe": 1, "reviewOnly": 3, "privateOrInternal": 0, "sourceBlind": 1, "totalScanned": 5},
+        }
+        analyst = build_subject_analyst_read("Crow", memory)
+        self.assertIn(analyst["dossierWorthiness"], {"strong_fit", "possible_fit"})
+        self.assertTrue(analyst["readyForDraft"])
+        self.assertEqual(analyst["dossierBlockedBy"], [])
+        self.assertIn("omit", analyst["draftReadinessReason"].lower())
+        self.assertNotIn("Orion", " ".join(analyst["publicSafeClaims"]))
+        self.assertLessEqual(len(analyst["dossierReadinessQuestions"]), 3)
 
-if __name__ == '__main__':
-    unittest.main()
+    def test_memory_first_fit_blocks_when_no_public_identity_or_public_reason(self):
+        memory = {
+            "sourceSafetyWarnings": ["source-blind private lore says token abcdefghijklmnopqrstuvwxyz and user id 123456789012345678"],
+            "evidenceCounts": {"publicSafe": 0, "reviewOnly": 0, "privateOrInternal": 1, "sourceBlind": 1, "totalScanned": 1},
+        }
+        analyst = build_subject_analyst_read("Unknown Subject", memory)
+        self.assertFalse(analyst["readyForDraft"])
+        self.assertIn("public_dossier_reason", analyst["dossierBlockedBy"])
+        blob = json.dumps(analyst)
+        self.assertNotIn("123456789012345678", blob)
+        self.assertNotIn("abcdefghijklmnopqrstuvwxyz", blob)
+
 
 class DossierReadinessPacketTests(unittest.TestCase):
     def test_dossier_readiness_packet_collapses_generic_review_questions(self):
@@ -960,3 +990,6 @@ class DossierReadinessPacketTests(unittest.TestCase):
 
         fallback = _review_guidance("Crow", "unclassified possible claim", "missing_confirmation", "needs_confirmation", False)
         self.assertEqual(fallback["suggestedMissingInfoQuestion"], generic)
+
+if __name__ == '__main__':
+    unittest.main()

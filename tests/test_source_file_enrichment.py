@@ -1397,3 +1397,37 @@ class SourceFileEntityIntelligenceIntegrationTests(unittest.TestCase):
         self.assertNotIn("subjectMemoryPacketV1", compact)
         self.assertNotIn("sourceFileCaseReportV1", compact)
         self.assertIn("compactRecommendationNotice", compact)
+
+class SourceFileMemoryFirstReadoutTests(unittest.TestCase):
+    def test_archive_case_report_and_brief_carry_memory_first_judgment(self):
+        packet = {
+            "subject": "Crow",
+            "sourceFile": {"id": "sf_crow", "name": "Crow", "status": "active"},
+            "sections": {},
+            "subjectAnalystReadV1": {
+                "subjectName": "Crow",
+                "internalRead": "BNL memory-first dossier fit: possible_fit. Internal engagement is strong; keep Orion internal.",
+                "currentRead": "Crow Source File readout: possible fit with public-safe community context.",
+                "dossierWorthiness": "possible_fit",
+                "publicSafeClaims": ["Crow is connected to BARCODE public community context."],
+                "strongestSignals": ["Discord/queue engagement supports the internal fit read."],
+                "dossierReadinessSummary": "BNL can draft cautiously with omissions.",
+                "readyForDraft": True,
+                "draftReadinessReason": "Draft using public-safe claims; omit unresolved public link and Orion context.",
+                "dossierBlockedBy": [],
+                "recommendedAdminActions": [],
+                "privateOrInternalExclusions": ["Keep Orion context internal."],
+                "sourceBlindInsights": ["Source-blind context exists but is not public proof."],
+                "doNotSayPublicly": ["Do not mention Orion publicly."],
+            },
+        }
+        archive = enrich.build_source_file_archive_payload(packet)
+        analyst = archive["subjectAnalystReadV1"]
+        report = archive["sourceFileCaseReportV1"]
+        brief = archive["sourceFileBriefV2"]
+        self.assertEqual(analyst["dossierWorthiness"], "possible_fit")
+        self.assertTrue(analyst["readyForDraft"])
+        self.assertIn("possible_fit", report["dossierUse"])
+        self.assertEqual(report["reviewBlockers"], [])
+        self.assertIn("possible_fit", brief["adminSummary"])
+        self.assertIn("omit", brief["recommendedNextAction"].lower())
