@@ -1386,6 +1386,43 @@ class SourceFileEntityIntelligenceIntegrationTests(unittest.TestCase):
         self.assertNotIn("cus_123", json.dumps(analyst).lower())
         self.assertNotIn("123456789012345678", json.dumps(analyst))
 
+
+    def test_archive_adds_dossier_completion_public_pattern_context(self):
+        packet = {
+            "subject": "Crow",
+            "sourceFile": {"id": "sf_crow", "name": "Crow", "status": "active"},
+            "sections": {},
+            "publicDossierStyleContext": {
+                "items": [
+                    {"status": "PUBLIC", "type": "community member dossier", "pattern": "community/music-adjacent subject", "toneNotes": ["concise public-safe BARCODE voice"], "structureNotes": ["role, summary, notes, tags pacing"], "styleNotes": ["short section rhythm"]},
+                    {"status": "DRAFT", "type": "private owner draft", "styleNotes": ["must not appear"]},
+                ]
+            },
+            "subjectAnalystReadV1": {
+                "subjectName": "Crow",
+                "internalRead": "Queue and Discord engagement support fit but stay internal.",
+                "currentRead": "Crow has public-safe community context.",
+                "dossierWorthiness": "possible_fit",
+                "publicSafeClaims": ["Crow is connected to BARCODE public community context."],
+                "strongestSignals": ["Internal queue engagement supports the fit read."],
+                "missingInfoQuestions": ["What public role/title may BNL use, if any?", "Is there an approved public link?"],
+                "dossierReadinessSummary": "BNL can draft cautiously.",
+                "readyForDraft": True,
+                "draftReadinessReason": "Use public-safe claims and omit unresolved role/link.",
+                "dossierBlockedBy": [],
+                "privateOrInternalExclusions": ["Keep queue history internal."],
+                "sourceBlindInsights": ["Source-blind context stays internal."],
+                "doNotSayPublicly": ["Do not mention queue history publicly."],
+            },
+        }
+        archive = enrich.build_source_file_archive_payload(packet)
+        completion = archive["dossierCompletionReadV1"]
+        self.assertEqual(completion["completionStatus"], "ready now")
+        self.assertIn("community", completion["nearestPublicDossierPattern"])
+        self.assertIn("concise public-safe BARCODE voice", json.dumps(completion))
+        self.assertNotIn("private owner draft", json.dumps(completion).lower())
+        self.assertIn("dossierCompletionReadV1", archive["sourceFileCaseReportV1"])
+
     def test_compact_recommendation_payload_excludes_full_memory_packet_and_case_report(self):
         payload = {
             "subjectName": "Signal Fox",

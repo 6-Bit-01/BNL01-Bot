@@ -369,7 +369,12 @@ def _read_model_public_dossier_items(read_model: dict[str, Any] | None) -> list[
             candidates.extend(read_model[key])
     out: list[dict[str, Any]] = []
     for item in candidates:
-        if isinstance(item, dict) and item not in out:
+        if not isinstance(item, dict):
+            continue
+        visibility = str(item.get("visibility") or item.get("clearance") or item.get("status") or item.get("publicationStatus") or "public").lower()
+        if any(term in visibility for term in ("draft", "private", "owner", "internal", "restricted")):
+            continue
+        if item not in out:
             out.append(item)
     return out
 
@@ -387,6 +392,55 @@ def _dossier_public_texts(dossier: dict[str, Any]) -> list[str]:
     texts += _strings(dossier.get("publicFacts"), max_items=6)
     return [text for text in texts if not _unsafe_reasons(text)]
 
+
+
+def _public_dossier_style_context(packet: dict[str, Any], read_model: dict[str, Any] | None) -> dict[str, Any]:
+    """Summarize current public dossier corpus for house-style matching.
+
+    Defensive input contract: callers may pass bounded style/context in the packet
+    (`stylePacket.publicDossierStyleContext`, `currentPublicDossierContext`) or in
+    the public read model. Only already-public items are consumed; draft/private/
+    owner-only/internal items are ignored.
+    """
+    style_packet = _dict(packet.get("stylePacket"))
+    inline: list[Any] = []
+    for key in ("publicDossierStyleContext", "currentPublicDossierContext", "publicDossierCorpus", "representativePublicDossierExamples", "categorySpecificExamples"):
+        value = style_packet.get(key) if key in style_packet else packet.get(key)
+        if isinstance(value, list):
+            inline.extend(value)
+        elif isinstance(value, dict):
+            inline.append(value)
+            for inner in ("items", "examples", "dossiers", "patterns"):
+                if isinstance(value.get(inner), list):
+                    inline.extend(value.get(inner) or [])
+    items = [x for x in inline if isinstance(x, dict)] + _read_model_public_dossier_items(read_model)
+    clean: list[dict[str, Any]] = []
+    for item in items:
+        visibility = str(item.get("visibility") or item.get("clearance") or item.get("status") or item.get("publicationStatus") or "public").lower()
+        if any(term in visibility for term in ("draft", "private", "owner", "internal", "restricted")):
+            continue
+        if item not in clean:
+            clean.append(item)
+        if len(clean) >= 10:
+            break
+    role_hay = " ".join(_strings(packet.get("publicSafeFacts"), max_items=8) + _strings(packet.get("publicSafeNotes"), max_items=4)).lower()
+    if any(t in role_hay for t in ("artist", "music", "track", "song", "producer", "dj")):
+        nearest = "artist/music public dossier pattern"
+    elif any(t in role_hay for t in ("collaborator", "broadcast", "radio", "production")):
+        nearest = "collaborator/production public dossier pattern"
+    else:
+        nearest = "community/member public dossier pattern"
+    notes: list[str] = []
+    for item in clean:
+        for key in ("styleNotes", "toneNotes", "structureNotes", "pattern", "type", "role"):
+            notes.extend(_strings(item.get(key), max_items=2))
+    return {
+        "available": bool(clean),
+        "count": len(clean),
+        "nearestPattern": nearest,
+        "styleNotes": notes[:6] or _style_guidance_used(style_packet),
+        "warning": "No current public dossier corpus/style context was supplied; site should pass bounded public dossier context for stronger house-style matching." if not clean else "",
+    }
 
 def _matching_public_dossiers(packet: dict[str, Any], read_model: dict[str, Any] | None) -> list[dict[str, Any]]:
     name, aliases = _subject_terms(packet)
@@ -431,6 +485,7 @@ def build_public_dossier_draft_evidence(packet: dict[str, Any], db_path: str | N
     """
     name, aliases = _subject_terms(packet)
     terms = [name] + aliases
+    style_context = _public_dossier_style_context(packet, public_read_model)
     bundle: dict[str, Any] = {
         "subjectName": name,
         "matchedAliasesUsedPrivately": [],
@@ -445,6 +500,7 @@ def build_public_dossier_draft_evidence(packet: dict[str, Any], db_path: str | N
         "officialPublicDossierContext": [],
         "publicDossierStyleGuidanceUsed": _style_guidance_used(_dict(packet.get("stylePacket"))),
         "publicDossierContextWarnings": [],
+        "publicDossierStyleContext": style_context,
         "sourceSummariesUsed": [],
         "excludedSourceWarnings": [],
         "missingInfoQuestions": [],
@@ -481,6 +537,10 @@ def build_public_dossier_draft_evidence(packet: dict[str, Any], db_path: str | N
             bundle["sourceSummariesUsed"].append(f"Used matching current public dossier context as official public dossier authority for {name}.")
     else:
         bundle["publicDossierContextWarnings"].append("No matching current public dossier/read-model facts were available as a direct official source; style examples were used only for structure and tone.")
+    if style_context.get("available"):
+        bundle["sourceSummariesUsed"].append(f"Compared draft against {style_context.get('count')} current public dossier style/context item(s); closest house pattern: {style_context.get('nearestPattern')}.")
+    elif style_context.get("warning"):
+        bundle["publicDossierContextWarnings"].append(style_context.get("warning"))
     if not db_path:
         bundle["excludedSourceWarnings"].append("Local BNL evidence database was not available; used the packet boundary only.")
     else:
@@ -983,6 +1043,9 @@ def generate_dossier_draft(packet: dict[str, Any], db_path: str | None = None, p
         for item in _strings(resolver.get("sourceSafetyWarnings"), max_items=3):
             owner_warnings.append(item)
     if analyst:
+        completion = _dict(analyst.get("dossierCompletionReadV1"))
+        if completion:
+            owner_warnings.append(f"Dossier-completion read: {completion.get('completionStatus')} / {completion.get('likelyDossierAngle')} using {completion.get('nearestPublicDossierPattern')}.")
         if _text(analyst.get("internalRead"), 500):
             owner_warnings.append(f"BNL internal subject read: {_text(analyst.get('internalRead'), 460)}")
         for item in _strings(analyst.get("recommendedAdminActions"), max_items=3):
@@ -1014,8 +1077,11 @@ def generate_dossier_draft(packet: dict[str, Any], db_path: str | None = None, p
             rejected.append(item)
         for item in _strings(analyst.get("sourceBlindInsights"), max_items=2):
             rejected.append(item)
+    style_context = _dict(evidence.get("publicDossierStyleContext")) if evidence else {}
     if evidence and evidence.get("publicDossierStyleGuidanceUsed"):
         rejected.append("Used public dossier examples for style and field shape only; unrelated example facts were not copied.")
+    if style_context.get("available"):
+        rejected.append(f"Matched current public dossier house style via {style_context.get('nearestPattern')}; did not copy existing dossier text in bulk.")
 
     tags, proposed_tags = _split_tags(packet, style_packet, category, kind, lane, public_facts, public_notes)
 
