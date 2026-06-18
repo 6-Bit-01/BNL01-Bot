@@ -5121,6 +5121,108 @@ def build_source_file_subject_analyst_read_v1(packet: dict[str, Any], db_path: s
     return _normalize_subject_analyst_read_v1(build_subject_analyst_read(subject, resolved, packet))
 
 
+
+def _public_dossier_context_items(packet: dict[str, Any]) -> list[dict[str, Any]]:
+    """Return bounded current-public-dossier style/context items supplied by site.
+
+    Defensive input contract: Source File refresh may pass `publicDossierStyleContext`,
+    `currentPublicDossierContext`, or `publicDossierCorpus` as a bounded list/dict of
+    already-public dossier summaries/examples. Draft/private/owner-only rows are ignored.
+    """
+    candidates: list[Any] = []
+    for key in ("publicDossierStyleContext", "currentPublicDossierContext", "publicDossierCorpus", "publicDossiers"):
+        value = packet.get(key)
+        if isinstance(value, dict):
+            for inner in ("items", "examples", "dossiers", "publicDossiers", "patterns"):
+                if isinstance(value.get(inner), list):
+                    candidates.extend(value.get(inner) or [])
+            candidates.append(value)
+        elif isinstance(value, list):
+            candidates.extend(value)
+    out: list[dict[str, Any]] = []
+    for item in candidates:
+        if not isinstance(item, dict):
+            continue
+        visibility = str(item.get("visibility") or item.get("clearance") or item.get("status") or item.get("publicationStatus") or "public").lower()
+        if any(term in visibility for term in ("draft", "private", "owner", "internal", "restricted")):
+            continue
+        if item not in out:
+            out.append(item)
+        if len(out) >= 8:
+            break
+    return out
+
+
+def _dossier_type_from_text(text: str) -> str:
+    low = text.lower()
+    if re.search(r"\b(artist|music|track|song|producer|dj|album)\b", low):
+        return "artist dossier"
+    if re.search(r"\b(collaborator|production|radio|broadcast|contributor)\b", low):
+        return "collaborator dossier"
+    if re.search(r"\b(queue|submission|submitter)\b", low):
+        return "queue participant dossier"
+    if re.search(r"\b(community|member|participant|listener|supporter)\b", low):
+        return "community member dossier"
+    if re.search(r"\b(internal|source|contact)\b", low):
+        return "internal-only contact/source context"
+    return "community/music-adjacent dossier"
+
+
+def build_dossier_completion_read_v1(packet: dict[str, Any], analyst: dict[str, Any], case_report: dict[str, Any] | None = None) -> dict[str, Any]:
+    subject = _case_text(analyst.get("subjectName") or packet.get("subject") or "this subject", 140)
+    public_claims = _case_list(analyst.get("publicReadyClaims") or analyst.get("publicSafeClaims") or packet.get("publicSafePossibilities"), limit=8, item_limit=260)
+    strongest = _case_list(analyst.get("strongestSignals"), limit=6, item_limit=260)
+    internal_support = _case_list([*(analyst.get("sourceBlindInsights") or []), *(analyst.get("privateOrInternalExclusions") or []), *((case_report or {}).get("queueSubmissionContext") if isinstance((case_report or {}).get("queueSubmissionContext"), list) else [(case_report or {}).get("queueSubmissionContext")])], limit=8, item_limit=260)
+    omit = _case_list([*(analyst.get("doNotSayPublicly") or []), *(analyst.get("privateOrInternalExclusions") or []), *(analyst.get("sourceBlindInsights") or [])], limit=8, item_limit=260)
+    missing = _case_list(analyst.get("missingInfoQuestions") or analyst.get("missingConfirmations"), limit=5, item_limit=220)
+    hay = " ".join([subject, analyst.get("likelySubjectType") or "", analyst.get("dossierWorthiness") or "", *public_claims, *strongest])
+    draft_angle = _dossier_type_from_text(hay)
+    public_items = _public_dossier_context_items(packet)
+    matched_types: list[str] = []
+    structure_notes: list[str] = []
+    tone_notes: list[str] = []
+    style_notes: list[str] = []
+    pattern = "No current public dossier corpus was supplied; site should pass bounded public dossier style/context for house-style comparison."
+    if public_items:
+        scored: list[tuple[int, dict[str, Any]]] = []
+        angle_terms = set(re.findall(r"[a-z]+", draft_angle.lower()))
+        for item in public_items:
+            item_text = " ".join(_case_list([item.get(k) for k in ("type", "category", "role", "title", "summary", "structureNotes", "toneNotes", "styleNotes")], limit=10, item_limit=180))
+            typ = _dossier_type_from_text(item_text)
+            if typ not in matched_types:
+                matched_types.append(typ)
+            score = len(angle_terms & set(re.findall(r"[a-z]+", item_text.lower())))
+            scored.append((score, item))
+            for key, target in (("structureNotes", structure_notes), ("toneNotes", tone_notes), ("styleNotes", style_notes)):
+                for txt in _case_list(item.get(key), limit=2, item_limit=180):
+                    if txt not in target:
+                        target.append(txt)
+        best = max(scored, key=lambda x: x[0])[1] if scored else public_items[0]
+        pattern = _case_text(best.get("pattern") or best.get("type") or best.get("category") or best.get("role") or _dossier_type_from_text(" ".join(_case_list(best, limit=8))), 180)
+    ready = bool(analyst.get("readyForDraft"))
+    blocked = _case_list(analyst.get("dossierBlockedBy"), limit=5, item_limit=120)
+    status = "ready now" if ready and not blocked else ("ready with omissions" if public_claims and not blocked else ("internal-only" if not public_claims and internal_support else "blocked"))
+    return _sanitize_archive_value({
+        "version": "1",
+        "subjectName": subject,
+        "completionStatus": status,
+        "likelyDossierAngle": draft_angle,
+        "nearestPublicDossierPattern": pattern,
+        "matchedPublicDossierTypes": matched_types[:5] or [draft_angle],
+        "whatBnlHas": _case_list([*strongest, *public_claims, *internal_support], limit=10, item_limit=240),
+        "publicSafeToUseNow": public_claims or ["No public-safe claim is confirmed yet."],
+        "keepInternal": internal_support or ["Queue/Discord/broadcast/source-blind context stays internal unless separately approved for public wording."],
+        "omitForNow": omit or ["Omit unresolved identity, role, relationship, queue, lore, collaboration, private, and source-blind details unless approved."],
+        "requiredToDraft": [m for m in missing if re.search(r"display name|identity", m, re.I)][:3],
+        "helpfulButOptional": [m for m in missing if not re.search(r"display name|identity", m, re.I)][:5],
+        "blockedByPublicSafety": blocked,
+        "styleNotes": style_notes[:5] or ["Use supplied current public dossier examples only for house style; do not copy facts or wording."],
+        "structureNotes": structure_notes[:5] or ["Follow the closest supplied public dossier structure when available; otherwise keep a concise role, summary, notes, tags shape."],
+        "toneNotes": tone_notes[:5] or ["Match current public dossier tone when supplied; avoid generic assistant-profile language."],
+        "draftCompositionPlan": _case_text(f"Draft a cautious {draft_angle} for {subject} from public-safe claims, keep internal support out of public copy, and omit optional unresolved role/link/lore/queue/collaboration details.", 420),
+        "publicDossierComparisonSummary": _case_text(f"Compared against {len(public_items)} supplied current public dossier style/context item(s). Closest pattern: {pattern}.", 320),
+    })
+
 def _source_package_from_packet(packet: dict[str, Any]) -> dict[str, Any]:
     """Build the full review-only archive package without compact-card trimming."""
 
@@ -5155,8 +5257,19 @@ def build_source_file_archive_payload(packet: dict[str, Any], *, environ: dict[s
     source_file_classification = packet.get("sourceFileClassificationV1") if isinstance(packet.get("sourceFileClassificationV1"), dict) else {}
     if subject_analyst_read and source_file_classification:
         subject_analyst_read["sourceFileClassificationSummaryV1"] = _classification_summary_for_analyst(source_file_classification)
+    dossier_completion_read = build_dossier_completion_read_v1(packet, subject_analyst_read, case_report) if subject_analyst_read else {}
+    if subject_analyst_read and dossier_completion_read:
+        subject_analyst_read["dossierCompletionReadV1"] = dossier_completion_read
+        for key, target in (("publicReadyClaims", "publicSafeClaims"), ("draftIngredients", "publicSafeToUseNow"), ("sourceFileIngredients", "whatBnlHas")):
+            merged = _case_list([*(subject_analyst_read.get(key) or []), *(dossier_completion_read.get(target) or [])], limit=12, item_limit=300)
+            subject_analyst_read[key] = merged
+        subject_analyst_read["currentRead"] = _case_text(f"{subject_analyst_read.get('currentRead') or ''} Dossier-completion read: {dossier_completion_read.get('completionStatus')} as {dossier_completion_read.get('likelyDossierAngle')}; closest public pattern: {dossier_completion_read.get('nearestPublicDossierPattern')}.", 700)
+        subject_analyst_read["dossierReadinessSummary"] = _case_text(f"{subject_analyst_read.get('dossierReadinessSummary') or ''} BNL has: {'; '.join((dossier_completion_read.get('whatBnlHas') or [])[:3])}. Public-use now: {'; '.join((dossier_completion_read.get('publicSafeToUseNow') or [])[:3])}. Omit: {'; '.join((dossier_completion_read.get('omitForNow') or [])[:3])}.", 700)
+        subject_analyst_read["recommendedAdminActions"] = _case_list([*(dossier_completion_read.get("requiredToDraft") or []), *(dossier_completion_read.get("helpfulButOptional") or []), *(subject_analyst_read.get("recommendedAdminActions") or [])], limit=5, item_limit=220)
     if subject_analyst_read:
         case_report["subjectAnalystReadV1"] = subject_analyst_read
+        if dossier_completion_read:
+            case_report["dossierCompletionReadV1"] = dossier_completion_read
         if subject_analyst_read.get("internalRead"):
             case_report["caseSummary"] = _case_text(f"{case_report.get('caseSummary')} BNL analyst read: {subject_analyst_read.get('internalRead')}", 900)
         if subject_analyst_read.get("dossierWorthiness") or subject_analyst_read.get("dossierReadinessSummary"):
@@ -5187,6 +5300,7 @@ def build_source_file_archive_payload(packet: dict[str, Any], *, environ: dict[s
         "evidenceReceiptSummary": _sanitize_archive_value(receipt),
         "sourceFileBriefV2": _sanitize_archive_value(build_source_file_brief_v2({**packet, "subjectAnalystReadV1": subject_analyst_read}, archive_id=packet.get("archiveId") or "")),
         "subjectAnalystReadV1": subject_analyst_read,
+        "dossierCompletionReadV1": dossier_completion_read,
         "sourceFileClassificationV1": _sanitize_archive_value(source_file_classification),
         "subjectMemoryPacketV1": subject_memory_packet,
         "sourceFileCaseReportV1": case_report,

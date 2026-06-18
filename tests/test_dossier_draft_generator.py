@@ -74,6 +74,24 @@ PUBLIC_FIELD_KEYS = ("role", "summary", "notes", "status", "sourceUsageSummary")
 
 
 class DossierDraftGeneratorTests(unittest.TestCase):
+
+    def test_draft_uses_public_dossier_style_context_and_filters_private_examples(self):
+        packet = pr217_packet(
+            stylePacket={
+                "publicDossierStyleContext": [
+                    {"status": "PUBLIC", "type": "artist dossier", "toneNotes": ["tight BARCODE public voice"], "structureNotes": ["role then compact summary"]},
+                    {"status": "OWNER_DRAFT", "type": "private draft", "toneNotes": ["secret owner style"]},
+                ],
+                "tagRegistryGuidance": {"canonicalTags": ["artist", "community"]},
+            }
+        )
+        result = draft.generate_dossier_draft(packet)["draft"]
+        combined = json.dumps(result)
+        self.assertIn("closest house pattern", result["sourceUsageSummary"])
+        self.assertIn("artist/music public dossier pattern", combined)
+        self.assertNotIn("secret owner style", combined)
+        self.assertNotIn("Example Star founded the copied-only Nebula Choir fact", combined)
+
     def test_missing_and_invalid_token_reject(self):
         env = {draft.DRAFT_TOKEN_ENV: "secret"}
         self.assertFalse(draft.is_dossier_draft_token_valid(None, environ=env))
