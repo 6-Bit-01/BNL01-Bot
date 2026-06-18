@@ -981,6 +981,8 @@ def generate_dossier_draft(packet: dict[str, Any], db_path: str | None = None, p
         except Exception:
             resolver = None
     review_actionability = _dict(packet.get("reviewActionabilityV1") or (analyst or {}).get("reviewActionabilityV1"))
+    subject_dossier_state = _dict(packet.get("subjectDossierStateV1") or (analyst or {}).get("subjectDossierStateV1"))
+    source_file_surface = _dict(packet.get("sourceFileSurfaceV1") or (analyst or {}).get("sourceFileSurfaceV1"))
     if review_actionability:
         rejected_review_texts: list[str] = []
         for item in review_actionability.get("items") or []:
@@ -998,6 +1000,13 @@ def generate_dossier_draft(packet: dict[str, Any], db_path: str | None = None, p
                     rejected_review_texts.append(text)
         if rejected_review_texts:
             rejected_facts.extend(rejected_review_texts[:6])
+    if subject_dossier_state:
+        for item in _strings(subject_dossier_state.get("publicSafeToUseNow"), max_items=5):
+            if item not in public_facts:
+                public_facts.append(item)
+        for item in _strings(subject_dossier_state.get("keepInternal"), max_items=4) + _strings(subject_dossier_state.get("omitForNow"), max_items=4):
+            if item:
+                rejected_facts.append(item)
     role = _role_from_context(public_facts, public_notes, category, kind, lane)[:_ROLE_LIMIT]
     if analyst:
         analyst_public = " ".join(_strings(analyst.get("draftIngredients"), max_items=9) + _strings(analyst.get("publicSafeClaims"), max_items=6)).lower()
@@ -1041,6 +1050,11 @@ def generate_dossier_draft(packet: dict[str, Any], db_path: str | None = None, p
 
     owner_warnings = _strings(packet.get("ownerReviewRules"), max_items=8) + _strings(packet.get("reviewOnlyWarnings"), max_items=8)
     owner_warnings.append("Owner Review must approve identity, role, category, links, and public wording before publication.")
+    if subject_dossier_state:
+        owner_warnings.append(f"Subject dossier state: {subject_dossier_state.get('state')} / {subject_dossier_state.get('recommendedNextAction')}.")
+    if source_file_surface:
+        primary = _dict(source_file_surface.get("primaryAction"))
+        owner_warnings.append(f"Source File surface primary action: {primary.get('label') or primary.get('actionKey')}.")
     public_warnings = _strings(packet.get("sourceBoundaryRules"), max_items=8)
     public_warnings.append("Public fields use the Source File packet as the subject boundary plus approved public-safe BNL evidence.")
     if evidence:
