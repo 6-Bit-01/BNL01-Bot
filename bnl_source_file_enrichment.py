@@ -25,7 +25,7 @@ from bnl_entity_intelligence import build_entity_intelligence_profile, resolve_e
 from bnl_evidence_ownership import classify_evidence_ownership, subject_owned_text_fragments
 from bnl_source_file_lookup import lookup_source_file
 from bnl_source_refresh_context import refresh_generation_context
-from bnl_subject_memory_resolver import build_subject_analyst_read, resolve_subject_memory, _review_guidance
+from bnl_subject_memory_resolver import build_subject_analyst_read, normalize_source_file_resolution_context, resolve_subject_memory, _review_guidance
 
 ENRICHMENT_INGEST_SOURCE = "bnl_source_file_enrichment"
 FALLBACK_INGEST_SOURCE = "bnl_source_knowledge_bridge"
@@ -4851,6 +4851,12 @@ def _normalize_subject_analyst_read_v1(analyst: dict[str, Any]) -> dict[str, Any
     normalized["readyForDraft"] = bool(analyst.get("readyForDraft"))
     normalized["dossierReadinessSummary"] = _case_text(analyst.get("dossierReadinessSummary"), 500)
     normalized["draftReadinessReason"] = _case_text(analyst.get("draftReadinessReason"), 500)
+    for key in ("sourceFileResolutionAudit", "resolvedQuestionAudit"):
+        if isinstance(analyst.get(key), dict) and analyst.get(key):
+            normalized[key] = _sanitize_archive_value(analyst.get(key))
+    for key in ("suppressedByExistingReviewCount", "suppressedByBoundaryCount", "unresolvedAfterResolutionCount"):
+        if key in analyst:
+            normalized[key] = int(analyst.get(key) or 0)
     for key in ("strongestSignals", "publicSafeClaims", "publicReadyClaims", "sourceBlindInsights", "privateOrInternalExclusions", "doNotSayPublicly", "missingInfoQuestions", "recommendedAdminActions", "draftIngredients", "provenanceSummary"):
         normalized[key] = _case_list(normalized.get(key), limit=12 if key != "draftIngredients" else 9, item_limit=360)
     normalized["subjectName"] = subject
@@ -4868,7 +4874,12 @@ def build_source_file_subject_analyst_read_v1(packet: dict[str, Any], db_path: s
     subject = _safe_text(packet.get("subject") or _first(source_file, ("name", "sourceFileName", "subject", "displayName", "title", "normalizedName")), 140)
     existing = packet.get("subjectAnalystReadV1") if isinstance(packet.get("subjectAnalystReadV1"), dict) else {}
     if existing:
-        return _normalize_subject_analyst_read_v1(existing)
+        normalized = _normalize_subject_analyst_read_v1(existing)
+        resolution_context = normalize_source_file_resolution_context(packet)
+        if resolution_context.get("hasContext") and not normalized.get("sourceFileResolutionAudit"):
+            normalized["sourceFileResolutionAudit"] = {"inputContextPresent": True, "resolvedQuestionKeyCount": len(resolution_context.get("resolvedQuestionKeys") or []), "suppressedByExistingReviewCount": 0, "suppressedByBoundaryCount": 0, "unresolvedAfterResolutionCount": len(normalized.get("dossierReadinessQuestions") or []) + len(normalized.get("dossierClarificationNeeds") or [])}
+            normalized["resolvedQuestionAudit"] = normalized["sourceFileResolutionAudit"]
+        return normalized
     resolved = packet.get("resolvedSubjectMemoryV1") if isinstance(packet.get("resolvedSubjectMemoryV1"), dict) else None
     if resolved is None:
         resolved = resolve_subject_memory(subject, db_path or "", aliases=_subject_analyst_aliases(packet))

@@ -4,7 +4,7 @@ import unittest
 import json
 
 import bnl_dossier_draft as draft
-from bnl_subject_memory_resolver import build_subject_analyst_read, build_subject_memory_diagnostic, resolve_subject_memory, _review_guidance, _make_reviewable_claim, _cluster_clarification_needs, _build_dossier_readiness, _build_dossier_readiness_from_clarifications, _public_role_candidate_for_subject, _build_review_context, _compose_source_file_review_card, _finalize_review_guidance, _canonical_question_metadata
+from bnl_subject_memory_resolver import build_subject_analyst_read, build_subject_memory_diagnostic, normalize_source_file_resolution_context, resolve_subject_memory, _review_guidance, _make_reviewable_claim, _cluster_clarification_needs, _build_dossier_readiness, _build_dossier_readiness_from_clarifications, _public_role_candidate_for_subject, _build_review_context, _compose_source_file_review_card, _finalize_review_guidance, _canonical_question_metadata
 
 
 class SubjectMemoryResolverTests(unittest.TestCase):
@@ -83,6 +83,31 @@ class SubjectMemoryResolverTests(unittest.TestCase):
         self.assertNotIn("secret", private["questionKey"])
         self.assertNotIn("999999", private["questionKey"])
 
+    def test_source_file_resolution_context_normalizes_supported_fields_safely(self):
+        key = _canonical_question_metadata("Crow", "What exact public name may BNL use for Crow?", section="identity", audience="subject")["questionKey"]
+        ctx = normalize_source_file_resolution_context({
+            "sourceFileQuestionResolutions": [{
+                "questionKey": key,
+                "questionCategory": "identity_name",
+                "resolutionState": "confirmed_public",
+                "resolved": True,
+                "safeToSuppressFromActivePacket": True,
+                "resolutionSummary": "Use Crow publicly; email crow@example.com token=abcdef1234567890 should not leak.",
+                "sourceIds": ["raw-site-id-123"],
+            }],
+            "sourceFileWorkflowContext": {
+                "claimReviews": [{"questionKey": "bnlq_boundary_abc", "decision": "do_not_say", "claimText": "Do not state a public role for Crow yet."}],
+                "sourceFileNotes": [{"type": "internal", "text": "Keep Orion context internal for now.", "publicSafe": False}],
+            },
+        })
+        self.assertIn(key, ctx["resolvedQuestionKeys"])
+        self.assertIn("identity_name", ctx["resolvedQuestionCategories"])
+        self.assertIn(key, ctx["publicSafeApprovedQuestionKeys"])
+        safe_blob = json.dumps({k: sorted(v) if isinstance(v, set) else v for k, v in ctx.items()})
+        self.assertNotIn("crow@example.com", safe_blob)
+        self.assertNotIn("abcdef1234567890", safe_blob)
+        self.assertNotIn("raw-site-id-123", safe_blob)
+
     def test_readiness_clarification_and_followups_carry_canonical_metadata(self):
         packet = {
             "reviewOnlyEvidence": [
@@ -107,6 +132,57 @@ class SubjectMemoryResolverTests(unittest.TestCase):
             self.assertEqual(card["recommendedFollowUpQuestion"], card["verificationPacketQuestion"])
         categories = {c["questionCategory"] for c in followups + analyst["dossierReadinessQuestions"] + analyst["dossierClarificationNeeds"]}
         self.assertTrue({"contest_event", "rules_instructions", "lore_context", "orion_context", "links_music_socials"} & categories)
+
+    def test_resolution_context_suppresses_readiness_clarification_and_followup_by_key(self):
+        memory = {
+            "reviewOnlyEvidence": [
+                {"summary": "Crow has Suno music link context needing public-safe provenance."},
+                {"summary": "Crow appears near contest rules and submission link context."},
+                {"summary": "Crow has Orion relay context needing confirmation."},
+                {"summary": "unclear rules and instructions near Crow"},
+            ],
+            "sourceSafetyWarnings": ["Some subject memory lacked public-safe provenance"],
+            "evidenceCounts": {"publicSafe": 0, "reviewOnly": 4, "privateOrInternal": 0, "sourceBlind": 0, "totalScanned": 4},
+        }
+        baseline = build_subject_analyst_read("Crow", memory)
+        keys = [
+            baseline["dossierReadinessQuestions"][0]["questionKey"],
+            baseline["dossierClarificationNeeds"][0]["questionKey"],
+            next(c["questionKey"] for c in baseline["reviewableClaims"] if c.get("recommendedFollowUpQuestion")),
+        ]
+        resolved = build_subject_analyst_read("Crow", memory, {
+            "resolvedBnlQuestions": [
+                {"questionKey": keys[0], "resolutionState": "confirmed_public", "resolved": True, "safeToSuppressFromActivePacket": True},
+                {"questionKey": keys[1], "resolutionState": "edited", "publicSafe": True, "safeToSuppressFromActivePacket": True},
+                {"questionKey": keys[2], "resolutionState": "do_not_say", "resolved": True, "safeToSuppressFromActivePacket": True, "resolutionSummary": "Do not state a public role for Crow yet."},
+            ]
+        })
+        active_keys = {q.get("questionKey") for q in resolved["dossierReadinessQuestions"] + resolved["dossierClarificationNeeds"]}
+        followup_keys = {c.get("questionKey") for c in resolved["reviewableClaims"] if c.get("recommendedFollowUpQuestion")}
+        self.assertFalse(set(keys) & active_keys)
+        self.assertNotIn(keys[2], followup_keys)
+        self.assertGreaterEqual(resolved["suppressedByExistingReviewCount"], 2)
+        self.assertGreaterEqual(resolved["suppressedByBoundaryCount"], 1)
+
+    def test_resolution_context_fallback_is_exact_and_pending_stays_active(self):
+        memory = {
+            "reviewOnlyEvidence": [{"summary": "Crow has Orion relay context needing confirmation."}],
+            "evidenceCounts": {"publicSafe": 0, "reviewOnly": 1, "privateOrInternal": 0, "sourceBlind": 0, "totalScanned": 1},
+        }
+        baseline = build_subject_analyst_read("Crow", memory)
+        question = next(q for q in baseline["dossierReadinessQuestions"] if "Orion" in q["question"])
+        exact = build_subject_analyst_read("Crow", memory, {
+            "sourceFileWorkflowContext": {"resolvedQuestions": [{"questionKey": question["questionKey"], "resolutionState": "do_not_say", "resolved": True}]}
+        })
+        self.assertNotIn(question["question"], [q["question"] for q in exact["dossierReadinessQuestions"]])
+        fuzzy = build_subject_analyst_read("Crow", memory, {
+            "resolvedQuestions": [{"question": "Keep Orion context internal for now", "resolutionState": "confirmed_internal", "resolved": True}]
+        })
+        self.assertIn(question["question"], [q["question"] for q in fuzzy["dossierReadinessQuestions"]])
+        pending = build_subject_analyst_read("Crow", memory, {
+            "resolvedQuestions": [{"questionKey": question["questionKey"], "resolutionState": "pending", "resolved": False, "safeToSuppressFromActivePacket": True}]
+        })
+        self.assertIn(question["questionKey"], [q["questionKey"] for q in pending["dossierReadinessQuestions"]])
 
     def test_readiness_uses_consolidated_clarification_questions(self):
         theory = _make_reviewable_claim("Crow", "theory/anomaly-heavy", "relationship", "needs_confirmation", "Review-only theory anomaly signal.", False, "low", "theory/anomaly-heavy")
