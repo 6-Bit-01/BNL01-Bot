@@ -783,3 +783,26 @@ class DossierDraftMemoryFirstTests(unittest.TestCase):
         self.assertNotIn("Orion", public)
         self.assertNotIn("Discord queue", public)
         self.assertNotIn("Confirm Orion", json.dumps(result["missingInfoQuestions"]))
+
+class SourceFilePagePlanDraftConsumptionTests(unittest.TestCase):
+    def test_draft_consumes_page_plan_use_omit_and_warnings_without_diagnostics(self):
+        packet = pr217_packet(
+            publicSafeFacts=[],
+            publicSafeNotes=[],
+            sourceFilePagePlanV1={
+                "pageMode": "draft_ready",
+                "primaryAction": {"label": "Request BNL draft", "kind": "request_bnl_draft"},
+                "draftPlan": {
+                    "use": ["Signal Fox is a public-safe BARCODE music artist."],
+                    "omit": ["Do not use internal queue lore."],
+                    "ownerReviewWarnings": ["Owner must approve role wording."],
+                },
+                "diagnosticsSummary": {"sourceSafetyNotes": ["SECRET INTERNAL DIAGNOSTIC"]},
+            },
+        )
+        result = draft.generate_dossier_draft(packet)["draft"]
+        public = json.dumps({k: result[k] for k in ("role", "summary", "notes")})
+        self.assertIn("BARCODE", public)
+        self.assertIn("Do not use internal queue lore.", json.dumps(result["unsupportedClaimsRejected"]))
+        self.assertIn("Owner must approve role wording.", result["ownerReviewWarnings"])
+        self.assertNotIn("SECRET INTERNAL DIAGNOSTIC", json.dumps(result))

@@ -1624,3 +1624,52 @@ class SourceFileMemoryFirstReadoutTests(unittest.TestCase):
         self.assertEqual(report["reviewBlockers"], [])
         self.assertIn("possible_fit", brief["adminSummary"])
         self.assertIn("omit", brief["recommendedNextAction"].lower())
+
+class SourceFilePagePlanV1Tests(unittest.TestCase):
+    def test_page_plan_emits_absorbs_legacy_cards_and_preserves_outputs(self):
+        packet = {
+            "subject": "Signal Fox",
+            "sourceFile": {"id": "sf_signal", "name": "Signal Fox"},
+            "sections": {},
+            "subjectAnalystReadV1": {
+                "subjectName": "Signal Fox",
+                "publicSafeClaims": ["Signal Fox has public BARCODE music context."],
+                "readyForDraft": True,
+                "dossierBlockedBy": [],
+                "reviewableClaims": [
+                    {"id": "public_claim", "claimText": "Signal Fox has public BARCODE music context.", "publicSafe": True},
+                    {"id": "vague_contest", "claimText": "Possible contest event connection, vague and unsupported.", "claimType": "contest", "publicSafe": False},
+                    {"id": "source_blind", "claimText": "SECRET SOURCE BLIND LORE RAW TEXT", "claimType": "internal_lore", "reviewLane": "source_blind", "publicSafe": False},
+                ],
+            },
+        }
+        archive = enrich.build_source_file_archive_payload(packet)
+        plan = archive["sourceFilePagePlanV1"]
+        self.assertIn("sourceFilePagePlanV1", archive["subjectAnalystReadV1"])
+        self.assertIn("sourceFilePagePlanV1", archive["sourceFileCaseReportV1"])
+        self.assertIn("dossierCompletionReadV1", archive)
+        self.assertIn("reviewActionabilityV1", archive)
+        self.assertIn("sourceFileSurfaceV1", archive)
+        self.assertEqual(plan["pageMode"], "draft_ready")
+        self.assertIn("Signal Fox has public BARCODE music context.", plan["draftPlan"]["use"])
+        self.assertGreaterEqual(plan["diagnosticsSummary"]["legacyReviewCardsAbsorbed"], 3)
+        disposition_text = json.dumps(plan).lower()
+        self.assertIn("ignore vague contest context", disposition_text)
+        self.assertRegex(disposition_text, "ignore_for_now|keep_internal|omit")
+        self.assertNotIn("SECRET SOURCE BLIND LORE RAW TEXT", json.dumps(plan))
+
+    def test_page_plan_modes_owner_admin_blocked_watch_internal_update(self):
+        owner = enrich.build_source_file_archive_payload({"subject":"Owner Fox","sourceFile":{"name":"Owner Fox"},"sections":{},"subjectAnalystReadV1":{"subjectName":"Owner Fox","publicSafeClaims":["Owner Fox has public context."],"readyForDraft":False,"reviewableClaims":[{"id":"ow","claimText":"Confirm public wording for Owner Fox role.","publicSafe":False}]}})["sourceFilePagePlanV1"]
+        self.assertTrue(owner["pageMode"] in {"owner_question", "build_source_file"} or any(c["control"]["kind"] == "ask_owner" for c in owner["cards"]))
+        admin = enrich.build_source_file_page_plan_v1({"subject":"Admin Fox"},{"subjectName":"Admin Fox"},{"subjectName":"Admin Fox","publicSafeToUseNow":["Admin Fox has public context."]},{"items":[{"id":"adm","actionability":"needs_admin_confirmation","claimText":"Confirm central public claim.","audience":"admin","priority":"high","safeDefault":"ask_admin"}]},{"state":"needs_admin_confirmation","recommendedNextAction":"Confirm central public claim."})
+        self.assertEqual(admin["pageMode"], "admin_question")
+        self.assertEqual(admin["primaryAction"]["kind"], "ask_admin")
+        blocked = enrich.build_source_file_archive_payload({"subject":"Unknown","sourceFile":{"name":"Unknown"},"sections":{},"subjectAnalystReadV1":{"subjectName":"Unknown","publicSafeClaims":[],"readyForDraft":False,"dossierBlockedBy":["Missing safe public identity/display name."]}})["sourceFilePagePlanV1"]
+        self.assertEqual(blocked["pageMode"], "blocked")
+        self.assertFalse(blocked["primaryAction"]["enabled"])
+        update = enrich.build_source_file_archive_payload({"subject":"Signal Fox","matchKind":"existing_dossier_update","sourceFile":{"name":"Signal Fox","publicDossierId":"dos_1"},"sections":{},"subjectAnalystReadV1":{"subjectName":"Signal Fox","publicSafeClaims":["Signal Fox has update material."],"readyForDraft":True,"dossierBlockedBy":[]}})["sourceFilePagePlanV1"]
+        self.assertEqual(update["pageMode"], "update_existing_dossier")
+        self.assertEqual(update["draftPlan"]["draftKind"], "update_existing")
+        watch = enrich.build_source_file_page_plan_v1({"subject":"Watch Fox"},{"subjectName":"Watch Fox"},{"subjectName":"Watch Fox"},{"items":[{"id":"pub","actionability":"approve_public_claim","claimText":"Watch Fox maybe public.","publicUse":"public_safe"}]},{"state":"watch_only","recommendedNextAction":"Keep watching."})
+        self.assertEqual(watch["pageMode"], "watch_only")
+        self.assertFalse(any(c["disposition"] == "use_publicly" for c in watch["cards"]))

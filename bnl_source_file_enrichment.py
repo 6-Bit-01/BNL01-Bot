@@ -5660,6 +5660,124 @@ def build_source_file_surface_v1(subject_state: dict[str, Any], review_actionabi
         "diagnosticsSummary": _case_text(f"Derived from subjectDossierStateV1 plus dossierCompletionReadV1/reviewActionabilityV1. Mode: {subject_state.get('recommendedSurfaceMode')}.", 220),
     })
 
+
+def _page_plan_control(kind: str, label: str, question: str = "", *, enabled: bool = True) -> dict[str, Any]:
+    return {"kind": kind, "label": _case_text(label, 90), "question": _case_text(question, 240), "enabled": bool(enabled)}
+
+
+def _page_plan_card(item: dict[str, Any], *, visible: bool = True) -> dict[str, Any]:
+    action = str(item.get("actionability") or "")
+    public_use = str(item.get("publicUse") or "")
+    text = _case_text(item.get("claimText") or item.get("question") or item.get("recommendedAction"), 260)
+    question = _case_text(item.get("question") or text, 240)
+    if action in {"true_blocker", "required_to_finish"}:
+        disposition = "blocks_draft" if item.get("blocksDraft") else ("ask_owner" if item.get("audience") == "owner" else "ask_admin")
+        control_kind = "ask_owner" if item.get("audience") == "owner" else "ask_admin"
+        title = "Resolve draft blocker" if item.get("blocksDraft") else "Required dossier decision"
+        safe_default = str(item.get("safeDefault") or ("ask_owner" if control_kind == "ask_owner" else "ask_admin"))
+    elif action == "needs_owner_wording":
+        disposition, control_kind, title, safe_default = "ask_owner", "ask_owner", "Owner wording needed", "ask_owner"
+    elif action == "needs_admin_confirmation":
+        disposition, control_kind, title, safe_default = "ask_admin", "ask_admin", "Admin confirmation needed", "ask_admin"
+    elif action == "approve_public_claim" or public_use == "public_safe":
+        disposition, control_kind, title, safe_default = "use_publicly", "approve_public_copy", "Public-safe claim for draft", "use_cautious_wording"
+    elif action in {"keep_internal", "diagnostic_only"} or public_use in {"internal_only", "not_public"}:
+        disposition, control_kind, title, safe_default = "keep_internal", "keep_internal", "Keep internal", "keep_internal"
+    elif action in {"omit_from_public"} or public_use == "omit":
+        disposition, control_kind, title, safe_default = "ignore_for_now", "omit", "Ignore vague or optional context", "omit"
+    elif action == "already_resolved":
+        disposition, control_kind, title, safe_default = "already_resolved", "none", "Already resolved", "none"
+    else:
+        disposition, control_kind, title, safe_default = "optional", "none", "Optional context", str(item.get("safeDefault") or "omit")
+    if re.search(r"\b(contest|event|challenge|jam|collab)", text, re.I) and disposition in {"optional", "ignore_for_now", "keep_internal"}:
+        title = "Ignore vague contest context"
+        disposition = "ignore_for_now"
+        safe_default = "omit"
+    body = item.get("reason") or item.get("recommendedAction") or text
+    if disposition in {"keep_internal", "ignore_for_now"}:
+        body = "BNL does not have enough public-safe evidence to use this in the dossier. Keep it internal unless better evidence appears."
+    return {
+        "id": _case_text(item.get("id") or _stable_review_actionability_id("page", text), 120),
+        "title": _case_text(title, 100),
+        "body": _case_text(body, 320),
+        "disposition": disposition,
+        "visible": bool(visible),
+        "priority": "high" if item.get("priority") == "high" or item.get("blocksDraft") else ("low" if item.get("priority") in {"low", "diagnostic"} else "medium"),
+        "control": _page_plan_control(control_kind, {"ask_owner":"Ask owner", "ask_admin":"Ask admin", "approve_public_copy":"Approve cautious wording", "keep_internal":"Keep internal", "omit":"Omit", "none":"No action"}.get(control_kind, "No action"), question, enabled=control_kind != "none"),
+        "sourceRefs": [_case_text(item.get("source"), 80)] if item.get("source") else [],
+        "safeDefault": safe_default,
+    }
+
+
+def build_source_file_page_plan_v1(packet: dict[str, Any], analyst: dict[str, Any], dossier_completion_read: dict[str, Any], review_actionability: dict[str, Any] | None = None, subject_state: dict[str, Any] | None = None, source_file_surface: dict[str, Any] | None = None, case_report: dict[str, Any] | None = None, source_file_classification: dict[str, Any] | None = None) -> dict[str, Any]:
+    """BNL-authored render plan for one Source File page; site displays this contract directly."""
+    subject = _case_text(dossier_completion_read.get("subjectName") or analyst.get("subjectName") or packet.get("subject") or "this subject", 140)
+    subject_key = _subject_key(subject)
+    state = str((subject_state or {}).get("state") or "source_file_building")
+    state_to_mode = {"ready_for_cautious_draft":"draft_ready", "update_existing_public_dossier":"update_existing_dossier", "needs_owner_wording":"owner_question", "needs_admin_confirmation":"admin_question", "candidate_new":"build_source_file", "source_file_building":"build_source_file"}
+    page_mode = state_to_mode.get(state, state if state in {"blocked", "internal_only", "watch_only"} else "build_source_file")
+    if _has_existing_public_dossier_context(packet) and page_mode == "draft_ready":
+        page_mode = "update_existing_dossier"
+    public_use = _public_safe_state_items(analyst, dossier_completion_read)
+    omit = _case_list((subject_state or {}).get("omitForNow") or dossier_completion_read.get("omitForNow") or analyst.get("doNotSayPublicly"), limit=10, item_limit=220)
+    keep_internal = _case_list((subject_state or {}).get("keepInternal") or dossier_completion_read.get("keepInternal") or analyst.get("privateOrInternalExclusions") or analyst.get("sourceBlindInsights"), limit=8, item_limit=220)
+    items = [i for i in ((review_actionability or {}).get("items") or []) if isinstance(i, dict)]
+    cards: list[dict[str, Any]] = []
+    hidden: list[dict[str, Any]] = []
+    absorbed = 0
+    for item in items[:40]:
+        card = _page_plan_card(item)
+        absorbed += 1
+        if page_mode in {"watch_only", "internal_only", "build_source_file"} and card["disposition"] in {"use_publicly", "optional"}:
+            hidden.append({"id": card["id"], "title": card["title"], "reason": "BNL is not applying public review pressure in this page mode."})
+            continue
+        if card["disposition"] in {"already_resolved"} or item.get("priority") == "diagnostic":
+            hidden.append({"id": card["id"], "title": card["title"], "reason": "Absorbed as resolved/diagnostic support, not an active page decision."})
+            continue
+        if card["disposition"] == "use_publicly" and len(public_use) >= 1:
+            hidden.append({"id": card["id"], "title": card["title"], "reason": "Absorbed into What BNL knows and draftPlan.use."})
+            continue
+        cards.append(card)
+    if not cards and page_mode == "blocked":
+        blocker = _case_list((subject_state or {}).get("requiredDecisions") or analyst.get("dossierBlockedBy") or dossier_completion_read.get("blockedByPublicSafety"), limit=1, item_limit=240)
+        cards.append({"id":"blocker:primary", "title":"Public dossier blocked", "body": blocker[0] if blocker else "BNL cannot responsibly draft until the core public identity/safety blocker is resolved.", "disposition":"blocks_draft", "visible":True, "priority":"high", "control":_page_plan_control("ask_owner", "Resolve blocker", blocker[0] if blocker else "Confirm the public identity/safety boundary."), "sourceRefs":[], "safeDefault":"ask_owner"})
+    questions = []
+    for item in items:
+        action = str(item.get("actionability") or "")
+        if action not in {"true_blocker", "required_to_finish", "needs_owner_wording", "needs_admin_confirmation"}:
+            continue
+        q = _case_text(item.get("question") or item.get("claimText"), 240)
+        if q and not re.search(r"\b(queue|lore|source[-_ ]blind|internal|classification|curiosity)\b", q, re.I):
+            audience = "owner" if item.get("audience") == "owner" or action in {"true_blocker", "needs_owner_wording"} else "admin"
+            questions.append({"audience": audience, "question": q, "reason": _case_text(item.get("reason") or "This decision unlocks public wording, identity, or a real draft blocker.", 220)})
+    action_map = {"draft_ready":("Request BNL draft", "request_bnl_draft", True), "owner_question":("Ask owner", "ask_owner", True), "admin_question":("Ask admin", "ask_admin", True), "update_existing_dossier":("Open update plan", "open_update_plan", True), "internal_only":("Keep internal", "keep_internal", True), "watch_only":("Refresh/watch", "refresh", True), "blocked":("Resolve blocker", "ask_owner", False), "build_source_file":("Gather/refresh", "refresh", True)}
+    label, kind, enabled = action_map.get(page_mode, ("No action", "none", False))
+    draft_kind = "update_existing" if page_mode == "update_existing_dossier" else ("new_dossier" if page_mode == "draft_ready" else "none")
+    can_draft = page_mode in {"draft_ready", "update_existing_dossier"}
+    sections = [
+        {"id":"what_bnl_knows", "title":"What BNL knows", "body": _case_text("BNL has enough public-safe material for a concise BARCODE-style dossier." if public_use else "BNL does not yet have enough public-safe material for dossier copy.", 260), "items": public_use[:8]},
+        {"id":"what_bnl_is_omitting", "title":"What BNL is omitting", "body":"Internal, source-blind, queue, lore, private, and unresolved review-only material stays out of public copy.", "items": omit[:6] or (["BNL will omit unresolved optional role, link, relationship, queue, lore, and collaboration details."] if can_draft else [])},
+        {"id":"current_decision", "title":"Current decision", "body": _case_text((subject_state or {}).get("recommendedNextAction") or dossier_completion_read.get("draftCompositionPlan") or "BNL is keeping the Source File review-only.", 320), "items": []},
+    ]
+    if keep_internal:
+        sections.append({"id":"internal_confidence", "title":"Internal confidence signals", "body":"BNL has internal confidence signals here, but they are not public dossier copy.", "items": ["Internal/source-blind support is summarized without raw private text."]})
+    safety_notes = ["No public publishing, identity merge, owner-review bypass, or raw private/source-blind evidence exposure is authorized."]
+    if keep_internal:
+        safety_notes.append("Internal/source-blind evidence was summarized generically instead of copied.")
+    return _sanitize_archive_value({
+        "version":"1", "subjectName":subject, "subjectKey":subject_key, "pageMode":page_mode,
+        "headline": _case_text(f"{subject}: {page_mode.replace('_', ' ')}", 140),
+        "bnlTake": _case_text((subject_state or {}).get("whyNow") or dossier_completion_read.get("draftCompositionPlan") or (source_file_surface or {}).get("summary") or "BNL authored this Source File page as an admin decision plan.", 420),
+        "primaryAction": {"label":label, "kind":kind, "enabled":enabled, "reason": _case_text((subject_state or {}).get("recommendedNextAction") or "Owner Review remains required before any publication.", 240)},
+        "secondaryActions": [_page_plan_control("refresh", "Refresh/watch", enabled=True)] if page_mode not in {"watch_only", "internal_only"} else [],
+        "sections": sections,
+        "cards": cards[:12],
+        "hiddenOrDiagnosticCards": hidden[:24],
+        "verificationQuestions": questions[:6],
+        "draftPlan": {"canDraft": can_draft, "draftKind": draft_kind, "publicAngle": _case_text(dossier_completion_read.get("likelyDossierAngle") or "short BARCODE public dossier", 160), "use": public_use[:10], "omit": omit[:10] or ["Omit internal/source-blind/private/review-only material and unresolved claims."], "ownerReviewWarnings": _case_list([*(analyst.get("ownerReviewWarnings") or []), "Owner Review must approve identity, role, category, links, and public wording before publication."], limit=8, item_limit=240)},
+        "diagnosticsSummary": {"legacyReviewCardsAbsorbed": absorbed, "legacyReviewCardsHidden": len(hidden), "sourceSafetyNotes": safety_notes},
+    })
+
 def _source_package_from_packet(packet: dict[str, Any]) -> dict[str, Any]:
     """Build the full review-only archive package without compact-card trimming."""
 
@@ -5698,6 +5816,7 @@ def build_source_file_archive_payload(packet: dict[str, Any], *, environ: dict[s
     review_actionability = build_review_actionability_v1(packet, subject_analyst_read, dossier_completion_read, case_report, source_file_classification) if subject_analyst_read and dossier_completion_read else {}
     subject_dossier_state = build_subject_dossier_state_v1(packet, subject_analyst_read, dossier_completion_read, review_actionability, case_report, source_file_classification) if subject_analyst_read and dossier_completion_read else {}
     source_file_surface = build_source_file_surface_v1(subject_dossier_state, review_actionability) if subject_dossier_state else {}
+    source_file_page_plan = build_source_file_page_plan_v1(packet, subject_analyst_read, dossier_completion_read, review_actionability, subject_dossier_state, source_file_surface, case_report, source_file_classification) if subject_analyst_read and dossier_completion_read else {}
     if subject_analyst_read and dossier_completion_read:
         subject_analyst_read["dossierCompletionReadV1"] = dossier_completion_read
         if review_actionability:
@@ -5706,6 +5825,8 @@ def build_source_file_archive_payload(packet: dict[str, Any], *, environ: dict[s
             subject_analyst_read["subjectDossierStateV1"] = subject_dossier_state
         if source_file_surface:
             subject_analyst_read["sourceFileSurfaceV1"] = source_file_surface
+        if source_file_page_plan:
+            subject_analyst_read["sourceFilePagePlanV1"] = source_file_page_plan
         for key, target in (("publicReadyClaims", "publicSafeClaims"), ("draftIngredients", "publicSafeToUseNow"), ("sourceFileIngredients", "whatBnlHas")):
             merged = _case_list([*(subject_analyst_read.get(key) or []), *(dossier_completion_read.get(target) or [])], limit=12, item_limit=300)
             subject_analyst_read[key] = merged
@@ -5722,6 +5843,8 @@ def build_source_file_archive_payload(packet: dict[str, Any], *, environ: dict[s
             case_report["subjectDossierStateV1"] = subject_dossier_state
         if source_file_surface:
             case_report["sourceFileSurfaceV1"] = source_file_surface
+        if source_file_page_plan:
+            case_report["sourceFilePagePlanV1"] = source_file_page_plan
         if subject_analyst_read.get("internalRead"):
             case_report["caseSummary"] = _case_text(f"{case_report.get('caseSummary')} BNL analyst read: {subject_analyst_read.get('internalRead')}", 900)
         if subject_analyst_read.get("dossierWorthiness") or subject_analyst_read.get("dossierReadinessSummary"):
@@ -5756,6 +5879,7 @@ def build_source_file_archive_payload(packet: dict[str, Any], *, environ: dict[s
         "reviewActionabilityV1": review_actionability,
         "subjectDossierStateV1": subject_dossier_state,
         "sourceFileSurfaceV1": source_file_surface,
+        "sourceFilePagePlanV1": source_file_page_plan,
         "sourceFileClassificationV1": _sanitize_archive_value(source_file_classification),
         "subjectMemoryPacketV1": subject_memory_packet,
         "sourceFileCaseReportV1": case_report,

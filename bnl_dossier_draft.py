@@ -983,6 +983,20 @@ def generate_dossier_draft(packet: dict[str, Any], db_path: str | None = None, p
     review_actionability = _dict(packet.get("reviewActionabilityV1") or (analyst or {}).get("reviewActionabilityV1"))
     subject_dossier_state = _dict(packet.get("subjectDossierStateV1") or (analyst or {}).get("subjectDossierStateV1"))
     source_file_surface = _dict(packet.get("sourceFileSurfaceV1") or (analyst or {}).get("sourceFileSurfaceV1"))
+    source_file_page_plan = _dict(packet.get("sourceFilePagePlanV1") or (analyst or {}).get("sourceFilePagePlanV1"))
+    page_plan_owner_warnings: list[str] = []
+    if source_file_page_plan:
+        draft_plan = _dict(source_file_page_plan.get("draftPlan"))
+        for item in _strings(draft_plan.get("use"), max_items=10):
+            safe_items, rejected_items = _reject_unsafe_public([item])
+            for safe in safe_items:
+                if safe not in public_facts:
+                    public_facts.append(safe)
+            rejected_facts.extend(rejected_items)
+        for item in _strings(draft_plan.get("omit"), max_items=8):
+            rejected_facts.append(item)
+        for item in _strings(draft_plan.get("ownerReviewWarnings"), max_items=6):
+            page_plan_owner_warnings.append(item)
     if review_actionability:
         rejected_review_texts: list[str] = []
         for item in review_actionability.get("items") or []:
@@ -1048,13 +1062,17 @@ def generate_dossier_draft(packet: dict[str, Any], db_path: str | None = None, p
     if _dict(packet.get("identityAliasStatus")).get("needsConfirmation") is not False:
         missing.append("Confirm preferred public display name and what identity authority, if any, may be stated publicly.")
 
-    owner_warnings = _strings(packet.get("ownerReviewRules"), max_items=8) + _strings(packet.get("reviewOnlyWarnings"), max_items=8)
+    owner_warnings = _strings(packet.get("ownerReviewRules"), max_items=8) + _strings(packet.get("reviewOnlyWarnings"), max_items=8) + page_plan_owner_warnings
     owner_warnings.append("Owner Review must approve identity, role, category, links, and public wording before publication.")
     if subject_dossier_state:
         owner_warnings.append(f"Subject dossier state: {subject_dossier_state.get('state')} / {subject_dossier_state.get('recommendedNextAction')}.")
     if source_file_surface:
         primary = _dict(source_file_surface.get("primaryAction"))
-        owner_warnings.append(f"Source File surface primary action: {primary.get('label') or primary.get('actionKey')}.")
+        owner_warnings.append(f"Source File surface primary action: {primary.get('label') or primary.get('actionKey')}."
+        )
+    if source_file_page_plan:
+        primary = _dict(source_file_page_plan.get("primaryAction"))
+        owner_warnings.append(f"Source File page plan: {source_file_page_plan.get('pageMode')} / {primary.get('label') or primary.get('kind')}.")
     public_warnings = _strings(packet.get("sourceBoundaryRules"), max_items=8)
     public_warnings.append("Public fields use the Source File packet as the subject boundary plus approved public-safe BNL evidence.")
     if evidence:
