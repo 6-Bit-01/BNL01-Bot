@@ -1492,6 +1492,93 @@ class SourceFileEntityIntelligenceIntegrationTests(unittest.TestCase):
         self.assertTrue(blocker["blocksDraft"])
         self.assertTrue(blocker["blocksPublishing"])
 
+    def test_archive_emits_subject_dossier_state_and_compact_surface(self):
+        packet = {
+            "subject": "Signal Fox",
+            "sourceFile": {"id": "sf_signal", "name": "Signal Fox"},
+            "sections": {},
+            "subjectAnalystReadV1": {
+                "subjectName": "Signal Fox",
+                "publicSafeClaims": ["Signal Fox appears in public BARCODE community context.", "Signal Fox has public music-adjacent activity."],
+                "missingInfoQuestions": ["Is there an approved public link?", "What optional role/title may BNL use?"],
+                "readyForDraft": True,
+                "dossierBlockedBy": [],
+                "privateOrInternalExclusions": ["Keep queue submission detail internal."],
+                "sourceBlindInsights": ["Source-blind lore says Signal Fox is an archive creature."],
+            },
+        }
+        archive = enrich.build_source_file_archive_payload(packet)
+        state = archive["subjectDossierStateV1"]
+        surface = archive["sourceFileSurfaceV1"]
+        self.assertEqual(state["state"], "ready_for_cautious_draft")
+        self.assertTrue(state["hasEnoughForTruthfulDossier"])
+        self.assertTrue(state["canDraftNow"])
+        self.assertEqual(surface["primaryAction"]["actionKey"], "create_draft")
+        self.assertIn("subjectDossierStateV1", archive["sourceFileCaseReportV1"])
+        self.assertIn("sourceFileSurfaceV1", archive["subjectAnalystReadV1"])
+        surface_text = json.dumps(surface).lower()
+        self.assertNotIn("archive creature", surface_text)
+        self.assertNotIn("queue submission detail", surface_text)
+        self.assertNotIn("source-blind lore says", surface_text)
+
+    def test_subject_dossier_state_blocks_without_safe_public_identity(self):
+        packet = {
+            "subject": "Unknown",
+            "sourceFile": {"id": "sf_unknown", "name": "Unknown"},
+            "sections": {},
+            "subjectAnalystReadV1": {
+                "subjectName": "Unknown",
+                "publicSafeClaims": [],
+                "missingInfoQuestions": ["Confirm preferred public display name and identity boundary."],
+                "readyForDraft": False,
+                "dossierBlockedBy": ["Missing safe public identity/display name."],
+            },
+        }
+        archive = enrich.build_source_file_archive_payload(packet)
+        self.assertEqual(archive["subjectDossierStateV1"]["state"], "blocked")
+        self.assertEqual(archive["sourceFileSurfaceV1"]["primaryAction"]["actionKey"], "ask_owner")
+        questions = json.dumps(archive["sourceFileSurfaceV1"]["verificationPacketQuestions"]).lower()
+        self.assertIn("display name", questions)
+
+    def test_existing_public_dossier_prefers_update_surface(self):
+        packet = {
+            "subject": "Signal Fox",
+            "matchKind": "existing_dossier_update",
+            "sourceFile": {"id": "sf_signal", "name": "Signal Fox", "publicDossierId": "dos_1"},
+            "sections": {},
+            "subjectAnalystReadV1": {
+                "subjectName": "Signal Fox",
+                "publicSafeClaims": ["Signal Fox has a public BARCODE dossier-worthy update."],
+                "readyForDraft": True,
+                "dossierBlockedBy": [],
+            },
+        }
+        archive = enrich.build_source_file_archive_payload(packet)
+        self.assertEqual(archive["subjectDossierStateV1"]["state"], "update_existing_public_dossier")
+        self.assertEqual(archive["sourceFileSurfaceV1"]["primaryAction"]["actionKey"], "open_update_plan")
+        self.assertNotEqual(archive["sourceFileSurfaceV1"]["primaryAction"]["actionKey"], "create_draft")
+
+    def test_surface_questions_only_include_decision_unlocking_prompts(self):
+        packet = {
+            "subject": "Crow",
+            "sourceFile": {"id": "sf_crow", "name": "Crow"},
+            "sections": {},
+            "subjectAnalystReadV1": {
+                "subjectName": "Crow",
+                "publicSafeClaims": ["Crow is connected to public BARCODE community context."],
+                "readyForDraft": False,
+                "dossierBlockedBy": [],
+                "reviewableClaims": [
+                    {"id": "owner_wording", "claimText": "Confirm public wording for Crow relationship.", "claimType": "relationship", "reviewLane": "needs_confirmation", "publicSafe": False},
+                    {"id": "internal_queue", "claimText": "Crow queue submission note should stay private.", "claimType": "queue_submission", "reviewLane": "needs_confirmation", "publicSafe": False},
+                ],
+            },
+        }
+        archive = enrich.build_source_file_archive_payload(packet)
+        surface_q = json.dumps(archive["sourceFileSurfaceV1"]["verificationPacketQuestions"]).lower()
+        self.assertIn("relationship", surface_q)
+        self.assertNotIn("queue", surface_q)
+
     def test_compact_recommendation_payload_excludes_full_memory_packet_and_case_report(self):
         payload = {
             "subjectName": "Signal Fox",
