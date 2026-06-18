@@ -105,6 +105,26 @@ class DossierDraftGeneratorTests(unittest.TestCase):
         self.assertEqual(result["origin"], "UNVERIFIED")
         self.assertEqual(result["identityAuthority"], "mixed_or_unclear")
 
+    def test_source_file_classification_internal_and_rejected_tags_not_public_tags(self):
+        packet = pr217_packet(
+            publicSafeFacts=["Signal Fox is a public-safe music project."],
+            proposedTags=["moderator", "queue", "artist"],
+            sourceFileClassificationV1={
+                "version": "1.0",
+                "publicSafeTagCandidates": ["artist", "music"],
+                "internalTags": ["moderator", "queue"],
+                "rejectedTagCandidates": ["contest"],
+                "doNotPubliclyTagAs": ["moderator", "queue", "contest"],
+                "blockedPublicTags": [{"tag": "moderator", "reason": "internal only"}],
+            },
+        )
+        result = draft.generate_dossier_draft(packet)["draft"]
+        public_tags = set(result["tags"]) | set(result["proposedTags"])
+        self.assertNotIn("moderator", public_tags)
+        self.assertNotIn("queue", public_tags)
+        self.assertNotIn("contest", public_tags)
+        self.assertIn("artist", public_tags)
+
     def test_final_status_metadata_does_not_leak_and_returns_pending(self):
         packet = pr217_packet(
             candidate={

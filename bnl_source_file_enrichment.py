@@ -243,6 +243,56 @@ TOPIC_LABELS = {
     "unknown/no clear theme": "Unknown/no clear theme",
 }
 
+_CANONICAL_TAGS = {
+    "artist", "producer", "broadcaster", "moderator", "community-member",
+    "project", "collective", "event", "platform", "lore-entity",
+    "ai-persona", "music", "visual-art", "discord", "barcode-radio",
+    "queue", "contest", "collaboration", "internal-only", "source-blind",
+    "needs-public-proof", "owner-approved-wording-needed",
+    "identity-unconfirmed", "role-unconfirmed",
+}
+_PUBLIC_SAFE_ROLE_TAGS = {"artist", "producer", "broadcaster", "project", "collective", "event", "platform", "lore-entity", "ai-persona", "music", "visual-art", "discord", "barcode-radio", "contest", "collaboration"}
+_INTERNAL_ONLY_ROLE_TAGS = {"moderator", "community-member", "queue", "internal-only", "source-blind"}
+_CLASSIFICATION_SAFETY_RE = re.compile(r"\b(?:stripe|checkout|payment|paid|purchase|customer|cus_[A-Za-z0-9_]+|acct_[A-Za-z0-9_]+|token|secret|api[_-]?key|authorization|bearer|password|discord\s*id|user\s*id|\d{15,22}|[\w.+-]+@[\w.-]+\.[A-Za-z]{2,})\b", re.I)
+
+
+def _canon_tag(value: Any) -> str:
+    tag = re.sub(r"[^a-z0-9]+", "-", str(value or "").lower()).strip("-")
+    aliases = {"community": "community-member", "member": "community-member", "mod": "moderator", "radio": "barcode-radio", "broadcast": "barcode-radio", "lore": "lore-entity", "persona": "ai-persona", "submission": "queue"}
+    return aliases.get(tag, tag)
+
+
+def _class_safe_text(value: Any, limit: int = 220) -> str:
+    text = _safe_text(value, limit)
+    text = _EMAIL_RE.sub("[email redacted]", text)
+    text = _LONG_ID_RE.sub("[id redacted]", text)
+    text = re.sub(r"\b(?:cus|acct|pi|pm|sub|cs)_[A-Za-z0-9_]+\b", "[account redacted]", text)
+    text = re.sub(r"\b(?:token|secret|api[_-]?key|authorization|bearer|password)\b\s*[:=]?\s*\S+", "[secret redacted]", text, flags=re.I)
+    text = re.sub(r"\b(?:stripe|checkout|payment|paid|purchase|customer)\b", "private account", text, flags=re.I)
+    return _safe_text(text, limit)
+
+
+def _add_unique(items: list[str], value: Any) -> None:
+    tag = _canon_tag(value)
+    if tag in _CANONICAL_TAGS and tag not in items:
+        items.append(tag)
+
+
+def _classification_summary_for_analyst(classification: dict[str, Any]) -> dict[str, Any]:
+    if not classification:
+        return {}
+    return {
+        "version": classification.get("version") or "1.0",
+        "subjectType": classification.get("subjectType") or "unknown",
+        "publicDossierType": classification.get("publicDossierType") or "unknown",
+        "confidence": classification.get("confidence") or "low",
+        "publicSafeTagCandidates": list(classification.get("publicSafeTagCandidates") or [])[:8],
+        "needsReviewTagCandidates": list(classification.get("needsReviewTagCandidates") or [])[:8],
+        "routingTags": list(classification.get("routingTags") or [])[:8],
+        "sourceSafety": classification.get("sourceSafety") or "insufficient",
+        "classificationBlockedBy": list(classification.get("classificationBlockedBy") or [])[:6],
+    }
+
 _TOPIC_KEYWORDS = {
     "music submissions": ("submit", "submission", "song", "track", "beat", "demo", "queue"),
     "production": ("mix", "master", "produce", "producer", "fl studio", "ableton", "sample", "vocal"),
@@ -470,6 +520,168 @@ def classify_entity_activity(subject_identity: dict[str, Any] | None, evidence_b
         "engagementRead": _classification_plain_list(engagement_use, ENGAGEMENT_LABELS),
         "dossierRead": _format_dossier_read(dossier_use, primary_role),
         "relationshipRead": RELATIONSHIP_LABELS.get(relationship_use, relationship_use),
+    }
+
+
+def build_source_file_classification_v1(subject_identity: dict[str, Any] | None, evidence_bundle: dict[str, Any] | None, analyst_read: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Emit durable Source File classification/tag profile for site consumption.
+
+    The profile is admin/review metadata. It separates public-safe tag candidates
+    from internal-only/rejected/needs-review candidates and never promotes private
+    or source-blind evidence into public facts.
+    """
+
+    identity = subject_identity or {}
+    bundle = evidence_bundle or {}
+    legacy = bundle.get("classification") if isinstance(bundle.get("classification"), dict) else classify_entity_activity(identity, bundle)
+    sections = bundle.get("sections") if isinstance(bundle.get("sections"), dict) else {}
+    source_file = bundle.get("sourceFile") if isinstance(bundle.get("sourceFile"), dict) else {}
+    resolution = normalize_source_file_resolution_context(bundle if isinstance(bundle, dict) else {})
+    texts: list[str] = []
+    for key in ("candidateType", "sourceType", "type", "kind", "recommendedCategory", "knownFacts", "facts", "evidenceSummary", "summary", "publicSafetyNotes"):
+        if source_file.get(key) not in (None, "", [], {}):
+            texts.append(str(source_file.get(key)))
+    for key in ("Public-Safe Notes", "Known Facts", "History With BARCODE / BNL / Discord / BARCODE Radio", "Why This Subject Matters", "Do Not Say", "Missing Info"):
+        texts.extend(str(x) for x in (sections.get(key) or [])[:8])
+    if analyst_read:
+        for key in ("publicSafeClaims", "draftIngredients", "reviewNeededClaims", "sourceBlindInsights", "doNotSayPublicly", "strongestSignals"):
+            texts.extend(str(x) for x in (analyst_read.get(key) or [])[:5])
+    texts.extend(str(x) for x in bundle.get("publicSafeCandidates") or [])
+    texts.extend(str(x) for x in resolution.get("sourceFileResolvedFacts") or [])
+    hay = " ".join(texts).lower()
+
+    internal_tags: list[str] = []
+    public_tags: list[str] = []
+    needs_review: list[str] = []
+    rejected: list[str] = []
+    routing: list[str] = []
+    reasons: list[str] = []
+    evidence_signals: list[str] = []
+    blocked_public: list[dict[str, str]] = []
+    blocked_by: list[str] = []
+
+    def signal(text: str) -> None:
+        clean = _class_safe_text(text, 180)
+        if clean and not _CLASSIFICATION_SAFETY_RE.search(clean) and clean not in evidence_signals:
+            evidence_signals.append(clean)
+
+    def block(tag: str, reason: str) -> None:
+        tag = _canon_tag(tag)
+        if tag in _CANONICAL_TAGS:
+            if tag not in rejected:
+                rejected.append(tag)
+            if tag not in blocked_by:
+                blocked_by.append(tag)
+            rec = {"tag": tag, "reason": _class_safe_text(reason, 160)}
+            if rec not in blocked_public:
+                blocked_public.append(rec)
+
+    role_map = [
+        ("artist", r"\b(artist|musician|rapper|singer|dj|performer)\b"),
+        ("producer", r"\b(producer|production|produces|mix(?:es|ing)?|master(?:s|ing)?)\b"),
+        ("broadcaster", r"\b(broadcaster|host|show|episode|broadcast|barcode radio|radio)\b"),
+        ("moderator", r"\b(moderator|mod\b|staff role|admin role|team role)\b"),
+        ("community-member", r"\b(community member|community subject|participant|recurring community|discord community)\b"),
+        ("project", r"\b(project|collective|release|label)\b"),
+        ("event", r"\b(event|contest|challenge|tournament|showcase)\b"),
+        ("platform", r"\b(platform|discord|youtube|twitch|site)\b"),
+        ("lore-entity", r"\b(lore|entity|canon|character|persona|orion|null tv)\b"),
+        ("ai-persona", r"\b(ai persona|persona|bot persona)\b"),
+        ("music", r"\b(music|song|track|album|beat)\b"),
+        ("visual-art", r"\b(visual art|image|illustration|artwork)\b"),
+        ("discord", r"\b(discord|server|channel)\b"),
+        ("barcode-radio", r"\b(barcode radio|radio|broadcast)\b"),
+        ("queue", r"\b(queue|submission|submitted|submitter)\b"),
+        ("contest", r"\b(contest|challenge|competition|tournament)\b"),
+        ("collaboration", r"\b(collaboration|collaborator|featured|worked with)\b"),
+    ]
+    observed: list[str] = []
+    for tag, pattern in role_map:
+        if re.search(pattern, hay, re.I):
+            _add_unique(observed, tag)
+            signal(f"{tag.replace('-', ' ')} signal present in sanitized Source File context.")
+    for role in [legacy.get("primaryRole"), *(legacy.get("secondaryRoles") or [])]:
+        mapped = {"active_community_member": "community-member", "barcode_entity": "lore-entity", "submitter": "queue", "barcode_team": "internal-only"}.get(str(role), str(role))
+        _add_unique(observed, mapped)
+
+    public_hay = " ".join([*(sections.get("Public-Safe Notes") or []), *(bundle.get("publicSafeCandidates") or []), *(resolution.get("sourceFileResolvedFacts") or []), *((analyst_read or {}).get("publicSafeClaims") or []), *((analyst_read or {}).get("draftIngredients") or [])]).lower()
+    public_ok = bool(public_hay) and not re.search(r"\b(source[-_ ]blind|internal only|keep internal|not public|unconfirmed|needs confirmation|private)\b", public_hay, re.I)
+    has_source_blind = bool(re.search(r"\bsource[-_ ]blind\b", hay, re.I) or bundle.get("warningCounts", {}).get("source_blind_memory"))
+    if has_source_blind:
+        _add_unique(internal_tags, "source-blind"); _add_unique(routing, "source-blind")
+    if re.search(r"\b(queue|submission|submitted|moderator|staff role|team role|member status|confirmed_internal|internal only|keep internal)\b", hay, re.I):
+        _add_unique(internal_tags, "internal-only")
+
+    for key, tag in (("role_title", "role-unconfirmed"), ("identity_name", "identity-unconfirmed"), ("relationship_affiliation", "collaboration")):
+        if key in resolution.get("resolvedQuestionCategories", set()) and key not in resolution.get("publicSafeApprovedQuestionKeys", set()):
+            _add_unique(routing, tag)
+    for rec in resolution.get("resolvedByQuestionKey", {}).values():
+        decision = str(rec.get("decision") or "")
+        cat = str(rec.get("questionCategory") or "")
+        tag = "role-unconfirmed" if "role" in cat else "identity-unconfirmed" if "identity" in cat else "needs-public-proof"
+        if decision in {"rejected", "do_not_say", "boundary", "not_public", "unsafe_public"}:
+            block(tag, f"Workflow resolution marked {cat or 'claim'} as {decision}.")
+        elif decision in {"confirmed_internal", "internal", "internal_only", "keep_internal"}:
+            _add_unique(internal_tags, tag); block(tag, f"Workflow resolution keeps {cat or 'claim'} internal.")
+
+    for tag in observed:
+        if tag in _INTERNAL_ONLY_ROLE_TAGS:
+            _add_unique(internal_tags, tag)
+            if tag in {"moderator", "community-member", "queue"}:
+                block(tag, "Internal/admin context only unless public-safe evidence or owner-approved wording exists.")
+            continue
+        if tag in _PUBLIC_SAFE_ROLE_TAGS and public_ok and tag not in rejected:
+            _add_unique(public_tags, tag)
+        else:
+            _add_unique(needs_review, tag)
+            _add_unique(routing, "needs-public-proof")
+    if not public_tags and observed:
+        _add_unique(routing, "owner-approved-wording-needed")
+    if not observed:
+        _add_unique(routing, "needs-public-proof")
+        reasons.append("No durable public-safe role/category signal was available; classification remains unknown.")
+
+    primary_tags = public_tags[:6] or [t for t in observed if t not in rejected][:3]
+    secondary_tags = [t for t in observed if t not in primary_tags and t not in rejected][:8]
+    subject_type = "unknown"
+    for tag, st in (("artist", "artist"), ("producer", "producer"), ("broadcaster", "broadcaster"), ("moderator", "moderator"), ("community-member", "community_member"), ("project", "project"), ("event", "event"), ("platform", "platform"), ("lore-entity", "lore_entity")):
+        if tag in primary_tags or tag in public_tags or tag in internal_tags:
+            subject_type = st; break
+    public_type = "unknown"
+    if subject_type in {"artist", "producer", "broadcaster", "moderator", "community_member"}:
+        public_type = "person"
+    elif subject_type in {"project", "event", "platform"}:
+        public_type = subject_type
+    elif "collective" in public_tags:
+        public_type = "collective"
+    if internal_tags and not public_tags and not public_ok:
+        public_type = "internal_only"
+    source_safety = "public_safe" if public_tags and not internal_tags and not has_source_blind else "source_blind" if has_source_blind and not public_tags else "mixed" if public_tags and internal_tags else "internal_only" if internal_tags else "insufficient"
+    confidence = "high" if public_tags and public_ok and not needs_review and not blocked_public else "medium" if public_tags or (observed and not has_source_blind) else "low"
+    if public_ok:
+        reasons.append("Public-safe or owner-approved context supports the public tag candidates.")
+    if internal_tags:
+        reasons.append("Internal/admin-only signals were separated from public tag candidates.")
+    if blocked_public:
+        reasons.append("Workflow boundaries blocked corresponding public tags.")
+    return {
+        "version": "1.0",
+        "subjectType": subject_type,
+        "publicDossierType": public_type,
+        "confidence": confidence,
+        "primaryTags": primary_tags[:8],
+        "secondaryTags": secondary_tags[:8],
+        "internalTags": internal_tags[:10],
+        "doNotPubliclyTagAs": rejected[:10],
+        "routingTags": routing[:10],
+        "evidenceSignals": evidence_signals[:8],
+        "publicSafeTagCandidates": public_tags[:10],
+        "needsReviewTagCandidates": needs_review[:10],
+        "rejectedTagCandidates": rejected[:10],
+        "classificationReasons": reasons[:8],
+        "blockedPublicTags": blocked_public[:10],
+        "sourceSafety": source_safety,
+        "classificationBlockedBy": blocked_by[:10],
     }
 
 
@@ -1642,6 +1854,8 @@ def collect_source_enrichment_evidence(db_path: str, guild_id: int | None, subje
         "sourceCounts": dict(source_counts),
         "diagnostics": diagnostics,
         "sourceFile": sf_obj if lookup_result else {},
+        "sourceFileWorkflowContext": (sf_obj.get("sourceFileWorkflowContext") or sf_obj.get("workflowContext") or {}) if isinstance(sf_obj, dict) else {},
+        "resolvedQuestions": (sf_obj.get("resolvedQuestions") or sf_obj.get("sourceFileQuestionResolutions") or []) if isinstance(sf_obj, dict) else [],
         "matchKind": match_kind,
         "publicSafeCandidates": public_safe_candidates[:5],
         "channelActivity": {
@@ -1656,6 +1870,9 @@ def collect_source_enrichment_evidence(db_path: str, guild_id: int | None, subje
         },
     }
     classification = classify_entity_activity(safe_identity, classification_bundle)
+    classification_bundle["classification"] = classification
+    classification_bundle["warningCounts"] = dict(warning_counts)
+    source_file_classification = build_source_file_classification_v1(safe_identity, classification_bundle)
     diagnostics.update({
         "classificationPrimaryRole": classification["primaryRole"],
         "classificationActivityLevel": classification["activityLevel"],
@@ -1674,6 +1891,7 @@ def collect_source_enrichment_evidence(db_path: str, guild_id: int | None, subje
         "subjectIdentity": safe_identity,
         "diagnostics": diagnostics,
         "classification": classification,
+        "sourceFileClassificationV1": source_file_classification,
         "knownContext": list(entity_summary.get("knownContext") or [])[:6] if raw_provenance else [],
         "usefulEvidence": list(entity_summary.get("usefulEvidence") or [])[:6] if raw_provenance else [],
         "relationshipSignals": list(entity_summary.get("relationshipSignals") or [])[:4] if raw_provenance else [],
@@ -4917,6 +5135,9 @@ def build_source_file_archive_payload(packet: dict[str, Any], *, environ: dict[s
     subject_memory_packet = build_subject_memory_packet_v1(packet)
     case_report = build_source_file_case_report_v1(subject_memory_packet)
     subject_analyst_read = build_source_file_subject_analyst_read_v1(packet, (environ or {}).get("BNL_DB_PATH") or packet.get("dbPath") or "")
+    source_file_classification = packet.get("sourceFileClassificationV1") if isinstance(packet.get("sourceFileClassificationV1"), dict) else {}
+    if subject_analyst_read and source_file_classification:
+        subject_analyst_read["sourceFileClassificationSummaryV1"] = _classification_summary_for_analyst(source_file_classification)
     if subject_analyst_read:
         case_report["subjectAnalystReadV1"] = subject_analyst_read
         if subject_analyst_read.get("internalRead"):
@@ -4940,6 +5161,7 @@ def build_source_file_archive_payload(packet: dict[str, Any], *, environ: dict[s
         "evidenceReceiptSummary": _sanitize_archive_value(receipt),
         "sourceFileBriefV2": _sanitize_archive_value(build_source_file_brief_v2(packet, archive_id=packet.get("archiveId") or "")),
         "subjectAnalystReadV1": subject_analyst_read,
+        "sourceFileClassificationV1": _sanitize_archive_value(source_file_classification),
         "subjectMemoryPacketV1": subject_memory_packet,
         "sourceFileCaseReportV1": case_report,
         "adminSummary": admin_summary,
@@ -4979,6 +5201,7 @@ def build_enrichment_recommendation_payload(packet: dict[str, Any], *, environ: 
         "sourceCoverage": list(packet.get("sourceCoverage") or []),
         "identityDiagnostics": dict(packet.get("diagnostics") or {}),
         "internalClassification": dict(packet.get("classification") or {}),
+        "sourceFileClassificationV1": dict(packet.get("sourceFileClassificationV1") or {}),
         "knownContext": list(packet.get("knownContext") or []),
         "usefulEvidence": list(packet.get("usefulEvidence") or packet.get("evidenceDetails") or []),
         "relationshipSignals": list(packet.get("relationshipSignals") or []),
@@ -5172,6 +5395,7 @@ def run_source_file_enrichment(
         "subjectIdentity": evidence.get("subjectIdentity") or {},
         "diagnostics": evidence.get("diagnostics") or {},
         "classification": evidence.get("classification") or {},
+        "sourceFileClassificationV1": evidence.get("sourceFileClassificationV1") or {},
         "sourceTypesChecked": (evidence.get("diagnostics") or {}).get("sourceTypesChecked", {}),
         "sourceTypesSkipped": (evidence.get("diagnostics") or {}).get("sourceTypesSkipped", {}),
         "runTime": datetime.now(timezone.utc).isoformat(),
@@ -5181,6 +5405,8 @@ def run_source_file_enrichment(
         "resolvedSubjectMemoryV1": resolved_subject_memory,
         "subjectAnalystReadV1": subject_analyst_read,
     }
+    if packet["sourceFileClassificationV1"] and packet["subjectAnalystReadV1"]:
+        packet["subjectAnalystReadV1"]["sourceFileClassificationSummaryV1"] = _classification_summary_for_analyst(packet["sourceFileClassificationV1"])
     _copy_evidence_fields(packet, evidence)
     packet["subjectIntelligenceDiagnostics"] = evidence.get("subjectIntelligenceDiagnostics") or {}
     packet["linkSignalDiagnostics"] = evidence.get("linkSignalDiagnostics") or {}
