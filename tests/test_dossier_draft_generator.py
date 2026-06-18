@@ -806,3 +806,40 @@ class DossierDraftSourceFilePagePlanTests(unittest.TestCase):
         self.assertIn("Source File page plan says drafting is not recommended yet.", result["missingInfoQuestions"])
         self.assertTrue(any("page plan warning" in x.lower() for x in result["ownerReviewWarnings"]))
         self.assertTrue(any("Private queue note" in x for x in result["unsupportedClaimsRejected"]))
+
+    def test_page_plan_material_informs_role_and_thin_check_before_missing_info(self):
+        packet = pr217_packet(
+            publicSafeFacts=[],
+            publicSafeNotes=[],
+            missingInfo=[],
+            safeClassification={"category": "Unknown", "kind": "Unknown", "ecosystemLane": "Unknown"},
+            sourceFilePagePlanV1={
+                "publicSafeMaterial": [
+                    {"material": "Signal Fox is publicly described as a community moderator for BARCODE events.", "confidence": "high", "needsApproval": True},
+                ],
+                "draftOrUpdatePlan": {
+                    "canDraft": True,
+                    "useTheseMaterials": ["Signal Fox has public BARCODE community moderator context."],
+                    "omitTheseMaterials": ["Private DJ set note"],
+                    "ownerReviewWarnings": ["Owner Review must approve the page-plan wording."],
+                },
+                "internalOmitHold": {
+                    "keepInternal": [{"material": "Internal source-blind music artist diagnostic"}],
+                    "omitFromPublicDraft": [{"material": "Private DJ set note"}],
+                },
+                "diagnosticsSummary": {
+                    "safetyNotes": ["Diagnostics say music artist but must not become public copy."],
+                },
+                "dossierWorthItDecision": {"decision": "worth_drafting_now", "draftReadiness": "ready"},
+            },
+        )
+        result = draft.generate_dossier_draft(packet)["draft"]
+        public = " ".join(str(result[k]) for k in PUBLIC_FIELD_KEYS)
+        self.assertEqual(result["role"], "Community moderator")
+        self.assertNotIn("Review pending", result["role"])
+        self.assertFalse(any("more public-safe facts" in q.lower() for q in result["missingInfoQuestions"]))
+        self.assertNotIn("DJ", public)
+        self.assertNotIn("source-blind music artist", public.lower())
+        self.assertNotIn("diagnostics say music artist", public.lower())
+        self.assertTrue(any("page-plan wording" in x for x in result["ownerReviewWarnings"]))
+        self.assertTrue(any("Private DJ set note" in x for x in result["unsupportedClaimsRejected"]))
