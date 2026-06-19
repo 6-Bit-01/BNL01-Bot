@@ -1676,6 +1676,52 @@ class SourceFilePagePlanV1Tests(unittest.TestCase):
         self.assertEqual(plan["whatBnlNeeds"][0]["requiredOrOptional"], "not_needed")
         self.assertEqual(plan["whatBnlNeeds"][0]["suggestedControl"]["kind"], "none")
         self.assertEqual(plan["publicSafeMaterial"][0]["confidence"], "none")
-        self.assertEqual(plan["questionsToAsk"][0]["requiredOrOptional"], "not_needed")
+        self.assertEqual(plan["questionsToAsk"][0]["audience"], "owner")
+        self.assertTrue(plan["questionsToAsk"][0]["question"].endswith("?"))
         self.assertFalse(plan["draftOrUpdatePlan"]["canDraft"])
         self.assertEqual(plan["draftOrUpdatePlan"]["draftType"], "none_yet")
+
+    def test_page_plan_questions_are_human_dossier_questions_not_assessment_notes(self):
+        packet = {
+            "subject": "Crow",
+            "matchKind": "candidate_intake",
+            "runTime": "2026-06-18T00:00:00Z",
+            "sourceFile": {"id": "sf_crow", "name": "Crow"},
+            "sections": {},
+            "subjectAnalystReadV1": {
+                "subjectName": "Crow",
+                "currentRead": "Music discussion, generic links, contest/event adjacency, Orion/project context, and private boundaries need separation.",
+                "publicSafeClaims": ["Crow has public music discussion and possible approved links."],
+                "missingInfoQuestions": [
+                    "Which Crow links are owned or approved for public reference?",
+                    "Is music, artist, or collaboration context approved?",
+                    "Was Crow actually involved in the contest/event context?",
+                ],
+                "dossierBlockedBy": ["Owner-approved public display name is missing."],
+                "privateOrInternalExclusions": [
+                    "Excluded 204 protected/private memory item(s)",
+                    "Source-blind Orion/context evidence exists",
+                    "Do not state artist/music role, queue/submission history, or relationships unless confirmed public-safe evidence supports that exact claim.",
+                ],
+                "reviewableClaims": [
+                    {"id": "count", "claimText": "Music discussion only: 40", "publicSafe": False},
+                    {"id": "warning", "claimText": "Do not state artist/music role unless confirmed.", "publicSafe": False},
+                    {"id": "contest", "claimText": "Possible contest/event connection.", "claimType": "contest", "publicSafe": False},
+                ],
+            },
+        }
+        plan = enrich.build_source_file_archive_payload(packet)["sourceFilePagePlanV1"]
+        questions = plan["questionsToAsk"]
+        questions_text = json.dumps(questions).lower()
+        self.assertLessEqual(len(questions), 8)
+        self.assertIn("owner", {q["audience"] for q in questions})
+        self.assertIn("admin", {q["audience"] for q in questions})
+        self.assertTrue(all(q["question"].endswith("?") for q in questions))
+        self.assertTrue(all(q["whatAnswerWouldUnlock"].lower() not in {"false", "none", "unknown", "safer omission", "draft readiness"} for q in questions))
+        self.assertNotIn("this question is included because it can unlock a safer dossier decision", questions_text)
+        self.assertNotIn("music discussion only: 40", questions_text)
+        self.assertNotIn("excluded 204", questions_text)
+        self.assertNotIn("source-blind", questions_text)
+        self.assertNotIn("do not state", questions_text)
+        self.assertIn("public-safe", json.dumps(plan["publicSafeMaterial"]).lower())
+        self.assertIn("internal/review-only material withheld", json.dumps(plan["internalOmitHold"]).lower())

@@ -5661,6 +5661,117 @@ def build_source_file_surface_v1(subject_state: dict[str, Any], review_actionabi
     })
 
 
+
+_DOSSIER_QUESTION_FALLBACK_WHY = {
+    "owner": "BNL needs owner-approved wording before using this publicly.",
+    "admin": "BNL needs an admin decision before this can shape the dossier.",
+    "public-source": "BNL needs a public source before using this as public dossier evidence.",
+    "general": "BNL needs this answered before deciding whether the dossier is solid.",
+}
+
+_INVALID_DOSSIER_QUESTION_PATTERNS = (
+    r"^\s*(music discussion only|song/track/demo|generic links|collaboration offers|excluded \d+|unlocks:)\b",
+    r"\b(source-blind|internal context exists|protected/private memory|raw evidence|diagnostics?|audit warning)\b",
+    r"^\s*do not state\b",
+    r"^\s*(false|none|unknown)\s*$",
+    r"this question is included because it can unlock a safer dossier decision",
+)
+
+def _valid_dossier_question_text(text: str) -> bool:
+    text = _case_text(text, 300).strip()
+    if not text or not text.endswith("?"):
+        return False
+    if any(re.search(pattern, text, re.I) for pattern in _INVALID_DOSSIER_QUESTION_PATTERNS):
+        return False
+    if re.search(r"\b\d+\s*$", text) and not re.search(r"\?\s*$", text):
+        return False
+    return True
+
+def _dossier_question_unlock(value: str, audience: str) -> str:
+    value = _case_text(value, 160).strip().rstrip(".")
+    bad = {"false", "none", "unknown", "safer omission", "draft readiness", "owner/admin-approved public wording, a safer omission, or draft readiness"}
+    if not value or value.lower() in bad:
+        if audience == "public-source":
+            return "Public-source-backed dossier evidence"
+        if audience == "owner":
+            return "Owner-approved public wording"
+        if audience == "admin":
+            return "Correct dossier role, category, or omission decision"
+        return "A clear dossier-build decision"
+    return value
+
+def build_dossier_verification_questions(
+    *,
+    subject: str,
+    required: list[str] | None = None,
+    optional: list[str] | None = None,
+    public_items: list[str] | None = None,
+    internal_items: list[str] | None = None,
+    omit_items: list[str] | None = None,
+    review_actionability: dict[str, Any] | None = None,
+    dossier_completion_read: dict[str, Any] | None = None,
+    subject_dossier_state: dict[str, Any] | None = None,
+    max_questions: int = 8,
+) -> list[dict[str, Any]]:
+    """Build concise human dossier-verification questions, not assessment notes.
+
+    The builder runs after assessment has separated public-safe/internal material. It
+    only emits BNL-authored questions that ask a human for confirmation, wording,
+    sources, or a dossier decision. Counts, warnings, diagnostics, and raw
+    source-blind/internal evidence stay in the page-plan assessment sections.
+    """
+
+    subject = _case_text(subject or "this subject", 120)
+    required = required or []
+    optional = optional or []
+    public_items = public_items or []
+    internal_items = internal_items or []
+    omit_items = omit_items or []
+    review_actionability = review_actionability or {}
+    dossier_completion_read = dossier_completion_read or {}
+    subject_dossier_state = subject_dossier_state or {}
+    combined = " ".join(_case_list([*required, *optional, *public_items, *internal_items, *omit_items, dossier_completion_read.get("likelyDossierAngle"), subject_dossier_state.get("dossierAngle")], limit=80, item_limit=220)).lower()
+    review_text = " ".join(_case_list([i.get("claimText") or i.get("question") or i.get("recommendedAction") for i in (review_actionability.get("items") or []) if isinstance(i, dict)], limit=40, item_limit=220)).lower()
+    all_text = f"{combined} {review_text}"
+    questions: list[dict[str, Any]] = []
+    seen: set[str] = set()
+
+    def add(slug: str, question: str, audience: str, why: str, unlock: str, required_or_optional: str = "required", control_kind: str | None = None) -> None:
+        if len(questions) >= max_questions or slug in seen or not _valid_dossier_question_text(question):
+            return
+        audience_norm = audience if audience in _DOSSIER_QUESTION_FALLBACK_WHY else "general"
+        seen.add(slug)
+        item = {
+            "id": f"question-{len(questions) + 1}-{_subject_key(slug)[:42]}",
+            "question": _case_text(question, 260),
+            "audience": audience_norm,
+            "whyBnlIsAsking": _case_text(why or _DOSSIER_QUESTION_FALLBACK_WHY[audience_norm], 260),
+            "whatAnswerWouldUnlock": _dossier_question_unlock(unlock, audience_norm),
+            "requiredOrOptional": "required" if required_or_optional == "required" else "optional",
+        }
+        if control_kind:
+            item["suggestedControl"] = _page_plan_control(control_kind, control_kind.replace("_", " ").title(), question)
+        questions.append(item)
+
+    identity_unclear = bool(required) or re.search(r"\b(name|identity|display|owner-approved)\b", all_text) or not public_items
+    if identity_unclear:
+        add("display-name", f"What public name should BNL use for {subject}?", "owner", "BNL needs one approved display name before writing public dossier copy.", "Public-safe subject naming", "required", "ask_owner")
+    add("public-role", f"What public role should BNL assign {subject} right now: community participant, artist, collaborator, organizer, or something else?", "admin", "BNL needs the correct public lane before deciding whether this becomes a dossier.", "Correct dossier role and category", "required" if re.search(r"\b(role|title|artist|organizer|collaborator|community)\b", all_text) else "optional", "ask_admin")
+    if re.search(r"\b(link|url|profile|social|owned|approved)\b", all_text):
+        add("approved-links", f"Which {subject} links are owned or approved for public reference?", "owner", "BNL should not attach music, social, or profile links unless they are confirmed.", "Safe public links section", "required", "ask_owner")
+    if re.search(r"\b(music|artist|song|track|demo|wip|collab|collaboration)\b", all_text):
+        add("music-collab", f"Is there any music, artist, or collaboration context {subject} is comfortable with BNL mentioning publicly?", "owner", "BNL has creative-context signal, but needs approval before treating it as public identity.", "Public-safe role and creative-context wording", "optional", "ask_owner")
+    if re.search(r"\b(contest|event|submission|submitted|queue)\b", all_text):
+        add("event-context", f"Was {subject} actually involved in the contest, event, queue, or submission context, or only mentioned near it?", "admin", "BNL should not imply participation, hosting, queue history, or submission without confirmation.", "Event-context wording or omission", "required", "ask_admin")
+    if re.search(r"\b(orion|ai|persona|project|lore)\b", all_text):
+        label = "Orion or AI/persona/project context" if "orion" in all_text else "AI/persona/project context"
+        add("ai-persona-project", f"Can {label} be mentioned publicly in relation to {subject}, and if so, what is the safe wording?", "admin", "BNL needs a public-safe boundary before using protected or contextual signal.", "Public-safe AI/persona context wording or internal-only handling", "optional", "ask_admin")
+    if internal_items or omit_items or re.search(r"\b(protected|private|internal|source-blind|do not state|omit)\b", all_text):
+        add("protected-boundary", f"Should protected {subject} context stay internal, or is there approved public wording BNL can use?", "admin", "BNL needs to separate useful internal understanding from public dossier copy.", "Public-safe summary or explicit omission", "required", "ask_admin")
+    if re.search(r"\b(public source|source needed|needs source|evidence)\b", all_text):
+        add("public-source", f"What public source can BNL cite before using this claim about {subject}?", "public-source", "BNL needs a public source before using this as public dossier evidence.", "Public-source-backed dossier evidence", "required", "approve_public_copy")
+    return questions[:max_questions]
+
 def _page_plan_control(kind: str, label: str, question: str = "", enabled: bool = True) -> dict[str, Any]:
     return {"kind": kind, "label": _case_text(label, 120), "questionToCopy": _case_text(question, 260), "enabled": bool(enabled)}
 
@@ -5746,14 +5857,18 @@ def build_source_file_page_plan_v1(packet: dict[str, Any], analyst: dict[str, An
         guidance.append({"id": _case_text(item.get("id") or _page_plan_item_id("review", text, idx), 120), "reviewIssue": text, "bnlDecision": decision, "bnlExplanation": _case_text(item.get("reason") or item.get("recommendedAction") or "BNL absorbed this review item into the page plan without treating it as public copy.", 320), "recommendedDefault": default, "stillActive": item.get("id") in set(review_actionability.get("activeReviewItemIds") or []), "neededToFinish": decision in {"ask_owner", "ask_admin", "blocks_draft"}, "suggestedControl": _page_plan_control(control, control.replace("_", " ").title() if control != "none" else "No control needed", item.get("question") or text, control != "none"), "sourceReviewRefs": [_case_text(item.get("id"), 120)] if item.get("id") else []})
     if not guidance:
         guidance.append({"id": "review-1-none", "reviewIssue": "No review-card issue is active right now.", "bnlDecision": "already_resolved", "bnlExplanation": "BNL does not have old review cards or claim decisions that require a separate action.", "recommendedDefault": "ignore", "stillActive": False, "neededToFinish": False, "suggestedControl": _page_plan_control("none", "No control needed", "", False), "sourceReviewRefs": []})
-    questions = []
-    for idx, q in enumerate((review_actionability.get("verificationPacketQuestions") or [])[:12]):
-        if isinstance(q, dict) and q.get("question"):
-            text = _case_text(q.get("question"), 260)
-            aud = "owner" if re.search(r"owner|identity|wording", text, re.I) else "admin"
-            questions.append({"id": _case_text(q.get("id") or _page_plan_item_id("question", text, idx), 120), "question": text, "audience": aud, "whyBnlIsAsking": "This question is included because it can unlock a safer dossier decision.", "whatAnswerWouldUnlock": "Owner/admin-approved public wording, a safer omission, or draft readiness.", "requiredOrOptional": "required"})
-    if not questions:
-        questions.append({"id": "question-1-not-needed", "question": "BNL does not have any decision-unlocking questions right now.", "audience": "internal_operator", "whyBnlIsAsking": "No outside answer is needed for the current Source File state.", "whatAnswerWouldUnlock": "Nothing is currently blocked by a question.", "requiredOrOptional": "not_needed"})
+    questions = build_dossier_verification_questions(
+        subject=subject,
+        required=required,
+        optional=optional,
+        public_items=public_items,
+        internal_items=internal_items,
+        omit_items=omit_items,
+        review_actionability=review_actionability,
+        dossier_completion_read=dossier_completion_read,
+        subject_dossier_state=subject_dossier_state,
+        max_questions=8,
+    )
     can_draft = bool(subject_dossier_state.get("canDraftNow") or subject_dossier_state.get("hasEnoughForTruthfulDossier")) and public_items and state not in {"blocked", "internal_only", "needs_owner_wording", "needs_admin_confirmation"}
     decision = "update_existing_dossier" if state == "update_existing_public_dossier" else ("worth_drafting_now" if can_draft else ("blocked" if state == "blocked" else ("internal_only" if state == "internal_only" else "not_worth_it_yet")))
     keep_internal = [{"id": _page_plan_item_id("internal", x, i), "material": "Internal/review-only material withheld from public copy.", "whyInternal": _case_text(x or "This material is not public-safe dossier copy.", 260), "couldBecomePublicLater": True, "whatWouldMakeItUsable": "Owner-approved/public evidence would be required before any public use."} for i, x in enumerate(internal_items)]
