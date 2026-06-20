@@ -47,6 +47,15 @@ _PUBLIC_NOTE_META_RE = re.compile(
     re.I,
 )
 _SOURCE_USAGE_FORBIDDEN_RE = re.compile(r"\b(private|source[-_\s]*blind|review-only|review\s+only|internal|admin-only|admin\s+only|payment|priority|stripe|checkout|customer)\b", re.I)
+_NON_PUBLIC_COPY_RE = re.compile(
+    r"\b("
+    r"recurring\s+named\s+topic|may\s+inform\s+public[-\s]*safe\s+wording|topic\s+bucket|named\s+topic|"
+    r"generic\s+evidence\s+counts?|source[-\s]*blind|review[-\s]*only|admin[-\s]*only|"
+    r"clean\s+public\s+summary\s+needed|clean\s+role\s+needed|needs?\s+review\s+before\s+claiming|"
+    r"admin[-\s]*only\s+evidence\s+exists|placeholder[-\s]*like"
+    r")\b",
+    re.I,
+)
 _ROLE_LIMIT = 80
 _SUMMARY_LIMIT = 700
 _NOTES_LIMIT = 900
@@ -59,6 +68,11 @@ _ROLE_OR_TAXONOMY_LABELS = {
     "sponsor", "system", "interface", "production", "radio", "producer", "ai", "human", "hybrid",
     "unknown", "public", "internal", "restricted", "active", "pending", "person", "music",
     "tech", "systems", "broadcast", "participant", "dossier", "source", "source file",
+}
+_VALID_CLASSIFICATION_VALUES = {
+    "category": {"Unknown", "Artist", "Community", "Collaborator", "Sponsor", "System", "Entity", "Person", "Organization", "Project"},
+    "kind": {"Unknown", "Person", "Entity", "Organization", "Project", "Group", "System", "Collaborator"},
+    "ecosystemLane": {"Unknown", "Music", "BARCODE", "Community", "Tech", "Production", "Sponsor", "Systems"},
 }
 
 
@@ -142,6 +156,8 @@ def _unsafe_reasons(text: str) -> list[str]:
         reasons.append("internal alias material")
     if _FINAL_RE.search(text):
         reasons.append("final/published status wording")
+    if _NON_PUBLIC_COPY_RE.search(text):
+        reasons.append("topic-only or review-only material")
     return reasons
 
 
@@ -700,7 +716,40 @@ def build_public_dossier_draft_evidence(packet: dict[str, Any], db_path: str | N
 
 
 def _classification_value(safe_classification: dict[str, Any], key: str, default: str) -> str:
-    return _text(safe_classification.get(key), 120) or default
+    value = _text(safe_classification.get(key), 120) or default
+    allowed = _VALID_CLASSIFICATION_VALUES.get(key)
+    if allowed and value not in allowed:
+        return default
+    return value
+
+
+def _conservative_classification(packet: dict[str, Any], owner_warnings: list[str] | None = None) -> dict[str, str]:
+    safe = _dict(packet.get("safeClassification"))
+    source = _dict(packet.get("sourceFileClassificationV1"))
+    out = {
+        key: _classification_value(safe, key, "Unknown")
+        for key in ("category", "kind", "ecosystemLane")
+    }
+    source_out = {
+        key: _classification_value(source, key, "Unknown")
+        for key in ("category", "kind", "ecosystemLane")
+    }
+    for key in ("category", "kind", "ecosystemLane"):
+        raw_safe = _text(safe.get(key), 120)
+        raw_source = _text(source.get(key), 120)
+        if owner_warnings is not None and raw_safe and raw_safe != out[key]:
+            owner_warnings.append(f"Invalid safeClassification {key} value was treated as Unknown for public draft safety.")
+        if owner_warnings is not None and raw_source and raw_source != source_out[key]:
+            owner_warnings.append(f"Invalid sourceFileClassificationV1 {key} value was treated as Unknown for public draft safety.")
+        if raw_source and source_out[key] == "Unknown":
+            if raw_source and raw_safe and raw_source != raw_safe and owner_warnings is not None:
+                owner_warnings.append(f"Source File classification conflicts with safeClassification for {key}; used the more conservative value.")
+            out[key] = "Unknown"
+        elif raw_source and out[key] != "Unknown" and source_out[key] != out[key]:
+            out[key] = "Unknown"
+            if owner_warnings is not None:
+                owner_warnings.append(f"Source File classification conflicts with safeClassification for {key}; used the more conservative value.")
+    return out
 
 
 def _identity_authority(packet: dict[str, Any], safe_classification: dict[str, Any]) -> str:
@@ -877,9 +926,12 @@ def _tag_candidates(category: str, kind: str, lane: str, facts: list[str], notes
         for item in _as_list(source_classification.get("blockedPublicTags"))
         if isinstance(item, dict)
     )
+    supported_tag_text = haystack
     for tag in _strings(packet.get("proposedTags"), limit_each=60, max_items=10):
         normalized = tag.lower().replace(" ", "-")
         if normalized in blocked_classification_tags:
+            continue
+        if normalized in {"artist", "community", "member", "mod", "moderator"} and normalized not in supported_tag_text:
             continue
         if not _unsafe_reasons(normalized) and normalized not in candidates:
             candidates.append(normalized)
@@ -928,7 +980,9 @@ def generate_dossier_draft(packet: dict[str, Any], db_path: str | None = None, p
     safe_classification = _dict(packet.get("safeClassification"))
     style_packet = _dict(packet.get("stylePacket"))
     name = _candidate_name(candidate)
-    category, kind, lane = _category_kind_lane(safe_classification)
+    classification_warnings: list[str] = []
+    conservative_classification = _conservative_classification(packet, classification_warnings)
+    category, kind, lane = _category_kind_lane(conservative_classification)
     public_facts, rejected_facts = _reject_unsafe_public(_strings(packet.get("publicSafeFacts"), max_items=16))
     raw_public_notes = _strings(packet.get("publicSafeNotes"), max_items=12)
     public_notes, rejected_notes = _reject_unsafe_public(raw_public_notes)
@@ -987,6 +1041,8 @@ def generate_dossier_draft(packet: dict[str, Any], db_path: str | None = None, p
     page_plan_draft_plan = _dict(source_file_page_plan.get("draftOrUpdatePlan")) if source_file_page_plan else {}
     page_plan_public_material_added = False
     if source_file_page_plan:
+        public_facts = []
+        public_notes = []
         page_plan_public_candidates = _strings(page_plan_draft_plan.get("useTheseMaterials"), max_items=8)
         for material in source_file_page_plan.get("publicSafeMaterial") or []:
             if not isinstance(material, dict):
@@ -1030,20 +1086,25 @@ def generate_dossier_draft(packet: dict[str, Any], db_path: str | None = None, p
             rejected_facts.extend(rejected_review_texts[:6])
     if subject_dossier_state:
         for item in _strings(subject_dossier_state.get("publicSafeToUseNow"), max_items=5):
-            if item not in public_facts:
-                public_facts.append(item)
+            safe_items, unsafe_items = _reject_unsafe_public([item])
+            for safe in safe_items:
+                if not source_file_page_plan and safe not in public_facts:
+                    public_facts.append(safe)
+            rejected_facts.extend(unsafe_items)
         for item in _strings(subject_dossier_state.get("keepInternal"), max_items=4) + _strings(subject_dossier_state.get("omitForNow"), max_items=4):
             if item:
                 rejected_facts.append(item)
     role = _role_from_context(public_facts, public_notes, category, kind, lane)[:_ROLE_LIMIT]
     if analyst:
         analyst_public = " ".join(_strings(analyst.get("draftIngredients"), max_items=9) + _strings(analyst.get("publicSafeClaims"), max_items=6)).lower()
-        if re.search(r"\b(music|artist|musician|track|song|album|producer|dj)\b", analyst_public):
+        if not source_file_page_plan and re.search(r"\b(music|artist|musician|track|song|album|producer|dj)\b", analyst_public):
             role = "Music artist"
         elif analyst.get("likelySubjectType") == "community_participant" and analyst.get("publicDraftPosture") in {"confident", "conservative"}:
             role = "Community participant"
         elif analyst.get("confidence") == "low" and role == "Review pending":
             role = "Dossier subject"
+    if role == "Review pending" or (source_file_page_plan and not page_plan_public_material_added):
+        role = "Dossier subject"
     thin = len(public_facts) + len(public_notes) < 2 and not page_plan_public_material_added
 
     missing = _strings(packet.get("missingInfo"), max_items=8)
@@ -1077,6 +1138,7 @@ def generate_dossier_draft(packet: dict[str, Any], db_path: str | None = None, p
         missing.append("Confirm preferred public display name and what identity authority, if any, may be stated publicly.")
 
     owner_warnings = _strings(packet.get("ownerReviewRules"), max_items=8) + _strings(packet.get("reviewOnlyWarnings"), max_items=8)
+    owner_warnings.extend(classification_warnings)
     owner_warnings.append("Owner Review must approve identity, role, category, links, and public wording before publication.")
     if source_file_page_plan:
         for item in _strings(page_plan_draft_plan.get("ownerReviewWarnings"), max_items=8):
