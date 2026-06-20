@@ -843,3 +843,80 @@ class DossierDraftSourceFilePagePlanTests(unittest.TestCase):
         self.assertNotIn("diagnostics say music artist", public.lower())
         self.assertTrue(any("page-plan wording" in x for x in result["ownerReviewWarnings"]))
         self.assertTrue(any("Private DJ set note" in x for x in result["unsupportedClaimsRejected"]))
+
+class DossierDraftPagePlanGroundingTests(unittest.TestCase):
+    def test_topic_only_page_plan_does_not_become_public_copy(self):
+        topic_line = "Recurring named topic: Bit’s may inform public-safe wording only after owner and admin review."
+        packet = pr217_packet(
+            publicSafeFacts=[],
+            publicSafeNotes=[],
+            proposedTags=["artist", "community", "member", "mod"],
+            safeClassification={"category": "Unknown", "kind": "Person", "ecosystemLane": "Unknown"},
+            sourceFileClassificationV1={"category": "Unknown", "kind": "Person", "ecosystemLane": "Unknown"},
+            sourceFilePagePlanV1={
+                "publicSafeMaterial": [{"material": topic_line, "confidence": "low"}],
+                "draftOrUpdatePlan": {
+                    "canDraft": False,
+                    "useTheseMaterials": [topic_line, "clean public summary needed", "clean role needed"],
+                    "omitTheseMaterials": ["admin-only evidence exists"],
+                    "ownerReviewWarnings": ["needs review before claiming"],
+                },
+                "dossierWorthItDecision": {"decision": "not_worth_it_yet", "draftReadiness": "not_ready"},
+            },
+        )
+        result = draft.generate_dossier_draft(packet)["draft"]
+        public = " ".join(str(result[k]) for k in ("role", "summary", "notes", "tags", "proposedTags"))
+        self.assertNotIn("Recurring named topic", public)
+        self.assertNotIn("may inform public-safe wording", public)
+        self.assertNotEqual(result["role"], "Music artist")
+        self.assertEqual(result["role"], "Dossier subject")
+        self.assertFalse({"artist", "community", "member", "mod"} & (set(result["tags"]) | set(result["proposedTags"])))
+        review_text = " ".join(result["ownerReviewWarnings"] + result["unsupportedClaimsRejected"])
+        self.assertIn("topic-only or review-only material", review_text)
+
+    def test_page_plan_public_safe_material_drives_draft(self):
+        packet = pr217_packet(
+            publicSafeFacts=[],
+            publicSafeNotes=[],
+            safeClassification={"category": "Community", "kind": "Person", "ecosystemLane": "BARCODE"},
+            sourceFileClassificationV1={"category": "Community", "kind": "Person", "ecosystemLane": "BARCODE"},
+            sourceFilePagePlanV1={
+                "publicSafeMaterial": [
+                    {"material": "Crow is publicly documented as a BARCODE community moderator for event discussions.", "confidence": "high"}
+                ],
+                "draftOrUpdatePlan": {
+                    "canDraft": True,
+                    "useTheseMaterials": ["Crow helps moderate public BARCODE community event discussions."],
+                    "ownerReviewWarnings": ["Owner Review must approve public moderator wording."],
+                },
+                "dossierWorthItDecision": {"decision": "worth_drafting_now", "draftReadiness": "ready"},
+            },
+        )
+        result = draft.generate_dossier_draft(packet)["draft"]
+        public = " ".join(str(result[k]) for k in ("role", "summary", "notes", "tags", "proposedTags"))
+        self.assertEqual(result["role"], "Community moderator")
+        self.assertIn("BARCODE", public)
+        self.assertIn("moderator", public.lower())
+        self.assertTrue(any("moderator wording" in x for x in result["ownerReviewWarnings"]))
+
+    def test_invalid_and_conflicting_classification_is_conservative(self):
+        packet = pr217_packet(
+            publicSafeFacts=[],
+            publicSafeNotes=[],
+            safeClassification={"category": "Artist", "kind": "internal_only", "ecosystemLane": "Music"},
+            sourceFileClassificationV1={"category": "Unknown", "kind": "kind", "ecosystemLane": "ecosystemLane"},
+            sourceFilePagePlanV1={
+                "publicSafeMaterial": [],
+                "draftOrUpdatePlan": {"canDraft": False, "useTheseMaterials": []},
+                "dossierWorthItDecision": {"decision": "not_worth_it_yet", "draftReadiness": "not_ready"},
+            },
+        )
+        result = draft.generate_dossier_draft(packet)["draft"]
+        self.assertEqual(result["category"], "Unknown")
+        self.assertEqual(result["kind"], "Unknown")
+        self.assertEqual(result["ecosystemLane"], "Unknown")
+        self.assertEqual(result["role"], "Dossier subject")
+        emitted = json.dumps(result)
+        self.assertNotIn("internal_only", emitted)
+        self.assertNotIn('"kind"', result["kind"])
+        self.assertTrue(any("classification" in x.lower() for x in result["ownerReviewWarnings"]))
