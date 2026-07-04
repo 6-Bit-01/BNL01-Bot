@@ -203,8 +203,8 @@ class DossierDraftGeneratorTests(unittest.TestCase):
 
     def test_thin_packet_returns_conservative_summary_and_missing_info(self):
         result = draft.generate_dossier_draft(pr217_packet(publicSafeFacts=[], publicSafeNotes=[]))["draft"]
-        self.assertIn("listed for review as a BARCODE Network dossier subject", result["summary"])
-        self.assertNotIn("owner review", result["summary"].lower())
+        self.assertEqual(result["summary"], "Signal Fox is a BARCODE Network dossier subject with public-facing details still being confirmed.")
+        self.assertNotIn("review", result["summary"].lower())
         self.assertTrue(result["missingInfoQuestions"])
         self.assertIn("Add more public-safe facts", result["missingInfoQuestions"][0])
 
@@ -556,7 +556,7 @@ class DossierDraftGeneratorTests(unittest.TestCase):
             conn.execute("CREATE TABLE broadcast_memory (cleaned_summary TEXT, public_safe INTEGER, status TEXT)")
             conn.execute(
                 "INSERT INTO entity_intelligence_facts VALUES (?,?,?,?,?,?,?,?,?,?)",
-                ("secret_fox", "Secret Fox", "role", "Secret Fox hosts public BARCODE collaboration reviews.", "public_safe", "owner_confirmed", 1, 0, "active", "now"),
+                ("secret_fox", "Secret Fox", "role", "Secret Fox hosts public BARCODE collaboration sessions.", "public_safe", "owner_confirmed", 1, 0, "active", "now"),
             )
             conn.execute(
                 "INSERT INTO broadcast_memory VALUES (?,?,?)",
@@ -569,7 +569,7 @@ class DossierDraftGeneratorTests(unittest.TestCase):
             result = draft.generate_dossier_draft(packet, tmp.name)["draft"]
             public = " ".join(str(result[k]) for k in ("role", "summary", "notes", "sourceUsageSummary", "ownerReviewWarnings", "publicSafetyWarnings", "unsupportedClaimsRejected", "tags", "proposedTags"))
             evidence_text = " ".join(evidence["publicFacts"] + evidence["notablePublicSignals"])
-            self.assertIn("Signal Fox hosts public BARCODE collaboration reviews", public)
+            self.assertIn("Signal Fox hosts public BARCODE collaboration sessions", public)
             self.assertIn("Signal Fox appears in public-safe BARCODE Radio notes", public)
             self.assertNotIn("Secret Fox", public)
             self.assertNotIn("Secret Fox", evidence_text)
@@ -694,7 +694,7 @@ class DossierDraftGeneratorTests(unittest.TestCase):
             public = " ".join(str(result[k]) for k in ("role", "summary", "notes", "sourceUsageSummary")).lower()
             for forbidden in ("owner", "admin", "review-only", "source-blind", "private", "internal", "stripe", "priority", "customer", "discord id"):
                 self.assertNotIn(forbidden, public)
-            self.assertIn("held 10 specific review-needed", result["sourceUsageSummary"])
+            self.assertNotIn("review", result["sourceUsageSummary"].lower())
             self.assertTrue(any("BNL internal subject read" in x and "recurring BARCODE-facing community subject" in x for x in result["ownerReviewWarnings"]))
             self.assertTrue(any("display name" in x.lower() for x in result["missingInfoQuestions"]))
             self.assertTrue(any("public links" in x.lower() for x in result["missingInfoQuestions"]))
@@ -896,10 +896,12 @@ class DossierDraftPagePlanGroundingTests(unittest.TestCase):
         self.assertEqual(result["role"], "Dossier subject")
         self.assertFalse(set(result["tags"]) | set(result["proposedTags"]))
         public = " ".join(str(result[k]) for k in ("role", "summary", "notes", "sourceUsageSummary", "tags", "proposedTags")).lower()
-        for forbidden in ("internal", "source file", "debug", "source/debug", "internal/source", "review-only", "source-blind", "admin-only", "owner review", "no public-safe material", "page plan", "draft generator", "resolver", "diagnostics", "validation", "unsupported claims", "rejected material", "bit’s"):
+        for forbidden in ("review", "owner review", "listed for review", "internal", "source file", "debug", "source/debug", "internal/source", "review-only", "source-blind", "admin-only", "no public-safe material", "page plan", "draft generator", "resolver", "diagnostics", "validation", "unsupported claims", "rejected material", "bit’s"):
             self.assertNotIn(forbidden, public)
-        self.assertIn("crow is listed for review as a barcode network dossier subject", result["summary"].lower())
+        self.assertEqual(result["summary"], "Crow is a BARCODE Network dossier subject with public-facing details still being confirmed.")
         self.assertEqual(result["notes"], "Public-facing context is limited; keep wording concise and confirmation-based.")
+        for key in ("role", "summary", "notes", "sourceUsageSummary"):
+            self.assertNotIn("review", str(result[key]).lower())
         metadata = " ".join(result["ownerReviewWarnings"] + result["publicSafetyWarnings"] + result["unsupportedClaimsRejected"] + result["missingInfoQuestions"]).lower()
         self.assertIn("internal", metadata)
         self.assertIn("source file", metadata)
