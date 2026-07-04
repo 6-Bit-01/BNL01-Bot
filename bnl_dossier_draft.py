@@ -69,11 +69,32 @@ _ROLE_OR_TAXONOMY_LABELS = {
     "unknown", "public", "internal", "restricted", "active", "pending", "person", "music",
     "tech", "systems", "broadcast", "participant", "dossier", "source", "source file",
 }
-_VALID_CLASSIFICATION_VALUES = {
-    "category": {"Unknown", "Artist", "Community", "Collaborator", "Sponsor", "System", "Entity", "Person", "Organization", "Project"},
-    "kind": {"Unknown", "Person", "Entity", "Organization", "Project", "Group", "System", "Collaborator"},
-    "ecosystemLane": {"Unknown", "Music", "BARCODE", "Community", "Tech", "Production", "Sponsor", "Systems"},
+VALID_DOSSIER_CATEGORIES = {"Entity", "Personnel", "Artist", "Collaborator", "Community", "Sponsor", "Interface", "Production"}
+VALID_DOSSIER_KINDS = {
+    "program", "interface", "platform", "system", "entity", "artist", "sponsor_character",
+    "story_arc", "technical_component", "archive_record", "core_entity", "network_operator",
+    "network_staff", "moderator", "collaborator", "community_member", "radio_regular",
+    "radio_entity", "unknown",
 }
+VALID_DOSSIER_ECOSYSTEM_LANES = {
+    "core_team", "network_operator", "network_staff", "community_mod", "radio_support",
+    "technical_operator", "artist", "collaborator", "community_member", "radio_regular",
+    "sponsor", "radio_entity", "infrastructure", "production", "external_platform", "unknown",
+}
+_VALID_CLASSIFICATION_VALUES = {
+    "category": VALID_DOSSIER_CATEGORIES,
+    "kind": VALID_DOSSIER_KINDS,
+    "ecosystemLane": VALID_DOSSIER_ECOSYSTEM_LANES,
+}
+_CLASSIFICATION_DEFAULTS = {"category": "Entity", "kind": "entity", "ecosystemLane": "unknown"}
+_PUBLIC_FIELD_FORBIDDEN_RE = re.compile(
+    r"\b("
+    r"internal|source\s+file|debug|source/debug|internal/source|review-only|source-blind|"
+    r"admin-only|owner\s+review|no\s+public-safe\s+material|page\s+plan|draft\s+generator|"
+    r"resolver|diagnostics?|validation|unsupported\s+claims?|rejected\s+material"
+    r")\b",
+    re.I,
+)
 
 
 def _as_list(value: Any) -> list[Any]:
@@ -715,11 +736,12 @@ def build_public_dossier_draft_evidence(packet: dict[str, Any], db_path: str | N
     return bundle
 
 
-def _classification_value(safe_classification: dict[str, Any], key: str, default: str) -> str:
-    value = _text(safe_classification.get(key), 120) or default
+def _classification_value(safe_classification: dict[str, Any], key: str, default: str | None = None) -> str:
+    fallback = default or _CLASSIFICATION_DEFAULTS[key]
+    value = _text(safe_classification.get(key), 120) or fallback
     allowed = _VALID_CLASSIFICATION_VALUES.get(key)
     if allowed and value not in allowed:
-        return default
+        return fallback
     return value
 
 
@@ -727,28 +749,29 @@ def _conservative_classification(packet: dict[str, Any], owner_warnings: list[st
     safe = _dict(packet.get("safeClassification"))
     source = _dict(packet.get("sourceFileClassificationV1"))
     out = {
-        key: _classification_value(safe, key, "Unknown")
+        key: _classification_value(safe, key)
         for key in ("category", "kind", "ecosystemLane")
     }
     source_out = {
-        key: _classification_value(source, key, "Unknown")
+        key: _classification_value(source, key)
         for key in ("category", "kind", "ecosystemLane")
     }
     for key in ("category", "kind", "ecosystemLane"):
         raw_safe = _text(safe.get(key), 120)
         raw_source = _text(source.get(key), 120)
+        fallback = _CLASSIFICATION_DEFAULTS[key]
         if owner_warnings is not None and raw_safe and raw_safe != out[key]:
-            owner_warnings.append(f"Invalid safeClassification {key} value was treated as Unknown for public draft safety.")
+            owner_warnings.append(f"Invalid safeClassification {key} value was treated as {fallback} for site taxonomy compatibility.")
         if owner_warnings is not None and raw_source and raw_source != source_out[key]:
-            owner_warnings.append(f"Invalid sourceFileClassificationV1 {key} value was treated as Unknown for public draft safety.")
-        if raw_source and source_out[key] == "Unknown":
-            if raw_source and raw_safe and raw_source != raw_safe and owner_warnings is not None:
-                owner_warnings.append(f"Source File classification conflicts with safeClassification for {key}; used the more conservative value.")
-            out[key] = "Unknown"
-        elif raw_source and out[key] != "Unknown" and source_out[key] != out[key]:
-            out[key] = "Unknown"
+            owner_warnings.append(f"Invalid sourceFileClassificationV1 {key} value was treated as {fallback} for site taxonomy compatibility.")
+        if raw_source and source_out[key] == fallback and raw_source not in _VALID_CLASSIFICATION_VALUES[key]:
+            if raw_safe and raw_source != raw_safe and owner_warnings is not None:
+                owner_warnings.append(f"Source File classification conflicts with safeClassification for {key}; used the conservative site-compatible fallback.")
+            out[key] = fallback
+        elif raw_source and out[key] != fallback and source_out[key] != out[key]:
+            out[key] = fallback
             if owner_warnings is not None:
-                owner_warnings.append(f"Source File classification conflicts with safeClassification for {key}; used the more conservative value.")
+                owner_warnings.append(f"Source File classification conflicts with safeClassification for {key}; used the conservative site-compatible fallback.")
     return out
 
 
@@ -794,9 +817,9 @@ def _origin(packet: dict[str, Any]) -> str:
 
 def _category_kind_lane(safe_classification: dict[str, Any]) -> tuple[str, str, str]:
     return (
-        _classification_value(safe_classification, "category", "Unknown"),
-        _classification_value(safe_classification, "kind", "Unknown"),
-        _classification_value(safe_classification, "ecosystemLane", "Unknown"),
+        _classification_value(safe_classification, "category"),
+        _classification_value(safe_classification, "kind"),
+        _classification_value(safe_classification, "ecosystemLane"),
     )
 
 
@@ -847,12 +870,12 @@ def _summary(name: str, role: str, facts: list[str], notes: list[str], style_pac
             if extra:
                 summary = f"{summary} {extra[0]}"
     else:
-        summary = f"{name} is a proposed dossier subject with limited public-safe source detail."
+        summary = f"{name} is listed for review as a BARCODE Network dossier subject while public-facing details are still being confirmed."
     if _word_count(summary) > 85:
         words = summary.split()
         summary = " ".join(words[:80]).rstrip(" ,;:") + "."
     if guide["length"] and _word_count(summary) < 25 and source_sentences:
-        summary = f"{summary} Public-facing context stays concise and source-backed."
+        summary = f"{summary} Public-facing context stays concise and confirmation-based."
     return summary[:_SUMMARY_LIMIT].strip()
 
 
@@ -862,9 +885,9 @@ def _notes(public_notes: list[str], facts: list[str]) -> str:
     if note_sentences:
         notes = " ".join(note_sentences[:2])
     elif len(facts) < 2:
-        notes = "Public-safe context is limited; add stronger confirmed public details before publication."
+        notes = "Public-facing context is limited; keep wording concise and confirmation-based."
     else:
-        notes = "Public-facing context is limited; keep the wording concise and source-backed."
+        notes = "Public-facing context is limited; keep wording concise and confirmation-based."
     return notes[:_NOTES_LIMIT].strip()
 
 
@@ -900,7 +923,7 @@ def _tag_candidates(category: str, kind: str, lane: str, facts: list[str], notes
     candidates: list[str] = []
     mapping = [
         (("artist", "music", "musician"), "artist"),
-        (("collaborator",), "collaborator"),
+        (("collaborat",), "collaborator"),
         (("community", "member"), "community"),
         (("community", "member"), "member"),
         (("personnel", "moderator", "mod"), "mod"),
@@ -971,8 +994,15 @@ def _first_link(packet: dict[str, Any]) -> dict[str, Any] | None:
 
 
 def _source_usage_summary(packet: dict[str, Any]) -> str:
-    parts = ["Used supplied public-safe packet facts, notes, safe classification, and site style guidance as draft boundary context."]
+    parts = ["Used supplied public-facing facts, notes, site-compatible classification, and site style guidance as draft boundary context."]
     return " ".join(part for part in parts if not _SOURCE_USAGE_FORBIDDEN_RE.search(part))
+
+
+def _clean_public_field(value: str, fallback: str) -> str:
+    clean = _text(value, 1000)
+    if not clean or _PUBLIC_FIELD_FORBIDDEN_RE.search(clean):
+        return fallback
+    return clean
 
 
 def generate_dossier_draft(packet: dict[str, Any], db_path: str | None = None, public_read_model: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -1103,7 +1133,12 @@ def generate_dossier_draft(packet: dict[str, Any], db_path: str | None = None, p
             role = "Community participant"
         elif analyst.get("confidence") == "low" and role == "Review pending":
             role = "Dossier subject"
-    if role == "Review pending" or (source_file_page_plan and not page_plan_public_material_added):
+    if source_file_page_plan and not page_plan_public_material_added:
+        category, kind, lane = _CLASSIFICATION_DEFAULTS["category"], _CLASSIFICATION_DEFAULTS["kind"], _CLASSIFICATION_DEFAULTS["ecosystemLane"]
+        public_facts = []
+        public_notes = []
+        role = "Dossier subject"
+    elif role == "Review pending":
         role = "Dossier subject"
     thin = len(public_facts) + len(public_notes) < 2 and not page_plan_public_material_added
 
@@ -1215,6 +1250,36 @@ def generate_dossier_draft(packet: dict[str, Any], db_path: str | None = None, p
 
     tags, proposed_tags = _split_tags(packet, style_packet, category, kind, lane, public_facts, public_notes)
 
+    public_summary = _clean_public_field(
+        _summary(name, role, public_facts, public_notes, style_packet),
+        f"{name} is listed for review as a BARCODE Network dossier subject while public-facing details are still being confirmed.",
+    )
+    public_notes_text = _clean_public_field(
+        _notes(public_notes, public_facts),
+        "Public-facing context is limited; keep wording concise and confirmation-based.",
+    )
+    public_role = _clean_public_field(role, "Dossier subject")[:_ROLE_LIMIT]
+    public_source_usage = _clean_public_field(
+        " ".join(
+            part
+            for part in [
+                _source_usage_summary(packet),
+                *(
+                    item
+                    for item in (_strings(evidence.get("sourceSummariesUsed"), max_items=4) if evidence else [])
+                    if not (_SOURCE_USAGE_FORBIDDEN_RE.search(item) or _PUBLIC_FIELD_FORBIDDEN_RE.search(item))
+                ),
+                *(
+                    item
+                    for item in (_strings(analyst.get("provenanceSummary"), max_items=3) if analyst else [])
+                    if not (_SOURCE_USAGE_FORBIDDEN_RE.search(item) or _PUBLIC_FIELD_FORBIDDEN_RE.search(item))
+                ),
+            ]
+            if part
+        ),
+        "Used supplied public-facing facts, notes, site-compatible classification, and site style guidance as draft boundary context.",
+    )
+
     draft = {
         "name": name,
         "category": category,
@@ -1224,9 +1289,9 @@ def generate_dossier_draft(packet: dict[str, Any], db_path: str | None = None, p
         "status": "PENDING",
         "clearance": _clearance(packet),
         "origin": _origin(packet),
-        "role": role,
-        "summary": _summary(name, role, public_facts, public_notes, style_packet),
-        "notes": _notes(public_notes, public_facts),
+        "role": public_role,
+        "summary": public_summary,
+        "notes": public_notes_text,
         "tags": tags,
         "proposedTags": proposed_tags,
         "primaryLink": _first_link(packet),
@@ -1236,23 +1301,7 @@ def generate_dossier_draft(packet: dict[str, Any], db_path: str | None = None, p
         "ownerReviewWarnings": owner_warnings[:12],
         "publicSafetyWarnings": public_warnings[:12],
         "unsupportedClaimsRejected": rejected[:14],
-        "sourceUsageSummary": " ".join(
-            part
-            for part in [
-                _source_usage_summary(packet),
-                *(
-                    item
-                    for item in (_strings(evidence.get("sourceSummariesUsed"), max_items=4) if evidence else [])
-                    if not _SOURCE_USAGE_FORBIDDEN_RE.search(item)
-                ),
-                *(
-                    item
-                    for item in (_strings(analyst.get("provenanceSummary"), max_items=3) if analyst else [])
-                    if not _SOURCE_USAGE_FORBIDDEN_RE.search(item)
-                ),
-            ]
-            if part
-        ),
+        "sourceUsageSummary": public_source_usage,
     }
     readiness = {}
     if analyst:
