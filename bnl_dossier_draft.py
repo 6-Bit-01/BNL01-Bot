@@ -19,6 +19,9 @@ DRAFT_TOKEN_ENV = "BNL_DOSSIER_DRAFT_GENERATOR_TOKEN"
 REQUEST_TYPE = "bnl_proposed_dossier_draft"
 VERSION = "1.0"
 
+WEAK_EVIDENCE_FALLBACK_SUMMARY = "{name} is a BARCODE Network dossier subject with public-facing details still being confirmed."
+WEAK_EVIDENCE_FALLBACK_NOTES = "Public-facing context is limited; keep wording concise and confirmation-based."
+
 VALID_STATUSES = {"ACTIVE", "INACTIVE", "ARCHIVED", "PENDING", "UNKNOWN"}
 VALID_CLEARANCES = {"PUBLIC", "INTERNAL", "RESTRICTED"}
 VALID_ORIGINS = {"KNOWN", "UNKNOWN", "UNVERIFIED", "WITHHELD"}
@@ -89,8 +92,8 @@ _VALID_CLASSIFICATION_VALUES = {
 _CLASSIFICATION_DEFAULTS = {"category": "Entity", "kind": "entity", "ecosystemLane": "unknown"}
 _PUBLIC_FIELD_FORBIDDEN_RE = re.compile(
     r"\b("
-    r"internal|source\s+file|debug|source/debug|internal/source|review-only|source-blind|"
-    r"admin-only|owner\s+review|no\s+public-safe\s+material|page\s+plan|draft\s+generator|"
+    r"internal|source\s+file|debug|source/debug|internal/source|review\w*|review-only|source-blind|"
+    r"admin-only|owner\s+review|listed\s+for\s+review|no\s+public-safe\s+material|page\s+plan|draft\s+generator|"
     r"resolver|diagnostics?|validation|unsupported\s+claims?|rejected\s+material"
     r")\b",
     re.I,
@@ -870,7 +873,7 @@ def _summary(name: str, role: str, facts: list[str], notes: list[str], style_pac
             if extra:
                 summary = f"{summary} {extra[0]}"
     else:
-        summary = f"{name} is listed for review as a BARCODE Network dossier subject while public-facing details are still being confirmed."
+        summary = WEAK_EVIDENCE_FALLBACK_SUMMARY.format(name=name)
     if _word_count(summary) > 85:
         words = summary.split()
         summary = " ".join(words[:80]).rstrip(" ,;:") + "."
@@ -885,9 +888,9 @@ def _notes(public_notes: list[str], facts: list[str]) -> str:
     if note_sentences:
         notes = " ".join(note_sentences[:2])
     elif len(facts) < 2:
-        notes = "Public-facing context is limited; keep wording concise and confirmation-based."
+        notes = WEAK_EVIDENCE_FALLBACK_NOTES
     else:
-        notes = "Public-facing context is limited; keep wording concise and confirmation-based."
+        notes = WEAK_EVIDENCE_FALLBACK_NOTES
     return notes[:_NOTES_LIMIT].strip()
 
 
@@ -1000,8 +1003,11 @@ def _source_usage_summary(packet: dict[str, Any]) -> str:
 
 def _clean_public_field(value: str, fallback: str) -> str:
     clean = _text(value, 1000)
+    safe_fallback = _text(fallback, 1000)
+    if _PUBLIC_FIELD_FORBIDDEN_RE.search(safe_fallback):
+        safe_fallback = WEAK_EVIDENCE_FALLBACK_NOTES
     if not clean or _PUBLIC_FIELD_FORBIDDEN_RE.search(clean):
-        return fallback
+        return safe_fallback
     return clean
 
 
@@ -1252,11 +1258,11 @@ def generate_dossier_draft(packet: dict[str, Any], db_path: str | None = None, p
 
     public_summary = _clean_public_field(
         _summary(name, role, public_facts, public_notes, style_packet),
-        f"{name} is listed for review as a BARCODE Network dossier subject while public-facing details are still being confirmed.",
+        WEAK_EVIDENCE_FALLBACK_SUMMARY.format(name=name),
     )
     public_notes_text = _clean_public_field(
         _notes(public_notes, public_facts),
-        "Public-facing context is limited; keep wording concise and confirmation-based.",
+        WEAK_EVIDENCE_FALLBACK_NOTES,
     )
     public_role = _clean_public_field(role, "Dossier subject")[:_ROLE_LIMIT]
     public_source_usage = _clean_public_field(
