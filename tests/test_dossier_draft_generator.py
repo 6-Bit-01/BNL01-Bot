@@ -203,7 +203,7 @@ class DossierDraftGeneratorTests(unittest.TestCase):
 
     def test_thin_packet_returns_conservative_summary_and_missing_info(self):
         result = draft.generate_dossier_draft(pr217_packet(publicSafeFacts=[], publicSafeNotes=[]))["draft"]
-        self.assertIn("limited public-safe source detail", result["summary"])
+        self.assertIn("listed for review as a BARCODE Network dossier subject", result["summary"])
         self.assertNotIn("owner review", result["summary"].lower())
         self.assertTrue(result["missingInfoQuestions"])
         self.assertIn("Add more public-safe facts", result["missingInfoQuestions"][0])
@@ -694,7 +694,7 @@ class DossierDraftGeneratorTests(unittest.TestCase):
             public = " ".join(str(result[k]) for k in ("role", "summary", "notes", "sourceUsageSummary")).lower()
             for forbidden in ("owner", "admin", "review-only", "source-blind", "private", "internal", "stripe", "priority", "customer", "discord id"):
                 self.assertNotIn(forbidden, public)
-            self.assertIn("reduced them to", result["sourceUsageSummary"])
+            self.assertIn("held 10 specific review-needed", result["sourceUsageSummary"])
             self.assertTrue(any("BNL internal subject read" in x and "recurring BARCODE-facing community subject" in x for x in result["ownerReviewWarnings"]))
             self.assertTrue(any("display name" in x.lower() for x in result["missingInfoQuestions"]))
             self.assertTrue(any("public links" in x.lower() for x in result["missingInfoQuestions"]))
@@ -874,6 +874,55 @@ class DossierDraftPagePlanGroundingTests(unittest.TestCase):
         review_text = " ".join(result["ownerReviewWarnings"] + result["unsupportedClaimsRejected"])
         self.assertIn("topic-only or review-only material", review_text)
 
+
+    def test_weak_crow_page_plan_uses_site_taxonomy_and_clean_public_fallbacks(self):
+        packet = pr217_packet(
+            candidate={"sourceFileId": "sf_crow", "subjectName": "Crow"},
+            publicSafeFacts=[],
+            publicSafeNotes=[],
+            proposedTags=["artist", "community", "member", "mod", "moderator"],
+            safeClassification={"category": "Internal only", "kind": "Unknown", "ecosystemLane": "Unknown"},
+            sourceFileClassificationV1={"category": "Unknown", "kind": "Person", "ecosystemLane": "BARCODE"},
+            sourceFilePagePlanV1={
+                "publicSafeMaterial": [{"material": "No public-safe material is ready; internal/source review-only page plan.", "confidence": "none"}],
+                "draftOrUpdatePlan": {"canDraft": False, "useTheseMaterials": ["Recurring named topic: Bit’s source-blind review-only signal."], "ownerReviewWarnings": ["Source File is internal-only and needs owner review."]},
+                "dossierWorthItDecision": {"decision": "not_worth_it_yet", "draftReadiness": "not_ready"},
+            },
+        )
+        result = draft.generate_dossier_draft(packet)["draft"]
+        self.assertEqual(result["category"], "Entity")
+        self.assertEqual(result["kind"], "entity")
+        self.assertEqual(result["ecosystemLane"], "unknown")
+        self.assertEqual(result["role"], "Dossier subject")
+        self.assertFalse(set(result["tags"]) | set(result["proposedTags"]))
+        public = " ".join(str(result[k]) for k in ("role", "summary", "notes", "sourceUsageSummary", "tags", "proposedTags")).lower()
+        for forbidden in ("internal", "source file", "debug", "source/debug", "internal/source", "review-only", "source-blind", "admin-only", "owner review", "no public-safe material", "page plan", "draft generator", "resolver", "diagnostics", "validation", "unsupported claims", "rejected material", "bit’s"):
+            self.assertNotIn(forbidden, public)
+        self.assertIn("crow is listed for review as a barcode network dossier subject", result["summary"].lower())
+        self.assertEqual(result["notes"], "Public-facing context is limited; keep wording concise and confirmation-based.")
+        metadata = " ".join(result["ownerReviewWarnings"] + result["publicSafetyWarnings"] + result["unsupportedClaimsRejected"] + result["missingInfoQuestions"]).lower()
+        self.assertIn("internal", metadata)
+        self.assertIn("source file", metadata)
+
+    def test_site_taxonomy_never_emits_known_invalid_values(self):
+        invalid_packets = [
+            {"category": "Unknown", "kind": "Unknown", "ecosystemLane": "Unknown"},
+            {"category": "Internal only", "kind": "Person", "ecosystemLane": "BARCODE"},
+            {"category": "System", "kind": "entity", "ecosystemLane": "Music"},
+            {"category": "Person", "kind": "Person", "ecosystemLane": "Unknown"},
+            {"category": "Organization", "kind": "entity", "ecosystemLane": "BARCODE"},
+            {"category": "Project", "kind": "entity", "ecosystemLane": "Music"},
+        ]
+        for safe in invalid_packets:
+            with self.subTest(safe=safe):
+                result = draft.generate_dossier_draft(pr217_packet(safeClassification=safe, sourceFileClassificationV1=safe))["draft"]
+                self.assertIn(result["category"], draft.VALID_DOSSIER_CATEGORIES)
+                self.assertIn(result["kind"], draft.VALID_DOSSIER_KINDS)
+                self.assertIn(result["ecosystemLane"], draft.VALID_DOSSIER_ECOSYSTEM_LANES)
+                self.assertNotIn(result["category"], {"Unknown", "Internal only", "System", "Person", "Organization", "Project"})
+                self.assertNotIn(result["kind"], {"Unknown", "Person"})
+                self.assertNotIn(result["ecosystemLane"], {"Unknown", "BARCODE", "Music"})
+
     def test_page_plan_public_safe_material_drives_draft(self):
         packet = pr217_packet(
             publicSafeFacts=[],
@@ -912,9 +961,9 @@ class DossierDraftPagePlanGroundingTests(unittest.TestCase):
             },
         )
         result = draft.generate_dossier_draft(packet)["draft"]
-        self.assertEqual(result["category"], "Unknown")
-        self.assertEqual(result["kind"], "Unknown")
-        self.assertEqual(result["ecosystemLane"], "Unknown")
+        self.assertEqual(result["category"], "Entity")
+        self.assertEqual(result["kind"], "entity")
+        self.assertEqual(result["ecosystemLane"], "unknown")
         self.assertEqual(result["role"], "Dossier subject")
         emitted = json.dumps(result)
         self.assertNotIn("internal_only", emitted)
