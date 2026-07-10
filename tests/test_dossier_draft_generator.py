@@ -116,6 +116,61 @@ class DossierDraftGeneratorTests(unittest.TestCase):
         self.assertNotIn("candidateId", public)
         self.assertNotIn("source file", public.lower())
 
+
+    def test_generic_source_count_summary_is_rejected_with_safe_fallback_and_log_reason(self):
+        bad = "Song/track/demo/WIP mentions without link claims: 2 Music discussion only: 29 Feedback requests: 19"
+        packet = pr217_packet(
+            candidate={"sourceFileId": "sf_crow", "subjectName": "Crow"},
+            proposedTags=["community", "mentions without link claims: 2", "debug-count"],
+            subjectAnalystReadV1={"provenanceSummary": [bad]},
+        )
+        with (
+            mock.patch.object(draft, "_summary", return_value=bad),
+            mock.patch.object(draft, "_notes", return_value="Topic buckets: 2 Discussion only: 29 Feedback requests: 19"),
+            mock.patch.object(draft, "_source_usage_summary", return_value="A: 2 B: 29 C: 19"),
+            self.assertLogs(level="INFO") as logs,
+        ):
+            result = draft.generate_dossier_draft(packet)["draft"]
+
+        self.assertEqual(result["summary"], "Crow is a BARCODE Network dossier subject with public-facing details still being confirmed.")
+        self.assertEqual(result["notes"], "Public-facing context is limited; keep wording concise and confirmation-based.")
+        self.assertEqual(result["sourceUsageSummary"], "Draft used supplied public-facing facts, site-compatible classification, and style guidance.")
+        self.assertNotIn("mentions without link claims: 2", result["tags"] + result["proposedTags"])
+        self.assertNotIn("debug-count", result["tags"] + result["proposedTags"])
+        log_text = " ".join(logs.output)
+        self.assertIn("summary_sanitized=True", log_text)
+        self.assertIn("reason=generic_source_count_summary", log_text)
+        public = " ".join(str(result[k]) for k in ("role", "summary", "notes", "sourceUsageSummary", "tags", "proposedTags")).lower()
+        for forbidden in ("review", "internal", "source file", "debug", "candidateid", "workflow record", "mentions without link claims", "discussion only", "feedback requests"):
+            self.assertNotIn(forbidden, public)
+
+    def test_clean_page_plan_material_beats_generic_source_count_fallback(self):
+        bad = "Song/track/demo/WIP mentions without link claims: 2 Music discussion only: 29 Feedback requests: 19"
+        packet = pr217_packet(
+            candidate={"sourceFileId": "sf_crow", "subjectName": "Crow"},
+            publicSafeFacts=[],
+            publicSafeNotes=[],
+            sourceFilePagePlanV1={
+                "publicSafeMaterial": [
+                    {"material": bad, "confidence": "low"},
+                    {"material": "Crow is publicly connected to BARCODE community music discussions.", "confidence": "high"},
+                ],
+                "draftOrUpdatePlan": {
+                    "canDraft": True,
+                    "useTheseMaterials": ["Crow participates in public BARCODE music community conversations."],
+                    "ownerReviewWarnings": [],
+                },
+            },
+        )
+        result = draft.generate_dossier_draft(packet)["draft"]
+        self.assertNotEqual(result["summary"], "Crow is a BARCODE Network dossier subject with public-facing details still being confirmed.")
+        self.assertIn("Crow", result["summary"])
+        self.assertIn("BARCODE", result["summary"])
+        public = " ".join(str(result[k]) for k in ("role", "summary", "notes", "sourceUsageSummary", "tags", "proposedTags"))
+        self.assertNotIn("Song/track/demo/WIP", public)
+        self.assertNotIn("Recurring named topic: Bit’s", public)
+        self.assertNotIn("Lardcode", public)
+
     def test_draft_uses_public_dossier_style_context_and_filters_private_examples(self):
         packet = pr217_packet(
             stylePacket={
