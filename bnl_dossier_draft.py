@@ -123,6 +123,29 @@ _BACKEND_COPY_TERMS_RE = re.compile(
     re.I,
 )
 _SOURCE_LABEL_RE = re.compile(r"(?:^|[\n;|])\s*(?:source|source\s+file|source\s+lane|evidence)\s*[:#-]", re.I)
+_GENERIC_SOURCE_COUNT_SUMMARY_RE = re.compile(
+    r"(?:"
+    r"mentions\s+without\s+link\s+claims|without\s+link\s+claims|"
+    r"(?:music\s+)?discussion\s+only|feedback\s+requests?|"
+    r"song\s*/\s*track\s*/\s*demo\s*/\s*wip|"
+    r"source[-\s]*(?:count|counts|stat|stats|statistics|summary)|"
+    r"count[-\s]*(?:summary|summaries)|topic\s+buckets?"
+    r")",
+    re.I,
+)
+_COUNT_SUMMARY_CHAIN_RE = re.compile(
+    r"(?:\b[A-Za-z][A-Za-z0-9'’/ -]{1,48}:\s*\d+\b[;,.]?\s*){3,}",
+    re.I,
+)
+
+
+def _generic_source_count_summary_reason(value: Any) -> str | None:
+    clean = _text(value, 2000)
+    if not clean:
+        return None
+    if _GENERIC_SOURCE_COUNT_SUMMARY_RE.search(clean) or _COUNT_SUMMARY_CHAIN_RE.search(clean):
+        return "generic_source_count_summary"
+    return None
 
 
 def _has_repeated_public_lines(text: str) -> bool:
@@ -138,6 +161,8 @@ def contains_dossier_public_copy_junk(value: Any) -> bool:
         return False
     if _PUBLIC_FIELD_FORBIDDEN_RE.search(clean) or _SITE_PUBLIC_COPY_JUNK_RE.search(clean):
         return True
+    if _generic_source_count_summary_reason(clean):
+        return True
     if len(_SOURCE_LABEL_RE.findall(clean)) >= 2:
         return True
     if _has_repeated_public_lines(str(value)):
@@ -150,14 +175,17 @@ def contains_dossier_public_copy_junk(value: Any) -> bool:
     return False
 
 
-def _sanitize_public_field(value: str, fallback: str) -> tuple[str, bool]:
+def _sanitize_public_field(value: str, fallback: str) -> tuple[str, bool, str | None]:
     clean = _text(value, 1000)
     safe_fallback = _text(fallback, 1000)
     if contains_dossier_public_copy_junk(safe_fallback):
         safe_fallback = WEAK_EVIDENCE_FALLBACK_NOTES
-    if not clean or contains_dossier_public_copy_junk(clean):
-        return safe_fallback, bool(clean)
-    return clean, False
+    if not clean:
+        return safe_fallback, False, None
+    generic_reason = _generic_source_count_summary_reason(clean)
+    if contains_dossier_public_copy_junk(clean):
+        return safe_fallback, True, generic_reason or "site_rejected_source_process_copy"
+    return clean, False, None
 
 
 def _as_list(value: Any) -> list[Any]:
@@ -242,6 +270,8 @@ def _unsafe_reasons(text: str) -> list[str]:
         reasons.append("final/published status wording")
     if _NON_PUBLIC_COPY_RE.search(text):
         reasons.append("topic-only or review-only material")
+    if _generic_source_count_summary_reason(text):
+        reasons.append("generic source/count summary")
     return reasons
 
 
@@ -1311,16 +1341,16 @@ def generate_dossier_draft(packet: dict[str, Any], db_path: str | None = None, p
     tags, proposed_tags = _split_tags(packet, style_packet, category, kind, lane, public_facts, public_notes)
 
     summary_raw = _summary(name, role, public_facts, public_notes, style_packet)
-    public_summary, summary_sanitized = _sanitize_public_field(
+    public_summary, summary_sanitized, summary_sanitize_reason = _sanitize_public_field(
         summary_raw,
         WEAK_EVIDENCE_FALLBACK_SUMMARY.format(name=name),
     )
     notes_raw = _notes(public_notes, public_facts)
-    public_notes_text, notes_sanitized = _sanitize_public_field(
+    public_notes_text, notes_sanitized, notes_sanitize_reason = _sanitize_public_field(
         notes_raw,
         WEAK_EVIDENCE_FALLBACK_NOTES,
     )
-    public_role, role_sanitized = _sanitize_public_field(role, "Dossier subject")
+    public_role, role_sanitized, role_sanitize_reason = _sanitize_public_field(role, "Dossier subject")
     public_role = public_role[:_ROLE_LIMIT]
     source_usage_raw = " ".join(
         part
@@ -1339,7 +1369,7 @@ def generate_dossier_draft(packet: dict[str, Any], db_path: str | None = None, p
         ]
         if part
     )
-    public_source_usage, source_usage_sanitized = _sanitize_public_field(
+    public_source_usage, source_usage_sanitized, source_usage_sanitize_reason = _sanitize_public_field(
         source_usage_raw,
         "Draft used supplied public-facing facts, site-compatible classification, and style guidance.",
     )
@@ -1353,8 +1383,14 @@ def generate_dossier_draft(packet: dict[str, Any], db_path: str | None = None, p
         rejected.append(warning)
     if tags_sanitized:
         rejected.append("Removed public tag candidates containing site-rejected source/process copy.")
+    sanitize_reasons = [
+        reason
+        for reason in (summary_sanitize_reason, role_sanitize_reason, notes_sanitize_reason, source_usage_sanitize_reason)
+        if reason
+    ]
+    sanitize_reason = "generic_source_count_summary" if "generic_source_count_summary" in sanitize_reasons else (sanitize_reasons[0] if sanitize_reasons else "none")
     logging.info(
-        "dossier_draft_public_copy_guard subject=%s category=%s kind=%s ecosystemLane=%s summary_sanitized=%s role_sanitized=%s notes_sanitized=%s sourceUsageSummary_sanitized=%s",
+        "dossier_draft_public_copy_guard subject=%s category=%s kind=%s ecosystemLane=%s summary_sanitized=%s role_sanitized=%s notes_sanitized=%s sourceUsageSummary_sanitized=%s reason=%s",
         re.sub(r"[^A-Za-z0-9 ._-]", "", name)[:80] or "Unknown",
         category,
         kind,
@@ -1363,6 +1399,7 @@ def generate_dossier_draft(packet: dict[str, Any], db_path: str | None = None, p
         role_sanitized,
         notes_sanitized,
         source_usage_sanitized,
+        sanitize_reason,
     )
 
     draft = {
