@@ -6,6 +6,7 @@ write Discord, memory, Source Files, candidates, or website state.
 from __future__ import annotations
 
 import hmac
+import logging
 import os
 import re
 import sqlite3
@@ -98,6 +99,65 @@ _PUBLIC_FIELD_FORBIDDEN_RE = re.compile(
     r")\b",
     re.I,
 )
+
+_SITE_PUBLIC_COPY_JUNK_RE = re.compile(
+    r"(?:"
+    r"starter\s+(?:evidence\s+)?note(?:\s+only)?\s*:|public\s+safety\s*:|missing\s+info\s*:|"
+    r"broadcast_memory|do\s+not\s+expose\s+private\s+discord\s+identity|"
+    r"verify\s+public-safe\s+wording|internal\s+discovery\s+classification|"
+    r"bnl\s+discovery\s+is\s+review-only|review\s+before\s+converting|"
+    r"medium-confidence\s+bnl\s+discovery|source[-\s]*file|dossier\s+seed|"
+    r"add\s+a\s+dossier\s+entry|user_profiles/|conversations/|relationship_journal|"
+    r"memory_tiers|local_profile_observed|public_discord_observed|local_relationship_trace|"
+    r"source\s+lane\s+mapping|source\s+lanes?|source\s+types?|ingest\s*key|ingestKey|"
+    r"candidateId|targetId|recommendationId|workflow\s+record|unknown\s*->\s*unknown|"
+    r"dossier_(?:candidate|recommendation)_[a-z0-9_\-]+|source_file_note_[a-z0-9_\-]+|"
+    r"(?:candidate|source|recommendation|target)[-_\s]*id\b"
+    r")",
+    re.I,
+)
+_BACKEND_COPY_TERMS_RE = re.compile(
+    r"\b(?:source|candidate|recommendation|target|workflow|ingest|memory|tier|lane|"
+    r"backend|internal|review|debug|diagnostic|metadata|packet|resolver|classification|"
+    r"dossier|source_file|source-file|public_safe|broadcast_memory)\b",
+    re.I,
+)
+_SOURCE_LABEL_RE = re.compile(r"(?:^|[\n;|])\s*(?:source|source\s+file|source\s+lane|evidence)\s*[:#-]", re.I)
+
+
+def _has_repeated_public_lines(text: str) -> bool:
+    lines = [re.sub(r"\s+", " ", line).strip().lower() for line in str(text).splitlines()]
+    lines = [line for line in lines if len(line) >= 12]
+    return len(lines) != len(set(lines))
+
+
+def contains_dossier_public_copy_junk(value: Any) -> bool:
+    """Mirror the website's public-copy junk guard for fields returned publicly."""
+    clean = _text(value, 2000)
+    if not clean:
+        return False
+    if _PUBLIC_FIELD_FORBIDDEN_RE.search(clean) or _SITE_PUBLIC_COPY_JUNK_RE.search(clean):
+        return True
+    if len(_SOURCE_LABEL_RE.findall(clean)) >= 2:
+        return True
+    if _has_repeated_public_lines(str(value)):
+        return True
+    words = re.findall(r"\b[\w'-]+\b", clean)
+    if len(words) >= 6:
+        backend_hits = len(_BACKEND_COPY_TERMS_RE.findall(clean))
+        if backend_hits >= 4 and backend_hits / max(len(words), 1) >= 0.28:
+            return True
+    return False
+
+
+def _sanitize_public_field(value: str, fallback: str) -> tuple[str, bool]:
+    clean = _text(value, 1000)
+    safe_fallback = _text(fallback, 1000)
+    if contains_dossier_public_copy_junk(safe_fallback):
+        safe_fallback = WEAK_EVIDENCE_FALLBACK_NOTES
+    if not clean or contains_dossier_public_copy_junk(clean):
+        return safe_fallback, bool(clean)
+    return clean, False
 
 
 def _as_list(value: Any) -> list[Any]:
@@ -1002,13 +1062,7 @@ def _source_usage_summary(packet: dict[str, Any]) -> str:
 
 
 def _clean_public_field(value: str, fallback: str) -> str:
-    clean = _text(value, 1000)
-    safe_fallback = _text(fallback, 1000)
-    if _PUBLIC_FIELD_FORBIDDEN_RE.search(safe_fallback):
-        safe_fallback = WEAK_EVIDENCE_FALLBACK_NOTES
-    if not clean or _PUBLIC_FIELD_FORBIDDEN_RE.search(clean):
-        return safe_fallback
-    return clean
+    return _sanitize_public_field(value, fallback)[0]
 
 
 def generate_dossier_draft(packet: dict[str, Any], db_path: str | None = None, public_read_model: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -1256,34 +1310,59 @@ def generate_dossier_draft(packet: dict[str, Any], db_path: str | None = None, p
 
     tags, proposed_tags = _split_tags(packet, style_packet, category, kind, lane, public_facts, public_notes)
 
-    public_summary = _clean_public_field(
-        _summary(name, role, public_facts, public_notes, style_packet),
+    summary_raw = _summary(name, role, public_facts, public_notes, style_packet)
+    public_summary, summary_sanitized = _sanitize_public_field(
+        summary_raw,
         WEAK_EVIDENCE_FALLBACK_SUMMARY.format(name=name),
     )
-    public_notes_text = _clean_public_field(
-        _notes(public_notes, public_facts),
+    notes_raw = _notes(public_notes, public_facts)
+    public_notes_text, notes_sanitized = _sanitize_public_field(
+        notes_raw,
         WEAK_EVIDENCE_FALLBACK_NOTES,
     )
-    public_role = _clean_public_field(role, "Dossier subject")[:_ROLE_LIMIT]
-    public_source_usage = _clean_public_field(
-        " ".join(
-            part
-            for part in [
-                _source_usage_summary(packet),
-                *(
-                    item
-                    for item in (_strings(evidence.get("sourceSummariesUsed"), max_items=4) if evidence else [])
-                    if not (_SOURCE_USAGE_FORBIDDEN_RE.search(item) or _PUBLIC_FIELD_FORBIDDEN_RE.search(item))
-                ),
-                *(
-                    item
-                    for item in (_strings(analyst.get("provenanceSummary"), max_items=3) if analyst else [])
-                    if not (_SOURCE_USAGE_FORBIDDEN_RE.search(item) or _PUBLIC_FIELD_FORBIDDEN_RE.search(item))
-                ),
-            ]
-            if part
-        ),
-        "Used supplied public-facing facts, notes, site-compatible classification, and site style guidance as draft boundary context.",
+    public_role, role_sanitized = _sanitize_public_field(role, "Dossier subject")
+    public_role = public_role[:_ROLE_LIMIT]
+    source_usage_raw = " ".join(
+        part
+        for part in [
+            _source_usage_summary(packet),
+            *(
+                item
+                for item in (_strings(evidence.get("sourceSummariesUsed"), max_items=4) if evidence else [])
+                if not (_SOURCE_USAGE_FORBIDDEN_RE.search(item) or _PUBLIC_FIELD_FORBIDDEN_RE.search(item))
+            ),
+            *(
+                item
+                for item in (_strings(analyst.get("provenanceSummary"), max_items=3) if analyst else [])
+                if not (_SOURCE_USAGE_FORBIDDEN_RE.search(item) or _PUBLIC_FIELD_FORBIDDEN_RE.search(item))
+            ),
+        ]
+        if part
+    )
+    public_source_usage, source_usage_sanitized = _sanitize_public_field(
+        source_usage_raw,
+        "Draft used supplied public-facing facts, site-compatible classification, and style guidance.",
+    )
+    original_tags, original_proposed_tags = list(tags), list(proposed_tags)
+    tags = [tag for tag in tags if not contains_dossier_public_copy_junk(tag)]
+    proposed_tags = [tag for tag in proposed_tags if not contains_dossier_public_copy_junk(tag)]
+    tags_sanitized = len(tags) != len(original_tags) or len(proposed_tags) != len(original_proposed_tags)
+    if summary_sanitized or role_sanitized or notes_sanitized or source_usage_sanitized or tags_sanitized:
+        warning = "BNL sanitized public dossier field copy because it contained site-rejected source/process copy."
+        owner_warnings.append(warning)
+        rejected.append(warning)
+    if tags_sanitized:
+        rejected.append("Removed public tag candidates containing site-rejected source/process copy.")
+    logging.info(
+        "dossier_draft_public_copy_guard subject=%s category=%s kind=%s ecosystemLane=%s summary_sanitized=%s role_sanitized=%s notes_sanitized=%s sourceUsageSummary_sanitized=%s",
+        re.sub(r"[^A-Za-z0-9 ._-]", "", name)[:80] or "Unknown",
+        category,
+        kind,
+        lane,
+        summary_sanitized,
+        role_sanitized,
+        notes_sanitized,
+        source_usage_sanitized,
     )
 
     draft = {
