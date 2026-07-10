@@ -3,6 +3,7 @@ import json
 import sqlite3
 import tempfile
 import unittest
+from unittest import mock
 
 os.environ.setdefault("DISCORD_BOT_TOKEN", "test-discord-token")
 os.environ.setdefault("GEMINI_API_KEY", "test-gemini-key")
@@ -74,6 +75,46 @@ PUBLIC_FIELD_KEYS = ("role", "summary", "notes", "status", "sourceUsageSummary")
 
 
 class DossierDraftGeneratorTests(unittest.TestCase):
+
+
+    def test_site_guard_replaces_summary_for_forbidden_patterns_before_return(self):
+        forbidden_summaries = [
+            "starter note only: confirm later",
+            "source file contains a public-looking sentence",
+            "source lanes should not be public",
+            "candidateId cand_123 was promoted",
+            "workflow record says unknown -> unknown",
+            "dossier_candidate_abc_123 generated this copy",
+            "Source: packet one\nSource: packet two",
+        ]
+        for bad_summary in forbidden_summaries:
+            with self.subTest(bad_summary=bad_summary):
+                with mock.patch.object(draft, "_summary", return_value=bad_summary):
+                    result = draft.generate_dossier_draft(pr217_packet(candidate={"subjectName": "Crow"}))["draft"]
+                self.assertEqual(result["summary"], "Crow is a BARCODE Network dossier subject with public-facing details still being confirmed.")
+                self.assertTrue(any("sanitized public dossier field copy" in x for x in result["ownerReviewWarnings"] + result["unsupportedClaimsRejected"]))
+
+    def test_site_guard_protects_role_notes_source_usage_and_tags(self):
+        packet = pr217_packet(
+            proposedTags=["community", "candidateId", "source-file", "clean-new-tag"],
+            subjectAnalystReadV1={"provenanceSummary": ["candidateId workflow record unknown -> unknown"]},
+        )
+        with (
+            mock.patch.object(draft, "_role_from_context", return_value="source file candidateId role"),
+            mock.patch.object(draft, "_notes", return_value="starter evidence note: source lane mapping"),
+            mock.patch.object(draft, "_source_usage_summary", return_value="workflow record candidateId unknown -> unknown"),
+        ):
+            result = draft.generate_dossier_draft(packet)["draft"]
+        self.assertEqual(result["role"], "Dossier subject")
+        self.assertEqual(result["notes"], "Public-facing context is limited; keep wording concise and confirmation-based.")
+        self.assertEqual(result["sourceUsageSummary"], "Draft used supplied public-facing facts, site-compatible classification, and style guidance.")
+        self.assertNotIn("candidateId", result["tags"] + result["proposedTags"])
+        self.assertNotIn("source-file", result["tags"] + result["proposedTags"])
+        metadata = " ".join(result["ownerReviewWarnings"] + result["publicSafetyWarnings"] + result["unsupportedClaimsRejected"] + result["missingInfoQuestions"])
+        self.assertIn("sanitized public dossier field copy", metadata)
+        public = " ".join(str(result[k]) for k in ("role", "summary", "notes", "sourceUsageSummary", "tags", "proposedTags"))
+        self.assertNotIn("candidateId", public)
+        self.assertNotIn("source file", public.lower())
 
     def test_draft_uses_public_dossier_style_context_and_filters_private_examples(self):
         packet = pr217_packet(
