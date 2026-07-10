@@ -1,3 +1,5 @@
+import asyncio
+import json
 import os
 import sqlite3
 import tempfile
@@ -8,6 +10,7 @@ os.environ.setdefault("GEMINI_API_KEY", "test-gemini-key")
 os.environ.setdefault("DISCORD_BOT_TOKEN", "test-discord-token")
 
 import bnl_source_file_refresh as refresh
+import bnl01_bot
 from bnl_entity_evidence import upsert_entity_evidence_event
 
 
@@ -41,6 +44,22 @@ class FakeOpener:
             self.posts.append(json.loads((request.data or b"{}").decode("utf-8")))
             return FakeResponse({"ok": True})
         return FakeResponse(self.get_payload)
+
+
+class FakeRefreshNowRequest:
+    def __init__(self, payload=None, headers=None, json_exc=None):
+        self._payload = payload
+        self.headers = headers or {}
+        self._json_exc = json_exc
+
+    async def json(self):
+        if self._json_exc:
+            raise self._json_exc
+        return self._payload
+
+
+def decode_json_response(response):
+    return json.loads(response.text)
 
 
 class SourceFileRefreshTests(unittest.TestCase):
@@ -941,6 +960,53 @@ class SourceFileRefreshTests(unittest.TestCase):
             source = handle.read()
         for forbidden in ("publish_public", "queue_payment", "artist_account", "canonical_profile_merge", "identity_alias"):
             self.assertNotIn(forbidden, source)
+
+
+class SourceFileRefreshNowRouteTests(unittest.TestCase):
+    def call_handler(self, result):
+        request = FakeRefreshNowRequest(
+            {
+                "requestId": "req_route",
+                "subjectName": "Crow",
+                "normalizedSubjectKey": "crow",
+                "reason": "opened_source_file",
+                "source": "admin_source_file_open",
+            },
+            headers={bnl01_bot.SOURCE_REFRESH_NOW_TOKEN_HEADER: "secret"},
+        )
+        with mock.patch.object(bnl01_bot, "is_source_refresh_now_token_valid", return_value=True), \
+             mock.patch.object(bnl01_bot, "_resolve_force_pull_guild", return_value=123), \
+             mock.patch.object(bnl01_bot, "process_source_file_refresh_now", return_value=result):
+            return asyncio.run(bnl01_bot._handle_source_file_refresh_now(request))
+
+    def test_route_returns_200_for_partial_success_with_failure_reason(self):
+        result = {
+            "ok": True,
+            "status": "partial_success",
+            "failureReason": "compact_recommendation_rejected",
+            "reason": "compact_recommendation_rejected",
+            "recommendation_id": None,
+            "archive_id": "arc_crow",
+            "archiveSent": True,
+        }
+
+        response = self.call_handler(result)
+        body = decode_json_response(response)
+
+        self.assertEqual(response.status, 200)
+        self.assertEqual(body["status"], "partial_success")
+        self.assertEqual(body["failureReason"], "compact_recommendation_rejected")
+        self.assertEqual(body["reason"], "compact_recommendation_rejected")
+        self.assertIsNone(body["recommendation_id"])
+        self.assertEqual(body["archive_id"], "arc_crow")
+
+    def test_route_still_returns_500_for_failed_status(self):
+        response = self.call_handler({"ok": False, "status": "failed", "failureReason": "archive_rejected"})
+        body = decode_json_response(response)
+
+        self.assertEqual(response.status, 500)
+        self.assertEqual(body["status"], "failed")
+        self.assertEqual(body["failureReason"], "archive_rejected")
 
 
 if __name__ == "__main__":

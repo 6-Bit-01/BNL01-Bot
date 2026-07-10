@@ -3584,7 +3584,7 @@ async def _handle_source_file_refresh_now(request: web.Request) -> web.Response:
         return web.json_response({"ok": False, "status": "failed", "failureReason": safe_error}, status=500)
 
     status = result.get("status") or ("success" if result.get("ok") else "failed")
-    http_status = 200 if status in {"success", "skipped", "dry_run"} else 500
+    http_status = 200 if status in {"success", "skipped", "dry_run", "partial_success"} else 500
     return web.json_response(result, status=http_status)
 
 async def start_force_pull_listener():
