@@ -2701,6 +2701,11 @@ def _is_relay_show_window_active(now_pacific: datetime = None) -> bool:
 
 
 RELAY_FORBIDDEN_SHOW_STATE_PATTERNS = (
+    (re.compile(r"\btonight(?:'s)?\b", re.IGNORECASE), "unsupported_tonight", "the next confirmed BARCODE Radio cycle"),
+    (re.compile(r"\bcurrently\s+(?:live|on[-\s]?air|available|open|active)\b", re.IGNORECASE), "unsupported_current_state", "scheduled for a confirmed future window"),
+    (re.compile(r"\bcurrent\s+show\b", re.IGNORECASE), "unsupported_current_show", "confirmed BARCODE Radio cycle"),
+    (re.compile(r"\bon[-\s]?air\b", re.IGNORECASE), "unsupported_on_air", "scheduled broadcast"),
+    (re.compile(r"\bavailability\s+(?:is|remains)\s+(?:open|active|live)\b", re.IGNORECASE), "unsupported_availability", "availability requires a current confirmed source"),
     (re.compile(r"\b(?:an?\s+echo\s+of\s+)?6\s*bit[’']s\s+imminent\s+broadcast\b", re.IGNORECASE), "six_bit_imminent_broadcast", "the next scheduled BARCODE Radio broadcast"),
     (re.compile(r"\bimminent\s+broadcast\b", re.IGNORECASE), "imminent_broadcast", "next scheduled broadcast"),
     (re.compile(r"\bbroadcast\s+is\s+imminent\b", re.IGNORECASE), "broadcast_is_imminent", "broadcast remains scheduled"),
@@ -3225,25 +3230,51 @@ def _select_relay_safe_continuity_source(guild_id: int, cursor_value: int, highe
     with sqlite3.connect(DB_FILE) as conn:
         rows = conn.execute(
             """
-            SELECT id, user_name, content, channel_policy, timestamp
+            SELECT id, user_id, user_name, content, channel_policy, timestamp
             FROM conversations
             WHERE guild_id=? AND role='user'
               AND channel_policy IN ('public_home','public_context','public_selective')
-              AND timestamp >= ?
+              AND datetime(timestamp) >= datetime(?)
             ORDER BY id DESC LIMIT ?
             """,
             (guild_id, cutoff, limit),
         ).fetchall()
+    identity_tokens = set()
+    user_ids = []
+    for _row_id, user_id, user_name, _content, _policy, _timestamp in rows:
+        if user_id is not None:
+            user_ids.append(int(user_id))
+        if user_name:
+            identity_tokens.add(str(user_name).strip())
+    if user_ids:
+        placeholders = ",".join("?" for _ in user_ids)
+        try:
+            with sqlite3.connect(DB_FILE) as conn:
+                profile_rows = conn.execute(
+                    f"SELECT display_name, preferred_name FROM user_profiles WHERE guild_id=? AND user_id IN ({placeholders})",
+                    (guild_id, *user_ids),
+                ).fetchall()
+            for display_name, preferred_name in profile_rows:
+                if display_name:
+                    identity_tokens.add(str(display_name).strip())
+                if preferred_name:
+                    identity_tokens.add(str(preferred_name).strip())
+        except sqlite3.OperationalError:
+            pass
+    identity_tokens = {token for token in identity_tokens if token and len(token) >= 2}
+
     fragments = []
     policies = set()
-    for row_id, user_name, content, policy, _timestamp in rows:
+    for row_id, user_id, user_name, content, policy, _timestamp in rows:
         text = _relay_safe_text_fragment(content)
-        if user_name:
-            text = re.sub(re.escape(str(user_name)), "participant", text, flags=re.IGNORECASE)
+        for token in sorted(identity_tokens, key=len, reverse=True):
+            text = re.sub(re.escape(token), "participant", text, flags=re.IGNORECASE)
         lowered = text.lower()
         if not text or len(text.split()) < 4:
             continue
-        if any(marker in lowered for marker in ("private", "moderator", "admin", "research", "payment", "queue", "now playing", "up next", "bnl-testing")):
+        if any(marker in lowered for marker in ("private", "moderator", "admin", "research", "payment", "queue", "read model", "now playing", "up next", "bnl-testing")):
+            continue
+        if any(re.search(re.escape(token), text, flags=re.IGNORECASE) for token in identity_tokens):
             continue
         policies.add(policy or "unknown")
         fragments.append(f"[public_continuity_theme_{len(fragments)+1}] {text}")
@@ -3328,15 +3359,12 @@ def _select_approved_quiet_relay_source(guild_id: int, cursor_value: int, highes
         counts = {"conversation_continuity": 0, "broadcast_memory": len(lines), "canon": 0, "reflection": 0}
         return RelaySourceDecision("broadcast_memory", "\n".join(lines), counts, source_cursor=cursor_value, highest_eligible_conversation_id=highest, metadata={"source_message_count": len(lines)})
     history = relay_recent_history(DB_FILE, guild_id, limit=25)
-    used = {relay_normalize_text(h.get("public_message", "")) for h in history}
-    anchor = CANON_RELAY_ANCHORS[len(history) % len(CANON_RELAY_ANCHORS)]
-    for candidate in CANON_RELAY_ANCHORS:
-        if relay_normalize_text(candidate) not in used:
-            anchor = candidate
-            break
-    canon = f"[approved_barcode_canon] {anchor}"
+    accepted_canon_count = sum(1 for h in history if str(h.get("event_type") or "") == "canon")
+    anchor_index = accepted_canon_count % len(CANON_RELAY_ANCHORS)
+    anchor = CANON_RELAY_ANCHORS[anchor_index]
+    canon = f"[approved_barcode_canon:{anchor_index}] {anchor}"
     counts = {"conversation_continuity": 0, "broadcast_memory": 0, "canon": 1, "reflection": 0}
-    return RelaySourceDecision("canon", canon, counts, source_cursor=cursor_value, highest_eligible_conversation_id=highest)
+    return RelaySourceDecision("canon", canon, counts, source_cursor=cursor_value, highest_eligible_conversation_id=highest, metadata={"canon_anchor_index": anchor_index})
 
 
 def _build_source_decision_prompt(decision: RelaySourceDecision, mode: str) -> str:
@@ -3368,7 +3396,7 @@ async def _generate_quiet_website_relay(guild_id: int, *, source_cursor: int, hi
         return WebsiteRelayDecision(False, skipReason="output_shape_invalid", sourceCursor=source_cursor, metadata={"reason": "output_shape_invalid", "source_class": quiet_source.source_class, "aggregate_source_counts": quiet_source.aggregate_counts})
     relay_message = _strict_relay_output_line(lines[0], limit=300, min_chars=40)
     directive = _strict_relay_output_line(lines[1], limit=220, min_chars=40)
-    show_supported = quiet_source.source_class == "canon" or _relay_context_supports_show_reference(quiet_source.context, relay_message)
+    show_supported = _relay_context_supports_show_reference(quiet_source.context, relay_message)
     relay_message = _sanitize_relay_temporal_claims(relay_message, guild_id, show_context_supported=show_supported, now_pacific=datetime.now(PACIFIC_TZ), limit=300, min_chars=0) if relay_message else ""
     relay_message = _strict_relay_output_line(relay_message, limit=300, min_chars=40)
     if not relay_message or not directive:
@@ -3379,7 +3407,7 @@ async def _generate_quiet_website_relay(guild_id: int, *, source_cursor: int, hi
     dup_reason = relay_reject_reason_for_candidate(DB_FILE, guild_id, relay_message, directive)
     if dup_reason:
         return WebsiteRelayDecision(False, skipReason=dup_reason, sourceCursor=source_cursor, metadata={"reason": dup_reason, "source_class": quiet_source.source_class, "aggregate_source_counts": quiet_source.aggregate_counts})
-    meta = {**quiet_source.metadata, "reason": reason, "source_class": quiet_source.source_class, "aggregate_source_counts": quiet_source.aggregate_counts, "relay_lane": "network_posture"}
+    meta = {**quiet_source.metadata, "reason": reason, "source_class": quiet_source.source_class, "aggregate_source_counts": quiet_source.aggregate_counts, "relay_lane": "network_posture", "highest_eligible_conversation_id": quiet_source.highest_eligible_conversation_id}
     return WebsiteRelayDecision(True, eventType=quiet_source.source_class, sourceConversationIds=quiet_source.source_conversation_ids, sourceCursor=source_cursor, message=relay_message, directive=directive, mode=mode, relayLane="network_posture", metadata=meta)
 
 
@@ -3492,7 +3520,7 @@ async def _execute_website_relay_transaction(guild_id: int, *, force: bool = Fal
             decision = WebsiteRelayDecision(False, skipReason="relay_generation_inflight", sourceCursor=relay_get_cursor(DB_FILE, guild_id) or 0, metadata={"reason": "relay_generation_inflight"})
         source_class = decision.metadata.get("source_class") or decision.eventType or "none"
         counts = decision.metadata.get("aggregate_source_counts") or {source_class: len(decision.sourceConversationIds or [])}
-        highest = max(decision.sourceConversationIds or [decision.sourceCursor or 0])
+        highest = int(decision.metadata.get("highest_eligible_conversation_id") or max(decision.sourceConversationIds or [decision.sourceCursor or 0]))
         if not decision.publish:
             reason = decision.skipReason or "no_safe_source"
             outcome = "disabled" if reason == "website_relay_disabled" else ("provider_failed" if reason in {"provider_failure", "relay_generation_timeout"} else ("no_safe_source" if reason in {"no_new_public_signal", "bootstrap_no_publish", "fresh_context_expired"} else "rejected"))

@@ -554,6 +554,67 @@ class WebsiteRelayRecoveryTests(unittest.TestCase):
             decision = asyncio.run(bnl01_bot._execute_website_relay_transaction(42, force=True, source="relay"))
         self.assertTrue(decision.publish)
         self.assertEqual(state.get_cursor(self.db, 42), 0)
+        attempt = state.last_attempt(self.db, 42)
+        self.assertEqual(attempt["cursor"], 0)
+        self.assertEqual(attempt["highest_eligible_conversation_id"], 1)
+
+    def test_canon_temporal_validation_rejects_unsupported_live_claim(self):
+        source = state.RelaySourceDecision("canon", "[approved_barcode_canon:0] BNL-01 serves as the BARCODE Network liaison voice.", {"canon": 1}, source_cursor=0)
+        async def fake_gemini(prompt, user_id=0, guild_id=0, route=""):
+            return ("BARCODE Radio is currently live and on-air tonight for the current show.\n"
+                    "Ask listeners to join the live BARCODE Radio window right now.")
+        with mock.patch.object(bnl01_bot, "_select_approved_quiet_relay_source", return_value=source), \
+             mock.patch.object(bnl01_bot, "get_gemini_response", side_effect=fake_gemini):
+            decision = asyncio.run(bnl01_bot._generate_quiet_website_relay(42, source_cursor=0, highest=0))
+        if decision.publish:
+            lowered = decision.message.lower()
+            self.assertNotIn("currently live", lowered)
+            self.assertNotIn("on-air", lowered)
+            self.assertNotIn("tonight", lowered)
+            self.assertNotIn("current show", lowered)
+        else:
+            self.assertIn(decision.skipReason, {"strict_sanitization_rejection", "stock_family_rejected"})
+
+    def test_timeless_barcode_radio_canon_fact_can_remain(self):
+        source = state.RelaySourceDecision("canon", "[approved_barcode_canon:0] BARCODE Radio is the Network broadcast corridor.", {"canon": 1}, source_cursor=0)
+        async def fake_gemini(prompt, user_id=0, guild_id=0, route=""):
+            return ("BARCODE Radio remains the Network broadcast corridor for confirmed public transmissions and archive questions.\n"
+                    "Ask which BARCODE archive question should be clarified for the public corridor next.")
+        with mock.patch.object(bnl01_bot, "_select_approved_quiet_relay_source", return_value=source), \
+             mock.patch.object(bnl01_bot, "get_gemini_response", side_effect=fake_gemini):
+            decision = asyncio.run(bnl01_bot._generate_quiet_website_relay(42, source_cursor=0, highest=0))
+        self.assertTrue(decision.publish)
+        self.assertIn("BARCODE Radio", decision.message)
+
+    def test_canon_anchor_rotation_uses_accepted_history_only_and_wraps(self):
+        first = bnl01_bot._select_approved_quiet_relay_source(42, 0, 0, allow_continuity=False)
+        state.record_publication(self.db, 42, message="Accepted canon relay one cites the broadcast corridor.", directive="Ask one archive question for the corridor.", mode="OBSERVATION", relay_lane="network_posture", event_type="canon", source_cursor=0)
+        failed = bnl01_bot._select_approved_quiet_relay_source(42, 0, 0, allow_continuity=False)
+        self.assertIn("approved_barcode_canon:1", failed.context)
+        state.record_publication(self.db, 42, message="Accepted canon relay two cites established figures.", directive="Ask one established figure question.", mode="OBSERVATION", relay_lane="network_posture", event_type="canon", source_cursor=0)
+        third = bnl01_bot._select_approved_quiet_relay_source(42, 0, 0, allow_continuity=False)
+        state.record_publication(self.db, 42, message="Accepted canon relay three cites BNL liaison framing.", directive="Ask one liaison-framing question.", mode="OBSERVATION", relay_lane="network_posture", event_type="canon", source_cursor=0)
+        wrapped = bnl01_bot._select_approved_quiet_relay_source(42, 0, 0, allow_continuity=False)
+        self.assertIn("approved_barcode_canon:0", first.context)
+        self.assertIn("approved_barcode_canon:1", failed.context)
+        self.assertIn("approved_barcode_canon:2", third.context)
+        self.assertIn("approved_barcode_canon:0", wrapped.context)
+
+    def test_continuity_removes_cross_mentions_profiles_ids_urls_and_stale_timestamps(self):
+        with sqlite3.connect(self.db) as conn:
+            conn.execute("CREATE TABLE user_profiles(user_id INTEGER, guild_id INTEGER, display_name TEXT, preferred_name TEXT, last_seen TEXT, last_greeting_at TEXT, PRIMARY KEY(user_id, guild_id))")
+            conn.execute("INSERT INTO user_profiles(user_id,guild_id,display_name,preferred_name) VALUES(?,?,?,?)", (2, 42, "DisplayTwo", "PreferredTwo"))
+        stale = (datetime.utcnow() - timedelta(days=10)).replace(microsecond=0).isoformat() + "+00:00"
+        recent = datetime.utcnow().replace(microsecond=0).isoformat() + "+00:00"
+        self.add_row("Stale ISO row should not survive.", ts=stale, user="StaleName")
+        with sqlite3.connect(self.db) as conn:
+            conn.execute("INSERT INTO conversations(user_id,user_name,guild_id,channel_name,channel_policy,role,content,timestamp) VALUES(?,?,?,?,?,?,?,?)", (1, "AlphaUser", 42, "pub", "public_home", "user", "AlphaUser asks DisplayTwo and PreferredTwo to review <@222222222222222222> 222222222222222222 https://example.com for BARCODE archive grouping.", recent))
+            conn.execute("INSERT INTO conversations(user_id,user_name,guild_id,channel_name,channel_policy,role,content,timestamp) VALUES(?,?,?,?,?,?,?,?)", (2, "BetaUser", 42, "pub", "public_home", "user", "BetaUser answers AlphaUser with a public BARCODE archive grouping question.", recent))
+        source = bnl01_bot._select_relay_safe_continuity_source(42, 0, 2)
+        self.assertIsNotNone(source)
+        for token in ("AlphaUser", "BetaUser", "DisplayTwo", "PreferredTwo", "222222222222222222", "<@", "example.com", "Stale ISO"):
+            self.assertNotIn(token, source.context)
+        self.assertIn("BARCODE archive", source.context)
 
     def test_exact_force_pull_status_lookup_survives_newer_attempt(self):
         state.begin_attempt(self.db, "force123", 42, "forcePull", cursor=0)
