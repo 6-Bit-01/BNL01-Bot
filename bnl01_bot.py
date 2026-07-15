@@ -141,10 +141,12 @@ from bnl_website_relay_state import (
     WebsiteRelayDecision,
     begin_attempt as relay_begin_attempt,
     complete_attempt as relay_complete_attempt,
+    get_attempt as relay_get_attempt,
     last_attempt as relay_last_attempt,
     bootstrap_cursor as relay_bootstrap_cursor,
     get_cursor as relay_get_cursor,
     record_publication as relay_record_publication,
+    normalize_text as relay_normalize_text,
     recent_history as relay_recent_history,
     reject_reason_for_candidate as relay_reject_reason_for_candidate,
     stock_directive_reason as relay_stock_directive_reason,
@@ -2415,6 +2417,10 @@ RELAY_TOPIC_KEYWORDS = {
 force_pull_runner = None
 _force_pull_state_by_guild: dict[int, dict] = {}
 _force_pull_tasks_by_guild: dict[int, asyncio.Task] = {}
+_force_pull_request_id_by_guild: dict[int, str] = {}
+_force_pull_recent_requests_by_peer: dict[str, deque] = defaultdict(lambda: deque(maxlen=8))
+FORCE_PULL_THROTTLE_SECONDS = 10
+FORCE_PULL_THROTTLE_MAX_REQUESTS = 4
 
 
 def _utc_now_iso() -> str:
@@ -2471,6 +2477,7 @@ async def _run_force_pull_relay_update(guild_id: int, request_id: str = ""):
         task = _force_pull_tasks_by_guild.get(guild_id)
         if task is asyncio.current_task():
             _force_pull_tasks_by_guild.pop(guild_id, None)
+            _force_pull_request_id_by_guild.pop(guild_id, None)
 
 
 def _website_relay_mode_from_context(messages: list[str], now_pt: datetime) -> str:
@@ -3155,7 +3162,7 @@ async def _fetch_fresh_public_relay_rows(guild_id: int) -> tuple[list[tuple], in
         rows = list(reversed(cur.fetchall()))
     if not rows and highest > int(cursor_value or 0):
         logging.info("website_relay_no_publish guild=%s reason=fresh_context_expired cursor=%s highest=%s", guild_id, cursor_value, highest)
-        return [], int(cursor_value or 0), "fresh_context_expired"
+        return [], highest, "fresh_context_expired"
     return rows, (max([int(r[0]) for r in rows]) if rows else int(cursor_value or 0)), ""
 
 
@@ -3190,49 +3197,145 @@ def _strict_relay_output_line(line: str, *, limit: int, min_chars: int = 0) -> s
 
 
 
-def _select_approved_quiet_relay_source(guild_id: int, cursor_value: int, highest: int) -> RelaySourceDecision:
-    """Choose one privacy-safe non-fresh source for quiet website relay attempts."""
-    counts = {"conversation_continuity": 0, "broadcast_memory": 0, "memory": 0, "canon": 1, "reflection": 0}
+RELAY_CONTINUITY_FRESHNESS_HOURS = 72
+BROADCAST_RELAY_SCOPES = {"relay", "website_relay"}
+CANON_RELAY_ANCHORS = (
+    "BARCODE Radio is the Network broadcast corridor, shaped by public transmissions, host signal, and audience-facing questions.",
+    "Cache Back, DJ Floppydisc, Mac Modem, and 6 Bit remain established BARCODE figures; unresolved details should be treated as archive questions, not invented certainty.",
+    "BNL-01 serves as the BARCODE Network liaison voice: he can frame confirmed canon, preserve uncertainty, and invite public clarification without claiming live state.",
+)
+
+
+def _relay_safe_text_fragment(text: str, *, limit: int = 160) -> str:
+    cleaned = clean_website_text(text)
+    cleaned = re.sub(r"<[@#][^>]+>", " ", cleaned)
+    cleaned = re.sub(r"@\w+|#\w+", " ", cleaned)
+    cleaned = re.sub(r"https?://\S+", "link", cleaned)
+    cleaned = re.sub(r"[`\"“”‘’]", "", cleaned)
+    cleaned = re.sub(r"\b\d{15,20}\b", " ", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    if len(cleaned) > limit:
+        cleaned = _safe_boundary_truncate(cleaned, limit=limit, min_chars=40, use_ellipsis=False)
+    return cleaned.strip()
+
+
+def _select_relay_safe_continuity_source(guild_id: int, cursor_value: int, highest: int, *, limit: int = 12) -> RelaySourceDecision | None:
+    """Return anonymized thematic continuity from recent eligible public rows only."""
+    cutoff = (datetime.utcnow() - timedelta(hours=RELAY_CONTINUITY_FRESHNESS_HOURS)).replace(microsecond=0).isoformat(sep=" ")
+    with sqlite3.connect(DB_FILE) as conn:
+        rows = conn.execute(
+            """
+            SELECT id, user_name, content, channel_policy, timestamp
+            FROM conversations
+            WHERE guild_id=? AND role='user'
+              AND channel_policy IN ('public_home','public_context','public_selective')
+              AND timestamp >= ?
+            ORDER BY id DESC LIMIT ?
+            """,
+            (guild_id, cutoff, limit),
+        ).fetchall()
+    fragments = []
+    policies = set()
+    for row_id, user_name, content, policy, _timestamp in rows:
+        text = _relay_safe_text_fragment(content)
+        if user_name:
+            text = re.sub(re.escape(str(user_name)), "participant", text, flags=re.IGNORECASE)
+        lowered = text.lower()
+        if not text or len(text.split()) < 4:
+            continue
+        if any(marker in lowered for marker in ("private", "moderator", "admin", "research", "payment", "queue", "now playing", "up next", "bnl-testing")):
+            continue
+        policies.add(policy or "unknown")
+        fragments.append(f"[public_continuity_theme_{len(fragments)+1}] {text}")
+    if not fragments:
+        return None
+    counts = {"conversation_continuity": len(fragments), "broadcast_memory": 0, "canon": 0, "reflection": 0}
+    return RelaySourceDecision(
+        "conversation_continuity",
+        "\n".join(fragments[:6]),
+        counts,
+        source_cursor=cursor_value,
+        highest_eligible_conversation_id=highest,
+        metadata={"source_message_count": len(fragments), "eligible_policies": sorted(policies), "freshness_hours": RELAY_CONTINUITY_FRESHNESS_HOURS},
+    )
+
+
+def _parse_broadcast_memory_row(row) -> dict:
+    if isinstance(row, sqlite3.Row):
+        return dict(row)
+    keys = ("episode_date", "cleaned_summary", "entry_type", "importance", "public_safe", "affects_next_show", "usage_scope", "target_show_date", "valid_until", "override_span_count", "needs_clarification", "status", "superseded_by_id")
+    return {key: row[idx] if idx < len(row) else None for idx, key in enumerate(keys)}
+
+
+def _scope_allows_relay(scope: str) -> bool:
+    scopes = {part.strip().lower().replace("-", "_") for part in re.split(r"[,/;]+|\band\b", scope or "") if part.strip()}
+    return bool(scopes & BROADCAST_RELAY_SCOPES)
+
+
+def _valid_until_active(value: str | None) -> bool:
+    if not value:
+        return True
     try:
-        context, meta = _build_relay_context(guild_id, limit=12)
-        if context and int(meta.get("source_message_count") or 0) > 0:
-            counts["conversation_continuity"] = int(meta.get("source_message_count") or 0)
-            return RelaySourceDecision("conversation_continuity", context, counts, source_cursor=cursor_value, highest_eligible_conversation_id=highest, metadata=meta)
-    except Exception as exc:
-        logging.info("relay_continuity_source_unavailable guild=%s reason=%s", guild_id, _safe_force_pull_error(exc))
-    try:
-        memories = get_recent_broadcast_memory(guild_id, public_only=True, limit=8)
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = PACIFIC_TZ.localize(parsed)
+        return parsed.astimezone(timezone.utc) >= datetime.now(timezone.utc)
     except Exception:
-        memories = []
-    safe_lines = []
-    for m in memories or []:
-        text = clean_website_text(str(m.get("summary") if isinstance(m, dict) else m[2] if len(m) > 2 else ""))[:220]
-        if text and not any(x in text.lower() for x in ("private", "moderator", "admin", "payment", "queue", "now playing", "bnl-testing")):
-            safe_lines.append(f"[approved_broadcast_memory_{len(safe_lines)+1}] {text}")
-    if safe_lines:
-        counts["broadcast_memory"] = len(safe_lines)
-        return RelaySourceDecision("broadcast_memory", "\n".join(safe_lines[:6]), counts, source_cursor=cursor_value, highest_eligible_conversation_id=highest)
+        return False
+
+
+def _approved_relay_broadcast_memory(guild_id: int, *, limit: int = 8) -> list[dict]:
     try:
         with sqlite3.connect(DB_FILE) as conn:
             conn.row_factory = sqlite3.Row
-            rows = conn.execute("""
-                SELECT tier, summary, source_channel_policy, source_trust, updated_at
-                FROM memory_tiers
-                WHERE guild_id=? AND tier IN ('short','medium','long','dormant','core')
-                  AND source_channel_policy IN ('public_home','public_context','public_selective')
-                  AND source_trust IN ('source_safe_public','source_safe_public_consolidated')
-                ORDER BY salience DESC, mentions DESC, id DESC LIMIT 8
-            """, (guild_id,)).fetchall()
-        mem_lines = [f"[public_{r['tier']}_memory_{i}] {clean_website_text(r['summary'])[:220]}" for i, r in enumerate(rows, 1) if clean_website_text(r['summary'])]
-    except Exception:
-        mem_lines = []
-    if mem_lines:
-        counts["memory"] = len(mem_lines)
-        return RelaySourceDecision("memory", "\n".join(mem_lines[:6]), counts, source_cursor=cursor_value, highest_eligible_conversation_id=highest)
-    canon = (
-        "[approved_barcode_canon] BARCODE Radio is the Network broadcast corridor: an in-world Friday transmission space shaped by Cache Back, DJ Floppydisc, Mac Modem, 6 Bit, and public audience signals. "
-        "Records may be incomplete; unresolved BARCODE questions should be framed as inquiry, not invented certainty."
-    )
+            rows = conn.execute(
+                """
+                SELECT episode_date, cleaned_summary, entry_type, importance, public_safe, affects_next_show,
+                       usage_scope, target_show_date, valid_until, override_span_count, needs_clarification,
+                       status, superseded_by_id
+                FROM broadcast_memory
+                WHERE guild_id=? AND status='active' AND public_safe=1
+                  AND COALESCE(superseded_by_id, 0)=0
+                ORDER BY id DESC LIMIT ?
+                """,
+                (guild_id, limit),
+            ).fetchall()
+    except sqlite3.OperationalError:
+        return []
+    accepted = []
+    for row in rows:
+        item = _parse_broadcast_memory_row(row)
+        if not _scope_allows_relay(str(item.get("usage_scope") or "")):
+            continue
+        if not _valid_until_active(item.get("valid_until")):
+            continue
+        summary = _relay_safe_text_fragment(str(item.get("cleaned_summary") or ""), limit=220)
+        if not summary:
+            continue
+        item["cleaned_summary"] = summary
+        accepted.append(item)
+    return accepted
+
+
+def _select_approved_quiet_relay_source(guild_id: int, cursor_value: int, highest: int, *, allow_continuity: bool = True) -> RelaySourceDecision:
+    """Choose one approved non-fresh source for quiet website relay attempts."""
+    continuity = _select_relay_safe_continuity_source(guild_id, cursor_value, highest) if allow_continuity else None
+    if continuity:
+        return continuity
+    memories = _approved_relay_broadcast_memory(guild_id, limit=8)
+    if memories:
+        lines = [f"[approved_broadcast_memory_{idx}] {item['cleaned_summary']}" for idx, item in enumerate(memories[:6], start=1)]
+        counts = {"conversation_continuity": 0, "broadcast_memory": len(lines), "canon": 0, "reflection": 0}
+        return RelaySourceDecision("broadcast_memory", "\n".join(lines), counts, source_cursor=cursor_value, highest_eligible_conversation_id=highest, metadata={"source_message_count": len(lines)})
+    history = relay_recent_history(DB_FILE, guild_id, limit=25)
+    used = {relay_normalize_text(h.get("public_message", "")) for h in history}
+    anchor = CANON_RELAY_ANCHORS[len(history) % len(CANON_RELAY_ANCHORS)]
+    for candidate in CANON_RELAY_ANCHORS:
+        if relay_normalize_text(candidate) not in used:
+            anchor = candidate
+            break
+    canon = f"[approved_barcode_canon] {anchor}"
+    counts = {"conversation_continuity": 0, "broadcast_memory": 0, "canon": 1, "reflection": 0}
     return RelaySourceDecision("canon", canon, counts, source_cursor=cursor_value, highest_eligible_conversation_id=highest)
 
 
@@ -3240,63 +3343,60 @@ def _build_source_decision_prompt(decision: RelaySourceDecision, mode: str) -> s
     return (
         f"Write a BNL website relay from the selected approved source class: {decision.source_class}.\n"
         "Return exactly two lines: public relay message, then current directive.\n"
-        "Line 1 must be substantive, specific, in-world, and temporally safe. For older continuity, memory, or canon, do not say it is current activity or fresh Discord movement.\n"
+        "Line 1 must be substantive, specific, in-world, and temporally safe. For continuity, broadcast memory, canon, or reflection, do not say it is current activity or fresh Discord movement.\n"
         "Line 2 must be a real inquiry, follow-up, recognition target, or invitation grounded in the source.\n"
-        "Forbidden: queue/read-model state, now-playing, up-next, payment, availability, queue counts, #bnl-testing, private/admin/mod/research content, prior relay output, Field Logs, runtime inference, generic waiting/monitoring/standby/quiet-signal/bridge-active copy, usernames, direct quotes, urgency, or pressure.\n"
+        "Forbidden: queue/read-model state, now-playing, up-next, payment, availability, queue counts, #bnl-testing, private/admin/mod/research content, prior relay output, Field Logs, runtime inference, generic waiting/monitoring/standby/quiet-signal/bridge-active copy, usernames, channel names, direct quotes, urgency, or pressure.\n"
+        "Do not claim tonight, currently, live, imminent, available, on-air, or other current show state unless the approved source explicitly says so.\n"
         f"Mode: {mode}.\nApproved source context:\n{decision.context}\n"
     )
 
 
-_relay_quiet_sources_enabled = False
-
-async def _generate_dynamic_website_relay_with_quiet_flag(guild_id: int, *, allow_quiet_sources: bool = False) -> WebsiteRelayDecision:
-    global _relay_quiet_sources_enabled
-    previous = _relay_quiet_sources_enabled
-    _relay_quiet_sources_enabled = allow_quiet_sources
+async def _generate_quiet_website_relay(guild_id: int, *, source_cursor: int, highest: int, reason: str = "approved_quiet_source") -> WebsiteRelayDecision:
+    quiet_source = _select_approved_quiet_relay_source(guild_id, source_cursor, highest, allow_continuity=(reason != "bootstrap_no_publish"))
+    if quiet_source.skip_reason:
+        logging.info("website_relay_no_publish guild=%s reason=%s", guild_id, quiet_source.skip_reason)
+        return WebsiteRelayDecision(False, skipReason=quiet_source.skip_reason, sourceCursor=source_cursor, metadata={"reason": quiet_source.skip_reason, "source_class": quiet_source.source_class})
+    mode = "OBSERVATION"
+    prompt = _build_source_decision_prompt(quiet_source, mode)
     try:
-        return await generate_dynamic_website_relay(guild_id)
-    finally:
-        _relay_quiet_sources_enabled = previous
+        generated = await get_gemini_response(prompt, user_id=0, guild_id=guild_id, route="website_relay_event") or ""
+    except Exception as exc:
+        logging.warning("website_relay_no_publish guild=%s reason=provider_failure error=%s", guild_id, _safe_force_pull_error(exc))
+        return WebsiteRelayDecision(False, skipReason="provider_failure", sourceCursor=source_cursor, metadata={"reason": "provider_failure", "source_class": quiet_source.source_class, "aggregate_source_counts": quiet_source.aggregate_counts})
+    lines = [ln.strip() for ln in generated.splitlines() if ln.strip()]
+    if len(lines) != 2:
+        return WebsiteRelayDecision(False, skipReason="output_shape_invalid", sourceCursor=source_cursor, metadata={"reason": "output_shape_invalid", "source_class": quiet_source.source_class, "aggregate_source_counts": quiet_source.aggregate_counts})
+    relay_message = _strict_relay_output_line(lines[0], limit=300, min_chars=40)
+    directive = _strict_relay_output_line(lines[1], limit=220, min_chars=40)
+    show_supported = quiet_source.source_class == "canon" or _relay_context_supports_show_reference(quiet_source.context, relay_message)
+    relay_message = _sanitize_relay_temporal_claims(relay_message, guild_id, show_context_supported=show_supported, now_pacific=datetime.now(PACIFIC_TZ), limit=300, min_chars=0) if relay_message else ""
+    relay_message = _strict_relay_output_line(relay_message, limit=300, min_chars=40)
+    if not relay_message or not directive:
+        return WebsiteRelayDecision(False, skipReason="strict_sanitization_rejection", sourceCursor=source_cursor, metadata={"reason": "strict_sanitization_rejection", "source_class": quiet_source.source_class, "aggregate_source_counts": quiet_source.aggregate_counts})
+    directive_reason = relay_stock_directive_reason(directive)
+    if directive_reason:
+        return WebsiteRelayDecision(False, skipReason=directive_reason, sourceCursor=source_cursor, metadata={"reason": directive_reason, "source_class": quiet_source.source_class, "aggregate_source_counts": quiet_source.aggregate_counts})
+    dup_reason = relay_reject_reason_for_candidate(DB_FILE, guild_id, relay_message, directive)
+    if dup_reason:
+        return WebsiteRelayDecision(False, skipReason=dup_reason, sourceCursor=source_cursor, metadata={"reason": dup_reason, "source_class": quiet_source.source_class, "aggregate_source_counts": quiet_source.aggregate_counts})
+    meta = {**quiet_source.metadata, "reason": reason, "source_class": quiet_source.source_class, "aggregate_source_counts": quiet_source.aggregate_counts, "relay_lane": "network_posture"}
+    return WebsiteRelayDecision(True, eventType=quiet_source.source_class, sourceConversationIds=quiet_source.source_conversation_ids, sourceCursor=source_cursor, message=relay_message, directive=directive, mode=mode, relayLane="network_posture", metadata=meta)
 
-async def generate_dynamic_website_relay(guild_id: int) -> WebsiteRelayDecision:
+
+async def generate_dynamic_website_relay(guild_id: int, *, allow_quiet_sources: bool = False) -> WebsiteRelayDecision:
     """Inspect fresh public Discord activity and return an explicit publish/skip decision."""
     logging.info(f"🛰️ Inspecting website relay signal via generate_dynamic_website_relay(guild_id={guild_id}).")
     _hydrate_recent_relay_memory(guild_id)
     rows, source_cursor, skip_reason = await _fetch_fresh_public_relay_rows(guild_id)
     if skip_reason:
+        if allow_quiet_sources and skip_reason in {"bootstrap_no_publish", "fresh_context_expired"}:
+            return await _generate_quiet_website_relay(guild_id, source_cursor=source_cursor, highest=source_cursor, reason=skip_reason)
         return WebsiteRelayDecision(False, skipReason=skip_reason, sourceCursor=source_cursor, metadata={"reason": skip_reason})
     if not rows:
-        if not _relay_quiet_sources_enabled:
+        if not allow_quiet_sources:
             logging.info("website_relay_no_publish guild=%s reason=no_new_public_signal", guild_id)
             return WebsiteRelayDecision(False, skipReason="no_new_public_signal", sourceCursor=source_cursor, metadata={"reason": "no_new_public_signal"})
-        quiet_source = _select_approved_quiet_relay_source(guild_id, source_cursor, source_cursor)
-        if quiet_source.skip_reason:
-            logging.info("website_relay_no_publish guild=%s reason=%s", guild_id, quiet_source.skip_reason)
-            return WebsiteRelayDecision(False, skipReason=quiet_source.skip_reason, sourceCursor=source_cursor, metadata={"reason": quiet_source.skip_reason, "source_class": quiet_source.source_class})
-        mode = "OBSERVATION"
-        prompt = _build_source_decision_prompt(quiet_source, mode)
-        try:
-            generated = await get_gemini_response(prompt, user_id=0, guild_id=guild_id, route="website_relay_event") or ""
-        except Exception as exc:
-            logging.warning("website_relay_no_publish guild=%s reason=provider_failure error=%s", guild_id, _safe_force_pull_error(exc))
-            return WebsiteRelayDecision(False, skipReason="provider_failure", sourceCursor=source_cursor, metadata={"reason": "provider_failure", "source_class": quiet_source.source_class, "aggregate_source_counts": quiet_source.aggregate_counts})
-        lines = [ln.strip() for ln in generated.splitlines() if ln.strip()]
-        if len(lines) != 2:
-            return WebsiteRelayDecision(False, skipReason="output_shape_invalid", sourceCursor=source_cursor, metadata={"reason": "output_shape_invalid", "source_class": quiet_source.source_class, "aggregate_source_counts": quiet_source.aggregate_counts})
-        relay_message = _strict_relay_output_line(lines[0], limit=300, min_chars=40)
-        directive = _strict_relay_output_line(lines[1], limit=220, min_chars=40)
-        relay_message = _sanitize_relay_temporal_claims(relay_message, guild_id, show_context_supported=(quiet_source.source_class == "canon" or _relay_context_supports_show_reference(quiet_source.context, relay_message)), now_pacific=datetime.now(PACIFIC_TZ), limit=300, min_chars=0) if relay_message else ""
-        relay_message = _strict_relay_output_line(relay_message, limit=300, min_chars=40)
-        if not relay_message or not directive:
-            return WebsiteRelayDecision(False, skipReason="strict_sanitization_rejection", sourceCursor=source_cursor, metadata={"reason": "strict_sanitization_rejection", "source_class": quiet_source.source_class, "aggregate_source_counts": quiet_source.aggregate_counts})
-        directive_reason = relay_stock_directive_reason(directive)
-        if directive_reason:
-            return WebsiteRelayDecision(False, skipReason=directive_reason, sourceCursor=source_cursor, metadata={"reason": directive_reason, "source_class": quiet_source.source_class, "aggregate_source_counts": quiet_source.aggregate_counts})
-        dup_reason = relay_reject_reason_for_candidate(DB_FILE, guild_id, relay_message, directive)
-        if dup_reason:
-            return WebsiteRelayDecision(False, skipReason=dup_reason, sourceCursor=source_cursor, metadata={"reason": dup_reason, "source_class": quiet_source.source_class, "aggregate_source_counts": quiet_source.aggregate_counts})
-        meta = {**quiet_source.metadata, "reason": "approved_quiet_source", "source_class": quiet_source.source_class, "aggregate_source_counts": quiet_source.aggregate_counts, "relay_lane": "network_posture"}
-        return WebsiteRelayDecision(True, eventType=quiet_source.source_class, sourceConversationIds=quiet_source.source_conversation_ids, sourceCursor=source_cursor, message=relay_message, directive=directive, mode=mode, relayLane="network_posture", metadata=meta)
+        return await _generate_quiet_website_relay(guild_id, source_cursor=source_cursor, highest=source_cursor)
 
     messages = [str(r[2] or "").strip() for r in rows if str(r[2] or "").strip()]
     unique_users = len({str(r[1] or "").strip().lower() for r in rows if str(r[1] or "").strip()})
@@ -3311,7 +3411,10 @@ async def generate_dynamic_website_relay(guild_id: int) -> WebsiteRelayDecision:
     strength_messages = messages[-12:]
     context_is_strong, context_reason = _assess_relay_context_strength(strength_messages, relay_context, unique_users=unique_users, total_chars=sum(len(m) for m in strength_messages))
     if not context_is_strong:
-        logging.info("website_relay_no_publish guild=%s reason=fresh_context_below_threshold count=%s unique_users=%s chars=%s", guild_id, len(messages), unique_users, total_chars)
+        logging.info("website_relay_fresh_below_threshold_using_quiet_source guild=%s count=%s unique_users=%s chars=%s", guild_id, len(messages), unique_users, total_chars)
+        if allow_quiet_sources:
+            current_cursor = relay_get_cursor(DB_FILE, guild_id) or 0
+            return await _generate_quiet_website_relay(guild_id, source_cursor=current_cursor, highest=source_cursor, reason="fresh_context_below_threshold")
         return WebsiteRelayDecision(False, skipReason="fresh_context_below_threshold", sourceConversationIds=[int(r[0]) for r in rows], sourceCursor=source_cursor, metadata={"reason": context_reason, "source_message_count": len(messages), "source_class": "fresh_discord"})
 
     now_pt = datetime.now(PACIFIC_TZ)
@@ -3377,7 +3480,12 @@ async def _execute_website_relay_transaction(guild_id: int, *, force: bool = Fal
     lock = _get_website_relay_transaction_lock(guild_id)
     trigger = "forcePull" if source == "forcePull" else ("manual" if force else "scheduled")
     attempt_id = attempt_id or uuid.uuid4().hex[:12]
-    relay_begin_attempt(DB_FILE, attempt_id, guild_id, trigger, cursor=relay_get_cursor(DB_FILE, guild_id) or 0)
+    initial_cursor = relay_get_cursor(DB_FILE, guild_id) or 0
+    relay_begin_attempt(DB_FILE, attempt_id, guild_id, trigger, cursor=initial_cursor)
+    flags = get_bnl_control_flags(force_refresh=force or source == "forcePull")
+    if not flags.get("websiteRelayEnabled", True):
+        relay_complete_attempt(DB_FILE, attempt_id, source_class="none", outcome="disabled", reason="website_relay_disabled", aggregate_source_counts={}, cursor=initial_cursor, highest_eligible_conversation_id=initial_cursor)
+        return WebsiteRelayDecision(False, skipReason="website_relay_disabled", sourceCursor=initial_cursor, metadata={"reason": "website_relay_disabled", "source_class": "none"})
     async with lock:
         decision = await _generate_website_relay_guarded(guild_id, allow_quiet_sources=True)
         if decision is None:
@@ -3387,7 +3495,7 @@ async def _execute_website_relay_transaction(guild_id: int, *, force: bool = Fal
         highest = max(decision.sourceConversationIds or [decision.sourceCursor or 0])
         if not decision.publish:
             reason = decision.skipReason or "no_safe_source"
-            outcome = "provider_failed" if reason == "provider_failure" else ("no_safe_source" if reason in {"no_new_public_signal", "bootstrap_no_publish", "fresh_context_expired"} else "rejected")
+            outcome = "disabled" if reason == "website_relay_disabled" else ("provider_failed" if reason in {"provider_failure", "relay_generation_timeout"} else ("no_safe_source" if reason in {"no_new_public_signal", "bootstrap_no_publish", "fresh_context_expired"} else "rejected"))
             relay_complete_attempt(DB_FILE, attempt_id, source_class=source_class, outcome=outcome, reason=reason, aggregate_source_counts=counts, cursor=decision.sourceCursor, highest_eligible_conversation_id=highest)
             return decision
         admin_note = build_admin_note(mode=decision.mode, message=decision.message, current_directive=decision.directive, source=admin_note_source) if force else ""
@@ -3453,10 +3561,25 @@ def _force_pull_authorized(request: web.Request) -> bool:
     return hmac.compare_digest(provided_secret, BNL_FORCE_PULL_SHARED_SECRET)
 
 
+def _force_pull_throttled(request: web.Request) -> bool:
+    peer = (getattr(request, "remote", None) or request.headers.get("x-forwarded-for") or "unknown").split(",")[0].strip()[:80]
+    now = time.monotonic()
+    window = _force_pull_recent_requests_by_peer[peer]
+    while window and now - window[0] > FORCE_PULL_THROTTLE_SECONDS:
+        window.popleft()
+    if len(window) >= FORCE_PULL_THROTTLE_MAX_REQUESTS:
+        logging.warning("force_pull_throttled peer=%s", peer)
+        return True
+    window.append(now)
+    return False
+
+
 async def _handle_force_pull(request: web.Request) -> web.Response:
     if not _force_pull_authorized(request):
         logging.warning("Invalid force-pull secret rejected")
         return web.json_response({"ok": False, "error": "unauthorized"}, status=401)
+    if _force_pull_throttled(request):
+        return web.json_response({"ok": False, "error": "rate_limited"}, status=429)
     if int(request.headers.get("content-length") or 0) > 2048:
         return web.json_response({"ok": False, "error": "body_too_large"}, status=413)
     if request.can_read_body:
@@ -3483,11 +3606,13 @@ async def _handle_force_pull(request: web.Request) -> web.Response:
             "status": "already_running",
             "message": "force_pull_already_running",
             "guild_id": guild_id,
+            "request_id": _force_pull_request_id_by_guild.get(guild_id, ""),
         }, status=202)
 
     request_id = uuid.uuid4().hex[:12]
     task = asyncio.create_task(_run_force_pull_relay_update(guild_id, request_id=request_id))
     _force_pull_tasks_by_guild[guild_id] = task
+    _force_pull_request_id_by_guild[guild_id] = request_id
 
     logging.info(f"Force-pull accepted guild={guild_id} request_id={request_id}")
     return web.json_response({
@@ -3508,8 +3633,8 @@ async def _handle_force_pull_status(request: web.Request) -> web.Response:
     guild_id = _resolve_force_pull_guild()
     if not guild_id:
         return web.json_response({"ok": False, "error": "no_guild_available"}, status=503)
-    attempt = relay_last_attempt(DB_FILE, guild_id)
-    if not attempt or attempt.get("attempt_id") != request_id:
+    attempt = relay_get_attempt(DB_FILE, request_id)
+    if not attempt or int(attempt.get("guild_id") or 0) != int(guild_id):
         return web.json_response({"ok": True, "status": "unknown", "request_id": request_id}, status=404)
     return web.json_response({"ok": True, "request_id": request_id, "status": attempt.get("outcome"), "source_class": attempt.get("source_class"), "reason": attempt.get("reason") or "", "accepted_relay_id": attempt.get("accepted_relay_id") or ""})
 
@@ -13113,6 +13238,15 @@ def _build_website_relay_timeout_fallback(guild_id: int) -> WebsiteRelayDecision
     )
 
 
+async def _call_generate_dynamic_website_relay(guild_id: int, *, allow_quiet_sources: bool = False) -> WebsiteRelayDecision:
+    try:
+        return await generate_dynamic_website_relay(guild_id, allow_quiet_sources=allow_quiet_sources)
+    except TypeError as exc:
+        if "allow_quiet_sources" not in str(exc):
+            raise
+        return await generate_dynamic_website_relay(guild_id)
+
+
 async def _generate_website_relay_guarded(guild_id: int, *, allow_quiet_sources: bool = False) -> WebsiteRelayDecision | None:
     existing = _website_relay_generation_tasks_by_guild.get(guild_id)
     if existing and not existing.done():
@@ -13123,7 +13257,7 @@ async def _generate_website_relay_guarded(guild_id: int, *, allow_quiet_sources:
 
     started = time.monotonic()
     state = {"timed_out": False}
-    task = asyncio.create_task(_generate_dynamic_website_relay_with_quiet_flag(guild_id, allow_quiet_sources=allow_quiet_sources))
+    task = asyncio.create_task(_call_generate_dynamic_website_relay(guild_id, allow_quiet_sources=allow_quiet_sources))
     _website_relay_generation_tasks_by_guild[guild_id] = task
     logging.info(f"website_relay_generation_started guild={guild_id}")
 

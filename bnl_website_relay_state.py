@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 MAX_HISTORY = 25
+MAX_ATTEMPTS_PER_GUILD = 100
 STOCK_FAMILIES = {
     "waiting_standby": (
         "waiting", "standing by", "standby", "awaiting signal", "awaiting fresh", "remains online",
@@ -212,6 +213,15 @@ def record_publication(db_path: str, guild_id: int, *, message: str, directive: 
     return relay_id
 
 
+def _prune_attempts(conn: sqlite3.Connection, guild_id: int) -> None:
+    old = conn.execute(
+        "SELECT attempt_id FROM website_relay_attempts WHERE guild_id=? ORDER BY started_at DESC LIMIT -1 OFFSET ?",
+        (guild_id, MAX_ATTEMPTS_PER_GUILD),
+    ).fetchall()
+    if old:
+        conn.executemany("DELETE FROM website_relay_attempts WHERE attempt_id=?", [(r[0],) for r in old])
+
+
 def begin_attempt(db_path: str, attempt_id: str, guild_id: int, trigger: str, source_class: str = "pending", *, cursor: int = 0, highest_eligible_conversation_id: int = 0, aggregate_source_counts: dict[str, int] | None = None) -> None:
     ensure_schema(db_path)
     with sqlite3.connect(db_path) as conn:
@@ -219,6 +229,8 @@ def begin_attempt(db_path: str, attempt_id: str, guild_id: int, trigger: str, so
         INSERT OR REPLACE INTO website_relay_attempts(attempt_id,guild_id,trigger,source_class,started_at,outcome,aggregate_source_counts,cursor,highest_eligible_conversation_id)
         VALUES(?,?,?,?,?,?,?,?,?)
         """, (attempt_id, guild_id, trigger, source_class, utc_now_iso(), "accepted", __import__('json').dumps(aggregate_source_counts or {}, sort_keys=True), int(cursor or 0), int(highest_eligible_conversation_id or 0)))
+        _prune_attempts(conn, guild_id)
+
 
 def complete_attempt(db_path: str, attempt_id: str, *, source_class: str, outcome: str, reason: str = "", aggregate_source_counts: dict[str, int] | None = None, cursor: int = 0, highest_eligible_conversation_id: int = 0, accepted_relay_id: str = "") -> None:
     ensure_schema(db_path)
@@ -228,6 +240,15 @@ def complete_attempt(db_path: str, attempt_id: str, *, source_class: str, outcom
         SET source_class=?, completed_at=?, outcome=?, reason=?, aggregate_source_counts=?, cursor=?, highest_eligible_conversation_id=?, accepted_relay_id=?
         WHERE attempt_id=?
         """, (source_class or "none", utc_now_iso(), outcome, reason or "", __import__('json').dumps(aggregate_source_counts or {}, sort_keys=True), int(cursor or 0), int(highest_eligible_conversation_id or 0), accepted_relay_id or "", attempt_id))
+
+
+def get_attempt(db_path: str, attempt_id: str) -> dict[str, Any]:
+    ensure_schema(db_path)
+    with sqlite3.connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute("SELECT * FROM website_relay_attempts WHERE attempt_id=?", (attempt_id,)).fetchone()
+    return dict(row) if row else {}
+
 
 def last_attempt(db_path: str, guild_id: int) -> dict[str, Any]:
     ensure_schema(db_path)

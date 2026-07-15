@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 import sqlite3
 import tempfile
@@ -410,9 +411,6 @@ class WebsiteRelayEventDrivenTests(unittest.TestCase):
         self.assertEqual(hist[0]["semantic_family"], "general_public_signal")
 
 
-if __name__ == "__main__":
-    unittest.main()
-
 class WebsiteRelayRecoveryTests(unittest.TestCase):
     setUp = WebsiteRelayEventDrivenTests.setUp
     tearDown = WebsiteRelayEventDrivenTests.tearDown
@@ -465,6 +463,138 @@ class WebsiteRelayRecoveryTests(unittest.TestCase):
              mock.patch.object(bnl01_bot, "update_website_status", side_effect=AssertionError("delivery should be gated")):
             decision = asyncio.run(bnl01_bot._execute_website_relay_transaction(42, force=True, source="relay"))
         self.assertFalse(decision.publish)
-        self.assertEqual(decision.skipReason, "website_post_failed")
+        self.assertEqual(decision.skipReason, "website_relay_disabled")
         self.assertEqual(state.get_cursor(self.db, 42), 0)
-        self.assertEqual(state.last_attempt(self.db, 42)["outcome"], "delivery_failed")
+        self.assertEqual(state.last_attempt(self.db, 42)["outcome"], "disabled")
+
+    def create_broadcast_memory_table(self):
+        with sqlite3.connect(self.db) as conn:
+            conn.execute("""
+            CREATE TABLE IF NOT EXISTS broadcast_memory (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id INTEGER NOT NULL,
+                episode_date TEXT NOT NULL,
+                cleaned_summary TEXT NOT NULL,
+                entry_type TEXT NOT NULL,
+                importance TEXT DEFAULT 'medium',
+                public_safe INTEGER DEFAULT 0,
+                affects_next_show INTEGER DEFAULT 0,
+                usage_scope TEXT DEFAULT 'internal',
+                target_show_date TEXT,
+                valid_until TEXT,
+                override_span_count INTEGER DEFAULT 1,
+                needs_clarification INTEGER DEFAULT 0,
+                status TEXT DEFAULT 'active',
+                superseded_by_id INTEGER
+            )
+            """)
+
+    def add_broadcast_memory(self, summary, *, entry_type="entry_type_should_not_appear", public_safe=1, usage_scope="relay", valid_until=None, status="active", superseded_by_id=None):
+        self.create_broadcast_memory_table()
+        with sqlite3.connect(self.db) as conn:
+            conn.execute(
+                """
+                INSERT INTO broadcast_memory(guild_id, episode_date, cleaned_summary, entry_type, public_safe, usage_scope, valid_until, status, superseded_by_id)
+                VALUES(42, '2026-07-10', ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (summary, entry_type, public_safe, usage_scope, valid_until, status, superseded_by_id),
+            )
+
+    def test_bootstrap_transaction_publishes_quiet_without_replaying_history(self):
+        self.add_row("Old historical Discord row from ArchivistName should not be replayed as fresh current content.", user="ArchivistName")
+        async def fake_gemini(prompt, user_id=0, guild_id=0, route=""):
+            self.assertIn("selected approved source class", prompt)
+            self.assertNotIn("ArchivistName", prompt)
+            self.assertNotIn("Old historical Discord row", prompt)
+            return ("BNL keeps this relay on BARCODE canon while the archive cursor aligns behind the curtain.\n"
+                    "Ask which BARCODE archive question should be clarified for the public corridor next.")
+        with mock.patch.object(bnl01_bot, "get_gemini_response", side_effect=fake_gemini), \
+             mock.patch.object(bnl01_bot, "update_website_status_controlled_async", return_value=True):
+            decision = asyncio.run(bnl01_bot._execute_website_relay_transaction(42, force=True, source="relay"))
+        self.assertTrue(decision.publish)
+        self.assertEqual(state.get_cursor(self.db, 42), 1)
+
+    def test_relay_safe_continuity_excludes_stale_identity_and_channel_tokens(self):
+        state.bootstrap_cursor(self.db, 42, 0)
+        stale = (datetime.utcnow() - timedelta(days=10)).replace(microsecond=0).isoformat(sep=" ")
+        self.add_row("Stale public note from DisplayName about an old topic.", ts=stale, user="DisplayName")
+        self.add_row("Fresh public discussion asks how BARCODE archive questions should be grouped for listeners.", user="FreshName")
+        source = bnl01_bot._select_relay_safe_continuity_source(42, 0, 1)
+        self.assertIsNotNone(source)
+        self.assertIn("archive questions", source.context)
+        self.assertNotIn("DisplayName", source.context)
+        self.assertNotIn("FreshName", source.context)
+        self.assertNotIn("channel:", source.context)
+        self.assertNotIn("Stale public note", source.context)
+
+    def test_broadcast_memory_selector_uses_cleaned_summary_and_rejects_invalid_rows(self):
+        expired = (datetime.utcnow() - timedelta(days=1)).isoformat()
+        self.add_broadcast_memory("Expired relay summary should not appear.", valid_until=expired)
+        self.add_broadcast_memory("Internal summary should not appear.", usage_scope="internal")
+        self.add_broadcast_memory("Superseded summary should not appear.", superseded_by_id=99)
+        self.add_broadcast_memory("Private summary should not appear.", public_safe=0)
+        self.add_broadcast_memory("Clean public relay-scoped memory about BARCODE archive follow-up.", entry_type="entry_type_should_not_appear")
+        source = bnl01_bot._select_approved_quiet_relay_source(42, 0, 0)
+        self.assertEqual(source.source_class, "broadcast_memory")
+        self.assertIn("Clean public relay-scoped memory", source.context)
+        self.assertNotIn("entry_type_should_not_appear", source.context)
+        self.assertNotIn("Expired relay summary", source.context)
+        self.assertNotIn("Internal summary", source.context)
+        self.assertNotIn("Superseded summary", source.context)
+        self.assertNotIn("Private summary", source.context)
+
+    def test_weak_fresh_rows_quiet_fallback_preserves_cursor_until_strong_delivery(self):
+        state.bootstrap_cursor(self.db, 42, 0)
+        self.add_row("too small", user="weak")
+        async def fake_gemini(prompt, user_id=0, guild_id=0, route=""):
+            return ("BARCODE canon gives BNL a stable archive question without consuming weak public chatter.\n"
+                    "Ask which archive thread should be clarified before weak chatter becomes evidence.")
+        with mock.patch.object(bnl01_bot, "get_gemini_response", side_effect=fake_gemini), \
+             mock.patch.object(bnl01_bot, "update_website_status_controlled_async", return_value=True):
+            decision = asyncio.run(bnl01_bot._execute_website_relay_transaction(42, force=True, source="relay"))
+        self.assertTrue(decision.publish)
+        self.assertEqual(state.get_cursor(self.db, 42), 0)
+
+    def test_exact_force_pull_status_lookup_survives_newer_attempt(self):
+        state.begin_attempt(self.db, "force123", 42, "forcePull", cursor=0)
+        state.complete_attempt(self.db, "force123", source_class="canon", outcome="published", reason="", cursor=0, accepted_relay_id="relay-a")
+        state.begin_attempt(self.db, "newer456", 42, "scheduled", cursor=0)
+        state.complete_attempt(self.db, "newer456", source_class="canon", outcome="rejected", reason="duplicate", cursor=0)
+        class Req:
+            headers = {}
+            match_info = {"request_id": "force123"}
+        with mock.patch.object(bnl01_bot, "BNL_FORCE_PULL_SHARED_SECRET", ""), \
+             mock.patch.object(bnl01_bot, "_resolve_force_pull_guild", return_value=42):
+            resp = asyncio.run(bnl01_bot._handle_force_pull_status(Req()))
+        self.assertEqual(resp.status, 200)
+        self.assertIn(b'"request_id": "force123"', resp.body)
+        self.assertIn(b'"status": "published"', resp.body)
+
+    def test_force_pull_auth_body_limit_malformed_and_throttle(self):
+        class Req:
+            def __init__(self, headers=None, body_error=None, remote="1.2.3.4"):
+                self.headers = headers or {}
+                self.can_read_body = True
+                self.remote = remote
+                self._body_error = body_error
+            async def json(self):
+                if self._body_error:
+                    raise self._body_error
+                return {}
+        with mock.patch.object(bnl01_bot, "BNL_FORCE_PULL_SHARED_SECRET", "secret"):
+            bad = asyncio.run(bnl01_bot._handle_force_pull(Req(headers={"x-bnl-secret": "bad"})))
+            self.assertEqual(bad.status, 401)
+            large = asyncio.run(bnl01_bot._handle_force_pull(Req(headers={"x-bnl-secret": "secret", "content-length": "4096"})))
+            self.assertEqual(large.status, 413)
+            malformed = asyncio.run(bnl01_bot._handle_force_pull(Req(headers={"x-bnl-secret": "secret"}, body_error=json.JSONDecodeError("bad", "{", 0), remote="2.2.2.2")))
+            self.assertEqual(malformed.status, 400)
+            with mock.patch.object(bnl01_bot, "_resolve_force_pull_guild", return_value=None):
+                for i in range(bnl01_bot.FORCE_PULL_THROTTLE_MAX_REQUESTS):
+                    asyncio.run(bnl01_bot._handle_force_pull(Req(headers={"x-bnl-secret": "secret"}, remote="3.3.3.3")))
+                throttled = asyncio.run(bnl01_bot._handle_force_pull(Req(headers={"x-bnl-secret": "secret"}, remote="3.3.3.3")))
+                self.assertEqual(throttled.status, 429)
+
+
+
+if __name__ == "__main__":
+    unittest.main()
