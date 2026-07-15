@@ -271,6 +271,120 @@ class WebsiteRelayEventDrivenTests(unittest.TestCase):
         self.assertEqual(decision.skipReason, "provider_failure")
         self.assertEqual(state.stock_directive_reason("Continue monitoring."), "stock_directive_rejected")
 
+    def test_website_relay_route_bypasses_glitch_and_cross_universe_rewrites(self):
+        async def base_result(contents, route):
+            return bnl01_bot.GenerationResult(True, "Line one.\nLine two directive with enough detail.", route=route)
+        async def forbidden_rewrite(*args, **kwargs):
+            raise AssertionError("creative rewrite called")
+        with mock.patch.object(bnl01_bot, "check_quota_availability", return_value=True), \
+             mock.patch.object(bnl01_bot, "_generate_gemini_content_result_async", side_effect=base_result), \
+             mock.patch.object(bnl01_bot, "_generate_gemini_content_with_fallback_async", side_effect=forbidden_rewrite), \
+             mock.patch.object(bnl01_bot.random, "random", return_value=0.0):
+            text = asyncio.run(bnl01_bot.get_gemini_response("prompt", 0, 42, route="website_relay_event"))
+        self.assertEqual(text, "Line one.\nLine two directive with enough detail.")
+
+    def test_general_glitch_rewrite_does_not_mutate_website_status(self):
+        async def base_result(contents, route):
+            return bnl01_bot.GenerationResult(True, "Normal Discord response.", route=route)
+        async def rewrite_result(*args, **kwargs):
+            return object()
+        with mock.patch.object(bnl01_bot, "check_quota_availability", return_value=True), \
+             mock.patch.object(bnl01_bot, "_generate_gemini_content_result_async", side_effect=base_result), \
+             mock.patch.object(bnl01_bot, "_generate_gemini_content_with_fallback_async", side_effect=rewrite_result), \
+             mock.patch.object(bnl01_bot, "_extract_text_and_tokens", return_value=("Glitched Discord response.", 0)), \
+             mock.patch.object(bnl01_bot.random, "random", side_effect=[0.0, 1.0]), \
+             mock.patch.object(bnl01_bot, "update_website_status_controlled_async", side_effect=AssertionError("website mutated")):
+            text = asyncio.run(bnl01_bot.get_gemini_response("prompt", 0, 42, route="normal_chat"))
+        self.assertEqual(text, "Glitched Discord response.")
+
+    def test_invalid_output_shapes_do_not_publish_or_advance(self):
+        for output in [
+            "Only one valid public observation line.",
+            "Public observation line with enough detail.\nToo short.",
+            "Public observation line with enough detail.\nIncomplete directive without punctuation",
+            "Public observation line with enough detail.\nDirective with enough detail for this public thread.\nExtra explanation.",
+        ]:
+            self.tearDown(); self.setUp()
+            state.bootstrap_cursor(self.db, 42, 0)
+            self.add_row("Can BNL explain how tonight's public broadcast track submissions work? #barcode", user="a")
+            self.add_row("I have a public question about the show and which track context matters?", user="b")
+            async def fake_gemini(prompt, user_id=0, guild_id=0, route=""):
+                return output
+            async def run_one():
+                with mock.patch.object(bnl01_bot, "get_gemini_response", side_effect=fake_gemini), \
+                     mock.patch.object(bnl01_bot, "update_website_status_controlled_async", side_effect=AssertionError("invalid output posted")):
+                    return await bnl01_bot._execute_website_relay_transaction(42, source="relay")
+            decision = asyncio.run(run_one())
+            self.assertFalse(decision.publish)
+            self.assertIn(decision.skipReason, {"output_shape_invalid", "strict_sanitization_rejection"})
+            self.assertEqual(state.get_cursor(self.db, 42), 0)
+            self.assertEqual(state.recent_history(self.db, 42, 10), [])
+
+    def test_legacy_passive_listen_directive_rejected(self):
+        directive = "Hold the relay in passive listen mode and refresh once clear public context returns from active Discord channels."
+        self.assertEqual(state.stock_directive_reason(directive), "stock_directive_rejected")
+
+    def test_more_than_24_fresh_rows_uses_newest_24_chronologically_and_cursor(self):
+        state.bootstrap_cursor(self.db, 42, 0)
+        for i in range(30):
+            self.add_row(f"Public row {i:02d} asks about broadcast track submissions and show context? #barcode", user=str(i % 3))
+        prompts = []
+        async def fake_gemini(prompt, user_id=0, guild_id=0, route=""):
+            prompts.append(prompt)
+            return "Fresh Discord rows focus on broadcast track submissions across the newest selected context.\nFollow the public thread for confirmed submission details or links before indexing the answer."
+        with mock.patch.object(bnl01_bot, "get_gemini_response", side_effect=fake_gemini):
+            decision = self.generate()
+        self.assertTrue(decision.publish)
+        self.assertEqual(len(decision.sourceConversationIds), 24)
+        self.assertEqual(decision.sourceConversationIds[0], 7)
+        self.assertEqual(decision.sourceConversationIds[-1], 30)
+        prompt = prompts[0]
+        self.assertNotIn("Public row 05", prompt)
+        self.assertLess(prompt.index("Public row 06"), prompt.index("Public row 29"))
+        self.assertEqual(decision.sourceCursor, 30)
+
+    def test_signal_strength_uses_newest_12_not_old_weak_prefix(self):
+        state.bootstrap_cursor(self.db, 42, 0)
+        for i in range(12):
+            self.add_row(f"weak prefix {i}", user="a")
+        self.add_row("Can BNL explain how tonight's public broadcast track submissions work? #barcode", user="b")
+        self.add_row("I have a public question about the show and which track context matters?", user="c")
+        async def fake_gemini(prompt, user_id=0, guild_id=0, route=""):
+            return "Newer Discord questions focus the relay on broadcast submissions despite the weak prefix.\nFollow the public thread for confirmed submission details or links before indexing the answer."
+        with mock.patch.object(bnl01_bot, "get_gemini_response", side_effect=fake_gemini):
+            decision = self.generate()
+        self.assertTrue(decision.publish)
+
+    def test_awaiting_confirmation_is_not_stock_but_stock_language_remains_rejected(self):
+        self.assertNotEqual(state.semantic_family("A release credit is awaiting confirmation from the artist."), "non_event_stock")
+        for text in [
+            "BNL is waiting for fresh public signal.",
+            "BNL is standing by until clearer activity returns.",
+            "BNL continues monitoring the quiet public signal.",
+        ]:
+            self.assertEqual(state.semantic_family(text), "non_event_stock")
+
+    def test_timed_out_generation_coroutine_receives_cancellation(self):
+        original_timeout = bnl01_bot.BNL_WEBSITE_RELAY_GENERATION_TIMEOUT_SECONDS
+        bnl01_bot.BNL_WEBSITE_RELAY_GENERATION_TIMEOUT_SECONDS = 0.01
+        cancelled = {"seen": False}
+        async def slow_generation(guild_id):
+            try:
+                await asyncio.sleep(1)
+            except asyncio.CancelledError:
+                cancelled["seen"] = True
+                raise
+        async def run_one():
+            with mock.patch.object(bnl01_bot, "generate_dynamic_website_relay", side_effect=slow_generation), \
+                 mock.patch.object(bnl01_bot, "update_website_status_controlled_async", side_effect=AssertionError("posted late")):
+                return await bnl01_bot._execute_website_relay_transaction(42, source="relay")
+        try:
+            decision = asyncio.run(run_one())
+        finally:
+            bnl01_bot.BNL_WEBSITE_RELAY_GENERATION_TIMEOUT_SECONDS = original_timeout
+        self.assertFalse(decision.publish)
+        self.assertTrue(cancelled["seen"])
+
 
 if __name__ == "__main__":
     unittest.main()

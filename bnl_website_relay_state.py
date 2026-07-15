@@ -93,10 +93,19 @@ def normalize_text(text: str) -> str:
     return text
 
 
+def _has_stock_marker(norm: str, marker: str) -> bool:
+    marker_norm = normalize_text(marker)
+    if not marker_norm:
+        return False
+    if " " in marker_norm:
+        return re.search(r"(?<![a-z0-9])" + re.escape(marker_norm) + r"(?![a-z0-9])", norm) is not None
+    return re.search(r"(?<![a-z0-9])" + re.escape(marker_norm) + r"(?![a-z0-9])", norm) is not None
+
+
 def semantic_family(text: str) -> str:
     norm = normalize_text(text)
     for family, markers in STOCK_FAMILIES.items():
-        if any(marker in norm for marker in markers):
+        if any(_has_stock_marker(norm, marker) for marker in markers):
             return "non_event_stock"
     if any(k in norm for k in ("track", "song", "submission", "broadcast", "show", "question", "asked", "discuss")):
         return "public_discord_activity"
@@ -107,6 +116,8 @@ STOCK_DIRECTIVE_MARKERS = (
     "continue monitoring", "await further activity", "await fresh", "review fresh context",
     "review fresh public discord context", "maintain observation posture", "stand by",
     "standing by", "monitor until", "await clearer", "waiting for", "remain online",
+    "hold the relay", "passive listen mode", "refresh once clear public context returns",
+    "clear public context returns",
 )
 
 
@@ -114,7 +125,7 @@ def stock_directive_reason(directive: str) -> str:
     norm = normalize_text(directive)
     if not norm:
         return "empty_directive"
-    if any(marker in norm for marker in STOCK_DIRECTIVE_MARKERS):
+    if any(_has_stock_marker(norm, marker) for marker in STOCK_DIRECTIVE_MARKERS):
         return "stock_directive_rejected"
     # A useful current directive should be specific enough to not fit every relay.
     if len(norm.split()) < 5:

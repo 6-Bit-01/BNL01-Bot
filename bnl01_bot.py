@@ -3136,11 +3136,12 @@ async def _fetch_fresh_public_relay_rows(guild_id: int) -> tuple[list[tuple], in
               AND channel_policy IN ('public_home', 'public_context', 'public_selective')
               AND id > ?
               AND timestamp >= ?
-            ORDER BY id ASC
+            ORDER BY id DESC
+            LIMIT 24
             """,
             (guild_id, int(cursor_value or 0), cutoff),
         )
-        rows = cur.fetchall()
+        rows = list(reversed(cur.fetchall()))
     if not rows and highest > int(cursor_value or 0):
         logging.info("website_relay_no_publish guild=%s reason=fresh_context_expired cursor=%s highest=%s", guild_id, cursor_value, highest)
         return [], int(cursor_value or 0), "fresh_context_expired"
@@ -3157,6 +3158,24 @@ def _hydrate_recent_relay_memory(guild_id: int) -> None:
             lane = h.get("relay_lane")
             if lane:
                 _recent_relay_lanes_by_guild[guild_id].append(lane)
+
+
+def _strict_relay_output_line(line: str, *, limit: int, min_chars: int = 0) -> str:
+    """Relay-only sanitizer that never manufactures fallback copy."""
+    text = clean_website_text((line or "").strip())
+    if not text or (min_chars and len(text) < min_chars):
+        return ""
+    if len(text) > limit:
+        boundary = max(text.rfind(". ", 0, limit + 1), text.rfind("? ", 0, limit + 1), text.rfind("! ", 0, limit + 1))
+        if boundary >= max(40, min_chars):
+            text = text[: boundary + 1].strip()
+        else:
+            return ""
+    if len(text) > limit or (min_chars and len(text) < min_chars):
+        return ""
+    if text[-1] not in ".!?":
+        return ""
+    return text
 
 
 async def generate_dynamic_website_relay(guild_id: int) -> WebsiteRelayDecision:
@@ -3180,7 +3199,8 @@ async def generate_dynamic_website_relay(guild_id: int) -> WebsiteRelayDecision:
         if content:
             relay_context_lines.append(f"[fresh_public_message_{idx}]\npolicy: {r[3] or 'unknown_policy'}\nchannel: {r[4] or 'unknown'}\ncontent: {content}")
     relay_context = "\n\n".join(relay_context_lines)
-    context_is_strong, context_reason = _assess_relay_context_strength(messages, relay_context, unique_users=unique_users, total_chars=total_chars)
+    strength_messages = messages[-12:]
+    context_is_strong, context_reason = _assess_relay_context_strength(strength_messages, relay_context, unique_users=unique_users, total_chars=sum(len(m) for m in strength_messages))
     if not context_is_strong:
         logging.info("website_relay_no_publish guild=%s reason=fresh_context_below_threshold count=%s unique_users=%s chars=%s", guild_id, len(messages), unique_users, total_chars)
         return WebsiteRelayDecision(False, skipReason="fresh_context_below_threshold", sourceConversationIds=[int(r[0]) for r in rows], sourceCursor=source_cursor, metadata={"reason": context_reason, "source_message_count": len(messages)})
@@ -3199,19 +3219,19 @@ async def generate_dynamic_website_relay(guild_id: int) -> WebsiteRelayDecision:
         f"Mode: {mode}.\nFresh public context:\n{relay_context}\n"
     )
     try:
-        generated = await get_gemini_response(prompt, user_id=0, guild_id=guild_id) or ""
+        generated = await get_gemini_response(prompt, user_id=0, guild_id=guild_id, route="website_relay_event") or ""
     except Exception as exc:
         logging.warning("website_relay_no_publish guild=%s reason=provider_failure error=%s", guild_id, _safe_force_pull_error(exc))
         return WebsiteRelayDecision(False, skipReason="provider_failure", sourceConversationIds=[int(r[0]) for r in rows], sourceCursor=source_cursor, metadata={"reason": "provider_failure"})
     lines = [ln.strip() for ln in generated.splitlines() if ln.strip()]
-    if not lines:
-        return WebsiteRelayDecision(False, skipReason="empty_output", sourceConversationIds=[int(r[0]) for r in rows], sourceCursor=source_cursor, metadata={"reason": "empty_output"})
-    relay_message = sanitize_website_status_message(lines[0], limit=300, min_chars=0)
-    directive = sanitize_website_status_message(lines[1] if len(lines) > 1 else "", limit=220, min_chars=40)
-    relay_message = _sanitize_relay_temporal_claims(relay_message, guild_id, show_context_supported=_relay_context_supports_show_reference(" ".join(messages), relay_message), now_pacific=now_pt, limit=360, min_chars=0)
-    directive = fit_complete_statement(directive, limit=220, min_chars=40, fallback="Review fresh public Discord context before the next relay update.")
+    if len(lines) != 2:
+        return WebsiteRelayDecision(False, skipReason="output_shape_invalid", sourceConversationIds=[int(r[0]) for r in rows], sourceCursor=source_cursor, metadata={"reason": "output_shape_invalid", "line_count": len(lines)})
+    relay_message = _strict_relay_output_line(lines[0], limit=300, min_chars=40)
+    directive = _strict_relay_output_line(lines[1], limit=220, min_chars=40)
+    relay_message = _sanitize_relay_temporal_claims(relay_message, guild_id, show_context_supported=_relay_context_supports_show_reference(" ".join(messages), relay_message), now_pacific=now_pt, limit=300, min_chars=0) if relay_message else ""
+    relay_message = _strict_relay_output_line(relay_message, limit=300, min_chars=40)
     if not relay_message or not directive:
-        return WebsiteRelayDecision(False, skipReason="sanitization_rejection", sourceConversationIds=[int(r[0]) for r in rows], sourceCursor=source_cursor, metadata={"reason": "sanitization_rejection"})
+        return WebsiteRelayDecision(False, skipReason="strict_sanitization_rejection", sourceConversationIds=[int(r[0]) for r in rows], sourceCursor=source_cursor, metadata={"reason": "strict_sanitization_rejection"})
     lane_ok, lane_reason = _validate_relay_lane_adherence(relay_message, relay_lane, True, guild_id)
     if not lane_ok:
         return WebsiteRelayDecision(False, skipReason="lane_validation_failure", sourceConversationIds=[int(r[0]) for r in rows], sourceCursor=source_cursor, relayLane=relay_lane, metadata={"reason": lane_reason})
@@ -12079,6 +12099,7 @@ async def get_gemini_generation_result(prompt: str, user_id: int, guild_id: int,
                     text = msg["parts"][0] if msg.get("parts") else ""
                     conversation_context += f"User: {text}\n"
         is_show_state_route = (route or "").startswith("show_state")
+        is_website_relay_event_route = (route or "") == "website_relay_event"
         show_state_route_block = ""
         if is_show_state_route:
             show_state_route_block = (
@@ -12144,6 +12165,7 @@ async def get_gemini_response(prompt: str, user_id: int, guild_id: int, route: s
         print("BNL DEBUG: sending prompt to Gemini")
 
         is_show_state_route = (route or "").startswith("show_state")
+        is_website_relay_event_route = (route or "") == "website_relay_event"
         public_authority_guard_active = _is_public_authority_guard_prompt(prompt)
         source_authority_context_present = prompt_has_source_authority_context(prompt)
         current_message_media_context_present = _prompt_has_current_message_media_context(prompt)
@@ -12181,7 +12203,7 @@ async def get_gemini_response(prompt: str, user_id: int, guild_id: int, route: s
         text = generation_result.text
 
         # -------- AI Generated Glitch Event --------
-        if text and random.random() < 0.08:
+        if text and not is_website_relay_event_route and random.random() < 0.08:
             show_state_rewrite_guard = ""
             if is_show_state_route:
                 show_state_rewrite_guard = """
@@ -12240,14 +12262,9 @@ async def get_gemini_response(prompt: str, user_id: int, guild_id: int, route: s
                     logging.info("glitch_rewrite_rejected reason=public_operator_causality_claim")
                 else:
                     text = glitch_text
-                    await update_website_status_controlled_async(
-                        mode="SIGNAL_DEGRADATION",
-                        message="Signal degradation detected. Liaison output may fluctuate.",
-                        status="ONLINE",
-                    )
 
         # -------- Rare Cross-Universe Bleed --------
-        if text and random.random() < CROSS_UNIVERSE_BLEED_CHANCE:
+        if text and not is_website_relay_event_route and random.random() < CROSS_UNIVERSE_BLEED_CHANCE:
             show_state_bleed_guard = ""
             if is_show_state_route:
                 show_state_bleed_guard = """
