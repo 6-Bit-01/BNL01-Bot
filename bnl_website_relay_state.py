@@ -111,6 +111,26 @@ def ensure_schema(db_path: str) -> None:
             if name not in cols:
                 conn.execute(ddl)
 
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS website_relay_pending_v2 (
+            guild_id INTEGER PRIMARY KEY,
+            relay_id TEXT NOT NULL,
+            message TEXT NOT NULL,
+            current_directive TEXT NOT NULL,
+            source_class TEXT NOT NULL,
+            trigger TEXT NOT NULL,
+            source_cursor INTEGER NOT NULL DEFAULT 0,
+            source_conversation_fingerprint TEXT NOT NULL,
+            canonical_json TEXT NOT NULL,
+            prepared_at TEXT NOT NULL,
+            mode TEXT NOT NULL DEFAULT 'OBSERVATION',
+            relay_lane TEXT NOT NULL DEFAULT 'current_signal',
+            event_type TEXT NOT NULL DEFAULT '',
+            aggregate_source_counts TEXT NOT NULL DEFAULT '{}',
+            highest_eligible_conversation_id INTEGER NOT NULL DEFAULT 0
+        )
+        """)
+
 
 def get_cursor(db_path: str, guild_id: int) -> int | None:
     ensure_schema(db_path)
@@ -201,6 +221,55 @@ def reject_reason_for_candidate(db_path: str, guild_id: int, message: str, direc
         if old and difflib.SequenceMatcher(None, norm, old).ratio() >= threshold:
             return "near_duplicate"
     return ""
+
+
+def get_pending_v2_publication(db_path: str, guild_id: int) -> dict[str, Any]:
+    ensure_schema(db_path)
+    with sqlite3.connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute("SELECT * FROM website_relay_pending_v2 WHERE guild_id=?", (guild_id,)).fetchone()
+    return dict(row) if row else {}
+
+
+def save_pending_v2_publication(
+    db_path: str,
+    guild_id: int,
+    *,
+    relay_id: str,
+    message: str,
+    current_directive: str,
+    source_class: str,
+    trigger: str,
+    source_cursor: int,
+    source_conversation_fingerprint: str,
+    canonical_json: str,
+    mode: str = "OBSERVATION",
+    relay_lane: str = "current_signal",
+    event_type: str = "",
+    aggregate_source_counts: dict[str, int] | None = None,
+    highest_eligible_conversation_id: int = 0,
+) -> None:
+    ensure_schema(db_path)
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("""
+        INSERT OR REPLACE INTO website_relay_pending_v2(
+            guild_id,relay_id,message,current_directive,source_class,trigger,source_cursor,source_conversation_fingerprint,
+            canonical_json,prepared_at,mode,relay_lane,event_type,aggregate_source_counts,highest_eligible_conversation_id
+        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """, (
+            guild_id, relay_id, message, current_directive, source_class, trigger, int(source_cursor or 0),
+            source_conversation_fingerprint or "", canonical_json, utc_now_iso(), mode or "OBSERVATION", relay_lane or "current_signal",
+            event_type or "", __import__('json').dumps(aggregate_source_counts or {}, sort_keys=True), int(highest_eligible_conversation_id or 0),
+        ))
+
+
+def clear_pending_v2_publication(db_path: str, guild_id: int, relay_id: str = "") -> None:
+    ensure_schema(db_path)
+    with sqlite3.connect(db_path) as conn:
+        if relay_id:
+            conn.execute("DELETE FROM website_relay_pending_v2 WHERE guild_id=? AND relay_id=?", (guild_id, relay_id))
+        else:
+            conn.execute("DELETE FROM website_relay_pending_v2 WHERE guild_id=?", (guild_id,))
 
 
 def record_publication(db_path: str, guild_id: int, *, message: str, directive: str, mode: str, relay_lane: str, event_type: str, source_cursor: int, published_timestamp: str | None = None, relay_id: str | None = None) -> str:

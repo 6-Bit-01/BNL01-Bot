@@ -169,6 +169,85 @@ class ContractV2Tests(unittest.TestCase):
             self.assertEqual(len(state.recent_history(f.name, 99)), 1)
             self.assertEqual(state.recent_history(f.name, 42), [])
 
+
+    def test_durable_pending_replay_across_transactions_and_restart(self):
+        decision_one = bnl01_bot.WebsiteRelayDecision(
+            True, eventType="canon", sourceConversationIds=[10, 11], sourceCursor=11,
+            message="First accepted relay speech stays durable.",
+            directive="Preserve this accepted directive across replay.",
+            mode="OBSERVATION", relayLane="network_posture",
+            metadata={"source_class": "canon", "aggregate_source_counts": {"canon": 1}},
+        )
+        sent = []
+        def lost_response(req, timeout=10):
+            sent.append(req.data)
+            raise urllib.error.URLError("lost after accept")
+        with tempfile.NamedTemporaryFile() as f, mock.patch.object(bnl01_bot, "DB_FILE", f.name), mock.patch.object(bnl01_bot, "BNL_WEBSITE_CONTRACT_VERSION", "2"), mock.patch.object(bnl01_bot, "BNL_STATUS_URL", "https://site.test"), mock.patch.object(bnl01_bot, "BNL_API_KEY", "key"), mock.patch.object(bnl01_bot, "get_bnl_control_flags", return_value={"websiteRelayEnabled": True, "heartbeatEnabled": True}), mock.patch.object(bnl01_bot, "_generate_website_relay_guarded", return_value=decision_one), mock.patch("urllib.request.urlopen", side_effect=lost_response):
+            first = asyncio.run(bnl01_bot._execute_website_relay_transaction(42, source="relay"))
+            self.assertFalse(first.publish)
+            self.assertEqual(first.skipReason, "website_post_failed")
+            self.assertEqual(first.metadata["reason"], "retryable_delivery_failure")
+            self.assertEqual(state.get_cursor(f.name, 42), None)
+            pending = state.get_pending_v2_publication(f.name, 42)
+            self.assertTrue(pending)
+            first_relay_id = pending["relay_id"]
+            first_bytes = pending["canonical_json"].encode()
+            self.assertEqual(sent[0], sent[1])
+            self.assertEqual(sent[0], first_bytes)
+
+            # Simulate a restart by clearing process-local transaction locks; pending state remains in SQLite.
+            bnl01_bot._website_relay_transaction_locks_by_guild.clear()
+            def should_not_generate(*args, **kwargs):
+                raise AssertionError("new candidate generated despite pending envelope")
+            def idempotent_response(req, timeout=10):
+                sent.append(req.data)
+                env = json.loads(req.data.decode())
+                return Resp(200, accepted_body(env, idempotent=True))
+            with mock.patch.object(bnl01_bot, "_generate_website_relay_guarded", side_effect=should_not_generate), mock.patch("urllib.request.urlopen", side_effect=idempotent_response):
+                second = asyncio.run(bnl01_bot._execute_website_relay_transaction(42, source="relay"))
+            self.assertTrue(second.publish)
+            self.assertTrue(second.metadata["pending_replay"])
+            self.assertEqual(second.metadata["accepted_relay_id"], first_relay_id)
+            self.assertEqual(sent[-1], first_bytes)
+            self.assertEqual(state.get_cursor(f.name, 42), 11)
+            hist = state.recent_history(f.name, 42)
+            self.assertEqual(len(hist), 1)
+            self.assertEqual(hist[0]["relay_id"], first_relay_id)
+            self.assertEqual(state.get_pending_v2_publication(f.name, 42), {})
+
+    def test_delivery_failures_are_hard_failures_for_manual_request(self):
+        async def failed_transaction(guild_id, **kwargs):
+            return bnl01_bot.WebsiteRelayDecision(False, skipReason="website_post_failed", metadata={"reason": "authentication_failed", "delivery_failure": True})
+        with mock.patch.object(bnl01_bot, "_execute_website_relay_transaction", side_effect=failed_transaction):
+            ok, _mode, msg, directive = asyncio.run(bnl01_bot.request_fresh_website_relay(42, force=True))
+        self.assertFalse(ok)
+        self.assertEqual((msg, directive), ("", ""))
+
+    def test_safe_no_publication_remains_non_failure_for_manual_request(self):
+        async def safe_empty(guild_id, **kwargs):
+            return bnl01_bot.WebsiteRelayDecision(False, skipReason="no_new_public_signal", metadata={"reason": "no_new_public_signal"})
+        with mock.patch.object(bnl01_bot, "_execute_website_relay_transaction", side_effect=safe_empty):
+            ok, _mode, msg, directive = asyncio.run(bnl01_bot.request_fresh_website_relay(42, force=True))
+        self.assertTrue(ok)
+        self.assertEqual((msg, directive), ("", ""))
+
+    def test_force_pull_delivery_failure_sets_failed_with_detail(self):
+        async def failed_transaction(guild_id, **kwargs):
+            return bnl01_bot.WebsiteRelayDecision(False, skipReason="website_post_failed", mode="OBSERVATION", metadata={"reason": "relay_id_conflict", "delivery_failure": True})
+        with mock.patch.object(bnl01_bot, "_execute_website_relay_transaction", side_effect=failed_transaction):
+            asyncio.run(bnl01_bot._run_force_pull_relay_update(42, request_id="force-fail"))
+        fp = bnl01_bot._get_force_pull_state(42)
+        self.assertEqual(fp["last_force_pull_status"], "failed")
+        self.assertEqual(fp["last_force_pull_error"], "relay_id_conflict")
+
+    def test_startup_hydration_rejects_persisted_false(self):
+        env = c.build_relay_envelope("bnl-hydrate-0003", "msg", "dir", "canon", "scheduled")
+        body = json.dumps({"status": "ONLINE", "mode": "OBSERVATION", "message": "msg", "currentDirective": "dir", "source": "relay", "lastSeen": "2026-07-15T00:00:00Z", "persisted": False, "contractVersion": 2, "presence": {"contractVersion": 2, "status": "ONLINE", "mode": "OBSERVATION", "source": "startup", "receivedAt": "2026-07-15T00:00:00Z"}, "relay": dict(env["relay"], contractVersion=2, publishedAt="2026-07-15T00:00:00Z")}).encode()
+        with tempfile.NamedTemporaryFile() as f, mock.patch.object(bnl01_bot, "DB_FILE", f.name), mock.patch.object(bnl01_bot, "BNL_STATUS_URL", "https://site.test"), mock.patch.object(bnl01_bot, "BNL_API_KEY", "key"), mock.patch("urllib.request.urlopen", return_value=Resp(200, body)):
+            self.assertFalse(bnl01_bot.hydrate_website_relay_v2(42))
+            self.assertEqual(state.recent_history(f.name, 42), [])
+            self.assertIsNone(state.get_cursor(f.name, 42))
+
     def test_v1_heartbeat_noops_without_http_stock_status(self):
         calls = []
         with mock.patch.object(bnl01_bot, "BNL_WEBSITE_CONTRACT_VERSION", "1"), mock.patch.object(bnl01_bot, "update_website_status_controlled_async", side_effect=lambda **kw: calls.append(kw)):

@@ -182,7 +182,8 @@ def validate_relay_response(data: Any, submitted: Dict[str, Any]) -> DeliveryRes
     return DeliveryResult(True, "published", "", relay_id=relay["relayId"], published_at=published_at, idempotent=bool(data.get("idempotent")))
 
 
-def deliver_json(url: str, api_key: str, envelope: Dict[str, Any], *, opener: Callable[..., Any] = urllib.request.urlopen, retries: int = 1, timeout: int = 10) -> DeliveryResult:
+def deliver_json(url: str, api_key: str, envelope: Dict[str, Any], *, opener: Optional[Callable[..., Any]] = None, retries: int = 1, timeout: int = 10) -> DeliveryResult:
+    opener = opener or urllib.request.urlopen
     payload = canonical_payload_bytes(envelope)
     last_reason = "retryable_delivery_failure"
     for attempt in range(max(0, retries) + 1):
@@ -227,7 +228,7 @@ def deliver_json(url: str, api_key: str, envelope: Dict[str, Any], *, opener: Ca
 
 
 def parse_status_relay(data: Any) -> Optional[Dict[str, Any]]:
-    if not isinstance(data, dict) or data.get("contractVersion") != 2:
+    if not isinstance(data, dict) or data.get("contractVersion") != 2 or data.get("persisted") is not True:
         return None
     relay = data.get("relay")
     if not isinstance(relay, dict):
