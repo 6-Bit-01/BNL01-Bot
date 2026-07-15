@@ -412,3 +412,59 @@ class WebsiteRelayEventDrivenTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class WebsiteRelayRecoveryTests(unittest.TestCase):
+    setUp = WebsiteRelayEventDrivenTests.setUp
+    tearDown = WebsiteRelayEventDrivenTests.tearDown
+    add_row = WebsiteRelayEventDrivenTests.add_row
+
+    def test_quiet_manual_transaction_publishes_from_canon_without_cursor_advance(self):
+        state.bootstrap_cursor(self.db, 42, 7)
+        async def fake_gemini(prompt, user_id=0, guild_id=0, route=""):
+            self.assertIn("selected approved source class: canon", prompt)
+            self.assertNotIn("queue counts", prompt.lower().split("approved source context:", 1)[-1])
+            return ("BARCODE canon keeps the relay trained on the broadcast corridor and its unresolved archive questions without claiming fresh movement.\n"
+                    "Ask which unresolved BARCODE history thread should be clarified before the next public index pass.")
+        with mock.patch.object(bnl01_bot, "get_gemini_response", side_effect=fake_gemini), \
+             mock.patch.object(bnl01_bot, "update_website_status_controlled_async", return_value=True):
+            decision = asyncio.run(bnl01_bot._execute_website_relay_transaction(42, force=True, source="relay"))
+        self.assertTrue(decision.publish)
+        self.assertEqual(decision.eventType, "canon")
+        self.assertEqual(state.get_cursor(self.db, 42), 7)
+        attempt = state.last_attempt(self.db, 42)
+        self.assertEqual(attempt["outcome"], "published")
+        self.assertEqual(attempt["source_class"], "canon")
+
+    def test_heartbeat_false_does_not_disable_manual_website_speech(self):
+        state.bootstrap_cursor(self.db, 42, 0)
+        self.add_row("Can BNL explain how public broadcast track submissions work? #barcode", user="a")
+        self.add_row("I have a public question about the show and which track context matters?", user="b")
+        async def fake_gemini(prompt, user_id=0, guild_id=0, route=""):
+            return ("Two fresh public questions compare broadcast submissions with track context in the public corridor.\n"
+                    "Follow the public questions for confirmed submission details before indexing the answer.")
+        with mock.patch.object(bnl01_bot, "BNL_API_KEY", "test-api-key"), \
+             mock.patch.object(bnl01_bot, "BNL_STATUS_URL", "https://example.invalid/api"), \
+             mock.patch.object(bnl01_bot, "get_bnl_control_flags", return_value={"websiteRelayEnabled": True, "heartbeatEnabled": False}), \
+             mock.patch.object(bnl01_bot, "get_gemini_response", side_effect=fake_gemini), \
+             mock.patch.object(bnl01_bot, "update_website_status", return_value=True):
+            ok, mode, msg, directive = asyncio.run(bnl01_bot.request_fresh_website_relay(42, force=True))
+        self.assertTrue(ok)
+        self.assertIn("fresh public questions", msg)
+
+    def test_website_relay_false_disables_delivery_and_preserves_cursor(self):
+        state.bootstrap_cursor(self.db, 42, 0)
+        self.add_row("Can BNL explain how public broadcast track submissions work? #barcode", user="a")
+        self.add_row("I have a public question about the show and which track context matters?", user="b")
+        async def fake_gemini(prompt, user_id=0, guild_id=0, route=""):
+            return ("Two fresh public questions compare broadcast submissions with track context in the public corridor.\n"
+                    "Follow the public questions for confirmed submission details before indexing the answer.")
+        with mock.patch.object(bnl01_bot, "BNL_API_KEY", "test-api-key"), \
+             mock.patch.object(bnl01_bot, "BNL_STATUS_URL", "https://example.invalid/api"), \
+             mock.patch.object(bnl01_bot, "get_bnl_control_flags", return_value={"websiteRelayEnabled": False, "heartbeatEnabled": True}), \
+             mock.patch.object(bnl01_bot, "get_gemini_response", side_effect=fake_gemini), \
+             mock.patch.object(bnl01_bot, "update_website_status", side_effect=AssertionError("delivery should be gated")):
+            decision = asyncio.run(bnl01_bot._execute_website_relay_transaction(42, force=True, source="relay"))
+        self.assertFalse(decision.publish)
+        self.assertEqual(decision.skipReason, "website_post_failed")
+        self.assertEqual(state.get_cursor(self.db, 42), 0)
+        self.assertEqual(state.last_attempt(self.db, 42)["outcome"], "delivery_failed")
