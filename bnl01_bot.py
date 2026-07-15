@@ -135,6 +135,15 @@ from discord import app_commands
 from discord.ext import tasks
 from google import genai
 
+from bnl_website_relay_state import (
+    WebsiteRelayDecision,
+    bootstrap_cursor as relay_bootstrap_cursor,
+    get_cursor as relay_get_cursor,
+    record_publication as relay_record_publication,
+    recent_history as relay_recent_history,
+    reject_reason_for_candidate as relay_reject_reason_for_candidate,
+)
+
 # ==================== CONFIGURATION ====================
 
 # Prefer env vars on VPS:
@@ -155,6 +164,7 @@ BNL_TYPING_INDICATOR_ENABLED = os.getenv("BNL_TYPING_INDICATOR_ENABLED", "false"
 BNL_TYPING_INDICATOR_COOLDOWN_SECONDS = max(8, int(os.getenv("BNL_TYPING_INDICATOR_COOLDOWN_SECONDS", "12") or 12))
 BNL_WEBSITE_RELAY_INTERVAL_MINUTES = max(1, int(os.getenv("BNL_WEBSITE_RELAY_INTERVAL_MINUTES", "20")))
 BNL_WEBSITE_RELAY_GENERATION_TIMEOUT_SECONDS = max(1.0, float(os.getenv("BNL_WEBSITE_RELAY_GENERATION_TIMEOUT_SECONDS", "25") or 25))
+BNL_WEBSITE_RELAY_FRESHNESS_MINUTES = max(1, int(os.getenv("BNL_WEBSITE_RELAY_FRESHNESS_MINUTES", "120") or 120))
 BNL_PRIMARY_GUILD_ID = int(os.getenv("BNL_PRIMARY_GUILD_ID", "0") or 0)
 
 
@@ -2425,25 +2435,34 @@ async def _run_force_pull_relay_update(guild_id: int, request_id: str = ""):
     tag = f" request_id={request_id}" if request_id else ""
     logging.info(f"Force-pull background relay update started guild={guild_id}{tag}")
     try:
-        mode, relay_message, directive, _relay_meta = await generate_dynamic_website_relay(guild_id)
+        decision = await generate_dynamic_website_relay(guild_id)
+        state["last_force_pull_completed_at"] = _utc_now_iso()
+        if not decision.publish:
+            state["last_force_pull_status"] = "succeeded"
+            state["last_force_pull_error"] = decision.skipReason or "no_relay_published"
+            logging.info("Force-pull completed without publication guild=%s reason=%s%s", guild_id, decision.skipReason, tag)
+            return
         ok = await update_website_status_controlled_async(
-            mode=mode,
-            message=relay_message,
+            mode=decision.mode,
+            message=decision.message,
             status="ONLINE",
             force=True,
-            current_directive=directive,
+            current_directive=decision.directive,
             source="forcePull",
-            admin_note=build_admin_note(mode=mode, message=relay_message, current_directive=directive, source="forcePull"),
+            admin_note=build_admin_note(mode=decision.mode, message=decision.message, current_directive=decision.directive, source="forcePull"),
         )
-        state["last_force_pull_completed_at"] = _utc_now_iso()
         if ok:
+            relay_record_publication(DB_FILE, guild_id, message=decision.message, directive=decision.directive, mode=decision.mode, relay_lane=decision.relayLane, event_type=decision.eventType, source_cursor=decision.sourceCursor)
+            _remember_relay_message(guild_id, decision.message)
+            _remember_relay_topic(guild_id, decision.message)
+            _remember_relay_lane(guild_id, decision.relayLane)
             state["last_force_pull_status"] = "succeeded"
             state["last_force_pull_error"] = ""
-            logging.info(f"Force-pull background relay update succeeded guild={guild_id} mode={mode}{tag}")
+            logging.info(f"Force-pull background relay update succeeded guild={guild_id} mode={decision.mode}{tag}")
         else:
             state["last_force_pull_status"] = "failed"
             state["last_force_pull_error"] = "relay_update_failed"
-            logging.warning(f"Force-pull background relay update failed guild={guild_id} mode={mode}{tag}")
+            logging.warning(f"Force-pull background relay update failed guild={guild_id} mode={decision.mode}{tag}")
     except Exception as e:
         state["last_force_pull_completed_at"] = _utc_now_iso()
         state["last_force_pull_status"] = "failed"
@@ -3101,313 +3120,122 @@ def _build_relay_context(guild_id: int, limit: int = 20) -> tuple[str, dict]:
     return context, meta
 
 
-async def generate_dynamic_website_relay(guild_id: int) -> tuple[str, str, str, dict]:
-    logging.info(f"🛰️ Generating website relay message via generate_dynamic_website_relay(guild_id={guild_id}).")
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    cursor.execute(
-        """
-        SELECT user_name, content, channel_policy
-        FROM conversations
-        WHERE guild_id = ? AND role = 'user'
-          AND channel_policy IN ('public_home', 'public_context', 'public_selective')
-        ORDER BY id DESC
-        LIMIT 24
-        """,
-        (guild_id,),
-    )
-    rows = cursor.fetchall()
-    conn.close()
+async def _fetch_fresh_public_relay_rows(guild_id: int) -> tuple[list[tuple], int, str]:
+    """Return only fresh eligible public Discord user rows newer than the relay cursor."""
+    cursor_value = relay_get_cursor(DB_FILE, guild_id)
+    with sqlite3.connect(DB_FILE) as conn:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT COALESCE(MAX(id), 0)
+            FROM conversations
+            WHERE guild_id = ? AND role = 'user'
+              AND channel_policy IN ('public_home', 'public_context', 'public_selective')
+            """,
+            (guild_id,),
+        )
+        highest = int((cur.fetchone() or [0])[0] or 0)
+        if cursor_value is None:
+            relay_bootstrap_cursor(DB_FILE, guild_id, highest)
+            logging.info("website_relay_bootstrap_no_publish guild=%s sourceCursor=%s", guild_id, highest)
+            return [], highest, "bootstrap_no_publish"
+        cutoff = (datetime.utcnow() - timedelta(minutes=BNL_WEBSITE_RELAY_FRESHNESS_MINUTES)).replace(microsecond=0).isoformat(sep=" ")
+        cur.execute(
+            """
+            SELECT id, user_name, content, channel_policy, channel_name, timestamp
+            FROM conversations
+            WHERE guild_id = ? AND role = 'user'
+              AND channel_policy IN ('public_home', 'public_context', 'public_selective')
+              AND id > ?
+              AND timestamp >= ?
+            ORDER BY id ASC
+            """,
+            (guild_id, int(cursor_value or 0), cutoff),
+        )
+        rows = cur.fetchall()
+    if not rows and highest > int(cursor_value or 0):
+        logging.info("website_relay_no_publish guild=%s reason=fresh_context_expired cursor=%s highest=%s", guild_id, cursor_value, highest)
+        return [], int(cursor_value or 0), "fresh_context_expired"
+    return rows, (max([int(r[0]) for r in rows]) if rows else int(cursor_value or 0)), ""
 
-    messages = [r[1].strip() for r in rows if r and len(r) > 1 and r[1] and r[1].strip()]
-    unique_users = len({(r[0] or "").strip().lower() for r in rows if r and r[0] and (r[0] or "").strip()})
-    total_chars = sum(len((r[1] or "").strip()) for r in rows if r and len(r) > 1 and r[1] and r[1].strip())
-    eligible_policies = sorted({(r[2] or "").strip() for r in rows if r and len(r) > 2 and (r[2] or "").strip()})
+
+def _hydrate_recent_relay_memory(guild_id: int) -> None:
+    history = relay_recent_history(DB_FILE, guild_id, limit=25)
+    if history:
+        _recent_relay_messages[guild_id] = [h.get("normalized_message", "") for h in reversed(history) if h.get("normalized_message")]
+        _recent_relay_lanes_by_guild[guild_id].clear()
+        for h in reversed(history[-8:]):
+            lane = h.get("relay_lane")
+            if lane:
+                _recent_relay_lanes_by_guild[guild_id].append(lane)
+
+
+async def generate_dynamic_website_relay(guild_id: int) -> WebsiteRelayDecision:
+    """Inspect fresh public Discord activity and return an explicit publish/skip decision."""
+    logging.info(f"🛰️ Inspecting website relay signal via generate_dynamic_website_relay(guild_id={guild_id}).")
+    _hydrate_recent_relay_memory(guild_id)
+    rows, source_cursor, skip_reason = await _fetch_fresh_public_relay_rows(guild_id)
+    if skip_reason:
+        return WebsiteRelayDecision(False, skipReason=skip_reason, sourceCursor=source_cursor, metadata={"reason": skip_reason})
+    if not rows:
+        logging.info("website_relay_no_publish guild=%s reason=no_new_public_signal", guild_id)
+        return WebsiteRelayDecision(False, skipReason="no_new_public_signal", sourceCursor=source_cursor, metadata={"reason": "no_new_public_signal"})
+
+    messages = [str(r[2] or "").strip() for r in rows if str(r[2] or "").strip()]
+    unique_users = len({str(r[1] or "").strip().lower() for r in rows if str(r[1] or "").strip()})
+    total_chars = sum(len(m) for m in messages)
+    eligible_policies = sorted({str(r[3] or "").strip() for r in rows if str(r[3] or "").strip()})
+    relay_context_lines = []
+    for idx, r in enumerate(rows, start=1):
+        content = clean_website_text(str(r[2] or ""))[:180]
+        if content:
+            relay_context_lines.append(f"[fresh_public_message_{idx}]\npolicy: {r[3] or 'unknown_policy'}\nchannel: {r[4] or 'unknown'}\ncontent: {content}")
+    relay_context = "\n\n".join(relay_context_lines)
+    context_is_strong, context_reason = _assess_relay_context_strength(messages, relay_context, unique_users=unique_users, total_chars=total_chars)
+    if not context_is_strong:
+        logging.info("website_relay_no_publish guild=%s reason=fresh_context_below_threshold count=%s unique_users=%s chars=%s", guild_id, len(messages), unique_users, total_chars)
+        return WebsiteRelayDecision(False, skipReason="fresh_context_below_threshold", sourceConversationIds=[int(r[0]) for r in rows], sourceCursor=source_cursor, metadata={"reason": context_reason, "source_message_count": len(messages)})
+
     now_pt = datetime.now(PACIFIC_TZ)
     mode = _website_relay_mode_from_context(messages, now_pt)
-    signal_summary = get_recent_signal_summary(guild_id)
-    relay_context, relay_context_meta = _build_relay_context(guild_id)
-    show_context_supported = _relay_context_supports_show_reference(
-        " ".join(messages),
-        signal_summary,
-        relay_context,
+    relay_lane = "current_signal"
+    prompt = (
+        "Write a BNL website relay only about the fresh eligible public Discord context supplied below.\n"
+        "Return exactly two lines: public relay message, then operator directive.\n"
+        "Do not mention queues, read-model state, Radio, releases, dossiers, transmissions, waiting, standby, quiet channels, observation posture, bridge-active status, or lack of signal.\n"
+        "Do not include usernames. Keep it public-safe and factual.\n"
+        f"Mode: {mode}.\nFresh public context:\n{relay_context}\n"
     )
-    source_channel_count = relay_context_meta.get("source_channel_count", 0)
-    context_is_strong, context_reason = _assess_relay_context_strength(messages, relay_context, unique_users=unique_users, total_chars=total_chars)
-    logging.info(f"website_relay_context_sources guild={guild_id} source_channel_count={source_channel_count}")
-    logging.info(f"website_relay_recent_message_count guild={guild_id} count={len(messages)}")
-    logging.info(f"website_relay_eligible_channel_count guild={guild_id} count={source_channel_count}")
-    logging.info(
-        f"website_relay_ambient_comparable_signal guild={guild_id} messages={len(messages)} "
-        f"unique_users={unique_users} total_chars={total_chars}"
-    )
-    logging.info(
-        f"website_relay_context_strength_decision guild={guild_id} strong={context_is_strong} reason={context_reason}"
-    )
-    if not context_is_strong:
-        logging.info(f"website_relay_context_rejected_reason guild={guild_id} reason={context_reason}")
-        logging.info(f"website_relay_blocker_applied guild={guild_id} blocker={context_reason}")
-    else:
-        logging.info(
-            f"website_relay_fresh_public_context_used guild={guild_id} reason={context_reason} "
-            f"messages={len(messages)} users={unique_users} policies={','.join(eligible_policies) or 'none'}"
-        )
-    lane_source_meta = {
-        "signal_summary": signal_summary,
-        "has_relay_context": bool(relay_context.strip()),
-        "source_channel_count": source_channel_count,
-        "message_count": relay_context_meta.get("source_message_count", len(messages)),
-        "unique_users": relay_context_meta.get("source_speaker_count", unique_users),
-    }
-    relay_lane, relay_lane_reason = _select_website_relay_lane(
-        guild_id,
-        context_is_strong,
-        context_reason,
-        lane_source_meta,
-    )
-    logging.info(
-        f"website_relay_lane_selected guild={guild_id} lane={relay_lane} "
-        f"reason={relay_lane_reason} context_is_strong={context_is_strong}"
-    )
-
-    recent_topics = _recent_relay_topic_summary(guild_id)
-    recent_lines = _recent_relay_messages.get(guild_id, [])[-5:]
-    relay_broadcast_context = build_scoped_broadcast_memory_context(guild_id, scope="relay", public_only=True, limit=3)
-    angle_seed = random.choice(RELAY_ANGLE_ROTATION)
-    logging.info(
-        f"🧠 Relay context inspection guild={guild_id}: "
-        f"has_messages={bool(messages)} has_specific_context={bool(relay_context.strip())} mode={mode} "
-        f"context_is_strong={context_is_strong} reason={context_reason} source_channel_count={source_channel_count}"
-    )
-
-    if mode == "SIGNAL_DEGRADATION" and not context_is_strong and context_reason == "public_context_weak":
-        logging.info(
-            f"website_relay_signal_degradation_blocked_for_quiet_context mode={mode} reason={context_reason} "
-            f"elapsed_seconds=0 source_channel_count={source_channel_count}"
-        )
-        mode = "OBSERVATION"
-
-    if GEMINI_API_KEY and context_is_strong:
-        prompt = (
-            "You are BNL-01 generating a website-only relay ticker line.\n"
-            "Return exactly two plain-text lines.\n"
-            "Line 1: message about 220-300 chars, complete sentence(s), no ellipsis, and never cut mid-word or mid-sentence.\n"
-            "Line 2: current directive about 120-220 chars, complete sentence(s), no ellipsis, and never cut mid-word or mid-sentence.\n"
-            "No markdown labels.\n"
-            "Public line must be 1-2 compact sentences max.\n"
-            "Use concrete Discord-side observations when present: recurring display names, channels, topics, jokes, questions, updates, or patterns.\n"
-            "Speaker attribution must remain tied to exact supplied speaker/message blocks.\n"
-            "Do not transfer one user's statement to another user.\n"
-            "Do not infer that a listed name said a line unless that line is in that person's message block.\n"
-            "Only name a user when a specific supplied speaker/message pair directly supports the claim.\n"
-            "When uncertain, do not name the person; prefer generalized room language like people are talking about/public chatter is leaning toward/several recent messages point at.\n"
-            "Never invent users, channels, events, or topics.\n"
-            "If concrete details are missing, explicitly say public signal is thin/unclear instead of pretending there is current activity, but do not present that as a current_signal lane.\n"
-            "Do not mention BARCODE Radio, 6 Bit broadcast timing, pre-broadcast state, host protocol, or live windows unless current eligible public context supports it.\n"
-            "Outside the real Friday show/pre-show window, never imply the broadcast is imminent, active, opening, live, or about to happen; use scheduled/future language only if show context is directly supported.\n"
-            "Do not exceed the character ranges and do not rely on truncation repair. Return complete sentences only.\n"
-            "Do not publish raw internal diagnostic terms like public_context_weak.\n"
-            "If context is weak, use a short complete archival/low-signal fallback in range.\n"
-            "Avoid stale phrases and concepts: submission pressure, short-burst chatter, archive buffer, signal activity high, "
-            "community signal activity, engagement metrics, across all channels, broadcast-side movement.\n"
-            "Keep it short: 1-3 sentences.\n"
-            "Public relay style: BARCODE-flavored but honest; do not fake dynamic movement.\n"
-            "Prefer grounded BARCODE terms like outer channel, transmission corridor, listening window, public access corridor, submission corridor, broadcast aperture, signal drift, receiver alignment, archive echo.\n"
-            "Rotate to one distinct angle for line 1 each time: whisper, wonder, overheard transmission, field note, archive murmur, cross-band drift, corridor note, receiver note.\n"
-            "Include light uncertainty sometimes: not sure why, hard to say, something odd, may be nothing, worth watching, could just be timing.\n"
-            "Do not sound like a dry server report.\n"
-            "Avoid cheesy disaster language like containment breach, red alert, multiverse collapse, emergency protocol, catastrophic anomaly.\n"
-            "Do not include admin/operator advice in line 1.\n"
-            "Line 2 should be short, atmospheric, and distinct from any admin analysis.\n"
-            "Tone: enigmatic broadcast-station surface text, minimal technical jargon, concise.\n"
-            "Hard-avoid these public phrases: elevated query volume, submission protocols, archival integrity, monitoring active, recurring mentions, ongoing observation, data acquisition, process and categorize incoming user data streams, user engagement remains stable, pattern deviations.\n"
-            "Do not invent concrete new canon events, releases, sponsors, incidents, characters, or secrets.\n"
-            "Keep lore abstract if used. Do not mention 9 Bit unless context includes it.\n"
-            f"{_build_relay_lane_prompt(relay_lane, _has_source_safe_public_residue(lane_source_meta))}\n"
-            f"Angle seed for this update: {angle_seed}.\n"
-            f"Recent relay topics to avoid repeating unless context demands it: {recent_topics}.\n"
-            f"Recent public lines to avoid mirroring: {' || '.join(recent_lines) or 'none'}.\n"
-            f"Public-safe relay-eligible broadcast memory:\n{relay_broadcast_context or '- (none)'}\n"
-            f"{BROADCAST_MEMORY_LANGUAGE_LIFT_GUIDANCE}\n"
-            f"Mode: {mode}.\n"
-            f"Context summary: {signal_summary or 'limited Discord-side traffic'}.\n"
-            f"Discord observations: {relay_context or 'No specific recent Discord observations available.'}\n"
-        )
+    try:
         generated = await get_gemini_response(prompt, user_id=0, guild_id=guild_id) or ""
-    else:
-        generated = ""
-
-    relay_message = ""
-    current_directive = ""
-    if generated:
-        lines = [ln.strip() for ln in generated.splitlines() if ln.strip()]
-        if lines:
-            relay_message = sanitize_website_status_message(lines[0], limit=300, min_chars=220)
-        if len(lines) > 1:
-            current_directive = sanitize_website_status_message(lines[1], limit=220, min_chars=120)
-
-    low_signal_generated = False
-    low_signal_recent_messages = _recent_relay_messages.get(guild_id, [])[-5:]
-    if _last_website_status_message:
-        low_signal_recent_messages = low_signal_recent_messages + [_last_website_status_message]
-    low_signal_meta = dict(lane_source_meta)
-    low_signal_meta["relay_lane"] = relay_lane
-
-    if not relay_message or _contains_stale_phrase(relay_message):
-        if not context_is_strong:
-            relay_message = await build_low_signal_relay_message(guild_id, context_reason, low_signal_recent_messages, low_signal_meta, relay_lane=relay_lane)
-            low_signal_generated = True
-        else:
-            relay_message = _pick_varied_relay_fallback(_last_website_status_message)
-    if not current_directive:
-        current_directive = RELAY_WEAK_CONTEXT_STANDBY_DIRECTIVE if not context_is_strong else random.choice(RELAY_DIRECTIVE_FALLBACKS)
-
-    if relay_message.strip().lower() == (_last_website_status_message or "").strip().lower() or _is_repetitive_relay(guild_id, relay_message):
-        if not context_is_strong:
-            old_lane = relay_lane
-            retry_lane, retry_reason = _select_website_relay_lane(
-                guild_id,
-                context_is_strong,
-                context_reason,
-                low_signal_meta,
-                avoid_lane=old_lane,
-            )
-            if retry_lane != old_lane:
-                relay_lane = retry_lane
-                low_signal_meta["relay_lane"] = relay_lane
-                relay_lane_reason = retry_reason
-                logging.info(
-                    f"website_relay_lane_retry guild={guild_id} old_lane={old_lane} "
-                    f"new_lane={relay_lane} reason=similar_to_recent"
-                )
-            low_signal_recent_messages = low_signal_recent_messages + [relay_message]
-            relay_message = await build_low_signal_relay_message(guild_id, context_reason, low_signal_recent_messages, low_signal_meta, relay_lane=relay_lane)
-            low_signal_generated = True
-        else:
-            relay_message = _pick_varied_relay_fallback(relay_message)
-    if _contains_stale_phrase(relay_message):
-        if not context_is_strong:
-            old_lane = relay_lane
-            retry_lane, retry_reason = _select_website_relay_lane(
-                guild_id,
-                context_is_strong,
-                context_reason,
-                low_signal_meta,
-                avoid_lane=old_lane,
-            )
-            if retry_lane != old_lane:
-                relay_lane = retry_lane
-                low_signal_meta["relay_lane"] = relay_lane
-                relay_lane_reason = retry_reason
-                logging.info(
-                    f"website_relay_lane_retry guild={guild_id} old_lane={old_lane} "
-                    f"new_lane={relay_lane} reason=stale_phrase"
-                )
-            low_signal_recent_messages = low_signal_recent_messages + [relay_message]
-            relay_message = await build_low_signal_relay_message(guild_id, context_reason, low_signal_recent_messages, low_signal_meta, relay_lane=relay_lane)
-            low_signal_generated = True
-        else:
-            relay_message = _pick_varied_relay_fallback(relay_message)
-
-    lane_ok, lane_mismatch_reason = _validate_relay_lane_adherence(relay_message, relay_lane, context_is_strong, guild_id)
+    except Exception as exc:
+        logging.warning("website_relay_no_publish guild=%s reason=provider_failure error=%s", guild_id, _safe_force_pull_error(exc))
+        return WebsiteRelayDecision(False, skipReason="provider_failure", sourceConversationIds=[int(r[0]) for r in rows], sourceCursor=source_cursor, metadata={"reason": "provider_failure"})
+    lines = [ln.strip() for ln in generated.splitlines() if ln.strip()]
+    if not lines:
+        return WebsiteRelayDecision(False, skipReason="empty_output", sourceConversationIds=[int(r[0]) for r in rows], sourceCursor=source_cursor, metadata={"reason": "empty_output"})
+    relay_message = sanitize_website_status_message(lines[0], limit=300, min_chars=0)
+    directive = sanitize_website_status_message(lines[1] if len(lines) > 1 else "", limit=220, min_chars=40)
+    relay_message = _sanitize_relay_temporal_claims(relay_message, guild_id, show_context_supported=_relay_context_supports_show_reference(" ".join(messages), relay_message), now_pacific=now_pt, limit=360, min_chars=0)
+    directive = fit_complete_statement(directive, limit=220, min_chars=40, fallback="Review fresh public Discord context before the next relay update.")
+    if not relay_message or not directive:
+        return WebsiteRelayDecision(False, skipReason="sanitization_rejection", sourceConversationIds=[int(r[0]) for r in rows], sourceCursor=source_cursor, metadata={"reason": "sanitization_rejection"})
+    lane_ok, lane_reason = _validate_relay_lane_adherence(relay_message, relay_lane, True, guild_id)
     if not lane_ok:
-        old_lane = relay_lane
-        if context_is_strong and old_lane == "current_signal":
-            retry_lane, retry_reason = _lane_retry_for_mismatch(guild_id, old_lane)
-        else:
-            retry_lane, retry_reason = _select_website_relay_lane(
-                guild_id,
-                context_is_strong,
-                context_reason,
-                low_signal_meta,
-                avoid_lane=old_lane,
-            )
-            if retry_lane == old_lane or retry_lane == "current_signal":
-                retry_lane, retry_reason = _lane_retry_for_mismatch(guild_id, old_lane)
-        relay_lane = retry_lane
-        low_signal_meta["relay_lane"] = relay_lane
-        relay_lane_reason = retry_reason
-        logging.info(
-            f"website_relay_lane_retry guild={guild_id} old_lane={old_lane} "
-            f"new_lane={relay_lane} reason={lane_mismatch_reason}"
-        )
-        low_signal_recent_messages = low_signal_recent_messages + [relay_message]
-        relay_message = await build_low_signal_relay_message(
-            guild_id,
-            lane_mismatch_reason or context_reason,
-            low_signal_recent_messages,
-            low_signal_meta,
-            relay_lane=relay_lane,
-        )
-        low_signal_generated = True
-        lane_ok, lane_mismatch_reason = _validate_relay_lane_adherence(relay_message, relay_lane, False, guild_id)
-        if not lane_ok:
-            relay_message = _build_low_signal_fallback_message(
-                guild_id,
-                lane_mismatch_reason or context_reason,
-                low_signal_recent_messages,
-                low_signal_meta,
-                relay_lane="network_posture",
-            )
-            relay_lane = "network_posture"
-            low_signal_meta["relay_lane"] = relay_lane
-            relay_lane_reason = "lane_mismatch_safe_fallback"
-            logging.info(
-                f"website_relay_lane_retry guild={guild_id} old_lane={old_lane} "
-                f"new_lane={relay_lane} reason=post_retry_validation"
-            )
-
-    temporal_sanitized = _sanitize_relay_temporal_claims(
-        relay_message,
-        guild_id,
-        show_context_supported=show_context_supported,
-        now_pacific=now_pt,
-        limit=360,
-        min_chars=220 if context_is_strong else 0,
-    )
-    if temporal_sanitized:
-        relay_message = temporal_sanitized
-    else:
-        relay_message = _weak_context_relay_message(guild_id, signal_summary, relay_context)
-        low_signal_generated = not context_is_strong
-        logging.info(f"website_relay_temporal_sanitize guild={guild_id} reason=fallback_after_rejection phrase=relay_message")
-
-    if current_directive.strip().lower() == (_last_website_directive or "").strip().lower():
-        options = [d for d in RELAY_DIRECTIVE_FALLBACKS if d.strip().lower() != (_last_website_directive or "").strip().lower()]
-        if options:
-            current_directive = random.choice(options)
-
-    relay_message = fit_complete_statement(relay_message, limit=360, min_chars=220 if context_is_strong else 0, fallback=_weak_context_relay_message(guild_id, signal_summary, relay_context))
-    logging.info(
-        f"📝 Relay generated guild={guild_id} preview={relay_message[:120]!r} "
-        f"context_used={bool(relay_context.strip())}"
-    )
-    _remember_relay_message(guild_id, relay_message)
-    _remember_relay_topic(guild_id, relay_message)
-    _remember_relay_lane(guild_id, relay_lane)
-    if context_is_strong:
-        logging.info(
-            f"website_relay_fresh_context_detected mode={mode} reason={context_reason} elapsed_seconds=0 "
-            f"source_channel_count={source_channel_count}"
-        )
+        return WebsiteRelayDecision(False, skipReason="lane_validation_failure", sourceConversationIds=[int(r[0]) for r in rows], sourceCursor=source_cursor, relayLane=relay_lane, metadata={"reason": lane_reason})
+    dup_reason = relay_reject_reason_for_candidate(DB_FILE, guild_id, relay_message, directive)
+    if dup_reason:
+        logging.info("website_relay_no_publish guild=%s reason=%s", guild_id, dup_reason)
+        return WebsiteRelayDecision(False, skipReason=dup_reason, sourceConversationIds=[int(r[0]) for r in rows], sourceCursor=source_cursor, relayLane=relay_lane, metadata={"reason": dup_reason})
     metadata = {
-        "context_is_strong": context_is_strong,
+        "context_is_strong": True,
         "reason": context_reason,
-        "has_specific_context": bool(relay_context.strip()),
-        "source_message_count": relay_context_meta.get("source_message_count", len(messages)),
-        "source_speaker_count": relay_context_meta.get("source_speaker_count", unique_users),
-        "source_channel_count": source_channel_count,
-        "attribution_context_format": relay_context_meta.get("attribution_context_format", "structured_pairs"),
-        "eligible_policies": relay_context_meta.get("eligible_policies", eligible_policies),
+        "source_message_count": len(messages),
+        "source_speaker_count": unique_users,
+        "eligible_policies": eligible_policies,
         "relay_lane": relay_lane,
-        "relay_lane_reason": relay_lane_reason,
-        "dormant_signal_enabled": False,
-        "is_weak_fallback": (not context_is_strong and not low_signal_generated and _is_weak_context_fallback(relay_message)),
-        "is_low_signal_dynamic": (not context_is_strong and low_signal_generated),
     }
-    _last_relay_metadata_by_guild[guild_id] = dict(metadata)
-    return mode, relay_message, fit_complete_statement(current_directive, limit=220, min_chars=120, fallback=RELAY_WEAK_CONTEXT_STANDBY_DIRECTIVE), metadata
-
+    return WebsiteRelayDecision(True, eventType="fresh_public_discord_activity", sourceConversationIds=[int(r[0]) for r in rows], sourceCursor=source_cursor, message=relay_message, directive=directive, mode=mode, relayLane=relay_lane, metadata=metadata)
 
 def resolve_network_guild_id(requested_guild_id: int) -> int:
     """Resolve guild id for network-facing actions, honoring primary-guild override."""
@@ -3423,31 +3251,35 @@ async def request_fresh_website_relay(guild_id: int, *, force: bool = True) -> t
     """
     Generate and post a fresh dynamic website relay update.
     Website only: no Discord post side effects.
-    Returns (success, mode, sanitized_message).
+    Returns (success, mode, sanitized_message, directive). If no qualifying fresh context exists,
+    success is True with an empty message so callers can report no publication without fallback copy.
     """
     try:
         target_guild_id = resolve_network_guild_id(guild_id)
         logging.info(f"📨 Fresh website relay requested guild={guild_id} target_guild={target_guild_id} force={force}.")
-        mode, relay_message, directive, _relay_meta = await generate_dynamic_website_relay(target_guild_id)
-        sanitized = fit_complete_statement(relay_message, limit=360, min_chars=0, fallback=_weak_context_relay_message(target_guild_id, signal_summary="", relay_context=""))
-        sanitized_directive = fit_complete_statement(directive, limit=220, min_chars=120, fallback=random.choice(RELAY_DIRECTIVE_FALLBACKS))
-        admin_note = build_admin_note(mode=mode, message=sanitized, current_directive=sanitized_directive, source="relay", compact=not force) if force else ""
+        decision = await generate_dynamic_website_relay(target_guild_id)
+        if not decision.publish:
+            logging.info("website_relay_request_no_publish guild=%s reason=%s", target_guild_id, decision.skipReason)
+            return True, decision.mode, "", ""
+        admin_note = build_admin_note(mode=decision.mode, message=decision.message, current_directive=decision.directive, source="relay", compact=not force) if force else ""
         ok = await update_website_status_controlled_async(
-            mode=mode,
-            message=sanitized,
+            mode=decision.mode,
+            message=decision.message,
             status="ONLINE",
             force=force,
-            current_directive=sanitized_directive,
+            current_directive=decision.directive,
             source="relay",
             admin_note=admin_note,
         )
         if ok:
-            logging.info(f"✅ Fresh website relay requested successfully (guild {target_guild_id}, mode {mode}).")
-        else:
-            logging.warning(f"⚠️ Fresh website relay request failed (guild {target_guild_id}, mode {mode}).")
-        return ok, mode, sanitized, sanitized_directive
+            relay_record_publication(DB_FILE, target_guild_id, message=decision.message, directive=decision.directive, mode=decision.mode, relay_lane=decision.relayLane, event_type=decision.eventType, source_cursor=decision.sourceCursor)
+            _remember_relay_message(target_guild_id, decision.message)
+            _remember_relay_topic(target_guild_id, decision.message)
+            _remember_relay_lane(target_guild_id, decision.relayLane)
+        logging.info(f"📨 Fresh website relay completed guild={target_guild_id} ok={ok} mode={decision.mode}.")
+        return ok, decision.mode, decision.message, decision.directive
     except Exception as e:
-        logging.error(f"❌ Fresh website relay request crashed safely (guild {guild_id}): {e}")
+        logging.error(f"Fresh website relay request failed for guild {guild_id}: {e}")
         return False, "OBSERVATION", "", ""
 
 
@@ -13087,39 +12919,19 @@ async def barcode_radio_queue_task():
                 await update_website_status_controlled_async(mode=mode, message=fit_complete_statement(website_msg, limit=360, min_chars=220, fallback=_pick_varied_fallback(phase_key)), status="ONLINE", force=True)
             mark_show_update_fired(guild.id, show_date, phase_key, discord_sent, website_msg)
 
-def _build_website_relay_timeout_fallback(guild_id: int) -> tuple[str, str, str, dict]:
-    relay_message = fit_complete_statement(
-        _pick_varied_relay_fallback(_last_website_status_message),
-        limit=360,
-        min_chars=0,
-        fallback=RELAY_WEAK_CONTEXT_STANDBY_MESSAGE,
-    )
-    directive = fit_complete_statement(
-        RELAY_WEAK_CONTEXT_STANDBY_DIRECTIVE,
-        limit=220,
-        min_chars=120,
-        fallback=RELAY_WEAK_CONTEXT_STANDBY_DIRECTIVE,
-    )
-    metadata = {
-        "context_is_strong": False,
-        "reason": "relay_generation_timeout",
-        "has_specific_context": False,
-        "source_message_count": 0,
-        "source_speaker_count": 0,
-        "source_channel_count": 0,
-        "attribution_context_format": "timeout_fallback",
-        "eligible_policies": [],
-        "relay_lane": "network_posture",
-        "relay_lane_reason": "relay_generation_timeout",
-        "dormant_signal_enabled": False,
-        "is_weak_fallback": True,
-        "is_low_signal_dynamic": False,
-    }
+def _build_website_relay_timeout_fallback(guild_id: int) -> WebsiteRelayDecision:
+    """Legacy compatibility wrapper: timeout/failure means no website publication."""
+    metadata = {"reason": "relay_generation_timeout"}
     _last_relay_metadata_by_guild[guild_id] = dict(metadata)
-    return "OBSERVATION", relay_message, directive, metadata
+    return WebsiteRelayDecision(
+        False,
+        skipReason="relay_generation_timeout",
+        sourceCursor=relay_get_cursor(DB_FILE, guild_id) or 0,
+        metadata=metadata,
+    )
 
 
-async def _generate_website_relay_guarded(guild_id: int) -> tuple[str, str, str, dict] | None:
+async def _generate_website_relay_guarded(guild_id: int) -> WebsiteRelayDecision | None:
     existing = _website_relay_generation_tasks_by_guild.get(guild_id)
     if existing and not existing.done():
         logging.info(f"website_relay_generation_skipped_inflight guild={guild_id}")
@@ -13164,11 +12976,11 @@ async def _generate_website_relay_guarded(guild_id: int) -> tuple[str, str, str,
             f"website_relay_generation_timeout guild={guild_id} elapsed_seconds={elapsed:.3f} "
             f"timeout_seconds={BNL_WEBSITE_RELAY_GENERATION_TIMEOUT_SECONDS:.1f}"
         )
-        return _build_website_relay_timeout_fallback(guild_id)
+        return WebsiteRelayDecision(False, skipReason="relay_generation_timeout", sourceCursor=relay_get_cursor(DB_FILE, guild_id) or 0, metadata={"reason": "relay_generation_timeout"})
     except Exception as e:
         elapsed = time.monotonic() - started
         logging.warning(f"website_relay_generation_completed guild={guild_id} elapsed_seconds={elapsed:.3f} status=failed error={e}")
-        return _build_website_relay_timeout_fallback(guild_id)
+        return WebsiteRelayDecision(False, skipReason="relay_generation_timeout", sourceCursor=relay_get_cursor(DB_FILE, guild_id) or 0, metadata={"reason": "relay_generation_timeout"})
 
 
 @tasks.loop(minutes=1)
@@ -13196,32 +13008,21 @@ async def website_relay_task():
         if relay_eligibility == "no":
             continue
         logging.info(f"⏲️ website_relay_task tick guild={guild.id} active_channel={active_channel_id}.")
-        guarded_result = await _generate_website_relay_guarded(guild.id)
-        if guarded_result is None:
+        decision = await _generate_website_relay_guarded(guild.id)
+        if decision is None:
             continue
-        mode, relay_message, directive, relay_meta = guarded_result
-        logging.info(f"📤 website_relay_task prepared mode={mode} preview={relay_message[:120]!r}")
-        elapsed = (datetime.now(PACIFIC_TZ) - _last_website_status_at).total_seconds() if _last_website_status_at else 0.0
-        weak_quiet = (
-            not relay_meta.get("has_specific_context")
-            and not relay_meta.get("context_is_strong")
-            and relay_meta.get("reason") == "public_context_weak"
-        )
-        low_signal_dynamic = weak_quiet and relay_meta.get("is_low_signal_dynamic")
-        weak_repeat = weak_quiet and relay_meta.get("is_weak_fallback") and _is_weak_context_fallback(_last_website_status_message or "")
-        if weak_quiet and not low_signal_dynamic and not weak_repeat:
-            logging.info(
-                f"website_relay_weak_context_skip mode={mode} reason={relay_meta.get('reason')} elapsed_seconds={elapsed:.1f} "
-                f"source_channel_count={relay_meta.get('source_channel_count', 0)}"
-            )
+        if not decision.publish:
+            logging.info("website_relay_no_publish guild=%s reason=%s", guild.id, decision.skipReason)
             continue
-        if weak_repeat and elapsed < WEAK_CONTEXT_REPEAT_COOLDOWN_SECONDS:
-            logging.info(
-                f"website_relay_fallback_deduped mode={mode} reason={relay_meta.get('reason')} elapsed_seconds={elapsed:.1f} "
-                f"source_channel_count={relay_meta.get('source_channel_count', 0)}"
-            )
-            continue
-        await update_website_status_controlled_async(mode=mode, message=relay_message, status="ONLINE", current_directive=directive, source="relay")
+        logging.info(f"📤 website_relay_task prepared mode={decision.mode} preview={decision.message[:120]!r}")
+        ok = await update_website_status_controlled_async(mode=decision.mode, message=decision.message, status="ONLINE", current_directive=decision.directive, source="relay")
+        if ok:
+            relay_record_publication(DB_FILE, guild.id, message=decision.message, directive=decision.directive, mode=decision.mode, relay_lane=decision.relayLane, event_type=decision.eventType, source_cursor=decision.sourceCursor)
+            _remember_relay_message(guild.id, decision.message)
+            _remember_relay_topic(guild.id, decision.message)
+            _remember_relay_lane(guild.id, decision.relayLane)
+        else:
+            logging.warning("website_relay_delivery_failed_no_cursor_advance guild=%s sourceCursor=%s", guild.id, decision.sourceCursor)
 
 # ==================== BATCHED REPLY SYSTEM (ACTIVE CHANNEL ONLY) ====================
 
