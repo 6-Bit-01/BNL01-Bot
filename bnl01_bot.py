@@ -13433,16 +13433,15 @@ async def _generate_website_relay_guarded(guild_id: int, *, allow_quiet_sources:
 
 @tasks.loop(minutes=1)
 async def website_presence_heartbeat_task():
+    if BNL_WEBSITE_CONTRACT_VERSION != "2":
+        return
     flags = get_bnl_control_flags()
     if not flags.get("heartbeatEnabled", True):
         return
     now_pt = datetime.now(PACIFIC_TZ)
     if (now_pt.minute % max(1, BNL_WEBSITE_HEARTBEAT_INTERVAL_MINUTES)) != 0:
         return
-    if BNL_WEBSITE_CONTRACT_VERSION == "2":
-        await asyncio.to_thread(publish_website_presence_v2, source="heartbeat", status="ONLINE", mode="OBSERVATION")
-    else:
-        await update_website_status_controlled_async(mode="OBSERVATION", message="BNL-01 remains online and observing.", status="ONLINE", source="heartbeat")
+    await asyncio.to_thread(publish_website_presence_v2, source="heartbeat", status="ONLINE", mode="OBSERVATION")
 
 @tasks.loop(minutes=1)
 async def website_relay_task():
@@ -15320,6 +15319,32 @@ def log_admin_controls_connection_check():
 
 # ==================== EVENT HANDLERS ====================
 
+def _resolve_startup_hydration_guild_id() -> int:
+    if BNL_PRIMARY_GUILD_ID:
+        return BNL_PRIMARY_GUILD_ID
+    try:
+        guild = next(iter_managed_guilds(), None)
+    except Exception:
+        guild = None
+    if guild is not None:
+        return int(getattr(guild, "id", 0) or 0)
+    if client.guilds:
+        return int(getattr(client.guilds[0], "id", 0) or 0)
+    return 0
+
+async def hydrate_startup_relay_v2_once() -> bool:
+    if BNL_WEBSITE_CONTRACT_VERSION != "2":
+        return False
+    hydration_guild_id = _resolve_startup_hydration_guild_id()
+    if not hydration_guild_id:
+        return False
+    return await asyncio.to_thread(hydrate_website_relay_v2, hydration_guild_id)
+
+async def publish_startup_presence_v2_if_enabled() -> bool:
+    if BNL_WEBSITE_CONTRACT_VERSION != "2":
+        return False
+    return await asyncio.to_thread(publish_website_presence_v2, source="startup", status="ONLINE", mode="OBSERVATION")
+
 @client.event
 async def on_ready():
     init_db()
@@ -15337,14 +15362,11 @@ async def on_ready():
     if not barcode_radio_queue_task.is_running():
         barcode_radio_queue_task.start()
 
-    for g in client.guilds:
-        if BNL_WEBSITE_CONTRACT_VERSION == "2":
-            await asyncio.to_thread(hydrate_website_relay_v2, g.id)
     if BNL_WEBSITE_CONTRACT_VERSION == "2":
-        await asyncio.to_thread(publish_website_presence_v2, source="startup", status="ONLINE", mode="OBSERVATION")
-
-    if not website_presence_heartbeat_task.is_running():
-        website_presence_heartbeat_task.start()
+        await hydrate_startup_relay_v2_once()
+        await publish_startup_presence_v2_if_enabled()
+        if not website_presence_heartbeat_task.is_running():
+            website_presence_heartbeat_task.start()
 
     if BNL_WEBSITE_RELAY_ENABLED and not website_relay_task.is_running():
         website_relay_task.start()

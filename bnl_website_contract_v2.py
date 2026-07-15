@@ -6,9 +6,13 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Callable, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, Optional
 
+STATUSES = {"ONLINE", "OFFLINE"}
+MODES = {"STANDBY", "OBSERVATION", "ACTIVE_LIAISON", "SIGNAL_DEGRADATION", "RESTRICTED"}
 PRESENCE_SOURCES = {"heartbeat", "startup", "admin", "reset", "unknown"}
+MAX_MESSAGE_LENGTH = 600
+MAX_DIRECTIVE_LENGTH = 800
 WEBSITE_SOURCE_CLASSES = {
     "fresh_public_event",
     "recent_public_continuity",
@@ -26,7 +30,7 @@ SOURCE_CLASS_MAP = {
     "reflection": "grounded_reflection",
 }
 TRIGGER_MAP = {"scheduled": "scheduled", "forcePull": "force_pull", "manual": "manual"}
-RELAY_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$")
+RELAY_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{2,159}$")
 
 
 class ContractV2Error(ValueError):
@@ -51,8 +55,29 @@ def effective_contract_version(raw: Optional[str]) -> str:
     return version
 
 
+def _validated_text(value: str, max_length: int, reason: str) -> str:
+    if not isinstance(value, str):
+        raise ContractV2Error(reason)
+    clean = value.strip()
+    if not clean or len(clean) > max_length:
+        raise ContractV2Error(reason)
+    return clean
+
+
+def validate_status(status: str) -> str:
+    if status not in STATUSES:
+        raise ContractV2Error("invalid_status")
+    return status
+
+
+def validate_mode(mode: str) -> str:
+    if mode not in MODES:
+        raise ContractV2Error("invalid_mode")
+    return mode
+
+
 def validate_relay_id(relay_id: str) -> str:
-    rid = (relay_id or "").strip()
+    rid = _validated_text(relay_id, 160, "invalid_relay_id")
     if not RELAY_ID_RE.match(rid):
         raise ContractV2Error("invalid_relay_id")
     return rid
@@ -78,7 +103,7 @@ def build_presence_envelope(status: str = "ONLINE", mode: str = "OBSERVATION", s
     source = (source or "unknown").strip() or "unknown"
     if source not in PRESENCE_SOURCES:
         raise ContractV2Error("unknown_presence_source")
-    return {"contractVersion": 2, "kind": "presence", "presence": {"status": status, "mode": mode, "source": source}}
+    return {"contractVersion": 2, "kind": "presence", "presence": {"status": validate_status(status), "mode": validate_mode(mode), "source": source}}
 
 
 def build_relay_envelope(relay_id: str, message: str, current_directive: str, source_class: str, trigger: str) -> Dict[str, Any]:
@@ -89,8 +114,8 @@ def build_relay_envelope(relay_id: str, message: str, current_directive: str, so
         "kind": "relay",
         "relay": {
             "relayId": validate_relay_id(relay_id),
-            "message": message or "",
-            "currentDirective": current_directive or "",
+            "message": _validated_text(message, MAX_MESSAGE_LENGTH, "invalid_message"),
+            "currentDirective": _validated_text(current_directive, MAX_DIRECTIVE_LENGTH, "invalid_directive"),
             "sourceClass": website_source_class,
             "trigger": website_trigger,
         },
@@ -112,15 +137,42 @@ def _valid_published_at(value: Any) -> bool:
         return False
 
 
+def validate_presence_response(data: Any, submitted: Dict[str, Any]) -> DeliveryResult:
+    if not isinstance(data, dict):
+        return DeliveryResult(False, "delivery_failed", "malformed_json")
+    if data.get("ok") is not True:
+        return DeliveryResult(False, "delivery_failed", "contract_rejected")
+    if data.get("persisted") is not True:
+        return DeliveryResult(False, "delivery_failed", "not_persisted")
+    presence = data.get("presence")
+    expected = submitted.get("presence") if isinstance(submitted, dict) else None
+    if not isinstance(presence, dict) or not isinstance(expected, dict):
+        return DeliveryResult(False, "delivery_failed", "malformed_json")
+    if presence.get("contractVersion") != 2:
+        return DeliveryResult(False, "delivery_failed", "response_mismatch")
+    for key in ("status", "mode", "source"):
+        if presence.get(key) != expected.get(key):
+            return DeliveryResult(False, "delivery_failed", "response_mismatch")
+    if not _valid_published_at(presence.get("receivedAt")):
+        return DeliveryResult(False, "delivery_failed", "response_mismatch")
+    return DeliveryResult(True, "published")
+
+
 def validate_relay_response(data: Any, submitted: Dict[str, Any]) -> DeliveryResult:
     if not isinstance(data, dict):
         return DeliveryResult(False, "delivery_failed", "malformed_json")
     if data.get("ok") is not True:
         return DeliveryResult(False, "delivery_failed", "contract_rejected")
+    if data.get("persisted") is not True:
+        return DeliveryResult(False, "delivery_failed", "not_persisted")
+    if "idempotent" in data and not isinstance(data.get("idempotent"), bool):
+        return DeliveryResult(False, "delivery_failed", "response_mismatch")
     relay = data.get("relay")
     expected = submitted.get("relay") if isinstance(submitted, dict) else None
     if not isinstance(relay, dict) or not isinstance(expected, dict):
         return DeliveryResult(False, "delivery_failed", "malformed_json")
+    if relay.get("contractVersion") != 2:
+        return DeliveryResult(False, "delivery_failed", "response_mismatch")
     for key in ("relayId", "message", "currentDirective", "sourceClass", "trigger"):
         if relay.get(key) != expected.get(key):
             return DeliveryResult(False, "delivery_failed", "response_mismatch")
@@ -141,22 +193,33 @@ def deliver_json(url: str, api_key: str, envelope: Dict[str, Any], *, opener: Ca
                 body = response.read().decode("utf-8")
             if 200 <= code < 300:
                 try:
-                    return validate_relay_response(json.loads(body or "{}"), envelope) if envelope.get("kind") == "relay" else DeliveryResult(True, "published", http_status=code)
+                    data = json.loads(body or "{}")
+                    return validate_relay_response(data, envelope) if envelope.get("kind") == "relay" else validate_presence_response(data, envelope)
                 except json.JSONDecodeError:
                     return DeliveryResult(False, "delivery_failed", "malformed_json", http_status=code)
             if code == 400:
                 return DeliveryResult(False, "delivery_failed", "contract_rejected", http_status=code)
+            if code in {401, 403}:
+                return DeliveryResult(False, "delivery_failed", "authentication_failed", http_status=code)
             if code == 409:
                 return DeliveryResult(False, "delivery_failed", "relay_id_conflict", http_status=code)
-            if code < 500 or attempt >= retries:
-                return DeliveryResult(False, "delivery_failed", "retryable_delivery_failure", http_status=code)
+            if code == 429 or code >= 500:
+                if attempt >= retries:
+                    return DeliveryResult(False, "delivery_failed", "retryable_delivery_failure", http_status=code)
+                continue
+            return DeliveryResult(False, "delivery_failed", "http_rejected", http_status=code)
         except urllib.error.HTTPError as e:
             if e.code == 400:
                 return DeliveryResult(False, "delivery_failed", "contract_rejected", http_status=e.code)
+            if e.code in {401, 403}:
+                return DeliveryResult(False, "delivery_failed", "authentication_failed", http_status=e.code)
             if e.code == 409:
                 return DeliveryResult(False, "delivery_failed", "relay_id_conflict", http_status=e.code)
-            if e.code < 500 or attempt >= retries:
-                return DeliveryResult(False, "delivery_failed", "retryable_delivery_failure", http_status=e.code)
+            if e.code == 429 or e.code >= 500:
+                if attempt >= retries:
+                    return DeliveryResult(False, "delivery_failed", "retryable_delivery_failure", http_status=e.code)
+                continue
+            return DeliveryResult(False, "delivery_failed", "http_rejected", http_status=e.code)
         except (urllib.error.URLError, TimeoutError, OSError, ValueError):
             if attempt >= retries:
                 return DeliveryResult(False, "delivery_failed", last_reason)
@@ -169,11 +232,15 @@ def parse_status_relay(data: Any) -> Optional[Dict[str, Any]]:
     relay = data.get("relay")
     if not isinstance(relay, dict):
         return None
-    required = {"relayId", "message", "currentDirective", "sourceClass", "trigger", "publishedAt"}
+    required = {"contractVersion", "relayId", "message", "currentDirective", "sourceClass", "trigger", "publishedAt"}
     if set(relay.keys()) != required:
         return None
     try:
+        if relay.get("contractVersion") != 2:
+            return None
         validate_relay_id(relay["relayId"])
+        _validated_text(relay.get("message"), MAX_MESSAGE_LENGTH, "invalid_message")
+        _validated_text(relay.get("currentDirective"), MAX_DIRECTIVE_LENGTH, "invalid_directive")
         if relay["sourceClass"] not in WEBSITE_SOURCE_CLASSES or relay["trigger"] not in set(TRIGGER_MAP.values()):
             return None
         if not _valid_published_at(relay["publishedAt"]):

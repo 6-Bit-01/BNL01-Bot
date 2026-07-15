@@ -1,3 +1,4 @@
+import asyncio
 import json
 import os
 os.environ.setdefault("GEMINI_API_KEY", "test-key")
@@ -5,7 +6,6 @@ os.environ.setdefault("DISCORD_BOT_TOKEN", "test-token")
 import tempfile
 import unittest
 import urllib.error
-from io import BytesIO
 from unittest import mock
 
 import bnl01_bot
@@ -29,10 +29,11 @@ class Resp:
 
 def accepted_body(envelope, *, idempotent=False, override=None):
     relay = dict(envelope["relay"])
+    relay["contractVersion"] = 2
     relay["publishedAt"] = "2026-07-15T00:00:00Z"
     if override:
         relay.update(override)
-    return json.dumps({"ok": True, "relay": relay, "idempotent": idempotent}).encode()
+    return json.dumps({"ok": True, "relay": relay, "idempotent": idempotent, "persisted": True}).encode()
 
 
 class ContractV2Tests(unittest.TestCase):
@@ -64,7 +65,7 @@ class ContractV2Tests(unittest.TestCase):
 
     def test_relay_id_validation(self):
         self.assertEqual(c.validate_relay_id("bnl-abc_123:45"), "bnl-abc_123:45")
-        for bad in ("", "short", "bad space"):
+        for bad in ("", "ab", "bad space"):
             with self.assertRaises(c.ContractV2Error):
                 c.validate_relay_id(bad)
 
@@ -90,6 +91,9 @@ class ContractV2Tests(unittest.TestCase):
             (Resp(409, b"{}"), "relay_id_conflict"),
             (Resp(500, b"{}"), "retryable_delivery_failure"),
             (Resp(200, b"not-json"), "malformed_json"),
+            (Resp(401, b"{}"), "authentication_failed"),
+            (Resp(418, b"{}"), "http_rejected"),
+            (Resp(200, json.dumps({"ok": True, "relay": dict(env["relay"], contractVersion=2, publishedAt="2026-07-15T00:00:00Z"), "persisted": False}).encode()), "not_persisted"),
             (Resp(200, accepted_body(env, override={"relayId": "bnl-other-0001"})), "response_mismatch"),
             (Resp(200, accepted_body(env, override={"message": "changed"})), "response_mismatch"),
         ]
@@ -112,7 +116,7 @@ class ContractV2Tests(unittest.TestCase):
 
     def test_startup_hydration_get_no_post_and_no_duplicate(self):
         env = c.build_relay_envelope("bnl-hydrate-0001", "msg", "dir", "canon", "scheduled")
-        body = json.dumps({"contractVersion": 2, "relay": dict(env["relay"], publishedAt="2026-07-15T00:00:00Z")}).encode()
+        body = json.dumps({"status": "ONLINE", "mode": "OBSERVATION", "message": "msg", "currentDirective": "dir", "source": "relay", "lastSeen": "2026-07-15T00:00:00Z", "persisted": True, "contractVersion": 2, "presence": {"contractVersion": 2, "status": "ONLINE", "mode": "OBSERVATION", "source": "startup", "receivedAt": "2026-07-15T00:00:00Z"}, "relay": dict(env["relay"], contractVersion=2, publishedAt="2026-07-15T00:00:00Z")}).encode()
         posts = []
         def opener(req, timeout=10):
             if req.get_method() == "POST":
@@ -124,6 +128,58 @@ class ContractV2Tests(unittest.TestCase):
             self.assertEqual(posts, [])
             self.assertEqual(len(state.recent_history(f.name, 42)), 1)
             self.assertIsNone(state.get_cursor(f.name, 42))
+
+    def test_presence_response_validation(self):
+        env = c.build_presence_envelope(source="startup")
+        good = {"ok": True, "presence": {"contractVersion": 2, "status": "ONLINE", "mode": "OBSERVATION", "source": "startup", "receivedAt": "2026-07-15T00:00:00Z"}, "persisted": True}
+        self.assertTrue(c.validate_presence_response(good, env).ok)
+        for bad in (
+            b"not-json",
+            json.dumps({"ok": False, "presence": good["presence"], "persisted": True}).encode(),
+            json.dumps({"ok": True, "presence": dict(good["presence"], source="heartbeat"), "persisted": True}).encode(),
+            json.dumps({"ok": True, "presence": good["presence"], "persisted": False}).encode(),
+            json.dumps({"ok": True, "presence": dict(good["presence"], receivedAt="not-a-date"), "persisted": True}).encode(),
+        ):
+            result = c.deliver_json("https://site.test", "k", env, opener=lambda req, timeout=10, body=bad: Resp(200, body), retries=0)
+            self.assertFalse(result.ok)
+
+    def test_relay_persisted_false_does_not_advance_cursor_or_history(self):
+        with tempfile.NamedTemporaryFile() as f:
+            state.begin_attempt(f.name, "a2", 42, "scheduled", cursor=7)
+            env = c.build_relay_envelope("bnl-persist-0001", "Substantive public relay speech.", "A grounded line of inquiry or invitation.", "canon", "scheduled")
+            body = json.dumps({"ok": True, "relay": dict(env["relay"], contractVersion=2, publishedAt="2026-07-15T00:00:00Z"), "persisted": False}).encode()
+            result = c.deliver_json("https://site.test", "k", env, opener=lambda req, timeout=10: Resp(200, body), retries=0)
+            self.assertEqual(result.reason, "not_persisted")
+            self.assertIsNone(state.get_cursor(f.name, 42))
+            self.assertEqual(state.recent_history(f.name, 42), [])
+
+    def test_network_hydration_resolves_one_primary_guild(self):
+        env = c.build_relay_envelope("bnl-hydrate-0002", "msg", "dir", "canon", "scheduled")
+        body = json.dumps({"status": "ONLINE", "mode": "OBSERVATION", "message": "msg", "currentDirective": "dir", "source": "relay", "lastSeen": "2026-07-15T00:00:00Z", "persisted": True, "contractVersion": 2, "presence": {"contractVersion": 2, "status": "ONLINE", "mode": "OBSERVATION", "source": "startup", "receivedAt": "2026-07-15T00:00:00Z"}, "relay": dict(env["relay"], contractVersion=2, publishedAt="2026-07-15T00:00:00Z")}).encode()
+        gets = []
+        def opener(req, timeout=10):
+            gets.append(req.get_method())
+            return Resp(200, body)
+        with tempfile.NamedTemporaryFile() as f, mock.patch.object(bnl01_bot, "DB_FILE", f.name), mock.patch.object(bnl01_bot, "BNL_STATUS_URL", "https://site.test"), mock.patch.object(bnl01_bot, "BNL_API_KEY", "key"), mock.patch.object(bnl01_bot, "BNL_PRIMARY_GUILD_ID", 99), mock.patch("urllib.request.urlopen", side_effect=opener):
+            gid = bnl01_bot._resolve_startup_hydration_guild_id()
+            self.assertEqual(gid, 99)
+            self.assertTrue(bnl01_bot.hydrate_website_relay_v2(gid))
+            self.assertFalse(bnl01_bot.hydrate_website_relay_v2(gid))
+            self.assertEqual(gets, ["GET", "GET"])
+            self.assertEqual(len(state.recent_history(f.name, 99)), 1)
+            self.assertEqual(state.recent_history(f.name, 42), [])
+
+    def test_v1_heartbeat_noops_without_http_stock_status(self):
+        calls = []
+        with mock.patch.object(bnl01_bot, "BNL_WEBSITE_CONTRACT_VERSION", "1"), mock.patch.object(bnl01_bot, "update_website_status_controlled_async", side_effect=lambda **kw: calls.append(kw)):
+            asyncio.run(bnl01_bot.website_presence_heartbeat_task.coro())
+        self.assertEqual(calls, [])
+
+    def test_v1_startup_presence_noops_without_http_stock_status(self):
+        calls = []
+        with mock.patch.object(bnl01_bot, "BNL_WEBSITE_CONTRACT_VERSION", "1"), mock.patch.object(bnl01_bot, "publish_website_presence_v2", side_effect=lambda **kw: calls.append(kw)):
+            self.assertFalse(asyncio.run(bnl01_bot.publish_startup_presence_v2_if_enabled()))
+        self.assertEqual(calls, [])
 
     def test_version_one_legacy_payload_and_no_v2_fallback(self):
         with mock.patch.object(bnl01_bot, "BNL_WEBSITE_CONTRACT_VERSION", "1"), mock.patch.object(bnl01_bot, "BNL_API_KEY", "key"), mock.patch.object(bnl01_bot, "BNL_STATUS_URL", "https://site.test"):
