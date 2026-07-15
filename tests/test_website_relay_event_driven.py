@@ -385,6 +385,30 @@ class WebsiteRelayEventDrivenTests(unittest.TestCase):
         self.assertFalse(decision.publish)
         self.assertTrue(cancelled["seen"])
 
+    def test_directive_monitor_vocabulary_does_not_make_event_message_stock(self):
+        reason = state.reject_reason_for_candidate(
+            self.db,
+            42,
+            "A public art collaboration settled on a shared zine format for the next community post.",
+            "Monitor the public collaboration thread for the next confirmed production step.",
+        )
+        self.assertEqual(reason, "")
+        self.assertEqual(state.stock_directive_reason("Continue monitoring."), "stock_directive_rejected")
+
+    def test_recorded_semantic_family_uses_public_message_not_directive(self):
+        state.record_publication(
+            self.db,
+            42,
+            message="A public art collaboration settled on a shared zine format for the next community post.",
+            directive="Watch the public collaboration thread for the next confirmed production step.",
+            mode="OBSERVATION",
+            relay_lane="current_signal",
+            event_type="fresh_public_discord_activity",
+            source_cursor=7,
+        )
+        hist = state.recent_history(self.db, 42, 1)
+        self.assertEqual(hist[0]["semantic_family"], "general_public_signal")
+
 
 if __name__ == "__main__":
     unittest.main()

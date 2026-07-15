@@ -149,7 +149,7 @@ def reject_reason_for_candidate(db_path: str, guild_id: int, message: str, direc
     dir_norm = normalize_text(directive)
     if not norm:
         return "empty_output"
-    fam = semantic_family(f"{message} {directive}")
+    fam = semantic_family(message)
     if fam == "non_event_stock":
         return "stock_family_rejected"
     for rec in recent_history(db_path, guild_id):
@@ -168,7 +168,7 @@ def record_publication(db_path: str, guild_id: int, *, message: str, directive: 
     ensure_schema(db_path)
     ts = published_timestamp or utc_now_iso()
     norm = normalize_text(message)
-    fam = semantic_family(f"{message} {directive}")
+    fam = semantic_family(message)
     relay_id = hashlib.sha256(f"{guild_id}|{source_cursor}|{norm}|{ts}".encode()).hexdigest()[:24]
     with sqlite3.connect(db_path) as conn:
         conn.execute("INSERT OR REPLACE INTO website_relay_state(guild_id,last_published_conversation_cursor,last_publication_timestamp) VALUES(?,?,?)", (guild_id, int(source_cursor or 0), ts))
