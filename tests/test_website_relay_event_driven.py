@@ -19,6 +19,8 @@ class WebsiteRelayEventDrivenTests(unittest.TestCase):
         self.tmp.close()
         self.db = self.tmp.name
         self.old_db = bnl01_bot.DB_FILE
+        self.old_contract_version = bnl01_bot.BNL_WEBSITE_CONTRACT_VERSION
+        bnl01_bot.BNL_WEBSITE_CONTRACT_VERSION = "1"
         bnl01_bot.DB_FILE = self.db
         bnl01_bot._recent_relay_messages.clear()
         bnl01_bot._website_relay_transaction_locks_by_guild.clear()
@@ -41,6 +43,7 @@ class WebsiteRelayEventDrivenTests(unittest.TestCase):
 
     def tearDown(self):
         bnl01_bot.DB_FILE = self.old_db
+        bnl01_bot.BNL_WEBSITE_CONTRACT_VERSION = self.old_contract_version
         try:
             os.unlink(self.db)
         except OSError:

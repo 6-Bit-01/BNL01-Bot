@@ -102,6 +102,14 @@ def ensure_schema(db_path: str) -> None:
         )
         """)
         conn.execute("CREATE INDEX IF NOT EXISTS idx_website_relay_attempts_guild_time ON website_relay_attempts(guild_id, started_at DESC)")
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(website_relay_attempts)").fetchall()}
+        for name, ddl in {
+            "prepared_relay_id": "ALTER TABLE website_relay_attempts ADD COLUMN prepared_relay_id TEXT",
+            "website_published_at": "ALTER TABLE website_relay_attempts ADD COLUMN website_published_at TEXT",
+            "idempotent": "ALTER TABLE website_relay_attempts ADD COLUMN idempotent INTEGER NOT NULL DEFAULT 0",
+        }.items():
+            if name not in cols:
+                conn.execute(ddl)
 
 
 def get_cursor(db_path: str, guild_id: int) -> int | None:
@@ -195,12 +203,12 @@ def reject_reason_for_candidate(db_path: str, guild_id: int, message: str, direc
     return ""
 
 
-def record_publication(db_path: str, guild_id: int, *, message: str, directive: str, mode: str, relay_lane: str, event_type: str, source_cursor: int, published_timestamp: str | None = None) -> str:
+def record_publication(db_path: str, guild_id: int, *, message: str, directive: str, mode: str, relay_lane: str, event_type: str, source_cursor: int, published_timestamp: str | None = None, relay_id: str | None = None) -> str:
     ensure_schema(db_path)
     ts = published_timestamp or utc_now_iso()
     norm = normalize_text(message)
     fam = semantic_family(message)
-    relay_id = hashlib.sha256(f"{guild_id}|{source_cursor}|{norm}|{ts}".encode()).hexdigest()[:24]
+    relay_id = relay_id or hashlib.sha256(f"{guild_id}|{source_cursor}|{norm}|{ts}".encode()).hexdigest()[:24]
     with sqlite3.connect(db_path) as conn:
         conn.execute("INSERT OR REPLACE INTO website_relay_state(guild_id,last_published_conversation_cursor,last_publication_timestamp) VALUES(?,?,?)", (guild_id, int(source_cursor or 0), ts))
         conn.execute("""
@@ -232,14 +240,36 @@ def begin_attempt(db_path: str, attempt_id: str, guild_id: int, trigger: str, so
         _prune_attempts(conn, guild_id)
 
 
-def complete_attempt(db_path: str, attempt_id: str, *, source_class: str, outcome: str, reason: str = "", aggregate_source_counts: dict[str, int] | None = None, cursor: int = 0, highest_eligible_conversation_id: int = 0, accepted_relay_id: str = "") -> None:
+def prepare_attempt_relay(db_path: str, attempt_id: str, prepared_relay_id: str) -> None:
+    ensure_schema(db_path)
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("UPDATE website_relay_attempts SET prepared_relay_id=? WHERE attempt_id=?", (prepared_relay_id or "", attempt_id))
+
+def hydrate_publication(db_path: str, guild_id: int, *, relay_id: str, message: str, directive: str, source_class: str, trigger: str, published_timestamp: str) -> bool:
+    ensure_schema(db_path)
+    norm = normalize_text(message)
+    fam = semantic_family(message)
+    with sqlite3.connect(db_path) as conn:
+        existing = conn.execute("SELECT public_message, public_directive, published_timestamp FROM website_relay_history WHERE relay_id=?", (relay_id,)).fetchone()
+        if existing:
+            return False
+        conn.execute("""
+        INSERT INTO website_relay_history(relay_id,guild_id,public_message,public_directive,mode,relay_lane,event_type,highest_source_conversation_id,normalized_message,semantic_family,published_timestamp)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?)
+        """, (relay_id, guild_id, message, directive, "OBSERVATION", "hydrated", source_class or trigger or "hydrated", 0, norm, fam, published_timestamp))
+        old = conn.execute("SELECT relay_id FROM website_relay_history WHERE guild_id=? ORDER BY published_timestamp DESC LIMIT -1 OFFSET ?", (guild_id, MAX_HISTORY)).fetchall()
+        if old:
+            conn.executemany("DELETE FROM website_relay_history WHERE relay_id=?", [(r[0],) for r in old])
+    return True
+
+def complete_attempt(db_path: str, attempt_id: str, *, source_class: str, outcome: str, reason: str = "", aggregate_source_counts: dict[str, int] | None = None, cursor: int = 0, highest_eligible_conversation_id: int = 0, accepted_relay_id: str = "", prepared_relay_id: str = "", website_published_at: str = "", idempotent: bool = False) -> None:
     ensure_schema(db_path)
     with sqlite3.connect(db_path) as conn:
         conn.execute("""
         UPDATE website_relay_attempts
-        SET source_class=?, completed_at=?, outcome=?, reason=?, aggregate_source_counts=?, cursor=?, highest_eligible_conversation_id=?, accepted_relay_id=?
+        SET source_class=?, completed_at=?, outcome=?, reason=?, aggregate_source_counts=?, cursor=?, highest_eligible_conversation_id=?, accepted_relay_id=?, prepared_relay_id=COALESCE(NULLIF(?, ''), prepared_relay_id), website_published_at=?, idempotent=?
         WHERE attempt_id=?
-        """, (source_class or "none", utc_now_iso(), outcome, reason or "", __import__('json').dumps(aggregate_source_counts or {}, sort_keys=True), int(cursor or 0), int(highest_eligible_conversation_id or 0), accepted_relay_id or "", attempt_id))
+        """, (source_class or "none", utc_now_iso(), outcome, reason or "", __import__('json').dumps(aggregate_source_counts or {}, sort_keys=True), int(cursor or 0), int(highest_eligible_conversation_id or 0), accepted_relay_id or "", prepared_relay_id or "", website_published_at or "", 1 if idempotent else 0, attempt_id))
 
 
 def get_attempt(db_path: str, attempt_id: str) -> dict[str, Any]:
