@@ -142,6 +142,7 @@ from bnl_website_relay_state import (
     record_publication as relay_record_publication,
     recent_history as relay_recent_history,
     reject_reason_for_candidate as relay_reject_reason_for_candidate,
+    stock_directive_reason as relay_stock_directive_reason,
 )
 
 # ==================== CONFIGURATION ====================
@@ -2379,6 +2380,7 @@ _last_relay_lane_by_guild: dict[int, str] = {}
 _recent_relay_lanes_by_guild = defaultdict(lambda: deque(maxlen=8))
 _last_relay_metadata_by_guild: dict[int, dict] = {}
 _website_relay_generation_tasks_by_guild: dict[int, asyncio.Task] = {}
+_website_relay_transaction_locks_by_guild: dict[int, asyncio.Lock] = {}
 RELAY_ANGLE_ROTATION = [
     "whisper",
     "wonder",
@@ -2435,34 +2437,20 @@ async def _run_force_pull_relay_update(guild_id: int, request_id: str = ""):
     tag = f" request_id={request_id}" if request_id else ""
     logging.info(f"Force-pull background relay update started guild={guild_id}{tag}")
     try:
-        decision = await generate_dynamic_website_relay(guild_id)
+        decision = await _execute_website_relay_transaction(guild_id, force=True, source="forcePull", admin_note_source="forcePull")
         state["last_force_pull_completed_at"] = _utc_now_iso()
-        if not decision.publish:
-            state["last_force_pull_status"] = "succeeded"
-            state["last_force_pull_error"] = decision.skipReason or "no_relay_published"
-            logging.info("Force-pull completed without publication guild=%s reason=%s%s", guild_id, decision.skipReason, tag)
-            return
-        ok = await update_website_status_controlled_async(
-            mode=decision.mode,
-            message=decision.message,
-            status="ONLINE",
-            force=True,
-            current_directive=decision.directive,
-            source="forcePull",
-            admin_note=build_admin_note(mode=decision.mode, message=decision.message, current_directive=decision.directive, source="forcePull"),
-        )
-        if ok:
-            relay_record_publication(DB_FILE, guild_id, message=decision.message, directive=decision.directive, mode=decision.mode, relay_lane=decision.relayLane, event_type=decision.eventType, source_cursor=decision.sourceCursor)
-            _remember_relay_message(guild_id, decision.message)
-            _remember_relay_topic(guild_id, decision.message)
-            _remember_relay_lane(guild_id, decision.relayLane)
+        if decision.publish:
             state["last_force_pull_status"] = "succeeded"
             state["last_force_pull_error"] = ""
             logging.info(f"Force-pull background relay update succeeded guild={guild_id} mode={decision.mode}{tag}")
-        else:
+        elif decision.skipReason == "website_post_failed":
             state["last_force_pull_status"] = "failed"
             state["last_force_pull_error"] = "relay_update_failed"
             logging.warning(f"Force-pull background relay update failed guild={guild_id} mode={decision.mode}{tag}")
+        else:
+            state["last_force_pull_status"] = "succeeded"
+            state["last_force_pull_error"] = decision.skipReason or "no_relay_published"
+            logging.info("Force-pull completed without publication guild=%s reason=%s%s", guild_id, decision.skipReason, tag)
     except Exception as e:
         state["last_force_pull_completed_at"] = _utc_now_iso()
         state["last_force_pull_status"] = "failed"
@@ -3164,7 +3152,8 @@ def _hydrate_recent_relay_memory(guild_id: int) -> None:
     if history:
         _recent_relay_messages[guild_id] = [h.get("normalized_message", "") for h in reversed(history) if h.get("normalized_message")]
         _recent_relay_lanes_by_guild[guild_id].clear()
-        for h in reversed(history[-8:]):
+        newest_lanes = history[:8]
+        for h in reversed(newest_lanes):
             lane = h.get("relay_lane")
             if lane:
                 _recent_relay_lanes_by_guild[guild_id].append(lane)
@@ -3202,8 +3191,11 @@ async def generate_dynamic_website_relay(guild_id: int) -> WebsiteRelayDecision:
     prompt = (
         "Write a BNL website relay only about the fresh eligible public Discord context supplied below.\n"
         "Return exactly two lines: public relay message, then operator directive.\n"
-        "Do not mention queues, read-model state, Radio, releases, dossiers, transmissions, waiting, standby, quiet channels, observation posture, bridge-active status, or lack of signal.\n"
-        "Do not include usernames. Keep it public-safe and factual.\n"
+        "Line 1 public observation: describe one specific, materially supported event, pattern, question, or change from the fresh Discord context. Do not describe internal processing.\n"
+        "Line 2 current directive: express a specific line of inquiry, follow-up posture, recognition target, or relevant invitation supported by that event. It must not fit every unrelated relay.\n"
+        "Forbidden sources: queue state, read-model state, now-playing, up-next, queue counts, payment state, availability, and inferred site/runtime conditions.\n"
+        "Radio, releases, dossiers, Transmissions, music, events, and other BARCODE subjects may be mentioned only when the supplied Discord context explicitly supports them. Do not infer live operational state.\n"
+        "Do not include usernames, direct quotations, waiting, standby, monitoring, listening-window, quiet-signal, bridge-active, generic online language, private/sensitive solicitations, urgency, or pressure.\n"
         f"Mode: {mode}.\nFresh public context:\n{relay_context}\n"
     )
     try:
@@ -3223,6 +3215,9 @@ async def generate_dynamic_website_relay(guild_id: int) -> WebsiteRelayDecision:
     lane_ok, lane_reason = _validate_relay_lane_adherence(relay_message, relay_lane, True, guild_id)
     if not lane_ok:
         return WebsiteRelayDecision(False, skipReason="lane_validation_failure", sourceConversationIds=[int(r[0]) for r in rows], sourceCursor=source_cursor, relayLane=relay_lane, metadata={"reason": lane_reason})
+    directive_reason = relay_stock_directive_reason(directive)
+    if directive_reason:
+        return WebsiteRelayDecision(False, skipReason=directive_reason, sourceConversationIds=[int(r[0]) for r in rows], sourceCursor=source_cursor, relayLane=relay_lane, metadata={"reason": directive_reason})
     dup_reason = relay_reject_reason_for_candidate(DB_FILE, guild_id, relay_message, directive)
     if dup_reason:
         logging.info("website_relay_no_publish guild=%s reason=%s", guild_id, dup_reason)
@@ -3236,6 +3231,43 @@ async def generate_dynamic_website_relay(guild_id: int) -> WebsiteRelayDecision:
         "relay_lane": relay_lane,
     }
     return WebsiteRelayDecision(True, eventType="fresh_public_discord_activity", sourceConversationIds=[int(r[0]) for r in rows], sourceCursor=source_cursor, message=relay_message, directive=directive, mode=mode, relayLane=relay_lane, metadata=metadata)
+
+
+def _get_website_relay_transaction_lock(guild_id: int) -> asyncio.Lock:
+    lock = _website_relay_transaction_locks_by_guild.get(guild_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _website_relay_transaction_locks_by_guild[guild_id] = lock
+    return lock
+
+
+async def _execute_website_relay_transaction(guild_id: int, *, force: bool = False, source: str = "relay", admin_note_source: str = "relay") -> WebsiteRelayDecision:
+    """Serialize the full per-guild relay transaction from cursor read through durable publication."""
+    lock = _get_website_relay_transaction_lock(guild_id)
+    async with lock:
+        decision = await _generate_website_relay_guarded(guild_id)
+        if decision is None:
+            return WebsiteRelayDecision(False, skipReason="relay_generation_inflight", sourceCursor=relay_get_cursor(DB_FILE, guild_id) or 0, metadata={"reason": "relay_generation_inflight"})
+        if not decision.publish:
+            return decision
+        admin_note = build_admin_note(mode=decision.mode, message=decision.message, current_directive=decision.directive, source=admin_note_source) if force else ""
+        ok = await update_website_status_controlled_async(
+            mode=decision.mode,
+            message=decision.message,
+            status="ONLINE",
+            force=force,
+            current_directive=decision.directive,
+            source=source,
+            admin_note=admin_note,
+        )
+        if not ok:
+            logging.warning("website_relay_delivery_failed_no_cursor_advance guild=%s sourceCursor=%s", guild_id, decision.sourceCursor)
+            return WebsiteRelayDecision(False, skipReason="website_post_failed", eventType=decision.eventType, sourceConversationIds=decision.sourceConversationIds, sourceCursor=decision.sourceCursor, message=decision.message, directive=decision.directive, mode=decision.mode, relayLane=decision.relayLane, metadata={**decision.metadata, "reason": "website_post_failed"})
+        relay_record_publication(DB_FILE, guild_id, message=decision.message, directive=decision.directive, mode=decision.mode, relay_lane=decision.relayLane, event_type=decision.eventType, source_cursor=decision.sourceCursor)
+        _remember_relay_message(guild_id, decision.message)
+        _remember_relay_topic(guild_id, decision.message)
+        _remember_relay_lane(guild_id, decision.relayLane)
+        return decision
 
 def resolve_network_guild_id(requested_guild_id: int) -> int:
     """Resolve guild id for network-facing actions, honoring primary-guild override."""
@@ -3257,27 +3289,12 @@ async def request_fresh_website_relay(guild_id: int, *, force: bool = True) -> t
     try:
         target_guild_id = resolve_network_guild_id(guild_id)
         logging.info(f"📨 Fresh website relay requested guild={guild_id} target_guild={target_guild_id} force={force}.")
-        decision = await generate_dynamic_website_relay(target_guild_id)
+        decision = await _execute_website_relay_transaction(target_guild_id, force=force, source="relay", admin_note_source="relay")
         if not decision.publish:
             logging.info("website_relay_request_no_publish guild=%s reason=%s", target_guild_id, decision.skipReason)
-            return True, decision.mode, "", ""
-        admin_note = build_admin_note(mode=decision.mode, message=decision.message, current_directive=decision.directive, source="relay", compact=not force) if force else ""
-        ok = await update_website_status_controlled_async(
-            mode=decision.mode,
-            message=decision.message,
-            status="ONLINE",
-            force=force,
-            current_directive=decision.directive,
-            source="relay",
-            admin_note=admin_note,
-        )
-        if ok:
-            relay_record_publication(DB_FILE, target_guild_id, message=decision.message, directive=decision.directive, mode=decision.mode, relay_lane=decision.relayLane, event_type=decision.eventType, source_cursor=decision.sourceCursor)
-            _remember_relay_message(target_guild_id, decision.message)
-            _remember_relay_topic(target_guild_id, decision.message)
-            _remember_relay_lane(target_guild_id, decision.relayLane)
-        logging.info(f"📨 Fresh website relay completed guild={target_guild_id} ok={ok} mode={decision.mode}.")
-        return ok, decision.mode, decision.message, decision.directive
+            return decision.skipReason != "website_post_failed", decision.mode, "", ""
+        logging.info(f"📨 Fresh website relay completed guild={target_guild_id} ok=True mode={decision.mode}.")
+        return True, decision.mode, decision.message, decision.directive
     except Exception as e:
         logging.error(f"Fresh website relay request failed for guild {guild_id}: {e}")
         return False, "OBSERVATION", "", ""
@@ -12963,7 +12980,7 @@ async def _generate_website_relay_guarded(guild_id: int) -> WebsiteRelayDecision
 
     try:
         result = await asyncio.wait_for(
-            asyncio.shield(task),
+            task,
             timeout=BNL_WEBSITE_RELAY_GENERATION_TIMEOUT_SECONDS,
         )
         elapsed = time.monotonic() - started
@@ -12972,11 +12989,13 @@ async def _generate_website_relay_guarded(guild_id: int) -> WebsiteRelayDecision
     except asyncio.TimeoutError:
         state["timed_out"] = True
         elapsed = time.monotonic() - started
+        if not task.done():
+            task.cancel()
         logging.warning(
             f"website_relay_generation_timeout guild={guild_id} elapsed_seconds={elapsed:.3f} "
             f"timeout_seconds={BNL_WEBSITE_RELAY_GENERATION_TIMEOUT_SECONDS:.1f}"
         )
-        return WebsiteRelayDecision(False, skipReason="relay_generation_timeout", sourceCursor=relay_get_cursor(DB_FILE, guild_id) or 0, metadata={"reason": "relay_generation_timeout"})
+        return WebsiteRelayDecision(False, skipReason="relay_generation_timeout", sourceCursor=relay_get_cursor(DB_FILE, guild_id) or 0, metadata={"reason": "relay_generation_timeout", "abandoned": True})
     except Exception as e:
         elapsed = time.monotonic() - started
         logging.warning(f"website_relay_generation_completed guild={guild_id} elapsed_seconds={elapsed:.3f} status=failed error={e}")
@@ -13008,21 +13027,11 @@ async def website_relay_task():
         if relay_eligibility == "no":
             continue
         logging.info(f"⏲️ website_relay_task tick guild={guild.id} active_channel={active_channel_id}.")
-        decision = await _generate_website_relay_guarded(guild.id)
-        if decision is None:
-            continue
+        decision = await _execute_website_relay_transaction(guild.id, force=False, source="relay", admin_note_source="relay")
         if not decision.publish:
             logging.info("website_relay_no_publish guild=%s reason=%s", guild.id, decision.skipReason)
             continue
-        logging.info(f"📤 website_relay_task prepared mode={decision.mode} preview={decision.message[:120]!r}")
-        ok = await update_website_status_controlled_async(mode=decision.mode, message=decision.message, status="ONLINE", current_directive=decision.directive, source="relay")
-        if ok:
-            relay_record_publication(DB_FILE, guild.id, message=decision.message, directive=decision.directive, mode=decision.mode, relay_lane=decision.relayLane, event_type=decision.eventType, source_cursor=decision.sourceCursor)
-            _remember_relay_message(guild.id, decision.message)
-            _remember_relay_topic(guild.id, decision.message)
-            _remember_relay_lane(guild.id, decision.relayLane)
-        else:
-            logging.warning("website_relay_delivery_failed_no_cursor_advance guild=%s sourceCursor=%s", guild.id, decision.sourceCursor)
+        logging.info(f"📤 website_relay_task published mode={decision.mode} preview={decision.message[:120]!r}")
 
 # ==================== BATCHED REPLY SYSTEM (ACTIVE CHANNEL ONLY) ====================
 

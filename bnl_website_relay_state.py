@@ -103,6 +103,25 @@ def semantic_family(text: str) -> str:
     return "general_public_signal"
 
 
+STOCK_DIRECTIVE_MARKERS = (
+    "continue monitoring", "await further activity", "await fresh", "review fresh context",
+    "review fresh public discord context", "maintain observation posture", "stand by",
+    "standing by", "monitor until", "await clearer", "waiting for", "remain online",
+)
+
+
+def stock_directive_reason(directive: str) -> str:
+    norm = normalize_text(directive)
+    if not norm:
+        return "empty_directive"
+    if any(marker in norm for marker in STOCK_DIRECTIVE_MARKERS):
+        return "stock_directive_rejected"
+    # A useful current directive should be specific enough to not fit every relay.
+    if len(norm.split()) < 5:
+        return "directive_too_thin"
+    return ""
+
+
 def recent_history(db_path: str, guild_id: int, limit: int = MAX_HISTORY) -> list[dict[str, Any]]:
     ensure_schema(db_path)
     with sqlite3.connect(db_path) as conn:
@@ -124,12 +143,13 @@ def reject_reason_for_candidate(db_path: str, guild_id: int, message: str, direc
         return "stock_family_rejected"
     for rec in recent_history(db_path, guild_id):
         old = rec.get("normalized_message") or normalize_text(rec.get("public_message", ""))
-        if norm == old or (dir_norm and dir_norm == normalize_text(rec.get("public_directive", ""))):
+        old_directive = normalize_text(rec.get("public_directive", ""))
+        # Directive equality alone is not a duplicate: only the public message, or
+        # the complete message/directive pair, can block a fresh relay.
+        if norm == old or (norm == old and dir_norm == old_directive):
             return "exact_duplicate"
         if old and difflib.SequenceMatcher(None, norm, old).ratio() >= threshold:
             return "near_duplicate"
-        if rec.get("semantic_family") == fam and fam != "public_discord_activity":
-            return "repeated_semantic_family"
     return ""
 
 

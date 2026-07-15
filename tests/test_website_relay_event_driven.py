@@ -20,6 +20,8 @@ class WebsiteRelayEventDrivenTests(unittest.TestCase):
         self.old_db = bnl01_bot.DB_FILE
         bnl01_bot.DB_FILE = self.db
         bnl01_bot._recent_relay_messages.clear()
+        bnl01_bot._website_relay_transaction_locks_by_guild.clear()
+        bnl01_bot._website_relay_generation_tasks_by_guild.clear()
         with sqlite3.connect(self.db) as conn:
             conn.execute("""
             CREATE TABLE conversations (
@@ -137,6 +139,137 @@ class WebsiteRelayEventDrivenTests(unittest.TestCase):
     def test_explicit_read_model_still_callable(self):
         with mock.patch.object(bnl01_bot, "BNL_READ_MODEL_ENABLED", False):
             self.assertIsInstance(bnl01_bot.fetch_bnl_read_model(force=True), dict)
+
+    def test_distinct_general_public_signal_messages_are_not_family_blocked(self):
+        state.record_publication(self.db, 42, message="A new public art thread gathered enough details to identify the technique being compared.", directive="Track the public technique comparison for a useful next reference.", mode="OBSERVATION", relay_lane="current_signal", event_type="fresh_public_discord_activity", source_cursor=1)
+        reason = state.reject_reason_for_candidate(self.db, 42, "A collaboration planning thread shifted toward a shared zine format.", "Determine whether the collaboration has a public next step worth indexing.")
+        self.assertEqual(reason, "")
+
+    def test_repeated_fallback_directive_alone_does_not_block_new_message(self):
+        repeated = "Review fresh public Discord context before the next relay update."
+        state.record_publication(self.db, 42, message="A public question identified one release-credit gap for follow-up.", directive=repeated, mode="OBSERVATION", relay_lane="current_signal", event_type="fresh_public_discord_activity", source_cursor=1)
+        reason = state.reject_reason_for_candidate(self.db, 42, "A separate artwork thread compared two cover treatments for a future post.", repeated)
+        self.assertEqual(reason, "")
+
+    def test_radio_release_dossier_transmission_topics_allowed_when_discord_grounded(self):
+        state.bootstrap_cursor(self.db, 42, 0)
+        self.add_row("Can BNL compare the public BARCODE Radio release notes with the Transmission topic people mentioned? #barcode", user="a")
+        self.add_row("There is also a public dossier question about credits for that music release discussion?", user="b")
+        prompts = []
+        async def fake_gemini(prompt, user_id=0, guild_id=0, route=""):
+            prompts.append(prompt)
+            return "Fresh Discord discussion connects BARCODE Radio, a release-credit question, a dossier angle, and a Transmission topic without confirming any live state.\nFollow the public thread for confirmed credits or links before treating the topic as indexed."
+        with mock.patch.object(bnl01_bot, "fetch_bnl_read_model", side_effect=AssertionError("read model called")), \
+             mock.patch.object(bnl01_bot, "get_recent_signal_summary", side_effect=AssertionError("queue helper called")), \
+             mock.patch.object(bnl01_bot, "get_gemini_response", side_effect=fake_gemini):
+            decision = self.generate()
+        self.assertTrue(decision.publish)
+        self.assertIn("BARCODE Radio", prompts[0])
+
+    def test_concurrent_transactions_publish_once_and_advance_once(self):
+        state.bootstrap_cursor(self.db, 42, 0)
+        self.add_row("Can BNL explain how tonight's public broadcast track submissions work? #barcode", user="a")
+        self.add_row("I have a public question about the show and which track context matters?", user="b")
+        post_count = 0
+        async def fake_post(**kwargs):
+            nonlocal post_count
+            post_count += 1
+            await asyncio.sleep(0.02)
+            return True
+        async def fake_gemini(prompt, user_id=0, guild_id=0, route=""):
+            await asyncio.sleep(0.02)
+            return "Two fresh Discord questions compare broadcast submissions with track context for tonight's show thread.\nFollow the public thread for confirmed submission details or links before indexing the answer."
+        async def run_two():
+            with mock.patch.object(bnl01_bot, "get_gemini_response", side_effect=fake_gemini), \
+                 mock.patch.object(bnl01_bot, "update_website_status_controlled_async", side_effect=fake_post):
+                return await asyncio.gather(
+                    bnl01_bot._execute_website_relay_transaction(42, source="relay"),
+                    bnl01_bot._execute_website_relay_transaction(42, force=True, source="forcePull", admin_note_source="forcePull"),
+                )
+        decisions = asyncio.run(run_two())
+        self.assertEqual(sum(1 for d in decisions if d.publish), 1)
+        self.assertEqual(post_count, 1)
+        self.assertEqual(len(state.recent_history(self.db, 42, 10)), 1)
+        self.assertEqual(state.get_cursor(self.db, 42), 2)
+
+    def test_concurrent_manual_and_scheduled_publish_once(self):
+        state.bootstrap_cursor(self.db, 42, 0)
+        self.add_row("Can BNL explain how tonight's public broadcast track submissions work? #barcode", user="a")
+        self.add_row("I have a public question about the show and which track context matters?", user="b")
+        post_count = 0
+        async def fake_post(**kwargs):
+            nonlocal post_count
+            post_count += 1
+            return True
+        async def fake_gemini(prompt, user_id=0, guild_id=0, route=""):
+            await asyncio.sleep(0.01)
+            return "Two fresh Discord questions compare broadcast submissions with track context for tonight's show thread.\nFollow the public thread for confirmed submission details or links before indexing the answer."
+        async def run_two():
+            with mock.patch.object(bnl01_bot, "get_gemini_response", side_effect=fake_gemini), \
+                 mock.patch.object(bnl01_bot, "update_website_status_controlled_async", side_effect=fake_post):
+                manual = asyncio.create_task(bnl01_bot.request_fresh_website_relay(42, force=True))
+                scheduled = asyncio.create_task(bnl01_bot._execute_website_relay_transaction(42, source="relay"))
+                return await asyncio.gather(manual, scheduled)
+        results = asyncio.run(run_two())
+        self.assertEqual(post_count, 1)
+        self.assertEqual(len(state.recent_history(self.db, 42, 10)), 1)
+        self.assertEqual(state.get_cursor(self.db, 42), 2)
+        self.assertTrue(results[0][0])
+
+    def test_transaction_failed_delivery_leaves_cursor_unchanged(self):
+        state.bootstrap_cursor(self.db, 42, 0)
+        self.add_row("Can BNL explain how tonight's public broadcast track submissions work? #barcode", user="a")
+        self.add_row("I have a public question about the show and which track context matters?", user="b")
+        async def fake_gemini(prompt, user_id=0, guild_id=0, route=""):
+            return "Two fresh Discord questions compare broadcast submissions with track context for tonight's show thread.\nFollow the public thread for confirmed submission details or links before indexing the answer."
+        async def run_one():
+            with mock.patch.object(bnl01_bot, "get_gemini_response", side_effect=fake_gemini), \
+                 mock.patch.object(bnl01_bot, "update_website_status_controlled_async", return_value=False):
+                return await bnl01_bot._execute_website_relay_transaction(42, source="relay")
+        decision = asyncio.run(run_one())
+        self.assertFalse(decision.publish)
+        self.assertEqual(decision.skipReason, "website_post_failed")
+        self.assertEqual(state.get_cursor(self.db, 42), 0)
+        self.assertEqual(state.recent_history(self.db, 42, 10), [])
+
+    def test_timed_out_generation_is_cancelled_and_cannot_publish_late(self):
+        original_timeout = bnl01_bot.BNL_WEBSITE_RELAY_GENERATION_TIMEOUT_SECONDS
+        bnl01_bot.BNL_WEBSITE_RELAY_GENERATION_TIMEOUT_SECONDS = 0.01
+        cancelled = asyncio.Event()
+        async def slow_generation(guild_id):
+            try:
+                await asyncio.sleep(1)
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+        async def run_one():
+            with mock.patch.object(bnl01_bot, "generate_dynamic_website_relay", side_effect=slow_generation), \
+                 mock.patch.object(bnl01_bot, "update_website_status_controlled_async", side_effect=AssertionError("posted late")):
+                return await bnl01_bot._execute_website_relay_transaction(42, source="relay")
+        try:
+            decision = asyncio.run(run_one())
+        finally:
+            bnl01_bot.BNL_WEBSITE_RELAY_GENERATION_TIMEOUT_SECONDS = original_timeout
+        self.assertFalse(decision.publish)
+        self.assertEqual(decision.skipReason, "relay_generation_timeout")
+
+    def test_restart_hydration_uses_newest_eight_lanes(self):
+        lanes = [f"lane_{i}" for i in range(10)]
+        for i, lane in enumerate(lanes):
+            state.record_publication(self.db, 42, message=f"Public Discord raised distinct track question {i} with enough detail.", directive=f"Follow public context item {i} for confirmed details.", mode="OBSERVATION", relay_lane=lane, event_type="fresh_public_discord_activity", source_cursor=i, published_timestamp=f"2026-07-15T00:00:{i:02d}Z")
+        bnl01_bot._recent_relay_lanes_by_guild[42].clear()
+        bnl01_bot._hydrate_recent_relay_memory(42)
+        self.assertEqual(list(bnl01_bot._recent_relay_lanes_by_guild[42]), lanes[2:10])
+
+    def test_silence_for_failure_modes_and_stock_directive(self):
+        state.bootstrap_cursor(self.db, 42, 0)
+        self.add_row("Can BNL explain how tonight's public broadcast track submissions work? #barcode", user="a")
+        self.add_row("I have a public question about the show and which track context matters?", user="b")
+        with mock.patch.object(bnl01_bot, "get_gemini_response", side_effect=RuntimeError("provider down")):
+            decision = self.generate()
+        self.assertFalse(decision.publish)
+        self.assertEqual(decision.skipReason, "provider_failure")
+        self.assertEqual(state.stock_directive_reason("Continue monitoring."), "stock_directive_rejected")
 
 
 if __name__ == "__main__":
