@@ -111,16 +111,16 @@ class WebsiteRelayGuardTests(unittest.IsolatedAsyncioTestCase):
 
         async def slow_generation(guild_id):
             await release.wait()
-            return ("OBSERVATION", "late", "directive", {})
+            return bnl01_bot.WebsiteRelayDecision(True, message="late", directive="directive", mode="OBSERVATION")
 
         bnl01_bot.BNL_WEBSITE_RELAY_GENERATION_TIMEOUT_SECONDS = 0.01
         try:
             with mock.patch.object(bnl01_bot, "generate_dynamic_website_relay", side_effect=slow_generation):
                 with self.assertLogs(level="WARNING") as logs:
-                    mode, message, directive, meta = await bnl01_bot._generate_website_relay_guarded(99)
-                self.assertEqual(mode, "OBSERVATION")
-                self.assertTrue(message)
-                self.assertEqual(meta["reason"], "relay_generation_timeout")
+                    decision = await bnl01_bot._generate_website_relay_guarded(99)
+                self.assertEqual(decision.mode, "OBSERVATION")
+                self.assertFalse(decision.publish)
+                self.assertEqual(decision.metadata["reason"], "relay_generation_timeout")
                 self.assertIn("website_relay_generation_timeout", "\n".join(logs.output))
         finally:
             release.set()
