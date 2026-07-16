@@ -40,6 +40,7 @@ from bnl_memory_governance import (
     complete_delete_member_data,
     correct_member_memory,
     forget_member_memory,
+    persist_shadow_diagnostics,
     live_enabled as memory_governance_live_enabled,
     shadow_enabled as memory_governance_shadow_enabled,
     view_member_memory,
@@ -12138,10 +12139,16 @@ def build_user_memory_context(user_id: int, guild_id: int, route_mode: str = ROU
                     "rendered_hash": gov_result.diagnostics.rendered_hash,
                     "legacy_vs_governed": gov_result.diagnostics.legacy_vs_governed,
                     "processing_errors": gov_result.diagnostics.processing_errors,
+                    "invalid_invariants": gov_result.diagnostics.invalid_invariants,
+                    "fallback_reason": gov_result.diagnostics.fallback_reason,
                 }
-                if memory_governance_live_enabled():
+                persist_shadow_diagnostics(gov_conn, gov_req, gov_result, legacy_context)
+                unsafe_governed = bool(gov_result.diagnostics.processing_errors or gov_result.diagnostics.invalid_invariants)
+                if memory_governance_live_enabled() and not unsafe_governed:
                     LAST_MEMORY_PROMPT_DIAGNOSTICS[(user_id, guild_id)] = diagnostics
-                    return gov_result.rendered_context or "No durable memory yet."
+                    return gov_result.rendered_context
+                if memory_governance_live_enabled() and unsafe_governed:
+                    diagnostics["memory_governance"]["fallback_reason"] = "unsafe_governed_result"
         except Exception as e:
             diagnostics["memory_governance"] = {"shadow_enabled": True, "live_enabled": False, "fallback_reason": type(e).__name__}
     LAST_MEMORY_PROMPT_DIAGNOSTICS[(user_id, guild_id)] = diagnostics

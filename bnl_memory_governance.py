@@ -1,185 +1,488 @@
 """Deterministic governed durable-memory candidate assembly and member controls.
 
-Scoring weights are intentionally fixed and documented here so stable inputs produce
-stable output. Candidate score = recall intent 2.0 + subject match 3.0 + topic
-overlap 0.35/term (max 2.1) + open loop/commitment 1.0 + authority rank up to
-2.4 + confidence rank up to 1.2 + freshness up to 1.0 + salience up to 1.0 +
-participant continuity 0.8 + bounded moment relevance 0.4 + correction state 2.5.
-Tie-break order: score desc, authority desc, confidence desc, observed_at desc,
-source_class, source_ref, entry_id.
+Scoring weights are fixed so stable inputs produce stable output. Candidate score =
+explicit recall 2.0 + subject match 3.0 + topic overlap 0.45/term (max 2.7) +
+open loop/commitment 1.0 + authority rank up to 2.8 + confidence rank up to 1.2
++ freshness up to 1.0 + salience up to 1.0 + participant continuity 0.8 +
+correction state 2.5. Tie-break order: score desc, authority desc, confidence
+desc, observed_at desc, source class, source ref, entry id.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
-import hashlib, os, re, sqlite3
-from typing import Any
+import hashlib
+import json
+import os
+import re
+import sqlite3
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 from bnl_memory_ledger import ensure_memory_ledger_schema, subject_key_for_user
 
 SHADOW_ENV = "BNL_MEMORY_GOVERNANCE_SHADOW_ENABLED"
 LIVE_ENV = "BNL_MEMORY_GOVERNANCE_LIVE_ENABLED"
-_ALLOWED_LIVE_MOMENT = False
-_BLOCKED_LIFECYCLES = {"corrected", "superseded", "retracted", "expired", "quarantined", "review_only", "needs_review", "forgotten", "deleted", "unresolved"}
-_PUBLIC_VIS = {"public", "public_safe", "reference_canon"}
-_INTERNAL_VIS = _PUBLIC_VIS | {"internal", "private", "mod"}
-_AUTHORITY = {"legacy_source_blind":0, "derived_summary":1, "evidence_projection":2, "entity_evidence_projection":2, "dossier_projection":2, "source_file_projection":2, "public_observation":3, "runtime_observation":4, "first_party_record":5, "approved_canon":6, "owner_correction":7}
-_CONF = {"unknown":0, "low":1, "medium":2, "high":3, "approved":4}
+BLOCKED_LIFECYCLES = {"corrected", "superseded", "retracted", "expired", "quarantined", "review_only", "needs_review", "forgotten", "deleted", "unresolved"}
+PUBLIC_VIS = {"public", "public_safe", "reference_canon"}
+INTERNAL_VIS = PUBLIC_VIS | {"internal", "private", "mod", "operator_only"}
+DURABLE_ENTRY_TYPES = {"claim", "preference", "boundary", "goal", "open_loop", "commitment", "canon_reference", "unresolved_question", "event"}
+DURABLE_PREDICATES = {"fact", "preference", "favorite", "boundary", "goal", "open_loop", "commitment", "canon_reference", "unresolved_question", "correction", "favorite_color", "favorite_food", "remembered_number"}
+NON_LIVE_PREDICATES = {"conversation", "model_output", "assistant_response", "raw_message"}
+PROJECTION_CLASSES = {"derived_summary", "evidence_projection", "source_file_projection", "dossier_projection", "entity_evidence_projection", "legacy_source_blind"}
+AUTHORITY = {"legacy_source_blind": 0, "derived_summary": 1, "evidence_projection": 2, "entity_evidence_projection": 2, "dossier_projection": 2, "source_file_projection": 2, "public_observation": 3, "runtime_observation": 4, "first_party_record": 5, "approved_canon": 6, "owner_correction": 7}
+CONF = {"unknown": 0, "low": 1, "medium": 2, "high": 3, "approved": 4}
+BROAD_RECALL_RE = re.compile(r"\b(what do you (?:know|remember) about me|what do you remember|my memory|everything you know|recall my)\b", re.I)
+RECALL_RE = re.compile(r"\b(remember|memory|recall|what do you know|what is my|what's my|my)\b", re.I)
 
 @dataclass(frozen=True)
 class GovernanceRequest:
-    guild_id: int; subject_user_id: int; route_mode: str; conversation_surface: str
-    channel_id: int = 0; channel_name: str = ""; channel_policy: str = "unknown"
-    visibility_allowance: str = "public_safe"; user_text: str = ""; topic_terms: tuple[str,...] = ()
-    participants: tuple[str,...] = (); direct_state: str = "direct"; budget_chars: int = 1200
-    allowed_source_classes: tuple[str,...] = (); now: str = ""
+    guild_id: int
+    subject_user_id: int
+    route_mode: str
+    conversation_surface: str
+    channel_id: int = 0
+    channel_name: str = ""
+    channel_policy: str = "unknown"
+    visibility_allowance: str = "public_safe"
+    user_text: str = ""
+    topic_terms: Tuple[str, ...] = ()
+    participants: Tuple[str, ...] = ()
+    direct_state: str = "direct"
+    budget_chars: int = 1200
+    allowed_source_classes: Tuple[str, ...] = ()
+    now: str = ""
 
 @dataclass(frozen=True)
 class MemoryCandidate:
-    source_class: str; source_type: str; source_ref: str; entry_id: str; subject_key: str
-    predicate_key: str; text: str; visibility: str; confidence: str; lifecycle: str
-    authority: int; salience: float = 0.0; observed_at: str = ""; derived: bool = False
-    projection: bool = False; participants: tuple[str,...] = (); lineage: tuple[tuple[str,str],...] = ()
+    source_class: str
+    source_type: str
+    source_ref: str
+    entry_id: str
+    guild_id: int
+    subject_key: str
+    predicate_key: str
+    entry_type: str
+    text: str
+    visibility: str
+    confidence: str
+    lifecycle: str
+    authority: int
+    salience: float = 0.0
+    observed_at: str = ""
+    valid_from: str = ""
+    valid_until: str = ""
+    derived: bool = False
+    projection: bool = False
+    participants: Tuple[str, ...] = ()
+    lineage: Tuple[Tuple[str, str], ...] = ()
     score: float = 0.0
+    eligible_root: bool = True
 
 @dataclass(frozen=True)
 class GovernanceExclusion:
-    source_ref: str; reason: str; source_class: str = ""; entry_id: str = ""
+    source_ref: str
+    reason: str
+    source_class: str = ""
+    entry_id: str = ""
 
 @dataclass
 class GovernanceDiagnostics:
-    route_policy: dict[str, Any] = field(default_factory=dict)
-    candidates_by_source: dict[str,int] = field(default_factory=dict)
-    selected_count: int = 0; excluded_by_reason: dict[str,int] = field(default_factory=dict)
-    contradiction_resolutions: list[str] = field(default_factory=list)
-    correction_supersession_exclusions: int = 0; moment_candidate_count: int = 0
-    visibility_exclusions: int = 0; token_budget_exclusions: int = 0; duplicate_suppression: int = 0
-    rendered_size: int = 0; rendered_hash: str = ""; legacy_vs_governed: dict[str,Any] = field(default_factory=dict)
-    processing_errors: list[str] = field(default_factory=list); fallback_reason: str = ""
+    route_policy: Dict[str, Any] = field(default_factory=dict)
+    candidates_by_source: Dict[str, int] = field(default_factory=dict)
+    selected_by_source: Dict[str, int] = field(default_factory=dict)
+    selected_count: int = 0
+    excluded_by_reason: Dict[str, int] = field(default_factory=dict)
+    contradiction_resolutions: List[str] = field(default_factory=list)
+    correction_supersession_exclusions: int = 0
+    moment_candidate_count: int = 0
+    moment_needs_review_excluded: int = 0
+    visibility_exclusions: int = 0
+    token_budget_exclusions: int = 0
+    duplicate_suppression: int = 0
+    invalid_invariants: List[str] = field(default_factory=list)
+    rendered_size: int = 0
+    rendered_hash: str = ""
+    legacy_vs_governed: Dict[str, Any] = field(default_factory=dict)
+    processing_errors: List[str] = field(default_factory=list)
+    fallback_reason: str = ""
 
 @dataclass(frozen=True)
 class GovernanceResult:
-    rendered_context: str; selected: tuple[MemoryCandidate,...]; exclusions: tuple[GovernanceExclusion,...]
+    rendered_context: str
+    selected: Tuple[MemoryCandidate, ...]
+    exclusions: Tuple[GovernanceExclusion, ...]
     diagnostics: GovernanceDiagnostics
 
-def gate_enabled(name: str, environ: dict[str,str]|None=None) -> bool:
-    return str((environ or os.environ).get(name, "")).strip().lower() in {"1","true","yes","on","enabled"}
-def shadow_enabled(environ=None): return gate_enabled(SHADOW_ENV, environ)
-def live_enabled(environ=None): return shadow_enabled(environ) and gate_enabled(LIVE_ENV, environ)
-def _terms(s: str) -> set[str]: return set(re.findall(r"[a-z0-9]{3,}", (s or "").lower()))
-def _hash(s: str) -> str: return hashlib.sha256((s or "").encode()).hexdigest()[:16]
-def _now(): return datetime.now(timezone.utc).isoformat()
-def _table_exists(conn, table): return bool(conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone())
-def _cols(conn, table): return {r[1] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()}
-def _add(diag, key, n=1): diag.excluded_by_reason[key]=diag.excluded_by_reason.get(key,0)+n
+def gate_enabled(name: str, environ: Optional[Dict[str, str]] = None) -> bool:
+    return str((environ or os.environ).get(name, "")).strip().lower() in {"1", "true", "yes", "on", "enabled"}
+
+def shadow_enabled(environ: Optional[Dict[str, str]] = None) -> bool:
+    return gate_enabled(SHADOW_ENV, environ)
+
+def live_enabled(environ: Optional[Dict[str, str]] = None) -> bool:
+    return shadow_enabled(environ) and gate_enabled(LIVE_ENV, environ)
+
+def _terms(s: str) -> Set[str]:
+    return {t for t in re.findall(r"[a-z0-9]{3,}", (s or "").lower()) if t not in {"what", "whats", "remember", "memory", "about", "know", "does", "this", "that", "queue"}}
+
+def _hash(s: str) -> str:
+    return hashlib.sha256((s or "").encode("utf-8")).hexdigest()[:16]
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+def _parse_time(value: str) -> float:
+    if not value:
+        return 0.0
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp()
+    except Exception:
+        return 0.0
+
+def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
+    return bool(conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone())
+
+def _cols(conn: sqlite3.Connection, table: str) -> Set[str]:
+    return {r[1] for r in conn.execute("PRAGMA table_info(%s)" % table).fetchall()}
+
+def _add(diag: GovernanceDiagnostics, key: str, n: int = 1) -> None:
+    diag.excluded_by_reason[key] = diag.excluded_by_reason.get(key, 0) + n
 
 def ensure_governance_schema(conn: sqlite3.Connection) -> None:
     ensure_memory_ledger_schema(conn)
-    cur=conn.cursor()
-    cur.execute("CREATE TABLE IF NOT EXISTS memory_governance_receipts (receipt_id TEXT PRIMARY KEY, guild_id INTEGER NOT NULL, user_id INTEGER NOT NULL, action TEXT NOT NULL, target_ref TEXT DEFAULT '', created_at TEXT NOT NULL, row_counts_json TEXT DEFAULT '{}')")
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_mgr_user ON memory_governance_receipts(guild_id,user_id,action)")
+    cur = conn.cursor()
+    cur.execute("CREATE TABLE IF NOT EXISTS memory_governance_receipts (receipt_id TEXT PRIMARY KEY, guild_id INTEGER NOT NULL, subject_hash TEXT NOT NULL, action TEXT NOT NULL, target_ref TEXT DEFAULT '', created_at TEXT NOT NULL, row_counts_json TEXT DEFAULT '{}')")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_mgr_subject ON memory_governance_receipts(guild_id,subject_hash,action)")
+    cur.execute("CREATE TABLE IF NOT EXISTS memory_governance_shadow_runs (run_id TEXT PRIMARY KEY, guild_id INTEGER NOT NULL, subject_hash TEXT NOT NULL, route_mode TEXT, channel_policy TEXT, created_at TEXT NOT NULL, rendered_hash TEXT, rendered_size INTEGER, legacy_hash TEXT, legacy_size INTEGER, selected_count INTEGER, excluded_json TEXT, errors_json TEXT)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_mgs_guild ON memory_governance_shadow_runs(guild_id, created_at)")
     conn.commit()
 
-def build_governed_context(conn: sqlite3.Connection, req: GovernanceRequest, *, legacy_context: str = "", include_review_moments: bool = False) -> GovernanceResult:
-    ensure_governance_schema(conn); diag=GovernanceDiagnostics(route_policy={"route_mode":req.route_mode,"channel_policy":req.channel_policy,"visibility":req.visibility_allowance})
-    exclusions=[]; cands=[]; subject=subject_key_for_user(req.subject_user_id); request_terms=set(req.topic_terms) or _terms(req.user_text)
-    if req.route_mode == "simple_greeting" or (len(request_terms) <= 1 and re.fullmatch(r"\s*(hi|hello|hey|yo|sup|gm|good morning)[!. ]*\s*", req.user_text or "", re.I)):
-        diag.fallback_reason="simple_greeting_skip"; return GovernanceResult("",(),(),diag)
-    allowed=set(req.allowed_source_classes or _AUTHORITY.keys())
-    public_route=req.visibility_allowance in {"public", "public_safe"}
-    try:
-        for r in conn.execute("SELECT * FROM memory_ledger_entries WHERE guild_id=? AND subject_key=?", (req.guild_id, subject)).fetchall():
-            d=dict(zip([c[1] for c in conn.execute('PRAGMA table_info(memory_ledger_entries)').fetchall()], r))
-            source_class=str(d.get("source_class") or ""); ref=f"ledger:{d.get('entry_id')}"; diag.candidates_by_source[source_class]=diag.candidates_by_source.get(source_class,0)+1
-            if source_class not in allowed: exclusions.append(GovernanceExclusion(ref,"route_source_class",source_class,str(d.get("entry_id")))); _add(diag,"route_source_class"); continue
-            life=str(d.get("lifecycle_status") or "active").lower()
-            if life in _BLOCKED_LIFECYCLES: exclusions.append(GovernanceExclusion(ref,"lifecycle",source_class,str(d.get("entry_id")))); _add(diag,"lifecycle"); diag.correction_supersession_exclusions+=1; continue
-            if conn.execute("SELECT 1 FROM memory_ledger_lineage WHERE guild_id=? AND target_entry_id=? AND lineage_type IN ('correction_of','supersedes','retracts')", (req.guild_id,d.get('entry_id'))).fetchone():
-                exclusions.append(GovernanceExclusion(ref,"superseded_or_retracted",source_class,str(d.get("entry_id")))); _add(diag,"superseded_or_retracted"); diag.correction_supersession_exclusions+=1; continue
-            vis=str(d.get("visibility") or "unknown")
-            if public_route and (vis not in _PUBLIC_VIS or not int(d.get("public_usable") or 0) or source_class=="legacy_source_blind"):
-                exclusions.append(GovernanceExclusion(ref,"visibility",source_class,str(d.get("entry_id")))); _add(diag,"visibility"); diag.visibility_exclusions+=1; continue
-            if vis not in _INTERNAL_VIS: exclusions.append(GovernanceExclusion(ref,"visibility",source_class,str(d.get("entry_id")))); _add(diag,"visibility"); continue
-            text=str(d.get("normalized_value") or "").strip()
-            if not text or text.lower().strip() == (req.user_text or "").lower().strip(): exclusions.append(GovernanceExclusion(ref,"current_message_or_empty",source_class,str(d.get("entry_id")))); _add(diag,"current_message_or_empty"); continue
-            cands.append(MemoryCandidate(source_class,"ledger",ref,str(d.get("entry_id")),subject,str(d.get("predicate_key") or "memory"),text,vis,str(d.get("confidence") or "unknown"),life,_AUTHORITY.get(source_class,0),float(d.get("salience") or 0),str(d.get("observed_at") or ""),bool(d.get("derived")),bool(d.get("projection"))))
-        if include_review_moments and _table_exists(conn,"moment_engine_moments"):
-            diag.moment_candidate_count = conn.execute("SELECT COUNT(*) FROM moment_engine_moments WHERE guild_id=?", (req.guild_id,)).fetchone()[0]
-    except Exception as e:
-        diag.processing_errors.append(type(e).__name__)
-    scored=[]; recall=bool(re.search(r"\b(remember|memory|recall|what do you know|my)\b", req.user_text or "", re.I))
-    for c in cands:
-        overlap=len(request_terms & _terms(c.text)); score=(2.0 if recall else 0)+(3.0 if c.subject_key==subject else 0)+min(2.1,0.35*overlap)+(1.0 if c.predicate_key in {"open_loop","commitment","goal"} else 0)+c.authority*0.34+_CONF.get(c.confidence,0)*0.3+min(1.0,max(0.0,c.salience))+ (2.5 if c.source_class=="owner_correction" else 0)
-        scored.append(c.__class__(**{**c.__dict__, "score": round(score,4)}))
-    ranked=sorted(scored, key=lambda c:(-c.score,-c.authority,-_CONF.get(c.confidence,0),c.observed_at,c.source_class,c.source_ref,c.entry_id))
-    selected=[]; seen=set(); used=0; per={}
-    for c in ranked:
-        norm=re.sub(r"\W+"," ",c.text.lower()).strip()
-        if norm in seen: diag.duplicate_suppression+=1; _add(diag,"duplicate"); continue
-        if per.get(c.source_type,0)>=6: _add(diag,"per_source_cap"); continue
-        line=f"- {c.text[:240]}"
-        if used+len(line)>max(0,req.budget_chars): diag.token_budget_exclusions+=1; _add(diag,"budget"); continue
-        seen.add(norm); selected.append(c); per[c.source_type]=per.get(c.source_type,0)+1; used+=len(line)
-    rendered="" if not selected else "Durable memory (governed):\n"+"\n".join(f"- {c.text[:240]}" for c in selected)
-    diag.selected_count=len(selected); diag.rendered_size=len(rendered); diag.rendered_hash=_hash(rendered); diag.legacy_vs_governed={"legacy_hash":_hash(legacy_context),"governed_hash":diag.rendered_hash,"same":_hash(legacy_context)==diag.rendered_hash,"legacy_size":len(legacy_context or "")}
-    return GovernanceResult(rendered, tuple(selected), tuple(exclusions), diag)
-
-def build_evaluation_report(results: list[GovernanceResult], guild_id: int) -> dict[str,Any]:
-    return {"guild_id":guild_id,"runs":len(results),"selected_total":sum(len(r.selected) for r in results),"visibility_violations":0,"cross_member_violations":0,"cross_guild_violations":0,"superseded_retracted_selected":0,"review_only_live_selected":0,"budget_overruns":0,"shadow_errors":sum(len(r.diagnostics.processing_errors) for r in results),"empty_result_frequency":sum(1 for r in results if not r.rendered_context),"rollback_readiness":"ready_env_disable_live"}
-
-def _receipt(action,guild_id,user_id,target=""):
-    return "mgr_"+hashlib.sha256(f"{action}|{guild_id}|{user_id}|{target}".encode()).hexdigest()[:32]
-
-def view_member_memory(conn, *, guild_id:int, user_id:int, limit:int=10) -> list[dict[str,Any]]:
-    ensure_governance_schema(conn); subject=subject_key_for_user(user_id); out=[]
-    for r in conn.execute("SELECT entry_id,predicate_key,normalized_value,source_class,lifecycle_status,derived,updated_at FROM memory_ledger_entries WHERE guild_id=? AND subject_key=? ORDER BY updated_at DESC LIMIT ?", (guild_id,subject,limit)).fetchall():
-        eid,pred,val,sc,life,derived,updated=r; out.append({"ref":"mem_"+_hash(eid),"kind":"derived/review-only assessment" if derived or life=="review_only" else "member-authored or observed fact","summary":str(val or '')[:220],"status":life,"correctable":life not in {"forgotten","deleted","retracted"},"_entry_id":eid})
-    return out
-
-def _resolve_ref(conn,guild_id,user_id,ref):
-    for item in view_member_memory(conn,guild_id=guild_id,user_id=user_id,limit=500):
-        if item["ref"]==ref: return item["_entry_id"]
+def _safe_sql_text_col(cols: Set[str], preferred: Iterable[str]) -> str:
+    for c in preferred:
+        if c in cols:
+            return c
     return ""
 
-def correct_member_memory(conn, *, guild_id:int, user_id:int, safe_ref:str, corrected_text:str) -> dict[str,Any]:
-    ensure_governance_schema(conn); target=_resolve_ref(conn,guild_id,user_id,safe_ref)
-    if not target: return {"ok":False,"reason":"ambiguous_or_unauthorized_target"}
-    if not (corrected_text or '').strip(): return {"ok":False,"reason":"empty_correction"}
-    subject=subject_key_for_user(user_id); rid=_receipt("correct",guild_id,user_id,safe_ref+_hash(corrected_text)); now=_now()
-    with conn:
-        prior=conn.execute("SELECT predicate_key,source_class,source_row_id,lifecycle_status FROM memory_ledger_entries WHERE guild_id=? AND subject_key=? AND entry_id=?",(guild_id,subject,target)).fetchone()
-        if not prior or prior[3] in {"forgotten","deleted","retracted"}: return {"ok":False,"reason":"already_forgotten_or_missing"}
-        if conn.execute("SELECT 1 FROM memory_governance_receipts WHERE receipt_id=?",(rid,)).fetchone(): return {"ok":True,"receipt":rid,"idempotent":True}
-        entry_id="mle_"+hashlib.sha256(f"correction|{guild_id}|{user_id}|{target}|{_hash(corrected_text)}".encode()).hexdigest()[:40]
-        conn.execute("INSERT OR IGNORE INTO memory_ledger_entries (entry_id,schema_version,guild_id,subject_key,subject_display_name,entry_type,predicate_key,normalized_value,source_class,source_table,source_row_id,source_role,visibility,confidence,public_usable,derived,projection,salience,observed_at,lifecycle_status,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (entry_id,"memory_ledger_v1",guild_id,subject,"","claim",prior[0],corrected_text[:1000],"owner_correction","member_memory_control",rid,"member_control","private","high",0,0,0,1.0,now,"active",now,now))
-        conn.execute("INSERT OR IGNORE INTO memory_ledger_lineage VALUES (?,?,?,?,?)",(entry_id,guild_id,"correction_of",target,now)); conn.execute("INSERT OR IGNORE INTO memory_ledger_lineage VALUES (?,?,?,?,?)",(entry_id,guild_id,"supersedes",target,now))
-        conn.execute("UPDATE memory_ledger_entries SET lifecycle_status='corrected', updated_at=? WHERE guild_id=? AND entry_id=?",(now,guild_id,target))
-        conn.execute("INSERT INTO memory_governance_receipts VALUES (?,?,?,?,?,?,?)",(rid,guild_id,user_id,"correct",safe_ref,now,'{"ledger_entries":1}'))
-    return {"ok":True,"receipt":rid,"ref":safe_ref}
+def _lineage(conn: sqlite3.Connection, guild_id: int, entry_id: str) -> Tuple[Tuple[str, str], ...]:
+    return tuple((str(a), str(b)) for a, b in conn.execute("SELECT lineage_type,target_entry_id FROM memory_ledger_lineage WHERE guild_id=? AND entry_id=? ORDER BY lineage_type,target_entry_id", (guild_id, entry_id)).fetchall())
 
-def forget_member_memory(conn, *, guild_id:int, user_id:int, safe_ref:str) -> dict[str,Any]:
-    ensure_governance_schema(conn); target=_resolve_ref(conn,guild_id,user_id,safe_ref); rid=_receipt("forget",guild_id,user_id,safe_ref); now=_now(); subject=subject_key_for_user(user_id)
-    if not target: return {"ok":False,"reason":"ambiguous_or_unauthorized_target"}
-    with conn:
-        if conn.execute("SELECT 1 FROM memory_governance_receipts WHERE receipt_id=?",(rid,)).fetchone(): return {"ok":True,"receipt":rid,"idempotent":True}
-        if not conn.execute("SELECT 1 FROM memory_ledger_entries WHERE guild_id=? AND subject_key=? AND entry_id=?",(guild_id,subject,target)).fetchone(): return {"ok":False,"reason":"unauthorized"}
-        conn.execute("UPDATE memory_ledger_entries SET lifecycle_status='forgotten', normalized_value='', updated_at=? WHERE guild_id=? AND entry_id=?",(now,guild_id,target))
-        conn.execute("INSERT INTO memory_governance_receipts VALUES (?,?,?,?,?,?,?)",(rid,guild_id,user_id,"forget",safe_ref,now,'{"ledger_entries":1}'))
-    return {"ok":True,"receipt":rid}
+def _has_eligible_projection_root(conn: sqlite3.Connection, guild_id: int, entry_id: str, seen: Optional[Set[str]] = None) -> bool:
+    seen = seen or set()
+    if entry_id in seen:
+        return False
+    seen.add(entry_id)
+    rows = conn.execute("SELECT target_entry_id FROM memory_ledger_lineage WHERE guild_id=? AND entry_id=? AND lineage_type='derived_from'", (guild_id, entry_id)).fetchall()
+    if not rows:
+        return False
+    for (target,) in rows:
+        r = conn.execute("SELECT source_class,lifecycle_status,derived,projection,predicate_key,entry_type FROM memory_ledger_entries WHERE guild_id=? AND entry_id=?", (guild_id, target)).fetchone()
+        if not r:
+            continue
+        sc, life, derived, projection, pred, etype = [str(x or "") for x in r]
+        if life in BLOCKED_LIFECYCLES:
+            continue
+        if (not int(derived or 0) and not int(projection or 0) and sc not in PROJECTION_CLASSES and (pred in DURABLE_PREDICATES or etype in DURABLE_ENTRY_TYPES)):
+            return True
+        if _has_eligible_projection_root(conn, guild_id, target, seen):
+            return True
+    return False
 
-def complete_delete_member_data(conn, *, guild_id:int, user_id:int, confirmation:str, inject_failure:bool=False) -> dict[str,Any]:
-    if confirmation != f"DELETE MY BNL DATA {guild_id}": return {"ok":False,"reason":"confirmation_required"}
-    ensure_governance_schema(conn); rid=_receipt("complete_delete",guild_id,user_id); now=_now(); counts={}
+def _entry_current(conn: sqlite3.Connection, guild_id: int, entry_id: str) -> bool:
+    return not bool(conn.execute("SELECT 1 FROM memory_ledger_lineage WHERE guild_id=? AND target_entry_id=? AND lineage_type IN ('correction_of','supersedes','retracts')", (guild_id, entry_id)).fetchone())
+
+def _valid_now(d: Dict[str, Any], now_ts: float) -> bool:
+    start = _parse_time(str(d.get("valid_from") or "")); end = _parse_time(str(d.get("valid_until") or ""))
+    return (not start or start <= now_ts) and (not end or end >= now_ts)
+
+def _classify_kind(source_class: str, entry_type: str, derived: bool, lifecycle: str) -> str:
+    if source_class == "owner_correction":
+        return "member-authored correction"
+    if entry_type in {"preference", "claim"} and source_class in {"first_party_record", "owner_correction"}:
+        return "member-authored fact"
+    if derived or lifecycle == "review_only":
+        return "review-only derived assessment"
+    return "observation"
+
+def _is_broad_recall(text: str) -> bool:
+    return bool(BROAD_RECALL_RE.search(text or ""))
+
+def _explicit_recall(text: str) -> bool:
+    return bool(RECALL_RE.search(text or ""))
+
+def _relevance_ok(c: MemoryCandidate, request_terms: Set[str], broad: bool) -> bool:
+    if broad:
+        return True
+    if c.predicate_key in {"open_loop", "commitment", "goal", "unresolved_question"}:
+        return True
+    if not request_terms:
+        return False
+    cand_terms = _terms(c.text) | _terms(c.predicate_key.replace("_", " "))
+    overlap = request_terms & cand_terms
+    return len(overlap) >= (2 if len(request_terms) >= 2 else 1)
+
+def _freshness_score(observed_at: str, now_ts: float) -> float:
+    ts = _parse_time(observed_at)
+    if not ts or not now_ts:
+        return 0.0
+    age_days = max(0.0, (now_ts - ts) / 86400.0)
+    return max(0.0, 1.0 - min(age_days, 365.0) / 365.0)
+
+def _moment_counts(conn: sqlite3.Connection, req: GovernanceRequest, diag: GovernanceDiagnostics) -> None:
+    if not _table_exists(conn, "memory_moment_windows"):
+        return
+    try:
+        subject = subject_key_for_user(req.subject_user_id)
+        diag.moment_candidate_count = conn.execute("SELECT COUNT(DISTINCT w.moment_id) FROM memory_moment_windows w LEFT JOIN memory_moment_participants p ON p.moment_id=w.moment_id WHERE w.guild_id=? AND (p.participant_key=? OR w.canonical_ledger_entry_id IN (SELECT entry_id FROM memory_ledger_entries WHERE guild_id=? AND subject_key=?))", (req.guild_id, subject, req.guild_id, subject)).fetchone()[0]
+        diag.moment_needs_review_excluded = conn.execute("SELECT COUNT(*) FROM memory_moment_windows WHERE guild_id=? AND lifecycle_status='needs_review'", (req.guild_id,)).fetchone()[0]
+    except Exception as e:
+        diag.processing_errors.append("moment:" + type(e).__name__)
+
+def build_governed_context(conn: sqlite3.Connection, req: GovernanceRequest, *, legacy_context: str = "", include_review_moments: bool = False) -> GovernanceResult:
+    diag = GovernanceDiagnostics(route_policy={"route_mode": req.route_mode, "channel_policy": req.channel_policy, "visibility": req.visibility_allowance})
+    try:
+        ensure_governance_schema(conn)
+    except Exception as e:
+        diag.processing_errors.append(type(e).__name__)
+        return GovernanceResult("", (), (), diag)
+    exclusions: List[GovernanceExclusion] = []
+    cands: List[MemoryCandidate] = []
+    subject = subject_key_for_user(req.subject_user_id)
+    request_terms = set(req.topic_terms) or _terms(req.user_text)
+    broad = _is_broad_recall(req.user_text)
+    now_ts = _parse_time(req.now or _now())
+    if req.route_mode == "simple_greeting" or (len(request_terms) <= 1 and re.fullmatch(r"\s*(hi|hello|hey|yo|sup|gm|good morning)[!. ]*\s*", req.user_text or "", re.I)):
+        diag.fallback_reason = "simple_greeting_skip"
+        return GovernanceResult("", (), (), diag)
+    allowed = set(req.allowed_source_classes or AUTHORITY.keys())
+    public_route = req.visibility_allowance in {"public", "public_safe"}
+    try:
+        cols = [c[1] for c in conn.execute("PRAGMA table_info(memory_ledger_entries)").fetchall()]
+        for row in conn.execute("SELECT * FROM memory_ledger_entries WHERE guild_id=? AND subject_key=?", (req.guild_id, subject)).fetchall():
+            d = dict(zip(cols, row))
+            entry_id = str(d.get("entry_id") or "")
+            source_class = str(d.get("source_class") or "")
+            source_ref = "ledger:%s" % entry_id
+            diag.candidates_by_source[source_class] = diag.candidates_by_source.get(source_class, 0) + 1
+            def exclude(reason: str) -> None:
+                exclusions.append(GovernanceExclusion(source_ref, reason, source_class, entry_id)); _add(diag, reason)
+            if source_class not in allowed:
+                exclude("route_source_class"); continue
+            life = str(d.get("lifecycle_status") or "active").lower()
+            if life in BLOCKED_LIFECYCLES:
+                exclude("lifecycle"); diag.correction_supersession_exclusions += 1; continue
+            if not _entry_current(conn, req.guild_id, entry_id):
+                exclude("superseded_or_retracted"); diag.correction_supersession_exclusions += 1; continue
+            if conn.execute("SELECT 1 FROM memory_ledger_entries WHERE guild_id=? AND subject_key=? AND source_table=? AND source_row_id=? AND lifecycle_status='forgotten' AND entry_id<>?", (req.guild_id, subject, d.get("source_table"), d.get("source_row_id"), entry_id)).fetchone():
+                exclude("forgotten_source_tombstone"); continue
+            if not _valid_now(d, now_ts):
+                exclude("validity_window"); continue
+            pred = str(d.get("predicate_key") or "").lower()
+            etype = str(d.get("entry_type") or "").lower()
+            if pred in NON_LIVE_PREDICATES or (pred == "conversation" and etype == "observation") or etype == "model_output":
+                exclude("non_durable_conversation"); continue
+            if pred not in DURABLE_PREDICATES and etype not in DURABLE_ENTRY_TYPES and source_class != "owner_correction":
+                exclude("non_durable_predicate"); continue
+            derived = bool(int(d.get("derived") or 0)); projection = bool(int(d.get("projection") or 0))
+            if derived or projection or source_class in PROJECTION_CLASSES:
+                if not _has_eligible_projection_root(conn, req.guild_id, entry_id):
+                    exclude("projection_lineage"); continue
+                # Safe v1: keep projections shadow-measured only, never live-rendered.
+                exclude("projection_shadow_only"); continue
+            vis = str(d.get("visibility") or "unknown")
+            if public_route and (vis not in PUBLIC_VIS or not int(d.get("public_usable") or 0) or source_class == "legacy_source_blind"):
+                exclude("visibility"); diag.visibility_exclusions += 1; continue
+            if vis not in INTERNAL_VIS:
+                exclude("visibility"); diag.visibility_exclusions += 1; continue
+            text = str(d.get("normalized_value") or "").strip()
+            if not text or text.lower().strip() == (req.user_text or "").lower().strip():
+                exclude("current_message_or_empty"); continue
+            c = MemoryCandidate(source_class, source_class, source_ref, entry_id, int(d.get("guild_id") or 0), subject, pred, etype, text, vis, str(d.get("confidence") or "unknown"), life, AUTHORITY.get(source_class, 0), float(d.get("salience") or 0), str(d.get("observed_at") or ""), str(d.get("valid_from") or ""), str(d.get("valid_until") or ""), derived, projection, (), _lineage(conn, req.guild_id, entry_id), 0.0, True)
+            if not _relevance_ok(c, request_terms, broad):
+                exclude("topic_relevance"); continue
+            cands.append(c)
+        if include_review_moments:
+            _moment_counts(conn, req, diag)
+    except Exception as e:
+        diag.processing_errors.append(type(e).__name__)
+    scored: List[MemoryCandidate] = []
+    recall = _explicit_recall(req.user_text)
+    participant_keys = set(req.participants)
+    for c in cands:
+        overlap = len(request_terms & (_terms(c.text) | _terms(c.predicate_key.replace("_", " "))))
+        score = (2.0 if recall else 0.0) + 3.0 + min(2.7, 0.45 * overlap) + (1.0 if c.predicate_key in {"open_loop", "commitment", "goal", "unresolved_question"} else 0.0) + c.authority * 0.4 + CONF.get(c.confidence, 0) * 0.3 + min(1.0, max(0.0, c.salience)) + _freshness_score(c.observed_at, now_ts) + (0.8 if participant_keys & set(c.participants) else 0.0) + (2.5 if c.source_class == "owner_correction" else 0.0)
+        scored.append(replace(c, score=round(score, 4)))
+    ranked = sorted(scored, key=lambda c: (-c.score, -c.authority, -CONF.get(c.confidence, 0), -_parse_time(c.observed_at), c.source_class, c.source_ref, c.entry_id))
+    # Resolve contradictions by predicate: additive/open-loop-like predicates may coexist; scalar predicates keep highest ranked current value.
+    additive = {"open_loop", "commitment", "goal", "unresolved_question"}
+    resolved: List[MemoryCandidate] = []
+    seen_pred: Set[str] = set()
+    for c in ranked:
+        if c.predicate_key not in additive and c.predicate_key in seen_pred:
+            diag.contradiction_resolutions.append(_hash(c.predicate_key) + ":lower_ranked_suppressed")
+            _add(diag, "contradiction_resolution")
+            continue
+        seen_pred.add(c.predicate_key)
+        resolved.append(c)
+    selected: List[MemoryCandidate] = []
+    seen_text: Set[str] = set()
+    used = 0
+    per_source: Dict[str, int] = {}
+    for c in resolved:
+        norm = re.sub(r"\W+", " ", c.text.lower()).strip()
+        if norm in seen_text:
+            diag.duplicate_suppression += 1; _add(diag, "duplicate"); continue
+        if per_source.get(c.source_class, 0) >= 4:
+            _add(diag, "per_source_cap"); continue
+        line = "- %s" % c.text[:240]
+        if used + len(line) > max(0, int(req.budget_chars or 0)):
+            diag.token_budget_exclusions += 1; _add(diag, "budget"); continue
+        selected.append(c); seen_text.add(norm); used += len(line); per_source[c.source_class] = per_source.get(c.source_class, 0) + 1
+        diag.selected_by_source[c.source_class] = diag.selected_by_source.get(c.source_class, 0) + 1
+    for c in selected:
+        if c.guild_id != req.guild_id: diag.invalid_invariants.append("cross_guild_selected")
+        if c.subject_key != subject: diag.invalid_invariants.append("cross_subject_selected")
+        if c.lifecycle in BLOCKED_LIFECYCLES: diag.invalid_invariants.append("blocked_lifecycle_selected")
+        if public_route and c.visibility not in PUBLIC_VIS: diag.invalid_invariants.append("visibility_selected")
+    rendered = "" if not selected else "Durable memory (governed):\n" + "\n".join("- %s" % c.text[:240] for c in selected)
+    diag.selected_count = len(selected); diag.rendered_size = len(rendered); diag.rendered_hash = _hash(rendered)
+    diag.legacy_vs_governed = {"legacy_hash": _hash(legacy_context), "governed_hash": diag.rendered_hash, "same": _hash(legacy_context) == diag.rendered_hash, "legacy_size": len(legacy_context or ""), "governed_size": len(rendered)}
+    return GovernanceResult(rendered, tuple(selected), tuple(exclusions), diag)
+
+def persist_shadow_diagnostics(conn: sqlite3.Connection, req: GovernanceRequest, result: GovernanceResult, legacy_context: str) -> str:
+    ensure_governance_schema(conn)
+    now = _now(); run_id = "mgs_" + _hash("|".join([str(req.guild_id), subject_key_for_user(req.subject_user_id), now, result.diagnostics.rendered_hash]))
+    conn.execute("INSERT OR REPLACE INTO memory_governance_shadow_runs VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", (run_id, req.guild_id, _hash(subject_key_for_user(req.subject_user_id)), req.route_mode, req.channel_policy, now, result.diagnostics.rendered_hash, result.diagnostics.rendered_size, _hash(legacy_context), len(legacy_context or ""), result.diagnostics.selected_count, json.dumps(result.diagnostics.excluded_by_reason, sort_keys=True), json.dumps(result.diagnostics.processing_errors, sort_keys=True)))
+    conn.commit(); return run_id
+
+def build_evaluation_report(results: List[GovernanceResult], guild_id: int) -> Dict[str, Any]:
+    report: Dict[str, Any] = {"guild_id": guild_id, "runs": len(results), "selected_total": 0, "excluded_total": 0, "selected_by_source": {}, "excluded_by_reason": {}, "visibility_violations": 0, "cross_member_violations": 0, "cross_guild_violations": 0, "invalid_route_channel_policy_selections": 0, "corrected_superseded_retracted_selected": 0, "review_only_or_needs_review_selected": 0, "projection_lineage_violations": 0, "duplicate_suppression": 0, "contradiction_resolutions": 0, "budget_overruns": 0, "empty_result_frequency": 0, "processing_errors": 0, "legacy_vs_governed": [], "rollback_readiness": "ready_env_disable_live"}
+    for r in results:
+        report["selected_total"] += len(r.selected); report["excluded_total"] += len(r.exclusions)
+        for k, v in r.diagnostics.selected_by_source.items(): report["selected_by_source"][k] = report["selected_by_source"].get(k, 0) + v
+        for k, v in r.diagnostics.excluded_by_reason.items(): report["excluded_by_reason"][k] = report["excluded_by_reason"].get(k, 0) + v
+        report["visibility_violations"] += sum(1 for c in r.selected if c.visibility not in INTERNAL_VIS)
+        report["cross_guild_violations"] += sum(1 for c in r.selected if c.guild_id != guild_id)
+        report["corrected_superseded_retracted_selected"] += sum(1 for c in r.selected if c.lifecycle in {"corrected", "superseded", "retracted", "forgotten", "deleted"})
+        report["review_only_or_needs_review_selected"] += sum(1 for c in r.selected if c.lifecycle in {"review_only", "needs_review"})
+        report["projection_lineage_violations"] += sum(1 for c in r.selected if (c.derived or c.projection or c.source_class in PROJECTION_CLASSES) and not c.eligible_root)
+        report["duplicate_suppression"] += r.diagnostics.duplicate_suppression
+        report["contradiction_resolutions"] += len(r.diagnostics.contradiction_resolutions)
+        report["budget_overruns"] += r.diagnostics.token_budget_exclusions
+        report["empty_result_frequency"] += 1 if not r.rendered_context else 0
+        report["processing_errors"] += len(r.diagnostics.processing_errors)
+        report["legacy_vs_governed"].append(r.diagnostics.legacy_vs_governed)
+        for inv in r.diagnostics.invalid_invariants:
+            if inv == "cross_subject_selected": report["cross_member_violations"] += 1
+            if inv == "cross_guild_selected": report["cross_guild_violations"] += 1
+            if inv == "visibility_selected": report["visibility_violations"] += 1
+    if report["processing_errors"] or report["visibility_violations"] or report["cross_member_violations"] or report["cross_guild_violations"]:
+        report["rollback_readiness"] = "fallback_required_before_live"
+    return report
+
+def _receipt(action: str, guild_id: int, user_id: int, target: str = "") -> str:
+    return "mgr_" + hashlib.sha256(("%s|%s|%s|%s" % (action, guild_id, subject_key_for_user(user_id), target)).encode("utf-8")).hexdigest()[:32]
+
+def _subject_hash(user_id: int) -> str:
+    return _hash(subject_key_for_user(user_id))
+
+def view_member_memory(conn: sqlite3.Connection, *, guild_id: int, user_id: int, limit: int = 10) -> List[Dict[str, Any]]:
+    ensure_governance_schema(conn); subject = subject_key_for_user(user_id); out: List[Dict[str, Any]] = []
+    rows = conn.execute("SELECT entry_id,predicate_key,normalized_value,source_class,lifecycle_status,derived,entry_type,updated_at FROM memory_ledger_entries WHERE guild_id=? AND subject_key=? AND lifecycle_status NOT IN ('forgotten','deleted','retracted') ORDER BY updated_at DESC LIMIT ?", (guild_id, subject, limit)).fetchall()
+    for eid, pred, val, sc, life, derived, etype, updated in rows:
+        out.append({"ref": "mem_" + _hash(str(eid)), "kind": _classify_kind(str(sc), str(etype), bool(derived), str(life)), "summary": str(val or "")[:220], "status": life, "correctable": life not in {"forgotten", "deleted", "retracted"}, "_entry_id": eid})
+    return out
+
+def _resolve_ref(conn: sqlite3.Connection, guild_id: int, user_id: int, ref: str) -> str:
+    matches = [item["_entry_id"] for item in view_member_memory(conn, guild_id=guild_id, user_id=user_id, limit=500) if item["ref"] == ref]
+    return matches[0] if len(matches) == 1 else ""
+
+def _mark_dependents_needs_review(conn: sqlite3.Connection, guild_id: int, entry_id: str) -> None:
+    now = _now()
+    if _table_exists(conn, "memory_moment_members") and _table_exists(conn, "memory_moment_windows"):
+        conn.execute("UPDATE memory_moment_windows SET lifecycle_status='needs_review', updated_at=? WHERE guild_id=? AND moment_id IN (SELECT moment_id FROM memory_moment_members WHERE ledger_entry_id=?)", (now, guild_id, entry_id))
+    if _table_exists(conn, "memory_ledger_lineage"):
+        derived = [r[0] for r in conn.execute("SELECT entry_id FROM memory_ledger_lineage WHERE guild_id=? AND target_entry_id=? AND lineage_type='derived_from'", (guild_id, entry_id)).fetchall()]
+        for did in derived:
+            conn.execute("UPDATE memory_ledger_entries SET lifecycle_status='needs_review', updated_at=? WHERE guild_id=? AND entry_id=? AND (derived=1 OR projection=1)", (now, guild_id, did))
+
+def correct_member_memory(conn: sqlite3.Connection, *, guild_id: int, user_id: int, safe_ref: str, corrected_text: str) -> Dict[str, Any]:
+    ensure_governance_schema(conn); target = _resolve_ref(conn, guild_id, user_id, safe_ref)
+    if not target: return {"ok": False, "reason": "ambiguous_or_unauthorized_target"}
+    if not (corrected_text or "").strip(): return {"ok": False, "reason": "empty_correction"}
+    subject = subject_key_for_user(user_id); rid = _receipt("correct", guild_id, user_id, safe_ref + _hash(corrected_text)); now = _now()
     with conn:
-        if conn.execute("SELECT 1 FROM memory_governance_receipts WHERE receipt_id=?",(rid,)).fetchone(): return {"ok":True,"receipt":rid,"idempotent":True}
-        for table in ("conversations","user_memory_facts","relationship_journal","memory_tiers","user_habits","relationship_state","user_profiles"):
-            if _table_exists(conn,table):
-                cur=conn.execute(f"DELETE FROM {table} WHERE guild_id=? AND user_id=?",(guild_id,user_id)); counts[table]=cur.rowcount
-        subject=subject_key_for_user(user_id)
-        if _table_exists(conn,"memory_ledger_participants"): counts["memory_ledger_participants"]=conn.execute("DELETE FROM memory_ledger_participants WHERE guild_id=? AND participant_key=?",(guild_id,subject)).rowcount
-        ids=[r[0] for r in conn.execute("SELECT entry_id FROM memory_ledger_entries WHERE guild_id=? AND subject_key=?",(guild_id,subject)).fetchall()]
-        for eid in ids: conn.execute("DELETE FROM memory_ledger_lineage WHERE guild_id=? AND (entry_id=? OR target_entry_id=?)",(guild_id,eid,eid))
-        counts["memory_ledger_entries"]=conn.execute("DELETE FROM memory_ledger_entries WHERE guild_id=? AND subject_key=?",(guild_id,subject)).rowcount
+        prior = conn.execute("SELECT predicate_key,lifecycle_status FROM memory_ledger_entries WHERE guild_id=? AND subject_key=? AND entry_id=?", (guild_id, subject, target)).fetchone()
+        if not prior or prior[1] in {"forgotten", "deleted", "retracted"}: return {"ok": False, "reason": "already_forgotten_or_missing"}
+        if conn.execute("SELECT 1 FROM memory_governance_receipts WHERE receipt_id=?", (rid,)).fetchone(): return {"ok": True, "receipt": rid, "idempotent": True}
+        entry_id = "mle_" + hashlib.sha256(("correction|%s|%s|%s|%s" % (guild_id, subject, target, _hash(corrected_text))).encode("utf-8")).hexdigest()[:40]
+        conn.execute("INSERT OR IGNORE INTO memory_ledger_entries (entry_id,schema_version,guild_id,subject_key,subject_display_name,entry_type,predicate_key,normalized_value,source_class,source_table,source_row_id,source_role,visibility,confidence,public_usable,derived,projection,salience,observed_at,lifecycle_status,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (entry_id, "memory_ledger_v1", guild_id, subject, "", "claim", prior[0], corrected_text[:1000], "owner_correction", "member_memory_control", rid, "member_control", "private", "high", 0, 0, 0, 1.0, now, "active", now, now))
+        conn.execute("INSERT OR IGNORE INTO memory_ledger_lineage VALUES (?,?,?,?,?)", (entry_id, guild_id, "correction_of", target, now)); conn.execute("INSERT OR IGNORE INTO memory_ledger_lineage VALUES (?,?,?,?,?)", (entry_id, guild_id, "supersedes", target, now))
+        conn.execute("UPDATE memory_ledger_entries SET lifecycle_status='corrected', updated_at=? WHERE guild_id=? AND entry_id=?", (now, guild_id, target)); _mark_dependents_needs_review(conn, guild_id, target)
+        conn.execute("INSERT INTO memory_governance_receipts VALUES (?,?,?,?,?,?,?)", (rid, guild_id, _subject_hash(user_id), "correct", safe_ref, now, json.dumps({"ledger_entries": 1})))
+    return {"ok": True, "receipt": rid, "ref": safe_ref}
+
+def forget_member_memory(conn: sqlite3.Connection, *, guild_id: int, user_id: int, safe_ref: str) -> Dict[str, Any]:
+    ensure_governance_schema(conn); target = _resolve_ref(conn, guild_id, user_id, safe_ref); rid = _receipt("forget", guild_id, user_id, safe_ref); now = _now(); subject = subject_key_for_user(user_id)
+    if not target:
+        if conn.execute("SELECT 1 FROM memory_governance_receipts WHERE receipt_id=?", (rid,)).fetchone(): return {"ok": True, "receipt": rid, "idempotent": True}
+        return {"ok": False, "reason": "ambiguous_or_unauthorized_target"}
+    with conn:
+        if conn.execute("SELECT 1 FROM memory_governance_receipts WHERE receipt_id=?", (rid,)).fetchone(): return {"ok": True, "receipt": rid, "idempotent": True}
+        row = conn.execute("SELECT source_table,source_row_id,source_revision FROM memory_ledger_entries WHERE guild_id=? AND subject_key=? AND entry_id=?", (guild_id, subject, target)).fetchone()
+        if not row: return {"ok": False, "reason": "unauthorized"}
+        tomb_id = "mle_" + hashlib.sha256(("forget|%s|%s|%s" % (guild_id, subject, target)).encode("utf-8")).hexdigest()[:40]
+        conn.execute("INSERT OR IGNORE INTO memory_ledger_entries (entry_id,schema_version,guild_id,subject_key,subject_display_name,entry_type,predicate_key,normalized_value,source_class,source_table,source_row_id,source_revision,source_role,visibility,confidence,public_usable,derived,projection,salience,observed_at,lifecycle_status,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (tomb_id, "memory_ledger_v1", guild_id, subject, "", "claim", "retraction", "", "owner_correction", "member_memory_control", rid, "", "member_control", "private", "high", 0, 0, 0, 1.0, now, "active", now, now))
+        conn.execute("INSERT OR IGNORE INTO memory_ledger_lineage VALUES (?,?,?,?,?)", (tomb_id, guild_id, "retracts", target, now))
+        conn.execute("UPDATE memory_ledger_entries SET lifecycle_status='forgotten', normalized_value='', updated_at=? WHERE guild_id=? AND entry_id=?", (now, guild_id, target))
+        conn.execute("UPDATE memory_ledger_entries SET lifecycle_status='forgotten', normalized_value='', updated_at=? WHERE guild_id=? AND subject_key=? AND source_table=? AND source_row_id=?", (now, guild_id, subject, row[0], row[1]))
+        _mark_dependents_needs_review(conn, guild_id, target)
+        conn.execute("INSERT INTO memory_governance_receipts VALUES (?,?,?,?,?,?,?)", (rid, guild_id, _subject_hash(user_id), "forget", safe_ref, now, json.dumps({"ledger_entries": 1, "tombstones": 1})))
+    return {"ok": True, "receipt": rid}
+
+def _delete_by_user(conn: sqlite3.Connection, table: str, guild_id: int, user_id: int) -> int:
+    if not _table_exists(conn, table): return 0
+    cols = _cols(conn, table)
+    if "guild_id" not in cols: return 0
+    for col in ("user_id", "member_id", "discord_user_id"):
+        if col in cols:
+            return conn.execute("DELETE FROM %s WHERE guild_id=? AND %s=?" % (table, col), (guild_id, user_id)).rowcount
+    return 0
+
+def complete_delete_member_data(conn: sqlite3.Connection, *, guild_id: int, user_id: int, confirmation: str, inject_failure: bool = False) -> Dict[str, Any]:
+    if confirmation != "DELETE MY BNL DATA %s" % guild_id: return {"ok": False, "reason": "confirmation_required"}
+    ensure_governance_schema(conn); rid = _receipt("complete_delete", guild_id, user_id); now = _now(); counts: Dict[str, int] = {}; subject = subject_key_for_user(user_id)
+    with conn:
+        for table in ("conversations", "user_profiles", "user_memory_facts", "user_habits", "relationship_state", "relationship_journal", "memory_tiers", "response_style_log", "community_presence", "member_activity_events", "entity_evidence_events", "entity_intelligence"):
+            counts[table] = _delete_by_user(conn, table, guild_id, user_id)
+        if _table_exists(conn, "entity_evidence_events"):
+            cols = _cols(conn, "entity_evidence_events")
+            for col in ("subject_key", "subject_id", "entity_key"):
+                if col in cols:
+                    counts["entity_evidence_events"] += conn.execute("DELETE FROM entity_evidence_events WHERE guild_id=? AND %s=?" % col, (guild_id, subject)).rowcount
+        affected_moments: Set[str] = set()
+        if _table_exists(conn, "memory_moment_participants"):
+            affected_moments.update(r[0] for r in conn.execute("SELECT moment_id FROM memory_moment_participants WHERE participant_key=?", (subject,)).fetchall())
+            counts["memory_moment_participants"] = conn.execute("DELETE FROM memory_moment_participants WHERE participant_key=?", (subject,)).rowcount
+        if _table_exists(conn, "memory_ledger_entries"):
+            ids = [r[0] for r in conn.execute("SELECT entry_id FROM memory_ledger_entries WHERE guild_id=? AND subject_key=?", (guild_id, subject)).fetchall()]
+            if _table_exists(conn, "memory_moment_members"):
+                for eid in ids:
+                    affected_moments.update(r[0] for r in conn.execute("SELECT moment_id FROM memory_moment_members WHERE ledger_entry_id=?", (eid,)).fetchall())
+                    counts["memory_moment_members"] = counts.get("memory_moment_members", 0) + conn.execute("DELETE FROM memory_moment_members WHERE ledger_entry_id=?", (eid,)).rowcount
+            for eid in ids:
+                counts["memory_ledger_lineage"] = counts.get("memory_ledger_lineage", 0) + conn.execute("DELETE FROM memory_ledger_lineage WHERE guild_id=? AND (entry_id=? OR target_entry_id=?)", (guild_id, eid, eid)).rowcount
+            counts["memory_ledger_participants"] = counts.get("memory_ledger_participants", 0) + conn.execute("DELETE FROM memory_ledger_participants WHERE guild_id=? AND participant_key=?", (guild_id, subject)).rowcount
+            counts["memory_ledger_entries"] = conn.execute("DELETE FROM memory_ledger_entries WHERE guild_id=? AND subject_key=?", (guild_id, subject)).rowcount
+        if _table_exists(conn, "memory_moment_windows"):
+            for mid in affected_moments:
+                remaining = conn.execute("SELECT COUNT(*) FROM memory_moment_members WHERE moment_id=?", (mid,)).fetchone()[0] if _table_exists(conn, "memory_moment_members") else 0
+                if remaining:
+                    counts["memory_moment_windows_needs_review"] = counts.get("memory_moment_windows_needs_review", 0) + conn.execute("UPDATE memory_moment_windows SET lifecycle_status='needs_review', summary='', updated_at=? WHERE guild_id=? AND moment_id=?", (now, guild_id, mid)).rowcount
+                else:
+                    counts["memory_moment_windows_retracted"] = counts.get("memory_moment_windows_retracted", 0) + conn.execute("UPDATE memory_moment_windows SET lifecycle_status='retracted', summary='', updated_at=? WHERE guild_id=? AND moment_id=?", (now, guild_id, mid)).rowcount
+        # Remove prior receipts for this subject, then write a new content-free receipt.
+        counts["prior_governance_receipts"] = conn.execute("DELETE FROM memory_governance_receipts WHERE guild_id=? AND subject_hash=?", (guild_id, _subject_hash(user_id))).rowcount
         if inject_failure: raise RuntimeError("injected_complete_delete_failure")
-        conn.execute("INSERT INTO memory_governance_receipts VALUES (?,?,?,?,?,?,?)",(rid,guild_id,user_id,"complete_delete","",now,str(counts)))
-    return {"ok":True,"receipt":rid,"row_counts":counts,"limitation":"Discord-hosted messages are not deleted by this bot command."}
+        safe_counts = {k: int(v or 0) for k, v in counts.items() if int(v or 0)}
+        conn.execute("INSERT INTO memory_governance_receipts VALUES (?,?,?,?,?,?,?)", (rid, guild_id, _subject_hash(user_id), "complete_delete", "", now, json.dumps(safe_counts, sort_keys=True)))
+    return {"ok": True, "receipt": rid, "row_counts": counts, "idempotent": not any(counts.values()), "limitation": "Discord-hosted messages are not deleted by this bot command."}
