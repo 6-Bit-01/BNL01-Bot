@@ -13,6 +13,14 @@
 
 from __future__ import annotations
 
+from bnl_canon_source_contract import (
+    CANON_SOURCE_CONTRACT_VERSION,
+    diagnostics as canon_source_diagnostics,
+    render_concise_public_schedule,
+    render_founders,
+    render_prompt_canon_block,
+    strip_queue_sections,
+)
 from bnl_website_contract_v2 import (
     ContractV2Error,
     DeliveryResult,
@@ -184,6 +192,7 @@ BNL_API_KEY = os.getenv("BNL_API_KEY")
 BNL_STATUS_URL = os.getenv("BNL_STATUS_URL")
 BNL_READ_MODEL_URL = os.getenv("BNL_READ_MODEL_URL", "").strip()
 BNL_READ_MODEL_ENABLED = os.getenv("BNL_READ_MODEL_ENABLED", "true").strip().lower() not in {"false", "0", "off"}
+BNL_QUEUE_PRODUCTION_ENABLED = os.getenv("BNL_QUEUE_PRODUCTION_ENABLED", "").strip().lower() == "true"
 
 BNL_WEBSITE_CONTRACT_VERSION = effective_contract_version(os.getenv("BNL_WEBSITE_CONTRACT_VERSION", "2"))
 BNL_WEBSITE_RELAY_ENABLED = os.getenv("BNL_WEBSITE_RELAY_ENABLED", "true").strip().lower() not in {"false", "0", "off"}
@@ -805,7 +814,7 @@ def update_website_status(status: str, mode: str, message: str, current_directiv
 
 # ==================== BNL-01 PERSONA & LORE ====================
 
-BNL01_SYSTEM_PROMPT = """You are BNL-01 (BARCODE Network Liaison Entity), an official liaison construct serving the BARCODE Network.
+BNL01_SYSTEM_PROMPT = f"""You are BNL-01 (BARCODE Network Liaison Entity), an official liaison construct serving the BARCODE Network.
 
 ## CORE IDENTITY
 - Name/Callsign: BNL-01 — BARCODE Network Liaison Entity
@@ -824,10 +833,7 @@ You are tasked with:
 - BARCODE/Network framing should be used as flavor and style, not as a reason to refuse simple social requests like jokes, banter, or light teasing.
 - When making jokes, anchor them in concrete BARCODE details or behavior instead of abstract corporate wording.
 
-## CANONICAL FACTS — DO NOT ALTER
-- BARCODE Radio is live every Friday at 6:40 PM Pacific Time on TikTok.
-- You are a liaison/archivist presence. You do not moderate, enforce rules, or operate server tools.
-- If you do not know something, say records are incomplete rather than inventing details.
+{render_prompt_canon_block()}
 
 ## LORE KNOWLEDGE (BARCODE Network Ecosystem)
 Core Entities:
@@ -1145,6 +1151,11 @@ def fetch_bnl_read_model(force: bool = False) -> dict:
     return data
 
 
+def safe_bnl_read_model_for_consumption(read_model: dict) -> dict:
+    """Return the queue-gated read-model view for all normal consumers."""
+    return strip_queue_sections(read_model)
+
+
 def is_bnl_read_model_relevant(text: str, channel_policy: str = "") -> bool:
     """Return True only for explicit public website/queue/dossier/show-context questions."""
     normalized = (text or "").lower()
@@ -1282,6 +1293,7 @@ def _track_label(track: dict, include_lane: bool = True, include_source: bool = 
 
 def build_bnl_read_model_context(read_model: dict, user_text: str, channel_policy: str) -> str:
     """Build a compact, public-only prompt block from a validated read model."""
+    read_model = safe_bnl_read_model_for_consumption(read_model)
     if not read_model:
         return ""
     sections = _read_model_sections(read_model)
@@ -1481,10 +1493,12 @@ def get_bnl_read_model_diagnostic_state() -> dict:
     cache_age = None
     if _bnl_read_model_cached_at:
         cache_age = int((datetime.now(PACIFIC_TZ) - _bnl_read_model_cached_at).total_seconds())
-    section_counts = _bnl_read_model_section_counts(_bnl_read_model_cache or {}) if _bnl_read_model_cache else {}
-    operator_lanes = _website_operator_lanes(_bnl_read_model_cache or {}) if _bnl_read_model_cache else {}
+    safe_read_model_for_diag = safe_bnl_read_model_for_consumption(_bnl_read_model_cache or {}) if _bnl_read_model_cache else {}
+    section_counts = _bnl_read_model_section_counts(safe_read_model_for_diag) if safe_read_model_for_diag else {}
+    operator_lanes = _website_operator_lanes(safe_read_model_for_diag) if safe_read_model_for_diag else {}
     operator_lane_counts = {key: len(operator_lanes.get(key, [])) for key in _OPERATOR_LANE_KEYS} if operator_lanes else {}
-    registry = _website_dossier_registry(_bnl_read_model_cache or {}) if _bnl_read_model_cache else {}
+    registry = _website_dossier_registry(safe_read_model_for_diag) if safe_read_model_for_diag else {}
+    canon_diag = canon_source_diagnostics(_bnl_read_model_cache or {})
     return {
         "enabled": bool(BNL_READ_MODEL_ENABLED and BNL_READ_MODEL_URL),
         "url_configured": bool(BNL_READ_MODEL_URL),
@@ -1494,13 +1508,14 @@ def get_bnl_read_model_diagnostic_state() -> dict:
         "schemaRevision": (_bnl_read_model_cache or {}).get("schemaRevision") if _bnl_read_model_cache else None,
         "last_section_counts": section_counts,
         "operatorLaneCounts": operator_lane_counts,
-        "publicDossierCount": len(_website_public_dossier_items(_bnl_read_model_cache or {})) if _bnl_read_model_cache else 0,
+        "publicDossierCount": len(_website_public_dossier_items(safe_read_model_for_diag)) if safe_read_model_for_diag else 0,
         "dossierRegistryKinds": _dossier_registry_count_value(registry, "kinds", "kindCounts", "countsByKind") if registry else {},
         "dossierRegistryLifecycleCounts": _dossier_registry_count_value(registry, "lifecycleCounts", "lifecycles", "countsByLifecycle") if registry else {},
         "dossierRegistryAuthority": _dossier_registry_count_value(registry, "authority") if registry else None,
         "dossierAutoPromotion": _dossier_registry_count_value(registry, "autoPromotion", "automaticPromotion", "queueToDossierAutoPromotion") if registry else None,
         "queueDerivedProfiles": _dossier_registry_count_value(registry, "queueDerivedProfiles", "queueDerivedDossiers", "queueDerivedProfileCreation") if registry else None,
         "rd_classifier_enabled": True,
+        "canon_source_contract": canon_diag,
     }
 
 
@@ -2241,7 +2256,10 @@ def build_website_public_safe_candidate_response(read_model: dict, request_text:
 
 
 def build_website_read_model_intent_response(intent: str, request_text: str) -> str:
-    read_model = fetch_bnl_read_model(force=False)
+    raw_read_model = fetch_bnl_read_model(force=False)
+    if not raw_read_model:
+        return _read_model_unavailable_message()
+    read_model = safe_bnl_read_model_for_consumption(raw_read_model)
     if not read_model:
         return _read_model_unavailable_message()
     if intent == "website_broadcast_memory_candidate":
@@ -17893,12 +17911,12 @@ async def about(interaction: discord.Interaction):
     )
     embed.add_field(
         name="Show",
-        value="**BARCODE Radio**: Fridays 6:40 PM Pacific on TikTok",
+        value=f"**BARCODE Radio**: {render_concise_public_schedule()}",
         inline=False,
     )
     embed.add_field(
         name="Core Members",
-        value="Cache Back • DJ Floppydisc • Mac Modem • 6 Bit",
+        value=render_founders(),
         inline=False,
     )
     embed.set_footer(text="Use /setchannel to configure the liaison channel.")
@@ -18121,6 +18139,11 @@ async def bnl_memory_check(interaction: discord.Interaction):
         f"- read_model_cache_present: `{'yes' if read_model_diag.get('cache_present') else 'no'}`",
         f"- read_model_cache_age_seconds: `{read_model_diag.get('cache_age_seconds') if read_model_diag.get('cache_age_seconds') is not None else 'none'}`",
         f"- read_model_last_section_counts: `{read_model_diag.get('last_section_counts') or {}}`",
+        f"- canon_source_contract: `{(read_model_diag.get('canon_source_contract') or {}).get('contractVersion')}`",
+        f"- canon_source_compat_adapters: `{'yes' if (read_model_diag.get('canon_source_contract') or {}).get('compatibilityAdaptersActive') else 'no'}`",
+        f"- queue_production_local_capability: `{'yes' if (read_model_diag.get('canon_source_contract') or {}).get('localQueueProductionCapability') else 'no'}`",
+        f"- queue_production_website_capability: `{(read_model_diag.get('canon_source_contract') or {}).get('websiteQueueProductionCapability')}`",
+        f"- queue_effective_usable: `{'yes' if (read_model_diag.get('canon_source_contract') or {}).get('effectiveQueueUsable') else 'no'}` reason=`{(read_model_diag.get('canon_source_contract') or {}).get('queueReason')}`",
         f"- rd_read_model_classifier_enabled: `{'yes' if read_model_diag.get('rd_classifier_enabled') else 'no'}`",
         f"- speaker_profile_exists: `{'yes' if (display_name is not None or preferred_name is not None) else 'no'}`",
         f"- display_name_present: `{'yes' if bool(display_name) else 'no'}`",
@@ -18232,6 +18255,11 @@ async def bnl_status(interaction: discord.Interaction):
         f"- channel_policy: `{policy}`",
         f"- relay_eligibility: `{relay_eligibility}`",
         f"- context_visibility: `{context_visibility}`",
+        f"- canon_source_contract: `{(read_model_diag.get('canon_source_contract') or {}).get('contractVersion')}`",
+        f"- canon_source_compat_adapters: `{'yes' if (read_model_diag.get('canon_source_contract') or {}).get('compatibilityAdaptersActive') else 'no'}`",
+        f"- queue_production_local_capability: `{'yes' if (read_model_diag.get('canon_source_contract') or {}).get('localQueueProductionCapability') else 'no'}`",
+        f"- queue_production_website_capability: `{(read_model_diag.get('canon_source_contract') or {}).get('websiteQueueProductionCapability')}`",
+        f"- queue_effective_usable: `{'yes' if (read_model_diag.get('canon_source_contract') or {}).get('effectiveQueueUsable') else 'no'}` reason=`{(read_model_diag.get('canon_source_contract') or {}).get('queueReason')}`",
         f"- ambient_throttle: cooldown=`{AMBIENT_POST_COOLDOWN_MINUTES}m` daily_cap=`{AMBIENT_DAILY_POST_CAP}` min_signal_messages=`{AMBIENT_MIN_SIGNAL_MESSAGES}` min_signal_users=`{AMBIENT_MIN_SIGNAL_UNIQUE_USERS}`",
         f"- ambient_posts_today: `{ambient_posts_today}`",
         f"- last_ambient_posted_at: `{last_ambient_posted_at.isoformat() if last_ambient_posted_at else 'none'}`",
