@@ -303,9 +303,12 @@ def governed_summary(conn: sqlite3.Connection, *, guild_id: int, user_id: int, r
     return " ".join(safe)[:500]
 
 
-def _open_loop_count(conn: sqlite3.Connection, *, guild_id: int, user_id: int) -> int:
+def _open_loop_count(conn: sqlite3.Connection, *, guild_id: int, user_id: int, channel_policy: str = "unknown") -> int:
     sk = subject_key_for_user(user_id)
     try:
+        public = str(channel_policy or "").startswith("public_")
+        if public:
+            return int(conn.execute("""SELECT COUNT(*) FROM memory_ledger_entries WHERE guild_id=? AND subject_key=? AND entry_type IN ('open_loop','commitment','unresolved_question') AND lifecycle_status='active' AND derived=0 AND projection=0 AND visibility IN ('public','public_safe') AND public_usable=1""", (guild_id, sk)).fetchone()[0])
         return int(conn.execute("""SELECT COUNT(*) FROM memory_ledger_entries WHERE guild_id=? AND subject_key=? AND entry_type IN ('open_loop','commitment','unresolved_question') AND lifecycle_status='active' AND derived=0 AND projection=0""", (guild_id, sk)).fetchone()[0])
     except sqlite3.OperationalError:
         return 0
@@ -320,7 +323,7 @@ def _compatible_moment_count(conn: sqlite3.Connection, *, guild_id: int, user_id
 def plan_engagement(conn: sqlite3.Connection, *, guild_id: int, user_id: int, candidate_type: str, route_mode: str, channel_policy: str, current_direct: bool, now: str = "", source_visibility: str = "public", send_authorized: bool = False) -> dict[str, Any]:
     ensure_relationship_v2_schema(conn); now_dt=parse_utc(now or _now()); settings=get_member_settings(conn,guild_id=guild_id,user_id=user_id); withheld=[]; errors=[]
     state=rebuild_state(conn,guild_id=guild_id,subject_user_id=user_id,evaluated_at=now_dt.isoformat())
-    open_loops = _open_loop_count(conn, guild_id=guild_id, user_id=user_id); moments = _compatible_moment_count(conn, guild_id=guild_id, user_id=user_id, channel_policy=channel_policy)
+    open_loops = _open_loop_count(conn, guild_id=guild_id, user_id=user_id, channel_policy=channel_policy); moments = _compatible_moment_count(conn, guild_id=guild_id, user_id=user_id, channel_policy=channel_policy)
     if not settings["proactive_enabled"] or state.get("engagement_opt_out"): withheld.append("member_opt_out")
     if not settings["playful_rivalry_enabled"] and candidate_type == "playful_rivalry": withheld.append("playful_rivalry_disabled")
     if channel_policy not in PUBLIC_POLICIES: withheld.append("channel_policy_ineligible")
@@ -354,14 +357,18 @@ def refresh_moment_links(conn: sqlite3.Connection, *, guild_id: int | None = Non
     ensure_relationship_v2_schema(conn); now=_now(); params=[]; where=""
     if guild_id is not None:
         where="AND e.guild_id=?"; params.append(guild_id)
-    conn.execute("UPDATE relationship_event_moment_links_v2 SET lifecycle='retracted', updated_at=?", (now,))
+    if guild_id is None:
+        conn.execute("UPDATE relationship_event_moment_links_v2 SET lifecycle='retracted', updated_at=?", (now,))
+    else:
+        conn.execute("UPDATE relationship_event_moment_links_v2 SET lifecycle='retracted', updated_at=? WHERE guild_id=?", (now, guild_id))
     try:
         rows = conn.execute(f"""SELECT e.event_id,w.moment_id,e.guild_id,e.subject_user_id FROM relationship_events_v2 e
-            JOIN relationship_event_ledger_links_v2 l ON l.event_id=e.event_id AND l.guild_id=e.guild_id
-            JOIN memory_moment_members mm ON mm.ledger_entry_id=l.ledger_entry_id
+            JOIN memory_ledger_entries src ON src.guild_id=e.guild_id AND src.source_table=e.source_table AND src.source_row_id=CAST(e.source_row_id AS TEXT) AND src.source_role=e.actor_role
+            JOIN memory_moment_members mm ON mm.ledger_entry_id=src.entry_id
             JOIN memory_moment_windows w ON w.moment_id=mm.moment_id AND w.guild_id=e.guild_id
             JOIN memory_moment_participants p ON p.moment_id=w.moment_id AND p.participant_key=e.subject_key
             WHERE e.lifecycle='active' AND e.actor_role='user' AND w.lifecycle_status='finalized'
+              AND src.lifecycle_status IN ('active','review_only')
               AND (e.channel_policy NOT LIKE 'public_%' OR w.visibility IN ('public','public_safe')) {where}
         """, tuple(params)).fetchall()
     except sqlite3.OperationalError:

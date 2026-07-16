@@ -4,7 +4,8 @@ os.environ.setdefault("GEMINI_API_KEY", "test-key")
 os.environ.setdefault("DISCORD_BOT_TOKEN", "test-token")
 
 from bnl_relationship_engine import *
-from bnl_memory_ledger import ensure_memory_ledger_schema
+from bnl_memory_ledger import ensure_memory_ledger_schema, shadow_conversation_row, subject_key_for_user
+import bnl_moment_engine as moments
 import bnl01_bot
 
 
@@ -138,23 +139,34 @@ def test_correction_forget_deactivates_underlying_event_and_delete_removes_proje
     counts=complete_delete_relationship_v2(c,guild_id=1,user_id=2)
     assert counts['relationship_events_v2'] == 1 and c.execute("select count(*) from memory_ledger_entries where source_table='relationship_events_v2'").fetchone()[0] == 0
 
-def test_moment_lifecycle_visibility_and_governed_open_loop_provenance():
-    c=conn(); obs(c,'remind me later',1)
-    assert plan_engagement(c,guild_id=1,user_id=2,candidate_type='open_loop_follow_up',route_mode='normal_chat',channel_policy='public_home',current_direct=True)['withheld_reason_codes'] == ['no_governed_open_loop']
-    c.execute("INSERT INTO memory_ledger_entries (entry_id,schema_version,guild_id,subject_key,entry_type,predicate_key,normalized_value,source_class,source_table,source_row_id,source_role,visibility,confidence,public_usable,derived,projection,salience,observed_at,lifecycle_status,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", ('ol1','memory_ledger_v1',1,subject_key_for_user(2),'open_loop','open_loop','follow up','first_party_record','test','1','user','private','medium',0,0,0,0.5,'2026-01-01T00:00:00+00:00','active','2026-01-01T00:00:00+00:00','2026-01-01T00:00:00+00:00'))
-    assert plan_engagement(c,guild_id=1,user_id=2,candidate_type='open_loop_follow_up',route_mode='normal_chat',channel_policy='public_home',current_direct=True)['relevant_open_loop_count'] == 1
-    c.execute("CREATE TABLE memory_moment_windows (moment_id TEXT, guild_id INTEGER, lifecycle_status TEXT, visibility TEXT)")
-    c.execute("CREATE TABLE memory_moment_participants (moment_id TEXT, participant_key TEXT)")
-    c.execute("INSERT INTO memory_moment_windows VALUES ('m1',1,'needs_review','public')"); c.execute("INSERT INTO memory_moment_participants VALUES ('m1',?)",(subject_key_for_user(2),))
-    assert plan_engagement(c,guild_id=1,user_id=2,candidate_type='recognition',route_mode='normal_chat',channel_policy='public_home',current_direct=True)['relevant_moment_count'] == 0
-    c.execute("UPDATE memory_moment_windows SET lifecycle_status='finalized'")
-    assert plan_engagement(c,guild_id=1,user_id=2,candidate_type='recognition',route_mode='normal_chat',channel_policy='public_home',current_direct=True)['relevant_moment_count'] == 1
-    led=c.execute("select ledger_entry_id from relationship_event_ledger_links_v2 limit 1").fetchone()[0]
-    c.execute("CREATE TABLE memory_moment_members (moment_id TEXT, ledger_entry_id TEXT)"); c.execute("INSERT INTO memory_moment_members VALUES ('m1',?)",(led,))
-    assert refresh_moment_links(c,guild_id=1) == 1
-    assert build_evaluation_report(c,guild_id=1)['moment_linked_events'] == 1
-    propagate_ledger_lifecycle(c,guild_id=1,ledger_entry_id=led,lifecycle='forgotten')
+def test_moment_link_uses_conversation_ledger_lineage_and_guild_refresh_is_scoped(monkeypatch):
+    monkeypatch.setenv('BNL_MEMORY_LEDGER_SHADOW_ENABLED','1'); monkeypatch.setenv('BNL_MOMENT_ENGINE_SHADOW_ENABLED','1')
+    c=conn(); moments.ensure_moment_schema(c)
+    base='2026-01-01T00:00:00+00:00'
+    r1=shadow_conversation_row(c,row_id=1,user_id=2,user_name='U2',guild_id=1,role='user',content='synth patch needs drums',channel_policy='public_home',channel_id=10,channel_name='c10',route_mode='normal_chat',observed_at=base)
+    moments.observe_ledger_entry(c,r1.entry_id)
+    r2=shadow_conversation_row(c,row_id=2,user_id=3,user_name='U3',guild_id=1,role='user',content='synth patch drums lock',channel_policy='public_home',channel_id=10,channel_name='c10',route_mode='normal_chat',observed_at='2026-01-01T00:01:00+00:00')
+    moments.observe_ledger_entry(c,r2.entry_id)
+    r3=shadow_conversation_row(c,row_id=3,user_id=2,user_name='U2',guild_id=1,role='user',content='yes synth patch and drums lock together',channel_policy='public_home',channel_id=10,channel_name='c10',route_mode='normal_chat',observed_at='2026-01-01T00:02:00+00:00')
+    moments.observe_ledger_entry(c,r3.entry_id); moments.sweep_expired_windows(c,guild_id=1,now='2026-01-01T00:10:00+00:00')
+    eid=observe_message(c,guild_id=1,user_id=2,role='user',content='thank you',source_row_id=1,channel_policy='public_home',route_mode='normal_chat',directed=True,observed_at=base)
+    assert refresh_moment_links(c,guild_id=1) >= 1
+    assert c.execute("select count(*) from relationship_event_moment_links_v2 where event_id=? and lifecycle='active'", (eid,)).fetchone()[0] == 1
+    c.execute("INSERT INTO relationship_event_moment_links_v2 VALUES ('other','m2',2,9,'active','2026-01-01T00:00:00+00:00','2026-01-01T00:00:00+00:00')")
+    refresh_moment_links(c,guild_id=1)
+    assert c.execute("select lifecycle from relationship_event_moment_links_v2 where guild_id=2 and event_id='other'").fetchone()[0] == 'active'
+    c.execute("UPDATE memory_moment_windows SET lifecycle_status='needs_review' WHERE guild_id=1")
+    refresh_moment_links(c,guild_id=1)
     assert build_evaluation_report(c,guild_id=1)['moment_linked_events'] == 0
+
+def test_governed_open_loop_public_visibility_filter():
+    c=conn(); obs(c,'thank you',1)
+    c.execute("INSERT INTO memory_ledger_entries (entry_id,schema_version,guild_id,subject_key,entry_type,predicate_key,normalized_value,source_class,source_table,source_row_id,source_role,visibility,confidence,public_usable,derived,projection,salience,observed_at,lifecycle_status,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", ('ol_private','memory_ledger_v1',1,subject_key_for_user(2),'open_loop','open_loop','follow up','first_party_record','test','1','user','private','medium',0,0,0,0.5,'2026-01-01T00:00:00+00:00','active','2026-01-01T00:00:00+00:00','2026-01-01T00:00:00+00:00'))
+    r=plan_engagement(c,guild_id=1,user_id=2,candidate_type='open_loop_follow_up',route_mode='normal_chat',channel_policy='public_home',current_direct=True)
+    assert r['relevant_open_loop_count'] == 0 and 'no_governed_open_loop' in r['withheld_reason_codes']
+    c.execute("INSERT INTO memory_ledger_entries (entry_id,schema_version,guild_id,subject_key,entry_type,predicate_key,normalized_value,source_class,source_table,source_row_id,source_role,visibility,confidence,public_usable,derived,projection,salience,observed_at,lifecycle_status,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", ('ol_public','memory_ledger_v1',1,subject_key_for_user(2),'open_loop','open_loop','follow up','first_party_record','test','2','user','public_safe','medium',1,0,0,0.5,'2026-01-01T00:00:00+00:00','active','2026-01-01T00:00:00+00:00','2026-01-01T00:00:00+00:00'))
+    r=plan_engagement(c,guild_id=1,user_id=2,candidate_type='open_loop_follow_up',route_mode='normal_chat',channel_policy='public_home',current_direct=True)
+    assert r['relevant_open_loop_count'] == 1
 
 def test_evaluation_report_truthful_and_shadow_no_discord_response():
     c=conn(); obs(c,'thank you',1); plan_engagement(c,guild_id=1,user_id=2,candidate_type='recognition',route_mode='normal_chat',channel_policy='public_home',current_direct=True)

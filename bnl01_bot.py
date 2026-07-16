@@ -56,6 +56,7 @@ from bnl_relationship_engine import (
     live_enabled as relationship_v2_live_enabled,
     observe_message as observe_relationship_v2_message,
     plan_engagement as plan_relationship_v2_engagement,
+    refresh_moment_links as refresh_relationship_v2_moment_links,
     set_member_setting as set_relationship_v2_member_setting,
     settings_summary as relationship_v2_settings_summary,
     shadow_enabled as relationship_v2_shadow_enabled,
