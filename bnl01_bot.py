@@ -9537,6 +9537,7 @@ def save_user_message(user_id: int, user_name: str, guild_id: int, content: str,
                     channel_id=int(channel_id or 0), message_id=int(message_id or 0) or None, route_mode=route_mode,
                     directed=bool(directed_to_bnl), observed_at=observed_at,
                 )
+                refresh_relationship_v2_moment_links(rel_conn, guild_id=guild_id)
                 if directed_to_bnl and (channel_policy or "").strip().lower() in PUBLIC_CHAT_POLICIES:
                     plan_relationship_v2_engagement(
                         rel_conn, guild_id=guild_id, user_id=user_id, candidate_type="recognition", route_mode=route_mode,
@@ -9620,6 +9621,7 @@ def save_model_message(user_id: int, guild_id: int, content: str, channel_name: 
                     channel_policy=(channel_policy or "unknown")[:40], channel_name=(channel_name or "").lower()[:80], channel_id=int(channel_id or 0),
                     route_mode=route_mode, directed=True, observed_at=observed_at,
                 )
+                refresh_relationship_v2_moment_links(rel_conn, guild_id=guild_id)
         except Exception as exc:
             logging.debug("relationship_v2_shadow_observe_model_failed error=%s", exc)
     prune_conversation_history(user_id, guild_id, calculate_adaptive_memory_limits(user_id, guild_id, route_mode=route_mode, channel_policy=channel_policy, user_text=content).get("conversation_rows", MAX_CONVERSATION_ROWS_PER_USER))

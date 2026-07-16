@@ -48,6 +48,16 @@ def test_directed_sealed_test_save_path_creates_no_relationship_evidence(monkeyp
         assert c.execute('select count(*) from relationship_events_v2').fetchone()[0] == 0
         assert c.execute("select rejection_reason from relationship_observation_diagnostics_v2").fetchone()[0] == 'sealed_test'
 
+def test_bot_save_paths_refresh_relationship_moment_links_in_shadow(monkeypatch):
+    tmp=tempfile.NamedTemporaryFile(delete=False); tmp.close(); monkeypatch.setattr(bnl01_bot,'DB_FILE',tmp.name); bnl01_bot.init_db(); monkeypatch.setenv(SHADOW_ENV,'1')
+    calls=[]
+    def fake_refresh(conn, *, guild_id=None):
+        calls.append(guild_id); return 0
+    monkeypatch.setattr(bnl01_bot, 'refresh_relationship_v2_moment_links', fake_refresh)
+    bnl01_bot.save_user_message(2,'u',1,'thank you',channel_policy='public_home',route_mode=bnl01_bot.ROUTE_MODE_NORMAL_CHAT,directed_to_bnl=True)
+    bnl01_bot.save_model_message(2,1,'audit only',channel_policy='public_home',route_mode=bnl01_bot.ROUTE_MODE_NORMAL_CHAT)
+    assert calls == [1, 1]
+
 def test_direct_save_path_creates_private_review_only_projection(monkeypatch):
     tmp=tempfile.NamedTemporaryFile(delete=False); tmp.close(); monkeypatch.setattr(bnl01_bot,'DB_FILE',tmp.name); bnl01_bot.init_db(); monkeypatch.setenv(SHADOW_ENV,'1')
     bnl01_bot.save_user_message(2,'u',1,'thank you',channel_policy='public_home',route_mode=bnl01_bot.ROUTE_MODE_NORMAL_CHAT,directed_to_bnl=True)
