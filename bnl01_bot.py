@@ -13,6 +13,20 @@
 
 from __future__ import annotations
 
+from bnl_website_contract_v2 import (
+    ContractV2Error,
+    DeliveryResult,
+    build_presence_envelope,
+    build_relay_envelope,
+    canonical_payload_bytes,
+    deliver_json as deliver_contract_v2_json,
+    effective_contract_version,
+    map_source_class,
+    map_trigger,
+    parse_status_relay,
+    validate_relay_id,
+)
+
 import os
 import re
 import asyncio
@@ -146,6 +160,11 @@ from bnl_website_relay_state import (
     bootstrap_cursor as relay_bootstrap_cursor,
     get_cursor as relay_get_cursor,
     record_publication as relay_record_publication,
+    prepare_attempt_relay as relay_prepare_attempt_relay,
+    hydrate_publication as relay_hydrate_publication,
+    get_pending_v2_publication as relay_get_pending_v2_publication,
+    save_pending_v2_publication as relay_save_pending_v2_publication,
+    clear_pending_v2_publication as relay_clear_pending_v2_publication,
     normalize_text as relay_normalize_text,
     recent_history as relay_recent_history,
     reject_reason_for_candidate as relay_reject_reason_for_candidate,
@@ -166,6 +185,7 @@ BNL_STATUS_URL = os.getenv("BNL_STATUS_URL")
 BNL_READ_MODEL_URL = os.getenv("BNL_READ_MODEL_URL", "").strip()
 BNL_READ_MODEL_ENABLED = os.getenv("BNL_READ_MODEL_ENABLED", "true").strip().lower() not in {"false", "0", "off"}
 
+BNL_WEBSITE_CONTRACT_VERSION = effective_contract_version(os.getenv("BNL_WEBSITE_CONTRACT_VERSION", "2"))
 BNL_WEBSITE_RELAY_ENABLED = os.getenv("BNL_WEBSITE_RELAY_ENABLED", "true").strip().lower() not in {"false", "0", "off"}
 BNL_ACTIVE_BATCHING_ENABLED = os.getenv("BNL_ACTIVE_BATCHING_ENABLED", "false").strip().lower() in {"true", "1", "on"}
 BNL_TYPING_INDICATOR_ENABLED = os.getenv("BNL_TYPING_INDICATOR_ENABLED", "false").strip().lower() in {"true", "1", "on"}
@@ -173,6 +193,7 @@ BNL_TYPING_INDICATOR_COOLDOWN_SECONDS = max(8, int(os.getenv("BNL_TYPING_INDICAT
 BNL_WEBSITE_RELAY_INTERVAL_MINUTES = max(1, int(os.getenv("BNL_WEBSITE_RELAY_INTERVAL_MINUTES", "20")))
 BNL_WEBSITE_RELAY_GENERATION_TIMEOUT_SECONDS = max(1.0, float(os.getenv("BNL_WEBSITE_RELAY_GENERATION_TIMEOUT_SECONDS", "25") or 25))
 BNL_WEBSITE_RELAY_FRESHNESS_MINUTES = max(1, int(os.getenv("BNL_WEBSITE_RELAY_FRESHNESS_MINUTES", "120") or 120))
+BNL_WEBSITE_HEARTBEAT_INTERVAL_MINUTES = max(1, int(os.getenv("BNL_WEBSITE_HEARTBEAT_INTERVAL_MINUTES", "5") or 5))
 BNL_PRIMARY_GUILD_ID = int(os.getenv("BNL_PRIMARY_GUILD_ID", "0") or 0)
 
 
@@ -2233,6 +2254,147 @@ def build_website_read_model_intent_response(intent: str, request_text: str) -> 
         return build_website_public_safe_candidate_response(read_model, request_text)
     return build_website_read_model_classifier_response(read_model, request_text)
 
+_last_website_presence_result = {"status": "idle", "reason": "", "source": "", "time": ""}
+_last_website_relay_delivery_result = {"status": "idle", "reason": "", "prepared_relay_id": "", "accepted_relay_id": "", "published_at": "", "idempotent": False}
+
+def _new_stable_relay_id(*, guild_id: int, source_cursor: int, message: str, directive: str, source_class: str, trigger: str, source_conversation_fingerprint: str) -> str:
+    identity = {
+        "guildId": int(guild_id or 0),
+        "sourceCursor": int(source_cursor or 0),
+        "sourceFingerprint": source_conversation_fingerprint or "",
+        "message": (message or "").strip(),
+        "currentDirective": (directive or "").strip(),
+        "sourceClass": map_source_class(source_class),
+        "trigger": map_trigger(trigger),
+    }
+    canonical = json.dumps(identity, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return validate_relay_id("bnl-" + hashlib.sha256(canonical).hexdigest()[:32])
+
+def _relay_source_fingerprint(decision: WebsiteRelayDecision) -> str:
+    ids = ",".join(str(int(x)) for x in sorted(decision.sourceConversationIds or []))
+    return hashlib.sha256(f"{decision.sourceCursor}|{ids}|{decision.eventType}".encode("utf-8")).hexdigest()[:32]
+
+def _pending_envelope_from_row(row: dict) -> dict:
+    raw = row.get("canonical_json") or "{}"
+    try:
+        return json.loads(raw)
+    except Exception:
+        return {}
+
+def _delivery_failure_decision(decision: WebsiteRelayDecision, *, detailed_reason: str, prepared_relay_id: str = "") -> WebsiteRelayDecision:
+    return WebsiteRelayDecision(
+        False,
+        skipReason="website_post_failed",
+        eventType=decision.eventType,
+        sourceConversationIds=decision.sourceConversationIds,
+        sourceCursor=decision.sourceCursor,
+        message=decision.message,
+        directive=decision.directive,
+        mode=decision.mode,
+        relayLane=decision.relayLane,
+        metadata={**decision.metadata, "reason": detailed_reason or "website_post_failed", "delivery_failure": True, "prepared_relay_id": prepared_relay_id},
+    )
+
+def publish_website_presence_v2(*, source: str, status: str = "ONLINE", mode: str = "OBSERVATION") -> bool:
+    if not BNL_API_KEY or not BNL_STATUS_URL:
+        _last_website_presence_result.update({"status": "skipped", "reason": "not_configured", "source": source, "time": _utc_now_iso()})
+        return False
+    try:
+        envelope = build_presence_envelope(status=status, mode=mode, source=source)
+        result = deliver_contract_v2_json(BNL_STATUS_URL, BNL_API_KEY, envelope, retries=0)
+        _last_website_presence_result.update({"status": "published" if result.ok else "delivery_failed", "reason": result.reason, "source": source, "time": _utc_now_iso()})
+        return result.ok
+    except Exception as exc:
+        _last_website_presence_result.update({"status": "delivery_failed", "reason": _safe_force_pull_error(exc), "source": source, "time": _utc_now_iso()})
+        return False
+
+def publish_website_relay_v2(*, relay_id: str, message: str, current_directive: str, source_class: str, trigger: str):
+    if not BNL_API_KEY or not BNL_STATUS_URL:
+        return DeliveryResult(False, "delivery_failed", "not_configured", relay_id=relay_id)
+    envelope = build_relay_envelope(relay_id, message, current_directive, source_class, trigger)
+    result = deliver_contract_v2_json(BNL_STATUS_URL, BNL_API_KEY, envelope, retries=1)
+    _last_website_relay_delivery_result.update({
+        "status": "published" if result.ok else "delivery_failed",
+        "reason": result.reason,
+        "prepared_relay_id": relay_id,
+        "accepted_relay_id": result.relay_id if result.ok else "",
+        "published_at": result.published_at if result.ok else "",
+        "idempotent": bool(result.idempotent),
+    })
+    return result
+
+def publish_website_relay_envelope_v2(envelope: dict):
+    relay = envelope.get("relay") if isinstance(envelope, dict) else {}
+    relay_id = relay.get("relayId", "") if isinstance(relay, dict) else ""
+    if not BNL_API_KEY or not BNL_STATUS_URL:
+        return DeliveryResult(False, "delivery_failed", "not_configured", relay_id=relay_id)
+    result = deliver_contract_v2_json(BNL_STATUS_URL, BNL_API_KEY, envelope, retries=1)
+    _last_website_relay_delivery_result.update({
+        "status": "published" if result.ok else "delivery_failed",
+        "reason": result.reason,
+        "prepared_relay_id": relay_id,
+        "accepted_relay_id": result.relay_id if result.ok else "",
+        "published_at": result.published_at if result.ok else "",
+        "idempotent": bool(result.idempotent),
+    })
+    return result
+
+def hydrate_website_relay_v2(guild_id: int) -> bool:
+    if not BNL_STATUS_URL or not BNL_API_KEY:
+        return False
+    req = urllib.request.Request(BNL_STATUS_URL, method="GET", headers={"x-api-key": BNL_API_KEY})
+    try:
+        with urllib.request.urlopen(req, timeout=10) as response:
+            data = json.loads(response.read().decode("utf-8") or "{}")
+    except Exception as exc:
+        logging.info("website_relay_hydration_skipped reason=%s", _safe_force_pull_error(exc))
+        return False
+    relay = parse_status_relay(data)
+    if not relay:
+        return False
+    pending = relay_get_pending_v2_publication(DB_FILE, guild_id)
+    if pending:
+        pending_matches = (
+            pending.get("relay_id") == relay["relayId"]
+            and pending.get("message") == relay["message"]
+            and pending.get("current_directive") == relay["currentDirective"]
+            and pending.get("source_class") == relay["sourceClass"]
+            and pending.get("trigger") == relay["trigger"]
+        )
+        if pending_matches:
+            try:
+                relay_record_publication(
+                    DB_FILE, guild_id, message=relay["message"], directive=relay["currentDirective"],
+                    mode=pending.get("mode") or "OBSERVATION", relay_lane=pending.get("relay_lane") or "current_signal",
+                    event_type=pending.get("event_type") or relay["sourceClass"], source_cursor=int(pending.get("source_cursor") or 0),
+                    published_timestamp=relay["publishedAt"], relay_id=relay["relayId"],
+                )
+            except ValueError as exc:
+                if str(exc) == "local_relay_id_conflict":
+                    logging.warning("website_relay_hydration_pending_conflict guild=%s relay_id=%s", guild_id, relay["relayId"])
+                    return False
+                raise
+            relay_clear_pending_v2_publication(DB_FILE, guild_id, relay["relayId"])
+            _last_website_relay_delivery_result.update({
+                "status": "hydrated_pending_confirmed",
+                "reason": "startup_hydration_confirmed_pending",
+                "prepared_relay_id": relay["relayId"],
+                "accepted_relay_id": relay["relayId"],
+                "published_at": relay["publishedAt"],
+                "idempotent": True,
+            })
+            _remember_relay_message(guild_id, relay["message"])
+            _remember_relay_topic(guild_id, relay["message"])
+            return True
+    changed = relay_hydrate_publication(
+        DB_FILE, guild_id, relay_id=relay["relayId"], message=relay["message"], directive=relay["currentDirective"],
+        source_class=relay["sourceClass"], trigger=relay["trigger"], published_timestamp=relay["publishedAt"]
+    )
+    if changed:
+        _remember_relay_message(guild_id, relay["message"])
+        _remember_relay_topic(guild_id, relay["message"])
+    return changed
+
 async def update_website_status_controlled_async(mode: str, message: str, status: str = "ONLINE", force: bool = False, current_directive: str = "", source: str = "relay", admin_note: str = "") -> bool:
     logging.info(f"website_status_push_offloaded source={source} mode={mode}")
     return await asyncio.to_thread(
@@ -2248,6 +2410,9 @@ async def update_website_status_controlled_async(mode: str, message: str, status
 
 
 def update_website_status_controlled(mode: str, message: str, status: str = "ONLINE", force: bool = False, current_directive: str = "", source: str = "relay", admin_note: str = "") -> bool:
+    if BNL_WEBSITE_CONTRACT_VERSION == "2":
+        logging.info("legacy_website_status_suppressed_under_v2 source=%s mode=%s", source, mode)
+        return False
     global _last_website_status_mode, _last_website_status_message, _last_website_directive, _last_website_status_at, _missing_status_key_warned
 
     now = datetime.now(PACIFIC_TZ)
@@ -2462,8 +2627,8 @@ async def _run_force_pull_relay_update(guild_id: int, request_id: str = ""):
             logging.info(f"Force-pull background relay update succeeded guild={guild_id} mode={decision.mode}{tag}")
         elif decision.skipReason == "website_post_failed":
             state["last_force_pull_status"] = "failed"
-            state["last_force_pull_error"] = "relay_update_failed"
-            logging.warning(f"Force-pull background relay update failed guild={guild_id} mode={decision.mode}{tag}")
+            state["last_force_pull_error"] = decision.metadata.get("reason") or "relay_update_failed"
+            logging.warning(f"Force-pull background relay update failed guild={guild_id} mode={decision.mode} reason={state['last_force_pull_error']}{tag}")
         else:
             state["last_force_pull_status"] = decision.skipReason or "no_publication"
             state["last_force_pull_error"] = decision.skipReason or "no_relay_published"
@@ -3515,6 +3680,40 @@ async def _execute_website_relay_transaction(guild_id: int, *, force: bool = Fal
         relay_complete_attempt(DB_FILE, attempt_id, source_class="none", outcome="disabled", reason="website_relay_disabled", aggregate_source_counts={}, cursor=initial_cursor, highest_eligible_conversation_id=initial_cursor)
         return WebsiteRelayDecision(False, skipReason="website_relay_disabled", sourceCursor=initial_cursor, metadata={"reason": "website_relay_disabled", "source_class": "none"})
     async with lock:
+        if BNL_WEBSITE_CONTRACT_VERSION == "2":
+            pending = relay_get_pending_v2_publication(DB_FILE, guild_id)
+            if pending:
+                envelope = _pending_envelope_from_row(pending)
+                prepared_relay_id = pending.get("relay_id") or ""
+                source_class = pending.get("source_class") or "none"
+                counts = json.loads(pending.get("aggregate_source_counts") or "{}")
+                source_cursor = int(pending.get("source_cursor") or 0)
+                highest = int(pending.get("highest_eligible_conversation_id") or source_cursor)
+                pending_decision = WebsiteRelayDecision(
+                    True,
+                    eventType=pending.get("event_type") or source_class,
+                    sourceCursor=source_cursor,
+                    message=pending.get("message") or "",
+                    directive=pending.get("current_directive") or "",
+                    mode=pending.get("mode") or "OBSERVATION",
+                    relayLane=pending.get("relay_lane") or "current_signal",
+                    metadata={"source_class": source_class, "pending_replay": True, "prepared_relay_id": prepared_relay_id},
+                )
+                relay_prepare_attempt_relay(DB_FILE, attempt_id, prepared_relay_id)
+                result = await asyncio.to_thread(publish_website_relay_envelope_v2, envelope)
+                reason = result.reason or ""
+                if not result.ok:
+                    relay_complete_attempt(DB_FILE, attempt_id, source_class=source_class, outcome="delivery_failed", reason=reason or "website_post_failed", aggregate_source_counts=counts, cursor=source_cursor, highest_eligible_conversation_id=highest, prepared_relay_id=prepared_relay_id)
+                    return _delivery_failure_decision(pending_decision, detailed_reason=reason or "website_post_failed", prepared_relay_id=prepared_relay_id)
+                relay_id = relay_record_publication(DB_FILE, guild_id, message=pending_decision.message, directive=pending_decision.directive, mode=pending_decision.mode, relay_lane=pending_decision.relayLane, event_type=pending_decision.eventType, source_cursor=source_cursor, published_timestamp=result.published_at, relay_id=result.relay_id)
+                relay_complete_attempt(DB_FILE, attempt_id, source_class=source_class, outcome="published", reason="idempotent_replay" if result.idempotent else "", aggregate_source_counts=counts, cursor=source_cursor, highest_eligible_conversation_id=highest, accepted_relay_id=relay_id, prepared_relay_id=prepared_relay_id, website_published_at=result.published_at, idempotent=result.idempotent)
+                relay_clear_pending_v2_publication(DB_FILE, guild_id, prepared_relay_id)
+                pending_decision.metadata.update({"accepted_relay_id": relay_id, "website_published_at": result.published_at, "website_idempotent": result.idempotent})
+                _remember_relay_message(guild_id, pending_decision.message)
+                _remember_relay_topic(guild_id, pending_decision.message)
+                _remember_relay_lane(guild_id, pending_decision.relayLane)
+                return pending_decision
+
         decision = await _generate_website_relay_guarded(guild_id, allow_quiet_sources=True)
         if decision is None:
             decision = WebsiteRelayDecision(False, skipReason="relay_generation_inflight", sourceCursor=relay_get_cursor(DB_FILE, guild_id) or 0, metadata={"reason": "relay_generation_inflight"})
@@ -3526,18 +3725,50 @@ async def _execute_website_relay_transaction(guild_id: int, *, force: bool = Fal
             outcome = "disabled" if reason == "website_relay_disabled" else ("provider_failed" if reason in {"provider_failure", "relay_generation_timeout"} else ("no_safe_source" if reason in {"no_new_public_signal", "bootstrap_no_publish", "fresh_context_expired"} else "rejected"))
             relay_complete_attempt(DB_FILE, attempt_id, source_class=source_class, outcome=outcome, reason=reason, aggregate_source_counts=counts, cursor=decision.sourceCursor, highest_eligible_conversation_id=highest)
             return decision
-        admin_note = build_admin_note(mode=decision.mode, message=decision.message, current_directive=decision.directive, source=admin_note_source) if force else ""
-        ok = await update_website_status_controlled_async(
-            mode=decision.mode, message=decision.message, status="ONLINE", force=force,
-            current_directive=decision.directive, source=source, admin_note=admin_note,
-        )
-        if not ok:
-            logging.warning("website_relay_delivery_failed_no_cursor_advance guild=%s sourceCursor=%s", guild_id, decision.sourceCursor)
-            relay_complete_attempt(DB_FILE, attempt_id, source_class=source_class, outcome="delivery_failed", reason="website_post_failed", aggregate_source_counts=counts, cursor=decision.sourceCursor, highest_eligible_conversation_id=highest)
-            return WebsiteRelayDecision(False, skipReason="website_post_failed", eventType=decision.eventType, sourceConversationIds=decision.sourceConversationIds, sourceCursor=decision.sourceCursor, message=decision.message, directive=decision.directive, mode=decision.mode, relayLane=decision.relayLane, metadata={**decision.metadata, "reason": "website_post_failed"})
-        relay_id = relay_record_publication(DB_FILE, guild_id, message=decision.message, directive=decision.directive, mode=decision.mode, relay_lane=decision.relayLane, event_type=decision.eventType, source_cursor=decision.sourceCursor)
-        relay_complete_attempt(DB_FILE, attempt_id, source_class=source_class, outcome="published", reason="", aggregate_source_counts=counts, cursor=decision.sourceCursor, highest_eligible_conversation_id=highest, accepted_relay_id=relay_id)
-        decision.metadata["accepted_relay_id"] = relay_id
+        if BNL_WEBSITE_CONTRACT_VERSION == "1":
+            admin_note = build_admin_note(mode=decision.mode, message=decision.message, current_directive=decision.directive, source=admin_note_source) if force else ""
+            ok = await update_website_status_controlled_async(
+                mode=decision.mode, message=decision.message, status="ONLINE", force=force,
+                current_directive=decision.directive, source=source, admin_note=admin_note,
+            )
+            if not ok:
+                logging.warning("website_relay_delivery_failed_no_cursor_advance guild=%s sourceCursor=%s", guild_id, decision.sourceCursor)
+                relay_complete_attempt(DB_FILE, attempt_id, source_class=source_class, outcome="delivery_failed", reason="website_post_failed", aggregate_source_counts=counts, cursor=decision.sourceCursor, highest_eligible_conversation_id=highest)
+                return WebsiteRelayDecision(False, skipReason="website_post_failed", eventType=decision.eventType, sourceConversationIds=decision.sourceConversationIds, sourceCursor=decision.sourceCursor, message=decision.message, directive=decision.directive, mode=decision.mode, relayLane=decision.relayLane, metadata={**decision.metadata, "reason": "website_post_failed", "delivery_failure": True})
+            relay_id = relay_record_publication(DB_FILE, guild_id, message=decision.message, directive=decision.directive, mode=decision.mode, relay_lane=decision.relayLane, event_type=decision.eventType, source_cursor=decision.sourceCursor)
+            relay_complete_attempt(DB_FILE, attempt_id, source_class=source_class, outcome="published", reason="", aggregate_source_counts=counts, cursor=decision.sourceCursor, highest_eligible_conversation_id=highest, accepted_relay_id=relay_id)
+            decision.metadata["accepted_relay_id"] = relay_id
+        else:
+            source_fingerprint = _relay_source_fingerprint(decision)
+            prepared_relay_id = _new_stable_relay_id(guild_id=guild_id, source_cursor=decision.sourceCursor, message=decision.message, directive=decision.directive, source_class=source_class, trigger=trigger, source_conversation_fingerprint=source_fingerprint)
+            relay_prepare_attempt_relay(DB_FILE, attempt_id, prepared_relay_id)
+            try:
+                envelope = build_relay_envelope(prepared_relay_id, decision.message, decision.directive, source_class, trigger)
+                relay = envelope["relay"]
+                canonical_json = canonical_payload_bytes(envelope).decode("utf-8")
+                relay_save_pending_v2_publication(
+                    DB_FILE, guild_id, relay_id=prepared_relay_id, message=relay["message"], current_directive=relay["currentDirective"],
+                    source_class=relay["sourceClass"], trigger=relay["trigger"], source_cursor=decision.sourceCursor,
+                    source_conversation_fingerprint=source_fingerprint, canonical_json=canonical_json, mode=decision.mode,
+                    relay_lane=decision.relayLane, event_type=decision.eventType, aggregate_source_counts=counts, highest_eligible_conversation_id=highest,
+                )
+                result = await asyncio.to_thread(publish_website_relay_envelope_v2, envelope)
+            except ContractV2Error as exc:
+                result = None
+                reason = str(exc) or "contract_validation_failed"
+            else:
+                reason = result.reason or "" if result else "contract_validation_failed"
+            if not result or not result.ok:
+                logging.warning("website_relay_delivery_failed_no_cursor_advance guild=%s sourceCursor=%s reason=%s", guild_id, decision.sourceCursor, reason)
+                relay_complete_attempt(DB_FILE, attempt_id, source_class=source_class, outcome="delivery_failed", reason=reason or "website_post_failed", aggregate_source_counts=counts, cursor=decision.sourceCursor, highest_eligible_conversation_id=highest, prepared_relay_id=prepared_relay_id)
+                return _delivery_failure_decision(decision, detailed_reason=reason or "website_post_failed", prepared_relay_id=prepared_relay_id)
+            relay_id = relay_record_publication(DB_FILE, guild_id, message=decision.message, directive=decision.directive, mode=decision.mode, relay_lane=decision.relayLane, event_type=decision.eventType, source_cursor=decision.sourceCursor, published_timestamp=result.published_at, relay_id=result.relay_id)
+            relay_complete_attempt(DB_FILE, attempt_id, source_class=source_class, outcome="published", reason="idempotent_replay" if result.idempotent else "", aggregate_source_counts=counts, cursor=decision.sourceCursor, highest_eligible_conversation_id=highest, accepted_relay_id=relay_id, prepared_relay_id=prepared_relay_id, website_published_at=result.published_at, idempotent=result.idempotent)
+            relay_clear_pending_v2_publication(DB_FILE, guild_id, prepared_relay_id)
+            decision.metadata["accepted_relay_id"] = relay_id
+            decision.metadata["prepared_relay_id"] = prepared_relay_id
+            decision.metadata["website_published_at"] = result.published_at
+            decision.metadata["website_idempotent"] = result.idempotent
         _remember_relay_message(guild_id, decision.message)
         _remember_relay_topic(guild_id, decision.message)
         _remember_relay_lane(guild_id, decision.relayLane)
@@ -13330,6 +13561,18 @@ async def _generate_website_relay_guarded(guild_id: int, *, allow_quiet_sources:
 
 
 @tasks.loop(minutes=1)
+async def website_presence_heartbeat_task():
+    if BNL_WEBSITE_CONTRACT_VERSION != "2":
+        return
+    flags = get_bnl_control_flags()
+    if not flags.get("heartbeatEnabled", True):
+        return
+    now_pt = datetime.now(PACIFIC_TZ)
+    if (now_pt.minute % max(1, BNL_WEBSITE_HEARTBEAT_INTERVAL_MINUTES)) != 0:
+        return
+    await asyncio.to_thread(publish_website_presence_v2, source="heartbeat", status="ONLINE", mode="OBSERVATION")
+
+@tasks.loop(minutes=1)
 async def website_relay_task():
     if not BNL_WEBSITE_RELAY_ENABLED:
         return
@@ -15205,6 +15448,32 @@ def log_admin_controls_connection_check():
 
 # ==================== EVENT HANDLERS ====================
 
+def _resolve_startup_hydration_guild_id() -> int:
+    if BNL_PRIMARY_GUILD_ID:
+        return BNL_PRIMARY_GUILD_ID
+    try:
+        guild = next(iter_managed_guilds(), None)
+    except Exception:
+        guild = None
+    if guild is not None:
+        return int(getattr(guild, "id", 0) or 0)
+    if client.guilds:
+        return int(getattr(client.guilds[0], "id", 0) or 0)
+    return 0
+
+async def hydrate_startup_relay_v2_once() -> bool:
+    if BNL_WEBSITE_CONTRACT_VERSION != "2":
+        return False
+    hydration_guild_id = _resolve_startup_hydration_guild_id()
+    if not hydration_guild_id:
+        return False
+    return await asyncio.to_thread(hydrate_website_relay_v2, hydration_guild_id)
+
+async def publish_startup_presence_v2_if_enabled() -> bool:
+    if BNL_WEBSITE_CONTRACT_VERSION != "2":
+        return False
+    return await asyncio.to_thread(publish_website_presence_v2, source="startup", status="ONLINE", mode="OBSERVATION")
+
 @client.event
 async def on_ready():
     init_db()
@@ -15221,6 +15490,12 @@ async def on_ready():
 
     if not barcode_radio_queue_task.is_running():
         barcode_radio_queue_task.start()
+
+    if BNL_WEBSITE_CONTRACT_VERSION == "2":
+        await hydrate_startup_relay_v2_once()
+        await publish_startup_presence_v2_if_enabled()
+        if not website_presence_heartbeat_task.is_running():
+            website_presence_heartbeat_task.start()
 
     if BNL_WEBSITE_RELAY_ENABLED and not website_relay_task.is_running():
         website_relay_task.start()
@@ -17963,7 +18238,12 @@ async def bnl_status(interaction: discord.Interaction):
         f"- next_ambient_message_at: `{next_ambient_message_at or 'none'}`",
         f"- last_ambient_mode: `{ambient_runtime.get('last_mode', 'unknown')}`",
         f"- last_ambient_skip_reason: `{ambient_runtime.get('last_skip_reason', 'unknown')}`",
+        f"- website_contract_version: `{BNL_WEBSITE_CONTRACT_VERSION}`",
         f"- website_relay_enabled: `{BNL_WEBSITE_RELAY_ENABLED}` (interval `{BNL_WEBSITE_RELAY_INTERVAL_MINUTES}m`)",
+        f"- website_heartbeat_interval: `{BNL_WEBSITE_HEARTBEAT_INTERVAL_MINUTES}m`",
+        f"- website_heartbeat_task_running: `{'yes' if website_presence_heartbeat_task.is_running() else 'no'}`",
+        f"- website_presence_last: `{_last_website_presence_result}`",
+        f"- website_relay_delivery_last: `{_last_website_relay_delivery_result}`",
         f"- website_relay_task_running: `{'yes' if website_relay_task.is_running() else 'no'}`",
         f"- website_bridge_configured: `{'yes' if website_bridge_configured else 'no'}`",
         f"- database_path: `{os.path.abspath(DB_FILE)}`",
@@ -18116,6 +18396,9 @@ async def bnl_status(interaction: discord.Interaction):
         f"- relay_last_attempt_source_class: `{relay_attempt.get('source_class') or 'none'}`",
         f"- relay_last_attempt_outcome: `{relay_attempt.get('outcome') or 'none'}`",
         f"- relay_last_attempt_reason: `{relay_attempt.get('reason') or 'none'}`",
+        f"- relay_last_prepared_relay_id: `{relay_attempt.get('prepared_relay_id') or 'none'}`",
+        f"- relay_last_accepted_relay_id: `{relay_attempt.get('accepted_relay_id') or 'none'}`",
+        f"- relay_last_idempotent: `{bool(relay_attempt.get('idempotent'))}`",
         f"- scoped_broadcast_memory_relay_context_active: `{'yes' if broadcast_count > 0 else 'no'}`",
     ])
     await send_safe_ephemeral_chunks(interaction, "\n".join(lines), limit=1700)
@@ -18170,13 +18453,17 @@ async def showtest(interaction: discord.Interaction, phase: app_commands.Choice[
     logging.info(f"/showtest website bridge target URL: {BNL_STATUS_URL}")
     logging.info(f"/showtest BNL_API_KEY present: {bool(BNL_API_KEY)}")
     logging.info(f"/showtest BNL_API_KEY length: {key_len}")
-    website_ok = website_ok if phase_key == "relay" else update_website_status_controlled(
-        mode=mode,
-        message=fit_complete_statement(website_msg, limit=360, min_chars=220, fallback=_pick_varied_fallback(phase_key)),
-        status="ONLINE",
-        force=True,
-        source="relay",
-    )
+    if phase_key != "relay" and BNL_WEBSITE_CONTRACT_VERSION == "2":
+        website_ok = True
+        logging.info("/showtest %s website write intentionally suppressed under contract v2", phase_key)
+    else:
+        website_ok = website_ok if phase_key == "relay" else update_website_status_controlled(
+            mode=mode,
+            message=fit_complete_statement(website_msg, limit=360, min_chars=220, fallback=_pick_varied_fallback(phase_key)),
+            status="ONLINE",
+            force=True,
+            source="relay",
+        )
 
     if phase_key != "relay":
         target_channel = interaction.channel if isinstance(interaction.channel, discord.TextChannel) else None
@@ -18201,7 +18488,7 @@ async def showtest(interaction: discord.Interaction, phase: app_commands.Choice[
         if phase_key == "relay":
             user_msg = f"✅ Website relay test fired for `{phase.value}` with mode `{mode}` and directive `{website_directive[:80]}`."
         else:
-            user_msg = f"✅ Show-day test fired for `{phase.value}` (mapped to `{phase_key}`)."
+            user_msg = f"✅ Show-day test fired for `{phase.value}` (mapped to `{phase_key}`); public website write intentionally suppressed under v2." if BNL_WEBSITE_CONTRACT_VERSION == "2" else f"✅ Show-day test fired for `{phase.value}` (mapped to `{phase_key}`)."
     else:
         user_msg = (
             f"⚠️ Show-day {'website relay' if phase_key == 'relay' else 'Discord test'} fired for `{phase.value}` "
