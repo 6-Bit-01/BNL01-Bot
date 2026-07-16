@@ -43,9 +43,10 @@ OPERATIONAL_STATE_RE = re.compile(
 )
 QUEUE_STATE_RE = re.compile(
     r"\bqueue status\b"
-    r"|\bqueue\b(?=.*\b(?:tracks?|submissions?|artists?|slots?|waiting|queued|currently|open|live)\b)"
-    r"|\bqueue\b(?=.*\bcurrently\b)(?=.*\bentries\b)"
-    r"|\b(?:tracks?|submissions?|artists?|slots?)\b(?=.*\bqueue\b)",
+    r"|\b(?:website|site|barcode|current|live)\s+queue\s+(?:status|is|was|open|closed|live|active)\b"
+    r"|\bqueue\s+(?:is|was|looks|seems|stays|remains|has|contains|currently\s+contains)\s+(?:currently\s+)?(?:open|closed|live|active|available|full|\w+\s+)?(?:tracks?|submissions?|artists?|slots?|entries|waiting)\b"
+    r"|\b(?:tracks?|submissions?|artists?|slots?|entries)\b(?=.*\b(?:currently|now|up next|next up|active|available|waiting|in)\b)(?=.*\bqueue\b)"
+    r"|\b(?:now|currently)\s+(?:in\s+)?(?:the\s+)?queue\b",
     re.I,
 )
 PAYMENT_STATE_RE = re.compile(r"\bpayment\b(?=.*\b(?:cleared|active|pending|owed|paid|submission|slot|session|confirmed)\b)", re.I)

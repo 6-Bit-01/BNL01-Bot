@@ -12310,6 +12310,40 @@ UNSUPPORTED_SENDER_SUBJECT_ATTRIBUTION_PATTERNS = (
     r"\b(?:him|her|them) (?:personally|processing|projecting|remembering|deploying)\b",
 )
 
+
+CONVERSATION_CONTINUITY_MARKER = "conversation continuity (bounded; continuity-only, not canon/current-state evidence):"
+
+def prompt_has_conversation_continuity_context(prompt: str) -> bool:
+    return CONVERSATION_CONTINUITY_MARKER in (prompt or "").lower()
+
+def _extract_conversation_continuity_context(prompt: str) -> str:
+    match = re.search(
+        r"Conversation continuity \(bounded; continuity-only, not canon/current-state evidence\):\n(?P<context>.*?)(?:\n(?:Room-first context rules:|Current channel:|Current channel policy:|User name to address|Prompt operator authority:)|\Z)",
+        prompt or "",
+        flags=re.DOTALL | re.IGNORECASE,
+    )
+    return (match.group("context").strip() if match else "")
+
+def _repair_unsupported_authority_with_conversation_context(text: str, prompt: str, route: str = "") -> str:
+    if not contains_unsupported_source_authority_claim(text):
+        return text or ""
+    context = _extract_conversation_continuity_context(prompt)
+    if not context:
+        return ""
+    candidate = re.sub(r"(?i)\b(?:archival\s+)?records?\s+(?:indicate|show|confirm)s?\s+(?:that\s+)?", "", text or "").strip()
+    candidate = re.sub(r"(?i)\b(?:archive|database|dossier|entity|source file|system)\s+(?:records?|lookup|scan)s?\s+(?:indicate|show|confirm)s?\s+(?:that\s+)?", "", candidate).strip()
+    candidate = re.sub(r"^[,;:\-\s]+", "", candidate).strip()
+    number_match = re.search(r"\b(?:number|remember)\D{0,40}(\d{1,12})\b|\b(\d{1,12})\b", candidate)
+    context_number = re.search(r"(?i)\bremember\s+this\s+number\s*[:\-]?\s*(\d{1,12})\b", context)
+    if context_number and (not number_match or context_number.group(1) in candidate):
+        repaired = f"You told me to remember {context_number.group(1)}."
+    else:
+        repaired = candidate
+    if not repaired or contains_unsupported_source_authority_claim(repaired):
+        return ""
+    logging.info("unsupported_source_authority_claim_repaired reason=conversation_continuity route=%s channel_policy=%s v2_context_present=1", route, _extract_channel_policy_from_prompt(prompt))
+    return repaired
+
 SOURCE_AUTHORITY_CONTEXT_MARKERS = (
     "broadcast memory context:",
     "broadcast memory context (cleaned summaries only):",
@@ -12765,8 +12799,20 @@ def _safe_uncertain_response_from_prompt(prompt: str) -> str:
             "I need to correct that. I have relevant broadcast-memory context here, so I should not claim there are no records. "
             "I can answer from that memory, but it is not a full dossier or account profile."
         )
+    v2_context = _extract_conversation_continuity_context(prompt)
+    if v2_context:
+        number_match = re.search(r"(?i)\bremember\s+this\s+number\s*[:\-]?\s*(\d{1,12})\b", v2_context)
+        if number_match:
+            logging.info("safe_uncertain_fallback_source_selected source=conversation_context_v2 channel_policy=%s extracted=number", _extract_channel_policy_from_prompt(prompt))
+            return f"You told me to remember {number_match.group(1)}."
+        logging.info("safe_uncertain_fallback_source_selected source=conversation_context_v2 channel_policy=%s extracted=generic", _extract_channel_policy_from_prompt(prompt))
+        return (
+            "I do have relevant recent conversation in this channel, but I won’t pretend I ran an archive or entity lookup. "
+            "I can answer from that conversation if you point me at the specific bit."
+        )
     room_match = re.search(r"Recent room context from this channel:\n(?P<context>.*?)(?:\nRoom-first context rules:|\nCurrent channel:|\Z)", prompt or "", flags=re.DOTALL)
     if room_match and room_match.group("context").strip():
+        logging.info("safe_uncertain_fallback_source_selected source=legacy_room_context channel_policy=%s", _extract_channel_policy_from_prompt(prompt))
         return (
             "I can place those names in the current room context, but I won’t pretend I ran an archive or entity lookup. "
             "What I know here comes from the recent channel conversation, not from a permanent BARCODE dossier record."
@@ -13097,6 +13143,9 @@ async def get_gemini_response(prompt: str, user_id: int, guild_id: int, route: s
             return _safe_uncertain_response_from_prompt(prompt)
 
         if unsupported_source_authority:
+            repaired = _repair_unsupported_authority_with_conversation_context(text, prompt, route)
+            if repaired:
+                return repaired
             logging.info("model_response_rejected reason=unsupported_source_authority route=%s channel_policy=%s source_context_present=0", route, _extract_channel_policy_from_prompt(prompt))
             return _safe_uncertain_response_from_prompt(prompt)
 
@@ -17300,8 +17349,7 @@ async def on_message(message: discord.Message):
                 _log_batch_event(logging.INFO, "skip", message.guild.id, message.channel.id, pending_count, "direct_reply_preempts_batch")
             repair = try_repair_response(direct_content)
             if repair:
-                if not is_sealed_test_channel:
-                    save_model_message(message.author.id, message.guild.id, repair, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0), route_mode=route_mode)
+                save_model_message(message.author.id, message.guild.id, repair, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0), route_mode=route_mode)
                 await message.reply(repair)
                 return
 
@@ -17309,8 +17357,7 @@ async def on_message(message: discord.Message):
             if self_reflection:
                 if not is_privileged_member(message.author, message.guild):
                     self_reflection = "Status reports are restricted to server owner/mod operators."
-                if not is_sealed_test_channel:
-                    save_model_message(message.author.id, message.guild.id, self_reflection, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0), route_mode=route_mode)
+                save_model_message(message.author.id, message.guild.id, self_reflection, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0), route_mode=route_mode)
                 await message.reply(self_reflection)
                 return
 
@@ -17318,8 +17365,7 @@ async def on_message(message: discord.Message):
             if not memory_recall:
                 memory_recall = try_memory_recall_response(message.author.id, message.guild.id, direct_content)
             if memory_recall:
-                if not is_sealed_test_channel:
-                    save_model_message(message.author.id, message.guild.id, memory_recall, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0), route_mode=route_mode)
+                save_model_message(message.author.id, message.guild.id, memory_recall, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0), route_mode=route_mode)
                 await message.reply(memory_recall)
                 return
 
@@ -17468,7 +17514,7 @@ async def on_message(message: discord.Message):
                 conversation_plan,
                 website_read_model_context=website_read_model_context,
                 source_context_block=source_context_block,
-                allow_model_save=not is_sealed_test_channel,
+                allow_model_save=True,
                 payload_expected=payload_expected,
                 payload_count=len(direct_payload_items),
                 prompt=prompt,
@@ -17566,8 +17612,7 @@ async def on_message(message: discord.Message):
             await message.reply(restricted_recall_guard)
             return
 
-        if not is_sealed_test_channel:
-            save_user_message(message.author.id, message.author.display_name, message.guild.id, direct_content, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0), message_id=getattr(message, "id", None), route_mode=route_mode)
+        save_user_message(message.author.id, message.author.display_name, message.guild.id, direct_content, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0), message_id=getattr(message, "id", None), route_mode=route_mode)
 
         repair = try_repair_response(direct_content)
         if repair:
@@ -17780,8 +17825,7 @@ async def on_message(message: discord.Message):
             await message.reply(restricted_recall_guard)
             return
 
-        if not is_sealed_test_channel:
-            save_user_message(message.author.id, message.author.display_name, message.guild.id, direct_content, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0), message_id=getattr(message, "id", None), route_mode=route_mode)
+        save_user_message(message.author.id, message.author.display_name, message.guild.id, direct_content, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0), message_id=getattr(message, "id", None), route_mode=route_mode)
 
         repair = try_repair_response(direct_content)
         if repair:

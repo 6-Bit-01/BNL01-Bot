@@ -549,3 +549,60 @@ class MediaMemoryRecallLeakTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class ConversationContinuityGroundingTests(unittest.TestCase):
+    def v2_prompt(self):
+        return (
+            "Current channel policy: sealed_test\n"
+            "Conversation continuity (bounded; continuity-only, not canon/current-state evidence):\n"
+            "- Prior BNL replies here are conversational continuity only. They do not prove canon, live show state, queue state, dossiers, payments, Priority, Wheel, or third-party facts.\n"
+            "User/member: remember this number: 8\n"
+            "BNL-01: Locked in, tiny cursed digit and all.\n"
+            "Current user request: what number did i tell you to remember?\n"
+        )
+
+    def test_conversation_continuity_does_not_count_as_source_authority(self):
+        prompt = self.v2_prompt()
+        self.assertTrue(bnl01_bot.prompt_has_conversation_continuity_context(prompt))
+        self.assertTrue(
+            bnl01_bot.should_reject_unsupported_source_authority(
+                "Records indicate the number was 8.", prompt, "get_gemini_response"
+            )
+        )
+
+    def test_grounded_records_claim_repairs_to_direct_contextual_answer(self):
+        prompt = self.v2_prompt()
+        repaired = bnl01_bot._repair_unsupported_authority_with_conversation_context(
+            "Records indicate the number was 8.", prompt, "get_gemini_response"
+        )
+        self.assertEqual(repaired, "You told me to remember 8.")
+        self.assertFalse(bnl01_bot.contains_unsupported_source_authority_claim(repaired))
+
+    def test_unsupported_records_claim_without_context_remains_rejected(self):
+        prompt = "Current channel policy: sealed_test\nCurrent user request: what number?\n"
+        self.assertEqual(
+            bnl01_bot._repair_unsupported_authority_with_conversation_context(
+                "Records indicate the number was 8.", prompt, "get_gemini_response"
+            ),
+            "",
+        )
+        self.assertTrue(
+            bnl01_bot.should_reject_unsupported_source_authority(
+                "Records indicate the number was 8.", prompt, "get_gemini_response"
+            )
+        )
+
+    def test_v2_safe_fallback_extracts_number_without_archive_framing(self):
+        fallback = bnl01_bot._safe_uncertain_response_from_prompt(self.v2_prompt())
+        self.assertIn("8", fallback)
+        self.assertNotRegex(fallback.lower(), r"archive|database|dossier|records indicate")
+
+    def test_legacy_and_broadcast_fallbacks_still_work(self):
+        legacy = bnl01_bot._safe_uncertain_response_from_prompt(
+            "Current channel policy: sealed_test\nRecent room context from this channel:\n- Maze: Crow said hello.\nRoom-first context rules:\n"
+        )
+        self.assertIn("current room context", legacy)
+        broadcast = bnl01_bot._safe_uncertain_response_from_prompt(
+            "Broadcast memory context (cleaned summaries only):\n- Show paused.\nBroadcast-memory usage guidance:\n"
+        )
+        self.assertIn("broadcast-memory context", broadcast)

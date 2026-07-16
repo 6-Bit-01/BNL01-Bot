@@ -1108,3 +1108,53 @@ class GuardedResponseRegenerationTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class SealedConversationPersistenceTests(unittest.TestCase):
+    def test_sealed_user_and_model_rows_are_conversation_only_and_pairable_once(self):
+        import sqlite3
+        old_db = bnl01_bot.DB_FILE
+        with tempfile.NamedTemporaryFile(delete=True) as tmp:
+            bnl01_bot.DB_FILE = tmp.name
+            bnl01_bot.init_db()
+            try:
+                user_decision = bnl01_bot.save_user_message(
+                    101, "Crow", 1, "remember this number: 8",
+                    channel_name="bnl-testing", channel_policy="sealed_test", channel_id=2,
+                    message_id=7001, route_mode=bnl01_bot.ROUTE_MODE_NORMAL_CHAT,
+                )
+                model_decision = bnl01_bot.save_model_message(
+                    101, 1, "You told me to remember 8.",
+                    channel_name="bnl-testing", channel_policy="sealed_test", channel_id=2,
+                    route_mode=bnl01_bot.ROUTE_MODE_NORMAL_CHAT,
+                )
+                self.assertTrue(user_decision.save_conversation)
+                self.assertTrue(model_decision.save_conversation)
+                self.assertFalse(model_decision.write_memory_tier)
+                self.assertFalse(model_decision.update_relationship)
+                conn = sqlite3.connect(tmp.name)
+                cur = conn.cursor()
+                cur.execute("SELECT role, channel_policy, channel_id, content FROM conversations ORDER BY id")
+                rows = cur.fetchall()
+                self.assertEqual(len(rows), 2)
+                self.assertEqual(rows[0][0], "user")
+                self.assertEqual(rows[1][0], "model")
+                self.assertTrue(all(r[1] == "sealed_test" and r[2] == 2 for r in rows))
+                for table in ("memory_tiers", "user_memory_facts", "relationship_state", "relationship_journal"):
+                    cur.execute(f"SELECT COUNT(*) FROM {table}")
+                    self.assertEqual(cur.fetchone()[0], 0, table)
+                conn.close()
+            finally:
+                bnl01_bot.DB_FILE = old_db
+
+    def test_empty_or_excluded_model_response_is_not_saved(self):
+        old_db = bnl01_bot.DB_FILE
+        with tempfile.NamedTemporaryFile(delete=True) as tmp:
+            bnl01_bot.DB_FILE = tmp.name
+            bnl01_bot.init_db()
+            try:
+                decision = bnl01_bot.save_model_message(
+                    101, 1, "", channel_name="bnl-testing", channel_policy="sealed_test", channel_id=2
+                )
+                self.assertFalse(decision.save_conversation)
+            finally:
+                bnl01_bot.DB_FILE = old_db
