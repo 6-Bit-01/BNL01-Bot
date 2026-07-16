@@ -11906,6 +11906,14 @@ def extract_user_facts(text: str):
         if subject and raw_value:
             facts.append((f"favorite_{subject[:30]}", raw_value[:120], 0.88))
 
+    remembered_number = re.search(
+        r"\b(?:please\s+)?remember\s+(?:(?:that\s+)?(?:(?:this|the)\s+)?number\s*(?::|-|is)?|this\s*:)\s*(\d{1,12})(?!\d)\b",
+        content,
+        flags=re.IGNORECASE,
+    )
+    if remembered_number:
+        facts.append(("remembered_number", remembered_number.group(1), 0.9))
+
     directive_note = None
     directive_patterns = (
         r"\b(?:please\s+)?remember\s+(?:this\s*:|that\s+)([^.!?\n]{3,140})",
@@ -11922,7 +11930,7 @@ def extract_user_facts(text: str):
             if m:
                 directive_note = m.group(1).strip(" .,!?;:")
                 break
-    if directive_note:
+    if directive_note and not remembered_number:
         note_lower = directive_note.strip().lower()
         structured_values = {str(value).strip().lower() for (_key, value, _confidence) in facts}
         structured_duplicate = note_lower in structured_values or any(value and value in note_lower for value in structured_values)
@@ -12051,13 +12059,13 @@ def apply_explicit_recall_governance(
     if not legacy_recall_response:
         return legacy_recall_response
     policy = (channel_policy or "unknown").strip().lower() or "unknown"
-    if route_mode in SOURCE_INTERNAL_MODES or policy in {"unknown", "sealed_test", "protected_system", "broadcast_memory", "reference_canon", "ai_image_tool", "internal_controlled"}:
+    if route_mode in SOURCE_INTERNAL_MODES or policy not in PUBLIC_CHAT_POLICIES:
         return legacy_recall_response
     if not memory_governance_shadow_enabled():
         return legacy_recall_response
     try:
         limits = calculate_adaptive_memory_limits(user_id, guild_id, route_mode=route_mode, channel_policy=policy, user_text=user_text, is_owner_or_mod=is_owner_or_mod)
-        visibility = limits.get("visibility", "public_safe")
+        visibility = "public_safe"
         gov_req = GovernanceRequest(
             guild_id=guild_id,
             subject_user_id=user_id,
@@ -12078,7 +12086,14 @@ def apply_explicit_recall_governance(
         unsafe_governed = bool(gov_result.diagnostics.processing_errors or gov_result.diagnostics.invalid_invariants)
         if memory_governance_live_enabled() and not unsafe_governed:
             return _format_explicit_recall_governed_response(gov_result)
-    except Exception:
+    except Exception as exc:
+        logging.warning(
+            "memory_governance_explicit_recall_exception event=%s route_mode=%s channel_policy=%s exception_type=%s",
+            "explicit_recall_governance_exception",
+            str(route_mode or "unknown")[:80],
+            policy[:80],
+            type(exc).__name__[:80],
+        )
         return legacy_recall_response
     return legacy_recall_response
 
