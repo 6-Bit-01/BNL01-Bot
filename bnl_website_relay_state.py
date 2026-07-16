@@ -279,11 +279,22 @@ def record_publication(db_path: str, guild_id: int, *, message: str, directive: 
     fam = semantic_family(message)
     relay_id = relay_id or hashlib.sha256(f"{guild_id}|{source_cursor}|{norm}|{ts}".encode()).hexdigest()[:24]
     with sqlite3.connect(db_path) as conn:
-        conn.execute("INSERT OR REPLACE INTO website_relay_state(guild_id,last_published_conversation_cursor,last_publication_timestamp) VALUES(?,?,?)", (guild_id, int(source_cursor or 0), ts))
-        conn.execute("""
-        INSERT INTO website_relay_history(relay_id,guild_id,public_message,public_directive,mode,relay_lane,event_type,highest_source_conversation_id,normalized_message,semantic_family,published_timestamp)
-        VALUES(?,?,?,?,?,?,?,?,?,?,?)
-        """, (relay_id, guild_id, message, directive, mode, relay_lane, event_type, int(source_cursor or 0), norm, fam, ts))
+        existing = conn.execute("SELECT public_message, public_directive FROM website_relay_history WHERE relay_id=?", (relay_id,)).fetchone()
+        if existing:
+            if existing[0] != message or existing[1] != directive:
+                raise ValueError("local_relay_id_conflict")
+            conn.execute("INSERT OR REPLACE INTO website_relay_state(guild_id,last_published_conversation_cursor,last_publication_timestamp) VALUES(?,?,?)", (guild_id, int(source_cursor or 0), ts))
+            conn.execute("""
+            UPDATE website_relay_history
+            SET guild_id=?, mode=?, relay_lane=?, event_type=?, highest_source_conversation_id=?, normalized_message=?, semantic_family=?, published_timestamp=?
+            WHERE relay_id=?
+            """, (guild_id, mode, relay_lane, event_type, int(source_cursor or 0), norm, fam, ts, relay_id))
+        else:
+            conn.execute("INSERT OR REPLACE INTO website_relay_state(guild_id,last_published_conversation_cursor,last_publication_timestamp) VALUES(?,?,?)", (guild_id, int(source_cursor or 0), ts))
+            conn.execute("""
+            INSERT INTO website_relay_history(relay_id,guild_id,public_message,public_directive,mode,relay_lane,event_type,highest_source_conversation_id,normalized_message,semantic_family,published_timestamp)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?)
+            """, (relay_id, guild_id, message, directive, mode, relay_lane, event_type, int(source_cursor or 0), norm, fam, ts))
         old = conn.execute("SELECT relay_id FROM website_relay_history WHERE guild_id=? ORDER BY published_timestamp DESC LIMIT -1 OFFSET ?", (guild_id, MAX_HISTORY)).fetchall()
         if old:
             conn.executemany("DELETE FROM website_relay_history WHERE relay_id=?", [(r[0],) for r in old])

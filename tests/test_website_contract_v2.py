@@ -248,6 +248,76 @@ class ContractV2Tests(unittest.TestCase):
             self.assertEqual(state.recent_history(f.name, 42), [])
             self.assertIsNone(state.get_cursor(f.name, 42))
 
+
+    def test_lost_response_then_startup_hydration_confirms_pending_without_post(self):
+        decision = bnl01_bot.WebsiteRelayDecision(
+            True, eventType="canon", sourceConversationIds=[20], sourceCursor=20,
+            message="Hydration confirms the accepted relay.",
+            directive="Use the persisted website acceptance as local confirmation.",
+            mode="OBSERVATION", relayLane="network_posture",
+            metadata={"source_class": "canon", "aggregate_source_counts": {"canon": 1}},
+        )
+        sent = []
+        def lost_response(req, timeout=10):
+            sent.append(req.data)
+            raise urllib.error.URLError("lost")
+        with tempfile.NamedTemporaryFile() as f, mock.patch.object(bnl01_bot, "DB_FILE", f.name), mock.patch.object(bnl01_bot, "BNL_WEBSITE_CONTRACT_VERSION", "2"), mock.patch.object(bnl01_bot, "BNL_STATUS_URL", "https://site.test"), mock.patch.object(bnl01_bot, "BNL_API_KEY", "key"), mock.patch.object(bnl01_bot, "get_bnl_control_flags", return_value={"websiteRelayEnabled": True, "heartbeatEnabled": True}), mock.patch.object(bnl01_bot, "_generate_website_relay_guarded", return_value=decision), mock.patch("urllib.request.urlopen", side_effect=lost_response):
+            first = asyncio.run(bnl01_bot._execute_website_relay_transaction(42, source="relay"))
+            self.assertFalse(first.publish)
+            pending = state.get_pending_v2_publication(f.name, 42)
+            self.assertTrue(pending)
+
+            env = json.loads(pending["canonical_json"])
+            body = json.dumps({"status": "ONLINE", "mode": "OBSERVATION", "message": pending["message"], "currentDirective": pending["current_directive"], "source": "relay", "lastSeen": "2026-07-15T00:00:00Z", "persisted": True, "contractVersion": 2, "presence": {"contractVersion": 2, "status": "ONLINE", "mode": "OBSERVATION", "source": "startup", "receivedAt": "2026-07-15T00:00:00Z"}, "relay": dict(env["relay"], contractVersion=2, publishedAt="2026-07-15T00:00:00Z")}).encode()
+            methods = []
+            def get_only(req, timeout=10):
+                methods.append(req.get_method())
+                return Resp(200, body)
+            with mock.patch("urllib.request.urlopen", side_effect=get_only):
+                self.assertTrue(bnl01_bot.hydrate_website_relay_v2(42))
+            self.assertEqual(methods, ["GET"])
+            self.assertEqual(state.get_cursor(f.name, 42), 20)
+            hist = state.recent_history(f.name, 42)
+            self.assertEqual(len(hist), 1)
+            self.assertEqual(hist[0]["relay_id"], pending["relay_id"])
+            self.assertEqual(state.get_pending_v2_publication(f.name, 42), {})
+
+    def test_existing_hydrated_row_reconciles_pending_confirmation_once(self):
+        with tempfile.NamedTemporaryFile() as f, mock.patch.object(bnl01_bot, "DB_FILE", f.name), mock.patch.object(bnl01_bot, "BNL_STATUS_URL", "https://site.test"), mock.patch.object(bnl01_bot, "BNL_API_KEY", "key"):
+            relay_id = "bnl-reconcile-0001"
+            msg = "Already hydrated relay text."
+            directive = "Already hydrated directive text."
+            state.hydrate_publication(f.name, 42, relay_id=relay_id, message=msg, directive=directive, source_class="approved_canon", trigger="scheduled", published_timestamp="2026-07-15T00:00:00Z")
+            env = c.build_relay_envelope(relay_id, msg, directive, "approved_canon", "scheduled")
+            state.save_pending_v2_publication(f.name, 42, relay_id=relay_id, message=msg, current_directive=directive, source_class="approved_canon", trigger="scheduled", source_cursor=12, source_conversation_fingerprint="fp", canonical_json=c.canonical_payload_bytes(env).decode(), mode="OBSERVATION", relay_lane="network_posture", event_type="canon")
+            body = json.dumps({"persisted": True, "contractVersion": 2, "relay": dict(env["relay"], contractVersion=2, publishedAt="2026-07-15T00:00:01Z")}).encode()
+            with mock.patch("urllib.request.urlopen", return_value=Resp(200, body)):
+                self.assertTrue(bnl01_bot.hydrate_website_relay_v2(42))
+            self.assertEqual(state.get_cursor(f.name, 42), 12)
+            hist = state.recent_history(f.name, 42)
+            self.assertEqual(len(hist), 1)
+            self.assertEqual(hist[0]["relay_id"], relay_id)
+            self.assertEqual(state.get_pending_v2_publication(f.name, 42), {})
+
+    def test_same_relay_id_different_content_conflicts_and_retains_pending(self):
+        with tempfile.NamedTemporaryFile() as f, mock.patch.object(bnl01_bot, "DB_FILE", f.name), mock.patch.object(bnl01_bot, "BNL_STATUS_URL", "https://site.test"), mock.patch.object(bnl01_bot, "BNL_API_KEY", "key"):
+            relay_id = "bnl-conflict-0001"
+            state.record_publication(f.name, 42, message="Original relay text.", directive="Original directive text.", mode="OBSERVATION", relay_lane="network_posture", event_type="canon", source_cursor=3, relay_id=relay_id, published_timestamp="2026-07-15T00:00:00Z")
+            env = c.build_relay_envelope(relay_id, "Different relay text.", "Different directive text.", "approved_canon", "scheduled")
+            state.save_pending_v2_publication(f.name, 42, relay_id=relay_id, message="Different relay text.", current_directive="Different directive text.", source_class="approved_canon", trigger="scheduled", source_cursor=9, source_conversation_fingerprint="fp", canonical_json=c.canonical_payload_bytes(env).decode(), mode="OBSERVATION", relay_lane="network_posture", event_type="canon")
+            body = json.dumps({"persisted": True, "contractVersion": 2, "relay": dict(env["relay"], contractVersion=2, publishedAt="2026-07-15T00:00:01Z")}).encode()
+            with mock.patch("urllib.request.urlopen", return_value=Resp(200, body)):
+                self.assertFalse(bnl01_bot.hydrate_website_relay_v2(42))
+            self.assertEqual(state.get_cursor(f.name, 42), 3)
+            self.assertTrue(state.get_pending_v2_publication(f.name, 42))
+            hist = state.recent_history(f.name, 42)
+            self.assertEqual(hist[0]["public_message"], "Original relay text.")
+
+    def test_punctuation_and_capitalization_distinct_payloads_get_distinct_ids(self):
+        rid1 = bnl01_bot._new_stable_relay_id(guild_id=42, source_cursor=1, message="Relay text.", directive="Directive text.", source_class="canon", trigger="scheduled", source_conversation_fingerprint="fp")
+        rid2 = bnl01_bot._new_stable_relay_id(guild_id=42, source_cursor=1, message="relay text", directive="Directive text!", source_class="canon", trigger="scheduled", source_conversation_fingerprint="fp")
+        self.assertNotEqual(rid1, rid2)
+
     def test_v1_heartbeat_noops_without_http_stock_status(self):
         calls = []
         with mock.patch.object(bnl01_bot, "BNL_WEBSITE_CONTRACT_VERSION", "1"), mock.patch.object(bnl01_bot, "update_website_status_controlled_async", side_effect=lambda **kw: calls.append(kw)):

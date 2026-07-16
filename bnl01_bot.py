@@ -21,6 +21,8 @@ from bnl_website_contract_v2 import (
     canonical_payload_bytes,
     deliver_json as deliver_contract_v2_json,
     effective_contract_version,
+    map_source_class,
+    map_trigger,
     parse_status_relay,
     validate_relay_id,
 )
@@ -2256,16 +2258,17 @@ _last_website_presence_result = {"status": "idle", "reason": "", "source": "", "
 _last_website_relay_delivery_result = {"status": "idle", "reason": "", "prepared_relay_id": "", "accepted_relay_id": "", "published_at": "", "idempotent": False}
 
 def _new_stable_relay_id(*, guild_id: int, source_cursor: int, message: str, directive: str, source_class: str, trigger: str, source_conversation_fingerprint: str) -> str:
-    identity = "|".join([
-        str(int(guild_id or 0)),
-        str(int(source_cursor or 0)),
-        relay_normalize_text(message),
-        relay_normalize_text(directive),
-        source_class or "",
-        trigger or "",
-        source_conversation_fingerprint or "",
-    ])
-    return validate_relay_id("bnl-" + hashlib.sha256(identity.encode("utf-8")).hexdigest()[:32])
+    identity = {
+        "guildId": int(guild_id or 0),
+        "sourceCursor": int(source_cursor or 0),
+        "sourceFingerprint": source_conversation_fingerprint or "",
+        "message": (message or "").strip(),
+        "currentDirective": (directive or "").strip(),
+        "sourceClass": map_source_class(source_class),
+        "trigger": map_trigger(trigger),
+    }
+    canonical = json.dumps(identity, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return validate_relay_id("bnl-" + hashlib.sha256(canonical).hexdigest()[:32])
 
 def _relay_source_fingerprint(decision: WebsiteRelayDecision) -> str:
     ids = ",".join(str(int(x)) for x in sorted(decision.sourceConversationIds or []))
@@ -2349,6 +2352,40 @@ def hydrate_website_relay_v2(guild_id: int) -> bool:
     relay = parse_status_relay(data)
     if not relay:
         return False
+    pending = relay_get_pending_v2_publication(DB_FILE, guild_id)
+    if pending:
+        pending_matches = (
+            pending.get("relay_id") == relay["relayId"]
+            and pending.get("message") == relay["message"]
+            and pending.get("current_directive") == relay["currentDirective"]
+            and pending.get("source_class") == relay["sourceClass"]
+            and pending.get("trigger") == relay["trigger"]
+        )
+        if pending_matches:
+            try:
+                relay_record_publication(
+                    DB_FILE, guild_id, message=relay["message"], directive=relay["currentDirective"],
+                    mode=pending.get("mode") or "OBSERVATION", relay_lane=pending.get("relay_lane") or "current_signal",
+                    event_type=pending.get("event_type") or relay["sourceClass"], source_cursor=int(pending.get("source_cursor") or 0),
+                    published_timestamp=relay["publishedAt"], relay_id=relay["relayId"],
+                )
+            except ValueError as exc:
+                if str(exc) == "local_relay_id_conflict":
+                    logging.warning("website_relay_hydration_pending_conflict guild=%s relay_id=%s", guild_id, relay["relayId"])
+                    return False
+                raise
+            relay_clear_pending_v2_publication(DB_FILE, guild_id, relay["relayId"])
+            _last_website_relay_delivery_result.update({
+                "status": "hydrated_pending_confirmed",
+                "reason": "startup_hydration_confirmed_pending",
+                "prepared_relay_id": relay["relayId"],
+                "accepted_relay_id": relay["relayId"],
+                "published_at": relay["publishedAt"],
+                "idempotent": True,
+            })
+            _remember_relay_message(guild_id, relay["message"])
+            _remember_relay_topic(guild_id, relay["message"])
+            return True
     changed = relay_hydrate_publication(
         DB_FILE, guild_id, relay_id=relay["relayId"], message=relay["message"], directive=relay["currentDirective"],
         source_class=relay["sourceClass"], trigger=relay["trigger"], published_timestamp=relay["publishedAt"]
