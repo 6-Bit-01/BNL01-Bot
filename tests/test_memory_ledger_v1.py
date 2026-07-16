@@ -29,8 +29,9 @@ class MemoryLedgerV1Tests(unittest.TestCase):
         duplicate = ledger.shadow_conversation_row(self.conn, row_id=500, **kwargs)
         second = ledger.shadow_conversation_row(self.conn, row_id=501, **kwargs)
         self.conn.commit()
-        self.assertEqual(first, duplicate)
-        self.assertNotEqual(first, second)
+        self.assertEqual(first.entry_id, duplicate.entry_id)
+        self.assertEqual(duplicate.outcome, "deduplicated")
+        self.assertNotEqual(first.entry_id, second.entry_id)
         self.assertEqual(self.count_entries(), 2)
 
     def test_number_sequence_is_additive_not_supersession(self):
@@ -60,6 +61,24 @@ class MemoryLedgerV1Tests(unittest.TestCase):
         ledger.shadow_conversation_row(self.conn, row_id=10, user_id=7, user_name="Crow", guild_id=1, role="user", content="We joked that the queue is haunted.", channel_policy="public_home")
         row = self.conn.execute("SELECT source_table, predicate_key FROM memory_ledger_entries").fetchone()
         self.assertEqual(row, ("conversations", "conversation"))
+
+
+    def test_single_and_twelve_digit_numbers_are_supported(self):
+        r1 = ledger.shadow_conversation_row(self.conn, row_id=20, user_id=7, user_name="Crow", guild_id=1, role="user", content="Remember this number: 8", channel_policy="sealed_test")
+        r2 = ledger.shadow_conversation_row(self.conn, row_id=21, user_id=7, user_name="Crow", guild_id=1, role="user", content="remember this number: 123456789012", channel_policy="sealed_test")
+        self.assertEqual((r1.outcome, r2.outcome), ("inserted", "inserted"))
+        values = [r[0] for r in self.conn.execute("SELECT normalized_value FROM memory_ledger_entries ORDER BY source_sequence").fetchall()]
+        self.assertEqual(values, ["8", "123456789012"])
+
+    def test_explicit_unique_correction_links_and_ambiguous_does_not(self):
+        ledger.shadow_conversation_row(self.conn, row_id=30, user_id=7, user_name="Crow", guild_id=1, role="user", content="remember this number: 731946", channel_policy="sealed_test")
+        linked = ledger.shadow_conversation_row(self.conn, row_id=31, user_id=7, user_name="Crow", guild_id=1, role="user", content="Correction: the number is 284517, not 731946", channel_policy="sealed_test")
+        self.assertEqual(linked.reason_code, "explicit_correction_linked")
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM memory_ledger_lineage WHERE lineage_type='correction_of'").fetchone()[0], 1)
+        ledger.shadow_conversation_row(self.conn, row_id=32, user_id=7, user_name="Crow", guild_id=1, role="user", content="remember this number: 111", channel_policy="sealed_test")
+        ledger.shadow_conversation_row(self.conn, row_id=33, user_id=7, user_name="Crow", guild_id=1, role="user", content="remember this number: 111", channel_policy="sealed_test")
+        unresolved = ledger.shadow_conversation_row(self.conn, row_id=34, user_id=7, user_name="Crow", guild_id=1, role="user", content="replace 111 with 222", channel_policy="sealed_test")
+        self.assertEqual(unresolved.reason_code, "unresolved_correction_target")
 
     def test_shadow_gate_default_disabled(self):
         with mock.patch.dict(os.environ, {}, clear=True):

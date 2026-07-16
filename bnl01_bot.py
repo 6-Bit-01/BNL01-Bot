@@ -22,10 +22,13 @@ from bnl_canon_source_contract import (
     strip_queue_sections,
 )
 from bnl_memory_ledger import (
+    LedgerWriteResult,
     build_memory_ledger_evaluation,
     ensure_memory_ledger_schema,
     shadow_broadcast_memory_row,
     shadow_conversation_row,
+    record_shadow_receipt,
+    shadow_broadcast_status_event,
     shadow_enabled as memory_ledger_shadow_enabled,
     shadow_memory_tier_row,
     shadow_relationship_journal_row,
@@ -4365,20 +4368,38 @@ def init_db():
     logging.info("✅ Database initialized successfully.")
 
 
-def _shadow_memory_ledger_write(writer_name: str, callback):
+def _shadow_memory_ledger_write(writer_name: str, callback, *, guild_id: int = 0, source_table: str = "unknown", source_row_id: int | str = "", source_revision: str = "", source_event_key: str = ""):
     if not memory_ledger_shadow_enabled():
         return None
+    conn = None
     try:
         conn = sqlite3.connect(DB_FILE)
+        result = callback(conn)
+        if not isinstance(result, LedgerWriteResult):
+            result = LedgerWriteResult(entry_id=str(result or ""), outcome="inserted" if result else "skipped", reason_code="legacy_adapter_result", source_table=source_table, source_row_id=str(source_row_id), source_revision=source_revision, source_event_key=source_event_key, guild_id=int(guild_id or 0))
         try:
-            result = callback(conn)
-            conn.commit()
-            return result
-        finally:
-            conn.close()
+            record_shadow_receipt(
+                conn, guild_id=result.guild_id or int(guild_id or 0), writer=writer_name, source_table=result.source_table or source_table,
+                source_row_id=result.source_row_id or source_row_id, source_revision=result.source_revision or source_revision,
+                source_event_key=result.source_event_key or source_event_key, outcome=result.outcome, reason_code=result.reason_code, entry_id=result.entry_id,
+            )
+        except Exception as receipt_exc:
+            logging.debug("memory_ledger_shadow_receipt_failed writer=%s error=%s", writer_name, receipt_exc)
+        conn.commit()
+        return result
     except Exception as exc:
         logging.debug("memory_ledger_shadow_write_failed writer=%s error=%s", writer_name, exc)
+        try:
+            if conn is None:
+                conn = sqlite3.connect(DB_FILE)
+            record_shadow_receipt(conn, guild_id=int(guild_id or 0), writer=writer_name, source_table=source_table, source_row_id=source_row_id, source_revision=source_revision, source_event_key=source_event_key, outcome="error", reason_code="shadow_exception", entry_id="")
+            conn.commit()
+        except Exception as receipt_exc:
+            logging.debug("memory_ledger_shadow_error_receipt_failed writer=%s error=%s", writer_name, receipt_exc)
         return None
+    finally:
+        if conn is not None:
+            conn.close()
 
 def _truncate_user_facts(user_id: int, guild_id: int, max_rows: int = MAX_FACTS_PER_USER):
     conn = sqlite3.connect(DB_FILE)
@@ -4451,6 +4472,7 @@ def upsert_user_fact(user_id: int, guild_id: int, fact_key: str, fact_value: str
     _shadow_memory_ledger_write(
         "user_memory_facts",
         lambda ledger_conn: shadow_user_fact_row(ledger_conn, row_id=fact_row_id, user_id=user_id, guild_id=guild_id, fact_key=fact_key, fact_value=fact_value, confidence=confidence, updated_at=now),
+        guild_id=guild_id, source_table="user_memory_facts", source_row_id=fact_row_id, source_revision=f"rev:{fact_row_id}:{now.lower()}",
     )
     _truncate_user_facts(user_id, guild_id, MAX_FACTS_PER_USER)
 
@@ -4577,6 +4599,7 @@ def add_relationship_journal(user_id: int, guild_id: int, entry_type: str, summa
     _shadow_memory_ledger_write(
         "relationship_journal",
         lambda ledger_conn: shadow_relationship_journal_row(ledger_conn, row_id=row_id, user_id=user_id, guild_id=guild_id, entry_type=entry_type, summary=summary[:220], timestamp=now),
+        guild_id=guild_id, source_table="relationship_journal", source_row_id=row_id, source_revision=str(row_id),
     )
 
 def get_relationship_journal(user_id: int, guild_id: int, limit: int = 5):
@@ -4840,6 +4863,7 @@ def _add_memory_tier_entry(user_id: int, guild_id: int, tier: str, summary: str,
         _shadow_memory_ledger_write(
             "memory_tiers",
             lambda ledger_conn: shadow_memory_tier_row(ledger_conn, row_id=row_id, user_id=user_id, guild_id=guild_id, tier=tier, summary=summary, salience=salience, channel_policy=source_channel_policy, topic_key=_memory_topic_key(summary), updated_at=datetime.now(PACIFIC_TZ).isoformat()),
+            guild_id=guild_id, source_table="memory_tiers", source_row_id=row_id, source_revision=f"rev:{row_id}",
         )
 
 
@@ -4865,14 +4889,17 @@ def _merge_or_insert_cluster(cursor, user_id: int, guild_id: int, tier: str, row
     if compatible:
         target = compatible[0]
         cursor.execute("UPDATE memory_tiers SET summary=?, salience=MAX(salience, ?), mentions=mentions + ?, updated_at=?, last_seen=?, lifecycle_note=? WHERE id=?", (summary, sal, mentions, now, now, lifecycle_note, target["id"]))
+        return {"row_id": target["id"], "summary": summary, "salience": sal, "tier": tier, "topic_key": topic_key, "updated_at": now, "derived_from_rows": tuple(int(r.get("id") or 0) for r in rows if r.get("id"))}
     else:
         first = rows[0]
-        _insert_memory_tier(cursor, user_id, guild_id, tier, summary, sal, mentions=mentions, source_role="consolidation", source_channel_policy=first.get("source_channel_policy") or "consolidated", source_channel_name="", source_origin=lifecycle_note, source_trust=source_trust, topic_key=topic_key, subject_key=first.get("subject_key") or "", project_key=first.get("project_key") or "", lifecycle_note=lifecycle_note)
+        row_id = _insert_memory_tier(cursor, user_id, guild_id, tier, summary, sal, mentions=mentions, source_role="consolidation", source_channel_policy=first.get("source_channel_policy") or "consolidated", source_channel_name="", source_origin=lifecycle_note, source_trust=source_trust, topic_key=topic_key, subject_key=first.get("subject_key") or "", project_key=first.get("project_key") or "", lifecycle_note=lifecycle_note)
+        return {"row_id": row_id, "summary": summary, "salience": sal, "tier": tier, "topic_key": topic_key, "updated_at": now, "derived_from_rows": tuple(int(r.get("id") or 0) for r in rows if r.get("id"))}
 
 
 def _consolidate_memory_tiers(user_id: int, guild_id: int, limits: dict | None = None) -> dict:
     limits = limits or calculate_adaptive_memory_limits(user_id, guild_id)
     result = {"short_to_medium": 0, "medium_to_long": 0, "aged_out": 0, "merged_topics": [], "limits": limits}
+    shadow_tier_events = []
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
     cols = _memory_tiers_columns(cursor)
@@ -4887,7 +4914,9 @@ def _consolidate_memory_tiers(user_id: int, guild_id: int, limits: dict | None =
             buckets[(topic, group)].append(r)
         for (topic, _group), rows in buckets.items():
             trust = _consolidated_trust_for(rows)
-            _merge_or_insert_cluster(cursor, user_id, guild_id, "medium", rows, topic, trust, "consolidated_short_to_medium")
+            shadow_event = _merge_or_insert_cluster(cursor, user_id, guild_id, "medium", rows, topic, trust, "consolidated_short_to_medium")
+            if shadow_event:
+                shadow_tier_events.append(shadow_event)
             result["short_to_medium"] += len(rows); result["merged_topics"].append(topic)
         cursor.executemany("DELETE FROM memory_tiers WHERE id=?", [(r["id"],) for r in overflow])
 
@@ -4907,7 +4936,9 @@ def _consolidate_memory_tiers(user_id: int, guild_id: int, limits: dict | None =
             confirmed = any(any(k in (r.get("summary") or "").lower() for k in ("remember", "confirmed", "owner-confirmed", "this matters", "keep this")) for r in rows)
             safe = _memory_visibility_group(rows[0].get("source_trust", ""), rows[0].get("source_channel_policy", "")) != "sealed_test"
             if safe and (repeated or high_salience or confirmed):
-                _merge_or_insert_cluster(cursor, user_id, guild_id, "long", rows, topic, _consolidated_trust_for(rows), "crystallized_medium_to_long")
+                shadow_event = _merge_or_insert_cluster(cursor, user_id, guild_id, "long", rows, topic, _consolidated_trust_for(rows), "crystallized_medium_to_long")
+                if shadow_event:
+                    shadow_tier_events.append(shadow_event)
                 result["medium_to_long"] += len(rows); result["merged_topics"].append(topic)
                 promoted_ids.update(r["id"] for r in rows)
             elif not safe or max(float(r.get("salience") or 0.0) for r in rows) < 0.55:
@@ -4925,6 +4956,20 @@ def _consolidate_memory_tiers(user_id: int, guild_id: int, limits: dict | None =
     result["aged_out"] += max(0, len(_fetch_tier_rows(cursor, user_id, guild_id, "long")) - limits["long"])
     conn.commit()
     conn.close()
+    for event in shadow_tier_events:
+        row_id = int(event.get("row_id") or 0)
+        if not row_id:
+            continue
+        _shadow_memory_ledger_write(
+            "memory_tiers_consolidation",
+            lambda ledger_conn, event=event, row_id=row_id: shadow_memory_tier_row(
+                ledger_conn, row_id=row_id, user_id=user_id, guild_id=guild_id, tier=event.get("tier") or "",
+                summary=event.get("summary") or "", salience=float(event.get("salience") or 0.5), topic_key=event.get("topic_key") or "",
+                updated_at=event.get("updated_at") or datetime.now(PACIFIC_TZ).isoformat(),
+                derived_from_entry_ids=tuple(f"mle_derived_source_row_{rid}" for rid in event.get("derived_from_rows") or ()),
+            ),
+            guild_id=guild_id, source_table="memory_tiers", source_row_id=row_id, source_revision=f"rev:{row_id}:{str(event.get('updated_at') or '').lower()}",
+        )
     LAST_MEMORY_LIFECYCLE_RESULT[(user_id, guild_id)] = result
     return result
 
@@ -9423,6 +9468,7 @@ def save_user_message(user_id: int, user_name: str, guild_id: int, content: str,
             content=content, channel_name=(channel_name or "").lower()[:80], channel_policy=(channel_policy or "unknown")[:40],
             channel_id=int(channel_id or 0), message_id=int(message_id or 0) or None, route_mode=route_mode, observed_at=observed_at,
         ),
+        guild_id=guild_id, source_table="conversations", source_row_id=row_id, source_revision=str(row_id),
     )
     try:
         mark_subject_dirty_for_evidence(
@@ -9486,10 +9532,11 @@ def save_model_message(user_id: int, guild_id: int, content: str, channel_name: 
     _shadow_memory_ledger_write(
         "conversations_model",
         lambda ledger_conn: shadow_conversation_row(
-            ledger_conn, row_id=row_id, user_id=user_id, user_name="BNL-01", guild_id=guild_id, role="model",
+            ledger_conn, row_id=row_id, user_id=user_id, user_name="", guild_id=guild_id, role="model",
             content=content, channel_name=(channel_name or "").lower()[:80], channel_policy=(channel_policy or "unknown")[:40],
             channel_id=int(channel_id or 0), message_id=None, route_mode=route_mode, observed_at=observed_at,
         ),
+        guild_id=guild_id, source_table="conversations", source_row_id=row_id, source_revision=str(row_id),
     )
     prune_conversation_history(user_id, guild_id, calculate_adaptive_memory_limits(user_id, guild_id, route_mode=route_mode, channel_policy=channel_policy, user_text=content).get("conversation_rows", MAX_CONVERSATION_ROWS_PER_USER))
     if decision.update_relationship:
@@ -10524,6 +10571,7 @@ def add_broadcast_memory_entry(guild_id: int, message: discord.Message, processe
             submitted_by_user_id=getattr(getattr(message, "author", None), "id", None), submitted_by_name=getattr(getattr(message, "author", None), "display_name", "system"),
             created_at=now,
         ),
+        guild_id=guild_id, source_table="broadcast_memory", source_row_id=int(new_id or 0), source_revision=f"rev:{int(new_id or 0)}:{now.lower()}",
     )
     return int(new_id or 0)
 
@@ -11029,9 +11077,16 @@ def _set_broadcast_memory_status(memory_id: int, status: str, actor_id: int, act
         """,
         (status, now_iso, actor_id, actor_name, reason[:200], memory_id),
     )
-    conn.commit()
     changed = cursor.rowcount
+    row = cursor.execute("SELECT guild_id, superseded_by_id FROM broadcast_memory WHERE id=?", (memory_id,)).fetchone()
+    conn.commit()
     conn.close()
+    if changed and row:
+        _shadow_memory_ledger_write(
+            "broadcast_memory_status",
+            lambda ledger_conn: shadow_broadcast_status_event(ledger_conn, row_id=memory_id, guild_id=int(row[0] or 0), status=status, updated_at=now_iso, actor_id=actor_id, actor_name=actor_name, superseded_by_id=row[1]),
+            guild_id=int(row[0] or 0), source_table="broadcast_memory", source_row_id=memory_id, source_revision=f"event:status:{status}:{now_iso.lower()}", source_event_key=f"status:{status}",
+        )
     return int(changed or 0)
 
 async def process_broadcast_memory_note(message) -> dict:
@@ -17125,8 +17180,19 @@ async def on_message(message: discord.Message):
             cursor = conn.cursor()
             cursor.execute("UPDATE broadcast_memory SET supersedes_id=?, corrected_by_user_id=?, corrected_by_name=?, correction_reason=? WHERE id=?", (target_id, message.author.id, message.author.display_name, "replacement", new_id))
             cursor.execute("UPDATE broadcast_memory SET superseded_by_id=?, updated_at=? WHERE id=?", (new_id, datetime.now(PACIFIC_TZ).isoformat(), target_id))
+            updated_at = datetime.now(PACIFIC_TZ).isoformat()
             conn.commit()
             conn.close()
+            _shadow_memory_ledger_write(
+                "broadcast_memory_replacement",
+                lambda ledger_conn: shadow_broadcast_memory_row(
+                    ledger_conn, row_id=int(new_id or 0), guild_id=message.guild.id, cleaned_summary=processed.get("cleaned_summary", ""),
+                    entry_type=processed.get("entry_type", target_type), public_safe=bool(processed.get("public_safe")), status="active",
+                    usage_scope=processed.get("usage_scope", "internal"), submitted_by_user_id=message.author.id, submitted_by_name=message.author.display_name,
+                    created_at=updated_at, updated_at=updated_at, supersedes_id=target_id,
+                ),
+                guild_id=message.guild.id, source_table="broadcast_memory", source_row_id=int(new_id or 0), source_revision=f"rev:{int(new_id or 0)}:{updated_at.lower()}",
+            )
             await message.reply(f"Corrected broadcast memory: resolved/superseded id {target_id} and added replacement id {new_id} for {processed.get('episode_date')}.")
             return
         processed_entries = await process_broadcast_memory_notes(message)
