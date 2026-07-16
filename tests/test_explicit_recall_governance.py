@@ -133,11 +133,15 @@ class RememberDirectiveExtractionTests(unittest.TestCase):
     def facts(self, text):
         return bnl01_bot.extract_user_facts(text)
 
-    def test_negative_interrogatives_create_no_user_note_and_greetings_unchanged(self):
+    def test_negative_interrogatives_create_no_remember_derived_facts_and_greetings_unchanged(self):
         negatives = [
+            "do you remember the number 8?",
+            "can you remember this number: 731946?",
+            "what number did I tell you to remember, 8?",
+            "why don’t you remember number 8?",
+            "do you remember X?",
             "what do you remember about me?",
             "what do you remember?",
-            "do you remember X?",
             "what number did I tell you to remember?",
             "what numbers did I ask you to remember?",
             "do you remember the number?",
@@ -145,8 +149,10 @@ class RememberDirectiveExtractionTests(unittest.TestCase):
             "what number did I ask you to remember?",
             "why don’t you remember X?",
         ]
+        remember_derived_keys = {"remembered_number", "user_note"}
         for text in negatives:
-            self.assertFalse(any(k == "user_note" for k, _v, _c in self.facts(text)), text)
+            facts = self.facts(text)
+            self.assertFalse(any(k in remember_derived_keys for k, _v, _c in facts), text)
         self.assertEqual(self.facts("hello BNL"), [])
 
     def test_exact_remember_number_production_phrases_create_only_remembered_number(self):

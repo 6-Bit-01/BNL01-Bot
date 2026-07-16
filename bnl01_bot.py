@@ -11906,25 +11906,26 @@ def extract_user_facts(text: str):
         if subject and raw_value:
             facts.append((f"favorite_{subject[:30]}", raw_value[:120], 0.88))
 
-    remembered_number = re.search(
-        r"\b(?:please\s+)?remember\s+(?:(?:that\s+)?(?:(?:this|the)\s+)?number\s*(?::|-|is)?|this\s*:)\s*(\d{1,12})(?!\d)\b",
-        content,
-        flags=re.IGNORECASE,
-    )
-    if remembered_number:
-        facts.append(("remembered_number", remembered_number.group(1), 0.9))
-
-    directive_note = None
-    directive_patterns = (
-        r"\b(?:please\s+)?remember\s+(?:this\s*:|that\s+)([^.!?\n]{3,140})",
-        r"\b(?:please\s+)?remember\s+((?:my|i\s+prefer|i\s+like|i\s+want|i\s+need|i\s+am|i'm|[0-9])[^.!?\n]{2,140})",
-    )
     interrogative_remember = (
         re.search(r"\?\s*$", content)
         or re.search(r"\b(?:what|do|did|can|why|how|when|where|who)\b[^.!?\n]{0,80}\bremember\b", lower, flags=re.IGNORECASE)
         or re.search(r"\bremember\b[^.!?\n]{0,80}\?", lower, flags=re.IGNORECASE)
     )
+
+    remembered_number = None
+    directive_note = None
+    directive_patterns = (
+        r"\b(?:please\s+)?remember\s+(?:this\s*:|that\s+)([^.!?\n]{3,140})",
+        r"\b(?:please\s+)?remember\s+((?:my|i\s+prefer|i\s+like|i\s+want|i\s+need|i\s+am|i'm|[0-9])[^.!?\n]{2,140})",
+    )
     if not interrogative_remember:
+        remembered_number = re.search(
+            r"\b(?:please\s+)?remember\s+(?:(?:that\s+)?(?:(?:this|the)\s+)?number\s*(?::|-|is)?|this\s*:)\s*(\d{1,12})(?!\d)\b",
+            content,
+            flags=re.IGNORECASE,
+        )
+        if remembered_number:
+            facts.append(("remembered_number", remembered_number.group(1), 0.9))
         for pattern in directive_patterns:
             m = re.search(pattern, content, flags=re.IGNORECASE)
             if m:
