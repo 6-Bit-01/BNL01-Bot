@@ -45,7 +45,7 @@ WEIGHTS: dict[str, dict[str, float]] = {
 }
 POSITIVE_MODEL_BLOCKED = {"rapport", "trust", "familiarity", "playfulness", "support", "mutuality"}
 PUBLIC_POLICIES = {"public_home", "public_context", "public_selective"}
-ELIGIBLE_RELATIONSHIP_POLICIES = PUBLIC_POLICIES | {"sealed_test"}
+ELIGIBLE_RELATIONSHIP_POLICIES = PUBLIC_POLICIES
 RELATIONSHIP_LIVE_ROUTES = {"normal_chat", "tagged", "active_batch"}
 DISALLOWED_RELATIONSHIP_ROUTES = {"relay", "website_relay_event", "ambient", "operator_command", "direct_payload_task", "show_status"}
 SIMPLE_GREETING_RE = re.compile(r"^\s*(hi|hello|hey|yo|sup|gm|good morning)[!. ]*\s*$", re.I)
@@ -73,7 +73,7 @@ def parse_utc(value: Any) -> datetime:
             return dt.astimezone(timezone.utc) if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
         except ValueError:
             continue
-    return datetime.now(timezone.utc).replace(microsecond=0)
+    return datetime(1970, 1, 1, tzinfo=timezone.utc)
 def stable_event_id(*, guild_id: int, subject_user_id: int, source_table: str, source_row_id: int | str, event_type: str, observed_at: str = "") -> str:
     return "relv2_" + _hash(SCHEMA_VERSION, guild_id, subject_user_id, source_table, source_row_id, event_type, observed_at)
 
@@ -120,11 +120,20 @@ def ensure_relationship_v2_schema(conn: sqlite3.Connection) -> None:
     cur.execute("""CREATE TABLE IF NOT EXISTS relationship_event_ledger_links_v2 (
         event_id TEXT NOT NULL, guild_id INTEGER NOT NULL, subject_user_id INTEGER NOT NULL, ledger_entry_id TEXT NOT NULL,
         created_at TEXT NOT NULL, PRIMARY KEY(event_id, ledger_entry_id))""")
+    cur.execute("""CREATE TABLE IF NOT EXISTS relationship_observation_diagnostics_v2 (
+        diagnostic_id TEXT PRIMARY KEY, schema_version TEXT NOT NULL, guild_id INTEGER NOT NULL, subject_user_id INTEGER NOT NULL,
+        subject_key TEXT NOT NULL, actor_role TEXT NOT NULL, rejection_reason TEXT NOT NULL, route_mode TEXT DEFAULT 'unknown',
+        channel_policy TEXT DEFAULT 'unknown', source_table TEXT DEFAULT 'unknown', source_row_id TEXT DEFAULT '', observed_at TEXT NOT NULL, created_at TEXT NOT NULL)""")
+    cur.execute("""CREATE TABLE IF NOT EXISTS relationship_event_moment_links_v2 (
+        event_id TEXT NOT NULL, moment_id TEXT NOT NULL, guild_id INTEGER NOT NULL, subject_user_id INTEGER NOT NULL, lifecycle TEXT DEFAULT 'active',
+        created_at TEXT NOT NULL, updated_at TEXT NOT NULL, PRIMARY KEY(event_id, moment_id))""")
     for sql in (
         "CREATE INDEX IF NOT EXISTS idx_relv2_events_subject ON relationship_events_v2(guild_id, subject_user_id, lifecycle, observed_at)",
         "CREATE INDEX IF NOT EXISTS idx_relv2_events_source ON relationship_events_v2(guild_id, source_table, source_row_id)",
         "CREATE INDEX IF NOT EXISTS idx_relv2_shadow_subject ON relationship_engagement_shadow_runs(guild_id, subject_user_id, created_at)",
         "CREATE INDEX IF NOT EXISTS idx_relv2_links_subject ON relationship_event_ledger_links_v2(guild_id, subject_user_id)",
+        "CREATE INDEX IF NOT EXISTS idx_relv2_diag_subject ON relationship_observation_diagnostics_v2(guild_id, subject_user_id, rejection_reason)",
+        "CREATE INDEX IF NOT EXISTS idx_relv2_moment_subject ON relationship_event_moment_links_v2(guild_id, subject_user_id, lifecycle)",
     ): cur.execute(sql)
 
 @dataclass(frozen=True)
@@ -142,8 +151,6 @@ class RelationshipEventV2:
 def classify_message(text: str, *, actor_role: str, directed: bool, channel_policy: str, route_mode: str) -> tuple[str, str, float, float]:
     t = _canon(text)
     if actor_role != "user":
-        if re.search(r"\b(friendly rival|rival mode|playful rivalry|nemesis accepted)\b", t):
-            return "model_playful_rivalry_acceptance", "model audit: playful-rivalry policy acceptance provenance", .3, 0.0
         return "model_audit", "model output recorded for audit with zero positive relationship weight", .3, 0.0
     if not directed or channel_policy not in ELIGIBLE_RELATIONSHIP_POLICIES or route_mode in DISALLOWED_RELATIONSHIP_ROUTES:
         return "unclassified", "passive or route-ineligible message; no relationship evidence", .0, 0.0
@@ -152,6 +159,7 @@ def classify_message(text: str, *, actor_role: str, directed: bool, channel_poli
         ("explicit_engagement_opt_in", r"\b(re-enable proactive|enable proactive|you can follow up again|opt me back in)\b"),
         ("explicit_relationship_mode_preference", r"\b(opt in|i want|enable|prefer)\b.{0,40}\b(friendly rival|rival mode|playful rivalry|nemesis)\b"),
         ("boundary", r"\b(stop|don'?t|do not)\b.{0,50}\b(joke|tease|call me|bring that up|follow up|recognize me|rival)\b"),
+        ("boundary_respected", r"\b(you can|it is ok to|okay to|allowed to)\b.{0,50}\b(joke|tease|rival|follow up|recognize me)\b"),
         ("repair_accepted", r"\b(we'?re good|we are good|all good|apology accepted|thanks for fixing|that helps)\b"),
         ("apology", r"\b(i'?m sorry|my bad|apologize)\b"), ("repair_attempt", r"\b(let'?s fix|let us fix|can we reset|repair|make it right)\b"),
         ("appreciation", r"\b(thanks|thank you|appreciate|grateful)\b"), ("constructive_collaboration", r"\b(let'?s|we should|can we|help me build|work together|collaborate)\b"),
@@ -186,15 +194,27 @@ def record_event(conn: sqlite3.Connection, event: RelationshipEventV2) -> str:
     if et == "explicit_engagement_opt_out": _set_pref(conn, guild_id=event.guild_id, user_id=event.subject_user_id, key="proactive", value="disabled", source_event_id=event.event_id)
     if et == "explicit_engagement_opt_in": _set_pref(conn, guild_id=event.guild_id, user_id=event.subject_user_id, key="proactive", value="enabled", source_event_id=event.event_id)
     if et == "explicit_relationship_mode_preference": _set_pref(conn, guild_id=event.guild_id, user_id=event.subject_user_id, key="playful_rivalry_opt_in", value="enabled", source_event_id=event.event_id)
-    if et != "unclassified": project_event_to_ledger(conn, event)
+    if event.actor_role == "user" and event.lifecycle == "active" and et not in {"unclassified"}: project_event_to_ledger(conn, event)
     return event.event_id
+
+def record_observation_diagnostic(conn: sqlite3.Connection, *, guild_id: int, user_id: int, role: str, reason: str, source_row_id: int | str, route_mode: str, channel_policy: str, observed_at: str = "", source_table: str = "conversations") -> str:
+    ensure_relationship_v2_schema(conn); obs = parse_utc(observed_at or _now()).isoformat(); did = "reldiag_" + _hash(guild_id, user_id, role, reason, source_table, source_row_id, obs)
+    conn.execute("INSERT OR IGNORE INTO relationship_observation_diagnostics_v2 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", (did, SCHEMA_VERSION, guild_id, user_id, subject_key_for_user(user_id), role, reason, route_mode, channel_policy, source_table, str(source_row_id), obs, _now()))
+    return did
 
 def observe_message(conn: sqlite3.Connection, *, guild_id: int, user_id: int, role: str, content: str, source_row_id: int | str, user_name: str = "", channel_policy: str = "unknown", channel_name: str = "", channel_id: int = 0, message_id: int | None = None, route_mode: str = "unknown", directed: bool = False, observed_at: str = "") -> str:
     et, summary, conf, sal = classify_message(content, actor_role=role, directed=directed, channel_policy=channel_policy, route_mode=route_mode)
-    if et == "unclassified" and role == "user": return ""
+    if et == "unclassified" and role == "user":
+        reason = "sealed_test" if channel_policy == "sealed_test" else ("passive" if not directed else "policy_or_route_or_ambiguous")
+        record_observation_diagnostic(conn, guild_id=guild_id, user_id=user_id, role=role, reason=reason, source_row_id=source_row_id, route_mode=route_mode, channel_policy=channel_policy, observed_at=observed_at)
+        return ""
     lifecycle = "review_only" if et == "model_audit" else "active"
     ev = RelationshipEventV2(guild_id, user_id, role, et, "user_to_bnl" if role == "user" else "bnl_to_user", "conversations", source_row_id, summary, message_id, route_mode, channel_id, channel_name, channel_policy, "private", "derived_relationship", conf, sal, observed_at=parse_utc(observed_at or _now()).isoformat(), lifecycle=lifecycle)
     eid = record_event(conn, ev); rebuild_state(conn, guild_id=guild_id, subject_user_id=user_id, evaluated_at=observed_at or _now()); return eid
+
+def record_model_playful_rivalry_acceptance(conn: sqlite3.Connection, *, guild_id: int, user_id: int, source_row_id: int | str, route_mode: str = "normal_chat", channel_policy: str = "public_home", observed_at: str = "") -> str:
+    ev = RelationshipEventV2(guild_id, user_id, "model", "model_playful_rivalry_acceptance", "bnl_to_user", "controlled_relationship_policy", source_row_id, "controlled policy acceptance provenance", route_mode=route_mode, channel_policy=channel_policy, visibility="private", authority="controlled_policy", confidence=.8, salience=0, observed_at=parse_utc(observed_at or _now()).isoformat(), lifecycle="active")
+    return record_event(conn, ev)
 
 def project_event_to_ledger(conn: sqlite3.Connection, event: RelationshipEventV2) -> str:
     # Relationship interpretations are derived personal state: never public usable, never live recall facts.
@@ -274,11 +294,13 @@ def governed_summary(conn: sqlite3.Connection, *, guild_id: int, user_id: int, r
     row=conn.execute("SELECT rapport,trust,familiarity,friction,support,repair,relationship_stage,rivalry_state,engagement_opt_out FROM relationship_state_v2 WHERE guild_id=? AND subject_user_id=?", (guild_id,user_id)).fetchone()
     if not row: return ""
     rapport, trust, fam, fric, support, repair, stage, rivalry, opt = row
-    safe = [f"Relationship calibration for current member only: stage={stage}", f"rapport={rapport:.2f}", f"familiarity={fam:.2f}"]
-    if opt or not settings["proactive_enabled"]: safe.append("proactive engagement disabled")
-    if rivalry == "mutual_rivalry" and settings["playful_rivalry_enabled"] and not opt: safe.append("mutual playful-rivalry style allowed only if user continues it")
-    if fric > .05 or repair > .05: safe.append(f"repair/friction calibration={repair:.2f}/{fric:.2f}")
-    return "; ".join(safe)[:500]
+    tone = "familiar" if fam >= .15 else "lightly familiar" if fam > .05 else "new/low-history"
+    warmth = "warm" if rapport >= .15 else "neutral-warm" if rapport > .03 else "neutral"
+    safe = [f"Private relationship calibration for current member only: use a {warmth}, {tone} tone.", "Do not mention internal relationship state, labels, scores, or evidence."]
+    if opt or not settings["proactive_enabled"]: safe.append("Do not proactively recognize or follow up with this member.")
+    if rivalry == "mutual_rivalry" and settings["playful_rivalry_enabled"] and not opt: safe.append("Playful rivalry is allowed only if the member continues it in the current turn.")
+    if fric > .05 or repair > .05: safe.append("Prefer careful repair-aware wording; do not relitigate the old friction.")
+    return " ".join(safe)[:500]
 
 
 def _open_loop_count(conn: sqlite3.Connection, *, guild_id: int, user_id: int) -> int:
@@ -295,7 +317,7 @@ def _compatible_moment_count(conn: sqlite3.Connection, *, guild_id: int, user_id
     except sqlite3.OperationalError:
         return 0
 
-def plan_engagement(conn: sqlite3.Connection, *, guild_id: int, user_id: int, candidate_type: str, route_mode: str, channel_policy: str, current_direct: bool, now: str = "", source_visibility: str = "public", actual_emit: bool = False) -> dict[str, Any]:
+def plan_engagement(conn: sqlite3.Connection, *, guild_id: int, user_id: int, candidate_type: str, route_mode: str, channel_policy: str, current_direct: bool, now: str = "", source_visibility: str = "public", send_authorized: bool = False) -> dict[str, Any]:
     ensure_relationship_v2_schema(conn); now_dt=parse_utc(now or _now()); settings=get_member_settings(conn,guild_id=guild_id,user_id=user_id); withheld=[]; errors=[]
     state=rebuild_state(conn,guild_id=guild_id,subject_user_id=user_id,evaluated_at=now_dt.isoformat())
     open_loops = _open_loop_count(conn, guild_id=guild_id, user_id=user_id); moments = _compatible_moment_count(conn, guild_id=guild_id, user_id=user_id, channel_policy=channel_policy)
@@ -309,27 +331,51 @@ def plan_engagement(conn: sqlite3.Connection, *, guild_id: int, user_id: int, ca
     if candidate_type == "dormant_signal_echo": withheld.append("dormant_echo_off_by_default")
     allowed_types={"recognition","open_loop_follow_up","repair_acknowledgement","support_follow_up","curiosity_question","dormant_signal_echo"}
     if candidate_type not in allowed_types: withheld.append("unknown_candidate")
-    emitted_recent = conn.execute("SELECT COUNT(*) FROM relationship_engagement_shadow_runs WHERE guild_id=? AND subject_user_id=? AND candidate_type=? AND actual_emitted=1", (guild_id,user_id,candidate_type)).fetchall()
-    recent_block = False
-    for (cnt,) in emitted_recent:
-        if cnt: recent_block = True
+    window_start = (now_dt.timestamp() - 86400.0)
+    emitted_rows = conn.execute("SELECT created_at FROM relationship_engagement_shadow_runs WHERE guild_id=? AND subject_user_id=? AND candidate_type=? AND actual_emitted=1", (guild_id,user_id,candidate_type)).fetchall()
+    recent_block = any(window_start <= parse_utc(created).timestamp() <= now_dt.timestamp() for (created,) in emitted_rows)
     if recent_block: withheld.append("per_user_live_cooldown")
-    sim_recent = int(conn.execute("SELECT COUNT(*) FROM relationship_engagement_shadow_runs WHERE guild_id=? AND subject_user_id=? AND candidate_type=? AND created_at<=? AND created_at>=?", (guild_id,user_id,candidate_type,now_dt.isoformat(), (now_dt.replace(hour=0, minute=0, second=0, microsecond=0)).isoformat())).fetchone()[0])
+    sim_recent = int(conn.execute("SELECT COUNT(*) FROM relationship_engagement_shadow_runs WHERE guild_id=? AND subject_user_id=? AND candidate_type=? AND actual_emitted=0 AND created_at<=? AND created_at>=?", (guild_id,user_id,candidate_type,now_dt.isoformat(), (now_dt.replace(hour=0, minute=0, second=0, microsecond=0)).isoformat())).fetchone()[0])
     policy_eligible = not withheld
     would_select = policy_eligible
-    live_allowed = would_select and active_engagement_live_enabled()
-    actual_emitted = bool(actual_emit and live_allowed)
-    if actual_emit and not live_allowed: errors.append("actual_emit_without_live_allowed")
-    run_id="relsr_"+_hash(guild_id,user_id,candidate_type,route_mode,channel_policy,now_dt.isoformat(),withheld,actual_emit)
+    live_allowed = would_select and live_enabled() and active_engagement_live_enabled() and bool(send_authorized)
+    actual_emitted = False
+    run_id="relsr_"+_hash(guild_id,user_id,candidate_type,route_mode,channel_policy,now_dt.isoformat(),withheld,send_authorized)
     conn.execute("""INSERT OR IGNORE INTO relationship_engagement_shadow_runs (run_id,schema_version,guild_id,subject_user_id,subject_key,candidate_type,policy_eligible,would_select,live_emission_allowed,actual_emitted,withheld_reason_codes,route_mode,channel_policy,visibility_decision,cooldown_decision,simulated_cooldown_decision,source_class_counts_json,relevant_open_loop_count,relevant_moment_count,legacy_hash,v2_hash,processing_errors_json,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", (run_id,SCHEMA_VERSION,guild_id,user_id,subject_key_for_user(user_id),candidate_type,1 if policy_eligible else 0,1 if would_select else 0,1 if live_allowed else 0,1 if actual_emitted else 0,json.dumps(sorted(set(withheld))),route_mode,channel_policy,source_visibility,"blocked" if recent_block else "clear","blocked" if sim_recent else "clear",json.dumps({"relationship_events_v2": sum(state.get("evidence_counts", {}).values())}),open_loops,moments,"not_collected",_hash(state),json.dumps(errors),now_dt.isoformat()))
     text="" if candidate_type != "dormant_signal_echo" else "An older remembered signal exists only as past context."
     return {"policy_eligible": policy_eligible, "would_select": would_select, "live_emission_allowed": live_allowed, "actual_emitted": actual_emitted, "withheld_reason_codes": sorted(set(withheld)), "run_id": run_id, "candidate_text": text, "relevant_open_loop_count": open_loops, "relevant_moment_count": moments}
 
 
+def record_engagement_emission(conn: sqlite3.Connection, *, run_id: str, emitted_at: str = "") -> int:
+    ensure_relationship_v2_schema(conn)
+    return conn.execute("UPDATE relationship_engagement_shadow_runs SET actual_emitted=1, live_emission_allowed=1, created_at=? WHERE run_id=? AND live_emission_allowed=1", (parse_utc(emitted_at or _now()).isoformat(), run_id)).rowcount
+
+def refresh_moment_links(conn: sqlite3.Connection, *, guild_id: int | None = None) -> int:
+    ensure_relationship_v2_schema(conn); now=_now(); params=[]; where=""
+    if guild_id is not None:
+        where="AND e.guild_id=?"; params.append(guild_id)
+    conn.execute("UPDATE relationship_event_moment_links_v2 SET lifecycle='retracted', updated_at=?", (now,))
+    try:
+        rows = conn.execute(f"""SELECT e.event_id,w.moment_id,e.guild_id,e.subject_user_id FROM relationship_events_v2 e
+            JOIN relationship_event_ledger_links_v2 l ON l.event_id=e.event_id AND l.guild_id=e.guild_id
+            JOIN memory_moment_members mm ON mm.ledger_entry_id=l.ledger_entry_id
+            JOIN memory_moment_windows w ON w.moment_id=mm.moment_id AND w.guild_id=e.guild_id
+            JOIN memory_moment_participants p ON p.moment_id=w.moment_id AND p.participant_key=e.subject_key
+            WHERE e.lifecycle='active' AND e.actor_role='user' AND w.lifecycle_status='finalized'
+              AND (e.channel_policy NOT LIKE 'public_%' OR w.visibility IN ('public','public_safe')) {where}
+        """, tuple(params)).fetchall()
+    except sqlite3.OperationalError:
+        return 0
+    count=0
+    for event_id, moment_id, gid, uid in rows:
+        count += conn.execute("INSERT OR REPLACE INTO relationship_event_moment_links_v2 VALUES (?,?,?,?,?,?,?)", (event_id, moment_id, gid, uid, "active", now, now)).rowcount
+    return count
+
 def propagate_ledger_lifecycle(conn: sqlite3.Connection, *, guild_id: int, ledger_entry_id: str, lifecycle: str) -> int:
     ensure_relationship_v2_schema(conn); now=_now(); rows=conn.execute("SELECT event_id,subject_user_id FROM relationship_event_ledger_links_v2 WHERE guild_id=? AND ledger_entry_id=?", (guild_id, ledger_entry_id)).fetchall(); count=0
     for eid, uid in rows:
         count += conn.execute("UPDATE relationship_events_v2 SET lifecycle=?, updated_at=? WHERE guild_id=? AND event_id=?", (lifecycle, now, guild_id, eid)).rowcount
+        conn.execute("UPDATE relationship_event_moment_links_v2 SET lifecycle='retracted', updated_at=? WHERE guild_id=? AND event_id=?", (now, guild_id, eid))
         rebuild_state(conn, guild_id=guild_id, subject_user_id=int(uid))
     return count
 
@@ -340,9 +386,12 @@ def build_evaluation_report(conn: sqlite3.Connection, *, guild_id: int | None = 
     lifecycle={r[0]:r[1] for r in conn.execute(f"SELECT lifecycle,COUNT(*) FROM relationship_events_v2 {where} GROUP BY lifecycle", p).fetchall()}
     return {
         "eligible_user_authored_events": one(f"SELECT COUNT(*) FROM relationship_events_v2 {where + (' AND' if where else 'WHERE')} actor_role='user' AND lifecycle='active' AND event_type<>'unclassified'"),
-        "rejected_or_unclassified_user_evidence": by_type.get("unclassified",0), "passive_message_rejections": by_type.get("unclassified",0),
+        "rejected_or_unclassified_user_evidence": one(f"SELECT COUNT(*) FROM relationship_observation_diagnostics_v2 {where}"),
+        "passive_message_rejections": one(f"SELECT COUNT(*) FROM relationship_observation_diagnostics_v2 {where + (' AND' if where else 'WHERE')} rejection_reason='passive'"),
+        "sealed_test_rejections": one(f"SELECT COUNT(*) FROM relationship_observation_diagnostics_v2 {where + (' AND' if where else 'WHERE')} rejection_reason='sealed_test'"),
+        "policy_route_ambiguity_rejections": one(f"SELECT COUNT(*) FROM relationship_observation_diagnostics_v2 {where + (' AND' if where else 'WHERE')} rejection_reason='policy_or_route_or_ambiguous'"),
         "model_audit_events": by_type.get("model_audit",0)+by_type.get("model_playful_rivalry_acceptance",0), "events_by_type": by_type, "lifecycle_exclusions": {k:v for k,v in lifecycle.items() if k in BLOCKED_LIFECYCLES},
-        "moment_linked_events": one(f"SELECT COUNT(*) FROM relationship_events_v2 {where + (' AND' if where else 'WHERE')} moment_id<>''"),
+        "moment_linked_events": one(f"SELECT COUNT(DISTINCT event_id) FROM relationship_event_moment_links_v2 {where + (' AND' if where else 'WHERE')} lifecycle='active'"),
         "cross_guild_member_violations": "not_collected", "visibility_violations": one(f"SELECT COUNT(*) FROM relationship_events_v2 {where + (' AND' if where else 'WHERE')} visibility<>'private'"),
         "policy_eligible_shadow_candidates": one(f"SELECT COUNT(*) FROM relationship_engagement_shadow_runs {where + (' AND' if where else 'WHERE')} policy_eligible=1"),
         "actual_live_emissions": one(f"SELECT COUNT(*) FROM relationship_engagement_shadow_runs {where + (' AND' if where else 'WHERE')} actual_emitted=1"),
@@ -362,6 +411,8 @@ def complete_delete_relationship_v2(conn: sqlite3.Connection, *, guild_id: int, 
         counts["memory_ledger_entries"] = counts.get("memory_ledger_entries",0) + conn.execute("DELETE FROM memory_ledger_entries WHERE guild_id=? AND entry_id=?", (guild_id,eid)).rowcount if _table_exists(conn,"memory_ledger_entries") else counts.get("memory_ledger_entries",0)
         if _table_exists(conn,"memory_ledger_lineage"): counts["memory_ledger_lineage"] = counts.get("memory_ledger_lineage",0) + conn.execute("DELETE FROM memory_ledger_lineage WHERE guild_id=? AND (entry_id=? OR target_entry_id=?)", (guild_id,eid,eid)).rowcount
         if _table_exists(conn,"memory_ledger_participants"): counts["memory_ledger_participants"] = counts.get("memory_ledger_participants",0) + conn.execute("DELETE FROM memory_ledger_participants WHERE guild_id=? AND entry_id=?", (guild_id,eid)).rowcount
+    counts["relationship_event_moment_links_v2"] = conn.execute("DELETE FROM relationship_event_moment_links_v2 WHERE guild_id=? AND subject_user_id=?", (guild_id,user_id)).rowcount
+    counts["relationship_observation_diagnostics_v2"] = conn.execute("DELETE FROM relationship_observation_diagnostics_v2 WHERE guild_id=? AND subject_user_id=?", (guild_id,user_id)).rowcount
     counts["relationship_event_ledger_links_v2"] = conn.execute("DELETE FROM relationship_event_ledger_links_v2 WHERE guild_id=? AND subject_user_id=?", (guild_id,user_id)).rowcount
     counts["relationship_events_v2"] = conn.execute("DELETE FROM relationship_events_v2 WHERE guild_id=? AND subject_user_id=?", (guild_id,user_id)).rowcount
     counts["relationship_state_v2"] = conn.execute("DELETE FROM relationship_state_v2 WHERE guild_id=? AND subject_user_id=?", (guild_id,user_id)).rowcount

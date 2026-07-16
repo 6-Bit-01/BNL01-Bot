@@ -9536,6 +9536,11 @@ def save_user_message(user_id: int, user_name: str, guild_id: int, content: str,
                     channel_id=int(channel_id or 0), message_id=int(message_id or 0) or None, route_mode=route_mode,
                     directed=bool(directed_to_bnl), observed_at=observed_at,
                 )
+                if directed_to_bnl and (channel_policy or "").strip().lower() in PUBLIC_CHAT_POLICIES:
+                    plan_relationship_v2_engagement(
+                        rel_conn, guild_id=guild_id, user_id=user_id, candidate_type="recognition", route_mode=route_mode,
+                        channel_policy=(channel_policy or "unknown")[:40], current_direct=True, now=observed_at,
+                    )
         except Exception as exc:
             logging.debug("relationship_v2_shadow_observe_user_failed error=%s", exc)
     try:
@@ -12149,7 +12154,7 @@ def _memory_row_public_safe(row) -> bool:
     return _memory_visibility_group(trust, policy) == "public_safe"
 
 
-def build_user_memory_context(user_id: int, guild_id: int, route_mode: str = ROUTE_MODE_NORMAL_CHAT, channel_policy: str = "unknown", user_text: str = "", is_owner_or_mod: bool = False) -> str:
+def build_user_memory_context(user_id: int, guild_id: int, route_mode: str = ROUTE_MODE_NORMAL_CHAT, channel_policy: str = "unknown", user_text: str = "", is_owner_or_mod: bool = False, current_direct: bool = False, governance_allowed: bool = False) -> str:
     if route_mode == ROUTE_MODE_SIMPLE_GREETING:
         LAST_MEMORY_PROMPT_DIAGNOSTICS[(user_id, guild_id)] = {"skipped_reason": "simple_greeting", "included": {"short": 0, "medium": 0, "long": 0}}
         return "Memory intentionally skipped for simple greeting."
@@ -12171,7 +12176,7 @@ def build_user_memory_context(user_id: int, guild_id: int, route_mode: str = ROU
             with sqlite3.connect(DB_FILE) as rel_conn:
                 rel_v2 = governed_relationship_v2_summary(
                     rel_conn, guild_id=guild_id, user_id=user_id, target_user_id=user_id, route_mode=route_mode, channel_policy=policy,
-                    simple_greeting=bool(route_mode == ROUTE_MODE_SIMPLE_GREETING), direct=True, governance_allowed=True,
+                    simple_greeting=bool(route_mode == ROUTE_MODE_SIMPLE_GREETING), direct=bool(current_direct), governance_allowed=bool(governance_allowed),
                 )
             if rel_v2:
                 sections.append(rel_v2)
@@ -13717,14 +13722,6 @@ async def generate_dynamic_ambient(guild_id: int, channel_id: int) -> str:
     temporal = get_temporal_context()
     ambient_mode = _select_ambient_mode(guild_id, temporal["show_phase"])
     ambient_broadcast_context = build_scoped_broadcast_memory_context(guild_id, scope="ambient", public_only=True, limit=3)
-    if relationship_v2_shadow_enabled():
-        try:
-            with sqlite3.connect(DB_FILE) as rel_conn:
-                # Shadow-only: evaluate dormant echo policy through the existing ambient path; do not alter prompt or send behavior.
-                plan_relationship_v2_engagement(rel_conn, guild_id=guild_id, user_id=0, candidate_type="dormant_signal_echo", route_mode=ROUTE_MODE_AMBIENT, channel_policy="public_home", current_direct=False)
-        except Exception as exc:
-            logging.debug("relationship_v2_ambient_shadow_plan_failed error=%s", exc)
-
     mode_guidance = {
         "room_observation": "Anchor in a fresh public-room pattern; stay concrete and understated.",
         "memory_echo": "Let memory tint the line, but keep recent public context as the subject.",
@@ -16196,6 +16193,7 @@ def build_user_aware_prompt(
     website_read_model_context: str = "",
     source_context_block: str = "",
     route_mode: str = ROUTE_MODE_NORMAL_CHAT,
+    is_direct_interaction: bool = False,
 ) -> tuple:
     print("BNL DEBUG: build_user_aware_prompt start")
     display_name, preferred_name = get_user_profile(user_id, guild_id)
@@ -16213,7 +16211,7 @@ def build_user_aware_prompt(
     permission_privileged = bool(privileged)
     prompt_operator_authority = permission_privileged and is_operator_authority_context(channel_policy, channel_name)
     public_identity_context = is_public_prompt_context(channel_policy)
-    memory_context = build_user_memory_context(user_id, guild_id, route_mode=route_mode, channel_policy=channel_policy, user_text=clean_content, is_owner_or_mod=prompt_operator_authority)
+    memory_context = build_user_memory_context(user_id, guild_id, route_mode=route_mode, channel_policy=channel_policy, user_text=clean_content, is_owner_or_mod=prompt_operator_authority, current_direct=bool(is_direct_interaction), governance_allowed=bool(memory_governance_live_enabled()))
     broadcast_context = build_broadcast_memory_context(
         guild_id,
         clean_content,
@@ -17917,6 +17915,7 @@ async def on_message(message: discord.Message):
                 website_read_model_context=website_read_model_context,
                 source_context_block=source_context_block,
                 route_mode=route_mode,
+                is_direct_interaction=bool(real_direct_target or is_reply or conversation_plan.should_reply),
             )
             prompt = _build_direct_payload_prompt(prompt, direct_payload_items, direct_content)
             log_response_style(message.guild.id, message.author.id, style_key)
@@ -18152,6 +18151,7 @@ async def on_message(message: discord.Message):
             website_read_model_context=website_read_model_context,
             source_context_block=source_context_block,
             route_mode=route_mode,
+            is_direct_interaction=True,
         )
         prompt = _build_direct_payload_prompt(prompt, direct_payload_items, direct_content)
         log_response_style(message.guild.id, message.author.id, style_key)
@@ -18364,6 +18364,7 @@ async def on_message(message: discord.Message):
             website_read_model_context=website_read_model_context,
             source_context_block=source_context_block,
             route_mode=route_mode,
+            is_direct_interaction=True,
         )
         prompt = _build_direct_payload_prompt(prompt, direct_payload_items, direct_content)
         log_response_style(message.guild.id, message.author.id, style_key)
