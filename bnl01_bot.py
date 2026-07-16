@@ -12155,6 +12155,12 @@ def build_user_memory_context(user_id: int, guild_id: int, route_mode: str = ROU
     return legacy_context
 
 
+def purge_member_memory_caches(user_id: int, guild_id: int) -> None:
+    """Remove in-process member/guild memory diagnostics after complete delete."""
+    for cache in (LAST_MEMORY_LIFECYCLE_RESULT, LAST_MEMORY_PROMPT_DIAGNOSTICS):
+        cache.pop((user_id, guild_id), None)
+
+
 def build_memory_diagnostic_snapshot(user_id: int, guild_id: int, route_mode: str = ROUTE_MODE_NORMAL_CHAT, channel_policy: str = "unknown", user_text: str = "", is_owner_or_mod: bool = False) -> dict:
     limits = calculate_adaptive_memory_limits(user_id, guild_id, route_mode=route_mode, channel_policy=channel_policy, user_text=user_text, is_owner_or_mod=is_owner_or_mod)
     return {
@@ -18483,6 +18489,7 @@ async def memory_complete_delete(interaction: discord.Interaction, confirmation:
     with sqlite3.connect(DB_FILE) as conn:
         result = complete_delete_member_data(conn, guild_id=interaction.guild.id, user_id=interaction.user.id, confirmation=confirmation.strip())
     if result.get("ok"):
+        purge_member_memory_caches(interaction.user.id, interaction.guild.id)
         await interaction.response.send_message(f"✅ Complete delete finished for bot-held personal data in this server. Receipt `{result.get('receipt')}`. This does not delete messages stored by Discord itself.", ephemeral=True)
     else:
         await interaction.response.send_message(f"❌ Complete delete not run: {result.get('reason')}. To confirm, type `DELETE MY BNL DATA {interaction.guild.id}`.", ephemeral=True)

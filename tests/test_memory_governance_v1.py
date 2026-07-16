@@ -1,4 +1,4 @@
-import os, sqlite3, sys, inspect
+import os, sqlite3, sys, inspect, hashlib
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -170,7 +170,7 @@ def test_complete_delete_real_schemas_shared_moment_repeat_receipt_and_rollback(
     assert c.execute("SELECT COUNT(*) FROM conversations WHERE user_id=10").fetchone()[0] == 0
     assert c.execute("SELECT COUNT(*) FROM memory_moment_participants WHERE participant_key=?", (subject_key_for_user(10),)).fetchone()[0] == 0
     assert c.execute("SELECT COUNT(*) FROM memory_moment_participants WHERE participant_key=?", (subject_key_for_user(11),)).fetchone()[0] == 1
-    assert c.execute("SELECT summary,lifecycle_status FROM memory_moment_windows WHERE moment_id='m1'").fetchone() == ('', 'retracted')
+    assert c.execute("SELECT summary,lifecycle_status FROM memory_moment_windows WHERE moment_id='m1'").fetchone() == ('', 'needs_review')
     receipt_row = c.execute("SELECT subject_hash,row_counts_json FROM memory_governance_receipts WHERE action='complete_delete'").fetchone()
     assert str(10) not in receipt_row[0] and 'secret' not in receipt_row[1]
     import json; json.loads(receipt_row[1])
@@ -186,3 +186,80 @@ def test_clearhistory_wording_and_queue_subsystem_untouched_static():
     governance_source = Path('bnl_memory_governance.py').read_text()
     assert 'queue_public_snapshot' not in governance_source
     assert 'payments' not in governance_source and 'playback' not in governance_source and 'availability' not in governance_source
+
+def test_forget_original_removes_active_correction_chain_and_obsolete_correction_rejected():
+    c = make_conn(); insert(c, eid='blue', value='favorite color is blue', pred='favorite_color')
+    original_ref = view_member_memory(c, guild_id=1, user_id=10)[0]['ref']
+    assert correct_member_memory(c, guild_id=1, user_id=10, safe_ref=original_ref, corrected_text='favorite color is green')['ok']
+    # Correcting the obsolete original is rejected, but forgetting through its old ref resolves the chain.
+    assert not correct_member_memory(c, guild_id=1, user_id=10, safe_ref=original_ref, corrected_text='favorite color is red')['ok']
+    assert forget_member_memory(c, guild_id=1, user_id=10, safe_ref=original_ref)['ok']
+    rendered = build_governed_context(c, req(user_text='what is my favorite color?', allowed_source_classes=('first_party_record','owner_correction'))).rendered_context
+    assert 'blue' not in rendered and 'green' not in rendered
+
+
+def test_complete_delete_actual_member_entity_broadcast_and_shadow_tables():
+    c = make_conn(); insert(c, eid='mine', value='delete me', pred='preference')
+    c.execute("CREATE TABLE community_presence (guild_id INTEGER, member_user_id INTEGER, subject_key TEXT, note TEXT)")
+    c.execute("INSERT INTO community_presence VALUES (1,10,'discord_user:10','mine')"); c.execute("INSERT INTO community_presence VALUES (1,11,'discord_user:11','other')")
+    c.execute("CREATE TABLE member_activity_events (guild_id INTEGER, member_user_id TEXT, note TEXT)"); c.execute("INSERT INTO member_activity_events VALUES (1,'10','mine')")
+    c.execute("CREATE TABLE entity_evidence_events (guild_id INTEGER, matched_user_id TEXT, subject_key TEXT, note TEXT)"); c.execute("INSERT INTO entity_evidence_events VALUES (1,'10','x','mine')"); c.execute("INSERT INTO entity_evidence_events VALUES (1,NULL,'discord_user:10','mine2')")
+    for table in ('entity_intelligence_facts','entity_intelligence_edges','entity_activity_rollups','entity_open_questions','entity_profile_snapshots','entity_scouting_queue'):
+        c.execute(f"CREATE TABLE {table} (guild_id INTEGER, subject_key TEXT, fact TEXT)"); c.execute(f"INSERT INTO {table} VALUES (1,'discord_user:10','mine')")
+    c.execute("CREATE TABLE broadcast_memory (guild_id INTEGER, submitted_by_user_id TEXT, submitted_by_name TEXT, corrected_by_user_id TEXT, corrected_by_name TEXT, show_note TEXT)")
+    c.execute("INSERT INTO broadcast_memory VALUES (1,'10','Deleted Name','10','Deleted Name','show content stays')")
+    c.execute("INSERT INTO memory_governance_shadow_runs VALUES ('r1',1,?,?,?,?,?,?,?,?,?,?,?)", (hashlib.sha256(subject_key_for_user(10).encode()).hexdigest()[:16],'route','policy','now','h',1,'lh',2,1,'{}','[]'))
+    c.commit()
+    res = complete_delete_member_data(c, guild_id=1, user_id=10, confirmation='DELETE MY BNL DATA 1')
+    assert res['ok']
+    assert c.execute("SELECT COUNT(*) FROM member_activity_events").fetchone()[0] == 0
+    assert c.execute("SELECT COUNT(*) FROM entity_evidence_events").fetchone()[0] == 0
+    assert c.execute("SELECT COUNT(*) FROM community_presence WHERE member_user_id=10 OR subject_key='discord_user:10'").fetchone()[0] == 0
+    assert c.execute("SELECT COUNT(*) FROM community_presence WHERE member_user_id=11").fetchone()[0] == 1
+    for table in ('entity_intelligence_facts','entity_intelligence_edges','entity_activity_rollups','entity_open_questions','entity_profile_snapshots','entity_scouting_queue'):
+        assert c.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] == 0
+    assert c.execute("SELECT submitted_by_user_id,submitted_by_name,corrected_by_user_id,corrected_by_name,show_note FROM broadcast_memory").fetchone() == (None, None, None, None, 'show content stays')
+    assert c.execute("SELECT COUNT(*) FROM memory_governance_shadow_runs").fetchone()[0] == 0
+
+
+def test_complete_delete_moments_are_guild_scoped_and_canonical_payload_scrubbed():
+    c = make_conn(); insert(c, eid='mine', value='secret summary from DeletedName', pred='preference')
+    # capture display name before deletion
+    c.execute("CREATE TABLE user_profiles (guild_id INTEGER, user_id INTEGER, display_name TEXT, preferred_name TEXT)"); c.execute("INSERT INTO user_profiles VALUES (1,10,'DeletedName','PreferredDeleted')")
+    c.execute("CREATE TABLE memory_moment_windows (moment_id TEXT, guild_id INTEGER, lifecycle_status TEXT, canonical_ledger_entry_id TEXT, summary TEXT, updated_at TEXT)")
+    c.execute("CREATE TABLE memory_moment_members (moment_id TEXT, ledger_entry_id TEXT)")
+    c.execute("CREATE TABLE memory_moment_participants (moment_id TEXT, participant_key TEXT)")
+    canonical_payload = '{"participants":["discord_user:10","discord_user:11"],"summary":"secret summary from DeletedName"}'
+    insert(c, guild=1, user=99, eid='canon1', value=canonical_payload, source='derived_summary', pred='preference', derived=1, projection=1)
+    c.execute("UPDATE memory_ledger_entries SET subject_key='moment:m1', source_table='memory_moment_windows', source_row_id='m1' WHERE entry_id='canon1'")
+    c.execute("INSERT INTO memory_ledger_participants VALUES ('canon1',1,?,'DeletedName','participant',0,'now')", (subject_key_for_user(10),))
+    c.execute("INSERT INTO memory_ledger_participants VALUES ('canon1',1,?,'Other','participant',1,'now')", (subject_key_for_user(11),))
+    c.execute("INSERT INTO memory_moment_windows VALUES ('m1',1,'finalized','canon1','secret summary from DeletedName','')")
+    c.execute("INSERT INTO memory_moment_windows VALUES ('m2',2,'finalized','','guild2 untouched','old')")
+    c.execute("INSERT INTO memory_moment_members VALUES ('m1','mine')")
+    c.execute("INSERT INTO memory_moment_participants VALUES ('m1',?)", (subject_key_for_user(10),))
+    c.execute("INSERT INTO memory_moment_participants VALUES ('m1',?)", (subject_key_for_user(11),))
+    c.execute("INSERT INTO memory_moment_participants VALUES ('m2',?)", (subject_key_for_user(10),))
+    before_g2 = c.execute("SELECT * FROM memory_moment_participants WHERE moment_id='m2'").fetchall()
+    c.commit()
+    assert complete_delete_member_data(c, guild_id=1, user_id=10, confirmation='DELETE MY BNL DATA 1')['ok']
+    assert c.execute("SELECT COUNT(*) FROM memory_moment_participants WHERE moment_id='m1' AND participant_key=?", (subject_key_for_user(10),)).fetchone()[0] == 0
+    assert c.execute("SELECT * FROM memory_moment_participants WHERE moment_id='m2'").fetchall() == before_g2
+    payload, life = c.execute("SELECT normalized_value,lifecycle_status FROM memory_ledger_entries WHERE entry_id='canon1'").fetchone()
+    hay = '\n'.join(str(x) for x in c.execute("SELECT * FROM memory_ledger_entries UNION ALL SELECT * FROM memory_ledger_entries").fetchall())
+    assert 'discord_user:10' not in payload and 'DeletedName' not in payload and 'secret summary' not in payload
+    assert life == 'needs_review'
+    assert c.execute("SELECT COUNT(*) FROM memory_ledger_participants WHERE entry_id='canon1' AND participant_key=?", (subject_key_for_user(10),)).fetchone()[0] == 0
+    assert c.execute("SELECT COUNT(*) FROM memory_ledger_lineage l WHERE l.guild_id=1 AND (l.entry_id NOT IN (SELECT entry_id FROM memory_ledger_entries WHERE guild_id=1) OR l.target_entry_id NOT IN (SELECT entry_id FROM memory_ledger_entries WHERE guild_id=1))").fetchone()[0] == 0
+
+
+def test_route_policy_violations_and_shadow_retention_are_real():
+    c = make_conn(); insert(c, eid='sealed', value='sealed synths', pred='preference')
+    c.execute("UPDATE memory_ledger_entries SET channel_policy='sealed_test' WHERE entry_id='sealed'"); c.commit()
+    r = build_governed_context(c, req(user_text='remember synths', channel_policy='public_home'))
+    assert r.rendered_context == '' and 'invalid_route_channel_policy' in r.diagnostics.excluded_by_reason
+    report = build_evaluation_report([r], guild_id=1)
+    assert report['invalid_route_channel_policy_selections'] >= 1
+    for i in range(505):
+        persist_shadow_diagnostics(c, req(), r, 'legacy')
+    assert c.execute("SELECT COUNT(*) FROM memory_governance_shadow_runs WHERE guild_id=1").fetchone()[0] <= 500

@@ -267,6 +267,15 @@ def build_governed_context(conn: sqlite3.Connection, req: GovernanceRequest, *, 
                 exclusions.append(GovernanceExclusion(source_ref, reason, source_class, entry_id)); _add(diag, reason)
             if source_class not in allowed:
                 exclude("route_source_class"); continue
+            source_route = str(d.get("route_mode") or "unknown").lower()
+            source_policy = str(d.get("channel_policy") or "unknown").lower()
+            restricted_policies = {"sealed_test", "protected_system", "internal_controlled", "reference_canon", "ai_image_tool"}
+            if source_policy in restricted_policies and source_policy != str(req.channel_policy or "").lower():
+                diag.invalid_invariants.append("invalid_route_channel_policy_selected")
+                exclude("invalid_route_channel_policy"); continue
+            if source_route in {"operator_command", "internal_control", "protected_system"} and source_route != str(req.route_mode or "").lower():
+                diag.invalid_invariants.append("invalid_route_channel_policy_selected")
+                exclude("invalid_route_channel_policy"); continue
             life = str(d.get("lifecycle_status") or "active").lower()
             if life in BLOCKED_LIFECYCLES:
                 exclude("lifecycle"); diag.correction_supersession_exclusions += 1; continue
@@ -352,6 +361,7 @@ def persist_shadow_diagnostics(conn: sqlite3.Connection, req: GovernanceRequest,
     ensure_governance_schema(conn)
     now = _now(); run_id = "mgs_" + _hash("|".join([str(req.guild_id), subject_key_for_user(req.subject_user_id), now, result.diagnostics.rendered_hash]))
     conn.execute("INSERT OR REPLACE INTO memory_governance_shadow_runs VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", (run_id, req.guild_id, _hash(subject_key_for_user(req.subject_user_id)), req.route_mode, req.channel_policy, now, result.diagnostics.rendered_hash, result.diagnostics.rendered_size, _hash(legacy_context), len(legacy_context or ""), result.diagnostics.selected_count, json.dumps(result.diagnostics.excluded_by_reason, sort_keys=True), json.dumps(result.diagnostics.processing_errors, sort_keys=True)))
+    conn.execute("DELETE FROM memory_governance_shadow_runs WHERE guild_id=? AND run_id NOT IN (SELECT run_id FROM memory_governance_shadow_runs WHERE guild_id=? ORDER BY created_at DESC, run_id DESC LIMIT 500)", (req.guild_id, req.guild_id))
     conn.commit(); return run_id
 
 def build_evaluation_report(results: List[GovernanceResult], guild_id: int) -> Dict[str, Any]:
@@ -375,7 +385,8 @@ def build_evaluation_report(results: List[GovernanceResult], guild_id: int) -> D
             if inv == "cross_subject_selected": report["cross_member_violations"] += 1
             if inv == "cross_guild_selected": report["cross_guild_violations"] += 1
             if inv == "visibility_selected": report["visibility_violations"] += 1
-    if report["processing_errors"] or report["visibility_violations"] or report["cross_member_violations"] or report["cross_guild_violations"]:
+            if inv == "invalid_route_channel_policy_selected": report["invalid_route_channel_policy_selections"] += 1
+    if report["processing_errors"] or report["visibility_violations"] or report["cross_member_violations"] or report["cross_guild_violations"] or report["invalid_route_channel_policy_selections"]:
         report["rollback_readiness"] = "fallback_required_before_live"
     return report
 
@@ -387,14 +398,79 @@ def _subject_hash(user_id: int) -> str:
 
 def view_member_memory(conn: sqlite3.Connection, *, guild_id: int, user_id: int, limit: int = 10) -> List[Dict[str, Any]]:
     ensure_governance_schema(conn); subject = subject_key_for_user(user_id); out: List[Dict[str, Any]] = []
-    rows = conn.execute("SELECT entry_id,predicate_key,normalized_value,source_class,lifecycle_status,derived,entry_type,updated_at FROM memory_ledger_entries WHERE guild_id=? AND subject_key=? AND lifecycle_status NOT IN ('forgotten','deleted','retracted') ORDER BY updated_at DESC LIMIT ?", (guild_id, subject, limit)).fetchall()
+    rows = conn.execute("SELECT entry_id,predicate_key,normalized_value,source_class,lifecycle_status,derived,entry_type,updated_at FROM memory_ledger_entries WHERE guild_id=? AND subject_key=? AND lifecycle_status NOT IN ('corrected','superseded','forgotten','deleted','retracted') ORDER BY updated_at DESC LIMIT ?", (guild_id, subject, limit)).fetchall()
     for eid, pred, val, sc, life, derived, etype, updated in rows:
-        out.append({"ref": "mem_" + _hash(str(eid)), "kind": _classify_kind(str(sc), str(etype), bool(derived), str(life)), "summary": str(val or "")[:220], "status": life, "correctable": life not in {"forgotten", "deleted", "retracted"}, "_entry_id": eid})
+        out.append({"ref": "mem_" + _hash(str(eid)), "kind": _classify_kind(str(sc), str(etype), bool(derived), str(life)), "summary": str(val or "")[:220], "status": life, "correctable": life not in {"corrected", "superseded", "forgotten", "deleted", "retracted"}, "_entry_id": eid})
     return out
 
-def _resolve_ref(conn: sqlite3.Connection, guild_id: int, user_id: int, ref: str) -> str:
-    matches = [item["_entry_id"] for item in view_member_memory(conn, guild_id=guild_id, user_id=user_id, limit=500) if item["ref"] == ref]
+def _resolve_ref(conn: sqlite3.Connection, guild_id: int, user_id: int, ref: str, include_historical: bool = False) -> str:
+    if include_historical:
+        subject = subject_key_for_user(user_id)
+        rows = conn.execute("SELECT entry_id FROM memory_ledger_entries WHERE guild_id=? AND subject_key=?", (guild_id, subject)).fetchall()
+        matches = [str(r[0]) for r in rows if "mem_" + _hash(str(r[0])) == ref]
+    else:
+        matches = [item["_entry_id"] for item in view_member_memory(conn, guild_id=guild_id, user_id=user_id, limit=500) if item["ref"] == ref]
     return matches[0] if len(matches) == 1 else ""
+
+def _correction_chain(conn: sqlite3.Connection, guild_id: int, start_entry_id: str) -> Set[str]:
+    seen: Set[str] = set()
+    stack = [start_entry_id]
+    while stack:
+        eid = stack.pop()
+        if not eid or eid in seen:
+            continue
+        seen.add(eid)
+        for (child,) in conn.execute("SELECT entry_id FROM memory_ledger_lineage WHERE guild_id=? AND target_entry_id=? AND lineage_type IN ('correction_of','supersedes')", (guild_id, eid)).fetchall():
+            if child not in seen:
+                stack.append(str(child))
+        for (parent,) in conn.execute("SELECT target_entry_id FROM memory_ledger_lineage WHERE guild_id=? AND entry_id=? AND lineage_type IN ('correction_of','supersedes')", (guild_id, eid)).fetchall():
+            if parent not in seen:
+                stack.append(str(parent))
+    return seen
+
+def _table_has_cols(conn: sqlite3.Connection, table: str, needed: Iterable[str]) -> bool:
+    return _table_exists(conn, table) and set(needed).issubset(_cols(conn, table))
+
+def _delete_where_col(conn: sqlite3.Connection, table: str, guild_id: int, col: str, value: Any) -> int:
+    if not _table_exists(conn, table):
+        return 0
+    cols = _cols(conn, table)
+    if col not in cols:
+        return 0
+    if "guild_id" in cols:
+        return conn.execute("DELETE FROM %s WHERE guild_id=? AND %s=?" % (table, col), (guild_id, value)).rowcount
+    return conn.execute("DELETE FROM %s WHERE %s=?" % (table, col), (value,)).rowcount
+
+def _null_identity_cols(conn: sqlite3.Connection, table: str, guild_id: int, id_col: str, name_col: str, user_id: int) -> int:
+    if not _table_exists(conn, table):
+        return 0
+    cols = _cols(conn, table)
+    if id_col not in cols:
+        return 0
+    assignments = [id_col + "=NULL"]
+    if name_col in cols:
+        assignments.append(name_col + "=NULL")
+    if "guild_id" in cols:
+        return conn.execute("UPDATE %s SET %s WHERE guild_id=? AND CAST(%s AS TEXT)=?" % (table, ", ".join(assignments), id_col), (guild_id, str(user_id))).rowcount
+    return conn.execute("UPDATE %s SET %s WHERE CAST(%s AS TEXT)=?" % (table, ", ".join(assignments), id_col), (str(user_id),)).rowcount
+
+def _safe_text_values(conn: sqlite3.Connection, guild_id: int, user_id: int) -> Set[str]:
+    values = {str(user_id), subject_key_for_user(user_id)}
+    if _table_exists(conn, "user_profiles"):
+        cols = _cols(conn, "user_profiles")
+        select_cols = [c for c in ("display_name", "preferred_name") if c in cols]
+        if select_cols:
+            row = conn.execute("SELECT %s FROM user_profiles WHERE guild_id=? AND user_id=?" % ",".join(select_cols), (guild_id, user_id)).fetchone()
+            if row:
+                values.update(str(v) for v in row if v)
+    return {v for v in values if v}
+
+def _scrub_text(text: str, values: Set[str]) -> str:
+    cleaned = text or ""
+    for v in sorted(values, key=len, reverse=True):
+        if v:
+            cleaned = cleaned.replace(v, "")
+    return cleaned
 
 def _mark_dependents_needs_review(conn: sqlite3.Connection, guild_id: int, entry_id: str) -> None:
     now = _now()
@@ -412,7 +488,7 @@ def correct_member_memory(conn: sqlite3.Connection, *, guild_id: int, user_id: i
     subject = subject_key_for_user(user_id); rid = _receipt("correct", guild_id, user_id, safe_ref + _hash(corrected_text)); now = _now()
     with conn:
         prior = conn.execute("SELECT predicate_key,lifecycle_status FROM memory_ledger_entries WHERE guild_id=? AND subject_key=? AND entry_id=?", (guild_id, subject, target)).fetchone()
-        if not prior or prior[1] in {"forgotten", "deleted", "retracted"}: return {"ok": False, "reason": "already_forgotten_or_missing"}
+        if not prior or prior[1] in {"corrected", "superseded", "forgotten", "deleted", "retracted"} or not _entry_current(conn, guild_id, target): return {"ok": False, "reason": "obsolete_or_missing"}
         if conn.execute("SELECT 1 FROM memory_governance_receipts WHERE receipt_id=?", (rid,)).fetchone(): return {"ok": True, "receipt": rid, "idempotent": True}
         entry_id = "mle_" + hashlib.sha256(("correction|%s|%s|%s|%s" % (guild_id, subject, target, _hash(corrected_text))).encode("utf-8")).hexdigest()[:40]
         conn.execute("INSERT OR IGNORE INTO memory_ledger_entries (entry_id,schema_version,guild_id,subject_key,subject_display_name,entry_type,predicate_key,normalized_value,source_class,source_table,source_row_id,source_role,visibility,confidence,public_usable,derived,projection,salience,observed_at,lifecycle_status,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (entry_id, "memory_ledger_v1", guild_id, subject, "", "claim", prior[0], corrected_text[:1000], "owner_correction", "member_memory_control", rid, "member_control", "private", "high", 0, 0, 0, 1.0, now, "active", now, now))
@@ -422,21 +498,26 @@ def correct_member_memory(conn: sqlite3.Connection, *, guild_id: int, user_id: i
     return {"ok": True, "receipt": rid, "ref": safe_ref}
 
 def forget_member_memory(conn: sqlite3.Connection, *, guild_id: int, user_id: int, safe_ref: str) -> Dict[str, Any]:
-    ensure_governance_schema(conn); target = _resolve_ref(conn, guild_id, user_id, safe_ref); rid = _receipt("forget", guild_id, user_id, safe_ref); now = _now(); subject = subject_key_for_user(user_id)
+    ensure_governance_schema(conn); target = _resolve_ref(conn, guild_id, user_id, safe_ref, include_historical=True); rid = _receipt("forget", guild_id, user_id, safe_ref); now = _now(); subject = subject_key_for_user(user_id)
     if not target:
         if conn.execute("SELECT 1 FROM memory_governance_receipts WHERE receipt_id=?", (rid,)).fetchone(): return {"ok": True, "receipt": rid, "idempotent": True}
         return {"ok": False, "reason": "ambiguous_or_unauthorized_target"}
     with conn:
         if conn.execute("SELECT 1 FROM memory_governance_receipts WHERE receipt_id=?", (rid,)).fetchone(): return {"ok": True, "receipt": rid, "idempotent": True}
-        row = conn.execute("SELECT source_table,source_row_id,source_revision FROM memory_ledger_entries WHERE guild_id=? AND subject_key=? AND entry_id=?", (guild_id, subject, target)).fetchone()
-        if not row: return {"ok": False, "reason": "unauthorized"}
-        tomb_id = "mle_" + hashlib.sha256(("forget|%s|%s|%s" % (guild_id, subject, target)).encode("utf-8")).hexdigest()[:40]
+        chain = _correction_chain(conn, guild_id, target)
+        owned = [r[0] for r in conn.execute("SELECT entry_id FROM memory_ledger_entries WHERE guild_id=? AND subject_key=?", (guild_id, subject)).fetchall()]
+        chain = {eid for eid in chain if eid in set(owned)}
+        if not chain: return {"ok": False, "reason": "unauthorized"}
+        source_rows = conn.execute("SELECT source_table,source_row_id FROM memory_ledger_entries WHERE guild_id=? AND entry_id IN (%s)" % ",".join("?" for _ in chain), tuple([guild_id] + sorted(chain))).fetchall()
+        tomb_id = "mle_" + hashlib.sha256(("forget|%s|%s|%s" % (guild_id, subject, ":".join(sorted(chain)))).encode("utf-8")).hexdigest()[:40]
         conn.execute("INSERT OR IGNORE INTO memory_ledger_entries (entry_id,schema_version,guild_id,subject_key,subject_display_name,entry_type,predicate_key,normalized_value,source_class,source_table,source_row_id,source_revision,source_role,visibility,confidence,public_usable,derived,projection,salience,observed_at,lifecycle_status,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (tomb_id, "memory_ledger_v1", guild_id, subject, "", "claim", "retraction", "", "owner_correction", "member_memory_control", rid, "", "member_control", "private", "high", 0, 0, 0, 1.0, now, "active", now, now))
-        conn.execute("INSERT OR IGNORE INTO memory_ledger_lineage VALUES (?,?,?,?,?)", (tomb_id, guild_id, "retracts", target, now))
-        conn.execute("UPDATE memory_ledger_entries SET lifecycle_status='forgotten', normalized_value='', updated_at=? WHERE guild_id=? AND entry_id=?", (now, guild_id, target))
-        conn.execute("UPDATE memory_ledger_entries SET lifecycle_status='forgotten', normalized_value='', updated_at=? WHERE guild_id=? AND subject_key=? AND source_table=? AND source_row_id=?", (now, guild_id, subject, row[0], row[1]))
-        _mark_dependents_needs_review(conn, guild_id, target)
-        conn.execute("INSERT INTO memory_governance_receipts VALUES (?,?,?,?,?,?,?)", (rid, guild_id, _subject_hash(user_id), "forget", safe_ref, now, json.dumps({"ledger_entries": 1, "tombstones": 1})))
+        for eid in chain:
+            conn.execute("INSERT OR IGNORE INTO memory_ledger_lineage VALUES (?,?,?,?,?)", (tomb_id, guild_id, "retracts", eid, now))
+            conn.execute("UPDATE memory_ledger_entries SET lifecycle_status='forgotten', normalized_value='', updated_at=? WHERE guild_id=? AND entry_id=?", (now, guild_id, eid))
+            _mark_dependents_needs_review(conn, guild_id, eid)
+        for table, row_id in source_rows:
+            conn.execute("UPDATE memory_ledger_entries SET lifecycle_status='forgotten', normalized_value='', updated_at=? WHERE guild_id=? AND subject_key=? AND source_table=? AND source_row_id=?", (now, guild_id, subject, table, row_id))
+        conn.execute("INSERT INTO memory_governance_receipts VALUES (?,?,?,?,?,?,?)", (rid, guild_id, _subject_hash(user_id), "forget", safe_ref, now, json.dumps({"ledger_entries": len(chain), "tombstones": 1})))
     return {"ok": True, "receipt": rid}
 
 def _delete_by_user(conn: sqlite3.Connection, table: str, guild_id: int, user_id: int) -> int:
@@ -448,41 +529,115 @@ def _delete_by_user(conn: sqlite3.Connection, table: str, guild_id: int, user_id
             return conn.execute("DELETE FROM %s WHERE guild_id=? AND %s=?" % (table, col), (guild_id, user_id)).rowcount
     return 0
 
+def _moment_ids_for_guild(conn: sqlite3.Connection, guild_id: int, where_sql: str, params: Tuple[Any, ...]) -> Set[str]:
+    if not _table_exists(conn, "memory_moment_windows"):
+        return set()
+    return {str(r[0]) for r in conn.execute("SELECT moment_id FROM memory_moment_windows WHERE guild_id=? AND " + where_sql, (guild_id,) + params).fetchall()}
+
+def _cleanup_canonical_moment(conn: sqlite3.Connection, guild_id: int, moment_id: str, subject: str, scrub_values: Set[str], now: str, counts: Dict[str, int]) -> None:
+    if not _table_exists(conn, "memory_moment_windows"):
+        return
+    cols = _cols(conn, "memory_moment_windows")
+    if "canonical_ledger_entry_id" not in cols:
+        return
+    row = conn.execute("SELECT canonical_ledger_entry_id FROM memory_moment_windows WHERE guild_id=? AND moment_id=?", (guild_id, moment_id)).fetchone()
+    if not row or not row[0]:
+        return
+    canonical = str(row[0])
+    if _table_exists(conn, "memory_ledger_participants"):
+        counts["canonical_ledger_participants"] = counts.get("canonical_ledger_participants", 0) + conn.execute("DELETE FROM memory_ledger_participants WHERE guild_id=? AND entry_id=? AND participant_key=?", (guild_id, canonical, subject)).rowcount
+    remaining = 0
+    if _table_exists(conn, "memory_moment_participants"):
+        remaining = conn.execute("SELECT COUNT(*) FROM memory_moment_participants p JOIN memory_moment_windows w ON w.moment_id=p.moment_id WHERE w.guild_id=? AND p.moment_id=?", (guild_id, moment_id)).fetchone()[0]
+    new_life = "needs_review" if remaining else "retracted"
+    if _table_exists(conn, "memory_ledger_entries"):
+        payload = conn.execute("SELECT normalized_value FROM memory_ledger_entries WHERE guild_id=? AND entry_id=?", (guild_id, canonical)).fetchone()
+        scrubbed = ""
+        counts["canonical_ledger_entries"] = counts.get("canonical_ledger_entries", 0) + conn.execute("UPDATE memory_ledger_entries SET normalized_value=?, lifecycle_status=?, updated_at=? WHERE guild_id=? AND entry_id=?", (scrubbed, new_life, now, guild_id, canonical)).rowcount
+        # Remove lineage edges from deleted sources; keep canonical row reachable but not dangling to deleted member entries.
+        counts["canonical_ledger_lineage"] = counts.get("canonical_ledger_lineage", 0) + conn.execute("DELETE FROM memory_ledger_lineage WHERE guild_id=? AND entry_id=? AND target_entry_id NOT IN (SELECT entry_id FROM memory_ledger_entries WHERE guild_id=?)", (guild_id, canonical, guild_id)).rowcount
+
 def complete_delete_member_data(conn: sqlite3.Connection, *, guild_id: int, user_id: int, confirmation: str, inject_failure: bool = False) -> Dict[str, Any]:
     if confirmation != "DELETE MY BNL DATA %s" % guild_id: return {"ok": False, "reason": "confirmation_required"}
-    ensure_governance_schema(conn); rid = _receipt("complete_delete", guild_id, user_id); now = _now(); counts: Dict[str, int] = {}; subject = subject_key_for_user(user_id)
+    ensure_governance_schema(conn); rid = _receipt("complete_delete", guild_id, user_id); now = _now(); counts: Dict[str, int] = {}; subject = subject_key_for_user(user_id); subject_hash = _subject_hash(user_id)
+    scrub_values = _safe_text_values(conn, guild_id, user_id)
     with conn:
-        for table in ("conversations", "user_profiles", "user_memory_facts", "user_habits", "relationship_state", "relationship_journal", "memory_tiers", "response_style_log", "community_presence", "member_activity_events", "entity_evidence_events", "entity_intelligence"):
+        # Core member-owned tables.
+        for table in ("conversations", "user_profiles", "user_memory_facts", "user_habits", "relationship_state", "relationship_journal", "memory_tiers", "response_style_log"):
             counts[table] = _delete_by_user(conn, table, guild_id, user_id)
+        # Community/member activity schemas use varied identity columns.
+        if _table_exists(conn, "community_presence"):
+            for col in ("user_id", "member_user_id", "subject_user_id", "discord_user_id"):
+                counts["community_presence"] = counts.get("community_presence", 0) + _delete_where_col(conn, "community_presence", guild_id, col, user_id)
+            cols = _cols(conn, "community_presence")
+            for col in ("subject_key", "member_key"):
+                if col in cols:
+                    counts["community_presence"] = counts.get("community_presence", 0) + _delete_where_col(conn, "community_presence", guild_id, col, subject)
+        if _table_exists(conn, "member_activity_events"):
+            cols = _cols(conn, "member_activity_events")
+            if "member_user_id" in cols:
+                counts["member_activity_events"] = conn.execute("DELETE FROM member_activity_events WHERE guild_id=? AND CAST(member_user_id AS TEXT)=?", (guild_id, str(user_id))).rowcount
+            else:
+                counts["member_activity_events"] = _delete_by_user(conn, "member_activity_events", guild_id, user_id)
+        # Entity evidence/intelligence actual tables.
         if _table_exists(conn, "entity_evidence_events"):
             cols = _cols(conn, "entity_evidence_events")
-            for col in ("subject_key", "subject_id", "entity_key"):
+            total = 0
+            if "matched_user_id" in cols:
+                total += conn.execute("DELETE FROM entity_evidence_events WHERE guild_id=? AND CAST(matched_user_id AS TEXT)=?", (guild_id, str(user_id))).rowcount
+            for col in ("subject_key", "subject_id", "entity_key", "matched_subject_key"):
                 if col in cols:
-                    counts["entity_evidence_events"] += conn.execute("DELETE FROM entity_evidence_events WHERE guild_id=? AND %s=?" % col, (guild_id, subject)).rowcount
+                    total += conn.execute("DELETE FROM entity_evidence_events WHERE guild_id=? AND %s=?" % col, (guild_id, subject)).rowcount
+            counts["entity_evidence_events"] = total
+        for table in ("entity_intelligence_facts", "entity_intelligence_edges", "entity_activity_rollups", "entity_open_questions", "entity_profile_snapshots", "entity_scouting_queue"):
+            if _table_exists(conn, table):
+                total = 0; cols = _cols(conn, table)
+                for col in ("subject_key", "entity_key", "source_key", "target_key", "profile_subject_key"):
+                    if col in cols:
+                        total += conn.execute("DELETE FROM %s WHERE guild_id=? AND %s=?" % (table, col), (guild_id, subject)).rowcount
+                for col in ("user_id", "member_user_id", "matched_user_id"):
+                    if col in cols:
+                        total += conn.execute("DELETE FROM %s WHERE guild_id=? AND CAST(%s AS TEXT)=?" % (table, col), (guild_id, str(user_id))).rowcount
+                counts[table] = total
+        # Preserve broadcast/show content but anonymize matching submitter/corrector identities.
+        counts["broadcast_memory_submitter_anonymized"] = _null_identity_cols(conn, "broadcast_memory", guild_id, "submitted_by_user_id", "submitted_by_name", user_id)
+        counts["broadcast_memory_corrector_anonymized"] = _null_identity_cols(conn, "broadcast_memory", guild_id, "corrected_by_user_id", "corrected_by_name", user_id)
         affected_moments: Set[str] = set()
-        if _table_exists(conn, "memory_moment_participants"):
-            affected_moments.update(r[0] for r in conn.execute("SELECT moment_id FROM memory_moment_participants WHERE participant_key=?", (subject,)).fetchall())
-            counts["memory_moment_participants"] = conn.execute("DELETE FROM memory_moment_participants WHERE participant_key=?", (subject,)).rowcount
+        # Guild-scoped moment participant lookup and deletion.
+        if _table_exists(conn, "memory_moment_participants") and _table_exists(conn, "memory_moment_windows"):
+            affected_moments.update(str(r[0]) for r in conn.execute("SELECT p.moment_id FROM memory_moment_participants p JOIN memory_moment_windows w ON w.moment_id=p.moment_id WHERE w.guild_id=? AND p.participant_key=?", (guild_id, subject)).fetchall())
+            counts["memory_moment_participants"] = conn.execute("DELETE FROM memory_moment_participants WHERE participant_key=? AND moment_id IN (SELECT moment_id FROM memory_moment_windows WHERE guild_id=?)", (subject, guild_id)).rowcount
+        ids: List[str] = []
         if _table_exists(conn, "memory_ledger_entries"):
-            ids = [r[0] for r in conn.execute("SELECT entry_id FROM memory_ledger_entries WHERE guild_id=? AND subject_key=?", (guild_id, subject)).fetchall()]
-            if _table_exists(conn, "memory_moment_members"):
-                for eid in ids:
-                    affected_moments.update(r[0] for r in conn.execute("SELECT moment_id FROM memory_moment_members WHERE ledger_entry_id=?", (eid,)).fetchall())
-                    counts["memory_moment_members"] = counts.get("memory_moment_members", 0) + conn.execute("DELETE FROM memory_moment_members WHERE ledger_entry_id=?", (eid,)).rowcount
+            ids = [str(r[0]) for r in conn.execute("SELECT entry_id FROM memory_ledger_entries WHERE guild_id=? AND subject_key=?", (guild_id, subject)).fetchall()]
+            if _table_exists(conn, "memory_moment_members") and _table_exists(conn, "memory_moment_windows") and ids:
+                q = ",".join("?" for _ in ids)
+                affected_moments.update(str(r[0]) for r in conn.execute("SELECT m.moment_id FROM memory_moment_members m JOIN memory_moment_windows w ON w.moment_id=m.moment_id WHERE w.guild_id=? AND m.ledger_entry_id IN (%s)" % q, tuple([guild_id] + ids)).fetchall())
+                counts["memory_moment_members"] = conn.execute("DELETE FROM memory_moment_members WHERE ledger_entry_id IN (%s) AND moment_id IN (SELECT moment_id FROM memory_moment_windows WHERE guild_id=?)" % q, tuple(ids + [guild_id])).rowcount
+            # Clean canonical moment copies before deleting member entries.
+            for mid in sorted(affected_moments):
+                _cleanup_canonical_moment(conn, guild_id, mid, subject, scrub_values, now, counts)
             for eid in ids:
                 counts["memory_ledger_lineage"] = counts.get("memory_ledger_lineage", 0) + conn.execute("DELETE FROM memory_ledger_lineage WHERE guild_id=? AND (entry_id=? OR target_entry_id=?)", (guild_id, eid, eid)).rowcount
             counts["memory_ledger_participants"] = counts.get("memory_ledger_participants", 0) + conn.execute("DELETE FROM memory_ledger_participants WHERE guild_id=? AND participant_key=?", (guild_id, subject)).rowcount
             counts["memory_ledger_entries"] = conn.execute("DELETE FROM memory_ledger_entries WHERE guild_id=? AND subject_key=?", (guild_id, subject)).rowcount
+            # Remove any now-dangling lineage in this guild.
+            counts["memory_ledger_lineage_dangling"] = conn.execute("DELETE FROM memory_ledger_lineage WHERE guild_id=? AND (entry_id NOT IN (SELECT entry_id FROM memory_ledger_entries WHERE guild_id=?) OR target_entry_id NOT IN (SELECT entry_id FROM memory_ledger_entries WHERE guild_id=?))", (guild_id, guild_id, guild_id)).rowcount
         if _table_exists(conn, "memory_moment_windows"):
-            for mid in affected_moments:
-                remaining = conn.execute("SELECT COUNT(*) FROM memory_moment_members WHERE moment_id=?", (mid,)).fetchone()[0] if _table_exists(conn, "memory_moment_members") else 0
-                if remaining:
-                    counts["memory_moment_windows_needs_review"] = counts.get("memory_moment_windows_needs_review", 0) + conn.execute("UPDATE memory_moment_windows SET lifecycle_status='needs_review', summary='', updated_at=? WHERE guild_id=? AND moment_id=?", (now, guild_id, mid)).rowcount
-                else:
-                    counts["memory_moment_windows_retracted"] = counts.get("memory_moment_windows_retracted", 0) + conn.execute("UPDATE memory_moment_windows SET lifecycle_status='retracted', summary='', updated_at=? WHERE guild_id=? AND moment_id=?", (now, guild_id, mid)).rowcount
-        # Remove prior receipts for this subject, then write a new content-free receipt.
-        counts["prior_governance_receipts"] = conn.execute("DELETE FROM memory_governance_receipts WHERE guild_id=? AND subject_hash=?", (guild_id, _subject_hash(user_id))).rowcount
+            cols = _cols(conn, "memory_moment_windows")
+            for mid in sorted(affected_moments):
+                remaining = conn.execute("SELECT COUNT(*) FROM memory_moment_participants p JOIN memory_moment_windows w ON w.moment_id=p.moment_id WHERE w.guild_id=? AND p.moment_id=?", (guild_id, mid)).fetchone()[0] if _table_exists(conn, "memory_moment_participants") else 0
+                status = "needs_review" if remaining else "retracted"
+                assignments = ["lifecycle_status=?", "updated_at=?"]
+                params: List[Any] = [status, now]
+                if "summary" in cols:
+                    assignments.append("summary=?"); params.append("")
+                params.extend([guild_id, mid])
+                counts["memory_moment_windows_%s" % status] = counts.get("memory_moment_windows_%s" % status, 0) + conn.execute("UPDATE memory_moment_windows SET %s WHERE guild_id=? AND moment_id=?" % ", ".join(assignments), tuple(params)).rowcount
+        # Delete shadow runs and prior receipts for this member only in this guild.
+        counts["memory_governance_shadow_runs"] = conn.execute("DELETE FROM memory_governance_shadow_runs WHERE guild_id=? AND subject_hash=?", (guild_id, subject_hash)).rowcount if _table_exists(conn, "memory_governance_shadow_runs") else 0
+        counts["prior_governance_receipts"] = conn.execute("DELETE FROM memory_governance_receipts WHERE guild_id=? AND subject_hash=?", (guild_id, subject_hash)).rowcount
         if inject_failure: raise RuntimeError("injected_complete_delete_failure")
         safe_counts = {k: int(v or 0) for k, v in counts.items() if int(v or 0)}
-        conn.execute("INSERT INTO memory_governance_receipts VALUES (?,?,?,?,?,?,?)", (rid, guild_id, _subject_hash(user_id), "complete_delete", "", now, json.dumps(safe_counts, sort_keys=True)))
+        conn.execute("INSERT INTO memory_governance_receipts VALUES (?,?,?,?,?,?,?)", (rid, guild_id, subject_hash, "complete_delete", "", now, json.dumps(safe_counts, sort_keys=True)))
     return {"ok": True, "receipt": rid, "row_counts": counts, "idempotent": not any(counts.values()), "limitation": "Discord-hosted messages are not deleted by this bot command."}
