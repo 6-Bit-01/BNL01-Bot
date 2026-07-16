@@ -21,6 +21,16 @@ from bnl_canon_source_contract import (
     render_prompt_canon_block,
     strip_queue_sections,
 )
+from bnl_memory_ledger import (
+    build_memory_ledger_evaluation,
+    ensure_memory_ledger_schema,
+    shadow_broadcast_memory_row,
+    shadow_conversation_row,
+    shadow_enabled as memory_ledger_shadow_enabled,
+    shadow_memory_tier_row,
+    shadow_relationship_journal_row,
+    shadow_user_fact_row,
+)
 from bnl_conversation_context_v2 import (
     CONVERSATION_CONTEXT_VERSION,
     ConversationContextRequest,
@@ -4348,10 +4358,27 @@ def init_db():
     evidence_conn = sqlite3.connect(DB_FILE)
     try:
         ensure_entity_evidence_schema(evidence_conn)
+        ensure_memory_ledger_schema(evidence_conn)
         evidence_conn.commit()
     finally:
         evidence_conn.close()
     logging.info("✅ Database initialized successfully.")
+
+
+def _shadow_memory_ledger_write(writer_name: str, callback):
+    if not memory_ledger_shadow_enabled():
+        return None
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        try:
+            result = callback(conn)
+            conn.commit()
+            return result
+        finally:
+            conn.close()
+    except Exception as exc:
+        logging.debug("memory_ledger_shadow_write_failed writer=%s error=%s", writer_name, exc)
+        return None
 
 def _truncate_user_facts(user_id: int, guild_id: int, max_rows: int = MAX_FACTS_PER_USER):
     conn = sqlite3.connect(DB_FILE)
@@ -4418,8 +4445,13 @@ def upsert_user_fact(user_id: int, guild_id: int, fact_key: str, fact_value: str
             (user_id, guild_id, fact_key, fact_value, confidence, is_core, now),
         )
         changed = False
+    fact_row_id = int(existing[0] if existing else cursor.lastrowid or 0)
     conn.commit()
     conn.close()
+    _shadow_memory_ledger_write(
+        "user_memory_facts",
+        lambda ledger_conn: shadow_user_fact_row(ledger_conn, row_id=fact_row_id, user_id=user_id, guild_id=guild_id, fact_key=fact_key, fact_value=fact_value, confidence=confidence, updated_at=now),
+    )
     _truncate_user_facts(user_id, guild_id, MAX_FACTS_PER_USER)
 
     if changed:
@@ -4539,8 +4571,13 @@ def add_relationship_journal(user_id: int, guild_id: int, entry_type: str, summa
         """,
         (user_id, guild_id, entry_type, summary[:220], now),
     )
+    row_id = int(cursor.lastrowid or 0)
     conn.commit()
     conn.close()
+    _shadow_memory_ledger_write(
+        "relationship_journal",
+        lambda ledger_conn: shadow_relationship_journal_row(ledger_conn, row_id=row_id, user_id=user_id, guild_id=guild_id, entry_type=entry_type, summary=summary[:220], timestamp=now),
+    )
 
 def get_relationship_journal(user_id: int, guild_id: int, limit: int = 5):
     conn = sqlite3.connect(DB_FILE)
@@ -4788,6 +4825,7 @@ def _insert_memory_tier(cursor, user_id: int, guild_id: int, tier: str, summary:
     }
     ordered = [c for c in ("user_id","guild_id","tier","summary","salience","mentions","updated_at","source_role","source_channel_policy","source_channel_name","source_origin","source_trust","topic_key","subject_key","project_key","first_seen","last_seen","lifecycle_note") if c in data and (c in cols or c in {"user_id","guild_id","tier","summary","salience","mentions","updated_at"})]
     cursor.execute(f"INSERT INTO memory_tiers ({', '.join(ordered)}) VALUES ({', '.join(['?']*len(ordered))})", [data[c] for c in ordered])
+    return int(cursor.lastrowid or 0)
 
 
 def _add_memory_tier_entry(user_id: int, guild_id: int, tier: str, summary: str, salience: float, source_role: str = "legacy_unknown", source_channel_policy: str = "legacy_unknown", source_channel_name: str = "", source_origin: str = "legacy_unknown", source_trust: str = "legacy_unknown"):
@@ -4795,9 +4833,14 @@ def _add_memory_tier_entry(user_id: int, guild_id: int, tier: str, summary: str,
         return
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
-    _insert_memory_tier(cursor, user_id, guild_id, tier, summary, salience, source_role=source_role, source_channel_policy=source_channel_policy, source_channel_name=source_channel_name, source_origin=source_origin, source_trust=source_trust, topic_key=_memory_topic_key(summary), subject_key=_memory_subject_key(summary), project_key=_memory_project_key(summary), lifecycle_note="direct_entry")
+    row_id = _insert_memory_tier(cursor, user_id, guild_id, tier, summary, salience, source_role=source_role, source_channel_policy=source_channel_policy, source_channel_name=source_channel_name, source_origin=source_origin, source_trust=source_trust, topic_key=_memory_topic_key(summary), subject_key=_memory_subject_key(summary), project_key=_memory_project_key(summary), lifecycle_note="direct_entry")
     conn.commit()
     conn.close()
+    if row_id:
+        _shadow_memory_ledger_write(
+            "memory_tiers",
+            lambda ledger_conn: shadow_memory_tier_row(ledger_conn, row_id=row_id, user_id=user_id, guild_id=guild_id, tier=tier, summary=summary, salience=salience, channel_policy=source_channel_policy, topic_key=_memory_topic_key(summary), updated_at=datetime.now(PACIFIC_TZ).isoformat()),
+        )
 
 
 def _fetch_tier_rows(cursor, user_id: int, guild_id: int, tier: str) -> list[dict]:
@@ -9368,8 +9411,19 @@ def save_user_message(user_id: int, user_name: str, guild_id: int, content: str,
             "INSERT INTO conversations (user_id, user_name, guild_id, channel_name, channel_policy, channel_id, role, content) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             (user_id, user_name, guild_id, (channel_name or "").lower()[:80], (channel_policy or "unknown")[:40], int(channel_id or 0), "user", content),
         )
+    row_id = int(cursor.lastrowid or 0)
+    observed_at = cursor.execute("SELECT timestamp FROM conversations WHERE id=?", (row_id,)).fetchone()
+    observed_at = observed_at[0] if observed_at else ""
     conn.commit()
     conn.close()
+    _shadow_memory_ledger_write(
+        "conversations_user",
+        lambda ledger_conn: shadow_conversation_row(
+            ledger_conn, row_id=row_id, user_id=user_id, user_name=user_name, guild_id=guild_id, role="user",
+            content=content, channel_name=(channel_name or "").lower()[:80], channel_policy=(channel_policy or "unknown")[:40],
+            channel_id=int(channel_id or 0), message_id=int(message_id or 0) or None, route_mode=route_mode, observed_at=observed_at,
+        ),
+    )
     try:
         mark_subject_dirty_for_evidence(
             DB_FILE,
@@ -9424,8 +9478,19 @@ def save_model_message(user_id: int, guild_id: int, content: str, channel_name: 
         "INSERT INTO conversations (user_id, user_name, guild_id, channel_name, channel_policy, channel_id, role, content) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         (user_id, "BNL-01", guild_id, (channel_name or "").lower()[:80], (channel_policy or "unknown")[:40], int(channel_id or 0), "model", content),
     )
+    row_id = int(cursor.lastrowid or 0)
+    observed_at = cursor.execute("SELECT timestamp FROM conversations WHERE id=?", (row_id,)).fetchone()
+    observed_at = observed_at[0] if observed_at else ""
     conn.commit()
     conn.close()
+    _shadow_memory_ledger_write(
+        "conversations_model",
+        lambda ledger_conn: shadow_conversation_row(
+            ledger_conn, row_id=row_id, user_id=user_id, user_name="BNL-01", guild_id=guild_id, role="model",
+            content=content, channel_name=(channel_name or "").lower()[:80], channel_policy=(channel_policy or "unknown")[:40],
+            channel_id=int(channel_id or 0), message_id=None, route_mode=route_mode, observed_at=observed_at,
+        ),
+    )
     prune_conversation_history(user_id, guild_id, calculate_adaptive_memory_limits(user_id, guild_id, route_mode=route_mode, channel_policy=channel_policy, user_text=content).get("conversation_rows", MAX_CONVERSATION_ROWS_PER_USER))
     if decision.update_relationship:
         update_relationship_state(user_id, guild_id, content, delta_affinity=0.04)
@@ -10450,6 +10515,16 @@ def add_broadcast_memory_entry(guild_id: int, message: discord.Message, processe
     new_id = cursor.lastrowid
     conn.commit()
     conn.close()
+    _shadow_memory_ledger_write(
+        "broadcast_memory",
+        lambda ledger_conn: shadow_broadcast_memory_row(
+            ledger_conn, row_id=int(new_id or 0), guild_id=guild_id, cleaned_summary=processed.get("cleaned_summary", ""),
+            entry_type=processed.get("entry_type", "notable_moment"), public_safe=bool(processed.get("public_safe")),
+            status="active", usage_scope=processed.get("usage_scope", "internal"),
+            submitted_by_user_id=getattr(getattr(message, "author", None), "id", None), submitted_by_name=getattr(getattr(message, "author", None), "display_name", "system"),
+            created_at=now,
+        ),
+    )
     return int(new_id or 0)
 
 
@@ -18459,6 +18534,15 @@ async def bnl_memory_check(interaction: discord.Interaction):
     active_override = get_active_show_state_override(guild.id)
     latest_broadcast_context_episode_date = get_latest_broadcast_episode_date(guild.id, public_only=False)
     member_activity_events_count, recent_member_events_count_7d = get_member_activity_event_counts(guild.id)
+    try:
+        ledger_conn = sqlite3.connect(DB_FILE)
+        try:
+            ledger_diag = build_memory_ledger_evaluation(ledger_conn, guild_id=guild.id)
+        finally:
+            ledger_conn.close()
+    except Exception as exc:
+        logging.debug("memory_ledger_diagnostic_failed error=%s", exc)
+        ledger_diag = {"schemaVersion": "memory_ledger_v1", "insertedLedgerEntries": "error"}
     lines = [
         "**BNL Memory Diagnostic (safe)**",
         f"- guild: `{guild.name}` (`{guild.id}`)",
@@ -18520,6 +18604,16 @@ async def bnl_memory_check(interaction: discord.Interaction):
         "- ambient_legacy_memory_policy: `legacy down-ranked; source-safe preferred`",
         "- direct_legacy_memory_policy: `allowed cautiously; never overrides cleaner context`",
         "- memory_tier_future_writes_source_gated: `yes`",
+        f"- memory_ledger_shadow_enabled: `{'yes' if memory_ledger_shadow_enabled() else 'no'}`",
+        f"- memory_ledger_schema: `{ledger_diag.get('schemaVersion')}`",
+        f"- memory_ledger_entries: `{ledger_diag.get('insertedLedgerEntries', 0)}`",
+        f"- memory_ledger_counts_by_source: `{ledger_diag.get('countsBySourceLane', {})}`",
+        f"- memory_ledger_counts_by_type: `{ledger_diag.get('countsByEntryType', {})}`",
+        f"- memory_ledger_counts_by_visibility: `{ledger_diag.get('countsByVisibility', {})}`",
+        f"- memory_ledger_counts_by_lifecycle: `{ledger_diag.get('countsByLifecycle', {})}`",
+        f"- memory_ledger_unmapped_provenance: `{ledger_diag.get('missingUnmappedProvenance', 0)}`",
+        f"- memory_ledger_public_rejections: `{ledger_diag.get('publicUsabilityRejections', 0)}`",
+        f"- memory_ledger_multiple_active_values: `{ledger_diag.get('entriesWithMultipleActiveValues', 0)}`",
         f"- memory_tiers_source_policy: `{memory_tier_source_policy_state}`",
         "- sealed_test_passive_capture: `disabled`",
         f"- sealed_test_conversation_rows: `{'present' if sealed_test_rows_present else 'none'}`",
