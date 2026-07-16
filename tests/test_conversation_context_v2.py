@@ -191,7 +191,11 @@ class ConversationContextV2CorrectionTests(unittest.TestCase):
             "Three tracks are in the queue.",
             "The queue currently contains three entries.",
             "Payment is active for that session.",
+            "Payment cleared for that submission.",
+            "That payment is pending and owed.",
+            "Your Priority slot is confirmed.",
             "Priority Signal is enabled and Wheel spins owed are three.",
+            "The current track is the paid-session closer.",
             "Up next is the paid session track.",
         ]
         rows=[]
@@ -202,6 +206,43 @@ class ConversationContextV2CorrectionTests(unittest.TestCase):
         for claim in claims:
             self.assertNotIn(claim, res.rendered_context)
         self.assertNotIn("queue question", res.rendered_context)
+
+    def test_ordinary_session_payment_priority_queue_and_wheel_conversation_allowed(self):
+        pairs = [
+            ("How should we divide the recording session?", "The recording session has two parts."),
+            ("How should I prioritize the bug?", "This issue has priority two for the sprint."),
+            ("Explain the payment article.", "The payment article includes three examples."),
+            ("Explain a programming queue.", "A queue has two basic operations."),
+            ("Describe the wheel.", "The wheel has three spokes."),
+        ]
+        for i, (user_text, model_text) in enumerate(pairs, start=1):
+            rows = [row(i * 2 - 1, "user", user_text), row(i * 2, "model", model_text)]
+            res = assemble_conversation_context_v2(rows, req(current_texts=("explain ordinary examples",)))
+            self.assertIn(model_text, res.rendered_context)
+
+    def test_unsafe_orphan_model_does_not_delete_prior_safe_pair(self):
+        rows = [
+            row(1, "user", "Explain cloud storage"),
+            row(2, "model", "Cloud storage keeps files remotely."),
+            row(3, "model", "The queue has three tracks waiting."),
+        ]
+        res = assemble_conversation_context_v2(rows, req(current_texts=("cloud storage follow up",)))
+        self.assertIn("User/member: Explain cloud storage", res.rendered_context)
+        self.assertIn("BNL-01: Cloud storage keeps files remotely.", res.rendered_context)
+        self.assertNotIn("The queue has three tracks waiting.", res.rendered_context)
+
+    def test_unsafe_pair_removal_does_not_reassign_safe_model_answer(self):
+        rows = [
+            row(1, "user", "first request?"),
+            row(2, "user", "second request"),
+            row(3, "model", "safe answer to second"),
+            row(4, "model", "The queue has three tracks waiting."),
+        ]
+        res = assemble_conversation_context_v2(rows, req(current_texts=("second request follow up",)))
+        self.assertIn("User/member: second request", res.rendered_context)
+        self.assertIn("BNL-01: safe answer to second", res.rendered_context)
+        self.assertNotIn("User/member: first request\nBNL-01: safe answer to second", res.rendered_context)
+        self.assertNotIn("The queue has three tracks waiting.", res.rendered_context)
 
     def test_storage_conversation_allowed_but_media_storage_diagnostics_excluded(self):
         ordinary = [row(1,"user","Which cloud storage plan works?"), row(2,"model","Use the smaller storage plan.")]
@@ -318,6 +359,17 @@ class BotConversationContextV2IntegrationTests(unittest.TestCase):
                         bad.append(kw.arg)
         self.assertNotIn("message_id", bad)
         self.assertEqual(bad, [])
+
+    def test_live_save_user_message_calls_keep_message_id_keyword(self):
+        import ast
+        with open("bnl01_bot.py", encoding="utf-8") as fh:
+            tree = ast.parse(fh.read())
+        missing = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call) and getattr(node.func, "id", "") == "save_user_message":
+                if not any(kw.arg == "message_id" for kw in node.keywords):
+                    missing.append(getattr(node, "lineno", 0))
+        self.assertEqual(missing, [])
 
     def test_active_batch_dedupes_all_current_participants_with_text_fallback(self):
         b=self.bot

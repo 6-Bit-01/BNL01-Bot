@@ -37,8 +37,18 @@ CORRECTION_RE = re.compile(r"\b(?:actually|correction|correcting|i meant|instead
 BOUNDARY_RE = re.compile(r"\b(?:don't|do not|stop|never|please don't|no longer|boundary|avoid)\b", re.I)
 OPEN_LOOP_RE = re.compile(r"\?|\b(?:which one|choose|pick|decide|i will|i'll|remind me|next time|use the first|use the second|second one|first one)\b", re.I)
 STRONG_CONTINUATION_RE = re.compile(r"\b(?:continue(?:\s+\w+){0,6}\s+from before|earlier in (?:the )?(?:other )?conversation|same topic as before|pick up where we left off|from the other channel|from that other conversation)\b", re.I)
-QUEUE_SUBJECT_RE = re.compile(r"\b(?:queue|session|payment|priority|priority signal|wheel|wheel spins|now playing|up next|current track|currently playing)\b", re.I)
-QUEUE_ASSERTION_VERB_RE = re.compile(r"\b(?:is|are|has|have|contains?|includes?|holds?|waiting|queued|open|live|enabled|owed|paid|next|playing|active|currently|three|two|one|\d+)\b", re.I)
+OPERATIONAL_STATE_RE = re.compile(
+    r"\b(?:now playing|up next|current track|currently playing|paid[- ]session|queue[- ]slot|submission[- ]slot|track[- ]session)\b",
+    re.I,
+)
+QUEUE_STATE_RE = re.compile(
+    r"\bqueue\b(?=.*\b(?:tracks?|entries|submissions?|artists?|slots?|waiting|queued|currently|contains?|holds?|open|live)\b)"
+    r"|\b(?:tracks?|entries|submissions?|artists?|slots?)\b(?=.*\bqueue\b)",
+    re.I,
+)
+PAYMENT_STATE_RE = re.compile(r"\bpayment\b(?=.*\b(?:cleared|active|pending|owed|paid|submission|slot|session|confirmed)\b)", re.I)
+PRIORITY_STATE_RE = re.compile(r"\b(?:priority signal|priority slot|your priority)\b|(?:\bpriority\b(?=.*\b(?:confirmed|enabled|slot|submission|paid)\b))", re.I)
+WHEEL_STATE_RE = re.compile(r"\bwheel spins?\b|\bwheel\b(?=.*\b(?:owed|enabled|confirmed|slot|submission|paid)\b)", re.I)
 UNSAFE_HISTORY_RE = re.compile(r"(?:\b(?:provider|host|preview|embed|media_buffer|media-storage|media storage|storage_diagnostic|storage diagnostic)\s*=|\bstored[- ]visual[- ]description\b|\binternal diagnostic\b|\bsource-mode\b|\bmode contamination\b)", re.I)
 
 @dataclass(frozen=True)
@@ -208,9 +218,19 @@ def _unsafe_row(row: dict) -> bool:
     content = str(row.get("content") or "")
     if UNSAFE_HISTORY_RE.search(content):
         return True
-    if role in {"model", "assistant", "bnl"} and QUEUE_SUBJECT_RE.search(content) and QUEUE_ASSERTION_VERB_RE.search(content):
+    if role in {"model", "assistant", "bnl"} and _unsafe_operational_state_assertion(content):
         return True
     return False
+
+def _unsafe_operational_state_assertion(content: str) -> bool:
+    text = content or ""
+    return bool(
+        OPERATIONAL_STATE_RE.search(text)
+        or QUEUE_STATE_RE.search(text)
+        or PAYMENT_STATE_RE.search(text)
+        or PRIORITY_STATE_RE.search(text)
+        or WHEEL_STATE_RE.search(text)
+    )
 
 def _cross_channel_allowed(pair: dict, req: ConversationContextRequest, current_text: str) -> bool:
     if req.channel_policy in SAME_CHANNEL_ONLY_PUBLIC_POLICIES:
@@ -235,26 +255,13 @@ def assemble_conversation_context_v2(rows: Iterable[dict], req: ConversationCont
     current_norms = {normalize_text(t) for t in req.current_texts if normalize_text(t)}
     current_text = " ".join(req.current_texts)
     source_rows = list(rows)
-    unsafe_paired_user_ids: set[int] = set()
-    pending_for_unsafe: list[dict] = []
-    for raw in sorted(source_rows, key=lambda r: int(r.get("id") or 0)):
-        raw_role = str(raw.get("role") or "").lower()
-        if raw_role == "user":
-            pending_for_unsafe.append(raw)
-            continue
-        if raw_role in {"model", "assistant", "bnl"} and _unsafe_row(raw):
-            for idx in range(len(pending_for_unsafe) - 1, -1, -1):
-                if _can_pair(pending_for_unsafe[idx], raw):
-                    unsafe_paired_user_ids.add(int(pending_for_unsafe[idx].get("id") or 0))
-                    pending_for_unsafe.pop(idx)
-                    break
     filtered, dupes, excluded = [], 0, 0
     for row in source_rows:
         p = _policy(row)
         same_room = _row_is_same_room(row, req)
-        if int(row.get("id") or 0) in unsafe_paired_user_ids:
-            excluded += 1; continue
-        if _unsafe_row(row):
+        role = str(row.get("role") or "").lower()
+        unsafe = _unsafe_row(row)
+        if unsafe and role == "user":
             excluded += 1; continue
         if same_room:
             if p != target_policy or (target_policy not in SAME_CHANNEL_CONTEXT_POLICIES): excluded += 1; continue
@@ -265,8 +272,15 @@ def assemble_conversation_context_v2(rows: Iterable[dict], req: ConversationCont
             if not _row_age_ok(row, now, CROSS_CHANNEL_RECENCY_MINUTES): excluded += 1; continue
         if p in BLOCKED_PUBLIC_POLICIES: excluded += 1; continue
         if _is_current_duplicate(row, req, current_norms): dupes += 1; continue
-        filtered.append(dict(row, _same_room=same_room))
-    pairs, unpaired_users, orphan_models = _pair_rows(filtered)
+        filtered.append(dict(row, _same_room=same_room, _unsafe_history=unsafe))
+    paired_all, unpaired_users, orphan_models = _pair_rows(filtered)
+    pairs = []
+    for pair in paired_all:
+        if pair["user"].get("_unsafe_history") or pair["model"].get("_unsafe_history"):
+            excluded += 2
+            continue
+        pairs.append(pair)
+    excluded += sum(1 for model in orphan_models if model.get("_unsafe_history"))
     scored_same, scored_cross = [], []
     for pair in pairs:
         same = bool(pair["user"].get("_same_room"))

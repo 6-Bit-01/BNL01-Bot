@@ -17252,7 +17252,7 @@ async def on_message(message: discord.Message):
             active_direct_session=active_same_user_session,
             conversation_surface=conversation_surface,
         )
-        save_decision = save_user_message(message.author.id, message.author.display_name, message.guild.id, conversation_content, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0), route_mode=conversation_plan.route_mode)
+        save_decision = save_user_message(message.author.id, message.author.display_name, message.guild.id, conversation_content, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0), message_id=getattr(message, "id", None), route_mode=conversation_plan.route_mode)
 
         # Direct/direct-like traffic is planned independently from passive batching;
         # non-direct active-channel traffic falls through to the batch planner below.
@@ -17569,7 +17569,7 @@ async def on_message(message: discord.Message):
             return
 
         if not is_sealed_test_channel:
-            save_user_message(message.author.id, message.author.display_name, message.guild.id, direct_content, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0), route_mode=route_mode)
+            save_user_message(message.author.id, message.author.display_name, message.guild.id, direct_content, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0), message_id=getattr(message, "id", None), route_mode=route_mode)
 
         repair = try_repair_response(direct_content)
         if repair:
@@ -17783,7 +17783,7 @@ async def on_message(message: discord.Message):
             return
 
         if not is_sealed_test_channel:
-            save_user_message(message.author.id, message.author.display_name, message.guild.id, direct_content, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0), route_mode=route_mode)
+            save_user_message(message.author.id, message.author.display_name, message.guild.id, direct_content, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0), message_id=getattr(message, "id", None), route_mode=route_mode)
 
         repair = try_repair_response(direct_content)
         if repair:
