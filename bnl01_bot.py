@@ -4391,7 +4391,14 @@ def _shadow_memory_ledger_write(writer_name: str, callback, *, guild_id: int = 0
         except Exception as receipt_exc:
             logging.debug("memory_ledger_shadow_receipt_failed writer=%s error=%s", writer_name, receipt_exc)
         conn.commit()
-        if result and result.entry_id and (result.source_table or source_table) == "conversations":
+        if (
+            result
+            and result.entry_id
+            and result.outcome in {"inserted", "deduplicated"}
+            and (result.source_table or source_table) == "conversations"
+            and moment_engine_shadow_enabled()
+            and memory_ledger_shadow_enabled()
+        ):
             try:
                 moment_conn = sqlite3.connect(DB_FILE)
                 try:

@@ -118,4 +118,25 @@ class MomentEngineV1Tests(unittest.TestCase):
         self.assertGreater(moments.build_moment_evaluation_report(self.conn,guild_id=2)["dangling_lineage_targets"],0)
         self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM memory_ledger_lineage l LEFT JOIN memory_ledger_entries e ON e.guild_id=l.guild_id AND e.entry_id=l.target_entry_id WHERE e.entry_id IS NULL AND l.guild_id=1").fetchone()[0],0)
 
+    def test_terminal_lifecycle_preserved_after_correction_and_rejected_refinalize(self):
+        self.add(101,1,"user","remember this number: 8",mins=20)
+        self.add(102,1,"model","ok",mins=20)
+        self.add(103,1,"user","remember this number: 9",mins=20)
+        self.sweep(24)
+        mid, entry_id = self.conn.execute("SELECT moment_id,canonical_ledger_entry_id FROM memory_moment_windows WHERE lifecycle_status='finalized' ORDER BY window_started_at DESC").fetchone()
+        self.assertTrue(entry_id.startswith("mle_"))
+        self.add(104,1,"user","Correction: the number is 10, not 8",mins=25)
+        self.assertEqual(self.conn.execute("SELECT lifecycle_status FROM memory_moment_windows WHERE moment_id=?",(mid,)).fetchone()[0],"needs_review")
+        result=moments.finalize_moment(self.conn, mid)
+        self.assertEqual(result.reason_code,"terminal_needs_review")
+        self.assertEqual(self.conn.execute("SELECT lifecycle_status FROM memory_moment_windows WHERE moment_id=?",(mid,)).fetchone()[0],"needs_review")
+        rendered=moments.render_shadow_moment_context(self.conn,guild_id=1,channel_id=10,participant_key="discord_user:1",visibility="sealed_test",topic_text="number",token_budget=50)
+        self.assertNotIn("Derived moment context", rendered)
+        self.add(201,7,"user","hello",mins=30)
+        self.sweep(35)
+        rejected_mid=self.conn.execute("SELECT moment_id FROM memory_moment_windows WHERE lifecycle_status='rejected' ORDER BY window_started_at DESC").fetchone()[0]
+        rejected_result=moments.finalize_moment(self.conn,rejected_mid)
+        self.assertEqual(rejected_result.reason_code,"terminal_rejected")
+        self.assertEqual(self.conn.execute("SELECT lifecycle_status FROM memory_moment_windows WHERE moment_id=?",(rejected_mid,)).fetchone()[0],"rejected")
+
 if __name__ == "__main__": unittest.main()

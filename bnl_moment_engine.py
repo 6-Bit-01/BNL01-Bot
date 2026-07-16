@@ -434,8 +434,13 @@ def finalize_moment(conn: sqlite3.Connection, moment_id: str) -> MomentObservati
     if not win:
         return MomentObservationResult(reason_code="missing_window", moment_id=moment_id)
     existing = _existing_moment_entry_id(conn, moment_id, int(win[0] or 0))
-    if win[10] == "finalized" and existing:
+    lifecycle = win[10] or ""
+    if lifecycle == "finalized":
         return MomentObservationResult("deduplicated", "already_finalized", moment_id, existing)
+    if lifecycle in {"needs_review", "rejected", "superseded", "retracted", "expired"}:
+        return MomentObservationResult("deduplicated", f"terminal_{lifecycle}", moment_id, existing)
+    if lifecycle != "open":
+        return MomentObservationResult("skipped", f"not_open_{lifecycle or 'unknown'}", moment_id, existing)
     rows = _entries(conn, moment_id)
     qtype, reason, humans, _models = _qualify(rows)
     if not qtype:

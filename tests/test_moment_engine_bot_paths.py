@@ -36,4 +36,11 @@ class MomentEngineBotPathTests(unittest.TestCase):
             rendered=bnl01_bot.build_conversation_context_v2_for_prompt(guild_id=1,current_user_id=1,channel_id=10,channel_name="c10",channel_policy="sealed_test",route_mode=bnl01_bot.ROUTE_MODE_NORMAL_CHAT,current_texts=["synth question"],current_participants={1})
         self.assertEqual(rendered,"")
 
+    def test_disabled_gate_does_not_call_moment_observer(self):
+        os.environ.pop("BNL_MOMENT_ENGINE_SHADOW_ENABLED",None)
+        with mock.patch("bnl01_bot.observe_moment_ledger_entry", side_effect=AssertionError("observer should not be called")):
+            bnl01_bot.save_user_message(3,"C",1,"remember this number: 10",channel_policy="sealed_test",channel_id=10)
+        self.assertEqual(self.rows("SELECT COUNT(*) FROM memory_ledger_entries WHERE source_table='conversations'")[0][0],1)
+        self.assertEqual(self.rows("SELECT name FROM sqlite_master WHERE type='table' AND name='memory_moment_windows'"),[])
+
 if __name__ == "__main__": unittest.main()
