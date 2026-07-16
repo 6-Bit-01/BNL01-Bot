@@ -50,6 +50,13 @@ from bnl_moment_engine import (
     shadow_enabled as moment_engine_shadow_enabled,
     sweep_expired_windows as sweep_expired_moment_windows,
 )
+from bnl_relationship_engine import (
+    ensure_relationship_v2_schema,
+    governed_summary as governed_relationship_v2_summary,
+    observe_message as observe_relationship_v2_message,
+    set_member_setting as set_relationship_v2_member_setting,
+    shadow_enabled as relationship_v2_shadow_enabled,
+)
 from bnl_conversation_context_v2 import (
     CONVERSATION_CONTEXT_VERSION,
     ConversationContextRequest,
@@ -4378,6 +4385,7 @@ def init_db():
     try:
         ensure_entity_evidence_schema(evidence_conn)
         ensure_memory_ledger_schema(evidence_conn)
+        ensure_relationship_v2_schema(evidence_conn)
         evidence_conn.commit()
     finally:
         evidence_conn.close()
@@ -9516,6 +9524,17 @@ def save_user_message(user_id: int, user_name: str, guild_id: int, content: str,
         ),
         guild_id=guild_id, source_table="conversations", source_row_id=row_id, source_revision=str(row_id),
     )
+    if relationship_v2_shadow_enabled():
+        try:
+            with sqlite3.connect(DB_FILE) as rel_conn:
+                observe_relationship_v2_message(
+                    rel_conn, guild_id=guild_id, user_id=user_id, role="user", content=content, source_row_id=row_id,
+                    user_name=user_name, channel_policy=(channel_policy or "unknown")[:40], channel_name=(channel_name or "").lower()[:80],
+                    channel_id=int(channel_id or 0), message_id=int(message_id or 0) or None, route_mode=route_mode,
+                    directed=bool(route_mode in {ROUTE_MODE_NORMAL_CHAT, ROUTE_MODE_SHOW_STATUS}), observed_at=observed_at,
+                )
+        except Exception as exc:
+            logging.debug("relationship_v2_shadow_observe_user_failed error=%s", exc)
     try:
         mark_subject_dirty_for_evidence(
             DB_FILE,
@@ -9584,6 +9603,16 @@ def save_model_message(user_id: int, guild_id: int, content: str, channel_name: 
         ),
         guild_id=guild_id, source_table="conversations", source_row_id=row_id, source_revision=str(row_id),
     )
+    if relationship_v2_shadow_enabled():
+        try:
+            with sqlite3.connect(DB_FILE) as rel_conn:
+                observe_relationship_v2_message(
+                    rel_conn, guild_id=guild_id, user_id=user_id, role="model", content=content, source_row_id=row_id,
+                    channel_policy=(channel_policy or "unknown")[:40], channel_name=(channel_name or "").lower()[:80], channel_id=int(channel_id or 0),
+                    route_mode=route_mode, directed=True, observed_at=observed_at,
+                )
+        except Exception as exc:
+            logging.debug("relationship_v2_shadow_observe_model_failed error=%s", exc)
     prune_conversation_history(user_id, guild_id, calculate_adaptive_memory_limits(user_id, guild_id, route_mode=route_mode, channel_policy=channel_policy, user_text=content).get("conversation_rows", MAX_CONVERSATION_ROWS_PER_USER))
     if decision.update_relationship:
         update_relationship_state(user_id, guild_id, content, delta_affinity=0.04)
@@ -18592,6 +18621,30 @@ async def memory_complete_delete(interaction: discord.Interaction, confirmation:
         await interaction.response.send_message(f"✅ Complete delete finished for bot-held personal data in this server. Receipt `{result.get('receipt')}`. This does not delete messages stored by Discord itself.", ephemeral=True)
     else:
         await interaction.response.send_message(f"❌ Complete delete not run: {result.get('reason')}. To confirm, type `DELETE MY BNL DATA {interaction.guild.id}`.", ephemeral=True)
+
+
+@tree.command(name="relationship_settings", description="Privately view or change your BNL relationship-v2 settings here.")
+@app_commands.describe(action="view, disable_proactive, enable_proactive, disable_playful_rivalry, controls")
+async def relationship_settings(interaction: discord.Interaction, action: str = "view"):
+    if not interaction.guild:
+        await interaction.response.send_message("❌ This command can only be used in a server.", ephemeral=True); return
+    action_norm = (action or "view").strip().lower()
+    with sqlite3.connect(DB_FILE) as conn:
+        if action_norm == "disable_proactive":
+            set_relationship_v2_member_setting(conn, guild_id=interaction.guild.id, user_id=interaction.user.id, proactive_enabled=False)
+            msg = "✅ Proactive recognition and follow-up disabled for you in this server."
+        elif action_norm == "enable_proactive":
+            set_relationship_v2_member_setting(conn, guild_id=interaction.guild.id, user_id=interaction.user.id, proactive_enabled=True)
+            msg = "✅ Proactive recognition and follow-up re-enabled for you in this server."
+        elif action_norm == "disable_playful_rivalry":
+            set_relationship_v2_member_setting(conn, guild_id=interaction.guild.id, user_id=interaction.user.id, playful_rivalry_enabled=False)
+            msg = "✅ Playful/rivalry classification disabled for you in this server."
+        elif action_norm == "controls":
+            msg = "For correction or deletion, use `/memory_view`, `/memory_correct`, `/memory_forget`, or `/memory_complete_delete`. Relationship state is self-only and not exposed to other members."
+        else:
+            summary = governed_relationship_v2_summary(conn, guild_id=interaction.guild.id, user_id=interaction.user.id, route_mode=ROUTE_MODE_NORMAL_CHAT, channel_policy="internal_controlled") or "No governed relationship-v2 summary is available while live mode is off or before evidence exists."
+            msg = summary + "\nSettings: use `disable_proactive`, `enable_proactive`, `disable_playful_rivalry`, or `controls`."
+    await interaction.response.send_message(msg[:1900], ephemeral=True)
 
 @tree.command(name="usage", description="View BNL-01's daily token usage statistics.")
 @app_commands.checks.has_permissions(administrator=True)

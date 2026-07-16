@@ -20,6 +20,7 @@ from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 from bnl_dossier_source_packets import subject_key as normalized_subject_key
 from bnl_memory_ledger import ensure_memory_ledger_schema, subject_key_for_user
+from bnl_relationship_engine import complete_delete_relationship_v2, ensure_relationship_v2_schema
 
 SHADOW_ENV = "BNL_MEMORY_GOVERNANCE_SHADOW_ENABLED"
 LIVE_ENV = "BNL_MEMORY_GOVERNANCE_LIVE_ENABLED"
@@ -583,6 +584,11 @@ def complete_delete_member_data(conn: sqlite3.Connection, *, guild_id: int, user
         # Core member-owned tables.
         for table in ("conversations", "user_profiles", "user_memory_facts", "user_habits", "relationship_state", "relationship_journal", "memory_tiers", "response_style_log"):
             counts[table] = _delete_by_user(conn, table, guild_id, user_id)
+        try:
+            ensure_relationship_v2_schema(conn)
+            counts.update(complete_delete_relationship_v2(conn, guild_id=guild_id, user_id=user_id))
+        except Exception:
+            counts["relationship_v2_delete_errors"] = counts.get("relationship_v2_delete_errors", 0) + 1
         # Community/member activity schemas use varied identity columns.
         if _table_exists(conn, "community_presence"):
             for col in ("user_id", "member_user_id", "subject_user_id", "discord_user_id"):
