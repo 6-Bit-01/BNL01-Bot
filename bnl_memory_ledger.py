@@ -368,15 +368,32 @@ def shadow_broadcast_memory_row(conn: sqlite3.Connection, *, row_id: int, guild_
     return insert_ledger_entry(conn, LedgerEntry(guild_id=guild_id, source_table="broadcast_memory", source_row_id=row_id, source_revision=rev, source_role="broadcast_memory", entry_type="show_event" if "show" in (entry_type or "") else "event", subject_key="barcode_radio", subject_display_name="BARCODE Radio", predicate_key=entry_type or "broadcast_memory", value=cleaned_summary[:500], source_class=SourceClass.FIRST_PARTY_RECORD, visibility=Visibility.PUBLIC_SAFE if public_ok else Visibility.INTERNAL, confidence=Confidence.HIGH if public_ok else Confidence.MEDIUM, public_usable=public_ok, salience=0.5, observed_at=created_at or updated_at or _now(), source_sequence=int(row_id or 0), freshness=usage_scope or "", lifecycle_status=lifecycle, participants=tuple([LedgerParticipant(f"discord_user:{submitted_by_user_id}", submitted_by_name or "", "submitter", 0)] if submitted_by_user_id else ()), lineage=lineage))
 
 
+def _unique_broadcast_primary_entry(conn: sqlite3.Connection, *, guild_id: int, source_row_id: int | str) -> str:
+    ensure_memory_ledger_schema(conn)
+    rows = conn.execute(
+        "SELECT entry_id FROM memory_ledger_entries WHERE guild_id=? AND source_table='broadcast_memory' AND source_row_id=? AND source_role='broadcast_memory' ORDER BY created_at DESC",
+        (guild_id, str(source_row_id)),
+    ).fetchall()
+    return rows[0][0] if len(rows) == 1 else ""
+
+
 def shadow_broadcast_status_event(conn: sqlite3.Connection, *, row_id: int, guild_id: int, status: str, updated_at: str, actor_id: int | None = None, actor_name: str = "", superseded_by_id: int | None = None) -> LedgerWriteResult:
     rev = source_revision_for(row_id, updated_at, event=f"status:{status}:{updated_at}")
-    target = stable_entry_id(guild_id=guild_id, source_table="broadcast_memory", source_row_id=row_id, source_revision=str(row_id), entry_type="event", subject_key="barcode_radio", predicate_key="broadcast_status")
     lineage = ()
+    reason_override = "ok"
+    if status == "superseded" and superseded_by_id:
+        old_entry = _unique_broadcast_primary_entry(conn, guild_id=guild_id, source_row_id=row_id)
+        replacement_entry = _unique_broadcast_primary_entry(conn, guild_id=guild_id, source_row_id=superseded_by_id)
+        if old_entry and replacement_entry:
+            lineage = (("derived_from", old_entry), ("derived_from", replacement_entry))
+        else:
+            reason_override = "unresolved_broadcast_status_lineage"
     lifecycle = RESOLVED_LIFECYCLE if status == "resolved" else REVIEW_ONLY_LIFECYCLE
     predicate = f"broadcast_status:{status or 'unknown'}"
-    if status == "superseded" and superseded_by_id:
-        lifecycle = REVIEW_ONLY_LIFECYCLE
-    return insert_ledger_entry(conn, LedgerEntry(guild_id=guild_id, source_table="broadcast_memory", source_row_id=row_id, source_revision=rev, source_event_key=f"status:{status}", source_role="broadcast_memory_status", entry_type="event", subject_key="barcode_radio", subject_display_name="BARCODE Radio", predicate_key=predicate, value=status or "unknown", source_class=SourceClass.FIRST_PARTY_RECORD, visibility=Visibility.INTERNAL, confidence=Confidence.HIGH, public_usable=False, observed_at=updated_at or _now(), source_sequence=int(row_id or 0), lifecycle_status=lifecycle, participants=tuple([LedgerParticipant(f"discord_user:{actor_id}", actor_name or "", "correction_actor", 0)] if actor_id else ()), lineage=lineage))
+    result = insert_ledger_entry(conn, LedgerEntry(guild_id=guild_id, source_table="broadcast_memory", source_row_id=row_id, source_revision=rev, source_event_key=f"status:{status}", source_role="broadcast_memory_status", entry_type="event", subject_key="barcode_radio", subject_display_name="BARCODE Radio", predicate_key=predicate, value=status or "unknown", source_class=SourceClass.FIRST_PARTY_RECORD, visibility=Visibility.INTERNAL, confidence=Confidence.HIGH, public_usable=False, observed_at=updated_at or _now(), source_sequence=int(row_id or 0), lifecycle_status=lifecycle, participants=tuple([LedgerParticipant(f"discord_user:{actor_id}", actor_name or "", "correction_actor", 0)] if actor_id else ()), lineage=lineage))
+    if reason_override != "ok" and result.outcome == "inserted":
+        return LedgerWriteResult(result.entry_id, result.outcome, reason_override, result.source_table, result.source_row_id, result.source_revision, result.source_event_key, result.guild_id)
+    return result
 
 
 def shadow_canon_reference(conn: sqlite3.Connection, *, guild_id: int, canon_id: str, subject_key: str, subject_display_name: str, predicate_key: str, value: str, observed_at: str = "") -> LedgerWriteResult:
@@ -424,5 +441,4 @@ def build_memory_ledger_evaluation(conn: sqlite3.Connection, *, guild_id: int | 
     dangling_lineage = int(cur.fetchone()[0] or 0)
     report["danglingLineageTargets"] = dangling_lineage
     report["legacyToLedgerParityMismatches"] = missing_receipt_entries + entries_without_receipts + dangling_lineage + int(report.get("shadowWriteErrors", 0)) + int(report.get("unresolvedCorrectionAttempts", 0))
-    report["implicitSupersessionsBlocked"] = 0
     return report

@@ -10573,6 +10573,8 @@ def add_broadcast_memory_entry(guild_id: int, message: discord.Message, processe
         ),
     )
     new_id = cursor.lastrowid
+    if processed.get("supersedes_id"):
+        cursor.execute("UPDATE broadcast_memory SET supersedes_id=?, corrected_by_user_id=?, corrected_by_name=?, correction_reason=?, updated_at=? WHERE id=?", (int(processed.get("supersedes_id") or 0), getattr(getattr(message, "author", None), "id", None), getattr(getattr(message, "author", None), "display_name", "system"), "replacement", now, new_id))
     committed = cursor.execute("SELECT cleaned_summary, entry_type, public_safe, status, usage_scope, submitted_by_user_id, submitted_by_name, created_at, updated_at, supersedes_id FROM broadcast_memory WHERE id=?", (new_id,)).fetchone()
     conn.commit()
     conn.close()
@@ -17178,7 +17180,6 @@ async def on_message(message: discord.Message):
                 cleared = clear_active_show_state_overrides(message.guild.id)
                 await message.reply(f"Logged. Normal schedule restored; resolved overrides: {cleared}.")
                 return
-            _set_broadcast_memory_status(target_id, "superseded", message.author.id, message.author.display_name, "explicit correction/replace request")
             if processed.get("entry_type") == "reject":
                 processed = {
                     "entry_type": target_type,
@@ -17191,23 +17192,18 @@ async def on_message(message: discord.Message):
                 }
             processed["episode_date"] = _extract_exact_episode_date(correction_text) or target_date
             processed["entry_type"] = processed.get("entry_type") or target_type
+            processed["supersedes_id"] = target_id
             new_id = add_broadcast_memory_entry(message.guild.id, faux_message, processed)
+            updated_at = datetime.now(PACIFIC_TZ).isoformat()
             conn = sqlite3.connect(DB_FILE)
             cursor = conn.cursor()
-            cursor.execute("UPDATE broadcast_memory SET supersedes_id=?, corrected_by_user_id=?, corrected_by_name=?, correction_reason=? WHERE id=?", (target_id, message.author.id, message.author.display_name, "replacement", new_id))
-            cursor.execute("UPDATE broadcast_memory SET superseded_by_id=?, updated_at=? WHERE id=?", (new_id, datetime.now(PACIFIC_TZ).isoformat(), target_id))
-            updated_at = datetime.now(PACIFIC_TZ).isoformat()
+            cursor.execute("UPDATE broadcast_memory SET status='superseded', superseded_by_id=?, updated_at=?, corrected_by_user_id=?, corrected_by_name=?, correction_reason=? WHERE id=?", (new_id, updated_at, message.author.id, message.author.display_name, "explicit correction/replace request", target_id))
             conn.commit()
             conn.close()
             _shadow_memory_ledger_write(
-                "broadcast_memory_replacement",
-                lambda ledger_conn: shadow_broadcast_memory_row(
-                    ledger_conn, row_id=int(new_id or 0), guild_id=message.guild.id, cleaned_summary=processed.get("cleaned_summary", ""),
-                    entry_type=processed.get("entry_type", target_type), public_safe=bool(processed.get("public_safe")), status="active",
-                    usage_scope=processed.get("usage_scope", "internal"), submitted_by_user_id=message.author.id, submitted_by_name=message.author.display_name,
-                    created_at=updated_at, updated_at=updated_at, supersedes_id=target_id,
-                ),
-                guild_id=message.guild.id, source_table="broadcast_memory", source_row_id=int(new_id or 0), source_revision=f"rev:{int(new_id or 0)}:{updated_at.lower()}",
+                "broadcast_memory_status",
+                lambda ledger_conn: shadow_broadcast_status_event(ledger_conn, row_id=target_id, guild_id=message.guild.id, status="superseded", updated_at=updated_at, actor_id=message.author.id, actor_name=message.author.display_name, superseded_by_id=new_id),
+                guild_id=message.guild.id, source_table="broadcast_memory", source_row_id=target_id, source_revision=f"event:status:superseded:{updated_at.lower()}", source_event_key="status:superseded",
             )
             await message.reply(f"Corrected broadcast memory: resolved/superseded id {target_id} and added replacement id {new_id} for {processed.get('episode_date')}.")
             return

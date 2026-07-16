@@ -138,6 +138,113 @@ class MemoryLedgerBotPathTests(unittest.TestCase):
         dump = str(self.rows("SELECT * FROM memory_ledger_shadow_receipts"))
         self.assertNotIn("RAW SECRET", dump)
 
+    def test_broadcast_replacement_has_one_revision_and_real_lineage(self):
+        self.enable()
+        original_id = bnl01_bot.add_broadcast_memory_entry(
+            1,
+            _Message("RAW original"),
+            {
+                "cleaned_summary": "Original safe summary.",
+                "entry_type": "show_note",
+                "public_safe": True,
+                "usage_scope": "ambient,direct",
+            },
+        )
+        replacement_id = bnl01_bot.add_broadcast_memory_entry(
+            1,
+            _Message("RAW replacement"),
+            {
+                "cleaned_summary": "Replacement safe summary.",
+                "entry_type": "show_note",
+                "public_safe": True,
+                "usage_scope": "ambient,direct",
+                "supersedes_id": original_id,
+            },
+        )
+        updated_at = "2026-07-16T00:00:00-07:00"
+        with sqlite3.connect(bnl01_bot.DB_FILE) as conn:
+            conn.execute(
+                "UPDATE broadcast_memory SET status='superseded', superseded_by_id=?, updated_at=? WHERE id=?",
+                (replacement_id, updated_at, original_id),
+            )
+            conn.commit()
+        bnl01_bot._shadow_memory_ledger_write(
+            "broadcast_memory_status",
+            lambda ledger_conn: ledger.shadow_broadcast_status_event(
+                ledger_conn,
+                row_id=original_id,
+                guild_id=1,
+                status="superseded",
+                updated_at=updated_at,
+                actor_id=42,
+                actor_name="Crow",
+                superseded_by_id=replacement_id,
+            ),
+            guild_id=1,
+            source_table="broadcast_memory",
+            source_row_id=original_id,
+            source_revision=f"event:status:superseded:{updated_at.lower()}",
+            source_event_key="status:superseded",
+        )
+        primary_rows = self.rows(
+            """
+            SELECT source_row_id, entry_id, normalized_value
+            FROM memory_ledger_entries
+            WHERE source_table='broadcast_memory' AND source_role='broadcast_memory'
+            ORDER BY CAST(source_row_id AS INTEGER)
+            """
+        )
+        self.assertEqual(len(primary_rows), 2)
+        original_entry = primary_rows[0][1]
+        replacement_entry = primary_rows[1][1]
+        self.assertEqual(primary_rows[0][0], str(original_id))
+        self.assertEqual(primary_rows[1][0], str(replacement_id))
+        self.assertEqual(primary_rows[1][2], "Replacement safe summary.")
+        self.assertEqual(
+            self.rows(
+                "SELECT COUNT(*) FROM memory_ledger_entries WHERE source_table='broadcast_memory' AND source_role='broadcast_memory' AND source_row_id=?",
+                (str(replacement_id),),
+            )[0][0],
+            1,
+        )
+        self.assertEqual(
+            self.rows(
+                "SELECT COUNT(*) FROM memory_ledger_entries WHERE source_table='broadcast_memory' AND source_role='broadcast_memory_status' AND source_row_id=?",
+                (str(original_id),),
+            )[0][0],
+            1,
+        )
+        self.assertEqual(
+            set(self.rows("SELECT lineage_type, target_entry_id FROM memory_ledger_lineage WHERE entry_id=?", (replacement_entry,))),
+            {("correction_of", original_entry), ("supersedes", original_entry)},
+        )
+        self.assertEqual(
+            self.rows(
+                """
+                SELECT COUNT(*)
+                FROM memory_ledger_lineage l
+                LEFT JOIN memory_ledger_entries e
+                  ON e.guild_id=l.guild_id AND e.entry_id=l.target_entry_id
+                WHERE e.entry_id IS NULL
+                """
+            )[0][0],
+            0,
+        )
+        effective_active = self.rows(
+            """
+            SELECT entry_id
+            FROM memory_ledger_entries
+            WHERE source_table='broadcast_memory'
+              AND source_role='broadcast_memory'
+              AND lifecycle_status='active'
+              AND entry_id NOT IN (
+                SELECT target_entry_id FROM memory_ledger_lineage
+                WHERE lineage_type IN ('supersedes', 'retracts')
+              )
+            """
+        )
+        self.assertEqual(effective_active, [(replacement_entry,)])
+
     def test_report_is_guild_scoped_and_counts_real_outcomes(self):
         self.enable()
         bnl01_bot.save_user_message(42, "Crow", 1, "remember this number: 8", channel_policy="sealed_test")
