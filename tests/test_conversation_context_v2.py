@@ -184,6 +184,34 @@ class ConversationContextV2CorrectionTests(unittest.TestCase):
         self.assertNotIn("System:", res.rendered_context)
         self.assertNotIn("Current user request:", res.rendered_context)
 
+
+    def test_queue_assertion_word_orders_exclude_whole_pair(self):
+        claims = [
+            "The queue has three tracks waiting.",
+            "Three tracks are in the queue.",
+            "The queue currently contains three entries.",
+            "Payment is active for that session.",
+            "Priority Signal is enabled and Wheel spins owed are three.",
+            "Up next is the paid session track.",
+        ]
+        rows=[]
+        for i, claim in enumerate(claims, start=1):
+            rows.append(row(i*2-1, "user", f"queue question {i}"))
+            rows.append(row(i*2, "model", claim))
+        res = assemble_conversation_context_v2(rows, req(current_texts=("queue question",)))
+        for claim in claims:
+            self.assertNotIn(claim, res.rendered_context)
+        self.assertNotIn("queue question", res.rendered_context)
+
+    def test_storage_conversation_allowed_but_media_storage_diagnostics_excluded(self):
+        ordinary = [row(1,"user","Which cloud storage plan works?"), row(2,"model","Use the smaller storage plan.")]
+        res = assemble_conversation_context_v2(ordinary, req(current_texts=("cloud storage",)))
+        self.assertIn("smaller storage plan", res.rendered_context)
+        diagnostic = [row(3,"user","what did you store?"), row(4,"model","provider=tenor host=cdn preview=yes stored visual description missing")]
+        bad = assemble_conversation_context_v2(diagnostic, req(current_texts=("what did you store?",)))
+        self.assertNotIn("provider=tenor", bad.rendered_context)
+        self.assertNotIn("what did you store", bad.rendered_context)
+
     def test_budget_preserves_whole_pairs_and_counts_rendered_only(self):
         long = "x" * 2000
         rows = [row(1,"user","first "+long), row(2,"model","first answer "+long), row(3,"user","second relevant"), row(4,"model","second answer")]
@@ -263,11 +291,48 @@ class BotConversationContextV2IntegrationTests(unittest.TestCase):
         b=self.bot
         self._insert("user","batch prior", mid=401); self._insert("model","batch answer", mid=402)
         prompt=b._format_batched_prompt([("member","current batch")], "balanced", "style")
-        ctx=b.build_conversation_context_v2_for_prompt(guild_id=99,current_user_id=1,channel_id=10,channel_name="home",channel_policy="public_home",route_mode=b.ROUTE_MODE_NORMAL_CHAT,conversation_surface=b.CONVERSATION_SURFACE_FREE_SPEAK_PUBLIC_HOME,current_texts=["current batch"],current_participants={1},is_batch=True)
+        ctx=b.build_active_batch_conversation_context_v2_prompt(
+            guild_id=99, channel_id=10, channel_name="home", channel_policy="public_home", first_uid=1,
+            collapsed_items=[("member", "current batch", 1)], unique_user_ids=[1], active_packet={"payload_items": [], "has_request_payload": False},
+            is_active_channel=False,
+        )
         prompt += "\n\n" + ctx
         self.assertIn("Conversation continuity (bounded", prompt)
         self.assertIn("batch answer", prompt)
         self.assertNotIn("User/member: current batch", prompt)
+
+
+    def test_save_model_message_calls_do_not_use_unsupported_message_id_keyword(self):
+        import inspect
+        import ast
+        import bnl01_bot
+        signature = inspect.signature(bnl01_bot.save_model_message)
+        allowed = set(signature.parameters)
+        with open("bnl01_bot.py", encoding="utf-8") as fh:
+            tree = ast.parse(fh.read())
+        bad = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call) and getattr(node.func, "id", "") == "save_model_message":
+                for kw in node.keywords:
+                    if kw.arg and kw.arg not in allowed:
+                        bad.append(kw.arg)
+        self.assertNotIn("message_id", bad)
+        self.assertEqual(bad, [])
+
+    def test_active_batch_dedupes_all_current_participants_with_text_fallback(self):
+        b=self.bot
+        self._insert("user", "older stable question", uid=1, mid=None); self._insert("model", "older stable answer", uid=1, mid=None)
+        self._insert("user", "current first participant", uid=1, mid=None)
+        self._insert("user", "current second participant", uid=2, mid=None)
+        ctx=b.build_active_batch_conversation_context_v2_prompt(
+            guild_id=99, channel_id=10, channel_name="home", channel_policy="public_home", first_uid=1,
+            collapsed_items=[("one", "current first participant", 1), ("two", "current second participant", 2)],
+            unique_user_ids=[1, 2], active_packet={"payload_items": [], "has_request_payload": False}, is_active_channel=False,
+        )
+        self.assertNotIn("current first participant", ctx)
+        self.assertNotIn("current second participant", ctx)
+        self.assertIn("older stable answer", ctx)
+        self.assertEqual(b.LAST_CONVERSATION_CONTEXT_V2_DIAGNOSTICS.get("current_message_duplicates_removed"), 2)
 
     def test_user_zero_generation_gets_no_v2_context(self):
         rendered=self.bot.build_conversation_context_v2_for_prompt(guild_id=99,current_user_id=0,channel_id=10,channel_name="home",channel_policy="public_home",route_mode=self.bot.ROUTE_MODE_NORMAL_CHAT,current_texts=["relay"])

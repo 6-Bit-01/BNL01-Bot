@@ -14748,6 +14748,37 @@ def _build_payload_fallback_lines(missing_items):
     # Deprecated for conversational routes: never synthesize missing payload content.
     return ""
 
+def build_active_batch_conversation_context_v2_prompt(
+    *,
+    guild_id: int,
+    channel_id: int,
+    channel_name: str,
+    channel_policy: str,
+    first_uid: int,
+    collapsed_items,
+    unique_user_ids,
+    active_packet: dict,
+    pending_state=None,
+    pending_anchor=None,
+    is_active_channel: bool = False,
+) -> str:
+    """Build the shared v2 continuity block used by active-batch/free-speak generation."""
+    route_mode_for_batch = ROUTE_MODE_DIRECT_PAYLOAD if active_packet.get("has_request_payload") or active_packet.get("payload_items") else ROUTE_MODE_NORMAL_CHAT
+    return build_conversation_context_v2_for_prompt(
+        guild_id=guild_id,
+        current_user_id=first_uid,
+        channel_id=channel_id,
+        channel_name=channel_name,
+        channel_policy=channel_policy,
+        route_mode=route_mode_for_batch,
+        conversation_surface=conversation_surface_for_channel_policy(channel_policy, is_active_channel),
+        current_texts=[content for (_name, content, _uid) in collapsed_items],
+        current_participants=set(unique_user_ids),
+        is_batch=True,
+        is_direct_target=bool(active_packet.get("addressed_to_bot")),
+        is_deferred_payload_session=bool(pending_state or pending_anchor),
+    )
+
 async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_state=None):
     channel_id = channel.id
     guild_id = channel.guild.id
@@ -15066,20 +15097,18 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
             log_response_style(channel.guild.id, first_uid, style_key)
             prompt = _format_batched_prompt(msg_list, style_key, style_rule)
             if conversation_context_v2_enabled():
-                route_mode_for_batch = ROUTE_MODE_DIRECT_PAYLOAD if active_packet.get("has_request_payload") or active_packet.get("payload_items") else ROUTE_MODE_NORMAL_CHAT
-                recent_room_prompt = build_conversation_context_v2_for_prompt(
+                recent_room_prompt = build_active_batch_conversation_context_v2_prompt(
                     guild_id=guild_id,
-                    current_user_id=first_uid,
                     channel_id=channel_id,
                     channel_name=getattr(channel, "name", ""),
                     channel_policy=channel_policy,
-                    route_mode=route_mode_for_batch,
-                    conversation_surface=conversation_surface_for_channel_policy(channel_policy, channel_id == get_guild_config(guild_id)),
-                    current_texts=[content for (_name, content, _uid) in collapsed_items],
-                    current_participants=set(unique_user_ids),
-                    is_batch=True,
-                    is_direct_target=bool(active_packet.get("addressed_to_bot")),
-                    is_deferred_payload_session=bool(pending_state or pending_anchor),
+                    first_uid=first_uid,
+                    collapsed_items=collapsed_items,
+                    unique_user_ids=unique_user_ids,
+                    active_packet=active_packet,
+                    pending_state=pending_state,
+                    pending_anchor=pending_anchor,
+                    is_active_channel=(channel_id == get_guild_config(guild_id)),
                 )
             else:
                 recent_room_prompt = build_recent_text_room_context_for_prompt(
@@ -17223,7 +17252,7 @@ async def on_message(message: discord.Message):
             active_direct_session=active_same_user_session,
             conversation_surface=conversation_surface,
         )
-        save_decision = save_user_message(message.author.id, message.author.display_name, message.guild.id, conversation_content, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0), message_id=getattr(message, "id", None), route_mode=conversation_plan.route_mode)
+        save_decision = save_user_message(message.author.id, message.author.display_name, message.guild.id, conversation_content, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0), route_mode=conversation_plan.route_mode)
 
         # Direct/direct-like traffic is planned independently from passive batching;
         # non-direct active-channel traffic falls through to the batch planner below.
@@ -17274,7 +17303,7 @@ async def on_message(message: discord.Message):
             repair = try_repair_response(direct_content)
             if repair:
                 if not is_sealed_test_channel:
-                    save_model_message(message.author.id, message.guild.id, repair, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0), message_id=getattr(message, "id", None), route_mode=route_mode)
+                    save_model_message(message.author.id, message.guild.id, repair, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0), route_mode=route_mode)
                 await message.reply(repair)
                 return
 
@@ -17283,7 +17312,7 @@ async def on_message(message: discord.Message):
                 if not is_privileged_member(message.author, message.guild):
                     self_reflection = "Status reports are restricted to server owner/mod operators."
                 if not is_sealed_test_channel:
-                    save_model_message(message.author.id, message.guild.id, self_reflection, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0), message_id=getattr(message, "id", None), route_mode=route_mode)
+                    save_model_message(message.author.id, message.guild.id, self_reflection, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0), route_mode=route_mode)
                 await message.reply(self_reflection)
                 return
 
@@ -17292,7 +17321,7 @@ async def on_message(message: discord.Message):
                 memory_recall = try_memory_recall_response(message.author.id, message.guild.id, direct_content)
             if memory_recall:
                 if not is_sealed_test_channel:
-                    save_model_message(message.author.id, message.guild.id, memory_recall, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0), message_id=getattr(message, "id", None), route_mode=route_mode)
+                    save_model_message(message.author.id, message.guild.id, memory_recall, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0), route_mode=route_mode)
                 await message.reply(memory_recall)
                 return
 
@@ -17540,11 +17569,11 @@ async def on_message(message: discord.Message):
             return
 
         if not is_sealed_test_channel:
-            save_user_message(message.author.id, message.author.display_name, message.guild.id, direct_content, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0), message_id=getattr(message, "id", None), route_mode=route_mode)
+            save_user_message(message.author.id, message.author.display_name, message.guild.id, direct_content, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0), route_mode=route_mode)
 
         repair = try_repair_response(direct_content)
         if repair:
-            save_model_message(message.author.id, message.guild.id, repair, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0), message_id=getattr(message, "id", None), route_mode=route_mode)
+            save_model_message(message.author.id, message.guild.id, repair, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0), route_mode=route_mode)
             await message.reply(repair)
             return
 
@@ -17552,7 +17581,7 @@ async def on_message(message: discord.Message):
         if self_reflection:
             if not is_privileged_member(message.author, message.guild):
                 self_reflection = "Status reports are restricted to server owner/mod operators."
-            save_model_message(message.author.id, message.guild.id, self_reflection, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0), message_id=getattr(message, "id", None), route_mode=route_mode)
+            save_model_message(message.author.id, message.guild.id, self_reflection, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0), route_mode=route_mode)
             await message.reply(self_reflection)
             return
 
@@ -17560,7 +17589,7 @@ async def on_message(message: discord.Message):
         if not memory_recall:
             memory_recall = try_memory_recall_response(message.author.id, message.guild.id, direct_content)
         if memory_recall:
-            save_model_message(message.author.id, message.guild.id, memory_recall, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0), message_id=getattr(message, "id", None), route_mode=route_mode)
+            save_model_message(message.author.id, message.guild.id, memory_recall, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0), route_mode=route_mode)
             await message.reply(memory_recall)
             return
 
@@ -17754,11 +17783,11 @@ async def on_message(message: discord.Message):
             return
 
         if not is_sealed_test_channel:
-            save_user_message(message.author.id, message.author.display_name, message.guild.id, direct_content, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0), message_id=getattr(message, "id", None), route_mode=route_mode)
+            save_user_message(message.author.id, message.author.display_name, message.guild.id, direct_content, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0), route_mode=route_mode)
 
         repair = try_repair_response(direct_content)
         if repair:
-            save_model_message(message.author.id, message.guild.id, repair, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0), message_id=getattr(message, "id", None), route_mode=route_mode)
+            save_model_message(message.author.id, message.guild.id, repair, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0), route_mode=route_mode)
             await message.reply(repair if len(repair) <= 2000 else repair[:1900] + "...")
             return
 
@@ -17766,7 +17795,7 @@ async def on_message(message: discord.Message):
         if self_reflection:
             if not is_privileged_member(message.author, message.guild):
                 self_reflection = "Status reports are restricted to server owner/mod operators."
-            save_model_message(message.author.id, message.guild.id, self_reflection, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0), message_id=getattr(message, "id", None), route_mode=route_mode)
+            save_model_message(message.author.id, message.guild.id, self_reflection, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0), route_mode=route_mode)
             await message.reply(self_reflection if len(self_reflection) <= 2000 else self_reflection[:1900] + "...")
             return
 
@@ -17774,7 +17803,7 @@ async def on_message(message: discord.Message):
         if not memory_recall:
             memory_recall = try_memory_recall_response(message.author.id, message.guild.id, direct_content)
         if memory_recall:
-            save_model_message(message.author.id, message.guild.id, memory_recall, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0), message_id=getattr(message, "id", None), route_mode=route_mode)
+            save_model_message(message.author.id, message.guild.id, memory_recall, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0), route_mode=route_mode)
             await message.reply(memory_recall if len(memory_recall) <= 2000 else memory_recall[:1900] + "...")
             return
 

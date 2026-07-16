@@ -37,8 +37,9 @@ CORRECTION_RE = re.compile(r"\b(?:actually|correction|correcting|i meant|instead
 BOUNDARY_RE = re.compile(r"\b(?:don't|do not|stop|never|please don't|no longer|boundary|avoid)\b", re.I)
 OPEN_LOOP_RE = re.compile(r"\?|\b(?:which one|choose|pick|decide|i will|i'll|remind me|next time|use the first|use the second|second one|first one)\b", re.I)
 STRONG_CONTINUATION_RE = re.compile(r"\b(?:continue(?:\s+\w+){0,6}\s+from before|earlier in (?:the )?(?:other )?conversation|same topic as before|pick up where we left off|from the other channel|from that other conversation)\b", re.I)
-QUEUE_ASSERTION_RE = re.compile(r"\b(?:queue|session|payment|priority|wheel|now playing|up next|current track|currently playing)\b.*\b(?:is|are|open|live|enabled|owed|paid|next|playing|active|now)\b|\b(?:now playing|up next|priority signal|wheel spins owed)\b", re.I)
-UNSAFE_HISTORY_RE = re.compile(r"\b(?:provider=|host=|preview=|storage|stored visual description|internal diagnostic|source-mode|mode contamination)\b", re.I)
+QUEUE_SUBJECT_RE = re.compile(r"\b(?:queue|session|payment|priority|priority signal|wheel|wheel spins|now playing|up next|current track|currently playing)\b", re.I)
+QUEUE_ASSERTION_VERB_RE = re.compile(r"\b(?:is|are|has|have|contains?|includes?|holds?|waiting|queued|open|live|enabled|owed|paid|next|playing|active|currently|three|two|one|\d+)\b", re.I)
+UNSAFE_HISTORY_RE = re.compile(r"(?:\b(?:provider|host|preview|embed|media_buffer|media-storage|media storage|storage_diagnostic|storage diagnostic)\s*=|\bstored[- ]visual[- ]description\b|\binternal diagnostic\b|\bsource-mode\b|\bmode contamination\b)", re.I)
 
 @dataclass(frozen=True)
 class ConversationContextRequest:
@@ -128,7 +129,8 @@ def _is_current_duplicate(row: dict, req: ConversationContextRequest, current_no
     if mid and mid in req.current_message_ids:
         return True
     role = str(row.get("role") or "").lower()
-    if role == "user" and int(row.get("user_id") or 0) == int(req.current_user_id or 0):
+    participant_ids = set(req.current_participants or frozenset()) if req.is_batch else {int(req.current_user_id or 0)}
+    if role == "user" and int(row.get("user_id") or 0) in participant_ids:
         return bool(normalize_text(row.get("content") or "") in current_norms)
     return False
 
@@ -206,7 +208,7 @@ def _unsafe_row(row: dict) -> bool:
     content = str(row.get("content") or "")
     if UNSAFE_HISTORY_RE.search(content):
         return True
-    if role in {"model", "assistant", "bnl"} and QUEUE_ASSERTION_RE.search(content):
+    if role in {"model", "assistant", "bnl"} and QUEUE_SUBJECT_RE.search(content) and QUEUE_ASSERTION_VERB_RE.search(content):
         return True
     return False
 
@@ -232,10 +234,26 @@ def assemble_conversation_context_v2(rows: Iterable[dict], req: ConversationCont
     now = req.now.astimezone(timezone.utc) if req.now.tzinfo else req.now.replace(tzinfo=timezone.utc)
     current_norms = {normalize_text(t) for t in req.current_texts if normalize_text(t)}
     current_text = " ".join(req.current_texts)
+    source_rows = list(rows)
+    unsafe_paired_user_ids: set[int] = set()
+    pending_for_unsafe: list[dict] = []
+    for raw in sorted(source_rows, key=lambda r: int(r.get("id") or 0)):
+        raw_role = str(raw.get("role") or "").lower()
+        if raw_role == "user":
+            pending_for_unsafe.append(raw)
+            continue
+        if raw_role in {"model", "assistant", "bnl"} and _unsafe_row(raw):
+            for idx in range(len(pending_for_unsafe) - 1, -1, -1):
+                if _can_pair(pending_for_unsafe[idx], raw):
+                    unsafe_paired_user_ids.add(int(pending_for_unsafe[idx].get("id") or 0))
+                    pending_for_unsafe.pop(idx)
+                    break
     filtered, dupes, excluded = [], 0, 0
-    for row in rows:
+    for row in source_rows:
         p = _policy(row)
         same_room = _row_is_same_room(row, req)
+        if int(row.get("id") or 0) in unsafe_paired_user_ids:
+            excluded += 1; continue
         if _unsafe_row(row):
             excluded += 1; continue
         if same_room:
