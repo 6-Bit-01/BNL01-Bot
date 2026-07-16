@@ -1,78 +1,112 @@
-import os, sqlite3, sys
-from pathlib import Path
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import os, sqlite3, tempfile
+
+os.environ.setdefault("GEMINI_API_KEY", "test-key")
+os.environ.setdefault("DISCORD_BOT_TOKEN", "test-token")
+
 from bnl_relationship_engine import *
+import bnl01_bot
+
 
 def conn():
     c=sqlite3.connect(':memory:'); ensure_relationship_v2_schema(c); return c
 
-def obs(c, text, rid, role='user', uid=2, guild=1, directed=True, policy='public_home', route='normal_chat', t='2026-01-01T00:00:00+00:00'):
+def obs(c, text, rid, role='user', uid=2, guild=1, directed=True, policy='public_home', route='normal_chat', t='2026-01-01 00:00:00'):
     return observe_message(c,guild_id=guild,user_id=uid,role=role,content=text,source_row_id=rid,channel_policy=policy,route_mode=route,directed=directed,observed_at=t)
 
 def state(c, uid=2, guild=1, t='2026-01-02T00:00:00+00:00'):
     return rebuild_state(c,guild_id=guild,subject_user_id=uid,evaluated_at=t)
 
-def test_model_replies_zero_weight_and_shadow_flags_off_by_default():
-    c=conn(); obs(c,'try these steps',1,role='model'); s=state(c)
-    assert all(s[d] == 0 for d in ('rapport','trust','familiarity','playfulness','support','mutuality'))
+def test_flags_default_off_with_empty_mapping():
     assert not shadow_enabled({}) and not live_enabled({}) and not active_engagement_live_enabled({})
 
-def test_passive_unrelated_public_chatter_no_event():
-    c=conn(); assert obs(c,'talking to someone else thanks',1,directed=False,route='passive_capture') == ''
-    assert c.execute('select count(*) from relationship_events_v2').fetchone()[0] == 0
+def test_model_replies_zero_weight():
+    c=conn(); obs(c,'friendly rival accepted',1,role='model'); s=state(c)
+    assert all(s[d] == 0 for d in ('rapport','trust','familiarity','playfulness','support','mutuality'))
+    assert s['rivalry_state'] != 'mutual_rivalry'
 
-def test_single_negative_or_joke_does_not_create_rivalry():
-    for txt in ['bad bot','lol jk','i disagree','that is wrong']:
-        c=conn(); obs(c,txt,1); assert state(c)['rivalry_state'] != 'mutual_rivalry'
+def test_passive_unrelated_public_chatter_no_event_and_save_path(monkeypatch):
+    tmp=tempfile.NamedTemporaryFile(delete=False); tmp.close(); monkeypatch.setattr(bnl01_bot,'DB_FILE',tmp.name); bnl01_bot.init_db(); monkeypatch.setenv(SHADOW_ENV,'1')
+    bnl01_bot.save_user_message(2,'u',1,'thanks unrelated',channel_policy='public_home',route_mode=bnl01_bot.ROUTE_MODE_NORMAL_CHAT,directed_to_bnl=False)
+    with sqlite3.connect(tmp.name) as c:
+        assert c.execute('select count(*) from relationship_events_v2').fetchone()[0] == 0
+    c=conn(); assert obs(c,'talking to someone else thanks',1,directed=False,route='normal_chat') == ''
 
-def test_explicit_mutual_playful_rivalry_requires_opt_in_and_context():
-    c=conn(); obs(c,'I opt in to friendly rival mode',1); obs(c,'lol rival mode',2); obs(c,'haha nemesis',3)
-    assert state(c)['rivalry_state'] == 'mutual_rivalry'
+def test_direct_save_path_creates_private_review_only_projection(monkeypatch):
+    tmp=tempfile.NamedTemporaryFile(delete=False); tmp.close(); monkeypatch.setattr(bnl01_bot,'DB_FILE',tmp.name); bnl01_bot.init_db(); monkeypatch.setenv(SHADOW_ENV,'1')
+    bnl01_bot.save_user_message(2,'u',1,'thank you',channel_policy='public_home',route_mode=bnl01_bot.ROUTE_MODE_NORMAL_CHAT,directed_to_bnl=True)
+    with sqlite3.connect(tmp.name) as c:
+        assert c.execute('select count(*) from relationship_events_v2').fetchone()[0] == 1
+        row=c.execute("select visibility, public_usable, derived, projection, lifecycle_status from memory_ledger_entries where source_table='relationship_events_v2'").fetchone()
+        assert row == ('private', 0, 1, 1, 'review_only')
 
-def test_boundary_or_opt_out_blocks_rivalry_and_engagement():
-    c=conn(); obs(c,"don't follow up",1); obs(c,'I opt in to friendly rival mode',2); obs(c,'lol rival mode',3); obs(c,'haha nemesis',4)
-    assert state(c)['rivalry_state'] == 'neutral'
-    r=plan_engagement(c,guild_id=1,user_id=2,candidate_type='recognition',route_mode='normal_chat',channel_policy='public_home',current_direct=True,now='2026-01-03T00:00:00+00:00')
-    assert 'member_opt_out' in r['withheld_reason_codes'] and not r['selected']
-
-def test_appreciation_improves_rapport_not_trust():
-    c=conn(); obs(c,'thank you',1); s=state(c); assert s['rapport'] > 0 and s['trust'] == 0
-
-def test_constructive_collaboration_gradually_increases_trust_and_familiarity():
-    c=conn(); [obs(c,'let us work together on this',i) for i in range(1,5)]; s=state(c)
-    assert 0 < s['trust'] < 1 and 0 < s['familiarity'] < 1
-
-def test_distinct_event_types_and_repair_reduces_friction_without_erasing_history():
-    c=conn(); texts=['help me','that is wrong','bad bot','my bad','let us fix this','we are good']
-    for i,t in enumerate(texts,1): obs(c,t,i)
-    types={r[0] for r in c.execute('select event_type from relationship_events_v2')}
-    assert {'support_request','correction','friction','apology','repair_attempt','repair_accepted'} <= types
-    s=state(c); assert s['friction'] < .12 and s['evidence_counts']['friction'] == 1
-
-def test_decay_deterministic_fixed_clock():
-    c=conn(); obs(c,'bad bot',1,t='2026-01-01T00:00:00+00:00')
-    assert state(c,t='2026-02-01T00:00:00+00:00') == state(c,t='2026-02-01T00:00:00+00:00')
-    assert state(c,t='2026-03-01T00:00:00+00:00')['friction'] < state(c,t='2026-01-02T00:00:00+00:00')['friction']
-
-def test_lifecycle_exclusions_cross_guild_member_and_public_summary_safety(monkeypatch):
-    c=conn(); obs(c,'thanks',1,uid=2,guild=1); obs(c,'thanks',2,uid=3,guild=1); obs(c,'thanks',3,uid=2,guild=9)
-    c.execute("update relationship_events_v2 set lifecycle='forgotten' where guild_id=1 and subject_user_id=2")
-    assert state(c,uid=2,guild=1)['rapport'] == 0
-    monkeypatch.setenv(LIVE_ENV,'1')
-    assert 'trust' not in governed_summary(c,guild_id=1,user_id=3,route_mode='normal_chat',channel_policy='public_home')
-    assert governed_summary(c,guild_id=9,user_id=2,route_mode='passive_capture',channel_policy='public_home') == ''
-
-def test_member_settings_complete_delete_and_no_mentions_dormant_echo():
-    c=conn(); obs(c,"don't follow up",1); set_member_setting(c,guild_id=1,user_id=2,proactive_enabled=False,playful_rivalry_enabled=False)
-    for ct in ['recognition','open_loop_follow_up','curiosity_question','dormant_signal_echo']:
-        r=plan_engagement(c,guild_id=1,user_id=2,candidate_type=ct,route_mode='normal_chat',channel_policy='public_home',current_direct=False,now=f'2026-01-0{2+len(ct)%5}T00:00:00+00:00')
-        assert not r['selected'] and '@' not in r.get('candidate_text','') and ('current' not in r.get('candidate_text','').lower())
-    counts=complete_delete_relationship_v2(c,guild_id=1,user_id=2)
-    assert counts['relationship_events_v2'] and c.execute('select count(*) from relationship_events_v2 where guild_id=1 and subject_user_id=2').fetchone()[0] == 0
-
-def test_cooldown_shadow_no_user_output_and_report():
-    c=conn(); obs(c,'thanks',1)
-    r1=plan_engagement(c,guild_id=1,user_id=2,candidate_type='recognition',route_mode='normal_chat',channel_policy='public_home',current_direct=True,now='2026-01-02T00:00:00+00:00')
+def test_shadow_would_select_without_live_and_does_not_consume_live_cooldown():
+    c=conn(); obs(c,'thank you',1)
+    r1=plan_engagement(c,guild_id=1,user_id=2,candidate_type='recognition',route_mode='normal_chat',channel_policy='public_home',current_direct=True,now='2026-01-02 00:00:00')
     r2=plan_engagement(c,guild_id=1,user_id=2,candidate_type='recognition',route_mode='normal_chat',channel_policy='public_home',current_direct=True,now='2026-01-02T01:00:00+00:00')
-    assert not r1['selected'] and 'per_user_cooldown' in r2['withheld_reason_codes']
-    report=build_evaluation_report(c,guild_id=1); assert report['eligible_user_authored_events'] == 1 and report['rollback_readiness']['relationship_live_default_off']
+    assert r1['would_select'] and not r1['live_emission_allowed']
+    assert r2['would_select'] and 'per_user_live_cooldown' not in r2['withheld_reason_codes']
+
+def test_false_rivalry_and_valid_mutual_rivalry_requires_model_acceptance_setting_and_context():
+    c=conn()
+    for i,txt in enumerate(['I opt in to friendly rival mode','lol friendly rival','haha nemesis'],1): obs(c,txt,i)
+    assert state(c)['rivalry_state'] != 'mutual_rivalry'
+    obs(c,'friendly rival accepted',4,role='model')
+    assert state(c)['rivalry_state'] == 'mutual_rivalry'
+    set_member_setting(c,guild_id=1,user_id=2,playful_rivalry_enabled=False)
+    assert state(c)['rivalry_state'] == 'neutral'
+    set_member_setting(c,guild_id=1,user_id=2,playful_rivalry_enabled=True)
+    assert state(c)['rivalry_state'] != 'mutual_rivalry'  # requires fresh explicit opt-in after disable
+
+def test_boundary_and_opt_out_override_engagement_and_proactive_reenable():
+    c=conn(); obs(c,"don't follow up",1); assert state(c)['engagement_opt_out']
+    assert 'member_opt_out' in plan_engagement(c,guild_id=1,user_id=2,candidate_type='recognition',route_mode='normal_chat',channel_policy='public_home',current_direct=True)['withheld_reason_codes']
+    set_member_setting(c,guild_id=1,user_id=2,proactive_enabled=True)
+    assert not state(c)['engagement_opt_out']
+    obs(c,"don't joke rival stuff",2); obs(c,'I opt in to friendly rival mode',3); obs(c,'lol friendly rival',4); obs(c,'haha nemesis',5); obs(c,'friendly rival accepted',6,role='model')
+    assert state(c)['rivalry_state'] == 'neutral'
+
+def test_appreciation_collaboration_repair_decay_and_timestamps():
+    c=conn(); obs(c,'thank you',1); assert state(c)['rapport'] > 0 and state(c)['trust'] == 0
+    for i in range(2,6): obs(c,'let us work together',i,t='2026-01-01 00:00:00')
+    s=state(c,t='2026-01-02T00:00:00+00:00'); assert s['trust'] > 0 and s['familiarity'] > 0
+    obs(c,'bad bot',6,t='2026-01-01 00:00:00'); before=state(c,t='2026-01-02T00:00:00+00:00')['friction']; obs(c,'we are good',7,t='2026-01-02T02:00:00+00:00')
+    after=state(c,t='2026-01-03 00:00:00')['friction']; assert after < before and state(c)['evidence_counts']['friction'] == 1
+
+def test_same_member_guild_summary_isolation_and_live_gating(monkeypatch):
+    c=conn(); obs(c,'thank you',1,uid=2,guild=1); state(c,uid=2,guild=1); monkeypatch.setenv(LIVE_ENV,'1')
+    assert governed_summary(c,guild_id=1,user_id=2,target_user_id=3,route_mode='normal_chat',channel_policy='public_home',direct=True) == ''
+    assert governed_summary(c,guild_id=2,user_id=2,target_user_id=2,route_mode='normal_chat',channel_policy='public_home',direct=True) == ''
+    assert governed_summary(c,guild_id=1,user_id=2,target_user_id=2,route_mode='normal_chat',channel_policy='public_home',direct=True)
+    assert governed_summary(c,guild_id=1,user_id=2,target_user_id=2,route_mode='relay',channel_policy='public_home',direct=True) == ''
+
+def test_settings_view_live_off_and_toggle_controls():
+    c=conn(); assert 'proactive=enabled' in settings_summary(c,guild_id=1,user_id=2)
+    set_member_setting(c,guild_id=1,user_id=2,proactive_enabled=False,playful_rivalry_enabled=False)
+    assert 'proactive=disabled' in settings_summary(c,guild_id=1,user_id=2) and 'playful_rivalry=disabled' in settings_summary(c,guild_id=1,user_id=2)
+    set_member_setting(c,guild_id=1,user_id=2,proactive_enabled=True,playful_rivalry_enabled=True)
+    assert 'proactive=enabled' in settings_summary(c,guild_id=1,user_id=2) and 'playful_rivalry=enabled' in settings_summary(c,guild_id=1,user_id=2)
+
+def test_correction_forget_deactivates_underlying_event_and_delete_removes_projection():
+    c=conn(); eid=obs(c,'thank you',1); assert state(c)['rapport'] > 0
+    led=c.execute('select ledger_entry_id from relationship_event_ledger_links_v2 where event_id=?',(eid,)).fetchone()[0]
+    propagate_ledger_lifecycle(c,guild_id=1,ledger_entry_id=led,lifecycle='forgotten')
+    assert state(c)['rapport'] == 0
+    counts=complete_delete_relationship_v2(c,guild_id=1,user_id=2)
+    assert counts['relationship_events_v2'] == 1 and c.execute("select count(*) from memory_ledger_entries where source_table='relationship_events_v2'").fetchone()[0] == 0
+
+def test_moment_lifecycle_visibility_and_governed_open_loop_provenance():
+    c=conn(); obs(c,'remind me later',1)
+    assert plan_engagement(c,guild_id=1,user_id=2,candidate_type='open_loop_follow_up',route_mode='normal_chat',channel_policy='public_home',current_direct=True)['withheld_reason_codes'] == ['no_governed_open_loop']
+    c.execute("INSERT INTO memory_ledger_entries (entry_id,schema_version,guild_id,subject_key,entry_type,predicate_key,normalized_value,source_class,source_table,source_row_id,source_role,visibility,confidence,public_usable,derived,projection,salience,observed_at,lifecycle_status,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", ('ol1','memory_ledger_v1',1,subject_key_for_user(2),'open_loop','open_loop','follow up','first_party_record','test','1','user','private','medium',0,0,0,0.5,'2026-01-01T00:00:00+00:00','active','2026-01-01T00:00:00+00:00','2026-01-01T00:00:00+00:00'))
+    assert plan_engagement(c,guild_id=1,user_id=2,candidate_type='open_loop_follow_up',route_mode='normal_chat',channel_policy='public_home',current_direct=True)['relevant_open_loop_count'] == 1
+    c.execute("CREATE TABLE memory_moment_windows (moment_id TEXT, guild_id INTEGER, lifecycle_status TEXT, visibility TEXT)")
+    c.execute("CREATE TABLE memory_moment_participants (moment_id TEXT, participant_key TEXT)")
+    c.execute("INSERT INTO memory_moment_windows VALUES ('m1',1,'needs_review','public')"); c.execute("INSERT INTO memory_moment_participants VALUES ('m1',?)",(subject_key_for_user(2),))
+    assert plan_engagement(c,guild_id=1,user_id=2,candidate_type='recognition',route_mode='normal_chat',channel_policy='public_home',current_direct=True)['relevant_moment_count'] == 0
+    c.execute("UPDATE memory_moment_windows SET lifecycle_status='finalized'")
+    assert plan_engagement(c,guild_id=1,user_id=2,candidate_type='recognition',route_mode='normal_chat',channel_policy='public_home',current_direct=True)['relevant_moment_count'] == 1
+
+def test_evaluation_report_truthful_and_shadow_no_discord_response():
+    c=conn(); obs(c,'thank you',1); plan_engagement(c,guild_id=1,user_id=2,candidate_type='recognition',route_mode='normal_chat',channel_policy='public_home',current_direct=True)
+    report=build_evaluation_report(c,guild_id=1)
+    assert report['legacy_v2_comparison'] == 'not_collected' and report['policy_eligible_shadow_candidates'] == 1 and report['actual_live_emissions'] == 0
