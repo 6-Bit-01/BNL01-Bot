@@ -53,7 +53,7 @@ class MemoryLedgerV1Tests(unittest.TestCase):
         self.assertEqual([r[0] for r in rows], ["discord_user:1", "discord_user:2"])
 
     def test_broadcast_uses_cleaned_summary_not_raw_note(self):
-        ledger.shadow_broadcast_memory_row(self.conn, row_id=9, guild_id=1, cleaned_summary="Safe show summary", entry_type="show_note", public_safe=True, status="active", usage_scope="public")
+        ledger.shadow_broadcast_memory_row(self.conn, row_id=9, guild_id=1, cleaned_summary="Safe show summary", entry_type="show_note", public_safe=True, status="active", usage_scope="ambient,direct")
         row = self.conn.execute("SELECT normalized_value, public_usable, visibility FROM memory_ledger_entries").fetchone()
         self.assertEqual(row, ("Safe show summary", 1, "public_safe"))
 
@@ -79,6 +79,41 @@ class MemoryLedgerV1Tests(unittest.TestCase):
         ledger.shadow_conversation_row(self.conn, row_id=33, user_id=7, user_name="Crow", guild_id=1, role="user", content="remember this number: 111", channel_policy="sealed_test")
         unresolved = ledger.shadow_conversation_row(self.conn, row_id=34, user_id=7, user_name="Crow", guild_id=1, role="user", content="replace 111 with 222", channel_policy="sealed_test")
         self.assertEqual(unresolved.reason_code, "unresolved_correction_target")
+
+
+    def test_explicit_correction_retires_old_value_from_effective_active_count(self):
+        ledger.shadow_conversation_row(self.conn, row_id=40, user_id=7, user_name="Crow", guild_id=1, role="user", content="remember this number: 8", channel_policy="sealed_test")
+        linked = ledger.shadow_conversation_row(self.conn, row_id=41, user_id=7, user_name="Crow", guild_id=1, role="user", content="replace 8 with 9", channel_policy="sealed_test")
+        self.assertEqual(linked.reason_code, "explicit_correction_linked")
+        edges = set(self.conn.execute("SELECT lineage_type FROM memory_ledger_lineage WHERE entry_id=?", (linked.entry_id,)).fetchall())
+        self.assertEqual(edges, {("correction_of",), ("supersedes",)})
+        report = ledger.build_memory_ledger_evaluation(self.conn, guild_id=1)
+        self.assertEqual(report["entriesWithMultipleActiveValues"], 0)
+        self.assertEqual(report["explicitCorrectionCounts"], 1)
+
+    def test_all_lineage_targets_resolve_to_entries(self):
+        ledger.shadow_conversation_row(self.conn, row_id=50, user_id=7, user_name="Crow", guild_id=1, role="user", content="remember this number: 8", channel_policy="sealed_test")
+        ledger.shadow_conversation_row(self.conn, row_id=51, user_id=7, user_name="Crow", guild_id=1, role="user", content="Correction: the number is 9, not 8", channel_policy="sealed_test")
+        missing = self.conn.execute("""
+            SELECT COUNT(*) FROM memory_ledger_lineage l
+            LEFT JOIN memory_ledger_entries e ON e.guild_id=l.guild_id AND e.entry_id=l.target_entry_id
+            WHERE e.entry_id IS NULL
+        """).fetchone()[0]
+        self.assertEqual(missing, 0)
+
+    def test_broadcast_usage_scopes_public_usability(self):
+        cases = [("ambient,direct", 1, "public_safe"), ("show_status", 1, "public_safe"), ("relay", 1, "public_safe"), ("internal", 0, "internal"), ("ambient", 0, "internal")]
+        for idx, (scope, expected_public, expected_visibility) in enumerate(cases, start=60):
+            ledger.shadow_broadcast_memory_row(self.conn, row_id=idx, guild_id=1, cleaned_summary=f"Summary {idx}", entry_type="show_note", public_safe=(idx != 64), status="active", usage_scope=scope)
+            row = self.conn.execute("SELECT public_usable, visibility FROM memory_ledger_entries WHERE source_row_id=?", (str(idx),)).fetchone()
+            self.assertEqual(row, (expected_public, expected_visibility))
+
+    def test_evaluation_detects_missing_success_receipt_entry_and_dangling_lineage(self):
+        ledger.record_shadow_receipt(self.conn, guild_id=1, writer="test", source_table="conversations", source_row_id=999, outcome="inserted", reason_code="ok", entry_id="missing")
+        self.conn.execute("INSERT INTO memory_ledger_lineage(entry_id, guild_id, lineage_type, target_entry_id, created_at) VALUES ('source', 1, 'supersedes', 'missing-target', 'now')")
+        report = ledger.build_memory_ledger_evaluation(self.conn, guild_id=1)
+        self.assertGreaterEqual(report["legacyToLedgerParityMismatches"], 2)
+        self.assertEqual(report["danglingLineageTargets"], 1)
 
     def test_shadow_gate_default_disabled(self):
         with mock.patch.dict(os.environ, {}, clear=True):

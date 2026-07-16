@@ -4388,14 +4388,27 @@ def _shadow_memory_ledger_write(writer_name: str, callback, *, guild_id: int = 0
         conn.commit()
         return result
     except Exception as exc:
-        logging.debug("memory_ledger_shadow_write_failed writer=%s error=%s", writer_name, exc)
+        logging.debug("memory_ledger_shadow_write_failed writer=%s error_type=%s", writer_name, type(exc).__name__)
+        if conn is not None:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            try:
+                conn.close()
+            except Exception:
+                pass
+            conn = None
+        receipt_conn = None
         try:
-            if conn is None:
-                conn = sqlite3.connect(DB_FILE)
-            record_shadow_receipt(conn, guild_id=int(guild_id or 0), writer=writer_name, source_table=source_table, source_row_id=source_row_id, source_revision=source_revision, source_event_key=source_event_key, outcome="error", reason_code="shadow_exception", entry_id="")
-            conn.commit()
+            receipt_conn = sqlite3.connect(DB_FILE)
+            record_shadow_receipt(receipt_conn, guild_id=int(guild_id or 0), writer=writer_name, source_table=source_table, source_row_id=source_row_id, source_revision=source_revision, source_event_key=source_event_key, outcome="error", reason_code="shadow_exception", entry_id="")
+            receipt_conn.commit()
         except Exception as receipt_exc:
-            logging.debug("memory_ledger_shadow_error_receipt_failed writer=%s error=%s", writer_name, receipt_exc)
+            logging.debug("memory_ledger_shadow_error_receipt_failed writer=%s error_type=%s", writer_name, type(receipt_exc).__name__)
+        finally:
+            if receipt_conn is not None:
+                receipt_conn.close()
         return None
     finally:
         if conn is not None:
@@ -4966,7 +4979,7 @@ def _consolidate_memory_tiers(user_id: int, guild_id: int, limits: dict | None =
                 ledger_conn, row_id=row_id, user_id=user_id, guild_id=guild_id, tier=event.get("tier") or "",
                 summary=event.get("summary") or "", salience=float(event.get("salience") or 0.5), topic_key=event.get("topic_key") or "",
                 updated_at=event.get("updated_at") or datetime.now(PACIFIC_TZ).isoformat(),
-                derived_from_entry_ids=tuple(f"mle_derived_source_row_{rid}" for rid in event.get("derived_from_rows") or ()),
+                derived_from_source_row_ids=tuple(int(rid or 0) for rid in event.get("derived_from_rows") or ()),
             ),
             guild_id=guild_id, source_table="memory_tiers", source_row_id=row_id, source_revision=f"rev:{row_id}:{str(event.get('updated_at') or '').lower()}",
         )
@@ -10560,19 +10573,22 @@ def add_broadcast_memory_entry(guild_id: int, message: discord.Message, processe
         ),
     )
     new_id = cursor.lastrowid
+    committed = cursor.execute("SELECT cleaned_summary, entry_type, public_safe, status, usage_scope, submitted_by_user_id, submitted_by_name, created_at, updated_at, supersedes_id FROM broadcast_memory WHERE id=?", (new_id,)).fetchone()
     conn.commit()
     conn.close()
-    _shadow_memory_ledger_write(
-        "broadcast_memory",
-        lambda ledger_conn: shadow_broadcast_memory_row(
-            ledger_conn, row_id=int(new_id or 0), guild_id=guild_id, cleaned_summary=processed.get("cleaned_summary", ""),
-            entry_type=processed.get("entry_type", "notable_moment"), public_safe=bool(processed.get("public_safe")),
-            status="active", usage_scope=processed.get("usage_scope", "internal"),
-            submitted_by_user_id=getattr(getattr(message, "author", None), "id", None), submitted_by_name=getattr(getattr(message, "author", None), "display_name", "system"),
-            created_at=now,
-        ),
-        guild_id=guild_id, source_table="broadcast_memory", source_row_id=int(new_id or 0), source_revision=f"rev:{int(new_id or 0)}:{now.lower()}",
-    )
+    if committed:
+        committed_updated_at = committed[8] or committed[7] or now
+        _shadow_memory_ledger_write(
+            "broadcast_memory",
+            lambda ledger_conn: shadow_broadcast_memory_row(
+                ledger_conn, row_id=int(new_id or 0), guild_id=guild_id, cleaned_summary=committed[0] or "",
+                entry_type=committed[1] or "notable_moment", public_safe=bool(committed[2]),
+                status=committed[3] or "active", usage_scope=committed[4] or "internal",
+                submitted_by_user_id=committed[5], submitted_by_name=committed[6] or "system",
+                created_at=committed[7] or committed_updated_at, updated_at=committed_updated_at, supersedes_id=committed[9],
+            ),
+            guild_id=guild_id, source_table="broadcast_memory", source_row_id=int(new_id or 0), source_revision=f"rev:{int(new_id or 0)}:{committed_updated_at.lower()}",
+        )
     return int(new_id or 0)
 
 
@@ -11081,7 +11097,7 @@ def _set_broadcast_memory_status(memory_id: int, status: str, actor_id: int, act
     row = cursor.execute("SELECT guild_id, superseded_by_id FROM broadcast_memory WHERE id=?", (memory_id,)).fetchone()
     conn.commit()
     conn.close()
-    if changed and row:
+    if changed and row and not (str(status or "").lower() == "superseded" and not row[1]):
         _shadow_memory_ledger_write(
             "broadcast_memory_status",
             lambda ledger_conn: shadow_broadcast_status_event(ledger_conn, row_id=memory_id, guild_id=int(row[0] or 0), status=status, updated_at=now_iso, actor_id=actor_id, actor_name=actor_name, superseded_by_id=row[1]),

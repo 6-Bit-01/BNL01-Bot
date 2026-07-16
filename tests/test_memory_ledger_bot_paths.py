@@ -101,13 +101,33 @@ class MemoryLedgerBotPathTests(unittest.TestCase):
         values = self.rows("SELECT normalized_value FROM memory_ledger_entries WHERE source_table='user_memory_facts' ORDER BY source_revision")
         self.assertEqual([v[0] for v in values], ["8", "9"])
 
-    def test_queue_operational_state_excluded_but_discussion_allowed(self):
+    def test_discord_queue_and_payment_discussion_is_not_content_excluded(self):
         self.enable()
-        bnl01_bot.save_user_message(42, "Crow", 1, "We joked that the queue is haunted.", channel_policy="public_home")
-        bnl01_bot.save_user_message(42, "Crow", 1, "The website queue is open.", channel_policy="public_home")
-        rows = self.rows("SELECT predicate_key, normalized_value FROM memory_ledger_entries WHERE source_table='conversations' ORDER BY source_row_id")
-        self.assertEqual(rows, [("conversation", "We joked that the queue is haunted.")])
-        self.assertEqual(self.rows("SELECT outcome, reason_code FROM memory_ledger_shadow_receipts WHERE outcome='skipped'")[0], ("skipped", "queue_operational_state_excluded"))
+        samples = [
+            "is the queue open?",
+            "payment is pending",
+            "what's your availability?",
+            "the current session was fun",
+            "we were talking about the queue",
+            "the DJ queue is full tonight",
+        ]
+        for idx, text in enumerate(samples, start=1):
+            bnl01_bot.save_user_message(42, "Crow", 1, text, channel_policy="public_home", message_id=idx)
+        rows = self.rows("SELECT normalized_value FROM memory_ledger_entries WHERE source_table='conversations' ORDER BY source_row_id")
+        self.assertEqual([r[0] for r in rows], samples)
+        self.assertEqual(self.rows("SELECT COUNT(*) FROM memory_ledger_shadow_receipts WHERE reason_code='queue_operational_state_excluded'")[0][0], 0)
+
+    def test_partial_shadow_failure_rolls_back_and_records_safe_error(self):
+        self.enable()
+        def partial_then_fail(conn):
+            ledger.shadow_conversation_row(conn, row_id=1, user_id=42, user_name="Crow", guild_id=1, role="user", content="remember this number: 8", channel_policy="sealed_test")
+            raise RuntimeError("boom with PRIVATE CONTENT")
+        bnl01_bot.save_user_message(42, "Crow", 1, "legacy survives", channel_policy="sealed_test")
+        bnl01_bot._shadow_memory_ledger_write("partial_failure_test", partial_then_fail, guild_id=1, source_table="conversations", source_row_id=999, source_revision="999")
+        self.assertEqual(self.rows("SELECT COUNT(*) FROM conversations")[0][0], 1)
+        self.assertEqual(self.rows("SELECT COUNT(*) FROM memory_ledger_entries WHERE normalized_value='8'")[0][0], 0)
+        self.assertEqual(self.rows("SELECT outcome, reason_code FROM memory_ledger_shadow_receipts WHERE writer='partial_failure_test'")[0], ("error", "shadow_exception"))
+        self.assertNotIn("PRIVATE CONTENT", str(self.rows("SELECT * FROM memory_ledger_shadow_receipts")))
 
     def test_broadcast_insert_cleaned_summary_and_raw_absent_from_receipts(self):
         self.enable()

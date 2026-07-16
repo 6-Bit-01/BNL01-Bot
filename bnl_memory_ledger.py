@@ -45,16 +45,6 @@ REJECTED_LIFECYCLE = "rejected"
 _NUMBER_REMEMBER_RE = re.compile(r"\bremember\b[^\n]{0,80}?\bnumber\b\D+(\d{1,12})(?!\d)", re.I)
 _REPLACE_NUMBER_RE = re.compile(r"\b(?:replace|supersede)\s+(\d{1,12})\s+\bwith\b\s+(\d{1,12})(?!\d)", re.I)
 _CORRECTION_NUMBER_RE = re.compile(r"\b(?:correction|actually|correcting|i meant)\b[^\n]{0,80}?\b(?:number\s+)?(?:is|was)?\s*(\d{1,12})\s*,?\s+not\s+(\d{1,12})(?!\d)", re.I)
-_QUEUE_OPERATIONAL_RE = re.compile(
-    r"\b(?:website|site|current|live)\s+queue\s+(?:is|was|currently|status|open|closed|active|available|full)\b|\bqueue\s+(?:status|open|closed)\b"
-    r"|\bqueue\s+(?:is\s+)?currently\s+(?:open|closed|active|available|full)\b"
-    r"|\bpayment\s+(?:cleared|pending|paid|failed|confirmed)\b"
-    r"|\bnow\s*playing\b|\bup\s*next\b|\bcurrent\s+session\b|\bavailability\b"
-    r"|\bpriority\s+(?:signal|slot|enabled|upgrade)\b|\bwheel\s+(?:spin|owed|enabled)\b"
-    r"|\bqueue[-_ ]derived\s+artist\b|\bqueueOpen\b|\bcurrentTrack\b|\bupNext\b|\bqueuedTracks\b",
-    re.I,
-)
-
 @dataclass(frozen=True)
 class LedgerWriteResult:
     entry_id: str = ""
@@ -271,9 +261,6 @@ def _public_ok(subject_key: str, predicate: str, value: str, source_class: Sourc
     return is_public_usable(claim)
 
 
-def is_queue_operational_state(text: str) -> bool:
-    return bool(_QUEUE_OPERATIONAL_RE.search(text or ""))
-
 
 def _unique_active_value_target(conn: sqlite3.Connection, *, guild_id: int, subject_key: str, predicate_key: str, old_value: str) -> str:
     ensure_memory_ledger_schema(conn)
@@ -304,17 +291,15 @@ def _conversation_fact(text: str, conn: sqlite3.Connection, guild_id: int, subje
         new, old = correction.group(1), correction.group(2)
         target = _unique_active_value_target(conn, guild_id=guild_id, subject_key=subject_key, predicate_key="remembered_number", old_value=old)
         if target:
-            return "remembered_number", new, (("correction_of", target),), ACTIVE_LIFECYCLE, "explicit_correction_linked"
+            return "remembered_number", new, (("supersedes", target), ("correction_of", target)), ACTIVE_LIFECYCLE, "explicit_correction_linked"
         return "remembered_number", new, (), REVIEW_ONLY_LIFECYCLE, "unresolved_correction_target"
     if "?" in (text or ""):
-        return "question", "", (), ACTIVE_LIFECYCLE, "ok"
+        return "conversation", (text or "")[:500], (), ACTIVE_LIFECYCLE, "ok"
     return "conversation", (text or "")[:500], (), ACTIVE_LIFECYCLE, "ok"
 
 
 def shadow_conversation_row(conn: sqlite3.Connection, *, row_id: int, user_id: int, user_name: str, guild_id: int, role: str, content: str, channel_name: str = "", channel_policy: str = "unknown", channel_id: int = 0, message_id: int | None = None, route_mode: str = "unknown", observed_at: str = "") -> LedgerWriteResult:
     role_norm = (role or "").lower()
-    if role_norm == "user" and is_queue_operational_state(content):
-        return skipped_result(guild_id=guild_id, source_table="conversations", source_row_id=row_id, reason_code="queue_operational_state_excluded", source_revision=str(row_id))
     visibility = _visibility(channel_policy)
     if role_norm != "user":
         subject_key = BNL_SUBJECT_KEY
@@ -336,9 +321,23 @@ def shadow_user_fact_row(conn: sqlite3.Connection, *, row_id: int, user_id: int,
     return insert_ledger_entry(conn, LedgerEntry(guild_id=guild_id, source_table="user_memory_facts", source_row_id=row_id, source_revision=rev, source_role="legacy_source_blind", entry_type="claim", subject_key=subject_key_for_user(user_id), predicate_key=fact_key or "legacy_fact", value=(fact_value or "")[:500], source_class=SourceClass.LEGACY_SOURCE_BLIND, visibility=Visibility.PRIVATE, confidence=Confidence.LOW, public_usable=False, observed_at=updated_at or _now(), source_sequence=int(row_id or 0), lifecycle_status=REVIEW_ONLY_LIFECYCLE, participants=(LedgerParticipant(subject_key_for_user(user_id), "", "subject", 0),)))
 
 
-def shadow_memory_tier_row(conn: sqlite3.Connection, *, row_id: int, user_id: int, guild_id: int, tier: str, summary: str, salience: float = 0.5, channel_policy: str = "legacy_unknown", topic_key: str = "", updated_at: str = "", derived_from_entry_ids: tuple[str, ...] = ()) -> LedgerWriteResult:
+def _entry_ids_for_source_rows(conn: sqlite3.Connection, *, guild_id: int, source_table: str, source_row_ids: tuple[int, ...]) -> tuple[str, ...]:
+    ensure_memory_ledger_schema(conn)
+    ids: list[str] = []
+    for source_row_id in source_row_ids:
+        rows = conn.execute(
+            "SELECT entry_id FROM memory_ledger_entries WHERE guild_id=? AND source_table=? AND source_row_id=? ORDER BY created_at DESC",
+            (guild_id, source_table, str(source_row_id)),
+        ).fetchall()
+        if len(rows) == 1:
+            ids.append(rows[0][0])
+    return tuple(sorted(set(ids)))
+
+
+def shadow_memory_tier_row(conn: sqlite3.Connection, *, row_id: int, user_id: int, guild_id: int, tier: str, summary: str, salience: float = 0.5, channel_policy: str = "legacy_unknown", topic_key: str = "", updated_at: str = "", derived_from_entry_ids: tuple[str, ...] = (), derived_from_source_row_ids: tuple[int, ...] = ()) -> LedgerWriteResult:
     rev = source_revision_for(row_id, updated_at)
-    lineage = tuple(("derived_from", eid) for eid in sorted(set(derived_from_entry_ids)) if eid)
+    real_source_ids = _entry_ids_for_source_rows(conn, guild_id=guild_id, source_table="memory_tiers", source_row_ids=derived_from_source_row_ids)
+    lineage = tuple(("derived_from", eid) for eid in sorted(set(tuple(derived_from_entry_ids) + real_source_ids)) if eid)
     return insert_ledger_entry(conn, LedgerEntry(guild_id=guild_id, source_table="memory_tiers", source_row_id=row_id, source_revision=rev, source_role="derived_projection", entry_type="derived_summary", subject_key=subject_key_for_user(user_id), predicate_key=topic_key or f"memory_tier:{tier}", value=(summary or "")[:500], source_class=SourceClass.DERIVED_SUMMARY, visibility=Visibility.PRIVATE, confidence=Confidence.LOW, public_usable=False, derived=True, projection=True, salience=salience, observed_at=updated_at or _now(), source_sequence=int(row_id or 0), lifecycle_status=REVIEW_ONLY_LIFECYCLE, participants=(LedgerParticipant(subject_key_for_user(user_id), "", "subject", 0),), lineage=lineage))
 
 
@@ -346,14 +345,24 @@ def shadow_relationship_journal_row(conn: sqlite3.Connection, *, row_id: int, us
     return insert_ledger_entry(conn, LedgerEntry(guild_id=guild_id, source_table="relationship_journal", source_row_id=row_id, source_revision=str(row_id), source_role="internal", entry_type="relationship_event", subject_key=subject_key_for_user(user_id), predicate_key=entry_type or "relationship_event", value=(summary or "")[:500], source_class=SourceClass.DERIVED_SUMMARY, visibility=Visibility.INTERNAL, confidence=Confidence.LOW, public_usable=False, derived=True, projection=True, salience=0.3, observed_at=timestamp or _now(), source_sequence=int(row_id or 0), lifecycle_status=REVIEW_ONLY_LIFECYCLE, participants=(LedgerParticipant(subject_key_for_user(user_id), "", "subject", 0),)))
 
 
+def _unique_entry_for_source(conn: sqlite3.Connection, *, guild_id: int, source_table: str, source_row_id: int | str, preferred_lifecycle: str | None = None) -> str:
+    ensure_memory_ledger_schema(conn)
+    sql = "SELECT entry_id FROM memory_ledger_entries WHERE guild_id=? AND source_table=? AND source_row_id=?"
+    params: list[Any] = [guild_id, source_table, str(source_row_id)]
+    if preferred_lifecycle:
+        sql += " AND lifecycle_status=?"
+        params.append(preferred_lifecycle)
+    rows = conn.execute(sql + " ORDER BY created_at DESC", params).fetchall()
+    return rows[0][0] if len(rows) == 1 else ""
+
+
 def shadow_broadcast_memory_row(conn: sqlite3.Connection, *, row_id: int, guild_id: int, cleaned_summary: str, entry_type: str, public_safe: bool, status: str, usage_scope: str, submitted_by_user_id: int | None = None, submitted_by_name: str = "", created_at: str = "", updated_at: str = "", supersedes_id: int | None = None) -> LedgerWriteResult:
     if not cleaned_summary:
         return skipped_result(guild_id=guild_id, source_table="broadcast_memory", source_row_id=row_id, reason_code="empty_cleaned_summary", source_revision=source_revision_for(row_id, updated_at or created_at))
     lifecycle = ACTIVE_LIFECYCLE if str(status or "active").lower() == "active" else (RESOLVED_LIFECYCLE if str(status or "").lower() == "resolved" else REVIEW_ONLY_LIFECYCLE)
-    public_ok = bool(public_safe and lifecycle == ACTIVE_LIFECYCLE and any(scope in {"public", "public_context", "recap", "show", "website", "broadcast", "ambient", "direct", "relay"} for scope in re.split(r"[,\s]+", usage_scope or "")))
-    target = ""
-    if supersedes_id:
-        target = stable_entry_id(guild_id=guild_id, source_table="broadcast_memory", source_row_id=supersedes_id, source_revision=str(supersedes_id), entry_type="show_event" if "show" in (entry_type or "") else "event", subject_key="barcode_radio", predicate_key=entry_type or "broadcast_memory")
+    scopes = {scope.strip().lower() for scope in re.split(r"[,\s]+", usage_scope or "") if scope.strip()}
+    public_ok = bool(public_safe and lifecycle == ACTIVE_LIFECYCLE and bool(scopes & {"ambient", "direct", "show_status", "relay"}))
+    target = _unique_entry_for_source(conn, guild_id=guild_id, source_table="broadcast_memory", source_row_id=supersedes_id, preferred_lifecycle=ACTIVE_LIFECYCLE) if supersedes_id else ""
     lineage = (("supersedes", target), ("correction_of", target)) if target else ()
     rev = source_revision_for(row_id, updated_at or created_at)
     return insert_ledger_entry(conn, LedgerEntry(guild_id=guild_id, source_table="broadcast_memory", source_row_id=row_id, source_revision=rev, source_role="broadcast_memory", entry_type="show_event" if "show" in (entry_type or "") else "event", subject_key="barcode_radio", subject_display_name="BARCODE Radio", predicate_key=entry_type or "broadcast_memory", value=cleaned_summary[:500], source_class=SourceClass.FIRST_PARTY_RECORD, visibility=Visibility.PUBLIC_SAFE if public_ok else Visibility.INTERNAL, confidence=Confidence.HIGH if public_ok else Confidence.MEDIUM, public_usable=public_ok, salience=0.5, observed_at=created_at or updated_at or _now(), source_sequence=int(row_id or 0), freshness=usage_scope or "", lifecycle_status=lifecycle, participants=tuple([LedgerParticipant(f"discord_user:{submitted_by_user_id}", submitted_by_name or "", "submitter", 0)] if submitted_by_user_id else ()), lineage=lineage))
@@ -403,11 +412,17 @@ def build_memory_ledger_evaluation(conn: sqlite3.Connection, *, guild_id: int | 
     report["publicUsabilityRejections"] = int(cur.fetchone()[0] or 0)
     cur.execute(f"SELECT COUNT(*) FROM memory_ledger_entries{where + (' AND' if where else ' WHERE')} entry_id NOT IN (SELECT target_entry_id FROM memory_ledger_lineage WHERE {'guild_id=? AND ' if guild_id is not None else ''} lineage_type IN ('supersedes','retracts')) AND lifecycle_status='active' GROUP BY subject_key, predicate_key HAVING COUNT(*) > 1", params + ([guild_id] if guild_id is not None else []))
     report["entriesWithMultipleActiveValues"] = len(cur.fetchall())
-    cur.execute(f"SELECT lineage_type, COUNT(*) FROM memory_ledger_lineage{where} GROUP BY lineage_type", params)
-    lineage_counts = dict(cur.fetchall())
-    report["explicitCorrectionCounts"] = int(lineage_counts.get("correction_of", 0) + lineage_counts.get("supersedes", 0))
+    cur.execute(f"SELECT COUNT(DISTINCT entry_id) FROM memory_ledger_lineage{where + (' AND' if where else ' WHERE')} lineage_type IN ('correction_of','supersedes')", params)
+    report["explicitCorrectionCounts"] = int(cur.fetchone()[0] or 0)
     cur.execute(f"SELECT COUNT(*) FROM memory_ledger_entries{where + (' AND' if where else ' WHERE')} lifecycle_status='review_only' AND predicate_key='remembered_number'", params)
     report["unresolvedCorrectionAttempts"] = int(cur.fetchone()[0] or 0)
-    report["legacyToLedgerParityMismatches"] = 0
-    report["implicitSupersessionsBlocked"] = int(report.get("entriesWithMultipleActiveValues", 0))
+    cur.execute(f"SELECT COUNT(*) FROM memory_ledger_shadow_receipts{where + (' AND' if where else ' WHERE')} outcome IN ('inserted','deduplicated') AND (entry_id='' OR entry_id NOT IN (SELECT entry_id FROM memory_ledger_entries WHERE {'guild_id=? AND ' if guild_id is not None else ''} 1=1))", params + ([guild_id] if guild_id is not None else []))
+    missing_receipt_entries = int(cur.fetchone()[0] or 0)
+    cur.execute(f"SELECT COUNT(*) FROM memory_ledger_entries e{where.replace('WHERE', 'WHERE e.') if where else ''} AND NOT EXISTS (SELECT 1 FROM memory_ledger_shadow_receipts r WHERE r.guild_id=e.guild_id AND r.entry_id=e.entry_id AND r.outcome IN ('inserted','deduplicated'))" if where else "SELECT COUNT(*) FROM memory_ledger_entries e WHERE NOT EXISTS (SELECT 1 FROM memory_ledger_shadow_receipts r WHERE r.guild_id=e.guild_id AND r.entry_id=e.entry_id AND r.outcome IN ('inserted','deduplicated'))", params)
+    entries_without_receipts = int(cur.fetchone()[0] or 0)
+    cur.execute(f"SELECT COUNT(*) FROM memory_ledger_lineage l{where.replace('WHERE', 'WHERE l.') if where else ''} AND NOT EXISTS (SELECT 1 FROM memory_ledger_entries e WHERE e.guild_id=l.guild_id AND e.entry_id=l.target_entry_id)" if where else "SELECT COUNT(*) FROM memory_ledger_lineage l WHERE NOT EXISTS (SELECT 1 FROM memory_ledger_entries e WHERE e.guild_id=l.guild_id AND e.entry_id=l.target_entry_id)", params)
+    dangling_lineage = int(cur.fetchone()[0] or 0)
+    report["danglingLineageTargets"] = dangling_lineage
+    report["legacyToLedgerParityMismatches"] = missing_receipt_entries + entries_without_receipts + dangling_lineage + int(report.get("shadowWriteErrors", 0)) + int(report.get("unresolvedCorrectionAttempts", 0))
+    report["implicitSupersessionsBlocked"] = 0
     return report
