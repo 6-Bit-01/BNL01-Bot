@@ -4,6 +4,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from bnl_memory_governance import *
 from bnl_memory_ledger import ensure_memory_ledger_schema, subject_key_for_user
+from bnl_entity_intelligence import ensure_entity_intelligence_schema
+from bnl_dossier_source_packets import subject_key as normalized_subject_key
 
 
 def make_conn():
@@ -200,12 +202,32 @@ def test_forget_original_removes_active_correction_chain_and_obsolete_correction
 
 def test_complete_delete_actual_member_entity_broadcast_and_shadow_tables():
     c = make_conn(); insert(c, eid='mine', value='delete me', pred='preference')
-    c.execute("CREATE TABLE community_presence (guild_id INTEGER, member_user_id INTEGER, subject_key TEXT, note TEXT)")
-    c.execute("INSERT INTO community_presence VALUES (1,10,'discord_user:10','mine')"); c.execute("INSERT INTO community_presence VALUES (1,11,'discord_user:11','other')")
+    ensure_entity_intelligence_schema(c)
+    deleted_key = normalized_subject_key('Deleted Name')
+    preferred_key = normalized_subject_key('Preferred Deleted')
+    c.execute("CREATE TABLE user_profiles (guild_id INTEGER, user_id INTEGER, display_name TEXT, preferred_name TEXT)")
+    c.execute("INSERT INTO user_profiles VALUES (1,10,'Deleted Name','Preferred Deleted')")
+    c.execute("CREATE TABLE community_presence (guild_id INTEGER, member_user_id INTEGER, subject_key TEXT, member_key TEXT, note TEXT)")
+    c.execute("INSERT INTO community_presence VALUES (1,NULL,?,'other-key','mine subject')", (deleted_key,))
+    c.execute("INSERT INTO community_presence VALUES (1,NULL,'other-key',?,'mine member')", (preferred_key,))
+    c.execute("INSERT INTO community_presence VALUES (1,11,'other-member','other-member','same guild other')")
+    c.execute("INSERT INTO community_presence VALUES (2,NULL,?,'other-key','cross guild stays')", (deleted_key,))
     c.execute("CREATE TABLE member_activity_events (guild_id INTEGER, member_user_id TEXT, note TEXT)"); c.execute("INSERT INTO member_activity_events VALUES (1,'10','mine')")
-    c.execute("CREATE TABLE entity_evidence_events (guild_id INTEGER, matched_user_id TEXT, subject_key TEXT, note TEXT)"); c.execute("INSERT INTO entity_evidence_events VALUES (1,'10','x','mine')"); c.execute("INSERT INTO entity_evidence_events VALUES (1,NULL,'discord_user:10','mine2')")
-    for table in ('entity_intelligence_facts','entity_intelligence_edges','entity_activity_rollups','entity_open_questions','entity_profile_snapshots','entity_scouting_queue'):
-        c.execute(f"CREATE TABLE {table} (guild_id INTEGER, subject_key TEXT, fact TEXT)"); c.execute(f"INSERT INTO {table} VALUES (1,'discord_user:10','mine')")
+    c.execute("CREATE TABLE entity_evidence_events (guild_id INTEGER, matched_user_id TEXT, subject_key TEXT, entity_key TEXT, note TEXT)")
+    c.execute("INSERT INTO entity_evidence_events VALUES (1,'10','x','x','mine matched id')")
+    c.execute("INSERT INTO entity_evidence_events VALUES (1,NULL,?,?,'mine name key')", (deleted_key, preferred_key))
+    c.execute("INSERT INTO entity_evidence_events VALUES (2,NULL,?,?,'cross guild stays')", (deleted_key, preferred_key))
+    c.execute("INSERT INTO entity_intelligence_facts (guild_id,subject_key,subject_name,fact_type,fact_label,fact_value,visibility,authority) VALUES (1,?,'Deleted Name','profile','color','green','review_only','observed')", (deleted_key,))
+    c.execute("INSERT INTO entity_intelligence_facts (guild_id,subject_key,subject_name,fact_type,fact_label,fact_value,visibility,authority) VALUES (1,'unrelated','Other','profile','color','blue','review_only','observed')")
+    c.execute("INSERT INTO entity_intelligence_facts (guild_id,subject_key,subject_name,fact_type,fact_label,fact_value,visibility,authority) VALUES (2,?,'Deleted Name','profile','color','green','review_only','observed')", (deleted_key,))
+    c.execute("INSERT INTO entity_intelligence_edges (guild_id,subject_key,object_key,object_label,relation_type,visibility,authority) VALUES (1,?,'project-a','Project A','likes','review_only','observed')", (deleted_key,))
+    c.execute("INSERT INTO entity_intelligence_edges (guild_id,subject_key,object_key,object_label,relation_type,visibility,authority) VALUES (1,'project-b',?,'Deleted Name','mentions','review_only','observed')", (preferred_key,))
+    c.execute("INSERT INTO entity_intelligence_edges (guild_id,subject_key,object_key,object_label,relation_type,visibility,authority) VALUES (1,'unrelated','project-c','Project C','likes','review_only','observed')")
+    c.execute("INSERT INTO entity_intelligence_edges (guild_id,subject_key,object_key,object_label,relation_type,visibility,authority) VALUES (2,?,'project-a','Project A','likes','review_only','observed')", (deleted_key,))
+    c.execute("INSERT INTO entity_activity_rollups (guild_id,subject_key,activity_type) VALUES (1,?,'chat')", (deleted_key,))
+    c.execute("INSERT INTO entity_open_questions (guild_id,subject_key,question) VALUES (1,?,'ask')", (deleted_key,))
+    c.execute("INSERT INTO entity_profile_snapshots (guild_id,subject_key,summary_json) VALUES (1,?,?)", (deleted_key, '{}'))
+    c.execute("INSERT INTO entity_scouting_queue (guild_id,subject_key,reason,source) VALUES (1,?,'r','s')", (deleted_key,))
     c.execute("CREATE TABLE broadcast_memory (guild_id INTEGER, submitted_by_user_id TEXT, submitted_by_name TEXT, corrected_by_user_id TEXT, corrected_by_name TEXT, show_note TEXT)")
     c.execute("INSERT INTO broadcast_memory VALUES (1,'10','Deleted Name','10','Deleted Name','show content stays')")
     c.execute("INSERT INTO memory_governance_shadow_runs VALUES ('r1',1,?,?,?,?,?,?,?,?,?,?,?)", (hashlib.sha256(subject_key_for_user(10).encode()).hexdigest()[:16],'route','policy','now','h',1,'lh',2,1,'{}','[]'))
@@ -213,13 +235,21 @@ def test_complete_delete_actual_member_entity_broadcast_and_shadow_tables():
     res = complete_delete_member_data(c, guild_id=1, user_id=10, confirmation='DELETE MY BNL DATA 1')
     assert res['ok']
     assert c.execute("SELECT COUNT(*) FROM member_activity_events").fetchone()[0] == 0
-    assert c.execute("SELECT COUNT(*) FROM entity_evidence_events").fetchone()[0] == 0
-    assert c.execute("SELECT COUNT(*) FROM community_presence WHERE member_user_id=10 OR subject_key='discord_user:10'").fetchone()[0] == 0
+    assert c.execute("SELECT COUNT(*) FROM entity_evidence_events WHERE guild_id=1").fetchone()[0] == 0
+    assert c.execute("SELECT COUNT(*) FROM entity_evidence_events WHERE guild_id=2").fetchone()[0] == 1
+    assert c.execute("SELECT COUNT(*) FROM community_presence WHERE guild_id=1 AND (member_user_id=10 OR subject_key=? OR member_key=?)", (deleted_key, preferred_key)).fetchone()[0] == 0
     assert c.execute("SELECT COUNT(*) FROM community_presence WHERE member_user_id=11").fetchone()[0] == 1
-    for table in ('entity_intelligence_facts','entity_intelligence_edges','entity_activity_rollups','entity_open_questions','entity_profile_snapshots','entity_scouting_queue'):
-        assert c.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] == 0
+    assert c.execute("SELECT COUNT(*) FROM community_presence WHERE guild_id=2 AND subject_key=?", (deleted_key,)).fetchone()[0] == 1
+    for table in ('entity_intelligence_facts','entity_activity_rollups','entity_open_questions','entity_profile_snapshots','entity_scouting_queue'):
+        assert c.execute(f"SELECT COUNT(*) FROM {table} WHERE guild_id=1 AND subject_key=?", (deleted_key,)).fetchone()[0] == 0
+    assert c.execute("SELECT COUNT(*) FROM entity_intelligence_facts WHERE guild_id=1 AND subject_key='unrelated'").fetchone()[0] == 1
+    assert c.execute("SELECT COUNT(*) FROM entity_intelligence_facts WHERE guild_id=2 AND subject_key=?", (deleted_key,)).fetchone()[0] == 1
+    assert c.execute("SELECT COUNT(*) FROM entity_intelligence_edges WHERE guild_id=1 AND (subject_key IN (?,?) OR object_key IN (?,?))", (deleted_key, preferred_key, deleted_key, preferred_key)).fetchone()[0] == 0
+    assert c.execute("SELECT COUNT(*) FROM entity_intelligence_edges WHERE guild_id=1 AND subject_key='unrelated'").fetchone()[0] == 1
+    assert c.execute("SELECT COUNT(*) FROM entity_intelligence_edges WHERE guild_id=2 AND subject_key=?", (deleted_key,)).fetchone()[0] == 1
     assert c.execute("SELECT submitted_by_user_id,submitted_by_name,corrected_by_user_id,corrected_by_name,show_note FROM broadcast_memory").fetchone() == (None, None, None, None, 'show content stays')
     assert c.execute("SELECT COUNT(*) FROM memory_governance_shadow_runs").fetchone()[0] == 0
+    assert complete_delete_member_data(c, guild_id=1, user_id=10, confirmation='DELETE MY BNL DATA 1')['ok']
 
 
 def test_complete_delete_moments_are_guild_scoped_and_canonical_payload_scrubbed():

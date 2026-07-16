@@ -18,6 +18,7 @@ import re
 import sqlite3
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
+from bnl_dossier_source_packets import subject_key as normalized_subject_key
 from bnl_memory_ledger import ensure_memory_ledger_schema, subject_key_for_user
 
 SHADOW_ENV = "BNL_MEMORY_GOVERNANCE_SHADOW_ENABLED"
@@ -465,6 +466,22 @@ def _safe_text_values(conn: sqlite3.Connection, guild_id: int, user_id: int) -> 
                 values.update(str(v) for v in row if v)
     return {v for v in values if v}
 
+def _identity_subject_keys(conn: sqlite3.Connection, guild_id: int, user_id: int) -> Set[str]:
+    """Return exact production subject keys for the member; no fuzzy alias matching."""
+    keys = {subject_key_for_user(user_id)}
+    if _table_exists(conn, "user_profiles"):
+        cols = _cols(conn, "user_profiles")
+        select_cols = [c for c in ("display_name", "preferred_name") if c in cols]
+        if select_cols:
+            row = conn.execute("SELECT %s FROM user_profiles WHERE guild_id=? AND user_id=?" % ",".join(select_cols), (guild_id, user_id)).fetchone()
+            if row:
+                for value in row:
+                    if value:
+                        key = normalized_subject_key(str(value))
+                        if key and key != "unknown-subject":
+                            keys.add(key)
+    return {k for k in keys if k}
+
 def _scrub_text(text: str, values: Set[str]) -> str:
     cleaned = text or ""
     for v in sorted(values, key=len, reverse=True):
@@ -561,6 +578,7 @@ def complete_delete_member_data(conn: sqlite3.Connection, *, guild_id: int, user
     if confirmation != "DELETE MY BNL DATA %s" % guild_id: return {"ok": False, "reason": "confirmation_required"}
     ensure_governance_schema(conn); rid = _receipt("complete_delete", guild_id, user_id); now = _now(); counts: Dict[str, int] = {}; subject = subject_key_for_user(user_id); subject_hash = _subject_hash(user_id)
     scrub_values = _safe_text_values(conn, guild_id, user_id)
+    identity_keys = _identity_subject_keys(conn, guild_id, user_id)
     with conn:
         # Core member-owned tables.
         for table in ("conversations", "user_profiles", "user_memory_facts", "user_habits", "relationship_state", "relationship_journal", "memory_tiers", "response_style_log"):
@@ -572,7 +590,8 @@ def complete_delete_member_data(conn: sqlite3.Connection, *, guild_id: int, user
             cols = _cols(conn, "community_presence")
             for col in ("subject_key", "member_key"):
                 if col in cols:
-                    counts["community_presence"] = counts.get("community_presence", 0) + _delete_where_col(conn, "community_presence", guild_id, col, subject)
+                    for key in identity_keys:
+                        counts["community_presence"] = counts.get("community_presence", 0) + _delete_where_col(conn, "community_presence", guild_id, col, key)
         if _table_exists(conn, "member_activity_events"):
             cols = _cols(conn, "member_activity_events")
             if "member_user_id" in cols:
@@ -587,18 +606,27 @@ def complete_delete_member_data(conn: sqlite3.Connection, *, guild_id: int, user
                 total += conn.execute("DELETE FROM entity_evidence_events WHERE guild_id=? AND CAST(matched_user_id AS TEXT)=?", (guild_id, str(user_id))).rowcount
             for col in ("subject_key", "subject_id", "entity_key", "matched_subject_key"):
                 if col in cols:
-                    total += conn.execute("DELETE FROM entity_evidence_events WHERE guild_id=? AND %s=?" % col, (guild_id, subject)).rowcount
+                    for key in identity_keys:
+                        total += conn.execute("DELETE FROM entity_evidence_events WHERE guild_id=? AND %s=?" % col, (guild_id, key)).rowcount
             counts["entity_evidence_events"] = total
-        for table in ("entity_intelligence_facts", "entity_intelligence_edges", "entity_activity_rollups", "entity_open_questions", "entity_profile_snapshots", "entity_scouting_queue"):
+        for table in ("entity_intelligence_facts", "entity_activity_rollups", "entity_open_questions", "entity_profile_snapshots", "entity_scouting_queue"):
             if _table_exists(conn, table):
                 total = 0; cols = _cols(conn, table)
-                for col in ("subject_key", "entity_key", "source_key", "target_key", "profile_subject_key"):
+                for col in ("subject_key",):
                     if col in cols:
-                        total += conn.execute("DELETE FROM %s WHERE guild_id=? AND %s=?" % (table, col), (guild_id, subject)).rowcount
+                        for key in identity_keys:
+                            total += conn.execute("DELETE FROM %s WHERE guild_id=? AND %s=?" % (table, col), (guild_id, key)).rowcount
                 for col in ("user_id", "member_user_id", "matched_user_id"):
                     if col in cols:
                         total += conn.execute("DELETE FROM %s WHERE guild_id=? AND CAST(%s AS TEXT)=?" % (table, col), (guild_id, str(user_id))).rowcount
                 counts[table] = total
+        if _table_exists(conn, "entity_intelligence_edges"):
+            total = 0; cols = _cols(conn, "entity_intelligence_edges")
+            for col in ("subject_key", "object_key"):
+                if col in cols:
+                    for key in identity_keys:
+                        total += conn.execute("DELETE FROM entity_intelligence_edges WHERE guild_id=? AND %s=?" % col, (guild_id, key)).rowcount
+            counts["entity_intelligence_edges"] = total
         # Preserve broadcast/show content but anonymize matching submitter/corrector identities.
         counts["broadcast_memory_submitter_anonymized"] = _null_identity_cols(conn, "broadcast_memory", guild_id, "submitted_by_user_id", "submitted_by_name", user_id)
         counts["broadcast_memory_corrector_anonymized"] = _null_identity_cols(conn, "broadcast_memory", guild_id, "corrected_by_user_id", "corrected_by_name", user_id)
