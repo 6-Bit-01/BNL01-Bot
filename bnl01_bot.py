@@ -34,7 +34,11 @@ from bnl_memory_ledger import (
     shadow_relationship_journal_row,
     shadow_user_fact_row,
 )
-from bnl_moment_engine import observe_ledger_entry as observe_moment_ledger_entry
+from bnl_moment_engine import (
+    observe_ledger_entry as observe_moment_ledger_entry,
+    shadow_enabled as moment_engine_shadow_enabled,
+    sweep_expired_windows as sweep_expired_moment_windows,
+)
 from bnl_conversation_context_v2 import (
     CONVERSATION_CONTEXT_VERSION,
     ConversationContextRequest,
@@ -13823,6 +13827,26 @@ def iter_managed_guilds():
         return [guild]
     return list(client.guilds)
 
+
+@tasks.loop(minutes=1)
+async def moment_engine_sweep_task():
+    if not moment_engine_shadow_enabled() or not memory_ledger_shadow_enabled():
+        return
+    try:
+        def _sweep():
+            conn = sqlite3.connect(DB_FILE)
+            try:
+                results = sweep_expired_moment_windows(conn)
+                conn.commit()
+                return results
+            finally:
+                conn.close()
+        results = await asyncio.to_thread(_sweep)
+        if results:
+            logging.info("moment_engine_sweep finalized_or_rejected=%s", len(results))
+    except Exception as exc:
+        logging.debug("moment_engine_sweep_failed error_type=%s", type(exc).__name__)
+
 @tasks.loop(minutes=1)
 async def barcode_radio_queue_task():
     now = datetime.now(PACIFIC_TZ)
@@ -15927,6 +15951,9 @@ async def on_ready():
 
     if not barcode_radio_queue_task.is_running():
         barcode_radio_queue_task.start()
+
+    if not moment_engine_sweep_task.is_running():
+        moment_engine_sweep_task.start()
 
     if BNL_WEBSITE_CONTRACT_VERSION == "2":
         await hydrate_startup_relay_v2_once()
