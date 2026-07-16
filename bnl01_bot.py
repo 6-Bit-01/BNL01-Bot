@@ -21,6 +21,11 @@ from bnl_canon_source_contract import (
     render_prompt_canon_block,
     strip_queue_sections,
 )
+from bnl_conversation_context_v2 import (
+    CONVERSATION_CONTEXT_VERSION,
+    ConversationContextRequest,
+    assemble_conversation_context_v2,
+)
 from bnl_website_contract_v2 import (
     ContractV2Error,
     DeliveryResult,
@@ -460,10 +465,10 @@ class ConversationPlan:
 
 
 ROUTE_MODE_CONTRACTS = {
-    ROUTE_MODE_NORMAL_CHAT: RouteModeContract(ROUTE_MODE_NORMAL_CHAT, frozenset(CONVERSATIONAL_POLICIES), frozenset({"room", "public_safe_memory", "show_status_public"}), frozenset({"source_safe_public"}), "save_rows_when_policy_known", "user_value_gated_public_only", "disabled_for_casual_questions", "public_safe"),
+    ROUTE_MODE_NORMAL_CHAT: RouteModeContract(ROUTE_MODE_NORMAL_CHAT, frozenset(CONVERSATIONAL_POLICIES), frozenset({"room", "public_safe_memory", "show_status_public", "conversation_continuity"}), frozenset({"source_safe_public"}), "save_rows_when_policy_known", "user_value_gated_public_only", "disabled_for_casual_questions", "public_safe"),
     ROUTE_MODE_SIMPLE_GREETING: RouteModeContract(ROUTE_MODE_SIMPLE_GREETING, frozenset(CONVERSATIONAL_POLICIES), frozenset({"display_name"}), frozenset(), "save_row_only", "disabled", "disabled", "public_safe_short"),
-    ROUTE_MODE_SHOW_STATUS: RouteModeContract(ROUTE_MODE_SHOW_STATUS, frozenset(CONVERSATIONAL_POLICIES | {"internal_controlled"}), frozenset({"show_status_public", "room", "public_safe_memory"}), frozenset({"source_safe_public"}), "save_rows_when_policy_known", "disabled_by_default", "disabled", "plain_status_no_fake_evidence"),
-    ROUTE_MODE_DIRECT_PAYLOAD: RouteModeContract(ROUTE_MODE_DIRECT_PAYLOAD, frozenset(CONVERSATIONAL_POLICIES | {"internal_controlled", "unknown"}), frozenset({"payload", "room", "public_safe_memory"}), frozenset({"source_safe_public"}), "save_rows_when_policy_known", "disabled_by_default", "payload_items_only", "task_response"),
+    ROUTE_MODE_SHOW_STATUS: RouteModeContract(ROUTE_MODE_SHOW_STATUS, frozenset(CONVERSATIONAL_POLICIES | {"internal_controlled"}), frozenset({"show_status_public", "room", "public_safe_memory", "conversation_continuity"}), frozenset({"source_safe_public"}), "save_rows_when_policy_known", "disabled_by_default", "disabled", "plain_status_no_fake_evidence"),
+    ROUTE_MODE_DIRECT_PAYLOAD: RouteModeContract(ROUTE_MODE_DIRECT_PAYLOAD, frozenset(CONVERSATIONAL_POLICIES | {"internal_controlled", "unknown"}), frozenset({"payload", "room", "public_safe_memory", "conversation_continuity"}), frozenset({"source_safe_public"}), "save_rows_when_policy_known", "disabled_by_default", "payload_items_only", "task_response"),
     ROUTE_MODE_SOURCE_ENRICHMENT: RouteModeContract(ROUTE_MODE_SOURCE_ENRICHMENT, frozenset({"sealed_test", "internal_controlled"}), frozenset({"source_files", "classification", "community_presence"}), frozenset(), "operator_audit_only", "disabled", "explicit_subject_only", "internal_technical_allowed"),
     ROUTE_MODE_SOURCE_LOOKUP: RouteModeContract(ROUTE_MODE_SOURCE_LOOKUP, frozenset({"sealed_test", "internal_controlled"}), frozenset({"source_files"}), frozenset(), "operator_audit_only", "disabled", "explicit_subject_only", "internal_technical_allowed"),
     ROUTE_MODE_COMMUNITY_SCOUTING: RouteModeContract(ROUTE_MODE_COMMUNITY_SCOUTING, frozenset({"public_home", "public_context", "public_selective"}), frozenset({"approved_public_presence"}), frozenset(), "presence_only", "disabled", "approved_internal_only", "internal_only"),
@@ -495,6 +500,41 @@ LAST_ROUTE_DEBUG = {}
 LAST_MEMORY_LIFECYCLE_RESULT = {}
 LAST_MEMORY_PROMPT_DIAGNOSTICS = {}
 LAST_MEMORY_SKIP_REASONS = defaultdict(int)
+LAST_CONVERSATION_CONTEXT_V2_DIAGNOSTICS = {
+    "contract_version": CONVERSATION_CONTEXT_VERSION,
+    "enabled": True,
+    "route_mode": "unknown",
+    "channel_policy": "unknown",
+    "same_room_paired_turn_count": 0,
+    "cross_channel_paired_turn_count": 0,
+    "unpaired_row_count": 0,
+    "current_message_duplicates_removed": 0,
+    "visibility_policy_exclusions": 0,
+    "final_char_count": 0,
+    "selection_fallback_reason": "not_used",
+}
+
+def conversation_context_v2_enabled() -> bool:
+    return (os.getenv("BNL_CONVERSATION_CONTEXT_V2_ENABLED", "true") or "true").strip().lower() not in {"false", "0", "off"}
+
+def update_conversation_context_v2_diagnostics(result=None, *, route_mode="unknown", channel_policy="unknown", enabled=None, reason="not_used"):
+    if enabled is None:
+        enabled = conversation_context_v2_enabled()
+    LAST_CONVERSATION_CONTEXT_V2_DIAGNOSTICS.update({
+        "contract_version": CONVERSATION_CONTEXT_VERSION,
+        "enabled": bool(enabled),
+        "route_mode": route_mode or "unknown",
+        "channel_policy": channel_policy or "unknown",
+        "same_room_paired_turn_count": getattr(result, "same_room_paired_turn_count", 0) if result else 0,
+        "cross_channel_paired_turn_count": getattr(result, "cross_channel_paired_turn_count", 0) if result else 0,
+        "unpaired_row_count": getattr(result, "unpaired_row_count", 0) if result else 0,
+        "current_message_duplicates_removed": getattr(result, "current_message_duplicates_removed", 0) if result else 0,
+        "visibility_policy_exclusions": getattr(result, "visibility_policy_exclusions", 0) if result else 0,
+        "final_char_count": getattr(result, "final_char_count", 0) if result else 0,
+        "selection_fallback_reason": getattr(result, "fallback_reason", reason) if result else reason,
+        "selection_reasons": list(getattr(result, "selection_reasons", ()))[:8] if result else [],
+    })
+    return LAST_CONVERSATION_CONTEXT_V2_DIAGNOSTICS
 
 
 BNL_REACTIONS_BASE = ["👁️", "📡", "⚙️", "🧠", "🛰️", "🔍", "💾", "📊", "🖥️", "📼", "🧬", "📶"]
@@ -11062,6 +11102,112 @@ async def process_broadcast_memory_notes(message) -> list[dict]:
             )
     return entries[:3]
 
+def get_conversation_context_v2_rows(
+    guild_id: int,
+    limit: int = 80,
+    *,
+    current_user_id: int = 0,
+    channel_id: int = 0,
+    channel_name: str = "",
+    channel_policy: str = "unknown",
+) -> list[dict]:
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    has_message_id = "message_id" in _conversations_columns()
+    message_id_expr = "message_id" if has_message_id else "NULL AS message_id"
+    safe_limit = max(1, min(int(limit or 80), 120))
+    normalized_channel_name = (channel_name or "").strip().lower()[:80]
+    policy = (channel_policy or "unknown").strip().lower()[:40]
+    rows_by_id = {}
+
+    def _remember(rows):
+        for row in rows:
+            rows_by_id[row[0]] = row
+
+    base_select = f"""
+        SELECT id, role, content, user_id, user_name, channel_id, channel_name, channel_policy, timestamp, {message_id_expr}
+        FROM conversations
+        WHERE guild_id = ?
+    """
+    # Bounded same-channel/same-policy candidates; assembler applies strict recency atomically after pairing.
+    if channel_id:
+        cursor.execute(
+            base_select + """
+              AND channel_id = ?
+              AND channel_policy = ?
+            ORDER BY id DESC LIMIT ?
+            """,
+            (guild_id, int(channel_id), policy, safe_limit),
+        )
+        _remember(cursor.fetchall())
+    if normalized_channel_name:
+        cursor.execute(
+            base_select + """
+              AND LOWER(COALESCE(channel_name, '')) = ?
+              AND channel_policy = ?
+              AND (COALESCE(channel_id, 0) = 0 OR ? = 0)
+            ORDER BY id DESC LIMIT ?
+            """,
+            (guild_id, normalized_channel_name, policy, int(channel_id or 0), safe_limit),
+        )
+        _remember(cursor.fetchall())
+    # Bounded same-user public-safe cross-channel candidates; assembler applies final recency/route/topic/policy gates.
+    if current_user_id and policy in {"public_home", "public_context"}:
+        cursor.execute(
+            base_select + """
+              AND user_id = ?
+              AND channel_policy IN ('public_home', 'public_context')
+            ORDER BY id DESC LIMIT ?
+            """,
+            (guild_id, int(current_user_id), safe_limit),
+        )
+        _remember(cursor.fetchall())
+    conn.close()
+    result = []
+    for row in sorted(rows_by_id.values(), key=lambda r: r[0]):
+        role = (row[1] or "").strip()
+        content = (row[2] or "").strip()
+        if not content:
+            continue
+        result.append({
+            "id": row[0], "role": role, "content": content, "user_id": row[3], "user_name": row[4],
+            "channel_id": row[5] or 0, "channel_name": row[6] or "", "channel_policy": row[7] or "unknown",
+            "timestamp": row[8], "message_id": row[9],
+            "prompt_history_excluded": should_exclude_from_prompt_history(role, content),
+        })
+    return result
+
+def build_conversation_context_v2_for_prompt(
+    *, guild_id: int, current_user_id: int, channel_id: int = 0, channel_name: str = "",
+    channel_policy: str = "unknown", route_mode: str = ROUTE_MODE_NORMAL_CHAT, conversation_surface: str = "unknown",
+    current_message_ids: set[int] | None = None, current_texts: list[str] | tuple[str, ...] | None = None,
+    current_participants: set[int] | None = None, is_direct_target: bool = False, is_reply_to_bnl: bool = False,
+    is_batch: bool = False, is_deferred_payload_session: bool = False, now=None, route_allowed_sources=None,
+) -> str:
+    if not conversation_context_v2_enabled():
+        update_conversation_context_v2_diagnostics(None, route_mode=route_mode, channel_policy=channel_policy, enabled=False, reason="rollback_disabled")
+        return ""
+    rows = get_conversation_context_v2_rows(guild_id, limit=80, current_user_id=current_user_id, channel_id=channel_id, channel_name=channel_name, channel_policy=channel_policy)
+    req = ConversationContextRequest(
+        guild_id=int(guild_id or 0), current_user_id=int(current_user_id or 0), channel_id=int(channel_id or 0),
+        channel_name=(channel_name or "").strip().lower(), channel_policy=(channel_policy or "unknown").strip().lower(),
+        route_mode=route_mode or ROUTE_MODE_NORMAL_CHAT, conversation_surface=conversation_surface or "unknown",
+        current_message_ids=frozenset(int(x or 0) for x in (current_message_ids or set()) if x),
+        current_texts=tuple(current_texts or ()),
+        current_participants=frozenset(int(x or 0) for x in (current_participants or set()) if x),
+        is_direct_target=bool(is_direct_target), is_reply_to_bnl=bool(is_reply_to_bnl), is_batch=bool(is_batch),
+        is_deferred_payload_session=bool(is_deferred_payload_session), now=now or datetime.now(timezone.utc),
+        route_allowed_sources=frozenset(route_allowed_sources or getattr(get_route_mode_contract(route_mode), "allowed_context_sources", frozenset())),
+    )
+    result = assemble_conversation_context_v2(rows, req)
+    update_conversation_context_v2_diagnostics(result, route_mode=route_mode, channel_policy=channel_policy, enabled=True)
+    logging.info(
+        "conversation_context_v2 selected same_pairs=%s cross_pairs=%s unpaired=%s dupes=%s excluded=%s chars=%s reason=%s",
+        result.same_room_paired_turn_count, result.cross_channel_paired_turn_count, result.unpaired_row_count,
+        result.current_message_duplicates_removed, result.visibility_policy_exclusions, result.final_char_count, result.fallback_reason,
+    )
+    return result.rendered_context
+
 def get_conversation_history(user_id: int, guild_id: int, limit: int = 50):
     """
     IMPORTANT: Order by id, not timestamp (timestamp ties can scramble order).
@@ -11165,20 +11311,6 @@ def get_recent_channel_context(guild_id: int, channel_id: int, limit: int = 12, 
                 (guild_id, normalized_channel_name, cutoff_sql, safe_limit),
             )
             _remember_rows(cursor.fetchall())
-        if normalized_channel_name and len(rows_by_id) < safe_limit:
-            cursor.execute(
-                """
-                SELECT id, user_name, role, content, channel_name, channel_policy, timestamp
-                FROM conversations
-                WHERE guild_id = ?
-                  AND LOWER(COALESCE(channel_name, '')) = ?
-                  AND channel_policy IN ('public_home', 'public_context', 'sealed_test')
-                ORDER BY id DESC
-                LIMIT ?
-                """,
-                (guild_id, normalized_channel_name, safe_limit),
-            )
-            _remember_rows(cursor.fetchall())
     finally:
         conn.close()
 
@@ -11233,23 +11365,42 @@ def format_room_context_for_prompt(rows: list[dict], current_user_name: str = ""
     return "\n".join(rendered)
 
 
-def build_room_first_direct_context(guild_id: int, channel_id: int, channel_name: str, channel_policy: str, current_user_name: str, route: str = "direct", current_text: str = "", current_has_media: bool = False) -> str:
-    rows = get_recent_channel_context(
-        guild_id,
-        channel_id,
-        limit=12,
-        minutes=45,
-        channel_name=channel_name,
-        channel_policy=channel_policy,
-    )
-    formatted = format_room_context_for_prompt(rows, current_user_name=current_user_name) if rows else ""
+def build_room_first_direct_context(guild_id: int, channel_id: int, channel_name: str, channel_policy: str, current_user_name: str, route: str = "direct", current_text: str = "", current_has_media: bool = False, *, current_user_id: int = 0, current_message_ids: set[int] | None = None, route_mode: str = ROUTE_MODE_NORMAL_CHAT, conversation_surface: str = "unknown", is_direct_target: bool = False, is_reply_to_bnl: bool = False, is_batch: bool = False, is_deferred_payload_session: bool = False) -> str:
+    if conversation_context_v2_enabled():
+        formatted = build_conversation_context_v2_for_prompt(
+            guild_id=guild_id,
+            current_user_id=current_user_id,
+            channel_id=channel_id,
+            channel_name=channel_name,
+            channel_policy=channel_policy,
+            route_mode=route_mode,
+            conversation_surface=conversation_surface,
+            current_message_ids=current_message_ids or set(),
+            current_texts=[current_text] if current_text else [],
+            current_participants={current_user_id} if current_user_id else set(),
+            is_direct_target=is_direct_target,
+            is_reply_to_bnl=is_reply_to_bnl,
+            is_batch=is_batch,
+            is_deferred_payload_session=is_deferred_payload_session,
+        )
+    else:
+        update_conversation_context_v2_diagnostics(None, route_mode=route_mode, channel_policy=channel_policy, enabled=False, reason="rollback_disabled")
+        rows = get_recent_channel_context(
+            guild_id,
+            channel_id,
+            limit=12,
+            minutes=45,
+            channel_name=channel_name,
+            channel_policy=channel_policy,
+        )
+        formatted = format_room_context_for_prompt(rows, current_user_name=current_user_name) if rows else ""
     recent_media = ""
     if current_has_media or current_batch_references_recent_media(current_text):
         recent_media = build_recent_media_context_for_prompt(guild_id, channel_id, channel_policy, current_user_name=current_user_name, limit=5)
     if recent_media:
         formatted = (formatted + "\n" + recent_media).strip() if formatted else recent_media
     if formatted:
-        logging.info(f"room_context_injected route={route} count={len(rows)} recent_media_context_found={int(bool(recent_media))}")
+        logging.info(f"room_context_injected route={route} context_v2_enabled={int(conversation_context_v2_enabled())} recent_media_context_found={int(bool(recent_media))}")
     return formatted
 
 def clear_guild_history(guild_id: int):
@@ -12639,7 +12790,7 @@ async def get_gemini_generation_result(prompt: str, user_id: int, guild_id: int,
             record_generation_result_status(result)
             return result
 
-        history = await asyncio.to_thread(get_conversation_history, user_id, guild_id) if user_id else []
+        history = await asyncio.to_thread(get_conversation_history, user_id, guild_id) if (user_id and not conversation_context_v2_enabled()) else []
         conversation_context = ""
         prompt_l = prompt.lower()
         show_related_now = any(x in prompt_l for x in ("show", "barcode radio", "broadcast", "radio", "6:40", "friday", "live"))
@@ -12691,7 +12842,7 @@ async def get_gemini_response(prompt: str, user_id: int, guild_id: int, route: s
                 f"({pct:.1f}%). Quota resets at midnight Pacific Time."
             )
 
-        history = await asyncio.to_thread(get_conversation_history, user_id, guild_id) if user_id else []
+        history = await asyncio.to_thread(get_conversation_history, user_id, guild_id) if (user_id and not conversation_context_v2_enabled()) else []
 
         conversation_context = ""
         prompt_l = prompt.lower()
@@ -14595,6 +14746,37 @@ def _build_payload_fallback_lines(missing_items):
     # Deprecated for conversational routes: never synthesize missing payload content.
     return ""
 
+def build_active_batch_conversation_context_v2_prompt(
+    *,
+    guild_id: int,
+    channel_id: int,
+    channel_name: str,
+    channel_policy: str,
+    first_uid: int,
+    collapsed_items,
+    unique_user_ids,
+    active_packet: dict,
+    pending_state=None,
+    pending_anchor=None,
+    is_active_channel: bool = False,
+) -> str:
+    """Build the shared v2 continuity block used by active-batch/free-speak generation."""
+    route_mode_for_batch = ROUTE_MODE_DIRECT_PAYLOAD if active_packet.get("has_request_payload") or active_packet.get("payload_items") else ROUTE_MODE_NORMAL_CHAT
+    return build_conversation_context_v2_for_prompt(
+        guild_id=guild_id,
+        current_user_id=first_uid,
+        channel_id=channel_id,
+        channel_name=channel_name,
+        channel_policy=channel_policy,
+        route_mode=route_mode_for_batch,
+        conversation_surface=conversation_surface_for_channel_policy(channel_policy, is_active_channel),
+        current_texts=[content for (_name, content, _uid) in collapsed_items],
+        current_participants=set(unique_user_ids),
+        is_batch=True,
+        is_direct_target=bool(active_packet.get("addressed_to_bot")),
+        is_deferred_payload_session=bool(pending_state or pending_anchor),
+    )
+
 async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_state=None):
     channel_id = channel.id
     guild_id = channel.guild.id
@@ -14912,13 +15094,28 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
             style_key, style_rule = choose_response_style(channel.guild.id, first_uid, len(collapsed_items), combined_text)
             log_response_style(channel.guild.id, first_uid, style_key)
             prompt = _format_batched_prompt(msg_list, style_key, style_rule)
-            recent_room_prompt = build_recent_text_room_context_for_prompt(
-                guild_id,
-                channel_id,
-                channel_policy,
-                current_texts={content for (_name, content, _uid) in collapsed_items},
-                limit=5,
-            )
+            if conversation_context_v2_enabled():
+                recent_room_prompt = build_active_batch_conversation_context_v2_prompt(
+                    guild_id=guild_id,
+                    channel_id=channel_id,
+                    channel_name=getattr(channel, "name", ""),
+                    channel_policy=channel_policy,
+                    first_uid=first_uid,
+                    collapsed_items=collapsed_items,
+                    unique_user_ids=unique_user_ids,
+                    active_packet=active_packet,
+                    pending_state=pending_state,
+                    pending_anchor=pending_anchor,
+                    is_active_channel=(channel_id == get_guild_config(guild_id)),
+                )
+            else:
+                recent_room_prompt = build_recent_text_room_context_for_prompt(
+                    guild_id,
+                    channel_id,
+                    channel_policy,
+                    current_texts={content for (_name, content, _uid) in collapsed_items},
+                    limit=5,
+                )
             if recent_room_prompt:
                 prompt += "\n\n" + recent_room_prompt + "\n"
             recent_media_prompt = ""
@@ -15665,7 +15862,7 @@ def build_user_aware_prompt(
         f"{source_context_prompt_block}"
         f"User name to address (optional): {name_to_use}\n"
         f"User display name: {display_name or fallback_display_name}\n"
-        f"User message: {clean_content}"
+        "Live request appears only in Current user request above."
     )
     return prompt, allow_greeting, style_key
 
@@ -16057,6 +16254,11 @@ async def _generate_direct_payload_session(session_key, reason: str):
         session["requester_display_name"],
         route="direct_payload_session",
         current_text=direct_content,
+        current_user_id=session["requester_user_id"],
+        current_message_ids={session.get("anchor_message_id")},
+        route_mode=ROUTE_MODE_DIRECT_PAYLOAD,
+        is_direct_target=True,
+        is_deferred_payload_session=True,
     )
     website_read_model_context = maybe_build_bnl_read_model_context(direct_content, session.get("channel_policy", "unknown"))
     source_context_block = await maybe_build_source_context_for_direct_message(
@@ -17048,7 +17250,7 @@ async def on_message(message: discord.Message):
             active_direct_session=active_same_user_session,
             conversation_surface=conversation_surface,
         )
-        save_decision = save_user_message(message.author.id, message.author.display_name, message.guild.id, conversation_content, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0), route_mode=conversation_plan.route_mode)
+        save_decision = save_user_message(message.author.id, message.author.display_name, message.guild.id, conversation_content, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0), message_id=getattr(message, "id", None), route_mode=conversation_plan.route_mode)
 
         # Direct/direct-like traffic is planned independently from passive batching;
         # non-direct active-channel traffic falls through to the batch planner below.
@@ -17180,6 +17382,12 @@ async def on_message(message: discord.Message):
                 route="direct_active",
                 current_text=direct_content,
                 current_has_media=bool(build_message_media_context(message).get("present", False)),
+                current_user_id=message.author.id,
+                current_message_ids={message.id},
+                route_mode=route_mode,
+                conversation_surface=conversation_surface,
+                is_direct_target=real_direct_target,
+                is_reply_to_bnl=is_reply,
             )
             website_read_model_context = maybe_build_bnl_read_model_context(direct_content, channel_policy)
             source_context_block = await maybe_build_source_context_for_direct_message(
@@ -17359,7 +17567,7 @@ async def on_message(message: discord.Message):
             return
 
         if not is_sealed_test_channel:
-            save_user_message(message.author.id, message.author.display_name, message.guild.id, direct_content, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0), route_mode=route_mode)
+            save_user_message(message.author.id, message.author.display_name, message.guild.id, direct_content, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0), message_id=getattr(message, "id", None), route_mode=route_mode)
 
         repair = try_repair_response(direct_content)
         if repair:
@@ -17411,6 +17619,12 @@ async def on_message(message: discord.Message):
             route="direct",
             current_text=direct_content,
             current_has_media=bool(build_message_media_context(message).get("present", False)),
+            current_user_id=message.author.id,
+            current_message_ids={message.id},
+            route_mode=route_mode,
+            conversation_surface=conversation_surface,
+            is_direct_target=real_direct_target,
+            is_reply_to_bnl=is_reply,
         )
         website_read_model_context = maybe_build_bnl_read_model_context(direct_content, channel_policy)
         source_context_block = await maybe_build_source_context_for_direct_message(
@@ -17567,7 +17781,7 @@ async def on_message(message: discord.Message):
             return
 
         if not is_sealed_test_channel:
-            save_user_message(message.author.id, message.author.display_name, message.guild.id, direct_content, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0), route_mode=route_mode)
+            save_user_message(message.author.id, message.author.display_name, message.guild.id, direct_content, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0), message_id=getattr(message, "id", None), route_mode=route_mode)
 
         repair = try_repair_response(direct_content)
         if repair:
@@ -17619,6 +17833,12 @@ async def on_message(message: discord.Message):
             route="direct",
             current_text=direct_content,
             current_has_media=bool(build_message_media_context(message).get("present", False)),
+            current_user_id=message.author.id,
+            current_message_ids={message.id},
+            route_mode=route_mode,
+            conversation_surface=conversation_surface,
+            is_direct_target=real_direct_target,
+            is_reply_to_bnl=is_reply,
         )
         website_read_model_context = maybe_build_bnl_read_model_context(direct_content, channel_policy)
         source_context_block = await maybe_build_source_context_for_direct_message(
@@ -18081,6 +18301,17 @@ async def bnl_context_check(interaction: discord.Interaction):
         f"- current_channel: `{getattr(current_channel, 'name', 'unknown')}` (`{getattr(current_channel, 'id', 'n/a')}`)",
         f"- invoker_is_owner: `{is_owner_operator(interaction.user)}`",
         f"- invoker_has_mod_role: `{has_mod_role(member)}`",
+        f"- conversation_context_contract: `{LAST_CONVERSATION_CONTEXT_V2_DIAGNOSTICS.get('contract_version')}`",
+        f"- conversation_context_enabled: `{'yes' if conversation_context_v2_enabled() else 'no'}`",
+        f"- conversation_context_last_route_mode: `{LAST_CONVERSATION_CONTEXT_V2_DIAGNOSTICS.get('route_mode')}`",
+        f"- conversation_context_last_channel_policy: `{LAST_CONVERSATION_CONTEXT_V2_DIAGNOSTICS.get('channel_policy')}`",
+        f"- conversation_context_same_room_pairs: `{LAST_CONVERSATION_CONTEXT_V2_DIAGNOSTICS.get('same_room_paired_turn_count')}`",
+        f"- conversation_context_cross_channel_pairs: `{LAST_CONVERSATION_CONTEXT_V2_DIAGNOSTICS.get('cross_channel_paired_turn_count')}`",
+        f"- conversation_context_unpaired_open_loops: `{LAST_CONVERSATION_CONTEXT_V2_DIAGNOSTICS.get('unpaired_row_count')}`",
+        f"- conversation_context_current_duplicates_removed: `{LAST_CONVERSATION_CONTEXT_V2_DIAGNOSTICS.get('current_message_duplicates_removed')}`",
+        f"- conversation_context_policy_exclusions: `{LAST_CONVERSATION_CONTEXT_V2_DIAGNOSTICS.get('visibility_policy_exclusions')}`",
+        f"- conversation_context_final_chars: `{LAST_CONVERSATION_CONTEXT_V2_DIAGNOSTICS.get('final_char_count')}`",
+        f"- conversation_context_reason: `{LAST_CONVERSATION_CONTEXT_V2_DIAGNOSTICS.get('selection_fallback_reason')}`",
         "- behavior_changes_applied: `none` (reporting only)",
     ]
     await send_safe_ephemeral_chunks(interaction, "\n".join(lines), limit=1700)
@@ -18140,6 +18371,17 @@ async def bnl_memory_check(interaction: discord.Interaction):
         f"- read_model_cache_age_seconds: `{read_model_diag.get('cache_age_seconds') if read_model_diag.get('cache_age_seconds') is not None else 'none'}`",
         f"- read_model_last_section_counts: `{read_model_diag.get('last_section_counts') or {}}`",
         f"- canon_source_contract: `{(read_model_diag.get('canon_source_contract') or {}).get('contractVersion')}`",
+        f"- conversation_context_contract: `{LAST_CONVERSATION_CONTEXT_V2_DIAGNOSTICS.get('contract_version')}`",
+        f"- conversation_context_enabled: `{'yes' if conversation_context_v2_enabled() else 'no'}`",
+        f"- conversation_context_last_route_mode: `{LAST_CONVERSATION_CONTEXT_V2_DIAGNOSTICS.get('route_mode')}`",
+        f"- conversation_context_last_channel_policy: `{LAST_CONVERSATION_CONTEXT_V2_DIAGNOSTICS.get('channel_policy')}`",
+        f"- conversation_context_same_room_pairs: `{LAST_CONVERSATION_CONTEXT_V2_DIAGNOSTICS.get('same_room_paired_turn_count')}`",
+        f"- conversation_context_cross_channel_pairs: `{LAST_CONVERSATION_CONTEXT_V2_DIAGNOSTICS.get('cross_channel_paired_turn_count')}`",
+        f"- conversation_context_unpaired_open_loops: `{LAST_CONVERSATION_CONTEXT_V2_DIAGNOSTICS.get('unpaired_row_count')}`",
+        f"- conversation_context_current_duplicates_removed: `{LAST_CONVERSATION_CONTEXT_V2_DIAGNOSTICS.get('current_message_duplicates_removed')}`",
+        f"- conversation_context_policy_exclusions: `{LAST_CONVERSATION_CONTEXT_V2_DIAGNOSTICS.get('visibility_policy_exclusions')}`",
+        f"- conversation_context_final_chars: `{LAST_CONVERSATION_CONTEXT_V2_DIAGNOSTICS.get('final_char_count')}`",
+        f"- conversation_context_reason: `{LAST_CONVERSATION_CONTEXT_V2_DIAGNOSTICS.get('selection_fallback_reason')}`",
         f"- canon_source_compat_adapters: `{'yes' if (read_model_diag.get('canon_source_contract') or {}).get('compatibilityAdaptersActive') else 'no'}`",
         f"- queue_production_local_capability: `{'yes' if (read_model_diag.get('canon_source_contract') or {}).get('localQueueProductionCapability') else 'no'}`",
         f"- queue_production_website_capability: `{(read_model_diag.get('canon_source_contract') or {}).get('websiteQueueProductionCapability')}`",
