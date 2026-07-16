@@ -16,6 +16,8 @@ from __future__ import annotations
 from bnl_canon_source_contract import (
     CANON_SOURCE_CONTRACT_VERSION,
     diagnostics as canon_source_diagnostics,
+    render_concise_public_schedule,
+    render_founders,
     render_prompt_canon_block,
     strip_queue_sections,
 )
@@ -1149,6 +1151,11 @@ def fetch_bnl_read_model(force: bool = False) -> dict:
     return data
 
 
+def safe_bnl_read_model_for_consumption(read_model: dict) -> dict:
+    """Return the queue-gated read-model view for all normal consumers."""
+    return strip_queue_sections(read_model)
+
+
 def is_bnl_read_model_relevant(text: str, channel_policy: str = "") -> bool:
     """Return True only for explicit public website/queue/dossier/show-context questions."""
     normalized = (text or "").lower()
@@ -1286,7 +1293,7 @@ def _track_label(track: dict, include_lane: bool = True, include_source: bool = 
 
 def build_bnl_read_model_context(read_model: dict, user_text: str, channel_policy: str) -> str:
     """Build a compact, public-only prompt block from a validated read model."""
-    read_model = strip_queue_sections(read_model)
+    read_model = safe_bnl_read_model_for_consumption(read_model)
     if not read_model:
         return ""
     sections = _read_model_sections(read_model)
@@ -1486,7 +1493,7 @@ def get_bnl_read_model_diagnostic_state() -> dict:
     cache_age = None
     if _bnl_read_model_cached_at:
         cache_age = int((datetime.now(PACIFIC_TZ) - _bnl_read_model_cached_at).total_seconds())
-    safe_read_model_for_diag = strip_queue_sections(_bnl_read_model_cache or {}) if _bnl_read_model_cache else {}
+    safe_read_model_for_diag = safe_bnl_read_model_for_consumption(_bnl_read_model_cache or {}) if _bnl_read_model_cache else {}
     section_counts = _bnl_read_model_section_counts(safe_read_model_for_diag) if safe_read_model_for_diag else {}
     operator_lanes = _website_operator_lanes(safe_read_model_for_diag) if safe_read_model_for_diag else {}
     operator_lane_counts = {key: len(operator_lanes.get(key, [])) for key in _OPERATOR_LANE_KEYS} if operator_lanes else {}
@@ -2249,7 +2256,10 @@ def build_website_public_safe_candidate_response(read_model: dict, request_text:
 
 
 def build_website_read_model_intent_response(intent: str, request_text: str) -> str:
-    read_model = fetch_bnl_read_model(force=False)
+    raw_read_model = fetch_bnl_read_model(force=False)
+    if not raw_read_model:
+        return _read_model_unavailable_message()
+    read_model = safe_bnl_read_model_for_consumption(raw_read_model)
     if not read_model:
         return _read_model_unavailable_message()
     if intent == "website_broadcast_memory_candidate":
@@ -17901,12 +17911,12 @@ async def about(interaction: discord.Interaction):
     )
     embed.add_field(
         name="Show",
-        value="**BARCODE Radio**: Fridays 6:40 PM Pacific on TikTok",
+        value=f"**BARCODE Radio**: {render_concise_public_schedule()}",
         inline=False,
     )
     embed.add_field(
         name="Core Members",
-        value="Cache Back • DJ Floppydisc • Mac Modem • 6 Bit",
+        value=render_founders(),
         inline=False,
     )
     embed.set_footer(text="Use /setchannel to configure the liaison channel.")
