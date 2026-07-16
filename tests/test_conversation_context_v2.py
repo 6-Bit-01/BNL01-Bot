@@ -187,6 +187,7 @@ class ConversationContextV2CorrectionTests(unittest.TestCase):
 
     def test_queue_assertion_word_orders_exclude_whole_pair(self):
         claims = [
+            "Queue status:\nThree tracks waiting.",
             "The queue has three tracks waiting.",
             "Three tracks are in the queue.",
             "The queue currently contains three entries.",
@@ -213,6 +214,8 @@ class ConversationContextV2CorrectionTests(unittest.TestCase):
             ("How should I prioritize the bug?", "This issue has priority two for the sprint."),
             ("Explain the payment article.", "The payment article includes three examples."),
             ("Explain a programming queue.", "A queue has two basic operations."),
+            ("Explain a programming queue with entries.", "A programming queue stores entries in first-in, first-out order."),
+            ("Explain queue data structures.", "A queue data structure contains entries and removes them FIFO."),
             ("Describe the wheel.", "The wheel has three spokes."),
         ]
         for i, (user_text, model_text) in enumerate(pairs, start=1):
@@ -243,6 +246,36 @@ class ConversationContextV2CorrectionTests(unittest.TestCase):
         self.assertIn("BNL-01: safe answer to second", res.rendered_context)
         self.assertNotIn("User/member: first request\nBNL-01: safe answer to second", res.rendered_context)
         self.assertNotIn("The queue has three tracks waiting.", res.rendered_context)
+
+    def test_pairing_before_filter_rejects_unsafe_user_pair_without_reassignment(self):
+        rows = [
+            row(1, "user", "first request?"),
+            row(2, "user", "provider=tenor current media"),
+            row(3, "model", "safe response to current media"),
+        ]
+        res = assemble_conversation_context_v2(rows, req(current_texts=("first request?",)))
+        self.assertNotIn("safe response to current media", res.rendered_context)
+        self.assertNotIn("User/member: first request?\nBNL-01: safe response to current media", res.rendered_context)
+
+    def test_pairing_before_filter_rejects_invalid_timestamp_pair_without_reassignment(self):
+        rows = [
+            row(1, "user", "first request?"),
+            dict(row(2, "user", "second request"), timestamp="not a timestamp"),
+            row(3, "model", "answer to second"),
+        ]
+        res = assemble_conversation_context_v2(rows, req(current_texts=("first request?",)))
+        self.assertNotIn("answer to second", res.rendered_context)
+        self.assertNotIn("User/member: first request?\nBNL-01: answer to second", res.rendered_context)
+
+    def test_pairing_before_filter_rejects_stale_user_pair_without_reassignment(self):
+        rows = [
+            row(1, "user", "first request?"),
+            row(2, "user", "second request", minutes=46),
+            row(3, "model", "answer to second", minutes=44),
+        ]
+        res = assemble_conversation_context_v2(rows, req(current_texts=("first request?",)))
+        self.assertNotIn("answer to second", res.rendered_context)
+        self.assertNotIn("User/member: first request?\nBNL-01: answer to second", res.rendered_context)
 
     def test_storage_conversation_allowed_but_media_storage_diagnostics_excluded(self):
         ordinary = [row(1,"user","Which cloud storage plan works?"), row(2,"model","Use the smaller storage plan.")]
@@ -287,10 +320,11 @@ class BotConversationContextV2IntegrationTests(unittest.TestCase):
         except OSError:
             pass
 
-    def _insert(self, role, content, uid=1, mid=None, channel=10, policy="public_home"):
+    def _insert(self, role, content, uid=1, mid=None, channel=10, policy="public_home", minutes=1):
         import sqlite3
+        ts = (datetime.now(timezone.utc) - timedelta(minutes=minutes)).replace(microsecond=0).isoformat(sep=" ")
         conn=sqlite3.connect(self.tmp.name)
-        conn.execute("INSERT INTO conversations (user_id,user_name,guild_id,channel_name,channel_policy,channel_id,message_id,role,content,timestamp) VALUES (?,?,?,?,?,?,?,?,?,?)", (uid, "member" if role=="user" else "BNL-01", 99, "home", policy, channel, mid, role, content, datetime.now(timezone.utc).replace(microsecond=0).isoformat(sep=" ")))
+        conn.execute("INSERT INTO conversations (user_id,user_name,guild_id,channel_name,channel_policy,channel_id,message_id,role,content,timestamp) VALUES (?,?,?,?,?,?,?,?,?,?)", (uid, "member" if role=="user" else "BNL-01", 99, "home", policy, channel, mid, role, content, ts))
         conn.commit(); conn.close()
 
     def test_direct_prompt_after_save_has_one_live_request_and_no_legacy_room_stack(self):
@@ -317,6 +351,18 @@ class BotConversationContextV2IntegrationTests(unittest.TestCase):
         self._insert("user","media q", mid=1); self._insert("model","provider=tenor host=cdn preview=yes stored visual description missing", mid=2)
         rendered=self.bot.build_conversation_context_v2_for_prompt(guild_id=99,current_user_id=1,channel_id=10,channel_name="home",channel_policy="public_home",route_mode=self.bot.ROUTE_MODE_NORMAL_CHAT,current_texts=["media q"],current_participants={1})
         self.assertNotIn("provider=tenor", rendered)
+
+    def test_db_retrieval_cutoff_does_not_split_and_reassign_pair(self):
+        b=self.bot
+        self._insert("user", "first request?", minutes=1)
+        self._insert("user", "second request", minutes=46)
+        self._insert("model", "answer to second", minutes=44)
+        ctx=b.build_conversation_context_v2_for_prompt(
+            guild_id=99, current_user_id=1, channel_id=10, channel_name="home", channel_policy="public_home",
+            route_mode=b.ROUTE_MODE_NORMAL_CHAT, current_texts=["first request?"], is_direct_target=True,
+        )
+        self.assertNotIn("answer to second", ctx)
+        self.assertNotIn("User/member: first request?\nBNL-01: answer to second", ctx)
 
     def test_deferred_payload_uses_v2_without_removing_payload_items(self):
         self._insert("user","previous payload setup", mid=301); self._insert("model","previous payload answer", mid=302)

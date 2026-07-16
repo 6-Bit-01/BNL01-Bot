@@ -11129,13 +11129,12 @@ def get_conversation_context_v2_rows(
         FROM conversations
         WHERE guild_id = ?
     """
-    # Bounded same-channel/same-policy candidates; name fallback remains age-bounded and is only for rows missing reliable ids.
+    # Bounded same-channel/same-policy candidates; assembler applies strict recency atomically after pairing.
     if channel_id:
         cursor.execute(
             base_select + """
               AND channel_id = ?
               AND channel_policy = ?
-              AND timestamp >= datetime('now', '-45 minutes')
             ORDER BY id DESC LIMIT ?
             """,
             (guild_id, int(channel_id), policy, safe_limit),
@@ -11146,20 +11145,18 @@ def get_conversation_context_v2_rows(
             base_select + """
               AND LOWER(COALESCE(channel_name, '')) = ?
               AND channel_policy = ?
-              AND timestamp >= datetime('now', '-45 minutes')
               AND (COALESCE(channel_id, 0) = 0 OR ? = 0)
             ORDER BY id DESC LIMIT ?
             """,
             (guild_id, normalized_channel_name, policy, int(channel_id or 0), safe_limit),
         )
         _remember(cursor.fetchall())
-    # Bounded same-user public-safe cross-channel candidates; assembler applies final route/topic/policy gates.
+    # Bounded same-user public-safe cross-channel candidates; assembler applies final recency/route/topic/policy gates.
     if current_user_id and policy in {"public_home", "public_context"}:
         cursor.execute(
             base_select + """
               AND user_id = ?
               AND channel_policy IN ('public_home', 'public_context')
-              AND timestamp >= datetime('now', '-30 minutes')
             ORDER BY id DESC LIMIT ?
             """,
             (guild_id, int(current_user_id), safe_limit),
@@ -11170,12 +11167,13 @@ def get_conversation_context_v2_rows(
     for row in sorted(rows_by_id.values(), key=lambda r: r[0]):
         role = (row[1] or "").strip()
         content = (row[2] or "").strip()
-        if not content or should_exclude_from_prompt_history(role, content):
+        if not content:
             continue
         result.append({
             "id": row[0], "role": role, "content": content, "user_id": row[3], "user_name": row[4],
             "channel_id": row[5] or 0, "channel_name": row[6] or "", "channel_policy": row[7] or "unknown",
             "timestamp": row[8], "message_id": row[9],
+            "prompt_history_excluded": should_exclude_from_prompt_history(role, content),
         })
     return result
 

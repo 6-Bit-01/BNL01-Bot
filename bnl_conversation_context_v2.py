@@ -42,8 +42,10 @@ OPERATIONAL_STATE_RE = re.compile(
     re.I,
 )
 QUEUE_STATE_RE = re.compile(
-    r"\bqueue\b(?=.*\b(?:tracks?|entries|submissions?|artists?|slots?|waiting|queued|currently|contains?|holds?|open|live)\b)"
-    r"|\b(?:tracks?|entries|submissions?|artists?|slots?)\b(?=.*\bqueue\b)",
+    r"\bqueue status\b"
+    r"|\bqueue\b(?=.*\b(?:tracks?|submissions?|artists?|slots?|waiting|queued|currently|open|live)\b)"
+    r"|\bqueue\b(?=.*\bcurrently\b)(?=.*\bentries\b)"
+    r"|\b(?:tracks?|submissions?|artists?|slots?)\b(?=.*\bqueue\b)",
     re.I,
 )
 PAYMENT_STATE_RE = re.compile(r"\bpayment\b(?=.*\b(?:cleared|active|pending|owed|paid|submission|slot|session|confirmed)\b)", re.I)
@@ -216,6 +218,8 @@ def _row_age_ok(row: dict, now: datetime, minutes: int) -> bool:
 def _unsafe_row(row: dict) -> bool:
     role = str(row.get("role") or "").lower()
     content = str(row.get("content") or "")
+    if row.get("prompt_history_excluded"):
+        return True
     if UNSAFE_HISTORY_RE.search(content):
         return True
     if role in {"model", "assistant", "bnl"} and _unsafe_operational_state_assertion(content):
@@ -223,7 +227,7 @@ def _unsafe_row(row: dict) -> bool:
     return False
 
 def _unsafe_operational_state_assertion(content: str) -> bool:
-    text = content or ""
+    text = re.sub(r"\s+", " ", content or "").strip()
     return bool(
         OPERATIONAL_STATE_RE.search(text)
         or QUEUE_STATE_RE.search(text)
@@ -255,32 +259,55 @@ def assemble_conversation_context_v2(rows: Iterable[dict], req: ConversationCont
     current_norms = {normalize_text(t) for t in req.current_texts if normalize_text(t)}
     current_text = " ".join(req.current_texts)
     source_rows = list(rows)
-    filtered, dupes, excluded = [], 0, 0
-    for row in source_rows:
+    paired_all, unpaired_all, orphan_models = _pair_rows([dict(row) for row in source_rows])
+    dupes, excluded = 0, 0
+
+    def _eligible_row(row: dict) -> tuple[bool, bool]:
         p = _policy(row)
         same_room = _row_is_same_room(row, req)
-        role = str(row.get("role") or "").lower()
-        unsafe = _unsafe_row(row)
-        if unsafe and role == "user":
-            excluded += 1; continue
+        if _unsafe_row(row):
+            return False, same_room
         if same_room:
-            if p != target_policy or (target_policy not in SAME_CHANNEL_CONTEXT_POLICIES): excluded += 1; continue
-            if not _row_age_ok(row, now, SAME_ROOM_RECENCY_MINUTES): excluded += 1; continue
+            if p != target_policy or (target_policy not in SAME_CHANNEL_CONTEXT_POLICIES):
+                return False, same_room
+            if not _row_age_ok(row, now, SAME_ROOM_RECENCY_MINUTES):
+                return False, same_room
         else:
-            if not _public_cross_compatible(p, target_policy): excluded += 1; continue
-            if int(row.get("user_id") or 0) != int(req.current_user_id or 0): excluded += 1; continue
-            if not _row_age_ok(row, now, CROSS_CHANNEL_RECENCY_MINUTES): excluded += 1; continue
-        if p in BLOCKED_PUBLIC_POLICIES: excluded += 1; continue
-        if _is_current_duplicate(row, req, current_norms): dupes += 1; continue
-        filtered.append(dict(row, _same_room=same_room, _unsafe_history=unsafe))
-    paired_all, unpaired_users, orphan_models = _pair_rows(filtered)
+            if not _public_cross_compatible(p, target_policy):
+                return False, same_room
+            if int(row.get("user_id") or 0) != int(req.current_user_id or 0):
+                return False, same_room
+            if not _row_age_ok(row, now, CROSS_CHANNEL_RECENCY_MINUTES):
+                return False, same_room
+        if p in BLOCKED_PUBLIC_POLICIES:
+            return False, same_room
+        return True, same_room
+
     pairs = []
     for pair in paired_all:
-        if pair["user"].get("_unsafe_history") or pair["model"].get("_unsafe_history"):
+        user_dup = _is_current_duplicate(pair["user"], req, current_norms)
+        model_dup = _is_current_duplicate(pair["model"], req, current_norms)
+        if user_dup or model_dup:
+            dupes += int(user_dup) + int(model_dup)
             excluded += 2
             continue
-        pairs.append(pair)
-    excluded += sum(1 for model in orphan_models if model.get("_unsafe_history"))
+        user_ok, user_same = _eligible_row(pair["user"])
+        model_ok, model_same = _eligible_row(pair["model"])
+        if not (user_ok and model_ok):
+            excluded += 2
+            continue
+        pairs.append({"user": dict(pair["user"], _same_room=user_same), "model": dict(pair["model"], _same_room=model_same)})
+    unpaired_users = []
+    for row in unpaired_all:
+        if _is_current_duplicate(row, req, current_norms):
+            dupes += 1
+            continue
+        ok, same = _eligible_row(row)
+        if not ok:
+            excluded += 1
+            continue
+        unpaired_users.append(dict(row, _same_room=same))
+    excluded += len(orphan_models)
     scored_same, scored_cross = [], []
     for pair in pairs:
         same = bool(pair["user"].get("_same_room"))
