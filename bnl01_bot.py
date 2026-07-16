@@ -34,6 +34,16 @@ from bnl_memory_ledger import (
     shadow_relationship_journal_row,
     shadow_user_fact_row,
 )
+from bnl_memory_governance import (
+    GovernanceRequest,
+    build_governed_context,
+    complete_delete_member_data,
+    correct_member_memory,
+    forget_member_memory,
+    live_enabled as memory_governance_live_enabled,
+    shadow_enabled as memory_governance_shadow_enabled,
+    view_member_memory,
+)
 from bnl_moment_engine import (
     observe_ledger_entry as observe_moment_ledger_entry,
     shadow_enabled as moment_engine_shadow_enabled,
@@ -12101,9 +12111,41 @@ def build_user_memory_context(user_id: int, guild_id: int, route_mode: str = ROU
             tier_lines.append("Private/legacy memory boundary: non-public-safe rows were not injected into public context." if limits["visibility"] == "public_safe" else "Private/legacy memory available only on internal/operator-safe routes.")
         if tier_lines:
             sections.append("\n".join(tier_lines))
+    legacy_context = "\n".join(sections) if sections else "No durable memory yet."
     diagnostics["skipped"] = dict(diagnostics["skipped"])
+    if memory_governance_shadow_enabled():
+        try:
+            with sqlite3.connect(DB_FILE) as gov_conn:
+                gov_req = GovernanceRequest(
+                    guild_id=guild_id,
+                    subject_user_id=user_id,
+                    route_mode=route_mode,
+                    conversation_surface="discord_prompt_assembly",
+                    channel_policy=policy,
+                    visibility_allowance=limits.get("visibility", "public_safe"),
+                    user_text=user_text or "",
+                    budget_chars=int(limits.get("prompt_budget") or 1200),
+                    allowed_source_classes=("owner_correction", "approved_canon", "first_party_record", "runtime_observation", "public_observation", "evidence_projection", "derived_summary"),
+                    now=datetime.now(PACIFIC_TZ).isoformat(),
+                )
+                gov_result = build_governed_context(gov_conn, gov_req, legacy_context=legacy_context, include_review_moments=True)
+                diagnostics["memory_governance"] = {
+                    "shadow_enabled": True,
+                    "live_enabled": memory_governance_live_enabled(),
+                    "selected_count": gov_result.diagnostics.selected_count,
+                    "excluded_by_reason": gov_result.diagnostics.excluded_by_reason,
+                    "rendered_size": gov_result.diagnostics.rendered_size,
+                    "rendered_hash": gov_result.diagnostics.rendered_hash,
+                    "legacy_vs_governed": gov_result.diagnostics.legacy_vs_governed,
+                    "processing_errors": gov_result.diagnostics.processing_errors,
+                }
+                if memory_governance_live_enabled():
+                    LAST_MEMORY_PROMPT_DIAGNOSTICS[(user_id, guild_id)] = diagnostics
+                    return gov_result.rendered_context or "No durable memory yet."
+        except Exception as e:
+            diagnostics["memory_governance"] = {"shadow_enabled": True, "live_enabled": False, "fallback_reason": type(e).__name__}
     LAST_MEMORY_PROMPT_DIAGNOSTICS[(user_id, guild_id)] = diagnostics
-    return "\n".join(sections) if sections else "No durable memory yet."
+    return legacy_context
 
 
 def build_memory_diagnostic_snapshot(user_id: int, guild_id: int, route_mode: str = ROUTE_MODE_NORMAL_CHAT, channel_policy: str = "unknown", user_text: str = "", is_owner_or_mod: bool = False) -> dict:
@@ -18384,14 +18426,59 @@ async def myname(interaction: discord.Interaction, name: str):
         ephemeral=True
     )
 
-@tree.command(name="clearhistory", description="Clear your conversation history with BNL-01 in this server.")
+@tree.command(name="clearhistory", description="Clear only your stored conversation rows in this server.")
 async def clear_history(interaction: discord.Interaction):
     rows_deleted = clear_user_history(interaction.user.id, interaction.guild.id)
     logging.info(f"🗑️ Cleared {rows_deleted} conversation records for {interaction.user.name}")
     await interaction.response.send_message(
-        f"✅ Your conversation history has been cleared. {rows_deleted} records removed from the Network archives.",
+        f"✅ Cleared **{rows_deleted}** BNL-stored conversation rows for you in this server. Durable facts, profile data, relationship data, and derived memory were not removed by `/clearhistory`; use `/memory_complete_delete` for broader bot-held personal data deletion. Discord's own message storage is not affected.",
         ephemeral=True,
     )
+
+@tree.command(name="memory_view", description="Privately view bounded durable memory BNL stores about you here.")
+async def memory_view(interaction: discord.Interaction):
+    if not interaction.guild:
+        await interaction.response.send_message("❌ This command can only be used in a server.", ephemeral=True); return
+    with sqlite3.connect(DB_FILE) as conn:
+        items = view_member_memory(conn, guild_id=interaction.guild.id, user_id=interaction.user.id, limit=10)
+    if not items:
+        await interaction.response.send_message("No governed durable-memory items are currently associated with you in this server.", ephemeral=True); return
+    lines = ["Your governed durable-memory items (private):"]
+    for item in items:
+        lines.append(f"- `{item['ref']}` — {item['kind']}; status: {item['status']}; summary: {item['summary']}")
+    await interaction.response.send_message("\n".join(lines)[:1900], ephemeral=True)
+
+@tree.command(name="memory_correct", description="Correct one of your governed memory items by safe reference.")
+@app_commands.describe(reference="Safe reference from /memory_view", corrected_text="The corrected memory text")
+async def memory_correct(interaction: discord.Interaction, reference: str, corrected_text: str):
+    if not interaction.guild:
+        await interaction.response.send_message("❌ This command can only be used in a server.", ephemeral=True); return
+    with sqlite3.connect(DB_FILE) as conn:
+        result = correct_member_memory(conn, guild_id=interaction.guild.id, user_id=interaction.user.id, safe_ref=reference.strip(), corrected_text=corrected_text.strip())
+    msg = f"✅ Correction recorded. Receipt `{result.get('receipt')}`." if result.get("ok") else f"❌ Correction rejected: {result.get('reason')}"
+    await interaction.response.send_message(msg, ephemeral=True)
+
+@tree.command(name="memory_forget", description="Forget one of your governed memory items by safe reference.")
+@app_commands.describe(reference="Safe reference from /memory_view")
+async def memory_forget(interaction: discord.Interaction, reference: str):
+    if not interaction.guild:
+        await interaction.response.send_message("❌ This command can only be used in a server.", ephemeral=True); return
+    with sqlite3.connect(DB_FILE) as conn:
+        result = forget_member_memory(conn, guild_id=interaction.guild.id, user_id=interaction.user.id, safe_ref=reference.strip())
+    msg = f"✅ Memory item forgotten for governed retrieval. Receipt `{result.get('receipt')}`." if result.get("ok") else f"❌ Forget rejected: {result.get('reason')}"
+    await interaction.response.send_message(msg, ephemeral=True)
+
+@tree.command(name="memory_complete_delete", description="Delete your bot-held personal conversation and memory data here.")
+@app_commands.describe(confirmation="Type: DELETE MY BNL DATA <server id>")
+async def memory_complete_delete(interaction: discord.Interaction, confirmation: str):
+    if not interaction.guild:
+        await interaction.response.send_message("❌ This command can only be used in a server.", ephemeral=True); return
+    with sqlite3.connect(DB_FILE) as conn:
+        result = complete_delete_member_data(conn, guild_id=interaction.guild.id, user_id=interaction.user.id, confirmation=confirmation.strip())
+    if result.get("ok"):
+        await interaction.response.send_message(f"✅ Complete delete finished for bot-held personal data in this server. Receipt `{result.get('receipt')}`. This does not delete messages stored by Discord itself.", ephemeral=True)
+    else:
+        await interaction.response.send_message(f"❌ Complete delete not run: {result.get('reason')}. To confirm, type `DELETE MY BNL DATA {interaction.guild.id}`.", ephemeral=True)
 
 @tree.command(name="usage", description="View BNL-01's daily token usage statistics.")
 @app_commands.checks.has_permissions(administrator=True)
