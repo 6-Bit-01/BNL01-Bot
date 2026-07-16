@@ -651,3 +651,60 @@ class ConversationContinuityRepairSafetyTests(unittest.TestCase):
             ),
             "",
         )
+
+
+class ConversationContinuityLatestRememberedNumberTests(unittest.TestCase):
+    def prompt(self, lines):
+        return (
+            "Current channel policy: sealed_test\n"
+            "Conversation continuity (bounded; continuity-only, not canon/current-state evidence):\n"
+            + "\n".join(lines)
+            + "\nCurrent user request: what number did i tell you to remember?\n"
+        )
+
+    def test_fallback_uses_latest_user_remembered_number(self):
+        prompt = self.prompt([
+            "User/member: remember this number: 8",
+            "BNL-01: got 8",
+            "User/member: remember this number: 9",
+            "BNL-01: replacing it with 9",
+        ])
+        self.assertEqual(bnl01_bot.resolve_latest_remembered_number_from_conversation_context(prompt), "9")
+        self.assertEqual(bnl01_bot._safe_uncertain_response_from_prompt(prompt), "You told me to remember 9.")
+
+    def test_repair_rejects_stale_candidate_when_later_user_value_exists(self):
+        prompt = self.prompt([
+            "User/member: remember this number: 8",
+            "BNL-01: got 8",
+            "User/member: remember this number: 9",
+        ])
+        self.assertEqual(
+            bnl01_bot._repair_unsupported_authority_with_conversation_context("Records indicate the number was 8.", prompt),
+            "",
+        )
+        self.assertEqual(
+            bnl01_bot._repair_unsupported_authority_with_conversation_context("Records indicate the number was 9.", prompt),
+            "You told me to remember 9.",
+        )
+
+    def test_fallback_single_user_instruction_returns_8(self):
+        prompt = self.prompt(["User/member: Remember this number - 8", "BNL-01: noted"] )
+        self.assertEqual(bnl01_bot._safe_uncertain_response_from_prompt(prompt), "You told me to remember 8.")
+
+    def test_model_only_remembered_number_is_not_used_by_fallback_or_repair(self):
+        prompt = self.prompt(["User/member: what was it?", "BNL-01: You asked me to remember this number: 8"])
+        self.assertEqual(bnl01_bot.resolve_latest_remembered_number_from_conversation_context(prompt), "")
+        fallback = bnl01_bot._safe_uncertain_response_from_prompt(prompt)
+        self.assertNotEqual(fallback, "You told me to remember 8.")
+        self.assertEqual(
+            bnl01_bot._repair_unsupported_authority_with_conversation_context("Records indicate the number was 8.", prompt),
+            "",
+        )
+
+    def test_public_and_sealed_prompt_boundaries_do_not_change_resolution_rules(self):
+        for policy in ("public_home", "sealed_test"):
+            with self.subTest(policy=policy):
+                prompt = self.prompt(["User/member: remember this number: 8"]).replace("Current channel policy: sealed_test", f"Current channel policy: {policy}")
+                self.assertEqual(bnl01_bot._safe_uncertain_response_from_prompt(prompt), "You told me to remember 8.")
+        shadow = self.prompt(["BNL-01: remember this number: 8"]).replace("Current channel policy: sealed_test", "Current channel policy: sealed_shadow")
+        self.assertEqual(bnl01_bot.resolve_latest_remembered_number_from_conversation_context(shadow), "")

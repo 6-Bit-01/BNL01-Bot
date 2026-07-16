@@ -1227,7 +1227,7 @@ class SendThenSaveOrderingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(cur.fetchone()[0], long_response)
         conn.close()
 
-    async def test_repeated_helper_calls_do_not_double_save_within_one_execution(self):
+    async def test_single_helper_execution_saves_exactly_one_model_row(self):
         msg = self.message()
         await bnl01_bot.send_reply_then_save_model(
             msg, "You told me to remember 8.", user_id=101, guild_id=1,

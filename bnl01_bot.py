@@ -12328,6 +12328,19 @@ def _conversation_continuity_user_lines(context: str) -> list[str]:
     return [line.strip() for line in (context or "").splitlines() if re.match(r"(?i)^User/member(?:\s*\([^)]*\))?:", line.strip())]
 
 
+REMEMBERED_NUMBER_INSTRUCTION_RE = re.compile(r"(?i)\bremember\s+(?:this\s+)?number\s*[:\-]?\s*(\d{1,12})\b")
+
+
+def resolve_latest_remembered_number_from_conversation_context(prompt_or_context: str) -> str:
+    context = _extract_conversation_continuity_context(prompt_or_context) or (prompt_or_context or "")
+    latest = ""
+    for line in _conversation_continuity_user_lines(context):
+        match = REMEMBERED_NUMBER_INSTRUCTION_RE.search(line)
+        if match:
+            latest = match.group(1)
+    return latest
+
+
 def _repair_unsupported_authority_with_conversation_context(text: str, prompt: str, route: str = "") -> str:
     if not contains_unsupported_source_authority_claim(text):
         return text or ""
@@ -12345,15 +12358,10 @@ def _repair_unsupported_authority_with_conversation_context(text: str, prompt: s
     if len(candidate_numbers) != 1:
         return ""
     candidate_number = next(iter(candidate_numbers))
-    user_supported = False
-    for line in _conversation_continuity_user_lines(context):
-        match = re.search(r"(?i)\bremember\s+this\s+number\s*[:\-]?\s*(\d{1,12})\b", line)
-        if match and match.group(1) == candidate_number:
-            user_supported = True
-            break
-    if not user_supported:
+    grounded_number = resolve_latest_remembered_number_from_conversation_context(context)
+    if candidate_number != grounded_number:
         return ""
-    repaired = f"You told me to remember {candidate_number}."
+    repaired = f"You told me to remember {grounded_number}."
     logging.info("unsupported_source_authority_claim_repaired reason=conversation_continuity_number route=%s channel_policy=%s v2_context_present=1", route, _extract_channel_policy_from_prompt(prompt))
     return repaired
 
@@ -12814,10 +12822,10 @@ def _safe_uncertain_response_from_prompt(prompt: str) -> str:
         )
     v2_context = _extract_conversation_continuity_context(prompt)
     if v2_context:
-        number_match = re.search(r"(?i)\bremember\s+this\s+number\s*[:\-]?\s*(\d{1,12})\b", v2_context)
-        if number_match:
+        remembered_number = resolve_latest_remembered_number_from_conversation_context(v2_context)
+        if remembered_number:
             logging.info("safe_uncertain_fallback_source_selected source=conversation_context_v2 channel_policy=%s extracted=number", _extract_channel_policy_from_prompt(prompt))
-            return f"You told me to remember {number_match.group(1)}."
+            return f"You told me to remember {remembered_number}."
         logging.info("safe_uncertain_fallback_source_selected source=conversation_context_v2 channel_policy=%s extracted=generic", _extract_channel_policy_from_prompt(prompt))
         return (
             "I do have relevant recent conversation in this channel, but I won’t pretend I ran an archive or entity lookup. "
@@ -16561,19 +16569,6 @@ async def apply_guarded_response_regeneration(
             diagnostics.update({"suppressed": True, "suppression_reason": "generic_non_answer_after_retry", "guard_fallback_or_generic_non_answer": True})
             return "", diagnostics
     return response, diagnostics
-
-
-async def _send_response_text(send_first, send_next, response: str, *, route: str = "", channel_id: int = 0, first_suffix: str = "...", next_prefix: str = "...", **send_kwargs) -> None:
-    if len(response or "") <= 2000:
-        await send_first(response, **send_kwargs)
-        return
-    chunks = split_message(response or "")
-    if not chunks:
-        await send_first(response or "", **send_kwargs)
-        return
-    await send_first(chunks[0] + first_suffix, **send_kwargs)
-    for chunk in chunks[1:]:
-        await send_next(next_prefix + chunk, **send_kwargs)
 
 
 async def send_reply_then_save_model(
