@@ -12324,6 +12324,10 @@ def _extract_conversation_continuity_context(prompt: str) -> str:
     )
     return (match.group("context").strip() if match else "")
 
+def _conversation_continuity_user_lines(context: str) -> list[str]:
+    return [line.strip() for line in (context or "").splitlines() if re.match(r"(?i)^User/member(?:\s*\([^)]*\))?:", line.strip())]
+
+
 def _repair_unsupported_authority_with_conversation_context(text: str, prompt: str, route: str = "") -> str:
     if not contains_unsupported_source_authority_claim(text):
         return text or ""
@@ -12333,15 +12337,24 @@ def _repair_unsupported_authority_with_conversation_context(text: str, prompt: s
     candidate = re.sub(r"(?i)\b(?:archival\s+)?records?\s+(?:indicate|show|confirm)s?\s+(?:that\s+)?", "", text or "").strip()
     candidate = re.sub(r"(?i)\b(?:archive|database|dossier|entity|source file|system)\s+(?:records?|lookup|scan)s?\s+(?:indicate|show|confirm)s?\s+(?:that\s+)?", "", candidate).strip()
     candidate = re.sub(r"^[,;:\-\s]+", "", candidate).strip()
-    number_match = re.search(r"\b(?:number|remember)\D{0,40}(\d{1,12})\b|\b(\d{1,12})\b", candidate)
-    context_number = re.search(r"(?i)\bremember\s+this\s+number\s*[:\-]?\s*(\d{1,12})\b", context)
-    if context_number and (not number_match or context_number.group(1) in candidate):
-        repaired = f"You told me to remember {context_number.group(1)}."
-    else:
-        repaired = candidate
-    if not repaired or contains_unsupported_source_authority_claim(repaired):
+    request = re.search(r"(?is)Current user request:\s*(?P<request>.*?)(?:\n[A-Z][^\n]{0,80}:|\Z)", prompt or "")
+    request_text = request.group("request") if request else prompt or ""
+    if not re.search(r"(?i)\b(?:what|which)\b.*\bnumber\b.*\bremember|\bremember\b.*\bnumber\b", request_text):
         return ""
-    logging.info("unsupported_source_authority_claim_repaired reason=conversation_continuity route=%s channel_policy=%s v2_context_present=1", route, _extract_channel_policy_from_prompt(prompt))
+    candidate_numbers = {m.group(0) for m in re.finditer(r"\b\d{1,12}\b", candidate)}
+    if len(candidate_numbers) != 1:
+        return ""
+    candidate_number = next(iter(candidate_numbers))
+    user_supported = False
+    for line in _conversation_continuity_user_lines(context):
+        match = re.search(r"(?i)\bremember\s+this\s+number\s*[:\-]?\s*(\d{1,12})\b", line)
+        if match and match.group(1) == candidate_number:
+            user_supported = True
+            break
+    if not user_supported:
+        return ""
+    repaired = f"You told me to remember {candidate_number}."
+    logging.info("unsupported_source_authority_claim_repaired reason=conversation_continuity_number route=%s channel_policy=%s v2_context_present=1", route, _extract_channel_policy_from_prompt(prompt))
     return repaired
 
 SOURCE_AUTHORITY_CONTEXT_MARKERS = (
@@ -14936,17 +14949,13 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
             if self_reflection:
                 if not is_privileged_member(member, channel.guild):
                     self_reflection = "Status reports are restricted to server owner/mod operators."
-                await channel.send(self_reflection, allowed_mentions=safe_mentions)
-                if not sealed_test_channel:
-                    save_model_message(unique_user_ids[0], channel.guild.id, self_reflection, channel_name=getattr(channel, "name", ""), channel_policy=channel_policy)
+                await send_channel_then_save_model(channel, self_reflection, user_id=unique_user_ids[0], guild_id=channel.guild.id, channel_name=getattr(channel, "name", ""), channel_policy=channel_policy, channel_id=channel_id, route_mode=ROUTE_MODE_NORMAL_CHAT, allowed_mentions=safe_mentions)
                 _channel_last_reply_at[channel_id] = datetime.now(PACIFIC_TZ)
                 return
 
             repair = try_repair_response(combined_text)
             if repair:
-                await channel.send(repair, allowed_mentions=safe_mentions)
-                if not sealed_test_channel:
-                    save_model_message(unique_user_ids[0], channel.guild.id, repair, channel_name=getattr(channel, "name", ""), channel_policy=channel_policy)
+                await send_channel_then_save_model(channel, repair, user_id=unique_user_ids[0], guild_id=channel.guild.id, channel_name=getattr(channel, "name", ""), channel_policy=channel_policy, channel_id=channel_id, route_mode=ROUTE_MODE_NORMAL_CHAT, allowed_mentions=safe_mentions)
                 _channel_last_reply_at[channel_id] = datetime.now(PACIFIC_TZ)
                 return
 
@@ -14954,9 +14963,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
             if not memory_recall:
                 memory_recall = try_memory_recall_response(unique_user_ids[0], channel.guild.id, combined_text)
             if memory_recall:
-                await channel.send(memory_recall, allowed_mentions=safe_mentions)
-                if not sealed_test_channel:
-                    save_model_message(unique_user_ids[0], channel.guild.id, memory_recall, channel_name=getattr(channel, "name", ""), channel_policy=channel_policy)
+                await send_channel_then_save_model(channel, memory_recall, user_id=unique_user_ids[0], guild_id=channel.guild.id, channel_name=getattr(channel, "name", ""), channel_policy=channel_policy, channel_id=channel_id, route_mode=ROUTE_MODE_NORMAL_CHAT, allowed_mentions=safe_mentions)
                 _channel_last_reply_at[channel_id] = datetime.now(PACIFIC_TZ)
                 return
         recent_bnl_reply_context = bool(_channel_last_reply_at.get(channel_id) and (datetime.now(PACIFIC_TZ) - _channel_last_reply_at[channel_id]).total_seconds() <= RECENT_MEDIA_LIVE_MOMENT_SECONDS)
@@ -15591,8 +15598,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
             mark_recent_media_events_response_state(guild_id, channel_id, set(unique_user_ids), channel_policy, "responded")
 
         for uid in unique_user_ids:
-            if not sealed_test_channel:
-                save_model_message(uid, channel.guild.id, response, channel_name=getattr(channel, "name", ""), channel_policy=channel_policy)
+            save_model_message(uid, channel.guild.id, response, channel_name=getattr(channel, "name", ""), channel_policy=channel_policy, channel_id=channel_id, route_mode=ROUTE_MODE_NORMAL_CHAT)
 
         if BNL_ACTIVE_BATCHING_ENABLED and (reason.startswith("request_intent:") or reason.startswith("request_payload_expected:") or reason in ("pending_request_payload_continuation", "pending_request_single_payload_continuation")):
             _set_pending_request_intent(channel_id, datetime.now(PACIFIC_TZ), reason)
@@ -16557,6 +16563,70 @@ async def apply_guarded_response_regeneration(
     return response, diagnostics
 
 
+async def _send_response_text(send_first, send_next, response: str, *, route: str = "", channel_id: int = 0, first_suffix: str = "...", next_prefix: str = "...", **send_kwargs) -> None:
+    if len(response or "") <= 2000:
+        await send_first(response, **send_kwargs)
+        return
+    chunks = split_message(response or "")
+    if not chunks:
+        await send_first(response or "", **send_kwargs)
+        return
+    await send_first(chunks[0] + first_suffix, **send_kwargs)
+    for chunk in chunks[1:]:
+        await send_next(next_prefix + chunk, **send_kwargs)
+
+
+async def send_reply_then_save_model(
+    message,
+    response: str,
+    *,
+    user_id: int,
+    guild_id: int,
+    channel_name: str = "",
+    channel_policy: str = "unknown",
+    channel_id: int = 0,
+    route_mode: str = ROUTE_MODE_NORMAL_CHAT,
+    allow_model_save: bool = True,
+    save: bool | None = None,
+    reply_text: str | None = None,
+) -> MemoryWriteDecision:
+    model_decision = MemoryWriteDecision(False, False, False, False, False, False, "model_save_skipped", context_visibility_for_policy(channel_policy))
+    sent_text = response or ""
+    await message.reply(reply_text if reply_text is not None else sent_text)
+    if allow_model_save and (save is None or save):
+        model_decision = save_model_message(user_id, guild_id, sent_text, channel_name=channel_name, channel_policy=channel_policy, channel_id=channel_id, route_mode=route_mode)
+    logging.info("model_conversation_row_after_send route=%s channel_policy=%s saved=%s reason=%s", route_mode, channel_policy, int(bool(getattr(model_decision, "save_conversation", False))), getattr(model_decision, "reason", "unknown"))
+    return model_decision
+
+
+async def send_channel_then_save_model(
+    channel,
+    response: str,
+    *,
+    user_id: int,
+    guild_id: int,
+    channel_name: str = "",
+    channel_policy: str = "unknown",
+    channel_id: int = 0,
+    route_mode: str = ROUTE_MODE_NORMAL_CHAT,
+    allow_model_save: bool = True,
+    allowed_mentions=None,
+) -> MemoryWriteDecision:
+    model_decision = MemoryWriteDecision(False, False, False, False, False, False, "model_save_skipped", context_visibility_for_policy(channel_policy))
+    kwargs = {"allowed_mentions": allowed_mentions} if allowed_mentions is not None else {}
+    if len(response or "") <= 2000:
+        await channel.send(response or "", **kwargs)
+    else:
+        chunks = split_message(response or "")
+        await channel.send(chunks[0] + "...", **kwargs)
+        for chunk in chunks[1:]:
+            await channel.send("..." + chunk, **kwargs)
+    if allow_model_save:
+        model_decision = save_model_message(user_id, guild_id, response or "", channel_name=channel_name, channel_policy=channel_policy, channel_id=channel_id, route_mode=route_mode)
+    logging.info("model_conversation_row_after_send route=%s channel_policy=%s saved=%s reason=%s", route_mode, channel_policy, int(bool(getattr(model_decision, "save_conversation", False))), getattr(model_decision, "reason", "unknown"))
+    return model_decision
+
+
 async def send_planned_conversation_response(
     message: discord.Message,
     response: str,
@@ -16622,16 +16692,6 @@ async def send_planned_conversation_response(
     if guard_diagnostics.get("suppressed"):
         logging.info("continuation_mark_skipped reason=guard_fallback_or_generic_non_answer route=%s channel_policy=%s", plan.route_mode, plan.channel_policy)
         return model_decision
-    if allow_model_save and not website_read_model_context:
-        model_decision = save_model_message(
-            message.author.id,
-            message.guild.id,
-            response,
-            channel_name=getattr(message.channel, "name", ""),
-            channel_policy=plan.channel_policy,
-            channel_id=getattr(message.channel, "id", 0),
-            route_mode=plan.route_mode,
-        )
     subject_ran = bool(subject_extraction_ran) if subject_extraction_ran is not None else bool(plan.subject_extraction_allowed)
     update_last_route_debug(
         route_mode=plan.route_mode,
@@ -16694,6 +16754,17 @@ async def send_planned_conversation_response(
     except Exception as exc:
         logging.error("response_send_failed route=%s channel_id=%s discord_error_type=%s", plan.route_mode, getattr(message.channel, "id", 0), type(exc).__name__)
         return model_decision
+    if allow_model_save and not website_read_model_context:
+        model_decision = save_model_message(
+            message.author.id,
+            message.guild.id,
+            response,
+            channel_name=getattr(message.channel, "name", ""),
+            channel_policy=plan.channel_policy,
+            channel_id=getattr(message.channel, "id", 0),
+            route_mode=plan.route_mode,
+        )
+        logging.info("model_conversation_row_after_send route=%s channel_policy=%s saved=%s reason=%s", plan.route_mode, plan.channel_policy, int(bool(getattr(model_decision, "save_conversation", False))), getattr(model_decision, "reason", "unknown"))
     if mark_recent_direct:
         meaningful_followup_question = _response_contains_direct_question_to_user(response) and not is_generic_non_answer_response(response, getattr(message.author, "display_name", ""))
         _mark_conversation_continuation_state(
@@ -17349,24 +17420,21 @@ async def on_message(message: discord.Message):
                 _log_batch_event(logging.INFO, "skip", message.guild.id, message.channel.id, pending_count, "direct_reply_preempts_batch")
             repair = try_repair_response(direct_content)
             if repair:
-                save_model_message(message.author.id, message.guild.id, repair, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0), route_mode=route_mode)
-                await message.reply(repair)
+                await send_reply_then_save_model(message, repair, user_id=message.author.id, guild_id=message.guild.id, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0), route_mode=route_mode)
                 return
 
             self_reflection = try_self_reflection_response(message.author.id, message.guild.id, direct_content)
             if self_reflection:
                 if not is_privileged_member(message.author, message.guild):
                     self_reflection = "Status reports are restricted to server owner/mod operators."
-                save_model_message(message.author.id, message.guild.id, self_reflection, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0), route_mode=route_mode)
-                await message.reply(self_reflection)
+                await send_reply_then_save_model(message, self_reflection, user_id=message.author.id, guild_id=message.guild.id, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0), route_mode=route_mode)
                 return
 
             memory_recall = resolve_recent_media_followup(message.author.id, message.guild.id, message.channel.id, channel_policy, direct_content)
             if not memory_recall:
                 memory_recall = try_memory_recall_response(message.author.id, message.guild.id, direct_content)
             if memory_recall:
-                save_model_message(message.author.id, message.guild.id, memory_recall, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0), route_mode=route_mode)
-                await message.reply(memory_recall)
+                await send_reply_then_save_model(message, memory_recall, user_id=message.author.id, guild_id=message.guild.id, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0), route_mode=route_mode)
                 return
 
             payload_expected, _ = _detect_request_payload_expectation(direct_content)
@@ -17616,24 +17684,21 @@ async def on_message(message: discord.Message):
 
         repair = try_repair_response(direct_content)
         if repair:
-            save_model_message(message.author.id, message.guild.id, repair, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0), route_mode=route_mode)
-            await message.reply(repair)
+            await send_reply_then_save_model(message, repair, user_id=message.author.id, guild_id=message.guild.id, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0), route_mode=route_mode)
             return
 
         self_reflection = try_self_reflection_response(message.author.id, message.guild.id, direct_content)
         if self_reflection:
             if not is_privileged_member(message.author, message.guild):
                 self_reflection = "Status reports are restricted to server owner/mod operators."
-            save_model_message(message.author.id, message.guild.id, self_reflection, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0), route_mode=route_mode)
-            await message.reply(self_reflection)
+            await send_reply_then_save_model(message, self_reflection, user_id=message.author.id, guild_id=message.guild.id, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0), route_mode=route_mode)
             return
 
         memory_recall = resolve_recent_media_followup(message.author.id, message.guild.id, message.channel.id, channel_policy, direct_content)
         if not memory_recall:
             memory_recall = try_memory_recall_response(message.author.id, message.guild.id, direct_content)
         if memory_recall:
-            save_model_message(message.author.id, message.guild.id, memory_recall, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0), route_mode=route_mode)
-            await message.reply(memory_recall)
+            await send_reply_then_save_model(message, memory_recall, user_id=message.author.id, guild_id=message.guild.id, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0), route_mode=route_mode)
             return
 
         payload_expected, _ = _detect_request_payload_expectation(direct_content)
@@ -17829,24 +17894,21 @@ async def on_message(message: discord.Message):
 
         repair = try_repair_response(direct_content)
         if repair:
-            save_model_message(message.author.id, message.guild.id, repair, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0), route_mode=route_mode)
-            await message.reply(repair if len(repair) <= 2000 else repair[:1900] + "...")
+            await send_reply_then_save_model(message, repair, user_id=message.author.id, guild_id=message.guild.id, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0), route_mode=route_mode, reply_text=repair if len(repair) <= 2000 else repair[:1900] + "...")
             return
 
         self_reflection = try_self_reflection_response(message.author.id, message.guild.id, direct_content)
         if self_reflection:
             if not is_privileged_member(message.author, message.guild):
                 self_reflection = "Status reports are restricted to server owner/mod operators."
-            save_model_message(message.author.id, message.guild.id, self_reflection, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0), route_mode=route_mode)
-            await message.reply(self_reflection if len(self_reflection) <= 2000 else self_reflection[:1900] + "...")
+            await send_reply_then_save_model(message, self_reflection, user_id=message.author.id, guild_id=message.guild.id, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0), route_mode=route_mode, reply_text=self_reflection if len(self_reflection) <= 2000 else self_reflection[:1900] + "...")
             return
 
         memory_recall = resolve_recent_media_followup(message.author.id, message.guild.id, message.channel.id, channel_policy, direct_content)
         if not memory_recall:
             memory_recall = try_memory_recall_response(message.author.id, message.guild.id, direct_content)
         if memory_recall:
-            save_model_message(message.author.id, message.guild.id, memory_recall, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0), route_mode=route_mode)
-            await message.reply(memory_recall if len(memory_recall) <= 2000 else memory_recall[:1900] + "...")
+            await send_reply_then_save_model(message, memory_recall, user_id=message.author.id, guild_id=message.guild.id, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0), route_mode=route_mode, reply_text=memory_recall if len(memory_recall) <= 2000 else memory_recall[:1900] + "...")
             return
 
         payload_expected, _ = _detect_request_payload_expectation(direct_content)

@@ -472,3 +472,48 @@ class ConversationContextV2SealedRegressionTests(unittest.TestCase):
             req(current_texts=("what about queue?",)),
         )
         self.assertEqual(blocked.rendered_context, "")
+
+class ConversationContextV2QueueBoundaryExpandedTests(unittest.TestCase):
+    def assert_model_excluded(self, text):
+        res = assemble_conversation_context_v2(
+            [row(900, "user", "queue status?"), row(901, "model", text)],
+            req(current_texts=("what about the queue?",)),
+        )
+        self.assertEqual(res.rendered_context, "", text)
+
+    def assert_model_allowed(self, text):
+        res = assemble_conversation_context_v2(
+            [row(910, "user", "queue discussion"), row(911, "model", text)],
+            req(current_texts=("what did we discuss about the queue?",)),
+        )
+        self.assertIn("queue", res.rendered_context.lower(), text)
+
+    def test_current_queue_state_assertions_are_blocked(self):
+        for text in (
+            "The queue is open.",
+            "The queue is closed.",
+            "The queue is live.",
+            "The queue is active.",
+            "The queue currently has 3 entries.",
+            "The queue has three tracks.",
+            "Three tracks are currently in the queue.",
+            "The current track is playing now.",
+            "Up next is the paid session track.",
+            "Payment cleared for that submission.",
+            "Your Priority slot is confirmed.",
+            "Wheel spins owed are three.",
+        ):
+            with self.subTest(text=text):
+                self.assert_model_excluded(text)
+
+    def test_ordinary_queue_discussion_is_allowed(self):
+        for text in (
+            "We were talking about the queue earlier.",
+            "People had ideas about how queues should work.",
+            "That queue joke was funny.",
+            "We discussed whether the queue was open.",
+            "If people say the queue is open in Discord, that does not mean the website queue changed.",
+            "Our planning notes criticized the queue idea without claiming it changed.",
+        ):
+            with self.subTest(text=text):
+                self.assert_model_allowed(text)

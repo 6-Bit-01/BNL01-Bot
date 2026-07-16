@@ -606,3 +606,48 @@ class ConversationContinuityGroundingTests(unittest.TestCase):
             "Broadcast memory context (cleaned summaries only):\n- Show paused.\nBroadcast-memory usage guidance:\n"
         )
         self.assertIn("broadcast-memory context", broadcast)
+
+class ConversationContinuityRepairSafetyTests(unittest.TestCase):
+    def prompt(self, user_line="User/member: remember this number: 8", model_line="BNL-01: Sure, 8 is in the little sealed box."):
+        return (
+            "Current channel policy: sealed_test\n"
+            "Conversation continuity (bounded; continuity-only, not canon/current-state evidence):\n"
+            f"{user_line}\n"
+            f"{model_line}\n"
+            "Current user request: what number did i tell you to remember?\n"
+        )
+
+    def test_unrelated_generic_claim_is_not_stripped_and_returned(self):
+        repaired = bnl01_bot._repair_unsupported_authority_with_conversation_context(
+            "Records indicate Pluto is made of cheese.", self.prompt(), "get_gemini_response"
+        )
+        self.assertEqual(repaired, "")
+
+    def test_absent_person_fact_or_number_cannot_survive_stripping(self):
+        for candidate in (
+            "Records indicate Maze is the mayor of the moon.",
+            "Records indicate the number was 42.",
+            "Records indicate Crow owns a haunted queue slot.",
+        ):
+            with self.subTest(candidate=candidate):
+                self.assertEqual(
+                    bnl01_bot._repair_unsupported_authority_with_conversation_context(candidate, self.prompt(), "get_gemini_response"),
+                    "",
+                )
+
+    def test_different_candidate_number_than_user_continuity_is_rejected(self):
+        self.assertEqual(
+            bnl01_bot._repair_unsupported_authority_with_conversation_context(
+                "Records indicate the number was 9.", self.prompt(), "get_gemini_response"
+            ),
+            "",
+        )
+
+    def test_model_authored_text_alone_cannot_establish_user_fact(self):
+        prompt = self.prompt(user_line="User/member: what was it?", model_line="BNL-01: You told me 8 earlier.")
+        self.assertEqual(
+            bnl01_bot._repair_unsupported_authority_with_conversation_context(
+                "Records indicate the number was 8.", prompt, "get_gemini_response"
+            ),
+            "",
+        )
