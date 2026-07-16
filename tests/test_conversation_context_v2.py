@@ -435,3 +435,85 @@ class BotConversationContextV2IntegrationTests(unittest.TestCase):
     def test_user_zero_generation_gets_no_v2_context(self):
         rendered=self.bot.build_conversation_context_v2_for_prompt(guild_id=99,current_user_id=0,channel_id=10,channel_name="home",channel_policy="public_home",route_mode=self.bot.ROUTE_MODE_NORMAL_CHAT,current_texts=["relay"])
         self.assertEqual(rendered, "")
+
+class ConversationContextV2SealedRegressionTests(unittest.TestCase):
+    def test_sealed_remember_number_pair_selected_and_public_does_not_cross(self):
+        rows = [
+            row(1, "user", "remember this number: 8", policy="sealed_test", channel=10, cname="bnl-testing"),
+            row(2, "model", "I tucked 8 into this sealed little corner.", policy="sealed_test", channel=10, cname="bnl-testing"),
+            row(3, "user", "remember this number: 99", policy="public_home", channel=20, cname="general"),
+            row(4, "model", "99 noted in public.", policy="public_home", channel=20, cname="general"),
+        ]
+        res = assemble_conversation_context_v2(
+            rows,
+            req(channel_policy="sealed_test", channel_id=10, channel_name="bnl-testing", current_texts=("what number did i tell you to remember?",)),
+        )
+        self.assertEqual(res.same_room_paired_turn_count, 1)
+        self.assertEqual(res.cross_channel_paired_turn_count, 0)
+        self.assertIn("remember this number: 8", res.rendered_context)
+        self.assertNotIn("99", res.rendered_context)
+
+    def test_queue_discussion_allowed_but_current_queue_state_excluded(self):
+        conversational = [
+            "We were talking about the queue earlier.",
+            "People in Discord had ideas about how queues should work.",
+            "That queue joke was funny.",
+            "If people talk about the queue in Discord, that does not mean the website queue changed.",
+        ]
+        for idx, text in enumerate(conversational, 1):
+            with self.subTest(text=text):
+                res = assemble_conversation_context_v2(
+                    [row(idx * 2 - 1, "user", text), row(idx * 2, "model", "Right, queue talk is just conversation here.")],
+                    req(current_texts=("what did we say about queue?",)),
+                )
+                self.assertIn("queue", res.rendered_context.lower())
+        blocked = assemble_conversation_context_v2(
+            [row(50, "user", "is the queue open?"), row(51, "model", "The website queue is currently open.")],
+            req(current_texts=("what about queue?",)),
+        )
+        self.assertEqual(blocked.rendered_context, "")
+
+class ConversationContextV2QueueBoundaryExpandedTests(unittest.TestCase):
+    def assert_model_excluded(self, text):
+        res = assemble_conversation_context_v2(
+            [row(900, "user", "queue status?"), row(901, "model", text)],
+            req(current_texts=("what about the queue?",)),
+        )
+        self.assertEqual(res.rendered_context, "", text)
+
+    def assert_model_allowed(self, text):
+        res = assemble_conversation_context_v2(
+            [row(910, "user", "queue discussion"), row(911, "model", text)],
+            req(current_texts=("what did we discuss about the queue?",)),
+        )
+        self.assertIn("queue", res.rendered_context.lower(), text)
+
+    def test_current_queue_state_assertions_are_blocked(self):
+        for text in (
+            "The queue is open.",
+            "The queue is closed.",
+            "The queue is live.",
+            "The queue is active.",
+            "The queue currently has 3 entries.",
+            "The queue has three tracks.",
+            "Three tracks are currently in the queue.",
+            "The current track is playing now.",
+            "Up next is the paid session track.",
+            "Payment cleared for that submission.",
+            "Your Priority slot is confirmed.",
+            "Wheel spins owed are three.",
+        ):
+            with self.subTest(text=text):
+                self.assert_model_excluded(text)
+
+    def test_ordinary_queue_discussion_is_allowed(self):
+        for text in (
+            "We were talking about the queue earlier.",
+            "People had ideas about how queues should work.",
+            "That queue joke was funny.",
+            "We discussed whether the queue was open.",
+            "If people say the queue is open in Discord, that does not mean the website queue changed.",
+            "Our planning notes criticized the queue idea without claiming it changed.",
+        ):
+            with self.subTest(text=text):
+                self.assert_model_allowed(text)

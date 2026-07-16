@@ -43,9 +43,11 @@ OPERATIONAL_STATE_RE = re.compile(
 )
 QUEUE_STATE_RE = re.compile(
     r"\bqueue status\b"
-    r"|\bqueue\b(?=.*\b(?:tracks?|submissions?|artists?|slots?|waiting|queued|currently|open|live)\b)"
-    r"|\bqueue\b(?=.*\bcurrently\b)(?=.*\bentries\b)"
-    r"|\b(?:tracks?|submissions?|artists?|slots?)\b(?=.*\bqueue\b)",
+    r"|\b(?:website|site|barcode|current|live)?\s*queue\s+(?:status\s+)?(?:is|was|looks|seems|stays|remains)\s+(?:currently\s+)?(?:open|closed|live|active|available|full)\b"
+    r"|\bqueue\s+(?:currently\s+)?(?:has|contains)\s+(?:\d+|one|two|three|four|five|six|seven|eight|nine|ten|several|some|many)\s+(?:tracks?|submissions?|artists?|slots?|entries|waiting)\b"
+    r"|\bqueue\s+(?:has|contains)\s+(?:currently\s+)?(?:\d+|one|two|three|four|five|six|seven|eight|nine|ten|several|some|many)\s+(?:tracks?|submissions?|artists?|slots?|entries|waiting)\b"
+    r"|\b(?:\d+|one|two|three|four|five|six|seven|eight|nine|ten|several|some|many)\s+(?:tracks?|submissions?|artists?|slots?|entries)\b(?=.*\b(?:currently|now|in)\b)(?=.*\bqueue\b)"
+    r"|\b(?:now|currently)\s+(?:in\s+)?(?:the\s+)?queue\b",
     re.I,
 )
 PAYMENT_STATE_RE = re.compile(r"\bpayment\b(?=.*\b(?:cleared|active|pending|owed|paid|submission|slot|session|confirmed)\b)", re.I)
@@ -228,9 +230,15 @@ def _unsafe_row(row: dict) -> bool:
 
 def _unsafe_operational_state_assertion(content: str) -> bool:
     text = re.sub(r"\s+", " ", content or "").strip()
+    lowered = text.lower()
+    conversational_queue_discussion = bool(
+        re.search(r"\b(?:talk(?:ing|ed)? about|discuss(?:ed|ing)?|ideas? about|joke|hypothetical|whether|if people|does not mean|doesn't mean|should work|planning|criticism|history)\b", lowered)
+        and "queue" in lowered
+    )
+    queue_state = bool(QUEUE_STATE_RE.search(text)) and not conversational_queue_discussion
     return bool(
         OPERATIONAL_STATE_RE.search(text)
-        or QUEUE_STATE_RE.search(text)
+        or queue_state
         or PAYMENT_STATE_RE.search(text)
         or PRIORITY_STATE_RE.search(text)
         or WHEEL_STATE_RE.search(text)

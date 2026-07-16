@@ -1108,3 +1108,167 @@ class GuardedResponseRegenerationTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class SealedConversationPersistenceTests(unittest.TestCase):
+    def test_sealed_user_and_model_rows_are_conversation_only_and_pairable_once(self):
+        import sqlite3
+        old_db = bnl01_bot.DB_FILE
+        with tempfile.NamedTemporaryFile(delete=True) as tmp:
+            bnl01_bot.DB_FILE = tmp.name
+            bnl01_bot.init_db()
+            try:
+                user_decision = bnl01_bot.save_user_message(
+                    101, "Crow", 1, "remember this number: 8",
+                    channel_name="bnl-testing", channel_policy="sealed_test", channel_id=2,
+                    message_id=7001, route_mode=bnl01_bot.ROUTE_MODE_NORMAL_CHAT,
+                )
+                model_decision = bnl01_bot.save_model_message(
+                    101, 1, "You told me to remember 8.",
+                    channel_name="bnl-testing", channel_policy="sealed_test", channel_id=2,
+                    route_mode=bnl01_bot.ROUTE_MODE_NORMAL_CHAT,
+                )
+                self.assertTrue(user_decision.save_conversation)
+                self.assertTrue(model_decision.save_conversation)
+                self.assertFalse(model_decision.write_memory_tier)
+                self.assertFalse(model_decision.update_relationship)
+                conn = sqlite3.connect(tmp.name)
+                cur = conn.cursor()
+                cur.execute("SELECT role, channel_policy, channel_id, content FROM conversations ORDER BY id")
+                rows = cur.fetchall()
+                self.assertEqual(len(rows), 2)
+                self.assertEqual(rows[0][0], "user")
+                self.assertEqual(rows[1][0], "model")
+                self.assertTrue(all(r[1] == "sealed_test" and r[2] == 2 for r in rows))
+                for table in ("memory_tiers", "user_memory_facts", "relationship_state", "relationship_journal"):
+                    cur.execute(f"SELECT COUNT(*) FROM {table}")
+                    self.assertEqual(cur.fetchone()[0], 0, table)
+                conn.close()
+            finally:
+                bnl01_bot.DB_FILE = old_db
+
+    def test_empty_or_excluded_model_response_is_not_saved(self):
+        old_db = bnl01_bot.DB_FILE
+        with tempfile.NamedTemporaryFile(delete=True) as tmp:
+            bnl01_bot.DB_FILE = tmp.name
+            bnl01_bot.init_db()
+            try:
+                decision = bnl01_bot.save_model_message(
+                    101, 1, "", channel_name="bnl-testing", channel_policy="sealed_test", channel_id=2
+                )
+                self.assertFalse(decision.save_conversation)
+            finally:
+                bnl01_bot.DB_FILE = old_db
+
+class SendThenSaveOrderingTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.old_db = bnl01_bot.DB_FILE
+        self.tmp = tempfile.NamedTemporaryFile(delete=True)
+        bnl01_bot.DB_FILE = self.tmp.name
+        bnl01_bot.init_db()
+
+    def tearDown(self):
+        bnl01_bot.DB_FILE = self.old_db
+        self.tmp.close()
+
+    def message(self, *, fail_reply=False):
+        msg = mock.Mock()
+        msg.author = mock.Mock(id=101, display_name="Crow")
+        msg.guild = mock.Mock(id=1)
+        msg.channel = mock.Mock(id=2, name="bnl-testing")
+        msg.content = "what number did i tell you to remember?"
+        if fail_reply:
+            msg.reply = mock.AsyncMock(side_effect=RuntimeError("discord down"))
+        else:
+            msg.reply = mock.AsyncMock()
+        msg.channel.send = mock.AsyncMock()
+        return msg
+
+    def model_count(self):
+        import sqlite3
+        conn = sqlite3.connect(bnl01_bot.DB_FILE)
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM conversations WHERE role='model'")
+        count = cur.fetchone()[0]
+        conn.close()
+        return count
+
+    async def test_successful_send_writes_one_model_row_after_delivery(self):
+        msg = self.message()
+        await bnl01_bot.send_reply_then_save_model(
+            msg, "You told me to remember 8.", user_id=101, guild_id=1,
+            channel_name="bnl-testing", channel_policy="sealed_test", channel_id=2,
+        )
+        msg.reply.assert_awaited_once()
+        self.assertEqual(self.model_count(), 1)
+
+    async def test_failed_send_writes_zero_model_rows(self):
+        msg = self.message(fail_reply=True)
+        with self.assertRaises(RuntimeError):
+            await bnl01_bot.send_reply_then_save_model(
+                msg, "You told me to remember 8.", user_id=101, guild_id=1,
+                channel_name="bnl-testing", channel_policy="sealed_test", channel_id=2,
+            )
+        self.assertEqual(self.model_count(), 0)
+
+    async def test_multi_chunk_successful_send_writes_one_complete_model_row(self):
+        channel = mock.Mock(id=2, name="bnl-testing")
+        channel.send = mock.AsyncMock()
+        long_response = "chunk " * 900
+        await bnl01_bot.send_channel_then_save_model(
+            channel, long_response, user_id=101, guild_id=1,
+            channel_name="bnl-testing", channel_policy="sealed_test", channel_id=2,
+        )
+        self.assertGreater(channel.send.await_count, 1)
+        self.assertEqual(self.model_count(), 1)
+        import sqlite3
+        conn = sqlite3.connect(bnl01_bot.DB_FILE)
+        cur = conn.cursor()
+        cur.execute("SELECT content FROM conversations WHERE role='model'")
+        self.assertEqual(cur.fetchone()[0], long_response)
+        conn.close()
+
+    async def test_single_helper_execution_saves_exactly_one_model_row(self):
+        msg = self.message()
+        await bnl01_bot.send_reply_then_save_model(
+            msg, "You told me to remember 8.", user_id=101, guild_id=1,
+            channel_name="bnl-testing", channel_policy="sealed_test", channel_id=2,
+        )
+        self.assertEqual(self.model_count(), 1)
+
+    async def test_sealed_success_forms_pair_and_recall_repairs_without_archive_framing(self):
+        import sqlite3
+        bnl01_bot.save_user_message(101, "Crow", 1, "remember this number: 8", channel_name="bnl-testing", channel_policy="sealed_test", channel_id=2, route_mode=bnl01_bot.ROUTE_MODE_NORMAL_CHAT)
+        msg = self.message()
+        await bnl01_bot.send_reply_then_save_model(
+            msg, "I tucked 8 into the sealed corner.", user_id=101, guild_id=1,
+            channel_name="bnl-testing", channel_policy="sealed_test", channel_id=2,
+        )
+        rows = bnl01_bot.get_conversation_context_v2_rows(1, limit=20, current_user_id=101, channel_id=2, channel_name="bnl-testing", channel_policy="sealed_test")
+        from bnl_conversation_context_v2 import ConversationContextRequest, assemble_conversation_context_v2
+        req = ConversationContextRequest(guild_id=1, current_user_id=101, channel_id=2, channel_name="bnl-testing", channel_policy="sealed_test", route_mode=bnl01_bot.ROUTE_MODE_NORMAL_CHAT, current_texts=("what number did i tell you to remember?",), is_direct_target=True)
+        res = assemble_conversation_context_v2(rows, req)
+        self.assertEqual(res.same_room_paired_turn_count, 1)
+        prompt = "Current channel policy: sealed_test\n" + res.rendered_context + "\nCurrent user request: what number did i tell you to remember?\n"
+        repaired = bnl01_bot._repair_unsupported_authority_with_conversation_context("Records indicate the number was 8.", prompt)
+        self.assertEqual(repaired, "You told me to remember 8.")
+        self.assertNotRegex(repaired.lower(), r"archive|database|dossier|records indicate")
+        conn = sqlite3.connect(bnl01_bot.DB_FILE); cur = conn.cursor()
+        for table in ("memory_tiers", "user_memory_facts", "relationship_state", "relationship_journal"):
+            cur.execute(f"SELECT COUNT(*) FROM {table}")
+            self.assertEqual(cur.fetchone()[0], 0, table)
+        conn.close()
+
+    async def test_sealed_failed_send_leaves_unpaired_user_turn(self):
+        bnl01_bot.save_user_message(101, "Crow", 1, "remember this number: 8", channel_name="bnl-testing", channel_policy="sealed_test", channel_id=2, route_mode=bnl01_bot.ROUTE_MODE_NORMAL_CHAT)
+        msg = self.message(fail_reply=True)
+        with self.assertRaises(RuntimeError):
+            await bnl01_bot.send_reply_then_save_model(
+                msg, "I tucked 8 into the sealed corner.", user_id=101, guild_id=1,
+                channel_name="bnl-testing", channel_policy="sealed_test", channel_id=2,
+            )
+        rows = bnl01_bot.get_conversation_context_v2_rows(1, limit=20, current_user_id=101, channel_id=2, channel_name="bnl-testing", channel_policy="sealed_test")
+        from bnl_conversation_context_v2 import ConversationContextRequest, assemble_conversation_context_v2
+        req = ConversationContextRequest(guild_id=1, current_user_id=101, channel_id=2, channel_name="bnl-testing", channel_policy="sealed_test", route_mode=bnl01_bot.ROUTE_MODE_NORMAL_CHAT, current_texts=("what number did i tell you to remember?",), is_direct_target=True)
+        res = assemble_conversation_context_v2(rows, req)
+        self.assertEqual(res.same_room_paired_turn_count, 0)
+        self.assertEqual(self.model_count(), 0)

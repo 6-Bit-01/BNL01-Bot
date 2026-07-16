@@ -549,3 +549,162 @@ class MediaMemoryRecallLeakTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class ConversationContinuityGroundingTests(unittest.TestCase):
+    def v2_prompt(self):
+        return (
+            "Current channel policy: sealed_test\n"
+            "Conversation continuity (bounded; continuity-only, not canon/current-state evidence):\n"
+            "- Prior BNL replies here are conversational continuity only. They do not prove canon, live show state, queue state, dossiers, payments, Priority, Wheel, or third-party facts.\n"
+            "User/member: remember this number: 8\n"
+            "BNL-01: Locked in, tiny cursed digit and all.\n"
+            "Current user request: what number did i tell you to remember?\n"
+        )
+
+    def test_conversation_continuity_does_not_count_as_source_authority(self):
+        prompt = self.v2_prompt()
+        self.assertTrue(bnl01_bot.prompt_has_conversation_continuity_context(prompt))
+        self.assertTrue(
+            bnl01_bot.should_reject_unsupported_source_authority(
+                "Records indicate the number was 8.", prompt, "get_gemini_response"
+            )
+        )
+
+    def test_grounded_records_claim_repairs_to_direct_contextual_answer(self):
+        prompt = self.v2_prompt()
+        repaired = bnl01_bot._repair_unsupported_authority_with_conversation_context(
+            "Records indicate the number was 8.", prompt, "get_gemini_response"
+        )
+        self.assertEqual(repaired, "You told me to remember 8.")
+        self.assertFalse(bnl01_bot.contains_unsupported_source_authority_claim(repaired))
+
+    def test_unsupported_records_claim_without_context_remains_rejected(self):
+        prompt = "Current channel policy: sealed_test\nCurrent user request: what number?\n"
+        self.assertEqual(
+            bnl01_bot._repair_unsupported_authority_with_conversation_context(
+                "Records indicate the number was 8.", prompt, "get_gemini_response"
+            ),
+            "",
+        )
+        self.assertTrue(
+            bnl01_bot.should_reject_unsupported_source_authority(
+                "Records indicate the number was 8.", prompt, "get_gemini_response"
+            )
+        )
+
+    def test_v2_safe_fallback_extracts_number_without_archive_framing(self):
+        fallback = bnl01_bot._safe_uncertain_response_from_prompt(self.v2_prompt())
+        self.assertIn("8", fallback)
+        self.assertNotRegex(fallback.lower(), r"archive|database|dossier|records indicate")
+
+    def test_legacy_and_broadcast_fallbacks_still_work(self):
+        legacy = bnl01_bot._safe_uncertain_response_from_prompt(
+            "Current channel policy: sealed_test\nRecent room context from this channel:\n- Maze: Crow said hello.\nRoom-first context rules:\n"
+        )
+        self.assertIn("current room context", legacy)
+        broadcast = bnl01_bot._safe_uncertain_response_from_prompt(
+            "Broadcast memory context (cleaned summaries only):\n- Show paused.\nBroadcast-memory usage guidance:\n"
+        )
+        self.assertIn("broadcast-memory context", broadcast)
+
+class ConversationContinuityRepairSafetyTests(unittest.TestCase):
+    def prompt(self, user_line="User/member: remember this number: 8", model_line="BNL-01: Sure, 8 is in the little sealed box."):
+        return (
+            "Current channel policy: sealed_test\n"
+            "Conversation continuity (bounded; continuity-only, not canon/current-state evidence):\n"
+            f"{user_line}\n"
+            f"{model_line}\n"
+            "Current user request: what number did i tell you to remember?\n"
+        )
+
+    def test_unrelated_generic_claim_is_not_stripped_and_returned(self):
+        repaired = bnl01_bot._repair_unsupported_authority_with_conversation_context(
+            "Records indicate Pluto is made of cheese.", self.prompt(), "get_gemini_response"
+        )
+        self.assertEqual(repaired, "")
+
+    def test_absent_person_fact_or_number_cannot_survive_stripping(self):
+        for candidate in (
+            "Records indicate Maze is the mayor of the moon.",
+            "Records indicate the number was 42.",
+            "Records indicate Crow owns a haunted queue slot.",
+        ):
+            with self.subTest(candidate=candidate):
+                self.assertEqual(
+                    bnl01_bot._repair_unsupported_authority_with_conversation_context(candidate, self.prompt(), "get_gemini_response"),
+                    "",
+                )
+
+    def test_different_candidate_number_than_user_continuity_is_rejected(self):
+        self.assertEqual(
+            bnl01_bot._repair_unsupported_authority_with_conversation_context(
+                "Records indicate the number was 9.", self.prompt(), "get_gemini_response"
+            ),
+            "",
+        )
+
+    def test_model_authored_text_alone_cannot_establish_user_fact(self):
+        prompt = self.prompt(user_line="User/member: what was it?", model_line="BNL-01: You told me 8 earlier.")
+        self.assertEqual(
+            bnl01_bot._repair_unsupported_authority_with_conversation_context(
+                "Records indicate the number was 8.", prompt, "get_gemini_response"
+            ),
+            "",
+        )
+
+
+class ConversationContinuityLatestRememberedNumberTests(unittest.TestCase):
+    def prompt(self, lines):
+        return (
+            "Current channel policy: sealed_test\n"
+            "Conversation continuity (bounded; continuity-only, not canon/current-state evidence):\n"
+            + "\n".join(lines)
+            + "\nCurrent user request: what number did i tell you to remember?\n"
+        )
+
+    def test_fallback_uses_latest_user_remembered_number(self):
+        prompt = self.prompt([
+            "User/member: remember this number: 8",
+            "BNL-01: got 8",
+            "User/member: remember this number: 9",
+            "BNL-01: replacing it with 9",
+        ])
+        self.assertEqual(bnl01_bot.resolve_latest_remembered_number_from_conversation_context(prompt), "9")
+        self.assertEqual(bnl01_bot._safe_uncertain_response_from_prompt(prompt), "You told me to remember 9.")
+
+    def test_repair_rejects_stale_candidate_when_later_user_value_exists(self):
+        prompt = self.prompt([
+            "User/member: remember this number: 8",
+            "BNL-01: got 8",
+            "User/member: remember this number: 9",
+        ])
+        self.assertEqual(
+            bnl01_bot._repair_unsupported_authority_with_conversation_context("Records indicate the number was 8.", prompt),
+            "",
+        )
+        self.assertEqual(
+            bnl01_bot._repair_unsupported_authority_with_conversation_context("Records indicate the number was 9.", prompt),
+            "You told me to remember 9.",
+        )
+
+    def test_fallback_single_user_instruction_returns_8(self):
+        prompt = self.prompt(["User/member: Remember this number - 8", "BNL-01: noted"] )
+        self.assertEqual(bnl01_bot._safe_uncertain_response_from_prompt(prompt), "You told me to remember 8.")
+
+    def test_model_only_remembered_number_is_not_used_by_fallback_or_repair(self):
+        prompt = self.prompt(["User/member: what was it?", "BNL-01: You asked me to remember this number: 8"])
+        self.assertEqual(bnl01_bot.resolve_latest_remembered_number_from_conversation_context(prompt), "")
+        fallback = bnl01_bot._safe_uncertain_response_from_prompt(prompt)
+        self.assertNotEqual(fallback, "You told me to remember 8.")
+        self.assertEqual(
+            bnl01_bot._repair_unsupported_authority_with_conversation_context("Records indicate the number was 8.", prompt),
+            "",
+        )
+
+    def test_public_and_sealed_prompt_boundaries_do_not_change_resolution_rules(self):
+        for policy in ("public_home", "sealed_test"):
+            with self.subTest(policy=policy):
+                prompt = self.prompt(["User/member: remember this number: 8"]).replace("Current channel policy: sealed_test", f"Current channel policy: {policy}")
+                self.assertEqual(bnl01_bot._safe_uncertain_response_from_prompt(prompt), "You told me to remember 8.")
+        shadow = self.prompt(["BNL-01: remember this number: 8"]).replace("Current channel policy: sealed_test", "Current channel policy: sealed_shadow")
+        self.assertEqual(bnl01_bot.resolve_latest_remembered_number_from_conversation_context(shadow), "")
