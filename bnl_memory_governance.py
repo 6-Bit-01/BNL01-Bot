@@ -20,6 +20,7 @@ from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 from bnl_dossier_source_packets import subject_key as normalized_subject_key
 from bnl_memory_ledger import ensure_memory_ledger_schema, subject_key_for_user
+from bnl_relationship_engine import complete_delete_relationship_v2, ensure_relationship_v2_schema, propagate_ledger_lifecycle
 
 SHADOW_ENV = "BNL_MEMORY_GOVERNANCE_SHADOW_ENABLED"
 LIVE_ENV = "BNL_MEMORY_GOVERNANCE_LIVE_ENABLED"
@@ -510,7 +511,7 @@ def correct_member_memory(conn: sqlite3.Connection, *, guild_id: int, user_id: i
         entry_id = "mle_" + hashlib.sha256(("correction|%s|%s|%s|%s" % (guild_id, subject, target, _hash(corrected_text))).encode("utf-8")).hexdigest()[:40]
         conn.execute("INSERT OR IGNORE INTO memory_ledger_entries (entry_id,schema_version,guild_id,subject_key,subject_display_name,entry_type,predicate_key,normalized_value,source_class,source_table,source_row_id,source_role,visibility,confidence,public_usable,derived,projection,salience,observed_at,lifecycle_status,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (entry_id, "memory_ledger_v1", guild_id, subject, "", "claim", prior[0], corrected_text[:1000], "owner_correction", "member_memory_control", rid, "member_control", "private", "high", 0, 0, 0, 1.0, now, "active", now, now))
         conn.execute("INSERT OR IGNORE INTO memory_ledger_lineage VALUES (?,?,?,?,?)", (entry_id, guild_id, "correction_of", target, now)); conn.execute("INSERT OR IGNORE INTO memory_ledger_lineage VALUES (?,?,?,?,?)", (entry_id, guild_id, "supersedes", target, now))
-        conn.execute("UPDATE memory_ledger_entries SET lifecycle_status='corrected', updated_at=? WHERE guild_id=? AND entry_id=?", (now, guild_id, target)); _mark_dependents_needs_review(conn, guild_id, target)
+        conn.execute("UPDATE memory_ledger_entries SET lifecycle_status='corrected', updated_at=? WHERE guild_id=? AND entry_id=?", (now, guild_id, target)); propagate_ledger_lifecycle(conn, guild_id=guild_id, ledger_entry_id=target, lifecycle="corrected"); _mark_dependents_needs_review(conn, guild_id, target)
         conn.execute("INSERT INTO memory_governance_receipts VALUES (?,?,?,?,?,?,?)", (rid, guild_id, _subject_hash(user_id), "correct", safe_ref, now, json.dumps({"ledger_entries": 1})))
     return {"ok": True, "receipt": rid, "ref": safe_ref}
 
@@ -531,6 +532,7 @@ def forget_member_memory(conn: sqlite3.Connection, *, guild_id: int, user_id: in
         for eid in chain:
             conn.execute("INSERT OR IGNORE INTO memory_ledger_lineage VALUES (?,?,?,?,?)", (tomb_id, guild_id, "retracts", eid, now))
             conn.execute("UPDATE memory_ledger_entries SET lifecycle_status='forgotten', normalized_value='', updated_at=? WHERE guild_id=? AND entry_id=?", (now, guild_id, eid))
+            propagate_ledger_lifecycle(conn, guild_id=guild_id, ledger_entry_id=eid, lifecycle="forgotten")
             _mark_dependents_needs_review(conn, guild_id, eid)
         for table, row_id in source_rows:
             conn.execute("UPDATE memory_ledger_entries SET lifecycle_status='forgotten', normalized_value='', updated_at=? WHERE guild_id=? AND subject_key=? AND source_table=? AND source_row_id=?", (now, guild_id, subject, table, row_id))
@@ -583,6 +585,8 @@ def complete_delete_member_data(conn: sqlite3.Connection, *, guild_id: int, user
         # Core member-owned tables.
         for table in ("conversations", "user_profiles", "user_memory_facts", "user_habits", "relationship_state", "relationship_journal", "memory_tiers", "response_style_log"):
             counts[table] = _delete_by_user(conn, table, guild_id, user_id)
+        ensure_relationship_v2_schema(conn)
+        counts.update(complete_delete_relationship_v2(conn, guild_id=guild_id, user_id=user_id))
         # Community/member activity schemas use varied identity columns.
         if _table_exists(conn, "community_presence"):
             for col in ("user_id", "member_user_id", "subject_user_id", "discord_user_id"):

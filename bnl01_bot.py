@@ -50,6 +50,17 @@ from bnl_moment_engine import (
     shadow_enabled as moment_engine_shadow_enabled,
     sweep_expired_windows as sweep_expired_moment_windows,
 )
+from bnl_relationship_engine import (
+    ensure_relationship_v2_schema,
+    governed_summary as governed_relationship_v2_summary,
+    live_enabled as relationship_v2_live_enabled,
+    observe_message as observe_relationship_v2_message,
+    plan_engagement as plan_relationship_v2_engagement,
+    refresh_moment_links as refresh_relationship_v2_moment_links,
+    set_member_setting as set_relationship_v2_member_setting,
+    settings_summary as relationship_v2_settings_summary,
+    shadow_enabled as relationship_v2_shadow_enabled,
+)
 from bnl_conversation_context_v2 import (
     CONVERSATION_CONTEXT_VERSION,
     ConversationContextRequest,
@@ -4378,6 +4389,7 @@ def init_db():
     try:
         ensure_entity_evidence_schema(evidence_conn)
         ensure_memory_ledger_schema(evidence_conn)
+        ensure_relationship_v2_schema(evidence_conn)
         evidence_conn.commit()
     finally:
         evidence_conn.close()
@@ -9484,7 +9496,7 @@ def is_active_channel_quiet(guild_id: int, minutes: int = 15) -> bool:
     conn.close()
     return int(row[0] if row else 0) == 0
 
-def save_user_message(user_id: int, user_name: str, guild_id: int, content: str, channel_name: str = "", channel_policy: str = "unknown", channel_id: int = 0, message_id: int | None = None, route_mode: str = ROUTE_MODE_NORMAL_CHAT):
+def save_user_message(user_id: int, user_name: str, guild_id: int, content: str, channel_name: str = "", channel_policy: str = "unknown", channel_id: int = 0, message_id: int | None = None, route_mode: str = ROUTE_MODE_NORMAL_CHAT, directed_to_bnl: bool = False):
     decision = decide_memory_write_policy(route_mode, channel_policy, "user", content, False)
     if not decision.save_conversation:
         logging.info("memory_write_policy_skip_conversation role=user route_mode=%s reason=%s", route_mode, decision.reason)
@@ -9516,6 +9528,23 @@ def save_user_message(user_id: int, user_name: str, guild_id: int, content: str,
         ),
         guild_id=guild_id, source_table="conversations", source_row_id=row_id, source_revision=str(row_id),
     )
+    if relationship_v2_shadow_enabled():
+        try:
+            with sqlite3.connect(DB_FILE) as rel_conn:
+                observe_relationship_v2_message(
+                    rel_conn, guild_id=guild_id, user_id=user_id, role="user", content=content, source_row_id=row_id,
+                    user_name=user_name, channel_policy=(channel_policy or "unknown")[:40], channel_name=(channel_name or "").lower()[:80],
+                    channel_id=int(channel_id or 0), message_id=int(message_id or 0) or None, route_mode=route_mode,
+                    directed=bool(directed_to_bnl), observed_at=observed_at,
+                )
+                refresh_relationship_v2_moment_links(rel_conn, guild_id=guild_id)
+                if directed_to_bnl and (channel_policy or "").strip().lower() in PUBLIC_CHAT_POLICIES:
+                    plan_relationship_v2_engagement(
+                        rel_conn, guild_id=guild_id, user_id=user_id, candidate_type="recognition", route_mode=route_mode,
+                        channel_policy=(channel_policy or "unknown")[:40], current_direct=True, now=observed_at,
+                    )
+        except Exception as exc:
+            logging.debug("relationship_v2_shadow_observe_user_failed error=%s", exc)
     try:
         mark_subject_dirty_for_evidence(
             DB_FILE,
@@ -9584,6 +9613,17 @@ def save_model_message(user_id: int, guild_id: int, content: str, channel_name: 
         ),
         guild_id=guild_id, source_table="conversations", source_row_id=row_id, source_revision=str(row_id),
     )
+    if relationship_v2_shadow_enabled():
+        try:
+            with sqlite3.connect(DB_FILE) as rel_conn:
+                observe_relationship_v2_message(
+                    rel_conn, guild_id=guild_id, user_id=user_id, role="model", content=content, source_row_id=row_id,
+                    channel_policy=(channel_policy or "unknown")[:40], channel_name=(channel_name or "").lower()[:80], channel_id=int(channel_id or 0),
+                    route_mode=route_mode, directed=True, observed_at=observed_at,
+                )
+                refresh_relationship_v2_moment_links(rel_conn, guild_id=guild_id)
+        except Exception as exc:
+            logging.debug("relationship_v2_shadow_observe_model_failed error=%s", exc)
     prune_conversation_history(user_id, guild_id, calculate_adaptive_memory_limits(user_id, guild_id, route_mode=route_mode, channel_policy=channel_policy, user_text=content).get("conversation_rows", MAX_CONVERSATION_ROWS_PER_USER))
     if decision.update_relationship:
         update_relationship_state(user_id, guild_id, content, delta_affinity=0.04)
@@ -12117,7 +12157,7 @@ def _memory_row_public_safe(row) -> bool:
     return _memory_visibility_group(trust, policy) == "public_safe"
 
 
-def build_user_memory_context(user_id: int, guild_id: int, route_mode: str = ROUTE_MODE_NORMAL_CHAT, channel_policy: str = "unknown", user_text: str = "", is_owner_or_mod: bool = False) -> str:
+def build_user_memory_context(user_id: int, guild_id: int, route_mode: str = ROUTE_MODE_NORMAL_CHAT, channel_policy: str = "unknown", user_text: str = "", is_owner_or_mod: bool = False, current_direct: bool = False, governance_allowed: bool = False) -> str:
     if route_mode == ROUTE_MODE_SIMPLE_GREETING:
         LAST_MEMORY_PROMPT_DIAGNOSTICS[(user_id, guild_id)] = {"skipped_reason": "simple_greeting", "included": {"short": 0, "medium": 0, "long": 0}}
         return "Memory intentionally skipped for simple greeting."
@@ -12134,6 +12174,17 @@ def build_user_memory_context(user_id: int, guild_id: int, route_mode: str = ROU
     tier_rows = get_memory_tiers(user_id, guild_id)
 
     sections = []
+    if relationship_v2_live_enabled():
+        try:
+            with sqlite3.connect(DB_FILE) as rel_conn:
+                rel_v2 = governed_relationship_v2_summary(
+                    rel_conn, guild_id=guild_id, user_id=user_id, target_user_id=user_id, route_mode=route_mode, channel_policy=policy,
+                    simple_greeting=bool(route_mode == ROUTE_MODE_SIMPLE_GREETING), direct=bool(current_direct), governance_allowed=bool(governance_allowed),
+                )
+            if rel_v2:
+                sections.append(rel_v2)
+        except Exception as exc:
+            logging.debug("relationship_v2_prompt_summary_failed error=%s", exc)
     if relation:
         interactions, affinity, stage, stance, last_topic, _updated_at = relation
         sections.append(
@@ -13674,7 +13725,6 @@ async def generate_dynamic_ambient(guild_id: int, channel_id: int) -> str:
     temporal = get_temporal_context()
     ambient_mode = _select_ambient_mode(guild_id, temporal["show_phase"])
     ambient_broadcast_context = build_scoped_broadcast_memory_context(guild_id, scope="ambient", public_only=True, limit=3)
-
     mode_guidance = {
         "room_observation": "Anchor in a fresh public-room pattern; stay concrete and understated.",
         "memory_echo": "Let memory tint the line, but keep recent public context as the subject.",
@@ -16146,6 +16196,7 @@ def build_user_aware_prompt(
     website_read_model_context: str = "",
     source_context_block: str = "",
     route_mode: str = ROUTE_MODE_NORMAL_CHAT,
+    is_direct_interaction: bool = False,
 ) -> tuple:
     print("BNL DEBUG: build_user_aware_prompt start")
     display_name, preferred_name = get_user_profile(user_id, guild_id)
@@ -16163,7 +16214,7 @@ def build_user_aware_prompt(
     permission_privileged = bool(privileged)
     prompt_operator_authority = permission_privileged and is_operator_authority_context(channel_policy, channel_name)
     public_identity_context = is_public_prompt_context(channel_policy)
-    memory_context = build_user_memory_context(user_id, guild_id, route_mode=route_mode, channel_policy=channel_policy, user_text=clean_content, is_owner_or_mod=prompt_operator_authority)
+    memory_context = build_user_memory_context(user_id, guild_id, route_mode=route_mode, channel_policy=channel_policy, user_text=clean_content, is_owner_or_mod=prompt_operator_authority, current_direct=bool(is_direct_interaction), governance_allowed=bool(memory_governance_live_enabled()))
     broadcast_context = build_broadcast_memory_context(
         guild_id,
         clean_content,
@@ -17711,7 +17762,7 @@ async def on_message(message: discord.Message):
             active_direct_session=active_same_user_session,
             conversation_surface=conversation_surface,
         )
-        save_decision = save_user_message(message.author.id, message.author.display_name, message.guild.id, conversation_content, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0), message_id=getattr(message, "id", None), route_mode=conversation_plan.route_mode)
+        save_decision = save_user_message(message.author.id, message.author.display_name, message.guild.id, conversation_content, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0), message_id=getattr(message, "id", None), route_mode=conversation_plan.route_mode, directed_to_bnl=bool(conversation_plan.should_reply or real_direct_target or is_reply))
 
         # Direct/direct-like traffic is planned independently from passive batching;
         # non-direct active-channel traffic falls through to the batch planner below.
@@ -17867,6 +17918,7 @@ async def on_message(message: discord.Message):
                 website_read_model_context=website_read_model_context,
                 source_context_block=source_context_block,
                 route_mode=route_mode,
+                is_direct_interaction=bool(real_direct_target or is_reply or conversation_plan.should_reply),
             )
             prompt = _build_direct_payload_prompt(prompt, direct_payload_items, direct_content)
             log_response_style(message.guild.id, message.author.id, style_key)
@@ -18023,7 +18075,7 @@ async def on_message(message: discord.Message):
             await message.reply(restricted_recall_guard)
             return
 
-        save_user_message(message.author.id, message.author.display_name, message.guild.id, direct_content, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0), message_id=getattr(message, "id", None), route_mode=route_mode)
+        save_user_message(message.author.id, message.author.display_name, message.guild.id, direct_content, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0), message_id=getattr(message, "id", None), route_mode=route_mode, directed_to_bnl=True)
 
         repair = try_repair_response(direct_content)
         if repair:
@@ -18102,6 +18154,7 @@ async def on_message(message: discord.Message):
             website_read_model_context=website_read_model_context,
             source_context_block=source_context_block,
             route_mode=route_mode,
+            is_direct_interaction=True,
         )
         prompt = _build_direct_payload_prompt(prompt, direct_payload_items, direct_content)
         log_response_style(message.guild.id, message.author.id, style_key)
@@ -18235,7 +18288,7 @@ async def on_message(message: discord.Message):
             await message.reply(restricted_recall_guard)
             return
 
-        save_user_message(message.author.id, message.author.display_name, message.guild.id, direct_content, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0), message_id=getattr(message, "id", None), route_mode=route_mode)
+        save_user_message(message.author.id, message.author.display_name, message.guild.id, direct_content, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0), message_id=getattr(message, "id", None), route_mode=route_mode, directed_to_bnl=True)
 
         repair = try_repair_response(direct_content)
         if repair:
@@ -18314,6 +18367,7 @@ async def on_message(message: discord.Message):
             website_read_model_context=website_read_model_context,
             source_context_block=source_context_block,
             route_mode=route_mode,
+            is_direct_interaction=True,
         )
         prompt = _build_direct_payload_prompt(prompt, direct_payload_items, direct_content)
         log_response_style(message.guild.id, message.author.id, style_key)
@@ -18592,6 +18646,33 @@ async def memory_complete_delete(interaction: discord.Interaction, confirmation:
         await interaction.response.send_message(f"✅ Complete delete finished for bot-held personal data in this server. Receipt `{result.get('receipt')}`. This does not delete messages stored by Discord itself.", ephemeral=True)
     else:
         await interaction.response.send_message(f"❌ Complete delete not run: {result.get('reason')}. To confirm, type `DELETE MY BNL DATA {interaction.guild.id}`.", ephemeral=True)
+
+
+@tree.command(name="relationship_settings", description="Privately view or change your BNL relationship-v2 settings here.")
+@app_commands.describe(action="view, disable_proactive, enable_proactive, disable_playful_rivalry, enable_playful_rivalry, controls")
+async def relationship_settings(interaction: discord.Interaction, action: str = "view"):
+    if not interaction.guild:
+        await interaction.response.send_message("❌ This command can only be used in a server.", ephemeral=True); return
+    action_norm = (action or "view").strip().lower()
+    with sqlite3.connect(DB_FILE) as conn:
+        if action_norm == "disable_proactive":
+            set_relationship_v2_member_setting(conn, guild_id=interaction.guild.id, user_id=interaction.user.id, proactive_enabled=False)
+            msg = "✅ Proactive recognition and follow-up disabled for you in this server."
+        elif action_norm == "enable_proactive":
+            set_relationship_v2_member_setting(conn, guild_id=interaction.guild.id, user_id=interaction.user.id, proactive_enabled=True)
+            msg = "✅ Proactive recognition and follow-up re-enabled for you in this server."
+        elif action_norm == "disable_playful_rivalry":
+            set_relationship_v2_member_setting(conn, guild_id=interaction.guild.id, user_id=interaction.user.id, playful_rivalry_enabled=False)
+            msg = "✅ Playful/rivalry classification disabled for you in this server."
+        elif action_norm == "enable_playful_rivalry":
+            set_relationship_v2_member_setting(conn, guild_id=interaction.guild.id, user_id=interaction.user.id, playful_rivalry_enabled=True)
+            msg = "✅ Playful/rivalry classification re-enabled for you in this server. Mutual rivalry still requires current explicit opt-in and reciprocal context."
+        elif action_norm == "controls":
+            msg = "For correction or deletion, use `/memory_view`, `/memory_correct`, `/memory_forget`, or `/memory_complete_delete`. Relationship state is self-only and not exposed to other members."
+        else:
+            summary = relationship_v2_settings_summary(conn, guild_id=interaction.guild.id, user_id=interaction.user.id)
+            msg = summary + "\nActions: `disable_proactive`, `enable_proactive`, `disable_playful_rivalry`, `enable_playful_rivalry`, or `controls`."
+    await interaction.response.send_message(msg[:1900], ephemeral=True)
 
 @tree.command(name="usage", description="View BNL-01's daily token usage statistics.")
 @app_commands.checks.has_permissions(administrator=True)
