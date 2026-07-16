@@ -34,6 +34,7 @@ from bnl_memory_ledger import (
     shadow_relationship_journal_row,
     shadow_user_fact_row,
 )
+from bnl_moment_engine import observe_ledger_entry as observe_moment_ledger_entry
 from bnl_conversation_context_v2 import (
     CONVERSATION_CONTEXT_VERSION,
     ConversationContextRequest,
@@ -4386,6 +4387,16 @@ def _shadow_memory_ledger_write(writer_name: str, callback, *, guild_id: int = 0
         except Exception as receipt_exc:
             logging.debug("memory_ledger_shadow_receipt_failed writer=%s error=%s", writer_name, receipt_exc)
         conn.commit()
+        if result and result.entry_id and (result.source_table or source_table) == "conversations":
+            try:
+                moment_conn = sqlite3.connect(DB_FILE)
+                try:
+                    observe_moment_ledger_entry(moment_conn, result.entry_id)
+                    moment_conn.commit()
+                finally:
+                    moment_conn.close()
+            except Exception as moment_exc:
+                logging.debug("moment_engine_shadow_failed writer=%s error_type=%s", writer_name, type(moment_exc).__name__)
         return result
     except Exception as exc:
         logging.debug("memory_ledger_shadow_write_failed writer=%s error_type=%s", writer_name, type(exc).__name__)
