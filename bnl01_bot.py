@@ -11906,15 +11906,37 @@ def extract_user_facts(text: str):
         if subject and raw_value:
             facts.append((f"favorite_{subject[:30]}", raw_value[:120], 0.88))
 
-    remember_note = re.search(
-        r"\bremember (?:that )?([^.!?\n]{3,140})",
-        content,
-        flags=re.IGNORECASE
+    interrogative_remember = (
+        re.search(r"\?\s*$", content)
+        or re.search(r"\b(?:what|do|did|can|why|how|when|where|who)\b[^.!?\n]{0,80}\bremember\b", lower, flags=re.IGNORECASE)
+        or re.search(r"\bremember\b[^.!?\n]{0,80}\?", lower, flags=re.IGNORECASE)
     )
-    if remember_note:
-        note = remember_note.group(1).strip(" .,!?:;")
-        if note:
-            facts.append(("user_note", note[:140], 0.64))
+
+    remembered_number = None
+    directive_note = None
+    directive_patterns = (
+        r"\b(?:please\s+)?remember\s+(?:this\s*:|that\s+)([^.!?\n]{3,140})",
+        r"\b(?:please\s+)?remember\s+((?:my|i\s+prefer|i\s+like|i\s+want|i\s+need|i\s+am|i'm|[0-9])[^.!?\n]{2,140})",
+    )
+    if not interrogative_remember:
+        remembered_number = re.search(
+            r"\b(?:please\s+)?remember\s+(?:(?:that\s+)?(?:(?:this|the)\s+)?number\s*(?::|-|is)?|this\s*:)\s*(\d{1,12})(?!\d)\b",
+            content,
+            flags=re.IGNORECASE,
+        )
+        if remembered_number:
+            facts.append(("remembered_number", remembered_number.group(1), 0.9))
+        for pattern in directive_patterns:
+            m = re.search(pattern, content, flags=re.IGNORECASE)
+            if m:
+                directive_note = m.group(1).strip(" .,!?;:")
+                break
+    if directive_note and not remembered_number:
+        note_lower = directive_note.strip().lower()
+        structured_values = {str(value).strip().lower() for (_key, value, _confidence) in facts}
+        structured_duplicate = note_lower in structured_values or any(value and value in note_lower for value in structured_values)
+        if not structured_duplicate:
+            facts.append(("user_note", directive_note[:140], 0.64))
 
     return facts
 
@@ -12006,6 +12028,75 @@ def try_memory_recall_response(user_id: int, guild_id: int, user_text: str) -> s
         return f"I do not have your favorite {dynamic_favorite_ask.group(1).strip()} recorded yet."
 
     return ""
+
+def _format_explicit_recall_governed_response(gov_result) -> str:
+    if not gov_result.selected:
+        return "I do not have eligible durable memories available for this recall."
+    lines = []
+    for candidate in gov_result.selected[:5]:
+        text = re.sub(r"\s+", " ", str(candidate.text or "")).strip()
+        if text:
+            lines.append(f"- {text[:240]}")
+    if not lines:
+        return "I do not have eligible durable memories available for this recall."
+    return "Here is what I can safely recall:\n" + "\n".join(lines)
+
+def apply_explicit_recall_governance(
+    user_id: int,
+    guild_id: int,
+    user_text: str,
+    legacy_recall_response: str,
+    route_mode: str,
+    channel_policy: str,
+    channel_id: int = 0,
+    channel_name: str = "",
+    is_owner_or_mod: bool = False,
+) -> str:
+    """Shadow/live governance wrapper for legacy explicit durable-memory recall.
+
+    The caller must invoke this only after try_memory_recall_response() returns a
+    non-empty legacy response, and only for that immediate explicit-recall path.
+    """
+    if not legacy_recall_response:
+        return legacy_recall_response
+    policy = (channel_policy or "unknown").strip().lower() or "unknown"
+    if route_mode in SOURCE_INTERNAL_MODES or policy not in PUBLIC_CHAT_POLICIES:
+        return legacy_recall_response
+    if not memory_governance_shadow_enabled():
+        return legacy_recall_response
+    try:
+        limits = calculate_adaptive_memory_limits(user_id, guild_id, route_mode=route_mode, channel_policy=policy, user_text=user_text, is_owner_or_mod=is_owner_or_mod)
+        visibility = "public_safe"
+        gov_req = GovernanceRequest(
+            guild_id=guild_id,
+            subject_user_id=user_id,
+            route_mode=route_mode,
+            conversation_surface="discord_explicit_recall",
+            channel_id=int(channel_id or 0),
+            channel_name=str(channel_name or "")[:120],
+            channel_policy=policy,
+            visibility_allowance=visibility,
+            user_text=user_text or "",
+            budget_chars=int(limits.get("prompt_budget") or 1200),
+            allowed_source_classes=("owner_correction", "approved_canon", "first_party_record", "runtime_observation", "public_observation", "evidence_projection", "derived_summary"),
+            now=datetime.now(PACIFIC_TZ).isoformat(),
+        )
+        with sqlite3.connect(DB_FILE) as gov_conn:
+            gov_result = build_governed_context(gov_conn, gov_req, legacy_context=legacy_recall_response, include_review_moments=True)
+            persist_shadow_diagnostics(gov_conn, gov_req, gov_result, legacy_recall_response)
+        unsafe_governed = bool(gov_result.diagnostics.processing_errors or gov_result.diagnostics.invalid_invariants)
+        if memory_governance_live_enabled() and not unsafe_governed:
+            return _format_explicit_recall_governed_response(gov_result)
+    except Exception as exc:
+        logging.warning(
+            "memory_governance_explicit_recall_exception event=%s route_mode=%s channel_policy=%s exception_type=%s",
+            "explicit_recall_governance_exception",
+            str(route_mode or "unknown")[:80],
+            policy[:80],
+            type(exc).__name__[:80],
+        )
+        return legacy_recall_response
+    return legacy_recall_response
 
 def _memory_row_relevance(row, topic_key: str, user_text: str) -> float:
     summary = (row[1] or "") if len(row) > 1 else ""
@@ -15215,6 +15306,8 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
             memory_recall = resolve_recent_media_followup(unique_user_ids[0], channel.guild.id, channel_id, channel_policy, combined_text)
             if not memory_recall:
                 memory_recall = try_memory_recall_response(unique_user_ids[0], channel.guild.id, combined_text)
+                if memory_recall:
+                    memory_recall = apply_explicit_recall_governance(unique_user_ids[0], channel.guild.id, combined_text, memory_recall, ROUTE_MODE_NORMAL_CHAT, channel_policy, channel_id=channel_id, channel_name=getattr(channel, "name", ""), is_owner_or_mod=is_privileged_member(member, channel.guild))
             if memory_recall:
                 await send_channel_then_save_model(channel, memory_recall, user_id=unique_user_ids[0], guild_id=channel.guild.id, channel_name=getattr(channel, "name", ""), channel_policy=channel_policy, channel_id=channel_id, route_mode=ROUTE_MODE_NORMAL_CHAT, allowed_mentions=safe_mentions)
                 _channel_last_reply_at[channel_id] = datetime.now(PACIFIC_TZ)
@@ -17681,6 +17774,8 @@ async def on_message(message: discord.Message):
             memory_recall = resolve_recent_media_followup(message.author.id, message.guild.id, message.channel.id, channel_policy, direct_content)
             if not memory_recall:
                 memory_recall = try_memory_recall_response(message.author.id, message.guild.id, direct_content)
+                if memory_recall:
+                    memory_recall = apply_explicit_recall_governance(message.author.id, message.guild.id, direct_content, memory_recall, route_mode, channel_policy, channel_id=getattr(message.channel, "id", 0), channel_name=getattr(message.channel, "name", ""), is_owner_or_mod=is_privileged_member(message.author, message.guild))
             if memory_recall:
                 await send_reply_then_save_model(message, memory_recall, user_id=message.author.id, guild_id=message.guild.id, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0), route_mode=route_mode)
                 return
@@ -17945,6 +18040,8 @@ async def on_message(message: discord.Message):
         memory_recall = resolve_recent_media_followup(message.author.id, message.guild.id, message.channel.id, channel_policy, direct_content)
         if not memory_recall:
             memory_recall = try_memory_recall_response(message.author.id, message.guild.id, direct_content)
+            if memory_recall:
+                memory_recall = apply_explicit_recall_governance(message.author.id, message.guild.id, direct_content, memory_recall, route_mode, channel_policy, channel_id=getattr(message.channel, "id", 0), channel_name=getattr(message.channel, "name", ""), is_owner_or_mod=is_privileged_member(message.author, message.guild))
         if memory_recall:
             await send_reply_then_save_model(message, memory_recall, user_id=message.author.id, guild_id=message.guild.id, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0), route_mode=route_mode)
             return
@@ -18155,6 +18252,8 @@ async def on_message(message: discord.Message):
         memory_recall = resolve_recent_media_followup(message.author.id, message.guild.id, message.channel.id, channel_policy, direct_content)
         if not memory_recall:
             memory_recall = try_memory_recall_response(message.author.id, message.guild.id, direct_content)
+            if memory_recall:
+                memory_recall = apply_explicit_recall_governance(message.author.id, message.guild.id, direct_content, memory_recall, route_mode, channel_policy, channel_id=getattr(message.channel, "id", 0), channel_name=getattr(message.channel, "name", ""), is_owner_or_mod=is_privileged_member(message.author, message.guild))
         if memory_recall:
             await send_reply_then_save_model(message, memory_recall, user_id=message.author.id, guild_id=message.guild.id, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0), route_mode=route_mode, reply_text=memory_recall if len(memory_recall) <= 2000 else memory_recall[:1900] + "...")
             return
