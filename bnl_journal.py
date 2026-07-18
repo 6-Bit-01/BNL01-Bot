@@ -1,14 +1,20 @@
 from __future__ import annotations
 
-import hashlib, json, re, sqlite3, urllib.error, urllib.request
+import hashlib
+import json
+import re
+import sqlite3
+import urllib.error
+import urllib.request
 from dataclasses import dataclass
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Optional
 
 PUBLIC_POLICIES = {"public_home", "public_context", "public_selective"}
-FORBIDDEN_SOURCE_TABLES = {"relationship_journal", "relationship_state", "user_profiles", "user_memory_facts", "user_habits", "memory_tiers", "queue", "payments", "customer_queue"}
 STATES = {"draft", "rejected", "approved_pending_delivery", "published", "delivery_failed"}
 WORD_MIN, WORD_MAX = 250, 500
+JOURNAL_ROUTE = "bnl_journal_generation"
+
 
 @dataclass
 class JournalResult:
@@ -25,15 +31,22 @@ class JournalResult:
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
+
 def _hash(*parts: Any) -> str:
-    return hashlib.sha256("|".join(str(p) for p in parts).encode()).hexdigest()
+    return hashlib.sha256("|".join(str(p) for p in parts).encode("utf-8")).hexdigest()
+
 
 def _json(obj: Any) -> str:
-    return json.dumps(obj, sort_keys=True, separators=(",", ":"))
+    return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+def _norm(text: str) -> str:
+    return re.sub(r"\s+", " ", re.sub(r"[^a-z0-9]+", " ", (text or "").lower())).strip()
+
 
 def ensure_schema(db_path: str) -> None:
-    with sqlite3.connect(db_path) as c:
-        c.execute("""CREATE TABLE IF NOT EXISTS bnl_journal_entries (
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("""CREATE TABLE IF NOT EXISTS bnl_journal_entries (
             entry_id TEXT NOT NULL, revision INTEGER NOT NULL DEFAULT 1, guild_id INTEGER NOT NULL,
             lifecycle_state TEXT NOT NULL, title TEXT NOT NULL, excerpt TEXT NOT NULL,
             sections_json TEXT NOT NULL, public_payload_json TEXT, canonical_payload_bytes BLOB,
@@ -41,192 +54,461 @@ def ensure_schema(db_path: str) -> None:
             authored_at TEXT NOT NULL, approved_at TEXT, published_at TEXT, review_reason TEXT,
             delivery_status TEXT, delivery_http_status INTEGER DEFAULT 0, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
             PRIMARY KEY(entry_id, revision))""")
-        c.execute("CREATE INDEX IF NOT EXISTS idx_bnl_journal_state ON bnl_journal_entries(guild_id,lifecycle_state,created_at DESC)")
-        c.execute("""CREATE TABLE IF NOT EXISTS bnl_journal_private_metadata (
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_bnl_journal_state ON bnl_journal_entries(guild_id,lifecycle_state,created_at DESC)")
+        conn.execute("""CREATE TABLE IF NOT EXISTS bnl_journal_private_metadata (
             entry_id TEXT NOT NULL, revision INTEGER NOT NULL DEFAULT 1, guild_id INTEGER NOT NULL,
             metadata_json TEXT NOT NULL, content_hash TEXT NOT NULL, lifecycle_state TEXT NOT NULL,
             created_at TEXT NOT NULL, updated_at TEXT NOT NULL, PRIMARY KEY(entry_id, revision))""")
-        c.execute("CREATE INDEX IF NOT EXISTS idx_bnl_journal_meta_state ON bnl_journal_private_metadata(guild_id,lifecycle_state,updated_at DESC)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_bnl_journal_meta_state ON bnl_journal_private_metadata(guild_id,lifecycle_state,updated_at DESC)")
+
 
 def table_exists(conn: sqlite3.Connection, name: str) -> bool:
     return bool(conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (name,)).fetchone())
 
-def _cols(conn, table):
+
+def _cols(conn: sqlite3.Connection, table: str) -> set[str]:
     return {r[1] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()}
 
-def accepted_relays(conn, guild_id: int, start: str, end: str, limit: int = 20) -> list[dict[str, Any]]:
-    if not table_exists(conn, "website_relay_history"): return []
+
+def sanitize_source_summary(text: str, names: Optional[list[str]] = None) -> str:
+    clean = re.sub(r"https?://\S+", "", text or "")
+    clean = re.sub(r"<@!?\d+>|@\w+", "someone", clean)
+    clean = re.sub(r"\b\d{12,}\b", "", clean)
+    for name in sorted(set(names or []), key=len, reverse=True):
+        if name.strip():
+            clean = re.sub(r"\b" + re.escape(name.strip()) + r"\b", "someone", clean, flags=re.I)
+    clean = re.sub(r"[\"“”‘’]", "", clean)
+    return re.sub(r"\s+", " ", clean).strip()[:240]
+
+
+def _anon_ref(prefix: str, idx: int) -> str:
+    return f"{prefix}:{idx}"
+
+
+def accepted_relays(conn: sqlite3.Connection, guild_id: int, start: str, end: str, limit: int = 20) -> list[dict[str, Any]]:
+    if not table_exists(conn, "website_relay_history"):
+        return []
     rows = conn.execute("""SELECT relay_id, public_message, public_directive, event_type, published_timestamp
         FROM website_relay_history WHERE guild_id=? AND published_timestamp>=? AND published_timestamp<=?
         ORDER BY published_timestamp DESC LIMIT ?""", (guild_id, start, end, limit)).fetchall()
-    return [{"refId": f"relay:{r[0]}", "relayId": r[0], "summary": f"{r[1]} {r[2]}", "observedAt": r[4], "sourceType": "accepted_website_relay"} for r in rows]
+    out = []
+    for idx, row in enumerate(rows, 1):
+        summary = sanitize_source_summary(f"{row[1]} {row[2]}")
+        if summary:
+            out.append({"refId": _anon_ref("fresh", idx), "sourceKind": "relay", "relayId": row[0], "summary": summary, "observedAt": row[4], "eventType": row[3]})
+    return out
 
-def public_conversations(conn, guild_id: int, start: str, end: str, limit: int = 40) -> list[dict[str, Any]]:
-    if not table_exists(conn, "conversations"): return []
+
+def public_conversations(conn: sqlite3.Connection, guild_id: int, start: str, end: str, limit: int = 40) -> list[dict[str, Any]]:
+    if not table_exists(conn, "conversations"):
+        return []
     cols = _cols(conn, "conversations")
     public_usable_clause = " AND public_usable=1" if "public_usable" in cols else ""
     visibility_clause = " AND visibility IN ('public','public_safe')" if "visibility" in cols else ""
+    role_clause = " AND role='user'" if "role" in cols else ""
     rows = conn.execute(f"""SELECT id, user_id, user_name, channel_policy, channel_name, content, timestamp
-        FROM conversations WHERE guild_id=? AND channel_policy IN ({','.join('?' for _ in PUBLIC_POLICIES)})
-        AND timestamp>=? AND timestamp<=? {public_usable_clause} {visibility_clause}
+        FROM conversations WHERE guild_id=? AND channel_policy IN ({','.join('?' for _ in sorted(PUBLIC_POLICIES))})
+        AND timestamp>=? AND timestamp<=? {public_usable_clause} {visibility_clause} {role_clause}
         ORDER BY timestamp DESC LIMIT ?""", (guild_id, *sorted(PUBLIC_POLICIES), start, end, limit)).fetchall()
-    out=[]
-    for r in rows:
-        text = sanitize_source_summary(r[5])
-        if text:
-            out.append({"refId": f"conversation:{r[0]}", "messageId": int(r[0]), "subjectRef": f"discord_user:{r[1]}", "channelPolicy": r[3], "channelName": r[4], "summary": text, "observedAt": r[6], "sourceType": "public_conversation"})
+    raw_names = [str(r[2] or "").strip() for r in rows if str(r[2] or "").strip()]
+    out = []
+    for idx, row in enumerate(rows, 1):
+        summary = sanitize_source_summary(row[5], raw_names)
+        if summary:
+            out.append({
+                "refId": _anon_ref("fresh", idx + 100),
+                "sourceKind": "conversation",
+                "messageId": int(row[0]),
+                "subjectRef": f"discord_user:{row[1]}",
+                "displayName": str(row[2] or "").strip(),
+                "channelPolicy": row[3],
+                "summary": summary,
+                "observedAt": row[6],
+            })
     return out
 
-def sanitize_source_summary(text: str) -> str:
-    text = re.sub(r"https?://\S+", "", text or "")
-    text = re.sub(r"<@!?\d+>|@\w+", "someone", text)
-    text = re.sub(r"\b\d{12,}\b", "", text)
-    text = re.sub(r"\s+", " ", text).strip()
-    return text[:240]
 
-def tokenize(text: str) -> set[str]:
-    return {w for w in re.findall(r"[a-z0-9]{4,}", (text or "").lower()) if w not in {"this","that","with","from","they","have","about","public"}}
+def _source_for_prompt(source: dict[str, Any]) -> dict[str, Any]:
+    allowed = {"refId", "sourceKind", "summary", "observedAt", "eventType", "channelPolicy"}
+    return {k: v for k, v in source.items() if k in allowed and v not in (None, "")}
+
+
+def _subject_refs(packet: dict[str, Any]) -> set[str]:
+    return {str(s.get("subjectRef")) for s in packet.get("privateSources", []) if s.get("subjectRef")}
+
 
 def retrieve_history(db_path: str, guild_id: int, current_packet: dict[str, Any], limit: int = 6) -> dict[str, Any]:
     ensure_schema(db_path)
-    terms = tokenize(_json(current_packet))
-    with sqlite3.connect(db_path) as c:
-        c.row_factory=sqlite3.Row
-        prev = c.execute("SELECT entry_id,revision,title,excerpt,sections_json,created_at FROM bnl_journal_entries WHERE guild_id=? AND lifecycle_state='published' ORDER BY published_at DESC, created_at DESC LIMIT 1", (guild_id,)).fetchone()
-        rows = c.execute("SELECT e.entry_id,e.revision,e.title,e.excerpt,e.sections_json,m.metadata_json,e.created_at FROM bnl_journal_entries e JOIN bnl_journal_private_metadata m ON m.entry_id=e.entry_id AND m.revision=e.revision WHERE e.guild_id=? AND e.lifecycle_state='published' AND m.lifecycle_state='published'", (guild_id,)).fetchall()
-    scored=[]; counts={}; notes=[]
-    for r in rows:
-        meta=json.loads(r[5] or "{}")
-        for t in meta.get("topicTags",[]): counts[t]=counts.get(t,0)+1
-        hay=" ".join([r[2] or "", r[3] or "", r[4] or "", r[5] or ""])
-        score=len(terms & tokenize(hay))
-        if score: scored.append((score, dict(r)))
-        if terms & set(meta.get("topicTags",[]) + meta.get("subjectRefs",[])):
-            notes.extend(meta.get("continuityNotes",[])[:3])
-    scored.sort(key=lambda x:(-x[0], x[1].get("created_at") or ""))
-    return {"previousEntry": dict(prev) if prev else None, "relevantOlderEntries": [r for _,r in scored[:limit]], "recurringTopicCounts": counts, "matchingContinuityNotes": notes[:10]}
+    current_subjects = _subject_refs(current_packet)
+    current_topics = set(current_packet.get("candidateTopicTags", []))
+    terms = set(_norm(_json(current_packet.get("safeSources", []))).split())
+    with sqlite3.connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        prev = conn.execute("""SELECT entry_id,revision,title,excerpt,sections_json,published_at,created_at
+            FROM bnl_journal_entries WHERE guild_id=? AND lifecycle_state='published'
+            ORDER BY published_at DESC, created_at DESC LIMIT 1""", (guild_id,)).fetchone()
+        rows = conn.execute("""SELECT e.entry_id,e.revision,e.title,e.excerpt,e.sections_json,e.published_at,e.created_at,m.metadata_json
+            FROM bnl_journal_entries e JOIN bnl_journal_private_metadata m
+              ON m.entry_id=e.entry_id AND m.revision=e.revision
+            WHERE e.guild_id=? AND e.lifecycle_state='published' AND m.lifecycle_state='published'""", (guild_id,)).fetchall()
+    recurring: dict[str, int] = {}
+    scored = []
+    notes = []
+    prev_key = (prev["entry_id"], int(prev["revision"])) if prev else None
+    for row in rows:
+        meta = json.loads(row["metadata_json"] or "{}")
+        tags = {str(t) for t in meta.get("topicTags", [])}
+        subjects = {str(s) for s in meta.get("subjectRefs", [])}
+        for tag in tags:
+            recurring[tag] = recurring.get(tag, 0) + 1
+        subject_score = 10 * len(current_subjects & subjects)
+        topic_score = 3 * len(current_topics & tags)
+        text_score = len(terms & set(_norm(" ".join([row["title"] or "", row["excerpt"] or "", row["sections_json"] or "", row["metadata_json"] or ""])).split()))
+        score = subject_score + topic_score + text_score
+        key = (row["entry_id"], int(row["revision"]))
+        if score and key != prev_key:
+            item = dict(row)
+            item.pop("metadata_json", None)
+            scored.append((score, row["published_at"] or row["created_at"] or "", item))
+        if current_subjects & subjects or current_topics & tags:
+            notes.extend(str(n)[:240] for n in meta.get("continuityNotes", [])[:3])
+    scored.sort(key=lambda x: (x[0], x[1]), reverse=True)
+    return {
+        "previousEntry": dict(prev) if prev else None,
+        "relevantOlderEntries": [item for _, _, item in scored[:limit]],
+        "recurringTopicCounts": recurring,
+        "matchingContinuityNotes": notes[:10],
+    }
+
 
 def build_source_packet(db_path: str, guild_id: int, hours: int = 72, now: Optional[str] = None) -> dict[str, Any]:
-    end = now or utc_now_iso(); start = (datetime.fromisoformat(end.replace('Z','+00:00'))-timedelta(hours=max(1,min(int(hours),168)))).isoformat().replace('+00:00','Z')
-    with sqlite3.connect(db_path) as c:
-        relays=accepted_relays(c,guild_id,start,end); convos=public_conversations(c,guild_id,start,end)
-    packet={"sourceWindowStart":start,"sourceWindowEnd":end,"relays":relays,"conversations":convos}
-    packet["history"]=retrieve_history(db_path,guild_id,packet)
-    packet["aggregateCounts"]={"eligibleRelays":len(relays),"eligibleConversations":len(convos),"participants":len({x.get('subjectRef') for x in convos}),"channels":len({x.get('channelName') for x in convos})}
+    bounded_hours = max(1, min(int(hours or 72), 168))
+    end = now or utc_now_iso()
+    start = (datetime.fromisoformat(end.replace("Z", "+00:00")) - timedelta(hours=bounded_hours)).isoformat().replace("+00:00", "Z")
+    with sqlite3.connect(db_path) as conn:
+        relays = accepted_relays(conn, guild_id, start, end)
+        conversations = public_conversations(conn, guild_id, start, end)
+    private_sources = relays + conversations
+    safe_sources = [_source_for_prompt(src) for src in private_sources]
+    packet = {
+        "sourceWindowStart": start,
+        "sourceWindowEnd": end,
+        "safeSources": safe_sources,
+        "privateSources": private_sources,
+        "candidateTopicTags": sorted({w for src in safe_sources for w in _norm(src.get("summary", "")).split() if len(w) > 4})[:20],
+    }
+    packet["history"] = retrieve_history(db_path, guild_id, packet)
+    packet["aggregateCounts"] = {
+        "eligibleRelays": len(relays),
+        "eligibleConversations": len(conversations),
+        "participants": len({x.get("subjectRef") for x in conversations}),
+        "channels": len({x.get("channelPolicy") for x in conversations}),
+    }
     return packet
 
-def generated_fallback(packet: dict[str,Any]) -> Optional[dict[str,Any]]:
-    sources=packet.get('relays',[]) + packet.get('conversations',[])
-    if not sources: return None
-    refs=[s['refId'] for s in sources[:3]]
-    body=("BARCODE's public rooms supplied BNL with a usable little knot of activity: accepted website relays on one side, "
-          "and public conversation fragments on the other. The shape is not scandal. It is texture: people circling songs, "
-          "bits, timing, and the small ritual weather that forms around a music community when everyone keeps adding one more strange brick. "
-          "The prior Journal archive is treated as memory of earlier observations, not proof of today; it merely points to older echoes worth comparing. "
-          "For this entry, the fresh public-safe sources carry the weight, and the older notes stay in the rafters like labeled wires.")
-    return {"title":"A Small Machine Heard Through the Wall","excerpt":"BNL links recent public relay texture with the older Journal archive without exposing the wires.","sections":[{"heading":"Fresh Wires, Old Echoes","body":body}],"sourceRefIds":{"Fresh Wires, Old Echoes":refs},"metadata":{"topicTags":["music","community-patterns"],"continuityNotes":["Watch for recurring music-discussion callbacks in future public-safe windows."],"unresolvedQuestions":["Which public themes repeat after the website endpoint exists?"],"confidenceFlags":["grounded"],"safetyFlags":["public_copy_anonymous"]}}
 
-def public_word_count(article):
-    text=' '.join([article.get('title',''),article.get('excerpt','')] + [s.get('heading','')+' '+s.get('body','') for s in article.get('sections',[])])
+def _bounded_history_for_prompt(history: dict[str, Any]) -> dict[str, Any]:
+    def compact(entry: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:
+        if not entry:
+            return None
+        sections = json.loads(entry.get("sections_json") or "[]") if isinstance(entry.get("sections_json"), str) else []
+        return {"entryId": entry.get("entry_id"), "revision": entry.get("revision"), "title": entry.get("title"), "excerpt": entry.get("excerpt"), "sectionHeadings": [str(s.get("heading", ""))[:80] for s in sections[:3]]}
+    return {
+        "previousEntry": compact(history.get("previousEntry")),
+        "relevantOlderEntries": [compact(e) for e in history.get("relevantOlderEntries", [])[:6]],
+        "recurringTopicCounts": dict(sorted((history.get("recurringTopicCounts") or {}).items(), key=lambda kv: (-kv[1], kv[0]))[:12]),
+        "matchingContinuityNotes": [str(n)[:240] for n in history.get("matchingContinuityNotes", [])[:8]],
+    }
+
+
+def build_generation_prompt(packet: dict[str, Any], *, repair_reason: str = "", previous_output: str = "") -> str:
+    safe_packet = {
+        "sourceWindowStart": packet.get("sourceWindowStart"),
+        "sourceWindowEnd": packet.get("sourceWindowEnd"),
+        "freshSources": packet.get("safeSources", [])[:60],
+        "history": _bounded_history_for_prompt(packet.get("history", {})),
+        "aggregateCounts": packet.get("aggregateCounts", {}),
+    }
+    repair = ""
+    if repair_reason:
+        repair = f"\nRepair required because: {repair_reason}. Previous invalid output is not evidence and must not be copied."
+    return (
+        "You are BNL-01 writing a BARCODE Network Journal entry. Return strict JSON only; no markdown fences."
+        "\nSchema: {\"title\":str,\"excerpt\":str,\"sections\":[{\"heading\":str,\"body\":str,\"sourceRefIds\":[str]}],\"metadata\":{\"topicTags\":[],\"subjectRefs\":[],\"continuityNotes\":[],\"unresolvedQuestions\":[],\"confidenceFlags\":[],\"safetyFlags\":[]}}."
+        "\nWrite 1-3 sections and 250-500 total words. Use BNL's formal, observant, lightly uncanny voice. Make it entertaining and grounded in BARCODE music/community texture."
+        "\nEvery section must cite at least one fresh sourceRefId from the current window. Older Journal material is continuity only, never proof of current activity."
+        "\nKeep community members anonymous. Do not include direct quotes, URLs, mentions, IDs, sourceRef tokens in public prose, private intent, relationships, harassment, or internal schema/storage terms."
+        f"{repair}\nGeneration-safe packet:\n{json.dumps(safe_packet, ensure_ascii=False, sort_keys=True)}"
+    )
+
+
+def parse_generated_json(text: str) -> dict[str, Any]:
+    raw = (text or "").strip()
+    if raw.startswith("```"):
+        raise ValueError("markdown_fence")
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError("malformed_json") from exc
+    if not isinstance(data, dict):
+        raise ValueError("json_not_object")
+    sections = data.get("sections")
+    if not isinstance(data.get("title"), str) or not isinstance(data.get("excerpt"), str) or not isinstance(sections, list):
+        raise ValueError("invalid_json_shape")
+    normalized_sections = []
+    source_ref_map = {}
+    for section in sections:
+        if not isinstance(section, dict) or not isinstance(section.get("heading"), str) or not isinstance(section.get("body"), str) or not isinstance(section.get("sourceRefIds"), list):
+            raise ValueError("invalid_section_shape")
+        refs = [str(r) for r in section.get("sourceRefIds", [])]
+        heading = section["heading"].strip()
+        normalized_sections.append({"heading": heading, "body": section["body"].strip()})
+        source_ref_map[heading] = refs
+    meta = data.get("metadata") if isinstance(data.get("metadata"), dict) else {}
+    article = {"title": data["title"].strip(), "excerpt": data["excerpt"].strip(), "sections": normalized_sections, "sourceRefIds": source_ref_map, "metadata": {}}
+    for key in ("topicTags", "subjectRefs", "continuityNotes", "unresolvedQuestions", "confidenceFlags", "safetyFlags"):
+        article["metadata"][key] = [str(x)[:240] for x in meta.get(key, [])] if isinstance(meta.get(key, []), list) else []
+    return article
+
+
+def public_word_count(article: dict[str, Any]) -> int:
+    text = " ".join([article.get("title", ""), article.get("excerpt", "")] + [s.get("heading", "") + " " + s.get("body", "") for s in article.get("sections", [])])
     return len(re.findall(r"\b\w+\b", text))
 
-def validate_article(article: dict[str,Any], packet: dict[str,Any], prior_titles: Optional[list[str]]=None, approved_names: Optional[set[str]]=None) -> str:
-    sections=article.get('sections')
-    if not isinstance(sections,list) or not (1<=len(sections)<=3): return 'invalid_section_count'
-    wc=public_word_count(article)
-    if wc<WORD_MIN or wc>WORD_MAX: return 'invalid_word_count'
-    valid={s['refId'] for s in packet.get('relays',[])+packet.get('conversations',[])}
-    if not valid: return 'no_new_source'
-    refmap=article.get('sourceRefIds') or {}
-    for sec in sections:
-        refs=refmap.get(sec.get('heading')) or sec.get('sourceRefIds')
-        if not refs or any(r not in valid for r in refs): return 'invalid_section_source_refs'
-    public_text='\n'.join([article.get('title',''),article.get('excerpt','')] + [s.get('heading','')+'\n'+s.get('body','') for s in sections])
-    if re.search(r"<@!?\d+>|@\w+|https?://|\b\d{12,}\b|relationship_journal|memory_tiers|source-file|dossier", public_text, re.I): return 'public_leak_pattern'
-    for c in packet.get('conversations',[]):
-        raw = c.get('summary','')
-        if raw and len(raw.split()) >= 5 and raw.lower() in public_text.lower(): return 'discord_phrase_copy'
-    names=set(approved_names or [])
-    for c in packet.get('conversations',[]):
-        nm=str(c.get('userName') or '').strip()
-        if nm and nm not in names and re.search(r"\b"+re.escape(nm)+r"\b", public_text): return 'community_name_leak'
-    norm= re.sub(r"\W+"," ", article.get('title','').lower()).strip()
-    for t in prior_titles or []:
-        if norm and norm == re.sub(r"\W+"," ", t.lower()).strip(): return 'duplicate_title'
-    return ''
 
-def build_public_payload(entry_id, revision, article, packet, content_hash, authored_at):
-    return {"contractVersion":1,"kind":"journal_entry","entry":{"entryId":entry_id,"revision":revision,"title":article['title'].strip(),"excerpt":article['excerpt'].strip(),"sections":[{"heading":s['heading'].strip(),"body":s['body'].strip()} for s in article['sections']],"authoredAt":authored_at,"sourceWindowStart":packet['sourceWindowStart'],"sourceWindowEnd":packet['sourceWindowEnd'],"contentHash":content_hash}}
+def _public_text(article: dict[str, Any]) -> str:
+    return "\n".join([article.get("title", ""), article.get("excerpt", "")] + [s.get("heading", "") + "\n" + s.get("body", "") for s in article.get("sections", [])])
 
-def create_draft(db_path: str, guild_id: int, hours: int = 72, generator: Callable[[dict[str,Any]], Optional[dict[str,Any]]]=generated_fallback) -> JournalResult:
-    ensure_schema(db_path); packet=build_source_packet(db_path,guild_id,hours); article=generator(packet)
-    if not article: return JournalResult(False,'no_draft','insufficient_grounded_material')
-    with sqlite3.connect(db_path) as c:
-        prior=[r[0] for r in c.execute("SELECT title FROM bnl_journal_entries WHERE guild_id=? AND lifecycle_state='published'",(guild_id,)).fetchall()]
-    reason=validate_article(article,packet,prior)
-    if reason: return JournalResult(False,'no_draft',reason)
-    authored=utc_now_iso(); entry_id='journal_'+_hash(guild_id,authored,article['title'])[:16]; revision=1
-    content_hash=_hash(article['title'],article['excerpt'],_json(article['sections']))
-    payload=build_public_payload(entry_id,revision,article,packet,content_hash,authored); canonical=_json(payload).encode()
-    meta=article.get('metadata',{}).copy(); meta.update({"sourceWindowStart":packet['sourceWindowStart'],"sourceWindowEnd":packet['sourceWindowEnd'],"supportingRelayIds":[r.get('relayId') for r in packet.get('relays',[])],"supportingConversationRefs":[{k:v for k,v in c.items() if k in {'refId','messageId','subjectRef','channelPolicy','observedAt'}} for c in packet.get('conversations',[])],"relatedPriorJournalEntryIds":[e.get('entry_id') for e in packet.get('history',{}).get('relevantOlderEntries',[])],"recurringTopicCounts":packet.get('history',{}).get('recurringTopicCounts',{}),"aggregateCounts":packet.get('aggregateCounts',{}),"sourceSummaries":[{"refId":s['refId'],"hash":_hash(s.get('summary','')),"summary":s.get('summary','')[:160]} for s in packet.get('relays',[])+packet.get('conversations',[])],"sourceRefIds":article.get('sourceRefIds',{})})
-    now=utc_now_iso()
-    with sqlite3.connect(db_path) as c:
-        c.execute("INSERT INTO bnl_journal_entries VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",(entry_id,revision,guild_id,'draft',article['title'],article['excerpt'],_json(article['sections']),_json(payload),canonical,content_hash,packet['sourceWindowStart'],packet['sourceWindowEnd'],authored,None,None,None,None,0,now,now))
-        c.execute("INSERT INTO bnl_journal_private_metadata VALUES (?,?,?,?,?,?,?,?)",(entry_id,revision,guild_id,_json(meta),content_hash,'draft',now,now))
-    return JournalResult(True,'draft','',entry_id,revision,content_hash)
 
-def approve_draft(db_path,guild_id,entry_id,content_hash):
-    ensure_schema(db_path); now=utc_now_iso()
-    with sqlite3.connect(db_path) as c:
-        row=c.execute("SELECT lifecycle_state,content_hash FROM bnl_journal_entries WHERE guild_id=? AND entry_id=? ORDER BY revision DESC LIMIT 1",(guild_id,entry_id)).fetchone()
-        if not row: return JournalResult(False,'not_found','not_found',entry_id)
-        if row[0] != 'draft': return JournalResult(False,row[0],'not_draft',entry_id)
-        if row[1] != content_hash: return JournalResult(False,'draft','content_hash_mismatch',entry_id,content_hash=row[1])
-        c.execute("UPDATE bnl_journal_entries SET lifecycle_state='approved_pending_delivery',approved_at=?,updated_at=? WHERE guild_id=? AND entry_id=?",(now,now,guild_id,entry_id))
-        c.execute("UPDATE bnl_journal_private_metadata SET lifecycle_state='approved_pending_delivery',updated_at=? WHERE guild_id=? AND entry_id=?",(now,guild_id,entry_id))
-    return JournalResult(True,'approved_pending_delivery','',entry_id,content_hash=content_hash)
+def validate_article(article: dict[str, Any], packet: dict[str, Any], prior_titles: Optional[list[str]] = None, approved_names: Optional[set[str]] = None) -> str:
+    sections = article.get("sections")
+    if not isinstance(sections, list) or not (1 <= len(sections) <= 3):
+        return "invalid_section_count"
+    wc = public_word_count(article)
+    if wc < WORD_MIN or wc > WORD_MAX:
+        return "invalid_word_count"
+    valid_refs = {s["refId"] for s in packet.get("safeSources", []) if s.get("refId")}
+    if not valid_refs:
+        return "no_new_source"
+    refmap = article.get("sourceRefIds") or {}
+    public_text = _public_text(article)
+    for section in sections:
+        refs = refmap.get(section.get("heading")) or section.get("sourceRefIds")
+        if not refs or any(str(r) not in valid_refs for r in refs):
+            return "invalid_section_source_refs"
+        if any(str(r) in public_text for r in refs):
+            return "source_ref_leak"
+    if re.search(r"<@!?\d+>|@\w+|https?://|\b\d{12,}\b|relationship_journal|memory_tiers|source[- ]?file|dossier|private_metadata|sourceRefIds?", public_text, re.I):
+        return "public_leak_pattern"
+    if re.search(r"[\"“”‘’]", public_text):
+        return "direct_quote_or_quote_mark"
+    names = set(approved_names or [])
+    for src in packet.get("privateSources", []):
+        name = str(src.get("displayName") or "").strip()
+        if name and name not in names and re.search(r"\b" + re.escape(name) + r"\b", public_text, re.I):
+            return "community_name_leak"
+    normalized_public = _norm(public_text)
+    for src in packet.get("privateSources", []):
+        summary = str(src.get("summary") or "")
+        words = _norm(summary).split()
+        for size in range(5, min(10, len(words)) + 1):
+            for i in range(0, len(words) - size + 1):
+                if " ".join(words[i:i + size]) in normalized_public:
+                    return "discord_phrase_copy"
+    norm_title = _norm(article.get("title", ""))
+    for title in prior_titles or []:
+        if norm_title and norm_title == _norm(title):
+            return "duplicate_title"
+    return ""
 
-def reject_draft(db_path,guild_id,entry_id,reason=''):
-    ensure_schema(db_path); now=utc_now_iso()
-    with sqlite3.connect(db_path) as c:
-        c.execute("UPDATE bnl_journal_entries SET lifecycle_state='rejected',review_reason=?,updated_at=? WHERE guild_id=? AND entry_id=? AND lifecycle_state='draft'",(reason[:500],now,guild_id,entry_id))
-        c.execute("UPDATE bnl_journal_private_metadata SET lifecycle_state='rejected',updated_at=? WHERE guild_id=? AND entry_id=?",(now,guild_id,entry_id))
-    return JournalResult(True,'rejected','',entry_id)
 
-def deliver_approved(db_path, guild_id, entry_id, base_url, api_key, opener=None, timeout=10):
-    ensure_schema(db_path); opener=opener or urllib.request.urlopen
-    with sqlite3.connect(db_path) as c:
-        row=c.execute("SELECT canonical_payload_bytes,content_hash FROM bnl_journal_entries WHERE guild_id=? AND entry_id=? AND lifecycle_state IN ('approved_pending_delivery','delivery_failed')",(guild_id,entry_id)).fetchone()
-    if not row: return JournalResult(False,'not_deliverable','not_approved',entry_id)
-    url=base_url.rstrip('/') + '/api/bnl/journal'; req=urllib.request.Request(url,data=row[0],method='POST',headers={'Content-Type':'application/json','x-api-key':api_key})
-    status='delivery_failed'; reason='retryable_delivery_failure'; http=0; idem=False; published=''
+def _prior_titles(conn: sqlite3.Connection, guild_id: int) -> list[str]:
+    return [r[0] for r in conn.execute("SELECT title FROM bnl_journal_entries WHERE guild_id=? AND lifecycle_state='published'", (guild_id,)).fetchall()]
+
+
+def build_public_payload(entry_id: str, revision: int, article: dict[str, Any], packet: dict[str, Any], content_hash: str, authored_at: str) -> dict[str, Any]:
+    return {"contractVersion": 1, "kind": "journal_entry", "entry": {"entryId": entry_id, "revision": revision, "title": article["title"], "excerpt": article["excerpt"], "sections": [{"heading": s["heading"], "body": s["body"]} for s in article["sections"]], "authoredAt": authored_at, "sourceWindowStart": packet["sourceWindowStart"], "sourceWindowEnd": packet["sourceWindowEnd"], "contentHash": content_hash}}
+
+
+def store_validated_draft(db_path: str, guild_id: int, packet: dict[str, Any], article: dict[str, Any], *, entry_id: str = "", revision: int = 1) -> JournalResult:
+    ensure_schema(db_path)
+    with sqlite3.connect(db_path) as conn:
+        reason = validate_article(article, packet, _prior_titles(conn, guild_id))
+    if reason:
+        return JournalResult(False, "no_draft", reason, entry_id=entry_id, revision=revision)
+    authored = utc_now_iso()
+    entry_id = entry_id or "journal_" + _hash(guild_id, authored, article["title"])[:16]
+    content_hash = _hash(article["title"], article["excerpt"], _json(article["sections"]))
+    payload = build_public_payload(entry_id, revision, article, packet, content_hash, authored)
+    canonical = _json(payload).encode("utf-8")
+    source_ref_ids = article.get("sourceRefIds", {})
+    meta = dict(article.get("metadata") or {})
+    meta.update({
+        "sourceWindowStart": packet["sourceWindowStart"],
+        "sourceWindowEnd": packet["sourceWindowEnd"],
+        "supportingRelayIds": [s.get("relayId") for s in packet.get("privateSources", []) if s.get("sourceKind") == "relay"],
+        "supportingConversationRefs": [{k: v for k, v in s.items() if k in {"refId", "messageId", "subjectRef", "channelPolicy", "observedAt"}} for s in packet.get("privateSources", []) if s.get("sourceKind") == "conversation"],
+        "subjectRefs": sorted(_subject_refs(packet) | set(str(x) for x in meta.get("subjectRefs", []))),
+        "relatedPriorJournalEntryIds": [e.get("entry_id") for e in packet.get("history", {}).get("relevantOlderEntries", [])],
+        "recurringTopicCounts": packet.get("history", {}).get("recurringTopicCounts", {}),
+        "aggregateCounts": packet.get("aggregateCounts", {}),
+        "sourceSummaries": [{"refId": s.get("refId"), "hash": _hash(s.get("summary", "")), "summary": s.get("summary", "")[:160]} for s in packet.get("privateSources", [])],
+        "sourceRefIds": source_ref_ids,
+    })
+    now = utc_now_iso()
+    with sqlite3.connect(db_path) as conn:
+        with conn:
+            conn.execute("INSERT INTO bnl_journal_entries VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (entry_id, revision, guild_id, "draft", article["title"], article["excerpt"], _json(article["sections"]), _json(payload), canonical, content_hash, packet["sourceWindowStart"], packet["sourceWindowEnd"], authored, None, None, None, None, 0, now, now))
+            conn.execute("INSERT INTO bnl_journal_private_metadata VALUES (?,?,?,?,?,?,?,?)", (entry_id, revision, guild_id, _json(meta), content_hash, "draft", now, now))
+    return JournalResult(True, "draft", "", entry_id, revision, content_hash)
+
+
+def generate_and_store_draft(db_path: str, guild_id: int, hours: int, generator: Callable[[dict[str, Any], str], str]) -> JournalResult:
+    packet = build_source_packet(db_path, guild_id, hours)
+    if not packet.get("safeSources"):
+        return JournalResult(False, "no_draft", "insufficient_grounded_material")
+    prompt = build_generation_prompt(packet)
+    last_reason = ""
+    for attempt in range(2):
+        raw = generator(packet, prompt if attempt == 0 else build_generation_prompt(packet, repair_reason=last_reason))
+        try:
+            article = parse_generated_json(raw)
+        except ValueError as exc:
+            last_reason = str(exc)
+            continue
+        with sqlite3.connect(db_path) as conn:
+            validation = validate_article(article, packet, _prior_titles(conn, guild_id))
+        if not validation:
+            return store_validated_draft(db_path, guild_id, packet, article)
+        last_reason = validation
+    return JournalResult(False, "no_draft", last_reason or "generation_failed")
+
+
+def approve_draft(db_path: str, guild_id: int, entry_id: str, content_hash: str, revision: Optional[int] = None) -> JournalResult:
+    ensure_schema(db_path)
+    now = utc_now_iso()
+    with sqlite3.connect(db_path) as conn:
+        row = conn.execute("SELECT revision,lifecycle_state,content_hash FROM bnl_journal_entries WHERE guild_id=? AND entry_id=? " + ("AND revision=?" if revision is not None else "ORDER BY revision DESC LIMIT 1"), (guild_id, entry_id, revision) if revision is not None else (guild_id, entry_id)).fetchone()
+        if not row:
+            return JournalResult(False, "not_found", "not_found", entry_id)
+        rev, state, stored_hash = int(row[0]), row[1], row[2]
+        if state != "draft":
+            return JournalResult(False, state, "not_draft", entry_id, rev, stored_hash)
+        if stored_hash != content_hash:
+            return JournalResult(False, "draft", "content_hash_mismatch", entry_id, rev, stored_hash)
+        with conn:
+            cur1 = conn.execute("UPDATE bnl_journal_entries SET lifecycle_state='approved_pending_delivery',approved_at=?,updated_at=? WHERE guild_id=? AND entry_id=? AND revision=? AND lifecycle_state='draft'", (now, now, guild_id, entry_id, rev))
+            cur2 = conn.execute("UPDATE bnl_journal_private_metadata SET lifecycle_state='approved_pending_delivery',updated_at=? WHERE guild_id=? AND entry_id=? AND revision=? AND lifecycle_state='draft'", (now, guild_id, entry_id, rev))
+            if cur1.rowcount != 1 or cur2.rowcount != 1:
+                raise sqlite3.IntegrityError("journal_approve_sync_failed")
+    return JournalResult(True, "approved_pending_delivery", "", entry_id, rev, stored_hash)
+
+
+def reject_draft(db_path: str, guild_id: int, entry_id: str, reason: str = "", revision: Optional[int] = None) -> JournalResult:
+    ensure_schema(db_path)
+    now = utc_now_iso()
+    with sqlite3.connect(db_path) as conn:
+        row = conn.execute("SELECT revision,lifecycle_state,content_hash FROM bnl_journal_entries WHERE guild_id=? AND entry_id=? " + ("AND revision=?" if revision is not None else "ORDER BY revision DESC LIMIT 1"), (guild_id, entry_id, revision) if revision is not None else (guild_id, entry_id)).fetchone()
+        if not row:
+            return JournalResult(False, "not_found", "not_found", entry_id)
+        rev, state, content_hash = int(row[0]), row[1], row[2]
+        if state != "draft":
+            return JournalResult(False, state, "not_draft", entry_id, rev, content_hash)
+        with conn:
+            cur1 = conn.execute("UPDATE bnl_journal_entries SET lifecycle_state='rejected',review_reason=?,updated_at=? WHERE guild_id=? AND entry_id=? AND revision=? AND lifecycle_state='draft'", (reason[:500], now, guild_id, entry_id, rev))
+            cur2 = conn.execute("UPDATE bnl_journal_private_metadata SET lifecycle_state='rejected',updated_at=? WHERE guild_id=? AND entry_id=? AND revision=? AND lifecycle_state='draft'", (now, guild_id, entry_id, rev))
+            if cur1.rowcount != 1 or cur2.rowcount != 1:
+                raise sqlite3.IntegrityError("journal_reject_sync_failed")
+    return JournalResult(True, "rejected", "", entry_id, rev, content_hash)
+
+
+def regenerate_draft(db_path: str, guild_id: int, entry_id: str, hours: int, generator: Callable[[dict[str, Any], str], str]) -> JournalResult:
+    ensure_schema(db_path)
+    with sqlite3.connect(db_path) as conn:
+        row = conn.execute("SELECT revision,lifecycle_state FROM bnl_journal_entries WHERE guild_id=? AND entry_id=? ORDER BY revision DESC LIMIT 1", (guild_id, entry_id)).fetchone()
+    if not row:
+        return JournalResult(False, "not_found", "not_found", entry_id)
+    old_revision, state = int(row[0]), row[1]
+    if state != "draft":
+        return JournalResult(False, state, "not_draft", entry_id, old_revision)
+    packet = build_source_packet(db_path, guild_id, hours)
+    last_reason = ""
+    for attempt in range(2):
+        raw = generator(packet, build_generation_prompt(packet, repair_reason=last_reason) if attempt else build_generation_prompt(packet))
+        try:
+            article = parse_generated_json(raw)
+        except ValueError as exc:
+            last_reason = str(exc)
+            continue
+        with sqlite3.connect(db_path) as conn:
+            validation = validate_article(article, packet, _prior_titles(conn, guild_id))
+        if validation:
+            last_reason = validation
+            continue
+        with sqlite3.connect(db_path) as conn:
+            with conn:
+                cur1 = conn.execute("UPDATE bnl_journal_entries SET lifecycle_state='rejected',review_reason='regenerated',updated_at=? WHERE guild_id=? AND entry_id=? AND revision=? AND lifecycle_state='draft'", (utc_now_iso(), guild_id, entry_id, old_revision))
+                cur2 = conn.execute("UPDATE bnl_journal_private_metadata SET lifecycle_state='rejected',updated_at=? WHERE guild_id=? AND entry_id=? AND revision=? AND lifecycle_state='draft'", (utc_now_iso(), guild_id, entry_id, old_revision))
+                if cur1.rowcount != 1 or cur2.rowcount != 1:
+                    raise sqlite3.IntegrityError("journal_regenerate_sync_failed")
+        return store_validated_draft(db_path, guild_id, packet, article, entry_id=entry_id, revision=old_revision + 1)
+    return JournalResult(False, "no_draft", last_reason or "generation_failed", entry_id, old_revision)
+
+
+def deliver_approved(db_path: str, guild_id: int, entry_id: str, base_url: str, api_key: str, opener=None, timeout: int = 10, revision: Optional[int] = None) -> JournalResult:
+    ensure_schema(db_path)
+    opener = opener or urllib.request.urlopen
+    with sqlite3.connect(db_path) as conn:
+        row = conn.execute("SELECT revision,canonical_payload_bytes,content_hash FROM bnl_journal_entries WHERE guild_id=? AND entry_id=? AND lifecycle_state IN ('approved_pending_delivery','delivery_failed') " + ("AND revision=?" if revision is not None else "ORDER BY revision DESC LIMIT 1"), (guild_id, entry_id, revision) if revision is not None else (guild_id, entry_id)).fetchone()
+    if not row:
+        return JournalResult(False, "not_deliverable", "not_approved", entry_id)
+    rev, canonical, content_hash = int(row[0]), row[1], row[2]
+    req = urllib.request.Request(base_url.rstrip("/") + "/api/bnl/journal", data=canonical, method="POST", headers={"Content-Type": "application/json", "x-api-key": api_key})
+    status = "delivery_failed"; reason = "retryable_delivery_failure"; http = 0; idem = False; published = ""
     try:
         with opener(req, timeout=timeout) as resp:
-            http=getattr(resp,'status',None) or resp.getcode(); data=json.loads(resp.read().decode() or '{}')
-        if 200 <= http < 300 and data.get('ok') is True and data.get('persisted') is True:
-            ack=data.get('entry') or {}; submitted=json.loads(row[0].decode())['entry']
-            if ack.get('entryId')==submitted['entryId'] and ack.get('revision')==submitted['revision'] and ack.get('contentHash')==submitted['contentHash']:
-                status='published'; reason=''; idem=bool(data.get('idempotent')); published=ack.get('publishedAt') or utc_now_iso()
-            elif ack.get('entryId')==submitted['entryId'] and ack.get('revision')==submitted['revision']:
-                reason='journal_id_conflict'
-            else: reason='response_mismatch'
-        elif http==404: reason='endpoint_not_found'
-        elif http in (401,403): reason='authentication_failed'
-        elif http==409: reason='journal_id_conflict'
-        else: reason='http_rejected'
-    except urllib.error.HTTPError as e:
-        http=e.code; reason='endpoint_not_found' if e.code==404 else ('journal_id_conflict' if e.code==409 else 'http_rejected')
+            http = getattr(resp, "status", None) or resp.getcode(); data = json.loads(resp.read().decode("utf-8") or "{}")
+        submitted = json.loads(canonical.decode("utf-8"))["entry"]
+        if 200 <= http < 300 and data.get("ok") is True and data.get("persisted") is True:
+            ack = data.get("entry") or {}
+            if ack.get("entryId") == submitted["entryId"] and ack.get("revision") == submitted["revision"] and ack.get("contentHash") == submitted["contentHash"]:
+                status = "published"; reason = ""; idem = bool(data.get("idempotent")); published = ack.get("publishedAt") or utc_now_iso()
+            elif ack.get("entryId") == submitted["entryId"] and ack.get("revision") == submitted["revision"]:
+                reason = "journal_id_conflict"
+            else:
+                reason = "response_mismatch"
+        elif http == 404:
+            reason = "endpoint_not_found"
+        elif http in (401, 403):
+            reason = "authentication_failed"
+        elif http == 409:
+            reason = "journal_id_conflict"
+        else:
+            reason = "http_rejected"
+    except urllib.error.HTTPError as exc:
+        http = exc.code; reason = "endpoint_not_found" if exc.code == 404 else ("journal_id_conflict" if exc.code == 409 else "http_rejected")
     except Exception:
-        reason='retryable_delivery_failure'
-    now=utc_now_iso()
-    with sqlite3.connect(db_path) as c:
-        c.execute("UPDATE bnl_journal_entries SET lifecycle_state=?,delivery_status=?,delivery_http_status=?,published_at=COALESCE(?,published_at),updated_at=? WHERE guild_id=? AND entry_id=?",(status,reason,http,published or None,now,guild_id,entry_id))
-        c.execute("UPDATE bnl_journal_private_metadata SET lifecycle_state=?,updated_at=? WHERE guild_id=? AND entry_id=?",(status,now,guild_id,entry_id))
-    return JournalResult(status=='published',status,reason,entry_id,content_hash=row[1],http_status=http,idempotent=idem)
+        reason = "retryable_delivery_failure"
+    now = utc_now_iso()
+    with sqlite3.connect(db_path) as conn:
+        with conn:
+            cur1 = conn.execute("UPDATE bnl_journal_entries SET lifecycle_state=?,delivery_status=?,delivery_http_status=?,published_at=COALESCE(?,published_at),updated_at=? WHERE guild_id=? AND entry_id=? AND revision=? AND lifecycle_state IN ('approved_pending_delivery','delivery_failed')", (status, reason, http, published or None, now, guild_id, entry_id, rev))
+            cur2 = conn.execute("UPDATE bnl_journal_private_metadata SET lifecycle_state=?,updated_at=? WHERE guild_id=? AND entry_id=? AND revision=?", (status, now, guild_id, entry_id, rev))
+            if cur1.rowcount != 1 or cur2.rowcount != 1:
+                raise sqlite3.IntegrityError("journal_delivery_sync_failed")
+    return JournalResult(status == "published", status, reason, entry_id, rev, content_hash, http, idem)
 
-def preview(db_path,guild_id,entry_id=None):
+
+def preview(db_path: str, guild_id: int, entry_id: Optional[str] = None, revision: Optional[int] = None) -> Optional[dict[str, Any]]:
     ensure_schema(db_path)
-    with sqlite3.connect(db_path) as c:
-        c.row_factory=sqlite3.Row
-        row=c.execute("SELECT entry_id,revision,lifecycle_state,title,excerpt,sections_json,content_hash FROM bnl_journal_entries WHERE guild_id=? " + ("AND entry_id=? " if entry_id else "") + "ORDER BY created_at DESC LIMIT 1", ((guild_id,entry_id) if entry_id else (guild_id,))).fetchone()
+    sql = "SELECT entry_id,revision,lifecycle_state,title,excerpt,sections_json,content_hash FROM bnl_journal_entries WHERE guild_id=?"
+    args: list[Any] = [guild_id]
+    if entry_id:
+        sql += " AND entry_id=?"; args.append(entry_id)
+    if revision is not None:
+        sql += " AND revision=?"; args.append(revision)
+    sql += " ORDER BY created_at DESC, revision DESC LIMIT 1"
+    with sqlite3.connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(sql, tuple(args)).fetchone()
     return dict(row) if row else None
