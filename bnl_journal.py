@@ -14,6 +14,20 @@ PUBLIC_POLICIES = {"public_home", "public_context", "public_selective"}
 STATES = {"draft", "rejected", "approved_pending_delivery", "published", "delivery_failed"}
 WORD_MIN, WORD_MAX = 250, 500
 JOURNAL_ROUTE = "bnl_journal_generation"
+JOURNAL_GENERATION_ATTEMPTS = 4
+
+_REPAIR_GUIDANCE = {
+    "discord_phrase_copy": (
+        "Rewrite the entire public article from scratch. Do not repeat any sequence of five or more "
+        "consecutive words from any fresh source summary. Preserve only the grounded meaning, and use "
+        "new sentence structure and vocabulary throughout."
+    ),
+    "direct_quote_or_quote_mark": "Remove all quotation marks and paraphrase every quoted or quote-like passage.",
+    "community_name_leak": "Remove every community member name and replace personal references with anonymous descriptions.",
+    "public_leak_pattern": "Remove every URL, mention, identifier, and internal implementation term from public prose.",
+    "source_ref_leak": "Keep source reference tokens only inside sourceRefIds arrays; remove them from all public prose.",
+    "invalid_word_count": "Rewrite the complete article so its total public word count is between 250 and 500 words.",
+}
 
 
 @dataclass
@@ -231,12 +245,25 @@ def build_generation_prompt(packet: dict[str, Any], *, repair_reason: str = "", 
     }
     repair = ""
     if repair_reason:
-        repair = f"\nRepair required because: {repair_reason}. Previous invalid output is not evidence and must not be copied."
+        guidance = _REPAIR_GUIDANCE.get(
+            repair_reason,
+            "Rewrite the complete JSON response and correct the named validation failure.",
+        )
+        repair = (
+            f"\nRepair required because: {repair_reason}. {guidance} "
+            "The previous invalid output is not evidence and must not be copied verbatim."
+        )
+        if previous_output:
+            repair += (
+                "\nPrevious rejected JSON follows for revision only. Rewrite it completely; do not return the same prose:\n"
+                + previous_output[:6000]
+            )
     return (
         "You are BNL-01 writing a BARCODE Network Journal entry. Return strict JSON only; no markdown fences."
         "\nSchema: {\"title\":str,\"excerpt\":str,\"sections\":[{\"heading\":str,\"body\":str,\"sourceRefIds\":[str]}],\"metadata\":{\"topicTags\":[],\"subjectRefs\":[],\"continuityNotes\":[],\"unresolvedQuestions\":[],\"confidenceFlags\":[],\"safetyFlags\":[]}}."
         "\nWrite 1-3 sections and 250-500 total words. Use BNL's formal, observant, lightly uncanny voice. Make it entertaining and grounded in BARCODE music/community texture."
         "\nEvery section must cite at least one fresh sourceRefId from the current window. Older Journal material is continuity only, never proof of current activity."
+        "\nParaphrase every source summary. Never repeat any sequence of five or more consecutive words from a fresh source summary."
         "\nKeep community members anonymous. Do not include direct quotes, URLs, mentions, IDs, sourceRef tokens in public prose, private intent, relationships, harassment, or internal schema/storage terms."
         f"{repair}\nGeneration-safe packet:\n{json.dumps(safe_packet, ensure_ascii=False, sort_keys=True)}"
     )
@@ -407,12 +434,21 @@ def generate_and_store_draft(db_path: str, guild_id: int, hours: int, generator:
         return JournalResult(False, "no_draft", "insufficient_grounded_material")
     prompt = build_generation_prompt(packet)
     last_reason = ""
-    for attempt in range(2):
+    previous_output = ""
+    for attempt in range(JOURNAL_GENERATION_ATTEMPTS):
         try:
-            raw = generator(packet, prompt if attempt == 0 else build_generation_prompt(packet, repair_reason=last_reason))
+            raw = generator(
+                packet,
+                prompt if attempt == 0 else build_generation_prompt(
+                    packet,
+                    repair_reason=last_reason,
+                    previous_output=previous_output,
+                ),
+            )
         except Exception as exc:
             reason = "quota_unavailable" if "quota" in str(exc).lower() else "provider_failure"
             return JournalResult(False, "no_draft", reason)
+        previous_output = raw
         try:
             article = parse_generated_json(raw)
         except ValueError as exc:
@@ -476,13 +512,22 @@ def regenerate_draft(db_path: str, guild_id: int, entry_id: str, hours: int, gen
         return JournalResult(False, state, "not_draft", entry_id, old_revision)
     packet = build_source_packet(db_path, guild_id, hours)
     last_reason = ""
+    previous_output = ""
     article: Optional[dict[str, Any]] = None
-    for attempt in range(2):
+    for attempt in range(JOURNAL_GENERATION_ATTEMPTS):
         try:
-            raw = generator(packet, build_generation_prompt(packet, repair_reason=last_reason) if attempt else build_generation_prompt(packet))
+            raw = generator(
+                packet,
+                build_generation_prompt(
+                    packet,
+                    repair_reason=last_reason,
+                    previous_output=previous_output,
+                ) if attempt else build_generation_prompt(packet),
+            )
         except Exception as exc:
             reason = "quota_unavailable" if "quota" in str(exc).lower() else "provider_failure"
             return JournalResult(False, "no_draft", reason, entry_id, old_revision)
+        previous_output = raw
         try:
             candidate = parse_generated_json(raw)
         except ValueError as exc:

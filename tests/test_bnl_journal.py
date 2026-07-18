@@ -69,9 +69,34 @@ class JournalTests(unittest.TestCase):
         def gen(packet, prompt):
             calls.append(prompt); return 'not-json'
         res = j.generate_and_store_draft(self.db, 1, 24, gen)
-        self.assertFalse(res.ok); self.assertEqual(len(calls), 2)
+        self.assertFalse(res.ok); self.assertEqual(len(calls), j.JOURNAL_GENERATION_ATTEMPTS)
         with sqlite3.connect(self.db) as c:
             self.assertEqual(c.execute("SELECT COUNT(*) FROM bnl_journal_entries").fetchone()[0], 0)
+
+    def test_phrase_copy_gets_actionable_rewrite_without_weakening_guard(self):
+        calls = []
+        copied = ' people discuss bass chaos and a hook'
+
+        def gen(packet, prompt):
+            calls.append(prompt)
+            if len(calls) == 1:
+                return article_json(packet, title='Copied First Pass', leak=copied)
+            return article_json(packet, title='Fully Rewritten Pass')
+
+        packet = self.packet()
+        invalid = j.parse_generated_json(article_json(packet, title='Guard Check', leak=copied))
+        self.assertEqual('discord_phrase_copy', j.validate_article(invalid, packet, []))
+
+        res = j.generate_and_store_draft(self.db, 1, 24, gen)
+        self.assertTrue(res.ok, res.reason)
+        self.assertEqual(2, len(calls))
+        self.assertIn('five or more consecutive words', calls[1])
+        self.assertIn('Previous rejected JSON', calls[1])
+        with sqlite3.connect(self.db) as c:
+            self.assertEqual(
+                1,
+                c.execute("SELECT COUNT(*) FROM bnl_journal_entries WHERE lifecycle_state='draft'").fetchone()[0],
+            )
 
     def test_source_specific_generated_json_creates_draft(self):
         def gen(packet, prompt): return article_json(packet)
