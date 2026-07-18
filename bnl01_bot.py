@@ -5888,6 +5888,8 @@ def _journal_website_base_url() -> str:
 
 
 def _generate_journal_json_sync(_packet: dict, prompt: str) -> str:
+    if not check_quota_availability():
+        raise RuntimeError("quota_unavailable")
     response = _generate_gemini_content_with_fallback(f"{BNL01_SYSTEM_PROMPT}\n\n{prompt}", JOURNAL_ROUTE)
     text, tokens = _extract_text_and_tokens(response)
     if tokens:
@@ -5913,56 +5915,61 @@ async def maybe_handle_journal_command(message: discord.Message, clean_content: 
         return True
     action = options.get("action")
     guild_id = message.guild.id
-    if action == "create":
-        hours = _parse_journal_hours(options.get("hours") or options.get("window"))
-        result = await asyncio.to_thread(generate_and_store_journal_draft, DB_FILE, guild_id, hours, _generate_journal_json_sync)
-        if not result.ok:
-            await message.reply(f"Journal draft not created: `{result.reason}`")
+    try:
+        if action == "create":
+            hours = _parse_journal_hours(options.get("hours") or options.get("window"))
+            result = await asyncio.to_thread(generate_and_store_journal_draft, DB_FILE, guild_id, hours, _generate_journal_json_sync)
+            if not result.ok:
+                await message.reply(f"Journal draft not created: `{result.reason}`")
+                return True
+            await message.reply(f"Journal draft `{result.entry_id}` r{result.revision} ready for private review. content_hash=`{result.content_hash}`")
             return True
-        await message.reply(f"Journal draft `{result.entry_id}` r{result.revision} ready for private review. content_hash=`{result.content_hash}`")
-        return True
-    if action == "regenerate":
-        entry_id = options.get("entry_id") or ""
-        hours = _parse_journal_hours(options.get("hours") or options.get("window"))
-        result = await asyncio.to_thread(regenerate_journal_draft, DB_FILE, guild_id, entry_id, hours, _generate_journal_json_sync)
-        if not result.ok:
-            await message.reply(f"Journal regeneration failed: `{result.reason}`")
+        if action == "regenerate":
+            entry_id = options.get("entry_id") or ""
+            hours = _parse_journal_hours(options.get("hours") or options.get("window"))
+            result = await asyncio.to_thread(regenerate_journal_draft, DB_FILE, guild_id, entry_id, hours, _generate_journal_json_sync)
+            if not result.ok:
+                await message.reply(f"Journal regeneration failed: `{result.reason}`")
+                return True
+            await message.reply(f"Journal draft `{result.entry_id}` r{result.revision} regenerated. content_hash=`{result.content_hash}`")
             return True
-        await message.reply(f"Journal draft `{result.entry_id}` r{result.revision} regenerated. content_hash=`{result.content_hash}`")
-        return True
-    if action == "preview":
-        row = await asyncio.to_thread(preview_journal_draft, DB_FILE, guild_id, options.get("entry_id"))
-        if not row:
-            await message.reply("No Journal draft found.")
+        if action == "preview":
+            row = await asyncio.to_thread(preview_journal_draft, DB_FILE, guild_id, options.get("entry_id"))
+            if not row:
+                await message.reply("No Journal draft found.")
+                return True
+            sections = json.loads(row.get("sections_json") or "[]")
+            text = f"Journal `{row['entry_id']}` r{row['revision']} state=`{row['lifecycle_state']}` hash=`{row['content_hash']}`\n**{row['title']}**\n_{row['excerpt']}_\n" + "\n".join(f"\n__{s.get('heading','')}__\n{s.get('body','')}" for s in sections)
+            await reply_with_discord_safe_chunks(message, text)
             return True
-        sections = json.loads(row.get("sections_json") or "[]")
-        text = f"Journal `{row['entry_id']}` r{row['revision']} state=`{row['lifecycle_state']}` hash=`{row['content_hash']}`\n**{row['title']}**\n_{row['excerpt']}_\n" + "\n".join(f"\n__{s.get('heading','')}__\n{s.get('body','')}" for s in sections)
-        await reply_with_discord_safe_chunks(message, text)
-        return True
-    if action == "reject":
-        entry_id = options.get("entry_id") or ""
-        result = await asyncio.to_thread(reject_journal_draft, DB_FILE, guild_id, entry_id, options.get("reason", ""))
-        if not result.ok:
-            await message.reply(f"Journal reject failed: `{result.reason}`")
+        if action == "reject":
+            entry_id = options.get("entry_id") or ""
+            result = await asyncio.to_thread(reject_journal_draft, DB_FILE, guild_id, entry_id, options.get("reason", ""))
+            if not result.ok:
+                await message.reply(f"Journal reject failed: `{result.reason}`")
+                return True
+            await message.reply(f"Journal `{entry_id}` r{result.revision} marked `{result.status}`.")
             return True
-        await message.reply(f"Journal `{entry_id}` r{result.revision} marked `{result.status}`.")
-        return True
-    if action == "approve":
-        entry_id = options.get("entry_id") or ""
-        content_hash = options.get("hash") or options.get("content_hash") or ""
-        result = await asyncio.to_thread(approve_journal_draft, DB_FILE, guild_id, entry_id, content_hash)
-        if not result.ok:
-            await message.reply(f"Journal approval failed: `{result.reason}`")
+        if action == "approve":
+            entry_id = options.get("entry_id") or ""
+            content_hash = options.get("hash") or options.get("content_hash") or ""
+            result = await asyncio.to_thread(approve_journal_draft, DB_FILE, guild_id, entry_id, content_hash)
+            if not result.ok:
+                await message.reply(f"Journal approval failed: `{result.reason}`")
+                return True
+            await message.reply(f"Journal `{entry_id}` r{result.revision} approved for delivery with exact hash `{content_hash}`. Delivery still requires explicit retry.")
             return True
-        await message.reply(f"Journal `{entry_id}` r{result.revision} approved for delivery with exact hash `{content_hash}`. Delivery still requires explicit retry.")
-        return True
-    if action == "retry":
-        entry_id = options.get("entry_id") or ""
-        if not BNL_API_KEY or not _journal_website_base_url():
-            await message.reply("Journal delivery not attempted: website URL or BNL API key missing.")
+        if action == "retry":
+            entry_id = options.get("entry_id") or ""
+            if not BNL_API_KEY or not _journal_website_base_url():
+                await message.reply("Journal delivery not attempted: website URL or BNL API key missing.")
+                return True
+            result = await asyncio.to_thread(deliver_approved_journal, DB_FILE, guild_id, entry_id, _journal_website_base_url(), BNL_API_KEY)
+            await message.reply(f"Journal delivery result: state=`{result.status}` reason=`{result.reason}` http=`{result.http_status}`")
             return True
-        result = await asyncio.to_thread(deliver_approved_journal, DB_FILE, guild_id, entry_id, _journal_website_base_url(), BNL_API_KEY)
-        await message.reply(f"Journal delivery result: state=`{result.status}` reason=`{result.reason}` http=`{result.http_status}`")
+    except Exception:
+        logging.exception("journal_command_failed action=%s reason=unexpected_exception", action)
+        await message.reply("Journal command failed safely: `unexpected_journal_error`")
         return True
     return False
 

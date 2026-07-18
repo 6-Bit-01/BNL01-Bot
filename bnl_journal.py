@@ -284,6 +284,17 @@ def validate_article(article: dict[str, Any], packet: dict[str, Any], prior_titl
     sections = article.get("sections")
     if not isinstance(sections, list) or not (1 <= len(sections) <= 3):
         return "invalid_section_count"
+    if not str(article.get("title") or "").strip() or not str(article.get("excerpt") or "").strip():
+        return "empty_required_field"
+    headings = []
+    for section in sections:
+        heading = str(section.get("heading") or "").strip()
+        body = str(section.get("body") or "").strip()
+        if not heading or not body:
+            return "empty_required_field"
+        if _norm(heading) in headings:
+            return "duplicate_section_heading"
+        headings.append(_norm(heading))
     wc = public_word_count(article)
     if wc < WORD_MIN or wc > WORD_MAX:
         return "invalid_word_count"
@@ -292,12 +303,12 @@ def validate_article(article: dict[str, Any], packet: dict[str, Any], prior_titl
         return "no_new_source"
     refmap = article.get("sourceRefIds") or {}
     public_text = _public_text(article)
+    if re.search(r"\bfresh:\d+\b", public_text):
+        return "source_ref_leak"
     for section in sections:
         refs = refmap.get(section.get("heading")) or section.get("sourceRefIds")
         if not refs or any(str(r) not in valid_refs for r in refs):
             return "invalid_section_source_refs"
-        if any(str(r) in public_text for r in refs):
-            return "source_ref_leak"
     if re.search(r"<@!?\d+>|@\w+|https?://|\b\d{12,}\b|relationship_journal|memory_tiers|source[- ]?file|dossier|private_metadata|sourceRefIds?", public_text, re.I):
         return "public_leak_pattern"
     if re.search(r"[\"“”‘’]", public_text):
@@ -330,37 +341,64 @@ def build_public_payload(entry_id: str, revision: int, article: dict[str, Any], 
     return {"contractVersion": 1, "kind": "journal_entry", "entry": {"entryId": entry_id, "revision": revision, "title": article["title"], "excerpt": article["excerpt"], "sections": [{"heading": s["heading"], "body": s["body"]} for s in article["sections"]], "authoredAt": authored_at, "sourceWindowStart": packet["sourceWindowStart"], "sourceWindowEnd": packet["sourceWindowEnd"], "contentHash": content_hash}}
 
 
-def store_validated_draft(db_path: str, guild_id: int, packet: dict[str, Any], article: dict[str, Any], *, entry_id: str = "", revision: int = 1) -> JournalResult:
-    ensure_schema(db_path)
-    with sqlite3.connect(db_path) as conn:
-        reason = validate_article(article, packet, _prior_titles(conn, guild_id))
-    if reason:
-        return JournalResult(False, "no_draft", reason, entry_id=entry_id, revision=revision)
+
+def cited_source_ref_ids(article: dict[str, Any]) -> set[str]:
+    refs: set[str] = set()
+    refmap = article.get("sourceRefIds") or {}
+    for section in article.get("sections", []) or []:
+        for ref in refmap.get(section.get("heading"), []) or section.get("sourceRefIds", []) or []:
+            refs.add(str(ref))
+    return refs
+
+
+def cited_private_sources(packet: dict[str, Any], article: dict[str, Any]) -> list[dict[str, Any]]:
+    cited = cited_source_ref_ids(article)
+    return [src for src in packet.get("privateSources", []) if str(src.get("refId")) in cited]
+
+
+def _draft_records(guild_id: int, packet: dict[str, Any], article: dict[str, Any], *, entry_id: str = "", revision: int = 1) -> tuple[tuple[Any, ...], tuple[Any, ...], JournalResult]:
     authored = utc_now_iso()
     entry_id = entry_id or "journal_" + _hash(guild_id, authored, article["title"])[:16]
     content_hash = _hash(article["title"], article["excerpt"], _json(article["sections"]))
     payload = build_public_payload(entry_id, revision, article, packet, content_hash, authored)
     canonical = _json(payload).encode("utf-8")
     source_ref_ids = article.get("sourceRefIds", {})
+    cited_sources = cited_private_sources(packet, article)
     meta = dict(article.get("metadata") or {})
+    meta.pop("subjectRefs", None)
     meta.update({
         "sourceWindowStart": packet["sourceWindowStart"],
         "sourceWindowEnd": packet["sourceWindowEnd"],
-        "supportingRelayIds": [s.get("relayId") for s in packet.get("privateSources", []) if s.get("sourceKind") == "relay"],
-        "supportingConversationRefs": [{k: v for k, v in s.items() if k in {"refId", "messageId", "subjectRef", "channelPolicy", "observedAt"}} for s in packet.get("privateSources", []) if s.get("sourceKind") == "conversation"],
-        "subjectRefs": sorted(_subject_refs(packet) | set(str(x) for x in meta.get("subjectRefs", []))),
+        "supportingRelayIds": [s.get("relayId") for s in cited_sources if s.get("sourceKind") == "relay"],
+        "supportingConversationRefs": [{k: v for k, v in s.items() if k in {"refId", "messageId", "subjectRef", "channelPolicy", "observedAt"}} for s in cited_sources if s.get("sourceKind") == "conversation"],
+        "subjectRefs": sorted({str(s.get("subjectRef")) for s in cited_sources if s.get("subjectRef")}),
         "relatedPriorJournalEntryIds": [e.get("entry_id") for e in packet.get("history", {}).get("relevantOlderEntries", [])],
         "recurringTopicCounts": packet.get("history", {}).get("recurringTopicCounts", {}),
         "aggregateCounts": packet.get("aggregateCounts", {}),
-        "sourceSummaries": [{"refId": s.get("refId"), "hash": _hash(s.get("summary", "")), "summary": s.get("summary", "")[:160]} for s in packet.get("privateSources", [])],
+        "sourceSummaries": [{"refId": s.get("refId"), "hash": _hash(s.get("summary", "")), "summary": s.get("summary", "")[:160]} for s in cited_sources],
         "sourceRefIds": source_ref_ids,
     })
     now = utc_now_iso()
+    entry_row = (entry_id, revision, guild_id, "draft", article["title"], article["excerpt"], _json(article["sections"]), _json(payload), canonical, content_hash, packet["sourceWindowStart"], packet["sourceWindowEnd"], authored, None, None, None, None, 0, now, now)
+    meta_row = (entry_id, revision, guild_id, _json(meta), content_hash, "draft", now, now)
+    return entry_row, meta_row, JournalResult(True, "draft", "", entry_id, revision, content_hash)
+
+
+def _insert_draft_rows(conn: sqlite3.Connection, entry_row: tuple[Any, ...], meta_row: tuple[Any, ...]) -> None:
+    conn.execute("INSERT INTO bnl_journal_entries VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", entry_row)
+    conn.execute("INSERT INTO bnl_journal_private_metadata VALUES (?,?,?,?,?,?,?,?)", meta_row)
+
+
+def store_validated_draft(db_path: str, guild_id: int, packet: dict[str, Any], article: dict[str, Any], *, entry_id: str = "", revision: int = 1) -> JournalResult:
+    ensure_schema(db_path)
     with sqlite3.connect(db_path) as conn:
+        reason = validate_article(article, packet, _prior_titles(conn, guild_id))
+        if reason:
+            return JournalResult(False, "no_draft", reason, entry_id=entry_id, revision=revision)
+        entry_row, meta_row, result = _draft_records(guild_id, packet, article, entry_id=entry_id, revision=revision)
         with conn:
-            conn.execute("INSERT INTO bnl_journal_entries VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (entry_id, revision, guild_id, "draft", article["title"], article["excerpt"], _json(article["sections"]), _json(payload), canonical, content_hash, packet["sourceWindowStart"], packet["sourceWindowEnd"], authored, None, None, None, None, 0, now, now))
-            conn.execute("INSERT INTO bnl_journal_private_metadata VALUES (?,?,?,?,?,?,?,?)", (entry_id, revision, guild_id, _json(meta), content_hash, "draft", now, now))
-    return JournalResult(True, "draft", "", entry_id, revision, content_hash)
+            _insert_draft_rows(conn, entry_row, meta_row)
+    return result
 
 
 def generate_and_store_draft(db_path: str, guild_id: int, hours: int, generator: Callable[[dict[str, Any], str], str]) -> JournalResult:
@@ -370,7 +408,11 @@ def generate_and_store_draft(db_path: str, guild_id: int, hours: int, generator:
     prompt = build_generation_prompt(packet)
     last_reason = ""
     for attempt in range(2):
-        raw = generator(packet, prompt if attempt == 0 else build_generation_prompt(packet, repair_reason=last_reason))
+        try:
+            raw = generator(packet, prompt if attempt == 0 else build_generation_prompt(packet, repair_reason=last_reason))
+        except Exception as exc:
+            reason = "quota_unavailable" if "quota" in str(exc).lower() else "provider_failure"
+            return JournalResult(False, "no_draft", reason)
         try:
             article = parse_generated_json(raw)
         except ValueError as exc:
@@ -422,6 +464,7 @@ def reject_draft(db_path: str, guild_id: int, entry_id: str, reason: str = "", r
     return JournalResult(True, "rejected", "", entry_id, rev, content_hash)
 
 
+
 def regenerate_draft(db_path: str, guild_id: int, entry_id: str, hours: int, generator: Callable[[dict[str, Any], str], str]) -> JournalResult:
     ensure_schema(db_path)
     with sqlite3.connect(db_path) as conn:
@@ -433,26 +476,43 @@ def regenerate_draft(db_path: str, guild_id: int, entry_id: str, hours: int, gen
         return JournalResult(False, state, "not_draft", entry_id, old_revision)
     packet = build_source_packet(db_path, guild_id, hours)
     last_reason = ""
+    article: Optional[dict[str, Any]] = None
     for attempt in range(2):
-        raw = generator(packet, build_generation_prompt(packet, repair_reason=last_reason) if attempt else build_generation_prompt(packet))
         try:
-            article = parse_generated_json(raw)
+            raw = generator(packet, build_generation_prompt(packet, repair_reason=last_reason) if attempt else build_generation_prompt(packet))
+        except Exception as exc:
+            reason = "quota_unavailable" if "quota" in str(exc).lower() else "provider_failure"
+            return JournalResult(False, "no_draft", reason, entry_id, old_revision)
+        try:
+            candidate = parse_generated_json(raw)
         except ValueError as exc:
             last_reason = str(exc)
             continue
         with sqlite3.connect(db_path) as conn:
-            validation = validate_article(article, packet, _prior_titles(conn, guild_id))
+            validation = validate_article(candidate, packet, _prior_titles(conn, guild_id))
         if validation:
             last_reason = validation
             continue
-        with sqlite3.connect(db_path) as conn:
-            with conn:
-                cur1 = conn.execute("UPDATE bnl_journal_entries SET lifecycle_state='rejected',review_reason='regenerated',updated_at=? WHERE guild_id=? AND entry_id=? AND revision=? AND lifecycle_state='draft'", (utc_now_iso(), guild_id, entry_id, old_revision))
-                cur2 = conn.execute("UPDATE bnl_journal_private_metadata SET lifecycle_state='rejected',updated_at=? WHERE guild_id=? AND entry_id=? AND revision=? AND lifecycle_state='draft'", (utc_now_iso(), guild_id, entry_id, old_revision))
-                if cur1.rowcount != 1 or cur2.rowcount != 1:
-                    raise sqlite3.IntegrityError("journal_regenerate_sync_failed")
-        return store_validated_draft(db_path, guild_id, packet, article, entry_id=entry_id, revision=old_revision + 1)
-    return JournalResult(False, "no_draft", last_reason or "generation_failed", entry_id, old_revision)
+        article = candidate
+        break
+    if article is None:
+        return JournalResult(False, "no_draft", last_reason or "generation_failed", entry_id, old_revision)
+    with sqlite3.connect(db_path) as conn:
+        reason = validate_article(article, packet, _prior_titles(conn, guild_id))
+        if reason:
+            return JournalResult(False, "no_draft", reason, entry_id, old_revision)
+        entry_row, meta_row, result = _draft_records(guild_id, packet, article, entry_id=entry_id, revision=old_revision + 1)
+        now = utc_now_iso()
+        with conn:
+            latest = conn.execute("SELECT lifecycle_state FROM bnl_journal_entries WHERE guild_id=? AND entry_id=? AND revision=?", (guild_id, entry_id, old_revision)).fetchone()
+            if not latest or latest[0] != "draft":
+                raise sqlite3.IntegrityError("journal_regenerate_state_changed")
+            cur1 = conn.execute("UPDATE bnl_journal_entries SET lifecycle_state='rejected',review_reason='regenerated',updated_at=? WHERE guild_id=? AND entry_id=? AND revision=? AND lifecycle_state='draft'", (now, guild_id, entry_id, old_revision))
+            cur2 = conn.execute("UPDATE bnl_journal_private_metadata SET lifecycle_state='rejected',updated_at=? WHERE guild_id=? AND entry_id=? AND revision=? AND lifecycle_state='draft'", (now, guild_id, entry_id, old_revision))
+            if cur1.rowcount != 1 or cur2.rowcount != 1:
+                raise sqlite3.IntegrityError("journal_regenerate_sync_failed")
+            _insert_draft_rows(conn, entry_row, meta_row)
+    return result
 
 
 def deliver_approved(db_path: str, guild_id: int, entry_id: str, base_url: str, api_key: str, opener=None, timeout: int = 10, revision: Optional[int] = None) -> JournalResult:

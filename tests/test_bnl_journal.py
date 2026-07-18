@@ -45,6 +45,7 @@ class JournalTests(unittest.TestCase):
                 (2, 8, 'Private', 1, 'mods', 'internal_controlled', 'user', 'secret internal', '2026-07-18T00:02:00Z', 1, 'public_safe'),
                 (3, 9, 'Nope', 1, 'general', 'public_home', 'model', 'bot text', '2026-07-18T00:03:00Z', 1, 'public_safe'),
                 (4, 10, 'Nope2', 1, 'general', 'public_home', 'user', 'not usable', '2026-07-18T00:04:00Z', 0, 'public_safe'),
+                (5, 11, 'OtherUser', 1, 'general', 'public_home', 'user', 'OtherUser mentions synth sparks and chorus plans', '2026-07-18T00:05:00Z', 1, 'public_safe'),
             ]
             c.executemany("INSERT INTO conversations VALUES (?,?,?,?,?,?,?,?,?,?,?)", rows)
             c.execute("CREATE TABLE relationship_journal(id INTEGER,user_id INTEGER,guild_id INTEGER,entry_type TEXT,summary TEXT,timestamp TEXT)")
@@ -55,7 +56,7 @@ class JournalTests(unittest.TestCase):
 
     def test_source_policy_public_usable_user_authored_and_anonymized(self):
         packet = self.packet()
-        self.assertEqual(len([s for s in packet['privateSources'] if s['sourceKind'] == 'conversation']), 1)
+        self.assertEqual(len([s for s in packet['privateSources'] if s['sourceKind'] == 'conversation']), 2)
         prompt = j.build_generation_prompt(packet)
         self.assertIn('fresh:101', prompt)
         self.assertNotIn('KnownUser', prompt)
@@ -118,6 +119,56 @@ class JournalTests(unittest.TestCase):
         self.assertEqual(rows, [(1, 'rejected', 'First Title'), (2, 'draft', 'Second Title')])
         self.assertEqual(metas, [(1, 'rejected'), (2, 'draft')])
 
+
+    def test_provider_exception_create_no_rows_and_regen_preserves_old(self):
+        def down(packet, prompt): raise RuntimeError('provider down')
+        res = j.generate_and_store_draft(self.db, 1, 24, down)
+        self.assertFalse(res.ok); self.assertEqual(res.reason, 'provider_failure')
+        with sqlite3.connect(self.db) as c:
+            self.assertEqual(c.execute("SELECT COUNT(*) FROM bnl_journal_entries").fetchone()[0], 0)
+        old = j.generate_and_store_draft(self.db, 1, 24, lambda p, pr: article_json(p, 'Old Draft')); self.assertTrue(old.ok)
+        regen = j.regenerate_draft(self.db, 1, old.entry_id, 24, down)
+        self.assertFalse(regen.ok); self.assertEqual(regen.reason, 'provider_failure')
+        with sqlite3.connect(self.db) as c:
+            self.assertEqual(c.execute("SELECT revision,lifecycle_state,title FROM bnl_journal_entries WHERE entry_id=?", (old.entry_id,)).fetchall(), [(1, 'draft', 'Old Draft')])
+
+    def test_cited_sources_only_private_metadata(self):
+        packet = self.packet()
+        relay_article = j.parse_generated_json(article_json(packet, 'Relay Only'))
+        relay_article['sourceRefIds'] = {'Public Noise, Carefully Labeled': ['fresh:1']}
+        res = j.store_validated_draft(self.db, 1, packet, relay_article); self.assertTrue(res.ok, res.reason)
+        with sqlite3.connect(self.db) as c:
+            meta = json.loads(c.execute("SELECT metadata_json FROM bnl_journal_private_metadata WHERE entry_id=?", (res.entry_id,)).fetchone()[0])
+        self.assertEqual(meta['supportingRelayIds'], ['r1'])
+        self.assertEqual(meta['supportingConversationRefs'], [])
+        self.assertEqual(meta['subjectRefs'], [])
+        conv = next(src for src in packet['privateSources'] if src.get('displayName') == 'KnownUser')
+        conv_article = j.parse_generated_json(article_json(packet, 'One Person Only'))
+        conv_article['sourceRefIds'] = {'Public Noise, Carefully Labeled': [conv['refId']]}
+        res2 = j.store_validated_draft(self.db, 1, packet, conv_article); self.assertTrue(res2.ok, res2.reason)
+        with sqlite3.connect(self.db) as c:
+            meta2 = json.loads(c.execute("SELECT metadata_json FROM bnl_journal_private_metadata WHERE entry_id=?", (res2.entry_id,)).fetchone()[0])
+        self.assertEqual(meta2['supportingRelayIds'], [])
+        self.assertEqual([r['subjectRef'] for r in meta2['supportingConversationRefs']], ['discord_user:7'])
+        self.assertEqual(meta2['subjectRefs'], ['discord_user:7'])
+
+    def test_regeneration_transaction_rollback_on_insert_failure(self):
+        res = j.generate_and_store_draft(self.db, 1, 24, lambda p, pr: article_json(p, 'Atomic Old')); self.assertTrue(res.ok)
+        with sqlite3.connect(self.db) as c:
+            c.execute("CREATE TRIGGER fail_journal_revision_two BEFORE INSERT ON bnl_journal_entries WHEN NEW.revision=2 BEGIN SELECT RAISE(ABORT, 'forced'); END;")
+        with self.assertRaises(sqlite3.IntegrityError):
+            j.regenerate_draft(self.db, 1, res.entry_id, 24, lambda p, pr: article_json(p, 'Atomic New'))
+        with sqlite3.connect(self.db) as c:
+            self.assertEqual(c.execute("SELECT revision,lifecycle_state,title FROM bnl_journal_entries WHERE entry_id=?", (res.entry_id,)).fetchall(), [(1, 'draft', 'Atomic Old')])
+            self.assertEqual(c.execute("SELECT revision,lifecycle_state FROM bnl_journal_private_metadata WHERE entry_id=?", (res.entry_id,)).fetchall(), [(1, 'draft')])
+
+    def test_empty_fields_duplicate_headings_and_arbitrary_fresh_leak(self):
+        packet = self.packet(); base = j.parse_generated_json(article_json(packet))
+        bad = dict(base); bad['title'] = ''; self.assertEqual('empty_required_field', j.validate_article(bad, packet, []))
+        bad = j.parse_generated_json(article_json(packet)); bad['sections'][0]['heading'] = ''; self.assertEqual('empty_required_field', j.validate_article(bad, packet, []))
+        bad = j.parse_generated_json(article_json(packet)); bad['sections'].append(dict(bad['sections'][0])); self.assertEqual('duplicate_section_heading', j.validate_article(bad, packet, []))
+        bad = j.parse_generated_json(article_json(packet, 'Fresh Leak', ' fresh:999')); self.assertEqual('source_ref_leak', j.validate_article(bad, packet, []))
+
     def test_public_payload_private_metadata_exact_bytes_idempotency_and_404(self):
         res = j.generate_and_store_draft(self.db, 1, 24, lambda p, pr: article_json(p)); self.assertTrue(res.ok)
         with sqlite3.connect(self.db) as c:
@@ -149,6 +200,26 @@ class BotJournalCommandTests(unittest.IsolatedAsyncioTestCase):
         handled = await bnl01_bot.maybe_handle_journal_command(msg, '!bnl journal create | hours=bad')
         self.assertTrue(handled); msg.reply.assert_awaited()
 
+
+    async def test_quota_exhaustion_does_not_call_gemini(self):
+        import bnl01_bot
+        with patch.object(bnl01_bot, 'check_quota_availability', return_value=False), patch.object(bnl01_bot, '_generate_gemini_content_with_fallback') as gemini:
+            with self.assertRaises(RuntimeError):
+                bnl01_bot._generate_journal_json_sync({}, 'prompt')
+            gemini.assert_not_called()
+
+    async def test_command_exception_boundary_replies_safely(self):
+        import bnl01_bot
+        old = bnl01_bot.DB_FILE; bnl01_bot.DB_FILE = self._make_db()
+        try:
+            msg = Mock(); msg.guild = Mock(id=1, get_member=Mock(return_value=Mock())); msg.author = Mock(id=1); msg.channel = Mock(name='research-and-development'); msg.reply = AsyncMock()
+            with patch.object(bnl01_bot, 'resolve_channel_policy', return_value='internal_controlled'), patch.object(bnl01_bot, 'can_send_dossier_recommendation', return_value=True), patch.object(bnl01_bot, 'generate_and_store_journal_draft', side_effect=RuntimeError('boom')):
+                handled = await bnl01_bot.maybe_handle_journal_command(msg, '!bnl journal create | hours=72')
+            self.assertTrue(handled)
+            self.assertIn('failed safely', msg.reply.await_args.args[0])
+        finally:
+            bnl01_bot.DB_FILE = old
+
     async def test_operator_create_path_with_mocked_gemini_creates_draft(self):
         import bnl01_bot
         old = bnl01_bot.DB_FILE; bnl01_bot.DB_FILE = self._make_db()
@@ -156,7 +227,7 @@ class BotJournalCommandTests(unittest.IsolatedAsyncioTestCase):
             packet = j.build_source_packet(bnl01_bot.DB_FILE, 1, 24, '2026-07-18T01:00:00Z')
             response = Mock(candidates=[Mock(content=Mock(parts=[Mock(text=article_json(packet))]))], usage_metadata=Mock(total_token_count=None))
             msg = Mock(); msg.guild = Mock(id=1, get_member=Mock(return_value=Mock())); msg.author = Mock(id=1); msg.channel = Mock(name='research-and-development'); msg.reply = AsyncMock()
-            with patch.object(bnl01_bot, 'resolve_channel_policy', return_value='internal_controlled'), patch.object(bnl01_bot, 'can_send_dossier_recommendation', return_value=True), patch.object(bnl01_bot, '_generate_gemini_content_with_fallback', return_value=response):
+            with patch.object(bnl01_bot, 'resolve_channel_policy', return_value='internal_controlled'), patch.object(bnl01_bot, 'can_send_dossier_recommendation', return_value=True), patch.object(bnl01_bot, 'check_quota_availability', return_value=True), patch.object(bnl01_bot, '_generate_gemini_content_with_fallback', return_value=response):
                 handled = await bnl01_bot.maybe_handle_journal_command(msg, '!bnl journal create | hours=bad')
             self.assertTrue(handled)
             with sqlite3.connect(bnl01_bot.DB_FILE) as c:
