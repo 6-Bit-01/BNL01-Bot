@@ -63,6 +63,10 @@ class JournalTests(unittest.TestCase):
         self.assertNotIn('discord_user:7', prompt)
         self.assertNotIn('relationship_journal', json.dumps(packet))
         self.assertNotIn('secret internal', json.dumps(packet))
+        self.assertIn('community chronicle', prompt)
+        self.assertIn('Never call people entities or organisms', prompt)
+        self.assertIn('Do not invent nicknames', prompt)
+        self.assertIn('Juicy means lively pattern recognition', prompt)
 
     def test_no_hard_coded_fallback_and_malformed_repair_no_rows(self):
         calls = []
@@ -97,6 +101,26 @@ class JournalTests(unittest.TestCase):
                 1,
                 c.execute("SELECT COUNT(*) FROM bnl_journal_entries WHERE lifecycle_state='draft'").fetchone()[0],
             )
+
+    def test_clinical_or_sensitive_copy_gets_rejected_and_rewritten(self):
+        packet = self.packet()
+        clinical = j.parse_generated_json(article_json(packet, title='Clinical Pass', leak=' Records indicate continuous effort across entities.'))
+        sensitive = j.parse_generated_json(article_json(packet, title='Sensitive Pass', leak=' Interpersonal conflicts among juveniles continue.'))
+        self.assertEqual('overly_clinical_voice', j.validate_article(clinical, packet, []))
+        self.assertEqual('sensitive_personal_detail', j.validate_article(sensitive, packet, []))
+
+        calls = []
+        def gen(packet, prompt):
+            calls.append(prompt)
+            if len(calls) == 1:
+                return article_json(packet, title='Clinical First Pass', leak=' Records indicate continuous effort across entities.')
+            return article_json(packet, title='Lively Rewritten Pass')
+
+        res = j.generate_and_store_draft(self.db, 1, 24, gen)
+        self.assertTrue(res.ok, res.reason)
+        self.assertEqual(2, len(calls))
+        self.assertIn('overly_clinical_voice', calls[1])
+        self.assertIn('lively, concrete community chronicle', calls[1])
 
     def test_source_specific_generated_json_creates_draft(self):
         def gen(packet, prompt): return article_json(packet)

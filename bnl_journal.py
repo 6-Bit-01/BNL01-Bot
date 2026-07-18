@@ -27,7 +27,32 @@ _REPAIR_GUIDANCE = {
     "public_leak_pattern": "Remove every URL, mention, identifier, and internal implementation term from public prose.",
     "source_ref_leak": "Keep source reference tokens only inside sourceRefIds arrays; remove them from all public prose.",
     "invalid_word_count": "Rewrite the complete article so its total public word count is between 250 and 500 words.",
+    "overly_clinical_voice": (
+        "Rewrite it as a lively, concrete community chronicle in BNL's voice. Remove academic, laboratory, audit, "
+        "and corporate-report language. Refer to anonymous people as producers, listeners, regulars, or the room—not entities."
+    ),
+    "sensitive_personal_detail": (
+        "Remove personal or domestic details that are unnecessary to the public community story, including details "
+        "about minors, interpersonal conflict, caregiving, or household obligations."
+    ),
 }
+
+_OVERLY_CLINICAL_PATTERNS = (
+    r"\bnetwork log\s*:",
+    r"\balgorithmic (?:refinement|analysis|calibration)\b",
+    r"\bmorphogenesis\b",
+    r"\bperceptual filters?\b",
+    r"\b(?:entities|organisms)\b",
+    r"\brecords (?:indicate|reveal|document)\b",
+    r"\bobservations (?:indicate|reveal|document|highlight)\b",
+    r"\boperational settings?\b",
+)
+
+_SENSITIVE_PERSONAL_PATTERNS = (
+    r"\binterpersonal conflicts?\b",
+    r"\bjuveniles?\b",
+    r"\bfoster (?:obligations?|care|duties)\b",
+)
 
 
 @dataclass
@@ -261,10 +286,15 @@ def build_generation_prompt(packet: dict[str, Any], *, repair_reason: str = "", 
     return (
         "You are BNL-01 writing a BARCODE Network Journal entry. Return strict JSON only; no markdown fences."
         "\nSchema: {\"title\":str,\"excerpt\":str,\"sections\":[{\"heading\":str,\"body\":str,\"sourceRefIds\":[str]}],\"metadata\":{\"topicTags\":[],\"subjectRefs\":[],\"continuityNotes\":[],\"unresolvedQuestions\":[],\"confidenceFlags\":[],\"safetyFlags\":[]}}."
-        "\nWrite 1-3 sections and 250-500 total words. Use BNL's formal, observant, lightly uncanny voice. Make it entertaining and grounded in BARCODE music/community texture."
+        "\nWrite 1-3 sections and 250-500 total words; prefer 2 sections and roughly 300-420 words. Give every section a real narrative job instead of inventorying activity."
+        "\nWrite like BNL keeping a sly, lively community chronicle—not a lab report, audit, academic paper, corporate briefing, or raw relay summary. BNL may be witty, lightly nosy, and uncanny, but never cruel."
+        "\nBuild one coherent story around the most interesting grounded patterns. Use concrete music and community texture, active verbs, readable paragraphs, and selective detail. Avoid abstract jargon and inflated technical language."
+        "\nUse a short, vivid title of about 4-10 words. Do not prefix it with Network Log. Keep the excerpt compact and inviting."
+        "\nDescribe anonymous humans naturally as a producer, listener, regular, artist, or the room. Never call people entities or organisms. Do not invent nicknames, motives, relationships, dialogue, or conclusions."
         "\nEvery section must cite at least one fresh sourceRefId from the current window. Older Journal material is continuity only, never proof of current activity."
         "\nParaphrase every source summary. Never repeat any sequence of five or more consecutive words from a fresh source summary."
         "\nKeep community members anonymous. Do not include direct quotes, URLs, mentions, IDs, sourceRef tokens in public prose, private intent, relationships, harassment, or internal schema/storage terms."
+        "\nExclude personal or domestic details that are unnecessary to the public community story, especially details involving minors, interpersonal conflict, caregiving, or household obligations. Juicy means lively pattern recognition—not private gossip."
         f"{repair}\nGeneration-safe packet:\n{json.dumps(safe_packet, ensure_ascii=False, sort_keys=True)}"
     )
 
@@ -345,6 +375,10 @@ def validate_article(article: dict[str, Any], packet: dict[str, Any], prior_titl
         name = str(src.get("displayName") or "").strip()
         if name and name not in names and re.search(r"\b" + re.escape(name) + r"\b", public_text, re.I):
             return "community_name_leak"
+    if any(re.search(pattern, public_text, re.I) for pattern in _SENSITIVE_PERSONAL_PATTERNS):
+        return "sensitive_personal_detail"
+    if any(re.search(pattern, public_text, re.I) for pattern in _OVERLY_CLINICAL_PATTERNS):
+        return "overly_clinical_voice"
     normalized_public = _norm(public_text)
     for src in packet.get("privateSources", []):
         summary = str(src.get("summary") or "")
