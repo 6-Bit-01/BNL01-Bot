@@ -12,7 +12,6 @@ import pytz
 from bnl_journal import (
     JournalResult,
     approve_draft,
-    build_packet_from_sources,
     build_source_packet_between,
     deliver_approved,
     generate_and_store_packet_draft,
@@ -422,38 +421,30 @@ def _weekly_packet(db_path: str, guild_id: int, start: str, end: str) -> tuple[O
     # reached a durable terminal state. Held/incomplete days are excluded.
     if len(complete) < 7 or len(active) < MIN_WEEKLY_ACTIVE_DAYS:
         return None, len(complete), len(active)
-    relays: list[dict[str, Any]] = []
-    conversations: list[dict[str, Any]] = []
     observation_context: list[dict[str, Any]] = []
-    totals = {"eligibleRelays": 0, "eligibleConversations": 0, "participants": 0, "channels": 0}
-    seen_subjects: set[str] = set()
     for row in complete:
         counts = json.loads(row["aggregate_counts_json"] or "{}")
         topics = json.loads(row["topic_counts_json"] or "{}")
-        subjects = json.loads(row["subject_counts_json"] or "{}")
-        for key in ("eligibleRelays", "eligibleConversations"):
-            totals[key] += int(counts.get(key) or 0)
-        seen_subjects.update(subjects)
         entry = daily_entries.get(row["journal_entry_id"] or "", {})
         observation_context.append({
             "date": row["observation_date"], "state": row["lifecycle_state"], "counts": counts,
             "topicCounts": topics, "dailyEntryId": row["journal_entry_id"] or "",
             "dailyTitle": entry.get("title", ""), "dailyExcerpt": entry.get("excerpt", ""),
         })
-        for idx, source in enumerate(json.loads(row["representative_sources_json"] or "[]"), 1):
-            item = dict(source)
-            item["refId"] = f"week:{row['observation_date'].replace('-', '')}:{idx}"
-            if item.get("sourceKind") == "conversation":
-                conversations.append(item)
-            else:
-                relays.append(item)
-    totals["participants"] = len(seen_subjects)
-    totals["daysObserved"] = len(complete)
-    totals["activeDays"] = len(active)
-    packet = build_packet_from_sources(
-        db_path, guild_id, start, end, relays, conversations,
-        entry_kind="weekly", aggregate_counts=totals, observation_context=observation_context,
+    # Re-read the durable full-week archive and sample it exactly once. Reusing
+    # already-sampled daily representatives caused busy weeks to be compressed
+    # twice and discarded the private display-name set needed for the normal
+    # cross-participant sanitization pass.
+    packet = build_source_packet_between(
+        db_path,
+        guild_id,
+        start,
+        end,
+        entry_kind="weekly",
+        observation_context=observation_context,
     )
+    packet.setdefault("aggregateCounts", {})["daysObserved"] = len(complete)
+    packet["aggregateCounts"]["activeDays"] = len(active)
     return packet, len(complete), len(active)
 
 
@@ -481,6 +472,10 @@ def run_weekly(
         result = AutomationResult(True, "weekly", "quiet", "no_meaningful_weekly_activity", source_window_start=start, source_window_end=end, aggregate_counts={"completeDays": complete_days, "activeDays": active_days})
     elif packet is None:
         result = AutomationResult(True, "weekly", "deferred", f"only_{complete_days}_complete_daily_observations", source_window_start=start, source_window_end=end, aggregate_counts={"completeDays": complete_days, "activeDays": active_days})
+    elif not packet.get("sourceArchiveAvailable", False):
+        result = AutomationResult(False, "weekly", "held", "source_archive_unavailable", source_window_start=start, source_window_end=end, aggregate_counts=packet.get("aggregateCounts"))
+    elif not packet.get("coverageComplete", True):
+        result = AutomationResult(False, "weekly", "incomplete", "window_began_before_archive_activation", source_window_start=start, source_window_end=end, aggregate_counts=packet.get("aggregateCounts"))
     else:
         result = _publish_packet(db_path, guild_id, "weekly", label, packet, generator, base_url, api_key, opener=opener)
     return _finish_run(db_path, run_id, result)
