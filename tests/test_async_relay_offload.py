@@ -1,5 +1,7 @@
 import asyncio
 import os
+import subprocess
+import sys
 import threading
 import unittest
 from types import SimpleNamespace
@@ -16,6 +18,34 @@ def gemini_response(text="BNL relay response.", tokens=17):
         candidates=[SimpleNamespace(content=SimpleNamespace(parts=[SimpleNamespace(text=text)]))],
         usage_metadata=SimpleNamespace(total_token_count=tokens),
     )
+
+
+class GeminiClientLifecycleTests(unittest.TestCase):
+    def test_module_import_does_not_construct_gemini_client(self):
+        probe = """
+from google import genai
+def fail_if_constructed(*args, **kwargs):
+    raise RuntimeError('Gemini client constructed during import')
+genai.Client = fail_if_constructed
+import bnl01_bot
+assert bnl01_bot.gemini_client is None
+"""
+        completed = subprocess.run(
+            [sys.executable, "-c", probe],
+            cwd=os.path.dirname(os.path.dirname(__file__)),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+
+    def test_gemini_client_is_created_once_on_first_generation(self):
+        fake_client = SimpleNamespace(models=SimpleNamespace(generate_content=mock.Mock()))
+        with mock.patch.object(bnl01_bot, "gemini_client", None), \
+             mock.patch.object(bnl01_bot.genai, "Client", return_value=fake_client) as factory:
+            self.assertIs(bnl01_bot.get_gemini_client(), fake_client)
+            self.assertIs(bnl01_bot.get_gemini_client(), fake_client)
+        factory.assert_called_once_with(api_key=bnl01_bot.GEMINI_API_KEY)
 
 
 class GeminiOffloadTests(unittest.IsolatedAsyncioTestCase):
@@ -49,7 +79,8 @@ class GeminiOffloadTests(unittest.IsolatedAsyncioTestCase):
                 raise Exception("503 service unavailable")
             return gemini_response("fallback ok", 5)
 
-        with mock.patch.object(bnl01_bot.gemini_client.models, "generate_content", side_effect=fake_generate_content):
+        fake_client = SimpleNamespace(models=SimpleNamespace(generate_content=mock.Mock(side_effect=fake_generate_content)))
+        with mock.patch.object(bnl01_bot, "gemini_client", fake_client):
             response = await bnl01_bot._generate_gemini_content_with_fallback_async("contents", "fallback_route")
 
         self.assertEqual(bnl01_bot._extract_text_and_tokens(response), ("fallback ok", 5))

@@ -239,23 +239,27 @@ class WebsiteRelayEventDrivenTests(unittest.TestCase):
     def test_timed_out_generation_is_cancelled_and_cannot_publish_late(self):
         original_timeout = bnl01_bot.BNL_WEBSITE_RELAY_GENERATION_TIMEOUT_SECONDS
         bnl01_bot.BNL_WEBSITE_RELAY_GENERATION_TIMEOUT_SECONDS = 0.01
-        cancelled = asyncio.Event()
-        async def slow_generation(guild_id):
-            try:
-                await asyncio.sleep(1)
-            except asyncio.CancelledError:
-                cancelled.set()
-                raise
         async def run_one():
+            cancelled = asyncio.Event()
+
+            async def slow_generation(guild_id):
+                try:
+                    await asyncio.sleep(1)
+                except asyncio.CancelledError:
+                    cancelled.set()
+                    raise
+
             with mock.patch.object(bnl01_bot, "generate_dynamic_website_relay", side_effect=slow_generation), \
                  mock.patch.object(bnl01_bot, "update_website_status_controlled_async", side_effect=AssertionError("posted late")):
-                return await bnl01_bot._execute_website_relay_transaction(42, source="relay")
+                decision = await bnl01_bot._execute_website_relay_transaction(42, source="relay")
+                return decision, cancelled.is_set()
         try:
-            decision = asyncio.run(run_one())
+            decision, was_cancelled = asyncio.run(run_one())
         finally:
             bnl01_bot.BNL_WEBSITE_RELAY_GENERATION_TIMEOUT_SECONDS = original_timeout
         self.assertFalse(decision.publish)
         self.assertEqual(decision.skipReason, "relay_generation_timeout")
+        self.assertTrue(was_cancelled)
 
     def test_restart_hydration_uses_newest_eight_lanes(self):
         lanes = [f"lane_{i}" for i in range(10)]
