@@ -120,6 +120,7 @@ import urllib.error
 import urllib.parse
 import calendar
 import time
+import threading
 
 from bnl_dossier_candidate_discovery import (
     DEFAULT_DISCOVERY_LANES,
@@ -332,8 +333,19 @@ DAILY_TOKEN_LIMIT = 1_350_000
 PACIFIC_TZ = pytz.timezone("US/Pacific")
 DB_FILE = "bnl01_conversations.db"
 
-# Initialize Gemini client once
-gemini_client = genai.Client(api_key=GEMINI_API_KEY)
+# The provider client owns HTTP transports and proxy discovery. Keep module
+# import side-effect free; construct and cache it only when generation starts.
+gemini_client = None
+_gemini_client_lock = threading.Lock()
+
+
+def get_gemini_client():
+    global gemini_client
+    if gemini_client is None:
+        with _gemini_client_lock:
+            if gemini_client is None:
+                gemini_client = genai.Client(api_key=GEMINI_API_KEY)
+    return gemini_client
 
 # ======== BATCHED REPLY CONFIG (ACTIVE CHANNEL) ========
 BATCH_WINDOW_SECONDS = 4
@@ -13194,9 +13206,10 @@ async def _generate_gemini_content_result_async(contents: str, route: str) -> Ge
 
 
 def _generate_gemini_content_with_fallback(contents: str, route: str):
+    client = get_gemini_client()
     logging.info(f"gemini_model_attempt model={GEMINI_MODEL} route={route}")
     try:
-        return gemini_client.models.generate_content(
+        return client.models.generate_content(
             model=_gemini_model_resource_name(GEMINI_MODEL),
             contents=contents
         )
@@ -13210,7 +13223,7 @@ def _generate_gemini_content_with_fallback(contents: str, route: str):
         )
         logging.info(f"gemini_model_attempt model={GEMINI_FALLBACK_MODEL} route={route}")
         try:
-            response = gemini_client.models.generate_content(
+            response = client.models.generate_content(
                 model=_gemini_model_resource_name(GEMINI_FALLBACK_MODEL),
                 contents=contents
             )

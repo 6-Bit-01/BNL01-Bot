@@ -608,7 +608,8 @@ class SubjectMemoryResolverTests(unittest.TestCase):
             }
             result = draft.generate_dossier_draft(p, tmp.name)["draft"]
             self.assertNotEqual(result["role"], "Music artist")
-            self.assertIn("limited public-safe source detail", result["summary"])
+            self.assertIn("public-facing details still being confirmed", result["summary"])
+            self.assertNotIn("unconfirmed music artist", result["summary"])
             self.assertTrue(any("resolver scanned" in x for x in result["ownerReviewWarnings"]))
 
     def test_draft_music_role_requires_public_safe_music(self):
@@ -620,7 +621,8 @@ class SubjectMemoryResolverTests(unittest.TestCase):
             p = {"requestType": "bnl_proposed_dossier_draft", "version": "1.0", "candidate": {"sourceFileId": "sf_crow", "subjectName": "Crow"}, "publicSafeFacts": [], "publicSafeNotes": [], "stylePacket": {}, "fieldRequirements": ["summary"], "safeClassification": {"category": "Unknown", "kind": "Person", "ecosystemLane": "Unknown"}}
             result = draft.generate_dossier_draft(p, tmp.name)["draft"]
             self.assertEqual(result["role"], "Music artist")
-            self.assertIn("subject memory resolver", result["sourceUsageSummary"])
+            self.assertIn("public-safe structured entity evidence summary", result["sourceUsageSummary"])
+            self.assertNotIn("subject memory resolver", result["sourceUsageSummary"])
 
     def test_contest_context_lanes_do_not_infer_organizer_and_humanize_labels(self):
         analyst = build_subject_analyst_read("Crow", {
