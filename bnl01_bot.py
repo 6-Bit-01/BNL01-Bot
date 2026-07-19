@@ -5990,6 +5990,15 @@ def _journal_control_flags(control: dict | None, fallback: dict) -> dict:
             value = control.get(key, config.get(key))
             if isinstance(value, bool):
                 flags[key] = value
+        excluded = control.get("memoryExcludedEntryIds")
+        if isinstance(excluded, list):
+            flags["journalMemoryExcludedEntryIds"] = list(dict.fromkeys(
+                entry_id
+                for item in excluded
+                if isinstance(item, str)
+                for entry_id in [item.strip()]
+                if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,159}", entry_id)
+            ))
     return flags
 
 
@@ -6141,6 +6150,7 @@ async def run_journal_automation_once(
             effective_flags = flags
             if effective_flags is None:
                 effective_flags = await asyncio.to_thread(get_bnl_control_flags, force_refresh=force)
+            memory_excluded_entry_ids = set(effective_flags.get("journalMemoryExcludedEntryIds") or [])
             if not effective_flags.get("journalAutoPublishEnabled", True):
                 results = [_journal_control_result(cadence, "paused", "auto_publish_paused")]
             elif cadence == "daily" and not effective_flags.get("journalDailyEnabled", True):
@@ -6156,6 +6166,7 @@ async def run_journal_automation_once(
                     _journal_website_base_url(),
                     BNL_API_KEY,
                     force=force,
+                    memory_excluded_entry_ids=memory_excluded_entry_ids,
                 )
                 results = [journal_automation_result_dict(result)]
             elif cadence == "weekly":
@@ -6167,6 +6178,7 @@ async def run_journal_automation_once(
                     _journal_website_base_url(),
                     BNL_API_KEY,
                     force=force,
+                    memory_excluded_entry_ids=memory_excluded_entry_ids,
                 )
                 results = [journal_automation_result_dict(result)]
             else:
@@ -6336,7 +6348,16 @@ async def maybe_handle_journal_command(message: discord.Message, clean_content: 
             return True
         if action == "create":
             hours = _parse_journal_hours(options.get("hours") or options.get("window"))
-            result = await asyncio.to_thread(generate_and_store_journal_draft, DB_FILE, guild_id, hours, _generate_journal_json_sync)
+            control, _ = await asyncio.to_thread(_journal_control_request_sync, "GET")
+            flags = _journal_control_flags(control, {})
+            result = await asyncio.to_thread(
+                generate_and_store_journal_draft,
+                DB_FILE,
+                guild_id,
+                hours,
+                _generate_journal_json_sync,
+                excluded_history_entry_ids=set(flags.get("journalMemoryExcludedEntryIds") or []),
+            )
             if not result.ok:
                 await message.reply(f"Journal draft not created: `{result.reason}`")
                 return True
@@ -6345,7 +6366,17 @@ async def maybe_handle_journal_command(message: discord.Message, clean_content: 
         if action == "regenerate":
             entry_id = options.get("entry_id") or ""
             hours = _parse_journal_hours(options.get("hours") or options.get("window"))
-            result = await asyncio.to_thread(regenerate_journal_draft, DB_FILE, guild_id, entry_id, hours, _generate_journal_json_sync)
+            control, _ = await asyncio.to_thread(_journal_control_request_sync, "GET")
+            flags = _journal_control_flags(control, {})
+            result = await asyncio.to_thread(
+                regenerate_journal_draft,
+                DB_FILE,
+                guild_id,
+                entry_id,
+                hours,
+                _generate_journal_json_sync,
+                excluded_history_entry_ids=set(flags.get("journalMemoryExcludedEntryIds") or []),
+            )
             if not result.ok:
                 await message.reply(f"Journal regeneration failed: `{result.reason}`")
                 return True

@@ -379,6 +379,7 @@ def run_daily(
     target_day: Optional[date] = None,
     force: bool = False,
     opener=None,
+    memory_excluded_entry_ids: Optional[set[str]] = None,
 ) -> AutomationResult:
     ensure_schema(db_path)
     start, end, label = _daily_period_for_day(target_day) if target_day else daily_period(now_utc)
@@ -387,7 +388,14 @@ def run_daily(
     claim, run_id, row = _claim_run(db_path, guild_id, "daily", start, end, force=force)
     if claim != "claimed":
         return _result_from_existing("daily", row, claim=claim)
-    packet = build_source_packet_between(db_path, guild_id, start, end, entry_kind="daily")
+    packet = build_source_packet_between(
+        db_path,
+        guild_id,
+        start,
+        end,
+        entry_kind="daily",
+        excluded_history_entry_ids=memory_excluded_entry_ids,
+    )
     _store_observation(db_path, guild_id, label, packet)
     if not packet.get("sourceArchiveAvailable", False):
         result = AutomationResult(False, "daily", "held", "source_archive_unavailable", source_window_start=start, source_window_end=end, aggregate_counts=packet.get("aggregateCounts"))
@@ -403,8 +411,16 @@ def run_daily(
     return _finish_run(db_path, run_id, result)
 
 
-def _weekly_packet(db_path: str, guild_id: int, start: str, end: str) -> tuple[Optional[dict[str, Any]], int, int]:
+def _weekly_packet(
+    db_path: str,
+    guild_id: int,
+    start: str,
+    end: str,
+    *,
+    memory_excluded_entry_ids: Optional[set[str]] = None,
+) -> tuple[Optional[dict[str, Any]], int, int]:
     ensure_schema(db_path)
+    excluded = {str(entry_id) for entry_id in (memory_excluded_entry_ids or set()) if str(entry_id)}
     with sqlite3.connect(db_path) as conn:
         conn.row_factory = sqlite3.Row
         observations = conn.execute("""SELECT * FROM bnl_journal_observations
@@ -425,10 +441,11 @@ def _weekly_packet(db_path: str, guild_id: int, start: str, end: str) -> tuple[O
     for row in complete:
         counts = json.loads(row["aggregate_counts_json"] or "{}")
         topics = json.loads(row["topic_counts_json"] or "{}")
-        entry = daily_entries.get(row["journal_entry_id"] or "", {})
+        daily_entry_id = str(row["journal_entry_id"] or "")
+        entry = daily_entries.get(daily_entry_id, {}) if daily_entry_id not in excluded else {}
         observation_context.append({
             "date": row["observation_date"], "state": row["lifecycle_state"], "counts": counts,
-            "topicCounts": topics, "dailyEntryId": row["journal_entry_id"] or "",
+            "topicCounts": topics, "dailyEntryId": "" if daily_entry_id in excluded else daily_entry_id,
             "dailyTitle": entry.get("title", ""), "dailyExcerpt": entry.get("excerpt", ""),
         })
     # Re-read the durable full-week archive and sample it exactly once. Reusing
@@ -442,6 +459,7 @@ def _weekly_packet(db_path: str, guild_id: int, start: str, end: str) -> tuple[O
         end,
         entry_kind="weekly",
         observation_context=observation_context,
+        excluded_history_entry_ids=excluded,
     )
     packet.setdefault("aggregateCounts", {})["daysObserved"] = len(complete)
     packet["aggregateCounts"]["activeDays"] = len(active)
@@ -459,6 +477,7 @@ def run_weekly(
     target_monday: Optional[date] = None,
     force: bool = False,
     opener=None,
+    memory_excluded_entry_ids: Optional[set[str]] = None,
 ) -> AutomationResult:
     ensure_schema(db_path)
     start, end, label = _weekly_period_for_monday(target_monday) if target_monday else weekly_period(now_utc)
@@ -467,7 +486,13 @@ def run_weekly(
     claim, run_id, row = _claim_run(db_path, guild_id, "weekly", start, end, force=force)
     if claim != "claimed":
         return _result_from_existing("weekly", row, claim=claim)
-    packet, complete_days, active_days = _weekly_packet(db_path, guild_id, start, end)
+    packet, complete_days, active_days = _weekly_packet(
+        db_path,
+        guild_id,
+        start,
+        end,
+        memory_excluded_entry_ids=memory_excluded_entry_ids,
+    )
     if packet is None and complete_days == 7 and active_days == 0:
         result = AutomationResult(True, "weekly", "quiet", "no_meaningful_weekly_activity", source_window_start=start, source_window_end=end, aggregate_counts={"completeDays": complete_days, "activeDays": active_days})
     elif packet is None:
@@ -573,6 +598,11 @@ def run_scheduled(
     opener=None,
 ) -> list[AutomationResult]:
     controls = flags or {}
+    memory_excluded_entry_ids = {
+        str(entry_id)
+        for entry_id in controls.get("journalMemoryExcludedEntryIds", [])
+        if str(entry_id)
+    }
     if not bool(controls.get("journalAutoPublishEnabled", True)):
         return [AutomationResult(False, "all", "paused", "auto_publish_paused")]
     try:
@@ -585,11 +615,11 @@ def run_scheduled(
     if bool(controls.get("journalDailyEnabled", True)):
         target_day = _pending_daily_day(db_path, guild_id, now_utc)
         if target_day is not None:
-            results.append(run_daily(db_path, guild_id, generator, base_url, api_key, now_utc=now_utc, target_day=target_day, opener=opener))
+            results.append(run_daily(db_path, guild_id, generator, base_url, api_key, now_utc=now_utc, target_day=target_day, opener=opener, memory_excluded_entry_ids=memory_excluded_entry_ids))
     if bool(controls.get("journalWeeklyEnabled", True)):
         target_monday = _pending_week_monday(db_path, guild_id, now_utc)
         if target_monday is not None:
-            results.append(run_weekly(db_path, guild_id, generator, base_url, api_key, now_utc=now_utc, target_monday=target_monday, opener=opener))
+            results.append(run_weekly(db_path, guild_id, generator, base_url, api_key, now_utc=now_utc, target_monday=target_monday, opener=opener, memory_excluded_entry_ids=memory_excluded_entry_ids))
     return results or [AutomationResult(False, "all", "not_due", "no_schedule_due")]
 
 

@@ -7,6 +7,7 @@ import unittest
 from unittest import mock
 
 import bnl_journal_source_store as source_store
+from bnl_journal_automation import AutomationResult
 
 os.environ.setdefault("GEMINI_API_KEY", "test-key")
 os.environ.setdefault("DISCORD_BOT_TOKEN", "test-token")
@@ -142,6 +143,37 @@ class JournalRuntimeControlTests(unittest.TestCase):
         daily.assert_not_called()
         self.assertEqual("paused", results[0]["status"])
         self.assertEqual("daily_automation_paused", results[0]["reason"])
+
+    def test_entry_memory_exclusions_are_sanitized_and_forwarded(self):
+        flags = bnl01_bot._journal_control_flags(
+            {
+                "config": {},
+                "memoryExcludedEntryIds": [
+                    " journal_valid-1 ",
+                    "journal_valid-1",
+                    "../invalid",
+                    "",
+                    123,
+                ],
+            },
+            {
+                "journalAutoPublishEnabled": True,
+                "journalDailyEnabled": True,
+                "journalWeeklyEnabled": True,
+            },
+        )
+        self.assertEqual(["journal_valid-1"], flags["journalMemoryExcludedEntryIds"])
+
+        result = AutomationResult(True, "daily", "quiet", aggregate_counts={})
+        with mock.patch.object(bnl01_bot, "BNL_JOURNAL_AUTOMATION_ENABLED", True), \
+             mock.patch.object(bnl01_bot, "BNL_PRIMARY_GUILD_ID", 0), \
+             mock.patch.object(bnl01_bot, "run_daily_journal_automation", return_value=result) as daily:
+            asyncio.run(bnl01_bot.run_journal_automation_once(1, cadence="daily", force=True, flags=flags))
+
+        self.assertEqual(
+            {"journal_valid-1"},
+            daily.call_args.kwargs["memory_excluded_entry_ids"],
+        )
 
     def test_control_flag_fetch_failure_retains_confirmed_pause(self):
         paused = {

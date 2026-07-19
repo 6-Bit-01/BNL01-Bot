@@ -179,6 +179,35 @@ class JournalEvidenceVoiceTests(unittest.TestCase):
         self.assertEqual("rhythm", packet["candidateTopicTags"][0])
         self.assertLess(packet["candidateTopicTags"].index("zebra"), packet["candidateTopicTags"].index("alpha"))
 
+    def test_memory_ineligible_entries_are_absent_from_all_history_lanes(self):
+        first = journal.store_validated_draft(self.db, 1, self.packet, _article(self.packet))
+        self.assertTrue(first.ok, first.reason)
+        with journal.sqlite3.connect(self.db) as conn:
+            conn.execute(
+                "UPDATE bnl_journal_entries SET lifecycle_state='published',published_at='2026-07-20T08:00:00Z' WHERE entry_id=?",
+                (first.entry_id,),
+            )
+            conn.execute(
+                "UPDATE bnl_journal_private_metadata SET lifecycle_state='published' WHERE entry_id=?",
+                (first.entry_id,),
+            )
+
+        included = journal.retrieve_history(self.db, 1, self.packet)
+        self.assertEqual(first.entry_id, included["previousEntry"]["entry_id"])
+        self.assertTrue(included["recurringTopicCounts"])
+
+        excluded = journal.retrieve_history(
+            self.db,
+            1,
+            self.packet,
+            excluded_entry_ids={first.entry_id},
+        )
+        self.assertIsNone(excluded["previousEntry"])
+        self.assertEqual([], excluded["relevantOlderEntries"])
+        self.assertEqual({}, excluded["recurringTopicCounts"])
+        self.assertEqual([], excluded["matchingContinuityNotes"])
+        self.assertEqual([], excluded["matchingUnresolvedQuestions"])
+
     def test_history_prompt_keeps_bounded_public_prose_without_private_questions(self):
         entry = {
             "entry_id": "journal-old",
