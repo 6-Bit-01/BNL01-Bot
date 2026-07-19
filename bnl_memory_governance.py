@@ -19,6 +19,8 @@ import sqlite3
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 from bnl_dossier_source_packets import subject_key as normalized_subject_key
+from bnl_journal import purge_user_journal_derivatives_on_connection
+from bnl_journal_source_store import purge_user_discord_sources_on_connection
 from bnl_memory_ledger import ensure_memory_ledger_schema, subject_key_for_user
 from bnl_relationship_engine import complete_delete_relationship_v2, ensure_relationship_v2_schema, propagate_ledger_lifecycle
 
@@ -669,6 +671,15 @@ def complete_delete_member_data(conn: sqlite3.Connection, *, guild_id: int, user
         # Delete shadow runs and prior receipts for this member only in this guild.
         counts["memory_governance_shadow_runs"] = conn.execute("DELETE FROM memory_governance_shadow_runs WHERE guild_id=? AND subject_hash=?", (guild_id, subject_hash)).rowcount if _table_exists(conn, "memory_governance_shadow_runs") else 0
         counts["prior_governance_receipts"] = conn.execute("DELETE FROM memory_governance_receipts WHERE guild_id=? AND subject_hash=?", (guild_id, subject_hash)).rowcount
+        # The Journal source archive is normally immutable. Complete deletion is
+        # the governed, transaction-scoped exception for this member's raw Discord
+        # inputs; website relays and other members/guilds remain untouched.
+        counts["bnl_journal_source_events"] = purge_user_discord_sources_on_connection(
+            conn, guild_id=guild_id, user_id=user_id
+        )
+        counts.update(purge_user_journal_derivatives_on_connection(
+            conn, guild_id=guild_id, user_id=user_id
+        ))
         if inject_failure: raise RuntimeError("injected_complete_delete_failure")
         safe_counts = {k: int(v or 0) for k, v in counts.items() if int(v or 0)}
         conn.execute("INSERT INTO memory_governance_receipts VALUES (?,?,?,?,?,?,?)", (rid, guild_id, subject_hash, "complete_delete", "", now, json.dumps(safe_counts, sort_keys=True)))

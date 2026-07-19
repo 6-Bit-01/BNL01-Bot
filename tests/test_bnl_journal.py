@@ -35,6 +35,8 @@ class Resp:
 
 class JournalTests(unittest.TestCase):
     def setUp(self):
+        self.clock = patch.object(j, "utc_now_iso", return_value="2026-07-18T01:00:00Z")
+        self.clock.start()
         self.tmp = tempfile.NamedTemporaryFile(delete=False); self.db = self.tmp.name; self.tmp.close(); j.ensure_schema(self.db)
         with sqlite3.connect(self.db) as c:
             c.execute("CREATE TABLE website_relay_history(relay_id TEXT PRIMARY KEY,guild_id INTEGER,public_message TEXT,public_directive TEXT,mode TEXT,relay_lane TEXT,event_type TEXT,highest_source_conversation_id INTEGER,normalized_message TEXT,semantic_family TEXT,published_timestamp TEXT)")
@@ -51,6 +53,9 @@ class JournalTests(unittest.TestCase):
             c.execute("CREATE TABLE relationship_journal(id INTEGER,user_id INTEGER,guild_id INTEGER,entry_type TEXT,summary TEXT,timestamp TEXT)")
             c.execute("INSERT INTO relationship_journal VALUES (1,7,1,'state','private relationship dirt','2026-07-18T00:00:00Z')")
 
+    def tearDown(self):
+        self.clock.stop()
+
     def packet(self):
         return j.build_source_packet(self.db, 1, 24, '2026-07-18T01:00:00Z')
 
@@ -58,7 +63,7 @@ class JournalTests(unittest.TestCase):
         packet = self.packet()
         self.assertEqual(len([s for s in packet['privateSources'] if s['sourceKind'] == 'conversation']), 2)
         prompt = j.build_generation_prompt(packet)
-        self.assertIn('fresh:101', prompt)
+        self.assertIn('"sourceKind": "conversation"', prompt)
         self.assertNotIn('KnownUser', prompt)
         self.assertNotIn('discord_user:7', prompt)
         self.assertNotIn('relationship_journal', json.dumps(packet))
@@ -239,6 +244,22 @@ class JournalTests(unittest.TestCase):
         def missing(req, timeout=10): raise urllib.error.HTTPError(req.full_url, 404, 'not found', {}, io.BytesIO())
         d2 = j.deliver_approved(self.db, 1, res2.entry_id, 'https://site.example', 'k', missing)
         self.assertFalse(d2.ok); self.assertEqual(d2.reason, 'endpoint_not_found')
+
+    def test_rehydrate_replays_exact_published_payload_without_regeneration(self):
+        res = j.generate_and_store_draft(self.db, 1, 24, lambda p, pr: article_json(p, 'Restore Me')); self.assertTrue(res.ok)
+        self.assertTrue(j.approve_draft(self.db, 1, res.entry_id, res.content_hash).ok)
+        payloads = []
+        def opener(req, timeout=10):
+            payloads.append(req.data)
+            submitted = json.loads(req.data.decode())['entry']
+            return Resp(json.dumps({"ok": True, "persisted": True, "idempotent": False, "entry": {"entryId": submitted['entryId'], "revision": submitted['revision'], "contentHash": submitted['contentHash'], "publishedAt": "2026-07-18T01:00:00Z"}}).encode())
+        self.assertTrue(j.deliver_approved(self.db, 1, res.entry_id, 'https://site.example', 'k', opener).ok)
+        restored = j.rehydrate_published_entries(self.db, 1, 'https://site.example', 'k', opener=opener)
+        self.assertTrue(restored['ok'], restored)
+        self.assertEqual(1, restored['restored'])
+        self.assertEqual(payloads[0], payloads[1])
+        with sqlite3.connect(self.db) as c:
+            self.assertEqual('published', c.execute("SELECT lifecycle_state FROM bnl_journal_entries WHERE entry_id=?", (res.entry_id,)).fetchone()[0])
 
 
 class BotJournalCommandTests(unittest.IsolatedAsyncioTestCase):

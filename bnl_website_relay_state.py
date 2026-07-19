@@ -8,6 +8,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
+from bnl_journal_source_store import record_source_event, timestamp_to_epoch_ms
+
 MAX_HISTORY = 25
 MAX_ATTEMPTS_PER_GUILD = 100
 STOCK_FAMILIES = {
@@ -194,11 +196,15 @@ def stock_directive_reason(directive: str) -> str:
 
 def recent_history(db_path: str, guild_id: int, limit: int = MAX_HISTORY) -> list[dict[str, Any]]:
     ensure_schema(db_path)
+    # The relay table is now a durable journal source archive.  Keep the
+    # operational duplicate-detection view bounded without deleting older
+    # rows that daily and weekly journals still need.
+    bounded_limit = max(0, min(int(limit), MAX_HISTORY))
     with sqlite3.connect(db_path) as conn:
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
             "SELECT * FROM website_relay_history WHERE guild_id=? ORDER BY published_timestamp DESC LIMIT ?",
-            (guild_id, limit),
+            (guild_id, bounded_limit),
         ).fetchall()
     return [dict(r) for r in rows]
 
@@ -295,9 +301,26 @@ def record_publication(db_path: str, guild_id: int, *, message: str, directive: 
             INSERT INTO website_relay_history(relay_id,guild_id,public_message,public_directive,mode,relay_lane,event_type,highest_source_conversation_id,normalized_message,semantic_family,published_timestamp)
             VALUES(?,?,?,?,?,?,?,?,?,?,?)
             """, (relay_id, guild_id, message, directive, mode, relay_lane, event_type, int(source_cursor or 0), norm, fam, ts))
-        old = conn.execute("SELECT relay_id FROM website_relay_history WHERE guild_id=? ORDER BY published_timestamp DESC LIMIT -1 OFFSET ?", (guild_id, MAX_HISTORY)).fetchall()
-        if old:
-            conn.executemany("DELETE FROM website_relay_history WHERE relay_id=?", [(r[0],) for r in old])
+    occurred_at_ms = timestamp_to_epoch_ms(ts)
+    if occurred_at_ms is not None:
+        try:
+            record_source_event(
+                db_path,
+                guild_id=guild_id,
+                source_kind="website_relay",
+                source_key=relay_id,
+                occurred_at_ms=occurred_at_ms,
+                raw_text=message + (("\n" + directive) if directive else ""),
+                channel_policy="public_relay",
+                subject_ref="bnl_01",
+                private_display_name="BNL-01",
+                public_usable=True,
+                metadata={"event_type": event_type, "mode": mode, "relay_lane": relay_lane, "source_cursor": int(source_cursor or 0)},
+            )
+        except Exception:
+            # Relay delivery must remain available if the local archive is
+            # temporarily unhealthy; the retained relay row can be backfilled.
+            pass
     return relay_id
 
 
@@ -337,9 +360,24 @@ def hydrate_publication(db_path: str, guild_id: int, *, relay_id: str, message: 
         INSERT INTO website_relay_history(relay_id,guild_id,public_message,public_directive,mode,relay_lane,event_type,highest_source_conversation_id,normalized_message,semantic_family,published_timestamp)
         VALUES(?,?,?,?,?,?,?,?,?,?,?)
         """, (relay_id, guild_id, message, directive, "OBSERVATION", "hydrated", source_class or trigger or "hydrated", 0, norm, fam, published_timestamp))
-        old = conn.execute("SELECT relay_id FROM website_relay_history WHERE guild_id=? ORDER BY published_timestamp DESC LIMIT -1 OFFSET ?", (guild_id, MAX_HISTORY)).fetchall()
-        if old:
-            conn.executemany("DELETE FROM website_relay_history WHERE relay_id=?", [(r[0],) for r in old])
+    occurred_at_ms = timestamp_to_epoch_ms(published_timestamp)
+    if occurred_at_ms is not None:
+        try:
+            record_source_event(
+                db_path,
+                guild_id=guild_id,
+                source_kind="website_relay",
+                source_key=relay_id,
+                occurred_at_ms=occurred_at_ms,
+                raw_text=message + (("\n" + directive) if directive else ""),
+                channel_policy="public_relay",
+                subject_ref="bnl_01",
+                private_display_name="BNL-01",
+                public_usable=True,
+                metadata={"event_type": source_class or trigger or "hydrated", "mode": "OBSERVATION", "relay_lane": "hydrated"},
+            )
+        except Exception:
+            pass
     return True
 
 def complete_attempt(db_path: str, attempt_id: str, *, source_class: str, outcome: str, reason: str = "", aggregate_source_counts: dict[str, int] | None = None, cursor: int = 0, highest_eligible_conversation_id: int = 0, accepted_relay_id: str = "", prepared_relay_id: str = "", website_published_at: str = "", idempotent: bool = False) -> None:
