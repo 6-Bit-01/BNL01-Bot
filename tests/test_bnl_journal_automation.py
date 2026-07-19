@@ -101,9 +101,11 @@ class JournalAutomationTests(unittest.TestCase):
         self.archive_clock.stop()
 
     def add_day(self, day, guild_id=1):
+        start, _, _ = automation._daily_period_for_day(date.fromisoformat(day))
+        start_utc = datetime.fromisoformat(start.replace("Z", "+00:00"))
         with sqlite3.connect(self.db) as conn:
             for index in range(6):
-                stamp = f"{day}T12:{index:02d}:00Z"
+                stamp = (start_utc + timedelta(hours=1, minutes=index)).isoformat().replace("+00:00", "Z")
                 conn.execute(
                     "INSERT INTO website_relay_history VALUES(?,?,?,?,?,?,?,?,?,?,?)",
                     (
@@ -151,9 +153,50 @@ class JournalAutomationTests(unittest.TestCase):
                 (activated_ms, activated_ms),
             )
 
+    def test_schedule_uses_seven_pm_pacific_and_tracks_daylight_saving(self):
+        before_daily = datetime(2026, 7, 21, 1, 59, tzinfo=timezone.utc)
+        at_daily = datetime(2026, 7, 21, 2, 0, tzinfo=timezone.utc)
+        self.assertFalse(automation.daily_due(before_daily))
+        self.assertTrue(automation.daily_due(at_daily))
+
+        start, end, _ = automation._daily_period_for_day(date(2026, 7, 19))
+        self.assertEqual("2026-07-20T02:00:00Z", start)
+        self.assertEqual("2026-07-21T02:00:00Z", end)
+
+        winter_start, winter_end, _ = automation._daily_period_for_day(date(2026, 11, 9))
+        self.assertEqual("2026-11-10T03:00:00Z", winter_start)
+        self.assertEqual("2026-11-11T03:00:00Z", winter_end)
+
+        monday_before = datetime(2026, 7, 21, 1, 59, tzinfo=timezone.utc)
+        monday_at = datetime(2026, 7, 21, 2, 0, tzinfo=timezone.utc)
+        self.assertFalse(automation.weekly_due(monday_before))
+        self.assertTrue(automation.weekly_due(monday_at))
+        next_daily, next_weekly = automation.next_schedule_times(
+            datetime(2026, 7, 20, 20, 0, tzinfo=timezone.utc)
+        )
+        self.assertEqual("2026-07-21T02:00:00Z", next_daily)
+        self.assertEqual("2026-07-21T02:00:00Z", next_weekly)
+
+    def test_forced_periods_never_include_an_unfinished_seven_pm_window(self):
+        monday_before_cutoff = datetime(2026, 7, 20, 20, 0, tzinfo=timezone.utc)
+        daily_start, daily_end, _ = automation.daily_period(monday_before_cutoff)
+        weekly_start, weekly_end, _ = automation.weekly_period(monday_before_cutoff)
+        self.assertEqual("2026-07-19T02:00:00Z", daily_start)
+        self.assertEqual("2026-07-20T02:00:00Z", daily_end)
+        self.assertEqual("2026-07-07T02:00:00Z", weekly_start)
+        self.assertEqual("2026-07-14T02:00:00Z", weekly_end)
+
+        monday_after_cutoff = datetime(2026, 7, 21, 3, 0, tzinfo=timezone.utc)
+        daily_start, daily_end, _ = automation.daily_period(monday_after_cutoff)
+        weekly_start, weekly_end, _ = automation.weekly_period(monday_after_cutoff)
+        self.assertEqual("2026-07-20T02:00:00Z", daily_start)
+        self.assertEqual("2026-07-21T02:00:00Z", daily_end)
+        self.assertEqual("2026-07-14T02:00:00Z", weekly_start)
+        self.assertEqual("2026-07-21T02:00:00Z", weekly_end)
+
     def test_daily_auto_publishes_once_and_persists_observation(self):
         self.add_day("2026-07-19")
-        now = datetime(2026, 7, 20, 12, 0, tzinfo=timezone.utc)
+        now = datetime(2026, 7, 21, 3, 0, tzinfo=timezone.utc)
         first = automation.run_daily(
             self.db,
             1,
@@ -186,7 +229,7 @@ class JournalAutomationTests(unittest.TestCase):
     def test_daily_uses_complete_half_open_window_and_far_more_than_25(self):
         with sqlite3.connect(self.db) as conn:
             for index in range(90):
-                observed = datetime(2026, 7, 19, 7, 0, tzinfo=timezone.utc) + timedelta(minutes=index * 10)
+                observed = datetime(2026, 7, 20, 2, 0, tzinfo=timezone.utc) + timedelta(minutes=index * 10)
                 stamp = observed.isoformat().replace("+00:00", "Z")
                 conn.execute(
                     "INSERT INTO website_relay_history VALUES(?,?,?,?,?,?,?,?,?,?,?)",
@@ -206,13 +249,13 @@ class JournalAutomationTests(unittest.TestCase):
                 )
             conn.execute(
                 "INSERT INTO website_relay_history VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-                ("boundary", 1, "Next day", "Later", "OBS", "lane", "fresh_public_discord_activity", 100, "next", "public", "2026-07-20T07:00:00Z"),
+                ("boundary", 1, "Next day", "Later", "OBS", "lane", "fresh_public_discord_activity", 100, "next", "public", "2026-07-21T02:00:00Z"),
             )
         packet = journal.build_source_packet_between(
             self.db,
             1,
-            "2026-07-19T07:00:00Z",
-            "2026-07-20T07:00:00Z",
+            "2026-07-20T02:00:00Z",
+            "2026-07-21T02:00:00Z",
             entry_kind="daily",
         )
         self.assertEqual(90, packet["aggregateCounts"]["eligibleRelays"])
@@ -235,9 +278,9 @@ class JournalAutomationTests(unittest.TestCase):
             "https://site.example", "key", now_utc=now, opener=self.opener,
         )
 
-        self.assertEqual("2026-07-17T07:00:00Z", first[0].source_window_start)
+        self.assertEqual("2026-07-18T02:00:00Z", first[0].source_window_start)
         self.assertEqual("published", first[0].status)
-        self.assertEqual("2026-07-18T07:00:00Z", second[0].source_window_start)
+        self.assertEqual("2026-07-19T02:00:00Z", second[0].source_window_start)
         self.assertEqual("published", second[0].status)
 
     def test_weekly_uses_durable_daily_observations(self):
@@ -257,7 +300,8 @@ class JournalAutomationTests(unittest.TestCase):
                 lambda packet, prompt: article_json(packet),
                 "https://site.example",
                 "key",
-                now_utc=datetime(2026, 7, now_day, 12, 0, tzinfo=timezone.utc),
+                target_day=date(2026, 7, now_day - 1),
+                force=True,
                 opener=self.opener,
             )
             self.assertEqual("published", result.status, result)
@@ -280,8 +324,8 @@ class JournalAutomationTests(unittest.TestCase):
         base_packet = journal.build_packet_from_sources(
             self.db,
             1,
-            "2026-07-13T07:00:00Z",
-            "2026-07-20T07:00:00Z",
+            "2026-07-14T02:00:00Z",
+            "2026-07-21T02:00:00Z",
             [],
             [],
             entry_kind="weekly",
@@ -317,7 +361,10 @@ class JournalAutomationTests(unittest.TestCase):
             day = monday + timedelta(days=offset)
             current_name = "Alice" if offset % 2 == 0 else "Bob"
             other_name = "Bob" if current_name == "Alice" else "Alice"
-            occurred = datetime(2026, 7, 13 + offset, 12, 0, tzinfo=timezone.utc)
+            window_start, _, _ = automation._daily_period_for_day(day)
+            occurred = datetime.fromisoformat(
+                window_start.replace("Z", "+00:00")
+            ) + timedelta(hours=1)
             source_store.record_source_event(
                 self.db,
                 guild_id=1,
@@ -384,7 +431,7 @@ class JournalAutomationTests(unittest.TestCase):
                 self.db, 1, label,
                 automation.AutomationResult(True, "daily", "quiet", source_window_start=start, source_window_end=end),
             )
-        now = datetime(2026, 7, 20, 13, 0, tzinfo=timezone.utc)
+        now = datetime(2026, 7, 21, 3, 0, tzinfo=timezone.utc)
         first = automation.run_weekly(
             self.db, 1, lambda *_args: self.fail("quiet week must not generate"),
             "https://site.example", "key", now_utc=now, force=True, opener=self.opener,

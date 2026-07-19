@@ -20,10 +20,10 @@ from bnl_journal import (
 )
 
 PACIFIC = pytz.timezone("US/Pacific")
-DAILY_READY_HOUR = 4
-DAILY_READY_MINUTE = 15
+DAILY_READY_HOUR = 19
+DAILY_READY_MINUTE = 0
 WEEKLY_READY_WEEKDAY = 0  # Monday, covering the prior Monday-Sunday week.
-WEEKLY_READY_HOUR = 5
+WEEKLY_READY_HOUR = 19
 MIN_DAILY_SOURCE_COUNT = 5
 MIN_WEEKLY_ACTIVE_DAYS = 1
 LEASE_MINUTES = 30
@@ -59,30 +59,37 @@ def _utc_iso(value: datetime) -> str:
     return value.astimezone(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
-def _pacific_midnight(day: date) -> datetime:
-    return PACIFIC.localize(datetime.combine(day, datetime_time.min))
+def _pacific_journal_cutoff(day: date) -> datetime:
+    return PACIFIC.localize(
+        datetime.combine(day, datetime_time(DAILY_READY_HOUR, DAILY_READY_MINUTE))
+    )
 
 
 def _daily_period_for_day(day: date) -> tuple[str, str, str]:
-    start_local = _pacific_midnight(day)
-    end_local = _pacific_midnight(day + timedelta(days=1))
+    start_local = _pacific_journal_cutoff(day)
+    end_local = _pacific_journal_cutoff(day + timedelta(days=1))
     return _utc_iso(start_local), _utc_iso(end_local), day.isoformat()
 
 
 def daily_period(now_utc: Optional[datetime] = None) -> tuple[str, str, str]:
     now = (now_utc or datetime.now(timezone.utc)).astimezone(PACIFIC)
-    return _daily_period_for_day(now.date() - timedelta(days=1))
+    start_day = now.date() - timedelta(days=1)
+    if (now.hour, now.minute) < (DAILY_READY_HOUR, DAILY_READY_MINUTE):
+        start_day -= timedelta(days=1)
+    return _daily_period_for_day(start_day)
 
 
 def _weekly_period_for_monday(monday: date) -> tuple[str, str, str]:
-    start_local = _pacific_midnight(monday)
-    end_local = _pacific_midnight(monday + timedelta(days=7))
+    start_local = _pacific_journal_cutoff(monday)
+    end_local = _pacific_journal_cutoff(monday + timedelta(days=7))
     return _utc_iso(start_local), _utc_iso(end_local), monday.isoformat()
 
 
 def weekly_period(now_utc: Optional[datetime] = None) -> tuple[str, str, str]:
     now = (now_utc or datetime.now(timezone.utc)).astimezone(PACIFIC)
     monday = now.date() - timedelta(days=now.weekday())
+    if now.weekday() == WEEKLY_READY_WEEKDAY and now.hour < WEEKLY_READY_HOUR:
+        monday -= timedelta(days=7)
     return _weekly_period_for_monday(monday - timedelta(days=7))
 
 
