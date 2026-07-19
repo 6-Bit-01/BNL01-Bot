@@ -525,8 +525,12 @@ def _archive_activation_day(db_path: str, guild_id: int) -> Optional[date]:
     if not row:
         return None
     activated = datetime.fromtimestamp(int(row[0]) / 1000.0, tz=timezone.utc).astimezone(PACIFIC)
-    # Activation normally occurs mid-day. Only the following local day is a
-    # guaranteed complete 24-hour window.
+    same_day_cutoff = _pacific_journal_cutoff(activated.date())
+    # The first fully covered window starts at the first 7 PM cutoff at or
+    # after activation. An activation later that evening must wait until the
+    # following day's cutoff.
+    if activated <= same_day_cutoff:
+        return activated.date()
     return activated.date() + timedelta(days=1)
 
 

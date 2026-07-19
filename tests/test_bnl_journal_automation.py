@@ -194,6 +194,25 @@ class JournalAutomationTests(unittest.TestCase):
         self.assertEqual("2026-07-14T02:00:00Z", weekly_start)
         self.assertEqual("2026-07-21T02:00:00Z", weekly_end)
 
+    def test_archive_activation_keeps_first_fully_covered_seven_pm_window(self):
+        self.set_archive_activation("2026-07-16T19:00:00Z")  # Noon PDT.
+        self.assertEqual(
+            date(2026, 7, 16),
+            automation._archive_activation_day(self.db, 1),
+        )
+
+        self.set_archive_activation("2026-07-17T02:00:00Z")  # 7 PM PDT.
+        self.assertEqual(
+            date(2026, 7, 16),
+            automation._archive_activation_day(self.db, 1),
+        )
+
+        self.set_archive_activation("2026-07-17T02:00:01Z")  # Just after 7 PM PDT.
+        self.assertEqual(
+            date(2026, 7, 17),
+            automation._archive_activation_day(self.db, 1),
+        )
+
     def test_daily_auto_publishes_once_and_persists_observation(self):
         self.add_day("2026-07-19")
         now = datetime(2026, 7, 21, 3, 0, tzinfo=timezone.utc)
@@ -266,7 +285,7 @@ class JournalAutomationTests(unittest.TestCase):
         for day in ("2026-07-17", "2026-07-18", "2026-07-19"):
             self.add_day(day)
         source_store.backfill_legacy_sources(self.db, 1)
-        self.set_archive_activation("2026-07-16T19:00:00Z")
+        self.set_archive_activation("2026-07-17T03:00:00Z")  # 8 PM PDT.
         now = datetime(2026, 7, 20, 12, 0, tzinfo=timezone.utc)
 
         first = automation.run_scheduled(
