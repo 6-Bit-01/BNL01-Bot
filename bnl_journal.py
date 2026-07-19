@@ -1119,26 +1119,37 @@ def _subject_refs(packet: dict[str, Any]) -> set[str]:
     return {str(s.get("subjectRef")) for s in packet.get("privateSources", []) if s.get("subjectRef")}
 
 
-def retrieve_history(db_path: str, guild_id: int, current_packet: dict[str, Any], limit: int = 6) -> dict[str, Any]:
+def retrieve_history(
+    db_path: str,
+    guild_id: int,
+    current_packet: dict[str, Any],
+    limit: int = 6,
+    *,
+    excluded_entry_ids: Optional[set[str]] = None,
+) -> dict[str, Any]:
     ensure_schema(db_path)
+    excluded = {str(entry_id) for entry_id in (excluded_entry_ids or set()) if str(entry_id)}
     current_subjects = _subject_refs(current_packet)
     current_topics = set(current_packet.get("candidateTopicTags", []))
     terms = set(_norm(_json(current_packet.get("safeSources", []))).split())
     with sqlite3.connect(db_path) as conn:
         conn.row_factory = sqlite3.Row
-        prev = conn.execute("""SELECT entry_id,revision,title,excerpt,sections_json,published_at,created_at
+        prev_rows = conn.execute("""SELECT entry_id,revision,title,excerpt,sections_json,published_at,created_at
             FROM bnl_journal_entries WHERE guild_id=? AND lifecycle_state='published'
-            ORDER BY published_at DESC, created_at DESC LIMIT 1""", (guild_id,)).fetchone()
+            ORDER BY published_at DESC, created_at DESC""", (guild_id,)).fetchall()
         rows = conn.execute("""SELECT e.entry_id,e.revision,e.title,e.excerpt,e.sections_json,e.published_at,e.created_at,m.metadata_json
             FROM bnl_journal_entries e JOIN bnl_journal_private_metadata m
               ON m.entry_id=e.entry_id AND m.revision=e.revision
             WHERE e.guild_id=? AND e.lifecycle_state='published' AND m.lifecycle_state='published'""", (guild_id,)).fetchall()
+    prev = next((row for row in prev_rows if str(row["entry_id"]) not in excluded), None)
     recurring: dict[str, int] = {}
     scored = []
     notes = []
     unresolved = []
     prev_key = (prev["entry_id"], int(prev["revision"])) if prev else None
     for row in rows:
+        if str(row["entry_id"]) in excluded:
+            continue
         meta = json.loads(row["metadata_json"] or "{}")
         tags = {str(t) for t in meta.get("topicTags", [])}
         subjects = {str(s) for s in meta.get("subjectRefs", [])}
@@ -1198,6 +1209,7 @@ def build_packet_from_sources(
     aggregate_counts: Optional[dict[str, Any]] = None,
     observation_context: Optional[list[dict[str, Any]]] = None,
     coverage_complete: bool = True,
+    excluded_history_entry_ids: Optional[set[str]] = None,
 ) -> dict[str, Any]:
     # Scrub with the complete window's identity set before sampling. Otherwise
     # a selected source can mention a community member whose own source was the
@@ -1262,7 +1274,12 @@ def build_packet_from_sources(
     )
     packet["generationContextLanes"] = context_lanes
     packet["privateContextLaneProvenance"] = private_lane_provenance
-    packet["history"] = retrieve_history(db_path, guild_id, packet)
+    packet["history"] = retrieve_history(
+        db_path,
+        guild_id,
+        packet,
+        excluded_entry_ids=excluded_history_entry_ids,
+    )
     return packet
 
 
@@ -1274,6 +1291,7 @@ def build_source_packet_between(
     *,
     entry_kind: str = "daily",
     observation_context: Optional[list[dict[str, Any]]] = None,
+    excluded_history_entry_ids: Optional[set[str]] = None,
 ) -> dict[str, Any]:
     try:
         from bnl_journal_source_store import backfill_legacy_sources, query_source_events, timestamp_to_epoch_ms
@@ -1334,6 +1352,7 @@ def build_source_packet_between(
                 "archivedSourceEvents": int(archived.counts.get("total") or 0),
             },
             observation_context=observation_context,
+            excluded_history_entry_ids=excluded_history_entry_ids,
             # The archive activation watermark prevents the automatic
             # publisher from claiming a full day that began before durable
             # capture was enabled. Manual previews remain available during
@@ -1369,17 +1388,33 @@ def build_source_packet_between(
             "channels": len({x.get("channelPolicy") for x in conversations if x.get("channelPolicy")}),
         },
         observation_context=observation_context,
+        excluded_history_entry_ids=excluded_history_entry_ids,
         coverage_complete=relay_count <= MAX_RELAY_SOURCES_PER_WINDOW and conversation_count <= MAX_CONVERSATION_SOURCES_PER_WINDOW,
     )
     packet["sourceArchiveAvailable"] = False
     return packet
 
 
-def build_source_packet(db_path: str, guild_id: int, hours: int = 72, now: Optional[str] = None, *, entry_kind: str = "manual") -> dict[str, Any]:
+def build_source_packet(
+    db_path: str,
+    guild_id: int,
+    hours: int = 72,
+    now: Optional[str] = None,
+    *,
+    entry_kind: str = "manual",
+    excluded_history_entry_ids: Optional[set[str]] = None,
+) -> dict[str, Any]:
     bounded_hours = max(1, min(int(hours or 72), 168))
     end = now or utc_now_iso()
     start = (datetime.fromisoformat(end.replace("Z", "+00:00")) - timedelta(hours=bounded_hours)).isoformat().replace("+00:00", "Z")
-    return build_source_packet_between(db_path, guild_id, start, end, entry_kind=entry_kind)
+    return build_source_packet_between(
+        db_path,
+        guild_id,
+        start,
+        end,
+        entry_kind=entry_kind,
+        excluded_history_entry_ids=excluded_history_entry_ids,
+    )
 
 
 def _bounded_history_for_prompt(history: dict[str, Any]) -> dict[str, Any]:
@@ -2035,8 +2070,16 @@ def generate_and_store_draft(
     entry_id: str = "",
     entry_kind: str = "manual",
     now: Optional[str] = None,
+    excluded_history_entry_ids: Optional[set[str]] = None,
 ) -> JournalResult:
-    packet = build_source_packet(db_path, guild_id, hours, now, entry_kind=entry_kind)
+    packet = build_source_packet(
+        db_path,
+        guild_id,
+        hours,
+        now,
+        entry_kind=entry_kind,
+        excluded_history_entry_ids=excluded_history_entry_ids,
+    )
     return generate_and_store_packet_draft(db_path, guild_id, packet, generator, entry_id=entry_id)
 
 
@@ -2079,7 +2122,15 @@ def reject_draft(db_path: str, guild_id: int, entry_id: str, reason: str = "", r
 
 
 
-def regenerate_draft(db_path: str, guild_id: int, entry_id: str, hours: int, generator: Callable[[dict[str, Any], str], str]) -> JournalResult:
+def regenerate_draft(
+    db_path: str,
+    guild_id: int,
+    entry_id: str,
+    hours: int,
+    generator: Callable[[dict[str, Any], str], str],
+    *,
+    excluded_history_entry_ids: Optional[set[str]] = None,
+) -> JournalResult:
     ensure_schema(db_path)
     with sqlite3.connect(db_path) as conn:
         row = conn.execute(
@@ -2113,7 +2164,10 @@ def regenerate_draft(db_path: str, guild_id: int, entry_id: str, hours: int, gen
         except (AttributeError, TypeError, ValueError):
             original_entry_kind = None
     original_entry_kind = original_entry_kind or "manual"
-    packet = build_source_packet(db_path, guild_id, hours, entry_kind=original_entry_kind)
+    packet_kwargs: dict[str, Any] = {"entry_kind": original_entry_kind}
+    if excluded_history_entry_ids is not None:
+        packet_kwargs["excluded_history_entry_ids"] = excluded_history_entry_ids
+    packet = build_source_packet(db_path, guild_id, hours, **packet_kwargs)
     last_reason = ""
     previous_output = ""
     article: Optional[dict[str, Any]] = None
