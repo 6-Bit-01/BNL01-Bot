@@ -189,6 +189,25 @@ class ChannelAuditPassiveCaptureTests(unittest.TestCase):
         self.assertEqual(habits[2], 1)
         self.assertIsNotNone(rel)
 
+    def test_long_public_message_is_bounded_and_kept_for_journal(self):
+        guild, channel = self.make_guild_channel("hellcat-nz", 991)
+        long_content = "A detailed public track note about bass, chorus, arrangement, and revisions. " * 30
+        message = FakeMessage(long_content, channel, guild=guild, author=FakeAuthor(42, "HellcatNZ"))
+
+        stored = bnl01_bot.record_passive_user_activity(message, long_content, "public_selective")
+
+        self.assertTrue(stored)
+        conn = sqlite3.connect(self.tmp.name)
+        saved_content = conn.execute("SELECT content FROM conversations").fetchone()[0]
+        archived = conn.execute(
+            "SELECT raw_text,sanitized_summary FROM bnl_journal_source_events WHERE source_kind='discord_message'"
+        ).fetchone()
+        conn.close()
+        self.assertEqual(1000, len(saved_content))
+        self.assertIsNotNone(archived)
+        self.assertLessEqual(len(archived[1]), 1000)
+        self.assertEqual("truncated_to_1000", bnl01_bot._passive_capture_last_skip_reason)
+
     def test_passive_capture_excludes_dm_protected_and_bot_messages(self):
         guild, protected = self.make_guild_channel("welcome", 1)
         self.assertFalse(bnl01_bot.record_passive_user_activity(FakeMessage("hello", protected, guild=guild), "hello", "protected_system"))
@@ -271,6 +290,30 @@ class ChannelAuditPassiveCaptureTests(unittest.TestCase):
         diag = bnl01_bot.build_dossier_recommendation_diagnostics(123)
         self.assertTrue(diag["backfill_available"])
         self.assertEqual(diag["backfill_last_channel"], "hellcat-nz")
+
+    def test_backfill_keeps_bounded_long_public_messages(self):
+        guild, channel = self.make_guild_channel("hellcat-nz", 991)
+        long_content = "A historical public production note about bass, chorus, arrangement, and revisions. " * 30
+        channel._history = [
+            FakeMessage(long_content, channel, guild=guild, author=FakeAuthor(42, "HellcatNZ"), message_id=7101)
+        ]
+
+        dry = asyncio.run(bnl01_bot.run_channel_backfill(channel, limit=50, dry_run=True))
+        self.assertEqual(1, dry["messagesEligible"])
+        self.assertEqual(1, dry["messagesTruncated"])
+
+        real = asyncio.run(bnl01_bot.run_channel_backfill(channel, limit=50, dry_run=False))
+        self.assertEqual(1, real["messagesInserted"])
+        self.assertEqual(1, real["messagesTruncated"])
+        conn = sqlite3.connect(self.tmp.name)
+        content, archived = conn.execute(
+            """SELECT c.content,e.sanitized_summary FROM conversations c
+               JOIN bnl_journal_source_events e ON e.source_kind='discord_message'
+               WHERE c.message_id=7101"""
+        ).fetchone()
+        conn.close()
+        self.assertEqual(1000, len(content))
+        self.assertLessEqual(len(archived), 1000)
 
     def test_backfill_command_operator_only_and_no_raw_transcripts(self):
         guild, channel = self.make_guild_channel("hellcat-nz", 991)

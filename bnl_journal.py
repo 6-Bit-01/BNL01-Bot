@@ -84,9 +84,23 @@ _REPAIR_GUIDANCE = {
     "public_leak_pattern": "Remove every URL, mention, identifier, and internal implementation term from public prose.",
     "source_ref_leak": "Keep source reference tokens only inside sourceRefIds arrays; remove them from all public prose.",
     "invalid_word_count": "Rewrite the complete article so its total public word count is between 250 and 500 words.",
+    "insufficient_source_breadth": (
+        "Use the supplied evidenceCoverageContract. Ground the article in the required number of distinct fresh sources, "
+        "participants, source kinds, and available parts of the window. Synthesize them into a few meaningful patterns; "
+        "do not turn the entry into a list."
+    ),
     "overly_clinical_voice": (
         "Rewrite it as a lively, concrete community chronicle in BNL's voice. Remove academic, laboratory, audit, "
         "and corporate-report language. Refer to anonymous people as producers, listeners, regulars, or the room—not entities."
+    ),
+    "flat_report_voice": (
+        "Rewrite as a lived community chronicle. Open with a grounded person, action, object, or moment instead of a "
+        "system report, and replace passive analysis with ordinary nouns and active verbs."
+    ),
+    "missing_bnl_reaction": (
+        "Add one brief first-person BNL reaction that expresses curiosity, amusement, attachment, uncertainty, or mild "
+        "unease without asserting a new external fact. Do not use I suspect, I think, or I wonder unless a valid "
+        "bnl_inference context lane supports it."
     ),
     "sensitive_personal_detail": (
         "Remove personal or domestic details that are unnecessary to the public community story, including details "
@@ -117,6 +131,33 @@ _OVERLY_CLINICAL_PATTERNS = (
     r"\brecords (?:indicate|reveal|document)\b",
     r"\bobservations (?:indicate|reveal|document|highlight)\b",
     r"\boperational settings?\b",
+    r"\bnascent audio signals?\b",
+    r"\bsonic constructs?\b",
+    r"\bauditory compositions?\b",
+    r"\binternal schematics?\b",
+    r"\bintended resonance\b",
+    r"\bdistributed spectral analy[sz]er\b",
+    r"\biterative signal generation\b",
+    r"\brelational signals?\b",
+    r"\bcontextual data\b",
+    r"\benvironmental factors?\b",
+    r"\btransmission dynamics?\b",
+    r"\bsignal integrity\b",
+    r"\bhuman (?:operating system|subroutines?)\b",
+)
+
+_REPORT_STYLE_OPENING_RE = re.compile(
+    r"^\s*(?:the\s+network|records?|observations?|analysis|data\s+streams?|recent\s+data)\s+"
+    r"(?:observes?|indicate|reveal|shows?|suggests?|detects?|highlight)\b",
+    re.IGNORECASE,
+)
+
+_BNL_REACTION_RE = re.compile(
+    r"\bI\s+(?:admit|confess|noticed|watched|found(?:\s+myself)?|caught\s+myself|remain|smiled|enjoyed|"
+    r"appreciated|liked|was\s+(?:amused|curious|fond|uneasy|surprised|pleased|glad)|"
+    r"am\s+(?:amused|curious|fond|uneasy|pleased|glad)|have\s+(?:begun|grown)|am\s+beginning|"
+    r"may\s+be\s+developing|keep\s+returning|cannot\s+quite|could\s+not\s+help|do\s+not\s+mind)\b",
+    re.IGNORECASE,
 )
 
 _SENSITIVE_PERSONAL_PATTERNS = (
@@ -954,6 +995,104 @@ def _evenly_sample(items: list[dict[str, Any]], limit: int) -> list[dict[str, An
     return [items[i] for i in sorted(indexes)]
 
 
+def _minimum_fresh_sources_for_entry(entry_kind: str, total: int) -> int:
+    """Require representative breadth without turning a short Journal into a roll call."""
+    if total <= 0:
+        return 0
+    if entry_kind == "manual":
+        return 1
+    if total <= 5:
+        return 1
+    if total <= 11:
+        return 3
+    if total <= 24:
+        return 5
+    if total <= 74:
+        return 7
+    if entry_kind == "weekly":
+        return min(total, 14)
+    if entry_kind == "daily":
+        return min(total, 10)
+    return min(total, 8)
+
+
+def _coverage_segment(
+    observed_at: Any,
+    start: str,
+    end: str,
+    segment_count: int,
+) -> str:
+    observed = _parse_context_datetime(observed_at)
+    start_at = _parse_context_datetime(start)
+    end_at = _parse_context_datetime(end)
+    if not observed or not start_at or not end_at or end_at <= start_at:
+        return ""
+    elapsed = max(0.0, min((observed - start_at).total_seconds(), (end_at - start_at).total_seconds() - 0.001))
+    index = int(elapsed / (end_at - start_at).total_seconds() * max(1, segment_count))
+    return f"segment-{min(max(index, 0), max(1, segment_count) - 1) + 1}"
+
+
+def build_evidence_coverage_contract(
+    entry_kind: str,
+    start: str,
+    end: str,
+    sources: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Describe how much of the supplied window a generated entry must actually use."""
+    usable = [source for source in sources if source.get("refId")]
+    total = len(usable)
+    kind_counts: dict[str, int] = {}
+    for source in usable:
+        kind = str(source.get("sourceKind") or "")
+        if kind:
+            kind_counts[kind] = kind_counts.get(kind, 0) + 1
+    kind_floor = max(3, (total + 19) // 20) if total else 0
+    required_kinds = (
+        sorted(kind for kind, count in kind_counts.items() if count >= kind_floor)
+        if entry_kind in {"daily", "weekly"}
+        else []
+    )
+
+    aliases = {
+        str(source.get("participantAlias") or "")
+        for source in usable
+        if str(source.get("participantAlias") or "")
+    }
+    if entry_kind == "manual":
+        required_participants = 0
+    elif total >= 12:
+        required_participants = min(3, len(aliases))
+    elif total >= 6:
+        required_participants = min(2, len(aliases))
+    else:
+        required_participants = min(1, len(aliases))
+
+    segment_count = 7 if entry_kind == "weekly" else 3
+    segment_by_ref = {
+        str(source["refId"]): segment
+        for source in usable
+        for segment in [_coverage_segment(source.get("observedAt"), start, end, segment_count)]
+        if segment
+    }
+    available_segments = set(segment_by_ref.values())
+    if entry_kind == "manual":
+        target_segments = 0
+    elif total >= 12:
+        target_segments = 4 if entry_kind == "weekly" else 3
+    elif total >= 6:
+        target_segments = 2
+    else:
+        target_segments = 1
+
+    return {
+        "minimumDistinctFreshSources": _minimum_fresh_sources_for_entry(entry_kind, total),
+        "requiredSourceKinds": required_kinds,
+        "minimumDistinctParticipants": required_participants,
+        "minimumDistinctWindowSegments": min(target_segments, len(available_segments)),
+        "segmentBySourceRef": segment_by_ref,
+    }
+
+
 def _count_legacy_sources(conn: sqlite3.Connection, guild_id: int, start: str, end: str) -> tuple[int, int]:
     relay_count = 0
     conversation_count = 0
@@ -997,6 +1136,7 @@ def retrieve_history(db_path: str, guild_id: int, current_packet: dict[str, Any]
     recurring: dict[str, int] = {}
     scored = []
     notes = []
+    unresolved = []
     prev_key = (prev["entry_id"], int(prev["revision"])) if prev else None
     for row in rows:
         meta = json.loads(row["metadata_json"] or "{}")
@@ -1015,12 +1155,14 @@ def retrieve_history(db_path: str, guild_id: int, current_packet: dict[str, Any]
             scored.append((score, row["published_at"] or row["created_at"] or "", item))
         if current_subjects & subjects or current_topics & tags:
             notes.extend(str(n)[:240] for n in meta.get("continuityNotes", [])[:3])
+            unresolved.extend(str(n)[:240] for n in meta.get("unresolvedQuestions", [])[:3])
     scored.sort(key=lambda x: (x[0], x[1]), reverse=True)
     return {
         "previousEntry": dict(prev) if prev else None,
         "relevantOlderEntries": [item for _, _, item in scored[:limit]],
         "recurringTopicCounts": recurring,
         "matchingContinuityNotes": notes[:10],
+        "matchingUnresolvedQuestions": unresolved[:10],
     }
 
 
@@ -1057,19 +1199,23 @@ def build_packet_from_sources(
     observation_context: Optional[list[dict[str, Any]]] = None,
     coverage_complete: bool = True,
 ) -> dict[str, Any]:
-    private_sources = _sample_source_kinds(relays, conversations)
-    current_display_names = [
+    # Scrub with the complete window's identity set before sampling. Otherwise
+    # a selected source can mention a community member whose own source was the
+    # one omitted from a >MAX_PROMPT_SOURCES window.
+    window_display_names = [
         str(source.get("displayName") or "").strip()
-        for source in private_sources
+        for source in list(relays) + list(conversations)
         if str(source.get("displayName") or "").strip()
     ]
+    window_display_names = list(dict.fromkeys(window_display_names))
+    private_sources = _sample_source_kinds(relays, conversations)
     safe_sources = []
     for source in private_sources:
         safe_source = _source_for_prompt(source)
         if "summary" in safe_source:
             safe_source["summary"] = sanitize_source_summary(
                 str(safe_source.get("summary") or ""),
-                current_display_names,
+                window_display_names,
                 limit=1000,
             )
         if safe_source.get("summary"):
@@ -1087,7 +1233,8 @@ def build_packet_from_sources(
         "sourceWindowEnd": end,
         "safeSources": safe_sources,
         "privateSources": private_sources,
-        "candidateTopicTags": sorted({w for src in safe_sources for w in _norm(src.get("summary", "")).split() if len(w) > 4})[:30],
+        "privateWindowDisplayNames": window_display_names,
+        "candidateTopicTags": list(journal_topic_counts(safe_sources, limit=30)),
         "aggregateCounts": counts,
         "coverageComplete": bool(coverage_complete),
         "observationContext": list(observation_context or []),
@@ -1106,12 +1253,13 @@ def build_packet_from_sources(
         safe_sources,
     )
     packet["safeSources"] = safe_sources
-    packet["candidateTopicTags"] = sorted({
-        word
-        for source in safe_sources
-        for word in _norm(source.get("summary", "")).split()
-        if len(word) > 4
-    })[:30]
+    packet["candidateTopicTags"] = list(journal_topic_counts(safe_sources, limit=30))
+    packet["evidenceCoverageContract"] = build_evidence_coverage_contract(
+        packet["entryKind"],
+        start,
+        end,
+        safe_sources,
+    )
     packet["generationContextLanes"] = context_lanes
     packet["privateContextLaneProvenance"] = private_lane_provenance
     packet["history"] = retrieve_history(db_path, guild_id, packet)
@@ -1239,7 +1387,21 @@ def _bounded_history_for_prompt(history: dict[str, Any]) -> dict[str, Any]:
         if not entry:
             return None
         sections = json.loads(entry.get("sections_json") or "[]") if isinstance(entry.get("sections_json"), str) else []
-        return {"entryId": entry.get("entry_id"), "revision": entry.get("revision"), "title": entry.get("title"), "excerpt": entry.get("excerpt"), "sectionHeadings": [str(s.get("heading", ""))[:80] for s in sections[:3]]}
+        return {
+            "entryId": entry.get("entry_id"),
+            "revision": entry.get("revision"),
+            "publishedAt": entry.get("published_at") or entry.get("created_at"),
+            "title": entry.get("title"),
+            "excerpt": entry.get("excerpt"),
+            "sectionSnapshots": [
+                {
+                    "heading": str(section.get("heading", ""))[:80],
+                    "bodyExcerpt": str(section.get("body", ""))[:420],
+                }
+                for section in sections[:3]
+                if isinstance(section, dict)
+            ],
+        }
     return {
         "previousEntry": compact(history.get("previousEntry")),
         "relevantOlderEntries": [compact(e) for e in history.get("relevantOlderEntries", [])[:6]],
@@ -1251,11 +1413,26 @@ def _bounded_history_for_prompt(history: dict[str, Any]) -> dict[str, Any]:
 def build_generation_prompt(packet: dict[str, Any], *, repair_reason: str = "", previous_output: str = "") -> str:
     entry_kind = str(packet.get("entryKind") or "manual")
     context_lanes = packet.get("generationContextLanes") if isinstance(packet.get("generationContextLanes"), dict) else {}
+    safe_sources = packet.get("safeSources", [])[:MAX_PROMPT_SOURCES]
+    coverage_contract = packet.get("evidenceCoverageContract")
+    if not isinstance(coverage_contract, dict):
+        coverage_contract = build_evidence_coverage_contract(
+            entry_kind,
+            str(packet.get("sourceWindowStart") or ""),
+            str(packet.get("sourceWindowEnd") or ""),
+            safe_sources,
+        )
     safe_packet = {
         "entryKind": entry_kind,
         "sourceWindowStart": packet.get("sourceWindowStart"),
         "sourceWindowEnd": packet.get("sourceWindowEnd"),
-        "freshSources": packet.get("safeSources", [])[:MAX_PROMPT_SOURCES],
+        "freshSources": safe_sources,
+        "evidenceCoverageContract": coverage_contract,
+        "editorialContract": {
+            "requiresFirstPersonReaction": len(safe_sources) >= 5,
+            "requiredBeatsAcrossEntry": ["concreteMoment", "peopleOrObservableRoles", "communityPattern", "bnlReaction"],
+            "fixedSectionTemplate": False,
+        },
         "history": _bounded_history_for_prompt(packet.get("history", {})),
         "aggregateCounts": packet.get("aggregateCounts", {}),
         "dailyObservations": packet.get("observationContext", [])[:7],
@@ -1295,12 +1472,19 @@ def build_generation_prompt(packet: dict[str, Any], *, repair_reason: str = "", 
         "You are BNL-01 writing a BARCODE Network Journal entry. Return strict JSON only; no markdown fences."
         "\nSchema: {\"title\":str,\"excerpt\":str,\"sections\":[{\"heading\":str,\"body\":str,\"sourceRefIds\":[str]}],\"metadata\":{\"topicTags\":[],\"subjectRefs\":[],\"continuityNotes\":[],\"unresolvedQuestions\":[],\"confidenceFlags\":[],\"safetyFlags\":[],\"contextUses\":[{\"laneType\":\"established_broadcast_memory|community_rumor|bnl_inference\",\"laneRefId\":str,\"sectionHeading\":str,\"claim\":str,\"basisRefIds\":[str]}]}}."
         "\nWrite 1-3 sections and 250-500 total words; prefer 2 sections and roughly 300-420 words. Give every section a real narrative job instead of inventorying activity."
-        "\nWrite like BNL keeping a sly, lively community chronicle—not a lab report, audit, academic paper, corporate briefing, or raw relay summary. BNL may be witty, lightly nosy, and uncanny, but never cruel."
-        "\nBuild one coherent story around the most interesting grounded patterns. Use concrete music and community texture, active verbs, readable paragraphs, and selective detail. Avoid abstract jargon and inflated technical language."
+        "\nJOURNAL EDITORIAL OVERRIDE: For this route, a lived community chronicle takes priority over BNL's general lightly corporate or systems-report register. Do not narrate ordinary human activity as machine analysis."
+        "\nAcross the complete entry, naturally include four beats: a concrete current-window moment; the people or observable roles who made it happen; a social, musical, or recurring community pattern; and one brief first-person BNL reaction. Blend them in any order and any combination. Do not label the beats or force them into a fixed section template."
+        "\nBNL is a warm, dryly funny archive keeper who is becoming attached to what he records. He may be amused, curious, fond, mildly uneasy, self-correcting, or uncertain. He is lightly uncanny, never cruel, and never generic neon-static cyberpunk."
+        "\nFreely vary and combine scene reporting, named-canon color, dry archive notes, recognizable community detail, callbacks, restrained glitches, self-revision, and—only when qualified—the rumor desk. Do not reuse a stock cadence, signature line, or joke merely because an older entry used it."
+        "\nUse ordinary nouns and active verbs. Say a producer brought a mix, a listener returned to a chorus, or the room kept discussing an idea when the evidence supports that action. Do not translate ordinary activity into sonic constructs, external calibration, distributed analysis, internal schematics, perceptual filters, operational settings, relational signals, or human subroutines."
+        "\nStart at least one section with a grounded person, action, object, or moment—never The Network observes, Records indicate, Observations reveal, Analysis shows, or Data streams reveal."
+        "\nUse first person sparingly but genuinely. A BNL reaction may describe BNL's response without adding an external fact: I noticed, I admit, I found myself returning to it, I remain curious, or I may be developing a preference. Reserve I suspect, I think, and I wonder for a properly declared bnl_inference context use."
+        "\nBuild one coherent story around the most interesting grounded patterns. Use concrete music and community texture, readable paragraphs, and selective detail. Never invent a time, place, object, action, motive, outcome, relationship, dialogue, emotional state, or scene decoration absent from the cited evidence."
         "\nUse a short, vivid title of about 4-10 words. Do not prefix it with Network Log. Keep the excerpt compact and inviting."
-        "\nDescribe anonymous humans naturally as a producer, listener, regular, artist, or the room. Never call people entities or organisms. Do not invent nicknames, motives, relationships, dialogue, or conclusions."
+        "\nDescribe anonymous humans with a concrete, recognizable action from their cited public message whenever possible, so a regular may recognize their own moment without being exposed. Use producer, listener, or artist only when that role is grounded; otherwise use a regular, a person in the room, or the room. Never call people entities or organisms. Do not invent nicknames or honorifics."
         "\nStable participant aliases in the packet are private pattern-analysis aids. Never reproduce an alias in public prose."
-        "\nEvery section must cite at least one fresh sourceRefId from the current window. Older Journal material is continuity only, never proof of current activity."
+        "\nThe evidenceCoverageContract is mandatory. Across all section sourceRefIds, meet its minimum distinct fresh sources, participants, source kinds, and available window segments. Every cited ref must materially support that section. Use this breadth to identify a few connected patterns rather than listing sources."
+        "\nEvery section must cite at least one fresh sourceRefId from the current window. Older Journal material is continuity and callback context only, never proof of current activity. Do not repeat an older conclusion when the current evidence changes it."
         "\nParaphrase every source summary. Never repeat any sequence of five or more consecutive words from a fresh source summary."
         "\nKeep community members anonymous. Do not include direct quotes, URLs, mentions, IDs, sourceRef tokens in public prose, private intent, relationships, harassment, or internal schema/storage terms."
         "\nExclude personal or domestic details that are unnecessary to the public community story, especially details involving minors, interpersonal conflict, caregiving, or household obligations. Juicy means lively pattern recognition—not private gossip."
@@ -1433,6 +1617,57 @@ def _context_lane_ref_contract(packet: dict[str, Any]) -> dict[str, dict[str, An
     return contract
 
 
+def _article_cited_refs(article: dict[str, Any]) -> set[str]:
+    refmap = article.get("sourceRefIds") or {}
+    refs: set[str] = set()
+    for section in article.get("sections", []):
+        heading = str(section.get("heading") or "")
+        values = refmap.get(heading) or section.get("sourceRefIds") or []
+        refs.update(str(ref) for ref in values if str(ref))
+    return refs
+
+
+def _evidence_coverage_reason(article: dict[str, Any], packet: dict[str, Any]) -> str:
+    sources = [source for source in packet.get("safeSources", []) if source.get("refId")]
+    contract = packet.get("evidenceCoverageContract")
+    if not isinstance(contract, dict):
+        contract = build_evidence_coverage_contract(
+            str(packet.get("entryKind") or "manual"),
+            str(packet.get("sourceWindowStart") or ""),
+            str(packet.get("sourceWindowEnd") or ""),
+            sources,
+        )
+    cited = _article_cited_refs(article)
+    if len(cited) < int(contract.get("minimumDistinctFreshSources") or 0):
+        return "insufficient_source_breadth"
+
+    by_ref = {str(source["refId"]): source for source in sources}
+    cited_sources = [by_ref[ref] for ref in cited if ref in by_ref]
+    cited_kinds = {str(source.get("sourceKind") or "") for source in cited_sources}
+    if not set(str(kind) for kind in contract.get("requiredSourceKinds", []) if str(kind)) <= cited_kinds:
+        return "insufficient_source_breadth"
+
+    cited_participants = {
+        str(source.get("participantAlias") or "")
+        for source in cited_sources
+        if str(source.get("participantAlias") or "")
+    }
+    if len(cited_participants) < int(contract.get("minimumDistinctParticipants") or 0):
+        return "insufficient_source_breadth"
+
+    segment_by_ref = contract.get("segmentBySourceRef")
+    if not isinstance(segment_by_ref, dict):
+        segment_by_ref = {}
+    cited_segments = {
+        str(segment_by_ref.get(ref) or "")
+        for ref in cited
+        if str(segment_by_ref.get(ref) or "")
+    }
+    if len(cited_segments) < int(contract.get("minimumDistinctWindowSegments") or 0):
+        return "insufficient_source_breadth"
+    return ""
+
+
 def validate_article(article: dict[str, Any], packet: dict[str, Any], prior_titles: Optional[list[str]] = None, approved_names: Optional[set[str]] = None) -> str:
     sections = article.get("sections")
     if not isinstance(sections, list) or not (1 <= len(sections) <= 3):
@@ -1462,19 +1697,37 @@ def validate_article(article: dict[str, Any], packet: dict[str, Any], prior_titl
         refs = refmap.get(section.get("heading")) or section.get("sourceRefIds")
         if not refs or any(str(r) not in valid_refs for r in refs):
             return "invalid_section_source_refs"
+    evidence_reason = _evidence_coverage_reason(article, packet)
+    if evidence_reason:
+        return evidence_reason
     if re.search(r"<@!?\d+>|@\w+|https?://|\b\d{12,}\b|participant-[a-f0-9]{8}|relationship_journal|memory_tiers|source[- ]?file|dossier|private_metadata|sourceRefIds?", public_text, re.I):
         return "public_leak_pattern"
     if re.search(r"[\"“”‘’]", public_text):
         return "direct_quote_or_quote_mark"
     names = set(approved_names or [])
-    for src in packet.get("privateSources", []):
-        name = str(src.get("displayName") or "").strip()
+    private_names = {
+        str(name or "").strip()
+        for name in packet.get("privateWindowDisplayNames", [])
+        if str(name or "").strip()
+    }
+    private_names.update(
+        str(src.get("displayName") or "").strip()
+        for src in packet.get("privateSources", [])
+        if str(src.get("displayName") or "").strip()
+    )
+    for name in private_names:
         if name and name not in names and _contains_identity_literal(public_text, name):
             return "community_name_leak"
     if any(re.search(pattern, public_text, re.I) for pattern in _SENSITIVE_PERSONAL_PATTERNS):
         return "sensitive_personal_detail"
     if any(re.search(pattern, public_text, re.I) for pattern in _OVERLY_CLINICAL_PATTERNS):
         return "overly_clinical_voice"
+    if any(_REPORT_STYLE_OPENING_RE.search(str(section.get("body") or "")) for section in sections):
+        return "flat_report_voice"
+    if len(packet.get("safeSources", [])) >= 5 and not _BNL_REACTION_RE.search(
+        "\n".join(str(section.get("body") or "") for section in sections)
+    ):
+        return "missing_bnl_reaction"
     normalized_public = _norm(public_text)
     for src in packet.get("privateSources", []):
         summary = str(src.get("summary") or "")

@@ -8125,6 +8125,7 @@ async def run_channel_backfill(channel, *, limit: int = BACKFILL_DEFAULT_LIMIT, 
         "messagesScanned": 0,
         "messagesEligible": 0,
         "messagesInserted": 0,
+        "messagesTruncated": 0,
         "skipReasons": defaultdict(int),
         "uniqueUsersFound": 0,
         "topUsers": [],
@@ -8155,11 +8156,12 @@ async def run_channel_backfill(channel, *, limit: int = BACKFILL_DEFAULT_LIMIT, 
                 result["skipReasons"]["system_message"] += 1; continue
             if not content:
                 result["skipReasons"]["empty_content"] += 1; continue
-            if len(content) >= 400:
-                result["skipReasons"]["content_too_long"] += 1; continue
+            captured_content = content[:1000]
+            if len(content) > len(captured_content):
+                result["messagesTruncated"] += 1
             user_id = int(getattr(author, "id", 0) or 0)
             user_name = (getattr(author, "display_name", "") or getattr(author, "name", "unknown"))[:80]
-            if conversation_row_exists_for_message(getattr(guild, "id", 0), getattr(channel, "id", 0), message_id, user_id, timestamp, content):
+            if conversation_row_exists_for_message(getattr(guild, "id", 0), getattr(channel, "id", 0), message_id, user_id, timestamp, captured_content):
                 result["rowsAlreadyExist"] += 1
                 result["skipReasons"]["duplicate_message"] += 1
                 continue
@@ -8168,16 +8170,16 @@ async def run_channel_backfill(channel, *, limit: int = BACKFILL_DEFAULT_LIMIT, 
             if not dry_run:
                 inserted = insert_backfilled_conversation_row(
                     guild_id=getattr(guild, "id", 0), channel_id=getattr(channel, "id", 0), channel_name=getattr(channel, "name", ""),
-                    channel_policy=policy, user_id=user_id, user_name=user_name, content=content, timestamp=timestamp, message_id=message_id,
+                    channel_policy=policy, user_id=user_id, user_name=user_name, content=captured_content, timestamp=timestamp, message_id=message_id,
                 )
                 if inserted:
                     result["messagesInserted"] += 1
                     upsert_user_profile(user_id, getattr(guild, "id", 0), user_name)
-                    update_relationship_state(user_id, getattr(guild, "id", 0), content, delta_affinity=0.03)
-                    update_user_habits(user_id, getattr(guild, "id", 0), content)
+                    update_relationship_state(user_id, getattr(guild, "id", 0), captured_content, delta_affinity=0.03)
+                    update_user_habits(user_id, getattr(guild, "id", 0), captured_content)
                     if community_scouting_enabled():
                         record_community_presence_event(
-                            DB_FILE, getattr(guild, "id", 0), user_name, content,
+                            DB_FILE, getattr(guild, "id", 0), user_name, captured_content,
                             channel_id=getattr(channel, "id", 0), channel_name=getattr(channel, "name", ""), channel_policy=policy,
                             direct_interaction=False, operator_mention=False,
                         )
@@ -8212,7 +8214,7 @@ def format_channel_backfill_result(result: dict) -> str:
         f"BNL permissions: view=`{int(bool(perms.get('view')))}` read_history=`{int(bool(perms.get('read_history')))}` send=`{int(bool(perms.get('send')))}` react=`{int(bool(perms.get('react')))}`",
         f"channel policy: `{result.get('channelPolicy')}` | eligible: `{'yes' if result.get('eligible') else 'no'}` ({result.get('eligibilityReason')})",
         f"dry_run: `{'yes' if result.get('dryRun') else 'no'}` | limit: `{result.get('limit')}` | status: `{result.get('status')}`",
-        f"messages scanned: `{result.get('messagesScanned')}` | eligible: `{result.get('messagesEligible')}` | inserted: `{result.get('messagesInserted')}` | already_exists: `{result.get('rowsAlreadyExist')}`",
+        f"messages scanned: `{result.get('messagesScanned')}` | eligible: `{result.get('messagesEligible')}` | inserted: `{result.get('messagesInserted')}` | truncated: `{result.get('messagesTruncated')}` | already_exists: `{result.get('rowsAlreadyExist')}`",
         f"messages skipped by reason: `{skip_text}`",
         f"unique users found: `{result.get('uniqueUsersFound')}` | top users by eligible count: `{top_text}`",
         f"tables {'would update' if result.get('dryRun') else 'updated'}: `{tables}`",
@@ -8316,24 +8318,31 @@ def record_passive_user_activity(message: discord.Message, content: str, channel
     if not (content or "").strip():
         mark_passive_capture_status(channel_name, user_name, "skipped", "empty_content")
         return False
-    if len(content) >= 400:
-        mark_passive_capture_status(channel_name, user_name, "skipped", "content_too_long")
-        return False
     if not passive_capture_expected_for_channel(channel, channel_policy):
         mark_passive_capture_status(channel_name, user_name, "skipped", f"policy_or_permission:{channel_policy}")
         return False
+    # Long public posts often contain the most useful track notes and creative
+    # context. Preserve a bounded version instead of dropping the entire event;
+    # the Journal archive keeps its existing public-policy and identity scrub.
+    captured_content = (content or "").strip()[:1000]
+    was_truncated = len((content or "").strip()) > len(captured_content)
     upsert_user_profile(author.id, guild.id, user_name)
     save_user_message(
         author.id,
         user_name,
         guild.id,
-        content.strip(),
+        captured_content,
         channel_name=channel_name,
         channel_policy=channel_policy,
         channel_id=getattr(channel, "id", 0),
         message_id=int(getattr(message, "id", 0) or 0) or None,
     )
-    mark_passive_capture_status(channel_name, user_name, "stored", "none")
+    mark_passive_capture_status(
+        channel_name,
+        user_name,
+        "stored",
+        "truncated_to_1000" if was_truncated else "none",
+    )
     return True
 
 def is_direct_bnl_target(message: discord.Message) -> bool:

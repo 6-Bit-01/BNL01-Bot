@@ -3,7 +3,7 @@ import os
 import sqlite3
 import tempfile
 import unittest
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from unittest.mock import patch
 
 os.environ.setdefault("GEMINI_API_KEY", "test-key")
@@ -15,7 +15,7 @@ import bnl_journal_source_store as source_store
 
 
 def article_json(packet):
-    ref = packet["safeSources"][0]["refId"]
+    refs = [source["refId"] for source in packet["safeSources"]]
     label = packet["sourceWindowEnd"][:10]
     cadence = "Weekly Signal Weather" if packet.get("entryKind") == "weekly" else "Signal Weather"
     body = " ".join(
@@ -24,6 +24,7 @@ def article_json(packet):
             for _ in range(18)
         ]
     )
+    body += " I admit the room's persistence has become one of my preferred recurring details."
     return json.dumps(
         {
             "title": f"{cadence} Ending {label}",
@@ -32,7 +33,7 @@ def article_json(packet):
                 {
                     "heading": "What the Room Carried",
                     "body": body,
-                    "sourceRefIds": [ref],
+                    "sourceRefIds": refs,
                 }
             ],
             "metadata": {
@@ -273,6 +274,102 @@ class JournalAutomationTests(unittest.TestCase):
         self.assertIn("journal_weekly_", weekly.entry_id)
         self.assertEqual(7, weekly.aggregate_counts["activeDays"])
         self.assertEqual(7, weekly.aggregate_counts["daysObserved"])
+
+    def test_weekly_refuses_archive_fallback_or_incomplete_coverage(self):
+        monday = date(2026, 7, 13)
+        base_packet = journal.build_packet_from_sources(
+            self.db,
+            1,
+            "2026-07-13T07:00:00Z",
+            "2026-07-20T07:00:00Z",
+            [],
+            [],
+            entry_kind="weekly",
+        )
+        cases = (
+            ({"sourceArchiveAvailable": False, "coverageComplete": True}, "held", "source_archive_unavailable"),
+            ({"sourceArchiveAvailable": True, "coverageComplete": False}, "incomplete", "window_began_before_archive_activation"),
+        )
+        for flags, expected_status, expected_reason in cases:
+            packet = dict(base_packet)
+            packet.update(flags)
+            with self.subTest(flags=flags), patch.object(
+                automation,
+                "_weekly_packet",
+                return_value=(packet, 7, 7),
+            ):
+                result = automation.run_weekly(
+                    self.db,
+                    1,
+                    lambda *_args: self.fail("untrusted weekly packet reached generation"),
+                    "https://site.example",
+                    "key",
+                    target_monday=monday,
+                    force=True,
+                    opener=self.opener,
+                )
+                self.assertEqual(expected_status, result.status)
+                self.assertEqual(expected_reason, result.reason)
+
+    def test_weekly_rebuilds_full_archive_once_and_reapplies_name_scrub(self):
+        monday = date(2026, 7, 13)
+        for offset in range(7):
+            day = monday + timedelta(days=offset)
+            current_name = "Alice" if offset % 2 == 0 else "Bob"
+            other_name = "Bob" if current_name == "Alice" else "Alice"
+            occurred = datetime(2026, 7, 13 + offset, 12, 0, tzinfo=timezone.utc)
+            source_store.record_source_event(
+                self.db,
+                guild_id=1,
+                source_kind="discord_message",
+                source_key=f"weekly-direct-{offset}",
+                occurred_at_ms=int(occurred.timestamp() * 1000),
+                raw_text=f"{current_name} discussed {other_name} and a changing chorus.",
+                # Simulate the normal first-pass author scrub leaving another
+                # member's public display name for the packet-wide scrub.
+                sanitized_summary=f"someone discussed {other_name} and a changing chorus.",
+                channel_id=900 + offset,
+                channel_policy="public_home",
+                subject_ref=f"discord_user:{100 + offset}",
+                private_display_name=current_name,
+                public_usable=True,
+            )
+            start, end, label = automation._daily_period_for_day(day)
+            observation_packet = journal.build_packet_from_sources(
+                self.db,
+                1,
+                start,
+                end,
+                [],
+                [],
+                entry_kind="daily",
+                aggregate_counts={"eligibleRelays": 0, "eligibleConversations": 0},
+            )
+            automation._store_observation(self.db, 1, label, observation_packet)
+            automation._mark_observation(
+                self.db,
+                1,
+                label,
+                automation.AutomationResult(
+                    True,
+                    "daily",
+                    "published",
+                    source_window_start=start,
+                    source_window_end=end,
+                ),
+            )
+
+        start, end, _ = automation._weekly_period_for_monday(monday)
+        packet, complete_days, active_days = automation._weekly_packet(self.db, 1, start, end)
+        self.assertIsNotNone(packet)
+        self.assertEqual((7, 7), (complete_days, active_days))
+        self.assertTrue(packet["sourceArchiveAvailable"])
+        self.assertEqual(7, packet["aggregateCounts"]["eligibleConversations"])
+        self.assertEqual(7, packet["aggregateCounts"]["participants"])
+        self.assertEqual(7, packet["aggregateCounts"]["channels"])
+        public_generation_text = json.dumps(packet["safeSources"])
+        self.assertNotIn("Alice", public_generation_text)
+        self.assertNotIn("Bob", public_generation_text)
 
     def test_all_quiet_week_is_terminal_and_does_not_block_catchup(self):
         for offset in range(7):
