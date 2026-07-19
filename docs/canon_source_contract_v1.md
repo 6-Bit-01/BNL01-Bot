@@ -22,6 +22,8 @@ When queue production is disabled, the contract strips queue/session/payment/ava
 
 Queue production remains disabled unless both gates are explicit: local `BNL_QUEUE_PRODUCTION_ENABLED=true` and website `capabilities.queueProduction=true`. Missing or malformed capability data fails closed.
 
+The website's bounded `sections.sourceContext` list remains public site canon, not live queue state. BNL may load those public summaries for an explicit site/read-model question even while live queue context is disabled. Queue/session/track values are still removed before prompt assembly.
+
 ## Vocabulary and compatibility coverage
 
 The contract defines source class, authority, visibility, confidence, freshness/currentness, subject identity, correction, contradiction/supersession, invalidity/retraction, public usability, derived/projection status, and current-time claim eligibility. Existing route/source/channel labels map through compatibility adapters; no persisted values are renamed.
@@ -48,6 +50,14 @@ Static approved canon and schedule facts cannot prove live/open/current/now stat
 - `/about` consumes contract schedule/founder render helpers instead of hardcoding the old 6:40 PM show-time wording.
 - Website read-model prompt context and R&D/operator read-model intent responses consume the sanitized view.
 - Safe diagnostics expose the active contract version, adapter state, local queue capability, observed site queue capability, and effective queue usability reason without raw queue values.
+
+## Native queue and show-day alignment
+
+Show-day announcement canon consumes the same two-gate decision without persisting queue data. The scheduled 6:40 PM Pacific intake message names the native BARCODE Radio queue only when the local bot gate and website capability are both true. Otherwise it uses provider-neutral public-intake wording; stock and generated announcements may not fall back to Auxchord-specific copy or imply BNL operates submissions.
+
+The 7:00 PM Pacific announcement is deliberately restrained: the schedule proves the broadcast window, not a current live/on-air state. The optional later-show sponsor reminder does not claim that a commercial break is active, due, required, or already called. Current state still requires fresh public runtime evidence and host control.
+
+This alignment does not write queue context to memory, relationships, dossiers, Source Files, Relay, recaps, the Journal, or public copy lanes. It does not enable show-day Discord posts, proactive engagement, queue write power, or either production gate.
 
 ## Not migrated
 

@@ -35,6 +35,17 @@ Configure secrets in the process environment; do not commit them. Core variables
 - `GEMINI_API_KEY`
 - BNL website URLs, API keys, Relay controls, and feature flags used by the deployed runtime
 
+Native queue context has two independent production gates. The local bot variable `BNL_QUEUE_PRODUCTION_ENABLED` defaults off and accepts only `true` (case-insensitive); the website read model must also report `capabilities.queueProduction=true`. Queue/session/track context is stripped unless both gates agree. Merging queue-aware code does not enable either gate.
+
+Activation order is site first, bot second:
+
+1. Keep the bot gate disabled while the website native-queue cutover is verified.
+2. Confirm the website capability is true and its public queue state is sanitized and accurate.
+3. Only after explicit owner approval, set `BNL_QUEUE_PRODUCTION_ENABLED=true` and restart the bot.
+4. Roll back the bot first by unsetting the variable or changing it away from `true`; the website can then be rolled back independently.
+
+Show-day copy follows the same boundary. The 6:40 PM Pacific intake message names the native queue only when both gates are usable; otherwise it uses provider-neutral public-intake wording. The 7:00 PM message describes the scheduled broadcast window without claiming unverified live state, and the later sponsor message remains optional and host-controlled.
+
 Importing `bnl01_bot` does not create a Gemini client or open provider transports. The client is created and cached on the first generation request, so tests, diagnostics, and tooling can import the runtime without valid provider networking.
 
 Run the bot only after the deployment environment is configured:

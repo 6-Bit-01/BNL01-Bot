@@ -16,6 +16,7 @@ from __future__ import annotations
 from bnl_canon_source_contract import (
     CANON_SOURCE_CONTRACT_VERSION,
     diagnostics as canon_source_diagnostics,
+    queue_usability,
     render_concise_public_schedule,
     render_founders,
     render_prompt_canon_block,
@@ -1385,6 +1386,22 @@ def _first_list(*values):
     return []
 
 
+def _public_source_context_items(read_model: dict) -> list[dict]:
+    """Return bounded public site-canon entries from either supported shape."""
+    sections = _read_model_sections(read_model)
+    raw = sections.get("sourceContext")
+    if raw is None and isinstance(read_model, dict):
+        raw = read_model.get("sourceContext")
+    if isinstance(raw, list):
+        return [item for item in raw if isinstance(item, dict)][:8]
+    if isinstance(raw, dict):
+        nested = _first_list(raw.get("items"), raw.get("entries"), raw.get("context"))
+        if nested:
+            return [item for item in nested if isinstance(item, dict)][:8]
+        return [raw]
+    return []
+
+
 def _compact_public_text(value, limit: int = 140) -> str:
     if value is None:
         return ""
@@ -1453,15 +1470,23 @@ def build_bnl_read_model_context(read_model: dict, user_text: str, channel_polic
     artists_section = sections.get("artists") if sections.get("artists") is not None else read_model.get("artists")
     dossiers_section = sections.get("dossiers") if sections.get("dossiers") is not None else read_model.get("dossiers")
     rules_section = sections.get("rules") if sections.get("rules") is not None else read_model.get("rules")
-    source_context = _first_mapping(sections.get("sourceContext"), read_model.get("sourceContext"))
+    source_context_items = _public_source_context_items(read_model)
 
     lines = [
         "Website public read model context:",
-        f"Source: {_compact_public_text(source_context.get('source') or 'barcode-network-site', 80)} / publicOnly=true / version=1",
+        f"Source: {_compact_public_text(read_model.get('source') or 'barcode-network-site', 80)} / publicOnly=true / version=1",
     ]
     schema_revision = _compact_public_text(read_model.get("schemaRevision"), 40)
     if schema_revision:
         lines[-1] += f" / schemaRevision={schema_revision}"
+
+    if source_context_items:
+        lines.append("\nPublic site canon:")
+        for item in source_context_items[:6]:
+            title = _compact_public_text(item.get("title") or item.get("name") or item.get("id"), 80)
+            summary = _compact_public_text(item.get("summary") or item.get("description"), 220)
+            if title and summary:
+                lines.append(f"- {title}: {summary}")
 
     if queue:
         session = _first_mapping(queue.get("session"), queue.get("currentSession"))
@@ -14645,26 +14670,96 @@ FRIDAY_SHOW_PHASES = [
     {"key": "sponsor_window", "hour": 21, "minute": 0, "window_min": SHOWDAY_WINDOW_MINUTES},
 ]
 
-SHOWDAY_FALLBACKS = {
-    "submissions_open": [
-        "📡 Intake corridor open. Auxchord routing is active; submission pressure can now be transmitted.",
-        "Signal intake has commenced. BNL-01 is routing inbound track traffic through the Friday relay.",
-        "Auxchord channels are now accepting payloads. Submit while the pre-broadcast gate is stable.",
+SHOWDAY_INTAKE_FALLBACKS = {
+    "public_intake": [
+        "📡 The Friday BARCODE Radio intake window has begun. Submit your original track through the current public submission route for tonight’s host-led broadcast.",
+        "BARCODE Radio’s Friday submission window is in place. Original music can enter through the public intake route while the pre-broadcast gate is open.",
+        "Signal intake has commenced for BARCODE Radio. Use the current public submission route during the scheduled Friday intake window.",
     ],
-    "show_live": [
-        "🎛️ Broadcast deployment confirmed. BARCODE Radio is now active and 6 Bit is on-air.",
-        "Carrier lock acquired. Friday transmission is live; 6 Bit has entered broadcast posture.",
-        "BARCODE Radio is now transmitting. Signal integrity is nominal and the host stack is online.",
-    ],
-    "sponsor_window": [
-        "📼 Sponsor relay window is active. Commercial packets require 6 Bit for compliant execution.",
-        "Funding cycle check: sponsor transmissions are due, and the host channel must process them.",
-        "Network obligations are now in rotation. Sponsor payloads should be run through 6 Bit’s lane.",
+    "native_queue": [
+        "📡 The Friday BARCODE Radio intake window has begun. Submit your original track through the native Network queue for tonight’s host-led broadcast.",
+        "BARCODE Radio’s native queue is the active submission route for the Friday intake window. Original music can enter while the pre-broadcast gate is open.",
+        "Signal intake has commenced through the native BARCODE Radio queue. Submit during the scheduled Friday intake window.",
     ],
 }
 
-def _pick_varied_fallback(phase_key: str, avoid: str = "") -> str:
-    options = SHOWDAY_FALLBACKS.get(phase_key, [])
+SHOWDAY_FALLBACKS = {
+    "show_live": [
+        "🎛️ The scheduled BARCODE Radio broadcast window has begun. 6 Bit remains the host; confirm the live signal through the public broadcast channel.",
+        "Friday transmission time has arrived. BARCODE Radio remains host-led, with current live state confirmed by the public broadcast surface.",
+        "The 7:00 PM Pacific broadcast window is in place. Follow BARCODE Radio’s public live channel for the confirmed signal.",
+    ],
+    "sponsor_window": [
+        "📼 The optional sponsor reminder window is in range. Any commercial break remains host-controlled and tied to the live production state.",
+        "Sponsor acknowledgements may enter the later broadcast window; timing remains with 6 Bit and the live production state.",
+        "The later-show sponsor window is available. No commercial break is implied until the host calls it.",
+    ],
+}
+
+def showday_submission_canon(read_model: dict | None = None) -> dict[str, str]:
+    """Resolve announcement wording without exposing or persisting queue state."""
+    usability = queue_usability(read_model or {})
+    if usability["usable"]:
+        return {
+            "mode": "native_queue",
+            "routeLabel": "native BARCODE Radio queue",
+            "promptRule": "Name the native BARCODE Radio queue as the submission route. BNL observes it but does not operate, reorder, or approve submissions.",
+        }
+    return {
+        "mode": "public_intake",
+        "routeLabel": "current public BARCODE Radio submission route",
+        "promptRule": "Refer to BARCODE Radio’s public submission intake generically. Do not name Auxchord, claim the native queue is active, or imply BNL operates submissions.",
+    }
+
+
+def _showday_phase_prompt_rule(phase_key: str, read_model: dict | None = None) -> str:
+    if phase_key == "submissions_open":
+        canon = showday_submission_canon(read_model)
+        return f"Submission route: {canon['routeLabel']}. {canon['promptRule']}"
+    if phase_key == "show_live":
+        return "This is the scheduled broadcast window, not proof of current live state. Keep the update restrained and direct listeners to the public broadcast channel for confirmation."
+    if phase_key == "sponsor_window":
+        return "This is an optional later-show sponsor reminder. Do not claim a commercial break is active, due, required, or already called; timing remains host-controlled."
+    return "Do not invent current operational state."
+
+
+def _showday_output_matches_canon(message: str, phase_key: str, read_model: dict | None = None) -> bool:
+    lowered = str(message or "").lower()
+    if not lowered or "auxchord" in lowered:
+        return False
+    if phase_key == "submissions_open":
+        canon = showday_submission_canon(read_model)
+        if canon["mode"] != "native_queue" and "queue" in lowered:
+            return False
+        if any(term in lowered for term in (
+            "bnl routes", "bnl is routing", "bnl operates", "bnl is operating",
+            "bnl processes", "bnl is processing", "bnl approves", "bnl is approving",
+            "bnl accepts submissions", "bnl is accepting submissions", "submit to bnl",
+            "bnl manages", "bnl is managing", "bnl controls", "bnl is controlling",
+            "bnl reorders", "bnl reordered", "bnl has reordered", "bnl owns",
+            "bnl runs the queue", "bnl runs submissions",
+        )):
+            return False
+    elif phase_key == "show_live" and any(term in lowered for term in (
+        "now active", "on-air", "on air", "now live", "now transmitting", "deployment confirmed", "carrier lock acquired",
+        "currently live", "live now", "is live", "are live", "we're live", "we are live",
+        "broadcast has begun", "broadcast has started", "transmission is live", "signal is live",
+    )):
+        return False
+    elif phase_key == "sponsor_window" and any(term in lowered for term in (
+        "window is active", "are due", "is due", "must process", "requires 6 bit", "should be run",
+        "break is active", "break is required", "break is mandatory", "already called", "has been called",
+    )):
+        return False
+    return True
+
+
+def _pick_varied_fallback(phase_key: str, avoid: str = "", read_model: dict | None = None) -> str:
+    if phase_key == "submissions_open":
+        mode = showday_submission_canon(read_model)["mode"]
+        options = list(SHOWDAY_INTAKE_FALLBACKS.get(mode, []))
+    else:
+        options = list(SHOWDAY_FALLBACKS.get(phase_key, []))
     if not options:
         return "Signal update acknowledged."
     random.shuffle(options)
@@ -14676,11 +14771,13 @@ def _pick_varied_fallback(phase_key: str, avoid: str = "") -> str:
 
 async def generate_showday_messages(guild_id: int, phase_key: str):
     signal_context = get_recent_signal_summary(guild_id)
+    read_model = await asyncio.to_thread(fetch_bnl_read_model) if phase_key == "submissions_open" else {}
     phase_desc = {
-        "submissions_open": "Friday 6:40 PM Pacific intake window opens for submissions",
-        "show_live": "Friday 7:00 PM Pacific live broadcast begins",
-        "sponsor_window": "around Friday 9:00 PM Pacific sponsor/commercial obligations window",
+        "submissions_open": "Friday 6:40 PM Pacific scheduled intake window begins",
+        "show_live": "Friday 7:00 PM Pacific scheduled broadcast window begins",
+        "sponsor_window": "optional later-show sponsor reminder window",
     }.get(phase_key, phase_key)
+    phase_rule = _showday_phase_prompt_rule(phase_key, read_model)
 
     prompt = (
         "You are BNL-01. Generate exactly two lines.\n"
@@ -14688,6 +14785,7 @@ async def generate_showday_messages(guild_id: int, phase_key: str):
         "Line 2: Website status message about 220-360 chars, complete sentence(s), no mid-word or mid-sentence cuts.\n"
         "Voice: concise, corporate, lightly sinister, signal-analysis.\n"
         f"Event: {phase_desc}.\n"
+        f"Truth boundary: {phase_rule}\n"
         f"Room context (optional): {signal_context or 'none'}.\n"
         "Do not quote users. No usernames. No emojis except optional one at start.\n"
         "Do not repeat generic stock wording. Keep it fresh.\n"
@@ -14696,11 +14794,16 @@ async def generate_showday_messages(guild_id: int, phase_key: str):
     lines = [ln.strip(" -•\t") for ln in text.splitlines() if ln.strip()]
     if len(lines) >= 2:
         discord_msg = lines[0][:320]
-        website_msg = fit_complete_statement(lines[1], limit=360, min_chars=220, fallback=_pick_varied_fallback(phase_key))
-        if discord_msg and website_msg:
+        website_msg = fit_complete_statement(lines[1], limit=360, min_chars=220, fallback=_pick_varied_fallback(phase_key, read_model=read_model))
+        if (
+            discord_msg
+            and website_msg
+            and _showday_output_matches_canon(discord_msg, phase_key, read_model)
+            and _showday_output_matches_canon(website_msg, phase_key, read_model)
+        ):
             return discord_msg, website_msg
-    fallback = _pick_varied_fallback(phase_key)
-    return fallback[:320], fit_complete_statement(fallback, limit=360, min_chars=220, fallback=_pick_varied_fallback(phase_key, avoid=fallback))
+    fallback = _pick_varied_fallback(phase_key, read_model=read_model)
+    return fallback[:320], fit_complete_statement(fallback, limit=360, min_chars=220, fallback=_pick_varied_fallback(phase_key, avoid=fallback, read_model=read_model))
 
 
 def iter_managed_guilds():
