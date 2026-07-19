@@ -153,6 +153,17 @@ def test_view_authorization_redaction_and_correct_rejects_unauthorized():
 def test_complete_delete_real_schemas_shared_moment_repeat_receipt_and_rollback():
     c = make_conn(); insert(c, eid='mine', value='delete me', pred='preference'); insert(c, user=11, eid='other', value='keep other', pred='preference')
     c.execute("CREATE TABLE conversations (id INTEGER PRIMARY KEY, guild_id INTEGER, user_id INTEGER, content TEXT)"); c.execute("INSERT INTO conversations VALUES (1,1,10,'secret')")
+    c.execute("CREATE TABLE bnl_journal_source_events (event_seq INTEGER PRIMARY KEY, guild_id INTEGER NOT NULL, source_kind TEXT NOT NULL, subject_ref TEXT NOT NULL)")
+    c.execute("CREATE TRIGGER trg_bnl_journal_sources_no_delete BEFORE DELETE ON bnl_journal_source_events BEGIN SELECT RAISE(ABORT, 'bnl_journal_source_events_immutable'); END")
+    c.executemany(
+        "INSERT INTO bnl_journal_source_events VALUES (?,?,?,?)",
+        [
+            (1, 1, 'discord_message', 'discord_user:10'),
+            (2, 1, 'discord_message', 'discord_user:11'),
+            (3, 2, 'discord_message', 'discord_user:10'),
+            (4, 1, 'website_relay', 'discord_user:10'),
+        ],
+    )
     c.execute("CREATE TABLE response_style_log (id INTEGER, guild_id INTEGER, user_id INTEGER, style_key TEXT)"); c.execute("INSERT INTO response_style_log VALUES (1,1,10,'x')")
     c.execute("CREATE TABLE memory_moment_windows (moment_id TEXT, guild_id INTEGER, lifecycle_status TEXT, summary TEXT, updated_at TEXT)")
     c.execute("CREATE TABLE memory_moment_members (moment_id TEXT, ledger_entry_id TEXT)")
@@ -167,18 +178,128 @@ def test_complete_delete_real_schemas_shared_moment_repeat_receipt_and_rollback(
     except RuntimeError:
         pass
     assert c.execute("SELECT COUNT(*) FROM conversations WHERE user_id=10").fetchone()[0] == 1
+    assert c.execute("SELECT COUNT(*) FROM bnl_journal_source_events WHERE event_seq=1").fetchone()[0] == 1
     res = complete_delete_member_data(c, guild_id=1, user_id=10, confirmation='DELETE MY BNL DATA 1')
     assert res['ok']
+    assert res['row_counts']['bnl_journal_source_events'] == 1
     assert c.execute("SELECT COUNT(*) FROM conversations WHERE user_id=10").fetchone()[0] == 0
+    assert {row[0] for row in c.execute("SELECT event_seq FROM bnl_journal_source_events")} == {2, 3, 4}
     assert c.execute("SELECT COUNT(*) FROM memory_moment_participants WHERE participant_key=?", (subject_key_for_user(10),)).fetchone()[0] == 0
     assert c.execute("SELECT COUNT(*) FROM memory_moment_participants WHERE participant_key=?", (subject_key_for_user(11),)).fetchone()[0] == 1
     assert c.execute("SELECT summary,lifecycle_status FROM memory_moment_windows WHERE moment_id='m1'").fetchone() == ('', 'needs_review')
     receipt_row = c.execute("SELECT subject_hash,row_counts_json FROM memory_governance_receipts WHERE action='complete_delete'").fetchone()
     assert str(10) not in receipt_row[0] and 'secret' not in receipt_row[1]
-    import json; json.loads(receipt_row[1])
+    import json; assert json.loads(receipt_row[1])['bnl_journal_source_events'] == 1
+    try:
+        c.execute("DELETE FROM bnl_journal_source_events WHERE event_seq=2")
+        assert False, 'archive delete guard was not restored'
+    except sqlite3.IntegrityError:
+        c.rollback()
     c.execute("INSERT INTO conversations VALUES (2,1,10,'new secret')"); c.commit()
     assert complete_delete_member_data(c, guild_id=1, user_id=10, confirmation='DELETE MY BNL DATA 1')['ok']
     assert c.execute("SELECT COUNT(*) FROM conversations WHERE user_id=10").fetchone()[0] == 0
+
+
+def test_complete_delete_lays_journal_privacy_groundwork_without_touching_published_prose():
+    import json
+
+    c = make_conn()
+    c.executescript("""
+        CREATE TABLE bnl_journal_source_events (
+            event_seq INTEGER PRIMARY KEY, guild_id INTEGER NOT NULL,
+            source_kind TEXT NOT NULL, subject_ref TEXT NOT NULL
+        );
+        CREATE TRIGGER trg_bnl_journal_sources_no_delete
+        BEFORE DELETE ON bnl_journal_source_events
+        BEGIN SELECT RAISE(ABORT, 'bnl_journal_source_events_immutable'); END;
+        CREATE TABLE bnl_journal_entries (
+            entry_id TEXT, revision INTEGER, guild_id INTEGER, lifecycle_state TEXT,
+            PRIMARY KEY(entry_id, revision)
+        );
+        CREATE TABLE bnl_journal_private_metadata (
+            entry_id TEXT, revision INTEGER, guild_id INTEGER, metadata_json TEXT,
+            lifecycle_state TEXT, updated_at TEXT, PRIMARY KEY(entry_id, revision)
+        );
+        CREATE TABLE bnl_journal_observations (
+            observation_id TEXT PRIMARY KEY, guild_id INTEGER,
+            aggregate_counts_json TEXT, topic_counts_json TEXT, subject_counts_json TEXT,
+            representative_sources_json TEXT, lifecycle_state TEXT,
+            journal_entry_id TEXT, journal_revision INTEGER, updated_at TEXT
+        );
+    """)
+    target = 'discord_user:10'
+    # The prefix-overlapping ID proves deletion uses exact identity matching.
+    other = 'discord_user:100'
+    c.executemany(
+        "INSERT INTO bnl_journal_source_events VALUES (?,?,?,?)",
+        [(1, 1, 'discord_message', target), (2, 1, 'discord_message', other)],
+    )
+    c.executemany(
+        "INSERT INTO bnl_journal_entries VALUES (?,?,?,?)",
+        [('published-entry', 1, 1, 'published'), ('target-draft', 1, 1, 'draft'), ('other-draft', 1, 1, 'draft')],
+    )
+
+    def metadata(subject, ref_id, summary):
+        return json.dumps({
+            'subjectRefs': [subject],
+            'supportingConversationRefs': [{'refId': ref_id, 'subjectRef': subject}],
+            'sourceSummaries': [{'refId': ref_id, 'summary': summary}],
+            'sourceRefIds': {'A': [ref_id]},
+            'topicTags': [summary],
+            'continuityNotes': [summary],
+        })
+
+    c.executemany(
+        "INSERT INTO bnl_journal_private_metadata VALUES (?,?,?,?,?,?)",
+        [
+            ('published-entry', 1, 1, metadata(target, 'fresh:1', 'secretword'), 'published', ''),
+            ('target-draft', 1, 1, metadata(target, 'fresh:1', 'secretword'), 'draft', ''),
+            ('other-draft', 1, 1, metadata(other, 'fresh:2', 'synthwave'), 'draft', ''),
+        ],
+    )
+    representatives = [
+        {'refId': 'fresh:1', 'sourceKind': 'conversation', 'subjectRef': target, 'summary': 'secretword'},
+        {'refId': 'fresh:2', 'sourceKind': 'conversation', 'subjectRef': other, 'summary': 'synthwave'},
+    ]
+    c.execute(
+        "INSERT INTO bnl_journal_observations VALUES (?,?,?,?,?,?,?,?,?,?)",
+        (
+            'obs-1', 1,
+            json.dumps({'eligibleConversations': 2, 'participants': 2, 'archivedSourceEvents': 2}),
+            json.dumps({'secretword': 1, 'synthwave': 1}),
+            json.dumps({target: 1, other: 1}), json.dumps(representatives),
+            'observed', 'target-draft', 1, '',
+        ),
+    )
+    c.commit()
+
+    try:
+        complete_delete_member_data(
+            c, guild_id=1, user_id=10,
+            confirmation='DELETE MY BNL DATA 1', inject_failure=True,
+        )
+    except RuntimeError:
+        pass
+    assert c.execute("SELECT COUNT(*) FROM bnl_journal_entries WHERE entry_id='target-draft'").fetchone()[0] == 1
+    assert target in c.execute("SELECT representative_sources_json FROM bnl_journal_observations").fetchone()[0]
+
+    result = complete_delete_member_data(c, guild_id=1, user_id=10, confirmation='DELETE MY BNL DATA 1')
+    assert result['ok']
+    assert c.execute("SELECT COUNT(*) FROM bnl_journal_entries WHERE entry_id='published-entry'").fetchone()[0] == 1
+    assert c.execute("SELECT COUNT(*) FROM bnl_journal_entries WHERE entry_id='target-draft'").fetchone()[0] == 0
+    assert c.execute("SELECT COUNT(*) FROM bnl_journal_entries WHERE entry_id='other-draft'").fetchone()[0] == 1
+    published_meta = c.execute("SELECT metadata_json FROM bnl_journal_private_metadata WHERE entry_id='published-entry'").fetchone()[0]
+    assert target not in published_meta and 'secretword' not in published_meta
+    observation = c.execute(
+        "SELECT aggregate_counts_json,topic_counts_json,subject_counts_json,representative_sources_json,journal_entry_id "
+        "FROM bnl_journal_observations WHERE observation_id='obs-1'"
+    ).fetchone()
+    assert json.loads(observation[0])['eligibleConversations'] == 1
+    assert json.loads(observation[1]) == {'synthwave': 1}
+    assert json.loads(observation[2]) == {other: 1}
+    assert all(item.get('subjectRef') != target for item in json.loads(observation[3]))
+    assert any(item.get('subjectRef') == other for item in json.loads(observation[3]))
+    assert observation[4] is None
 
 
 def test_clearhistory_wording_and_queue_subsystem_untouched_static():

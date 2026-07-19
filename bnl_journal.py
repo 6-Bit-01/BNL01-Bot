@@ -15,6 +15,13 @@ STATES = {"draft", "rejected", "approved_pending_delivery", "published", "delive
 WORD_MIN, WORD_MAX = 250, 500
 JOURNAL_ROUTE = "bnl_journal_generation"
 JOURNAL_GENERATION_ATTEMPTS = 4
+MAX_RELAY_SOURCES_PER_WINDOW = 500
+MAX_CONVERSATION_SOURCES_PER_WINDOW = 2_000
+MAX_PROMPT_SOURCES = 180
+JOURNAL_TOPIC_STOPWORDS = {
+    "about", "after", "again", "being", "could", "from", "have", "into", "just", "more", "other", "their",
+    "there", "these", "they", "this", "through", "under", "where", "which", "while", "with", "would", "someone",
+}
 
 _REPAIR_GUIDANCE = {
     "discord_phrase_copy": (
@@ -105,6 +112,202 @@ def table_exists(conn: sqlite3.Connection, name: str) -> bool:
     return bool(conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (name,)).fetchone())
 
 
+def journal_topic_counts(sources: list[dict[str, Any]], limit: int = 30) -> dict[str, int]:
+    """Build the deterministic, non-identifying topic rollup used by observations."""
+    counts: dict[str, int] = {}
+    for source in sources:
+        words = set(re.findall(r"[a-z0-9]+", str(source.get("summary") or "").lower()))
+        for word in words:
+            if len(word) >= 5 and word not in JOURNAL_TOPIC_STOPWORDS:
+                counts[word] = counts.get(word, 0) + 1
+    return dict(sorted(counts.items(), key=lambda item: (-item[1], item[0]))[:limit])
+
+
+def _json_object(value: Any) -> dict[str, Any]:
+    try:
+        parsed = json.loads(value or "{}") if isinstance(value, str) else value
+    except (TypeError, json.JSONDecodeError):
+        return {}
+    return dict(parsed) if isinstance(parsed, dict) else {}
+
+
+def _json_list(value: Any) -> list[Any]:
+    try:
+        parsed = json.loads(value or "[]") if isinstance(value, str) else value
+    except (TypeError, json.JSONDecodeError):
+        return []
+    return list(parsed) if isinstance(parsed, list) else []
+
+
+def _contains_exact_json_scalar(value: Any, target: str) -> bool:
+    if isinstance(value, dict):
+        return any(_contains_exact_json_scalar(item, target) for item in value.values())
+    if isinstance(value, list):
+        return any(_contains_exact_json_scalar(item, target) for item in value)
+    return isinstance(value, str) and value == target
+
+
+def purge_user_journal_derivatives_on_connection(
+    conn: sqlite3.Connection,
+    guild_id: int,
+    user_id: int,
+) -> dict[str, int]:
+    """Scrub one member from hidden Journal derivatives in the caller transaction.
+
+    Published public prose is immutable. Its private source linkage is scrubbed.
+    Unpublished revisions grounded in the deleted member are removed so they can
+    never be approved or delivered later. Daily observations are recalculated
+    from their remaining representative sources before weekly synthesis can use
+    them again.
+    """
+    guild = int(guild_id)
+    user = int(user_id)
+    if guild <= 0 or user <= 0:
+        raise ValueError("invalid_journal_privacy_scope")
+    subject_ref = f"discord_user:{user}"
+    now = utc_now_iso()
+    counts: dict[str, int] = {}
+
+    if table_exists(conn, "bnl_journal_observations"):
+        rows = conn.execute(
+            """SELECT observation_id,aggregate_counts_json,topic_counts_json,
+                      subject_counts_json,representative_sources_json
+               FROM bnl_journal_observations WHERE guild_id=?""",
+            (guild,),
+        ).fetchall()
+        for observation_id, aggregate_raw, _topics_raw, subjects_raw, representatives_raw in rows:
+            subjects = _json_object(subjects_raw)
+            representatives = [item for item in _json_list(representatives_raw) if isinstance(item, dict)]
+            removed = [item for item in representatives if str(item.get("subjectRef") or "") == subject_ref]
+            if subject_ref not in subjects and not removed:
+                continue
+            subjects.pop(subject_ref, None)
+            remaining = [item for item in representatives if str(item.get("subjectRef") or "") != subject_ref]
+            aggregate = _json_object(aggregate_raw)
+            removed_conversations = len([item for item in removed if item.get("sourceKind") == "conversation"])
+            for key in ("eligibleConversations", "promptConversations", "archivedSourceEvents"):
+                if key in aggregate:
+                    aggregate[key] = max(0, int(aggregate.get(key) or 0) - removed_conversations)
+            if "participants" in aggregate:
+                aggregate["participants"] = len(subjects)
+            conn.execute(
+                """UPDATE bnl_journal_observations
+                   SET aggregate_counts_json=?,topic_counts_json=?,subject_counts_json=?,
+                       representative_sources_json=?,updated_at=?
+                   WHERE guild_id=? AND observation_id=?""",
+                (
+                    _json(aggregate),
+                    _json(journal_topic_counts(remaining)),
+                    _json(subjects),
+                    _json(remaining),
+                    now,
+                    guild,
+                    observation_id,
+                ),
+            )
+            counts["bnl_journal_observations_scrubbed"] = counts.get("bnl_journal_observations_scrubbed", 0) + 1
+
+    unpublished: list[tuple[str, int]] = []
+    if table_exists(conn, "bnl_journal_private_metadata"):
+        has_entries = table_exists(conn, "bnl_journal_entries")
+        if has_entries:
+            rows = conn.execute(
+                """SELECT m.entry_id,m.revision,m.metadata_json,
+                          COALESCE(e.lifecycle_state,m.lifecycle_state)
+                   FROM bnl_journal_private_metadata m
+                   LEFT JOIN bnl_journal_entries e
+                     ON e.entry_id=m.entry_id AND e.revision=m.revision
+                   WHERE m.guild_id=?""",
+                (guild,),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT entry_id,revision,metadata_json,lifecycle_state FROM bnl_journal_private_metadata WHERE guild_id=?",
+                (guild,),
+            ).fetchall()
+        for entry_id, revision, metadata_raw, lifecycle_state in rows:
+            metadata = _json_object(metadata_raw)
+            supporting = [item for item in metadata.get("supportingConversationRefs", []) if isinstance(item, dict)]
+            target_supporting = [item for item in supporting if str(item.get("subjectRef") or "") == subject_ref]
+            subject_refs = [str(item) for item in metadata.get("subjectRefs", [])]
+            affected = (
+                subject_ref in subject_refs
+                or bool(target_supporting)
+                or _contains_exact_json_scalar(metadata, subject_ref)
+            )
+            if not affected:
+                continue
+            key = (str(entry_id), int(revision))
+            if str(lifecycle_state or "") != "published":
+                unpublished.append(key)
+                continue
+
+            target_ref_ids = {str(item.get("refId")) for item in target_supporting if item.get("refId")}
+            metadata["supportingConversationRefs"] = [
+                item for item in supporting if str(item.get("subjectRef") or "") != subject_ref
+            ]
+            metadata["subjectRefs"] = [item for item in subject_refs if item != subject_ref]
+            metadata["sourceSummaries"] = [
+                item for item in metadata.get("sourceSummaries", [])
+                if isinstance(item, dict) and str(item.get("refId") or "") not in target_ref_ids
+            ]
+            source_ref_ids = metadata.get("sourceRefIds")
+            if isinstance(source_ref_ids, dict):
+                metadata["sourceRefIds"] = {
+                    str(heading): [str(ref) for ref in refs if str(ref) not in target_ref_ids]
+                    for heading, refs in source_ref_ids.items()
+                    if isinstance(refs, list)
+                }
+            # These model-derived fields cannot be reliably separated by source.
+            # Clear them on an affected published entry rather than allowing a
+            # deleted member's private evidence to guide future synthesis.
+            for key_name in ("topicTags", "continuityNotes", "unresolvedQuestions", "recurringTopicCounts"):
+                metadata[key_name] = {} if key_name == "recurringTopicCounts" else []
+            metadata["privacyScrubbed"] = True
+            conn.execute(
+                """UPDATE bnl_journal_private_metadata SET metadata_json=?,updated_at=?
+                   WHERE guild_id=? AND entry_id=? AND revision=?""",
+                (_json(metadata), now, guild, entry_id, int(revision)),
+            )
+            counts["bnl_journal_published_metadata_scrubbed"] = counts.get("bnl_journal_published_metadata_scrubbed", 0) + 1
+
+    if unpublished:
+        for entry_id, revision in sorted(set(unpublished)):
+            counts["bnl_journal_unpublished_metadata_deleted"] = counts.get("bnl_journal_unpublished_metadata_deleted", 0) + conn.execute(
+                "DELETE FROM bnl_journal_private_metadata WHERE guild_id=? AND entry_id=? AND revision=?",
+                (guild, entry_id, revision),
+            ).rowcount
+            if table_exists(conn, "bnl_journal_entries"):
+                counts["bnl_journal_unpublished_entries_deleted"] = counts.get("bnl_journal_unpublished_entries_deleted", 0) + conn.execute(
+                    "DELETE FROM bnl_journal_entries WHERE guild_id=? AND entry_id=? AND revision=? AND lifecycle_state<>'published'",
+                    (guild, entry_id, revision),
+                ).rowcount
+            if table_exists(conn, "bnl_journal_observations"):
+                conn.execute(
+                    """UPDATE bnl_journal_observations
+                       SET lifecycle_state='observed',journal_entry_id=NULL,journal_revision=0,updated_at=?
+                       WHERE guild_id=? AND journal_entry_id=? AND journal_revision=?""",
+                    (now, guild, entry_id, revision),
+                )
+            if table_exists(conn, "bnl_journal_automation_runs"):
+                counts["bnl_journal_automation_runs_invalidated"] = counts.get("bnl_journal_automation_runs_invalidated", 0) + conn.execute(
+                    """UPDATE bnl_journal_automation_runs
+                       SET lifecycle_state='held',reason='privacy_source_deleted',journal_entry_id=NULL,
+                           journal_revision=0,lease_expires_at=NULL,updated_at=?
+                       WHERE guild_id=? AND journal_entry_id=? AND journal_revision=?
+                         AND lifecycle_state<>'published'""",
+                    (now, guild, entry_id, revision),
+                ).rowcount
+            if table_exists(conn, "bnl_journal_automation_state"):
+                conn.execute(
+                    """UPDATE bnl_journal_automation_state
+                       SET last_status='held',last_reason='privacy_source_deleted',last_entry_id='',last_revision=0,updated_at=?
+                       WHERE guild_id=? AND last_entry_id=? AND last_revision=?""",
+                    (now, guild, entry_id, revision),
+                )
+    return {key: int(value or 0) for key, value in counts.items() if int(value or 0)}
+
+
 def _cols(conn: sqlite3.Connection, table: str) -> set[str]:
     return {r[1] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()}
 
@@ -124,12 +327,12 @@ def _anon_ref(prefix: str, idx: int) -> str:
     return f"{prefix}:{idx}"
 
 
-def accepted_relays(conn: sqlite3.Connection, guild_id: int, start: str, end: str, limit: int = 20) -> list[dict[str, Any]]:
+def accepted_relays(conn: sqlite3.Connection, guild_id: int, start: str, end: str, limit: int = MAX_RELAY_SOURCES_PER_WINDOW) -> list[dict[str, Any]]:
     if not table_exists(conn, "website_relay_history"):
         return []
     rows = conn.execute("""SELECT relay_id, public_message, public_directive, event_type, published_timestamp
-        FROM website_relay_history WHERE guild_id=? AND published_timestamp>=? AND published_timestamp<=?
-        ORDER BY published_timestamp DESC LIMIT ?""", (guild_id, start, end, limit)).fetchall()
+        FROM website_relay_history WHERE guild_id=? AND published_timestamp>=? AND published_timestamp<?
+        ORDER BY published_timestamp ASC, relay_id ASC LIMIT ?""", (guild_id, start, end, limit)).fetchall()
     out = []
     for idx, row in enumerate(rows, 1):
         summary = sanitize_source_summary(f"{row[1]} {row[2]}")
@@ -138,7 +341,7 @@ def accepted_relays(conn: sqlite3.Connection, guild_id: int, start: str, end: st
     return out
 
 
-def public_conversations(conn: sqlite3.Connection, guild_id: int, start: str, end: str, limit: int = 40) -> list[dict[str, Any]]:
+def public_conversations(conn: sqlite3.Connection, guild_id: int, start: str, end: str, limit: int = MAX_CONVERSATION_SOURCES_PER_WINDOW) -> list[dict[str, Any]]:
     if not table_exists(conn, "conversations"):
         return []
     cols = _cols(conn, "conversations")
@@ -147,8 +350,8 @@ def public_conversations(conn: sqlite3.Connection, guild_id: int, start: str, en
     role_clause = " AND role='user'" if "role" in cols else ""
     rows = conn.execute(f"""SELECT id, user_id, user_name, channel_policy, channel_name, content, timestamp
         FROM conversations WHERE guild_id=? AND channel_policy IN ({','.join('?' for _ in sorted(PUBLIC_POLICIES))})
-        AND timestamp>=? AND timestamp<=? {public_usable_clause} {visibility_clause} {role_clause}
-        ORDER BY timestamp DESC LIMIT ?""", (guild_id, *sorted(PUBLIC_POLICIES), start, end, limit)).fetchall()
+        AND timestamp>=? AND timestamp<? {public_usable_clause} {visibility_clause} {role_clause}
+        ORDER BY timestamp ASC, id ASC LIMIT ?""", (guild_id, *sorted(PUBLIC_POLICIES), start, end, limit)).fetchall()
     raw_names = [str(r[2] or "").strip() for r in rows if str(r[2] or "").strip()]
     out = []
     for idx, row in enumerate(rows, 1):
@@ -159,6 +362,7 @@ def public_conversations(conn: sqlite3.Connection, guild_id: int, start: str, en
                 "sourceKind": "conversation",
                 "messageId": int(row[0]),
                 "subjectRef": f"discord_user:{row[1]}",
+                "participantAlias": "participant-" + _hash("journal-participant", guild_id, row[1])[:8],
                 "displayName": str(row[2] or "").strip(),
                 "channelPolicy": row[3],
                 "summary": summary,
@@ -168,8 +372,40 @@ def public_conversations(conn: sqlite3.Connection, guild_id: int, start: str, en
 
 
 def _source_for_prompt(source: dict[str, Any]) -> dict[str, Any]:
-    allowed = {"refId", "sourceKind", "summary", "observedAt", "eventType", "channelPolicy"}
+    allowed = {"refId", "sourceKind", "summary", "observedAt", "eventType", "channelPolicy", "participantAlias"}
     return {k: v for k, v in source.items() if k in allowed and v not in (None, "")}
+
+
+def _evenly_sample(items: list[dict[str, Any]], limit: int) -> list[dict[str, Any]]:
+    """Keep chronological coverage without silently taking only the newest rows."""
+    if limit <= 0 or len(items) <= limit:
+        return list(items)
+    if limit == 1:
+        return [items[-1]]
+    indexes = {round(i * (len(items) - 1) / (limit - 1)) for i in range(limit)}
+    return [items[i] for i in sorted(indexes)]
+
+
+def _count_legacy_sources(conn: sqlite3.Connection, guild_id: int, start: str, end: str) -> tuple[int, int]:
+    relay_count = 0
+    conversation_count = 0
+    if table_exists(conn, "website_relay_history"):
+        relay_count = int(conn.execute(
+            "SELECT COUNT(*) FROM website_relay_history WHERE guild_id=? AND published_timestamp>=? AND published_timestamp<?",
+            (guild_id, start, end),
+        ).fetchone()[0])
+    if table_exists(conn, "conversations"):
+        cols = _cols(conn, "conversations")
+        public_usable_clause = " AND public_usable=1" if "public_usable" in cols else ""
+        visibility_clause = " AND visibility IN ('public','public_safe')" if "visibility" in cols else ""
+        role_clause = " AND role='user'" if "role" in cols else ""
+        conversation_count = int(conn.execute(
+            f"""SELECT COUNT(*) FROM conversations WHERE guild_id=?
+            AND channel_policy IN ({','.join('?' for _ in sorted(PUBLIC_POLICIES))})
+            AND timestamp>=? AND timestamp<? {public_usable_clause} {visibility_clause} {role_clause}""",
+            (guild_id, *sorted(PUBLIC_POLICIES), start, end),
+        ).fetchone()[0])
+    return relay_count, conversation_count
 
 
 def _subject_refs(packet: dict[str, Any]) -> set[str]:
@@ -220,30 +456,177 @@ def retrieve_history(db_path: str, guild_id: int, current_packet: dict[str, Any]
     }
 
 
-def build_source_packet(db_path: str, guild_id: int, hours: int = 72, now: Optional[str] = None) -> dict[str, Any]:
-    bounded_hours = max(1, min(int(hours or 72), 168))
-    end = now or utc_now_iso()
-    start = (datetime.fromisoformat(end.replace("Z", "+00:00")) - timedelta(hours=bounded_hours)).isoformat().replace("+00:00", "Z")
-    with sqlite3.connect(db_path) as conn:
-        relays = accepted_relays(conn, guild_id, start, end)
-        conversations = public_conversations(conn, guild_id, start, end)
-    private_sources = relays + conversations
+def _sample_source_kinds(relays: list[dict[str, Any]], conversations: list[dict[str, Any]], limit: int = MAX_PROMPT_SOURCES) -> list[dict[str, Any]]:
+    total = len(relays) + len(conversations)
+    if total <= limit:
+        chosen = list(relays) + list(conversations)
+    elif not relays:
+        chosen = _evenly_sample(conversations, limit)
+    elif not conversations:
+        chosen = _evenly_sample(relays, limit)
+    else:
+        relay_quota = min(len(relays), max(1, limit // 2))
+        conversation_quota = min(len(conversations), max(1, limit - relay_quota))
+        spare = limit - relay_quota - conversation_quota
+        if spare > 0:
+            add_relays = min(spare, len(relays) - relay_quota)
+            relay_quota += add_relays
+            conversation_quota += min(spare - add_relays, len(conversations) - conversation_quota)
+        chosen = _evenly_sample(relays, relay_quota) + _evenly_sample(conversations, conversation_quota)
+    return sorted(chosen, key=lambda src: (str(src.get("observedAt") or ""), str(src.get("sourceKind") or ""), str(src.get("refId") or "")))
+
+
+def build_packet_from_sources(
+    db_path: str,
+    guild_id: int,
+    start: str,
+    end: str,
+    relays: list[dict[str, Any]],
+    conversations: list[dict[str, Any]],
+    *,
+    entry_kind: str = "daily",
+    aggregate_counts: Optional[dict[str, Any]] = None,
+    observation_context: Optional[list[dict[str, Any]]] = None,
+    coverage_complete: bool = True,
+) -> dict[str, Any]:
+    private_sources = _sample_source_kinds(relays, conversations)
     safe_sources = [_source_for_prompt(src) for src in private_sources]
+    counts = dict(aggregate_counts or {})
+    counts.setdefault("eligibleRelays", len(relays))
+    counts.setdefault("eligibleConversations", len(conversations))
+    counts.setdefault("participants", len({x.get("subjectRef") for x in conversations if x.get("subjectRef")}))
+    counts.setdefault("channels", len({x.get("channelPolicy") for x in conversations if x.get("channelPolicy")}))
+    counts["promptRelays"] = len([s for s in private_sources if s.get("sourceKind") == "relay"])
+    counts["promptConversations"] = len([s for s in private_sources if s.get("sourceKind") == "conversation"])
     packet = {
+        "entryKind": entry_kind if entry_kind in {"daily", "weekly", "manual"} else "manual",
         "sourceWindowStart": start,
         "sourceWindowEnd": end,
         "safeSources": safe_sources,
         "privateSources": private_sources,
-        "candidateTopicTags": sorted({w for src in safe_sources for w in _norm(src.get("summary", "")).split() if len(w) > 4})[:20],
+        "candidateTopicTags": sorted({w for src in safe_sources for w in _norm(src.get("summary", "")).split() if len(w) > 4})[:30],
+        "aggregateCounts": counts,
+        "coverageComplete": bool(coverage_complete),
+        "observationContext": list(observation_context or []),
     }
     packet["history"] = retrieve_history(db_path, guild_id, packet)
-    packet["aggregateCounts"] = {
-        "eligibleRelays": len(relays),
-        "eligibleConversations": len(conversations),
-        "participants": len({x.get("subjectRef") for x in conversations}),
-        "channels": len({x.get("channelPolicy") for x in conversations}),
-    }
     return packet
+
+
+def build_source_packet_between(
+    db_path: str,
+    guild_id: int,
+    start: str,
+    end: str,
+    *,
+    entry_kind: str = "daily",
+    observation_context: Optional[list[dict[str, Any]]] = None,
+) -> dict[str, Any]:
+    try:
+        from bnl_journal_source_store import backfill_legacy_sources, query_source_events, timestamp_to_epoch_ms
+
+        backfill_legacy_sources(db_path, guild_id)
+        start_ms = timestamp_to_epoch_ms(start)
+        end_ms = timestamp_to_epoch_ms(end)
+        if start_ms is None or end_ms is None:
+            raise ValueError("invalid_source_window")
+        archived = query_source_events(db_path, guild_id, start_ms, end_ms)
+        relays: list[dict[str, Any]] = []
+        conversations: list[dict[str, Any]] = []
+        for event in archived.events:
+            if not event.get("public_usable") or not str(event.get("sanitized_summary") or "").strip():
+                continue
+            observed_at = datetime.fromtimestamp(int(event["occurred_at_ms"]) / 1000.0, tz=timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+            metadata = event.get("metadata") if isinstance(event.get("metadata"), dict) else {}
+            base = {
+                "refId": f"fresh:{int(event['event_seq'])}",
+                "summary": str(event.get("sanitized_summary") or "")[:1000],
+                "observedAt": observed_at,
+            }
+            if event.get("source_kind") == "discord_message":
+                subject_ref = str(event.get("subject_ref") or "")
+                source_key = str(event.get("source_key") or "")
+                message_id = metadata.get("messageId") or metadata.get("legacyMessageId")
+                if message_id in (None, "") and source_key.isdigit():
+                    message_id = int(source_key)
+                conversations.append({
+                    **base,
+                    "sourceKind": "conversation",
+                    "messageId": message_id or source_key,
+                    "subjectRef": subject_ref,
+                    "participantAlias": "participant-" + _hash("journal-participant", guild_id, subject_ref)[:8] if subject_ref else "",
+                    "displayName": str(event.get("private_display_name") or ""),
+                    "channelPolicy": str(event.get("channel_policy") or ""),
+                })
+            elif event.get("source_kind") == "website_relay":
+                relays.append({
+                    **base,
+                    "sourceKind": "relay",
+                    "relayId": str(event.get("source_key") or ""),
+                    "eventType": str(metadata.get("event_type") or metadata.get("eventType") or ""),
+                })
+        packet = build_packet_from_sources(
+            db_path,
+            guild_id,
+            start,
+            end,
+            relays,
+            conversations,
+            entry_kind=entry_kind,
+            aggregate_counts={
+                "eligibleRelays": len(relays),
+                "eligibleConversations": len(conversations),
+                "participants": len({x.get("subjectRef") for x in conversations if x.get("subjectRef")}),
+                "channels": int(archived.counts.get("uniqueChannels") or 0),
+                "archivedSourceEvents": int(archived.counts.get("total") or 0),
+            },
+            observation_context=observation_context,
+            # The archive activation watermark prevents the automatic
+            # publisher from claiming a full day that began before durable
+            # capture was enabled. Manual previews remain available during
+            # the first partial day.
+            coverage_complete=(
+                bool(archived.counts.get("coverageComplete"))
+                if entry_kind in {"daily", "weekly"}
+                else True
+            ),
+        )
+        packet["sourceArchiveAvailable"] = True
+        return packet
+    except (ImportError, sqlite3.Error, ValueError):
+        # Safe compatibility path for a partially deployed schema. Automation
+        # exposes this in private metadata so operators can see the downgrade.
+        pass
+    with sqlite3.connect(db_path) as conn:
+        relay_count, conversation_count = _count_legacy_sources(conn, guild_id, start, end)
+        relays = accepted_relays(conn, guild_id, start, end)
+        conversations = public_conversations(conn, guild_id, start, end)
+    packet = build_packet_from_sources(
+        db_path,
+        guild_id,
+        start,
+        end,
+        relays,
+        conversations,
+        entry_kind=entry_kind,
+        aggregate_counts={
+            "eligibleRelays": relay_count,
+            "eligibleConversations": conversation_count,
+            "participants": len({x.get("subjectRef") for x in conversations if x.get("subjectRef")}),
+            "channels": len({x.get("channelPolicy") for x in conversations if x.get("channelPolicy")}),
+        },
+        observation_context=observation_context,
+        coverage_complete=relay_count <= MAX_RELAY_SOURCES_PER_WINDOW and conversation_count <= MAX_CONVERSATION_SOURCES_PER_WINDOW,
+    )
+    packet["sourceArchiveAvailable"] = False
+    return packet
+
+
+def build_source_packet(db_path: str, guild_id: int, hours: int = 72, now: Optional[str] = None, *, entry_kind: str = "manual") -> dict[str, Any]:
+    bounded_hours = max(1, min(int(hours or 72), 168))
+    end = now or utc_now_iso()
+    start = (datetime.fromisoformat(end.replace("Z", "+00:00")) - timedelta(hours=bounded_hours)).isoformat().replace("+00:00", "Z")
+    return build_source_packet_between(db_path, guild_id, start, end, entry_kind=entry_kind)
 
 
 def _bounded_history_for_prompt(history: dict[str, Any]) -> dict[str, Any]:
@@ -261,13 +644,21 @@ def _bounded_history_for_prompt(history: dict[str, Any]) -> dict[str, Any]:
 
 
 def build_generation_prompt(packet: dict[str, Any], *, repair_reason: str = "", previous_output: str = "") -> str:
+    entry_kind = str(packet.get("entryKind") or "manual")
     safe_packet = {
+        "entryKind": entry_kind,
         "sourceWindowStart": packet.get("sourceWindowStart"),
         "sourceWindowEnd": packet.get("sourceWindowEnd"),
-        "freshSources": packet.get("safeSources", [])[:60],
+        "freshSources": packet.get("safeSources", [])[:MAX_PROMPT_SOURCES],
         "history": _bounded_history_for_prompt(packet.get("history", {})),
         "aggregateCounts": packet.get("aggregateCounts", {}),
+        "dailyObservations": packet.get("observationContext", [])[:7],
     }
+    cadence_rule = (
+        "\nThis is a weekly synthesis. Connect patterns across the supplied daily observations and current source evidence; do not merely list seven daily recaps."
+        if entry_kind == "weekly"
+        else "\nThis is a daily chronicle covering one complete source window. Distill the day instead of listing every relay."
+    )
     repair = ""
     if repair_reason:
         guidance = _REPAIR_GUIDANCE.get(
@@ -291,11 +682,12 @@ def build_generation_prompt(packet: dict[str, Any], *, repair_reason: str = "", 
         "\nBuild one coherent story around the most interesting grounded patterns. Use concrete music and community texture, active verbs, readable paragraphs, and selective detail. Avoid abstract jargon and inflated technical language."
         "\nUse a short, vivid title of about 4-10 words. Do not prefix it with Network Log. Keep the excerpt compact and inviting."
         "\nDescribe anonymous humans naturally as a producer, listener, regular, artist, or the room. Never call people entities or organisms. Do not invent nicknames, motives, relationships, dialogue, or conclusions."
+        "\nStable participant aliases in the packet are private pattern-analysis aids. Never reproduce an alias in public prose."
         "\nEvery section must cite at least one fresh sourceRefId from the current window. Older Journal material is continuity only, never proof of current activity."
         "\nParaphrase every source summary. Never repeat any sequence of five or more consecutive words from a fresh source summary."
         "\nKeep community members anonymous. Do not include direct quotes, URLs, mentions, IDs, sourceRef tokens in public prose, private intent, relationships, harassment, or internal schema/storage terms."
         "\nExclude personal or domestic details that are unnecessary to the public community story, especially details involving minors, interpersonal conflict, caregiving, or household obligations. Juicy means lively pattern recognition—not private gossip."
-        f"{repair}\nGeneration-safe packet:\n{json.dumps(safe_packet, ensure_ascii=False, sort_keys=True)}"
+        f"{cadence_rule}{repair}\nGeneration-safe packet:\n{json.dumps(safe_packet, ensure_ascii=False, sort_keys=True)}"
     )
 
 
@@ -360,13 +752,13 @@ def validate_article(article: dict[str, Any], packet: dict[str, Any], prior_titl
         return "no_new_source"
     refmap = article.get("sourceRefIds") or {}
     public_text = _public_text(article)
-    if re.search(r"\bfresh:\d+\b", public_text):
+    if any(str(ref) in public_text for ref in valid_refs) or re.search(r"\b(?:fresh|week):[a-z0-9:._-]+\b", public_text, re.I):
         return "source_ref_leak"
     for section in sections:
         refs = refmap.get(section.get("heading")) or section.get("sourceRefIds")
         if not refs or any(str(r) not in valid_refs for r in refs):
             return "invalid_section_source_refs"
-    if re.search(r"<@!?\d+>|@\w+|https?://|\b\d{12,}\b|relationship_journal|memory_tiers|source[- ]?file|dossier|private_metadata|sourceRefIds?", public_text, re.I):
+    if re.search(r"<@!?\d+>|@\w+|https?://|\b\d{12,}\b|participant-[a-f0-9]{8}|relationship_journal|memory_tiers|source[- ]?file|dossier|private_metadata|sourceRefIds?", public_text, re.I):
         return "public_leak_pattern"
     if re.search(r"[\"“”‘’]", public_text):
         return "direct_quote_or_quote_mark"
@@ -428,8 +820,10 @@ def _draft_records(guild_id: int, packet: dict[str, Any], article: dict[str, Any
     meta = dict(article.get("metadata") or {})
     meta.pop("subjectRefs", None)
     meta.update({
+        "entryKind": packet.get("entryKind", "manual"),
         "sourceWindowStart": packet["sourceWindowStart"],
         "sourceWindowEnd": packet["sourceWindowEnd"],
+        "coverageComplete": bool(packet.get("coverageComplete", True)),
         "supportingRelayIds": [s.get("relayId") for s in cited_sources if s.get("sourceKind") == "relay"],
         "supportingConversationRefs": [{k: v for k, v in s.items() if k in {"refId", "messageId", "subjectRef", "channelPolicy", "observedAt"}} for s in cited_sources if s.get("sourceKind") == "conversation"],
         "subjectRefs": sorted({str(s.get("subjectRef")) for s in cited_sources if s.get("subjectRef")}),
@@ -462,10 +856,18 @@ def store_validated_draft(db_path: str, guild_id: int, packet: dict[str, Any], a
     return result
 
 
-def generate_and_store_draft(db_path: str, guild_id: int, hours: int, generator: Callable[[dict[str, Any], str], str]) -> JournalResult:
-    packet = build_source_packet(db_path, guild_id, hours)
+def generate_and_store_packet_draft(
+    db_path: str,
+    guild_id: int,
+    packet: dict[str, Any],
+    generator: Callable[[dict[str, Any], str], str],
+    *,
+    entry_id: str = "",
+) -> JournalResult:
+    if not packet.get("coverageComplete", True):
+        return JournalResult(False, "no_draft", "incomplete_source_window", entry_id=entry_id)
     if not packet.get("safeSources"):
-        return JournalResult(False, "no_draft", "insufficient_grounded_material")
+        return JournalResult(False, "no_draft", "insufficient_grounded_material", entry_id=entry_id)
     prompt = build_generation_prompt(packet)
     last_reason = ""
     previous_output = ""
@@ -481,7 +883,7 @@ def generate_and_store_draft(db_path: str, guild_id: int, hours: int, generator:
             )
         except Exception as exc:
             reason = "quota_unavailable" if "quota" in str(exc).lower() else "provider_failure"
-            return JournalResult(False, "no_draft", reason)
+            return JournalResult(False, "no_draft", reason, entry_id=entry_id)
         previous_output = raw
         try:
             article = parse_generated_json(raw)
@@ -491,9 +893,23 @@ def generate_and_store_draft(db_path: str, guild_id: int, hours: int, generator:
         with sqlite3.connect(db_path) as conn:
             validation = validate_article(article, packet, _prior_titles(conn, guild_id))
         if not validation:
-            return store_validated_draft(db_path, guild_id, packet, article)
+            return store_validated_draft(db_path, guild_id, packet, article, entry_id=entry_id)
         last_reason = validation
-    return JournalResult(False, "no_draft", last_reason or "generation_failed")
+    return JournalResult(False, "no_draft", last_reason or "generation_failed", entry_id=entry_id)
+
+
+def generate_and_store_draft(
+    db_path: str,
+    guild_id: int,
+    hours: int,
+    generator: Callable[[dict[str, Any], str], str],
+    *,
+    entry_id: str = "",
+    entry_kind: str = "manual",
+    now: Optional[str] = None,
+) -> JournalResult:
+    packet = build_source_packet(db_path, guild_id, hours, now, entry_kind=entry_kind)
+    return generate_and_store_packet_draft(db_path, guild_id, packet, generator, entry_id=entry_id)
 
 
 def approve_draft(db_path: str, guild_id: int, entry_id: str, content_hash: str, revision: Optional[int] = None) -> JournalResult:
@@ -594,14 +1010,8 @@ def regenerate_draft(db_path: str, guild_id: int, entry_id: str, hours: int, gen
     return result
 
 
-def deliver_approved(db_path: str, guild_id: int, entry_id: str, base_url: str, api_key: str, opener=None, timeout: int = 10, revision: Optional[int] = None) -> JournalResult:
-    ensure_schema(db_path)
+def _post_canonical_payload(canonical: bytes, base_url: str, api_key: str, opener, timeout: int) -> tuple[str, str, int, bool, str]:
     opener = opener or urllib.request.urlopen
-    with sqlite3.connect(db_path) as conn:
-        row = conn.execute("SELECT revision,canonical_payload_bytes,content_hash FROM bnl_journal_entries WHERE guild_id=? AND entry_id=? AND lifecycle_state IN ('approved_pending_delivery','delivery_failed') " + ("AND revision=?" if revision is not None else "ORDER BY revision DESC LIMIT 1"), (guild_id, entry_id, revision) if revision is not None else (guild_id, entry_id)).fetchone()
-    if not row:
-        return JournalResult(False, "not_deliverable", "not_approved", entry_id)
-    rev, canonical, content_hash = int(row[0]), row[1], row[2]
     req = urllib.request.Request(base_url.rstrip("/") + "/api/bnl/journal", data=canonical, method="POST", headers={"Content-Type": "application/json", "x-api-key": api_key})
     status = "delivery_failed"; reason = "retryable_delivery_failure"; http = 0; idem = False; published = ""
     try:
@@ -625,9 +1035,26 @@ def deliver_approved(db_path: str, guild_id: int, entry_id: str, base_url: str, 
         else:
             reason = "http_rejected"
     except urllib.error.HTTPError as exc:
-        http = exc.code; reason = "endpoint_not_found" if exc.code == 404 else ("journal_id_conflict" if exc.code == 409 else "http_rejected")
+        http = exc.code
+        reason = (
+            "endpoint_not_found" if exc.code == 404
+            else "authentication_failed" if exc.code in (401, 403)
+            else "journal_id_conflict" if exc.code == 409
+            else "http_rejected"
+        )
     except Exception:
         reason = "retryable_delivery_failure"
+    return status, reason, int(http or 0), idem, published
+
+
+def deliver_approved(db_path: str, guild_id: int, entry_id: str, base_url: str, api_key: str, opener=None, timeout: int = 10, revision: Optional[int] = None) -> JournalResult:
+    ensure_schema(db_path)
+    with sqlite3.connect(db_path) as conn:
+        row = conn.execute("SELECT revision,canonical_payload_bytes,content_hash FROM bnl_journal_entries WHERE guild_id=? AND entry_id=? AND lifecycle_state IN ('approved_pending_delivery','delivery_failed') " + ("AND revision=?" if revision is not None else "ORDER BY revision DESC LIMIT 1"), (guild_id, entry_id, revision) if revision is not None else (guild_id, entry_id)).fetchone()
+    if not row:
+        return JournalResult(False, "not_deliverable", "not_approved", entry_id)
+    rev, canonical, content_hash = int(row[0]), row[1], row[2]
+    status, reason, http, idem, published = _post_canonical_payload(canonical, base_url, api_key, opener, timeout)
     now = utc_now_iso()
     with sqlite3.connect(db_path) as conn:
         with conn:
@@ -636,6 +1063,50 @@ def deliver_approved(db_path: str, guild_id: int, entry_id: str, base_url: str, 
             if cur1.rowcount != 1 or cur2.rowcount != 1:
                 raise sqlite3.IntegrityError("journal_delivery_sync_failed")
     return JournalResult(status == "published", status, reason, entry_id, rev, content_hash, http, idem)
+
+
+def rehydrate_published_entries(
+    db_path: str,
+    guild_id: int,
+    base_url: str,
+    api_key: str,
+    *,
+    opener=None,
+    timeout: int = 10,
+) -> dict[str, Any]:
+    """Re-send exact published payloads after a disposable site cache loss.
+
+    This never regenerates prose or changes revision history. The website's
+    immutable/idempotent Journal endpoint either restores the exact record or
+    acknowledges that it is already present.
+    """
+    ensure_schema(db_path)
+    if not base_url or not api_key:
+        return {"ok": False, "reason": "website_configuration_missing", "attempted": 0, "restored": 0, "failed": 0}
+    with sqlite3.connect(db_path) as conn:
+        rows = conn.execute(
+            """SELECT entry_id,revision,canonical_payload_bytes,content_hash
+               FROM bnl_journal_entries
+               WHERE guild_id=? AND lifecycle_state='published'
+               ORDER BY COALESCE(published_at,created_at) ASC,entry_id ASC,revision ASC""",
+            (guild_id,),
+        ).fetchall()
+    restored = 0
+    failed: list[dict[str, Any]] = []
+    for entry_id, revision, canonical, _content_hash in rows:
+        status, reason, http, _idem, _published = _post_canonical_payload(canonical, base_url, api_key, opener, timeout)
+        if status == "published":
+            restored += 1
+        else:
+            failed.append({"entryId": str(entry_id), "revision": int(revision), "reason": reason, "httpStatus": http})
+    return {
+        "ok": not failed,
+        "reason": "" if not failed else "one_or_more_entries_failed",
+        "attempted": len(rows),
+        "restored": restored,
+        "failed": len(failed),
+        "failures": failed[:20],
+    }
 
 
 def preview(db_path: str, guild_id: int, entry_id: Optional[str] = None, revision: Optional[int] = None) -> Optional[dict[str, Any]]:

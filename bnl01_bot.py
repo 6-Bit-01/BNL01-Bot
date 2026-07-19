@@ -74,7 +74,22 @@ from bnl_journal import (
     generate_and_store_draft as generate_and_store_journal_draft,
     preview as preview_journal_draft,
     regenerate_draft as regenerate_journal_draft,
+    rehydrate_published_entries as rehydrate_published_journal_entries,
     reject_draft as reject_journal_draft,
+)
+from bnl_journal_source_store import (
+    purge_guild_discord_sources as purge_guild_journal_sources,
+    purge_user_discord_sources as purge_user_journal_sources,
+    record_source_event as record_journal_source_event,
+    sanitize_summary as sanitize_journal_source_summary,
+    timestamp_to_epoch_ms as journal_timestamp_to_epoch_ms,
+)
+from bnl_journal_automation import (
+    automation_status as journal_automation_status,
+    result_dict as journal_automation_result_dict,
+    run_daily as run_daily_journal_automation,
+    run_scheduled as run_scheduled_journal_automation,
+    run_weekly as run_weekly_journal_automation,
 )
 from bnl_website_contract_v2 import (
     ContractV2Error,
@@ -309,6 +324,7 @@ BNL_OWNER_USER_ID = int(os.getenv("BNL_OWNER_USER_ID", "0") or 0)
 BNL_MOD_ROLE_ID = int(os.getenv("BNL_MOD_ROLE_ID", "0") or 0)
 BNL_TESTING_CHANNEL_ID = int(os.getenv("BNL_TESTING_CHANNEL_ID", "0") or 0)
 BNL_BROADCAST_MEMORY_CHANNEL_ID = int(os.getenv("BNL_BROADCAST_MEMORY_CHANNEL_ID", "1509384896554995752") or 0)
+BNL_JOURNAL_AUTOMATION_ENABLED = os.getenv("BNL_JOURNAL_AUTOMATION_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
 BNL_COMMUNITY_SCOUTING_ENABLED = community_scouting_enabled()
 BNL_COMMUNITY_SCOUTING_MIN_SIGNALS = community_min_signals()
 
@@ -1088,6 +1104,7 @@ _classification_last_missing_info_count = 0
 BNL_CONTROL_FLAGS_TTL_SECONDS = 300
 _bnl_control_flags_cache = None
 _bnl_control_flags_cached_at = None
+_bnl_control_flags_has_remote_snapshot = False
 _bnl_control_flags_404_warned = False
 _bnl_control_flags_last_source_url = None
 BNL_READ_MODEL_TTL_SECONDS = 20
@@ -1130,13 +1147,19 @@ def get_bnl_control_flags(force_refresh: bool = False) -> dict:
       websiteRelayEnabled: True
       heartbeatEnabled: True
       showdayDiscordPostsEnabled: False
+      journalAutoPublishEnabled: True
+      journalDailyEnabled: True
+      journalWeeklyEnabled: True
     """
-    global _bnl_control_flags_cache, _bnl_control_flags_cached_at, _bnl_control_flags_404_warned, _bnl_control_flags_last_source_url
+    global _bnl_control_flags_cache, _bnl_control_flags_cached_at, _bnl_control_flags_has_remote_snapshot, _bnl_control_flags_404_warned, _bnl_control_flags_last_source_url
     now = datetime.now(PACIFIC_TZ)
     defaults = {
         "websiteRelayEnabled": True,
         "heartbeatEnabled": True,
         "showdayDiscordPostsEnabled": False,
+        "journalAutoPublishEnabled": True,
+        "journalDailyEnabled": True,
+        "journalWeeklyEnabled": True,
     }
 
     if not force_refresh and _bnl_control_flags_cache and _bnl_control_flags_cached_at:
@@ -1169,13 +1192,28 @@ def get_bnl_control_flags(force_refresh: bool = False) -> dict:
                     continue
                 body = response.read().decode("utf-8", errors="replace")
                 data = json.loads(body) if body else {}
+                journal_keys = {
+                    "journalAutoPublishEnabled",
+                    "journalDailyEnabled",
+                    "journalWeeklyEnabled",
+                }
+                if not isinstance(data, dict) or not journal_keys.issubset(data):
+                    logging.warning(
+                        "⚠️ Control flags response from %s omitted required Journal flags; ignoring it.",
+                        url,
+                    )
+                    continue
                 flags = {
                     "websiteRelayEnabled": _coerce_flag(data.get("websiteRelayEnabled"), defaults["websiteRelayEnabled"]),
                     "heartbeatEnabled": _coerce_flag(data.get("heartbeatEnabled"), defaults["heartbeatEnabled"]),
                     "showdayDiscordPostsEnabled": _coerce_flag(data.get("showdayDiscordPostsEnabled"), defaults["showdayDiscordPostsEnabled"]),
+                    "journalAutoPublishEnabled": _coerce_flag(data.get("journalAutoPublishEnabled"), defaults["journalAutoPublishEnabled"]),
+                    "journalDailyEnabled": _coerce_flag(data.get("journalDailyEnabled"), defaults["journalDailyEnabled"]),
+                    "journalWeeklyEnabled": _coerce_flag(data.get("journalWeeklyEnabled"), defaults["journalWeeklyEnabled"]),
                 }
                 _bnl_control_flags_cache = flags
                 _bnl_control_flags_cached_at = now
+                _bnl_control_flags_has_remote_snapshot = True
                 _bnl_control_flags_last_source_url = url
                 logging.info(f"🌐 Control flags fetched from {url} (HTTP {code}).")
                 return flags
@@ -1193,10 +1231,19 @@ def get_bnl_control_flags(force_refresh: bool = False) -> dict:
         except Exception as e:
             logging.warning(f"⚠️ Control flags fetch failed for {url}: {e}")
 
+    if _bnl_control_flags_has_remote_snapshot and _bnl_control_flags_cache:
+        logging.warning(
+            "⚠️ All control flag fetches failed; retaining the last confirmed remote flags."
+        )
+        return dict(_bnl_control_flags_cache)
+
+    # Preserve the historical local-startup behavior when no control plane has
+    # ever answered. These defaults are not marked as a confirmed remote
+    # snapshot and therefore cannot overwrite a later confirmed pause state.
     _bnl_control_flags_cache = defaults
     _bnl_control_flags_cached_at = now
     _bnl_control_flags_last_source_url = None
-    return defaults
+    return dict(defaults)
 
 
 def fetch_bnl_read_model(force: bool = False) -> dict:
@@ -2692,6 +2739,8 @@ _force_pull_state_by_guild: dict[int, dict] = {}
 _force_pull_tasks_by_guild: dict[int, asyncio.Task] = {}
 _force_pull_request_id_by_guild: dict[int, str] = {}
 _force_pull_recent_requests_by_peer: dict[str, deque] = defaultdict(lambda: deque(maxlen=8))
+_journal_automation_locks_by_guild: dict[int, asyncio.Lock] = {}
+_journal_automation_runtime_by_guild: dict[int, dict] = {}
 FORCE_PULL_THROTTLE_SECONDS = 10
 FORCE_PULL_THROTTLE_MAX_REQUESTS = 4
 
@@ -5853,7 +5902,10 @@ def _format_rd_entity_context_response(subject: str, context: dict) -> str:
 
 
 def _parse_journal_command(text: str) -> tuple[bool, dict, str]:
-    m = re.match(r"(?is)^\s*!bnl\s+journal\s+(create|preview|regenerate|reject|approve|retry)\b(.*)$", text or "")
+    m = re.match(
+        r"(?is)^\s*!bnl\s+journal\s+(create|preview|regenerate|reject|approve|retry|status|run-daily|run-weekly|rehydrate)\b(.*)$",
+        text or "",
+    )
     if not m:
         return False, {}, ""
     action = m.group(1).lower()
@@ -5897,6 +5949,321 @@ def _generate_journal_json_sync(_packet: dict, prompt: str) -> str:
     return text or ""
 
 
+def _journal_control_url() -> str:
+    explicit = os.getenv("BNL_JOURNAL_CONTROL_URL", "").strip()
+    if explicit:
+        return explicit.rstrip("/")
+    base = _journal_website_base_url()
+    return f"{base}/api/bnl/journal/control" if base else ""
+
+
+def _journal_control_request_sync(method: str, payload: dict | None = None) -> tuple[dict | None, str]:
+    """Read or update the website control plane without making it a runtime dependency."""
+    url = _journal_control_url()
+    if not url or not BNL_API_KEY:
+        return None, "control_plane_configuration_missing"
+    body = None
+    headers = {"Accept": "application/json", "x-api-key": BNL_API_KEY}
+    if payload is not None:
+        body = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    request = urllib.request.Request(url, data=body, method=method.upper(), headers=headers)
+    try:
+        with urllib.request.urlopen(request, timeout=10) as response:
+            status = int(getattr(response, "status", None) or response.getcode())
+            raw = response.read().decode("utf-8", errors="replace")
+            data = json.loads(raw) if raw else {}
+            if not 200 <= status < 300 or not isinstance(data, dict):
+                return None, f"control_plane_http_{status}"
+            return data, ""
+    except urllib.error.HTTPError as exc:
+        return None, f"control_plane_http_{int(exc.code or 0)}"
+    except Exception as exc:
+        return None, f"control_plane_{type(exc).__name__.lower()}"
+
+
+def _journal_control_flags(control: dict | None, fallback: dict) -> dict:
+    flags = dict(fallback or {})
+    if isinstance(control, dict):
+        config = control.get("config") if isinstance(control.get("config"), dict) else {}
+        for key in ("journalAutoPublishEnabled", "journalDailyEnabled", "journalWeeklyEnabled"):
+            value = control.get(key, config.get(key))
+            if isinstance(value, bool):
+                flags[key] = value
+    return flags
+
+
+def _journal_control_claim_sync(control: dict | None) -> tuple[dict | None, str]:
+    requests = control.get("runRequests") if isinstance(control, dict) else None
+    if not isinstance(requests, list):
+        return None, ""
+    candidates = [item for item in requests if isinstance(item, dict) and item.get("status") == "queued"]
+    # A request left running by a process crash is safe to reclaim only with
+    # this VPS worker's stable token. The site rejects a different worker.
+    candidates.extend(
+        item for item in requests
+        if isinstance(item, dict) and item.get("status") == "running" and item not in candidates
+    )
+    worker_identity = (
+        os.getenv("BNL_JOURNAL_WORKER_ID", "").strip()
+        or os.getenv("HOSTNAME", "").strip()
+        or "bnl01-primary"
+    )
+    for candidate in candidates:
+        request_id = str(candidate.get("requestId") or "")[:120]
+        cadence = str(candidate.get("cadence") or "").lower()
+        if not request_id or cadence not in {"daily", "weekly"}:
+            continue
+        claim_token = "worker-" + hashlib.sha256(
+            f"{worker_identity}|{request_id}".encode("utf-8")
+        ).hexdigest()[:32]
+        data, reason = _journal_control_request_sync("POST", {
+            "action": "claimRunRequest",
+            "requestId": request_id,
+            "claimedAt": _utc_now_iso(),
+            "claimToken": claim_token,
+        })
+        if data and isinstance(data.get("request"), dict):
+            return data["request"], ""
+        if reason in {"control_plane_http_404", "control_plane_http_409"}:
+            continue
+        return None, reason or "claim_response_invalid"
+    return None, ""
+
+
+def _journal_site_run_state(status: str) -> str:
+    normalized = str(status or "").strip().lower()
+    if normalized in {
+        "running", "published", "held", "delivery_failed", "busy", "backoff",
+        "failed", "complete", "already_processed", "disabled",
+    }:
+        return normalized
+    if normalized in {"paused"}:
+        return "disabled"
+    if normalized in {"quiet", "deferred", "not_due"}:
+        return "skipped"
+    return "failed"
+
+
+def _journal_site_run_record(result: dict, *, guild_id: int, request_id: str = "") -> dict:
+    cadence = str(result.get("cadence") or "all")[:16]
+    start = str(result.get("source_window_start") or "")
+    end = str(result.get("source_window_end") or "")
+    entry_id = str(result.get("entry_id") or "")[:160]
+    stable_key = f"{guild_id}|{cadence}|{start}|{end}|{entry_id}|{request_id}"
+    run_id = request_id or ("jsite_" + hashlib.sha256(stable_key.encode("utf-8")).hexdigest()[:20])
+    counts = result.get("aggregate_counts") if isinstance(result.get("aggregate_counts"), dict) else {}
+    source_count = int(counts.get("eligibleRelays") or 0) + int(counts.get("eligibleConversations") or 0)
+    run = {
+        "runId": run_id[:160],
+        "cadence": cadence if cadence in {"daily", "weekly"} else "daily",
+        "state": _journal_site_run_state(str(result.get("status") or "failed")),
+        "occurredAt": _utc_now_iso(),
+        "detail": str(result.get("reason") or "")[:240],
+    }
+    if request_id:
+        run["requestId"] = request_id[:120]
+    if entry_id:
+        run["entryId"] = entry_id
+    if source_count:
+        run["sourceCount"] = source_count
+    return run
+
+
+def _journal_report_run_sync(result: dict, *, guild_id: int, request_id: str = "") -> tuple[dict | None, str]:
+    run = _journal_site_run_record(result, guild_id=guild_id, request_id=request_id)
+    return _journal_control_request_sync("POST", {"action": "reportRun", "run": run})
+
+
+def _journal_heartbeat_sync(runtime: dict, flags: dict) -> tuple[dict | None, str]:
+    last_site_run = runtime.get("lastSiteRun") if isinstance(runtime.get("lastSiteRun"), dict) else None
+    if not BNL_JOURNAL_AUTOMATION_ENABLED or not flags.get("journalAutoPublishEnabled", True):
+        automation_status = "paused"
+    elif runtime.get("lastError"):
+        automation_status = "degraded"
+    else:
+        automation_status = "online"
+    telemetry = {
+        "observedAt": _utc_now_iso(),
+        "automationStatus": automation_status,
+        "detail": str(runtime.get("lastError") or runtime.get("lastDetail") or "scheduler_ready")[:240],
+    }
+    if runtime.get("nextDailyAt"):
+        telemetry["nextDailyAt"] = str(runtime["nextDailyAt"])
+    if runtime.get("nextWeeklyAt"):
+        telemetry["nextWeeklyAt"] = str(runtime["nextWeeklyAt"])
+    if last_site_run:
+        telemetry["lastRun"] = last_site_run
+    return _journal_control_request_sync("POST", {"action": "heartbeat", "telemetry": telemetry})
+
+
+def _journal_automation_lock(guild_id: int) -> asyncio.Lock:
+    lock = _journal_automation_locks_by_guild.get(int(guild_id))
+    if lock is None:
+        lock = asyncio.Lock()
+        _journal_automation_locks_by_guild[int(guild_id)] = lock
+    return lock
+
+
+def _journal_control_result(cadence: str, status: str, reason: str) -> dict:
+    return {
+        "ok": False,
+        "cadence": cadence,
+        "status": status,
+        "reason": reason,
+        "entry_id": "",
+        "revision": 0,
+        "source_window_start": "",
+        "source_window_end": "",
+        "aggregate_counts": {},
+    }
+
+
+async def run_journal_automation_once(
+    guild_id: int,
+    *,
+    cadence: str = "scheduled",
+    force: bool = False,
+    flags: dict | None = None,
+) -> list[dict]:
+    """Serialize generation/delivery per guild and enforce every automation control flag."""
+    guild_id = resolve_network_guild_id(int(guild_id))
+    cadence = str(cadence or "scheduled").lower()
+    lock = _journal_automation_lock(guild_id)
+    if lock.locked():
+        return [_journal_control_result(cadence, "busy", "journal_automation_already_running")]
+    async with lock:
+        runtime = _journal_automation_runtime_by_guild.setdefault(guild_id, {})
+        runtime.update({"lastStartedAt": _utc_now_iso(), "lastError": "", "lastCadence": cadence})
+        if not BNL_JOURNAL_AUTOMATION_ENABLED:
+            results = [_journal_control_result(cadence, "paused", "local_automation_disabled")]
+        else:
+            effective_flags = flags
+            if effective_flags is None:
+                effective_flags = await asyncio.to_thread(get_bnl_control_flags, force_refresh=force)
+            if not effective_flags.get("journalAutoPublishEnabled", True):
+                results = [_journal_control_result(cadence, "paused", "auto_publish_paused")]
+            elif cadence == "daily" and not effective_flags.get("journalDailyEnabled", True):
+                results = [_journal_control_result("daily", "paused", "daily_automation_paused")]
+            elif cadence == "weekly" and not effective_flags.get("journalWeeklyEnabled", True):
+                results = [_journal_control_result("weekly", "paused", "weekly_automation_paused")]
+            elif cadence == "daily":
+                result = await asyncio.to_thread(
+                    run_daily_journal_automation,
+                    DB_FILE,
+                    guild_id,
+                    _generate_journal_json_sync,
+                    _journal_website_base_url(),
+                    BNL_API_KEY,
+                    force=force,
+                )
+                results = [journal_automation_result_dict(result)]
+            elif cadence == "weekly":
+                result = await asyncio.to_thread(
+                    run_weekly_journal_automation,
+                    DB_FILE,
+                    guild_id,
+                    _generate_journal_json_sync,
+                    _journal_website_base_url(),
+                    BNL_API_KEY,
+                    force=force,
+                )
+                results = [journal_automation_result_dict(result)]
+            else:
+                scheduled = await asyncio.to_thread(
+                    run_scheduled_journal_automation,
+                    DB_FILE,
+                    guild_id,
+                    _generate_journal_json_sync,
+                    _journal_website_base_url(),
+                    BNL_API_KEY,
+                    effective_flags,
+                )
+                results = [journal_automation_result_dict(item) for item in scheduled]
+        runtime.update({
+            "lastCompletedAt": _utc_now_iso(),
+            "lastResults": results,
+            "lastDetail": "; ".join(str(item.get("reason") or item.get("status") or "") for item in results)[:240],
+        })
+        logging.info(
+            "journal_automation_cycle guild=%s cadence=%s results=%s",
+            guild_id,
+            cadence,
+            ",".join(f"{item.get('cadence')}:{item.get('status')}" for item in results),
+        )
+        return results
+
+
+async def run_journal_automation_control_cycle(guild_id: int) -> list[dict]:
+    """Poll admin controls, claim at most one Run Now request, then run/report safely."""
+    guild_id = resolve_network_guild_id(int(guild_id))
+    base_flags = await asyncio.to_thread(get_bnl_control_flags)
+    control, control_error = await asyncio.to_thread(_journal_control_request_sync, "GET")
+    if control is not None and (
+        not isinstance(control.get("config"), dict)
+        or not isinstance(control.get("runRequests"), list)
+    ):
+        control = None
+        control_error = control_error or "control_plane_response_invalid"
+    flags = _journal_control_flags(control, base_flags)
+    if control is None:
+        reason = "control_plane_unavailable:%s" % (control_error or "control_get_failed")
+        results = [_journal_control_result("scheduled", "held", reason)]
+        runtime = _journal_automation_runtime_by_guild.setdefault(guild_id, {})
+        runtime.update({
+            "lastCompletedAt": _utc_now_iso(),
+            "lastResults": results,
+            "lastDetail": reason[:240],
+            "lastError": reason[:240],
+        })
+        logging.warning(
+            "journal_automation_cycle_held guild=%s reason=%s",
+            guild_id,
+            reason,
+        )
+        await asyncio.to_thread(_journal_heartbeat_sync, runtime, flags)
+        return results
+    claimed = None
+    if control is not None:
+        claimed, claim_error = await asyncio.to_thread(_journal_control_claim_sync, control)
+        control_error = claim_error or control_error
+    request_id = str((claimed or {}).get("requestId") or "")[:120]
+    cadence = str((claimed or {}).get("cadence") or "scheduled").lower()
+    if claimed:
+        await asyncio.to_thread(_journal_control_request_sync, "POST", {
+            "action": "reportRun",
+            "run": {
+                "runId": request_id,
+                "cadence": cadence,
+                "state": "running",
+                "occurredAt": _utc_now_iso(),
+                "requestId": request_id,
+                "detail": "claimed_by_bot_scheduler",
+            },
+        })
+    results = await run_journal_automation_once(
+        guild_id,
+        cadence=cadence if cadence in {"daily", "weekly"} else "scheduled",
+        force=bool(claimed),
+        flags=flags,
+    )
+    local_status = await asyncio.to_thread(journal_automation_status, DB_FILE, guild_id)
+    for result in results:
+        if claimed or result.get("status") not in {"not_due", "paused"}:
+            await asyncio.to_thread(_journal_report_run_sync, result, guild_id=guild_id, request_id=request_id)
+    runtime = _journal_automation_runtime_by_guild.setdefault(guild_id, {})
+    runtime["nextDailyAt"] = local_status.get("nextDailyAt") or ""
+    runtime["nextWeeklyAt"] = local_status.get("nextWeeklyAt") or ""
+    reported = [item for item in results if claimed or item.get("status") not in {"not_due", "paused"}]
+    if reported:
+        runtime["lastSiteRun"] = _journal_site_run_record(
+            reported[-1], guild_id=guild_id, request_id=request_id
+        )
+    runtime["lastError"] = control_error
+    await asyncio.to_thread(_journal_heartbeat_sync, runtime, flags)
+    return results
+
+
 async def maybe_handle_journal_command(message: discord.Message, clean_content: str) -> bool:
     matched, options, _ = _parse_journal_command(clean_content)
     if not matched:
@@ -5916,6 +6283,57 @@ async def maybe_handle_journal_command(message: discord.Message, clean_content: 
     action = options.get("action")
     guild_id = message.guild.id
     try:
+        if action == "status":
+            flags = await asyncio.to_thread(get_bnl_control_flags, force_refresh=True)
+            control, control_error = await asyncio.to_thread(_journal_control_request_sync, "GET")
+            flags = _journal_control_flags(control, flags)
+            status = await asyncio.to_thread(journal_automation_status, DB_FILE, guild_id)
+            last_state = status.get("lastState") if isinstance(status.get("lastState"), dict) else {}
+            await message.reply(
+                "Journal automation: "
+                f"local=`{'on' if BNL_JOURNAL_AUTOMATION_ENABLED else 'off'}` "
+                f"auto=`{'on' if flags.get('journalAutoPublishEnabled', True) else 'off'}` "
+                f"daily=`{'on' if flags.get('journalDailyEnabled', True) else 'off'}` "
+                f"weekly=`{'on' if flags.get('journalWeeklyEnabled', True) else 'off'}` "
+                f"last=`{last_state.get('last_status') or 'none'}` "
+                f"reason=`{last_state.get('last_reason') or control_error or 'none'}`"
+            )
+            return True
+        if action in {"run-daily", "run-weekly"}:
+            cadence = "daily" if action == "run-daily" else "weekly"
+            flags = await asyncio.to_thread(get_bnl_control_flags, force_refresh=True)
+            control, _ = await asyncio.to_thread(_journal_control_request_sync, "GET")
+            flags = _journal_control_flags(control, flags)
+            results = await run_journal_automation_once(guild_id, cadence=cadence, force=True, flags=flags)
+            for item in results:
+                await asyncio.to_thread(_journal_report_run_sync, item, guild_id=guild_id)
+            _journal_automation_runtime_by_guild.setdefault(guild_id, {})["lastSiteRun"] = (
+                _journal_site_run_record(results[-1], guild_id=guild_id)
+            )
+            item = results[-1]
+            counts = item.get("aggregate_counts") if isinstance(item.get("aggregate_counts"), dict) else {}
+            source_count = int(counts.get("eligibleRelays") or 0) + int(counts.get("eligibleConversations") or 0)
+            await message.reply(
+                f"Journal {cadence} run: state=`{item.get('status')}` reason=`{item.get('reason') or 'none'}` "
+                f"entry=`{item.get('entry_id') or 'none'}` sources=`{source_count}`"
+            )
+            return True
+        if action == "rehydrate":
+            result = await asyncio.to_thread(
+                rehydrate_published_journal_entries,
+                DB_FILE,
+                guild_id,
+                _journal_website_base_url(),
+                BNL_API_KEY,
+            )
+            await message.reply(
+                "Journal website restore: "
+                f"attempted=`{int(result.get('attempted') or 0)}` "
+                f"restored=`{int(result.get('restored') or 0)}` "
+                f"failed=`{int(result.get('failed') or 0)}` "
+                f"reason=`{result.get('reason') or 'none'}`"
+            )
+            return True
         if action == "create":
             hours = _parse_journal_hours(options.get("hours") or options.get("window"))
             result = await asyncio.to_thread(generate_and_store_journal_draft, DB_FILE, guild_id, hours, _generate_journal_json_sync)
@@ -7638,7 +8056,29 @@ def insert_backfilled_conversation_row(*, guild_id: int, channel_id: int, channe
                 """,
                 (user_id, user_name, guild_id, (channel_name or "").lower()[:80], (channel_policy or "unknown")[:40], int(channel_id or 0), content, timestamp),
             )
+        row_id = int(cur.lastrowid or 0)
         conn.commit()
+        if (channel_policy or "").strip().lower() in PUBLIC_CHAT_POLICIES:
+            try:
+                occurred_at_ms = journal_timestamp_to_epoch_ms(timestamp)
+                if occurred_at_ms is not None:
+                    record_journal_source_event(
+                        DB_FILE,
+                        guild_id=guild_id,
+                        source_kind="discord_message",
+                        source_key=str(int(message_id or 0)) if int(message_id or 0) else f"legacy_row:{row_id}",
+                        occurred_at_ms=occurred_at_ms,
+                        raw_text=content,
+                        sanitized_summary=sanitize_journal_source_summary(content, [user_name]),
+                        channel_id=int(channel_id or 0) or None,
+                        channel_policy=(channel_policy or "unknown")[:40],
+                        subject_ref=f"discord_user:{user_id}",
+                        private_display_name=user_name,
+                        public_usable=True,
+                        metadata={"messageId": int(message_id or 0) or None, "conversationRowId": row_id, "source": "discord_backfill"},
+                    )
+            except Exception as exc:
+                logging.warning("journal_source_capture_failed source=discord_backfill row_id=%s error_type=%s", row_id, type(exc).__name__)
         return True
     finally:
         conn.close()
@@ -9656,6 +10096,31 @@ def save_user_message(user_id: int, user_name: str, guild_id: int, content: str,
     observed_at = observed_at[0] if observed_at else ""
     conn.commit()
     conn.close()
+    if (channel_policy or "").strip().lower() in PUBLIC_CHAT_POLICIES:
+        try:
+            occurred_at_ms = journal_timestamp_to_epoch_ms(observed_at)
+            if occurred_at_ms is not None:
+                record_journal_source_event(
+                    DB_FILE,
+                    guild_id=guild_id,
+                    source_kind="discord_message",
+                    source_key=str(int(message_id or 0)) if int(message_id or 0) else f"legacy_row:{row_id}",
+                    occurred_at_ms=occurred_at_ms,
+                    raw_text=content,
+                    sanitized_summary=sanitize_journal_source_summary(content, [user_name]),
+                    channel_id=int(channel_id or 0) or None,
+                    channel_policy=(channel_policy or "unknown")[:40],
+                    subject_ref=f"discord_user:{user_id}",
+                    private_display_name=user_name,
+                    public_usable=True,
+                    metadata={
+                        "messageId": int(message_id or 0) or None,
+                        "conversationRowId": row_id,
+                        "routeMode": route_mode,
+                    },
+                )
+        except Exception as exc:
+            logging.warning("journal_source_capture_failed source=discord_message row_id=%s error_type=%s", row_id, type(exc).__name__)
     _shadow_memory_ledger_write(
         "conversations_user",
         lambda ledger_conn: shadow_conversation_row(
@@ -11768,6 +12233,12 @@ def clear_guild_history(guild_id: int):
     rows_deleted = cursor.rowcount
     conn.commit()
     conn.close()
+    purged_sources = purge_guild_journal_sources(DB_FILE, guild_id)
+    logging.info(
+        "journal_source_archive_purged scope=guild guild_id=%s rows=%s",
+        guild_id,
+        purged_sources,
+    )
     return rows_deleted
 
 def clear_user_history(user_id: int, guild_id: int):
@@ -11777,6 +12248,13 @@ def clear_user_history(user_id: int, guild_id: int):
     rows_deleted = cursor.rowcount
     conn.commit()
     conn.close()
+    purged_sources = purge_user_journal_sources(DB_FILE, guild_id, user_id)
+    logging.info(
+        "journal_source_archive_purged scope=user guild_id=%s user_id=%s rows=%s",
+        guild_id,
+        user_id,
+        purged_sources,
+    )
     return rows_deleted
 
 def get_recent_guild_user_messages(guild_id: int, limit: int = AMBIENT_CONTEXT_MESSAGES):
@@ -13988,6 +14466,21 @@ async def source_file_refresh_worker_task():
         )
     except Exception as exc:
         logging.warning("source_refresh_worker_cycle processed=0 skipped=0 failed=1 error=%s", exc)
+
+    for guild in iter_managed_guilds():
+        guild_id = int(getattr(guild, "id", 0) or 0)
+        if not guild_id:
+            continue
+        try:
+            await run_journal_automation_control_cycle(guild_id)
+        except Exception as exc:
+            runtime = _journal_automation_runtime_by_guild.setdefault(guild_id, {})
+            runtime.update({"lastCompletedAt": _utc_now_iso(), "lastError": type(exc).__name__})
+            logging.exception(
+                "journal_automation_cycle_failed guild=%s error_type=%s",
+                guild_id,
+                type(exc).__name__,
+            )
 
 # ==================== AMBIENT MESSAGE TASK ====================
 
@@ -16240,12 +16733,16 @@ def log_admin_controls_connection_check():
             f"✅ Admin controls connected via {_bnl_control_flags_last_source_url} "
             f"(websiteRelayEnabled={flags.get('websiteRelayEnabled')}, "
             f"heartbeatEnabled={flags.get('heartbeatEnabled')}, "
-            f"showdayDiscordPostsEnabled={flags.get('showdayDiscordPostsEnabled')})."
+            f"showdayDiscordPostsEnabled={flags.get('showdayDiscordPostsEnabled')}, "
+            f"journalAutoPublishEnabled={flags.get('journalAutoPublishEnabled')}, "
+            f"journalDailyEnabled={flags.get('journalDailyEnabled')}, "
+            f"journalWeeklyEnabled={flags.get('journalWeeklyEnabled')})."
         )
     else:
         logging.warning(
             "⚠️ Admin controls unreachable; using local defaults "
-            "(websiteRelayEnabled=True, heartbeatEnabled=True, showdayDiscordPostsEnabled=False)."
+            "(websiteRelayEnabled=True, heartbeatEnabled=True, showdayDiscordPostsEnabled=False, "
+            "journalAutoPublishEnabled=True, journalDailyEnabled=True, journalWeeklyEnabled=True)."
         )
 
 
