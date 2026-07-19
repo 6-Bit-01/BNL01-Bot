@@ -18,10 +18,60 @@ JOURNAL_GENERATION_ATTEMPTS = 4
 MAX_RELAY_SOURCES_PER_WINDOW = 500
 MAX_CONVERSATION_SOURCES_PER_WINDOW = 2_000
 MAX_PROMPT_SOURCES = 180
+MAX_BROADCAST_MEMORY_CONTEXT = 8
+MAX_RUMOR_CONTEXT = 4
+JOURNAL_PUBLIC_BROADCAST_SCOPES = {"ambient", "direct", "journal", "relay", "show_status"}
+JOURNAL_CONTEXT_LANE_TYPES = {
+    "established_broadcast_memory",
+    "community_rumor",
+    "bnl_inference",
+}
 JOURNAL_TOPIC_STOPWORDS = {
     "about", "after", "again", "being", "could", "from", "have", "into", "just", "more", "other", "their",
     "there", "these", "they", "this", "through", "under", "where", "which", "while", "with", "would", "someone",
 }
+
+_CONTEXT_TOPIC_STOPWORDS = JOURNAL_TOPIC_STOPWORDS | {
+    "barcode", "bnl", "community", "discord", "journal", "member", "members", "network", "people",
+    "public", "regular", "regulars", "someone", "thing", "things", "today", "tonight", "yesterday",
+}
+
+_CONTEXT_CLAIM_STOPWORDS = _CONTEXT_TOPIC_STOPWORDS | {
+    "apparently", "around", "during", "heard", "inference", "maybe", "might", "possibly", "rumor", "rumors", "rumour",
+    "rumours", "said", "says", "speculate", "speculated", "speculating", "speculation", "suggested",
+    "suggests", "suspect", "suspects", "theory", "think", "thinks", "unconfirmed", "wonder", "wondered",
+    "wonders",
+}
+
+_RUMOR_MARKER_RE = re.compile(
+    r"\b(?:apparently|i heard|heard that|maybe|might be|people say|rumou?r|some say|speculat(?:e|ed|ing|ion)|"
+    r"theory|the word is|word around|word is|wonder(?:ed|ing)? (?:if|whether)|unconfirmed)\b",
+    re.IGNORECASE,
+)
+_RUMOR_PUBLIC_TOPIC_RE = re.compile(
+    r"\b(?:album|artist|broadcast|episode|journal|listener|music|producer|queue|radio|release|set|show|signal|"
+    r"song|studio|track|website)\b",
+    re.IGNORECASE,
+)
+_RUMOR_SENSITIVE_RE = re.compile(
+    r"\b(?:accus(?:e|ed|ation)|address|caregiv|child|doxx|dm\b|family|harass|home|household|medical|minor|"
+    r"moderation|password|payment|phone|private|relationship|secret|sexual|staff|suicid|therapy|workplace)\b",
+    re.IGNORECASE,
+)
+_EXPLICIT_RUMOR_RE = re.compile(
+    r"\b(?:apparently|rumou?r|some regulars (?:say|suspect|wonder)|speculat(?:e|ed|ing|ion)|unconfirmed|"
+    r"word around|word is)\b",
+    re.IGNORECASE,
+)
+_EXPLICIT_BNL_INFERENCE_RE = re.compile(
+    r"\b(?:bnl (?:suspects|thinks|wonders)|i (?:suspect|think|wonder)|my theory|bnl(?:s|'s|’s) theory)\b",
+    re.IGNORECASE,
+)
+_STRONG_INFERENCE_CUE_RE = re.compile(
+    r"\b(?:proves?|must mean|points? (?:to|toward)|part of (?:a|the) (?:larger|broader) plan|"
+    r"signals? (?:a|the) (?:larger|broader) plan)\b",
+    re.IGNORECASE,
+)
 
 _REPAIR_GUIDANCE = {
     "discord_phrase_copy": (
@@ -41,6 +91,20 @@ _REPAIR_GUIDANCE = {
     "sensitive_personal_detail": (
         "Remove personal or domestic details that are unnecessary to the public community story, including details "
         "about minors, interpersonal conflict, caregiving, or household obligations."
+    ),
+    "invalid_context_use": (
+        "Correct metadata.contextUses. Use only supplied laneRefIds and fresh sourceRefIds, name the exact public "
+        "section heading, and keep established record, community rumor, and BNL inference classifications separate."
+    ),
+    "rumor_not_explicitly_framed": (
+        "If using community rumor, explicitly call it rumor, speculation, or something regulars wondered; never state it as fact."
+    ),
+    "inference_not_explicitly_framed": (
+        "If using BNL inference, explicitly frame it as what BNL suspects, thinks, or wonders; never state it as established fact."
+    ),
+    "undeclared_context_use": (
+        "The prose appears to use established memory, rumor, or BNL inference without declaring traceable metadata.contextUses. Add the correct "
+        "context use with supplied basis refs, or remove that unsupported interpretation."
     ),
 }
 
@@ -261,8 +325,11 @@ def purge_user_journal_derivatives_on_connection(
             # These model-derived fields cannot be reliably separated by source.
             # Clear them on an affected published entry rather than allowing a
             # deleted member's private evidence to guide future synthesis.
-            for key_name in ("topicTags", "continuityNotes", "unresolvedQuestions", "recurringTopicCounts"):
-                metadata[key_name] = {} if key_name == "recurringTopicCounts" else []
+            for key_name in (
+                "topicTags", "continuityNotes", "unresolvedQuestions", "recurringTopicCounts",
+                "contextUses", "usedGenerationContextLanes", "usedContextLaneProvenance",
+            ):
+                metadata[key_name] = {} if key_name in {"recurringTopicCounts", "usedGenerationContextLanes", "usedContextLaneProvenance"} else []
             metadata["privacyScrubbed"] = True
             conn.execute(
                 """UPDATE bnl_journal_private_metadata SET metadata_json=?,updated_at=?
@@ -312,15 +379,516 @@ def _cols(conn: sqlite3.Connection, table: str) -> set[str]:
     return {r[1] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()}
 
 
-def sanitize_source_summary(text: str, names: Optional[list[str]] = None) -> str:
+def _parse_context_datetime(value: Any, *, end_of_day: bool = False) -> Optional[datetime]:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    try:
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", raw):
+            parsed = datetime.fromisoformat(raw).replace(tzinfo=timezone.utc)
+            return parsed + timedelta(days=1) - timedelta(microseconds=1) if end_of_day else parsed
+        parsed = datetime.fromisoformat(raw[:-1] + "+00:00" if raw.endswith("Z") else raw)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _topic_terms(text: str) -> set[str]:
+    return {
+        token
+        for token in re.findall(r"[a-z0-9]+", str(text or "").lower())
+        if len(token) >= 4 and token not in _CONTEXT_TOPIC_STOPWORDS
+    }
+
+
+def _context_claim_terms(text: str) -> set[str]:
+    return {
+        token
+        for token in re.findall(r"[a-z0-9]+", str(text or "").lower())
+        if len(token) >= 4 and token not in _CONTEXT_CLAIM_STOPWORDS
+    }
+
+
+def _context_sentences(text: str) -> list[str]:
+    return [part.strip() for part in re.split(r"(?:[.!?]+|\n+)", str(text or "")) if part.strip()]
+
+
+def _claim_overlap(left: str | set[str], right: str | set[str]) -> int:
+    left_terms = left if isinstance(left, set) else _context_claim_terms(left)
+    right_terms = right if isinstance(right, set) else _context_claim_terms(right)
+    return len(left_terms & right_terms)
+
+
+def _claim_is_represented(claim: str, section: str) -> bool:
+    return bool(_claim_matching_sentences(claim, section))
+
+
+def _claim_matching_sentences(claim: str, text: str) -> list[str]:
+    normalized_claim = _norm(claim)
+    claim_terms = _context_claim_terms(claim)
+    if len(claim_terms) < 2:
+        return []
+    required = max(2, min(4, (len(claim_terms) + 1) // 2))
+    sentences = _context_sentences(text)
+    exact_matches = [
+        sentence
+        for sentence in sentences
+        if len(normalized_claim.split()) >= 4 and normalized_claim == _norm(sentence)
+    ]
+    if exact_matches:
+        return exact_matches
+    matches = []
+    for sentence in sentences:
+        normalized_sentence = _norm(sentence)
+        if (
+            len(normalized_claim.split()) >= 4
+            and normalized_claim in normalized_sentence
+        ) or _claim_overlap(claim_terms, sentence) >= required:
+            matches.append(sentence)
+    return matches
+
+
+def _scope_tokens(value: str) -> set[str]:
+    return {
+        token.strip().lower().replace("-", "_").replace(" ", "_")
+        for token in re.split(r"[,/;]+|\band\b", str(value or ""), flags=re.IGNORECASE)
+        if token.strip()
+    }
+
+
+def _journal_identity_tokens(conn: sqlite3.Connection, guild_id: int) -> list[str]:
+    names: set[str] = set()
+    if table_exists(conn, "conversations"):
+        cols = _cols(conn, "conversations")
+        if {"guild_id", "user_name"} <= cols:
+            for row in conn.execute(
+                "SELECT DISTINCT user_name FROM conversations WHERE guild_id=? AND TRIM(COALESCE(user_name,''))<>''",
+                (int(guild_id),),
+            ).fetchall():
+                names.add(str(row[0]).strip())
+    if table_exists(conn, "user_profiles"):
+        cols = _cols(conn, "user_profiles")
+        available = [name for name in ("display_name", "preferred_name") if name in cols]
+        if "guild_id" in cols and available:
+            for row in conn.execute(
+                f"SELECT {','.join(available)} FROM user_profiles WHERE guild_id=?",
+                (int(guild_id),),
+            ).fetchall():
+                names.update(str(value).strip() for value in row if str(value or "").strip())
+    return sorted({name for name in names if len(name) >= 2}, key=len, reverse=True)
+
+
+def _memory_select_expression(columns: set[str], name: str, fallback: str = "NULL") -> str:
+    return name if name in columns else f"{fallback} AS {name}"
+
+
+def _approved_journal_broadcast_memory(
+    conn: sqlite3.Connection,
+    guild_id: int,
+    safe_sources: list[dict[str, Any]],
+    source_window_end: str,
+    *,
+    limit: int = MAX_BROADCAST_MEMORY_CONTEXT,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Return generation-safe established records plus private row provenance.
+
+    Broadcast memory is operator-only at intake. Journal usage is narrower still:
+    only active, explicitly public-safe, non-superseded, unambiguous rows in a
+    public output scope may cross into this private generation lane.
+    """
+    if not table_exists(conn, "broadcast_memory"):
+        return [], []
+    columns = _cols(conn, "broadcast_memory")
+    required = {"id", "guild_id", "cleaned_summary", "status", "public_safe"}
+    if not required <= columns:
+        return [], []
+    selected_columns = [
+        _memory_select_expression(columns, "id"),
+        _memory_select_expression(columns, "episode_date", "''"),
+        _memory_select_expression(columns, "cleaned_summary", "''"),
+        _memory_select_expression(columns, "entry_type", "'notable_moment'"),
+        _memory_select_expression(columns, "importance", "'medium'"),
+        _memory_select_expression(columns, "usage_scope", "''"),
+        _memory_select_expression(columns, "valid_until"),
+        _memory_select_expression(columns, "needs_clarification", "0"),
+        _memory_select_expression(columns, "superseded_by_id", "0"),
+        _memory_select_expression(columns, "created_at", "''"),
+    ]
+    rows = conn.execute(
+        f"SELECT {','.join(selected_columns)} FROM broadcast_memory "
+        "WHERE guild_id=? AND status='active' AND public_safe=1 ORDER BY id DESC LIMIT 250",
+        (int(guild_id),),
+    ).fetchall()
+    identity_tokens = _journal_identity_tokens(conn, guild_id)
+    window_end = _parse_context_datetime(source_window_end) or datetime.now(timezone.utc)
+    source_terms = {
+        str(source.get("refId")): _topic_terms(str(source.get("summary") or ""))
+        for source in safe_sources
+        if source.get("refId")
+    }
+    safe_records: list[dict[str, Any]] = []
+    provenance: list[dict[str, Any]] = []
+    for row in rows:
+        (
+            row_id, episode_date, cleaned_summary, entry_type, importance,
+            usage_scope, valid_until, needs_clarification, superseded_by_id, created_at,
+        ) = row
+        if int(needs_clarification or 0) != 0 or int(superseded_by_id or 0) != 0:
+            continue
+        scopes = _scope_tokens(str(usage_scope or ""))
+        if not (scopes & JOURNAL_PUBLIC_BROADCAST_SCOPES) or "internal" in scopes:
+            continue
+        expiry = _parse_context_datetime(valid_until, end_of_day=True)
+        if valid_until and (expiry is None or expiry < window_end):
+            continue
+        summary = sanitize_source_summary(str(cleaned_summary or ""), identity_tokens)
+        if not summary:
+            continue
+        memory_terms = _topic_terms(summary)
+        matched_refs = sorted(
+            ref_id for ref_id, terms in source_terms.items() if len(memory_terms & terms) >= 2
+        )
+        if not matched_refs:
+            continue
+        lane_ref = "memory:" + _hash("journal-memory", guild_id, int(row_id))[:16]
+        safe_records.append({
+            "laneRefId": lane_ref,
+            "epistemicStatus": "established_network_record",
+            "summary": summary,
+            "entryType": str(entry_type or "notable_moment")[:80],
+            "importance": str(importance or "medium")[:20],
+            "episodeDate": str(episode_date or "")[:32],
+            "matchedFreshSourceRefIds": matched_refs[:12],
+        })
+        provenance.append({
+            "laneRefId": lane_ref,
+            "sourceTable": "broadcast_memory",
+            "rowId": int(row_id),
+            "createdAt": str(created_at or "")[:48],
+            "matchedFreshSourceRefIds": matched_refs[:12],
+        })
+        if len(safe_records) >= max(1, int(limit)):
+            break
+    return safe_records, provenance
+
+
+def _journal_rumor_context(
+    private_sources: list[dict[str, Any]],
+    *,
+    identity_tokens: Optional[list[str]] = None,
+    limit: int = MAX_RUMOR_CONTEXT,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Classify only repeated, explicit, public-safe speculation as rumor.
+
+    A single message or a single participant can never create a Journal rumor.
+    The classifier intentionally covers only low-risk Network/music/show topics.
+    """
+    candidates: list[dict[str, Any]] = []
+    for source in private_sources:
+        if source.get("sourceKind") != "conversation":
+            continue
+        if str(source.get("channelPolicy") or "") not in PUBLIC_POLICIES:
+            continue
+        summary = sanitize_source_summary(
+            str(source.get("summary") or ""),
+            [*(identity_tokens or []), str(source.get("displayName") or "")],
+        )
+        subject_ref = str(source.get("subjectRef") or "")
+        if not summary or not subject_ref:
+            continue
+        if not _RUMOR_MARKER_RE.search(summary) or not _RUMOR_PUBLIC_TOPIC_RE.search(summary):
+            continue
+        if _RUMOR_SENSITIVE_RE.search(summary):
+            continue
+        terms = _topic_terms(_RUMOR_MARKER_RE.sub(" ", summary))
+        if len(terms) < 2:
+            continue
+        candidates.append({**source, "summary": summary, "topicTerms": terms})
+
+    clusters: list[dict[str, Any]] = []
+    for candidate in sorted(candidates, key=lambda item: (str(item.get("observedAt") or ""), str(item.get("refId") or ""))):
+        best: Optional[dict[str, Any]] = None
+        best_overlap = 0
+        for cluster in clusters:
+            overlap = len(candidate["topicTerms"] & cluster["topicTerms"])
+            if overlap >= 2 and overlap > best_overlap:
+                best = cluster
+                best_overlap = overlap
+        if best is None:
+            clusters.append({"topicTerms": set(candidate["topicTerms"]), "sources": [candidate]})
+        else:
+            best["sources"].append(candidate)
+            best["topicTerms"].update(candidate["topicTerms"])
+
+    safe_records: list[dict[str, Any]] = []
+    provenance: list[dict[str, Any]] = []
+    for cluster in clusters:
+        sources = cluster["sources"]
+        subject_refs = sorted({str(item.get("subjectRef") or "") for item in sources if item.get("subjectRef")})
+        if len(sources) < 2 or len(subject_refs) < 2:
+            continue
+        source_refs = sorted({str(item.get("refId")) for item in sources if item.get("refId")})
+        lane_ref = "rumor:" + _hash("journal-rumor", *source_refs)[:16]
+        safe_records.append({
+            "laneRefId": lane_ref,
+            "epistemicStatus": "unconfirmed_public_rumor",
+            "topicTerms": sorted(cluster["topicTerms"])[:10],
+            "independentParticipantCount": len(subject_refs),
+            "evidence": [
+                {"sourceRefId": str(item.get("refId")), "summary": str(item.get("summary") or "")[:240]}
+                for item in sources[:6]
+            ],
+        })
+        provenance.append({
+            "laneRefId": lane_ref,
+            "sourceRefs": [
+                {
+                    key: item.get(key)
+                    for key in ("refId", "messageId", "subjectRef", "channelPolicy", "observedAt")
+                    if item.get(key) not in (None, "")
+                }
+                for item in sources[:12]
+            ],
+        })
+        if len(safe_records) >= max(1, int(limit)):
+            break
+    return safe_records, provenance
+
+
+def _journal_inference_context(
+    safe_sources: list[dict[str, Any]],
+    established_records: list[dict[str, Any]],
+    rumor_records: list[dict[str, Any]],
+) -> Optional[dict[str, Any]]:
+    topic_refs: dict[str, set[str]] = {}
+    for source in safe_sources:
+        ref_id = str(source.get("refId") or "")
+        if not ref_id:
+            continue
+        for term in _context_claim_terms(str(source.get("summary") or "")):
+            topic_refs.setdefault(term, set()).add(ref_id)
+    repeated = sorted(
+        ((term, refs) for term, refs in topic_refs.items() if len(refs) >= 2),
+        key=lambda item: (-len(item[1]), item[0]),
+    )
+    dependencies_by_fresh_ref: dict[str, set[str]] = {}
+    for item in established_records:
+        lane_ref = str(item.get("laneRefId") or "")
+        if not lane_ref:
+            continue
+        for ref in item.get("matchedFreshSourceRefIds", []):
+            fresh_ref = str(ref)
+            if fresh_ref.startswith("fresh:"):
+                dependencies_by_fresh_ref.setdefault(fresh_ref, set()).add(lane_ref)
+    for item in rumor_records:
+        lane_ref = str(item.get("laneRefId") or "")
+        if not lane_ref:
+            continue
+        for evidence in item.get("evidence", []):
+            if not isinstance(evidence, dict):
+                continue
+            fresh_ref = str(evidence.get("sourceRefId") or "")
+            if fresh_ref.startswith("fresh:"):
+                dependencies_by_fresh_ref.setdefault(fresh_ref, set()).add(lane_ref)
+    context_fresh_refs = set(dependencies_by_fresh_ref)
+    fresh_basis = sorted({ref for _term, refs in repeated[:5] for ref in refs} | context_fresh_refs)[:16]
+    context_basis = [
+        str(item.get("laneRefId"))
+        for item in [*established_records, *rumor_records]
+        if item.get("laneRefId")
+    ]
+    if not context_basis and not fresh_basis:
+        return None
+    basis = [*context_basis, *fresh_basis]
+    allowed_basis = basis[:24]
+    allowed_basis_set = set(allowed_basis)
+    required_parent_refs = [lane_ref for lane_ref in context_basis if lane_ref in allowed_basis_set]
+    return {
+        "laneRefId": "inference:" + _hash("journal-inference", *basis)[:16],
+        "epistemicStatus": "bnl_inference_only",
+        "candidateThemes": [term for term, _refs in repeated[:5]],
+        "allowedBasisRefIds": allowed_basis,
+        "requiredParentContextLaneRefs": required_parent_refs,
+        "requiredContextLaneRefsByFreshSourceRef": {
+            fresh_ref: sorted(lane_ref for lane_ref in lane_refs if lane_ref in allowed_basis_set)
+            for fresh_ref, lane_refs in sorted(dependencies_by_fresh_ref.items())
+            if fresh_ref in allowed_basis_set
+            and any(lane_ref in allowed_basis_set for lane_ref in lane_refs)
+        },
+    }
+
+
+def build_generation_context_lanes(
+    db_path: str,
+    guild_id: int,
+    source_window_end: str,
+    safe_sources: list[dict[str, Any]],
+    private_sources: list[dict[str, Any]],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    with sqlite3.connect(db_path) as conn:
+        identity_tokens = _journal_identity_tokens(conn, guild_id)
+        established, memory_provenance = _approved_journal_broadcast_memory(
+            conn, guild_id, safe_sources, source_window_end
+        )
+    rumors, rumor_provenance = _journal_rumor_context(private_sources, identity_tokens=identity_tokens)
+    inference = _journal_inference_context(safe_sources, established, rumors)
+    lanes: dict[str, Any] = {}
+    if established:
+        lanes["establishedBroadcastMemory"] = established
+    if rumors:
+        lanes["communityRumors"] = rumors
+    if inference:
+        lanes["bnlInference"] = inference
+    private_provenance: dict[str, Any] = {}
+    if memory_provenance:
+        private_provenance["establishedBroadcastMemory"] = memory_provenance
+    if rumor_provenance:
+        private_provenance["communityRumors"] = rumor_provenance
+    return lanes, private_provenance
+
+
+def _mask_rumor_sources_outside_lane(
+    safe_sources: list[dict[str, Any]],
+    lanes: dict[str, Any],
+    private_sources: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    rumor_refs = {
+        str(evidence.get("sourceRefId") or "")
+        for rumor in lanes.get("communityRumors", [])
+        if isinstance(rumor, dict)
+        for evidence in rumor.get("evidence", [])
+        if isinstance(evidence, dict) and evidence.get("sourceRefId")
+    }
+    rumor_like_refs = {
+        str(source.get("refId") or "")
+        for source in private_sources
+        if source.get("sourceKind") == "conversation"
+        and source.get("refId")
+        and _RUMOR_MARKER_RE.search(str(source.get("summary") or ""))
+    }
+    if not rumor_like_refs:
+        return safe_sources
+    masked: list[dict[str, Any]] = []
+    for source in safe_sources:
+        item = dict(source)
+        ref_id = str(item.get("refId") or "")
+        if ref_id in rumor_like_refs and ref_id not in rumor_refs:
+            continue
+        if ref_id in rumor_refs:
+            item["summary"] = (
+                "Repeated public participants raised the same unconfirmed low-risk music or Network question. "
+                "Use the matching communityRumors lane and declare it before discussing its details."
+            )
+        masked.append(item)
+    return masked
+
+
+def _finalize_context_lanes_for_safe_sources(
+    lanes: dict[str, Any],
+    provenance: dict[str, Any],
+    safe_sources: list[dict[str, Any]],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    safe_refs = {
+        str(source.get("refId") or "")
+        for source in safe_sources
+        if isinstance(source, dict) and source.get("refId")
+    }
+    established: list[dict[str, Any]] = []
+    for item in lanes.get("establishedBroadcastMemory", []):
+        if not isinstance(item, dict):
+            continue
+        matched = [str(ref) for ref in item.get("matchedFreshSourceRefIds", []) if str(ref) in safe_refs]
+        if matched:
+            established.append({**item, "matchedFreshSourceRefIds": matched})
+
+    rumors: list[dict[str, Any]] = []
+    rumor_evidence_by_ref: dict[str, str] = {}
+    for item in lanes.get("communityRumors", []):
+        if not isinstance(item, dict):
+            continue
+        filtered_evidence = [
+            evidence_item
+            for evidence_item in item.get("evidence", [])
+            if isinstance(evidence_item, dict) and str(evidence_item.get("sourceRefId") or "") in safe_refs
+        ]
+        if len(filtered_evidence) < 2:
+            continue
+        rumors.append({**item, "evidence": filtered_evidence})
+        rumor_evidence_by_ref.update({
+            str(evidence_item.get("sourceRefId")): str(evidence_item.get("summary") or "")
+            for evidence_item in filtered_evidence
+        })
+
+    inference_sources = [
+        {
+            **source,
+            "summary": rumor_evidence_by_ref.get(str(source.get("refId") or ""), str(source.get("summary") or "")),
+        }
+        for source in safe_sources
+    ]
+    inference = _journal_inference_context(inference_sources, established, rumors)
+    finalized: dict[str, Any] = {}
+    if established:
+        finalized["establishedBroadcastMemory"] = established
+    if rumors:
+        finalized["communityRumors"] = rumors
+    if inference:
+        finalized["bnlInference"] = inference
+
+    retained_refs = {
+        str(item.get("laneRefId") or "")
+        for item in [*established, *rumors]
+        if item.get("laneRefId")
+    }
+    finalized_provenance: dict[str, Any] = {}
+    for key in ("establishedBroadcastMemory", "communityRumors"):
+        selected = []
+        for item in provenance.get(key, []):
+            if not isinstance(item, dict) or str(item.get("laneRefId") or "") not in retained_refs:
+                continue
+            selected_item = dict(item)
+            if key == "establishedBroadcastMemory":
+                selected_item["matchedFreshSourceRefIds"] = [
+                    str(ref)
+                    for ref in item.get("matchedFreshSourceRefIds", [])
+                    if str(ref) in safe_refs
+                ]
+            selected.append(selected_item)
+        if selected:
+            finalized_provenance[key] = selected
+    return finalized, finalized_provenance
+
+
+def _identity_literal_pattern(name: str) -> Optional[re.Pattern[str]]:
+    literal = str(name or "").strip()
+    if not literal:
+        return None
+    left_boundary = r"(?<!\w)" if (literal[0].isalnum() or literal[0] == "_") else ""
+    right_boundary = r"(?!\w)" if (literal[-1].isalnum() or literal[-1] == "_") else ""
+    return re.compile(left_boundary + re.escape(literal) + right_boundary, re.IGNORECASE)
+
+
+def _replace_identity_literal(text: str, name: str, replacement: str = "someone") -> str:
+    pattern = _identity_literal_pattern(name)
+    return pattern.sub(replacement, text) if pattern else text
+
+
+def _contains_identity_literal(text: str, name: str) -> bool:
+    pattern = _identity_literal_pattern(name)
+    return bool(pattern and pattern.search(text))
+
+
+def sanitize_source_summary(text: str, names: Optional[list[str]] = None, *, limit: int = 240) -> str:
     clean = re.sub(r"https?://\S+", "", text or "")
     clean = re.sub(r"<@!?\d+>|@\w+", "someone", clean)
     clean = re.sub(r"\b\d{12,}\b", "", clean)
     for name in sorted(set(names or []), key=len, reverse=True):
         if name.strip():
-            clean = re.sub(r"\b" + re.escape(name.strip()) + r"\b", "someone", clean, flags=re.I)
+            clean = _replace_identity_literal(clean, name)
     clean = re.sub(r"[\"“”‘’]", "", clean)
-    return re.sub(r"\s+", " ", clean).strip()[:240]
+    return re.sub(r"\s+", " ", clean).strip()[:max(1, int(limit))]
 
 
 def _anon_ref(prefix: str, idx: int) -> str:
@@ -490,7 +1058,22 @@ def build_packet_from_sources(
     coverage_complete: bool = True,
 ) -> dict[str, Any]:
     private_sources = _sample_source_kinds(relays, conversations)
-    safe_sources = [_source_for_prompt(src) for src in private_sources]
+    current_display_names = [
+        str(source.get("displayName") or "").strip()
+        for source in private_sources
+        if str(source.get("displayName") or "").strip()
+    ]
+    safe_sources = []
+    for source in private_sources:
+        safe_source = _source_for_prompt(source)
+        if "summary" in safe_source:
+            safe_source["summary"] = sanitize_source_summary(
+                str(safe_source.get("summary") or ""),
+                current_display_names,
+                limit=1000,
+            )
+        if safe_source.get("summary"):
+            safe_sources.append(safe_source)
     counts = dict(aggregate_counts or {})
     counts.setdefault("eligibleRelays", len(relays))
     counts.setdefault("eligibleConversations", len(conversations))
@@ -509,6 +1092,28 @@ def build_packet_from_sources(
         "coverageComplete": bool(coverage_complete),
         "observationContext": list(observation_context or []),
     }
+    context_lanes, private_lane_provenance = build_generation_context_lanes(
+        db_path,
+        guild_id,
+        end,
+        safe_sources,
+        private_sources,
+    )
+    safe_sources = _mask_rumor_sources_outside_lane(safe_sources, context_lanes, private_sources)
+    context_lanes, private_lane_provenance = _finalize_context_lanes_for_safe_sources(
+        context_lanes,
+        private_lane_provenance,
+        safe_sources,
+    )
+    packet["safeSources"] = safe_sources
+    packet["candidateTopicTags"] = sorted({
+        word
+        for source in safe_sources
+        for word in _norm(source.get("summary", "")).split()
+        if len(word) > 4
+    })[:30]
+    packet["generationContextLanes"] = context_lanes
+    packet["privateContextLaneProvenance"] = private_lane_provenance
     packet["history"] = retrieve_history(db_path, guild_id, packet)
     return packet
 
@@ -645,6 +1250,7 @@ def _bounded_history_for_prompt(history: dict[str, Any]) -> dict[str, Any]:
 
 def build_generation_prompt(packet: dict[str, Any], *, repair_reason: str = "", previous_output: str = "") -> str:
     entry_kind = str(packet.get("entryKind") or "manual")
+    context_lanes = packet.get("generationContextLanes") if isinstance(packet.get("generationContextLanes"), dict) else {}
     safe_packet = {
         "entryKind": entry_kind,
         "sourceWindowStart": packet.get("sourceWindowStart"),
@@ -653,6 +1259,7 @@ def build_generation_prompt(packet: dict[str, Any], *, repair_reason: str = "", 
         "history": _bounded_history_for_prompt(packet.get("history", {})),
         "aggregateCounts": packet.get("aggregateCounts", {}),
         "dailyObservations": packet.get("observationContext", [])[:7],
+        "privateGenerationContextLanes": context_lanes,
     }
     cadence_rule = (
         "\nThis is a weekly synthesis. Connect patterns across the supplied daily observations and current source evidence; do not merely list seven daily recaps."
@@ -674,9 +1281,19 @@ def build_generation_prompt(packet: dict[str, Any], *, repair_reason: str = "", 
                 "\nPrevious rejected JSON follows for revision only. Rewrite it completely; do not return the same prose:\n"
                 + previous_output[:6000]
             )
+    context_rule = (
+        "\nOptional private context lanes are supplied. They are aids, not mandatory sections, and may be used only when they materially connect to fresh current-window evidence."
+        "\n- establishedBroadcastMemory contains moderator-approved, public-safe Network records. You may treat those records as established history, but not as proof that the same thing happened in the current window."
+        "\n- communityRumors contains repeated public speculation from at least two participants. It is unconfirmed. If used, public prose must explicitly call it rumor, speculation, or something regulars wondered; never silently promote it to fact."
+        "\n- bnlInference is permission to connect grounded dots, not evidence. If used, public prose must explicitly say BNL suspects, thinks, or wonders. Every requiredParentContextLaneRefs item is mandatory for every use of that inference, regardless of which fresh ref you choose: include all parent laneRefs in the inference basisRefIds and add each parent's own valid contextUse in the same section. Its requiredContextLaneRefsByFreshSourceRef map may impose additional fresh-ref-specific dependencies under the same rule."
+        "\nFor every context lane actually used, add one metadata.contextUses object with laneType, laneRefId, sectionHeading, claim, and basisRefIds. claim must be the exact complete public sentence from that named section. Include both the laneRefId and at least one fresh sourceRefId in basisRefIds, and put every fresh basisRefId in that same section's sourceRefIds. If basisRefIds references another memory or rumor lane, give that secondary lane its own contextUse for the same section."
+        "\nWhen established memory, public rumor, and BNL interpretation form a substantive story, a dedicated third section is welcome. Omit it on thin or quiet windows; never pad beyond three sections."
+        if context_lanes
+        else "\nNo optional context lane qualified for this window. Do not invent broadcast memory, rumors, or BNL theories. Return metadata.contextUses as an empty list."
+    )
     return (
         "You are BNL-01 writing a BARCODE Network Journal entry. Return strict JSON only; no markdown fences."
-        "\nSchema: {\"title\":str,\"excerpt\":str,\"sections\":[{\"heading\":str,\"body\":str,\"sourceRefIds\":[str]}],\"metadata\":{\"topicTags\":[],\"subjectRefs\":[],\"continuityNotes\":[],\"unresolvedQuestions\":[],\"confidenceFlags\":[],\"safetyFlags\":[]}}."
+        "\nSchema: {\"title\":str,\"excerpt\":str,\"sections\":[{\"heading\":str,\"body\":str,\"sourceRefIds\":[str]}],\"metadata\":{\"topicTags\":[],\"subjectRefs\":[],\"continuityNotes\":[],\"unresolvedQuestions\":[],\"confidenceFlags\":[],\"safetyFlags\":[],\"contextUses\":[{\"laneType\":\"established_broadcast_memory|community_rumor|bnl_inference\",\"laneRefId\":str,\"sectionHeading\":str,\"claim\":str,\"basisRefIds\":[str]}]}}."
         "\nWrite 1-3 sections and 250-500 total words; prefer 2 sections and roughly 300-420 words. Give every section a real narrative job instead of inventorying activity."
         "\nWrite like BNL keeping a sly, lively community chronicle—not a lab report, audit, academic paper, corporate briefing, or raw relay summary. BNL may be witty, lightly nosy, and uncanny, but never cruel."
         "\nBuild one coherent story around the most interesting grounded patterns. Use concrete music and community texture, active verbs, readable paragraphs, and selective detail. Avoid abstract jargon and inflated technical language."
@@ -687,7 +1304,7 @@ def build_generation_prompt(packet: dict[str, Any], *, repair_reason: str = "", 
         "\nParaphrase every source summary. Never repeat any sequence of five or more consecutive words from a fresh source summary."
         "\nKeep community members anonymous. Do not include direct quotes, URLs, mentions, IDs, sourceRef tokens in public prose, private intent, relationships, harassment, or internal schema/storage terms."
         "\nExclude personal or domestic details that are unnecessary to the public community story, especially details involving minors, interpersonal conflict, caregiving, or household obligations. Juicy means lively pattern recognition—not private gossip."
-        f"{cadence_rule}{repair}\nGeneration-safe packet:\n{json.dumps(safe_packet, ensure_ascii=False, sort_keys=True)}"
+        f"{cadence_rule}{context_rule}{repair}\nGeneration-safe packet:\n{json.dumps(safe_packet, ensure_ascii=False, sort_keys=True)}"
     )
 
 
@@ -717,6 +1334,21 @@ def parse_generated_json(text: str) -> dict[str, Any]:
     article = {"title": data["title"].strip(), "excerpt": data["excerpt"].strip(), "sections": normalized_sections, "sourceRefIds": source_ref_map, "metadata": {}}
     for key in ("topicTags", "subjectRefs", "continuityNotes", "unresolvedQuestions", "confidenceFlags", "safetyFlags"):
         article["metadata"][key] = [str(x)[:240] for x in meta.get(key, [])] if isinstance(meta.get(key, []), list) else []
+    context_uses = meta.get("contextUses", [])
+    if not isinstance(context_uses, list):
+        raise ValueError("invalid_context_use")
+    normalized_uses = []
+    for item in context_uses[:12]:
+        if not isinstance(item, dict) or not isinstance(item.get("basisRefIds"), list):
+            raise ValueError("invalid_context_use")
+        normalized_uses.append({
+            "laneType": str(item.get("laneType") or "")[:64],
+            "laneRefId": str(item.get("laneRefId") or "")[:96],
+            "sectionHeading": str(item.get("sectionHeading") or "")[:120],
+            "claim": str(item.get("claim") or "")[:320],
+            "basisRefIds": [str(ref)[:96] for ref in item.get("basisRefIds", [])[:24]],
+        })
+    article["metadata"]["contextUses"] = normalized_uses
     return article
 
 
@@ -727,6 +1359,78 @@ def public_word_count(article: dict[str, Any]) -> int:
 
 def _public_text(article: dict[str, Any]) -> str:
     return "\n".join([article.get("title", ""), article.get("excerpt", "")] + [s.get("heading", "") + "\n" + s.get("body", "") for s in article.get("sections", [])])
+
+
+def _context_lane_ref_contract(packet: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    lanes = packet.get("generationContextLanes") if isinstance(packet.get("generationContextLanes"), dict) else {}
+    contract: dict[str, dict[str, Any]] = {}
+    for item in lanes.get("establishedBroadcastMemory", []) if isinstance(lanes.get("establishedBroadcastMemory"), list) else []:
+        if not isinstance(item, dict) or not item.get("laneRefId"):
+            continue
+        lane_ref = str(item["laneRefId"])
+        contract[lane_ref] = {
+            "laneType": "established_broadcast_memory",
+            "allowedBasisRefIds": {lane_ref, *[str(ref) for ref in item.get("matchedFreshSourceRefIds", [])]},
+            "claimTerms": _context_claim_terms(str(item.get("summary") or "")),
+        }
+    for item in lanes.get("communityRumors", []) if isinstance(lanes.get("communityRumors"), list) else []:
+        if not isinstance(item, dict) or not item.get("laneRefId"):
+            continue
+        lane_ref = str(item["laneRefId"])
+        evidence_refs = {
+            str(evidence.get("sourceRefId"))
+            for evidence in item.get("evidence", [])
+            if isinstance(evidence, dict) and evidence.get("sourceRefId")
+        }
+        evidence_term_counts: dict[str, int] = {}
+        for evidence in item.get("evidence", []):
+            if not isinstance(evidence, dict):
+                continue
+            for term in _context_claim_terms(str(evidence.get("summary") or "")):
+                evidence_term_counts[term] = evidence_term_counts.get(term, 0) + 1
+        contract[lane_ref] = {
+            "laneType": "community_rumor",
+            "allowedBasisRefIds": {lane_ref, *evidence_refs},
+            "claimTerms": {term for term, count in evidence_term_counts.items() if count >= 2},
+        }
+    inference = lanes.get("bnlInference")
+    if isinstance(inference, dict) and inference.get("laneRefId"):
+        lane_ref = str(inference["laneRefId"])
+        candidate_themes = _context_claim_terms(" ".join(str(term) for term in inference.get("candidateThemes", [])))
+        raw_dependencies = inference.get("requiredContextLaneRefsByFreshSourceRef", {})
+        if not isinstance(raw_dependencies, dict):
+            raw_dependencies = {}
+        raw_parent_refs = inference.get("requiredParentContextLaneRefs", [])
+        if not isinstance(raw_parent_refs, list):
+            raw_parent_refs = []
+        contract[lane_ref] = {
+            "laneType": "bnl_inference",
+            "allowedBasisRefIds": {
+                lane_ref,
+                *[str(ref) for ref in inference.get("allowedBasisRefIds", [])],
+            },
+            "claimTerms": candidate_themes,
+            "candidateThemes": candidate_themes,
+            "requiredParentLaneRefs": {
+                str(parent_ref)
+                for parent_ref in raw_parent_refs
+                if str(parent_ref)
+            },
+            "freshBasisDependencies": {
+                str(fresh_ref): {str(dependency) for dependency in dependencies if str(dependency)}
+                for fresh_ref, dependencies in raw_dependencies.items()
+                if isinstance(dependencies, list)
+            },
+        }
+    for lane_ref, item in contract.items():
+        other_terms = {
+            term
+            for other_ref, other in contract.items()
+            if other_ref != lane_ref
+            for term in set(other.get("claimTerms") or set())
+        }
+        item["distinctiveClaimTerms"] = set(item.get("claimTerms") or set()) - other_terms
+    return contract
 
 
 def validate_article(article: dict[str, Any], packet: dict[str, Any], prior_titles: Optional[list[str]] = None, approved_names: Optional[set[str]] = None) -> str:
@@ -752,7 +1456,7 @@ def validate_article(article: dict[str, Any], packet: dict[str, Any], prior_titl
         return "no_new_source"
     refmap = article.get("sourceRefIds") or {}
     public_text = _public_text(article)
-    if any(str(ref) in public_text for ref in valid_refs) or re.search(r"\b(?:fresh|week):[a-z0-9:._-]+\b", public_text, re.I):
+    if any(str(ref) in public_text for ref in valid_refs) or re.search(r"\b(?:fresh|week|memory|rumor|inference):[a-z0-9:._-]+\b", public_text, re.I):
         return "source_ref_leak"
     for section in sections:
         refs = refmap.get(section.get("heading")) or section.get("sourceRefIds")
@@ -765,7 +1469,7 @@ def validate_article(article: dict[str, Any], packet: dict[str, Any], prior_titl
     names = set(approved_names or [])
     for src in packet.get("privateSources", []):
         name = str(src.get("displayName") or "").strip()
-        if name and name not in names and re.search(r"\b" + re.escape(name) + r"\b", public_text, re.I):
+        if name and name not in names and _contains_identity_literal(public_text, name):
             return "community_name_leak"
     if any(re.search(pattern, public_text, re.I) for pattern in _SENSITIVE_PERSONAL_PATTERNS):
         return "sensitive_personal_detail"
@@ -779,6 +1483,136 @@ def validate_article(article: dict[str, Any], packet: dict[str, Any], prior_titl
             for i in range(0, len(words) - size + 1):
                 if " ".join(words[i:i + size]) in normalized_public:
                     return "discord_phrase_copy"
+    context_contract = _context_lane_ref_contract(packet)
+    section_text = {
+        str(section.get("heading") or ""): str(section.get("body") or "")
+        for section in sections
+    }
+    section_refs = {
+        str(section.get("heading") or ""): {
+            str(ref)
+            for ref in (refmap.get(section.get("heading")) or section.get("sourceRefIds") or [])
+            if str(ref)
+        }
+        for section in sections
+    }
+    context_uses = article.get("metadata", {}).get("contextUses", [])
+    if not isinstance(context_uses, list):
+        return "invalid_context_use"
+    declared_pairs = {
+        (str(use.get("laneRefId") or ""), str(use.get("sectionHeading") or ""))
+        for use in context_uses
+        if isinstance(use, dict) and use.get("laneRefId") and use.get("sectionHeading")
+    }
+    declared_types_by_heading: dict[str, set[str]] = {}
+    for use in context_uses:
+        if isinstance(use, dict):
+            declared_types_by_heading.setdefault(str(use.get("sectionHeading") or ""), set()).add(
+                str(use.get("laneType") or "")
+            )
+    for use in context_uses:
+        if not isinstance(use, dict):
+            return "invalid_context_use"
+        lane_type = str(use.get("laneType") or "")
+        lane_ref = str(use.get("laneRefId") or "")
+        heading = str(use.get("sectionHeading") or "")
+        claim = str(use.get("claim") or "").strip()
+        basis = {str(ref) for ref in use.get("basisRefIds", []) if str(ref)} if isinstance(use.get("basisRefIds"), list) else set()
+        lane_contract = context_contract.get(lane_ref)
+        fresh_basis = basis & valid_refs
+        claim_terms = _context_claim_terms(claim)
+        lane_claim_terms = set(lane_contract.get("claimTerms") or set()) if lane_contract else set()
+        lane_overlap_required = 1 if lane_type == "bnl_inference" else 2
+        fresh_dependency_map = lane_contract.get("freshBasisDependencies", {}) if lane_contract else {}
+        required_parent_refs = set(lane_contract.get("requiredParentLaneRefs") or set()) if lane_contract else set()
+        required_dependencies = {
+            dependency
+            for fresh_ref in fresh_basis
+            for dependency in (
+                fresh_dependency_map.get(fresh_ref, set())
+                if isinstance(fresh_dependency_map, dict)
+                else set()
+            )
+        }
+        if (
+            lane_type not in JOURNAL_CONTEXT_LANE_TYPES
+            or not lane_contract
+            or lane_contract.get("laneType") != lane_type
+            or heading not in section_text
+            or not claim
+            or len(claim_terms) < 2
+            or len(claim_terms & lane_claim_terms) < lane_overlap_required
+            or not _claim_is_represented(claim, section_text[heading])
+            or lane_ref not in basis
+            or not fresh_basis
+            or not fresh_basis <= section_refs.get(heading, set())
+            or (
+                lane_type == "bnl_inference"
+                and (
+                    not required_parent_refs <= basis
+                    or any((parent_ref, heading) not in declared_pairs for parent_ref in required_parent_refs)
+                    or not required_dependencies <= basis
+                    or any((dependency, heading) not in declared_pairs for dependency in required_dependencies)
+                )
+            )
+            or not basis <= set(lane_contract.get("allowedBasisRefIds") or set())
+            or any(
+                ref != lane_ref
+                and ref.startswith(("memory:", "rumor:"))
+                and (ref, heading) not in declared_pairs
+                for ref in basis
+            )
+        ):
+            return "invalid_context_use"
+        target_claim_sentences = _claim_matching_sentences(claim, section_text[heading])
+        if lane_type == "community_rumor" and (
+            not target_claim_sentences
+            or any(not _EXPLICIT_RUMOR_RE.search(sentence) for sentence in target_claim_sentences)
+        ):
+            return "rumor_not_explicitly_framed"
+        if lane_type == "bnl_inference" and (
+            not target_claim_sentences
+            or any(not _EXPLICIT_BNL_INFERENCE_RE.search(sentence) for sentence in target_claim_sentences)
+        ):
+            return "inference_not_explicitly_framed"
+    title_excerpt = "\n".join([str(article.get("title") or ""), str(article.get("excerpt") or "")])
+    if _EXPLICIT_RUMOR_RE.search(title_excerpt) or _EXPLICIT_BNL_INFERENCE_RE.search(title_excerpt):
+        return "undeclared_context_use"
+    for heading, text in section_text.items():
+        declared_types = declared_types_by_heading.get(heading, set())
+        if _EXPLICIT_RUMOR_RE.search(text) and "community_rumor" not in declared_types:
+            return "undeclared_context_use"
+        if _EXPLICIT_BNL_INFERENCE_RE.search(text) and "bnl_inference" not in declared_types:
+            return "undeclared_context_use"
+    public_locations: list[tuple[Optional[str], str]] = [
+        (None, str(article.get("title") or "")),
+        (None, str(article.get("excerpt") or "")),
+        *[(heading, text) for heading, text in section_text.items()],
+    ]
+    for lane_ref, lane_contract in context_contract.items():
+        claim_terms = set(lane_contract.get("claimTerms") or set())
+        distinctive_terms = set(lane_contract.get("distinctiveClaimTerms") or set())
+        for heading, location_text in public_locations:
+            if heading is not None and (lane_ref, heading) in declared_pairs:
+                continue
+            for sentence in _context_sentences(location_text):
+                if lane_contract.get("laneType") == "bnl_inference":
+                    themes = set(lane_contract.get("candidateThemes") or set())
+                    if (
+                        len(themes) >= 2
+                        and _STRONG_INFERENCE_CUE_RE.search(sentence)
+                        and _claim_overlap(themes, sentence) >= 2
+                    ):
+                        return "undeclared_context_use"
+                    continue
+                if (
+                    len(claim_terms) >= 3
+                    and _claim_overlap(claim_terms, sentence) >= 3
+                ) or (
+                    len(distinctive_terms) >= 2
+                    and _claim_overlap(distinctive_terms, sentence) >= 2
+                ):
+                    return "undeclared_context_use"
     norm_title = _norm(article.get("title", ""))
     for title in prior_titles or []:
         if norm_title and norm_title == _norm(title):
@@ -791,7 +1625,10 @@ def _prior_titles(conn: sqlite3.Connection, guild_id: int) -> list[str]:
 
 
 def build_public_payload(entry_id: str, revision: int, article: dict[str, Any], packet: dict[str, Any], content_hash: str, authored_at: str) -> dict[str, Any]:
-    return {"contractVersion": 1, "kind": "journal_entry", "entry": {"entryId": entry_id, "revision": revision, "title": article["title"], "excerpt": article["excerpt"], "sections": [{"heading": s["heading"], "body": s["body"]} for s in article["sections"]], "authoredAt": authored_at, "sourceWindowStart": packet["sourceWindowStart"], "sourceWindowEnd": packet["sourceWindowEnd"], "contentHash": content_hash}}
+    entry_kind = str(packet.get("entryKind") or "manual")
+    if entry_kind not in {"daily", "weekly", "manual"}:
+        entry_kind = "manual"
+    return {"contractVersion": 1, "kind": "journal_entry", "entry": {"entryId": entry_id, "revision": revision, "entryKind": entry_kind, "title": article["title"], "excerpt": article["excerpt"], "sections": [{"heading": s["heading"], "body": s["body"]} for s in article["sections"]], "authoredAt": authored_at, "sourceWindowStart": packet["sourceWindowStart"], "sourceWindowEnd": packet["sourceWindowEnd"], "contentHash": content_hash}}
 
 
 
@@ -809,6 +1646,33 @@ def cited_private_sources(packet: dict[str, Any], article: dict[str, Any]) -> li
     return [src for src in packet.get("privateSources", []) if str(src.get("refId")) in cited]
 
 
+def _used_context_lane_metadata(packet: dict[str, Any], context_uses: list[dict[str, Any]]) -> tuple[dict[str, Any], dict[str, Any]]:
+    used_refs = {
+        str(use.get("laneRefId") or "")
+        for use in context_uses
+        if isinstance(use, dict) and use.get("laneRefId")
+    }
+    lanes = packet.get("generationContextLanes") if isinstance(packet.get("generationContextLanes"), dict) else {}
+    used_lanes: dict[str, Any] = {}
+    for key in ("establishedBroadcastMemory", "communityRumors"):
+        values = lanes.get(key) if isinstance(lanes.get(key), list) else []
+        selected = [item for item in values if isinstance(item, dict) and str(item.get("laneRefId") or "") in used_refs]
+        if selected:
+            used_lanes[key] = selected
+    inference = lanes.get("bnlInference")
+    if isinstance(inference, dict) and str(inference.get("laneRefId") or "") in used_refs:
+        used_lanes["bnlInference"] = inference
+
+    private = packet.get("privateContextLaneProvenance") if isinstance(packet.get("privateContextLaneProvenance"), dict) else {}
+    used_provenance: dict[str, Any] = {}
+    for key in ("establishedBroadcastMemory", "communityRumors"):
+        values = private.get(key) if isinstance(private.get(key), list) else []
+        selected = [item for item in values if isinstance(item, dict) and str(item.get("laneRefId") or "") in used_refs]
+        if selected:
+            used_provenance[key] = selected
+    return used_lanes, used_provenance
+
+
 def _draft_records(guild_id: int, packet: dict[str, Any], article: dict[str, Any], *, entry_id: str = "", revision: int = 1) -> tuple[tuple[Any, ...], tuple[Any, ...], JournalResult]:
     authored = utc_now_iso()
     entry_id = entry_id or "journal_" + _hash(guild_id, authored, article["title"])[:16]
@@ -819,6 +1683,9 @@ def _draft_records(guild_id: int, packet: dict[str, Any], article: dict[str, Any
     cited_sources = cited_private_sources(packet, article)
     meta = dict(article.get("metadata") or {})
     meta.pop("subjectRefs", None)
+    context_uses = [item for item in meta.get("contextUses", []) if isinstance(item, dict)]
+    used_context_lanes, used_context_provenance = _used_context_lane_metadata(packet, context_uses)
+    lane_candidates = packet.get("generationContextLanes") if isinstance(packet.get("generationContextLanes"), dict) else {}
     meta.update({
         "entryKind": packet.get("entryKind", "manual"),
         "sourceWindowStart": packet["sourceWindowStart"],
@@ -832,6 +1699,14 @@ def _draft_records(guild_id: int, packet: dict[str, Any], article: dict[str, Any
         "aggregateCounts": packet.get("aggregateCounts", {}),
         "sourceSummaries": [{"refId": s.get("refId"), "hash": _hash(s.get("summary", "")), "summary": s.get("summary", "")[:160]} for s in cited_sources],
         "sourceRefIds": source_ref_ids,
+        "contextLaneCandidateCounts": {
+            "establishedBroadcastMemory": len(lane_candidates.get("establishedBroadcastMemory", [])) if isinstance(lane_candidates.get("establishedBroadcastMemory"), list) else 0,
+            "communityRumors": len(lane_candidates.get("communityRumors", [])) if isinstance(lane_candidates.get("communityRumors"), list) else 0,
+            "bnlInference": 1 if isinstance(lane_candidates.get("bnlInference"), dict) else 0,
+        },
+        "usedGenerationContextLanes": used_context_lanes,
+        "usedContextLaneProvenance": used_context_provenance,
+        "contextUses": context_uses,
     })
     now = utc_now_iso()
     entry_row = (entry_id, revision, guild_id, "draft", article["title"], article["excerpt"], _json(article["sections"]), _json(payload), canonical, content_hash, packet["sourceWindowStart"], packet["sourceWindowEnd"], authored, None, None, None, None, 0, now, now)
@@ -954,13 +1829,38 @@ def reject_draft(db_path: str, guild_id: int, entry_id: str, reason: str = "", r
 def regenerate_draft(db_path: str, guild_id: int, entry_id: str, hours: int, generator: Callable[[dict[str, Any], str], str]) -> JournalResult:
     ensure_schema(db_path)
     with sqlite3.connect(db_path) as conn:
-        row = conn.execute("SELECT revision,lifecycle_state FROM bnl_journal_entries WHERE guild_id=? AND entry_id=? ORDER BY revision DESC LIMIT 1", (guild_id, entry_id)).fetchone()
+        row = conn.execute(
+            """SELECT e.revision,e.lifecycle_state,m.metadata_json,e.public_payload_json
+               FROM bnl_journal_entries e
+               LEFT JOIN bnl_journal_private_metadata m
+                 ON m.entry_id=e.entry_id AND m.revision=e.revision AND m.guild_id=e.guild_id
+               WHERE e.guild_id=? AND e.entry_id=?
+               ORDER BY e.revision DESC LIMIT 1""",
+            (guild_id, entry_id),
+        ).fetchone()
     if not row:
         return JournalResult(False, "not_found", "not_found", entry_id)
     old_revision, state = int(row[0]), row[1]
     if state != "draft":
         return JournalResult(False, state, "not_draft", entry_id, old_revision)
-    packet = build_source_packet(db_path, guild_id, hours)
+    original_entry_kind: Optional[str] = None
+    try:
+        stored_metadata = json.loads(str(row[2] or "{}"))
+        candidate_kind = str(stored_metadata.get("entryKind") or "") if isinstance(stored_metadata, dict) else ""
+        if candidate_kind in {"daily", "weekly", "manual"}:
+            original_entry_kind = candidate_kind
+    except (TypeError, ValueError):
+        original_entry_kind = None
+    if original_entry_kind is None:
+        try:
+            stored_payload = json.loads(str(row[3] or "{}"))
+            candidate_kind = str((stored_payload.get("entry") or {}).get("entryKind") or "")
+            if candidate_kind in {"daily", "weekly", "manual"}:
+                original_entry_kind = candidate_kind
+        except (AttributeError, TypeError, ValueError):
+            original_entry_kind = None
+    original_entry_kind = original_entry_kind or "manual"
+    packet = build_source_packet(db_path, guild_id, hours, entry_kind=original_entry_kind)
     last_reason = ""
     previous_output = ""
     article: Optional[dict[str, Any]] = None
