@@ -82,25 +82,22 @@ class JournalTests(unittest.TestCase):
         with sqlite3.connect(self.db) as c:
             self.assertEqual(c.execute("SELECT COUNT(*) FROM bnl_journal_entries").fetchone()[0], 0)
 
-    def test_phrase_copy_gets_actionable_rewrite_without_weakening_guard(self):
+    def test_public_safe_wording_overlap_is_not_a_publish_blocker(self):
         calls = []
         copied = ' people discuss bass chaos and a hook'
 
         def gen(packet, prompt):
             calls.append(prompt)
-            if len(calls) == 1:
-                return article_json(packet, title='Copied First Pass', leak=copied)
-            return article_json(packet, title='Quoted Second Pass', leak=f' "{copied.strip()}"')
+            return article_json(packet, title='Public Wording Pass', leak=copied)
 
         packet = self.packet()
-        invalid = j.parse_generated_json(article_json(packet, title='Guard Check', leak=copied))
-        self.assertEqual('discord_phrase_copy', j.validate_article(invalid, packet, []))
+        article = j.parse_generated_json(article_json(packet, title='Guard Check', leak=copied))
+        self.assertEqual('', j.validate_article(article, packet, []))
 
         res = j.generate_and_store_draft(self.db, 1, 24, gen)
         self.assertTrue(res.ok, res.reason)
-        self.assertEqual(2, len(calls))
-        self.assertIn('brief direct quote', calls[1])
-        self.assertIn('Previous rejected JSON', calls[1])
+        self.assertEqual(1, len(calls))
+        self.assertIn('Use a direct quote only rarely', calls[0])
         with sqlite3.connect(self.db) as c:
             self.assertEqual(
                 1,
@@ -127,6 +124,67 @@ class JournalTests(unittest.TestCase):
         self.assertIn('overly_clinical_voice', calls[1])
         self.assertIn('lively, concrete community chronicle', calls[1])
 
+    def test_editorial_polish_cannot_cancel_a_blocking_clean_entry(self):
+        calls = []
+
+        def gen(packet, prompt):
+            calls.append(prompt)
+            return article_json(
+                packet,
+                title='Persistent Clinical Voice',
+                leak=' Records indicate continuous effort across entities.',
+            )
+
+        result = j.generate_and_store_draft(self.db, 1, 24, gen)
+        self.assertTrue(result.ok, result.reason)
+        self.assertEqual(j.JOURNAL_GENERATION_ATTEMPTS, len(calls))
+        with sqlite3.connect(self.db) as conn:
+            self.assertEqual(
+                [('draft', 'Persistent Clinical Voice')],
+                conn.execute(
+                    "SELECT lifecycle_state,title FROM bnl_journal_entries"
+                ).fetchall(),
+            )
+
+    def test_retained_publishable_entry_survives_later_provider_failure(self):
+        calls = []
+
+        def gen(packet, prompt):
+            calls.append(prompt)
+            if len(calls) == 1:
+                return article_json(
+                    packet,
+                    title='Retained Safe Candidate',
+                    leak=' Records indicate continuous effort across entities.',
+                )
+            raise RuntimeError('provider down during polish')
+
+        result = j.generate_and_store_draft(self.db, 1, 24, gen)
+        self.assertTrue(result.ok, result.reason)
+        self.assertEqual(2, len(calls))
+
+    def test_advisory_style_never_hides_a_blocking_context_failure(self):
+        def gen(packet, prompt):
+            article = json.loads(article_json(
+                packet,
+                title='Clinical But Unsupported',
+                leak=' Records indicate continuous effort across entities.',
+            ))
+            article['metadata']['contextUses'] = [{
+                'laneType': 'bnl_inference',
+                'laneRefId': 'inference:not-supplied',
+                'sectionHeading': 'Public Noise, Carefully Labeled',
+                'claim': 'I think this proves a larger plan.',
+                'basisRefIds': [packet['safeSources'][0]['refId']],
+            }]
+            return json.dumps(article)
+
+        result = j.generate_and_store_draft(self.db, 1, 24, gen)
+        self.assertFalse(result.ok)
+        self.assertEqual('invalid_context_use', result.reason)
+        with sqlite3.connect(self.db) as conn:
+            self.assertEqual(0, conn.execute("SELECT COUNT(*) FROM bnl_journal_entries").fetchone()[0])
+
     def test_source_specific_generated_json_creates_draft(self):
         def gen(packet, prompt): return article_json(packet)
         res = j.generate_and_store_draft(self.db, 1, 24, gen)
@@ -147,10 +205,10 @@ class JournalTests(unittest.TestCase):
         self.assertEqual(hist['recurringTopicCounts']['bass'], 11)
         self.assertFalse(any(r['entry_id'] == 'e10' for r in hist['relevantOlderEntries']))
 
-    def test_validation_rejects_names_refs_urls_mentions_ids_and_unquoted_copied_phrases(self):
+    def test_validation_rejects_names_refs_urls_mentions_and_ids(self):
         packet = self.packet(); good = j.parse_generated_json(article_json(packet))
         self.assertEqual('', j.validate_article(good, packet, []))
-        for leak, reason in [(' KnownUser', 'community_name_leak'), (' fresh:101', 'source_ref_leak'), (' https://x.test', 'public_leak_pattern'), (' @KnownUser', 'public_leak_pattern'), (' 1234567890123', 'public_leak_pattern'), (' people discuss bass chaos and a hook', 'discord_phrase_copy')]:
+        for leak, reason in [(' KnownUser', 'community_name_leak'), (' fresh:101', 'source_ref_leak'), (' https://x.test', 'public_leak_pattern'), (' @KnownUser', 'public_leak_pattern'), (' 1234567890123', 'public_leak_pattern')]:
             bad = j.parse_generated_json(article_json(packet, title='Unique ' + reason, leak=leak))
             self.assertEqual(reason, j.validate_article(bad, packet, []), leak)
 
@@ -171,7 +229,7 @@ class JournalTests(unittest.TestCase):
         result = j.generate_and_store_draft(self.db, 1, 24, gen)
         self.assertTrue(result.ok, result.reason)
         self.assertEqual(1, len(calls))
-        self.assertIn('direct quote is welcome', calls[0])
+        self.assertIn('Use a direct quote only rarely', calls[0])
         self.assertNotIn('Do not include direct quotes', calls[0])
 
     def test_approved_entry_cannot_be_rejected_and_tables_remain_approved(self):
@@ -192,6 +250,45 @@ class JournalTests(unittest.TestCase):
             metas = c.execute("SELECT revision,lifecycle_state FROM bnl_journal_private_metadata WHERE entry_id=? ORDER BY revision", (res.entry_id,)).fetchall()
         self.assertEqual(rows, [(1, 'rejected', 'First Title'), (2, 'draft', 'Second Title')])
         self.assertEqual(metas, [(1, 'rejected'), (2, 'draft')])
+
+    def test_editorial_polish_cannot_cancel_regeneration(self):
+        first = j.generate_and_store_draft(
+            self.db,
+            1,
+            24,
+            lambda packet, prompt: article_json(packet, 'First Draft'),
+        )
+        self.assertTrue(first.ok, first.reason)
+        calls = []
+
+        def clinical_regeneration(packet, prompt):
+            calls.append(prompt)
+            return article_json(
+                packet,
+                'Regenerated Clinical Draft',
+                ' Records indicate continuous effort across entities.',
+            )
+
+        regenerated = j.regenerate_draft(
+            self.db,
+            1,
+            first.entry_id,
+            24,
+            clinical_regeneration,
+        )
+
+        self.assertTrue(regenerated.ok, regenerated.reason)
+        self.assertEqual(2, regenerated.revision)
+        self.assertEqual(j.JOURNAL_GENERATION_ATTEMPTS, len(calls))
+        with sqlite3.connect(self.db) as conn:
+            self.assertEqual(
+                [(1, 'rejected'), (2, 'draft')],
+                conn.execute(
+                    "SELECT revision,lifecycle_state FROM bnl_journal_entries "
+                    "WHERE entry_id=? ORDER BY revision",
+                    (first.entry_id,),
+                ).fetchall(),
+            )
 
 
     def test_provider_exception_create_no_rows_and_regen_preserves_old(self):

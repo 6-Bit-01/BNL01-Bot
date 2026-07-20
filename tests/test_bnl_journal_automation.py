@@ -245,6 +245,104 @@ class JournalAutomationTests(unittest.TestCase):
             self.assertEqual("published", conn.execute("SELECT lifecycle_state FROM bnl_journal_observations").fetchone()[0])
             self.assertEqual(1, conn.execute("SELECT COUNT(*) FROM bnl_journal_entries WHERE lifecycle_state='published'").fetchone()[0])
 
+    def test_editorial_polish_cannot_hold_daily_publication(self):
+        self.add_day("2026-07-19")
+        calls = []
+
+        def persistent_clinical_style(packet, prompt):
+            calls.append(prompt)
+            article = json.loads(article_json(packet))
+            article["title"] = "Persistent Clinical Daily"
+            article["sections"][0]["body"] += (
+                " Records indicate continuous effort across entities."
+            )
+            return json.dumps(article)
+
+        first = automation.run_daily(
+            self.db,
+            1,
+            persistent_clinical_style,
+            "https://site.example",
+            "key",
+            target_day=date(2026, 7, 19),
+            force=True,
+            opener=self.opener,
+        )
+        second = automation.run_daily(
+            self.db,
+            1,
+            lambda *_args: self.fail("published daily window generated twice"),
+            "https://site.example",
+            "key",
+            target_day=date(2026, 7, 19),
+            force=True,
+            opener=self.opener,
+        )
+
+        self.assertTrue(first.ok, first)
+        self.assertEqual("published", first.status)
+        self.assertEqual(journal.JOURNAL_GENERATION_ATTEMPTS, len(calls))
+        self.assertEqual(first.entry_id, second.entry_id)
+        self.assertEqual("published", second.status)
+        with sqlite3.connect(self.db) as conn:
+            self.assertEqual(
+                1,
+                conn.execute(
+                    "SELECT COUNT(*) FROM bnl_journal_entries WHERE lifecycle_state='published'"
+                ).fetchone()[0],
+            )
+
+    def test_newly_closed_day_publishes_before_an_older_held_backlog(self):
+        self.add_day("2026-07-18")
+        self.add_day("2026-07-19")
+        self.set_archive_activation("2026-07-18T02:00:01Z")
+
+        def provider_down(_packet, _prompt):
+            raise RuntimeError("provider down")
+
+        held = automation.run_daily(
+            self.db,
+            1,
+            provider_down,
+            "https://site.example",
+            "key",
+            target_day=date(2026, 7, 18),
+            force=True,
+            opener=self.opener,
+        )
+        self.assertEqual("held", held.status)
+
+        results = automation.run_scheduled(
+            self.db,
+            1,
+            lambda packet, prompt: article_json(packet),
+            "https://site.example",
+            "key",
+            {
+                "journalAutoPublishEnabled": True,
+                "journalDailyEnabled": True,
+                "journalWeeklyEnabled": False,
+            },
+            now_utc=datetime(2026, 7, 21, 3, 0, tzinfo=timezone.utc),
+            opener=self.opener,
+        )
+
+        self.assertEqual(1, len(results))
+        self.assertEqual("published", results[0].status)
+        expected_start, expected_end, _ = automation._daily_period_for_day(
+            date(2026, 7, 19)
+        )
+        self.assertEqual(expected_start, results[0].source_window_start)
+        self.assertEqual(expected_end, results[0].source_window_end)
+        self.assertEqual(
+            date(2026, 7, 18),
+            automation._pending_daily_day(
+                self.db,
+                1,
+                datetime(2026, 7, 21, 3, 0, tzinfo=timezone.utc),
+            ),
+        )
+
     def test_daily_uses_complete_half_open_window_and_far_more_than_25(self):
         with sqlite3.connect(self.db) as conn:
             for index in range(90):
@@ -281,7 +379,7 @@ class JournalAutomationTests(unittest.TestCase):
         self.assertEqual(90, len(packet["safeSources"]))
         self.assertFalse(any(source.get("relayId") == "boundary" for source in packet["privateSources"]))
 
-    def test_scheduler_catches_up_oldest_missing_complete_day(self):
+    def test_scheduler_publishes_newest_day_then_catches_up_older_day(self):
         for day in ("2026-07-17", "2026-07-18", "2026-07-19"):
             self.add_day(day)
         source_store.backfill_legacy_sources(self.db, 1)
@@ -297,9 +395,9 @@ class JournalAutomationTests(unittest.TestCase):
             "https://site.example", "key", now_utc=now, opener=self.opener,
         )
 
-        self.assertEqual("2026-07-18T02:00:00Z", first[0].source_window_start)
+        self.assertEqual("2026-07-19T02:00:00Z", first[0].source_window_start)
         self.assertEqual("published", first[0].status)
-        self.assertEqual("2026-07-19T02:00:00Z", second[0].source_window_start)
+        self.assertEqual("2026-07-18T02:00:00Z", second[0].source_window_start)
         self.assertEqual("published", second[0].status)
 
     def test_weekly_uses_durable_daily_observations(self):

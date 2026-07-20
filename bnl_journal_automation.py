@@ -555,12 +555,15 @@ def _pending_daily_day(db_path: str, guild_id: int, now_utc: Optional[datetime])
                 (guild_id,),
             ).fetchall()
         }
-    current = first
-    while current <= latest:
+    # Always give the newly closed 7-to-7 window first priority. Once that
+    # window is terminal, the interval worker walks backward through any
+    # older backlog without letting an old held run starve today's Journal.
+    current = latest
+    while current >= first:
         start, end, _ = _daily_period_for_day(current)
         if rows.get(("daily", start, end)) not in TERMINAL_RUN_STATES:
             return current
-        current += timedelta(days=1)
+        current -= timedelta(days=1)
     return None
 
 

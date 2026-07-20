@@ -224,7 +224,8 @@ from bnl_source_file_refresh import (
 )
 from collections import Counter, defaultdict, deque
 from dataclasses import dataclass, replace
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, time as datetime_time, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 import pytz
 import discord
@@ -335,6 +336,11 @@ BNL_COMMUNITY_SCOUTING_MIN_SIGNALS = community_min_signals()
 
 DAILY_TOKEN_LIMIT = 1_350_000
 PACIFIC_TZ = pytz.timezone("US/Pacific")
+JOURNAL_DAILY_SCHEDULE_TIME = datetime_time(
+    hour=19,
+    minute=0,
+    tzinfo=ZoneInfo("America/Los_Angeles"),
+)
 DB_FILE = "bnl01_conversations.db"
 
 # The provider client owns HTTP transports and proxy discovery. Keep module
@@ -6179,8 +6185,6 @@ async def run_journal_automation_once(
     guild_id = resolve_network_guild_id(int(guild_id))
     cadence = str(cadence or "scheduled").lower()
     lock = _journal_automation_lock(guild_id)
-    if lock.locked():
-        return [_journal_control_result(cadence, "busy", "journal_automation_already_running")]
     async with lock:
         runtime = _journal_automation_runtime_by_guild.setdefault(guild_id, {})
         runtime.update({"lastStartedAt": _utc_now_iso(), "lastError": "", "lastCadence": cadence})
@@ -6260,18 +6264,28 @@ async def run_journal_automation_control_cycle(guild_id: int) -> list[dict]:
     flags = _journal_control_flags(control, base_flags)
     if control is None:
         reason = "control_plane_unavailable:%s" % (control_error or "control_get_failed")
-        results = [_journal_control_result("scheduled", "held", reason)]
+        # The control endpoint is useful for remote Run Now requests, but it
+        # must not be a single point of failure for the local 7 PM schedule.
+        # get_bnl_control_flags() retains the last confirmed pause state, so
+        # the local fallback still honors operator controls.
+        results = await run_journal_automation_once(
+            guild_id,
+            cadence="scheduled",
+            force=False,
+            flags=flags,
+        )
+        local_status = await asyncio.to_thread(journal_automation_status, DB_FILE, guild_id)
         runtime = _journal_automation_runtime_by_guild.setdefault(guild_id, {})
         runtime.update({
-            "lastCompletedAt": _utc_now_iso(),
-            "lastResults": results,
-            "lastDetail": reason[:240],
+            "nextDailyAt": local_status.get("nextDailyAt") or "",
+            "nextWeeklyAt": local_status.get("nextWeeklyAt") or "",
             "lastError": reason[:240],
         })
         logging.warning(
-            "journal_automation_cycle_held guild=%s reason=%s",
+            "journal_control_plane_unavailable_local_schedule_continued guild=%s reason=%s results=%s",
             guild_id,
             reason,
+            ",".join(f"{item.get('cadence')}:{item.get('status')}" for item in results),
         )
         await asyncio.to_thread(_journal_heartbeat_sync, runtime, flags)
         return results
@@ -14508,6 +14522,29 @@ tree = app_commands.CommandTree(client)
 _ambient_post_locks = {}
 
 
+async def _run_journal_automation_for_managed_guilds(trigger: str) -> None:
+    """Run the idempotent Journal scheduler for each configured Discord guild."""
+    for guild in iter_managed_guilds():
+        guild_id = int(getattr(guild, "id", 0) or 0)
+        if not guild_id:
+            continue
+        try:
+            logging.info(
+                "journal_automation_trigger guild=%s trigger=%s",
+                guild_id,
+                trigger,
+            )
+            await run_journal_automation_control_cycle(guild_id)
+        except Exception as exc:
+            runtime = _journal_automation_runtime_by_guild.setdefault(guild_id, {})
+            runtime.update({"lastCompletedAt": _utc_now_iso(), "lastError": type(exc).__name__})
+            logging.exception(
+                "journal_automation_cycle_failed guild=%s trigger=%s error_type=%s",
+                guild_id,
+                trigger,
+                type(exc).__name__,
+            )
+
 
 @tasks.loop(minutes=DEFAULT_PROCESS_INTERVAL_MINUTES)
 async def source_file_refresh_worker_task():
@@ -14548,20 +14585,13 @@ async def source_file_refresh_worker_task():
     except Exception as exc:
         logging.warning("source_refresh_worker_cycle processed=0 skipped=0 failed=1 error=%s", exc)
 
-    for guild in iter_managed_guilds():
-        guild_id = int(getattr(guild, "id", 0) or 0)
-        if not guild_id:
-            continue
-        try:
-            await run_journal_automation_control_cycle(guild_id)
-        except Exception as exc:
-            runtime = _journal_automation_runtime_by_guild.setdefault(guild_id, {})
-            runtime.update({"lastCompletedAt": _utc_now_iso(), "lastError": type(exc).__name__})
-            logging.exception(
-                "journal_automation_cycle_failed guild=%s error_type=%s",
-                guild_id,
-                type(exc).__name__,
-            )
+    await _run_journal_automation_for_managed_guilds("interval_catch_up")
+
+
+@tasks.loop(time=JOURNAL_DAILY_SCHEDULE_TIME)
+async def journal_daily_schedule_task():
+    """Start the daily Journal cycle at exactly 7:00 PM Pacific."""
+    await _run_journal_automation_for_managed_guilds("daily_7pm_pacific")
 
 # ==================== AMBIENT MESSAGE TASK ====================
 
@@ -16964,6 +16994,9 @@ async def on_ready():
 
     if not source_file_refresh_worker_task.is_running():
         source_file_refresh_worker_task.start()
+
+    if not journal_daily_schedule_task.is_running():
+        journal_daily_schedule_task.start()
 
     logging.info(f"🎯 BNL-01 online as {client.user.name} ({client.user.id})")
     logging.info(f"📡 Monitoring {len(client.guilds)} server(s)")
