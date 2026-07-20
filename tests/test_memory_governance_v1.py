@@ -1,4 +1,4 @@
-import os, sqlite3, sys, inspect, hashlib
+import os, sqlite3, sys, inspect, hashlib, unittest
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -6,6 +6,7 @@ from bnl_memory_governance import *
 from bnl_memory_ledger import ensure_memory_ledger_schema, subject_key_for_user
 from bnl_entity_intelligence import ensure_entity_intelligence_schema
 from bnl_dossier_source_packets import subject_key as normalized_subject_key
+from tests.unittest_compat import install_function_cases
 
 
 def make_conn():
@@ -26,7 +27,7 @@ def req(**kw):
     return GovernanceRequest(**d)
 
 
-def test_gates_default_off_live_requires_both_and_legacy_unchanged(monkeypatch):
+def _case_gates_default_off_live_requires_both_and_legacy_unchanged(monkeypatch):
     monkeypatch.delenv(SHADOW_ENV, raising=False); monkeypatch.delenv(LIVE_ENV, raising=False)
     assert not shadow_enabled(); assert not live_enabled()
     monkeypatch.setenv(LIVE_ENV, '1')
@@ -35,7 +36,7 @@ def test_gates_default_off_live_requires_both_and_legacy_unchanged(monkeypatch):
     assert live_enabled()
 
 
-def test_unrelated_raw_conversation_observation_not_selected_but_durable_fact_is():
+def _case_unrelated_raw_conversation_observation_not_selected_but_durable_fact_is():
     c = make_conn()
     insert(c, eid='color', value='favorite color is green', pred='favorite_color', etype='preference')
     insert(c, eid='sandwich', value='I ate a sandwich and then watched television', pred='conversation', etype='observation')
@@ -45,7 +46,7 @@ def test_unrelated_raw_conversation_observation_not_selected_but_durable_fact_is
     assert any(e.reason == 'non_durable_conversation' for e in r.exclusions)
 
 
-def test_broad_recall_and_topic_specific_recall_differ_deterministically():
+def _case_broad_recall_and_topic_specific_recall_differ_deterministically():
     c = make_conn()
     insert(c, eid='color', value='favorite color is green', pred='favorite_color')
     insert(c, eid='music', value='favorite music tool is a sampler', pred='preference')
@@ -57,7 +58,7 @@ def test_broad_recall_and_topic_specific_recall_differ_deterministically():
     assert 'green' in topic and 'sampler' not in topic
 
 
-def test_guild_member_visibility_route_channel_and_current_message_isolation():
+def _case_guild_member_visibility_route_channel_and_current_message_isolation():
     c = make_conn()
     insert(c, eid='good', value='likes modular synths', pred='preference')
     insert(c, guild=2, eid='wrongguild', value='likes modular synths in wrong guild', pred='preference')
@@ -72,7 +73,7 @@ def test_guild_member_visibility_route_channel_and_current_message_isolation():
     assert current.rendered_context == ''
 
 
-def test_owner_correction_wins_and_forget_tombstone_idempotent_prevents_reintroduction():
+def _case_owner_correction_wins_and_forget_tombstone_idempotent_prevents_reintroduction():
     c = make_conn(); insert(c, eid='base', value='old favorite color blue', pred='favorite_color')
     ref = view_member_memory(c, guild_id=1, user_id=10)[0]['ref']
     res = correct_member_memory(c, guild_id=1, user_id=10, safe_ref=ref, corrected_text='favorite color is green')
@@ -87,7 +88,7 @@ def test_owner_correction_wins_and_forget_tombstone_idempotent_prevents_reintrod
     assert 'blue' not in build_governed_context(c, req(user_text='favorite color')).rendered_context
 
 
-def test_blocked_lifecycles_and_projection_loop_prevention():
+def _case_blocked_lifecycles_and_projection_loop_prevention():
     c = make_conn()
     for life in ('forgotten','retracted','superseded','expired','review_only','needs_review','quarantined','unresolved'):
         insert(c, eid=life, value=f'{life} synths', life=life, pred='preference')
@@ -98,7 +99,7 @@ def test_blocked_lifecycles_and_projection_loop_prevention():
     assert r.diagnostics.excluded_by_reason['lifecycle'] == 8
 
 
-def test_freshness_recency_per_source_caps_and_budget():
+def _case_freshness_recency_per_source_caps_and_budget():
     c = make_conn()
     insert(c, eid='old', value='favorite snack is chips', pred='favorite_food', observed='2025-01-01T00:00:00+00:00')
     insert(c, eid='new', value='favorite snack is mango', pred='favorite_food', observed='2026-07-01T00:00:00+00:00')
@@ -112,7 +113,7 @@ def test_freshness_recency_per_source_caps_and_budget():
     assert tight.diagnostics.token_budget_exclusions >= 1
 
 
-def test_moment_engine_tables_detected_and_shadow_only():
+def _case_moment_engine_tables_detected_and_shadow_only():
     c = make_conn(); insert(c, eid='fact', value='likes synths', pred='preference')
     c.execute("CREATE TABLE memory_moment_windows (moment_id TEXT, guild_id INTEGER, lifecycle_status TEXT, canonical_ledger_entry_id TEXT, summary TEXT, updated_at TEXT)")
     c.execute("CREATE TABLE memory_moment_participants (moment_id TEXT, participant_key TEXT)")
@@ -125,7 +126,7 @@ def test_moment_engine_tables_detected_and_shadow_only():
     assert 'PRIVATE MOMENT SUMMARY' not in r.rendered_context
 
 
-def test_evaluation_report_counts_injected_violations():
+def _case_evaluation_report_counts_injected_violations():
     bad = MemoryCandidate('first_party_record','first_party_record','x','x',2,'discord_user:999','preference','claim','bad','unknown','high','needs_review',5,eligible_root=False,projection=True)
     diag = GovernanceDiagnostics(selected_by_source={'first_party_record':1}, excluded_by_reason={'budget':2}, token_budget_exclusions=2, duplicate_suppression=1, contradiction_resolutions=['a'], processing_errors=['boom'], legacy_vs_governed={'legacy_size':5})
     result = GovernanceResult('x', (bad,), (GovernanceExclusion('y','visibility'),), diag)
@@ -138,19 +139,19 @@ def test_evaluation_report_counts_injected_violations():
     assert report['rollback_readiness'] == 'fallback_required_before_live'
 
 
-def test_processing_errors_mark_unsafe_for_live_fallback():
+def _case_processing_errors_mark_unsafe_for_live_fallback():
     r = build_governed_context(object(), req())  # type: ignore[arg-type]
     assert r.diagnostics.processing_errors
 
 
-def test_view_authorization_redaction_and_correct_rejects_unauthorized():
+def _case_view_authorization_redaction_and_correct_rejects_unauthorized():
     c = make_conn(); insert(c, eid='mine', value='my private synths', pred='preference'); insert(c, user=11, eid='other', value='other private secret', pred='preference')
     mine = view_member_memory(c, guild_id=1, user_id=10)
     assert len(mine) == 1 and 'other private secret' not in str(mine)
     assert not correct_member_memory(c, guild_id=1, user_id=10, safe_ref='mem_notreal', corrected_text='x')['ok']
 
 
-def test_complete_delete_real_schemas_shared_moment_repeat_receipt_and_rollback():
+def _case_complete_delete_real_schemas_shared_moment_repeat_receipt_and_rollback():
     c = make_conn(); insert(c, eid='mine', value='delete me', pred='preference'); insert(c, user=11, eid='other', value='keep other', pred='preference')
     c.execute("CREATE TABLE conversations (id INTEGER PRIMARY KEY, guild_id INTEGER, user_id INTEGER, content TEXT)"); c.execute("INSERT INTO conversations VALUES (1,1,10,'secret')")
     c.execute("CREATE TABLE bnl_journal_source_events (event_seq INTEGER PRIMARY KEY, guild_id INTEGER NOT NULL, source_kind TEXT NOT NULL, subject_ref TEXT NOT NULL)")
@@ -200,7 +201,7 @@ def test_complete_delete_real_schemas_shared_moment_repeat_receipt_and_rollback(
     assert c.execute("SELECT COUNT(*) FROM conversations WHERE user_id=10").fetchone()[0] == 0
 
 
-def test_complete_delete_lays_journal_privacy_groundwork_without_touching_published_prose():
+def _case_complete_delete_lays_journal_privacy_groundwork_without_touching_published_prose():
     import json
 
     c = make_conn()
@@ -302,7 +303,7 @@ def test_complete_delete_lays_journal_privacy_groundwork_without_touching_publis
     assert observation[4] is None
 
 
-def test_clearhistory_wording_and_queue_subsystem_untouched_static():
+def _case_clearhistory_wording_and_queue_subsystem_untouched_static():
     source = Path('bnl01_bot.py').read_text()
     assert 'conversation rows' in source
     assert 'Durable facts, profile data, relationship data, and derived memory were not removed' in source
@@ -310,7 +311,7 @@ def test_clearhistory_wording_and_queue_subsystem_untouched_static():
     assert 'queue_public_snapshot' not in governance_source
     assert 'payments' not in governance_source and 'playback' not in governance_source and 'availability' not in governance_source
 
-def test_forget_original_removes_active_correction_chain_and_obsolete_correction_rejected():
+def _case_forget_original_removes_active_correction_chain_and_obsolete_correction_rejected():
     c = make_conn(); insert(c, eid='blue', value='favorite color is blue', pred='favorite_color')
     original_ref = view_member_memory(c, guild_id=1, user_id=10)[0]['ref']
     assert correct_member_memory(c, guild_id=1, user_id=10, safe_ref=original_ref, corrected_text='favorite color is green')['ok']
@@ -321,7 +322,7 @@ def test_forget_original_removes_active_correction_chain_and_obsolete_correction
     assert 'blue' not in rendered and 'green' not in rendered
 
 
-def test_complete_delete_actual_member_entity_broadcast_and_shadow_tables():
+def _case_complete_delete_actual_member_entity_broadcast_and_shadow_tables():
     c = make_conn(); insert(c, eid='mine', value='delete me', pred='preference')
     ensure_entity_intelligence_schema(c)
     deleted_key = normalized_subject_key('Deleted Name')
@@ -351,7 +352,12 @@ def test_complete_delete_actual_member_entity_broadcast_and_shadow_tables():
     c.execute("INSERT INTO entity_scouting_queue (guild_id,subject_key,reason,source) VALUES (1,?,'r','s')", (deleted_key,))
     c.execute("CREATE TABLE broadcast_memory (guild_id INTEGER, submitted_by_user_id TEXT, submitted_by_name TEXT, corrected_by_user_id TEXT, corrected_by_name TEXT, show_note TEXT)")
     c.execute("INSERT INTO broadcast_memory VALUES (1,'10','Deleted Name','10','Deleted Name','show content stays')")
-    c.execute("INSERT INTO memory_governance_shadow_runs VALUES ('r1',1,?,?,?,?,?,?,?,?,?,?,?)", (hashlib.sha256(subject_key_for_user(10).encode()).hexdigest()[:16],'route','policy','now','h',1,'lh',2,1,'{}','[]'))
+    c.execute(
+        "INSERT INTO memory_governance_shadow_runs "
+        "(run_id,guild_id,subject_hash,route_mode,channel_policy,created_at,rendered_hash,rendered_size,legacy_hash,legacy_size,selected_count,excluded_json,errors_json) "
+        "VALUES ('r1',1,?,?,?,?,?,?,?,?,?,?,?)",
+        (hashlib.sha256(subject_key_for_user(10).encode()).hexdigest()[:16],'route','policy','now','h',1,'lh',2,1,'{}','[]'),
+    )
     c.commit()
     res = complete_delete_member_data(c, guild_id=1, user_id=10, confirmation='DELETE MY BNL DATA 1')
     assert res['ok']
@@ -373,7 +379,7 @@ def test_complete_delete_actual_member_entity_broadcast_and_shadow_tables():
     assert complete_delete_member_data(c, guild_id=1, user_id=10, confirmation='DELETE MY BNL DATA 1')['ok']
 
 
-def test_complete_delete_moments_are_guild_scoped_and_canonical_payload_scrubbed():
+def _case_complete_delete_moments_are_guild_scoped_and_canonical_payload_scrubbed():
     c = make_conn(); insert(c, eid='mine', value='secret summary from DeletedName', pred='preference')
     # capture display name before deletion
     c.execute("CREATE TABLE user_profiles (guild_id INTEGER, user_id INTEGER, display_name TEXT, preferred_name TEXT)"); c.execute("INSERT INTO user_profiles VALUES (1,10,'DeletedName','PreferredDeleted')")
@@ -404,7 +410,7 @@ def test_complete_delete_moments_are_guild_scoped_and_canonical_payload_scrubbed
     assert c.execute("SELECT COUNT(*) FROM memory_ledger_lineage l WHERE l.guild_id=1 AND (l.entry_id NOT IN (SELECT entry_id FROM memory_ledger_entries WHERE guild_id=1) OR l.target_entry_id NOT IN (SELECT entry_id FROM memory_ledger_entries WHERE guild_id=1))").fetchone()[0] == 0
 
 
-def test_route_policy_violations_and_shadow_retention_are_real():
+def _case_route_policy_violations_and_shadow_retention_are_real():
     c = make_conn(); insert(c, eid='sealed', value='sealed synths', pred='preference')
     c.execute("UPDATE memory_ledger_entries SET channel_policy='sealed_test' WHERE entry_id='sealed'"); c.commit()
     r = build_governed_context(c, req(user_text='remember synths', channel_policy='public_home'))
@@ -414,3 +420,10 @@ def test_route_policy_violations_and_shadow_retention_are_real():
     for i in range(505):
         persist_shadow_diagnostics(c, req(), r, 'legacy')
     assert c.execute("SELECT COUNT(*) FROM memory_governance_shadow_runs WHERE guild_id=1").fetchone()[0] <= 500
+
+
+class MemoryGovernanceV1Tests(unittest.TestCase):
+    pass
+
+
+install_function_cases(globals(), MemoryGovernanceV1Tests)

@@ -550,8 +550,14 @@ def render_shadow_moment_context(conn: sqlite3.Connection, *, guild_id: int, cha
     return "\n".join(lines)
 
 
-def build_moment_evaluation_report(conn: sqlite3.Connection, *, guild_id: int | None = None) -> dict[str, Any]:
-    ensure_moment_schema(conn)
+def build_moment_evaluation_report(
+    conn: sqlite3.Connection,
+    *,
+    guild_id: int | None = None,
+    prepare_schema: bool = True,
+) -> dict[str, Any]:
+    if prepare_schema:
+        ensure_moment_schema(conn)
     where = ""
     params: list[Any] = []
     if guild_id is not None:
