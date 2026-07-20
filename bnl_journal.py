@@ -75,11 +75,9 @@ _STRONG_INFERENCE_CUE_RE = re.compile(
 
 _REPAIR_GUIDANCE = {
     "discord_phrase_copy": (
-        "Rewrite the entire public article from scratch. Do not repeat any sequence of five or more "
-        "consecutive words from any fresh source summary. Preserve only the grounded meaning, and use "
-        "new sentence structure and vocabulary throughout."
+        "Rewrite the copied passage in new language, or preserve exact public-safe wording as a brief direct "
+        "quote inside clear double quotation marks. Keep the speaker anonymous."
     ),
-    "direct_quote_or_quote_mark": "Remove all quotation marks and paraphrase every quoted or quote-like passage.",
     "community_name_leak": "Remove every community member name and replace personal references with anonymous descriptions.",
     "public_leak_pattern": "Remove every URL, mention, identifier, and internal implementation term from public prose.",
     "source_ref_leak": "Keep source reference tokens only inside sourceRefIds arrays; remove them from all public prose.",
@@ -99,8 +97,9 @@ _REPAIR_GUIDANCE = {
     ),
     "missing_bnl_reaction": (
         "Add one brief first-person BNL reaction that expresses curiosity, amusement, attachment, uncertainty, or mild "
-        "unease without asserting a new external fact. Do not use I suspect, I think, or I wonder unless a valid "
-        "bnl_inference context lane supports it."
+        "unease without asserting a new external fact. Natural openings include I admit, I noticed, I found myself, "
+        "I smiled, I laughed, I remain curious, I am fond of, and I felt. Do not use I suspect, I think, or I wonder "
+        "unless a valid bnl_inference context lane supports it."
     ),
     "sensitive_personal_detail": (
         "Remove personal or domestic details that are unnecessary to the public community story, including details "
@@ -154,10 +153,15 @@ _REPORT_STYLE_OPENING_RE = re.compile(
 
 _BNL_REACTION_RE = re.compile(
     r"\bI\s+(?:admit|confess|noticed|watched|found(?:\s+myself)?|caught\s+myself|remain|smiled|enjoyed|"
-    r"appreciated|liked|was\s+(?:amused|curious|fond|uneasy|surprised|pleased|glad)|"
+    r"appreciated|liked|laughed|grinned|chuckled|felt|feel|"
+    r"was\s+(?:amused|curious|fond|uneasy|surprised|pleased|glad|drawn)|"
     r"am\s+(?:amused|curious|fond|uneasy|pleased|glad)|have\s+(?:begun|grown)|am\s+beginning|"
     r"may\s+be\s+developing|keep\s+returning|cannot\s+quite|could\s+not\s+help|do\s+not\s+mind)\b",
     re.IGNORECASE,
+)
+
+_DIRECT_QUOTE_SPAN_RE = re.compile(
+    r'"[^"\n]+"|“[^”\n]+”'
 )
 
 _SENSITIVE_PERSONAL_PATTERNS = (
@@ -1520,8 +1524,8 @@ def build_generation_prompt(packet: dict[str, Any], *, repair_reason: str = "", 
         "\nStable participant aliases in the packet are private pattern-analysis aids. Never reproduce an alias in public prose."
         "\nThe evidenceCoverageContract is mandatory. Across all section sourceRefIds, meet its minimum distinct fresh sources, participants, source kinds, and available window segments. Every cited ref must materially support that section. Use this breadth to identify a few connected patterns rather than listing sources."
         "\nEvery section must cite at least one fresh sourceRefId from the current window. Older Journal material is continuity and callback context only, never proof of current activity. Do not repeat an older conclusion when the current evidence changes it."
-        "\nParaphrase every source summary. Never repeat any sequence of five or more consecutive words from a fresh source summary."
-        "\nKeep community members anonymous. Do not include direct quotes, URLs, mentions, IDs, sourceRef tokens in public prose, private intent, relationships, harassment, or internal schema/storage terms."
+        "\nParaphrase source summaries by default. A brief direct quote is welcome when exact public-safe wording improves the story, especially when the line is funny. Put quoted wording inside clear double quotation marks, cite its fresh source in that section, and keep the speaker anonymous. Never repeat any sequence of five or more consecutive source words outside a clear direct quote."
+        "\nKeep community members anonymous. Do not include URLs, mentions, IDs, sourceRef tokens in public prose, private intent, relationships, harassment, or internal schema/storage terms."
         "\nExclude personal or domestic details that are unnecessary to the public community story, especially details involving minors, interpersonal conflict, caregiving, or household obligations. Juicy means lively pattern recognition—not private gossip."
         f"{cadence_rule}{context_rule}{repair}\nGeneration-safe packet:\n{json.dumps(safe_packet, ensure_ascii=False, sort_keys=True)}"
     )
@@ -1737,8 +1741,6 @@ def validate_article(article: dict[str, Any], packet: dict[str, Any], prior_titl
         return evidence_reason
     if re.search(r"<@!?\d+>|@\w+|https?://|\b\d{12,}\b|participant-[a-f0-9]{8}|relationship_journal|memory_tiers|source[- ]?file|dossier|private_metadata|sourceRefIds?", public_text, re.I):
         return "public_leak_pattern"
-    if re.search(r"[\"“”‘’]", public_text):
-        return "direct_quote_or_quote_mark"
     names = set(approved_names or [])
     private_names = {
         str(name or "").strip()
@@ -1755,15 +1757,19 @@ def validate_article(article: dict[str, Any], packet: dict[str, Any], prior_titl
             return "community_name_leak"
     if any(re.search(pattern, public_text, re.I) for pattern in _SENSITIVE_PERSONAL_PATTERNS):
         return "sensitive_personal_detail"
-    if any(re.search(pattern, public_text, re.I) for pattern in _OVERLY_CLINICAL_PATTERNS):
+    narrative_text = _DIRECT_QUOTE_SPAN_RE.sub(" ", public_text)
+    if any(re.search(pattern, narrative_text, re.I) for pattern in _OVERLY_CLINICAL_PATTERNS):
         return "overly_clinical_voice"
     if any(_REPORT_STYLE_OPENING_RE.search(str(section.get("body") or "")) for section in sections):
         return "flat_report_voice"
     if len(packet.get("safeSources", [])) >= 5 and not _BNL_REACTION_RE.search(
-        "\n".join(str(section.get("body") or "") for section in sections)
+        "\n".join(
+            _DIRECT_QUOTE_SPAN_RE.sub(" ", str(section.get("body") or ""))
+            for section in sections
+        )
     ):
         return "missing_bnl_reaction"
-    normalized_public = _norm(public_text)
+    normalized_public = _norm(narrative_text)
     for src in packet.get("privateSources", []):
         summary = str(src.get("summary") or "")
         words = _norm(summary).split()
