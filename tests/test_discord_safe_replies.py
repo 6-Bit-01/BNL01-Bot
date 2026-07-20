@@ -33,7 +33,7 @@ class FakeChannel:
         self.parent = None
         self.sent = []
 
-    async def send(self, text):
+    async def send(self, text, **kwargs):
         self.sent.append(text)
 
 
@@ -45,7 +45,7 @@ class FakeMessage:
         self.channel = FakeChannel(channel_name, self.guild)
         self.replies = []
 
-    async def reply(self, text):
+    async def reply(self, text, **kwargs):
         self.replies.append(text)
 
 
@@ -54,7 +54,7 @@ class FailingReplyMessage(FakeMessage):
         super().__init__(*args, **kwargs)
         self.fail_first_reply = True
 
-    async def reply(self, text):
+    async def reply(self, text, **kwargs):
         if self.fail_first_reply:
             self.fail_first_reply = False
             raise RuntimeError("simulated discord send failure")

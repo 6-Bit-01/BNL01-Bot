@@ -652,7 +652,7 @@ class FakeMessage:
         self.channel = FakeChannel(channel_name)
         self.replies = []
 
-    async def reply(self, text):
+    async def reply(self, text, **kwargs):
         self.replies.append(text)
 
 

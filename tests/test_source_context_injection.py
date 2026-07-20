@@ -157,14 +157,16 @@ class SourceContextBotIntegrationTests(unittest.TestCase):
         self.assertEqual(block, "")
 
     def test_prompt_accepts_source_context_without_breaking_existing_args(self):
+        prompt_metadata = {}
         with mock.patch.object(bnl01_bot, "get_user_profile", return_value=("Operator", None)), \
              mock.patch.object(bnl01_bot, "should_allow_greeting", return_value=False), \
              mock.patch.object(bnl01_bot, "choose_response_style", return_value=("concise", "style rule")), \
              mock.patch.object(bnl01_bot, "build_user_memory_context", return_value="No durable memory."), \
              mock.patch.object(bnl01_bot, "build_broadcast_memory_context", return_value=""):
-            prompt, _allow, _style = bnl01_bot.build_user_aware_prompt(1, 1, "Operator", "what do we know about Hellcat?", channel_name="research-and-development", privileged=True, channel_policy="internal_controlled", source_context_block="SOURCE FILE / INTERNAL CASE FILE CONTEXT:\nSubject: Hellcat")
+            prompt, _allow, _style = bnl01_bot.build_user_aware_prompt(1, 1, "Operator", "what do we know about Hellcat?", channel_name="research-and-development", privileged=True, channel_policy="internal_controlled", source_context_block="SOURCE FILE / INTERNAL CASE FILE CONTEXT:\nSubject: Hellcat", prompt_metadata=prompt_metadata)
         self.assertIn("SOURCE FILE / INTERNAL CASE FILE CONTEXT", prompt)
         self.assertIn("Prompt operator authority: approved_operator_context", prompt)
+        self.assertTrue(prompt_metadata["source_context_available"])
 
     def test_diagnostics_include_source_context_safe_metadata(self):
         diag = bnl01_bot.build_dossier_recommendation_diagnostics()

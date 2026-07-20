@@ -27,7 +27,7 @@ class FakeReplyMessage:
         self.replies = []
         self.raise_on_reply = None
 
-    async def reply(self, text):
+    async def reply(self, text, **kwargs):
         if self.raise_on_reply:
             raise self.raise_on_reply
         self.replies.append(text)

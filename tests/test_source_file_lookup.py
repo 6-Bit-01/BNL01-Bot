@@ -240,7 +240,7 @@ class SourceFileLookupBotTests(unittest.TestCase):
             self.channel = SourceFileLookupBotTests.Channel(self.guild)
             self.replies = []
 
-        async def reply(self, text):
+        async def reply(self, text, **kwargs):
             self.replies.append(text)
 
     def test_unauthorized_users_cannot_use_lookup(self):
