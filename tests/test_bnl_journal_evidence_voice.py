@@ -98,7 +98,7 @@ class JournalEvidenceVoiceTests(unittest.TestCase):
         self.assertIn("evidenceCoverageContract", prompt)
         self.assertIn("concrete, recognizable action", prompt)
         self.assertIn("Never invent a time, place, object, action", prompt)
-        self.assertIn("direct quote is welcome", prompt)
+        self.assertIn("Use a direct quote only rarely", prompt)
         self.assertNotIn("Do not include direct quotes", prompt)
 
     def test_report_opening_clinical_language_and_missing_reaction_are_rejected(self):

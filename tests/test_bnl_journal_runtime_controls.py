@@ -57,6 +57,13 @@ class JournalRuntimeControlTests(unittest.TestCase):
             self.assertEqual(action, options["action"])
             self.assertEqual("", error)
 
+    def test_daily_worker_is_pinned_to_seven_pm_pacific(self):
+        scheduled_times = bnl01_bot.journal_daily_schedule_task.time
+        self.assertEqual(1, len(scheduled_times))
+        scheduled = scheduled_times[0]
+        self.assertEqual((19, 0), (scheduled.hour, scheduled.minute))
+        self.assertEqual("America/Los_Angeles", getattr(scheduled.tzinfo, "key", ""))
+
     def test_control_get_uses_api_key_and_expected_endpoint(self):
         captured = []
 
@@ -205,26 +212,84 @@ class JournalRuntimeControlTests(unittest.TestCase):
         self.assertTrue(flags["journalDailyEnabled"])
         self.assertTrue(flags["journalWeeklyEnabled"])
 
-    def test_control_get_failure_holds_without_running_scheduler(self):
-        runner = mock.AsyncMock()
+    def test_control_get_failure_runs_local_schedule_with_cached_flags(self):
+        cached_flags = {
+            "journalAutoPublishEnabled": True,
+            "journalDailyEnabled": True,
+            "journalWeeklyEnabled": True,
+        }
+        runner = mock.AsyncMock(return_value=[{
+            "cadence": "all",
+            "status": "not_due",
+            "reason": "no_schedule_due",
+        }])
         with mock.patch.object(bnl01_bot, "resolve_network_guild_id", return_value=1), \
-             mock.patch.object(bnl01_bot, "get_bnl_control_flags", return_value={
-                 "journalAutoPublishEnabled": True,
-                 "journalDailyEnabled": True,
-                 "journalWeeklyEnabled": True,
-             }), \
+             mock.patch.object(bnl01_bot, "get_bnl_control_flags", return_value=cached_flags), \
              mock.patch.object(bnl01_bot, "_journal_control_request_sync", return_value=(None, "control_plane_timeout")), \
              mock.patch.object(bnl01_bot, "_journal_heartbeat_sync", return_value=(None, "")), \
+             mock.patch.object(bnl01_bot, "journal_automation_status", return_value={}), \
              mock.patch.object(bnl01_bot, "run_journal_automation_once", new=runner):
             results = asyncio.run(bnl01_bot.run_journal_automation_control_cycle(1))
 
-        runner.assert_not_awaited()
-        self.assertEqual("held", results[0]["status"])
+        runner.assert_awaited_once_with(
+            1,
+            cadence="scheduled",
+            force=False,
+            flags=cached_flags,
+        )
+        self.assertEqual("not_due", results[0]["status"])
+        self.assertEqual("no_schedule_due", results[0]["reason"])
         self.assertEqual(
             "control_plane_unavailable:control_plane_timeout",
-            results[0]["reason"],
+            bnl01_bot._journal_automation_runtime_by_guild[1]["lastError"],
         )
-        self.assertEqual(results[0]["reason"], bnl01_bot._journal_automation_runtime_by_guild[1]["lastError"])
+
+    def test_control_get_failure_still_honors_cached_publish_pause(self):
+        cached_flags = {
+            "journalAutoPublishEnabled": False,
+            "journalDailyEnabled": False,
+            "journalWeeklyEnabled": True,
+        }
+        with mock.patch.object(bnl01_bot, "resolve_network_guild_id", return_value=1), \
+             mock.patch.object(bnl01_bot, "BNL_JOURNAL_AUTOMATION_ENABLED", True), \
+             mock.patch.object(bnl01_bot, "get_bnl_control_flags", return_value=cached_flags), \
+             mock.patch.object(bnl01_bot, "_journal_control_request_sync", return_value=(None, "control_plane_timeout")), \
+             mock.patch.object(bnl01_bot, "_journal_heartbeat_sync", return_value=(None, "")), \
+             mock.patch.object(bnl01_bot, "journal_automation_status", return_value={}), \
+             mock.patch.object(bnl01_bot, "run_scheduled_journal_automation") as scheduled:
+            results = asyncio.run(bnl01_bot.run_journal_automation_control_cycle(1))
+
+        scheduled.assert_not_called()
+        self.assertEqual("paused", results[0]["status"])
+        self.assertEqual("auto_publish_paused", results[0]["reason"])
+
+    def test_overlapping_schedule_waits_instead_of_returning_busy(self):
+        async def scenario():
+            lock = bnl01_bot._journal_automation_lock(1)
+            await lock.acquire()
+            try:
+                pending = asyncio.create_task(
+                    bnl01_bot.run_journal_automation_once(
+                        1,
+                        cadence="daily",
+                        flags={
+                            "journalAutoPublishEnabled": False,
+                            "journalDailyEnabled": True,
+                            "journalWeeklyEnabled": True,
+                        },
+                    )
+                )
+                await asyncio.sleep(0)
+                self.assertFalse(pending.done())
+            finally:
+                lock.release()
+            return await pending
+
+        with mock.patch.object(bnl01_bot, "resolve_network_guild_id", return_value=1):
+            results = asyncio.run(scenario())
+
+        self.assertEqual("paused", results[0]["status"])
+        self.assertEqual("auto_publish_paused", results[0]["reason"])
 
     def test_clear_history_also_purges_durable_journal_discord_sources(self):
         temp = tempfile.NamedTemporaryFile(delete=False)

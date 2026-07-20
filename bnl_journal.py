@@ -15,6 +15,12 @@ STATES = {"draft", "rejected", "approved_pending_delivery", "published", "delive
 WORD_MIN, WORD_MAX = 250, 500
 JOURNAL_ROUTE = "bnl_journal_generation"
 JOURNAL_GENERATION_ATTEMPTS = 4
+ADVISORY_VALIDATION_REASONS = frozenset({
+    "overly_clinical_voice",
+    "flat_report_voice",
+    "missing_bnl_reaction",
+    "duplicate_title",
+})
 MAX_RELAY_SOURCES_PER_WINDOW = 500
 MAX_CONVERSATION_SOURCES_PER_WINDOW = 2_000
 MAX_PROMPT_SOURCES = 180
@@ -74,10 +80,6 @@ _STRONG_INFERENCE_CUE_RE = re.compile(
 )
 
 _REPAIR_GUIDANCE = {
-    "discord_phrase_copy": (
-        "Rewrite the copied passage in new language, or preserve exact public-safe wording as a brief direct "
-        "quote inside clear double quotation marks. Keep the speaker anonymous."
-    ),
     "community_name_leak": "Remove every community member name and replace personal references with anonymous descriptions.",
     "public_leak_pattern": "Remove every URL, mention, identifier, and internal implementation term from public prose.",
     "source_ref_leak": "Keep source reference tokens only inside sourceRefIds arrays; remove them from all public prose.",
@@ -1524,7 +1526,7 @@ def build_generation_prompt(packet: dict[str, Any], *, repair_reason: str = "", 
         "\nStable participant aliases in the packet are private pattern-analysis aids. Never reproduce an alias in public prose."
         "\nThe evidenceCoverageContract is mandatory. Across all section sourceRefIds, meet its minimum distinct fresh sources, participants, source kinds, and available window segments. Every cited ref must materially support that section. Use this breadth to identify a few connected patterns rather than listing sources."
         "\nEvery section must cite at least one fresh sourceRefId from the current window. Older Journal material is continuity and callback context only, never proof of current activity. Do not repeat an older conclusion when the current evidence changes it."
-        "\nParaphrase source summaries by default. A brief direct quote is welcome when exact public-safe wording improves the story, especially when the line is funny. Put quoted wording inside clear double quotation marks, cite its fresh source in that section, and keep the speaker anonymous. Never repeat any sequence of five or more consecutive source words outside a clear direct quote."
+        "\nParaphrase source summaries by default. Use a direct quote only rarely, when one brief public-safe line is unusually worth preserving. Put quoted wording inside clear double quotation marks, cite its fresh source in that section, and keep the speaker anonymous."
         "\nKeep community members anonymous. Do not include URLs, mentions, IDs, sourceRef tokens in public prose, private intent, relationships, harassment, or internal schema/storage terms."
         "\nExclude personal or domestic details that are unnecessary to the public community story, especially details involving minors, interpersonal conflict, caregiving, or household obligations. Juicy means lively pattern recognition—not private gossip."
         f"{cadence_rule}{context_rule}{repair}\nGeneration-safe packet:\n{json.dumps(safe_packet, ensure_ascii=False, sort_keys=True)}"
@@ -1707,7 +1709,14 @@ def _evidence_coverage_reason(article: dict[str, Any], packet: dict[str, Any]) -
     return ""
 
 
-def validate_article(article: dict[str, Any], packet: dict[str, Any], prior_titles: Optional[list[str]] = None, approved_names: Optional[set[str]] = None) -> str:
+def validate_article(
+    article: dict[str, Any],
+    packet: dict[str, Any],
+    prior_titles: Optional[list[str]] = None,
+    approved_names: Optional[set[str]] = None,
+    *,
+    blocking_only: bool = False,
+) -> str:
     sections = article.get("sections")
     if not isinstance(sections, list) or not (1 <= len(sections) <= 3):
         return "invalid_section_count"
@@ -1758,25 +1767,17 @@ def validate_article(article: dict[str, Any], packet: dict[str, Any], prior_titl
     if any(re.search(pattern, public_text, re.I) for pattern in _SENSITIVE_PERSONAL_PATTERNS):
         return "sensitive_personal_detail"
     narrative_text = _DIRECT_QUOTE_SPAN_RE.sub(" ", public_text)
-    if any(re.search(pattern, narrative_text, re.I) for pattern in _OVERLY_CLINICAL_PATTERNS):
+    if not blocking_only and any(re.search(pattern, narrative_text, re.I) for pattern in _OVERLY_CLINICAL_PATTERNS):
         return "overly_clinical_voice"
-    if any(_REPORT_STYLE_OPENING_RE.search(str(section.get("body") or "")) for section in sections):
+    if not blocking_only and any(_REPORT_STYLE_OPENING_RE.search(str(section.get("body") or "")) for section in sections):
         return "flat_report_voice"
-    if len(packet.get("safeSources", [])) >= 5 and not _BNL_REACTION_RE.search(
+    if not blocking_only and len(packet.get("safeSources", [])) >= 5 and not _BNL_REACTION_RE.search(
         "\n".join(
             _DIRECT_QUOTE_SPAN_RE.sub(" ", str(section.get("body") or ""))
             for section in sections
         )
     ):
         return "missing_bnl_reaction"
-    normalized_public = _norm(narrative_text)
-    for src in packet.get("privateSources", []):
-        summary = str(src.get("summary") or "")
-        words = _norm(summary).split()
-        for size in range(5, min(10, len(words)) + 1):
-            for i in range(0, len(words) - size + 1):
-                if " ".join(words[i:i + size]) in normalized_public:
-                    return "discord_phrase_copy"
     context_contract = _context_lane_ref_contract(packet)
     section_text = {
         str(section.get("heading") or ""): str(section.get("body") or "")
@@ -1909,7 +1910,7 @@ def validate_article(article: dict[str, Any], packet: dict[str, Any], prior_titl
                     return "undeclared_context_use"
     norm_title = _norm(article.get("title", ""))
     for title in prior_titles or []:
-        if norm_title and norm_title == _norm(title):
+        if not blocking_only and norm_title and norm_title == _norm(title):
             return "duplicate_title"
     return ""
 
@@ -2013,10 +2014,81 @@ def _insert_draft_rows(conn: sqlite3.Connection, entry_row: tuple[Any, ...], met
     conn.execute("INSERT INTO bnl_journal_private_metadata VALUES (?,?,?,?,?,?,?,?)", meta_row)
 
 
-def store_validated_draft(db_path: str, guild_id: int, packet: dict[str, Any], article: dict[str, Any], *, entry_id: str = "", revision: int = 1) -> JournalResult:
+def _generate_article_with_repairs(
+    packet: dict[str, Any],
+    generator: Callable[[dict[str, Any], str], str],
+    prior_titles: list[str],
+) -> tuple[Optional[dict[str, Any]], str, bool]:
+    """Return the best blocking-clean article without letting polish cancel publication."""
+    last_reason = ""
+    previous_output = ""
+    retained_publishable: Optional[dict[str, Any]] = None
+    for attempt in range(JOURNAL_GENERATION_ATTEMPTS):
+        try:
+            raw = generator(
+                packet,
+                build_generation_prompt(
+                    packet,
+                    repair_reason=last_reason,
+                    previous_output=previous_output,
+                ) if attempt else build_generation_prompt(packet),
+            )
+        except Exception as exc:
+            if retained_publishable is not None:
+                return retained_publishable, "", True
+            reason = "quota_unavailable" if "quota" in str(exc).lower() else "provider_failure"
+            return None, reason, False
+        previous_output = raw
+        try:
+            article = parse_generated_json(raw)
+        except ValueError as exc:
+            last_reason = str(exc)
+            continue
+
+        blocking_reason = validate_article(
+            article,
+            packet,
+            prior_titles,
+            blocking_only=True,
+        )
+        if blocking_reason:
+            last_reason = blocking_reason
+            continue
+
+        validation = validate_article(article, packet, prior_titles)
+        if not validation:
+            return article, "", False
+        if validation not in ADVISORY_VALIDATION_REASONS:
+            # Future validation reasons remain blocking unless explicitly
+            # classified as editorial guidance above.
+            last_reason = validation
+            continue
+        retained_publishable = article
+        last_reason = validation
+
+    if retained_publishable is not None:
+        return retained_publishable, "", True
+    return None, last_reason or "generation_failed", False
+
+
+def store_validated_draft(
+    db_path: str,
+    guild_id: int,
+    packet: dict[str, Any],
+    article: dict[str, Any],
+    *,
+    entry_id: str = "",
+    revision: int = 1,
+    allow_advisory: bool = False,
+) -> JournalResult:
     ensure_schema(db_path)
     with sqlite3.connect(db_path) as conn:
-        reason = validate_article(article, packet, _prior_titles(conn, guild_id))
+        reason = validate_article(
+            article,
+            packet,
+            _prior_titles(conn, guild_id),
+            blocking_only=allow_advisory,
+        )
         if reason:
             return JournalResult(False, "no_draft", reason, entry_id=entry_id, revision=revision)
         entry_row, meta_row, result = _draft_records(guild_id, packet, article, entry_id=entry_id, revision=revision)
@@ -2037,34 +2109,23 @@ def generate_and_store_packet_draft(
         return JournalResult(False, "no_draft", "incomplete_source_window", entry_id=entry_id)
     if not packet.get("safeSources"):
         return JournalResult(False, "no_draft", "insufficient_grounded_material", entry_id=entry_id)
-    prompt = build_generation_prompt(packet)
-    last_reason = ""
-    previous_output = ""
-    for attempt in range(JOURNAL_GENERATION_ATTEMPTS):
-        try:
-            raw = generator(
-                packet,
-                prompt if attempt == 0 else build_generation_prompt(
-                    packet,
-                    repair_reason=last_reason,
-                    previous_output=previous_output,
-                ),
-            )
-        except Exception as exc:
-            reason = "quota_unavailable" if "quota" in str(exc).lower() else "provider_failure"
-            return JournalResult(False, "no_draft", reason, entry_id=entry_id)
-        previous_output = raw
-        try:
-            article = parse_generated_json(raw)
-        except ValueError as exc:
-            last_reason = str(exc)
-            continue
-        with sqlite3.connect(db_path) as conn:
-            validation = validate_article(article, packet, _prior_titles(conn, guild_id))
-        if not validation:
-            return store_validated_draft(db_path, guild_id, packet, article, entry_id=entry_id)
-        last_reason = validation
-    return JournalResult(False, "no_draft", last_reason or "generation_failed", entry_id=entry_id)
+    with sqlite3.connect(db_path) as conn:
+        prior_titles = _prior_titles(conn, guild_id)
+    article, reason, allow_advisory = _generate_article_with_repairs(
+        packet,
+        generator,
+        prior_titles,
+    )
+    if article is None:
+        return JournalResult(False, "no_draft", reason, entry_id=entry_id)
+    return store_validated_draft(
+        db_path,
+        guild_id,
+        packet,
+        article,
+        entry_id=entry_id,
+        allow_advisory=allow_advisory,
+    )
 
 
 def generate_and_store_draft(
@@ -2174,39 +2235,22 @@ def regenerate_draft(
     if excluded_history_entry_ids is not None:
         packet_kwargs["excluded_history_entry_ids"] = excluded_history_entry_ids
     packet = build_source_packet(db_path, guild_id, hours, **packet_kwargs)
-    last_reason = ""
-    previous_output = ""
-    article: Optional[dict[str, Any]] = None
-    for attempt in range(JOURNAL_GENERATION_ATTEMPTS):
-        try:
-            raw = generator(
-                packet,
-                build_generation_prompt(
-                    packet,
-                    repair_reason=last_reason,
-                    previous_output=previous_output,
-                ) if attempt else build_generation_prompt(packet),
-            )
-        except Exception as exc:
-            reason = "quota_unavailable" if "quota" in str(exc).lower() else "provider_failure"
-            return JournalResult(False, "no_draft", reason, entry_id, old_revision)
-        previous_output = raw
-        try:
-            candidate = parse_generated_json(raw)
-        except ValueError as exc:
-            last_reason = str(exc)
-            continue
-        with sqlite3.connect(db_path) as conn:
-            validation = validate_article(candidate, packet, _prior_titles(conn, guild_id))
-        if validation:
-            last_reason = validation
-            continue
-        article = candidate
-        break
-    if article is None:
-        return JournalResult(False, "no_draft", last_reason or "generation_failed", entry_id, old_revision)
     with sqlite3.connect(db_path) as conn:
-        reason = validate_article(article, packet, _prior_titles(conn, guild_id))
+        prior_titles = _prior_titles(conn, guild_id)
+    article, reason, allow_advisory = _generate_article_with_repairs(
+        packet,
+        generator,
+        prior_titles,
+    )
+    if article is None:
+        return JournalResult(False, "no_draft", reason, entry_id, old_revision)
+    with sqlite3.connect(db_path) as conn:
+        reason = validate_article(
+            article,
+            packet,
+            _prior_titles(conn, guild_id),
+            blocking_only=allow_advisory,
+        )
         if reason:
             return JournalResult(False, "no_draft", reason, entry_id, old_revision)
         entry_row, meta_row, result = _draft_records(guild_id, packet, article, entry_id=entry_id, revision=old_revision + 1)
