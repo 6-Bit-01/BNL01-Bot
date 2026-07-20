@@ -90,7 +90,7 @@ class JournalTests(unittest.TestCase):
             calls.append(prompt)
             if len(calls) == 1:
                 return article_json(packet, title='Copied First Pass', leak=copied)
-            return article_json(packet, title='Fully Rewritten Pass')
+            return article_json(packet, title='Quoted Second Pass', leak=f' "{copied.strip()}"')
 
         packet = self.packet()
         invalid = j.parse_generated_json(article_json(packet, title='Guard Check', leak=copied))
@@ -99,7 +99,7 @@ class JournalTests(unittest.TestCase):
         res = j.generate_and_store_draft(self.db, 1, 24, gen)
         self.assertTrue(res.ok, res.reason)
         self.assertEqual(2, len(calls))
-        self.assertIn('five or more consecutive words', calls[1])
+        self.assertIn('brief direct quote', calls[1])
         self.assertIn('Previous rejected JSON', calls[1])
         with sqlite3.connect(self.db) as c:
             self.assertEqual(
@@ -147,12 +147,32 @@ class JournalTests(unittest.TestCase):
         self.assertEqual(hist['recurringTopicCounts']['bass'], 11)
         self.assertFalse(any(r['entry_id'] == 'e10' for r in hist['relevantOlderEntries']))
 
-    def test_validation_rejects_names_refs_urls_mentions_ids_quotes_and_copied_phrases(self):
+    def test_validation_rejects_names_refs_urls_mentions_ids_and_unquoted_copied_phrases(self):
         packet = self.packet(); good = j.parse_generated_json(article_json(packet))
         self.assertEqual('', j.validate_article(good, packet, []))
-        for leak, reason in [(' KnownUser', 'community_name_leak'), (' fresh:101', 'source_ref_leak'), (' https://x.test', 'public_leak_pattern'), (' @KnownUser', 'public_leak_pattern'), (' 1234567890123', 'public_leak_pattern'), (' "quoted"', 'direct_quote_or_quote_mark'), (' people discuss bass chaos and a hook', 'discord_phrase_copy')]:
+        for leak, reason in [(' KnownUser', 'community_name_leak'), (' fresh:101', 'source_ref_leak'), (' https://x.test', 'public_leak_pattern'), (' @KnownUser', 'public_leak_pattern'), (' 1234567890123', 'public_leak_pattern'), (' people discuss bass chaos and a hook', 'discord_phrase_copy')]:
             bad = j.parse_generated_json(article_json(packet, title='Unique ' + reason, leak=leak))
             self.assertEqual(reason, j.validate_article(bad, packet, []), leak)
+
+    def test_direct_quotes_and_curly_apostrophes_do_not_hold_generation(self):
+        quote = '“people discuss bass chaos and a hook”'
+        packet = self.packet()
+        article = j.parse_generated_json(
+            article_json(packet, title='The Room’s Quoted Line', leak=f' {quote}')
+        )
+        self.assertEqual('', j.validate_article(article, packet, []))
+
+        calls = []
+
+        def gen(source_packet, prompt):
+            calls.append(prompt)
+            return article_json(source_packet, title='The Room’s Quoted Line', leak=f' {quote}')
+
+        result = j.generate_and_store_draft(self.db, 1, 24, gen)
+        self.assertTrue(result.ok, result.reason)
+        self.assertEqual(1, len(calls))
+        self.assertIn('direct quote is welcome', calls[0])
+        self.assertNotIn('Do not include direct quotes', calls[0])
 
     def test_approved_entry_cannot_be_rejected_and_tables_remain_approved(self):
         res = j.generate_and_store_draft(self.db, 1, 24, lambda p, pr: article_json(p)); self.assertTrue(res.ok)
