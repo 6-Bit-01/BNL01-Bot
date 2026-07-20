@@ -24,8 +24,6 @@ ADVISORY_VALIDATION_REASONS = frozenset({
 MAX_RELAY_SOURCES_PER_WINDOW = 500
 MAX_CONVERSATION_SOURCES_PER_WINDOW = 2_000
 MAX_PROMPT_SOURCES = 180
-MAX_DAILY_DERIVATIVE_RELAY_PROMPT_SOURCES = 3
-DAILY_DERIVATIVE_RELAY_EVENT_TYPES = frozenset({"fresh_public_discord_activity"})
 MAX_BROADCAST_MEMORY_CONTEXT = 8
 MAX_RUMOR_CONTEXT = 4
 JOURNAL_PUBLIC_BROADCAST_SCOPES = {"ambient", "direct", "journal", "relay", "show_status"}
@@ -1059,7 +1057,7 @@ def _window_segment_activity(
     relays: list[dict[str, Any]],
     conversations: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    """Expose non-identifying daily activity density without treating relays as people."""
+    """Expose non-identifying daily activity across the relay and context streams."""
     labels = ("early", "middle", "late")
     counts = {
         f"segment-{index}": {"conversationSources": 0, "relaySources": 0}
@@ -1279,45 +1277,22 @@ def _sample_source_kinds(
             return _time_stratified_sample(items, quota, start, end)
         return _evenly_sample(items, quota)
 
-    candidate_relays = list(relays)
-    if entry_kind == "daily" and conversations:
-        derivative_relays: list[dict[str, Any]] = []
-        independent_relays: list[dict[str, Any]] = []
-        for source in relays:
-            event_type = str(source.get("eventType") or "").strip().lower()
-            target = (
-                derivative_relays
-                if event_type in DAILY_DERIVATIVE_RELAY_EVENT_TYPES
-                else independent_relays
-            )
-            target.append(source)
-        # These scheduled relay readings paraphrase batches of public Discord
-        # activity whose original conversations are already present. One
-        # reading per daily segment preserves their connective context without
-        # giving the underlying moments a second vote. Relays with any other
-        # event type remain eligible as distinct status/canon.
-        derivative_quota = min(
-            len(derivative_relays),
-            MAX_DAILY_DERIVATIVE_RELAY_PROMPT_SOURCES,
-        )
-        candidate_relays = independent_relays + sample(derivative_relays, derivative_quota)
-
-    total = len(candidate_relays) + len(conversations)
+    total = len(relays) + len(conversations)
     if total <= limit:
-        chosen = candidate_relays + list(conversations)
-    elif not candidate_relays:
+        chosen = list(relays) + list(conversations)
+    elif not relays:
         chosen = sample(conversations, limit)
     elif not conversations:
-        chosen = sample(candidate_relays, limit)
+        chosen = sample(relays, limit)
     else:
-        relay_quota = min(len(candidate_relays), max(1, limit // 2))
+        relay_quota = min(len(relays), max(1, limit // 2))
         conversation_quota = min(len(conversations), max(1, limit - relay_quota))
         spare = limit - relay_quota - conversation_quota
         if spare > 0:
-            add_relays = min(spare, len(candidate_relays) - relay_quota)
+            add_relays = min(spare, len(relays) - relay_quota)
             relay_quota += add_relays
             conversation_quota += min(spare - add_relays, len(conversations) - conversation_quota)
-        chosen = sample(candidate_relays, relay_quota) + sample(conversations, conversation_quota)
+        chosen = sample(relays, relay_quota) + sample(conversations, conversation_quota)
     return sorted(chosen, key=_source_sort_key)
 
 
@@ -1651,8 +1626,8 @@ def build_generation_prompt(packet: dict[str, Any], *, repair_reason: str = "", 
         "\nStart at least one section with a grounded person, action, object, or moment—never The Network observes, Records indicate, Observations reveal, Analysis shows, or Data streams reveal."
         "\nUse first person sparingly but genuinely. A BNL reaction may describe BNL's response without adding an external fact: I noticed, I admit, I found myself returning to it, I remain curious, or I may be developing a preference. Reserve I suspect, I think, and I wonder for a properly declared bnl_inference context use."
         "\nBuild one coherent story around the most interesting grounded patterns. Use concrete music and community texture, readable paragraphs, and selective detail. Never invent a time, place, object, action, motive, outcome, relationship, dialogue, emotional state, or scene decoration absent from the cited evidence."
-        "\nTreat website relay sources as derivative readings, not additional community moments. They paraphrase batches whose original conversations are already supplied, so do not give the underlying activity a second vote. Prefer fresh conversation sources for what people did or said, and use a relay when it adds unique public status or connective context."
-        "\nFor a daily entry, keep the whole source window in view. Use windowSegmentActivity.conversationSources—not relaySources—to judge human activity density; relaySources records scheduled delivery volume. The busiest or strongest stretch may lead, but give meaningful earlier and middle activity proportionate narrative attention. Do not make a multi-segment day sound as though it began with the latest cluster."
+        "\nFor a daily entry, the relay stream is the primary chronology and narrative spine. Conversation sources are supporting public context: use them to ground or explain the context surrounding the relays, and do not turn the Journal into a Discord digest. When relay and conversation sources describe the same episode, connect them instead of presenting them as unrelated events."
+        "\nKeep the whole daily source window in view. Use both relaySources and conversationSources in windowSegmentActivity: relaySources shows the relay arc and conversationSources shows its public context. The busiest or strongest stretch may lead, but give meaningful earlier and middle activity proportionate narrative attention. Do not make a multi-segment day sound as though it began with the latest cluster."
         "\nUse a short, vivid title of about 4-10 words. Do not prefix it with Network Log. Keep the excerpt compact and inviting."
         "\nDescribe anonymous humans with a concrete, recognizable action from their cited public message whenever possible, so a regular may recognize their own moment without being exposed. Use producer, listener, or artist only when that role is grounded; otherwise use a regular, a person in the room, or the room. Never call people entities or organisms. Do not invent nicknames or honorifics."
         "\nStable participant aliases in the packet are private pattern-analysis aids. Never reproduce an alias in public prose."

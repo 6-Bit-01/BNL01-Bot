@@ -52,7 +52,7 @@ class JournalEvidenceVoiceTests(unittest.TestCase):
                 "sourceKind": "relay",
                 "summary": f"A public mix update carried bass detail number {index}.",
                 "observedAt": f"2026-07-19T{hour:02d}:00:00Z",
-                "eventType": "canon",
+                "eventType": "fresh_public_activity",
             }
             for index, hour in enumerate((8, 10, 14, 16, 20, 22), 1)
         ]
@@ -100,14 +100,15 @@ class JournalEvidenceVoiceTests(unittest.TestCase):
         self.assertIn("concrete, recognizable action", prompt)
         self.assertIn("Never invent a time, place, object, action", prompt)
         self.assertIn("Use a direct quote only rarely", prompt)
-        self.assertIn("website relay sources as derivative readings", prompt)
-        self.assertIn("do not give the underlying activity a second vote", prompt)
-        self.assertIn("keep the whole source window in view", prompt)
-        self.assertIn("conversationSources—not relaySources", prompt)
+        self.assertIn("relay stream is the primary chronology and narrative spine", prompt)
+        self.assertIn("Conversation sources are supporting public context", prompt)
+        self.assertIn("do not turn the Journal into a Discord digest", prompt)
+        self.assertIn("Keep the whole daily source window in view", prompt)
+        self.assertIn("Use both relaySources and conversationSources", prompt)
         self.assertIn("windowSegmentActivity", prompt)
         self.assertNotIn("Do not include direct quotes", prompt)
 
-    def test_daily_packet_discounts_relay_echoes_and_reports_full_window_density(self):
+    def test_daily_packet_keeps_relay_spine_and_balances_conversation_context(self):
         start_at = datetime(2026, 7, 19, tzinfo=timezone.utc)
 
         def stamp(segment, index, count):
@@ -154,12 +155,16 @@ class JournalEvidenceVoiceTests(unittest.TestCase):
 
         prompt_relays = [source for source in packet["privateSources"] if source["sourceKind"] == "relay"]
         prompt_conversations = [source for source in packet["privateSources"] if source["sourceKind"] == "conversation"]
-        self.assertEqual(journal.MAX_DAILY_DERIVATIVE_RELAY_PROMPT_SOURCES, len(prompt_relays))
-        self.assertEqual(sum(conversation_counts), len(prompt_conversations))
+        safe_relays = [source for source in packet["safeSources"] if source["sourceKind"] == "relay"]
+        safe_conversations = [source for source in packet["safeSources"] if source["sourceKind"] == "conversation"]
+        self.assertEqual(sum(relay_counts), len(prompt_relays))
+        self.assertEqual(journal.MAX_PROMPT_SOURCES - sum(relay_counts), len(prompt_conversations))
+        self.assertEqual(71, len(safe_relays))
+        self.assertEqual(109, len(safe_conversations))
         self.assertEqual(71, packet["aggregateCounts"]["eligibleRelays"])
         self.assertEqual(138, packet["aggregateCounts"]["eligibleConversations"])
-        self.assertEqual(3, packet["aggregateCounts"]["promptRelays"])
-        self.assertEqual(138, packet["aggregateCounts"]["promptConversations"])
+        self.assertEqual(71, packet["aggregateCounts"]["promptRelays"])
+        self.assertEqual(109, packet["aggregateCounts"]["promptConversations"])
         self.assertEqual(
             [
                 {"segment": "early", "conversationSources": 37, "relaySources": 23},
@@ -178,6 +183,23 @@ class JournalEvidenceVoiceTests(unittest.TestCase):
             for source in prompt_relays
         }
         self.assertEqual({"segment-1", "segment-2", "segment-3"}, relay_segments)
+        conversation_segment_counts = {
+            segment: len([
+                source
+                for source in prompt_conversations
+                if journal._coverage_segment(
+                    source["observedAt"],
+                    packet["sourceWindowStart"],
+                    packet["sourceWindowEnd"],
+                    3,
+                ) == segment
+            ])
+            for segment in ("segment-1", "segment-2", "segment-3")
+        }
+        self.assertEqual(
+            {"segment-1": 31, "segment-2": 9, "segment-3": 69},
+            conversation_segment_counts,
+        )
 
     def test_daily_conversation_sampling_preserves_quiet_segments_without_flattening_busy_one(self):
         start_at = datetime(2026, 7, 19, tzinfo=timezone.utc)
@@ -233,7 +255,7 @@ class JournalEvidenceVoiceTests(unittest.TestCase):
         self.assertEqual(3, len(sampled_by_segment[1]))
         self.assertGreater(len(sampled_by_segment[2]), len(sampled_by_segment[0]))
 
-    def test_daily_keeps_distinct_relay_status_while_discounting_repeated_echoes(self):
+    def test_daily_keeps_full_mixed_relay_history_below_prompt_cap(self):
         start_at = datetime(2026, 7, 19, tzinfo=timezone.utc)
         relays = [
             {
@@ -276,7 +298,7 @@ class JournalEvidenceVoiceTests(unittest.TestCase):
 
         self.assertIn("fresh:distinct-status", {source["refId"] for source in sampled})
         self.assertEqual(
-            3,
+            30,
             len([
                 source
                 for source in sampled
