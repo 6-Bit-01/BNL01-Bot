@@ -98,6 +98,8 @@ class JournalEvidenceVoiceTests(unittest.TestCase):
         self.assertIn("evidenceCoverageContract", prompt)
         self.assertIn("concrete, recognizable action", prompt)
         self.assertIn("Never invent a time, place, object, action", prompt)
+        self.assertIn("direct quote is welcome", prompt)
+        self.assertNotIn("Do not include direct quotes", prompt)
 
     def test_report_opening_clinical_language_and_missing_reaction_are_rejected(self):
         report = _article(self.packet, opening="The Network observes a producer carrying a bass sketch through the room.")
@@ -114,10 +116,29 @@ class JournalEvidenceVoiceTests(unittest.TestCase):
             "I smiled when the room gave the idea another careful pass.",
             "I confess the patience on display pleased me.",
             "I am fond of the way this room lets a chorus change slowly.",
+            "I felt the room's patience settle in.",
+            "I laughed when the smallest change became the evening's main event.",
         ):
             with self.subTest(reaction=reaction):
                 article = _article(self.packet, reaction_text=reaction)
                 self.assertEqual("", journal.validate_article(article, self.packet, []))
+
+    def test_quoted_first_person_line_does_not_replace_bnl_reaction(self):
+        article = _article(
+            self.packet,
+            reaction=False,
+            opening='A producer brought a bass sketch and said “I smiled when the loop finally landed.”',
+        )
+        self.assertEqual("missing_bnl_reaction", journal.validate_article(article, self.packet, []))
+
+    def test_reaction_repair_names_natural_validator_compatible_stems(self):
+        prompt = journal.build_generation_prompt(
+            self.packet,
+            repair_reason="missing_bnl_reaction",
+            previous_output="{}",
+        )
+        self.assertIn("I laughed", prompt)
+        self.assertIn("I felt", prompt)
 
     def test_all_window_names_are_scrubbed_and_validated_before_sampling(self):
         conversations = [
