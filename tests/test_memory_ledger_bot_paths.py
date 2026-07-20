@@ -21,11 +21,11 @@ class _Message:
         self.content = content
         self.author = _Author()
         self.replies = []
-    async def reply(self, text):
+    async def reply(self, text, **kwargs):
         self.replies.append(text)
 
 class _FailMessage(_Message):
-    async def reply(self, text):
+    async def reply(self, text, **kwargs):
         raise RuntimeError("send failed")
 
 class MemoryLedgerBotPathTests(unittest.TestCase):

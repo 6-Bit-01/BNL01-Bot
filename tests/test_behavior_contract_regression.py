@@ -414,6 +414,7 @@ class BehaviorContractRouteTests(unittest.TestCase):
                 "Records indicate the source file has a HellcatNZ entry.",
                 source_prompt,
                 "free_speak_media_generation",
+                source_context_available=True,
             )
         )
         subject_prompt = media_prompt(user_text="is this me?")

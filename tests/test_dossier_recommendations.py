@@ -647,7 +647,7 @@ class DossierDiscoveryRoutingTests(unittest.TestCase):
             self.guild = DossierDiscoveryRoutingTests.Guild()
             self.channel = DossierDiscoveryRoutingTests.Channel()
             self.replies = []
-        async def reply(self, text):
+        async def reply(self, text, **kwargs):
             self.replies.append(text)
 
     def test_unauthorized_users_cannot_run_discovery(self):

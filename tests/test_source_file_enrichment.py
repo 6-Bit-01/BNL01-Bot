@@ -1032,7 +1032,7 @@ class SourceFileEnrichmentBotTests(unittest.TestCase):
             self.guild = SourceFileEnrichmentBotTests.Guild()
             self.channel = SourceFileEnrichmentBotTests.Channel(channel_name)
             self.replies = []
-        async def reply(self, text):
+        async def reply(self, text, **kwargs):
             self.replies.append(text)
 
     def test_rejects_unauthorized_user(self):
