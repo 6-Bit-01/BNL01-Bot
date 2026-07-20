@@ -1001,6 +1001,83 @@ def _evenly_sample(items: list[dict[str, Any]], limit: int) -> list[dict[str, An
     return [items[i] for i in sorted(indexes)]
 
 
+def _source_sort_key(source: dict[str, Any]) -> tuple[str, str, str]:
+    return (
+        str(source.get("observedAt") or ""),
+        str(source.get("sourceKind") or ""),
+        str(source.get("refId") or ""),
+    )
+
+
+def _time_stratified_sample(
+    items: list[dict[str, Any]],
+    limit: int,
+    start: str,
+    end: str,
+    *,
+    segment_count: int = 3,
+) -> list[dict[str, Any]]:
+    """Reserve temporal breadth, then let remaining slots follow activity density."""
+    ordered = sorted(items, key=_source_sort_key)
+    if limit <= 0:
+        return []
+    if len(ordered) <= limit:
+        return ordered
+    buckets: dict[str, list[dict[str, Any]]] = {}
+    for source in ordered:
+        segment = _coverage_segment(source.get("observedAt"), start, end, segment_count)
+        if segment:
+            buckets.setdefault(segment, []).append(source)
+    active_segments = [
+        buckets.get(f"segment-{index}", [])
+        for index in range(1, max(1, int(segment_count)) + 1)
+        if buckets.get(f"segment-{index}")
+    ]
+    if not active_segments or limit < len(active_segments):
+        return _evenly_sample(ordered, limit)
+
+    # Half of the budget is available as an equal temporal floor. Quiet
+    # segments keep all of their material; the other half continues to follow
+    # real activity density, so a busy stretch may still lead the story.
+    floor = max(1, limit // (2 * len(active_segments)))
+    selected: list[dict[str, Any]] = []
+    for bucket in active_segments:
+        selected.extend(_evenly_sample(bucket, min(len(bucket), floor)))
+    selected_ids = {id(source) for source in selected}
+    remaining = [source for source in ordered if id(source) not in selected_ids]
+    remaining_quota = limit - len(selected)
+    if remaining_quota > 0:
+        selected.extend(_evenly_sample(remaining, remaining_quota))
+    return sorted(selected, key=_source_sort_key)
+
+
+def _window_segment_activity(
+    start: str,
+    end: str,
+    relays: list[dict[str, Any]],
+    conversations: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Expose non-identifying daily activity across the relay and context streams."""
+    labels = ("early", "middle", "late")
+    counts = {
+        f"segment-{index}": {"conversationSources": 0, "relaySources": 0}
+        for index in range(1, 4)
+    }
+    for source in [*relays, *conversations]:
+        segment = _coverage_segment(source.get("observedAt"), start, end, 3)
+        if segment not in counts:
+            continue
+        key = "conversationSources" if source.get("sourceKind") == "conversation" else "relaySources"
+        counts[segment][key] += 1
+    return [
+        {
+            "segment": label,
+            **counts[f"segment-{index}"],
+        }
+        for index, label in enumerate(labels, 1)
+    ]
+
+
 def _minimum_fresh_sources_for_entry(entry_kind: str, total: int) -> int:
     """Require representative breadth without turning a short Journal into a roll call."""
     if total <= 0:
@@ -1183,14 +1260,30 @@ def retrieve_history(
     }
 
 
-def _sample_source_kinds(relays: list[dict[str, Any]], conversations: list[dict[str, Any]], limit: int = MAX_PROMPT_SOURCES) -> list[dict[str, Any]]:
+def _sample_source_kinds(
+    relays: list[dict[str, Any]],
+    conversations: list[dict[str, Any]],
+    limit: int = MAX_PROMPT_SOURCES,
+    *,
+    start: str = "",
+    end: str = "",
+    entry_kind: str = "manual",
+) -> list[dict[str, Any]]:
+    if limit <= 0:
+        return []
+
+    def sample(items: list[dict[str, Any]], quota: int) -> list[dict[str, Any]]:
+        if entry_kind == "daily" and start and end:
+            return _time_stratified_sample(items, quota, start, end)
+        return _evenly_sample(items, quota)
+
     total = len(relays) + len(conversations)
     if total <= limit:
         chosen = list(relays) + list(conversations)
     elif not relays:
-        chosen = _evenly_sample(conversations, limit)
+        chosen = sample(conversations, limit)
     elif not conversations:
-        chosen = _evenly_sample(relays, limit)
+        chosen = sample(relays, limit)
     else:
         relay_quota = min(len(relays), max(1, limit // 2))
         conversation_quota = min(len(conversations), max(1, limit - relay_quota))
@@ -1199,8 +1292,8 @@ def _sample_source_kinds(relays: list[dict[str, Any]], conversations: list[dict[
             add_relays = min(spare, len(relays) - relay_quota)
             relay_quota += add_relays
             conversation_quota += min(spare - add_relays, len(conversations) - conversation_quota)
-        chosen = _evenly_sample(relays, relay_quota) + _evenly_sample(conversations, conversation_quota)
-    return sorted(chosen, key=lambda src: (str(src.get("observedAt") or ""), str(src.get("sourceKind") or ""), str(src.get("refId") or "")))
+        chosen = sample(relays, relay_quota) + sample(conversations, conversation_quota)
+    return sorted(chosen, key=_source_sort_key)
 
 
 def build_packet_from_sources(
@@ -1226,7 +1319,13 @@ def build_packet_from_sources(
         if str(source.get("displayName") or "").strip()
     ]
     window_display_names = list(dict.fromkeys(window_display_names))
-    private_sources = _sample_source_kinds(relays, conversations)
+    private_sources = _sample_source_kinds(
+        relays,
+        conversations,
+        start=start,
+        end=end,
+        entry_kind=entry_kind,
+    )
     safe_sources = []
     for source in private_sources:
         safe_source = _source_for_prompt(source)
@@ -1256,6 +1355,11 @@ def build_packet_from_sources(
         "aggregateCounts": counts,
         "coverageComplete": bool(coverage_complete),
         "observationContext": list(observation_context or []),
+        "windowSegmentActivity": (
+            _window_segment_activity(start, end, relays, conversations)
+            if entry_kind == "daily"
+            else []
+        ),
     }
     context_lanes, private_lane_provenance = build_generation_context_lanes(
         db_path,
@@ -1477,6 +1581,7 @@ def build_generation_prompt(packet: dict[str, Any], *, repair_reason: str = "", 
         "history": _bounded_history_for_prompt(packet.get("history", {})),
         "aggregateCounts": packet.get("aggregateCounts", {}),
         "dailyObservations": packet.get("observationContext", [])[:7],
+        "windowSegmentActivity": packet.get("windowSegmentActivity", []),
         "privateGenerationContextLanes": context_lanes,
     }
     cadence_rule = (
@@ -1521,6 +1626,8 @@ def build_generation_prompt(packet: dict[str, Any], *, repair_reason: str = "", 
         "\nStart at least one section with a grounded person, action, object, or moment—never The Network observes, Records indicate, Observations reveal, Analysis shows, or Data streams reveal."
         "\nUse first person sparingly but genuinely. A BNL reaction may describe BNL's response without adding an external fact: I noticed, I admit, I found myself returning to it, I remain curious, or I may be developing a preference. Reserve I suspect, I think, and I wonder for a properly declared bnl_inference context use."
         "\nBuild one coherent story around the most interesting grounded patterns. Use concrete music and community texture, readable paragraphs, and selective detail. Never invent a time, place, object, action, motive, outcome, relationship, dialogue, emotional state, or scene decoration absent from the cited evidence."
+        "\nFor a daily entry, the relay stream is the primary chronology and narrative spine. Conversation sources are supporting public context: use them to ground or explain the context surrounding the relays, and do not turn the Journal into a Discord digest. When relay and conversation sources describe the same episode, connect them instead of presenting them as unrelated events."
+        "\nKeep the whole daily source window in view. Use both relaySources and conversationSources in windowSegmentActivity: relaySources shows the relay arc and conversationSources shows its public context. The busiest or strongest stretch may lead, but give meaningful earlier and middle activity proportionate narrative attention. Do not make a multi-segment day sound as though it began with the latest cluster."
         "\nUse a short, vivid title of about 4-10 words. Do not prefix it with Network Log. Keep the excerpt compact and inviting."
         "\nDescribe anonymous humans with a concrete, recognizable action from their cited public message whenever possible, so a regular may recognize their own moment without being exposed. Use producer, listener, or artist only when that role is grounded; otherwise use a regular, a person in the room, or the room. Never call people entities or organisms. Do not invent nicknames or honorifics."
         "\nStable participant aliases in the packet are private pattern-analysis aids. Never reproduce an alias in public prose."

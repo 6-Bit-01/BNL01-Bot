@@ -1,6 +1,7 @@
 import json
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 
 import bnl_journal as journal
 
@@ -99,7 +100,249 @@ class JournalEvidenceVoiceTests(unittest.TestCase):
         self.assertIn("concrete, recognizable action", prompt)
         self.assertIn("Never invent a time, place, object, action", prompt)
         self.assertIn("Use a direct quote only rarely", prompt)
+        self.assertIn("relay stream is the primary chronology and narrative spine", prompt)
+        self.assertIn("Conversation sources are supporting public context", prompt)
+        self.assertIn("do not turn the Journal into a Discord digest", prompt)
+        self.assertIn("Keep the whole daily source window in view", prompt)
+        self.assertIn("Use both relaySources and conversationSources", prompt)
+        self.assertIn("windowSegmentActivity", prompt)
         self.assertNotIn("Do not include direct quotes", prompt)
+
+    def test_daily_packet_keeps_relay_spine_and_balances_conversation_context(self):
+        start_at = datetime(2026, 7, 19, tzinfo=timezone.utc)
+
+        def stamp(segment, index, count):
+            offset = int((index + 1) * 8 * 60 / (count + 1))
+            return (start_at + timedelta(hours=segment * 8, minutes=offset)).isoformat().replace("+00:00", "Z")
+
+        relay_counts = (23, 24, 24)
+        relays = [
+            {
+                "refId": f"fresh:relay-{segment}-{index}",
+                "sourceKind": "relay",
+                "summary": "A scheduled relay paraphrased a batch of public conversations.",
+                "observedAt": stamp(segment, index, count),
+                "eventType": "fresh_public_discord_activity",
+            }
+            for segment, count in enumerate(relay_counts)
+            for index in range(count)
+        ]
+        conversation_counts = (37, 9, 92)
+        conversations = [
+            {
+                "refId": f"fresh:conversation-{segment}-{index}",
+                "sourceKind": "conversation",
+                "summary": f"A regular shared a distinct public moment {segment}-{index}.",
+                "observedAt": stamp(segment, index, count),
+                "participantAlias": f"participant-{segment}-{index}",
+                "subjectRef": f"discord_user:{segment * 1000 + index}",
+                "displayName": f"WindowMember{segment:01d}{index:03d}",
+                "channelPolicy": "public_home",
+            }
+            for segment, count in enumerate(conversation_counts)
+            for index in range(count)
+        ]
+
+        packet = journal.build_packet_from_sources(
+            self.db,
+            1,
+            "2026-07-19T00:00:00Z",
+            "2026-07-20T00:00:00Z",
+            relays,
+            conversations,
+            entry_kind="daily",
+        )
+
+        prompt_relays = [source for source in packet["privateSources"] if source["sourceKind"] == "relay"]
+        prompt_conversations = [source for source in packet["privateSources"] if source["sourceKind"] == "conversation"]
+        safe_relays = [source for source in packet["safeSources"] if source["sourceKind"] == "relay"]
+        safe_conversations = [source for source in packet["safeSources"] if source["sourceKind"] == "conversation"]
+        self.assertEqual(sum(relay_counts), len(prompt_relays))
+        self.assertEqual(journal.MAX_PROMPT_SOURCES - sum(relay_counts), len(prompt_conversations))
+        self.assertEqual(71, len(safe_relays))
+        self.assertEqual(109, len(safe_conversations))
+        self.assertEqual(71, packet["aggregateCounts"]["eligibleRelays"])
+        self.assertEqual(138, packet["aggregateCounts"]["eligibleConversations"])
+        self.assertEqual(71, packet["aggregateCounts"]["promptRelays"])
+        self.assertEqual(109, packet["aggregateCounts"]["promptConversations"])
+        self.assertEqual(
+            [
+                {"segment": "early", "conversationSources": 37, "relaySources": 23},
+                {"segment": "middle", "conversationSources": 9, "relaySources": 24},
+                {"segment": "late", "conversationSources": 92, "relaySources": 24},
+            ],
+            packet["windowSegmentActivity"],
+        )
+        relay_segments = {
+            journal._coverage_segment(
+                source["observedAt"],
+                packet["sourceWindowStart"],
+                packet["sourceWindowEnd"],
+                3,
+            )
+            for source in prompt_relays
+        }
+        self.assertEqual({"segment-1", "segment-2", "segment-3"}, relay_segments)
+        conversation_segment_counts = {
+            segment: len([
+                source
+                for source in prompt_conversations
+                if journal._coverage_segment(
+                    source["observedAt"],
+                    packet["sourceWindowStart"],
+                    packet["sourceWindowEnd"],
+                    3,
+                ) == segment
+            ])
+            for segment in ("segment-1", "segment-2", "segment-3")
+        }
+        self.assertEqual(
+            {"segment-1": 31, "segment-2": 9, "segment-3": 69},
+            conversation_segment_counts,
+        )
+
+    def test_daily_conversation_sampling_preserves_quiet_segments_without_flattening_busy_one(self):
+        start_at = datetime(2026, 7, 19, tzinfo=timezone.utc)
+        counts = (20, 3, 220)
+        conversations = []
+        for segment, count in enumerate(counts):
+            for index in range(count):
+                offset = int((index + 1) * 8 * 60 / (count + 1))
+                conversations.append({
+                    "refId": f"fresh:conversation-{segment}-{index}",
+                    "sourceKind": "conversation",
+                    "summary": f"A regular shared moment {segment}-{index}.",
+                    "observedAt": (
+                        start_at + timedelta(hours=segment * 8, minutes=offset)
+                    ).isoformat().replace("+00:00", "Z"),
+                    "participantAlias": f"participant-{segment}-{index}",
+                    "subjectRef": f"discord_user:{segment * 1000 + index}",
+                    "displayName": f"Member{segment:01d}{index:03d}",
+                    "channelPolicy": "public_home",
+                })
+        relays = [
+            {
+                "refId": f"fresh:relay-{index}",
+                "sourceKind": "relay",
+                "summary": "A derivative relay summarized public activity.",
+                "observedAt": (
+                    start_at + timedelta(minutes=index * 120)
+                ).isoformat().replace("+00:00", "Z"),
+                "eventType": "fresh_public_discord_activity",
+            }
+            for index in range(12)
+        ]
+
+        sampled = journal._sample_source_kinds(
+            relays,
+            conversations,
+            start="2026-07-19T00:00:00Z",
+            end="2026-07-20T00:00:00Z",
+            entry_kind="daily",
+        )
+        sampled_conversations = [source for source in sampled if source["sourceKind"] == "conversation"]
+        sampled_by_segment = {
+            segment: [
+                source
+                for source in sampled_conversations
+                if source["refId"].startswith(f"fresh:conversation-{segment}-")
+            ]
+            for segment in range(3)
+        }
+
+        self.assertEqual(180, len(sampled))
+        self.assertEqual(20, len(sampled_by_segment[0]))
+        self.assertEqual(3, len(sampled_by_segment[1]))
+        self.assertGreater(len(sampled_by_segment[2]), len(sampled_by_segment[0]))
+
+    def test_daily_keeps_full_mixed_relay_history_below_prompt_cap(self):
+        start_at = datetime(2026, 7, 19, tzinfo=timezone.utc)
+        relays = [
+            {
+                "refId": f"fresh:echo-{index}",
+                "sourceKind": "relay",
+                "summary": "A scheduled relay paraphrased public Discord activity.",
+                "observedAt": (
+                    start_at + timedelta(minutes=(index + 1) * 45)
+                ).isoformat().replace("+00:00", "Z"),
+                "eventType": "fresh_public_discord_activity",
+            }
+            for index in range(30)
+        ]
+        relays.insert(15, {
+            "refId": "fresh:distinct-status",
+            "sourceKind": "relay",
+            "summary": "A distinct public Network status changed.",
+            "observedAt": "2026-07-19T12:00:00Z",
+            "eventType": "status_change",
+        })
+        conversations = [
+            {
+                "refId": f"fresh:conversation-{index}",
+                "sourceKind": "conversation",
+                "summary": f"A regular shared public moment {index}.",
+                "observedAt": (
+                    start_at + timedelta(minutes=(index + 1) * 100)
+                ).isoformat().replace("+00:00", "Z"),
+            }
+            for index in range(12)
+        ]
+
+        sampled = journal._sample_source_kinds(
+            relays,
+            conversations,
+            start="2026-07-19T00:00:00Z",
+            end="2026-07-20T00:00:00Z",
+            entry_kind="daily",
+        )
+
+        self.assertIn("fresh:distinct-status", {source["refId"] for source in sampled})
+        self.assertEqual(
+            30,
+            len([
+                source
+                for source in sampled
+                if source.get("eventType") == "fresh_public_discord_activity"
+            ]),
+        )
+        self.assertEqual(12, len([source for source in sampled if source["sourceKind"] == "conversation"]))
+
+    def test_relay_only_daily_window_keeps_existing_source_breadth(self):
+        start_at = datetime(2026, 7, 19, tzinfo=timezone.utc)
+        relays = [
+            {
+                "refId": f"fresh:relay-only-{index}",
+                "sourceKind": "relay",
+                "summary": f"Unique relay status {index}.",
+                "observedAt": (
+                    start_at + timedelta(minutes=(index + 0.5) * 24 * 60 / 200)
+                ).isoformat().replace("+00:00", "Z"),
+                "eventType": "fresh_public_discord_activity",
+            }
+            for index in range(200)
+        ]
+        sampled = journal._sample_source_kinds(
+            relays,
+            [],
+            start="2026-07-19T00:00:00Z",
+            end="2026-07-20T00:00:00Z",
+            entry_kind="daily",
+        )
+        self.assertEqual(journal.MAX_PROMPT_SOURCES, len(sampled))
+        self.assertEqual("fresh:relay-only-0", sampled[0]["refId"])
+        self.assertEqual("fresh:relay-only-199", sampled[-1]["refId"])
+        self.assertEqual(
+            {"segment-1", "segment-2", "segment-3"},
+            {
+                journal._coverage_segment(
+                    source["observedAt"],
+                    "2026-07-19T00:00:00Z",
+                    "2026-07-20T00:00:00Z",
+                    3,
+                )
+                for source in sampled
+            },
+        )
 
     def test_report_opening_clinical_language_and_missing_reaction_are_rejected(self):
         report = _article(self.packet, opening="The Network observes a producer carrying a bass sketch through the room.")
