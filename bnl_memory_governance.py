@@ -157,7 +157,9 @@ def ensure_governance_schema(conn: sqlite3.Connection) -> None:
     cur = conn.cursor()
     cur.execute("CREATE TABLE IF NOT EXISTS memory_governance_receipts (receipt_id TEXT PRIMARY KEY, guild_id INTEGER NOT NULL, subject_hash TEXT NOT NULL, action TEXT NOT NULL, target_ref TEXT DEFAULT '', created_at TEXT NOT NULL, row_counts_json TEXT DEFAULT '{}')")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_mgr_subject ON memory_governance_receipts(guild_id,subject_hash,action)")
-    cur.execute("CREATE TABLE IF NOT EXISTS memory_governance_shadow_runs (run_id TEXT PRIMARY KEY, guild_id INTEGER NOT NULL, subject_hash TEXT NOT NULL, route_mode TEXT, channel_policy TEXT, created_at TEXT NOT NULL, rendered_hash TEXT, rendered_size INTEGER, legacy_hash TEXT, legacy_size INTEGER, selected_count INTEGER, excluded_json TEXT, errors_json TEXT)")
+    cur.execute("CREATE TABLE IF NOT EXISTS memory_governance_shadow_runs (run_id TEXT PRIMARY KEY, guild_id INTEGER NOT NULL, subject_hash TEXT NOT NULL, route_mode TEXT, channel_policy TEXT, created_at TEXT NOT NULL, rendered_hash TEXT, rendered_size INTEGER, legacy_hash TEXT, legacy_size INTEGER, selected_count INTEGER, excluded_json TEXT, errors_json TEXT, diagnostics_json TEXT DEFAULT '{}')")
+    if "diagnostics_json" not in {row[1] for row in cur.execute("PRAGMA table_info(memory_governance_shadow_runs)").fetchall()}:
+        cur.execute("ALTER TABLE memory_governance_shadow_runs ADD COLUMN diagnostics_json TEXT DEFAULT '{}'")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_mgs_guild ON memory_governance_shadow_runs(guild_id, created_at)")
     conn.commit()
 
@@ -364,7 +366,39 @@ def build_governed_context(conn: sqlite3.Connection, req: GovernanceRequest, *, 
 def persist_shadow_diagnostics(conn: sqlite3.Connection, req: GovernanceRequest, result: GovernanceResult, legacy_context: str) -> str:
     ensure_governance_schema(conn)
     now = _now(); run_id = "mgs_" + _hash("|".join([str(req.guild_id), subject_key_for_user(req.subject_user_id), now, result.diagnostics.rendered_hash]))
-    conn.execute("INSERT OR REPLACE INTO memory_governance_shadow_runs VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", (run_id, req.guild_id, _hash(subject_key_for_user(req.subject_user_id)), req.route_mode, req.channel_policy, now, result.diagnostics.rendered_hash, result.diagnostics.rendered_size, _hash(legacy_context), len(legacy_context or ""), result.diagnostics.selected_count, json.dumps(result.diagnostics.excluded_by_reason, sort_keys=True), json.dumps(result.diagnostics.processing_errors, sort_keys=True)))
+    invalid_invariant_counts: Dict[str, int] = {}
+    for invariant in result.diagnostics.invalid_invariants:
+        key = str(invariant or "unknown")[:120]
+        invalid_invariant_counts[key] = invalid_invariant_counts.get(key, 0) + 1
+    aggregate_diagnostics = {
+        "selected_by_source": dict(result.diagnostics.selected_by_source),
+        "invalid_invariant_counts": invalid_invariant_counts,
+        "fallback_reason": str(result.diagnostics.fallback_reason or "")[:120],
+        "visibility_exclusions": int(result.diagnostics.visibility_exclusions or 0),
+        "token_budget_exclusions": int(result.diagnostics.token_budget_exclusions or 0),
+        "duplicate_suppression": int(result.diagnostics.duplicate_suppression or 0),
+        "contradiction_resolution_count": len(result.diagnostics.contradiction_resolutions),
+        "moment_candidate_count": int(result.diagnostics.moment_candidate_count or 0),
+        "moment_needs_review_excluded": int(result.diagnostics.moment_needs_review_excluded or 0),
+        "empty_result": 0 if result.rendered_context else 1,
+    }
+    conn.execute(
+        """
+        INSERT OR REPLACE INTO memory_governance_shadow_runs (
+            run_id, guild_id, subject_hash, route_mode, channel_policy, created_at,
+            rendered_hash, rendered_size, legacy_hash, legacy_size, selected_count,
+            excluded_json, errors_json, diagnostics_json
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """,
+        (
+            run_id, req.guild_id, _hash(subject_key_for_user(req.subject_user_id)), req.route_mode,
+            req.channel_policy, now, result.diagnostics.rendered_hash, result.diagnostics.rendered_size,
+            _hash(legacy_context), len(legacy_context or ""), result.diagnostics.selected_count,
+            json.dumps(result.diagnostics.excluded_by_reason, sort_keys=True),
+            json.dumps(result.diagnostics.processing_errors, sort_keys=True),
+            json.dumps(aggregate_diagnostics, sort_keys=True),
+        ),
+    )
     conn.execute("DELETE FROM memory_governance_shadow_runs WHERE guild_id=? AND run_id NOT IN (SELECT run_id FROM memory_governance_shadow_runs WHERE guild_id=? ORDER BY created_at DESC, run_id DESC LIMIT 500)", (req.guild_id, req.guild_id))
     conn.commit(); return run_id
 

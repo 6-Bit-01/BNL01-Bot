@@ -402,8 +402,14 @@ def shadow_canon_reference(conn: sqlite3.Connection, *, guild_id: int, canon_id:
     return insert_ledger_entry(conn, LedgerEntry(guild_id=guild_id, source_table="approved_canon", source_row_id=canon_id, source_revision=str(canon_id), source_role="approved_canon", entry_type="canon_reference", subject_key=subject_key, subject_display_name=subject_display_name, predicate_key=predicate_key, value=(value or "")[:500], source_class=SourceClass.APPROVED_CANON, visibility=Visibility.REFERENCE_CANON, confidence=Confidence.APPROVED, public_usable=True, observed_at=observed_at or _now(), lifecycle_status=ACTIVE_LIFECYCLE))
 
 
-def build_memory_ledger_evaluation(conn: sqlite3.Connection, *, guild_id: int | None = None) -> dict[str, Any]:
-    ensure_memory_ledger_schema(conn)
+def build_memory_ledger_evaluation(
+    conn: sqlite3.Connection,
+    *,
+    guild_id: int | None = None,
+    prepare_schema: bool = True,
+) -> dict[str, Any]:
+    if prepare_schema:
+        ensure_memory_ledger_schema(conn)
     params: list[Any] = []
     where = ""
     if guild_id is not None:

@@ -24,7 +24,6 @@ from bnl_canon_source_contract import (
 )
 from bnl_memory_ledger import (
     LedgerWriteResult,
-    build_memory_ledger_evaluation,
     ensure_memory_ledger_schema,
     shadow_broadcast_memory_row,
     shadow_conversation_row,
@@ -66,6 +65,10 @@ from bnl_conversation_context_v2 import (
     CONVERSATION_CONTEXT_VERSION,
     ConversationContextRequest,
     assemble_conversation_context_v2,
+)
+from bnl_shadow_acceptance import (
+    build_v2_shadow_acceptance_snapshot,
+    render_v2_shadow_acceptance_lines,
 )
 from bnl_journal import (
     JOURNAL_ROUTE,
@@ -19731,14 +19734,21 @@ async def bnl_memory_check(interaction: discord.Interaction):
     active_override = get_active_show_state_override(guild.id)
     latest_broadcast_context_episode_date = get_latest_broadcast_episode_date(guild.id, public_only=False)
     member_activity_events_count, recent_member_events_count_7d = get_member_activity_event_counts(guild.id)
+    shadow_acceptance = None
     try:
-        ledger_conn = sqlite3.connect(DB_FILE)
+        diagnostic_conn = sqlite3.connect(DB_FILE)
         try:
-            ledger_diag = build_memory_ledger_evaluation(ledger_conn, guild_id=guild.id)
+            shadow_acceptance = build_v2_shadow_acceptance_snapshot(
+                diagnostic_conn,
+                guild_id=guild.id,
+                environ=os.environ,
+                conversation_context_diagnostics=LAST_CONVERSATION_CONTEXT_V2_DIAGNOSTICS,
+            )
+            ledger_diag = shadow_acceptance["reports"]["memoryLedger"]
         finally:
-            ledger_conn.close()
+            diagnostic_conn.close()
     except Exception as exc:
-        logging.debug("memory_ledger_diagnostic_failed error=%s", exc)
+        logging.debug("v2_shadow_acceptance_diagnostic_failed error=%s", exc)
         ledger_diag = {"schemaVersion": "memory_ledger_v1", "insertedLedgerEntries": "error"}
     lines = [
         "**BNL Memory Diagnostic (safe)**",
@@ -19803,7 +19813,8 @@ async def bnl_memory_check(interaction: discord.Interaction):
         "- memory_tier_future_writes_source_gated: `yes`",
         f"- memory_ledger_shadow_enabled: `{'yes' if memory_ledger_shadow_enabled() else 'no'}`",
         f"- memory_ledger_schema: `{ledger_diag.get('schemaVersion')}`",
-        f"- memory_ledger_entries: `{ledger_diag.get('insertedLedgerEntries', 0)}`",
+        f"- memory_ledger_inserted_shadow_receipts: `{ledger_diag.get('insertedLedgerEntries', 0)}`",
+        f"- memory_ledger_actual_rows: `{ledger_diag.get('actualLedgerRows', 0)}`",
         f"- memory_ledger_counts_by_source: `{ledger_diag.get('countsBySourceLane', {})}`",
         f"- memory_ledger_counts_by_type: `{ledger_diag.get('countsByEntryType', {})}`",
         f"- memory_ledger_counts_by_visibility: `{ledger_diag.get('countsByVisibility', {})}`",
@@ -19838,6 +19849,10 @@ async def bnl_memory_check(interaction: discord.Interaction):
         f"- active_show_state_needs_clarification: `{active_override[8] if active_override else 0}`",
         f"- active_show_state_summary: `{_safe_truncate_summary(active_override[2], 120) if active_override and active_override[3] else 'hidden_or_none'}`",
     ]
+    if shadow_acceptance is not None:
+        lines.extend(["", *render_v2_shadow_acceptance_lines(shadow_acceptance)])
+    else:
+        lines.extend(["", "**V2 Shadow Acceptance / Rollback Evidence**", "- status: `report_error`", "- behavior_changes_applied: `none`"])
     await send_safe_ephemeral_chunks(interaction, "\n".join(lines), limit=1700)
 
 

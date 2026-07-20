@@ -386,11 +386,72 @@ def propagate_ledger_lifecycle(conn: sqlite3.Connection, *, guild_id: int, ledge
         rebuild_state(conn, guild_id=guild_id, subject_user_id=int(uid))
     return count
 
-def build_evaluation_report(conn: sqlite3.Connection, *, guild_id: int | None = None) -> dict[str, Any]:
-    ensure_relationship_v2_schema(conn); where="WHERE guild_id=?" if guild_id is not None else ""; p=([guild_id] if guild_id is not None else [])
+def build_evaluation_report(conn: sqlite3.Connection, *, guild_id: int | None = None, prepare_schema: bool = True) -> dict[str, Any]:
+    if prepare_schema:
+        ensure_relationship_v2_schema(conn)
+    where="WHERE guild_id=?" if guild_id is not None else ""; p=([guild_id] if guild_id is not None else [])
     def one(sql, pp=p): return conn.execute(sql, pp).fetchone()[0]
     by_type={r[0]:r[1] for r in conn.execute(f"SELECT event_type,COUNT(*) FROM relationship_events_v2 {where} GROUP BY event_type", p).fetchall()}
     lifecycle={r[0]:r[1] for r in conn.execute(f"SELECT lifecycle,COUNT(*) FROM relationship_events_v2 {where} GROUP BY lifecycle", p).fetchall()}
+    scoped = "guild_id=? AND " if guild_id is not None else ""
+    if _table_exists(conn, "memory_ledger_entries"):
+        ledger_link_integrity_violations = one(
+            "SELECT COUNT(*) FROM relationship_event_ledger_links_v2 l "
+            "LEFT JOIN relationship_events_v2 e ON e.event_id=l.event_id "
+            "LEFT JOIN memory_ledger_entries m ON m.entry_id=l.ledger_entry_id "
+            f"WHERE {('l.guild_id=? AND ' if guild_id is not None else '')}"
+            "(e.event_id IS NULL OR e.guild_id<>l.guild_id "
+            "OR e.subject_user_id<>l.subject_user_id "
+            "OR m.entry_id IS NULL OR m.guild_id<>l.guild_id "
+            "OR m.subject_key<>('discord_user:' || CAST(l.subject_user_id AS TEXT)))"
+        )
+    else:
+        # A persisted link cannot be verified when its target table is absent.
+        ledger_link_integrity_violations = one(
+            f"SELECT COUNT(*) FROM relationship_event_ledger_links_v2 {where}"
+        )
+    if _table_exists(conn, "memory_moment_windows") and _table_exists(
+        conn, "memory_moment_participants"
+    ):
+        moment_link_integrity_violations = one(
+            "SELECT COUNT(*) FROM relationship_event_moment_links_v2 l "
+            "LEFT JOIN relationship_events_v2 e ON e.event_id=l.event_id "
+            "LEFT JOIN memory_moment_windows w ON w.moment_id=l.moment_id "
+            f"WHERE {('l.guild_id=? AND ' if guild_id is not None else '')}"
+            "(e.event_id IS NULL OR e.guild_id<>l.guild_id "
+            "OR e.subject_user_id<>l.subject_user_id "
+            "OR w.moment_id IS NULL OR w.guild_id<>l.guild_id "
+            "OR NOT EXISTS ("
+            "SELECT 1 FROM memory_moment_participants p "
+            "WHERE p.moment_id=l.moment_id "
+            "AND p.participant_key=('discord_user:' || CAST(l.subject_user_id AS TEXT))"
+            "))"
+        )
+    else:
+        # A persisted link cannot be verified when either target table is absent.
+        moment_link_integrity_violations = one(
+            f"SELECT COUNT(*) FROM relationship_event_moment_links_v2 {where}"
+        )
+    cross_guild_member_violations = sum([
+        one(f"SELECT COUNT(*) FROM relationship_events_v2 WHERE {scoped}subject_key<>('discord_user:' || CAST(subject_user_id AS TEXT))"),
+        one(f"SELECT COUNT(*) FROM relationship_state_v2 WHERE {scoped}subject_key<>('discord_user:' || CAST(subject_user_id AS TEXT))"),
+        one(f"SELECT COUNT(*) FROM relationship_engagement_shadow_runs WHERE {scoped}subject_key<>('discord_user:' || CAST(subject_user_id AS TEXT))"),
+        one(f"SELECT COUNT(*) FROM relationship_observation_diagnostics_v2 WHERE {scoped}subject_key<>('discord_user:' || CAST(subject_user_id AS TEXT))"),
+        one(f"SELECT COUNT(*) FROM relationship_member_settings_v2 WHERE {scoped}subject_key<>('discord_user:' || CAST(subject_user_id AS TEXT))"),
+        one(f"SELECT COUNT(*) FROM relationship_member_preferences_v2 WHERE {scoped}subject_key<>('discord_user:' || CAST(subject_user_id AS TEXT))"),
+    ])
+    withheld_reason_counts: dict[str, int] = {}
+    for raw_reasons, count in conn.execute(f"SELECT withheld_reason_codes,COUNT(*) FROM relationship_engagement_shadow_runs {where} GROUP BY withheld_reason_codes", p).fetchall():
+        try:
+            parsed = json.loads(raw_reasons or "[]")
+            reasons = parsed if isinstance(parsed, list) else []
+        except (TypeError, ValueError, json.JSONDecodeError):
+            reasons = []
+        if raw_reasons and raw_reasons != "[]" and not reasons:
+            reasons = ["malformed_withheld_reason_json"]
+        for raw_reason in reasons:
+            reason = re.sub(r"[^a-z0-9_:-]+", "_", str(raw_reason or "unknown").strip().lower())[:80] or "unknown"
+            withheld_reason_counts[reason] = withheld_reason_counts.get(reason, 0) + int(count or 0)
     return {
         "eligible_user_authored_events": one(f"SELECT COUNT(*) FROM relationship_events_v2 {where + (' AND' if where else 'WHERE')} actor_role='user' AND lifecycle='active' AND event_type<>'unclassified'"),
         "rejected_or_unclassified_user_evidence": one(f"SELECT COUNT(*) FROM relationship_observation_diagnostics_v2 {where}"),
@@ -399,12 +460,18 @@ def build_evaluation_report(conn: sqlite3.Connection, *, guild_id: int | None = 
         "policy_route_ambiguity_rejections": one(f"SELECT COUNT(*) FROM relationship_observation_diagnostics_v2 {where + (' AND' if where else 'WHERE')} rejection_reason='policy_or_route_or_ambiguous'"),
         "model_audit_events": by_type.get("model_audit",0)+by_type.get("model_playful_rivalry_acceptance",0), "events_by_type": by_type, "lifecycle_exclusions": {k:v for k,v in lifecycle.items() if k in BLOCKED_LIFECYCLES},
         "moment_linked_events": one(f"SELECT COUNT(DISTINCT event_id) FROM relationship_event_moment_links_v2 {where + (' AND' if where else 'WHERE')} lifecycle='active'"),
-        "cross_guild_member_violations": "not_collected", "visibility_violations": one(f"SELECT COUNT(*) FROM relationship_events_v2 {where + (' AND' if where else 'WHERE')} visibility<>'private'"),
+        "cross_guild_member_violations": cross_guild_member_violations,
+        "ledger_link_integrity_violations": ledger_link_integrity_violations,
+        "moment_link_integrity_violations": moment_link_integrity_violations,
+        "visibility_violations": one(f"SELECT COUNT(*) FROM relationship_events_v2 {where + (' AND' if where else 'WHERE')} visibility<>'private'"),
+        "shadow_runs": one(f"SELECT COUNT(*) FROM relationship_engagement_shadow_runs {where}"),
         "policy_eligible_shadow_candidates": one(f"SELECT COUNT(*) FROM relationship_engagement_shadow_runs {where + (' AND' if where else 'WHERE')} policy_eligible=1"),
+        "would_select": one(f"SELECT COUNT(*) FROM relationship_engagement_shadow_runs {where + (' AND' if where else 'WHERE')} would_select=1"),
+        "live_emission_allowed": one(f"SELECT COUNT(*) FROM relationship_engagement_shadow_runs {where + (' AND' if where else 'WHERE')} live_emission_allowed=1"),
         "actual_live_emissions": one(f"SELECT COUNT(*) FROM relationship_engagement_shadow_runs {where + (' AND' if where else 'WHERE')} actual_emitted=1"),
-        "withheld_reasons": {r[0]:r[1] for r in conn.execute(f"SELECT withheld_reason_codes,COUNT(*) FROM relationship_engagement_shadow_runs {where} GROUP BY withheld_reason_codes", p).fetchall()},
+        "withheld_reasons": withheld_reason_counts,
         "opt_out_rejections": one(f"SELECT COUNT(*) FROM relationship_engagement_shadow_runs {where + (' AND' if where else 'WHERE')} withheld_reason_codes LIKE '%member_opt_out%'"),
-        "privacy_rejections": one(f"SELECT COUNT(*) FROM relationship_engagement_shadow_runs {where + (' AND' if where else 'WHERE')} withheld_reason_codes LIKE '%visibility%' OR withheld_reason_codes LIKE '%policy%'"),
+        "privacy_rejections": one(f"SELECT COUNT(*) FROM relationship_engagement_shadow_runs {where + (' AND' if where else 'WHERE')} (withheld_reason_codes LIKE '%visibility%' OR withheld_reason_codes LIKE '%policy%')"),
         "cooldown_rejections": one(f"SELECT COUNT(*) FROM relationship_engagement_shadow_runs {where + (' AND' if where else 'WHERE')} withheld_reason_codes LIKE '%cooldown%'"),
         "rivalry_rejections": one(f"SELECT COUNT(*) FROM relationship_engagement_shadow_runs {where + (' AND' if where else 'WHERE')} withheld_reason_codes LIKE '%rivalry%'"),
         "processing_errors": one(f"SELECT COUNT(*) FROM relationship_engagement_shadow_runs {where + (' AND' if where else 'WHERE')} processing_errors_json<>'[]'"),

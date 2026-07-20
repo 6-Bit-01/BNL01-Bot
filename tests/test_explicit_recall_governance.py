@@ -89,6 +89,32 @@ class ExplicitRecallGovernanceTests(unittest.TestCase):
         self.assertEqual(empty, "I do not have eligible durable memories available for this recall.")
         self.assertNotIn("secret", empty)
 
+    def test_unsetting_live_gate_restores_legacy_byte_exact_and_keeps_shadow_evidence(self):
+        os.environ["BNL_MEMORY_GOVERNANCE_SHADOW_ENABLED"] = "1"
+        os.environ["BNL_MEMORY_GOVERNANCE_LIVE_ENABLED"] = "1"
+        self.insert_ledger()
+        legacy = "Archive recall:\n- favorite color: old"
+
+        live = self.govern(legacy)
+        self.assertNotEqual(live, legacy)
+        self.assertIn("favorite color is green", live)
+        self.assertEqual(
+            self.rows("SELECT COUNT(*) FROM memory_governance_shadow_runs")[0][0],
+            1,
+        )
+
+        os.environ.pop("BNL_MEMORY_GOVERNANCE_LIVE_ENABLED", None)
+        rolled_back = self.govern(legacy)
+        self.assertEqual(rolled_back, legacy)
+        self.assertEqual(
+            self.rows("SELECT COUNT(*) FROM memory_governance_shadow_runs")[0][0],
+            2,
+        )
+        self.assertEqual(
+            self.rows("SELECT DISTINCT errors_json FROM memory_governance_shadow_runs"),
+            [("[]",)],
+        )
+
     def test_public_owner_mod_live_recall_remains_public_safe_only(self):
         os.environ["BNL_MEMORY_GOVERNANCE_SHADOW_ENABLED"] = "1"
         os.environ["BNL_MEMORY_GOVERNANCE_LIVE_ENABLED"] = "1"

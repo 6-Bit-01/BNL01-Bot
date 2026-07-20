@@ -1,14 +1,16 @@
 import asyncio
 import os
 from types import SimpleNamespace
+import unittest
 
 os.environ.setdefault("GEMINI_API_KEY", "test-gemini-key")
 os.environ.setdefault("DISCORD_BOT_TOKEN", "test-discord-token")
 
 import bnl01_bot
+from tests.unittest_compat import install_function_cases
 
 
-def test_rd_assessment_intent_and_clean_candidate():
+def _case_rd_assessment_intent_and_clean_candidate():
     text = "@BNL-01 is this appropriate for broadcast memory? DJ Floppydisc keeps trying to get me to play Chumbawamba even though the Oreaganomics Clause says I need to make the music or know someone who made it."
     assert bnl01_bot.detect_rd_ops_intent(text) == "broadcast_memory_assessment"
     response = bnl01_bot.build_rd_broadcast_memory_assessment_response(text)
@@ -19,7 +21,7 @@ def test_rd_assessment_intent_and_clean_candidate():
     assert "is this appropriate" not in clean_line.lower()
 
 
-def test_rd_draft_uses_sanitized_summary():
+def _case_rd_draft_uses_sanitized_summary():
     text = "@BNL-01 write the broadcast memory note: DJ Floppydisc keeps trying to get me to play Chumbawamba even though the Oreaganomics Clause says I need to make the music or know someone who made it."
     assert bnl01_bot.detect_rd_ops_intent(text) == "broadcast_memory_draft"
     response = bnl01_bot.build_rd_broadcast_memory_draft_response(text)
@@ -30,7 +32,7 @@ def test_rd_draft_uses_sanitized_summary():
     assert "broadcast memory?" not in summary.lower()
 
 
-def test_structured_summary_meta_scaffold_rejected_when_only_question():
+def _case_structured_summary_meta_scaffold_rejected_when_only_question():
     content = """Broadcast memory note
 Title: Test
 Date: 2026-06-12
@@ -49,7 +51,7 @@ This is broadcast memory only.
     assert result["reason"] == "summary is meta/R&D scaffold; include the actual show memory."
 
 
-def test_structured_summary_meta_scaffold_removed_when_payload_remains():
+def _case_structured_summary_meta_scaffold_removed_when_payload_remains():
     content = """Broadcast memory note
 Title: DJ Floppydisc
 Date: 2026-06-12
@@ -67,3 +69,10 @@ This is broadcast memory only.
     assert result["entry_type"] == "running_joke"
     assert "does this belong" not in result["cleaned_summary"].lower()
     assert "DJ Floppydisc" in result["cleaned_summary"]
+
+
+class BroadcastMemoryRDSanitizerTests(unittest.TestCase):
+    pass
+
+
+install_function_cases(globals(), BroadcastMemoryRDSanitizerTests)

@@ -54,6 +54,17 @@ Run the bot only after the deployment environment is configured:
 python bnl01_bot.py
 ```
 
+## V2 shadow acceptance
+
+The v2 memory and relationship stack is evaluated in the fixed shadow order
+Ledger → Moments → Governance → Relationship. The acceptance diagnostic enables
+nothing, keeps every live gate off, requires owner review, and never performs an
+automatic cutover. Conversation Context v2 is a separate continuity preflight.
+
+See [BNL-01 v2 Shadow Acceptance and Rollback](docs/BNL01_V2_SHADOW_ACCEPTANCE_AND_ROLLBACK.md)
+for the aggregate evidence fields, exact stop conditions, and reverse-order
+rollback procedure.
+
 ## Release baseline
 
 Before merging a runtime change:
