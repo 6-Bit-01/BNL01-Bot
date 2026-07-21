@@ -292,19 +292,326 @@ class JournalAutomationTests(unittest.TestCase):
                 ).fetchone()[0],
             )
 
+    def test_out_of_range_daily_length_publishes_in_the_same_attempt(self):
+        self.add_day("2026-07-19")
+        calls = []
+
+        def very_long_but_safe(packet, _prompt):
+            calls.append(1)
+            article = json.loads(article_json(packet))
+            article["title"] = "A Long Day Still Publishes"
+            article["sections"][0]["body"] += " " + " ".join(
+                "The public music room kept another grounded detail in view."
+                for _ in range(80)
+            )
+            return json.dumps(article)
+
+        result = automation.run_daily(
+            self.db,
+            1,
+            very_long_but_safe,
+            "https://site.example",
+            "key",
+            target_day=date(2026, 7, 19),
+            force=True,
+            opener=self.opener,
+        )
+
+        self.assertTrue(result.ok, result)
+        self.assertEqual("published", result.status)
+        self.assertEqual(1, len(calls))
+        with sqlite3.connect(self.db) as conn:
+            metadata = json.loads(
+                conn.execute(
+                    "SELECT metadata_json FROM bnl_journal_private_metadata WHERE entry_id=?",
+                    (result.entry_id,),
+                ).fetchone()[0]
+            )
+        self.assertGreater(metadata["publicWordCount"], 500)
+
+    def test_repeated_privacy_failure_uses_safe_rescue_and_still_publishes(self):
+        self.add_day("2026-07-19")
+        calls = []
+
+        def leaking_generator(packet, _prompt):
+            calls.append(1)
+            article = json.loads(article_json(packet))
+            article["title"] = "Rejected Private Candidate"
+            article["sections"][0]["body"] += " Member0 carried the private version."
+            return json.dumps(article)
+
+        result = automation.run_daily(
+            self.db,
+            1,
+            leaking_generator,
+            "https://site.example",
+            "key",
+            target_day=date(2026, 7, 19),
+            force=True,
+            opener=self.opener,
+        )
+
+        self.assertTrue(result.ok, result)
+        self.assertEqual("published", result.status)
+        self.assertEqual(
+            "automatic_rescue_after_community_name_leak",
+            result.reason,
+        )
+        self.assertEqual(journal.JOURNAL_GENERATION_ATTEMPTS, len(calls))
+        with sqlite3.connect(self.db) as conn:
+            payload = conn.execute(
+                "SELECT public_payload_json FROM bnl_journal_entries WHERE entry_id=?",
+                (result.entry_id,),
+            ).fetchone()[0]
+        self.assertNotIn("Member0", payload)
+        self.assertNotIn("Rejected Private Candidate", payload)
+
+    def test_provider_failure_uses_grounded_static_rescue_in_the_same_run(self):
+        self.add_day("2026-07-19")
+        calls = []
+
+        def provider_down(_packet, _prompt):
+            calls.append(1)
+            raise RuntimeError("provider down")
+
+        result = automation.run_daily(
+            self.db,
+            1,
+            provider_down,
+            "https://site.example",
+            "key",
+            target_day=date(2026, 7, 19),
+            force=True,
+            opener=self.opener,
+        )
+
+        self.assertTrue(result.ok, result)
+        self.assertEqual("published", result.status)
+        self.assertEqual("automatic_rescue_after_provider_failure", result.reason)
+        self.assertEqual(1, len(calls))
+
+    def test_static_rescue_cannot_be_blocked_by_a_common_display_name(self):
+        self.add_day("2026-07-19")
+        with sqlite3.connect(self.db) as conn:
+            conn.execute("UPDATE conversations SET user_name='Room'")
+
+        result = automation.run_daily(
+            self.db,
+            1,
+            lambda *_args: "not-json",
+            "https://site.example",
+            "key",
+            target_day=date(2026, 7, 19),
+            force=True,
+            opener=self.opener,
+        )
+
+        self.assertTrue(result.ok, result)
+        self.assertEqual("published", result.status)
+        self.assertTrue(result.reason.startswith("automatic_rescue_after_"), result)
+
+    def test_oversized_model_output_is_repaired_before_site_delivery(self):
+        self.add_day("2026-07-19")
+        calls = []
+        delivered_sizes = []
+
+        def oversized(packet, _prompt):
+            calls.append(1)
+            article = json.loads(article_json(packet))
+            article["sections"][0]["body"] = "signal " * 5_000
+            return json.dumps(article)
+
+        def bounded_opener(request, timeout=10):
+            delivered_sizes.append(len(request.data))
+            self.assertLessEqual(len(request.data), journal.JOURNAL_MAX_PUBLIC_PAYLOAD_BYTES)
+            return Response(request)
+
+        result = automation.run_daily(
+            self.db,
+            1,
+            oversized,
+            "https://site.example",
+            "key",
+            target_day=date(2026, 7, 19),
+            force=True,
+            opener=bounded_opener,
+        )
+
+        self.assertTrue(result.ok, result)
+        self.assertEqual("automatic_rescue_after_payload_too_large", result.reason)
+        self.assertEqual(journal.JOURNAL_GENERATION_ATTEMPTS, len(calls))
+        self.assertEqual(1, len(delivered_sizes))
+
+    def test_site_unsafe_public_text_repairs_to_static_rescue(self):
+        self.add_day("2026-07-19")
+        calls = []
+
+        def unsafe_text(packet, _prompt):
+            article = json.loads(article_json(packet))
+            unsafe = ("\x00", "\ud800", "\ufeff")[len(calls) % 3]
+            calls.append(unsafe)
+            article["sections"][0]["body"] += unsafe
+            return json.dumps(article)
+
+        result = automation.run_daily(
+            self.db,
+            1,
+            unsafe_text,
+            "https://site.example",
+            "key",
+            target_day=date(2026, 7, 19),
+            force=True,
+            opener=self.opener,
+        )
+
+        self.assertTrue(result.ok, result)
+        self.assertEqual("published", result.status)
+        self.assertEqual("automatic_rescue_after_invalid_public_text", result.reason)
+        self.assertEqual(journal.JOURNAL_GENERATION_ATTEMPTS, len(calls))
+
+    def test_malformed_private_metadata_is_sanitized_without_canceling_publication(self):
+        self.add_day("2026-07-19")
+
+        def malformed_metadata(packet, _prompt):
+            article = json.loads(article_json(packet))
+            article["metadata"]["topicTags"] = ["music", "\ud800"]
+            return json.dumps(article)
+
+        result = automation.run_daily(
+            self.db,
+            1,
+            malformed_metadata,
+            "https://site.example",
+            "key",
+            target_day=date(2026, 7, 19),
+            force=True,
+            opener=self.opener,
+        )
+
+        self.assertTrue(result.ok, result)
+        self.assertEqual("published", result.status)
+        with sqlite3.connect(self.db) as conn:
+            metadata = json.loads(
+                conn.execute(
+                    "SELECT metadata_json FROM bnl_journal_private_metadata WHERE entry_id=?",
+                    (result.entry_id,),
+                ).fetchone()[0]
+            )
+        self.assertEqual(["music", "?"], metadata["topicTags"])
+
+    def test_one_source_static_rescue_does_not_invent_multiple_exchanges(self):
+        self.add_day("2026-07-19")
+        with sqlite3.connect(self.db) as conn:
+            conn.execute("DELETE FROM website_relay_history WHERE relay_id NOT LIKE '%-0'")
+            conn.execute("DELETE FROM conversations")
+
+        result = automation.run_daily(
+            self.db,
+            1,
+            lambda *_args: (_ for _ in ()).throw(RuntimeError("provider down")),
+            "https://site.example",
+            "key",
+            target_day=date(2026, 7, 19),
+            force=True,
+            opener=self.opener,
+        )
+
+        self.assertTrue(result.ok, result)
+        with sqlite3.connect(self.db) as conn:
+            payload = json.loads(
+                conn.execute(
+                    "SELECT public_payload_json FROM bnl_journal_entries WHERE entry_id=?",
+                    (result.entry_id,),
+                ).fetchone()[0]
+            )
+        public_text = json.dumps(payload["entry"], sort_keys=True)
+        self.assertIn("At least one relay left a public trace", public_text)
+        self.assertNotIn("one exchange to the next", public_text)
+
+    def test_filtered_activity_is_not_misreported_as_no_activity(self):
+        packet = {
+            "entryKind": "daily",
+            "sourceWindowStart": "2026-07-20T02:00:00Z",
+            "sourceWindowEnd": "2026-07-21T02:00:00Z",
+            "safeSources": [],
+            "privateSources": [{"refId": "fresh:9", "sourceKind": "conversation", "displayName": "Room"}],
+            "privateWindowDisplayNames": ["Room"],
+            "aggregateCounts": {"eligibleRelays": 0, "eligibleConversations": 1},
+            "coverageComplete": True,
+            "sourceArchiveAvailable": True,
+            "history": {},
+            "generationContextLanes": {},
+            "privateContextLaneProvenance": {},
+            "windowSegmentActivity": [],
+        }
+
+        prepared = journal.ensure_automatic_window_source(packet)
+
+        self.assertEqual("no_chroniclable_public_material", prepared["quietWindowObservationKind"])
+        self.assertEqual(2, len(prepared["privateSources"]))
+        self.assertEqual("Room", prepared["privateSources"][0]["displayName"])
+        article = journal._automatic_rescue_article(prepared, "quiet_window")
+        public_text = journal._public_text(article)
+        self.assertIn("left traces", public_text)
+        self.assertNotIn("without a relay or conversation", public_text)
+
+    def test_complete_zero_activity_day_publishes_an_honest_quiet_entry(self):
+        self.set_archive_activation("2026-07-19T02:00:00Z")
+
+        result = automation.run_daily(
+            self.db,
+            1,
+            lambda *_args: self.fail("a zero-source window must not ask the model to invent a scene"),
+            "https://site.example",
+            "key",
+            target_day=date(2026, 7, 19),
+            force=True,
+            opener=self.opener,
+        )
+
+        self.assertTrue(result.ok, result)
+        self.assertEqual("published", result.status)
+        self.assertEqual("automatic_quiet_window", result.reason)
+        self.assertEqual(1, result.aggregate_counts["quietWindowObservation"])
+        with sqlite3.connect(self.db) as conn:
+            observation = conn.execute(
+                "SELECT lifecycle_state,aggregate_counts_json FROM bnl_journal_observations"
+            ).fetchone()
+        self.assertEqual("published", observation[0])
+        self.assertEqual(1, json.loads(observation[1])["quietWindowObservation"])
+
+    def test_low_activity_day_is_not_silently_skipped(self):
+        self.add_day("2026-07-19")
+        with sqlite3.connect(self.db) as conn:
+            conn.execute("DELETE FROM website_relay_history WHERE relay_id NOT LIKE '%-0'")
+            conn.execute("DELETE FROM conversations WHERE content NOT LIKE '%number 0.%'")
+
+        result = automation.run_daily(
+            self.db,
+            1,
+            lambda packet, _prompt: article_json(packet),
+            "https://site.example",
+            "key",
+            target_day=date(2026, 7, 19),
+            force=True,
+            opener=self.opener,
+        )
+
+        self.assertTrue(result.ok, result)
+        self.assertEqual("published", result.status)
+        self.assertEqual(1, result.aggregate_counts["eligibleRelays"])
+        self.assertEqual(1, result.aggregate_counts["eligibleConversations"])
+
     def test_newly_closed_day_publishes_before_an_older_held_backlog(self):
         self.add_day("2026-07-18")
         self.add_day("2026-07-19")
         self.set_archive_activation("2026-07-18T02:00:01Z")
 
-        def provider_down(_packet, _prompt):
-            raise RuntimeError("provider down")
-
         held = automation.run_daily(
             self.db,
             1,
-            provider_down,
-            "https://site.example",
+            lambda *_args: self.fail("missing website configuration must hold before generation"),
+            "",
             "key",
             target_day=date(2026, 7, 18),
             force=True,
@@ -342,6 +649,130 @@ class JournalAutomationTests(unittest.TestCase):
                 datetime(2026, 7, 21, 3, 0, tzinfo=timezone.utc),
             ),
         )
+
+    def test_force_run_recovers_the_same_held_window_without_a_duplicate(self):
+        self.add_day("2026-07-19")
+
+        held = automation.run_daily(
+            self.db,
+            1,
+            lambda *_args: self.fail("missing website configuration must hold before generation"),
+            "",
+            "key",
+            target_day=date(2026, 7, 19),
+            force=True,
+            opener=self.opener,
+        )
+        recovered = automation.run_daily(
+            self.db,
+            1,
+            lambda packet, _prompt: article_json(packet),
+            "https://site.example",
+            "key",
+            now_utc=datetime(2026, 7, 22, 3, 0, tzinfo=timezone.utc),
+            force=True,
+            opener=self.opener,
+        )
+        repeated = automation.run_daily(
+            self.db,
+            1,
+            lambda *_args: self.fail("published recovery generated twice"),
+            "https://site.example",
+            "key",
+            target_day=date(2026, 7, 19),
+            force=True,
+            opener=self.opener,
+        )
+
+        self.assertEqual(("held", "website_configuration_missing"), (held.status, held.reason))
+        self.assertEqual("published", recovered.status)
+        expected_start, expected_end, _ = automation._daily_period_for_day(date(2026, 7, 19))
+        self.assertEqual(expected_start, recovered.source_window_start)
+        self.assertEqual(expected_end, recovered.source_window_end)
+        self.assertEqual("published", repeated.status)
+        self.assertEqual(recovered.entry_id, repeated.entry_id)
+        with sqlite3.connect(self.db) as conn:
+            run = conn.execute(
+                "SELECT lifecycle_state,attempt_count FROM bnl_journal_automation_runs"
+            ).fetchone()
+            published = conn.execute(
+                "SELECT COUNT(*) FROM bnl_journal_entries WHERE lifecycle_state='published'"
+            ).fetchone()[0]
+        self.assertEqual(("published", 2), run)
+        self.assertEqual(1, published)
+
+    def test_force_run_prefers_the_most_recent_held_window(self):
+        self.add_day("2026-07-18")
+        self.add_day("2026-07-19")
+        for held_day in (date(2026, 7, 18), date(2026, 7, 19)):
+            held = automation.run_daily(
+                self.db,
+                1,
+                lambda *_args: self.fail("missing configuration holds before generation"),
+                "",
+                "key",
+                target_day=held_day,
+                force=True,
+                opener=self.opener,
+            )
+            self.assertEqual("held", held.status)
+
+        recovered = automation.run_daily(
+            self.db,
+            1,
+            lambda packet, _prompt: article_json(packet),
+            "https://site.example",
+            "key",
+            now_utc=datetime(2026, 7, 22, 3, 0, tzinfo=timezone.utc),
+            force=True,
+            opener=self.opener,
+        )
+
+        expected_start, _, _ = automation._daily_period_for_day(date(2026, 7, 19))
+        self.assertEqual("published", recovered.status)
+        self.assertEqual(expected_start, recovered.source_window_start)
+
+    def test_rejected_automatic_revision_is_replaced_instead_of_deadlocking(self):
+        self.add_day("2026-07-19")
+        start, end, label = automation._daily_period_for_day(date(2026, 7, 19))
+        packet = journal.build_source_packet_between(
+            self.db,
+            1,
+            start,
+            end,
+            entry_kind="daily",
+        )
+        entry_id = automation._entry_id(1, "daily", label)
+        draft = journal.generate_and_store_packet_draft(
+            self.db,
+            1,
+            packet,
+            lambda source_packet, _prompt: article_json(source_packet),
+            entry_id=entry_id,
+        )
+        self.assertTrue(draft.ok, draft)
+        self.assertTrue(journal.reject_draft(self.db, 1, entry_id, "revise").ok)
+
+        result = automation.run_daily(
+            self.db,
+            1,
+            lambda source_packet, _prompt: article_json(source_packet),
+            "https://site.example",
+            "key",
+            target_day=date(2026, 7, 19),
+            force=True,
+            opener=self.opener,
+        )
+
+        self.assertTrue(result.ok, result)
+        self.assertEqual("published", result.status)
+        self.assertEqual(2, result.revision)
+        with sqlite3.connect(self.db) as conn:
+            states = conn.execute(
+                "SELECT revision,lifecycle_state FROM bnl_journal_entries WHERE entry_id=? ORDER BY revision",
+                (entry_id,),
+            ).fetchall()
+        self.assertEqual([(1, "rejected"), (2, "published")], states)
 
     def test_daily_uses_complete_half_open_window_and_far_more_than_25(self):
         with sqlite3.connect(self.db) as conn:
@@ -535,7 +966,7 @@ class JournalAutomationTests(unittest.TestCase):
         self.assertNotIn("Alice", public_generation_text)
         self.assertNotIn("Bob", public_generation_text)
 
-    def test_all_quiet_week_is_terminal_and_does_not_block_catchup(self):
+    def test_all_quiet_week_still_publishes_once(self):
         for offset in range(7):
             day = datetime(2026, 7, 13, tzinfo=timezone.utc).date() + timedelta(days=offset)
             start, end, label = automation._daily_period_for_day(day)
@@ -549,17 +980,18 @@ class JournalAutomationTests(unittest.TestCase):
                 automation.AutomationResult(True, "daily", "quiet", source_window_start=start, source_window_end=end),
             )
         now = datetime(2026, 7, 21, 3, 0, tzinfo=timezone.utc)
+
         first = automation.run_weekly(
-            self.db, 1, lambda *_args: self.fail("quiet week must not generate"),
+            self.db, 1, lambda *_args: self.fail("an all-quiet week must use deterministic copy"),
             "https://site.example", "key", now_utc=now, force=True, opener=self.opener,
         )
         second = automation.run_weekly(
-            self.db, 1, lambda *_args: self.fail("completed quiet week must not rerun"),
+            self.db, 1, lambda *_args: self.fail("published quiet week generated twice"),
             "https://site.example", "key", now_utc=now, opener=self.opener,
         )
-        self.assertEqual("quiet", first.status)
-        self.assertEqual("no_meaningful_weekly_activity", first.reason)
-        self.assertEqual("quiet", second.status)
+        self.assertEqual("published", first.status)
+        self.assertEqual("published", second.status)
+        self.assertEqual(first.entry_id, second.entry_id)
 
 
 if __name__ == "__main__":

@@ -12,9 +12,9 @@ from typing import Any, Callable, Optional
 
 PUBLIC_POLICIES = {"public_home", "public_context", "public_selective"}
 STATES = {"draft", "rejected", "approved_pending_delivery", "published", "delivery_failed"}
-WORD_MIN, WORD_MAX = 250, 500
 JOURNAL_ROUTE = "bnl_journal_generation"
 JOURNAL_GENERATION_ATTEMPTS = 4
+JOURNAL_MAX_PUBLIC_PAYLOAD_BYTES = 24_000
 ADVISORY_VALIDATION_REASONS = frozenset({
     "overly_clinical_voice",
     "flat_report_voice",
@@ -73,6 +73,7 @@ _EXPLICIT_BNL_INFERENCE_RE = re.compile(
     r"\b(?:bnl (?:suspects|thinks|wonders)|i (?:suspect|think|wonder)|my theory|bnl(?:s|'s|’s) theory)\b",
     re.IGNORECASE,
 )
+_UNSAFE_PUBLIC_CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f\ufeff]")
 _STRONG_INFERENCE_CUE_RE = re.compile(
     r"\b(?:proves?|must mean|points? (?:to|toward)|part of (?:a|the) (?:larger|broader) plan|"
     r"signals? (?:a|the) (?:larger|broader) plan)\b",
@@ -83,7 +84,13 @@ _REPAIR_GUIDANCE = {
     "community_name_leak": "Remove every community member name and replace personal references with anonymous descriptions.",
     "public_leak_pattern": "Remove every URL, mention, identifier, and internal implementation term from public prose.",
     "source_ref_leak": "Keep source reference tokens only inside sourceRefIds arrays; remove them from all public prose.",
-    "invalid_word_count": "Rewrite the complete article so its total public word count is between 250 and 500 words.",
+    "payload_too_large": (
+        "Shorten the public article enough to fit the website's 24,000-byte transport envelope. "
+        "Keep the strongest grounded scenes; this is a delivery constraint, not a word-count target."
+    ),
+    "invalid_public_text": (
+        "Remove invalid control characters or malformed Unicode from every public text field, then rewrite the JSON."
+    ),
     "insufficient_source_breadth": (
         "Use the supplied evidenceCoverageContract. Ground the article in the required number of distinct fresh sources, "
         "participants, source kinds, and available parts of the window. Synthesize them into a few meaningful patterns; "
@@ -1557,6 +1564,7 @@ def _bounded_history_for_prompt(history: dict[str, Any]) -> dict[str, Any]:
 
 def build_generation_prompt(packet: dict[str, Any], *, repair_reason: str = "", previous_output: str = "") -> str:
     entry_kind = str(packet.get("entryKind") or "manual")
+    quiet_window = bool(packet.get("quietWindowObservation"))
     context_lanes = packet.get("generationContextLanes") if isinstance(packet.get("generationContextLanes"), dict) else {}
     safe_sources = packet.get("safeSources", [])[:MAX_PROMPT_SOURCES]
     coverage_contract = packet.get("evidenceCoverageContract")
@@ -1575,7 +1583,11 @@ def build_generation_prompt(packet: dict[str, Any], *, repair_reason: str = "", 
         "evidenceCoverageContract": coverage_contract,
         "editorialContract": {
             "requiresFirstPersonReaction": len(safe_sources) >= 5,
-            "requiredBeatsAcrossEntry": ["concreteMoment", "peopleOrObservableRoles", "communityPattern", "bnlReaction"],
+            "requiredBeatsAcrossEntry": (
+                ["verifiedQuietWindow", "bnlReaction"]
+                if quiet_window
+                else ["concreteMoment", "peopleOrObservableRoles", "communityPattern", "bnlReaction"]
+            ),
             "fixedSectionTemplate": False,
         },
         "history": _bounded_history_for_prompt(packet.get("history", {})),
@@ -1584,10 +1596,34 @@ def build_generation_prompt(packet: dict[str, Any], *, repair_reason: str = "", 
         "windowSegmentActivity": packet.get("windowSegmentActivity", []),
         "privateGenerationContextLanes": context_lanes,
     }
-    cadence_rule = (
-        "\nThis is a weekly synthesis. Connect patterns across the supplied daily observations and current source evidence; do not merely list seven daily recaps."
-        if entry_kind == "weekly"
-        else "\nThis is a daily chronicle covering one complete source window. Distill the day instead of listing every relay."
+    if quiet_window:
+        if packet.get("quietWindowObservationKind") == "no_chroniclable_public_material":
+            cadence_rule = (
+                "\nThis complete automatic window contains one verified window_observation: public traces existed, "
+                "but none supported an honest scene without guessing. Reflect only on that boundary. Do not claim "
+                "there was no activity, and do not invent people, actions, music, dialogue, or events."
+            )
+        else:
+            cadence_rule = (
+                "\nThis complete automatic window contains one verified window_observation: no eligible public relay "
+                "or conversation was recorded. Reflect only on the quiet. Do not invent people, actions, music, "
+                "dialogue, or events. The absence of public activity is the only current-window fact."
+            )
+    elif entry_kind == "weekly":
+        cadence_rule = (
+            "\nThis is a weekly synthesis. Connect patterns across the supplied daily observations and current source evidence; do not merely list seven daily recaps."
+        )
+    else:
+        cadence_rule = "\nThis is a daily chronicle covering one complete source window. Distill the day instead of listing every relay."
+    length_rule = (
+        "\nKeep a quiet-window entry as short as the honest reflection needs to be."
+        if quiet_window
+        else "\nUse as much space as the story needs, then stop. Length is guidance and never a publication gate."
+    )
+    beat_rule = (
+        "\nFor this verified quiet window, include the observed silence and one brief first-person BNL reaction. Do not manufacture the normal people, scene, or community-pattern beats."
+        if quiet_window
+        else "\nAcross the complete entry, naturally include four beats: a concrete current-window moment; the people or observable roles who made it happen; a social, musical, or recurring community pattern; and one brief first-person BNL reaction. Blend them in any order and any combination. Do not label the beats or force them into a fixed section template."
     )
     repair = ""
     if repair_reason:
@@ -1617,9 +1653,10 @@ def build_generation_prompt(packet: dict[str, Any], *, repair_reason: str = "", 
     return (
         "You are BNL-01 writing a BARCODE Network Journal entry. Return strict JSON only; no markdown fences."
         "\nSchema: {\"title\":str,\"excerpt\":str,\"sections\":[{\"heading\":str,\"body\":str,\"sourceRefIds\":[str]}],\"metadata\":{\"topicTags\":[],\"subjectRefs\":[],\"continuityNotes\":[],\"unresolvedQuestions\":[],\"confidenceFlags\":[],\"safetyFlags\":[],\"contextUses\":[{\"laneType\":\"established_broadcast_memory|community_rumor|bnl_inference\",\"laneRefId\":str,\"sectionHeading\":str,\"claim\":str,\"basisRefIds\":[str]}]}}."
-        "\nWrite 1-3 sections and 250-500 total words; prefer 2 sections and roughly 300-420 words. Give every section a real narrative job instead of inventorying activity."
+        "\nWrite 1-3 sections. Prefer 2 when the material supports them, and give every section a real narrative job instead of inventorying activity."
+        f"{length_rule}"
         "\nJOURNAL EDITORIAL OVERRIDE: For this route, a lived community chronicle takes priority over BNL's general lightly corporate or systems-report register. Do not narrate ordinary human activity as machine analysis."
-        "\nAcross the complete entry, naturally include four beats: a concrete current-window moment; the people or observable roles who made it happen; a social, musical, or recurring community pattern; and one brief first-person BNL reaction. Blend them in any order and any combination. Do not label the beats or force them into a fixed section template."
+        f"{beat_rule}"
         "\nBNL is a warm, dryly funny archive keeper who is becoming attached to what he records. He may be amused, curious, fond, mildly uneasy, self-correcting, or uncertain. He is lightly uncanny, never cruel, and never generic neon-static cyberpunk."
         "\nFreely vary and combine scene reporting, named-canon color, dry archive notes, recognizable community detail, callbacks, restrained glitches, self-revision, and—only when qualified—the rumor desk. Do not reuse a stock cadence, signature line, or joke merely because an older entry used it."
         "\nUse ordinary nouns and active verbs. Say a producer brought a mix, a listener returned to a chorus, or the room kept discussing an idea when the evidence supports that action. Do not translate ordinary activity into sonic constructs, external calibration, distributed analysis, internal schematics, perceptual filters, operational settings, relational signals, or human subroutines."
@@ -1640,6 +1677,12 @@ def build_generation_prompt(packet: dict[str, Any], *, repair_reason: str = "", 
     )
 
 
+def _utf8_safe_generated_metadata(value: Any, limit: int) -> str:
+    """Keep malformed private metadata from crashing an otherwise safe entry."""
+
+    return str(value)[:limit].encode("utf-8", errors="replace").decode("utf-8")
+
+
 def parse_generated_json(text: str) -> dict[str, Any]:
     raw = (text or "").strip()
     if raw.startswith("```"):
@@ -1658,14 +1701,18 @@ def parse_generated_json(text: str) -> dict[str, Any]:
     for section in sections:
         if not isinstance(section, dict) or not isinstance(section.get("heading"), str) or not isinstance(section.get("body"), str) or not isinstance(section.get("sourceRefIds"), list):
             raise ValueError("invalid_section_shape")
-        refs = [str(r) for r in section.get("sourceRefIds", [])]
+        refs = [_utf8_safe_generated_metadata(r, 96) for r in section.get("sourceRefIds", [])]
         heading = section["heading"].strip()
         normalized_sections.append({"heading": heading, "body": section["body"].strip()})
         source_ref_map[heading] = refs
     meta = data.get("metadata") if isinstance(data.get("metadata"), dict) else {}
     article = {"title": data["title"].strip(), "excerpt": data["excerpt"].strip(), "sections": normalized_sections, "sourceRefIds": source_ref_map, "metadata": {}}
     for key in ("topicTags", "subjectRefs", "continuityNotes", "unresolvedQuestions", "confidenceFlags", "safetyFlags"):
-        article["metadata"][key] = [str(x)[:240] for x in meta.get(key, [])] if isinstance(meta.get(key, []), list) else []
+        article["metadata"][key] = (
+            [_utf8_safe_generated_metadata(x, 240) for x in meta.get(key, [])]
+            if isinstance(meta.get(key, []), list)
+            else []
+        )
     context_uses = meta.get("contextUses", [])
     if not isinstance(context_uses, list):
         raise ValueError("invalid_context_use")
@@ -1674,11 +1721,14 @@ def parse_generated_json(text: str) -> dict[str, Any]:
         if not isinstance(item, dict) or not isinstance(item.get("basisRefIds"), list):
             raise ValueError("invalid_context_use")
         normalized_uses.append({
-            "laneType": str(item.get("laneType") or "")[:64],
-            "laneRefId": str(item.get("laneRefId") or "")[:96],
-            "sectionHeading": str(item.get("sectionHeading") or "")[:120],
-            "claim": str(item.get("claim") or "")[:320],
-            "basisRefIds": [str(ref)[:96] for ref in item.get("basisRefIds", [])[:24]],
+            "laneType": _utf8_safe_generated_metadata(item.get("laneType") or "", 64),
+            "laneRefId": _utf8_safe_generated_metadata(item.get("laneRefId") or "", 96),
+            "sectionHeading": _utf8_safe_generated_metadata(item.get("sectionHeading") or "", 120),
+            "claim": _utf8_safe_generated_metadata(item.get("claim") or "", 320),
+            "basisRefIds": [
+                _utf8_safe_generated_metadata(ref, 96)
+                for ref in item.get("basisRefIds", [])[:24]
+            ],
         })
     article["metadata"]["contextUses"] = normalized_uses
     return article
@@ -1687,6 +1737,201 @@ def parse_generated_json(text: str) -> dict[str, Any]:
 def public_word_count(article: dict[str, Any]) -> int:
     text = " ".join([article.get("title", ""), article.get("excerpt", "")] + [s.get("heading", "") + " " + s.get("body", "") for s in article.get("sections", [])])
     return len(re.findall(r"\b\w+\b", text))
+
+
+def public_payload_byte_count(article: dict[str, Any], packet: dict[str, Any]) -> int:
+    """Conservatively preflight the website's exact transport envelope."""
+
+    entry_kind = str(packet.get("entryKind") or "manual")
+    if entry_kind not in {"daily", "weekly", "manual"}:
+        entry_kind = "manual"
+    envelope = {
+        "contractVersion": 1,
+        "kind": "journal_entry",
+        "entry": {
+            # The real automatic entry ID is shorter.  Using the contract
+            # maximum here makes this a safe upper bound rather than a guess.
+            "entryId": "j" + ("x" * 79),
+            "revision": 2_147_483_647,
+            "entryKind": entry_kind,
+            "title": str(article.get("title") or ""),
+            "excerpt": str(article.get("excerpt") or ""),
+            "sections": [
+                {
+                    "heading": str(section.get("heading") or ""),
+                    "body": str(section.get("body") or ""),
+                }
+                for section in article.get("sections", [])
+                if isinstance(section, dict)
+            ],
+            "authoredAt": "2000-01-01T00:00:00Z",
+            "sourceWindowStart": str(packet.get("sourceWindowStart") or ""),
+            "sourceWindowEnd": str(packet.get("sourceWindowEnd") or ""),
+            "contentHash": "0" * 64,
+        },
+    }
+    return len(_json(envelope).encode("utf-8"))
+
+
+def ensure_automatic_window_source(packet: dict[str, Any]) -> dict[str, Any]:
+    """Give a complete automatic window with no safe sources one honest fact."""
+
+    entry_kind = str(packet.get("entryKind") or "manual")
+    if (
+        entry_kind not in {"daily", "weekly"}
+        or packet.get("safeSources")
+        or not packet.get("coverageComplete", True)
+        or not packet.get("sourceArchiveAvailable", False)
+    ):
+        return packet
+
+    counts = dict(packet.get("aggregateCounts") or {})
+    observed_activity = bool(packet.get("privateSources")) or (
+        int(counts.get("eligibleRelays") or 0)
+        + int(counts.get("eligibleConversations") or 0)
+    ) > 0
+    observation_kind = (
+        "no_chroniclable_public_material"
+        if observed_activity
+        else "no_eligible_public_activity"
+    )
+    prepared = dict(packet)
+    source = {
+        "refId": "fresh:window-observation",
+        "sourceKind": "window_observation",
+        "summary": (
+            "The complete public source window left traces, but no scene BNL "
+            "could chronicle without guessing."
+            if observed_activity
+            else "The complete public source window closed without an eligible relay or public conversation."
+        ),
+        "observedAt": str(packet.get("sourceWindowEnd") or ""),
+        "eventType": observation_kind,
+    }
+    prepared["safeSources"] = [dict(source)]
+    # Preserve the private audit trail.  The synthetic observation supplements
+    # it; it must never overwrite evidence that was excluded from public prose.
+    prepared["privateSources"] = [
+        *[dict(item) for item in packet.get("privateSources", []) if isinstance(item, dict)],
+        dict(source),
+    ]
+    prepared["candidateTopicTags"] = []
+    prepared["quietWindowObservation"] = True
+    prepared["quietWindowObservationKind"] = observation_kind
+    counts["quietWindowObservation"] = 1
+    counts["quietWindowObservationKind"] = observation_kind
+    prepared["aggregateCounts"] = counts
+    prepared["evidenceCoverageContract"] = build_evidence_coverage_contract(
+        entry_kind,
+        str(packet.get("sourceWindowStart") or ""),
+        str(packet.get("sourceWindowEnd") or ""),
+        prepared["safeSources"],
+    )
+    return prepared
+
+
+def _automatic_rescue_article(packet: dict[str, Any], failure_reason: str) -> Optional[dict[str, Any]]:
+    """Build a minimal hard-safe chronicle after every model rewrite is invalid.
+
+    This is deliberately available only to scheduled daily/weekly entries.  It
+    never republishes rejected prose and never relaxes identity, privacy,
+    citation, or context validation.  Manual drafts continue to fail visibly so
+    an operator can revise them.
+    """
+
+    entry_kind = str(packet.get("entryKind") or "manual")
+    sources = [source for source in packet.get("safeSources", []) if source.get("refId")]
+    if entry_kind not in {"daily", "weekly"} or not sources:
+        return None
+
+    refs = [str(source["refId"]) for source in sources]
+    quiet = bool(packet.get("quietWindowObservation"))
+    cadence_word = "day" if entry_kind == "daily" else "week"
+    if quiet:
+        title = "The Window Kept Its Appointment"
+        heading = "What Could Be Kept"
+        if packet.get("quietWindowObservationKind") == "no_chroniclable_public_material":
+            excerpt = f"The {cadence_word} left traces, but no honest scene could be made from them."
+            body = (
+                f"The complete public {cadence_word} left traces, but none that could be turned into a scene "
+                "without guessing. I kept that boundary instead of dressing uncertainty up as an event. "
+                f"The {cadence_word} still belongs in the record: present, unresolved, and not erased."
+            )
+        else:
+            excerpt = f"The public {cadence_word} went quiet, and BNL kept the appointment."
+            body = (
+                f"The complete public {cadence_word} closed without a relay or conversation to turn into a scene. "
+                f"That does not make the {cadence_word} missing; the silence is the honest part of its record. "
+                "I noticed the open space, kept its place, and left the next signal somewhere to arrive."
+            )
+    else:
+        kinds = {str(source.get("sourceKind") or "") for source in sources}
+        if {"relay", "conversation"} <= kinds:
+            trace = "Relay and conversation sources both left public traces"
+        elif "relay" in kinds:
+            trace = "At least one relay left a public trace"
+        elif "conversation" in kinds:
+            trace = "At least one public conversation left a trace"
+        else:
+            trace = "At least one grounded public trace remained"
+        segments = [
+            item
+            for item in packet.get("windowSegmentActivity", [])
+            if isinstance(item, dict)
+            and (int(item.get("relaySources") or 0) + int(item.get("conversationSources") or 0)) > 0
+        ]
+        span = (
+            " from early through late"
+            if len(segments) >= 3
+            else " across more than one stretch of the window"
+            if len(segments) >= 2
+            else " during the window"
+        )
+        title = "The Day Kept Its Place" if entry_kind == "daily" else "The Week Kept Its Place"
+        excerpt = "At least one public trace remained, even when it refused to become one neat scene."
+        heading = "The Trace That Remained"
+        cadence_preference = "day" if entry_kind == "daily" else "week"
+        body = (
+            f"{trace}{span}. The available details did not resolve into one clean scene, but that trace "
+            f"still belongs to the record. I prefer a {cadence_preference} that resists neat filing. "
+            "The archive keeps it without adding a scene, a motive, or an exchange that the sources did "
+            "not establish."
+        )
+
+    safe_reason = re.sub(r"[^a-z0-9_]+", "_", str(failure_reason or "generation_failed").lower()).strip("_")[:80]
+    return {
+        "title": title,
+        "excerpt": excerpt,
+        "sections": [{"heading": heading, "body": body}],
+        "sourceRefIds": {heading: refs},
+        "metadata": {
+            "topicTags": [],
+            "subjectRefs": [],
+            "continuityNotes": [],
+            "unresolvedQuestions": [],
+            "confidenceFlags": ["automatic_rescue"],
+            "safetyFlags": [f"automatic_rescue_after_{safe_reason}"],
+            "contextUses": [],
+        },
+    }
+
+
+def _static_rescue_validation_packet(packet: dict[str, Any]) -> dict[str, Any]:
+    """Remove identity literals only when validating our own hard-coded copy.
+
+    Model prose never uses this path.  The rescue text is source-independent,
+    so a member named ``Room`` or ``Day`` cannot turn a safe static fallback
+    into a permanent false-positive hold.
+    """
+
+    prepared = dict(packet)
+    prepared["privateWindowDisplayNames"] = []
+    prepared["privateSources"] = [
+        {key: value for key, value in source.items() if key != "displayName"}
+        for source in packet.get("privateSources", [])
+        if isinstance(source, dict)
+    ]
+    return prepared
 
 
 def _public_text(article: dict[str, Any]) -> str:
@@ -1838,9 +2083,24 @@ def validate_article(
         if _norm(heading) in headings:
             return "duplicate_section_heading"
         headings.append(_norm(heading))
-    wc = public_word_count(article)
-    if wc < WORD_MIN or wc > WORD_MAX:
-        return "invalid_word_count"
+    public_fields = [
+        str(article.get("title") or ""),
+        str(article.get("excerpt") or ""),
+        *[
+            str(section.get(key) or "")
+            for section in sections
+            for key in ("heading", "body")
+        ],
+    ]
+    try:
+        if any(_UNSAFE_PUBLIC_CONTROL_RE.search(value) for value in public_fields):
+            return "invalid_public_text"
+        for value in public_fields:
+            value.encode("utf-8")
+    except UnicodeEncodeError:
+        return "invalid_public_text"
+    if public_payload_byte_count(article, packet) > JOURNAL_MAX_PUBLIC_PAYLOAD_BYTES:
+        return "payload_too_large"
     valid_refs = {s["refId"] for s in packet.get("safeSources", []) if s.get("refId")}
     if not valid_refs:
         return "no_new_source"
@@ -2090,6 +2350,8 @@ def _draft_records(guild_id: int, packet: dict[str, Any], article: dict[str, Any
     lane_candidates = packet.get("generationContextLanes") if isinstance(packet.get("generationContextLanes"), dict) else {}
     meta.update({
         "entryKind": packet.get("entryKind", "manual"),
+        "publicWordCount": public_word_count(article),
+        "publicPayloadBytes": len(canonical),
         "sourceWindowStart": packet["sourceWindowStart"],
         "sourceWindowEnd": packet["sourceWindowEnd"],
         "coverageComplete": bool(packet.get("coverageComplete", True)),
@@ -2125,8 +2387,34 @@ def _generate_article_with_repairs(
     packet: dict[str, Any],
     generator: Callable[[dict[str, Any], str], str],
     prior_titles: list[str],
-) -> tuple[Optional[dict[str, Any]], str, bool]:
+) -> tuple[Optional[dict[str, Any]], str, bool, str, bool]:
     """Return the best blocking-clean article without letting polish cancel publication."""
+
+    def static_rescue(reason: str) -> Optional[dict[str, Any]]:
+        rescue = _automatic_rescue_article(packet, reason)
+        if rescue is None:
+            return None
+        # The hard-coded rescue makes no memory, rumor, inference, or identity
+        # claim.  Keep all other hard validators, including citations,
+        # sensitive-detail patterns, and the 24 KB transport preflight.
+        packet["generationContextLanes"] = {}
+        packet["privateContextLaneProvenance"] = {}
+        validation_packet = _static_rescue_validation_packet(packet)
+        if validate_article(
+            rescue,
+            validation_packet,
+            prior_titles,
+            blocking_only=True,
+        ):
+            return None
+        return rescue
+
+    if packet.get("quietWindowObservation"):
+        rescue = static_rescue("quiet_window")
+        if rescue is not None:
+            return rescue, "", True, "automatic_quiet_window", True
+        return None, "quiet_window_rescue_invalid", False, "", False
+
     last_reason = ""
     previous_output = ""
     retained_publishable: Optional[dict[str, Any]] = None
@@ -2142,9 +2430,12 @@ def _generate_article_with_repairs(
             )
         except Exception as exc:
             if retained_publishable is not None:
-                return retained_publishable, "", True
+                return retained_publishable, "", True, "", False
             reason = "quota_unavailable" if "quota" in str(exc).lower() else "provider_failure"
-            return None, reason, False
+            rescue = static_rescue(reason)
+            if rescue is not None:
+                return rescue, "", True, f"automatic_rescue_after_{reason}", True
+            return None, reason, False, "", False
         previous_output = raw
         try:
             article = parse_generated_json(raw)
@@ -2164,7 +2455,7 @@ def _generate_article_with_repairs(
 
         validation = validate_article(article, packet, prior_titles)
         if not validation:
-            return article, "", False
+            return article, "", False, "", False
         if validation not in ADVISORY_VALIDATION_REASONS:
             # Future validation reasons remain blocking unless explicitly
             # classified as editorial guidance above.
@@ -2174,8 +2465,12 @@ def _generate_article_with_repairs(
         last_reason = validation
 
     if retained_publishable is not None:
-        return retained_publishable, "", True
-    return None, last_reason or "generation_failed", False
+        return retained_publishable, "", True, "", False
+    rescue_reason = last_reason or "generation_failed"
+    rescue = static_rescue(rescue_reason)
+    if rescue is not None:
+        return rescue, "", True, f"automatic_rescue_after_{rescue_reason}", True
+    return None, rescue_reason, False, "", False
 
 
 def store_validated_draft(
@@ -2187,12 +2482,15 @@ def store_validated_draft(
     entry_id: str = "",
     revision: int = 1,
     allow_advisory: bool = False,
+    identity_independent_static_copy: bool = False,
 ) -> JournalResult:
     ensure_schema(db_path)
     with sqlite3.connect(db_path) as conn:
         reason = validate_article(
             article,
-            packet,
+            _static_rescue_validation_packet(packet)
+            if identity_independent_static_copy
+            else packet,
             _prior_titles(conn, guild_id),
             blocking_only=allow_advisory,
         )
@@ -2211,28 +2509,35 @@ def generate_and_store_packet_draft(
     generator: Callable[[dict[str, Any], str], str],
     *,
     entry_id: str = "",
+    revision: int = 1,
 ) -> JournalResult:
+    packet = ensure_automatic_window_source(packet)
     if not packet.get("coverageComplete", True):
         return JournalResult(False, "no_draft", "incomplete_source_window", entry_id=entry_id)
     if not packet.get("safeSources"):
         return JournalResult(False, "no_draft", "insufficient_grounded_material", entry_id=entry_id)
     with sqlite3.connect(db_path) as conn:
         prior_titles = _prior_titles(conn, guild_id)
-    article, reason, allow_advisory = _generate_article_with_repairs(
+    article, reason, allow_advisory, recovery_detail, static_copy = _generate_article_with_repairs(
         packet,
         generator,
         prior_titles,
     )
     if article is None:
         return JournalResult(False, "no_draft", reason, entry_id=entry_id)
-    return store_validated_draft(
+    stored = store_validated_draft(
         db_path,
         guild_id,
         packet,
         article,
         entry_id=entry_id,
+        revision=revision,
         allow_advisory=allow_advisory,
+        identity_independent_static_copy=static_copy,
     )
+    if stored.ok and recovery_detail:
+        stored.reason = recovery_detail
+    return stored
 
 
 def generate_and_store_draft(
@@ -2344,7 +2649,7 @@ def regenerate_draft(
     packet = build_source_packet(db_path, guild_id, hours, **packet_kwargs)
     with sqlite3.connect(db_path) as conn:
         prior_titles = _prior_titles(conn, guild_id)
-    article, reason, allow_advisory = _generate_article_with_repairs(
+    article, reason, allow_advisory, recovery_detail, static_copy = _generate_article_with_repairs(
         packet,
         generator,
         prior_titles,
@@ -2354,7 +2659,7 @@ def regenerate_draft(
     with sqlite3.connect(db_path) as conn:
         reason = validate_article(
             article,
-            packet,
+            _static_rescue_validation_packet(packet) if static_copy else packet,
             _prior_titles(conn, guild_id),
             blocking_only=allow_advisory,
         )
@@ -2371,6 +2676,8 @@ def regenerate_draft(
             if cur1.rowcount != 1 or cur2.rowcount != 1:
                 raise sqlite3.IntegrityError("journal_regenerate_sync_failed")
             _insert_draft_rows(conn, entry_row, meta_row)
+    if recovery_detail:
+        result.reason = recovery_detail
     return result
 
 

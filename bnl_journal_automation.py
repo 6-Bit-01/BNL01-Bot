@@ -14,6 +14,7 @@ from bnl_journal import (
     approve_draft,
     build_source_packet_between,
     deliver_approved,
+    ensure_automatic_window_source,
     generate_and_store_packet_draft,
     journal_topic_counts,
     utc_now_iso,
@@ -24,10 +25,8 @@ DAILY_READY_HOUR = 19
 DAILY_READY_MINUTE = 0
 WEEKLY_READY_WEEKDAY = 0  # Monday, covering the prior Monday-Sunday week.
 WEEKLY_READY_HOUR = 19
-MIN_DAILY_SOURCE_COUNT = 5
-MIN_WEEKLY_ACTIVE_DAYS = 1
 LEASE_MINUTES = 30
-RETRY_MINUTES = 60
+RETRY_MINUTES = 15
 TERMINAL_RUN_STATES = {"published", "quiet", "incomplete"}
 
 
@@ -325,17 +324,6 @@ def _mark_observation(db_path: str, guild_id: int, label: str, result: Automatio
         ))
 
 
-def _has_meaningful_daily_activity(packet: dict[str, Any]) -> bool:
-    counts = packet.get("aggregateCounts") or {}
-    total = int(counts.get("eligibleRelays") or 0) + int(counts.get("eligibleConversations") or 0)
-    if total < MIN_DAILY_SOURCE_COUNT:
-        return False
-    if int(counts.get("eligibleConversations") or 0) > 0:
-        return True
-    quiet_markers = {"quiet", "quiet_source", "non_event_stock", "heartbeat", "hydrated"}
-    return any(str(source.get("eventType") or "").lower() not in quiet_markers for source in packet.get("privateSources", []))
-
-
 def _publish_packet(
     db_path: str,
     guild_id: int,
@@ -365,14 +353,50 @@ def _publish_packet(
             return AutomationResult(False, cadence, "held", approved.reason, entry_id, int(existing[0]), packet["sourceWindowStart"], packet["sourceWindowEnd"], packet.get("aggregateCounts"))
         delivered = deliver_approved(db_path, guild_id, entry_id, base_url, api_key, opener=opener, revision=int(existing[0]))
         return AutomationResult(delivered.ok, cadence, delivered.status, delivered.reason, entry_id, delivered.revision, packet["sourceWindowStart"], packet["sourceWindowEnd"], packet.get("aggregateCounts"))
-    generated = generate_and_store_packet_draft(db_path, guild_id, packet, generator, entry_id=entry_id)
+    next_revision = int(existing[0]) + 1 if existing and existing[1] == "rejected" else 1
+    generated = generate_and_store_packet_draft(
+        db_path,
+        guild_id,
+        packet,
+        generator,
+        entry_id=entry_id,
+        revision=next_revision,
+    )
     if not generated.ok:
         return AutomationResult(False, cadence, "held", generated.reason, entry_id, generated.revision, packet["sourceWindowStart"], packet["sourceWindowEnd"], packet.get("aggregateCounts"))
     approved = approve_draft(db_path, guild_id, entry_id, generated.content_hash, revision=generated.revision)
     if not approved.ok:
         return AutomationResult(False, cadence, "held", approved.reason, entry_id, generated.revision, packet["sourceWindowStart"], packet["sourceWindowEnd"], packet.get("aggregateCounts"))
     delivered = deliver_approved(db_path, guild_id, entry_id, base_url, api_key, opener=opener, revision=generated.revision)
-    return AutomationResult(delivered.ok, cadence, delivered.status, delivered.reason, entry_id, delivered.revision, packet["sourceWindowStart"], packet["sourceWindowEnd"], packet.get("aggregateCounts"))
+    detail = generated.reason if delivered.ok and generated.reason else delivered.reason
+    return AutomationResult(delivered.ok, cadence, delivered.status, detail, entry_id, delivered.revision, packet["sourceWindowStart"], packet["sourceWindowEnd"], packet.get("aggregateCounts"))
+
+
+def _forced_retry_daily_day(
+    db_path: str,
+    guild_id: int,
+    now_utc: Optional[datetime],
+) -> Optional[date]:
+    """Prefer an existing held window when an operator explicitly runs now."""
+
+    now = now_utc or datetime.now(timezone.utc)
+    with sqlite3.connect(db_path) as conn:
+        rows = conn.execute(
+            """SELECT source_window_start,source_window_end
+               FROM bnl_journal_automation_runs
+               WHERE guild_id=? AND cadence='daily'
+                 AND lifecycle_state IN ('held','delivery_failed','deferred')
+               ORDER BY source_window_start DESC""",
+            (guild_id,),
+        ).fetchall()
+    for start, end in rows:
+        try:
+            if _parse_utc(str(end)) > now:
+                continue
+            return _parse_utc(str(start)).astimezone(PACIFIC).date()
+        except (TypeError, ValueError):
+            continue
+    return None
 
 
 def run_daily(
@@ -389,6 +413,8 @@ def run_daily(
     memory_excluded_entry_ids: Optional[set[str]] = None,
 ) -> AutomationResult:
     ensure_schema(db_path)
+    if force and target_day is None:
+        target_day = _forced_retry_daily_day(db_path, guild_id, now_utc)
     start, end, label = _daily_period_for_day(target_day) if target_day else daily_period(now_utc)
     if not force and target_day is None and not daily_due(now_utc):
         return AutomationResult(False, "daily", "not_due", "before_daily_publish_time", source_window_start=start, source_window_end=end)
@@ -403,6 +429,7 @@ def run_daily(
         entry_kind="daily",
         excluded_history_entry_ids=memory_excluded_entry_ids,
     )
+    packet = ensure_automatic_window_source(packet)
     _store_observation(db_path, guild_id, label, packet)
     if not packet.get("sourceArchiveAvailable", False):
         result = AutomationResult(False, "daily", "held", "source_archive_unavailable", source_window_start=start, source_window_end=end, aggregate_counts=packet.get("aggregateCounts"))
@@ -410,8 +437,6 @@ def run_daily(
         # Time cannot make a pre-archive window complete. Record it explicitly
         # and move on instead of blocking every later catch-up day forever.
         result = AutomationResult(False, "daily", "incomplete", "window_began_before_archive_activation", source_window_start=start, source_window_end=end, aggregate_counts=packet.get("aggregateCounts"))
-    elif not _has_meaningful_daily_activity(packet):
-        result = AutomationResult(True, "daily", "quiet", "insufficient_meaningful_activity", source_window_start=start, source_window_end=end, aggregate_counts=packet.get("aggregateCounts"))
     else:
         result = _publish_packet(db_path, guild_id, "daily", label, packet, generator, base_url, api_key, opener=opener)
     _mark_observation(db_path, guild_id, label, result)
@@ -439,10 +464,15 @@ def _weekly_packet(
                 WHERE guild_id=? AND lifecycle_state='published' AND source_window_start>=? AND source_window_end<=?""", (guild_id, start, end)).fetchall()
         }
     complete = [row for row in observations if row["lifecycle_state"] in {"published", "quiet"}]
-    active = [row for row in complete if row["lifecycle_state"] == "published"]
+    active = [
+        row
+        for row in complete
+        if row["lifecycle_state"] == "published"
+        and not int((json.loads(row["aggregate_counts_json"] or "{}") or {}).get("quietWindowObservation") or 0)
+    ]
     # A weekly synthesis is only grounded once all seven daily windows have
     # reached a durable terminal state. Held/incomplete days are excluded.
-    if len(complete) < 7 or len(active) < MIN_WEEKLY_ACTIVE_DAYS:
+    if len(complete) < 7:
         return None, len(complete), len(active)
     observation_context: list[dict[str, Any]] = []
     for row in complete:
@@ -500,9 +530,9 @@ def run_weekly(
         end,
         memory_excluded_entry_ids=memory_excluded_entry_ids,
     )
-    if packet is None and complete_days == 7 and active_days == 0:
-        result = AutomationResult(True, "weekly", "quiet", "no_meaningful_weekly_activity", source_window_start=start, source_window_end=end, aggregate_counts={"completeDays": complete_days, "activeDays": active_days})
-    elif packet is None:
+    if packet is not None:
+        packet = ensure_automatic_window_source(packet)
+    if packet is None:
         result = AutomationResult(True, "weekly", "deferred", f"only_{complete_days}_complete_daily_observations", source_window_start=start, source_window_end=end, aggregate_counts={"completeDays": complete_days, "activeDays": active_days})
     elif not packet.get("sourceArchiveAvailable", False):
         result = AutomationResult(False, "weekly", "held", "source_archive_unavailable", source_window_start=start, source_window_end=end, aggregate_counts=packet.get("aggregateCounts"))

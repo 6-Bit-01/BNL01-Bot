@@ -104,6 +104,46 @@ class JournalTests(unittest.TestCase):
                 c.execute("SELECT COUNT(*) FROM bnl_journal_entries WHERE lifecycle_state='draft'").fetchone()[0],
             )
 
+    def test_word_count_is_guidance_only_at_both_extremes(self):
+        packet = self.packet()
+        cases = (
+            (
+                "Short Honest Entry",
+                "A public track discussion left a trace. I admit, I kept listening.",
+            ),
+            (
+                "Long Honest Entry",
+                " ".join(
+                    "A public track discussion kept changing shape while the room listened."
+                    for _ in range(90)
+                ),
+            ),
+        )
+
+        for title, body in cases:
+            with self.subTest(title=title):
+                raw = json.loads(article_json(packet, title=title))
+                raw["sections"][0]["body"] = body
+                article = j.parse_generated_json(json.dumps(raw))
+                self.assertEqual("", j.validate_article(article, packet, []))
+                result = j.generate_and_store_packet_draft(
+                    self.db,
+                    1,
+                    packet,
+                    lambda *_args, payload=json.dumps(raw): payload,
+                )
+                self.assertTrue(result.ok, result)
+
+        with sqlite3.connect(self.db) as conn:
+            stored_counts = [
+                json.loads(row[0])["publicWordCount"]
+                for row in conn.execute(
+                    "SELECT metadata_json FROM bnl_journal_private_metadata ORDER BY created_at"
+                ).fetchall()
+            ]
+        self.assertLess(stored_counts[0], 250)
+        self.assertGreater(stored_counts[1], 500)
+
     def test_clinical_or_sensitive_copy_gets_rejected_and_rewritten(self):
         packet = self.packet()
         clinical = j.parse_generated_json(article_json(packet, title='Clinical Pass', leak=' Records indicate continuous effort across entities.'))
@@ -414,7 +454,7 @@ class BotJournalCommandTests(unittest.IsolatedAsyncioTestCase):
             packet = j.build_source_packet(bnl01_bot.DB_FILE, 1, 24, '2026-07-18T01:00:00Z')
             response = Mock(candidates=[Mock(content=Mock(parts=[Mock(text=article_json(packet))]))], usage_metadata=Mock(total_token_count=None))
             msg = Mock(); msg.guild = Mock(id=1, get_member=Mock(return_value=Mock())); msg.author = Mock(id=1); msg.channel = Mock(name='research-and-development'); msg.reply = AsyncMock()
-            with patch.object(bnl01_bot, 'resolve_channel_policy', return_value='internal_controlled'), patch.object(bnl01_bot, 'can_send_dossier_recommendation', return_value=True), patch.object(bnl01_bot, 'check_quota_availability', return_value=True), patch.object(bnl01_bot, '_generate_gemini_content_with_fallback', return_value=response):
+            with patch.object(j, 'utc_now_iso', return_value='2026-07-18T01:00:00Z'), patch.object(bnl01_bot, 'resolve_channel_policy', return_value='internal_controlled'), patch.object(bnl01_bot, 'can_send_dossier_recommendation', return_value=True), patch.object(bnl01_bot, 'check_quota_availability', return_value=True), patch.object(bnl01_bot, '_generate_gemini_content_with_fallback', return_value=response):
                 handled = await bnl01_bot.maybe_handle_journal_command(msg, '!bnl journal create | hours=bad')
             self.assertTrue(handled)
             with sqlite3.connect(bnl01_bot.DB_FILE) as c:
