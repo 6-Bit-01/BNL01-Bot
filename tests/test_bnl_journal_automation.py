@@ -245,6 +245,71 @@ class JournalAutomationTests(unittest.TestCase):
             self.assertEqual("published", conn.execute("SELECT lifecycle_state FROM bnl_journal_observations").fetchone()[0])
             self.assertEqual(1, conn.execute("SELECT COUNT(*) FROM bnl_journal_entries WHERE lifecycle_state='published'").fetchone()[0])
 
+    def test_word_count_target_is_guidance_and_never_retries(self):
+        self.add_day("2026-07-19")
+        self.add_day("2026-07-20")
+        calls = []
+
+        def outside_target(packet, prompt):
+            calls.append(prompt)
+            article = json.loads(article_json(packet))
+            if packet["sourceWindowStart"].startswith("2026-07-20"):
+                article["sections"][0]["body"] = (
+                    "A producer brought a mix into the public music room, and listeners kept the rhythm moving. "
+                    "I admit the small exchange still gave the day a shape worth keeping."
+                )
+            else:
+                article["sections"][0]["body"] = " ".join(
+                    [
+                        "A producer brought another grounded mix into the public music room while listeners kept the rhythm moving and the community answered with its own careful mischief."
+                        for _ in range(50)
+                    ]
+                )
+                article["sections"][0]["body"] += (
+                    " I admit the room's persistence has become one of my preferred recurring details."
+                )
+            return json.dumps(article)
+
+        short_result = automation.run_daily(
+            self.db,
+            1,
+            outside_target,
+            "https://site.example",
+            "key",
+            target_day=date(2026, 7, 19),
+            force=True,
+            opener=self.opener,
+        )
+        long_result = automation.run_daily(
+            self.db,
+            1,
+            outside_target,
+            "https://site.example",
+            "key",
+            target_day=date(2026, 7, 20),
+            force=True,
+            opener=self.opener,
+        )
+
+        self.assertEqual(("published", "published"), (short_result.status, long_result.status))
+        self.assertEqual(2, len(calls))
+        self.assertTrue(
+            all(
+                "Write 1-3 sections and 250-500 total words; prefer 2 sections and roughly 300-420 words."
+                in prompt
+                for prompt in calls
+            )
+        )
+        with sqlite3.connect(self.db) as conn:
+            word_counts = {
+                entry_id: json.loads(metadata_json)["publicWordCount"]
+                for entry_id, metadata_json in conn.execute(
+                    "SELECT entry_id,metadata_json FROM bnl_journal_private_metadata"
+                ).fetchall()
+            }
+        self.assertLess(word_counts[short_result.entry_id], 250)
+        self.assertGreater(word_counts[long_result.entry_id], 500)
+
     def test_editorial_polish_cannot_hold_daily_publication(self):
         self.add_day("2026-07-19")
         calls = []

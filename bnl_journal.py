@@ -12,7 +12,6 @@ from typing import Any, Callable, Optional
 
 PUBLIC_POLICIES = {"public_home", "public_context", "public_selective"}
 STATES = {"draft", "rejected", "approved_pending_delivery", "published", "delivery_failed"}
-WORD_MIN, WORD_MAX = 250, 500
 JOURNAL_ROUTE = "bnl_journal_generation"
 JOURNAL_GENERATION_ATTEMPTS = 4
 ADVISORY_VALIDATION_REASONS = frozenset({
@@ -83,7 +82,6 @@ _REPAIR_GUIDANCE = {
     "community_name_leak": "Remove every community member name and replace personal references with anonymous descriptions.",
     "public_leak_pattern": "Remove every URL, mention, identifier, and internal implementation term from public prose.",
     "source_ref_leak": "Keep source reference tokens only inside sourceRefIds arrays; remove them from all public prose.",
-    "invalid_word_count": "Rewrite the complete article so its total public word count is between 250 and 500 words.",
     "insufficient_source_breadth": (
         "Use the supplied evidenceCoverageContract. Ground the article in the required number of distinct fresh sources, "
         "participants, source kinds, and available parts of the window. Synthesize them into a few meaningful patterns; "
@@ -1838,9 +1836,6 @@ def validate_article(
         if _norm(heading) in headings:
             return "duplicate_section_heading"
         headings.append(_norm(heading))
-    wc = public_word_count(article)
-    if wc < WORD_MIN or wc > WORD_MAX:
-        return "invalid_word_count"
     valid_refs = {s["refId"] for s in packet.get("safeSources", []) if s.get("refId")}
     if not valid_refs:
         return "no_new_source"
@@ -2090,6 +2085,7 @@ def _draft_records(guild_id: int, packet: dict[str, Any], article: dict[str, Any
     lane_candidates = packet.get("generationContextLanes") if isinstance(packet.get("generationContextLanes"), dict) else {}
     meta.update({
         "entryKind": packet.get("entryKind", "manual"),
+        "publicWordCount": public_word_count(article),
         "sourceWindowStart": packet["sourceWindowStart"],
         "sourceWindowEnd": packet["sourceWindowEnd"],
         "coverageComplete": bool(packet.get("coverageComplete", True)),
