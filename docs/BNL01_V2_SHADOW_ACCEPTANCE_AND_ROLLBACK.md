@@ -176,10 +176,12 @@ as a selected-invariant failure. An unmatched count, any remainder, and every
 other invalid-invariant label continue to fail closed as hard stops. No retained
 row is rewritten or deleted.
 
-New shadow rows omit the corroborated count from persisted selected-invariant
-diagnostics while preserving the `invalid_route_channel_policy` exclusion.
-The conservative in-process runtime marker and live-governance fallback remain
-unchanged; revising that dormant behavior requires a separate reviewed change.
+Shadow rows preserve the raw aggregate marker and exclusion counts. The
+acceptance reader performs the compatibility reclassification exactly once at
+report time, so a one-marker/one-exclusion row is safely reclassified while a
+two-marker/one-exclusion row retains one hard blocker. The conservative
+in-process runtime marker and live-governance fallback remain unchanged;
+revising that dormant behavior requires a separate reviewed change.
 
 ### Relationship evidence
 

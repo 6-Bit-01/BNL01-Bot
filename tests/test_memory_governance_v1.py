@@ -435,7 +435,9 @@ def _case_route_policy_violations_and_shadow_retention_are_real():
     persist_shadow_diagnostics(c, req(), r, 'legacy')
     saved_exclusions, saved_diagnostics = c.execute("SELECT excluded_json, diagnostics_json FROM memory_governance_shadow_runs ORDER BY created_at DESC LIMIT 1").fetchone()
     assert json.loads(saved_exclusions) == {'invalid_route_channel_policy': 1}
-    assert json.loads(saved_diagnostics)['invalid_invariant_counts'] == {}
+    assert json.loads(saved_diagnostics)['invalid_invariant_counts'] == {
+        'invalid_route_channel_policy_selected': 1,
+    }
     for i in range(504):
         persist_shadow_diagnostics(c, req(), r, 'legacy')
     assert c.execute("SELECT COUNT(*) FROM memory_governance_shadow_runs WHERE guild_id=1").fetchone()[0] <= 500
@@ -458,7 +460,9 @@ def _case_route_policy_violations_and_shadow_retention_are_real():
     persist_shadow_diagnostics(c, req(user_text='operator modular synths'), route_mismatch, 'legacy')
     route_exclusions, route_diagnostics = c.execute("SELECT excluded_json, diagnostics_json FROM memory_governance_shadow_runs ORDER BY created_at DESC, run_id DESC LIMIT 1").fetchone()
     assert json.loads(route_exclusions)['invalid_route_channel_policy'] == 2
-    assert json.loads(route_diagnostics)['invalid_invariant_counts'] == {}
+    assert json.loads(route_diagnostics)['invalid_invariant_counts'] == {
+        'invalid_route_channel_policy_selected': 2,
+    }
 
 
 class MemoryGovernanceV1Tests(unittest.TestCase):

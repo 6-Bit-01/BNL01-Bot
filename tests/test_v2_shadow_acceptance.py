@@ -65,23 +65,6 @@ class V2ShadowAcceptanceTests(unittest.TestCase):
             conversation_context_diagnostics=context,
         )
 
-    def restore_legacy_route_marker(self, count):
-        run_id, diagnostics_json = self.conn.execute(
-            "SELECT run_id, diagnostics_json "
-            "FROM memory_governance_shadow_runs "
-            "ORDER BY created_at DESC, run_id DESC LIMIT 1"
-        ).fetchone()
-        diagnostics = json.loads(diagnostics_json)
-        diagnostics["invalid_invariant_counts"] = {
-            "invalid_route_channel_policy_selected": count,
-        }
-        self.conn.execute(
-            "UPDATE memory_governance_shadow_runs "
-            "SET diagnostics_json=? WHERE run_id=?",
-            (json.dumps(diagnostics, sort_keys=True), run_id),
-        )
-        self.conn.commit()
-
     def test_defaults_are_reporting_only_and_all_shadow_stages_are_disabled(self):
         before_changes = self.conn.total_changes
         before_schema = self.conn.execute(
@@ -207,7 +190,7 @@ class V2ShadowAcceptanceTests(unittest.TestCase):
         ).fetchone()[0]
         self.assertNotIn(subject_hash, encoded)
 
-    def test_legacy_route_policy_label_is_preserved_but_not_a_hard_blocker(self):
+    def test_route_policy_label_is_reclassified_once_and_not_a_hard_blocker(self):
         request = GovernanceRequest(
             guild_id=1,
             subject_user_id=99,
@@ -229,7 +212,6 @@ class V2ShadowAcceptanceTests(unittest.TestCase):
             ),
             "legacy",
         )
-        self.restore_legacy_route_marker(1)
         before_row = self.conn.execute(
             "SELECT excluded_json, diagnostics_json "
             "FROM memory_governance_shadow_runs"
@@ -278,7 +260,7 @@ class V2ShadowAcceptanceTests(unittest.TestCase):
             rendered,
         )
 
-    def test_unmatched_legacy_label_remains_a_hard_blocker(self):
+    def test_persisted_unmatched_route_policy_label_remains_a_hard_blocker(self):
         persist_shadow_diagnostics(
             self.conn,
             GovernanceRequest(
@@ -302,7 +284,18 @@ class V2ShadowAcceptanceTests(unittest.TestCase):
             ),
             "legacy",
         )
-        self.restore_legacy_route_marker(2)
+        stored = self.conn.execute(
+            "SELECT excluded_json, diagnostics_json "
+            "FROM memory_governance_shadow_runs"
+        ).fetchone()
+        self.assertEqual(
+            json.loads(stored[0]),
+            {"invalid_route_channel_policy": 1},
+        )
+        self.assertEqual(
+            json.loads(stored[1])["invalid_invariant_counts"],
+            {"invalid_route_channel_policy_selected": 2},
+        )
 
         snapshot = self.snapshot(
             {"BNL_MEMORY_GOVERNANCE_SHADOW_ENABLED": "true"}
