@@ -70,6 +70,35 @@ class MemoryLedgerV1Tests(unittest.TestCase):
         values = [r[0] for r in self.conn.execute("SELECT normalized_value FROM memory_ledger_entries ORDER BY source_sequence").fetchall()]
         self.assertEqual(values, ["8", "123456789012"])
 
+    def test_bare_remember_number_is_durable_but_declarative_and_questions_are_not(self):
+        ledger.shadow_conversation_row(self.conn, row_id=22, user_id=7, user_name="Crow", guild_id=1, role="user", content="remember 8", channel_policy="sealed_test")
+        ledger.shadow_conversation_row(self.conn, row_id=23, user_id=7, user_name="Crow", guild_id=1, role="user", content="do you remember 9?", channel_policy="sealed_test")
+        ledger.shadow_conversation_row(self.conn, row_id=24, user_id=7, user_name="Crow", guild_id=1, role="user", content="I remember 10 people", channel_policy="sealed_test")
+        ledger.shadow_conversation_row(self.conn, row_id=25, user_id=7, user_name="Crow", guild_id=1, role="user", content="I do not remember 11", channel_policy="sealed_test")
+        ledger.shadow_conversation_row(self.conn, row_id=26, user_id=7, user_name="Crow", guild_id=1, role="user", content="what's up? / remember 12", channel_policy="sealed_test")
+        ledger.shadow_conversation_row(self.conn, row_id=27, user_id=7, user_name="Crow", guild_id=1, role="user", content="remember 13 / what's up?", channel_policy="sealed_test")
+        ledger.shadow_conversation_row(self.conn, row_id=28, user_id=7, user_name="Crow", guild_id=1, role="user", content="hey BNL, please remember the number 14", channel_policy="sealed_test")
+        ledger.shadow_conversation_row(self.conn, row_id=29, user_id=7, user_name="Crow", guild_id=1, role="user", content="remember 15 for me", channel_policy="sealed_test")
+        ledger.shadow_conversation_row(self.conn, row_id=30, user_id=7, user_name="Crow", guild_id=1, role="user", content=", remember 16", channel_policy="sealed_test")
+        ledger.shadow_conversation_row(self.conn, row_id=31, user_id=7, user_name="Crow", guild_id=1, role="user", content="Hey, BNL, remember 17", channel_policy="sealed_test")
+        ledger.shadow_conversation_row(self.conn, row_id=32, user_id=7, user_name="Crow", guild_id=1, role="user", content="bnlremember 18", channel_policy="sealed_test")
+        ledger.shadow_conversation_row(self.conn, row_id=33, user_id=7, user_name="Crow", guild_id=1, role="user", content="bnlplease remember 19", channel_policy="sealed_test")
+        rows = self.conn.execute(
+            "SELECT predicate_key, normalized_value FROM memory_ledger_entries ORDER BY source_sequence"
+        ).fetchall()
+        self.assertEqual(rows[0], ("remembered_number", "8"))
+        self.assertEqual(rows[1], ("conversation", "do you remember 9?"))
+        self.assertEqual(rows[2], ("conversation", "I remember 10 people"))
+        self.assertEqual(rows[3], ("conversation", "I do not remember 11"))
+        self.assertEqual(rows[4], ("remembered_number", "12"))
+        self.assertEqual(rows[5], ("remembered_number", "13"))
+        self.assertEqual(rows[6], ("remembered_number", "14"))
+        self.assertEqual(rows[7], ("remembered_number", "15"))
+        self.assertEqual(rows[8], ("remembered_number", "16"))
+        self.assertEqual(rows[9], ("remembered_number", "17"))
+        self.assertEqual(rows[10], ("conversation", "bnlremember 18"))
+        self.assertEqual(rows[11], ("conversation", "bnlplease remember 19"))
+
     def test_explicit_unique_correction_links_and_ambiguous_does_not(self):
         ledger.shadow_conversation_row(self.conn, row_id=30, user_id=7, user_name="Crow", guild_id=1, role="user", content="remember this number: 731946", channel_policy="sealed_test")
         linked = ledger.shadow_conversation_row(self.conn, row_id=31, user_id=7, user_name="Crow", guild_id=1, role="user", content="Correction: the number is 284517, not 731946", channel_policy="sealed_test")

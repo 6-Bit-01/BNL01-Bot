@@ -42,7 +42,15 @@ REVIEW_ONLY_LIFECYCLE = "review_only"
 RESOLVED_LIFECYCLE = "resolved"
 REJECTED_LIFECYCLE = "rejected"
 
-_NUMBER_REMEMBER_RE = re.compile(r"\bremember\b[^\n]{0,80}?\bnumber\b\D+(\d{1,12})(?!\d)", re.I)
+_NUMBER_REMEMBER_RE = re.compile(
+    r"(?:^|\s/\s)\s*(?:[,;:\-]\s*)?"
+    r"(?:(?:hey\s*,?\s+)?bnl(?:-01)?\b(?:\s*[,;:\-]\s*|\s+))?"
+    r"(?:please\s+)?remember\s+"
+    r"(?:(?:(?:that\s+(?:the\s+)?|(?:this|the)\s+)?number)\s*(?::|-|is)?\s*|this\s*:\s*)?"
+    r"(\d{1,12})(?!\d)(?:\s*(?:,\s*)?(?:please|for\s+(?:me|later)))?"
+    r"(?=\s*[.!]?(?:\s*/\s|\s*$))",
+    re.I,
+)
 _REPLACE_NUMBER_RE = re.compile(r"\b(?:replace|supersede)\s+(\d{1,12})\s+\bwith\b\s+(\d{1,12})(?!\d)", re.I)
 _CORRECTION_NUMBER_RE = re.compile(r"\b(?:correction|actually|correcting|i meant)\b[^\n]{0,80}?\b(?:number\s+)?(?:is|was)?\s*(\d{1,12})\s*,?\s+not\s+(\d{1,12})(?!\d)", re.I)
 @dataclass(frozen=True)
