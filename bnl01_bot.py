@@ -15767,7 +15767,7 @@ def _detect_request_intent(text: str):
     if "?" in t:
         return True, "question_mark"
     patterns = [
-        r"\bremember these\b", r"\btell me\b", r"\bmake me\b", r"\bwrite\b", r"\bdraft\b",
+        r"^\s*(?:please\s+)?remember\b", r"\btell me\b", r"\bmake me\b", r"\bwrite\b", r"\bdraft\b",
         r"\bgive me\b", r"\bexplain\b", r"\bhelp\b", r"\bfix\b", r"\bsummarize\b",
         r"\bmake a joke\b", r"\btell me a joke\b", r"\babout each\b", r"\bfor each\b",
         r"\bcan you\b", r"\bcould you\b", r"\bplease\b", r"\bshow me\b",
