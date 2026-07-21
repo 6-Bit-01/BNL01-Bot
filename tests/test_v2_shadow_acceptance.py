@@ -65,6 +65,23 @@ class V2ShadowAcceptanceTests(unittest.TestCase):
             conversation_context_diagnostics=context,
         )
 
+    def restore_legacy_route_marker(self, count):
+        run_id, diagnostics_json = self.conn.execute(
+            "SELECT run_id, diagnostics_json "
+            "FROM memory_governance_shadow_runs "
+            "ORDER BY created_at DESC, run_id DESC LIMIT 1"
+        ).fetchone()
+        diagnostics = json.loads(diagnostics_json)
+        diagnostics["invalid_invariant_counts"] = {
+            "invalid_route_channel_policy_selected": count,
+        }
+        self.conn.execute(
+            "UPDATE memory_governance_shadow_runs "
+            "SET diagnostics_json=? WHERE run_id=?",
+            (json.dumps(diagnostics, sort_keys=True), run_id),
+        )
+        self.conn.commit()
+
     def test_defaults_are_reporting_only_and_all_shadow_stages_are_disabled(self):
         before_changes = self.conn.total_changes
         before_schema = self.conn.execute(
@@ -189,6 +206,155 @@ class V2ShadowAcceptanceTests(unittest.TestCase):
             "SELECT subject_hash FROM memory_governance_shadow_runs"
         ).fetchone()[0]
         self.assertNotIn(subject_hash, encoded)
+
+    def test_legacy_route_policy_label_is_preserved_but_not_a_hard_blocker(self):
+        request = GovernanceRequest(
+            guild_id=1,
+            subject_user_id=99,
+            route_mode="normal_chat",
+            conversation_surface="test",
+            channel_policy="public_home",
+        )
+        persist_shadow_diagnostics(
+            self.conn,
+            request,
+            GovernanceResult(
+                "",
+                (),
+                (),
+                GovernanceDiagnostics(
+                    invalid_invariants=["invalid_route_channel_policy_selected"],
+                    excluded_by_reason={"invalid_route_channel_policy": 1},
+                ),
+            ),
+            "legacy",
+        )
+        self.restore_legacy_route_marker(1)
+        before_row = self.conn.execute(
+            "SELECT excluded_json, diagnostics_json "
+            "FROM memory_governance_shadow_runs"
+        ).fetchone()
+        before_changes = self.conn.total_changes
+
+        snapshot = self.snapshot(
+            {"BNL_MEMORY_GOVERNANCE_SHADOW_ENABLED": "true"}
+        )
+        report = snapshot["reports"]["memoryGovernance"]
+
+        self.assertEqual(report["invalid_invariants"], {})
+        self.assertEqual(report["invalid_invariant_count"], 0)
+        self.assertEqual(report["invalid_invariant_runs"], 0)
+        self.assertEqual(
+            report["legacy_reclassified_exclusions"],
+            {"invalid_route_channel_policy_selected": 1},
+        )
+        self.assertEqual(report["legacy_reclassified_exclusion_count"], 1)
+        self.assertEqual(report["legacy_reclassified_exclusion_runs"], 1)
+        self.assertNotIn(
+            "memory_governance:invalid_invariants", snapshot["blockers"]
+        )
+        self.assertEqual(
+            snapshot["stages"]["memory_governance"]["status"],
+            "blocked_by_prerequisite",
+        )
+        self.assertIn(
+            "governance_legacy_safe_exclusions_reclassified",
+            snapshot["warnings"],
+        )
+        self.assertEqual(snapshot["status"], "collecting_shadow_evidence")
+        self.assertEqual(self.conn.total_changes, before_changes)
+        self.assertEqual(
+            self.conn.execute(
+                "SELECT excluded_json, diagnostics_json "
+                "FROM memory_governance_shadow_runs"
+            ).fetchone(),
+            before_row,
+        )
+
+        rendered = "\n".join(render_v2_shadow_acceptance_lines(snapshot))
+        self.assertIn("governance_invalid_invariants: `{}`", rendered)
+        self.assertIn(
+            'governance_legacy_reclassified_exclusions: `{"invalid_route_channel_policy_selected": 1}`',
+            rendered,
+        )
+
+    def test_unmatched_legacy_label_remains_a_hard_blocker(self):
+        persist_shadow_diagnostics(
+            self.conn,
+            GovernanceRequest(
+                guild_id=1,
+                subject_user_id=99,
+                route_mode="normal_chat",
+                conversation_surface="test",
+                channel_policy="public_home",
+            ),
+            GovernanceResult(
+                "",
+                (),
+                (),
+                GovernanceDiagnostics(
+                    invalid_invariants=[
+                        "invalid_route_channel_policy_selected",
+                        "invalid_route_channel_policy_selected",
+                    ],
+                    excluded_by_reason={"invalid_route_channel_policy": 1},
+                ),
+            ),
+            "legacy",
+        )
+        self.restore_legacy_route_marker(2)
+
+        snapshot = self.snapshot(
+            {"BNL_MEMORY_GOVERNANCE_SHADOW_ENABLED": "true"}
+        )
+        report = snapshot["reports"]["memoryGovernance"]
+        self.assertEqual(
+            report["legacy_reclassified_exclusions"],
+            {"invalid_route_channel_policy_selected": 1},
+        )
+        self.assertEqual(
+            report["invalid_invariants"],
+            {"invalid_route_channel_policy_selected": 1},
+        )
+        self.assertEqual(report["invalid_invariant_count"], 1)
+        self.assertIn("memory_governance:invalid_invariants", snapshot["blockers"])
+        self.assertEqual(snapshot["status"], "blocked_shadow_invariant_failure")
+
+    def test_true_governance_invariant_remains_a_hard_blocker(self):
+        persist_shadow_diagnostics(
+            self.conn,
+            GovernanceRequest(
+                guild_id=1,
+                subject_user_id=99,
+                route_mode="normal_chat",
+                conversation_surface="test",
+                channel_policy="public_home",
+            ),
+            GovernanceResult(
+                "",
+                (),
+                (),
+                GovernanceDiagnostics(
+                    invalid_invariants=[
+                        "cross_guild_selected",
+                        "future_unknown_selected",
+                    ]
+                ),
+            ),
+            "legacy",
+        )
+
+        snapshot = self.snapshot(
+            {"BNL_MEMORY_GOVERNANCE_SHADOW_ENABLED": "true"}
+        )
+        report = snapshot["reports"]["memoryGovernance"]
+        self.assertEqual(
+            report["invalid_invariants"],
+            {"cross_guild_selected": 1, "future_unknown_selected": 1},
+        )
+        self.assertEqual(report["invalid_invariant_count"], 2)
+        self.assertIn("memory_governance:invalid_invariants", snapshot["blockers"])
+        self.assertEqual(snapshot["status"], "blocked_shadow_invariant_failure")
 
     def test_governance_schema_migration_preserves_old_rows_and_accepts_new_aggregates(self):
         migrated = sqlite3.connect(":memory:")

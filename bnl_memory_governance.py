@@ -277,6 +277,9 @@ def build_governed_context(conn: sqlite3.Connection, req: GovernanceRequest, *, 
             source_policy = str(d.get("channel_policy") or "unknown").lower()
             restricted_policies = {"sealed_test", "protected_system", "internal_controlled", "reference_canon", "ai_image_tool"}
             if source_policy in restricted_policies and source_policy != str(req.channel_policy or "").lower():
+                # Keep the conservative runtime marker until live-governance
+                # behavior is reviewed separately. Persisted owner diagnostics
+                # reclassify the corroborated pre-selection exclusion below.
                 diag.invalid_invariants.append("invalid_route_channel_policy_selected")
                 exclude("invalid_route_channel_policy"); continue
             if source_route in {"operator_command", "internal_control", "protected_system"} and source_route != str(req.route_mode or "").lower():
@@ -370,6 +373,27 @@ def persist_shadow_diagnostics(conn: sqlite3.Connection, req: GovernanceRequest,
     for invariant in result.diagnostics.invalid_invariants:
         key = str(invariant or "unknown")[:120]
         invalid_invariant_counts[key] = invalid_invariant_counts.get(key, 0) + 1
+    # The runtime keeps this conservative marker because it participates in a
+    # dormant live-governance fallback. For reporting, a matching exclusion
+    # proves the candidate was rejected before selection, so do not persist it
+    # as a selected invariant. Any unmatched remainder still fails closed.
+    route_marker = "invalid_route_channel_policy_selected"
+    safe_route_exclusions = int(
+        result.diagnostics.excluded_by_reason.get(
+            "invalid_route_channel_policy", 0
+        )
+        or 0
+    )
+    matched = min(
+        int(invalid_invariant_counts.get(route_marker, 0) or 0),
+        safe_route_exclusions,
+    )
+    if matched:
+        remaining = int(invalid_invariant_counts[route_marker]) - matched
+        if remaining:
+            invalid_invariant_counts[route_marker] = remaining
+        else:
+            invalid_invariant_counts.pop(route_marker, None)
     aggregate_diagnostics = {
         "selected_by_source": dict(result.diagnostics.selected_by_source),
         "invalid_invariant_counts": invalid_invariant_counts,
@@ -419,11 +443,20 @@ def build_evaluation_report(results: List[GovernanceResult], guild_id: int) -> D
         report["empty_result_frequency"] += 1 if not r.rendered_context else 0
         report["processing_errors"] += len(r.diagnostics.processing_errors)
         report["legacy_vs_governed"].append(r.diagnostics.legacy_vs_governed)
+        route_policy_markers = 0
         for inv in r.diagnostics.invalid_invariants:
             if inv == "cross_subject_selected": report["cross_member_violations"] += 1
             if inv == "cross_guild_selected": report["cross_guild_violations"] += 1
             if inv == "visibility_selected": report["visibility_violations"] += 1
-            if inv == "invalid_route_channel_policy_selected": report["invalid_route_channel_policy_selections"] += 1
+            if inv == "invalid_route_channel_policy_selected": route_policy_markers += 1
+        # A route-policy mismatch is rejected before candidates reach the
+        # selected set. Reclassify only the count corroborated by matching safe
+        # exclusions; any unmatched remainder still fails closed.
+        report["invalid_route_channel_policy_selections"] += max(
+            0,
+            route_policy_markers
+            - int(r.diagnostics.excluded_by_reason.get("invalid_route_channel_policy", 0) or 0),
+        )
     if report["processing_errors"] or report["visibility_violations"] or report["cross_member_violations"] or report["cross_guild_violations"] or report["invalid_route_channel_policy_selections"]:
         report["rollback_readiness"] = "fallback_required_before_live"
     return report

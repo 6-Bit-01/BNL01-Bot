@@ -166,6 +166,21 @@ failures by themselves. Governance live must remain off, so the legacy result
 continues to be the actual production result while shadow candidates are
 measured.
 
+Retained v1 rows may contain `invalid_route_channel_policy_selected`. The v1
+writer emitted that label when a mismatched route or restricted channel-policy
+candidate was safely excluded *before* selection. The v2 acceptance reader
+preserves a historical count under `legacy_reclassified_exclusions` only when
+the same retained run contains a matching `invalid_route_channel_policy`
+exclusion. It shows a review warning but does not treat that corroborated count
+as a selected-invariant failure. An unmatched count, any remainder, and every
+other invalid-invariant label continue to fail closed as hard stops. No retained
+row is rewritten or deleted.
+
+New shadow rows omit the corroborated count from persisted selected-invariant
+diagnostics while preserving the `invalid_route_channel_policy` exclusion.
+The conservative in-process runtime marker and live-governance fallback remain
+unchanged; revising that dormant behavior requires a separate reviewed change.
+
 ### Relationship evidence
 
 Review at least:

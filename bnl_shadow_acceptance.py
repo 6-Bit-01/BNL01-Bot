@@ -18,13 +18,20 @@ from bnl_moment_engine import build_moment_evaluation_report
 from bnl_relationship_engine import build_evaluation_report as build_relationship_evaluation_report
 
 
-SHADOW_ACCEPTANCE_VERSION = "v2_shadow_acceptance_v1"
+SHADOW_ACCEPTANCE_VERSION = "v2_shadow_acceptance_v2"
 SHADOW_EVALUATION_ORDER = (
     "memory_ledger",
     "moment_engine",
     "memory_governance",
     "relationship_v2",
 )
+
+# Older Governance writers used this selected-invariant label when a candidate
+# was safely rejected before selection. Keep the retained evidence visible, but
+# do not let that known historical classification create a false hard blocker.
+LEGACY_RECLASSIFIED_SAFE_EXCLUSIONS = {
+    "invalid_route_channel_policy_selected": "invalid_route_channel_policy",
+}
 
 
 def _flag_enabled(environ: Mapping[str, str], name: str, default: str = "") -> bool:
@@ -232,6 +239,30 @@ def _invariant_counts(value: Any) -> Dict[str, int]:
     return {}
 
 
+def _partition_legacy_preselection_labels(
+    invariants: Mapping[str, int],
+    exclusions: Mapping[str, int],
+) -> tuple[Dict[str, int], Dict[str, int]]:
+    """Reclassify only labels corroborated by a same-run safe exclusion."""
+
+    active = dict(invariants)
+    reclassified: Dict[str, int] = {}
+    for marker, exclusion_reason in LEGACY_RECLASSIFIED_SAFE_EXCLUSIONS.items():
+        matched = min(
+            int(active.get(marker, 0) or 0),
+            int(exclusions.get(exclusion_reason, 0) or 0),
+        )
+        if not matched:
+            continue
+        reclassified[marker] = matched
+        remaining = int(active[marker]) - matched
+        if remaining:
+            active[marker] = remaining
+        else:
+            active.pop(marker, None)
+    return active, reclassified
+
+
 def _aggregate_count(value: Any) -> int:
     """Parse a persisted aggregate count or fail the diagnostic closed."""
 
@@ -256,6 +287,9 @@ def _empty_governance_report() -> Dict[str, Any]:
         "invalid_invariants": {},
         "invalid_invariant_count": 0,
         "invalid_invariant_runs": 0,
+        "legacy_reclassified_exclusions": {},
+        "legacy_reclassified_exclusion_count": 0,
+        "legacy_reclassified_exclusion_runs": 0,
         "fallback_reasons": {},
         "visibility_exclusions": 0,
         "token_budget_exclusions": 0,
@@ -298,9 +332,10 @@ def build_persisted_governance_report(
     exclusions: Counter[str] = Counter()
     selected_sources: Counter[str] = Counter()
     invalid_invariants: Counter[str] = Counter()
+    legacy_reclassified_exclusions: Counter[str] = Counter()
     fallback_reasons: Counter[str] = Counter()
     selected_total = processing_errors = same_hash = 0
-    invalid_runs = aggregate_runs = visibility = budget = duplicates = contradictions = 0
+    invalid_runs = legacy_reclassified_runs = aggregate_runs = visibility = budget = duplicates = contradictions = 0
     moment_candidates = moment_review = 0
 
     zero_selection_runs = 0
@@ -322,7 +357,8 @@ def build_persisted_governance_report(
             selected_count = _aggregate_count(selected)
             selected_total += selected_count
             zero_selection_runs += int(selected_count == 0)
-            exclusions.update(_count_mapping(excluded))
+            row_exclusions = _count_mapping(excluded)
+            exclusions.update(row_exclusions)
             processing_errors += _error_count(errors)
             same_hash += int(bool(rendered_hash and legacy_hash and rendered_hash == legacy_hash))
             diag = _json_value(diagnostics[0], {}) if diagnostics else {}
@@ -333,8 +369,16 @@ def build_persisted_governance_report(
             row_invariants = _invariant_counts(
                 diag.get("invalid_invariant_counts", diag.get("invalid_invariants"))
             )
-            invalid_invariants.update(row_invariants)
-            invalid_runs += int(bool(row_invariants))
+            row_actual_invariants, row_reclassified = (
+                _partition_legacy_preselection_labels(
+                    row_invariants,
+                    row_exclusions,
+                )
+            )
+            legacy_reclassified_exclusions.update(row_reclassified)
+            legacy_reclassified_runs += int(bool(row_reclassified))
+            invalid_invariants.update(row_actual_invariants)
+            invalid_runs += int(bool(row_actual_invariants))
             fallback = str(diag.get("fallback_reason") or "none")
             fallback_reasons[fallback] += 1
             visibility += _aggregate_count(diag.get("visibility_exclusions"))
@@ -374,6 +418,13 @@ def build_persisted_governance_report(
         "invalid_invariants": dict(sorted(invalid_invariants.items())),
         "invalid_invariant_count": sum(invalid_invariants.values()),
         "invalid_invariant_runs": invalid_runs,
+        "legacy_reclassified_exclusions": dict(
+            sorted(legacy_reclassified_exclusions.items())
+        ),
+        "legacy_reclassified_exclusion_count": sum(
+            legacy_reclassified_exclusions.values()
+        ),
+        "legacy_reclassified_exclusion_runs": legacy_reclassified_runs,
         "fallback_reasons": dict(sorted(fallback_reasons.items())),
         "visibility_exclusions": visibility,
         "token_budget_exclusions": budget,
@@ -693,6 +744,8 @@ def build_v2_shadow_acceptance_snapshot(
         governance.get("runs", 0) or 0
     ):
         warnings.append("governance_older_rows_lack_aggregate_diagnostics")
+    if int(governance.get("legacy_reclassified_exclusion_count", 0) or 0):
+        warnings.append("governance_legacy_safe_exclusions_reclassified")
 
     stage_statuses = [stage["status"] for stage in stages.values()]
     if live_gates:
@@ -813,6 +866,8 @@ def render_v2_shadow_acceptance_lines(snapshot: Mapping[str, Any]) -> List[str]:
             governance.get("invalid_invariant_count", 0),
             (governance.get("evidenceWindow") or {}).get("last", "none"),
         ),
+        "- governance_invalid_invariants: `%s`" % json.dumps(governance.get("invalid_invariants", {}), sort_keys=True),
+        "- governance_legacy_reclassified_exclusions: `%s`" % json.dumps(governance.get("legacy_reclassified_exclusions", {}), sort_keys=True),
         "- governance_exclusions: `%s`" % json.dumps(governance.get("excluded_by_reason", {}), sort_keys=True),
         "- relationship: status=`%s` shadow=`%s` relationship_live=`%s` engagement_live=`%s` events=`%s` rejected_observations=`%s` plans=`%s` would_select=`%s` live_allowed=`%s` actual_emissions=`%s` errors=`%s` window_last=`%s`" % (
             (stages.get("relationship_v2") or {}).get("status", "unknown"),
