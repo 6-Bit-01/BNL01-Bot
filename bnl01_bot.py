@@ -12946,20 +12946,15 @@ def extract_user_facts(text: str):
         or re.search(r"\bremember\b[^.!?\n]{0,80}\?", lower, flags=re.IGNORECASE)
     )
 
-    remembered_number = None
+    remembered_number = REMEMBERED_NUMBER_INSTRUCTION_RE.search(content)
     directive_note = None
     directive_patterns = (
         r"\b(?:please\s+)?remember\s+(?:this\s*:|that\s+)([^.!?\n]{3,140})",
         r"\b(?:please\s+)?remember\s+((?:my|i\s+prefer|i\s+like|i\s+want|i\s+need|i\s+am|i'm|[0-9])[^.!?\n]{2,140})",
     )
+    if remembered_number:
+        facts.append(("remembered_number", remembered_number.group(1), 0.9))
     if not interrogative_remember:
-        remembered_number = re.search(
-            r"\b(?:please\s+)?remember\s+(?:(?:that\s+)?(?:(?:this|the)\s+)?number\s*(?::|-|is)?|this\s*:)\s*(\d{1,12})(?!\d)\b",
-            content,
-            flags=re.IGNORECASE,
-        )
-        if remembered_number:
-            facts.append(("remembered_number", remembered_number.group(1), 0.9))
         for pattern in directive_patterns:
             m = re.search(pattern, content, flags=re.IGNORECASE)
             if m:
@@ -13695,14 +13690,22 @@ def _conversation_continuity_user_lines(context: str) -> list[str]:
     return [line.strip() for line in (context or "").splitlines() if re.match(r"(?i)^User/member(?:\s*\([^)]*\))?:", line.strip())]
 
 
-REMEMBERED_NUMBER_INSTRUCTION_RE = re.compile(r"(?i)\bremember\s+(?:this\s+)?number\s*[:\-]?\s*(\d{1,12})\b")
+REMEMBERED_NUMBER_INSTRUCTION_RE = re.compile(
+    r"(?i)(?:^|\s/\s)\s*(?:[,;:\-]\s*)?"
+    r"(?:(?:hey\s*,?\s+)?bnl(?:-01)?\b(?:\s*[,;:\-]\s*|\s+))?"
+    r"(?:please\s+)?remember\s+"
+    r"(?:(?:(?:that\s+(?:the\s+)?|(?:this|the)\s+)?number)\s*(?::|-|is)?\s*|this\s*:\s*)?"
+    r"(\d{1,12})(?!\d)(?:\s*(?:,\s*)?(?:please|for\s+(?:me|later)))?"
+    r"(?=\s*[.!]?(?:\s*/\s|\s*$))"
+)
 
 
 def resolve_latest_remembered_number_from_conversation_context(prompt_or_context: str) -> str:
     context = _extract_conversation_continuity_context(prompt_or_context) or (prompt_or_context or "")
     latest = ""
     for line in _conversation_continuity_user_lines(context):
-        match = REMEMBERED_NUMBER_INSTRUCTION_RE.search(line)
+        user_text = re.sub(r"(?i)^User/member(?:\s*\([^)]*\))?:\s*", "", line)
+        match = REMEMBERED_NUMBER_INSTRUCTION_RE.search(user_text)
         if match:
             latest = match.group(1)
     return latest
@@ -15767,7 +15770,7 @@ def _detect_request_intent(text: str):
     if "?" in t:
         return True, "question_mark"
     patterns = [
-        r"^\s*(?:please\s+)?remember\b", r"\btell me\b", r"\bmake me\b", r"\bwrite\b", r"\bdraft\b",
+        r"(?:^|\s/\s)\s*(?:please\s+)?remember\b", r"\btell me\b", r"\bmake me\b", r"\bwrite\b", r"\bdraft\b",
         r"\bgive me\b", r"\bexplain\b", r"\bhelp\b", r"\bfix\b", r"\bsummarize\b",
         r"\bmake a joke\b", r"\btell me a joke\b", r"\babout each\b", r"\bfor each\b",
         r"\bcan you\b", r"\bcould you\b", r"\bplease\b", r"\bshow me\b",

@@ -860,7 +860,7 @@ class RegressionExamplesTests(unittest.TestCase):
         text = "remember this number: 8"
         self.assertEqual(
             bnl01_bot._detect_request_intent(text),
-            (True, r"^\s*(?:please\s+)?remember\b"),
+            (True, r"(?:^|\s/\s)\s*(?:please\s+)?remember\b"),
         )
         packet = bnl01_bot._build_active_response_packet(
             123,
@@ -872,7 +872,7 @@ class RegressionExamplesTests(unittest.TestCase):
         self.assertEqual(packet["decision"], "answer")
         self.assertEqual(
             packet["reason"],
-            r"request_intent:^\s*(?:please\s+)?remember\b",
+            r"request_intent:(?:^|\s/\s)\s*(?:please\s+)?remember\b",
         )
 
     def test_remember_directive_variants_route_without_matching_declarative_chatter(self):
@@ -891,6 +891,109 @@ class RegressionExamplesTests(unittest.TestCase):
             bnl01_bot._detect_request_intent("I remember this song from Ohio."),
             (False, "none"),
         )
+
+    def test_remember_directive_in_second_collapsed_fragment_is_answered(self):
+        text = "okay / remember this number: 8"
+        self.assertTrue(bnl01_bot._detect_request_intent(text)[0])
+        collapsed = bnl01_bot._collapse_consecutive_batch_fragments(
+            [("6 Bit", "okay", 101), ("6 Bit", "remember this number: 8", 101)]
+        )
+        self.assertEqual(collapsed[0][1], text)
+        self.assertEqual(
+            bnl01_bot._classify_batch_engagement(collapsed)[0],
+            "answer",
+        )
+
+    def test_bare_remember_number_is_backed_by_fact_and_context_extractors(self):
+        self.assertIn(
+            ("remembered_number", "8", 0.9),
+            bnl01_bot.extract_user_facts("remember 8"),
+        )
+        context = (
+            "Conversation continuity (bounded; continuity-only, not canon/current-state evidence):\n"
+            "User/member: remember 8\n"
+            "Room-first context rules:\n"
+        )
+        self.assertEqual(
+            bnl01_bot.resolve_latest_remembered_number_from_conversation_context(context),
+            "8",
+        )
+
+    def test_bare_remember_number_extractors_reject_declarative_and_interrogative_uses(self):
+        for text in (
+            "I remember 8 people",
+            "I do not remember 8",
+            "do you remember 8",
+            "do you remember 8?",
+            "remember 8?",
+        ):
+            self.assertNotIn("remembered_number", {fact[0] for fact in bnl01_bot.extract_user_facts(text)}, text)
+            context = (
+                "Conversation continuity (bounded; continuity-only, not canon/current-state evidence):\n"
+                f"User/member: {text}\n"
+                "Room-first context rules:\n"
+            )
+            self.assertEqual(
+                bnl01_bot.resolve_latest_remembered_number_from_conversation_context(context),
+                "",
+                text,
+            )
+
+    def test_bare_remember_number_extractors_accept_supported_batch_fragment(self):
+        for text in (
+            "what's up? / remember 8",
+            "remember 8 / what's up?",
+            "BNL, remember this number: 8",
+            "BNL remember 8",
+            "hey BNL, please remember the number 8",
+            "Hey, BNL, remember 8",
+            "remember this number: 8, please",
+            "remember 8 for me",
+        ):
+            self.assertIn(
+                ("remembered_number", "8", 0.9),
+                bnl01_bot.extract_user_facts(text),
+                text,
+            )
+            context = (
+                "Conversation continuity (bounded; continuity-only, not canon/current-state evidence):\n"
+                f"User/member: {text}\n"
+                "Room-first context rules:\n"
+            )
+            self.assertEqual(
+                bnl01_bot.resolve_latest_remembered_number_from_conversation_context(context),
+                "8",
+                text,
+            )
+
+    def test_removed_bot_mention_punctuation_keeps_remember_directive_extractable(self):
+        bot = SimpleNamespace(id=999, display_name="BNL-01")
+        message = SimpleNamespace(
+            content="<@999>, remember this number: 8",
+            mentions=[bot],
+            raw_mentions=[999],
+            guild=SimpleNamespace(get_member=lambda user_id: bot if user_id == 999 else None),
+            role_mentions=[],
+            channel_mentions=[],
+        )
+        resolved = bnl01_bot.resolve_discord_user_mentions_for_conversation(
+            message,
+            message.content,
+            bot_user_id=999,
+            remove_bot_mention=True,
+        )
+        self.assertEqual(resolved, ", remember this number: 8")
+        self.assertIn(("remembered_number", "8", 0.9), bnl01_bot.extract_user_facts(resolved))
+
+    def test_concatenated_bnl_prefixes_are_not_remember_directives(self):
+        for text in ("bnlremember 8", "bnlplease remember 8", "hey BNLremember 8"):
+            self.assertNotIn("remembered_number", {fact[0] for fact in bnl01_bot.extract_user_facts(text)}, text)
+            context = (
+                "Conversation continuity (bounded; continuity-only, not canon/current-state evidence):\n"
+                f"User/member: {text}\n"
+                "Room-first context rules:\n"
+            )
+            self.assertEqual(bnl01_bot.resolve_latest_remembered_number_from_conversation_context(context), "", text)
 
     def test_lardcode_prompt_not_subject_candidate(self):
         text = "I had to go to another dimension on Friday where they have Lardcode radio. It's like Barcode but all songs are about baking. Is Barcode back this week?"
