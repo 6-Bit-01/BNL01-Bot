@@ -414,7 +414,7 @@ class BotJournalCommandTests(unittest.IsolatedAsyncioTestCase):
             packet = j.build_source_packet(bnl01_bot.DB_FILE, 1, 24, '2026-07-18T01:00:00Z')
             response = Mock(candidates=[Mock(content=Mock(parts=[Mock(text=article_json(packet))]))], usage_metadata=Mock(total_token_count=None))
             msg = Mock(); msg.guild = Mock(id=1, get_member=Mock(return_value=Mock())); msg.author = Mock(id=1); msg.channel = Mock(name='research-and-development'); msg.reply = AsyncMock()
-            with patch.object(bnl01_bot, 'resolve_channel_policy', return_value='internal_controlled'), patch.object(bnl01_bot, 'can_send_dossier_recommendation', return_value=True), patch.object(bnl01_bot, 'check_quota_availability', return_value=True), patch.object(bnl01_bot, '_generate_gemini_content_with_fallback', return_value=response):
+            with patch.object(j, 'utc_now_iso', return_value='2026-07-18T01:00:00Z'), patch.object(bnl01_bot, 'resolve_channel_policy', return_value='internal_controlled'), patch.object(bnl01_bot, 'can_send_dossier_recommendation', return_value=True), patch.object(bnl01_bot, 'check_quota_availability', return_value=True), patch.object(bnl01_bot, '_generate_gemini_content_with_fallback', return_value=response):
                 handled = await bnl01_bot.maybe_handle_journal_command(msg, '!bnl journal create | hours=bad')
             self.assertTrue(handled)
             with sqlite3.connect(bnl01_bot.DB_FILE) as c:
