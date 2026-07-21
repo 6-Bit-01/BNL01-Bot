@@ -243,7 +243,7 @@ def _partition_legacy_preselection_labels(
     invariants: Mapping[str, int],
     exclusions: Mapping[str, int],
 ) -> tuple[Dict[str, int], Dict[str, int]]:
-    """Reclassify only labels corroborated by a same-run safe exclusion."""
+    """Reclassify corroborated legacy labels exactly once at report time."""
 
     active = dict(invariants)
     reclassified: Dict[str, int] = {}

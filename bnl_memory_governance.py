@@ -278,8 +278,8 @@ def build_governed_context(conn: sqlite3.Connection, req: GovernanceRequest, *, 
             restricted_policies = {"sealed_test", "protected_system", "internal_controlled", "reference_canon", "ai_image_tool"}
             if source_policy in restricted_policies and source_policy != str(req.channel_policy or "").lower():
                 # Keep the conservative runtime marker until live-governance
-                # behavior is reviewed separately. Persisted owner diagnostics
-                # reclassify the corroborated pre-selection exclusion below.
+                # behavior is reviewed separately. The acceptance reader
+                # reclassifies a corroborated pre-selection exclusion once.
                 diag.invalid_invariants.append("invalid_route_channel_policy_selected")
                 exclude("invalid_route_channel_policy"); continue
             if source_route in {"operator_command", "internal_control", "protected_system"} and source_route != str(req.route_mode or "").lower():
@@ -373,27 +373,10 @@ def persist_shadow_diagnostics(conn: sqlite3.Connection, req: GovernanceRequest,
     for invariant in result.diagnostics.invalid_invariants:
         key = str(invariant or "unknown")[:120]
         invalid_invariant_counts[key] = invalid_invariant_counts.get(key, 0) + 1
-    # The runtime keeps this conservative marker because it participates in a
-    # dormant live-governance fallback. For reporting, a matching exclusion
-    # proves the candidate was rejected before selection, so do not persist it
-    # as a selected invariant. Any unmatched remainder still fails closed.
-    route_marker = "invalid_route_channel_policy_selected"
-    safe_route_exclusions = int(
-        result.diagnostics.excluded_by_reason.get(
-            "invalid_route_channel_policy", 0
-        )
-        or 0
-    )
-    matched = min(
-        int(invalid_invariant_counts.get(route_marker, 0) or 0),
-        safe_route_exclusions,
-    )
-    if matched:
-        remaining = int(invalid_invariant_counts[route_marker]) - matched
-        if remaining:
-            invalid_invariant_counts[route_marker] = remaining
-        else:
-            invalid_invariant_counts.pop(route_marker, None)
+    # Persist the raw aggregate counts. The acceptance reader owns the one
+    # compatibility reclassification pass for the historical route-policy
+    # marker. Keeping that operation in one layer preserves any unmatched
+    # remainder as a fail-closed blocker.
     aggregate_diagnostics = {
         "selected_by_source": dict(result.diagnostics.selected_by_source),
         "invalid_invariant_counts": invalid_invariant_counts,
