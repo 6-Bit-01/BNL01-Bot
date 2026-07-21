@@ -856,6 +856,42 @@ class LeakGuardTests(unittest.TestCase):
 
 
 class RegressionExamplesTests(unittest.TestCase):
+    def test_singular_remember_directive_is_answered_in_batched_sealed_test(self):
+        text = "remember this number: 8"
+        self.assertEqual(
+            bnl01_bot._detect_request_intent(text),
+            (True, r"^\s*(?:please\s+)?remember\b"),
+        )
+        packet = bnl01_bot._build_active_response_packet(
+            123,
+            [("6 Bit", text, 101)],
+            pending_state=False,
+            guild_id=1,
+            channel_policy="sealed_test",
+        )
+        self.assertEqual(packet["decision"], "answer")
+        self.assertEqual(
+            packet["reason"],
+            r"request_intent:^\s*(?:please\s+)?remember\b",
+        )
+
+    def test_remember_directive_variants_route_without_matching_declarative_chatter(self):
+        for text in (
+            "remember these names",
+            "please remember that number: 8",
+            "remember 8",
+        ):
+            with self.subTest(text=text):
+                self.assertTrue(bnl01_bot._detect_request_intent(text)[0])
+                self.assertEqual(
+                    bnl01_bot._classify_batch_engagement([("6 Bit", text, 101)])[0],
+                    "answer",
+                )
+        self.assertEqual(
+            bnl01_bot._detect_request_intent("I remember this song from Ohio."),
+            (False, "none"),
+        )
+
     def test_lardcode_prompt_not_subject_candidate(self):
         text = "I had to go to another dimension on Friday where they have Lardcode radio. It's like Barcode but all songs are about baking. Is Barcode back this week?"
         self.assertFalse(bnl01_bot.is_valid_subject_candidate_for_memory_or_scouting(text, bnl01_bot.ROUTE_MODE_NORMAL_CHAT, "public_context"))
