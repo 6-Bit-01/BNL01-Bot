@@ -218,6 +218,197 @@ class SourceFileEnrichmentTests(unittest.TestCase):
         self.assertEqual(dossier["matchKind"], "existing_dossier_update")
         self.assertIn("Existing Dossier Update", enrich.format_source_enrichment_response(dossier))
 
+    def _public_dossier_only_lookup(self):
+        return {
+            "ok": True,
+            "found": True,
+            "matchKind": "public_dossier_only",
+            "data": {
+                "matchKind": "public_dossier_only",
+                "workflowLane": "public_dossier_update_target",
+                "recommendedAction": "create_existing_dossier_update",
+                "targetDossierId": "EN-004",
+                "publicDossierName": "DJ Floppydisc",
+                "sourceFile": None,
+            },
+        }
+
+    def test_public_dossier_only_is_nonattachable_and_dry_run_does_not_create(self):
+        lookup = self._public_dossier_only_lookup()
+        match_kind, _note, source_file = enrich.classify_source_match(lookup)
+        self.assertEqual(match_kind, "public_dossier_only")
+        self.assertEqual(source_file, {})
+        creator = mock.Mock()
+        result = enrich.run_source_file_enrichment(
+            self.db,
+            1,
+            "DJ Floppydisc",
+            dry_run=True,
+            lookup_func=lambda query: lookup,
+            workspace_creator=creator,
+        )
+        creator.assert_not_called()
+        self.assertEqual(result["status"], "target_setup_required")
+        self.assertFalse(result["sent"])
+        response = enrich.format_source_enrichment_response(result)
+        self.assertIn("would create that internal review-only target", response)
+        self.assertIn("No notes were sent", response)
+        self.assertNotIn("Would send as BNL Source File Enrichment: yes", response)
+
+    def test_malformed_public_dossier_only_contract_fails_closed_without_mutation(self):
+        lookup = self._public_dossier_only_lookup()
+        del lookup["data"]["recommendedAction"]
+        creator = mock.Mock()
+        compact_sender = mock.Mock()
+        archive_sender = mock.Mock()
+
+        match_kind, _note, source_file = enrich.classify_source_match(lookup)
+        self.assertEqual(match_kind, "public_dossier_only")
+        self.assertEqual(source_file, {})
+        result = enrich.run_source_file_enrichment(
+            self.db,
+            1,
+            "DJ Floppydisc",
+            lookup_func=lambda query: lookup,
+            workspace_creator=creator,
+            sender=compact_sender,
+            archive_sender=archive_sender,
+        )
+
+        self.assertEqual(result["status"], "target_setup_failed")
+        self.assertIn("contract_not_confirmed", result["sendResult"]["error"])
+        creator.assert_not_called()
+        compact_sender.assert_not_called()
+        archive_sender.assert_not_called()
+
+        dry_run = enrich.run_source_file_enrichment(
+            self.db,
+            1,
+            "DJ Floppydisc",
+            dry_run=True,
+            lookup_func=lambda query: lookup,
+            workspace_creator=creator,
+        )
+        self.assertEqual(dry_run["status"], "target_setup_failed")
+        self.assertNotIn("would create", enrich.format_source_enrichment_response(dry_run).lower())
+        creator.assert_not_called()
+
+    def test_public_dossier_only_creates_exact_internal_target_then_sends_by_candidate_id(self):
+        self.conn.execute("INSERT INTO broadcast_memory VALUES (NULL,1,'2026-07-17','DJ Floppydisc appeared in a public-safe BARCODE Radio note.','show_note',1,'ambient,direct','active','now')")
+        self.conn.commit()
+        lookups = []
+
+        def lookup(query):
+            lookups.append(query)
+            if query["lookupKey"] == "subject":
+                return self._public_dossier_only_lookup()
+            return {
+                "ok": True,
+                "found": True,
+                "matchKind": "existing_dossier_update_name",
+                "data": {
+                    "workflowLane": "existing_dossier_update",
+                    "sourceFile": {
+                        "candidateId": "cand_dj",
+                        "id": "cand_dj",
+                        "name": "DJ Floppydisc",
+                        "status": "existing_dossier_update",
+                    },
+                },
+            }
+
+        compact_calls = []
+        archive_calls = []
+        result = enrich.run_source_file_enrichment(
+            self.db,
+            1,
+            "DJ Floppydisc",
+            dry_run=False,
+            force=True,
+            lookup_func=lookup,
+            workspace_creator=lambda lookup_result, subject, environ: {"ok": True, "candidateId": "cand_dj", "targetDossierId": "EN-004"},
+            sender=lambda payload: compact_calls.append(payload) or {"ok": True, "recommendationId": "rec_dj"},
+            archive_sender=lambda payload: archive_calls.append(payload) or {"ok": True, "archiveId": "arc_dj", "status": 200},
+            environ={"BNL_DOSSIER_INGEST_TOKEN": "ingest"},
+        )
+        self.assertTrue(result["sent"])
+        self.assertEqual([query["lookupKey"] for query in lookups], ["subject", "candidateId"])
+        self.assertEqual(lookups[-1]["lookupValue"], "cand_dj")
+        self.assertEqual(archive_calls[0]["candidateId"], "cand_dj")
+        self.assertEqual(compact_calls[0]["targetCandidateId"], "cand_dj")
+
+    def test_public_dossier_only_creation_or_canonical_lookup_failure_sends_nothing(self):
+        compact_calls = []
+        archive_calls = []
+        failed = enrich.run_source_file_enrichment(
+            self.db,
+            1,
+            "DJ Floppydisc",
+            lookup_func=lambda query: self._public_dossier_only_lookup(),
+            workspace_creator=lambda lookup_result, subject, environ: {"ok": False, "error": "source_file_target_setup_http_500"},
+            sender=lambda payload: compact_calls.append(payload) or {"ok": True},
+            archive_sender=lambda payload: archive_calls.append(payload) or {"ok": True},
+        )
+        self.assertEqual(failed["status"], "target_setup_failed")
+
+        def mismatched_lookup(query):
+            if query["lookupKey"] == "subject":
+                return self._public_dossier_only_lookup()
+            return {"ok": True, "found": True, "matchKind": "existing_dossier_update_name", "data": {"sourceFile": {"candidateId": "wrong", "name": "DJ Floppydisc", "status": "existing_dossier_update"}}}
+
+        mismatched = enrich.run_source_file_enrichment(
+            self.db,
+            1,
+            "DJ Floppydisc",
+            lookup_func=mismatched_lookup,
+            workspace_creator=lambda lookup_result, subject, environ: {"ok": True, "candidateId": "cand_dj"},
+            sender=lambda payload: compact_calls.append(payload) or {"ok": True},
+            archive_sender=lambda payload: archive_calls.append(payload) or {"ok": True},
+        )
+        self.assertEqual(mismatched["status"], "target_setup_lookup_failed")
+        self.assertEqual(compact_calls, [])
+        self.assertEqual(archive_calls, [])
+
+    def test_protected_target_creator_validates_internal_only_contract(self):
+        payload = {
+            "ok": True,
+            "mutation": "internal_workflow_only",
+            "publishesPublicDossier": False,
+            "publicDossierMutated": False,
+            "workflowLane": "existing_dossier_update",
+            "sourceFileActive": False,
+            "existingDossierUpdateLane": True,
+            "targetDossierId": "EN-004",
+            "candidate": {"id": "cand_dj", "status": "existing_dossier_update", "existingDossierMatch": {"id": "EN-004"}},
+        }
+        response = mock.MagicMock()
+        response.status = 200
+        response.read.return_value = json.dumps(payload).encode("utf-8")
+        response.__enter__.return_value = response
+        opener = mock.Mock()
+        opener.open.return_value = response
+        result = enrich.create_existing_dossier_update_target(
+            self._public_dossier_only_lookup(),
+            "DJ Floppydisc",
+            {"BNL_SOURCE_FILE_READ_TOKEN": "read", "BNL_SOURCE_FILE_READ_URL": "https://site.test/api/bnl/source-files?ignored=1"},
+            opener=opener,
+        )
+        self.assertEqual(result["candidateId"], "cand_dj")
+        request = opener.open.call_args.args[0]
+        self.assertEqual(request.full_url, "https://site.test/api/bnl/source-files")
+        self.assertEqual(json.loads(request.data), {"action": "create_existing_dossier_update", "targetDossierId": "EN-004", "requestedSubject": "DJ Floppydisc"})
+
+        payload["publicDossierMutated"] = True
+        response.read.return_value = json.dumps(payload).encode("utf-8")
+        rejected = enrich.create_existing_dossier_update_target(
+            self._public_dossier_only_lookup(),
+            "DJ Floppydisc",
+            {"BNL_SOURCE_FILE_READ_TOKEN": "read", "BNL_SOURCE_FILE_READ_URL": "https://site.test/api/bnl/source-files"},
+            opener=opener,
+        )
+        self.assertFalse(rejected["ok"])
+        self.assertEqual(rejected["error"], "source_file_target_setup_invalid_response")
+
     def test_no_match_returns_bounded_no_target_response(self):
         result = enrich.run_source_file_enrichment(self.db, 1, "Unknown", dry_run=True, lookup_func=lambda query: {"ok": True, "found": False, "data": {}})
         response = enrich.format_source_enrichment_response(result)
