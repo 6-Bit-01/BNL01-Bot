@@ -1,4 +1,4 @@
-import os, sqlite3, sys, inspect, hashlib, unittest
+import json, os, sqlite3, sys, inspect, hashlib, unittest
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -415,11 +415,50 @@ def _case_route_policy_violations_and_shadow_retention_are_real():
     c.execute("UPDATE memory_ledger_entries SET channel_policy='sealed_test' WHERE entry_id='sealed'"); c.commit()
     r = build_governed_context(c, req(user_text='remember synths', channel_policy='public_home'))
     assert r.rendered_context == '' and 'invalid_route_channel_policy' in r.diagnostics.excluded_by_reason
+    # The conservative runtime marker remains until the live-governance path
+    # is reviewed separately; this PR changes only persisted owner reporting.
+    assert r.diagnostics.invalid_invariants == ['invalid_route_channel_policy_selected']
     report = build_evaluation_report([r], guild_id=1)
-    assert report['invalid_route_channel_policy_selections'] >= 1
-    for i in range(505):
+    assert report['invalid_route_channel_policy_selections'] == 0
+    assert report['rollback_readiness'] == 'ready_env_disable_live'
+    unmatched = GovernanceResult(
+        '',
+        (),
+        (),
+        GovernanceDiagnostics(
+            invalid_invariants=['invalid_route_channel_policy_selected'],
+        ),
+    )
+    unmatched_report = build_evaluation_report([unmatched], guild_id=1)
+    assert unmatched_report['invalid_route_channel_policy_selections'] == 1
+    assert unmatched_report['rollback_readiness'] == 'fallback_required_before_live'
+    persist_shadow_diagnostics(c, req(), r, 'legacy')
+    saved_exclusions, saved_diagnostics = c.execute("SELECT excluded_json, diagnostics_json FROM memory_governance_shadow_runs ORDER BY created_at DESC LIMIT 1").fetchone()
+    assert json.loads(saved_exclusions) == {'invalid_route_channel_policy': 1}
+    assert json.loads(saved_diagnostics)['invalid_invariant_counts'] == {}
+    for i in range(504):
         persist_shadow_diagnostics(c, req(), r, 'legacy')
     assert c.execute("SELECT COUNT(*) FROM memory_governance_shadow_runs WHERE guild_id=1").fetchone()[0] <= 500
+
+    insert(c, eid='public', value='public modular synths preference', pred='preference')
+    mixed = build_governed_context(c, req(user_text='remember synths', channel_policy='public_home'))
+    assert [candidate.entry_id for candidate in mixed.selected] == ['public']
+    assert mixed.diagnostics.excluded_by_reason['invalid_route_channel_policy'] == 1
+    assert mixed.diagnostics.invalid_invariants == ['invalid_route_channel_policy_selected']
+
+    insert(c, eid='operator', value='operator modular synths preference', pred='preference')
+    c.execute("UPDATE memory_ledger_entries SET route_mode='operator_command' WHERE entry_id='operator'"); c.commit()
+    route_mismatch = build_governed_context(c, req(user_text='operator modular synths', channel_policy='public_home'))
+    assert 'operator modular synths preference' not in route_mismatch.rendered_context
+    assert route_mismatch.diagnostics.excluded_by_reason['invalid_route_channel_policy'] == 2
+    assert route_mismatch.diagnostics.invalid_invariants == [
+        'invalid_route_channel_policy_selected',
+        'invalid_route_channel_policy_selected',
+    ]
+    persist_shadow_diagnostics(c, req(user_text='operator modular synths'), route_mismatch, 'legacy')
+    route_exclusions, route_diagnostics = c.execute("SELECT excluded_json, diagnostics_json FROM memory_governance_shadow_runs ORDER BY created_at DESC, run_id DESC LIMIT 1").fetchone()
+    assert json.loads(route_exclusions)['invalid_route_channel_policy'] == 2
+    assert json.loads(route_diagnostics)['invalid_invariant_counts'] == {}
 
 
 class MemoryGovernanceV1Tests(unittest.TestCase):
