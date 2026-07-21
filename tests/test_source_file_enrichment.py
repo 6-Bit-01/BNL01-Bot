@@ -148,6 +148,61 @@ class SourceFileEnrichmentTests(unittest.TestCase):
         self.assertEqual(result["status"], "dry_run")
         self.assertEqual(result["resolutionMode"], "candidateId")
         self.assertEqual(result["subject"], "HellcatNZ")
+        self.assertEqual(result["matchKind"], "active_source_file")
+
+    def test_candidate_id_lookup_uses_record_workflow_lane(self):
+        for workflow_lane, status, expected in (
+            ("active_source_file", "active", "active_source_file"),
+            ("candidate_intake", "candidate_intake", "candidate_intake"),
+            ("existing_dossier_update", "existing_dossier_update", "existing_dossier_update"),
+        ):
+            with self.subTest(workflow_lane=workflow_lane):
+                result = enrich.classify_source_match({
+                    "ok": True,
+                    "found": True,
+                    "matchKind": "candidate_id",
+                    "data": {
+                        "workflowLane": workflow_lane,
+                        "sourceFile": {
+                            "candidateId": "cand_exact",
+                            "name": "Exact Subject",
+                            "status": status,
+                            "workflowLane": workflow_lane,
+                        },
+                    },
+                })
+                self.assertEqual(result[0], expected)
+
+        conflict = enrich.classify_source_match({
+            "ok": True,
+            "found": True,
+            "matchKind": "candidate_id",
+            "data": {
+                "workflowLane": "active_source_file",
+                "sourceFileActive": False,
+                "sourceFile": {"candidateId": "cand_exact", "status": "active"},
+            },
+        })
+        self.assertEqual(conflict[0], "error")
+
+        duplicate_flag_conflict = enrich.classify_source_match({
+            "ok": True,
+            "found": True,
+            "matchKind": "candidate_id",
+            "data": {
+                "sourceFileActive": True,
+                "sourceFile": {"candidateId": "cand_exact", "sourceFileActive": False},
+            },
+        })
+        self.assertEqual(duplicate_flag_conflict[0], "error")
+
+        incomplete = enrich.classify_source_match({
+            "ok": True,
+            "found": True,
+            "matchKind": "candidate_id",
+            "data": {"sourceFile": {"candidateId": "cand_exact"}},
+        })
+        self.assertEqual(incomplete[0], "candidate_intake")
 
     def test_alias_confirmed_proceeds_but_unconfirmed_alias_is_review_only(self):
         confirmed = enrich.run_source_file_enrichment(
@@ -305,7 +360,7 @@ class SourceFileEnrichmentTests(unittest.TestCase):
             return {
                 "ok": True,
                 "found": True,
-                "matchKind": "existing_dossier_update_name",
+                "matchKind": "candidate_id",
                 "data": {
                     "workflowLane": "existing_dossier_update",
                     "sourceFile": {

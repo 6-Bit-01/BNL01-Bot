@@ -1306,6 +1306,42 @@ def classify_source_match(lookup_result: dict[str, Any]) -> tuple[str, str, dict
         return "public_dossier_only", "An exact public dossier exists, but its protected internal update target must be created before enrichment can attach.", {}
     obj = _source_file_obj(lookup_result)
     data = lookup_result.get("data") if isinstance(lookup_result.get("data"), dict) else {}
+    lane_map = {
+        "active": "active_source_file",
+        "active_source_file": "active_source_file",
+        "candidate_intake": "candidate_intake",
+        "existing_dossier_update": "existing_dossier_update",
+    }
+    lane_signals = {
+        lane_map[value]
+        for value in (
+            str(data.get("workflowLane") or "").strip().lower(),
+            str(obj.get("workflowLane") or "").strip().lower(),
+            str(obj.get("status") or "").strip().lower(),
+            str(obj.get("state") or "").strip().lower(),
+        )
+        if value in lane_map
+    }
+    active_flags = [value for value in (data.get("sourceFileActive"), obj.get("sourceFileActive")) if isinstance(value, bool)]
+    existing_flags = [value for value in (data.get("existingDossierUpdateLane"), obj.get("existingDossierUpdateLane")) if isinstance(value, bool)]
+    if len(lane_signals) > 1:
+        return "error", "Source File workflow lane metadata conflicted; enrichment was stopped safely.", {}
+    if len(set(active_flags)) > 1 or len(set(existing_flags)) > 1:
+        return "error", "Source File workflow flags conflicted; enrichment was stopped safely.", {}
+    explicit_lane = next(iter(lane_signals), "")
+    if active_flags and explicit_lane and any(value != (explicit_lane == "active_source_file") for value in active_flags):
+        return "error", "Source File active-state metadata conflicted; enrichment was stopped safely.", {}
+    if existing_flags and explicit_lane and any(value != (explicit_lane == "existing_dossier_update") for value in existing_flags):
+        return "error", "Source File dossier-lane metadata conflicted; enrichment was stopped safely.", {}
+    if not explicit_lane and True in active_flags and True in existing_flags:
+        return "error", "Source File workflow flags conflicted; enrichment was stopped safely.", {}
+    explicit_lane = explicit_lane or ("existing_dossier_update" if True in existing_flags else "active_source_file" if True in active_flags else "")
+    if explicit_lane == "existing_dossier_update":
+        return explicit_lane, "Existing Dossier Update material for admin review.", obj
+    if explicit_lane == "candidate_intake":
+        return explicit_lane, "Candidate Intake enrichment only — not active case-file fact.", obj
+    if explicit_lane == "active_source_file":
+        return explicit_lane, "Active Source File enrichment target.", obj
     raw = " ".join(str(x or "") for x in (
         lookup_result.get("matchKind"), data.get("matchKind"), obj.get("status"), obj.get("state"), obj.get("reviewStatus"),
         obj.get("kind"), obj.get("type"), obj.get("candidateType"), obj.get("sourceType"), obj.get("dossierStatus"),
