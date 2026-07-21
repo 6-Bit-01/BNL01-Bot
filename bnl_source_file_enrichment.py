@@ -1,8 +1,10 @@
 """Review-only Source File enrichment helpers for BNL.
 
 This module builds structured case-file notes from approved local BNL stores and
-optionally posts them through the existing review-only dossier recommendation
-endpoint. It never publishes, promotes, merges, or overwrites Source Files.
+optionally posts them through the existing review-only dossier endpoints. When
+the protected read model explicitly identifies a public-dossier-only target, it
+may create that dossier's internal update workspace before attaching notes. It
+never publishes, promotes, merges identities, or changes public dossier copy.
 """
 
 from __future__ import annotations
@@ -11,8 +13,13 @@ import hashlib
 import inspect
 import json
 import logging
+import os
 import re
+import socket
 import sqlite3
+import urllib.error
+import urllib.parse
+import urllib.request
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
 from typing import Any, Callable
@@ -23,7 +30,7 @@ from bnl_entity_activity_summary import build_entity_activity_summary, refresh_e
 from bnl_entity_evidence import _website_safe_payload_text
 from bnl_entity_intelligence import build_entity_intelligence_profile, resolve_entity_context_for_surface, safe_text as _entity_safe_text
 from bnl_evidence_ownership import classify_evidence_ownership, subject_owned_text_fragments
-from bnl_source_file_lookup import lookup_source_file
+from bnl_source_file_lookup import get_source_file_read_url, lookup_source_file
 from bnl_source_refresh_context import refresh_generation_context
 from bnl_subject_memory_resolver import build_subject_analyst_read, normalize_source_file_resolution_context, resolve_subject_memory, _review_guidance
 
@@ -37,6 +44,7 @@ SITE_RAW_PROVENANCE_JSON_LIMIT = 20000
 SITE_RAW_PROVENANCE_JSON_TARGET = 18000
 SITE_LIST_ITEM_LIMIT = 500
 SITE_LIST_MAX_ITEMS = 25
+SOURCE_FILE_TARGET_SETUP_TIMEOUT_SECONDS = 8
 COMPACT_RECOMMENDATION_LIST_MAX_ITEMS = 8
 COMPACT_RECOMMENDATION_LIST_ITEM_LIMIT = 220
 COMPACT_RECOMMENDATION_TEXT_FIELD_LIMITS = {
@@ -1113,6 +1121,108 @@ def _source_file_obj(lookup_result: dict[str, Any]) -> dict[str, Any]:
     return data if isinstance(data, dict) else {}
 
 
+def _lookup_data(lookup_result: dict[str, Any]) -> dict[str, Any]:
+    return lookup_result.get("data") if isinstance(lookup_result.get("data"), dict) else {}
+
+
+def _has_public_dossier_only_label(lookup_result: dict[str, Any]) -> bool:
+    """Recognize the site's non-attachable sentinel without trusting its contract."""
+
+    data = _lookup_data(lookup_result)
+    labels = {
+        str(lookup_result.get("matchKind") or "").strip().lower(),
+        str(data.get("matchKind") or "").strip().lower(),
+    }
+    return "public_dossier_only" in labels
+
+
+def _is_public_dossier_only_lookup(lookup_result: dict[str, Any]) -> bool:
+    data = _lookup_data(lookup_result)
+    return bool(
+        lookup_result.get("ok")
+        and lookup_result.get("found")
+        and _has_public_dossier_only_label(lookup_result)
+        and data.get("workflowLane") == "public_dossier_update_target"
+        and data.get("recommendedAction") == "create_existing_dossier_update"
+        and "sourceFile" in data
+        and data.get("sourceFile") is None
+        and str(data.get("targetDossierId") or "").strip()
+    )
+
+
+def create_existing_dossier_update_target(
+    lookup_result: dict[str, Any],
+    requested_subject: str,
+    environ: dict[str, str] | None = None,
+    opener=None,
+) -> dict[str, Any]:
+    """Create the site's protected internal update target for an exact public dossier."""
+
+    data = _lookup_data(lookup_result)
+    if not _is_public_dossier_only_lookup(lookup_result):
+        return {"ok": False, "error": "public_dossier_only_contract_not_confirmed", "retryable": False}
+    target_dossier_id = str(data.get("targetDossierId") or "").strip()[:200]
+    env = environ if environ is not None else os.environ
+    token = (env.get("BNL_SOURCE_FILE_READ_TOKEN") or "").strip()
+    configured_url = get_source_file_read_url(env)
+    parsed_url = urllib.parse.urlsplit(configured_url)
+    endpoint = urllib.parse.urlunsplit((parsed_url.scheme, parsed_url.netloc, parsed_url.path, "", ""))
+    if not token or parsed_url.scheme not in {"http", "https"} or not parsed_url.netloc or not endpoint:
+        return {"ok": False, "error": "source_file_target_setup_not_configured", "retryable": False}
+    payload = {
+        "action": "create_existing_dossier_update",
+        "targetDossierId": target_dossier_id,
+        "requestedSubject": _safe_text(requested_subject, 200),
+    }
+    request = urllib.request.Request(
+        endpoint,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Accept": "application/json", "Content-Type": "application/json", "x-bnl-source-file-read-token": token},
+        method="POST",
+    )
+    urlopen = opener.open if opener is not None else urllib.request.urlopen
+    try:
+        with urlopen(request, timeout=SOURCE_FILE_TARGET_SETUP_TIMEOUT_SECONDS) as response:
+            status = getattr(response, "status", None) or response.getcode()
+            raw = response.read().decode("utf-8")
+    except urllib.error.HTTPError as exc:
+        status = int(exc.code or 0)
+        logging.warning("source_file_target_setup_failed status=%s", status or "unknown")
+        return {"ok": False, "error": f"source_file_target_setup_http_{status or 'error'}", "status": status, "retryable": status >= 500}
+    except (urllib.error.URLError, TimeoutError, socket.timeout):
+        logging.warning("source_file_target_setup_failed reason=network_or_timeout")
+        return {"ok": False, "error": "source_file_target_setup_network_or_timeout", "retryable": True}
+    except Exception:
+        logging.warning("source_file_target_setup_failed reason=unexpected_error")
+        return {"ok": False, "error": "source_file_target_setup_unexpected_error", "retryable": True}
+    try:
+        response_data = json.loads(raw) if raw.strip() else {}
+    except json.JSONDecodeError:
+        return {"ok": False, "error": "source_file_target_setup_invalid_json", "status": status, "retryable": True}
+    candidate = response_data.get("candidate") if isinstance(response_data.get("candidate"), dict) else {}
+    candidate_match = candidate.get("existingDossierMatch") if isinstance(candidate.get("existingDossierMatch"), dict) else {}
+    candidate_id = str(candidate.get("id") or "").strip()[:200]
+    contract_ok = bool(
+        200 <= int(status or 0) < 300
+        and response_data.get("ok") is True
+        and response_data.get("mutation") == "internal_workflow_only"
+        and response_data.get("publishesPublicDossier") is False
+        and response_data.get("publicDossierMutated") is False
+        and response_data.get("workflowLane") == "existing_dossier_update"
+        and response_data.get("sourceFileActive") is False
+        and response_data.get("existingDossierUpdateLane") is True
+        and str(response_data.get("targetDossierId") or "") == target_dossier_id
+        and candidate_id
+        and candidate.get("status") == "existing_dossier_update"
+        and str(candidate_match.get("id") or "") == target_dossier_id
+    )
+    if not contract_ok:
+        logging.warning("source_file_target_setup_failed reason=invalid_response_contract")
+        return {"ok": False, "error": "source_file_target_setup_invalid_response", "status": status, "retryable": False}
+    logging.info("source_file_target_setup_succeeded target_type=existing_dossier_update")
+    return {"ok": True, "candidateId": candidate_id, "targetDossierId": target_dossier_id, "status": status}
+
+
 def _first(obj: dict[str, Any], keys: tuple[str, ...]) -> Any:
     for key in keys:
         if obj.get(key) not in (None, "", []):
@@ -1192,6 +1302,8 @@ def classify_source_match(lookup_result: dict[str, Any]) -> tuple[str, str, dict
         return "error", _safe_text(lookup_result.get("error") or "lookup failed", 140), {}
     if not lookup_result.get("found"):
         return "none", "No active Source File, Candidate Intake item, or existing dossier target was confirmed.", {}
+    if _has_public_dossier_only_label(lookup_result):
+        return "public_dossier_only", "An exact public dossier exists, but its protected internal update target must be created before enrichment can attach.", {}
     obj = _source_file_obj(lookup_result)
     data = lookup_result.get("data") if isinstance(lookup_result.get("data"), dict) else {}
     raw = " ".join(str(x or "") for x in (
@@ -6003,7 +6115,7 @@ def build_enrichment_recommendation_payload(packet: dict[str, Any], *, environ: 
     subject = str(packet.get("subject") or "").strip()
     match_kind = str(packet.get("matchKind") or "none")
     source_file = packet.get("sourceFile") if isinstance(packet.get("sourceFile"), dict) else {}
-    target_candidate_id = _first(source_file, ("candidateId", "targetCandidateId", "id")) if match_kind in {"candidate_intake", "active_source_file"} else None
+    target_candidate_id = _first(source_file, ("candidateId", "targetCandidateId", "id")) if match_kind in {"candidate_intake", "active_source_file", "existing_dossier_update"} else None
     target_dossier_id = _first(source_file, ("targetDossierId", "dossierId", "publicDossierId")) if match_kind == "existing_dossier_update" else None
     _validate_source_payload_fields(packet)
     evidence = build_compact_enrichment_evidence_summary(packet)
@@ -6094,6 +6206,27 @@ def _call_site_sender(sender: Callable[..., dict[str, Any]], payload: dict[str, 
     return sender(payload, **kwargs) if kwargs else sender(payload)
 
 
+def _target_setup_result(subject: str, *, dry_run: bool, status: str, error: str = "") -> dict[str, Any]:
+    return {
+        "ok": not bool(error),
+        "dryRun": dry_run,
+        "subject": _safe_text(subject, 90),
+        "status": status,
+        "matchKind": "public_dossier_only",
+        "matchNote": "A protected Existing Dossier Update target is required before enrichment can attach.",
+        "recommendedAction": "create_existing_dossier_update",
+        "resolutionMode": "public_dossier_only",
+        "sections": {},
+        "sourceCounts": {},
+        "warningCounts": {},
+        "sourceTypes": [],
+        "warnings": [error] if error else [],
+        "sent": False,
+        "sendResult": {"ok": False, "error": error} if error else {},
+        "runTime": datetime.now(timezone.utc).isoformat(),
+    }
+
+
 def run_source_file_enrichment(
     db_path: str,
     guild_id: int | None,
@@ -6110,6 +6243,7 @@ def run_source_file_enrichment(
     force: bool = False,
     diagnostics: bool = False,
     callback_base_url: str | None = None,
+    workspace_creator: Callable[[dict[str, Any], str, dict[str, str] | None], dict[str, Any]] = create_existing_dossier_update_target,
 ) -> dict[str, Any]:
     canonical_key = lookup_key if lookup_key in {"subject", "alias", "candidateId", "normalizedName"} else "subject"
     target_value = (lookup_value if lookup_value is not None else subject) or ""
@@ -6117,6 +6251,45 @@ def run_source_file_enrichment(
     lookup_result = lookup_func(query)
     match_kind, match_note, source_file = classify_source_match(lookup_result)
     resolution_mode = {"subject": "exact", "candidateId": "candidateId", "alias": "alias", "normalizedName": "exact"}.get(canonical_key, "exact")
+
+    if match_kind == "public_dossier_only":
+        if not _is_public_dossier_only_lookup(lookup_result):
+            return _target_setup_result(
+                target_value,
+                dry_run=dry_run,
+                status="target_setup_failed",
+                error="public_dossier_only_contract_not_confirmed",
+            )
+        if dry_run:
+            return _target_setup_result(target_value, dry_run=True, status="target_setup_required")
+        setup_result = workspace_creator(lookup_result, str(target_value), environ)
+        if not setup_result.get("ok"):
+            return _target_setup_result(
+                target_value,
+                dry_run=False,
+                status="target_setup_failed",
+                error=_safe_text(setup_result.get("error") or "source_file_target_setup_failed", 180),
+            )
+        candidate_id = str(setup_result.get("candidateId") or "").strip()
+        canonical_query = {"lookupKey": "candidateId", "lookupValue": candidate_id, "candidateId": candidate_id}
+        canonical_lookup = lookup_func(canonical_query)
+        canonical_match_kind, canonical_match_note, canonical_source_file = classify_source_match(canonical_lookup)
+        canonical_data = _lookup_data(canonical_lookup)
+        canonical_source_id = str(_first(canonical_source_file, ("candidateId", "candidate_id", "id")) or "").strip()
+        if canonical_match_kind != "existing_dossier_update" or canonical_data.get("workflowLane") != "existing_dossier_update" or not candidate_id or canonical_source_id != candidate_id:
+            return _target_setup_result(
+                target_value,
+                dry_run=False,
+                status="target_setup_lookup_failed",
+                error="source_file_target_setup_canonical_lookup_mismatch",
+            )
+        lookup_result = canonical_lookup
+        match_kind = canonical_match_kind
+        match_note = canonical_match_note
+        source_file = canonical_source_file
+        canonical_key = "candidateId"
+        target_value = candidate_id
+        resolution_mode = "candidateId"
 
     if match_kind == "none":
         possible_matches = _possible_match_items(lookup_result)
@@ -6345,6 +6518,14 @@ def format_source_enrichment_response(result: dict[str, Any]) -> str:
     if result.get("status") == "no_target":
         return (f"Source enrichment: No confirmed target found for “{subject}.”\n"
                 "Next: create/promote a Candidate Intake item first or run candidate bridge/discovery. No notes were sent.")
+    if result.get("status") == "target_setup_required":
+        return (
+            f"Dry run Source File enrichment for “{subject}.”\n"
+            "An exact public dossier exists, but no protected Existing Dossier Update workspace exists yet.\n"
+            "A live refresh would create that internal review-only target, re-check its candidateId, and only then attach notes. No notes were sent."
+        )
+    if result.get("status") in {"target_setup_failed", "target_setup_lookup_failed"}:
+        return f"Source enrichment target setup failed safely for “{subject}”: {_safe_text((result.get('sendResult') or {}).get('error') or result.get('matchNote'), 180)} No notes were sent."
     if result.get("status") == "lookup_failed":
         return f"Source enrichment lookup failed for “{subject}”: {_safe_text(result.get('matchNote'), 140)}"
     sections = result.get("sections") or {}

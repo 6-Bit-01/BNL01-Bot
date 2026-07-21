@@ -140,6 +140,109 @@ class SourceFileRefreshTests(unittest.TestCase):
         self.assertEqual(rows[0]["evidence_count"], 2)
         self.assertIn("subject_activity_link_signal", rows[0]["reason"])
 
+    def test_existing_queue_schema_migrates_candidate_id_without_data_loss(self):
+        old = tempfile.NamedTemporaryFile(suffix=".sqlite", delete=False)
+        old.close()
+        try:
+            conn = sqlite3.connect(old.name)
+            conn.execute(
+                f"""CREATE TABLE {refresh.QUEUE_TABLE} (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, guild_id INTEGER,
+                    subject_key TEXT NOT NULL, subject_name TEXT NOT NULL,
+                    reason TEXT NOT NULL, evidence_source TEXT,
+                    evidence_count INTEGER NOT NULL DEFAULT 1,
+                    priority INTEGER NOT NULL DEFAULT 50,
+                    status TEXT NOT NULL DEFAULT 'queued', queued_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL, not_before_at TEXT, last_attempt_at TEXT,
+                    attempts INTEGER NOT NULL DEFAULT 0, last_error TEXT,
+                    refresh_mode TEXT NOT NULL DEFAULT 'automatic', created_by TEXT
+                )"""
+            )
+            conn.execute(
+                f"INSERT INTO {refresh.QUEUE_TABLE} (guild_id, subject_key, subject_name, reason, queued_at, updated_at) VALUES (1, 'signal-fox', 'Signal Fox', 'old', 'now', 'now')"
+            )
+            refresh.ensure_source_file_refresh_schema(conn)
+            refresh.ensure_source_file_refresh_schema(conn)
+            conn.commit()
+            columns = {row[1] for row in conn.execute(f"PRAGMA table_info({refresh.QUEUE_TABLE})")}
+            row = conn.execute(f"SELECT subject_name, candidate_id FROM {refresh.QUEUE_TABLE}").fetchone()
+            conn.close()
+            self.assertIn("candidate_id", columns)
+            self.assertEqual(row, ("Signal Fox", None))
+        finally:
+            os.unlink(old.name)
+
+    def test_existing_state_schema_migrates_candidate_id_without_data_loss(self):
+        old = tempfile.NamedTemporaryFile(suffix=".sqlite", delete=False)
+        old.close()
+        try:
+            conn = sqlite3.connect(old.name)
+            conn.execute(
+                f"""CREATE TABLE {refresh.STATE_TABLE} (
+                    guild_id INTEGER, subject_key TEXT NOT NULL,
+                    subject_name TEXT NOT NULL, last_refresh_status TEXT,
+                    last_recommendation_id TEXT, cooldown_until TEXT,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (guild_id, subject_key)
+                )"""
+            )
+            conn.execute(
+                f"INSERT INTO {refresh.STATE_TABLE} (guild_id, subject_key, subject_name, last_refresh_status, last_recommendation_id, cooldown_until, updated_at) VALUES (1, 'signal-fox', 'Signal Fox', 'succeeded', 'rec_old', '2999-01-01T00:00:00+00:00', 'now')"
+            )
+            refresh.ensure_source_file_refresh_schema(conn)
+            refresh.ensure_source_file_refresh_schema(conn)
+            conn.commit()
+            columns = {row[1] for row in conn.execute(f"PRAGMA table_info({refresh.STATE_TABLE})")}
+            row = conn.execute(f"SELECT subject_name, last_recommendation_id, candidate_id FROM {refresh.STATE_TABLE}").fetchone()
+            conn.close()
+            self.assertIn("candidate_id", columns)
+            self.assertEqual(row, ("Signal Fox", "rec_old", None))
+        finally:
+            os.unlink(old.name)
+
+    def test_candidate_identity_survives_dedupe_and_upgrades_failed_row(self):
+        refresh.enqueue_source_file_refresh(self.db, guild_id=1, subject_name="Signal Fox", reason="automatic", evidence_source="test")
+        conn = sqlite3.connect(self.db)
+        conn.execute(f"UPDATE {refresh.QUEUE_TABLE} SET status='failed' WHERE subject_key='signal-fox'")
+        conn.commit()
+        conn.close()
+        upgraded = refresh.enqueue_source_file_refresh(
+            self.db,
+            guild_id=1,
+            subject_name="Signal Fox",
+            reason="site retry",
+            evidence_source="site_refresh_request",
+            candidate_id="cand_exact",
+        )
+        self.assertTrue(upgraded["deduped"])
+        self.assertEqual(self.rows()[0]["candidate_id"], "cand_exact")
+        refresh.enqueue_source_file_refresh(self.db, guild_id=1, subject_name="Signal Fox", reason="later evidence", evidence_source="test")
+        rows = self.all_queue_rows()
+        self.assertEqual(len(rows), 2)
+        self.assertEqual({row["candidate_id"] for row in rows}, {"cand_exact", None})
+
+    def test_conflicting_candidate_identities_are_never_merged_or_replaced(self):
+        refresh.enqueue_source_file_refresh(
+            self.db,
+            guild_id=1,
+            subject_name="Signal Fox",
+            reason="first exact request",
+            evidence_source="site_refresh_request",
+            candidate_id="cand_a",
+        )
+        refresh.enqueue_source_file_refresh(
+            self.db,
+            guild_id=1,
+            subject_name="Signal Fox",
+            reason="different exact request",
+            evidence_source="site_refresh_request",
+            candidate_id="cand_b",
+        )
+        rows = self.all_queue_rows()
+        self.assertEqual(len(rows), 2)
+        self.assertEqual({row["candidate_id"] for row in rows}, {"cand_a", "cand_b"})
+        self.assertEqual({row["evidence_count"] for row in rows}, {1})
+
     def test_entity_evidence_upsert_marks_subject_dirty(self):
         conn = sqlite3.connect(self.db)
         conn.row_factory = sqlite3.Row
@@ -547,6 +650,42 @@ class SourceFileRefreshTests(unittest.TestCase):
         self.assertEqual(state["last_refresh_status"], "succeeded")
         self.assertEqual(self.rows(), [])
 
+    def test_site_polling_uses_candidate_identity_for_preflight_and_worker(self):
+        opener = FakeOpener({"ok": True, "requests": [{"id": "req_1", "candidateId": "cand_exact", "subjectName": "Signal Fox", "status": "pending"}]})
+        queries = []
+        lookup = lambda query: queries.append(query) or {"ok": True, "found": True, "sourceFile": {"candidateId": "cand_exact", "subjectName": "Signal Fox"}}
+        result = {"sent": True, "sendResult": {"recommendationId": "rec_1"}, "sourceCounts": {}, "subject": "Signal Fox"}
+        with mock.patch.object(refresh, "run_source_file_enrichment", return_value=result) as mocked:
+            summary = refresh.process_site_refresh_requests(
+                self.db,
+                guild_id=1,
+                environ={"BNL_SOURCE_FILE_READ_TOKEN": "read", "BNL_WEBSITE_BASE_URL": "https://site.test", "BNL_DOSSIER_INGEST_TOKEN": "ingest"},
+                opener=opener,
+                lookup_func=lookup,
+            )
+        self.assertEqual(summary["processed"], 1)
+        self.assertTrue(queries)
+        self.assertTrue(all(query["lookupKey"] == "candidateId" for query in queries))
+        self.assertEqual(mocked.call_args.kwargs["lookup_key"], "candidateId")
+        self.assertEqual(mocked.call_args.kwargs["lookup_value"], "cand_exact")
+
+    def test_site_candidate_identity_is_opaque_and_preserved_to_200_characters(self):
+        candidate_id = "cand_" + ("x" * 145) + "_123456789012345678"
+        self.assertEqual(len(candidate_id), 169)
+        lookup_key, lookup_value = refresh._site_refresh_lookup_parts({"candidateId": candidate_id, "subjectName": "Signal Fox"})
+        self.assertEqual(lookup_key, "candidateId")
+        self.assertEqual(lookup_value, candidate_id)
+        queued = refresh.enqueue_source_file_refresh(
+            self.db,
+            guild_id=1,
+            subject_name="Signal Fox",
+            reason="exact site request",
+            evidence_source="site_refresh_request",
+            candidate_id=candidate_id,
+        )
+        self.assertTrue(queued["queued"])
+        self.assertEqual(self.rows()[0]["candidate_id"], candidate_id)
+
     def test_site_polling_failure_marks_failed(self):
         opener = FakeOpener({"ok": True, "requests": [{"id": "req_1", "subjectName": "Signal Fox", "status": "pending"}]})
         lookup = lambda query: {"ok": True, "found": True, "sourceFile": {"subjectName": "Signal Fox"}}
@@ -635,8 +774,147 @@ class SourceFileRefreshTests(unittest.TestCase):
         self.assertTrue(result["archiveSent"])
         self.assertEqual(result["archiveId"], "arc_now")
         self.assertEqual(mocked.call_count, 1)
+        self.assertEqual(mocked.call_args.kwargs["lookup_key"], "candidateId")
+        self.assertEqual(mocked.call_args.kwargs["lookup_value"], "cand_1")
         self.assertEqual([p["status"] for p in opener.posts], ["claimed", "completed"])
         self.assertEqual(opener.posts[-1]["completedByRecommendationId"], "rec_now")
+
+    def test_refresh_now_targets_exact_candidate_row_and_ignores_subject_cooldown(self):
+        refresh.enqueue_source_file_refresh(
+            self.db,
+            guild_id=1,
+            subject_name="Signal Fox",
+            reason="older exact request",
+            evidence_source="site_refresh_request",
+            priority=100,
+            candidate_id="cand_a",
+        )
+        conn = sqlite3.connect(self.db)
+        try:
+            conn.execute(
+                f"INSERT OR REPLACE INTO {refresh.STATE_TABLE} (guild_id, subject_key, subject_name, last_refresh_completed_at, last_refresh_status, last_recommendation_id, cooldown_until, candidate_id, updated_at) VALUES (1, 'signal-fox', 'Signal Fox', '2026-07-21T00:00:00+00:00', 'succeeded', 'rec_a', '2999-01-01T00:00:00+00:00', 'cand_a', '2026-07-21T00:00:00+00:00')"
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        opener = FakeOpener({"ok": True, "requests": []})
+        lookup = lambda query: {"ok": True, "found": True, "sourceFile": {"candidateId": query["lookupValue"], "subjectName": "Signal Fox"}}
+        result = {"sent": True, "sendResult": {"recommendationId": "rec_b"}, "sourceCounts": {}, "subject": "Signal Fox"}
+
+        with mock.patch.object(refresh, "run_source_file_enrichment", return_value=result) as mocked:
+            response = refresh.process_source_file_refresh_now(
+                self.db,
+                {"requestId": "req_b", "candidateId": "cand_b", "subjectName": "Signal Fox"},
+                guild_id=1,
+                environ={"BNL_SOURCE_FILE_READ_TOKEN": "read", "BNL_WEBSITE_BASE_URL": "https://site.test", "BNL_DOSSIER_INGEST_TOKEN": "ingest"},
+                opener=opener,
+                lookup_func=lookup,
+            )
+
+        self.assertEqual(response["status"], "success")
+        self.assertEqual(response["recommendationId"], "rec_b")
+        self.assertEqual(mocked.call_args.kwargs["lookup_value"], "cand_b")
+        rows = self.all_queue_rows()
+        self.assertEqual({row["candidate_id"]: row["status"] for row in rows}, {"cand_a": "queued", "cand_b": "succeeded"})
+        self.assertEqual([post["status"] for post in opener.posts], ["claimed", "completed"])
+
+    def test_refresh_now_current_marks_only_its_exact_candidate_row_terminal(self):
+        refresh.enqueue_source_file_refresh(
+            self.db,
+            guild_id=1,
+            subject_name="Signal Fox",
+            reason="different exact request",
+            evidence_source="source_refresh_now",
+            priority=100,
+            candidate_id="cand_b",
+        )
+        conn = sqlite3.connect(self.db)
+        try:
+            conn.execute(
+                f"INSERT OR REPLACE INTO {refresh.STATE_TABLE} (guild_id, subject_key, subject_name, last_refresh_completed_at, last_refresh_status, last_recommendation_id, cooldown_until, candidate_id, updated_at) VALUES (1, 'signal-fox', 'Signal Fox', '2026-07-21T00:00:00+00:00', 'succeeded', 'rec_a', '2999-01-01T00:00:00+00:00', 'cand_a', '2026-07-21T00:00:00+00:00')"
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        opener = FakeOpener({"ok": True, "requests": []})
+        lookup = lambda query: {"ok": True, "found": True, "sourceFile": {"candidateId": query["lookupValue"], "subjectName": "Signal Fox"}}
+
+        with mock.patch.object(refresh, "run_source_file_enrichment") as mocked:
+            response = refresh.process_source_file_refresh_now(
+                self.db,
+                {"requestId": "req_a", "candidateId": "cand_a", "subjectName": "Signal Fox"},
+                guild_id=1,
+                environ={"BNL_SOURCE_FILE_READ_TOKEN": "read", "BNL_WEBSITE_BASE_URL": "https://site.test", "BNL_DOSSIER_INGEST_TOKEN": "ingest"},
+                opener=opener,
+                lookup_func=lookup,
+            )
+
+        mocked.assert_not_called()
+        self.assertEqual(response["status"], "success")
+        self.assertEqual(response["recommendationId"], "rec_a")
+        rows = self.all_queue_rows()
+        self.assertEqual({row["candidate_id"]: row["status"] for row in rows}, {"cand_b": "queued", "cand_a": "skipped"})
+        self.assertEqual([post["status"] for post in opener.posts], ["claimed", "completed"])
+
+    def test_site_polling_targets_the_row_enqueued_for_each_candidate_request(self):
+        refresh.enqueue_source_file_refresh(
+            self.db,
+            guild_id=1,
+            subject_name="Signal Fox",
+            reason="older exact request",
+            evidence_source="site_refresh_request",
+            priority=95,
+            candidate_id="cand_a",
+        )
+        opener = FakeOpener({"ok": True, "requests": [{"id": "req_b", "candidateId": "cand_b", "subjectName": "Signal Fox", "status": "pending"}]})
+        lookup = lambda query: {"ok": True, "found": True, "sourceFile": {"candidateId": query["lookupValue"], "subjectName": "Signal Fox"}}
+        result = {"sent": True, "sendResult": {"recommendationId": "rec_b"}, "sourceCounts": {}, "subject": "Signal Fox"}
+
+        with mock.patch.object(refresh, "run_source_file_enrichment", return_value=result) as mocked:
+            summary = refresh.process_site_refresh_requests(
+                self.db,
+                guild_id=1,
+                environ={"BNL_SOURCE_FILE_READ_TOKEN": "read", "BNL_WEBSITE_BASE_URL": "https://site.test", "BNL_DOSSIER_INGEST_TOKEN": "ingest"},
+                opener=opener,
+                lookup_func=lookup,
+            )
+
+        self.assertEqual(summary["processed"], 1)
+        self.assertEqual(mocked.call_args.kwargs["lookup_value"], "cand_b")
+        rows = self.all_queue_rows()
+        self.assertEqual({row["candidate_id"]: row["status"] for row in rows}, {"cand_a": "queued", "cand_b": "succeeded"})
+        self.assertEqual([post["status"] for post in opener.posts], ["claimed", "completed"])
+
+    def test_worker_reuses_persisted_candidate_identity_after_database_reopen(self):
+        refresh.enqueue_source_file_refresh(
+            self.db,
+            guild_id=1,
+            subject_name="Signal Fox",
+            reason="site retry",
+            evidence_source="site_refresh_request",
+            candidate_id="cand_restart",
+        )
+        lookup = lambda query: {"ok": True, "found": True, "sourceFile": {"candidateId": "cand_restart"}}
+        result = {"sent": True, "sendResult": {"recommendationId": "rec_restart"}, "sourceCounts": {}, "subject": "Signal Fox"}
+        with mock.patch.object(refresh, "run_source_file_enrichment", return_value=result) as mocked:
+            summary = refresh.process_source_file_refresh_queue(
+                self.db,
+                guild_id=1,
+                lookup_func=lookup,
+                environ={"BNL_DOSSIER_INGEST_TOKEN": "ingest"},
+            )
+        self.assertEqual(summary["processed"], 1)
+        self.assertEqual(mocked.call_args.kwargs["lookup_key"], "candidateId")
+        self.assertEqual(mocked.call_args.kwargs["lookup_value"], "cand_restart")
+
+    def test_worker_without_candidate_identity_uses_subject_lookup(self):
+        refresh.enqueue_source_file_refresh(self.db, guild_id=1, subject_name="Signal Fox", reason="automatic", evidence_source="test")
+        lookup = lambda query: {"ok": True, "found": True, "sourceFile": {"subjectName": "Signal Fox"}}
+        result = {"sent": True, "sendResult": {"recommendationId": "rec_subject"}, "sourceCounts": {}, "subject": "Signal Fox"}
+        with mock.patch.object(refresh, "run_source_file_enrichment", return_value=result) as mocked:
+            refresh.process_source_file_refresh_queue(self.db, guild_id=1, lookup_func=lookup, environ={"BNL_DOSSIER_INGEST_TOKEN": "ingest"})
+        self.assertEqual(mocked.call_args.kwargs["lookup_key"], "subject")
+        self.assertEqual(mocked.call_args.kwargs["lookup_value"], "Signal Fox")
 
     def test_refresh_now_failed_refresh_marks_site_failed(self):
         opener = FakeOpener({"ok": True, "requests": []})
