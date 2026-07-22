@@ -92,6 +92,18 @@ class FakeMessage:
         self.reactions.append(emoji)
 
 
+class BlockingReplyMessage(FakeMessage):
+    def __init__(self, channel, content, *, author=None, mentions=None):
+        super().__init__(channel, content, author=author, mentions=mentions)
+        self.reply_started = asyncio.Event()
+        self.release_reply = asyncio.Event()
+
+    async def reply(self, text, **_kwargs):
+        self.reply_started.set()
+        await self.release_reply.wait()
+        self.replies.append(text)
+
+
 class BlockingSendChannel(FakeChannel):
     def __init__(self, channel_id, *, name="bnl-testing", guild=None):
         super().__init__(channel_id, name=name, guild=guild)
@@ -421,6 +433,74 @@ class ConversationBatchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(channel.sent, ["Fresh combined response."])
         self.assertEqual(list(bnl01_bot._channel_buffers[channel.id]), [])
 
+    async def test_second_late_fragment_survives_slow_regeneration_and_keeps_full_context(self):
+        channel = self._channel(8112)
+        first_generation_started = asyncio.Event()
+        release_first_generation = asyncio.Event()
+        regenerated_generation_started = asyncio.Event()
+        release_regenerated_generation = asyncio.Event()
+        prompts = []
+        batch_events = []
+
+        async def generate(prompt, **_kwargs):
+            prompts.append(prompt)
+            if len(prompts) == 1:
+                first_generation_started.set()
+                await release_first_generation.wait()
+                return "Stale first draft."
+            if len(prompts) == 2:
+                regenerated_generation_started.set()
+                await release_regenerated_generation.wait()
+                return "Stale regenerated draft."
+            return "Fresh response covering all three fragments."
+
+        self._prime_flush(channel, "hey BNL")
+        with (
+            self._flush_runtime(channel.id, generate),
+            mock.patch.object(bnl01_bot, "_batch_max_wait_seconds", return_value=0.2),
+            mock.patch.object(
+                bnl01_bot,
+                "_log_batch_event",
+                side_effect=lambda _level, event, _guild_id, _channel_id, _count, reason: batch_events.append((event, reason)),
+            ),
+        ):
+            first_task = asyncio.create_task(bnl01_bot._flush_channel_buffer(channel))
+            bnl01_bot._channel_tasks[channel.id] = first_task
+            await asyncio.wait_for(first_generation_started.wait(), timeout=0.5)
+
+            generation_id = bnl01_bot._channel_generation_id[channel.id]
+            bnl01_bot._channel_preempted_generation_id[channel.id] = generation_id
+            bnl01_bot._channel_message_interrupt_generation_id[channel.id] = generation_id
+            self._append(channel, "you still sound like a nerd")
+            bnl01_bot._reset_debounce(channel)
+            release_first_generation.set()
+
+            await asyncio.wait_for(regenerated_generation_started.wait(), timeout=0.5)
+            self.assertIn(("regenerated_batch_once", "retry"), batch_events)
+            bnl01_bot._channel_preempted_generation_id[channel.id] = generation_id
+            bnl01_bot._channel_message_interrupt_generation_id[channel.id] = generation_id
+            self._append(channel, "but I know you're trying")
+            bnl01_bot._reset_debounce(channel)
+
+            # Hold the retry past the original batch deadline, as the live provider
+            # plus glitch-rewrite path did, without making the test wait ten seconds.
+            await asyncio.sleep(0.25)
+            release_regenerated_generation.set()
+            await asyncio.wait_for(first_task, timeout=1)
+
+            successor = bnl01_bot._channel_tasks[channel.id]
+            self.assertIsNot(successor, first_task)
+            await asyncio.wait_for(successor, timeout=1)
+
+        self.assertEqual(len(prompts), 3)
+        self.assertIn("hey BNL", prompts[2])
+        self.assertIn("you still sound like a nerd", prompts[2])
+        self.assertIn("but I know you're trying", prompts[2])
+        self.assertEqual(channel.sent, ["Fresh response covering all three fragments."])
+        self.assertEqual(list(bnl01_bot._channel_buffers[channel.id]), [])
+        self.assertNotIn(channel.id, bnl01_bot._channel_interrupt_handoff)
+        self.assertNotIn(("skip", "stale_batch"), batch_events)
+
     async def test_interrupt_handoff_merges_with_newer_buffered_fragment(self):
         channel = self._channel(8107)
         prompts = []
@@ -528,6 +608,44 @@ class ConversationBatchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(message.replies, [])
         self.assertEqual(list(bnl01_bot._channel_buffers[channel.id]), [])
 
+    async def test_paced_direct_reply_clears_preserved_interrupt_handoff(self):
+        channel = self._channel(8114)
+        message = FakeMessage(channel, "BNL, answer this now")
+        now = bnl01_bot.datetime.now(bnl01_bot.PACIFIC_TZ)
+        bnl01_bot._channel_interrupt_handoff[channel.id] = [
+            ("Jon", "an older interrupted fragment", 100),
+        ]
+        bnl01_bot._channel_first_seen[channel.id] = now
+        bnl01_bot._channel_last_message_at[channel.id] = now
+        never_release = asyncio.Event()
+        pending_task = asyncio.create_task(never_release.wait())
+        bnl01_bot._channel_tasks[channel.id] = pending_task
+        plan = SimpleNamespace(
+            route_mode=bnl01_bot.ROUTE_MODE_NORMAL_CHAT,
+            should_reply=True,
+            response_timing=bnl01_bot.RESPONSE_TIMING_PACED_DIRECT,
+        )
+
+        with (
+            self._on_message_runtime(channel.id, followup_candidate=False),
+            mock.patch.object(bnl01_bot, "is_direct_bnl_target", return_value=True),
+            mock.patch.object(bnl01_bot, "plan_conversation_response", return_value=plan),
+            mock.patch.object(bnl01_bot, "try_repair_response", return_value="Direct reply."),
+            mock.patch.object(
+                bnl01_bot,
+                "send_reply_then_save_model",
+                new=mock.AsyncMock(),
+            ) as send_reply,
+        ):
+            await bnl01_bot.on_message(message)
+            await asyncio.sleep(0)
+
+        self.assertTrue(pending_task.cancelled())
+        self.assertNotIn(channel.id, bnl01_bot._channel_interrupt_handoff)
+        self.assertNotIn(channel.id, bnl01_bot._channel_first_seen)
+        self.assertNotIn(channel.id, bnl01_bot._channel_last_message_at)
+        send_reply.assert_awaited_once()
+
     async def test_on_message_plain_name_request_preempts_batch_and_accepts_tag_payload(self):
         channel = self._channel(8110)
         author = FakeAuthor()
@@ -563,6 +681,124 @@ class ConversationBatchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(channel.sent, [])
         self.assertEqual(request.replies, [])
         self.assertEqual(payload.replies, [])
+
+    async def test_deferred_payload_request_runs_recall_guards_before_starting_session(self):
+        channel = self._channel(8113)
+        request = FakeMessage(
+            channel,
+            "BNL, summarize each of these people from #research-and-development",
+        )
+        plan = SimpleNamespace(
+            should_reply=True,
+            response_timing=bnl01_bot.RESPONSE_TIMING_DEFERRED_PAYLOAD_SESSION,
+        )
+
+        with (
+            mock.patch.object(
+                bnl01_bot,
+                "_preempt_pending_batch_for_deferred_session",
+                new=mock.AsyncMock(return_value=0),
+            ) as preempt,
+            mock.patch.object(bnl01_bot, "_start_direct_payload_session") as start_session,
+        ):
+            handled = await bnl01_bot._maybe_start_deferred_payload_session(
+                request,
+                plan,
+                channel_policy="public_home",
+                request_text=request.content,
+                current_turn_context="",
+            )
+
+        self.assertTrue(handled)
+        preempt.assert_awaited_once_with(channel)
+        start_session.assert_not_called()
+        self.assertEqual(
+            request.replies,
+            [bnl01_bot.restricted_channel_recall_boundary_response()],
+        )
+
+    async def test_deferred_payload_session_blocks_restricted_recall_in_followup(self):
+        channel = self._channel(8115)
+        author = FakeAuthor()
+        request = FakeMessage(
+            channel,
+            "BNL, summarize each of these things",
+            author=author,
+        )
+        payload = FakeMessage(
+            channel,
+            "what happened in #research-and-development?",
+            author=author,
+        )
+
+        with mock.patch.object(
+            bnl01_bot,
+            "_direct_session_timer",
+            new=mock.AsyncMock(return_value=None),
+        ):
+            session = bnl01_bot._start_direct_payload_session(
+                request,
+                channel_policy="public_home",
+                request_text=request.content,
+                current_turn_context="",
+            )
+            await asyncio.sleep(0)
+
+        key = (channel.guild.id, channel.id, author.id)
+        with (
+            self._on_message_runtime(channel.id, followup_candidate=True),
+            mock.patch.object(bnl01_bot, "resolve_channel_policy", return_value="public_home"),
+        ):
+            await bnl01_bot.on_message(payload)
+
+        self.assertTrue(session["completed"])
+        self.assertTrue(session["generation_invalidated"])
+        self.assertNotIn(key, bnl01_bot._direct_payload_sessions)
+        self.assertEqual(session["payload_lines"], [])
+        self.assertEqual(
+            payload.replies,
+            [bnl01_bot.restricted_channel_recall_boundary_response()],
+        )
+
+    async def test_generation_recall_guard_cannot_delete_replacement_session_during_reply(self):
+        channel = self._channel(8116)
+        anchor = BlockingReplyMessage(
+            channel,
+            "BNL, summarize each of these things",
+        )
+        key = (channel.guild.id, channel.id, anchor.author.id)
+        guarded_session = {
+            "guild_id": channel.guild.id,
+            "channel_id": channel.id,
+            "channel_policy": "public_home",
+            "original_request_text": anchor.content,
+            "payload_lines": ["what happened in #research-and-development?"],
+            "anchor_message": anchor,
+            "completed": False,
+            "generating": False,
+            "generation_invalidated": False,
+            "revision": 0,
+            "last_committed_payload_count": 0,
+            "last_bot_response_at": None,
+        }
+        bnl01_bot._direct_payload_sessions[key] = guarded_session
+
+        generation_task = asyncio.create_task(
+            bnl01_bot._generate_direct_payload_session(key, "quiet_timeout")
+        )
+        await asyncio.wait_for(anchor.reply_started.wait(), timeout=0.5)
+        self.assertNotIn(key, bnl01_bot._direct_payload_sessions)
+
+        replacement_session = {"replacement": True}
+        bnl01_bot._direct_payload_sessions[key] = replacement_session
+        anchor.release_reply.set()
+        await asyncio.wait_for(generation_task, timeout=0.5)
+
+        self.assertIs(bnl01_bot._direct_payload_sessions[key], replacement_session)
+        self.assertEqual(
+            anchor.replies,
+            [bnl01_bot.restricted_channel_recall_boundary_response()],
+        )
 
     async def test_buffer_max_never_starts_an_overlapping_flush(self):
         channel = self._channel(8106)
