@@ -314,6 +314,48 @@ class DirectPayloadAddressingTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(session["completed"])
         self.assertFalse(session["generating"])
 
+    async def test_deferred_plan_starts_existing_protected_payload_waiter(self):
+        author = SimpleNamespace(id=100, display_name="Jon")
+        guild = SimpleNamespace(id=1)
+        channel = SimpleNamespace(id=2, name="bnl-testing", guild=guild)
+        message = SimpleNamespace(id=10, guild=guild, channel=channel, author=author)
+        plan = bnl01_bot.plan_conversation_response(
+            "BNL, tell me something about each of these people",
+            "sealed_test",
+            route_mode=bnl01_bot.ROUTE_MODE_NORMAL_CHAT,
+            active_channel=True,
+            plain_text_name_seen=True,
+            followup_candidate=True,
+            channel_allows_conversation=True,
+            batching_enabled=True,
+            payload_expected=True,
+            payload_count=0,
+            conversation_surface=bnl01_bot.CONVERSATION_SURFACE_FREE_SPEAK_SEALED_MIRROR,
+        )
+
+        with mock.patch.object(
+            bnl01_bot,
+            "_direct_session_timer",
+            new=mock.AsyncMock(return_value=None),
+        ) as timer:
+            started = await bnl01_bot._maybe_start_deferred_payload_session(
+                message,
+                plan,
+                channel_policy="sealed_test",
+                request_text="BNL, tell me something about each of these people",
+                current_turn_context="anchor addressing",
+            )
+            session = bnl01_bot._direct_payload_sessions[(1, 2, 100)]
+            await session["timer_task"]
+
+        key = (1, 2, 100)
+        self.assertTrue(started)
+        self.assertIs(bnl01_bot._direct_payload_sessions[key], session)
+        self.assertEqual(session["original_request_text"], "BNL, tell me something about each of these people")
+        self.assertEqual(session["payload_lines"], [])
+        self.assertEqual(session["current_turn_context"], "anchor addressing")
+        timer.assert_awaited_once_with(key)
+
 
 class ConversationPlannerTests(unittest.TestCase):
     def test_simple_greeting_creates_paced_generated_response(self):
@@ -471,6 +513,102 @@ class ConversationPlannerTests(unittest.TestCase):
         self.assertEqual(plans[0].response_timing, plans[1].response_timing)
         self.assertEqual(plans[0].response_generation, plans[1].response_generation)
         self.assertEqual(plans[0].batch_behavior, plans[1].batch_behavior)
+
+    def test_recent_free_speak_followups_reenter_debounce_when_enabled(self):
+        for policy in ("public_home", "sealed_test"):
+            plan = bnl01_bot.plan_conversation_response(
+                "you still sound like a nerd",
+                policy,
+                route_mode=bnl01_bot.ROUTE_MODE_NORMAL_CHAT,
+                followup_candidate=True,
+                channel_allows_conversation=True,
+                batching_enabled=True,
+            )
+            self.assertFalse(plan.should_reply, policy)
+            self.assertTrue(plan.batch_allowed, policy)
+            self.assertEqual(plan.directness, "recent_followup", policy)
+            self.assertEqual(plan.policy_reply_class, "batched_followup", policy)
+            self.assertEqual(plan.response_timing, bnl01_bot.RESPONSE_TIMING_BATCHED_CHANNEL, policy)
+            self.assertEqual(plan.batch_behavior, bnl01_bot.BATCH_BEHAVIOR_ENTER_BATCH, policy)
+
+    def test_plain_name_list_request_starts_protected_payload_waiter(self):
+        plan = bnl01_bot.plan_conversation_response(
+            "BNL, tell me something about each of these people",
+            "sealed_test",
+            route_mode=bnl01_bot.ROUTE_MODE_NORMAL_CHAT,
+            active_channel=True,
+            plain_text_name_seen=True,
+            followup_candidate=True,
+            channel_allows_conversation=True,
+            batching_enabled=True,
+            payload_expected=True,
+            payload_count=0,
+            conversation_surface=bnl01_bot.CONVERSATION_SURFACE_FREE_SPEAK_SEALED_MIRROR,
+        )
+        self.assertTrue(plan.should_reply)
+        self.assertTrue(plan.direct_session_used)
+        self.assertEqual(plan.route_mode, bnl01_bot.ROUTE_MODE_DIRECT_PAYLOAD)
+        self.assertEqual(plan.response_timing, bnl01_bot.RESPONSE_TIMING_DEFERRED_PAYLOAD_SESSION)
+        self.assertEqual(plan.batch_behavior, bnl01_bot.BATCH_BEHAVIOR_DO_NOT_BATCH)
+
+    def test_deictic_list_request_does_not_count_as_inline_payload(self):
+        for text in (
+            "BNL, tell me something about each of these people",
+            "BNL, tell me something about these people",
+            "BNL, write one for each of the following",
+            "BNL, tell me about those names",
+        ):
+            self.assertEqual(bnl01_bot._collect_inline_direct_payload_items(text), [], text)
+
+    def test_inline_list_request_still_collects_actual_names(self):
+        self.assertEqual(
+            bnl01_bot._collect_inline_direct_payload_items("BNL, tell me about these people: Chris and Pat"),
+            ["Chris", "Pat"],
+        )
+
+    def test_unaddressed_list_shaped_room_chat_stays_in_normal_batching(self):
+        plan = bnl01_bot.plan_conversation_response(
+            "tell me something about each of these people",
+            "sealed_test",
+            route_mode=bnl01_bot.ROUTE_MODE_NORMAL_CHAT,
+            active_channel=True,
+            channel_allows_conversation=True,
+            batching_enabled=True,
+            payload_expected=True,
+            payload_count=0,
+            conversation_surface=bnl01_bot.CONVERSATION_SURFACE_FREE_SPEAK_SEALED_MIRROR,
+        )
+        self.assertFalse(plan.should_reply)
+        self.assertFalse(plan.direct_session_used)
+        self.assertEqual(plan.response_timing, bnl01_bot.RESPONSE_TIMING_BATCHED_CHANNEL)
+        self.assertEqual(plan.batch_behavior, bnl01_bot.BATCH_BEHAVIOR_ENTER_BATCH)
+
+    def test_real_mentions_and_replies_still_outrank_followup_batching(self):
+        mention = bnl01_bot.plan_conversation_response(
+            "actual mention",
+            "sealed_test",
+            route_mode=bnl01_bot.ROUTE_MODE_NORMAL_CHAT,
+            real_direct_target=True,
+            followup_candidate=True,
+            batching_enabled=True,
+        )
+        reply = bnl01_bot.plan_conversation_response(
+            "reply to BNL",
+            "public_home",
+            route_mode=bnl01_bot.ROUTE_MODE_NORMAL_CHAT,
+            reply_to_bot=True,
+            followup_candidate=True,
+            batching_enabled=True,
+        )
+        for plan in (mention, reply):
+            self.assertTrue(plan.should_reply)
+            self.assertEqual(plan.response_timing, bnl01_bot.RESPONSE_TIMING_PACED_DIRECT)
+            self.assertEqual(plan.batch_behavior, bnl01_bot.BATCH_BEHAVIOR_PREEMPT_BATCH)
+
+    def test_sealed_test_chat_is_not_prompt_operator_authority(self):
+        self.assertFalse(bnl01_bot.is_operator_authority_context("sealed_test", "bnl-testing"))
+        self.assertTrue(bnl01_bot.is_operator_authority_context("internal_controlled", "research-and-development"))
+        self.assertTrue(bnl01_bot.is_operator_authority_context("broadcast_memory", "bnl-broadcast-memory"))
 
     def test_public_home_and_sealed_test_free_speak_parity_examples(self):
         cases = [
