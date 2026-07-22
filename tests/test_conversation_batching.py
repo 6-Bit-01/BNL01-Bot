@@ -151,6 +151,12 @@ class ConversationBatchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
             for key in list(bnl01_bot._conversation_continuation_state):
                 if len(key) >= 2 and key[1] == channel_id:
                     bnl01_bot._conversation_continuation_state.pop(key, None)
+            for key in list(bnl01_bot._direct_conversation_ingress_revision):
+                if len(key) >= 2 and key[1] == channel_id:
+                    bnl01_bot._direct_conversation_ingress_revision.pop(key, None)
+            for key in list(bnl01_bot._inflight_direct_repair_generations):
+                if len(key) >= 2 and key[1] == channel_id:
+                    bnl01_bot._inflight_direct_repair_generations.pop(key, None)
             for key, session in list(bnl01_bot._direct_payload_sessions.items()):
                 if len(key) >= 2 and key[1] == channel_id:
                     timer_task = session.get("timer_task")
@@ -396,6 +402,80 @@ class ConversationBatchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("and why do they blink?", prompts[0])
         self.assertEqual(channel.sent, ["One combined response."])
 
+    async def test_batched_repair_turn_uses_visible_context_generation_not_canned_reply(self):
+        channel = self._channel(8116)
+        prompts = []
+        prior_exchange = (
+            "Conversation continuity (bounded same-room window):\n"
+            "- Jon: @Miss Bit what do you think about Friday's opener?\n"
+            "- BNL-01: The tag was for Miss Bit, but I answered anyway."
+        )
+
+        async def generate(prompt, **_kwargs):
+            prompts.append(prompt)
+            return "You're right—the Friday opener was the question, and I answered the wrong person."
+
+        self._prime_flush(channel, "that's not what I asked")
+        with self._flush_runtime(channel.id, generate), mock.patch.object(
+            bnl01_bot,
+            "build_recent_text_room_context_for_prompt",
+            return_value=prior_exchange,
+        ):
+            await bnl01_bot._flush_channel_buffer(channel)
+
+        self.assertEqual(len(prompts), 1)
+        self.assertIn("This is a correction turn", prompts[0])
+        self.assertIn("visible prior exchange", prompts[0])
+        self.assertIn("what do you think about Friday's opener?", prompts[0])
+        self.assertIn("The tag was for Miss Bit, but I answered anyway.", prompts[0])
+        self.assertNotIn("Give me the exact output", prompts[0])
+        self.assertEqual(
+            channel.sent,
+            ["You're right—the Friday opener was the question, and I answered the wrong person."],
+        )
+
+    async def test_batched_durable_recall_governs_once_then_presents_naturally(self):
+        channel = self._channel(8118)
+        provider = mock.AsyncMock(side_effect=AssertionError("deterministic recall must not generate"))
+        legacy = "Archive recall:\n- favorite movie: Hackers [core]\n- current project: BARCODE Radio"
+
+        self._prime_flush(channel, "what do you remember about me?")
+        with (
+            self._flush_runtime(channel.id, provider),
+            mock.patch.object(bnl01_bot, "resolve_recent_media_followup", return_value=""),
+            mock.patch.object(bnl01_bot, "try_memory_recall_response", return_value=legacy),
+            mock.patch.object(bnl01_bot, "apply_explicit_recall_governance", return_value=legacy) as govern,
+            mock.patch.object(bnl01_bot, "is_privileged_member", return_value=False),
+        ):
+            await bnl01_bot._flush_channel_buffer(channel)
+
+        govern.assert_called_once()
+        provider.assert_not_awaited()
+        self.assertEqual(len(channel.sent), 1)
+        self.assertIn("Hackers", channel.sent[0])
+        self.assertIn("BARCODE Radio", channel.sent[0])
+        self.assertNotRegex(channel.sent[0].lower(), r"archive recall|\[core\]|current project")
+
+    async def test_batched_media_followup_wins_without_durable_governance(self):
+        channel = self._channel(8119)
+        provider = mock.AsyncMock(side_effect=AssertionError("deterministic media must not generate"))
+        media_reply = "Crow's recent gif came through as **Spock Logical**."
+
+        self._prime_flush(channel, "what did Crow post?")
+        with (
+            self._flush_runtime(channel.id, provider),
+            mock.patch.object(bnl01_bot, "resolve_recent_media_followup", return_value=media_reply),
+            mock.patch.object(bnl01_bot, "try_memory_recall_response") as recall,
+            mock.patch.object(bnl01_bot, "apply_explicit_recall_governance") as govern,
+            mock.patch.object(bnl01_bot, "is_privileged_member", return_value=False),
+        ):
+            await bnl01_bot._flush_channel_buffer(channel)
+
+        recall.assert_not_called()
+        govern.assert_not_called()
+        provider.assert_not_awaited()
+        self.assertEqual(channel.sent, [media_reply])
+
     async def test_late_fragment_does_not_cancel_generation_and_rebuilds_once(self):
         channel = self._channel(8104)
         generation_started = asyncio.Event()
@@ -500,6 +580,77 @@ class ConversationBatchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(list(bnl01_bot._channel_buffers[channel.id]), [])
         self.assertNotIn(channel.id, bnl01_bot._channel_interrupt_handoff)
         self.assertNotIn(("skip", "stale_batch"), batch_events)
+
+    async def test_fragment_during_guard_regeneration_blocks_stale_send_and_preserves_packet(self):
+        channel = self._channel(8115)
+        guard_started = asyncio.Event()
+        release_guard = asyncio.Event()
+        prompts = []
+        guard_calls = 0
+
+        async def generate(prompt, **_kwargs):
+            prompts.append(prompt)
+            if len(prompts) == 1:
+                return "My current operational parameters are stable."
+            return "Fresh response covering both fragments."
+
+        async def guarded(response, **_kwargs):
+            nonlocal guard_calls
+            guard_calls += 1
+            if guard_calls == 1:
+                guard_started.set()
+                await release_guard.wait()
+                response = ""
+            return response, {
+                "suppressed": guard_calls == 1,
+                "suppression_reason": "register_mismatch_after_retry" if guard_calls == 1 else "",
+                "scripted_mode_leak_guard_triggered": False,
+                "register_mismatch_guard_triggered": guard_calls == 1,
+                "source_grounding_guard_triggered": False,
+                "regenerated_for_mode_leak": False,
+                "regenerated_for_register_mismatch": guard_calls == 1,
+            }
+
+        self._prime_flush(channel, "hey BNL")
+        wait_state = {
+            "selected_wait_seconds": 0.01,
+            "max_wait_seconds": 1.0,
+            "payload_count": 0,
+            "elapsed_seconds": 0,
+            "request_anchor": False,
+        }
+        with (
+            self._flush_runtime(channel.id, generate),
+            mock.patch.object(bnl01_bot, "_adaptive_batch_wait_seconds", return_value=wait_state),
+            mock.patch.object(
+                bnl01_bot,
+                "apply_guarded_response_regeneration",
+                new=mock.AsyncMock(side_effect=guarded),
+            ),
+        ):
+            first_task = asyncio.create_task(bnl01_bot._flush_channel_buffer(channel))
+            bnl01_bot._channel_tasks[channel.id] = first_task
+            await asyncio.wait_for(guard_started.wait(), timeout=0.5)
+
+            generation_id = bnl01_bot._channel_generation_id[channel.id]
+            bnl01_bot._channel_preempted_generation_id[channel.id] = generation_id
+            bnl01_bot._channel_message_interrupt_generation_id[channel.id] = generation_id
+            self._append(channel, "you still sound like a nerd")
+            bnl01_bot._reset_debounce(channel)
+
+            release_guard.set()
+            await asyncio.wait_for(first_task, timeout=1)
+            successor = bnl01_bot._channel_tasks[channel.id]
+            self.assertIsNot(successor, first_task)
+            await asyncio.wait_for(successor, timeout=1)
+
+        self.assertEqual(len(prompts), 2)
+        self.assertIn("hey BNL", prompts[1])
+        self.assertIn("you still sound like a nerd", prompts[1])
+        self.assertEqual(channel.sent, ["Fresh response covering both fragments."])
+        self.assertNotIn("My current operational parameters are stable.", channel.sent)
+        self.assertEqual(list(bnl01_bot._channel_buffers[channel.id]), [])
+        self.assertNotIn(channel.id, bnl01_bot._channel_interrupt_handoff)
 
     async def test_interrupt_handoff_merges_with_newer_buffered_fragment(self):
         channel = self._channel(8107)
@@ -630,7 +781,8 @@ class ConversationBatchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
             self._on_message_runtime(channel.id, followup_candidate=False),
             mock.patch.object(bnl01_bot, "is_direct_bnl_target", return_value=True),
             mock.patch.object(bnl01_bot, "plan_conversation_response", return_value=plan),
-            mock.patch.object(bnl01_bot, "try_repair_response", return_value="Direct reply."),
+            mock.patch.object(bnl01_bot, "try_self_reflection_response", return_value="Direct reply."),
+            mock.patch.object(bnl01_bot, "is_privileged_member", return_value=True),
             mock.patch.object(
                 bnl01_bot,
                 "send_reply_then_save_model",
@@ -645,6 +797,409 @@ class ConversationBatchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(channel.id, bnl01_bot._channel_first_seen)
         self.assertNotIn(channel.id, bnl01_bot._channel_last_message_at)
         send_reply.assert_awaited_once()
+
+    async def test_direct_repair_turn_reaches_contextual_generation_not_canned_reply(self):
+        channel = self._channel(8117)
+        message = FakeMessage(channel, "BNL, that's not what I asked")
+        generated = "You're right—you asked about Friday's opener, and I answered the wrong person."
+        plan = bnl01_bot.plan_conversation_response(
+            "that's not what I asked",
+            "sealed_test",
+            route_mode=bnl01_bot.ROUTE_MODE_NORMAL_CHAT,
+            active_channel=True,
+            real_direct_target=True,
+            batching_enabled=True,
+            conversation_surface=bnl01_bot.CONVERSATION_SURFACE_FREE_SPEAK_SEALED_MIRROR,
+        )
+
+        with (
+            self._on_message_runtime(channel.id, followup_candidate=False),
+            mock.patch.object(bnl01_bot, "is_direct_bnl_target", return_value=True),
+            mock.patch.object(bnl01_bot, "plan_conversation_response", return_value=plan),
+            mock.patch.object(bnl01_bot, "is_privileged_member", return_value=False),
+            mock.patch.object(bnl01_bot, "resolve_recent_media_followup", return_value=""),
+            mock.patch.object(bnl01_bot, "try_memory_recall_response", return_value=""),
+            mock.patch.object(bnl01_bot, "build_show_state_override_context", return_value={}),
+            mock.patch.object(bnl01_bot, "_get_recent_show_state_topic_context", return_value={}),
+            mock.patch.object(bnl01_bot, "build_room_first_direct_context", return_value="Prior visible exchange: Friday's opener."),
+            mock.patch.object(bnl01_bot, "maybe_build_bnl_read_model_context", return_value=""),
+            mock.patch.object(bnl01_bot, "maybe_build_source_context_for_direct_message", new=mock.AsyncMock(return_value="")),
+            mock.patch.object(
+                bnl01_bot,
+                "build_user_aware_prompt",
+                return_value=("Prior visible exchange: Friday's opener.\nCorrection-turn contract: make the corrected attempt now.", False, "social_signal"),
+            ),
+            mock.patch.object(bnl01_bot, "log_response_style"),
+            mock.patch.object(bnl01_bot, "get_gemini_response_with_optional_typing", new=mock.AsyncMock(return_value=generated)) as generate,
+            mock.patch.object(bnl01_bot, "suppress_stale_media_fallback", side_effect=lambda response, **_kwargs: response),
+            mock.patch.object(bnl01_bot, "send_planned_conversation_response", new=mock.AsyncMock()) as send_planned,
+        ):
+            await bnl01_bot.on_message(message)
+
+        generate.assert_awaited_once()
+        self.assertIn("Prior visible exchange", generate.await_args.args[1])
+        send_planned.assert_awaited_once()
+        self.assertEqual(send_planned.await_args.args[1], generated)
+        self.assertEqual(message.replies, [])
+        self.assertNotIn("Give me the exact output", generated)
+
+    async def test_direct_repair_ingress_identity_is_per_user_channel_and_cleanup_is_identity_safe(self):
+        channel = self._channel(8121)
+        first = FakeMessage(channel, "BNL, that's not what I asked")
+        first_ingress = bnl01_bot._register_direct_conversation_ingress(first)
+        first_token = bnl01_bot._begin_direct_repair_generation(first_ingress)
+        self.assertIsNotNone(first_token)
+
+        other_user = FakeMessage(
+            channel,
+            "unrelated message",
+            author=FakeAuthor(user_id=200, display_name="Crow"),
+        )
+        bnl01_bot._register_direct_conversation_ingress(other_user)
+        other_channel = self._channel(8122)
+        bnl01_bot._register_direct_conversation_ingress(
+            FakeMessage(other_channel, "unrelated room", author=first.author)
+        )
+        self.assertTrue(bnl01_bot._direct_repair_generation_is_current(first_token))
+
+        human_directed = FakeMessage(channel, "<@456> I meant Friday's opener", author=first.author)
+        second_ingress = bnl01_bot._register_direct_conversation_ingress(human_directed)
+        self.assertFalse(bnl01_bot._direct_repair_generation_is_current(first_token))
+        second_token = bnl01_bot._begin_direct_repair_generation(second_ingress)
+        self.assertIsNotNone(second_token)
+
+        bnl01_bot._finish_direct_repair_generation(first_token, "older_task_finished")
+        key = second_token["key"]
+        self.assertIs(bnl01_bot._inflight_direct_repair_generations.get(key), second_token)
+        bnl01_bot._finish_direct_repair_generation(second_token, "test_complete")
+        self.assertNotIn(key, bnl01_bot._inflight_direct_repair_generations)
+
+    async def test_stale_repair_paused_before_route_cannot_clear_newer_batch(self):
+        channel = self._channel(8123)
+        author = FakeAuthor()
+        first = FakeMessage(channel, "BNL, that's not what I asked", author=author)
+        newer = FakeMessage(channel, "I meant Friday's opener—answer that.", author=author)
+        first_hook_entered = asyncio.Event()
+        release_first_hook = asyncio.Event()
+
+        async def provider_status_hook(message, _clean_content):
+            if message.id == first.id:
+                first_hook_entered.set()
+                await release_first_hook.wait()
+            return False
+
+        async def batch_generate(prompt, **_kwargs):
+            self.assertIn("I meant Friday's opener", prompt)
+            return "Friday's opener—got it. That's the question I should have answered."
+
+        direct_generate = mock.AsyncMock(side_effect=AssertionError("stale repair must stop before generation"))
+        with (
+            self._on_message_runtime(channel.id, followup_candidate=False),
+            mock.patch.object(
+                bnl01_bot,
+                "maybe_handle_provider_status_command",
+                new=mock.AsyncMock(side_effect=provider_status_hook),
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "is_direct_bnl_target",
+                side_effect=lambda message: message.id == first.id,
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "get_gemini_response_with_optional_typing",
+                new=direct_generate,
+            ),
+        ):
+            first_task = asyncio.create_task(bnl01_bot.on_message(first))
+            await asyncio.wait_for(first_hook_entered.wait(), timeout=0.5)
+            await bnl01_bot.on_message(newer)
+            scheduled = bnl01_bot._channel_tasks.pop(channel.id)
+            scheduled.cancel()
+            try:
+                await scheduled
+            except asyncio.CancelledError:
+                pass
+
+            buffered_before_resume = list(bnl01_bot._channel_buffers[channel.id])
+            self.assertEqual(len(buffered_before_resume), 1)
+            self.assertIn("Friday's opener", buffered_before_resume[0].content)
+
+            release_first_hook.set()
+            await asyncio.wait_for(first_task, timeout=0.5)
+            self.assertEqual(list(bnl01_bot._channel_buffers[channel.id]), buffered_before_resume)
+            direct_generate.assert_not_awaited()
+            self.assertEqual(first.replies, [])
+
+            with self._flush_runtime(channel.id, batch_generate):
+                await bnl01_bot._flush_channel_buffer(channel)
+
+        self.assertEqual(
+            channel.sent,
+            ["Friday's opener—got it. That's the question I should have answered."],
+        )
+
+    async def test_newer_fragment_during_direct_repair_generation_discards_old_and_flushes_newer_batch(self):
+        channel = self._channel(8124)
+        author = FakeAuthor()
+        first = FakeMessage(channel, "BNL, that's not what I asked", author=author)
+        newer = FakeMessage(channel, "I meant Friday's opener—answer that.", author=author)
+        generation_started = asyncio.Event()
+        release_generation = asyncio.Event()
+
+        async def direct_generate(_channel, _prompt, _user_id, _guild_id, **_kwargs):
+            generation_started.set()
+            await release_generation.wait()
+            return "Stale answer that must never send."
+
+        async def batch_generate(prompt, **_kwargs):
+            self.assertIn("I meant Friday's opener", prompt)
+            return "Friday's opener—understood. Here's the corrected answer."
+
+        plan = bnl01_bot.plan_conversation_response(
+            "that's not what I asked",
+            "sealed_test",
+            route_mode=bnl01_bot.ROUTE_MODE_NORMAL_CHAT,
+            active_channel=True,
+            real_direct_target=True,
+            batching_enabled=True,
+            conversation_surface=bnl01_bot.CONVERSATION_SURFACE_FREE_SPEAK_SEALED_MIRROR,
+        )
+        real_planner = bnl01_bot.plan_conversation_response
+
+        def plan_for_message(text, *args, **kwargs):
+            if bnl01_bot.is_conversational_repair_intent(text):
+                return plan
+            return real_planner(text, *args, **kwargs)
+
+        send_planned = mock.AsyncMock()
+        with (
+            self._on_message_runtime(channel.id, followup_candidate=False),
+            mock.patch.object(
+                bnl01_bot,
+                "is_direct_bnl_target",
+                side_effect=lambda message: message.id == first.id,
+            ),
+            mock.patch.object(bnl01_bot, "plan_conversation_response", side_effect=plan_for_message),
+            mock.patch.object(bnl01_bot, "is_privileged_member", return_value=False),
+            mock.patch.object(bnl01_bot, "resolve_recent_media_followup", return_value=""),
+            mock.patch.object(bnl01_bot, "try_memory_recall_response", return_value=""),
+            mock.patch.object(bnl01_bot, "build_show_state_override_context", return_value={}),
+            mock.patch.object(bnl01_bot, "_get_recent_show_state_topic_context", return_value={}),
+            mock.patch.object(bnl01_bot, "build_room_first_direct_context", return_value="Prior visible exchange: Friday's opener."),
+            mock.patch.object(bnl01_bot, "maybe_build_bnl_read_model_context", return_value=""),
+            mock.patch.object(bnl01_bot, "maybe_build_source_context_for_direct_message", new=mock.AsyncMock(return_value="")),
+            mock.patch.object(
+                bnl01_bot,
+                "build_user_aware_prompt",
+                return_value=("Prior visible exchange: Friday's opener.\nCorrection-turn contract.", False, "social_signal"),
+            ),
+            mock.patch.object(bnl01_bot, "log_response_style"),
+            mock.patch.object(
+                bnl01_bot,
+                "get_gemini_response_with_optional_typing",
+                new=mock.AsyncMock(side_effect=direct_generate),
+            ),
+            mock.patch.object(bnl01_bot, "suppress_stale_media_fallback", side_effect=lambda response, **_kwargs: response),
+            mock.patch.object(bnl01_bot, "send_planned_conversation_response", new=send_planned),
+        ):
+            first_task = asyncio.create_task(bnl01_bot.on_message(first))
+            await asyncio.wait_for(generation_started.wait(), timeout=0.5)
+            await bnl01_bot.on_message(newer)
+            scheduled = bnl01_bot._channel_tasks.pop(channel.id)
+            scheduled.cancel()
+            try:
+                await scheduled
+            except asyncio.CancelledError:
+                pass
+
+            release_generation.set()
+            await asyncio.wait_for(first_task, timeout=0.5)
+            send_planned.assert_not_awaited()
+            self.assertEqual(first.replies, [])
+            self.assertEqual(len(bnl01_bot._channel_buffers[channel.id]), 1)
+
+            with self._flush_runtime(channel.id, batch_generate):
+                await bnl01_bot._flush_channel_buffer(channel)
+
+        self.assertEqual(channel.sent, ["Friday's opener—understood. Here's the corrected answer."])
+
+    async def test_newer_message_during_direct_repair_pacing_prevents_guard_send_save_and_mark(self):
+        channel = self._channel(8125)
+        message = FakeMessage(channel, "BNL, that's not what I asked")
+        ingress = bnl01_bot._register_direct_conversation_ingress(message)
+        token = bnl01_bot._begin_direct_repair_generation(ingress)
+        plan = bnl01_bot.plan_conversation_response(
+            "that's not what I asked",
+            "sealed_test",
+            route_mode=bnl01_bot.ROUTE_MODE_NORMAL_CHAT,
+            active_channel=True,
+            real_direct_target=True,
+            batching_enabled=True,
+            conversation_surface=bnl01_bot.CONVERSATION_SURFACE_FREE_SPEAK_SEALED_MIRROR,
+        )
+        pacing_started = asyncio.Event()
+        release_pacing = asyncio.Event()
+
+        async def paced(*_args, **_kwargs):
+            pacing_started.set()
+            await release_pacing.wait()
+
+        guard = mock.AsyncMock(return_value=("must not send", {"suppressed": False}))
+        save = mock.Mock()
+        mark = mock.Mock()
+        greeting = mock.Mock()
+        show_state = mock.Mock()
+        with (
+            mock.patch.object(bnl01_bot, "_apply_direct_response_pacing", side_effect=paced),
+            mock.patch.object(bnl01_bot, "apply_guarded_response_regeneration", new=guard),
+            mock.patch.object(bnl01_bot, "save_model_message", new=save),
+            mock.patch.object(bnl01_bot, "_mark_conversation_continuation_state", new=mark),
+            mock.patch.object(bnl01_bot, "set_last_greeting_at", new=greeting),
+            mock.patch.object(bnl01_bot, "_store_show_state_topic_context", new=show_state),
+        ):
+            send_task = asyncio.create_task(
+                bnl01_bot.send_planned_conversation_response(
+                    message,
+                    "older repair draft",
+                    plan,
+                    prompt="repair prompt",
+                    source_context_available=True,
+                    direct_repair_generation=token,
+                    allow_greeting_on_commit=True,
+                    show_state_context_on_commit={"context_source": "followup"},
+                )
+            )
+            await asyncio.wait_for(pacing_started.wait(), timeout=0.5)
+            bnl01_bot._register_direct_conversation_ingress(
+                FakeMessage(channel, "/debug last route", author=message.author)
+            )
+            release_pacing.set()
+            await asyncio.wait_for(send_task, timeout=0.5)
+
+        guard.assert_not_awaited()
+        save.assert_not_called()
+        mark.assert_not_called()
+        greeting.assert_not_called()
+        show_state.assert_not_called()
+        self.assertEqual(message.replies, [])
+        self.assertNotIn(token["key"], bnl01_bot._inflight_direct_repair_generations)
+
+    async def test_newer_message_during_direct_repair_guard_prevents_send_save_and_mark(self):
+        channel = self._channel(8126)
+        message = FakeMessage(channel, "BNL, that's not what I asked")
+        ingress = bnl01_bot._register_direct_conversation_ingress(message)
+        token = bnl01_bot._begin_direct_repair_generation(ingress)
+        plan = bnl01_bot.plan_conversation_response(
+            "that's not what I asked",
+            "sealed_test",
+            route_mode=bnl01_bot.ROUTE_MODE_NORMAL_CHAT,
+            active_channel=True,
+            real_direct_target=True,
+            batching_enabled=True,
+            conversation_surface=bnl01_bot.CONVERSATION_SURFACE_FREE_SPEAK_SEALED_MIRROR,
+        )
+        guard_started = asyncio.Event()
+        release_guard = asyncio.Event()
+
+        async def guarded(response, **_kwargs):
+            guard_started.set()
+            await release_guard.wait()
+            return response, {"suppressed": False}
+
+        save = mock.Mock()
+        mark = mock.Mock()
+        greeting = mock.Mock()
+        show_state = mock.Mock()
+        with (
+            mock.patch.object(bnl01_bot, "_apply_direct_response_pacing", new=mock.AsyncMock()),
+            mock.patch.object(bnl01_bot, "apply_guarded_response_regeneration", side_effect=guarded),
+            mock.patch.object(bnl01_bot, "build_message_media_context", return_value={"present": False}),
+            mock.patch.object(bnl01_bot, "save_model_message", new=save),
+            mock.patch.object(bnl01_bot, "_mark_conversation_continuation_state", new=mark),
+            mock.patch.object(bnl01_bot, "set_last_greeting_at", new=greeting),
+            mock.patch.object(bnl01_bot, "_store_show_state_topic_context", new=show_state),
+        ):
+            send_task = asyncio.create_task(
+                bnl01_bot.send_planned_conversation_response(
+                    message,
+                    "older repair draft",
+                    plan,
+                    prompt="repair prompt",
+                    source_context_available=True,
+                    direct_repair_generation=token,
+                    allow_greeting_on_commit=True,
+                    show_state_context_on_commit={"context_source": "followup"},
+                )
+            )
+            await asyncio.wait_for(guard_started.wait(), timeout=0.5)
+            bnl01_bot._register_direct_conversation_ingress(
+                FakeMessage(channel, "<@456> I meant the opener", author=message.author)
+            )
+            release_guard.set()
+            await asyncio.wait_for(send_task, timeout=0.5)
+
+        save.assert_not_called()
+        mark.assert_not_called()
+        greeting.assert_not_called()
+        show_state.assert_not_called()
+        self.assertEqual(message.replies, [])
+        self.assertNotIn(token["key"], bnl01_bot._inflight_direct_repair_generations)
+
+    async def test_direct_repair_commits_greeting_and_show_state_only_after_successful_send(self):
+        channel = self._channel(8127)
+        message = FakeMessage(channel, "BNL, that's not what I asked")
+        ingress = bnl01_bot._register_direct_conversation_ingress(message)
+        token = bnl01_bot._begin_direct_repair_generation(ingress)
+        plan = bnl01_bot.plan_conversation_response(
+            "that's not what I asked",
+            "sealed_test",
+            route_mode=bnl01_bot.ROUTE_MODE_NORMAL_CHAT,
+            active_channel=True,
+            real_direct_target=True,
+            batching_enabled=True,
+            conversation_surface=bnl01_bot.CONVERSATION_SURFACE_FREE_SPEAK_SEALED_MIRROR,
+        )
+        show_context = {"context_source": "followup", "answer_type": "show_state"}
+        greeting = mock.Mock()
+        show_state = mock.Mock()
+        save = mock.Mock(return_value=SimpleNamespace(save_conversation=True, reason="saved"))
+        with (
+            mock.patch.object(bnl01_bot, "_apply_direct_response_pacing", new=mock.AsyncMock()),
+            mock.patch.object(
+                bnl01_bot,
+                "apply_guarded_response_regeneration",
+                new=mock.AsyncMock(return_value=("Corrected answer.", {"suppressed": False})),
+            ),
+            mock.patch.object(bnl01_bot, "build_message_media_context", return_value={"present": False}),
+            mock.patch.object(bnl01_bot, "update_last_route_debug"),
+            mock.patch.object(bnl01_bot, "save_model_message", new=save),
+            mock.patch.object(bnl01_bot, "set_last_greeting_at", new=greeting),
+            mock.patch.object(bnl01_bot, "_store_show_state_topic_context", new=show_state),
+            mock.patch.object(bnl01_bot, "_mark_conversation_continuation_state"),
+        ):
+            await bnl01_bot.send_planned_conversation_response(
+                message,
+                "Corrected answer.",
+                plan,
+                prompt="repair prompt",
+                source_context_available=True,
+                direct_repair_generation=token,
+                allow_greeting_on_commit=True,
+                show_state_context_on_commit=show_context,
+            )
+
+        self.assertEqual(message.replies, ["Corrected answer."])
+        greeting.assert_called_once()
+        self.assertEqual(greeting.call_args.args[:2], (message.author.id, message.guild.id))
+        show_state.assert_called_once_with(
+            message.guild.id,
+            message.channel.id,
+            message.author.id,
+            show_context,
+        )
+        save.assert_called_once()
+        self.assertNotIn(token["key"], bnl01_bot._inflight_direct_repair_generations)
 
     async def test_on_message_plain_name_request_preempts_batch_and_accepts_tag_payload(self):
         channel = self._channel(8110)
