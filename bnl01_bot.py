@@ -6866,8 +6866,6 @@ def is_operator_authority_context(channel_policy: str, channel_name: str = "") -
     normalized_name = _normalize_channel_name(channel_name)
     if policy == "broadcast_memory" or normalized_name == "bnl-broadcast-memory":
         return True
-    if policy == "sealed_test" or normalized_name == "bnl-testing":
-        return True
     if policy == "internal_controlled" and normalized_name == "research-and-development":
         return True
     return False
@@ -7348,8 +7346,18 @@ def decide_reply_eligibility(
             True,
             bool(contract.get("reply_when_mentioned", False)),
         )
-    if followup_candidate:
+    if followup_candidate and not (plain_text_name_seen and free_speak_surface):
         allowed = policy in CONVERSATIONAL_POLICIES and bool(contract.get("reply_when_mentioned", False))
+        if allowed and batching and free_speak_surface:
+            return ReplyEligibility(
+                False,
+                f"{surface}_recent_followup_entered_batch",
+                "recent_followup",
+                "batched_followup",
+                True,
+                False,
+                True,
+            )
         return ReplyEligibility(
             allowed,
             "recent_direct_followup_allowed" if allowed else f"{policy}_followup_blocked",
@@ -7495,8 +7503,9 @@ def plan_conversation_response(
     Pipeline audit map:
     - Commands/protected hooks are immediate_command/operator handlers and stay outside
       normal chat generation.
-    - Direct mentions, replies, recent direct follow-ups, and batching-disabled free-speak
-      fallbacks enter paced_direct unless they intentionally start/continue a deferred payload session.
+    - Direct mentions and replies enter paced_direct. On free-speak surfaces, recent
+      unaddressed follow-ups re-enter the debounce coordinator when batching is enabled;
+      batching-disabled fallbacks remain paced direct.
     - Active-channel non-direct messages, free-speak passive room conversation, and
       free-speak plain-text name calls enter debounce batching when batching is enabled;
       non-free-speak passive channels stay quiet when batching is disabled.
@@ -7580,7 +7589,12 @@ def plan_conversation_response(
             "free_speak_conversation",
         }
     )
-    if direct_like and payload_expected and payload_count == 0:
+    plain_name_payload_request = bool(
+        eligibility.policy_reply_class == "batched_plain_name"
+        and eligibility.generation_allowed
+        and conversation_surface_allows_free_speak(surface)
+    )
+    if (direct_like or plain_name_payload_request) and payload_expected and payload_count == 0:
         plan = ConversationPlan(
             ROUTE_MODE_DIRECT_PAYLOAD,
             channel_policy,
@@ -7620,7 +7634,7 @@ def plan_conversation_response(
         plan = _attach_reply_eligibility(plan, eligibility, batching, surface)
         _conversation_plan_log(plan)
         return plan
-    if eligibility.policy_reply_class in {"batched_passive", "batched_plain_name", "silent_observe"} and (active_channel or conversation_surface_allows_free_speak(surface)) and not direct_like:
+    if eligibility.policy_reply_class in {"batched_passive", "batched_plain_name", "batched_followup", "silent_observe"} and (active_channel or conversation_surface_allows_free_speak(surface)) and not direct_like:
         if eligibility.batch_allowed:
             plan = ConversationPlan(
                 mode,
@@ -16591,6 +16605,33 @@ def build_active_batch_conversation_context_v2_prompt(
         is_deferred_payload_session=bool(pending_state or pending_anchor),
     )
 
+
+def _ensure_pending_batch_scheduled(channel: discord.TextChannel, *, reason: str) -> bool:
+    """Schedule buffered work after the task that owned the prior generation exits."""
+    channel_id = channel.id
+    if not _channel_buffers[channel_id] and channel_id not in _channel_interrupt_handoff:
+        return False
+
+    current_task = asyncio.current_task()
+    pending_task = _channel_tasks.get(channel_id)
+    if pending_task and pending_task is not current_task and not pending_task.done():
+        return False
+
+    now = datetime.now(PACIFIC_TZ)
+    _channel_first_seen.setdefault(channel_id, now)
+    _channel_last_message_at.setdefault(channel_id, now)
+    _channel_tasks[channel_id] = asyncio.create_task(_schedule_flush(channel))
+    _log_batch_event(
+        logging.INFO,
+        "pending_batch_rescheduled",
+        channel.guild.id,
+        channel_id,
+        len(_channel_buffers[channel_id]),
+        reason,
+    )
+    return True
+
+
 async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_state=None):
     channel_id = channel.id
     guild_id = channel.guild.id
@@ -16599,7 +16640,8 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
     now = datetime.now(PACIFIC_TZ)
     handoff_items = _channel_interrupt_handoff.pop(channel_id, None)
     buf = _channel_buffers[channel_id]
-    message_count = len(handoff_items) if handoff_items is not None else len(buf)
+    buffered_items = list(buf)
+    message_count = len(handoff_items or []) + len(buffered_items)
 
     if handoff_items is None and not buf:
         _log_batch_event(logging.INFO, "skip", guild_id, channel_id, 0, "empty_buffer")
@@ -16630,7 +16672,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
     elif _channel_payload_wait_extended.get(channel_id):
         selected_wait_seconds = ADAPTIVE_PAYLOAD_WAIT_WITH_ITEMS_SECONDS
     cycle_deadline = batch_start + timedelta(seconds=batch_max_wait)
-    items = list(handoff_items) if handoff_items is not None else list(buf)
+    items = list(handoff_items or []) + buffered_items
     if BNL_ACTIVE_BATCHING_ENABLED:
         pending_state = _consume_pending_request_intent(channel_id, now)
         pending_anchor = _consume_pending_request_anchor(channel_id, now)
@@ -17391,6 +17433,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
     finally:
         _channel_payload_wait_extended[channel_id] = False
         _clear_generation_state(channel_id, local_generation_id)
+        _ensure_pending_batch_scheduled(channel, reason="generation_exit_with_pending_work")
 
 async def _schedule_flush(channel: discord.TextChannel):
     """
@@ -17441,6 +17484,36 @@ async def _schedule_flush(channel: discord.TextChannel):
         sleep_time = min(max(0.1, remaining_quiet), max(0.1, remaining_deadline), float(BATCH_WINDOW_SECONDS))
         await asyncio.sleep(sleep_time)
 
+
+async def _flush_channel_buffer_now(channel: discord.TextChannel) -> bool:
+    """Flush a full buffer without overlapping an active scheduled generation."""
+    channel_id = channel.id
+    if _channel_generating[channel_id]:
+        _log_batch_event(
+            logging.INFO,
+            "buffer_max_deferred",
+            channel.guild.id,
+            channel_id,
+            len(_channel_buffers[channel_id]),
+            "active_generation_preserved",
+        )
+        return False
+
+    scheduled_task = _channel_tasks.get(channel_id)
+    current_task = asyncio.current_task()
+    if scheduled_task and scheduled_task is not current_task and not scheduled_task.done():
+        scheduled_task.cancel()
+        try:
+            await scheduled_task
+        except asyncio.CancelledError:
+            pass
+
+    flush_task = asyncio.create_task(_flush_channel_buffer(channel))
+    _channel_tasks[channel_id] = flush_task
+    await flush_task
+    return True
+
+
 def _reset_debounce(channel: discord.TextChannel):
     cid = channel.id
     if cid not in _channel_first_seen:
@@ -17466,6 +17539,17 @@ def _reset_debounce(channel: discord.TextChannel):
         anchor_uid = raw_items[-1][2] if raw_items[-1][2] else 0
         _set_pending_request_anchor(cid, channel.guild.id, anchor_uid, "request_payload", datetime.now(PACIFIC_TZ), payload_reason)
         _log_batch_event(logging.INFO, "pending_request_anchor_preserved", channel.guild.id, cid, len(raw_items), f"payload_expected=1;count={len(raw_items)}")
+
+    if _channel_generating[cid]:
+        _log_batch_event(
+            logging.INFO,
+            "debounce_reset_deferred",
+            channel.guild.id,
+            cid,
+            len(_channel_buffers[cid]),
+            "active_generation_task_preserved",
+        )
+        return
 
     t = _channel_tasks.get(cid)
     if t and not t.done():
@@ -17790,6 +17874,19 @@ async def on_typing(channel, user, when):
     _log_batch_event(logging.DEBUG, "typing_signal_observed", channel.guild.id, channel.id, len(_channel_buffers[channel.id]), "reason=active_generation")
 
 
+def _is_deictic_payload_placeholder(text: str) -> bool:
+    normalized = re.sub(r"\s+", " ", (text or "").strip().lower()).strip(" .,!?:;")
+    if not normalized:
+        return False
+    return bool(
+        re.fullmatch(
+            r"(?:each|all)?\s*(?:of\s+)?(?:these|those|the\s+following)"
+            r"(?:\s+(?:people|names|items|characters|folks|entries|ones))?",
+            normalized,
+        )
+    )
+
+
 def _collect_inline_direct_payload_items(clean_content: str):
     payload_items = []
     multiline = _extract_multiline_request_payload(clean_content)
@@ -17808,6 +17905,8 @@ def _collect_inline_direct_payload_items(clean_content: str):
     unique = []
     seen = set()
     for raw_item in payload_items:
+        if _is_deictic_payload_placeholder(raw_item):
+            continue
         key = _normalize_payload_item_key(raw_item)
         if not key or key in seen:
             continue
@@ -17887,6 +17986,115 @@ CONVERSATION_CONTINUATION_TTL_SECONDS = max(60, int(os.getenv("BNL_CONVERSATION_
 BNL_QUESTION_ANSWER_TTL_SECONDS = max(60, int(os.getenv("BNL_QUESTION_ANSWER_TTL_SECONDS", "1200") or 1200))
 CONVERSATION_RETRANSMISSION_TTL_SECONDS = max(60, int(os.getenv("BNL_RETRANSMISSION_LATCH_TTL_SECONDS", "180") or 180))
 _conversation_continuation_state = {}
+
+
+def _start_direct_payload_session(
+    message: discord.Message,
+    *,
+    channel_policy: str,
+    request_text: str,
+    current_turn_context: str,
+):
+    """Start the existing protected waiter for a request whose payload is still coming."""
+    session_key = _direct_session_key(message)
+    now = datetime.now(timezone.utc)
+    session = {
+        "guild_id": message.guild.id,
+        "guild": message.guild,
+        "channel_id": message.channel.id,
+        "requester_user_id": message.author.id,
+        "requester_display_name": message.author.display_name,
+        "requester_member": message.author,
+        "channel_policy": channel_policy,
+        "request_text": request_text,
+        "original_request_text": request_text,
+        "anchor_message_id": message.id,
+        "anchor_message": message,
+        "payload_lines": [],
+        "payload_turn_contexts": [],
+        "created_at": now,
+        "last_payload_at": None,
+        "hard_deadline": now + timedelta(seconds=DIRECT_PAYLOAD_HARD_CAP_SECONDS),
+        "completed": False,
+        "generating": False,
+        "generation_invalidated": False,
+        "revision": 0,
+        "last_generation_snapshot_revision": 0,
+        "last_committed_revision": 0,
+        "last_committed_payload_count": 0,
+        "last_bot_response_at": None,
+        "current_turn_context": current_turn_context,
+    }
+    _direct_payload_sessions[session_key] = session
+    session["timer_task"] = asyncio.create_task(_direct_session_timer(session_key))
+    logging.info(
+        "direct_payload_session_created guild_id=%s channel_id=%s user_id=%s channel_policy=%s",
+        message.guild.id,
+        message.channel.id,
+        message.author.id,
+        channel_policy,
+    )
+    return session
+
+
+async def _preempt_pending_batch_for_deferred_session(channel: discord.TextChannel) -> int:
+    """Give an explicit protected payload request sole ownership of the next reply."""
+    channel_id = channel.id
+    pending_count = len(_channel_buffers[channel_id]) + len(_channel_interrupt_handoff.get(channel_id, []))
+    scheduled_task = _channel_tasks.get(channel_id)
+
+    _channel_buffers[channel_id].clear()
+    _channel_interrupt_handoff.pop(channel_id, None)
+    _channel_first_seen.pop(channel_id, None)
+    _channel_last_message_at.pop(channel_id, None)
+    _channel_payload_wait_extended[channel_id] = False
+    _channel_pending_request_intent.pop(channel_id, None)
+    _channel_pending_request_anchor.pop(channel_id, None)
+
+    if scheduled_task and scheduled_task is not asyncio.current_task() and not scheduled_task.done():
+        scheduled_task.cancel()
+        try:
+            await scheduled_task
+        except asyncio.CancelledError:
+            pass
+    if _channel_tasks.get(channel_id) is scheduled_task:
+        _channel_tasks.pop(channel_id, None)
+    _channel_preempted_generation_id[channel_id] = 0
+    _channel_message_interrupt_generation_id[channel_id] = 0
+    if pending_count or scheduled_task:
+        _log_batch_event(
+            logging.INFO,
+            "preempt",
+            channel.guild.id,
+            channel_id,
+            pending_count,
+            "explicit_deferred_payload_session",
+        )
+    return pending_count
+
+
+async def _maybe_start_deferred_payload_session(
+    message: discord.Message,
+    conversation_plan: ConversationPlan,
+    *,
+    channel_policy: str,
+    request_text: str,
+    current_turn_context: str,
+) -> bool:
+    """Connect the coordinator's deferred decision to the existing session waiter."""
+    if not (
+        conversation_plan.should_reply
+        and conversation_plan.response_timing == RESPONSE_TIMING_DEFERRED_PAYLOAD_SESSION
+    ):
+        return False
+    await _preempt_pending_batch_for_deferred_session(message.channel)
+    _start_direct_payload_session(
+        message,
+        channel_policy=channel_policy,
+        request_text=request_text,
+        current_turn_context=current_turn_context,
+    )
+    return True
 
 
 def append_direct_payload_session_turn(session: dict, resolved_text: str, turn_context: str) -> bool:
@@ -19375,6 +19583,15 @@ async def on_message(message: discord.Message):
         )
         save_decision = save_user_message(message.author.id, message.author.display_name, message.guild.id, conversation_content, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0), message_id=getattr(message, "id", None), route_mode=conversation_plan.route_mode, directed_to_bnl=bool(conversation_plan.should_reply or real_direct_target or is_reply))
 
+        if await _maybe_start_deferred_payload_session(
+            message,
+            conversation_plan,
+            channel_policy=channel_policy,
+            request_text=direct_content,
+            current_turn_context=current_turn_context,
+        ):
+            return
+
         # Direct/direct-like traffic is planned independently from passive batching;
         # non-direct active-channel traffic falls through to the batch planner below.
         if conversation_plan.should_reply and conversation_plan.response_timing == RESPONSE_TIMING_PACED_DIRECT:
@@ -19436,36 +19653,12 @@ async def on_message(message: discord.Message):
             if payload_expected:
                 route_mode = ROUTE_MODE_DIRECT_PAYLOAD
             if payload_expected and len(direct_payload_items) == 0:
-                session = {
-                    "guild_id": message.guild.id,
-                    "guild": message.guild,
-                    "channel_id": message.channel.id,
-                    "requester_user_id": message.author.id,
-                    "requester_display_name": message.author.display_name,
-                    "requester_member": message.author,
-                    "channel_policy": channel_policy,
-                    "request_text": direct_content,
-                    "original_request_text": direct_content,
-                    "anchor_message_id": message.id,
-                    "anchor_message": message,
-                    "payload_lines": [],
-                    "payload_turn_contexts": [],
-                    "created_at": datetime.now(timezone.utc),
-                    "last_payload_at": None,
-                    "hard_deadline": datetime.now(timezone.utc) + timedelta(seconds=DIRECT_PAYLOAD_HARD_CAP_SECONDS),
-                    "completed": False,
-                    "generating": False,
-                    "generation_invalidated": False,
-                    "revision": 0,
-                    "last_generation_snapshot_revision": 0,
-                    "last_committed_revision": 0,
-                    "last_committed_payload_count": 0,
-                    "last_bot_response_at": None,
-                    "current_turn_context": current_turn_context,
-                }
-                _direct_payload_sessions[session_key] = session
-                session["timer_task"] = asyncio.create_task(_direct_session_timer(session_key))
-                logging.info("direct_payload_session_created")
+                _start_direct_payload_session(
+                    message,
+                    channel_policy=channel_policy,
+                    request_text=direct_content,
+                    current_turn_context=current_turn_context,
+                )
                 return
 
             show_state_ctx = build_show_state_override_context(message.guild.id, direct_content)
@@ -19641,7 +19834,7 @@ async def on_message(message: discord.Message):
         )
         _channel_last_message_at[message.channel.id] = datetime.now(PACIFIC_TZ)
         if len(_channel_buffers[message.channel.id]) >= BATCH_MAX_MESSAGES:
-            await _flush_channel_buffer(message.channel)
+            await _flush_channel_buffer_now(message.channel)
             return
         _reset_debounce(message.channel)
         return
