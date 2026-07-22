@@ -9958,6 +9958,14 @@ def get_restricted_channel_recall_guard_response(channel_policy: str, user_text:
     return restricted_channel_recall_boundary_response()
 
 
+def get_conversation_recall_guard_response(channel_policy: str, user_text: str, guild_id: int, channel_id: int) -> str:
+    """Apply sealed-test and restricted-channel recall boundaries in one order."""
+    return (
+        get_sealed_test_recall_guard_response(channel_policy, user_text, guild_id, channel_id)
+        or get_restricted_channel_recall_guard_response(channel_policy, user_text, guild_id, channel_id)
+    )
+
+
 def try_repair_response(user_text: str) -> str:
     t = (user_text or "").lower().strip()
     if not t:
@@ -16656,16 +16664,30 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
 
     batch_max_wait = _batch_max_wait_seconds(channel_id)
     last_msg_at = _channel_last_message_at.get(channel_id)
+    resumed_interrupted_handoff = False
     if last_msg_at and (now - last_msg_at).total_seconds() > batch_max_wait:
-        stale_reason = "extended_payload_stale_batch" if _channel_payload_wait_extended.get(channel_id) else "stale_batch"
-        _log_batch_event(logging.INFO, "stale_batch_allowed_extended_payload", guild_id, channel_id, message_count, f"extended={int(_channel_payload_wait_extended.get(channel_id))};max_wait={batch_max_wait}")
-        buf.clear()
-        _channel_first_seen.pop(channel_id, None)
-        _channel_last_message_at.pop(channel_id, None)
-        _log_batch_event(logging.INFO, "skip", guild_id, channel_id, message_count, stale_reason)
-        return
+        if handoff_items is None:
+            stale_reason = "extended_payload_stale_batch" if _channel_payload_wait_extended.get(channel_id) else "stale_batch"
+            _log_batch_event(logging.INFO, "stale_batch_allowed_extended_payload", guild_id, channel_id, message_count, f"extended={int(_channel_payload_wait_extended.get(channel_id))};max_wait={batch_max_wait}")
+            buf.clear()
+            _channel_first_seen.pop(channel_id, None)
+            _channel_last_message_at.pop(channel_id, None)
+            _log_batch_event(logging.INFO, "skip", guild_id, channel_id, message_count, stale_reason)
+            return
+        # These messages were waiting behind an in-flight generation, not abandoned.
+        # Flush them immediately with the preserved packet and give the replacement
+        # generation its own deadline instead of deleting user input as stale.
+        resumed_interrupted_handoff = True
+        _log_batch_event(
+            logging.INFO,
+            "stale_batch_allowed_interrupt_handoff",
+            guild_id,
+            channel_id,
+            message_count,
+            f"blocked_by_generation=1;max_wait={batch_max_wait}",
+        )
 
-    batch_start = _channel_first_seen.get(channel_id, now)
+    batch_start = now if resumed_interrupted_handoff else _channel_first_seen.get(channel_id, now)
     selected_wait_seconds = float(BATCH_WINDOW_SECONDS)
     if scheduler_wait_state and isinstance(scheduler_wait_state, dict):
         selected_wait_seconds = float(scheduler_wait_state.get("selected_wait_seconds", selected_wait_seconds))
@@ -17244,6 +17266,22 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
             if pending_after_discard > 0 or interrupted_by_message:
                 _log_batch_event(logging.INFO, "stale_response_discarded", guild_id, channel_id, len(items), "interrupted_preempted")
             if pending_after_discard > 0:
+                # The generated response covered ``items`` but cannot be sent after a
+                # newer fragment arrived. Preserve that full packet for the successor
+                # flush; requeueing only the newest buffer loses the conversation that
+                # the discarded response was answering.
+                _channel_interrupt_handoff[channel_id] = list(items)
+                _channel_first_seen[channel_id] = datetime.now(PACIFIC_TZ)
+                _channel_preempted_generation_id[channel_id] = 0
+                _channel_message_interrupt_generation_id[channel_id] = 0
+                _log_batch_event(
+                    logging.INFO,
+                    "hard_interrupt_packet_handoff",
+                    guild_id,
+                    channel_id,
+                    len(items) + pending_after_discard,
+                    "full_context_preserved_after_regeneration",
+                )
                 _log_batch_event(
                     logging.INFO,
                     "generation_requeued_after_interruption",
@@ -18088,6 +18126,21 @@ async def _maybe_start_deferred_payload_session(
     ):
         return False
     await _preempt_pending_batch_for_deferred_session(message.channel)
+    recall_guard = get_conversation_recall_guard_response(
+        channel_policy,
+        request_text,
+        message.guild.id,
+        message.channel.id,
+    )
+    if recall_guard:
+        await message.reply(recall_guard, allowed_mentions=discord.AllowedMentions.none())
+        logging.info(
+            "direct_payload_session_start_blocked reason=recall_guard guild_id=%s channel_id=%s user_id=%s",
+            message.guild.id,
+            message.channel.id,
+            message.author.id,
+        )
+        return True
     _start_direct_payload_session(
         message,
         channel_policy=channel_policy,
@@ -18126,12 +18179,15 @@ def close_direct_payload_session_after_failed_generation(session_key, session: d
     session["generating"] = False
     session["completed"] = True
     session["generation_invalidated"] = False
-    _direct_payload_sessions.pop(session_key, None)
+    removed_current_session = _direct_payload_sessions.get(session_key) is session
+    if removed_current_session:
+        _direct_payload_sessions.pop(session_key, None)
     logging.info(
-        "direct_payload_session_closed reason=%s revision=%s payload_count=%s",
+        "direct_payload_session_closed reason=%s revision=%s payload_count=%s removed_current_session=%s",
         reason,
         int(session.get("revision", 0)),
         len(session.get("payload_lines", [])),
+        int(removed_current_session),
     )
 
 
@@ -18352,6 +18408,27 @@ async def _generate_direct_payload_session(session_key, reason: str):
     if delta_mode:
         logging.info(f"direct_session_delta_continuation_started from_payload_count={last_committed_payload_count} to_payload_count={payload_count}")
     direct_content = session["original_request_text"] + "\n" + "\n".join(generation_lines)
+    recall_guard_content = session["original_request_text"] + "\n" + "\n".join(payload_lines)
+    recall_guard = get_conversation_recall_guard_response(
+        session.get("channel_policy", "unknown"),
+        recall_guard_content,
+        session["guild_id"],
+        session.get("channel_id", 0),
+    )
+    if recall_guard:
+        # Remove this exact guarded revision before yielding to Discord. A new
+        # request may create a replacement session while the boundary reply sends.
+        close_direct_payload_session_after_failed_generation(session_key, session, "recall_guard")
+        try:
+            await anchor_message.reply(recall_guard, allowed_mentions=discord.AllowedMentions.none())
+        except Exception as exc:
+            logging.error(
+                "response_send_failed route=%s channel_id=%s discord_error_type=%s",
+                "direct_payload_session_recall_guard",
+                session.get("channel_id", 0),
+                type(exc).__name__,
+            )
+        return
     direct_payload_items = []
     seen = set()
     for line in generation_lines:
@@ -19459,6 +19536,31 @@ async def on_message(message: discord.Message):
                         f"payload_count={payload_count};last_committed_payload_count={last_committed_payload_count}"
                     )
                 else:
+                    recall_guard_content = "\n".join(
+                        [
+                            active_direct_session.get("original_request_text", ""),
+                            *active_direct_session.get("payload_lines", []),
+                            line,
+                        ]
+                    )
+                    recall_guard = get_conversation_recall_guard_response(
+                        active_direct_session.get("channel_policy", channel_policy),
+                        recall_guard_content,
+                        active_direct_session.get("guild_id", message.guild.id),
+                        active_direct_session.get("channel_id", message.channel.id),
+                    )
+                    if recall_guard:
+                        active_direct_session["generation_invalidated"] = True
+                        active_direct_session["completed"] = True
+                        _direct_payload_sessions.pop(session_key, None)
+                        await message.reply(recall_guard, allowed_mentions=discord.AllowedMentions.none())
+                        logging.info(
+                            "direct_payload_session_payload_blocked reason=recall_guard guild_id=%s channel_id=%s user_id=%s",
+                            message.guild.id,
+                            message.channel.id,
+                            message.author.id,
+                        )
+                        return
                     append_direct_payload_session_turn(
                         active_direct_session,
                         line,
@@ -19619,9 +19721,13 @@ async def on_message(message: discord.Message):
                 _channel_preempted_generation_id[message.channel.id] = _channel_generation_id[message.channel.id]
                 _channel_message_interrupt_generation_id[message.channel.id] = _channel_generation_id[message.channel.id]
                 _log_batch_event(logging.INFO, "stale_response_discarded", message.guild.id, message.channel.id, len(_channel_buffers[message.channel.id]), "direct_reply_preempted_generation")
-            pending_count = len(_channel_buffers[message.channel.id])
+            pending_count = (
+                len(_channel_buffers[message.channel.id])
+                + len(_channel_interrupt_handoff.get(message.channel.id, []))
+            )
             if pending_count:
                 _channel_buffers[message.channel.id].clear()
+                _channel_interrupt_handoff.pop(message.channel.id, None)
                 _channel_first_seen.pop(message.channel.id, None)
                 _channel_last_message_at.pop(message.channel.id, None)
                 pending_task = _channel_tasks.get(message.channel.id)
