@@ -163,7 +163,9 @@ class BehaviorContractRouteTests(unittest.TestCase):
             "",
         )
         recall = bnl01_bot.resolve_recent_media_followup(101, 10, 20, "sealed_test", "what was my GIF?")
-        self.assertIn("recent gif", recall.lower())
+        self.assertIn("recent post", recall.lower())
+        self.assertIn("visual detail", recall.lower())
+        self.assertNotRegex(recall.lower(), r"provider=|preview=|logged as|stored visual description")
 
 
     def test_public_home_substantive_roleplay_continuation_forces_answer(self):
@@ -500,8 +502,9 @@ class BehaviorContractGenerationTests(unittest.IsolatedAsyncioTestCase):
             response_state="answered",
         )
         recall = bnl01_bot.resolve_recent_media_followup(101, 33, 44, "sealed_test", "can you see that GIF?")
-        self.assertIn("do not have", recall.lower())
-        self.assertIn("recent gif", recall.lower())
+        self.assertIn("didn't get enough visual detail", recall.lower())
+        self.assertIn("recent post", recall.lower())
+        self.assertNotRegex(recall.lower(), r"provider=|preview=|logged as|stored visual description")
 
     async def test_glitch_rewrite_kept_when_grounded_and_rejected_when_it_adds_fake_media_source(self):
         prompt = media_prompt("sealed_test", room_context="- Maze: booth lights made the room buzz.")

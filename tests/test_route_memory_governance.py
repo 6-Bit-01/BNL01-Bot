@@ -923,6 +923,8 @@ class MemoryInjectionGovernanceTests(unittest.TestCase):
             bnl01_bot.DB_FILE = old_db
         self.assertIn("Mode contract: normal_chat", prompt)
         self.assertIn("Answer the user's actual message", prompt)
+        self.assertIn("bounded conversational answer", prompt)
+        self.assertIn("use the visible prior exchange", prompt)
         self.assertIn("Do not expose source-file, dossier, classification, candidate", prompt)
         self.assertIn("unless explicitly asked", prompt)
 
@@ -932,9 +934,6 @@ class LeakGuardTests(unittest.TestCase):
         leaked_texts = (
             "Records are thin",
             "Lardcode Radio: Records are thin",
-            "one suspicious blinking light",
-            "preliminary analysis",
-            "data stream",
             "source coverage",
             "existing dossier update",
             "public dossier update lane",
@@ -947,8 +946,63 @@ class LeakGuardTests(unittest.TestCase):
             self.assertTrue(bnl01_bot.detect_scripted_mode_leak(text, bnl01_bot.ROUTE_MODE_NORMAL_CHAT), text)
 
     def test_guard_preserves_bnl_voice_phrases(self):
-        for text in ("Functioning within optimal parameters", "ambient signal patterns are calm"):
-            self.assertFalse(bnl01_bot.detect_scripted_mode_leak(text, bnl01_bot.ROUTE_MODE_NORMAL_CHAT), text)
+        for text in (
+            "Functioning within optimal parameters",
+            "ambient signal patterns are calm",
+            "preliminary analysis: you are enjoying this far too much",
+            "encouragement has entered the data stream",
+            "one suspicious blinking light just became two",
+            "the insult crossed a compromised broadcast loop and still landed",
+        ):
+            self.assertFalse(
+                bnl01_bot.detect_normal_chat_presentation_mode_leak(
+                    text,
+                    bnl01_bot.ROUTE_MODE_NORMAL_CHAT,
+                ),
+                text,
+            )
+
+    def test_shared_fallback_keeps_legacy_mode_leak_contract(self):
+        for text in (
+            "Acknowledged, operator.",
+            "Preliminary analysis: signal nominal.",
+            "Encouragement entered the data stream.",
+            "One suspicious blinking light remains.",
+            "The message crossed a compromised broadcast loop.",
+        ):
+            self.assertTrue(
+                bnl01_bot.detect_scripted_mode_leak(
+                    text,
+                    bnl01_bot.ROUTE_MODE_NORMAL_CHAT,
+                ),
+                text,
+            )
+
+    def test_social_turns_cannot_select_analytic_or_deep_styles(self):
+        with (
+            mock.patch.object(bnl01_bot, "get_recent_response_styles", return_value=[]),
+            mock.patch.object(bnl01_bot.random, "choices", return_value=["social_signal"]) as choose,
+        ):
+            picked, _rule = bnl01_bot.choose_response_style(
+                1,
+                101,
+                3,
+                "hey BNL you still sound like a nerd but I know you're trying",
+            )
+        self.assertEqual(picked, "social_signal")
+        self.assertEqual(choose.call_args.args[0], ["brief_ping", "steady_reply", "social_signal"])
+
+    def test_operator_status_trigger_is_command_shaped(self):
+        with mock.patch.object(bnl01_bot, "build_upgrade_status_response", return_value="status") as build:
+            self.assertEqual(bnl01_bot.try_self_reflection_response(101, 1, "BNL, run status pulse"), "status")
+            self.assertEqual(bnl01_bot.try_self_reflection_response(101, 1, "your status pulse reply sounded strange"), "")
+            self.assertEqual(bnl01_bot.try_self_reflection_response(101, 1, "how are your operational parameters?"), "")
+        build.assert_called_once_with(101, 1)
+
+    def test_repair_detection_is_intent_not_a_canned_response(self):
+        self.assertTrue(bnl01_bot.is_conversational_repair_intent("that's not what I asked"))
+        self.assertFalse(bnl01_bot.is_conversational_repair_intent("you missed—what should we deploy now?"))
+        self.assertEqual(bnl01_bot.try_repair_response("that's not what I asked"), "")
 
     def test_guard_does_not_fire_for_ordinary_classification_discussion(self):
         text = "We talked about genre classification in the archive yesterday."
@@ -1140,8 +1194,9 @@ class RegressionExamplesTests(unittest.TestCase):
 
     def test_simple_greeting_uses_generation_contract_not_stock_pool(self):
         contract = bnl01_bot.normal_chat_prompt_contract(bnl01_bot.ROUTE_MODE_SIMPLE_GREETING).lower()
-        self.assertIn("natural reply", contract)
-        self.assertIn("does not sound like a presence/status template", contract)
+        self.assertIn("react to the exact greeting with one short reply", contract)
+        self.assertIn("glitch language", contract)
+        self.assertNotIn("presence/status template", contract)
         self.assertFalse(hasattr(bnl01_bot, "SIMPLE_GREETING_RESPONSE_POOL"))
         self.assertFalse(hasattr(bnl01_bot, "build_simple_greeting_response"))
 
@@ -1155,6 +1210,23 @@ class RegressionExamplesTests(unittest.TestCase):
         self.assertNotIn("optimal parameters", lowered)
         self.assertNotIn("ambient signal patterns", lowered)
         self.assertNotIn("ask me that normally", lowered)
+
+    def test_direct_and_batched_prompts_share_the_technical_voice_boundary(self):
+        direct = bnl01_bot.normal_chat_prompt_contract(bnl01_bot.ROUTE_MODE_NORMAL_CHAT).lower()
+        batched = bnl01_bot._format_batched_prompt(
+            [("Crow", "you still sound like a nerd", 101)],
+            "social_signal",
+            "brief and playful",
+        ).lower()
+        for prompt in (direct, batched):
+            self.assertIn("technical, system, operational, network, and glitch language", prompt)
+            self.assertIn("take over the whole reply", prompt)
+            self.assertIn("no phrase is disallowed merely because it sounds mechanical", prompt)
+            self.assertNotIn("do not use 'acknowledged'", prompt)
+            self.assertNotIn("do not start with \"acknowledged\"", prompt)
+            self.assertNotIn("operational-parameters disclaimer", prompt)
+        self.assertNotIn("use corporate/system flavor lightly", batched)
+        self.assertNotIn("do not begin ordinary chat with 'acknowledged'", batched)
 
     def test_check_in_fallback_makes_sense_as_answer(self):
         fallback = bnl01_bot.safe_fallback_response_for_mode_leak(
@@ -1403,7 +1475,8 @@ class RecentMediaRoomContextTests(unittest.TestCase):
         )
         response = bnl01_bot.resolve_recent_media_followup(101, 1, 2, "public_home", "what was my GIF of?")
         self.assertIn("Tenor", response)
-        self.assertIn("do not have a detailed visual description", response)
+        self.assertIn("didn't get enough visual detail", response)
+        self.assertNotRegex(response.lower(), r"provider=|preview=|logged as|stored visual description")
 
     def test_public_home_media_context_is_transient_not_durable_memory(self):
         event = bnl01_bot.record_recent_media_event(
@@ -1557,6 +1630,56 @@ class RecentMediaRoomContextTests(unittest.TestCase):
         self.assertFalse(diag["canned_ack_suppressed"])
 
 
+class RecallPresentationTests(unittest.TestCase):
+    def test_legacy_fact_recall_hides_storage_labels_but_preserves_values(self):
+        legacy = (
+            "Archive recall:\n"
+            "- favorite movie: Hackers [core]\n"
+            "- user note: the opener starts at eight\n"
+            "- current project: BARCODE Radio"
+        )
+        response = bnl01_bot.format_explicit_recall_for_chat(legacy)
+        self.assertIn("Hackers", response)
+        self.assertIn("the opener starts at eight", response)
+        self.assertIn("BARCODE Radio", response)
+        self.assertNotRegex(response.lower(), r"archive recall|\[core\]|user note|current project")
+
+    def test_governed_recall_heading_is_natural_without_changing_selection(self):
+        governed = "Here is what I can safely recall:\n- favorite color is green\n- preferred answer length is short"
+        response = bnl01_bot.format_explicit_recall_for_chat(governed)
+        self.assertEqual(
+            response,
+            "Here's what I remember:\n- favorite color is green\n- preferred answer length is short",
+        )
+
+    def test_habit_telemetry_becomes_plain_language(self):
+        legacy = (
+            "Observed pattern snapshot:\n"
+            "- Volume: 10 logged messages\n"
+            "- Question rate: 0.60\n"
+            "- Humor rate: 0.30\n"
+            "- Late-night activity: 0.40\n"
+            "- Typical length: 35.0 chars\n"
+            "- Recent topic drift: radio"
+        )
+        response = bnl01_bot.format_explicit_recall_for_chat(legacy)
+        self.assertIn("ask a lot of questions", response)
+        self.assertIn("Humor", response)
+        self.assertIn("late at night", response)
+        self.assertIn("radio", response)
+        self.assertNotRegex(response.lower(), r"observed pattern snapshot|question rate|logged messages|chars")
+
+    def test_empty_and_favorite_recall_stay_honest_and_natural(self):
+        self.assertEqual(
+            bnl01_bot.format_explicit_recall_for_chat("Your favorite movie on record is **Hackers**."),
+            "Your favorite movie is **Hackers**.",
+        )
+        self.assertEqual(
+            bnl01_bot.format_explicit_recall_for_chat("I do not have durable memory entries for you yet."),
+            "I don't have anything reliable to recall about you yet.",
+        )
+
+
 class GuardedResponseRegenerationTests(unittest.IsolatedAsyncioTestCase):
     async def test_grounding_retry_honors_quota_and_records_status(self):
         provider = mock.AsyncMock()
@@ -1576,14 +1699,79 @@ class GuardedResponseRegenerationTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result.success)
         self.assertEqual(result.provider_error_code, "local_quota_guard")
 
-    async def test_screenshot_style_operational_banter_is_regenerated_even_when_short(self):
-        async def fake_regen(channel, prompt, user_id, guild_id, route="get_gemini_response"):
-            self.assertIn("previous draft tripped the mode-leak guard", prompt)
-            return "Nerd is acceptable. I prefer 'aggressively specialized,' but the charge will stand."
+    async def test_shared_grounding_retry_does_not_tone_filter_safe_machine_voice(self):
+        provider_result = bnl01_bot.GenerationResult(
+            True,
+            "Preliminary analysis: signal nominal.",
+            "",
+            "",
+            "",
+            "conversation_grounding_regeneration",
+            0.0,
+            "test-model",
+        )
+        with (
+            mock.patch.object(bnl01_bot, "check_quota_availability", return_value=True),
+            mock.patch.object(
+                bnl01_bot,
+                "_generate_gemini_content_result_async",
+                new=mock.AsyncMock(return_value=provider_result),
+            ),
+        ):
+            response = await bnl01_bot._strict_regenerate_grounded_conversation_response(
+                "Current user request: what tag?",
+                "website_relay_event",
+            )
+        self.assertEqual("Preliminary analysis: signal nominal.", response)
 
+    async def test_shared_grounding_retry_uses_the_full_source_authority_boundary(self):
+        unsupported_claims = (
+            "The Network confirms the opener is Friday.",
+            "The record confirms the opener is Friday.",
+            "The archive shows the opener is Friday.",
+            "The archive indicates the opener is Friday.",
+            "A verified log places the opener on Friday.",
+            "Verified logs place the opener on Friday.",
+            "Archive scans place the opener on Friday.",
+        )
+        for candidate in unsupported_claims:
+            with self.subTest(candidate=candidate):
+                provider_result = bnl01_bot.GenerationResult(
+                    True,
+                    candidate,
+                    "",
+                    "",
+                    "",
+                    "conversation_grounding_regeneration",
+                    0.0,
+                    "test-model",
+                )
+                with (
+                    mock.patch.object(bnl01_bot, "check_quota_availability", return_value=True),
+                    mock.patch.object(
+                        bnl01_bot,
+                        "_generate_gemini_content_result_async",
+                        new=mock.AsyncMock(return_value=provider_result),
+                    ),
+                ):
+                    response = await bnl01_bot._strict_regenerate_grounded_conversation_response(
+                        "Current user request: when is the opener?",
+                        "normal_chat",
+                        source_context_available=False,
+                    )
+                self.assertEqual("", response)
+
+    async def test_screenshot_style_operational_banter_is_not_tone_policed(self):
         stock = "Acknowledged, 6 Bit. The designation 'nerd' is processed as a descriptor."
         self.assertTrue(bnl01_bot.detect_scripted_mode_leak(stock, bnl01_bot.ROUTE_MODE_NORMAL_CHAT))
-        with mock.patch.object(bnl01_bot, "get_gemini_response_with_optional_typing", side_effect=fake_regen):
+        self.assertFalse(
+            bnl01_bot.detect_normal_chat_presentation_mode_leak(
+                stock,
+                bnl01_bot.ROUTE_MODE_NORMAL_CHAT,
+            )
+        )
+        provider = mock.AsyncMock(return_value="must not be used")
+        with mock.patch.object(bnl01_bot, "get_gemini_response_with_optional_typing", provider):
             response, diagnostics = await bnl01_bot.apply_guarded_response_regeneration(
                 stock,
                 prompt="Current user request: nerd",
@@ -1596,9 +1784,294 @@ class GuardedResponseRegenerationTests(unittest.IsolatedAsyncioTestCase):
                 is_reply=True,
             )
         self.assertFalse(diagnostics["suppressed"])
-        self.assertTrue(diagnostics["regenerated_for_mode_leak"])
-        self.assertNotIn("Acknowledged", response)
-        self.assertNotIn("processed as", response)
+        self.assertEqual(stock, response)
+        self.assertFalse(diagnostics["register_mismatch_guard_triggered"])
+        self.assertFalse(diagnostics["regenerated_for_register_mismatch"])
+        provider.assert_not_awaited()
+
+    async def test_exact_live_operational_banter_register_is_not_tone_policed(self):
+        stock = (
+            "My processing prioritizes clarity, 6 Bit. If this translates to a 'nerd' designation, "
+            "then my current operational parameters are stable. The Network's iterative development "
+            "cycles ensure my 'trying' is perpetual."
+        )
+
+        provider = mock.AsyncMock(return_value="must not be used")
+        with mock.patch.object(bnl01_bot, "get_gemini_response_with_optional_typing", provider):
+            response, diagnostics = await bnl01_bot.apply_guarded_response_regeneration(
+                stock,
+                prompt="Current user request: hey BNL / you still sound like a nerd / but I know you're trying",
+                user_id=101,
+                guild_id=1,
+                route_mode=bnl01_bot.ROUTE_MODE_NORMAL_CHAT,
+                channel_policy="sealed_test",
+                user_display_name="6 Bit",
+                current_user_text="hey BNL you still sound like a nerd but I know you're trying",
+            )
+        self.assertFalse(diagnostics["suppressed"])
+        self.assertEqual(stock, response)
+        self.assertFalse(diagnostics["register_mismatch_guard_triggered"])
+        self.assertFalse(diagnostics["regenerated_for_register_mismatch"])
+        provider.assert_not_awaited()
+
+    async def test_technical_character_voice_survives_the_complete_guard_pipeline(self):
+        banter = "hey BNL you still sound like a nerd but I know you're trying"
+        flavor_replies = (
+            "Nerd is fair. Your confidence in me is becoming an inconveniently positive datapoint.",
+            "My systems registered the insult. Nerd is fair, and the confidence helps.",
+            "Preliminary analysis: nerd is fair, and you are enjoying this far too much.",
+            "Nerd is fair. Encouragement has entered the data stream; irritatingly, it helps.",
+            "Nerd is fair. My systems registered the insult; it was an interesting datapoint.",
+            "My processing prioritizes making fun of you. Obviously.",
+            "I register your complaint as completely justified.",
+            "Your confidence is an interesting datapoint for the Network analysis and frankly I appreciate it.",
+            "My processing prioritizes clarity, which is why I am telling you directly: that joke sucked.",
+            "My processing is designed to prioritize clarity, which is why your joke sucked.",
+            "My architecture is configured for contextual consistency, which is why that opener works.",
+            "My programming does not encompass mercy, so yes, I am roasting you.",
+            "I do not experience human emotions, but that was funny enough to trigger a checksum spike.",
+            (
+                "My processing prioritizes clarity and my current operational parameters are stable "
+                "enough to confirm one thing: nerd is fair, and your confidence helps."
+            ),
+            (
+                "My processing prioritizes clarity. My current operational parameters are stable. "
+                "The Network's iterative development cycle ensures my 'trying' is perpetual. "
+                "Anyway, nerd is fair, and your confidence helps."
+            ),
+            (
+                "Nerd is fair. My processing prioritizes clarity and my current operational "
+                "parameters are stable while the Network's iterative development cycle ensures "
+                "my trying is perpetual."
+            ),
+        )
+        for candidate in flavor_replies:
+            with self.subTest(candidate=candidate):
+                provider = mock.AsyncMock(return_value="must not be used")
+                with mock.patch.object(
+                    bnl01_bot,
+                    "get_gemini_response_with_optional_typing",
+                    provider,
+                ):
+                    response, diagnostics = await bnl01_bot.apply_guarded_response_regeneration(
+                        candidate,
+                        prompt="Current user request: nerd banter",
+                        user_id=101,
+                        guild_id=1,
+                        route_mode=bnl01_bot.ROUTE_MODE_NORMAL_CHAT,
+                        channel_policy="sealed_test",
+                        current_user_text=banter,
+                    )
+                self.assertEqual(candidate, response)
+                self.assertFalse(diagnostics["suppressed"])
+                self.assertFalse(diagnostics["scripted_mode_leak_guard_triggered"])
+                self.assertFalse(diagnostics["register_mismatch_guard_triggered"])
+                provider.assert_not_awaited()
+
+    async def test_system_talk_is_not_rejected_by_a_style_classifier(self):
+        process_only_replies = (
+            "Your input has been received and is being processed.",
+            "Request acknowledged. Running sentiment analysis now.",
+            "SYSTEM STATUS: Engagement protocol active. Sentiment input processed.",
+            "My programming does not encompass humor.",
+            "I do not experience human emotions in the usual way.",
+            "My current operational parameters are stable.",
+            "Request acknowledged. Response protocol active.",
+            "Processing continues. Systems nominal.",
+            "My current operational parameters are stable. The Network is watching.",
+            "Noted. Running analysis.",
+            "Processing request. Please stand by.",
+            "My processing is designed to prioritize context and accuracy.",
+            "My architecture is configured for contextual consistency.",
+            "This is an interesting datapoint for the Network analysis.",
+            "My processing prioritizes clarity and my current operational parameters are stable.",
+            "Your message is logged. Awaiting next input.",
+            "Analysis complete. Response protocol nominal.",
+            "Input received. Formulating response.",
+            "Diagnostic complete. Conversation subsystem active.",
+            "Analysis finished. Waiting for further instructions.",
+            "Request received. Standing by.",
+            "Input received. Generating output.",
+            "[SIGNAL DESYNC] SYSTEM STATUS: conversation subsystem unstable. The Network is watching.",
+            "PR0TOCOL FRACTURE—request acknowledged; response channel glitching.",
+            (
+                "My processing is designed to prioritize clarity and my architecture is configured "
+                "for contextual consistency."
+            ),
+            "Acknowledged:",
+            "I register your question:",
+        )
+        for candidate in process_only_replies:
+            with self.subTest(candidate=candidate):
+                provider = mock.AsyncMock(return_value="must not be used")
+                with mock.patch.object(
+                    bnl01_bot,
+                    "get_gemini_response_with_optional_typing",
+                    provider,
+                ):
+                    response, diagnostics = await bnl01_bot.apply_guarded_response_regeneration(
+                        candidate,
+                        prompt="Current user request: nerd banter",
+                        user_id=101,
+                        guild_id=1,
+                        route_mode=bnl01_bot.ROUTE_MODE_NORMAL_CHAT,
+                        channel_policy="sealed_test",
+                        current_user_text="you still sound like a nerd but I know you're trying",
+                    )
+                self.assertEqual(candidate, response)
+                self.assertFalse(diagnostics["suppressed"])
+                self.assertFalse(diagnostics["register_mismatch_guard_triggered"])
+                self.assertFalse(diagnostics["regenerated_for_register_mismatch"])
+                provider.assert_not_awaited()
+
+    async def test_validation_only_preserves_technical_voice_byte_exact(self):
+        candidate = "Preliminary analysis: the opener works; the static gives it teeth."
+        provider = mock.AsyncMock(return_value="must not be used")
+        with mock.patch.object(
+            bnl01_bot,
+            "get_gemini_response_with_optional_typing",
+            provider,
+        ):
+            response = await bnl01_bot.validate_deterministic_normal_chat_response(
+                candidate,
+                user_id=101,
+                guild_id=1,
+                route_mode=bnl01_bot.ROUTE_MODE_NORMAL_CHAT,
+                channel_policy="sealed_test",
+                current_user_text="what do you think of the opener?",
+            )
+        self.assertEqual(candidate, response)
+        provider.assert_not_awaited()
+
+    async def test_explicit_status_question_allows_literal_operational_answer(self):
+        for user_text in (
+            "BNL, answer like a diagnostic readout: how are your systems?",
+            "BNL, explain your operational parameters",
+            "BNL, are your systems okay?",
+            "BNL, are all your systems okay?",
+            "BNL, are your systems doing okay?",
+        ):
+            with self.subTest(user_text=user_text):
+                provider = mock.AsyncMock()
+                with mock.patch.object(bnl01_bot, "get_gemini_response_with_optional_typing", provider):
+                    response, diagnostics = await bnl01_bot.apply_guarded_response_regeneration(
+                        "My current operational parameters are stable.",
+                        prompt="Current user request: systems status",
+                        user_id=101,
+                        guild_id=1,
+                        route_mode=bnl01_bot.ROUTE_MODE_NORMAL_CHAT,
+                        channel_policy="sealed_test",
+                        current_user_text=user_text,
+                    )
+                self.assertEqual(response, "My current operational parameters are stable.")
+                self.assertFalse(diagnostics["register_mismatch_guard_triggered"])
+                provider.assert_not_awaited()
+
+    async def test_explicit_register_wording_is_preserved_through_full_guard(self):
+        provider = mock.AsyncMock()
+        with mock.patch.object(bnl01_bot, "get_gemini_response_with_optional_typing", provider):
+            response, diagnostics = await bnl01_bot.apply_guarded_response_regeneration(
+                "I register your request.",
+                prompt="Current user request: exact wording",
+                user_id=101,
+                guild_id=1,
+                route_mode=bnl01_bot.ROUTE_MODE_NORMAL_CHAT,
+                channel_policy="sealed_test",
+                current_user_text="BNL, reply with I register your request",
+            )
+        self.assertEqual("I register your request.", response)
+        self.assertFalse(diagnostics["register_mismatch_guard_triggered"])
+        provider.assert_not_awaited()
+
+    async def test_explicit_network_watch_question_allows_literal_answer(self):
+        for user_text in (
+            "BNL, is the Network still watching?",
+            "BNL, does the Network watch us?",
+        ):
+            with self.subTest(user_text=user_text):
+                provider = mock.AsyncMock(return_value="must not be used")
+                with mock.patch.object(bnl01_bot, "get_gemini_response_with_optional_typing", provider):
+                    response, diagnostics = await bnl01_bot.apply_guarded_response_regeneration(
+                        "The Network is watching.",
+                        prompt="Current user request: Network watch status",
+                        user_id=101,
+                        guild_id=1,
+                        route_mode=bnl01_bot.ROUTE_MODE_NORMAL_CHAT,
+                        channel_policy="sealed_test",
+                        current_user_text=user_text,
+                    )
+                self.assertEqual("The Network is watching.", response)
+                self.assertFalse(diagnostics["register_mismatch_guard_triggered"])
+                provider.assert_not_awaited()
+
+    async def test_explicit_technical_question_allows_relevant_machine_language(self):
+        candidate = "My processing is designed to process nearby room context before older signals."
+        for user_text in (
+            "BNL, can you explain how you process context?",
+            "BNL, can you walk me through how you process context?",
+            "BNL, could you break down how you process context?",
+            "BNL, how exactly do you process context?",
+        ):
+            with self.subTest(user_text=user_text):
+                provider = mock.AsyncMock(return_value="must not be used")
+                with mock.patch.object(bnl01_bot, "get_gemini_response_with_optional_typing", provider):
+                    response, diagnostics = await bnl01_bot.apply_guarded_response_regeneration(
+                        candidate,
+                        prompt="Current user request: explain context processing",
+                        user_id=101,
+                        guild_id=1,
+                        route_mode=bnl01_bot.ROUTE_MODE_NORMAL_CHAT,
+                        channel_policy="sealed_test",
+                        current_user_text=user_text,
+                    )
+                self.assertEqual(candidate, response)
+                self.assertFalse(diagnostics["register_mismatch_guard_triggered"])
+                provider.assert_not_awaited()
+
+    async def test_status_question_does_not_trigger_a_tone_rewrite(self):
+        technical_replies = (
+            "I register your question as an interesting datapoint for the Network analysis.",
+            "I do not experience human emotions, but my systems are stable.",
+        )
+        for candidate in technical_replies:
+            with self.subTest(candidate=candidate):
+                provider = mock.AsyncMock(return_value="must not be used")
+                with mock.patch.object(
+                    bnl01_bot,
+                    "get_gemini_response_with_optional_typing",
+                    provider,
+                ):
+                    response, diagnostics = await bnl01_bot.apply_guarded_response_regeneration(
+                        candidate,
+                        prompt="Current user request: systems status",
+                        user_id=101,
+                        guild_id=1,
+                        route_mode=bnl01_bot.ROUTE_MODE_NORMAL_CHAT,
+                        channel_policy="sealed_test",
+                        current_user_text="BNL, are your systems functioning within normal parameters?",
+                    )
+                self.assertEqual(candidate, response)
+                self.assertFalse(diagnostics["register_mismatch_guard_triggered"])
+                provider.assert_not_awaited()
+
+    async def test_validation_only_preserves_machine_voice_without_provider(self):
+        provider = mock.AsyncMock(return_value="must not be used")
+        with mock.patch.object(bnl01_bot, "get_gemini_response_with_optional_typing", provider):
+            response, diagnostics = await bnl01_bot.apply_guarded_response_regeneration(
+                "My current operational parameters are stable.",
+                prompt="",
+                user_id=101,
+                guild_id=1,
+                route_mode=bnl01_bot.ROUTE_MODE_NORMAL_CHAT,
+                channel_policy="sealed_test",
+                current_user_text="you still sound like a nerd",
+                source_context_available=True,
+                regeneration_allowed=False,
+            )
+        self.assertEqual(response, "My current operational parameters are stable.")
+        self.assertFalse(diagnostics["suppressed"])
+        self.assertFalse(diagnostics["register_mismatch_guard_triggered"])
+        provider.assert_not_awaited()
 
     async def test_unsupported_record_claim_regenerates_from_named_room_context(self):
         prompt = (
@@ -1651,7 +2124,8 @@ class GuardedResponseRegenerationTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_mode_leak_substantive_request_regenerates_without_generic_fallback(self):
         async def fake_regen(channel, prompt, user_id, guild_id, route="get_gemini_response"):
-            self.assertIn("previous draft tripped the mode-leak guard", prompt)
+            self.assertIn("previous draft exposed internal Source File", prompt)
+            self.assertIn("No phrase is disallowed merely because it sounds mechanical", prompt)
             return "Crow, the show note points to a normal BARCODE answer instead of an internal classification."
 
         with mock.patch.object(bnl01_bot, "get_gemini_response_with_optional_typing", side_effect=fake_regen):
@@ -1671,11 +2145,9 @@ class GuardedResponseRegenerationTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotEqual("I’m here, Crow. What do you need?", response)
         self.assertFalse(bnl01_bot.is_generic_non_answer_response(response, "Crow"))
 
-    async def test_mode_leak_retry_failure_suppresses(self):
-        async def fake_regen(channel, prompt, user_id, guild_id, route="get_gemini_response"):
-            return "I’m here, Crow. What do you need?"
-
-        with mock.patch.object(bnl01_bot, "get_gemini_response_with_optional_typing", side_effect=fake_regen):
+    async def test_archive_style_language_is_not_a_hard_tone_failure(self):
+        provider = mock.AsyncMock(return_value="must not be used")
+        with mock.patch.object(bnl01_bot, "get_gemini_response_with_optional_typing", provider):
             response, diagnostics = await bnl01_bot.apply_guarded_response_regeneration(
                 "Records are thin",
                 prompt="CURRENT USER MESSAGE: What happened with BARCODE?",
@@ -1686,9 +2158,10 @@ class GuardedResponseRegenerationTests(unittest.IsolatedAsyncioTestCase):
                 user_display_name="Crow",
                 current_user_text="What happened with BARCODE?",
             )
-        self.assertEqual("", response)
-        self.assertTrue(diagnostics["suppressed"])
-        self.assertEqual("scripted_mode_leak_after_retry", diagnostics["suppression_reason"])
+        self.assertEqual("Records are thin", response)
+        self.assertFalse(diagnostics["suppressed"])
+        self.assertFalse(diagnostics["scripted_mode_leak_guard_triggered"])
+        provider.assert_not_awaited()
 
     async def test_generic_non_answer_to_substantive_request_regenerates(self):
         async def fake_regen(channel, prompt, user_id, guild_id, route="get_gemini_response"):

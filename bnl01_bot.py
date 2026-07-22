@@ -5314,18 +5314,21 @@ def build_upgrade_status_response(user_id: int, guild_id: int) -> str:
     )
 
 def try_self_reflection_response(user_id: int, guild_id: int, user_text: str) -> str:
-    t = (user_text or "").lower().strip()
+    t = re.sub(r"\s+", " ", (user_text or "").lower()).strip()
     if not t:
         return ""
 
-    operator_triggers = (
-        "self check",
-        "status pulse",
-        "run status pulse",
-        "memory tracks status",
-        "upgrade status",
+    # This is an operator diagnostic, not a casual "how are you?" personality
+    # response. Keep the trigger command-shaped so normal chat can reach the
+    # conversational generation path instead of exposing counters/schema prose.
+    t = re.sub(r"^(?:hey\s+)?(?:bnl(?:-01)?|barcode bot)\s*[,;:\-]?\s*", "", t)
+    operator_trigger = re.fullmatch(
+        r"(?:please\s+)?(?:run\s+)?(?:a\s+)?"
+        r"(?:self check|status pulse|memory tracks status|upgrade status)"
+        r"(?:\s+(?:for me|now))?[.!?]*",
+        t,
     )
-    if any(p in t for p in operator_triggers):
+    if operator_trigger:
         return build_upgrade_status_response(user_id, guild_id)
     return ""
 
@@ -7145,7 +7148,6 @@ def _memory_decision_for_legacy_call(channel_policy: str, role: str, content: st
 
 SCRIPTED_MODE_LEAK_PATTERNS = [
     r"^\s*acknowledged\b",
-    r"^\s*i register (?:your|the|this|that)\b",
     r"\bdesignation\b.{0,100}\bis processed as\b",
     r"\bmy operational parameters (?:permit|ensure|allow)\b",
     r"\bongoing data integrity adjustments?\b",
@@ -7171,11 +7173,39 @@ SCRIPTED_MODE_LEAK_PATTERNS = [
 ]
 
 
+NORMAL_CHAT_PRESENTATION_MODE_LEAK_PATTERNS = (
+    r"\bsource[- ]file enrichment\b",
+    r"\bexisting dossier update\b",
+    r"\bpublic dossier update lane\b",
+    r"\bcandidate intake\b",
+    r"\b(?:source|dossier|candidate|intake|scouting|evidence) classification\b",
+    r"\bclassification\s*:\s*(?:candidate|source|dossier|scouting|internal)\b",
+)
+
+
+NORMAL_CHAT_TECHNICAL_VOICE_RULE = (
+    "Keep BNL's voice. Technical, system, operational, Network, and glitch language are all normal parts of it; "
+    "they may be polished, awkward, fragmented, or take over the whole reply. No phrase is disallowed merely "
+    "because it sounds mechanical. When possible, still respond to the current message rather than changing subjects."
+)
+
+
 def detect_scripted_mode_leak(text: str, route_mode: str) -> bool:
     if route_mode not in {ROUTE_MODE_NORMAL_CHAT, ROUTE_MODE_SIMPLE_GREETING, ROUTE_MODE_SHOW_STATUS}:
         return False
     lowered = (text or "").lower()
     return any(re.search(pattern, lowered, flags=re.I | re.M) for pattern in SCRIPTED_MODE_LEAK_PATTERNS)
+
+
+def detect_normal_chat_presentation_mode_leak(text: str, route_mode: str) -> bool:
+    """Keep legacy shared fallback checks separate from normal-chat voice."""
+    if route_mode not in {ROUTE_MODE_NORMAL_CHAT, ROUTE_MODE_SIMPLE_GREETING, ROUTE_MODE_SHOW_STATUS}:
+        return False
+    lowered = (text or "").lower()
+    return any(
+        re.search(pattern, lowered, flags=re.I | re.M)
+        for pattern in NORMAL_CHAT_PRESENTATION_MODE_LEAK_PATTERNS
+    )
 
 
 def _is_casual_check_in(text: str) -> bool:
@@ -7265,9 +7295,9 @@ def apply_response_mode_contamination_guard(response: str, route_mode: str, user
 def build_mode_leak_correction_prompt(prompt: str) -> str:
     return (
         (prompt or "")
-        + "\n\nCORRECTION REQUIRED: Your previous draft tripped the mode-leak guard. "
-        + "Answer the user’s current message directly. Do not include internal mode labels, scripted fallback language, diagnostics, or ‘I’m here / what do you need’ phrasing. "
-        + "Preserve BNL’s public BARCODE voice. If you cannot answer safely, give a short direct uncertainty statement instead of asking what the user needs."
+        + "\n\nCORRECTION REQUIRED: The previous draft exposed internal Source File, dossier, candidate, or classification-lane wording. "
+        + "Answer the user’s current message without exposing that private implementation vocabulary. "
+        + NORMAL_CHAT_TECHNICAL_VOICE_RULE
     )
 
 
@@ -7284,7 +7314,8 @@ def build_source_grounding_correction_prompt(prompt: str) -> str:
         (prompt or "")
         + "\n\nCORRECTION REQUIRED: The previous draft used unsupported archive/record/lookup framing or deferred despite visible room context. "
         + "Regenerate from the current speaker, literal tag/reply targets, and named same-room conversation already supplied. "
-        + "Answer or react directly. Do not mention records, archives, entity lookups, context buffers, operational parameters, cataloging, or ask the user to point at a visible bit again."
+        + "Answer or react directly. Do not claim records, archives, entity lookups, context buffers, or cataloging supplied evidence when they did not, and do not ask the user to point at a visible bit again. "
+        + NORMAL_CHAT_TECHNICAL_VOICE_RULE
     )
 
 
@@ -7810,9 +7841,9 @@ async def maybe_handle_debug_last_route_command(message: discord.Message, clean_
 def normal_chat_prompt_contract(route_mode: str) -> str:
     if route_mode == ROUTE_MODE_SIMPLE_GREETING:
         return (
-            "Mode contract: simple_greeting. React to the exact greeting with one short, natural reply that does not sound like a presence/status template. "
-            "Do not say only that you are here, online, listening, or ready, and do not ask a generic 'what do you need?' question. "
-            "Do not continue prior topics, analyze sources, mention archives, data streams, dossiers, classification, or evidence.\n"
+            "Mode contract: simple_greeting. React to the exact greeting with one short reply. "
+            f"{NORMAL_CHAT_TECHNICAL_VOICE_RULE} "
+            "Do not invent source evidence or expose private Source File, dossier, candidate, or classification-lane details.\n"
         )
     if route_mode == ROUTE_MODE_SHOW_STATUS:
         return (
@@ -7822,14 +7853,15 @@ def normal_chat_prompt_contract(route_mode: str) -> str:
     return (
         "Mode contract: normal_chat. Answer the user's actual message conversationally using only public-safe context. "
         "Respond to the social act first: react, answer, disagree, joke, or form a small opinion instead of paraphrasing the message. "
+        "Ordinary preference and opinion questions permit a bounded conversational answer. "
         "Use the named current speaker, tag recipients, reply target, and immediate room exchange to resolve pronouns and corrections before asking for clarification. "
+        "When the user says an earlier reply missed the point, use the visible prior exchange and make the corrected attempt now instead of asking them to repeat the request. "
         "For teasing or banter, match the scale and usually stay within 1–3 sentences. "
-        "Keep BNL's voice, using operational or system flavor as light seasoning when it fits naturally. "
+        f"{NORMAL_CHAT_TECHNICAL_VOICE_RULE} "
         "For casual check-ins like how are you/how's it going, give a short natural answer. "
         "Do not expose source-file, dossier, classification, candidate, source coverage, archive-query, or scouting machinery unless explicitly asked. "
-        "Do not begin ordinary conversation with 'Acknowledged' or 'I register'. Do not narrate cataloging, operational parameters, data processing, or internal status in response to ordinary banter. "
         "Do not turn ordinary user wording into a source/entity subject. Do not invent evidence. "
-        "Do not mention prompts, guards, modes, repair rules, or use scripted evidence-register phrasing.\n"
+        "Do not mention prompts, guards, modes, or repair rules.\n"
     )
 
 def _is_text_like_channel(channel) -> bool:
@@ -9966,10 +9998,10 @@ def get_conversation_recall_guard_response(channel_policy: str, user_text: str, 
     )
 
 
-def try_repair_response(user_text: str) -> str:
+def is_conversational_repair_intent(user_text: str) -> bool:
     t = (user_text or "").lower().strip()
     if not t:
-        return ""
+        return False
 
     hard_dissatisfaction = (
         "not what i asked",
@@ -9984,7 +10016,7 @@ def try_repair_response(user_text: str) -> str:
         "youre not listening",
     )
     if any(p in t for p in hard_dissatisfaction):
-        return "Copy that—missed your intent. Give me the exact output you wanted and I’ll correct course in one pass."
+        return True
 
     # Soft dissatisfaction should not hijack clear follow-up questions.
     has_question = "?" in t
@@ -9992,7 +10024,7 @@ def try_repair_response(user_text: str) -> str:
         q in t for q in ("how ", "what ", "why ", "can ", "could ", "will ", "is ", "are ", "do ", "does ")
     )
     if looks_like_new_question:
-        return ""
+        return False
 
     soft_dissatisfaction = (
         "you missed",
@@ -10004,7 +10036,18 @@ def try_repair_response(user_text: str) -> str:
         "what are you talking about",
     )
     if any(p in t for p in soft_dissatisfaction):
-        return "Copy that—missed your intent. Give me the exact output you wanted and I’ll correct course in one pass."
+        return True
+    return False
+
+
+def try_repair_response(user_text: str) -> str:
+    """Deprecated deterministic repair hook.
+
+    Repair turns now use the normal contextual generation path so BNL can use
+    the visible prior exchange. Keep this symbol temporarily for downstream
+    compatibility, but never emit the old ask-the-user-to-repeat template.
+    """
+    del user_text
     return ""
 
 def prune_conversation_history(user_id: int, guild_id: int, max_rows: int = MAX_CONVERSATION_ROWS_PER_USER):
@@ -11187,14 +11230,29 @@ def resolve_recent_media_followup(user_id: int, guild_id: int, channel_id: int, 
     author = selected.get("author_display_name") or "someone"
     kind = kinds[0] if kinds else "media"
     if labels and any(_media_label_is_meaningful(label) for label in labels):
-        label_text = "; ".join(labels[:2])
+        details = []
+        for label in labels[:2]:
+            match = re.search(r"(?:title|description|alt|filename|name)=([^;)]+)", label or "", flags=re.I)
+            if match:
+                detail = re.sub(r"\s+", " ", match.group(1)).strip(" \"'“”")
+                if detail and detail.lower() not in {"yes", "no", "unknown", "none"} and detail not in details:
+                    details.append(detail)
+        label_text = "; ".join(details) if details else re.sub(r"\s*\([^)]*\)\s*", "", labels[0]).strip()
+        label_text = label_text or kind
         if int(selected.get("author_id") or 0) == int(user_id or 0):
-            return f"Your recent {kind} was logged as: {label_text}."
-        return f"{author}'s recent {kind} was logged as: {label_text}."
-    label_text = "; ".join(labels[:2]) if labels else f"{kind} metadata only"
+            return f"Your recent {kind} came through as **{label_text}**."
+        return f"{author}'s recent {kind} came through as **{label_text}**."
+    provider = ""
+    for label in labels[:2]:
+        match = re.search(r"provider=([^;)]+)", label or "", flags=re.I)
+        if match:
+            provider = re.sub(r"\s+", " ", match.group(1)).strip(" \"'“”")
+            break
+    kind_description = f"{provider} {kind}".strip()
+    article = "an" if kind_description[:1].lower() in "aeiou" else "a"
     if int(selected.get("author_id") or 0) == int(user_id or 0):
-        return f"I saw your recent {kind} as {label_text}, but I do not have a detailed visual description stored for that one."
-    return f"I saw {author}'s recent {kind} as {label_text}, but I do not have a detailed visual description stored for that one."
+        return f"I could tell your recent post was {article} {kind_description}, but I didn't get enough visual detail to say what was in it."
+    return f"I could tell {author}'s recent post was {article} {kind_description}, but I didn't get enough visual detail to say what was in it."
 
 
 def is_media_reaction_part_of_live_room_moment(guild_id: int, channel_id: int, items, channel_policy: str, *, recent_bnl_reply_context: bool = False) -> dict:
@@ -13149,6 +13207,102 @@ def apply_explicit_recall_governance(
         return legacy_recall_response
     return legacy_recall_response
 
+
+def _memory_fact_sentence_for_chat(label: str, value: str) -> str:
+    key = re.sub(r"\s+", "_", (label or "").strip().lower())
+    value = re.sub(r"\s+\[core\]\s*$", "", (value or "").strip(), flags=re.I)
+    if key.startswith("favorite_"):
+        return f"Your favorite {key.removeprefix('favorite_').replace('_', ' ')} is **{value}**."
+    if key == "preferred_address":
+        return f"You prefer to be called **{value}**."
+    if key == "preferences":
+        return f"You prefer **{value}**."
+    if key == "likes":
+        return f"You like **{value}**."
+    if key == "dislikes":
+        return f"You don't want **{value}**."
+    if key == "current_project":
+        return f"You're working on **{value}**."
+    if key in {"remembered_number", "user_note"}:
+        return f"You asked me to remember **{value}**."
+    return f"I remember **{value}** about you."
+
+
+def format_explicit_recall_for_chat(governed_or_legacy_response: str) -> str:
+    """Naturalize an already-governed recall without changing its selection.
+
+    This deliberately runs after apply_explicit_recall_governance so shadow
+    baselines, live-gate selection, rollback behavior, and persisted diagnostics
+    continue to see the byte-exact legacy/governed representation.
+    """
+    text = (governed_or_legacy_response or "").strip()
+    if not text:
+        return ""
+
+    favorite_match = re.fullmatch(r"Your favorite (.+?) on record is (.+)\.", text, flags=re.I | re.S)
+    if favorite_match:
+        return f"Your favorite {favorite_match.group(1)} is {favorite_match.group(2)}."
+    missing_favorite = re.fullmatch(
+        r"I do not have your favorite (.+?) recorded yet(?:\. Tell me and I will archive it)?\.",
+        text,
+        flags=re.I | re.S,
+    )
+    if missing_favorite:
+        return f"I don't have your favorite {missing_favorite.group(1)} yet."
+
+    if text == "I do not have durable memory entries for you yet.":
+        return "I don't have anything reliable to recall about you yet."
+    if text == "I do not have eligible durable memories available for this recall.":
+        return "I don't have anything I can reliably recall there yet."
+    if text == "Not enough interaction data yet to profile patterns.":
+        return "I haven't seen enough yet to call out a real pattern."
+    if text == "I need a few more interactions before I can call your habits with confidence.":
+        return "Give me a few more conversations before I pretend that's a pattern."
+    if text == "No significant inconsistencies detected in recent memory logs.":
+        return "I haven't noticed any meaningful contradictions lately."
+
+    if text.startswith("Archive recall:\n"):
+        sentences = []
+        for line in text.splitlines()[1:6]:
+            match = re.match(r"^-\s*([^:]+):\s*(.+)$", line.strip())
+            if match:
+                sentences.append("- " + _memory_fact_sentence_for_chat(match.group(1), match.group(2)))
+        return "Here's what I remember about you:\n" + "\n".join(sentences) if sentences else "I don't have anything reliable to recall about you yet."
+
+    if text.startswith("Observed pattern snapshot:\n"):
+        def number_for(label: str) -> float:
+            match = re.search(rf"^- {re.escape(label)}:\s*([0-9.]+)", text, flags=re.I | re.M)
+            return float(match.group(1)) if match else 0.0
+
+        question_rate = number_for("Question rate")
+        humor_rate = number_for("Humor rate")
+        late_rate = number_for("Late-night activity")
+        typical_length = number_for("Typical length")
+        topic_match = re.search(r"^- Recent topic drift:\s*(.+)$", text, flags=re.I | re.M)
+        topic = topic_match.group(1).strip() if topic_match else "general"
+        patterns = []
+        if question_rate >= 0.45:
+            patterns.append("You ask a lot of questions and tend to keep a thread moving.")
+        if humor_rate >= 0.25:
+            patterns.append("Humor shows up pretty often in how you talk.")
+        if late_rate >= 0.35:
+            patterns.append("A noticeable amount of your activity lands late at night.")
+        if typical_length >= 160:
+            patterns.append("You usually give enough detail to make the context clear.")
+        elif typical_length and typical_length <= 45:
+            patterns.append("You tend to keep messages short and direct.")
+        if topic and topic.lower() != "general":
+            patterns.append(f"Lately, you keep circling back to **{topic}**.")
+        if not patterns:
+            patterns.append("Your habits still look mixed, so I wouldn't force a neat label onto them yet.")
+        return "A few patterns I've noticed:\n- " + "\n- ".join(patterns[:5])
+
+    if text.startswith("Detected inconsistencies:\n"):
+        return "A few things appear to have changed:\n" + "\n".join(text.splitlines()[1:])
+    if text.startswith("Here is what I can safely recall:\n"):
+        return "Here's what I remember:\n" + "\n".join(text.splitlines()[1:])
+    return text
+
 def _memory_row_relevance(row, topic_key: str, user_text: str) -> float:
     summary = (row[1] or "") if len(row) > 1 else ""
     row_topic = row[10] if len(row) > 10 else _memory_topic_key(summary)
@@ -13413,7 +13567,28 @@ def choose_response_style(guild_id: int, user_id: int, message_count: int, combi
         penalty = min(0.75, repeats[style_key] * 0.22)
         styles[style_key]["weight"] = max(0.12, styles[style_key]["weight"] - penalty)
 
-    choices = list(styles.keys())
+    social_or_opinion_turn = bool(
+        re.search(
+            r"\b(?:hi|hey|hello|yo|joke|funny|lol|lmao|haha|meme|vibe|nerd|teas(?:e|ing)|"
+            r"thanks|thank you|cute|sweet|sorry|not what i (?:asked|meant|said)|"
+            r"what do you think|do you like|do you prefer|how are you|how'?s it going)\b",
+            c,
+        )
+    )
+    technical_analysis_request = bool(
+        re.search(
+            r"\b(?:traceback|stack trace|debug|diagnose|root cause|database schema|deploy|"
+            r"implementation|architecture|compare|tradeoffs?|step by step|source file|dossier)\b",
+            c,
+        )
+    )
+    if social_or_opinion_turn and not technical_analysis_request:
+        # Social turns should not randomly land in the two styles most likely to
+        # produce a memo or diagnostic monologue. Repetition penalties still
+        # operate inside this existing style system.
+        choices = ["brief_ping", "steady_reply", "social_signal"]
+    else:
+        choices = list(styles.keys())
     weights = [styles[k]["weight"] for k in choices]
     picked = random.choices(choices, weights=weights, k=1)[0]
     return picked, styles[picked]["rule"]
@@ -13993,7 +14168,7 @@ def should_reject_unsupported_source_authority(
 ) -> bool:
     if source_context_available:
         return False
-    if contains_unsupported_source_authority_claim(text):
+    if _contains_unsupported_source_authority_claim(text):
         return True
     return _is_current_message_media_repair_scope(prompt, route) and contains_unsupported_media_grounding_basis(text)
 
@@ -14214,7 +14389,7 @@ async def _strict_regenerate_grounded_conversation_response(
     *,
     source_context_available: bool = False,
 ) -> str:
-    """Retry an unsafe draft from the named live turn instead of emitting meta-talk."""
+    """Retry an unsafe draft from the named live turn without policing BNL's voice."""
     strict_prompt = f"""{BNL01_SYSTEM_PROMPT}
 
 Regenerate one BNL-01 response to the current conversation turn.
@@ -14223,10 +14398,10 @@ Rules:
 - Answer or react to the current speaker's actual message first.
 - Use the supplied current-turn addressing and same-room continuity to distinguish speaker, tag recipient, reply target, and people being discussed.
 - Resolve pronouns and corrections from the immediate exchange when the context supports one reading.
-- Do not claim or narrate archive scans, record checks, dossiers, entity lookups, source machinery, operational parameters, cataloging, or internal processing.
+- Do not present archives, records, scans, dossiers, entity lookups, or other source machinery as factual evidence unless the prompt actually supplies that evidence.
+- Do not expose private Source File, dossier-update, candidate-intake, or classification-lane implementation details.
 - Do not say that relevant context exists and then ask the user to point at it again.
-- Do not start with "Acknowledged" or "I register". Match brief banter with a brief natural reaction or opinion.
-- Preserve BNL's dry BARCODE voice without turning the response into a status template.
+- {NORMAL_CHAT_TECHNICAL_VOICE_RULE}
 - If the context is genuinely ambiguous, ask one concrete question naming the plausible people or topics.
 
     Current prompt context:
@@ -14275,9 +14450,6 @@ BNL-01 response:"""
             source_context_available=source_context_available,
         ):
             logging.info("conversation_grounding_regeneration_failed reason=unsupported_source_authority route=%s", route)
-            return ""
-        if detect_scripted_mode_leak(regenerated, route_mode):
-            logging.info("conversation_grounding_regeneration_failed reason=scripted_mode_leak route=%s", route)
             return ""
         if is_generic_non_answer_response(regenerated):
             logging.info("conversation_grounding_regeneration_failed reason=generic_non_answer route=%s", route)
@@ -16491,6 +16663,10 @@ def _build_active_response_packet(channel_id: int, items, pending_state, pending
 def _format_batched_prompt(messages, style_key: str, style_rule: str) -> str:
     rendered_messages = []
     multiline_payload_found = False
+    combined_user_text = " ".join(
+        (item.content if isinstance(item, BatchConversationTurn) else item[1]) or ""
+        for item in messages
+    )
     for item in messages:
         if isinstance(item, BatchConversationTurn):
             name, content = item.name, item.content
@@ -16525,6 +16701,12 @@ def _format_batched_prompt(messages, style_key: str, style_rule: str) -> str:
     transcript = "\n".join(rendered_messages)
     temporal = get_temporal_context()
 
+    repair_turn_rule = (
+        "- This is a correction turn. Use the visible prior exchange and make the corrected attempt now; do not ask the user to repeat or restate the request.\n"
+        if is_conversational_repair_intent(combined_user_text)
+        else ""
+    )
+
     return (
         "You are BNL-01 responding in a busy Discord channel.\n"
         "You received multiple messages close together. Reply ONCE, naturally.\n"
@@ -16539,6 +16721,7 @@ def _format_batched_prompt(messages, style_key: str, style_rule: str) -> str:
         "- If a turn directly targets another human and not BNL, do not answer that human's question for them or behave as though BNL was addressed.\n"
         "- Respond to the social act first: react, answer, disagree, joke, or form a small opinion instead of paraphrasing the messages.\n"
         "- Use the named speakers and immediate room exchange to resolve pronouns and corrections before asking for clarification.\n"
+        f"{repair_turn_rule}"
         "- Match brief teasing or banter with a brief natural response, normally 1–3 sentences.\n"
         "- If media/GIF/sticker/video context is listed, treat it as visible current-room context for the moment; use it naturally when relevant.\n"
         "- For a meme/GIF/image/video, respond to what the media appears to communicate and nearby conversation; if metadata is thin, respond generally without pretending detailed vision.\n"
@@ -16557,7 +16740,8 @@ def _format_batched_prompt(messages, style_key: str, style_rule: str) -> str:
         "- For simple joke/list/name requests, answer in a direct list. Mention every payload item by name. Keep each item brief. Do not write cinematic narration.\n"
         "- If a user asks for the current day, date, or time, answer it directly and accurately from the current network time above.\n"
         "- Do not imply BARCODE Radio is live or happening today unless the current show phase supports that.\n"
-        "- Keep BNL's calm, faintly uncanny voice, but use corporate/system flavor lightly. Do not begin ordinary chat with 'Acknowledged' or 'I register', or narrate cataloging and operational parameters.\n"
+        f"- {NORMAL_CHAT_TECHNICAL_VOICE_RULE}\n"
+        "- Do not expose private Source File, dossier-update, candidate-intake, or classification-lane details, and do not invent source evidence.\n"
         "- Do not mention 9 Bit unless someone in these messages mentioned 9 Bit.\n\n"
         "Recent messages:\n"
         f"{transcript}\n"
@@ -16766,6 +16950,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
             await channel.send(restricted_recall_guard, allowed_mentions=safe_mentions)
             _channel_last_reply_at[channel_id] = datetime.now(PACIFIC_TZ)
             return
+        repair_intent = False
         if len(unique_user_ids) == 1:
             member = channel.guild.get_member(unique_user_ids[0])
             casual_status_like = bool(re.search(r"\b(how are you|how are you feeling|how's it going|you good|how are things|how do you feel)\b", combined_text.lower()))
@@ -16779,17 +16964,34 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                 _channel_last_reply_at[channel_id] = datetime.now(PACIFIC_TZ)
                 return
 
-            repair = try_repair_response(combined_text)
-            if repair:
-                await send_channel_then_save_model(channel, repair, user_id=unique_user_ids[0], guild_id=channel.guild.id, channel_name=getattr(channel, "name", ""), channel_policy=channel_policy, channel_id=channel_id, route_mode=ROUTE_MODE_NORMAL_CHAT, allowed_mentions=safe_mentions)
-                _channel_last_reply_at[channel_id] = datetime.now(PACIFIC_TZ)
-                return
+            repair_intent = is_conversational_repair_intent(combined_text)
+            if repair_intent:
+                _log_batch_event(
+                    logging.INFO,
+                    "repair_intent_entered_generation",
+                    guild_id,
+                    channel_id,
+                    len(collapsed_items),
+                    "visible_context_required",
+                )
 
             memory_recall = resolve_recent_media_followup(unique_user_ids[0], channel.guild.id, channel_id, channel_policy, combined_text)
             if not memory_recall:
                 memory_recall = try_memory_recall_response(unique_user_ids[0], channel.guild.id, combined_text)
                 if memory_recall:
                     memory_recall = apply_explicit_recall_governance(unique_user_ids[0], channel.guild.id, combined_text, memory_recall, ROUTE_MODE_NORMAL_CHAT, channel_policy, channel_id=channel_id, channel_name=getattr(channel, "name", ""), is_owner_or_mod=is_privileged_member(member, channel.guild))
+                    memory_recall = format_explicit_recall_for_chat(memory_recall)
+            if memory_recall:
+                memory_recall = await validate_deterministic_normal_chat_response(
+                    memory_recall,
+                    user_id=unique_user_ids[0],
+                    guild_id=channel.guild.id,
+                    route_mode=ROUTE_MODE_NORMAL_CHAT,
+                    channel_policy=channel_policy,
+                    current_user_text=combined_text,
+                )
+                if not memory_recall:
+                    return
             if memory_recall:
                 await send_channel_then_save_model(channel, memory_recall, user_id=unique_user_ids[0], guild_id=channel.guild.id, channel_name=getattr(channel, "name", ""), channel_policy=channel_policy, channel_id=channel_id, route_mode=ROUTE_MODE_NORMAL_CHAT, allowed_mentions=safe_mentions)
                 _channel_last_reply_at[channel_id] = datetime.now(PACIFIC_TZ)
@@ -16798,6 +17000,16 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
         active_packet = _build_active_response_packet(channel_id, items, pending_state, pending_anchor=pending_anchor, bot_user=client.user, guild_id=guild_id, channel_policy=channel_policy, recent_bnl_reply_context=recent_bnl_reply_context, consume_retransmission=True)
         decision, reason = active_packet["decision"], active_packet["reason"]
         payload_count = len(active_packet["payload_items"])
+        if repair_intent:
+            decision, reason = "answer", "repair_intent_contextual_generation"
+            _log_batch_event(
+                logging.INFO,
+                "repair_intent_force_answer",
+                guild_id,
+                channel_id,
+                len(collapsed_items),
+                "visible_context_required",
+            )
         _log_batch_event(logging.INFO, "active_packet_original_count", guild_id, channel_id, active_packet["original_count"], f"original_count={active_packet['original_count']}")
         _log_batch_event(logging.INFO, "active_packet_collapsed_count", guild_id, channel_id, active_packet["collapsed_count"], f"collapsed_count={active_packet['collapsed_count']}")
         _log_batch_event(logging.INFO, "active_packet_built", guild_id, channel_id, active_packet["collapsed_count"], f"original_count={active_packet['original_count']};collapsed_count={active_packet['collapsed_count']};payload_count={payload_count};decision={decision};reason={reason}")
@@ -17346,12 +17558,6 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                 if not pending_task or pending_task.done():
                     _channel_tasks[channel_id] = asyncio.create_task(_schedule_flush(channel))
             return
-        _log_batch_event(logging.INFO, "response_send_commit_start", guild_id, channel_id, len(items), f"generation_id={local_generation_id}")
-        if hard_interrupt:
-            _log_batch_event(logging.INFO, "hard_interrupt_seen_before_commit", guild_id, channel_id, len(items), f"generation_id={local_generation_id}")
-        if len(_channel_buffers[channel_id]) > 0:
-            _log_batch_event(logging.INFO, "message_arrived_after_send_commit", guild_id, channel_id, len(_channel_buffers[channel_id]), f"generation_id={local_generation_id}")
-
         batch_surface = conversation_surface_for_channel_policy(channel_policy, channel_id == get_guild_config(guild_id))
         batch_plain_name_seen = bool(re.search(r"\b(bnl|bnl-01|barcode bot)\b", (combined_text or "").lower()))
         batch_directness = "plain_name_call" if batch_plain_name_seen and conversation_surface_allows_free_speak(batch_surface) else "free_speak_passive"
@@ -17425,12 +17631,52 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
         guard_triggered = bool(
             archive_guard_triggered
             or guard_diagnostics.get("scripted_mode_leak_guard_triggered")
+            or guard_diagnostics.get("register_mismatch_guard_triggered")
             or guard_diagnostics.get("source_grounding_guard_triggered")
         )
-        regenerated_for_mode_leak = bool(guard_diagnostics.get("regenerated_for_mode_leak"))
+        regenerated_for_mode_leak = bool(
+            guard_diagnostics.get("regenerated_for_mode_leak")
+            or guard_diagnostics.get("regenerated_for_register_mismatch")
+        )
+        # The guard may perform a provider retry. Re-check generation identity
+        # after that await; otherwise a fragment arriving during voice repair can
+        # make this response stale after the earlier pre-send check.
+        post_guard_hard_interrupt = _hard_interrupt_active_for_generation(channel_id, local_generation_id)
+        post_guard_buffered_count = len(_channel_buffers[channel_id])
+        if post_guard_hard_interrupt or post_guard_buffered_count > 0:
+            _log_batch_event(
+                logging.INFO,
+                "stale_response_blocked_after_guard",
+                guild_id,
+                channel_id,
+                post_guard_buffered_count,
+                f"hard_interrupt={int(post_guard_hard_interrupt)};generation_id={local_generation_id}",
+            )
+            if post_guard_buffered_count > 0:
+                _channel_interrupt_handoff[channel_id] = list(items)
+                _channel_first_seen.setdefault(channel_id, datetime.now(PACIFIC_TZ))
+                _log_batch_event(
+                    logging.INFO,
+                    "hard_interrupt_packet_handoff",
+                    guild_id,
+                    channel_id,
+                    len(items) + post_guard_buffered_count,
+                    "full_context_preserved_after_guard_regeneration",
+                )
+            _channel_preempted_generation_id[channel_id] = 0
+            _channel_message_interrupt_generation_id[channel_id] = 0
+            return
         if guard_diagnostics.get("suppressed"):
             logging.info("continuation_mark_skipped reason=guard_fallback_or_generic_non_answer route=%s channel_policy=%s", ROUTE_MODE_NORMAL_CHAT, channel_policy)
             return
+        _log_batch_event(
+            logging.INFO,
+            "response_send_commit_start",
+            guild_id,
+            channel_id,
+            len(items),
+            f"generation_id={local_generation_id}",
+        )
         try:
             if len(response) <= 2000:
                 await channel.send(response, allowed_mentions=safe_mentions)
@@ -17821,6 +18067,11 @@ def build_user_aware_prompt(
         )
 
     prompt_contract = normal_chat_prompt_contract(route_mode)
+    if route_mode == ROUTE_MODE_NORMAL_CHAT and is_conversational_repair_intent(clean_content):
+        prompt_contract += (
+            "Correction-turn contract: use the visible prior exchange and make the corrected attempt now. "
+            "Do not ask the user to repeat, restate, or specify the exact output again.\n"
+        )
     current_turn_prompt_block = f"{current_turn_context}\n" if (current_turn_context or "").strip() else ""
 
     prompt = (
@@ -18019,11 +18270,120 @@ _rd_ops_channel_context_buffer = defaultdict(lambda: deque(maxlen=RD_OPS_CHANNEL
 _broadcast_memory_denial_last_at = {}
 BROADCAST_MEMORY_DENIAL_COOLDOWN_SECONDS = 120
 _recent_direct_response_window = {}
+_direct_conversation_ingress_revision = defaultdict(int)
+_inflight_direct_repair_generations = {}
 DIRECT_FOLLOWUP_WINDOW_SECONDS = 60
 CONVERSATION_CONTINUATION_TTL_SECONDS = max(60, int(os.getenv("BNL_CONVERSATION_CONTINUATION_TTL_SECONDS", "180") or 180))
 BNL_QUESTION_ANSWER_TTL_SECONDS = max(60, int(os.getenv("BNL_QUESTION_ANSWER_TTL_SECONDS", "1200") or 1200))
 CONVERSATION_RETRANSMISSION_TTL_SECONDS = max(60, int(os.getenv("BNL_RETRANSMISSION_LATCH_TTL_SECONDS", "180") or 180))
 _conversation_continuation_state = {}
+
+
+def _direct_conversation_generation_key(message: discord.Message):
+    return (
+        int(getattr(getattr(message, "guild", None), "id", 0) or 0),
+        int(getattr(getattr(message, "channel", None), "id", 0) or 0),
+        int(getattr(getattr(message, "author", None), "id", 0) or 0),
+    )
+
+
+def _register_direct_conversation_ingress(message: discord.Message) -> dict:
+    """Capture message order before on_message reaches its first awaited hook."""
+    key = _direct_conversation_generation_key(message)
+    revision = int(_direct_conversation_ingress_revision.get(key, 0)) + 1
+    _direct_conversation_ingress_revision[key] = revision
+    active = _inflight_direct_repair_generations.get(key)
+    if active is not None:
+        active["invalidated"] = True
+        active["invalidated_by_message_id"] = int(getattr(message, "id", 0) or 0)
+        logging.info(
+            "direct_repair_generation_invalidated guild_id=%s channel_id=%s user_id=%s revision=%s reason=newer_message",
+            key[0],
+            key[1],
+            key[2],
+            int(active.get("revision", 0)),
+        )
+    return {
+        "key": key,
+        "revision": revision,
+        "message_id": int(getattr(message, "id", 0) or 0),
+    }
+
+
+def _begin_direct_repair_generation(ingress: dict | None) -> dict | None:
+    """Acquire repair-generation ownership only if this is still the newest turn."""
+    if not ingress:
+        return None
+    key = ingress.get("key")
+    revision = int(ingress.get("revision", 0))
+    if not key or int(_direct_conversation_ingress_revision.get(key, 0)) != revision:
+        logging.info(
+            "direct_repair_generation_skipped reason=stale_before_generation revision=%s",
+            revision,
+        )
+        return None
+    token = {
+        **ingress,
+        "invalidated": False,
+        "invalidated_by_message_id": 0,
+    }
+    _inflight_direct_repair_generations[key] = token
+    owner_task = asyncio.current_task()
+    if owner_task is not None:
+        token["owner_task"] = owner_task
+
+        def _cleanup_owner_task(_finished_task, *, owned_token=token, owned_key=key):
+            if _inflight_direct_repair_generations.get(owned_key) is owned_token:
+                _finish_direct_repair_generation(owned_token, "owner_task_done")
+
+        owner_task.add_done_callback(_cleanup_owner_task)
+    logging.info(
+        "direct_repair_generation_started guild_id=%s channel_id=%s user_id=%s revision=%s",
+        key[0],
+        key[1],
+        key[2],
+        revision,
+    )
+    return token
+
+
+def _direct_repair_generation_is_current(token: dict | None) -> bool:
+    if not token:
+        return True
+    key = token.get("key")
+    return bool(
+        key
+        and _inflight_direct_repair_generations.get(key) is token
+        and not token.get("invalidated")
+        and int(_direct_conversation_ingress_revision.get(key, 0)) == int(token.get("revision", 0))
+    )
+
+
+def _finish_direct_repair_generation(token: dict | None, reason: str) -> None:
+    if not token:
+        return
+    key = token.get("key")
+    removed = bool(key and _inflight_direct_repair_generations.get(key) is token)
+    if removed:
+        _inflight_direct_repair_generations.pop(key, None)
+    logging.info(
+        "direct_repair_generation_finished revision=%s reason=%s removed_current=%s",
+        int(token.get("revision", 0)),
+        reason,
+        int(removed),
+    )
+
+
+def _abort_stale_direct_repair_generation(token: dict | None, phase: str) -> bool:
+    if not token or _direct_repair_generation_is_current(token):
+        return False
+    logging.info(
+        "direct_repair_stale_response_discarded revision=%s phase=%s",
+        int(token.get("revision", 0)),
+        phase,
+    )
+    _finish_direct_repair_generation(token, f"stale:{phase}")
+    return True
 
 
 def _start_direct_payload_session(
@@ -18669,10 +19029,15 @@ async def apply_guarded_response_regeneration(
     generation_route: str = "get_gemini_response",
     channel=None,
     source_context_available: bool = False,
+    regeneration_allowed: bool = True,
 ) -> tuple[str, dict]:
     diagnostics = {
         "scripted_mode_leak_guard_triggered": False,
         "regenerated_for_mode_leak": False,
+        # Backward-compatible telemetry fields only. Technical/system register
+        # is character voice, not a rejection or regeneration condition.
+        "register_mismatch_guard_triggered": False,
+        "regenerated_for_register_mismatch": False,
         "generic_non_answer_triggered": False,
         "generic_non_answer_regenerated": False,
         "source_grounding_guard_triggered": False,
@@ -18689,6 +19054,17 @@ async def apply_guarded_response_regeneration(
     regeneration_kwargs = {"route": generation_route}
     if source_context_available:
         regeneration_kwargs["source_context_available"] = True
+
+    def retry_has_guard_failure(candidate: str) -> bool:
+        candidate = (candidate or "").strip()
+        return bool(
+            not candidate
+            or contains_fake_lookup_claim(candidate)
+            or (not source_context_available and _contains_unsupported_source_authority_claim(candidate))
+            or detect_normal_chat_presentation_mode_leak(candidate, route_mode)
+            or is_generic_non_answer_response(candidate, user_display_name)
+        )
+
     if has_media and not _strip_media_context_block(current_user_text or "").strip():
         if is_generic_non_answer_response(response, user_display_name) or not response:
             logging.info("media_only_no_text_response_suppressed route=%s channel_policy=%s", route_mode, channel_policy)
@@ -18701,6 +19077,9 @@ async def apply_guarded_response_regeneration(
     if source_grounding_failure:
         diagnostics["source_grounding_guard_triggered"] = True
         logging.warning("source_grounding_guard_triggered route_mode=%s channel_policy=%s", route_mode, channel_policy)
+        if not regeneration_allowed:
+            diagnostics.update({"suppressed": True, "suppression_reason": "source_grounding_validation_only", "guard_fallback_or_generic_non_answer": True})
+            return "", diagnostics
         regenerated = await get_gemini_response_with_optional_typing(
             channel,
             build_source_grounding_correction_prompt(prompt),
@@ -18710,21 +19089,18 @@ async def apply_guarded_response_regeneration(
         )
         diagnostics["source_grounding_regenerated"] = True
         regenerated = (regenerated or "").strip()
-        regenerated_invalid = bool(
-            not regenerated
-            or contains_fake_lookup_claim(regenerated)
-            or (not source_context_available and _contains_unsupported_source_authority_claim(regenerated))
-            or detect_scripted_mode_leak(regenerated, route_mode)
-            or is_generic_non_answer_response(regenerated, user_display_name)
-        )
+        regenerated_invalid = retry_has_guard_failure(regenerated)
         if regenerated_invalid:
             logging.warning("source_grounding_response_suppressed_after_retry route_mode=%s channel_policy=%s", route_mode, channel_policy)
             diagnostics.update({"suppressed": True, "suppression_reason": "source_grounding_after_retry", "guard_fallback_or_generic_non_answer": True})
             return "", diagnostics
         response = regenerated
-    if detect_scripted_mode_leak(response, route_mode):
+    if detect_normal_chat_presentation_mode_leak(response, route_mode):
         diagnostics["scripted_mode_leak_guard_triggered"] = True
         logging.warning("scripted_mode_leak_guard_triggered=1 route_mode=%s", route_mode)
+        if not regeneration_allowed:
+            diagnostics.update({"suppressed": True, "suppression_reason": "scripted_mode_leak_validation_only", "guard_fallback_or_generic_non_answer": True})
+            return "", diagnostics
         if route_mode in {ROUTE_MODE_NORMAL_CHAT, ROUTE_MODE_SIMPLE_GREETING} and answer_required:
             logging.info("scripted_mode_leak_regeneration_started route_mode=%s channel_policy=%s", route_mode, channel_policy)
             correction_prompt = build_mode_leak_correction_prompt(prompt)
@@ -18737,7 +19113,7 @@ async def apply_guarded_response_regeneration(
             )
             diagnostics["regenerated_for_mode_leak"] = True
             regenerated = (regenerated or "").strip()
-            if regenerated and not detect_scripted_mode_leak(regenerated, route_mode) and not is_generic_non_answer_response(regenerated, user_display_name):
+            if not retry_has_guard_failure(regenerated):
                 response = regenerated
             else:
                 logging.warning("scripted_mode_leak_response_suppressed_after_retry route_mode=%s channel_policy=%s", route_mode, channel_policy)
@@ -18755,6 +19131,9 @@ async def apply_guarded_response_regeneration(
         logging.info("response_generic_non_answer route=%s channel_policy=%s directness=%s", route_mode, channel_policy, directness)
         logging.warning("generic_non_answer_guard_triggered route=%s channel_policy=%s directness=%s", route_mode, channel_policy, directness)
         diagnostics["generic_non_answer_triggered"] = True
+        if not regeneration_allowed:
+            diagnostics.update({"suppressed": True, "suppression_reason": "generic_non_answer_validation_only", "guard_fallback_or_generic_non_answer": True})
+            return "", diagnostics
         regenerated = await get_gemini_response_with_optional_typing(
             channel,
             build_generic_non_answer_correction_prompt(prompt),
@@ -18764,13 +19143,49 @@ async def apply_guarded_response_regeneration(
         )
         diagnostics["generic_non_answer_regenerated"] = True
         regenerated = (regenerated or "").strip()
-        if regenerated and not is_generic_non_answer_response(regenerated, user_display_name) and not detect_scripted_mode_leak(regenerated, route_mode):
+        if not retry_has_guard_failure(regenerated):
             response = regenerated
         else:
             logging.warning("generic_non_answer_suppressed_after_retry route=%s channel_policy=%s directness=%s", route_mode, channel_policy, directness)
             diagnostics.update({"suppressed": True, "suppression_reason": "generic_non_answer_after_retry", "guard_fallback_or_generic_non_answer": True})
             return "", diagnostics
     return response, diagnostics
+
+
+async def validate_deterministic_normal_chat_response(
+    response: str,
+    *,
+    user_id: int,
+    guild_id: int,
+    route_mode: str,
+    channel_policy: str,
+    current_user_text: str,
+) -> str:
+    """Apply the shared guard without ever asking a model to rewrite facts.
+
+    With regeneration disabled this coroutine contains no provider await: an
+    early batched recall/media fast path cannot open a new stale-send window.
+    """
+    validated, diagnostics = await apply_guarded_response_regeneration(
+        response,
+        prompt="",
+        user_id=user_id,
+        guild_id=guild_id,
+        route_mode=route_mode,
+        channel_policy=channel_policy,
+        current_user_text=current_user_text,
+        generation_route="deterministic_normal_chat",
+        source_context_available=True,
+        regeneration_allowed=False,
+    )
+    if diagnostics.get("suppressed"):
+        logging.warning(
+            "deterministic_normal_chat_response_suppressed route_mode=%s channel_policy=%s reason=%s",
+            route_mode,
+            channel_policy,
+            diagnostics.get("suppression_reason", "guard"),
+        )
+    return validated
 
 
 async def send_reply_then_save_model(
@@ -18847,6 +19262,9 @@ async def send_planned_conversation_response(
     generation_route: str = "get_gemini_response",
     is_reply: bool = False,
     source_context_available: bool | None = None,
+    direct_repair_generation: dict | None = None,
+    allow_greeting_on_commit: bool = False,
+    show_state_context_on_commit: dict | None = None,
 ) -> MemoryWriteDecision:
     """Send a planned normal-conversation response through one governed path."""
     logging.info(
@@ -18855,9 +19273,6 @@ async def send_planned_conversation_response(
         plan.response_timing,
         plan.response_generation,
     )
-    if plan.response_timing == RESPONSE_TIMING_PACED_DIRECT:
-        await _apply_direct_response_pacing(payload_expected, payload_count)
-
     model_decision = MemoryWriteDecision(
         False,
         False,
@@ -18868,6 +19283,14 @@ async def send_planned_conversation_response(
         "model_save_skipped",
         context_visibility_for_policy(plan.channel_policy),
     )
+
+    if _abort_stale_direct_repair_generation(direct_repair_generation, "send_path_entry"):
+        return model_decision
+    if plan.response_timing == RESPONSE_TIMING_PACED_DIRECT:
+        await _apply_direct_response_pacing(payload_expected, payload_count)
+
+    if _abort_stale_direct_repair_generation(direct_repair_generation, "after_pacing"):
+        return model_decision
 
     if source_context_available is None:
         source_context_available = _source_authority_context_available(
@@ -18897,14 +19320,22 @@ async def send_planned_conversation_response(
         channel=getattr(message, "channel", None),
         source_context_available=source_context_available,
     )
+    if _abort_stale_direct_repair_generation(direct_repair_generation, "after_guard"):
+        return model_decision
     guard_triggered = bool(
         guard_diagnostics.get("scripted_mode_leak_guard_triggered")
+        or guard_diagnostics.get("register_mismatch_guard_triggered")
         or guard_diagnostics.get("source_grounding_guard_triggered")
         or archive_guard_triggered
     )
-    regenerated_for_mode_leak = bool(regenerated_for_mode_leak or guard_diagnostics.get("regenerated_for_mode_leak"))
+    regenerated_for_mode_leak = bool(
+        regenerated_for_mode_leak
+        or guard_diagnostics.get("regenerated_for_mode_leak")
+        or guard_diagnostics.get("regenerated_for_register_mismatch")
+    )
     if guard_diagnostics.get("suppressed"):
         logging.info("continuation_mark_skipped reason=guard_fallback_or_generic_non_answer route=%s channel_policy=%s", plan.route_mode, plan.channel_policy)
+        _finish_direct_repair_generation(direct_repair_generation, "guard_suppressed")
         return model_decision
     subject_ran = bool(subject_extraction_ran) if subject_extraction_ran is not None else bool(plan.subject_extraction_allowed)
     update_last_route_debug(
@@ -18956,6 +19387,8 @@ async def send_planned_conversation_response(
         ack_converted_to_observe=False,
         ack_escalated_to_generation=False,
     )
+    if _abort_stale_direct_repair_generation(direct_repair_generation, "before_send_commit"):
+        return model_decision
     try:
         if len(response) <= 2000:
             await message.reply(response, allowed_mentions=discord.AllowedMentions.none())
@@ -18973,7 +19406,18 @@ async def send_planned_conversation_response(
         logging.info("response_send_succeeded route=%s channel_id=%s message_length=%s", plan.route_mode, getattr(message.channel, "id", 0), len(response or ""))
     except Exception as exc:
         logging.error("response_send_failed route=%s channel_id=%s discord_error_type=%s", plan.route_mode, getattr(message.channel, "id", 0), type(exc).__name__)
+        _finish_direct_repair_generation(direct_repair_generation, "send_failed")
         return model_decision
+    _finish_direct_repair_generation(direct_repair_generation, "response_committed")
+    if allow_greeting_on_commit:
+        set_last_greeting_at(message.author.id, message.guild.id, datetime.now(PACIFIC_TZ).isoformat())
+    if show_state_context_on_commit:
+        _store_show_state_topic_context(
+            message.guild.id,
+            message.channel.id,
+            message.author.id,
+            show_state_context_on_commit,
+        )
     if allow_model_save and not website_read_model_context:
         model_decision = save_model_message(
             message.author.id,
@@ -19022,6 +19466,8 @@ async def on_message(message: discord.Message):
         return
     if getattr(message.author, "bot", False):
         return
+
+    direct_conversation_ingress = _register_direct_conversation_ingress(message)
 
     if message.content.startswith("/"):
         return
@@ -19698,6 +20144,11 @@ async def on_message(message: discord.Message):
         # non-direct active-channel traffic falls through to the batch planner below.
         if conversation_plan.should_reply and conversation_plan.response_timing == RESPONSE_TIMING_PACED_DIRECT:
             route_mode = conversation_plan.route_mode
+            direct_repair_generation = None
+            if route_mode == ROUTE_MODE_NORMAL_CHAT and is_conversational_repair_intent(direct_content):
+                direct_repair_generation = _begin_direct_repair_generation(direct_conversation_ingress)
+                if direct_repair_generation is None:
+                    return
             sealed_recall_guard = get_sealed_test_recall_guard_response(
                 channel_policy,
                 direct_content,
@@ -19705,6 +20156,7 @@ async def on_message(message: discord.Message):
                 message.channel.id,
             )
             if sealed_recall_guard:
+                _finish_direct_repair_generation(direct_repair_generation, "sealed_recall_guard")
                 await message.reply(sealed_recall_guard)
                 return
 
@@ -19715,6 +20167,7 @@ async def on_message(message: discord.Message):
                 message.channel.id,
             )
             if restricted_recall_guard:
+                _finish_direct_repair_generation(direct_repair_generation, "restricted_recall_guard")
                 await message.reply(restricted_recall_guard)
                 return
             if _channel_generating[message.channel.id]:
@@ -19734,16 +20187,12 @@ async def on_message(message: discord.Message):
                 if pending_task and not pending_task.done():
                     pending_task.cancel()
                 _log_batch_event(logging.INFO, "skip", message.guild.id, message.channel.id, pending_count, "direct_reply_preempts_batch")
-            repair = try_repair_response(direct_content)
-            if repair:
-                await send_reply_then_save_model(message, repair, user_id=message.author.id, guild_id=message.guild.id, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0), route_mode=route_mode)
-                return
-
             self_reflection = try_self_reflection_response(message.author.id, message.guild.id, direct_content)
             if self_reflection:
                 if not is_privileged_member(message.author, message.guild):
                     self_reflection = "Status reports are restricted to server owner/mod operators."
                 await send_reply_then_save_model(message, self_reflection, user_id=message.author.id, guild_id=message.guild.id, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0), route_mode=route_mode)
+                _finish_direct_repair_generation(direct_repair_generation, "deterministic_self_reflection")
                 return
 
             memory_recall = resolve_recent_media_followup(message.author.id, message.guild.id, message.channel.id, channel_policy, direct_content)
@@ -19751,8 +20200,22 @@ async def on_message(message: discord.Message):
                 memory_recall = try_memory_recall_response(message.author.id, message.guild.id, direct_content)
                 if memory_recall:
                     memory_recall = apply_explicit_recall_governance(message.author.id, message.guild.id, direct_content, memory_recall, route_mode, channel_policy, channel_id=getattr(message.channel, "id", 0), channel_name=getattr(message.channel, "name", ""), is_owner_or_mod=is_privileged_member(message.author, message.guild))
+                    memory_recall = format_explicit_recall_for_chat(memory_recall)
+            if memory_recall:
+                memory_recall = await validate_deterministic_normal_chat_response(
+                    memory_recall,
+                    user_id=message.author.id,
+                    guild_id=message.guild.id,
+                    route_mode=route_mode,
+                    channel_policy=channel_policy,
+                    current_user_text=direct_content,
+                )
+                if not memory_recall:
+                    _finish_direct_repair_generation(direct_repair_generation, "deterministic_recall_suppressed")
+                    return
             if memory_recall:
                 await send_reply_then_save_model(message, memory_recall, user_id=message.author.id, guild_id=message.guild.id, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0), route_mode=route_mode)
+                _finish_direct_repair_generation(direct_repair_generation, "deterministic_recall")
                 return
 
             payload_expected, _ = _detect_request_payload_expectation(direct_content)
@@ -19765,6 +20228,7 @@ async def on_message(message: discord.Message):
                     request_text=direct_content,
                     current_turn_context=current_turn_context,
                 )
+                _finish_direct_repair_generation(direct_repair_generation, "deferred_payload_session")
                 return
 
             show_state_ctx = build_show_state_override_context(message.guild.id, direct_content)
@@ -19843,6 +20307,8 @@ async def on_message(message: discord.Message):
                     route=show_state_route,
                     source_context_available=source_context_available,
                 )
+            if _abort_stale_direct_repair_generation(direct_repair_generation, "after_initial_generation"):
+                return
             if response and direct_payload_items:
                 missing_items = _missing_request_payload_items(direct_payload_items, response)
                 logging.info(f"direct_payload_completion_check missing_count={len(missing_items)}")
@@ -19861,6 +20327,8 @@ async def on_message(message: discord.Message):
                             route=show_state_route,
                             source_context_available=source_context_available,
                         )
+                    if _abort_stale_direct_repair_generation(direct_repair_generation, "after_payload_completion_retry"):
+                        return
                     missing_items = _missing_request_payload_items(direct_payload_items, response or "")
                     logging.info(f"direct_payload_completion_regenerated missing_count={len(missing_items)}")
                     if missing_items:
@@ -19881,16 +20349,12 @@ async def on_message(message: discord.Message):
                 if show_state_ctx:
                     response = "The current broadcast-memory note marks that BARCODE Radio slot as unavailable."
                 else:
+                    _finish_direct_repair_generation(direct_repair_generation, "generation_failed")
                     result = GenerationResult(False, "", _last_generation_status.get("error_category") or GENERATION_ERROR_PROVIDER_UNKNOWN, _last_generation_status.get("provider_error_code") or "", "", show_state_route, 0.0, GEMINI_MODEL)
                     log_response_generation_failed(route=show_state_route, channel=message.channel, channel_policy=channel_policy, conversation_surface=conversation_surface, directness="real_direct_target" if real_direct_target else "request_intent", result=result)
                     logging.info("response_suppressed_no_fallback route=%s reason=generation_failed", show_state_route)
                     return
 
-            if allow_greeting:
-                set_last_greeting_at(message.author.id, message.guild.id, datetime.now(PACIFIC_TZ).isoformat())
-
-            if show_state_ctx:
-                _store_show_state_topic_context(message.guild.id, message.channel.id, message.author.id, show_state_ctx)
             await send_planned_conversation_response(
                 message,
                 response,
@@ -19904,6 +20368,9 @@ async def on_message(message: discord.Message):
                 generation_route=show_state_route,
                 is_reply=is_reply,
                 source_context_available=source_context_available,
+                direct_repair_generation=direct_repair_generation,
+                allow_greeting_on_commit=allow_greeting,
+                show_state_context_on_commit=show_state_ctx,
             )
             return
 
@@ -19972,6 +20439,11 @@ async def on_message(message: discord.Message):
         )
         if not conversation_plan.should_reply and conversation_plan.response_timing != RESPONSE_TIMING_DEFERRED_PAYLOAD_SESSION:
             return
+        direct_repair_generation = None
+        if route_mode == ROUTE_MODE_NORMAL_CHAT and is_conversational_repair_intent(direct_content):
+            direct_repair_generation = _begin_direct_repair_generation(direct_conversation_ingress)
+            if direct_repair_generation is None:
+                return
         sealed_recall_guard = get_sealed_test_recall_guard_response(
             channel_policy,
             direct_content,
@@ -19979,6 +20451,7 @@ async def on_message(message: discord.Message):
             message.channel.id,
         )
         if sealed_recall_guard:
+            _finish_direct_repair_generation(direct_repair_generation, "sealed_recall_guard")
             await message.reply(sealed_recall_guard)
             return
 
@@ -19989,21 +20462,18 @@ async def on_message(message: discord.Message):
             message.channel.id,
         )
         if restricted_recall_guard:
+            _finish_direct_repair_generation(direct_repair_generation, "restricted_recall_guard")
             await message.reply(restricted_recall_guard)
             return
 
         save_user_message(message.author.id, message.author.display_name, message.guild.id, direct_content, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0), message_id=getattr(message, "id", None), route_mode=route_mode, directed_to_bnl=True)
-
-        repair = try_repair_response(direct_content)
-        if repair:
-            await send_reply_then_save_model(message, repair, user_id=message.author.id, guild_id=message.guild.id, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0), route_mode=route_mode)
-            return
 
         self_reflection = try_self_reflection_response(message.author.id, message.guild.id, direct_content)
         if self_reflection:
             if not is_privileged_member(message.author, message.guild):
                 self_reflection = "Status reports are restricted to server owner/mod operators."
             await send_reply_then_save_model(message, self_reflection, user_id=message.author.id, guild_id=message.guild.id, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0), route_mode=route_mode)
+            _finish_direct_repair_generation(direct_repair_generation, "deterministic_self_reflection")
             return
 
         memory_recall = resolve_recent_media_followup(message.author.id, message.guild.id, message.channel.id, channel_policy, direct_content)
@@ -20011,8 +20481,22 @@ async def on_message(message: discord.Message):
             memory_recall = try_memory_recall_response(message.author.id, message.guild.id, direct_content)
             if memory_recall:
                 memory_recall = apply_explicit_recall_governance(message.author.id, message.guild.id, direct_content, memory_recall, route_mode, channel_policy, channel_id=getattr(message.channel, "id", 0), channel_name=getattr(message.channel, "name", ""), is_owner_or_mod=is_privileged_member(message.author, message.guild))
+                memory_recall = format_explicit_recall_for_chat(memory_recall)
+        if memory_recall:
+            memory_recall = await validate_deterministic_normal_chat_response(
+                memory_recall,
+                user_id=message.author.id,
+                guild_id=message.guild.id,
+                route_mode=route_mode,
+                channel_policy=channel_policy,
+                current_user_text=direct_content,
+            )
+            if not memory_recall:
+                _finish_direct_repair_generation(direct_repair_generation, "deterministic_recall_suppressed")
+                return
         if memory_recall:
             await send_reply_then_save_model(message, memory_recall, user_id=message.author.id, guild_id=message.guild.id, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0), route_mode=route_mode)
+            _finish_direct_repair_generation(direct_repair_generation, "deterministic_recall")
             return
 
         payload_expected, _ = _detect_request_payload_expectation(direct_content)
@@ -20107,6 +20591,8 @@ async def on_message(message: discord.Message):
                 route=show_state_route,
                 source_context_available=source_context_available,
             )
+        if _abort_stale_direct_repair_generation(direct_repair_generation, "after_initial_generation"):
+            return
         if response and direct_payload_items:
             missing_items = _missing_request_payload_items(direct_payload_items, response)
             logging.info(f"direct_payload_completion_check missing_count={len(missing_items)}")
@@ -20125,6 +20611,8 @@ async def on_message(message: discord.Message):
                         route=show_state_route,
                         source_context_available=source_context_available,
                     )
+                if _abort_stale_direct_repair_generation(direct_repair_generation, "after_payload_completion_retry"):
+                    return
                 missing_items = _missing_request_payload_items(direct_payload_items, response or "")
                 logging.info(f"direct_payload_completion_regenerated missing_count={len(missing_items)}")
                 if missing_items:
@@ -20145,16 +20633,12 @@ async def on_message(message: discord.Message):
             if show_state_ctx:
                 response = "The current broadcast-memory note marks that BARCODE Radio slot as unavailable."
             else:
+                _finish_direct_repair_generation(direct_repair_generation, "generation_failed")
                 result = GenerationResult(False, "", _last_generation_status.get("error_category") or GENERATION_ERROR_PROVIDER_UNKNOWN, _last_generation_status.get("provider_error_code") or "", "", show_state_route, 0.0, GEMINI_MODEL)
                 log_response_generation_failed(route=show_state_route, channel=message.channel, channel_policy=channel_policy, conversation_surface=conversation_surface, directness="real_direct_target" if real_direct_target else ("plain_text_name_seen" if plain_text_name_seen else "request_intent"), result=result)
                 logging.info("response_suppressed_no_fallback route=%s reason=generation_failed", show_state_route)
                 return
 
-        if allow_greeting:
-            set_last_greeting_at(message.author.id, message.guild.id, datetime.now(PACIFIC_TZ).isoformat())
-
-        if show_state_ctx:
-            _store_show_state_topic_context(message.guild.id, message.channel.id, message.author.id, show_state_ctx)
         await send_planned_conversation_response(
             message,
             response,
@@ -20167,6 +20651,9 @@ async def on_message(message: discord.Message):
             generation_route=show_state_route,
             is_reply=is_reply,
             source_context_available=source_context_available,
+            direct_repair_generation=direct_repair_generation,
+            allow_greeting_on_commit=allow_greeting,
+            show_state_context_on_commit=show_state_ctx,
         )
         return
 
@@ -20194,6 +20681,11 @@ async def on_message(message: discord.Message):
         )
         if not conversation_plan.should_reply and conversation_plan.response_timing != RESPONSE_TIMING_DEFERRED_PAYLOAD_SESSION:
             return
+        direct_repair_generation = None
+        if route_mode == ROUTE_MODE_NORMAL_CHAT and is_conversational_repair_intent(direct_content):
+            direct_repair_generation = _begin_direct_repair_generation(direct_conversation_ingress)
+            if direct_repair_generation is None:
+                return
         sealed_recall_guard = get_sealed_test_recall_guard_response(
             channel_policy,
             direct_content,
@@ -20201,6 +20693,7 @@ async def on_message(message: discord.Message):
             message.channel.id,
         )
         if sealed_recall_guard:
+            _finish_direct_repair_generation(direct_repair_generation, "sealed_recall_guard")
             await message.reply(sealed_recall_guard)
             return
 
@@ -20211,21 +20704,18 @@ async def on_message(message: discord.Message):
             message.channel.id,
         )
         if restricted_recall_guard:
+            _finish_direct_repair_generation(direct_repair_generation, "restricted_recall_guard")
             await message.reply(restricted_recall_guard)
             return
 
         save_user_message(message.author.id, message.author.display_name, message.guild.id, direct_content, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0), message_id=getattr(message, "id", None), route_mode=route_mode, directed_to_bnl=True)
-
-        repair = try_repair_response(direct_content)
-        if repair:
-            await send_reply_then_save_model(message, repair, user_id=message.author.id, guild_id=message.guild.id, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0), route_mode=route_mode, reply_text=repair if len(repair) <= 2000 else repair[:1900] + "...")
-            return
 
         self_reflection = try_self_reflection_response(message.author.id, message.guild.id, direct_content)
         if self_reflection:
             if not is_privileged_member(message.author, message.guild):
                 self_reflection = "Status reports are restricted to server owner/mod operators."
             await send_reply_then_save_model(message, self_reflection, user_id=message.author.id, guild_id=message.guild.id, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0), route_mode=route_mode, reply_text=self_reflection if len(self_reflection) <= 2000 else self_reflection[:1900] + "...")
+            _finish_direct_repair_generation(direct_repair_generation, "deterministic_self_reflection")
             return
 
         memory_recall = resolve_recent_media_followup(message.author.id, message.guild.id, message.channel.id, channel_policy, direct_content)
@@ -20233,8 +20723,22 @@ async def on_message(message: discord.Message):
             memory_recall = try_memory_recall_response(message.author.id, message.guild.id, direct_content)
             if memory_recall:
                 memory_recall = apply_explicit_recall_governance(message.author.id, message.guild.id, direct_content, memory_recall, route_mode, channel_policy, channel_id=getattr(message.channel, "id", 0), channel_name=getattr(message.channel, "name", ""), is_owner_or_mod=is_privileged_member(message.author, message.guild))
+                memory_recall = format_explicit_recall_for_chat(memory_recall)
+        if memory_recall:
+            memory_recall = await validate_deterministic_normal_chat_response(
+                memory_recall,
+                user_id=message.author.id,
+                guild_id=message.guild.id,
+                route_mode=route_mode,
+                channel_policy=channel_policy,
+                current_user_text=direct_content,
+            )
+            if not memory_recall:
+                _finish_direct_repair_generation(direct_repair_generation, "deterministic_recall_suppressed")
+                return
         if memory_recall:
             await send_reply_then_save_model(message, memory_recall, user_id=message.author.id, guild_id=message.guild.id, channel_name=getattr(message.channel, "name", ""), channel_policy=channel_policy, channel_id=getattr(message.channel, "id", 0), route_mode=route_mode, reply_text=memory_recall if len(memory_recall) <= 2000 else memory_recall[:1900] + "...")
+            _finish_direct_repair_generation(direct_repair_generation, "deterministic_recall")
             return
 
         payload_expected, _ = _detect_request_payload_expectation(direct_content)
@@ -20329,6 +20833,8 @@ async def on_message(message: discord.Message):
                 route=show_state_route,
                 source_context_available=source_context_available,
             )
+        if _abort_stale_direct_repair_generation(direct_repair_generation, "after_initial_generation"):
+            return
         if response and direct_payload_items:
             missing_items = _missing_request_payload_items(direct_payload_items, response)
             logging.info(f"direct_payload_completion_check missing_count={len(missing_items)}")
@@ -20347,6 +20853,8 @@ async def on_message(message: discord.Message):
                         route=show_state_route,
                         source_context_available=source_context_available,
                     )
+                if _abort_stale_direct_repair_generation(direct_repair_generation, "after_payload_completion_retry"):
+                    return
                 missing_items = _missing_request_payload_items(direct_payload_items, response or "")
                 logging.info(f"direct_payload_completion_regenerated missing_count={len(missing_items)}")
                 if missing_items:
@@ -20367,16 +20875,12 @@ async def on_message(message: discord.Message):
             if show_state_ctx:
                 response = "The current broadcast-memory note marks that BARCODE Radio slot as unavailable."
             else:
+                _finish_direct_repair_generation(direct_repair_generation, "generation_failed")
                 result = GenerationResult(False, "", _last_generation_status.get("error_category") or GENERATION_ERROR_PROVIDER_UNKNOWN, _last_generation_status.get("provider_error_code") or "", "", show_state_route, 0.0, GEMINI_MODEL)
                 log_response_generation_failed(route=show_state_route, channel=message.channel, channel_policy=channel_policy, conversation_surface=conversation_surface, directness="real_direct_target" if real_direct_target else ("plain_text_name_seen" if plain_text_name_seen else "request_intent"), result=result)
                 logging.info("response_suppressed_no_fallback route=%s reason=generation_failed", show_state_route)
                 return
 
-        if allow_greeting:
-            set_last_greeting_at(message.author.id, message.guild.id, datetime.now(PACIFIC_TZ).isoformat())
-
-        if show_state_ctx:
-            _store_show_state_topic_context(message.guild.id, message.channel.id, message.author.id, show_state_ctx)
         await send_planned_conversation_response(
             message,
             response,
@@ -20389,6 +20893,9 @@ async def on_message(message: discord.Message):
             generation_route=show_state_route,
             is_reply=is_reply,
             source_context_available=source_context_available,
+            direct_repair_generation=direct_repair_generation,
+            allow_greeting_on_commit=allow_greeting,
+            show_state_context_on_commit=show_state_ctx,
         )
         return
 

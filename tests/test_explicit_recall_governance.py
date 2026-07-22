@@ -151,8 +151,10 @@ class ExplicitRecallGovernanceTests(unittest.TestCase):
         offsets = [i for i in range(len(text)) if text.startswith("try_memory_recall_response", i) and text[max(0, i-4):i].strip().endswith("=")]
         self.assertGreaterEqual(len(offsets), 4)
         for i in offsets:
-            window = text[i:i + 500]
+            window = text[i:i + 1200]
             self.assertIn("apply_explicit_recall_governance", window)
+            self.assertIn("format_explicit_recall_for_chat", window)
+            self.assertIn("validate_deterministic_normal_chat_response", window)
 
 
 class RememberDirectiveExtractionTests(unittest.TestCase):
