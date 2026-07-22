@@ -456,6 +456,51 @@ class BotConversationContextV2IntegrationTests(unittest.TestCase):
         self.assertIn("batch answer", prompt)
         self.assertNotIn("User/member: current batch", prompt)
 
+    def test_opener_correction_batch_uses_v2_prior_pair_and_fresh_judgment_contract(self):
+        b = self.bot
+        correction = "BNL, that's not what I meant."
+        clarification = "I meant the opener video, not me talking. Give me your actual read in full Network mode."
+        self._insert("user", "BNL, should Friday's opener be serious or chaotic?", mid=411, minutes=4)
+        self._insert(
+            "model",
+            "Serious gives structure. Chaotic triggers novelty. Both yield valuable data.",
+            mid=412,
+            minutes=3,
+        )
+        self._insert("user", correction, mid=413, minutes=2)
+        self._insert("user", clarification, mid=414, minutes=1)
+
+        raw_items = [("6 Bit", correction, 1), ("6 Bit", clarification, 1)]
+        collapsed_items = b._collapse_consecutive_batch_fragments(raw_items)
+        self.assertEqual(
+            collapsed_items,
+            [("6 Bit", f"{correction} / {clarification}", 1)],
+        )
+        prompt = b._format_batched_prompt(collapsed_items, "analytic_mode", "clear tradeoffs")
+        ctx = b.build_active_batch_conversation_context_v2_prompt(
+            guild_id=99,
+            channel_id=10,
+            channel_name="home",
+            channel_policy="public_home",
+            first_uid=1,
+            collapsed_items=collapsed_items,
+            unique_user_ids=[1],
+            active_packet={"items": raw_items, "payload_items": [], "has_request_payload": False},
+            is_active_channel=True,
+        )
+        prompt += "\n\n" + ctx
+        lowered = prompt.lower()
+
+        self.assertIn("should friday's opener be serious or chaotic?", lowered)
+        self.assertIn("both yield valuable data", lowered)
+        self.assertEqual(lowered.count("bnl, that's not what i meant"), 1)
+        self.assertEqual(lowered.count("i meant the opener video"), 1)
+        self.assertEqual(b.LAST_CONVERSATION_CONTEXT_V2_DIAGNOSTICS.get("current_message_duplicates_removed"), 2)
+        self.assertIn("state a clear position or recommendation", lowered)
+        self.assertIn("newest clarification as authoritative", lowered)
+        self.assertIn("independently reassessed judgment may still reach the same conclusion", lowered)
+        self.assertIn("response style mode: analytic_mode", lowered)
+
 
     def test_save_model_message_calls_do_not_use_unsupported_message_id_keyword(self):
         import inspect

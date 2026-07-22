@@ -1204,6 +1204,8 @@ class RegressionExamplesTests(unittest.TestCase):
         contract = bnl01_bot.normal_chat_prompt_contract(bnl01_bot.ROUTE_MODE_NORMAL_CHAT)
         lowered = contract.lower()
         self.assertIn("answer the user's actual message", lowered)
+        self.assertIn("state a clear position or recommendation", lowered)
+        self.assertIn("do not substitute a description of both sides", lowered)
         self.assertIn("keep bnl's voice", lowered)
         self.assertIn("do not expose source-file, dossier, classification, candidate", lowered)
         self.assertIn("unless explicitly asked", lowered)
@@ -1227,6 +1229,40 @@ class RegressionExamplesTests(unittest.TestCase):
             self.assertNotIn("operational-parameters disclaimer", prompt)
         self.assertNotIn("use corporate/system flavor lightly", batched)
         self.assertNotIn("do not begin ordinary chat with 'acknowledged'", batched)
+
+    def test_direct_and_batched_prompts_share_judgment_and_correction_obligations(self):
+        with (
+            mock.patch.object(bnl01_bot, "get_user_profile", return_value=("6 Bit", None)),
+            mock.patch.object(bnl01_bot, "should_allow_greeting", return_value=False),
+            mock.patch.object(bnl01_bot, "choose_response_style", return_value=("social_signal", "brief and direct")),
+            mock.patch.object(bnl01_bot, "build_user_memory_context", return_value="No durable memory."),
+            mock.patch.object(bnl01_bot, "build_broadcast_memory_context", return_value=""),
+        ):
+            direct, _allow, _style = bnl01_bot.build_user_aware_prompt(
+                101,
+                1,
+                "6 Bit",
+                "BNL, that's not what I meant. Give me your actual read.",
+                room_context="Visible prior exchange: should the opener be serious or chaotic?",
+                channel_name="bnl-testing",
+                channel_policy="sealed_test",
+                route_mode=bnl01_bot.ROUTE_MODE_NORMAL_CHAT,
+            )
+        batched = bnl01_bot._format_batched_prompt(
+            [
+                ("6 Bit", "BNL, that's not what I meant.", 101),
+                ("6 Bit", "I meant the opener video. Give me your actual read.", 101),
+            ],
+            "social_signal",
+            "brief and direct",
+        )
+        for prompt in (direct, batched):
+            lowered = prompt.lower()
+            self.assertIn("state a clear position or recommendation", lowered)
+            self.assertIn("newest clarification as authoritative", lowered)
+            self.assertIn("do not merely apologize, rename the subject", lowered)
+            self.assertIn("independently reassessed judgment may still reach the same conclusion", lowered)
+            self.assertIn("keep bnl's voice", lowered)
 
     def test_check_in_fallback_makes_sense_as_answer(self):
         fallback = bnl01_bot.safe_fallback_response_for_mode_leak(

@@ -434,6 +434,50 @@ class ConversationBatchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
             ["You're right—the Friday opener was the question, and I answered the wrong person."],
         )
 
+    async def test_live_opener_correction_prompt_requires_a_revised_judgment(self):
+        channel = self._channel(8135)
+        prompts = []
+        prior_exchange = (
+            "Conversation continuity (bounded same-room window):\n"
+            "- 6 Bit: BNL, should Friday's opener be serious or chaotic?\n"
+            "- BNL-01: Serious gives structure. Chaotic triggers novelty. Both yield valuable data."
+        )
+
+        async def generate(prompt, **_kwargs):
+            prompts.append(prompt)
+            return (
+                "Chaotic—with just enough structure to make the collapse feel intentional. "
+                "For the opener video, BARCODE should look like the Network lost control before the show even starts."
+            )
+
+        self._prime_flush(
+            channel,
+            "BNL, that's not what I meant.",
+            "I meant the opener video, not me talking. Give me your actual read in full Network mode.",
+        )
+        with self._flush_runtime(channel.id, generate), mock.patch.object(
+            bnl01_bot,
+            "build_recent_text_room_context_for_prompt",
+            return_value=prior_exchange,
+        ):
+            await bnl01_bot._flush_channel_buffer(channel)
+
+        self.assertEqual(len(prompts), 1)
+        lowered_prompt = prompts[0].lower()
+        self.assertIn("state a clear position or recommendation", lowered_prompt)
+        self.assertIn("do not substitute a description of both sides", lowered_prompt)
+        self.assertIn("newest clarification as authoritative", lowered_prompt)
+        self.assertIn("do not merely apologize, rename the subject", lowered_prompt)
+        self.assertIn("should friday's opener be serious or chaotic?", lowered_prompt)
+        self.assertIn("i meant the opener video", lowered_prompt)
+        self.assertEqual(
+            channel.sent,
+            [
+                "Chaotic—with just enough structure to make the collapse feel intentional. "
+                "For the opener video, BARCODE should look like the Network lost control before the show even starts."
+            ],
+        )
+
     async def test_batched_durable_recall_governs_once_then_presents_naturally(self):
         channel = self._channel(8118)
         provider = mock.AsyncMock(side_effect=AssertionError("deterministic recall must not generate"))
