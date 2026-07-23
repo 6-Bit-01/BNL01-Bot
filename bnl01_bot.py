@@ -95,6 +95,8 @@ from bnl_journal_source_store import (
 from bnl_journal_automation import (
     automation_status as journal_automation_status,
     load_journal_memory_exclusions,
+    prepare_scheduled as prepare_scheduled_journal_automation,
+    release_scheduled as release_scheduled_journal_automation,
     release_prepared_entry as release_prepared_journal_entry,
     result_dict as journal_automation_result_dict,
     run_daily as run_daily_journal_automation,
@@ -132,6 +134,7 @@ import urllib.parse
 import calendar
 import time
 import threading
+import concurrent.futures
 
 from bnl_dossier_candidate_discovery import (
     DEFAULT_DISCOVERY_LANES,
@@ -343,10 +346,19 @@ BNL_COMMUNITY_SCOUTING_MIN_SIGNALS = community_min_signals()
 
 DAILY_TOKEN_LIMIT = 1_350_000
 PACIFIC_TZ = pytz.timezone("US/Pacific")
+JOURNAL_PREPARATION_SCHEDULE_TIME = datetime_time(
+    hour=18,
+    minute=30,
+    tzinfo=ZoneInfo("America/Los_Angeles"),
+)
 JOURNAL_DAILY_SCHEDULE_TIME = datetime_time(
     hour=19,
     minute=0,
     tzinfo=ZoneInfo("America/Los_Angeles"),
+)
+JOURNAL_PREPARATION_MAX_SECONDS = max(
+    60,
+    int(os.getenv("BNL_JOURNAL_PREPARATION_MAX_SECONDS", "1500") or 1500),
 )
 DB_FILE = "bnl01_conversations.db"
 
@@ -6008,6 +6020,53 @@ def _generate_journal_json_sync(_packet: dict, prompt: str) -> str:
     return text or ""
 
 
+def _journal_preparation_budget_seconds(now_pacific: datetime | None = None) -> float:
+    now = now_pacific or datetime.now(PACIFIC_TZ)
+    if now.tzinfo is None:
+        now = PACIFIC_TZ.localize(now)
+    else:
+        now = now.astimezone(PACIFIC_TZ)
+    if (18, 30) <= (now.hour, now.minute) < (19, 0):
+        release_at = PACIFIC_TZ.localize(
+            datetime.combine(now.date(), datetime_time(19, 0))
+        )
+        return max(
+            1.0,
+            min(
+                float(JOURNAL_PREPARATION_MAX_SECONDS),
+                (release_at - now).total_seconds() - 5.0,
+            ),
+        )
+    return float(JOURNAL_PREPARATION_MAX_SECONDS)
+
+
+def _bounded_journal_preparation_generator(
+    *,
+    now_pacific: datetime | None = None,
+):
+    """Bound the complete four-attempt preparation lane before release time."""
+    deadline = time.monotonic() + _journal_preparation_budget_seconds(now_pacific)
+
+    def generate(packet: dict, prompt: str) -> str:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise RuntimeError("journal_preparation_timeout")
+        executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="journal-provider",
+        )
+        future = executor.submit(_generate_journal_json_sync, packet, prompt)
+        try:
+            return future.result(timeout=remaining)
+        except concurrent.futures.TimeoutError as exc:
+            future.cancel()
+            raise RuntimeError("journal_preparation_timeout") from exc
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
+
+    return generate
+
+
 def _journal_control_url() -> str:
     explicit = os.getenv("BNL_JOURNAL_CONTROL_URL", "").strip()
     if explicit:
@@ -6159,7 +6218,7 @@ def _journal_site_run_state(status: str) -> str:
         return normalized
     if normalized in {"paused"}:
         return "disabled"
-    if normalized in {"quiet", "deferred", "not_due"}:
+    if normalized in {"quiet", "deferred", "not_due", "not_applicable", "superseded"}:
         return "skipped"
     return "failed"
 
@@ -6242,16 +6301,25 @@ async def run_journal_automation_once(
     guild_id: int,
     *,
     cadence: str = "scheduled",
+    phase: str = "recover",
     force: bool = False,
     flags: dict | None = None,
 ) -> list[dict]:
     """Serialize generation/delivery per guild and enforce every automation control flag."""
     guild_id = resolve_network_guild_id(int(guild_id))
     cadence = str(cadence or "scheduled").lower()
+    phase = str(phase or "recover").lower()
+    if phase not in {"prepare", "release", "recover"}:
+        phase = "recover"
     lock = _journal_automation_lock(guild_id)
     async with lock:
         runtime = _journal_automation_runtime_by_guild.setdefault(guild_id, {})
-        runtime.update({"lastStartedAt": _utc_now_iso(), "lastError": "", "lastCadence": cadence})
+        runtime.update({
+            "lastStartedAt": _utc_now_iso(),
+            "lastError": "",
+            "lastCadence": cadence,
+            "lastPhase": phase,
+        })
         if not BNL_JOURNAL_AUTOMATION_ENABLED:
             results = [_journal_control_result(cadence, "paused", "local_automation_disabled")]
         else:
@@ -6300,15 +6368,33 @@ async def run_journal_automation_once(
                 )
                 results = [journal_automation_result_dict(result)]
             else:
-                scheduled = await asyncio.to_thread(
-                    run_scheduled_journal_automation,
-                    DB_FILE,
-                    guild_id,
-                    _generate_journal_json_sync,
-                    _journal_website_base_url(),
-                    BNL_API_KEY,
-                    effective_flags,
-                )
+                if phase == "release":
+                    scheduled = await asyncio.to_thread(
+                        release_scheduled_journal_automation,
+                        DB_FILE,
+                        guild_id,
+                        _journal_website_base_url(),
+                        BNL_API_KEY,
+                        effective_flags,
+                    )
+                elif phase == "prepare":
+                    scheduled = await asyncio.to_thread(
+                        prepare_scheduled_journal_automation,
+                        DB_FILE,
+                        guild_id,
+                        _bounded_journal_preparation_generator(),
+                        effective_flags,
+                    )
+                else:
+                    scheduled = await asyncio.to_thread(
+                        run_scheduled_journal_automation,
+                        DB_FILE,
+                        guild_id,
+                        _bounded_journal_preparation_generator(),
+                        _journal_website_base_url(),
+                        BNL_API_KEY,
+                        effective_flags,
+                    )
                 results = [journal_automation_result_dict(item) for item in scheduled]
         runtime.update({
             "lastCompletedAt": _utc_now_iso(),
@@ -6316,15 +6402,20 @@ async def run_journal_automation_once(
             "lastDetail": "; ".join(str(item.get("reason") or item.get("status") or "") for item in results)[:240],
         })
         logging.info(
-            "journal_automation_cycle guild=%s cadence=%s results=%s",
+            "journal_automation_cycle guild=%s cadence=%s phase=%s results=%s",
             guild_id,
             cadence,
+            phase,
             ",".join(f"{item.get('cadence')}:{item.get('status')}" for item in results),
         )
         return results
 
 
-async def run_journal_automation_control_cycle(guild_id: int) -> list[dict]:
+async def run_journal_automation_control_cycle(
+    guild_id: int,
+    *,
+    phase: str = "recover",
+) -> list[dict]:
     """Poll admin controls, claim at most one Run Now request, then run/report safely."""
     guild_id = resolve_network_guild_id(int(guild_id))
     base_flags = await asyncio.to_thread(get_bnl_control_flags)
@@ -6345,6 +6436,7 @@ async def run_journal_automation_control_cycle(guild_id: int) -> list[dict]:
         results = await run_journal_automation_once(
             guild_id,
             cadence="scheduled",
+            phase=phase,
             force=False,
             flags=flags,
         )
@@ -6364,7 +6456,7 @@ async def run_journal_automation_control_cycle(guild_id: int) -> list[dict]:
         await asyncio.to_thread(_journal_heartbeat_sync, runtime, flags)
         return results
     claimed = None
-    if control is not None:
+    if control is not None and phase == "recover":
         claimed, claim_error = await asyncio.to_thread(_journal_control_claim_sync, control)
         control_error = claim_error or control_error
     request_id = str((claimed or {}).get("requestId") or "")[:120]
@@ -6384,6 +6476,7 @@ async def run_journal_automation_control_cycle(guild_id: int) -> list[dict]:
     results = await run_journal_automation_once(
         guild_id,
         cadence=cadence if cadence in {"daily", "weekly"} else "scheduled",
+        phase="recover" if claimed else phase,
         force=bool(claimed),
         flags=flags,
     )
@@ -15342,7 +15435,11 @@ tree = app_commands.CommandTree(client)
 _ambient_post_locks = {}
 
 
-async def _run_journal_automation_for_managed_guilds(trigger: str) -> None:
+async def _run_journal_automation_for_managed_guilds(
+    trigger: str,
+    *,
+    phase: str = "recover",
+) -> None:
     """Run the idempotent Journal scheduler for each configured Discord guild."""
     for guild in iter_managed_guilds():
         guild_id = int(getattr(guild, "id", 0) or 0)
@@ -15350,11 +15447,12 @@ async def _run_journal_automation_for_managed_guilds(trigger: str) -> None:
             continue
         try:
             logging.info(
-                "journal_automation_trigger guild=%s trigger=%s",
+                "journal_automation_trigger guild=%s trigger=%s phase=%s",
                 guild_id,
                 trigger,
+                phase,
             )
-            await run_journal_automation_control_cycle(guild_id)
+            await run_journal_automation_control_cycle(guild_id, phase=phase)
         except Exception as exc:
             runtime = _journal_automation_runtime_by_guild.setdefault(guild_id, {})
             runtime.update({"lastCompletedAt": _utc_now_iso(), "lastError": type(exc).__name__})
@@ -15405,13 +15503,28 @@ async def source_file_refresh_worker_task():
     except Exception as exc:
         logging.warning("source_refresh_worker_cycle processed=0 skipped=0 failed=1 error=%s", exc)
 
-    await _run_journal_automation_for_managed_guilds("interval_catch_up")
+    await _run_journal_automation_for_managed_guilds(
+        "interval_catch_up",
+        phase="recover",
+    )
+
+
+@tasks.loop(time=JOURNAL_PREPARATION_SCHEDULE_TIME)
+async def journal_preparation_schedule_task():
+    """Close evidence and start the scheduled Journal at 6:30 PM Pacific."""
+    await _run_journal_automation_for_managed_guilds(
+        "preparation_630pm_pacific",
+        phase="prepare",
+    )
 
 
 @tasks.loop(time=JOURNAL_DAILY_SCHEDULE_TIME)
 async def journal_daily_schedule_task():
-    """Start the daily Journal cycle at exactly 7:00 PM Pacific."""
-    await _run_journal_automation_for_managed_guilds("daily_7pm_pacific")
+    """Release the already-prepared scheduled Journal at 7:00 PM Pacific."""
+    await _run_journal_automation_for_managed_guilds(
+        "release_7pm_pacific",
+        phase="release",
+    )
 
 # ==================== AMBIENT MESSAGE TASK ====================
 
@@ -18105,6 +18218,9 @@ async def on_ready():
 
     if not source_file_refresh_worker_task.is_running():
         source_file_refresh_worker_task.start()
+
+    if not journal_preparation_schedule_task.is_running():
+        journal_preparation_schedule_task.start()
 
     if not journal_daily_schedule_task.is_running():
         journal_daily_schedule_task.start()

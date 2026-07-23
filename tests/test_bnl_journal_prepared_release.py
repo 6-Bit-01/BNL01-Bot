@@ -18,7 +18,7 @@ import bnl_journal_automation as automation
 import bnl_journal_source_store as source_store
 
 
-TARGET_DAY = date(2026, 7, 19)
+TARGET_DAY = date(2026, 7, 20)
 
 
 def article_json(packet, *, title="Prepared Signal Weather", body_repeat=18):
@@ -756,7 +756,7 @@ class PreparedReleaseTests(unittest.TestCase):
         self.assertIsNone(run["frozen_packet_json"])
         self.assertIsNone(run["prepared_payload_hash"])
         self.assertEqual("rejected", self.entry_row(prepared.entry_id, prepared.revision)["lifecycle_state"])
-        now = datetime(2026, 7, 21, 3, 0, tzinfo=timezone.utc)
+        now = datetime(2026, 7, 22, 3, 0, tzinfo=timezone.utc)
         self.assertEqual(TARGET_DAY, automation._pending_daily_day(self.db, 1, now))
 
     def test_payload_tampering_is_rejected_before_network(self):
