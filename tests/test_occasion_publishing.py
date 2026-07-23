@@ -550,6 +550,66 @@ class OccasionBotPathTests(unittest.TestCase):
             ).fetchall()
         self.assertEqual(("published", content, "1001"), occurrence)
         self.assertEqual([("occasion",)], log_rows)
+        capacity = bnl01_bot.get_ambient_capacity_state(
+            1,
+            channel.id,
+            now_pacific=now,
+        )
+        self.assertEqual(1, capacity["actualPosts"])
+        self.assertEqual(1, capacity["capacityUsed"])
+        self.assertEqual(0, capacity["occasionReserved"])
+        for source_type in ("ambient", "dormant_echo", "showday"):
+            self.assertFalse(
+                bnl01_bot.ambient_capacity_decision(
+                    1,
+                    channel.id,
+                    source_type,
+                    now_pacific=now,
+                )["allowed"]
+            )
+
+    def test_occasion_reserves_normal_day_capacity_before_target_time(self):
+        now = pacific(2026, 7, 4, 9, 0)
+
+        capacity = bnl01_bot.get_ambient_capacity_state(
+            1,
+            222,
+            now_pacific=now,
+        )
+        self.assertEqual(0, capacity["actualPosts"])
+        self.assertEqual(1, capacity["capacityUsed"])
+        self.assertEqual(1, capacity["occasionReserved"])
+        self.assertFalse(
+            bnl01_bot.ambient_capacity_decision(
+                1,
+                222,
+                "ambient",
+                now_pacific=now,
+            )["allowed"]
+        )
+        self.assertTrue(
+            bnl01_bot.ambient_capacity_decision(
+                1,
+                222,
+                "occasion",
+                now_pacific=now,
+            )["allowed"]
+        )
+
+    def test_disabled_occasion_does_not_reserve_capacity(self):
+        now = pacific(2026, 7, 4, 9, 0)
+        with mock.patch.dict(
+            os.environ,
+            {"BNL_OCCASION_DISABLED_IDS": "independence_day"},
+        ):
+            capacity = bnl01_bot.get_ambient_capacity_state(
+                1,
+                222,
+                now_pacific=now,
+            )
+        self.assertEqual(0, capacity["actualPosts"])
+        self.assertEqual(0, capacity["capacityUsed"])
+        self.assertEqual(0, capacity["occasionReserved"])
 
     def test_provider_failure_retries_after_restart_and_eventually_posts(self):
         now = pacific(2026, 7, 4)
@@ -560,6 +620,14 @@ class OccasionBotPathTests(unittest.TestCase):
         first = self.run_cycle(channel, now, failure)
         self.assertEqual("retryable", first["status"])
         self.assertEqual([], channel.send_attempts)
+        retry_capacity = bnl01_bot.get_ambient_capacity_state(
+            1,
+            channel.id,
+            now_pacific=now,
+        )
+        self.assertEqual(0, retry_capacity["actualPosts"])
+        self.assertEqual(1, retry_capacity["capacityUsed"])
+        self.assertEqual(1, retry_capacity["occasionReserved"])
 
         content = valid_reflection()
         success = mock.AsyncMock(return_value=(content, ""))
@@ -571,6 +639,29 @@ class OccasionBotPathTests(unittest.TestCase):
         self.assertEqual("published", second["status"])
         self.assertEqual(1, success.await_count)
         self.assertEqual(content, channel.messages[0].content)
+
+    def test_occasion_waits_when_an_existing_post_already_filled_normal_cap(self):
+        now = pacific(2026, 7, 4)
+        channel = FakeChannel()
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                """
+                INSERT INTO ambient_log(
+                    guild_id,channel_id,message,source_type,posted_at
+                ) VALUES(?,?,?,?,?)
+                """,
+                (1, channel.id, "earlier", "ambient", now.isoformat()),
+            )
+        generator = mock.AsyncMock(
+            return_value=(valid_reflection(), "")
+        )
+
+        result = self.run_cycle(channel, now, generator)
+
+        self.assertEqual("waiting_for_capacity", result["status"])
+        self.assertEqual("daily_cap_reached", result["reason"])
+        self.assertEqual(0, generator.await_count)
+        self.assertEqual([], channel.send_attempts)
 
     def test_discord_failure_reuses_canonical_payload_without_regeneration(self):
         now = pacific(2026, 7, 4)
@@ -637,6 +728,22 @@ class OccasionBotPathTests(unittest.TestCase):
             )
         self.assertEqual("delivery_record_pending", first["status"])
         self.assertEqual(1, len(channel.messages))
+        crash_capacity = bnl01_bot.get_ambient_capacity_state(
+            1,
+            channel.id,
+            now_pacific=now,
+        )
+        self.assertEqual(0, crash_capacity["actualPosts"])
+        self.assertEqual(1, crash_capacity["capacityUsed"])
+        self.assertEqual(1, crash_capacity["occasionReserved"])
+        self.assertFalse(
+            bnl01_bot.ambient_capacity_decision(
+                1,
+                channel.id,
+                "showday",
+                now_pacific=now,
+            )["allowed"]
+        )
 
         retry = self.run_cycle(
             channel,
@@ -781,8 +888,9 @@ class OccasionBotPathTests(unittest.TestCase):
         self.assertNotIn("BARCODE Open Channel Day", radio_packet["context"])
         self.assertNotIn("BARCODE house tradition", radio_packet["context"])
 
-    def test_occasion_does_not_consume_ambient_or_dormant_echo_capacity(self):
-        now = datetime.now(bnl01_bot.PACIFIC_TZ).isoformat()
+    def test_shared_capacity_counts_every_automatic_ambient_owned_source(self):
+        now = pacific(2026, 7, 23, 12, 0)
+        now_iso = now.isoformat()
         with sqlite3.connect(self.db_path) as conn:
             conn.executemany(
                 """
@@ -791,16 +899,77 @@ class OccasionBotPathTests(unittest.TestCase):
                 ) VALUES(?,?,?,?,?)
                 """,
                 (
-                    (1, 222, "ambient", "ambient", now),
-                    (1, 222, "echo", "dormant_echo", now),
-                    (1, 222, "holiday", "occasion", now),
-                    (1, 222, "show", "showday", now),
+                    (1, 222, "ambient", "ambient", now_iso),
+                    (1, 222, "echo", "dormant_echo", now_iso),
+                    (1, 222, "holiday", "occasion", now_iso),
+                    (1, 222, "show", "showday", now_iso),
+                    (1, 222, "manual test", "showday_test", now_iso),
                 ),
             )
-        self.assertEqual(
-            2,
-            bnl01_bot.get_self_started_posts_today(1, 222),
+        capacity = bnl01_bot.get_ambient_capacity_state(
+            1,
+            222,
+            now_pacific=now,
         )
+        self.assertEqual(4, capacity["actualPosts"])
+        self.assertEqual(4, capacity["capacityUsed"])
+        self.assertEqual(
+            {
+                "ambient": 1,
+                "dormant_echo": 1,
+                "occasion": 1,
+                "showday": 1,
+            },
+            capacity["sourceCounts"],
+        )
+
+    def test_high_activity_never_allows_a_third_post(self):
+        now = pacific(2026, 7, 4, 9, 0)
+        occasion_store.seed_occurrences(
+            self.db_path,
+            1,
+            222,
+            now,
+        )
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                """
+                INSERT INTO ambient_log(
+                    guild_id,channel_id,message,source_type,posted_at
+                ) VALUES(?,?,?,?,?)
+                """,
+                (1, 222, "show", "showday", now.isoformat()),
+            )
+
+        with mock.patch.object(
+            bnl01_bot,
+            "ambient_daily_post_cap",
+            return_value=2,
+        ):
+            capacity = bnl01_bot.get_ambient_capacity_state(
+                1,
+                222,
+                now_pacific=now,
+            )
+            self.assertEqual(1, capacity["actualPosts"])
+            self.assertEqual(2, capacity["capacityUsed"])
+            self.assertTrue(
+                bnl01_bot.ambient_capacity_decision(
+                    1,
+                    222,
+                    "occasion",
+                    now_pacific=now,
+                )["allowed"]
+            )
+            for source_type in ("ambient", "dormant_echo", "showday"):
+                decision = bnl01_bot.ambient_capacity_decision(
+                    1,
+                    222,
+                    source_type,
+                    now_pacific=now,
+                )
+                self.assertFalse(decision["allowed"])
+                self.assertEqual(2, decision["cap"])
 
     def test_high_activity_cap_uses_public_day_signal_not_weekday(self):
         friday = pacific(2026, 7, 24, 12, 0)

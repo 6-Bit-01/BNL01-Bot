@@ -28,7 +28,9 @@ from bnl_occasion import (
     OCCASION_DELIVERY_RETRY_MINUTES,
     OCCASION_PROVIDER_RETRY_MINUTES,
     OCCASION_REGISTRY,
+    calendar_occasions_on,
     cancel_open_occurrences as cancel_open_occasion_occurrences,
+    capacity_state as occasion_capacity_state,
     claim_next_due as claim_next_due_occasion,
     delivery_nonce as occasion_delivery_nonce,
     diagnostics as occasion_diagnostics,
@@ -429,6 +431,12 @@ AMBIENT_MIN_SIGNAL_CHARS = 120
 AMBIENT_HIGH_ACTIVITY_MIN_MESSAGES = 15
 AMBIENT_HIGH_ACTIVITY_MIN_UNIQUE_USERS = 4
 AMBIENT_HIGH_ACTIVITY_MIN_CHARS = 700
+AMBIENT_CAP_SOURCE_TYPES = (
+    "ambient",
+    "dormant_echo",
+    "occasion",
+    "showday",
+)
 AMBIENT_RESCHEDULE_MIN_HOURS = 4
 AMBIENT_RESCHEDULE_MAX_HOURS = 6
 AMBIENT_SIMILARITY_THRESHOLD = 0.75
@@ -13270,25 +13278,100 @@ def get_ambient_posts_today(guild_id: int, channel_id: int) -> int:
     return int(row[0]) if row and row[0] is not None else 0
 
 
-def get_self_started_posts_today(guild_id: int, channel_id: int) -> int:
-    """Count only ordinary unsolicited output that shares Ambient capacity."""
-    now = datetime.now(PACIFIC_TZ)
-    start_day = now.replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+def get_ambient_capacity_state(
+    guild_id: int,
+    channel_id: int,
+    *,
+    now_pacific: datetime = None,
+) -> dict:
+    """Return actual and reserved use of the shared automatic Ambient quota."""
+    now = now_pacific or datetime.now(PACIFIC_TZ)
+    if now.tzinfo is None:
+        now = PACIFIC_TZ.localize(now)
+    else:
+        now = now.astimezone(PACIFIC_TZ)
+    start_local = PACIFIC_TZ.localize(
+        datetime.combine(now.date(), datetime.min.time())
+    )
+    end_local = PACIFIC_TZ.localize(
+        datetime.combine(now.date() + timedelta(days=1), datetime.min.time())
+    )
+    placeholders = ",".join("?" for _ in AMBIENT_CAP_SOURCE_TYPES)
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
     cursor.execute(
-        """
-        SELECT COUNT(*)
+        f"""
+        SELECT source_type, COUNT(*)
         FROM ambient_log
         WHERE guild_id = ? AND channel_id = ?
-          AND source_type IN ('ambient', 'dormant_echo')
-          AND posted_at >= ?
+          AND source_type IN ({placeholders})
+          AND datetime(COALESCE(posted_at, timestamp)) >= datetime(?)
+          AND datetime(COALESCE(posted_at, timestamp)) < datetime(?)
+        GROUP BY source_type
         """,
-        (guild_id, channel_id, start_day),
+        (
+            guild_id,
+            channel_id,
+            *AMBIENT_CAP_SOURCE_TYPES,
+            start_local.astimezone(timezone.utc).isoformat(),
+            end_local.astimezone(timezone.utc).isoformat(),
+        ),
     )
-    row = cursor.fetchone()
+    source_counts = {
+        str(source_type or "ambient"): int(count or 0)
+        for source_type, count in cursor.fetchall()
+    }
     conn.close()
-    return int(row[0]) if row and row[0] is not None else 0
+    occasion_state = occasion_capacity_state(DB_FILE, guild_id, now)
+    nonoccasion_actual = sum(
+        source_counts.get(source_type, 0)
+        for source_type in ("ambient", "dormant_echo", "showday")
+    )
+    occasion_actual = max(
+        source_counts.get("occasion", 0),
+        int(occasion_state.get("publishedToday") or 0),
+    )
+    disabled_ids = disabled_occasion_ids()
+    scheduled_today = any(
+        item.occasion_id not in disabled_ids
+        for item in calendar_occasions_on(now.date())
+    )
+    next_open_id = str(
+        (occasion_state.get("nextOpen") or {}).get("occasionId") or ""
+    )
+    ledger_open_enabled = bool(
+        occasion_state.get("hasOpenOccurrence")
+        and next_open_id not in disabled_ids
+    )
+    has_open_occasion = bool(
+        ledger_open_enabled
+        or (scheduled_today and occasion_actual == 0)
+    )
+    occasion_reserved = (
+        1
+        if (
+            occasion_output_enabled()
+            and occasion_actual == 0
+            and (
+                ledger_open_enabled
+                or scheduled_today
+            )
+        )
+        else 0
+    )
+    actual_posts = nonoccasion_actual + occasion_actual
+    capacity_used = nonoccasion_actual + max(
+        occasion_actual,
+        occasion_reserved,
+    )
+    return {
+        "actualPosts": actual_posts,
+        "capacityUsed": capacity_used,
+        "occasionActual": occasion_actual,
+        "occasionReserved": occasion_reserved,
+        "hasOpenOccasion": has_open_occasion,
+        "sourceCounts": source_counts,
+    }
 
 
 def get_public_activity_today(guild_id: int, now_pacific: datetime = None) -> dict:
@@ -13337,10 +13420,42 @@ def ambient_daily_post_cap(guild_id: int, now_pacific: datetime = None) -> int:
     return 2 if is_high_activity_day(guild_id, now_pacific=now_pacific) else AMBIENT_DAILY_POST_CAP
 
 
+def ambient_capacity_decision(
+    guild_id: int,
+    channel_id: int,
+    source_type: str,
+    *,
+    now_pacific: datetime = None,
+) -> dict:
+    """Apply the 0-1 normal / 1-2 high-activity cap to automatic output."""
+    state = get_ambient_capacity_state(
+        guild_id,
+        channel_id,
+        now_pacific=now_pacific,
+    )
+    cap = ambient_daily_post_cap(guild_id, now_pacific=now_pacific)
+    if source_type == "occasion":
+        if state["occasionActual"] >= 1:
+            allowed = False
+            reason = "occasion_already_posted_today"
+        else:
+            allowed = state["actualPosts"] < cap
+            reason = "capacity_available" if allowed else "daily_cap_reached"
+    else:
+        allowed = state["capacityUsed"] < cap
+        reason = "capacity_available" if allowed else "daily_cap_reached"
+    return {
+        **state,
+        "allowed": allowed,
+        "reason": reason,
+        "cap": cap,
+    }
+
+
 def schedule_after_ambient_post(
     guild_id: int,
     last_msg: str,
-    posts_today_after_send: int,
+    capacity_used_after_send: int,
     *,
     now_pacific: datetime = None,
 ) -> str:
@@ -13351,7 +13466,7 @@ def schedule_after_ambient_post(
     else:
         now = now.astimezone(PACIFIC_TZ)
     cap = ambient_daily_post_cap(guild_id, now_pacific=now)
-    if posts_today_after_send < cap:
+    if capacity_used_after_send < cap:
         candidate = now + timedelta(
             hours=random.uniform(
                 AMBIENT_RESCHEDULE_MIN_HOURS,
@@ -15965,6 +16080,20 @@ async def process_due_occasion_for_guild(
     if channel is None:
         return {"status": "waiting_for_channel"}
 
+    capacity = ambient_capacity_decision(
+        guild_id,
+        channel_id,
+        "occasion",
+        now_pacific=now,
+    )
+    if capacity["hasOpenOccasion"] and not capacity["allowed"]:
+        return {
+            "status": "waiting_for_capacity",
+            "reason": capacity["reason"],
+            "capacityUsed": capacity["capacityUsed"],
+            "cap": capacity["cap"],
+        }
+
     claim = await asyncio.to_thread(
         claim_next_due_occasion,
         DB_FILE,
@@ -16152,6 +16281,13 @@ tree = app_commands.CommandTree(client)
 _ambient_post_locks = {}
 
 
+def _ambient_post_lock_for(guild_id: int) -> asyncio.Lock:
+    lock_key = str(int(guild_id))
+    if lock_key not in _ambient_post_locks:
+        _ambient_post_locks[lock_key] = asyncio.Lock()
+    return _ambient_post_locks[lock_key]
+
+
 async def _run_journal_automation_for_managed_guilds(
     trigger: str,
     *,
@@ -16268,12 +16404,13 @@ async def ambient_message_task():
                 else None
             )
             try:
-                occasion_result = await process_due_occasion_for_guild(
-                    guild_id,
-                    channel_id,
-                    occasion_channel,
-                    now_pacific=now,
-                )
+                async with _ambient_post_lock_for(guild_id):
+                    occasion_result = await process_due_occasion_for_guild(
+                        guild_id,
+                        channel_id,
+                        occasion_channel,
+                        now_pacific=now,
+                    )
                 if occasion_result.get("status") not in {"idle", "waiting_for_channel"}:
                     logging.info(
                         "occasion_cycle guild=%s status=%s reason=%s",
@@ -16309,10 +16446,7 @@ async def ambient_message_task():
                     update_guild_ambient_times(guild_id, last_msg or "", next_scheduled)
                     continue
 
-                lock_key = str(guild_id)
-                if lock_key not in _ambient_post_locks:
-                    _ambient_post_locks[lock_key] = asyncio.Lock()
-                async with _ambient_post_locks[lock_key]:
+                async with _ambient_post_lock_for(guild_id):
                     last_posted_at = get_last_ambient_posted_at(guild_id, channel_id)
                     if last_posted_at and (now - last_posted_at) < timedelta(minutes=AMBIENT_POST_COOLDOWN_MINUTES):
                         _set_ambient_runtime_state(guild_id, skip_reason="cooldown_window")
@@ -16320,12 +16454,21 @@ async def ambient_message_task():
                         update_guild_ambient_times(guild_id, last_msg or "", next_scheduled)
                         continue
 
-                    posts_today = get_self_started_posts_today(guild_id, channel_id)
-                    daily_cap = ambient_daily_post_cap(guild_id, now_pacific=now)
-                    if posts_today >= daily_cap:
+                    capacity = ambient_capacity_decision(
+                        guild_id,
+                        channel_id,
+                        "ambient",
+                        now_pacific=now,
+                    )
+                    if not capacity["allowed"]:
                         prev_reason = _get_ambient_runtime_state(guild_id).get("last_skip_reason")
                         if prev_reason != "daily_cap_reached":
-                            logging.info(f"📡 Ambient skipped for guild {guild_id}: daily cap reached ({posts_today}/{daily_cap}).")
+                            logging.info(
+                                "📡 Ambient skipped for guild %s: shared daily cap reached (%s/%s).",
+                                guild_id,
+                                capacity["capacityUsed"],
+                                capacity["cap"],
+                            )
                         _set_ambient_runtime_state(guild_id, skip_reason="daily_cap_reached")
                         schedule_next_day_ambient(guild_id, last_msg or "")
                         continue
@@ -16365,7 +16508,7 @@ async def ambient_message_task():
                     next_scheduled = schedule_after_ambient_post(
                         guild_id,
                         msg,
-                        posts_today + 1,
+                        capacity["capacityUsed"] + 1,
                         now_pacific=now,
                     )
                     logging.info(f"📡 Ambient posted successfully in guild {guild_id}")
@@ -16600,12 +16743,28 @@ async def barcode_radio_queue_task():
 
             discord_sent = ""
             if should_post_discord and channel:
-                try:
-                    await channel.send(discord_msg, allowed_mentions=discord.AllowedMentions.none())
-                    discord_sent = discord_msg
-                    log_ambient(guild.id, channel.id, discord_msg, source_type="showday")
-                except Exception as e:
-                    logging.error(f"Show-day Discord update failed (guild {guild.id}, {phase_key}): {e}")
+                async with _ambient_post_lock_for(guild.id):
+                    capacity = ambient_capacity_decision(
+                        guild.id,
+                        channel.id,
+                        "showday",
+                        now_pacific=now,
+                    )
+                    if not capacity["allowed"]:
+                        logging.info(
+                            "showday_discord_skipped_daily_cap guild=%s phase=%s used=%s cap=%s",
+                            guild.id,
+                            phase_key,
+                            capacity["capacityUsed"],
+                            capacity["cap"],
+                        )
+                    else:
+                        try:
+                            await channel.send(discord_msg, allowed_mentions=discord.AllowedMentions.none())
+                            discord_sent = discord_msg
+                            log_ambient(guild.id, channel.id, discord_msg, source_type="showday")
+                        except Exception as e:
+                            logging.error(f"Show-day Discord update failed (guild {guild.id}, {phase_key}): {e}")
             mode = "RESTRICTED" if phase_key == "sponsor_window" else "ACTIVE_LIAISON"
             if flags.get("websiteRelayEnabled", True):
                 await update_website_status_controlled_async(mode=mode, message=fit_complete_statement(website_msg, limit=360, min_chars=220, fallback=_pick_varied_fallback(phase_key)), status="ONLINE", force=True)
@@ -22655,7 +22814,16 @@ async def bnl_status(interaction: discord.Interaction):
     active_channel = guild.get_channel(active_channel_id) if active_channel_id else None
     _active_channel_id, _last_ambient_message, next_ambient_message_at = get_guild_ambient_state(guild.id)
     ambient_posts_today = get_ambient_posts_today(guild.id, active_channel_id) if active_channel_id else 0
-    self_started_posts_today = get_self_started_posts_today(guild.id, active_channel_id) if active_channel_id else 0
+    ambient_capacity = (
+        get_ambient_capacity_state(guild.id, active_channel_id)
+        if active_channel_id
+        else {
+            "actualPosts": 0,
+            "capacityUsed": 0,
+            "occasionReserved": 0,
+            "sourceCounts": {},
+        }
+    )
     ambient_cap_today = ambient_daily_post_cap(guild.id)
     last_ambient_posted_at = get_last_ambient_posted_at(guild.id, active_channel_id) if active_channel_id else None
     ambient_runtime = _get_ambient_runtime_state(guild.id)
@@ -22695,7 +22863,10 @@ async def bnl_status(interaction: discord.Interaction):
         f"- queue_effective_usable: `{'yes' if (read_model_diag.get('canon_source_contract') or {}).get('effectiveQueueUsable') else 'no'}` reason=`{(read_model_diag.get('canon_source_contract') or {}).get('queueReason')}`",
         f"- ambient_throttle: cooldown=`{AMBIENT_POST_COOLDOWN_MINUTES}m` daily_cap_today=`{ambient_cap_today}` normal_cap=`{AMBIENT_DAILY_POST_CAP}` high_activity_cap=`2` min_signal_messages=`{AMBIENT_MIN_SIGNAL_MESSAGES}` min_signal_users=`{AMBIENT_MIN_SIGNAL_UNIQUE_USERS}`",
         f"- ambient_posts_today: `{ambient_posts_today}`",
-        f"- self_started_capacity_used_today: `{self_started_posts_today}`",
+        f"- ambient_capacity_actual_posts_today: `{ambient_capacity['actualPosts']}`",
+        f"- ambient_capacity_used_or_reserved_today: `{ambient_capacity['capacityUsed']}`",
+        f"- ambient_capacity_occasion_reserved: `{ambient_capacity['occasionReserved']}`",
+        f"- ambient_capacity_source_counts: `{json.dumps(ambient_capacity['sourceCounts'], sort_keys=True)}`",
         f"- last_ambient_posted_at: `{last_ambient_posted_at.isoformat() if last_ambient_posted_at else 'none'}`",
         f"- next_ambient_message_at: `{next_ambient_message_at or 'none'}`",
         f"- last_ambient_mode: `{ambient_runtime.get('last_mode', 'unknown')}`",
@@ -22941,7 +23112,7 @@ async def showtest(interaction: discord.Interaction, phase: app_commands.Choice[
         if target_channel:
             try:
                 await target_channel.send(discord_msg)
-                log_ambient(interaction.guild.id, interaction.channel_id, discord_msg, source_type="showday")
+                log_ambient(interaction.guild.id, interaction.channel_id, discord_msg, source_type="showday_test")
             except Exception as e:
                 logging.error(f"Show-test Discord update failed (guild {interaction.guild.id}, {phase_key}): {e}")
                 await interaction.followup.send(

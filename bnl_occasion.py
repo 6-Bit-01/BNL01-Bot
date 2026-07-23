@@ -2035,6 +2035,78 @@ def occurrence_attempts(
     return [dict(row) for row in rows]
 
 
+def capacity_state(
+    db_path: str,
+    guild_id: int,
+    now_local: datetime,
+) -> dict[str, Any]:
+    """Describe occasion use and reservation for the current local day.
+
+    Published occurrences count on the day they were actually delivered.
+    One nonterminal occurrence scheduled no later than the end of the current
+    local day reserves one slot so ordinary Ambient output cannot displace a
+    durable holiday retry.
+    """
+    ensure_schema(db_path)
+    if now_local.tzinfo is None:
+        raise ValueError("now_local_must_be_timezone_aware")
+    local_date = now_local.date()
+    start_local = _localize(
+        now_local.tzinfo,
+        datetime.combine(local_date, datetime_time.min),
+    )
+    end_local = _localize(
+        now_local.tzinfo,
+        datetime.combine(local_date + timedelta(days=1), datetime_time.min),
+    )
+    start_iso = _iso(start_local)
+    end_iso = _iso(end_local)
+    with sqlite3.connect(db_path) as conn:
+        published_today = int(
+            conn.execute(
+                """
+                SELECT COUNT(*)
+                FROM bnl_occasion_occurrences
+                WHERE guild_id=? AND state='published'
+                  AND datetime(published_at)>=datetime(?)
+                  AND datetime(published_at)<datetime(?)
+                """,
+                (int(guild_id), start_iso, end_iso),
+            ).fetchone()[0]
+            or 0
+        )
+        placeholders = ",".join("?" for _ in NONTERMINAL_STATES)
+        open_row = conn.execute(
+            f"""
+            SELECT occurrence_key,occasion_id,occasion_name,scheduled_for,state
+            FROM bnl_occasion_occurrences
+            WHERE guild_id=? AND state IN ({placeholders})
+              AND datetime(scheduled_for)<datetime(?)
+            ORDER BY scheduled_for,occasion_id LIMIT 1
+            """,
+            (
+                int(guild_id),
+                *sorted(NONTERMINAL_STATES),
+                end_iso,
+            ),
+        ).fetchone()
+    return {
+        "localDate": local_date.isoformat(),
+        "publishedToday": published_today,
+        "hasOpenOccurrence": bool(open_row),
+        "reserved": 1 if open_row and published_today == 0 else 0,
+        "nextOpen": {
+            "occurrenceKey": open_row[0],
+            "occasionId": open_row[1],
+            "occasionName": open_row[2],
+            "scheduledFor": open_row[3],
+            "state": open_row[4],
+        }
+        if open_row
+        else {},
+    }
+
+
 def diagnostics(db_path: str, guild_id: int) -> dict[str, Any]:
     ensure_schema(db_path)
     with sqlite3.connect(db_path) as conn:
