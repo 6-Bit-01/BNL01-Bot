@@ -33,6 +33,23 @@ class ConversationBatchConfigTests(unittest.TestCase):
         )
         self.assertEqual(completed.stdout.strip().splitlines()[-1], "0")
 
+    def test_typing_indicator_defaults_on_in_a_clean_process(self):
+        env = os.environ.copy()
+        env.pop("BNL_TYPING_INDICATOR_ENABLED", None)
+        completed = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "import bnl01_bot; print(int(bnl01_bot.BNL_TYPING_INDICATOR_ENABLED))",
+            ],
+            cwd=Path(__file__).resolve().parents[1],
+            env=env,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(completed.stdout.strip().splitlines()[-1], "1")
+
 
 class FakeGuild:
     def __init__(self, guild_id=7700):
@@ -46,15 +63,47 @@ class FakeGuild:
         )
 
 
+class FakeTypingContext:
+    def __init__(self, channel):
+        self.channel = channel
+        self.entered = False
+
+    async def __aenter__(self):
+        self.channel.typing_events.append("start")
+        if self.channel.typing_enter_error:
+            raise self.channel.typing_enter_error
+        self.entered = True
+        self.channel.typing_active += 1
+        self.channel.typing_started.set()
+        return self
+
+    async def __aexit__(self, _exc_type, _exc, _traceback):
+        self.channel.typing_events.append("stop")
+        if self.entered:
+            self.channel.typing_active -= 1
+        self.channel.typing_stopped.set()
+        if self.channel.typing_exit_error:
+            raise self.channel.typing_exit_error
+
+
 class FakeChannel:
     def __init__(self, channel_id, *, name="bnl-testing", guild=None):
         self.id = channel_id
         self.name = name
         self.guild = guild or FakeGuild()
         self.sent = []
+        self.typing_events = []
+        self.typing_active = 0
+        self.typing_started = asyncio.Event()
+        self.typing_stopped = asyncio.Event()
+        self.typing_enter_error = None
+        self.typing_exit_error = None
 
     async def send(self, text, **_kwargs):
         self.sent.append(text)
+
+    def typing(self):
+        return FakeTypingContext(self)
 
 
 class FakeAuthor:
@@ -120,7 +169,9 @@ class ConversationBatchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.channel_ids = set()
         self.original_batching_enabled = bnl01_bot.BNL_ACTIVE_BATCHING_ENABLED
+        self.original_typing_enabled = bnl01_bot.BNL_TYPING_INDICATOR_ENABLED
         bnl01_bot.BNL_ACTIVE_BATCHING_ENABLED = True
+        bnl01_bot.BNL_TYPING_INDICATOR_ENABLED = True
 
     async def asyncTearDown(self):
         for channel_id in self.channel_ids:
@@ -146,6 +197,10 @@ class ConversationBatchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
                 bnl01_bot._channel_pending_request_intent,
                 bnl01_bot._channel_pending_request_anchor,
                 bnl01_bot._channel_generation_typing_pause_used,
+                bnl01_bot._channel_typing_indicator_last_at,
+                bnl01_bot._channel_batch_typing_sessions,
+                bnl01_bot._channel_batch_typing_interrupt_revision,
+                bnl01_bot._channel_batch_typing_applied_revision,
             ):
                 state.pop(channel_id, None)
             for key in list(bnl01_bot._conversation_continuation_state):
@@ -168,6 +223,7 @@ class ConversationBatchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
                             pass
                     bnl01_bot._direct_payload_sessions.pop(key, None)
         bnl01_bot.BNL_ACTIVE_BATCHING_ENABLED = self.original_batching_enabled
+        bnl01_bot.BNL_TYPING_INDICATOR_ENABLED = self.original_typing_enabled
 
     def _channel(self, channel_id, *, blocking_send=False):
         self.channel_ids.add(channel_id)
@@ -556,6 +612,68 @@ class ConversationBatchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("and why do they blink?", prompts[1])
         self.assertEqual(channel.sent, ["Fresh combined response."])
         self.assertEqual(list(bnl01_bot._channel_buffers[channel.id]), [])
+
+    async def test_visible_typing_stops_for_new_message_then_restarts_for_fresh_draft(self):
+        channel = self._channel(8122)
+        first_generation_started = asyncio.Event()
+        release_first_generation = asyncio.Event()
+        prompts = []
+
+        async def generate(prompt, **_kwargs):
+            prompts.append(prompt)
+            if len(prompts) == 1:
+                first_generation_started.set()
+                await release_first_generation.wait()
+                return "Stale first draft."
+            return "Fresh combined response."
+
+        self._prime_flush(channel, "BNL, why are routers weird?")
+        with self._flush_runtime(channel.id, generate):
+            task = asyncio.create_task(bnl01_bot._flush_channel_buffer(channel))
+            bnl01_bot._channel_tasks[channel.id] = task
+            await asyncio.wait_for(first_generation_started.wait(), timeout=0.5)
+            self.assertEqual(channel.typing_events, ["start"])
+            self.assertEqual(channel.typing_active, 1)
+
+            generation_id = bnl01_bot._channel_generation_id[channel.id]
+            bnl01_bot._channel_preempted_generation_id[channel.id] = generation_id
+            bnl01_bot._channel_message_interrupt_generation_id[channel.id] = generation_id
+            await bnl01_bot._interrupt_batch_typing(
+                channel.id,
+                generation_id,
+                reason="new_message_while_generating",
+                restart_expected=True,
+            )
+            self._append(channel, "and why do they blink?")
+            bnl01_bot._reset_debounce(channel)
+
+            self.assertEqual(channel.typing_events, ["start", "stop"])
+            self.assertEqual(channel.typing_active, 0)
+            release_first_generation.set()
+            await asyncio.wait_for(task, timeout=1)
+
+        self.assertEqual(len(prompts), 2)
+        self.assertNotIn("and why do they blink?", prompts[0])
+        self.assertIn("and why do they blink?", prompts[1])
+        self.assertEqual(channel.sent, ["Fresh combined response."])
+        self.assertEqual(channel.typing_events, ["start", "stop", "start", "stop"])
+        self.assertEqual(channel.typing_active, 0)
+
+    async def test_typing_api_failures_never_abort_batch_reply(self):
+        for channel_id, failure_point in ((8123, "enter"), (8124, "exit")):
+            with self.subTest(failure_point=failure_point):
+                channel = self._channel(channel_id)
+                if failure_point == "enter":
+                    channel.typing_enter_error = RuntimeError("typing enter failed")
+                else:
+                    channel.typing_exit_error = RuntimeError("typing exit failed")
+                self._prime_flush(channel, "BNL, still there?")
+
+                with self._flush_runtime(channel.id, mock.AsyncMock(return_value="Still receiving.")):
+                    await bnl01_bot._flush_channel_buffer(channel)
+
+                self.assertEqual(channel.sent, ["Still receiving."])
+                self.assertEqual(channel.typing_active, 0)
 
     async def test_second_late_fragment_survives_slow_regeneration_and_keeps_full_context(self):
         channel = self._channel(8112)

@@ -302,7 +302,7 @@ BNL_QUEUE_PRODUCTION_ENABLED = os.getenv("BNL_QUEUE_PRODUCTION_ENABLED", "").str
 BNL_WEBSITE_CONTRACT_VERSION = effective_contract_version(os.getenv("BNL_WEBSITE_CONTRACT_VERSION", "2"))
 BNL_WEBSITE_RELAY_ENABLED = os.getenv("BNL_WEBSITE_RELAY_ENABLED", "true").strip().lower() not in {"false", "0", "off"}
 BNL_ACTIVE_BATCHING_ENABLED = os.getenv("BNL_ACTIVE_BATCHING_ENABLED", "false").strip().lower() in {"true", "1", "on"}
-BNL_TYPING_INDICATOR_ENABLED = os.getenv("BNL_TYPING_INDICATOR_ENABLED", "false").strip().lower() in {"true", "1", "on"}
+BNL_TYPING_INDICATOR_ENABLED = os.getenv("BNL_TYPING_INDICATOR_ENABLED", "true").strip().lower() in {"true", "1", "on"}
 BNL_TYPING_INDICATOR_COOLDOWN_SECONDS = max(8, int(os.getenv("BNL_TYPING_INDICATOR_COOLDOWN_SECONDS", "12") or 12))
 BNL_WEBSITE_RELAY_INTERVAL_MINUTES = max(1, int(os.getenv("BNL_WEBSITE_RELAY_INTERVAL_MINUTES", "20")))
 BNL_WEBSITE_RELAY_GENERATION_TIMEOUT_SECONDS = max(1.0, float(os.getenv("BNL_WEBSITE_RELAY_GENERATION_TIMEOUT_SECONDS", "25") or 25))
@@ -456,7 +456,7 @@ GREETING_COOLDOWN_MINUTES = 90
 GREETING_CHANCE = 0.35
 
 # ======== PASSIVE REACTION CONFIG ========
-REACTION_CHANCE = 0.24
+REACTION_CHANCE = 0.22
 
 
 # ==================== ROUTE / MODE GOVERNANCE ====================
@@ -675,11 +675,19 @@ def update_conversation_context_v2_diagnostics(result=None, *, route_mode="unkno
     return LAST_CONVERSATION_CONTEXT_V2_DIAGNOSTICS
 
 
-BNL_REACTIONS_BASE = ["👁️", "📡", "⚙️", "🧠", "🛰️", "🔍", "💾", "📊", "🖥️", "📼", "🧬", "📶"]
-BNL_REACTIONS_BROADCAST = ["📻", "🎚️", "🎛️", "🔊", "🎤", "📡", "📼"]
-BNL_REACTIONS_GLITCH = ["🧿", "🫨", "⚠️", "❓", "🌀", "☢️", "📛"]
-BNL_REACTIONS_TECH = ["🧠", "⚙️", "💻", "🛰️", "🗜️", "📈", "🔧"]
-BNL_REACTIONS_VIBE = ["🫡", "👀", "🔥", "💯", "😵‍💫", "🧪", "🕶️"]
+BNL_REACTIONS_BASE = ["👁️", "📡", "⚙️", "🧠", "🛰️", "🔍", "💾", "📊", "🖥️", "📼", "🧬", "📶", "🌐", "🗃️"]
+BNL_REACTIONS_BROADCAST = ["📻", "🎚️", "🎛️", "🔊", "🎤", "📡", "📼", "🎧", "🎶"]
+BNL_REACTIONS_GLITCH = ["🧿", "🫨", "⚠️", "❓", "🌀", "☢️", "📛", "📟"]
+BNL_REACTIONS_TECH = ["🧠", "⚙️", "💻", "🛰️", "🗜️", "📈", "🔧", "💾", "🗄️"]
+BNL_REACTIONS_VIBE = ["🫡", "👀", "🔥", "💯", "😵‍💫", "🧪", "🕶️", "🫶", "🖤"]
+BNL_CUSTOM_REACTION_CHANCE = 0.35
+BNL_CUSTOM_REACTION_NAMES = {
+    "base": ("barcode", "bnl", "bnl01", "sixbit", "galaknoise"),
+    "broadcast": ("djfloppydisc", "floppydisc", "sixbit", "galaknoise"),
+    "glitch": ("nulltv", "null_tv"),
+    "tech": ("macmodem", "mac_modem", "cacheback", "cache_back"),
+    "vibe": ("barcode", "bnl", "bnl01", "sixbit", "galaknoise"),
+}
 
 PROTECTED_SYSTEM_CHANNELS = {"welcome", "episode-tracker"}
 PUBLIC_HOME_CHANNELS = {"barcode-bot"}
@@ -14191,18 +14199,62 @@ async def send_safe_ephemeral_chunks(interaction: discord.Interaction, text: str
 
 _last_reaction_by_channel = {}
 
-def choose_contextual_reaction(message: discord.Message) -> str:
-    content = (message.content or "").lower()
-    pools = [BNL_REACTIONS_BASE]
 
-    if any(k in content for k in ("radio", "broadcast", "mix", "track", "song", "music", "tiktok", "show")):
-        pools.append(BNL_REACTIONS_BROADCAST)
-    if any(k in content for k in ("glitch", "bug", "error", "broken", "weird", "corrupt", "crash")):
-        pools.append(BNL_REACTIONS_GLITCH)
-    if any(k in content for k in ("code", "deploy", "server", "bot", "update", "memory", "database", "api")):
-        pools.append(BNL_REACTIONS_TECH)
-    if any(k in content for k in ("lol", "lmao", "damn", "crazy", "fire", "wild", "w")):
-        pools.append(BNL_REACTIONS_VIBE)
+def _reaction_context_groups(content: str) -> list[str]:
+    groups = ["base"]
+    if any(k in content for k in ("radio", "broadcast", "mix", "track", "song", "music", "tiktok", "show", "listen", "audio", "dj")):
+        groups.append("broadcast")
+    if any(k in content for k in ("glitch", "bug", "error", "broken", "weird", "corrupt", "crash", "static")):
+        groups.append("glitch")
+    if any(k in content for k in ("code", "deploy", "server", "bot", "update", "memory", "database", "api", "archive", "backup")):
+        groups.append("tech")
+    if any(k in content for k in ("lol", "lmao", "damn", "crazy", "fire", "wild", "w", "love", "community")):
+        groups.append("vibe")
+    return groups
+
+
+def _normalized_custom_emoji_name(name: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", (name or "").strip().lower())
+
+
+def _available_custom_reactions(message: discord.Message, groups: list[str]) -> list:
+    guild = getattr(message, "guild", None)
+    guild_emojis = list(getattr(guild, "emojis", ()) or ())
+    if not guild_emojis:
+        return []
+
+    allowed_names = {
+        _normalized_custom_emoji_name(name)
+        for group in groups
+        for name in BNL_CUSTOM_REACTION_NAMES.get(group, ())
+    }
+    available = []
+    for emoji in guild_emojis:
+        if _normalized_custom_emoji_name(getattr(emoji, "name", "")) not in allowed_names:
+            continue
+        if not getattr(emoji, "available", True):
+            continue
+        is_usable = getattr(emoji, "is_usable", None)
+        try:
+            if callable(is_usable) and not is_usable():
+                continue
+        except Exception:
+            continue
+        available.append(emoji)
+    return available
+
+
+def choose_contextual_reaction(message: discord.Message, *, allow_custom: bool = True):
+    content = (message.content or "").lower()
+    groups = _reaction_context_groups(content)
+    pools_by_group = {
+        "base": BNL_REACTIONS_BASE,
+        "broadcast": BNL_REACTIONS_BROADCAST,
+        "glitch": BNL_REACTIONS_GLITCH,
+        "tech": BNL_REACTIONS_TECH,
+        "vibe": BNL_REACTIONS_VIBE,
+    }
+    pools = [pools_by_group[group] for group in groups]
 
     merged = []
     for p in pools:
@@ -14212,10 +14264,52 @@ def choose_contextual_reaction(message: discord.Message) -> str:
         merged = BNL_REACTIONS_BASE[:]
 
     last = _last_reaction_by_channel.get(message.channel.id)
-    options = [e for e in merged if e != last] or merged
+    if allow_custom:
+        custom_options = [
+            emoji
+            for emoji in _available_custom_reactions(message, groups)
+            if str(emoji) != last
+        ]
+        if custom_options and random.random() < BNL_CUSTOM_REACTION_CHANCE:
+            choice = random.choice(custom_options)
+            _last_reaction_by_channel[message.channel.id] = str(choice)
+            return choice
+
+    options = [e for e in merged if str(e) != last] or merged
     choice = random.choice(options)
-    _last_reaction_by_channel[message.channel.id] = choice
+    _last_reaction_by_channel[message.channel.id] = str(choice)
     return choice
+
+
+async def add_contextual_reaction(message: discord.Message) -> bool:
+    emoji = choose_contextual_reaction(message)
+    try:
+        await message.add_reaction(emoji)
+        return True
+    except Exception as exc:
+        if isinstance(emoji, str):
+            logging.info(
+                "passive_reaction_failed channel_id=%s emoji_type=unicode reason=%s",
+                getattr(getattr(message, "channel", None), "id", 0),
+                type(exc).__name__,
+            )
+            return False
+
+    fallback = choose_contextual_reaction(message, allow_custom=False)
+    try:
+        await message.add_reaction(fallback)
+        logging.info(
+            "passive_reaction_custom_fallback channel_id=%s",
+            getattr(getattr(message, "channel", None), "id", 0),
+        )
+        return True
+    except Exception as exc:
+        logging.info(
+            "passive_reaction_failed channel_id=%s emoji_type=fallback reason=%s",
+            getattr(getattr(message, "channel", None), "id", 0),
+            type(exc).__name__,
+        )
+        return False
 
 # ==================== GEMINI API INTERACTION ====================
 
@@ -16903,6 +16997,9 @@ _channel_recent_typing_at = {}
 _channel_recent_typing_user_id = {}
 _channel_generation_typing_pause_used = defaultdict(bool)
 _channel_typing_indicator_last_at = {}
+_channel_batch_typing_sessions = {}
+_channel_batch_typing_interrupt_revision = defaultdict(int)
+_channel_batch_typing_applied_revision = defaultdict(int)
 _show_state_topic_context = {}
 
 
@@ -16976,6 +17073,156 @@ TYPING_SEND_GRACE_SECONDS = 1.5
 HARD_INTERRUPT_REEVALUATE_PAUSE_MIN_SECONDS = 0.75
 HARD_INTERRUPT_REEVALUATE_PAUSE_MAX_SECONDS = 1.5
 POST_GENERATION_CAPTURE_GRACE_SECONDS = 0.5
+
+
+async def _stop_batch_typing(channel_id: int, generation_id: int, *, reason: str) -> bool:
+    session = _channel_batch_typing_sessions.get(channel_id)
+    if not session or session.get("generation_id") != generation_id:
+        return False
+    _channel_batch_typing_sessions.pop(channel_id, None)
+    typing_cm = session.get("typing_cm")
+    try:
+        await typing_cm.__aexit__(None, None, None)
+        logging.info(
+            "batch_typing_indicator_stopped channel=%s generation_id=%s reason=%s",
+            channel_id,
+            generation_id,
+            reason,
+        )
+    except discord.HTTPException as exc:
+        logging.info(
+            "batch_typing_indicator_failed reason=exit_http_exception status=%s channel=%s generation_id=%s",
+            getattr(exc, "status", "unknown"),
+            channel_id,
+            generation_id,
+        )
+    except Exception as exc:
+        logging.info(
+            "batch_typing_indicator_failed reason=exit_%s channel=%s generation_id=%s",
+            type(exc).__name__,
+            channel_id,
+            generation_id,
+        )
+    return True
+
+
+async def _interrupt_batch_typing(
+    channel_id: int,
+    generation_id: int,
+    *,
+    reason: str,
+    restart_expected: bool,
+) -> None:
+    if restart_expected:
+        _channel_batch_typing_interrupt_revision[channel_id] += 1
+    else:
+        # A direct replacement response owns the next indicator. Do not let the
+        # batch indicator's cooldown hide typing for that fresh reply.
+        _channel_typing_indicator_last_at.pop(channel_id, None)
+    await _stop_batch_typing(channel_id, generation_id, reason=reason)
+
+
+async def _ensure_batch_typing(channel, generation_id: int) -> bool:
+    if not BNL_TYPING_INDICATOR_ENABLED or channel is None:
+        if not BNL_TYPING_INDICATOR_ENABLED:
+            logging.info("batch_typing_indicator_skipped reason=disabled")
+        if channel is not None:
+            channel_id = int(getattr(channel, "id", 0) or 0)
+            _channel_batch_typing_applied_revision[channel_id] = (
+                _channel_batch_typing_interrupt_revision.get(channel_id, 0)
+            )
+        return False
+
+    channel_id = int(getattr(channel, "id", 0) or 0)
+    existing = _channel_batch_typing_sessions.get(channel_id)
+    if existing and existing.get("generation_id") == generation_id:
+        return True
+    if existing:
+        await _stop_batch_typing(
+            channel_id,
+            int(existing.get("generation_id", 0) or 0),
+            reason="superseded_generation",
+        )
+
+    while True:
+        interrupt_revision = _channel_batch_typing_interrupt_revision.get(channel_id, 0)
+        applied_revision = _channel_batch_typing_applied_revision.get(channel_id, 0)
+        restarting = interrupt_revision > applied_revision
+        if not restarting:
+            break
+        pause_seconds = random.uniform(
+            HARD_INTERRUPT_REEVALUATE_PAUSE_MIN_SECONDS,
+            HARD_INTERRUPT_REEVALUATE_PAUSE_MAX_SECONDS,
+        )
+        logging.info(
+            "batch_typing_indicator_restart_pause channel=%s generation_id=%s seconds=%.2f",
+            channel_id,
+            generation_id,
+            pause_seconds,
+        )
+        await asyncio.sleep(pause_seconds)
+        if _channel_batch_typing_interrupt_revision.get(channel_id, 0) != interrupt_revision:
+            continue
+        if _hard_interrupt_active_for_generation(channel_id, generation_id):
+            return False
+        break
+
+    now = datetime.now(timezone.utc)
+    last_at = _channel_typing_indicator_last_at.get(channel_id)
+    if (
+        not restarting
+        and last_at
+        and (now - last_at).total_seconds() < BNL_TYPING_INDICATOR_COOLDOWN_SECONDS
+    ):
+        logging.info("batch_typing_indicator_skipped reason=cooldown channel=%s", channel_id)
+        return False
+
+    typing_cm = None
+    try:
+        typing_cm = channel.typing()
+        await typing_cm.__aenter__()
+    except discord.HTTPException as exc:
+        _channel_batch_typing_applied_revision[channel_id] = interrupt_revision
+        logging.info(
+            "batch_typing_indicator_failed reason=http_exception status=%s channel=%s generation_id=%s",
+            getattr(exc, "status", "unknown"),
+            channel_id,
+            generation_id,
+        )
+        return False
+    except Exception as exc:
+        _channel_batch_typing_applied_revision[channel_id] = interrupt_revision
+        logging.info(
+            "batch_typing_indicator_failed reason=%s channel=%s generation_id=%s",
+            type(exc).__name__,
+            channel_id,
+            generation_id,
+        )
+        return False
+
+    if (
+        _channel_batch_typing_interrupt_revision.get(channel_id, 0) != interrupt_revision
+        or _hard_interrupt_active_for_generation(channel_id, generation_id)
+    ):
+        try:
+            await typing_cm.__aexit__(None, None, None)
+        except Exception:
+            pass
+        return False
+
+    _channel_batch_typing_sessions[channel_id] = {
+        "generation_id": generation_id,
+        "typing_cm": typing_cm,
+    }
+    _channel_batch_typing_applied_revision[channel_id] = interrupt_revision
+    _channel_typing_indicator_last_at[channel_id] = now
+    logging.info(
+        "batch_typing_indicator_started channel=%s generation_id=%s restarted=%s",
+        channel_id,
+        generation_id,
+        int(restarting),
+    )
+    return True
 
 
 def _show_state_topic_key(guild_id: int, channel_id: int):
@@ -17092,10 +17339,17 @@ def _log_batch_event(level: int, event: str, guild_id: int, channel_id: int, mes
         f"[batch:{event}] guild_id={guild_id} channel_id={channel_id} message_count={message_count} reason={reason}",
     )
 
-def _clear_generation_state(channel_id: int, generation_id: int):
+async def _clear_generation_state(channel_id: int, generation_id: int):
+    await _stop_batch_typing(channel_id, generation_id, reason="generation_exit")
     if _channel_generation_id[channel_id] == generation_id:
         _channel_generating[channel_id] = False
         _channel_generation_typing_pause_used[channel_id] = False
+    if (
+        _channel_batch_typing_interrupt_revision.get(channel_id, 0)
+        <= _channel_batch_typing_applied_revision.get(channel_id, 0)
+    ):
+        _channel_batch_typing_interrupt_revision.pop(channel_id, None)
+        _channel_batch_typing_applied_revision.pop(channel_id, None)
 
 
 def _typing_signal_is_recent(channel_id: int, now: datetime):
@@ -18473,9 +18727,21 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
             _log_batch_event(logging.INFO, "active_packet_generation_started", guild_id, channel_id, len(collapsed_items), f"payload_count={len(active_packet['payload_items'])};decision={decision};reason={reason}")
             generation_elapsed = max(0.0, (datetime.now(PACIFIC_TZ) - batch_start).total_seconds())
             _log_batch_event(logging.INFO, "generation_started_after_wait", guild_id, channel_id, len(collapsed_items), f"payload_count={len(active_packet['payload_items'])};elapsed_seconds={generation_elapsed:.2f};selected_wait_seconds={selected_wait_seconds:.2f}")
-            _log_batch_event(logging.INFO, "generation_typing_started", guild_id, channel_id, len(collapsed_items), f"payload_count={len(active_packet['payload_items'])};elapsed_seconds={generation_elapsed:.2f};selected_wait_seconds={selected_wait_seconds:.2f}")
-            if True:  # typing indicator disabled: Discord 429 was aborting bot replies
-                response = await get_gemini_response(prompt, user_id=first_uid, guild_id=channel.guild.id, route=generation_route)
+            typing_active = await _ensure_batch_typing(channel, local_generation_id)
+            _log_batch_event(
+                logging.INFO,
+                "generation_typing_started",
+                guild_id,
+                channel_id,
+                len(collapsed_items),
+                f"payload_count={len(active_packet['payload_items'])};elapsed_seconds={generation_elapsed:.2f};selected_wait_seconds={selected_wait_seconds:.2f};indicator_active={int(typing_active)}",
+            )
+            response = await get_gemini_response(
+                prompt,
+                user_id=first_uid,
+                guild_id=channel.guild.id,
+                route=generation_route,
+            )
 
             response = suppress_stale_media_fallback(
                 response,
@@ -18525,8 +18791,12 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                             + "Missing required payload items: " + ", ".join(missing_items) + ". "
                             + "Missing item count: " + str(len(missing_items)) + "."
                         )
-                        if True:  # typing indicator disabled: Discord 429 was aborting bot replies
-                            regenerated = await get_gemini_response(correction_prompt, user_id=first_uid, guild_id=channel.guild.id, route=generation_route)
+                        regenerated = await get_gemini_response(
+                            correction_prompt,
+                            user_id=first_uid,
+                            guild_id=channel.guild.id,
+                            route=generation_route,
+                        )
                         if regenerated:
                             response = regenerated
                             payload_completion_regenerated = True
@@ -18827,6 +19097,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
             generation_route=generation_route if 'generation_route' in locals() else "get_gemini_response",
             channel=channel,
             source_context_available=False,
+            batch_generation_id=local_generation_id,
         )
         guard_triggered = bool(
             archive_guard_triggered
@@ -18869,6 +19140,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
         if guard_diagnostics.get("suppressed"):
             logging.info("continuation_mark_skipped reason=guard_fallback_or_generic_non_answer route=%s channel_policy=%s", ROUTE_MODE_NORMAL_CHAT, channel_policy)
             return
+        await _stop_batch_typing(channel_id, local_generation_id, reason="response_ready")
         _log_batch_event(
             logging.INFO,
             "response_send_commit_start",
@@ -18916,7 +19188,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
         _channel_last_reply_at[channel_id] = datetime.now(PACIFIC_TZ)
     finally:
         _channel_payload_wait_extended[channel_id] = False
-        _clear_generation_state(channel_id, local_generation_id)
+        await _clear_generation_state(channel_id, local_generation_id)
         _ensure_pending_batch_scheduled(channel, reason="generation_exit_with_pending_work")
 
 async def _schedule_flush(channel: discord.TextChannel):
@@ -20278,6 +20550,7 @@ async def apply_guarded_response_regeneration(
     channel=None,
     source_context_available: bool = False,
     regeneration_allowed: bool = True,
+    batch_generation_id: int | None = None,
 ) -> tuple[str, dict]:
     diagnostics = {
         "scripted_mode_leak_guard_triggered": False,
@@ -20302,6 +20575,22 @@ async def apply_guarded_response_regeneration(
     regeneration_kwargs = {"route": generation_route}
     if source_context_available:
         regeneration_kwargs["source_context_available"] = True
+
+    async def regenerate(candidate_prompt: str):
+        if batch_generation_id is not None:
+            return await get_gemini_response(
+                candidate_prompt,
+                user_id,
+                guild_id,
+                **regeneration_kwargs,
+            )
+        return await get_gemini_response_with_optional_typing(
+            channel,
+            candidate_prompt,
+            user_id,
+            guild_id,
+            **regeneration_kwargs,
+        )
 
     def retry_has_guard_failure(candidate: str) -> bool:
         candidate = (candidate or "").strip()
@@ -20328,13 +20617,7 @@ async def apply_guarded_response_regeneration(
         if not regeneration_allowed:
             diagnostics.update({"suppressed": True, "suppression_reason": "source_grounding_validation_only", "guard_fallback_or_generic_non_answer": True})
             return "", diagnostics
-        regenerated = await get_gemini_response_with_optional_typing(
-            channel,
-            build_source_grounding_correction_prompt(prompt),
-            user_id,
-            guild_id,
-            **regeneration_kwargs,
-        )
+        regenerated = await regenerate(build_source_grounding_correction_prompt(prompt))
         diagnostics["source_grounding_regenerated"] = True
         regenerated = (regenerated or "").strip()
         regenerated_invalid = retry_has_guard_failure(regenerated)
@@ -20352,13 +20635,7 @@ async def apply_guarded_response_regeneration(
         if route_mode in {ROUTE_MODE_NORMAL_CHAT, ROUTE_MODE_SIMPLE_GREETING} and answer_required:
             logging.info("scripted_mode_leak_regeneration_started route_mode=%s channel_policy=%s", route_mode, channel_policy)
             correction_prompt = build_mode_leak_correction_prompt(prompt)
-            regenerated = await get_gemini_response_with_optional_typing(
-                channel,
-                correction_prompt,
-                user_id,
-                guild_id,
-                **regeneration_kwargs,
-            )
+            regenerated = await regenerate(correction_prompt)
             diagnostics["regenerated_for_mode_leak"] = True
             regenerated = (regenerated or "").strip()
             if not retry_has_guard_failure(regenerated):
@@ -20382,13 +20659,7 @@ async def apply_guarded_response_regeneration(
         if not regeneration_allowed:
             diagnostics.update({"suppressed": True, "suppression_reason": "generic_non_answer_validation_only", "guard_fallback_or_generic_non_answer": True})
             return "", diagnostics
-        regenerated = await get_gemini_response_with_optional_typing(
-            channel,
-            build_generic_non_answer_correction_prompt(prompt),
-            user_id,
-            guild_id,
-            **regeneration_kwargs,
-        )
+        regenerated = await regenerate(build_generic_non_answer_correction_prompt(prompt))
         diagnostics["generic_non_answer_regenerated"] = True
         regenerated = (regenerated or "").strip()
         if not retry_has_guard_failure(regenerated):
@@ -21326,8 +21597,7 @@ async def on_message(message: discord.Message):
     )
     if channel_policy != "broadcast_memory" and not suppress_human_to_human_turn and random.random() < REACTION_CHANCE:
         try:
-            emoji = choose_contextual_reaction(message)
-            await message.add_reaction(emoji)
+            await add_contextual_reaction(message)
         except Exception:
             pass
 
@@ -21437,8 +21707,15 @@ async def on_message(message: discord.Message):
                 await message.reply(restricted_recall_guard)
                 return
             if _channel_generating[message.channel.id]:
-                _channel_preempted_generation_id[message.channel.id] = _channel_generation_id[message.channel.id]
-                _channel_message_interrupt_generation_id[message.channel.id] = _channel_generation_id[message.channel.id]
+                interrupted_generation_id = _channel_generation_id[message.channel.id]
+                _channel_preempted_generation_id[message.channel.id] = interrupted_generation_id
+                _channel_message_interrupt_generation_id[message.channel.id] = interrupted_generation_id
+                await _interrupt_batch_typing(
+                    message.channel.id,
+                    interrupted_generation_id,
+                    reason="direct_reply_preempted_generation",
+                    restart_expected=False,
+                )
                 _log_batch_event(logging.INFO, "stale_response_discarded", message.guild.id, message.channel.id, len(_channel_buffers[message.channel.id]), "direct_reply_preempted_generation")
             pending_count = (
                 len(_channel_buffers[message.channel.id])
@@ -21646,8 +21923,15 @@ async def on_message(message: discord.Message):
         if free_speak_surface:
             logging.info(f"[conversation] guild_id={message.guild.id} channel_id={message.channel.id} conversation_surface={conversation_surface} reason=free_speak_surface_batch")
         if _channel_generating[message.channel.id]:
-            _channel_preempted_generation_id[message.channel.id] = _channel_generation_id[message.channel.id]
-            _channel_message_interrupt_generation_id[message.channel.id] = _channel_generation_id[message.channel.id]
+            interrupted_generation_id = _channel_generation_id[message.channel.id]
+            _channel_preempted_generation_id[message.channel.id] = interrupted_generation_id
+            _channel_message_interrupt_generation_id[message.channel.id] = interrupted_generation_id
+            await _interrupt_batch_typing(
+                message.channel.id,
+                interrupted_generation_id,
+                reason="new_message_while_generating",
+                restart_expected=True,
+            )
             _log_batch_event(
                 logging.INFO,
                 "hard_message_interrupt_detected",
