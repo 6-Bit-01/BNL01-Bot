@@ -4,6 +4,7 @@ import os
 import sqlite3
 import tempfile
 import threading
+import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta, timezone
@@ -201,6 +202,26 @@ class PreparedReleaseTests(unittest.TestCase):
             ).fetchone()
         return dict(row) if row else None
 
+    def assert_owed_occurrence_has_no_revision_link(self, result):
+        self.assertEqual("", result.entry_id)
+        self.assertEqual(0, result.revision)
+        run = self.run_row()
+        self.assertEqual("held", run["lifecycle_state"])
+        self.assertIsNone(run["journal_entry_id"])
+        self.assertEqual(0, run["journal_revision"])
+        with sqlite3.connect(self.db) as conn:
+            observation = conn.execute(
+                "SELECT lifecycle_state,journal_entry_id,journal_revision "
+                "FROM bnl_journal_observations WHERE guild_id=1 AND observation_date=?",
+                (TARGET_DAY.isoformat(),),
+            ).fetchone()
+            state = conn.execute(
+                "SELECT last_status,last_entry_id,last_revision "
+                "FROM bnl_journal_automation_state WHERE guild_id=1"
+            ).fetchone()
+        self.assertEqual(("held", None, 0), observation)
+        self.assertEqual(("held", "", 0), state)
+
     def test_prepare_is_network_free_and_persists_exact_request_integrity(self):
         with patch.object(automation, "deliver_approved", side_effect=AssertionError("prepare posted")) as delivery:
             prepared = self.prepare()
@@ -211,7 +232,7 @@ class PreparedReleaseTests(unittest.TestCase):
         entry = self.entry_row(prepared.entry_id, prepared.revision)
         canonical = bytes(entry["canonical_payload_bytes"])
         self.assertEqual("prepared", run["lifecycle_state"])
-        self.assertEqual("approved_pending_delivery", entry["lifecycle_state"])
+        self.assertEqual("prepared_exact", entry["lifecycle_state"])
         self.assertEqual(prepared.entry_id, run["journal_entry_id"])
         self.assertEqual(prepared.revision, run["journal_revision"])
         self.assertEqual(len(canonical), run["prepared_payload_bytes"])
@@ -368,7 +389,16 @@ class PreparedReleaseTests(unittest.TestCase):
         run = self.run_row()
         self.assertEqual("held", run["lifecycle_state"])
         self.assertIsNone(run["lease_expires_at"])
-        self.assertEqual("rejected", self.entry_row(result.entry_id, result.revision)["lifecycle_state"])
+        self.assertEqual("", result.entry_id)
+        self.assertEqual(0, result.revision)
+        with sqlite3.connect(self.db) as conn:
+            self.assertEqual(
+                "rejected",
+                conn.execute(
+                    "SELECT lifecycle_state FROM bnl_journal_entries "
+                    "ORDER BY revision DESC LIMIT 1"
+                ).fetchone()[0],
+            )
 
     def test_failed_preparation_retry_reuses_frozen_packet_despite_backdated_source(self):
         first_packets = []
@@ -426,6 +456,11 @@ class PreparedReleaseTests(unittest.TestCase):
         with ThreadPoolExecutor(max_workers=2) as pool:
             first = pool.submit(self.release, blocking_opener)
             self.assertTrue(entered.wait(timeout=5), "first release never reached the network")
+            with sqlite3.connect(self.db) as conn:
+                conn.execute(
+                    "UPDATE bnl_journal_automation_runs "
+                    "SET delivery_lease_expires_at='2000-01-01T00:00:00Z'"
+                )
             second = self.release(blocking_opener)
             allow_response.set()
             first_result = first.result(timeout=5)
@@ -433,6 +468,185 @@ class PreparedReleaseTests(unittest.TestCase):
         self.assertEqual("published", first_result.status, first_result)
         self.assertEqual("busy", second.status, second)
         self.assertEqual(1, len(calls))
+        self.assertEqual(1, self.run_row()["delivery_epoch"])
+
+    def test_privacy_purge_waits_through_run_finalization_while_other_writes_continue(self):
+        prepared = self.prepare()
+        self.assertEqual("prepared", prepared.status, prepared)
+        with sqlite3.connect(self.db) as conn:
+            conn.execute(
+                "CREATE TABLE unrelated_release_writes("
+                "id INTEGER PRIMARY KEY,note TEXT NOT NULL)"
+            )
+
+        post_entered = threading.Event()
+        allow_response = threading.Event()
+        purge_started = threading.Event()
+        purge_acquired = threading.Event()
+        calls = []
+
+        def blocking_opener(request, timeout=10):
+            calls.append(request.data)
+            post_entered.set()
+            self.assertTrue(
+                allow_response.wait(timeout=5),
+                "test did not release network response",
+            )
+            return AcceptedResponse(request)
+
+        def purge_member():
+            purge_started.set()
+            with source_store.journal_release_privacy_fence(self.db):
+                purge_acquired.set()
+                with sqlite3.connect(self.db, timeout=10) as conn:
+                    conn.execute("BEGIN IMMEDIATE")
+                    removed = source_store.purge_user_discord_sources_on_connection(
+                        conn,
+                        guild_id=1,
+                        user_id=100,
+                    )
+                    counts = journal.purge_user_journal_derivatives_on_connection(
+                        conn,
+                        guild_id=1,
+                        user_id=100,
+                    )
+                    conn.commit()
+            return removed, counts
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            release_future = pool.submit(self.release, blocking_opener)
+            self.assertTrue(post_entered.wait(timeout=5))
+            purge_future = pool.submit(purge_member)
+            self.assertTrue(purge_started.wait(timeout=5))
+            self.assertFalse(
+                purge_acquired.wait(timeout=0.1),
+                "privacy purge crossed the gate before run finalization",
+            )
+            with sqlite3.connect(self.db, timeout=1) as conn:
+                conn.execute(
+                    "INSERT INTO unrelated_release_writes(note) VALUES('continued')"
+                )
+            allow_response.set()
+            released = release_future.result(timeout=5)
+            removed, counts = purge_future.result(timeout=5)
+
+        self.assertEqual("published", released.status, released)
+        self.assertEqual(1, len(calls))
+        self.assertEqual(1, removed)
+        self.assertTrue(purge_acquired.is_set())
+        self.assertGreaterEqual(
+            counts.get("bnl_journal_published_packets_scrubbed", 0),
+            1,
+        )
+        run = self.run_row()
+        self.assertEqual("published", run["lifecycle_state"])
+        self.assertEqual(prepared.entry_id, run["journal_entry_id"])
+        self.assertEqual(prepared.revision, run["journal_revision"])
+        with sqlite3.connect(self.db) as conn:
+            self.assertEqual(
+                1,
+                conn.execute(
+                    "SELECT COUNT(*) FROM unrelated_release_writes"
+                ).fetchone()[0],
+            )
+            observation = conn.execute(
+                "SELECT lifecycle_state,journal_entry_id,journal_revision "
+                "FROM bnl_journal_observations WHERE guild_id=1 "
+                "AND observation_date=?",
+                (TARGET_DAY.isoformat(),),
+            ).fetchone()
+        self.assertEqual(
+            ("published", prepared.entry_id, prepared.revision),
+            observation,
+        )
+
+    def test_privacy_purge_recovers_crash_after_entry_publish_before_run_finish(self):
+        prepared = self.prepare()
+        self.assertEqual("prepared", prepared.status, prepared)
+        start, end, _label = automation._daily_period_for_day(TARGET_DAY)
+        claim, run_id, delivery_epoch, _row = automation._claim_delivery(
+            self.db,
+            1,
+            "daily",
+            start,
+            end,
+            force=True,
+        )
+        self.assertEqual("claimed", claim)
+
+        posted = []
+
+        def opener(request, timeout=10):
+            posted.append(request.data)
+            return AcceptedResponse(request)
+
+        delivered = journal.deliver_approved(
+            self.db,
+            1,
+            prepared.entry_id,
+            "https://site.example",
+            "key",
+            opener=opener,
+            revision=prepared.revision,
+            delivery_fence=(run_id, delivery_epoch),
+        )
+        self.assertEqual("published", delivered.status, delivered)
+        self.assertEqual(1, len(posted))
+        self.assertEqual("delivering", self.run_row()["lifecycle_state"])
+
+        with source_store.journal_release_privacy_fence(self.db):
+            with sqlite3.connect(self.db) as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                self.assertEqual(
+                    1,
+                    source_store.purge_user_discord_sources_on_connection(
+                        conn,
+                        guild_id=1,
+                        user_id=100,
+                    ),
+                )
+                counts = journal.purge_user_journal_derivatives_on_connection(
+                    conn,
+                    guild_id=1,
+                    user_id=100,
+                )
+                conn.commit()
+
+        self.assertEqual(
+            1,
+            counts.get("bnl_journal_published_runs_recovered"),
+        )
+        run = self.run_row()
+        self.assertEqual("published", run["lifecycle_state"])
+        self.assertEqual("delivery_already_recorded", run["reason"])
+        self.assertEqual(prepared.entry_id, run["journal_entry_id"])
+        self.assertEqual(prepared.revision, run["journal_revision"])
+        self.assertIsNone(run["frozen_packet_json"])
+        self.assertTrue(run["prepared_payload_hash"])
+        with sqlite3.connect(self.db) as conn:
+            observation = conn.execute(
+                "SELECT lifecycle_state,journal_entry_id,journal_revision "
+                "FROM bnl_journal_observations WHERE guild_id=1 "
+                "AND observation_date=?",
+                (TARGET_DAY.isoformat(),),
+            ).fetchone()
+            state = conn.execute(
+                "SELECT last_status,last_reason,last_entry_id,last_revision "
+                "FROM bnl_journal_automation_state WHERE guild_id=1",
+            ).fetchone()
+        self.assertEqual(
+            ("published", prepared.entry_id, prepared.revision),
+            observation,
+        )
+        self.assertEqual(
+            (
+                "published",
+                "delivery_already_recorded",
+                prepared.entry_id,
+                prepared.revision,
+            ),
+            state,
+        )
 
     def test_delivery_retry_resends_byte_identical_idempotent_request(self):
         prepared = self.prepare()
@@ -513,7 +727,7 @@ class PreparedReleaseTests(unittest.TestCase):
             entries = conn.execute(
                 "SELECT title,lifecycle_state FROM bnl_journal_entries ORDER BY revision"
             ).fetchall()
-        self.assertEqual([("Current Epoch Candidate", "approved_pending_delivery")], entries)
+        self.assertEqual([("Current Epoch Candidate", "prepared_exact")], entries)
         self.assertEqual(current.revision, self.run_row()["journal_revision"])
 
     def test_deleted_cited_source_invalidates_without_post_and_keeps_occurrence_owed(self):
@@ -581,7 +795,16 @@ class PreparedReleaseTests(unittest.TestCase):
         )
         self.assertEqual("held", result.status, result)
         self.assertEqual("request_body_too_large", result.reason)
-        entry = self.entry_row(result.entry_id, result.revision)
+        self.assertEqual("", result.entry_id)
+        self.assertEqual(0, result.revision)
+        with sqlite3.connect(self.db) as conn:
+            conn.row_factory = sqlite3.Row
+            entry = dict(
+                conn.execute(
+                    "SELECT * FROM bnl_journal_entries "
+                    "ORDER BY revision DESC LIMIT 1"
+                ).fetchone()
+            )
         canonical = bytes(entry["canonical_payload_bytes"])
         self.assertGreater(len(canonical), journal.JOURNAL_SITE_REQUEST_BODY_MAX_BYTES)
         self.assertEqual("rejected", entry["lifecycle_state"])
@@ -599,8 +822,8 @@ class PreparedReleaseTests(unittest.TestCase):
             )
         )
         self.assertEqual("prepared", retried.status, retried)
-        self.assertEqual(result.entry_id, retried.entry_id)
-        self.assertEqual(result.revision + 1, retried.revision)
+        self.assertEqual(entry["entry_id"], retried.entry_id)
+        self.assertEqual(int(entry["revision"]) + 1, retried.revision)
         self.assertEqual(frozen_hash, self.run_row()["frozen_packet_hash"])
 
     def test_validation_exhaustion_never_creates_a_prepared_fallback(self):
@@ -620,6 +843,7 @@ class PreparedReleaseTests(unittest.TestCase):
         self.assertEqual("held", run["lifecycle_state"])
         self.assertTrue(run["frozen_packet_hash"])
         self.assertIsNone(run["prepared_payload_hash"])
+        self.assert_owed_occurrence_has_no_revision_link(result)
 
     def test_storage_failure_stays_held_and_owed_with_frozen_packet(self):
         with patch.object(
@@ -635,6 +859,7 @@ class PreparedReleaseTests(unittest.TestCase):
         self.assertEqual("held", run["lifecycle_state"])
         self.assertTrue(run["frozen_packet_hash"])
         self.assertIsNone(run["prepared_payload_hash"])
+        self.assert_owed_occurrence_has_no_revision_link(result)
 
     def test_existing_run_table_is_migrated_without_losing_occurrence(self):
         tmp = tempfile.NamedTemporaryFile(delete=False)
@@ -707,6 +932,112 @@ class PreparedReleaseTests(unittest.TestCase):
                 <= state_columns
             )
         finally:
+            try:
+                os.unlink(legacy_db)
+            except FileNotFoundError:
+                pass
+
+    def test_schema_migration_takes_write_lease_before_column_snapshot(self):
+        tmp = tempfile.NamedTemporaryFile(delete=False)
+        legacy_db = tmp.name
+        tmp.close()
+        blocker = None
+        real_connect = sqlite3.connect
+        try:
+            with real_connect(legacy_db) as conn:
+                conn.executescript(
+                    """
+                    CREATE TABLE bnl_journal_automation_runs(
+                        run_id TEXT PRIMARY KEY,guild_id INTEGER NOT NULL,
+                        cadence TEXT NOT NULL,source_window_start TEXT NOT NULL,
+                        source_window_end TEXT NOT NULL,lifecycle_state TEXT NOT NULL,
+                        reason TEXT,journal_entry_id TEXT,
+                        journal_revision INTEGER NOT NULL DEFAULT 0,
+                        aggregate_counts_json TEXT NOT NULL DEFAULT '{}',
+                        attempt_count INTEGER NOT NULL DEFAULT 0,
+                        lease_expires_at TEXT,created_at TEXT NOT NULL,
+                        updated_at TEXT NOT NULL,
+                        UNIQUE(guild_id,cadence,source_window_start,source_window_end));
+                    CREATE TABLE bnl_journal_automation_state(
+                        guild_id INTEGER PRIMARY KEY,last_checked_at TEXT,
+                        last_status TEXT,last_reason TEXT,last_cadence TEXT,
+                        last_entry_id TEXT,last_revision INTEGER NOT NULL DEFAULT 0,
+                        last_source_window_start TEXT,last_source_window_end TEXT,
+                        next_retry_at TEXT,updated_at TEXT NOT NULL);
+                    """
+                )
+            blocker = real_connect(legacy_db)
+            blocker.execute("BEGIN IMMEDIATE")
+            statements = []
+            statements_lock = threading.Lock()
+
+            class TracedConnection(sqlite3.Connection):
+                pass
+
+            def traced_connect(*args, **kwargs):
+                kwargs["factory"] = TracedConnection
+                conn = real_connect(*args, **kwargs)
+
+                def record(statement):
+                    with statements_lock:
+                        statements.append(statement)
+
+                conn.set_trace_callback(record)
+                return conn
+
+            with patch.object(automation.sqlite3, "connect", side_effect=traced_connect):
+                with ThreadPoolExecutor(max_workers=4) as pool:
+                    futures = [pool.submit(automation.ensure_schema, legacy_db) for _ in range(4)]
+                    try:
+                        deadline = time.monotonic() + 2
+                        while time.monotonic() < deadline:
+                            with statements_lock:
+                                begins = sum(
+                                    statement.strip().upper() == "BEGIN IMMEDIATE"
+                                    for statement in statements
+                                )
+                            if begins == 4:
+                                break
+                            time.sleep(0.01)
+                        with statements_lock:
+                            before_release = list(statements)
+                        self.assertEqual(
+                            4,
+                            sum(
+                                statement.strip().upper() == "BEGIN IMMEDIATE"
+                                for statement in before_release
+                            ),
+                        )
+                        self.assertFalse(
+                            any(
+                                "PRAGMA TABLE_INFO" in statement.upper()
+                                for statement in before_release
+                            ),
+                            before_release,
+                        )
+                    finally:
+                        blocker.commit()
+                    for future in futures:
+                        future.result(timeout=5)
+
+            with real_connect(legacy_db) as conn:
+                run_columns = {
+                    row[1]
+                    for row in conn.execute(
+                        "PRAGMA table_info(bnl_journal_automation_runs)"
+                    )
+                }
+                state_columns = {
+                    row[1]
+                    for row in conn.execute(
+                        "PRAGMA table_info(bnl_journal_automation_state)"
+                    )
+                }
+            self.assertIn("prepared_payload_hash", run_columns)
+            self.assertIn("memory_exclusions_confirmed_at", state_columns)
+        finally:
+            if blocker is not None:
+                blocker.close()
             try:
                 os.unlink(legacy_db)
             except FileNotFoundError:

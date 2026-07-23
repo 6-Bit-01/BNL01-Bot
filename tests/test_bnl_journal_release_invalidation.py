@@ -188,6 +188,15 @@ class JournalReleaseInvalidationTests(unittest.TestCase):
             ).fetchone()
         return dict(row) if row else {}
 
+    def daily_observation_link(self):
+        with sqlite3.connect(self.db) as conn:
+            return conn.execute(
+                "SELECT lifecycle_state,journal_entry_id,journal_revision "
+                "FROM bnl_journal_observations "
+                "WHERE guild_id=1 AND observation_date=?",
+                (TARGET_DAY.isoformat(),),
+            ).fetchone()
+
     def test_nonprivacy_payload_integrity_failure_retains_packet_and_marks_state_held(self):
         self.add_day(TARGET_DAY)
         prepared = self.prepare_daily()
@@ -218,6 +227,8 @@ class JournalReleaseInvalidationTests(unittest.TestCase):
         result = self.release_daily(forbidden_opener)
         self.assertEqual("held", result.status, result)
         self.assertEqual("prepared_payload_integrity_failed", result.reason)
+        self.assertEqual("", result.entry_id)
+        self.assertEqual(0, result.revision)
         self.assertEqual([], posts)
 
         after = self.run_row("daily")
@@ -227,6 +238,7 @@ class JournalReleaseInvalidationTests(unittest.TestCase):
         state = self.automation_state()
         self.assertEqual("held", state["last_status"])
         self.assertEqual("prepared_payload_integrity_failed", state["last_reason"])
+        self.assertEqual(("held", None, 0), self.daily_observation_link())
 
     def test_payload_mutation_between_claim_and_final_fence_makes_zero_posts(self):
         self.add_day(TARGET_DAY)
@@ -266,6 +278,8 @@ class JournalReleaseInvalidationTests(unittest.TestCase):
 
         self.assertEqual("held", result.status, result)
         self.assertEqual("prepared_payload_integrity_failed", result.reason)
+        self.assertEqual("", result.entry_id)
+        self.assertEqual(0, result.revision)
         self.assertEqual([], posts)
         after = self.run_row("daily")
         self.assertEqual("held", after["lifecycle_state"])
@@ -279,6 +293,7 @@ class JournalReleaseInvalidationTests(unittest.TestCase):
                 (prepared.entry_id, prepared.revision),
             ).fetchone()[0]
         self.assertEqual("rejected", lifecycle)
+        self.assertEqual(("held", None, 0), self.daily_observation_link())
 
     def test_weekly_daily_memory_exclusion_blocks_post_and_retires_packet(self):
         for offset in range(7):
@@ -323,6 +338,11 @@ class JournalReleaseInvalidationTests(unittest.TestCase):
         self.assertEqual(7, len(daily_entry_ids))
         self.assertTrue(daily_entry_ids <= set(metadata["relatedPriorJournalEntryIds"]))
         excluded_entry_id = sorted(daily_entry_ids)[0]
+        automation.store_journal_memory_exclusions(
+            self.db,
+            1,
+            {excluded_entry_id},
+        )
 
         posts = []
 
@@ -338,10 +358,14 @@ class JournalReleaseInvalidationTests(unittest.TestCase):
             target_monday=WEEK_START,
             force=True,
             opener=forbidden_opener,
-            memory_excluded_entry_ids={excluded_entry_id},
+            # Simulate a release caller that captured the prior empty set. The
+            # final fence must use the newer durable control snapshot.
+            memory_excluded_entry_ids=set(),
         )
         self.assertEqual("held", result.status, result)
         self.assertEqual("privacy_eligibility_changed", result.reason)
+        self.assertEqual("", result.entry_id)
+        self.assertEqual(0, result.revision)
         self.assertEqual([], posts)
         run = self.run_row("weekly")
         self.assertEqual("held", run["lifecycle_state"])
@@ -443,6 +467,7 @@ class JournalReleaseInvalidationTests(unittest.TestCase):
                 (prepared.entry_id, prepared.revision),
             ).fetchone()[0]
         self.assertEqual("rejected", lifecycle)
+        self.assertEqual(("held", None, 0), self.daily_observation_link())
 
 
 if __name__ == "__main__":

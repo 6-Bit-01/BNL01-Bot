@@ -62,10 +62,11 @@ class JournalDeliveryFenceTests(unittest.TestCase):
         self.canonical = self._stage_approved_revision_and_run()
 
     def tearDown(self):
-        try:
-            os.unlink(self.db)
-        except FileNotFoundError:
-            pass
+        for path in (self.db, self.db + ".journal-privacy.lock"):
+            try:
+                os.unlink(path)
+            except FileNotFoundError:
+                pass
 
     @staticmethod
     def _iso(value):
@@ -240,7 +241,7 @@ class JournalDeliveryFenceTests(unittest.TestCase):
         self.assertEqual([self.canonical], posts)
         self.assertEqual(("published", "published"), self._states())
 
-    def test_privacy_purge_waits_for_fenced_post_commit_and_preserves_published_prose(self):
+    def test_privacy_purge_waits_for_journal_gate_while_unrelated_writes_continue(self):
         subject_ref = "discord_user:100"
         source_store.record_source_event(
             self.db,
@@ -255,6 +256,10 @@ class JournalDeliveryFenceTests(unittest.TestCase):
             public_usable=True,
         )
         with sqlite3.connect(self.db) as conn:
+            conn.execute(
+                "CREATE TABLE unrelated_delivery_fence_writes "
+                "(id INTEGER PRIMARY KEY, note TEXT NOT NULL)"
+            )
             metadata_raw = conn.execute(
                 "SELECT metadata_json FROM bnl_journal_private_metadata "
                 "WHERE guild_id=? AND entry_id=? AND revision=?",
@@ -304,21 +309,22 @@ class JournalDeliveryFenceTests(unittest.TestCase):
             return AcceptedResponse(request)
 
         def purge_member_sources_and_derivatives():
-            with sqlite3.connect(self.db, timeout=10) as conn:
-                purge_started.set()
-                conn.execute("BEGIN IMMEDIATE")
+            purge_started.set()
+            with source_store.journal_release_privacy_fence(self.db):
                 purge_acquired.set()
-                removed = source_store.purge_user_discord_sources_on_connection(
-                    conn,
-                    guild_id=self.guild_id,
-                    user_id=100,
-                )
-                counts = journal.purge_user_journal_derivatives_on_connection(
-                    conn,
-                    guild_id=self.guild_id,
-                    user_id=100,
-                )
-                conn.commit()
+                with sqlite3.connect(self.db, timeout=10) as conn:
+                    conn.execute("BEGIN IMMEDIATE")
+                    removed = source_store.purge_user_discord_sources_on_connection(
+                        conn,
+                        guild_id=self.guild_id,
+                        user_id=100,
+                    )
+                    counts = journal.purge_user_journal_derivatives_on_connection(
+                        conn,
+                        guild_id=self.guild_id,
+                        user_id=100,
+                    )
+                    conn.commit()
             return removed, counts
 
         with ThreadPoolExecutor(max_workers=2) as pool:
@@ -339,9 +345,20 @@ class JournalDeliveryFenceTests(unittest.TestCase):
             self.assertTrue(purge_started.wait(timeout=5), "privacy purge thread never started")
             self.assertFalse(
                 purge_acquired.wait(timeout=0.1),
-                "privacy purge acquired the database before fenced delivery committed",
+                "privacy purge crossed the Journal gate before delivery finished",
             )
             self.assertFalse(purge_future.done())
+            with sqlite3.connect(self.db, timeout=1) as conn:
+                conn.execute(
+                    "INSERT INTO unrelated_delivery_fence_writes(note) VALUES('continued')"
+                )
+            with sqlite3.connect(self.db) as conn:
+                self.assertEqual(
+                    1,
+                    conn.execute(
+                        "SELECT COUNT(*) FROM unrelated_delivery_fence_writes"
+                    ).fetchone()[0],
+                )
             allow_response.set()
             delivered = delivery_future.result(timeout=5)
             removed, counts = purge_future.result(timeout=5)

@@ -81,6 +81,38 @@ class JournalSourceStoreTests(unittest.TestCase):
         self.assertTrue(all(result.ok for result in results))
         self.assertEqual(1, len({result.event_seq for result in results}))
 
+    def test_concurrent_legacy_schema_upgrade_is_serialized(self):
+        with sqlite3.connect(self.db) as conn:
+            conn.execute(
+                "CREATE TABLE bnl_journal_source_archive_state("
+                "guild_id INTEGER PRIMARY KEY,activated_at_ms INTEGER NOT NULL,"
+                "created_at_ms INTEGER NOT NULL)"
+            )
+
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            futures = [pool.submit(store.ensure_schema, self.db) for _ in range(8)]
+            for future in futures:
+                future.result(timeout=10)
+
+        with sqlite3.connect(self.db) as conn:
+            columns = {
+                row[1]
+                for row in conn.execute(
+                    "PRAGMA table_info(bnl_journal_source_archive_state)"
+                )
+            }
+        self.assertTrue(
+            {
+                "legacy_backfill_completed_at_ms",
+                "legacy_conversation_cursor",
+                "legacy_relay_cursor_rowid",
+                "legacy_relay_cursor_timestamp",
+                "legacy_relay_cursor_id",
+            }
+            <= columns
+        )
+        self.assertTrue(self._record("post-upgrade-source").ok)
+
     def test_query_is_exact_unbounded_deterministic_and_fully_counted(self):
         self._record("before", occurred=999)
         self._record("end", occurred=2_000)

@@ -10,8 +10,18 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Optional
 
+from bnl_journal_source_store import journal_release_privacy_fence
+
 PUBLIC_POLICIES = {"public_home", "public_context", "public_selective"}
-STATES = {"draft", "rejected", "approved_pending_delivery", "published", "delivery_failed"}
+SCHEDULED_PREPARED_STATE = "prepared_exact"
+STATES = {
+    "draft",
+    "rejected",
+    "approved_pending_delivery",
+    SCHEDULED_PREPARED_STATE,
+    "published",
+    "delivery_failed",
+}
 JOURNAL_ROUTE = "bnl_journal_generation"
 JOURNAL_GENERATION_ATTEMPTS = 4
 # Must match the website receiver's raw UTF-8 request-body limit. The complete
@@ -394,6 +404,7 @@ def purge_user_journal_derivatives_on_connection(
     run_columns: set[str] = set()
     run_records: list[dict[str, Any]] = []
     affected_run_ids: set[str] = set()
+    published_recoveries: dict[str, dict[str, Any]] = {}
     if table_exists(conn, "bnl_journal_automation_runs"):
         run_columns = _cols(conn, "bnl_journal_automation_runs")
         selected_columns = [
@@ -427,15 +438,54 @@ def purge_user_journal_derivatives_on_connection(
                     continue
 
                 run_id = str(run.get("run_id") or "")
-                if str(run.get("lifecycle_state") or "") == "published":
+                entry_id = str(run.get("journal_entry_id") or "")
+                revision = int(run.get("journal_revision") or 0)
+                published_link = False
+                if entry_id and revision > 0 and table_exists(conn, "bnl_journal_entries"):
+                    state = conn.execute(
+                        "SELECT lifecycle_state FROM bnl_journal_entries "
+                        "WHERE guild_id=? AND entry_id=? AND revision=?",
+                        (guild, entry_id, revision),
+                    ).fetchone()
+                    published_link = bool(state and str(state[0]) == "published")
+                if (
+                    not published_link
+                    and entry_id
+                    and revision > 0
+                    and table_exists(conn, "bnl_journal_private_metadata")
+                ):
+                    state = conn.execute(
+                        "SELECT lifecycle_state FROM bnl_journal_private_metadata "
+                        "WHERE guild_id=? AND entry_id=? AND revision=?",
+                        (guild, entry_id, revision),
+                    ).fetchone()
+                    published_link = bool(state and str(state[0]) == "published")
+
+                if (
+                    str(run.get("lifecycle_state") or "") == "published"
+                    or published_link
+                ):
                     # Published public prose and its immutable revision remain;
-                    # only the now-ineligible private packet is discarded.
+                    # only the now-ineligible private packet is discarded. If a
+                    # worker crashed after recording the published entry but
+                    # before finalizing its run, recover the durable occurrence
+                    # here rather than making an already-public Journal owed.
                     assignments = [
                         f"{column}=NULL"
                         for column in ("frozen_packet_json", "frozen_packet_hash", "packet_frozen_at")
                         if column in run_columns
                     ]
                     params: list[Any] = []
+                    if published_link and str(run.get("lifecycle_state") or "") != "published":
+                        assignments.extend(
+                            [
+                                "lifecycle_state='published'",
+                                "reason='delivery_already_recorded'",
+                            ]
+                        )
+                        for column in ("lease_expires_at", "delivery_lease_expires_at"):
+                            if column in run_columns:
+                                assignments.append(f"{column}=NULL")
                     if "updated_at" in run_columns:
                         assignments.append("updated_at=?")
                         params.append(now)
@@ -443,35 +493,101 @@ def purge_user_journal_derivatives_on_connection(
                         params.extend((guild, run_id))
                         changed = conn.execute(
                             f"UPDATE bnl_journal_automation_runs SET {','.join(assignments)} "
-                            "WHERE guild_id=? AND run_id=? AND lifecycle_state='published'",
+                            "WHERE guild_id=? AND run_id=?",
                             tuple(params),
                         ).rowcount
                         counts["bnl_journal_published_packets_scrubbed"] = counts.get(
                             "bnl_journal_published_packets_scrubbed", 0
                         ) + changed
+                    if (
+                        changed
+                        and published_link
+                        and str(run.get("lifecycle_state") or "") != "published"
+                    ):
+                        published_recoveries[run_id] = run
+                        counts["bnl_journal_published_runs_recovered"] = counts.get(
+                            "bnl_journal_published_runs_recovered", 0
+                        ) + 1
                     continue
 
                 affected_run_ids.add(run_id)
+                if entry_id and revision > 0:
+                    unpublished.add((entry_id, revision))
+
+        if published_recoveries:
+            observation_columns = (
+                _cols(conn, "bnl_journal_observations")
+                if table_exists(conn, "bnl_journal_observations")
+                else set()
+            )
+            state_columns = (
+                _cols(conn, "bnl_journal_automation_state")
+                if table_exists(conn, "bnl_journal_automation_state")
+                else set()
+            )
+            for run in published_recoveries.values():
                 entry_id = str(run.get("journal_entry_id") or "")
                 revision = int(run.get("journal_revision") or 0)
-                if entry_id and revision > 0:
-                    published_link = False
-                    if table_exists(conn, "bnl_journal_entries"):
-                        state = conn.execute(
-                            "SELECT lifecycle_state FROM bnl_journal_entries "
-                            "WHERE guild_id=? AND entry_id=? AND revision=?",
-                            (guild, entry_id, revision),
-                        ).fetchone()
-                        published_link = bool(state and str(state[0]) == "published")
-                    if not published_link and table_exists(conn, "bnl_journal_private_metadata"):
-                        state = conn.execute(
-                            "SELECT lifecycle_state FROM bnl_journal_private_metadata "
-                            "WHERE guild_id=? AND entry_id=? AND revision=?",
-                            (guild, entry_id, revision),
-                        ).fetchone()
-                        published_link = bool(state and str(state[0]) == "published")
-                    if not published_link:
-                        unpublished.add((entry_id, revision))
+                if {
+                    "guild_id",
+                    "source_window_start",
+                    "source_window_end",
+                    "lifecycle_state",
+                    "journal_entry_id",
+                    "journal_revision",
+                    "updated_at",
+                } <= observation_columns:
+                    conn.execute(
+                        "UPDATE bnl_journal_observations SET lifecycle_state='published',"
+                        "journal_entry_id=?,journal_revision=?,updated_at=? "
+                        "WHERE guild_id=? AND source_window_start=? AND source_window_end=?",
+                        (
+                            entry_id,
+                            revision,
+                            now,
+                            guild,
+                            str(run.get("source_window_start") or ""),
+                            str(run.get("source_window_end") or ""),
+                        ),
+                    )
+                if {
+                    "guild_id",
+                    "last_checked_at",
+                    "last_status",
+                    "last_reason",
+                    "last_cadence",
+                    "last_entry_id",
+                    "last_revision",
+                    "last_source_window_start",
+                    "last_source_window_end",
+                    "next_retry_at",
+                    "updated_at",
+                } <= state_columns:
+                    conn.execute(
+                        "UPDATE bnl_journal_automation_state SET last_checked_at=?,"
+                        "last_status='published',last_reason='delivery_already_recorded',"
+                        "last_cadence=?,last_entry_id=?,last_revision=?,"
+                        "last_source_window_start=?,last_source_window_end=?,"
+                        "next_retry_at=NULL,updated_at=? WHERE guild_id=? AND ("
+                        "(last_entry_id=? AND last_revision=?) OR "
+                        "(last_cadence=? AND last_source_window_start=? "
+                        "AND last_source_window_end=?))",
+                        (
+                            now,
+                            str(run.get("cadence") or ""),
+                            entry_id,
+                            revision,
+                            str(run.get("source_window_start") or ""),
+                            str(run.get("source_window_end") or ""),
+                            now,
+                            guild,
+                            entry_id,
+                            revision,
+                            str(run.get("cadence") or ""),
+                            str(run.get("source_window_start") or ""),
+                            str(run.get("source_window_end") or ""),
+                        ),
+                    )
 
         # Before packet persistence, the cited private metadata was the only
         # durable route from a staged revision back to its occurrence owner.
@@ -2504,6 +2620,7 @@ def _delivery_fence_owned(
     guild_id: int,
     entry_id: str,
     revision: Optional[int],
+    require_live_lease: bool = True,
 ) -> bool:
     """Validate an automation delivery owner inside its network transaction."""
     if delivery_fence is None or revision is None:
@@ -2537,6 +2654,8 @@ def _delivery_fence_owned(
         or int(row[4] or 0) != int(delivery_fence[1])
     ):
         return False
+    if not require_live_lease:
+        return True
     lease_raw = str(row[5] or "")
     if not lease_raw:
         return False
@@ -2845,13 +2964,26 @@ def approve_draft(
             return JournalResult(False, "draft", "source_packet_hash_mismatch", entry_id, rev, stored_hash)
         metadata["canonicalPayloadHash"] = request_hash
         metadata["canonicalPayloadBytes"] = len(canonical)
-        cur1 = conn.execute("UPDATE bnl_journal_entries SET lifecycle_state='approved_pending_delivery',approved_at=?,updated_at=? WHERE guild_id=? AND entry_id=? AND revision=? AND lifecycle_state='draft'", (now, now, guild_id, entry_id, rev))
-        cur2 = conn.execute("UPDATE bnl_journal_private_metadata SET metadata_json=?,lifecycle_state='approved_pending_delivery',updated_at=? WHERE guild_id=? AND entry_id=? AND revision=? AND lifecycle_state='draft'", (_json(metadata), now, guild_id, entry_id, rev))
+        approved_state = (
+            SCHEDULED_PREPARED_STATE
+            if attempt_fence is not None
+            else "approved_pending_delivery"
+        )
+        cur1 = conn.execute(
+            "UPDATE bnl_journal_entries SET lifecycle_state=?,approved_at=?,updated_at=? "
+            "WHERE guild_id=? AND entry_id=? AND revision=? AND lifecycle_state='draft'",
+            (approved_state, now, now, guild_id, entry_id, rev),
+        )
+        cur2 = conn.execute(
+            "UPDATE bnl_journal_private_metadata SET metadata_json=?,lifecycle_state=?,updated_at=? "
+            "WHERE guild_id=? AND entry_id=? AND revision=? AND lifecycle_state='draft'",
+            (_json(metadata), approved_state, now, guild_id, entry_id, rev),
+        )
         if cur1.rowcount != 1 or cur2.rowcount != 1:
             conn.rollback()
             raise sqlite3.IntegrityError("journal_approve_sync_failed")
         conn.commit()
-    return JournalResult(True, "approved_pending_delivery", "", entry_id, rev, stored_hash)
+    return JournalResult(True, approved_state, "", entry_id, rev, stored_hash)
 
 
 def reject_draft(db_path: str, guild_id: int, entry_id: str, reason: str = "", revision: Optional[int] = None) -> JournalResult:
@@ -3003,45 +3135,52 @@ def deliver_approved(
 ) -> JournalResult:
     ensure_schema(db_path)
     if delivery_fence is not None:
-        with sqlite3.connect(db_path) as conn:
-            conn.execute("BEGIN IMMEDIATE")
-            if not _delivery_fence_owned(
-                conn,
-                delivery_fence,
-                guild_id=guild_id,
-                entry_id=entry_id,
-                revision=revision,
-            ):
-                conn.rollback()
-                return JournalResult(
-                    False,
-                    "not_deliverable",
-                    "delivery_epoch_lost",
-                    entry_id,
-                    int(revision or 0),
-                )
-            row = conn.execute(
-                "SELECT revision,canonical_payload_bytes,content_hash FROM bnl_journal_entries "
-                "WHERE guild_id=? AND entry_id=? "
-                "AND lifecycle_state IN ('approved_pending_delivery','delivery_failed') AND revision=?",
-                (guild_id, entry_id, int(revision)),
-            ).fetchone()
-            if not row:
-                conn.rollback()
-                return JournalResult(False, "not_deliverable", "not_approved", entry_id, int(revision or 0))
-            rev, canonical, content_hash = int(row[0]), row[1], row[2]
-            if delivery_preflight is not None:
-                preflight_reason = str(delivery_preflight(conn) or "")
-                if preflight_reason:
+        # Privacy/deletion writers share this narrow Journal fence. The main
+        # SQLite transaction is deliberately released before the network wait,
+        # so unrelated bot writes are never blocked by website latency.
+        with journal_release_privacy_fence(db_path):
+            with sqlite3.connect(db_path, timeout=30) as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                if not _delivery_fence_owned(
+                    conn,
+                    delivery_fence,
+                    guild_id=guild_id,
+                    entry_id=entry_id,
+                    revision=revision,
+                ):
                     conn.rollback()
                     return JournalResult(
                         False,
                         "not_deliverable",
-                        preflight_reason,
+                        "delivery_epoch_lost",
                         entry_id,
-                        rev,
-                        content_hash,
+                        int(revision or 0),
                     )
+                row = conn.execute(
+                    "SELECT revision,canonical_payload_bytes,content_hash FROM bnl_journal_entries "
+                    "WHERE guild_id=? AND entry_id=? "
+                    "AND lifecycle_state IN ('prepared_exact','approved_pending_delivery','delivery_failed') "
+                    "AND revision=?",
+                    (guild_id, entry_id, int(revision)),
+                ).fetchone()
+                if not row:
+                    conn.rollback()
+                    return JournalResult(False, "not_deliverable", "not_approved", entry_id, int(revision or 0))
+                rev, canonical, content_hash = int(row[0]), bytes(row[1] or b""), row[2]
+                if delivery_preflight is not None:
+                    preflight_reason = str(delivery_preflight(conn) or "")
+                    if preflight_reason:
+                        conn.rollback()
+                        return JournalResult(
+                            False,
+                            "not_deliverable",
+                            preflight_reason,
+                            entry_id,
+                            rev,
+                            content_hash,
+                        )
+                conn.commit()
+
             status, reason, http, idem, published = _post_canonical_payload(
                 canonical,
                 base_url,
@@ -3050,22 +3189,58 @@ def deliver_approved(
                 timeout,
             )
             now = utc_now_iso()
-            cur1 = conn.execute(
-                "UPDATE bnl_journal_entries SET lifecycle_state=?,delivery_status=?,"
-                "delivery_http_status=?,published_at=COALESCE(?,published_at),updated_at=? "
-                "WHERE guild_id=? AND entry_id=? AND revision=? "
-                "AND lifecycle_state IN ('approved_pending_delivery','delivery_failed')",
-                (status, reason, http, published or None, now, guild_id, entry_id, rev),
-            )
-            cur2 = conn.execute(
-                "UPDATE bnl_journal_private_metadata SET lifecycle_state=?,updated_at=? "
-                "WHERE guild_id=? AND entry_id=? AND revision=?",
-                (status, now, guild_id, entry_id, rev),
-            )
-            if cur1.rowcount != 1 or cur2.rowcount != 1:
-                conn.rollback()
-                raise sqlite3.IntegrityError("journal_delivery_sync_failed")
-            conn.commit()
+            with sqlite3.connect(db_path, timeout=30) as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                if not _delivery_fence_owned(
+                    conn,
+                    delivery_fence,
+                    guild_id=guild_id,
+                    entry_id=entry_id,
+                    revision=rev,
+                    require_live_lease=False,
+                ):
+                    conn.rollback()
+                    return JournalResult(
+                        False,
+                        "not_deliverable",
+                        "delivery_epoch_lost",
+                        entry_id,
+                        rev,
+                        content_hash,
+                        http,
+                        idem,
+                    )
+                persisted_state = (
+                    "published"
+                    if status == "published"
+                    else SCHEDULED_PREPARED_STATE
+                )
+                cur1 = conn.execute(
+                    "UPDATE bnl_journal_entries SET lifecycle_state=?,delivery_status=?,"
+                    "delivery_http_status=?,published_at=COALESCE(?,published_at),updated_at=? "
+                    "WHERE guild_id=? AND entry_id=? AND revision=? "
+                    "AND lifecycle_state IN ('prepared_exact','approved_pending_delivery','delivery_failed')",
+                    (
+                        persisted_state,
+                        reason,
+                        http,
+                        published or None,
+                        now,
+                        guild_id,
+                        entry_id,
+                        rev,
+                    ),
+                )
+                cur2 = conn.execute(
+                    "UPDATE bnl_journal_private_metadata SET lifecycle_state=?,updated_at=? "
+                    "WHERE guild_id=? AND entry_id=? AND revision=? "
+                    "AND lifecycle_state IN ('prepared_exact','approved_pending_delivery','delivery_failed')",
+                    (persisted_state, now, guild_id, entry_id, rev),
+                )
+                if cur1.rowcount != 1 or cur2.rowcount != 1:
+                    conn.rollback()
+                    raise sqlite3.IntegrityError("journal_delivery_sync_failed")
+                conn.commit()
         return JournalResult(status == "published", status, reason, entry_id, rev, content_hash, http, idem)
 
     with sqlite3.connect(db_path) as conn:

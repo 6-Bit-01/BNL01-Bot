@@ -8,18 +8,26 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import sqlite3
+import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+
+import fcntl
 
 
 PUBLIC_POLICIES = ("public_context", "public_home", "public_selective")
 SOURCE_TABLE = "bnl_journal_source_events"
 STATE_TABLE = "bnl_journal_source_archive_state"
 DELETE_TRIGGER = "trg_bnl_journal_sources_no_delete"
+_JOURNAL_PRIVACY_LOCKS: Dict[str, threading.RLock] = {}
+_JOURNAL_PRIVACY_LOCKS_GUARD = threading.Lock()
+_JOURNAL_PRIVACY_LOCK_LOCAL = threading.local()
 
 
 @dataclass(frozen=True)
@@ -54,6 +62,63 @@ def _now_ms() -> int:
 
 def _content_hash(raw_text: str) -> str:
     return hashlib.sha256((raw_text or "").encode("utf-8")).hexdigest()
+
+
+def _journal_privacy_lock_key(db_path: str) -> str:
+    raw = os.path.abspath(str(db_path or ""))
+    return os.path.realpath(raw)
+
+
+@contextmanager
+def journal_release_privacy_fence(db_path: str, *, blocking: bool = True):
+    """Serialize Journal release with eligibility-decreasing privacy writes.
+
+    The process lock keeps same-process threads from relying on platform-specific
+    ``flock`` reentrancy. The sidecar lock extends the same ordering across a
+    brief old/new process overlap during restart or rollback. Callers must take
+    this fence before opening a main-database write transaction.
+    """
+    key = _journal_privacy_lock_key(db_path)
+    with _JOURNAL_PRIVACY_LOCKS_GUARD:
+        process_lock = _JOURNAL_PRIVACY_LOCKS.setdefault(key, threading.RLock())
+    process_acquired = process_lock.acquire(blocking=blocking)
+    if not process_acquired:
+        yield False
+        return
+    try:
+        held = getattr(_JOURNAL_PRIVACY_LOCK_LOCAL, "keys", set())
+        if key in held:
+            yield True
+            return
+        lock_path = key + ".journal-privacy.lock"
+        descriptor = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+        file_acquired = False
+        try:
+            operation = fcntl.LOCK_EX
+            if not blocking:
+                operation |= fcntl.LOCK_NB
+            try:
+                fcntl.flock(descriptor, operation)
+                file_acquired = True
+            except BlockingIOError:
+                yield False
+                return
+            held = set(held)
+            held.add(key)
+            _JOURNAL_PRIVACY_LOCK_LOCAL.keys = held
+            yield True
+        finally:
+            if file_acquired:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+            os.close(descriptor)
+            if file_acquired:
+                remaining = set(
+                    getattr(_JOURNAL_PRIVACY_LOCK_LOCAL, "keys", set())
+                )
+                remaining.discard(key)
+                _JOURNAL_PRIVACY_LOCK_LOCAL.keys = remaining
+    finally:
+        process_lock.release()
 
 
 def _canonical_json(value: Optional[Mapping[str, Any]]) -> str:
@@ -104,6 +169,10 @@ def sanitize_summary(text: str, private_names: Optional[Sequence[str]] = None, l
 
 def ensure_schema(db_path: str) -> None:
     with sqlite3.connect(db_path, timeout=30) as conn:
+        # The schema snapshot and its conditional ALTERs are one serialized
+        # migration. Without this lease, concurrent startup paths can both see
+        # a missing legacy column and race into duplicate-column failures.
+        conn.execute("BEGIN IMMEDIATE")
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS bnl_journal_source_archive_state (
@@ -455,15 +524,16 @@ def _purge_discord_source_events(db_path: str, guild_id: int, user_id: Optional[
     and deletion back together, so the immutability guard remains installed.
     """
     ensure_schema(db_path)
-    with sqlite3.connect(db_path, timeout=30) as conn:
-        conn.execute("BEGIN EXCLUSIVE")
-        try:
-            removed = _purge_discord_source_events_on_connection(conn, guild_id, user_id)
-            conn.commit()
-            return removed
-        except Exception:
-            conn.rollback()
-            raise
+    with journal_release_privacy_fence(db_path):
+        with sqlite3.connect(db_path, timeout=30) as conn:
+            conn.execute("BEGIN EXCLUSIVE")
+            try:
+                removed = _purge_discord_source_events_on_connection(conn, guild_id, user_id)
+                conn.commit()
+                return removed
+            except Exception:
+                conn.rollback()
+                raise
 
 
 def purge_guild_discord_sources(db_path: str, guild_id: int) -> int:

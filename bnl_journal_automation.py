@@ -13,6 +13,7 @@ import pytz
 
 from bnl_journal import (
     JOURNAL_SITE_REQUEST_BODY_MAX_BYTES,
+    SCHEDULED_PREPARED_STATE,
     JournalResult,
     approve_draft,
     build_source_packet_between,
@@ -23,6 +24,7 @@ from bnl_journal import (
     journal_topic_counts,
     utc_now_iso,
 )
+from bnl_journal_source_store import journal_release_privacy_fence
 
 PACIFIC = pytz.timezone("US/Pacific")
 DAILY_READY_HOUR = 19
@@ -142,7 +144,10 @@ def next_schedule_times(now_utc: Optional[datetime] = None) -> tuple[str, str]:
 
 
 def ensure_schema(db_path: str) -> None:
-    with sqlite3.connect(db_path) as conn:
+    with sqlite3.connect(db_path, timeout=30) as conn:
+        # Serialize the legacy-column snapshot with every conditional ALTER.
+        # Journal entrypoints can initialize concurrently during startup.
+        conn.execute("BEGIN IMMEDIATE")
         conn.execute("""CREATE TABLE IF NOT EXISTS bnl_journal_observations (
             observation_id TEXT PRIMARY KEY,
             guild_id INTEGER NOT NULL,
@@ -200,6 +205,22 @@ def ensure_schema(db_path: str) -> None:
         for column, declaration in run_migrations.items():
             if column not in run_columns:
                 conn.execute(f"ALTER TABLE bnl_journal_automation_runs ADD COLUMN {column} {declaration}")
+        conn.execute(
+            """CREATE TRIGGER IF NOT EXISTS trg_bnl_journal_runs_guard_legacy_running
+               BEFORE UPDATE OF lifecycle_state ON bnl_journal_automation_runs
+               WHEN NEW.lifecycle_state='running'
+                AND (
+                    OLD.lifecycle_state IN ('preparing','prepared','delivering')
+                    OR COALESCE(OLD.preparation_epoch,0) > 0
+                    OR COALESCE(OLD.delivery_epoch,0) > 0
+                    OR OLD.frozen_packet_json IS NOT NULL
+                    OR OLD.frozen_packet_hash IS NOT NULL
+                    OR OLD.prepared_payload_hash IS NOT NULL
+                )
+               BEGIN
+                   SELECT RAISE(ABORT,'journal_prepared_release_downgrade_guard');
+               END"""
+        )
         conn.execute("CREATE INDEX IF NOT EXISTS idx_bnl_journal_runs_latest ON bnl_journal_automation_runs(guild_id,updated_at DESC)")
         conn.execute("""CREATE TABLE IF NOT EXISTS bnl_journal_automation_state (
             guild_id INTEGER PRIMARY KEY,
@@ -227,48 +248,48 @@ def ensure_schema(db_path: str) -> None:
                 conn.execute(
                     f"ALTER TABLE bnl_journal_automation_state ADD COLUMN {column} {declaration}"
                 )
+        if conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='bnl_journal_entries'"
+        ).fetchone():
+            # Hide already-staged occurrence payloads from pre-upgrade delivery
+            # code before a rollback can observe the legacy lifecycle values.
+            conn.execute(
+                "UPDATE bnl_journal_entries SET lifecycle_state='prepared_exact' "
+                "WHERE lifecycle_state IN ('approved_pending_delivery','delivery_failed') "
+                "AND EXISTS ("
+                "SELECT 1 FROM bnl_journal_automation_runs r "
+                "WHERE r.guild_id=bnl_journal_entries.guild_id "
+                "AND r.journal_entry_id=bnl_journal_entries.entry_id "
+                "AND r.journal_revision=bnl_journal_entries.revision "
+                "AND r.prepared_payload_hash IS NOT NULL"
+                ")"
+            )
+            if conn.execute(
+                "SELECT 1 FROM sqlite_master "
+                "WHERE type='table' AND name='bnl_journal_private_metadata'"
+            ).fetchone():
+                conn.execute(
+                    "UPDATE bnl_journal_private_metadata SET lifecycle_state='prepared_exact' "
+                    "WHERE lifecycle_state IN ('approved_pending_delivery','delivery_failed') "
+                    "AND EXISTS ("
+                    "SELECT 1 FROM bnl_journal_automation_runs r "
+                    "WHERE r.guild_id=bnl_journal_private_metadata.guild_id "
+                    "AND r.journal_entry_id=bnl_journal_private_metadata.entry_id "
+                    "AND r.journal_revision=bnl_journal_private_metadata.revision "
+                    "AND r.prepared_payload_hash IS NOT NULL"
+                    ")"
+                )
 
 
-def store_journal_memory_exclusions(
-    db_path: str,
-    guild_id: int,
-    entry_ids: set[str] | list[str],
-) -> set[str]:
-    """Persist one confirmed website memory-eligibility snapshot."""
-    ensure_schema(db_path)
-    resolved = {
-        str(entry_id).strip()
-        for entry_id in entry_ids
-        if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,159}", str(entry_id).strip())
-    }
-    now = utc_now_iso()
-    with sqlite3.connect(db_path) as conn:
-        conn.execute("BEGIN IMMEDIATE")
-        conn.execute(
-            "INSERT INTO bnl_journal_automation_state("
-            "guild_id,memory_excluded_entry_ids_json,memory_exclusions_confirmed_at,updated_at"
-            ") VALUES(?,?,?,?) ON CONFLICT(guild_id) DO UPDATE SET "
-            "memory_excluded_entry_ids_json=excluded.memory_excluded_entry_ids_json,"
-            "memory_exclusions_confirmed_at=excluded.memory_exclusions_confirmed_at,"
-            "updated_at=excluded.updated_at",
-            (int(guild_id), _json(sorted(resolved)), now, now),
-        )
-        conn.commit()
-    return resolved
-
-
-def load_journal_memory_exclusions(
-    db_path: str,
+def _load_journal_memory_exclusions_on_connection(
+    conn: sqlite3.Connection,
     guild_id: int,
 ) -> tuple[set[str], bool]:
-    """Return the last confirmed exclusion set; never infer confirmed-empty."""
-    ensure_schema(db_path)
-    with sqlite3.connect(db_path) as conn:
-        row = conn.execute(
-            "SELECT memory_excluded_entry_ids_json,memory_exclusions_confirmed_at "
-            "FROM bnl_journal_automation_state WHERE guild_id=?",
-            (int(guild_id),),
-        ).fetchone()
+    row = conn.execute(
+        "SELECT memory_excluded_entry_ids_json,memory_exclusions_confirmed_at "
+        "FROM bnl_journal_automation_state WHERE guild_id=?",
+        (int(guild_id),),
+    ).fetchone()
     if not row or not str(row[1] or ""):
         return set(), False
     try:
@@ -285,6 +306,45 @@ def load_journal_memory_exclusions(
     if len(resolved) != len(values):
         return set(), False
     return resolved, True
+
+
+def store_journal_memory_exclusions(
+    db_path: str,
+    guild_id: int,
+    entry_ids: set[str] | list[str],
+) -> set[str]:
+    """Persist one confirmed website memory-eligibility snapshot."""
+    ensure_schema(db_path)
+    resolved = {
+        str(entry_id).strip()
+        for entry_id in entry_ids
+        if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,159}", str(entry_id).strip())
+    }
+    now = utc_now_iso()
+    with journal_release_privacy_fence(db_path):
+        with sqlite3.connect(db_path) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                "INSERT INTO bnl_journal_automation_state("
+                "guild_id,memory_excluded_entry_ids_json,memory_exclusions_confirmed_at,updated_at"
+                ") VALUES(?,?,?,?) ON CONFLICT(guild_id) DO UPDATE SET "
+                "memory_excluded_entry_ids_json=excluded.memory_excluded_entry_ids_json,"
+                "memory_exclusions_confirmed_at=excluded.memory_exclusions_confirmed_at,"
+                "updated_at=excluded.updated_at",
+                (int(guild_id), _json(sorted(resolved)), now, now),
+            )
+            conn.commit()
+    return resolved
+
+
+def load_journal_memory_exclusions(
+    db_path: str,
+    guild_id: int,
+) -> tuple[set[str], bool]:
+    """Return the last confirmed exclusion set; never infer confirmed-empty."""
+    ensure_schema(db_path)
+    with sqlite3.connect(db_path) as conn:
+        return _load_journal_memory_exclusions_on_connection(conn, guild_id)
 
 
 def _run_id(guild_id: int, cadence: str, start: str, end: str) -> str:
@@ -377,7 +437,11 @@ def _claim_preparation(
             lease_expires = current.get("lease_expires_at") or ""
             # A manual Run Now may bypass retry backoff, but it must never
             # steal a live lease from the scheduler or another operator.
-            if current["lifecycle_state"] == "preparing" and lease_expires and _parse_utc(lease_expires) > now:
+            if (
+                current["lifecycle_state"] in {"running", "preparing"}
+                and lease_expires
+                and _parse_utc(lease_expires) > now
+            ):
                 conn.commit()
                 return "busy", run_id, int(current.get("preparation_epoch") or 0), current
             epoch = int(current.get("preparation_epoch") or 0) + 1
@@ -776,8 +840,8 @@ def _adopt_legacy_staged_revision(
                 cadence,
                 "held",
                 failure,
-                entry_id,
-                revision,
+                "",
+                0,
                 start,
                 end,
                 aggregate,
@@ -830,10 +894,37 @@ def _adopt_legacy_staged_revision(
             }
         )
         now = utc_now_iso()
+        entry_changed = conn.execute(
+            "UPDATE bnl_journal_entries SET lifecycle_state=?,updated_at=? "
+            "WHERE guild_id=? AND entry_id=? AND revision=? "
+            "AND lifecycle_state IN ('approved_pending_delivery','delivery_failed')",
+            (
+                SCHEDULED_PREPARED_STATE,
+                now,
+                guild_id,
+                entry_id,
+                revision,
+            ),
+        ).rowcount
+        if entry_changed != 1:
+            conn.rollback()
+            return AutomationResult(
+                False,
+                cadence,
+                "busy",
+                "preparation_epoch_superseded",
+            )
         conn.execute(
-            "UPDATE bnl_journal_private_metadata SET metadata_json=?,updated_at=? "
+            "UPDATE bnl_journal_private_metadata SET metadata_json=?,lifecycle_state=?,updated_at=? "
             "WHERE guild_id=? AND entry_id=? AND revision=?",
-            (_json(metadata), now, guild_id, entry_id, revision),
+            (
+                _json(metadata),
+                SCHEDULED_PREPARED_STATE,
+                now,
+                guild_id,
+                entry_id,
+                revision,
+            ),
         )
         result = AutomationResult(
             True,
@@ -919,8 +1010,8 @@ def _mark_prepared(
                 cadence,
                 "held",
                 reason,
-                entry_id,
-                revision,
+                "",
+                0,
                 str(packet.get("sourceWindowStart") or ""),
                 str(packet.get("sourceWindowEnd") or ""),
                 packet.get("aggregateCounts") or {},
@@ -948,7 +1039,11 @@ def _mark_prepared(
             "WHERE e.guild_id=? AND e.entry_id=? AND e.revision=?",
             (guild_id, entry_id, int(revision)),
         ).fetchone()
-        if not entry or str(entry[0]) not in {"approved_pending_delivery", "delivery_failed"}:
+        if not entry or str(entry[0]) not in {
+            SCHEDULED_PREPARED_STATE,
+            "approved_pending_delivery",
+            "delivery_failed",
+        }:
             conn.rollback()
             return hold_invalid_revision("prepared_revision_missing")
         canonical = bytes(entry[1] or b"")
@@ -968,6 +1063,39 @@ def _mark_prepared(
             conn.rollback()
             return hold_invalid_revision("source_packet_hash_mismatch")
         now = utc_now_iso()
+        if str(entry[0]) != SCHEDULED_PREPARED_STATE:
+            entry_changed = conn.execute(
+                "UPDATE bnl_journal_entries SET lifecycle_state=?,updated_at=? "
+                "WHERE guild_id=? AND entry_id=? AND revision=? "
+                "AND lifecycle_state IN ('approved_pending_delivery','delivery_failed')",
+                (
+                    SCHEDULED_PREPARED_STATE,
+                    now,
+                    guild_id,
+                    entry_id,
+                    int(revision),
+                ),
+            ).rowcount
+            metadata_changed = conn.execute(
+                "UPDATE bnl_journal_private_metadata SET lifecycle_state=?,updated_at=? "
+                "WHERE guild_id=? AND entry_id=? AND revision=? "
+                "AND lifecycle_state IN ('approved_pending_delivery','delivery_failed')",
+                (
+                    SCHEDULED_PREPARED_STATE,
+                    now,
+                    guild_id,
+                    entry_id,
+                    int(revision),
+                ),
+            ).rowcount
+            if entry_changed != 1 or metadata_changed != 1:
+                conn.rollback()
+                return AutomationResult(
+                    False,
+                    cadence,
+                    "busy",
+                    "preparation_epoch_superseded",
+                )
         result = AutomationResult(
             True,
             cadence,
@@ -1122,12 +1250,26 @@ def _store_observation(
     return observation_id, ""
 
 
-def _mark_observation(db_path: str, guild_id: int, label: str, result: AutomationResult) -> None:
+def _mark_observation(
+    db_path: str,
+    guild_id: int,
+    label: str,
+    result: AutomationResult,
+) -> None:
     with sqlite3.connect(db_path) as conn:
-        conn.execute("""UPDATE bnl_journal_observations SET lifecycle_state=?,journal_entry_id=?,journal_revision=?,updated_at=?
-            WHERE guild_id=? AND observation_date=?""", (
-            result.status, result.entry_id or None, int(result.revision or 0), utc_now_iso(), guild_id, label,
-        ))
+        conn.execute(
+            "UPDATE bnl_journal_observations SET lifecycle_state=?,"
+            "journal_entry_id=?,journal_revision=?,updated_at=? "
+            "WHERE guild_id=? AND observation_date=?",
+            (
+                result.status,
+                result.entry_id or None,
+                int(result.revision or 0),
+                utc_now_iso(),
+                guild_id,
+                label,
+            ),
+        )
 
 
 def _has_meaningful_daily_activity(packet: dict[str, Any]) -> bool:
@@ -1171,13 +1313,13 @@ def _reject_staged_revision_for_retry(
         entry_changed = conn.execute(
             "UPDATE bnl_journal_entries SET lifecycle_state='rejected',review_reason=?,updated_at=? "
             "WHERE guild_id=? AND entry_id=? AND revision=? "
-            "AND lifecycle_state IN ('draft','approved_pending_delivery','delivery_failed')",
+            "AND lifecycle_state IN ('draft','prepared_exact','approved_pending_delivery','delivery_failed')",
             (reason, now, guild_id, entry_id, int(revision)),
         ).rowcount
         metadata_changed = conn.execute(
             "UPDATE bnl_journal_private_metadata SET lifecycle_state='rejected',updated_at=? "
             "WHERE guild_id=? AND entry_id=? AND revision=? "
-            "AND lifecycle_state IN ('draft','approved_pending_delivery','delivery_failed')",
+            "AND lifecycle_state IN ('draft','prepared_exact','approved_pending_delivery','delivery_failed')",
             (now, guild_id, entry_id, int(revision)),
         ).rowcount
         if entry_changed != 1 or metadata_changed != 1:
@@ -1208,7 +1350,12 @@ def _prepare_packet(
             AutomationResult(True, cadence, "published", "already_published", entry_id, int(existing["revision"]), packet["sourceWindowStart"], packet["sourceWindowEnd"], packet.get("aggregateCounts")),
         )
     existing_source_hash = ""
-    if existing and existing["lifecycle_state"] in {"draft", "approved_pending_delivery", "delivery_failed"}:
+    if existing and existing["lifecycle_state"] in {
+        "draft",
+        SCHEDULED_PREPARED_STATE,
+        "approved_pending_delivery",
+        "delivery_failed",
+    }:
         try:
             existing_metadata = json.loads(str(existing.get("metadata_json") or "{}"))
         except (TypeError, json.JSONDecodeError):
@@ -1232,7 +1379,11 @@ def _prepare_packet(
                 return AutomationResult(False, cadence, "busy", "preparation_epoch_superseded")
             existing = {**existing, "lifecycle_state": "rejected"}
 
-    if existing and existing["lifecycle_state"] in {"approved_pending_delivery", "delivery_failed"}:
+    if existing and existing["lifecycle_state"] in {
+        SCHEDULED_PREPARED_STATE,
+        "approved_pending_delivery",
+        "delivery_failed",
+    }:
         return _mark_prepared(
             db_path,
             guild_id,
@@ -1271,7 +1422,17 @@ def _prepare_packet(
                 db_path,
                 run_id,
                 preparation_epoch,
-                AutomationResult(False, cadence, "held", approved.reason, entry_id, int(existing["revision"]), packet["sourceWindowStart"], packet["sourceWindowEnd"], packet.get("aggregateCounts")),
+                AutomationResult(
+                    False,
+                    cadence,
+                    "held",
+                    approved.reason,
+                    "",
+                    0,
+                    packet["sourceWindowStart"],
+                    packet["sourceWindowEnd"],
+                    packet.get("aggregateCounts"),
+                ),
             )
         return _mark_prepared(
             db_path,
@@ -1303,7 +1464,17 @@ def _prepare_packet(
             db_path,
             run_id,
             preparation_epoch,
-            AutomationResult(False, cadence, "held", generated.reason, entry_id, generated.revision, packet["sourceWindowStart"], packet["sourceWindowEnd"], packet.get("aggregateCounts")),
+            AutomationResult(
+                False,
+                cadence,
+                "held",
+                generated.reason,
+                "",
+                0,
+                packet["sourceWindowStart"],
+                packet["sourceWindowEnd"],
+                packet.get("aggregateCounts"),
+            ),
         )
     approved = approve_draft(
         db_path,
@@ -1331,7 +1502,17 @@ def _prepare_packet(
             db_path,
             run_id,
             preparation_epoch,
-            AutomationResult(False, cadence, "held", approved.reason, entry_id, generated.revision, packet["sourceWindowStart"], packet["sourceWindowEnd"], packet.get("aggregateCounts")),
+            AutomationResult(
+                False,
+                cadence,
+                "held",
+                approved.reason,
+                "",
+                0,
+                packet["sourceWindowStart"],
+                packet["sourceWindowEnd"],
+                packet.get("aggregateCounts"),
+            ),
         )
     return _mark_prepared(
         db_path,
@@ -1380,7 +1561,7 @@ def _prepare_packet_safely(
                 cadence,
                 "held",
                 "journal_preparation_storage_failed",
-                _entry_id(guild_id, cadence, label),
+                "",
                 0,
                 str(packet.get("sourceWindowStart") or ""),
                 str(packet.get("sourceWindowEnd") or ""),
@@ -1465,12 +1646,14 @@ def _invalidate_prepared_in_transaction(
     ).fetchone()
     conn.execute(
         "UPDATE bnl_journal_entries SET lifecycle_state='rejected',review_reason=?,updated_at=? "
-        "WHERE guild_id=? AND entry_id=? AND revision=? AND lifecycle_state IN ('approved_pending_delivery','delivery_failed')",
+        "WHERE guild_id=? AND entry_id=? AND revision=? "
+        "AND lifecycle_state IN ('prepared_exact','approved_pending_delivery','delivery_failed')",
         (reason, now, guild_id, entry_id, int(revision)),
     )
     conn.execute(
         "UPDATE bnl_journal_private_metadata SET lifecycle_state='rejected',updated_at=? "
-        "WHERE guild_id=? AND entry_id=? AND revision=? AND lifecycle_state IN ('approved_pending_delivery','delivery_failed')",
+        "WHERE guild_id=? AND entry_id=? AND revision=? "
+        "AND lifecycle_state IN ('prepared_exact','approved_pending_delivery','delivery_failed')",
         (now, guild_id, entry_id, int(revision)),
     )
     packet_reset = (
@@ -1525,10 +1708,9 @@ def _claim_delivery(
     ensure_schema(db_path)
     run_id = _run_id(guild_id, cadence, start, end)
     now_dt = datetime.now(timezone.utc)
-    # A live delivery owner holds a SQLite write transaction across the POST so
-    # deletion and release have one serialization boundary. Read its lease
-    # before requesting our own write lock; concurrent triggers can then report
-    # ``busy`` immediately instead of waiting behind the network timeout.
+    # A caller-level Journal fence serializes this claim with the complete
+    # network/finalization interval. This read remains an inexpensive shortcut
+    # for direct tests and defensive callers.
     try:
         with sqlite3.connect(db_path) as read_conn:
             read_conn.row_factory = sqlite3.Row
@@ -1615,7 +1797,11 @@ def _claim_delivery(
             conn.commit()
             current.update({"lifecycle_state": "published", "reason": recovered.reason})
             return "complete", run_id, int(current.get("delivery_epoch") or 0), current
-        if not entry or str(entry[0]) not in {"approved_pending_delivery", "delivery_failed"}:
+        if not entry or str(entry[0]) not in {
+            SCHEDULED_PREPARED_STATE,
+            "approved_pending_delivery",
+            "delivery_failed",
+        }:
             _invalidate_prepared_in_transaction(
                 conn,
                 run_id,
@@ -1787,10 +1973,22 @@ def _finish_invalidated_delivery(
             retire_packet=result.reason.startswith("privacy_"),
         )
         conn.commit()
-    return result
+    return AutomationResult(
+        False,
+        result.cadence,
+        "held",
+        result.reason,
+        "",
+        0,
+        result.source_window_start,
+        result.source_window_end,
+        result.aggregate_counts,
+        result.http_status,
+        result.idempotent,
+    )
 
 
-def release_occurrence(
+def _release_occurrence_under_fence(
     db_path: str,
     guild_id: int,
     cadence: str,
@@ -1858,14 +2056,22 @@ def release_occurrence(
         }
 
         def final_delivery_preflight(conn: sqlite3.Connection) -> str:
+            durable_excluded_entry_ids, durable_exclusions_confirmed = (
+                _load_journal_memory_exclusions_on_connection(conn, guild_id)
+            )
+            effective_excluded_entry_ids = (
+                durable_excluded_entry_ids
+                if durable_exclusions_confirmed
+                else excluded_entry_ids
+            )
             private = conn.execute(
                 "SELECT m.metadata_json,e.canonical_payload_bytes "
                 "FROM bnl_journal_private_metadata m "
                 "JOIN bnl_journal_entries e "
                 "ON e.guild_id=m.guild_id AND e.entry_id=m.entry_id AND e.revision=m.revision "
                 "WHERE m.guild_id=? AND m.entry_id=? AND m.revision=? "
-                "AND m.lifecycle_state IN ('approved_pending_delivery','delivery_failed') "
-                "AND e.lifecycle_state IN ('approved_pending_delivery','delivery_failed')",
+                "AND m.lifecycle_state IN ('prepared_exact','approved_pending_delivery','delivery_failed') "
+                "AND e.lifecycle_state IN ('prepared_exact','approved_pending_delivery','delivery_failed')",
                 (guild_id, entry_id, revision),
             ).fetchone()
             if not private:
@@ -1891,7 +2097,7 @@ def release_occurrence(
                 conn,
                 guild_id,
                 metadata,
-                excluded_entry_ids,
+                effective_excluded_entry_ids,
             )
 
         try:
@@ -1972,6 +2178,46 @@ def release_occurrence(
         bool(finished.idempotent),
     )
     return finished
+
+
+def release_occurrence(
+    db_path: str,
+    guild_id: int,
+    cadence: str,
+    start: str,
+    end: str,
+    base_url: str,
+    api_key: str,
+    *,
+    force: bool = False,
+    opener=None,
+    memory_excluded_entry_ids: Optional[set[str]] = None,
+    memory_exclusions_confirmed: bool = True,
+) -> AutomationResult:
+    """Own claim, POST, and durable finalization under one narrow gate."""
+    with journal_release_privacy_fence(db_path, blocking=False) as acquired:
+        if not acquired:
+            return AutomationResult(
+                False,
+                cadence,
+                "busy",
+                "delivery_owner_in_progress",
+                source_window_start=start,
+                source_window_end=end,
+            )
+        return _release_occurrence_under_fence(
+            db_path,
+            guild_id,
+            cadence,
+            start,
+            end,
+            base_url,
+            api_key,
+            force=force,
+            opener=opener,
+            memory_excluded_entry_ids=memory_excluded_entry_ids,
+            memory_exclusions_confirmed=memory_exclusions_confirmed,
+        )
 
 
 def release_prepared_entry(
@@ -2187,8 +2433,6 @@ def release_daily(
         memory_excluded_entry_ids=memory_excluded_entry_ids,
         memory_exclusions_confirmed=memory_exclusions_confirmed,
     )
-    if result.status not in {"busy", "backoff"}:
-        _mark_observation(db_path, guild_id, label, result)
     return result
 
 

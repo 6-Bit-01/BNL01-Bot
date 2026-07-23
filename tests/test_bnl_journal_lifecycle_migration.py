@@ -254,6 +254,10 @@ class JournalLifecycleMigrationTests(unittest.TestCase):
             )
         self.assertTrue(metadata["legacyPreparedRevisionAdopted"])
         self.assertEqual(run["frozen_packet_hash"], metadata["frozenSourceHash"])
+        self.assertEqual(
+            "prepared_exact",
+            self.entry_row(entry_id, approved.revision)["lifecycle_state"],
+        )
 
         posted = []
 
@@ -332,7 +336,99 @@ class JournalLifecycleMigrationTests(unittest.TestCase):
         self.assertEqual("prepared_payload_unavailable", result.reason)
         self.assertEqual([], posts)
         self.assertEqual(
-            "approved_pending_delivery",
+            "prepared_exact",
+            self.entry_row(entry_id, approved.revision)["lifecycle_state"],
+        )
+
+    def test_invalid_legacy_adoption_clears_rejected_revision_everywhere(self):
+        packet = self.packet()
+        start, end, label = automation._daily_period_for_day(TARGET_DAY)
+        entry_id = automation._entry_id(1, "daily", label)
+        generated = journal.generate_and_store_packet_draft(
+            self.db,
+            1,
+            packet,
+            lambda current, _prompt: article_json(current),
+            entry_id=entry_id,
+        )
+        approved = journal.approve_draft(
+            self.db,
+            1,
+            entry_id,
+            generated.content_hash,
+            revision=generated.revision,
+        )
+        self.assertTrue(approved.ok, approved)
+        with sqlite3.connect(self.db) as conn:
+            conn.execute(
+                "UPDATE bnl_journal_entries SET source_window_start=? "
+                "WHERE guild_id=1 AND entry_id=? AND revision=?",
+                ("2000-01-01T00:00:00Z", entry_id, approved.revision),
+            )
+            now = journal.utc_now_iso()
+            conn.execute(
+                "INSERT INTO bnl_journal_observations("
+                "observation_id,guild_id,observation_date,source_window_start,"
+                "source_window_end,aggregate_counts_json,topic_counts_json,"
+                "subject_counts_json,representative_sources_json,lifecycle_state,"
+                "journal_entry_id,journal_revision,created_at,updated_at"
+                ") VALUES(?,?,?,?,?,'{}','{}','{}','[]','observed',NULL,0,?,?)",
+                (
+                    "legacy-invalid-observation",
+                    1,
+                    label,
+                    start,
+                    end,
+                    now,
+                    now,
+                ),
+            )
+        claim, run_id, epoch, _row = automation._claim_preparation(
+            self.db,
+            1,
+            "daily",
+            start,
+            end,
+            force=True,
+        )
+        self.assertEqual("claimed", claim)
+
+        result = automation._adopt_legacy_staged_revision(
+            self.db,
+            1,
+            run_id,
+            epoch,
+            "daily",
+            entry_id,
+            start,
+            end,
+            set(),
+        )
+
+        self.assertIsNotNone(result)
+        self.assertEqual("held", result.status, result)
+        self.assertEqual("legacy_source_window_mismatch", result.reason)
+        self.assertEqual("", result.entry_id)
+        self.assertEqual(0, result.revision)
+        run = self.run_row()
+        self.assertEqual("held", run["lifecycle_state"])
+        self.assertIsNone(run["journal_entry_id"])
+        self.assertEqual(0, run["journal_revision"])
+        with sqlite3.connect(self.db) as conn:
+            observation = conn.execute(
+                "SELECT lifecycle_state,journal_entry_id,journal_revision "
+                "FROM bnl_journal_observations WHERE guild_id=1 "
+                "AND observation_date=?",
+                (label,),
+            ).fetchone()
+            state = conn.execute(
+                "SELECT last_status,last_entry_id,last_revision "
+                "FROM bnl_journal_automation_state WHERE guild_id=1",
+            ).fetchone()
+        self.assertEqual(("held", None, 0), observation)
+        self.assertEqual(("held", "", 0), state)
+        self.assertEqual(
+            "rejected",
             self.entry_row(entry_id, approved.revision)["lifecycle_state"],
         )
 
@@ -355,6 +451,201 @@ class JournalLifecycleMigrationTests(unittest.TestCase):
         result = automation.result_dict(released)
         self.assertEqual(202, result["http_status"])
         self.assertTrue(result["idempotent"])
+
+    def test_persisted_guard_blocks_legacy_takeover_of_prepared_delivery(self):
+        prepared = self.prepare_daily()
+        self.assertEqual("prepared", prepared.status, prepared)
+        before = self.run_row()
+        canonical_before = bytes(
+            self.entry_row(prepared.entry_id, prepared.revision)[
+                "canonical_payload_bytes"
+            ]
+        )
+
+        def legacy_takeover():
+            with sqlite3.connect(self.db) as conn:
+                conn.execute(
+                    "UPDATE bnl_journal_automation_runs "
+                    "SET lifecycle_state='running',reason='',lease_expires_at=? "
+                    "WHERE run_id=?",
+                    ("2099-01-01T00:00:00Z", before["run_id"]),
+                )
+
+        with self.assertRaisesRegex(
+            sqlite3.IntegrityError,
+            "journal_prepared_release_downgrade_guard",
+        ):
+            legacy_takeover()
+        self.assertEqual("prepared", self.run_row()["lifecycle_state"])
+
+        with sqlite3.connect(self.db) as conn:
+            conn.execute(
+                "UPDATE bnl_journal_automation_runs "
+                "SET lifecycle_state='delivering',delivery_epoch=delivery_epoch+1,"
+                "delivery_lease_expires_at='2099-01-01T00:00:00Z' WHERE run_id=?",
+                (before["run_id"],),
+            )
+        with self.assertRaisesRegex(
+            sqlite3.IntegrityError,
+            "journal_prepared_release_downgrade_guard",
+        ):
+            legacy_takeover()
+        self.assertEqual("delivering", self.run_row()["lifecycle_state"])
+
+        with sqlite3.connect(self.db) as conn:
+            conn.execute(
+                "UPDATE bnl_journal_automation_runs "
+                "SET lifecycle_state='delivery_failed',delivery_lease_expires_at=NULL "
+                "WHERE run_id=?",
+                (before["run_id"],),
+            )
+        with self.assertRaisesRegex(
+            sqlite3.IntegrityError,
+            "journal_prepared_release_downgrade_guard",
+        ):
+            legacy_takeover()
+
+        after = self.run_row()
+        self.assertEqual("delivery_failed", after["lifecycle_state"])
+        self.assertEqual(before["journal_entry_id"], after["journal_entry_id"])
+        self.assertEqual(before["journal_revision"], after["journal_revision"])
+        self.assertEqual(
+            before["prepared_payload_hash"],
+            after["prepared_payload_hash"],
+        )
+        self.assertEqual(
+            canonical_before,
+            bytes(
+                self.entry_row(prepared.entry_id, prepared.revision)[
+                    "canonical_payload_bytes"
+                ]
+            ),
+        )
+
+    def test_downgrade_guard_allows_legacy_run_without_prepared_payload(self):
+        start, end, _label = automation._daily_period_for_day(
+            TARGET_DAY + timedelta(days=1)
+        )
+        run_id = automation._run_id(2, "daily", start, end)
+        now = journal.utc_now_iso()
+        with sqlite3.connect(self.db) as conn:
+            conn.execute(
+                "INSERT INTO bnl_journal_automation_runs("
+                "run_id,guild_id,cadence,source_window_start,source_window_end,"
+                "lifecycle_state,reason,aggregate_counts_json,attempt_count,"
+                "created_at,updated_at) "
+                "VALUES(?,?,?,?,?,'delivery_failed','legacy_failure','{}',1,?,?)",
+                (run_id, 2, "daily", start, end, now, now),
+            )
+            conn.execute(
+                "UPDATE bnl_journal_automation_runs "
+                "SET lifecycle_state='running' WHERE run_id=?",
+                (run_id,),
+            )
+            state = conn.execute(
+                "SELECT lifecycle_state FROM bnl_journal_automation_runs "
+                "WHERE run_id=?",
+                (run_id,),
+            ).fetchone()[0]
+        self.assertEqual("running", state)
+
+    def test_unfenced_legacy_delivery_cannot_see_scheduled_prepared_bytes(self):
+        prepared = self.prepare_daily()
+        self.assertEqual("prepared", prepared.status, prepared)
+        posts = []
+
+        def forbidden_opener(request, timeout=10):
+            posts.append(request.data)
+            raise AssertionError("legacy delivery reached scheduled prepared bytes")
+
+        delivered = journal.deliver_approved(
+            self.db,
+            1,
+            prepared.entry_id,
+            "https://site.example",
+            "key",
+            opener=forbidden_opener,
+            revision=prepared.revision,
+        )
+
+        self.assertFalse(delivered.ok)
+        self.assertEqual("not_deliverable", delivered.status)
+        self.assertEqual([], posts)
+        self.assertEqual("prepared", self.run_row()["lifecycle_state"])
+        self.assertEqual(
+            "prepared_exact",
+            self.entry_row(prepared.entry_id, prepared.revision)[
+                "lifecycle_state"
+            ],
+        )
+
+    def test_downgrade_guard_blocks_held_frozen_occurrence(self):
+        prepared = self.prepare_daily()
+        self.assertEqual("prepared", prepared.status, prepared)
+        before = self.run_row()
+        with sqlite3.connect(self.db) as conn:
+            conn.execute(
+                "UPDATE bnl_journal_automation_runs SET lifecycle_state='held',"
+                "reason='temporary_storage_failure' WHERE run_id=?",
+                (before["run_id"],),
+            )
+        with self.assertRaisesRegex(
+            sqlite3.IntegrityError,
+            "journal_prepared_release_downgrade_guard",
+        ):
+            with sqlite3.connect(self.db) as conn:
+                conn.execute(
+                    "UPDATE bnl_journal_automation_runs SET lifecycle_state='running' "
+                    "WHERE run_id=?",
+                    (before["run_id"],),
+                )
+        after = self.run_row()
+        self.assertEqual("held", after["lifecycle_state"])
+        self.assertEqual(before["frozen_packet_json"], after["frozen_packet_json"])
+        self.assertEqual(before["frozen_packet_hash"], after["frozen_packet_hash"])
+
+    def test_new_preparation_respects_live_legacy_running_lease(self):
+        day = TARGET_DAY + timedelta(days=1)
+        start, end, _label = automation._daily_period_for_day(day)
+        run_id = automation._run_id(2, "daily", start, end)
+        now = journal.utc_now_iso()
+        with sqlite3.connect(self.db) as conn:
+            conn.execute(
+                "INSERT INTO bnl_journal_automation_runs("
+                "run_id,guild_id,cadence,source_window_start,source_window_end,"
+                "lifecycle_state,reason,aggregate_counts_json,attempt_count,"
+                "lease_expires_at,created_at,updated_at) "
+                "VALUES(?,?,?,?,?,'running','','{}',1,?,?,?)",
+                (run_id, 2, "daily", start, end, "2099-01-01T00:00:00Z", now, now),
+            )
+
+        claim, _, epoch, _ = automation._claim_preparation(
+            self.db,
+            2,
+            "daily",
+            start,
+            end,
+            force=True,
+        )
+        self.assertEqual("busy", claim)
+        self.assertEqual(0, epoch)
+
+        with sqlite3.connect(self.db) as conn:
+            conn.execute(
+                "UPDATE bnl_journal_automation_runs SET lease_expires_at=? "
+                "WHERE run_id=?",
+                ("2000-01-01T00:00:00Z", run_id),
+            )
+        claim, _, epoch, _ = automation._claim_preparation(
+            self.db,
+            2,
+            "daily",
+            start,
+            end,
+            force=True,
+        )
+        self.assertEqual("claimed", claim)
+        self.assertEqual(1, epoch)
 
 
 if __name__ == "__main__":
