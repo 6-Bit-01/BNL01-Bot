@@ -91,6 +91,7 @@ BARCODE = SubjectIdentity("barcode", "BARCODE", ("BARCODE collective",))
 BARCODE_NETWORK = SubjectIdentity("barcode_network", "BARCODE Network")
 BARCODE_RADIO = SubjectIdentity("barcode_radio", "BARCODE Radio")
 SIX_BIT = SubjectIdentity("6_bit", "6 Bit", ("Six Bit",))
+GALAKNOISE = SubjectIdentity("galaknoise", "GALAKNOISE")
 BNL01 = SubjectIdentity("bnl_01", "BNL-01", ("BNL", "BARCODE Network Liaison Entity"))
 
 FOUNDING_MEMBERS = ("6 Bit", "DJ Floppydisc", "Cache Back", "Mac Modem")
@@ -104,7 +105,8 @@ BNL_ROLES = (
 CANON_FACTS = (
     CanonFact(BARCODE, "founding_members", FOUNDING_MEMBERS),
     CanonFact(BARCODE_NETWORK, "origin", "The music and collective existed before BARCODE Network; the Network grew around that signal and now connects music, live broadcasts, community, software, archive, characters, and story."),
-    CanonFact(SIX_BIT, "primary_identity", "artist, producer, host, and founding BARCODE member first"),
+    CanonFact(SIX_BIT, "primary_identity", "artist, MC, host, and founding BARCODE member first"),
+    CanonFact(GALAKNOISE, "primary_role", "music producer for BARCODE"),
     CanonFact(BARCODE_RADIO, "public_nature", "real weekly live broadcast and community music space on TikTok"),
     CanonFact(BARCODE_RADIO, "friday_public_schedule", FRIDAY_PUBLIC_SCHEDULE),
     CanonFact(BNL01, "identity", "BARCODE Network Liaison Entity: an unfinished but active intelligence and one shared mind with filtered surfaces"),
@@ -188,7 +190,8 @@ def render_prompt_canon_block() -> str:
         "## CANONICAL FACTS — DO NOT ALTER",
         f"- BARCODE began as the four-member digital hip-hop collective of: {', '.join(FOUNDING_MEMBERS)}.",
         "- The music and collective existed before BARCODE Network; the Network grew around that signal and now connects music, live broadcasts, community, software, archive, characters, and story.",
-        "- 6 Bit is an artist, producer, host, and founding BARCODE member first.",
+        "- 6 Bit is an artist, MC, host, and founding BARCODE member first; he is not the music producer.",
+        "- GALAKNOISE is BARCODE's music producer.",
         "- BARCODE Radio is a real weekly live broadcast and community music space on TikTok.",
         f"- Current public Friday schedule: submissions/intake begins at {FRIDAY_PUBLIC_SCHEDULE.intake_begins}; the show begins at {FRIDAY_PUBLIC_SCHEDULE.show_begins}; the first track is targeted for {FRIDAY_PUBLIC_SCHEDULE.first_track_target}.",
         "- You are the BARCODE Network Liaison Entity: an unfinished but active intelligence and one shared mind with filtered surfaces.",

@@ -8,7 +8,8 @@ This PR adds a small typed vocabulary for approved in-world canon and source saf
 
 - BARCODE began as the four-member digital hip-hop collective of 6 Bit, DJ Floppydisc, Cache Back, and Mac Modem.
 - The music and collective existed before BARCODE Network; the Network grew around that signal.
-- 6 Bit is an artist, producer, host, and founding BARCODE member first.
+- 6 Bit is an artist, MC, host, and founding BARCODE member first; he is not the music producer.
+- GALAKNOISE is BARCODE's music producer.
 - BARCODE Radio is a real weekly live broadcast/community music space on TikTok.
 - Friday public schedule is immutable contract data: intake/submissions at 6:40 PM Pacific, show start at 7:00 PM Pacific, and first-track target at 7:05 PM Pacific.
 - BNL-01 remains an in-world BARCODE Network Liaison Entity with filtered surfaces and incomplete-record behavior.

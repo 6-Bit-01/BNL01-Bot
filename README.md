@@ -46,6 +46,22 @@ Activation order is site first, bot second:
 
 Show-day copy follows the same boundary. The 6:40 PM Pacific intake message names the native queue only when both gates are usable; otherwise it uses provider-neutral public-intake wording. The 7:00 PM message describes the scheduled broadcast window without claiming unverified live state, and the later sponsor message remains optional and host-controlled.
 
+Holiday and occasion reflections use the existing Ambient coordinator and active
+liaison channel. The maintained calendar targets 10:00 AM Pacific, stores each
+occurrence and canonical payload in the bot database before delivery, and
+retries provider or Discord failures without consuming ordinary Ambient
+capacity. Major/cultural dates take precedence, while owner-established
+BARCODE-relevant dates are curated from source-backed radio, sound, music,
+archive, communication, and technology observances or milestones. A roughly
+two-week gap is a selection guide, not an automatic filler rule; the curated
+layer is limited to twelve real dates. Three house
+traditions—Open Channel Day, Archive Pulse Day, and Scan Day—are layered onto
+real dates and are not claims about historical BARCODE anniversaries.
+`BNL_OCCASION_POSTS_ENABLED` defaults on and can be set to `false` to cancel
+unpublished occurrences. `BNL_OCCASION_DISABLED_IDS` accepts a comma-separated
+list of calendar IDs for per-occurrence cancellation. These controls do not
+activate queue access, Journal reuse, or any memory-v2 live gate.
+
 Importing `bnl01_bot` does not create a Gemini client or open provider transports. The client is created and cached on the first generation request, so tests, diagnostics, and tooling can import the runtime without valid provider networking.
 
 Run the bot only after the deployment environment is configured:
