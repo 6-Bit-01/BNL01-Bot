@@ -16,7 +16,7 @@ import bnl_journal_source_store as source_store
 from tests.test_bnl_journal_prepared_release import AcceptedResponse, article_json
 
 
-TARGET_DAY = date(2026, 7, 19)
+TARGET_DAY = date(2026, 7, 20)
 
 
 class JournalLifecycleMigrationTests(unittest.TestCase):

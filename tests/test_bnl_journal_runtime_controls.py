@@ -4,6 +4,7 @@ import os
 import sqlite3
 import tempfile
 import unittest
+from datetime import datetime
 from unittest import mock
 
 import bnl_journal as journal
@@ -59,12 +60,102 @@ class JournalRuntimeControlTests(unittest.TestCase):
             self.assertEqual(action, options["action"])
             self.assertEqual("", error)
 
-    def test_daily_worker_is_pinned_to_seven_pm_pacific(self):
-        scheduled_times = bnl01_bot.journal_daily_schedule_task.time
-        self.assertEqual(1, len(scheduled_times))
-        scheduled = scheduled_times[0]
-        self.assertEqual((19, 0), (scheduled.hour, scheduled.minute))
-        self.assertEqual("America/Los_Angeles", getattr(scheduled.tzinfo, "key", ""))
+    def test_workers_are_pinned_to_six_thirty_and_seven_pm_pacific(self):
+        preparation_times = bnl01_bot.journal_preparation_schedule_task.time
+        release_times = bnl01_bot.journal_daily_schedule_task.time
+        self.assertEqual(1, len(preparation_times))
+        self.assertEqual(1, len(release_times))
+        preparation = preparation_times[0]
+        release = release_times[0]
+        self.assertEqual((18, 30), (preparation.hour, preparation.minute))
+        self.assertEqual((19, 0), (release.hour, release.minute))
+        self.assertEqual(
+            "America/Los_Angeles",
+            getattr(preparation.tzinfo, "key", ""),
+        )
+        self.assertEqual(
+            "America/Los_Angeles",
+            getattr(release.tzinfo, "key", ""),
+        )
+
+    def test_preparation_budget_finishes_before_release_lane(self):
+        at_close = bnl01_bot.PACIFIC_TZ.localize(
+            datetime(2026, 7, 21, 18, 30, 0)
+        )
+        near_release = bnl01_bot.PACIFIC_TZ.localize(
+            datetime(2026, 7, 21, 18, 59, 50)
+        )
+        self.assertEqual(
+            float(bnl01_bot.JOURNAL_PREPARATION_MAX_SECONDS),
+            bnl01_bot._journal_preparation_budget_seconds(at_close),
+        )
+        self.assertEqual(
+            5.0,
+            bnl01_bot._journal_preparation_budget_seconds(near_release),
+        )
+
+    def test_exact_phase_dispatch_prepares_with_generator_and_releases_without_one(self):
+        flags = {
+            "journalAutoPublishEnabled": True,
+            "journalDailyEnabled": True,
+            "journalWeeklyEnabled": True,
+        }
+        prepared_result = AutomationResult(
+            True,
+            "daily",
+            "prepared",
+            source_window_start="2026-07-21T01:30:00Z",
+            source_window_end="2026-07-22T01:30:00Z",
+        )
+        released_result = AutomationResult(
+            True,
+            "daily",
+            "published",
+            source_window_start="2026-07-21T01:30:00Z",
+            source_window_end="2026-07-22T01:30:00Z",
+        )
+        bounded_generator = object()
+        with mock.patch.object(bnl01_bot, "BNL_JOURNAL_AUTOMATION_ENABLED", True), \
+             mock.patch.object(bnl01_bot, "resolve_network_guild_id", return_value=1), \
+             mock.patch.object(bnl01_bot, "DB_FILE", "test.db"), \
+             mock.patch.object(bnl01_bot, "BNL_API_KEY", "key"), \
+             mock.patch.object(bnl01_bot, "_journal_website_base_url", return_value="https://site.example"), \
+             mock.patch.object(bnl01_bot, "_bounded_journal_preparation_generator", return_value=bounded_generator) as bounded, \
+             mock.patch.object(bnl01_bot, "prepare_scheduled_journal_automation", return_value=[prepared_result]) as prepare, \
+             mock.patch.object(bnl01_bot, "release_scheduled_journal_automation", return_value=[released_result]) as release:
+            prepared = asyncio.run(
+                bnl01_bot.run_journal_automation_once(
+                    1,
+                    cadence="scheduled",
+                    phase="prepare",
+                    flags=flags,
+                )
+            )
+            released = asyncio.run(
+                bnl01_bot.run_journal_automation_once(
+                    1,
+                    cadence="scheduled",
+                    phase="release",
+                    flags=flags,
+                )
+            )
+
+        bounded.assert_called_once_with()
+        prepare.assert_called_once_with(
+            "test.db",
+            1,
+            bounded_generator,
+            flags,
+        )
+        release.assert_called_once_with(
+            "test.db",
+            1,
+            "https://site.example",
+            "key",
+            flags,
+        )
+        self.assertEqual("prepared", prepared[0]["status"])
+        self.assertEqual("published", released[0]["status"])
 
     def test_control_get_uses_api_key_and_expected_endpoint(self):
         captured = []
@@ -298,6 +389,7 @@ class JournalRuntimeControlTests(unittest.TestCase):
         runner.assert_awaited_once_with(
             1,
             cadence="scheduled",
+            phase="recover",
             force=False,
             flags={**cached_flags, "journalMemoryExclusionsConfirmed": False},
         )

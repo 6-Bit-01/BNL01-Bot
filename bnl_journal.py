@@ -1806,6 +1806,83 @@ def _sample_source_kinds(
     return sorted(chosen, key=_source_sort_key)
 
 
+def _source_period_partitions(
+    period_bounds: list[dict[str, Any]],
+    relays: list[dict[str, Any]],
+    conversations: list[dict[str, Any]],
+    *,
+    eligible_ref_ids: Optional[set[str]] = None,
+) -> list[dict[str, Any]]:
+    """Describe ordered source-only periods from one already-loaded raw range.
+
+    Weekly cadence assembly uses these bounded, non-prose contexts so it can
+    account for each aligned period without re-querying the source archive or
+    manufacturing a hidden Daily article.
+    """
+    partitions: list[dict[str, Any]] = []
+    for spec in period_bounds:
+        start = str(spec.get("sourceWindowStart") or "")
+        end = str(spec.get("sourceWindowEnd") or "")
+        try:
+            start_dt = _parse_context_datetime(start)
+            end_dt = _parse_context_datetime(end)
+        except (TypeError, ValueError):
+            start_dt = None
+            end_dt = None
+        if start_dt is None or end_dt is None or end_dt <= start_dt:
+            raise ValueError("invalid_source_period_partition")
+
+        def in_period(source: dict[str, Any]) -> bool:
+            observed = _parse_context_datetime(source.get("observedAt"))
+            return observed is not None and start_dt <= observed < end_dt
+
+        period_relays = [source for source in relays if in_period(source)]
+        period_conversations = [source for source in conversations if in_period(source)]
+        ordered = sorted(period_relays + period_conversations, key=_source_sort_key)
+        eligible_ordered = [
+            source
+            for source in ordered
+            if eligible_ref_ids is None
+            or str(source.get("refId") or "") in eligible_ref_ids
+        ]
+        representative_refs = [
+            str(source.get("refId") or "")
+            for source in _evenly_sample(
+                eligible_ordered,
+                min(12, len(eligible_ordered)),
+            )
+            if str(source.get("refId") or "")
+        ]
+        safe_topics = [
+            _source_for_prompt(source)
+            for source in ordered
+            if str(source.get("summary") or "").strip()
+        ]
+        partitions.append(
+            {
+                "periodId": str(spec.get("periodId") or ""),
+                "periodKind": str(spec.get("periodKind") or "daily_period"),
+                "releaseDay": str(spec.get("releaseDay") or ""),
+                "sourceWindowStart": start,
+                "sourceWindowEnd": end,
+                "aggregateCounts": {
+                    "eligibleRelays": len(period_relays),
+                    "eligibleConversations": len(period_conversations),
+                    "participants": len(
+                        {
+                            source.get("subjectRef")
+                            for source in period_conversations
+                            if source.get("subjectRef")
+                        }
+                    ),
+                },
+                "topicTags": list(journal_topic_counts(safe_topics, limit=12)),
+                "sourceRefIds": representative_refs,
+            }
+        )
+    return partitions
+
+
 def build_packet_from_sources(
     db_path: str,
     guild_id: int,
@@ -1912,6 +1989,7 @@ def build_source_packet_between(
     entry_kind: str = "daily",
     observation_context: Optional[list[dict[str, Any]]] = None,
     excluded_history_entry_ids: Optional[set[str]] = None,
+    source_period_bounds: Optional[list[dict[str, Any]]] = None,
 ) -> dict[str, Any]:
     try:
         from bnl_journal_source_store import backfill_legacy_sources, query_source_events, timestamp_to_epoch_ms
@@ -1983,6 +2061,17 @@ def build_source_packet_between(
                 else True
             ),
         )
+        if source_period_bounds:
+            packet["sourcePeriodPartitions"] = _source_period_partitions(
+                source_period_bounds,
+                relays,
+                conversations,
+                eligible_ref_ids={
+                    str(source.get("refId") or "")
+                    for source in packet.get("safeSources", [])
+                    if str(source.get("refId") or "")
+                },
+            )
         packet["sourceArchiveAvailable"] = True
         return packet
     except (ImportError, sqlite3.Error, ValueError):
@@ -2011,6 +2100,17 @@ def build_source_packet_between(
         excluded_history_entry_ids=excluded_history_entry_ids,
         coverage_complete=relay_count <= MAX_RELAY_SOURCES_PER_WINDOW and conversation_count <= MAX_CONVERSATION_SOURCES_PER_WINDOW,
     )
+    if source_period_bounds:
+        packet["sourcePeriodPartitions"] = _source_period_partitions(
+            source_period_bounds,
+            relays,
+            conversations,
+            eligible_ref_ids={
+                str(source.get("refId") or "")
+                for source in packet.get("safeSources", [])
+                if str(source.get("refId") or "")
+            },
+        )
     packet["sourceArchiveAvailable"] = False
     return packet
 
@@ -2090,12 +2190,13 @@ def build_generation_prompt(packet: dict[str, Any], *, repair_reason: str = "", 
         },
         "history": _bounded_history_for_prompt(packet.get("history", {})),
         "aggregateCounts": packet.get("aggregateCounts", {}),
-        "dailyObservations": packet.get("observationContext", [])[:7],
+        "dailyObservations": packet.get("weeklyDailyPeriodContexts", packet.get("observationContext", []))[:6],
+        "weeklyFinalPeriod": packet.get("weeklyFinalPeriodContext"),
         "windowSegmentActivity": packet.get("windowSegmentActivity", []),
         "privateGenerationContextLanes": context_lanes,
     }
     cadence_rule = (
-        "\nThis is a weekly synthesis. Connect patterns across the supplied daily observations and current source evidence; do not merely list seven daily recaps."
+        "\nThis is a weekly synthesis. Connect patterns across the six supplied Tuesday-Sunday Daily-period contexts, the fresh final Sunday-to-Monday period, and the full current source evidence. A source-only period context is not a hidden Daily article. Do not list period recaps."
         if entry_kind == "weekly"
         else "\nThis is a daily chronicle covering one complete source window. Distill the day instead of listing every relay."
     )
@@ -2769,7 +2870,13 @@ def _generate_article_with_repairs(
         except Exception as exc:
             if retained_publishable is not None:
                 return retained_publishable, "", True
-            reason = "quota_unavailable" if "quota" in str(exc).lower() else "provider_failure"
+            lowered = str(exc).lower()
+            if "quota" in lowered:
+                reason = "quota_unavailable"
+            elif "journal_preparation_timeout" in lowered:
+                reason = "journal_preparation_timeout"
+            else:
+                reason = "provider_failure"
             return None, reason, False
         previous_output = raw
         try:

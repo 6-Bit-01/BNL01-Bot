@@ -15,7 +15,7 @@ import bnl_journal_source_store as source_store
 from tests.test_bnl_journal_prepared_release import AcceptedResponse, article_json
 
 
-TARGET_DAY = date(2026, 7, 19)
+TARGET_DAY = date(2026, 7, 20)
 WEEK_START = date(2026, 7, 13)
 
 
@@ -299,6 +299,8 @@ class JournalReleaseInvalidationTests(unittest.TestCase):
         for offset in range(7):
             day = WEEK_START + timedelta(days=offset)
             self.add_day(day)
+            if offset == 6:
+                continue
             published = automation.run_daily(
                 self.db,
                 1,
@@ -335,7 +337,7 @@ class JournalReleaseInvalidationTests(unittest.TestCase):
                     (prepared.entry_id, prepared.revision),
                 ).fetchone()[0]
             )
-        self.assertEqual(7, len(daily_entry_ids))
+        self.assertEqual(6, len(daily_entry_ids))
         self.assertTrue(daily_entry_ids <= set(metadata["relatedPriorJournalEntryIds"]))
         excluded_entry_id = sorted(daily_entry_ids)[0]
         automation.store_journal_memory_exclusions(
@@ -408,7 +410,7 @@ class JournalReleaseInvalidationTests(unittest.TestCase):
     def test_used_broadcast_memory_expiring_after_preparation_blocks_post(self):
         # TARGET_DAY ends before this date expires, so the memory may be used
         # during preparation. At the patched release instant it is stale.
-        self.add_broadcast_memory(valid_until="2026-07-21")
+        self.add_broadcast_memory(valid_until="2026-07-22")
         self.add_day(TARGET_DAY)
         prepared = self.prepare_daily(self.memory_generator)
         self.assertEqual("prepared", prepared.status, prepared)
@@ -419,7 +421,7 @@ class JournalReleaseInvalidationTests(unittest.TestCase):
             posts.append(request.data)
             raise AssertionError("expired established memory reached the website")
 
-        with patch.object(automation, "utc_now_iso", return_value="2026-07-22T12:00:00Z"):
+        with patch.object(automation, "utc_now_iso", return_value="2026-07-23T12:00:00Z"):
             result = self.release_daily(forbidden_opener)
         self.assertEqual("held", result.status, result)
         self.assertEqual("privacy_memory_ineligible", result.reason)
