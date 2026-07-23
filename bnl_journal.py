@@ -14,6 +14,9 @@ PUBLIC_POLICIES = {"public_home", "public_context", "public_selective"}
 STATES = {"draft", "rejected", "approved_pending_delivery", "published", "delivery_failed"}
 JOURNAL_ROUTE = "bnl_journal_generation"
 JOURNAL_GENERATION_ATTEMPTS = 4
+# Must match the website receiver's raw UTF-8 request-body limit. The complete
+# serialized envelope is measured; article text is never truncated to fit it.
+JOURNAL_SITE_REQUEST_BODY_MAX_BYTES = 24_000
 ADVISORY_VALIDATION_REASONS = frozenset({
     "overly_clinical_voice",
     "flat_report_voice",
@@ -195,6 +198,11 @@ def _json(obj: Any) -> str:
     return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 
 
+def canonical_payload_hash(payload: bytes) -> str:
+    """Hash the exact request bytes, independently of the public content hash."""
+    return hashlib.sha256(bytes(payload)).hexdigest()
+
+
 def _norm(text: str) -> str:
     return re.sub(r"\s+", " ", re.sub(r"[^a-z0-9]+", " ", (text or "").lower())).strip()
 
@@ -316,7 +324,7 @@ def purge_user_journal_derivatives_on_connection(
             )
             counts["bnl_journal_observations_scrubbed"] = counts.get("bnl_journal_observations_scrubbed", 0) + 1
 
-    unpublished: list[tuple[str, int]] = []
+    unpublished: set[tuple[str, int]] = set()
     if table_exists(conn, "bnl_journal_private_metadata"):
         has_entries = table_exists(conn, "bnl_journal_entries")
         if has_entries:
@@ -348,7 +356,7 @@ def purge_user_journal_derivatives_on_connection(
                 continue
             key = (str(entry_id), int(revision))
             if str(lifecycle_state or "") != "published":
-                unpublished.append(key)
+                unpublished.add(key)
                 continue
 
             target_ref_ids = {str(item.get("refId")) for item in target_supporting if item.get("refId")}
@@ -383,12 +391,122 @@ def purge_user_journal_derivatives_on_connection(
             )
             counts["bnl_journal_published_metadata_scrubbed"] = counts.get("bnl_journal_published_metadata_scrubbed", 0) + 1
 
+    run_columns: set[str] = set()
+    run_records: list[dict[str, Any]] = []
+    affected_run_ids: set[str] = set()
+    if table_exists(conn, "bnl_journal_automation_runs"):
+        run_columns = _cols(conn, "bnl_journal_automation_runs")
+        selected_columns = [
+            column
+            for column in (
+                "run_id", "lifecycle_state", "journal_entry_id", "journal_revision",
+                "cadence", "source_window_start", "source_window_end", "frozen_packet_json",
+            )
+            if column in run_columns
+        ]
+        if {"run_id", "guild_id"} <= run_columns:
+            rows = conn.execute(
+                f"SELECT {','.join(selected_columns)} FROM bnl_journal_automation_runs WHERE guild_id=?",
+                (guild,),
+            ).fetchall()
+            run_records = [dict(zip(selected_columns, row)) for row in rows]
+
+        # The packet is private preparation state even when the final article
+        # did not cite this member. An unpublished occurrence that contains the
+        # deleted subject must lose both its packet and any staged revision.
+        if "frozen_packet_json" in run_columns:
+            for run in run_records:
+                raw_packet = str(run.get("frozen_packet_json") or "")
+                if not raw_packet:
+                    continue
+                try:
+                    frozen_packet = json.loads(raw_packet)
+                except (TypeError, json.JSONDecodeError):
+                    continue
+                if not _contains_exact_json_scalar(frozen_packet, subject_ref):
+                    continue
+
+                run_id = str(run.get("run_id") or "")
+                if str(run.get("lifecycle_state") or "") == "published":
+                    # Published public prose and its immutable revision remain;
+                    # only the now-ineligible private packet is discarded.
+                    assignments = [
+                        f"{column}=NULL"
+                        for column in ("frozen_packet_json", "frozen_packet_hash", "packet_frozen_at")
+                        if column in run_columns
+                    ]
+                    params: list[Any] = []
+                    if "updated_at" in run_columns:
+                        assignments.append("updated_at=?")
+                        params.append(now)
+                    if assignments:
+                        params.extend((guild, run_id))
+                        changed = conn.execute(
+                            f"UPDATE bnl_journal_automation_runs SET {','.join(assignments)} "
+                            "WHERE guild_id=? AND run_id=? AND lifecycle_state='published'",
+                            tuple(params),
+                        ).rowcount
+                        counts["bnl_journal_published_packets_scrubbed"] = counts.get(
+                            "bnl_journal_published_packets_scrubbed", 0
+                        ) + changed
+                    continue
+
+                affected_run_ids.add(run_id)
+                entry_id = str(run.get("journal_entry_id") or "")
+                revision = int(run.get("journal_revision") or 0)
+                if entry_id and revision > 0:
+                    published_link = False
+                    if table_exists(conn, "bnl_journal_entries"):
+                        state = conn.execute(
+                            "SELECT lifecycle_state FROM bnl_journal_entries "
+                            "WHERE guild_id=? AND entry_id=? AND revision=?",
+                            (guild, entry_id, revision),
+                        ).fetchone()
+                        published_link = bool(state and str(state[0]) == "published")
+                    if not published_link and table_exists(conn, "bnl_journal_private_metadata"):
+                        state = conn.execute(
+                            "SELECT lifecycle_state FROM bnl_journal_private_metadata "
+                            "WHERE guild_id=? AND entry_id=? AND revision=?",
+                            (guild, entry_id, revision),
+                        ).fetchone()
+                        published_link = bool(state and str(state[0]) == "published")
+                    if not published_link:
+                        unpublished.add((entry_id, revision))
+
+        # Before packet persistence, the cited private metadata was the only
+        # durable route from a staged revision back to its occurrence owner.
+        for run in run_records:
+            link = (
+                str(run.get("journal_entry_id") or ""),
+                int(run.get("journal_revision") or 0),
+            )
+            if str(run.get("lifecycle_state") or "") != "published" and link in unpublished:
+                affected_run_ids.add(str(run.get("run_id") or ""))
+
+    # A preparation worker stores its run identity in private metadata before
+    # the occurrence row is linked to the revision. If deletion lands in that
+    # narrow interval, remove the staged revision by that identity as well.
+    if affected_run_ids and table_exists(conn, "bnl_journal_private_metadata"):
+        rows = conn.execute(
+            "SELECT entry_id,revision,metadata_json,lifecycle_state "
+            "FROM bnl_journal_private_metadata WHERE guild_id=?",
+            (guild,),
+        ).fetchall()
+        for entry_id, revision, metadata_raw, lifecycle_state in rows:
+            metadata = _json_object(metadata_raw)
+            if (
+                str(metadata.get("automationRunId") or "") in affected_run_ids
+                and str(lifecycle_state or "") != "published"
+            ):
+                unpublished.add((str(entry_id), int(revision)))
+
     if unpublished:
-        for entry_id, revision in sorted(set(unpublished)):
-            counts["bnl_journal_unpublished_metadata_deleted"] = counts.get("bnl_journal_unpublished_metadata_deleted", 0) + conn.execute(
-                "DELETE FROM bnl_journal_private_metadata WHERE guild_id=? AND entry_id=? AND revision=?",
-                (guild, entry_id, revision),
-            ).rowcount
+        for entry_id, revision in sorted(unpublished):
+            if table_exists(conn, "bnl_journal_private_metadata"):
+                counts["bnl_journal_unpublished_metadata_deleted"] = counts.get("bnl_journal_unpublished_metadata_deleted", 0) + conn.execute(
+                    "DELETE FROM bnl_journal_private_metadata WHERE guild_id=? AND entry_id=? AND revision=?",
+                    (guild, entry_id, revision),
+                ).rowcount
             if table_exists(conn, "bnl_journal_entries"):
                 counts["bnl_journal_unpublished_entries_deleted"] = counts.get("bnl_journal_unpublished_entries_deleted", 0) + conn.execute(
                     "DELETE FROM bnl_journal_entries WHERE guild_id=? AND entry_id=? AND revision=? AND lifecycle_state<>'published'",
@@ -401,15 +519,6 @@ def purge_user_journal_derivatives_on_connection(
                        WHERE guild_id=? AND journal_entry_id=? AND journal_revision=?""",
                     (now, guild, entry_id, revision),
                 )
-            if table_exists(conn, "bnl_journal_automation_runs"):
-                counts["bnl_journal_automation_runs_invalidated"] = counts.get("bnl_journal_automation_runs_invalidated", 0) + conn.execute(
-                    """UPDATE bnl_journal_automation_runs
-                       SET lifecycle_state='held',reason='privacy_source_deleted',journal_entry_id=NULL,
-                           journal_revision=0,lease_expires_at=NULL,updated_at=?
-                       WHERE guild_id=? AND journal_entry_id=? AND journal_revision=?
-                         AND lifecycle_state<>'published'""",
-                    (now, guild, entry_id, revision),
-                ).rowcount
             if table_exists(conn, "bnl_journal_automation_state"):
                 conn.execute(
                     """UPDATE bnl_journal_automation_state
@@ -417,7 +526,177 @@ def purge_user_journal_derivatives_on_connection(
                        WHERE guild_id=? AND last_entry_id=? AND last_revision=?""",
                     (now, guild, entry_id, revision),
                 )
+
+    if affected_run_ids and run_columns:
+        records_by_id = {str(run.get("run_id") or ""): run for run in run_records}
+        observation_columns = (
+            _cols(conn, "bnl_journal_observations")
+            if table_exists(conn, "bnl_journal_observations")
+            else set()
+        )
+        state_columns = (
+            _cols(conn, "bnl_journal_automation_state")
+            if table_exists(conn, "bnl_journal_automation_state")
+            else set()
+        )
+        for run_id in sorted(affected_run_ids):
+            if not run_id:
+                continue
+            run = records_by_id.get(run_id, {})
+            entry_id = str(run.get("journal_entry_id") or "")
+            revision = int(run.get("journal_revision") or 0)
+
+            # A frozen packet may be invalidated before a revision exists, so
+            # reset the matching daily observation by window as well as link.
+            if {
+                "guild_id", "source_window_start", "source_window_end", "lifecycle_state",
+                "journal_entry_id", "journal_revision", "updated_at",
+            } <= observation_columns:
+                conn.execute(
+                    "UPDATE bnl_journal_observations SET lifecycle_state='observed',"
+                    "journal_entry_id=NULL,journal_revision=0,updated_at=? "
+                    "WHERE guild_id=? AND source_window_start=? AND source_window_end=? "
+                    "AND lifecycle_state<>'published'",
+                    (
+                        now,
+                        guild,
+                        str(run.get("source_window_start") or ""),
+                        str(run.get("source_window_end") or ""),
+                    ),
+                )
+
+            assignments: list[str] = []
+            if "lifecycle_state" in run_columns:
+                assignments.append("lifecycle_state='held'")
+            if "reason" in run_columns:
+                assignments.append("reason='privacy_source_deleted'")
+            for column, expression in (
+                ("journal_entry_id", "NULL"),
+                ("journal_revision", "0"),
+                ("lease_expires_at", "NULL"),
+                ("frozen_packet_json", "NULL"),
+                ("frozen_packet_hash", "NULL"),
+                ("packet_frozen_at", "NULL"),
+                ("prepared_payload_hash", "NULL"),
+                ("prepared_payload_bytes", "0"),
+                ("prepared_at", "NULL"),
+                ("delivery_lease_expires_at", "NULL"),
+            ):
+                if column in run_columns:
+                    assignments.append(f"{column}={expression}")
+            if "preparation_epoch" in run_columns:
+                assignments.append("preparation_epoch=COALESCE(preparation_epoch,0)+1")
+            if "delivery_epoch" in run_columns:
+                assignments.append("delivery_epoch=COALESCE(delivery_epoch,0)+1")
+            params: list[Any] = []
+            if "updated_at" in run_columns:
+                assignments.append("updated_at=?")
+                params.append(now)
+            if assignments and {"guild_id", "run_id", "lifecycle_state"} <= run_columns:
+                params.extend((guild, run_id))
+                changed = conn.execute(
+                    f"UPDATE bnl_journal_automation_runs SET {','.join(assignments)} "
+                    "WHERE guild_id=? AND run_id=? AND lifecycle_state<>'published'",
+                    tuple(params),
+                ).rowcount
+                counts["bnl_journal_automation_runs_invalidated"] = counts.get(
+                    "bnl_journal_automation_runs_invalidated", 0
+                ) + changed
+
+            # Keep the existing website-facing run telemetry truthful without
+            # requiring any newly migrated automation-state columns.
+            state_assignments: list[str] = []
+            state_params: list[Any] = []
+            for column, value in (
+                ("last_status", "held"),
+                ("last_reason", "privacy_source_deleted"),
+                ("last_entry_id", ""),
+            ):
+                if column in state_columns:
+                    state_assignments.append(f"{column}=?")
+                    state_params.append(value)
+            if "last_revision" in state_columns:
+                state_assignments.append("last_revision=0")
+            if "next_retry_at" in state_columns:
+                state_assignments.append("next_retry_at=NULL")
+            if "updated_at" in state_columns:
+                state_assignments.append("updated_at=?")
+                state_params.append(now)
+            where_parts: list[str] = []
+            where_params: list[Any] = []
+            if entry_id and revision > 0 and {"last_entry_id", "last_revision"} <= state_columns:
+                where_parts.append("(last_entry_id=? AND last_revision=?)")
+                where_params.extend((entry_id, revision))
+            if {"last_cadence", "last_source_window_start", "last_source_window_end"} <= state_columns:
+                where_parts.append("(last_cadence=? AND last_source_window_start=? AND last_source_window_end=?)")
+                where_params.extend((
+                    str(run.get("cadence") or ""),
+                    str(run.get("source_window_start") or ""),
+                    str(run.get("source_window_end") or ""),
+                ))
+            if state_assignments and where_parts and "guild_id" in state_columns:
+                conn.execute(
+                    f"UPDATE bnl_journal_automation_state SET {','.join(state_assignments)} "
+                    f"WHERE guild_id=? AND ({' OR '.join(where_parts)})",
+                    tuple(state_params + [guild] + where_params),
+                )
     return {key: int(value or 0) for key, value in counts.items() if int(value or 0)}
+
+
+def purge_guild_journal_derivatives_on_connection(
+    conn: sqlite3.Connection,
+    guild_id: int,
+) -> dict[str, int]:
+    """Scrub every member-derived hidden Journal record for one guild."""
+    guild = int(guild_id)
+    if guild <= 0:
+        raise ValueError("invalid_journal_privacy_scope")
+    user_ids: set[int] = set()
+
+    def collect(value: Any) -> None:
+        for match in re.finditer(r"discord_user:(\d+)", str(value or "")):
+            user_id = int(match.group(1))
+            if user_id > 0:
+                user_ids.add(user_id)
+
+    if table_exists(conn, "bnl_journal_source_events"):
+        for row in conn.execute(
+            "SELECT subject_ref FROM bnl_journal_source_events "
+            "WHERE guild_id=? AND source_kind='discord_message'",
+            (guild,),
+        ).fetchall():
+            collect(row[0])
+    for table, columns in (
+        ("bnl_journal_private_metadata", ("metadata_json",)),
+        ("bnl_journal_automation_runs", ("frozen_packet_json",)),
+        (
+            "bnl_journal_observations",
+            ("subject_counts_json", "representative_sources_json"),
+        ),
+    ):
+        if not table_exists(conn, table):
+            continue
+        available = _cols(conn, table)
+        selected = [column for column in columns if column in available]
+        if not selected or "guild_id" not in available:
+            continue
+        for row in conn.execute(
+            f"SELECT {','.join(selected)} FROM {table} WHERE guild_id=?",
+            (guild,),
+        ).fetchall():
+            for value in row:
+                collect(value)
+
+    totals: dict[str, int] = {}
+    for user_id in sorted(user_ids):
+        counts = purge_user_journal_derivatives_on_connection(
+            conn,
+            guild,
+            user_id,
+        )
+        for key, value in counts.items():
+            totals[key] = totals.get(key, 0) + int(value or 0)
+    return {key: value for key, value in totals.items() if value}
 
 
 def _cols(conn: sqlite3.Connection, table: str) -> set[str]:
@@ -529,6 +808,113 @@ def _memory_select_expression(columns: set[str], name: str, fallback: str = "NUL
     return name if name in columns else f"{fallback} AS {name}"
 
 
+def _broadcast_memory_eligibility_hash(
+    guild_id: int,
+    row_id: int,
+    cleaned_summary: Any,
+    usage_scope: Any,
+    valid_until: Any,
+    needs_clarification: Any,
+    superseded_by_id: Any,
+    created_at: Any,
+) -> str:
+    return _hash(
+        "journal-memory-eligibility-v1",
+        int(guild_id),
+        int(row_id),
+        str(cleaned_summary or ""),
+        str(usage_scope or ""),
+        str(valid_until or ""),
+        int(needs_clarification or 0),
+        int(superseded_by_id or 0),
+        str(created_at or ""),
+        "active",
+        1,
+    )
+
+
+def journal_broadcast_memory_provenance_is_eligible(
+    conn: sqlite3.Connection,
+    guild_id: int,
+    provenance: list[dict[str, Any]],
+    eligible_at: str,
+) -> bool:
+    """Revalidate every used established-memory row at the supplied instant."""
+    used = [item for item in provenance if isinstance(item, dict) and item.get("rowId")]
+    if not used:
+        return True
+    if not table_exists(conn, "broadcast_memory"):
+        return False
+    columns = _cols(conn, "broadcast_memory")
+    required = {"id", "guild_id", "cleaned_summary", "status", "public_safe"}
+    if not required <= columns:
+        return False
+    selected_columns = [
+        _memory_select_expression(columns, "id"),
+        _memory_select_expression(columns, "cleaned_summary", "''"),
+        _memory_select_expression(columns, "usage_scope", "''"),
+        _memory_select_expression(columns, "valid_until"),
+        _memory_select_expression(columns, "needs_clarification", "0"),
+        _memory_select_expression(columns, "superseded_by_id", "0"),
+        _memory_select_expression(columns, "created_at", "''"),
+        _memory_select_expression(columns, "status", "''"),
+        _memory_select_expression(columns, "public_safe", "0"),
+    ]
+    row_ids = sorted({int(item["rowId"]) for item in used})
+    placeholders = ",".join("?" for _ in row_ids)
+    rows = conn.execute(
+        f"SELECT {','.join(selected_columns)} FROM broadcast_memory "
+        f"WHERE guild_id=? AND id IN ({placeholders})",
+        (int(guild_id), *row_ids),
+    ).fetchall()
+    by_id = {int(row[0]): row for row in rows}
+    if set(by_id) != set(row_ids):
+        return False
+    eligibility_instant = _parse_context_datetime(eligible_at) or datetime.now(timezone.utc)
+    expected_hashes = {
+        int(item["rowId"]): str(item.get("eligibilityHash") or "")
+        for item in used
+    }
+    for row_id in row_ids:
+        (
+            _row_id,
+            cleaned_summary,
+            usage_scope,
+            valid_until,
+            needs_clarification,
+            superseded_by_id,
+            created_at,
+            status,
+            public_safe,
+        ) = by_id[row_id]
+        scopes = _scope_tokens(str(usage_scope or ""))
+        expiry = _parse_context_datetime(valid_until, end_of_day=True)
+        if (
+            str(status or "") != "active"
+            or int(public_safe or 0) != 1
+            or int(needs_clarification or 0) != 0
+            or int(superseded_by_id or 0) != 0
+            or not (scopes & JOURNAL_PUBLIC_BROADCAST_SCOPES)
+            or "internal" in scopes
+            or not str(cleaned_summary or "").strip()
+            or (valid_until and (expiry is None or expiry < eligibility_instant))
+        ):
+            return False
+        current_hash = _broadcast_memory_eligibility_hash(
+            guild_id,
+            row_id,
+            cleaned_summary,
+            usage_scope,
+            valid_until,
+            needs_clarification,
+            superseded_by_id,
+            created_at,
+        )
+        if not expected_hashes.get(row_id) or expected_hashes[row_id] != current_hash:
+            return False
+    return True
+
+
 def _approved_journal_broadcast_memory(
     conn: sqlite3.Connection,
     guild_id: int,
@@ -613,6 +999,16 @@ def _approved_journal_broadcast_memory(
             "rowId": int(row_id),
             "createdAt": str(created_at or "")[:48],
             "matchedFreshSourceRefIds": matched_refs[:12],
+            "eligibilityHash": _broadcast_memory_eligibility_hash(
+                guild_id,
+                int(row_id),
+                cleaned_summary,
+                usage_scope,
+                valid_until,
+                needs_clarification,
+                superseded_by_id,
+                created_at,
+            ),
         })
         if len(safe_records) >= max(1, int(limit)):
             break
@@ -2070,12 +2466,104 @@ def _used_context_lane_metadata(packet: dict[str, Any], context_uses: list[dict[
     return used_lanes, used_provenance
 
 
-def _draft_records(guild_id: int, packet: dict[str, Any], article: dict[str, Any], *, entry_id: str = "", revision: int = 1) -> tuple[tuple[Any, ...], tuple[Any, ...], JournalResult]:
+def _attempt_fence_owned(
+    conn: sqlite3.Connection,
+    attempt_fence: Optional[tuple[str, int]],
+) -> bool:
+    """Check an automation preparation epoch inside the caller's transaction."""
+    if attempt_fence is None:
+        return True
+    if not table_exists(conn, "bnl_journal_automation_runs"):
+        return False
+    columns = _cols(conn, "bnl_journal_automation_runs")
+    if "preparation_epoch" not in columns:
+        return False
+    row = conn.execute(
+        "SELECT lifecycle_state,preparation_epoch,lease_expires_at "
+        "FROM bnl_journal_automation_runs WHERE run_id=?",
+        (str(attempt_fence[0]),),
+    ).fetchone()
+    if not row or str(row[0]) != "preparing" or int(row[1] or 0) != int(attempt_fence[1]):
+        return False
+    lease_raw = str(row[2] or "")
+    if not lease_raw:
+        return False
+    try:
+        lease = datetime.fromisoformat(lease_raw.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    if lease.tzinfo is None:
+        lease = lease.replace(tzinfo=timezone.utc)
+    return lease.astimezone(timezone.utc) > datetime.now(timezone.utc)
+
+
+def _delivery_fence_owned(
+    conn: sqlite3.Connection,
+    delivery_fence: Optional[tuple[str, int]],
+    *,
+    guild_id: int,
+    entry_id: str,
+    revision: Optional[int],
+) -> bool:
+    """Validate an automation delivery owner inside its network transaction."""
+    if delivery_fence is None or revision is None:
+        return False
+    if not table_exists(conn, "bnl_journal_automation_runs"):
+        return False
+    columns = _cols(conn, "bnl_journal_automation_runs")
+    required = {
+        "run_id",
+        "guild_id",
+        "lifecycle_state",
+        "journal_entry_id",
+        "journal_revision",
+        "delivery_epoch",
+        "delivery_lease_expires_at",
+    }
+    if not required <= columns:
+        return False
+    row = conn.execute(
+        "SELECT guild_id,lifecycle_state,journal_entry_id,journal_revision,"
+        "delivery_epoch,delivery_lease_expires_at "
+        "FROM bnl_journal_automation_runs WHERE run_id=?",
+        (str(delivery_fence[0]),),
+    ).fetchone()
+    if (
+        not row
+        or int(row[0]) != int(guild_id)
+        or str(row[1]) != "delivering"
+        or str(row[2] or "") != str(entry_id)
+        or int(row[3] or 0) != int(revision)
+        or int(row[4] or 0) != int(delivery_fence[1])
+    ):
+        return False
+    lease_raw = str(row[5] or "")
+    if not lease_raw:
+        return False
+    try:
+        lease = datetime.fromisoformat(lease_raw.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    if lease.tzinfo is None:
+        lease = lease.replace(tzinfo=timezone.utc)
+    return lease.astimezone(timezone.utc) > datetime.now(timezone.utc)
+
+
+def _draft_records(
+    guild_id: int,
+    packet: dict[str, Any],
+    article: dict[str, Any],
+    *,
+    entry_id: str = "",
+    revision: int = 1,
+    automation_context: Optional[dict[str, Any]] = None,
+) -> tuple[tuple[Any, ...], tuple[Any, ...], JournalResult]:
     authored = utc_now_iso()
     entry_id = entry_id or "journal_" + _hash(guild_id, authored, article["title"])[:16]
     content_hash = _hash(article["title"], article["excerpt"], _json(article["sections"]))
     payload = build_public_payload(entry_id, revision, article, packet, content_hash, authored)
     canonical = _json(payload).encode("utf-8")
+    request_hash = canonical_payload_hash(canonical)
     source_ref_ids = article.get("sourceRefIds", {})
     cited_sources = cited_private_sources(packet, article)
     meta = dict(article.get("metadata") or {})
@@ -2083,6 +2571,21 @@ def _draft_records(guild_id: int, packet: dict[str, Any], article: dict[str, Any
     context_uses = [item for item in meta.get("contextUses", []) if isinstance(item, dict)]
     used_context_lanes, used_context_provenance = _used_context_lane_metadata(packet, context_uses)
     lane_candidates = packet.get("generationContextLanes") if isinstance(packet.get("generationContextLanes"), dict) else {}
+    related_entry_ids = list(dict.fromkeys(
+        [
+            str(e.get("entry_id"))
+            for e in (
+                [packet.get("history", {}).get("previousEntry")]
+                + list(packet.get("history", {}).get("relevantOlderEntries", []))
+            )
+            if isinstance(e, dict) and e.get("entry_id")
+        ]
+        + [
+            str(observation.get("dailyEntryId"))
+            for observation in packet.get("observationContext", [])
+            if isinstance(observation, dict) and observation.get("dailyEntryId")
+        ]
+    ))
     meta.update({
         "entryKind": packet.get("entryKind", "manual"),
         "publicWordCount": public_word_count(article),
@@ -2092,7 +2595,7 @@ def _draft_records(guild_id: int, packet: dict[str, Any], article: dict[str, Any
         "supportingRelayIds": [s.get("relayId") for s in cited_sources if s.get("sourceKind") == "relay"],
         "supportingConversationRefs": [{k: v for k, v in s.items() if k in {"refId", "messageId", "subjectRef", "channelPolicy", "observedAt"}} for s in cited_sources if s.get("sourceKind") == "conversation"],
         "subjectRefs": sorted({str(s.get("subjectRef")) for s in cited_sources if s.get("subjectRef")}),
-        "relatedPriorJournalEntryIds": [e.get("entry_id") for e in packet.get("history", {}).get("relevantOlderEntries", [])],
+        "relatedPriorJournalEntryIds": related_entry_ids,
         "recurringTopicCounts": packet.get("history", {}).get("recurringTopicCounts", {}),
         "aggregateCounts": packet.get("aggregateCounts", {}),
         "sourceSummaries": [{"refId": s.get("refId"), "hash": _hash(s.get("summary", "")), "summary": s.get("summary", "")[:160]} for s in cited_sources],
@@ -2105,7 +2608,15 @@ def _draft_records(guild_id: int, packet: dict[str, Any], article: dict[str, Any
         "usedGenerationContextLanes": used_context_lanes,
         "usedContextLaneProvenance": used_context_provenance,
         "contextUses": context_uses,
+        "canonicalPayloadHash": request_hash,
+        "canonicalPayloadBytes": len(canonical),
     })
+    if automation_context:
+        meta.update({
+            "automationRunId": str(automation_context.get("runId") or ""),
+            "automationPreparationEpoch": int(automation_context.get("preparationEpoch") or 0),
+            "frozenSourceHash": str(automation_context.get("sourceHash") or ""),
+        })
     now = utc_now_iso()
     entry_row = (entry_id, revision, guild_id, "draft", article["title"], article["excerpt"], _json(article["sections"]), _json(payload), canonical, content_hash, packet["sourceWindowStart"], packet["sourceWindowEnd"], authored, None, None, None, None, 0, now, now)
     meta_row = (entry_id, revision, guild_id, _json(meta), content_hash, "draft", now, now)
@@ -2183,9 +2694,15 @@ def store_validated_draft(
     entry_id: str = "",
     revision: int = 1,
     allow_advisory: bool = False,
+    attempt_fence: Optional[tuple[str, int]] = None,
+    source_hash: str = "",
 ) -> JournalResult:
     ensure_schema(db_path)
     with sqlite3.connect(db_path) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        if not _attempt_fence_owned(conn, attempt_fence):
+            conn.rollback()
+            return JournalResult(False, "superseded", "preparation_epoch_lost", entry_id=entry_id, revision=revision)
         reason = validate_article(
             article,
             packet,
@@ -2193,10 +2710,25 @@ def store_validated_draft(
             blocking_only=allow_advisory,
         )
         if reason:
+            conn.rollback()
             return JournalResult(False, "no_draft", reason, entry_id=entry_id, revision=revision)
-        entry_row, meta_row, result = _draft_records(guild_id, packet, article, entry_id=entry_id, revision=revision)
-        with conn:
-            _insert_draft_rows(conn, entry_row, meta_row)
+        automation_context = None
+        if attempt_fence is not None:
+            automation_context = {
+                "runId": attempt_fence[0],
+                "preparationEpoch": attempt_fence[1],
+                "sourceHash": source_hash,
+            }
+        entry_row, meta_row, result = _draft_records(
+            guild_id,
+            packet,
+            article,
+            entry_id=entry_id,
+            revision=revision,
+            automation_context=automation_context,
+        )
+        _insert_draft_rows(conn, entry_row, meta_row)
+        conn.commit()
     return result
 
 
@@ -2207,6 +2739,9 @@ def generate_and_store_packet_draft(
     generator: Callable[[dict[str, Any], str], str],
     *,
     entry_id: str = "",
+    revision: int = 1,
+    attempt_fence: Optional[tuple[str, int]] = None,
+    source_hash: str = "",
 ) -> JournalResult:
     if not packet.get("coverageComplete", True):
         return JournalResult(False, "no_draft", "incomplete_source_window", entry_id=entry_id)
@@ -2227,7 +2762,10 @@ def generate_and_store_packet_draft(
         packet,
         article,
         entry_id=entry_id,
+        revision=revision,
         allow_advisory=allow_advisory,
+        attempt_fence=attempt_fence,
+        source_hash=source_hash,
     )
 
 
@@ -2253,23 +2791,66 @@ def generate_and_store_draft(
     return generate_and_store_packet_draft(db_path, guild_id, packet, generator, entry_id=entry_id)
 
 
-def approve_draft(db_path: str, guild_id: int, entry_id: str, content_hash: str, revision: Optional[int] = None) -> JournalResult:
+def approve_draft(
+    db_path: str,
+    guild_id: int,
+    entry_id: str,
+    content_hash: str,
+    revision: Optional[int] = None,
+    *,
+    attempt_fence: Optional[tuple[str, int]] = None,
+    source_hash: str = "",
+) -> JournalResult:
     ensure_schema(db_path)
     now = utc_now_iso()
     with sqlite3.connect(db_path) as conn:
-        row = conn.execute("SELECT revision,lifecycle_state,content_hash FROM bnl_journal_entries WHERE guild_id=? AND entry_id=? " + ("AND revision=?" if revision is not None else "ORDER BY revision DESC LIMIT 1"), (guild_id, entry_id, revision) if revision is not None else (guild_id, entry_id)).fetchone()
+        conn.execute("BEGIN IMMEDIATE")
+        if not _attempt_fence_owned(conn, attempt_fence):
+            conn.rollback()
+            return JournalResult(False, "superseded", "preparation_epoch_lost", entry_id, int(revision or 0))
+        row = conn.execute(
+            "SELECT e.revision,e.lifecycle_state,e.content_hash,e.canonical_payload_bytes,m.metadata_json "
+            "FROM bnl_journal_entries e LEFT JOIN bnl_journal_private_metadata m "
+            "ON m.entry_id=e.entry_id AND m.revision=e.revision AND m.guild_id=e.guild_id "
+            "WHERE e.guild_id=? AND e.entry_id=? "
+            + ("AND e.revision=?" if revision is not None else "ORDER BY e.revision DESC LIMIT 1"),
+            (guild_id, entry_id, revision) if revision is not None else (guild_id, entry_id),
+        ).fetchone()
         if not row:
+            conn.rollback()
             return JournalResult(False, "not_found", "not_found", entry_id)
         rev, state, stored_hash = int(row[0]), row[1], row[2]
         if state != "draft":
+            conn.rollback()
             return JournalResult(False, state, "not_draft", entry_id, rev, stored_hash)
         if stored_hash != content_hash:
+            conn.rollback()
             return JournalResult(False, "draft", "content_hash_mismatch", entry_id, rev, stored_hash)
-        with conn:
-            cur1 = conn.execute("UPDATE bnl_journal_entries SET lifecycle_state='approved_pending_delivery',approved_at=?,updated_at=? WHERE guild_id=? AND entry_id=? AND revision=? AND lifecycle_state='draft'", (now, now, guild_id, entry_id, rev))
-            cur2 = conn.execute("UPDATE bnl_journal_private_metadata SET lifecycle_state='approved_pending_delivery',updated_at=? WHERE guild_id=? AND entry_id=? AND revision=? AND lifecycle_state='draft'", (now, guild_id, entry_id, rev))
-            if cur1.rowcount != 1 or cur2.rowcount != 1:
-                raise sqlite3.IntegrityError("journal_approve_sync_failed")
+        canonical = bytes(row[3] or b"")
+        if not canonical:
+            conn.rollback()
+            return JournalResult(False, "draft", "canonical_payload_missing", entry_id, rev, stored_hash)
+        if len(canonical) > JOURNAL_SITE_REQUEST_BODY_MAX_BYTES:
+            conn.rollback()
+            return JournalResult(False, "draft", "request_body_too_large", entry_id, rev, stored_hash)
+        request_hash = canonical_payload_hash(canonical)
+        metadata = _json_object(row[4])
+        stored_request_hash = str(metadata.get("canonicalPayloadHash") or "")
+        if stored_request_hash and stored_request_hash != request_hash:
+            conn.rollback()
+            return JournalResult(False, "draft", "canonical_payload_hash_mismatch", entry_id, rev, stored_hash)
+        stored_source_hash = str(metadata.get("frozenSourceHash") or "")
+        if source_hash and stored_source_hash != source_hash:
+            conn.rollback()
+            return JournalResult(False, "draft", "source_packet_hash_mismatch", entry_id, rev, stored_hash)
+        metadata["canonicalPayloadHash"] = request_hash
+        metadata["canonicalPayloadBytes"] = len(canonical)
+        cur1 = conn.execute("UPDATE bnl_journal_entries SET lifecycle_state='approved_pending_delivery',approved_at=?,updated_at=? WHERE guild_id=? AND entry_id=? AND revision=? AND lifecycle_state='draft'", (now, now, guild_id, entry_id, rev))
+        cur2 = conn.execute("UPDATE bnl_journal_private_metadata SET metadata_json=?,lifecycle_state='approved_pending_delivery',updated_at=? WHERE guild_id=? AND entry_id=? AND revision=? AND lifecycle_state='draft'", (_json(metadata), now, guild_id, entry_id, rev))
+        if cur1.rowcount != 1 or cur2.rowcount != 1:
+            conn.rollback()
+            raise sqlite3.IntegrityError("journal_approve_sync_failed")
+        conn.commit()
     return JournalResult(True, "approved_pending_delivery", "", entry_id, rev, stored_hash)
 
 
@@ -2407,8 +2988,86 @@ def _post_canonical_payload(canonical: bytes, base_url: str, api_key: str, opene
     return status, reason, int(http or 0), idem, published
 
 
-def deliver_approved(db_path: str, guild_id: int, entry_id: str, base_url: str, api_key: str, opener=None, timeout: int = 10, revision: Optional[int] = None) -> JournalResult:
+def deliver_approved(
+    db_path: str,
+    guild_id: int,
+    entry_id: str,
+    base_url: str,
+    api_key: str,
+    opener=None,
+    timeout: int = 10,
+    revision: Optional[int] = None,
+    *,
+    delivery_fence: Optional[tuple[str, int]] = None,
+    delivery_preflight: Optional[Callable[[sqlite3.Connection], str]] = None,
+) -> JournalResult:
     ensure_schema(db_path)
+    if delivery_fence is not None:
+        with sqlite3.connect(db_path) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            if not _delivery_fence_owned(
+                conn,
+                delivery_fence,
+                guild_id=guild_id,
+                entry_id=entry_id,
+                revision=revision,
+            ):
+                conn.rollback()
+                return JournalResult(
+                    False,
+                    "not_deliverable",
+                    "delivery_epoch_lost",
+                    entry_id,
+                    int(revision or 0),
+                )
+            row = conn.execute(
+                "SELECT revision,canonical_payload_bytes,content_hash FROM bnl_journal_entries "
+                "WHERE guild_id=? AND entry_id=? "
+                "AND lifecycle_state IN ('approved_pending_delivery','delivery_failed') AND revision=?",
+                (guild_id, entry_id, int(revision)),
+            ).fetchone()
+            if not row:
+                conn.rollback()
+                return JournalResult(False, "not_deliverable", "not_approved", entry_id, int(revision or 0))
+            rev, canonical, content_hash = int(row[0]), row[1], row[2]
+            if delivery_preflight is not None:
+                preflight_reason = str(delivery_preflight(conn) or "")
+                if preflight_reason:
+                    conn.rollback()
+                    return JournalResult(
+                        False,
+                        "not_deliverable",
+                        preflight_reason,
+                        entry_id,
+                        rev,
+                        content_hash,
+                    )
+            status, reason, http, idem, published = _post_canonical_payload(
+                canonical,
+                base_url,
+                api_key,
+                opener,
+                timeout,
+            )
+            now = utc_now_iso()
+            cur1 = conn.execute(
+                "UPDATE bnl_journal_entries SET lifecycle_state=?,delivery_status=?,"
+                "delivery_http_status=?,published_at=COALESCE(?,published_at),updated_at=? "
+                "WHERE guild_id=? AND entry_id=? AND revision=? "
+                "AND lifecycle_state IN ('approved_pending_delivery','delivery_failed')",
+                (status, reason, http, published or None, now, guild_id, entry_id, rev),
+            )
+            cur2 = conn.execute(
+                "UPDATE bnl_journal_private_metadata SET lifecycle_state=?,updated_at=? "
+                "WHERE guild_id=? AND entry_id=? AND revision=?",
+                (status, now, guild_id, entry_id, rev),
+            )
+            if cur1.rowcount != 1 or cur2.rowcount != 1:
+                conn.rollback()
+                raise sqlite3.IntegrityError("journal_delivery_sync_failed")
+            conn.commit()
+        return JournalResult(status == "published", status, reason, entry_id, rev, content_hash, http, idem)
+
     with sqlite3.connect(db_path) as conn:
         row = conn.execute("SELECT revision,canonical_payload_bytes,content_hash FROM bnl_journal_entries WHERE guild_id=? AND entry_id=? AND lifecycle_state IN ('approved_pending_delivery','delivery_failed') " + ("AND revision=?" if revision is not None else "ORDER BY revision DESC LIMIT 1"), (guild_id, entry_id, revision) if revision is not None else (guild_id, entry_id)).fetchone()
     if not row:

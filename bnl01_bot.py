@@ -77,23 +77,29 @@ from bnl_journal import (
     deliver_approved as deliver_approved_journal,
     generate_and_store_draft as generate_and_store_journal_draft,
     preview as preview_journal_draft,
+    purge_guild_journal_derivatives_on_connection,
+    purge_user_journal_derivatives_on_connection,
     regenerate_draft as regenerate_journal_draft,
     rehydrate_published_entries as rehydrate_published_journal_entries,
     reject_draft as reject_journal_draft,
 )
 from bnl_journal_source_store import (
-    purge_guild_discord_sources as purge_guild_journal_sources,
-    purge_user_discord_sources as purge_user_journal_sources,
+    ensure_schema as ensure_journal_source_schema,
+    purge_guild_discord_sources_on_connection,
+    purge_user_discord_sources_on_connection,
     record_source_event as record_journal_source_event,
     sanitize_summary as sanitize_journal_source_summary,
     timestamp_to_epoch_ms as journal_timestamp_to_epoch_ms,
 )
 from bnl_journal_automation import (
     automation_status as journal_automation_status,
+    load_journal_memory_exclusions,
+    release_prepared_entry as release_prepared_journal_entry,
     result_dict as journal_automation_result_dict,
     run_daily as run_daily_journal_automation,
     run_scheduled as run_scheduled_journal_automation,
     run_weekly as run_weekly_journal_automation,
+    store_journal_memory_exclusions,
 )
 from bnl_website_contract_v2 import (
     ContractV2Error,
@@ -6054,6 +6060,44 @@ def _journal_control_flags(control: dict | None, fallback: dict) -> dict:
     return flags
 
 
+def _journal_control_flags_for_guild(
+    guild_id: int,
+    control: dict | None,
+    fallback: dict,
+) -> dict:
+    """Resolve live controls over the last durable eligibility snapshot."""
+    flags = dict(fallback or {})
+    try:
+        stored_ids, stored_confirmed = load_journal_memory_exclusions(
+            DB_FILE,
+            int(guild_id),
+        )
+    except sqlite3.Error:
+        stored_ids, stored_confirmed = set(), False
+        logging.exception(
+            "journal_memory_exclusion_snapshot_load_failed guild=%s",
+            guild_id,
+        )
+    if stored_confirmed:
+        flags["journalMemoryExcludedEntryIds"] = sorted(stored_ids)
+    flags["journalMemoryExclusionsConfirmed"] = bool(
+        stored_confirmed or flags.get("journalMemoryExclusionsConfirmed", False)
+    )
+    flags = _journal_control_flags(control, flags)
+    live_exclusions = control.get("memoryExcludedEntryIds") if isinstance(control, dict) else None
+    if isinstance(live_exclusions, list):
+        confirmed_ids = set(flags.get("journalMemoryExcludedEntryIds") or [])
+        flags["journalMemoryExclusionsConfirmed"] = True
+        try:
+            store_journal_memory_exclusions(DB_FILE, int(guild_id), confirmed_ids)
+        except sqlite3.Error:
+            logging.exception(
+                "journal_memory_exclusion_snapshot_store_failed guild=%s",
+                guild_id,
+            )
+    return flags
+
+
 def _journal_control_claim_sync(control: dict | None) -> tuple[dict | None, str]:
     requests = control.get("runRequests") if isinstance(control, dict) else None
     if not isinstance(requests, list):
@@ -6094,6 +6138,19 @@ def _journal_control_claim_sync(control: dict | None) -> tuple[dict | None, str]
 
 def _journal_site_run_state(status: str) -> str:
     normalized = str(status or "").strip().lower()
+    if normalized in {
+        "preparing",
+        "prepared",
+        "waiting",
+        "waiting_for_release",
+        "waiting_release",
+        "delivering",
+    }:
+        # The current site contract has no separate preparation lifecycle.
+        # These are active, nonterminal phases rather than failures; preserve
+        # the exact internal phase in the run detail while projecting the
+        # compatible existing state.
+        return "running"
     if normalized in {
         "running", "published", "held", "delivery_failed", "busy", "backoff",
         "failed", "complete", "already_processed", "disabled",
@@ -6200,7 +6257,15 @@ async def run_journal_automation_once(
             effective_flags = flags
             if effective_flags is None:
                 effective_flags = await asyncio.to_thread(get_bnl_control_flags, force_refresh=force)
+                effective_flags = _journal_control_flags_for_guild(
+                    guild_id,
+                    None,
+                    effective_flags,
+                )
             memory_excluded_entry_ids = set(effective_flags.get("journalMemoryExcludedEntryIds") or [])
+            memory_exclusions_confirmed = bool(
+                effective_flags.get("journalMemoryExclusionsConfirmed", True)
+            )
             if not effective_flags.get("journalAutoPublishEnabled", True):
                 results = [_journal_control_result(cadence, "paused", "auto_publish_paused")]
             elif cadence == "daily" and not effective_flags.get("journalDailyEnabled", True):
@@ -6217,6 +6282,7 @@ async def run_journal_automation_once(
                     BNL_API_KEY,
                     force=force,
                     memory_excluded_entry_ids=memory_excluded_entry_ids,
+                    memory_exclusions_confirmed=memory_exclusions_confirmed,
                 )
                 results = [journal_automation_result_dict(result)]
             elif cadence == "weekly":
@@ -6229,6 +6295,7 @@ async def run_journal_automation_once(
                     BNL_API_KEY,
                     force=force,
                     memory_excluded_entry_ids=memory_excluded_entry_ids,
+                    memory_exclusions_confirmed=memory_exclusions_confirmed,
                 )
                 results = [journal_automation_result_dict(result)]
             else:
@@ -6267,7 +6334,7 @@ async def run_journal_automation_control_cycle(guild_id: int) -> list[dict]:
     ):
         control = None
         control_error = control_error or "control_plane_response_invalid"
-    flags = _journal_control_flags(control, base_flags)
+    flags = _journal_control_flags_for_guild(guild_id, control, base_flags)
     if control is None:
         reason = "control_plane_unavailable:%s" % (control_error or "control_get_failed")
         # The control endpoint is useful for remote Run Now requests, but it
@@ -6358,7 +6425,7 @@ async def maybe_handle_journal_command(message: discord.Message, clean_content: 
         if action == "status":
             flags = await asyncio.to_thread(get_bnl_control_flags, force_refresh=True)
             control, control_error = await asyncio.to_thread(_journal_control_request_sync, "GET")
-            flags = _journal_control_flags(control, flags)
+            flags = _journal_control_flags_for_guild(guild_id, control, flags)
             status = await asyncio.to_thread(journal_automation_status, DB_FILE, guild_id)
             last_state = status.get("lastState") if isinstance(status.get("lastState"), dict) else {}
             await message.reply(
@@ -6375,7 +6442,7 @@ async def maybe_handle_journal_command(message: discord.Message, clean_content: 
             cadence = "daily" if action == "run-daily" else "weekly"
             flags = await asyncio.to_thread(get_bnl_control_flags, force_refresh=True)
             control, _ = await asyncio.to_thread(_journal_control_request_sync, "GET")
-            flags = _journal_control_flags(control, flags)
+            flags = _journal_control_flags_for_guild(guild_id, control, flags)
             results = await run_journal_automation_once(guild_id, cadence=cadence, force=True, flags=flags)
             for item in results:
                 await asyncio.to_thread(_journal_report_run_sync, item, guild_id=guild_id)
@@ -6409,7 +6476,7 @@ async def maybe_handle_journal_command(message: discord.Message, clean_content: 
         if action == "create":
             hours = _parse_journal_hours(options.get("hours") or options.get("window"))
             control, _ = await asyncio.to_thread(_journal_control_request_sync, "GET")
-            flags = _journal_control_flags(control, {})
+            flags = _journal_control_flags_for_guild(guild_id, control, {})
             result = await asyncio.to_thread(
                 generate_and_store_journal_draft,
                 DB_FILE,
@@ -6427,7 +6494,7 @@ async def maybe_handle_journal_command(message: discord.Message, clean_content: 
             entry_id = options.get("entry_id") or ""
             hours = _parse_journal_hours(options.get("hours") or options.get("window"))
             control, _ = await asyncio.to_thread(_journal_control_request_sync, "GET")
-            flags = _journal_control_flags(control, {})
+            flags = _journal_control_flags_for_guild(guild_id, control, {})
             result = await asyncio.to_thread(
                 regenerate_journal_draft,
                 DB_FILE,
@@ -6473,8 +6540,37 @@ async def maybe_handle_journal_command(message: discord.Message, clean_content: 
             if not BNL_API_KEY or not _journal_website_base_url():
                 await message.reply("Journal delivery not attempted: website URL or BNL API key missing.")
                 return True
-            result = await asyncio.to_thread(deliver_approved_journal, DB_FILE, guild_id, entry_id, _journal_website_base_url(), BNL_API_KEY)
-            await message.reply(f"Journal delivery result: state=`{result.status}` reason=`{result.reason}` http=`{result.http_status}`")
+            flags = await asyncio.to_thread(get_bnl_control_flags, force_refresh=True)
+            control, _ = await asyncio.to_thread(_journal_control_request_sync, "GET")
+            flags = _journal_control_flags_for_guild(guild_id, control, flags)
+            result = await asyncio.to_thread(
+                release_prepared_journal_entry,
+                DB_FILE,
+                guild_id,
+                entry_id,
+                _journal_website_base_url(),
+                BNL_API_KEY,
+                force=True,
+                memory_excluded_entry_ids=set(flags.get("journalMemoryExcludedEntryIds") or []),
+                memory_exclusions_confirmed=bool(
+                    flags.get("journalMemoryExclusionsConfirmed", False)
+                ),
+            )
+            if result is None:
+                # Manual review drafts are intentionally outside the scheduled
+                # occurrence owner and retain their existing explicit retry path.
+                result = await asyncio.to_thread(
+                    deliver_approved_journal,
+                    DB_FILE,
+                    guild_id,
+                    entry_id,
+                    _journal_website_base_url(),
+                    BNL_API_KEY,
+                )
+            await message.reply(
+                f"Journal delivery result: state=`{result.status}` reason=`{result.reason}` "
+                f"http=`{int(getattr(result, 'http_status', 0) or 0)}`"
+            )
             return True
     except Exception:
         logging.exception("journal_command_failed action=%s reason=unexpected_exception", action)
@@ -12702,33 +12798,53 @@ def build_room_first_direct_context(guild_id: int, channel_id: int, channel_name
     return formatted
 
 def clear_guild_history(guild_id: int):
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    cursor.execute("DELETE FROM conversations WHERE guild_id = ?", (guild_id,))
-    rows_deleted = cursor.rowcount
-    conn.commit()
-    conn.close()
-    purged_sources = purge_guild_journal_sources(DB_FILE, guild_id)
+    ensure_journal_schema(DB_FILE)
+    ensure_journal_source_schema(DB_FILE)
+    with sqlite3.connect(DB_FILE, timeout=30) as conn:
+        conn.execute("BEGIN EXCLUSIVE")
+        cursor = conn.execute("DELETE FROM conversations WHERE guild_id = ?", (guild_id,))
+        rows_deleted = cursor.rowcount
+        derivative_counts = purge_guild_journal_derivatives_on_connection(
+            conn,
+            guild_id,
+        )
+        purged_sources = purge_guild_discord_sources_on_connection(conn, guild_id)
+        conn.commit()
     logging.info(
-        "journal_source_archive_purged scope=guild guild_id=%s rows=%s",
+        "journal_source_archive_purged scope=guild guild_id=%s rows=%s derivatives=%s",
         guild_id,
         purged_sources,
+        derivative_counts,
     )
     return rows_deleted
 
 def clear_user_history(user_id: int, guild_id: int):
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    cursor.execute("DELETE FROM conversations WHERE user_id = ? AND guild_id = ?", (user_id, guild_id))
-    rows_deleted = cursor.rowcount
-    conn.commit()
-    conn.close()
-    purged_sources = purge_user_journal_sources(DB_FILE, guild_id, user_id)
+    ensure_journal_schema(DB_FILE)
+    ensure_journal_source_schema(DB_FILE)
+    with sqlite3.connect(DB_FILE, timeout=30) as conn:
+        conn.execute("BEGIN EXCLUSIVE")
+        cursor = conn.execute(
+            "DELETE FROM conversations WHERE user_id = ? AND guild_id = ?",
+            (user_id, guild_id),
+        )
+        rows_deleted = cursor.rowcount
+        derivative_counts = purge_user_journal_derivatives_on_connection(
+            conn,
+            guild_id,
+            user_id,
+        )
+        purged_sources = purge_user_discord_sources_on_connection(
+            conn,
+            guild_id,
+            user_id,
+        )
+        conn.commit()
     logging.info(
-        "journal_source_archive_purged scope=user guild_id=%s user_id=%s rows=%s",
+        "journal_source_archive_purged scope=user guild_id=%s user_id=%s rows=%s derivatives=%s",
         guild_id,
         user_id,
         purged_sources,
+        derivative_counts,
     )
     return rows_deleted
 

@@ -442,6 +442,11 @@ def purge_user_discord_sources_on_connection(conn: sqlite3.Connection, guild_id:
     return _purge_discord_source_events_on_connection(conn, guild_id, user_id)
 
 
+def purge_guild_discord_sources_on_connection(conn: sqlite3.Connection, guild_id: int) -> int:
+    """Purge one guild's raw Discord Journal sources in a caller transaction."""
+    return _purge_discord_source_events_on_connection(conn, guild_id)
+
+
 def _purge_discord_source_events(db_path: str, guild_id: int, user_id: Optional[int] = None) -> int:
     """Delete an explicitly scoped Discord archive while keeping normal rows immutable.
 
