@@ -670,6 +670,148 @@ class PreparedReleaseTests(unittest.TestCase):
         self.assertEqual(attempts[0], attempts[1])
         self.assertEqual(self.run_row()["prepared_payload_hash"], hashlib.sha256(attempts[1]).hexdigest())
 
+    def test_preparation_retry_waits_thirty_minutes_without_lowering_quality_path(self):
+        first_attempt = []
+
+        def timed_out(packet, prompt):
+            first_attempt.append((packet, prompt))
+            raise RuntimeError("journal_preparation_timeout")
+
+        first = self.prepare(timed_out)
+        self.assertEqual("held", first.status, first)
+        self.assertEqual(1, len(first_attempt))
+
+        with sqlite3.connect(self.db) as conn:
+            state = conn.execute(
+                "SELECT last_checked_at,next_retry_at "
+                "FROM bnl_journal_automation_state WHERE guild_id=1"
+            ).fetchone()
+        self.assertIsNotNone(state)
+        retry_delay = automation._parse_utc(state[1]) - automation._parse_utc(state[0])
+        self.assertGreaterEqual(retry_delay, timedelta(minutes=29, seconds=58))
+        self.assertLessEqual(retry_delay, timedelta(minutes=30))
+
+        generation_calls = []
+
+        def full_quality_generator(packet, prompt):
+            generation_calls.append((packet, prompt))
+            return article_json(packet)
+
+        with sqlite3.connect(self.db) as conn:
+            conn.execute(
+                "UPDATE bnl_journal_automation_runs SET updated_at=? "
+                "WHERE cadence='daily'",
+                (
+                    automation._utc_iso(
+                        datetime.now(timezone.utc) - timedelta(minutes=29)
+                    ),
+                ),
+            )
+        waiting = automation.prepare_daily(
+            self.db,
+            1,
+            full_quality_generator,
+            target_day=TARGET_DAY,
+            force=False,
+        )
+        self.assertEqual("backoff", waiting.status, waiting)
+        self.assertEqual([], generation_calls)
+
+        with sqlite3.connect(self.db) as conn:
+            conn.execute(
+                "UPDATE bnl_journal_automation_runs SET updated_at=? "
+                "WHERE cadence='daily'",
+                (
+                    automation._utc_iso(
+                        datetime.now(timezone.utc) - timedelta(minutes=31)
+                    ),
+                ),
+            )
+        recovered = automation.prepare_daily(
+            self.db,
+            1,
+            full_quality_generator,
+            target_day=TARGET_DAY,
+            force=False,
+        )
+        self.assertEqual("prepared", recovered.status, recovered)
+        self.assertEqual(1, len(generation_calls))
+        self.assertEqual(first_attempt[0], generation_calls[0])
+
+    def test_delivery_retry_waits_fifteen_minutes_and_never_regenerates(self):
+        prepared = self.prepare()
+        attempts = []
+
+        def lost_response(request, timeout=10):
+            attempts.append(request.data)
+            raise OSError("response lost")
+
+        failed = self.release(lost_response)
+        self.assertEqual("delivery_failed", failed.status, failed)
+
+        with sqlite3.connect(self.db) as conn:
+            state = conn.execute(
+                "SELECT last_checked_at,next_retry_at "
+                "FROM bnl_journal_automation_state WHERE guild_id=1"
+            ).fetchone()
+        self.assertIsNotNone(state)
+        retry_delay = automation._parse_utc(state[1]) - automation._parse_utc(state[0])
+        self.assertGreaterEqual(retry_delay, timedelta(minutes=14, seconds=58))
+        self.assertLessEqual(retry_delay, timedelta(minutes=15))
+
+        with sqlite3.connect(self.db) as conn:
+            conn.execute(
+                "UPDATE bnl_journal_automation_runs SET updated_at=? "
+                "WHERE cadence='daily'",
+                (
+                    automation._utc_iso(
+                        datetime.now(timezone.utc) - timedelta(minutes=14)
+                    ),
+                ),
+            )
+        waiting = automation.release_daily(
+            self.db,
+            1,
+            "https://site.example",
+            "key",
+            target_day=TARGET_DAY,
+            force=False,
+            opener=lambda *_args, **_kwargs: self.fail(
+                "delivery retried before its fifteen-minute backoff"
+            ),
+        )
+        self.assertEqual("backoff", waiting.status, waiting)
+        self.assertEqual(1, len(attempts))
+
+        with sqlite3.connect(self.db) as conn:
+            conn.execute(
+                "UPDATE bnl_journal_automation_runs SET updated_at=? "
+                "WHERE cadence='daily'",
+                (
+                    automation._utc_iso(
+                        datetime.now(timezone.utc) - timedelta(minutes=16)
+                    ),
+                ),
+            )
+
+        def idempotent_response(request, timeout=10):
+            attempts.append(request.data)
+            return AcceptedResponse(request, idempotent=True)
+
+        recovered = automation.release_daily(
+            self.db,
+            1,
+            "https://site.example",
+            "key",
+            target_day=TARGET_DAY,
+            force=False,
+            opener=idempotent_response,
+        )
+        self.assertEqual("published", recovered.status, recovered)
+        self.assertEqual((prepared.entry_id, prepared.revision), (recovered.entry_id, recovered.revision))
+        self.assertEqual(2, len(attempts))
+        self.assertEqual(attempts[0], attempts[1])
+
     def test_unconfirmed_memory_controls_wait_without_changing_prepared_bytes(self):
         prepared = self.prepare()
         before = self.run_row()

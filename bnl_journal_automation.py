@@ -41,7 +41,8 @@ MIN_DAILY_SOURCE_COUNT = 5
 MIN_WEEKLY_ACTIVE_DAYS = 1
 LEASE_MINUTES = 30
 DELIVERY_LEASE_MINUTES = 2
-RETRY_MINUTES = 60
+PREPARATION_RETRY_MINUTES = 30
+DELIVERY_RETRY_MINUTES = 15
 TERMINAL_RUN_STATES = {"published", "quiet", "incomplete", "superseded"}
 DELIVERY_PREFLIGHT_INVALIDATION_REASONS = frozenset({
     "prepared_revision_missing",
@@ -1040,7 +1041,9 @@ def _claim_preparation(
             if current["lifecycle_state"] in {"held", "delivery_failed", "deferred"} and not force:
                 updated_at = str(current.get("updated_at") or "")
                 if updated_at:
-                    retry_at = _parse_utc(updated_at) + timedelta(minutes=RETRY_MINUTES)
+                    retry_at = _parse_utc(updated_at) + timedelta(
+                        minutes=PREPARATION_RETRY_MINUTES
+                    )
                     if retry_at > now:
                         current["retry_at"] = _utc_iso(retry_at)
                         conn.commit()
@@ -1098,7 +1101,10 @@ def _finish_preparation(
 ) -> AutomationResult:
     retry_at = ""
     if result.status in {"held", "delivery_failed", "deferred"}:
-        retry_at = _utc_iso(datetime.now(timezone.utc) + timedelta(minutes=RETRY_MINUTES))
+        retry_at = _utc_iso(
+            datetime.now(timezone.utc)
+            + timedelta(minutes=PREPARATION_RETRY_MINUTES)
+        )
     with sqlite3.connect(db_path) as conn:
         conn.execute("BEGIN IMMEDIATE")
         row = conn.execute(
@@ -2318,7 +2324,10 @@ def _invalidate_prepared_in_transaction(
             conn,
             guild_id,
             result,
-            next_retry_at=_utc_iso(datetime.now(timezone.utc) + timedelta(minutes=RETRY_MINUTES)),
+            next_retry_at=_utc_iso(
+                datetime.now(timezone.utc)
+                + timedelta(minutes=PREPARATION_RETRY_MINUTES)
+            ),
         )
 
 
@@ -2375,8 +2384,16 @@ def _claim_delivery(
             return "complete", run_id, int(current.get("delivery_epoch") or 0), current
         if current["lifecycle_state"] == "delivery_failed" and not force:
             updated_at = str(current.get("updated_at") or "")
-            if updated_at and _parse_utc(updated_at) + timedelta(minutes=RETRY_MINUTES) > now_dt:
-                current["retry_at"] = _utc_iso(_parse_utc(updated_at) + timedelta(minutes=RETRY_MINUTES))
+            if (
+                updated_at
+                and _parse_utc(updated_at)
+                + timedelta(minutes=DELIVERY_RETRY_MINUTES)
+                > now_dt
+            ):
+                current["retry_at"] = _utc_iso(
+                    _parse_utc(updated_at)
+                    + timedelta(minutes=DELIVERY_RETRY_MINUTES)
+                )
                 conn.commit()
                 return "backoff", run_id, int(current.get("delivery_epoch") or 0), current
         delivery_lease = str(current.get("delivery_lease_expires_at") or "")
@@ -2529,7 +2546,10 @@ def _finish_delivery(
 ) -> AutomationResult:
     retry_at = ""
     if result.status in {"held", "delivery_failed", "deferred"}:
-        retry_at = _utc_iso(datetime.now(timezone.utc) + timedelta(minutes=RETRY_MINUTES))
+        retry_at = _utc_iso(
+            datetime.now(timezone.utc)
+            + timedelta(minutes=DELIVERY_RETRY_MINUTES)
+        )
     with sqlite3.connect(db_path) as conn:
         conn.execute("BEGIN IMMEDIATE")
         row = conn.execute(
