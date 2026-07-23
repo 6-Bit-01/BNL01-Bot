@@ -5370,6 +5370,15 @@ def is_owner_operator(user: discord.abc.User) -> bool:
     return bool(BNL_OWNER_USER_ID) and bool(user) and user.id == BNL_OWNER_USER_ID
 
 
+def configured_owner_control_denial_reason(user: discord.abc.User) -> str:
+    """Fail closed for controls reserved to the configured BARCODE owner."""
+    if not BNL_OWNER_USER_ID:
+        return "owner_user_id_not_configured"
+    if not is_owner_operator(user):
+        return "configured_owner_required"
+    return ""
+
+
 def has_mod_role(member: discord.Member) -> bool:
     if not member or not BNL_MOD_ROLE_ID:
         return False
@@ -5992,6 +6001,24 @@ def _parse_journal_command(text: str) -> tuple[bool, dict, str]:
     return True, opts, ""
 
 
+JOURNAL_OPERATOR_READ_ONLY_ACTIONS = frozenset({"preview", "status"})
+
+
+def journal_command_permission_denial(
+    action: str,
+    user: discord.abc.User,
+    member: discord.Member | None,
+    guild: discord.Guild,
+) -> str:
+    """Keep Journal mutations owner-only while retaining operator read access."""
+    normalized_action = str(action or "").strip().lower()
+    if normalized_action not in JOURNAL_OPERATOR_READ_ONLY_ACTIONS:
+        return configured_owner_control_denial_reason(user)
+    if not can_send_dossier_recommendation(user, member, guild):
+        return "operator_permission_required"
+    return ""
+
+
 def _parse_journal_hours(value, default: int = 72) -> int:
     try:
         hours = int(str(value or default).strip())
@@ -6504,16 +6531,35 @@ async def maybe_handle_journal_command(message: discord.Message, clean_content: 
     if not getattr(message, "guild", None):
         await message.reply("Journal controls require a server operator context.")
         return True
+    action = str(options.get("action") or "").strip().lower()
     member = message.author if isinstance(message.author, discord.Member) else message.guild.get_member(message.author.id)
-    if not can_send_dossier_recommendation(message.author, member, message.guild):
-        await message.reply("Journal controls are operator-only.")
+    permission_denial = journal_command_permission_denial(
+        action,
+        message.author,
+        member,
+        message.guild,
+    )
+    if permission_denial:
+        logging.warning(
+            "journal_command_denied action=%s user_id=%s reason=%s",
+            action,
+            getattr(message.author, "id", 0),
+            permission_denial,
+        )
+        if permission_denial == "owner_user_id_not_configured":
+            await message.reply(
+                "Manual Journal controls are disabled because `BNL_OWNER_USER_ID` is not configured."
+            )
+        elif permission_denial == "configured_owner_required":
+            await message.reply("Manual Journal mutations are owner-only.")
+        else:
+            await message.reply("Journal read-only controls are operator-only.")
         return True
     policy = resolve_channel_policy(getattr(message, "channel", None))
     channel_name = getattr(getattr(message, "channel", None), "name", "") or ""
     if is_public_prompt_context(policy) and not is_operator_authority_context(policy, channel_name):
         await message.reply("Journal controls are restricted to approved operator channels.")
         return True
-    action = options.get("action")
     guild_id = message.guild.id
     try:
         if action == "status":
@@ -18575,6 +18621,50 @@ CONVERSATION_RETRANSMISSION_TTL_SECONDS = max(60, int(os.getenv("BNL_RETRANSMISS
 _conversation_continuation_state = {}
 
 
+async def maybe_reject_unauthorized_official_broadcast_memory(
+    message: discord.Message,
+    clean_content: str,
+) -> bool:
+    """Reject official broadcast-memory mutations unless the configured owner acts."""
+    denial_reason = configured_owner_control_denial_reason(
+        getattr(message, "author", None)
+    )
+    if not denial_reason:
+        return False
+    logging.info(
+        "broadcast_memory_intake_denied user_id=%s channel_id=%s reason=%s",
+        getattr(getattr(message, "author", None), "id", 0),
+        getattr(getattr(message, "channel", None), "id", 0),
+        denial_reason,
+    )
+    if clean_content:
+        key = (
+            getattr(getattr(message, "guild", None), "id", 0) or 0,
+            getattr(getattr(message, "channel", None), "id", 0) or 0,
+            getattr(getattr(message, "author", None), "id", 0) or 0,
+        )
+        now = datetime.now(timezone.utc)
+        last = _broadcast_memory_denial_last_at.get(key)
+        if (
+            not last
+            or (now - last).total_seconds()
+            >= BROADCAST_MEMORY_DENIAL_COOLDOWN_SECONDS
+        ):
+            _broadcast_memory_denial_last_at[key] = now
+            if denial_reason == "owner_user_id_not_configured":
+                reply = (
+                    "Not stored. Official broadcast-memory controls are disabled "
+                    "because `BNL_OWNER_USER_ID` is not configured."
+                )
+            else:
+                reply = (
+                    "Not stored. Official broadcast memory can only be created "
+                    "or corrected by the configured owner."
+                )
+            await message.reply(reply)
+    return True
+
+
 def _direct_conversation_generation_key(message: discord.Message):
     return (
         int(getattr(getattr(message, "guild", None), "id", 0) or 0),
@@ -19926,23 +20016,14 @@ async def on_message(message: discord.Message):
         return
 
     if channel_policy == "broadcast_memory":
-        member = message.author if isinstance(message.author, discord.Member) else message.guild.get_member(message.author.id)
-        allowed = is_owner_operator(message.author) or has_mod_role(member) or is_privileged_member(member, message.guild)
-        if not allowed:
-            logging.info("broadcast_memory_intake_denied user_id=%s channel_id=%s reason=permission", message.author.id, message.channel.id)
-            if clean_content:
-                key = (getattr(message.guild, "id", 0) or 0, message.channel.id, message.author.id)
-                now = datetime.now(timezone.utc)
-                last = _broadcast_memory_denial_last_at.get(key)
-                if not last or (now - last).total_seconds() >= BROADCAST_MEMORY_DENIAL_COOLDOWN_SECONDS:
-                    _broadcast_memory_denial_last_at[key] = now
-                    await message.reply("Not stored. Broadcast memory is operator-only. Ask a mod/operator to repost this as an official note, or discuss it in the public/R&D lane first.")
+        if await maybe_reject_unauthorized_official_broadcast_memory(
+            message,
+            clean_content,
+        ):
             return
         if not clean_content:
             return
         lower_clean = clean_content.lower()
-        is_owner = bool(is_owner_operator(message.author))
-        is_mod = bool(has_mod_role(member) or is_privileged_member(member, message.guild))
         explicit_target_id = _parse_broadcast_memory_target_id(clean_content)
         resolve_last_intent = bool(re.search(r"\bbnl\b.*\b(resolve|mark)\b.*\blast memory\b", lower_clean)) or ("last memory was wrong" in lower_clean and "resolve" in lower_clean)
         replace_last_match = re.search(r"\bbnl\b.*\b(correct|replace)\b.*\blast memory\b(?:\s*with)?\s*:\s*(.+)$", clean_content, flags=re.IGNORECASE)
@@ -19985,10 +20066,14 @@ async def on_message(message: discord.Message):
                         await message.reply("Multiple matches found; please specify one id/date/topic:\n" + "\n".join(lines))
                         return
                     target = candidates[0]
-            target_id, target_date, target_user_id, target_user_name, target_summary, target_type = target
-            if (not is_owner) and int(target_user_id or 0) != int(message.author.id):
-                await message.reply("Correction not applied. That entry requires owner authority.")
-                return
+            (
+                target_id,
+                target_date,
+                _target_user_id,
+                _target_user_name,
+                _target_summary,
+                target_type,
+            ) = target
             if resolve_last_intent or resolve_by_topic or resolve_by_id:
                 changed = await asyncio.to_thread(
                     _set_broadcast_memory_status,
