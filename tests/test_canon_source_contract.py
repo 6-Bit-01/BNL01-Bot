@@ -58,6 +58,20 @@ class CanonSourceContractTests(unittest.TestCase):
         self.assertEqual(c.CANON_SOURCE_CONTRACT_VERSION, "canon_source_contract_v1")
         self.assertEqual(c.FOUNDING_MEMBERS, ("6 Bit", "DJ Floppydisc", "Cache Back", "Mac Modem"))
         self.assertEqual(c.render_founders(), "6 Bit • DJ Floppydisc • Cache Back • Mac Modem")
+        facts = {(fact.subject.key, fact.predicate): fact.value for fact in c.CANON_FACTS}
+        self.assertEqual(
+            facts[("6_bit", "primary_identity")],
+            "artist, MC, host, and founding BARCODE member first",
+        )
+        self.assertEqual(
+            facts[("galaknoise", "primary_role")],
+            "music producer for BARCODE",
+        )
+        prompt_canon = c.render_prompt_canon_block()
+        self.assertIn("6 Bit is an artist, MC, host", prompt_canon)
+        self.assertIn("he is not the music producer", prompt_canon)
+        self.assertIn("GALAKNOISE is BARCODE's music producer", prompt_canon)
+        self.assertNotIn("6 Bit is an artist, producer", prompt_canon)
 
     def test_schedule_distinguishes_intake_show_first_track(self):
         self.assertEqual(c.FRIDAY_PUBLIC_SCHEDULE.intake_begins, "6:40 PM Pacific")

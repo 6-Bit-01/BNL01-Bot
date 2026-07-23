@@ -46,6 +46,25 @@ Activation order is site first, bot second:
 
 Show-day copy follows the same boundary. The 6:40 PM Pacific intake message names the native queue only when both gates are usable; otherwise it uses provider-neutral public-intake wording. The 7:00 PM message describes the scheduled broadcast window without claiming unverified live state, and the later sponsor message remains optional and host-controlled.
 
+Holiday and occasion reflections extend the existing Ambient coordinator and
+active liaison channel. The maintained calendar targets 10:00 AM Pacific,
+stores each occurrence and canonical payload in the bot database before
+delivery, and retries provider or Discord failures while reserving and
+consuming one shared Ambient slot. Source-backed major, cultural, community,
+art, health, broadcast, archive, communication, and technology dates keep
+recurring occasion days no more than ten days apart across the Gregorian
+calendar cycle.
+They retain their real names; BARCODE flavor comes from BNL's reflection voice,
+not invented dates or renamed observances. Ordinary Ambient, Dormant Echoes,
+occasion reflections, and automatic show-day Discord posts share one daily
+quota: at most one post on a normal day and at most two only after the existing
+public activity signal crosses the high-activity thresholds. Occasion
+occurrences bypass weak-signal requirements but cannot create an extra post.
+`BNL_OCCASION_POSTS_ENABLED` defaults on and can be set to `false` to cancel
+unpublished occurrences. `BNL_OCCASION_DISABLED_IDS` accepts a comma-separated
+list of calendar IDs for per-occurrence cancellation. These controls do not
+activate queue access, Journal reuse, or any memory-v2 live gate.
+
 Importing `bnl01_bot` does not create a Gemini client or open provider transports. The client is created and cached on the first generation request, so tests, diagnostics, and tooling can import the runtime without valid provider networking.
 
 Run the bot only after the deployment environment is configured:
