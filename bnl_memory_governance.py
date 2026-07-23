@@ -20,7 +20,10 @@ from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 from bnl_dossier_source_packets import subject_key as normalized_subject_key
 from bnl_journal import purge_user_journal_derivatives_on_connection
-from bnl_journal_source_store import purge_user_discord_sources_on_connection
+from bnl_journal_source_store import (
+    journal_release_privacy_fence,
+    purge_user_discord_sources_on_connection,
+)
 from bnl_memory_ledger import ensure_memory_ledger_schema, subject_key_for_user
 from bnl_relationship_engine import complete_delete_relationship_v2, ensure_relationship_v2_schema, propagate_ledger_lifecycle
 
@@ -628,7 +631,7 @@ def _cleanup_canonical_moment(conn: sqlite3.Connection, guild_id: int, moment_id
         # Remove lineage edges from deleted sources; keep canonical row reachable but not dangling to deleted member entries.
         counts["canonical_ledger_lineage"] = counts.get("canonical_ledger_lineage", 0) + conn.execute("DELETE FROM memory_ledger_lineage WHERE guild_id=? AND entry_id=? AND target_entry_id NOT IN (SELECT entry_id FROM memory_ledger_entries WHERE guild_id=?)", (guild_id, canonical, guild_id)).rowcount
 
-def complete_delete_member_data(conn: sqlite3.Connection, *, guild_id: int, user_id: int, confirmation: str, inject_failure: bool = False) -> Dict[str, Any]:
+def _complete_delete_member_data(conn: sqlite3.Connection, *, guild_id: int, user_id: int, confirmation: str, inject_failure: bool = False) -> Dict[str, Any]:
     if confirmation != "DELETE MY BNL DATA %s" % guild_id: return {"ok": False, "reason": "confirmation_required"}
     ensure_governance_schema(conn); rid = _receipt("complete_delete", guild_id, user_id); now = _now(); counts: Dict[str, int] = {}; subject = subject_key_for_user(user_id); subject_hash = _subject_hash(user_id)
     scrub_values = _safe_text_values(conn, guild_id, user_id)
@@ -734,3 +737,35 @@ def complete_delete_member_data(conn: sqlite3.Connection, *, guild_id: int, user
         safe_counts = {k: int(v or 0) for k, v in counts.items() if int(v or 0)}
         conn.execute("INSERT INTO memory_governance_receipts VALUES (?,?,?,?,?,?,?)", (rid, guild_id, subject_hash, "complete_delete", "", now, json.dumps(safe_counts, sort_keys=True)))
     return {"ok": True, "receipt": rid, "row_counts": counts, "idempotent": not any(counts.values()), "limitation": "Discord-hosted messages are not deleted by this bot command."}
+
+
+def complete_delete_member_data(
+    conn: sqlite3.Connection,
+    *,
+    guild_id: int,
+    user_id: int,
+    confirmation: str,
+    inject_failure: bool = False,
+) -> Dict[str, Any]:
+    """Run complete deletion before any prepared Journal can cross the POST gate."""
+    main_path = ""
+    for _seq, name, path in conn.execute("PRAGMA database_list").fetchall():
+        if str(name) == "main":
+            main_path = str(path or "")
+            break
+    if not main_path:
+        return _complete_delete_member_data(
+            conn,
+            guild_id=guild_id,
+            user_id=user_id,
+            confirmation=confirmation,
+            inject_failure=inject_failure,
+        )
+    with journal_release_privacy_fence(main_path):
+        return _complete_delete_member_data(
+            conn,
+            guild_id=guild_id,
+            user_id=user_id,
+            confirmation=confirmation,
+            inject_failure=inject_failure,
+        )

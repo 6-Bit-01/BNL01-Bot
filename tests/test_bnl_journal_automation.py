@@ -502,21 +502,24 @@ class JournalAutomationTests(unittest.TestCase):
         self.assertEqual(7, weekly.aggregate_counts["daysObserved"])
 
     def test_weekly_refuses_archive_fallback_or_incomplete_coverage(self):
-        monday = date(2026, 7, 13)
-        base_packet = journal.build_packet_from_sources(
-            self.db,
-            1,
-            "2026-07-14T02:00:00Z",
-            "2026-07-21T02:00:00Z",
-            [],
-            [],
-            entry_kind="weekly",
-        )
         cases = (
             ({"sourceArchiveAvailable": False, "coverageComplete": True}, "held", "source_archive_unavailable"),
             ({"sourceArchiveAvailable": True, "coverageComplete": False}, "incomplete", "window_began_before_archive_activation"),
         )
-        for flags, expected_status, expected_reason in cases:
+        # Each case uses its own occurrence. A frozen packet is now durable by
+        # design and must not be replaced by a later retry of the same week.
+        for index, (flags, expected_status, expected_reason) in enumerate(cases):
+            monday = date(2026, 7, 13) + timedelta(days=7 * index)
+            start, end, _ = automation._weekly_period_for_monday(monday)
+            base_packet = journal.build_packet_from_sources(
+                self.db,
+                1,
+                start,
+                end,
+                [],
+                [],
+                entry_kind="weekly",
+            )
             packet = dict(base_packet)
             packet.update(flags)
             with self.subTest(flags=flags), patch.object(

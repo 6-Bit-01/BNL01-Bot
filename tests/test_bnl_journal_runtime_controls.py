@@ -6,6 +6,8 @@ import tempfile
 import unittest
 from unittest import mock
 
+import bnl_journal as journal
+import bnl_journal_automation as automation
 import bnl_journal_source_store as source_store
 from bnl_journal_automation import AutomationResult
 
@@ -182,6 +184,67 @@ class JournalRuntimeControlTests(unittest.TestCase):
             daily.call_args.kwargs["memory_excluded_entry_ids"],
         )
 
+    def test_memory_exclusion_snapshot_survives_outage_and_confirmed_empty(self):
+        temp = tempfile.NamedTemporaryFile(delete=False)
+        db_path = temp.name
+        temp.close()
+        try:
+            base = {
+                "journalAutoPublishEnabled": True,
+                "journalDailyEnabled": True,
+                "journalWeeklyEnabled": True,
+            }
+            with mock.patch.object(bnl01_bot, "DB_FILE", db_path):
+                live = bnl01_bot._journal_control_flags_for_guild(
+                    1,
+                    {
+                        "config": {},
+                        "memoryExcludedEntryIds": ["journal-z", "journal-a"],
+                    },
+                    base,
+                )
+                self.assertTrue(live["journalMemoryExclusionsConfirmed"])
+                self.assertEqual(
+                    ["journal-z", "journal-a"],
+                    live["journalMemoryExcludedEntryIds"],
+                )
+
+                after_restart_outage = bnl01_bot._journal_control_flags_for_guild(
+                    1,
+                    None,
+                    base,
+                )
+                self.assertTrue(
+                    after_restart_outage["journalMemoryExclusionsConfirmed"]
+                )
+                self.assertEqual(
+                    ["journal-a", "journal-z"],
+                    after_restart_outage["journalMemoryExcludedEntryIds"],
+                )
+
+                confirmed_empty = bnl01_bot._journal_control_flags_for_guild(
+                    1,
+                    {"config": {}, "memoryExcludedEntryIds": []},
+                    base,
+                )
+                self.assertTrue(confirmed_empty["journalMemoryExclusionsConfirmed"])
+                self.assertEqual([], confirmed_empty["journalMemoryExcludedEntryIds"])
+                stored, confirmed = bnl01_bot.load_journal_memory_exclusions(db_path, 1)
+                self.assertTrue(confirmed)
+                self.assertEqual(set(), stored)
+
+            second = tempfile.NamedTemporaryFile(delete=False)
+            second_path = second.name
+            second.close()
+            try:
+                with mock.patch.object(bnl01_bot, "DB_FILE", second_path):
+                    cold = bnl01_bot._journal_control_flags_for_guild(1, None, base)
+                self.assertFalse(cold["journalMemoryExclusionsConfirmed"])
+            finally:
+                os.unlink(second_path)
+        finally:
+            os.unlink(db_path)
+
     def test_control_flag_fetch_failure_retains_confirmed_pause(self):
         paused = {
             "websiteRelayEnabled": True,
@@ -226,6 +289,7 @@ class JournalRuntimeControlTests(unittest.TestCase):
         with mock.patch.object(bnl01_bot, "resolve_network_guild_id", return_value=1), \
              mock.patch.object(bnl01_bot, "get_bnl_control_flags", return_value=cached_flags), \
              mock.patch.object(bnl01_bot, "_journal_control_request_sync", return_value=(None, "control_plane_timeout")), \
+             mock.patch.object(bnl01_bot, "load_journal_memory_exclusions", return_value=(set(), False)), \
              mock.patch.object(bnl01_bot, "_journal_heartbeat_sync", return_value=(None, "")), \
              mock.patch.object(bnl01_bot, "journal_automation_status", return_value={}), \
              mock.patch.object(bnl01_bot, "run_journal_automation_once", new=runner):
@@ -235,7 +299,7 @@ class JournalRuntimeControlTests(unittest.TestCase):
             1,
             cadence="scheduled",
             force=False,
-            flags=cached_flags,
+            flags={**cached_flags, "journalMemoryExclusionsConfirmed": False},
         )
         self.assertEqual("not_due", results[0]["status"])
         self.assertEqual("no_schedule_due", results[0]["reason"])
@@ -254,6 +318,7 @@ class JournalRuntimeControlTests(unittest.TestCase):
              mock.patch.object(bnl01_bot, "BNL_JOURNAL_AUTOMATION_ENABLED", True), \
              mock.patch.object(bnl01_bot, "get_bnl_control_flags", return_value=cached_flags), \
              mock.patch.object(bnl01_bot, "_journal_control_request_sync", return_value=(None, "control_plane_timeout")), \
+             mock.patch.object(bnl01_bot, "load_journal_memory_exclusions", return_value=(set(), False)), \
              mock.patch.object(bnl01_bot, "_journal_heartbeat_sync", return_value=(None, "")), \
              mock.patch.object(bnl01_bot, "journal_automation_status", return_value={}), \
              mock.patch.object(bnl01_bot, "run_scheduled_journal_automation") as scheduled:
@@ -322,12 +387,72 @@ class JournalRuntimeControlTests(unittest.TestCase):
                     channel_policy="public_home" if source_kind == "discord_message" else "public_relay",
                 )
 
+            journal.ensure_schema(db_path)
+            automation.ensure_schema(db_path)
+            source_event = next(
+                event
+                for event in source_store.query_source_events(db_path, 1, 0, 2_000).events
+                if event["source_key"] == "u7-g1"
+            )
+            claim, run_id, epoch, _ = automation._claim_preparation(
+                db_path,
+                1,
+                "daily",
+                "2026-07-20T02:00:00Z",
+                "2026-07-21T02:00:00Z",
+                force=True,
+            )
+            self.assertEqual("claimed", claim)
+            frozen_packet = {
+                "entryKind": "daily",
+                "sourceArchiveAvailable": True,
+                "coverageComplete": True,
+                "sourceWindowStart": "2026-07-20T02:00:00Z",
+                "sourceWindowEnd": "2026-07-21T02:00:00Z",
+                "aggregateCounts": {"eligibleConversations": 1},
+                "privateSources": [
+                    {
+                        "refId": f"fresh:{source_event['event_seq']}",
+                        "sourceKind": "conversation",
+                        "subjectRef": "discord_user:7",
+                        "summary": "durable source text",
+                    }
+                ],
+                "safeSources": [],
+                "privateContextLaneProvenance": {},
+            }
+            frozen, packet_hash, reason = automation._freeze_or_load_packet(
+                db_path,
+                1,
+                run_id,
+                epoch,
+                lambda: frozen_packet,
+            )
+            self.assertEqual(frozen_packet, frozen)
+            self.assertTrue(packet_hash)
+            self.assertEqual("", reason)
+            with sqlite3.connect(db_path) as conn:
+                conn.execute(
+                    "UPDATE bnl_journal_automation_runs "
+                    "SET lifecycle_state='prepared',lease_expires_at=NULL WHERE run_id=?",
+                    (run_id,),
+                )
+
             with mock.patch.object(bnl01_bot, "DB_FILE", db_path):
                 self.assertEqual(1, bnl01_bot.clear_user_history(7, 1))
                 self.assertEqual(
                     {"u8-g1", "relay-g1"},
                     {event["source_key"] for event in source_store.query_source_events(db_path, 1, 0, 2_000).events},
                 )
+                with sqlite3.connect(db_path) as conn:
+                    lifecycle, frozen_json, prepared_hash = conn.execute(
+                        "SELECT lifecycle_state,frozen_packet_json,prepared_payload_hash "
+                        "FROM bnl_journal_automation_runs WHERE run_id=?",
+                        (run_id,),
+                    ).fetchone()
+                self.assertEqual("held", lifecycle)
+                self.assertIsNone(frozen_json)
+                self.assertIsNone(prepared_hash)
                 self.assertEqual(1, bnl01_bot.clear_guild_history(1))
 
             self.assertEqual(

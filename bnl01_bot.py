@@ -77,23 +77,30 @@ from bnl_journal import (
     deliver_approved as deliver_approved_journal,
     generate_and_store_draft as generate_and_store_journal_draft,
     preview as preview_journal_draft,
+    purge_guild_journal_derivatives_on_connection,
+    purge_user_journal_derivatives_on_connection,
     regenerate_draft as regenerate_journal_draft,
     rehydrate_published_entries as rehydrate_published_journal_entries,
     reject_draft as reject_journal_draft,
 )
 from bnl_journal_source_store import (
-    purge_guild_discord_sources as purge_guild_journal_sources,
-    purge_user_discord_sources as purge_user_journal_sources,
+    ensure_schema as ensure_journal_source_schema,
+    journal_release_privacy_fence,
+    purge_guild_discord_sources_on_connection,
+    purge_user_discord_sources_on_connection,
     record_source_event as record_journal_source_event,
     sanitize_summary as sanitize_journal_source_summary,
     timestamp_to_epoch_ms as journal_timestamp_to_epoch_ms,
 )
 from bnl_journal_automation import (
     automation_status as journal_automation_status,
+    load_journal_memory_exclusions,
+    release_prepared_entry as release_prepared_journal_entry,
     result_dict as journal_automation_result_dict,
     run_daily as run_daily_journal_automation,
     run_scheduled as run_scheduled_journal_automation,
     run_weekly as run_weekly_journal_automation,
+    store_journal_memory_exclusions,
 )
 from bnl_website_contract_v2 import (
     ContractV2Error,
@@ -6054,6 +6061,44 @@ def _journal_control_flags(control: dict | None, fallback: dict) -> dict:
     return flags
 
 
+def _journal_control_flags_for_guild(
+    guild_id: int,
+    control: dict | None,
+    fallback: dict,
+) -> dict:
+    """Resolve live controls over the last durable eligibility snapshot."""
+    flags = dict(fallback or {})
+    try:
+        stored_ids, stored_confirmed = load_journal_memory_exclusions(
+            DB_FILE,
+            int(guild_id),
+        )
+    except sqlite3.Error:
+        stored_ids, stored_confirmed = set(), False
+        logging.exception(
+            "journal_memory_exclusion_snapshot_load_failed guild=%s",
+            guild_id,
+        )
+    if stored_confirmed:
+        flags["journalMemoryExcludedEntryIds"] = sorted(stored_ids)
+    flags["journalMemoryExclusionsConfirmed"] = bool(
+        stored_confirmed or flags.get("journalMemoryExclusionsConfirmed", False)
+    )
+    flags = _journal_control_flags(control, flags)
+    live_exclusions = control.get("memoryExcludedEntryIds") if isinstance(control, dict) else None
+    if isinstance(live_exclusions, list):
+        confirmed_ids = set(flags.get("journalMemoryExcludedEntryIds") or [])
+        flags["journalMemoryExclusionsConfirmed"] = True
+        try:
+            store_journal_memory_exclusions(DB_FILE, int(guild_id), confirmed_ids)
+        except sqlite3.Error:
+            logging.exception(
+                "journal_memory_exclusion_snapshot_store_failed guild=%s",
+                guild_id,
+            )
+    return flags
+
+
 def _journal_control_claim_sync(control: dict | None) -> tuple[dict | None, str]:
     requests = control.get("runRequests") if isinstance(control, dict) else None
     if not isinstance(requests, list):
@@ -6094,6 +6139,19 @@ def _journal_control_claim_sync(control: dict | None) -> tuple[dict | None, str]
 
 def _journal_site_run_state(status: str) -> str:
     normalized = str(status or "").strip().lower()
+    if normalized in {
+        "preparing",
+        "prepared",
+        "waiting",
+        "waiting_for_release",
+        "waiting_release",
+        "delivering",
+    }:
+        # The current site contract has no separate preparation lifecycle.
+        # These are active, nonterminal phases rather than failures; preserve
+        # the exact internal phase in the run detail while projecting the
+        # compatible existing state.
+        return "running"
     if normalized in {
         "running", "published", "held", "delivery_failed", "busy", "backoff",
         "failed", "complete", "already_processed", "disabled",
@@ -6200,7 +6258,15 @@ async def run_journal_automation_once(
             effective_flags = flags
             if effective_flags is None:
                 effective_flags = await asyncio.to_thread(get_bnl_control_flags, force_refresh=force)
+                effective_flags = _journal_control_flags_for_guild(
+                    guild_id,
+                    None,
+                    effective_flags,
+                )
             memory_excluded_entry_ids = set(effective_flags.get("journalMemoryExcludedEntryIds") or [])
+            memory_exclusions_confirmed = bool(
+                effective_flags.get("journalMemoryExclusionsConfirmed", True)
+            )
             if not effective_flags.get("journalAutoPublishEnabled", True):
                 results = [_journal_control_result(cadence, "paused", "auto_publish_paused")]
             elif cadence == "daily" and not effective_flags.get("journalDailyEnabled", True):
@@ -6217,6 +6283,7 @@ async def run_journal_automation_once(
                     BNL_API_KEY,
                     force=force,
                     memory_excluded_entry_ids=memory_excluded_entry_ids,
+                    memory_exclusions_confirmed=memory_exclusions_confirmed,
                 )
                 results = [journal_automation_result_dict(result)]
             elif cadence == "weekly":
@@ -6229,6 +6296,7 @@ async def run_journal_automation_once(
                     BNL_API_KEY,
                     force=force,
                     memory_excluded_entry_ids=memory_excluded_entry_ids,
+                    memory_exclusions_confirmed=memory_exclusions_confirmed,
                 )
                 results = [journal_automation_result_dict(result)]
             else:
@@ -6267,7 +6335,7 @@ async def run_journal_automation_control_cycle(guild_id: int) -> list[dict]:
     ):
         control = None
         control_error = control_error or "control_plane_response_invalid"
-    flags = _journal_control_flags(control, base_flags)
+    flags = _journal_control_flags_for_guild(guild_id, control, base_flags)
     if control is None:
         reason = "control_plane_unavailable:%s" % (control_error or "control_get_failed")
         # The control endpoint is useful for remote Run Now requests, but it
@@ -6358,7 +6426,7 @@ async def maybe_handle_journal_command(message: discord.Message, clean_content: 
         if action == "status":
             flags = await asyncio.to_thread(get_bnl_control_flags, force_refresh=True)
             control, control_error = await asyncio.to_thread(_journal_control_request_sync, "GET")
-            flags = _journal_control_flags(control, flags)
+            flags = _journal_control_flags_for_guild(guild_id, control, flags)
             status = await asyncio.to_thread(journal_automation_status, DB_FILE, guild_id)
             last_state = status.get("lastState") if isinstance(status.get("lastState"), dict) else {}
             await message.reply(
@@ -6375,7 +6443,7 @@ async def maybe_handle_journal_command(message: discord.Message, clean_content: 
             cadence = "daily" if action == "run-daily" else "weekly"
             flags = await asyncio.to_thread(get_bnl_control_flags, force_refresh=True)
             control, _ = await asyncio.to_thread(_journal_control_request_sync, "GET")
-            flags = _journal_control_flags(control, flags)
+            flags = _journal_control_flags_for_guild(guild_id, control, flags)
             results = await run_journal_automation_once(guild_id, cadence=cadence, force=True, flags=flags)
             for item in results:
                 await asyncio.to_thread(_journal_report_run_sync, item, guild_id=guild_id)
@@ -6409,7 +6477,7 @@ async def maybe_handle_journal_command(message: discord.Message, clean_content: 
         if action == "create":
             hours = _parse_journal_hours(options.get("hours") or options.get("window"))
             control, _ = await asyncio.to_thread(_journal_control_request_sync, "GET")
-            flags = _journal_control_flags(control, {})
+            flags = _journal_control_flags_for_guild(guild_id, control, {})
             result = await asyncio.to_thread(
                 generate_and_store_journal_draft,
                 DB_FILE,
@@ -6427,7 +6495,7 @@ async def maybe_handle_journal_command(message: discord.Message, clean_content: 
             entry_id = options.get("entry_id") or ""
             hours = _parse_journal_hours(options.get("hours") or options.get("window"))
             control, _ = await asyncio.to_thread(_journal_control_request_sync, "GET")
-            flags = _journal_control_flags(control, {})
+            flags = _journal_control_flags_for_guild(guild_id, control, {})
             result = await asyncio.to_thread(
                 regenerate_journal_draft,
                 DB_FILE,
@@ -6473,8 +6541,37 @@ async def maybe_handle_journal_command(message: discord.Message, clean_content: 
             if not BNL_API_KEY or not _journal_website_base_url():
                 await message.reply("Journal delivery not attempted: website URL or BNL API key missing.")
                 return True
-            result = await asyncio.to_thread(deliver_approved_journal, DB_FILE, guild_id, entry_id, _journal_website_base_url(), BNL_API_KEY)
-            await message.reply(f"Journal delivery result: state=`{result.status}` reason=`{result.reason}` http=`{result.http_status}`")
+            flags = await asyncio.to_thread(get_bnl_control_flags, force_refresh=True)
+            control, _ = await asyncio.to_thread(_journal_control_request_sync, "GET")
+            flags = _journal_control_flags_for_guild(guild_id, control, flags)
+            result = await asyncio.to_thread(
+                release_prepared_journal_entry,
+                DB_FILE,
+                guild_id,
+                entry_id,
+                _journal_website_base_url(),
+                BNL_API_KEY,
+                force=True,
+                memory_excluded_entry_ids=set(flags.get("journalMemoryExcludedEntryIds") or []),
+                memory_exclusions_confirmed=bool(
+                    flags.get("journalMemoryExclusionsConfirmed", False)
+                ),
+            )
+            if result is None:
+                # Manual review drafts are intentionally outside the scheduled
+                # occurrence owner and retain their existing explicit retry path.
+                result = await asyncio.to_thread(
+                    deliver_approved_journal,
+                    DB_FILE,
+                    guild_id,
+                    entry_id,
+                    _journal_website_base_url(),
+                    BNL_API_KEY,
+                )
+            await message.reply(
+                f"Journal delivery result: state=`{result.status}` reason=`{result.reason}` "
+                f"http=`{int(getattr(result, 'http_status', 0) or 0)}`"
+            )
             return True
     except Exception:
         logging.exception("journal_command_failed action=%s reason=unexpected_exception", action)
@@ -12164,19 +12261,17 @@ def get_active_show_state_override(guild_id: int, show_date: str = None):
 
 def clear_active_show_state_overrides(guild_id: int):
     now_iso = datetime.now(PACIFIC_TZ).isoformat()
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    cursor.execute(
-        """
-        UPDATE broadcast_memory
-        SET status='resolved', updated_at=?
-        WHERE guild_id=? AND status='active' AND entry_type='show_state_override'
-        """,
-        (now_iso, guild_id),
-    )
-    changed = cursor.rowcount
-    conn.commit()
-    conn.close()
+    with journal_release_privacy_fence(DB_FILE):
+        with sqlite3.connect(DB_FILE, timeout=30) as conn:
+            cursor = conn.execute(
+                """
+                UPDATE broadcast_memory
+                SET status='resolved', updated_at=?
+                WHERE guild_id=? AND status='active' AND entry_type='show_state_override'
+                """,
+                (now_iso, guild_id),
+            )
+            changed = cursor.rowcount
     return int(changed or 0)
 
 def _summary_snippet(text: str, limit: int = 70) -> str:
@@ -12235,26 +12330,53 @@ def _find_active_broadcast_memory_by_id(guild_id: int, memory_id: int):
 
 def _set_broadcast_memory_status(memory_id: int, status: str, actor_id: int, actor_name: str, reason: str = ""):
     now_iso = datetime.now(PACIFIC_TZ).isoformat()
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    cursor.execute(
-        """
-        UPDATE broadcast_memory
-        SET status=?, updated_at=?, corrected_by_user_id=?, corrected_by_name=?, correction_reason=?
-        WHERE id=?
-        """,
-        (status, now_iso, actor_id, actor_name, reason[:200], memory_id),
-    )
-    changed = cursor.rowcount
-    row = cursor.execute("SELECT guild_id, superseded_by_id FROM broadcast_memory WHERE id=?", (memory_id,)).fetchone()
-    conn.commit()
-    conn.close()
+    with journal_release_privacy_fence(DB_FILE):
+        with sqlite3.connect(DB_FILE, timeout=30) as conn:
+            cursor = conn.execute(
+                """
+                UPDATE broadcast_memory
+                SET status=?, updated_at=?, corrected_by_user_id=?, corrected_by_name=?, correction_reason=?
+                WHERE id=?
+                """,
+                (status, now_iso, actor_id, actor_name, reason[:200], memory_id),
+            )
+            changed = cursor.rowcount
+            row = conn.execute(
+                "SELECT guild_id, superseded_by_id FROM broadcast_memory WHERE id=?",
+                (memory_id,),
+            ).fetchone()
     if changed and row and not (str(status or "").lower() == "superseded" and not row[1]):
         _shadow_memory_ledger_write(
             "broadcast_memory_status",
             lambda ledger_conn: shadow_broadcast_status_event(ledger_conn, row_id=memory_id, guild_id=int(row[0] or 0), status=status, updated_at=now_iso, actor_id=actor_id, actor_name=actor_name, superseded_by_id=row[1]),
             guild_id=int(row[0] or 0), source_table="broadcast_memory", source_row_id=memory_id, source_revision=f"event:status:{status}:{now_iso.lower()}", source_event_key=f"status:{status}",
         )
+    return int(changed or 0)
+
+
+def _supersede_broadcast_memory(
+    memory_id: int,
+    replacement_id: int,
+    actor_id: int,
+    actor_name: str,
+    updated_at: str,
+) -> int:
+    """Make an established-memory row ineligible behind the Journal fence."""
+    with journal_release_privacy_fence(DB_FILE):
+        with sqlite3.connect(DB_FILE, timeout=30) as conn:
+            changed = conn.execute(
+                "UPDATE broadcast_memory SET status='superseded', superseded_by_id=?, "
+                "updated_at=?, corrected_by_user_id=?, corrected_by_name=?, correction_reason=? "
+                "WHERE id=?",
+                (
+                    int(replacement_id),
+                    updated_at,
+                    int(actor_id),
+                    actor_name,
+                    "explicit correction/replace request",
+                    int(memory_id),
+                ),
+            ).rowcount
     return int(changed or 0)
 
 async def process_broadcast_memory_note(message) -> dict:
@@ -12702,35 +12824,72 @@ def build_room_first_direct_context(guild_id: int, channel_id: int, channel_name
     return formatted
 
 def clear_guild_history(guild_id: int):
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    cursor.execute("DELETE FROM conversations WHERE guild_id = ?", (guild_id,))
-    rows_deleted = cursor.rowcount
-    conn.commit()
-    conn.close()
-    purged_sources = purge_guild_journal_sources(DB_FILE, guild_id)
+    ensure_journal_schema(DB_FILE)
+    ensure_journal_source_schema(DB_FILE)
+    with journal_release_privacy_fence(DB_FILE):
+        with sqlite3.connect(DB_FILE, timeout=30) as conn:
+            conn.execute("BEGIN EXCLUSIVE")
+            cursor = conn.execute("DELETE FROM conversations WHERE guild_id = ?", (guild_id,))
+            rows_deleted = cursor.rowcount
+            derivative_counts = purge_guild_journal_derivatives_on_connection(
+                conn,
+                guild_id,
+            )
+            purged_sources = purge_guild_discord_sources_on_connection(conn, guild_id)
+            conn.commit()
     logging.info(
-        "journal_source_archive_purged scope=guild guild_id=%s rows=%s",
+        "journal_source_archive_purged scope=guild guild_id=%s rows=%s derivatives=%s",
         guild_id,
         purged_sources,
+        derivative_counts,
     )
     return rows_deleted
 
 def clear_user_history(user_id: int, guild_id: int):
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    cursor.execute("DELETE FROM conversations WHERE user_id = ? AND guild_id = ?", (user_id, guild_id))
-    rows_deleted = cursor.rowcount
-    conn.commit()
-    conn.close()
-    purged_sources = purge_user_journal_sources(DB_FILE, guild_id, user_id)
+    ensure_journal_schema(DB_FILE)
+    ensure_journal_source_schema(DB_FILE)
+    with journal_release_privacy_fence(DB_FILE):
+        with sqlite3.connect(DB_FILE, timeout=30) as conn:
+            conn.execute("BEGIN EXCLUSIVE")
+            cursor = conn.execute(
+                "DELETE FROM conversations WHERE user_id = ? AND guild_id = ?",
+                (user_id, guild_id),
+            )
+            rows_deleted = cursor.rowcount
+            derivative_counts = purge_user_journal_derivatives_on_connection(
+                conn,
+                guild_id,
+                user_id,
+            )
+            purged_sources = purge_user_discord_sources_on_connection(
+                conn,
+                guild_id,
+                user_id,
+            )
+            conn.commit()
     logging.info(
-        "journal_source_archive_purged scope=user guild_id=%s user_id=%s rows=%s",
+        "journal_source_archive_purged scope=user guild_id=%s user_id=%s rows=%s derivatives=%s",
         guild_id,
         user_id,
         purged_sources,
+        derivative_counts,
     )
     return rows_deleted
+
+
+def _complete_delete_member_data_sync(
+    guild_id: int,
+    user_id: int,
+    confirmation: str,
+) -> dict:
+    with sqlite3.connect(DB_FILE, timeout=30) as conn:
+        return complete_delete_member_data(
+            conn,
+            guild_id=guild_id,
+            user_id=user_id,
+            confirmation=confirmation,
+        )
+
 
 def get_recent_guild_user_messages(guild_id: int, limit: int = AMBIENT_CONTEXT_MESSAGES):
     conn = sqlite3.connect(DB_FILE)
@@ -19715,7 +19874,14 @@ async def on_message(message: discord.Message):
                 await message.reply("Correction not applied. That entry requires owner authority.")
                 return
             if resolve_last_intent or resolve_by_topic or resolve_by_id:
-                changed = _set_broadcast_memory_status(target_id, "resolved", message.author.id, message.author.display_name, "explicit resolve request")
+                changed = await asyncio.to_thread(
+                    _set_broadcast_memory_status,
+                    target_id,
+                    "resolved",
+                    message.author.id,
+                    message.author.display_name,
+                    "explicit resolve request",
+                )
                 if not changed:
                     await message.reply("Correction not applied. I could not find a matching active broadcast-memory entry.")
                     return
@@ -19736,8 +19902,18 @@ async def on_message(message: discord.Message):
             faux_message = type("Msg", (), {"content": correction_text, "author": message.author})()
             processed = await process_broadcast_memory_note(faux_message)
             if processed.get("entry_type") == "show_state_resume":
-                _set_broadcast_memory_status(target_id, "resolved", message.author.id, message.author.display_name, "official correction schedule resumed")
-                cleared = clear_active_show_state_overrides(message.guild.id)
+                await asyncio.to_thread(
+                    _set_broadcast_memory_status,
+                    target_id,
+                    "resolved",
+                    message.author.id,
+                    message.author.display_name,
+                    "official correction schedule resumed",
+                )
+                cleared = await asyncio.to_thread(
+                    clear_active_show_state_overrides,
+                    message.guild.id,
+                )
                 await message.reply(f"Logged. Normal schedule restored; resolved overrides: {cleared}.")
                 return
             if processed.get("entry_type") == "reject":
@@ -19755,11 +19931,14 @@ async def on_message(message: discord.Message):
             processed["supersedes_id"] = target_id
             new_id = add_broadcast_memory_entry(message.guild.id, faux_message, processed)
             updated_at = datetime.now(PACIFIC_TZ).isoformat()
-            conn = sqlite3.connect(DB_FILE)
-            cursor = conn.cursor()
-            cursor.execute("UPDATE broadcast_memory SET status='superseded', superseded_by_id=?, updated_at=?, corrected_by_user_id=?, corrected_by_name=?, correction_reason=? WHERE id=?", (new_id, updated_at, message.author.id, message.author.display_name, "explicit correction/replace request", target_id))
-            conn.commit()
-            conn.close()
+            await asyncio.to_thread(
+                _supersede_broadcast_memory,
+                target_id,
+                new_id,
+                message.author.id,
+                message.author.display_name,
+                updated_at,
+            )
             _shadow_memory_ledger_write(
                 "broadcast_memory_status",
                 lambda ledger_conn: shadow_broadcast_status_event(ledger_conn, row_id=target_id, guild_id=message.guild.id, status="superseded", updated_at=updated_at, actor_id=message.author.id, actor_name=message.author.display_name, superseded_by_id=new_id),
@@ -19770,7 +19949,10 @@ async def on_message(message: discord.Message):
         processed_entries = await process_broadcast_memory_notes(message)
         processed = processed_entries[0] if processed_entries else {"entry_type": "reject", "reason": "insufficient signal"}
         if processed.get("entry_type") == "show_state_resume":
-            cleared = clear_active_show_state_overrides(message.guild.id)
+            cleared = await asyncio.to_thread(
+                clear_active_show_state_overrides,
+                message.guild.id,
+            )
             await message.reply(f"Logged. Normal schedule restored; resolved overrides: {cleared}.")
             return
         if processed.get("entry_type") == "reject":
@@ -20999,7 +21181,7 @@ async def clear_channel(interaction: discord.Interaction):
 @tree.command(name="clearguildhistory", description="Clear all BNL-01 conversation history for this server.")
 @app_commands.checks.has_permissions(administrator=True)
 async def clear_guild_history_cmd(interaction: discord.Interaction):
-    rows_deleted = clear_guild_history(interaction.guild.id)
+    rows_deleted = await asyncio.to_thread(clear_guild_history, interaction.guild.id)
     logging.info(f"🗑️ Cleared {rows_deleted} guild conversation records in {interaction.guild.name}")
     await interaction.response.send_message(
         f"✅ Cleared **{rows_deleted}** conversation records from this server's Network archives.",
@@ -21067,7 +21249,11 @@ async def myname(interaction: discord.Interaction, name: str):
 
 @tree.command(name="clearhistory", description="Clear only your stored conversation rows in this server.")
 async def clear_history(interaction: discord.Interaction):
-    rows_deleted = clear_user_history(interaction.user.id, interaction.guild.id)
+    rows_deleted = await asyncio.to_thread(
+        clear_user_history,
+        interaction.user.id,
+        interaction.guild.id,
+    )
     logging.info(f"🗑️ Cleared {rows_deleted} conversation records for {interaction.user.name}")
     await interaction.response.send_message(
         f"✅ Cleared **{rows_deleted}** BNL-stored conversation rows for you in this server. Durable facts, profile data, relationship data, and derived memory were not removed by `/clearhistory`; use `/memory_complete_delete` for broader bot-held personal data deletion. Discord's own message storage is not affected.",
@@ -21112,8 +21298,12 @@ async def memory_forget(interaction: discord.Interaction, reference: str):
 async def memory_complete_delete(interaction: discord.Interaction, confirmation: str):
     if not interaction.guild:
         await interaction.response.send_message("❌ This command can only be used in a server.", ephemeral=True); return
-    with sqlite3.connect(DB_FILE) as conn:
-        result = complete_delete_member_data(conn, guild_id=interaction.guild.id, user_id=interaction.user.id, confirmation=confirmation.strip())
+    result = await asyncio.to_thread(
+        _complete_delete_member_data_sync,
+        interaction.guild.id,
+        interaction.user.id,
+        confirmation.strip(),
+    )
     if result.get("ok"):
         purge_member_memory_caches(interaction.user.id, interaction.guild.id)
         await interaction.response.send_message(f"✅ Complete delete finished for bot-held personal data in this server. Receipt `{result.get('receipt')}`. This does not delete messages stored by Discord itself.", ephemeral=True)
