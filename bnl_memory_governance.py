@@ -640,6 +640,16 @@ def _complete_delete_member_data(conn: sqlite3.Connection, *, guild_id: int, use
         # Core member-owned tables.
         for table in ("conversations", "user_profiles", "user_memory_facts", "user_habits", "relationship_state", "relationship_journal", "memory_tiers", "response_style_log"):
             counts[table] = _delete_by_user(conn, table, guild_id, user_id)
+        if _table_exists(conn, "ambient_log"):
+            ambient_cols = _cols(conn, "ambient_log")
+            if {"guild_id", "subject_user_id"}.issubset(ambient_cols):
+                counts["ambient_log_dormant_echo"] = conn.execute(
+                    """
+                    DELETE FROM ambient_log
+                    WHERE guild_id = ? AND subject_user_id = ?
+                    """,
+                    (guild_id, user_id),
+                ).rowcount
         ensure_relationship_v2_schema(conn)
         counts.update(complete_delete_relationship_v2(conn, guild_id=guild_id, user_id=user_id))
         # Community/member activity schemas use varied identity columns.

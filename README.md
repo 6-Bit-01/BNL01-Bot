@@ -65,6 +65,22 @@ unpublished occurrences. `BNL_OCCASION_DISABLED_IDS` accepts a comma-separated
 list of calendar IDs for per-occurrence cancellation. These controls do not
 activate queue access, Journal reuse, or any memory-v2 live gate.
 
+Dormant Signal Echoes run only through the existing Ambient coordinator and
+only in `#barcode-bot`. A candidate must have repeated eligible public history,
+an existing familiar/trusted legacy relationship state, and no eligible public
+activity for at least 14 days. A callback also requires fresh, meaningful
+`#barcode-bot` conversation from the prior 24 hours. Selection then passes a 5%
+rarity gate plus a 21-day global and 120-day per-member cooldown. Echoes consume
+the same shared automatic-post quota as ordinary Ambient, occasions, and
+show-day output; they never ping, DM, summon, or claim the absent member is
+currently present.
+`BNL_DORMANT_ECHO_ENABLED=false` is the canary kill switch.
+`BNL_DORMANT_ECHO_SELECTION_CHANCE` may reduce the default `0.05` probability
+without changing the shared cap. The selected basis is stored on the existing
+Ambient log as counts and source-row references, never as a second proactive
+engine or new memory authority. Memory/Governance/Relationship v2 live gates
+remain unchanged.
+
 ## Relay accepted-history durability
 
 Accepted public Relays are retained indefinitely in the existing
