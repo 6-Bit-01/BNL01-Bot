@@ -23,6 +23,10 @@ class WebsiteRelayEventDrivenTests(unittest.TestCase):
         bnl01_bot.BNL_WEBSITE_CONTRACT_VERSION = "1"
         bnl01_bot.DB_FILE = self.db
         bnl01_bot._recent_relay_messages.clear()
+        bnl01_bot._recent_relay_topics.clear()
+        bnl01_bot._recent_relay_lanes_by_guild.clear()
+        bnl01_bot._recent_relay_sources_by_guild.clear()
+        bnl01_bot._last_relay_lane_by_guild.clear()
         bnl01_bot._website_relay_transaction_locks_by_guild.clear()
         bnl01_bot._website_relay_generation_tasks_by_guild.clear()
         with sqlite3.connect(self.db) as conn:
@@ -44,6 +48,11 @@ class WebsiteRelayEventDrivenTests(unittest.TestCase):
     def tearDown(self):
         bnl01_bot.DB_FILE = self.old_db
         bnl01_bot.BNL_WEBSITE_CONTRACT_VERSION = self.old_contract_version
+        bnl01_bot._recent_relay_messages.clear()
+        bnl01_bot._recent_relay_topics.clear()
+        bnl01_bot._recent_relay_lanes_by_guild.clear()
+        bnl01_bot._recent_relay_sources_by_guild.clear()
+        bnl01_bot._last_relay_lane_by_guild.clear()
         try:
             os.unlink(self.db)
         except OSError:
@@ -122,13 +131,162 @@ class WebsiteRelayEventDrivenTests(unittest.TestCase):
         state.record_publication(self.db, 42, message="Public Discord is comparing show questions with track submission context.", directive="Review those fresh public questions.", mode="OBSERVATION", relay_lane="current_signal", event_type="fresh_public_discord_activity", source_cursor=5)
         self.assertIn(state.reject_reason_for_candidate(self.db, 42, "Public Discord is comparing show questions with track submission context!", "Review those fresh public questions."), {"exact_duplicate", "near_duplicate"})
 
-    def test_history_retains_25_and_no_raw_names(self):
+    def test_permanent_history_retains_all_rows_while_recent_view_stays_25(self):
         for i in range(30):
-            state.record_publication(self.db, 42, message=f"Public Discord raised distinct track question {i} with enough detail.", directive=f"Review public context item {i}.", mode="OBSERVATION", relay_lane="current_signal", event_type="fresh_public_discord_activity", source_cursor=i)
+            state.record_publication(
+                self.db,
+                42,
+                message=f"Public Discord raised distinct track question {i} with enough detail.",
+                directive=f"Review public context item {i}.",
+                mode="OBSERVATION",
+                relay_lane="current_signal",
+                event_type="fresh_public_discord_activity",
+                source_cursor=i,
+                published_timestamp=f"2026-07-15T00:00:{i:02d}Z",
+                relay_id=f"relay-{i:02d}",
+            )
         hist = state.recent_history(self.db, 42, 50)
         self.assertEqual(len(hist), 25)
+        with sqlite3.connect(self.db) as conn:
+            permanent_count = conn.execute(
+                "SELECT COUNT(*) FROM website_relay_history WHERE guild_id=42"
+            ).fetchone()[0]
+            oldest = conn.execute(
+                """
+                SELECT public_message
+                FROM website_relay_history
+                WHERE guild_id=42
+                ORDER BY published_timestamp, relay_id
+                LIMIT 1
+                """
+            ).fetchone()[0]
+        self.assertEqual(permanent_count, 30)
+        self.assertEqual(state.accepted_publication_count(self.db, 42), 30)
+        self.assertIn("question 0", oldest)
         joined = "\n".join(str(h) for h in hist)
         self.assertNotIn("tester", joined)
+
+    def test_same_id_retry_cannot_rewrite_accepted_row_or_cross_guilds(self):
+        relay_id = "relay-immutable-01"
+        accepted_timestamp = "2026-07-01T00:00:00Z"
+        state.record_publication(
+            self.db,
+            42,
+            message="One accepted public Relay keeps its original text.",
+            directive="Keep the accepted directive exactly as published.",
+            mode="OBSERVATION",
+            relay_lane="current_signal",
+            event_type="fresh_public_discord_activity",
+            source_cursor=7,
+            published_timestamp=accepted_timestamp,
+            relay_id=relay_id,
+        )
+        state.record_publication(
+            self.db,
+            42,
+            message="One accepted public Relay keeps its original text.",
+            directive="Keep the accepted directive exactly as published.",
+            mode="DIFFERENT_RETRY_MODE",
+            relay_lane="network_posture",
+            event_type="canon",
+            source_cursor=99,
+            published_timestamp="2026-07-31T00:00:00Z",
+            relay_id=relay_id,
+        )
+        with sqlite3.connect(self.db) as connection:
+            row = connection.execute(
+                """
+                SELECT guild_id, public_message, public_directive, mode,
+                       relay_lane, event_type,
+                       highest_source_conversation_id, published_timestamp
+                FROM website_relay_history
+                WHERE relay_id=?
+                """,
+                (relay_id,),
+            ).fetchone()
+            count = connection.execute(
+                "SELECT COUNT(*) FROM website_relay_history WHERE relay_id=?",
+                (relay_id,),
+            ).fetchone()[0]
+            publication_state = connection.execute(
+                """
+                SELECT last_published_conversation_cursor,
+                       last_publication_timestamp
+                FROM website_relay_state
+                WHERE guild_id=42
+                """
+            ).fetchone()
+        self.assertEqual(count, 1)
+        self.assertEqual(
+            row,
+            (
+                42,
+                "One accepted public Relay keeps its original text.",
+                "Keep the accepted directive exactly as published.",
+                "OBSERVATION",
+                "current_signal",
+                "fresh_public_discord_activity",
+                7,
+                accepted_timestamp,
+            ),
+        )
+        self.assertEqual(publication_state, (7, accepted_timestamp))
+
+        with self.assertRaisesRegex(ValueError, "local_relay_id_conflict"):
+            state.record_publication(
+                self.db,
+                99,
+                message="One accepted public Relay keeps its original text.",
+                directive="Keep the accepted directive exactly as published.",
+                mode="OBSERVATION",
+                relay_lane="current_signal",
+                event_type="fresh_public_discord_activity",
+                source_cursor=7,
+                published_timestamp=accepted_timestamp,
+                relay_id=relay_id,
+            )
+        self.assertIsNone(state.get_cursor(self.db, 99))
+
+    def test_hydrated_placeholder_enrichment_keeps_acceptance_time(self):
+        relay_id = "relay-hydrated-01"
+        accepted_timestamp = "2026-07-01T00:00:00Z"
+        state.hydrate_publication(
+            self.db,
+            42,
+            relay_id=relay_id,
+            message="Hydrated accepted Relay text stays immutable.",
+            directive="Keep its accepted directive and time.",
+            source_class="approved_canon",
+            trigger="scheduled",
+            published_timestamp=accepted_timestamp,
+        )
+        state.record_publication(
+            self.db,
+            42,
+            message="Hydrated accepted Relay text stays immutable.",
+            directive="Keep its accepted directive and time.",
+            mode="OBSERVATION",
+            relay_lane="network_posture",
+            event_type="canon",
+            source_cursor=12,
+            published_timestamp="2026-07-31T00:00:00Z",
+            relay_id=relay_id,
+        )
+        with sqlite3.connect(self.db) as connection:
+            row = connection.execute(
+                """
+                SELECT relay_lane, event_type,
+                       highest_source_conversation_id, published_timestamp
+                FROM website_relay_history
+                WHERE relay_id=?
+                """,
+                (relay_id,),
+            ).fetchone()
+        self.assertEqual(
+            row,
+            ("network_posture", "canon", 12, accepted_timestamp),
+        )
+        self.assertEqual(state.get_cursor(self.db, 42), 12)
 
     def test_read_model_helpers_not_called_by_generation(self):
         state.bootstrap_cursor(self.db, 42, 0)
@@ -168,7 +326,10 @@ class WebsiteRelayEventDrivenTests(unittest.TestCase):
              mock.patch.object(bnl01_bot, "get_gemini_response", side_effect=fake_gemini):
             decision = self.generate()
         self.assertTrue(decision.publish)
+        self.assertEqual(decision.eventType, "fresh_public_discord_activity")
         self.assertIn("BARCODE Radio", prompts[0])
+        self.assertIn("Recent accepted Relay diversity context", prompts[0])
+        self.assertIn("avoidance guidance only", prompts[0])
 
     def test_concurrent_transactions_publish_once_and_advance_once(self):
         state.bootstrap_cursor(self.db, 42, 0)
@@ -268,6 +429,102 @@ class WebsiteRelayEventDrivenTests(unittest.TestCase):
         bnl01_bot._recent_relay_lanes_by_guild[42].clear()
         bnl01_bot._hydrate_recent_relay_memory(42)
         self.assertEqual(list(bnl01_bot._recent_relay_lanes_by_guild[42]), lanes[2:10])
+
+    def test_restart_hydration_restores_subject_source_angle_and_last_lane(self):
+        accepted = [
+            (
+                "relay-a",
+                "A public archive discussion identified one old release question.",
+                "conversation_continuity",
+                "residual_echo",
+            ),
+            (
+                "relay-b",
+                "A public track discussion compared two submission approaches.",
+                "broadcast_memory",
+                "question_formation",
+            ),
+            (
+                "relay-c",
+                "The crowd discussion asked how names should appear in a recap.",
+                "fresh_public_discord_activity",
+                "current_signal",
+            ),
+        ]
+        for index, (relay_id, message, event_type, lane) in enumerate(accepted):
+            state.record_publication(
+                self.db,
+                42,
+                message=message,
+                directive=f"Follow accepted subject {index} for a confirmed detail.",
+                mode="OBSERVATION",
+                relay_lane=lane,
+                event_type=event_type,
+                source_cursor=index,
+                published_timestamp=f"2026-07-15T00:00:0{index}Z",
+                relay_id=relay_id,
+            )
+        bnl01_bot._recent_relay_messages.clear()
+        bnl01_bot._recent_relay_topics.clear()
+        bnl01_bot._recent_relay_lanes_by_guild.clear()
+        bnl01_bot._recent_relay_sources_by_guild.clear()
+        bnl01_bot._last_relay_lane_by_guild.clear()
+
+        bnl01_bot._hydrate_recent_relay_memory(42)
+
+        self.assertEqual(
+            bnl01_bot._recent_relay_topics[42],
+            ["archive_pressure", "submission_corridor", "crowd_behavior"],
+        )
+        self.assertEqual(
+            list(bnl01_bot._recent_relay_sources_by_guild[42]),
+            ["conversation_continuity", "broadcast_memory", "fresh_discord"],
+        )
+        self.assertEqual(
+            list(bnl01_bot._recent_relay_lanes_by_guild[42]),
+            ["residual_echo", "question_formation", "current_signal"],
+        )
+        self.assertEqual(
+            bnl01_bot._last_relay_lane_by_guild[42],
+            "current_signal",
+        )
+
+    def test_restart_hydration_clears_stale_state_when_archive_is_empty(self):
+        bnl01_bot._recent_relay_messages[42] = ["stale"]
+        bnl01_bot._recent_relay_topics[42] = ["stale_topic"]
+        bnl01_bot._recent_relay_lanes_by_guild[42].append("network_posture")
+        bnl01_bot._recent_relay_sources_by_guild[42].append("canon")
+        bnl01_bot._last_relay_lane_by_guild[42] = "network_posture"
+
+        bnl01_bot._hydrate_recent_relay_memory(42)
+
+        self.assertEqual(bnl01_bot._recent_relay_messages[42], [])
+        self.assertEqual(bnl01_bot._recent_relay_topics[42], [])
+        self.assertEqual(list(bnl01_bot._recent_relay_lanes_by_guild[42]), [])
+        self.assertEqual(list(bnl01_bot._recent_relay_sources_by_guild[42]), [])
+        self.assertNotIn(42, bnl01_bot._last_relay_lane_by_guild)
+
+    def test_diversity_prompt_uses_only_grounded_accepted_history(self):
+        for index in range(30):
+            state.record_publication(
+                self.db,
+                42,
+                message=f"Accepted public archive subject {index} remains distinct.",
+                directive=f"Follow archive subject {index} for one confirmed detail.",
+                mode="OBSERVATION",
+                relay_lane="current_signal",
+                event_type="fresh_public_discord_activity",
+                source_cursor=index,
+                published_timestamp=f"2026-07-15T00:00:{index:02d}Z",
+                relay_id=f"angle-{index:02d}",
+            )
+        bnl01_bot._hydrate_recent_relay_memory(42)
+        block = bnl01_bot._relay_diversity_prompt_block(42)
+        self.assertIn("subject families: archive_pressure", block)
+        self.assertIn("source classes: fresh_discord", block)
+        self.assertIn("relay angles: current_signal", block)
+        self.assertNotIn("next presentation angle:", block)
+        self.assertEqual(len(state.recent_history(self.db, 42, 50)), 25)
 
     def test_silence_for_failure_modes_and_stock_directive(self):
         state.bootstrap_cursor(self.db, 42, 0)
@@ -506,6 +763,115 @@ class WebsiteRelayRecoveryTests(unittest.TestCase):
                 """,
                 (summary, entry_type, public_safe, usage_scope, valid_until, status, superseded_by_id),
             )
+
+    def test_quiet_source_rotation_uses_accepted_history_across_restart(self):
+        state.bootstrap_cursor(self.db, 42, 0)
+        self.add_row(
+            "A recent public archive discussion asks how release questions should be grouped."
+        )
+        self.add_broadcast_memory(
+            "Approved public relay memory compares two track-submission approaches."
+        )
+
+        first = bnl01_bot._select_approved_quiet_relay_source(42, 0, 1)
+        self.assertEqual(first.source_class, "conversation_continuity")
+        state.record_publication(
+            self.db,
+            42,
+            message="A recent public archive question remains available as continuity.",
+            directive="Follow the archive question for one confirmed grouping detail.",
+            mode="OBSERVATION",
+            relay_lane="residual_echo",
+            event_type=first.source_class,
+            source_cursor=0,
+            published_timestamp="2026-07-15T00:00:01Z",
+            relay_id="rotation-1",
+        )
+
+        state.begin_attempt(
+            self.db,
+            "rejected-not-accepted",
+            42,
+            "scheduled",
+            source_class="canon",
+        )
+        state.complete_attempt(
+            self.db,
+            "rejected-not-accepted",
+            source_class="canon",
+            outcome="rejected",
+            reason="candidate_rejected",
+        )
+        state.save_pending_v2_publication(
+            self.db,
+            42,
+            relay_id="pending-not-accepted",
+            message="Pending draft must not affect diversity.",
+            current_directive="Pending directive must not affect diversity.",
+            source_class="canon",
+            trigger="scheduled",
+            source_cursor=0,
+            source_conversation_fingerprint="pending",
+            canonical_json="{}",
+        )
+
+        bnl01_bot._recent_relay_sources_by_guild.clear()
+        second = bnl01_bot._select_approved_quiet_relay_source(42, 0, 1)
+        self.assertEqual(second.source_class, "broadcast_memory")
+        state.record_publication(
+            self.db,
+            42,
+            message="Approved memory preserves a different track-submission subject.",
+            directive="Follow the approved memory for one confirmed comparison detail.",
+            mode="OBSERVATION",
+            relay_lane="question_formation",
+            event_type=second.source_class,
+            source_cursor=0,
+            published_timestamp="2026-07-15T00:00:02Z",
+            relay_id="rotation-2",
+        )
+
+        bnl01_bot._recent_relay_sources_by_guild.clear()
+        third = bnl01_bot._select_approved_quiet_relay_source(42, 0, 1)
+        self.assertEqual(third.source_class, "canon")
+        state.record_publication(
+            self.db,
+            42,
+            message="BARCODE canon preserves a third grounded archive angle.",
+            directive="Ask which confirmed canon detail belongs in the public index.",
+            mode="OBSERVATION",
+            relay_lane="network_posture",
+            event_type=third.source_class,
+            source_cursor=0,
+            published_timestamp="2026-07-15T00:00:03Z",
+            relay_id="rotation-3",
+        )
+
+        bnl01_bot._recent_relay_sources_by_guild.clear()
+        wrapped = bnl01_bot._select_approved_quiet_relay_source(42, 0, 1)
+        self.assertEqual(wrapped.source_class, "conversation_continuity")
+        self.assertEqual(state.accepted_publication_count(self.db, 42), 3)
+
+    def test_quiet_angle_rotation_survives_restart(self):
+        first_lane = bnl01_bot._select_quiet_relay_lane(42, "canon")
+        self.assertEqual(first_lane, "question_formation")
+        state.record_publication(
+            self.db,
+            42,
+            message="BARCODE canon frames one confirmed public archive question.",
+            directive="Ask which confirmed archive detail should be indexed next.",
+            mode="OBSERVATION",
+            relay_lane=first_lane,
+            event_type="canon",
+            source_cursor=0,
+            published_timestamp="2026-07-15T00:00:01Z",
+            relay_id="angle-restart",
+        )
+        bnl01_bot._recent_relay_lanes_by_guild.clear()
+        bnl01_bot._last_relay_lane_by_guild.clear()
+        bnl01_bot._hydrate_recent_relay_memory(42)
+        second_lane = bnl01_bot._select_quiet_relay_lane(42, "canon")
+        self.assertEqual(second_lane, "network_posture")
 
     def test_bootstrap_transaction_publishes_quiet_without_replaying_history(self):
         self.add_row("Old historical Discord row from ArchivistName should not be replayed as fresh current content.", user="ArchivistName")

@@ -65,6 +65,50 @@ unpublished occurrences. `BNL_OCCASION_DISABLED_IDS` accepts a comma-separated
 list of calendar IDs for per-occurrence cancellation. These controls do not
 activate queue access, Journal reuse, or any memory-v2 live gate.
 
+## Relay accepted-history durability
+
+Accepted public Relays are retained indefinitely in the existing
+`website_relay_history` SQLite table. The operational recent-25 view remains
+bounded, and the website's public recent-20 projection is unchanged.
+
+`bnl_relay_backup.py` exports a full Relay-only snapshot for a named month. The
+compressed artifact contains only accepted Relay rows plus the minimal Relay
+cursor state; it does not copy the production database, attempts, pending
+drafts, conversations, heartbeats, provider traces, Journals, or other private
+tables.
+
+```bash
+python -m bnl_relay_backup export \
+  --db bnl01_conversations.db \
+  --month 2026-07 \
+  --output-dir backups/relay
+
+python -m bnl_relay_backup verify \
+  --archive backups/relay/<archive>.json.gz \
+  --checksum backups/relay/<archive>.json.gz.sha256
+
+python -m bnl_relay_backup upload \
+  --archive backups/relay/<archive>.json.gz \
+  --checksum backups/relay/<archive>.json.gz.sha256 \
+  --remote "gdrive:BNL-01 Backups/Relay Archive"
+
+python -m bnl_relay_backup round-trip \
+  --archive backups/relay/<archive>.json.gz \
+  --checksum backups/relay/<archive>.json.gz.sha256 \
+  --remote "gdrive:BNL-01 Backups/Relay Archive" \
+  --production-db /home/ubuntu/bnl01/bnl01_conversations.db
+```
+
+Transport uses the operator's external `rclone` configuration and never reads
+or writes OAuth credentials itself. Round-trip proof downloads the artifact,
+verifies its checksum, restores it twice into a temporary isolated database,
+and confirms the production database was untouched.
+
+No timer, service, or cron entry is installed by this repository. The
+`scheduled-run` command fails closed unless
+`BNL_RELAY_BACKUP_SCHEDULE_ENABLED=true`; keep it false until Google Drive
+authentication and an end-to-end owner-approved proof are complete.
+
 Importing `bnl01_bot` does not create a Gemini client or open provider transports. The client is created and cached on the first generation request, so tests, diagnostics, and tooling can import the runtime without valid provider networking.
 
 Run the bot only after the deployment environment is configured:

@@ -203,10 +203,28 @@ def recent_history(db_path: str, guild_id: int, limit: int = MAX_HISTORY) -> lis
     with sqlite3.connect(db_path) as conn:
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
-            "SELECT * FROM website_relay_history WHERE guild_id=? ORDER BY published_timestamp DESC LIMIT ?",
+            "SELECT * FROM website_relay_history WHERE guild_id=? ORDER BY published_timestamp DESC, relay_id DESC LIMIT ?",
             (guild_id, bounded_limit),
         ).fetchall()
     return [dict(r) for r in rows]
+
+
+def accepted_publication_count(db_path: str, guild_id: int, event_types: tuple[str, ...] = ()) -> int:
+    """Count accepted public Relay rows without applying the operational 25-row view."""
+    ensure_schema(db_path)
+    params: list[Any] = [guild_id]
+    where = "guild_id=?"
+    normalized_types = tuple(item.strip() for item in event_types if item and item.strip())
+    if normalized_types:
+        placeholders = ",".join("?" for _item in normalized_types)
+        where += f" AND event_type IN ({placeholders})"
+        params.extend(normalized_types)
+    with sqlite3.connect(db_path) as conn:
+        row = conn.execute(
+            f"SELECT COUNT(*) FROM website_relay_history WHERE {where}",
+            params,
+        ).fetchone()
+    return int((row or [0])[0] or 0)
 
 
 def reject_reason_for_candidate(db_path: str, guild_id: int, message: str, directive: str = "", *, threshold: float = 0.92) -> str:
@@ -278,31 +296,135 @@ def clear_pending_v2_publication(db_path: str, guild_id: int, relay_id: str = ""
             conn.execute("DELETE FROM website_relay_pending_v2 WHERE guild_id=?", (guild_id,))
 
 
+def _later_publication_timestamp(current: str | None, candidate: str) -> str:
+    if not current:
+        return candidate
+    current_epoch = timestamp_to_epoch_ms(current)
+    candidate_epoch = timestamp_to_epoch_ms(candidate)
+    if current_epoch is not None and candidate_epoch is not None:
+        return candidate if candidate_epoch > current_epoch else current
+    if candidate_epoch is not None:
+        return candidate
+    if current_epoch is not None:
+        return current
+    return max(current, candidate)
+
+
+def _advance_publication_state(
+    conn: sqlite3.Connection,
+    guild_id: int,
+    source_cursor: int,
+    published_timestamp: str,
+) -> None:
+    existing = conn.execute(
+        """
+        SELECT last_published_conversation_cursor, last_publication_timestamp
+        FROM website_relay_state
+        WHERE guild_id=?
+        """,
+        (guild_id,),
+    ).fetchone()
+    if existing is None:
+        conn.execute(
+            """
+            INSERT INTO website_relay_state(
+                guild_id,
+                last_published_conversation_cursor,
+                last_publication_timestamp
+            ) VALUES(?,?,?)
+            """,
+            (guild_id, int(source_cursor or 0), published_timestamp),
+        )
+        return
+    next_cursor = max(int(existing[0] or 0), int(source_cursor or 0))
+    next_timestamp = _later_publication_timestamp(
+        existing[1],
+        published_timestamp,
+    )
+    conn.execute(
+        """
+        UPDATE website_relay_state
+        SET last_published_conversation_cursor=?,
+            last_publication_timestamp=?
+        WHERE guild_id=?
+        """,
+        (next_cursor, next_timestamp, guild_id),
+    )
+
+
 def record_publication(db_path: str, guild_id: int, *, message: str, directive: str, mode: str, relay_lane: str, event_type: str, source_cursor: int, published_timestamp: str | None = None, relay_id: str | None = None) -> str:
     ensure_schema(db_path)
     ts = published_timestamp or utc_now_iso()
     norm = normalize_text(message)
     fam = semantic_family(message)
     relay_id = relay_id or hashlib.sha256(f"{guild_id}|{source_cursor}|{norm}|{ts}".encode()).hexdigest()[:24]
+    inserted = False
     with sqlite3.connect(db_path) as conn:
-        existing = conn.execute("SELECT public_message, public_directive FROM website_relay_history WHERE relay_id=?", (relay_id,)).fetchone()
-        if existing:
-            if existing[0] != message or existing[1] != directive:
-                raise ValueError("local_relay_id_conflict")
-            conn.execute("INSERT OR REPLACE INTO website_relay_state(guild_id,last_published_conversation_cursor,last_publication_timestamp) VALUES(?,?,?)", (guild_id, int(source_cursor or 0), ts))
-            conn.execute("""
-            UPDATE website_relay_history
-            SET guild_id=?, mode=?, relay_lane=?, event_type=?, highest_source_conversation_id=?, normalized_message=?, semantic_family=?, published_timestamp=?
+        conn.row_factory = sqlite3.Row
+        existing = conn.execute(
+            """
+            SELECT guild_id, public_message, public_directive, mode, relay_lane,
+                   event_type, highest_source_conversation_id,
+                   published_timestamp
+            FROM website_relay_history
             WHERE relay_id=?
-            """, (guild_id, mode, relay_lane, event_type, int(source_cursor or 0), norm, fam, ts, relay_id))
+            """,
+            (relay_id,),
+        ).fetchone()
+        if existing:
+            if (
+                int(existing["guild_id"]) != int(guild_id)
+                or existing["public_message"] != message
+                or existing["public_directive"] != directive
+            ):
+                raise ValueError("local_relay_id_conflict")
+            accepted_timestamp = str(existing["published_timestamp"])
+            accepted_cursor = int(
+                existing["highest_source_conversation_id"] or 0
+            )
+            if existing["relay_lane"] == "hydrated":
+                accepted_cursor = max(
+                    accepted_cursor,
+                    int(source_cursor or 0),
+                )
+                conn.execute(
+                    """
+                    UPDATE website_relay_history
+                    SET mode=?, relay_lane=?, event_type=?,
+                        highest_source_conversation_id=?,
+                        normalized_message=?, semantic_family=?
+                    WHERE relay_id=?
+                    """,
+                    (
+                        mode,
+                        relay_lane,
+                        event_type,
+                        accepted_cursor,
+                        norm,
+                        fam,
+                        relay_id,
+                    ),
+                )
+            _advance_publication_state(
+                conn,
+                guild_id,
+                accepted_cursor,
+                accepted_timestamp,
+            )
         else:
-            conn.execute("INSERT OR REPLACE INTO website_relay_state(guild_id,last_published_conversation_cursor,last_publication_timestamp) VALUES(?,?,?)", (guild_id, int(source_cursor or 0), ts))
             conn.execute("""
             INSERT INTO website_relay_history(relay_id,guild_id,public_message,public_directive,mode,relay_lane,event_type,highest_source_conversation_id,normalized_message,semantic_family,published_timestamp)
             VALUES(?,?,?,?,?,?,?,?,?,?,?)
             """, (relay_id, guild_id, message, directive, mode, relay_lane, event_type, int(source_cursor or 0), norm, fam, ts))
+            _advance_publication_state(
+                conn,
+                guild_id,
+                int(source_cursor or 0),
+                ts,
+            )
+            inserted = True
     occurred_at_ms = timestamp_to_epoch_ms(ts)
-    if occurred_at_ms is not None:
+    if inserted and occurred_at_ms is not None:
         try:
             record_source_event(
                 db_path,

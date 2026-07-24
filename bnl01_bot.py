@@ -266,6 +266,7 @@ from google import genai
 from bnl_website_relay_state import (
     RelaySourceDecision,
     WebsiteRelayDecision,
+    accepted_publication_count as relay_accepted_publication_count,
     begin_attempt as relay_begin_attempt,
     complete_attempt as relay_complete_attempt,
     get_attempt as relay_get_attempt,
@@ -2818,19 +2819,10 @@ _recent_relay_topics: dict[int, list[str]] = {}
 _recent_weak_context_modes: dict[int, list[str]] = {}
 _last_relay_lane_by_guild: dict[int, str] = {}
 _recent_relay_lanes_by_guild = defaultdict(lambda: deque(maxlen=8))
+_recent_relay_sources_by_guild = defaultdict(lambda: deque(maxlen=8))
 _last_relay_metadata_by_guild: dict[int, dict] = {}
 _website_relay_generation_tasks_by_guild: dict[int, asyncio.Task] = {}
 _website_relay_transaction_locks_by_guild: dict[int, asyncio.Lock] = {}
-RELAY_ANGLE_ROTATION = [
-    "whisper",
-    "wonder",
-    "overheard transmission",
-    "field note",
-    "archive murmur",
-    "cross-band drift",
-    "corridor note",
-    "receiver note",
-]
 RELAY_TOPIC_KEYWORDS = {
     "submission_corridor": ("submit", "submission", "track", "send", "payload", "intake"),
     "host_signal": ("host", "6 bit", "6bit", "voice", "carrier"),
@@ -2840,6 +2832,22 @@ RELAY_TOPIC_KEYWORDS = {
     "signal_drift": ("drift", "interference", "cross-band", "phase", "offset"),
     "timing_tension": ("friday", "tonight", "show", "countdown", "window"),
     "outer_channel_movement": ("outer channel", "corridor", "aperture", "access"),
+}
+QUIET_RELAY_SOURCE_CLASSES = (
+    "conversation_continuity",
+    "broadcast_memory",
+    "canon",
+)
+RELAY_SOURCE_CLASS_ALIASES = {
+    "recent_public_continuity": "conversation_continuity",
+    "scoped_broadcast_memory": "broadcast_memory",
+    "public_safe_memory": "broadcast_memory",
+    "approved_canon": "canon",
+}
+QUIET_RELAY_LANES_BY_SOURCE = {
+    "conversation_continuity": ("residual_echo", "question_formation", "network_posture"),
+    "broadcast_memory": ("residual_echo", "question_formation", "network_posture"),
+    "canon": ("question_formation", "network_posture"),
 }
 force_pull_runner = None
 _force_pull_state_by_guild: dict[int, dict] = {}
@@ -3480,6 +3488,23 @@ def _relay_topic_from_text(text: str) -> str:
     return "general_surface"
 
 
+def _relay_source_class_from_event_type(event_type: str) -> str:
+    normalized = (event_type or "").strip().lower()
+    if normalized == "fresh_public_discord_activity":
+        return "fresh_discord"
+    normalized = RELAY_SOURCE_CLASS_ALIASES.get(normalized, normalized)
+    if normalized in QUIET_RELAY_SOURCE_CLASSES:
+        return normalized
+    return normalized or "unknown"
+
+
+def _remember_relay_source(guild_id: int, source_class: str):
+    normalized = _relay_source_class_from_event_type(source_class)
+    if normalized == "unknown":
+        return
+    _recent_relay_sources_by_guild[guild_id].append(normalized)
+
+
 def _remember_relay_topic(guild_id: int, message: str, max_items: int = 8):
     topic = _relay_topic_from_text(message)
     pool = _recent_relay_topics.setdefault(guild_id, [])
@@ -3494,6 +3519,38 @@ def _recent_relay_topic_summary(guild_id: int, max_items: int = 5) -> str:
         return "no stored topic history"
     trimmed = topics[-max_items:]
     return ", ".join(trimmed)
+
+
+def _rotation_rank(recent: list[str], value: str, base_index: int) -> tuple[int, int, int, int]:
+    recent_window = recent[-8:]
+    immediate_repeat = 1 if recent_window and recent_window[-1] == value else 0
+    recent_count = recent_window.count(value)
+    last_index = max((idx for idx, item in enumerate(recent_window) if item == value), default=-1)
+    return immediate_repeat, recent_count, last_index, base_index
+
+
+def _prioritize_relay_subject_items(guild_id: int, items: list, text_getter) -> list:
+    recent_topics = list(_recent_relay_topics.get(guild_id, []))[-8:]
+    ranked = []
+    for idx, item in enumerate(items):
+        topic = _relay_topic_from_text(text_getter(item))
+        ranked.append((_rotation_rank(recent_topics, topic, idx), item))
+    ranked.sort(key=lambda pair: pair[0])
+    return [item for _rank, item in ranked]
+
+
+def _relay_diversity_prompt_block(guild_id: int) -> str:
+    subjects = list(_recent_relay_topics.get(guild_id, []))[-6:]
+    sources = list(_recent_relay_sources_by_guild.get(guild_id, []))[-6:]
+    lanes = list(_recent_relay_lanes_by_guild.get(guild_id, []))[-6:]
+    return (
+        "Recent accepted Relay diversity context, oldest to newest:\n"
+        f"- subject families: {', '.join(subjects) if subjects else 'none'}\n"
+        f"- source classes: {', '.join(sources) if sources else 'none'}\n"
+        f"- relay angles: {', '.join(lanes) if lanes else 'none'}\n"
+        "When the approved evidence supports more than one truthful choice, prefer a subject and framing that are less represented above. "
+        "Never invent, distort, or abandon the approved source merely to be different.\n"
+    )
 
 
 def _remember_relay_message(guild_id: int, message: str, max_items: int = 8):
@@ -3602,14 +3659,25 @@ async def _fetch_fresh_public_relay_rows(guild_id: int) -> tuple[list[tuple], in
 
 def _hydrate_recent_relay_memory(guild_id: int) -> None:
     history = relay_recent_history(DB_FILE, guild_id, limit=25)
-    if history:
-        _recent_relay_messages[guild_id] = [h.get("normalized_message", "") for h in reversed(history) if h.get("normalized_message")]
-        _recent_relay_lanes_by_guild[guild_id].clear()
-        newest_lanes = history[:8]
-        for h in reversed(newest_lanes):
-            lane = h.get("relay_lane")
-            if lane:
-                _recent_relay_lanes_by_guild[guild_id].append(lane)
+    chronological = list(reversed(history[:8]))
+    _recent_relay_messages[guild_id] = []
+    _recent_relay_topics[guild_id] = []
+    _recent_relay_lanes_by_guild[guild_id].clear()
+    _recent_relay_sources_by_guild[guild_id].clear()
+    _last_relay_lane_by_guild.pop(guild_id, None)
+    for record in chronological:
+        message = record.get("public_message") or ""
+        normalized = record.get("normalized_message") or _normalize_for_repeat(message)
+        if normalized:
+            _recent_relay_messages[guild_id].append(normalized)
+        if message:
+            _remember_relay_topic(guild_id, message)
+        lane = (record.get("relay_lane") or "").strip()
+        if lane:
+            _recent_relay_lanes_by_guild[guild_id].append(lane)
+            if lane in RELAY_LANES:
+                _last_relay_lane_by_guild[guild_id] = lane
+        _remember_relay_source(guild_id, record.get("event_type") or "")
 
 
 def _strict_relay_output_line(line: str, *, limit: int, min_chars: int = 0) -> str:
@@ -3709,6 +3777,7 @@ def _select_relay_safe_continuity_source(guild_id: int, cursor_value: int, highe
         fragments.append(f"[public_continuity_theme_{len(fragments)+1}] {text}")
     if not fragments:
         return None
+    fragments = _prioritize_relay_subject_items(guild_id, fragments, lambda item: item)
     counts = {"conversation_continuity": len(fragments), "broadcast_memory": 0, "canon": 0, "reflection": 0}
     return RelaySourceDecision(
         "conversation_continuity",
@@ -3716,7 +3785,12 @@ def _select_relay_safe_continuity_source(guild_id: int, cursor_value: int, highe
         counts,
         source_cursor=cursor_value,
         highest_eligible_conversation_id=highest,
-        metadata={"source_message_count": len(fragments), "eligible_policies": sorted(policies), "freshness_hours": RELAY_CONTINUITY_FRESHNESS_HOURS},
+        metadata={
+            "source_message_count": len(fragments),
+            "eligible_policies": sorted(policies),
+            "freshness_hours": RELAY_CONTINUITY_FRESHNESS_HOURS,
+            "candidate_subject_families": [_relay_topic_from_text(item) for item in fragments[:6]],
+        },
     )
 
 
@@ -3779,24 +3853,81 @@ def _approved_relay_broadcast_memory(guild_id: int, *, limit: int = 8) -> list[d
 
 def _select_approved_quiet_relay_source(guild_id: int, cursor_value: int, highest: int, *, allow_continuity: bool = True) -> RelaySourceDecision:
     """Choose one approved non-fresh source for quiet website relay attempts."""
+    _hydrate_recent_relay_memory(guild_id)
+    available: list[RelaySourceDecision] = []
     continuity = _select_relay_safe_continuity_source(guild_id, cursor_value, highest) if allow_continuity else None
     if continuity:
-        return continuity
+        available.append(continuity)
     memories = _approved_relay_broadcast_memory(guild_id, limit=8)
     if memories:
+        memories = _prioritize_relay_subject_items(
+            guild_id,
+            memories,
+            lambda item: str(item.get("cleaned_summary") or ""),
+        )
         lines = [f"[approved_broadcast_memory_{idx}] {item['cleaned_summary']}" for idx, item in enumerate(memories[:6], start=1)]
         counts = {"conversation_continuity": 0, "broadcast_memory": len(lines), "canon": 0, "reflection": 0}
-        return RelaySourceDecision("broadcast_memory", "\n".join(lines), counts, source_cursor=cursor_value, highest_eligible_conversation_id=highest, metadata={"source_message_count": len(lines)})
-    history = relay_recent_history(DB_FILE, guild_id, limit=25)
-    accepted_canon_count = sum(1 for h in history if str(h.get("event_type") or "") == "canon")
+        available.append(
+            RelaySourceDecision(
+                "broadcast_memory",
+                "\n".join(lines),
+                counts,
+                source_cursor=cursor_value,
+                highest_eligible_conversation_id=highest,
+                metadata={
+                    "source_message_count": len(lines),
+                    "candidate_subject_families": [
+                        _relay_topic_from_text(item.get("cleaned_summary") or "")
+                        for item in memories[:6]
+                    ],
+                },
+            )
+        )
+    accepted_canon_count = relay_accepted_publication_count(
+        DB_FILE,
+        guild_id,
+        ("canon", "approved_canon"),
+    )
     anchor_index = accepted_canon_count % len(CANON_RELAY_ANCHORS)
     anchor = CANON_RELAY_ANCHORS[anchor_index]
     canon = f"[approved_barcode_canon:{anchor_index}] {anchor}"
     counts = {"conversation_continuity": 0, "broadcast_memory": 0, "canon": 1, "reflection": 0}
-    return RelaySourceDecision("canon", canon, counts, source_cursor=cursor_value, highest_eligible_conversation_id=highest, metadata={"canon_anchor_index": anchor_index})
+    available.append(
+        RelaySourceDecision(
+            "canon",
+            canon,
+            counts,
+            source_cursor=cursor_value,
+            highest_eligible_conversation_id=highest,
+            metadata={
+                "canon_anchor_index": anchor_index,
+                "candidate_subject_families": [_relay_topic_from_text(anchor)],
+            },
+        )
+    )
+    recent_sources = list(_recent_relay_sources_by_guild.get(guild_id, []))
+    ranked = sorted(
+        enumerate(available),
+        key=lambda pair: _rotation_rank(recent_sources, pair[1].source_class, pair[0]),
+    )
+    selected = ranked[0][1]
+    selected.metadata["available_source_classes"] = [item.source_class for item in available]
+    selected.metadata["recent_source_classes"] = recent_sources[-6:]
+    return selected
 
 
-def _build_source_decision_prompt(decision: RelaySourceDecision, mode: str) -> str:
+def _select_quiet_relay_lane(guild_id: int, source_class: str) -> str:
+    candidates = list(QUIET_RELAY_LANES_BY_SOURCE.get(source_class, ("question_formation", "network_posture")))
+    recent_lanes = list(_recent_relay_lanes_by_guild.get(guild_id, []))
+    ranked = sorted(
+        enumerate(candidates),
+        key=lambda pair: _rotation_rank(recent_lanes, pair[1], pair[0]),
+    )
+    return ranked[0][1] if ranked else "network_posture"
+
+
+def _build_source_decision_prompt(decision: RelaySourceDecision, mode: str, guild_id: int, relay_lane: str) -> str:
+    has_public_residue = decision.source_class in {"conversation_continuity", "broadcast_memory"}
     return (
         f"Write a BNL website relay from the selected approved source class: {decision.source_class}.\n"
         "Return exactly two lines: public relay message, then current directive.\n"
@@ -3804,7 +3935,11 @@ def _build_source_decision_prompt(decision: RelaySourceDecision, mode: str) -> s
         "Line 2 must be a real inquiry, follow-up, recognition target, or invitation grounded in the source.\n"
         "Forbidden: queue/read-model state, now-playing, up-next, payment, availability, queue counts, #bnl-testing, private/admin/mod/research content, prior relay output, Field Logs, runtime inference, generic waiting/monitoring/standby/quiet-signal/bridge-active copy, usernames, channel names, direct quotes, urgency, or pressure.\n"
         "Do not claim tonight, currently, live, imminent, available, on-air, or other current show state unless the approved source explicitly says so.\n"
-        f"Mode: {mode}.\nApproved source context:\n{decision.context}\n"
+        f"Mode: {mode}.\n"
+        f"{_build_relay_lane_prompt(relay_lane, has_public_residue)}"
+        f"{_relay_diversity_prompt_block(guild_id)}"
+        "The diversity context is avoidance guidance only, not factual source material. Do not quote it or treat it as current activity.\n"
+        f"Approved source context:\n{decision.context}\n"
     )
 
 
@@ -3814,7 +3949,8 @@ async def _generate_quiet_website_relay(guild_id: int, *, source_cursor: int, hi
         logging.info("website_relay_no_publish guild=%s reason=%s", guild_id, quiet_source.skip_reason)
         return WebsiteRelayDecision(False, skipReason=quiet_source.skip_reason, sourceCursor=source_cursor, metadata={"reason": quiet_source.skip_reason, "source_class": quiet_source.source_class})
     mode = "OBSERVATION"
-    prompt = _build_source_decision_prompt(quiet_source, mode)
+    relay_lane = _select_quiet_relay_lane(guild_id, quiet_source.source_class)
+    prompt = _build_source_decision_prompt(quiet_source, mode, guild_id, relay_lane)
     try:
         generated = await get_gemini_response(prompt, user_id=0, guild_id=guild_id, route="website_relay_event") or ""
     except Exception as exc:
@@ -3833,11 +3969,24 @@ async def _generate_quiet_website_relay(guild_id: int, *, source_cursor: int, hi
     directive_reason = relay_stock_directive_reason(directive)
     if directive_reason:
         return WebsiteRelayDecision(False, skipReason=directive_reason, sourceCursor=source_cursor, metadata={"reason": directive_reason, "source_class": quiet_source.source_class, "aggregate_source_counts": quiet_source.aggregate_counts})
+    lane_ok, lane_reason = _validate_relay_lane_adherence(relay_message, relay_lane, False, guild_id)
+    if not lane_ok:
+        return WebsiteRelayDecision(
+            False,
+            skipReason="lane_validation_failure",
+            sourceCursor=source_cursor,
+            relayLane=relay_lane,
+            metadata={
+                "reason": lane_reason,
+                "source_class": quiet_source.source_class,
+                "aggregate_source_counts": quiet_source.aggregate_counts,
+            },
+        )
     dup_reason = relay_reject_reason_for_candidate(DB_FILE, guild_id, relay_message, directive)
     if dup_reason:
         return WebsiteRelayDecision(False, skipReason=dup_reason, sourceCursor=source_cursor, metadata={"reason": dup_reason, "source_class": quiet_source.source_class, "aggregate_source_counts": quiet_source.aggregate_counts})
-    meta = {**quiet_source.metadata, "reason": reason, "source_class": quiet_source.source_class, "aggregate_source_counts": quiet_source.aggregate_counts, "relay_lane": "network_posture", "highest_eligible_conversation_id": quiet_source.highest_eligible_conversation_id}
-    return WebsiteRelayDecision(True, eventType=quiet_source.source_class, sourceConversationIds=quiet_source.source_conversation_ids, sourceCursor=source_cursor, message=relay_message, directive=directive, mode=mode, relayLane="network_posture", metadata=meta)
+    meta = {**quiet_source.metadata, "reason": reason, "source_class": quiet_source.source_class, "aggregate_source_counts": quiet_source.aggregate_counts, "relay_lane": relay_lane, "highest_eligible_conversation_id": quiet_source.highest_eligible_conversation_id}
+    return WebsiteRelayDecision(True, eventType=quiet_source.source_class, sourceConversationIds=quiet_source.source_conversation_ids, sourceCursor=source_cursor, message=relay_message, directive=directive, mode=mode, relayLane=relay_lane, metadata=meta)
 
 
 async def generate_dynamic_website_relay(guild_id: int, *, allow_quiet_sources: bool = False) -> WebsiteRelayDecision:
@@ -3885,7 +4034,10 @@ async def generate_dynamic_website_relay(guild_id: int, *, allow_quiet_sources: 
         "Forbidden sources: queue state, read-model state, now-playing, up-next, queue counts, payment state, availability, and inferred site/runtime conditions.\n"
         "Radio, releases, dossiers, Transmissions, music, events, and other BARCODE subjects may be mentioned only when the supplied Discord context explicitly supports them. Do not infer live operational state.\n"
         "Do not include usernames, direct quotations, waiting, standby, monitoring, listening-window, quiet-signal, bridge-active, generic online language, private/sensitive solicitations, urgency, or pressure.\n"
-        f"Mode: {mode}.\nFresh public context:\n{relay_context}\n"
+        f"Mode: {mode}.\n"
+        f"{_relay_diversity_prompt_block(guild_id)}"
+        "The diversity context is avoidance guidance only, not factual source material. Do not quote it or treat it as current activity.\n"
+        f"Fresh public context:\n{relay_context}\n"
     )
     try:
         generated = await get_gemini_response(prompt, user_id=0, guild_id=guild_id, route="website_relay_event") or ""
@@ -3976,6 +4128,7 @@ async def _execute_website_relay_transaction(guild_id: int, *, force: bool = Fal
                 _remember_relay_message(guild_id, pending_decision.message)
                 _remember_relay_topic(guild_id, pending_decision.message)
                 _remember_relay_lane(guild_id, pending_decision.relayLane)
+                _remember_relay_source(guild_id, pending_decision.eventType)
                 return pending_decision
 
         decision = await _generate_website_relay_guarded(guild_id, allow_quiet_sources=True)
@@ -4036,6 +4189,7 @@ async def _execute_website_relay_transaction(guild_id: int, *, force: bool = Fal
         _remember_relay_message(guild_id, decision.message)
         _remember_relay_topic(guild_id, decision.message)
         _remember_relay_lane(guild_id, decision.relayLane)
+        _remember_relay_source(guild_id, decision.eventType)
         return decision
 
 def resolve_network_guild_id(requested_guild_id: int) -> int:
