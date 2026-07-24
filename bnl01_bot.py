@@ -13,6 +13,8 @@
 
 from __future__ import annotations
 
+from typing import Union
+
 from bnl_canon_source_contract import (
     CANON_SOURCE_CONTRACT_VERSION,
     diagnostics as canon_source_diagnostics,
@@ -17702,11 +17704,11 @@ class BatchMomentPromptSourceBasis:
     has_moment_gist: bool = True
 
 
-PromptSourceBasis = (
-    MemoryPromptSourceBasis
-    | ConversationPromptSourceBasis
-    | BatchMomentPromptSourceBasis
-)
+PromptSourceBasis = Union[
+    MemoryPromptSourceBasis,
+    ConversationPromptSourceBasis,
+    BatchMomentPromptSourceBasis,
+]
 
 _SOURCE_BEARING_MEMORY_MARKERS = (
     "Moment-based continuity gist",
