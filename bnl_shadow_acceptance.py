@@ -16,6 +16,10 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence
 from bnl_memory_ledger import build_memory_ledger_evaluation
 from bnl_moment_engine import build_moment_evaluation_report
 from bnl_relationship_engine import build_evaluation_report as build_relationship_evaluation_report
+from bnl_unified_response_assessment import (
+    build_evaluation_report as build_unified_assessment_evaluation_report,
+    shadow_configuration as unified_assessment_shadow_configuration,
+)
 
 
 SHADOW_ACCEPTANCE_VERSION = "v2_shadow_acceptance_v2"
@@ -39,7 +43,7 @@ def _flag_enabled(environ: Mapping[str, str], name: str, default: str = "") -> b
     return value.strip().lower() in {"1", "true", "yes", "on", "enabled"}
 
 
-def build_gate_snapshot(environ: Optional[Mapping[str, str]] = None) -> Dict[str, bool]:
+def build_gate_snapshot(environ: Optional[Mapping[str, str]] = None) -> Dict[str, Any]:
     """Return requested and effective gate state without changing the environment."""
 
     env = environ if environ is not None else os.environ
@@ -52,6 +56,7 @@ def build_gate_snapshot(environ: Optional[Mapping[str, str]] = None) -> Dict[str
     engagement_live = _flag_enabled(env, "BNL_ACTIVE_ENGAGEMENT_V2_LIVE_ENABLED")
     context_value = str(env.get("BNL_CONVERSATION_CONTEXT_V2_ENABLED", "true") or "true")
     context_enabled = context_value.strip().lower() not in {"false", "0", "off"}
+    unified_assessment = unified_assessment_shadow_configuration(env)
     return {
         "conversation_context_v2": context_enabled,
         "memory_ledger_shadow_requested": ledger,
@@ -63,6 +68,15 @@ def build_gate_snapshot(environ: Optional[Mapping[str, str]] = None) -> Dict[str
         "relationship_v2_shadow_requested": relationship_shadow,
         "relationship_v2_live_requested": relationship_live,
         "active_engagement_v2_live_requested": engagement_live,
+        "unified_response_assessment_shadow_requested": bool(
+            unified_assessment["requested"]
+        ),
+        "unified_response_assessment_shadow_effective": bool(
+            unified_assessment["effective"]
+        ),
+        "unified_response_assessment_shadow_reason": str(
+            unified_assessment["reason"]
+        ),
         "all_live_gates_clear": not (
             governance_live_requested or relationship_live or engagement_live
         ),
@@ -500,6 +514,46 @@ def _read_relationship_report(conn: sqlite3.Connection, guild_id: int) -> Dict[s
         return _report_error({**_empty_relationship_report(), "tablePresent": True}, exc)
 
 
+def _empty_unified_assessment_report() -> Dict[str, Any]:
+    return {
+        "tablePresent": False,
+        "runs": 0,
+        "response_sent_runs": 0,
+        "current_exchange_primary_runs": 0,
+        "comparison_status_counts": {},
+        "response_alignment_counts": {},
+        "prompt_overincluded_runs": 0,
+        "prompt_underincluded_runs": 0,
+        "prompt_different_runs": 0,
+        "source_basis_changed_runs": 0,
+        "guard_triggered_runs": 0,
+        "guard_repaired_runs": 0,
+        "visible_control_marker_runs": 0,
+        "processing_errors": 0,
+        "behavior_changed_runs": 0,
+        "new_authority_applied_runs": 0,
+        "content_fields_present": [],
+        "evidenceWindow": {"first": "none", "last": "none"},
+    }
+
+
+def _read_unified_assessment_report(
+    conn: sqlite3.Connection,
+    guild_id: int,
+) -> Dict[str, Any]:
+    try:
+        return build_unified_assessment_evaluation_report(
+            conn,
+            guild_id=guild_id,
+            prepare_schema=False,
+        )
+    except (sqlite3.DatabaseError, ValueError, TypeError) as exc:
+        return _report_error(
+            _empty_unified_assessment_report(),
+            exc,
+        )
+
+
 def _safe_context_report(diagnostics: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
     source = diagnostics or {}
     numeric = (
@@ -561,6 +615,7 @@ def build_v2_shadow_acceptance_snapshot(
     moments = _read_moment_report(conn, guild_id)
     governance = build_persisted_governance_report(conn, guild_id=guild_id)
     relationship = _read_relationship_report(conn, guild_id)
+    unified_assessment = _read_unified_assessment_report(conn, guild_id)
     context = _safe_context_report(conversation_context_diagnostics)
 
     live_gates = [
@@ -723,11 +778,30 @@ def build_v2_shadow_acceptance_snapshot(
         },
     }
 
+    unified_assessment_blockers = []
+    for key in (
+        "processing_errors",
+        "behavior_changed_runs",
+        "new_authority_applied_runs",
+    ):
+        if int(unified_assessment.get(key, 0) or 0):
+            unified_assessment_blockers.append(key)
+    if unified_assessment.get("content_fields_present"):
+        unified_assessment_blockers.append("content_fields_present")
+    if unified_assessment.get("reportError"):
+        unified_assessment_blockers.append(
+            "report_error:%s" % unified_assessment["reportError"]
+        )
+
     blockers = ["live_gate_enabled:%s" % name for name in live_gates]
     if context_cross_channel:
         blockers.append("conversation_context_cross_channel_pair")
     for stage_name, stage in stages.items():
         blockers.extend("%s:%s" % (stage_name, reason) for reason in stage["blockers"])
+    blockers.extend(
+        "unified_response_assessment:%s" % reason
+        for reason in unified_assessment_blockers
+    )
 
     warnings = []
     if int(ledger.get("legacyToLedgerParityMismatches", 0) or 0):
@@ -746,13 +820,39 @@ def build_v2_shadow_acceptance_snapshot(
         warnings.append("governance_older_rows_lack_aggregate_diagnostics")
     if int(governance.get("legacy_reclassified_exclusion_count", 0) or 0):
         warnings.append("governance_legacy_safe_exclusions_reclassified")
+    if (
+        gates.get("unified_response_assessment_shadow_effective")
+        and int(unified_assessment.get("runs", 0) or 0) == 0
+    ):
+        warnings.append("unified_assessment_no_response_evidence")
+    if any(
+        int(unified_assessment.get(key, 0) or 0)
+        for key in (
+            "prompt_overincluded_runs",
+            "prompt_underincluded_runs",
+            "prompt_different_runs",
+        )
+    ):
+        warnings.append("unified_assessment_prompt_comparison_review")
+    if int(unified_assessment.get("visible_control_marker_runs", 0) or 0):
+        warnings.append("unified_assessment_visible_control_marker_review")
 
     stage_statuses = [stage["status"] for stage in stages.values()]
+    unified_assessment_ready = bool(
+        not gates.get("unified_response_assessment_shadow_requested")
+        or (
+            int(unified_assessment.get("runs", 0) or 0) > 0
+            and not unified_assessment_blockers
+        )
+    )
     if live_gates:
         status = "blocked_live_authority_detected"
     elif blockers:
         status = "blocked_shadow_invariant_failure"
-    elif all(value.startswith("candidate_pass") for value in stage_statuses):
+    elif (
+        all(value.startswith("candidate_pass") for value in stage_statuses)
+        and unified_assessment_ready
+    ):
         status = "ready_for_owner_review_not_live_cutover"
     else:
         status = "collecting_shadow_evidence"
@@ -776,12 +876,37 @@ def build_v2_shadow_acceptance_snapshot(
             "momentEngine": moments,
             "memoryGovernance": governance,
             "relationshipV2": relationship,
+            "unifiedResponseAssessment": unified_assessment,
+        },
+        "unifiedResponseAssessmentShadow": {
+            "requested": bool(
+                gates.get(
+                    "unified_response_assessment_shadow_requested"
+                )
+            ),
+            "effective": bool(
+                gates.get(
+                    "unified_response_assessment_shadow_effective"
+                )
+            ),
+            "reason": str(
+                gates.get(
+                    "unified_response_assessment_shadow_reason",
+                    "disabled",
+                )
+            ),
+            "evidenceObserved": int(
+                unified_assessment.get("runs", 0) or 0
+            )
+            > 0,
+            "blockers": unified_assessment_blockers,
         },
         "rollback": {
             "legacyProductionTruthPreserved": gates["all_live_gates_clear"],
             "databaseDeletionRequired": False,
             "restartRequiredAfterEnvironmentChange": True,
             "disableOrder": [
+                "BNL_UNIFIED_RESPONSE_ASSESSMENT_SHADOW_ENABLED",
                 "BNL_ACTIVE_ENGAGEMENT_V2_LIVE_ENABLED",
                 "BNL_RELATIONSHIP_V2_LIVE_ENABLED",
                 "BNL_MEMORY_GOVERNANCE_LIVE_ENABLED",
@@ -813,6 +938,8 @@ def render_v2_shadow_acceptance_lines(snapshot: Mapping[str, Any]) -> List[str]:
     moments = reports.get("momentEngine") or {}
     governance = reports.get("memoryGovernance") or {}
     relationship = reports.get("relationshipV2") or {}
+    unified_assessment = reports.get("unifiedResponseAssessment") or {}
+    unified_state = snapshot.get("unifiedResponseAssessmentShadow") or {}
     blockers = snapshot.get("blockers") or []
     warnings = snapshot.get("warnings") or []
 
@@ -889,6 +1016,32 @@ def render_v2_shadow_acceptance_lines(snapshot: Mapping[str, Any]) -> List[str]:
             relationship.get("moment_link_integrity_violations", 0),
         ),
         "- relationship_legacy_v2_comparison: `%s`" % relationship.get("legacy_v2_comparison", "not_collected"),
+        "- unified_assessment: requested=`%s` effective=`%s` reason=`%s` runs=`%s` current_primary=`%s` comparison=`%s` alignments=`%s` source_changes=`%s` guards=`%s/%s` visible_control_markers=`%s` errors=`%s` behavior_changes=`%s` new_authority=`%s` window_last=`%s`" % (
+            _on(unified_state.get("requested")),
+            _on(unified_state.get("effective")),
+            unified_state.get("reason", "disabled"),
+            unified_assessment.get("runs", 0),
+            unified_assessment.get("current_exchange_primary_runs", 0),
+            json.dumps(
+                unified_assessment.get("comparison_status_counts", {}),
+                sort_keys=True,
+            ),
+            json.dumps(
+                unified_assessment.get("response_alignment_counts", {}),
+                sort_keys=True,
+            ),
+            unified_assessment.get("source_basis_changed_runs", 0),
+            unified_assessment.get("guard_triggered_runs", 0),
+            unified_assessment.get("guard_repaired_runs", 0),
+            unified_assessment.get("visible_control_marker_runs", 0),
+            unified_assessment.get("processing_errors", 0),
+            unified_assessment.get("behavior_changed_runs", 0),
+            unified_assessment.get("new_authority_applied_runs", 0),
+            (unified_assessment.get("evidenceWindow") or {}).get(
+                "last",
+                "none",
+            ),
+        ),
         "- blockers: `%s`" % (", ".join(blockers) if blockers else "none"),
         "- warnings: `%s`" % (", ".join(warnings) if warnings else "none"),
         "- rollback: `disable in reverse dependency order; restart; preserve shadow evidence; delete nothing`",

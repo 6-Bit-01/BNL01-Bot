@@ -29,6 +29,10 @@ from bnl_shadow_acceptance import (
     build_v2_shadow_acceptance_snapshot,
     render_v2_shadow_acceptance_lines,
 )
+from bnl_unified_response_assessment import (
+    build_unified_response_assessment,
+    persist_shadow_run as persist_unified_assessment_shadow_run,
+)
 
 
 class V2ShadowAcceptanceTests(unittest.TestCase):
@@ -43,6 +47,7 @@ class V2ShadowAcceptanceTests(unittest.TestCase):
                 "BNL_RELATIONSHIP_V2_SHADOW_ENABLED": "",
                 "BNL_RELATIONSHIP_V2_LIVE_ENABLED": "",
                 "BNL_ACTIVE_ENGAGEMENT_V2_LIVE_ENABLED": "",
+                "BNL_UNIFIED_RESPONSE_ASSESSMENT_SHADOW_ENABLED": "",
             },
             clear=False,
         )
@@ -79,6 +84,9 @@ class V2ShadowAcceptanceTests(unittest.TestCase):
         self.assertTrue(snapshot["ownerReviewRequired"])
         self.assertFalse(snapshot["automaticCutoverAllowed"])
         self.assertFalse(snapshot["behaviorChangesApplied"])
+        self.assertFalse(
+            snapshot["unifiedResponseAssessmentShadow"]["requested"]
+        )
         self.assertTrue(
             all(stage["status"] == "disabled" for stage in snapshot["stages"].values())
         )
@@ -88,6 +96,109 @@ class V2ShadowAcceptanceTests(unittest.TestCase):
                 "SELECT type,name,sql FROM sqlite_master ORDER BY type,name"
             ).fetchall(),
             before_schema,
+        )
+
+    def test_unified_assessment_overlay_is_content_free_and_not_a_fifth_stage(self):
+        assessment = build_unified_response_assessment(
+            guild_id=1,
+            route_mode="normal_chat",
+            channel_policy="public_home",
+            conversation_surface="active_channel",
+            current_speaker_user_ids=(99,),
+            participant_user_ids=(99, 100),
+            speaker_labels=("PRIVATE ONE", "PRIVATE TWO"),
+            current_exchange_source_ids=(500, 501),
+            governed_entry_ids=("PRIVATE LEDGER REF",),
+            prompt_lanes=("current_exchange", "conversation_context"),
+            immediate_recap=True,
+        )
+        persist_unified_assessment_shadow_run(
+            self.conn,
+            assessment,
+            response=(
+                "[Pause: 0.2s]\n"
+                "PRIVATE ONE has the intro; PRIVATE TWO has the artwork."
+            ),
+        )
+        self.conn.commit()
+
+        environ = {
+            "BNL_MEMORY_LEDGER_SHADOW_ENABLED": "true",
+            "BNL_MOMENT_ENGINE_SHADOW_ENABLED": "true",
+            "BNL_MEMORY_GOVERNANCE_SHADOW_ENABLED": "true",
+            "BNL_RELATIONSHIP_V2_SHADOW_ENABLED": "true",
+        }
+        snapshot = self.snapshot(environ)
+        overlay = snapshot["unifiedResponseAssessmentShadow"]
+        report = snapshot["reports"]["unifiedResponseAssessment"]
+
+        self.assertEqual(
+            snapshot["evaluationOrder"],
+            list(SHADOW_EVALUATION_ORDER),
+        )
+        self.assertNotIn("unified_response_assessment", snapshot["stages"])
+        self.assertTrue(overlay["requested"])
+        self.assertTrue(overlay["effective"])
+        self.assertEqual(overlay["reason"], "shadow_only")
+        self.assertTrue(overlay["evidenceObserved"])
+        self.assertEqual(overlay["blockers"], [])
+        self.assertEqual(report["runs"], 1)
+        self.assertEqual(report["current_exchange_primary_runs"], 1)
+        self.assertEqual(report["visible_control_marker_runs"], 1)
+        self.assertEqual(report["behavior_changed_runs"], 0)
+        self.assertEqual(report["new_authority_applied_runs"], 0)
+        self.assertEqual(report["content_fields_present"], [])
+        self.assertIn(
+            "unified_assessment_visible_control_marker_review",
+            snapshot["warnings"],
+        )
+
+        encoded = json.dumps(snapshot, sort_keys=True)
+        self.assertNotIn("PRIVATE ONE", encoded)
+        self.assertNotIn("PRIVATE TWO", encoded)
+        self.assertNotIn("PRIVATE LEDGER REF", encoded)
+        rendered = "\n".join(render_v2_shadow_acceptance_lines(snapshot))
+        self.assertIn("unified_assessment:", rendered)
+        self.assertIn("visible_control_markers=`1`", rendered)
+
+    def test_unified_assessment_new_authority_or_behavior_is_a_hard_blocker(self):
+        assessment = build_unified_response_assessment(
+            guild_id=1,
+            route_mode="normal_chat",
+            channel_policy="public_home",
+            conversation_surface="active_channel",
+            current_speaker_user_ids=(99,),
+        )
+        persist_unified_assessment_shadow_run(
+            self.conn,
+            assessment,
+            response="Safe response.",
+        )
+        self.conn.execute(
+            "UPDATE unified_response_assessment_shadow_runs "
+            "SET behavior_changed=1, new_authority_applied=1"
+        )
+        self.conn.commit()
+
+        snapshot = self.snapshot(
+            {
+                "BNL_MEMORY_LEDGER_SHADOW_ENABLED": "true",
+                "BNL_MOMENT_ENGINE_SHADOW_ENABLED": "true",
+                "BNL_MEMORY_GOVERNANCE_SHADOW_ENABLED": "true",
+                "BNL_RELATIONSHIP_V2_SHADOW_ENABLED": "true",
+            }
+        )
+        self.assertEqual(
+            snapshot["status"],
+            "blocked_shadow_invariant_failure",
+        )
+        self.assertIn(
+            "unified_response_assessment:behavior_changed_runs",
+            snapshot["blockers"],
+        )
+        self.assertIn(
+            "unified_response_assessment:new_authority_applied_runs",
+            snapshot["blockers"],
         )
 
     def test_missing_schemas_are_reported_without_creating_tables(self):
@@ -770,6 +881,18 @@ class V2ShadowAcceptanceTests(unittest.TestCase):
             channel_policy="public_home",
             current_direct=True,
             now="2026-07-19T00:12:00+00:00",
+        )
+        persist_unified_assessment_shadow_run(
+            self.conn,
+            build_unified_response_assessment(
+                guild_id=1,
+                route_mode="normal_chat",
+                channel_policy="public_home",
+                conversation_surface="test",
+                current_speaker_user_ids=(2,),
+                prompt_lanes=("current_exchange",),
+            ),
+            response="Acknowledged.",
         )
         self.conn.commit()
 
