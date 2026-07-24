@@ -65,6 +65,30 @@ class GeneralConversationContinuityContractTests(unittest.TestCase):
         self.assertNotIn("[CONVERSATION_CONTINUITY_REQUIRED]", contract)
         self.assertIn("General conversation continuity contract:", contract)
 
+    def test_natural_room_recap_requires_immediate_exchange_without_gist_word(self):
+        contract = bnl01_bot.build_general_conversation_continuity_contract(
+            "What were Miss Bit and I just talking about?",
+            BOUNDED_CONTEXT,
+        )
+
+        self.assertIn("[CONVERSATION_CONTINUITY_REQUIRED]", contract)
+        self.assertIn("This is an immediate room recap.", contract)
+        self.assertIn(
+            "preserve every supplied speaker's distinct contribution",
+            contract,
+        )
+        self.assertIn("regardless of participant count", contract)
+        self.assertIn("Do not substitute an older completed thread", contract)
+
+    def test_current_batch_recap_contract_does_not_need_prior_context(self):
+        contract = bnl01_bot.build_current_exchange_recap_contract(
+            "We split the work. What were we just talking about?"
+        )
+
+        self.assertIn("[CONVERSATION_CONTINUITY_REQUIRED]", contract)
+        self.assertIn("no magic word such as “gist” is required", contract)
+        self.assertIn("current batch transcript as the primary evidence", contract)
+
     def test_no_prior_context_does_not_activate_or_render_contract(self):
         contract = bnl01_bot.build_general_conversation_continuity_contract(
             "Keep going.",

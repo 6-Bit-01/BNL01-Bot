@@ -93,6 +93,7 @@ from bnl_conversation_context_v2 import (
     CONVERSATION_CONTEXT_VERSION,
     ConversationContextRequest,
     assemble_conversation_context_v2,
+    immediate_room_recap_requested,
     sanitize_history_text,
 )
 from bnl_shadow_acceptance import (
@@ -8052,7 +8053,13 @@ _CONTEXTUAL_NEW_TOPIC_RE = re.compile(
 def contextual_followthrough_requested(text: str) -> bool:
     """Return whether the current turn explicitly depends on an earlier exchange."""
     cleaned = re.sub(r"\s+", " ", str(text or "")).strip()
-    return bool(cleaned and _CONTEXTUAL_FOLLOWTHROUGH_CUES_RE.search(cleaned))
+    return bool(
+        cleaned
+        and (
+            _CONTEXTUAL_FOLLOWTHROUGH_CUES_RE.search(cleaned)
+            or immediate_room_recap_requested(cleaned)
+        )
+    )
 
 
 def _has_bounded_conversation_context(
@@ -8094,6 +8101,7 @@ def build_general_conversation_continuity_contract(
     prior_context: str,
     *,
     typed_moment_gist_basis: bool = False,
+    include_immediate_recap: bool = True,
 ) -> str:
     """Render one topic-agnostic contract over already-approved prior context.
 
@@ -8121,16 +8129,48 @@ def build_general_conversation_continuity_contract(
         if typed_moment_gist_basis
         else ""
     )
+    immediate_recap_rule = (
+        "- This is an immediate room recap. Use the newest supplied same-room "
+        "human exchange as the primary evidence, preserve every supplied "
+        "speaker's distinct contribution regardless of participant count, and "
+        "state the combined meaning naturally. Do not substitute an older "
+        "completed thread, Moment, durable memory, relationship note, or canon "
+        "unless the current exchange explicitly depends on it.\n"
+        if include_immediate_recap
+        and immediate_room_recap_requested(current_text)
+        else ""
+    )
     return (
         marker
         + "General conversation continuity contract:\n"
         "- Treat the supplied bounded continuity evidence according to its source label and connect it to the current turn when relevant.\n"
         + evidence_rule
+        + immediate_recap_rule
         + "- Resolve omitted references from the supported continuity evidence before asking the user to restate them.\n"
         "- Preserve the concrete people, objects, place, problem, decision, constraints, tone, and last completed step that matter to the current request.\n"
         "- Continue or answer the same conversational act directly. This applies equally to ordinary conversation, technical work, jokes, ideas, stories, plans, and scenes.\n"
         "- Infer only links supported by the supplied messages. Do not invent missing history, narrate retrieval, or promote a conversational trace into a permanent personal fact.\n"
         "- BNL's technical voice may color the answer, but a parameter log, process report, or status readout is not a substitute for doing what the current turn asks.\n"
+    )
+
+
+def build_current_exchange_recap_contract(current_text: str) -> str:
+    """Tell a batched response how to assess a recap already in its live transcript."""
+    if not immediate_room_recap_requested(current_text):
+        return ""
+    return (
+        "[CONVERSATION_CONTINUITY_REQUIRED]\n"
+        "Immediate room recap contract:\n"
+        "- The newest message is asking what the room was just discussing, "
+        "deciding, handling, or doing; no magic word such as “gist” is required.\n"
+        "- Treat the current batch transcript as the primary evidence. Preserve "
+        "every supplied speaker's distinct contribution regardless of participant "
+        "count and state the combined meaning naturally.\n"
+        "- For this request, summarizing the supported exchange is the requested "
+        "social act. Do not replace it with a reaction, joke, archive report, or "
+        "older completed BNL thread.\n"
+        "- Use only supplied current-room or eligible continuity evidence. If it "
+        "is genuinely insufficient, say that briefly instead of guessing.\n"
     )
 
 
@@ -22693,6 +22733,9 @@ def _format_batched_prompt(messages, style_key: str, style_rule: str) -> str:
         (item.content if isinstance(item, BatchConversationTurn) else item[1]) or ""
         for item in messages
     )
+    current_exchange_recap_contract = build_current_exchange_recap_contract(
+        combined_user_text
+    )
     for item in messages:
         if isinstance(item, BatchConversationTurn):
             name, content = item.name, item.content
@@ -22775,6 +22818,7 @@ def _format_batched_prompt(messages, style_key: str, style_rule: str) -> str:
         "Recent messages:\n"
         f"{transcript}\n"
         f"Multiline payload detected in batch: {'yes' if multiline_payload_found else 'no'}\n"
+        f"{current_exchange_recap_contract}"
     )
 
 
@@ -23397,6 +23441,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                 combined_text,
                 batch_continuity_source,
                 typed_moment_gist_basis=batch_has_typed_moment_gist,
+                include_immediate_recap=False,
             )
             if continuity_contract:
                 prompt += "\n\n" + continuity_contract
@@ -28679,6 +28724,107 @@ async def bnl_context_check(interaction: discord.Interaction):
 
 
 
+def _collect_bnl_memory_diagnostic_data(
+    *,
+    guild_id: int,
+    user_id: int,
+    policy: str,
+) -> tuple:
+    """Collect the database-heavy owner diagnostic away from Discord's loop."""
+    read_model_diag = get_bnl_read_model_diagnostic_state()
+    display_name, preferred_name = get_user_profile(user_id, guild_id)
+    recent_user_rows = get_recent_conversation_count(
+        user_id,
+        guild_id,
+        limit=200,
+    )
+    recent_public_rows = get_recent_public_context_count(guild_id, limit=500)
+    policy_metadata_exists = conversation_rows_have_channel_policy_metadata(
+        guild_id
+    )
+    policy_counts = get_guild_policy_counts(guild_id)
+    role_counts = get_guild_role_counts(guild_id)
+    unknown_policy_model_rows = get_unknown_policy_model_row_count(guild_id)
+    tier_counts = get_memory_tier_counts(user_id, guild_id)
+    adaptive_memory = build_memory_diagnostic_snapshot(
+        user_id,
+        guild_id,
+        route_mode=ROUTE_MODE_NORMAL_CHAT,
+        channel_policy=policy,
+        user_text="",
+        is_owner_or_mod=True,
+    )
+    source_summary = get_memory_source_summary(user_id, guild_id)
+    memory_source_fields_available = memory_tiers_has_source_fields()
+    memory_tier_source_policy_state = (
+        "source-gated"
+        if memory_source_fields_available
+        else "source fields unavailable"
+    )
+    sealed_test_rows_present = policy_counts.get("sealed_test", 0) > 0
+    broadcast_count = len(
+        get_recent_broadcast_memory(guild_id, public_only=False, limit=500)
+    )
+    latest_written_episode_date, latest_show_episode_date = (
+        get_broadcast_memory_diagnostic_dates(guild_id)
+    )
+    active_override = get_active_show_state_override(guild_id)
+    latest_broadcast_context_episode_date = get_latest_broadcast_episode_date(
+        guild_id,
+        public_only=False,
+    )
+    member_activity_events_count, recent_member_events_count_7d = (
+        get_member_activity_event_counts(guild_id)
+    )
+    shadow_acceptance = None
+    try:
+        diagnostic_conn = sqlite3.connect(DB_FILE)
+        try:
+            shadow_acceptance = build_v2_shadow_acceptance_snapshot(
+                diagnostic_conn,
+                guild_id=guild_id,
+                environ=os.environ,
+                conversation_context_diagnostics=dict(
+                    LAST_CONVERSATION_CONTEXT_V2_DIAGNOSTICS
+                ),
+            )
+            ledger_diag = shadow_acceptance["reports"]["memoryLedger"]
+        finally:
+            diagnostic_conn.close()
+    except Exception as exc:
+        logging.debug("v2_shadow_acceptance_diagnostic_failed error=%s", exc)
+        ledger_diag = {
+            "schemaVersion": "memory_ledger_v1",
+            "insertedLedgerEntries": "error",
+        }
+    return (
+        read_model_diag,
+        display_name,
+        preferred_name,
+        recent_user_rows,
+        recent_public_rows,
+        policy_metadata_exists,
+        policy_counts,
+        role_counts,
+        unknown_policy_model_rows,
+        tier_counts,
+        adaptive_memory,
+        source_summary,
+        memory_source_fields_available,
+        memory_tier_source_policy_state,
+        sealed_test_rows_present,
+        broadcast_count,
+        latest_written_episode_date,
+        latest_show_episode_date,
+        active_override,
+        latest_broadcast_context_episode_date,
+        member_activity_events_count,
+        recent_member_events_count_7d,
+        shadow_acceptance,
+        ledger_diag,
+    )
+
+
 @tree.command(name="bnl_memory_check", description="Owner-only safe memory/context diagnostic.")
 async def bnl_memory_check(interaction: discord.Interaction):
     if not BNL_OWNER_USER_ID:
@@ -28694,47 +28840,57 @@ async def bnl_memory_check(interaction: discord.Interaction):
         await interaction.response.send_message("❌ This command can only be used in a server.", ephemeral=True)
         return
 
+    await interaction.response.defer(ephemeral=True)
     guild = interaction.guild
     current_channel = interaction.channel if isinstance(interaction.channel, discord.abc.GuildChannel) else None
     policy = resolve_channel_policy(current_channel)
     context_visibility = context_visibility_for_policy(policy)
     relay_eligibility = website_relay_eligibility(policy)
-    read_model_diag = get_bnl_read_model_diagnostic_state()
-
-    display_name, preferred_name = get_user_profile(interaction.user.id, guild.id)
-    recent_user_rows = get_recent_conversation_count(interaction.user.id, guild.id, limit=200)
-    recent_public_rows = get_recent_public_context_count(guild.id, limit=500)
-    policy_metadata_exists = conversation_rows_have_channel_policy_metadata(guild.id)
-    policy_counts = get_guild_policy_counts(guild.id)
-    role_counts = get_guild_role_counts(guild.id)
-    unknown_policy_model_rows = get_unknown_policy_model_row_count(guild.id)
-    tier_counts = get_memory_tier_counts(interaction.user.id, guild.id)
-    adaptive_memory = build_memory_diagnostic_snapshot(interaction.user.id, guild.id, route_mode=ROUTE_MODE_NORMAL_CHAT, channel_policy=policy, user_text="", is_owner_or_mod=True)
-    source_summary = get_memory_source_summary(interaction.user.id, guild.id)
-    memory_source_fields_available = memory_tiers_has_source_fields()
-    memory_tier_source_policy_state = "source-gated" if memory_source_fields_available else "source fields unavailable"
-    sealed_test_rows_present = policy_counts.get("sealed_test", 0) > 0
-    broadcast_count = len(get_recent_broadcast_memory(guild.id, public_only=False, limit=500))
-    latest_written_episode_date, latest_show_episode_date = get_broadcast_memory_diagnostic_dates(guild.id)
-    active_override = get_active_show_state_override(guild.id)
-    latest_broadcast_context_episode_date = get_latest_broadcast_episode_date(guild.id, public_only=False)
-    member_activity_events_count, recent_member_events_count_7d = get_member_activity_event_counts(guild.id)
-    shadow_acceptance = None
     try:
-        diagnostic_conn = sqlite3.connect(DB_FILE)
-        try:
-            shadow_acceptance = build_v2_shadow_acceptance_snapshot(
-                diagnostic_conn,
-                guild_id=guild.id,
-                environ=os.environ,
-                conversation_context_diagnostics=LAST_CONVERSATION_CONTEXT_V2_DIAGNOSTICS,
-            )
-            ledger_diag = shadow_acceptance["reports"]["memoryLedger"]
-        finally:
-            diagnostic_conn.close()
+        (
+            read_model_diag,
+            display_name,
+            preferred_name,
+            recent_user_rows,
+            recent_public_rows,
+            policy_metadata_exists,
+            policy_counts,
+            role_counts,
+            unknown_policy_model_rows,
+            tier_counts,
+            adaptive_memory,
+            source_summary,
+            memory_source_fields_available,
+            memory_tier_source_policy_state,
+            sealed_test_rows_present,
+            broadcast_count,
+            latest_written_episode_date,
+            latest_show_episode_date,
+            active_override,
+            latest_broadcast_context_episode_date,
+            member_activity_events_count,
+            recent_member_events_count_7d,
+            shadow_acceptance,
+            ledger_diag,
+        ) = await asyncio.to_thread(
+            _collect_bnl_memory_diagnostic_data,
+            guild_id=guild.id,
+            user_id=interaction.user.id,
+            policy=policy,
+        )
     except Exception as exc:
-        logging.debug("v2_shadow_acceptance_diagnostic_failed error=%s", exc)
-        ledger_diag = {"schemaVersion": "memory_ledger_v1", "insertedLedgerEntries": "error"}
+        logging.exception(
+            "bnl_memory_check_report_failed guild_id=%s error_type=%s",
+            guild.id,
+            type(exc).__name__,
+        )
+        await send_safe_ephemeral_chunks(
+            interaction,
+            "❌ BNL memory diagnostic could not be built. No memory or gate "
+            "changes were made. Check the service log and try again.",
+            limit=1700,
+        )
+        return
     lines = [
         "**BNL Memory Diagnostic (safe)**",
         f"- guild: `{guild.name}` (`{guild.id}`)",
