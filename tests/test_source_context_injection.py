@@ -156,6 +156,20 @@ class SourceContextBotIntegrationTests(unittest.TestCase):
         lookup_mock.assert_not_called()
         self.assertEqual(block, "")
 
+    def test_bot_helper_rejects_non_direct_operator_free_speak(self):
+        bnl01_bot.BNL_OWNER_USER_ID = 999
+        with mock.patch.object(bnl01_bot, "lookup_source_file") as lookup_mock:
+            block = asyncio.run(
+                bnl01_bot.maybe_build_source_context_for_direct_message(
+                    self.Message(channel_name="bnl-testing"),
+                    "what do we know about Hellcat?",
+                    "sealed_test",
+                    direct_interaction=False,
+                )
+            )
+        lookup_mock.assert_not_called()
+        self.assertEqual(block, "")
+
     def test_prompt_accepts_source_context_without_breaking_existing_args(self):
         prompt_metadata = {}
         with mock.patch.object(bnl01_bot, "get_user_profile", return_value=("Operator", None)), \

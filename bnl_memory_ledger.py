@@ -1,8 +1,8 @@
 """Unified Memory Ledger v1 shadow schema and write adapters.
 
-The ledger is append-oriented shadow infrastructure only. Legacy memory remains the
-production source of truth; this module never participates in prompt assembly or
-retrieval.
+The ledger is append-oriented shadow infrastructure. Legacy memory remains the
+default production source of truth; separately gated governance and Moment
+adapters may consume only revalidated, route-safe projections.
 """
 from __future__ import annotations
 
@@ -42,17 +42,41 @@ REVIEW_ONLY_LIFECYCLE = "review_only"
 RESOLVED_LIFECYCLE = "resolved"
 REJECTED_LIFECYCLE = "rejected"
 
-_NUMBER_REMEMBER_RE = re.compile(
-    r"(?:^|\s/\s)\s*(?:[,;:\-]\s*)?"
-    r"(?:(?:hey\s*,?\s+)?bnl(?:-01)?\b(?:\s*[,;:\-]\s*|\s+))?"
-    r"(?:please\s+)?remember\s+"
-    r"(?:(?:(?:that\s+(?:the\s+)?|(?:this|the)\s+)?number)\s*(?::|-|is)?\s*|this\s*:\s*)?"
-    r"(\d{1,12})(?!\d)(?:\s*(?:,\s*)?(?:please|for\s+(?:me|later)))?"
-    r"(?=\s*[.!]?(?:\s*/\s|\s*$))",
+APPROVED_SELF_AUTHORED_FACT_KEYS = frozenset({
+    "preferred_name",
+    "pronouns",
+    "favorite_color",
+    "favorite_movie",
+})
+_CONVERSATION_CORRECTION_RE = re.compile(
+    r"\b(?:actually|correction|correcting|i meant|instead|not that|"
+    r"that's wrong|that is wrong|replace|swap|change)\b",
     re.I,
 )
-_REPLACE_NUMBER_RE = re.compile(r"\b(?:replace|supersede)\s+(\d{1,12})\s+\bwith\b\s+(\d{1,12})(?!\d)", re.I)
-_CORRECTION_NUMBER_RE = re.compile(r"\b(?:correction|actually|correcting|i meant)\b[^\n]{0,80}?\b(?:number\s+)?(?:is|was)?\s*(\d{1,12})\s*,?\s+not\s+(\d{1,12})(?!\d)", re.I)
+_CORRECTION_TOPIC_STOPWORDS = frozenset(
+    {
+        "actually",
+        "and",
+        "change",
+        "correcting",
+        "correction",
+        "for",
+        "from",
+        "instead",
+        "into",
+        "meant",
+        "not",
+        "replace",
+        "swap",
+        "that",
+        "the",
+        "this",
+        "to",
+        "use",
+        "with",
+        "wrong",
+    }
+)
 @dataclass(frozen=True)
 class LedgerWriteResult:
     entry_id: str = ""
@@ -264,63 +288,472 @@ def _source_class(route: str, fallback: SourceClass) -> SourceClass:
     return map_route_source_label(route) if has_explicit_route_source_mapping(route) else fallback
 
 
+def _conversation_correction_topic_tokens(value: str) -> set[str]:
+    return {
+        token
+        for token in re.findall(r"[a-z0-9][a-z0-9'-]{2,40}", _canon(value))
+        if token not in _CORRECTION_TOPIC_STOPWORDS
+    }
+
+
+def _finalized_conversation_correction_resolution(
+    conn: sqlite3.Connection,
+    *,
+    guild_id: int,
+    subject_key: str,
+    correction_value: str,
+    channel_policy: str,
+    current_entry_id: str,
+) -> tuple[str, tuple[str, ...]]:
+    """Resolve only one same-author finalized source; ambiguity never guesses."""
+    if (
+        not _CONVERSATION_CORRECTION_RE.search(correction_value or "")
+        or _canon(channel_policy) not in {"public_home", "public_context"}
+        or not conn.execute(
+            """
+            SELECT 1 FROM sqlite_master
+            WHERE type='table' AND name='memory_moment_windows'
+            """
+        ).fetchone()
+    ):
+        return "", ()
+    correction_tokens = _conversation_correction_topic_tokens(
+        correction_value
+    )
+    if not correction_tokens:
+        return "", ()
+    rows = conn.execute(
+        """
+        SELECT DISTINCT e.entry_id,e.normalized_value
+        FROM memory_ledger_entries e
+        JOIN memory_moment_members m
+          ON m.ledger_entry_id=e.entry_id
+        JOIN memory_moment_windows w
+          ON w.moment_id=m.moment_id
+        WHERE e.guild_id=? AND e.subject_key=?
+          AND e.entry_id<>?
+          AND e.source_table='conversations'
+          AND e.source_role='user'
+          AND e.entry_type='observation'
+          AND e.lifecycle_status='active'
+          AND e.public_usable=1
+          AND e.channel_policy IN ('public_home','public_context')
+          AND w.guild_id=e.guild_id
+          AND w.lifecycle_status='finalized'
+          AND w.public_usable=1
+          AND NOT EXISTS (
+            SELECT 1 FROM memory_ledger_lineage l
+            WHERE l.guild_id=e.guild_id
+              AND l.target_entry_id=e.entry_id
+              AND l.lineage_type IN (
+                'correction_of','supersedes','retracts'
+              )
+          )
+        ORDER BY e.observed_at DESC,e.source_sequence DESC,e.entry_id DESC
+        LIMIT 40
+        """,
+        (int(guild_id or 0), subject_key, current_entry_id),
+    ).fetchall()
+    ranked: list[tuple[int, str]] = []
+    for entry_id, value in rows:
+        overlap = len(
+            correction_tokens
+            & _conversation_correction_topic_tokens(str(value or ""))
+        )
+        if overlap > 0:
+            ranked.append((overlap, str(entry_id or "")))
+    if not ranked:
+        return "", ()
+    highest = max(score for score, _entry_id in ranked)
+    # One shared word is not enough to connect an ordinary correction to an
+    # older finalized Moment.  A mistaken supersession is worse than leaving
+    # the correction unlinked for later context-aware review.
+    if highest < 2:
+        return "", ()
+    strongest = {
+        entry_id
+        for score, entry_id in ranked
+        if score == highest and entry_id
+    }
+    if len(strongest) == 1:
+        return next(iter(strongest)), ()
+    return "", tuple(sorted(strongest))
+
+
 def _public_ok(subject_key: str, predicate: str, value: str, source_class: SourceClass, visibility: Visibility, confidence: Confidence, *, valid: bool = True, projection: bool = False) -> bool:
     claim = SourceClaim(stable_entry_id(guild_id=0, source_table="eval", source_row_id=0, entry_type="claim", subject_key=subject_key, predicate_key=predicate), SubjectIdentity(subject_key, subject_key), predicate, value, source_class, visibility, confidence, valid=valid, projection=projection)
     return is_public_usable(claim)
 
 
 
-def _unique_active_value_target(conn: sqlite3.Connection, *, guild_id: int, subject_key: str, predicate_key: str, old_value: str) -> str:
+def _current_first_party_fact(
+    conn: sqlite3.Connection,
+    *,
+    guild_id: int,
+    subject_key: str,
+    predicate_key: str,
+) -> tuple[str, str]:
     ensure_memory_ledger_schema(conn)
     rows = conn.execute(
         """
-        SELECT entry_id FROM memory_ledger_entries
-        WHERE guild_id=? AND subject_key=? AND predicate_key=? AND normalized_value=? AND lifecycle_status='active'
+        SELECT entry_id, normalized_value
+        FROM memory_ledger_entries
+        WHERE guild_id=? AND subject_key=? AND predicate_key=?
+          AND source_class IN ('first_party_record','owner_correction')
+          AND lifecycle_status='active'
           AND entry_id NOT IN (SELECT target_entry_id FROM memory_ledger_lineage WHERE guild_id=? AND lineage_type IN ('supersedes','retracts'))
+        ORDER BY observed_at DESC, created_at DESC, entry_id DESC
         """,
-        (guild_id, subject_key, predicate_key, old_value, guild_id),
+        (guild_id, subject_key, predicate_key, guild_id),
     ).fetchall()
-    return rows[0][0] if len(rows) == 1 else ""
+    if not rows:
+        return "", ""
+    return str(rows[0][0] or ""), str(rows[0][1] or "")
 
 
-def _conversation_fact(text: str, conn: sqlite3.Connection, guild_id: int, subject_key: str) -> tuple[str, str, tuple[tuple[str, str], ...], str, str]:
-    remember = _NUMBER_REMEMBER_RE.search(text or "")
-    if remember:
-        return "remembered_number", remember.group(1), (), ACTIVE_LIFECYCLE, "ok"
-    replacement = _REPLACE_NUMBER_RE.search(text or "")
-    if replacement:
-        old, new = replacement.group(1), replacement.group(2)
-        target = _unique_active_value_target(conn, guild_id=guild_id, subject_key=subject_key, predicate_key="remembered_number", old_value=old)
-        if target:
-            return "remembered_number", new, (("supersedes", target), ("correction_of", target)), ACTIVE_LIFECYCLE, "explicit_correction_linked"
-        return "remembered_number", new, (), REVIEW_ONLY_LIFECYCLE, "unresolved_correction_target"
-    correction = _CORRECTION_NUMBER_RE.search(text or "")
-    if correction:
-        new, old = correction.group(1), correction.group(2)
-        target = _unique_active_value_target(conn, guild_id=guild_id, subject_key=subject_key, predicate_key="remembered_number", old_value=old)
-        if target:
-            return "remembered_number", new, (("supersedes", target), ("correction_of", target)), ACTIVE_LIFECYCLE, "explicit_correction_linked"
-        return "remembered_number", new, (), REVIEW_ONLY_LIFECYCLE, "unresolved_correction_target"
-    if "?" in (text or ""):
-        return "conversation", (text or "")[:500], (), ACTIVE_LIFECYCLE, "ok"
-    return "conversation", (text or "")[:500], (), ACTIVE_LIFECYCLE, "ok"
-
-
-def shadow_conversation_row(conn: sqlite3.Connection, *, row_id: int, user_id: int, user_name: str, guild_id: int, role: str, content: str, channel_name: str = "", channel_policy: str = "unknown", channel_id: int = 0, message_id: int | None = None, route_mode: str = "unknown", observed_at: str = "") -> LedgerWriteResult:
+def shadow_conversation_row(
+    conn: sqlite3.Connection,
+    *,
+    row_id: int,
+    user_id: int,
+    user_name: str,
+    guild_id: int,
+    role: str,
+    content: str,
+    channel_name: str = "",
+    channel_policy: str = "unknown",
+    channel_id: int = 0,
+    message_id: int | None = None,
+    route_mode: str = "unknown",
+    observed_at: str = "",
+    conversation_target_user_ids: tuple[int, ...] = (),
+) -> LedgerWriteResult:
     role_norm = (role or "").lower()
     visibility = _visibility(channel_policy)
     if role_norm != "user":
         subject_key = BNL_SUBJECT_KEY
-        participants = (LedgerParticipant(BNL_SUBJECT_KEY, "BNL-01", "author", 0), LedgerParticipant(subject_key_for_user(user_id), user_name or "", "conversation_target", 1))
+        target_user_ids = tuple(
+            sorted(
+                {
+                    int(target_user_id)
+                    for target_user_id in (
+                        conversation_target_user_ids
+                        or ((user_id,) if int(user_id or 0) > 0 else ())
+                    )
+                    if int(target_user_id or 0) > 0
+                }
+            )
+        )
+        participants = (
+            LedgerParticipant(BNL_SUBJECT_KEY, "BNL-01", "author", 0),
+            *tuple(
+                LedgerParticipant(
+                    subject_key_for_user(target_user_id),
+                    "",
+                    "conversation_target",
+                    index,
+                )
+                for index, target_user_id in enumerate(
+                    target_user_ids,
+                    start=1,
+                )
+            ),
+        )
         entry = LedgerEntry(guild_id=guild_id, source_table="conversations", source_row_id=row_id, source_revision=str(row_id), source_role="model", entry_type="derived_summary", subject_key=BNL_SUBJECT_KEY, subject_display_name="BNL-01", predicate_key="model_output", value=(content or "")[:500], source_class=SourceClass.DERIVED_SUMMARY, route_mode=route_mode, channel_id=channel_id, channel_name=channel_name, channel_policy=channel_policy, source_message_id=message_id, visibility=visibility, confidence=Confidence.LOW, public_usable=False, derived=True, projection=True, salience=0.1, observed_at=observed_at or _now(), source_sequence=row_id, participants=participants)
         return insert_ledger_entry(conn, entry)
     subject_key = subject_key_for_user(user_id)
-    predicate, value, lineage, lifecycle, reason = _conversation_fact(content, conn, guild_id, subject_key)
     source_class = _source_class("conversation_continuity", SourceClass.PUBLIC_OBSERVATION)
-    public_ok = _public_ok(subject_key, predicate, value, source_class, visibility, Confidence.MEDIUM) if lifecycle == ACTIVE_LIFECYCLE else False
-    result = insert_ledger_entry(conn, LedgerEntry(guild_id=guild_id, source_table="conversations", source_row_id=row_id, source_revision=str(row_id), source_role="user", entry_type="observation", subject_key=subject_key, subject_display_name=user_name or "", predicate_key=predicate, value=value, source_class=source_class, route_mode=route_mode, channel_id=channel_id, channel_name=channel_name, channel_policy=channel_policy, source_message_id=message_id, visibility=visibility, confidence=Confidence.MEDIUM, public_usable=public_ok, salience=0.2, observed_at=observed_at or _now(), source_sequence=row_id, lifecycle_status=lifecycle, participants=(LedgerParticipant(subject_key, user_name or "", "author", 0),), lineage=lineage))
-    if reason != "ok" and result.outcome == "inserted":
-        return LedgerWriteResult(result.entry_id, result.outcome, reason, result.source_table, result.source_row_id, result.source_revision, result.source_event_key, result.guild_id)
+    value = (content or "")[:500]
+    public_ok = _public_ok(
+        subject_key,
+        "conversation",
+        value,
+        source_class,
+        visibility,
+        Confidence.MEDIUM,
+    )
+    result = insert_ledger_entry(
+        conn,
+        LedgerEntry(
+            guild_id=guild_id,
+            source_table="conversations",
+            source_row_id=row_id,
+            source_revision=str(row_id),
+            source_role="user",
+            entry_type="observation",
+            subject_key=subject_key,
+            subject_display_name=user_name or "",
+            predicate_key="conversation",
+            value=value,
+            source_class=source_class,
+            route_mode=route_mode,
+            channel_id=channel_id,
+            channel_name=channel_name,
+            channel_policy=channel_policy,
+            source_message_id=message_id,
+            visibility=visibility,
+            confidence=Confidence.MEDIUM,
+            public_usable=public_ok,
+            salience=0.2,
+            observed_at=observed_at or _now(),
+            source_sequence=row_id,
+            participants=(LedgerParticipant(subject_key, user_name or "", "author", 0),),
+        ),
+    )
+    if result.outcome == "inserted":
+        (
+            correction_target,
+            ambiguous_correction_targets,
+        ) = _finalized_conversation_correction_resolution(
+            conn,
+            guild_id=guild_id,
+            subject_key=subject_key,
+            correction_value=value,
+            channel_policy=channel_policy,
+            current_entry_id=result.entry_id,
+        )
+        if correction_target:
+            now = _now()
+            for lineage_type in ("correction_of", "supersedes"):
+                conn.execute(
+                    """
+                    INSERT OR IGNORE INTO memory_ledger_lineage
+                      (entry_id,guild_id,lineage_type,target_entry_id,created_at)
+                    VALUES (?,?,?,?,?)
+                    """,
+                    (
+                        result.entry_id,
+                        int(guild_id or 0),
+                        lineage_type,
+                        correction_target,
+                        now,
+                    ),
+                )
+        elif ambiguous_correction_targets:
+            placeholders = ",".join(
+                "?" for _target in ambiguous_correction_targets
+            )
+            conn.execute(
+                f"""
+                UPDATE memory_moment_windows
+                SET lifecycle_status='needs_review',updated_at=?
+                WHERE guild_id=? AND lifecycle_status='finalized'
+                  AND moment_id IN (
+                    SELECT moment_id FROM memory_moment_members
+                    WHERE ledger_entry_id IN ({placeholders})
+                  )
+                """,
+                (
+                    _now(),
+                    int(guild_id or 0),
+                    *ambiguous_correction_targets,
+                ),
+            )
+    return result
+
+
+def shadow_first_party_user_fact(
+    conn: sqlite3.Connection,
+    *,
+    row_id: int,
+    user_id: int,
+    user_name: str,
+    guild_id: int,
+    fact_key: str,
+    fact_value: str,
+    channel_name: str = "",
+    channel_policy: str = "unknown",
+    channel_id: int = 0,
+    message_id: int | None = None,
+    route_mode: str = "unknown",
+    observed_at: str = "",
+) -> LedgerWriteResult:
+    """Project one approved direct self-report from its conversation source.
+
+    This remains a shadow write. The source conversation row is the authority;
+    legacy ``user_memory_facts`` is retained only for production compatibility.
+    Repetition does not create a stronger entry, while a later direct value
+    supersedes the prior current value for that same field.
+    """
+    key = _canon(fact_key)
+    value = re.sub(r"\s+", " ", str(fact_value or "")).strip()[:500]
+    if key not in APPROVED_SELF_AUTHORED_FACT_KEYS:
+        return skipped_result(
+            guild_id=guild_id,
+            source_table="conversations",
+            source_row_id=row_id,
+            source_revision=str(row_id),
+            reason_code="self_authored_fact_not_allowlisted",
+        )
+    if not value:
+        return skipped_result(
+            guild_id=guild_id,
+            source_table="conversations",
+            source_row_id=row_id,
+            source_revision=str(row_id),
+            reason_code="empty_self_authored_fact",
+        )
+
+    subject_key = subject_key_for_user(user_id)
+    prior_entry_id, prior_value = _current_first_party_fact(
+        conn,
+        guild_id=guild_id,
+        subject_key=subject_key,
+        predicate_key=key,
+    )
+    if prior_entry_id and _canon(prior_value) == _canon(value):
+        return skipped_result(
+            guild_id=guild_id,
+            source_table="conversations",
+            source_row_id=row_id,
+            source_revision=str(row_id),
+            reason_code="repeated_self_authored_value",
+        )
+
+    visibility = _visibility(channel_policy)
+    source_class = SourceClass.FIRST_PARTY_RECORD
+    public_ok = _public_ok(
+        subject_key,
+        key,
+        value,
+        source_class,
+        visibility,
+        Confidence.HIGH,
+    )
+    lineage = (
+        (("supersedes", prior_entry_id), ("correction_of", prior_entry_id))
+        if prior_entry_id
+        else ()
+    )
+    result = insert_ledger_entry(
+        conn,
+        LedgerEntry(
+            guild_id=guild_id,
+            source_table="conversations",
+            source_row_id=row_id,
+            source_revision=str(row_id),
+            source_role="member_self_report",
+            entry_type="preference",
+            subject_key=subject_key,
+            subject_display_name=user_name or "",
+            predicate_key=key,
+            value=value,
+            source_class=source_class,
+            route_mode=route_mode,
+            channel_id=channel_id,
+            channel_name=channel_name,
+            channel_policy=channel_policy,
+            source_message_id=message_id,
+            visibility=visibility,
+            confidence=Confidence.HIGH,
+            public_usable=public_ok,
+            salience=0.45,
+            observed_at=observed_at or _now(),
+            source_sequence=row_id,
+            participants=(LedgerParticipant(subject_key, user_name or "", "author", 0),),
+            lineage=lineage,
+        ),
+    )
+    if result.outcome == "inserted" and prior_entry_id:
+        conn.execute(
+            """
+            UPDATE memory_ledger_entries
+            SET lifecycle_status='superseded', updated_at=?
+            WHERE guild_id=? AND entry_id=?
+            """,
+            (_now(), int(guild_id or 0), prior_entry_id),
+        )
+    return result
+
+
+def shadow_member_control_fact(
+    conn: sqlite3.Connection,
+    *,
+    row_id: int,
+    user_id: int,
+    guild_id: int,
+    fact_key: str,
+    fact_value: str,
+    control_ref: str,
+    observed_at: str = "",
+) -> LedgerWriteResult:
+    """Project an explicit member control as first-party authoritative input."""
+    key = _canon(fact_key)
+    value = re.sub(r"\s+", " ", str(fact_value or "")).strip()[:500]
+    revision = "control:" + _canon(control_ref or f"fact:{row_id}")
+    if key not in APPROVED_SELF_AUTHORED_FACT_KEYS:
+        return skipped_result(
+            guild_id=guild_id,
+            source_table="user_memory_facts",
+            source_row_id=row_id,
+            source_revision=revision,
+            reason_code="member_control_fact_not_allowlisted",
+        )
+    if not value:
+        return skipped_result(
+            guild_id=guild_id,
+            source_table="user_memory_facts",
+            source_row_id=row_id,
+            source_revision=revision,
+            reason_code="empty_member_control_fact",
+        )
+    subject_key = subject_key_for_user(user_id)
+    prior_entry_id, prior_value = _current_first_party_fact(
+        conn,
+        guild_id=guild_id,
+        subject_key=subject_key,
+        predicate_key=key,
+    )
+    if prior_entry_id and _canon(prior_value) == _canon(value):
+        return skipped_result(
+            guild_id=guild_id,
+            source_table="user_memory_facts",
+            source_row_id=row_id,
+            source_revision=revision,
+            reason_code="repeated_member_control_value",
+        )
+    lineage = (
+        (("supersedes", prior_entry_id), ("correction_of", prior_entry_id))
+        if prior_entry_id
+        else ()
+    )
+    result = insert_ledger_entry(
+        conn,
+        LedgerEntry(
+            guild_id=guild_id,
+            source_table="user_memory_facts",
+            source_row_id=row_id,
+            source_revision=revision,
+            source_event_key=_canon(control_ref),
+            source_role="member_control",
+            entry_type="preference",
+            subject_key=subject_key,
+            predicate_key=key,
+            value=value,
+            source_class=SourceClass.FIRST_PARTY_RECORD,
+            route_mode="member_control",
+            channel_policy="member_control",
+            visibility=Visibility.PUBLIC_SAFE,
+            confidence=Confidence.HIGH,
+            public_usable=True,
+            salience=0.5,
+            observed_at=observed_at or _now(),
+            source_sequence=int(row_id or 0),
+            participants=(
+                LedgerParticipant(subject_key, "", "control_actor", 0),
+            ),
+            lineage=lineage,
+        ),
+    )
+    if result.outcome == "inserted" and prior_entry_id:
+        conn.execute(
+            """
+            UPDATE memory_ledger_entries
+            SET lifecycle_status='superseded', updated_at=?
+            WHERE guild_id=? AND entry_id=?
+            """,
+            (_now(), int(guild_id or 0), prior_entry_id),
+        )
     return result
 
 

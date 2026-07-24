@@ -113,6 +113,9 @@ class AdaptiveMemoryLifecycleTests(unittest.TestCase):
         text = str(diag)
         self.assertIn("configured_limits", text)
         self.assertIn("tier_counts", text)
+        self.assertIn("runtime_gates", text)
+        self.assertIn("moment_gist_canary", text)
+        self.assertIn("memory_governance_live", text)
         self.assertNotIn("PRIVATE_ADMIN_ALPHA", text)
 
 

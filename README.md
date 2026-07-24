@@ -144,6 +144,42 @@ See [BNL-01 v2 Shadow Acceptance and Rollback](docs/BNL01_V2_SHADOW_ACCEPTANCE_A
 for the aggregate evidence fields, exact stop conditions, and reverse-order
 rollback procedure.
 
+## Conversation and memory authority
+
+BNL's conversation and memory paths are connected, but they are not one
+undifferentiated store:
+
+| Layer | Authority and current role |
+| --- | --- |
+| Conversation Context v2 | The live, bounded owner for nearby room continuity and relevant same-member public follow-ups. It defaults on and does not make every message durable. |
+| Approved member facts | Only a direct self-report of preferred name, pronouns, favorite color, or favorite movie may update the live personal fact owner automatically. These facts remain source-linked, changeable, and non-Core. |
+| Unified Memory Ledger | Additive, source-linked shadow evidence and lineage. It is not live reply authority by itself. |
+| Moment Engine | Builds derived, participant-attributed meaning gists from eligible Ledger evidence. A Moment is paraphrase support, never a transcript or quotation authority. |
+| Memory Governance | Compares eligible durable candidates in shadow. The existing broad live switch is not an approved production cutover path. |
+| Relationship v2 / Active Engagement v2 | Derived tone and proactive-behavior layers. Their live gates remain off until earlier memory authority, precedence, correction, deletion, and rollback canaries pass. |
+
+Normal continuity may connect relevant prior messages across ordinary topics,
+including stories, jokes, plans, and technical work. It must keep speakers
+distinct, preserve public/private and channel-policy boundaries, and avoid
+turning conversation traces into biography. Multi-person replies are shared
+room output rather than a personal BNL reply copied into every participant's
+history.
+
+When asked what another person said, BNL should give a cautious gist by default.
+Exact wording is a separate, fail-closed evidence mode: it requires a
+consequential verification or dispute request, one typed target, one eligible
+same-room public human message, and a still-matching live Discord source.
+Memory tiers, relationship notes, summaries, Relays, Journals, and Moments never
+authorize a quote.
+
+`BNL_MOMENT_GIST_CANARY_ENABLED` defaults off. Even when explicitly set, it
+requires both Ledger and Moment shadow gates, non-empty guild and member
+allowlists, a direct request, and an eligible public route. Deploying the code
+does not enable this canary or any global v2 live gate. See
+[the July 24 memory intelligence checkpoint](BARCODE_BNL_MEMORY_INTELLIGENCE_CHECKPOINT_2026-07-24.md)
+for the implemented/enabled/observed distinction and the ordered work that
+still remains.
+
 ## Release baseline
 
 Before merging a runtime change:

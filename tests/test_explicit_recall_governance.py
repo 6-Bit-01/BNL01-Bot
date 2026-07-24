@@ -156,13 +156,89 @@ class ExplicitRecallGovernanceTests(unittest.TestCase):
             self.assertIn("format_explicit_recall_for_chat", window)
             self.assertIn("validate_deterministic_normal_chat_response", window)
 
+    def test_specific_recall_requires_source_linked_direct_fact_and_survives_pruning(self):
+        os.environ["BNL_MEMORY_LEDGER_SHADOW_ENABLED"] = "1"
+        bnl01_bot.upsert_user_fact(
+            42,
+            1,
+            "favorite_movie",
+            "Legacy Guess",
+            0.7,
+        )
+        source_blind = bnl01_bot.try_memory_recall_response(
+            42,
+            1,
+            "what is my favorite movie?",
+        )
+        self.assertEqual(
+            source_blind,
+            "I don't have your favorite movie reliably recorded yet.",
+        )
 
-class RememberDirectiveExtractionTests(unittest.TestCase):
+        bnl01_bot.save_user_message(
+            42,
+            "Crow",
+            1,
+            "my favorite movie is Hackers",
+            channel_name="barcode-bot",
+            channel_policy="public_home",
+            channel_id=10,
+            message_id=5001,
+            directed_to_bnl=True,
+        )
+        row = self.rows(
+            """
+            SELECT fact_value, source_conversation_row_id, source_message_id,
+                   source_channel_policy, source_kind, source_directed,
+                   source_ledger_entry_id, lifecycle_status
+            FROM user_memory_facts
+            WHERE user_id=42 AND guild_id=1 AND fact_key='favorite_movie'
+            """
+        )[0]
+        self.assertEqual(
+            row[:6],
+            ("Hackers", 1, 5001, "public_home", "member_self_report", 1),
+        )
+        self.assertTrue(row[6].startswith("mle_"))
+        self.assertEqual(row[7], "active")
+        self.assertIn(
+            "**Hackers**",
+            bnl01_bot.try_memory_recall_response(
+                42,
+                1,
+                "what is my favorite movie?",
+            ),
+        )
+
+        with sqlite3.connect(bnl01_bot.DB_FILE) as conn:
+            conn.execute("DELETE FROM conversations")
+            conn.commit()
+        self.assertIn(
+            "**Hackers**",
+            bnl01_bot.try_memory_recall_response(
+                42,
+                1,
+                "what is my favorite movie?",
+            ),
+        )
+
+
+class ApprovedMemberFactExtractionTests(unittest.TestCase):
     def facts(self, text):
         return bnl01_bot.extract_user_facts(text)
 
-    def test_negative_interrogatives_create_no_remember_derived_facts_and_greetings_unchanged(self):
-        negatives = [
+    def test_remember_requests_and_arbitrary_notes_never_become_durable_facts(self):
+        unsupported = [
+            "remember this number: 731946",
+            "Remember this number - 8",
+            "please remember the number 284517",
+            "remember this: 731946",
+            "remember that the number is 8",
+            "remember that my door code changed",
+            "remember my backup contact is Leo",
+            "please remember I prefer short answers",
+            "my favorite song is Blue Monday",
+            "my current project is a visual album",
             "do you remember the number 8?",
             "can you remember this number: 731946?",
             "what number did I tell you to remember, 8?",
@@ -177,38 +253,42 @@ class RememberDirectiveExtractionTests(unittest.TestCase):
             "what number did I ask you to remember?",
             "why don’t you remember X?",
         ]
-        remember_derived_keys = {"remembered_number", "user_note"}
-        for text in negatives:
-            facts = self.facts(text)
-            self.assertFalse(any(k in remember_derived_keys for k, _v, _c in facts), text)
+        for text in unsupported:
+            self.assertEqual(self.facts(text), [], text)
         self.assertEqual(self.facts("hello BNL"), [])
 
-    def test_exact_remember_number_production_phrases_create_only_remembered_number(self):
+    def test_only_four_clear_direct_self_reports_are_extracted(self):
         cases = {
-            "remember this number: 731946": "731946",
-            "Remember this number - 8": "8",
-            "please remember the number 284517": "284517",
-            "remember this: 731946": "731946",
-            "remember that the number is 8": "8",
+            "call me Crow": [("preferred_name", "Crow", 0.90)],
+            "my pronouns are they/them": [("pronouns", "they/them", 0.90)],
+            "my favorite color is green": [("favorite_color", "green", 0.88)],
+            "my favourite colour is blue": [("favorite_color", "blue", 0.88)],
+            "my favorite movie is Hackers": [("favorite_movie", "Hackers", 0.90)],
         }
         for text, expected in cases.items():
-            facts = self.facts(text)
-            self.assertEqual([f for f in facts if f[0] == "remembered_number"], [("remembered_number", expected, 0.9)], text)
-            self.assertFalse(any(k == "user_note" for k, _v, _c in facts), text)
+            self.assertEqual(self.facts(text), expected, text)
+        extracted_keys = {
+            key
+            for text in cases
+            for key, _value, _confidence in self.facts(text)
+        }
+        self.assertEqual(
+            extracted_keys,
+            {"preferred_name", "pronouns", "favorite_color", "favorite_movie"},
+        )
 
-    def test_positive_directives_create_notes_without_structured_duplicates(self):
-        cases = {
-            "remember that my door code changed": "my door code changed",
-            "remember my backup contact is Leo": "my backup contact is Leo",
-        }
-        for text, expected in cases.items():
-            self.assertIn(("user_note", expected, 0.64), self.facts(text))
-        preference_facts = self.facts("please remember I prefer short answers")
-        self.assertIn(("preferences", "short answers", 0.72), preference_facts)
-        self.assertFalse(any(k == "user_note" and "short answers" in v for k, v, _c in preference_facts))
-        facts = self.facts("remember that my favorite movie is Hackers")
-        self.assertIn(("favorite_movie", "Hackers", 0.92), facts)
-        self.assertFalse(any(k == "user_note" and v == "my favorite movie is Hackers" for k, v, _c in facts))
+    def test_questions_roleplay_quotes_past_and_third_party_claims_are_rejected(self):
+        rejected = [
+            "is my favorite color green?",
+            'pretend I said "my favorite color is green"',
+            '"my favorite movie is Hackers"',
+            "my favorite color used to be green",
+            "my favorite movie is no longer Hackers",
+            "someone said my favorite color is green",
+            "they wrote my pronouns are they/them",
+        ]
+        for text in rejected:
+            self.assertEqual(self.facts(text), [], text)
 
 
 if __name__ == "__main__":
