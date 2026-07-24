@@ -6,6 +6,7 @@ from bnl_conversation_context_v2 import (
     CONVERSATION_CONTEXT_VERSION,
     ConversationContextRequest,
     assemble_conversation_context_v2,
+    immediate_room_recap_requested,
     normalize_text,
     sanitize_history_text,
     sanitize_speaker_name,
@@ -35,6 +36,24 @@ def req(**kw):
     return ConversationContextRequest(**base)
 
 class ConversationContextV2Tests(unittest.TestCase):
+    def test_natural_room_recap_phrasing_is_participant_neutral(self):
+        requests = (
+            "What were Miss Bit and I just talking about?",
+            "What were they just discussing?",
+            "What did everyone decide?",
+            "What just happened?",
+            "Catch me up.",
+        )
+
+        for text in requests:
+            with self.subTest(text=text):
+                self.assertTrue(immediate_room_recap_requested(text))
+        self.assertFalse(immediate_room_recap_requested("What are you doing?"))
+        self.assertFalse(
+            immediate_room_recap_requested("What did you do yesterday?")
+        )
+        self.assertFalse(immediate_room_recap_requested("Where were we?"))
+
     def test_pair_chronological_and_model_retained(self):
         res = assemble_conversation_context_v2([row(1,"user","explain the red synth"), row(2,"model","The red synth is acting as lead." )], req())
         self.assertEqual(res.contract_version, CONVERSATION_CONTEXT_VERSION)
@@ -76,6 +95,236 @@ class ConversationContextV2Tests(unittest.TestCase):
         self.assertIn("drums answer", res.rendered_context)
         self.assertNotIn("old answer", res.rendered_context)
         self.assertGreaterEqual(res.visibility_policy_exclusions, 1)
+
+    def test_natural_room_recap_selects_latest_unanswered_human_exchange(self):
+        rows = [
+            row(
+                1,
+                "user",
+                "The machine only fails on its second restart.",
+                user=1,
+                name="Jon",
+                minutes=8,
+            ),
+            row(
+                2,
+                "model",
+                "Check the restart logs and compare the second boot.",
+                user=1,
+                minutes=7,
+            ),
+            row(
+                3,
+                "user",
+                "I'm handling the intro.",
+                user=1,
+                name="Jon",
+                minutes=3,
+            ),
+            row(
+                4,
+                "user",
+                "I'm handling the artwork.",
+                user=2,
+                name="Miss Bit",
+                minutes=2,
+            ),
+        ]
+
+        result = assemble_conversation_context_v2(
+            rows,
+            req(
+                current_texts=(
+                    "BNL, what were Miss Bit and I just talking about?",
+                ),
+            ),
+        )
+
+        self.assertIn(
+            'User/member (display name “Jon”; immediate room recap): '
+            "I'm handling the intro.",
+            result.rendered_context,
+        )
+        self.assertIn(
+            'User/member (display name “Miss Bit”; immediate room recap): '
+            "I'm handling the artwork.",
+            result.rendered_context,
+        )
+        self.assertNotIn("machine only fails", result.rendered_context)
+        self.assertNotIn("restart logs", result.rendered_context)
+        self.assertEqual(result.selected_row_ids, (3, 4))
+        self.assertEqual(result.unpaired_row_count, 2)
+        self.assertIn("immediate_room_recap", result.selection_reasons)
+
+    def test_natural_room_recap_has_no_two_person_selection_limit(self):
+        contributions = (
+            (1, "Avery", "Avery set the party at their house."),
+            (2, "Blake", "Blake brought the speakers."),
+            (3, "Casey", "Casey chose the music."),
+            (4, "Devon", "Devon brought the cake."),
+            (5, "Emery", "Emery set up the lights."),
+            (6, "Finley", "Finley organized the games."),
+            (7, "Gray", "Gray opened the back room."),
+            (8, "Harper", "Harper dropped the cake."),
+            (9, "Indigo", "Indigo saw Batman arrive."),
+            (10, "Jules", "Jules checked that everyone was okay."),
+        )
+        rows = [
+            row(
+                index,
+                "user",
+                content,
+                user=index,
+                name=name,
+                minutes=11 - index,
+            )
+            for index, name, content in contributions
+        ]
+
+        result = assemble_conversation_context_v2(
+            rows,
+            req(
+                current_user_id=11,
+                current_texts=("What were we all just talking about?",),
+                current_participants=frozenset({11}),
+            ),
+        )
+
+        for _index, name, content in contributions:
+            with self.subTest(name=name):
+                self.assertIn(f"display name “{name}”", result.rendered_context)
+                self.assertIn(content, result.rendered_context)
+        self.assertEqual(result.selected_row_ids, tuple(range(1, 11)))
+        self.assertEqual(result.unpaired_row_count, 10)
+
+    def test_large_room_recap_preserves_newest_contributions_at_prompt_limit(self):
+        rows = [
+            row(
+                index,
+                "user",
+                f"Member {index} contribution "
+                + ("with useful event detail " * 8),
+                user=index,
+                name=f"Member {index}",
+                minutes=(31 - index) / 10,
+            )
+            for index in range(1, 31)
+        ]
+
+        result = assemble_conversation_context_v2(
+            rows,
+            req(
+                current_user_id=40,
+                current_texts=("What were we all just talking about?",),
+                current_participants=frozenset({40}),
+            ),
+        )
+
+        self.assertIn("Member 30 contribution", result.rendered_context)
+        self.assertGreater(result.unpaired_row_count, 2)
+        self.assertLessEqual(result.final_char_count, 2600)
+
+    def test_current_multi_person_batch_recap_does_not_import_older_thread(self):
+        rows = [
+            row(
+                1,
+                "user",
+                "The machine only fails on its second restart.",
+                user=1,
+                name="Jon",
+                minutes=8,
+            ),
+            row(
+                2,
+                "model",
+                "Check the restart logs and compare the second boot.",
+                user=1,
+                minutes=7,
+            ),
+        ]
+
+        result = assemble_conversation_context_v2(
+            rows,
+            req(
+                is_batch=True,
+                current_texts=(
+                    "I'm handling the intro.",
+                    "I'm handling the artwork.",
+                    "What were Miss Bit and I just talking about?",
+                ),
+                current_participants=frozenset({1, 2}),
+            ),
+        )
+
+        self.assertEqual(result.rendered_context, "")
+        self.assertNotIn("restart", result.rendered_context)
+
+    def test_current_batch_recap_does_not_require_multiple_participants(self):
+        rows = [
+            row(
+                1,
+                "user",
+                "The older thread was about restart logs.",
+                user=1,
+                name="Jon",
+                minutes=8,
+            ),
+            row(
+                2,
+                "model",
+                "Compare the first and second restart.",
+                user=1,
+                minutes=7,
+            ),
+        ]
+
+        result = assemble_conversation_context_v2(
+            rows,
+            req(
+                is_batch=True,
+                current_texts=(
+                    "I'm handling the intro.",
+                    "What were we just talking about?",
+                ),
+                current_participants=frozenset({1}),
+            ),
+        )
+
+        self.assertEqual(result.rendered_context, "")
+        self.assertNotIn("restart", result.rendered_context)
+
+    def test_batch_address_fragment_does_not_hide_stored_recap_evidence(self):
+        rows = [
+            row(
+                1,
+                "user",
+                "Avery has the lights.",
+                user=2,
+                name="Avery",
+                minutes=3,
+            ),
+            row(
+                2,
+                "user",
+                "Blake has the camera.",
+                user=3,
+                name="Blake",
+                minutes=2,
+            ),
+        ]
+
+        result = assemble_conversation_context_v2(
+            rows,
+            req(
+                is_batch=True,
+                current_user_id=1,
+                current_texts=("BNL", "What were they just discussing?"),
+                current_participants=frozenset({1}),
+            ),
+        )
+
+        self.assertIn("Avery has the lights.", result.rendered_context)
+        self.assertIn("Blake has the camera.", result.rendered_context)
 
     def test_channel_name_fallback_is_still_age_bounded(self):
         rows = [row(1,"user","stale by name", channel=0, cname="home", minutes=200), row(2,"model","stale answer", channel=0, cname="home", minutes=199)]
@@ -606,11 +855,11 @@ class BotConversationContextV2IntegrationTests(unittest.TestCase):
         except OSError:
             pass
 
-    def _insert(self, role, content, uid=1, mid=None, channel=10, policy="public_home", minutes=1):
+    def _insert(self, role, content, uid=1, mid=None, channel=10, policy="public_home", minutes=1, name=None):
         import sqlite3
         ts = (datetime.now(timezone.utc) - timedelta(minutes=minutes)).replace(microsecond=0).isoformat(sep=" ")
         conn=sqlite3.connect(self.tmp.name)
-        conn.execute("INSERT INTO conversations (user_id,user_name,guild_id,channel_name,channel_policy,channel_id,message_id,role,content,timestamp) VALUES (?,?,?,?,?,?,?,?,?,?)", (uid, "member" if role=="user" else "BNL-01", 99, "home", policy, channel, mid, role, content, ts))
+        conn.execute("INSERT INTO conversations (user_id,user_name,guild_id,channel_name,channel_policy,channel_id,message_id,role,content,timestamp) VALUES (?,?,?,?,?,?,?,?,?,?)", (uid, name or ("member" if role=="user" else "BNL-01"), 99, "home", policy, channel, mid, role, content, ts))
         conn.commit(); conn.close()
 
     def test_direct_prompt_after_save_has_one_live_request_and_no_legacy_room_stack(self):
@@ -743,6 +992,70 @@ class BotConversationContextV2IntegrationTests(unittest.TestCase):
         self.assertIn("Conversation continuity (bounded", prompt)
         self.assertIn("batch answer", prompt)
         self.assertNotIn("User/member: current batch", prompt)
+
+    def test_live_batch_recap_uses_current_group_and_excludes_older_bnl_thread(self):
+        b = self.bot
+        self._insert(
+            "user",
+            "The machine only fails on its second restart.",
+            uid=1,
+            name="Jon",
+            minutes=8,
+        )
+        self._insert(
+            "model",
+            "Check the restart logs and compare the second boot.",
+            uid=1,
+            minutes=7,
+        )
+        current_items = [
+            ("Jon", "I'm handling the intro.", 1),
+            ("Miss Bit", "I'm handling the artwork.", 2),
+            (
+                "Jon",
+                "BNL, what were Miss Bit and I just talking about?",
+                1,
+            ),
+        ]
+        combined_text = " ".join(content for _name, content, _uid in current_items)
+        prompt = b._format_batched_prompt(
+            current_items,
+            "balanced",
+            "Answer naturally.",
+        )
+        context = b.build_active_batch_conversation_context_v2_prompt(
+            guild_id=99,
+            channel_id=10,
+            channel_name="home",
+            channel_policy="public_home",
+            first_uid=1,
+            collapsed_items=current_items,
+            unique_user_ids=[1, 2],
+            active_packet={
+                "items": current_items,
+                "payload_items": [],
+                "has_request_payload": False,
+                "addressed_to_bot": True,
+            },
+            is_active_channel=True,
+        )
+        if context:
+            prompt += "\n\n" + context
+        continuity_contract = b.build_general_conversation_continuity_contract(
+            combined_text,
+            context,
+            include_immediate_recap=False,
+        )
+        if continuity_contract:
+            prompt += "\n\n" + continuity_contract
+
+        self.assertIn("- Jon: I'm handling the intro.", prompt)
+        self.assertIn("- Miss Bit: I'm handling the artwork.", prompt)
+        self.assertIn("Immediate room recap contract:", prompt)
+        self.assertIn("no magic word such as “gist” is required", prompt)
+        self.assertIn("regardless of participant count", prompt)
+        self.assertNotIn("machine only fails", prompt)
+        self.assertNotIn("restart logs", prompt)
 
     def test_opener_correction_batch_uses_v2_prior_pair_and_fresh_judgment_contract(self):
         b = self.bot
