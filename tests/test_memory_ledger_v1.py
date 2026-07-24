@@ -17,10 +17,34 @@ class MemoryLedgerV1Tests(unittest.TestCase):
     def count_entries(self):
         return self.conn.execute("SELECT COUNT(*) FROM memory_ledger_entries").fetchone()[0]
 
+    def add_approved_fact(
+        self,
+        row_id,
+        fact_key,
+        fact_value,
+        *,
+        observed_at="2026-01-01T00:00:00+00:00",
+    ):
+        return ledger.shadow_first_party_user_fact(
+            self.conn,
+            row_id=row_id,
+            user_id=7,
+            user_name="Crow",
+            guild_id=1,
+            fact_key=fact_key,
+            fact_value=fact_value,
+            channel_name="barcode-bot",
+            channel_policy="public_home",
+            channel_id=10,
+            message_id=1000 + row_id,
+            route_mode="normal_chat",
+            observed_at=observed_at,
+        )
+
     def test_schema_idempotent_and_stable_id(self):
         ledger.ensure_memory_ledger_schema(self.conn)
-        one = ledger.stable_entry_id(guild_id=1, source_table="conversations", source_row_id=500, entry_type="observation", subject_key="discord_user:7", predicate_key="remembered_number")
-        two = ledger.stable_entry_id(guild_id=1, source_table="conversations", source_row_id=500, entry_type="observation", subject_key="discord_user:7", predicate_key="remembered_number")
+        one = ledger.stable_entry_id(guild_id=1, source_table="conversations", source_row_id=500, entry_type="preference", subject_key="discord_user:7", predicate_key="favorite_color")
+        two = ledger.stable_entry_id(guild_id=1, source_table="conversations", source_row_id=500, entry_type="preference", subject_key="discord_user:7", predicate_key="favorite_color")
         self.assertEqual(one, two)
 
     def test_exact_source_dedup_but_separate_rows_survive(self):
@@ -34,11 +58,17 @@ class MemoryLedgerV1Tests(unittest.TestCase):
         self.assertNotEqual(first.entry_id, second.entry_id)
         self.assertEqual(self.count_entries(), 2)
 
-    def test_number_sequence_is_additive_not_supersession(self):
+    def test_remember_directives_remain_raw_conversation_without_durable_lineage(self):
         ledger.shadow_conversation_row(self.conn, row_id=1, user_id=7, user_name="Crow", guild_id=1, role="user", content="remember this number: 731946", channel_policy="sealed_test", observed_at="2026-01-01T00:00:01+00:00")
         ledger.shadow_conversation_row(self.conn, row_id=2, user_id=7, user_name="Crow", guild_id=1, role="user", content="remember this number: 284517", channel_policy="sealed_test", observed_at="2026-01-01T00:00:02+00:00")
-        rows = self.conn.execute("SELECT normalized_value, lifecycle_status FROM memory_ledger_entries ORDER BY source_sequence").fetchall()
-        self.assertEqual(rows, [("731946", "active"), ("284517", "active")])
+        rows = self.conn.execute("SELECT predicate_key, normalized_value, lifecycle_status FROM memory_ledger_entries ORDER BY source_sequence").fetchall()
+        self.assertEqual(
+            rows,
+            [
+                ("conversation", "remember this number: 731946", "active"),
+                ("conversation", "remember this number: 284517", "active"),
+            ],
+        )
         self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM memory_ledger_lineage WHERE lineage_type IN ('supersedes','correction_of')").fetchone()[0], 0)
 
     def test_model_row_is_derived_and_cannot_establish_user_fact(self):
@@ -63,66 +93,137 @@ class MemoryLedgerV1Tests(unittest.TestCase):
         self.assertEqual(row, ("conversations", "conversation"))
 
 
-    def test_single_and_twelve_digit_numbers_are_supported(self):
+    def test_number_directives_are_preserved_verbatim_as_conversation_rows(self):
         r1 = ledger.shadow_conversation_row(self.conn, row_id=20, user_id=7, user_name="Crow", guild_id=1, role="user", content="Remember this number: 8", channel_policy="sealed_test")
         r2 = ledger.shadow_conversation_row(self.conn, row_id=21, user_id=7, user_name="Crow", guild_id=1, role="user", content="remember this number: 123456789012", channel_policy="sealed_test")
         self.assertEqual((r1.outcome, r2.outcome), ("inserted", "inserted"))
-        values = [r[0] for r in self.conn.execute("SELECT normalized_value FROM memory_ledger_entries ORDER BY source_sequence").fetchall()]
-        self.assertEqual(values, ["8", "123456789012"])
+        rows = self.conn.execute("SELECT predicate_key, normalized_value FROM memory_ledger_entries ORDER BY source_sequence").fetchall()
+        self.assertEqual(
+            rows,
+            [
+                ("conversation", "Remember this number: 8"),
+                ("conversation", "remember this number: 123456789012"),
+            ],
+        )
 
-    def test_bare_remember_number_is_durable_but_declarative_and_questions_are_not(self):
-        ledger.shadow_conversation_row(self.conn, row_id=22, user_id=7, user_name="Crow", guild_id=1, role="user", content="remember 8", channel_policy="sealed_test")
-        ledger.shadow_conversation_row(self.conn, row_id=23, user_id=7, user_name="Crow", guild_id=1, role="user", content="do you remember 9?", channel_policy="sealed_test")
-        ledger.shadow_conversation_row(self.conn, row_id=24, user_id=7, user_name="Crow", guild_id=1, role="user", content="I remember 10 people", channel_policy="sealed_test")
-        ledger.shadow_conversation_row(self.conn, row_id=25, user_id=7, user_name="Crow", guild_id=1, role="user", content="I do not remember 11", channel_policy="sealed_test")
-        ledger.shadow_conversation_row(self.conn, row_id=26, user_id=7, user_name="Crow", guild_id=1, role="user", content="what's up? / remember 12", channel_policy="sealed_test")
-        ledger.shadow_conversation_row(self.conn, row_id=27, user_id=7, user_name="Crow", guild_id=1, role="user", content="remember 13 / what's up?", channel_policy="sealed_test")
-        ledger.shadow_conversation_row(self.conn, row_id=28, user_id=7, user_name="Crow", guild_id=1, role="user", content="hey BNL, please remember the number 14", channel_policy="sealed_test")
-        ledger.shadow_conversation_row(self.conn, row_id=29, user_id=7, user_name="Crow", guild_id=1, role="user", content="remember 15 for me", channel_policy="sealed_test")
-        ledger.shadow_conversation_row(self.conn, row_id=30, user_id=7, user_name="Crow", guild_id=1, role="user", content=", remember 16", channel_policy="sealed_test")
-        ledger.shadow_conversation_row(self.conn, row_id=31, user_id=7, user_name="Crow", guild_id=1, role="user", content="Hey, BNL, remember 17", channel_policy="sealed_test")
-        ledger.shadow_conversation_row(self.conn, row_id=32, user_id=7, user_name="Crow", guild_id=1, role="user", content="bnlremember 18", channel_policy="sealed_test")
-        ledger.shadow_conversation_row(self.conn, row_id=33, user_id=7, user_name="Crow", guild_id=1, role="user", content="bnlplease remember 19", channel_policy="sealed_test")
+    def test_all_remember_language_stays_conversation_only(self):
+        samples = [
+            "remember 8",
+            "do you remember 9?",
+            "I remember 10 people",
+            "I do not remember 11",
+            "what's up? / remember 12",
+            "remember 13 / what's up?",
+            "hey BNL, please remember the number 14",
+            "remember 15 for me",
+            ", remember 16",
+            "Hey, BNL, remember 17",
+            "bnlremember 18",
+            "bnlplease remember 19",
+        ]
+        for row_id, content in enumerate(samples, start=22):
+            ledger.shadow_conversation_row(
+                self.conn,
+                row_id=row_id,
+                user_id=7,
+                user_name="Crow",
+                guild_id=1,
+                role="user",
+                content=content,
+                channel_policy="sealed_test",
+            )
         rows = self.conn.execute(
             "SELECT predicate_key, normalized_value FROM memory_ledger_entries ORDER BY source_sequence"
         ).fetchall()
-        self.assertEqual(rows[0], ("remembered_number", "8"))
-        self.assertEqual(rows[1], ("conversation", "do you remember 9?"))
-        self.assertEqual(rows[2], ("conversation", "I remember 10 people"))
-        self.assertEqual(rows[3], ("conversation", "I do not remember 11"))
-        self.assertEqual(rows[4], ("remembered_number", "12"))
-        self.assertEqual(rows[5], ("remembered_number", "13"))
-        self.assertEqual(rows[6], ("remembered_number", "14"))
-        self.assertEqual(rows[7], ("remembered_number", "15"))
-        self.assertEqual(rows[8], ("remembered_number", "16"))
-        self.assertEqual(rows[9], ("remembered_number", "17"))
-        self.assertEqual(rows[10], ("conversation", "bnlremember 18"))
-        self.assertEqual(rows[11], ("conversation", "bnlplease remember 19"))
+        self.assertEqual(rows, [("conversation", content) for content in samples])
+        self.assertEqual(
+            self.conn.execute(
+                "SELECT COUNT(*) FROM memory_ledger_entries WHERE predicate_key='remembered_number'"
+            ).fetchone()[0],
+            0,
+        )
 
-    def test_explicit_unique_correction_links_and_ambiguous_does_not(self):
-        ledger.shadow_conversation_row(self.conn, row_id=30, user_id=7, user_name="Crow", guild_id=1, role="user", content="remember this number: 731946", channel_policy="sealed_test")
-        linked = ledger.shadow_conversation_row(self.conn, row_id=31, user_id=7, user_name="Crow", guild_id=1, role="user", content="Correction: the number is 284517, not 731946", channel_policy="sealed_test")
-        self.assertEqual(linked.reason_code, "explicit_correction_linked")
-        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM memory_ledger_lineage WHERE lineage_type='correction_of'").fetchone()[0], 1)
-        ledger.shadow_conversation_row(self.conn, row_id=32, user_id=7, user_name="Crow", guild_id=1, role="user", content="remember this number: 111", channel_policy="sealed_test")
-        ledger.shadow_conversation_row(self.conn, row_id=33, user_id=7, user_name="Crow", guild_id=1, role="user", content="remember this number: 111", channel_policy="sealed_test")
-        unresolved = ledger.shadow_conversation_row(self.conn, row_id=34, user_id=7, user_name="Crow", guild_id=1, role="user", content="replace 111 with 222", channel_policy="sealed_test")
-        self.assertEqual(unresolved.reason_code, "unresolved_correction_target")
+    def test_only_four_approved_source_linked_fields_are_projected(self):
+        expected = {
+            "preferred_name": "Crow",
+            "pronouns": "they/them",
+            "favorite_color": "green",
+            "favorite_movie": "Hackers",
+        }
+        for row_id, (key, value) in enumerate(expected.items(), start=30):
+            result = self.add_approved_fact(row_id, key, value)
+            self.assertEqual(result.outcome, "inserted")
+        rejected = self.add_approved_fact(40, "remembered_number", "8")
+        self.assertEqual(rejected.outcome, "skipped")
+        self.assertEqual(rejected.reason_code, "self_authored_fact_not_allowlisted")
+        rows = self.conn.execute(
+            """
+            SELECT predicate_key, normalized_value, source_role, source_class,
+                   channel_policy, source_message_id, public_usable
+            FROM memory_ledger_entries
+            ORDER BY source_sequence
+            """
+        ).fetchall()
+        self.assertEqual(
+            rows,
+            [
+                (key, value, "member_self_report", "first_party_record", "public_home", 1000 + row_id, 1)
+                for row_id, (key, value) in enumerate(expected.items(), start=30)
+            ],
+        )
 
-
-    def test_explicit_correction_retires_old_value_from_effective_active_count(self):
-        ledger.shadow_conversation_row(self.conn, row_id=40, user_id=7, user_name="Crow", guild_id=1, role="user", content="remember this number: 8", channel_policy="sealed_test")
-        linked = ledger.shadow_conversation_row(self.conn, row_id=41, user_id=7, user_name="Crow", guild_id=1, role="user", content="replace 8 with 9", channel_policy="sealed_test")
-        self.assertEqual(linked.reason_code, "explicit_correction_linked")
-        edges = set(self.conn.execute("SELECT lineage_type FROM memory_ledger_lineage WHERE entry_id=?", (linked.entry_id,)).fetchall())
-        self.assertEqual(edges, {("correction_of",), ("supersedes",)})
+    def test_repetition_adds_no_authority_but_changed_approved_value_supersedes(self):
+        original = self.add_approved_fact(
+            40,
+            "favorite_color",
+            "green",
+            observed_at="2026-01-01T00:00:01+00:00",
+        )
+        repeated = self.add_approved_fact(
+            41,
+            "favorite_color",
+            "green",
+            observed_at="2026-01-01T00:00:02+00:00",
+        )
+        changed = self.add_approved_fact(
+            42,
+            "favorite_color",
+            "violet",
+            observed_at="2026-01-01T00:00:03+00:00",
+        )
+        self.assertEqual(repeated.outcome, "skipped")
+        self.assertEqual(repeated.reason_code, "repeated_self_authored_value")
+        self.assertEqual(changed.outcome, "inserted")
+        rows = self.conn.execute(
+            """
+            SELECT entry_id, normalized_value, lifecycle_status
+            FROM memory_ledger_entries
+            WHERE predicate_key='favorite_color'
+            ORDER BY source_sequence
+            """
+        ).fetchall()
+        self.assertEqual(
+            rows,
+            [
+                (original.entry_id, "green", "superseded"),
+                (changed.entry_id, "violet", "active"),
+            ],
+        )
+        edges = set(self.conn.execute("SELECT lineage_type, target_entry_id FROM memory_ledger_lineage WHERE entry_id=?", (changed.entry_id,)).fetchall())
+        self.assertEqual(
+            edges,
+            {
+                ("correction_of", original.entry_id),
+                ("supersedes", original.entry_id),
+            },
+        )
         report = ledger.build_memory_ledger_evaluation(self.conn, guild_id=1)
         self.assertEqual(report["entriesWithMultipleActiveValues"], 0)
         self.assertEqual(report["explicitCorrectionCounts"], 1)
 
     def test_all_lineage_targets_resolve_to_entries(self):
-        ledger.shadow_conversation_row(self.conn, row_id=50, user_id=7, user_name="Crow", guild_id=1, role="user", content="remember this number: 8", channel_policy="sealed_test")
-        ledger.shadow_conversation_row(self.conn, row_id=51, user_id=7, user_name="Crow", guild_id=1, role="user", content="Correction: the number is 9, not 8", channel_policy="sealed_test")
+        self.add_approved_fact(50, "favorite_movie", "Hackers")
+        self.add_approved_fact(51, "favorite_movie", "The Matrix")
         missing = self.conn.execute("""
             SELECT COUNT(*) FROM memory_ledger_lineage l
             LEFT JOIN memory_ledger_entries e ON e.guild_id=l.guild_id AND e.entry_id=l.target_entry_id

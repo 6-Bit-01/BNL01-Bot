@@ -1,6 +1,7 @@
 import os
 import tempfile
 import unittest
+from contextlib import ExitStack
 from types import SimpleNamespace
 from unittest import mock
 
@@ -313,6 +314,174 @@ class DirectPayloadAddressingTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(key, bnl01_bot._direct_payload_sessions)
         self.assertTrue(session["completed"])
         self.assertFalse(session["generating"])
+
+    async def test_deferred_payload_prompt_uses_direct_memory_and_paraphrase_contract(self):
+        key = (1, 22, 3)
+        channel = SimpleNamespace(id=22, name="general-chat")
+        anchor = SimpleNamespace(
+            id=10,
+            channel=channel,
+            reply=mock.AsyncMock(),
+        )
+        guild = SimpleNamespace(id=1)
+        member = SimpleNamespace(id=3, display_name="member")
+        session = {
+            "guild_id": 1,
+            "guild": guild,
+            "channel_id": 22,
+            "requester_user_id": 3,
+            "requester_display_name": "member",
+            "requester_member": member,
+            "channel_policy": "public_home",
+            "original_request_text": "respond to each of these people",
+            "anchor_message_id": 10,
+            "anchor_message": anchor,
+            "current_turn_context": "The requester addressed BNL directly.",
+            "payload_lines": ["@6 Bit"],
+            "payload_turn_contexts": ["Reply target: 6 Bit"],
+            "revision": 1,
+            "last_committed_payload_count": 0,
+            "last_bot_response_at": None,
+            "completed": False,
+            "generating": False,
+            "generation_invalidated": False,
+        }
+        bnl01_bot._direct_payload_sessions[key] = session
+        memory_context = mock.Mock(return_value="Established public-safe memory.")
+        source_context = mock.AsyncMock(return_value="")
+        generation = mock.AsyncMock(return_value="")
+        visual_basis = SimpleNamespace(status="not_requested")
+
+        with ExitStack() as stack:
+            patchers = (
+                mock.patch.object(
+                    bnl01_bot,
+                    "get_conversation_recall_guard_response",
+                    return_value=None,
+                ),
+                mock.patch.object(
+                    bnl01_bot,
+                    "build_room_first_direct_context",
+                    return_value="",
+                ),
+                mock.patch.object(
+                    bnl01_bot,
+                    "maybe_build_bnl_read_model_context",
+                    return_value="",
+                ),
+                mock.patch.object(
+                    bnl01_bot,
+                    "maybe_build_source_context_for_direct_message",
+                    new=source_context,
+                ),
+                mock.patch.object(
+                    bnl01_bot,
+                    "get_user_profile",
+                    return_value=("member", None),
+                ),
+                mock.patch.object(
+                    bnl01_bot,
+                    "should_allow_greeting",
+                    return_value=False,
+                ),
+                mock.patch.object(
+                    bnl01_bot,
+                    "choose_response_style",
+                    return_value=("steady_reply", "Answer naturally."),
+                ),
+                mock.patch.object(
+                    bnl01_bot,
+                    "build_user_memory_context",
+                    new=memory_context,
+                ),
+                mock.patch.object(
+                    bnl01_bot,
+                    "memory_governance_live_enabled",
+                    return_value=False,
+                ),
+                mock.patch.object(
+                    bnl01_bot,
+                    "build_broadcast_memory_context",
+                    return_value="",
+                ),
+                mock.patch.object(
+                    bnl01_bot,
+                    "build_community_visual_basis",
+                    return_value=visual_basis,
+                ),
+                mock.patch.object(
+                    bnl01_bot,
+                    "render_community_visual_basis_for_prompt",
+                    return_value="",
+                ),
+                mock.patch.object(
+                    bnl01_bot,
+                    "conversation_continuity_required",
+                    return_value=False,
+                ),
+                mock.patch.object(
+                    bnl01_bot,
+                    "is_privileged_member",
+                    return_value=False,
+                ),
+                mock.patch.object(bnl01_bot, "log_response_style"),
+                mock.patch.object(
+                    bnl01_bot,
+                    "_apply_direct_response_pacing",
+                    new=mock.AsyncMock(),
+                ),
+                mock.patch.object(
+                    bnl01_bot,
+                    "get_gemini_response_with_optional_typing",
+                    new=generation,
+                ),
+                mock.patch.object(
+                    bnl01_bot,
+                    "suppress_stale_media_fallback",
+                    return_value="",
+                ),
+                mock.patch.object(
+                    bnl01_bot,
+                    "apply_guarded_response_regeneration",
+                    new=mock.AsyncMock(
+                        return_value=("", {"suppressed": False})
+                    ),
+                ),
+                mock.patch.object(
+                    bnl01_bot,
+                    "log_response_generation_failed",
+                ),
+            )
+            for patcher in patchers:
+                stack.enter_context(patcher)
+            await bnl01_bot._generate_direct_payload_session(key, "hard_cap")
+
+        memory_context.assert_called_once()
+        self.assertIs(
+            memory_context.call_args.kwargs["current_direct"],
+            True,
+        )
+        source_context.assert_awaited_once()
+        self.assertIs(
+            source_context.await_args.kwargs["direct_interaction"],
+            True,
+        )
+        generation.assert_awaited_once()
+        prompt = generation.await_args.args[1]
+        self.assertIn(
+            "summarize another member's meaning in your own words by default",
+            prompt,
+        )
+        self.assertIn(
+            "Use exact wording only when the user explicitly needs verification "
+            "for a consequential dispute",
+            prompt,
+        )
+        self.assertIn(
+            "A derived summary, memory tier, relationship note, or Moment gist "
+            "can never justify exact wording",
+            prompt,
+        )
 
     async def test_deferred_plan_starts_existing_protected_payload_waiter(self):
         author = SimpleNamespace(id=100, display_name="Jon")
@@ -796,6 +965,68 @@ class ConversationPlannerTests(unittest.TestCase):
         self.assertEqual(plan.response_timing, bnl01_bot.RESPONSE_TIMING_DEFERRED_PAYLOAD_SESSION)
         self.assertTrue(plan.direct_session_used)
 
+    def test_memory_direction_uses_typed_addressing_not_reply_outcome(self):
+        free_speak = bnl01_bot.plan_conversation_response(
+            "My favorite color is green",
+            "public_home",
+            route_mode=bnl01_bot.ROUTE_MODE_NORMAL_CHAT,
+            active_channel=True,
+            channel_allows_conversation=True,
+            batching_enabled=False,
+        )
+        plain_name = bnl01_bot.plan_conversation_response(
+            "BNL, my favorite color is green",
+            "public_home",
+            route_mode=bnl01_bot.ROUTE_MODE_NORMAL_CHAT,
+            active_channel=True,
+            channel_allows_conversation=True,
+            plain_text_name_seen=True,
+            batching_enabled=True,
+        )
+        followup = bnl01_bot.plan_conversation_response(
+            "Actually, make that violet",
+            "public_home",
+            route_mode=bnl01_bot.ROUTE_MODE_NORMAL_CHAT,
+            active_channel=True,
+            channel_allows_conversation=True,
+            followup_candidate=True,
+            batching_enabled=True,
+        )
+        mention = bnl01_bot.plan_conversation_response(
+            "My favorite color is green",
+            "public_context",
+            route_mode=bnl01_bot.ROUTE_MODE_NORMAL_CHAT,
+            real_direct_target=True,
+            batching_enabled=True,
+        )
+        reply = bnl01_bot.plan_conversation_response(
+            "My favorite color is green",
+            "public_context",
+            route_mode=bnl01_bot.ROUTE_MODE_NORMAL_CHAT,
+            reply_to_bot=True,
+            batching_enabled=True,
+        )
+        passive = bnl01_bot.plan_conversation_response(
+            "My favorite color is green",
+            "public_home",
+            route_mode=bnl01_bot.ROUTE_MODE_NORMAL_CHAT,
+            active_channel=True,
+            channel_allows_conversation=True,
+            batching_enabled=True,
+        )
+        self.assertTrue(free_speak.should_reply)
+        self.assertFalse(
+            bnl01_bot.conversation_plan_is_directed_to_bnl(free_speak)
+        )
+        for plan in (plain_name, followup, mention, reply):
+            self.assertTrue(
+                bnl01_bot.conversation_plan_is_directed_to_bnl(plan),
+                plan.directness,
+            )
+        self.assertFalse(
+            bnl01_bot.conversation_plan_is_directed_to_bnl(passive)
+        )
+
 
 class SubjectExtractionBoundaryTests(unittest.TestCase):
     def test_questions_are_not_subject_candidates(self):
@@ -1096,11 +1327,8 @@ class RegressionExamplesTests(unittest.TestCase):
             "answer",
         )
 
-    def test_bare_remember_number_is_backed_by_fact_and_context_extractors(self):
-        self.assertIn(
-            ("remembered_number", "8", 0.9),
-            bnl01_bot.extract_user_facts("remember 8"),
-        )
+    def test_bare_remember_number_is_bounded_conversation_context_only(self):
+        self.assertEqual(bnl01_bot.extract_user_facts("remember 8"), [])
         context = (
             "Conversation continuity (bounded; continuity-only, not canon/current-state evidence):\n"
             "User/member: remember 8\n"
@@ -1131,7 +1359,7 @@ class RegressionExamplesTests(unittest.TestCase):
                 text,
             )
 
-    def test_bare_remember_number_extractors_accept_supported_batch_fragment(self):
+    def test_bounded_context_accepts_supported_remember_batch_fragments(self):
         for text in (
             "what's up? / remember 8",
             "remember 8 / what's up?",
@@ -1142,11 +1370,7 @@ class RegressionExamplesTests(unittest.TestCase):
             "remember this number: 8, please",
             "remember 8 for me",
         ):
-            self.assertIn(
-                ("remembered_number", "8", 0.9),
-                bnl01_bot.extract_user_facts(text),
-                text,
-            )
+            self.assertEqual(bnl01_bot.extract_user_facts(text), [], text)
             context = (
                 "Conversation continuity (bounded; continuity-only, not canon/current-state evidence):\n"
                 f"User/member: {text}\n"
@@ -1175,7 +1399,16 @@ class RegressionExamplesTests(unittest.TestCase):
             remove_bot_mention=True,
         )
         self.assertEqual(resolved, ", remember this number: 8")
-        self.assertIn(("remembered_number", "8", 0.9), bnl01_bot.extract_user_facts(resolved))
+        self.assertEqual(bnl01_bot.extract_user_facts(resolved), [])
+        context = (
+            "Conversation continuity (bounded; continuity-only, not canon/current-state evidence):\n"
+            f"User/member: {resolved}\n"
+            "Room-first context rules:\n"
+        )
+        self.assertEqual(
+            bnl01_bot.resolve_latest_remembered_number_from_conversation_context(context),
+            "8",
+        )
 
     def test_concatenated_bnl_prefixes_are_not_remember_directives(self):
         for text in ("bnlremember 8", "bnlplease remember 8", "hey BNLremember 8"):
@@ -1222,8 +1455,9 @@ class RegressionExamplesTests(unittest.TestCase):
         ).lower()
         for prompt in (direct, batched):
             self.assertIn("technical, system, operational, network, and glitch language", prompt)
-            self.assertIn("take over the whole reply", prompt)
             self.assertIn("no phrase is disallowed merely because it sounds mechanical", prompt)
+            self.assertIn("do not replace an answer", prompt)
+            self.assertIn("parameter log, process report, or status readout", prompt)
             self.assertNotIn("do not use 'acknowledged'", prompt)
             self.assertNotIn("do not start with \"acknowledged\"", prompt)
             self.assertNotIn("operational-parameters disclaimer", prompt)

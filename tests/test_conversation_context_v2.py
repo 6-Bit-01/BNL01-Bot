@@ -44,7 +44,12 @@ class ConversationContextV2Tests(unittest.TestCase):
         self.assertLess(res.rendered_context.index("User/member"), res.rendered_context.index("BNL-01"))
 
     def test_current_message_id_dedupe_and_text_fallback_dedupe(self):
-        rows = [row(1,"user","repeat me", mid=555), row(2,"user","Repeat me", mid=None), row(3,"user","older thing"), row(4,"model","older answer")]
+        rows = [
+            row(1,"user","older thing", minutes=3),
+            row(2,"model","older answer", minutes=2.9),
+            row(3,"user","repeat me", mid=555, minutes=1.1),
+            row(4,"user","Repeat me", mid=None, minutes=1),
+        ]
         res = assemble_conversation_context_v2(rows, req(current_message_ids=frozenset({555}), current_texts=("repeat   me",)))
         self.assertEqual(res.current_message_duplicates_removed, 2)
         self.assertNotIn("repeat me", res.rendered_context.lower())
@@ -93,6 +98,42 @@ class ConversationContextV2Tests(unittest.TestCase):
         self.assertEqual(related.cross_channel_paired_turn_count, 1)
         other_user = assemble_conversation_context_v2([row(1,"user","cats", user=2, channel=20), row(2,"model","cat answer", user=2, channel=20)], req(current_texts=("continue cats",)))
         self.assertEqual(other_user.cross_channel_paired_turn_count, 0)
+
+    def test_explicit_cross_channel_continuation_survives_unrelated_same_room_context(self):
+        rows = [
+            row(1, "user", "The weather changed again.", minutes=4),
+            row(2, "model", "Rain is moving through.", minutes=3.9),
+            row(
+                3,
+                "user",
+                "The red synth needs the slower attack we discussed.",
+                channel=20,
+                cname="finished-tracks",
+                minutes=8,
+            ),
+            row(
+                4,
+                "model",
+                "Keep the red synth attack near 180 milliseconds.",
+                channel=20,
+                cname="finished-tracks",
+                minutes=7.9,
+            ),
+        ]
+
+        result = assemble_conversation_context_v2(
+            rows,
+            req(
+                current_texts=(
+                    "Continue from the other channel about the red synth.",
+                )
+            ),
+        )
+
+        self.assertEqual(result.same_room_paired_turn_count, 1)
+        self.assertEqual(result.cross_channel_paired_turn_count, 1)
+        self.assertIn("Rain is moving through.", result.rendered_context)
+        self.assertIn("180 milliseconds", result.rendered_context)
 
     def test_protected_and_sealed_boundaries(self):
         bad = ["sealed_test","internal_controlled","broadcast_memory","protected_system","reference_canon","ai_image_tool","unknown","legacy-unknown"]
@@ -201,11 +242,189 @@ class ConversationContextV2CorrectionTests(unittest.TestCase):
         related = assemble_conversation_context_v2(rows, req(channel_id=10, channel_name="general", current_texts=("continue from before about general other topic",)))
         self.assertEqual(related.cross_channel_paired_turn_count, 1)
 
-    def test_pairing_uses_nearest_unanswered_user_request(self):
-        rows = [row(1,"user","first request"), row(2,"user","second request"), row(3,"model","answer to second")]
-        res = assemble_conversation_context_v2(rows, req(current_texts=("why second?",)))
-        self.assertIn("User/member: second request", res.rendered_context)
-        self.assertNotIn("User/member: first request\nBNL-01: answer to second", res.rendered_context)
+    def test_pairing_preserves_immediate_same_speaker_fragments(self):
+        rows = [
+            row(1,"user","C.L. Kestrel braces one hand on the bar.", minutes=2.1),
+            row(2,"user","Then the lights go out.", minutes=2),
+            row(3,"model","Kestrel waits in the dark before answering.", minutes=1),
+        ]
+        res = assemble_conversation_context_v2(rows, req(current_texts=("Keep going.",)))
+        self.assertIn(
+            "User/member: C.L. Kestrel braces one hand on the bar. Then the lights go out.",
+            res.rendered_context,
+        )
+        self.assertIn(
+            "BNL-01: Kestrel waits in the dark before answering.",
+            res.rendered_context,
+        )
+        self.assertEqual(res.same_room_paired_turn_count, 1)
+        self.assertEqual(res.selected_row_ids, (1, 2, 3))
+
+    def test_older_pending_row_is_not_absorbed_into_fresh_response_cluster(self):
+        rows = [
+            row(1,"user","old unrelated passive remark", minutes=30),
+            row(2,"user","Signal Witch poster direction", minutes=2),
+            row(3,"model","Make Signal Witch the red focal point.", minutes=1),
+        ]
+        res = assemble_conversation_context_v2(
+            rows,
+            req(current_texts=("continue the Signal Witch poster",)),
+        )
+        self.assertNotIn("old unrelated passive remark", res.rendered_context)
+        self.assertIn("Signal Witch poster direction", res.rendered_context)
+        self.assertIn("Make Signal Witch the red focal point.", res.rendered_context)
+        self.assertEqual(res.same_room_paired_turn_count, 1)
+        self.assertEqual(res.selected_row_ids, (2, 3))
+
+    def test_stale_pending_row_does_not_poison_fresh_response_cluster(self):
+        rows = [
+            row(1,"user","stale unrelated request", minutes=50),
+            row(2,"user","fresh cassette layout request", minutes=2),
+            row(3,"model","Keep the cassette layout asymmetric.", minutes=1),
+        ]
+        res = assemble_conversation_context_v2(
+            rows,
+            req(current_texts=("continue the cassette layout",)),
+        )
+        self.assertNotIn("stale unrelated request", res.rendered_context)
+        self.assertIn("fresh cassette layout request", res.rendered_context)
+        self.assertIn("Keep the cassette layout asymmetric.", res.rendered_context)
+        self.assertEqual(res.same_room_paired_turn_count, 1)
+        self.assertEqual(res.selected_row_ids, (2, 3))
+
+    def test_multi_speaker_response_cluster_is_never_personalized(self):
+        rows = [
+            row(1,"user","Signal Witch poster direction", user=1, minutes=2.2),
+            row(2,"user","Cassette teeth border", user=2, minutes=2.1),
+            row(3,"model","Use both ideas in the shared composition.", user=1, minutes=1),
+            row(4,"model","Use both ideas in the shared composition.", user=2, minutes=1),
+        ]
+        res = assemble_conversation_context_v2(
+            rows,
+            req(current_texts=("continue the Signal Witch poster",)),
+        )
+        self.assertEqual(res.same_room_paired_turn_count, 1)
+        self.assertIn("Signal Witch poster direction", res.rendered_context)
+        self.assertIn("Cassette teeth border", res.rendered_context)
+        self.assertIn(
+            "BNL-01 (reply to room/group): Use both ideas in the shared composition.",
+            res.rendered_context,
+        )
+        self.assertNotIn("BNL-01 (reply to member)", res.rendered_context)
+        self.assertEqual(res.selected_row_ids, (1, 2, 3))
+        self.assertNotIn(4, res.selected_row_ids)
+
+    def test_authoritative_group_mapping_excludes_trailing_nonparticipant(self):
+        model_row = dict(
+            row(
+                3,
+                "model",
+                "Use the mapped ideas in the shared composition.",
+                user=0,
+                minutes=1,
+            ),
+            response_participant_ids=(1, 2),
+        )
+        rows = [
+            row(1, "user", "Signal Witch poster direction", user=1, minutes=2.2),
+            row(2, "user", "Unrelated cassette interruption", user=3, minutes=2.1),
+            model_row,
+        ]
+        res = assemble_conversation_context_v2(
+            rows,
+            req(current_texts=("continue the Signal Witch poster",)),
+        )
+        self.assertEqual(res.same_room_paired_turn_count, 1)
+        self.assertIn("Signal Witch poster direction", res.rendered_context)
+        self.assertNotIn("Unrelated cassette interruption", res.rendered_context)
+        self.assertIn(
+            "BNL-01 (reply to room/group): Use the mapped ideas",
+            res.rendered_context,
+        )
+        self.assertEqual(res.selected_row_ids, (1, 3))
+
+    def test_authoritative_group_mapping_keeps_nonparticipant_as_separate_open_loop(self):
+        model_row = dict(
+            row(
+                3,
+                "model",
+                "Use the mapped ideas in the shared composition.",
+                user=0,
+                minutes=1,
+            ),
+            response_participant_ids=(1, 2),
+        )
+        rows = [
+            row(1, "user", "Signal Witch poster direction", user=1, minutes=2.2),
+            row(
+                2,
+                "user",
+                "Should the cassette interruption become its own note?",
+                user=3,
+                name="Interrupter",
+                minutes=2.1,
+            ),
+            model_row,
+        ]
+
+        res = assemble_conversation_context_v2(
+            rows,
+            req(current_texts=("What about the cassette interruption?",)),
+        )
+
+        self.assertEqual(res.same_room_paired_turn_count, 1)
+        self.assertEqual(res.unpaired_row_count, 1)
+        self.assertIn(
+            "User/member (display name “Interrupter”; open loop): "
+            "Should the cassette interruption become its own note?",
+            res.rendered_context,
+        )
+        self.assertIn(
+            "BNL-01 (reply to room/group): Use the mapped ideas",
+            res.rendered_context,
+        )
+        self.assertIn(2, res.selected_row_ids)
+
+    def test_authoritative_group_mapping_stays_group_with_one_source_row_left(self):
+        model_row = dict(
+            row(
+                2,
+                "model",
+                "One answer originally addressed both members.",
+                user=0,
+                minutes=1,
+            ),
+            response_participant_ids=(1, 2),
+        )
+        res = assemble_conversation_context_v2(
+            [
+                row(1, "user", "Only one participant source remains.", user=1, minutes=2),
+                model_row,
+            ],
+            req(current_texts=("continue the participant source",)),
+        )
+        self.assertEqual(res.same_room_paired_turn_count, 1)
+        self.assertIn("Only one participant source remains.", res.rendered_context)
+        self.assertIn(
+            "BNL-01 (reply to room/group): One answer originally addressed both members.",
+            res.rendered_context,
+        )
+        self.assertNotIn("BNL-01 (reply to member)", res.rendered_context)
+        self.assertEqual(res.selected_row_ids, (1, 2))
+
+    def test_multi_speaker_room_reply_never_crosses_channels(self):
+        rows = [
+            row(1,"user","Signal Witch poster direction", user=1, channel=20, cname="other", minutes=2.2),
+            row(2,"user","Cassette teeth border", user=2, channel=20, cname="other", minutes=2.1),
+            row(3,"model","Use both ideas in the shared composition.", user=1, channel=20, cname="other", minutes=1),
+        ]
+        res = assemble_conversation_context_v2(
+            rows,
+            req(current_texts=("continue the Signal Witch poster from before",)),
+        )
+        self.assertEqual(res.rendered_context, "")
+        self.assertEqual(res.same_room_paired_turn_count, 0)
+        self.assertEqual(res.cross_channel_paired_turn_count, 0)
 
     def test_orphan_model_and_arbitrary_unpaired_user_are_not_open_loop(self):
         res = assemble_conversation_context_v2([row(1,"model","orphan answer"), row(2,"user","arbitrary statement")], req(current_texts=("fresh topic",)))
@@ -302,7 +521,7 @@ class ConversationContextV2CorrectionTests(unittest.TestCase):
         self.assertIn("BNL-01: Cloud storage keeps files remotely.", res.rendered_context)
         self.assertNotIn("The queue has three tracks waiting.", res.rendered_context)
 
-    def test_unsafe_pair_removal_does_not_reassign_safe_model_answer(self):
+    def test_safe_single_speaker_cluster_survives_later_unsafe_orphan(self):
         rows = [
             row(1, "user", "first request?"),
             row(2, "user", "second request"),
@@ -310,9 +529,8 @@ class ConversationContextV2CorrectionTests(unittest.TestCase):
             row(4, "model", "The queue has three tracks waiting."),
         ]
         res = assemble_conversation_context_v2(rows, req(current_texts=("second request follow up",)))
-        self.assertIn("User/member: second request", res.rendered_context)
+        self.assertIn("User/member: first request? second request", res.rendered_context)
         self.assertIn("BNL-01: safe answer to second", res.rendered_context)
-        self.assertNotIn("User/member: first request\nBNL-01: safe answer to second", res.rendered_context)
         self.assertNotIn("The queue has three tracks waiting.", res.rendered_context)
 
     def test_pairing_before_filter_rejects_unsafe_user_pair_without_reassignment(self):
@@ -419,6 +637,76 @@ class BotConversationContextV2IntegrationTests(unittest.TestCase):
         self._insert("user","media q", mid=1); self._insert("model","provider=tenor host=cdn preview=yes stored visual description missing", mid=2)
         rendered=self.bot.build_conversation_context_v2_for_prompt(guild_id=99,current_user_id=1,channel_id=10,channel_name="home",channel_policy="public_home",route_mode=self.bot.ROUTE_MODE_NORMAL_CHAT,current_texts=["media q"],current_participants={1})
         self.assertNotIn("provider=tenor", rendered)
+
+    def test_bot_row_fetch_uses_group_mapping_over_trailing_user_cluster(self):
+        self._insert(
+            "user",
+            "Mapped member requested the Signal Witch poster.",
+            uid=1,
+            minutes=2.2,
+        )
+        self._insert(
+            "user",
+            "Unmapped member interrupted with cassette notes.",
+            uid=3,
+            minutes=2.1,
+        )
+        self.bot.save_model_message(
+            1,
+            99,
+            "The shared answer follows only the stored participant mapping.",
+            channel_name="home",
+            channel_policy="public_home",
+            channel_id=10,
+            conversation_target_user_ids=(1, 2),
+        )
+
+        ctx = self.bot.build_conversation_context_v2_for_prompt(
+            guild_id=99,
+            current_user_id=1,
+            channel_id=10,
+            channel_name="home",
+            channel_policy="public_home",
+            route_mode=self.bot.ROUTE_MODE_NORMAL_CHAT,
+            current_texts=["continue the Signal Witch poster"],
+            current_participants={1},
+        )
+
+        self.assertIn("Mapped member requested the Signal Witch poster.", ctx)
+        self.assertNotIn("Unmapped member interrupted with cassette notes.", ctx)
+        self.assertIn("BNL-01 (reply to room/group)", ctx)
+
+    def test_bot_row_fetch_keeps_mapped_reply_group_scoped_after_one_user_row(self):
+        self._insert(
+            "user",
+            "Only one mapped participant row remains.",
+            uid=1,
+            minutes=2,
+        )
+        self.bot.save_model_message(
+            1,
+            99,
+            "The response was addressed to two mapped participants.",
+            channel_name="home",
+            channel_policy="public_home",
+            channel_id=10,
+            conversation_target_user_ids=(1, 2),
+        )
+
+        ctx = self.bot.build_conversation_context_v2_for_prompt(
+            guild_id=99,
+            current_user_id=1,
+            channel_id=10,
+            channel_name="home",
+            channel_policy="public_home",
+            route_mode=self.bot.ROUTE_MODE_NORMAL_CHAT,
+            current_texts=["continue the mapped participant row"],
+            current_participants={1},
+        )
+
+        self.assertIn("Only one mapped participant row remains.", ctx)
+        self.assertIn("BNL-01 (reply to room/group)", ctx)
+        self.assertNotIn("BNL-01 (reply to member)", ctx)
 
     def test_db_retrieval_cutoff_does_not_split_and_reassign_pair(self):
         b=self.bot

@@ -14,6 +14,7 @@ MAX_SAME_ROOM_PAIRS = 4
 MAX_CROSS_CHANNEL_PAIRS = 1
 MAX_UNPAIRED_ROWS = 2
 IMMEDIATE_REFERENT_RECENCY_MINUTES = 10
+RESPONSE_CLUSTER_MAX_USER_SPAN_SECONDS = 30
 MAX_RENDERED_CHARS = 2600
 MAX_RENDERED_LINE_CHARS = 360
 FUTURE_SKEW_SECONDS = 0
@@ -205,26 +206,138 @@ def _can_pair(user_row: dict, model_row: dict) -> bool:
     )
 
 def _pair_rows(rows: list[dict]) -> tuple[list[dict], list[dict], list[dict]]:
+    """Pair response clusters without inventing a private addressee.
+
+    Legacy batched responses may have been persisted once under each
+    participant; current group responses use one room-scoped model row plus an
+    authoritative participant mapping. A backward nearest-user search can
+    otherwise relabel one group answer as a private reply to each person. Keep
+    the timestamp-contiguous trailing user cluster at each model row. When a
+    participant mapping exists, only mapped users may ground the group reply;
+    the row stays room-scoped even if pruning left only one mapped user row. A
+    legacy one-participant cluster may form a personal pair, while a legacy
+    multi-participant cluster may form one explicitly room-scoped group reply.
+    Older pending rows remain unpaired.
+    """
     pairs, unpaired_users, orphan_models = [], [], []
-    pending: list[dict] = []
+    pending_by_room: dict[tuple[str, str], list[dict]] = {}
+
+    def room_key(row: dict) -> tuple[str, str]:
+        channel_id = int(row.get("channel_id") or 0)
+        channel_name = str(row.get("channel_name") or "").strip().lower()
+        identity = f"id:{channel_id}" if channel_id else f"name:{channel_name}"
+        return (_policy(row), identity)
+
+    def split_trailing_cluster(segment: list[dict]) -> tuple[list[dict], list[dict]]:
+        if not segment:
+            return [], []
+        newest = _parse_time(segment[-1].get("timestamp"))
+        if not newest.valid or not newest.value:
+            return segment[:-1], segment[-1:]
+        cluster_start = len(segment) - 1
+        for index in range(len(segment) - 2, -1, -1):
+            parsed = _parse_time(segment[index].get("timestamp"))
+            if not parsed.valid or not parsed.value:
+                break
+            trailing_span = (newest.value - parsed.value).total_seconds()
+            if trailing_span < 0 or trailing_span > RESPONSE_CLUSTER_MAX_USER_SPAN_SECONDS:
+                break
+            cluster_start = index
+        return segment[:cluster_start], segment[cluster_start:]
+
     for row in sorted(rows, key=lambda r: int(r.get("id") or 0)):
         role = str(row.get("role") or "").lower()
+        key = room_key(row)
         if role == "user":
-            pending.append(row)
+            pending_by_room.setdefault(key, []).append(row)
             continue
         if role not in {"model", "assistant", "bnl"}:
             continue
-        match_idx = None
-        for idx in range(len(pending) - 1, -1, -1):
-            if _can_pair(pending[idx], row):
-                match_idx = idx
-                break
-        if match_idx is None:
+        segment = pending_by_room.pop(key, [])
+        older_pending, response_cluster = split_trailing_cluster(segment)
+        unpaired_users.extend(older_pending)
+        participant_ids = {
+            int(item.get("user_id") or 0)
+            for item in response_cluster
+            if int(item.get("user_id") or 0)
+        }
+        model_user_id = int(row.get("user_id") or 0)
+        if "response_participant_ids" in row:
+            mapped_participant_ids = {
+                int(participant_id or 0)
+                for participant_id in (
+                    row.get("response_participant_ids") or ()
+                )
+                if int(participant_id or 0) > 0
+            }
+            mapped_cluster = tuple(
+                item
+                for item in response_cluster
+                if int(item.get("user_id") or 0) in mapped_participant_ids
+            )
+            mapping_excluded = tuple(
+                item
+                for item in response_cluster
+                if int(item.get("user_id") or 0) not in mapped_participant_ids
+            )
+            unpaired_users.extend(mapping_excluded)
+            if (
+                not mapped_participant_ids
+                or not mapped_cluster
+                or (
+                    model_user_id
+                    and model_user_id not in mapped_participant_ids
+                )
+            ):
+                unpaired_users.extend(mapped_cluster)
+                orphan_models.append(row)
+                continue
+            pairs.append(
+                {
+                    "users": mapped_cluster,
+                    "model": row,
+                    "_room_group": True,
+                    "_response_participant_ids": tuple(
+                        sorted(mapped_participant_ids)
+                    ),
+                }
+            )
+            continue
+        if len(participant_ids) >= 2:
+            if model_user_id and model_user_id not in participant_ids:
+                unpaired_users.extend(response_cluster)
+                orphan_models.append(row)
+                continue
+            pairs.append(
+                {
+                    "users": tuple(response_cluster),
+                    "model": row,
+                    "_room_group": True,
+                }
+            )
+            continue
+        if (
+            len(participant_ids) != 1
+            or (model_user_id and model_user_id not in participant_ids)
+        ):
+            unpaired_users.extend(response_cluster)
             orphan_models.append(row)
             continue
-        user_row = pending.pop(match_idx)
+        user_row = dict(response_cluster[-1])
+        user_row["content"] = "\n".join(
+            str(item.get("content") or "").strip()
+            for item in response_cluster
+            if str(item.get("content") or "").strip()
+        )
+        user_row["_cluster_rows"] = tuple(response_cluster)
+        user_row["_cluster_row_ids"] = tuple(
+            int(item.get("id") or 0)
+            for item in response_cluster
+            if int(item.get("id") or 0)
+        )
         pairs.append({"user": user_row, "model": row})
-    unpaired_users.extend(pending)
+    for segment in pending_by_room.values():
+        unpaired_users.extend(segment)
     return pairs, unpaired_users, orphan_models
 
 def _score_pair(pair: dict, req: ConversationContextRequest, current_text: str, same_room: bool, now: datetime) -> tuple[int, tuple[str, ...]]:
@@ -243,6 +356,48 @@ def _score_pair(pair: dict, req: ConversationContextRequest, current_text: str, 
     if CORRECTION_RE.search(u.get("content") or ""): score += 70; reasons.append("correction")
     if BOUNDARY_RE.search(u.get("content") or ""): score += 65; reasons.append("boundary")
     if OPEN_LOOP_RE.search(text): score += 40; reasons.append("open_loop")
+    return score, tuple(reasons)
+
+def _score_room_group(pair: dict, req: ConversationContextRequest, current_text: str, now: datetime) -> tuple[int, tuple[str, ...]]:
+    users = tuple(pair.get("users") or ())
+    text = " ".join(
+        [str(user.get("content") or "") for user in users]
+        + [str(pair["model"].get("content") or "")]
+    )
+    newest_user = users[-1] if users else {}
+    parsed = _parse_time(newest_user.get("timestamp"))
+    age_min = max(0, (now - parsed.value).total_seconds() / 60) if parsed.valid and parsed.value else 9999
+    participant_ids = set(pair.get("_response_participant_ids") or ())
+    if not participant_ids:
+        participant_ids = {
+            int(user.get("user_id") or 0)
+            for user in users
+            if int(user.get("user_id") or 0)
+        }
+    reasons = ["complete_room_group"]
+    score = 1000 + max(0, int(120 - age_min)) + 120
+    if int(req.current_user_id or 0) in participant_ids:
+        score += 90
+        reasons.append("current_user")
+    if participant_ids & set(req.current_participants or frozenset()):
+        score += 35
+        reasons.append("participant")
+    if req.is_reply_to_bnl or req.is_direct_target:
+        score += 20
+        reasons.append("direct_continuity")
+    overlap = _overlap(text, current_text)
+    if overlap:
+        score += min(80, overlap * 16)
+        reasons.append("topic_overlap")
+    if any(CORRECTION_RE.search(str(user.get("content") or "")) for user in users):
+        score += 70
+        reasons.append("correction")
+    if any(BOUNDARY_RE.search(str(user.get("content") or "")) for user in users):
+        score += 65
+        reasons.append("boundary")
+    if OPEN_LOOP_RE.search(text):
+        score += 40
+        reasons.append("open_loop")
     return score, tuple(reasons)
 
 def _row_age_ok(row: dict, now: datetime, minutes: int) -> bool:
@@ -330,18 +485,52 @@ def assemble_conversation_context_v2(rows: Iterable[dict], req: ConversationCont
 
     pairs = []
     for pair in paired_all:
-        user_dup = _is_current_duplicate(pair["user"], req, current_norms)
+        room_group = bool(pair.get("_room_group"))
+        cluster_rows = (
+            tuple(pair.get("users") or ())
+            if room_group
+            else tuple(pair["user"].get("_cluster_rows") or (pair["user"],))
+        )
+        user_dup = any(
+            _is_current_duplicate(cluster_row, req, current_norms)
+            for cluster_row in cluster_rows
+        )
         model_dup = _is_current_duplicate(pair["model"], req, current_norms)
         if user_dup or model_dup:
             dupes += int(user_dup) + int(model_dup)
             excluded += 2
             continue
-        user_ok, user_same = _eligible_row(pair["user"])
+        cluster_eligibility = [
+            _eligible_row(cluster_row)
+            for cluster_row in cluster_rows
+        ]
+        user_ok = bool(cluster_eligibility) and all(
+            item[0] for item in cluster_eligibility
+        )
+        user_same = bool(cluster_eligibility) and all(
+            item[1] for item in cluster_eligibility
+        )
         model_ok, model_same = _eligible_row(pair["model"])
-        if not (user_ok and model_ok):
-            excluded += 2
+        if not (
+            user_ok
+            and model_ok
+            and (not room_group or (user_same and model_same))
+        ):
+            excluded += len(cluster_rows) + 1
             continue
-        pairs.append({"user": dict(pair["user"], _same_room=user_same), "model": dict(pair["model"], _same_room=model_same)})
+        if room_group:
+            pairs.append(
+                {
+                    "users": tuple(dict(user, _same_room=True) for user in cluster_rows),
+                    "model": dict(pair["model"], _same_room=True),
+                    "_room_group": True,
+                    "_response_participant_ids": tuple(
+                        pair.get("_response_participant_ids") or ()
+                    ),
+                }
+            )
+        else:
+            pairs.append({"user": dict(pair["user"], _same_room=user_same), "model": dict(pair["model"], _same_room=model_same)})
     unpaired_users = []
     for row in unpaired_all:
         if _is_current_duplicate(row, req, current_norms):
@@ -355,15 +544,37 @@ def assemble_conversation_context_v2(rows: Iterable[dict], req: ConversationCont
     excluded += len(orphan_models)
     scored_same, scored_cross = [], []
     for pair in pairs:
+        if pair.get("_room_group"):
+            score, reasons = _score_room_group(pair, req, current_text, now)
+            scored_same.append((score, pair, reasons))
+            continue
         same = bool(pair["user"].get("_same_room"))
         if not same and not _cross_channel_allowed(pair, req, current_text):
             excluded += 1; continue
         score, reasons = _score_pair(pair, req, current_text, same, now)
         (scored_same if same else scored_cross).append((score, pair, reasons))
-    scored_same.sort(key=lambda x: (-x[0], int(x[1]["user"].get("id") or 0)))
+    def _pair_first_row_id(pair: dict) -> int:
+        if pair.get("_room_group"):
+            return min(
+                (
+                    int(user.get("id") or 0)
+                    for user in tuple(pair.get("users") or ())
+                ),
+                default=0,
+            )
+        return int(pair["user"].get("id") or 0)
+
+    scored_same.sort(key=lambda x: (-x[0], _pair_first_row_id(x[1])))
     scored_cross.sort(key=lambda x: (-x[0], int(x[1]["user"].get("id") or 0)))
     selected_pairs = scored_same[:MAX_SAME_ROOM_PAIRS]
-    selected_cross = [] if selected_pairs else scored_cross[:MAX_CROSS_CHANNEL_PAIRS]
+    explicit_cross_channel_continuation = bool(
+        STRONG_CONTINUATION_RE.search(current_text or "")
+    )
+    selected_cross = (
+        scored_cross[:MAX_CROSS_CHANNEL_PAIRS]
+        if (not selected_pairs or explicit_cross_channel_continuation)
+        else []
+    )
     open_unpaired = []
     immediate_referent_followup = bool(IMMEDIATE_REFERENT_RE.search(current_text or ""))
     for r in sorted([r for r in unpaired_users if r.get("_same_room")], key=lambda r: int(r.get("id") or 0), reverse=True):
@@ -383,7 +594,18 @@ def assemble_conversation_context_v2(rows: Iterable[dict], req: ConversationCont
             break
     candidates = []
     for _score, pair, why in selected_pairs:
-        candidates.append((int(pair["user"].get("id") or 0), "same_pair", pair, why))
+        if pair.get("_room_group"):
+            users = tuple(pair.get("users") or ())
+            candidates.append(
+                (
+                    min((int(user.get("id") or 0) for user in users), default=0),
+                    "room_group",
+                    pair,
+                    why,
+                )
+            )
+        else:
+            candidates.append((int(pair["user"].get("id") or 0), "same_pair", pair, why))
     for _score, pair, why in selected_cross:
         candidates.append((int(pair["user"].get("id") or 0), "cross_pair", pair, why))
     for row in open_unpaired:
@@ -410,9 +632,38 @@ def assemble_conversation_context_v2(rows: Iterable[dict], req: ConversationCont
                 ]
                 if not _append_block(lines, block, MAX_RENDERED_CHARS):
                     continue
-                row_ids.extend([int(item["user"].get("id") or 0), int(item["model"].get("id") or 0)])
+                cluster_ids = tuple(item["user"].get("_cluster_row_ids") or ())
+                row_ids.extend(
+                    [
+                        *(cluster_ids or (int(item["user"].get("id") or 0),)),
+                        int(item["model"].get("id") or 0),
+                    ]
+                )
                 if kind == "same_pair": rendered_same += 1
                 else: rendered_cross += 1
+                reasons.extend(why)
+            elif kind == "room_group":
+                users = tuple(item.get("users") or ())
+                block = [
+                    *[
+                        f"{_user_role_label(user)}: {sanitize_history_text(user.get('content') or '')}"
+                        for user in users
+                    ],
+                    f"BNL-01 (reply to room/group): {sanitize_history_text(item['model'].get('content') or '')}",
+                ]
+                if not _append_block(lines, block, MAX_RENDERED_CHARS):
+                    continue
+                row_ids.extend(
+                    [
+                        *[
+                            int(user.get("id") or 0)
+                            for user in users
+                            if int(user.get("id") or 0)
+                        ],
+                        int(item["model"].get("id") or 0),
+                    ]
+                )
+                rendered_same += 1
                 reasons.extend(why)
             elif kind == "unpaired_user":
                 qualifier = "immediate room event" if item.get("_unpaired_reason") == "immediate_referent_unpaired" else "open loop"

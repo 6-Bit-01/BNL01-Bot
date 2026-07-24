@@ -343,6 +343,294 @@ class ConversationBatchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
             stack.enter_context(patcher)
         return stack
 
+    async def _capture_prompt_memory_direction(
+        self,
+        *,
+        channel_id,
+        active_channel_id,
+        channel_policy,
+        content,
+        direct_target=False,
+        reply_to_bot=False,
+        followup_candidate=False,
+    ):
+        channel = self._channel(channel_id)
+        message = FakeMessage(channel, content)
+        fake_bot = SimpleNamespace(id=999, display_name="BNL-01")
+        if reply_to_bot:
+            message.reference = SimpleNamespace(
+                resolved=SimpleNamespace(author=fake_bot)
+            )
+
+        memory_context = mock.Mock(return_value="Established public-safe memory.")
+        source_context = mock.AsyncMock(return_value="")
+        generation = mock.AsyncMock(return_value="Grounded response.")
+        send_planned = mock.AsyncMock()
+        visual_basis = SimpleNamespace(status="not_requested")
+
+        with self._on_message_runtime(
+            channel.id,
+            followup_candidate=followup_candidate,
+        ):
+            with ExitStack() as stack:
+                patchers = (
+                    mock.patch.object(
+                        type(bnl01_bot.client),
+                        "user",
+                        new_callable=mock.PropertyMock,
+                        return_value=fake_bot,
+                    ),
+                    mock.patch.object(
+                        bnl01_bot,
+                        "BNL_ACTIVE_BATCHING_ENABLED",
+                        False,
+                    ),
+                    mock.patch.object(
+                        bnl01_bot,
+                        "get_guild_config",
+                        return_value=active_channel_id,
+                    ),
+                    mock.patch.object(
+                        bnl01_bot,
+                        "resolve_channel_policy",
+                        return_value=channel_policy,
+                    ),
+                    mock.patch.object(
+                        bnl01_bot,
+                        "is_direct_bnl_target",
+                        return_value=direct_target,
+                    ),
+                    mock.patch.object(
+                        bnl01_bot,
+                        "get_sealed_test_recall_guard_response",
+                        return_value=None,
+                    ),
+                    mock.patch.object(
+                        bnl01_bot,
+                        "get_restricted_channel_recall_guard_response",
+                        return_value=None,
+                    ),
+                    mock.patch.object(
+                        bnl01_bot,
+                        "try_self_reflection_response",
+                        return_value=None,
+                    ),
+                    mock.patch.object(
+                        bnl01_bot,
+                        "resolve_recent_media_followup",
+                        return_value=None,
+                    ),
+                    mock.patch.object(
+                        bnl01_bot,
+                        "try_memory_recall_response",
+                        return_value=None,
+                    ),
+                    mock.patch.object(
+                        bnl01_bot,
+                        "build_show_state_override_context",
+                        return_value={},
+                    ),
+                    mock.patch.object(
+                        bnl01_bot,
+                        "_get_recent_show_state_topic_context",
+                        return_value={},
+                    ),
+                    mock.patch.object(
+                        bnl01_bot,
+                        "build_room_first_direct_context",
+                        return_value="",
+                    ),
+                    mock.patch.object(
+                        bnl01_bot,
+                        "maybe_build_bnl_read_model_context",
+                        return_value="",
+                    ),
+                    mock.patch.object(
+                        bnl01_bot,
+                        "maybe_build_source_context_for_direct_message",
+                        new=source_context,
+                    ),
+                    mock.patch.object(
+                        bnl01_bot,
+                        "get_user_profile",
+                        return_value=("Jon", None),
+                    ),
+                    mock.patch.object(
+                        bnl01_bot,
+                        "should_allow_greeting",
+                        return_value=False,
+                    ),
+                    mock.patch.object(
+                        bnl01_bot,
+                        "choose_response_style",
+                        return_value=("steady_reply", "Answer naturally."),
+                    ),
+                    mock.patch.object(
+                        bnl01_bot,
+                        "build_user_memory_context",
+                        new=memory_context,
+                    ),
+                    mock.patch.object(
+                        bnl01_bot,
+                        "memory_governance_live_enabled",
+                        return_value=False,
+                    ),
+                    mock.patch.object(
+                        bnl01_bot,
+                        "build_broadcast_memory_context",
+                        return_value="",
+                    ),
+                    mock.patch.object(
+                        bnl01_bot,
+                        "build_community_visual_basis",
+                        return_value=visual_basis,
+                    ),
+                    mock.patch.object(
+                        bnl01_bot,
+                        "render_community_visual_basis_for_prompt",
+                        return_value="",
+                    ),
+                    mock.patch.object(
+                        bnl01_bot,
+                        "conversation_continuity_required",
+                        return_value=False,
+                    ),
+                    mock.patch.object(
+                        bnl01_bot,
+                        "is_privileged_member",
+                        return_value=False,
+                    ),
+                    mock.patch.object(
+                        bnl01_bot,
+                        "maybe_update_broadcast_status_from_text",
+                    ),
+                    mock.patch.object(
+                        bnl01_bot,
+                        "maybe_update_restricted_status_from_text",
+                    ),
+                    mock.patch.object(bnl01_bot, "log_response_style"),
+                    mock.patch.object(
+                        bnl01_bot,
+                        "get_gemini_response_with_optional_typing",
+                        new=generation,
+                    ),
+                    mock.patch.object(
+                        bnl01_bot,
+                        "suppress_stale_media_fallback",
+                        side_effect=lambda response, **_kwargs: response,
+                    ),
+                    mock.patch.object(
+                        bnl01_bot,
+                        "send_planned_conversation_response",
+                        new=send_planned,
+                    ),
+                )
+                for patcher in patchers:
+                    stack.enter_context(patcher)
+                await bnl01_bot.on_message(message)
+
+        memory_context.assert_called_once()
+        source_context.assert_awaited_once()
+        generation.assert_awaited_once()
+        send_planned.assert_awaited_once()
+        return {
+            "current_direct": memory_context.call_args.kwargs["current_direct"],
+            "source_direct": source_context.await_args.kwargs[
+                "direct_interaction"
+            ],
+            "prompt": generation.await_args.args[1],
+        }
+
+    def _assert_people_memory_contract(self, prompt):
+        self.assertIn(
+            "summarize another member's meaning in your own words by default",
+            prompt,
+        )
+        self.assertIn(
+            "Use exact wording only when the user explicitly needs verification "
+            "for a consequential dispute",
+            prompt,
+        )
+        self.assertIn(
+            "A derived summary, memory tier, relationship note, or Moment gist "
+            "can never justify exact wording",
+            prompt,
+        )
+
+    async def test_typed_directness_reaches_memory_and_source_prompt_boundaries(self):
+        cases = (
+            {
+                "label": "configured_active_free_speak",
+                "channel_id": 8140,
+                "active_channel_id": 8140,
+                "channel_policy": "public_home",
+                "content": "What makes Friday's opener work?",
+                "expected_direct": False,
+            },
+            {
+                "label": "non_active_public_free_speak",
+                "channel_id": 8141,
+                "active_channel_id": 999_141,
+                "channel_policy": "public_home",
+                "content": "What makes Friday's opener work?",
+                "expected_direct": False,
+            },
+            {
+                "label": "mention_in_other_public_channel",
+                "channel_id": 8142,
+                "active_channel_id": 999_142,
+                "channel_policy": "public_context",
+                "content": "<@999> what makes Friday's opener work?",
+                "direct_target": True,
+                "expected_direct": True,
+            },
+            {
+                "label": "reply_with_no_active_channel",
+                "channel_id": 8143,
+                "active_channel_id": None,
+                "channel_policy": "public_context",
+                "content": "What makes Friday's opener work?",
+                "direct_target": True,
+                "reply_to_bot": True,
+                "expected_direct": True,
+            },
+            {
+                "label": "plain_name_call",
+                "channel_id": 8144,
+                "active_channel_id": 8144,
+                "channel_policy": "public_home",
+                "content": "BNL, what makes Friday's opener work?",
+                "expected_direct": True,
+            },
+            {
+                "label": "recent_followup",
+                "channel_id": 8145,
+                "active_channel_id": 8145,
+                "channel_policy": "public_home",
+                "content": "Actually, make the opener stranger.",
+                "followup_candidate": True,
+                "expected_direct": True,
+            },
+        )
+
+        for case in cases:
+            with self.subTest(case=case["label"]):
+                result = await self._capture_prompt_memory_direction(
+                    **{key: value for key, value in case.items() if key not in {
+                        "label",
+                        "expected_direct",
+                    }}
+                )
+                self.assertIs(
+                    result["current_direct"],
+                    case["expected_direct"],
+                )
+                self.assertIs(
+                    result["source_direct"],
+                    case["expected_direct"],
+                )
+                self._assert_people_memory_contract(result["prompt"])
+
     async def test_quiet_timer_restarts_when_a_second_fragment_arrives(self):
         channel = self._channel(8101)
         flushed = asyncio.Event()
@@ -457,6 +745,81 @@ class ConversationBatchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("BNL, why are routers weird?", prompts[0])
         self.assertIn("and why do they blink?", prompts[0])
         self.assertEqual(channel.sent, ["One combined response."])
+
+    async def test_active_batch_guard_receives_typed_gist_attribution_contract(self):
+        channel = self._channel(8136)
+        prompts = []
+        guard_kwargs = []
+        addressing = bnl01_bot.DiscordTurnAddressing(
+            speaker="Jon",
+            explicit_tag_recipients=("BNL-01", "@Crow"),
+            reply_target="none",
+            explicitly_mentions_bnl=True,
+            reply_targets_bnl=False,
+            directly_targets_bnl=True,
+            targets_other_human=True,
+            plain_text_names_bnl=False,
+        )
+        turn = bnl01_bot.BatchConversationTurn(
+            "Jon",
+            "what did @Crow mean about the poster layout?",
+            100,
+            addressing,
+            (202,),
+        )
+        now = bnl01_bot.datetime.now(bnl01_bot.PACIFIC_TZ)
+        bnl01_bot._channel_buffers[channel.id].append(turn)
+        bnl01_bot._channel_first_seen[channel.id] = now
+        bnl01_bot._channel_last_message_at[channel.id] = now
+        bnl01_bot._channel_last_reply_at[channel.id] = (
+            now - bnl01_bot.timedelta(hours=2)
+        )
+
+        async def generate(prompt, **_kwargs):
+            prompts.append(prompt)
+            return "Crow preferred the stronger cobalt framing."
+
+        async def guarded(response, **kwargs):
+            guard_kwargs.append(kwargs)
+            return response, {
+                "suppressed": False,
+                "scripted_mode_leak_guard_triggered": False,
+                "source_grounding_guard_triggered": False,
+                "regenerated_for_mode_leak": False,
+            }
+
+        with (
+            self._flush_runtime(channel.id, generate),
+            mock.patch.object(
+                bnl01_bot,
+                "resolve_channel_policy",
+                return_value="public_home",
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "build_user_memory_context",
+                return_value="",
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "apply_guarded_response_regeneration",
+                new=mock.AsyncMock(side_effect=guarded),
+            ),
+        ):
+            await bnl01_bot._flush_channel_buffer(channel)
+
+        self.assertEqual(len(prompts), 1)
+        self.assertIn("Third-party attribution mode", prompts[0])
+        self.assertEqual(len(guard_kwargs), 1)
+        self.assertTrue(
+            guard_kwargs[0]["third_party_attribution_requested"]
+        )
+        self.assertFalse(guard_kwargs[0]["exact_quote_requested"])
+        self.assertIsNone(guard_kwargs[0]["exact_quote_authority"])
+        self.assertEqual(
+            channel.sent,
+            ["Crow preferred the stronger cobalt framing."],
+        )
 
     async def test_batched_repair_turn_uses_visible_context_generation_not_canned_reply(self):
         channel = self._channel(8116)
@@ -1542,6 +1905,65 @@ class ConversationBatchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(scheduled.cancelled())
         flush.assert_awaited_once_with(channel)
         self.assertTrue(bnl01_bot._channel_tasks[channel.id].done())
+
+    async def test_batch_presend_uses_basis_refreshed_by_guard(self):
+        channel = self._channel(8131)
+        old_basis = object()
+        refreshed_basis = object()
+        checked_bases = []
+
+        async def generate(_prompt, **_kwargs):
+            return "Current grounded batch answer."
+
+        async def guarded(response, **_kwargs):
+            return response, {
+                "suppressed": False,
+                "scripted_mode_leak_guard_triggered": False,
+                "source_grounding_guard_triggered": False,
+                "regenerated_for_mode_leak": False,
+                "_revalidated_prompt_source_bases": (refreshed_basis,),
+            }
+
+        def source_check(bases):
+            checked_bases.append(tuple(bases))
+            return "" if tuple(bases) == (refreshed_basis,) else (
+                "memory_source_changed"
+            )
+
+        self._prime_flush(channel, "How does that earlier detail connect?")
+        with (
+            self._flush_runtime(channel.id, generate),
+            mock.patch.object(
+                bnl01_bot,
+                "build_user_memory_context",
+                return_value=(
+                    "Approved direct self-reports:\n"
+                    "- Favorite color: amber"
+                ),
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "build_memory_prompt_source_basis",
+                return_value=old_basis,
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "apply_guarded_response_regeneration",
+                new=mock.AsyncMock(side_effect=guarded),
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "prompt_source_basis_failure",
+                side_effect=source_check,
+            ),
+        ):
+            await bnl01_bot._flush_channel_buffer(channel)
+
+        self.assertEqual(
+            channel.sent,
+            ["Current grounded batch answer."],
+        )
+        self.assertEqual(checked_bases, [(refreshed_basis,)])
 
 
 if __name__ == "__main__":
