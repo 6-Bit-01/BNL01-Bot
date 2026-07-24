@@ -30,6 +30,7 @@ from bnl_shadow_acceptance import (
     render_v2_shadow_acceptance_lines,
 )
 from bnl_unified_response_assessment import (
+    build_conversation_evidence_item,
     build_unified_response_assessment,
     persist_shadow_run as persist_unified_assessment_shadow_run,
 )
@@ -244,6 +245,92 @@ class V2ShadowAcceptanceTests(unittest.TestCase):
             render_v2_shadow_acceptance_lines(snapshot)
         )
         self.assertIn("grounding_failures=`1`", rendered)
+
+    def test_conclusion_reason_contradiction_is_a_hard_blocker(self):
+        request = (
+            "Between Chrome Prophet and Null Basilica, which fits that "
+            "requirement better?"
+        )
+        assessment = build_unified_response_assessment(
+            guild_id=1,
+            route_mode="normal_chat",
+            channel_policy="sealed_test",
+            conversation_surface="test",
+            current_speaker_user_ids=(99,),
+            participant_user_ids=(99, 100),
+            speaker_labels=("Jon", "Miss Bit"),
+            prompt_lanes=("current_exchange", "conversation_context"),
+            current_exchange_source_ids=(1, 2, 3),
+            current_payload_anchors=(
+                "chrome prophet",
+                "null basilica",
+            ),
+            current_text=request,
+            conversation_evidence_items=(
+                build_conversation_evidence_item(
+                    text="Chrome Prophet sounds like a person.",
+                    source_id=1,
+                    speaker_user_id=99,
+                    speaker_label="Jon",
+                ),
+                build_conversation_evidence_item(
+                    text=(
+                        "The hidden room should sound like a place, "
+                        "not a character."
+                    ),
+                    source_id=2,
+                    speaker_user_id=100,
+                    speaker_label="Miss Bit",
+                ),
+                build_conversation_evidence_item(
+                    text="Null Basilica sounds like a place.",
+                    source_id=3,
+                    speaker_user_id=99,
+                    speaker_label="Jon",
+                ),
+                build_conversation_evidence_item(
+                    text=request,
+                    speaker_user_id=99,
+                    speaker_label="Jon",
+                    current_turn=True,
+                ),
+            ),
+        )
+        persist_unified_assessment_shadow_run(
+            self.conn,
+            assessment,
+            response=(
+                "Chrome Prophet sounds like a person. "
+                "Null Basilica sounds like a place. "
+                "I choose Chrome Prophet."
+            ),
+        )
+        self.conn.commit()
+
+        snapshot = self.snapshot(
+            {
+                "BNL_MEMORY_LEDGER_SHADOW_ENABLED": "true",
+                "BNL_MOMENT_ENGINE_SHADOW_ENABLED": "true",
+                "BNL_MEMORY_GOVERNANCE_SHADOW_ENABLED": "true",
+                "BNL_RELATIONSHIP_V2_SHADOW_ENABLED": "true",
+            }
+        )
+        report = snapshot["reports"]["unifiedResponseAssessment"]
+        self.assertEqual(report["response_coherence_failure_runs"], 1)
+        self.assertEqual(report["conclusion_contradiction_runs"], 1)
+        self.assertEqual(
+            report["coherence_reason_code_counts"],
+            {"conclusion_reason_contradiction": 1},
+        )
+        self.assertIn(
+            "unified_response_assessment:"
+            "response_coherence_failure_runs",
+            snapshot["blockers"],
+        )
+        rendered = "\n".join(
+            render_v2_shadow_acceptance_lines(snapshot)
+        )
+        self.assertIn("contradictions=`1`", rendered)
 
     def test_missing_schemas_are_reported_without_creating_tables(self):
         empty = sqlite3.connect(":memory:")

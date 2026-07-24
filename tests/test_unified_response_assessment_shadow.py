@@ -4,6 +4,8 @@ import unittest
 
 from bnl_unified_response_assessment import (
     ASSESSMENT_VERSION,
+    assess_response_coherence,
+    build_conversation_evidence_item,
     build_evaluation_report,
     build_unified_response_assessment,
     ensure_schema,
@@ -24,6 +26,59 @@ FOUNDATION_SHADOWS = {
 
 
 class UnifiedResponseAssessmentShadowTests(unittest.TestCase):
+    def shared_choice_assessment(self):
+        final_question = (
+            "Between Chrome Prophet and Null Basilica, which fits that "
+            "requirement better, and why?"
+        )
+        evidence = (
+            build_conversation_evidence_item(
+                text="“Chrome Prophet” sounds like a person.",
+                source_id=10,
+                speaker_user_id=101,
+                speaker_label="Jon",
+            ),
+            build_conversation_evidence_item(
+                text=(
+                    "The hidden room should sound like a place, "
+                    "not a character."
+                ),
+                source_id=11,
+                speaker_user_id=202,
+                speaker_label="Miss Bit",
+            ),
+            build_conversation_evidence_item(
+                text="“Null Basilica” sounds like a place.",
+                source_id=12,
+                speaker_user_id=101,
+                speaker_label="Jon",
+            ),
+            build_conversation_evidence_item(
+                text=final_question,
+                speaker_user_id=101,
+                speaker_label="Jon",
+                current_turn=True,
+            ),
+        )
+        return build_unified_response_assessment(
+            guild_id=1,
+            route_mode="normal_chat",
+            channel_policy="sealed_test",
+            conversation_surface="test",
+            current_speaker_user_ids=(101,),
+            participant_user_ids=(101, 202),
+            speaker_labels=("Jon", "Miss Bit"),
+            current_exchange_source_ids=(10, 11, 12),
+            prompt_lanes=("current_exchange", "conversation_context"),
+            current_payload_anchors=(
+                "chrome prophet",
+                "null basilica",
+            ),
+            thread_focus_mode="new_thread",
+            current_text=final_question,
+            conversation_evidence_items=evidence,
+        )
+
     def test_shadow_derives_from_foundations_and_explicit_false_is_rollback(self):
         derived = shadow_configuration(FOUNDATION_SHADOWS)
         self.assertTrue(derived["requested"])
@@ -171,6 +226,327 @@ class UnifiedResponseAssessmentShadowTests(unittest.TestCase):
         self.assertEqual(assessment.response_act, "continue_active_thread")
         self.assertEqual(assessment.prompt_extra_lanes, ())
         self.assertEqual(assessment.prompt_missing_lanes, ())
+
+    def test_semantic_frame_resolves_shared_objective_and_attribution(self):
+        assessment = self.shared_choice_assessment()
+
+        self.assertEqual(
+            assessment.current_objective,
+            (
+                "Between Chrome Prophet and Null Basilica, which fits that "
+                "requirement better, and why?"
+            ),
+        )
+        self.assertEqual(assessment.objective_kind, "compare_options")
+        self.assertEqual(
+            assessment.current_options,
+            ("chrome prophet", "null basilica"),
+        )
+        self.assertEqual(
+            tuple(
+                (referent.option_key, referent.speaker_user_id)
+                for referent in assessment.option_referents
+            ),
+            (("chrome prophet", 101), ("null basilica", 101)),
+        )
+        self.assertEqual(len(assessment.attributed_criteria), 1)
+        criterion = assessment.attributed_criteria[0]
+        self.assertEqual(criterion.speaker_user_id, 202)
+        self.assertEqual(criterion.speaker_label, "Miss Bit")
+        self.assertEqual(criterion.positive_terms, ("place",))
+        self.assertEqual(criterion.negative_terms, ("character",))
+        self.assertEqual(assessment.ambiguity_reasons, ())
+        self.assertEqual(
+            assessment.response_act,
+            "evaluate_current_options",
+        )
+        self.assertEqual(
+            assessment.expected_answer_shape,
+            "choice_then_reason",
+        )
+
+    def test_unresolved_criterion_requires_one_clarifying_question(self):
+        request = (
+            "Between Chrome Prophet and Null Basilica, which fits that "
+            "requirement better?"
+        )
+        assessment = build_unified_response_assessment(
+            guild_id=1,
+            route_mode="normal_chat",
+            channel_policy="sealed_test",
+            conversation_surface="test",
+            current_speaker_user_ids=(101,),
+            current_payload_anchors=(
+                "chrome prophet",
+                "null basilica",
+            ),
+            current_text=request,
+            conversation_evidence_items=(
+                build_conversation_evidence_item(
+                    text=request,
+                    speaker_user_id=101,
+                    speaker_label="Jon",
+                    current_turn=True,
+                ),
+            ),
+        )
+
+        self.assertEqual(
+            assessment.ambiguity_reasons,
+            ("criterion_referent_unresolved",),
+        )
+        self.assertEqual(
+            assessment.response_act,
+            "ask_clarifying_question",
+        )
+        self.assertEqual(
+            assessment.expected_answer_shape,
+            "one_clarifying_question",
+        )
+        coherence = assess_response_coherence(
+            assessment,
+            "Which requirement should I use to compare them?",
+        )
+        self.assertEqual(coherence.status, "passed")
+        self.assertEqual(coherence.clarification_status, "appropriate")
+
+    def test_decisions_corrections_and_open_loops_keep_source_lineage(self):
+        evidence = (
+            build_conversation_evidence_item(
+                text=(
+                    "Actually, we decided to use Saturday instead of Friday."
+                ),
+                source_id=20,
+                speaker_user_id=101,
+                speaker_label="Jon",
+            ),
+            build_conversation_evidence_item(
+                text="Who owns the artwork?",
+                source_id=21,
+                speaker_user_id=202,
+                speaker_label="Miss Bit",
+            ),
+        )
+        assessment = build_unified_response_assessment(
+            guild_id=1,
+            route_mode="normal_chat",
+            channel_policy="sealed_test",
+            conversation_surface="test",
+            current_speaker_user_ids=(202,),
+            participant_user_ids=(101, 202),
+            speaker_labels=("Jon", "Miss Bit"),
+            current_exchange_source_ids=(20, 21),
+            prompt_lanes=("current_exchange", "conversation_context"),
+            current_text="Who owns the artwork?",
+            conversation_evidence_items=evidence,
+        )
+
+        self.assertEqual(assessment.decision_source_ids, (20,))
+        self.assertEqual(assessment.correction_source_ids, (20,))
+        self.assertEqual(assessment.open_loop_source_ids, (21,))
+        roles_by_source = {
+            item.source_id: item.semantic_roles
+            for item in assessment.conversation_evidence_items
+        }
+        self.assertIn("decision", roles_by_source[20])
+        self.assertIn("correction", roles_by_source[20])
+        self.assertIn("open_loop", roles_by_source[21])
+
+    def test_conclusion_must_agree_with_its_own_criterion_reasoning(self):
+        assessment = self.shared_choice_assessment()
+
+        contradictory = assess_response_coherence(
+            assessment,
+            (
+                "Chrome Prophet sounds like a person. "
+                "Null Basilica sounds like a place. "
+                "I choose Chrome Prophet."
+            ),
+        )
+        self.assertEqual(contradictory.status, "failed")
+        self.assertEqual(
+            contradictory.conclusion_status,
+            "contradictory",
+        )
+        self.assertIn(
+            "conclusion_reason_contradiction",
+            contradictory.reason_codes,
+        )
+
+        coherent = assess_response_coherence(
+            assessment,
+            (
+                "Chrome Prophet sounds like a person. "
+                "Null Basilica sounds like a place. "
+                "I choose Null Basilica."
+            ),
+        )
+        self.assertEqual(coherent.status, "passed")
+        self.assertEqual(coherent.conclusion_status, "consistent")
+        self.assertEqual(coherent.criterion_status, "covered")
+
+    def test_semantic_frame_is_domain_neutral_across_conversation_shapes(self):
+        cases = (
+            (
+                "planning",
+                "We should deploy after CI passes.",
+                "What should we do next?",
+                "continue_or_answer",
+                1,
+            ),
+            (
+                "technical",
+                "The provider retry still times out.",
+                "How do we isolate the failing boundary?",
+                "continue_or_answer",
+                0,
+            ),
+            (
+                "creative",
+                "The chorus must feel playful, not formal.",
+                "Which version fits that criterion better?",
+                "continue_or_answer",
+                1,
+            ),
+            (
+                "joking",
+                "The joke should stay short and weird.",
+                "Give me the next line.",
+                "continue_or_answer",
+                1,
+            ),
+            (
+                "resumed",
+                "We left the rollout question unresolved.",
+                "Go back to the rollout question from earlier.",
+                "resume_thread",
+                0,
+            ),
+            (
+                "combined",
+                "One thread covers tone; another covers timing.",
+                "Combine both threads into one recommendation.",
+                "combine_threads",
+                0,
+            ),
+            (
+                "topic_change",
+                "The old topic was the server restart.",
+                "Now help me name the new event.",
+                "new_thread",
+                0,
+            ),
+        )
+        for name, prior_text, current_text, focus, criterion_count in cases:
+            with self.subTest(name=name):
+                evidence = (
+                    build_conversation_evidence_item(
+                        text=prior_text,
+                        source_id=10,
+                        speaker_user_id=101,
+                        speaker_label="Jon",
+                    ),
+                    build_conversation_evidence_item(
+                        text=current_text,
+                        speaker_user_id=202,
+                        speaker_label="Miss Bit",
+                        current_turn=True,
+                    ),
+                )
+                assessment = build_unified_response_assessment(
+                    guild_id=1,
+                    route_mode="normal_chat",
+                    channel_policy="sealed_test",
+                    conversation_surface="test",
+                    current_speaker_user_ids=(202,),
+                    participant_user_ids=(101, 202),
+                    speaker_labels=("Jon", "Miss Bit"),
+                    current_exchange_source_ids=(10,),
+                    prompt_lanes=(
+                        "current_exchange",
+                        "conversation_context",
+                    ),
+                    continuity_required=True,
+                    current_text=current_text,
+                    conversation_evidence_items=evidence,
+                    thread_focus_mode=focus,
+                )
+                self.assertEqual(
+                    assessment.thread_focus_mode,
+                    focus,
+                )
+                self.assertTrue(assessment.current_objective)
+                self.assertEqual(
+                    len(assessment.conversation_evidence_items),
+                    2,
+                )
+                self.assertEqual(
+                    assessment.participant_user_ids,
+                    (101, 202),
+                )
+                self.assertEqual(
+                    len(assessment.attributed_criteria),
+                    criterion_count,
+                )
+                self.assertNotEqual(
+                    assessment.response_act,
+                    "ask_clarifying_question",
+                )
+
+    def test_receipt_flags_conclusion_contradiction_without_content(self):
+        conn = sqlite3.connect(":memory:")
+        try:
+            assessment = self.shared_choice_assessment()
+            persist_shadow_run(
+                conn,
+                assessment,
+                response=(
+                    "Chrome Prophet sounds like a person. "
+                    "Null Basilica sounds like a place. "
+                    "I choose Chrome Prophet."
+                ),
+            )
+            conn.commit()
+
+            row = conn.execute(
+                "SELECT objective_kind, criterion_count, option_count, "
+                "response_coherence_status, "
+                "coherence_conclusion_status, "
+                "coherence_reason_codes_json, response_alignment "
+                "FROM unified_response_assessment_shadow_runs"
+            ).fetchone()
+            self.assertEqual(row[:5], (
+                "compare_options",
+                1,
+                2,
+                "failed",
+                "contradictory",
+            ))
+            self.assertEqual(
+                json.loads(row[5]),
+                ["conclusion_reason_contradiction"],
+            )
+            self.assertEqual(row[6], "response_coherence_failure")
+
+            report = build_evaluation_report(conn, guild_id=1)
+            self.assertEqual(
+                report["response_coherence_failure_runs"],
+                1,
+            )
+            self.assertEqual(
+                report["conclusion_contradiction_runs"],
+                1,
+            )
+            self.assertEqual(
+                report["coherence_reason_code_counts"],
+                {"conclusion_reason_contradiction": 1},
+            )
+            encoded = json.dumps(report, sort_keys=True)
+            self.assertNotIn("Chrome Prophet", encoded)
+            self.assertNotIn("Null Basilica", encoded)
+            self.assertNotIn("Miss Bit", encoded)
+        finally:
+            conn.close()
 
     def test_receipt_is_content_free_and_observes_visible_pause_marker(self):
         conn = sqlite3.connect(":memory:")
@@ -438,6 +814,15 @@ class UnifiedResponseAssessmentShadowTests(unittest.TestCase):
                 "prior_thread_anchor_count",
                 "prior_thread_anchor_hit_count",
                 "payload_grounding_status",
+                "objective_kind",
+                "expected_answer_shape",
+                "contribution_count",
+                "criterion_count",
+                "option_count",
+                "ambiguity_reason_count",
+                "response_coherence_status",
+                "coherence_conclusion_status",
+                "coherence_reason_codes_json",
             ):
                 self.assertIn(column, columns)
             self.assertEqual(
