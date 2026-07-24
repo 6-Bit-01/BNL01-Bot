@@ -280,6 +280,141 @@ class UnifiedResponseAssessmentBotPathTests(unittest.TestCase):
                 self.assertNotIn("response_text", schema)
                 self.assertNotIn("speaker_labels", schema)
 
+    def test_bot_adapter_distinguishes_current_fragments_from_prior_choice(self):
+        basis = bnl01_bot.ConversationPromptSourceBasis(
+            expected_digest="digest",
+            rendered_context=(
+                "Conversation continuity:\n"
+                "User/member: Pick Ghost Signal or Neon Static.\n"
+                "BNL-01: Ghost Signal is stronger.\n"
+                "User/member (current payload fragment): "
+                "“Dead Channel” sounds abandoned.\n"
+                "User/member (current payload fragment): "
+                "“Open Circuit” sounds active."
+            ),
+            guild_id=1,
+            current_user_id=101,
+            channel_id=303,
+            channel_name="bnl-testing",
+            channel_policy="sealed_test",
+            source_row_ids=(1, 2, 3, 4),
+            participant_user_ids=(101, 102),
+            speaker_labels=("Jon", "Miss Bit"),
+        )
+        with mock.patch.object(
+            bnl01_bot,
+            "unified_response_assessment_shadow_enabled",
+            return_value=True,
+        ):
+            assessment = (
+                bnl01_bot.build_unified_response_assessment_shadow(
+                    guild_id=1,
+                    route_mode=bnl01_bot.ROUTE_MODE_NORMAL_CHAT,
+                    channel_policy="sealed_test",
+                    conversation_surface="test",
+                    current_text=(
+                        "Which title fits a hidden test zone better, and why?"
+                    ),
+                    current_speaker_user_ids=(101,),
+                    current_speaker_labels=("Jon",),
+                    prompt_source_bases=(basis,),
+                    prompt_lanes=(
+                        "current_exchange",
+                        "conversation_context",
+                    ),
+                )
+            )
+
+        self.assertEqual(
+            assessment.current_payload_anchors,
+            ("dead channel", "open circuit"),
+        )
+        self.assertEqual(
+            assessment.prior_thread_anchors,
+            ("ghost signal", "neon static"),
+        )
+        self.assertEqual(assessment.thread_focus_mode, "new_thread")
+        self.assertEqual(assessment.comparison_status, "match")
+
+
+class CurrentPayloadGroundingGuardTests(unittest.IsolatedAsyncioTestCase):
+    async def test_shared_guard_regenerates_stale_option_substitution(self):
+        provider = mock.AsyncMock(
+            return_value=(
+                "Dead Channel fits the hidden test zone better because it "
+                "sounds deliberately abandoned."
+            )
+        )
+        current_text = (
+            'Pick between “Dead Channel” and “Open Circuit” for the hidden '
+            "test zone."
+        )
+        with mock.patch.object(
+            bnl01_bot,
+            "get_gemini_response_with_optional_typing",
+            provider,
+        ):
+            response, diagnostics = (
+                await bnl01_bot.apply_guarded_response_regeneration(
+                    "Ghost Signal is the stronger choice.",
+                    prompt="Current user request: " + current_text,
+                    user_id=101,
+                    guild_id=1,
+                    route_mode=bnl01_bot.ROUTE_MODE_NORMAL_CHAT,
+                    channel_policy="sealed_test",
+                    current_user_text=current_text,
+                )
+            )
+
+        self.assertIn("Dead Channel", response)
+        self.assertTrue(
+            diagnostics["current_payload_grounding_guard_triggered"]
+        )
+        self.assertTrue(
+            diagnostics["current_payload_grounding_regenerated"]
+        )
+        self.assertEqual(
+            diagnostics["current_payload_grounding_status"],
+            "grounded_current_payload",
+        )
+        self.assertFalse(diagnostics["suppressed"])
+        provider.assert_awaited_once()
+        self.assertIn(
+            "CURRENT-PAYLOAD CORRECTION REQUIRED",
+            provider.await_args.args[1],
+        )
+
+    async def test_shared_guard_suppresses_second_unanswered_choice(self):
+        provider = mock.AsyncMock(
+            return_value="Ghost Signal still feels strongest."
+        )
+        current_text = (
+            'Choose “Dead Channel” or “Open Circuit” for the hidden test zone.'
+        )
+        with mock.patch.object(
+            bnl01_bot,
+            "get_gemini_response_with_optional_typing",
+            provider,
+        ):
+            response, diagnostics = (
+                await bnl01_bot.apply_guarded_response_regeneration(
+                    "Neon Static is the better title.",
+                    prompt="Current user request: " + current_text,
+                    user_id=101,
+                    guild_id=1,
+                    route_mode=bnl01_bot.ROUTE_MODE_NORMAL_CHAT,
+                    channel_policy="sealed_test",
+                    current_user_text=current_text,
+                )
+            )
+
+        self.assertEqual(response, "")
+        self.assertTrue(diagnostics["suppressed"])
+        self.assertEqual(
+            diagnostics["suppression_reason"],
+            "current_payload_grounding_after_retry",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

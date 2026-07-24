@@ -19,8 +19,10 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
 
+from bnl_conversation_context_v2 import assess_payload_grounding
 
-ASSESSMENT_VERSION = "unified_response_assessment_v1"
+
+ASSESSMENT_VERSION = "unified_response_assessment_v2"
 SHADOW_ENV = "BNL_UNIFIED_RESPONSE_ASSESSMENT_SHADOW_ENABLED"
 TABLE_NAME = "unified_response_assessment_shadow_runs"
 
@@ -61,6 +63,17 @@ _KNOWN_LANES = frozenset(
         "relationship",
         "canon",
     )
+)
+_THREAD_FOCUS_MODES = frozenset(
+    {
+        "unclassified",
+        "continue_or_answer",
+        "new_thread",
+        "resume_thread",
+        "combine_threads",
+        "resume_requested_unresolved",
+        "combine_requested_unresolved",
+    }
 )
 _VISIBLE_CONTROL_MARKER_RE = re.compile(
     r"(?im)^\s*(?:"
@@ -161,6 +174,15 @@ def _known_lanes(values: Sequence[Any]) -> Tuple[str, ...]:
     )
 
 
+def _thread_focus_mode(value: Any) -> str:
+    normalized = str(value or "unclassified").strip()
+    return (
+        normalized
+        if normalized in _THREAD_FOCUS_MODES
+        else "unclassified"
+    )
+
+
 def _basis_kind(value: Any) -> str:
     name = type(value).__name__
     return {
@@ -230,6 +252,9 @@ class UnifiedResponseAssessment:
     moment_candidate_count: int
     governed_candidate_count: int
     governance_exclusion_count: int
+    current_payload_anchors: Tuple[str, ...]
+    prior_thread_anchors: Tuple[str, ...]
+    thread_focus_mode: str
 
 
 def build_unified_response_assessment(
@@ -267,6 +292,9 @@ def build_unified_response_assessment(
     website_read_model_present: bool = False,
     source_context_present: bool = False,
     broadcast_memory_present: bool = False,
+    current_payload_anchors: Sequence[str] = (),
+    prior_thread_anchors: Sequence[str] = (),
+    thread_focus_mode: str = "unclassified",
 ) -> UnifiedResponseAssessment:
     """Assemble one deterministic assessment without rendering it live."""
 
@@ -429,6 +457,9 @@ def build_unified_response_assessment(
             0,
             int(governance_exclusion_count or 0),
         ),
+        current_payload_anchors=_unique_strings(current_payload_anchors)[:8],
+        prior_thread_anchors=_unique_strings(prior_thread_anchors)[:16],
+        thread_focus_mode=_thread_focus_mode(thread_focus_mode),
     )
 
 
@@ -476,6 +507,12 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
             response_length INTEGER NOT NULL DEFAULT 0,
             speaker_label_coverage_count INTEGER NOT NULL DEFAULT 0,
             visible_control_marker INTEGER NOT NULL DEFAULT 0,
+            thread_focus_mode TEXT NOT NULL DEFAULT 'unclassified',
+            current_payload_anchor_count INTEGER NOT NULL DEFAULT 0,
+            current_payload_anchor_hit_count INTEGER NOT NULL DEFAULT 0,
+            prior_thread_anchor_count INTEGER NOT NULL DEFAULT 0,
+            prior_thread_anchor_hit_count INTEGER NOT NULL DEFAULT 0,
+            payload_grounding_status TEXT NOT NULL DEFAULT 'not_evaluated_legacy',
             response_alignment TEXT NOT NULL,
             processing_errors_json TEXT NOT NULL DEFAULT '[]',
             behavior_changed INTEGER NOT NULL DEFAULT 0,
@@ -484,6 +521,39 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
         )
         """
     )
+    existing_columns = {
+        str(row[1])
+        for row in conn.execute(
+            "PRAGMA table_info(unified_response_assessment_shadow_runs)"
+        )
+    }
+    additive_columns = (
+        (
+            "thread_focus_mode",
+            "TEXT NOT NULL DEFAULT 'unclassified'",
+        ),
+        ("current_payload_anchor_count", "INTEGER NOT NULL DEFAULT 0"),
+        (
+            "current_payload_anchor_hit_count",
+            "INTEGER NOT NULL DEFAULT 0",
+        ),
+        ("prior_thread_anchor_count", "INTEGER NOT NULL DEFAULT 0"),
+        (
+            "prior_thread_anchor_hit_count",
+            "INTEGER NOT NULL DEFAULT 0",
+        ),
+        (
+            "payload_grounding_status",
+            "TEXT NOT NULL DEFAULT 'not_evaluated_legacy'",
+        ),
+    )
+    for column_name, column_definition in additive_columns:
+        if column_name in existing_columns:
+            continue
+        conn.execute(
+            "ALTER TABLE unified_response_assessment_shadow_runs "
+            "ADD COLUMN %s %s" % (column_name, column_definition)
+        )
     conn.execute(
         """
         CREATE INDEX IF NOT EXISTS idx_unified_assessment_shadow_guild
@@ -511,6 +581,7 @@ def _guard_signal(guard_diagnostics: Mapping[str, Any]) -> Tuple[bool, bool]:
         "contextual_followthrough_guard_triggered",
         "community_visual_guard_triggered",
         "exact_quote_guard_triggered",
+        "current_payload_grounding_guard_triggered",
         "prompt_source_basis_changed",
     )
     repair_keys = (
@@ -521,6 +592,7 @@ def _guard_signal(guard_diagnostics: Mapping[str, Any]) -> Tuple[bool, bool]:
         "contextual_followthrough_regenerated",
         "community_visual_regenerated",
         "exact_quote_regenerated",
+        "current_payload_grounding_regenerated",
         "prompt_source_basis_regenerated",
     )
     return (
@@ -557,6 +629,12 @@ def persist_shadow_run(
     visible_control_marker = bool(
         _VISIBLE_CONTROL_MARKER_RE.search(response_text)
     )
+    payload_grounding = assess_payload_grounding(
+        response_text,
+        current_payload_anchors=assessment.current_payload_anchors,
+        prior_thread_anchors=assessment.prior_thread_anchors,
+        combine_requested=assessment.thread_focus_mode == "combine_threads",
+    )
     source_changed = bool(guard.get("prompt_source_basis_changed"))
     if not response_sent:
         alignment = "not_sent"
@@ -566,6 +644,8 @@ def persist_shadow_run(
         alignment = "suppressed"
     elif visible_control_marker:
         alignment = "visible_control_marker"
+    elif payload_grounding.failed:
+        alignment = "payload_grounding_failure"
     elif assessment.response_act == "recap_current_exchange" and labels:
         alignment = (
             "recap_full_speaker_label_coverage"
@@ -596,11 +676,14 @@ def persist_shadow_run(
             prompt_missing_lanes_json, source_basis_changed_before_send,
             guard_triggered, guard_repaired, response_sent, response_length,
             speaker_label_coverage_count, visible_control_marker,
+            thread_focus_mode, current_payload_anchor_count,
+            current_payload_anchor_hit_count, prior_thread_anchor_count,
+            prior_thread_anchor_hit_count, payload_grounding_status,
             response_alignment, processing_errors_json, behavior_changed,
             new_authority_applied, created_at
         ) VALUES (
             ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,
-            ?,?,?,?,?,?,?,?,?
+            ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?
         )
         """,
         (
@@ -642,6 +725,12 @@ def persist_shadow_run(
             len(response_text),
             speaker_coverage,
             int(visible_control_marker),
+            assessment.thread_focus_mode,
+            payload_grounding.current_anchor_count,
+            payload_grounding.current_anchor_hit_count,
+            payload_grounding.prior_anchor_count,
+            payload_grounding.prior_anchor_hit_count,
+            payload_grounding.status,
             alignment,
             json.dumps(
                 tuple(
@@ -684,6 +773,12 @@ def _empty_evaluation_report() -> Dict[str, Any]:
         "excluded_lane_reason_counts": {},
         "response_act_counts": {},
         "response_alignment_counts": {},
+        "thread_focus_mode_counts": {},
+        "payload_grounding_status_counts": {},
+        "payload_grounding_applicable_runs": 0,
+        "payload_grounding_failure_runs": 0,
+        "current_payload_anchor_total": 0,
+        "current_payload_anchor_hit_total": 0,
         "prompt_overincluded_runs": 0,
         "prompt_underincluded_runs": 0,
         "prompt_different_runs": 0,
@@ -728,6 +823,36 @@ def build_evaluation_report(
             "source_text",
         }
     )
+    thread_focus_column = (
+        "thread_focus_mode"
+        if "thread_focus_mode" in columns
+        else "'unclassified'"
+    )
+    current_anchor_count_column = (
+        "current_payload_anchor_count"
+        if "current_payload_anchor_count" in columns
+        else "0"
+    )
+    current_anchor_hit_column = (
+        "current_payload_anchor_hit_count"
+        if "current_payload_anchor_hit_count" in columns
+        else "0"
+    )
+    prior_anchor_count_column = (
+        "prior_thread_anchor_count"
+        if "prior_thread_anchor_count" in columns
+        else "0"
+    )
+    prior_anchor_hit_column = (
+        "prior_thread_anchor_hit_count"
+        if "prior_thread_anchor_hit_count" in columns
+        else "0"
+    )
+    payload_status_column = (
+        "payload_grounding_status"
+        if "payload_grounding_status" in columns
+        else "'not_evaluated_legacy'"
+    )
     rows = conn.execute(
         """
         SELECT response_sent, selected_lanes_json, excluded_lanes_json,
@@ -735,12 +860,19 @@ def build_evaluation_report(
                source_basis_changed_before_send, guard_triggered,
                guard_repaired, visible_control_marker, response_alignment,
                processing_errors_json, behavior_changed,
-               new_authority_applied, created_at
+               new_authority_applied, %s, %s, %s, %s, %s, %s, created_at
         FROM unified_response_assessment_shadow_runs
         WHERE guild_id=?
         ORDER BY created_at DESC, run_id DESC
         LIMIT ?
-        """,
+        """ % (
+            thread_focus_column,
+            current_anchor_count_column,
+            current_anchor_hit_column,
+            prior_anchor_count_column,
+            prior_anchor_hit_column,
+            payload_status_column,
+        ),
         (int(guild_id or 0), max(1, min(int(limit or 500), 5000))),
     ).fetchall()
 
@@ -749,9 +881,13 @@ def build_evaluation_report(
     act_counts = Counter()
     comparison_counts = Counter()
     alignment_counts = Counter()
+    focus_counts = Counter()
+    payload_status_counts = Counter()
     response_sent_runs = current_primary = source_changed = 0
     guard_triggered_runs = guard_repaired_runs = marker_runs = 0
     processing_errors = behavior_changed = new_authority = 0
+    payload_applicable = payload_failures = 0
+    current_anchor_total = current_anchor_hit_total = 0
     for row in rows:
         (
             response_sent,
@@ -767,6 +903,12 @@ def build_evaluation_report(
             errors_json,
             changed_behavior,
             applied_authority,
+            thread_focus_mode,
+            current_anchor_count,
+            current_anchor_hit_count,
+            _prior_anchor_count,
+            _prior_anchor_hit_count,
+            payload_grounding_status,
             _created_at,
         ) = row
         selected = _safe_json(selected_json, [])
@@ -790,6 +932,30 @@ def build_evaluation_report(
         act_counts[str(response_act or "unknown")] += 1
         comparison_counts[str(comparison or "unknown")] += 1
         alignment_counts[str(response_alignment or "unknown")] += 1
+        focus_counts[str(thread_focus_mode or "unclassified")] += 1
+        payload_status = str(
+            payload_grounding_status or "not_evaluated_legacy"
+        )
+        payload_status_counts[payload_status] += 1
+        normalized_current_anchor_count = max(
+            0,
+            int(current_anchor_count or 0),
+        )
+        normalized_current_anchor_hits = max(
+            0,
+            int(current_anchor_hit_count or 0),
+        )
+        current_anchor_total += normalized_current_anchor_count
+        current_anchor_hit_total += normalized_current_anchor_hits
+        payload_applicable += int(normalized_current_anchor_count >= 2)
+        payload_failures += int(
+            payload_status
+            in {
+                "current_payload_unanswered",
+                "stale_thread_substitution",
+                "mixed_thread_contamination",
+            }
+        )
         response_sent_runs += int(bool(response_sent))
         current_primary += int(bool(selected and selected[0] == "current_exchange"))
         source_changed += int(bool(source_basis_changed))
@@ -810,6 +976,14 @@ def build_evaluation_report(
         "excluded_lane_reason_counts": dict(sorted(excluded_counts.items())),
         "response_act_counts": dict(sorted(act_counts.items())),
         "response_alignment_counts": dict(sorted(alignment_counts.items())),
+        "thread_focus_mode_counts": dict(sorted(focus_counts.items())),
+        "payload_grounding_status_counts": dict(
+            sorted(payload_status_counts.items())
+        ),
+        "payload_grounding_applicable_runs": payload_applicable,
+        "payload_grounding_failure_runs": payload_failures,
+        "current_payload_anchor_total": current_anchor_total,
+        "current_payload_anchor_hit_total": current_anchor_hit_total,
         "prompt_overincluded_runs": comparison_counts.get(
             "prompt_overincluded",
             0,
@@ -828,7 +1002,7 @@ def build_evaluation_report(
         "new_authority_applied_runs": new_authority,
         "content_fields_present": disallowed_content_columns,
         "evidenceWindow": {
-            "first": str(rows[-1][13]) if rows else "none",
-            "last": str(rows[0][13]) if rows else "none",
+            "first": str(rows[-1][-1]) if rows else "none",
+            "last": str(rows[0][-1]) if rows else "none",
         },
     }

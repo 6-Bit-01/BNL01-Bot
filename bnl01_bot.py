@@ -92,9 +92,14 @@ from bnl_relationship_engine import (
 from bnl_conversation_context_v2 import (
     CONVERSATION_CONTEXT_VERSION,
     ConversationContextRequest,
+    assess_payload_grounding,
     assemble_conversation_context_v2,
+    classify_thread_focus,
+    extract_current_payload_anchors,
+    extract_prior_thread_anchors,
     immediate_room_recap_requested,
     sanitize_history_text,
+    thread_combine_requested,
 )
 from bnl_shadow_acceptance import (
     build_v2_shadow_acceptance_snapshot,
@@ -692,6 +697,10 @@ LAST_CONVERSATION_CONTEXT_V2_DIAGNOSTICS = {
     "visibility_policy_exclusions": 0,
     "final_char_count": 0,
     "selection_fallback_reason": "not_used",
+    "thread_focus_mode": "unclassified",
+    "current_payload_anchor_count": 0,
+    "matched_thread_count": 0,
+    "suppressed_thread_count": 0,
 }
 
 def conversation_context_v2_enabled() -> bool:
@@ -791,6 +800,10 @@ def update_conversation_context_v2_diagnostics(result=None, *, route_mode="unkno
         "final_char_count": getattr(result, "final_char_count", 0) if result else 0,
         "selection_fallback_reason": getattr(result, "fallback_reason", reason) if result else reason,
         "selection_reasons": list(getattr(result, "selection_reasons", ()))[:8] if result else [],
+        "thread_focus_mode": getattr(result, "thread_focus_mode", "unclassified") if result else "unclassified",
+        "current_payload_anchor_count": getattr(result, "current_payload_anchor_count", 0) if result else 0,
+        "matched_thread_count": getattr(result, "matched_thread_count", 0) if result else 0,
+        "suppressed_thread_count": getattr(result, "suppressed_thread_count", 0) if result else 0,
     })
     return LAST_CONVERSATION_CONTEXT_V2_DIAGNOSTICS
 
@@ -8383,6 +8396,16 @@ def build_contextual_followthrough_correction_prompt(prompt: str) -> str:
     )
 
 
+def build_current_payload_grounding_correction_prompt(prompt: str) -> str:
+    return (
+        (prompt or "")
+        + "\n\nCURRENT-PAYLOAD CORRECTION REQUIRED: The previous draft did not answer the named alternatives in the current exchange. "
+        + "Answer the current choice, comparison, or selection directly and explicitly name at least one of its current alternatives. "
+        + "Messages labeled as current payload fragments belong to this request even when another member supplied one of them. "
+        + "Do not substitute names or options from an older completed exchange unless the current request explicitly resumes or combines that thread."
+    )
+
+
 def decide_reply_eligibility(
     clean_content: str,
     channel_policy: str,
@@ -15005,9 +15028,10 @@ def build_conversation_context_v2_for_prompt(
     result = assemble_conversation_context_v2(rows, req)
     update_conversation_context_v2_diagnostics(result, route_mode=route_mode, channel_policy=channel_policy, enabled=True)
     logging.info(
-        "conversation_context_v2 selected same_pairs=%s cross_pairs=%s unpaired=%s dupes=%s excluded=%s chars=%s reason=%s",
+        "conversation_context_v2 selected same_pairs=%s cross_pairs=%s unpaired=%s dupes=%s excluded=%s chars=%s reason=%s focus=%s anchors=%s matched=%s suppressed=%s",
         result.same_room_paired_turn_count, result.cross_channel_paired_turn_count, result.unpaired_row_count,
         result.current_message_duplicates_removed, result.visibility_policy_exclusions, result.final_char_count, result.fallback_reason,
+        result.thread_focus_mode, result.current_payload_anchor_count, result.matched_thread_count, result.suppressed_thread_count,
     )
     return result.rendered_context
 
@@ -17898,6 +17922,23 @@ def build_unified_response_assessment_shadow(
             for basis in prompt_source_bases
         )
     )
+    conversation_contexts = tuple(
+        basis.rendered_context
+        for basis in conversation_bases
+        if basis.rendered_context
+    )
+    current_payload_anchors = extract_current_payload_anchors(
+        current_text,
+        conversation_contexts,
+    )
+    prior_thread_anchors = extract_prior_thread_anchors(
+        conversation_contexts,
+        current_payload_anchors=current_payload_anchors,
+    )
+    thread_focus_mode = classify_thread_focus(
+        current_text,
+        conversation_contexts,
+    )
     canon_relevant = _canon_relevant_to_response(current_text)
     return build_unified_response_assessment(
         guild_id=guild_id,
@@ -17956,6 +17997,9 @@ def build_unified_response_assessment_shadow(
         website_read_model_present=website_read_model_present,
         source_context_present=source_context_present,
         broadcast_memory_present=broadcast_memory_present,
+        current_payload_anchors=current_payload_anchors,
+        prior_thread_anchors=prior_thread_anchors,
+        thread_focus_mode=thread_focus_mode,
     )
 
 
@@ -17981,10 +18025,13 @@ def record_unified_response_assessment_shadow(
             assessment_conn.commit()
         logging.info(
             "unified_response_assessment_shadow_recorded "
-            "route_mode=%s response_act=%s comparison=%s",
+            "route_mode=%s response_act=%s comparison=%s "
+            "thread_focus=%s payload_anchor_count=%s",
             assessment.route_mode,
             assessment.response_act,
             assessment.comparison_status,
+            assessment.thread_focus_mode,
+            len(assessment.current_payload_anchors),
         )
         return run_id
     except Exception as exc:
@@ -24269,6 +24316,9 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
             or guard_diagnostics.get("contextual_followthrough_guard_triggered")
             or guard_diagnostics.get("community_visual_guard_triggered")
             or guard_diagnostics.get("exact_quote_guard_triggered")
+            or guard_diagnostics.get(
+                "current_payload_grounding_guard_triggered"
+            )
         )
         regenerated_for_mode_leak = bool(
             guard_diagnostics.get("regenerated_for_mode_leak")
@@ -26243,6 +26293,11 @@ async def apply_guarded_response_regeneration(
         "exact_quote_regenerated": False,
         "exact_quote_guard_reason": "",
         "exact_quote_basis_stale": False,
+        "current_payload_grounding_guard_triggered": False,
+        "current_payload_grounding_regenerated": False,
+        "current_payload_grounding_status": "not_evaluated",
+        "current_payload_anchor_count": 0,
+        "prior_thread_anchor_count": 0,
         "prompt_source_basis_changed": False,
         "prompt_source_basis_changed_kinds": (),
         "prompt_source_basis_regenerated": False,
@@ -26260,6 +26315,38 @@ async def apply_guarded_response_regeneration(
         third_party_attribution_requested
     )
     prompt_source_bases = tuple(prompt_source_bases or ())
+    conversation_contexts = tuple(
+        basis.rendered_context
+        for basis in prompt_source_bases
+        if isinstance(basis, ConversationPromptSourceBasis)
+        and basis.rendered_context
+    )
+    current_payload_anchors = extract_current_payload_anchors(
+        current_user_text,
+        conversation_contexts,
+    )
+    prior_thread_anchors = extract_prior_thread_anchors(
+        conversation_contexts,
+        current_payload_anchors=current_payload_anchors,
+    )
+    combine_current_threads = bool(
+        thread_combine_requested(current_user_text)
+    )
+    diagnostics["current_payload_anchor_count"] = len(
+        current_payload_anchors
+    )
+    diagnostics["prior_thread_anchor_count"] = len(
+        prior_thread_anchors
+    )
+
+    def payload_grounding(candidate: str):
+        return assess_payload_grounding(
+            candidate,
+            current_payload_anchors=current_payload_anchors,
+            prior_thread_anchors=prior_thread_anchors,
+            combine_requested=combine_current_threads,
+        )
+
     quote_guard_requested = bool(
         exact_quote_requested or third_party_attribution_requested
     )
@@ -26354,6 +26441,7 @@ async def apply_guarded_response_regeneration(
                     exact_requested=exact_quote_requested,
                 )
             )
+            or payload_grounding(candidate).failed
         )
 
     if prompt_source_bases:
@@ -26637,6 +26725,54 @@ async def apply_guarded_response_regeneration(
             logging.warning("generic_non_answer_suppressed_after_retry route=%s channel_policy=%s directness=%s", route_mode, channel_policy, directness)
             diagnostics.update({"suppressed": True, "suppression_reason": "generic_non_answer_after_retry", "guard_fallback_or_generic_non_answer": True})
             return "", diagnostics
+    current_payload_grounding = payload_grounding(response)
+    diagnostics["current_payload_grounding_status"] = (
+        current_payload_grounding.status
+    )
+    if current_payload_grounding.failed:
+        diagnostics["current_payload_grounding_guard_triggered"] = True
+        logging.warning(
+            "current_payload_grounding_guard_triggered "
+            "status=%s route_mode=%s channel_policy=%s "
+            "current_anchor_count=%s prior_anchor_count=%s",
+            current_payload_grounding.status,
+            route_mode,
+            channel_policy,
+            current_payload_grounding.current_anchor_count,
+            current_payload_grounding.prior_anchor_count,
+        )
+        if not regeneration_allowed:
+            diagnostics.update(
+                {
+                    "suppressed": True,
+                    "suppression_reason": (
+                        "current_payload_grounding_validation_only"
+                    ),
+                    "guard_fallback_or_generic_non_answer": True,
+                }
+            )
+            return "", diagnostics
+        regenerated = await regenerate(
+            build_current_payload_grounding_correction_prompt(prompt)
+        )
+        diagnostics["current_payload_grounding_regenerated"] = True
+        regenerated = (regenerated or "").strip()
+        regenerated_grounding = payload_grounding(regenerated)
+        diagnostics["current_payload_grounding_status"] = (
+            regenerated_grounding.status
+        )
+        if retry_has_guard_failure(regenerated):
+            diagnostics.update(
+                {
+                    "suppressed": True,
+                    "suppression_reason": (
+                        "current_payload_grounding_after_retry"
+                    ),
+                    "guard_fallback_or_generic_non_answer": True,
+                }
+            )
+            return "", diagnostics
+        response = regenerated
     # No provider await may occur after this source-of-truth recheck. If a
     # deletion, clear, or correction changed the supporting rows during any
     # regeneration above, suppress instead of sending a stale grounded claim.
@@ -26917,6 +27053,9 @@ async def send_planned_conversation_response(
         or guard_diagnostics.get("contextual_followthrough_guard_triggered")
         or guard_diagnostics.get("community_visual_guard_triggered")
         or guard_diagnostics.get("exact_quote_guard_triggered")
+        or guard_diagnostics.get(
+            "current_payload_grounding_guard_triggered"
+        )
         or archive_guard_triggered
     )
     regenerated_for_mode_leak = bool(
@@ -29175,6 +29314,10 @@ async def bnl_context_check(interaction: discord.Interaction):
         f"- conversation_context_policy_exclusions: `{LAST_CONVERSATION_CONTEXT_V2_DIAGNOSTICS.get('visibility_policy_exclusions')}`",
         f"- conversation_context_final_chars: `{LAST_CONVERSATION_CONTEXT_V2_DIAGNOSTICS.get('final_char_count')}`",
         f"- conversation_context_reason: `{LAST_CONVERSATION_CONTEXT_V2_DIAGNOSTICS.get('selection_fallback_reason')}`",
+        f"- conversation_context_thread_focus: `{LAST_CONVERSATION_CONTEXT_V2_DIAGNOSTICS.get('thread_focus_mode')}`",
+        f"- conversation_context_payload_anchors: `{LAST_CONVERSATION_CONTEXT_V2_DIAGNOSTICS.get('current_payload_anchor_count')}`",
+        f"- conversation_context_threads_matched: `{LAST_CONVERSATION_CONTEXT_V2_DIAGNOSTICS.get('matched_thread_count')}`",
+        f"- conversation_context_threads_suppressed: `{LAST_CONVERSATION_CONTEXT_V2_DIAGNOSTICS.get('suppressed_thread_count')}`",
         "- behavior_changes_applied: `none` (reporting only)",
     ]
     await send_safe_ephemeral_chunks(interaction, "\n".join(lines), limit=1700)
@@ -29372,6 +29515,10 @@ async def bnl_memory_check(interaction: discord.Interaction):
         f"- conversation_context_policy_exclusions: `{LAST_CONVERSATION_CONTEXT_V2_DIAGNOSTICS.get('visibility_policy_exclusions')}`",
         f"- conversation_context_final_chars: `{LAST_CONVERSATION_CONTEXT_V2_DIAGNOSTICS.get('final_char_count')}`",
         f"- conversation_context_reason: `{LAST_CONVERSATION_CONTEXT_V2_DIAGNOSTICS.get('selection_fallback_reason')}`",
+        f"- conversation_context_thread_focus: `{LAST_CONVERSATION_CONTEXT_V2_DIAGNOSTICS.get('thread_focus_mode')}`",
+        f"- conversation_context_payload_anchors: `{LAST_CONVERSATION_CONTEXT_V2_DIAGNOSTICS.get('current_payload_anchor_count')}`",
+        f"- conversation_context_threads_matched: `{LAST_CONVERSATION_CONTEXT_V2_DIAGNOSTICS.get('matched_thread_count')}`",
+        f"- conversation_context_threads_suppressed: `{LAST_CONVERSATION_CONTEXT_V2_DIAGNOSTICS.get('suppressed_thread_count')}`",
         f"- canon_source_compat_adapters: `{'yes' if (read_model_diag.get('canon_source_contract') or {}).get('compatibilityAdaptersActive') else 'no'}`",
         f"- queue_production_local_capability: `{'yes' if (read_model_diag.get('canon_source_contract') or {}).get('localQueueProductionCapability') else 'no'}`",
         f"- queue_production_website_capability: `{(read_model_diag.get('canon_source_contract') or {}).get('websiteQueueProductionCapability')}`",

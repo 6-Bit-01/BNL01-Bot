@@ -201,6 +201,50 @@ class V2ShadowAcceptanceTests(unittest.TestCase):
             snapshot["blockers"],
         )
 
+    def test_unrepaired_payload_grounding_failure_is_a_hard_blocker(self):
+        assessment = build_unified_response_assessment(
+            guild_id=1,
+            route_mode="normal_chat",
+            channel_policy="sealed_test",
+            conversation_surface="test",
+            current_speaker_user_ids=(99,),
+            prompt_lanes=("current_exchange", "conversation_context"),
+            current_exchange_source_ids=(1, 2),
+            current_payload_anchors=("dead channel", "open circuit"),
+            prior_thread_anchors=("ghost signal", "neon static"),
+            thread_focus_mode="new_thread",
+        )
+        persist_unified_assessment_shadow_run(
+            self.conn,
+            assessment,
+            response="Ghost Signal is the stronger title.",
+        )
+        self.conn.commit()
+
+        snapshot = self.snapshot(
+            {
+                "BNL_MEMORY_LEDGER_SHADOW_ENABLED": "true",
+                "BNL_MOMENT_ENGINE_SHADOW_ENABLED": "true",
+                "BNL_MEMORY_GOVERNANCE_SHADOW_ENABLED": "true",
+                "BNL_RELATIONSHIP_V2_SHADOW_ENABLED": "true",
+            }
+        )
+        report = snapshot["reports"]["unifiedResponseAssessment"]
+        self.assertEqual(report["payload_grounding_failure_runs"], 1)
+        self.assertEqual(
+            report["payload_grounding_status_counts"],
+            {"stale_thread_substitution": 1},
+        )
+        self.assertIn(
+            "unified_response_assessment:"
+            "payload_grounding_failure_runs",
+            snapshot["blockers"],
+        )
+        rendered = "\n".join(
+            render_v2_shadow_acceptance_lines(snapshot)
+        )
+        self.assertIn("grounding_failures=`1`", rendered)
+
     def test_missing_schemas_are_reported_without_creating_tables(self):
         empty = sqlite3.connect(":memory:")
         try:
