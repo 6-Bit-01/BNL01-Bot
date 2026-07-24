@@ -6,6 +6,7 @@ from bnl_unified_response_assessment import (
     ASSESSMENT_VERSION,
     build_evaluation_report,
     build_unified_response_assessment,
+    ensure_schema,
     persist_shadow_run,
     shadow_configuration,
 )
@@ -265,6 +266,132 @@ class UnifiedResponseAssessmentShadowTests(unittest.TestCase):
             self.assertEqual(
                 report["response_alignment_counts"],
                 {"visible_control_marker": 1},
+            )
+        finally:
+            conn.close()
+
+    def test_receipt_detects_stale_choice_even_when_lane_comparison_matches(self):
+        conn = sqlite3.connect(":memory:")
+        try:
+            assessment = build_unified_response_assessment(
+                guild_id=321,
+                route_mode="normal_chat",
+                channel_policy="sealed_test",
+                conversation_surface="test",
+                current_speaker_user_ids=(1,),
+                prompt_lanes=("current_exchange", "conversation_context"),
+                current_exchange_source_ids=(10, 11),
+                current_payload_anchors=("dead channel", "open circuit"),
+                prior_thread_anchors=("ghost signal", "neon static"),
+                thread_focus_mode="new_thread",
+            )
+            self.assertEqual(assessment.comparison_status, "match")
+
+            persist_shadow_run(
+                conn,
+                assessment,
+                response="Ghost Signal is the stronger hidden-zone title.",
+                created_at="2026-07-24T18:35:11+00:00",
+            )
+            persist_shadow_run(
+                conn,
+                assessment,
+                response="Dead Channel is the stronger hidden-zone title.",
+                guard_diagnostics={
+                    "current_payload_grounding_guard_triggered": True,
+                    "current_payload_grounding_regenerated": True,
+                },
+                created_at="2026-07-24T18:36:11+00:00",
+            )
+            conn.commit()
+
+            rows = conn.execute(
+                "SELECT payload_grounding_status, response_alignment, "
+                "current_payload_anchor_count, "
+                "current_payload_anchor_hit_count, "
+                "prior_thread_anchor_hit_count "
+                "FROM unified_response_assessment_shadow_runs "
+                "ORDER BY created_at"
+            ).fetchall()
+            self.assertEqual(
+                rows[0],
+                (
+                    "stale_thread_substitution",
+                    "payload_grounding_failure",
+                    2,
+                    0,
+                    1,
+                ),
+            )
+            self.assertEqual(
+                rows[1],
+                (
+                    "grounded_current_payload",
+                    "guard_repaired",
+                    2,
+                    1,
+                    0,
+                ),
+            )
+
+            report = build_evaluation_report(conn, guild_id=321)
+            self.assertEqual(report["runs"], 2)
+            self.assertEqual(
+                report["comparison_status_counts"],
+                {"match": 2},
+            )
+            self.assertEqual(
+                report["payload_grounding_status_counts"],
+                {
+                    "grounded_current_payload": 1,
+                    "stale_thread_substitution": 1,
+                },
+            )
+            self.assertEqual(report["payload_grounding_applicable_runs"], 2)
+            self.assertEqual(report["payload_grounding_failure_runs"], 1)
+            self.assertEqual(
+                report["thread_focus_mode_counts"],
+                {"new_thread": 2},
+            )
+            self.assertEqual(report["guard_triggered_runs"], 1)
+            self.assertEqual(report["guard_repaired_runs"], 1)
+        finally:
+            conn.close()
+
+    def test_existing_v1_receipt_table_is_migrated_additively(self):
+        conn = sqlite3.connect(":memory:")
+        try:
+            conn.execute(
+                """
+                CREATE TABLE unified_response_assessment_shadow_runs (
+                    run_id TEXT PRIMARY KEY,
+                    guild_id INTEGER NOT NULL,
+                    created_at TEXT NOT NULL
+                )
+                """
+            )
+
+            ensure_schema(conn)
+
+            columns = {
+                row[1]: row
+                for row in conn.execute(
+                    "PRAGMA table_info("
+                    "unified_response_assessment_shadow_runs)"
+                )
+            }
+            for column in (
+                "thread_focus_mode",
+                "current_payload_anchor_count",
+                "current_payload_anchor_hit_count",
+                "prior_thread_anchor_count",
+                "prior_thread_anchor_hit_count",
+                "payload_grounding_status",
+            ):
+                self.assertIn(column, columns)
+            self.assertEqual(
+                columns["payload_grounding_status"][4],
+                "'not_evaluated_legacy'",
             )
         finally:
             conn.close()

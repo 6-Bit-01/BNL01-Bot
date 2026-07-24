@@ -5,11 +5,17 @@ from datetime import datetime, timezone, timedelta
 from bnl_conversation_context_v2 import (
     CONVERSATION_CONTEXT_VERSION,
     ConversationContextRequest,
+    assess_payload_grounding,
     assemble_conversation_context_v2,
+    classify_thread_focus,
+    extract_current_payload_anchors,
+    extract_explicit_choice_anchors,
+    extract_prior_thread_anchors,
     immediate_room_recap_requested,
     normalize_text,
     sanitize_history_text,
     sanitize_speaker_name,
+    thread_resume_requested,
 )
 
 NOW = datetime(2026, 7, 16, 12, 0, tzinfo=timezone.utc)
@@ -36,6 +42,216 @@ def req(**kw):
     return ConversationContextRequest(**base)
 
 class ConversationContextV2Tests(unittest.TestCase):
+    def test_resume_wording_requires_an_actual_thread_reference(self):
+        self.assertFalse(
+            thread_resume_requested("Which title sounds older?")
+        )
+        self.assertTrue(
+            thread_resume_requested("Return to the older title question.")
+        )
+
+    def test_payload_anchor_matching_does_not_use_word_substrings(self):
+        result = assess_payload_grounding(
+            "The circuit opened successfully.",
+            current_payload_anchors=("open", "closed"),
+        )
+        self.assertEqual(result.status, "current_payload_unanswered")
+        self.assertEqual(result.current_anchor_hit_count, 0)
+
+    def test_named_choice_helpers_keep_current_and_prior_payloads_distinct(self):
+        current = (
+            'Compare “Dead Channel” with “Open Circuit”; '
+            "which title fits better?"
+        )
+        context = (
+            "Conversation continuity:\n"
+            'User/member: Pick Ghost Signal or Neon Static.\n'
+            "BNL-01: Ghost Signal is stronger.\n"
+            'User/member (current payload fragment): “Dead Channel” sounds abandoned.\n'
+            'User/member (current payload fragment): “Open Circuit” sounds active.'
+        )
+
+        self.assertEqual(
+            extract_explicit_choice_anchors(current),
+            ("dead channel", "open circuit"),
+        )
+        current_anchors = extract_current_payload_anchors(
+            current,
+            (context,),
+        )
+        self.assertEqual(current_anchors, ("dead channel", "open circuit"))
+        self.assertEqual(
+            extract_prior_thread_anchors(
+                (context,),
+                current_payload_anchors=current_anchors,
+            ),
+            ("ghost signal", "neon static"),
+        )
+        self.assertEqual(
+            classify_thread_focus(current, (context,)),
+            "new_thread",
+        )
+
+        stale = assess_payload_grounding(
+            "Ghost Signal is the better hidden-zone title.",
+            current_payload_anchors=current_anchors,
+            prior_thread_anchors=("ghost signal", "neon static"),
+        )
+        self.assertEqual(stale.status, "stale_thread_substitution")
+        self.assertTrue(stale.failed)
+
+    def test_fragmented_new_choice_suppresses_completed_old_choice_thread(self):
+        rows = [
+            row(
+                1,
+                "user",
+                "Pick one: Ghost Signal or Neon Static?",
+                user=1,
+                name="Jon",
+                minutes=8,
+            ),
+            row(
+                2,
+                "model",
+                "Ghost Signal is stronger than Neon Static.",
+                user=1,
+                minutes=7,
+            ),
+            row(
+                3,
+                "user",
+                "Dead Channel sounds abandoned.",
+                user=1,
+                name="Jon",
+                minutes=2,
+            ),
+            row(
+                4,
+                "user",
+                "I can handle the artwork.",
+                user=3,
+                name="Miss Bit",
+                minutes=1.5,
+            ),
+            row(
+                5,
+                "user",
+                "Open Circuit sounds active.",
+                user=2,
+                name="Avery",
+                minutes=1,
+            ),
+        ]
+
+        result = assemble_conversation_context_v2(
+            rows,
+            req(
+                current_texts=(
+                    "Which title fits a hidden test zone better, and why?",
+                ),
+            ),
+        )
+
+        self.assertEqual(result.thread_focus_mode, "new_thread")
+        self.assertEqual(result.current_payload_anchor_count, 2)
+        self.assertEqual(result.matched_thread_count, 0)
+        self.assertEqual(result.suppressed_thread_count, 1)
+        self.assertEqual(result.selected_row_ids, (3, 4, 5))
+        self.assertEqual(result.unpaired_row_count, 3)
+        self.assertIn("Dead Channel", result.rendered_context)
+        self.assertIn("Open Circuit", result.rendered_context)
+        self.assertIn("Miss Bit", result.rendered_context)
+        self.assertIn("I can handle the artwork", result.rendered_context)
+        self.assertNotIn("Ghost Signal", result.rendered_context)
+        self.assertNotIn("Neon Static", result.rendered_context)
+        self.assertIn(
+            "current_payload_new_thread",
+            result.selection_reasons,
+        )
+
+    def test_explicit_resume_reselects_older_thread_after_interruption(self):
+        rows = [
+            row(
+                1,
+                "user",
+                "Pick Ghost Signal or Neon Static.",
+                minutes=8,
+            ),
+            row(2, "model", "Ghost Signal wins.", minutes=7),
+            row(
+                3,
+                "user",
+                "The unrelated machine thread concerns restart logs.",
+                minutes=5,
+            ),
+            row(
+                4,
+                "model",
+                "Compare the first and second restart.",
+                minutes=4,
+            ),
+        ]
+
+        result = assemble_conversation_context_v2(
+            rows,
+            req(
+                current_texts=(
+                    "Go back to “Ghost Signal” or “Neon Static”; "
+                    "which title was stronger?",
+                ),
+            ),
+        )
+
+        self.assertEqual(result.thread_focus_mode, "resume_thread")
+        self.assertEqual(result.matched_thread_count, 1)
+        self.assertEqual(result.suppressed_thread_count, 1)
+        self.assertEqual(result.selected_row_ids, (1, 2))
+        self.assertIn("Ghost Signal wins", result.rendered_context)
+        self.assertNotIn("restart logs", result.rendered_context)
+
+    def test_explicit_combine_selects_multiple_named_threads(self):
+        rows = [
+            row(
+                1,
+                "user",
+                "Pick Ghost Signal or Neon Static.",
+                minutes=8,
+            ),
+            row(2, "model", "Ghost Signal wins.", minutes=7),
+            row(
+                3,
+                "user",
+                "Pick Dead Channel or Open Circuit.",
+                user=2,
+                name="Miss Bit",
+                minutes=5,
+            ),
+            row(
+                4,
+                "model",
+                "Open Circuit wins.",
+                user=2,
+                minutes=4,
+            ),
+        ]
+
+        result = assemble_conversation_context_v2(
+            rows,
+            req(
+                current_texts=(
+                    "Compare “Ghost Signal” with “Dead Channel” and "
+                    "combine both threads.",
+                ),
+            ),
+        )
+
+        self.assertEqual(result.thread_focus_mode, "combine_threads")
+        self.assertEqual(result.matched_thread_count, 2)
+        self.assertEqual(result.suppressed_thread_count, 0)
+        self.assertEqual(result.selected_row_ids, (1, 2, 3, 4))
+        self.assertIn("Ghost Signal wins", result.rendered_context)
+        self.assertIn("Open Circuit wins", result.rendered_context)
+
     def test_natural_room_recap_phrasing_is_participant_neutral(self):
         requests = (
             "What were Miss Bit and I just talking about?",

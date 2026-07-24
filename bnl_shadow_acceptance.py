@@ -522,6 +522,10 @@ def _empty_unified_assessment_report() -> Dict[str, Any]:
         "current_exchange_primary_runs": 0,
         "comparison_status_counts": {},
         "response_alignment_counts": {},
+        "thread_focus_mode_counts": {},
+        "payload_grounding_status_counts": {},
+        "payload_grounding_applicable_runs": 0,
+        "payload_grounding_failure_runs": 0,
         "prompt_overincluded_runs": 0,
         "prompt_underincluded_runs": 0,
         "prompt_different_runs": 0,
@@ -563,6 +567,9 @@ def _safe_context_report(diagnostics: Optional[Mapping[str, Any]]) -> Dict[str, 
         "current_message_duplicates_removed",
         "visibility_policy_exclusions",
         "final_char_count",
+        "current_payload_anchor_count",
+        "matched_thread_count",
+        "suppressed_thread_count",
     )
     result: Dict[str, Any] = {
         "scope": "process_last_run",
@@ -573,6 +580,9 @@ def _safe_context_report(diagnostics: Optional[Mapping[str, Any]]) -> Dict[str, 
             source.get("selection_fallback_reason") or "not_used"
         )[:96],
         "selection_reason_count": len(list(source.get("selection_reasons") or ())[:8]),
+        "thread_focus_mode": str(
+            source.get("thread_focus_mode") or "unclassified"
+        )[:64],
     }
     for key in numeric:
         result[key] = int(source.get(key) or 0)
@@ -788,6 +798,12 @@ def build_v2_shadow_acceptance_snapshot(
             unified_assessment_blockers.append(key)
     if unified_assessment.get("content_fields_present"):
         unified_assessment_blockers.append("content_fields_present")
+    if int(
+        unified_assessment.get("payload_grounding_failure_runs", 0) or 0
+    ):
+        unified_assessment_blockers.append(
+            "payload_grounding_failure_runs"
+        )
     if unified_assessment.get("reportError"):
         unified_assessment_blockers.append(
             "report_error:%s" % unified_assessment["reportError"]
@@ -949,10 +965,14 @@ def render_v2_shadow_acceptance_lines(snapshot: Mapping[str, Any]) -> List[str]:
         "- overall_status: `%s`" % snapshot.get("status", "unknown"),
         "- evaluation_order: `%s`" % " -> ".join(snapshot.get("evaluationOrder") or SHADOW_EVALUATION_ORDER),
         "- all_live_gates_clear: `%s`" % ("yes" if gates.get("all_live_gates_clear") else "NO - STOP"),
-        "- context_v2_preflight: `%s` scope=`process_last_run` same_room_pairs=`%s` cross_channel_pairs=`%s` fallback=`%s`" % (
+        "- context_v2_preflight: `%s` scope=`process_last_run` same_room_pairs=`%s` cross_channel_pairs=`%s` focus=`%s` payload_anchors=`%s` matched_threads=`%s` suppressed_threads=`%s` fallback=`%s`" % (
             (snapshot.get("conversationContextPreflight") or {}).get("status", "unknown"),
             context.get("same_room_paired_turn_count", 0),
             context.get("cross_channel_paired_turn_count", 0),
+            context.get("thread_focus_mode", "unclassified"),
+            context.get("current_payload_anchor_count", 0),
+            context.get("matched_thread_count", 0),
+            context.get("suppressed_thread_count", 0),
             context.get("selection_fallback_reason", "not_used"),
         ),
         "- ledger: status=`%s` shadow=`%s` receipts=`%s` inserted=`%s` deduplicated=`%s` skipped=`%s` errors=`%s` actual_rows=`%s` dangling_lineage=`%s` window_last=`%s`" % (
@@ -1016,7 +1036,7 @@ def render_v2_shadow_acceptance_lines(snapshot: Mapping[str, Any]) -> List[str]:
             relationship.get("moment_link_integrity_violations", 0),
         ),
         "- relationship_legacy_v2_comparison: `%s`" % relationship.get("legacy_v2_comparison", "not_collected"),
-        "- unified_assessment: requested=`%s` effective=`%s` reason=`%s` runs=`%s` current_primary=`%s` comparison=`%s` alignments=`%s` source_changes=`%s` guards=`%s/%s` visible_control_markers=`%s` errors=`%s` behavior_changes=`%s` new_authority=`%s` window_last=`%s`" % (
+        "- unified_assessment: requested=`%s` effective=`%s` reason=`%s` runs=`%s` current_primary=`%s` comparison=`%s` alignments=`%s` thread_focus=`%s` grounding=`%s` grounding_applicable=`%s` grounding_failures=`%s` source_changes=`%s` guards=`%s/%s` visible_control_markers=`%s` errors=`%s` behavior_changes=`%s` new_authority=`%s` window_last=`%s`" % (
             _on(unified_state.get("requested")),
             _on(unified_state.get("effective")),
             unified_state.get("reason", "disabled"),
@@ -1029,6 +1049,25 @@ def render_v2_shadow_acceptance_lines(snapshot: Mapping[str, Any]) -> List[str]:
             json.dumps(
                 unified_assessment.get("response_alignment_counts", {}),
                 sort_keys=True,
+            ),
+            json.dumps(
+                unified_assessment.get("thread_focus_mode_counts", {}),
+                sort_keys=True,
+            ),
+            json.dumps(
+                unified_assessment.get(
+                    "payload_grounding_status_counts",
+                    {},
+                ),
+                sort_keys=True,
+            ),
+            unified_assessment.get(
+                "payload_grounding_applicable_runs",
+                0,
+            ),
+            unified_assessment.get(
+                "payload_grounding_failure_runs",
+                0,
             ),
             unified_assessment.get("source_basis_changed_runs", 0),
             unified_assessment.get("guard_triggered_runs", 0),
