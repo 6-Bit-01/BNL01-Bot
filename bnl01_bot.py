@@ -8396,11 +8396,29 @@ def build_contextual_followthrough_correction_prompt(prompt: str) -> str:
     )
 
 
-def build_current_payload_grounding_correction_prompt(prompt: str) -> str:
+def build_current_payload_grounding_correction_prompt(
+    prompt: str,
+    current_payload_anchors=(),
+) -> str:
+    resolved = tuple(
+        dict.fromkeys(
+            str(anchor or "").strip()
+            for anchor in current_payload_anchors or ()
+            if str(anchor or "").strip()
+        )
+    )
+    resolved_line = (
+        "\nResolved current alternatives: "
+        + " | ".join(f"“{anchor}”" for anchor in resolved)
+        + "."
+        if resolved
+        else ""
+    )
     return (
         (prompt or "")
         + "\n\nCURRENT-PAYLOAD CORRECTION REQUIRED: The previous draft did not answer the named alternatives in the current exchange. "
-        + "Answer the current choice, comparison, or selection directly and explicitly name at least one of its current alternatives. "
+        + resolved_line
+        + "\nAnswer the current choice, comparison, or selection directly. In the first sentence, explicitly name at least one resolved current alternative; if choosing both or neither, name both. "
         + "Messages labeled as current payload fragments belong to this request even when another member supplied one of them. "
         + "Do not substitute names or options from an older completed exchange unless the current request explicitly resumes or combines that thread."
     )
@@ -26753,7 +26771,10 @@ async def apply_guarded_response_regeneration(
             )
             return "", diagnostics
         regenerated = await regenerate(
-            build_current_payload_grounding_correction_prompt(prompt)
+            build_current_payload_grounding_correction_prompt(
+                prompt,
+                current_payload_anchors,
+            )
         )
         diagnostics["current_payload_grounding_regenerated"] = True
         regenerated = (regenerated or "").strip()
@@ -26762,6 +26783,14 @@ async def apply_guarded_response_regeneration(
             regenerated_grounding.status
         )
         if retry_has_guard_failure(regenerated):
+            logging.warning(
+                "current_payload_grounding_regeneration_result "
+                "status=%s outcome=suppressed route_mode=%s "
+                "channel_policy=%s",
+                regenerated_grounding.status,
+                route_mode,
+                channel_policy,
+            )
             diagnostics.update(
                 {
                     "suppressed": True,
@@ -26772,6 +26801,13 @@ async def apply_guarded_response_regeneration(
                 }
             )
             return "", diagnostics
+        logging.info(
+            "current_payload_grounding_regeneration_result "
+            "status=%s outcome=repaired route_mode=%s channel_policy=%s",
+            regenerated_grounding.status,
+            route_mode,
+            channel_policy,
+        )
         response = regenerated
     # No provider await may occur after this source-of-truth recheck. If a
     # deletion, clear, or correction changed the supporting rows during any

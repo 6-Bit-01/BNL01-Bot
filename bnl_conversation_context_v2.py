@@ -83,7 +83,7 @@ _TITLE_CHOICE_RE = re.compile(
     r"(?:\s+[A-Z][A-Za-z0-9'’\-]*){0,4})"
 )
 _BETWEEN_TITLE_CHOICE_RE = re.compile(
-    r"\bbetween\s+"
+    r"(?i:\bbetween)\s+"
     r"(?P<first>[A-Z][A-Za-z0-9'’\-]*(?:\s+[A-Z][A-Za-z0-9'’\-]*){0,3})"
     r"\s+and\s+"
     r"(?P<second>[A-Z][A-Za-z0-9'’\-]*(?:\s+[A-Z][A-Za-z0-9'’\-]*){0,3})"
@@ -344,6 +344,51 @@ def _extract_named_anchors(text: str) -> tuple[str, ...]:
     )[:8]
 
 
+def _current_choice_reference_present(
+    response: str,
+    *,
+    option_count: int,
+) -> bool:
+    """Recognize unambiguous references to alternatives in the current turn.
+
+    A natural answer does not always repeat an option verbatim.  With an
+    explicit bounded choice in the current turn, "the latter" or "the second
+    option" is still grounded.  Keep this deliberately narrower than general
+    pronoun resolution so an unrelated "that one" cannot satisfy the guard.
+    """
+    if option_count < 2:
+        return False
+    normalized = normalize_text(response)
+    if not normalized:
+        return False
+    reference_patterns = [
+        r"\b(?:the\s+)?first\s+(?:one|option|choice|title|name|label|version|idea|concept)\b",
+        r"\b(?:option|choice|title|name|label|version|idea|concept)\s+(?:one|1)\b",
+        r"\b(?:the\s+)?1st\s+(?:one|option|choice|title|name|label|version|idea|concept)\b",
+        r"\b(?:the\s+)?second\s+(?:one|option|choice|title|name|label|version|idea|concept)\b",
+        r"\b(?:option|choice|title|name|label|version|idea|concept)\s+(?:two|2)\b",
+        r"\b(?:the\s+)?2nd\s+(?:one|option|choice|title|name|label|version|idea|concept)\b",
+    ]
+    if option_count == 2:
+        reference_patterns.extend(
+            (
+                r"\b(?:the\s+)?former(?:\s+(?:one|option|choice|title|name))?\b",
+                r"\b(?:the\s+)?latter(?:\s+(?:one|option|choice|title|name))?\b",
+                r"\b(?:both|neither|either)\s+(?:one|option|choice|title|name)s?\b",
+                r"^(?:both|neither|either)\b",
+            )
+        )
+    if option_count >= 3:
+        reference_patterns.extend(
+            (
+                r"\b(?:the\s+)?third\s+(?:one|option|choice|title|name|label|version|idea|concept)\b",
+                r"\b(?:option|choice|title|name|label|version|idea|concept)\s+(?:three|3)\b",
+                r"\b(?:the\s+)?3rd\s+(?:one|option|choice|title|name|label|version|idea|concept)\b",
+            )
+        )
+    return any(re.search(pattern, normalized) for pattern in reference_patterns)
+
+
 def extract_explicit_choice_anchors(text: str) -> tuple[str, ...]:
     """Extract alternatives only when the text actually requests a choice."""
     anchors = _extract_named_anchors(text)
@@ -501,6 +546,11 @@ def assess_payload_grounding(
         status = "grounded_current_payload"
     elif prior_hits:
         status = "stale_thread_substitution"
+    elif _current_choice_reference_present(
+        response,
+        option_count=len(current),
+    ):
+        status = "grounded_current_payload_reference"
     else:
         status = "current_payload_unanswered"
     return PayloadGroundingAssessment(
