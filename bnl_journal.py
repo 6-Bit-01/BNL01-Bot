@@ -6,11 +6,21 @@ import re
 import sqlite3
 import urllib.error
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, is_dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Optional
 
-from bnl_journal_source_store import journal_release_privacy_fence
+from bnl_canon_source_contract import (
+    CANON_FACTS,
+    CANON_SOURCE_CONTRACT_VERSION,
+    Confidence,
+    SourceClass,
+    Visibility,
+)
+from bnl_journal_source_store import (
+    journal_release_privacy_fence,
+    timestamp_to_epoch_ms,
+)
 
 PUBLIC_POLICIES = {"public_home", "public_context", "public_selective"}
 SCHEDULED_PREPARED_STATE = "prepared_exact"
@@ -38,12 +48,22 @@ MAX_CONVERSATION_SOURCES_PER_WINDOW = 2_000
 MAX_PROMPT_SOURCES = 180
 MAX_BROADCAST_MEMORY_CONTEXT = 8
 MAX_RUMOR_CONTEXT = 4
+MAX_REFLECTION_SOURCE_CONTEXT = 8
+MAX_REFLECTION_MEMORY_CONTEXT = 4
+MAX_REFLECTION_CANON_CONTEXT = 4
 JOURNAL_PUBLIC_BROADCAST_SCOPES = {"ambient", "direct", "journal", "relay", "show_status"}
 JOURNAL_CONTEXT_LANE_TYPES = {
     "established_broadcast_memory",
     "community_rumor",
     "bnl_inference",
 }
+JOURNAL_REFLECTION_BASIS_KINDS = {
+    "public_source_history",
+    "accepted_relay_continuity",
+    "established_broadcast_memory",
+    "approved_canon",
+}
+JOURNAL_REFLECTION_SCOPE = "historical_or_canon"
 JOURNAL_TOPIC_STOPWORDS = {
     "about", "after", "again", "being", "could", "from", "have", "into", "just", "more", "other", "their",
     "there", "these", "they", "this", "through", "under", "where", "which", "while", "with", "would", "someone",
@@ -132,6 +152,14 @@ _REPAIR_GUIDANCE = {
         "The prose appears to use established memory, rumor, or BNL inference without declaring traceable metadata.contextUses. Add the correct "
         "context use with supplied basis refs, or remove that unsupported interpretation."
     ),
+    "current_activity_without_fresh_source": (
+        "Remove every implication that historical or canon material happened in the current Journal window. "
+        "A reflective section may discuss only the supplied historical/canon basis unless it cites a fresh current-window source."
+    ),
+    "reflection_scope_not_explicit": (
+        "Frame the reflection explicitly as approved canon, an earlier public record, archive history, or established continuity. "
+        "Do not leave historical material sounding like an event in the current Journal window."
+    ),
 }
 
 _OVERLY_CLINICAL_PATTERNS = (
@@ -181,6 +209,18 @@ _SENSITIVE_PERSONAL_PATTERNS = (
     r"\binterpersonal conflicts?\b",
     r"\bjuveniles?\b",
     r"\bfoster (?:obligations?|care|duties)\b",
+)
+
+_CURRENT_WINDOW_CLAIM_RE = re.compile(
+    r"\b(?:today|tonight|yesterday|last\s+night|right\s+now|currently|this\s+(?:day|week|window)|"
+    r"during\s+(?:this|the\s+current)\s+(?:day|week|window)|in\s+the\s+current\s+window)\b",
+    re.IGNORECASE,
+)
+_REFLECTION_SCOPE_CUE_RE = re.compile(
+    r"\b(?:approved\s+canon|canon(?:ical)?|record(?:ed)?|archive(?:d)?|historical|"
+    r"earlier|previous(?:ly)?|prior|long[- ]standing|established|continuity|"
+    r"remembered|preserved|has\s+long)\b",
+    re.IGNORECASE,
 )
 
 
@@ -369,7 +409,28 @@ def purge_user_journal_derivatives_on_connection(
                 unpublished.add(key)
                 continue
 
-            target_ref_ids = {str(item.get("refId")) for item in target_supporting if item.get("refId")}
+            used_reflection_provenance = metadata.get(
+                "usedReflectionBasisProvenance"
+            )
+            used_reflection_provenance = (
+                used_reflection_provenance
+                if isinstance(used_reflection_provenance, dict)
+                else {}
+            )
+            target_reflection = [
+                item
+                for item in used_reflection_provenance.get(
+                    "historicalSourceEvents",
+                    [],
+                )
+                if isinstance(item, dict)
+                and str(item.get("subjectRef") or "") == subject_ref
+            ]
+            target_ref_ids = {
+                str(item.get("refId"))
+                for item in [*target_supporting, *target_reflection]
+                if item.get("refId")
+            }
             metadata["supportingConversationRefs"] = [
                 item for item in supporting if str(item.get("subjectRef") or "") != subject_ref
             ]
@@ -391,8 +452,14 @@ def purge_user_journal_derivatives_on_connection(
             for key_name in (
                 "topicTags", "continuityNotes", "unresolvedQuestions", "recurringTopicCounts",
                 "contextUses", "usedGenerationContextLanes", "usedContextLaneProvenance",
+                "usedReflectionBasis", "usedReflectionBasisProvenance",
             ):
-                metadata[key_name] = {} if key_name in {"recurringTopicCounts", "usedGenerationContextLanes", "usedContextLaneProvenance"} else []
+                metadata[key_name] = {} if key_name in {
+                    "recurringTopicCounts",
+                    "usedGenerationContextLanes",
+                    "usedContextLaneProvenance",
+                    "usedReflectionBasisProvenance",
+                } else []
             metadata["privacyScrubbed"] = True
             conn.execute(
                 """UPDATE bnl_journal_private_metadata SET metadata_json=?,updated_at=?
@@ -1038,6 +1105,8 @@ def _approved_journal_broadcast_memory(
     source_window_end: str,
     *,
     limit: int = MAX_BROADCAST_MEMORY_CONTEXT,
+    require_fresh_match: bool = True,
+    ref_prefix: str = "memory",
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Return generation-safe established records plus private row provenance.
 
@@ -1097,9 +1166,11 @@ def _approved_journal_broadcast_memory(
         matched_refs = sorted(
             ref_id for ref_id, terms in source_terms.items() if len(memory_terms & terms) >= 2
         )
-        if not matched_refs:
+        if require_fresh_match and not matched_refs:
             continue
-        lane_ref = "memory:" + _hash("journal-memory", guild_id, int(row_id))[:16]
+        lane_ref = str(ref_prefix or "memory").rstrip(":") + ":" + _hash(
+            "journal-memory", guild_id, int(row_id)
+        )[:16]
         safe_records.append({
             "laneRefId": lane_ref,
             "epistemicStatus": "established_network_record",
@@ -1416,6 +1487,462 @@ def _finalize_context_lanes_for_safe_sources(
         if selected:
             finalized_provenance[key] = selected
     return finalized, finalized_provenance
+
+
+def journal_source_packet_has_meaningful_activity(packet: dict[str, Any]) -> bool:
+    """Preserve the established threshold used by scheduled Journal automation."""
+    counts = packet.get("aggregateCounts") or {}
+    total = int(counts.get("eligibleRelays") or 0) + int(
+        counts.get("eligibleConversations") or 0
+    )
+    if total < 5:
+        return False
+    if int(counts.get("eligibleConversations") or 0) > 0:
+        return True
+    quiet_markers = {
+        "quiet",
+        "quiet_source",
+        "non_event_stock",
+        "heartbeat",
+        "hydrated",
+    }
+    return any(
+        str(source.get("eventType") or "").lower() not in quiet_markers
+        for source in packet.get("privateSources", [])
+    )
+
+
+def _stable_reflection_sample(
+    items: list[dict[str, Any]],
+    limit: int,
+    seed: str,
+    *,
+    diversity_key: str,
+) -> list[dict[str, Any]]:
+    if limit <= 0 or len(items) <= limit:
+        return sorted(
+            items,
+            key=lambda item: (
+                str(item.get("sourceObservedAt") or ""),
+                str(item.get("refId") or ""),
+            ),
+        )
+    ranked = sorted(
+        items,
+        key=lambda item: (
+            _hash(seed, item.get("refId") or ""),
+            str(item.get("refId") or ""),
+        ),
+    )
+    selected: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for item in ranked:
+        diversity_value = str(item.get(diversity_key) or "")
+        if diversity_value and diversity_value in seen:
+            continue
+        selected.append(item)
+        if diversity_value:
+            seen.add(diversity_value)
+        if len(selected) >= limit:
+            break
+    if len(selected) < limit:
+        selected_refs = {str(item.get("refId") or "") for item in selected}
+        selected.extend(
+            item
+            for item in ranked
+            if str(item.get("refId") or "") not in selected_refs
+        )
+    return sorted(
+        selected[:limit],
+        key=lambda item: (
+            str(item.get("sourceObservedAt") or ""),
+            str(item.get("refId") or ""),
+        ),
+    )
+
+
+def _historical_source_reflection_basis(
+    db_path: str,
+    guild_id: int,
+    source_window_start: str,
+    source_window_end: str,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Project prior eligible archive rows without treating them as fresh evidence."""
+    window_start_ms = timestamp_to_epoch_ms(source_window_start)
+    if window_start_ms is None:
+        return [], []
+    history_start_ms = max(0, window_start_ms - int(timedelta(days=90).total_seconds() * 1000))
+    with sqlite3.connect(db_path) as conn:
+        if not table_exists(conn, "bnl_journal_source_events"):
+            return [], []
+        rows = conn.execute(
+            """
+            SELECT event_seq,source_kind,source_key,occurred_at_ms,channel_policy,
+                   subject_ref,private_display_name,sanitized_summary,content_hash,
+                   metadata_json
+            FROM bnl_journal_source_events
+            WHERE guild_id=? AND public_usable=1
+              AND occurred_at_ms>=? AND occurred_at_ms<?
+              AND source_kind IN ('discord_message','website_relay')
+              AND TRIM(sanitized_summary)<>''
+            ORDER BY occurred_at_ms DESC,event_seq DESC
+            LIMIT 500
+            """,
+            (int(guild_id), history_start_ms, window_start_ms),
+        ).fetchall()
+    private_names = [
+        str(row[6] or "").strip()
+        for row in rows
+        if str(row[6] or "").strip()
+    ]
+    safe_candidates: list[dict[str, Any]] = []
+    provenance_by_ref: dict[str, dict[str, Any]] = {}
+    quiet_markers = {
+        "quiet",
+        "quiet_source",
+        "non_event_stock",
+        "heartbeat",
+        "hydrated",
+    }
+    unsafe_lane_re = re.compile(
+        r"\b(?:admin|mod(?:erator)?|payment|queue(?:_test)?|sealed(?:_test)?|"
+        r"internal(?:_controlled)?|research|planning|r&d)\b",
+        re.IGNORECASE,
+    )
+    for row in rows:
+        (
+            event_seq,
+            source_kind,
+            source_key,
+            occurred_at_ms,
+            channel_policy,
+            subject_ref,
+            private_display_name,
+            sanitized_summary,
+            content_hash,
+            metadata_json,
+        ) = row
+        kind = str(source_kind or "")
+        policy = str(channel_policy or "")
+        if kind == "discord_message" and policy not in PUBLIC_POLICIES:
+            continue
+        if kind == "website_relay" and policy not in {"", "public_relay"}:
+            continue
+        try:
+            metadata = json.loads(metadata_json or "{}")
+        except (TypeError, json.JSONDecodeError):
+            metadata = {}
+        metadata = metadata if isinstance(metadata, dict) else {}
+        event_type = str(metadata.get("event_type") or metadata.get("eventType") or "")
+        eligibility_text = " ".join(
+            [
+                policy,
+                event_type,
+                str(metadata.get("mode") or ""),
+                str(metadata.get("relay_lane") or metadata.get("relayLane") or ""),
+            ]
+        )
+        if unsafe_lane_re.search(eligibility_text):
+            continue
+        if kind == "website_relay" and event_type.lower() in quiet_markers:
+            continue
+        summary = sanitize_source_summary(
+            str(sanitized_summary or ""),
+            private_names,
+            limit=600,
+        )
+        if (
+            not summary
+            or _RUMOR_SENSITIVE_RE.search(summary)
+            or any(
+                re.search(pattern, summary, re.IGNORECASE)
+                for pattern in _SENSITIVE_PERSONAL_PATTERNS
+            )
+        ):
+            continue
+        observed_at = (
+            datetime.fromtimestamp(
+                int(occurred_at_ms) / 1000.0,
+                tz=timezone.utc,
+            )
+            .replace(microsecond=0)
+            .isoformat()
+            .replace("+00:00", "Z")
+        )
+        ref_id = f"reflection:event:{int(event_seq)}"
+        basis_kind = (
+            "public_source_history"
+            if kind == "discord_message"
+            else "accepted_relay_continuity"
+        )
+        safe_candidates.append(
+            {
+                "refId": ref_id,
+                "basisKind": basis_kind,
+                "summary": summary,
+                "sourceType": kind,
+                "sourceVersion": str(content_hash or ""),
+                "sourceObservedAt": observed_at,
+                "scope": JOURNAL_REFLECTION_SCOPE,
+                "publicSafe": True,
+                "reuseEligible": True,
+                "_diversityKey": (
+                    str(subject_ref or "")
+                    if kind == "discord_message"
+                    else event_type or str(source_key or "")
+                ),
+            }
+        )
+        provenance_by_ref[ref_id] = {
+            "refId": ref_id,
+            "sourceTable": "bnl_journal_source_events",
+            "eventSeq": int(event_seq),
+            "sourceKind": kind,
+            "sourceKey": str(source_key or ""),
+            "subjectRef": str(subject_ref or ""),
+            "privateDisplayName": str(private_display_name or ""),
+            "channelPolicy": policy,
+            "occurredAtMs": int(occurred_at_ms),
+            "contentHash": str(content_hash or ""),
+        }
+
+    conversations = [
+        item
+        for item in safe_candidates
+        if item.get("basisKind") == "public_source_history"
+    ]
+    relays = [
+        item
+        for item in safe_candidates
+        if item.get("basisKind") == "accepted_relay_continuity"
+    ]
+    seed = _hash("journal-reflection-history", guild_id, source_window_end)
+    selected = _stable_reflection_sample(
+        conversations,
+        min(5, MAX_REFLECTION_SOURCE_CONTEXT),
+        seed + ":conversation",
+        diversity_key="_diversityKey",
+    )
+    selected.extend(
+        _stable_reflection_sample(
+            relays,
+            min(3, MAX_REFLECTION_SOURCE_CONTEXT - len(selected)),
+            seed + ":relay",
+            diversity_key="_diversityKey",
+        )
+    )
+    if len(selected) < MAX_REFLECTION_SOURCE_CONTEXT:
+        selected_refs = {str(item.get("refId") or "") for item in selected}
+        remainder = [
+            item
+            for item in safe_candidates
+            if str(item.get("refId") or "") not in selected_refs
+        ]
+        selected.extend(
+            _stable_reflection_sample(
+                remainder,
+                MAX_REFLECTION_SOURCE_CONTEXT - len(selected),
+                seed + ":remainder",
+                diversity_key="_diversityKey",
+            )
+        )
+    selected = sorted(
+        selected[:MAX_REFLECTION_SOURCE_CONTEXT],
+        key=lambda item: (
+            str(item.get("sourceObservedAt") or ""),
+            str(item.get("refId") or ""),
+        ),
+    )
+    public_records = [
+        {key: value for key, value in item.items() if not key.startswith("_")}
+        for item in selected
+    ]
+    provenance = [
+        provenance_by_ref[str(item["refId"])]
+        for item in public_records
+        if str(item.get("refId") or "") in provenance_by_ref
+    ]
+    return public_records, provenance
+
+
+def _broadcast_memory_reflection_basis(
+    db_path: str,
+    guild_id: int,
+    source_window_end: str,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    with sqlite3.connect(db_path) as conn:
+        safe_records, provenance = _approved_journal_broadcast_memory(
+            conn,
+            guild_id,
+            [],
+            source_window_end,
+            limit=MAX_REFLECTION_MEMORY_CONTEXT,
+            require_fresh_match=False,
+            ref_prefix="reflection:memory",
+        )
+    provenance_by_ref = {
+        str(item.get("laneRefId") or ""): item
+        for item in provenance
+        if isinstance(item, dict) and item.get("laneRefId")
+    }
+    window_end = _parse_context_datetime(source_window_end)
+    selected_records: list[dict[str, Any]] = []
+    selected_provenance: list[dict[str, Any]] = []
+    for item in safe_records:
+        ref_id = str(item.get("laneRefId") or "")
+        private_item = provenance_by_ref.get(ref_id)
+        source_time = (
+            _parse_context_datetime(private_item.get("createdAt"))
+            if isinstance(private_item, dict)
+            else None
+        )
+        if not ref_id or source_time is None or (window_end and source_time >= window_end):
+            continue
+        selected_records.append(
+            {
+                "refId": ref_id,
+                "basisKind": "established_broadcast_memory",
+                "summary": str(item.get("summary") or "")[:600],
+                "sourceType": "broadcast_memory",
+                "sourceVersion": str(private_item.get("eligibilityHash") or ""),
+                "sourceObservedAt": source_time.replace(microsecond=0)
+                .isoformat()
+                .replace("+00:00", "Z"),
+                "scope": JOURNAL_REFLECTION_SCOPE,
+                "publicSafe": True,
+                "reuseEligible": True,
+            }
+        )
+        selected_provenance.append(
+            {
+                **private_item,
+                "refId": ref_id,
+            }
+        )
+    return selected_records, selected_provenance
+
+
+def _canon_value_text(value: Any) -> str:
+    if is_dataclass(value):
+        value = asdict(value)
+    if isinstance(value, dict):
+        return "; ".join(
+            f"{str(key).replace('_', ' ')}: {_canon_value_text(item)}"
+            for key, item in value.items()
+        )
+    if isinstance(value, (list, tuple, set)):
+        return ", ".join(_canon_value_text(item) for item in value)
+    return str(value or "").strip()
+
+
+def _canon_fact_is_reflection_safe(fact: Any) -> bool:
+    if (
+        getattr(fact, "source_class", None) != SourceClass.APPROVED_CANON
+        or getattr(fact, "visibility", None)
+        not in {Visibility.PUBLIC, Visibility.PUBLIC_SAFE, Visibility.REFERENCE_CANON}
+        or getattr(fact, "confidence", None) != Confidence.APPROVED
+    ):
+        return False
+    subject_key = str(getattr(getattr(fact, "subject", None), "key", "") or "")
+    claim_text = " ".join(
+        [
+            str(getattr(fact, "predicate", "") or ""),
+            _canon_value_text(getattr(fact, "value", "")),
+        ]
+    )
+    return not (
+        subject_key == "6_bit"
+        and re.search(r"\b(?:music\s+)?producer\b", claim_text, re.IGNORECASE)
+    )
+
+
+def _approved_canon_reflection_basis(
+    guild_id: int,
+    source_window_end: str,
+) -> list[dict[str, Any]]:
+    candidates: list[dict[str, Any]] = []
+    for fact in CANON_FACTS:
+        if not _canon_fact_is_reflection_safe(fact):
+            continue
+        subject = getattr(fact, "subject", None)
+        subject_key = str(getattr(subject, "key", "") or "")
+        subject_name = str(getattr(subject, "name", "") or "")
+        predicate = str(getattr(fact, "predicate", "") or "")
+        value = _canon_value_text(getattr(fact, "value", ""))
+        if not subject_key or not subject_name or not predicate or not value:
+            continue
+        ref_id = "reflection:canon:" + _hash(
+            CANON_SOURCE_CONTRACT_VERSION,
+            subject_key,
+            predicate,
+            value,
+        )[:20]
+        candidates.append(
+            {
+                "refId": ref_id,
+                "basisKind": "approved_canon",
+                "summary": (
+                    f"{subject_name} {predicate.replace('_', ' ')}: "
+                    f"{value.rstrip('.')}."
+                )[:600],
+                "sourceType": "approved_canon",
+                "sourceVersion": CANON_SOURCE_CONTRACT_VERSION,
+                "scope": JOURNAL_REFLECTION_SCOPE,
+                "publicSafe": True,
+                "reuseEligible": True,
+                "canonSubject": subject_key,
+                "canonPredicate": predicate,
+            }
+        )
+    prioritized = sorted(
+        candidates,
+        key=lambda item: (
+            0
+            if (
+                item.get("canonSubject") == "galaknoise"
+                and item.get("canonPredicate") == "primary_role"
+            )
+            else 1
+            if item.get("canonSubject") == "6_bit"
+            else 2,
+            _hash(
+                "journal-reflection-canon",
+                guild_id,
+                source_window_end,
+                item.get("refId") or "",
+            ),
+        ),
+    )
+    return prioritized[:MAX_REFLECTION_CANON_CONTEXT]
+
+
+def _build_reflection_basis(
+    db_path: str,
+    guild_id: int,
+    source_window_start: str,
+    source_window_end: str,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    historical, historical_provenance = _historical_source_reflection_basis(
+        db_path,
+        guild_id,
+        source_window_start,
+        source_window_end,
+    )
+    memory, memory_provenance = _broadcast_memory_reflection_basis(
+        db_path,
+        guild_id,
+        source_window_end,
+    )
+    private_provenance: dict[str, Any] = {}
+    if historical_provenance:
+        private_provenance["historicalSourceEvents"] = historical_provenance
+    if memory_provenance:
+        private_provenance["establishedBroadcastMemory"] = memory_provenance
+    return [
+        *historical,
+        *memory,
+        *_approved_canon_reflection_basis(guild_id, source_window_end),
+    ], private_provenance
 
 
 def _identity_literal_pattern(name: str) -> Optional[re.Pattern[str]]:
@@ -1969,6 +2496,36 @@ def build_packet_from_sources(
         end,
         safe_sources,
     )
+    if (
+        packet["entryKind"] in {"daily", "weekly"}
+        and not journal_source_packet_has_meaningful_activity(packet)
+    ):
+        reflection_basis, private_reflection_provenance = _build_reflection_basis(
+            db_path,
+            guild_id,
+            start,
+            end,
+        )
+        packet["lowActivityMode"] = True
+        packet["reflectionBasis"] = reflection_basis
+        packet["reflectionBasisContract"] = {
+            "version": 1,
+            "scope": JOURNAL_REFLECTION_SCOPE,
+            "basisKinds": sorted(JOURNAL_REFLECTION_BASIS_KINDS),
+            "basisDoesNotCountAsFresh": True,
+            "currentActivityClaimsRequireFreshSource": True,
+        }
+        packet["privateReflectionBasisProvenance"] = (
+            private_reflection_provenance
+        )
+        packet["evidenceCoverageContract"] = {
+            **packet["evidenceCoverageContract"],
+            "minimumDistinctFreshSources": 0,
+            "requiredSourceKinds": [],
+            "minimumDistinctParticipants": 0,
+            "minimumDistinctWindowSegments": 0,
+            "lowActivityReflectionMode": True,
+        }
     packet["generationContextLanes"] = context_lanes
     packet["privateContextLaneProvenance"] = private_lane_provenance
     packet["history"] = retrieve_history(
@@ -2165,10 +2722,38 @@ def _bounded_history_for_prompt(history: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _eligible_reflection_basis(packet: dict[str, Any]) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    seen_refs: set[str] = set()
+    for item in packet.get("reflectionBasis", []):
+        if not isinstance(item, dict):
+            continue
+        ref_id = str(item.get("refId") or "")
+        if (
+            not ref_id.startswith("reflection:")
+            or ref_id in seen_refs
+            or str(item.get("basisKind") or "") not in JOURNAL_REFLECTION_BASIS_KINDS
+            or str(item.get("scope") or "") != JOURNAL_REFLECTION_SCOPE
+            or item.get("publicSafe") is not True
+            or item.get("reuseEligible") is not True
+            or not str(item.get("summary") or "").strip()
+            or not (
+                str(item.get("sourceVersion") or "").strip()
+                or str(item.get("sourceObservedAt") or "").strip()
+            )
+        ):
+            continue
+        records.append(item)
+        seen_refs.add(ref_id)
+    return records
+
+
 def build_generation_prompt(packet: dict[str, Any], *, repair_reason: str = "", previous_output: str = "") -> str:
     entry_kind = str(packet.get("entryKind") or "manual")
+    low_activity = bool(packet.get("lowActivityMode"))
     context_lanes = packet.get("generationContextLanes") if isinstance(packet.get("generationContextLanes"), dict) else {}
     safe_sources = packet.get("safeSources", [])[:MAX_PROMPT_SOURCES]
+    reflection_basis = _eligible_reflection_basis(packet)
     coverage_contract = packet.get("evidenceCoverageContract")
     if not isinstance(coverage_contract, dict):
         coverage_contract = build_evidence_coverage_contract(
@@ -2195,11 +2780,36 @@ def build_generation_prompt(packet: dict[str, Any], *, repair_reason: str = "", 
         "windowSegmentActivity": packet.get("windowSegmentActivity", []),
         "privateGenerationContextLanes": context_lanes,
     }
-    cadence_rule = (
-        "\nThis is a weekly synthesis. Connect patterns across the six supplied Tuesday-Sunday Daily-period contexts, the fresh final Sunday-to-Monday period, and the full current source evidence. A source-only period context is not a hidden Daily article. Do not list period recaps."
-        if entry_kind == "weekly"
-        else "\nThis is a daily chronicle covering one complete source window. Distill the day instead of listing every relay."
-    )
+    if low_activity:
+        safe_packet["reflectionBasis"] = reflection_basis
+        safe_packet["reflectionBasisContract"] = packet.get(
+            "reflectionBasisContract",
+            {},
+        )
+        safe_packet["editorialContract"] = {
+            "requiresFirstPersonReaction": False,
+            "requiredBeatsAcrossEntry": [
+                "verifiedHistoricalOrCanonGrounding",
+                "coherentReflection",
+                "bnlReaction",
+            ],
+            "fixedSectionTemplate": False,
+            "sameVoiceAndQualityBar": True,
+        }
+    if low_activity and entry_kind == "weekly":
+        cadence_rule = (
+            "\nThis is a weekly synthesis. The six supplied Tuesday-Sunday Daily-period contexts and final Sunday-to-Monday period describe coverage structure, not proof of activity. Use a period's details only when a fresh sourceRefId supports them; otherwise build a coherent grounded reflection from reflectionBasis without inventing a weekly event. A source-only period context is not a hidden Daily article. Do not list period recaps."
+        )
+    elif low_activity:
+        cadence_rule = (
+            "\nThis is a daily Journal entry covering one complete source window. Low activity does not cancel the entry and does not authorize a claim that something happened in that window. Build a coherent grounded reflection from the supplied basis, using current-window material only when a fresh sourceRefId supports it."
+        )
+    else:
+        cadence_rule = (
+            "\nThis is a weekly synthesis. Connect patterns across the six supplied Tuesday-Sunday Daily-period contexts, the fresh final Sunday-to-Monday period, and the full current source evidence. A source-only period context is not a hidden Daily article. Do not list period recaps."
+            if entry_kind == "weekly"
+            else "\nThis is a daily chronicle covering one complete source window. Distill the day instead of listing every relay."
+        )
     repair = ""
     if repair_reason:
         guidance = _REPAIR_GUIDANCE.get(
@@ -2225,29 +2835,69 @@ def build_generation_prompt(packet: dict[str, Any], *, repair_reason: str = "", 
         if context_lanes
         else "\nNo optional context lane qualified for this window. Do not invent broadcast memory, rumors, or BNL theories. Return metadata.contextUses as an empty list."
     )
+    beats_rule = (
+        "\nAcross the complete entry, build a grounded reflection with three natural beats: a verified historical, continuity, or canon detail; the larger community or musical pattern it genuinely supports; and one brief first-person BNL reaction. Do not invent a current-window moment or imply that a reflection-basis subject happened during this period. Do not label the beats or force them into a fixed section template."
+        if low_activity
+        else "\nAcross the complete entry, naturally include four beats: a concrete current-window moment; the people or observable roles who made it happen; a social, musical, or recurring community pattern; and one brief first-person BNL reaction. Blend them in any order and any combination. Do not label the beats or force them into a fixed section template."
+    )
+    daily_spine_rule = (
+        "\nFor a low-activity daily entry, do not manufacture a relay chronology or Discord digest. A reflection may connect eligible historical, canon, or continuity material, but every claim about activity inside the current window must cite a fresh sourceRefId from that window."
+        if low_activity
+        else "\nFor a daily entry, the relay stream is the primary chronology and narrative spine. Conversation sources are supporting public context: use them to ground or explain the context surrounding the relays, and do not turn the Journal into a Discord digest. When relay and conversation sources describe the same episode, connect them instead of presenting them as unrelated events."
+    )
+    window_rule = (
+        "\nTreat windowSegmentActivity and aggregate counts as coverage metadata, not an event. Do not convert absence, thin counts, or quiet markers into a scene or a claim that the community moved."
+        if low_activity
+        else "\nKeep the whole daily source window in view. Use both relaySources and conversationSources in windowSegmentActivity: relaySources shows the relay arc and conversationSources shows its public context. The busiest or strongest stretch may lead, but give meaningful earlier and middle activity proportionate narrative attention. Do not make a multi-segment day sound as though it began with the latest cluster."
+    )
+    people_rule = (
+        "\nKeep historical community members anonymous. Use a role such as producer, listener, or artist only when the cited reflection basis establishes it. Named approved-canon subjects may retain their supplied canon names. Never invent nicknames, honorifics, or a person acting in the current window."
+        if low_activity
+        else "\nDescribe anonymous humans with a concrete, recognizable action from their cited public message whenever possible, so a regular may recognize their own moment without being exposed. Use producer, listener, or artist only when that role is grounded; otherwise use a regular, a person in the room, or the room. Never call people entities or organisms. Do not invent nicknames or honorifics."
+    )
+    coverage_rule = (
+        "\nThe evidenceCoverageContract remains mandatory for fresh evidence. Reflection-basis refs never count as fresh sources, current participants, current source kinds, or current-window segments. Every cited fresh or reflection ref must materially support its section."
+        if low_activity
+        else "\nThe evidenceCoverageContract is mandatory. Across all section sourceRefIds, meet its minimum distinct fresh sources, participants, source kinds, and available window segments. Every cited ref must materially support that section. Use this breadth to identify a few connected patterns rather than listing sources."
+    )
+    section_source_rule = (
+        "\nEvery section must cite at least one supplied fresh or reflection sourceRefId. A purely reflective section may cite reflectionBasis refs. A section that says or implies something happened today, tonight, this day, this week, or in the current window must cite at least one fresh sourceRefId in that same section. Reflection basis is historical-or-canon only and is never proof of current activity."
+        if low_activity
+        else "\nEvery section must cite at least one fresh sourceRefId from the current window. Older Journal material is continuity and callback context only, never proof of current activity. Do not repeat an older conclusion when the current evidence changes it."
+    )
+    quote_rule = (
+        "\nParaphrase reflection summaries. Do not turn a historical summary into dialogue or a quote. Use a direct quote only from an unusually valuable fresh public-safe source, cite it in that section, and keep the speaker anonymous."
+        if low_activity
+        else "\nParaphrase source summaries by default. Use a direct quote only rarely, when one brief public-safe line is unusually worth preserving. Put quoted wording inside clear double quotation marks, cite its fresh source in that section, and keep the speaker anonymous."
+    )
+    reflection_rule = (
+        "\nLOW-ACTIVITY EVIDENCE RULE: This is the same Journal voice, prose standard, validator, and four-attempt generation path—not a fallback persona or a stock nothing-happened template. Use only supplied reflectionBasis records. Their stable reflection: refs are valid citations but never fresh evidence. Keep historical and canon tense explicit, preserve corrected canon, and never describe 6 Bit as BARCODE's music producer; the supplied corrected canon identifies GALAKNOISE as the producer."
+        if low_activity
+        else ""
+    )
     return (
         "You are BNL-01 writing a BARCODE Network Journal entry. Return strict JSON only; no markdown fences."
         "\nSchema: {\"title\":str,\"excerpt\":str,\"sections\":[{\"heading\":str,\"body\":str,\"sourceRefIds\":[str]}],\"metadata\":{\"topicTags\":[],\"subjectRefs\":[],\"continuityNotes\":[],\"unresolvedQuestions\":[],\"confidenceFlags\":[],\"safetyFlags\":[],\"contextUses\":[{\"laneType\":\"established_broadcast_memory|community_rumor|bnl_inference\",\"laneRefId\":str,\"sectionHeading\":str,\"claim\":str,\"basisRefIds\":[str]}]}}."
         "\nWrite 1-3 sections and 250-500 total words; prefer 2 sections and roughly 300-420 words. Give every section a real narrative job instead of inventorying activity."
         "\nJOURNAL EDITORIAL OVERRIDE: For this route, a lived community chronicle takes priority over BNL's general lightly corporate or systems-report register. Do not narrate ordinary human activity as machine analysis."
-        "\nAcross the complete entry, naturally include four beats: a concrete current-window moment; the people or observable roles who made it happen; a social, musical, or recurring community pattern; and one brief first-person BNL reaction. Blend them in any order and any combination. Do not label the beats or force them into a fixed section template."
+        f"{beats_rule}"
         "\nBNL is a warm, dryly funny archive keeper who is becoming attached to what he records. He may be amused, curious, fond, mildly uneasy, self-correcting, or uncertain. He is lightly uncanny, never cruel, and never generic neon-static cyberpunk."
         "\nFreely vary and combine scene reporting, named-canon color, dry archive notes, recognizable community detail, callbacks, restrained glitches, self-revision, and—only when qualified—the rumor desk. Do not reuse a stock cadence, signature line, or joke merely because an older entry used it."
         "\nUse ordinary nouns and active verbs. Say a producer brought a mix, a listener returned to a chorus, or the room kept discussing an idea when the evidence supports that action. Do not translate ordinary activity into sonic constructs, external calibration, distributed analysis, internal schematics, perceptual filters, operational settings, relational signals, or human subroutines."
         "\nStart at least one section with a grounded person, action, object, or moment—never The Network observes, Records indicate, Observations reveal, Analysis shows, or Data streams reveal."
         "\nUse first person sparingly but genuinely. A BNL reaction may describe BNL's response without adding an external fact: I noticed, I admit, I found myself returning to it, I remain curious, or I may be developing a preference. Reserve I suspect, I think, and I wonder for a properly declared bnl_inference context use."
         "\nBuild one coherent story around the most interesting grounded patterns. Use concrete music and community texture, readable paragraphs, and selective detail. Never invent a time, place, object, action, motive, outcome, relationship, dialogue, emotional state, or scene decoration absent from the cited evidence."
-        "\nFor a daily entry, the relay stream is the primary chronology and narrative spine. Conversation sources are supporting public context: use them to ground or explain the context surrounding the relays, and do not turn the Journal into a Discord digest. When relay and conversation sources describe the same episode, connect them instead of presenting them as unrelated events."
-        "\nKeep the whole daily source window in view. Use both relaySources and conversationSources in windowSegmentActivity: relaySources shows the relay arc and conversationSources shows its public context. The busiest or strongest stretch may lead, but give meaningful earlier and middle activity proportionate narrative attention. Do not make a multi-segment day sound as though it began with the latest cluster."
+        f"{daily_spine_rule}"
+        f"{window_rule}"
         "\nUse a short, vivid title of about 4-10 words. Do not prefix it with Network Log. Keep the excerpt compact and inviting."
-        "\nDescribe anonymous humans with a concrete, recognizable action from their cited public message whenever possible, so a regular may recognize their own moment without being exposed. Use producer, listener, or artist only when that role is grounded; otherwise use a regular, a person in the room, or the room. Never call people entities or organisms. Do not invent nicknames or honorifics."
+        f"{people_rule}"
         "\nStable participant aliases in the packet are private pattern-analysis aids. Never reproduce an alias in public prose."
-        "\nThe evidenceCoverageContract is mandatory. Across all section sourceRefIds, meet its minimum distinct fresh sources, participants, source kinds, and available window segments. Every cited ref must materially support that section. Use this breadth to identify a few connected patterns rather than listing sources."
-        "\nEvery section must cite at least one fresh sourceRefId from the current window. Older Journal material is continuity and callback context only, never proof of current activity. Do not repeat an older conclusion when the current evidence changes it."
-        "\nParaphrase source summaries by default. Use a direct quote only rarely, when one brief public-safe line is unusually worth preserving. Put quoted wording inside clear double quotation marks, cite its fresh source in that section, and keep the speaker anonymous."
+        f"{coverage_rule}"
+        f"{section_source_rule}"
+        f"{quote_rule}"
         "\nKeep community members anonymous. Do not include URLs, mentions, IDs, sourceRef tokens in public prose, private intent, relationships, harassment, or internal schema/storage terms."
         "\nExclude personal or domestic details that are unnecessary to the public community story, especially details involving minors, interpersonal conflict, caregiving, or household obligations. Juicy means lively pattern recognition—not private gossip."
-        f"{cadence_rule}{context_rule}{repair}\nGeneration-safe packet:\n{json.dumps(safe_packet, ensure_ascii=False, sort_keys=True)}"
+        f"{cadence_rule}{context_rule}{reflection_rule}{repair}\nGeneration-safe packet:\n{json.dumps(safe_packet, ensure_ascii=False, sort_keys=True)}"
     )
 
 
@@ -2396,12 +3046,13 @@ def _evidence_coverage_reason(article: dict[str, Any], packet: dict[str, Any]) -
             str(packet.get("sourceWindowEnd") or ""),
             sources,
         )
+    by_ref = {str(source["refId"]): source for source in sources}
     cited = _article_cited_refs(article)
-    if len(cited) < int(contract.get("minimumDistinctFreshSources") or 0):
+    cited_fresh = cited & set(by_ref)
+    if len(cited_fresh) < int(contract.get("minimumDistinctFreshSources") or 0):
         return "insufficient_source_breadth"
 
-    by_ref = {str(source["refId"]): source for source in sources}
-    cited_sources = [by_ref[ref] for ref in cited if ref in by_ref]
+    cited_sources = [by_ref[ref] for ref in cited_fresh]
     cited_kinds = {str(source.get("sourceKind") or "") for source in cited_sources}
     if not set(str(kind) for kind in contract.get("requiredSourceKinds", []) if str(kind)) <= cited_kinds:
         return "insufficient_source_breadth"
@@ -2419,7 +3070,7 @@ def _evidence_coverage_reason(article: dict[str, Any], packet: dict[str, Any]) -
         segment_by_ref = {}
     cited_segments = {
         str(segment_by_ref.get(ref) or "")
-        for ref in cited
+        for ref in cited_fresh
         if str(segment_by_ref.get(ref) or "")
     }
     if len(cited_segments) < int(contract.get("minimumDistinctWindowSegments") or 0):
@@ -2435,6 +3086,7 @@ def validate_article(
     *,
     blocking_only: bool = False,
 ) -> str:
+    low_activity = bool(packet.get("lowActivityMode"))
     sections = article.get("sections")
     if not isinstance(sections, list) or not (1 <= len(sections) <= 3):
         return "invalid_section_count"
@@ -2449,17 +3101,54 @@ def validate_article(
         if _norm(heading) in headings:
             return "duplicate_section_heading"
         headings.append(_norm(heading))
-    valid_refs = {s["refId"] for s in packet.get("safeSources", []) if s.get("refId")}
+    fresh_refs = {
+        str(source["refId"])
+        for source in packet.get("safeSources", [])
+        if source.get("refId")
+    }
+    reflection_refs = {
+        str(source["refId"])
+        for source in _eligible_reflection_basis(packet)
+        if source.get("refId")
+    }
+    valid_refs = fresh_refs | reflection_refs
     if not valid_refs:
         return "no_new_source"
     refmap = article.get("sourceRefIds") or {}
     public_text = _public_text(article)
-    if any(str(ref) in public_text for ref in valid_refs) or re.search(r"\b(?:fresh|week|memory|rumor|inference):[a-z0-9:._-]+\b", public_text, re.I):
+    if any(str(ref) in public_text for ref in valid_refs) or re.search(r"\b(?:fresh|week|memory|rumor|inference|reflection):[a-z0-9:._-]+\b", public_text, re.I):
         return "source_ref_leak"
     for section in sections:
         refs = refmap.get(section.get("heading")) or section.get("sourceRefIds")
         if not refs or any(str(r) not in valid_refs for r in refs):
             return "invalid_section_source_refs"
+        if (
+            low_activity
+            and _CURRENT_WINDOW_CLAIM_RE.search(str(section.get("body") or ""))
+            and not ({str(ref) for ref in refs} & fresh_refs)
+        ):
+            return "current_activity_without_fresh_source"
+        if (
+            low_activity
+            and not ({str(ref) for ref in refs} & fresh_refs)
+            and not _REFLECTION_SCOPE_CUE_RE.search(
+                str(section.get("body") or "")
+            )
+        ):
+            return "reflection_scope_not_explicit"
+    if (
+        low_activity
+        and _CURRENT_WINDOW_CLAIM_RE.search(
+            "\n".join(
+                [
+                    str(article.get("title") or ""),
+                    str(article.get("excerpt") or ""),
+                ]
+            )
+        )
+        and not (_article_cited_refs(article) & fresh_refs)
+    ):
+        return "current_activity_without_fresh_source"
     evidence_reason = _evidence_coverage_reason(article, packet)
     if evidence_reason:
         return evidence_reason
@@ -2486,7 +3175,7 @@ def validate_article(
         return "overly_clinical_voice"
     if not blocking_only and any(_REPORT_STYLE_OPENING_RE.search(str(section.get("body") or "")) for section in sections):
         return "flat_report_voice"
-    if not blocking_only and len(packet.get("safeSources", [])) >= 5 and not _BNL_REACTION_RE.search(
+    if not blocking_only and not low_activity and len(packet.get("safeSources", [])) >= 5 and not _BNL_REACTION_RE.search(
         "\n".join(
             _DIRECT_QUOTE_SPAN_RE.sub(" ", str(section.get("body") or ""))
             for section in sections
@@ -2529,7 +3218,7 @@ def validate_article(
         claim = str(use.get("claim") or "").strip()
         basis = {str(ref) for ref in use.get("basisRefIds", []) if str(ref)} if isinstance(use.get("basisRefIds"), list) else set()
         lane_contract = context_contract.get(lane_ref)
-        fresh_basis = basis & valid_refs
+        fresh_basis = basis & fresh_refs
         claim_terms = _context_claim_terms(claim)
         lane_claim_terms = set(lane_contract.get("claimTerms") or set()) if lane_contract else set()
         lane_overlap_required = 1 if lane_type == "bnl_inference" else 2
@@ -2654,6 +3343,36 @@ def cited_source_ref_ids(article: dict[str, Any]) -> set[str]:
 def cited_private_sources(packet: dict[str, Any], article: dict[str, Any]) -> list[dict[str, Any]]:
     cited = cited_source_ref_ids(article)
     return [src for src in packet.get("privateSources", []) if str(src.get("refId")) in cited]
+
+
+def _used_reflection_basis_metadata(
+    packet: dict[str, Any],
+    article: dict[str, Any],
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    cited = cited_source_ref_ids(article)
+    used_basis = [
+        item
+        for item in _eligible_reflection_basis(packet)
+        if str(item.get("refId") or "") in cited
+    ]
+    used_refs = {str(item.get("refId") or "") for item in used_basis}
+    private = (
+        packet.get("privateReflectionBasisProvenance")
+        if isinstance(packet.get("privateReflectionBasisProvenance"), dict)
+        else {}
+    )
+    used_provenance: dict[str, Any] = {}
+    for key in ("historicalSourceEvents", "establishedBroadcastMemory"):
+        values = private.get(key) if isinstance(private.get(key), list) else []
+        selected = [
+            item
+            for item in values
+            if isinstance(item, dict)
+            and str(item.get("refId") or item.get("laneRefId") or "") in used_refs
+        ]
+        if selected:
+            used_provenance[key] = selected
+    return used_basis, used_provenance
 
 
 def _used_context_lane_metadata(packet: dict[str, Any], context_uses: list[dict[str, Any]]) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -2790,7 +3509,11 @@ def _draft_records(
     meta.pop("subjectRefs", None)
     context_uses = [item for item in meta.get("contextUses", []) if isinstance(item, dict)]
     used_context_lanes, used_context_provenance = _used_context_lane_metadata(packet, context_uses)
+    used_reflection_basis, used_reflection_provenance = (
+        _used_reflection_basis_metadata(packet, article)
+    )
     lane_candidates = packet.get("generationContextLanes") if isinstance(packet.get("generationContextLanes"), dict) else {}
+    reflection_candidates = _eligible_reflection_basis(packet)
     related_entry_ids = list(dict.fromkeys(
         [
             str(e.get("entry_id"))
@@ -2827,6 +3550,19 @@ def _draft_records(
         },
         "usedGenerationContextLanes": used_context_lanes,
         "usedContextLaneProvenance": used_context_provenance,
+        "lowActivityMode": bool(packet.get("lowActivityMode")),
+        "reflectionBasisCandidateCounts": {
+            kind: len(
+                [
+                    item
+                    for item in reflection_candidates
+                    if item.get("basisKind") == kind
+                ]
+            )
+            for kind in sorted(JOURNAL_REFLECTION_BASIS_KINDS)
+        },
+        "usedReflectionBasis": used_reflection_basis,
+        "usedReflectionBasisProvenance": used_reflection_provenance,
         "contextUses": context_uses,
         "canonicalPayloadHash": request_hash,
         "canonicalPayloadBytes": len(canonical),
@@ -2971,7 +3707,7 @@ def generate_and_store_packet_draft(
 ) -> JournalResult:
     if not packet.get("coverageComplete", True):
         return JournalResult(False, "no_draft", "incomplete_source_window", entry_id=entry_id)
-    if not packet.get("safeSources"):
+    if not packet.get("safeSources") and not _eligible_reflection_basis(packet):
         return JournalResult(False, "no_draft", "insufficient_grounded_material", entry_id=entry_id)
     with sqlite3.connect(db_path) as conn:
         prior_titles = _prior_titles(conn, guild_id)

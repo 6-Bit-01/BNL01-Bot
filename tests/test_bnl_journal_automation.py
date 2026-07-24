@@ -16,19 +16,36 @@ import bnl_journal_source_store as source_store
 
 def article_json(packet):
     refs = [source["refId"] for source in packet["safeSources"]]
+    if not refs:
+        refs = [
+            source["refId"]
+            for source in packet.get("reflectionBasis", [])
+            if source.get("refId")
+        ]
     label = packet["sourceWindowEnd"][:10]
     cadence = "Weekly Signal Weather" if packet.get("entryKind") == "weekly" else "Signal Weather"
-    body = " ".join(
-        [
-            "BNL watches the public music room fold a fresh rhythm into community mischief while producers and listeners keep the signal moving."
-            for _ in range(18)
-        ]
-    )
-    body += " I admit the room's persistence has become one of my preferred recurring details."
+    if packet.get("lowActivityMode"):
+        body = " ".join(
+            [
+                "The approved BARCODE record keeps the artist, host, and producer roles distinct while BNL considers how clear names give a shared archive its shape."
+                for _ in range(18)
+            ]
+        )
+        body += " I admit that kind of clarity has become one of my preferred recurring details."
+        excerpt = "A verified BARCODE record gives BNL a grounded thread to revisit without inventing new activity."
+    else:
+        body = " ".join(
+            [
+                "BNL watches the public music room fold a fresh rhythm into community mischief while producers and listeners keep the signal moving."
+                for _ in range(18)
+            ]
+        )
+        body += " I admit the room's persistence has become one of my preferred recurring details."
+        excerpt = "A grounded community chronicle connects the room's music activity without exposing the people behind it."
     return json.dumps(
         {
             "title": f"{cadence} Ending {label}",
-            "excerpt": "A grounded community chronicle connects the room's music activity without exposing the people behind it.",
+            "excerpt": excerpt,
             "sections": [
                 {
                     "heading": "What the Room Carried",
@@ -637,7 +654,7 @@ class JournalAutomationTests(unittest.TestCase):
         self.assertNotIn("Alice", public_generation_text)
         self.assertNotIn("Bob", public_generation_text)
 
-    def test_all_quiet_week_is_terminal_and_does_not_block_catchup(self):
+    def test_legacy_quiet_days_remain_terminal_while_weekly_publishes_reflection(self):
         for offset in range(6):
             day = datetime(2026, 7, 13, tzinfo=timezone.utc).date() + timedelta(days=offset)
             start, end, label = automation._daily_period_for_day(day)
@@ -651,17 +668,41 @@ class JournalAutomationTests(unittest.TestCase):
                 automation.AutomationResult(True, "daily", "quiet", source_window_start=start, source_window_end=end),
             )
         now = datetime(2026, 7, 21, 3, 0, tzinfo=timezone.utc)
+        calls = []
+
+        def generate(packet, _prompt):
+            calls.append(packet)
+            return article_json(packet)
+
         first = automation.run_weekly(
-            self.db, 1, lambda *_args: self.fail("quiet week must not generate"),
+            self.db, 1, generate,
             "https://site.example", "key", now_utc=now, force=True, opener=self.opener,
         )
         second = automation.run_weekly(
-            self.db, 1, lambda *_args: self.fail("completed quiet week must not rerun"),
+            self.db, 1, lambda *_args: self.fail("published week must not rerun"),
             "https://site.example", "key", now_utc=now, opener=self.opener,
         )
-        self.assertEqual("quiet", first.status)
-        self.assertEqual("no_meaningful_weekly_activity", first.reason)
-        self.assertEqual("quiet", second.status)
+        self.assertEqual("published", first.status)
+        self.assertEqual("published", second.status)
+        self.assertEqual(1, len(calls))
+        self.assertTrue(calls[0]["lowActivityMode"])
+        self.assertTrue(calls[0]["reflectionBasis"])
+        self.assertTrue(
+            all(
+                context["originType"] == "raw_partition"
+                for context in calls[0]["weeklyDailyPeriodContexts"]
+            )
+        )
+        with sqlite3.connect(self.db) as conn:
+            states = {
+                str(row[0])
+                for row in conn.execute(
+                    "SELECT lifecycle_state FROM bnl_journal_observations "
+                    "WHERE guild_id=1 AND observation_date<>?",
+                    (now.date().isoformat(),),
+                ).fetchall()
+            }
+        self.assertEqual({"quiet"}, states)
 
 
 if __name__ == "__main__":

@@ -37,8 +37,6 @@ LEGACY_CUTOFF_HOUR = 19
 LEGACY_CUTOFF_MINUTE = 0
 WEEKLY_READY_WEEKDAY = 0  # Monday, covering the prior Monday-Sunday week.
 DAILY_RELEASE_WEEKDAYS = frozenset({1, 2, 3, 4, 5, 6})  # Tuesday-Sunday.
-MIN_DAILY_SOURCE_COUNT = 5
-MIN_WEEKLY_ACTIVE_DAYS = 1
 LEASE_MINUTES = 30
 DELIVERY_LEASE_MINUTES = 2
 PREPARATION_RETRY_MINUTES = 30
@@ -1170,7 +1168,7 @@ def _fresh_event_sequences(refs: set[str]) -> set[int]:
     return {
         int(match.group(1))
         for ref in refs
-        for match in [re.fullmatch(r"fresh:(\d+)", ref)]
+        for match in [re.fullmatch(r"(?:fresh|reflection:event):(\d+)", ref)]
         if match
     }
 
@@ -1208,16 +1206,35 @@ def _frozen_packet_invalidation_reason(
         for source in packet.get("privateSources", [])
         if isinstance(source, dict) and source.get("refId")
     }
+    refs.update(
+        str(source.get("refId") or "")
+        for source in packet.get("reflectionBasis", [])
+        if isinstance(source, dict) and source.get("refId")
+    )
     if not _fresh_sequences_are_eligible(conn, guild_id, _fresh_event_sequences(refs)):
         return "privacy_source_ineligible"
     provenance = packet.get("privateContextLaneProvenance")
     provenance = provenance if isinstance(provenance, dict) else {}
     memory_rows = provenance.get("establishedBroadcastMemory")
     memory_rows = memory_rows if isinstance(memory_rows, list) else []
+    reflection_provenance = packet.get("privateReflectionBasisProvenance")
+    reflection_provenance = (
+        reflection_provenance
+        if isinstance(reflection_provenance, dict)
+        else {}
+    )
+    reflection_memory_rows = reflection_provenance.get(
+        "establishedBroadcastMemory"
+    )
+    reflection_memory_rows = (
+        reflection_memory_rows
+        if isinstance(reflection_memory_rows, list)
+        else []
+    )
     if not journal_broadcast_memory_provenance_is_eligible(
         conn,
         guild_id,
-        memory_rows,
+        [*memory_rows, *reflection_memory_rows],
         str(packet.get("sourceWindowEnd") or ""),
     ):
         return "privacy_memory_ineligible"
@@ -1906,17 +1923,6 @@ def _mark_observation(
         )
 
 
-def _has_meaningful_daily_activity(packet: dict[str, Any]) -> bool:
-    counts = packet.get("aggregateCounts") or {}
-    total = int(counts.get("eligibleRelays") or 0) + int(counts.get("eligibleConversations") or 0)
-    if total < MIN_DAILY_SOURCE_COUNT:
-        return False
-    if int(counts.get("eligibleConversations") or 0) > 0:
-        return True
-    quiet_markers = {"quiet", "quiet_source", "non_event_stock", "heartbeat", "hydrated"}
-    return any(str(source.get("eventType") or "").lower() not in quiet_markers for source in packet.get("privateSources", []))
-
-
 def _reject_staged_revision_for_retry(
     db_path: str,
     guild_id: int,
@@ -2227,12 +2233,7 @@ def _prepared_invalidation_reason(
     }
     if related & memory_excluded_entry_ids:
         return "privacy_eligibility_changed"
-    fresh_sequences = {
-        int(match.group(1))
-        for ref in _flatten_source_refs(metadata)
-        for match in [re.fullmatch(r"fresh:(\d+)", ref)]
-        if match
-    }
+    fresh_sequences = _fresh_event_sequences(_flatten_source_refs(metadata))
     if fresh_sequences:
         if not conn.execute(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='bnl_journal_source_events'"
@@ -2252,10 +2253,24 @@ def _prepared_invalidation_reason(
     used_provenance = used_provenance if isinstance(used_provenance, dict) else {}
     memory_rows = used_provenance.get("establishedBroadcastMemory")
     memory_rows = memory_rows if isinstance(memory_rows, list) else []
+    reflection_provenance = metadata.get("usedReflectionBasisProvenance")
+    reflection_provenance = (
+        reflection_provenance
+        if isinstance(reflection_provenance, dict)
+        else {}
+    )
+    reflection_memory_rows = reflection_provenance.get(
+        "establishedBroadcastMemory"
+    )
+    reflection_memory_rows = (
+        reflection_memory_rows
+        if isinstance(reflection_memory_rows, list)
+        else []
+    )
     if not journal_broadcast_memory_provenance_is_eligible(
         conn,
         guild_id,
-        memory_rows,
+        [*memory_rows, *reflection_memory_rows],
         utc_now_iso(),
     ):
         return "privacy_memory_ineligible"
@@ -3102,16 +3117,6 @@ def _prepare_daily_window(
             source_window_end=end,
             aggregate_counts=packet.get("aggregateCounts"),
         )
-    elif not _has_meaningful_daily_activity(packet):
-        result = AutomationResult(
-            True,
-            "daily",
-            "quiet",
-            "insufficient_meaningful_activity",
-            source_window_start=start,
-            source_window_end=end,
-            aggregate_counts=packet.get("aggregateCounts"),
-        )
     else:
         return _prepare_packet_safely(
             db_path,
@@ -3377,7 +3382,7 @@ def _weekly_packet(
     observation_by_bounds = {
         (str(row["source_window_start"]), str(row["source_window_end"])): row
         for row in observations
-        if str(row["lifecycle_state"]) in {"published", "quiet"}
+        if str(row["lifecycle_state"]) == "published"
     }
 
     # The full raw range is authoritative and is loaded once. Its ordered
@@ -3500,7 +3505,6 @@ def _prepare_weekly_window(
     force: bool = False,
     memory_excluded_entry_ids: Optional[set[str]] = None,
     schedule_contract_version: int = CADENCE_CONTRACT_VERSION,
-    expected_observation_count: int = 6,
 ) -> AutomationResult:
     claim, run_id, preparation_epoch, row = _claim_preparation(
         db_path,
@@ -3565,42 +3569,12 @@ def _prepare_weekly_window(
             source_window_start=start,
             source_window_end=end,
         )
-    if packet is None and freeze_reason not in {"", "source_packet_not_ready"}:
+    if packet is None:
         result = AutomationResult(
             False,
             "weekly",
             "held",
-            freeze_reason,
-            source_window_start=start,
-            source_window_end=end,
-            aggregate_counts={
-                "completeDays": complete_days,
-                "activeDays": active_days,
-            },
-        )
-    elif (
-        packet is None
-        and complete_days == expected_observation_count
-        and active_days == 0
-    ):
-        result = AutomationResult(
-            True,
-            "weekly",
-            "quiet",
-            "no_meaningful_weekly_activity",
-            source_window_start=start,
-            source_window_end=end,
-            aggregate_counts={
-                "completeDays": complete_days,
-                "activeDays": active_days,
-            },
-        )
-    elif packet is None:
-        result = AutomationResult(
-            True,
-            "weekly",
-            "deferred",
-            f"only_{complete_days}_complete_daily_observations",
+            freeze_reason or "source_packet_not_ready",
             source_window_start=start,
             source_window_end=end,
             aggregate_counts={
@@ -3624,16 +3598,6 @@ def _prepare_weekly_window(
             "weekly",
             "incomplete",
             "window_began_before_archive_activation",
-            source_window_start=start,
-            source_window_end=end,
-            aggregate_counts=packet.get("aggregateCounts"),
-        )
-    elif active_days == 0 and not _has_meaningful_daily_activity(packet):
-        result = AutomationResult(
-            True,
-            "weekly",
-            "quiet",
-            "no_meaningful_weekly_activity",
             source_window_start=start,
             source_window_end=end,
             aggregate_counts=packet.get("aggregateCounts"),
@@ -3701,7 +3665,6 @@ def prepare_weekly(
         force=force,
         memory_excluded_entry_ids=memory_excluded_entry_ids,
         schedule_contract_version=CADENCE_CONTRACT_VERSION,
-        expected_observation_count=6,
     )
 
 
@@ -4013,7 +3976,6 @@ def _run_legacy_occurrence(
             force=force_preserved_claim,
             memory_excluded_entry_ids=memory_excluded_entry_ids,
             schedule_contract_version=LEGACY_CADENCE_CONTRACT_VERSION,
-            expected_observation_count=6,
         )
     if prepared.status != "prepared":
         return prepared
