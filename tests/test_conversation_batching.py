@@ -821,6 +821,60 @@ class ConversationBatchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
             ["Crow preferred the stronger cobalt framing."],
         )
 
+    async def test_batch_records_one_participant_neutral_unified_assessment_after_send(self):
+        channel = self._channel(8137)
+        now = bnl01_bot.datetime.now(bnl01_bot.PACIFIC_TZ)
+        for item in (
+            ("Jon", "I will handle the intro.", 100),
+            ("Miss Bit", "I will handle the artwork.", 101),
+            ("Crow", "I will handle the promo clips.", 102),
+            ("Jon", "What did everyone just decide?", 100),
+        ):
+            bnl01_bot._channel_buffers[channel.id].append(item)
+        bnl01_bot._channel_first_seen[channel.id] = now
+        bnl01_bot._channel_last_message_at[channel.id] = now
+        bnl01_bot._channel_last_reply_at[channel.id] = (
+            now - bnl01_bot.timedelta(hours=2)
+        )
+        recorder = mock.AsyncMock()
+
+        async def generate(_prompt, **_kwargs):
+            return (
+                "Jon has the intro, Miss Bit has the artwork, and Crow has "
+                "the promo clips."
+            )
+
+        with (
+            self._flush_runtime(channel.id, generate),
+            mock.patch.object(
+                bnl01_bot,
+                "unified_response_assessment_shadow_enabled",
+                return_value=True,
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "record_unified_response_assessment_shadow_after_send",
+                new=recorder,
+            ),
+        ):
+            await bnl01_bot._flush_channel_buffer(channel)
+
+        self.assertEqual(len(channel.sent), 1)
+        recorder.assert_awaited_once()
+        assessment = recorder.call_args.args[0]
+        self.assertEqual(assessment.response_act, "recap_current_exchange")
+        self.assertEqual(len(assessment.current_speaker_user_ids), 3)
+        self.assertEqual(len(assessment.participant_user_ids), 3)
+        self.assertEqual(
+            assessment.selected_lanes,
+            ("current_exchange",),
+        )
+        self.assertEqual(
+            recorder.call_args.kwargs["response"],
+            channel.sent[0],
+        )
+        self.assertTrue(recorder.call_args.kwargs["response_sent"])
+
     async def test_batched_repair_turn_uses_visible_context_generation_not_canned_reply(self):
         channel = self._channel(8116)
         prompts = []
@@ -1686,9 +1740,17 @@ class ConversationBatchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
             conversation_surface=bnl01_bot.CONVERSATION_SURFACE_FREE_SPEAK_SEALED_MIRROR,
         )
         show_context = {"context_source": "followup", "answer_type": "show_state"}
+        unified_assessment = bnl01_bot.build_unified_response_assessment(
+            guild_id=message.guild.id,
+            route_mode=bnl01_bot.ROUTE_MODE_NORMAL_CHAT,
+            channel_policy="sealed_test",
+            conversation_surface="test",
+            current_speaker_user_ids=(message.author.id,),
+        )
         greeting = mock.Mock()
         show_state = mock.Mock()
         save = mock.Mock(return_value=SimpleNamespace(save_conversation=True, reason="saved"))
+        assessment_record = mock.AsyncMock()
         with (
             mock.patch.object(bnl01_bot, "_apply_direct_response_pacing", new=mock.AsyncMock()),
             mock.patch.object(
@@ -1702,6 +1764,11 @@ class ConversationBatchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
             mock.patch.object(bnl01_bot, "set_last_greeting_at", new=greeting),
             mock.patch.object(bnl01_bot, "_store_show_state_topic_context", new=show_state),
             mock.patch.object(bnl01_bot, "_mark_conversation_continuation_state"),
+            mock.patch.object(
+                bnl01_bot,
+                "record_unified_response_assessment_shadow_after_send",
+                new=assessment_record,
+            ),
         ):
             await bnl01_bot.send_planned_conversation_response(
                 message,
@@ -1712,6 +1779,7 @@ class ConversationBatchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
                 direct_repair_generation=token,
                 allow_greeting_on_commit=True,
                 show_state_context_on_commit=show_context,
+                unified_response_assessment_shadow=unified_assessment,
             )
 
         self.assertEqual(message.replies, ["Corrected answer."])
@@ -1724,6 +1792,12 @@ class ConversationBatchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
             show_context,
         )
         save.assert_called_once()
+        assessment_record.assert_awaited_once_with(
+            unified_assessment,
+            response="Corrected answer.",
+            guard_diagnostics={"suppressed": False},
+            response_sent=True,
+        )
         self.assertNotIn(token["key"], bnl01_bot._inflight_direct_repair_generations)
 
     async def test_on_message_plain_name_request_preempts_batch_and_accepts_tag_payload(self):

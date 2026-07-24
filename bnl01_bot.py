@@ -100,6 +100,13 @@ from bnl_shadow_acceptance import (
     build_v2_shadow_acceptance_snapshot,
     render_v2_shadow_acceptance_lines,
 )
+from bnl_unified_response_assessment import (
+    UnifiedResponseAssessment,
+    build_unified_response_assessment,
+    ensure_schema as ensure_unified_response_assessment_schema,
+    persist_shadow_run as persist_unified_response_assessment_shadow_run,
+    shadow_enabled as unified_response_assessment_shadow_enabled,
+)
 from bnl_journal import (
     JOURNAL_ROUTE,
     ensure_schema as ensure_journal_schema,
@@ -4877,6 +4884,7 @@ def init_db():
         ensure_entity_evidence_schema(evidence_conn)
         ensure_memory_ledger_schema(evidence_conn)
         ensure_relationship_v2_schema(evidence_conn)
+        ensure_unified_response_assessment_schema(evidence_conn)
         orphan_reconciliation = (
             reconcile_orphaned_conversation_ledger_sources(
                 evidence_conn,
@@ -17404,7 +17412,21 @@ def build_user_memory_context(
     source_metadata: dict | None = None,
 ) -> str:
     if source_metadata is not None:
-        source_metadata["moment_gist_rendered"] = False
+        source_metadata.update(
+            {
+                "moment_gist_rendered": False,
+                "approved_fact_count": 0,
+                "legacy_relationship_present": False,
+                "legacy_memory_present": False,
+                "relationship_v2_candidate_present": False,
+                "governed_entry_ids": (),
+                "governed_candidate_count": 0,
+                "governance_exclusion_count": 0,
+                "governance_contradiction_count": 0,
+                "moment_candidate_count": 0,
+                "prompt_budget": 0,
+            }
+        )
     if route_mode == ROUTE_MODE_SIMPLE_GREETING:
         LAST_MEMORY_PROMPT_DIAGNOSTICS[(user_id, guild_id)] = {"skipped_reason": "simple_greeting", "included": {"short": 0, "medium": 0, "long": 0}}
         return "Memory intentionally skipped for simple greeting."
@@ -17419,6 +17441,14 @@ def build_user_memory_context(
     journal = get_relationship_journal(user_id, guild_id, limit=4)
     habits = get_user_habits(user_id, guild_id)
     tier_rows = get_memory_tiers(user_id, guild_id)
+    if source_metadata is not None:
+        source_metadata.update(
+            {
+                "approved_fact_count": len(approved_facts),
+                "legacy_relationship_present": bool(relation or journal),
+                "prompt_budget": int(limits.get("prompt_budget") or 0),
+            }
+        )
 
     sections = []
     moment_gist_context = ""
@@ -17570,6 +17600,8 @@ def build_user_memory_context(
                 + "\n".join(tier_lines)
             )
     legacy_context = "\n".join(sections) if sections else "No durable memory yet."
+    if source_metadata is not None:
+        source_metadata["legacy_memory_present"] = bool(sections)
     diagnostics["skipped"] = dict(diagnostics["skipped"])
     if memory_governance_shadow_enabled():
         try:
@@ -17599,6 +17631,30 @@ def build_user_memory_context(
                     "invalid_invariants": gov_result.diagnostics.invalid_invariants,
                     "fallback_reason": gov_result.diagnostics.fallback_reason,
                 }
+                if source_metadata is not None:
+                    source_metadata.update(
+                        {
+                            "governed_entry_ids": tuple(
+                                candidate.entry_id
+                                for candidate in gov_result.selected
+                                if candidate.entry_id
+                            ),
+                            "governed_candidate_count": int(
+                                gov_result.diagnostics.selected_count or 0
+                            ),
+                            "governance_exclusion_count": sum(
+                                int(count or 0)
+                                for count in gov_result.diagnostics.excluded_by_reason.values()
+                            ),
+                            "governance_contradiction_count": len(
+                                gov_result.diagnostics.contradiction_resolutions
+                            ),
+                            "moment_candidate_count": int(
+                                gov_result.diagnostics.moment_candidate_count
+                                or 0
+                            ),
+                        }
+                    )
                 persist_shadow_diagnostics(gov_conn, gov_req, gov_result, legacy_context)
                 unsafe_governed = bool(gov_result.diagnostics.processing_errors or gov_result.diagnostics.invalid_invariants)
                 if memory_governance_live_enabled() and not unsafe_governed:
@@ -17729,6 +17785,8 @@ class ConversationPromptSourceBasis:
     channel_name: str
     channel_policy: str
     source_row_ids: tuple[int, ...] = ()
+    participant_user_ids: tuple[int, ...] = ()
+    speaker_labels: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -17749,6 +17807,214 @@ PromptSourceBasis = Union[
     ConversationPromptSourceBasis,
     BatchMomentPromptSourceBasis,
 ]
+
+_UNIFIED_ASSESSMENT_CANON_RELEVANCE_RE = re.compile(
+    r"\b(?:barcode(?: network| radio)?|bnl-?01|6 bit|six bit|"
+    r"cache back|dj floppydisc|mac modem|sheila|cliff|studio rats?|"
+    r"9 bit|auxchord|friday show|broadcast)\b",
+    re.I,
+)
+
+
+def _canon_relevant_to_response(text: str) -> bool:
+    return bool(_UNIFIED_ASSESSMENT_CANON_RELEVANCE_RE.search(text or ""))
+
+
+def build_unified_response_assessment_shadow(
+    *,
+    guild_id: int,
+    route_mode: str,
+    channel_policy: str,
+    conversation_surface: str,
+    current_text: str,
+    current_speaker_user_ids: tuple[int, ...],
+    current_speaker_labels: tuple[str, ...],
+    target_user_ids: tuple[int, ...] = (),
+    prompt_source_bases: tuple[PromptSourceBasis, ...] = (),
+    memory_source_metadata: dict | None = None,
+    prompt_lanes: tuple[str, ...] = (),
+    continuity_required: bool = False,
+    exact_quote_requested: bool = False,
+    exact_quote_authority_present: bool = False,
+    show_state_present: bool = False,
+    website_read_model_present: bool = False,
+    source_context_present: bool = False,
+    broadcast_memory_present: bool = False,
+) -> UnifiedResponseAssessment | None:
+    """Build a shadow view from evidence already selected by existing owners."""
+    if not unified_response_assessment_shadow_enabled():
+        return None
+
+    memory_meta = memory_source_metadata or {}
+    conversation_bases = tuple(
+        basis
+        for basis in prompt_source_bases
+        if isinstance(basis, ConversationPromptSourceBasis)
+    )
+    participant_user_ids = tuple(
+        dict.fromkeys(
+            int(user_id or 0)
+            for user_id in (
+                *current_speaker_user_ids,
+                *target_user_ids,
+                *(
+                    participant_id
+                    for basis in conversation_bases
+                    for participant_id in basis.participant_user_ids
+                ),
+            )
+            if int(user_id or 0) > 0
+        )
+    )
+    speaker_labels = tuple(
+        dict.fromkeys(
+            label
+            for label in (
+                *current_speaker_labels,
+                *(
+                    speaker_label
+                    for basis in conversation_bases
+                    for speaker_label in basis.speaker_labels
+                ),
+            )
+            if str(label or "").strip()
+        )
+    )
+    current_exchange_source_ids = tuple(
+        dict.fromkeys(
+            source_row_id
+            for basis in conversation_bases
+            for source_row_id in basis.source_row_ids
+        )
+    )
+    has_moment_gist = bool(
+        memory_meta.get("moment_gist_rendered")
+        or any(
+            isinstance(
+                basis,
+                (MemoryPromptSourceBasis, BatchMomentPromptSourceBasis),
+            )
+            and basis.has_moment_gist
+            for basis in prompt_source_bases
+        )
+    )
+    canon_relevant = _canon_relevant_to_response(current_text)
+    return build_unified_response_assessment(
+        guild_id=guild_id,
+        route_mode=route_mode,
+        channel_policy=channel_policy,
+        conversation_surface=conversation_surface,
+        current_speaker_user_ids=current_speaker_user_ids,
+        target_user_ids=target_user_ids,
+        participant_user_ids=participant_user_ids,
+        speaker_labels=speaker_labels,
+        current_exchange_source_ids=current_exchange_source_ids,
+        prior_moment_ids=("rendered_moment_gist",) if has_moment_gist else (),
+        governed_entry_ids=tuple(
+            memory_meta.get("governed_entry_ids") or ()
+        ),
+        relationship_candidate_keys=(
+            ("relationship_v2_candidate",)
+            if memory_meta.get("relationship_v2_candidate_present")
+            else ()
+        ),
+        canon_refs=(
+            ("canon:%s" % CANON_SOURCE_CONTRACT_VERSION,)
+            if canon_relevant
+            else ()
+        ),
+        prompt_lanes=prompt_lanes,
+        continuity_required=continuity_required,
+        immediate_recap=immediate_room_recap_requested(current_text),
+        exact_quote_requested=exact_quote_requested,
+        exact_quote_authority_present=exact_quote_authority_present,
+        source_bases=prompt_source_bases,
+        prompt_budget=int(memory_meta.get("prompt_budget") or 0),
+        moment_candidate_count=int(
+            memory_meta.get("moment_candidate_count") or 0
+        ),
+        governed_candidate_count=int(
+            memory_meta.get("governed_candidate_count") or 0
+        ),
+        governance_exclusion_count=int(
+            memory_meta.get("governance_exclusion_count") or 0
+        ),
+        governance_contradiction_count=int(
+            memory_meta.get("governance_contradiction_count") or 0
+        ),
+        legacy_memory_present=bool(
+            memory_meta.get("legacy_memory_present")
+        ),
+        legacy_relationship_present=bool(
+            memory_meta.get("legacy_relationship_present")
+        ),
+        relationship_v2_candidate_present=bool(
+            memory_meta.get("relationship_v2_candidate_present")
+        ),
+        canon_relevant=canon_relevant,
+        show_state_present=show_state_present,
+        website_read_model_present=website_read_model_present,
+        source_context_present=source_context_present,
+        broadcast_memory_present=broadcast_memory_present,
+    )
+
+
+def record_unified_response_assessment_shadow(
+    assessment: UnifiedResponseAssessment | None,
+    *,
+    response: str,
+    guard_diagnostics: dict | None = None,
+    response_sent: bool = True,
+) -> str:
+    """Persist one content-free receipt; never affect response delivery."""
+    if assessment is None:
+        return ""
+    try:
+        with sqlite3.connect(DB_FILE, timeout=0.25) as assessment_conn:
+            run_id = persist_unified_response_assessment_shadow_run(
+                assessment_conn,
+                assessment,
+                response=response,
+                guard_diagnostics=guard_diagnostics,
+                response_sent=response_sent,
+            )
+            assessment_conn.commit()
+        logging.info(
+            "unified_response_assessment_shadow_recorded "
+            "route_mode=%s response_act=%s comparison=%s",
+            assessment.route_mode,
+            assessment.response_act,
+            assessment.comparison_status,
+        )
+        return run_id
+    except Exception as exc:
+        logging.warning(
+            "unified_response_assessment_shadow_record_failed "
+            "route_mode=%s error=%s",
+            assessment.route_mode,
+            type(exc).__name__,
+        )
+        return ""
+
+
+async def record_unified_response_assessment_shadow_after_send(
+    assessment: UnifiedResponseAssessment | None,
+    *,
+    response: str,
+    guard_diagnostics: dict | None = None,
+    response_sent: bool = True,
+) -> str:
+    """Keep additive shadow persistence off Discord's live event loop."""
+    if assessment is None:
+        return ""
+    return await asyncio.to_thread(
+        record_unified_response_assessment_shadow,
+        assessment,
+        response=response,
+        guard_diagnostics=guard_diagnostics,
+        response_sent=response_sent,
+    )
+
 
 _SOURCE_BEARING_MEMORY_MARKERS = (
     "Moment-based continuity gist",
@@ -17984,6 +18250,30 @@ def build_conversation_prompt_source_basis(
                 }
             )
         )
+        participant_user_ids = tuple(
+            sorted(
+                {
+                    int(row.get("user_id") or 0)
+                    for row in selected_rows
+                    if str(row.get("role") or "").strip().lower() == "user"
+                    and int(row.get("user_id") or 0) > 0
+                }
+            )
+        )
+        speaker_labels = tuple(
+            dict.fromkeys(
+                _safe_prompt_display_label(
+                    str(row.get("user_name") or ""),
+                    "",
+                )
+                for row in selected_rows
+                if str(row.get("role") or "").strip().lower() == "user"
+                and _safe_prompt_display_label(
+                    str(row.get("user_name") or ""),
+                    "",
+                )
+            )
+        )
         # Hand-built/test continuity blocks can lack resolvable rows. Preserve
         # the older conservative candidate digest for that compatibility path;
         # production-rendered v2 blocks carry exact source ids.
@@ -18018,6 +18308,8 @@ def build_conversation_prompt_source_basis(
         channel_name=(channel_name or "").strip().lower(),
         channel_policy=(channel_policy or "unknown").strip().lower(),
         source_row_ids=source_row_ids,
+        participant_user_ids=participant_user_ids,
+        speaker_labels=speaker_labels,
     )
 
 
@@ -23437,6 +23729,83 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                 batch_continuity_source,
                 typed_moment_gist_basis=batch_has_typed_moment_gist,
             )
+            batch_assessment_prompt_lanes = tuple(
+                dict.fromkeys(
+                    lane
+                    for lane, present in (
+                        ("current_exchange", True),
+                        (
+                            "conversation_context",
+                            batch_conversation_basis is not None,
+                        ),
+                        (
+                            "legacy_memory",
+                            any(
+                                isinstance(
+                                    basis,
+                                    MemoryPromptSourceBasis,
+                                )
+                                for basis in batch_prompt_source_bases
+                            ),
+                        ),
+                        (
+                            "relationship",
+                            bool(
+                                batch_memory_source_metadata.get(
+                                    "legacy_relationship_present"
+                                )
+                            ),
+                        ),
+                        ("prior_moment", batch_has_typed_moment_gist),
+                        (
+                            "canon",
+                            _canon_relevant_to_response(combined_text),
+                        ),
+                    )
+                    if present
+                )
+            )
+            batch_unified_assessment = (
+                build_unified_response_assessment_shadow(
+                    guild_id=guild_id,
+                    route_mode=ROUTE_MODE_NORMAL_CHAT,
+                    channel_policy=channel_policy,
+                    conversation_surface=(
+                        conversation_surface_for_channel_policy(
+                            channel_policy
+                        )
+                    ),
+                    current_text=combined_text,
+                    current_speaker_user_ids=tuple(unique_user_ids),
+                    current_speaker_labels=tuple(
+                        dict.fromkeys(
+                            _safe_prompt_display_label(name)
+                            for name, _content, _uid in collapsed_items
+                            if _safe_prompt_display_label(name)
+                        )
+                    ),
+                    target_user_ids=(
+                        (batch_attribution_contract.target_user_id,)
+                        if batch_attribution_contract.target_user_id > 0
+                        else ()
+                    ),
+                    prompt_source_bases=tuple(
+                        batch_prompt_source_bases
+                    ),
+                    memory_source_metadata=(
+                        batch_memory_source_metadata
+                    ),
+                    prompt_lanes=batch_assessment_prompt_lanes,
+                    continuity_required=batch_continuity_required,
+                    exact_quote_requested=(
+                        batch_attribution_contract.exact_quote_requested
+                    ),
+                    exact_quote_authority_present=(
+                        batch_attribution_contract.exact_quote_authority
+                        is not None
+                    ),
+                )
+            )
             continuity_contract = build_general_conversation_continuity_contract(
                 combined_text,
                 batch_continuity_source,
@@ -24028,6 +24397,12 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
             _log_batch_event(logging.INFO, "pending_request_continuation_answer", guild_id, channel_id, len(collapsed_items), f"reason={reason}")
         _log_batch_event(logging.INFO, "batch_response_answer", guild_id, channel_id, len(collapsed_items), f"reason={reason}")
         _channel_last_reply_at[channel_id] = datetime.now(PACIFIC_TZ)
+        await record_unified_response_assessment_shadow_after_send(
+            batch_unified_assessment,
+            response=response,
+            guard_diagnostics=guard_diagnostics,
+            response_sent=True,
+        )
     finally:
         _channel_payload_wait_extended[channel_id] = False
         await _clear_generation_state(channel_id, local_generation_id)
@@ -24447,6 +24822,63 @@ def build_user_aware_prompt(
         continuity_source_context,
         typed_moment_gist_basis=has_typed_moment_gist,
     )
+    assessment_prompt_lanes = tuple(
+        dict.fromkeys(
+            lane
+            for lane, present in (
+                ("current_exchange", True),
+                (
+                    "conversation_context",
+                    conversation_prompt_basis is not None,
+                ),
+                ("legacy_memory", memory_prompt_basis is not None),
+                (
+                    "relationship",
+                    bool(
+                        memory_source_metadata.get(
+                            "legacy_relationship_present"
+                        )
+                    ),
+                ),
+                ("prior_moment", has_typed_moment_gist),
+                ("broadcast_memory", bool(broadcast_context)),
+                ("show_state", bool(show_state_context)),
+                (
+                    "website_read_model",
+                    bool(website_read_model_context),
+                ),
+                ("source_context", bool(source_context_block)),
+                ("canon", _canon_relevant_to_response(clean_content)),
+            )
+            if present
+        )
+    )
+    unified_assessment = build_unified_response_assessment_shadow(
+        guild_id=guild_id,
+        route_mode=route_mode,
+        channel_policy=channel_policy,
+        conversation_surface=conversation_surface_for_channel_policy(
+            channel_policy
+        ),
+        current_text=clean_content,
+        current_speaker_user_ids=(int(user_id or 0),),
+        current_speaker_labels=(safe_display_name,),
+        target_user_ids=(
+            (int(moment_attribution_target_user_id),)
+            if int(moment_attribution_target_user_id or 0) > 0
+            else ()
+        ),
+        prompt_source_bases=tuple(prompt_source_bases),
+        memory_source_metadata=memory_source_metadata,
+        prompt_lanes=assessment_prompt_lanes,
+        continuity_required=continuity_required_state,
+        exact_quote_requested=exact_quote_requested,
+        exact_quote_authority_present=exact_quote_authority is not None,
+        show_state_present=bool(show_state_context),
+        website_read_model_present=bool(website_read_model_context),
+        source_context_present=bool(source_context_block),
+        broadcast_memory_present=bool(broadcast_context),
+    )
 
     if prompt_metadata is not None:
         prompt_metadata["source_context_available"] = bool(
@@ -24469,6 +24901,9 @@ def build_user_aware_prompt(
         )
         prompt_metadata["prompt_source_bases"] = tuple(
             prompt_source_bases
+        )
+        prompt_metadata["unified_response_assessment_shadow"] = (
+            unified_assessment
         )
 
     room_prompt_block = ""
@@ -25540,6 +25975,12 @@ async def _generate_direct_payload_session(session_key, reason: str):
     session["generating"] = False
     session["generation_invalidated"] = False
     logging.info(f"direct_session_committed revision={generation_revision} payload_count={payload_count}")
+    await record_unified_response_assessment_shadow_after_send(
+        prompt_metadata.get("unified_response_assessment_shadow"),
+        response=response,
+        guard_diagnostics=guard_diagnostics,
+        response_sent=True,
+    )
     if delta_mode:
         logging.info(f"direct_session_delta_completed new_payload_count={payload_count}")
 
@@ -26405,6 +26846,7 @@ async def send_planned_conversation_response(
     exact_quote_authority: CurrentRoomQuoteAuthority | None = None,
     third_party_attribution_requested: bool = False,
     prompt_source_bases: tuple[PromptSourceBasis, ...] = (),
+    unified_response_assessment_shadow: UnifiedResponseAssessment | None = None,
 ) -> MemoryWriteDecision:
     """Send a planned normal-conversation response through one governed path."""
     logging.info(
@@ -26628,6 +27070,12 @@ async def send_planned_conversation_response(
             logging.info("continuation_mark_skipped reason=guard_fallback_or_generic_non_answer route=%s channel_policy=%s", plan.route_mode, plan.channel_policy)
         if _response_requests_retransmission(response):
             _mark_awaiting_retransmission(message.guild.id, message.channel.id, message.author.id)
+    await record_unified_response_assessment_shadow_after_send(
+        unified_response_assessment_shadow,
+        response=response,
+        guard_diagnostics=guard_diagnostics,
+        response_sent=True,
+    )
     return model_decision
 
 
@@ -27621,6 +28069,9 @@ async def on_message(message: discord.Message):
                 prompt_source_bases=tuple(
                     prompt_metadata.get("prompt_source_bases") or ()
                 ),
+                unified_response_assessment_shadow=prompt_metadata.get(
+                    "unified_response_assessment_shadow"
+                ),
             )
             return
 
@@ -27952,6 +28403,9 @@ async def on_message(message: discord.Message):
             prompt_source_bases=tuple(
                 prompt_metadata.get("prompt_source_bases") or ()
             ),
+            unified_response_assessment_shadow=prompt_metadata.get(
+                "unified_response_assessment_shadow"
+            ),
         )
         return
 
@@ -28234,6 +28688,9 @@ async def on_message(message: discord.Message):
             ),
             prompt_source_bases=tuple(
                 prompt_metadata.get("prompt_source_bases") or ()
+            ),
+            unified_response_assessment_shadow=prompt_metadata.get(
+                "unified_response_assessment_shadow"
             ),
         )
         return
