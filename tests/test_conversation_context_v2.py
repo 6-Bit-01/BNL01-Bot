@@ -58,6 +58,35 @@ class ConversationContextV2Tests(unittest.TestCase):
         self.assertEqual(result.status, "current_payload_unanswered")
         self.assertEqual(result.current_anchor_hit_count, 0)
 
+    def test_payload_grounding_accepts_unambiguous_current_choice_reference(self):
+        for response in (
+            "The latter fits better because it sounds like a place.",
+            "The second option fits better because it sounds like a place.",
+            "Neither option fits the room yet.",
+        ):
+            with self.subTest(response=response):
+                result = assess_payload_grounding(
+                    response,
+                    current_payload_anchors=(
+                        "circuit saint",
+                        "null chapel",
+                    ),
+                )
+                self.assertEqual(
+                    result.status,
+                    "grounded_current_payload_reference",
+                )
+                self.assertFalse(result.failed)
+
+    def test_current_choice_reference_does_not_override_named_stale_option(self):
+        result = assess_payload_grounding(
+            "Ghost Signal is still stronger than the second option.",
+            current_payload_anchors=("dead channel", "open circuit"),
+            prior_thread_anchors=("ghost signal", "neon static"),
+        )
+        self.assertEqual(result.status, "stale_thread_substitution")
+        self.assertTrue(result.failed)
+
     def test_named_choice_helpers_keep_current_and_prior_payloads_distinct(self):
         current = (
             'Compare “Dead Channel” with “Open Circuit”; '

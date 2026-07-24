@@ -383,6 +383,88 @@ class CurrentPayloadGroundingGuardTests(unittest.IsolatedAsyncioTestCase):
             "CURRENT-PAYLOAD CORRECTION REQUIRED",
             provider.await_args.args[1],
         )
+        retry_prompt = provider.await_args.args[1].lower()
+        self.assertIn("resolved current alternatives", retry_prompt)
+        self.assertIn("dead channel", retry_prompt)
+        self.assertIn("open circuit", retry_prompt)
+
+    async def test_shared_guard_accepts_referential_current_choice_answer(self):
+        provider = mock.AsyncMock()
+        current_text = (
+            "Between Circuit Saint and Null Chapel, which fits the hidden "
+            "room better?"
+        )
+        with mock.patch.object(
+            bnl01_bot,
+            "get_gemini_response_with_optional_typing",
+            provider,
+        ):
+            response, diagnostics = (
+                await bnl01_bot.apply_guarded_response_regeneration(
+                    (
+                        "The latter fits better because it reads as a place "
+                        "instead of a person."
+                    ),
+                    prompt="Current user request: " + current_text,
+                    user_id=101,
+                    guild_id=1,
+                    route_mode=bnl01_bot.ROUTE_MODE_NORMAL_CHAT,
+                    channel_policy="sealed_test",
+                    current_user_text=current_text,
+                )
+            )
+
+        self.assertIn("The latter fits better", response)
+        self.assertEqual(
+            diagnostics["current_payload_grounding_status"],
+            "grounded_current_payload_reference",
+        )
+        self.assertFalse(
+            diagnostics["current_payload_grounding_guard_triggered"]
+        )
+        self.assertFalse(diagnostics["suppressed"])
+        provider.assert_not_awaited()
+
+    async def test_shared_guard_accepts_referential_grounding_retry(self):
+        provider = mock.AsyncMock(
+            return_value=(
+                "The second option fits better because it sounds like a place."
+            )
+        )
+        current_text = (
+            "Between Circuit Saint and Null Chapel, which fits the hidden "
+            "room better?"
+        )
+        with mock.patch.object(
+            bnl01_bot,
+            "get_gemini_response_with_optional_typing",
+            provider,
+        ):
+            response, diagnostics = (
+                await bnl01_bot.apply_guarded_response_regeneration(
+                    "Ghost Signal is still the stronger archive name.",
+                    prompt="Current user request: " + current_text,
+                    user_id=101,
+                    guild_id=1,
+                    route_mode=bnl01_bot.ROUTE_MODE_NORMAL_CHAT,
+                    channel_policy="sealed_test",
+                    current_user_text=current_text,
+                )
+            )
+
+        self.assertIn("The second option fits better", response)
+        self.assertTrue(
+            diagnostics["current_payload_grounding_guard_triggered"]
+        )
+        self.assertTrue(
+            diagnostics["current_payload_grounding_regenerated"]
+        )
+        self.assertEqual(
+            diagnostics["current_payload_grounding_status"],
+            "grounded_current_payload_reference",
+        )
+        self.assertFalse(diagnostics["suppressed"])
+        provider.assert_awaited_once()
 
     async def test_shared_guard_suppresses_second_unanswered_choice(self):
         provider = mock.AsyncMock(

@@ -358,6 +358,57 @@ class UnifiedResponseAssessmentShadowTests(unittest.TestCase):
         finally:
             conn.close()
 
+    def test_receipt_accepts_unambiguous_current_choice_reference(self):
+        conn = sqlite3.connect(":memory:")
+        try:
+            assessment = build_unified_response_assessment(
+                guild_id=321,
+                route_mode="normal_chat",
+                channel_policy="sealed_test",
+                conversation_surface="test",
+                current_speaker_user_ids=(1,),
+                prompt_lanes=("current_exchange",),
+                current_exchange_source_ids=(10,),
+                current_payload_anchors=(
+                    "circuit saint",
+                    "null chapel",
+                ),
+                thread_focus_mode="new_thread",
+            )
+            persist_shadow_run(
+                conn,
+                assessment,
+                response=(
+                    "The latter fits better because it sounds like a place."
+                ),
+            )
+            conn.commit()
+
+            row = conn.execute(
+                "SELECT payload_grounding_status, response_alignment, "
+                "current_payload_anchor_count, "
+                "current_payload_anchor_hit_count "
+                "FROM unified_response_assessment_shadow_runs"
+            ).fetchone()
+            self.assertEqual(
+                row,
+                (
+                    "grounded_current_payload_reference",
+                    "guard_clear",
+                    2,
+                    0,
+                ),
+            )
+            report = build_evaluation_report(conn, guild_id=321)
+            self.assertEqual(report["payload_grounding_applicable_runs"], 1)
+            self.assertEqual(report["payload_grounding_failure_runs"], 0)
+            self.assertEqual(
+                report["payload_grounding_status_counts"],
+                {"grounded_current_payload_reference": 1},
+            )
+        finally:
+            conn.close()
+
     def test_existing_v1_receipt_table_is_migrated_additively(self):
         conn = sqlite3.connect(":memory:")
         try:
