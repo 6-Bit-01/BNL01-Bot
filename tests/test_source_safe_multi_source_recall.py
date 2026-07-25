@@ -363,6 +363,43 @@ class SourceSafeMultiSourceRecallTests(unittest.IsolatedAsyncioTestCase):
             original_source_digest,
         )
 
+    def test_final_presend_revalidation_preserves_packet_diagnostics(self):
+        self.enable_canary()
+        self.insert_ledger(
+            "favorite color is green",
+            entry_id="source-a",
+            predicate="favorite_color",
+            entry_type="preference",
+            source_class="first_party_record",
+        )
+        room_context = (
+            "Conversation continuity (bounded same-room window):\n"
+            "- Test Member: I am still building the shared memory system."
+        )
+        _prompt, metadata = self.build_prompt(room_context)
+        bases = tuple(metadata["prompt_source_bases"])
+        before = bnl01_bot.memory_governance_canary_last_diagnostics(
+            42,
+            1,
+        )
+        self.assertTrue(before["synthesis_packet_assembled"])
+
+        self.assertEqual(
+            bnl01_bot.prompt_source_basis_failure(bases),
+            "",
+        )
+
+        after = bnl01_bot.memory_governance_canary_last_diagnostics(
+            42,
+            1,
+        )
+        self.assertTrue(after["synthesis_packet_assembled"])
+        self.assertGreaterEqual(after["packet_lane_count"], 2)
+        self.assertGreaterEqual(after["packet_source_count"], 2)
+        self.assertEqual(after["packet_conversation_source_count"], 0)
+        self.assertEqual(after["processing_error_count"], 0)
+        self.assertEqual(after["invalid_invariant_count"], 0)
+
     def test_canary_disable_after_prompt_assembly_fails_closed(self):
         self.enable_canary()
         self.insert_ledger(
