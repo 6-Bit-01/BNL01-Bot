@@ -1042,6 +1042,79 @@ class ConversationBatchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("BARCODE Radio", channel.sent[0])
         self.assertNotRegex(channel.sent[0].lower(), r"archive recall|\[core\]|current project")
 
+    async def test_batched_broad_recall_canary_enters_source_safe_synthesis(self):
+        channel = self._channel(8120)
+        prompts = []
+
+        async def generate(prompt, **_kwargs):
+            prompts.append(prompt)
+            return (
+                "I remember your green preference, the shared dreaming "
+                "conversation, and the memory-system work we have been doing."
+            )
+
+        canary_env = {
+            "BNL_MEMORY_GOVERNANCE_CANARY_ENABLED": "true",
+            "BNL_MEMORY_GOVERNANCE_CANARY_GUILD_IDS": str(
+                channel.guild.id
+            ),
+            "BNL_MEMORY_GOVERNANCE_CANARY_USER_IDS": "100",
+            "BNL_MEMORY_LEDGER_SHADOW_ENABLED": "true",
+            "BNL_MEMORY_GOVERNANCE_SHADOW_ENABLED": "true",
+            "BNL_MOMENT_ENGINE_SHADOW_ENABLED": "true",
+        }
+        legacy = "Here is what I can safely recall:\n- one Moment only"
+        self._prime_flush(channel, "what do you remember about me?")
+        with (
+            self._flush_runtime(channel.id, generate),
+            mock.patch.dict(os.environ, canary_env, clear=False),
+            mock.patch.object(
+                bnl01_bot,
+                "resolve_channel_policy",
+                return_value="public_home",
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "try_memory_recall_response",
+                return_value=legacy,
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "apply_explicit_recall_governance",
+            ) as deterministic_governance,
+            mock.patch.object(
+                bnl01_bot,
+                "build_user_memory_context",
+                return_value=(
+                    "Durable memory (governed):\n"
+                    "- favorite color is green\n"
+                    "- shared dreaming Moment"
+                ),
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "is_privileged_member",
+                return_value=False,
+            ),
+        ):
+            await bnl01_bot._flush_channel_buffer(channel)
+
+        deterministic_governance.assert_not_called()
+        self.assertEqual(len(prompts), 1)
+        self.assertIn(
+            "Source-safe personal recall synthesis contract:",
+            prompts[0],
+        )
+        self.assertIn("favorite color is green", prompts[0])
+        self.assertIn("shared dreaming Moment", prompts[0])
+        self.assertEqual(
+            channel.sent,
+            [
+                "I remember your green preference, the shared dreaming "
+                "conversation, and the memory-system work we have been doing."
+            ],
+        )
+
     async def test_batched_media_followup_wins_without_durable_governance(self):
         channel = self._channel(8119)
         provider = mock.AsyncMock(side_effect=AssertionError("deterministic media must not generate"))
