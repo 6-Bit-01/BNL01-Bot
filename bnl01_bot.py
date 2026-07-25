@@ -342,6 +342,10 @@ BNL_MOMENT_GIST_CANARY_ENABLED = (
     os.getenv("BNL_MOMENT_GIST_CANARY_ENABLED", "").strip().lower()
     in {"true", "1", "yes", "on", "enabled"}
 )
+BNL_MEMORY_GOVERNANCE_CANARY_ENABLED = (
+    os.getenv("BNL_MEMORY_GOVERNANCE_CANARY_ENABLED", "").strip().lower()
+    in {"true", "1", "yes", "on", "enabled"}
+)
 BNL_UNIFIED_MOMENT_CANARY_ENABLED = (
     os.getenv("BNL_UNIFIED_MOMENT_CANARY_ENABLED", "").strip().lower()
     in {"true", "1", "yes", "on", "enabled"}
@@ -698,6 +702,17 @@ LAST_ROUTE_DEBUG = {}
 LAST_MEMORY_LIFECYCLE_RESULT = {}
 LAST_MEMORY_PROMPT_DIAGNOSTICS = {}
 LAST_MEMORY_SKIP_REASONS = defaultdict(int)
+DEFAULT_MEMORY_GOVERNANCE_CANARY_DIAGNOSTICS = {
+    "configured_enabled": False,
+    "fully_scoped": False,
+    "enabled_for_route": False,
+    "evaluated": False,
+    "response_mode": "not_evaluated",
+    "selected_count": 0,
+    "rendered": False,
+    "fallback_reason": "not_evaluated",
+}
+LAST_MEMORY_GOVERNANCE_CANARY_DIAGNOSTICS = {}
 LAST_CONVERSATION_CONTEXT_V2_DIAGNOSTICS = {
     "contract_version": CONVERSATION_CONTEXT_VERSION,
     "enabled": True,
@@ -794,6 +809,81 @@ def moment_gist_canary_enabled(
         in {"public_home", "public_context"}
         and memory_ledger_shadow_enabled(env)
         and moment_engine_shadow_enabled(env)
+    )
+
+
+def memory_governance_canary_configuration(
+    environ: dict[str, str] | None = None,
+) -> dict[str, int | bool]:
+    """Return safe explicit-recall canary state without exposing allowlisted IDs."""
+    env = os.environ if environ is None else environ
+    enabled = str(
+        env.get(
+            "BNL_MEMORY_GOVERNANCE_CANARY_ENABLED",
+            "true" if BNL_MEMORY_GOVERNANCE_CANARY_ENABLED else "",
+        )
+    ).strip().lower() in {"true", "1", "yes", "on", "enabled"}
+    guilds = _positive_int_allowlist(
+        env.get("BNL_MEMORY_GOVERNANCE_CANARY_GUILD_IDS", "")
+    )
+    users = _positive_int_allowlist(
+        env.get("BNL_MEMORY_GOVERNANCE_CANARY_USER_IDS", "")
+    )
+    return {
+        "configured_enabled": enabled,
+        "guild_allowlist_count": len(guilds),
+        "user_allowlist_count": len(users),
+        "fully_scoped": bool(enabled and len(guilds) == 1 and users),
+    }
+
+
+def memory_governance_canary_enabled(
+    *,
+    guild_id: int,
+    user_id: int,
+    route_mode: str,
+    channel_policy: str,
+    environ: dict[str, str] | None = None,
+) -> bool:
+    """Authorize governed output only for one explicit personal-recall route.
+
+    The existing global live switch remains independent. The canary requires
+    one configured guild, an allowlisted participant, the established public
+    explicit-recall surfaces, and both Ledger and Governance shadow inputs.
+    """
+    env = os.environ if environ is None else environ
+    configuration = memory_governance_canary_configuration(env)
+    guilds = _positive_int_allowlist(
+        env.get("BNL_MEMORY_GOVERNANCE_CANARY_GUILD_IDS", "")
+    )
+    users = _positive_int_allowlist(
+        env.get("BNL_MEMORY_GOVERNANCE_CANARY_USER_IDS", "")
+    )
+    return bool(
+        configuration["fully_scoped"]
+        and int(guild_id or 0) in guilds
+        and int(user_id or 0) in users
+        and route_mode in {ROUTE_MODE_NORMAL_CHAT, ROUTE_MODE_DIRECT_PAYLOAD}
+        and (channel_policy or "").strip().lower()
+        in {"public_home", "public_context"}
+        and memory_ledger_shadow_enabled(env)
+        and memory_governance_shadow_enabled(env)
+    )
+
+
+def memory_governance_canary_last_diagnostics(
+    user_id: int,
+    guild_id: int,
+) -> dict:
+    not_evaluated = {
+        **DEFAULT_MEMORY_GOVERNANCE_CANARY_DIAGNOSTICS,
+        **memory_governance_canary_configuration(),
+    }
+    return dict(
+        LAST_MEMORY_GOVERNANCE_CANARY_DIAGNOSTICS.get(
+            (int(user_id or 0), int(guild_id or 0)),
+            not_evaluated,
+        )
     )
 
 
@@ -17298,9 +17388,57 @@ def apply_explicit_recall_governance(
     if not legacy_recall_response:
         return legacy_recall_response
     policy = (channel_policy or "unknown").strip().lower() or "unknown"
+    canary_configuration = memory_governance_canary_configuration()
+    canary_enabled_for_route = memory_governance_canary_enabled(
+        guild_id=guild_id,
+        user_id=user_id,
+        route_mode=route_mode,
+        channel_policy=policy,
+    )
+
+    def record_canary_diagnostics(
+        *,
+        evaluated: bool,
+        response_mode: str,
+        selected_count: int = 0,
+        rendered: bool = False,
+        fallback_reason: str = "",
+        legacy_vs_governed: dict | None = None,
+        processing_error_count: int = 0,
+        invalid_invariant_count: int = 0,
+    ) -> None:
+        LAST_MEMORY_GOVERNANCE_CANARY_DIAGNOSTICS[
+            (int(user_id or 0), int(guild_id or 0))
+        ] = {
+            **canary_configuration,
+            "enabled_for_route": bool(canary_enabled_for_route),
+            "evaluated": bool(evaluated),
+            "response_mode": str(response_mode or "unknown")[:80],
+            "selected_count": max(0, int(selected_count or 0)),
+            "rendered": bool(rendered),
+            "fallback_reason": str(fallback_reason or "")[:120],
+            "legacy_vs_governed": dict(legacy_vs_governed or {}),
+            "processing_error_count": max(
+                0, int(processing_error_count or 0)
+            ),
+            "invalid_invariant_count": max(
+                0, int(invalid_invariant_count or 0)
+            ),
+        }
+
     if route_mode in SOURCE_INTERNAL_MODES or policy not in PUBLIC_CHAT_POLICIES:
+        record_canary_diagnostics(
+            evaluated=False,
+            response_mode="legacy_route_excluded",
+            fallback_reason="route_not_authorized",
+        )
         return legacy_recall_response
     if not memory_governance_shadow_enabled():
+        record_canary_diagnostics(
+            evaluated=False,
+            response_mode="legacy_shadow_disabled",
+            fallback_reason="governance_shadow_disabled",
+        )
         return legacy_recall_response
     try:
         limits = calculate_adaptive_memory_limits(user_id, guild_id, route_mode=route_mode, channel_policy=policy, user_text=user_text, is_owner_or_mod=is_owner_or_mod)
@@ -17321,11 +17459,59 @@ def apply_explicit_recall_governance(
         )
         with sqlite3.connect(DB_FILE) as gov_conn:
             gov_result = build_governed_context(gov_conn, gov_req, legacy_context=legacy_recall_response, include_review_moments=True)
+            unsafe_governed = bool(
+                gov_result.diagnostics.processing_errors
+                or gov_result.diagnostics.invalid_invariants
+            )
+            global_live_enabled = memory_governance_live_enabled()
+            governed_authority = bool(
+                global_live_enabled or canary_enabled_for_route
+            )
+            response_mode = (
+                "legacy_unsafe_fallback"
+                if unsafe_governed
+                else "governed"
+                if governed_authority and gov_result.rendered_context
+                else "safe_empty"
+                if governed_authority
+                else "legacy_shadow_comparison"
+            )
+            gov_result.diagnostics.route_policy.update(
+                {
+                    "conversation_surface": "discord_explicit_recall",
+                    "memory_governance_canary_enabled_for_route": bool(
+                        canary_enabled_for_route
+                    ),
+                    "global_live_enabled": bool(global_live_enabled),
+                    "response_mode": response_mode,
+                }
+            )
             persist_shadow_diagnostics(gov_conn, gov_req, gov_result, legacy_recall_response)
-        unsafe_governed = bool(gov_result.diagnostics.processing_errors or gov_result.diagnostics.invalid_invariants)
-        if memory_governance_live_enabled() and not unsafe_governed:
+        record_canary_diagnostics(
+            evaluated=True,
+            response_mode=response_mode,
+            selected_count=gov_result.diagnostics.selected_count,
+            rendered=bool(gov_result.rendered_context),
+            fallback_reason=(
+                "unsafe_governed_result" if unsafe_governed else ""
+            ),
+            legacy_vs_governed=gov_result.diagnostics.legacy_vs_governed,
+            processing_error_count=len(
+                gov_result.diagnostics.processing_errors
+            ),
+            invalid_invariant_count=len(
+                gov_result.diagnostics.invalid_invariants
+            ),
+        )
+        if governed_authority and not unsafe_governed:
             return _format_explicit_recall_governed_response(gov_result)
     except Exception as exc:
+        record_canary_diagnostics(
+            evaluated=False,
+            response_mode="legacy_exception_fallback",
+            fallback_reason=type(exc).__name__,
+            processing_error_count=1,
+        )
         logging.warning(
             "memory_governance_explicit_recall_exception event=%s route_mode=%s channel_policy=%s exception_type=%s",
             "explicit_recall_governance_exception",
@@ -18910,7 +19096,11 @@ def prompt_source_basis_failure(
 
 def purge_member_memory_caches(user_id: int, guild_id: int) -> None:
     """Remove in-process member/guild memory diagnostics after complete delete."""
-    for cache in (LAST_MEMORY_LIFECYCLE_RESULT, LAST_MEMORY_PROMPT_DIAGNOSTICS):
+    for cache in (
+        LAST_MEMORY_LIFECYCLE_RESULT,
+        LAST_MEMORY_PROMPT_DIAGNOSTICS,
+        LAST_MEMORY_GOVERNANCE_CANARY_DIAGNOSTICS,
+    ):
         cache.pop((user_id, guild_id), None)
 
 
@@ -18929,6 +19119,15 @@ def build_memory_diagnostic_snapshot(user_id: int, guild_id: int, route_mode: st
             "memory_ledger_shadow": memory_ledger_shadow_enabled(),
             "moment_engine_shadow": moment_engine_shadow_enabled(),
             "moment_gist_canary": moment_gist_canary_configuration(),
+            "memory_governance_canary": (
+                memory_governance_canary_configuration()
+            ),
+            "memory_governance_canary_last": (
+                memory_governance_canary_last_diagnostics(
+                    user_id,
+                    guild_id,
+                )
+            ),
             "unified_moment_canary": (
                 unified_moment_canary_configuration()
             ),
@@ -30273,6 +30472,8 @@ async def bnl_memory_check(interaction: discord.Interaction):
         f"- memory_ledger_shadow_enabled: `{'yes' if memory_ledger_shadow_enabled() else 'no'}`",
         f"- moment_engine_shadow_enabled: `{'yes' if moment_engine_shadow_enabled() else 'no'}`",
         f"- moment_gist_canary_configuration: `{moment_gist_canary_configuration()}`",
+        f"- memory_governance_canary_configuration: `{memory_governance_canary_configuration()}`",
+        f"- memory_governance_canary_last: `{memory_governance_canary_last_diagnostics(interaction.user.id, guild.id)}`",
         f"- unified_moment_canary_configuration: `{unified_moment_canary_configuration()}`",
         f"- memory_governance_shadow_enabled: `{'yes' if memory_governance_shadow_enabled() else 'no'}`",
         f"- memory_governance_live_enabled: `{'yes' if memory_governance_live_enabled() else 'no'}`",
