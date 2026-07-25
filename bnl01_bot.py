@@ -885,13 +885,12 @@ BNL_REACTIONS_BROADCAST = ["📻", "🎚️", "🎛️", "🔊", "🎤", "📡",
 BNL_REACTIONS_GLITCH = ["🧿", "🫨", "⚠️", "❓", "🌀", "☢️", "📛", "📟"]
 BNL_REACTIONS_TECH = ["🧠", "⚙️", "💻", "🛰️", "🗜️", "📈", "🔧", "💾", "🗄️"]
 BNL_REACTIONS_VIBE = ["🫡", "👀", "🔥", "💯", "😵‍💫", "🧪", "🕶️", "🫶", "🖤"]
-BNL_CUSTOM_REACTION_CHANCE = 0.35
 BNL_CUSTOM_REACTION_NAMES = {
-    "base": ("barcode", "bnl", "bnl01", "sixbit", "galaknoise"),
-    "broadcast": ("djfloppydisc", "floppydisc", "sixbit", "galaknoise"),
-    "glitch": ("nulltv", "null_tv"),
-    "tech": ("macmodem", "mac_modem", "cacheback", "cache_back"),
-    "vibe": ("barcode", "bnl", "bnl01", "sixbit", "galaknoise"),
+    "base": ("barcode", "bnl", "bnl01", "sixbit", "6bit", "galaknoise"),
+    "broadcast": ("djfloppydisc", "floppydisc", "sixbit", "6bit", "galaknoise"),
+    "glitch": ("nulltv", "null_tv", "willythewarg"),
+    "tech": ("macmodem", "mac_modem", "macmod3m", "cacheback", "cache_back"),
+    "vibe": ("barcode", "bnl", "bnl01", "sixbit", "6bit", "galaknoise"),
 }
 
 PROTECTED_SYSTEM_CHANNELS = {"welcome", "episode-tracker"}
@@ -19103,6 +19102,7 @@ _last_reaction_by_channel = {}
 
 
 def _reaction_context_groups(content: str) -> list[str]:
+    content = (content or "").lower()
     groups = ["base"]
     if any(k in content for k in ("radio", "broadcast", "mix", "track", "song", "music", "tiktok", "show", "listen", "audio", "dj")):
         groups.append("broadcast")
@@ -19110,13 +19110,27 @@ def _reaction_context_groups(content: str) -> list[str]:
         groups.append("glitch")
     if any(k in content for k in ("code", "deploy", "server", "bot", "update", "memory", "database", "api", "archive", "backup")):
         groups.append("tech")
-    if any(k in content for k in ("lol", "lmao", "damn", "crazy", "fire", "wild", "w", "love", "community")):
+    if (
+        any(k in content for k in ("lol", "lmao", "damn", "crazy", "fire", "wild", "love", "community"))
+        or re.search(r"(?<![a-z0-9])w(?![a-z0-9])", content)
+    ):
         groups.append("vibe")
     return groups
 
 
 def _normalized_custom_emoji_name(name: str) -> str:
     return re.sub(r"[^a-z0-9]+", "", (name or "").strip().lower())
+
+
+def _custom_emoji_name_matches(name: str, allowed_names: set[str]) -> bool:
+    normalized_name = _normalized_custom_emoji_name(name)
+    if not normalized_name:
+        return False
+    return any(
+        normalized_name == allowed_name
+        or (len(allowed_name) >= 3 and allowed_name in normalized_name)
+        for allowed_name in allowed_names
+    )
 
 
 def _available_custom_reactions(message: discord.Message, groups: list[str]) -> list:
@@ -19132,7 +19146,7 @@ def _available_custom_reactions(message: discord.Message, groups: list[str]) -> 
     }
     available = []
     for emoji in guild_emojis:
-        if _normalized_custom_emoji_name(getattr(emoji, "name", "")) not in allowed_names:
+        if not _custom_emoji_name_matches(getattr(emoji, "name", ""), allowed_names):
             continue
         if not getattr(emoji, "available", True):
             continue
@@ -19167,15 +19181,11 @@ def choose_contextual_reaction(message: discord.Message, *, allow_custom: bool =
 
     last = _last_reaction_by_channel.get(message.channel.id)
     if allow_custom:
-        custom_options = [
+        merged.extend(
             emoji
             for emoji in _available_custom_reactions(message, groups)
             if str(emoji) != last
-        ]
-        if custom_options and random.random() < BNL_CUSTOM_REACTION_CHANCE:
-            choice = random.choice(custom_options)
-            _last_reaction_by_channel[message.channel.id] = str(choice)
-            return choice
+        )
 
     options = [e for e in merged if str(e) != last] or merged
     choice = random.choice(options)
