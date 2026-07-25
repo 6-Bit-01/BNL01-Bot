@@ -76,6 +76,7 @@ class MomentEpisodeLifecycleV2Tests(unittest.TestCase):
         minutes=0,
         channel_id=10,
         users=(1, 2, 1),
+        policy="public_home",
     ):
         sources = []
         for offset, text in enumerate(messages):
@@ -87,6 +88,7 @@ class MomentEpisodeLifecycleV2Tests(unittest.TestCase):
                     hours=hours,
                     minutes=minutes,
                     channel_id=channel_id,
+                    policy=policy,
                 )
             )
         moments.sweep_expired_windows(
@@ -102,6 +104,76 @@ class MomentEpisodeLifecycleV2Tests(unittest.TestCase):
             (channel_id,),
         ).fetchone()[0]
         return moment_id, tuple(sources)
+
+    def test_sealed_canary_renders_only_revalidated_aggregate_episode(self):
+        _moment_id, sources = self.finalize_shared_moment(
+            95,
+            (
+                "Let's build the synth routing for the chorus",
+                "The synth drum patch needs a bass answer",
+                "Which synth layer should we test next?",
+            ),
+            users=(1, 2, 3),
+            policy="sealed_test",
+        )
+        rendered = moments.render_active_episode_canary_context(
+            self.conn,
+            guild_id=1,
+            channel_id=10,
+            channel_policy="sealed_test",
+            route_mode="normal_chat",
+            topic_text="How should we continue the synth routing?",
+            participant_keys=("discord_user:1",),
+            now=self.timestamp(minutes=4),
+        )
+        self.assertIn("Active same-channel episode signal", rendered)
+        self.assertIn("Shared human participants: 3", rendered)
+        self.assertIn("Unresolved open loops:", rendered)
+        for forbidden in (
+            "Member 1",
+            "Member 2",
+            "Member 3",
+            "chorus",
+            "bass answer",
+            "mep_",
+            "mm_",
+        ):
+            self.assertNotIn(forbidden, rendered)
+
+        self.assertEqual(
+            moments.render_active_episode_canary_context(
+                self.conn,
+                guild_id=1,
+                channel_id=10,
+                channel_policy="public_home",
+                route_mode="normal_chat",
+                topic_text="synth routing",
+                now=self.timestamp(minutes=4),
+            ),
+            "",
+        )
+
+        self.conn.execute(
+            """
+            UPDATE memory_ledger_entries
+            SET lifecycle_status='retracted'
+            WHERE entry_id=?
+            """,
+            (sources[0].entry_id,),
+        )
+        self.assertEqual(
+            moments.render_active_episode_canary_context(
+                self.conn,
+                guild_id=1,
+                channel_id=10,
+                channel_policy="sealed_test",
+                route_mode="normal_chat",
+                topic_text="How should we continue the synth routing?",
+                participant_keys=("discord_user:1",),
+                now=self.timestamp(minutes=4),
+            ),
+            "",
+        )
 
     def test_coherent_moments_extend_one_shared_episode_with_any_participant_count(self):
         first_moment, _ = self.finalize_shared_moment(

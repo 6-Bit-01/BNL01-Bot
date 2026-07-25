@@ -165,13 +165,20 @@ turning conversation traces into biography. Multi-person replies are shared
 room output rather than a personal BNL reply copied into every participant's
 history.
 
-The episodic Moment lifecycle remains shadow-only. It records content-free
-action, reaction, decision, assignment, outcome, and open-loop roles against
-their Ledger sources; supports any number of participants on one shared
-episode; and propagates correction or deletion into review state. The Unified
-Response Assessment may record an opaque active-episode reference for
-comparison, but episode content is not rendered into production prompts in
-this stage.
+The episodic Moment lifecycle remains shadow-only by default. It records
+content-free action, reaction, decision, assignment, outcome, and open-loop
+roles against their Ledger sources; supports any number of participants on one
+shared episode; and propagates correction or deletion into review state. The
+Unified Response Assessment may record an opaque active-episode reference for
+comparison.
+
+`BNL_UNIFIED_MOMENT_CANARY_ENABLED` defaults off. When it and the exact guild
+and channel allowlists are configured, the Unified Assessment and a
+source-revalidated, content-free active-episode signal may guide a response
+only on that `sealed_test` route. The canary cannot run unless all assessment
+shadow prerequisites are effective and all global live gates are off. Public
+and other non-allowlisted prompts remain unchanged. Setting the flag to
+`false` and restarting is the response-path kill switch.
 
 When asked what another person said, BNL should give a cautious gist by default.
 Exact wording is a separate, fail-closed evidence mode: it requires a

@@ -10,7 +10,10 @@ from bnl_unified_response_assessment import (
     build_unified_response_assessment,
     ensure_schema,
     persist_shadow_run,
+    render_sealed_canary_brief,
+    response_exposes_canary_control_markers,
     shadow_configuration,
+    with_prompt_lane_presence,
 )
 
 
@@ -123,6 +126,73 @@ class UnifiedResponseAssessmentShadowTests(unittest.TestCase):
         self.assertEqual(
             live["active_live_gates"],
             ("BNL_RELATIONSHIP_V2_LIVE_ENABLED",),
+        )
+
+    def test_sealed_canary_brief_preserves_attribution_without_raw_transcript(self):
+        assessment = self.shared_choice_assessment()
+        brief = render_sealed_canary_brief(
+            assessment,
+            active_episode_context=(
+                "[Active same-channel episode signal; aggregate continuity "
+                "only, never quotation or durable-fact authority]\n"
+                "- Shared human participants: 2."
+            ),
+        )
+        self.assertIn("SEALED UNIFIED CONVERSATION CANARY", brief)
+        self.assertIn(
+            "Current options: chrome prophet | null basilica",
+            brief,
+        )
+        self.assertIn("Criterion attributed to Miss Bit", brief)
+        self.assertIn("favor [place]; avoid [character]", brief)
+        self.assertIn("one clear choice first", brief)
+        self.assertIn("Active same-channel episode signal", brief)
+        self.assertNotIn(
+            "The hidden room should sound like a place, not a character.",
+            brief,
+        )
+        self.assertTrue(
+            response_exposes_canary_control_markers(
+                "The unified response assessment says to choose it."
+            )
+        )
+        self.assertFalse(
+            response_exposes_canary_control_markers(
+                "Null Basilica fits because it reads as a place."
+            )
+        )
+
+    def test_prompt_lane_reconciliation_tracks_episode_rendering(self):
+        assessment = build_unified_response_assessment(
+            guild_id=1,
+            route_mode="normal_chat",
+            channel_policy="sealed_test",
+            conversation_surface="test",
+            current_speaker_user_ids=(1,),
+            current_exchange_source_ids=(10,),
+            active_episode_id="opaque_episode",
+            prompt_lanes=("current_exchange", "conversation_context"),
+        )
+        self.assertEqual(
+            assessment.comparison_status,
+            "prompt_underincluded",
+        )
+        rendered = with_prompt_lane_presence(
+            assessment,
+            "active_episode",
+            present=True,
+        )
+        self.assertIn("active_episode", rendered.prompt_lanes)
+        self.assertEqual(rendered.comparison_status, "match")
+        removed = with_prompt_lane_presence(
+            rendered,
+            "active_episode",
+            present=False,
+        )
+        self.assertNotIn("active_episode", removed.prompt_lanes)
+        self.assertEqual(
+            removed.comparison_status,
+            "prompt_underincluded",
         )
 
     def test_immediate_recap_is_current_first_for_any_participant_count(self):
@@ -759,6 +829,60 @@ class UnifiedResponseAssessmentShadowTests(unittest.TestCase):
         finally:
             conn.close()
 
+    def test_receipt_reports_scoped_canary_without_new_authority(self):
+        conn = sqlite3.connect(":memory:")
+        try:
+            assessment = self.shared_choice_assessment()
+            persist_shadow_run(
+                conn,
+                assessment,
+                response=(
+                    "Null Basilica fits better because it reads as a place "
+                    "instead of a person."
+                ),
+                guard_diagnostics={
+                    "unified_moment_canary_applied": True,
+                    "unified_moment_canary_scope_valid": True,
+                    "unified_moment_canary_episode_context": True,
+                    "unified_moment_canary_coherence_guard_triggered": True,
+                    "unified_moment_canary_coherence_regenerated": True,
+                },
+            )
+            conn.commit()
+            row = conn.execute(
+                """
+                SELECT behavior_changed,new_authority_applied,
+                       scoped_canary_applied,
+                       scoped_canary_scope_valid,
+                       scoped_canary_episode_context,
+                       scoped_canary_guard_triggered,
+                       scoped_canary_guard_repaired,
+                       scoped_canary_output_leak_guard
+                FROM unified_response_assessment_shadow_runs
+                """
+            ).fetchone()
+            self.assertEqual(row, (0, 0, 1, 1, 1, 1, 1, 0))
+            report = build_evaluation_report(conn, guild_id=1)
+            self.assertEqual(report["scoped_canary_runs"], 1)
+            self.assertEqual(
+                report["scoped_canary_episode_context_runs"],
+                1,
+            )
+            self.assertEqual(
+                report["scoped_canary_guard_triggered_runs"],
+                1,
+            )
+            self.assertEqual(
+                report["scoped_canary_guard_repaired_runs"],
+                1,
+            )
+            self.assertEqual(
+                report["scoped_canary_invalid_scope_runs"],
+                0,
+            )
+        finally:
+            conn.close()
+
     def test_receipt_detects_stale_choice_even_when_lane_comparison_matches(self):
         conn = sqlite3.connect(":memory:")
         try:
@@ -936,6 +1060,12 @@ class UnifiedResponseAssessmentShadowTests(unittest.TestCase):
                 "response_coherence_status",
                 "coherence_conclusion_status",
                 "coherence_reason_codes_json",
+                "scoped_canary_applied",
+                "scoped_canary_scope_valid",
+                "scoped_canary_episode_context",
+                "scoped_canary_guard_triggered",
+                "scoped_canary_guard_repaired",
+                "scoped_canary_output_leak_guard",
             ):
                 self.assertIn(column, columns)
             self.assertEqual(

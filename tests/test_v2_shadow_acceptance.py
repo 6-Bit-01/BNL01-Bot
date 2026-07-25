@@ -202,6 +202,63 @@ class V2ShadowAcceptanceTests(unittest.TestCase):
             snapshot["blockers"],
         )
 
+    def test_scoped_canary_receipt_is_reported_and_invalid_scope_blocks(self):
+        assessment = build_unified_response_assessment(
+            guild_id=1,
+            route_mode="normal_chat",
+            channel_policy="sealed_test",
+            conversation_surface="test",
+            current_speaker_user_ids=(99,),
+            prompt_lanes=("current_exchange", "active_episode"),
+        )
+        persist_unified_assessment_shadow_run(
+            self.conn,
+            assessment,
+            response="Lead with the neighborhood because it preserves choice.",
+            guard_diagnostics={
+                "unified_moment_canary_applied": True,
+                "unified_moment_canary_scope_valid": True,
+                "unified_moment_canary_episode_context": True,
+            },
+        )
+        self.conn.commit()
+        environ = {
+            "BNL_MEMORY_LEDGER_SHADOW_ENABLED": "true",
+            "BNL_MOMENT_ENGINE_SHADOW_ENABLED": "true",
+            "BNL_MEMORY_GOVERNANCE_SHADOW_ENABLED": "true",
+            "BNL_RELATIONSHIP_V2_SHADOW_ENABLED": "true",
+        }
+
+        snapshot = self.snapshot(environ)
+        report = snapshot["reports"]["unifiedResponseAssessment"]
+        self.assertEqual(report["scoped_canary_runs"], 1)
+        self.assertEqual(report["scoped_canary_episode_context_runs"], 1)
+        self.assertEqual(report["scoped_canary_invalid_scope_runs"], 0)
+        self.assertNotIn(
+            "unified_response_assessment:"
+            "scoped_canary_invalid_scope_runs",
+            snapshot["blockers"],
+        )
+        rendered = "\n".join(
+            render_v2_shadow_acceptance_lines(snapshot)
+        )
+        self.assertIn(
+            "unified_moment_canary: runs=`1` episode_context=`1`",
+            rendered,
+        )
+
+        self.conn.execute(
+            "UPDATE unified_response_assessment_shadow_runs "
+            "SET scoped_canary_scope_valid=0"
+        )
+        self.conn.commit()
+        invalid_snapshot = self.snapshot(environ)
+        self.assertIn(
+            "unified_response_assessment:"
+            "scoped_canary_invalid_scope_runs",
+            invalid_snapshot["blockers"],
+        )
+
     def test_unrepaired_payload_grounding_failure_is_a_hard_blocker(self):
         assessment = build_unified_response_assessment(
             guild_id=1,

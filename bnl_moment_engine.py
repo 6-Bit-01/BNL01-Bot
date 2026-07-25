@@ -3629,6 +3629,191 @@ def active_episode_for_assessment(
     )
 
 
+def render_active_episode_canary_context(
+    conn: sqlite3.Connection,
+    *,
+    guild_id: int,
+    channel_id: int,
+    channel_policy: str,
+    route_mode: str,
+    topic_text: str,
+    participant_keys: tuple[str, ...] = (),
+    now: str | None = None,
+) -> str:
+    """Render source-revalidated aggregate episode context for sealed testing.
+
+    This is deliberately narrower than the public Moment gist canary. It may
+    describe one active episode only when every linked source is still usable
+    inside the exact same sealed channel. It never renders source text,
+    participant names, ids, Moment ids, or episode ids.
+    """
+
+    if (
+        str(channel_policy or "").strip().lower() != "sealed_test"
+        or int(guild_id or 0) <= 0
+        or int(channel_id or 0) <= 0
+    ):
+        return ""
+    reference = active_episode_for_assessment(
+        conn,
+        guild_id=int(guild_id or 0),
+        channel_id=int(channel_id or 0),
+        channel_policy="sealed_test",
+        route_mode=str(route_mode or "unknown"),
+        topic_text=str(topic_text or "")[:8000],
+        participant_keys=participant_keys,
+        now=now,
+    )
+    if reference is None:
+        return ""
+    episode = conn.execute(
+        """
+        SELECT topic_family,visibility,public_usable,lifecycle_status,
+               participant_count,open_loop_count,semantic_types_json
+        FROM memory_moment_episodes
+        WHERE episode_id=? AND guild_id=? AND channel_id=?
+          AND channel_policy='sealed_test' AND route_mode=?
+        """,
+        (
+            reference.episode_id,
+            int(guild_id or 0),
+            int(channel_id or 0),
+            str(route_mode or "unknown"),
+        ),
+    ).fetchone()
+    if (
+        not episode
+        or str(episode[1] or "") != "sealed_test"
+        or bool(episode[2])
+        or str(episode[3] or "") != "active"
+        or max(0, int(episode[4] or 0)) != reference.participant_count
+        or max(0, int(episode[5] or 0)) != reference.open_loop_count
+    ):
+        return ""
+    try:
+        semantic_types = tuple(
+            value
+            for value in json.loads(str(episode[6] or "[]"))
+            if value in EPISODE_EVENT_TYPES
+        )
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return ""
+    if semantic_types != reference.semantic_types:
+        return ""
+
+    for moment_id in reference.source_moment_ids:
+        window = conn.execute(
+            """
+            SELECT guild_id,channel_id,channel_policy,route_mode,visibility,
+                   public_usable,lifecycle_status,summary,
+                   canonical_ledger_entry_id
+            FROM memory_moment_windows
+            WHERE moment_id=?
+            """,
+            (moment_id,),
+        ).fetchone()
+        if (
+            not window
+            or int(window[0] or 0) != int(guild_id or 0)
+            or int(window[1] or 0) != int(channel_id or 0)
+            or str(window[2] or "") != "sealed_test"
+            or str(window[3] or "") != str(route_mode or "unknown")
+            or str(window[4] or "") != "sealed_test"
+            or bool(window[5])
+            or str(window[6] or "") != "finalized"
+            or not _is_safe_gist_summary(str(window[7] or ""))
+            or not str(window[8] or "")
+        ):
+            return ""
+        rows = _entries(conn, moment_id)
+        failure, _failure_lifecycle = _moment_source_failure(
+            conn,
+            moment_id=moment_id,
+            rows=rows,
+            guild_id=int(guild_id or 0),
+            channel_id=int(channel_id or 0),
+            channel_policy="sealed_test",
+            route_mode=str(route_mode or "unknown"),
+            visibility="sealed_test",
+            public_usable=False,
+        )
+        if failure:
+            return ""
+        if any(
+            conn.execute(
+                """
+                SELECT 1 FROM memory_ledger_lineage
+                WHERE guild_id=? AND target_entry_id=?
+                  AND lineage_type IN (
+                    'correction_of','supersedes','retracts'
+                  )
+                LIMIT 1
+                """,
+                (int(guild_id or 0), source.entry_id),
+            ).fetchone()
+            for source in rows
+        ):
+            return ""
+        canonical = conn.execute(
+            """
+            SELECT guild_id,source_table,source_row_id,entry_type,channel_id,
+                   channel_policy,route_mode,visibility,public_usable,
+                   lifecycle_status,normalized_value
+            FROM memory_ledger_entries WHERE entry_id=?
+            """,
+            (str(window[8] or ""),),
+        ).fetchone()
+        if (
+            not canonical
+            or int(canonical[0] or 0) != int(guild_id or 0)
+            or str(canonical[1] or "") != "memory_moment_windows"
+            or str(canonical[2] or "") != moment_id
+            or str(canonical[3] or "") != "shared_moment"
+            or int(canonical[4] or 0) != int(channel_id or 0)
+            or str(canonical[5] or "") != "sealed_test"
+            or str(canonical[6] or "") != str(route_mode or "unknown")
+            or str(canonical[7] or "") != "sealed_test"
+            or bool(canonical[8])
+            or str(canonical[9] or "")
+            not in SOURCE_LIFECYCLES_USABLE_FOR_MOMENTS
+        ):
+            return ""
+        try:
+            canonical_value = json.loads(str(canonical[10] or ""))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return ""
+        if (
+            not isinstance(canonical_value, dict)
+            or canonical_value.get("schema") != MOMENT_SCHEMA_VERSION
+            or canonical_value.get("moment_id") != moment_id
+            or canonical_value.get("summary") != str(window[7] or "")
+            or canonical_value.get("public_usable") is not False
+            or canonical_value.get("lifecycle_status") != "finalized"
+        ):
+            return ""
+
+    topic_family = str(episode[0] or "topic_other")
+    topic_label = TOPIC_GIST_LABELS.get(
+        topic_family,
+        TOPIC_GIST_LABELS["topic_other"],
+    )
+    semantic_label = (
+        ", ".join(reference.semantic_types)
+        if reference.semantic_types
+        else "ongoing discussion"
+    )
+    return (
+        "[Active same-channel episode signal; aggregate continuity only, "
+        "never quotation or durable-fact authority]\n"
+        f"- Continuity topic: {topic_label}.\n"
+        f"- Shared human participants: {reference.participant_count}.\n"
+        f"- Observed conversation roles: {semantic_label}.\n"
+        f"- Unresolved open loops: {reference.open_loop_count}.\n"
+        "- Resolve all details from the selected current-room evidence. "
+        "Current requests and corrections outrank this aggregate signal."
+    )
+
+
 def finalize_moment(conn: sqlite3.Connection, moment_id: str) -> MomentObservationResult:
     ensure_moment_schema(conn)
     win = conn.execute(

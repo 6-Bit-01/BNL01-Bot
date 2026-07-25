@@ -568,6 +568,12 @@ def _empty_unified_assessment_report() -> Dict[str, Any]:
         "processing_errors": 0,
         "behavior_changed_runs": 0,
         "new_authority_applied_runs": 0,
+        "scoped_canary_runs": 0,
+        "scoped_canary_invalid_scope_runs": 0,
+        "scoped_canary_episode_context_runs": 0,
+        "scoped_canary_guard_triggered_runs": 0,
+        "scoped_canary_guard_repaired_runs": 0,
+        "scoped_canary_output_leak_guard_runs": 0,
         "content_fields_present": [],
         "evidenceWindow": {"first": "none", "last": "none"},
     }
@@ -862,6 +868,16 @@ def build_v2_shadow_acceptance_snapshot(
     if unified_assessment.get("reportError"):
         unified_assessment_blockers.append(
             "report_error:%s" % unified_assessment["reportError"]
+        )
+    if int(
+        unified_assessment.get(
+            "scoped_canary_invalid_scope_runs",
+            0,
+        )
+        or 0
+    ):
+        unified_assessment_blockers.append(
+            "scoped_canary_invalid_scope_runs"
         )
 
     blockers = ["live_gate_enabled:%s" % name for name in live_gates]
@@ -1208,6 +1224,29 @@ def render_v2_shadow_acceptance_lines(snapshot: Mapping[str, Any]) -> List[str]:
             unified_assessment.get("criterion_total", 0),
             unified_assessment.get("option_total", 0),
             unified_assessment.get("ambiguity_reason_total", 0),
+        ),
+        "- unified_moment_canary: runs=`%s` episode_context=`%s` guards=`%s/%s` output_leak_guards=`%s` invalid_scope=`%s`" % (
+            unified_assessment.get("scoped_canary_runs", 0),
+            unified_assessment.get(
+                "scoped_canary_episode_context_runs",
+                0,
+            ),
+            unified_assessment.get(
+                "scoped_canary_guard_triggered_runs",
+                0,
+            ),
+            unified_assessment.get(
+                "scoped_canary_guard_repaired_runs",
+                0,
+            ),
+            unified_assessment.get(
+                "scoped_canary_output_leak_guard_runs",
+                0,
+            ),
+            unified_assessment.get(
+                "scoped_canary_invalid_scope_runs",
+                0,
+            ),
         ),
         "- blockers: `%s`" % (", ".join(blockers) if blockers else "none"),
         "- warnings: `%s`" % (", ".join(warnings) if warnings else "none"),

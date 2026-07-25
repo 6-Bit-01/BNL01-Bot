@@ -74,6 +74,7 @@ from bnl_memory_governance import (
 from bnl_moment_engine import (
     active_episode_for_assessment,
     observe_ledger_entry as observe_moment_ledger_entry,
+    render_active_episode_canary_context,
     render_shadow_moment_context,
     shadow_enabled as moment_engine_shadow_enabled,
     sweep_expired_episodes,
@@ -110,11 +111,15 @@ from bnl_shadow_acceptance import (
 from bnl_unified_response_assessment import (
     ConversationEvidenceItem,
     UnifiedResponseAssessment,
+    assess_response_coherence,
     build_conversation_evidence_item,
     build_unified_response_assessment,
     ensure_schema as ensure_unified_response_assessment_schema,
     persist_shadow_run as persist_unified_response_assessment_shadow_run,
+    render_sealed_canary_brief,
+    response_exposes_canary_control_markers,
     shadow_enabled as unified_response_assessment_shadow_enabled,
+    with_prompt_lane_presence,
 )
 from bnl_journal import (
     JOURNAL_ROUTE,
@@ -335,6 +340,10 @@ BNL_TYPING_INDICATOR_COOLDOWN_SECONDS = max(8, int(os.getenv("BNL_TYPING_INDICAT
 BNL_DORMANT_ECHO_ENABLED = os.getenv("BNL_DORMANT_ECHO_ENABLED", "true").strip().lower() in {"true", "1", "yes", "on", "enabled"}
 BNL_MOMENT_GIST_CANARY_ENABLED = (
     os.getenv("BNL_MOMENT_GIST_CANARY_ENABLED", "").strip().lower()
+    in {"true", "1", "yes", "on", "enabled"}
+)
+BNL_UNIFIED_MOMENT_CANARY_ENABLED = (
+    os.getenv("BNL_UNIFIED_MOMENT_CANARY_ENABLED", "").strip().lower()
     in {"true", "1", "yes", "on", "enabled"}
 )
 try:
@@ -785,6 +794,65 @@ def moment_gist_canary_enabled(
         in {"public_home", "public_context"}
         and memory_ledger_shadow_enabled(env)
         and moment_engine_shadow_enabled(env)
+    )
+
+
+def unified_moment_canary_configuration(
+    environ: dict[str, str] | None = None,
+) -> dict[str, int | bool]:
+    """Return scoped canary state without exposing allowlisted ids."""
+
+    env = os.environ if environ is None else environ
+    enabled = str(
+        env.get(
+            "BNL_UNIFIED_MOMENT_CANARY_ENABLED",
+            "true" if BNL_UNIFIED_MOMENT_CANARY_ENABLED else "",
+        )
+    ).strip().lower() in {"true", "1", "yes", "on", "enabled"}
+    guilds = _positive_int_allowlist(
+        env.get("BNL_UNIFIED_MOMENT_CANARY_GUILD_IDS", "")
+    )
+    channels = _positive_int_allowlist(
+        env.get("BNL_UNIFIED_MOMENT_CANARY_CHANNEL_IDS", "")
+    )
+    return {
+        "configured_enabled": enabled,
+        "guild_allowlist_count": len(guilds),
+        "channel_allowlist_count": len(channels),
+        "fully_scoped": bool(
+            enabled and len(guilds) == 1 and len(channels) == 1
+        ),
+    }
+
+
+def unified_moment_canary_enabled(
+    *,
+    guild_id: int,
+    channel_id: int,
+    route_mode: str,
+    channel_policy: str,
+    environ: dict[str, str] | None = None,
+) -> bool:
+    """Authorize the assessment/Moment brief only for an exact sealed route."""
+
+    env = os.environ if environ is None else environ
+    configuration = unified_moment_canary_configuration(env)
+    guilds = _positive_int_allowlist(
+        env.get("BNL_UNIFIED_MOMENT_CANARY_GUILD_IDS", "")
+    )
+    channels = _positive_int_allowlist(
+        env.get("BNL_UNIFIED_MOMENT_CANARY_CHANNEL_IDS", "")
+    )
+    return bool(
+        configuration["fully_scoped"]
+        and int(guild_id or 0) in guilds
+        and int(channel_id or 0) in channels
+        and str(channel_policy or "").strip().lower() == "sealed_test"
+        and route_mode
+        in {ROUTE_MODE_NORMAL_CHAT, ROUTE_MODE_DIRECT_PAYLOAD}
+        and memory_ledger_shadow_enabled(env)
+        and moment_engine_shadow_enabled(env)
+        and unified_response_assessment_shadow_enabled(env)
     )
 
 
@@ -17849,10 +17917,27 @@ class BatchMomentPromptSourceBasis:
     has_moment_gist: bool = True
 
 
+@dataclass(frozen=True)
+class UnifiedMomentCanaryPromptSourceBasis:
+    """Reconstructable sealed-test assessment and episode prompt block."""
+
+    expected_digest: str
+    rendered_context: str
+    assessment: UnifiedResponseAssessment
+    guild_id: int
+    channel_id: int
+    channel_policy: str
+    route_mode: str
+    topic_text: str
+    participant_user_ids: tuple[int, ...] = ()
+    episode_context_present: bool = False
+
+
 PromptSourceBasis = Union[
     MemoryPromptSourceBasis,
     ConversationPromptSourceBasis,
     BatchMomentPromptSourceBasis,
+    UnifiedMomentCanaryPromptSourceBasis,
 ]
 
 _UNIFIED_ASSESSMENT_CANON_RELEVANCE_RE = re.compile(
@@ -18133,6 +18218,15 @@ def record_unified_response_assessment_shadow(
     response_sent: bool = True,
 ) -> str:
     """Persist one content-free receipt; never affect response delivery."""
+    for basis in tuple(
+        (guard_diagnostics or {}).get(
+            "_revalidated_prompt_source_bases"
+        )
+        or ()
+    ):
+        if isinstance(basis, UnifiedMomentCanaryPromptSourceBasis):
+            assessment = basis.assessment
+            break
     if assessment is None:
         return ""
     try:
@@ -18220,6 +18314,116 @@ def _has_typed_moment_gist_basis(
 
 def _prompt_source_digest(value: str) -> str:
     return hashlib.sha256(str(value or "").encode("utf-8")).hexdigest()
+
+
+def _render_unified_moment_canary_context(
+    assessment: UnifiedResponseAssessment,
+    *,
+    guild_id: int,
+    channel_id: int,
+    channel_policy: str,
+    route_mode: str,
+    topic_text: str,
+    participant_user_ids: tuple[int, ...],
+) -> tuple[str, bool, UnifiedResponseAssessment]:
+    """Rebuild the sealed canary block from current source state."""
+
+    if (
+        not isinstance(assessment, UnifiedResponseAssessment)
+        or assessment.guild_id != int(guild_id or 0)
+        or assessment.channel_policy
+        != str(channel_policy or "").strip().lower()
+        or not unified_moment_canary_enabled(
+            guild_id=int(guild_id or 0),
+            channel_id=int(channel_id or 0),
+            route_mode=str(route_mode or "unknown"),
+            channel_policy=str(channel_policy or "unknown"),
+        )
+    ):
+        return "", False, assessment
+    episode_context = ""
+    if (
+        DB_FILE != ":memory:"
+        and os.path.exists(DB_FILE)
+        and int(channel_id or 0) > 0
+    ):
+        participant_keys = tuple(
+            "discord_user:%s" % int(user_id)
+            for user_id in participant_user_ids
+            if int(user_id or 0) > 0
+        )
+        try:
+            with sqlite3.connect(
+                "file:%s?mode=ro" % DB_FILE,
+                uri=True,
+                timeout=0.1,
+            ) as episode_conn:
+                episode_context = render_active_episode_canary_context(
+                    episode_conn,
+                    guild_id=int(guild_id or 0),
+                    channel_id=int(channel_id or 0),
+                    channel_policy=str(channel_policy or "unknown"),
+                    route_mode=str(route_mode or "unknown"),
+                    topic_text=str(topic_text or "")[:8000],
+                    participant_keys=participant_keys,
+                )
+        except (OSError, sqlite3.DatabaseError, ValueError, TypeError):
+            episode_context = ""
+    reconciled_assessment = with_prompt_lane_presence(
+        assessment,
+        "active_episode",
+        present=bool(episode_context),
+    )
+    rendered = render_sealed_canary_brief(
+        reconciled_assessment,
+        active_episode_context=episode_context,
+    )
+    return rendered, bool(episode_context), reconciled_assessment
+
+
+def build_unified_moment_canary_prompt_source_basis(
+    assessment: UnifiedResponseAssessment | None,
+    *,
+    guild_id: int,
+    channel_id: int,
+    channel_policy: str,
+    route_mode: str,
+    topic_text: str,
+    participant_user_ids: tuple[int, ...],
+) -> UnifiedMomentCanaryPromptSourceBasis | None:
+    if assessment is None:
+        return None
+    rendered, episode_context_present, reconciled_assessment = (
+        _render_unified_moment_canary_context(
+            assessment,
+            guild_id=guild_id,
+            channel_id=channel_id,
+            channel_policy=channel_policy,
+            route_mode=route_mode,
+            topic_text=topic_text,
+            participant_user_ids=participant_user_ids,
+        )
+    )
+    if not rendered:
+        return None
+    return UnifiedMomentCanaryPromptSourceBasis(
+        expected_digest=_prompt_source_digest(rendered),
+        rendered_context=rendered,
+        assessment=reconciled_assessment,
+        guild_id=int(guild_id or 0),
+        channel_id=int(channel_id or 0),
+        channel_policy=str(channel_policy or "unknown").strip().lower(),
+        route_mode=str(route_mode or "unknown"),
+        topic_text=str(topic_text or "")[:8000],
+        participant_user_ids=tuple(
+            dict.fromkeys(
+                int(user_id or 0)
+                for user_id in participant_user_ids
+                if int(user_id or 0) > 0
+            )
+        ),
+        episode_context_present=bool(episode_context_present),
+    )
 
 
 def _conversation_prompt_candidate_digest(
@@ -18530,6 +18734,34 @@ def refresh_prompt_source_basis(
     basis: PromptSourceBasis,
 ) -> tuple[PromptSourceBasis, bool]:
     """Synchronously rebuild one source basis after any provider await."""
+    if isinstance(basis, UnifiedMomentCanaryPromptSourceBasis):
+        (
+            fresh_context,
+            episode_context_present,
+            reconciled_assessment,
+        ) = (
+            _render_unified_moment_canary_context(
+                basis.assessment,
+                guild_id=basis.guild_id,
+                channel_id=basis.channel_id,
+                channel_policy=basis.channel_policy,
+                route_mode=basis.route_mode,
+                topic_text=basis.topic_text,
+                participant_user_ids=basis.participant_user_ids,
+            )
+        )
+        fresh = replace(
+            basis,
+            expected_digest=_prompt_source_digest(fresh_context),
+            rendered_context=fresh_context,
+            assessment=reconciled_assessment,
+            episode_context_present=bool(episode_context_present),
+        )
+        return fresh, bool(
+            fresh.expected_digest != basis.expected_digest
+            or fresh.episode_context_present
+            != basis.episode_context_present
+        )
     if isinstance(basis, MemoryPromptSourceBasis):
         source_metadata: dict = {}
         fresh_context = build_user_memory_context(
@@ -18611,6 +18843,8 @@ def refresh_prompt_source_bases(
         kind = (
             "conversation"
             if isinstance(basis, ConversationPromptSourceBasis)
+            else "unified_moment_canary"
+            if isinstance(basis, UnifiedMomentCanaryPromptSourceBasis)
             else "batch_moment"
             if isinstance(basis, BatchMomentPromptSourceBasis)
             else "memory"
@@ -18622,11 +18856,14 @@ def refresh_prompt_source_bases(
         if basis.rendered_context not in updated_prompt:
             replacement_failed = True
             continue
-        replacement = (
-            fresh.rendered_context
-            if fresh.rendered_context
-            else "No currently eligible source-bearing memory context."
-        )
+        if isinstance(basis, UnifiedMomentCanaryPromptSourceBasis):
+            replacement = fresh.rendered_context
+        else:
+            replacement = (
+                fresh.rendered_context
+                if fresh.rendered_context
+                else "No currently eligible source-bearing memory context."
+            )
         # Prompt construction places reconstructable authority blocks after
         # user-authored text. Replace the last matching block so a member who
         # happens to repeat the old rendered context cannot cause us to refresh
@@ -18660,6 +18897,11 @@ def prompt_source_basis_failure(
                 return (
                     "conversation_source_changed"
                     if isinstance(basis, ConversationPromptSourceBasis)
+                    else "unified_moment_canary_source_changed"
+                    if isinstance(
+                        basis,
+                        UnifiedMomentCanaryPromptSourceBasis,
+                    )
                     else "memory_source_changed"
                 )
     except Exception:
@@ -18688,6 +18930,9 @@ def build_memory_diagnostic_snapshot(user_id: int, guild_id: int, route_mode: st
             "memory_ledger_shadow": memory_ledger_shadow_enabled(),
             "moment_engine_shadow": moment_engine_shadow_enabled(),
             "moment_gist_canary": moment_gist_canary_configuration(),
+            "unified_moment_canary": (
+                unified_moment_canary_configuration()
+            ),
             "memory_governance_shadow": memory_governance_shadow_enabled(),
             "memory_governance_live": memory_governance_live_enabled(),
             "relationship_v2_shadow": relationship_v2_shadow_enabled(),
@@ -23963,6 +24208,14 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                     if present
                 )
             )
+            batch_unified_moment_canary_scope = (
+                unified_moment_canary_enabled(
+                    guild_id=guild_id,
+                    channel_id=channel_id,
+                    route_mode=ROUTE_MODE_NORMAL_CHAT,
+                    channel_policy=channel_policy,
+                )
+            )
             batch_unified_assessment = (
                 build_unified_response_assessment_shadow(
                     guild_id=guild_id,
@@ -24019,6 +24272,30 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                     ),
                 )
             )
+            batch_unified_moment_canary_basis = (
+                build_unified_moment_canary_prompt_source_basis(
+                    batch_unified_assessment,
+                    guild_id=guild_id,
+                    channel_id=channel_id,
+                    channel_policy=channel_policy,
+                    route_mode=ROUTE_MODE_NORMAL_CHAT,
+                    topic_text=combined_text,
+                    participant_user_ids=(
+                        batch_unified_assessment.participant_user_ids
+                        if batch_unified_assessment is not None
+                        else tuple(unique_user_ids)
+                    ),
+                )
+                if batch_unified_moment_canary_scope
+                else None
+            )
+            if batch_unified_moment_canary_basis is not None:
+                batch_unified_assessment = (
+                    batch_unified_moment_canary_basis.assessment
+                )
+                batch_prompt_source_bases.append(
+                    batch_unified_moment_canary_basis
+                )
             continuity_contract = build_general_conversation_continuity_contract(
                 combined_text,
                 batch_continuity_source,
@@ -24027,6 +24304,11 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
             )
             if continuity_contract:
                 prompt += "\n\n" + continuity_contract
+            if batch_unified_moment_canary_basis is not None:
+                prompt += (
+                    "\n\n"
+                    + batch_unified_moment_canary_basis.rendered_context
+                )
             community_visual_basis = build_community_visual_basis(
                 guild_id,
                 (
@@ -24484,6 +24766,12 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
             or guard_diagnostics.get("exact_quote_guard_triggered")
             or guard_diagnostics.get(
                 "current_payload_grounding_guard_triggered"
+            )
+            or guard_diagnostics.get(
+                "unified_moment_canary_coherence_guard_triggered"
+            )
+            or guard_diagnostics.get(
+                "unified_moment_canary_output_leak_guard_triggered"
             )
         )
         regenerated_for_mode_leak = bool(
@@ -25069,6 +25357,12 @@ def build_user_aware_prompt(
             if present
         )
     )
+    unified_moment_canary_scope = unified_moment_canary_enabled(
+        guild_id=guild_id,
+        channel_id=channel_id,
+        route_mode=route_mode,
+        channel_policy=channel_policy,
+    )
     unified_assessment = build_unified_response_assessment_shadow(
         guild_id=guild_id,
         route_mode=route_mode,
@@ -25096,6 +25390,26 @@ def build_user_aware_prompt(
         source_context_present=bool(source_context_block),
         broadcast_memory_present=bool(broadcast_context),
     )
+    unified_moment_canary_basis = (
+        build_unified_moment_canary_prompt_source_basis(
+            unified_assessment,
+            guild_id=guild_id,
+            channel_id=channel_id,
+            channel_policy=channel_policy,
+            route_mode=route_mode,
+            topic_text=clean_content,
+            participant_user_ids=(
+                unified_assessment.participant_user_ids
+                if unified_assessment is not None
+                else (int(user_id or 0),)
+            ),
+        )
+        if unified_moment_canary_scope
+        else None
+    )
+    if unified_moment_canary_basis is not None:
+        unified_assessment = unified_moment_canary_basis.assessment
+        prompt_source_bases.append(unified_moment_canary_basis)
 
     if prompt_metadata is not None:
         prompt_metadata["source_context_available"] = bool(
@@ -25121,6 +25435,13 @@ def build_user_aware_prompt(
         )
         prompt_metadata["unified_response_assessment_shadow"] = (
             unified_assessment
+        )
+        prompt_metadata["unified_moment_canary_applied"] = bool(
+            unified_moment_canary_basis is not None
+        )
+        prompt_metadata["unified_moment_canary_episode_context"] = bool(
+            unified_moment_canary_basis is not None
+            and unified_moment_canary_basis.episode_context_present
         )
 
     room_prompt_block = ""
@@ -25184,6 +25505,11 @@ def build_user_aware_prompt(
             f"{NORMAL_CHAT_CORRECTION_RULE}\n"
         )
     current_turn_prompt_block = f"{current_turn_context}\n" if (current_turn_context or "").strip() else ""
+    unified_moment_canary_prompt_block = (
+        unified_moment_canary_basis.rendered_context + "\n"
+        if unified_moment_canary_basis is not None
+        else ""
+    )
 
     prompt = (
         f"Current user request: {clean_content}\n"
@@ -25197,6 +25523,7 @@ def build_user_aware_prompt(
         f"{prompt_contract}"
         f"{room_prompt_block}"
         f"{continuity_prompt_block}"
+        f"{unified_moment_canary_prompt_block}"
         f"{channel_prompt_block}"
         f"{greeting_rule}\n"
         f"Response style mode: {style_key}\n"
@@ -26468,6 +26795,15 @@ async def apply_guarded_response_regeneration(
         "prompt_source_basis_changed": False,
         "prompt_source_basis_changed_kinds": (),
         "prompt_source_basis_regenerated": False,
+        "unified_moment_canary_applied": False,
+        "unified_moment_canary_scope_valid": False,
+        "unified_moment_canary_episode_context": False,
+        "unified_moment_canary_coherence_status": "not_applicable",
+        "unified_moment_canary_coherence_reason_codes": (),
+        "unified_moment_canary_coherence_guard_triggered": False,
+        "unified_moment_canary_coherence_regenerated": False,
+        "unified_moment_canary_output_leak_guard_triggered": False,
+        "unified_moment_canary_output_leak_regenerated": False,
         "suppressed": False,
         "suppression_reason": "",
         "guard_fallback_or_generic_non_answer": False,
@@ -26482,6 +26818,64 @@ async def apply_guarded_response_regeneration(
         third_party_attribution_requested
     )
     prompt_source_bases = tuple(prompt_source_bases or ())
+    unified_moment_canary_basis = next(
+        (
+            basis
+            for basis in prompt_source_bases
+            if isinstance(
+                basis,
+                UnifiedMomentCanaryPromptSourceBasis,
+            )
+        ),
+        None,
+    )
+    if unified_moment_canary_basis is not None:
+        current_channel_id = int(
+            getattr(channel, "id", 0) or 0
+        )
+        canary_scope_valid = bool(
+            unified_moment_canary_basis.channel_policy == "sealed_test"
+            and unified_moment_canary_basis.assessment.channel_policy
+            == "sealed_test"
+            and unified_moment_canary_basis.assessment.guild_id
+            == unified_moment_canary_basis.guild_id
+            and unified_moment_canary_basis.guild_id
+            == int(guild_id or 0)
+            and unified_moment_canary_basis.channel_policy
+            == str(channel_policy or "").strip().lower()
+            and current_channel_id > 0
+            and unified_moment_canary_basis.channel_id
+            == current_channel_id
+            and unified_moment_canary_enabled(
+                guild_id=unified_moment_canary_basis.guild_id,
+                channel_id=unified_moment_canary_basis.channel_id,
+                route_mode=unified_moment_canary_basis.route_mode,
+                channel_policy=(
+                    unified_moment_canary_basis.channel_policy
+                ),
+            )
+        )
+        diagnostics.update(
+            {
+                "unified_moment_canary_applied": True,
+                "unified_moment_canary_scope_valid": canary_scope_valid,
+                "unified_moment_canary_episode_context": bool(
+                    unified_moment_canary_basis
+                    .episode_context_present
+                ),
+            }
+        )
+        if not canary_scope_valid:
+            diagnostics.update(
+                {
+                    "suppressed": True,
+                    "suppression_reason": (
+                        "unified_moment_canary_scope_invalid"
+                    ),
+                    "guard_fallback_or_generic_non_answer": True,
+                }
+            )
+            return "", diagnostics
     conversation_contexts = tuple(
         basis.rendered_context
         for basis in prompt_source_bases
@@ -26609,6 +27003,18 @@ async def apply_guarded_response_regeneration(
                 )
             )
             or payload_grounding(candidate).failed
+            or (
+                unified_moment_canary_basis is not None
+                and response_exposes_canary_control_markers(candidate)
+            )
+            or (
+                unified_moment_canary_basis is not None
+                and assess_response_coherence(
+                    unified_moment_canary_basis.assessment,
+                    candidate,
+                ).status
+                == "failed"
+            )
         )
 
     if prompt_source_bases:
@@ -26649,6 +27055,9 @@ async def apply_guarded_response_regeneration(
                         "suppression_reason": (
                             "conversation_source_changed_before_guard"
                             if "conversation" in changed_source_kinds
+                            else "unified_moment_canary_source_changed_before_guard"
+                            if "unified_moment_canary"
+                            in changed_source_kinds
                             else "memory_source_changed_before_guard"
                         ),
                         "guard_fallback_or_generic_non_answer": True,
@@ -26659,10 +27068,25 @@ async def apply_guarded_response_regeneration(
                 refreshed_prompt
                 + "\n\nSOURCE LIFECYCLE UPDATE: Supporting memory changed "
                 "while the prior draft was generated. Use only the refreshed "
-                "context above. Do not preserve a fact, Moment gist, or "
-                "attribution that is no longer present."
+                "context above. Do not preserve a fact, Moment gist, episode "
+                "signal, or attribution that is no longer present."
             )
             prompt_source_bases = refreshed_source_bases
+            unified_moment_canary_basis = next(
+                (
+                    basis
+                    for basis in prompt_source_bases
+                    if isinstance(
+                        basis,
+                        UnifiedMomentCanaryPromptSourceBasis,
+                    )
+                ),
+                None,
+            )
+            diagnostics["unified_moment_canary_episode_context"] = bool(
+                unified_moment_canary_basis is not None
+                and unified_moment_canary_basis.episode_context_present
+            )
             response = (await regenerate(prompt) or "").strip()
             diagnostics["prompt_source_basis_regenerated"] = True
             if retry_has_guard_failure(response):
@@ -26958,6 +27382,95 @@ async def apply_guarded_response_regeneration(
             channel_policy,
         )
         response = regenerated
+    if unified_moment_canary_basis is not None:
+        canary_coherence = assess_response_coherence(
+            unified_moment_canary_basis.assessment,
+            response,
+        )
+        canary_output_leak = response_exposes_canary_control_markers(
+            response
+        )
+        diagnostics[
+            "unified_moment_canary_coherence_status"
+        ] = canary_coherence.status
+        diagnostics[
+            "unified_moment_canary_coherence_reason_codes"
+        ] = canary_coherence.reason_codes
+        if canary_coherence.status == "failed" or canary_output_leak:
+            diagnostics[
+                "unified_moment_canary_coherence_guard_triggered"
+            ] = canary_coherence.status == "failed"
+            diagnostics[
+                "unified_moment_canary_output_leak_guard_triggered"
+            ] = canary_output_leak
+            if not regeneration_allowed:
+                diagnostics.update(
+                    {
+                        "suppressed": True,
+                        "suppression_reason": (
+                            "unified_moment_canary_validation_only"
+                        ),
+                        "guard_fallback_or_generic_non_answer": True,
+                    }
+                )
+                return "", diagnostics
+            canary_reason = (
+                ", ".join(canary_coherence.reason_codes)
+                if canary_coherence.reason_codes
+                else "internal-control-label leak"
+            )
+            correction_prompt = (
+                prompt
+                + "\n\nCANARY COHERENCE CORRECTION REQUIRED: "
+                + canary_reason
+                + ". Regenerate the answer now. Follow the sealed brief's "
+                "required conversational act and answer shape. Preserve "
+                "speaker attribution and controlling criteria when relevant. "
+                "If ambiguity is genuine, ask exactly one natural "
+                "clarification; otherwise answer directly. Make any choice "
+                "agree with its criterion-based reason. Never mention the "
+                "brief, canary, assessment, episode signal, internal labels, "
+                "or this correction."
+            )
+            regenerated = (await regenerate(correction_prompt) or "").strip()
+            if canary_coherence.status == "failed":
+                diagnostics[
+                    "unified_moment_canary_coherence_regenerated"
+                ] = True
+            if canary_output_leak:
+                diagnostics[
+                    "unified_moment_canary_output_leak_regenerated"
+                ] = True
+            regenerated_coherence = assess_response_coherence(
+                unified_moment_canary_basis.assessment,
+                regenerated,
+            )
+            regenerated_leak = response_exposes_canary_control_markers(
+                regenerated
+            )
+            diagnostics[
+                "unified_moment_canary_coherence_status"
+            ] = regenerated_coherence.status
+            diagnostics[
+                "unified_moment_canary_coherence_reason_codes"
+            ] = regenerated_coherence.reason_codes
+            if (
+                not regenerated
+                or regenerated_coherence.status == "failed"
+                or regenerated_leak
+                or retry_has_guard_failure(regenerated)
+            ):
+                diagnostics.update(
+                    {
+                        "suppressed": True,
+                        "suppression_reason": (
+                            "unified_moment_canary_after_retry"
+                        ),
+                        "guard_fallback_or_generic_non_answer": True,
+                    }
+                )
+                return "", diagnostics
+            response = regenerated
     # No provider await may occur after this source-of-truth recheck. If a
     # deletion, clear, or correction changed the supporting rows during any
     # regeneration above, suppress instead of sending a stale grounded claim.
@@ -27240,6 +27753,12 @@ async def send_planned_conversation_response(
         or guard_diagnostics.get("exact_quote_guard_triggered")
         or guard_diagnostics.get(
             "current_payload_grounding_guard_triggered"
+        )
+        or guard_diagnostics.get(
+            "unified_moment_canary_coherence_guard_triggered"
+        )
+        or guard_diagnostics.get(
+            "unified_moment_canary_output_leak_guard_triggered"
         )
         or archive_guard_triggered
     )
@@ -29744,6 +30263,7 @@ async def bnl_memory_check(interaction: discord.Interaction):
         f"- memory_ledger_shadow_enabled: `{'yes' if memory_ledger_shadow_enabled() else 'no'}`",
         f"- moment_engine_shadow_enabled: `{'yes' if moment_engine_shadow_enabled() else 'no'}`",
         f"- moment_gist_canary_configuration: `{moment_gist_canary_configuration()}`",
+        f"- unified_moment_canary_configuration: `{unified_moment_canary_configuration()}`",
         f"- memory_governance_shadow_enabled: `{'yes' if memory_governance_shadow_enabled() else 'no'}`",
         f"- memory_governance_live_enabled: `{'yes' if memory_governance_live_enabled() else 'no'}`",
         f"- relationship_v2_shadow_enabled: `{'yes' if relationship_v2_shadow_enabled() else 'no'}`",
