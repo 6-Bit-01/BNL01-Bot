@@ -72,9 +72,11 @@ from bnl_memory_governance import (
     view_member_memory,
 )
 from bnl_moment_engine import (
+    active_episode_for_assessment,
     observe_ledger_entry as observe_moment_ledger_entry,
     render_shadow_moment_context,
     shadow_enabled as moment_engine_shadow_enabled,
+    sweep_expired_episodes,
     sweep_expired_windows as sweep_expired_moment_windows,
 )
 from bnl_relationship_engine import (
@@ -17865,6 +17867,50 @@ def _canon_relevant_to_response(text: str) -> bool:
     return bool(_UNIFIED_ASSESSMENT_CANON_RELEVANCE_RE.search(text or ""))
 
 
+def _active_episode_id_for_unified_assessment(
+    *,
+    guild_id: int,
+    channel_id: int,
+    channel_policy: str,
+    route_mode: str,
+    topic_text: str,
+    participant_user_ids: tuple[int, ...],
+) -> str:
+    """Read one opaque episode id for shadow comparison only."""
+
+    if (
+        not moment_engine_shadow_enabled()
+        or not memory_ledger_shadow_enabled()
+        or int(channel_id or 0) <= 0
+        or DB_FILE == ":memory:"
+        or not os.path.exists(DB_FILE)
+    ):
+        return ""
+    participant_keys = tuple(
+        "discord_user:%s" % int(user_id)
+        for user_id in participant_user_ids
+        if int(user_id or 0) > 0
+    )
+    try:
+        with sqlite3.connect(
+            "file:%s?mode=ro" % DB_FILE,
+            uri=True,
+            timeout=0.1,
+        ) as episode_conn:
+            reference = active_episode_for_assessment(
+                episode_conn,
+                guild_id=int(guild_id or 0),
+                channel_id=int(channel_id or 0),
+                channel_policy=str(channel_policy or "unknown"),
+                route_mode=str(route_mode or "unknown"),
+                topic_text=str(topic_text or "")[:8000],
+                participant_keys=participant_keys,
+            )
+        return reference.episode_id if reference is not None else ""
+    except (OSError, sqlite3.DatabaseError, ValueError, TypeError):
+        return ""
+
+
 def build_unified_response_assessment_shadow(
     *,
     guild_id: int,
@@ -17874,6 +17920,7 @@ def build_unified_response_assessment_shadow(
     current_text: str,
     current_speaker_user_ids: tuple[int, ...],
     current_speaker_labels: tuple[str, ...],
+    channel_id: int = 0,
     current_contribution_items: tuple[
         ConversationEvidenceItem, ...
     ] = (),
@@ -17983,6 +18030,22 @@ def build_unified_response_assessment_shadow(
         *historical_evidence_items,
         *current_evidence_items,
     )
+    active_episode_id = str(
+        memory_meta.get("active_episode_id") or ""
+    ).strip()
+    if not active_episode_id:
+        active_episode_id = _active_episode_id_for_unified_assessment(
+            guild_id=guild_id,
+            channel_id=channel_id,
+            channel_policy=channel_policy,
+            route_mode=route_mode,
+            topic_text="\n".join(
+                item.text[:1000]
+                for item in semantic_evidence_items
+                if str(item.text or "").strip()
+            ),
+            participant_user_ids=participant_user_ids,
+        )
     current_payload_anchors = extract_current_payload_anchors(
         current_text,
         conversation_contexts,
@@ -18006,6 +18069,7 @@ def build_unified_response_assessment_shadow(
         participant_user_ids=participant_user_ids,
         speaker_labels=speaker_labels,
         current_exchange_source_ids=current_exchange_source_ids,
+        active_episode_id=active_episode_id,
         prior_moment_ids=("rendered_moment_gist",) if has_moment_gist else (),
         governed_entry_ids=tuple(
             memory_meta.get("governed_entry_ids") or ()
@@ -21788,14 +21852,20 @@ async def moment_engine_sweep_task():
         def _sweep():
             conn = sqlite3.connect(DB_FILE)
             try:
-                results = sweep_expired_moment_windows(conn)
+                moment_results = sweep_expired_moment_windows(conn)
+                episode_results = sweep_expired_episodes(conn)
                 conn.commit()
-                return results
+                return moment_results, episode_results
             finally:
                 conn.close()
-        results = await asyncio.to_thread(_sweep)
-        if results:
-            logging.info("moment_engine_sweep finalized_or_rejected=%s", len(results))
+        moment_results, episode_results = await asyncio.to_thread(_sweep)
+        if moment_results or episode_results:
+            logging.info(
+                "moment_engine_sweep finalized_or_rejected=%s "
+                "episodes_finalized=%s",
+                len(moment_results),
+                len(episode_results),
+            )
     except Exception as exc:
         logging.debug("moment_engine_sweep_failed error_type=%s", type(exc).__name__)
 
@@ -23912,6 +23982,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                             if _safe_prompt_display_label(name)
                         )
                     ),
+                    channel_id=channel_id,
                     current_contribution_items=tuple(
                         build_conversation_evidence_item(
                             text=content,
@@ -25008,6 +25079,7 @@ def build_user_aware_prompt(
         current_text=clean_content,
         current_speaker_user_ids=(int(user_id or 0),),
         current_speaker_labels=(safe_display_name,),
+        channel_id=channel_id,
         target_user_ids=(
             (int(moment_attribution_target_user_id),)
             if int(moment_attribution_target_user_id or 0) > 0

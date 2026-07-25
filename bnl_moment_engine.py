@@ -1,8 +1,9 @@
-"""Moment Engine v1 shadow infrastructure.
+"""Moment Engine shadow infrastructure.
 
 Builds bounded, auditable conversational moments from Unified Memory Ledger
-conversation entries only. Construction remains shadow-first; a separately
-allowlisted prompt canary may render only revalidated public-safe gist.
+conversation entries and joins coherent finalized Moments into source-backed
+episodic lifecycle v2 records. Construction remains shadow-first; a separately
+allowlisted prompt canary may render only revalidated public-safe Moment gist.
 """
 from __future__ import annotations
 
@@ -27,12 +28,24 @@ from bnl_memory_ledger import (
 
 MOMENT_ENGINE_SHADOW_ENV = "BNL_MOMENT_ENGINE_SHADOW_ENABLED"
 MOMENT_SCHEMA_VERSION = "memory_moment_v1"
+EPISODE_SCHEMA_VERSION = "memory_moment_episode_v2"
 REMEMBERED_NUMBER_QUARANTINE_MIGRATION = "remembered_number_quarantine_v1"
 SAFE_MOMENT_PROJECTION_MIGRATION = "safe_moment_projection_v1"
 MOMENT_CONTRIBUTION_BACKFILL_MIGRATION = "moment_contribution_backfill_v1"
+EPISODIC_LIFECYCLE_MIGRATION = "episodic_lifecycle_v2"
 MAX_WINDOW_SECONDS = 5 * 60
 INACTIVITY_SECONDS = 2 * 60
+EPISODE_INACTIVITY_SECONDS = 24 * 60 * 60
+EPISODE_REOPEN_SECONDS = 30 * 24 * 60 * 60
 CONTRIBUTION_GIST_VERSION = "moment_contribution_gist_v1"
+EPISODE_EVENT_TYPES = (
+    "action",
+    "reaction",
+    "decision",
+    "assignment",
+    "outcome",
+    "open_loop",
+)
 
 STOP = set("a an and are as at be but by for from how i in is it me my of on or our that the this to was we what when where who why with you your did do does about into can could would should just yep yes no ok okay hey hi hello thanks thank lol lmao got noted also ask asked".split())
 LOW_SIGNAL = set("hi hey hello thanks thank you ok okay yep yes no lol lmao cool nice got it noted".split())
@@ -47,6 +60,63 @@ STRONG_MARKERS = (
     "follow up",
     "follow-up",
     "celebrate",
+)
+_EPISODE_RESUME_RE = re.compile(
+    r"\b(?:resume|continue|pick\s+(?:it|this|that)\s+back\s+up|"
+    r"pick\s+up\s+where\s+we\s+left\s+off|back\s+to|return(?:ing)?\s+to|"
+    r"get\s+back\s+to|reopen)\b",
+    re.I,
+)
+_EPISODE_RELATED_RE = re.compile(
+    r"\b(?:combine|connect|link|tie)\b.{0,36}"
+    r"\b(?:thread|topic|discussion|conversation|idea|plan|moment)s?\b"
+    r"|\b(?:bring|put)\b.{0,24}\btogether\b",
+    re.I,
+)
+_EPISODE_CLOSE_RE = re.compile(
+    r"\b(?:done|finished|complete(?:d)?|resolved|fixed|settled|shipped|"
+    r"closed|wrapped\s+up|that\s+worked|tests?\s+passed|deployed)\b",
+    re.I,
+)
+_EPISODE_NEGATED_CLOSE_RE = re.compile(
+    r"\b(?:not|never|isn(?:'|’)t|wasn(?:'|’)t|aren(?:'|’)t|"
+    r"weren(?:'|’)t|hasn(?:'|’)t|haven(?:'|’)t|hadn(?:'|’)t)\b"
+    r".{0,32}\b(?:done|finished|complete(?:d)?|resolved|fixed|settled|"
+    r"shipped|closed|wrapped\s+up|passed|deployed)\b",
+    re.I,
+)
+_EPISODE_ACTION_RE = re.compile(
+    r"\b(?:i|we|you|they|he|she)\s+(?:will|plan(?:ned)?\s+to|"
+    r"intend(?:ed)?\s+to|need(?:ed)?\s+to|should|could)\b"
+    r"|\b(?:let(?:'|’)s|implement|build|fix|test|send|write|create|"
+    r"change|update|deploy|review|check|run)\b",
+    re.I,
+)
+_EPISODE_REACTION_RE = re.compile(
+    r"\b(?:agree|disagree|like|love|hate|prefer|reject|oppose|"
+    r"works?|doesn(?:'|’)t\s+work|good|bad|better|worse)\b",
+    re.I,
+)
+_EPISODE_DECISION_RE = re.compile(
+    r"\b(?:decid(?:e|ed)|agreed|settled|final\s+(?:choice|decision)|"
+    r"go\s+with|choose|chose|pick(?:ed)?|select(?:ed)?)\b",
+    re.I,
+)
+_EPISODE_ASSIGNMENT_RE = re.compile(
+    r"\b(?:assign(?:ed)?|responsible\s+for|owner\s+of|"
+    r"i(?:'|’)?ll\s+(?:handle|own|take|do)|"
+    r"you(?:'|’)?ll\s+(?:handle|own|take|do)|"
+    r"(?:i|you|we|they|he|she)\s+(?:need|needs|will|should)\s+to|"
+    r"[a-z][a-z0-9_.-]*(?:\s+[a-z][a-z0-9_.-]*){0,2}\s+"
+    r"will\s+(?:handle|own|take|do))\b",
+    re.I,
+)
+_EPISODE_OPEN_LOOP_RE = re.compile(
+    r"\?|"
+    r"\b(?:still\s+need|need\s+to\s+decide|not\s+settled|unresolved|"
+    r"open\s+(?:question|loop)|follow\s+up|next\s+step|to\s+do|todo|"
+    r"pending|waiting\s+on)\b",
+    re.I,
 )
 VIS_RANK = {"public": 0, "public_safe": 0, "reference_canon": 0, "internal": 2, "private": 3, "mod": 3, "sealed_test": 4, "protected": 4, "ai_image_tool": 4, "unknown": 5}
 PUBLIC_CROSS_CHANNEL_POLICIES = frozenset({"public_home", "public_context"})
@@ -65,6 +135,26 @@ class MomentObservationResult:
     reason_code: str = "not_attempted"
     moment_id: str = ""
     ledger_entry_id: str = ""
+
+
+@dataclass(frozen=True)
+class EpisodeObservationResult:
+    outcome: str = "skipped"
+    reason_code: str = "not_attempted"
+    episode_id: str = ""
+    moment_id: str = ""
+
+
+@dataclass(frozen=True)
+class ActiveEpisodeReference:
+    """Opaque, content-free reference for the shadow response assessment."""
+
+    episode_id: str
+    lifecycle_status: str
+    source_moment_ids: tuple[str, ...]
+    participant_count: int
+    open_loop_count: int
+    semantic_types: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -169,6 +259,19 @@ def _topic_key(family: str, signature: tuple[str, ...]) -> str:
 
 def stable_moment_id(guild_id: int, channel_id: int, topic_key: str, started_at: str) -> str:
     return "mom_" + hashlib.sha256(f"{MOMENT_SCHEMA_VERSION}\x1f{guild_id}\x1f{channel_id}\x1f{topic_key}\x1f{started_at}".encode("utf-8")).hexdigest()[:32]
+
+
+def stable_episode_id(
+    guild_id: int,
+    channel_id: int,
+    opening_moment_id: str,
+) -> str:
+    return "mep_" + hashlib.sha256(
+        (
+            f"{EPISODE_SCHEMA_VERSION}\x1f{guild_id}\x1f"
+            f"{channel_id}\x1f{opening_moment_id}"
+        ).encode("utf-8")
+    ).hexdigest()[:32]
 
 
 def _meaningful(text: str, role: str, predicate_key: str) -> bool:
@@ -1149,6 +1252,48 @@ def ensure_moment_schema(conn: sqlite3.Connection) -> None:
       moment_id TEXT NOT NULL, participant_key TEXT NOT NULL, ledger_entry_id TEXT NOT NULL,
       gist_version TEXT NOT NULL, created_at TEXT NOT NULL,
       PRIMARY KEY(moment_id, participant_key, ledger_entry_id))""")
+    cur.execute("""CREATE TABLE IF NOT EXISTS memory_moment_episodes (
+      episode_id TEXT PRIMARY KEY, schema_version TEXT NOT NULL,
+      guild_id INTEGER NOT NULL, channel_id INTEGER NOT NULL,
+      channel_name TEXT, channel_policy TEXT NOT NULL, route_mode TEXT NOT NULL,
+      visibility TEXT NOT NULL, public_usable INTEGER DEFAULT 0,
+      topic_key TEXT NOT NULL, topic_family TEXT DEFAULT '',
+      topic_signature TEXT DEFAULT '[]', lifecycle_status TEXT NOT NULL,
+      opened_at TEXT NOT NULL, last_activity_at TEXT NOT NULL,
+      finalized_at TEXT, finalization_reason TEXT DEFAULT '',
+      reopen_count INTEGER DEFAULT 0, split_count INTEGER DEFAULT 0,
+      revision INTEGER DEFAULT 1, moment_count INTEGER DEFAULT 0,
+      human_entry_count INTEGER DEFAULT 0, participant_count INTEGER DEFAULT 0,
+      semantic_types_json TEXT DEFAULT '[]', action_count INTEGER DEFAULT 0,
+      reaction_count INTEGER DEFAULT 0, decision_count INTEGER DEFAULT 0,
+      assignment_count INTEGER DEFAULT 0, outcome_count INTEGER DEFAULT 0,
+      open_loop_count INTEGER DEFAULT 0,
+      created_at TEXT NOT NULL, updated_at TEXT NOT NULL)""")
+    cur.execute("""CREATE TABLE IF NOT EXISTS memory_moment_episode_moments (
+      episode_id TEXT NOT NULL, moment_id TEXT NOT NULL,
+      link_role TEXT NOT NULL, source_digest TEXT NOT NULL,
+      linked_at TEXT NOT NULL, PRIMARY KEY(episode_id, moment_id))""")
+    cur.execute("""CREATE TABLE IF NOT EXISTS memory_moment_episode_participants (
+      episode_id TEXT NOT NULL, participant_key TEXT NOT NULL,
+      participant_role TEXT NOT NULL, safe_display_name TEXT DEFAULT '',
+      first_seen_at TEXT NOT NULL, last_seen_at TEXT NOT NULL,
+      source_moment_count INTEGER DEFAULT 0,
+      participation_order INTEGER DEFAULT 0,
+      created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+      PRIMARY KEY(episode_id, participant_key, participant_role))""")
+    cur.execute("""CREATE TABLE IF NOT EXISTS memory_moment_episode_events (
+      episode_id TEXT NOT NULL, ledger_entry_id TEXT NOT NULL,
+      participant_key TEXT NOT NULL, event_type TEXT NOT NULL,
+      observed_at TEXT NOT NULL, source_sequence INTEGER DEFAULT 0,
+      lifecycle_status TEXT NOT NULL, source_digest TEXT NOT NULL,
+      created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+      PRIMARY KEY(episode_id, ledger_entry_id, event_type))""")
+    cur.execute("""CREATE TABLE IF NOT EXISTS memory_moment_episode_lineage (
+      from_episode_id TEXT NOT NULL, to_episode_id TEXT NOT NULL,
+      relation_type TEXT NOT NULL, evidence_moment_id TEXT NOT NULL,
+      evidence_entry_id TEXT NOT NULL, created_at TEXT NOT NULL,
+      PRIMARY KEY(from_episode_id, to_episode_id, relation_type,
+                  evidence_moment_id, evidence_entry_id))""")
     try:
         cur.execute(
             "ALTER TABLE memory_moment_contribution_sources "
@@ -1175,6 +1320,12 @@ def ensure_moment_schema(conn: sqlite3.Connection) -> None:
         "CREATE INDEX IF NOT EXISTS idx_mmp_participant ON memory_moment_participants(participant_key, moment_id)",
         "CREATE INDEX IF NOT EXISTS idx_mmc_participant ON memory_moment_contributions(participant_key, moment_id, lifecycle_status)",
         "CREATE INDEX IF NOT EXISTS idx_mmcs_entry ON memory_moment_contribution_sources(ledger_entry_id, moment_id)",
+        "CREATE INDEX IF NOT EXISTS idx_mme_scope ON memory_moment_episodes(guild_id, channel_id, lifecycle_status, last_activity_at)",
+        "CREATE INDEX IF NOT EXISTS idx_mme_topic ON memory_moment_episodes(guild_id, channel_id, topic_family, lifecycle_status, last_activity_at)",
+        "CREATE INDEX IF NOT EXISTS idx_mmem_moment ON memory_moment_episode_moments(moment_id, episode_id)",
+        "CREATE INDEX IF NOT EXISTS idx_mmep_participant ON memory_moment_episode_participants(participant_key, episode_id)",
+        "CREATE INDEX IF NOT EXISTS idx_mmee_source ON memory_moment_episode_events(ledger_entry_id, episode_id, lifecycle_status)",
+        "CREATE INDEX IF NOT EXISTS idx_mmel_target ON memory_moment_episode_lineage(to_episode_id, relation_type)",
         "CREATE INDEX IF NOT EXISTS idx_mmd_guild ON memory_moment_diagnostics(guild_id, event_type, reason_code)",
     ]:
         cur.execute(sql)
@@ -1234,6 +1385,84 @@ def ensure_moment_schema(conn: sqlite3.Connection) -> None:
             AND participant_key=OLD.participant_key;
         END"""
     )
+    cur.execute(
+        """CREATE TRIGGER IF NOT EXISTS trg_episode_source_delete
+        AFTER DELETE ON memory_ledger_entries
+        BEGIN
+          UPDATE memory_moment_episodes
+          SET lifecycle_status='needs_review', public_usable=0,
+              finalization_reason='source_deleted',
+              updated_at=CURRENT_TIMESTAMP
+          WHERE episode_id IN (
+            SELECT link.episode_id
+            FROM memory_moment_episode_moments link
+            JOIN memory_moment_members member
+              ON member.moment_id=link.moment_id
+            WHERE member.ledger_entry_id=OLD.entry_id
+          )
+            AND lifecycle_status IN ('active','finalized');
+          DELETE FROM memory_moment_episode_events
+          WHERE ledger_entry_id=OLD.entry_id;
+        END"""
+    )
+    cur.execute(
+        """CREATE TRIGGER IF NOT EXISTS trg_episode_source_lifecycle
+        AFTER UPDATE OF lifecycle_status,normalized_value,public_usable
+        ON memory_ledger_entries
+        WHEN NEW.lifecycle_status NOT IN ('active','review_only')
+          OR NEW.normalized_value IS NOT OLD.normalized_value
+          OR NEW.public_usable IS NOT OLD.public_usable
+        BEGIN
+          UPDATE memory_moment_episodes
+          SET lifecycle_status='needs_review', public_usable=0,
+              finalization_reason='source_changed',
+              updated_at=CURRENT_TIMESTAMP
+          WHERE episode_id IN (
+            SELECT link.episode_id
+            FROM memory_moment_episode_moments link
+            JOIN memory_moment_members member
+              ON member.moment_id=link.moment_id
+            WHERE member.ledger_entry_id=NEW.entry_id
+          )
+            AND lifecycle_status IN ('active','finalized');
+          UPDATE memory_moment_episode_events
+          SET lifecycle_status='needs_review', updated_at=CURRENT_TIMESTAMP
+          WHERE ledger_entry_id=NEW.entry_id;
+        END"""
+    )
+    cur.execute(
+        """CREATE TRIGGER IF NOT EXISTS trg_episode_moment_lifecycle
+        AFTER UPDATE OF lifecycle_status ON memory_moment_windows
+        WHEN NEW.lifecycle_status <> 'finalized'
+        BEGIN
+          UPDATE memory_moment_episodes
+          SET lifecycle_status='needs_review', public_usable=0,
+              finalization_reason='linked_moment_changed',
+              updated_at=CURRENT_TIMESTAMP
+          WHERE episode_id IN (
+            SELECT episode_id FROM memory_moment_episode_moments
+            WHERE moment_id=NEW.moment_id
+          )
+            AND lifecycle_status IN ('active','finalized');
+        END"""
+    )
+    cur.execute(
+        """CREATE TRIGGER IF NOT EXISTS trg_episode_moment_delete
+        AFTER DELETE ON memory_moment_windows
+        BEGIN
+          UPDATE memory_moment_episodes
+          SET lifecycle_status='needs_review', public_usable=0,
+              finalization_reason='linked_moment_deleted',
+              updated_at=CURRENT_TIMESTAMP
+          WHERE episode_id IN (
+            SELECT episode_id FROM memory_moment_episode_moments
+            WHERE moment_id=OLD.moment_id
+          )
+            AND lifecycle_status IN ('active','finalized');
+          DELETE FROM memory_moment_episode_moments
+          WHERE moment_id=OLD.moment_id;
+        END"""
+    )
     if not cur.execute(
         "SELECT 1 FROM memory_moment_migrations WHERE migration_key=?",
         (REMEMBERED_NUMBER_QUARANTINE_MIGRATION,),
@@ -1261,6 +1490,16 @@ def ensure_moment_schema(conn: sqlite3.Connection) -> None:
             "INSERT OR IGNORE INTO memory_moment_migrations VALUES(?,?)",
             (MOMENT_CONTRIBUTION_BACKFILL_MIGRATION, _now()),
         )
+    if not cur.execute(
+        "SELECT 1 FROM memory_moment_migrations WHERE migration_key=?",
+        (EPISODIC_LIFECYCLE_MIGRATION,),
+    ).fetchone():
+        episode_backfill = backfill_episodic_lifecycle(conn)
+        if int(episode_backfill.get("errors", 0) or 0) == 0:
+            cur.execute(
+                "INSERT OR IGNORE INTO memory_moment_migrations VALUES(?,?)",
+                (EPISODIC_LIFECYCLE_MIGRATION, _now()),
+            )
 
 
 def quarantine_legacy_remembered_number_artifacts(
@@ -1983,6 +2222,1413 @@ def _moment_source_failure(
     return "", ""
 
 
+def _table_exists(conn: sqlite3.Connection, table_name: str) -> bool:
+    return bool(
+        conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+            (table_name,),
+        ).fetchone()
+    )
+
+
+def _episode_event_types(source: SourceEntry) -> tuple[str, ...]:
+    """Return typed, content-free semantic roles for one human source."""
+
+    if (
+        not source.is_human
+        or not _meaningful(
+            source.normalized_value,
+            source.source_role,
+            source.predicate_key,
+        )
+        or _contains_sensitive_moment_source(
+            source.normalized_value,
+            source.predicate_key,
+        )
+    ):
+        return ()
+    value = str(source.normalized_value or "")
+    frame = _parse_contribution_semantic_frame(source)
+    frame_type = frame.frame_type if frame is not None else ""
+    observed: set[str] = set()
+    if (
+        frame_type
+        in {
+            "conditional_plan",
+            "plan",
+            "proposal",
+            "replacement",
+            "correction_replacement",
+        }
+        or _EPISODE_ACTION_RE.search(value)
+    ):
+        observed.add("action")
+    if (
+        frame_type
+        in {
+            "agreement",
+            "disagreement",
+            "preference",
+            "rejection",
+            "correction",
+            "correction_replacement",
+        }
+        or _EPISODE_REACTION_RE.search(value)
+    ):
+        observed.add("reaction")
+    if (
+        frame_type in {"preference", "replacement", "correction_replacement"}
+        or _EPISODE_DECISION_RE.search(value)
+    ):
+        observed.add("decision")
+    if _EPISODE_ASSIGNMENT_RE.search(value):
+        observed.add("assignment")
+    if _episode_source_closed(value):
+        observed.add("outcome")
+    if frame_type == "question" or _EPISODE_OPEN_LOOP_RE.search(value):
+        observed.add("open_loop")
+    return tuple(
+        event_type
+        for event_type in EPISODE_EVENT_TYPES
+        if event_type in observed
+    )
+
+
+def _episode_resume_requested(rows: list[SourceEntry]) -> bool:
+    return any(
+        row.is_human and _EPISODE_RESUME_RE.search(row.normalized_value or "")
+        for row in rows
+    )
+
+
+def _episode_related_link_requested(rows: list[SourceEntry]) -> bool:
+    return any(
+        row.is_human and _EPISODE_RELATED_RE.search(row.normalized_value or "")
+        for row in rows
+    )
+
+
+def _episode_explicitly_closed(rows: list[SourceEntry]) -> bool:
+    human_rows = [row for row in rows if row.is_human]
+    return bool(
+        human_rows
+        and any(
+            _episode_source_closed(row.normalized_value or "")
+            for row in human_rows
+        )
+        and not any(_EPISODE_OPEN_LOOP_RE.search(row.normalized_value or "") for row in human_rows)
+    )
+
+
+def _episode_source_closed(value: str) -> bool:
+    return bool(
+        _EPISODE_CLOSE_RE.search(value or "")
+        and not _EPISODE_NEGATED_CLOSE_RE.search(value or "")
+    )
+
+
+def _moment_episode_basis(
+    conn: sqlite3.Connection,
+    moment_id: str,
+) -> tuple[dict[str, Any], list[SourceEntry]] | None:
+    row = conn.execute(
+        """
+        SELECT guild_id,channel_id,channel_name,channel_policy,route_mode,
+               visibility,public_usable,topic_key,topic_family,topic_signature,
+               window_started_at,last_activity_at,lifecycle_status,
+               canonical_ledger_entry_id
+        FROM memory_moment_windows WHERE moment_id=?
+        """,
+        (moment_id,),
+    ).fetchone()
+    if not row or str(row[12] or "") != "finalized":
+        return None
+    basis = {
+        "moment_id": str(moment_id),
+        "guild_id": int(row[0] or 0),
+        "channel_id": int(row[1] or 0),
+        "channel_name": str(row[2] or ""),
+        "channel_policy": str(row[3] or "unknown"),
+        "route_mode": str(row[4] or "unknown"),
+        "visibility": str(row[5] or "unknown"),
+        "public_usable": bool(row[6]),
+        "topic_key": str(row[7] or ""),
+        "topic_family": str(row[8] or ""),
+        "topic_signature": _load_sig(str(row[9] or "[]")),
+        "window_started_at": str(row[10] or _now()),
+        "last_activity_at": str(row[11] or _now()),
+        "canonical_ledger_entry_id": str(row[13] or ""),
+    }
+    rows = _entries(conn, moment_id)
+    failure, _failure_lifecycle = _moment_source_failure(
+        conn,
+        moment_id=moment_id,
+        rows=rows,
+        guild_id=basis["guild_id"],
+        channel_id=basis["channel_id"],
+        channel_policy=basis["channel_policy"],
+        route_mode=basis["route_mode"],
+        visibility=basis["visibility"],
+        public_usable=basis["public_usable"],
+    )
+    if failure:
+        return None
+    return basis, rows
+
+
+def _episode_scope_matches(
+    episode: tuple[Any, ...],
+    basis: dict[str, Any],
+) -> bool:
+    return (
+        int(episode[1] or 0) == int(basis["guild_id"])
+        and int(episode[2] or 0) == int(basis["channel_id"])
+        and str(episode[3] or "") == str(basis["channel_policy"])
+        and str(episode[4] or "") == str(basis["route_mode"])
+        and str(episode[5] or "") == str(basis["visibility"])
+    )
+
+
+def _episode_topic_matches(
+    episode: tuple[Any, ...],
+    basis: dict[str, Any],
+) -> bool:
+    return _coherent(
+        str(basis["topic_family"]),
+        tuple(basis["topic_signature"]),
+        str(episode[6] or ""),
+        _load_sig(str(episode[7] or "[]")),
+    )
+
+
+def _episode_row(
+    conn: sqlite3.Connection,
+    episode_id: str,
+) -> tuple[Any, ...] | None:
+    return conn.execute(
+        """
+        SELECT episode_id,guild_id,channel_id,channel_policy,route_mode,
+               visibility,topic_family,topic_signature,lifecycle_status,
+               opened_at,last_activity_at,open_loop_count,public_usable
+        FROM memory_moment_episodes WHERE episode_id=?
+        """,
+        (episode_id,),
+    ).fetchone()
+
+
+def _moment_source_digest(
+    rows: list[SourceEntry],
+    *,
+    moment_id: str,
+    canonical_ledger_entry_id: str,
+) -> str:
+    return hashlib.sha256(
+        (
+            f"{moment_id}\x1f{canonical_ledger_entry_id}\x1f"
+            f"{_source_digest(rows)}"
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _moment_human_participant_keys(
+    conn: sqlite3.Connection,
+    moment_id: str,
+) -> set[str]:
+    return {
+        str(row[0])
+        for row in conn.execute(
+            """
+            SELECT participant_key FROM memory_moment_participants
+            WHERE moment_id=? AND participant_role='human_author'
+              AND authored_entry_count>0
+            """,
+            (moment_id,),
+        ).fetchall()
+        if str(row[0] or "")
+    }
+
+
+def _episode_participant_overlap(
+    conn: sqlite3.Connection,
+    episode_id: str,
+    moment_id: str,
+) -> bool:
+    moment_keys = _moment_human_participant_keys(conn, moment_id)
+    if not moment_keys:
+        return False
+    return bool(
+        conn.execute(
+            """
+            SELECT 1 FROM memory_moment_episode_participants
+            WHERE episode_id=? AND participant_role='human_author'
+              AND participant_key IN (%s)
+            LIMIT 1
+            """
+            % ",".join("?" for _ in moment_keys),
+            (episode_id, *sorted(moment_keys)),
+        ).fetchone()
+    )
+
+
+def _mark_episode_needs_review(
+    conn: sqlite3.Connection,
+    episode_id: str,
+    *,
+    reason: str,
+    guild_id: int = 0,
+    moment_id: str = "",
+    entry_id: str = "",
+) -> None:
+    conn.execute(
+        """
+        UPDATE memory_moment_episodes
+        SET lifecycle_status='needs_review', public_usable=0,
+            finalization_reason=?, updated_at=?
+        WHERE episode_id=? AND lifecycle_status IN ('active','finalized')
+        """,
+        (reason[:120], _now(), episode_id),
+    )
+    _diag(
+        conn,
+        guild_id,
+        "episode_awaiting_review",
+        reason,
+        episode_id or moment_id,
+        entry_id,
+    )
+
+
+def _rebuild_episode_projection(
+    conn: sqlite3.Connection,
+    episode_id: str,
+) -> bool:
+    episode = _episode_row(conn, episode_id)
+    if not episode:
+        return False
+    linked = conn.execute(
+        """
+        SELECT link.moment_id,link.link_role
+        FROM memory_moment_episode_moments link
+        JOIN memory_moment_windows window ON window.moment_id=link.moment_id
+        WHERE link.episode_id=?
+        ORDER BY window.window_started_at,window.last_activity_at,link.moment_id
+        """,
+        (episode_id,),
+    ).fetchall()
+    if not linked:
+        _mark_episode_needs_review(
+            conn,
+            episode_id,
+            reason="episode_without_moments",
+            guild_id=int(episode[1] or 0),
+        )
+        return False
+
+    bases: list[dict[str, Any]] = []
+    source_rows: list[SourceEntry] = []
+    for moment_id, _link_role in linked:
+        loaded = _moment_episode_basis(conn, str(moment_id))
+        if not loaded:
+            _mark_episode_needs_review(
+                conn,
+                episode_id,
+                reason="linked_moment_unusable",
+                guild_id=int(episode[1] or 0),
+                moment_id=str(moment_id),
+            )
+            return False
+        basis, rows = loaded
+        if not _episode_scope_matches(episode, basis):
+            _mark_episode_needs_review(
+                conn,
+                episode_id,
+                reason="linked_moment_scope_mismatch",
+                guild_id=int(episode[1] or 0),
+                moment_id=str(moment_id),
+            )
+            return False
+        bases.append(basis)
+        source_rows.extend(rows)
+        conn.execute(
+            """
+            UPDATE memory_moment_episode_moments SET source_digest=?
+            WHERE episode_id=? AND moment_id=?
+            """,
+            (
+                _moment_source_digest(
+                    rows,
+                    moment_id=str(moment_id),
+                    canonical_ledger_entry_id=str(
+                        basis["canonical_ledger_entry_id"]
+                    ),
+                ),
+                episode_id,
+                str(moment_id),
+            ),
+        )
+
+    now = _now()
+    conn.execute(
+        "DELETE FROM memory_moment_episode_participants WHERE episode_id=?",
+        (episode_id,),
+    )
+    conn.execute(
+        "DELETE FROM memory_moment_episode_events WHERE episode_id=?",
+        (episode_id,),
+    )
+
+    participant_sources: dict[
+        tuple[str, str], dict[str, Any]
+    ] = {}
+    semantic_counts = {event_type: 0 for event_type in EPISODE_EVENT_TYPES}
+    outstanding_open_loops = 0
+    ordered_sources = sorted(
+        source_rows,
+        key=lambda source: (
+            source.observed_at,
+            source.source_sequence,
+            source.entry_id,
+        ),
+    )
+    for source in ordered_sources:
+        participant_key = (
+            source.subject_key if source.is_human else BNL_SUBJECT_KEY
+        )
+        participant_role = (
+            "human_author" if source.is_human else "bnl_participant"
+        )
+        participant_name = (
+            _safe_participant_display_name(source.subject_display_name)
+            if source.is_human
+            else "BNL-01"
+        )
+        participant_key_tuple = (participant_key, participant_role)
+        state = participant_sources.setdefault(
+            participant_key_tuple,
+            {
+                "safe_display_name": participant_name,
+                "first_seen_at": source.observed_at,
+                "last_seen_at": source.observed_at,
+                "moment_ids": set(),
+                "order": len(participant_sources),
+            },
+        )
+        state["last_seen_at"] = max(
+            str(state["last_seen_at"]),
+            str(source.observed_at),
+        )
+        source_moment_ids = {
+            str(row[0])
+            for row in conn.execute(
+                """
+                SELECT link.moment_id
+                FROM memory_moment_episode_moments link
+                JOIN memory_moment_members member
+                  ON member.moment_id=link.moment_id
+                WHERE link.episode_id=? AND member.ledger_entry_id=?
+                """,
+                (episode_id, source.entry_id),
+            ).fetchall()
+        }
+        state["moment_ids"].update(source_moment_ids)
+        event_types = _episode_event_types(source)
+        for event_type in event_types:
+            semantic_counts[event_type] += 1
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO memory_moment_episode_events(
+                  episode_id,ledger_entry_id,participant_key,event_type,
+                  observed_at,source_sequence,lifecycle_status,source_digest,
+                  created_at,updated_at
+                ) VALUES(?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    episode_id,
+                    source.entry_id,
+                    participant_key,
+                    event_type,
+                    source.observed_at,
+                    source.source_sequence,
+                    source.lifecycle_status,
+                    hashlib.sha256(
+                        (
+                            f"{source.entry_id}\x1f{source.lifecycle_status}\x1f"
+                            f"{source.normalized_value}"
+                        ).encode("utf-8")
+                    ).hexdigest(),
+                    now,
+                    now,
+                ),
+            )
+        if "outcome" in event_types:
+            outstanding_open_loops = (
+                0
+                if _EPISODE_CLOSE_RE.search(source.normalized_value or "")
+                else max(0, outstanding_open_loops - 1)
+            )
+        if "open_loop" in event_types:
+            outstanding_open_loops += 1
+        if "assignment" in event_types and "outcome" not in event_types:
+            outstanding_open_loops += 1
+
+    for (participant_key, participant_role), state in participant_sources.items():
+        conn.execute(
+            """
+            INSERT INTO memory_moment_episode_participants(
+              episode_id,participant_key,participant_role,safe_display_name,
+              first_seen_at,last_seen_at,source_moment_count,
+              participation_order,created_at,updated_at
+            ) VALUES(?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                episode_id,
+                participant_key,
+                participant_role,
+                state["safe_display_name"],
+                state["first_seen_at"],
+                state["last_seen_at"],
+                len(state["moment_ids"]),
+                state["order"],
+                now,
+                now,
+            ),
+        )
+
+    human_rows = [
+        row
+        for row in ordered_sources
+        if row.is_human
+        and _meaningful(
+            row.normalized_value,
+            row.source_role,
+            row.predicate_key,
+        )
+    ]
+    topic_families = {
+        str(basis["topic_family"])
+        for basis in bases
+        if str(basis["topic_family"])
+    }
+    topic_family = (
+        next(iter(topic_families))
+        if len(topic_families) == 1
+        else "topic_other"
+    )
+    topic_signature = tuple(
+        sorted(
+            {
+                token
+                for basis in bases
+                for token in tuple(basis["topic_signature"])
+            }
+        )
+    )[:24]
+    last_activity_at = max(
+        str(basis["last_activity_at"]) for basis in bases
+    )
+    public_usable = bool(
+        bases
+        and all(bool(basis["public_usable"]) for basis in bases)
+        and all(
+            str(basis["visibility"]) in {"public", "public_safe"}
+            for basis in bases
+        )
+    )
+    semantic_types = tuple(
+        event_type
+        for event_type in EPISODE_EVENT_TYPES
+        if semantic_counts[event_type] > 0
+    )
+    conn.execute(
+        """
+        UPDATE memory_moment_episodes
+        SET topic_family=?,topic_signature=?,last_activity_at=?,
+            public_usable=?,moment_count=?,human_entry_count=?,
+            participant_count=?,semantic_types_json=?,action_count=?,
+            reaction_count=?,decision_count=?,assignment_count=?,
+            outcome_count=?,open_loop_count=?,revision=revision+1,
+            updated_at=?
+        WHERE episode_id=?
+        """,
+        (
+            topic_family,
+            _json_sig(topic_signature),
+            last_activity_at,
+            int(public_usable),
+            len(bases),
+            len({row.entry_id for row in human_rows}),
+            len(
+                {
+                    row.subject_key
+                    for row in human_rows
+                    if row.subject_key
+                }
+            ),
+            json.dumps(semantic_types),
+            semantic_counts["action"],
+            semantic_counts["reaction"],
+            semantic_counts["decision"],
+            semantic_counts["assignment"],
+            semantic_counts["outcome"],
+            outstanding_open_loops,
+            now,
+            episode_id,
+        ),
+    )
+    return True
+
+
+def _insert_episode_moment(
+    conn: sqlite3.Connection,
+    episode_id: str,
+    basis: dict[str, Any],
+    rows: list[SourceEntry],
+    *,
+    link_role: str,
+) -> bool:
+    inserted = conn.execute(
+        """
+        INSERT OR IGNORE INTO memory_moment_episode_moments(
+          episode_id,moment_id,link_role,source_digest,linked_at
+        ) VALUES(?,?,?,?,?)
+        """,
+        (
+            episode_id,
+            basis["moment_id"],
+            link_role,
+            _moment_source_digest(
+                rows,
+                moment_id=str(basis["moment_id"]),
+                canonical_ledger_entry_id=str(
+                    basis["canonical_ledger_entry_id"]
+                ),
+            ),
+            _now(),
+        ),
+    ).rowcount
+    return bool(inserted)
+
+
+def _open_episode(
+    conn: sqlite3.Connection,
+    basis: dict[str, Any],
+    rows: list[SourceEntry],
+) -> str:
+    episode_id = stable_episode_id(
+        int(basis["guild_id"]),
+        int(basis["channel_id"]),
+        str(basis["moment_id"]),
+    )
+    now = _now()
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO memory_moment_episodes(
+          episode_id,schema_version,guild_id,channel_id,channel_name,
+          channel_policy,route_mode,visibility,public_usable,topic_key,
+          topic_family,topic_signature,lifecycle_status,opened_at,
+          last_activity_at,created_at,updated_at
+        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """,
+        (
+            episode_id,
+            EPISODE_SCHEMA_VERSION,
+            basis["guild_id"],
+            basis["channel_id"],
+            basis["channel_name"],
+            basis["channel_policy"],
+            basis["route_mode"],
+            basis["visibility"],
+            int(bool(basis["public_usable"])),
+            basis["topic_key"],
+            basis["topic_family"],
+            _json_sig(tuple(basis["topic_signature"])),
+            "active",
+            basis["window_started_at"],
+            basis["last_activity_at"],
+            now,
+            now,
+        ),
+    )
+    _insert_episode_moment(
+        conn,
+        episode_id,
+        basis,
+        rows,
+        link_role="opened",
+    )
+    _rebuild_episode_projection(conn, episode_id)
+    _diag(
+        conn,
+        int(basis["guild_id"]),
+        "episode_opened",
+        "ok",
+        episode_id,
+        str(basis["canonical_ledger_entry_id"]),
+    )
+    return episode_id
+
+
+def finalize_episode(
+    conn: sqlite3.Connection,
+    episode_id: str,
+    *,
+    reason: str = "inactivity",
+    finalized_at: str = "",
+) -> EpisodeObservationResult:
+    episode = _episode_row(conn, episode_id)
+    if not episode:
+        return EpisodeObservationResult(
+            reason_code="missing_episode",
+            episode_id=episode_id,
+        )
+    lifecycle = str(episode[8] or "")
+    if lifecycle == "finalized":
+        return EpisodeObservationResult(
+            "deduplicated",
+            "already_finalized",
+            episode_id,
+        )
+    if lifecycle in {"needs_review", "retracted", "superseded", "expired"}:
+        return EpisodeObservationResult(
+            "deduplicated",
+            f"terminal_{lifecycle}",
+            episode_id,
+        )
+    if lifecycle != "active":
+        return EpisodeObservationResult(
+            "skipped",
+            f"not_active_{lifecycle or 'unknown'}",
+            episode_id,
+        )
+    timestamp = finalized_at or _now()
+    conn.execute(
+        """
+        UPDATE memory_moment_episodes
+        SET lifecycle_status='finalized',finalized_at=?,
+            finalization_reason=?,updated_at=?
+        WHERE episode_id=?
+        """,
+        (timestamp, reason[:120], _now(), episode_id),
+    )
+    _diag(
+        conn,
+        int(episode[1] or 0),
+        "episode_finalized",
+        reason,
+        episode_id,
+    )
+    return EpisodeObservationResult(
+        "finalized",
+        reason,
+        episode_id,
+    )
+
+
+def link_episode_lineage(
+    conn: sqlite3.Connection,
+    *,
+    from_episode_id: str,
+    to_episode_id: str,
+    relation_type: str,
+    evidence_moment_id: str,
+    evidence_entry_id: str,
+) -> bool:
+    """Create an episode edge only from one current, human-owned source."""
+
+    if relation_type not in {
+        "split_from",
+        "interrupted_from",
+        "related_to",
+    }:
+        return False
+    if (
+        not from_episode_id
+        or not to_episode_id
+        or from_episode_id == to_episode_id
+    ):
+        return False
+    source = _fetch_entry(conn, evidence_entry_id)
+    if (
+        not source
+        or not source.is_human
+        or source.lifecycle_status not in SOURCE_LIFECYCLES_USABLE_FOR_MOMENTS
+        or _contains_sensitive_moment_source(
+            source.normalized_value,
+            source.predicate_key,
+        )
+        or not conn.execute(
+            """
+            SELECT 1 FROM memory_moment_members
+            WHERE moment_id=? AND ledger_entry_id=?
+            """,
+            (evidence_moment_id, evidence_entry_id),
+        ).fetchone()
+        or not conn.execute(
+            """
+            SELECT 1 FROM memory_moment_episode_moments
+            WHERE episode_id=? AND moment_id=?
+            """,
+            (from_episode_id, evidence_moment_id),
+        ).fetchone()
+    ):
+        return False
+    source_episode = _episode_row(conn, from_episode_id)
+    target_episode = _episode_row(conn, to_episode_id)
+    if (
+        not source_episode
+        or not target_episode
+        or tuple(source_episode[1:6]) != tuple(target_episode[1:6])
+        or source.guild_id != int(source_episode[1] or 0)
+        or source.channel_id != int(source_episode[2] or 0)
+        or source.channel_policy != str(source_episode[3] or "")
+        or source.route_mode != str(source_episode[4] or "")
+        or source.visibility != str(source_episode[5] or "")
+    ):
+        return False
+    inserted = conn.execute(
+        """
+        INSERT OR IGNORE INTO memory_moment_episode_lineage(
+          from_episode_id,to_episode_id,relation_type,evidence_moment_id,
+          evidence_entry_id,created_at
+        ) VALUES(?,?,?,?,?,?)
+        """,
+        (
+            from_episode_id,
+            to_episode_id,
+            relation_type,
+            evidence_moment_id,
+            evidence_entry_id,
+            _now(),
+        ),
+    ).rowcount
+    return bool(inserted)
+
+
+def _episode_evidence_entry(rows: list[SourceEntry]) -> str:
+    for row in rows:
+        if row.is_human:
+            return row.entry_id
+    return ""
+
+
+def _active_episodes_for_basis(
+    conn: sqlite3.Connection,
+    basis: dict[str, Any],
+) -> list[tuple[Any, ...]]:
+    return conn.execute(
+        """
+        SELECT episode_id,guild_id,channel_id,channel_policy,route_mode,
+               visibility,topic_family,topic_signature,lifecycle_status,
+               opened_at,last_activity_at,open_loop_count,public_usable
+        FROM memory_moment_episodes
+        WHERE guild_id=? AND channel_id=? AND channel_policy=?
+          AND route_mode=? AND visibility=? AND lifecycle_status='active'
+        ORDER BY last_activity_at DESC,episode_id
+        """,
+        (
+            basis["guild_id"],
+            basis["channel_id"],
+            basis["channel_policy"],
+            basis["route_mode"],
+            basis["visibility"],
+        ),
+    ).fetchall()
+
+
+def _eligible_reopen_candidates(
+    conn: sqlite3.Connection,
+    basis: dict[str, Any],
+) -> list[tuple[Any, ...]]:
+    cutoff = (
+        _parse_ts(str(basis["window_started_at"]))
+        - timedelta(seconds=EPISODE_REOPEN_SECONDS)
+    ).isoformat()
+    rows = conn.execute(
+        """
+        SELECT episode_id,guild_id,channel_id,channel_policy,route_mode,
+               visibility,topic_family,topic_signature,lifecycle_status,
+               opened_at,last_activity_at,open_loop_count,public_usable
+        FROM memory_moment_episodes
+        WHERE guild_id=? AND channel_id=? AND channel_policy=?
+          AND route_mode=? AND visibility=? AND lifecycle_status='finalized'
+          AND last_activity_at>=?
+        ORDER BY last_activity_at DESC,episode_id
+        """,
+        (
+            basis["guild_id"],
+            basis["channel_id"],
+            basis["channel_policy"],
+            basis["route_mode"],
+            basis["visibility"],
+            cutoff,
+        ),
+    ).fetchall()
+    return [
+        row
+        for row in rows
+        if _episode_topic_matches(row, basis)
+        and _episode_participant_overlap(
+            conn,
+            str(row[0]),
+            str(basis["moment_id"]),
+        )
+    ]
+
+
+def _eligible_related_candidates(
+    conn: sqlite3.Connection,
+    basis: dict[str, Any],
+) -> list[tuple[Any, ...]]:
+    cutoff = (
+        _parse_ts(str(basis["window_started_at"]))
+        - timedelta(seconds=EPISODE_REOPEN_SECONDS)
+    ).isoformat()
+    rows = conn.execute(
+        """
+        SELECT episode_id,guild_id,channel_id,channel_policy,route_mode,
+               visibility,topic_family,topic_signature,lifecycle_status,
+               opened_at,last_activity_at,open_loop_count,public_usable
+        FROM memory_moment_episodes
+        WHERE guild_id=? AND channel_id=? AND channel_policy=?
+          AND route_mode=? AND visibility=? AND lifecycle_status='finalized'
+          AND last_activity_at>=?
+        ORDER BY last_activity_at DESC,episode_id
+        """,
+        (
+            basis["guild_id"],
+            basis["channel_id"],
+            basis["channel_policy"],
+            basis["route_mode"],
+            basis["visibility"],
+            cutoff,
+        ),
+    ).fetchall()
+    return [
+        row
+        for row in rows
+        if _episode_participant_overlap(
+            conn,
+            str(row[0]),
+            str(basis["moment_id"]),
+        )
+    ]
+
+
+def reopen_episode(
+    conn: sqlite3.Connection,
+    *,
+    episode_id: str,
+    moment_id: str,
+) -> EpisodeObservationResult:
+    loaded = _moment_episode_basis(conn, moment_id)
+    episode = _episode_row(conn, episode_id)
+    if not loaded or not episode:
+        return EpisodeObservationResult(
+            reason_code="missing_episode_or_moment",
+            episode_id=episode_id,
+            moment_id=moment_id,
+        )
+    basis, rows = loaded
+    if (
+        str(episode[8] or "") != "finalized"
+        or not _episode_scope_matches(episode, basis)
+        or not _episode_topic_matches(episode, basis)
+        or not _episode_participant_overlap(conn, episode_id, moment_id)
+        or not _episode_resume_requested(rows)
+    ):
+        return EpisodeObservationResult(
+            reason_code="reopen_evidence_invalid",
+            episode_id=episode_id,
+            moment_id=moment_id,
+        )
+    active = _active_episodes_for_basis(conn, basis)
+    if active:
+        return EpisodeObservationResult(
+            reason_code="active_episode_already_present",
+            episode_id=episode_id,
+            moment_id=moment_id,
+        )
+    conn.execute(
+        """
+        UPDATE memory_moment_episodes
+        SET lifecycle_status='active',finalized_at=NULL,
+            finalization_reason='',reopen_count=reopen_count+1,
+            updated_at=?
+        WHERE episode_id=?
+        """,
+        (_now(), episode_id),
+    )
+    _insert_episode_moment(
+        conn,
+        episode_id,
+        basis,
+        rows,
+        link_role="reopened",
+    )
+    if not _rebuild_episode_projection(conn, episode_id):
+        return EpisodeObservationResult(
+            "needs_review",
+            "reopen_projection_failed",
+            episode_id,
+            moment_id,
+        )
+    _diag(
+        conn,
+        int(basis["guild_id"]),
+        "episode_reopened",
+        "explicit_resume_source",
+        episode_id,
+        _episode_evidence_entry(rows),
+    )
+    return EpisodeObservationResult(
+        "reopened",
+        "explicit_resume_source",
+        episode_id,
+        moment_id,
+    )
+
+
+def observe_finalized_moment_episode(
+    conn: sqlite3.Connection,
+    moment_id: str,
+    *,
+    require_shadow_gate: bool = True,
+) -> EpisodeObservationResult:
+    """Attach one finalized Moment to the existing episodic lifecycle."""
+
+    if require_shadow_gate and not shadow_enabled():
+        return EpisodeObservationResult(
+            reason_code="moment_gate_disabled",
+            moment_id=moment_id,
+        )
+    loaded = _moment_episode_basis(conn, moment_id)
+    if not loaded:
+        return EpisodeObservationResult(
+            reason_code="moment_not_finalized_or_usable",
+            moment_id=moment_id,
+        )
+    basis, rows = loaded
+    existing = conn.execute(
+        """
+        SELECT episode_id FROM memory_moment_episode_moments
+        WHERE moment_id=? ORDER BY linked_at,episode_id LIMIT 1
+        """,
+        (moment_id,),
+    ).fetchone()
+    if existing:
+        return EpisodeObservationResult(
+            "deduplicated",
+            "moment_already_linked",
+            str(existing[0]),
+            moment_id,
+        )
+
+    try:
+        conn.execute("SAVEPOINT episode_observe")
+        active = _active_episodes_for_basis(conn, basis)
+        if len(active) > 1:
+            for episode in active:
+                _mark_episode_needs_review(
+                    conn,
+                    str(episode[0]),
+                    reason="multiple_active_episodes_in_scope",
+                    guild_id=int(basis["guild_id"]),
+                    moment_id=moment_id,
+                )
+            conn.execute("RELEASE episode_observe")
+            return EpisodeObservationResult(
+                "needs_review",
+                "multiple_active_episodes_in_scope",
+                moment_id=moment_id,
+            )
+
+        prior_episode: tuple[Any, ...] | None = active[0] if active else None
+        if prior_episode and (
+            _parse_ts(str(basis["window_started_at"]))
+            - _parse_ts(str(prior_episode[10] or ""))
+        ).total_seconds() > EPISODE_INACTIVITY_SECONDS:
+            finalize_episode(
+                conn,
+                str(prior_episode[0]),
+                reason="episode_inactivity",
+                finalized_at=str(basis["window_started_at"]),
+            )
+            prior_episode = None
+
+        if prior_episode and _episode_topic_matches(prior_episode, basis):
+            episode_id = str(prior_episode[0])
+            _insert_episode_moment(
+                conn,
+                episode_id,
+                basis,
+                rows,
+                link_role="extended",
+            )
+            if not _rebuild_episode_projection(conn, episode_id):
+                conn.execute("RELEASE episode_observe")
+                return EpisodeObservationResult(
+                    "needs_review",
+                    "extension_projection_failed",
+                    episode_id,
+                    moment_id,
+                )
+            _diag(
+                conn,
+                int(basis["guild_id"]),
+                "episode_extended",
+                "topic_coherent",
+                episode_id,
+                str(basis["canonical_ledger_entry_id"]),
+            )
+            outcome = EpisodeObservationResult(
+                "extended",
+                "topic_coherent",
+                episode_id,
+                moment_id,
+            )
+        elif prior_episode:
+            old_episode_id = str(prior_episode[0])
+            relation_type = (
+                "interrupted_from"
+                if int(prior_episode[11] or 0) > 0
+                else "split_from"
+            )
+            finalize_episode(
+                conn,
+                old_episode_id,
+                reason=(
+                    "topic_interruption"
+                    if relation_type == "interrupted_from"
+                    else "topic_change"
+                ),
+                finalized_at=str(basis["window_started_at"]),
+            )
+            episode_id = _open_episode(conn, basis, rows)
+            evidence_entry_id = _episode_evidence_entry(rows)
+            if evidence_entry_id:
+                link_episode_lineage(
+                    conn,
+                    from_episode_id=episode_id,
+                    to_episode_id=old_episode_id,
+                    relation_type=relation_type,
+                    evidence_moment_id=moment_id,
+                    evidence_entry_id=evidence_entry_id,
+                )
+            conn.execute(
+                """
+                UPDATE memory_moment_episodes
+                SET split_count=split_count+1,updated_at=?
+                WHERE episode_id=?
+                """,
+                (_now(), old_episode_id),
+            )
+            _diag(
+                conn,
+                int(basis["guild_id"]),
+                "episode_split",
+                relation_type,
+                episode_id,
+                evidence_entry_id,
+            )
+            outcome = EpisodeObservationResult(
+                "split",
+                relation_type,
+                episode_id,
+                moment_id,
+            )
+        else:
+            reopen_candidates = (
+                _eligible_reopen_candidates(conn, basis)
+                if _episode_resume_requested(rows)
+                else []
+            )
+            if len(reopen_candidates) == 1:
+                outcome = reopen_episode(
+                    conn,
+                    episode_id=str(reopen_candidates[0][0]),
+                    moment_id=moment_id,
+                )
+            else:
+                episode_id = _open_episode(conn, basis, rows)
+                related_candidates = (
+                    _eligible_related_candidates(conn, basis)
+                    if (
+                        not _episode_resume_requested(rows)
+                        and _episode_related_link_requested(rows)
+                    )
+                    else []
+                )
+                evidence_entry_id = _episode_evidence_entry(rows)
+                if len(related_candidates) == 1 and evidence_entry_id:
+                    link_episode_lineage(
+                        conn,
+                        from_episode_id=episode_id,
+                        to_episode_id=str(related_candidates[0][0]),
+                        relation_type="related_to",
+                        evidence_moment_id=moment_id,
+                        evidence_entry_id=evidence_entry_id,
+                    )
+                    _diag(
+                        conn,
+                        int(basis["guild_id"]),
+                        "episode_related",
+                        "explicit_unique_related_source",
+                        episode_id,
+                        evidence_entry_id,
+                    )
+                elif len(related_candidates) > 1:
+                    _diag(
+                        conn,
+                        int(basis["guild_id"]),
+                        "episode_related_skipped",
+                        "ambiguous_related_candidates",
+                        episode_id,
+                        evidence_entry_id,
+                    )
+                if len(reopen_candidates) > 1:
+                    _diag(
+                        conn,
+                        int(basis["guild_id"]),
+                        "episode_reopen_skipped",
+                        "ambiguous_reopen_candidates",
+                        episode_id,
+                        _episode_evidence_entry(rows),
+                    )
+                    reason = "ambiguous_reopen_candidates"
+                else:
+                    reason = (
+                        "resume_source_without_unique_episode"
+                        if _episode_resume_requested(rows)
+                        else "new_episode"
+                    )
+                outcome = EpisodeObservationResult(
+                    "opened",
+                    reason,
+                    episode_id,
+                    moment_id,
+                )
+
+        if (
+            outcome.episode_id
+            and outcome.outcome
+            not in {"needs_review", "error", "skipped"}
+            and _episode_explicitly_closed(rows)
+        ):
+            finalize_episode(
+                conn,
+                outcome.episode_id,
+                reason="explicit_outcome",
+                finalized_at=str(basis["last_activity_at"]),
+            )
+        conn.execute("RELEASE episode_observe")
+        return outcome
+    except Exception:
+        try:
+            conn.execute("ROLLBACK TO episode_observe")
+            conn.execute("RELEASE episode_observe")
+        except Exception:
+            pass
+        try:
+            _diag(
+                conn,
+                int(basis["guild_id"]),
+                "episode_processing_error",
+                "exception",
+                moment_id,
+            )
+        except Exception:
+            pass
+        return EpisodeObservationResult(
+            "error",
+            "exception",
+            moment_id=moment_id,
+        )
+
+
+def backfill_episodic_lifecycle(
+    conn: sqlite3.Connection,
+) -> dict[str, int]:
+    counts = {
+        "observed": 0,
+        "deduplicated": 0,
+        "errors": 0,
+    }
+    for (moment_id,) in conn.execute(
+        """
+        SELECT moment_id FROM memory_moment_windows
+        WHERE lifecycle_status='finalized'
+        ORDER BY window_started_at,last_activity_at,moment_id
+        """
+    ).fetchall():
+        result = observe_finalized_moment_episode(
+            conn,
+            str(moment_id),
+            require_shadow_gate=False,
+        )
+        if result.outcome == "error":
+            counts["errors"] += 1
+        elif result.outcome == "deduplicated":
+            counts["deduplicated"] += 1
+        elif result.outcome not in {"skipped", "needs_review"}:
+            counts["observed"] += 1
+    return counts
+
+
+def sweep_expired_episodes(
+    conn: sqlite3.Connection,
+    *,
+    guild_id: int | None = None,
+    now: str | None = None,
+) -> list[EpisodeObservationResult]:
+    if not shadow_enabled() or not ledger_shadow_enabled():
+        return []
+    ensure_moment_schema(conn)
+    base = _parse_ts(now or _now())
+    params: list[Any] = []
+    where = "lifecycle_status='active'"
+    if guild_id is not None:
+        where += " AND guild_id=?"
+        params.append(guild_id)
+    results = []
+    for episode_id, last_activity_at in conn.execute(
+        f"""
+        SELECT episode_id,last_activity_at
+        FROM memory_moment_episodes WHERE {where}
+        """,
+        params,
+    ).fetchall():
+        if (
+            base - _parse_ts(str(last_activity_at or ""))
+        ).total_seconds() >= EPISODE_INACTIVITY_SECONDS:
+            results.append(
+                finalize_episode(
+                    conn,
+                    str(episode_id),
+                    reason="episode_inactivity",
+                    finalized_at=base.isoformat(),
+                )
+            )
+    return results
+
+
+def active_episode_for_assessment(
+    conn: sqlite3.Connection,
+    *,
+    guild_id: int,
+    channel_id: int,
+    channel_policy: str,
+    route_mode: str,
+    topic_text: str,
+    participant_keys: tuple[str, ...] = (),
+    now: str | None = None,
+) -> ActiveEpisodeReference | None:
+    """Select one active episode without creating schema or changing state."""
+
+    if (
+        not shadow_enabled()
+        or not ledger_shadow_enabled()
+        or not _table_exists(conn, "memory_moment_episodes")
+    ):
+        return None
+    candidates = conn.execute(
+        """
+        SELECT episode_id,guild_id,channel_id,channel_policy,route_mode,
+               visibility,topic_family,topic_signature,lifecycle_status,
+               opened_at,last_activity_at,open_loop_count,public_usable,
+               participant_count,semantic_types_json
+        FROM memory_moment_episodes
+        WHERE guild_id=? AND channel_id=? AND channel_policy=?
+          AND route_mode=? AND lifecycle_status='active'
+        ORDER BY last_activity_at DESC,episode_id
+        """,
+        (
+            int(guild_id or 0),
+            int(channel_id or 0),
+            str(channel_policy or "unknown"),
+            str(route_mode or "unknown"),
+        ),
+    ).fetchall()
+    if len(candidates) != 1:
+        return None
+    candidate = candidates[0]
+    if (
+        _parse_ts(now or _now())
+        - _parse_ts(str(candidate[10] or ""))
+    ).total_seconds() >= EPISODE_INACTIVITY_SECONDS:
+        return None
+    signature = _topic_signature(topic_text, "conversation")
+    family = _topic_family(topic_text, "conversation")
+    if signature and not _coherent(
+        family,
+        signature,
+        str(candidate[6] or ""),
+        _load_sig(str(candidate[7] or "[]")),
+    ):
+        return None
+    scoped_participant_keys = tuple(
+        sorted(
+            {
+                str(key)
+                for key in participant_keys
+                if re.fullmatch(r"discord_user:[1-9]\d*", str(key or ""))
+            }
+        )
+    )
+    if scoped_participant_keys and not conn.execute(
+        """
+        SELECT 1 FROM memory_moment_episode_participants
+        WHERE episode_id=? AND participant_role='human_author'
+          AND participant_key IN (%s)
+        LIMIT 1
+        """
+        % ",".join("?" for _ in scoped_participant_keys),
+        (str(candidate[0]), *scoped_participant_keys),
+    ).fetchone():
+        return None
+    source_moments = tuple(
+        str(row[0])
+        for row in conn.execute(
+            """
+            SELECT link.moment_id
+            FROM memory_moment_episode_moments link
+            JOIN memory_moment_windows window
+              ON window.moment_id=link.moment_id
+            WHERE link.episode_id=? AND window.lifecycle_status='finalized'
+            ORDER BY window.window_started_at,link.moment_id
+            """,
+            (str(candidate[0]),),
+        ).fetchall()
+    )
+    link_count = int(
+        conn.execute(
+            """
+            SELECT COUNT(*) FROM memory_moment_episode_moments
+            WHERE episode_id=?
+            """,
+            (str(candidate[0]),),
+        ).fetchone()[0]
+        or 0
+    )
+    if not source_moments or len(source_moments) != link_count:
+        return None
+    try:
+        semantic_types = tuple(
+            event_type
+            for event_type in json.loads(str(candidate[14] or "[]"))
+            if event_type in EPISODE_EVENT_TYPES
+        )
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+    return ActiveEpisodeReference(
+        episode_id=str(candidate[0]),
+        lifecycle_status=str(candidate[8] or ""),
+        source_moment_ids=source_moments,
+        participant_count=max(0, int(candidate[13] or 0)),
+        open_loop_count=max(0, int(candidate[11] or 0)),
+        semantic_types=semantic_types,
+    )
+
+
 def finalize_moment(conn: sqlite3.Connection, moment_id: str) -> MomentObservationResult:
     ensure_moment_schema(conn)
     win = conn.execute(
@@ -2077,6 +3723,7 @@ def finalize_moment(conn: sqlite3.Connection, moment_id: str) -> MomentObservati
         public_usable=public_usable,
     )
     _diag(conn, int(win[0] or 0), "window_finalized", reason, moment_id, moment_entry_id)
+    observe_finalized_moment_episode(conn, moment_id)
     return MomentObservationResult(result.outcome, result.reason_code, moment_id, moment_entry_id)
 
 
@@ -2635,4 +4282,250 @@ def build_moment_evaluation_report(
         "affected_moments_awaiting_correction_review": one(f"SELECT COUNT(*) FROM memory_moment_windows{where + (' AND' if where else ' WHERE')} lifecycle_status='needs_review'", params),
         "finalization_latency": one(f"SELECT COALESCE(AVG(strftime('%s',finalized_at)-strftime('%s',last_activity_at)),0) FROM memory_moment_windows{where + (' AND' if where else ' WHERE')} finalized_at IS NOT NULL", params),
     }
+    episode_tables = {
+        "memory_moment_episodes",
+        "memory_moment_episode_moments",
+        "memory_moment_episode_participants",
+        "memory_moment_episode_events",
+        "memory_moment_episode_lineage",
+    }
+    episode_defaults: dict[str, Any] = {
+        "episode_schema_present": False,
+        "episodes_by_lifecycle": {},
+        "active_episodes": 0,
+        "finalized_episodes": 0,
+        "episodes_awaiting_review": 0,
+        "episodes_with_open_loops": 0,
+        "episode_events_by_type": {},
+        "episode_lineage_by_type": {},
+        "episode_moment_links": 0,
+        "episode_source_links": 0,
+        "episode_extensions": 0,
+        "episode_splits": 0,
+        "episode_reopens": 0,
+        "episode_processing_errors": 0,
+        "episode_duplicate_moment_links": 0,
+        "episode_active_scope_duplicates": 0,
+        "episode_cross_scope_violations": 0,
+        "episode_orphaned_moment_links": 0,
+        "episode_orphaned_source_links": 0,
+        "episode_participant_link_violations": 0,
+    }
+    report.update(episode_defaults)
+    if all(_table_exists(conn, table) for table in episode_tables):
+        episode_where = ""
+        episode_params: list[Any] = []
+        if guild_id is not None:
+            episode_where = " WHERE guild_id=?"
+            episode_params = [guild_id]
+        episode_scoped = "episode.guild_id=? AND " if guild_id is not None else ""
+        episode_scoped_params = [guild_id] if guild_id is not None else []
+        report.update(
+            {
+                "episode_schema_present": True,
+                "episodes_by_lifecycle": dict(
+                    conn.execute(
+                        f"""
+                        SELECT lifecycle_status,COUNT(*)
+                        FROM memory_moment_episodes{episode_where}
+                        GROUP BY lifecycle_status
+                        """,
+                        episode_params,
+                    ).fetchall()
+                ),
+                "active_episodes": one(
+                    f"""
+                    SELECT COUNT(*) FROM memory_moment_episodes
+                    {episode_where + (' AND' if episode_where else ' WHERE')}
+                    lifecycle_status='active'
+                    """,
+                    episode_params,
+                ),
+                "finalized_episodes": one(
+                    f"""
+                    SELECT COUNT(*) FROM memory_moment_episodes
+                    {episode_where + (' AND' if episode_where else ' WHERE')}
+                    lifecycle_status='finalized'
+                    """,
+                    episode_params,
+                ),
+                "episodes_awaiting_review": one(
+                    f"""
+                    SELECT COUNT(*) FROM memory_moment_episodes
+                    {episode_where + (' AND' if episode_where else ' WHERE')}
+                    lifecycle_status='needs_review'
+                    """,
+                    episode_params,
+                ),
+                "episodes_with_open_loops": one(
+                    f"""
+                    SELECT COUNT(*) FROM memory_moment_episodes
+                    {episode_where + (' AND' if episode_where else ' WHERE')}
+                    lifecycle_status='active' AND open_loop_count>0
+                    """,
+                    episode_params,
+                ),
+                "episode_events_by_type": dict(
+                    conn.execute(
+                        f"""
+                        SELECT event.event_type,COUNT(*)
+                        FROM memory_moment_episode_events event
+                        JOIN memory_moment_episodes episode
+                          ON episode.episode_id=event.episode_id
+                        WHERE {episode_scoped}1=1
+                        GROUP BY event.event_type
+                        """,
+                        episode_scoped_params,
+                    ).fetchall()
+                ),
+                "episode_lineage_by_type": dict(
+                    conn.execute(
+                        f"""
+                        SELECT lineage.relation_type,COUNT(*)
+                        FROM memory_moment_episode_lineage lineage
+                        JOIN memory_moment_episodes episode
+                          ON episode.episode_id=lineage.from_episode_id
+                        WHERE {episode_scoped}1=1
+                        GROUP BY lineage.relation_type
+                        """,
+                        episode_scoped_params,
+                    ).fetchall()
+                ),
+                "episode_moment_links": one(
+                    f"""
+                    SELECT COUNT(*)
+                    FROM memory_moment_episode_moments link
+                    JOIN memory_moment_episodes episode
+                      ON episode.episode_id=link.episode_id
+                    WHERE {episode_scoped}1=1
+                    """,
+                    episode_scoped_params,
+                ),
+                "episode_source_links": one(
+                    f"""
+                    SELECT COUNT(*)
+                    FROM memory_moment_episode_events event
+                    JOIN memory_moment_episodes episode
+                      ON episode.episode_id=event.episode_id
+                    WHERE {episode_scoped}1=1
+                    """,
+                    episode_scoped_params,
+                ),
+                "episode_extensions": one(
+                    f"""
+                    SELECT COUNT(*) FROM memory_moment_diagnostics
+                    {where + (' AND' if where else ' WHERE')}
+                    event_type='episode_extended'
+                    """,
+                    params,
+                ),
+                "episode_splits": one(
+                    f"""
+                    SELECT COUNT(*) FROM memory_moment_diagnostics
+                    {where + (' AND' if where else ' WHERE')}
+                    event_type='episode_split'
+                    """,
+                    params,
+                ),
+                "episode_reopens": one(
+                    f"""
+                    SELECT COUNT(*) FROM memory_moment_diagnostics
+                    {where + (' AND' if where else ' WHERE')}
+                    event_type='episode_reopened'
+                    """,
+                    params,
+                ),
+                "episode_processing_errors": one(
+                    f"""
+                    SELECT COUNT(*) FROM memory_moment_diagnostics
+                    {where + (' AND' if where else ' WHERE')}
+                    event_type='episode_processing_error'
+                    """,
+                    params,
+                ),
+                "episode_duplicate_moment_links": one(
+                    f"""
+                    SELECT COUNT(*) FROM (
+                      SELECT link.moment_id,
+                             COUNT(DISTINCT link.episode_id) AS c
+                      FROM memory_moment_episode_moments link
+                      JOIN memory_moment_episodes episode
+                        ON episode.episode_id=link.episode_id
+                      WHERE {episode_scoped}1=1
+                      GROUP BY link.moment_id HAVING c>1
+                    )
+                    """,
+                    episode_scoped_params,
+                ),
+                "episode_active_scope_duplicates": one(
+                    f"""
+                    SELECT COALESCE(SUM(c-1),0) FROM (
+                      SELECT COUNT(*) AS c FROM memory_moment_episodes episode
+                      WHERE {episode_scoped}
+                        episode.lifecycle_status='active'
+                      GROUP BY episode.guild_id,episode.channel_id,
+                               episode.channel_policy,episode.route_mode,
+                               episode.visibility HAVING c>1
+                    )
+                    """,
+                    episode_scoped_params,
+                ),
+                "episode_cross_scope_violations": one(
+                    f"""
+                    SELECT COUNT(*)
+                    FROM memory_moment_episode_moments link
+                    JOIN memory_moment_episodes episode
+                      ON episode.episode_id=link.episode_id
+                    JOIN memory_moment_windows window
+                      ON window.moment_id=link.moment_id
+                    WHERE {episode_scoped}(
+                      episode.guild_id<>window.guild_id
+                      OR episode.channel_id<>window.channel_id
+                      OR episode.channel_policy<>window.channel_policy
+                      OR episode.route_mode<>window.route_mode
+                      OR episode.visibility<>window.visibility
+                    )
+                    """,
+                    episode_scoped_params,
+                ),
+                "episode_orphaned_moment_links": one(
+                    f"""
+                    SELECT COUNT(*)
+                    FROM memory_moment_episode_moments link
+                    JOIN memory_moment_episodes episode
+                      ON episode.episode_id=link.episode_id
+                    LEFT JOIN memory_moment_windows window
+                      ON window.moment_id=link.moment_id
+                    WHERE {episode_scoped}window.moment_id IS NULL
+                    """,
+                    episode_scoped_params,
+                ),
+                "episode_orphaned_source_links": one(
+                    f"""
+                    SELECT COUNT(*)
+                    FROM memory_moment_episode_events event
+                    JOIN memory_moment_episodes episode
+                      ON episode.episode_id=event.episode_id
+                    LEFT JOIN memory_ledger_entries source
+                      ON source.entry_id=event.ledger_entry_id
+                    WHERE {episode_scoped}source.entry_id IS NULL
+                    """,
+                    episode_scoped_params,
+                ),
+                "episode_participant_link_violations": one(
+                    f"""
+                    SELECT COUNT(*)
+                    FROM memory_moment_episode_events event
+                    JOIN memory_moment_episodes episode
+                      ON episode.episode_id=event.episode_id
+                    LEFT JOIN memory_moment_episode_participants participant
+                      ON participant.episode_id=event.episode_id
+                     AND participant.participant_key=event.participant_key
+                    WHERE {episode_scoped}
+                      participant.participant_key IS NULL
+                    """,
+                    episode_scoped_params,
+                ),
+            }
+        )
     return report

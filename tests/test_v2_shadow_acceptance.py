@@ -373,6 +373,57 @@ class V2ShadowAcceptanceTests(unittest.TestCase):
                 )
                 self.assertFalse(snapshot["automaticCutoverAllowed"])
 
+    def test_episode_scope_invariant_is_a_hard_moment_blocker(self):
+        for index in (1, 2):
+            self.conn.execute(
+                """
+                INSERT INTO memory_moment_episodes(
+                  episode_id,schema_version,guild_id,channel_id,channel_name,
+                  channel_policy,route_mode,visibility,public_usable,topic_key,
+                  topic_family,topic_signature,lifecycle_status,opened_at,
+                  last_activity_at,created_at,updated_at
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    "episode-%s" % index,
+                    "memory_moment_episode_v2",
+                    1,
+                    100,
+                    "general",
+                    "public_home",
+                    "normal_chat",
+                    "public_safe",
+                    1,
+                    "topic-%s" % index,
+                    "topic_other",
+                    "[]",
+                    "active",
+                    "2026-07-19T00:00:00+00:00",
+                    "2026-07-19T00:01:00+00:00",
+                    "2026-07-19T00:00:00+00:00",
+                    "2026-07-19T00:01:00+00:00",
+                ),
+            )
+        self.conn.commit()
+
+        snapshot = self.snapshot(
+            {"BNL_MOMENT_ENGINE_SHADOW_ENABLED": "true"}
+        )
+        self.assertEqual(
+            snapshot["reports"]["momentEngine"][
+                "episode_active_scope_duplicates"
+            ],
+            1,
+        )
+        self.assertIn(
+            "moment_engine:episode_active_scope_duplicates",
+            snapshot["blockers"],
+        )
+        self.assertEqual(
+            snapshot["status"],
+            "blocked_shadow_invariant_failure",
+        )
+
     def test_relationship_shadow_is_blocked_when_earlier_stages_are_not_accepted(self):
         snapshot = self.snapshot({"BNL_RELATIONSHIP_V2_SHADOW_ENABLED": "true"})
         stage = snapshot["stages"]["relationship_v2"]
@@ -978,6 +1029,53 @@ class V2ShadowAcceptanceTests(unittest.TestCase):
             "(guild_id,moment_id,event_type,reason_code,ledger_entry_id,created_at) "
             "VALUES (1,'controlled-moment','eligible_ledger_entry_observed','ok',?,?)",
             (ledger_result.entry_id, "2026-07-19T00:00:00+00:00"),
+        )
+        self.conn.execute(
+            """
+            INSERT INTO memory_moment_episodes(
+              episode_id,schema_version,guild_id,channel_id,channel_name,
+              channel_policy,route_mode,visibility,public_usable,topic_key,
+              topic_family,topic_signature,lifecycle_status,opened_at,
+              last_activity_at,moment_count,human_entry_count,
+              participant_count,created_at,updated_at
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                "controlled-episode",
+                "memory_moment_episode_v2",
+                1,
+                100,
+                "general",
+                "public_home",
+                "normal_chat",
+                "public_safe",
+                1,
+                "synth-patch",
+                "topic_other",
+                "[]",
+                "active",
+                "2026-07-19T00:00:00+00:00",
+                "2026-07-19T00:01:00+00:00",
+                1,
+                1,
+                1,
+                "2026-07-19T00:00:00+00:00",
+                "2026-07-19T00:10:00+00:00",
+            ),
+        )
+        self.conn.execute(
+            """
+            INSERT INTO memory_moment_episode_moments(
+              episode_id,moment_id,link_role,source_digest,linked_at
+            ) VALUES(?,?,?,?,?)
+            """,
+            (
+                "controlled-episode",
+                "controlled-moment",
+                "opened",
+                "aggregate-test-digest",
+                "2026-07-19T00:10:00+00:00",
+            ),
         )
         persist_shadow_diagnostics(
             self.conn,

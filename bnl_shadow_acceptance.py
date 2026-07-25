@@ -188,6 +188,26 @@ def _empty_moment_report() -> Dict[str, Any]:
         "incompatible_visibility_violations": 0,
         "dangling_lineage_targets": 0,
         "affected_moments_awaiting_correction_review": 0,
+        "episode_schema_present": False,
+        "episodes_by_lifecycle": {},
+        "active_episodes": 0,
+        "finalized_episodes": 0,
+        "episodes_awaiting_review": 0,
+        "episodes_with_open_loops": 0,
+        "episode_events_by_type": {},
+        "episode_lineage_by_type": {},
+        "episode_moment_links": 0,
+        "episode_source_links": 0,
+        "episode_extensions": 0,
+        "episode_splits": 0,
+        "episode_reopens": 0,
+        "episode_processing_errors": 0,
+        "episode_duplicate_moment_links": 0,
+        "episode_active_scope_duplicates": 0,
+        "episode_cross_scope_violations": 0,
+        "episode_orphaned_moment_links": 0,
+        "episode_orphaned_source_links": 0,
+        "episode_participant_link_violations": 0,
     }
 
 
@@ -679,6 +699,13 @@ def build_v2_shadow_acceptance_snapshot(
             "cross_channel_violations",
             "incompatible_visibility_violations",
             "dangling_lineage_targets",
+            "episode_processing_errors",
+            "episode_duplicate_moment_links",
+            "episode_active_scope_duplicates",
+            "episode_cross_scope_violations",
+            "episode_orphaned_moment_links",
+            "episode_orphaned_source_links",
+            "episode_participant_link_violations",
         )
         if int(moments.get(key, 0) or 0)
     ]
@@ -687,6 +714,12 @@ def build_v2_shadow_acceptance_snapshot(
     moment_evidence = (
         int(moments.get("eligible_entries_observed", 0) or 0) > 0
         and int(moments.get("finalized_moments", 0) or 0) > 0
+        and bool(moments.get("episode_schema_present"))
+        and (
+            int(moments.get("active_episodes", 0) or 0)
+            + int(moments.get("finalized_episodes", 0) or 0)
+            > 0
+        )
     )
     moment_prerequisites = [] if ledger_status.startswith("candidate_pass") else ["memory_ledger"]
     moment_status = _stage_status(
@@ -850,6 +883,8 @@ def build_v2_shadow_acceptance_snapshot(
         warnings.append("ledger_multiple_active_values_review")
     if int(moments.get("affected_moments_awaiting_correction_review", 0) or 0):
         warnings.append("moment_correction_review_pending")
+    if int(moments.get("episodes_awaiting_review", 0) or 0):
+        warnings.append("moment_episode_review_pending")
     if relationship.get("legacy_v2_comparison") == "not_collected":
         warnings.append("relationship_legacy_v2_comparison_not_collected")
     if int(governance.get("aggregateDiagnosticRuns", 0) or 0) < int(
@@ -1014,7 +1049,7 @@ def render_v2_shadow_acceptance_lines(snapshot: Mapping[str, Any]) -> List[str]:
             (ledger.get("evidenceWindow") or {}).get("last", "none"),
         ),
         "- ledger_parity_metric: `%s` (`informational`; intentional derived rows are included)" % ledger.get("legacyToLedgerParityMismatches", 0),
-        "- moments: status=`%s` requested=`%s` effective=`%s` eligible=`%s` open=`%s` finalized=`%s` rejected=`%s` errors=`%s` safety_violations=`%s` window_last=`%s`" % (
+        "- moments: status=`%s` requested=`%s` effective=`%s` eligible=`%s` open=`%s` finalized=`%s` rejected=`%s` active_episodes=`%s` finalized_episodes=`%s` episode_open_loops=`%s` errors=`%s` safety_violations=`%s` window_last=`%s`" % (
             (stages.get("moment_engine") or {}).get("status", "unknown"),
             _on(gates.get("moment_engine_shadow_requested")),
             _on(gates.get("moment_engine_shadow_effective")),
@@ -1022,8 +1057,28 @@ def render_v2_shadow_acceptance_lines(snapshot: Mapping[str, Any]) -> List[str]:
             moments.get("open_windows", 0),
             moments.get("finalized_moments", 0),
             json.dumps(moments.get("rejected_windows_by_reason", {}), sort_keys=True),
-            moments.get("processing_errors", 0),
-            sum(int(moments.get(key, 0) or 0) for key in ("duplicate_memberships", "bnl_only_violations", "cross_guild_violations", "cross_channel_violations", "incompatible_visibility_violations", "dangling_lineage_targets")),
+            moments.get("active_episodes", 0),
+            moments.get("finalized_episodes", 0),
+            moments.get("episodes_with_open_loops", 0),
+            int(moments.get("processing_errors", 0) or 0)
+            + int(moments.get("episode_processing_errors", 0) or 0),
+            sum(
+                int(moments.get(key, 0) or 0)
+                for key in (
+                    "duplicate_memberships",
+                    "bnl_only_violations",
+                    "cross_guild_violations",
+                    "cross_channel_violations",
+                    "incompatible_visibility_violations",
+                    "dangling_lineage_targets",
+                    "episode_duplicate_moment_links",
+                    "episode_active_scope_duplicates",
+                    "episode_cross_scope_violations",
+                    "episode_orphaned_moment_links",
+                    "episode_orphaned_source_links",
+                    "episode_participant_link_violations",
+                )
+            ),
             (moments.get("evidenceWindow") or {}).get("last", "none"),
         ),
         "- governance: status=`%s` shadow=`%s` live_requested=`%s` live_effective=`%s` runs=`%s` aggregate_runs=`%s` selected=`%s` empty_runs=`%s` errors=`%s` invalid_invariants=`%s` window_last=`%s`" % (

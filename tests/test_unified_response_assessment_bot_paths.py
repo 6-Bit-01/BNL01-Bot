@@ -194,6 +194,10 @@ class UnifiedResponseAssessmentBotPathTests(unittest.TestCase):
             bnl01_bot,
             "unified_response_assessment_shadow_enabled",
             return_value=True,
+        ), mock.patch.object(
+            bnl01_bot,
+            "_active_episode_id_for_unified_assessment",
+            return_value="mep_opaque_shadow_reference",
         ):
             prompt_on, *_ = bnl01_bot.build_user_aware_prompt(
                 101,
@@ -222,6 +226,14 @@ class UnifiedResponseAssessmentBotPathTests(unittest.TestCase):
         self.assertEqual(
             assessment.selected_lanes,
             ("current_exchange", "conversation_context"),
+        )
+        self.assertEqual(
+            assessment.active_episode_id,
+            "mep_opaque_shadow_reference",
+        )
+        self.assertIn(
+            ("active_episode", "current_exchange_precedence"),
+            assessment.excluded_lanes,
         )
 
     def test_bot_recorder_persists_only_aggregate_receipt(self):

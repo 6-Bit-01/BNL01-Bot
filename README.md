@@ -154,7 +154,7 @@ undifferentiated store:
 | Conversation Context v2 | The live, bounded owner for nearby room continuity and relevant same-member public follow-ups. It defaults on and does not make every message durable. |
 | Approved member facts | Only a direct self-report of preferred name, pronouns, favorite color, or favorite movie may update the live personal fact owner automatically. These facts remain source-linked, changeable, and non-Core. |
 | Unified Memory Ledger | Additive, source-linked shadow evidence and lineage. It is not live reply authority by itself. |
-| Moment Engine | Builds derived, participant-attributed meaning gists from eligible Ledger evidence. A Moment is paraphrase support, never a transcript or quotation authority. |
+| Moment Engine | Builds derived, participant-attributed meaning gists from eligible Ledger evidence. Its shadow episodic lifecycle can join coherent Moments into one shared active episode, split on topic interruption, and reopen or link only from source-backed evidence. A Moment or episode is paraphrase support, never a transcript or quotation authority. |
 | Memory Governance | Compares eligible durable candidates in shadow. The existing broad live switch is not an approved production cutover path. |
 | Relationship v2 / Active Engagement v2 | Derived tone and proactive-behavior layers. Their live gates remain off until earlier memory authority, precedence, correction, deletion, and rollback canaries pass. |
 
@@ -164,6 +164,14 @@ distinct, preserve public/private and channel-policy boundaries, and avoid
 turning conversation traces into biography. Multi-person replies are shared
 room output rather than a personal BNL reply copied into every participant's
 history.
+
+The episodic Moment lifecycle remains shadow-only. It records content-free
+action, reaction, decision, assignment, outcome, and open-loop roles against
+their Ledger sources; supports any number of participants on one shared
+episode; and propagates correction or deletion into review state. The Unified
+Response Assessment may record an opaque active-episode reference for
+comparison, but episode content is not rendered into production prompts in
+this stage.
 
 When asked what another person said, BNL should give a cautious gist by default.
 Exact wording is a separate, fail-closed evidence mode: it requires a
