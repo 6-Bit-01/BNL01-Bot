@@ -3,6 +3,7 @@ import os
 import sqlite3
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 
@@ -11,7 +12,13 @@ os.environ.setdefault("GEMINI_API_KEY", "test-gemini-key")
 os.environ.setdefault("DISCORD_BOT_TOKEN", "test-discord-token")
 
 import bnl01_bot
-from bnl_memory_governance import ensure_governance_schema
+import bnl_memory_ledger as ledger
+import bnl_moment_engine as moments
+from bnl_memory_governance import (
+    GovernanceDiagnostics,
+    GovernanceResult,
+    ensure_governance_schema,
+)
 from bnl_memory_ledger import subject_key_for_user
 
 
@@ -23,6 +30,7 @@ class MemoryGovernanceCanaryAuthorizationTests(unittest.TestCase):
             "BNL_MEMORY_GOVERNANCE_CANARY_USER_IDS": "202",
             "BNL_MEMORY_LEDGER_SHADOW_ENABLED": "true",
             "BNL_MEMORY_GOVERNANCE_SHADOW_ENABLED": "true",
+            "BNL_MOMENT_ENGINE_SHADOW_ENABLED": "true",
         }
 
     def request(self, **overrides):
@@ -67,6 +75,7 @@ class MemoryGovernanceCanaryAuthorizationTests(unittest.TestCase):
             "missing_governance_shadow": (
                 "BNL_MEMORY_GOVERNANCE_SHADOW_ENABLED"
             ),
+            "missing_moment_shadow": "BNL_MOMENT_ENGINE_SHADOW_ENABLED",
         }
         for label, missing in cases.items():
             with self.subTest(label=label):
@@ -168,6 +177,7 @@ class MemoryGovernanceCanaryIntegrationTests(unittest.TestCase):
         "BNL_MEMORY_LEDGER_SHADOW_ENABLED",
         "BNL_MEMORY_GOVERNANCE_SHADOW_ENABLED",
         "BNL_MEMORY_GOVERNANCE_LIVE_ENABLED",
+        "BNL_MOMENT_ENGINE_SHADOW_ENABLED",
     )
 
     def setUp(self):
@@ -207,6 +217,7 @@ class MemoryGovernanceCanaryIntegrationTests(unittest.TestCase):
                 "BNL_MEMORY_GOVERNANCE_CANARY_USER_IDS": users,
                 "BNL_MEMORY_LEDGER_SHADOW_ENABLED": "true",
                 "BNL_MEMORY_GOVERNANCE_SHADOW_ENABLED": "true",
+                "BNL_MOMENT_ENGINE_SHADOW_ENABLED": "true",
             }
         )
 
@@ -219,6 +230,8 @@ class MemoryGovernanceCanaryIntegrationTests(unittest.TestCase):
         lifecycle="active",
         visibility="public_safe",
         public_usable=1,
+        source_policy="public_home",
+        route_mode=None,
     ):
         with sqlite3.connect(bnl01_bot.DB_FILE) as conn:
             ensure_governance_schema(conn)
@@ -259,8 +272,8 @@ class MemoryGovernanceCanaryIntegrationTests(unittest.TestCase):
                     lifecycle,
                     timestamp,
                     timestamp,
-                    bnl01_bot.ROUTE_MODE_NORMAL_CHAT,
-                    "public_home",
+                    route_mode or bnl01_bot.ROUTE_MODE_NORMAL_CHAT,
+                    source_policy,
                 ),
             )
             conn.commit()
@@ -272,17 +285,89 @@ class MemoryGovernanceCanaryIntegrationTests(unittest.TestCase):
         user_id=42,
         guild_id=1,
         policy="public_home",
+        user_text="BNL, what do you remember about me?",
     ):
         return bnl01_bot.apply_explicit_recall_governance(
             user_id,
             guild_id,
-            "BNL, what do you remember about me?",
+            user_text,
             legacy,
             bnl01_bot.ROUTE_MODE_NORMAL_CHAT,
             policy,
             channel_id=99,
             channel_name="barcode-bot",
         )
+
+    def insert_public_question_moment(self):
+        messages = (
+            (
+                "user",
+                "Could dreaming affect programmed identity and anxiety?",
+            ),
+            (
+                "model",
+                "Those themes can be explored without treating them as facts.",
+            ),
+            (
+                "user",
+                "Does being alive connect to dreaming and programmed identity?",
+            ),
+            (
+                "model",
+                "That continues the same philosophical question.",
+            ),
+            (
+                "user",
+                "Could anxiety connect dreaming, being alive, and programmed identity?",
+            ),
+            (
+                "model",
+                "The thread now connects those questions directly.",
+            ),
+        )
+        moment_id = ""
+        with sqlite3.connect(bnl01_bot.DB_FILE) as conn:
+            ensure_governance_schema(conn)
+            moments.ensure_moment_schema(conn)
+            base = datetime(2026, 7, 25, 18, 0, tzinfo=timezone.utc)
+            for index, (role, content) in enumerate(messages, start=1):
+                write = ledger.shadow_conversation_row(
+                    conn,
+                    row_id=5000 + index,
+                    user_id=42,
+                    user_name="Test Member" if role == "user" else "BNL-01",
+                    guild_id=1,
+                    role=role,
+                    content=content,
+                    channel_policy="public_home",
+                    channel_id=10,
+                    channel_name="barcode-bot",
+                    route_mode=bnl01_bot.ROUTE_MODE_NORMAL_CHAT,
+                    observed_at=(
+                        base + timedelta(seconds=index * 10)
+                    ).isoformat(),
+                )
+                observed = moments.observe_ledger_entry(
+                    conn,
+                    write.entry_id,
+                )
+                moment_id = observed.moment_id or moment_id
+            finalized = moments.finalize_moment(conn, moment_id)
+            self.assertIn(
+                finalized.outcome,
+                {"inserted", "deduplicated"},
+            )
+            gist = conn.execute(
+                """
+                SELECT contribution_gist
+                FROM memory_moment_contributions
+                WHERE moment_id=? AND participant_key=?
+                """,
+                (moment_id, subject_key_for_user(42)),
+            ).fetchone()
+            conn.commit()
+        self.assertIsNotNone(gist)
+        return moment_id, gist[0]
 
     def latest_persisted_diagnostics(self):
         with sqlite3.connect(bnl01_bot.DB_FILE) as conn:
@@ -325,6 +410,144 @@ class MemoryGovernanceCanaryIntegrationTests(unittest.TestCase):
         )
         self.assertFalse(persisted["global_live_enabled"])
         self.assertEqual(persisted["response_mode"], "governed")
+
+    def test_production_shaped_route_markers_reclassify_and_moment_gist_serves(self):
+        self.enable_canary()
+        for index in range(3):
+            self.insert_ledger(
+                f"restricted compatibility row {index}",
+                entry_id=f"restricted-{index}",
+                predicate="conversation",
+                source_policy="sealed_test",
+            )
+        moment_id, gist = self.insert_public_question_moment()
+        current_user_gist = gist.replace("The participant ", "You ", 1)
+        legacy = (
+            "Archive recall:\n"
+            "- raw wording that must not become governed output"
+        )
+        with sqlite3.connect(bnl01_bot.DB_FILE) as conn:
+            self.assertEqual(
+                moments.select_public_participant_moment_gists(
+                    conn,
+                    guild_id=1,
+                    participant_key=subject_key_for_user(43),
+                    topic_text="what do you remember about me?",
+                    broad_recall=True,
+                    allowed_channel_policies=(
+                        "public_home",
+                        "public_context",
+                    ),
+                ),
+                (),
+            )
+            self.assertEqual(
+                moments.select_public_participant_moment_gists(
+                    conn,
+                    guild_id=1,
+                    participant_key=subject_key_for_user(42),
+                    topic_text=(
+                        "quote exactly what I said in that dispute"
+                    ),
+                    broad_recall=True,
+                    allowed_channel_policies=(
+                        "public_home",
+                        "public_context",
+                    ),
+                ),
+                (),
+            )
+
+        response = self.govern(legacy)
+
+        self.assertIn("Here is what I can safely recall:", response)
+        self.assertIn(current_user_gist, response)
+        self.assertNotIn(gist, response)
+        self.assertIn("dreaming", response)
+        self.assertNotIn("raw wording", response)
+        diagnostics = bnl01_bot.memory_governance_canary_last_diagnostics(
+            42,
+            1,
+        )
+        self.assertEqual(diagnostics["response_mode"], "governed")
+        self.assertEqual(diagnostics["selected_count"], 1)
+        self.assertTrue(diagnostics["rendered"])
+        self.assertEqual(diagnostics["processing_error_count"], 0)
+        self.assertEqual(diagnostics["invalid_invariant_count"], 0)
+        self.assertEqual(diagnostics["raw_invalid_invariant_count"], 3)
+        self.assertEqual(diagnostics["reclassified_invariant_count"], 3)
+        persisted = self.latest_persisted_diagnostics()
+        self.assertEqual(
+            persisted["effective_invalid_invariant_count"],
+            0,
+        )
+        self.assertEqual(persisted["reclassified_invariant_count"], 3)
+        self.assertEqual(
+            persisted["selected_by_source"],
+            {"moment_gist": 1},
+        )
+
+        with sqlite3.connect(bnl01_bot.DB_FILE) as conn:
+            source_id = conn.execute(
+                """
+                SELECT ledger_entry_id
+                FROM memory_moment_contribution_sources
+                WHERE moment_id=? AND participant_key=?
+                ORDER BY ledger_entry_id
+                LIMIT 1
+                """,
+                (moment_id, subject_key_for_user(42)),
+            ).fetchone()[0]
+            conn.execute(
+                """
+                UPDATE memory_ledger_entries
+                SET visibility='private', public_usable=0
+                WHERE entry_id=?
+                """,
+                (source_id,),
+            )
+            conn.commit()
+
+        invalidated = self.govern(legacy)
+        self.assertEqual(
+            invalidated,
+            "I do not have eligible durable memories available for this recall.",
+        )
+        self.assertNotIn("dreaming", invalidated)
+        self.assertNotIn("raw wording", invalidated)
+
+    def test_unmatched_route_invariant_still_falls_back_fail_closed(self):
+        self.enable_canary()
+        unsafe = GovernanceResult(
+            rendered_context="must not render",
+            selected=(),
+            exclusions=(),
+            diagnostics=GovernanceDiagnostics(
+                invalid_invariants=[
+                    "invalid_route_channel_policy_selected"
+                ]
+            ),
+        )
+        legacy = "byte-exact legacy"
+
+        with mock.patch(
+            "bnl01_bot.build_governed_context",
+            return_value=unsafe,
+        ):
+            response = self.govern(legacy)
+
+        self.assertEqual(response, legacy)
+        diagnostics = bnl01_bot.memory_governance_canary_last_diagnostics(
+            42,
+            1,
+        )
+        self.assertEqual(
+            diagnostics["response_mode"],
+            "legacy_unsafe_fallback",
+        )
+        self.assertEqual(diagnostics["invalid_invariant_count"], 1)
+        self.assertEqual(diagnostics["raw_invalid_invariant_count"], 1)
+        self.assertEqual(diagnostics["reclassified_invariant_count"], 0)
 
     def test_correction_visibility_forget_and_delete_remain_fail_closed(self):
         self.enable_canary()

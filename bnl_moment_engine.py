@@ -139,6 +139,17 @@ class MomentObservationResult:
 
 
 @dataclass(frozen=True)
+class PublicParticipantMomentGist:
+    moment_id: str
+    contribution_gist: str
+    frame_type: str
+    last_activity_at: str
+    salience: float
+    visibility: str
+    canonical_ledger_entry_id: str
+
+
+@dataclass(frozen=True)
 class EpisodeObservationResult:
     outcome: str = "skipped"
     reason_code: str = "not_attempted"
@@ -4787,6 +4798,154 @@ def _contribution_is_renderable(
         participant_key,
     )
     return gist, label
+
+
+def select_public_participant_moment_gists(
+    conn: sqlite3.Connection,
+    *,
+    guild_id: int,
+    participant_key: str,
+    topic_text: str = "",
+    broad_recall: bool = False,
+    token_budget: int = 160,
+    freshness_days: int = 3650,
+    allowed_channel_policies: tuple[str, ...] = (),
+    max_results: int = 4,
+) -> tuple[PublicParticipantMomentGist, ...]:
+    """Return source-revalidated participant gists for governed recall.
+
+    This is intentionally narrower than general Moment rendering: it accepts
+    only a typed Discord participant, public conversational policies, finalized
+    public-safe Moments, and the participant-specific contribution projection.
+    Exact-quote and third-party attribution requests remain owned by their
+    separate live-source paths.
+    """
+    ensure_moment_schema(conn)
+    if not re.fullmatch(r"discord_user:[1-9]\d*", participant_key or ""):
+        return ()
+    attribution = _parse_attribution_request(topic_text)
+    if attribution.exact_authority_requested or attribution.requested:
+        return ()
+    policies = tuple(
+        sorted(
+            {
+                _canon(policy)
+                for policy in (allowed_channel_policies or ())
+                if _canon(policy) in PUBLIC_CROSS_CHANNEL_POLICIES
+            }
+        )
+    )
+    if not policies:
+        return ()
+    relevance_text = _recall_topic_focus(topic_text)
+    family = _topic_family(relevance_text, "conversation")
+    signature = _topic_signature(relevance_text, "conversation")
+    if not broad_recall and not signature:
+        return ()
+    cutoff = (
+        datetime.now(timezone.utc) - timedelta(days=max(1, freshness_days))
+    ).isoformat()
+    placeholders = ",".join("?" for _ in policies)
+    rows = conn.execute(
+        f"""
+        SELECT moment_id,summary,topic_family,topic_signature,visibility,
+               last_activity_at,salience,channel_id,channel_policy,route_mode,
+               canonical_ledger_entry_id
+        FROM memory_moment_windows
+        WHERE guild_id=? AND channel_policy IN ({placeholders})
+          AND route_mode IN (
+              'normal_chat','direct_payload','direct_payload_task'
+          )
+          AND lifecycle_status='finalized' AND public_usable=1
+          AND last_activity_at>=?
+        ORDER BY salience DESC,last_activity_at DESC,moment_id
+        LIMIT 100
+        """,
+        (int(guild_id or 0), *policies, cutoff),
+    ).fetchall()
+    selected: list[PublicParticipantMomentGist] = []
+    seen_gists: set[str] = set()
+    used_words = 0
+    for row in rows:
+        moment_id = str(row[0] or "")
+        visibility = str(row[4] or "unknown")
+        window_signature = _load_sig(str(row[3] or "[]"))
+        if visibility not in {"public", "public_safe"}:
+            continue
+        if not broad_recall and (
+            not _coherent(
+                family,
+                signature,
+                str(row[2] or ""),
+                window_signature,
+            )
+            or not _contribution_topic_coherent(
+                signature,
+                window_signature,
+            )
+        ):
+            continue
+        if not _human_participant_present(
+            conn,
+            moment_id,
+            participant_key,
+        ):
+            continue
+        if not _moment_is_renderable(
+            conn,
+            moment_id=moment_id,
+            summary=str(row[1] or ""),
+            guild_id=int(guild_id or 0),
+            channel_id=int(row[7] or 0),
+            channel_policy=str(row[8] or ""),
+            route_mode=str(row[9] or "unknown"),
+            visibility=visibility,
+            canonical_ledger_entry_id=str(row[10] or ""),
+        ):
+            continue
+        gist, _label = _contribution_is_renderable(
+            conn,
+            moment_id=moment_id,
+            participant_key=participant_key,
+            guild_id=int(guild_id or 0),
+            channel_id=int(row[7] or 0),
+            channel_policy=str(row[8] or ""),
+            route_mode=str(row[9] or "unknown"),
+            visibility=visibility,
+        )
+        normalized_gist = re.sub(r"\s+", " ", gist).strip()
+        if not normalized_gist or normalized_gist.lower() in seen_gists:
+            continue
+        gist_words = normalized_gist.split()
+        if (
+            used_words + len(gist_words) > max(1, int(token_budget or 0))
+            or len(selected) >= max(1, int(max_results or 0))
+        ):
+            continue
+        contribution = conn.execute(
+            """
+            SELECT frame_type
+            FROM memory_moment_contributions
+            WHERE moment_id=? AND participant_key=?
+            """,
+            (moment_id, participant_key),
+        ).fetchone()
+        selected.append(
+            PublicParticipantMomentGist(
+                moment_id=moment_id,
+                contribution_gist=normalized_gist,
+                frame_type=str(contribution[0] or "") if contribution else "",
+                last_activity_at=str(row[5] or ""),
+                salience=float(row[6] or 0),
+                visibility=visibility,
+                canonical_ledger_entry_id=str(row[10] or ""),
+            )
+        )
+        seen_gists.add(normalized_gist.lower())
+        used_words += len(gist_words)
+        if len(selected) >= max(1, int(max_results or 0)):
+            break
+    return tuple(selected)
 
 
 def render_shadow_moment_context(
