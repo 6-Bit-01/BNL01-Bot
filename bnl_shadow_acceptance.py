@@ -524,8 +524,20 @@ def _empty_unified_assessment_report() -> Dict[str, Any]:
         "response_alignment_counts": {},
         "thread_focus_mode_counts": {},
         "payload_grounding_status_counts": {},
+        "objective_kind_counts": {},
+        "expected_answer_shape_counts": {},
+        "response_coherence_status_counts": {},
+        "coherence_reason_code_counts": {},
         "payload_grounding_applicable_runs": 0,
         "payload_grounding_failure_runs": 0,
+        "response_coherence_failure_runs": 0,
+        "response_coherence_review_runs": 0,
+        "conclusion_contradiction_runs": 0,
+        "ambiguity_without_clarification_runs": 0,
+        "contribution_total": 0,
+        "criterion_total": 0,
+        "option_total": 0,
+        "ambiguity_reason_total": 0,
         "prompt_overincluded_runs": 0,
         "prompt_underincluded_runs": 0,
         "prompt_different_runs": 0,
@@ -804,6 +816,16 @@ def build_v2_shadow_acceptance_snapshot(
         unified_assessment_blockers.append(
             "payload_grounding_failure_runs"
         )
+    if int(
+        unified_assessment.get(
+            "response_coherence_failure_runs",
+            0,
+        )
+        or 0
+    ):
+        unified_assessment_blockers.append(
+            "response_coherence_failure_runs"
+        )
     if unified_assessment.get("reportError"):
         unified_assessment_blockers.append(
             "report_error:%s" % unified_assessment["reportError"]
@@ -852,6 +874,10 @@ def build_v2_shadow_acceptance_snapshot(
         warnings.append("unified_assessment_prompt_comparison_review")
     if int(unified_assessment.get("visible_control_marker_runs", 0) or 0):
         warnings.append("unified_assessment_visible_control_marker_review")
+    if int(
+        unified_assessment.get("response_coherence_review_runs", 0) or 0
+    ):
+        warnings.append("unified_assessment_response_coherence_review")
 
     stage_statuses = [stage["status"] for stage in stages.values()]
     unified_assessment_ready = bool(
@@ -1080,6 +1106,53 @@ def render_v2_shadow_acceptance_lines(snapshot: Mapping[str, Any]) -> List[str]:
                 "last",
                 "none",
             ),
+        ),
+        "- unified_assessment_semantics: objectives=`%s` answer_shapes=`%s` coherence=`%s` reasons=`%s` failures=`%s` reviews=`%s` contradictions=`%s` ambiguity_without_clarification=`%s` contributions=`%s` criteria=`%s` options=`%s` ambiguity_reasons=`%s`" % (
+            json.dumps(
+                unified_assessment.get("objective_kind_counts", {}),
+                sort_keys=True,
+            ),
+            json.dumps(
+                unified_assessment.get(
+                    "expected_answer_shape_counts",
+                    {},
+                ),
+                sort_keys=True,
+            ),
+            json.dumps(
+                unified_assessment.get(
+                    "response_coherence_status_counts",
+                    {},
+                ),
+                sort_keys=True,
+            ),
+            json.dumps(
+                unified_assessment.get(
+                    "coherence_reason_code_counts",
+                    {},
+                ),
+                sort_keys=True,
+            ),
+            unified_assessment.get(
+                "response_coherence_failure_runs",
+                0,
+            ),
+            unified_assessment.get(
+                "response_coherence_review_runs",
+                0,
+            ),
+            unified_assessment.get(
+                "conclusion_contradiction_runs",
+                0,
+            ),
+            unified_assessment.get(
+                "ambiguity_without_clarification_runs",
+                0,
+            ),
+            unified_assessment.get("contribution_total", 0),
+            unified_assessment.get("criterion_total", 0),
+            unified_assessment.get("option_total", 0),
+            unified_assessment.get("ambiguity_reason_total", 0),
         ),
         "- blockers: `%s`" % (", ".join(blockers) if blockers else "none"),
         "- warnings: `%s`" % (", ".join(warnings) if warnings else "none"),

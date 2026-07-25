@@ -280,6 +280,62 @@ class UnifiedResponseAssessmentBotPathTests(unittest.TestCase):
                 self.assertNotIn("response_text", schema)
                 self.assertNotIn("speaker_labels", schema)
 
+    def test_conversation_basis_carries_typed_human_contributions(self):
+        selected_rows = (
+            {
+                "id": 10,
+                "role": "user",
+                "content": (
+                    "The hidden room should sound like a place, "
+                    "not a character."
+                ),
+                "user_id": 202,
+                "user_name": "Miss Bit",
+            },
+            {
+                "id": 11,
+                "role": "model",
+                "content": "Prior BNL reply.",
+                "user_id": 0,
+                "user_name": "BNL-01",
+            },
+        )
+        with mock.patch.object(
+            bnl01_bot,
+            "conversation_context_v2_enabled",
+            return_value=True,
+        ):
+            with mock.patch.object(
+                bnl01_bot,
+                "get_conversation_context_v2_rows",
+                return_value=list(selected_rows),
+            ):
+                with mock.patch.object(
+                    bnl01_bot,
+                    "_conversation_prompt_source_rows",
+                    return_value=list(selected_rows),
+                ):
+                    basis = (
+                        bnl01_bot.build_conversation_prompt_source_basis(
+                            "Conversation continuity:\nselected",
+                            guild_id=1,
+                            current_user_id=101,
+                            channel_id=303,
+                            channel_name="bnl-testing",
+                            channel_policy="sealed_test",
+                        )
+                    )
+
+        self.assertIsNotNone(basis)
+        self.assertEqual(len(basis.evidence_items), 1)
+        item = basis.evidence_items[0]
+        self.assertEqual(item.source_id, 10)
+        self.assertEqual(item.speaker_user_id, 202)
+        self.assertEqual(item.speaker_label, "Miss Bit")
+        self.assertIn("criterion", item.semantic_roles)
+        self.assertEqual(item.criterion_positive_terms, ("place",))
+        self.assertEqual(item.criterion_negative_terms, ("character",))
+
     def test_bot_adapter_distinguishes_current_fragments_from_prior_choice(self):
         basis = bnl01_bot.ConversationPromptSourceBasis(
             expected_digest="digest",
@@ -300,6 +356,35 @@ class UnifiedResponseAssessmentBotPathTests(unittest.TestCase):
             source_row_ids=(1, 2, 3, 4),
             participant_user_ids=(101, 102),
             speaker_labels=("Jon", "Miss Bit"),
+            evidence_items=(
+                bnl01_bot.build_conversation_evidence_item(
+                    text="Pick Ghost Signal or Neon Static.",
+                    source_id=1,
+                    speaker_user_id=101,
+                    speaker_label="Jon",
+                ),
+                bnl01_bot.build_conversation_evidence_item(
+                    text="“Dead Channel” sounds abandoned.",
+                    source_id=3,
+                    speaker_user_id=101,
+                    speaker_label="Jon",
+                ),
+                bnl01_bot.build_conversation_evidence_item(
+                    text=(
+                        "The hidden test zone should sound abandoned, "
+                        "not active."
+                    ),
+                    source_id=4,
+                    speaker_user_id=102,
+                    speaker_label="Miss Bit",
+                ),
+                bnl01_bot.build_conversation_evidence_item(
+                    text="“Open Circuit” sounds active.",
+                    source_id=5,
+                    speaker_user_id=101,
+                    speaker_label="Jon",
+                ),
+            ),
         )
         with mock.patch.object(
             bnl01_bot,
@@ -335,6 +420,15 @@ class UnifiedResponseAssessmentBotPathTests(unittest.TestCase):
         )
         self.assertEqual(assessment.thread_focus_mode, "new_thread")
         self.assertEqual(assessment.comparison_status, "match")
+        self.assertEqual(assessment.objective_kind, "compare_options")
+        self.assertEqual(
+            assessment.attributed_criteria[0].speaker_user_id,
+            102,
+        )
+        self.assertEqual(
+            assessment.expected_answer_shape,
+            "choice_then_reason",
+        )
 
 
 class CurrentPayloadGroundingGuardTests(unittest.IsolatedAsyncioTestCase):

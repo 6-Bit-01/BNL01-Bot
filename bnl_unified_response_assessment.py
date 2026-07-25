@@ -22,7 +22,7 @@ from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
 from bnl_conversation_context_v2 import assess_payload_grounding
 
 
-ASSESSMENT_VERSION = "unified_response_assessment_v2"
+ASSESSMENT_VERSION = "unified_response_assessment_v3"
 SHADOW_ENV = "BNL_UNIFIED_RESPONSE_ASSESSMENT_SHADOW_ENABLED"
 TABLE_NAME = "unified_response_assessment_shadow_runs"
 
@@ -81,6 +81,154 @@ _VISIBLE_CONTROL_MARKER_RE = re.compile(
     r"|<\s*(?:pause|wait|typing|thinking)(?:\s+[^>\n]{0,40})?\s*>"
     r")\s*"
 )
+_SEMANTIC_WORD_RE = re.compile(r"[a-z0-9][a-z0-9'’-]*", re.I)
+_OBJECTIVE_RE = re.compile(
+    r"\?|"
+    r"\b(?:choose|pick|select|compare|decide|explain|tell|show|give|help|"
+    r"recap|summari[sz]e|continue|resume|combine|fix|build|make|write|"
+    r"what|which|why|how|where|when|who)\b",
+    re.I,
+)
+_CHOICE_OBJECTIVE_RE = re.compile(
+    r"\b(?:choose|pick|select|compare|decide\s+between|which)\b"
+    r"|\b(?:better|best|fits?|works?|prefer)\b",
+    re.I,
+)
+_CRITERION_RE = re.compile(
+    r"\b(?:should|must|needs?\s+to|has\s+to|have\s+to|required?|"
+    r"requirement|criterion|criteria|constraint|make\s+sure|keep\s+it|"
+    r"only\s+if|better\s+if)\b",
+    re.I,
+)
+_CRITERION_REFERENCE_RE = re.compile(
+    r"\b(?:that|the|this|those|these)\s+"
+    r"(?:requirement|criterion|criteria|constraint|rule)\b",
+    re.I,
+)
+_MODAL_QUESTION_RE = re.compile(
+    r"^\s*(?:what|how|where|when|who)\b.{0,40}\bshould\b"
+    r"|^\s*should\s+(?:i|we|you|they)\b",
+    re.I,
+)
+_NEGATIVE_CRITERION_RE = re.compile(
+    r"\b(?:not|without|avoid|never|rather\s+than|instead\s+of)\b",
+    re.I,
+)
+_DECISION_RE = re.compile(
+    r"\b(?:we\s+(?:decided|agreed|settled)|"
+    r"(?:let'?s|we(?:'ll|\s+will))\s+(?:use|pick|choose|go\s+with)|"
+    r"(?:final|decision|settled)\s*(?:is|on)?|"
+    r"i\s+(?:choose|pick|prefer|favor)|go\s+with)\b",
+    re.I,
+)
+_CORRECTION_RE = re.compile(
+    r"\b(?:actually|correction|correcting|i\s+meant|instead|"
+    r"not\s+that|that'?s\s+wrong|that\s+is\s+wrong)\b",
+    re.I,
+)
+_OPEN_LOOP_RE = re.compile(
+    r"\?|"
+    r"\b(?:still\s+need|need\s+to\s+decide|not\s+settled|unresolved|"
+    r"open\s+question|what\s+next|which\s+one)\b",
+    re.I,
+)
+_UNRESOLVED_REFERENT_RE = re.compile(
+    r"\b(?:that|this|it|those|these|they|them|there|the\s+former|"
+    r"the\s+latter|the\s+first|the\s+second)\b",
+    re.I,
+)
+_QUOTED_OPTION_RE = re.compile(r"[\"“](?P<value>[^\"”\n]{1,80})[\"”]")
+_BETWEEN_OPTION_RE = re.compile(
+    r"\bbetween\s+"
+    r"(?P<first>[A-Za-z0-9][A-Za-z0-9'’\-]*(?:\s+[A-Za-z0-9][A-Za-z0-9'’\-]*){0,4})"
+    r"\s+and\s+"
+    r"(?P<second>[A-Za-z0-9][A-Za-z0-9'’\-]*(?:\s+[A-Za-z0-9][A-Za-z0-9'’\-]*){0,4})",
+    re.I,
+)
+_OR_OPTION_RE = re.compile(
+    r"(?P<first>[A-Z][A-Za-z0-9'’\-]*(?:\s+[A-Z][A-Za-z0-9'’\-]*){0,4})"
+    r"\s+(?:or|versus|vs\.?)\s+"
+    r"(?P<second>[A-Z][A-Za-z0-9'’\-]*(?:\s+[A-Z][A-Za-z0-9'’\-]*){0,4})"
+)
+_LEADING_OPTION_RE = re.compile(
+    r"^\s*[\"“]?(?P<value>[A-Z][A-Za-z0-9'’\-]*"
+    r"(?:\s+[A-Z][A-Za-z0-9'’\-]*){0,4})[\"”]?"
+    r"\s+(?:sounds?|feels?|seems?|reads?|is|works?|fits?)\b"
+)
+_RESPONSE_QUESTION_RE = re.compile(r"\?")
+_RESPONSE_CLARIFICATION_RE = re.compile(
+    r"\b(?:do\s+you\s+mean|which\s+(?:requirement|criterion|one)|"
+    r"can\s+you\s+clarify|what\s+does\s+that\s+refer\s+to|"
+    r"are\s+you\s+asking)\b",
+    re.I,
+)
+_SEMANTIC_STOPWORDS = frozenset(
+    {
+        "a",
+        "an",
+        "and",
+        "as",
+        "be",
+        "better",
+        "best",
+        "by",
+        "criterion",
+        "criteria",
+        "constraint",
+        "do",
+        "does",
+        "feel",
+        "feels",
+        "fit",
+        "fits",
+        "for",
+        "from",
+        "has",
+        "have",
+        "it",
+        "is",
+        "keep",
+        "like",
+        "make",
+        "more",
+        "must",
+        "need",
+        "needs",
+        "of",
+        "or",
+        "require",
+        "required",
+        "requirement",
+        "read",
+        "reads",
+        "rule",
+        "should",
+        "seem",
+        "seems",
+        "sound",
+        "sounds",
+        "than",
+        "that",
+        "the",
+        "this",
+        "to",
+        "which",
+        "why",
+        "with",
+    }
+)
+_TERM_FAMILIES = {
+    "place": frozenset(
+        {"place", "location", "room", "site", "setting", "space", "zone"}
+    ),
+    "person": frozenset(
+        {"person", "character", "human", "someone", "individual", "name"}
+    ),
+    "short": frozenset({"short", "brief", "concise", "compact"}),
+    "clear": frozenset({"clear", "plain", "direct", "understandable"}),
+    "funny": frozenset({"funny", "joke", "joking", "playful", "humorous"}),
+    "serious": frozenset({"serious", "formal", "professional", "solemn"}),
+}
 
 
 def _flag(value: Any) -> bool:
@@ -91,6 +239,168 @@ def _flag(value: Any) -> bool:
         "on",
         "enabled",
     }
+
+
+def _semantic_normalize(value: Any) -> str:
+    return " ".join(_SEMANTIC_WORD_RE.findall(str(value or "").lower()))
+
+
+def _semantic_terms(value: Any) -> Tuple[str, ...]:
+    return tuple(
+        dict.fromkeys(
+            term
+            for term in _SEMANTIC_WORD_RE.findall(str(value or "").lower())
+            if len(term) > 1 and term not in _SEMANTIC_STOPWORDS
+        )
+    )
+
+
+def _normalized_option(value: Any) -> str:
+    cleaned = _semantic_normalize(value).strip()
+    return cleaned[:120]
+
+
+def _extract_option_anchors(value: Any) -> Tuple[str, ...]:
+    raw = str(value or "")
+    options = []
+    for match in _QUOTED_OPTION_RE.finditer(raw):
+        options.append(match.group("value"))
+    for pattern in (_BETWEEN_OPTION_RE, _OR_OPTION_RE):
+        for match in pattern.finditer(raw):
+            options.extend((match.group("first"), match.group("second")))
+    leading = _LEADING_OPTION_RE.search(raw)
+    if leading:
+        options.append(leading.group("value"))
+    return tuple(
+        dict.fromkeys(
+            option
+            for option in (_normalized_option(item) for item in options)
+            if option
+        )
+    )[:8]
+
+
+def _criterion_terms(value: Any) -> Tuple[Tuple[str, ...], Tuple[str, ...]]:
+    text = str(value or "")
+    if "?" in text and _MODAL_QUESTION_RE.search(text):
+        return (), ()
+    reference_spans = tuple(
+        match.span() for match in _CRITERION_REFERENCE_RE.finditer(text)
+    )
+    marker = next(
+        (
+            candidate
+            for candidate in _CRITERION_RE.finditer(text)
+            if not any(
+                start <= candidate.start() < end
+                for start, end in reference_spans
+            )
+        ),
+        None,
+    )
+    if not marker:
+        return (), ()
+    clause = text[marker.end() :]
+    if not clause.strip():
+        clause = text
+    split = _NEGATIVE_CRITERION_RE.split(clause, maxsplit=1)
+    positive = _semantic_terms(split[0])
+    negative = _semantic_terms(split[1]) if len(split) > 1 else ()
+    return positive[:8], negative[:8]
+
+
+@dataclass(frozen=True)
+class ConversationEvidenceItem:
+    """Ephemeral, attributed meaning supplied by an existing evidence owner."""
+
+    source_id: int
+    speaker_user_id: int
+    speaker_label: str
+    text: str
+    current_turn: bool
+    semantic_roles: Tuple[str, ...]
+    option_anchors: Tuple[str, ...]
+    criterion_positive_terms: Tuple[str, ...]
+    criterion_negative_terms: Tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class AttributedCriterion:
+    source_id: int
+    speaker_user_id: int
+    speaker_label: str
+    text: str
+    positive_terms: Tuple[str, ...]
+    negative_terms: Tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class OptionReferent:
+    option_key: str
+    source_id: int
+    speaker_user_id: int
+    speaker_label: str
+    relation: str
+
+
+@dataclass(frozen=True)
+class ResponseCoherenceAssessment:
+    """Content-free judgment produced after generation for shadow comparison."""
+
+    status: str
+    objective_status: str
+    criterion_status: str
+    attribution_status: str
+    conclusion_status: str
+    clarification_status: str
+    reason_codes: Tuple[str, ...]
+    criterion_coverage_count: int
+    speaker_attribution_coverage_count: int
+
+
+def build_conversation_evidence_item(
+    *,
+    text: str,
+    source_id: int = 0,
+    speaker_user_id: int = 0,
+    speaker_label: str = "",
+    current_turn: bool = False,
+) -> ConversationEvidenceItem:
+    """Classify one already-selected human contribution without persisting it."""
+
+    value = str(text or "").strip()
+    positive_terms, negative_terms = _criterion_terms(value)
+    roles = []
+    if current_turn:
+        roles.append("current_turn")
+    if _OBJECTIVE_RE.search(value):
+        roles.append("objective")
+    if positive_terms or negative_terms:
+        roles.append("criterion")
+    elif _CRITERION_REFERENCE_RE.search(value):
+        roles.append("criterion_reference")
+    if _DECISION_RE.search(value):
+        roles.append("decision")
+    if _CORRECTION_RE.search(value):
+        roles.append("correction")
+    if _OPEN_LOOP_RE.search(value):
+        roles.append("open_loop")
+    options = _extract_option_anchors(value)
+    if options:
+        roles.append("option")
+    if not roles:
+        roles.append("contribution")
+    return ConversationEvidenceItem(
+        source_id=max(0, int(source_id or 0)),
+        speaker_user_id=max(0, int(speaker_user_id or 0)),
+        speaker_label=str(speaker_label or "").strip()[:72],
+        text=value,
+        current_turn=bool(current_turn),
+        semantic_roles=_unique_strings(roles),
+        option_anchors=options,
+        criterion_positive_terms=positive_terms,
+        criterion_negative_terms=negative_terms,
+    )
 
 
 def shadow_configuration(
@@ -203,11 +513,19 @@ def _response_act(
     exact_quote_requested: bool,
     route_mode: str,
     show_state_present: bool,
+    objective_kind: str = "unspecified",
+    ambiguity_reasons: Sequence[str] = (),
 ) -> str:
+    if ambiguity_reasons:
+        return "ask_clarifying_question"
     if immediate_recap:
         return "recap_current_exchange"
     if exact_quote_requested:
         return "verify_exact_wording"
+    if objective_kind == "compare_options":
+        return "evaluate_current_options"
+    if objective_kind == "confirm_decision":
+        return "confirm_current_decision"
     if continuity_required:
         return "continue_active_thread"
     if route_mode == "direct_payload_task":
@@ -215,6 +533,176 @@ def _response_act(
     if show_state_present or route_mode == "show_status":
         return "answer_show_status"
     return "answer_current_turn"
+
+
+def _current_objective(value: str) -> str:
+    text = re.sub(r"\s+", " ", str(value or "")).strip()
+    if not text:
+        return ""
+    segments = tuple(
+        segment.strip()
+        for segment in re.split(r"(?<=[?.!])\s+", text)
+        if segment.strip()
+    )
+    for segment in reversed(segments):
+        if _OBJECTIVE_RE.search(segment):
+            return segment[:600]
+    return text[:600]
+
+
+def _objective_kind(
+    *,
+    objective: str,
+    current_options: Sequence[str],
+    immediate_recap: bool,
+    exact_quote_requested: bool,
+    evidence_items: Sequence[ConversationEvidenceItem],
+) -> str:
+    if immediate_recap:
+        return "recap"
+    if exact_quote_requested:
+        return "exact_quote"
+    if len(tuple(current_options or ())) >= 2 and _CHOICE_OBJECTIVE_RE.search(
+        objective or ""
+    ):
+        return "compare_options"
+    if any(
+        "decision" in item.semantic_roles and item.current_turn
+        for item in evidence_items or ()
+    ):
+        return "confirm_decision"
+    if objective:
+        return "answer_question" if "?" in objective else "complete_request"
+    return "unspecified"
+
+
+def _criterion_items(
+    evidence_items: Sequence[ConversationEvidenceItem],
+) -> Tuple[AttributedCriterion, ...]:
+    result = []
+    for item in evidence_items or ():
+        if not (
+            item.criterion_positive_terms or item.criterion_negative_terms
+        ):
+            continue
+        result.append(
+            AttributedCriterion(
+                source_id=item.source_id,
+                speaker_user_id=item.speaker_user_id,
+                speaker_label=item.speaker_label,
+                text=item.text,
+                positive_terms=item.criterion_positive_terms,
+                negative_terms=item.criterion_negative_terms,
+            )
+        )
+    return tuple(result)
+
+
+def _option_referents(
+    current_options: Sequence[str],
+    evidence_items: Sequence[ConversationEvidenceItem],
+) -> Tuple[OptionReferent, ...]:
+    result = []
+    items = tuple(evidence_items or ())
+    for option in _unique_strings(current_options)[:8]:
+        normalized = _normalized_option(option)
+        candidates = []
+        for item in items:
+            item_text = " %s " % _semantic_normalize(item.text)
+            explicit = normalized in item.option_anchors
+            mentioned = bool(
+                normalized and " %s " % normalized in item_text
+            )
+            if not (explicit or mentioned):
+                continue
+            candidates.append(
+                (
+                    1 if item.current_turn else 0,
+                    0 if explicit else 1,
+                    item,
+                )
+            )
+        if candidates:
+            _current_rank, _mention_rank, chosen = sorted(
+                candidates,
+                key=lambda candidate: (
+                    candidate[0],
+                    candidate[1],
+                    candidate[2].source_id,
+                ),
+            )[0]
+            relation = (
+                "introduced"
+                if not chosen.current_turn
+                else "current_request"
+            )
+            result.append(
+                OptionReferent(
+                    option_key=normalized,
+                    source_id=chosen.source_id,
+                    speaker_user_id=chosen.speaker_user_id,
+                    speaker_label=chosen.speaker_label,
+                    relation=relation,
+                )
+            )
+        else:
+            result.append(
+                OptionReferent(
+                    option_key=normalized,
+                    source_id=0,
+                    speaker_user_id=0,
+                    speaker_label="",
+                    relation="unresolved_origin",
+                )
+            )
+    return tuple(result)
+
+
+def _ambiguity_reasons(
+    *,
+    objective: str,
+    objective_kind: str,
+    criteria: Sequence[AttributedCriterion],
+    current_options: Sequence[str],
+    thread_focus_mode: str,
+) -> Tuple[str, ...]:
+    reasons = []
+    if thread_focus_mode in {
+        "resume_requested_unresolved",
+        "combine_requested_unresolved",
+    }:
+        reasons.append("requested_thread_unavailable")
+    if _CRITERION_REFERENCE_RE.search(objective or "") and not criteria:
+        reasons.append("criterion_referent_unresolved")
+    if objective_kind == "compare_options" and len(current_options) < 2:
+        reasons.append("comparison_options_incomplete")
+    if (
+        _UNRESOLVED_REFERENT_RE.search(objective or "")
+        and not criteria
+        and not current_options
+    ):
+        reasons.append("current_referent_unresolved")
+    return _unique_strings(reasons)
+
+
+def _expected_answer_shape(
+    *,
+    response_act: str,
+    objective_kind: str,
+) -> str:
+    if response_act == "ask_clarifying_question":
+        return "one_clarifying_question"
+    if response_act == "recap_current_exchange":
+        return "speaker_attributed_recap"
+    if response_act == "verify_exact_wording":
+        return "verified_quote_or_labeled_gist"
+    if objective_kind == "compare_options":
+        return "choice_then_reason"
+    if response_act == "confirm_current_decision":
+        return "decision_then_next_step"
+    if response_act == "continue_active_thread":
+        return "direct_continuation"
+    return "direct_answer_then_support"
 
 
 @dataclass(frozen=True)
@@ -255,6 +743,17 @@ class UnifiedResponseAssessment:
     current_payload_anchors: Tuple[str, ...]
     prior_thread_anchors: Tuple[str, ...]
     thread_focus_mode: str
+    current_objective: str
+    objective_kind: str
+    conversation_evidence_items: Tuple[ConversationEvidenceItem, ...]
+    current_options: Tuple[str, ...]
+    option_referents: Tuple[OptionReferent, ...]
+    attributed_criteria: Tuple[AttributedCriterion, ...]
+    decision_source_ids: Tuple[int, ...]
+    correction_source_ids: Tuple[int, ...]
+    open_loop_source_ids: Tuple[int, ...]
+    ambiguity_reasons: Tuple[str, ...]
+    expected_answer_shape: str
 
 
 def build_unified_response_assessment(
@@ -295,6 +794,10 @@ def build_unified_response_assessment(
     current_payload_anchors: Sequence[str] = (),
     prior_thread_anchors: Sequence[str] = (),
     thread_focus_mode: str = "unclassified",
+    current_text: str = "",
+    conversation_evidence_items: Sequence[
+        ConversationEvidenceItem
+    ] = (),
 ) -> UnifiedResponseAssessment:
     """Assemble one deterministic assessment without rendering it live."""
 
@@ -310,12 +813,69 @@ def build_unified_response_assessment(
     relationship_keys = _unique_strings(relationship_candidate_keys)
     canonical_refs = _unique_strings(canon_refs)
     actual_prompt_lanes = _known_lanes(prompt_lanes)
+    evidence_items = tuple(
+        item
+        for item in (conversation_evidence_items or ())
+        if isinstance(item, ConversationEvidenceItem)
+        and str(item.text or "").strip()
+    )
+    objective = _current_objective(current_text)
+    current_options = _unique_strings(current_payload_anchors)[:8]
+    resolved_thread_focus = _thread_focus_mode(thread_focus_mode)
+    criteria = _criterion_items(evidence_items)
+    objective_kind = _objective_kind(
+        objective=objective,
+        current_options=current_options,
+        immediate_recap=bool(immediate_recap),
+        exact_quote_requested=bool(exact_quote_requested),
+        evidence_items=evidence_items,
+    )
+    ambiguity_reasons = _ambiguity_reasons(
+        objective=objective,
+        objective_kind=objective_kind,
+        criteria=criteria,
+        current_options=current_options,
+        thread_focus_mode=resolved_thread_focus,
+    )
+    option_referents = _option_referents(
+        current_options,
+        evidence_items,
+    )
+    decision_source_ids = _unique_positive_ints(
+        tuple(
+            item.source_id
+            for item in evidence_items
+            if "decision" in item.semantic_roles
+        )
+    )
+    correction_source_ids = _unique_positive_ints(
+        tuple(
+            item.source_id
+            for item in evidence_items
+            if "correction" in item.semantic_roles
+        )
+    )
+    open_loop_source_ids = _unique_positive_ints(
+        tuple(
+            item.source_id
+            for item in evidence_items
+            if "open_loop" in item.semantic_roles
+        )
+    )
 
     selected = ["current_exchange"]
     excluded = []
     conflicts = []
     inferences = []
     diagnostics = []
+    if objective:
+        inferences.append("current_objective_resolved")
+    if current_options:
+        inferences.append("current_options_resolved")
+    if criteria:
+        inferences.append("attributed_criteria_resolved")
+    if ambiguity_reasons:
+        diagnostics.append("genuine_ambiguity_detected")
 
     if immediate_recap:
         if "conversation_context" in actual_prompt_lanes or exchange_ids:
@@ -418,8 +978,23 @@ def build_unified_response_assessment(
         exact_quote_requested=bool(exact_quote_requested),
         route_mode=str(route_mode or "unknown"),
         show_state_present=bool(show_state_present),
+        objective_kind=objective_kind,
+        ambiguity_reasons=ambiguity_reasons,
+    )
+    expected_answer_shape = _expected_answer_shape(
+        response_act=act,
+        objective_kind=objective_kind,
     )
     diagnostics.append("response_act:%s" % act)
+    diagnostics.append("objective_kind:%s" % objective_kind)
+    diagnostics.append(
+        "expected_answer_shape:%s" % expected_answer_shape
+    )
+    diagnostics.append(
+        "contribution_count:%s" % len(evidence_items)
+    )
+    diagnostics.append("criterion_count:%s" % len(criteria))
+    diagnostics.append("option_count:%s" % len(current_options))
     diagnostics.append("prompt_comparison:%s" % comparison)
 
     return UnifiedResponseAssessment(
@@ -459,7 +1034,367 @@ def build_unified_response_assessment(
         ),
         current_payload_anchors=_unique_strings(current_payload_anchors)[:8],
         prior_thread_anchors=_unique_strings(prior_thread_anchors)[:16],
-        thread_focus_mode=_thread_focus_mode(thread_focus_mode),
+        thread_focus_mode=resolved_thread_focus,
+        current_objective=objective,
+        objective_kind=objective_kind,
+        conversation_evidence_items=evidence_items,
+        current_options=current_options,
+        option_referents=option_referents,
+        attributed_criteria=criteria,
+        decision_source_ids=decision_source_ids,
+        correction_source_ids=correction_source_ids,
+        open_loop_source_ids=open_loop_source_ids,
+        ambiguity_reasons=ambiguity_reasons,
+        expected_answer_shape=expected_answer_shape,
+    )
+
+
+def _expanded_terms(values: Sequence[str]) -> frozenset[str]:
+    expanded = set()
+    for value in values or ():
+        term = _semantic_normalize(value)
+        if not term:
+            continue
+        matched_family = False
+        for family, members in _TERM_FAMILIES.items():
+            if term == family or term in members:
+                expanded.update(members)
+                expanded.add(family)
+                matched_family = True
+        if not matched_family:
+            expanded.add(term)
+    return frozenset(expanded)
+
+
+def _anchor_present(normalized_text: str, anchor: str) -> bool:
+    value = _semantic_normalize(anchor)
+    return bool(
+        value and " %s " % value in " %s " % normalized_text
+    )
+
+
+def _selected_option_index(
+    response: str,
+    options: Sequence[str],
+) -> Optional[int]:
+    normalized = _semantic_normalize(response)
+    option_values = tuple(_semantic_normalize(option) for option in options)
+    explicit_matches = []
+    for index, option in enumerate(option_values):
+        if not option:
+            continue
+        escaped = re.escape(option)
+        patterns = (
+            r"\b(?:choose|pick|select|favor|prefer|recommend)\s+"
+            r"(?:the\s+)?%s\b" % escaped,
+            r"\b(?:go|went|going)\s+with\s+(?:the\s+)?%s\b" % escaped,
+            r"\b%s\b.{0,50}\b(?:is|seems|sounds|reads|feels)\b"
+            r".{0,35}\b(?:better|best|fits?|works?)\b" % escaped,
+            r"\b%s\b.{0,35}\b(?:better|best)\s+"
+            r"(?:choice|option|fit|answer)\b" % escaped,
+        )
+        for pattern in patterns:
+            for match in re.finditer(pattern, normalized):
+                explicit_matches.append((match.start(), index))
+    if explicit_matches:
+        return sorted(explicit_matches)[-1][1]
+
+    reference_matches = []
+    reference_patterns = (
+        (0, r"\b(?:the\s+)?(?:first|former)\b"),
+        (1, r"\b(?:the\s+)?(?:second|latter)\b"),
+        (2, r"\b(?:the\s+)?third\b"),
+    )
+    for index, pattern in reference_patterns:
+        if index >= len(option_values):
+            continue
+        for match in re.finditer(pattern, normalized):
+            reference_matches.append((match.start(), index))
+    if reference_matches:
+        return sorted(reference_matches)[-1][1]
+
+    hits = tuple(
+        index
+        for index, option in enumerate(option_values)
+        if _anchor_present(normalized, option)
+    )
+    return hits[0] if len(hits) == 1 else None
+
+
+def _option_descriptor_terms(
+    response: str,
+    options: Sequence[str],
+) -> Tuple[frozenset[str], ...]:
+    result = [set() for _ in options]
+    segments = tuple(
+        segment.strip()
+        for segment in re.split(
+            r"(?:[.!?;\n]+|\bwhile\b|\bwhereas\b|\bbut\b)",
+            str(response or ""),
+            flags=re.I,
+        )
+        if segment.strip()
+    )
+    for segment in segments:
+        normalized = _semantic_normalize(segment)
+        expanded = _expanded_terms(_semantic_terms(segment))
+        for index, option in enumerate(options):
+            if _anchor_present(normalized, option):
+                result[index].update(expanded)
+        if re.search(r"\b(?:the\s+)?(?:first|former)\b", normalized):
+            if result:
+                result[0].update(expanded)
+        if re.search(r"\b(?:the\s+)?(?:second|latter)\b", normalized):
+            if len(result) > 1:
+                result[1].update(expanded)
+        if re.search(r"\b(?:the\s+)?third\b", normalized):
+            if len(result) > 2:
+                result[2].update(expanded)
+    return tuple(frozenset(values) for values in result)
+
+
+def assess_response_coherence(
+    assessment: UnifiedResponseAssessment,
+    response: str,
+) -> ResponseCoherenceAssessment:
+    """Compare one generated response with the ephemeral semantic frame."""
+
+    response_text = str(response or "").strip()
+    response_terms = _expanded_terms(_semantic_terms(response_text))
+    reasons = []
+
+    grounding = assess_payload_grounding(
+        response_text,
+        current_payload_anchors=assessment.current_payload_anchors,
+        prior_thread_anchors=assessment.prior_thread_anchors,
+        combine_requested=assessment.thread_focus_mode == "combine_threads",
+    )
+
+    selected_option = _selected_option_index(
+        response_text,
+        assessment.current_options,
+    )
+    if not response_text:
+        objective_status = "missing"
+    elif assessment.response_act == "ask_clarifying_question":
+        objective_status = (
+            "clarification_requested"
+            if _RESPONSE_QUESTION_RE.search(response_text)
+            else "missing"
+        )
+    elif assessment.objective_kind == "compare_options":
+        objective_status = (
+            "addressed" if selected_option is not None else "missing"
+        )
+    elif assessment.response_act == "recap_current_exchange":
+        objective_status = "addressed"
+    elif assessment.current_objective:
+        objective_terms = _expanded_terms(
+            _semantic_terms(assessment.current_objective)
+        )
+        objective_status = (
+            "addressed"
+            if objective_terms & response_terms
+            else "uncertain"
+        )
+    else:
+        objective_status = "not_evaluated"
+
+    covered_criteria = 0
+    for criterion in assessment.attributed_criteria:
+        criterion_terms = _expanded_terms(
+            (
+                *criterion.positive_terms,
+                *criterion.negative_terms,
+            )
+        )
+        if criterion_terms & response_terms:
+            covered_criteria += 1
+    if not assessment.attributed_criteria:
+        criterion_status = "not_applicable"
+    elif covered_criteria == len(assessment.attributed_criteria):
+        criterion_status = "covered"
+    elif covered_criteria:
+        criterion_status = "partial"
+    else:
+        criterion_status = "missing"
+
+    current_speakers = set(assessment.current_speaker_user_ids)
+    criterion_speakers = {
+        criterion.speaker_user_id
+        for criterion in assessment.attributed_criteria
+        if criterion.speaker_user_id > 0
+    }
+    labels_to_cover = tuple(
+        label
+        for label in assessment.speaker_labels
+        if len(label.strip()) >= 2
+    )
+    speaker_coverage = sum(
+        1
+        for label in labels_to_cover
+        if label.lower() in response_text.lower()
+    )
+    criterion_labels_to_cover = tuple(
+        dict.fromkeys(
+            criterion.speaker_label
+            for criterion in assessment.attributed_criteria
+            if criterion.speaker_user_id not in current_speakers
+            and len(criterion.speaker_label.strip()) >= 2
+        )
+    )
+    criterion_label_coverage = sum(
+        1
+        for label in criterion_labels_to_cover
+        if label.lower() in response_text.lower()
+    )
+    if assessment.response_act == "recap_current_exchange" and labels_to_cover:
+        attribution_status = (
+            "full"
+            if speaker_coverage == len(labels_to_cover)
+            else "partial"
+            if speaker_coverage
+            else "missing"
+        )
+    elif criterion_speakers - current_speakers:
+        attribution_status = (
+            "explicit"
+            if criterion_label_coverage
+            else "implicit_preserved"
+            if criterion_status in {"covered", "partial"}
+            else "missing"
+        )
+    else:
+        attribution_status = "not_applicable"
+
+    if assessment.response_act == "ask_clarifying_question":
+        conclusion_status = "deferred_for_clarification"
+    elif assessment.objective_kind != "compare_options":
+        conclusion_status = "not_applicable"
+    elif selected_option is None:
+        conclusion_status = "missing"
+    elif not assessment.attributed_criteria:
+        conclusion_status = "not_evaluable"
+    else:
+        descriptors = _option_descriptor_terms(
+            response_text,
+            assessment.current_options,
+        )
+        positive_terms = _expanded_terms(
+            tuple(
+                term
+                for criterion in assessment.attributed_criteria
+                for term in criterion.positive_terms
+            )
+        )
+        negative_terms = _expanded_terms(
+            tuple(
+                term
+                for criterion in assessment.attributed_criteria
+                for term in criterion.negative_terms
+            )
+        )
+        selected_descriptors = descriptors[selected_option]
+        alternative_descriptors = frozenset(
+            term
+            for index, values in enumerate(descriptors)
+            if index != selected_option
+            for term in values
+        )
+        selected_positive = bool(selected_descriptors & positive_terms)
+        selected_negative = bool(selected_descriptors & negative_terms)
+        alternative_positive = bool(
+            alternative_descriptors & positive_terms
+        )
+        if selected_negative and (
+            alternative_positive or not selected_positive
+        ):
+            conclusion_status = "contradictory"
+        elif selected_positive and not selected_negative:
+            conclusion_status = "consistent"
+        else:
+            conclusion_status = "not_evaluable"
+
+    has_clarification = bool(
+        _RESPONSE_CLARIFICATION_RE.search(response_text)
+        or (
+            assessment.ambiguity_reasons
+            and _RESPONSE_QUESTION_RE.search(response_text)
+        )
+    )
+    if assessment.ambiguity_reasons:
+        clarification_status = (
+            "appropriate"
+            if has_clarification
+            else "unjustified_answer"
+        )
+    else:
+        clarification_status = (
+            "unnecessary_clarification"
+            if _RESPONSE_CLARIFICATION_RE.search(response_text)
+            else "not_needed"
+        )
+
+    if (
+        grounding.failed
+        and assessment.response_act != "ask_clarifying_question"
+    ):
+        reasons.append("payload_grounding_failure")
+    if objective_status == "missing":
+        reasons.append("objective_unanswered")
+    elif objective_status == "uncertain":
+        reasons.append("objective_alignment_uncertain")
+    if criterion_status == "missing":
+        reasons.append("attributed_criterion_unaddressed")
+    elif criterion_status == "partial":
+        reasons.append("attributed_criterion_partial")
+    if attribution_status == "missing":
+        reasons.append("participant_attribution_missing")
+    if conclusion_status == "missing":
+        reasons.append("choice_conclusion_missing")
+    elif conclusion_status == "contradictory":
+        reasons.append("conclusion_reason_contradiction")
+    if clarification_status == "unjustified_answer":
+        reasons.append("ambiguity_answered_without_clarification")
+    elif clarification_status == "unnecessary_clarification":
+        reasons.append("clarification_without_ambiguity")
+
+    hard_failures = {
+        "payload_grounding_failure",
+        "objective_unanswered",
+        "conclusion_reason_contradiction",
+        "ambiguity_answered_without_clarification",
+    }
+    review_reasons = {
+        "objective_alignment_uncertain",
+        "attributed_criterion_unaddressed",
+        "attributed_criterion_partial",
+        "participant_attribution_missing",
+        "choice_conclusion_missing",
+        "clarification_without_ambiguity",
+    }
+    reason_codes = _unique_strings(reasons)
+    if hard_failures & set(reason_codes):
+        status = "failed"
+    elif review_reasons & set(reason_codes):
+        status = "review"
+    else:
+        status = "passed"
+
+    return ResponseCoherenceAssessment(
+        status=status,
+        objective_status=objective_status,
+        criterion_status=criterion_status,
+        attribution_status=attribution_status,
+        conclusion_status=conclusion_status,
+        clarification_status=clarification_status,
+        reason_codes=reason_codes,
+        criterion_coverage_count=covered_criteria,
+        speaker_attribution_coverage_count=(
+            speaker_coverage
+            if assessment.response_act == "recap_current_exchange"
+            else criterion_label_coverage
+        ),
     )
 
 
@@ -513,6 +1448,27 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
             prior_thread_anchor_count INTEGER NOT NULL DEFAULT 0,
             prior_thread_anchor_hit_count INTEGER NOT NULL DEFAULT 0,
             payload_grounding_status TEXT NOT NULL DEFAULT 'not_evaluated_legacy',
+            objective_kind TEXT NOT NULL DEFAULT 'unspecified',
+            expected_answer_shape TEXT NOT NULL DEFAULT 'direct_answer_then_support',
+            contribution_count INTEGER NOT NULL DEFAULT 0,
+            contribution_speaker_count INTEGER NOT NULL DEFAULT 0,
+            criterion_count INTEGER NOT NULL DEFAULT 0,
+            criterion_speaker_count INTEGER NOT NULL DEFAULT 0,
+            option_count INTEGER NOT NULL DEFAULT 0,
+            unresolved_option_origin_count INTEGER NOT NULL DEFAULT 0,
+            decision_count INTEGER NOT NULL DEFAULT 0,
+            correction_count INTEGER NOT NULL DEFAULT 0,
+            open_loop_count INTEGER NOT NULL DEFAULT 0,
+            ambiguity_reason_count INTEGER NOT NULL DEFAULT 0,
+            response_coherence_status TEXT NOT NULL DEFAULT 'not_evaluated_legacy',
+            coherence_objective_status TEXT NOT NULL DEFAULT 'not_evaluated_legacy',
+            coherence_criterion_status TEXT NOT NULL DEFAULT 'not_evaluated_legacy',
+            coherence_attribution_status TEXT NOT NULL DEFAULT 'not_evaluated_legacy',
+            coherence_conclusion_status TEXT NOT NULL DEFAULT 'not_evaluated_legacy',
+            coherence_clarification_status TEXT NOT NULL DEFAULT 'not_evaluated_legacy',
+            coherence_reason_codes_json TEXT NOT NULL DEFAULT '[]',
+            criterion_coverage_count INTEGER NOT NULL DEFAULT 0,
+            semantic_speaker_coverage_count INTEGER NOT NULL DEFAULT 0,
             response_alignment TEXT NOT NULL,
             processing_errors_json TEXT NOT NULL DEFAULT '[]',
             behavior_changed INTEGER NOT NULL DEFAULT 0,
@@ -545,6 +1501,57 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
         (
             "payload_grounding_status",
             "TEXT NOT NULL DEFAULT 'not_evaluated_legacy'",
+        ),
+        ("objective_kind", "TEXT NOT NULL DEFAULT 'unspecified'"),
+        (
+            "expected_answer_shape",
+            "TEXT NOT NULL DEFAULT 'direct_answer_then_support'",
+        ),
+        ("contribution_count", "INTEGER NOT NULL DEFAULT 0"),
+        ("contribution_speaker_count", "INTEGER NOT NULL DEFAULT 0"),
+        ("criterion_count", "INTEGER NOT NULL DEFAULT 0"),
+        ("criterion_speaker_count", "INTEGER NOT NULL DEFAULT 0"),
+        ("option_count", "INTEGER NOT NULL DEFAULT 0"),
+        (
+            "unresolved_option_origin_count",
+            "INTEGER NOT NULL DEFAULT 0",
+        ),
+        ("decision_count", "INTEGER NOT NULL DEFAULT 0"),
+        ("correction_count", "INTEGER NOT NULL DEFAULT 0"),
+        ("open_loop_count", "INTEGER NOT NULL DEFAULT 0"),
+        ("ambiguity_reason_count", "INTEGER NOT NULL DEFAULT 0"),
+        (
+            "response_coherence_status",
+            "TEXT NOT NULL DEFAULT 'not_evaluated_legacy'",
+        ),
+        (
+            "coherence_objective_status",
+            "TEXT NOT NULL DEFAULT 'not_evaluated_legacy'",
+        ),
+        (
+            "coherence_criterion_status",
+            "TEXT NOT NULL DEFAULT 'not_evaluated_legacy'",
+        ),
+        (
+            "coherence_attribution_status",
+            "TEXT NOT NULL DEFAULT 'not_evaluated_legacy'",
+        ),
+        (
+            "coherence_conclusion_status",
+            "TEXT NOT NULL DEFAULT 'not_evaluated_legacy'",
+        ),
+        (
+            "coherence_clarification_status",
+            "TEXT NOT NULL DEFAULT 'not_evaluated_legacy'",
+        ),
+        (
+            "coherence_reason_codes_json",
+            "TEXT NOT NULL DEFAULT '[]'",
+        ),
+        ("criterion_coverage_count", "INTEGER NOT NULL DEFAULT 0"),
+        (
+            "semantic_speaker_coverage_count",
+            "INTEGER NOT NULL DEFAULT 0",
         ),
     )
     for column_name, column_definition in additive_columns:
@@ -635,6 +1642,7 @@ def persist_shadow_run(
         prior_thread_anchors=assessment.prior_thread_anchors,
         combine_requested=assessment.thread_focus_mode == "combine_threads",
     )
+    coherence = assess_response_coherence(assessment, response_text)
     source_changed = bool(guard.get("prompt_source_basis_changed"))
     if not response_sent:
         alignment = "not_sent"
@@ -646,6 +1654,8 @@ def persist_shadow_run(
         alignment = "visible_control_marker"
     elif payload_grounding.failed:
         alignment = "payload_grounding_failure"
+    elif coherence.status == "failed":
+        alignment = "response_coherence_failure"
     elif assessment.response_act == "recap_current_exchange" and labels:
         alignment = (
             "recap_full_speaker_label_coverage"
@@ -654,94 +1664,192 @@ def persist_shadow_run(
         )
     elif guard_repaired:
         alignment = "guard_repaired"
+    elif coherence.status == "review":
+        alignment = "response_coherence_review"
     else:
         alignment = "guard_clear"
 
     run_id = "ura_" + uuid.uuid4().hex
     timestamp = created_at or datetime.now(timezone.utc).isoformat()
-    conn.execute(
-        """
-        INSERT INTO unified_response_assessment_shadow_runs (
-            run_id, schema_version, guild_id, route_mode, channel_policy,
-            conversation_surface, current_speaker_count, target_count,
-            participant_count, current_exchange_source_count,
-            active_episode_present, prior_moment_count, moment_candidate_count,
-            governed_entry_count, governed_candidate_count,
-            governance_exclusion_count, relationship_candidate_count,
-            canon_ref_count, response_act, selected_lanes_json,
-            excluded_lanes_json, conflict_reasons_json,
-            supported_inference_count, exact_quote_authority_present,
-            source_basis_kinds_json, source_basis_count, prompt_budget,
-            prompt_lanes_json, comparison_status, prompt_extra_lanes_json,
-            prompt_missing_lanes_json, source_basis_changed_before_send,
-            guard_triggered, guard_repaired, response_sent, response_length,
-            speaker_label_coverage_count, visible_control_marker,
-            thread_focus_mode, current_payload_anchor_count,
-            current_payload_anchor_hit_count, prior_thread_anchor_count,
-            prior_thread_anchor_hit_count, payload_grounding_status,
-            response_alignment, processing_errors_json, behavior_changed,
-            new_authority_applied, created_at
-        ) VALUES (
-            ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,
-            ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?
-        )
-        """,
-        (
-            run_id,
-            assessment.schema_version,
-            assessment.guild_id,
-            assessment.route_mode,
-            assessment.channel_policy,
-            assessment.conversation_surface,
-            len(assessment.current_speaker_user_ids),
-            len(assessment.target_user_ids),
-            len(assessment.participant_user_ids),
-            len(assessment.current_exchange_source_ids),
-            int(bool(assessment.active_episode_id)),
-            len(assessment.prior_moment_ids),
-            assessment.moment_candidate_count,
-            len(assessment.governed_entry_ids),
-            assessment.governed_candidate_count,
-            assessment.governance_exclusion_count,
-            len(assessment.relationship_candidate_keys),
-            len(assessment.canon_refs),
-            assessment.response_act,
-            json.dumps(assessment.selected_lanes),
-            json.dumps(_excluded_counts(assessment.excluded_lanes), sort_keys=True),
-            json.dumps(assessment.conflict_reasons),
-            len(assessment.supported_inferences),
-            int(assessment.exact_quote_authority_present),
-            json.dumps(assessment.source_basis_kinds),
-            len(assessment.source_basis_kinds),
-            assessment.prompt_budget,
-            json.dumps(assessment.prompt_lanes),
-            assessment.comparison_status,
-            json.dumps(assessment.prompt_extra_lanes),
-            json.dumps(assessment.prompt_missing_lanes),
-            int(source_changed),
-            int(guard_triggered),
-            int(guard_repaired),
-            int(bool(response_sent)),
-            len(response_text),
-            speaker_coverage,
-            int(visible_control_marker),
-            assessment.thread_focus_mode,
-            payload_grounding.current_anchor_count,
-            payload_grounding.current_anchor_hit_count,
-            payload_grounding.prior_anchor_count,
-            payload_grounding.prior_anchor_hit_count,
-            payload_grounding.status,
-            alignment,
-            json.dumps(
-                tuple(
-                    "processing_error"
-                    for _error in (processing_errors or ())
-                )
-            ),
-            0,
-            0,
-            timestamp,
+    semantic_speakers = {
+        (item.speaker_user_id, item.speaker_label.lower())
+        for item in assessment.conversation_evidence_items
+        if item.speaker_user_id > 0 or item.speaker_label
+    }
+    criterion_speakers = {
+        (criterion.speaker_user_id, criterion.speaker_label.lower())
+        for criterion in assessment.attributed_criteria
+        if criterion.speaker_user_id > 0 or criterion.speaker_label
+    }
+    semantic_role_counts = Counter(
+        role
+        for item in assessment.conversation_evidence_items
+        for role in item.semantic_roles
+    )
+    columns = (
+        "run_id",
+        "schema_version",
+        "guild_id",
+        "route_mode",
+        "channel_policy",
+        "conversation_surface",
+        "current_speaker_count",
+        "target_count",
+        "participant_count",
+        "current_exchange_source_count",
+        "active_episode_present",
+        "prior_moment_count",
+        "moment_candidate_count",
+        "governed_entry_count",
+        "governed_candidate_count",
+        "governance_exclusion_count",
+        "relationship_candidate_count",
+        "canon_ref_count",
+        "response_act",
+        "selected_lanes_json",
+        "excluded_lanes_json",
+        "conflict_reasons_json",
+        "supported_inference_count",
+        "exact_quote_authority_present",
+        "source_basis_kinds_json",
+        "source_basis_count",
+        "prompt_budget",
+        "prompt_lanes_json",
+        "comparison_status",
+        "prompt_extra_lanes_json",
+        "prompt_missing_lanes_json",
+        "source_basis_changed_before_send",
+        "guard_triggered",
+        "guard_repaired",
+        "response_sent",
+        "response_length",
+        "speaker_label_coverage_count",
+        "visible_control_marker",
+        "thread_focus_mode",
+        "current_payload_anchor_count",
+        "current_payload_anchor_hit_count",
+        "prior_thread_anchor_count",
+        "prior_thread_anchor_hit_count",
+        "payload_grounding_status",
+        "objective_kind",
+        "expected_answer_shape",
+        "contribution_count",
+        "contribution_speaker_count",
+        "criterion_count",
+        "criterion_speaker_count",
+        "option_count",
+        "unresolved_option_origin_count",
+        "decision_count",
+        "correction_count",
+        "open_loop_count",
+        "ambiguity_reason_count",
+        "response_coherence_status",
+        "coherence_objective_status",
+        "coherence_criterion_status",
+        "coherence_attribution_status",
+        "coherence_conclusion_status",
+        "coherence_clarification_status",
+        "coherence_reason_codes_json",
+        "criterion_coverage_count",
+        "semantic_speaker_coverage_count",
+        "response_alignment",
+        "processing_errors_json",
+        "behavior_changed",
+        "new_authority_applied",
+        "created_at",
+    )
+    values = (
+        run_id,
+        assessment.schema_version,
+        assessment.guild_id,
+        assessment.route_mode,
+        assessment.channel_policy,
+        assessment.conversation_surface,
+        len(assessment.current_speaker_user_ids),
+        len(assessment.target_user_ids),
+        len(assessment.participant_user_ids),
+        len(assessment.current_exchange_source_ids),
+        int(bool(assessment.active_episode_id)),
+        len(assessment.prior_moment_ids),
+        assessment.moment_candidate_count,
+        len(assessment.governed_entry_ids),
+        assessment.governed_candidate_count,
+        assessment.governance_exclusion_count,
+        len(assessment.relationship_candidate_keys),
+        len(assessment.canon_refs),
+        assessment.response_act,
+        json.dumps(assessment.selected_lanes),
+        json.dumps(
+            _excluded_counts(assessment.excluded_lanes),
+            sort_keys=True,
         ),
+        json.dumps(assessment.conflict_reasons),
+        len(assessment.supported_inferences),
+        int(assessment.exact_quote_authority_present),
+        json.dumps(assessment.source_basis_kinds),
+        len(assessment.source_basis_kinds),
+        assessment.prompt_budget,
+        json.dumps(assessment.prompt_lanes),
+        assessment.comparison_status,
+        json.dumps(assessment.prompt_extra_lanes),
+        json.dumps(assessment.prompt_missing_lanes),
+        int(source_changed),
+        int(guard_triggered),
+        int(guard_repaired),
+        int(bool(response_sent)),
+        len(response_text),
+        speaker_coverage,
+        int(visible_control_marker),
+        assessment.thread_focus_mode,
+        payload_grounding.current_anchor_count,
+        payload_grounding.current_anchor_hit_count,
+        payload_grounding.prior_anchor_count,
+        payload_grounding.prior_anchor_hit_count,
+        payload_grounding.status,
+        assessment.objective_kind,
+        assessment.expected_answer_shape,
+        len(assessment.conversation_evidence_items),
+        len(semantic_speakers),
+        len(assessment.attributed_criteria),
+        len(criterion_speakers),
+        len(assessment.current_options),
+        sum(
+            1
+            for referent in assessment.option_referents
+            if referent.relation == "unresolved_origin"
+        ),
+        int(semantic_role_counts.get("decision", 0)),
+        int(semantic_role_counts.get("correction", 0)),
+        int(semantic_role_counts.get("open_loop", 0)),
+        len(assessment.ambiguity_reasons),
+        coherence.status,
+        coherence.objective_status,
+        coherence.criterion_status,
+        coherence.attribution_status,
+        coherence.conclusion_status,
+        coherence.clarification_status,
+        json.dumps(coherence.reason_codes),
+        coherence.criterion_coverage_count,
+        coherence.speaker_attribution_coverage_count,
+        alignment,
+        json.dumps(
+            tuple(
+                "processing_error"
+                for _error in (processing_errors or ())
+            )
+        ),
+        0,
+        0,
+        timestamp,
+    )
+    conn.execute(
+        "INSERT INTO unified_response_assessment_shadow_runs (%s) "
+        "VALUES (%s)"
+        % (
+            ",".join(columns),
+            ",".join("?" for _column in columns),
+        ),
+        values,
     )
     return run_id
 
@@ -775,8 +1883,25 @@ def _empty_evaluation_report() -> Dict[str, Any]:
         "response_alignment_counts": {},
         "thread_focus_mode_counts": {},
         "payload_grounding_status_counts": {},
+        "objective_kind_counts": {},
+        "expected_answer_shape_counts": {},
+        "response_coherence_status_counts": {},
+        "coherence_objective_status_counts": {},
+        "coherence_criterion_status_counts": {},
+        "coherence_attribution_status_counts": {},
+        "coherence_conclusion_status_counts": {},
+        "coherence_clarification_status_counts": {},
+        "coherence_reason_code_counts": {},
         "payload_grounding_applicable_runs": 0,
         "payload_grounding_failure_runs": 0,
+        "response_coherence_failure_runs": 0,
+        "response_coherence_review_runs": 0,
+        "conclusion_contradiction_runs": 0,
+        "ambiguity_without_clarification_runs": 0,
+        "contribution_total": 0,
+        "criterion_total": 0,
+        "option_total": 0,
+        "ambiguity_reason_total": 0,
         "current_payload_anchor_total": 0,
         "current_payload_anchor_hit_total": 0,
         "prompt_overincluded_runs": 0,
@@ -821,38 +1946,18 @@ def build_evaluation_report(
             "participant_ids",
             "source_ids",
             "source_text",
+            "current_objective",
+            "objective_text",
+            "criterion_text",
+            "option_text",
+            "contribution_text",
+            "ambiguity_text",
         }
     )
-    thread_focus_column = (
-        "thread_focus_mode"
-        if "thread_focus_mode" in columns
-        else "'unclassified'"
-    )
-    current_anchor_count_column = (
-        "current_payload_anchor_count"
-        if "current_payload_anchor_count" in columns
-        else "0"
-    )
-    current_anchor_hit_column = (
-        "current_payload_anchor_hit_count"
-        if "current_payload_anchor_hit_count" in columns
-        else "0"
-    )
-    prior_anchor_count_column = (
-        "prior_thread_anchor_count"
-        if "prior_thread_anchor_count" in columns
-        else "0"
-    )
-    prior_anchor_hit_column = (
-        "prior_thread_anchor_hit_count"
-        if "prior_thread_anchor_hit_count" in columns
-        else "0"
-    )
-    payload_status_column = (
-        "payload_grounding_status"
-        if "payload_grounding_status" in columns
-        else "'not_evaluated_legacy'"
-    )
+
+    def _column(name: str, fallback: str) -> str:
+        return name if name in columns else fallback
+
     rows = conn.execute(
         """
         SELECT response_sent, selected_lanes_json, excluded_lanes_json,
@@ -860,18 +1965,57 @@ def build_evaluation_report(
                source_basis_changed_before_send, guard_triggered,
                guard_repaired, visible_control_marker, response_alignment,
                processing_errors_json, behavior_changed,
-               new_authority_applied, %s, %s, %s, %s, %s, %s, created_at
+               new_authority_applied, %s, %s, %s, %s, %s, %s,
+               %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+               created_at
         FROM unified_response_assessment_shadow_runs
         WHERE guild_id=?
         ORDER BY created_at DESC, run_id DESC
         LIMIT ?
         """ % (
-            thread_focus_column,
-            current_anchor_count_column,
-            current_anchor_hit_column,
-            prior_anchor_count_column,
-            prior_anchor_hit_column,
-            payload_status_column,
+            _column("thread_focus_mode", "'unclassified'"),
+            _column("current_payload_anchor_count", "0"),
+            _column("current_payload_anchor_hit_count", "0"),
+            _column("prior_thread_anchor_count", "0"),
+            _column("prior_thread_anchor_hit_count", "0"),
+            _column(
+                "payload_grounding_status",
+                "'not_evaluated_legacy'",
+            ),
+            _column("objective_kind", "'unspecified'"),
+            _column(
+                "expected_answer_shape",
+                "'direct_answer_then_support'",
+            ),
+            _column(
+                "response_coherence_status",
+                "'not_evaluated_legacy'",
+            ),
+            _column(
+                "coherence_objective_status",
+                "'not_evaluated_legacy'",
+            ),
+            _column(
+                "coherence_criterion_status",
+                "'not_evaluated_legacy'",
+            ),
+            _column(
+                "coherence_attribution_status",
+                "'not_evaluated_legacy'",
+            ),
+            _column(
+                "coherence_conclusion_status",
+                "'not_evaluated_legacy'",
+            ),
+            _column(
+                "coherence_clarification_status",
+                "'not_evaluated_legacy'",
+            ),
+            _column("coherence_reason_codes_json", "'[]'"),
+            _column("contribution_count", "0"),
+            _column("criterion_count", "0"),
+            _column("option_count", "0"),
+            _column("ambiguity_reason_count", "0"),
         ),
         (int(guild_id or 0), max(1, min(int(limit or 500), 5000))),
     ).fetchall()
@@ -883,10 +2027,23 @@ def build_evaluation_report(
     alignment_counts = Counter()
     focus_counts = Counter()
     payload_status_counts = Counter()
+    objective_kind_counts = Counter()
+    answer_shape_counts = Counter()
+    coherence_status_counts = Counter()
+    coherence_objective_counts = Counter()
+    coherence_criterion_counts = Counter()
+    coherence_attribution_counts = Counter()
+    coherence_conclusion_counts = Counter()
+    coherence_clarification_counts = Counter()
+    coherence_reason_counts = Counter()
     response_sent_runs = current_primary = source_changed = 0
     guard_triggered_runs = guard_repaired_runs = marker_runs = 0
     processing_errors = behavior_changed = new_authority = 0
     payload_applicable = payload_failures = 0
+    coherence_failures = coherence_reviews = 0
+    conclusion_contradictions = ambiguity_without_clarification = 0
+    contribution_total = criterion_total = option_total = 0
+    ambiguity_reason_total = 0
     current_anchor_total = current_anchor_hit_total = 0
     for row in rows:
         (
@@ -909,6 +2066,19 @@ def build_evaluation_report(
             _prior_anchor_count,
             _prior_anchor_hit_count,
             payload_grounding_status,
+            objective_kind,
+            expected_answer_shape,
+            coherence_status,
+            coherence_objective_status,
+            coherence_criterion_status,
+            coherence_attribution_status,
+            coherence_conclusion_status,
+            coherence_clarification_status,
+            coherence_reason_codes_json,
+            contribution_count,
+            criterion_count,
+            option_count,
+            ambiguity_reason_count,
             _created_at,
         ) = row
         selected = _safe_json(selected_json, [])
@@ -922,6 +2092,15 @@ def build_evaluation_report(
         errors = _safe_json(errors_json, ["invalid_json"])
         if not isinstance(errors, (list, tuple, dict)):
             errors = ["invalid_shape"] if errors else []
+        coherence_reasons = _safe_json(
+            coherence_reason_codes_json,
+            ["invalid_json"],
+        )
+        if not isinstance(coherence_reasons, (list, tuple)):
+            coherence_reasons = (
+                ["invalid_shape"] if coherence_reasons else []
+            )
+            processing_errors += 1
         selected_counts.update(str(item) for item in selected)
         excluded_counts.update(
             {
@@ -937,6 +2116,34 @@ def build_evaluation_report(
             payload_grounding_status or "not_evaluated_legacy"
         )
         payload_status_counts[payload_status] += 1
+        objective_kind_counts[str(objective_kind or "unspecified")] += 1
+        answer_shape_counts[
+            str(expected_answer_shape or "unknown")
+        ] += 1
+        coherence_status_value = str(
+            coherence_status or "not_evaluated_legacy"
+        )
+        coherence_status_counts[coherence_status_value] += 1
+        coherence_objective_counts[
+            str(coherence_objective_status or "not_evaluated_legacy")
+        ] += 1
+        coherence_criterion_counts[
+            str(coherence_criterion_status or "not_evaluated_legacy")
+        ] += 1
+        coherence_attribution_counts[
+            str(coherence_attribution_status or "not_evaluated_legacy")
+        ] += 1
+        conclusion_value = str(
+            coherence_conclusion_status or "not_evaluated_legacy"
+        )
+        coherence_conclusion_counts[conclusion_value] += 1
+        clarification_value = str(
+            coherence_clarification_status or "not_evaluated_legacy"
+        )
+        coherence_clarification_counts[clarification_value] += 1
+        coherence_reason_counts.update(
+            str(reason) for reason in coherence_reasons
+        )
         normalized_current_anchor_count = max(
             0,
             int(current_anchor_count or 0),
@@ -955,6 +2162,21 @@ def build_evaluation_report(
                 "stale_thread_substitution",
                 "mixed_thread_contamination",
             }
+        )
+        coherence_failures += int(coherence_status_value == "failed")
+        coherence_reviews += int(coherence_status_value == "review")
+        conclusion_contradictions += int(
+            conclusion_value == "contradictory"
+        )
+        ambiguity_without_clarification += int(
+            clarification_value == "unjustified_answer"
+        )
+        contribution_total += max(0, int(contribution_count or 0))
+        criterion_total += max(0, int(criterion_count or 0))
+        option_total += max(0, int(option_count or 0))
+        ambiguity_reason_total += max(
+            0,
+            int(ambiguity_reason_count or 0),
         )
         response_sent_runs += int(bool(response_sent))
         current_primary += int(bool(selected and selected[0] == "current_exchange"))
@@ -980,8 +2202,45 @@ def build_evaluation_report(
         "payload_grounding_status_counts": dict(
             sorted(payload_status_counts.items())
         ),
+        "objective_kind_counts": dict(
+            sorted(objective_kind_counts.items())
+        ),
+        "expected_answer_shape_counts": dict(
+            sorted(answer_shape_counts.items())
+        ),
+        "response_coherence_status_counts": dict(
+            sorted(coherence_status_counts.items())
+        ),
+        "coherence_objective_status_counts": dict(
+            sorted(coherence_objective_counts.items())
+        ),
+        "coherence_criterion_status_counts": dict(
+            sorted(coherence_criterion_counts.items())
+        ),
+        "coherence_attribution_status_counts": dict(
+            sorted(coherence_attribution_counts.items())
+        ),
+        "coherence_conclusion_status_counts": dict(
+            sorted(coherence_conclusion_counts.items())
+        ),
+        "coherence_clarification_status_counts": dict(
+            sorted(coherence_clarification_counts.items())
+        ),
+        "coherence_reason_code_counts": dict(
+            sorted(coherence_reason_counts.items())
+        ),
         "payload_grounding_applicable_runs": payload_applicable,
         "payload_grounding_failure_runs": payload_failures,
+        "response_coherence_failure_runs": coherence_failures,
+        "response_coherence_review_runs": coherence_reviews,
+        "conclusion_contradiction_runs": conclusion_contradictions,
+        "ambiguity_without_clarification_runs": (
+            ambiguity_without_clarification
+        ),
+        "contribution_total": contribution_total,
+        "criterion_total": criterion_total,
+        "option_total": option_total,
+        "ambiguity_reason_total": ambiguity_reason_total,
         "current_payload_anchor_total": current_anchor_total,
         "current_payload_anchor_hit_total": current_anchor_hit_total,
         "prompt_overincluded_runs": comparison_counts.get(

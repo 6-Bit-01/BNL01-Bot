@@ -106,7 +106,9 @@ from bnl_shadow_acceptance import (
     render_v2_shadow_acceptance_lines,
 )
 from bnl_unified_response_assessment import (
+    ConversationEvidenceItem,
     UnifiedResponseAssessment,
+    build_conversation_evidence_item,
     build_unified_response_assessment,
     ensure_schema as ensure_unified_response_assessment_schema,
     persist_shadow_run as persist_unified_response_assessment_shadow_run,
@@ -17829,6 +17831,7 @@ class ConversationPromptSourceBasis:
     source_row_ids: tuple[int, ...] = ()
     participant_user_ids: tuple[int, ...] = ()
     speaker_labels: tuple[str, ...] = ()
+    evidence_items: tuple[ConversationEvidenceItem, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -17871,6 +17874,9 @@ def build_unified_response_assessment_shadow(
     current_text: str,
     current_speaker_user_ids: tuple[int, ...],
     current_speaker_labels: tuple[str, ...],
+    current_contribution_items: tuple[
+        ConversationEvidenceItem, ...
+    ] = (),
     target_user_ids: tuple[int, ...] = (),
     prompt_source_bases: tuple[PromptSourceBasis, ...] = (),
     memory_source_metadata: dict | None = None,
@@ -17945,6 +17951,38 @@ def build_unified_response_assessment_shadow(
         for basis in conversation_bases
         if basis.rendered_context
     )
+    historical_evidence_items = tuple(
+        item
+        for basis in conversation_bases
+        for item in basis.evidence_items
+    )
+    current_evidence_items = tuple(
+        item
+        for item in current_contribution_items
+        if isinstance(item, ConversationEvidenceItem)
+    )
+    if not current_evidence_items and str(current_text or "").strip():
+        current_evidence_items = (
+            build_conversation_evidence_item(
+                text=current_text,
+                source_id=0,
+                speaker_user_id=(
+                    int(current_speaker_user_ids[0])
+                    if current_speaker_user_ids
+                    else 0
+                ),
+                speaker_label=(
+                    str(current_speaker_labels[0])
+                    if current_speaker_labels
+                    else ""
+                ),
+                current_turn=True,
+            ),
+        )
+    semantic_evidence_items = (
+        *historical_evidence_items,
+        *current_evidence_items,
+    )
     current_payload_anchors = extract_current_payload_anchors(
         current_text,
         conversation_contexts,
@@ -18018,6 +18056,8 @@ def build_unified_response_assessment_shadow(
         current_payload_anchors=current_payload_anchors,
         prior_thread_anchors=prior_thread_anchors,
         thread_focus_mode=thread_focus_mode,
+        current_text=current_text,
+        conversation_evidence_items=semantic_evidence_items,
     )
 
 
@@ -18044,12 +18084,19 @@ def record_unified_response_assessment_shadow(
         logging.info(
             "unified_response_assessment_shadow_recorded "
             "route_mode=%s response_act=%s comparison=%s "
-            "thread_focus=%s payload_anchor_count=%s",
+            "thread_focus=%s payload_anchor_count=%s objective_kind=%s "
+            "contribution_count=%s criterion_count=%s option_count=%s "
+            "ambiguity_count=%s",
             assessment.route_mode,
             assessment.response_act,
             assessment.comparison_status,
             assessment.thread_focus_mode,
             len(assessment.current_payload_anchors),
+            assessment.objective_kind,
+            len(assessment.conversation_evidence_items),
+            len(assessment.attributed_criteria),
+            len(assessment.current_options),
+            len(assessment.ambiguity_reasons),
         )
         return run_id
     except Exception as exc:
@@ -18339,6 +18386,21 @@ def build_conversation_prompt_source_basis(
                 )
             )
         )
+        evidence_items = tuple(
+            build_conversation_evidence_item(
+                text=str(row.get("content") or ""),
+                source_id=int(row.get("id") or 0),
+                speaker_user_id=int(row.get("user_id") or 0),
+                speaker_label=_safe_prompt_display_label(
+                    str(row.get("user_name") or ""),
+                    "",
+                ),
+                current_turn=False,
+            )
+            for row in selected_rows
+            if str(row.get("role") or "").strip().lower() == "user"
+            and str(row.get("content") or "").strip()
+        )
         # Hand-built/test continuity blocks can lack resolvable rows. Preserve
         # the older conservative candidate digest for that compatibility path;
         # production-rendered v2 blocks carry exact source ids.
@@ -18375,6 +18437,7 @@ def build_conversation_prompt_source_basis(
         source_row_ids=source_row_ids,
         participant_user_ids=participant_user_ids,
         speaker_labels=speaker_labels,
+        evidence_items=evidence_items,
     )
 
 
@@ -23848,6 +23911,20 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                             for name, _content, _uid in collapsed_items
                             if _safe_prompt_display_label(name)
                         )
+                    ),
+                    current_contribution_items=tuple(
+                        build_conversation_evidence_item(
+                            text=content,
+                            source_id=0,
+                            speaker_user_id=int(user_id or 0),
+                            speaker_label=_safe_prompt_display_label(
+                                name,
+                                "",
+                            ),
+                            current_turn=True,
+                        )
+                        for name, content, user_id in collapsed_items
+                        if str(content or "").strip()
                     ),
                     target_user_ids=(
                         (batch_attribution_contract.target_user_id,)
