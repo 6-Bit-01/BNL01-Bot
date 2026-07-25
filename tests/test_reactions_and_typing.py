@@ -38,6 +38,14 @@ class FakeReactionMessage:
 
 
 class ContextualReactionTests(unittest.IsolatedAsyncioTestCase):
+    ORIGINAL_REACTIONS = {
+        "👁️", "📡", "⚙️", "🧠", "🛰️", "🔍", "💾", "📊", "🖥️", "📼", "🧬", "📶",
+        "📻", "🎚️", "🎛️", "🔊", "🎤",
+        "🧿", "🫨", "⚠️", "❓", "🌀", "☢️", "📛",
+        "💻", "🗜️", "📈", "🔧",
+        "🫡", "👀", "🔥", "💯", "😵‍💫", "🧪", "🕶️",
+    }
+
     def setUp(self):
         bnl01_bot._last_reaction_by_channel.clear()
 
@@ -47,10 +55,19 @@ class ContextualReactionTests(unittest.IsolatedAsyncioTestCase):
     def test_reaction_probability_is_slightly_reduced(self):
         self.assertEqual(bnl01_bot.REACTION_CHANCE, 0.22)
 
+    def test_every_original_unicode_reaction_remains_reachable(self):
+        current = {
+            *bnl01_bot.BNL_REACTIONS_BASE,
+            *bnl01_bot.BNL_REACTIONS_BROADCAST,
+            *bnl01_bot.BNL_REACTIONS_GLITCH,
+            *bnl01_bot.BNL_REACTIONS_TECH,
+            *bnl01_bot.BNL_REACTIONS_VIBE,
+        }
+        self.assertTrue(self.ORIGINAL_REACTIONS.issubset(current))
+
     def test_contextual_unicode_pool_includes_expanded_broadcast_reactions(self):
         message = FakeReactionMessage("listen to this new track")
         with (
-            mock.patch.object(bnl01_bot.random, "random", return_value=1.0),
             mock.patch.object(bnl01_bot.random, "choice", return_value="🎧") as choose,
         ):
             reaction = bnl01_bot.choose_contextual_reaction(message)
@@ -58,8 +75,18 @@ class ContextualReactionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(reaction, "🎧")
         self.assertIn("🎧", choose.call_args.args[0])
 
-    def test_only_available_usable_allowlisted_custom_emoji_can_be_selected(self):
-        allowed = FakeCustomEmoji("DJ_FloppyDisc", 1)
+    def test_standalone_w_triggers_vibe_without_matching_every_letter_w(self):
+        self.assertEqual(
+            bnl01_bot._reaction_context_groups("we should wait for the next window"),
+            ["base"],
+        )
+        self.assertEqual(
+            bnl01_bot._reaction_context_groups("that track is a W"),
+            ["base", "broadcast", "vibe"],
+        )
+
+    def test_available_usable_custom_emoji_joins_contextual_pool_as_normal_candidate(self):
+        allowed = FakeCustomEmoji("DJ_FloppyDisc_hype", 1)
         not_allowlisted = FakeCustomEmoji("party_blob", 2)
         unavailable = FakeCustomEmoji("barcode", 3, available=False)
         unusable = FakeCustomEmoji("sixbit", 4, usable=False)
@@ -69,21 +96,37 @@ class ContextualReactionTests(unittest.IsolatedAsyncioTestCase):
         )
 
         with (
-            mock.patch.object(bnl01_bot.random, "random", return_value=0.0),
-            mock.patch.object(bnl01_bot.random, "choice", side_effect=lambda options: options[0]),
+            mock.patch.object(bnl01_bot.random, "choice", return_value=allowed) as choose,
         ):
             reaction = bnl01_bot.choose_contextual_reaction(message)
 
         self.assertIs(reaction, allowed)
+        options = choose.call_args.args[0]
+        self.assertIn(allowed, options)
+        self.assertIn("📻", options)
+        self.assertNotIn(not_allowlisted, options)
+
+    def test_numeric_six_bit_custom_emoji_name_is_recognized(self):
+        six_bit = FakeCustomEmoji("6Bit_signal", 5)
+        message = FakeReactionMessage("signal received", (six_bit,))
+
+        with mock.patch.object(bnl01_bot.random, "choice", return_value=six_bit) as choose:
+            reaction = bnl01_bot.choose_contextual_reaction(message)
+
+        self.assertIs(reaction, six_bit)
+        self.assertIn(six_bit, choose.call_args.args[0])
 
     async def test_failed_custom_reaction_falls_back_to_unicode(self):
-        allowed = FakeCustomEmoji("barcode", 5)
+        allowed = FakeCustomEmoji("barcode", 6)
         message = FakeReactionMessage("signal received", (allowed,))
         message.fail_custom = True
 
         with (
-            mock.patch.object(bnl01_bot.random, "random", return_value=0.0),
-            mock.patch.object(bnl01_bot.random, "choice", side_effect=lambda options: options[0]),
+            mock.patch.object(
+                bnl01_bot.random,
+                "choice",
+                side_effect=lambda options: allowed if allowed in options else options[0],
+            ),
         ):
             added = await bnl01_bot.add_contextual_reaction(message)
 
@@ -99,7 +142,6 @@ class ContextualReactionTests(unittest.IsolatedAsyncioTestCase):
 
         message.add_reaction = reject
         with (
-            mock.patch.object(bnl01_bot.random, "random", return_value=1.0),
             mock.patch.object(bnl01_bot.random, "choice", side_effect=lambda options: options[0]),
         ):
             added = await bnl01_bot.add_contextual_reaction(message)
