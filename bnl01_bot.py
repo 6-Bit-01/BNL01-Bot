@@ -60,6 +60,7 @@ from bnl_memory_ledger import (
 )
 from bnl_memory_governance import (
     GovernanceRequest,
+    assess_governance_result_safety,
     build_governed_context,
     complete_delete_member_data,
     correct_member_memory,
@@ -711,6 +712,10 @@ DEFAULT_MEMORY_GOVERNANCE_CANARY_DIAGNOSTICS = {
     "selected_count": 0,
     "rendered": False,
     "fallback_reason": "not_evaluated",
+    "processing_error_count": 0,
+    "invalid_invariant_count": 0,
+    "raw_invalid_invariant_count": 0,
+    "reclassified_invariant_count": 0,
 }
 LAST_MEMORY_GOVERNANCE_CANARY_DIAGNOSTICS = {}
 LAST_CONVERSATION_CONTEXT_V2_DIAGNOSTICS = {
@@ -849,7 +854,7 @@ def memory_governance_canary_enabled(
 
     The existing global live switch remains independent. The canary requires
     one configured guild, an allowlisted participant, the established public
-    explicit-recall surfaces, and both Ledger and Governance shadow inputs.
+    explicit-recall surfaces, and Ledger, Moment, and Governance shadow inputs.
     """
     env = os.environ if environ is None else environ
     configuration = memory_governance_canary_configuration(env)
@@ -868,6 +873,7 @@ def memory_governance_canary_enabled(
         in {"public_home", "public_context"}
         and memory_ledger_shadow_enabled(env)
         and memory_governance_shadow_enabled(env)
+        and moment_engine_shadow_enabled(env)
     )
 
 
@@ -17363,6 +17369,13 @@ def _format_explicit_recall_governed_response(gov_result) -> str:
     lines = []
     for candidate in gov_result.selected[:5]:
         text = re.sub(r"\s+", " ", str(candidate.text or "")).strip()
+        if candidate.source_class == "moment_gist":
+            text = re.sub(
+                r"^The participant\s+",
+                "You ",
+                text,
+                count=1,
+            )
         if text:
             lines.append(f"- {text[:240]}")
     if not lines:
@@ -17406,6 +17419,8 @@ def apply_explicit_recall_governance(
         legacy_vs_governed: dict | None = None,
         processing_error_count: int = 0,
         invalid_invariant_count: int = 0,
+        raw_invalid_invariant_count: int = 0,
+        reclassified_invariant_count: int = 0,
     ) -> None:
         LAST_MEMORY_GOVERNANCE_CANARY_DIAGNOSTICS[
             (int(user_id or 0), int(guild_id or 0))
@@ -17423,6 +17438,12 @@ def apply_explicit_recall_governance(
             ),
             "invalid_invariant_count": max(
                 0, int(invalid_invariant_count or 0)
+            ),
+            "raw_invalid_invariant_count": max(
+                0, int(raw_invalid_invariant_count or 0)
+            ),
+            "reclassified_invariant_count": max(
+                0, int(reclassified_invariant_count or 0)
             ),
         }
 
@@ -17454,16 +17475,35 @@ def apply_explicit_recall_governance(
             visibility_allowance=visibility,
             user_text=user_text or "",
             budget_chars=int(limits.get("prompt_budget") or 1200),
-            allowed_source_classes=("owner_correction", "approved_canon", "first_party_record", "runtime_observation", "public_observation", "evidence_projection", "derived_summary"),
+            allowed_source_classes=(
+                "owner_correction",
+                "approved_canon",
+                "first_party_record",
+                "runtime_observation",
+                "public_observation",
+                "moment_gist",
+                "evidence_projection",
+                "derived_summary",
+            ),
             now=datetime.now(PACIFIC_TZ).isoformat(),
         )
+        global_live_enabled = memory_governance_live_enabled()
         with sqlite3.connect(DB_FILE) as gov_conn:
-            gov_result = build_governed_context(gov_conn, gov_req, legacy_context=legacy_recall_response, include_review_moments=True)
-            unsafe_governed = bool(
-                gov_result.diagnostics.processing_errors
-                or gov_result.diagnostics.invalid_invariants
+            gov_result = build_governed_context(
+                gov_conn,
+                gov_req,
+                legacy_context=legacy_recall_response,
+                include_review_moments=True,
+                include_public_moment_gists=bool(
+                    moment_engine_shadow_enabled()
+                    and (
+                        canary_enabled_for_route
+                        or global_live_enabled
+                    )
+                ),
             )
-            global_live_enabled = memory_governance_live_enabled()
+            safety = assess_governance_result_safety(gov_result)
+            unsafe_governed = safety.unsafe
             governed_authority = bool(
                 global_live_enabled or canary_enabled_for_route
             )
@@ -17497,10 +17537,14 @@ def apply_explicit_recall_governance(
             ),
             legacy_vs_governed=gov_result.diagnostics.legacy_vs_governed,
             processing_error_count=len(
-                gov_result.diagnostics.processing_errors
+                safety.processing_errors
             ),
-            invalid_invariant_count=len(
-                gov_result.diagnostics.invalid_invariants
+            invalid_invariant_count=len(safety.blocking_invariants),
+            raw_invalid_invariant_count=(
+                safety.raw_invalid_invariant_count
+            ),
+            reclassified_invariant_count=(
+                safety.reclassified_invariant_count
             ),
         )
         if governed_authority and not unsafe_governed:
@@ -17955,7 +17999,9 @@ def build_user_memory_context(
                         }
                     )
                 persist_shadow_diagnostics(gov_conn, gov_req, gov_result, legacy_context)
-                unsafe_governed = bool(gov_result.diagnostics.processing_errors or gov_result.diagnostics.invalid_invariants)
+                unsafe_governed = assess_governance_result_safety(
+                    gov_result
+                ).unsafe
                 if memory_governance_live_enabled() and not unsafe_governed:
                     LAST_MEMORY_PROMPT_DIAGNOSTICS[(user_id, guild_id)] = diagnostics
                     governed_context = gov_result.rendered_context

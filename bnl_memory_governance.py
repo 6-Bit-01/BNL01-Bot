@@ -26,6 +26,7 @@ from bnl_journal_source_store import (
     purge_user_discord_sources_on_connection,
 )
 from bnl_memory_ledger import ensure_memory_ledger_schema, subject_key_for_user
+from bnl_moment_engine import select_public_participant_moment_gists
 from bnl_relationship_engine import complete_delete_relationship_v2, ensure_relationship_v2_schema, propagate_ledger_lifecycle
 
 SHADOW_ENV = "BNL_MEMORY_GOVERNANCE_SHADOW_ENABLED"
@@ -58,7 +59,7 @@ APPROVED_MEMBER_SCALAR_PREDICATES = {
     "favorite_movie",
 }
 PROJECTION_CLASSES = {"derived_summary", "evidence_projection", "source_file_projection", "dossier_projection", "entity_evidence_projection", "legacy_source_blind"}
-AUTHORITY = {"legacy_source_blind": 0, "derived_summary": 1, "evidence_projection": 2, "entity_evidence_projection": 2, "dossier_projection": 2, "source_file_projection": 2, "public_observation": 3, "runtime_observation": 4, "first_party_record": 5, "approved_canon": 6, "owner_correction": 7}
+AUTHORITY = {"legacy_source_blind": 0, "derived_summary": 1, "moment_gist": 2, "evidence_projection": 2, "entity_evidence_projection": 2, "dossier_projection": 2, "source_file_projection": 2, "public_observation": 3, "runtime_observation": 4, "first_party_record": 5, "approved_canon": 6, "owner_correction": 7}
 CONF = {"unknown": 0, "low": 1, "medium": 2, "high": 3, "approved": 4}
 IDENTITY_OWNER_ID_COLUMNS = {
     "user_id",
@@ -172,6 +173,66 @@ class GovernanceResult:
     selected: Tuple[MemoryCandidate, ...]
     exclusions: Tuple[GovernanceExclusion, ...]
     diagnostics: GovernanceDiagnostics
+
+
+@dataclass(frozen=True)
+class GovernanceSafetyAssessment:
+    processing_errors: Tuple[str, ...]
+    blocking_invariants: Tuple[str, ...]
+    raw_invalid_invariant_count: int
+    reclassified_invariant_count: int
+
+    @property
+    def unsafe(self) -> bool:
+        return bool(self.processing_errors or self.blocking_invariants)
+
+
+def _diagnostic_markers(value: Any) -> Tuple[str, ...]:
+    if not value:
+        return ()
+    if isinstance(value, str):
+        return (value,)
+    try:
+        return tuple(str(marker or "unknown") for marker in value)
+    except TypeError:
+        return (str(value),)
+
+
+def assess_governance_result_safety(
+    result: GovernanceResult,
+) -> GovernanceSafetyAssessment:
+    """Apply the acceptance reclassification before a result gains authority."""
+    errors = _diagnostic_markers(result.diagnostics.processing_errors)
+    raw_invariants = _diagnostic_markers(
+        result.diagnostics.invalid_invariants
+    )
+    safe_route_exclusions = max(
+        0,
+        int(
+            result.diagnostics.excluded_by_reason.get(
+                "invalid_route_channel_policy",
+                0,
+            )
+            or 0
+        ),
+    )
+    blocking: List[str] = []
+    reclassified = 0
+    for invariant in raw_invariants:
+        if (
+            invariant == "invalid_route_channel_policy_selected"
+            and reclassified < safe_route_exclusions
+        ):
+            reclassified += 1
+            continue
+        blocking.append(invariant)
+    return GovernanceSafetyAssessment(
+        processing_errors=errors,
+        blocking_invariants=tuple(blocking),
+        raw_invalid_invariant_count=len(raw_invariants),
+        reclassified_invariant_count=reclassified,
+    )
+
 
 def gate_enabled(name: str, environ: Optional[Dict[str, str]] = None) -> bool:
     return str((environ or os.environ).get(name, "")).strip().lower() in {"1", "true", "yes", "on", "enabled"}
@@ -320,7 +381,14 @@ def _moment_counts(conn: sqlite3.Connection, req: GovernanceRequest, diag: Gover
     except Exception as e:
         diag.processing_errors.append("moment:" + type(e).__name__)
 
-def build_governed_context(conn: sqlite3.Connection, req: GovernanceRequest, *, legacy_context: str = "", include_review_moments: bool = False) -> GovernanceResult:
+def build_governed_context(
+    conn: sqlite3.Connection,
+    req: GovernanceRequest,
+    *,
+    legacy_context: str = "",
+    include_review_moments: bool = False,
+    include_public_moment_gists: bool = False,
+) -> GovernanceResult:
     diag = GovernanceDiagnostics(route_policy={"route_mode": req.route_mode, "channel_policy": req.channel_policy, "visibility": req.visibility_allowance})
     try:
         ensure_governance_schema(conn)
@@ -402,10 +470,71 @@ def build_governed_context(conn: sqlite3.Connection, req: GovernanceRequest, *, 
             if not _relevance_ok(c, request_terms, broad):
                 exclude("topic_relevance"); continue
             cands.append(c)
-        if include_review_moments:
-            _moment_counts(conn, req, diag)
     except Exception as e:
         diag.processing_errors.append(type(e).__name__)
+    if include_review_moments or include_public_moment_gists:
+        _moment_counts(conn, req, diag)
+    if include_public_moment_gists and "moment_gist" in allowed:
+        try:
+            for moment in select_public_participant_moment_gists(
+                conn,
+                guild_id=req.guild_id,
+                participant_key=subject,
+                topic_text=req.user_text,
+                broad_recall=broad,
+                token_budget=160,
+                freshness_days=3650,
+                allowed_channel_policies=("public_home", "public_context"),
+                max_results=4,
+            ):
+                diag.candidates_by_source["moment_gist"] = (
+                    diag.candidates_by_source.get("moment_gist", 0) + 1
+                )
+                candidate = MemoryCandidate(
+                    "moment_gist",
+                    moment.frame_type or "participant_contribution",
+                    "moment:%s" % moment.moment_id,
+                    moment.canonical_ledger_entry_id or moment.moment_id,
+                    req.guild_id,
+                    subject,
+                    "shared_moment",
+                    "shared_moment",
+                    moment.contribution_gist,
+                    moment.visibility,
+                    "medium",
+                    "finalized",
+                    AUTHORITY["moment_gist"],
+                    moment.salience,
+                    moment.last_activity_at,
+                    "",
+                    "",
+                    True,
+                    True,
+                    (subject,),
+                    (),
+                    0.0,
+                    True,
+                )
+                if not _relevance_ok(
+                    candidate,
+                    request_terms,
+                    broad,
+                ):
+                    exclusions.append(
+                        GovernanceExclusion(
+                            candidate.source_ref,
+                            "topic_relevance",
+                            candidate.source_class,
+                            candidate.entry_id,
+                        )
+                    )
+                    _add(diag, "topic_relevance")
+                    continue
+                cands.append(candidate)
+        except Exception as e:
+            diag.processing_errors.append(
+                "moment_gist:" + type(e).__name__
+            )
     scored: List[MemoryCandidate] = []
     recall = _explicit_recall(req.user_text)
     participant_keys = set(req.participants)
@@ -415,7 +544,13 @@ def build_governed_context(conn: sqlite3.Connection, req: GovernanceRequest, *, 
         scored.append(replace(c, score=round(score, 4)))
     ranked = sorted(scored, key=lambda c: (-c.score, -c.authority, -CONF.get(c.confidence, 0), -_parse_time(c.observed_at), c.source_class, c.source_ref, c.entry_id))
     # Resolve contradictions by predicate: additive/open-loop-like predicates may coexist; scalar predicates keep highest ranked current value.
-    additive = {"open_loop", "commitment", "goal", "unresolved_question"}
+    additive = {
+        "open_loop",
+        "commitment",
+        "goal",
+        "unresolved_question",
+        "shared_moment",
+    }
     resolved: List[MemoryCandidate] = []
     seen_pred: Set[str] = set()
     for c in ranked:
@@ -453,18 +588,26 @@ def build_governed_context(conn: sqlite3.Connection, req: GovernanceRequest, *, 
 def persist_shadow_diagnostics(conn: sqlite3.Connection, req: GovernanceRequest, result: GovernanceResult, legacy_context: str) -> str:
     ensure_governance_schema(conn)
     now = _now(); run_id = "mgs_" + _hash("|".join([str(req.guild_id), subject_key_for_user(req.subject_user_id), now, result.diagnostics.rendered_hash]))
+    safety = assess_governance_result_safety(result)
     invalid_invariant_counts: Dict[str, int] = {}
-    for invariant in result.diagnostics.invalid_invariants:
+    for invariant in _diagnostic_markers(
+        result.diagnostics.invalid_invariants
+    ):
         key = str(invariant or "unknown")[:120]
         invalid_invariant_counts[key] = invalid_invariant_counts.get(key, 0) + 1
-    # Persist the raw aggregate counts. The acceptance reader owns the one
-    # compatibility reclassification pass for the historical route-policy
-    # marker. Keeping that operation in one layer preserves any unmatched
-    # remainder as a fail-closed blocker.
+    # Persist both the raw aggregate and the shared safety assessment. The
+    # assessor reclassifies only markers corroborated by matching safe
+    # pre-selection exclusions; unmatched remainders remain fail-closed.
     aggregate_diagnostics = {
         "route_policy": dict(result.diagnostics.route_policy),
         "selected_by_source": dict(result.diagnostics.selected_by_source),
         "invalid_invariant_counts": invalid_invariant_counts,
+        "effective_invalid_invariant_count": len(
+            safety.blocking_invariants
+        ),
+        "reclassified_invariant_count": (
+            safety.reclassified_invariant_count
+        ),
         "fallback_reason": str(result.diagnostics.fallback_reason or "")[:120],
         "visibility_exclusions": int(result.diagnostics.visibility_exclusions or 0),
         "token_budget_exclusions": int(result.diagnostics.token_budget_exclusions or 0),
@@ -497,6 +640,7 @@ def persist_shadow_diagnostics(conn: sqlite3.Connection, req: GovernanceRequest,
 def build_evaluation_report(results: List[GovernanceResult], guild_id: int) -> Dict[str, Any]:
     report: Dict[str, Any] = {"guild_id": guild_id, "runs": len(results), "selected_total": 0, "excluded_total": 0, "selected_by_source": {}, "excluded_by_reason": {}, "visibility_violations": 0, "cross_member_violations": 0, "cross_guild_violations": 0, "invalid_route_channel_policy_selections": 0, "corrected_superseded_retracted_selected": 0, "review_only_or_needs_review_selected": 0, "projection_lineage_violations": 0, "duplicate_suppression": 0, "contradiction_resolutions": 0, "budget_overruns": 0, "empty_result_frequency": 0, "processing_errors": 0, "legacy_vs_governed": [], "rollback_readiness": "ready_env_disable_live"}
     for r in results:
+        safety = assess_governance_result_safety(r)
         report["selected_total"] += len(r.selected); report["excluded_total"] += len(r.exclusions)
         for k, v in r.diagnostics.selected_by_source.items(): report["selected_by_source"][k] = report["selected_by_source"].get(k, 0) + v
         for k, v in r.diagnostics.excluded_by_reason.items(): report["excluded_by_reason"][k] = report["excluded_by_reason"].get(k, 0) + v
@@ -509,22 +653,14 @@ def build_evaluation_report(results: List[GovernanceResult], guild_id: int) -> D
         report["contradiction_resolutions"] += len(r.diagnostics.contradiction_resolutions)
         report["budget_overruns"] += r.diagnostics.token_budget_exclusions
         report["empty_result_frequency"] += 1 if not r.rendered_context else 0
-        report["processing_errors"] += len(r.diagnostics.processing_errors)
+        report["processing_errors"] += len(safety.processing_errors)
         report["legacy_vs_governed"].append(r.diagnostics.legacy_vs_governed)
-        route_policy_markers = 0
-        for inv in r.diagnostics.invalid_invariants:
+        for inv in safety.blocking_invariants:
             if inv == "cross_subject_selected": report["cross_member_violations"] += 1
             if inv == "cross_guild_selected": report["cross_guild_violations"] += 1
             if inv == "visibility_selected": report["visibility_violations"] += 1
-            if inv == "invalid_route_channel_policy_selected": route_policy_markers += 1
-        # A route-policy mismatch is rejected before candidates reach the
-        # selected set. Reclassify only the count corroborated by matching safe
-        # exclusions; any unmatched remainder still fails closed.
-        report["invalid_route_channel_policy_selections"] += max(
-            0,
-            route_policy_markers
-            - int(r.diagnostics.excluded_by_reason.get("invalid_route_channel_policy", 0) or 0),
-        )
+            if inv == "invalid_route_channel_policy_selected":
+                report["invalid_route_channel_policy_selections"] += 1
     if report["processing_errors"] or report["visibility_violations"] or report["cross_member_violations"] or report["cross_guild_violations"] or report["invalid_route_channel_policy_selections"]:
         report["rollback_readiness"] = "fallback_required_before_live"
     return report
