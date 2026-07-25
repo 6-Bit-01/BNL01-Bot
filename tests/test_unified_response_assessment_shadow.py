@@ -310,6 +310,119 @@ class UnifiedResponseAssessmentShadowTests(unittest.TestCase):
         self.assertEqual(coherence.status, "passed")
         self.assertEqual(coherence.clarification_status, "appropriate")
 
+    def test_pronoun_followup_uses_selected_conversation_referent(self):
+        request = "How does it work?"
+        assessment = build_unified_response_assessment(
+            guild_id=1,
+            route_mode="normal_chat",
+            channel_policy="sealed_test",
+            conversation_surface="test",
+            current_speaker_user_ids=(101,),
+            participant_user_ids=(101, 202),
+            speaker_labels=("Jon", "Miss Bit"),
+            current_exchange_source_ids=(40,),
+            prompt_lanes=("current_exchange", "conversation_context"),
+            current_text=request,
+            conversation_evidence_items=(
+                build_conversation_evidence_item(
+                    text=(
+                        "The grounding fallback retries one draft before "
+                        "suppressing a stale answer."
+                    ),
+                    source_id=40,
+                    speaker_user_id=202,
+                    speaker_label="Miss Bit",
+                ),
+                build_conversation_evidence_item(
+                    text=request,
+                    speaker_user_id=101,
+                    speaker_label="Jon",
+                    current_turn=True,
+                ),
+            ),
+        )
+
+        self.assertEqual(assessment.ambiguity_reasons, ())
+        self.assertEqual(assessment.response_act, "answer_current_turn")
+        self.assertEqual(
+            assessment.expected_answer_shape,
+            "direct_answer_then_support",
+        )
+        coherence = assess_response_coherence(
+            assessment,
+            (
+                "The grounding fallback retries one draft, then suppresses "
+                "the answer only if that retry is still stale."
+            ),
+        )
+        self.assertNotEqual(coherence.status, "failed")
+        self.assertNotIn(
+            "ambiguity_answered_without_clarification",
+            coherence.reason_codes,
+        )
+
+    def test_pronoun_without_usable_context_still_requires_clarification(self):
+        request = "How does it work?"
+        assessment = build_unified_response_assessment(
+            guild_id=1,
+            route_mode="normal_chat",
+            channel_policy="sealed_test",
+            conversation_surface="test",
+            current_speaker_user_ids=(101,),
+            current_text=request,
+            conversation_evidence_items=(
+                build_conversation_evidence_item(
+                    text="Okay.",
+                    source_id=50,
+                    speaker_user_id=202,
+                    speaker_label="Miss Bit",
+                ),
+                build_conversation_evidence_item(
+                    text=request,
+                    speaker_user_id=101,
+                    speaker_label="Jon",
+                    current_turn=True,
+                ),
+            ),
+        )
+
+        self.assertEqual(
+            assessment.ambiguity_reasons,
+            ("current_referent_unresolved",),
+        )
+        self.assertEqual(
+            assessment.response_act,
+            "ask_clarifying_question",
+        )
+
+    def test_pronoun_can_resolve_inside_fragmented_current_turn(self):
+        request = "How does it work?"
+        assessment = build_unified_response_assessment(
+            guild_id=1,
+            route_mode="normal_chat",
+            channel_policy="sealed_test",
+            conversation_surface="test",
+            current_speaker_user_ids=(101,),
+            current_text=request,
+            conversation_evidence_items=(
+                build_conversation_evidence_item(
+                    text="The retry guard now has a bounded fallback.",
+                    speaker_user_id=101,
+                    speaker_label="Jon",
+                    current_turn=True,
+                ),
+                build_conversation_evidence_item(
+                    text=request,
+                    speaker_user_id=101,
+                    speaker_label="Jon",
+                    current_turn=True,
+                ),
+            ),
+        )
+
+        self.assertEqual(assessment.ambiguity_reasons, ())
+        self.assertEqual(assessment.response_act, "answer_current_turn")
+
     def test_decisions_corrections_and_open_loops_keep_source_lineage(self):
         evidence = (
             build_conversation_evidence_item(

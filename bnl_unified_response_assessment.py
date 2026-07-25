@@ -22,7 +22,7 @@ from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
 from bnl_conversation_context_v2 import assess_payload_grounding
 
 
-ASSESSMENT_VERSION = "unified_response_assessment_v3"
+ASSESSMENT_VERSION = "unified_response_assessment_v4"
 SHADOW_ENV = "BNL_UNIFIED_RESPONSE_ASSESSMENT_SHADOW_ENABLED"
 TABLE_NAME = "unified_response_assessment_shadow_runs"
 
@@ -136,6 +136,25 @@ _UNRESOLVED_REFERENT_RE = re.compile(
     r"\b(?:that|this|it|those|these|they|them|there|the\s+former|"
     r"the\s+latter|the\s+first|the\s+second)\b",
     re.I,
+)
+_REFERENT_CONTEXT_FILLERS = frozenset(
+    {
+        "got",
+        "hello",
+        "hey",
+        "hi",
+        "lmao",
+        "lol",
+        "no",
+        "ok",
+        "okay",
+        "right",
+        "sure",
+        "thank",
+        "thanks",
+        "understood",
+        "yes",
+    }
 )
 _QUOTED_OPTION_RE = re.compile(r"[\"“](?P<value>[^\"”\n]{1,80})[\"”]")
 _BETWEEN_OPTION_RE = re.compile(
@@ -658,6 +677,39 @@ def _option_referents(
     return tuple(result)
 
 
+def _usable_referent_context_present(
+    objective: str,
+    evidence_items: Sequence[ConversationEvidenceItem],
+) -> bool:
+    """Recognize a referent supplied by the planner's selected evidence."""
+
+    objective_text = str(objective or "").strip()
+    objective_normalized = _semantic_normalize(objective_text)
+    for item in reversed(tuple(evidence_items or ())):
+        item_text = str(item.text or "").strip()
+        if not item_text:
+            continue
+        if _semantic_normalize(item_text) == objective_normalized:
+            continue
+
+        residual = item_text
+        if objective_text and objective_text in residual:
+            residual = residual.replace(objective_text, " ", 1)
+        residual_terms = set(_semantic_terms(residual))
+        residual_terms.difference_update(_semantic_terms(item.speaker_label))
+        residual_terms.difference_update(_REFERENT_CONTEXT_FILLERS)
+        if (
+            len(residual_terms) >= 2
+            or item.option_anchors
+            or item.criterion_positive_terms
+            or item.criterion_negative_terms
+            or "decision" in item.semantic_roles
+            or "correction" in item.semantic_roles
+        ):
+            return True
+    return False
+
+
 def _ambiguity_reasons(
     *,
     objective: str,
@@ -665,6 +717,7 @@ def _ambiguity_reasons(
     criteria: Sequence[AttributedCriterion],
     current_options: Sequence[str],
     thread_focus_mode: str,
+    evidence_items: Sequence[ConversationEvidenceItem],
 ) -> Tuple[str, ...]:
     reasons = []
     if thread_focus_mode in {
@@ -680,6 +733,10 @@ def _ambiguity_reasons(
         _UNRESOLVED_REFERENT_RE.search(objective or "")
         and not criteria
         and not current_options
+        and not _usable_referent_context_present(
+            objective,
+            evidence_items,
+        )
     ):
         reasons.append("current_referent_unresolved")
     return _unique_strings(reasons)
@@ -836,6 +893,7 @@ def build_unified_response_assessment(
         criteria=criteria,
         current_options=current_options,
         thread_focus_mode=resolved_thread_focus,
+        evidence_items=evidence_items,
     )
     option_referents = _option_referents(
         current_options,
