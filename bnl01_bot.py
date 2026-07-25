@@ -45,7 +45,10 @@ from bnl_occasion import (
 )
 from bnl_memory_ledger import (
     LedgerWriteResult,
+    backfill_atomic_knowledge_candidates,
     ensure_memory_ledger_schema,
+    form_atomic_candidate_from_ledger_entry,
+    record_atomic_knowledge_processing_error,
     subject_key_for_user,
     shadow_broadcast_memory_row,
     shadow_conversation_row,
@@ -5071,6 +5074,38 @@ def init_db():
                 reason="startup_orphan_reconciliation",
             )
         )
+        knowledge_backfill = {
+            "phase": "disabled",
+            "completed": False,
+            "counts": {},
+        }
+        if memory_ledger_shadow_enabled():
+            try:
+                knowledge_backfill = backfill_atomic_knowledge_candidates(
+                    evidence_conn,
+                    batch_size=250,
+                )
+            except Exception as knowledge_exc:
+                try:
+                    record_atomic_knowledge_processing_error(
+                        evidence_conn,
+                        guild_id=0,
+                        reason_code=(
+                            "startup_backfill_"
+                            + type(knowledge_exc).__name__
+                        )[:120],
+                    )
+                except Exception as diagnostic_exc:
+                    logging.debug(
+                        "atomic_knowledge_backfill_diagnostic_failed "
+                        "error_type=%s",
+                        type(diagnostic_exc).__name__,
+                    )
+                knowledge_backfill = {
+                    "phase": "error",
+                    "completed": False,
+                    "counts": {"processing_error": 1},
+                }
         evidence_conn.commit()
     finally:
         evidence_conn.close()
@@ -5078,6 +5113,13 @@ def init_db():
         logging.info(
             "memory_orphan_reconciliation counts=%s",
             orphan_reconciliation,
+        )
+    if memory_ledger_shadow_enabled():
+        logging.info(
+            "atomic_knowledge_backfill phase=%s completed=%s counts=%s",
+            knowledge_backfill.get("phase"),
+            int(bool(knowledge_backfill.get("completed"))),
+            knowledge_backfill.get("counts"),
         )
     logging.info("✅ Database initialized successfully.")
 
@@ -5099,6 +5141,37 @@ def _shadow_memory_ledger_write(writer_name: str, callback, *, guild_id: int = 0
             )
         except Exception as receipt_exc:
             logging.debug("memory_ledger_shadow_receipt_failed writer=%s error=%s", writer_name, receipt_exc)
+        if (
+            result.entry_id
+            and result.outcome in {"inserted", "deduplicated"}
+        ):
+            try:
+                form_atomic_candidate_from_ledger_entry(
+                    conn,
+                    result.entry_id,
+                )
+            except Exception as knowledge_exc:
+                logging.debug(
+                    "atomic_knowledge_shadow_failed writer=%s error_type=%s",
+                    writer_name,
+                    type(knowledge_exc).__name__,
+                )
+                try:
+                    record_atomic_knowledge_processing_error(
+                        conn,
+                        guild_id=result.guild_id or int(guild_id or 0),
+                        reason_code=(
+                            "shadow_write_" + type(knowledge_exc).__name__
+                        )[:120],
+                        root_entry_ids=(result.entry_id,),
+                    )
+                except Exception as diagnostic_exc:
+                    logging.debug(
+                        "atomic_knowledge_shadow_diagnostic_failed "
+                        "writer=%s error_type=%s",
+                        writer_name,
+                        type(diagnostic_exc).__name__,
+                    )
         conn.commit()
         if (
             result
@@ -30536,6 +30609,26 @@ async def bnl_memory_check(interaction: discord.Interaction):
         f"- memory_ledger_unmapped_provenance: `{ledger_diag.get('missingUnmappedProvenance', 0)}`",
         f"- memory_ledger_public_rejections: `{ledger_diag.get('publicUsabilityRejections', 0)}`",
         f"- memory_ledger_multiple_active_values: `{ledger_diag.get('entriesWithMultipleActiveValues', 0)}`",
+        f"- atomic_knowledge_schema: `{ledger_diag.get('knowledgeCandidateSchemaVersion', 'absent')}`",
+        f"- atomic_knowledge_by_type: `{ledger_diag.get('knowledgeCandidateTotalsByType', {})}`",
+        f"- atomic_knowledge_by_state: `{ledger_diag.get('knowledgeCandidateTotalsByState', {})}`",
+        f"- atomic_knowledge_by_visibility: `{ledger_diag.get('knowledgeCandidateTotalsByVisibility', {})}`",
+        f"- atomic_knowledge_by_authority: `{ledger_diag.get('knowledgeCandidateTotalsByAuthority', {})}`",
+        f"- atomic_knowledge_by_confidence: `{ledger_diag.get('knowledgeCandidateTotalsByConfidence', {})}`",
+        f"- atomic_knowledge_by_epistemic_status: `{ledger_diag.get('knowledgeCandidateTotalsByEpistemicStatus', {})}`",
+        f"- atomic_knowledge_by_currentness: `{ledger_diag.get('knowledgeCandidateTotalsByCurrentness', {})}`",
+        f"- atomic_knowledge_root_kinds: `{ledger_diag.get('knowledgeCandidateRootKinds', {})}`",
+        f"- atomic_knowledge_receipt_events: `{ledger_diag.get('knowledgeCandidateReceiptEvents', {})}`",
+        f"- atomic_knowledge_rejections: `{ledger_diag.get('knowledgeCandidateRejectionsByReason', {})}`",
+        f"- atomic_knowledge_invalidations: `{ledger_diag.get('knowledgeCandidateInvalidationsByReason', {})}`",
+        f"- atomic_knowledge_orphaned_roots: `{ledger_diag.get('knowledgeCandidateOrphanedRoots', 0)}`",
+        f"- atomic_knowledge_missing_independent_roots: `{ledger_diag.get('knowledgeCandidateMissingIndependentRoots', 0)}`",
+        f"- atomic_knowledge_participant_isolation_violations: `{ledger_diag.get('knowledgeCandidateParticipantIsolationViolations', 0)}`",
+        f"- atomic_knowledge_derivative_only_rejections: `{ledger_diag.get('knowledgeCandidateDerivativeOnlyRejections', 0)}`",
+        f"- atomic_knowledge_live_eligible: `{ledger_diag.get('knowledgeCandidateLiveEligibleCount', 0)}`",
+        f"- atomic_knowledge_processing_errors: `{ledger_diag.get('knowledgeCandidateProcessingErrors', 0)}`",
+        f"- atomic_knowledge_correction_delete_privacy_invalidations: `{ledger_diag.get('knowledgeCandidateCorrectionDeletePrivacyInvalidations', 0)}`",
+        f"- atomic_knowledge_backfill: `{ledger_diag.get('knowledgeCandidateBackfill', {})}`",
         f"- memory_tiers_source_policy: `{memory_tier_source_policy_state}`",
         "- sealed_test_passive_capture: `disabled`",
         f"- sealed_test_conversation_rows: `{'present' if sealed_test_rows_present else 'none'}`",

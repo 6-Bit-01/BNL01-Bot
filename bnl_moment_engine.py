@@ -22,7 +22,9 @@ from bnl_memory_ledger import (
     LedgerEntry,
     LedgerParticipant,
     ensure_memory_ledger_schema,
+    form_atomic_candidates_from_moment,
     insert_ledger_entry,
+    record_atomic_knowledge_processing_error,
     shadow_enabled as ledger_shadow_enabled,
 )
 
@@ -4477,6 +4479,21 @@ def finalize_moment(
         rows,
         public_usable=public_usable,
     )
+    try:
+        form_atomic_candidates_from_moment(conn, moment_id)
+    except Exception as knowledge_exc:
+        try:
+            record_atomic_knowledge_processing_error(
+                conn,
+                guild_id=int(win[0] or 0),
+                reason_code=(
+                    "moment_projection_" + type(knowledge_exc).__name__
+                )[:120],
+                candidate_type="topic_or_motif",
+                root_entry_ids=tuple(source_ids),
+            )
+        except Exception:
+            pass
     _diag(conn, int(win[0] or 0), "window_finalized", reason, moment_id, moment_entry_id)
     observe_finalized_moment_episode(conn, moment_id)
     return MomentObservationResult(result.outcome, result.reason_code, moment_id, moment_entry_id)

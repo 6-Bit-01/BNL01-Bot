@@ -25,7 +25,13 @@ from bnl_journal_source_store import (
     journal_release_privacy_fence,
     purge_user_discord_sources_on_connection,
 )
-from bnl_memory_ledger import ensure_memory_ledger_schema, subject_key_for_user
+from bnl_memory_ledger import (
+    ensure_memory_ledger_schema,
+    form_atomic_candidate_from_ledger_entry,
+    purge_atomic_knowledge_for_subject,
+    record_atomic_knowledge_processing_error,
+    subject_key_for_user,
+)
 from bnl_moment_engine import select_public_participant_moment_gists
 from bnl_relationship_engine import complete_delete_relationship_v2, ensure_relationship_v2_schema, propagate_ledger_lifecycle
 
@@ -1361,6 +1367,23 @@ def correct_member_memory(conn: sqlite3.Connection, *, guild_id: int, user_id: i
             return {"ok": False, "reason": "invalid_correction_value"}
         entry_id = "mle_" + hashlib.sha256(("correction|%s|%s|%s|%s" % (guild_id, subject, target, _hash(corrected_text))).encode("utf-8")).hexdigest()[:40]
         conn.execute("INSERT OR IGNORE INTO memory_ledger_entries (entry_id,schema_version,guild_id,subject_key,subject_display_name,entry_type,predicate_key,normalized_value,source_class,source_table,source_row_id,source_role,visibility,confidence,public_usable,derived,projection,salience,observed_at,lifecycle_status,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (entry_id, "memory_ledger_v1", guild_id, subject, "", "claim", prior[0], corrected_value[:1000], "first_party_record", "member_memory_control", rid, "member_control", "private", "high", 0, 0, 0, 1.0, now, "active", now, now))
+        conn.execute(
+            """
+            UPDATE memory_ledger_entries
+            SET route_mode='member_control',channel_policy='member_control'
+            WHERE guild_id=? AND entry_id=?
+            """,
+            (guild_id, entry_id),
+        )
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO memory_ledger_participants(
+              entry_id,guild_id,participant_key,display_name,
+              participant_role,order_index,created_at
+            ) VALUES(?,?,?,?,?,?,?)
+            """,
+            (entry_id, guild_id, subject, "", "control_actor", 0, now),
+        )
         conn.execute("INSERT OR IGNORE INTO memory_ledger_lineage VALUES (?,?,?,?,?)", (entry_id, guild_id, "correction_of", target, now)); conn.execute("INSERT OR IGNORE INTO memory_ledger_lineage VALUES (?,?,?,?,?)", (entry_id, guild_id, "supersedes", target, now))
         contribution_counts = _invalidate_contributions_for_ledger_entries(
             conn,
@@ -1387,6 +1410,21 @@ def correct_member_memory(conn: sqlite3.Connection, *, guild_id: int, user_id: i
             "live_facts": live_fact_updates,
         }
         receipt_counts.update(contribution_counts)
+        try:
+            form_atomic_candidate_from_ledger_entry(conn, entry_id)
+        except Exception as knowledge_exc:
+            try:
+                record_atomic_knowledge_processing_error(
+                    conn,
+                    guild_id=guild_id,
+                    reason_code=(
+                        "member_correction_" + type(knowledge_exc).__name__
+                    )[:120],
+                    candidate_type="person_role_fact",
+                    root_entry_ids=(entry_id,),
+                )
+            except Exception:
+                pass
         conn.execute("INSERT INTO memory_governance_receipts VALUES (?,?,?,?,?,?,?)", (rid, guild_id, _subject_hash(user_id), "correct", safe_ref, now, json.dumps(receipt_counts, sort_keys=True)))
     return {"ok": True, "receipt": rid, "ref": safe_ref}
 
@@ -2232,6 +2270,13 @@ def _complete_delete_member_data(conn: sqlite3.Connection, *, guild_id: int, use
             owned_ledger_ids
             | participant_model_ids
             | source_bound_raw_ids
+        )
+        counts.update(
+            purge_atomic_knowledge_for_subject(
+                conn,
+                guild_id=guild_id,
+                subject_key=subject,
+            )
         )
         deleted_ledger_source_refs: Set[Tuple[str, str]] = set()
         if delete_ledger_ids:
