@@ -313,17 +313,27 @@ Review at least:
 
 - eligible ledger entries observed;
 - open, finalized, rejected, and correction-review windows;
+- active, finalized, and correction-review episodes;
+- episode Moment/source link totals and content-free semantic-role counts;
+- episode extension, topic-split/interruption, explicit reopen, and
+  source-backed related-lineage counts;
+- episodes with unresolved open loops;
 - rejection reasons and qualification types;
 - participant and finalization aggregates;
 - processing errors;
 - duplicate memberships;
+- Moments linked into more than one episode or duplicate active episodes in
+  one scope;
 - BNL-only finalized moments;
 - cross-guild, cross-channel, and incompatible-visibility violations; and
-- dangling lineage targets.
+- dangling Moment, episode, source, participant, or lineage targets.
 
 Open windows are collecting evidence, not failures. After the inactivity window,
 controlled coherent input should produce at least one finalized moment, while
 low-signal or isolated input should be rejected rather than promoted.
+An active episode is likewise collecting source-backed Moments rather than
+declaring durable truth. Topic interruption may finalize and split it; a later
+reopen or related link must have one unambiguous eligible human source.
 
 ### Governance evidence
 
@@ -415,8 +425,10 @@ observed:
 - a report cannot be built or returns a database/report error;
 - the Ledger records a shadow write error or dangling lineage target;
 - the Moment Engine records a processing error, duplicate membership, BNL-only
-  finalized moment, cross-guild violation, cross-channel violation,
-  incompatible-visibility violation, or dangling lineage target;
+  finalized moment, duplicate active episode scope, one Moment linked into
+  multiple episodes, cross-guild violation, cross-channel violation,
+  incompatible-visibility violation, or dangling Moment/episode/source/
+  participant/lineage target;
 - Governance records a processing error or changes the production result while
   its live gate is off;
 - Relationship v2 records a processing error, visibility/cross-guild linkage

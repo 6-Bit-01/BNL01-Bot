@@ -1,4 +1,5 @@
 import os, sqlite3, tempfile, unittest
+from datetime import datetime, timedelta, timezone
 from unittest import mock
 os.environ.setdefault("GEMINI_API_KEY", "test-gemini-key")
 os.environ.setdefault("DISCORD_BOT_TOKEN", "test-discord-token")
@@ -12,6 +13,12 @@ class MomentEngineBotPathTests(unittest.TestCase):
         bnl01_bot.init_db()
     def tearDown(self):
         bnl01_bot.DB_FILE=self.old
+        for key in (
+            "BNL_UNIFIED_RESPONSE_ASSESSMENT_SHADOW_ENABLED",
+            "BNL_MEMORY_GOVERNANCE_SHADOW_ENABLED",
+            "BNL_RELATIONSHIP_V2_SHADOW_ENABLED",
+        ):
+            os.environ.pop(key, None)
     def rows(self,sql):
         c=sqlite3.connect(self.tmp.name); r=c.execute(sql).fetchall(); c.close(); return r
     def test_disabled_gate_creates_no_moment_schema_or_windows(self):
@@ -42,5 +49,55 @@ class MomentEngineBotPathTests(unittest.TestCase):
             bnl01_bot.save_user_message(3,"C",1,"remember this number: 10",channel_policy="sealed_test",channel_id=10)
         self.assertEqual(self.rows("SELECT COUNT(*) FROM memory_ledger_entries WHERE source_table='conversations'")[0][0],1)
         self.assertEqual(self.rows("SELECT name FROM sqlite_master WHERE type='table' AND name='memory_moment_windows'"),[])
+
+    def test_active_episode_reference_reaches_shadow_assessment_only(self):
+        os.environ["BNL_MOMENT_ENGINE_SHADOW_ENABLED"] = "1"
+        os.environ["BNL_UNIFIED_RESPONSE_ASSESSMENT_SHADOW_ENABLED"] = "1"
+        os.environ["BNL_MEMORY_GOVERNANCE_SHADOW_ENABLED"] = "1"
+        os.environ["BNL_RELATIONSHIP_V2_SHADOW_ENABLED"] = "1"
+        for user_id, text in (
+            (1, "Let's build the synth routing for the chorus"),
+            (2, "The synth drum patch needs a bass answer"),
+            (3, "Which synth layer should we test next?"),
+        ):
+            bnl01_bot.save_user_message(
+                user_id,
+                "Member %s" % user_id,
+                1,
+                text,
+                channel_policy="public_home",
+                channel_id=10,
+                channel_name="channel-10",
+            )
+        with sqlite3.connect(self.tmp.name) as conn:
+            bnl01_bot.sweep_expired_moment_windows(
+                conn,
+                now=(
+                    datetime.now(timezone.utc) + timedelta(minutes=3)
+                ).isoformat(),
+            )
+            conn.commit()
+
+        assessment = bnl01_bot.build_unified_response_assessment_shadow(
+            guild_id=1,
+            route_mode=bnl01_bot.ROUTE_MODE_NORMAL_CHAT,
+            channel_policy="public_home",
+            conversation_surface="public",
+            current_text="How should we continue the synth routing?",
+            current_speaker_user_ids=(1,),
+            current_speaker_labels=("Member 1",),
+            channel_id=10,
+            prompt_lanes=("current_exchange",),
+            continuity_required=True,
+        )
+
+        self.assertIsNotNone(assessment)
+        self.assertTrue(assessment.active_episode_id.startswith("mep_"))
+        self.assertIn("active_episode", assessment.selected_lanes)
+        self.assertIn("active_episode", assessment.prompt_missing_lanes)
+        self.assertNotIn(
+            assessment.active_episode_id,
+            assessment.diagnostic_reasons,
+        )
 
 if __name__ == "__main__": unittest.main()

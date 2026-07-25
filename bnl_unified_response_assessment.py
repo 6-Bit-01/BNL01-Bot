@@ -22,7 +22,7 @@ from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
 from bnl_conversation_context_v2 import assess_payload_grounding
 
 
-ASSESSMENT_VERSION = "unified_response_assessment_v4"
+ASSESSMENT_VERSION = "unified_response_assessment_v5"
 SHADOW_ENV = "BNL_UNIFIED_RESPONSE_ASSESSMENT_SHADOW_ENABLED"
 TABLE_NAME = "unified_response_assessment_shadow_runs"
 
@@ -967,8 +967,9 @@ def build_unified_response_assessment(
             excluded.append(("active_episode", "current_exchange_precedence"))
         else:
             selected.append("active_episode")
+        diagnostics.append("active_episode_selected_from_moment_v2")
     else:
-        diagnostics.append("active_episode_unavailable_in_moment_v1")
+        diagnostics.append("active_episode_not_selected")
 
     if moment_ids:
         if immediate_recap:
