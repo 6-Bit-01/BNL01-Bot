@@ -19557,8 +19557,9 @@ def prompt_source_basis_failure(
     bases: tuple[PromptSourceBasis, ...],
 ) -> str:
     """Return a fail-closed reason at the last synchronous pre-send boundary."""
+    bases = tuple(bases or ())
     try:
-        for basis in bases or ():
+        for basis in bases:
             _fresh, changed = refresh_prompt_source_basis(basis)
             if changed:
                 return (
@@ -19573,6 +19574,25 @@ def prompt_source_basis_failure(
                 )
     except Exception:
         return "source_revalidation_failed"
+    source_safe_memory_basis = next(
+        (
+            basis
+            for basis in bases
+            if isinstance(basis, MemoryPromptSourceBasis)
+            and basis.source_safe_recall_synthesis
+        ),
+        None,
+    )
+    if source_safe_memory_basis is not None:
+        _record_source_safe_recall_packet_assembled(
+            user_id=source_safe_memory_basis.user_id,
+            guild_id=source_safe_memory_basis.guild_id,
+            conversation_source_count=sum(
+                len(basis.evidence_items)
+                for basis in bases
+                if isinstance(basis, ConversationPromptSourceBasis)
+            ),
+        )
     return ""
 
 
