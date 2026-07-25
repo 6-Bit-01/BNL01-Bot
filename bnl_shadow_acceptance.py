@@ -137,6 +137,30 @@ def _empty_ledger_report() -> Dict[str, Any]:
         "entriesWithMultipleActiveValues": 0,
         "danglingLineageTargets": 0,
         "legacyToLedgerParityMismatches": 0,
+        "knowledgeCandidateSchemaVersion": "absent",
+        "knowledgeCandidateTotalsByType": {},
+        "knowledgeCandidateTotalsByState": {},
+        "knowledgeCandidateTotalsByVisibility": {},
+        "knowledgeCandidateTotalsByAuthority": {},
+        "knowledgeCandidateTotalsByConfidence": {},
+        "knowledgeCandidateTotalsByEpistemicStatus": {},
+        "knowledgeCandidateTotalsByCurrentness": {},
+        "knowledgeCandidateReceiptEvents": {},
+        "knowledgeCandidateRejectionsByReason": {},
+        "knowledgeCandidateInvalidationsByReason": {},
+        "knowledgeCandidateRootKinds": {},
+        "knowledgeCandidateOrphanedRoots": 0,
+        "knowledgeCandidateMissingIndependentRoots": 0,
+        "knowledgeCandidateParticipantIsolationViolations": 0,
+        "knowledgeCandidateDerivativeOnlyRejections": 0,
+        "knowledgeCandidateLiveEligibleCount": 0,
+        "knowledgeCandidateProcessingErrors": 0,
+        "knowledgeCandidateCorrectionDeletePrivacyInvalidations": 0,
+        "knowledgeCandidateBackfill": {
+            "phase": "not_started",
+            "completed": False,
+            "counts": {},
+        },
     }
 
 
@@ -1065,6 +1089,73 @@ def render_v2_shadow_acceptance_lines(snapshot: Mapping[str, Any]) -> List[str]:
             (ledger.get("evidenceWindow") or {}).get("last", "none"),
         ),
         "- ledger_parity_metric: `%s` (`informational`; intentional derived rows are included)" % ledger.get("legacyToLedgerParityMismatches", 0),
+        "- atomic_knowledge: schema=`%s` types=`%s` states=`%s` visibility=`%s` authority=`%s` confidence=`%s` epistemic=`%s` currentness=`%s` roots=`%s` events=`%s` rejected=`%s` invalidated=`%s` orphaned=`%s` missing_independent=`%s` participant_isolation=`%s` derivative_only=`%s` live_eligible=`%s` errors=`%s` privacy_lifecycle=`%s` backfill=`%s`" % (
+            ledger.get("knowledgeCandidateSchemaVersion", "absent"),
+            json.dumps(
+                ledger.get("knowledgeCandidateTotalsByType", {}),
+                sort_keys=True,
+            ),
+            json.dumps(
+                ledger.get("knowledgeCandidateTotalsByState", {}),
+                sort_keys=True,
+            ),
+            json.dumps(
+                ledger.get("knowledgeCandidateTotalsByVisibility", {}),
+                sort_keys=True,
+            ),
+            json.dumps(
+                ledger.get("knowledgeCandidateTotalsByAuthority", {}),
+                sort_keys=True,
+            ),
+            json.dumps(
+                ledger.get("knowledgeCandidateTotalsByConfidence", {}),
+                sort_keys=True,
+            ),
+            json.dumps(
+                ledger.get(
+                    "knowledgeCandidateTotalsByEpistemicStatus",
+                    {},
+                ),
+                sort_keys=True,
+            ),
+            json.dumps(
+                ledger.get("knowledgeCandidateTotalsByCurrentness", {}),
+                sort_keys=True,
+            ),
+            json.dumps(
+                ledger.get("knowledgeCandidateRootKinds", {}),
+                sort_keys=True,
+            ),
+            json.dumps(
+                ledger.get("knowledgeCandidateReceiptEvents", {}),
+                sort_keys=True,
+            ),
+            json.dumps(
+                ledger.get("knowledgeCandidateRejectionsByReason", {}),
+                sort_keys=True,
+            ),
+            json.dumps(
+                ledger.get("knowledgeCandidateInvalidationsByReason", {}),
+                sort_keys=True,
+            ),
+            ledger.get("knowledgeCandidateOrphanedRoots", 0),
+            ledger.get("knowledgeCandidateMissingIndependentRoots", 0),
+            ledger.get(
+                "knowledgeCandidateParticipantIsolationViolations",
+                0,
+            ),
+            ledger.get("knowledgeCandidateDerivativeOnlyRejections", 0),
+            ledger.get("knowledgeCandidateLiveEligibleCount", 0),
+            ledger.get("knowledgeCandidateProcessingErrors", 0),
+            ledger.get(
+                "knowledgeCandidateCorrectionDeletePrivacyInvalidations",
+                0,
+            ),
+            json.dumps(
+                ledger.get("knowledgeCandidateBackfill", {}),
+                sort_keys=True,
+            ),
+        ),
         "- moments: status=`%s` requested=`%s` effective=`%s` eligible=`%s` open=`%s` finalized=`%s` rejected=`%s` active_episodes=`%s` finalized_episodes=`%s` episode_open_loops=`%s` errors=`%s` safety_violations=`%s` window_last=`%s`" % (
             (stages.get("moment_engine") or {}).get("status", "unknown"),
             _on(gates.get("moment_engine_shadow_requested")),
