@@ -875,6 +875,75 @@ class ConversationBatchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertTrue(recorder.call_args.kwargs["response_sent"])
 
+    async def test_batch_adds_unified_moment_canary_only_in_exact_sealed_scope(self):
+        channel = self._channel(8138)
+        prompts = []
+        guard_kwargs = []
+        self._prime_flush(
+            channel,
+            "We need the district to introduce community life.",
+            "BNL, which direction should lead and why?",
+        )
+        canary_env = {
+            "BNL_MEMORY_LEDGER_SHADOW_ENABLED": "true",
+            "BNL_MOMENT_ENGINE_SHADOW_ENABLED": "true",
+            "BNL_MEMORY_GOVERNANCE_SHADOW_ENABLED": "true",
+            "BNL_RELATIONSHIP_V2_SHADOW_ENABLED": "true",
+            "BNL_MEMORY_GOVERNANCE_LIVE_ENABLED": "false",
+            "BNL_RELATIONSHIP_V2_LIVE_ENABLED": "false",
+            "BNL_ACTIVE_ENGAGEMENT_V2_LIVE_ENABLED": "false",
+            "BNL_UNIFIED_RESPONSE_ASSESSMENT_SHADOW_ENABLED": "true",
+            "BNL_UNIFIED_MOMENT_CANARY_ENABLED": "true",
+            "BNL_UNIFIED_MOMENT_CANARY_GUILD_IDS": "7700",
+            "BNL_UNIFIED_MOMENT_CANARY_CHANNEL_IDS": "8138",
+        }
+
+        async def generate(prompt, **_kwargs):
+            prompts.append(prompt)
+            return "Lead with the lived-in neighborhood, then reveal danger."
+
+        async def guarded(response, **kwargs):
+            guard_kwargs.append(kwargs)
+            return response, {
+                "suppressed": False,
+                "scripted_mode_leak_guard_triggered": False,
+                "source_grounding_guard_triggered": False,
+                "regenerated_for_mode_leak": False,
+            }
+
+        with (
+            self._flush_runtime(channel.id, generate),
+            mock.patch.dict(os.environ, canary_env, clear=False),
+            mock.patch.object(bnl01_bot, "DB_FILE", ":memory:"),
+            mock.patch.object(
+                bnl01_bot,
+                "apply_guarded_response_regeneration",
+                new=mock.AsyncMock(side_effect=guarded),
+            ),
+        ):
+            await bnl01_bot._flush_channel_buffer(channel)
+
+        self.assertEqual(len(prompts), 1)
+        self.assertIn(
+            "SEALED UNIFIED CONVERSATION CANARY",
+            prompts[0],
+        )
+        self.assertEqual(len(guard_kwargs), 1)
+        canary_bases = tuple(
+            basis
+            for basis in guard_kwargs[0]["prompt_source_bases"]
+            if isinstance(
+                basis,
+                bnl01_bot.UnifiedMomentCanaryPromptSourceBasis,
+            )
+        )
+        self.assertEqual(len(canary_bases), 1)
+        self.assertEqual(canary_bases[0].channel_id, channel.id)
+        self.assertEqual(
+            channel.sent,
+            ["Lead with the lived-in neighborhood, then reveal danger."],
+        )
+
     async def test_batched_repair_turn_uses_visible_context_generation_not_canned_reply(self):
         channel = self._channel(8116)
         prompts = []

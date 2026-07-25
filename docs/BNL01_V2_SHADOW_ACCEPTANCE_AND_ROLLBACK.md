@@ -184,6 +184,55 @@ All live gates must remain off throughout the entire acceptance pass:
 Enabling any live gate blocks acceptance immediately. The reporting code does
 not set these variables and does not provide an automatic activation path.
 
+## Unified Assessment + Moment sealed response canary
+
+`BNL_UNIFIED_MOMENT_CANARY_ENABLED` is a separately scoped,
+response-changing canary for normal conversation in a sealed test channel. It
+defaults off and does not authorize public use. Deploying the code alone does
+not enable it.
+
+The canary fails closed unless all of the following are true:
+
+- `BNL_UNIFIED_MOMENT_CANARY_ENABLED=true`;
+- exactly one guild is listed in `BNL_UNIFIED_MOMENT_CANARY_GUILD_IDS`;
+- exactly one channel is listed in `BNL_UNIFIED_MOMENT_CANARY_CHANNEL_IDS`;
+- the route policy is `sealed_test` and the route is normal chat or a direct
+  payload;
+- the Ledger, Moment, Governance, and Relationship shadow prerequisites for
+  the Unified Response Assessment are effective; and
+- Memory Governance, Relationship v2, and Active Engagement v2 live gates are
+  all off.
+
+When scoped, the canary renders the current Unified Assessment as a bounded
+semantic brief, including selected same-channel speaker labels when attribution
+matters. Any active episode contributes only a same-channel, content-free
+aggregate such as topic family, participant count, semantic roles, and
+open-loop count. The episode aggregate does not render source text, names,
+Discord IDs, Moment IDs, episode IDs, or durable memory. Every linked Moment,
+source, visibility boundary, correction, deletion, lineage edge, and canonical
+Ledger projection is revalidated before use and again before send.
+
+The response guard checks that the answer follows the current objective,
+attributed criteria, required conversational act, and answer shape; that its
+conclusion agrees with its reasoning; and that internal canary labels are not
+exposed. One guarded regeneration is allowed. A second failure is suppressed.
+Public, private, and non-allowlisted prompt construction is byte-identical
+whether this canary flag is on or off.
+
+The owner diagnostic reports content-free canary runs, active-episode context
+runs, guard triggers and repairs, internal-label guards, and invalid-scope
+runs. Any invalid-scope run, source-boundary violation, internal-label leak, or
+unrepaired contradiction is a stop condition.
+
+Rollback is environment-only: set
+`BNL_UNIFIED_MOMENT_CANARY_ENABLED=false`, restart the bot, and confirm that
+new diagnostic runs no longer increment the canary counter. Keep the shadow
+layers running for diagnosis unless their own evidence requires rollback.
+Turning this sealed canary off does not delete its aggregate receipts. A
+successful sealed observation authorizes only an owner decision about a later,
+separately reviewed public route; it never promotes sealed data or behavior
+automatically.
+
 ## Moment gist response canary
 
 `BNL_MOMENT_GIST_CANARY_ENABLED` is a separate, response-changing canary. It is
@@ -480,19 +529,20 @@ Journal, Relay, Ambient, dossier, or summary prose cannot confirm a fact.
 Rollback disables gates in reverse dependency order, restarts the bot, and
 preserves the shadow tables for diagnosis:
 
-1. `BNL_MOMENT_GIST_CANARY_ENABLED`
-2. `BNL_ACTIVE_ENGAGEMENT_V2_LIVE_ENABLED`
-3. `BNL_RELATIONSHIP_V2_LIVE_ENABLED`
-4. `BNL_MEMORY_GOVERNANCE_LIVE_ENABLED`
-5. `BNL_RELATIONSHIP_V2_SHADOW_ENABLED`
-6. `BNL_MEMORY_GOVERNANCE_SHADOW_ENABLED`
-7. `BNL_MOMENT_ENGINE_SHADOW_ENABLED`
-8. `BNL_MEMORY_LEDGER_SHADOW_ENABLED`
+1. `BNL_UNIFIED_MOMENT_CANARY_ENABLED`
+2. `BNL_MOMENT_GIST_CANARY_ENABLED`
+3. `BNL_ACTIVE_ENGAGEMENT_V2_LIVE_ENABLED`
+4. `BNL_RELATIONSHIP_V2_LIVE_ENABLED`
+5. `BNL_MEMORY_GOVERNANCE_LIVE_ENABLED`
+6. `BNL_RELATIONSHIP_V2_SHADOW_ENABLED`
+7. `BNL_MEMORY_GOVERNANCE_SHADOW_ENABLED`
+8. `BNL_MOMENT_ENGINE_SHADOW_ENABLED`
+9. `BNL_MEMORY_LEDGER_SHADOW_ENABLED`
 
-The Moment gist canary is first because it is the only new response-changing
-path described in this document. The live gates should already be off; listing
-them makes the emergency rollback order explicit. After changing the
-environment, restart the bot and re-run the read-only diagnostic.
+The two canaries are first because they are the response-changing paths
+described in this document. The live gates should already be off; listing them
+makes the emergency rollback order explicit. After changing the environment,
+restart the bot and re-run the read-only diagnostic.
 
 For a stage-local failure, disable that stage and do not start later stages.
 Earlier accepted shadow layers may remain on for continued observation:
