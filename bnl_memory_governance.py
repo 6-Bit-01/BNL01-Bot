@@ -462,6 +462,7 @@ def persist_shadow_diagnostics(conn: sqlite3.Connection, req: GovernanceRequest,
     # marker. Keeping that operation in one layer preserves any unmatched
     # remainder as a fail-closed blocker.
     aggregate_diagnostics = {
+        "route_policy": dict(result.diagnostics.route_policy),
         "selected_by_source": dict(result.diagnostics.selected_by_source),
         "invalid_invariant_counts": invalid_invariant_counts,
         "fallback_reason": str(result.diagnostics.fallback_reason or "")[:120],
