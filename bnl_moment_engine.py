@@ -32,6 +32,7 @@ EPISODE_SCHEMA_VERSION = "memory_moment_episode_v2"
 REMEMBERED_NUMBER_QUARANTINE_MIGRATION = "remembered_number_quarantine_v1"
 SAFE_MOMENT_PROJECTION_MIGRATION = "safe_moment_projection_v1"
 MOMENT_CONTRIBUTION_BACKFILL_MIGRATION = "moment_contribution_backfill_v1"
+LEGACY_MOMENT_RECONSTRUCTION_MIGRATION = "legacy_moment_reconstruction_v1"
 EPISODIC_LIFECYCLE_MIGRATION = "episodic_lifecycle_v2"
 MAX_WINDOW_SECONDS = 5 * 60
 INACTIVITY_SECONDS = 2 * 60
@@ -380,6 +381,11 @@ _ATTRIBUTION_REQUEST_PATTERNS = (
         re.I,
     ),
 )
+_RECALL_TOPIC_FOCUS_RE = re.compile(
+    r"\b(?:discussion|conversation|exchange|thread|memory|point)?\s*"
+    r"about\s+(?P<topic>[^.?!\n]{1,160})(?=[.?!\n]|$)",
+    re.I,
+)
 _DISCORD_MENTION_RE = re.compile(r"<@!?(\d+)>")
 _SAFE_CONTRIBUTION_TOKEN_RE = re.compile(r"[a-z][a-z'-]{2,30}", re.I)
 _CONTRIBUTION_STOP = STOP | {
@@ -615,6 +621,49 @@ _SEMANTIC_CONCEPT_STOP = _CONTRIBUTION_STOP | {
     "versus",
     "while",
 }
+_QUESTION_THREAD_INTENT_RE = re.compile(
+    r"\?|"
+    r"\b(?:am\s+i|are\s+we|is\s+(?:it|this|that)|"
+    r"why|whether|how\s+(?:can|could|do|does|is|are)|"
+    r"questions?\s+about)\b",
+    re.I,
+)
+_QUESTION_THREAD_FILLER = frozenset(
+    {
+        "even",
+        "great",
+        "if",
+        "leads",
+        "like",
+        "more",
+        "not",
+        "oh",
+        "questions",
+        "said",
+        "saying",
+        "so",
+        "then",
+        "which",
+    }
+)
+_QUESTION_THREAD_CONCEPT_PATTERNS = (
+    (re.compile(r"\bdream(?:s|ed|ing)?\b", re.I), "dreaming"),
+    (
+        re.compile(r"\b(?:alive|living|exist(?:s|ed|ing|ence)?)\b", re.I),
+        "being alive",
+    ),
+    (
+        re.compile(
+            r"\b(?:program(?:s|med|ming)?|coded)\b.{0,80}"
+            r"\b(?:identity|authentic(?:ity)?|myself|me)\b|"
+            r"\b(?:identity|authentic(?:ity)?|myself)\b.{0,80}"
+            r"\b(?:program(?:s|med|ming)?|coded)\b",
+            re.I,
+        ),
+        "programmed identity",
+    ),
+    (re.compile(r"\b(?:anxiety|anxious)\b", re.I), "anxiety"),
+)
 
 
 @dataclass(frozen=True)
@@ -681,6 +730,61 @@ def _make_semantic_frame(
         if not secondary:
             return None
     return ContributionSemanticFrame(frame_type, primary, secondary)
+
+
+def _question_thread_concepts(source: SourceEntry) -> tuple[str, ...]:
+    text = re.sub(r"\s+", " ", str(source.normalized_value or "")).strip()
+    if (
+        not text
+        or not _QUESTION_THREAD_INTENT_RE.search(text)
+        or _contains_sensitive_moment_source(text, source.predicate_key)
+    ):
+        return ()
+    recognized = sorted(
+        (
+            (match.start(), label)
+            for pattern, label in _QUESTION_THREAD_CONCEPT_PATTERNS
+            if (match := pattern.search(text))
+        ),
+        key=lambda item: item[0],
+    )
+    if recognized:
+        return tuple(dict.fromkeys(label for _offset, label in recognized))
+    return tuple(
+        concept
+        for concept in _semantic_concepts(
+            text,
+            source,
+            minimum=1,
+            maximum=4,
+        )
+        if concept not in _QUESTION_THREAD_FILLER
+    )
+
+
+def _build_question_thread_semantic_frame(
+    rows: list[SourceEntry],
+) -> ContributionSemanticFrame | None:
+    """Synthesize one source-backed theme from a sustained question sequence."""
+    if len(rows) < 3 or any(
+        not _QUESTION_THREAD_INTENT_RE.search(row.normalized_value or "")
+        for row in rows
+    ):
+        return None
+    concepts: list[str] = []
+    for source in rows:
+        source_concepts = _question_thread_concepts(source)
+        if not source_concepts:
+            return None
+        for concept in source_concepts:
+            if concept not in concepts:
+                concepts.append(concept)
+    if len(concepts) < 3:
+        return None
+    return ContributionSemanticFrame(
+        "question_thread",
+        tuple(concepts[:6]),
+    )
 
 
 def _parse_contribution_semantic_frame(
@@ -914,6 +1018,7 @@ _SEMANTIC_FRAME_PRIORITY = {
     "plan": 35,
     "proposal": 30,
     "agreement": 25,
+    "question_thread": 22,
     "question": 20,
     "observation": 10,
     "topic_observation": 5,
@@ -994,7 +1099,7 @@ def _semantic_concept_text(concepts: tuple[str, ...]) -> str:
         return concepts[0]
     if len(concepts) == 2:
         return f"{concepts[0]} and {concepts[1]}"
-    return f"{concepts[0]}, {concepts[1]}, and {concepts[2]}"
+    return f"{', '.join(concepts[:-1])}, and {concepts[-1]}"
 
 
 def _render_contribution_semantic_frame(
@@ -1069,6 +1174,11 @@ def _render_contribution_semantic_frame(
             "The participant raised a question centered on "
             f"{primary}."
         )
+    if frame.frame_type == "question_thread":
+        return (
+            "The participant explored connected questions involving "
+            f"{primary}."
+        )
     if frame.frame_type == "observation":
         return (
             "The participant reported an observation centered on "
@@ -1103,7 +1213,10 @@ def _build_contribution_projection(
         for row in rows
     ):
         return "", ""
-    frame = _select_contribution_semantic_frame(rows)
+    frame = (
+        _build_question_thread_semantic_frame(rows)
+        or _select_contribution_semantic_frame(rows)
+    )
     if frame is None:
         return "", ""
     # A neutral sentence without an explicit semantic frame is too weak to
@@ -1171,6 +1284,15 @@ def _parse_attribution_request(text: str) -> AttributionRequest:
             exact_authority_requested=exact,
         )
     return AttributionRequest(exact_authority_requested=exact)
+
+
+def _recall_topic_focus(text: str) -> str:
+    value = re.sub(r"\s+", " ", str(text or "")).strip()
+    matches = list(_RECALL_TOPIC_FOCUS_RE.finditer(value))
+    if not matches:
+        return value
+    focused = str(matches[-1].group("topic") or "").strip(" \t,;:-")
+    return focused or value
 
 
 def _coherent(family: str, signature: tuple[str, ...], window_family: str, window_signature: tuple[str, ...]) -> bool:
@@ -1313,6 +1435,12 @@ def ensure_moment_schema(conn: sqlite3.Connection) -> None:
       reason_code TEXT DEFAULT '', ledger_entry_id TEXT DEFAULT '', created_at TEXT NOT NULL)""")
     cur.execute("""CREATE TABLE IF NOT EXISTS memory_moment_migrations (
       migration_key TEXT PRIMARY KEY, applied_at TEXT NOT NULL)""")
+    cur.execute("""CREATE TABLE IF NOT EXISTS memory_moment_reconstructions (
+      legacy_moment_id TEXT NOT NULL, reconstruction_version TEXT NOT NULL,
+      reconstructed_moment_id TEXT DEFAULT '', source_digest TEXT DEFAULT '',
+      outcome TEXT NOT NULL, reason_code TEXT NOT NULL,
+      created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+      PRIMARY KEY(legacy_moment_id, reconstruction_version))""")
     for sql in [
         "CREATE INDEX IF NOT EXISTS idx_mmw_scope ON memory_moment_windows(guild_id, channel_id, lifecycle_status, last_activity_at)",
         "CREATE INDEX IF NOT EXISTS idx_mmw_canonical ON memory_moment_windows(guild_id, canonical_ledger_entry_id)",
@@ -1327,6 +1455,7 @@ def ensure_moment_schema(conn: sqlite3.Connection) -> None:
         "CREATE INDEX IF NOT EXISTS idx_mmee_source ON memory_moment_episode_events(ledger_entry_id, episode_id, lifecycle_status)",
         "CREATE INDEX IF NOT EXISTS idx_mmel_target ON memory_moment_episode_lineage(to_episode_id, relation_type)",
         "CREATE INDEX IF NOT EXISTS idx_mmd_guild ON memory_moment_diagnostics(guild_id, event_type, reason_code)",
+        "CREATE INDEX IF NOT EXISTS idx_mmr_reconstructed ON memory_moment_reconstructions(reconstructed_moment_id, outcome)",
     ]:
         cur.execute(sql)
     cur.execute(
@@ -1490,6 +1619,16 @@ def ensure_moment_schema(conn: sqlite3.Connection) -> None:
             "INSERT OR IGNORE INTO memory_moment_migrations VALUES(?,?)",
             (MOMENT_CONTRIBUTION_BACKFILL_MIGRATION, _now()),
         )
+    if not cur.execute(
+        "SELECT 1 FROM memory_moment_migrations WHERE migration_key=?",
+        (LEGACY_MOMENT_RECONSTRUCTION_MIGRATION,),
+    ).fetchone():
+        reconstruction = reconstruct_legacy_moments(conn)
+        if int(reconstruction.get("errors", 0) or 0) == 0:
+            cur.execute(
+                "INSERT OR IGNORE INTO memory_moment_migrations VALUES(?,?)",
+                (LEGACY_MOMENT_RECONSTRUCTION_MIGRATION, _now()),
+            )
     if not cur.execute(
         "SELECT 1 FROM memory_moment_migrations WHERE migration_key=?",
         (EPISODIC_LIFECYCLE_MIGRATION,),
@@ -1764,6 +1903,349 @@ def quarantine_legacy_unsafe_moment_projections(
                     str(participant_role),
                 ),
             ).rowcount
+    return counts
+
+
+def stable_reconstructed_moment_id(legacy_moment_id: str) -> str:
+    return "mom_" + hashlib.sha256(
+        (
+            f"{MOMENT_SCHEMA_VERSION}\x1f"
+            f"{LEGACY_MOMENT_RECONSTRUCTION_MIGRATION}\x1f"
+            f"{legacy_moment_id}"
+        ).encode("utf-8")
+    ).hexdigest()[:32]
+
+
+def _record_legacy_moment_reconstruction(
+    conn: sqlite3.Connection,
+    *,
+    legacy_moment_id: str,
+    reconstructed_moment_id: str = "",
+    source_digest: str = "",
+    outcome: str,
+    reason_code: str,
+) -> None:
+    now = _now()
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO memory_moment_reconstructions(
+          legacy_moment_id,reconstruction_version,reconstructed_moment_id,
+          source_digest,outcome,reason_code,created_at,updated_at
+        ) VALUES(?,?,?,?,?,?,?,?)
+        """,
+        (
+            legacy_moment_id,
+            LEGACY_MOMENT_RECONSTRUCTION_MIGRATION,
+            reconstructed_moment_id,
+            source_digest,
+            outcome,
+            reason_code,
+            now,
+            now,
+        ),
+    )
+
+
+def reconstruct_legacy_moments(
+    conn: sqlite3.Connection,
+) -> dict[str, int]:
+    """Build new safe Moments from preserved sources without reviving old rows."""
+    conn.execute("""CREATE TABLE IF NOT EXISTS memory_moment_reconstructions (
+      legacy_moment_id TEXT NOT NULL, reconstruction_version TEXT NOT NULL,
+      reconstructed_moment_id TEXT DEFAULT '', source_digest TEXT DEFAULT '',
+      outcome TEXT NOT NULL, reason_code TEXT NOT NULL,
+      created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+      PRIMARY KEY(legacy_moment_id, reconstruction_version))""")
+    counts = {
+        "considered": 0,
+        "reconstructed": 0,
+        "deduplicated": 0,
+        "skipped": 0,
+        "errors": 0,
+        "contributions": 0,
+    }
+    candidates = conn.execute(
+        """
+        SELECT moment_id,guild_id,channel_id,channel_name,channel_policy,
+               route_mode,window_started_at,last_activity_at,visibility
+        FROM memory_moment_windows
+        WHERE lifecycle_status='retracted'
+          AND qualification_reason='legacy_extractive_projection'
+        ORDER BY window_started_at,moment_id
+        """
+    ).fetchall()
+    for candidate in candidates:
+        legacy_moment_id = str(candidate[0] or "")
+        counts["considered"] += 1
+        prior_audit = conn.execute(
+            """
+            SELECT outcome FROM memory_moment_reconstructions
+            WHERE legacy_moment_id=? AND reconstruction_version=?
+            """,
+            (
+                legacy_moment_id,
+                LEGACY_MOMENT_RECONSTRUCTION_MIGRATION,
+            ),
+        ).fetchone()
+        if prior_audit:
+            if str(prior_audit[0] or "") != "error":
+                counts["deduplicated"] += 1
+                continue
+            conn.execute(
+                """
+                DELETE FROM memory_moment_reconstructions
+                WHERE legacy_moment_id=? AND reconstruction_version=?
+                """,
+                (
+                    legacy_moment_id,
+                    LEGACY_MOMENT_RECONSTRUCTION_MIGRATION,
+                ),
+            )
+
+        rows = _entries(conn, legacy_moment_id)
+        digest = _source_digest(rows)
+        reconstructed_moment_id = stable_reconstructed_moment_id(
+            legacy_moment_id
+        )
+
+        def skip(reason_code: str) -> None:
+            _record_legacy_moment_reconstruction(
+                conn,
+                legacy_moment_id=legacy_moment_id,
+                source_digest=digest,
+                outcome="skipped",
+                reason_code=reason_code,
+            )
+            counts["skipped"] += 1
+
+        existing = conn.execute(
+            """
+            SELECT lifecycle_status FROM memory_moment_windows
+            WHERE moment_id=?
+            """,
+            (reconstructed_moment_id,),
+        ).fetchone()
+        if existing:
+            if (
+                str(existing[0] or "") == "finalized"
+                and _source_digest(
+                    _entries(conn, reconstructed_moment_id)
+                )
+                == digest
+            ):
+                _record_legacy_moment_reconstruction(
+                    conn,
+                    legacy_moment_id=legacy_moment_id,
+                    reconstructed_moment_id=reconstructed_moment_id,
+                    source_digest=digest,
+                    outcome="reconstructed",
+                    reason_code="existing_exact_reconstruction",
+                )
+                counts["deduplicated"] += 1
+            else:
+                _record_legacy_moment_reconstruction(
+                    conn,
+                    legacy_moment_id=legacy_moment_id,
+                    reconstructed_moment_id=reconstructed_moment_id,
+                    source_digest=digest,
+                    outcome="error",
+                    reason_code="reconstruction_id_conflict",
+                )
+                counts["errors"] += 1
+            continue
+
+        (
+            _old_moment_id,
+            guild_id,
+            channel_id,
+            channel_name,
+            channel_policy,
+            route_mode,
+            window_started_at,
+            last_activity_at,
+            visibility,
+        ) = candidate
+        guild_id = int(guild_id or 0)
+        channel_id = int(channel_id or 0)
+        channel_name = str(channel_name or "")
+        channel_policy = str(channel_policy or "unknown")
+        route_mode = str(route_mode or "unknown")
+        visibility = str(visibility or "unknown")
+        public_usable = bool(
+            rows
+            and visibility in {"public", "public_safe"}
+            and all(
+                row.visibility in {"public", "public_safe"}
+                for row in rows
+            )
+            and all(
+                row.public_usable
+                for row in rows
+                if row.is_human
+            )
+        )
+        source_failure, _failure_lifecycle = _moment_source_failure(
+            conn,
+            moment_id=legacy_moment_id,
+            rows=rows,
+            guild_id=guild_id,
+            channel_id=channel_id,
+            channel_policy=channel_policy,
+            route_mode=route_mode,
+            visibility=visibility,
+            public_usable=public_usable,
+        )
+        if source_failure:
+            skip(source_failure)
+            continue
+        if not public_usable:
+            skip("legacy_sources_not_public_usable")
+            continue
+        qtype, reason, humans, _models = _qualify(rows)
+        if not qtype:
+            skip(reason)
+            continue
+        family, signature, topic_key = _topic_projection(rows)
+        summary = _summary(rows, qtype, reason)
+        if (
+            not signature
+            or not _topic_signature_is_non_extractive(
+                _json_sig(signature)
+            )
+            or not _is_safe_gist_summary(summary)
+        ):
+            skip("safe_projection_unavailable")
+            continue
+
+        try:
+            conn.execute("SAVEPOINT legacy_moment_reconstruction")
+            now = _now()
+            conn.execute(
+                """
+                INSERT INTO memory_moment_windows(
+                  moment_id,guild_id,channel_id,channel_name,channel_policy,
+                  route_mode,topic_key,topic_family,topic_signature,
+                  window_started_at,last_activity_at,lifecycle_status,
+                  visibility,public_usable,created_at,updated_at
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    reconstructed_moment_id,
+                    guild_id,
+                    channel_id,
+                    channel_name,
+                    channel_policy,
+                    route_mode,
+                    topic_key,
+                    family,
+                    _json_sig(signature),
+                    str(window_started_at or _now()),
+                    str(last_activity_at or window_started_at or _now()),
+                    "open",
+                    visibility,
+                    1,
+                    now,
+                    now,
+                ),
+            )
+            for source in rows:
+                _insert_membership(
+                    conn,
+                    reconstructed_moment_id,
+                    source,
+                    _meaningful(
+                        source.normalized_value,
+                        source.source_role,
+                        source.predicate_key,
+                    ),
+                    _topic_family(
+                        source.normalized_value,
+                        source.predicate_key,
+                    ),
+                    _topic_signature(
+                        source.normalized_value,
+                        source.predicate_key,
+                    ),
+                )
+            _recount(conn, reconstructed_moment_id)
+            finalization = finalize_moment(
+                conn,
+                reconstructed_moment_id,
+                ensure_schema=False,
+            )
+            rebuilt = conn.execute(
+                """
+                SELECT lifecycle_status,public_usable,
+                       canonical_ledger_entry_id
+                FROM memory_moment_windows WHERE moment_id=?
+                """,
+                (reconstructed_moment_id,),
+            ).fetchone()
+            if (
+                finalization.outcome
+                not in {"inserted", "deduplicated", "active"}
+                or not rebuilt
+                or str(rebuilt[0] or "") != "finalized"
+                or not bool(rebuilt[1])
+                or not str(rebuilt[2] or "")
+            ):
+                raise ValueError(
+                    f"reconstruction_finalization_failed:"
+                    f"{finalization.reason_code}"
+                )
+            canonical_entry_id = str(rebuilt[2])
+            inserted_contributions = int(
+                conn.execute(
+                    """
+                    SELECT COUNT(*) FROM memory_moment_contributions
+                    WHERE moment_id=?
+                    """,
+                    (reconstructed_moment_id,),
+                ).fetchone()[0]
+            )
+            _record_legacy_moment_reconstruction(
+                conn,
+                legacy_moment_id=legacy_moment_id,
+                reconstructed_moment_id=reconstructed_moment_id,
+                source_digest=digest,
+                outcome="reconstructed",
+                reason_code="eligible_sources_rebuilt",
+            )
+            _diag(
+                conn,
+                guild_id,
+                "legacy_moment_reconstructed",
+                "eligible_sources_rebuilt",
+                reconstructed_moment_id,
+                canonical_entry_id,
+            )
+            observe_finalized_moment_episode(
+                conn,
+                reconstructed_moment_id,
+                require_shadow_gate=False,
+            )
+            conn.execute("RELEASE legacy_moment_reconstruction")
+            counts["reconstructed"] += 1
+            counts["contributions"] += inserted_contributions
+        except Exception:
+            try:
+                conn.execute(
+                    "ROLLBACK TO legacy_moment_reconstruction"
+                )
+                conn.execute(
+                    "RELEASE legacy_moment_reconstruction"
+                )
+            except Exception:
+                pass
+            _record_legacy_moment_reconstruction(
+                conn,
+                legacy_moment_id=legacy_moment_id,
+                reconstructed_moment_id=reconstructed_moment_id,
+                source_digest=digest,
+                outcome="error",
+                reason_code="reconstruction_exception",
+            )
+            counts["errors"] += 1
     return counts
 
 
@@ -2126,15 +2608,62 @@ def _qualify(rows: list[SourceEntry]) -> tuple[str, str, list[SourceEntry], list
     return "", "low_signal_or_insufficient_continuity", humans, models
 
 
-def _summary(rows: list[SourceEntry], qtype: str, reason: str) -> str:
-    del reason
-    families = {
-        _topic_family(row.normalized_value, row.predicate_key)
+def _topic_projection(
+    rows: list[SourceEntry],
+) -> tuple[str, tuple[str, ...], str]:
+    human_rows = [
+        row
         for row in rows
         if row.is_human
+        and _meaningful(
+            row.normalized_value,
+            row.source_role,
+            row.predicate_key,
+        )
+    ]
+    families = {
+        _topic_family(row.normalized_value, row.predicate_key)
+        for row in human_rows
     }
-    known_families = sorted(family for family in families if family != "low_signal")
-    family = known_families[0] if len(known_families) == 1 else "topic_other"
+    known_families = sorted(
+        family for family in families if family != "low_signal"
+    )
+    family = (
+        known_families[0]
+        if len(known_families) == 1
+        else "topic_other"
+    )
+    source_signatures = {
+        token
+        for row in human_rows
+        for token in _topic_signature(
+            row.normalized_value,
+            row.predicate_key,
+        )
+    }
+    semantic_signatures: set[str] = set()
+    participants: dict[str, list[SourceEntry]] = {}
+    for row in human_rows:
+        participants.setdefault(row.subject_key, []).append(row)
+    for participant_rows in participants.values():
+        frame = _build_question_thread_semantic_frame(participant_rows)
+        if frame is None:
+            continue
+        semantic_signatures.update(
+            _topic_signature(" ".join(frame.primary), "conversation")
+        )
+    signature = tuple(
+        (
+            sorted(semantic_signatures)
+            + sorted(source_signatures - semantic_signatures)
+        )[:24]
+    )
+    return family, signature, _topic_key(family, signature)
+
+
+def _summary(rows: list[SourceEntry], qtype: str, reason: str) -> str:
+    del reason
+    family, _signature, _topic_key_value = _topic_projection(rows)
     topic_label = TOPIC_GIST_LABELS.get(family, TOPIC_GIST_LABELS["topic_other"])
     if qtype == "shared_activity":
         return (
@@ -2197,13 +2726,23 @@ def _moment_source_failure(
     if member_count != len(rows):
         return "dangling_source", "needs_review"
     for source in rows:
-        if _contains_sensitive_moment_source(
+        if source.is_human and _contains_sensitive_moment_source(
             source.normalized_value,
             source.predicate_key,
         ):
             return "sensitive_source_excluded", "retracted"
         if source.lifecycle_status not in SOURCE_LIFECYCLES_USABLE_FOR_MOMENTS:
             return "source_lifecycle_not_usable", "needs_review"
+        if conn.execute(
+            """
+            SELECT 1 FROM memory_ledger_lineage
+            WHERE guild_id=? AND target_entry_id=?
+              AND lineage_type IN ('correction_of','supersedes','retracts')
+            LIMIT 1
+            """,
+            (source.guild_id, source.entry_id),
+        ).fetchone():
+            return "source_superseded_or_retracted", "needs_review"
         if source.source_table != "conversations" or source.entry_type not in {
             "observation",
             "derived_summary",
@@ -3814,8 +4353,14 @@ def render_active_episode_canary_context(
     )
 
 
-def finalize_moment(conn: sqlite3.Connection, moment_id: str) -> MomentObservationResult:
-    ensure_moment_schema(conn)
+def finalize_moment(
+    conn: sqlite3.Connection,
+    moment_id: str,
+    *,
+    ensure_schema: bool = True,
+) -> MomentObservationResult:
+    if ensure_schema:
+        ensure_moment_schema(conn)
     win = conn.execute(
         "SELECT guild_id,channel_id,channel_name,channel_policy,route_mode,topic_key,window_started_at,last_activity_at,visibility,public_usable,lifecycle_status,canonical_ledger_entry_id FROM memory_moment_windows WHERE moment_id=?",
         (moment_id,),
@@ -3872,13 +4417,14 @@ def finalize_moment(conn: sqlite3.Connection, moment_id: str) -> MomentObservati
     source_ids = [r.entry_id for r in rows]
     participant_count = len({r.subject_key for r in humans})
     salience = min(1.0, 0.15 + 0.10 * len(humans) + 0.10 * participant_count + (0.08 if qtype == "conversational" else 0.12))
+    topic_family, topic_signature, topic_key = _topic_projection(rows)
     summary = _summary(rows, qtype, reason)
     participants = [LedgerParticipant(p[0], p[1] or "", p[2], int(p[3] or 0)) for p in conn.execute("SELECT participant_key,safe_display_name,participant_role,participation_order FROM memory_moment_participants WHERE moment_id=? ORDER BY participation_order,participant_key", (moment_id,)).fetchall()]
     visibility = win[8] or "unknown"
     public_usable = bool(win[9]) and VIS_RANK.get(visibility, 5) <= VIS_RANK.get("public_safe", 0)
     value = json.dumps({
         "schema": MOMENT_SCHEMA_VERSION, "moment_id": moment_id, "summary": summary, "window_started_at": win[6], "last_activity_at": win[7],
-        "topic_key": win[5], "qualification_type": qtype, "qualification_reason": reason, "salience": salience,
+        "topic_key": topic_key, "qualification_type": qtype, "qualification_reason": reason, "salience": salience,
         "participant_scope": "separate_audited_records", "public_usable": public_usable, "lifecycle_status": "finalized", "source_revision": "1",
     }, sort_keys=True)
     entry = LedgerEntry(
@@ -3896,10 +4442,23 @@ def finalize_moment(conn: sqlite3.Connection, moment_id: str) -> MomentObservati
         conn.execute("INSERT OR IGNORE INTO memory_ledger_lineage VALUES(?,?,?,?,?)", (source_id, int(win[0] or 0), "part_of_moment", moment_entry_id, _now()))
     conn.execute(
         """
-        UPDATE memory_moment_windows SET lifecycle_status='finalized', finalized_at=?, qualification_type=?, qualification_reason=?,
+        UPDATE memory_moment_windows SET topic_key=?,topic_family=?,topic_signature=?,
+            lifecycle_status='finalized', finalized_at=?, qualification_type=?, qualification_reason=?,
             salience=?, summary=?, canonical_ledger_entry_id=?, updated_at=? WHERE moment_id=?
         """,
-        (_now(), qtype, reason, salience, summary, moment_entry_id, _now(), moment_id),
+        (
+            topic_key,
+            topic_family,
+            _json_sig(topic_signature),
+            _now(),
+            qtype,
+            reason,
+            salience,
+            summary,
+            moment_entry_id,
+            _now(),
+            moment_id,
+        ),
     )
     _replace_moment_contributions(
         conn,
@@ -4252,7 +4811,7 @@ def render_shadow_moment_context(
     relevance_text = (
         attribution.topic_text
         if attribution.requested
-        else topic_text
+        else _recall_topic_focus(topic_text)
     )
     family = _topic_family(relevance_text, "conversation")
     signature = _topic_signature(relevance_text, "conversation")
