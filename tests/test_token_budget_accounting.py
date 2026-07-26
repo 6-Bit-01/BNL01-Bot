@@ -63,7 +63,7 @@ class TokenBudgetAccountingTests(unittest.TestCase):
             total = bnl01_bot.record_generation_token_usage(
                 provider_response(),
                 route="bnl_memory_preview_candidate",
-                model="gemini-2.5-flash",
+                model="gemini-3.6-flash",
             )
             diagnostics = bnl01_bot.get_usage_breakdown()
 
@@ -99,7 +99,7 @@ class TokenBudgetAccountingTests(unittest.TestCase):
             (
                 "2026-07-26",
                 "bnl_memory_preview_candidate",
-                "gemini-2.5-flash",
+                "gemini-3.6-flash",
                 100,
                 20,
                 30,
@@ -199,17 +199,16 @@ class TokenBudgetAccountingTests(unittest.TestCase):
             )
             diagnostics = bnl01_bot.get_usage_breakdown()
 
-        self.assertIs(returned, response)
+        self.assertIs(returned.raw_response, response)
+        self.assertEqual(returned.model_name, bnl01_bot.GEMINI_MODEL)
+        self.assertFalse(returned.fallback_used)
         call = fake_client.models.generate_content.call_args
         config = call.kwargs["config"]
         self.assertEqual(
             config.max_output_tokens,
-            bnl01_bot.BNL_GEMINI_MAX_OUTPUT_TOKENS,
+            bnl01_bot.policy_for_route("normal_chat").max_output_tokens,
         )
-        self.assertEqual(
-            config.thinking_config.thinking_budget,
-            bnl01_bot.BNL_GEMINI_THINKING_BUDGET,
-        )
+        self.assertIsNone(config.thinking_config)
         self.assertEqual(diagnostics["total_tokens"], 75)
         self.assertEqual(diagnostics["tracked_calls"], 1)
         self.assertEqual(diagnostics["routes"][0]["route"], "normal_chat")
@@ -233,7 +232,7 @@ class TokenBudgetAccountingTests(unittest.TestCase):
             bnl01_bot.record_generation_token_usage(
                 response,
                 route="normal_chat",
-                model="gemini-2.5-flash",
+                model="gemini-3.6-flash",
                 fallback_total=2_500,
             )
             diagnostics = bnl01_bot.get_usage_breakdown()
@@ -262,16 +261,21 @@ class TokenBudgetAccountingTests(unittest.TestCase):
             "_pacific_usage_date",
             return_value=today,
         ):
-            self.assertTrue(bnl01_bot.check_quota_availability())
+            self.assertTrue(
+                bnl01_bot.check_quota_availability(bnl01_bot.JOURNAL_ROUTE)
+            )
+            self.assertFalse(
+                bnl01_bot.check_quota_availability("normal_chat")
+            )
             with self.assertRaises(
                 bnl01_bot.LocalModelBudgetExhausted
             ):
-                bnl01_bot.reserve_local_model_budget("small prompt")
+                bnl01_bot.reserve_local_model_budget("small prompt", "normal_chat")
         self.assertEqual(bnl01_bot._token_budget_reserved_tokens, 0)
 
     def test_inflight_reservation_prevents_concurrent_oversubscription(self):
         prompt = "small prompt"
-        reservation = bnl01_bot._estimated_generation_reservation(prompt)
+        reservation = bnl01_bot._estimated_generation_reservation(prompt, "normal_chat")
         with (
             mock.patch.object(
                 bnl01_bot,
@@ -284,14 +288,96 @@ class TokenBudgetAccountingTests(unittest.TestCase):
                 reservation * 2 - 1,
             ),
         ):
-            first = bnl01_bot.reserve_local_model_budget(prompt)
+            first = bnl01_bot.reserve_local_model_budget(prompt, "normal_chat")
             with self.assertRaises(
                 bnl01_bot.LocalModelBudgetExhausted
             ):
-                bnl01_bot.reserve_local_model_budget(prompt)
+                bnl01_bot.reserve_local_model_budget(prompt, "normal_chat")
             bnl01_bot.release_local_model_budget(first)
 
         self.assertEqual(bnl01_bot._token_budget_reserved_tokens, 0)
+
+
+    def test_failed_provider_attempt_is_ledgered_without_incrementing_zero_usage(self):
+        error = Exception("503 service unavailable")
+        with mock.patch.object(
+            bnl01_bot,
+            "_pacific_usage_date",
+            return_value="2026-07-26",
+        ):
+            recorded = bnl01_bot.record_failed_generation_attempt(
+                error,
+                route="normal_chat",
+                model="gemini-3.6-flash",
+            )
+            diagnostics = bnl01_bot.get_usage_breakdown()
+        self.assertEqual(recorded, 0)
+        self.assertEqual(diagnostics["total_tokens"], 0)
+        with sqlite3.connect(self.db_path) as conn:
+            row = conn.execute(
+                """
+                SELECT route, model, outcome, error_category,
+                       provider_status_code, total_tokens
+                FROM model_generation_attempts
+                """
+            ).fetchone()
+        self.assertEqual(
+            row,
+            (
+                "normal_chat",
+                "gemini-3.6-flash",
+                "failure",
+                "server",
+                503,
+                0,
+            ),
+        )
+
+    def test_journal_capacity_is_protected_from_ordinary_routes(self):
+        today = "2026-07-26"
+        ordinary_ceiling = bnl01_bot.budget_ceiling_for_route(
+            bnl01_bot.DAILY_TOKEN_LIMIT,
+            "normal_chat",
+        )
+        with sqlite3.connect(self.db_path) as conn:
+            bnl01_bot._ensure_token_usage_schema(conn.cursor())
+            conn.execute(
+                """
+                UPDATE token_usage
+                SET tokens_used_today = ?, last_reset_date = ?
+                WHERE id = 1
+                """,
+                (ordinary_ceiling - 10, today),
+            )
+        with mock.patch.object(
+            bnl01_bot,
+            "_pacific_usage_date",
+            return_value=today,
+        ):
+            with self.assertRaises(bnl01_bot.LocalModelBudgetExhausted):
+                bnl01_bot.reserve_local_model_budget(
+                    "small prompt",
+                    "normal_chat",
+                )
+            journal_reservation = bnl01_bot.reserve_local_model_budget(
+                "small prompt",
+                bnl01_bot.JOURNAL_ROUTE,
+            )
+            bnl01_bot.release_local_model_budget(journal_reservation)
+        self.assertEqual(bnl01_bot._token_budget_reserved_tokens, 0)
+
+    def test_gemini3_journal_config_preserves_large_output_without_legacy_cap(self):
+        config = bnl01_bot._generation_config_for_model(
+            "gemini-3.6-flash",
+            bnl01_bot.JOURNAL_ROUTE,
+        )
+        self.assertEqual(
+            config.max_output_tokens,
+            bnl01_bot.policy_for_route(
+                bnl01_bot.JOURNAL_ROUTE
+            ).max_output_tokens,
+        )
+        self.assertIsNone(config.thinking_config)
 
 
 if __name__ == "__main__":

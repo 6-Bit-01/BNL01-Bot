@@ -340,6 +340,22 @@ from discord import app_commands
 from discord.ext import tasks
 from google import genai
 
+from bnl_gemini_routing import (
+    DEFAULT_FALLBACK_MODEL,
+    DEFAULT_PRIMARY_MODEL,
+    ProviderFailureKind,
+    budget_ceiling_for_route,
+    estimated_generation_reservation,
+    fallback_eligible_failure,
+    journal_protected_tokens,
+    policy_for_route,
+    provider_failure_kind,
+    provider_status_code,
+    retry_delay_seconds,
+    retryable_failure,
+    single_attempt_reservation,
+)
+
 from bnl_website_relay_state import (
     RelaySourceDecision,
     WebsiteRelayDecision,
@@ -368,8 +384,8 @@ from bnl_website_relay_state import (
 #   export GEMINI_API_KEY="..."
 #   export DISCORD_BOT_TOKEN="..."
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip() or "gemini-2.5-flash"
-GEMINI_FALLBACK_MODEL = os.getenv("GEMINI_FALLBACK_MODEL", "gemini-2.5-flash-lite").strip() or "gemini-2.5-flash-lite"
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", DEFAULT_PRIMARY_MODEL).strip() or DEFAULT_PRIMARY_MODEL
+GEMINI_FALLBACK_MODEL = os.getenv("GEMINI_FALLBACK_MODEL", DEFAULT_FALLBACK_MODEL).strip() or DEFAULT_FALLBACK_MODEL
 DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 BNL_API_KEY = os.getenv("BNL_API_KEY")
 BNL_STATUS_URL = os.getenv("BNL_STATUS_URL")
@@ -416,6 +432,8 @@ GENERATION_ERROR_PROVIDER_NETWORK = "provider_network_error"
 GENERATION_ERROR_PROVIDER_SERVER = "provider_server_error"
 GENERATION_ERROR_PROVIDER_EMPTY = "provider_empty_response"
 GENERATION_ERROR_PROVIDER_UNKNOWN = "provider_unknown_error"
+GENERATION_ERROR_PROVIDER_MODEL_UNAVAILABLE = "provider_model_unavailable"
+GENERATION_ERROR_PROVIDER_INVALID_REQUEST = "provider_invalid_request"
 GENERATION_ERROR_LOCAL_MODEL_BUDGET = "local_model_budget_exhausted"
 
 
@@ -458,6 +476,16 @@ class TokenUsageBreakdown:
     cached_tokens: int = 0
 
 
+@dataclass(frozen=True)
+class RoutedGenerationResponse:
+    raw_response: Any
+    model_name: str
+    fallback_used: bool = False
+
+    def __getattr__(self, name: str):
+        return getattr(self.raw_response, name)
+
+
 _last_generation_status = {
     "status": "never",
     "error_category": "",
@@ -492,23 +520,11 @@ def _bounded_env_int(
     return max(minimum, min(maximum, value))
 
 
-# Gemini 2.5 Flash otherwise uses dynamic thinking, which can consume thousands
-# of invisible output tokens on an ordinary Discord reply. Keep enough bounded
-# reasoning for BNL's governed context work while reserving room for the answer.
-BNL_GEMINI_THINKING_BUDGET = _bounded_env_int(
-    "BNL_GEMINI_THINKING_BUDGET",
-    1024,
-    minimum=0,
-    maximum=24_576,
-)
-BNL_GEMINI_MAX_OUTPUT_TOKENS = max(
-    BNL_GEMINI_THINKING_BUDGET + 600,
-    _bounded_env_int(
-        "BNL_GEMINI_MAX_OUTPUT_TOKENS",
-        4096,
-        minimum=600,
-        maximum=32_768,
-    ),
+# The pinned Python 3.9-compatible SDK can call Gemini 3 but cannot express
+# Gemini 3 thinking_level. Route policies therefore protect quality with
+# route-specific output allowances and leave Gemini 3 reasoning provider-managed.
+BNL_GEMINI_JOURNAL_PROTECTED_TOKENS = journal_protected_tokens(
+    DAILY_TOKEN_LIMIT
 )
 PACIFIC_TZ = pytz.timezone("US/Pacific")
 JOURNAL_PREPARATION_SCHEDULE_TIME = datetime_time(
@@ -7087,8 +7103,10 @@ def _journal_website_base_url() -> str:
 
 
 def _generate_journal_json_sync(_packet: dict, prompt: str) -> str:
-    if not check_quota_availability():
-        raise RuntimeError("quota_unavailable")
+    if not check_quota_availability(JOURNAL_ROUTE):
+        raise LocalModelBudgetExhausted(
+            "local_model_budget_exhausted"
+        )
     response = _generate_gemini_content_with_fallback(f"{BNL01_SYSTEM_PROMPT}\n\n{prompt}", JOURNAL_ROUTE)
     text, _tokens = _extract_text_and_tokens(response)
     return text or ""
@@ -8216,6 +8234,32 @@ def classify_generation_error(exc: Exception | None = None, *, empty_response: b
             GENERATION_ERROR_LOCAL_MODEL_BUDGET,
             GENERATION_ERROR_LOCAL_MODEL_BUDGET,
             "BNL's local daily model budget is exhausted.",
+        )
+    provider_kind = provider_failure_kind(exc)
+    status_code = provider_status_code(exc)
+    if provider_kind == ProviderFailureKind.RATE_LIMITED:
+        return (
+            GENERATION_ERROR_PROVIDER_RATE_LIMITED,
+            str(status_code or 429),
+            "Google's project/model rate limit is temporarily exhausted.",
+        )
+    if provider_kind == ProviderFailureKind.SERVER:
+        return (
+            GENERATION_ERROR_PROVIDER_SERVER,
+            str(status_code or 503),
+            "Google's generation service is temporarily unavailable.",
+        )
+    if provider_kind == ProviderFailureKind.MODEL_UNAVAILABLE:
+        return (
+            GENERATION_ERROR_PROVIDER_MODEL_UNAVAILABLE,
+            str(status_code or 404),
+            "The configured Google model is unavailable.",
+        )
+    if provider_kind == ProviderFailureKind.INVALID_REQUEST:
+        return (
+            GENERATION_ERROR_PROVIDER_INVALID_REQUEST,
+            str(status_code or 400),
+            "The configured Google model request is invalid.",
         )
     msg = str(exc or "")
     msg_l = msg.lower()
@@ -15962,6 +16006,31 @@ def _ensure_token_usage_schema(cursor: sqlite3.Cursor) -> None:
         ON token_usage_events (usage_date, route)
         """
     )
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS model_generation_attempts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            usage_date TEXT NOT NULL,
+            recorded_at TEXT NOT NULL,
+            route TEXT NOT NULL,
+            model TEXT NOT NULL,
+            outcome TEXT NOT NULL,
+            error_category TEXT NOT NULL DEFAULT '',
+            provider_status_code INTEGER NOT NULL DEFAULT 0,
+            prompt_tokens INTEGER NOT NULL DEFAULT 0,
+            candidate_tokens INTEGER NOT NULL DEFAULT 0,
+            thought_tokens INTEGER NOT NULL DEFAULT 0,
+            cached_tokens INTEGER NOT NULL DEFAULT 0,
+            total_tokens INTEGER NOT NULL DEFAULT 0
+        )
+        """
+    )
+    cursor.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_model_generation_attempts_date_route
+        ON model_generation_attempts (usage_date, route)
+        """
+    )
     cursor.execute("INSERT OR IGNORE INTO token_usage (id) VALUES (1)")
 
 
@@ -16002,14 +16071,15 @@ def check_and_reset_daily_counters():
             today_pacific,
         )
 
-def check_quota_availability():
+def check_quota_availability(route: str = ""):
     check_and_reset_daily_counters()
     with sqlite3.connect(DB_FILE) as conn:
         result = conn.execute(
             "SELECT tokens_used_today FROM token_usage WHERE id = 1"
         ).fetchone()
     tokens_used = result[0] if result else 0
-    return tokens_used < DAILY_TOKEN_LIMIT
+    ceiling = budget_ceiling_for_route(DAILY_TOKEN_LIMIT, route)
+    return tokens_used < ceiling
 
 
 def _usage_int(value) -> int:
@@ -16166,6 +16236,83 @@ def record_generation_token_usage(
     )
 
 
+def record_failed_generation_attempt(
+    exc: Exception,
+    *,
+    route: str,
+    model: str,
+) -> int:
+    kind = provider_failure_kind(exc)
+    status_code = provider_status_code(exc)
+    usage_carrier = getattr(exc, "response", None)
+    breakdown = _extract_token_usage_breakdown(usage_carrier)
+    if breakdown.total_tokens:
+        record_token_usage(
+            breakdown,
+            route=f"{route}.failed_{kind.value}",
+            model=model,
+        )
+    today_pacific = _pacific_usage_date()
+    safe_route = re.sub(
+        r"[^a-zA-Z0-9_.:-]+",
+        "_",
+        str(route or "unknown"),
+    )[:120] or "unknown"
+    safe_model = re.sub(
+        r"[^a-zA-Z0-9_.:/-]+",
+        "_",
+        str(model or "unknown"),
+    )[:120] or "unknown"
+    with sqlite3.connect(DB_FILE, timeout=30) as conn:
+        cursor = conn.cursor()
+        cursor.execute("BEGIN IMMEDIATE")
+        _ensure_token_usage_schema(cursor)
+        _reset_token_counter_if_needed(cursor, today_pacific)
+        cursor.execute(
+            """
+            INSERT INTO model_generation_attempts (
+                usage_date,
+                recorded_at,
+                route,
+                model,
+                outcome,
+                error_category,
+                provider_status_code,
+                prompt_tokens,
+                candidate_tokens,
+                thought_tokens,
+                cached_tokens,
+                total_tokens
+            )
+            VALUES (?, ?, ?, ?, 'failure', ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                today_pacific,
+                datetime.now(timezone.utc).isoformat(),
+                safe_route,
+                safe_model,
+                kind.value,
+                status_code,
+                _usage_int(breakdown.prompt_tokens),
+                _usage_int(breakdown.candidate_tokens),
+                _usage_int(breakdown.thought_tokens),
+                _usage_int(breakdown.cached_tokens),
+                _usage_int(breakdown.total_tokens),
+            ),
+        )
+        conn.commit()
+    logging.warning(
+        "model_generation_attempt_failed route=%s model=%s category=%s "
+        "status=%s total_tokens=%s",
+        safe_route,
+        safe_model,
+        kind.value,
+        status_code,
+        _usage_int(breakdown.total_tokens),
+    )
+    return _usage_int(breakdown.total_tokens)
+
+
 def increment_token_usage(tokens: int):
     """Backward-compatible unattributed accounting for legacy callers."""
     return record_token_usage(
@@ -16175,20 +16322,23 @@ def increment_token_usage(tokens: int):
     )
 
 
-def _estimated_generation_reservation(contents: str) -> int:
-    # Google documents roughly four characters per token. Dividing by three
-    # is intentionally conservative so concurrent calls fail closed near the
-    # local cap instead of overshooting it.
-    estimated_prompt_tokens = max(
-        1,
-        (len(str(contents or "")) + 2) // 3,
+def _estimated_generation_reservation(
+    contents: str,
+    route: str = "",
+) -> int:
+    return estimated_generation_reservation(
+        contents,
+        policy_for_route(route),
     )
-    return estimated_prompt_tokens + BNL_GEMINI_MAX_OUTPUT_TOKENS
 
 
-def reserve_local_model_budget(contents: str) -> int:
+def reserve_local_model_budget(
+    contents: str,
+    route: str = "",
+) -> int:
     global _token_budget_reserved_tokens
-    reservation = _estimated_generation_reservation(contents)
+    reservation = _estimated_generation_reservation(contents, route)
+    ceiling = budget_ceiling_for_route(DAILY_TOKEN_LIMIT, route)
     with _token_budget_reservation_lock:
         tokens_used, _ = get_usage_stats()
         projected_total = (
@@ -16196,7 +16346,7 @@ def reserve_local_model_budget(contents: str) -> int:
             + _token_budget_reserved_tokens
             + reservation
         )
-        if projected_total > DAILY_TOKEN_LIMIT:
+        if projected_total > ceiling:
             raise LocalModelBudgetExhausted(
                 "local_model_budget_exhausted"
             )
@@ -16256,8 +16406,21 @@ def get_usage_breakdown() -> dict:
             (last_reset,),
         ).fetchall()
     tracked_total = _usage_int(totals[1] if totals else 0)
+    ordinary_route_ceiling = budget_ceiling_for_route(
+        DAILY_TOKEN_LIMIT,
+        "normal_chat",
+    )
     return {
         "usage_date": last_reset,
+        "ordinary_route_ceiling": ordinary_route_ceiling,
+        "ordinary_route_remaining": max(
+            0,
+            ordinary_route_ceiling - _usage_int(tokens_used),
+        ),
+        "journal_protected_tokens": max(
+            0,
+            DAILY_TOKEN_LIMIT - ordinary_route_ceiling,
+        ),
         "total_tokens": _usage_int(tokens_used),
         "tracked_calls": _usage_int(totals[0] if totals else 0),
         "tracked_total_tokens": tracked_total,
@@ -20833,18 +20996,18 @@ def _generation_config_for_model(
     model_name: str,
     route: str,
 ):
-    normalized_model = str(model_name or "").lower()
+    policy = policy_for_route(route)
     config_kwargs = {
-        "max_output_tokens": BNL_GEMINI_MAX_OUTPUT_TOKENS,
+        "max_output_tokens": policy.max_output_tokens,
     }
+    normalized_model = str(model_name or "").lower()
     if "gemini-2.5" in normalized_model:
-        thinking_budget = (
-            0
-            if "flash-lite" in normalized_model
-            else BNL_GEMINI_THINKING_BUDGET
+        legacy_budget = min(
+            policy.legacy_thinking_budget,
+            max(0, policy.max_output_tokens - 600),
         )
         config_kwargs["thinking_config"] = genai.types.ThinkingConfig(
-            thinking_budget=thinking_budget,
+            thinking_budget=legacy_budget,
         )
     return genai.types.GenerateContentConfig(**config_kwargs)
 
@@ -20864,6 +21027,7 @@ async def _generate_gemini_content_result_async(contents: str, route: str) -> Ge
     model = GEMINI_MODEL
     try:
         response = await _generate_gemini_content_with_fallback_async(contents, route)
+        model = getattr(response, "model_name", GEMINI_MODEL)
         text, _tokens = _extract_text_and_tokens(response)
         elapsed = time.monotonic() - started
         if not text:
@@ -20883,71 +21047,121 @@ async def _generate_gemini_content_result_async(contents: str, route: str) -> Ge
         return result
 
 
-def _generate_gemini_content_with_fallback(contents: str, route: str):
-    reservation = reserve_local_model_budget(contents)
-    client = get_gemini_client()
-    try:
-        logging.info(f"gemini_model_attempt model={GEMINI_MODEL} route={route}")
+def _generate_model_with_retry(
+    client,
+    *,
+    model_name: str,
+    contents: str,
+    route: str,
+    policy,
+):
+    last_error = None
+    for attempt_index in range(policy.provider_retries + 1):
+        logging.info(
+            "gemini_model_attempt model=%s route=%s attempt=%s",
+            model_name,
+            route,
+            attempt_index + 1,
+        )
         try:
             response = client.models.generate_content(
-                model=_gemini_model_resource_name(GEMINI_MODEL),
+                model=_gemini_model_resource_name(model_name),
                 contents=contents,
-                config=_generation_config_for_model(
-                    GEMINI_MODEL,
-                    route,
-                ),
+                config=_generation_config_for_model(model_name, route),
             )
             record_generation_token_usage(
                 response,
                 route=route,
-                model=GEMINI_MODEL,
-                fallback_total=reservation,
+                model=model_name,
+                fallback_total=single_attempt_reservation(contents, policy),
             )
             return response
-        except Exception as primary_error:
-            if not _is_gemini_503(primary_error):
-                raise
-
-            logging.warning(
-                f"gemini_primary_unavailable_trying_fallback primary={GEMINI_MODEL} "
-                f"fallback={GEMINI_FALLBACK_MODEL} reason=gemini_503"
+        except Exception as error:
+            last_error = error
+            kind = provider_failure_kind(error)
+            record_failed_generation_attempt(
+                error,
+                route=route,
+                model=model_name,
             )
-            logging.info(
-                f"gemini_model_attempt model={GEMINI_FALLBACK_MODEL} "
-                f"route={route}"
+            if attempt_index < policy.provider_retries and retryable_failure(kind):
+                delay = retry_delay_seconds(attempt_index)
+                logging.warning(
+                    "gemini_model_retry model=%s route=%s category=%s "
+                    "delay_seconds=%s",
+                    model_name,
+                    route,
+                    kind.value,
+                    delay,
+                )
+                time.sleep(delay)
+                continue
+            raise
+    raise last_error or RuntimeError("provider_generation_failed")
+
+
+def _generate_gemini_content_with_fallback(contents: str, route: str):
+    policy = policy_for_route(route)
+    reservation = reserve_local_model_budget(contents, route)
+    client = get_gemini_client()
+    try:
+        try:
+            response = _generate_model_with_retry(
+                client,
+                model_name=GEMINI_MODEL,
+                contents=contents,
+                route=route,
+                policy=policy,
+            )
+            return RoutedGenerationResponse(
+                raw_response=response,
+                model_name=GEMINI_MODEL,
+                fallback_used=False,
+            )
+        except Exception as primary_error:
+            kind = provider_failure_kind(primary_error)
+            fallback_allowed = (
+                policy.allow_fallback
+                and GEMINI_FALLBACK_MODEL
+                and GEMINI_FALLBACK_MODEL != GEMINI_MODEL
+                and fallback_eligible_failure(kind)
+            )
+            if not fallback_allowed:
+                raise
+            logging.warning(
+                "gemini_primary_failed_trying_fallback primary=%s "
+                "fallback=%s route=%s category=%s same_project=true",
+                GEMINI_MODEL,
+                GEMINI_FALLBACK_MODEL,
+                route,
+                kind.value,
             )
             try:
-                response = client.models.generate_content(
-                    model=_gemini_model_resource_name(
-                        GEMINI_FALLBACK_MODEL
-                    ),
+                response = _generate_model_with_retry(
+                    client,
+                    model_name=GEMINI_FALLBACK_MODEL,
                     contents=contents,
-                    config=_generation_config_for_model(
-                        GEMINI_FALLBACK_MODEL,
-                        route,
-                    ),
-                )
-                record_generation_token_usage(
-                    response,
                     route=route,
-                    model=GEMINI_FALLBACK_MODEL,
-                    fallback_total=reservation,
+                    policy=policy,
                 )
-                logging.info(
-                    f"gemini_fallback_succeeded fallback="
-                    f"{GEMINI_FALLBACK_MODEL}"
-                )
-                return response
             except Exception as fallback_error:
-                if _is_gemini_503(fallback_error):
-                    logging.error(
-                        f"gemini_fallback_failed fallback="
-                        f"{GEMINI_FALLBACK_MODEL} reason=gemini_503"
-                    )
-                    logging.error(
-                        "direct_generation_failed reason=gemini_503"
-                    )
+                logging.error(
+                    "gemini_fallback_failed fallback=%s route=%s category=%s",
+                    GEMINI_FALLBACK_MODEL,
+                    route,
+                    provider_failure_kind(fallback_error).value,
+                )
                 raise
+            logging.info(
+                "gemini_fallback_succeeded fallback=%s route=%s",
+                GEMINI_FALLBACK_MODEL,
+                route,
+            )
+            return RoutedGenerationResponse(
+                raw_response=response,
+                model_name=GEMINI_FALLBACK_MODEL,
+                fallback_used=True,
+            )
     finally:
         release_local_model_budget(reservation)
 
@@ -21696,7 +21910,7 @@ def _safe_uncertain_response_from_prompt(prompt: str) -> str:
 async def get_gemini_generation_result(prompt: str, user_id: int, guild_id: int, route: str = "get_gemini_response") -> GenerationResult:
     started = time.monotonic()
     try:
-        if not check_quota_availability():
+        if not check_quota_availability(route):
             result = GenerationResult(
                 False,
                 "",
@@ -21761,7 +21975,7 @@ async def get_gemini_response(
     source_context_available: bool = False,
 ):
     try:
-        if not check_quota_availability():
+        if not check_quota_availability(route):
             result = GenerationResult(
                 False,
                 "",
@@ -32746,6 +32960,17 @@ async def usage(interaction: discord.Interaction):
         ),
         inline=False,
     )
+    embed.add_field(
+        name="Journal-Protected Capacity",
+        value=(
+            f"**{diagnostics['journal_protected_tokens']:,} tokens** held "
+            "for Journal generation before ordinary routes may use the "
+            "rest of the daily budget.\n"
+            f"Ordinary-route capacity remaining: "
+            f"**{diagnostics['ordinary_route_remaining']:,}**"
+        ),
+        inline=False,
+    )
     route_lines = [
         f"`{item['route']}` — {item['total_tokens']:,} "
         f"tokens / {item['calls']:,} call(s)"
@@ -33510,7 +33735,7 @@ async def bnl_memory_preview(
             ephemeral=True,
         )
         return
-    if not check_quota_availability():
+    if not check_quota_availability("bnl_memory_preview_candidate"):
         tokens_used, _last_reset = get_usage_stats()
         await interaction.response.send_message(
             "❌ Preview not run: BNL's local daily model budget is "

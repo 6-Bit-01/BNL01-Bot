@@ -35,15 +35,17 @@ Configure secrets in the process environment; do not commit them. Core variables
 - `GEMINI_API_KEY`
 - BNL website URLs, API keys, Relay controls, and feature flags used by the deployed runtime
 
-BNL keeps its own 1,350,000-token daily API safety budget, independent of the
-consumer Gemini app and Google project rate limits. `/usage` reports the
-provider-returned input, visible-output, thinking, cached, and total token
-counts by generation route. The counter resets at midnight Pacific Time.
-Gemini 2.5 Flash thinking is bounded to 1,024 tokens per request by default, and
-the complete response budget defaults to 4,096 tokens. Operators may lower
-those bounds with `BNL_GEMINI_THINKING_BUDGET` and
-`BNL_GEMINI_MAX_OUTPUT_TOKENS`; no environment change is required for the safe
-defaults.
+BNL keeps its own 1,350,000-token daily API safety budget, independent of
+consumer Gemini subscriptions and Google project limits. Production defaults to
+`gemini-3.6-flash` with same-project `gemini-3.5-flash` fallback for ordinary
+conversation/background routes after bounded retry on 429/503 or an unavailable
+primary model. Governed memory, Source File/dossier, and Journal routes do not
+automatically downgrade. Route-specific output allowances preserve quality, and
+`BNL_GEMINI_JOURNAL_PROTECTED_TOKENS` (default 250,000) keeps daily capacity for
+the Journal. The pinned Python 3.9-compatible SDK leaves Gemini 3 reasoning
+provider-managed; it does not apply the obsolete global 1,024-token thinking cap.
+`/usage` reports provider-returned input, visible-output, thinking, cached, and
+total token counts by route. The local counter resets at midnight Pacific Time.
 
 Native queue context has two independent production gates. The local bot variable `BNL_QUEUE_PRODUCTION_ENABLED` defaults off and accepts only `true` (case-insensitive); the website read model must also report `capabilities.queueProduction=true`. Queue/session/track context is stripped unless both gates agree. Merging queue-aware code does not enable either gate.
 
