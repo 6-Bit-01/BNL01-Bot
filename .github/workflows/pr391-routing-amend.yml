@@ -33,6 +33,20 @@ jobs:
       - name: Apply route-aware Gemini amendment
         run: python tools/pr391_amend.py
 
+      - name: Correct generated newline escape
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path("bnl01_bot.py")
+          text = path.read_text()
+          broken = '            "rest of the daily budget.\n"\n'
+          fixed = '            "rest of the daily budget.\\n"\n'
+          if broken not in text:
+              raise SystemExit("expected generated newline target not found")
+          path.write_text(text.replace(broken, fixed, 1))
+          PY
+
       - name: Run focused routing and accounting tests
         shell: bash
         run: |
