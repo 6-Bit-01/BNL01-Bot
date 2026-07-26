@@ -59,11 +59,11 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           sha=$(git rev-parse HEAD)
-          gh pr comment 391 --body "Routing amendment applied and verified at \`$sha\`. Focused routing/accounting tests and the full repository check passed on Python 3.12. Temporary workflow cleanup and normal Python 3.9/3.12 CI remain next."
+          gh pr comment 391 --body "Routing amendment applied and verified at \`$sha\`. Focused routing/accounting tests and the full repository check passed on Python 3.12. Temporary workflow cleanup and normal Python 3.9/3.12 CI remain next. Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
 
       - name: Report failure on PR 391
         if: failure()
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh pr comment 391 --body "The automated routing amendment did not commit because an assertion or test failed. No routing amendment was pushed. Inspect this workflow run before retrying."
+          gh pr comment 391 --body "The automated routing amendment did not commit because an assertion or test failed. No routing amendment was pushed. Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
