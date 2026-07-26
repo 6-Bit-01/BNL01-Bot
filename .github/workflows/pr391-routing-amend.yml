@@ -34,13 +34,19 @@ jobs:
         run: python tools/pr391_amend.py
 
       - name: Run focused routing and accounting tests
+        shell: bash
         run: |
+          set +e
           python -m unittest -v \
             tests.test_gemini_routing_policy \
             tests.test_token_budget_accounting \
             tests.test_async_relay_offload \
             tests.test_memory_preview_bot_path \
-            tests.test_route_memory_governance
+            tests.test_route_memory_governance \
+            2>&1 | tee /tmp/pr391-focused-tests.log
+          status=${PIPESTATUS[0]}
+          echo "focused_test_status=$status" >> "$GITHUB_ENV"
+          exit "$status"
 
       - name: Run full repository checks
         run: make check PYTHON=python
@@ -63,7 +69,24 @@ jobs:
 
       - name: Report failure on PR 391
         if: failure()
+        shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh pr comment 391 --body "The automated routing amendment did not commit because an assertion or test failed. No routing amendment was pushed. Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          {
+            echo 'The automated routing amendment did not commit because an assertion or test failed. No routing amendment was pushed.'
+            echo
+            echo "Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            echo
+            echo '<details><summary>Focused-test failure tail</summary>'
+            echo
+            echo '```text'
+            if [ -f /tmp/pr391-focused-tests.log ]; then
+              tail -n 160 /tmp/pr391-focused-tests.log
+            else
+              echo 'Focused-test log was not created; failure occurred before that step.'
+            fi
+            echo '```'
+            echo '</details>'
+          } > /tmp/pr391-failure-comment.md
+          gh pr comment 391 --body-file /tmp/pr391-failure-comment.md
