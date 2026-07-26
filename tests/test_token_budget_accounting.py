@@ -114,10 +114,11 @@ class TokenBudgetAccountingTests(unittest.TestCase):
             conn.execute(
                 """
                 UPDATE token_usage
-                SET tokens_used_today = 1_000,
-                    last_reset_date = '2026-07-26'
+                SET tokens_used_today = ?,
+                    last_reset_date = ?
                 WHERE id = 1
-                """
+                """,
+                (1_000, "2026-07-26"),
             )
         with mock.patch.object(
             bnl01_bot,
