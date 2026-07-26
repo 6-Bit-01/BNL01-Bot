@@ -266,6 +266,7 @@ class IntelligencePacketDiagnostics:
     packet_digest: str = ""
     prompt_applied: bool = False
     live_applied: bool = False
+    receipt_run_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -2056,7 +2057,11 @@ def build_packet(
         dict.fromkeys(diagnostics.invalid_invariants)
     )
     if persist:
-        persist_packet_run(conn, packet, created_at=request.now or "")
+        diagnostics.receipt_run_id = persist_packet_run(
+            conn,
+            packet,
+            created_at=request.now or "",
+        )
     return packet
 
 
@@ -2140,6 +2145,59 @@ def persist_packet_run(
         ),
     )
     return run_id
+
+
+def mark_packet_application(
+    conn: sqlite3.Connection,
+    packet: UnifiedIntelligencePacket,
+    *,
+    prompt_applied: bool | None = None,
+    live_applied: bool | None = None,
+) -> bool:
+    """Update the exact retained packet receipt used by a scoped canary.
+
+    Packet contents and source identifiers remain in memory only.  The
+    persisted receipt records only whether the already-validated packet reached
+    a prompt or a sent response.
+    """
+
+    ensure_schema(conn)
+    run_id = str(packet.diagnostics.receipt_run_id or "").strip()
+    if not run_id:
+        return False
+    assignments = []
+    values: list[Any] = []
+    if prompt_applied is not None:
+        assignments.append("prompt_applied=?")
+        values.append(int(bool(prompt_applied)))
+    if live_applied is not None:
+        assignments.append("live_applied=?")
+        values.append(int(bool(live_applied)))
+    if not assignments:
+        return True
+    values.extend(
+        (
+            run_id,
+            packet.packet_id,
+            int(packet.request.guild_id or 0),
+        )
+    )
+    cursor = conn.execute(
+        """
+        UPDATE memory_governance_intelligence_packet_runs
+        SET %s
+        WHERE run_id=? AND packet_id=? AND guild_id=?
+        """
+        % ",".join(assignments),
+        tuple(values),
+    )
+    if cursor.rowcount != 1:
+        return False
+    if prompt_applied is not None:
+        packet.diagnostics.prompt_applied = bool(prompt_applied)
+    if live_applied is not None:
+        packet.diagnostics.live_applied = bool(live_applied)
+    return True
 
 
 def _safe_json(value: Any, fallback: Any) -> Any:

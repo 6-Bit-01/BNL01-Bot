@@ -119,7 +119,20 @@ from bnl_unified_intelligence_packet import (
     PacketConversationEvidence,
     UnifiedIntelligencePacket,
     build_packet as build_unified_intelligence_packet,
+    ensure_schema as ensure_unified_intelligence_packet_schema,
     shadow_enabled as unified_intelligence_packet_shadow_enabled,
+)
+from bnl_shared_brain_synthesis import (
+    SharedBrainSynthesisBasis,
+    SynthesisCanaryDecision,
+    begin_run as begin_shared_brain_synthesis_run,
+    build_basis as build_shared_brain_synthesis_basis,
+    configuration as shared_brain_synthesis_canary_configuration,
+    ensure_schema as ensure_shared_brain_synthesis_schema,
+    evaluate_candidate as evaluate_shared_brain_synthesis_candidate,
+    finalize_run as finalize_shared_brain_synthesis_run,
+    record_fallback as record_shared_brain_synthesis_fallback,
+    revalidate_basis as revalidate_shared_brain_synthesis_basis,
 )
 from bnl_unified_response_assessment import (
     ConversationEvidenceItem,
@@ -5084,7 +5097,9 @@ def init_db():
         ensure_entity_evidence_schema(evidence_conn)
         ensure_memory_ledger_schema(evidence_conn)
         ensure_relationship_v2_schema(evidence_conn)
+        ensure_unified_intelligence_packet_schema(evidence_conn)
         ensure_unified_response_assessment_schema(evidence_conn)
+        ensure_shared_brain_synthesis_schema(evidence_conn)
         orphan_reconciliation = (
             reconcile_orphaned_conversation_ledger_sources(
                 evidence_conn,
@@ -18638,6 +18653,7 @@ PromptSourceBasis = Union[
     ConversationPromptSourceBasis,
     BatchMomentPromptSourceBasis,
     UnifiedMomentCanaryPromptSourceBasis,
+    SharedBrainSynthesisBasis,
 ]
 
 _UNIFIED_ASSESSMENT_CANON_RELEVANCE_RE = re.compile(
@@ -18830,6 +18846,7 @@ def build_unified_response_assessment_shadow(
     source_context_snapshot: str = "",
     current_direct: bool = True,
     broadcast_memory_present: bool = False,
+    intelligence_packet_out: dict | None = None,
 ) -> UnifiedResponseAssessment | None:
     """Build a shadow view from evidence already selected by existing owners."""
     if not unified_response_assessment_shadow_enabled():
@@ -18976,6 +18993,9 @@ def build_unified_response_assessment_shadow(
             "passed"
         )
     )
+    if intelligence_packet_out is not None:
+        intelligence_packet_out["packet"] = intelligence_packet
+        intelligence_packet_out["usable"] = packet_usable
     canon_relevant = _canon_relevant_to_response(current_text)
     if intelligence_packet is None:
         assessment_moment_refs = (
@@ -19662,6 +19682,16 @@ def refresh_prompt_source_basis(
     basis: PromptSourceBasis,
 ) -> tuple[PromptSourceBasis, bool]:
     """Synchronously rebuild one source basis after any provider await."""
+    if isinstance(basis, SharedBrainSynthesisBasis):
+        try:
+            with sqlite3.connect(DB_FILE, timeout=0.25) as synthesis_conn:
+                valid, _status = revalidate_shared_brain_synthesis_basis(
+                    synthesis_conn,
+                    basis,
+                )
+            return basis, not valid
+        except (OSError, sqlite3.DatabaseError, TypeError, ValueError):
+            return basis, True
     if isinstance(basis, UnifiedMomentCanaryPromptSourceBasis):
         (
             fresh_context,
@@ -19781,6 +19811,8 @@ def refresh_prompt_source_bases(
         kind = (
             "conversation"
             if isinstance(basis, ConversationPromptSourceBasis)
+            else "shared_brain_synthesis"
+            if isinstance(basis, SharedBrainSynthesisBasis)
             else "unified_moment_canary"
             if isinstance(basis, UnifiedMomentCanaryPromptSourceBasis)
             else "batch_moment"
@@ -19788,6 +19820,9 @@ def refresh_prompt_source_bases(
             else "memory"
         )
         changed_kinds.append(kind)
+        if isinstance(basis, SharedBrainSynthesisBasis):
+            replacement_failed = True
+            continue
         if isinstance(basis, ConversationPromptSourceBasis):
             replacement_failed = True
             continue
@@ -19843,6 +19878,8 @@ def prompt_source_basis_failure(
                 return (
                     "conversation_source_changed"
                     if isinstance(basis, ConversationPromptSourceBasis)
+                    else "shared_brain_synthesis_source_changed"
+                    if isinstance(basis, SharedBrainSynthesisBasis)
                     else "unified_moment_canary_source_changed"
                     if isinstance(
                         basis,
@@ -19910,6 +19947,9 @@ def build_memory_diagnostic_snapshot(user_id: int, guild_id: int, route_mode: st
             ),
             "unified_moment_canary": (
                 unified_moment_canary_configuration()
+            ),
+            "shared_brain_synthesis_canary": (
+                shared_brain_synthesis_canary_configuration()
             ),
             "memory_governance_shadow": memory_governance_shadow_enabled(),
             "memory_governance_live": memory_governance_live_enabled(),
@@ -26513,6 +26553,7 @@ def build_user_aware_prompt(
         route_mode=route_mode,
         channel_policy=channel_policy,
     )
+    intelligence_packet_out: dict = {}
     unified_assessment = build_unified_response_assessment_shadow(
         guild_id=guild_id,
         route_mode=route_mode,
@@ -26540,6 +26581,7 @@ def build_user_aware_prompt(
         source_context_present=bool(source_context_block),
         source_context_snapshot=source_context_block,
         broadcast_memory_present=bool(broadcast_context),
+        intelligence_packet_out=intelligence_packet_out,
     )
     unified_moment_canary_basis = (
         build_unified_moment_canary_prompt_source_basis(
@@ -26561,6 +26603,23 @@ def build_user_aware_prompt(
     if unified_moment_canary_basis is not None:
         unified_assessment = unified_moment_canary_basis.assessment
         prompt_source_bases.append(unified_moment_canary_basis)
+
+    shared_brain_synthesis_basis = build_shared_brain_synthesis_basis(
+        guild_id=guild_id,
+        user_id=user_id,
+        channel_id=channel_id,
+        route_mode=route_mode,
+        channel_policy=channel_policy,
+        current_direct=bool(is_direct_interaction),
+        user_text=clean_content,
+        packet=intelligence_packet_out.get("packet"),
+        assessment=unified_assessment,
+        has_media=_prompt_has_current_message_media_context(clean_content),
+        exact_quote_requested=exact_quote_requested,
+        third_party_attribution_requested=(
+            third_party_attribution_requested
+        ),
+    )
 
     if prompt_metadata is not None:
         prompt_metadata["source_context_available"] = bool(
@@ -26586,6 +26645,9 @@ def build_user_aware_prompt(
         )
         prompt_metadata["unified_response_assessment_shadow"] = (
             unified_assessment
+        )
+        prompt_metadata["shared_brain_synthesis_canary_basis"] = (
+            shared_brain_synthesis_basis
         )
         prompt_metadata["unified_moment_canary_applied"] = bool(
             unified_moment_canary_basis is not None
@@ -28912,6 +28974,257 @@ async def send_channel_then_save_model(
     return model_decision
 
 
+@dataclass(frozen=True)
+class SharedBrainSynthesisExecution:
+    decision: SynthesisCanaryDecision
+    response: str
+    prompt: str
+    prompt_source_bases: tuple[PromptSourceBasis, ...]
+    candidate_active: bool
+
+
+def _begin_shared_brain_synthesis_receipt(
+    basis: SharedBrainSynthesisBasis,
+    baseline_response: str,
+):
+    with sqlite3.connect(DB_FILE, timeout=0.25) as conn:
+        run = begin_shared_brain_synthesis_run(
+            conn,
+            basis,
+            baseline_response=baseline_response,
+        )
+        conn.commit()
+        return run
+
+
+def _evaluate_shared_brain_synthesis_receipt(
+    run,
+    baseline_response: str,
+    candidate_response: str,
+) -> SynthesisCanaryDecision:
+    with sqlite3.connect(DB_FILE, timeout=0.25) as conn:
+        decision = evaluate_shared_brain_synthesis_candidate(
+            conn,
+            run,
+            baseline_response=baseline_response,
+            candidate_response=candidate_response,
+        )
+        conn.commit()
+        return decision
+
+
+def _fallback_shared_brain_synthesis_receipt(
+    decision: SynthesisCanaryDecision,
+    reason: str,
+) -> SynthesisCanaryDecision:
+    with sqlite3.connect(DB_FILE, timeout=0.25) as conn:
+        fallback = record_shared_brain_synthesis_fallback(
+            conn,
+            decision,
+            reason=reason,
+        )
+        conn.commit()
+        return fallback
+
+
+def _finalize_shared_brain_synthesis_receipt(
+    decision: SynthesisCanaryDecision,
+    *,
+    final_response: str,
+    response_sent: bool,
+    candidate_live: bool,
+    guard_status: str,
+) -> bool:
+    with sqlite3.connect(DB_FILE, timeout=0.25) as conn:
+        finalized = finalize_shared_brain_synthesis_run(
+            conn,
+            decision,
+            final_response=final_response,
+            response_sent=response_sent,
+            candidate_live=candidate_live,
+            guard_status=guard_status,
+        )
+        conn.commit()
+        return finalized
+
+
+async def safely_fallback_shared_brain_synthesis(
+    decision: SynthesisCanaryDecision,
+    reason: str,
+) -> SynthesisCanaryDecision:
+    try:
+        return await asyncio.to_thread(
+            _fallback_shared_brain_synthesis_receipt,
+            decision,
+            reason,
+        )
+    except Exception as exc:
+        logging.warning(
+            "shared_brain_synthesis_canary_fallback_receipt_failed "
+            "error=%s",
+            type(exc).__name__,
+        )
+        return decision
+
+
+async def safely_finalize_shared_brain_synthesis(
+    decision: SynthesisCanaryDecision | None,
+    *,
+    final_response: str,
+    response_sent: bool,
+    candidate_live: bool,
+    guard_status: str,
+) -> bool:
+    if decision is None:
+        return False
+    try:
+        return await asyncio.to_thread(
+            _finalize_shared_brain_synthesis_receipt,
+            decision,
+            final_response=final_response,
+            response_sent=response_sent,
+            candidate_live=candidate_live,
+            guard_status=guard_status,
+        )
+    except Exception as exc:
+        logging.warning(
+            "shared_brain_synthesis_canary_finalize_failed error=%s",
+            type(exc).__name__,
+        )
+        return False
+
+
+async def maybe_generate_shared_brain_synthesis_canary(
+    *,
+    channel,
+    baseline_response: str,
+    prompt: str,
+    prompt_source_bases: tuple[PromptSourceBasis, ...],
+    basis: SharedBrainSynthesisBasis | None,
+    user_id: int,
+    guild_id: int,
+    user_display_name: str,
+    source_context_available: bool,
+) -> SharedBrainSynthesisExecution | None:
+    """Generate one packet-grounded candidate without risking baseline loss."""
+
+    if basis is None:
+        return None
+    try:
+        run = await asyncio.to_thread(
+            _begin_shared_brain_synthesis_receipt,
+            basis,
+            baseline_response,
+        )
+    except Exception as exc:
+        logging.warning(
+            "shared_brain_synthesis_canary_begin_failed error=%s",
+            type(exc).__name__,
+        )
+        return None
+
+    if not run.prompt_applied:
+        decision = SynthesisCanaryDecision(
+            run=run,
+            response=baseline_response,
+            candidate_selected=False,
+            fallback_reason=run.fallback_reason or "prompt_not_applied",
+            comparison_status="not_comparable",
+            baseline_coherence_status="not_evaluated",
+            candidate_coherence_status="not_evaluated",
+            candidate_evidence_coverage_count=0,
+            revalidation_status=run.revalidation_status,
+        )
+        return SharedBrainSynthesisExecution(
+            decision=decision,
+            response=baseline_response,
+            prompt=prompt,
+            prompt_source_bases=prompt_source_bases,
+            candidate_active=False,
+        )
+
+    candidate_prompt = (
+        str(prompt or "").rstrip()
+        + "\n\n"
+        + basis.rendered_context
+    )
+    try:
+        candidate_response = await get_gemini_response_with_optional_typing(
+            channel,
+            candidate_prompt,
+            user_id,
+            guild_id,
+            route="shared_brain_synthesis_canary",
+            source_context_available=source_context_available,
+        )
+    except Exception as exc:
+        logging.warning(
+            "shared_brain_synthesis_canary_generation_failed error=%s",
+            type(exc).__name__,
+        )
+        candidate_response = ""
+    try:
+        decision = await asyncio.to_thread(
+            _evaluate_shared_brain_synthesis_receipt,
+            run,
+            baseline_response,
+            candidate_response or "",
+        )
+        if (
+            decision.candidate_selected
+            and is_generic_non_answer_response(
+                candidate_response or "",
+                user_display_name,
+            )
+        ):
+            decision = await asyncio.to_thread(
+                _fallback_shared_brain_synthesis_receipt,
+                decision,
+                "candidate_generic_non_answer",
+            )
+    except Exception as exc:
+        logging.warning(
+            "shared_brain_synthesis_canary_evaluation_failed error=%s",
+            type(exc).__name__,
+        )
+        decision = SynthesisCanaryDecision(
+            run=run,
+            response=baseline_response,
+            candidate_selected=False,
+            fallback_reason="candidate_evaluation_failed",
+            comparison_status="not_comparable",
+            baseline_coherence_status="not_evaluated",
+            candidate_coherence_status="not_evaluated",
+            candidate_evidence_coverage_count=0,
+            revalidation_status="processing_error",
+        )
+        try:
+            decision = await asyncio.to_thread(
+                _fallback_shared_brain_synthesis_receipt,
+                decision,
+                "candidate_evaluation_failed",
+            )
+        except Exception:
+            pass
+
+    candidate_active = bool(decision.candidate_selected)
+    return SharedBrainSynthesisExecution(
+        decision=decision,
+        response=(
+            candidate_response
+            if candidate_active
+            else baseline_response
+        ),
+        prompt=candidate_prompt if candidate_active else prompt,
+        prompt_source_bases=(
+            (*prompt_source_bases, basis)
+            if candidate_active
+            else prompt_source_bases
+        ),
+        candidate_active=candidate_active,
+    )
+
+
 async def send_planned_conversation_response(
     message: discord.Message,
     response: str,
@@ -28941,6 +29254,9 @@ async def send_planned_conversation_response(
     third_party_attribution_requested: bool = False,
     prompt_source_bases: tuple[PromptSourceBasis, ...] = (),
     unified_response_assessment_shadow: UnifiedResponseAssessment | None = None,
+    shared_brain_synthesis_canary_basis: (
+        SharedBrainSynthesisBasis | None
+    ) = None,
 ) -> MemoryWriteDecision:
     """Send a planned normal-conversation response through one governed path."""
     logging.info(
@@ -28975,34 +29291,186 @@ async def send_planned_conversation_response(
         )
     else:
         source_context_available = bool(source_context_available)
+
+    baseline_response = response or ""
+    baseline_prompt = prompt
+    baseline_prompt_source_bases = tuple(prompt_source_bases or ())
+    media_context = build_message_media_context(message)
+    synthesis_execution = (
+        await maybe_generate_shared_brain_synthesis_canary(
+            channel=getattr(message, "channel", None),
+            baseline_response=baseline_response,
+            prompt=baseline_prompt,
+            prompt_source_bases=baseline_prompt_source_bases,
+            basis=shared_brain_synthesis_canary_basis,
+            user_id=message.author.id,
+            guild_id=message.guild.id,
+            user_display_name=getattr(
+                message.author,
+                "display_name",
+                "",
+            ),
+            source_context_available=source_context_available,
+        )
+    )
+    synthesis_decision = (
+        synthesis_execution.decision
+        if synthesis_execution is not None
+        else None
+    )
+    synthesis_candidate_active = bool(
+        synthesis_execution is not None
+        and synthesis_execution.candidate_active
+    )
+    if synthesis_execution is not None:
+        response = synthesis_execution.response
+        prompt = synthesis_execution.prompt
+        prompt_source_bases = synthesis_execution.prompt_source_bases
+    else:
+        response = baseline_response
+        prompt = baseline_prompt
+        prompt_source_bases = baseline_prompt_source_bases
+
+    if _abort_stale_direct_repair_generation(
+        direct_repair_generation,
+        "after_shared_brain_synthesis_canary",
+    ):
+        if synthesis_decision is not None:
+            synthesis_decision = (
+                await safely_fallback_shared_brain_synthesis(
+                    synthesis_decision,
+                    "stale_after_candidate_generation",
+                )
+            )
+            await safely_finalize_shared_brain_synthesis(
+                synthesis_decision,
+                final_response=baseline_response,
+                response_sent=False,
+                candidate_live=False,
+                guard_status="stale_after_candidate_generation",
+            )
+        return model_decision
+
+    async def _run_response_guard(
+        selected_response: str,
+        selected_prompt: str,
+        selected_bases: tuple[PromptSourceBasis, ...],
+    ):
+        return await apply_guarded_response_regeneration(
+            selected_response or "",
+            prompt=selected_prompt,
+            user_id=message.author.id,
+            guild_id=message.guild.id,
+            route_mode=plan.route_mode,
+            channel_policy=plan.channel_policy,
+            directness=plan.directness,
+            user_display_name=getattr(
+                message.author,
+                "display_name",
+                "",
+            ),
+            current_user_text=getattr(message, "content", ""),
+            has_media=bool(media_context.get("present", False)),
+            is_reply=is_reply,
+            generation_route=generation_route,
+            channel=getattr(message, "channel", None),
+            source_context_available=source_context_available,
+            conversation_continuity_required=(
+                conversation_continuity_required
+            ),
+            community_visual_basis=community_visual_basis,
+            exact_quote_requested=exact_quote_requested,
+            exact_quote_authority=exact_quote_authority,
+            third_party_attribution_requested=(
+                third_party_attribution_requested
+            ),
+            prompt_source_bases=selected_bases,
+        )
+
     archive_guard_triggered = bool(
         not source_context_available
         and _contains_unsupported_source_authority_claim(response or "")
     )
-    media_context = build_message_media_context(message)
-    response, guard_diagnostics = await apply_guarded_response_regeneration(
+    response, guard_diagnostics = await _run_response_guard(
         response or "",
-        prompt=prompt,
-        user_id=message.author.id,
-        guild_id=message.guild.id,
-        route_mode=plan.route_mode,
-        channel_policy=plan.channel_policy,
-        directness=plan.directness,
-        user_display_name=getattr(message.author, "display_name", ""),
-        current_user_text=getattr(message, "content", ""),
-        has_media=bool(media_context.get("present", False)),
-        is_reply=is_reply,
-        generation_route=generation_route,
-        channel=getattr(message, "channel", None),
-        source_context_available=source_context_available,
-        conversation_continuity_required=conversation_continuity_required,
-        community_visual_basis=community_visual_basis,
-        exact_quote_requested=exact_quote_requested,
-        exact_quote_authority=exact_quote_authority,
-        third_party_attribution_requested=third_party_attribution_requested,
-        prompt_source_bases=prompt_source_bases,
+        prompt,
+        tuple(prompt_source_bases or ()),
     )
-    if _abort_stale_direct_repair_generation(direct_repair_generation, "after_guard"):
+    canary_guard_fallback_triggered = False
+    if synthesis_candidate_active and synthesis_decision is not None:
+        fallback_reason = ""
+        if guard_diagnostics.get("suppressed"):
+            fallback_reason = "candidate_guard_suppressed"
+        else:
+            try:
+                synthesis_decision = await asyncio.to_thread(
+                    _evaluate_shared_brain_synthesis_receipt,
+                    synthesis_decision.run,
+                    baseline_response,
+                    response or "",
+                )
+                if (
+                    synthesis_decision.candidate_selected
+                    and is_generic_non_answer_response(
+                        response or "",
+                        getattr(message.author, "display_name", ""),
+                    )
+                ):
+                    fallback_reason = "candidate_generic_non_answer"
+                elif not synthesis_decision.candidate_selected:
+                    fallback_reason = (
+                        synthesis_decision.fallback_reason
+                        or "candidate_post_guard_rejected"
+                    )
+            except Exception as exc:
+                logging.warning(
+                    "shared_brain_synthesis_canary_post_guard_failed "
+                    "error=%s",
+                    type(exc).__name__,
+                )
+                fallback_reason = "candidate_post_guard_evaluation_failed"
+        if fallback_reason:
+            synthesis_decision = (
+                await safely_fallback_shared_brain_synthesis(
+                    synthesis_decision,
+                    fallback_reason,
+                )
+            )
+            synthesis_candidate_active = False
+            canary_guard_fallback_triggered = True
+            response = baseline_response
+            prompt = baseline_prompt
+            prompt_source_bases = baseline_prompt_source_bases
+            archive_guard_triggered = bool(
+                not source_context_available
+                and _contains_unsupported_source_authority_claim(
+                    response or ""
+                )
+            )
+            response, guard_diagnostics = await _run_response_guard(
+                response,
+                prompt,
+                prompt_source_bases,
+            )
+
+    if _abort_stale_direct_repair_generation(
+        direct_repair_generation,
+        "after_guard",
+    ):
+        if synthesis_decision is not None:
+            synthesis_decision = (
+                await safely_fallback_shared_brain_synthesis(
+                    synthesis_decision,
+                    "stale_after_guard",
+                )
+            )
+            await safely_finalize_shared_brain_synthesis(
+                synthesis_decision,
+                final_response=baseline_response,
+                response_sent=False,
+                candidate_live=False,
+                guard_status="stale_after_guard",
+            )
         return model_decision
     guard_triggered = bool(
         guard_diagnostics.get("scripted_mode_leak_guard_triggered")
@@ -29023,6 +29491,7 @@ async def send_planned_conversation_response(
         or guard_diagnostics.get(
             "source_safe_recall_output_leak_guard_triggered"
         )
+        or canary_guard_fallback_triggered
         or archive_guard_triggered
     )
     regenerated_for_mode_leak = bool(
@@ -29032,6 +29501,13 @@ async def send_planned_conversation_response(
     )
     if guard_diagnostics.get("suppressed"):
         logging.info("continuation_mark_skipped reason=guard_fallback_or_generic_non_answer route=%s channel_policy=%s", plan.route_mode, plan.channel_policy)
+        await safely_finalize_shared_brain_synthesis(
+            synthesis_decision,
+            final_response=response or baseline_response,
+            response_sent=False,
+            candidate_live=False,
+            guard_status="guard_suppressed",
+        )
         _finish_direct_repair_generation(direct_repair_generation, "guard_suppressed")
         return model_decision
     prompt_source_bases = tuple(
@@ -29089,6 +29565,20 @@ async def send_planned_conversation_response(
         ack_escalated_to_generation=False,
     )
     if _abort_stale_direct_repair_generation(direct_repair_generation, "before_send_commit"):
+        if synthesis_decision is not None:
+            synthesis_decision = (
+                await safely_fallback_shared_brain_synthesis(
+                    synthesis_decision,
+                    "stale_before_send_commit",
+                )
+            )
+            await safely_finalize_shared_brain_synthesis(
+                synthesis_decision,
+                final_response=baseline_response,
+                response_sent=False,
+                candidate_live=False,
+                guard_status="stale_before_send_commit",
+            )
         return model_decision
     quote_presend_failure = await exact_quote_presend_failure(
         response,
@@ -29104,6 +29594,13 @@ async def send_planned_conversation_response(
             "direct_exact_quote_suppressed_before_send reason=%s",
             quote_presend_failure,
         )
+        await safely_finalize_shared_brain_synthesis(
+            synthesis_decision,
+            final_response=response,
+            response_sent=False,
+            candidate_live=False,
+            guard_status="exact_quote_presend_failed",
+        )
         _finish_direct_repair_generation(
             direct_repair_generation,
             "exact_quote_presend_failed",
@@ -29112,10 +29609,63 @@ async def send_planned_conversation_response(
     direct_source_failure = prompt_source_basis_failure(
         prompt_source_bases
     )
+    if direct_source_failure and synthesis_candidate_active:
+        synthesis_decision = await safely_fallback_shared_brain_synthesis(
+            synthesis_decision,
+            "candidate_presend_%s" % direct_source_failure,
+        )
+        synthesis_candidate_active = False
+        response = baseline_response
+        prompt = baseline_prompt
+        prompt_source_bases = baseline_prompt_source_bases
+        response, guard_diagnostics = await _run_response_guard(
+            response,
+            prompt,
+            prompt_source_bases,
+        )
+        if guard_diagnostics.get("suppressed"):
+            await safely_finalize_shared_brain_synthesis(
+                synthesis_decision,
+                final_response=response,
+                response_sent=False,
+                candidate_live=False,
+                guard_status="baseline_guard_suppressed_at_presend",
+            )
+            _finish_direct_repair_generation(
+                direct_repair_generation,
+                "guard_suppressed",
+            )
+            return model_decision
+        prompt_source_bases = tuple(
+            guard_diagnostics.get("_revalidated_prompt_source_bases")
+            or prompt_source_bases
+        )
+        if _abort_stale_direct_repair_generation(
+            direct_repair_generation,
+            "after_presend_canary_fallback",
+        ):
+            await safely_finalize_shared_brain_synthesis(
+                synthesis_decision,
+                final_response=response,
+                response_sent=False,
+                candidate_live=False,
+                guard_status="stale_after_presend_canary_fallback",
+            )
+            return model_decision
+        direct_source_failure = prompt_source_basis_failure(
+            prompt_source_bases
+        )
     if direct_source_failure:
         logging.warning(
             "direct_prompt_source_suppressed_before_send reason=%s",
             direct_source_failure,
+        )
+        await safely_finalize_shared_brain_synthesis(
+            synthesis_decision,
+            final_response=response,
+            response_sent=False,
+            candidate_live=False,
+            guard_status="prompt_source_presend_failed",
         )
         _finish_direct_repair_generation(
             direct_repair_generation,
@@ -29139,8 +29689,26 @@ async def send_planned_conversation_response(
         logging.info("response_send_succeeded route=%s channel_id=%s message_length=%s", plan.route_mode, getattr(message.channel, "id", 0), len(response or ""))
     except Exception as exc:
         logging.error("response_send_failed route=%s channel_id=%s discord_error_type=%s", plan.route_mode, getattr(message.channel, "id", 0), type(exc).__name__)
+        await safely_finalize_shared_brain_synthesis(
+            synthesis_decision,
+            final_response=response,
+            response_sent=False,
+            candidate_live=False,
+            guard_status="discord_send_failed",
+        )
         _finish_direct_repair_generation(direct_repair_generation, "send_failed")
         return model_decision
+    await safely_finalize_shared_brain_synthesis(
+        synthesis_decision,
+        final_response=response,
+        response_sent=True,
+        candidate_live=synthesis_candidate_active,
+        guard_status=(
+            "candidate_sent"
+            if synthesis_candidate_active
+            else "established_path_sent"
+        ),
+    )
     _finish_direct_repair_generation(direct_repair_generation, "response_committed")
     if allow_greeting_on_commit:
         set_last_greeting_at(message.author.id, message.guild.id, datetime.now(PACIFIC_TZ).isoformat())
@@ -30188,6 +30756,9 @@ async def on_message(message: discord.Message):
                 unified_response_assessment_shadow=prompt_metadata.get(
                     "unified_response_assessment_shadow"
                 ),
+                shared_brain_synthesis_canary_basis=prompt_metadata.get(
+                    "shared_brain_synthesis_canary_basis"
+                ),
             )
             return
 
@@ -30532,6 +31103,9 @@ async def on_message(message: discord.Message):
             unified_response_assessment_shadow=prompt_metadata.get(
                 "unified_response_assessment_shadow"
             ),
+            shared_brain_synthesis_canary_basis=prompt_metadata.get(
+                "shared_brain_synthesis_canary_basis"
+            ),
         )
         return
 
@@ -30827,6 +31401,9 @@ async def on_message(message: discord.Message):
             ),
             unified_response_assessment_shadow=prompt_metadata.get(
                 "unified_response_assessment_shadow"
+            ),
+            shared_brain_synthesis_canary_basis=prompt_metadata.get(
+                "shared_brain_synthesis_canary_basis"
             ),
         )
         return
@@ -31559,6 +32136,7 @@ async def bnl_memory_check(interaction: discord.Interaction):
         f"- memory_governance_canary_configuration: `{memory_governance_canary_configuration()}`",
         f"- memory_governance_canary_last: `{memory_governance_canary_last_diagnostics(interaction.user.id, guild.id)}`",
         f"- unified_moment_canary_configuration: `{unified_moment_canary_configuration()}`",
+        f"- shared_brain_synthesis_canary_configuration: `{shared_brain_synthesis_canary_configuration()}`",
         f"- memory_governance_shadow_enabled: `{'yes' if memory_governance_shadow_enabled() else 'no'}`",
         f"- memory_governance_live_enabled: `{'yes' if memory_governance_live_enabled() else 'no'}`",
         f"- relationship_v2_shadow_enabled: `{'yes' if relationship_v2_shadow_enabled() else 'no'}`",

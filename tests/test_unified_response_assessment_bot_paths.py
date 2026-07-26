@@ -209,6 +209,7 @@ class UnifiedResponseAssessmentBotPathTests(unittest.TestCase):
             )
 
         metadata_on = {}
+        synthesis_basis = object()
         with mock.patch.object(
             bnl01_bot,
             "unified_response_assessment_shadow_enabled",
@@ -221,6 +222,10 @@ class UnifiedResponseAssessmentBotPathTests(unittest.TestCase):
             bnl01_bot,
             "_build_unified_intelligence_packet_shadow",
             return_value=packet,
+        ), mock.patch.object(
+            bnl01_bot,
+            "build_shared_brain_synthesis_basis",
+            return_value=synthesis_basis,
         ):
             prompt_on, *_ = bnl01_bot.build_user_aware_prompt(
                 101,
@@ -238,6 +243,10 @@ class UnifiedResponseAssessmentBotPathTests(unittest.TestCase):
 
         self.assertEqual(prompt_on, prompt_off)
         self.assertNotIn(packet_only_sentinel, prompt_on)
+        self.assertIs(
+            metadata_on["shared_brain_synthesis_canary_basis"],
+            synthesis_basis,
+        )
         self.assertIsNone(
             metadata_off["unified_response_assessment_shadow"]
         )
