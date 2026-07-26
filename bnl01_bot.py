@@ -46,6 +46,7 @@ from bnl_occasion import (
 from bnl_memory_ledger import (
     LedgerWriteResult,
     backfill_atomic_knowledge_candidates,
+    backfill_atomic_knowledge_lifecycle,
     ensure_memory_ledger_schema,
     form_atomic_candidate_from_ledger_entry,
     record_atomic_knowledge_processing_error,
@@ -60,6 +61,7 @@ from bnl_memory_ledger import (
     shadow_memory_tier_row,
     shadow_relationship_journal_row,
     shadow_user_fact_row,
+    sweep_atomic_knowledge_lifecycle,
 )
 from bnl_memory_governance import (
     GovernanceRequest,
@@ -5087,6 +5089,11 @@ def init_db():
             "completed": False,
             "counts": {},
         }
+        knowledge_lifecycle_backfill = {
+            "phase": "disabled",
+            "completed": False,
+            "counts": {},
+        }
         if memory_ledger_shadow_enabled():
             try:
                 knowledge_backfill = backfill_atomic_knowledge_candidates(
@@ -5114,6 +5121,41 @@ def init_db():
                     "completed": False,
                     "counts": {"processing_error": 1},
                 }
+            if knowledge_backfill.get("completed"):
+                try:
+                    knowledge_lifecycle_backfill = (
+                        backfill_atomic_knowledge_lifecycle(
+                            evidence_conn,
+                            batch_size=250,
+                        )
+                    )
+                except Exception as lifecycle_exc:
+                    try:
+                        record_atomic_knowledge_processing_error(
+                            evidence_conn,
+                            guild_id=0,
+                            reason_code=(
+                                "startup_lifecycle_backfill_"
+                                + type(lifecycle_exc).__name__
+                            )[:120],
+                        )
+                    except Exception as diagnostic_exc:
+                        logging.debug(
+                            "atomic_knowledge_lifecycle_"
+                            "backfill_diagnostic_failed error_type=%s",
+                            type(diagnostic_exc).__name__,
+                        )
+                    knowledge_lifecycle_backfill = {
+                        "phase": "error",
+                        "completed": False,
+                        "counts": {"processing_error": 1},
+                    }
+            else:
+                knowledge_lifecycle_backfill = {
+                    "phase": "waiting_for_candidate_backfill",
+                    "completed": False,
+                    "counts": {},
+                }
         evidence_conn.commit()
     finally:
         evidence_conn.close()
@@ -5128,6 +5170,13 @@ def init_db():
             knowledge_backfill.get("phase"),
             int(bool(knowledge_backfill.get("completed"))),
             knowledge_backfill.get("counts"),
+        )
+        logging.info(
+            "atomic_knowledge_lifecycle_backfill "
+            "phase=%s completed=%s counts=%s",
+            knowledge_lifecycle_backfill.get("phase"),
+            int(bool(knowledge_lifecycle_backfill.get("completed"))),
+            knowledge_lifecycle_backfill.get("counts"),
         )
     logging.info("✅ Database initialized successfully.")
 
@@ -22802,25 +22851,67 @@ def iter_managed_guilds():
 
 @tasks.loop(minutes=1)
 async def moment_engine_sweep_task():
-    if not moment_engine_shadow_enabled() or not memory_ledger_shadow_enabled():
+    if not memory_ledger_shadow_enabled():
         return
     try:
         def _sweep():
             conn = sqlite3.connect(DB_FILE)
             try:
-                moment_results = sweep_expired_moment_windows(conn)
-                episode_results = sweep_expired_episodes(conn)
+                moment_results = []
+                episode_results = []
+                if moment_engine_shadow_enabled():
+                    moment_results = sweep_expired_moment_windows(conn)
+                    episode_results = sweep_expired_episodes(conn)
+                try:
+                    lifecycle_result = sweep_atomic_knowledge_lifecycle(
+                        conn,
+                        batch_size=100,
+                        min_interval_seconds=900,
+                    )
+                except Exception as lifecycle_exc:
+                    record_atomic_knowledge_processing_error(
+                        conn,
+                        guild_id=0,
+                        reason_code=(
+                            "periodic_lifecycle_sweep_"
+                            + type(lifecycle_exc).__name__
+                        )[:120],
+                    )
+                    lifecycle_result = {
+                        "ran": False,
+                        "error": type(lifecycle_exc).__name__,
+                    }
+                    logging.debug(
+                        "atomic_knowledge_lifecycle_sweep_failed "
+                        "error_type=%s",
+                        type(lifecycle_exc).__name__,
+                    )
                 conn.commit()
-                return moment_results, episode_results
+                return moment_results, episode_results, lifecycle_result
             finally:
                 conn.close()
-        moment_results, episode_results = await asyncio.to_thread(_sweep)
+        moment_results, episode_results, lifecycle_result = (
+            await asyncio.to_thread(_sweep)
+        )
         if moment_results or episode_results:
             logging.info(
                 "moment_engine_sweep finalized_or_rejected=%s "
                 "episodes_finalized=%s",
                 len(moment_results),
                 len(episode_results),
+            )
+        if (
+            lifecycle_result.get("ran")
+            and int(
+                (
+                    lifecycle_result.get("last_result") or {}
+                ).get("state_changes", 0)
+                or 0
+            )
+        ):
+            logging.info(
+                "atomic_knowledge_lifecycle_sweep result=%s",
+                lifecycle_result.get("last_result"),
             )
     except Exception as exc:
         logging.debug("moment_engine_sweep_failed error_type=%s", type(exc).__name__)
@@ -31269,6 +31360,24 @@ async def bnl_memory_check(interaction: discord.Interaction):
         f"- atomic_knowledge_processing_errors: `{ledger_diag.get('knowledgeCandidateProcessingErrors', 0)}`",
         f"- atomic_knowledge_correction_delete_privacy_invalidations: `{ledger_diag.get('knowledgeCandidateCorrectionDeletePrivacyInvalidations', 0)}`",
         f"- atomic_knowledge_backfill: `{ledger_diag.get('knowledgeCandidateBackfill', {})}`",
+        f"- atomic_knowledge_lifecycle_schema: `{ledger_diag.get('knowledgeLifecycleSchemaVersion', 'absent')}`",
+        f"- atomic_knowledge_consolidation_groups: `{ledger_diag.get('knowledgeLifecycleConsolidationGroups', 0)}`",
+        f"- atomic_knowledge_canonical_candidates: `{ledger_diag.get('knowledgeLifecycleCanonicalCandidates', 0)}`",
+        f"- atomic_knowledge_reinforcement_distribution: `{ledger_diag.get('knowledgeLifecycleReinforcementDistribution', {})}`",
+        f"- atomic_knowledge_consolidated_authority: `{ledger_diag.get('knowledgeLifecycleConsolidatedAuthority', {})}`",
+        f"- atomic_knowledge_consolidated_confidence: `{ledger_diag.get('knowledgeLifecycleConsolidatedConfidence', {})}`",
+        f"- atomic_knowledge_eligible_independent_roots: `{ledger_diag.get('knowledgeLifecycleEligibleIndependentRoots', 0)}`",
+        f"- atomic_knowledge_duplicate_support_roots: `{ledger_diag.get('knowledgeLifecycleDuplicateSupportRoots', 0)}`",
+        f"- atomic_knowledge_conflict_scopes: `{ledger_diag.get('knowledgeLifecycleConflictScopes', 0)}`",
+        f"- atomic_knowledge_review_statuses: `{ledger_diag.get('knowledgeLifecycleReviewStatuses', {})}`",
+        f"- atomic_knowledge_lifecycle_reasons: `{ledger_diag.get('knowledgeLifecycleReasons', {})}`",
+        f"- atomic_knowledge_lifecycle_transitions: `{ledger_diag.get('knowledgeLifecycleTransitionStates', {})}`",
+        f"- atomic_knowledge_lifecycle_event_roots: `{ledger_diag.get('knowledgeLifecycleEventRoots', 0)}`",
+        f"- atomic_knowledge_lifecycle_reinforcement_roots: `{ledger_diag.get('knowledgeLifecycleReinforcementEventRoots', 0)}`",
+        f"- atomic_knowledge_lifecycle_missing_promotion_provenance: `{ledger_diag.get('knowledgeLifecycleMissingPromotionProvenance', 0)}`",
+        f"- atomic_knowledge_lifecycle_dirty_candidates: `{ledger_diag.get('knowledgeLifecycleDirtyCandidates', 0)}`",
+        f"- atomic_knowledge_lifecycle_backfill: `{ledger_diag.get('knowledgeLifecycleBackfill', {})}`",
+        f"- atomic_knowledge_lifecycle_sweep: `{ledger_diag.get('knowledgeLifecycleSweep', {})}`",
         f"- memory_tiers_source_policy: `{memory_tier_source_policy_state}`",
         "- sealed_test_passive_capture: `disabled`",
         f"- sealed_test_conversation_rows: `{'present' if sealed_test_rows_present else 'none'}`",

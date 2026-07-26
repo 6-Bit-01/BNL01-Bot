@@ -7,7 +7,7 @@ adapters may consume only revalidated, route-safe projections.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 import os
@@ -31,6 +31,13 @@ from bnl_canon_source_contract import (
 MEMORY_LEDGER_SCHEMA_VERSION = "memory_ledger_v1"
 ATOMIC_KNOWLEDGE_SCHEMA_VERSION = "memory_ledger_atomic_knowledge_v1"
 ATOMIC_KNOWLEDGE_BACKFILL = "atomic_knowledge_backfill_v1"
+ATOMIC_KNOWLEDGE_LIFECYCLE_SCHEMA_VERSION = (
+    "memory_ledger_atomic_knowledge_lifecycle_v1"
+)
+ATOMIC_KNOWLEDGE_LIFECYCLE_BACKFILL = (
+    "atomic_knowledge_lifecycle_backfill_v1"
+)
+ATOMIC_KNOWLEDGE_LIFECYCLE_SWEEP = "atomic_knowledge_lifecycle_sweep_v1"
 MEMORY_LEDGER_SHADOW_ENV = "BNL_MEMORY_LEDGER_SHADOW_ENABLED"
 BNL_SUBJECT_KEY = "bnl_01"
 
@@ -68,8 +75,26 @@ KNOWLEDGE_CURRENTNESS = frozenset(
     {"current", "historical", "open", "unresolved", "uncertain"}
 )
 KNOWLEDGE_CANDIDATE_STATES = frozenset(
-    {"candidate", "contested", "superseded", "invalidated"}
+    {
+        "candidate",
+        "provisional",
+        "established",
+        "contested",
+        "superseded",
+        "retired",
+        "invalidated",
+    }
 )
+KNOWLEDGE_ACTIVE_CANDIDATE_STATES = frozenset(
+    {"candidate", "provisional", "established"}
+)
+KNOWLEDGE_TERMINAL_CANDIDATE_STATES = frozenset(
+    {"superseded", "retired", "invalidated"}
+)
+# A motif's predicate/contradiction scope is its atomic meaning; the prose value
+# is an evidence-bounded rendering and may vary across independently rooted
+# Moments. Scalar facts and other candidate types retain value-level conflict.
+KNOWLEDGE_SCOPE_CONSOLIDATED_TYPES = frozenset({"topic_or_motif"})
 KNOWLEDGE_TERMINAL_ROOT_LIFECYCLES = frozenset(
     {
         "corrected",
@@ -106,6 +131,13 @@ _KNOWLEDGE_AUTHORITY_RANK = {
     SourceClass.FIRST_PARTY_RECORD.value: 4,
     SourceClass.APPROVED_CANON.value: 5,
     SourceClass.OWNER_CORRECTION.value: 6,
+}
+_KNOWLEDGE_CONFIDENCE_RANK = {
+    Confidence.UNKNOWN.value: 0,
+    Confidence.LOW.value: 1,
+    Confidence.MEDIUM.value: 2,
+    Confidence.HIGH.value: 3,
+    Confidence.APPROVED.value: 4,
 }
 _KNOWLEDGE_RESTRICTED_VISIBILITIES = frozenset(
     {
@@ -377,12 +409,59 @@ def ensure_memory_ledger_schema(conn: sqlite3.Connection) -> None:
             promotion_status TEXT NOT NULL DEFAULT 'unpromoted',
             invalidated_reason TEXT DEFAULT '',
             invalidated_at TEXT DEFAULT '',
+            lifecycle_schema_version TEXT DEFAULT '',
+            consolidation_id TEXT DEFAULT '',
+            canonical_candidate_id TEXT DEFAULT '',
+            supporting_candidate_count INTEGER NOT NULL DEFAULT 0,
+            eligible_independent_root_count INTEGER NOT NULL DEFAULT 0,
+            reinforcement_count INTEGER NOT NULL DEFAULT 0,
+            duplicate_support_count INTEGER NOT NULL DEFAULT 0,
+            conflict_value_count INTEGER NOT NULL DEFAULT 0,
+            consolidated_authority_class TEXT NOT NULL DEFAULT 'legacy_source_blind',
+            consolidated_confidence_class TEXT NOT NULL DEFAULT 'unknown',
+            lifecycle_support_digest TEXT DEFAULT '',
+            lifecycle_reason TEXT DEFAULT '',
+            review_status TEXT NOT NULL DEFAULT 'not_evaluated',
+            review_due_at TEXT DEFAULT '',
+            lifecycle_evaluated_at TEXT DEFAULT '',
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
             UNIQUE(
                 schema_version, guild_id, candidate_type, subject_key,
                 predicate_key, contradiction_key, root_digest
             )
+        )
+        """
+    )
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS memory_ledger_knowledge_lifecycle_events (
+            event_id TEXT PRIMARY KEY,
+            guild_id INTEGER NOT NULL,
+            consolidation_id TEXT NOT NULL,
+            candidate_id TEXT NOT NULL,
+            prior_state TEXT NOT NULL,
+            next_state TEXT NOT NULL,
+            reason_code TEXT NOT NULL,
+            support_digest TEXT NOT NULL,
+            reinforcement_count INTEGER NOT NULL DEFAULT 0,
+            conflict_value_count INTEGER NOT NULL DEFAULT 0,
+            review_status TEXT NOT NULL,
+            occurred_at TEXT NOT NULL
+        )
+        """
+    )
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS memory_ledger_knowledge_lifecycle_roots (
+            event_id TEXT NOT NULL,
+            guild_id INTEGER NOT NULL,
+            candidate_id TEXT NOT NULL,
+            root_entry_id TEXT NOT NULL,
+            evidence_identity_digest TEXT NOT NULL,
+            counts_as_reinforcement INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY(event_id, root_entry_id)
         )
         """
     )
@@ -452,6 +531,21 @@ def ensure_memory_ledger_schema(conn: sqlite3.Connection) -> None:
     for sql in (
         "ALTER TABLE memory_ledger_knowledge_candidates ADD COLUMN confidence_class TEXT NOT NULL DEFAULT 'unknown'",
         "ALTER TABLE memory_ledger_knowledge_roots ADD COLUMN confidence TEXT NOT NULL DEFAULT 'unknown'",
+        "ALTER TABLE memory_ledger_knowledge_candidates ADD COLUMN lifecycle_schema_version TEXT DEFAULT ''",
+        "ALTER TABLE memory_ledger_knowledge_candidates ADD COLUMN consolidation_id TEXT DEFAULT ''",
+        "ALTER TABLE memory_ledger_knowledge_candidates ADD COLUMN canonical_candidate_id TEXT DEFAULT ''",
+        "ALTER TABLE memory_ledger_knowledge_candidates ADD COLUMN supporting_candidate_count INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE memory_ledger_knowledge_candidates ADD COLUMN eligible_independent_root_count INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE memory_ledger_knowledge_candidates ADD COLUMN reinforcement_count INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE memory_ledger_knowledge_candidates ADD COLUMN duplicate_support_count INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE memory_ledger_knowledge_candidates ADD COLUMN conflict_value_count INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE memory_ledger_knowledge_candidates ADD COLUMN consolidated_authority_class TEXT NOT NULL DEFAULT 'legacy_source_blind'",
+        "ALTER TABLE memory_ledger_knowledge_candidates ADD COLUMN consolidated_confidence_class TEXT NOT NULL DEFAULT 'unknown'",
+        "ALTER TABLE memory_ledger_knowledge_candidates ADD COLUMN lifecycle_support_digest TEXT DEFAULT ''",
+        "ALTER TABLE memory_ledger_knowledge_candidates ADD COLUMN lifecycle_reason TEXT DEFAULT ''",
+        "ALTER TABLE memory_ledger_knowledge_candidates ADD COLUMN review_status TEXT NOT NULL DEFAULT 'not_evaluated'",
+        "ALTER TABLE memory_ledger_knowledge_candidates ADD COLUMN review_due_at TEXT DEFAULT ''",
+        "ALTER TABLE memory_ledger_knowledge_candidates ADD COLUMN lifecycle_evaluated_at TEXT DEFAULT ''",
     ):
         try:
             cur.execute(sql)
@@ -473,14 +567,27 @@ def ensure_memory_ledger_schema(conn: sqlite3.Connection) -> None:
         "CREATE INDEX IF NOT EXISTS idx_mlkc_subject ON memory_ledger_knowledge_candidates(guild_id, subject_key, candidate_state)",
         "CREATE INDEX IF NOT EXISTS idx_mlkc_contradiction ON memory_ledger_knowledge_candidates(guild_id, contradiction_key, candidate_state)",
         "CREATE INDEX IF NOT EXISTS idx_mlkc_visibility ON memory_ledger_knowledge_candidates(guild_id, visibility, authority_class)",
+        "CREATE INDEX IF NOT EXISTS idx_mlkc_consolidation ON memory_ledger_knowledge_candidates(guild_id, consolidation_id, candidate_state)",
+        "CREATE INDEX IF NOT EXISTS idx_mlkc_canonical ON memory_ledger_knowledge_candidates(guild_id, canonical_candidate_id, candidate_state)",
         "CREATE INDEX IF NOT EXISTS idx_mlkr_root ON memory_ledger_knowledge_roots(guild_id, root_entry_id, root_status)",
         "CREATE INDEX IF NOT EXISTS idx_mlkp_participant ON memory_ledger_knowledge_participants(guild_id, participant_key)",
         "CREATE INDEX IF NOT EXISTS idx_mlkreceipt_event ON memory_ledger_knowledge_receipts(guild_id, event_type, reason_code)",
+        "CREATE INDEX IF NOT EXISTS idx_mlkle_guild ON memory_ledger_knowledge_lifecycle_events(guild_id, next_state, reason_code)",
+        "CREATE INDEX IF NOT EXISTS idx_mlklr_candidate ON memory_ledger_knowledge_lifecycle_roots(guild_id, candidate_id, counts_as_reinforcement)",
     ]:
         cur.execute(sql)
+    # These triggers are versioned in place so existing production databases
+    # receive lifecycle semantics instead of retaining the v1 trigger bodies.
+    for trigger_name in (
+        "trg_atomic_knowledge_root_delete",
+        "trg_atomic_knowledge_root_change",
+        "trg_atomic_knowledge_participant_delete",
+        "trg_atomic_knowledge_lineage_change",
+    ):
+        cur.execute(f"DROP TRIGGER IF EXISTS {trigger_name}")
     cur.execute(
         """
-        CREATE TRIGGER IF NOT EXISTS trg_atomic_knowledge_root_delete
+        CREATE TRIGGER IF NOT EXISTS trg_atomic_knowledge_root_delete_v2
         AFTER DELETE ON memory_ledger_entries
         BEGIN
           INSERT OR IGNORE INTO memory_ledger_knowledge_receipts(
@@ -501,7 +608,9 @@ def ensure_memory_ledger_schema(conn: sqlite3.Connection) -> None:
           SET normalized_value='',candidate_state='invalidated',
               candidate_eligible=0,live_eligible=0,
               invalidated_reason='root_deleted',
-              invalidated_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP
+              invalidated_at=CURRENT_TIMESTAMP,
+              lifecycle_reason='root_deleted',review_status='dirty',
+              lifecycle_evaluated_at='',updated_at=CURRENT_TIMESTAMP
           WHERE candidate_id IN (
             SELECT candidate_id FROM memory_ledger_knowledge_roots
             WHERE root_entry_id=OLD.entry_id
@@ -516,7 +625,7 @@ def ensure_memory_ledger_schema(conn: sqlite3.Connection) -> None:
     )
     cur.execute(
         """
-        CREATE TRIGGER IF NOT EXISTS trg_atomic_knowledge_root_change
+        CREATE TRIGGER IF NOT EXISTS trg_atomic_knowledge_root_change_v2
         AFTER UPDATE OF lifecycle_status,normalized_value,public_usable,
           visibility,source_class,confidence,subject_key,channel_policy,
           route_mode
@@ -543,11 +652,17 @@ def ensure_memory_ledger_schema(conn: sqlite3.Connection) -> None:
             CASE
               WHEN NEW.lifecycle_status IN ('corrected','superseded')
                 THEN 'superseded'
+              WHEN NEW.lifecycle_status IN ('resolved','expired')
+                THEN 'retired'
               ELSE 'invalidated'
             END,
             CASE
               WHEN NEW.lifecycle_status IN ('corrected','superseded')
                 THEN 'root_superseded'
+              WHEN NEW.lifecycle_status='resolved'
+                THEN 'root_resolved'
+              WHEN NEW.lifecycle_status='expired'
+                THEN 'root_expired'
               WHEN NEW.lifecycle_status IN ('forgotten','deleted','retracted')
                 THEN 'root_privacy_or_deletion'
               WHEN NEW.public_usable IS NOT OLD.public_usable
@@ -585,12 +700,18 @@ def ensure_memory_ledger_schema(conn: sqlite3.Connection) -> None:
             candidate_state=CASE
               WHEN NEW.lifecycle_status IN ('corrected','superseded')
                 THEN 'superseded'
+              WHEN NEW.lifecycle_status IN ('resolved','expired')
+                THEN 'retired'
               ELSE 'invalidated'
             END,
             candidate_eligible=0,live_eligible=0,
             invalidated_reason=CASE
               WHEN NEW.lifecycle_status IN ('corrected','superseded')
                 THEN 'root_superseded'
+              WHEN NEW.lifecycle_status='resolved'
+                THEN 'root_resolved'
+              WHEN NEW.lifecycle_status='expired'
+                THEN 'root_expired'
               WHEN NEW.lifecycle_status IN ('forgotten','deleted','retracted')
                 THEN 'root_privacy_or_deletion'
               WHEN NEW.public_usable IS NOT OLD.public_usable
@@ -604,7 +725,29 @@ def ensure_memory_ledger_schema(conn: sqlite3.Connection) -> None:
                 THEN 'root_confidence_changed'
               ELSE 'root_changed'
             END,
-            invalidated_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP
+            invalidated_at=CURRENT_TIMESTAMP,
+            lifecycle_reason=CASE
+              WHEN NEW.lifecycle_status IN ('corrected','superseded')
+                THEN 'root_superseded'
+              WHEN NEW.lifecycle_status='resolved'
+                THEN 'root_resolved'
+              WHEN NEW.lifecycle_status='expired'
+                THEN 'root_expired'
+              WHEN NEW.lifecycle_status IN ('forgotten','deleted','retracted')
+                THEN 'root_privacy_or_deletion'
+              WHEN NEW.public_usable IS NOT OLD.public_usable
+                OR NEW.visibility IS NOT OLD.visibility
+                OR NEW.source_class IS NOT OLD.source_class
+                OR NEW.subject_key IS NOT OLD.subject_key
+                OR NEW.channel_policy IS NOT OLD.channel_policy
+                OR NEW.route_mode IS NOT OLD.route_mode
+                THEN 'root_privacy_or_provenance_changed'
+              WHEN NEW.confidence IS NOT OLD.confidence
+                THEN 'root_confidence_changed'
+              ELSE 'root_changed'
+            END,
+            review_status='dirty',lifecycle_evaluated_at='',
+            updated_at=CURRENT_TIMESTAMP
           WHERE candidate_id IN (
             SELECT candidate_id FROM memory_ledger_knowledge_roots
             WHERE root_entry_id=NEW.entry_id
@@ -627,7 +770,7 @@ def ensure_memory_ledger_schema(conn: sqlite3.Connection) -> None:
     )
     cur.execute(
         """
-        CREATE TRIGGER IF NOT EXISTS trg_atomic_knowledge_participant_delete
+        CREATE TRIGGER IF NOT EXISTS trg_atomic_knowledge_participant_delete_v2
         AFTER DELETE ON memory_ledger_participants
         BEGIN
           INSERT OR IGNORE INTO memory_ledger_knowledge_receipts(
@@ -649,7 +792,9 @@ def ensure_memory_ledger_schema(conn: sqlite3.Connection) -> None:
           SET normalized_value='',candidate_state='invalidated',
               candidate_eligible=0,live_eligible=0,
               invalidated_reason='participant_deleted',
-              invalidated_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP
+              invalidated_at=CURRENT_TIMESTAMP,
+              lifecycle_reason='participant_deleted',review_status='dirty',
+              lifecycle_evaluated_at='',updated_at=CURRENT_TIMESTAMP
           WHERE candidate_id IN (
             SELECT candidate_id FROM memory_ledger_knowledge_roots
             WHERE root_entry_id=OLD.entry_id
@@ -659,7 +804,7 @@ def ensure_memory_ledger_schema(conn: sqlite3.Connection) -> None:
     )
     cur.execute(
         """
-        CREATE TRIGGER IF NOT EXISTS trg_atomic_knowledge_lineage_change
+        CREATE TRIGGER IF NOT EXISTS trg_atomic_knowledge_lineage_change_v2
         AFTER INSERT ON memory_ledger_lineage
         WHEN NEW.lineage_type IN ('correction_of','supersedes','retracts')
         BEGIN
@@ -697,7 +842,10 @@ def ensure_memory_ledger_schema(conn: sqlite3.Connection) -> None:
             END,
             candidate_eligible=0,live_eligible=0,
             invalidated_reason='root_' || NEW.lineage_type,
-            invalidated_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP
+            invalidated_at=CURRENT_TIMESTAMP,
+            lifecycle_reason='root_' || NEW.lineage_type,
+            review_status='dirty',lifecycle_evaluated_at='',
+            updated_at=CURRENT_TIMESTAMP
           WHERE candidate_id IN (
             SELECT candidate_id FROM memory_ledger_knowledge_roots
             WHERE root_entry_id=NEW.target_entry_id
@@ -1113,6 +1261,954 @@ def _knowledge_participant_scope(
     return participants, ""
 
 
+def _parse_knowledge_time(value: Any) -> datetime | None:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _knowledge_time(value: datetime) -> str:
+    return value.astimezone(timezone.utc).isoformat()
+
+
+def _knowledge_consolidation_id(
+    *,
+    guild_id: int,
+    candidate_type: str,
+    subject_key: str,
+    predicate_key: str,
+    contradiction_key: str,
+    value_digest: str,
+    visibility: str,
+    participant_scope_digest: str,
+) -> str:
+    semantic_value_digest = (
+        "scope_consolidated"
+        if candidate_type in KNOWLEDGE_SCOPE_CONSOLIDATED_TYPES
+        else value_digest
+    )
+    return "mlkcon_" + _knowledge_digest(
+        ATOMIC_KNOWLEDGE_LIFECYCLE_SCHEMA_VERSION,
+        int(guild_id or 0),
+        candidate_type,
+        subject_key,
+        predicate_key,
+        contradiction_key,
+        semantic_value_digest,
+        visibility,
+        participant_scope_digest,
+    )[:40]
+
+
+def _knowledge_evidence_identity(
+    conn: sqlite3.Connection,
+    entry: dict[str, Any],
+) -> str:
+    """Collapse exact source copies while preserving distinct source records."""
+    current_id = str(entry.get("entry_id") or "")
+    current = entry
+    visited = {current_id}
+    for _depth in range(8):
+        duplicate_targets = conn.execute(
+            """
+            SELECT target_entry_id
+            FROM memory_ledger_lineage
+            WHERE entry_id=? AND lineage_type='duplicate_of'
+            ORDER BY target_entry_id
+            """,
+            (current_id,),
+        ).fetchall()
+        target_id = next(
+            (
+                str(row[0] or "")
+                for row in duplicate_targets
+                if str(row[0] or "") and str(row[0] or "") not in visited
+            ),
+            "",
+        )
+        if not target_id:
+            break
+        target = _knowledge_entry_rows(conn, (target_id,)).get(target_id)
+        if not target:
+            break
+        visited.add(target_id)
+        current_id = target_id
+        current = target
+    return _knowledge_digest(
+        int(current.get("guild_id") or 0),
+        current.get("source_table"),
+        current.get("source_row_id"),
+    )
+
+
+def _knowledge_review_policy(
+    *,
+    candidate_type: str,
+    epistemic_statuses: set[str],
+    currentnesses: set[str],
+    last_seen_at: str,
+    now: datetime,
+    authoritative_single_source: bool,
+) -> tuple[str, str, bool]:
+    """Return review status, due time, and conservative stale retirement."""
+    if authoritative_single_source or (
+        candidate_type == "project_event_or_milestone"
+        and currentnesses == {"historical"}
+    ):
+        return "not_required", "", False
+    last_seen = _parse_knowledge_time(last_seen_at)
+    if last_seen is None:
+        return "missing_observation_time", "", False
+    if (
+        "inference" in epistemic_statuses
+        or "contested" in epistemic_statuses
+        or "uncertain" in currentnesses
+    ):
+        review_days, retire_days = 30, 90
+    elif (
+        candidate_type == "open_loop_or_question"
+        or bool(currentnesses.intersection({"open", "unresolved"}))
+    ):
+        review_days, retire_days = 90, 180
+    elif candidate_type == "topic_or_motif" and currentnesses == {"historical"}:
+        return "not_required", "", False
+    else:
+        review_days, retire_days = 180, 0
+    review_due = last_seen + timedelta(days=review_days)
+    retired = bool(
+        retire_days and now >= last_seen + timedelta(days=retire_days)
+    )
+    if retired:
+        return "retired_stale", _knowledge_time(review_due), True
+    return (
+        "due" if now >= review_due else "current",
+        _knowledge_time(review_due),
+        False,
+    )
+
+
+def _knowledge_root_is_eligible(
+    conn: sqlite3.Connection,
+    *,
+    candidate: dict[str, Any],
+    root: dict[str, Any],
+) -> bool:
+    entry = root.get("entry")
+    if not entry or not bool(root.get("is_independent")):
+        return False
+    if str(root.get("root_status") or "") != "eligible":
+        return False
+    if str(entry.get("lifecycle_status") or "") != ACTIVE_LIFECYCLE:
+        return False
+    if _knowledge_is_derivative(entry):
+        return False
+    if _knowledge_operational_or_test_source(entry):
+        return False
+    if str(entry.get("subject_key") or "") != str(
+        candidate.get("subject_key") or ""
+    ):
+        return False
+    if not _knowledge_route_visibility_is_explicit(entry):
+        return False
+    if str(entry.get("visibility") or "") in _KNOWLEDGE_RESTRICTED_VISIBILITIES:
+        return False
+    if (
+        str(candidate.get("visibility") or "")
+        in {
+            Visibility.PUBLIC.value,
+            Visibility.PUBLIC_SAFE.value,
+            Visibility.REFERENCE_CANON.value,
+        }
+        and not bool(entry.get("public_usable"))
+    ):
+        return False
+    if conn.execute(
+        """
+        SELECT 1
+        FROM memory_ledger_lineage
+        WHERE target_entry_id=?
+          AND lineage_type IN ('supersedes','retracts')
+        LIMIT 1
+        """,
+        (entry.get("entry_id"),),
+    ).fetchone():
+        return False
+    return True
+
+
+def _knowledge_candidate_roots(
+    conn: sqlite3.Connection,
+    candidate: dict[str, Any],
+) -> tuple[list[dict[str, Any]], int]:
+    rows = conn.execute(
+        """
+        SELECT root_entry_id,is_independent,root_status
+        FROM memory_ledger_knowledge_roots
+        WHERE candidate_id=?
+        ORDER BY root_entry_id
+        """,
+        (candidate["candidate_id"],),
+    ).fetchall()
+    entry_ids = tuple(str(row[0] or "") for row in rows if str(row[0] or ""))
+    entries = _knowledge_entry_rows(conn, entry_ids)
+    roots: list[dict[str, Any]] = []
+    derivative_count = 0
+    for entry_id, is_independent, root_status in rows:
+        root = {
+            "root_entry_id": str(entry_id or ""),
+            "is_independent": bool(is_independent),
+            "root_status": str(root_status or ""),
+            "entry": entries.get(str(entry_id or "")),
+        }
+        if not bool(is_independent):
+            derivative_count += 1
+        if _knowledge_root_is_eligible(
+            conn,
+            candidate=candidate,
+            root=root,
+        ):
+            root["evidence_identity"] = _knowledge_evidence_identity(
+                conn,
+                root["entry"],
+            )
+            roots.append(root)
+    if roots:
+        visibility, reason = _knowledge_visibility(
+            {
+                str(root["entry"].get("visibility") or "unknown")
+                for root in roots
+            }
+        )
+        if reason or visibility != str(candidate.get("visibility") or ""):
+            return [], derivative_count
+    return roots, derivative_count
+
+
+def _record_knowledge_lifecycle_event(
+    conn: sqlite3.Connection,
+    *,
+    candidate: dict[str, Any],
+    consolidation_id: str,
+    prior_state: str,
+    next_state: str,
+    reason_code: str,
+    reinforcement_count: int,
+    conflict_value_count: int,
+    review_status: str,
+    roots: list[dict[str, Any]],
+) -> None:
+    support_pairs = tuple(
+        sorted(
+            {
+                (
+                    str(root.get("root_entry_id") or ""),
+                    str(root.get("evidence_identity") or ""),
+                )
+                for root in roots
+                if str(root.get("root_entry_id") or "")
+            }
+        )
+    )
+    support_digest = _knowledge_digest(
+        *(
+            f"{root_id}:{evidence_identity}"
+            for root_id, evidence_identity in support_pairs
+        )
+    )
+    event_id = "mlkle_" + _knowledge_digest(
+        ATOMIC_KNOWLEDGE_LIFECYCLE_SCHEMA_VERSION,
+        consolidation_id,
+        candidate["candidate_id"],
+        prior_state,
+        next_state,
+        reason_code,
+        support_digest,
+        reinforcement_count,
+        conflict_value_count,
+        review_status,
+    )[:40]
+    now = _now()
+    inserted = conn.execute(
+        """
+        INSERT OR IGNORE INTO memory_ledger_knowledge_lifecycle_events(
+          event_id,guild_id,consolidation_id,candidate_id,prior_state,
+          next_state,reason_code,support_digest,reinforcement_count,
+          conflict_value_count,review_status,occurred_at
+        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
+        """,
+        (
+            event_id,
+            int(candidate.get("guild_id") or 0),
+            consolidation_id,
+            candidate["candidate_id"],
+            prior_state,
+            next_state,
+            reason_code,
+            support_digest,
+            int(reinforcement_count or 0),
+            int(conflict_value_count or 0),
+            review_status,
+            now,
+        ),
+    ).rowcount
+    if not inserted:
+        return
+    representatives: dict[str, str] = {}
+    for root_id, evidence_identity in support_pairs:
+        representatives.setdefault(evidence_identity, root_id)
+    for root_id, evidence_identity in support_pairs:
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO memory_ledger_knowledge_lifecycle_roots(
+              event_id,guild_id,candidate_id,root_entry_id,
+              evidence_identity_digest,counts_as_reinforcement,created_at
+            ) VALUES(?,?,?,?,?,?,?)
+            """,
+            (
+                event_id,
+                int(candidate.get("guild_id") or 0),
+                candidate["candidate_id"],
+                root_id,
+                evidence_identity,
+                1 if representatives.get(evidence_identity) == root_id else 0,
+                now,
+            ),
+        )
+    event_type = (
+        "promoted"
+        if next_state in {"provisional", "established"}
+        and prior_state != next_state
+        else "reinforced"
+        if prior_state == next_state
+        else next_state
+    )
+    _record_knowledge_receipt(
+        conn,
+        guild_id=int(candidate.get("guild_id") or 0),
+        event_type=event_type,
+        reason_code=reason_code,
+        candidate_id=candidate["candidate_id"],
+        candidate_type=str(candidate.get("candidate_type") or ""),
+        root_entry_ids=tuple(root_id for root_id, _identity in support_pairs),
+        proposal_digest=support_digest,
+    )
+
+
+def _knowledge_scope_rows(
+    conn: sqlite3.Connection,
+    scope: tuple[Any, ...],
+) -> list[dict[str, Any]]:
+    rows = conn.execute(
+        """
+        SELECT
+          candidate_id,guild_id,candidate_type,subject_key,predicate_key,
+          normalized_value,value_digest,epistemic_status,currentness,
+          candidate_state,contradiction_key,supersedes_candidate_id,
+          visibility,authority_class,confidence_class,route_scope_json,
+          participant_scope_digest,first_seen_at,last_seen_at,
+          candidate_eligible,invalidated_reason,lifecycle_schema_version,
+          consolidation_id,canonical_candidate_id,
+          supporting_candidate_count,eligible_independent_root_count,
+          reinforcement_count,duplicate_support_count,
+          conflict_value_count,consolidated_authority_class,
+          consolidated_confidence_class,lifecycle_support_digest,
+          lifecycle_reason,review_status,review_due_at,
+          lifecycle_evaluated_at
+        FROM memory_ledger_knowledge_candidates
+        WHERE guild_id=? AND candidate_type=? AND subject_key=?
+          AND predicate_key=? AND contradiction_key=? AND visibility=?
+          AND participant_scope_digest=?
+        ORDER BY candidate_id
+        """,
+        scope,
+    ).fetchall()
+    keys = (
+        "candidate_id",
+        "guild_id",
+        "candidate_type",
+        "subject_key",
+        "predicate_key",
+        "normalized_value",
+        "value_digest",
+        "epistemic_status",
+        "currentness",
+        "candidate_state",
+        "contradiction_key",
+        "supersedes_candidate_id",
+        "visibility",
+        "authority_class",
+        "confidence_class",
+        "route_scope_json",
+        "participant_scope_digest",
+        "first_seen_at",
+        "last_seen_at",
+        "candidate_eligible",
+        "invalidated_reason",
+        "lifecycle_schema_version",
+        "consolidation_id",
+        "canonical_candidate_id",
+        "supporting_candidate_count",
+        "eligible_independent_root_count",
+        "reinforcement_count",
+        "duplicate_support_count",
+        "conflict_value_count",
+        "consolidated_authority_class",
+        "consolidated_confidence_class",
+        "lifecycle_support_digest",
+        "lifecycle_reason",
+        "review_status",
+        "review_due_at",
+        "lifecycle_evaluated_at",
+    )
+    return [dict(zip(keys, row)) for row in rows]
+
+
+def _reconcile_atomic_knowledge_scope(
+    conn: sqlite3.Connection,
+    scope: tuple[Any, ...],
+    *,
+    now: datetime,
+) -> dict[str, int]:
+    candidates = _knowledge_scope_rows(conn, scope)
+    if not candidates:
+        return {"scopes": 0, "candidates": 0, "state_changes": 0}
+    by_id = {candidate["candidate_id"]: candidate for candidate in candidates}
+    explicitly_superseded = {
+        str(candidate.get("supersedes_candidate_id") or "")
+        for candidate in candidates
+        if str(candidate.get("supersedes_candidate_id") or "") in by_id
+        and candidate.get("candidate_state")
+        not in KNOWLEDGE_TERMINAL_CANDIDATE_STATES
+    }
+    candidate_roots: dict[str, list[dict[str, Any]]] = {}
+    candidate_derivatives: dict[str, int] = {}
+    for candidate in candidates:
+        if (
+            candidate.get("candidate_state")
+            in KNOWLEDGE_TERMINAL_CANDIDATE_STATES
+            or candidate["candidate_id"] in explicitly_superseded
+            or not str(candidate.get("normalized_value") or "")
+        ):
+            candidate_roots[candidate["candidate_id"]] = []
+            candidate_derivatives[candidate["candidate_id"]] = 0
+            continue
+        roots, derivative_count = _knowledge_candidate_roots(conn, candidate)
+        candidate_roots[candidate["candidate_id"]] = roots
+        candidate_derivatives[candidate["candidate_id"]] = derivative_count
+
+    groups: dict[str, dict[str, Any]] = {}
+    for candidate in candidates:
+        consolidation_id = _knowledge_consolidation_id(
+            guild_id=int(candidate.get("guild_id") or 0),
+            candidate_type=str(candidate.get("candidate_type") or ""),
+            subject_key=str(candidate.get("subject_key") or ""),
+            predicate_key=str(candidate.get("predicate_key") or ""),
+            contradiction_key=str(candidate.get("contradiction_key") or ""),
+            value_digest=str(candidate.get("value_digest") or ""),
+            visibility=str(candidate.get("visibility") or ""),
+            participant_scope_digest=str(
+                candidate.get("participant_scope_digest") or ""
+            ),
+        )
+        group = groups.setdefault(
+            consolidation_id,
+            {
+                "candidates": [],
+                "roots": {},
+                "evidence": {},
+                "derivative_count": 0,
+            },
+        )
+        group["candidates"].append(candidate)
+        roots = candidate_roots.get(candidate["candidate_id"], [])
+        if roots:
+            group["derivative_count"] += int(
+                candidate_derivatives.get(candidate["candidate_id"], 0)
+            )
+        for root in roots:
+            root_id = str(root.get("root_entry_id") or "")
+            evidence_identity = str(root.get("evidence_identity") or "")
+            group["roots"][root_id] = root
+            group["evidence"].setdefault(evidence_identity, set()).add(root_id)
+
+    for consolidation_id, group in groups.items():
+        active_ids = sorted(
+            candidate["candidate_id"]
+            for candidate in group["candidates"]
+            if candidate_roots.get(candidate["candidate_id"])
+            and candidate["candidate_id"] not in explicitly_superseded
+        )
+        group["canonical_candidate_id"] = (
+            active_ids[0]
+            if active_ids
+            else min(
+                candidate["candidate_id"]
+                for candidate in group["candidates"]
+            )
+        )
+        authorities = {
+            str(root["entry"].get("source_class") or "")
+            for root in group["roots"].values()
+        }
+        group["authority_class"] = (
+            min(
+                authorities,
+                key=lambda value: (
+                    _KNOWLEDGE_AUTHORITY_RANK.get(value, -1),
+                    value,
+                ),
+            )
+            if authorities
+            else SourceClass.LEGACY_SOURCE_BLIND.value
+        )
+        confidences = {
+            str(
+                root["entry"].get("confidence")
+                or Confidence.UNKNOWN.value
+            )
+            for root in group["roots"].values()
+        }
+        group["confidence_class"] = (
+            min(
+                confidences,
+                key=lambda value: (
+                    _KNOWLEDGE_CONFIDENCE_RANK.get(value, 0),
+                    value,
+                ),
+            )
+            if confidences
+            else Confidence.UNKNOWN.value
+        )
+        group["support_digest"] = _knowledge_digest(
+            *(
+                f"{root_id}:{root.get('evidence_identity') or ''}"
+                for root_id, root in sorted(group["roots"].items())
+            )
+        )
+        root_ids = tuple(sorted(group["roots"]))
+        root_lineage_correction = bool(
+            root_ids
+            and conn.execute(
+                """
+                SELECT 1
+                FROM memory_ledger_lineage
+                WHERE entry_id IN (%s)
+                  AND lineage_type IN ('correction_of','supersedes')
+                LIMIT 1
+                """ % ",".join("?" for _entry_id in root_ids),
+                root_ids,
+            ).fetchone()
+        )
+        group["explicit_correction_source"] = root_lineage_correction or any(
+            bool(str(candidate.get("supersedes_candidate_id") or ""))
+            and bool(candidate_roots.get(candidate["candidate_id"]))
+            for candidate in group["candidates"]
+        )
+        group["authoritative_single_source"] = (
+            len(group["evidence"]) == 1
+            and (
+                group["authority_class"]
+                in {
+                    SourceClass.APPROVED_CANON.value,
+                    SourceClass.OWNER_CORRECTION.value,
+                }
+                or bool(group["explicit_correction_source"])
+            )
+        )
+        last_seen = max(
+            (
+                str(candidate.get("last_seen_at") or "")
+                for candidate in group["candidates"]
+            ),
+            default="",
+        )
+        review_status, review_due_at, stale_retired = (
+            _knowledge_review_policy(
+                candidate_type=str(
+                    group["candidates"][0].get("candidate_type") or ""
+                ),
+                epistemic_statuses={
+                    str(candidate.get("epistemic_status") or "")
+                    for candidate in group["candidates"]
+                },
+                currentnesses={
+                    str(candidate.get("currentness") or "")
+                    for candidate in group["candidates"]
+                },
+                last_seen_at=last_seen,
+                now=now,
+                authoritative_single_source=bool(
+                    group["authoritative_single_source"]
+                ),
+            )
+        )
+        group["review_status"] = review_status
+        group["review_due_at"] = review_due_at
+        group["stale_retired"] = stale_retired
+
+    active_group_ids = {
+        consolidation_id
+        for consolidation_id, group in groups.items()
+        if group["roots"] and not group["stale_retired"]
+    }
+    conflict_value_count = len(active_group_ids)
+    changes = 0
+    evaluated_at = _knowledge_time(now)
+    for consolidation_id, group in groups.items():
+        roots = list(group["roots"].values())
+        root_count = len(group["roots"])
+        reinforcement_count = len(group["evidence"])
+        duplicate_support_count = max(0, root_count - reinforcement_count)
+        supporting_candidate_count = sum(
+            1
+            for candidate in group["candidates"]
+            if candidate_roots.get(candidate["candidate_id"])
+        )
+        forced_contested = any(
+            str(candidate.get("epistemic_status") or "") == "contested"
+            or str(candidate.get("invalidated_reason") or "")
+            == "same_roots_meaning_mismatch"
+            for candidate in group["candidates"]
+        )
+        for candidate in group["candidates"]:
+            candidate_id = candidate["candidate_id"]
+            prior_state = str(candidate.get("candidate_state") or "candidate")
+            valid_roots = candidate_roots.get(candidate_id, [])
+            reason = ""
+            if prior_state == "invalidated":
+                next_state = "invalidated"
+                reason = str(
+                    candidate.get("invalidated_reason")
+                    or candidate.get("lifecycle_reason")
+                    or "source_invalidated"
+                )
+            elif prior_state == "superseded" or candidate_id in explicitly_superseded:
+                next_state = "superseded"
+                reason = str(
+                    candidate.get("invalidated_reason")
+                    or "explicit_candidate_supersession"
+                )
+            elif prior_state == "retired":
+                next_state = "retired"
+                reason = str(
+                    candidate.get("invalidated_reason")
+                    or candidate.get("lifecycle_reason")
+                    or "retired"
+                )
+            elif not valid_roots:
+                root_lifecycles = {
+                    str(row[0] or "")
+                    for row in conn.execute(
+                        """
+                        SELECT lifecycle_status
+                        FROM memory_ledger_knowledge_roots
+                        WHERE candidate_id=? AND is_independent=1
+                        """,
+                        (candidate_id,),
+                    ).fetchall()
+                }
+                if root_lifecycles and root_lifecycles.issubset(
+                    {"resolved", "expired"}
+                ):
+                    next_state = "retired"
+                    reason = "all_independent_roots_resolved_or_expired"
+                else:
+                    next_state = "invalidated"
+                    reason = "no_eligible_independent_roots"
+            elif bool(group["stale_retired"]):
+                next_state = "retired"
+                reason = "stale_uncertain_or_open_knowledge"
+            elif conflict_value_count > 1:
+                next_state = "contested"
+                reason = "unresolved_contradiction"
+            elif forced_contested:
+                next_state = "contested"
+                reason = (
+                    "same_roots_meaning_mismatch"
+                    if str(candidate.get("invalidated_reason") or "")
+                    == "same_roots_meaning_mismatch"
+                    else "explicitly_contested_evidence"
+                )
+            elif (
+                bool(group["authoritative_single_source"])
+                or (
+                    reinforcement_count >= 2
+                    and not {
+                        str(item.get("epistemic_status") or "")
+                        for item in group["candidates"]
+                    }.intersection({"inference", "contested"})
+                    and not {
+                        str(item.get("currentness") or "")
+                        for item in group["candidates"]
+                    }.intersection({"uncertain", "unresolved"})
+                )
+            ):
+                next_state = "established"
+                reason = (
+                    "explicit_correction_established"
+                    if bool(group["explicit_correction_source"])
+                    else "authoritative_source_established"
+                    if bool(group["authoritative_single_source"])
+                    else "independent_reinforcement_established"
+                )
+            elif str(candidate.get("epistemic_status") or "") == "inference":
+                next_state = "candidate"
+                reason = "inference_requires_review"
+            else:
+                next_state = "provisional"
+                reason = "single_independent_source_provisional"
+            candidate_eligible = int(
+                next_state in KNOWLEDGE_ACTIVE_CANDIDATE_STATES
+            )
+            next_invalidated_reason = (
+                reason
+                if next_state
+                in {"contested", "superseded", "retired", "invalidated"}
+                else ""
+            )
+            next_invalidated_at = (
+                str(candidate.get("lifecycle_evaluated_at") or evaluated_at)
+                if next_invalidated_reason
+                else ""
+            )
+            new_values = (
+                next_state,
+                candidate_eligible,
+                ATOMIC_KNOWLEDGE_LIFECYCLE_SCHEMA_VERSION,
+                consolidation_id,
+                group["canonical_candidate_id"],
+                supporting_candidate_count,
+                root_count,
+                reinforcement_count,
+                duplicate_support_count,
+                conflict_value_count,
+                group["authority_class"],
+                group["confidence_class"],
+                group["support_digest"],
+                reason,
+                group["review_status"],
+                group["review_due_at"],
+            )
+            old_values = (
+                prior_state,
+                int(candidate.get("candidate_eligible") or 0),
+                str(candidate.get("lifecycle_schema_version") or ""),
+                str(candidate.get("consolidation_id") or ""),
+                str(candidate.get("canonical_candidate_id") or ""),
+                int(candidate.get("supporting_candidate_count") or 0),
+                int(candidate.get("eligible_independent_root_count") or 0),
+                int(candidate.get("reinforcement_count") or 0),
+                int(candidate.get("duplicate_support_count") or 0),
+                int(candidate.get("conflict_value_count") or 0),
+                str(
+                    candidate.get("consolidated_authority_class") or ""
+                ),
+                str(
+                    candidate.get("consolidated_confidence_class") or ""
+                ),
+                str(candidate.get("lifecycle_support_digest") or ""),
+                str(candidate.get("lifecycle_reason") or ""),
+                str(candidate.get("review_status") or ""),
+                str(candidate.get("review_due_at") or ""),
+            )
+            if new_values != old_values:
+                _record_knowledge_lifecycle_event(
+                    conn,
+                    candidate=candidate,
+                    consolidation_id=consolidation_id,
+                    prior_state=prior_state,
+                    next_state=next_state,
+                    reason_code=reason,
+                    reinforcement_count=reinforcement_count,
+                    conflict_value_count=conflict_value_count,
+                    review_status=str(group["review_status"]),
+                    roots=roots,
+                )
+                conn.execute(
+                    """
+                    UPDATE memory_ledger_knowledge_candidates
+                    SET candidate_state=?,candidate_eligible=?,live_eligible=0,
+                        lifecycle_schema_version=?,consolidation_id=?,
+                        canonical_candidate_id=?,
+                        supporting_candidate_count=?,
+                        eligible_independent_root_count=?,
+                        reinforcement_count=?,duplicate_support_count=?,
+                        conflict_value_count=?,
+                        consolidated_authority_class=?,
+                        consolidated_confidence_class=?,
+                        lifecycle_support_digest=?,lifecycle_reason=?,
+                        review_status=?,review_due_at=?,
+                        lifecycle_evaluated_at=?,invalidated_reason=?,
+                        invalidated_at=?,updated_at=?
+                    WHERE candidate_id=?
+                    """,
+                    (
+                        next_state,
+                        candidate_eligible,
+                        ATOMIC_KNOWLEDGE_LIFECYCLE_SCHEMA_VERSION,
+                        consolidation_id,
+                        group["canonical_candidate_id"],
+                        supporting_candidate_count,
+                        root_count,
+                        reinforcement_count,
+                        duplicate_support_count,
+                        conflict_value_count,
+                        group["authority_class"],
+                        group["confidence_class"],
+                        group["support_digest"],
+                        reason,
+                        group["review_status"],
+                        group["review_due_at"],
+                        evaluated_at,
+                        next_invalidated_reason,
+                        next_invalidated_at,
+                        evaluated_at,
+                        candidate_id,
+                    ),
+                )
+                changes += 1
+            else:
+                conn.execute(
+                    """
+                    UPDATE memory_ledger_knowledge_candidates
+                    SET live_eligible=0,lifecycle_evaluated_at=?
+                    WHERE candidate_id=?
+                      AND (
+                        live_eligible<>0
+                        OR COALESCE(lifecycle_evaluated_at,'')=''
+                      )
+                    """,
+                    (evaluated_at, candidate_id),
+                )
+    return {
+        "scopes": 1,
+        "candidates": len(candidates),
+        "state_changes": changes,
+    }
+
+
+def reconcile_atomic_knowledge_lifecycle(
+    conn: sqlite3.Connection,
+    *,
+    candidate_ids: tuple[str, ...] = (),
+    guild_id: int | None = None,
+    now: str | datetime | None = None,
+) -> dict[str, int]:
+    """Deterministically consolidate and evaluate selected contradiction scopes."""
+    ensure_memory_ledger_schema(conn)
+    if isinstance(now, datetime):
+        evaluated_now = now
+    else:
+        evaluated_now = _parse_knowledge_time(now) if now else None
+    evaluated_now = evaluated_now or datetime.now(timezone.utc)
+    if evaluated_now.tzinfo is None:
+        evaluated_now = evaluated_now.replace(tzinfo=timezone.utc)
+    scopes: set[tuple[Any, ...]] = set()
+    if candidate_ids:
+        clean_ids = tuple(
+            sorted(
+                {
+                    str(candidate_id or "")
+                    for candidate_id in candidate_ids
+                    if str(candidate_id or "")
+                }
+            )
+        )
+        if clean_ids:
+            placeholders = ",".join("?" for _candidate_id in clean_ids)
+            rows = conn.execute(
+                """
+                SELECT DISTINCT
+                  guild_id,candidate_type,subject_key,predicate_key,
+                  contradiction_key,visibility,participant_scope_digest
+                FROM memory_ledger_knowledge_candidates
+                WHERE candidate_id IN (%s)
+                """ % placeholders,
+                clean_ids,
+            ).fetchall()
+            scopes.update(tuple(row) for row in rows)
+    else:
+        if guild_id is None:
+            rows = conn.execute(
+                """
+                SELECT DISTINCT
+                  guild_id,candidate_type,subject_key,predicate_key,
+                  contradiction_key,visibility,participant_scope_digest
+                FROM memory_ledger_knowledge_candidates
+                """
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """
+                SELECT DISTINCT
+                  guild_id,candidate_type,subject_key,predicate_key,
+                  contradiction_key,visibility,participant_scope_digest
+                FROM memory_ledger_knowledge_candidates
+                WHERE guild_id=?
+                """,
+                (int(guild_id or 0),),
+            ).fetchall()
+        scopes.update(tuple(row) for row in rows)
+    report = {"scopes": 0, "candidates": 0, "state_changes": 0}
+    for scope in sorted(scopes):
+        result = _reconcile_atomic_knowledge_scope(
+            conn,
+            scope,
+            now=evaluated_now.astimezone(timezone.utc),
+        )
+        for key in report:
+            report[key] += int(result.get(key, 0) or 0)
+    return report
+
+
+def reconcile_atomic_knowledge_lifecycle_for_roots(
+    conn: sqlite3.Connection,
+    *,
+    root_entry_ids: tuple[str, ...],
+    now: str | datetime | None = None,
+) -> dict[str, int]:
+    """Re-evaluate every contradiction scope touched by exact Ledger roots."""
+    clean_ids = tuple(
+        sorted(
+            {
+                str(entry_id or "")
+                for entry_id in root_entry_ids
+                if str(entry_id or "")
+            }
+        )
+    )
+    if not clean_ids:
+        return {"scopes": 0, "candidates": 0, "state_changes": 0}
+    ensure_memory_ledger_schema(conn)
+    placeholders = ",".join("?" for _entry_id in clean_ids)
+    candidate_ids = tuple(
+        str(row[0])
+        for row in conn.execute(
+            """
+            SELECT DISTINCT candidate_id
+            FROM memory_ledger_knowledge_roots
+            WHERE root_entry_id IN (%s)
+            ORDER BY candidate_id
+            """ % placeholders,
+            clean_ids,
+        ).fetchall()
+    )
+    if not candidate_ids:
+        return {"scopes": 0, "candidates": 0, "state_changes": 0}
+    return reconcile_atomic_knowledge_lifecycle(
+        conn,
+        candidate_ids=candidate_ids,
+        now=now,
+    )
+
+
 def form_atomic_knowledge_candidate(
     conn: sqlite3.Connection,
     proposal: AtomicKnowledgeProposal,
@@ -1482,20 +2578,16 @@ def _form_atomic_knowledge_candidate_impl(
         authority_values,
         key=lambda value: (_KNOWLEDGE_AUTHORITY_RANK[value], value),
     )
-    confidence_rank = {
-        Confidence.UNKNOWN.value: 0,
-        Confidence.LOW.value: 1,
-        Confidence.MEDIUM.value: 2,
-        Confidence.HIGH.value: 3,
-        Confidence.APPROVED.value: 4,
-    }
     confidence_values = {
         str(entry.get("confidence") or Confidence.UNKNOWN.value)
         for entry in independent_entries
     }
     confidence_class = min(
         confidence_values,
-        key=lambda value: (confidence_rank.get(value, 0), value),
+        key=lambda value: (
+            _KNOWLEDGE_CONFIDENCE_RANK.get(value, 0),
+            value,
+        ),
     )
     contradiction_key = _knowledge_tag(
         proposal.contradiction_key
@@ -1594,6 +2686,10 @@ def _form_atomic_knowledge_candidate_impl(
                 root_entry_ids=all_ids,
                 proposal_digest=value_digest,
             )
+            reconcile_atomic_knowledge_lifecycle(
+                conn,
+                candidate_ids=(candidate_id,),
+            )
             return AtomicKnowledgeResult(
                 candidate_id,
                 "contested",
@@ -1613,28 +2709,35 @@ def _form_atomic_knowledge_candidate_impl(
             """,
             (last_seen, last_seen, _now(), candidate_id),
         )
+        active_match = (
+            str(existing[1]) in KNOWLEDGE_ACTIVE_CANDIDATE_STATES
+            and bool(existing[2])
+        )
+        match_reason = (
+            "matched_terminal_candidate"
+            if str(existing[1]) in KNOWLEDGE_TERMINAL_CANDIDATE_STATES
+            else "matched_contested_candidate"
+            if not active_match
+            else "exact_candidate_match"
+        )
         _record_knowledge_receipt(
             conn,
             guild_id=guild_id,
             event_type="matched_existing",
-            reason_code=(
-                "matched_terminal_candidate"
-                if str(existing[1]) != "candidate" or not bool(existing[2])
-                else "exact_candidate_match"
-            ),
+            reason_code=match_reason,
             candidate_id=candidate_id,
             candidate_type=candidate_type,
             root_entry_ids=all_ids,
             proposal_digest=value_digest,
         )
+        reconcile_atomic_knowledge_lifecycle(
+            conn,
+            candidate_ids=(candidate_id,),
+        )
         return AtomicKnowledgeResult(
             candidate_id,
             "matched_existing",
-            (
-                "matched_terminal_candidate"
-                if str(existing[1]) != "candidate" or not bool(existing[2])
-                else "exact_candidate_match"
-            ),
+            match_reason,
             candidate_type,
             len(all_ids),
         )
@@ -1656,15 +2759,19 @@ def _form_atomic_knowledge_candidate_impl(
             candidate_id,
         ),
     ).fetchall()
-    conflicting_rows = [
-        (
-            str(row[0]),
-            str(row[2] or ""),
-            bool(row[3]),
-        )
-        for row in conflicts
-        if _canon(row[1]) != _canon(meaning)
-    ]
+    conflicting_rows = (
+        []
+        if candidate_type in KNOWLEDGE_SCOPE_CONSOLIDATED_TYPES
+        else [
+            (
+                str(row[0]),
+                str(row[2] or ""),
+                bool(row[3]),
+            )
+            for row in conflicts
+            if _canon(row[1]) != _canon(meaning)
+        ]
+    )
     explicitly_superseded: list[str] = []
     unresolved_conflicts: list[str] = []
     for conflict_id, conflict_state, conflict_eligible in conflicting_rows:
@@ -1695,7 +2802,10 @@ def _form_atomic_knowledge_candidate_impl(
             tuple(independent_ids + old_roots),
         ).fetchone():
             explicitly_superseded.append(conflict_id)
-        elif conflict_state == "candidate" and conflict_eligible:
+        elif (
+            conflict_state in KNOWLEDGE_ACTIVE_CANDIDATE_STATES
+            and conflict_eligible
+        ):
             unresolved_conflicts.append(conflict_id)
 
     initial_state = (
@@ -1887,6 +2997,10 @@ def _form_atomic_knowledge_candidate_impl(
         candidate_type=candidate_type,
         root_entry_ids=all_ids,
         proposal_digest=value_digest,
+    )
+    reconcile_atomic_knowledge_lifecycle(
+        conn,
+        candidate_ids=(candidate_id,),
     )
     return AtomicKnowledgeResult(
         candidate_id,
@@ -2276,6 +3390,237 @@ def backfill_atomic_knowledge_candidates(
     }
 
 
+def backfill_atomic_knowledge_lifecycle(
+    conn: sqlite3.Connection,
+    *,
+    batch_size: int = 250,
+    now: str | datetime | None = None,
+) -> dict[str, Any]:
+    """Run one bounded, resumable lifecycle pass over existing candidates."""
+    ensure_memory_ledger_schema(conn)
+    safe_batch = max(1, min(int(batch_size or 250), 500))
+    state = conn.execute(
+        """
+        SELECT phase,cursor_value,completed,counts_json
+        FROM memory_ledger_knowledge_backfill
+        WHERE migration_key=?
+        """,
+        (ATOMIC_KNOWLEDGE_LIFECYCLE_BACKFILL,),
+    ).fetchone()
+    if state:
+        phase = str(state[0] or "candidates")
+        cursor = str(state[1] or "")
+        completed = bool(state[2])
+        try:
+            counts = {
+                str(key): int(value or 0)
+                for key, value in json.loads(str(state[3] or "{}")).items()
+            }
+        except (TypeError, ValueError, json.JSONDecodeError):
+            counts = {}
+    else:
+        phase, cursor, completed, counts = "candidates", "", False, {}
+        conn.execute(
+            """
+            INSERT INTO memory_ledger_knowledge_backfill(
+              migration_key,phase,cursor_value,completed,counts_json,updated_at
+            ) VALUES(?,?,?,?,?,?)
+            """,
+            (
+                ATOMIC_KNOWLEDGE_LIFECYCLE_BACKFILL,
+                phase,
+                cursor,
+                0,
+                "{}",
+                _now(),
+            ),
+        )
+    if completed:
+        return {
+            "migration": ATOMIC_KNOWLEDGE_LIFECYCLE_BACKFILL,
+            "phase": phase,
+            "completed": True,
+            "counts": counts,
+        }
+    rows = conn.execute(
+        """
+        SELECT candidate_id
+        FROM memory_ledger_knowledge_candidates
+        WHERE candidate_id>?
+        ORDER BY candidate_id
+        LIMIT ?
+        """,
+        (cursor, safe_batch),
+    ).fetchall()
+    candidate_ids = tuple(str(row[0] or "") for row in rows)
+    if candidate_ids:
+        result = reconcile_atomic_knowledge_lifecycle(
+            conn,
+            candidate_ids=candidate_ids,
+            now=now,
+        )
+        counts["scopes_evaluated"] = int(
+            counts.get("scopes_evaluated", 0) or 0
+        ) + int(result.get("scopes", 0) or 0)
+        counts["candidates_evaluated"] = int(
+            counts.get("candidates_evaluated", 0) or 0
+        ) + int(result.get("candidates", 0) or 0)
+        counts["state_changes"] = int(
+            counts.get("state_changes", 0) or 0
+        ) + int(result.get("state_changes", 0) or 0)
+        cursor = candidate_ids[-1]
+    if len(rows) < safe_batch:
+        phase, cursor, completed = "complete", "", True
+    conn.execute(
+        """
+        UPDATE memory_ledger_knowledge_backfill
+        SET phase=?,cursor_value=?,completed=?,counts_json=?,updated_at=?
+        WHERE migration_key=?
+        """,
+        (
+            phase,
+            cursor,
+            1 if completed else 0,
+            json.dumps(counts, sort_keys=True),
+            _now(),
+            ATOMIC_KNOWLEDGE_LIFECYCLE_BACKFILL,
+        ),
+    )
+    return {
+        "migration": ATOMIC_KNOWLEDGE_LIFECYCLE_BACKFILL,
+        "phase": phase,
+        "completed": bool(completed),
+        "counts": counts,
+    }
+
+
+def sweep_atomic_knowledge_lifecycle(
+    conn: sqlite3.Connection,
+    *,
+    batch_size: int = 100,
+    now: str | datetime | None = None,
+    min_interval_seconds: int = 900,
+) -> dict[str, Any]:
+    """Periodically revisit a bounded candidate slice for review/decay."""
+    ensure_memory_ledger_schema(conn)
+    safe_batch = max(1, min(int(batch_size or 100), 250))
+    if isinstance(now, datetime):
+        sweep_now = now
+    else:
+        sweep_now = _parse_knowledge_time(now) if now else None
+    sweep_now = sweep_now or datetime.now(timezone.utc)
+    if sweep_now.tzinfo is None:
+        sweep_now = sweep_now.replace(tzinfo=timezone.utc)
+    state = conn.execute(
+        """
+        SELECT cursor_value,counts_json,updated_at
+        FROM memory_ledger_knowledge_backfill
+        WHERE migration_key=?
+        """,
+        (ATOMIC_KNOWLEDGE_LIFECYCLE_SWEEP,),
+    ).fetchone()
+    if state:
+        cursor = str(state[0] or "")
+        try:
+            counts = {
+                str(key): int(value or 0)
+                for key, value in json.loads(str(state[1] or "{}")).items()
+            }
+        except (TypeError, ValueError, json.JSONDecodeError):
+            counts = {}
+        last_run = _parse_knowledge_time(state[2])
+        if (
+            last_run is not None
+            and max(0, int(min_interval_seconds or 0)) > 0
+            and (
+                sweep_now.astimezone(timezone.utc) - last_run
+            ).total_seconds()
+            < max(0, int(min_interval_seconds or 0))
+        ):
+            return {
+                "migration": ATOMIC_KNOWLEDGE_LIFECYCLE_SWEEP,
+                "ran": False,
+                "cursor": cursor,
+                "wrapped": False,
+                "counts": counts,
+            }
+    else:
+        cursor, counts = "", {}
+        conn.execute(
+            """
+            INSERT INTO memory_ledger_knowledge_backfill(
+              migration_key,phase,cursor_value,completed,counts_json,updated_at
+            ) VALUES(?,?,?,?,?,?)
+            """,
+            (
+                ATOMIC_KNOWLEDGE_LIFECYCLE_SWEEP,
+                "sweep",
+                "",
+                0,
+                "{}",
+                _knowledge_time(sweep_now),
+            ),
+        )
+    rows = conn.execute(
+        """
+        SELECT candidate_id
+        FROM memory_ledger_knowledge_candidates
+        WHERE candidate_id>?
+        ORDER BY candidate_id
+        LIMIT ?
+        """,
+        (cursor, safe_batch),
+    ).fetchall()
+    candidate_ids = tuple(str(row[0] or "") for row in rows)
+    result = {
+        "scopes": 0,
+        "candidates": 0,
+        "state_changes": 0,
+    }
+    if candidate_ids:
+        result = reconcile_atomic_knowledge_lifecycle(
+            conn,
+            candidate_ids=candidate_ids,
+            now=sweep_now,
+        )
+    wrapped = len(rows) < safe_batch
+    next_cursor = "" if wrapped else candidate_ids[-1]
+    counts["runs"] = int(counts.get("runs", 0) or 0) + 1
+    counts["scopes_evaluated"] = int(
+        counts.get("scopes_evaluated", 0) or 0
+    ) + int(result.get("scopes", 0) or 0)
+    counts["candidates_evaluated"] = int(
+        counts.get("candidates_evaluated", 0) or 0
+    ) + int(result.get("candidates", 0) or 0)
+    counts["state_changes"] = int(
+        counts.get("state_changes", 0) or 0
+    ) + int(result.get("state_changes", 0) or 0)
+    if wrapped:
+        counts["wraps"] = int(counts.get("wraps", 0) or 0) + 1
+    conn.execute(
+        """
+        UPDATE memory_ledger_knowledge_backfill
+        SET phase='sweep',cursor_value=?,completed=0,
+            counts_json=?,updated_at=?
+        WHERE migration_key=?
+        """,
+        (
+            next_cursor,
+            json.dumps(counts, sort_keys=True),
+            _knowledge_time(sweep_now),
+            ATOMIC_KNOWLEDGE_LIFECYCLE_SWEEP,
+        ),
+    )
+    return {
+        "migration": ATOMIC_KNOWLEDGE_LIFECYCLE_SWEEP,
+        "ran": True,
+        "cursor": next_cursor,
+        "wrapped": wrapped,
+        "counts": counts,
+        "last_result": result,
+    }
+
+
 def purge_atomic_knowledge_for_subject(
     conn: sqlite3.Connection,
     *,
@@ -2304,11 +3649,42 @@ def purge_atomic_knowledge_for_subject(
         "memory_ledger_knowledge_roots": 0,
         "memory_ledger_knowledge_participants": 0,
         "memory_ledger_knowledge_receipts": 0,
+        "memory_ledger_knowledge_lifecycle_events": 0,
+        "memory_ledger_knowledge_lifecycle_roots": 0,
     }
     if not candidate_ids:
         return counts
     placeholders = ",".join("?" for _candidate_id in candidate_ids)
     params = tuple(sorted(candidate_ids))
+    lifecycle_event_ids = tuple(
+        str(row[0])
+        for row in conn.execute(
+            """
+            SELECT event_id
+            FROM memory_ledger_knowledge_lifecycle_events
+            WHERE candidate_id IN (%s)
+            """ % placeholders,
+            params,
+        ).fetchall()
+    )
+    if lifecycle_event_ids:
+        event_placeholders = ",".join(
+            "?" for _event_id in lifecycle_event_ids
+        )
+        counts["memory_ledger_knowledge_lifecycle_roots"] = conn.execute(
+            """
+            DELETE FROM memory_ledger_knowledge_lifecycle_roots
+            WHERE event_id IN (%s)
+            """ % event_placeholders,
+            lifecycle_event_ids,
+        ).rowcount
+    counts["memory_ledger_knowledge_lifecycle_events"] = conn.execute(
+        """
+        DELETE FROM memory_ledger_knowledge_lifecycle_events
+        WHERE candidate_id IN (%s)
+        """ % placeholders,
+        params,
+    ).rowcount
     counts["memory_ledger_knowledge_receipts"] = conn.execute(
         """
         DELETE FROM memory_ledger_knowledge_receipts
@@ -2966,6 +4342,24 @@ def build_memory_ledger_evaluation(
         ATOMIC_KNOWLEDGE_SCHEMA_VERSION if knowledge_tables_present else "absent"
     )
     report["knowledgeCandidateTablesPresent"] = knowledge_tables_present
+    lifecycle_tables_present = bool(
+        cur.execute(
+            """
+            SELECT COUNT(*) FROM sqlite_master
+            WHERE type='table' AND name IN (
+              'memory_ledger_knowledge_lifecycle_events',
+              'memory_ledger_knowledge_lifecycle_roots'
+            )
+            """
+        ).fetchone()[0]
+        == 2
+    )
+    report["knowledgeLifecycleSchemaVersion"] = (
+        ATOMIC_KNOWLEDGE_LIFECYCLE_SCHEMA_VERSION
+        if lifecycle_tables_present
+        else "absent"
+    )
+    report["knowledgeLifecycleTablesPresent"] = lifecycle_tables_present
     report["knowledgeCandidateTotalsByType"] = {}
     report["knowledgeCandidateTotalsByState"] = {}
     report["knowledgeCandidateTotalsByVisibility"] = {}
@@ -2988,10 +4382,35 @@ def build_memory_ledger_evaluation(
     report["knowledgeCandidateLiveEligibleCount"] = 0
     report["knowledgeCandidateProcessingErrors"] = 0
     report["knowledgeCandidateCorrectionDeletePrivacyInvalidations"] = 0
+    report["knowledgeLifecycleConsolidationGroups"] = 0
+    report["knowledgeLifecycleCanonicalCandidates"] = 0
+    report["knowledgeLifecycleReinforcementDistribution"] = {}
+    report["knowledgeLifecycleConsolidatedAuthority"] = {}
+    report["knowledgeLifecycleConsolidatedConfidence"] = {}
+    report["knowledgeLifecycleEligibleIndependentRoots"] = 0
+    report["knowledgeLifecycleDuplicateSupportRoots"] = 0
+    report["knowledgeLifecycleConflictScopes"] = 0
+    report["knowledgeLifecycleReviewStatuses"] = {}
+    report["knowledgeLifecycleReasons"] = {}
+    report["knowledgeLifecycleTransitionStates"] = {}
+    report["knowledgeLifecycleEventRoots"] = 0
+    report["knowledgeLifecycleReinforcementEventRoots"] = 0
+    report["knowledgeLifecycleMissingPromotionProvenance"] = 0
+    report["knowledgeLifecycleDirtyCandidates"] = 0
     report["knowledgeCandidateBackfill"] = {
         "phase": "not_started",
         "completed": False,
         "counts": {},
+    }
+    report["knowledgeLifecycleBackfill"] = {
+        "phase": "not_started",
+        "completed": False,
+        "counts": {},
+    }
+    report["knowledgeLifecycleSweep"] = {
+        "cursor": "",
+        "counts": {},
+        "updated_at": "",
     }
     if knowledge_tables_present:
         candidate_where = ""
@@ -3224,6 +4643,190 @@ def build_memory_ledger_evaluation(
         report[
             "knowledgeCandidateCorrectionDeletePrivacyInvalidations"
         ] = int(cur.fetchone()[0] or 0)
+        cur.execute(
+            f"""
+            SELECT COUNT(DISTINCT consolidation_id)
+            FROM memory_ledger_knowledge_candidates
+            {candidate_where}{rejection_suffix}
+              COALESCE(consolidation_id,'')<>''
+            """,
+            candidate_params,
+        )
+        report["knowledgeLifecycleConsolidationGroups"] = int(
+            cur.fetchone()[0] or 0
+        )
+        cur.execute(
+            f"""
+            SELECT COUNT(*)
+            FROM memory_ledger_knowledge_candidates
+            {candidate_where}{rejection_suffix}
+              COALESCE(canonical_candidate_id,'')=candidate_id
+            """,
+            candidate_params,
+        )
+        report["knowledgeLifecycleCanonicalCandidates"] = int(
+            cur.fetchone()[0] or 0
+        )
+        cur.execute(
+            f"""
+            SELECT reinforcement_count,COUNT(*)
+            FROM memory_ledger_knowledge_candidates
+            {candidate_where}{rejection_suffix}
+              COALESCE(canonical_candidate_id,'')=candidate_id
+            GROUP BY reinforcement_count
+            """,
+            candidate_params,
+        )
+        report["knowledgeLifecycleReinforcementDistribution"] = {
+            str(key): int(value or 0)
+            for key, value in cur.fetchall()
+        }
+        for key, column in (
+            (
+                "knowledgeLifecycleConsolidatedAuthority",
+                "consolidated_authority_class",
+            ),
+            (
+                "knowledgeLifecycleConsolidatedConfidence",
+                "consolidated_confidence_class",
+            ),
+        ):
+            cur.execute(
+                f"""
+                SELECT {column},COUNT(*)
+                FROM memory_ledger_knowledge_candidates
+                {candidate_where}{rejection_suffix}
+                  COALESCE(canonical_candidate_id,'')=candidate_id
+                GROUP BY {column}
+                """,
+                candidate_params,
+            )
+            report[key] = {
+                str(name or "unknown"): int(value or 0)
+                for name, value in cur.fetchall()
+            }
+        cur.execute(
+            f"""
+            SELECT
+              COALESCE(SUM(eligible_independent_root_count),0),
+              COALESCE(SUM(duplicate_support_count),0)
+            FROM memory_ledger_knowledge_candidates
+            {candidate_where}{rejection_suffix}
+              COALESCE(canonical_candidate_id,'')=candidate_id
+            """,
+            candidate_params,
+        )
+        lifecycle_support = cur.fetchone() or (0, 0)
+        report["knowledgeLifecycleEligibleIndependentRoots"] = int(
+            lifecycle_support[0] or 0
+        )
+        report["knowledgeLifecycleDuplicateSupportRoots"] = int(
+            lifecycle_support[1] or 0
+        )
+        conflict_filter = "WHERE guild_id=?" if guild_id is not None else ""
+        cur.execute(
+            f"""
+            SELECT COUNT(*) FROM (
+              SELECT guild_id,candidate_type,subject_key,predicate_key,
+                     contradiction_key,visibility,participant_scope_digest
+              FROM memory_ledger_knowledge_candidates
+              {conflict_filter}
+              GROUP BY guild_id,candidate_type,subject_key,predicate_key,
+                       contradiction_key,visibility,participant_scope_digest
+              HAVING MAX(conflict_value_count)>1
+            )
+            """,
+            [guild_id] if guild_id is not None else [],
+        )
+        report["knowledgeLifecycleConflictScopes"] = int(
+            cur.fetchone()[0] or 0
+        )
+        for key, column in (
+            ("knowledgeLifecycleReviewStatuses", "review_status"),
+            ("knowledgeLifecycleReasons", "lifecycle_reason"),
+        ):
+            cur.execute(
+                f"""
+                SELECT {column},COUNT(*)
+                FROM memory_ledger_knowledge_candidates
+                {candidate_where}
+                GROUP BY {column}
+                """,
+                candidate_params,
+            )
+            report[key] = {
+                str(name or "unset"): int(value or 0)
+                for name, value in cur.fetchall()
+            }
+        if lifecycle_tables_present:
+            cur.execute(
+                f"""
+                SELECT next_state,COUNT(*)
+                FROM memory_ledger_knowledge_lifecycle_events
+                {candidate_where}
+                GROUP BY next_state
+                """,
+                candidate_params,
+            )
+            report["knowledgeLifecycleTransitionStates"] = {
+                str(name or "unknown"): int(value or 0)
+                for name, value in cur.fetchall()
+            }
+            cur.execute(
+                f"""
+                SELECT
+                  COUNT(*),
+                  COALESCE(SUM(counts_as_reinforcement),0)
+                FROM memory_ledger_knowledge_lifecycle_roots
+                {candidate_where}
+                """,
+                candidate_params,
+            )
+            event_roots = cur.fetchone() or (0, 0)
+            report["knowledgeLifecycleEventRoots"] = int(event_roots[0] or 0)
+            report["knowledgeLifecycleReinforcementEventRoots"] = int(
+                event_roots[1] or 0
+            )
+            event_alias_filter = ""
+            event_alias_params: list[Any] = []
+            if guild_id is not None:
+                event_alias_filter = " AND e.guild_id=?"
+                event_alias_params = [guild_id]
+            cur.execute(
+                f"""
+                SELECT COUNT(*)
+                FROM memory_ledger_knowledge_lifecycle_events e
+                WHERE e.reinforcement_count>0
+                  {event_alias_filter}
+                  AND NOT EXISTS (
+                    SELECT 1
+                    FROM memory_ledger_knowledge_lifecycle_roots r
+                    WHERE r.event_id=e.event_id
+                      AND r.counts_as_reinforcement=1
+                  )
+                """,
+                event_alias_params,
+            )
+            report["knowledgeLifecycleMissingPromotionProvenance"] = int(
+                cur.fetchone()[0] or 0
+            )
+        cur.execute(
+            f"""
+            SELECT COUNT(*)
+            FROM memory_ledger_knowledge_candidates
+            {candidate_where}{rejection_suffix}
+              (
+                COALESCE(lifecycle_schema_version,'')<>?
+                OR COALESCE(lifecycle_evaluated_at,'')=''
+                OR review_status='dirty'
+              )
+            """,
+            candidate_params
+            + [ATOMIC_KNOWLEDGE_LIFECYCLE_SCHEMA_VERSION],
+        )
+        report["knowledgeLifecycleDirtyCandidates"] = int(
+            cur.fetchone()[0] or 0
+        )
         backfill = cur.execute(
             """
             SELECT phase,completed,counts_json
@@ -3241,5 +4844,43 @@ def build_memory_ledger_evaluation(
                 "phase": str(backfill[0] or "unknown"),
                 "completed": bool(backfill[1]),
                 "counts": backfill_counts,
+            }
+        lifecycle_backfill = cur.execute(
+            """
+            SELECT phase,completed,counts_json
+            FROM memory_ledger_knowledge_backfill
+            WHERE migration_key=?
+            """,
+            (ATOMIC_KNOWLEDGE_LIFECYCLE_BACKFILL,),
+        ).fetchone()
+        if lifecycle_backfill:
+            try:
+                lifecycle_counts = json.loads(
+                    str(lifecycle_backfill[2] or "{}")
+                )
+            except (TypeError, ValueError, json.JSONDecodeError):
+                lifecycle_counts = {"invalid_json": 1}
+            report["knowledgeLifecycleBackfill"] = {
+                "phase": str(lifecycle_backfill[0] or "unknown"),
+                "completed": bool(lifecycle_backfill[1]),
+                "counts": lifecycle_counts,
+            }
+        lifecycle_sweep = cur.execute(
+            """
+            SELECT cursor_value,counts_json,updated_at
+            FROM memory_ledger_knowledge_backfill
+            WHERE migration_key=?
+            """,
+            (ATOMIC_KNOWLEDGE_LIFECYCLE_SWEEP,),
+        ).fetchone()
+        if lifecycle_sweep:
+            try:
+                sweep_counts = json.loads(str(lifecycle_sweep[1] or "{}"))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                sweep_counts = {"invalid_json": 1}
+            report["knowledgeLifecycleSweep"] = {
+                "cursor": str(lifecycle_sweep[0] or ""),
+                "counts": sweep_counts,
+                "updated_at": str(lifecycle_sweep[2] or ""),
             }
     return report

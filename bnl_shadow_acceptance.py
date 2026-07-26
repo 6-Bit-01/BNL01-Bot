@@ -156,10 +156,36 @@ def _empty_ledger_report() -> Dict[str, Any]:
         "knowledgeCandidateLiveEligibleCount": 0,
         "knowledgeCandidateProcessingErrors": 0,
         "knowledgeCandidateCorrectionDeletePrivacyInvalidations": 0,
+        "knowledgeLifecycleSchemaVersion": "absent",
+        "knowledgeLifecycleConsolidationGroups": 0,
+        "knowledgeLifecycleCanonicalCandidates": 0,
+        "knowledgeLifecycleReinforcementDistribution": {},
+        "knowledgeLifecycleConsolidatedAuthority": {},
+        "knowledgeLifecycleConsolidatedConfidence": {},
+        "knowledgeLifecycleEligibleIndependentRoots": 0,
+        "knowledgeLifecycleDuplicateSupportRoots": 0,
+        "knowledgeLifecycleConflictScopes": 0,
+        "knowledgeLifecycleReviewStatuses": {},
+        "knowledgeLifecycleReasons": {},
+        "knowledgeLifecycleTransitionStates": {},
+        "knowledgeLifecycleEventRoots": 0,
+        "knowledgeLifecycleReinforcementEventRoots": 0,
+        "knowledgeLifecycleMissingPromotionProvenance": 0,
+        "knowledgeLifecycleDirtyCandidates": 0,
         "knowledgeCandidateBackfill": {
             "phase": "not_started",
             "completed": False,
             "counts": {},
+        },
+        "knowledgeLifecycleBackfill": {
+            "phase": "not_started",
+            "completed": False,
+            "counts": {},
+        },
+        "knowledgeLifecycleSweep": {
+            "cursor": "",
+            "counts": {},
+            "updated_at": "",
         },
     }
 
@@ -1153,6 +1179,62 @@ def render_v2_shadow_acceptance_lines(snapshot: Mapping[str, Any]) -> List[str]:
             ),
             json.dumps(
                 ledger.get("knowledgeCandidateBackfill", {}),
+                sort_keys=True,
+            ),
+        ),
+        "- atomic_knowledge_lifecycle: schema=`%s` groups=`%s` canonical=`%s` reinforcement=`%s` authority=`%s` confidence=`%s` eligible_roots=`%s` duplicate_support=`%s` conflicts=`%s` review=`%s` reasons=`%s` transitions=`%s` event_roots=`%s` reinforcement_roots=`%s` missing_promotion_provenance=`%s` dirty=`%s` backfill=`%s` sweep=`%s`" % (
+            ledger.get("knowledgeLifecycleSchemaVersion", "absent"),
+            ledger.get("knowledgeLifecycleConsolidationGroups", 0),
+            ledger.get("knowledgeLifecycleCanonicalCandidates", 0),
+            json.dumps(
+                ledger.get(
+                    "knowledgeLifecycleReinforcementDistribution",
+                    {},
+                ),
+                sort_keys=True,
+            ),
+            json.dumps(
+                ledger.get(
+                    "knowledgeLifecycleConsolidatedAuthority",
+                    {},
+                ),
+                sort_keys=True,
+            ),
+            json.dumps(
+                ledger.get(
+                    "knowledgeLifecycleConsolidatedConfidence",
+                    {},
+                ),
+                sort_keys=True,
+            ),
+            ledger.get("knowledgeLifecycleEligibleIndependentRoots", 0),
+            ledger.get("knowledgeLifecycleDuplicateSupportRoots", 0),
+            ledger.get("knowledgeLifecycleConflictScopes", 0),
+            json.dumps(
+                ledger.get("knowledgeLifecycleReviewStatuses", {}),
+                sort_keys=True,
+            ),
+            json.dumps(
+                ledger.get("knowledgeLifecycleReasons", {}),
+                sort_keys=True,
+            ),
+            json.dumps(
+                ledger.get("knowledgeLifecycleTransitionStates", {}),
+                sort_keys=True,
+            ),
+            ledger.get("knowledgeLifecycleEventRoots", 0),
+            ledger.get("knowledgeLifecycleReinforcementEventRoots", 0),
+            ledger.get(
+                "knowledgeLifecycleMissingPromotionProvenance",
+                0,
+            ),
+            ledger.get("knowledgeLifecycleDirtyCandidates", 0),
+            json.dumps(
+                ledger.get("knowledgeLifecycleBackfill", {}),
+                sort_keys=True,
+            ),
+            json.dumps(
+                ledger.get("knowledgeLifecycleSweep", {}),
                 sort_keys=True,
             ),
         ),

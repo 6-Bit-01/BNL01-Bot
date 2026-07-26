@@ -556,7 +556,7 @@ class AtomicKnowledgeCandidateTests(unittest.TestCase):
 
         self.assertEqual(replacement.outcome, "created")
         replacement_row = self.candidate_row(replacement.candidate_id)
-        self.assertEqual(replacement_row[5], "candidate")
+        self.assertEqual(replacement_row[5], "established")
         self.assertEqual(
             replacement_row[15],
             corrected_old.candidate_id,
@@ -716,6 +716,10 @@ class AtomicKnowledgeCandidateTests(unittest.TestCase):
         self.assertEqual(
             self.candidate_row(original_candidate.candidate_id)[5],
             "superseded",
+        )
+        self.assertEqual(
+            self.candidate_row(corrected_candidate_id)[5],
+            "established",
         )
         self.assertEqual(
             self.candidate_row(corrected_candidate_id)[15],

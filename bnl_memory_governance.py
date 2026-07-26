@@ -29,6 +29,7 @@ from bnl_memory_ledger import (
     ensure_memory_ledger_schema,
     form_atomic_candidate_from_ledger_entry,
     purge_atomic_knowledge_for_subject,
+    reconcile_atomic_knowledge_lifecycle_for_roots,
     record_atomic_knowledge_processing_error,
     subject_key_for_user,
 )
@@ -1489,10 +1490,42 @@ def forget_member_memory(conn: sqlite3.Connection, *, guild_id: int, user_id: in
             source_rows=[(str(table or ""), str(row_id or "")) for table, row_id, _source_predicate in source_rows],
             now=now,
         )
+        lifecycle_counts = {
+            "scopes": 0,
+            "candidates": 0,
+            "state_changes": 0,
+        }
+        try:
+            lifecycle_counts = (
+                reconcile_atomic_knowledge_lifecycle_for_roots(
+                    conn,
+                    root_entry_ids=tuple(sorted(affected_entry_ids)),
+                    now=now,
+                )
+            )
+        except Exception as knowledge_exc:
+            try:
+                record_atomic_knowledge_processing_error(
+                    conn,
+                    guild_id=guild_id,
+                    reason_code=(
+                        "member_forget_lifecycle_"
+                        + type(knowledge_exc).__name__
+                    )[:120],
+                    root_entry_ids=tuple(sorted(affected_entry_ids))[:16],
+                )
+            except Exception:
+                pass
         receipt_counts = {
             "ledger_entries": len(chain),
             "tombstones": 1,
             "live_facts": live_fact_updates,
+            "atomic_lifecycle_scopes": int(
+                lifecycle_counts.get("scopes", 0) or 0
+            ),
+            "atomic_lifecycle_state_changes": int(
+                lifecycle_counts.get("state_changes", 0) or 0
+            ),
         }
         receipt_counts.update(contribution_counts)
         conn.execute("INSERT INTO memory_governance_receipts VALUES (?,?,?,?,?,?,?)", (rid, guild_id, _subject_hash(user_id), "forget", safe_ref, now, json.dumps(receipt_counts, sort_keys=True)))
