@@ -67,9 +67,11 @@ from bnl_memory_governance import (
     GovernanceRequest,
     assess_governance_result_safety,
     build_governed_context,
+    classify_personal_recall_intent,
     complete_delete_member_data,
     correct_member_memory,
     forget_member_memory,
+    normalize_personal_recall_intent,
     persist_shadow_diagnostics,
     purge_conversation_ledger_sources,
     reconcile_orphaned_conversation_ledger_sources,
@@ -133,6 +135,7 @@ from bnl_shared_brain_synthesis import (
     finalize_run as finalize_shared_brain_synthesis_run,
     record_fallback as record_shared_brain_synthesis_fallback,
     revalidate_basis as revalidate_shared_brain_synthesis_basis,
+    route_scope_enabled as shared_brain_synthesis_route_scope_enabled,
 )
 from bnl_unified_response_assessment import (
     ConversationEvidenceItem,
@@ -17372,39 +17375,7 @@ def _escape_discord_markdown(value: str) -> str:
 
 
 def _normalized_personal_recall_intent(text: str) -> str:
-    cleaned = re.sub(r"\s+", " ", str(text or "").lower().replace("’", "'")).strip()
-    cleaned = re.sub(
-        r"^(?:hey\s+|yo\s+|hi\s+)?(?:bnl(?:-?01)?|barcode bot)\s*[,;:—-]*\s*",
-        "",
-        cleaned,
-        flags=re.I,
-    )
-    cleaned = re.sub(r"^(?:(?:so|okay|ok|well)\s*[,;:—-]*\s*)+", "", cleaned)
-    cleaned = re.sub(
-        r"^(?:please\s+)?(?:(?:can|could|would|will)\s+you\s+)?",
-        "",
-        cleaned,
-        flags=re.I,
-    )
-    cleaned = cleaned.strip(" \t\r\n.!?")
-    cleaned = re.sub(
-        r"\s*(?:,?\s+(?:please|honestly|again|currently|right now|now|so far))+$",
-        "",
-        cleaned,
-        flags=re.I,
-    )
-    return cleaned.strip(" \t\r\n.!?")
-
-
-_BROAD_PERSONAL_RECALL_PATTERNS = (
-    r"what do you remember about me",
-    r"what do you have on me",
-    r"what do you know about me",
-    r"tell me what you (?:remember|know) about me",
-    r"tell me everything you remember about me",
-    r"tell me everything you remember",
-    r"what have you learned about me",
-)
+    return normalize_personal_recall_intent(text)
 _SOURCE_SAFE_RECALL_OUTPUT_LEAK_RE = re.compile(
     r"\b(?:source-safe personal recall synthesis contract|"
     r"source-safe recall packet|recall source lanes?|source lanes?|"
@@ -17416,19 +17387,67 @@ _SOURCE_SAFE_RECALL_OUTPUT_LEAK_RE = re.compile(
 
 
 def is_broad_personal_recall_request(user_text: str) -> bool:
-    """Recognize only the established broad first-person recall intent."""
+    """Use Memory Governance's single broad self-profile interpretation."""
 
-    recall_intent = _normalized_personal_recall_intent(user_text)
-    if not recall_intent or re.search(
-        r"\b(?:do not|don't|never|not yet|later|before you answer|"
-        r"don't answer|do not answer|hold off|wait)\b",
-        recall_intent,
-        flags=re.I,
-    ):
-        return False
-    return any(
-        re.fullmatch(pattern, recall_intent)
-        for pattern in _BROAD_PERSONAL_RECALL_PATTERNS
+    return classify_personal_recall_intent(
+        user_text
+    ).broad_self_profile
+
+
+def governed_broad_recall_route_expansion_enabled(
+    *,
+    guild_id: int,
+    user_id: int,
+    channel_id: int,
+    route_mode: str,
+    channel_policy: str,
+    user_text: str,
+    current_direct: bool,
+    has_media: bool = False,
+    exact_quote_requested: bool = False,
+    third_party_attribution_requested: bool = False,
+    environ: dict[str, str] | None = None,
+) -> bool:
+    """Authorize normal-generation parity for one allowlisted route family."""
+
+    return shared_brain_synthesis_route_scope_enabled(
+        guild_id=guild_id,
+        user_id=user_id,
+        channel_id=channel_id,
+        route_mode=route_mode,
+        channel_policy=channel_policy,
+        current_direct=current_direct,
+        user_text=user_text,
+        has_media=has_media,
+        exact_quote_requested=exact_quote_requested,
+        third_party_attribution_requested=(
+            third_party_attribution_requested
+        ),
+        environ=environ,
+    )
+
+
+def broad_personal_recall_enters_normal_generation(
+    *,
+    route_mode: str,
+    channel_policy: str,
+    user_text: str,
+    current_direct: bool,
+    has_media: bool = False,
+    exact_quote_requested: bool = False,
+    third_party_attribution_requested: bool = False,
+) -> bool:
+    """Remove the competing canned path for the expanded public route."""
+
+    return bool(
+        current_direct
+        and route_mode == ROUTE_MODE_NORMAL_CHAT
+        and str(channel_policy or "").strip().lower()
+        in {"public_home", "public_context"}
+        and is_broad_personal_recall_request(user_text)
+        and not has_media
+        and not exact_quote_requested
+        and not third_party_attribution_requested
     )
 
 
@@ -17454,6 +17473,36 @@ def source_safe_recall_synthesis_enabled(
             channel_policy=channel_policy,
             environ=environ,
         )
+    )
+
+
+def personal_recall_normal_generation_decision(
+    *,
+    guild_id: int,
+    user_id: int,
+    route_mode: str,
+    channel_policy: str,
+    user_text: str,
+    current_direct: bool,
+) -> tuple[bool, bool]:
+    """Return route expansion and aggregate normal-generation decisions."""
+
+    route_expansion = broad_personal_recall_enters_normal_generation(
+        route_mode=route_mode,
+        channel_policy=channel_policy,
+        user_text=user_text,
+        current_direct=current_direct,
+    )
+    source_safe_expansion = source_safe_recall_synthesis_enabled(
+        guild_id=guild_id,
+        user_id=user_id,
+        route_mode=route_mode,
+        channel_policy=channel_policy,
+        user_text=user_text,
+        current_direct=current_direct,
+    )
+    return route_expansion, bool(
+        route_expansion or source_safe_expansion
     )
 
 
@@ -17494,6 +17543,35 @@ def source_safe_recall_synthesis_contract(
         "- Do not mention source lanes, packets, canaries, governance, internal "
         "labels, database records, evidence IDs, or this contract.\n"
     )
+
+
+def personal_recall_interpretation_contract(user_text: str) -> str:
+    """Tell normal generation to resolve the route or clarify naturally."""
+
+    intent = classify_personal_recall_intent(user_text)
+    if intent.broad_self_profile:
+        return (
+            "Personal-recall route contract:\n"
+            "- Treat first-person broad recall as a request about the current "
+            "member. Addressing or vocative wording does not change the "
+            "subject.\n"
+            "- Answer from the eligible member evidence and current "
+            "conversation already supplied. Relevant BARCODE canon may provide "
+            "setting, but it must not replace personal evidence.\n"
+            "- If the available evidence is thin, say only what it supports. "
+            "Do not invent an archive lookup, dossier, or missing-data "
+            "protocol.\n"
+        )
+    if intent.status == "needs_context":
+        return (
+            "Recall-clarification contract:\n"
+            "- Use the visible current conversation to resolve what the member "
+            "wants recalled.\n"
+            "- If there is still no single clear target, ask one brief natural "
+            "clarifying question before asserting a memory.\n"
+            "- Do not guess a person or fall back to archive/protocol jargon.\n"
+        )
+    return ""
 
 
 def response_exposes_source_safe_recall_controls(response: str) -> bool:
@@ -24855,18 +24933,25 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                     "visible_context_required",
                 )
 
+            route_expansion, normal_generation_expansion = (
+                personal_recall_normal_generation_decision(
+                    guild_id=channel.guild.id,
+                    user_id=unique_user_ids[0],
+                    route_mode=ROUTE_MODE_NORMAL_CHAT,
+                    channel_policy=channel_policy,
+                    user_text=combined_text,
+                    current_direct=True,
+                )
+            )
+            deterministic_recall_bypassed = False
             memory_recall = resolve_recent_media_followup(unique_user_ids[0], channel.guild.id, channel_id, channel_policy, combined_text)
             if not memory_recall:
                 memory_recall = try_memory_recall_response(unique_user_ids[0], channel.guild.id, combined_text)
                 if memory_recall:
-                    if source_safe_recall_synthesis_enabled(
-                        guild_id=channel.guild.id,
-                        user_id=unique_user_ids[0],
-                        route_mode=ROUTE_MODE_NORMAL_CHAT,
-                        channel_policy=channel_policy,
-                        user_text=combined_text,
-                        current_direct=True,
-                    ):
+                    # normal_generation_expansion already includes the
+                    # source_safe_recall_synthesis_enabled decision.
+                    if normal_generation_expansion:
+                        deterministic_recall_bypassed = True
                         memory_recall = ""
                     else:
                         memory_recall = apply_explicit_recall_governance(unique_user_ids[0], channel.guild.id, combined_text, memory_recall, ROUTE_MODE_NORMAL_CHAT, channel_policy, channel_id=channel_id, channel_name=getattr(channel, "name", ""), is_owner_or_mod=is_privileged_member(member, channel.guild))
@@ -24882,6 +24967,15 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                 )
                 if not memory_recall:
                     return
+            if deterministic_recall_bypassed and route_expansion:
+                _log_batch_event(
+                    logging.INFO,
+                    "governed_broad_recall_route_expansion",
+                    guild_id,
+                    channel_id,
+                    len(collapsed_items),
+                    "deterministic_shortcut_bypassed",
+                )
             if memory_recall:
                 await send_channel_then_save_model(channel, memory_recall, user_id=unique_user_ids[0], guild_id=channel.guild.id, channel_name=getattr(channel, "name", ""), channel_policy=channel_policy, channel_id=channel_id, route_mode=ROUTE_MODE_NORMAL_CHAT, allowed_mentions=safe_mentions)
                 _channel_last_reply_at[channel_id] = datetime.now(PACIFIC_TZ)
@@ -25342,6 +25436,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                     channel_policy=channel_policy,
                 )
             )
+            batch_intelligence_packet_out: dict = {}
             batch_unified_assessment = (
                 build_unified_response_assessment_shadow(
                     guild_id=guild_id,
@@ -25400,6 +25495,9 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                         active_packet.get("addressed_to_bot")
                         or is_broad_personal_recall_request(combined_text)
                     ),
+                    intelligence_packet_out=(
+                        batch_intelligence_packet_out
+                    ),
                 )
             )
             batch_unified_moment_canary_basis = (
@@ -25426,6 +25524,32 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                 batch_prompt_source_bases.append(
                     batch_unified_moment_canary_basis
                 )
+            batch_shared_brain_synthesis_basis = (
+                build_shared_brain_synthesis_basis(
+                    guild_id=guild_id,
+                    user_id=first_uid,
+                    channel_id=channel_id,
+                    route_mode=ROUTE_MODE_NORMAL_CHAT,
+                    channel_policy=channel_policy,
+                    current_direct=bool(
+                        active_packet.get("addressed_to_bot")
+                        or is_broad_personal_recall_request(combined_text)
+                    ),
+                    user_text=combined_text,
+                    packet=batch_intelligence_packet_out.get("packet"),
+                    assessment=batch_unified_assessment,
+                    has_media=bool(active_packet.get("media_present")),
+                    exact_quote_requested=(
+                        batch_attribution_contract.exact_quote_requested
+                    ),
+                    third_party_attribution_requested=(
+                        batch_attribution_contract
+                        .third_party_attribution_requested
+                    ),
+                )
+                if len(unique_user_ids) == 1
+                else None
+            )
             continuity_contract = build_general_conversation_continuity_contract(
                 combined_text,
                 batch_continuity_source,
@@ -25453,6 +25577,16 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                 if batch_recall_synthesis_contract:
                     prompt += (
                         "\n\n" + batch_recall_synthesis_contract
+                    )
+                batch_recall_interpretation_contract = (
+                    personal_recall_interpretation_contract(
+                        combined_text
+                    )
+                )
+                if batch_recall_interpretation_contract:
+                    prompt += (
+                        "\n\n"
+                        + batch_recall_interpretation_contract
                     )
             if batch_unified_moment_canary_basis is not None:
                 prompt += (
@@ -25876,6 +26010,42 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
             ack_escalated_to_generation=bool(locals().get("ack_diag", {}).get("ack_escalated_to_generation", False)),
         )
 
+        batch_baseline_response = response or ""
+        batch_baseline_prompt = prompt
+        batch_baseline_source_bases = tuple(
+            batch_prompt_source_bases
+        )
+        batch_synthesis_execution = (
+            await maybe_generate_shared_brain_synthesis_canary(
+                channel=channel,
+                baseline_response=batch_baseline_response,
+                prompt=batch_baseline_prompt,
+                prompt_source_bases=batch_baseline_source_bases,
+                basis=batch_shared_brain_synthesis_basis,
+                user_id=first_uid,
+                guild_id=guild_id,
+                user_display_name=(
+                    collapsed_items[-1][0] if collapsed_items else ""
+                ),
+                source_context_available=False,
+            )
+        )
+        batch_synthesis_decision = (
+            batch_synthesis_execution.decision
+            if batch_synthesis_execution is not None
+            else None
+        )
+        batch_synthesis_candidate_active = bool(
+            batch_synthesis_execution is not None
+            and batch_synthesis_execution.candidate_active
+        )
+        if batch_synthesis_execution is not None:
+            response = batch_synthesis_execution.response
+            prompt = batch_synthesis_execution.prompt
+            batch_prompt_source_bases = list(
+                batch_synthesis_execution.prompt_source_bases
+            )
+        batch_canary_guard_fallback_triggered = False
         archive_guard_triggered = bool(_contains_unsupported_source_authority_claim(response or ""))
         response, guard_diagnostics = await apply_guarded_response_regeneration(
             response or "",
@@ -25906,6 +26076,116 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
             ),
             prompt_source_bases=tuple(batch_prompt_source_bases),
         )
+        if (
+            batch_synthesis_candidate_active
+            and batch_synthesis_decision is not None
+        ):
+            batch_fallback_reason = ""
+            if guard_diagnostics.get("suppressed"):
+                batch_fallback_reason = "candidate_guard_suppressed"
+            else:
+                try:
+                    batch_synthesis_decision = await asyncio.to_thread(
+                        _evaluate_shared_brain_synthesis_receipt,
+                        batch_synthesis_decision.run,
+                        batch_baseline_response,
+                        response or "",
+                    )
+                    if (
+                        batch_synthesis_decision.candidate_selected
+                        and is_generic_non_answer_response(
+                            response or "",
+                            (
+                                collapsed_items[-1][0]
+                                if collapsed_items
+                                else ""
+                            ),
+                        )
+                    ):
+                        batch_fallback_reason = (
+                            "candidate_generic_non_answer"
+                        )
+                    elif not batch_synthesis_decision.candidate_selected:
+                        batch_fallback_reason = (
+                            batch_synthesis_decision.fallback_reason
+                            or "candidate_post_guard_rejected"
+                        )
+                except Exception as exc:
+                    logging.warning(
+                        "shared_brain_synthesis_batch_post_guard_failed "
+                        "error=%s",
+                        type(exc).__name__,
+                    )
+                    batch_fallback_reason = (
+                        "candidate_post_guard_evaluation_failed"
+                    )
+            if batch_fallback_reason:
+                batch_synthesis_decision = (
+                    await safely_fallback_shared_brain_synthesis(
+                        batch_synthesis_decision,
+                        batch_fallback_reason,
+                    )
+                )
+                batch_synthesis_candidate_active = False
+                batch_canary_guard_fallback_triggered = True
+                response = batch_baseline_response
+                prompt = batch_baseline_prompt
+                batch_prompt_source_bases = list(
+                    batch_baseline_source_bases
+                )
+                archive_guard_triggered = bool(
+                    _contains_unsupported_source_authority_claim(
+                        response or ""
+                    )
+                )
+                response, guard_diagnostics = (
+                    await apply_guarded_response_regeneration(
+                        response or "",
+                        prompt=prompt,
+                        user_id=first_uid,
+                        guild_id=guild_id,
+                        route_mode=ROUTE_MODE_NORMAL_CHAT,
+                        channel_policy=channel_policy,
+                        directness=batch_directness,
+                        user_display_name=(
+                            collapsed_items[-1][0]
+                            if collapsed_items
+                            else ""
+                        ),
+                        current_user_text=combined_text,
+                        has_media=bool(
+                            active_packet.get("media_present", False)
+                        ),
+                        is_reply=False,
+                        generation_route=(
+                            generation_route
+                            if "generation_route" in locals()
+                            else "get_gemini_response"
+                        ),
+                        channel=channel,
+                        source_context_available=False,
+                        batch_generation_id=local_generation_id,
+                        conversation_continuity_required=(
+                            batch_continuity_required
+                        ),
+                        community_visual_basis=community_visual_basis,
+                        exact_quote_requested=(
+                            batch_attribution_contract
+                            .exact_quote_requested
+                        ),
+                        exact_quote_authority=(
+                            batch_attribution_contract
+                            .exact_quote_authority
+                        ),
+                        third_party_attribution_requested=(
+                            batch_attribution_contract
+                            .third_party_attribution_requested
+                        ),
+                        prompt_source_bases=tuple(
+                            batch_prompt_source_bases
+                        ),
+                    )
+                )
         guard_triggered = bool(
             archive_guard_triggered
             or guard_diagnostics.get("scripted_mode_leak_guard_triggered")
@@ -25926,6 +26206,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
             or guard_diagnostics.get(
                 "source_safe_recall_output_leak_guard_triggered"
             )
+            or batch_canary_guard_fallback_triggered
         )
         regenerated_for_mode_leak = bool(
             guard_diagnostics.get("regenerated_for_mode_leak")
@@ -25958,9 +26239,30 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                 )
             _channel_preempted_generation_id[channel_id] = 0
             _channel_message_interrupt_generation_id[channel_id] = 0
+            if batch_synthesis_decision is not None:
+                batch_synthesis_decision = (
+                    await safely_fallback_shared_brain_synthesis(
+                        batch_synthesis_decision,
+                        "stale_after_batch_candidate_guard",
+                    )
+                )
+                await safely_finalize_shared_brain_synthesis(
+                    batch_synthesis_decision,
+                    final_response=batch_baseline_response,
+                    response_sent=False,
+                    candidate_live=False,
+                    guard_status="stale_after_batch_candidate_guard",
+                )
             return
         if guard_diagnostics.get("suppressed"):
             logging.info("continuation_mark_skipped reason=guard_fallback_or_generic_non_answer route=%s channel_policy=%s", ROUTE_MODE_NORMAL_CHAT, channel_policy)
+            await safely_finalize_shared_brain_synthesis(
+                batch_synthesis_decision,
+                final_response=response or batch_baseline_response,
+                response_sent=False,
+                candidate_live=False,
+                guard_status="batch_guard_suppressed",
+            )
             return
         batch_presend_source_bases = tuple(
             guard_diagnostics.get("_revalidated_prompt_source_bases")
@@ -25987,10 +26289,142 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                     presend_quote_failure,
                     channel_id,
                 )
+                await safely_finalize_shared_brain_synthesis(
+                    batch_synthesis_decision,
+                    final_response=response,
+                    response_sent=False,
+                    candidate_live=False,
+                    guard_status="batch_exact_quote_presend_failed",
+                )
                 return
         batch_source_failure = prompt_source_basis_failure(
             batch_presend_source_bases
         )
+        if (
+            batch_source_failure
+            and batch_synthesis_candidate_active
+            and batch_synthesis_decision is not None
+        ):
+            batch_synthesis_decision = (
+                await safely_fallback_shared_brain_synthesis(
+                    batch_synthesis_decision,
+                    "candidate_presend_%s" % batch_source_failure,
+                )
+            )
+            batch_synthesis_candidate_active = False
+            response = batch_baseline_response
+            prompt = batch_baseline_prompt
+            batch_prompt_source_bases = list(
+                batch_baseline_source_bases
+            )
+            response, guard_diagnostics = (
+                await apply_guarded_response_regeneration(
+                    response or "",
+                    prompt=prompt,
+                    user_id=first_uid,
+                    guild_id=guild_id,
+                    route_mode=ROUTE_MODE_NORMAL_CHAT,
+                    channel_policy=channel_policy,
+                    directness=batch_directness,
+                    user_display_name=(
+                        collapsed_items[-1][0]
+                        if collapsed_items
+                        else ""
+                    ),
+                    current_user_text=combined_text,
+                    has_media=bool(
+                        active_packet.get("media_present", False)
+                    ),
+                    is_reply=False,
+                    generation_route=(
+                        generation_route
+                        if "generation_route" in locals()
+                        else "get_gemini_response"
+                    ),
+                    channel=channel,
+                    source_context_available=False,
+                    batch_generation_id=local_generation_id,
+                    conversation_continuity_required=(
+                        batch_continuity_required
+                    ),
+                    community_visual_basis=community_visual_basis,
+                    exact_quote_requested=(
+                        batch_attribution_contract.exact_quote_requested
+                    ),
+                    exact_quote_authority=(
+                        batch_attribution_contract.exact_quote_authority
+                    ),
+                    third_party_attribution_requested=(
+                        batch_attribution_contract
+                        .third_party_attribution_requested
+                    ),
+                    prompt_source_bases=tuple(
+                        batch_prompt_source_bases
+                    ),
+                )
+            )
+            if guard_diagnostics.get("suppressed"):
+                await safely_finalize_shared_brain_synthesis(
+                    batch_synthesis_decision,
+                    final_response=response,
+                    response_sent=False,
+                    candidate_live=False,
+                    guard_status=(
+                        "batch_baseline_guard_suppressed_at_presend"
+                    ),
+                )
+                return
+            batch_presend_source_bases = tuple(
+                guard_diagnostics.get(
+                    "_revalidated_prompt_source_bases"
+                )
+                or batch_prompt_source_bases
+            )
+            fallback_hard_interrupt = (
+                _hard_interrupt_active_for_generation(
+                    channel_id,
+                    local_generation_id,
+                )
+            )
+            fallback_buffered_count = len(
+                _channel_buffers[channel_id]
+            )
+            if fallback_hard_interrupt or fallback_buffered_count > 0:
+                _log_batch_event(
+                    logging.INFO,
+                    "stale_response_blocked_after_presend_fallback",
+                    guild_id,
+                    channel_id,
+                    fallback_buffered_count,
+                    (
+                        "hard_interrupt=%s;generation_id=%s"
+                        % (
+                            int(fallback_hard_interrupt),
+                            local_generation_id,
+                        )
+                    ),
+                )
+                if fallback_buffered_count > 0:
+                    _channel_interrupt_handoff[channel_id] = list(items)
+                    _channel_first_seen.setdefault(
+                        channel_id,
+                        datetime.now(PACIFIC_TZ),
+                    )
+                _channel_preempted_generation_id[channel_id] = 0
+                _channel_message_interrupt_generation_id[channel_id] = 0
+                await safely_finalize_shared_brain_synthesis(
+                    batch_synthesis_decision,
+                    final_response=response,
+                    response_sent=False,
+                    candidate_live=False,
+                    guard_status=(
+                        "stale_after_batch_presend_fallback"
+                    ),
+                )
+                return
+            batch_source_failure = prompt_source_basis_failure(
+                batch_presend_source_bases
+            )
         if batch_source_failure:
             _log_batch_event(
                 logging.INFO,
@@ -25999,6 +26433,13 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                 channel_id,
                 len(items),
                 f"reason={batch_source_failure}",
+            )
+            await safely_finalize_shared_brain_synthesis(
+                batch_synthesis_decision,
+                final_response=response,
+                response_sent=False,
+                candidate_live=False,
+                guard_status="batch_prompt_source_presend_failed",
             )
             return
         _log_batch_event(
@@ -26020,7 +26461,25 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
             logging.info("response_send_succeeded route=%s channel_id=%s message_length=%s", generation_route if 'generation_route' in locals() else "get_gemini_response", channel_id, len(response or ""))
         except Exception as exc:
             logging.error("response_send_failed route=%s channel_id=%s discord_error_type=%s", generation_route if 'generation_route' in locals() else "get_gemini_response", channel_id, type(exc).__name__)
+            await safely_finalize_shared_brain_synthesis(
+                batch_synthesis_decision,
+                final_response=response,
+                response_sent=False,
+                candidate_live=False,
+                guard_status="batch_discord_send_failed",
+            )
             return
+        await safely_finalize_shared_brain_synthesis(
+            batch_synthesis_decision,
+            final_response=response,
+            response_sent=True,
+            candidate_live=batch_synthesis_candidate_active,
+            guard_status=(
+                "batch_candidate_sent"
+                if batch_synthesis_candidate_active
+                else "batch_established_path_sent"
+            ),
+        )
         _log_batch_event(logging.INFO, "response_send_commit_complete", guild_id, channel_id, len(items), f"generation_id={local_generation_id}")
         for uid in unique_user_ids:
             meaningful_followup_question = _response_contains_direct_question_to_user(response) and not is_generic_non_answer_response(response)
@@ -26722,6 +27181,9 @@ def build_user_aware_prompt(
         user_text=clean_content,
         current_direct=recall_current_direct,
     )
+    recall_interpretation_contract = (
+        personal_recall_interpretation_contract(clean_content)
+    )
     if route_mode == ROUTE_MODE_NORMAL_CHAT and is_conversational_repair_intent(clean_content):
         prompt_contract += (
             "Correction-turn contract: use the visible prior exchange and make the corrected attempt now. "
@@ -26745,6 +27207,7 @@ def build_user_aware_prompt(
         "Source-authority basis rule: archive/record/source/dossier/scan/deployment/broadcast-memory language may be style or honest supplied-source reporting, but do not claim those sources prove/indicate/confirm something unless source/broadcast/show-state/read-model context is actually supplied.\n"
         "People-and-memory rule: preserve who said what and summarize another member's meaning in your own words by default. Do not act like a quote search engine. Use exact wording only when the user explicitly needs verification for a consequential dispute, the eligible current public source text is still present, and a minimal attributed quote is necessary. A derived summary, memory tier, relationship note, or Moment gist can never justify exact wording.\n"
         f"{prompt_contract}"
+        f"{recall_interpretation_contract}"
         f"{recall_synthesis_contract}"
         f"{room_prompt_block}"
         f"{continuity_prompt_block}"
@@ -29001,6 +29464,7 @@ def _evaluate_shared_brain_synthesis_receipt(
     run,
     baseline_response: str,
     candidate_response: str,
+    candidate_generation_latency_ms: int | None = None,
 ) -> SynthesisCanaryDecision:
     with sqlite3.connect(DB_FILE, timeout=0.25) as conn:
         decision = evaluate_shared_brain_synthesis_candidate(
@@ -29008,6 +29472,9 @@ def _evaluate_shared_brain_synthesis_receipt(
             run,
             baseline_response=baseline_response,
             candidate_response=candidate_response,
+            candidate_generation_latency_ms=(
+                candidate_generation_latency_ms
+            ),
         )
         conn.commit()
         return decision
@@ -29148,6 +29615,7 @@ async def maybe_generate_shared_brain_synthesis_canary(
         + "\n\n"
         + basis.rendered_context
     )
+    candidate_generation_started = time.monotonic()
     try:
         candidate_response = await get_gemini_response_with_optional_typing(
             channel,
@@ -29163,12 +29631,22 @@ async def maybe_generate_shared_brain_synthesis_canary(
             type(exc).__name__,
         )
         candidate_response = ""
+    candidate_generation_latency_ms = max(
+        0,
+        int(
+            round(
+                (time.monotonic() - candidate_generation_started)
+                * 1000
+            )
+        ),
+    )
     try:
         decision = await asyncio.to_thread(
             _evaluate_shared_brain_synthesis_receipt,
             run,
             baseline_response,
             candidate_response or "",
+            candidate_generation_latency_ms,
         )
         if (
             decision.candidate_selected
@@ -30526,18 +31004,23 @@ async def on_message(message: discord.Message):
                 _finish_direct_repair_generation(direct_repair_generation, "deterministic_self_reflection")
                 return
 
+            route_expansion, normal_generation_expansion = (
+                personal_recall_normal_generation_decision(
+                    guild_id=message.guild.id,
+                    user_id=message.author.id,
+                    route_mode=route_mode,
+                    channel_policy=channel_policy,
+                    user_text=direct_content,
+                    current_direct=True,
+                )
+            )
             memory_recall = resolve_recent_media_followup(message.author.id, message.guild.id, message.channel.id, channel_policy, direct_content)
             if not memory_recall:
                 memory_recall = try_memory_recall_response(message.author.id, message.guild.id, direct_content)
                 if memory_recall:
-                    if source_safe_recall_synthesis_enabled(
-                        guild_id=message.guild.id,
-                        user_id=message.author.id,
-                        route_mode=route_mode,
-                        channel_policy=channel_policy,
-                        user_text=direct_content,
-                        current_direct=True,
-                    ):
+                    # normal_generation_expansion already includes the
+                    # source_safe_recall_synthesis_enabled decision.
+                    if normal_generation_expansion:
                         memory_recall = ""
                     else:
                         memory_recall = apply_explicit_recall_governance(message.author.id, message.guild.id, direct_content, memory_recall, route_mode, channel_policy, channel_id=getattr(message.channel, "id", 0), channel_name=getattr(message.channel, "name", ""), is_owner_or_mod=is_privileged_member(message.author, message.guild))
@@ -30871,18 +31354,23 @@ async def on_message(message: discord.Message):
             _finish_direct_repair_generation(direct_repair_generation, "deterministic_self_reflection")
             return
 
+        route_expansion, normal_generation_expansion = (
+            personal_recall_normal_generation_decision(
+                guild_id=message.guild.id,
+                user_id=message.author.id,
+                route_mode=route_mode,
+                channel_policy=channel_policy,
+                user_text=direct_content,
+                current_direct=True,
+            )
+        )
         memory_recall = resolve_recent_media_followup(message.author.id, message.guild.id, message.channel.id, channel_policy, direct_content)
         if not memory_recall:
             memory_recall = try_memory_recall_response(message.author.id, message.guild.id, direct_content)
             if memory_recall:
-                if source_safe_recall_synthesis_enabled(
-                    guild_id=message.guild.id,
-                    user_id=message.author.id,
-                    route_mode=route_mode,
-                    channel_policy=channel_policy,
-                    user_text=direct_content,
-                    current_direct=True,
-                ):
+                # normal_generation_expansion already includes the
+                # source_safe_recall_synthesis_enabled decision.
+                if normal_generation_expansion:
                     memory_recall = ""
                 else:
                     memory_recall = apply_explicit_recall_governance(message.author.id, message.guild.id, direct_content, memory_recall, route_mode, channel_policy, channel_id=getattr(message.channel, "id", 0), channel_name=getattr(message.channel, "name", ""), is_owner_or_mod=is_privileged_member(message.author, message.guild))
@@ -31170,18 +31658,23 @@ async def on_message(message: discord.Message):
             _finish_direct_repair_generation(direct_repair_generation, "deterministic_self_reflection")
             return
 
+        route_expansion, normal_generation_expansion = (
+            personal_recall_normal_generation_decision(
+                guild_id=message.guild.id,
+                user_id=message.author.id,
+                route_mode=route_mode,
+                channel_policy=channel_policy,
+                user_text=direct_content,
+                current_direct=True,
+            )
+        )
         memory_recall = resolve_recent_media_followup(message.author.id, message.guild.id, message.channel.id, channel_policy, direct_content)
         if not memory_recall:
             memory_recall = try_memory_recall_response(message.author.id, message.guild.id, direct_content)
             if memory_recall:
-                if source_safe_recall_synthesis_enabled(
-                    guild_id=message.guild.id,
-                    user_id=message.author.id,
-                    route_mode=route_mode,
-                    channel_policy=channel_policy,
-                    user_text=direct_content,
-                    current_direct=True,
-                ):
+                # normal_generation_expansion already includes the
+                # source_safe_recall_synthesis_enabled decision.
+                if normal_generation_expansion:
                     memory_recall = ""
                 else:
                     memory_recall = apply_explicit_recall_governance(message.author.id, message.guild.id, direct_content, memory_recall, route_mode, channel_policy, channel_id=getattr(message.channel, "id", 0), channel_name=getattr(message.channel, "name", ""), is_owner_or_mod=is_privileged_member(message.author, message.guild))

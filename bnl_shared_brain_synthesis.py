@@ -18,6 +18,10 @@ import sqlite3
 import uuid
 from typing import Any, Mapping
 
+from bnl_memory_governance import (
+    PERSONAL_RECALL_ROUTE_FAMILY,
+    classify_personal_recall_intent,
+)
 from bnl_memory_ledger import subject_key_for_user
 from bnl_unified_intelligence_packet import (
     UnifiedIntelligencePacket,
@@ -39,7 +43,9 @@ GUILD_IDS_ENV = "BNL_SHARED_BRAIN_SYNTHESIS_CANARY_GUILD_IDS"
 USER_IDS_ENV = "BNL_SHARED_BRAIN_SYNTHESIS_CANARY_USER_IDS"
 CHANNEL_IDS_ENV = "BNL_SHARED_BRAIN_SYNTHESIS_CANARY_CHANNEL_IDS"
 _ROUTE_MODE = "normal_chat"
-_CHANNEL_POLICY = "public_context"
+_CHANNEL_POLICIES = frozenset({"public_home", "public_context"})
+_MAX_SCOPED_USERS = 8
+_MAX_SCOPED_CHANNELS = 4
 _LIVE_GATES = (
     "BNL_MEMORY_GOVERNANCE_LIVE_ENABLED",
     "BNL_RELATIONSHIP_V2_LIVE_ENABLED",
@@ -63,19 +69,6 @@ _LANE_LABELS = {
     "canon": "approved canon",
     "source_file": "authorized source context",
 }
-_BROAD_PROFILE_RE = re.compile(
-    r"(?:"
-    r"what\s+do\s+you\s+(?:know|remember)\s+about\s+me|"
-    r"what\s+do\s+you\s+have\s+on\s+me|"
-    r"what\s+am\s+i\s+all\s+about|"
-    r"what\s+have\s+you\s+learned\s+about\s+me|"
-    r"tell\s+me\s+(?:everything\s+)?(?:you\s+)?(?:know|remember)\s+about\s+me|"
-    r"tell\s+me\s+everything\s+you\s+remember|"
-    r"tell\s+me\s+about\s+myself|"
-    r"who\s+am\s+i\s+to\s+you"
-    r")",
-    re.I,
-)
 _CONTROL_MARKERS = (
     "unified intelligence packet",
     "shared-brain canary",
@@ -166,6 +159,15 @@ class SynthesisCanaryDecision:
     candidate_coherence_status: str
     candidate_evidence_coverage_count: int
     revalidation_status: str
+    candidate_generation_latency_ms: int = 0
+
+
+@dataclass(frozen=True)
+class RouteScopeDecision:
+    eligible: bool
+    reason: str
+    intent_status: str
+    route_family: str
 
 
 def _flag(value: Any) -> bool:
@@ -215,11 +217,14 @@ def configuration(
     guilds = _positive_ids(env.get(GUILD_IDS_ENV, ""))
     users = _positive_ids(env.get(USER_IDS_ENV, ""))
     channels = _positive_ids(env.get(CHANNEL_IDS_ENV, ""))
+    scope_present = bool(requested and guilds and users and channels)
+    scope_within_limits = bool(
+        len(guilds) == 1
+        and 1 <= len(users) <= _MAX_SCOPED_USERS
+        and 1 <= len(channels) <= _MAX_SCOPED_CHANNELS
+    )
     fully_scoped = bool(
-        requested
-        and len(guilds) == 1
-        and len(users) == 1
-        and len(channels) == 1
+        scope_present and scope_within_limits
     )
     packet_ready = packet_shadow_enabled(env)
     assessment_ready = assessment_shadow_enabled(env)
@@ -234,6 +239,8 @@ def configuration(
     )
     if not requested:
         reason = "disabled"
+    elif scope_present and not scope_within_limits:
+        reason = "scope_limit_exceeded"
     elif not fully_scoped:
         reason = "scope_incomplete"
     elif active_live_gates:
@@ -251,22 +258,79 @@ def configuration(
         "effective": effective,
         "reason": reason,
         "route_mode": _ROUTE_MODE,
-        "channel_policy": _CHANNEL_POLICY,
+        "route_family": PERSONAL_RECALL_ROUTE_FAMILY,
+        "channel_policies": tuple(sorted(_CHANNEL_POLICIES)),
+        "max_scoped_users": _MAX_SCOPED_USERS,
+        "max_scoped_channels": _MAX_SCOPED_CHANNELS,
         "active_live_gates": active_live_gates,
     }
 
 
 def broad_profile_request(text: str) -> bool:
-    value = re.sub(r"\s+", " ", str(text or "")).strip().replace("’", "'")
-    value = re.sub(
-        r"^(?:hey\s+|yo\s+|hi\s+)?"
-        r"(?:bnl(?:-?01)?|barcode bot)\s*[,;:—-]*\s*",
-        "",
-        value,
-        flags=re.I,
+    return classify_personal_recall_intent(text).broad_self_profile
+
+
+def route_scope_decision(
+    *,
+    guild_id: int,
+    user_id: int,
+    channel_id: int,
+    route_mode: str,
+    channel_policy: str,
+    current_direct: bool,
+    user_text: str,
+    has_media: bool = False,
+    exact_quote_requested: bool = False,
+    third_party_attribution_requested: bool = False,
+    environ: Mapping[str, str] | None = None,
+) -> RouteScopeDecision:
+    """Evaluate the route family before packet/assessment availability."""
+
+    env = os.environ if environ is None else environ
+    config = configuration(env)
+    intent = classify_personal_recall_intent(user_text)
+    if not config["effective"]:
+        reason = "configuration_%s" % config["reason"]
+    elif int(guild_id or 0) not in _positive_ids(
+        env.get(GUILD_IDS_ENV, "")
+    ):
+        reason = "guild_not_allowlisted"
+    elif int(user_id or 0) not in _positive_ids(
+        env.get(USER_IDS_ENV, "")
+    ):
+        reason = "user_not_allowlisted"
+    elif int(channel_id or 0) not in _positive_ids(
+        env.get(CHANNEL_IDS_ENV, "")
+    ):
+        reason = "channel_not_allowlisted"
+    elif str(route_mode or "") != _ROUTE_MODE:
+        reason = "route_mode_not_supported"
+    elif str(channel_policy or "").strip().lower() not in _CHANNEL_POLICIES:
+        reason = "channel_policy_not_supported"
+    elif not current_direct:
+        reason = "not_direct"
+    elif not intent.broad_self_profile:
+        reason = "intent_%s" % (intent.reason or intent.status)
+    elif has_media:
+        reason = "media_present"
+    elif exact_quote_requested:
+        reason = "exact_quote_requested"
+    elif third_party_attribution_requested:
+        reason = "third_party_attribution_requested"
+    else:
+        reason = "eligible"
+    return RouteScopeDecision(
+        eligible=reason == "eligible",
+        reason=reason,
+        intent_status=intent.status,
+        route_family=(
+            intent.route_family or PERSONAL_RECALL_ROUTE_FAMILY
+        ),
     )
-    value = value.strip(" .!?")
-    return bool(_BROAD_PROFILE_RE.fullmatch(value))
+
+
+def route_scope_enabled(**kwargs: Any) -> bool:
+    return route_scope_decision(**kwargs).eligible
 
 
 def _packet_usable(packet: UnifiedIntelligencePacket | None) -> bool:
@@ -297,32 +361,34 @@ def scope_enabled(
     environ: Mapping[str, str] | None = None,
 ) -> bool:
     env = os.environ if environ is None else environ
-    config = configuration(env)
-    guilds = _positive_ids(env.get(GUILD_IDS_ENV, ""))
-    users = _positive_ids(env.get(USER_IDS_ENV, ""))
-    channels = _positive_ids(env.get(CHANNEL_IDS_ENV, ""))
     return bool(
-        config["effective"]
-        and int(guild_id or 0) in guilds
-        and int(user_id or 0) in users
-        and int(channel_id or 0) in channels
-        and str(route_mode or "") == _ROUTE_MODE
-        and str(channel_policy or "").strip().lower() == _CHANNEL_POLICY
-        and current_direct
-        and broad_profile_request(user_text)
-        and not has_media
-        and not exact_quote_requested
-        and not third_party_attribution_requested
+        route_scope_enabled(
+            guild_id=guild_id,
+            user_id=user_id,
+            channel_id=channel_id,
+            route_mode=route_mode,
+            channel_policy=channel_policy,
+            current_direct=current_direct,
+            user_text=user_text,
+            has_media=has_media,
+            exact_quote_requested=exact_quote_requested,
+            third_party_attribution_requested=(
+                third_party_attribution_requested
+            ),
+            environ=env,
+        )
         and _packet_usable(packet)
         and isinstance(assessment, UnifiedResponseAssessment)
         and packet.request.guild_id == int(guild_id or 0)
         and packet.request.subject_user_id == int(user_id or 0)
         and packet.request.channel_id == int(channel_id or 0)
         and packet.request.route_mode == _ROUTE_MODE
-        and packet.request.channel_policy == _CHANNEL_POLICY
+        and packet.request.channel_policy
+        == str(channel_policy or "").strip().lower()
         and packet.request.direct_state == "direct"
         and assessment.guild_id == int(guild_id or 0)
-        and assessment.channel_policy == _CHANNEL_POLICY
+        and assessment.channel_policy
+        == str(channel_policy or "").strip().lower()
     )
 
 
@@ -534,7 +600,7 @@ def revalidate_basis(
             env.get(CHANNEL_IDS_ENV, "")
         )
         or basis.route_mode != _ROUTE_MODE
-        or basis.channel_policy != _CHANNEL_POLICY
+        or basis.channel_policy not in _CHANNEL_POLICIES
         or basis.packet.request.subject_user_id != basis.user_id
         or basis.packet.request.guild_id != basis.guild_id
         or basis.packet.request.channel_id != basis.channel_id
@@ -586,6 +652,7 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
             guild_id INTEGER NOT NULL,
             subject_hash TEXT NOT NULL,
             channel_scope_hash TEXT NOT NULL,
+            route_family TEXT NOT NULL DEFAULT 'broad_self_profile',
             route_mode TEXT NOT NULL,
             channel_policy TEXT NOT NULL,
             packet_item_count INTEGER NOT NULL DEFAULT 0,
@@ -600,6 +667,7 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
             final_response_hash TEXT NOT NULL DEFAULT '',
             baseline_response_length INTEGER NOT NULL DEFAULT 0,
             candidate_response_length INTEGER NOT NULL DEFAULT 0,
+            candidate_generation_latency_ms INTEGER NOT NULL DEFAULT 0,
             final_response_length INTEGER NOT NULL DEFAULT 0,
             comparison_status TEXT NOT NULL DEFAULT 'not_evaluated',
             baseline_coherence_status TEXT NOT NULL DEFAULT 'not_evaluated',
@@ -619,6 +687,26 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
         )
         """
     )
+    columns = {
+        str(row[1])
+        for row in conn.execute("PRAGMA table_info(%s)" % TABLE_NAME)
+    }
+    if "route_family" not in columns:
+        conn.execute(
+            """
+            ALTER TABLE memory_governance_shared_brain_synthesis_runs
+            ADD COLUMN route_family TEXT NOT NULL
+            DEFAULT 'broad_self_profile'
+            """
+        )
+    if "candidate_generation_latency_ms" not in columns:
+        conn.execute(
+            """
+            ALTER TABLE memory_governance_shared_brain_synthesis_runs
+            ADD COLUMN candidate_generation_latency_ms INTEGER NOT NULL
+            DEFAULT 0
+            """
+        )
     conn.execute(
         """
         CREATE INDEX IF NOT EXISTS idx_shared_brain_synthesis_guild
@@ -670,13 +758,14 @@ def begin_run(
         """
         INSERT INTO memory_governance_shared_brain_synthesis_runs(
           run_id,packet_run_id,packet_id,schema_version,guild_id,
-          subject_hash,channel_scope_hash,route_mode,channel_policy,
+          subject_hash,channel_scope_hash,route_family,route_mode,
+          channel_policy,
           packet_item_count,rendered_item_count,rendered_lane_counts_json,
           packet_digest,source_ref_digest,baseline_generated,
           baseline_response_hash,baseline_response_length,
           revalidation_status,prompt_applied,fallback_reason,
           processing_error_count,created_at,updated_at
-        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """,
         (
             run_id,
@@ -686,6 +775,7 @@ def begin_run(
             basis.guild_id,
             _digest(subject_key_for_user(basis.user_id))[:16],
             _digest(basis.guild_id, basis.channel_id)[:16],
+            PERSONAL_RECALL_ROUTE_FAMILY,
             basis.route_mode,
             basis.channel_policy,
             len(basis.packet.items),
@@ -731,6 +821,7 @@ def evaluate_candidate(
     *,
     baseline_response: str,
     candidate_response: str,
+    candidate_generation_latency_ms: int | None = None,
     environ: Mapping[str, str] | None = None,
 ) -> SynthesisCanaryDecision:
     baseline = str(baseline_response or "").strip()
@@ -785,7 +876,10 @@ def evaluate_candidate(
         """
         UPDATE memory_governance_shared_brain_synthesis_runs
         SET candidate_generated=?,candidate_response_hash=?,
-            candidate_response_length=?,comparison_status=?,
+            candidate_response_length=?,
+            candidate_generation_latency_ms=COALESCE(
+              ?,candidate_generation_latency_ms
+            ),comparison_status=?,
             baseline_coherence_status=?,candidate_coherence_status=?,
             candidate_evidence_coverage_count=?,candidate_output_leak=?,
             revalidation_status=?,
@@ -798,6 +892,11 @@ def evaluate_candidate(
             int(bool(candidate)),
             _digest(candidate),
             len(candidate),
+            (
+                max(0, int(candidate_generation_latency_ms))
+                if candidate_generation_latency_ms is not None
+                else None
+            ),
             comparison_status,
             baseline_coherence.status,
             candidate_coherence.status,
@@ -811,6 +910,17 @@ def evaluate_candidate(
             run.run_id,
         ),
     )
+    stored_latency = int(
+        conn.execute(
+            """
+            SELECT candidate_generation_latency_ms
+            FROM memory_governance_shared_brain_synthesis_runs
+            WHERE run_id=?
+            """,
+            (run.run_id,),
+        ).fetchone()[0]
+        or 0
+    )
     return SynthesisCanaryDecision(
         run=run,
         response=selected,
@@ -821,6 +931,7 @@ def evaluate_candidate(
         candidate_coherence_status=candidate_coherence.status,
         candidate_evidence_coverage_count=evidence_coverage,
         revalidation_status=revalidation_status,
+        candidate_generation_latency_ms=stored_latency,
     )
 
 
@@ -865,6 +976,9 @@ def record_fallback(
             decision.candidate_evidence_coverage_count
         ),
         revalidation_status=decision.revalidation_status,
+        candidate_generation_latency_ms=(
+            decision.candidate_generation_latency_ms
+        ),
     )
 
 
@@ -929,6 +1043,12 @@ def _empty_report() -> dict[str, Any]:
         "baselineCoherenceStatusCounts": {},
         "candidateCoherenceStatusCounts": {},
         "candidateEvidenceCoverageTotal": 0,
+        "routeFamilyCounts": {},
+        "candidateGenerationLatencyMs": {
+            "average": 0,
+            "maximum": 0,
+            "samples": 0,
+        },
         "revalidationStatusCounts": {},
         "controlMarkerLeakRuns": 0,
         "processingErrors": 0,
@@ -972,6 +1092,16 @@ def build_evaluation_report(
             "source_refs",
         }
     )
+    route_family_expr = (
+        "route_family"
+        if "route_family" in columns
+        else "'broad_self_profile'"
+    )
+    latency_expr = (
+        "candidate_generation_latency_ms"
+        if "candidate_generation_latency_ms" in columns
+        else "0"
+    )
     invalid_scope_runs = int(
         conn.execute(
             """
@@ -979,11 +1109,12 @@ def build_evaluation_report(
             FROM memory_governance_shared_brain_synthesis_runs
             WHERE guild_id=?
               AND (
-                route_mode<>? OR channel_policy<>?
+                route_mode<>?
+                OR channel_policy NOT IN ('public_home','public_context')
                 OR subject_hash='' OR channel_scope_hash=''
               )
             """,
-            (int(guild_id or 0), _ROUTE_MODE, _CHANNEL_POLICY),
+            (int(guild_id or 0), _ROUTE_MODE),
         ).fetchone()[0]
         or 0
     )
@@ -1030,12 +1161,16 @@ def build_evaluation_report(
                baseline_coherence_status,candidate_coherence_status,
                candidate_evidence_coverage_count,revalidation_status,
                candidate_output_leak,
-               processing_error_count,response_sent,created_at
+               processing_error_count,response_sent,
+               {route_family_expr},{latency_expr},created_at
         FROM memory_governance_shared_brain_synthesis_runs
         WHERE guild_id=?
         ORDER BY created_at DESC,run_id DESC
         LIMIT ?
-        """,
+        """.format(
+            route_family_expr=route_family_expr,
+            latency_expr=latency_expr,
+        ),
         (int(guild_id or 0), max(1, min(int(limit or 500), 2000))),
     ).fetchall()
     fallbacks: Counter[str] = Counter()
@@ -1043,6 +1178,8 @@ def build_evaluation_report(
     baseline_coherence: Counter[str] = Counter()
     candidate_coherence: Counter[str] = Counter()
     revalidation: Counter[str] = Counter()
+    route_families: Counter[str] = Counter()
+    latency_values: list[int] = []
     prompt = live = selected = coverage = leaks = errors = sent = 0
     for row in rows:
         (
@@ -1059,6 +1196,8 @@ def build_evaluation_report(
             output_leak,
             processing_errors,
             response_sent,
+            route_family,
+            candidate_latency_ms,
             _created_at,
         ) = row
         prompt += int(bool(prompt_applied))
@@ -1074,6 +1213,12 @@ def build_evaluation_report(
         leaks += int(bool(output_leak))
         errors += int(processing_errors or 0)
         sent += int(bool(response_sent))
+        route_families[
+            str(route_family or PERSONAL_RECALL_ROUTE_FAMILY)
+        ] += 1
+        latency = max(0, int(candidate_latency_ms or 0))
+        if latency:
+            latency_values.append(latency)
     return {
         "tablePresent": True,
         "schemaVersion": str(rows[0][0]) if rows else SCHEMA_VERSION,
@@ -1091,6 +1236,16 @@ def build_evaluation_report(
             sorted(candidate_coherence.items())
         ),
         "candidateEvidenceCoverageTotal": coverage,
+        "routeFamilyCounts": dict(sorted(route_families.items())),
+        "candidateGenerationLatencyMs": {
+            "average": (
+                int(round(sum(latency_values) / len(latency_values)))
+                if latency_values
+                else 0
+            ),
+            "maximum": max(latency_values, default=0),
+            "samples": len(latency_values),
+        },
         "revalidationStatusCounts": dict(sorted(revalidation.items())),
         "controlMarkerLeakRuns": leaks,
         "processingErrors": errors,

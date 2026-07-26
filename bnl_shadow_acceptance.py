@@ -741,6 +741,12 @@ def _read_shared_brain_synthesis_report(
                 "baselineCoherenceStatusCounts": {},
                 "candidateCoherenceStatusCounts": {},
                 "candidateEvidenceCoverageTotal": 0,
+                "routeFamilyCounts": {},
+                "candidateGenerationLatencyMs": {
+                    "average": 0,
+                    "maximum": 0,
+                    "samples": 0,
+                },
                 "revalidationStatusCounts": {},
                 "controlMarkerLeakRuns": 0,
                 "processingErrors": 0,
@@ -1754,7 +1760,7 @@ def render_v2_shadow_acceptance_lines(snapshot: Mapping[str, Any]) -> List[str]:
                 "none",
             ),
         ),
-        "- shared_brain_synthesis_canary: status=`%s` requested=`%s` effective=`%s` reason=`%s` fully_scoped=`%s` schema=`%s` runs=`%s` prompt_applied=`%s` candidate_selected=`%s` live_applied=`%s` responses_sent=`%s` fallbacks=`%s` fallback_reasons=`%s` comparison=`%s` baseline_coherence=`%s` candidate_coherence=`%s` evidence_coverage=`%s` revalidation=`%s` control_leaks=`%s` errors=`%s` invalid_scope=`%s` invalid_revalidation_live=`%s` ungrounded_live=`%s` relationship_posture_applied=`%s` content_fields=`%s` window_last=`%s`" % (
+        "- shared_brain_synthesis_canary: status=`%s` requested=`%s` effective=`%s` reason=`%s` fully_scoped=`%s` schema=`%s` runs=`%s` route_families=`%s` prompt_applied=`%s` candidate_selected=`%s` live_applied=`%s` responses_sent=`%s` fallbacks=`%s` fallback_reasons=`%s` comparison=`%s` baseline_coherence=`%s` candidate_coherence=`%s` evidence_coverage=`%s` candidate_latency_ms=`%s` revalidation=`%s` control_leaks=`%s` errors=`%s` invalid_scope=`%s` invalid_revalidation_live=`%s` ungrounded_live=`%s` relationship_posture_applied=`%s` content_fields=`%s` window_last=`%s`" % (
             shared_brain_synthesis_state.get("status", "unknown"),
             _on(shared_brain_synthesis_state.get("requested")),
             _on(shared_brain_synthesis_state.get("effective")),
@@ -1765,6 +1771,10 @@ def render_v2_shadow_acceptance_lines(snapshot: Mapping[str, Any]) -> List[str]:
                 "shared_brain_synthesis_canary_v1",
             ),
             shared_brain_synthesis.get("runs", 0),
+            json.dumps(
+                shared_brain_synthesis.get("routeFamilyCounts", {}),
+                sort_keys=True,
+            ),
             shared_brain_synthesis.get("promptAppliedRuns", 0),
             shared_brain_synthesis.get("candidateSelectedRuns", 0),
             shared_brain_synthesis.get("liveAppliedRuns", 0),
@@ -1798,6 +1808,13 @@ def render_v2_shadow_acceptance_lines(snapshot: Mapping[str, Any]) -> List[str]:
             shared_brain_synthesis.get(
                 "candidateEvidenceCoverageTotal",
                 0,
+            ),
+            json.dumps(
+                shared_brain_synthesis.get(
+                    "candidateGenerationLatencyMs",
+                    {},
+                ),
+                sort_keys=True,
             ),
             json.dumps(
                 shared_brain_synthesis.get(
