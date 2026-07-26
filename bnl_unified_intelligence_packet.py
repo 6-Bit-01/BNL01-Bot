@@ -28,6 +28,7 @@ from bnl_memory_governance import (
     GovernanceRequest,
     assess_governance_result_safety,
     build_governed_context,
+    classify_personal_recall_intent,
     ensure_governance_schema,
 )
 from bnl_memory_ledger import (
@@ -162,18 +163,6 @@ _TERM_STOPWORDS = {
     "with",
     "you",
 }
-_BROAD_PROFILE_RE = re.compile(
-    r"\b(?:"
-    r"what\s+do\s+you\s+(?:know|remember)\s+about\s+me|"
-    r"what\s+do\s+you\s+have\s+on\s+me|"
-    r"what\s+am\s+i\s+all\s+about|"
-    r"what\s+have\s+you\s+learned\s+about\s+me|"
-    r"tell\s+me\s+(?:everything\s+)?(?:you\s+)?(?:know|remember)\s+about\s+me|"
-    r"tell\s+me\s+about\s+myself|"
-    r"who\s+am\s+i\s+to\s+you"
-    r")\b",
-    re.I,
-)
 _CURRENT_CORRECTION_RE = re.compile(
     r"\b(?:correction|correcting|that's\s+wrong|that\s+is\s+wrong|"
     r"not\s+anymore|no[,;:]?\s+(?:my|i|we)|"
@@ -441,7 +430,7 @@ def _terms(value: Any) -> set[str]:
 
 
 def _broad_profile_request(value: str) -> bool:
-    return bool(_BROAD_PROFILE_RE.search(str(value or "")))
+    return classify_personal_recall_intent(value).broad_self_profile
 
 
 def _public_route(request: IntelligencePacketRequest) -> bool:

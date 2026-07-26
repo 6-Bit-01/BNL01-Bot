@@ -99,8 +99,144 @@ RAW_CONVERSATION_LEDGER_SQL = """
   )
 )
 """
-BROAD_RECALL_RE = re.compile(r"\b(what do you (?:know|remember) about me|what do you remember|my memory|everything you know|recall my)\b", re.I)
 RECALL_RE = re.compile(r"\b(remember|memory|recall|what do you know|what is my|what's my|my)\b", re.I)
+PERSONAL_RECALL_ROUTE_FAMILY = "broad_self_profile"
+_PERSONAL_RECALL_HOLD_RE = re.compile(
+    r"\b(?:do not|don't|never|not yet|later|before you answer|"
+    r"don't answer|do not answer|hold off|wait)\b",
+    re.I,
+)
+_PROFILE_SCOPE_SUFFIX = (
+    r"(?: (?:in|within|around|for|regarding) "
+    r"(?!.*\b(?:and|also|then|plus)\b).+)?"
+)
+_BROAD_SELF_PROFILE_PATTERNS = (
+    rf"what do you (?:know|remember) about me{_PROFILE_SCOPE_SUFFIX}",
+    r"what do you have on me",
+    rf"what am i all about{_PROFILE_SCOPE_SUFFIX}",
+    rf"what have you learned about me{_PROFILE_SCOPE_SUFFIX}",
+    rf"tell me (?:everything )?(?:you )?(?:know|remember) about me"
+    rf"{_PROFILE_SCOPE_SUFFIX}",
+    r"tell me everything you remember",
+    r"tell me about myself",
+    r"who am i to you",
+)
+_AMBIGUOUS_RECALL_PATTERNS = (
+    r"what do you (?:know|remember)",
+    r"what do you recall",
+    r"do you remember",
+    r"tell me what you remember",
+    r"what can you tell me",
+)
+
+
+@dataclass(frozen=True)
+class PersonalRecallIntent:
+    """Canonical interpretation of one possible personal-recall request."""
+
+    normalized_text: str
+    status: str
+    route_family: str = ""
+    reason: str = ""
+
+    @property
+    def broad_self_profile(self) -> bool:
+        return bool(
+            self.status == "matched"
+            and self.route_family == PERSONAL_RECALL_ROUTE_FAMILY
+        )
+
+
+def normalize_personal_recall_intent(text: str) -> str:
+    """Remove Discord/vocative wording without changing the request meaning."""
+
+    value = re.sub(
+        r"\s+",
+        " ",
+        str(text or "").replace("’", "'"),
+    ).strip()
+    value = re.sub(r"^\s*<@!?\d+>\s*", "", value, flags=re.I)
+    value = re.sub(r"^[,;:!?—–-]+\s*", "", value)
+    value = re.sub(
+        r"^(?:(?:hey|yo|hi|hello)\s+)?"
+        r"(?:bnl(?:-?01)?|barcode bot|b|bud|buddy)"
+        r"(?:\s*[,;:!?—–-]+\s*|\s+)",
+        "",
+        value,
+        flags=re.I,
+    )
+    value = re.sub(
+        r"^(?:(?:so|okay|ok|well)\s*[,;:—–-]*\s*)+",
+        "",
+        value,
+        flags=re.I,
+    )
+    value = re.sub(
+        r"^(?:please\s+)?(?:(?:can|could|would|will)\s+you\s+)?",
+        "",
+        value,
+        flags=re.I,
+    )
+    value = value.strip(" \t\r\n.,!?;:—–-").lower()
+    value = re.sub(
+        r"\s*(?:,?\s+(?:please|honestly|again|currently|"
+        r"right now|now|so far))+$",
+        "",
+        value,
+        flags=re.I,
+    )
+    return value.strip(" \t\r\n.,!?;:—–-")
+
+
+def classify_personal_recall_intent(text: str) -> PersonalRecallIntent:
+    """Return one shared routing decision for broad self-profile wording."""
+
+    normalized = normalize_personal_recall_intent(text)
+    if not normalized:
+        return PersonalRecallIntent(
+            normalized,
+            "not_recall",
+            reason="empty",
+        )
+    if _PERSONAL_RECALL_HOLD_RE.search(normalized):
+        return PersonalRecallIntent(
+            normalized,
+            "blocked",
+            reason="answer_deferred_or_negated",
+        )
+    if any(
+        re.fullmatch(pattern, normalized, flags=re.I)
+        for pattern in _BROAD_SELF_PROFILE_PATTERNS
+    ):
+        return PersonalRecallIntent(
+            normalized,
+            "matched",
+            route_family=PERSONAL_RECALL_ROUTE_FAMILY,
+            reason="canonical_broad_self_profile",
+        )
+    if any(
+        re.fullmatch(pattern, normalized, flags=re.I)
+        for pattern in _AMBIGUOUS_RECALL_PATTERNS
+    ):
+        return PersonalRecallIntent(
+            normalized,
+            "needs_context",
+            reason="recall_target_ambiguous",
+        )
+    if any(
+        re.search(pattern, normalized, flags=re.I)
+        for pattern in _BROAD_SELF_PROFILE_PATTERNS
+    ):
+        return PersonalRecallIntent(
+            normalized,
+            "not_recall",
+            reason="mixed_or_unsupported_request",
+        )
+    return PersonalRecallIntent(
+        normalized,
+        "not_recall",
+        reason="not_personal_recall",
+    )
 
 @dataclass(frozen=True)
 class GovernanceRequest:
@@ -356,7 +492,7 @@ def _classify_kind(source_class: str, entry_type: str, derived: bool, lifecycle:
     return "observation"
 
 def _is_broad_recall(text: str) -> bool:
-    return bool(BROAD_RECALL_RE.search(text or ""))
+    return classify_personal_recall_intent(text).broad_self_profile
 
 def _explicit_recall(text: str) -> bool:
     return bool(RECALL_RE.search(text or ""))

@@ -1115,6 +1115,225 @@ class ConversationBatchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
             ],
         )
 
+    async def test_batched_broad_recall_route_uses_normal_baseline_and_packet_canary(self):
+        channel = self._channel(8126)
+        baseline = (
+            "You keep building strange music and helping the BARCODE room."
+        )
+        candidate = (
+            "You keep turning strange music into shared BARCODE projects, "
+            "and you show up for the people building them with you."
+        )
+        legacy = "Here is what I can safely recall:\n- community banter"
+        run = SimpleNamespace(run_id="batch-route-run")
+        first_decision = SimpleNamespace(
+            run=run,
+            candidate_selected=True,
+            fallback_reason="",
+        )
+        execution = bnl01_bot.SharedBrainSynthesisExecution(
+            decision=first_decision,
+            response=candidate,
+            prompt="baseline prompt\n\nprivate packet evidence",
+            prompt_source_bases=("packet-basis",),
+            candidate_active=True,
+        )
+        final_decision = SimpleNamespace(
+            run=run,
+            candidate_selected=True,
+            fallback_reason="",
+        )
+        finalized = mock.AsyncMock(return_value=True)
+
+        self._prime_flush(
+            channel,
+            "Hey bud what do you know about me",
+        )
+        with (
+            self._flush_runtime(
+                channel.id,
+                mock.AsyncMock(return_value=baseline),
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "resolve_channel_policy",
+                return_value="public_home",
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "try_memory_recall_response",
+                return_value=legacy,
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "apply_explicit_recall_governance",
+            ) as deterministic_governance,
+            mock.patch.object(
+                bnl01_bot,
+                "build_user_memory_context",
+                return_value=(
+                    "Derived memory summaries:\n"
+                    "- strange music\n"
+                    "- helps the community"
+                ),
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "build_unified_response_assessment_shadow",
+                return_value=object(),
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "build_shared_brain_synthesis_basis",
+                return_value=object(),
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "maybe_generate_shared_brain_synthesis_canary",
+                new=mock.AsyncMock(return_value=execution),
+            ) as synthesize,
+            mock.patch.object(
+                bnl01_bot,
+                "_evaluate_shared_brain_synthesis_receipt",
+                return_value=final_decision,
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "prompt_source_basis_failure",
+                return_value="",
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "safely_finalize_shared_brain_synthesis",
+                new=finalized,
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "record_unified_response_assessment_shadow_after_send",
+                new=mock.AsyncMock(),
+            ),
+        ):
+            await bnl01_bot._flush_channel_buffer(channel)
+
+        deterministic_governance.assert_not_called()
+        synthesize.assert_awaited_once()
+        self.assertEqual(channel.sent, [candidate])
+        finalized.assert_awaited_once()
+        self.assertTrue(finalized.await_args.kwargs["response_sent"])
+        self.assertTrue(finalized.await_args.kwargs["candidate_live"])
+
+    async def test_batched_packet_source_change_falls_back_to_normal_baseline(self):
+        channel = self._channel(8127)
+        baseline = (
+            "You keep building strange music and helping the BARCODE room."
+        )
+        candidate = (
+            "You keep turning strange music into shared BARCODE projects."
+        )
+        run = SimpleNamespace(run_id="batch-source-fallback-run")
+        selected = SimpleNamespace(
+            run=run,
+            candidate_selected=True,
+            fallback_reason="",
+        )
+        execution = bnl01_bot.SharedBrainSynthesisExecution(
+            decision=selected,
+            response=candidate,
+            prompt="baseline prompt\n\nprivate packet evidence",
+            prompt_source_bases=("packet-basis",),
+            candidate_active=True,
+        )
+        fallback = SimpleNamespace(
+            run=run,
+            candidate_selected=False,
+            fallback_reason="candidate_presend_packet_source_changed",
+        )
+        finalized = mock.AsyncMock(return_value=True)
+        source_results = iter(("packet_source_changed", ""))
+
+        self._prime_flush(
+            channel,
+            "Hey BNL what do you know about me?",
+        )
+        with (
+            self._flush_runtime(
+                channel.id,
+                mock.AsyncMock(return_value=baseline),
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "resolve_channel_policy",
+                return_value="public_home",
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "try_memory_recall_response",
+                return_value=(
+                    "Here is what I can safely recall:\n"
+                    "- community banter"
+                ),
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "build_user_memory_context",
+                return_value=(
+                    "Derived memory summaries:\n"
+                    "- strange music\n"
+                    "- helps the community"
+                ),
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "build_unified_response_assessment_shadow",
+                return_value=object(),
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "build_shared_brain_synthesis_basis",
+                return_value=object(),
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "maybe_generate_shared_brain_synthesis_canary",
+                new=mock.AsyncMock(return_value=execution),
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "_evaluate_shared_brain_synthesis_receipt",
+                return_value=selected,
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "prompt_source_basis_failure",
+                side_effect=lambda _bases: next(source_results),
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "safely_fallback_shared_brain_synthesis",
+                new=mock.AsyncMock(return_value=fallback),
+            ) as fall_back,
+            mock.patch.object(
+                bnl01_bot,
+                "safely_finalize_shared_brain_synthesis",
+                new=finalized,
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "record_unified_response_assessment_shadow_after_send",
+                new=mock.AsyncMock(),
+            ),
+        ):
+            await bnl01_bot._flush_channel_buffer(channel)
+
+        self.assertEqual(channel.sent, [baseline])
+        fall_back.assert_awaited_once()
+        self.assertEqual(
+            fall_back.await_args.args[1],
+            "candidate_presend_packet_source_changed",
+        )
+        finalized.assert_awaited_once()
+        self.assertFalse(finalized.await_args.kwargs["candidate_live"])
+
     async def test_batched_media_followup_wins_without_durable_governance(self):
         channel = self._channel(8119)
         provider = mock.AsyncMock(side_effect=AssertionError("deterministic media must not generate"))

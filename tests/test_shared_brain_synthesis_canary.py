@@ -209,7 +209,7 @@ class SharedBrainSynthesisCanaryTests(unittest.TestCase):
         self.assertIsNotNone(basis)
         return basis
 
-    def test_configuration_requires_one_exact_scope_and_no_global_live_gate(self):
+    def test_configuration_requires_bounded_scope_and_no_global_live_gate(self):
         configured = configuration(self.flags)
         self.assertTrue(configured["effective"])
         self.assertEqual(configured["reason"], "scoped_canary")
@@ -217,10 +217,22 @@ class SharedBrainSynthesisCanaryTests(unittest.TestCase):
         self.assertEqual(configured["user_allowlist_count"], 1)
         self.assertEqual(configured["channel_allowlist_count"], 1)
 
-        incomplete = configuration(
+        bounded_expansion = configuration(
             {
                 **self.flags,
                 "BNL_SHARED_BRAIN_SYNTHESIS_CANARY_CHANNEL_IDS": "10,11",
+            }
+        )
+        self.assertTrue(bounded_expansion["effective"])
+        self.assertEqual(
+            bounded_expansion["channel_allowlist_count"],
+            2,
+        )
+
+        incomplete = configuration(
+            {
+                **self.flags,
+                "BNL_SHARED_BRAIN_SYNTHESIS_CANARY_USER_IDS": "",
             }
         )
         self.assertFalse(incomplete["effective"])
@@ -308,6 +320,7 @@ class SharedBrainSynthesisCanaryTests(unittest.TestCase):
                 "You are about modular synths, music, and building "
                 "the archive project into something shared."
             ),
+            candidate_generation_latency_ms=125,
             environ=self.flags,
         )
         self.assertTrue(decision.candidate_selected)
@@ -333,6 +346,14 @@ class SharedBrainSynthesisCanaryTests(unittest.TestCase):
         self.assertEqual(report["liveAppliedRuns"], 1)
         self.assertEqual(report["responseSentRuns"], 1)
         self.assertGreater(report["candidateEvidenceCoverageTotal"], 0)
+        self.assertEqual(
+            report["routeFamilyCounts"],
+            {"broad_self_profile": 1},
+        )
+        self.assertEqual(
+            report["candidateGenerationLatencyMs"],
+            {"average": 125, "maximum": 125, "samples": 1},
+        )
         self.assertEqual(report["liveInvalidRevalidationRuns"], 0)
         self.assertEqual(report["liveUngroundedRuns"], 0)
         self.assertEqual(report["relationshipPostureAppliedRuns"], 0)
