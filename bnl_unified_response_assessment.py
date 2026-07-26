@@ -24,7 +24,7 @@ from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
 from bnl_conversation_context_v2 import assess_payload_grounding
 
 
-ASSESSMENT_VERSION = "unified_response_assessment_v6"
+ASSESSMENT_VERSION = "unified_response_assessment_v7"
 SHADOW_ENV = "BNL_UNIFIED_RESPONSE_ASSESSMENT_SHADOW_ENABLED"
 TABLE_NAME = "unified_response_assessment_shadow_runs"
 
@@ -822,6 +822,13 @@ class UnifiedResponseAssessment:
     open_loop_source_ids: Tuple[int, ...]
     ambiguity_reasons: Tuple[str, ...]
     expected_answer_shape: str
+    profile_sufficiency_status: str = "not_applicable"
+    profile_sufficiency_met: bool = True
+    profile_required_point_count: int = 0
+    profile_selected_point_count: int = 0
+    profile_independent_root_count: int = 0
+    profile_independent_occurrence_count: int = 0
+    profile_sufficiency_reasons: Tuple[str, ...] = ()
 
 
 def build_unified_response_assessment(
@@ -871,6 +878,13 @@ def build_unified_response_assessment(
     packet_conflict_reasons: Sequence[str] = (),
     packet_missing_lanes: Sequence[str] = (),
     packet_revalidation_status: str = "",
+    profile_sufficiency_status: str = "not_applicable",
+    profile_sufficiency_met: bool = True,
+    profile_required_point_count: int = 0,
+    profile_selected_point_count: int = 0,
+    profile_independent_root_count: int = 0,
+    profile_independent_occurrence_count: int = 0,
+    profile_sufficiency_reasons: Sequence[str] = (),
 ) -> UnifiedResponseAssessment:
     """Assemble one deterministic assessment without rendering it live."""
 
@@ -942,6 +956,55 @@ def build_unified_response_assessment(
     conflicts = []
     inferences = []
     diagnostics = []
+    normalized_profile_status = str(
+        profile_sufficiency_status or "not_applicable"
+    ).strip().lower()
+    if normalized_profile_status not in {
+        "not_applicable",
+        "rich",
+        "sparse",
+        "empty",
+        "insufficient",
+    }:
+        normalized_profile_status = "insufficient"
+    normalized_profile_reasons = _unique_strings(
+        profile_sufficiency_reasons
+    )
+    normalized_profile_required_points = max(
+        0,
+        int(profile_required_point_count or 0),
+    )
+    normalized_profile_selected_points = max(
+        0,
+        int(profile_selected_point_count or 0),
+    )
+    normalized_profile_roots = max(
+        0,
+        int(profile_independent_root_count or 0),
+    )
+    normalized_profile_occurrences = max(
+        0,
+        int(profile_independent_occurrence_count or 0),
+    )
+    expected_profile_points = {
+        "rich": 2,
+        "sparse": 1,
+    }.get(normalized_profile_status)
+    if normalized_profile_status == "not_applicable":
+        profile_met = bool(profile_sufficiency_met)
+    elif expected_profile_points is None:
+        profile_met = False
+    else:
+        profile_met = bool(
+            profile_sufficiency_met
+            and normalized_profile_required_points
+            == expected_profile_points
+            and normalized_profile_selected_points
+            >= expected_profile_points
+            and normalized_profile_roots >= expected_profile_points
+            and normalized_profile_occurrences
+            >= expected_profile_points
+        )
     if objective:
         inferences.append("current_objective_resolved")
     if current_options:
@@ -1052,6 +1115,23 @@ def build_unified_response_assessment(
             "packet_revalidation:%s"
             % str(packet_revalidation_status or "unknown").strip()[:80]
         )
+    diagnostics.append(
+        "profile_sufficiency:%s" % normalized_profile_status
+    )
+    if not profile_met:
+        conflicts.append(
+            (
+                "profile_sufficiency_%s"
+                % normalized_profile_status
+                if normalized_profile_status in {"empty", "insufficient"}
+                else "profile_sufficiency_status_count_mismatch"
+            )
+        )
+        diagnostics.append("profile_sufficiency_not_met")
+    elif normalized_profile_status == "sparse":
+        diagnostics.append("profile_sparse_answer_required")
+    elif normalized_profile_status == "rich":
+        diagnostics.append("profile_rich_evidence_ready")
 
     selected_lanes = _unique_strings(selected)
     excluded_lanes = tuple(
@@ -1087,6 +1167,8 @@ def build_unified_response_assessment(
         response_act=act,
         objective_kind=objective_kind,
     )
+    if normalized_profile_status == "sparse":
+        expected_answer_shape = "honest_narrow_answer"
     diagnostics.append("response_act:%s" % act)
     diagnostics.append("objective_kind:%s" % objective_kind)
     diagnostics.append(
@@ -1148,6 +1230,15 @@ def build_unified_response_assessment(
         open_loop_source_ids=open_loop_source_ids,
         ambiguity_reasons=ambiguity_reasons,
         expected_answer_shape=expected_answer_shape,
+        profile_sufficiency_status=normalized_profile_status,
+        profile_sufficiency_met=profile_met,
+        profile_required_point_count=normalized_profile_required_points,
+        profile_selected_point_count=normalized_profile_selected_points,
+        profile_independent_root_count=normalized_profile_roots,
+        profile_independent_occurrence_count=(
+            normalized_profile_occurrences
+        ),
+        profile_sufficiency_reasons=normalized_profile_reasons,
     )
 
 
@@ -1791,6 +1882,13 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
             coherence_reason_codes_json TEXT NOT NULL DEFAULT '[]',
             criterion_coverage_count INTEGER NOT NULL DEFAULT 0,
             semantic_speaker_coverage_count INTEGER NOT NULL DEFAULT 0,
+            profile_sufficiency_status TEXT NOT NULL DEFAULT 'not_applicable',
+            profile_sufficiency_met INTEGER NOT NULL DEFAULT 0,
+            profile_required_point_count INTEGER NOT NULL DEFAULT 0,
+            profile_selected_point_count INTEGER NOT NULL DEFAULT 0,
+            profile_independent_root_count INTEGER NOT NULL DEFAULT 0,
+            profile_independent_occurrence_count INTEGER NOT NULL DEFAULT 0,
+            profile_sufficiency_reasons_json TEXT NOT NULL DEFAULT '[]',
             response_alignment TEXT NOT NULL,
             processing_errors_json TEXT NOT NULL DEFAULT '[]',
             behavior_changed INTEGER NOT NULL DEFAULT 0,
@@ -1898,6 +1996,22 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
         (
             "scoped_canary_output_leak_guard",
             "INTEGER NOT NULL DEFAULT 0",
+        ),
+        (
+            "profile_sufficiency_status",
+            "TEXT NOT NULL DEFAULT 'not_applicable'",
+        ),
+        ("profile_sufficiency_met", "INTEGER NOT NULL DEFAULT 0"),
+        ("profile_required_point_count", "INTEGER NOT NULL DEFAULT 0"),
+        ("profile_selected_point_count", "INTEGER NOT NULL DEFAULT 0"),
+        ("profile_independent_root_count", "INTEGER NOT NULL DEFAULT 0"),
+        (
+            "profile_independent_occurrence_count",
+            "INTEGER NOT NULL DEFAULT 0",
+        ),
+        (
+            "profile_sufficiency_reasons_json",
+            "TEXT NOT NULL DEFAULT '[]'",
         ),
     )
     for column_name, column_definition in additive_columns:
@@ -2130,6 +2244,13 @@ def persist_shadow_run(
         "coherence_reason_codes_json",
         "criterion_coverage_count",
         "semantic_speaker_coverage_count",
+        "profile_sufficiency_status",
+        "profile_sufficiency_met",
+        "profile_required_point_count",
+        "profile_selected_point_count",
+        "profile_independent_root_count",
+        "profile_independent_occurrence_count",
+        "profile_sufficiency_reasons_json",
         "response_alignment",
         "processing_errors_json",
         "behavior_changed",
@@ -2215,6 +2336,13 @@ def persist_shadow_run(
         json.dumps(coherence.reason_codes),
         coherence.criterion_coverage_count,
         coherence.speaker_attribution_coverage_count,
+        assessment.profile_sufficiency_status,
+        int(assessment.profile_sufficiency_met),
+        assessment.profile_required_point_count,
+        assessment.profile_selected_point_count,
+        assessment.profile_independent_root_count,
+        assessment.profile_independent_occurrence_count,
+        json.dumps(assessment.profile_sufficiency_reasons),
         alignment,
         json.dumps(
             tuple(

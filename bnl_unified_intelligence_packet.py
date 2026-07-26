@@ -25,6 +25,7 @@ from bnl_canon_source_contract import (
     SourceClass,
 )
 from bnl_memory_governance import (
+    APPROVED_MEMBER_SCALAR_PREDICATES,
     GovernanceRequest,
     assess_governance_result_safety,
     build_governed_context,
@@ -33,13 +34,16 @@ from bnl_memory_governance import (
 )
 from bnl_memory_ledger import (
     ATOMIC_KNOWLEDGE_LIFECYCLE_SCHEMA_VERSION,
+    knowledge_occurrence_identity,
+    knowledge_root_identity,
+    knowledge_source_root_identity,
     subject_key_for_user,
 )
 from bnl_moment_engine import select_public_participant_moment_gists
 from bnl_relationship_engine import shadow_packet_posture
 
 
-SCHEMA_VERSION = "unified_intelligence_packet_v1"
+SCHEMA_VERSION = "unified_intelligence_packet_v2"
 TABLE_NAME = "memory_governance_intelligence_packet_runs"
 SHADOW_ENV = "BNL_UNIFIED_INTELLIGENCE_PACKET_SHADOW_ENABLED"
 _SHADOW_PREREQUISITES = (
@@ -107,6 +111,21 @@ _LANE_CAPS = {
     "source_file": 2,
     "relationship_posture": 1,
 }
+_BROAD_PROFILE_LANE_CAPS = {
+    **_LANE_CAPS,
+    "conversation_context": 2,
+    "atomic_knowledge": 4,
+    "moment": 2,
+    "open_loop": 1,
+    "canon": 2,
+    "source_file": 1,
+}
+_PROFILE_MEMBER_EVIDENCE_LANES = frozenset(
+    {"approved_fact", "atomic_knowledge", "moment"}
+)
+_ROOT_COLLAPSE_MEMBER_LANES = (
+    _PROFILE_MEMBER_EVIDENCE_LANES | {"conversation_context"}
+)
 _ASSESSMENT_LANE_MAP = {
     "current_intent": "current_exchange",
     "conversation_context": "conversation_context",
@@ -227,6 +246,9 @@ class IntelligencePacketItem:
     score: float = 0.0
     revalidation_kind: str = ""
     revalidation_key: str = ""
+    root_identities: tuple[str, ...] = ()
+    occurrence_identities: tuple[str, ...] = ()
+    point_identity: str = ""
 
 
 @dataclass(frozen=True)
@@ -248,6 +270,8 @@ class IntelligencePacketDiagnostics:
     visibility_exclusions: int = 0
     budget_exclusions: int = 0
     duplicate_suppression: int = 0
+    root_collapse_suppression: int = 0
+    shared_root_projection_count: int = 0
     processing_errors: list[str] = field(default_factory=list)
     invalid_invariants: list[str] = field(default_factory=list)
     revalidation_status: str = "not_evaluated"
@@ -267,6 +291,18 @@ class PacketRevalidationResult:
 
 
 @dataclass(frozen=True)
+class ProfileSufficiency:
+    status: str = "not_applicable"
+    satisfied: bool = False
+    required_point_count: int = 0
+    selected_point_count: int = 0
+    candidate_point_count: int = 0
+    independent_root_count: int = 0
+    independent_occurrence_count: int = 0
+    reason_codes: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
 class UnifiedIntelligencePacket:
     schema_version: str
     packet_id: str
@@ -274,6 +310,7 @@ class UnifiedIntelligencePacket:
     items: tuple[IntelligencePacketItem, ...]
     exclusions: tuple[IntelligencePacketExclusion, ...]
     diagnostics: IntelligencePacketDiagnostics
+    profile_sufficiency: ProfileSufficiency = ProfileSufficiency()
 
     @property
     def detailed_lanes(self) -> tuple[str, ...]:
@@ -429,6 +466,148 @@ def _terms(value: Any) -> set[str]:
     }
 
 
+def _point_identity(
+    *,
+    subject_key: str,
+    predicate_key: str,
+    text: str,
+) -> str:
+    normalized = re.sub(r"\W+", " ", str(text or "").lower()).strip()
+    if not normalized:
+        return ""
+    return _digest(
+        "profile_point",
+        str(subject_key or ""),
+        str(predicate_key or ""),
+        normalized,
+    )
+
+
+def _entry_root_metadata(
+    conn: sqlite3.Connection,
+    entry_id: str,
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    root = knowledge_root_identity(conn, str(entry_id or ""))
+    occurrence = knowledge_occurrence_identity(conn, str(entry_id or ""))
+    return (
+        ((root,) if root else ()),
+        ((occurrence,) if occurrence else ()),
+    )
+
+
+def _conversation_root_metadata(
+    conn: sqlite3.Connection,
+    *,
+    guild_id: int,
+    subject_key: str,
+    source_row_id: int,
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    root = knowledge_source_root_identity(
+        guild_id=int(guild_id or 0),
+        source_table="conversations",
+        source_row_id=int(source_row_id or 0),
+    )
+    entry_row = conn.execute(
+        """
+        SELECT entry_id
+        FROM memory_ledger_entries
+        WHERE guild_id=? AND subject_key=?
+          AND source_table='conversations' AND source_row_id=?
+          AND lifecycle_status='active'
+        ORDER BY
+          CASE
+            WHEN entry_type='observation'
+             AND predicate_key='conversation' THEN 0
+            ELSE 1
+          END,
+          entry_id
+        LIMIT 1
+        """,
+        (
+            int(guild_id or 0),
+            str(subject_key or ""),
+            str(int(source_row_id or 0)),
+        ),
+    ).fetchone()
+    occurrence = (
+        knowledge_occurrence_identity(conn, str(entry_row[0]))
+        if entry_row and str(entry_row[0] or "")
+        else ""
+    )
+    return (
+        ((root,) if root else ()),
+        ((occurrence,) if occurrence else ()),
+    )
+
+
+def _moment_root_metadata(
+    conn: sqlite3.Connection,
+    *,
+    moment_id: str,
+    subject_key: str,
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    try:
+        rows = conn.execute(
+            """
+            SELECT DISTINCT source.ledger_entry_id
+            FROM memory_moment_contribution_sources source
+            JOIN memory_ledger_entries entry
+              ON entry.entry_id=source.ledger_entry_id
+            WHERE source.moment_id=? AND source.participant_key=?
+              AND entry.subject_key=? AND entry.lifecycle_status='active'
+              AND entry.derived=0 AND entry.projection=0
+            ORDER BY source.ledger_entry_id
+            """,
+            (
+                str(moment_id or ""),
+                str(subject_key or ""),
+                str(subject_key or ""),
+            ),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        rows = ()
+    roots = []
+    occurrences = []
+    for (entry_id,) in rows:
+        root = knowledge_root_identity(conn, str(entry_id or ""))
+        occurrence = knowledge_occurrence_identity(
+            conn,
+            str(entry_id or ""),
+        )
+        if root:
+            roots.append(root)
+        if occurrence:
+            occurrences.append(occurrence)
+    return (
+        tuple(dict.fromkeys(roots)),
+        tuple(dict.fromkeys(occurrences)),
+    )
+
+
+def _profile_member_item(
+    request: IntelligencePacketRequest,
+    item: IntelligencePacketItem,
+) -> bool:
+    return bool(
+        item.lane in _PROFILE_MEMBER_EVIDENCE_LANES
+        and item.subject_key == subject_key_for_user(request.subject_user_id)
+        and item.point_identity
+        and item.root_identities
+        and item.occurrence_identities
+    )
+
+
+def _root_bearing_member_item(
+    request: IntelligencePacketRequest,
+    item: IntelligencePacketItem,
+) -> bool:
+    return bool(
+        item.lane in _ROOT_COLLAPSE_MEMBER_LANES
+        and item.subject_key == subject_key_for_user(request.subject_user_id)
+        and item.root_identities
+    )
+
+
 def _broad_profile_request(value: str) -> bool:
     return classify_personal_recall_intent(value).broad_self_profile
 
@@ -550,6 +729,31 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
         )
         """
     )
+    for column, definition in (
+        ("root_collapse_suppression_count", "INTEGER NOT NULL DEFAULT 0"),
+        ("shared_root_projection_count", "INTEGER NOT NULL DEFAULT 0"),
+        (
+            "profile_sufficiency_status",
+            "TEXT NOT NULL DEFAULT 'not_applicable'",
+        ),
+        ("profile_sufficiency_met", "INTEGER NOT NULL DEFAULT 0"),
+        ("profile_required_point_count", "INTEGER NOT NULL DEFAULT 0"),
+        ("profile_selected_point_count", "INTEGER NOT NULL DEFAULT 0"),
+        ("profile_candidate_point_count", "INTEGER NOT NULL DEFAULT 0"),
+        ("profile_independent_root_count", "INTEGER NOT NULL DEFAULT 0"),
+        (
+            "profile_independent_occurrence_count",
+            "INTEGER NOT NULL DEFAULT 0",
+        ),
+        ("profile_reason_codes_json", "TEXT NOT NULL DEFAULT '[]'"),
+    ):
+        try:
+            conn.execute(
+                "ALTER TABLE memory_governance_intelligence_packet_runs "
+                "ADD COLUMN %s %s" % (column, definition)
+            )
+        except sqlite3.OperationalError:
+            pass
     conn.execute(
         """
         CREATE INDEX IF NOT EXISTS idx_intelligence_packet_guild
@@ -665,15 +869,22 @@ def _conversation_items(
                 )
                 continue
             policy = str(row.get("channel_policy") or "unknown")
+            row_subject = subject_key_for_user(
+                int(row.get("user_id") or 0)
+            )
+            roots, occurrences = _conversation_root_metadata(
+                conn,
+                guild_id=int(row.get("guild_id") or 0),
+                subject_key=row_subject,
+                source_row_id=int(row.get("id") or 0),
+            )
             item = IntelligencePacketItem(
                 lane=lane,
                 source_class=SourceClass.PUBLIC_OBSERVATION.value,
                 source_type="conversation_row",
                 source_ref="conversation:%s" % int(row["id"]),
                 source_digest=_conversation_digest(row),
-                subject_key=subject_key_for_user(
-                    int(row.get("user_id") or 0)
-                ),
+                subject_key=row_subject,
                 predicate_key="current_intent" if evidence.current_turn else "conversation_context",
                 text=str(row.get("content") or "")[:1200],
                 visibility=_visibility_for_policy(policy),
@@ -688,6 +899,17 @@ def _conversation_items(
                 score=100.0 if evidence.current_turn else 88.0,
                 revalidation_kind="conversation",
                 revalidation_key=str(int(row["id"])),
+                root_identities=roots,
+                occurrence_identities=occurrences,
+                point_identity=_point_identity(
+                    subject_key=row_subject,
+                    predicate_key=(
+                        "current_intent"
+                        if evidence.current_turn
+                        else "conversation_context"
+                    ),
+                    text=str(row.get("content") or ""),
+                ),
             )
         else:
             speaker_id = int(evidence.speaker_user_id or request.subject_user_id or 0)
@@ -718,6 +940,11 @@ def _conversation_items(
                 score=100.0,
                 revalidation_kind="current",
                 revalidation_key=source_digest,
+                point_identity=_point_identity(
+                    subject_key=subject_key_for_user(speaker_id),
+                    predicate_key="current_intent",
+                    text=text,
+                ),
             )
         if not _route_allows_item(request, item):
             diagnostics.visibility_exclusions += 1
@@ -871,6 +1098,7 @@ def _governed_items(
             diagnostics.candidates_by_lane.get(lane, 0) + 1
         )
         if candidate.source_class == "moment_gist":
+            moment_id = candidate.source_ref.removeprefix("moment:")
             source_digest = _digest(
                 "moment",
                 candidate.source_ref,
@@ -880,11 +1108,20 @@ def _governed_items(
                 candidate.observed_at,
             )
             revalidation_kind = "moment"
-            revalidation_key = candidate.source_ref.removeprefix("moment:")
+            revalidation_key = moment_id
+            roots, occurrences = _moment_root_metadata(
+                conn,
+                moment_id=moment_id,
+                subject_key=candidate.subject_key,
+            )
         else:
             source_digest = _ledger_entry_digest(conn, candidate.entry_id)
             revalidation_kind = "ledger"
             revalidation_key = candidate.entry_id
+            roots, occurrences = _entry_root_metadata(
+                conn,
+                candidate.entry_id,
+            )
         item = IntelligencePacketItem(
             lane=lane,
             source_class=candidate.source_class,
@@ -912,6 +1149,13 @@ def _governed_items(
             }[lane],
             revalidation_kind=revalidation_kind,
             revalidation_key=revalidation_key,
+            root_identities=roots,
+            occurrence_identities=occurrences,
+            point_identity=_point_identity(
+                subject_key=candidate.subject_key,
+                predicate_key=candidate.predicate_key,
+                text=candidate.text,
+            ),
         )
         if not source_digest:
             _add_exclusion(
@@ -919,6 +1163,19 @@ def _governed_items(
                 exclusions,
                 lane=lane,
                 reason="governed_source_unversioned",
+                source_class=item.source_class,
+            )
+            continue
+        if (
+            broad
+            and lane in _PROFILE_MEMBER_EVIDENCE_LANES
+            and (not roots or not occurrences)
+        ):
+            _add_exclusion(
+                diagnostics,
+                exclusions,
+                lane=lane,
+                reason="member_evidence_missing_root_lineage",
                 source_class=item.source_class,
             )
             continue
@@ -1079,6 +1336,8 @@ def _atomic_root_valid(
         or str(root.get("lifecycle_status") or "") != "active"
         or bool(root.get("derived"))
         or bool(root.get("projection"))
+        or str(root.get("source_class") or "")
+        == SourceClass.LEGACY_SOURCE_BLIND.value
     ):
         return False
     if _public_route(request):
@@ -1098,6 +1357,32 @@ def _atomic_root_valid(
             }
         )
     return str(root.get("visibility") or "") in _INTERNAL_VISIBILITIES
+
+
+def _atomic_member_fact_authorized(
+    candidate: Mapping[str, Any],
+    authority_class: str,
+) -> bool:
+    """Keep atomic state from bypassing the member scalar-fact boundary."""
+
+    if (
+        str(candidate.get("candidate_type") or "") != "person_role_fact"
+        or not str(candidate.get("subject_key") or "").startswith(
+            "discord_user:"
+        )
+    ):
+        return True
+    source_class = str(authority_class or "")
+    if source_class in {
+        SourceClass.OWNER_CORRECTION.value,
+        SourceClass.APPROVED_CANON.value,
+    }:
+        return True
+    return bool(
+        source_class == SourceClass.FIRST_PARTY_RECORD.value
+        and str(candidate.get("predicate_key") or "").strip().lower()
+        in APPROVED_MEMBER_SCALAR_PREDICATES
+    )
 
 
 def _atomic_items(
@@ -1139,6 +1424,11 @@ def _atomic_items(
     for candidate_id in candidate_ids:
         candidate = _atomic_candidate_row(conn, candidate_id)
         candidate_type = str(candidate.get("candidate_type") or "")
+        authority_class = str(
+            candidate.get("consolidated_authority_class")
+            or candidate.get("authority_class")
+            or SourceClass.LEGACY_SOURCE_BLIND.value
+        )
         lane = (
             "open_loop"
             if candidate_type == "open_loop_or_question"
@@ -1187,6 +1477,11 @@ def _atomic_items(
             "contested",
         }:
             reason = "atomic_inference_or_contested"
+        elif not _atomic_member_fact_authorized(
+            candidate,
+            authority_class,
+        ):
+            reason = "atomic_member_fact_not_authorized"
         visibility = str(candidate.get("visibility") or "unknown")
         if not reason and _public_route(request) and visibility not in _PUBLIC_VISIBILITIES:
             reason = "atomic_visibility"
@@ -1277,11 +1572,6 @@ def _atomic_items(
             )
             continue
         state = str(candidate.get("candidate_state") or "")
-        authority_class = str(
-            candidate.get("consolidated_authority_class")
-            or candidate.get("authority_class")
-            or SourceClass.LEGACY_SOURCE_BLIND.value
-        )
         confidence = str(
             candidate.get("consolidated_confidence_class")
             or candidate.get("confidence_class")
@@ -1305,6 +1595,42 @@ def _atomic_items(
             base_score = 72.0
         else:
             base_score = 96.0 if state == "established" else 69.0
+        root_entry_ids = tuple(
+            str(root.get("root_entry_id") or "")
+            for root in roots
+            if str(root.get("root_entry_id") or "")
+        )
+        root_identities = tuple(
+            dict.fromkeys(
+                identity
+                for identity in (
+                    knowledge_root_identity(conn, entry_id)
+                    for entry_id in root_entry_ids
+                )
+                if identity
+            )
+        )
+        occurrence_identities = tuple(
+            dict.fromkeys(
+                identity
+                for identity in (
+                    knowledge_occurrence_identity(conn, entry_id)
+                    for entry_id in root_entry_ids
+                )
+                if identity
+            )
+        )
+        if broad and (
+            not root_identities or not occurrence_identities
+        ):
+            _add_exclusion(
+                diagnostics,
+                exclusions,
+                lane=lane,
+                reason="member_evidence_missing_root_lineage",
+                source_class=authority_class,
+            )
+            continue
         items.append(
             IntelligencePacketItem(
                 lane=lane,
@@ -1320,9 +1646,7 @@ def _atomic_items(
                 lifecycle=state,
                 authority=_AUTHORITY_RANK.get(authority_class, 0),
                 participants=participants,
-                lineage=tuple(
-                    str(root.get("root_entry_id") or "") for root in roots
-                ),
+                lineage=root_entry_ids,
                 observed_at=str(candidate.get("last_seen_at") or ""),
                 usage="tentative" if state == "provisional" else "content",
                 score=base_score
@@ -1337,6 +1661,15 @@ def _atomic_items(
                 ),
                 revalidation_kind="atomic",
                 revalidation_key=candidate_id,
+                root_identities=root_identities,
+                occurrence_identities=occurrence_identities,
+                point_identity=_point_identity(
+                    subject_key=subject,
+                    predicate_key=str(
+                        candidate.get("predicate_key") or ""
+                    ),
+                    text=text,
+                ),
             )
         )
     return items
@@ -1677,7 +2010,11 @@ def _select_items(
     candidates: list[IntelligencePacketItem],
     diagnostics: IntelligencePacketDiagnostics,
     exclusions: list[IntelligencePacketExclusion],
-) -> tuple[IntelligencePacketItem, ...]:
+) -> tuple[
+    tuple[IntelligencePacketItem, ...],
+    tuple[IntelligencePacketItem, ...],
+]:
+    broad = _broad_profile_request(request.user_text)
     if request.immediate_recap:
         kept = []
         for item in candidates:
@@ -1703,9 +2040,26 @@ def _select_items(
         diagnostics,
         exclusions,
     )
+    profile_candidates: list[IntelligencePacketItem] = []
+    broad_lane_priority = {
+        "current_intent": 0,
+        "approved_fact": 1,
+        "atomic_knowledge": 2,
+        "moment": 3,
+        "open_loop": 4,
+        "conversation_context": 5,
+        "canon": 6,
+        "source_file": 7,
+        "relationship_posture": 8,
+    }
     ordered = sorted(
         candidates,
         key=lambda item: (
+            (
+                broad_lane_priority.get(item.lane, 9)
+                if broad
+                else 0
+            ),
             -item.score,
             -item.authority,
             -_CONFIDENCE_RANK.get(item.confidence, 0),
@@ -1714,10 +2068,44 @@ def _select_items(
     )
     selected: list[IntelligencePacketItem] = []
     seen_text: set[str] = set()
+    seen_profile_roots: set[str] = set()
+    selected_root_items: list[IntelligencePacketItem] = []
     lane_counts: Counter[str] = Counter()
     used = 0
     budget = min(max(int(request.budget_chars or 2400), 400), 6000)
+    lane_caps = _BROAD_PROFILE_LANE_CAPS if broad else _LANE_CAPS
     for item in ordered:
+        item_roots = set(item.root_identities)
+        if broad and _root_bearing_member_item(request, item) and item_roots:
+            root_overlap = item_roots.intersection(seen_profile_roots)
+            same_root_projection = any(
+                (
+                    item_roots.issubset(set(prior.root_identities))
+                    or set(prior.root_identities).issubset(item_roots)
+                )
+                and (
+                    (
+                        item.point_identity
+                        and item.point_identity == prior.point_identity
+                    )
+                    or item.lane != prior.lane
+                )
+                for prior in selected_root_items
+            )
+            if same_root_projection:
+                diagnostics.root_collapse_suppression += 1
+                _add_exclusion(
+                    diagnostics,
+                    exclusions,
+                    lane=item.lane,
+                    reason="same_root_projection",
+                    source_class=item.source_class,
+                )
+                continue
+            if root_overlap:
+                diagnostics.shared_root_projection_count += 1
+        if _profile_member_item(request, item):
+            profile_candidates.append(item)
         normalized = re.sub(r"\W+", " ", item.text.lower()).strip()
         if normalized and normalized in seen_text:
             diagnostics.duplicate_suppression += 1
@@ -1729,7 +2117,7 @@ def _select_items(
                 source_class=item.source_class,
             )
             continue
-        if lane_counts[item.lane] >= _LANE_CAPS.get(item.lane, 2):
+        if lane_counts[item.lane] >= lane_caps.get(item.lane, 2):
             _add_exclusion(
                 diagnostics,
                 exclusions,
@@ -1738,8 +2126,12 @@ def _select_items(
                 source_class=item.source_class,
             )
             continue
-        item_cost = min(len(item.text), 500) + 36
-        if item.lane != "current_intent" and used + item_cost > budget:
+        item_cost = (
+            0
+            if item.lane == "current_intent"
+            else min(len(item.text), 500) + 36
+        )
+        if used + item_cost > budget:
             diagnostics.budget_exclusions += 1
             _add_exclusion(
                 diagnostics,
@@ -1750,6 +2142,9 @@ def _select_items(
             )
             continue
         selected.append(item)
+        if broad and _root_bearing_member_item(request, item):
+            seen_profile_roots.update(item_roots)
+            selected_root_items.append(item)
         if normalized:
             seen_text.add(normalized)
         lane_counts[item.lane] += 1
@@ -1768,7 +2163,7 @@ def _select_items(
         if int(count or 0) and not diagnostics.selected_by_lane.get(lane):
             diagnostics.missing_lanes.append(lane)
     if (
-        _broad_profile_request(request.user_text)
+        broad
         and not any(
             item.lane
             in {
@@ -1784,7 +2179,105 @@ def _select_items(
     diagnostics.missing_lanes = list(
         dict.fromkeys(diagnostics.missing_lanes)
     )
-    return tuple(selected)
+    return tuple(selected), tuple(profile_candidates)
+
+
+def _profile_sufficiency(
+    request: IntelligencePacketRequest,
+    *,
+    selected: Sequence[IntelligencePacketItem],
+    candidates: Sequence[IntelligencePacketItem],
+) -> ProfileSufficiency:
+    if not _broad_profile_request(request.user_text):
+        return ProfileSufficiency(
+            status="not_applicable",
+            satisfied=True,
+            reason_codes=("not_broad_profile",),
+        )
+    candidate_items = tuple(
+        item for item in candidates if _profile_member_item(request, item)
+    )
+    selected_items = tuple(
+        item for item in selected if _profile_member_item(request, item)
+    )
+    candidate_points = {
+        item.point_identity for item in candidate_items if item.point_identity
+    }
+    candidate_occurrences = {
+        identity
+        for item in candidate_items
+        for identity in item.occurrence_identities
+        if identity
+    }
+    selected_points = {
+        item.point_identity for item in selected_items if item.point_identity
+    }
+    selected_roots = {
+        identity
+        for item in selected_items
+        for identity in item.root_identities
+        if identity
+    }
+    selected_occurrences = {
+        identity
+        for item in selected_items
+        for identity in item.occurrence_identities
+        if identity
+    }
+    candidate_point_count = len(candidate_points)
+    required_points = (
+        2
+        if candidate_point_count >= 2
+        and len(candidate_occurrences) >= 2
+        else 1
+        if candidate_point_count >= 1
+        and len(candidate_occurrences) >= 1
+        else 0
+    )
+    reasons = []
+    if required_points == 0:
+        status = "empty"
+        satisfied = False
+        reasons.append("no_supported_member_evidence")
+    elif required_points == 1:
+        satisfied = bool(
+            len(selected_points) >= 1
+            and len(selected_roots) >= 1
+            and len(selected_occurrences) >= 1
+        )
+        status = "sparse" if satisfied else "insufficient"
+        reasons.append(
+            "sparse_supported_member_evidence"
+            if satisfied
+            else "sparse_member_evidence_not_selected"
+        )
+    else:
+        enough_points = len(selected_points) >= 2
+        enough_roots = len(selected_roots) >= 2
+        enough_occurrences = len(selected_occurrences) >= 2
+        satisfied = enough_points and enough_roots and enough_occurrences
+        status = "rich" if satisfied else "insufficient"
+        if satisfied:
+            reasons.append("rich_supported_member_evidence")
+        else:
+            if not enough_points:
+                reasons.append("member_point_requirement_not_met")
+            if not enough_roots:
+                reasons.append("independent_root_requirement_not_met")
+            if not enough_occurrences:
+                reasons.append(
+                    "independent_occurrence_requirement_not_met"
+                )
+    return ProfileSufficiency(
+        status=status,
+        satisfied=satisfied,
+        required_point_count=required_points,
+        selected_point_count=len(selected_points),
+        candidate_point_count=candidate_point_count,
+        independent_root_count=len(selected_roots),
+        independent_occurrence_count=len(selected_occurrences),
+        reason_codes=tuple(reasons),
+    )
 
 
 def _moment_version(
@@ -1905,6 +2398,7 @@ def _packet_invariants(
 ) -> tuple[str, ...]:
     invalid = []
     subject = subject_key_for_user(packet.request.subject_user_id)
+    broad = _broad_profile_request(packet.request.user_text)
     for item in packet.items:
         if not _route_allows_item(packet.request, item):
             invalid.append("selected_visibility_violation")
@@ -1928,6 +2422,33 @@ def _packet_invariants(
             "provisional",
         }:
             invalid.append("atomic_state_violation")
+        if (
+            item.revalidation_kind == "atomic"
+            and item.source_class == SourceClass.LEGACY_SOURCE_BLIND.value
+        ):
+            invalid.append("atomic_source_blind_violation")
+        if (
+            item.revalidation_kind == "atomic"
+            and not _atomic_member_fact_authorized(
+                {
+                    "candidate_type": item.source_type,
+                    "subject_key": item.subject_key,
+                    "predicate_key": item.predicate_key,
+                },
+                item.source_class,
+            )
+        ):
+            invalid.append("atomic_member_fact_authority_violation")
+        if (
+            broad
+            and item.lane in _PROFILE_MEMBER_EVIDENCE_LANES
+            and (
+                not item.root_identities
+                or not item.occurrence_identities
+                or not item.point_identity
+            )
+        ):
+            invalid.append("profile_item_root_lineage_violation")
     return tuple(dict.fromkeys(invalid))
 
 
@@ -1991,11 +2512,16 @@ def build_packet(
         )
     except (sqlite3.DatabaseError, TypeError, ValueError) as exc:
         diagnostics.processing_errors.append(type(exc).__name__)
-    selected = _select_items(
+    selected, profile_candidates = _select_items(
         request,
         candidates,
         diagnostics,
         exclusions,
+    )
+    profile_sufficiency = _profile_sufficiency(
+        request,
+        selected=selected,
+        candidates=profile_candidates,
     )
     digest_payload = tuple(
         (
@@ -2005,10 +2531,17 @@ def build_packet(
             item.source_digest,
             item.lifecycle,
             item.usage,
+            item.root_identities,
+            item.occurrence_identities,
+            item.point_identity,
         )
         for item in selected
     )
-    diagnostics.packet_digest = _digest(SCHEMA_VERSION, digest_payload)
+    diagnostics.packet_digest = _digest(
+        SCHEMA_VERSION,
+        digest_payload,
+        profile_sufficiency,
+    )
     packet_id = "uip_" + _digest(
         SCHEMA_VERSION,
         request.guild_id,
@@ -2024,6 +2557,7 @@ def build_packet(
         items=selected,
         exclusions=tuple(exclusions),
         diagnostics=diagnostics,
+        profile_sufficiency=profile_sufficiency,
     )
     invalid = _packet_invariants(packet)
     if invalid:
@@ -2075,10 +2609,18 @@ def persist_packet_run(
           atomic_state_counts_json,excluded_by_reason_json,
           missing_lanes_json,conflict_count,visibility_exclusion_count,
           budget_exclusion_count,duplicate_suppression_count,
+          root_collapse_suppression_count,shared_root_projection_count,
+          profile_sufficiency_status,profile_sufficiency_met,
+          profile_required_point_count,profile_selected_point_count,
+          profile_candidate_point_count,profile_independent_root_count,
+          profile_independent_occurrence_count,profile_reason_codes_json,
           processing_error_count,invalid_invariant_count,
           revalidation_status,revalidation_changed_count,packet_digest,
           source_ref_digest,prompt_applied,live_applied,created_at
-        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        ) VALUES(
+          ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,
+          ?,?,?,?,?,?,?
+        )
         """,
         (
             run_id,
@@ -2108,6 +2650,19 @@ def persist_packet_run(
             int(packet.diagnostics.visibility_exclusions or 0),
             int(packet.diagnostics.budget_exclusions or 0),
             int(packet.diagnostics.duplicate_suppression or 0),
+            int(packet.diagnostics.root_collapse_suppression or 0),
+            int(packet.diagnostics.shared_root_projection_count or 0),
+            packet.profile_sufficiency.status,
+            int(bool(packet.profile_sufficiency.satisfied)),
+            int(packet.profile_sufficiency.required_point_count or 0),
+            int(packet.profile_sufficiency.selected_point_count or 0),
+            int(packet.profile_sufficiency.candidate_point_count or 0),
+            int(packet.profile_sufficiency.independent_root_count or 0),
+            int(
+                packet.profile_sufficiency.independent_occurrence_count
+                or 0
+            ),
+            json.dumps(packet.profile_sufficiency.reason_codes),
             len(packet.diagnostics.processing_errors),
             len(packet.diagnostics.invalid_invariants),
             packet.diagnostics.revalidation_status,
@@ -2211,6 +2766,14 @@ def _empty_report() -> dict[str, Any]:
         "visibilityExclusions": 0,
         "budgetExclusions": 0,
         "duplicateSuppressions": 0,
+        "rootCollapseSuppressions": 0,
+        "sharedRootProjections": 0,
+        "profileSufficiencyStatusCounts": {},
+        "profileSufficiencyMetRuns": 0,
+        "profileSelectedPointTotal": 0,
+        "profileIndependentRootTotal": 0,
+        "profileIndependentOccurrenceTotal": 0,
+        "profileReasonCodeCounts": {},
         "processingErrors": 0,
         "invalidInvariants": 0,
         "revalidationStatusCounts": {},
@@ -2252,13 +2815,18 @@ def build_evaluation_report(
             "packet_content",
         }
     )
+    def column(name: str, fallback: str) -> str:
+        return name if name in columns else "%s AS %s" % (fallback, name)
+
     rows = conn.execute(
         """
         SELECT schema_version,item_count,selected_lane_counts_json,
                source_class_counts_json,atomic_state_counts_json,
                excluded_by_reason_json,missing_lanes_json,conflict_count,
                visibility_exclusion_count,budget_exclusion_count,
-               duplicate_suppression_count,processing_error_count,
+               duplicate_suppression_count,
+               %s,%s,%s,%s,%s,%s,%s,%s,%s,
+               processing_error_count,
                invalid_invariant_count,revalidation_status,
                revalidation_changed_count,prompt_applied,live_applied,
                created_at
@@ -2266,7 +2834,21 @@ def build_evaluation_report(
         WHERE guild_id=?
         ORDER BY created_at DESC,run_id DESC
         LIMIT ?
-        """,
+        """
+        % (
+            column("root_collapse_suppression_count", "0"),
+            column("shared_root_projection_count", "0"),
+            column(
+                "profile_sufficiency_status",
+                "'not_applicable'",
+            ),
+            column("profile_sufficiency_met", "0"),
+            column("profile_selected_point_count", "0"),
+            column("profile_independent_root_count", "0"),
+            column("profile_independent_occurrence_count", "0"),
+            column("profile_reason_codes_json", "'[]'"),
+            column("profile_candidate_point_count", "0"),
+        ),
         (int(guild_id or 0), max(1, min(int(limit or 1000), 5000))),
     ).fetchall()
     selected_lanes: Counter[str] = Counter()
@@ -2275,7 +2857,11 @@ def build_evaluation_report(
     exclusions: Counter[str] = Counter()
     missing: Counter[str] = Counter()
     revalidation: Counter[str] = Counter()
+    profile_statuses: Counter[str] = Counter()
+    profile_reasons: Counter[str] = Counter()
     item_total = conflicts = visibility = budget = duplicates = 0
+    root_collapses = shared_roots = profile_met = 0
+    profile_points = profile_roots = profile_occurrences = 0
     errors = invalid = changed = prompt = live = 0
     for row in rows:
         (
@@ -2290,6 +2876,15 @@ def build_evaluation_report(
             visibility_count,
             budget_count,
             duplicate_count,
+            root_collapse_count,
+            shared_root_count,
+            profile_status,
+            profile_satisfied,
+            profile_selected_points,
+            profile_independent_roots,
+            profile_independent_occurrences,
+            profile_reason_json,
+            _profile_candidate_points,
             error_count,
             invalid_count,
             revalidation_status,
@@ -2324,6 +2919,20 @@ def build_evaluation_report(
         visibility += int(visibility_count or 0)
         budget += int(budget_count or 0)
         duplicates += int(duplicate_count or 0)
+        root_collapses += int(root_collapse_count or 0)
+        shared_roots += int(shared_root_count or 0)
+        profile_statuses[str(profile_status or "not_applicable")] += 1
+        profile_met += int(bool(profile_satisfied))
+        profile_points += int(profile_selected_points or 0)
+        profile_roots += int(profile_independent_roots or 0)
+        profile_occurrences += int(profile_independent_occurrences or 0)
+        parsed_profile_reasons = _safe_json(profile_reason_json, [])
+        if isinstance(parsed_profile_reasons, list):
+            profile_reasons.update(
+                str(reason) for reason in parsed_profile_reasons
+            )
+        else:
+            errors += 1
         errors += int(error_count or 0)
         invalid += int(invalid_count or 0)
         changed += int(bool(changed_count))
@@ -2344,6 +2953,16 @@ def build_evaluation_report(
         "visibilityExclusions": visibility,
         "budgetExclusions": budget,
         "duplicateSuppressions": duplicates,
+        "rootCollapseSuppressions": root_collapses,
+        "sharedRootProjections": shared_roots,
+        "profileSufficiencyStatusCounts": dict(
+            sorted(profile_statuses.items())
+        ),
+        "profileSufficiencyMetRuns": profile_met,
+        "profileSelectedPointTotal": profile_points,
+        "profileIndependentRootTotal": profile_roots,
+        "profileIndependentOccurrenceTotal": profile_occurrences,
+        "profileReasonCodeCounts": dict(sorted(profile_reasons.items())),
         "processingErrors": errors,
         "invalidInvariants": invalid,
         "revalidationStatusCounts": dict(sorted(revalidation.items())),

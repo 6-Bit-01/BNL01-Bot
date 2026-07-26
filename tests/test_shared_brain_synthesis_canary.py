@@ -1,6 +1,7 @@
 import os
 import sqlite3
 import unittest
+from dataclasses import replace
 from unittest import mock
 
 from bnl_canon_source_contract import Confidence, SourceClass, Visibility
@@ -15,6 +16,7 @@ from bnl_shared_brain_synthesis import (
     begin_run,
     build_basis,
     build_evaluation_report,
+    build_packet_owned_prompt,
     configuration,
     ensure_schema,
     evaluate_candidate,
@@ -96,8 +98,8 @@ class SharedBrainSynthesisCanaryTests(unittest.TestCase):
                 entry_type="preference",
                 subject_key="discord_user:7",
                 subject_display_name="Crow",
-                predicate_key="favorite_instrument",
-                value="modular synths",
+                predicate_key="favorite_movie",
+                value="Arrival",
                 source_class=SourceClass.FIRST_PARTY_RECORD,
                 route_mode="normal_chat",
                 channel_id=10,
@@ -107,6 +109,7 @@ class SharedBrainSynthesisCanaryTests(unittest.TestCase):
                 confidence=Confidence.HIGH,
                 public_usable=True,
                 observed_at="2026-07-25T12:00:01+00:00",
+                source_sequence=901,
                 lifecycle_status="active",
                 participants=(
                     ledger.LedgerParticipant(
@@ -126,6 +129,53 @@ class SharedBrainSynthesisCanaryTests(unittest.TestCase):
     def tearDown(self):
         self.conn.close()
         self.env.stop()
+
+    def _add_profile_fact(
+        self,
+        *,
+        source_row_id,
+        predicate_key,
+        value,
+        observed_at,
+    ):
+        result = ledger.insert_ledger_entry(
+            self.conn,
+            ledger.LedgerEntry(
+                guild_id=1,
+                source_table="conversations",
+                source_row_id=source_row_id,
+                source_revision=(
+                    f"{source_row_id}:{predicate_key}"
+                ),
+                source_role="member_self_report",
+                entry_type="preference",
+                subject_key="discord_user:7",
+                subject_display_name="Crow",
+                predicate_key=predicate_key,
+                value=value,
+                source_class=SourceClass.FIRST_PARTY_RECORD,
+                route_mode="normal_chat",
+                channel_id=10,
+                channel_name="bnl-testing",
+                channel_policy="public_context",
+                visibility=Visibility.PUBLIC,
+                confidence=Confidence.HIGH,
+                public_usable=True,
+                observed_at=observed_at,
+                source_sequence=int(source_row_id),
+                lifecycle_status="active",
+                participants=(
+                    ledger.LedgerParticipant(
+                        "discord_user:7",
+                        "Crow",
+                        "author",
+                        0,
+                    ),
+                ),
+            ),
+        )
+        self.assertTrue(result.entry_id)
+        return result.entry_id
 
     def _request(self):
         text = "BNL-01, what am I all about?"
@@ -171,6 +221,7 @@ class SharedBrainSynthesisCanaryTests(unittest.TestCase):
         )
 
     def _build_assessment(self, packet):
+        profile = packet.profile_sufficiency
         return build_unified_response_assessment(
             guild_id=1,
             route_mode="normal_chat",
@@ -191,6 +242,15 @@ class SharedBrainSynthesisCanaryTests(unittest.TestCase):
             packet_revalidation_status=(
                 packet.diagnostics.revalidation_status
             ),
+            profile_sufficiency_status=profile.status,
+            profile_sufficiency_met=profile.satisfied,
+            profile_required_point_count=profile.required_point_count,
+            profile_selected_point_count=profile.selected_point_count,
+            profile_independent_root_count=profile.independent_root_count,
+            profile_independent_occurrence_count=(
+                profile.independent_occurrence_count
+            ),
+            profile_sufficiency_reasons=profile.reason_codes,
         )
 
     def _build_basis(self, packet, assessment):
@@ -300,6 +360,491 @@ class SharedBrainSynthesisCanaryTests(unittest.TestCase):
         self.assertNotIn("relationship_posture", dict(lane_counts))
         self.assertNotIn("approved canon", rendered)
 
+    def test_packet_owned_prompt_replaces_only_the_competing_factual_block(self):
+        legacy_context = (
+            "Relationship state: stage=familiar, stance=warm.\n"
+            "Observed habits: messages=100, last_topic=music.\n"
+            "Derived memory summaries: one legacy summary."
+        )
+        basis = build_basis(
+            guild_id=1,
+            user_id=7,
+            channel_id=10,
+            route_mode="normal_chat",
+            channel_policy="public_context",
+            current_direct=True,
+            user_text=self.packet.request.user_text,
+            packet=self.packet,
+            assessment=self.assessment,
+            competing_factual_contexts=(legacy_context,),
+            environ=self.flags,
+        )
+        self.assertIsNotNone(basis)
+        baseline_prompt = (
+            "Current user request: BNL-01, what am I all about?\n"
+            "BNL persona and BARCODE lore remain active.\n"
+            "Recent room context: modular synths.\n"
+            "Durable memory context:\n"
+            + legacy_context
+            + "\nPersonal-recall route contract remains active."
+        )
+        result = build_packet_owned_prompt(baseline_prompt, basis)
+        self.assertTrue(result.ready)
+        self.assertEqual(result.replaced_factual_context_count, 1)
+        self.assertNotIn("Relationship state:", result.prompt)
+        self.assertNotIn("Observed habits:", result.prompt)
+        self.assertNotIn("Derived memory summaries:", result.prompt)
+        self.assertIn("Current user request:", result.prompt)
+        self.assertIn("BNL persona and BARCODE lore", result.prompt)
+        self.assertIn("Recent room context:", result.prompt)
+        self.assertIn("Personal-recall route contract", result.prompt)
+        self.assertEqual(result.prompt.count(basis.rendered_context), 1)
+
+    def test_nonpacket_factual_owner_records_a_fail_closed_fallback(self):
+        for lane in (
+            "broadcast_memory",
+            "show_state",
+            "source_context",
+            "website_read_model",
+        ):
+            with self.subTest(lane=lane):
+                assessment = replace(
+                    self.assessment,
+                    selected_lanes=(
+                        *self.assessment.selected_lanes,
+                        lane,
+                    ),
+                )
+                basis = build_basis(
+                    guild_id=1,
+                    user_id=7,
+                    channel_id=10,
+                    route_mode="normal_chat",
+                    channel_policy="public_context",
+                    current_direct=True,
+                    user_text=self.packet.request.user_text,
+                    packet=self.packet,
+                    assessment=assessment,
+                    environ=self.flags,
+                )
+                self.assertIsNotNone(basis)
+                self.assertEqual(
+                    basis.blocking_factual_owner_lanes,
+                    (lane,),
+                )
+                owned = build_packet_owned_prompt(
+                    "Current user request: What am I all about?",
+                    basis,
+                )
+                self.assertFalse(owned.ready)
+                self.assertEqual(
+                    owned.reason,
+                    "nonpacket_factual_owner_selected",
+                )
+                run = begin_run(
+                    self.conn,
+                    basis,
+                    baseline_response="Established path response.",
+                    candidate_prompt_ready=owned.ready,
+                    candidate_prompt_failure_reason=owned.reason,
+                    environ=self.flags,
+                )
+                self.assertFalse(run.prompt_applied)
+                self.assertEqual(
+                    run.fallback_reason,
+                    (
+                        "candidate_prompt_"
+                        "nonpacket_factual_owner_selected"
+                    ),
+                )
+
+    def test_empty_or_canon_only_profile_cannot_enter_synthesis(self):
+        self.conn.execute(
+            """
+            UPDATE memory_ledger_entries
+            SET lifecycle_status='deleted'
+            WHERE entry_id=?
+            """,
+            (self.fact_entry_id,),
+        )
+        packet = self._build_packet()
+        self.assertEqual(packet.profile_sufficiency.status, "empty")
+        self.assertFalse(packet.profile_sufficiency.satisfied)
+        assessment = self._build_assessment(packet)
+        self.assertIsNone(
+            build_basis(
+                guild_id=1,
+                user_id=7,
+                channel_id=10,
+                route_mode="normal_chat",
+                channel_policy="public_context",
+                current_direct=True,
+                user_text=packet.request.user_text,
+                packet=packet,
+                assessment=assessment,
+                environ=self.flags,
+            )
+        )
+
+    def test_malformed_profile_status_count_pairs_cannot_enter_synthesis(self):
+        def basis_for(packet, assessment):
+            return build_basis(
+                guild_id=1,
+                user_id=7,
+                channel_id=10,
+                route_mode="normal_chat",
+                channel_policy="public_context",
+                current_direct=True,
+                user_text=packet.request.user_text,
+                packet=packet,
+                assessment=assessment,
+                environ=self.flags,
+            )
+
+        malformed_rich_profile = replace(
+            self.packet.profile_sufficiency,
+            status="rich",
+            satisfied=True,
+            required_point_count=1,
+            selected_point_count=2,
+            independent_root_count=2,
+            independent_occurrence_count=2,
+        )
+        malformed_rich_packet = replace(
+            self.packet,
+            profile_sufficiency=malformed_rich_profile,
+        )
+        malformed_rich_assessment = replace(
+            self.assessment,
+            profile_sufficiency_status="rich",
+            profile_sufficiency_met=True,
+            profile_required_point_count=1,
+            profile_selected_point_count=2,
+            profile_independent_root_count=2,
+            profile_independent_occurrence_count=2,
+        )
+        malformed_sparse_profile = replace(
+            self.packet.profile_sufficiency,
+            status="sparse",
+            satisfied=True,
+            required_point_count=2,
+            selected_point_count=2,
+            independent_root_count=2,
+            independent_occurrence_count=2,
+        )
+        malformed_sparse_packet = replace(
+            self.packet,
+            profile_sufficiency=malformed_sparse_profile,
+        )
+        malformed_sparse_assessment = replace(
+            self.assessment,
+            profile_sufficiency_status="sparse",
+            profile_sufficiency_met=True,
+            profile_required_point_count=2,
+            profile_selected_point_count=2,
+            profile_independent_root_count=2,
+            profile_independent_occurrence_count=2,
+        )
+
+        self.assertIsNone(
+            basis_for(
+                malformed_rich_packet,
+                malformed_rich_assessment,
+            )
+        )
+        self.assertIsNone(
+            basis_for(
+                malformed_sparse_packet,
+                malformed_sparse_assessment,
+            )
+        )
+
+    def test_rich_profile_requires_two_member_points_and_rejects_lore_first(self):
+        second = ledger.insert_ledger_entry(
+            self.conn,
+            ledger.LedgerEntry(
+                guild_id=1,
+                source_table="conversations",
+                source_row_id=902,
+                source_revision="902",
+                source_role="member_self_report",
+                entry_type="preference",
+                subject_key="discord_user:7",
+                subject_display_name="Crow",
+                predicate_key="favorite_color",
+                value="violet",
+                source_class=SourceClass.FIRST_PARTY_RECORD,
+                route_mode="normal_chat",
+                channel_id=10,
+                channel_name="bnl-testing",
+                channel_policy="public_context",
+                visibility=Visibility.PUBLIC,
+                confidence=Confidence.HIGH,
+                public_usable=True,
+                observed_at="2026-07-26T12:00:01+00:00",
+                source_sequence=902,
+                lifecycle_status="active",
+                participants=(
+                    ledger.LedgerParticipant(
+                        "discord_user:7",
+                        "Crow",
+                        "author",
+                        0,
+                    ),
+                ),
+            ),
+        )
+        self.assertTrue(second.entry_id)
+        packet = self._build_packet()
+        self.assertEqual(packet.profile_sufficiency.status, "rich")
+        assessment = self._build_assessment(packet)
+        basis = self._build_basis(packet, assessment)
+
+        one_point_run = begin_run(
+            self.conn,
+            basis,
+            baseline_response="You keep connecting music and project work.",
+            environ=self.flags,
+        )
+        one_point = evaluate_candidate(
+            self.conn,
+            one_point_run,
+            baseline_response="You keep connecting music and project work.",
+            candidate_response="Your favorite movie is Arrival.",
+            environ=self.flags,
+        )
+        self.assertFalse(one_point.candidate_selected)
+        self.assertEqual(
+            one_point.fallback_reason,
+            "candidate_member_points_insufficient",
+        )
+
+        lore_run = begin_run(
+            self.conn,
+            basis,
+            baseline_response="You keep connecting music and project work.",
+            environ=self.flags,
+        )
+        lore_first = evaluate_candidate(
+            self.conn,
+            lore_run,
+            baseline_response="You keep connecting music and project work.",
+            candidate_response=(
+                "The liaison entity is an unfinished active intelligence. "
+                "Your favorite movie is Arrival and your favorite color is "
+                "violet."
+            ),
+            environ=self.flags,
+        )
+        self.assertFalse(lore_first.candidate_selected)
+        self.assertTrue(lore_first.candidate_lore_dominant)
+        self.assertEqual(
+            lore_first.fallback_reason,
+            "candidate_canon_dominates_member_evidence",
+        )
+
+        grounded_run = begin_run(
+            self.conn,
+            basis,
+            baseline_response="You keep connecting music and project work.",
+            environ=self.flags,
+        )
+        grounded = evaluate_candidate(
+            self.conn,
+            grounded_run,
+            baseline_response="You keep connecting music and project work.",
+            candidate_response=(
+                "Your favorite movie is Arrival, and your favorite color is "
+                "violet."
+            ),
+            environ=self.flags,
+        )
+        self.assertTrue(grounded.candidate_selected)
+        self.assertEqual(
+            grounded.candidate_member_point_coverage_count,
+            2,
+        )
+        self.assertGreaterEqual(
+            grounded.candidate_member_root_coverage_count,
+            2,
+        )
+        self.assertGreaterEqual(
+            grounded.candidate_member_occurrence_coverage_count,
+            2,
+        )
+
+        lore_after_run = begin_run(
+            self.conn,
+            basis,
+            baseline_response="You keep connecting music and project work.",
+            environ=self.flags,
+        )
+        lore_after = evaluate_candidate(
+            self.conn,
+            lore_after_run,
+            baseline_response="You keep connecting music and project work.",
+            candidate_response=(
+                "Your favorite movie is Arrival and your favorite color is "
+                "violet. The chrome signal drifts beneath midnight towers. "
+                "A masked liaison tends the nocturnal broadcast. Static "
+                "gathers around the cathedral antenna."
+            ),
+            environ=self.flags,
+        )
+        self.assertFalse(lore_after.candidate_selected)
+        self.assertTrue(lore_after.candidate_lore_dominant)
+        self.assertEqual(
+            lore_after.fallback_reason,
+            "candidate_canon_dominates_member_evidence",
+        )
+
+        concise_support_run = begin_run(
+            self.conn,
+            basis,
+            baseline_response="You keep connecting music and project work.",
+            environ=self.flags,
+        )
+        concise_support = evaluate_candidate(
+            self.conn,
+            concise_support_run,
+            baseline_response="You keep connecting music and project work.",
+            candidate_response=(
+                "Your favorite movie is Arrival and your favorite color is "
+                "violet. Those preferences make a vivid pairing."
+            ),
+            environ=self.flags,
+        )
+        self.assertTrue(concise_support.candidate_selected)
+
+    def test_generic_overlap_cannot_claim_two_distinct_member_points(self):
+        self.conn.execute(
+            """
+            UPDATE memory_ledger_entries
+            SET lifecycle_status='deleted',
+                observed_at='2026-07-25T08:00:01+00:00'
+            WHERE entry_id=?
+            """,
+            (self.fact_entry_id,),
+        )
+        self._add_profile_fact(
+            source_row_id=902,
+            predicate_key="favorite_movie",
+            value="bot code systems",
+            observed_at="2026-07-25T09:00:02+00:00",
+        )
+        self._add_profile_fact(
+            source_row_id=903,
+            predicate_key="favorite_color",
+            value="website code systems",
+            observed_at="2026-07-25T10:00:03+00:00",
+        )
+        packet = self._build_packet()
+        self.assertEqual(packet.profile_sufficiency.status, "rich")
+        basis = self._build_basis(
+            packet,
+            self._build_assessment(packet),
+        )
+
+        generic_run = begin_run(
+            self.conn,
+            basis,
+            baseline_response="You keep building connected systems.",
+            environ=self.flags,
+        )
+        generic = evaluate_candidate(
+            self.conn,
+            generic_run,
+            baseline_response="You keep building connected systems.",
+            candidate_response="You keep returning to code systems.",
+            environ=self.flags,
+        )
+        self.assertFalse(generic.candidate_selected)
+        self.assertEqual(
+            generic.fallback_reason,
+            "candidate_member_points_insufficient",
+        )
+        self.assertLess(
+            generic.candidate_member_point_coverage_count,
+            2,
+        )
+
+        anchored_run = begin_run(
+            self.conn,
+            basis,
+            baseline_response="You keep building connected systems.",
+            environ=self.flags,
+        )
+        anchored = evaluate_candidate(
+            self.conn,
+            anchored_run,
+            baseline_response="You keep building connected systems.",
+            candidate_response=(
+                "You keep returning to bot code systems and website code "
+                "systems."
+            ),
+            environ=self.flags,
+        )
+        self.assertTrue(anchored.candidate_selected)
+        self.assertEqual(
+            anchored.candidate_member_point_coverage_count,
+            2,
+        )
+
+    def test_sparse_profile_rejects_candidate_that_claims_two_points(self):
+        self._add_profile_fact(
+            source_row_id=901,
+            predicate_key="favorite_color",
+            value="violet",
+            observed_at="2026-07-25T12:00:02+00:00",
+        )
+        packet = self._build_packet()
+        self.assertEqual(packet.profile_sufficiency.status, "sparse")
+        self.assertGreaterEqual(
+            packet.profile_sufficiency.selected_point_count,
+            2,
+        )
+        basis = self._build_basis(
+            packet,
+            self._build_assessment(packet),
+        )
+
+        broad_run = begin_run(
+            self.conn,
+            basis,
+            baseline_response="I can support one narrow point.",
+            environ=self.flags,
+        )
+        broad = evaluate_candidate(
+            self.conn,
+            broad_run,
+            baseline_response="I can support one narrow point.",
+            candidate_response=(
+                "Your favorite movie is Arrival and your favorite color is "
+                "violet."
+            ),
+            environ=self.flags,
+        )
+        self.assertFalse(broad.candidate_selected)
+        self.assertEqual(
+            broad.fallback_reason,
+            "candidate_sparse_scope_exceeded",
+        )
+
+        narrow_run = begin_run(
+            self.conn,
+            basis,
+            baseline_response="I can support one narrow point.",
+            environ=self.flags,
+        )
+        narrow = evaluate_candidate(
+            self.conn,
+            narrow_run,
+            baseline_response="I can support one narrow point.",
+            candidate_response="Your favorite movie is Arrival.",
+            environ=self.flags,
+        )
+        self.assertTrue(narrow.candidate_selected)
+
     def test_candidate_is_applied_only_after_revalidation_and_grounding(self):
         run = begin_run(
             self.conn,
@@ -317,8 +862,9 @@ class SharedBrainSynthesisCanaryTests(unittest.TestCase):
                 "You keep connecting music and project work."
             ),
             candidate_response=(
-                "You are about modular synths, music, and building "
-                "the archive project into something shared."
+                "Your favorite movie is Arrival. You are also about modular "
+                "synths, music, and building the archive project into "
+                "something shared."
             ),
             candidate_generation_latency_ms=125,
             environ=self.flags,
@@ -437,8 +983,9 @@ class SharedBrainSynthesisCanaryTests(unittest.TestCase):
             run,
             baseline_response="You are about music and project work.",
             candidate_response=(
-                "You are all about modular synths and the archive "
-                "project; both keep showing up in the way you build."
+                "Your favorite movie is Arrival. You are also all about "
+                "modular synths and the archive project; both keep showing "
+                "up in the way you build."
             ),
             environ=self.flags,
         )
@@ -503,6 +1050,94 @@ class SharedBrainSynthesisCanaryTests(unittest.TestCase):
             ),
             snapshot["blockers"],
         )
+
+    def test_acceptance_blocks_only_live_profile_or_prompt_violations(self):
+        rejected_run = begin_run(
+            self.conn,
+            self.basis,
+            baseline_response="You keep connecting music and project work.",
+            environ=self.flags,
+        )
+        rejected = evaluate_candidate(
+            self.conn,
+            rejected_run,
+            baseline_response="You keep connecting music and project work.",
+            candidate_response=(
+                "The liaison entity is an unfinished active intelligence. "
+                "Your favorite movie is Arrival."
+            ),
+            environ=self.flags,
+        )
+        self.assertFalse(rejected.candidate_selected)
+        rejected_snapshot = build_v2_shadow_acceptance_snapshot(
+            self.conn,
+            guild_id=1,
+            environ=self.flags,
+        )
+        self.assertNotIn(
+            "shared_brain_synthesis_canary:liveLoreDominantRuns",
+            rejected_snapshot["blockers"],
+        )
+
+        accepted_run = begin_run(
+            self.conn,
+            self.basis,
+            baseline_response="You keep connecting music and project work.",
+            environ=self.flags,
+        )
+        accepted = evaluate_candidate(
+            self.conn,
+            accepted_run,
+            baseline_response="You keep connecting music and project work.",
+            candidate_response="Your favorite movie is Arrival.",
+            environ=self.flags,
+        )
+        self.assertTrue(accepted.candidate_selected)
+        self.assertTrue(
+            finalize_run(
+                self.conn,
+                accepted,
+                final_response=accepted.response,
+                response_sent=True,
+                candidate_live=True,
+                guard_status="candidate_sent",
+            )
+        )
+        self.conn.execute(
+            """
+            UPDATE memory_governance_shared_brain_synthesis_runs
+            SET candidate_member_root_coverage_count=0,
+                candidate_lore_dominant=1,
+                competing_factual_context_count=1,
+                replaced_factual_context_count=0
+            WHERE run_id=?
+            """,
+            (accepted.run.run_id,),
+        )
+        report = build_evaluation_report(self.conn, guild_id=1)
+        self.assertEqual(
+            report["liveInsufficientMemberCoverageRuns"],
+            1,
+        )
+        self.assertEqual(report["liveLoreDominantRuns"], 1)
+        self.assertEqual(
+            report["livePromptOwnershipViolationRuns"],
+            1,
+        )
+        snapshot = build_v2_shadow_acceptance_snapshot(
+            self.conn,
+            guild_id=1,
+            environ=self.flags,
+        )
+        for key in (
+            "liveInsufficientMemberCoverageRuns",
+            "liveLoreDominantRuns",
+            "livePromptOwnershipViolationRuns",
+        ):
+            self.assertIn(
+                "shared_brain_synthesis_canary:%s" % key,
+                snapshot["blockers"],
+            )
 
     def test_receipt_schema_contains_no_member_or_response_content(self):
         ensure_schema(self.conn)
