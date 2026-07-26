@@ -35,6 +35,16 @@ Configure secrets in the process environment; do not commit them. Core variables
 - `GEMINI_API_KEY`
 - BNL website URLs, API keys, Relay controls, and feature flags used by the deployed runtime
 
+BNL keeps its own 1,350,000-token daily API safety budget, independent of the
+consumer Gemini app and Google project rate limits. `/usage` reports the
+provider-returned input, visible-output, thinking, cached, and total token
+counts by generation route. The counter resets at midnight Pacific Time.
+Gemini 2.5 Flash thinking is bounded to 1,024 tokens per request by default, and
+the complete response budget defaults to 4,096 tokens. Operators may lower
+those bounds with `BNL_GEMINI_THINKING_BUDGET` and
+`BNL_GEMINI_MAX_OUTPUT_TOKENS`; no environment change is required for the safe
+defaults.
+
 Native queue context has two independent production gates. The local bot variable `BNL_QUEUE_PRODUCTION_ENABLED` defaults off and accepts only `true` (case-insensitive); the website read model must also report `capabilities.queueProduction=true`. Queue/session/track context is stripped unless both gates agree. Merging queue-aware code does not enable either gate.
 
 Activation order is site first, bot second:
