@@ -303,6 +303,121 @@ def governed_summary(conn: sqlite3.Connection, *, guild_id: int, user_id: int, r
     return " ".join(safe)[:500]
 
 
+def shadow_packet_posture(
+    conn: sqlite3.Connection,
+    *,
+    guild_id: int,
+    user_id: int,
+    route_mode: str,
+    channel_policy: str,
+    direct: bool,
+    target_user_id: int | None = None,
+    environ: Mapping[str, str] | None = None,
+) -> dict[str, Any]:
+    """Return private, tone-only posture for the shadow intelligence packet.
+
+    This adapter deliberately does not use the Relationship live gate and does
+    not render into a prompt.  It lets the later packet evaluator compare the
+    posture Relationship v2 would contribute while keeping that posture private
+    and non-factual.
+    """
+
+    if (
+        not shadow_enabled(environ)
+        or not direct
+        or int(user_id or 0) <= 0
+        or (
+            target_user_id is not None
+            and int(target_user_id or 0) != int(user_id or 0)
+        )
+        or channel_policy not in PUBLIC_POLICIES
+        or route_mode not in RELATIONSHIP_LIVE_ROUTES
+    ):
+        return {}
+    ensure_relationship_v2_schema(conn)
+    settings = get_member_settings(
+        conn,
+        guild_id=int(guild_id or 0),
+        user_id=int(user_id or 0),
+    )
+    row = conn.execute(
+        """
+        SELECT rapport,familiarity,friction,repair,relationship_stage,
+               rivalry_state,engagement_opt_out,updated_at,schema_version
+        FROM relationship_state_v2
+        WHERE guild_id=? AND subject_user_id=?
+        """,
+        (int(guild_id or 0), int(user_id or 0)),
+    ).fetchone()
+    if not row:
+        return {}
+    (
+        rapport,
+        familiarity,
+        friction,
+        repair,
+        stage,
+        rivalry,
+        opt_out,
+        updated_at,
+        schema_version,
+    ) = row
+    warmth = (
+        "warm"
+        if float(rapport or 0) >= 0.15
+        else "neutral_warm"
+        if float(rapport or 0) > 0.03
+        else "neutral"
+    )
+    familiarity_mode = (
+        "familiar"
+        if float(familiarity or 0) >= 0.15
+        else "lightly_familiar"
+        if float(familiarity or 0) > 0.05
+        else "low_history"
+    )
+    boundary_mode = (
+        "repair_aware"
+        if float(friction or 0) > 0.05 or float(repair or 0) > 0.05
+        else "ordinary"
+    )
+    proactive_allowed = bool(
+        not opt_out and settings.get("proactive_enabled", True)
+    )
+    rivalry_allowed = bool(
+        rivalry == "mutual_rivalry"
+        and settings.get("playful_rivalry_enabled", True)
+        and proactive_allowed
+    )
+    posture_text = (
+        "tone=%s; familiarity=%s; boundary=%s; proactive=%s; rivalry=%s"
+        % (
+            warmth,
+            familiarity_mode,
+            boundary_mode,
+            "allowed" if proactive_allowed else "disabled",
+            "current_turn_only" if rivalry_allowed else "disabled",
+        )
+    )
+    digest = _hash(
+        SCHEMA_VERSION,
+        guild_id,
+        user_id,
+        posture_text,
+        updated_at,
+        schema_version,
+    )
+    return {
+        "source_ref": "relationship:%s" % int(user_id or 0),
+        "source_digest": digest,
+        "posture": posture_text,
+        "visibility": "private",
+        "usage": "tone_only",
+        "updated_at": str(updated_at or ""),
+        "relationship_stage": str(stage or "new"),
+    }
+
+
 def _open_loop_count(conn: sqlite3.Connection, *, guild_id: int, user_id: int, channel_policy: str = "unknown") -> int:
     sk = subject_key_for_user(user_id)
     try:

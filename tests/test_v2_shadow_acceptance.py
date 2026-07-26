@@ -49,6 +49,7 @@ class V2ShadowAcceptanceTests(unittest.TestCase):
                 "BNL_RELATIONSHIP_V2_LIVE_ENABLED": "",
                 "BNL_ACTIVE_ENGAGEMENT_V2_LIVE_ENABLED": "",
                 "BNL_UNIFIED_RESPONSE_ASSESSMENT_SHADOW_ENABLED": "",
+                "BNL_UNIFIED_INTELLIGENCE_PACKET_SHADOW_ENABLED": "",
             },
             clear=False,
         )
@@ -1188,6 +1189,7 @@ class V2ShadowAcceptanceTests(unittest.TestCase):
                 "BNL_MOMENT_ENGINE_SHADOW_ENABLED": "true",
                 "BNL_MEMORY_GOVERNANCE_SHADOW_ENABLED": "true",
                 "BNL_RELATIONSHIP_V2_SHADOW_ENABLED": "true",
+                "BNL_UNIFIED_INTELLIGENCE_PACKET_SHADOW_ENABLED": "false",
             },
             context={"same_room_paired_turn_count": 1},
         )

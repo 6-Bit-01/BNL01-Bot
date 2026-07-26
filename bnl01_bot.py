@@ -114,6 +114,13 @@ from bnl_shadow_acceptance import (
     build_v2_shadow_acceptance_snapshot,
     render_v2_shadow_acceptance_lines,
 )
+from bnl_unified_intelligence_packet import (
+    IntelligencePacketRequest,
+    PacketConversationEvidence,
+    UnifiedIntelligencePacket,
+    build_packet as build_unified_intelligence_packet,
+    shadow_enabled as unified_intelligence_packet_shadow_enabled,
+)
 from bnl_unified_response_assessment import (
     ConversationEvidenceItem,
     UnifiedResponseAssessment,
@@ -18689,6 +18696,114 @@ def _active_episode_id_for_unified_assessment(
         return ""
 
 
+def _build_unified_intelligence_packet_shadow(
+    *,
+    guild_id: int,
+    route_mode: str,
+    channel_policy: str,
+    conversation_surface: str,
+    channel_id: int,
+    current_text: str,
+    current_speaker_user_ids: tuple[int, ...],
+    target_user_ids: tuple[int, ...],
+    participant_user_ids: tuple[int, ...],
+    conversation_evidence_items: tuple[ConversationEvidenceItem, ...],
+    source_context_snapshot: str,
+    source_context_authorized: bool,
+    current_direct: bool,
+) -> UnifiedIntelligencePacket | None:
+    """Build and persist one packet receipt without exposing it to the prompt."""
+
+    if (
+        not unified_intelligence_packet_shadow_enabled()
+        or DB_FILE == ":memory:"
+        or not os.path.exists(DB_FILE)
+    ):
+        return None
+    current_speakers = tuple(
+        dict.fromkeys(
+            int(user_id or 0)
+            for user_id in current_speaker_user_ids
+            if int(user_id or 0) > 0
+        )
+    )
+    targets = tuple(
+        dict.fromkeys(
+            int(user_id or 0)
+            for user_id in target_user_ids
+            if int(user_id or 0) > 0
+        )
+    )
+    if len(targets) == 1:
+        subject_user_id = targets[0]
+    elif len(current_speakers) == 1:
+        subject_user_id = current_speakers[0]
+    else:
+        subject_user_id = 0
+    participants = tuple(
+        dict.fromkeys(
+            int(user_id or 0)
+            for user_id in (
+                *participant_user_ids,
+                *current_speakers,
+                *targets,
+            )
+            if int(user_id or 0) > 0
+        )
+    )
+    evidence = tuple(
+        PacketConversationEvidence(
+            text=item.text,
+            source_id=int(item.source_id or 0),
+            speaker_user_id=int(item.speaker_user_id or 0),
+            speaker_label=item.speaker_label,
+            current_turn=bool(item.current_turn),
+        )
+        for item in conversation_evidence_items
+        if isinstance(item, ConversationEvidenceItem)
+        and str(item.text or "").strip()
+    )
+    if channel_policy in PUBLIC_CHAT_POLICIES:
+        visibility_allowance = "public_safe"
+    elif channel_policy == "sealed_test":
+        visibility_allowance = "sealed_test"
+    else:
+        visibility_allowance = "internal"
+    request = IntelligencePacketRequest(
+        guild_id=int(guild_id or 0),
+        subject_user_id=int(subject_user_id or 0),
+        route_mode=str(route_mode or "unknown"),
+        conversation_surface=str(conversation_surface or "unknown"),
+        channel_id=int(channel_id or 0),
+        channel_policy=str(channel_policy or "unknown"),
+        visibility_allowance=visibility_allowance,
+        user_text=str(current_text or "")[:8000],
+        participant_user_ids=participants,
+        direct_state="direct" if current_direct else "indirect",
+        conversation_evidence=evidence,
+        source_context_snapshot=str(source_context_snapshot or "")[:12000],
+        source_context_authorized=bool(source_context_authorized),
+        immediate_recap=immediate_room_recap_requested(current_text),
+    )
+    try:
+        with sqlite3.connect(DB_FILE, timeout=0.25) as packet_conn:
+            packet = build_unified_intelligence_packet(
+                packet_conn,
+                request,
+                persist=True,
+            )
+            packet_conn.commit()
+        return packet
+    except (OSError, sqlite3.DatabaseError, TypeError, ValueError) as exc:
+        logging.warning(
+            "unified_intelligence_packet_shadow_failed "
+            "route_mode=%s error=%s",
+            route_mode,
+            type(exc).__name__,
+        )
+        return None
+
+
 def build_unified_response_assessment_shadow(
     *,
     guild_id: int,
@@ -18712,6 +18827,8 @@ def build_unified_response_assessment_shadow(
     show_state_present: bool = False,
     website_read_model_present: bool = False,
     source_context_present: bool = False,
+    source_context_snapshot: str = "",
+    current_direct: bool = True,
     broadcast_memory_present: bool = False,
 ) -> UnifiedResponseAssessment | None:
     """Build a shadow view from evidence already selected by existing owners."""
@@ -18836,7 +18953,102 @@ def build_unified_response_assessment_shadow(
         current_text,
         conversation_contexts,
     )
+    intelligence_packet = _build_unified_intelligence_packet_shadow(
+        guild_id=guild_id,
+        route_mode=route_mode,
+        channel_policy=channel_policy,
+        conversation_surface=conversation_surface,
+        channel_id=channel_id,
+        current_text=current_text,
+        current_speaker_user_ids=current_speaker_user_ids,
+        target_user_ids=target_user_ids,
+        participant_user_ids=participant_user_ids,
+        conversation_evidence_items=semantic_evidence_items,
+        source_context_snapshot=source_context_snapshot,
+        source_context_authorized=bool(source_context_present),
+        current_direct=current_direct,
+    )
+    packet_usable = bool(
+        intelligence_packet is not None
+        and not intelligence_packet.diagnostics.processing_errors
+        and not intelligence_packet.diagnostics.invalid_invariants
+        and intelligence_packet.diagnostics.revalidation_status.startswith(
+            "passed"
+        )
+    )
     canon_relevant = _canon_relevant_to_response(current_text)
+    if intelligence_packet is None:
+        assessment_moment_refs = (
+            ("rendered_moment_gist",) if has_moment_gist else ()
+        )
+        assessment_governed_refs = tuple(
+            memory_meta.get("governed_entry_ids") or ()
+        )
+        assessment_relationship_refs = (
+            ("relationship_v2_candidate",)
+            if memory_meta.get("relationship_v2_candidate_present")
+            else ()
+        )
+        assessment_canon_refs = (
+            ("canon:%s" % CANON_SOURCE_CONTRACT_VERSION,)
+            if canon_relevant
+            else ()
+        )
+        assessment_moment_candidate_count = int(
+            memory_meta.get("moment_candidate_count") or 0
+        )
+        assessment_governed_candidate_count = int(
+            memory_meta.get("governed_candidate_count") or 0
+        )
+        assessment_exclusion_count = int(
+            memory_meta.get("governance_exclusion_count") or 0
+        )
+        assessment_contradiction_count = int(
+            memory_meta.get("governance_contradiction_count") or 0
+        )
+    else:
+        assessment_moment_refs = (
+            intelligence_packet.moment_refs if packet_usable else ()
+        )
+        assessment_governed_refs = (
+            intelligence_packet.governed_refs if packet_usable else ()
+        )
+        assessment_relationship_refs = (
+            intelligence_packet.relationship_refs if packet_usable else ()
+        )
+        assessment_canon_refs = (
+            intelligence_packet.canon_refs if packet_usable else ()
+        )
+        assessment_moment_candidate_count = int(
+            intelligence_packet.diagnostics.candidates_by_lane.get(
+                "moment",
+                0,
+            )
+            or 0
+        )
+        assessment_governed_candidate_count = sum(
+            int(
+                intelligence_packet.diagnostics.candidates_by_lane.get(
+                    lane,
+                    0,
+                )
+                or 0
+            )
+            for lane in (
+                "approved_fact",
+                "atomic_knowledge",
+                "open_loop",
+            )
+        )
+        assessment_exclusion_count = sum(
+            int(value or 0)
+            for value in (
+                intelligence_packet.diagnostics.excluded_by_reason.values()
+            )
+        )
+        assessment_contradiction_count = len(
+            intelligence_packet.diagnostics.conflict_reasons
+        )
     return build_unified_response_assessment(
         guild_id=guild_id,
         route_mode=route_mode,
@@ -18848,20 +19060,10 @@ def build_unified_response_assessment_shadow(
         speaker_labels=speaker_labels,
         current_exchange_source_ids=current_exchange_source_ids,
         active_episode_id=active_episode_id,
-        prior_moment_ids=("rendered_moment_gist",) if has_moment_gist else (),
-        governed_entry_ids=tuple(
-            memory_meta.get("governed_entry_ids") or ()
-        ),
-        relationship_candidate_keys=(
-            ("relationship_v2_candidate",)
-            if memory_meta.get("relationship_v2_candidate_present")
-            else ()
-        ),
-        canon_refs=(
-            ("canon:%s" % CANON_SOURCE_CONTRACT_VERSION,)
-            if canon_relevant
-            else ()
-        ),
+        prior_moment_ids=assessment_moment_refs,
+        governed_entry_ids=assessment_governed_refs,
+        relationship_candidate_keys=assessment_relationship_refs,
+        canon_refs=assessment_canon_refs,
         prompt_lanes=prompt_lanes,
         continuity_required=continuity_required,
         immediate_recap=immediate_room_recap_requested(current_text),
@@ -18869,18 +19071,10 @@ def build_unified_response_assessment_shadow(
         exact_quote_authority_present=exact_quote_authority_present,
         source_bases=prompt_source_bases,
         prompt_budget=int(memory_meta.get("prompt_budget") or 0),
-        moment_candidate_count=int(
-            memory_meta.get("moment_candidate_count") or 0
-        ),
-        governed_candidate_count=int(
-            memory_meta.get("governed_candidate_count") or 0
-        ),
-        governance_exclusion_count=int(
-            memory_meta.get("governance_exclusion_count") or 0
-        ),
-        governance_contradiction_count=int(
-            memory_meta.get("governance_contradiction_count") or 0
-        ),
+        moment_candidate_count=assessment_moment_candidate_count,
+        governed_candidate_count=assessment_governed_candidate_count,
+        governance_exclusion_count=assessment_exclusion_count,
+        governance_contradiction_count=assessment_contradiction_count,
         legacy_memory_present=bool(
             memory_meta.get("legacy_memory_present")
         ),
@@ -18888,9 +19082,9 @@ def build_unified_response_assessment_shadow(
             memory_meta.get("legacy_relationship_present")
         ),
         relationship_v2_candidate_present=bool(
-            memory_meta.get("relationship_v2_candidate_present")
+            assessment_relationship_refs
         ),
-        canon_relevant=canon_relevant,
+        canon_relevant=bool(assessment_canon_refs),
         show_state_present=show_state_present,
         website_read_model_present=website_read_model_present,
         source_context_present=source_context_present,
@@ -18900,6 +19094,41 @@ def build_unified_response_assessment_shadow(
         thread_focus_mode=thread_focus_mode,
         current_text=current_text,
         conversation_evidence_items=semantic_evidence_items,
+        packet_selected_lanes=(
+            intelligence_packet.assessment_lanes if packet_usable else ()
+        ),
+        packet_excluded_lanes=(
+            intelligence_packet.assessment_exclusions
+            if intelligence_packet is not None
+            else ()
+        ),
+        packet_conflict_reasons=(
+            (
+                *intelligence_packet.diagnostics.conflict_reasons,
+                *(
+                    ("packet_processing_error",)
+                    if intelligence_packet.diagnostics.processing_errors
+                    else ()
+                ),
+                *(
+                    ("packet_invalid_invariant",)
+                    if intelligence_packet.diagnostics.invalid_invariants
+                    else ()
+                ),
+            )
+            if intelligence_packet is not None
+            else ()
+        ),
+        packet_missing_lanes=(
+            intelligence_packet.assessment_missing_lanes
+            if intelligence_packet is not None
+            else ()
+        ),
+        packet_revalidation_status=(
+            intelligence_packet.diagnostics.revalidation_status
+            if intelligence_packet is not None
+            else ""
+        ),
     )
 
 
@@ -25127,6 +25356,10 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                         batch_attribution_contract.exact_quote_authority
                         is not None
                     ),
+                    current_direct=bool(
+                        active_packet.get("addressed_to_bot")
+                        or is_broad_personal_recall_request(combined_text)
+                    ),
                 )
             )
             batch_unified_moment_canary_basis = (
@@ -26305,6 +26538,7 @@ def build_user_aware_prompt(
         show_state_present=bool(show_state_context),
         website_read_model_present=bool(website_read_model_context),
         source_context_present=bool(source_context_block),
+        source_context_snapshot=source_context_block,
         broadcast_memory_present=bool(broadcast_context),
     )
     unified_moment_canary_basis = (

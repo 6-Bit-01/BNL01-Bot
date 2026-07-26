@@ -119,6 +119,7 @@ class GovernanceRequest:
     budget_chars: int = 1200
     allowed_source_classes: Tuple[str, ...] = ()
     now: str = ""
+    broad_recall: bool = False
 
 @dataclass(frozen=True)
 class MemoryCandidate:
@@ -406,7 +407,7 @@ def build_governed_context(
     cands: List[MemoryCandidate] = []
     subject = subject_key_for_user(req.subject_user_id)
     request_terms = set(req.topic_terms) or _terms(req.user_text)
-    broad = _is_broad_recall(req.user_text)
+    broad = bool(req.broad_recall or _is_broad_recall(req.user_text))
     now_ts = _parse_time(req.now or _now())
     if req.route_mode == "simple_greeting" or (len(request_terms) <= 1 and re.fullmatch(r"\s*(hi|hello|hey|yo|sup|gm|good morning)[!. ]*\s*", req.user_text or "", re.I)):
         diag.fallback_reason = "simple_greeting_skip"
