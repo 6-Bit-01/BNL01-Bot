@@ -88,6 +88,25 @@ class UnifiedResponseAssessmentBotPathTests(unittest.TestCase):
     def test_direct_prompt_is_byte_identical_with_shadow_on_or_off(self):
         visual_basis = SimpleNamespace(status="not_requested")
         conversation_basis = self.conversation_basis(3)
+        packet_only_sentinel = "PACKET-ONLY-PRIVATE-SENTINEL"
+        packet = SimpleNamespace(
+            private_packet_text=packet_only_sentinel,
+            diagnostics=SimpleNamespace(
+                processing_errors=(),
+                invalid_invariants=(),
+                revalidation_status="passed",
+                candidates_by_lane={"atomic_knowledge": 1},
+                excluded_by_reason={},
+                conflict_reasons=(),
+            ),
+            moment_refs=(),
+            governed_refs=("atomic:opaque-packet-ref",),
+            relationship_refs=(),
+            canon_refs=(),
+            assessment_lanes=("governed_memory",),
+            assessment_exclusions=(),
+            assessment_missing_lanes=(),
+        )
 
         def memory_context(*_args, **kwargs):
             metadata = kwargs.get("source_metadata")
@@ -198,6 +217,10 @@ class UnifiedResponseAssessmentBotPathTests(unittest.TestCase):
             bnl01_bot,
             "_active_episode_id_for_unified_assessment",
             return_value="mep_opaque_shadow_reference",
+        ), mock.patch.object(
+            bnl01_bot,
+            "_build_unified_intelligence_packet_shadow",
+            return_value=packet,
         ):
             prompt_on, *_ = bnl01_bot.build_user_aware_prompt(
                 101,
@@ -214,6 +237,7 @@ class UnifiedResponseAssessmentBotPathTests(unittest.TestCase):
             )
 
         self.assertEqual(prompt_on, prompt_off)
+        self.assertNotIn(packet_only_sentinel, prompt_on)
         self.assertIsNone(
             metadata_off["unified_response_assessment_shadow"]
         )

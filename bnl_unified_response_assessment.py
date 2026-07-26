@@ -24,7 +24,7 @@ from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
 from bnl_conversation_context_v2 import assess_payload_grounding
 
 
-ASSESSMENT_VERSION = "unified_response_assessment_v5"
+ASSESSMENT_VERSION = "unified_response_assessment_v6"
 SHADOW_ENV = "BNL_UNIFIED_RESPONSE_ASSESSMENT_SHADOW_ENABLED"
 TABLE_NAME = "unified_response_assessment_shadow_runs"
 
@@ -866,6 +866,11 @@ def build_unified_response_assessment(
     conversation_evidence_items: Sequence[
         ConversationEvidenceItem
     ] = (),
+    packet_selected_lanes: Sequence[str] = (),
+    packet_excluded_lanes: Sequence[Tuple[str, str]] = (),
+    packet_conflict_reasons: Sequence[str] = (),
+    packet_missing_lanes: Sequence[str] = (),
+    packet_revalidation_status: str = "",
 ) -> UnifiedResponseAssessment:
     """Assemble one deterministic assessment without rendering it live."""
 
@@ -1020,6 +1025,33 @@ def build_unified_response_assessment(
         conflicts.append("current_exchange_precedence")
     if int(governance_contradiction_count or 0) > 0:
         conflicts.append("governance_contradiction_resolved")
+    packet_lanes = _known_lanes(packet_selected_lanes)
+    if packet_lanes:
+        for lane in packet_lanes:
+            if immediate_recap and lane in _LOWER_PRECEDENCE_LANES:
+                excluded.append((lane, "current_exchange_precedence"))
+            else:
+                selected.append(lane)
+        diagnostics.append("unified_intelligence_packet_shadow")
+    for lane, reason in packet_excluded_lanes or ():
+        normalized_lane = str(lane or "").strip()
+        normalized_reason = str(reason or "").strip()
+        if normalized_lane in _KNOWN_LANES and normalized_reason:
+            excluded.append((normalized_lane, normalized_reason))
+    conflicts.extend(
+        str(reason or "").strip()
+        for reason in packet_conflict_reasons or ()
+        if str(reason or "").strip()
+    )
+    for lane in packet_missing_lanes or ():
+        normalized_lane = str(lane or "").strip()
+        if normalized_lane:
+            diagnostics.append("packet_missing_lane:%s" % normalized_lane)
+    if packet_revalidation_status:
+        diagnostics.append(
+            "packet_revalidation:%s"
+            % str(packet_revalidation_status or "unknown").strip()[:80]
+        )
 
     selected_lanes = _unique_strings(selected)
     excluded_lanes = tuple(

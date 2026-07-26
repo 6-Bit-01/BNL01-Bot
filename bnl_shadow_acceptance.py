@@ -16,13 +16,17 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence
 from bnl_memory_ledger import build_memory_ledger_evaluation
 from bnl_moment_engine import build_moment_evaluation_report
 from bnl_relationship_engine import build_evaluation_report as build_relationship_evaluation_report
+from bnl_unified_intelligence_packet import (
+    build_evaluation_report as build_intelligence_packet_evaluation_report,
+    shadow_configuration as intelligence_packet_shadow_configuration,
+)
 from bnl_unified_response_assessment import (
     build_evaluation_report as build_unified_assessment_evaluation_report,
     shadow_configuration as unified_assessment_shadow_configuration,
 )
 
 
-SHADOW_ACCEPTANCE_VERSION = "v2_shadow_acceptance_v2"
+SHADOW_ACCEPTANCE_VERSION = "v2_shadow_acceptance_v3"
 SHADOW_EVALUATION_ORDER = (
     "memory_ledger",
     "moment_engine",
@@ -57,6 +61,7 @@ def build_gate_snapshot(environ: Optional[Mapping[str, str]] = None) -> Dict[str
     context_value = str(env.get("BNL_CONVERSATION_CONTEXT_V2_ENABLED", "true") or "true")
     context_enabled = context_value.strip().lower() not in {"false", "0", "off"}
     unified_assessment = unified_assessment_shadow_configuration(env)
+    intelligence_packet = intelligence_packet_shadow_configuration(env)
     return {
         "conversation_context_v2": context_enabled,
         "memory_ledger_shadow_requested": ledger,
@@ -76,6 +81,15 @@ def build_gate_snapshot(environ: Optional[Mapping[str, str]] = None) -> Dict[str
         ),
         "unified_response_assessment_shadow_reason": str(
             unified_assessment["reason"]
+        ),
+        "unified_intelligence_packet_shadow_requested": bool(
+            intelligence_packet["requested"]
+        ),
+        "unified_intelligence_packet_shadow_effective": bool(
+            intelligence_packet["effective"]
+        ),
+        "unified_intelligence_packet_shadow_reason": str(
+            intelligence_packet["reason"]
         ),
         "all_live_gates_clear": not (
             governance_live_requested or relationship_live or engagement_live
@@ -646,6 +660,45 @@ def _read_unified_assessment_report(
         )
 
 
+def _read_intelligence_packet_report(
+    conn: sqlite3.Connection,
+    guild_id: int,
+) -> Dict[str, Any]:
+    try:
+        return build_intelligence_packet_evaluation_report(
+            conn,
+            guild_id=guild_id,
+            prepare_schema=False,
+        )
+    except (sqlite3.DatabaseError, ValueError, TypeError) as exc:
+        return _report_error(
+            {
+                "tablePresent": False,
+                "schemaVersion": "unified_intelligence_packet_v1",
+                "runs": 0,
+                "itemTotal": 0,
+                "selectedByLane": {},
+                "selectedBySourceClass": {},
+                "selectedAtomicStates": {},
+                "excludedByReason": {},
+                "missingLaneCounts": {},
+                "conflictRuns": 0,
+                "visibilityExclusions": 0,
+                "budgetExclusions": 0,
+                "duplicateSuppressions": 0,
+                "processingErrors": 0,
+                "invalidInvariants": 0,
+                "revalidationStatusCounts": {},
+                "revalidationChangedRuns": 0,
+                "promptAppliedRuns": 0,
+                "liveAppliedRuns": 0,
+                "contentFieldsPresent": [],
+                "evidenceWindow": {"first": "none", "last": "none"},
+            },
+            exc,
+        )
+
+
 def _safe_context_report(diagnostics: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
     source = diagnostics or {}
     numeric = (
@@ -713,6 +766,7 @@ def build_v2_shadow_acceptance_snapshot(
     moments = _read_moment_report(conn, guild_id)
     governance = build_persisted_governance_report(conn, guild_id=guild_id)
     relationship = _read_relationship_report(conn, guild_id)
+    intelligence_packet = _read_intelligence_packet_report(conn, guild_id)
     unified_assessment = _read_unified_assessment_report(conn, guild_id)
     context = _safe_context_report(conversation_context_diagnostics)
 
@@ -852,6 +906,44 @@ def build_v2_shadow_acceptance_snapshot(
         blockers=relationship_blockers,
     )
 
+    intelligence_packet_blockers = []
+    for key in (
+        "processingErrors",
+        "invalidInvariants",
+        "revalidationChangedRuns",
+        "promptAppliedRuns",
+        "liveAppliedRuns",
+    ):
+        if int(intelligence_packet.get(key, 0) or 0):
+            intelligence_packet_blockers.append(key)
+    if intelligence_packet.get("contentFieldsPresent"):
+        intelligence_packet_blockers.append("contentFieldsPresent")
+    if intelligence_packet.get("reportError"):
+        intelligence_packet_blockers.append(
+            "report_error:%s" % intelligence_packet["reportError"]
+        )
+    intelligence_packet_evidence = (
+        int(intelligence_packet.get("runs", 0) or 0) > 0
+    )
+    intelligence_packet_prerequisites = [
+        name
+        for name, status in (
+            ("memory_ledger", ledger_status),
+            ("moment_engine", moment_status),
+            ("memory_governance", governance_status),
+            ("relationship_v2", relationship_status),
+        )
+        if not status.startswith("candidate_pass")
+    ]
+    intelligence_packet_status = _stage_status(
+        requested=gates[
+            "unified_intelligence_packet_shadow_requested"
+        ],
+        prerequisites=intelligence_packet_prerequisites,
+        evidence=intelligence_packet_evidence,
+        blockers=intelligence_packet_blockers,
+    )
+
     context_cross_channel = int(context.get("cross_channel_paired_turn_count", 0) or 0)
     if not gates["conversation_context_v2"]:
         context_status = "rollback_disabled"
@@ -939,6 +1031,10 @@ def build_v2_shadow_acceptance_snapshot(
         "unified_response_assessment:%s" % reason
         for reason in unified_assessment_blockers
     )
+    blockers.extend(
+        "unified_intelligence_packet:%s" % reason
+        for reason in intelligence_packet_blockers
+    )
 
     warnings = []
     if int(ledger.get("legacyToLedgerParityMismatches", 0) or 0):
@@ -979,6 +1075,15 @@ def build_v2_shadow_acceptance_snapshot(
         unified_assessment.get("response_coherence_review_runs", 0) or 0
     ):
         warnings.append("unified_assessment_response_coherence_review")
+    if int(intelligence_packet.get("conflictRuns", 0) or 0):
+        warnings.append("intelligence_packet_conflicts_safely_excluded")
+    if intelligence_packet.get("missingLaneCounts"):
+        warnings.append("intelligence_packet_missing_lanes_review")
+    if (
+        gates.get("unified_intelligence_packet_shadow_effective")
+        and not intelligence_packet_evidence
+    ):
+        warnings.append("intelligence_packet_no_packet_evidence")
 
     stage_statuses = [stage["status"] for stage in stages.values()]
     unified_assessment_ready = bool(
@@ -988,12 +1093,20 @@ def build_v2_shadow_acceptance_snapshot(
             and not unified_assessment_blockers
         )
     )
+    intelligence_packet_ready = bool(
+        not gates.get("unified_intelligence_packet_shadow_requested")
+        or (
+            intelligence_packet_evidence
+            and not intelligence_packet_blockers
+        )
+    )
     if live_gates:
         status = "blocked_live_authority_detected"
     elif blockers:
         status = "blocked_shadow_invariant_failure"
     elif (
         all(value.startswith("candidate_pass") for value in stage_statuses)
+        and intelligence_packet_ready
         and unified_assessment_ready
     ):
         status = "ready_for_owner_review_not_live_cutover"
@@ -1019,7 +1132,29 @@ def build_v2_shadow_acceptance_snapshot(
             "momentEngine": moments,
             "memoryGovernance": governance,
             "relationshipV2": relationship,
+            "unifiedIntelligencePacket": intelligence_packet,
             "unifiedResponseAssessment": unified_assessment,
+        },
+        "unifiedIntelligencePacketShadow": {
+            "status": intelligence_packet_status,
+            "requested": bool(
+                gates.get(
+                    "unified_intelligence_packet_shadow_requested"
+                )
+            ),
+            "effective": bool(
+                gates.get(
+                    "unified_intelligence_packet_shadow_effective"
+                )
+            ),
+            "reason": str(
+                gates.get(
+                    "unified_intelligence_packet_shadow_reason",
+                    "disabled",
+                )
+            ),
+            "evidenceObserved": intelligence_packet_evidence,
+            "blockers": intelligence_packet_blockers,
         },
         "unifiedResponseAssessmentShadow": {
             "requested": bool(
@@ -1050,6 +1185,7 @@ def build_v2_shadow_acceptance_snapshot(
             "restartRequiredAfterEnvironmentChange": True,
             "disableOrder": [
                 "BNL_UNIFIED_RESPONSE_ASSESSMENT_SHADOW_ENABLED",
+                "BNL_UNIFIED_INTELLIGENCE_PACKET_SHADOW_ENABLED",
                 "BNL_ACTIVE_ENGAGEMENT_V2_LIVE_ENABLED",
                 "BNL_RELATIONSHIP_V2_LIVE_ENABLED",
                 "BNL_MEMORY_GOVERNANCE_LIVE_ENABLED",
@@ -1081,7 +1217,11 @@ def render_v2_shadow_acceptance_lines(snapshot: Mapping[str, Any]) -> List[str]:
     moments = reports.get("momentEngine") or {}
     governance = reports.get("memoryGovernance") or {}
     relationship = reports.get("relationshipV2") or {}
+    intelligence_packet = reports.get("unifiedIntelligencePacket") or {}
     unified_assessment = reports.get("unifiedResponseAssessment") or {}
+    intelligence_packet_state = (
+        snapshot.get("unifiedIntelligencePacketShadow") or {}
+    )
     unified_state = snapshot.get("unifiedResponseAssessmentShadow") or {}
     blockers = snapshot.get("blockers") or []
     warnings = snapshot.get("warnings") or []
@@ -1306,6 +1446,58 @@ def render_v2_shadow_acceptance_lines(snapshot: Mapping[str, Any]) -> List[str]:
             relationship.get("moment_link_integrity_violations", 0),
         ),
         "- relationship_legacy_v2_comparison: `%s`" % relationship.get("legacy_v2_comparison", "not_collected"),
+        "- unified_intelligence_packet: status=`%s` requested=`%s` effective=`%s` reason=`%s` schema=`%s` runs=`%s` items=`%s` lanes=`%s` sources=`%s` atomic_states=`%s` missing=`%s` conflicts=`%s` revalidation=`%s` source_changes=`%s` errors=`%s` invalid_invariants=`%s` prompt_applied=`%s` live_applied=`%s` content_fields=`%s` window_last=`%s`" % (
+            intelligence_packet_state.get(
+                "status",
+                "unknown",
+            ),
+            _on(intelligence_packet_state.get("requested")),
+            _on(intelligence_packet_state.get("effective")),
+            intelligence_packet_state.get("reason", "disabled"),
+            intelligence_packet.get(
+                "schemaVersion",
+                "unified_intelligence_packet_v1",
+            ),
+            intelligence_packet.get("runs", 0),
+            intelligence_packet.get("itemTotal", 0),
+            json.dumps(
+                intelligence_packet.get("selectedByLane", {}),
+                sort_keys=True,
+            ),
+            json.dumps(
+                intelligence_packet.get("selectedBySourceClass", {}),
+                sort_keys=True,
+            ),
+            json.dumps(
+                intelligence_packet.get("selectedAtomicStates", {}),
+                sort_keys=True,
+            ),
+            json.dumps(
+                intelligence_packet.get("missingLaneCounts", {}),
+                sort_keys=True,
+            ),
+            intelligence_packet.get("conflictRuns", 0),
+            json.dumps(
+                intelligence_packet.get(
+                    "revalidationStatusCounts",
+                    {},
+                ),
+                sort_keys=True,
+            ),
+            intelligence_packet.get("revalidationChangedRuns", 0),
+            intelligence_packet.get("processingErrors", 0),
+            intelligence_packet.get("invalidInvariants", 0),
+            intelligence_packet.get("promptAppliedRuns", 0),
+            intelligence_packet.get("liveAppliedRuns", 0),
+            json.dumps(
+                intelligence_packet.get("contentFieldsPresent", []),
+                sort_keys=True,
+            ),
+            (intelligence_packet.get("evidenceWindow") or {}).get(
+                "last",
+                "none",
+            ),
+        ),
         "- unified_assessment: requested=`%s` effective=`%s` reason=`%s` runs=`%s` current_primary=`%s` comparison=`%s` alignments=`%s` thread_focus=`%s` grounding=`%s` grounding_applicable=`%s` grounding_failures=`%s` source_changes=`%s` guards=`%s/%s` visible_control_markers=`%s` errors=`%s` behavior_changes=`%s` new_authority=`%s` window_last=`%s`" % (
             _on(unified_state.get("requested")),
             _on(unified_state.get("effective")),
