@@ -691,7 +691,7 @@ def _read_intelligence_packet_report(
         return _report_error(
             {
                 "tablePresent": False,
-                "schemaVersion": "unified_intelligence_packet_v1",
+                "schemaVersion": "unified_intelligence_packet_v2",
                 "runs": 0,
                 "itemTotal": 0,
                 "selectedByLane": {},
@@ -730,7 +730,7 @@ def _read_shared_brain_synthesis_report(
         return _report_error(
             {
                 "tablePresent": False,
-                "schemaVersion": "shared_brain_synthesis_canary_v1",
+                "schemaVersion": "shared_brain_synthesis_canary_v2",
                 "runs": 0,
                 "promptAppliedRuns": 0,
                 "liveAppliedRuns": 0,
@@ -741,6 +741,13 @@ def _read_shared_brain_synthesis_report(
                 "baselineCoherenceStatusCounts": {},
                 "candidateCoherenceStatusCounts": {},
                 "candidateEvidenceCoverageTotal": 0,
+                "candidateMemberPointCoverageTotal": 0,
+                "candidateMemberRootCoverageTotal": 0,
+                "candidateMemberOccurrenceCoverageTotal": 0,
+                "candidateCanonCoverageTotal": 0,
+                "loreDominantRuns": 0,
+                "promptFactualOwnerRuns": 0,
+                "promptOwnershipFailureRuns": 0,
                 "routeFamilyCounts": {},
                 "candidateGenerationLatencyMs": {
                     "average": 0,
@@ -754,6 +761,9 @@ def _read_shared_brain_synthesis_report(
                 "invalidScopeRuns": 0,
                 "liveInvalidRevalidationRuns": 0,
                 "liveUngroundedRuns": 0,
+                "liveInsufficientMemberCoverageRuns": 0,
+                "liveLoreDominantRuns": 0,
+                "livePromptOwnershipViolationRuns": 0,
                 "relationshipPostureAppliedRuns": 0,
                 "contentFieldsPresent": [],
                 "evidenceWindow": {"first": "none", "last": "none"},
@@ -1081,6 +1091,9 @@ def build_v2_shadow_acceptance_snapshot(
         "invalidScopeRuns",
         "liveInvalidRevalidationRuns",
         "liveUngroundedRuns",
+        "liveInsufficientMemberCoverageRuns",
+        "liveLoreDominantRuns",
+        "livePromptOwnershipViolationRuns",
         "relationshipPostureAppliedRuns",
     ):
         if int(shared_brain_synthesis.get(key, 0) or 0):
@@ -1718,7 +1731,7 @@ def render_v2_shadow_acceptance_lines(snapshot: Mapping[str, Any]) -> List[str]:
             intelligence_packet_state.get("reason", "disabled"),
             intelligence_packet.get(
                 "schemaVersion",
-                "unified_intelligence_packet_v1",
+                "unified_intelligence_packet_v2",
             ),
             intelligence_packet.get("runs", 0),
             intelligence_packet.get("itemTotal", 0),
@@ -1760,7 +1773,7 @@ def render_v2_shadow_acceptance_lines(snapshot: Mapping[str, Any]) -> List[str]:
                 "none",
             ),
         ),
-        "- shared_brain_synthesis_canary: status=`%s` requested=`%s` effective=`%s` reason=`%s` fully_scoped=`%s` schema=`%s` runs=`%s` route_families=`%s` prompt_applied=`%s` candidate_selected=`%s` live_applied=`%s` responses_sent=`%s` fallbacks=`%s` fallback_reasons=`%s` comparison=`%s` baseline_coherence=`%s` candidate_coherence=`%s` evidence_coverage=`%s` candidate_latency_ms=`%s` revalidation=`%s` control_leaks=`%s` errors=`%s` invalid_scope=`%s` invalid_revalidation_live=`%s` ungrounded_live=`%s` relationship_posture_applied=`%s` content_fields=`%s` window_last=`%s`" % (
+        "- shared_brain_synthesis_canary: status=`%s` requested=`%s` effective=`%s` reason=`%s` fully_scoped=`%s` schema=`%s` runs=`%s` route_families=`%s` prompt_applied=`%s` candidate_selected=`%s` live_applied=`%s` responses_sent=`%s` fallbacks=`%s` fallback_reasons=`%s` comparison=`%s` baseline_coherence=`%s` candidate_coherence=`%s` evidence_coverage=`%s` member_points=`%s` member_roots=`%s` member_occurrences=`%s` canon_coverage=`%s` lore_dominant=`%s` prompt_factual_owner=`%s` prompt_owner_failures=`%s` candidate_latency_ms=`%s` revalidation=`%s` control_leaks=`%s` errors=`%s` invalid_scope=`%s` invalid_revalidation_live=`%s` ungrounded_live=`%s` insufficient_member_live=`%s` lore_dominant_live=`%s` prompt_owner_violation_live=`%s` relationship_posture_applied=`%s` content_fields=`%s` window_last=`%s`" % (
             shared_brain_synthesis_state.get("status", "unknown"),
             _on(shared_brain_synthesis_state.get("requested")),
             _on(shared_brain_synthesis_state.get("effective")),
@@ -1768,7 +1781,7 @@ def render_v2_shadow_acceptance_lines(snapshot: Mapping[str, Any]) -> List[str]:
             _on(shared_brain_synthesis_state.get("fullyScoped")),
             shared_brain_synthesis.get(
                 "schemaVersion",
-                "shared_brain_synthesis_canary_v1",
+                "shared_brain_synthesis_canary_v2",
             ),
             shared_brain_synthesis.get("runs", 0),
             json.dumps(
@@ -1809,6 +1822,28 @@ def render_v2_shadow_acceptance_lines(snapshot: Mapping[str, Any]) -> List[str]:
                 "candidateEvidenceCoverageTotal",
                 0,
             ),
+            shared_brain_synthesis.get(
+                "candidateMemberPointCoverageTotal",
+                0,
+            ),
+            shared_brain_synthesis.get(
+                "candidateMemberRootCoverageTotal",
+                0,
+            ),
+            shared_brain_synthesis.get(
+                "candidateMemberOccurrenceCoverageTotal",
+                0,
+            ),
+            shared_brain_synthesis.get(
+                "candidateCanonCoverageTotal",
+                0,
+            ),
+            shared_brain_synthesis.get("loreDominantRuns", 0),
+            shared_brain_synthesis.get("promptFactualOwnerRuns", 0),
+            shared_brain_synthesis.get(
+                "promptOwnershipFailureRuns",
+                0,
+            ),
             json.dumps(
                 shared_brain_synthesis.get(
                     "candidateGenerationLatencyMs",
@@ -1831,6 +1866,15 @@ def render_v2_shadow_acceptance_lines(snapshot: Mapping[str, Any]) -> List[str]:
                 0,
             ),
             shared_brain_synthesis.get("liveUngroundedRuns", 0),
+            shared_brain_synthesis.get(
+                "liveInsufficientMemberCoverageRuns",
+                0,
+            ),
+            shared_brain_synthesis.get("liveLoreDominantRuns", 0),
+            shared_brain_synthesis.get(
+                "livePromptOwnershipViolationRuns",
+                0,
+            ),
             shared_brain_synthesis.get(
                 "relationshipPostureAppliedRuns",
                 0,

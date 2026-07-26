@@ -12,6 +12,7 @@ from bnl_shadow_acceptance import (
     build_v2_shadow_acceptance_snapshot,
     render_v2_shadow_acceptance_lines,
 )
+from bnl_shared_brain_synthesis import render_packet_context
 from bnl_unified_intelligence_packet import (
     IntelligencePacketRequest,
     PacketConversationEvidence,
@@ -29,6 +30,7 @@ class UnifiedIntelligencePacketTests(unittest.TestCase):
     def setUp(self):
         self.flags = {
             "BNL_MEMORY_LEDGER_SHADOW_ENABLED": "true",
+            ledger.CONVERSATION_MOTIF_FORMATION_ENV: "true",
             "BNL_MOMENT_ENGINE_SHADOW_ENABLED": "true",
             "BNL_MEMORY_GOVERNANCE_SHADOW_ENABLED": "true",
             "BNL_RELATIONSHIP_V2_SHADOW_ENABLED": "true",
@@ -114,6 +116,7 @@ class UnifiedIntelligencePacketTests(unittest.TestCase):
                     datetime(2026, 7, 25, tzinfo=timezone.utc)
                     + timedelta(seconds=int(row_id))
                 ).isoformat(),
+                source_sequence=int(row_id),
                 lifecycle_status=lifecycle_status,
                 participants=tuple(participants),
             ),
@@ -135,29 +138,44 @@ class UnifiedIntelligencePacketTests(unittest.TestCase):
             self.add_entry(
                 row_id,
                 subject_key=subject_key,
+                entry_type="observation",
                 predicate_key=predicate_key,
                 value=value,
+                source_class=SourceClass.PUBLIC_OBSERVATION,
                 visibility=visibility,
                 public_usable=public_usable,
             )
             for row_id in (first_row, first_row + 1)
         )
-        results = tuple(
-            ledger.form_atomic_candidate_from_ledger_entry(
-                self.conn,
-                entry_id,
-            )
-            for entry_id in roots
+        result = ledger.form_atomic_knowledge_candidate(
+            self.conn,
+            ledger.AtomicKnowledgeProposal(
+                candidate_type="topic_or_motif",
+                subject_key=subject_key,
+                subject_display_name="Crow",
+                predicate_key=predicate_key,
+                meaning=value,
+                root_entry_ids=roots,
+                participant_keys=(subject_key,),
+                epistemic_status="observed",
+                uncertainty_note=(
+                    "Repeated observation; not a scalar identity fact."
+                ),
+                currentness="historical",
+                contradiction_key=f"{subject_key}:{predicate_key}",
+                retrieval_tags=("test_topic_motif",),
+            ),
         )
+        self.assertEqual(result.outcome, "created")
         canonical_id = self.conn.execute(
             """
             SELECT canonical_candidate_id
             FROM memory_ledger_knowledge_candidates
             WHERE candidate_id=?
             """,
-            (results[-1].candidate_id,),
+            (result.candidate_id,),
         ).fetchone()[0]
-        return roots, canonical_id or results[-1].candidate_id
+        return roots, canonical_id or result.candidate_id
 
     def add_public_moment(self):
         base = datetime(2026, 7, 25, 12, 0, tzinfo=timezone.utc)
@@ -238,6 +256,51 @@ class UnifiedIntelligencePacketTests(unittest.TestCase):
                 "2026-07-25T12:06:00+00:00",
             ),
         )
+
+    def add_raw_public_conversation(
+        self,
+        row_id,
+        text,
+        observed_at,
+        *,
+        user_id=7,
+        user_name="Crow",
+    ):
+        self.conn.execute(
+            """
+            INSERT INTO conversations(
+                id,guild_id,user_id,user_name,role,content,channel_id,
+                channel_policy,timestamp
+            ) VALUES(?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                int(row_id),
+                1,
+                int(user_id),
+                user_name,
+                "user",
+                text,
+                10,
+                "public_home",
+                observed_at,
+            ),
+        )
+        result = ledger.shadow_conversation_row(
+            self.conn,
+            row_id=int(row_id),
+            user_id=int(user_id),
+            user_name=user_name,
+            guild_id=1,
+            role="user",
+            content=text,
+            channel_policy="public_home",
+            channel_id=10,
+            channel_name="barcode-bot",
+            route_mode="normal_chat",
+            observed_at=observed_at,
+        )
+        self.assertEqual(result.outcome, "inserted")
+        return result.entry_id
 
     def public_request(
         self,
@@ -405,6 +468,397 @@ class UnifiedIntelligencePacketTests(unittest.TestCase):
         self.assertIn("live_applied=`0`", rendered)
         self.assertNotIn("modular synths", rendered)
 
+    def test_profile_sufficiency_uses_distinct_points_and_occurrences(self):
+        rows = (
+            (
+                910,
+                "I keep fixing bot code and memory systems.",
+                "2026-07-23T10:00:00+00:00",
+            ),
+            (
+                911,
+                "I keep developing visual art and character designs.",
+                "2026-07-23T10:05:00+00:00",
+            ),
+            (
+                912,
+                "The website code still needs careful testing.",
+                "2026-07-25T10:00:00+00:00",
+            ),
+            (
+                913,
+                "The character artwork needs another visual style.",
+                "2026-07-25T10:05:00+00:00",
+            ),
+        )
+        for row in rows:
+            self.add_raw_public_conversation(*row)
+        formed = ledger.form_atomic_candidates_from_recurring_conversation(
+            self.conn,
+            trigger_entry_id=self.conn.execute(
+                """
+                SELECT entry_id FROM memory_ledger_entries
+                WHERE source_table='conversations' AND source_row_id='913'
+                  AND entry_type='observation'
+                """
+            ).fetchone()[0],
+            environ=self.flags,
+        )
+        self.assertGreaterEqual(len(formed), 2)
+        request = self.public_request()
+        request = IntelligencePacketRequest(
+            **{
+                **request.__dict__,
+                "conversation_evidence": (
+                    PacketConversationEvidence(
+                        text=rows[2][1],
+                        source_id=912,
+                        speaker_user_id=7,
+                        speaker_label="Crow",
+                    ),
+                    request.conversation_evidence[-1],
+                ),
+            }
+        )
+
+        packet = build_packet(
+            self.conn,
+            request,
+            persist=False,
+            environ=self.flags,
+        )
+
+        self.assertEqual(packet.profile_sufficiency.status, "rich")
+        self.assertTrue(packet.profile_sufficiency.satisfied)
+        self.assertEqual(
+            packet.profile_sufficiency.required_point_count,
+            2,
+        )
+        self.assertGreaterEqual(
+            packet.profile_sufficiency.selected_point_count,
+            2,
+        )
+        self.assertGreaterEqual(
+            packet.profile_sufficiency.independent_root_count,
+            2,
+        )
+        self.assertEqual(
+            packet.profile_sufficiency.independent_occurrence_count,
+            2,
+        )
+        self.assertEqual(
+            {
+                item.lane
+                for item in packet.items
+                if item.point_identity
+                and item.lane == "atomic_knowledge"
+            },
+            {"atomic_knowledge"},
+        )
+        self.assertGreaterEqual(
+            packet.diagnostics.root_collapse_suppression,
+            1,
+        )
+        self.assertGreaterEqual(
+            packet.diagnostics.excluded_by_reason.get(
+                "same_root_projection",
+                0,
+            ),
+            1,
+        )
+
+    def test_distinct_atomic_points_can_share_exact_human_roots(self):
+        rows = (
+            (
+                920,
+                (
+                    "I keep fixing bot code while drawing visual art "
+                    "for the project."
+                ),
+                "2026-07-23T10:00:00+00:00",
+            ),
+            (
+                921,
+                (
+                    "The website system and artwork design both need "
+                    "another pass."
+                ),
+                "2026-07-25T10:00:00+00:00",
+            ),
+        )
+        entry_ids = tuple(
+            self.add_raw_public_conversation(*row) for row in rows
+        )
+        formed = ledger.form_atomic_candidates_from_recurring_conversation(
+            self.conn,
+            trigger_entry_id=entry_ids[-1],
+            environ=self.flags,
+        )
+        self.assertEqual(len(formed), 2)
+
+        packet = build_packet(
+            self.conn,
+            self.public_request(),
+            persist=False,
+            environ=self.flags,
+        )
+        atomic_items = tuple(
+            item for item in packet.items if item.lane == "atomic_knowledge"
+        )
+
+        self.assertEqual(len(atomic_items), 2)
+        self.assertEqual(
+            len({item.point_identity for item in atomic_items}),
+            2,
+        )
+        self.assertEqual(
+            len({item.root_identities for item in atomic_items}),
+            1,
+        )
+        self.assertEqual(
+            len({item.occurrence_identities for item in atomic_items}),
+            1,
+        )
+        self.assertEqual(packet.profile_sufficiency.status, "rich")
+        self.assertTrue(packet.profile_sufficiency.satisfied)
+        self.assertEqual(
+            packet.profile_sufficiency.selected_point_count,
+            2,
+        )
+        self.assertEqual(
+            packet.profile_sufficiency.independent_root_count,
+            2,
+        )
+        self.assertEqual(
+            packet.profile_sufficiency.independent_occurrence_count,
+            2,
+        )
+        self.assertGreaterEqual(
+            packet.diagnostics.shared_root_projection_count,
+            1,
+        )
+
+    def test_moment_and_atomic_projection_share_one_human_root_set(self):
+        moment_id = self.add_public_moment()
+        roots = tuple(
+            str(row[0])
+            for row in self.conn.execute(
+                """
+                SELECT ledger_entry_id
+                FROM memory_moment_contribution_sources
+                WHERE moment_id=? AND participant_key='discord_user:7'
+                ORDER BY ledger_entry_id
+                """,
+                (moment_id,),
+            ).fetchall()
+        )
+        self.assertEqual(len(roots), 2)
+        formed = ledger.form_atomic_knowledge_candidate(
+            self.conn,
+            ledger.AtomicKnowledgeProposal(
+                candidate_type="topic_or_motif",
+                subject_key="discord_user:7",
+                subject_display_name="Crow",
+                predicate_key="modular_synthesis_motif",
+                meaning=(
+                    "Recurring public conversation about modular synthesis."
+                ),
+                root_entry_ids=roots,
+                participant_keys=("discord_user:7",),
+                epistemic_status="observed",
+                uncertainty_note=(
+                    "Moment-derived observation; not an exact quote."
+                ),
+                currentness="historical",
+                contradiction_key=(
+                    "discord_user:7:modular_synthesis_motif"
+                ),
+                retrieval_tags=("music_production",),
+            ),
+        )
+        self.assertEqual(formed.outcome, "created")
+
+        packet = build_packet(
+            self.conn,
+            self.public_request(),
+            persist=False,
+            environ=self.flags,
+        )
+        selected_lanes = {
+            item.lane for item in packet.items if item.root_identities
+        }
+
+        self.assertIn("atomic_knowledge", selected_lanes)
+        self.assertNotIn("moment", selected_lanes)
+        self.assertGreaterEqual(
+            packet.diagnostics.root_collapse_suppression,
+            1,
+        )
+        self.assertGreaterEqual(
+            packet.diagnostics.excluded_by_reason.get(
+                "same_root_projection",
+                0,
+            ),
+            1,
+        )
+        self.assertEqual(packet.profile_sufficiency.status, "sparse")
+        self.assertTrue(packet.profile_sufficiency.satisfied)
+        self.assertEqual(
+            packet.profile_sufficiency.candidate_point_count,
+            1,
+        )
+
+    def test_moment_superset_projection_does_not_inflate_profile(self):
+        moment_id = self.add_public_moment()
+        roots = tuple(
+            str(row[0])
+            for row in self.conn.execute(
+                """
+                SELECT ledger_entry_id
+                FROM memory_moment_contribution_sources
+                WHERE moment_id=? AND participant_key='discord_user:7'
+                ORDER BY ledger_entry_id
+                """,
+                (moment_id,),
+            ).fetchall()
+        )
+        self.assertEqual(len(roots), 2)
+        formed = ledger.form_atomic_knowledge_candidate(
+            self.conn,
+            ledger.AtomicKnowledgeProposal(
+                candidate_type="topic_or_motif",
+                subject_key="discord_user:7",
+                subject_display_name="Crow",
+                predicate_key="synth_chorus_motif",
+                meaning="Recurring public conversation about synth choruses.",
+                root_entry_ids=(roots[0],),
+                participant_keys=("discord_user:7",),
+                epistemic_status="observed",
+                uncertainty_note=(
+                    "One observed contribution; not an exact quote."
+                ),
+                currentness="historical",
+                contradiction_key="discord_user:7:synth_chorus_motif",
+                retrieval_tags=("music_production",),
+            ),
+        )
+        self.assertEqual(formed.outcome, "created")
+
+        packet = build_packet(
+            self.conn,
+            self.public_request(),
+            persist=False,
+            environ=self.flags,
+        )
+        member_items = tuple(
+            item
+            for item in packet.items
+            if item.lane in {"atomic_knowledge", "moment"}
+        )
+
+        self.assertEqual(
+            tuple(item.lane for item in member_items),
+            ("atomic_knowledge",),
+        )
+        self.assertEqual(packet.profile_sufficiency.status, "sparse")
+        self.assertEqual(
+            packet.profile_sufficiency.candidate_point_count,
+            1,
+        )
+        self.assertGreaterEqual(
+            packet.diagnostics.excluded_by_reason.get(
+                "same_root_projection",
+                0,
+            ),
+            1,
+        )
+
+    def test_current_intent_does_not_consume_rendered_evidence_budget(self):
+        self.add_entry(
+            930,
+            predicate_key="favorite_movie",
+            value="Arrival",
+        )
+        self.add_entry(
+            5000,
+            predicate_key="favorite_color",
+            value="violet",
+        )
+        current_fragments = tuple(
+            PacketConversationEvidence(
+                text=(
+                    f"current-fragment-{index} "
+                    + ("temporary request wording " * 50)
+                ),
+                speaker_user_id=7,
+                speaker_label="Crow",
+                current_turn=True,
+            )
+            for index in range(5)
+        )
+        base = self.public_request()
+        request = IntelligencePacketRequest(
+            **{
+                **base.__dict__,
+                "budget_chars": 400,
+                "conversation_evidence": current_fragments,
+            }
+        )
+
+        packet = build_packet(
+            self.conn,
+            request,
+            persist=False,
+            environ=self.flags,
+        )
+        rendered, _lane_counts, _item_count, _digests = (
+            render_packet_context(packet)
+        )
+
+        self.assertEqual(
+            len(
+                tuple(
+                    item
+                    for item in packet.items
+                    if item.lane == "current_intent"
+                )
+            ),
+            5,
+        )
+        self.assertEqual(packet.profile_sufficiency.status, "rich")
+        self.assertGreaterEqual(
+            len(
+                tuple(
+                    item
+                    for item in packet.items
+                    if item.lane == "approved_fact"
+                )
+            ),
+            2,
+        )
+        self.assertNotIn("current-fragment-", rendered)
+        self.assertLessEqual(len(rendered), 5000)
+
+    def test_canon_cannot_satisfy_an_empty_personal_profile(self):
+        packet = build_packet(
+            self.conn,
+            self.public_request(),
+            persist=False,
+            environ=self.flags,
+        )
+
+        self.assertIn("canon", packet.detailed_lanes)
+        self.assertEqual(packet.profile_sufficiency.status, "empty")
+        self.assertFalse(packet.profile_sufficiency.satisfied)
+        self.assertEqual(
+            packet.profile_sufficiency.selected_point_count,
+            0,
+        )
+        self.assertEqual(
+            packet.profile_sufficiency.independent_occurrence_count,
+            0,
+        )
+
     def test_private_cross_subject_contested_and_live_rows_fail_closed(self):
         self.add_conversation_context_row()
         _roots, selected_candidate = self.add_established_atomic()
@@ -492,6 +946,99 @@ class UnifiedIntelligencePacketTests(unittest.TestCase):
             1,
         )
 
+    def test_atomic_member_fact_cannot_bypass_scalar_allowlist(self):
+        self.add_conversation_context_row()
+        roots = tuple(
+            self.add_entry(
+                row_id,
+                predicate_key="favorite_instrument",
+                value="modular synths",
+            )
+            for row_id in (55, 56)
+        )
+        for root in roots:
+            ledger.form_atomic_candidate_from_ledger_entry(self.conn, root)
+
+        packet = build_packet(
+            self.conn,
+            self.public_request(text="What do you remember about me?"),
+            persist=False,
+            environ=self.flags,
+        )
+
+        self.assertNotIn(
+            "modular synths",
+            {item.text for item in packet.items},
+        )
+        self.assertGreaterEqual(
+            packet.diagnostics.excluded_by_reason.get(
+                "atomic_member_fact_not_authorized",
+                0,
+            ),
+            1,
+        )
+
+    def test_atomic_source_blind_root_fails_closed_if_state_is_malformed(self):
+        self.add_conversation_context_row()
+        roots, candidate_id = self.add_established_atomic(first_row=57)
+        self.conn.execute(
+            """
+            UPDATE memory_ledger_entries
+            SET source_class='legacy_source_blind',
+                visibility='public',
+                public_usable=1
+            WHERE entry_id IN (?,?)
+            """,
+            roots,
+        )
+        self.conn.execute(
+            """
+            UPDATE memory_ledger_knowledge_candidates
+            SET normalized_value='modular synths',
+                candidate_state='established',
+                authority_class='legacy_source_blind',
+                consolidated_authority_class='legacy_source_blind',
+                visibility='public',
+                candidate_eligible=1,
+                live_eligible=0,
+                invalidated_reason='',
+                review_status='current',
+                review_due_at=''
+            WHERE candidate_id=? OR canonical_candidate_id=?
+            """,
+            (candidate_id, candidate_id),
+        )
+        self.conn.execute(
+            """
+            UPDATE memory_ledger_knowledge_roots
+            SET root_status='eligible',
+                lifecycle_status='active',
+                source_class='legacy_source_blind',
+                visibility='public'
+            WHERE candidate_id=? AND root_entry_id IN (?,?)
+            """,
+            (candidate_id, *roots),
+        )
+
+        packet = build_packet(
+            self.conn,
+            self.public_request(text="What do you remember about me?"),
+            persist=False,
+            environ=self.flags,
+        )
+
+        self.assertNotIn(
+            "modular synths",
+            {item.text for item in packet.items},
+        )
+        self.assertGreaterEqual(
+            packet.diagnostics.excluded_by_reason.get(
+                "atomic_root_revalidation",
+                0,
+            ),
+            1,
+        )
+
     def test_source_mutation_breaks_revalidation(self):
         self.add_conversation_context_row()
         roots, _candidate_id = self.add_established_atomic()
@@ -527,12 +1074,29 @@ class UnifiedIntelligencePacketTests(unittest.TestCase):
         self.add_conversation_context_row()
         root = self.add_entry(
             70,
-            predicate_key="favorite_instrument",
-            value="modular synths",
+            entry_type="observation",
+            predicate_key="conversation",
+            value="I spent the evening patching the music bot.",
+            source_class=SourceClass.PUBLIC_OBSERVATION,
         )
-        created = ledger.form_atomic_candidate_from_ledger_entry(
+        created = ledger.form_atomic_knowledge_candidate(
             self.conn,
-            root,
+            ledger.AtomicKnowledgeProposal(
+                candidate_type="topic_or_motif",
+                subject_key="discord_user:7",
+                subject_display_name="Crow",
+                predicate_key="code_and_music_motif",
+                meaning="Recurring public conversation about music systems.",
+                root_entry_ids=(root,),
+                participant_keys=("discord_user:7",),
+                epistemic_status="observed",
+                uncertainty_note="Tentative observation; not a scalar fact.",
+                currentness="historical",
+                contradiction_key=(
+                    "discord_user:7:code_and_music_motif"
+                ),
+                retrieval_tags=("code_and_systems", "music_production"),
+            ),
         )
         packet = build_packet(
             self.conn,

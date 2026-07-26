@@ -105,6 +105,10 @@ class MemoryDiagnosticCommandTests(unittest.IsolatedAsyncioTestCase):
         async def send(_interaction, text, limit=0):
             events.append("send")
             self.assertIn("BNL Memory Diagnostic", text)
+            self.assertIn(
+                "- conversation_motif_formation_shadow_enabled: `yes`",
+                text,
+            )
             self.assertEqual(limit, 1700)
 
         item.response.defer.side_effect = defer
@@ -119,6 +123,11 @@ class MemoryDiagnosticCommandTests(unittest.IsolatedAsyncioTestCase):
                 bnl01_bot,
                 "resolve_channel_policy",
                 return_value="sealed_test",
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "conversation_motif_formation_enabled",
+                return_value=True,
             ),
             mock.patch.object(
                 bnl01_bot.asyncio,

@@ -128,6 +128,99 @@ class UnifiedResponseAssessmentShadowTests(unittest.TestCase):
             ("BNL_RELATIONSHIP_V2_LIVE_ENABLED",),
         )
 
+    def test_profile_sufficiency_is_evaluated_without_retrieval(self):
+        rich = build_unified_response_assessment(
+            guild_id=1,
+            route_mode="normal_chat",
+            channel_policy="public_home",
+            conversation_surface="active_channel_batch",
+            current_speaker_user_ids=(7,),
+            target_user_ids=(7,),
+            current_text="What am I all about?",
+            packet_selected_lanes=("governed_memory", "canon"),
+            profile_sufficiency_status="rich",
+            profile_sufficiency_met=True,
+            profile_required_point_count=2,
+            profile_selected_point_count=2,
+            profile_independent_root_count=4,
+            profile_independent_occurrence_count=2,
+            profile_sufficiency_reasons=(
+                "rich_supported_member_evidence",
+            ),
+        )
+        empty = build_unified_response_assessment(
+            guild_id=1,
+            route_mode="normal_chat",
+            channel_policy="public_home",
+            conversation_surface="active_channel_batch",
+            current_speaker_user_ids=(7,),
+            target_user_ids=(7,),
+            current_text="What am I all about?",
+            packet_selected_lanes=("canon",),
+            profile_sufficiency_status="empty",
+            profile_sufficiency_met=False,
+            profile_sufficiency_reasons=(
+                "no_supported_member_evidence",
+            ),
+        )
+        malformed_rich = build_unified_response_assessment(
+            guild_id=1,
+            route_mode="normal_chat",
+            channel_policy="public_home",
+            conversation_surface="active_channel_batch",
+            current_speaker_user_ids=(7,),
+            target_user_ids=(7,),
+            current_text="What am I all about?",
+            profile_sufficiency_status="rich",
+            profile_sufficiency_met=True,
+            profile_required_point_count=1,
+            profile_selected_point_count=2,
+            profile_independent_root_count=2,
+            profile_independent_occurrence_count=2,
+        )
+        malformed_sparse = build_unified_response_assessment(
+            guild_id=1,
+            route_mode="normal_chat",
+            channel_policy="public_home",
+            conversation_surface="active_channel_batch",
+            current_speaker_user_ids=(7,),
+            target_user_ids=(7,),
+            current_text="What am I all about?",
+            profile_sufficiency_status="sparse",
+            profile_sufficiency_met=True,
+            profile_required_point_count=2,
+            profile_selected_point_count=2,
+            profile_independent_root_count=2,
+            profile_independent_occurrence_count=2,
+        )
+
+        self.assertTrue(rich.profile_sufficiency_met)
+        self.assertEqual(rich.profile_sufficiency_status, "rich")
+        self.assertIn(
+            "profile_rich_evidence_ready",
+            rich.diagnostic_reasons,
+        )
+        self.assertFalse(empty.profile_sufficiency_met)
+        self.assertEqual(empty.profile_sufficiency_status, "empty")
+        self.assertIn(
+            "profile_sufficiency_empty",
+            empty.conflict_reasons,
+        )
+        self.assertIn(
+            "profile_sufficiency_not_met",
+            empty.diagnostic_reasons,
+        )
+        self.assertFalse(malformed_rich.profile_sufficiency_met)
+        self.assertFalse(malformed_sparse.profile_sufficiency_met)
+        self.assertIn(
+            "profile_sufficiency_not_met",
+            malformed_rich.diagnostic_reasons,
+        )
+        self.assertIn(
+            "profile_sufficiency_not_met",
+            malformed_sparse.diagnostic_reasons,
+        )
+
     def test_sealed_canary_brief_preserves_attribution_without_raw_transcript(self):
         assessment = self.shared_choice_assessment()
         brief = render_sealed_canary_brief(
@@ -1060,6 +1153,13 @@ class UnifiedResponseAssessmentShadowTests(unittest.TestCase):
                 "response_coherence_status",
                 "coherence_conclusion_status",
                 "coherence_reason_codes_json",
+                "profile_sufficiency_status",
+                "profile_sufficiency_met",
+                "profile_required_point_count",
+                "profile_selected_point_count",
+                "profile_independent_root_count",
+                "profile_independent_occurrence_count",
+                "profile_sufficiency_reasons_json",
                 "scoped_canary_applied",
                 "scoped_canary_scope_valid",
                 "scoped_canary_episode_context",

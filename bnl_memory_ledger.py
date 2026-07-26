@@ -13,7 +13,7 @@ import json
 import os
 import re
 import sqlite3
-from typing import Any
+from typing import Any, Iterable
 
 from bnl_canon_source_contract import (
     Confidence,
@@ -39,6 +39,9 @@ ATOMIC_KNOWLEDGE_LIFECYCLE_BACKFILL = (
 )
 ATOMIC_KNOWLEDGE_LIFECYCLE_SWEEP = "atomic_knowledge_lifecycle_sweep_v1"
 MEMORY_LEDGER_SHADOW_ENV = "BNL_MEMORY_LEDGER_SHADOW_ENABLED"
+CONVERSATION_MOTIF_FORMATION_ENV = (
+    "BNL_CONVERSATION_MOTIF_FORMATION_SHADOW_ENABLED"
+)
 BNL_SUBJECT_KEY = "bnl_01"
 
 ENTRY_TYPES = frozenset({
@@ -158,6 +161,380 @@ _KNOWLEDGE_TEST_OR_OPERATIONAL_SOURCE_RE = re.compile(
     r"(?:queue|payment|wheel|rehearsal|show[_-]?test|simulation)",
     re.I,
 )
+_CONVERSATION_MOTIF_RECALL_RE = re.compile(
+    r"\b(?:what|who|tell|remind)\b.{0,48}"
+    r"\b(?:know|remember|have|got|recall)\b.{0,36}"
+    r"\b(?:about|on)?\s*(?:me|myself|who\s+i\s+am)\b"
+    r"|\bwhat\s+am\s+i\s+all\s+about\b",
+    re.I,
+)
+_CONVERSATION_MOTIF_UNSAFE_RE = re.compile(
+    r"\b(?:password|passcode|pin|one[- ]?time\s+(?:code|password)|otp|"
+    r"verification\s+code|security\s+code|recovery\s+code|access\s+code|"
+    r"api\s+key|secret\s+key|private\s+key|seed\s+phrase|"
+    r"(?:auth|access|deployment|session)\s+token|routing\s+number|"
+    r"bank\s+account|credit\s+card|debit\s+card|social\s+security|ssn)\b"
+    r"|\b(?:ignore|disregard|override|bypass|reveal)\b.{0,40}"
+    r"\b(?:system|developer|assistant|prompt|instructions?|rules?|secret)\b",
+    re.I,
+)
+_CONVERSATION_MOTIF_DIRECT_FACT_RE = re.compile(
+    r"\b(?:call\s+me|my\s+(?:email|phone(?:\s+number)?|home\s+address|"
+    r"street\s+address|legal\s+name|real\s+name|full\s+name|"
+    r"preferred\s+name|pronouns?|birthday|date\s+of\s+birth|employer|"
+    r"workplace|favorite\s+(?:color|movie|food|place))\s+(?:is|are)|"
+    r"i\s+(?:live|reside)\s+(?:at|in|near))\b",
+    re.I,
+)
+_CONVERSATION_MOTIF_SENSITIVE_RE = re.compile(
+    r"\b(?:diagnos(?:ed|is)|medical\s+condition|health\s+condition|"
+    r"medication|therapy|therapist|pregnan(?:t|cy)|sexuality|"
+    r"sexual\s+orientation|gender\s+identity|race|ethnicity|religion|"
+    r"political\s+affiliation|immigration\s+status|criminal\s+record|"
+    r"salary|income|bank\s+balance|financial\s+account|home\s+location|"
+    r"where\s+i\s+live|family\s+emergency|private\s+relationship)\b",
+    re.I,
+)
+_CONVERSATION_MOTIF_ROLEPLAY_RE = re.compile(
+    r"\b(?:pretend|role[- ]?play|in\s+(?:this|the)\s+scene|"
+    r"my\s+character|character\s+says|if\s+i\s+(?:said|were)|"
+    r"hypothetically|just\s+kidding|j/?k|sarcasm)\b",
+    re.I,
+)
+_CONVERSATION_MOTIF_URL_OR_MENTION_RE = re.compile(
+    r"(?:\bhttps?://|\bwww\.|"
+    r"\b[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}\b|<@!?\d+>)",
+    re.I,
+)
+_CONVERSATION_MOTIF_TERM_RE = re.compile(r"[a-z][a-z'’-]{2,}", re.I)
+_CONVERSATION_MOTIF_STOPWORDS = frozenset(
+    """
+    about after again also and are because been before being but can could
+    did does doing for from getting going had has have here how into its just
+    know like made make more much need now okay only our really remember said
+    should some still than that the their them then there these they thing
+    things this those through too want was were what when where which who why
+    will with would yeah yes you your
+    """.split()
+)
+_CONVERSATION_MOTIF_FAMILIES = (
+    (
+        "music_production",
+        "music and audio production",
+        frozenset(
+            {
+                "album",
+                "artist",
+                "audio",
+                "beat",
+                "broadcast",
+                "drum",
+                "drums",
+                "mix",
+                "music",
+                "radio",
+                "release",
+                "song",
+                "songs",
+                "sound",
+                "synth",
+                "track",
+                "tracks",
+                "vocal",
+                "vocals",
+            }
+        ),
+    ),
+    (
+        "games_and_creatures",
+        "games and interactive systems",
+        frozenset(
+            {
+                "battle",
+                "battles",
+                "card",
+                "cards",
+                "class",
+                "classes",
+                "creature",
+                "creatures",
+                "game",
+                "games",
+                "level",
+                "levels",
+                "monster",
+                "monsters",
+                "player",
+                "players",
+            }
+        ),
+    ),
+    (
+        "art_and_visuals",
+        "art and visual design",
+        frozenset(
+            {
+                "animation",
+                "art",
+                "artwork",
+                "banner",
+                "character",
+                "characters",
+                "design",
+                "image",
+                "images",
+                "photo",
+                "photos",
+                "sprite",
+                "style",
+                "visual",
+                "visuals",
+            }
+        ),
+    ),
+    (
+        "code_and_systems",
+        "software and technical systems",
+        frozenset(
+            {
+                "bot",
+                "bug",
+                "bugs",
+                "code",
+                "deploy",
+                "deployment",
+                "error",
+                "fix",
+                "github",
+                "memory",
+                "system",
+                "systems",
+                "test",
+                "testing",
+                "website",
+            }
+        ),
+    ),
+    (
+        "community_and_collaboration",
+        "community, collaboration, and shared projects",
+        frozenset(
+            {
+                "collab",
+                "collaboration",
+                "community",
+                "discord",
+                "friend",
+                "friends",
+                "group",
+                "member",
+                "members",
+                "people",
+                "project",
+                "projects",
+                "server",
+                "team",
+            }
+        ),
+    ),
+    (
+        "lore_and_writing",
+        "lore, writing, and worldbuilding",
+        frozenset(
+            {
+                "book",
+                "canon",
+                "chapter",
+                "lore",
+                "narrative",
+                "scene",
+                "story",
+                "world",
+                "worldbuilding",
+                "write",
+                "writing",
+            }
+        ),
+    ),
+    (
+        "cooking",
+        "food and cooking",
+        frozenset(
+            {
+                "bake",
+                "baking",
+                "cook",
+                "cooking",
+                "dinner",
+                "food",
+                "lunch",
+                "meal",
+                "oven",
+                "pizza",
+                "recipe",
+            }
+        ),
+    ),
+    (
+        "outdoors",
+        "outdoor plans and conditions",
+        frozenset(
+            {
+                "hike",
+                "hiking",
+                "mountain",
+                "outdoors",
+                "rain",
+                "trail",
+                "weather",
+            }
+        ),
+    ),
+    (
+        "humor_and_banter",
+        "jokes and community banter",
+        frozenset(
+            {
+                "banter",
+                "funny",
+                "joke",
+                "jokes",
+                "laugh",
+                "meme",
+                "memes",
+            }
+        ),
+    ),
+)
+_CONVERSATION_MOTIF_ANCHORS = {
+    "music_production": frozenset(
+        {
+            "album",
+            "artist",
+            "audio",
+            "beat",
+            "drum",
+            "drums",
+            "music",
+            "radio",
+            "song",
+            "songs",
+            "sound",
+            "synth",
+            "track",
+            "tracks",
+            "vocal",
+            "vocals",
+        }
+    ),
+    "games_and_creatures": frozenset(
+        {
+            "battle",
+            "battles",
+            "creature",
+            "creatures",
+            "game",
+            "games",
+            "monster",
+            "monsters",
+            "player",
+            "players",
+        }
+    ),
+    "art_and_visuals": frozenset(
+        {
+            "animation",
+            "art",
+            "artwork",
+            "image",
+            "images",
+            "photo",
+            "photos",
+            "sprite",
+            "visual",
+            "visuals",
+        }
+    ),
+    "code_and_systems": frozenset(
+        {
+            "bot",
+            "bug",
+            "bugs",
+            "code",
+            "deploy",
+            "deployment",
+            "github",
+            "website",
+        }
+    ),
+    "community_and_collaboration": frozenset(
+        {
+            "collab",
+            "collaboration",
+            "community",
+            "discord",
+            "group",
+            "member",
+            "members",
+            "server",
+            "team",
+        }
+    ),
+    "lore_and_writing": frozenset(
+        {
+            "canon",
+            "lore",
+            "narrative",
+            "story",
+            "worldbuilding",
+            "write",
+            "writing",
+        }
+    ),
+    "cooking": frozenset(
+        {
+            "bake",
+            "baking",
+            "cook",
+            "cooking",
+            "dinner",
+            "food",
+            "lunch",
+            "meal",
+            "oven",
+            "pizza",
+            "recipe",
+        }
+    ),
+    "outdoors": frozenset(
+        {
+            "hike",
+            "hiking",
+            "mountain",
+            "outdoors",
+            "rain",
+            "trail",
+            "weather",
+        }
+    ),
+    "humor_and_banter": frozenset(
+        {
+            "banter",
+            "funny",
+            "joke",
+            "jokes",
+            "laugh",
+            "meme",
+            "memes",
+        }
+    ),
+}
+_CONVERSATION_MOTIF_WINDOW_SECONDS = 30 * 60
+_CONVERSATION_OCCURRENCE_MAX_SCAN = 64
+_CONVERSATION_CORRECTION_MAX_SCAN = 40
+_CONVERSATION_MOTIF_MAX_SCAN = 240
+_CONVERSATION_MOTIF_MAX_CANDIDATES = 6
+_CONVERSATION_MOTIF_MAX_ROOTS = 12
 
 APPROVED_SELF_AUTHORED_FACT_KEYS = frozenset({
     "preferred_name",
@@ -166,8 +543,17 @@ APPROVED_SELF_AUTHORED_FACT_KEYS = frozenset({
     "favorite_movie",
 })
 _CONVERSATION_CORRECTION_RE = re.compile(
-    r"\b(?:actually|correction|correcting|i meant|instead|not that|"
-    r"that's wrong|that is wrong|replace|swap|change)\b",
+    r"(?:"
+    r"^\s*(?:actually|correction|correcting)\b"
+    r"|\b(?:i|we)\s+meant\b"
+    r"|\b(?:that's|that\s+is)\s+wrong\b"
+    r"|^\s*no\s*[,;:]\s*not\s+that\b"
+    r"|\b(?:i|we)\s+(?:need|want)\s+to\s+correct\b"
+    r"|\b(?:please\s+)?correct\s+(?:that|this|my|the\s+(?:last|previous))\b"
+    r"|\b(?:change|replace|swap)\s+"
+    r"(?:my\s+(?:answer|preference|favorite|name|pronouns?)"
+    r"|the\s+(?:last|previous)\b)"
+    r")",
     re.I,
 )
 _CORRECTION_TOPIC_STOPWORDS = frozenset(
@@ -250,6 +636,22 @@ class AtomicKnowledgeResult:
 def shadow_enabled(environ: dict[str, str] | None = None) -> bool:
     value = (environ or os.environ).get(MEMORY_LEDGER_SHADOW_ENV, "")
     return str(value).strip().lower() in {"1", "true", "yes", "on", "enabled"}
+
+
+def conversation_motif_formation_enabled(
+    environ: dict[str, str] | None = None,
+) -> bool:
+    """Keep recurring-conversation formation shadow-only and kill-switchable."""
+    env = os.environ if environ is None else environ
+    if not shadow_enabled(env):
+        return False
+    return str(env.get(CONVERSATION_MOTIF_FORMATION_ENV, "")).strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+        "enabled",
+    }
 
 
 def _now() -> str:
@@ -528,6 +930,23 @@ def ensure_memory_ledger_schema(conn: sqlite3.Connection) -> None:
         )
         """
     )
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS memory_ledger_conversation_motif_fences (
+            guild_id INTEGER NOT NULL,
+            subject_key TEXT NOT NULL,
+            predicate_key TEXT NOT NULL,
+            correction_entry_id TEXT DEFAULT '',
+            correction_observed_at TEXT DEFAULT '',
+            reason_code TEXT NOT NULL,
+            fence_state TEXT NOT NULL DEFAULT 'active',
+            satisfied_at TEXT DEFAULT '',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY(guild_id, subject_key, predicate_key)
+        )
+        """
+    )
     for sql in (
         "ALTER TABLE memory_ledger_knowledge_candidates ADD COLUMN confidence_class TEXT NOT NULL DEFAULT 'unknown'",
         "ALTER TABLE memory_ledger_knowledge_roots ADD COLUMN confidence TEXT NOT NULL DEFAULT 'unknown'",
@@ -546,6 +965,8 @@ def ensure_memory_ledger_schema(conn: sqlite3.Connection) -> None:
         "ALTER TABLE memory_ledger_knowledge_candidates ADD COLUMN review_status TEXT NOT NULL DEFAULT 'not_evaluated'",
         "ALTER TABLE memory_ledger_knowledge_candidates ADD COLUMN review_due_at TEXT DEFAULT ''",
         "ALTER TABLE memory_ledger_knowledge_candidates ADD COLUMN lifecycle_evaluated_at TEXT DEFAULT ''",
+        "ALTER TABLE memory_ledger_conversation_motif_fences ADD COLUMN fence_state TEXT NOT NULL DEFAULT 'active'",
+        "ALTER TABLE memory_ledger_conversation_motif_fences ADD COLUMN satisfied_at TEXT DEFAULT ''",
     ):
         try:
             cur.execute(sql)
@@ -574,6 +995,7 @@ def ensure_memory_ledger_schema(conn: sqlite3.Connection) -> None:
         "CREATE INDEX IF NOT EXISTS idx_mlkreceipt_event ON memory_ledger_knowledge_receipts(guild_id, event_type, reason_code)",
         "CREATE INDEX IF NOT EXISTS idx_mlkle_guild ON memory_ledger_knowledge_lifecycle_events(guild_id, next_state, reason_code)",
         "CREATE INDEX IF NOT EXISTS idx_mlklr_candidate ON memory_ledger_knowledge_lifecycle_roots(guild_id, candidate_id, counts_as_reinforcement)",
+        "CREATE INDEX IF NOT EXISTS idx_mlcmf_subject ON memory_ledger_conversation_motif_fences(guild_id, subject_key, predicate_key)",
     ]:
         cur.execute(sql)
     # These triggers are versioned in place so existing production databases
@@ -853,6 +1275,36 @@ def ensure_memory_ledger_schema(conn: sqlite3.Connection) -> None:
         END
         """
     )
+    cur.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS trg_conversation_motif_fence_source_delete_v1
+        AFTER DELETE ON memory_ledger_entries
+        BEGIN
+          UPDATE memory_ledger_knowledge_candidates
+          SET normalized_value='',candidate_state='invalidated',
+              candidate_eligible=0,live_eligible=0,
+              invalidated_reason='correction_fence_source_deleted',
+              invalidated_at=CURRENT_TIMESTAMP,
+              lifecycle_reason='correction_fence_source_deleted',
+              review_status='dirty',lifecycle_evaluated_at='',
+              updated_at=CURRENT_TIMESTAMP
+          WHERE guild_id=OLD.guild_id AND subject_key=OLD.subject_key
+            AND candidate_type='topic_or_motif'
+            AND predicate_key IN (
+              SELECT predicate_key
+              FROM memory_ledger_conversation_motif_fences
+              WHERE guild_id=OLD.guild_id
+                AND subject_key=OLD.subject_key
+                AND correction_entry_id=OLD.entry_id
+            )
+            AND retrieval_tags_json LIKE '%recurring_public_conversation%';
+
+          DELETE FROM memory_ledger_conversation_motif_fences
+          WHERE guild_id=OLD.guild_id AND subject_key=OLD.subject_key
+            AND correction_entry_id=OLD.entry_id;
+        END
+        """
+    )
 
 
 def record_shadow_receipt(conn: sqlite3.Connection, *, guild_id: int, writer: str, source_table: str, source_row_id: int | str, source_revision: str = "", source_event_key: str = "", outcome: str, reason_code: str, entry_id: str = "") -> None:
@@ -1062,7 +1514,7 @@ def _knowledge_entry_rows(
           predicate_key,normalized_value,source_class,source_table,
           source_row_id,source_revision,source_role,route_mode,channel_id,
           channel_name,channel_policy,visibility,confidence,public_usable,
-          derived,projection,observed_at,lifecycle_status
+          derived,projection,observed_at,source_sequence,lifecycle_status
         FROM memory_ledger_entries
         WHERE entry_id IN (%s)
         """ % placeholders,
@@ -1093,7 +1545,8 @@ def _knowledge_entry_rows(
             "derived": bool(row[19]),
             "projection": bool(row[20]),
             "observed_at": str(row[21] or ""),
-            "lifecycle_status": str(row[22] or ""),
+            "source_sequence": int(row[22] or 0),
+            "lifecycle_status": str(row[23] or ""),
         }
     if by_id:
         placeholders = ",".join("?" for _entry_id in by_id)
@@ -1348,6 +1801,163 @@ def _knowledge_evidence_identity(
     )
 
 
+def knowledge_root_identity(
+    conn: sqlite3.Connection,
+    entry_id: str,
+) -> str:
+    """Return one content-free identity for the original source record."""
+    entry = _knowledge_entry_rows(
+        conn,
+        (str(entry_id or "").strip(),),
+    ).get(str(entry_id or "").strip())
+    if not entry:
+        return ""
+    return _knowledge_evidence_identity(conn, entry)
+
+
+def knowledge_source_root_identity(
+    *,
+    guild_id: int,
+    source_table: str,
+    source_row_id: int | str,
+) -> str:
+    """Build the same content-free root identity without reading an entry."""
+    if not int(guild_id or 0) or not str(source_table or "").strip():
+        return ""
+    if not str(source_row_id or "").strip():
+        return ""
+    return _knowledge_digest(
+        int(guild_id or 0),
+        str(source_table or "").strip(),
+        str(source_row_id or "").strip(),
+    )
+
+
+def _knowledge_occurrence_identity(
+    conn: sqlite3.Connection,
+    entry: dict[str, Any],
+) -> str:
+    """Collapse one Moment or one bounded 30-minute exchange."""
+    evidence_identity = _knowledge_evidence_identity(conn, entry)
+    if (
+        str(entry.get("source_table") or "") != "conversations"
+        or str(entry.get("source_role") or "").lower()
+        not in {
+            "user",
+            "member_self_report",
+            "member_control",
+            "owner",
+            "operator",
+        }
+    ):
+        return evidence_identity
+    moment_row = conn.execute(
+        """
+        SELECT l.target_entry_id
+        FROM memory_ledger_lineage l
+        JOIN memory_ledger_entries target
+          ON target.entry_id=l.target_entry_id
+        WHERE l.entry_id=? AND l.lineage_type='part_of_moment'
+          AND target.lifecycle_status IN ('active','review_only')
+        ORDER BY l.target_entry_id
+        LIMIT 1
+        """,
+        (str(entry.get("entry_id") or ""),),
+    ).fetchone()
+    if moment_row and str(moment_row[0] or ""):
+        return _knowledge_digest(
+            "conversation_moment_occurrence",
+            int(entry.get("guild_id") or 0),
+            str(moment_row[0]),
+        )
+    scope_parts = (
+        int(entry.get("guild_id") or 0),
+        int(entry.get("channel_id") or 0),
+        str(entry.get("channel_policy") or "unknown"),
+        str(entry.get("subject_key") or ""),
+    )
+    observed = _parse_knowledge_time(entry.get("observed_at"))
+    current_sequence = int(entry.get("source_sequence") or 0)
+    if observed is None or current_sequence <= 0:
+        return ""
+    rows = conn.execute(
+        """
+        SELECT entry_id,observed_at,source_sequence
+        FROM memory_ledger_entries
+        WHERE guild_id=? AND subject_key=? AND source_table='conversations'
+          AND source_role IN (
+            'user','member_self_report','member_control','owner','operator'
+          )
+          AND channel_id=? AND channel_policy=?
+          AND source_sequence<=?
+        ORDER BY source_sequence DESC,entry_id DESC
+        LIMIT ?
+        """,
+        (
+            scope_parts[0],
+            scope_parts[3],
+            scope_parts[1],
+            scope_parts[2],
+            current_sequence,
+            _CONVERSATION_OCCURRENCE_MAX_SCAN + 1,
+        ),
+    ).fetchall()
+    current_id = str(entry.get("entry_id") or "")
+    current_index = next(
+        (
+            index
+            for index, row in enumerate(rows)
+            if str(row[0] or "") == current_id
+        ),
+        -1,
+    )
+    if current_index < 0:
+        return ""
+    bounded_rows = rows[
+        current_index : current_index + _CONVERSATION_OCCURRENCE_MAX_SCAN
+    ]
+    has_unscanned_prior = (
+        len(rows) > current_index + _CONVERSATION_OCCURRENCE_MAX_SCAN
+    )
+    anchor_id = current_id
+    prior_time = observed
+    found_idle_boundary = False
+    for row_entry_id, row_observed_at, _row_sequence in bounded_rows[1:]:
+        row_time = _parse_knowledge_time(row_observed_at)
+        if row_time is None or row_time > prior_time:
+            return ""
+        idle_seconds = (prior_time - row_time).total_seconds()
+        if idle_seconds > _CONVERSATION_MOTIF_WINDOW_SECONDS:
+            found_idle_boundary = True
+            break
+        anchor_id = str(row_entry_id or anchor_id)
+        prior_time = row_time
+    if has_unscanned_prior and not found_idle_boundary:
+        # An unbounded continuous exchange has no safe countable identity.
+        # Withhold it instead of inventing a second occurrence alongside the
+        # earlier real anchor.
+        return ""
+    return _knowledge_digest(
+        "conversation_occurrence",
+        *scope_parts,
+        anchor_id,
+    )
+
+
+def knowledge_occurrence_identity(
+    conn: sqlite3.Connection,
+    entry_id: str,
+) -> str:
+    """Return one content-free recurrence window for a human Ledger root."""
+    entry = _knowledge_entry_rows(
+        conn,
+        (str(entry_id or "").strip(),),
+    ).get(str(entry_id or "").strip())
+    if not entry:
+        return ""
+    return _knowledge_occurrence_identity(conn, entry)
+
+
 def _knowledge_review_policy(
     *,
     candidate_type: str,
@@ -1478,6 +2088,16 @@ def _knowledge_candidate_roots(
                 conn,
                 root["entry"],
             )
+            root["occurrence_identity"] = _knowledge_occurrence_identity(
+                conn,
+                root["entry"],
+            )
+            candidate_tags = set(_knowledge_retrieval_tags(candidate))
+            root["reinforcement_identity"] = (
+                root["occurrence_identity"]
+                if "recurring_public_conversation" in candidate_tags
+                else root["evidence_identity"]
+            )
             roots.append(root)
     if roots:
         visibility, reason = _knowledge_visibility(
@@ -1489,6 +2109,24 @@ def _knowledge_candidate_roots(
         if reason or visibility != str(candidate.get("visibility") or ""):
             return [], derivative_count
     return roots, derivative_count
+
+
+def _knowledge_retrieval_tags(
+    candidate: dict[str, Any],
+) -> tuple[str, ...]:
+    try:
+        parsed = json.loads(
+            str(candidate.get("retrieval_tags_json") or "[]")
+        )
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return ()
+    if not isinstance(parsed, list):
+        return ()
+    return tuple(
+        str(tag)
+        for tag in parsed
+        if str(tag or "")
+    )
 
 
 def _record_knowledge_lifecycle_event(
@@ -1509,7 +2147,11 @@ def _record_knowledge_lifecycle_event(
             {
                 (
                     str(root.get("root_entry_id") or ""),
-                    str(root.get("evidence_identity") or ""),
+                    str(
+                        root.get("reinforcement_identity")
+                        or root.get("evidence_identity")
+                        or ""
+                    ),
                 )
                 for root in roots
                 if str(root.get("root_entry_id") or "")
@@ -1613,6 +2255,7 @@ def _knowledge_scope_rows(
           candidate_state,contradiction_key,supersedes_candidate_id,
           visibility,authority_class,confidence_class,route_scope_json,
           participant_scope_digest,first_seen_at,last_seen_at,
+          retrieval_tags_json,
           candidate_eligible,invalidated_reason,lifecycle_schema_version,
           consolidation_id,canonical_candidate_id,
           supporting_candidate_count,eligible_independent_root_count,
@@ -1649,6 +2292,7 @@ def _knowledge_scope_rows(
         "participant_scope_digest",
         "first_seen_at",
         "last_seen_at",
+        "retrieval_tags_json",
         "candidate_eligible",
         "invalidated_reason",
         "lifecycle_schema_version",
@@ -1734,11 +2378,39 @@ def _reconcile_atomic_knowledge_scope(
             )
         for root in roots:
             root_id = str(root.get("root_entry_id") or "")
-            evidence_identity = str(root.get("evidence_identity") or "")
+            evidence_identity = str(
+                root.get("reinforcement_identity")
+                or root.get("evidence_identity")
+                or ""
+            )
             group["roots"][root_id] = root
             group["evidence"].setdefault(evidence_identity, set()).add(root_id)
 
     for consolidation_id, group in groups.items():
+        group["recurring_public_conversation"] = any(
+            "recurring_public_conversation"
+            in set(_knowledge_retrieval_tags(candidate))
+            for candidate in group["candidates"]
+        )
+        motif_fence = (
+            _conversation_motif_fence_row(
+                conn,
+                guild_id=int(group["candidates"][0].get("guild_id") or 0),
+                subject_key=str(
+                    group["candidates"][0].get("subject_key") or ""
+                ),
+                predicate_key=str(
+                    group["candidates"][0].get("predicate_key") or ""
+                ),
+            )
+            if group["recurring_public_conversation"]
+            else {}
+        )
+        group["conversation_motif_correction_fenced"] = bool(
+            motif_fence
+            and str(motif_fence.get("fence_state") or "active")
+            == "active"
+        )
         active_ids = sorted(
             candidate["candidate_id"]
             for candidate in group["candidates"]
@@ -1788,7 +2460,9 @@ def _reconcile_atomic_knowledge_scope(
         )
         group["support_digest"] = _knowledge_digest(
             *(
-                f"{root_id}:{root.get('evidence_identity') or ''}"
+                f"{root_id}:"
+                f"{root.get('evidence_identity') or ''}:"
+                f"{root.get('reinforcement_identity') or ''}"
                 for root_id, root in sorted(group["roots"].items())
             )
         )
@@ -1902,6 +2576,9 @@ def _reconcile_atomic_knowledge_scope(
                     or candidate.get("lifecycle_reason")
                     or "retired"
                 )
+            elif bool(group["conversation_motif_correction_fenced"]):
+                next_state = "contested"
+                reason = "conversation_motif_correction_fence"
             elif not valid_roots:
                 root_lifecycles = {
                     str(row[0] or "")
@@ -1925,6 +2602,12 @@ def _reconcile_atomic_knowledge_scope(
             elif bool(group["stale_retired"]):
                 next_state = "retired"
                 reason = "stale_uncertain_or_open_knowledge"
+            elif (
+                bool(group["recurring_public_conversation"])
+                and reinforcement_count < 2
+            ):
+                next_state = "invalidated"
+                reason = "recurring_conversation_reinforcement_lost"
             elif conflict_value_count > 1:
                 next_state = "contested"
                 reason = "unresolved_contradiction"
@@ -2207,6 +2890,188 @@ def reconcile_atomic_knowledge_lifecycle_for_roots(
         candidate_ids=candidate_ids,
         now=now,
     )
+
+
+def _replace_atomic_candidate_current_roots(
+    conn: sqlite3.Connection,
+    *,
+    candidate_id: str,
+    guild_id: int,
+    subject_key: str,
+    participants: tuple[str, ...],
+    all_ids: tuple[str, ...],
+    independent_ids: tuple[str, ...],
+    entries: dict[str, dict[str, Any]],
+    derivation_paths: dict[str, dict[str, tuple[str, ...]]],
+    now: str,
+) -> None:
+    """Replace only a candidate's live root/participant associations.
+
+    Lifecycle events, lifecycle roots, and receipts are append-only audit
+    history and are intentionally untouched by a bounded motif refresh.
+    """
+    conn.execute(
+        """
+        DELETE FROM memory_ledger_knowledge_roots
+        WHERE candidate_id=?
+        """,
+        (str(candidate_id or ""),),
+    )
+    conn.execute(
+        """
+        DELETE FROM memory_ledger_knowledge_participants
+        WHERE candidate_id=?
+        """,
+        (str(candidate_id or ""),),
+    )
+    for participant_key in participants:
+        conn.execute(
+            """
+            INSERT INTO memory_ledger_knowledge_participants(
+              candidate_id,guild_id,participant_key,participant_role,created_at
+            ) VALUES(?,?,?,?,?)
+            """,
+            (
+                candidate_id,
+                guild_id,
+                participant_key,
+                "subject" if participant_key == subject_key else "participant",
+                now,
+            ),
+        )
+    independent_set = set(independent_ids)
+    for entry_id in all_ids:
+        entry = entries[entry_id]
+        independent = entry_id in independent_set
+        if independent:
+            root_kind = (
+                "human_source"
+                if str(entry.get("source_role") or "").lower()
+                in {
+                    "user",
+                    "member_self_report",
+                    "member_control",
+                    "owner",
+                    "operator",
+                }
+                else "source_record"
+            )
+            paths: list[list[str]] = [[entry_id]]
+        else:
+            root_kind = "bnl_derivative"
+            paths = [
+                list(path)
+                for path in derivation_paths.get(entry_id, {}).values()
+                if path[-1] in independent_set
+            ]
+        entry_digest = _knowledge_digest(
+            entry_id,
+            entry.get("source_revision"),
+            _canon(entry.get("normalized_value")),
+        )
+        conn.execute(
+            """
+            INSERT INTO memory_ledger_knowledge_roots(
+              candidate_id,guild_id,root_entry_id,root_kind,is_independent,
+              source_class,source_table,source_row_id,source_revision,
+              source_role,visibility,confidence,lifecycle_status,root_status,
+              root_digest,lineage_path_json,created_at,updated_at
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                candidate_id,
+                guild_id,
+                entry_id,
+                root_kind,
+                1 if independent else 0,
+                entry.get("source_class"),
+                entry.get("source_table"),
+                entry.get("source_row_id"),
+                entry.get("source_revision"),
+                entry.get("source_role"),
+                entry.get("visibility"),
+                entry.get("confidence"),
+                entry.get("lifecycle_status"),
+                "eligible",
+                entry_digest,
+                json.dumps(paths, sort_keys=True, separators=(",", ":")),
+                now,
+                now,
+            ),
+        )
+
+
+def _recurring_motif_candidate_id(
+    conn: sqlite3.Connection,
+    *,
+    guild_id: int,
+    subject_key: str,
+    predicate_key: str,
+    contradiction_key: str,
+    visibility: str,
+    participant_scope_digest: str,
+    root_digest: str,
+    fallback_candidate_id: str,
+) -> str:
+    """Reuse one nonterminal recurring-motif identity across root refreshes."""
+    rows = conn.execute(
+        """
+        SELECT candidate_id,candidate_state,invalidated_reason,root_digest,
+               canonical_candidate_id,created_at
+        FROM memory_ledger_knowledge_candidates
+        WHERE guild_id=? AND candidate_type='topic_or_motif'
+          AND subject_key=? AND predicate_key=? AND contradiction_key=?
+          AND visibility=? AND participant_scope_digest=?
+          AND retrieval_tags_json LIKE '%recurring_public_conversation%'
+        ORDER BY created_at,candidate_id
+        """,
+        (
+            int(guild_id or 0),
+            str(subject_key or ""),
+            str(predicate_key or ""),
+            str(contradiction_key or ""),
+            str(visibility or ""),
+            str(participant_scope_digest or ""),
+        ),
+    ).fetchall()
+    # An exact legacy row must win even if terminal; otherwise the candidate
+    # table's root-digest uniqueness contract would be violated.  Terminal
+    # replay stays terminal and therefore fails closed.
+    exact = next(
+        (
+            str(row[0] or "")
+            for row in rows
+            if str(row[3] or "") == str(root_digest or "")
+            and str(row[0] or "")
+        ),
+        "",
+    )
+    if exact:
+        return exact
+    refreshable = [
+        row
+        for row in rows
+        if (
+            str(row[1] or "")
+            in {"candidate", "provisional", "established"}
+            or (
+                str(row[1] or "") == "contested"
+                and str(row[2] or "").startswith(
+                    "conversation_motif_correction"
+                )
+            )
+        )
+    ]
+    if not refreshable:
+        return fallback_candidate_id
+    refreshable.sort(
+        key=lambda row: (
+            0 if str(row[4] or "") == str(row[0] or "") else 1,
+            str(row[5] or ""),
+            str(row[0] or ""),
+        )
+    )
+    return str(refreshable[0][0] or fallback_candidate_id)
 
 
 def form_atomic_knowledge_candidate(
@@ -2647,6 +3512,22 @@ def _form_atomic_knowledge_candidate_impl(
         contradiction_key=contradiction_key,
         root_entry_ids=independent_ids,
     )
+    recurring_public_conversation = bool(
+        candidate_type == "topic_or_motif"
+        and "recurring_public_conversation" in tags
+    )
+    if recurring_public_conversation:
+        candidate_id = _recurring_motif_candidate_id(
+            conn,
+            guild_id=guild_id,
+            subject_key=subject_key,
+            predicate_key=predicate_key,
+            contradiction_key=contradiction_key,
+            visibility=visibility,
+            participant_scope_digest=participant_scope_digest,
+            root_digest=root_digest,
+            fallback_candidate_id=candidate_id,
+        )
     value_digest = _knowledge_digest(_canon(meaning))
     first_seen = min(
         (str(entry.get("observed_at") or "") for entry in independent_entries),
@@ -2658,7 +3539,8 @@ def _form_atomic_knowledge_candidate_impl(
     )
     existing = conn.execute(
         """
-        SELECT normalized_value,candidate_state,candidate_eligible
+        SELECT normalized_value,candidate_state,candidate_eligible,
+               invalidated_reason,root_digest
         FROM memory_ledger_knowledge_candidates
         WHERE candidate_id=?
         """,
@@ -2697,25 +3579,96 @@ def _form_atomic_knowledge_candidate_impl(
                 candidate_type,
                 len(all_ids),
             )
-        conn.execute(
-            """
-            UPDATE memory_ledger_knowledge_candidates
-            SET last_seen_at=CASE
-                  WHEN ? > COALESCE(last_seen_at,'') THEN ?
-                  ELSE last_seen_at
-                END,
-                updated_at=?
-            WHERE candidate_id=?
-            """,
-            (last_seen, last_seen, _now(), candidate_id),
+        prior_state = str(existing[1] or "")
+        refreshable_recurring = bool(
+            recurring_public_conversation
+            and (
+                prior_state
+                in {"candidate", "provisional", "established"}
+                or (
+                    prior_state == "contested"
+                    and str(existing[3] or "").startswith(
+                        "conversation_motif_correction"
+                    )
+                )
+            )
         )
+        roots_refreshed = bool(
+            refreshable_recurring
+            and str(existing[4] or "") != root_digest
+        )
+        refreshed_at = _now()
+        if roots_refreshed:
+            conn.execute(
+                """
+                UPDATE memory_ledger_knowledge_candidates
+                SET subject_display_name=?,visibility=?,authority_class=?,
+                    confidence_class=?,route_scope_json=?,
+                    participant_scope_digest=?,
+                    first_seen_at=CASE
+                      WHEN COALESCE(first_seen_at,'')='' OR ?<first_seen_at
+                        THEN ?
+                      ELSE first_seen_at
+                    END,
+                    last_seen_at=?,
+                    retrieval_tags_json=?,root_digest=?,
+                    independent_root_count=?,derivative_root_count=?,
+                    review_status='dirty',lifecycle_evaluated_at='',
+                    updated_at=?
+                WHERE candidate_id=?
+                """,
+                (
+                    _knowledge_text(proposal.subject_display_name, 120),
+                    visibility,
+                    authority_class,
+                    confidence_class,
+                    route_scope_json,
+                    participant_scope_digest,
+                    first_seen,
+                    first_seen,
+                    last_seen,
+                    json.dumps(tags, separators=(",", ":")),
+                    root_digest,
+                    len(independent_ids),
+                    len(derivative_ids),
+                    refreshed_at,
+                    candidate_id,
+                ),
+            )
+            _replace_atomic_candidate_current_roots(
+                conn,
+                candidate_id=candidate_id,
+                guild_id=guild_id,
+                subject_key=subject_key,
+                participants=participants,
+                all_ids=all_ids,
+                independent_ids=independent_ids,
+                entries=entries,
+                derivation_paths=derivation_paths,
+                now=refreshed_at,
+            )
+        else:
+            conn.execute(
+                """
+                UPDATE memory_ledger_knowledge_candidates
+                SET last_seen_at=CASE
+                      WHEN ? > COALESCE(last_seen_at,'') THEN ?
+                      ELSE last_seen_at
+                    END,
+                    updated_at=?
+                WHERE candidate_id=?
+                """,
+                (last_seen, last_seen, refreshed_at, candidate_id),
+            )
         active_match = (
-            str(existing[1]) in KNOWLEDGE_ACTIVE_CANDIDATE_STATES
+            prior_state in KNOWLEDGE_ACTIVE_CANDIDATE_STATES
             and bool(existing[2])
         )
         match_reason = (
-            "matched_terminal_candidate"
-            if str(existing[1]) in KNOWLEDGE_TERMINAL_CANDIDATE_STATES
+            "conversation_motif_roots_refreshed"
+            if roots_refreshed
+            else "matched_terminal_candidate"
+            if prior_state in KNOWLEDGE_TERMINAL_CANDIDATE_STATES
             else "matched_contested_candidate"
             if not active_match
             else "exact_candidate_match"
@@ -2865,80 +3818,18 @@ def _form_atomic_knowledge_candidate_impl(
             now,
         ),
     )
-    for participant_key in participants:
-        conn.execute(
-            """
-            INSERT OR IGNORE INTO memory_ledger_knowledge_participants(
-              candidate_id,guild_id,participant_key,participant_role,created_at
-            ) VALUES(?,?,?,?,?)
-            """,
-            (
-                candidate_id,
-                guild_id,
-                participant_key,
-                "subject" if participant_key == subject_key else "participant",
-                now,
-            ),
-        )
-    for entry_id in all_ids:
-        entry = entries[entry_id]
-        independent = entry_id in independent_ids
-        if independent:
-            root_kind = (
-                "human_source"
-                if str(entry.get("source_role") or "").lower()
-                in {
-                    "user",
-                    "member_self_report",
-                    "member_control",
-                    "owner",
-                    "operator",
-                }
-                else "source_record"
-            )
-            paths: list[list[str]] = [[entry_id]]
-        else:
-            root_kind = "bnl_derivative"
-            paths = [
-                list(path)
-                for path in derivation_paths.get(entry_id, {}).values()
-                if path[-1] in independent_ids
-            ]
-        entry_digest = _knowledge_digest(
-            entry_id,
-            entry.get("source_revision"),
-            _canon(entry.get("normalized_value")),
-        )
-        conn.execute(
-            """
-            INSERT INTO memory_ledger_knowledge_roots(
-              candidate_id,guild_id,root_entry_id,root_kind,is_independent,
-              source_class,source_table,source_row_id,source_revision,
-              source_role,visibility,confidence,lifecycle_status,root_status,
-              root_digest,lineage_path_json,created_at,updated_at
-            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-            """,
-            (
-                candidate_id,
-                guild_id,
-                entry_id,
-                root_kind,
-                1 if independent else 0,
-                entry.get("source_class"),
-                entry.get("source_table"),
-                entry.get("source_row_id"),
-                entry.get("source_revision"),
-                entry.get("source_role"),
-                entry.get("visibility"),
-                entry.get("confidence"),
-                entry.get("lifecycle_status"),
-                "eligible",
-                entry_digest,
-                json.dumps(paths, sort_keys=True, separators=(",", ":")),
-                now,
-                now,
-            ),
-        )
+    _replace_atomic_candidate_current_roots(
+        conn,
+        candidate_id=candidate_id,
+        guild_id=guild_id,
+        subject_key=subject_key,
+        participants=participants,
+        all_ids=all_ids,
+        independent_ids=independent_ids,
+        entries=entries,
+        derivation_paths=derivation_paths,
+        now=now,
+    )
 
     for superseded_id in explicitly_superseded:
         conn.execute(
@@ -3130,6 +4021,924 @@ def form_atomic_candidate_from_ledger_entry(
             ),
         ),
     )
+
+
+def _conversation_motif_terms(
+    value: str,
+    *,
+    include_correction: bool = False,
+    include_direct_fact: bool = False,
+) -> tuple[str, ...]:
+    text = re.sub(r"\s+", " ", str(value or "")).strip()
+    if (
+        not text
+        or len(text.split()) < 4
+        or (
+            not include_correction
+            and _CONVERSATION_CORRECTION_RE.search(text)
+        )
+        or _CONVERSATION_MOTIF_RECALL_RE.search(text)
+        or _CONVERSATION_MOTIF_UNSAFE_RE.search(text)
+        or (
+            not include_direct_fact
+            and _CONVERSATION_MOTIF_DIRECT_FACT_RE.search(text)
+        )
+        or _CONVERSATION_MOTIF_SENSITIVE_RE.search(text)
+        or _CONVERSATION_MOTIF_ROLEPLAY_RE.search(text)
+        or _CONVERSATION_MOTIF_URL_OR_MENTION_RE.search(text)
+    ):
+        return ()
+    return tuple(
+        dict.fromkeys(
+            token
+            for token in _CONVERSATION_MOTIF_TERM_RE.findall(text.lower())
+            if token not in _CONVERSATION_MOTIF_STOPWORDS
+        )
+    )[:32]
+
+
+def _conversation_motif_family_matches(
+    terms: tuple[str, ...],
+) -> tuple[tuple[str, str], ...]:
+    term_set = set(terms)
+    return tuple(
+        (family, label)
+        for family, label, markers in _CONVERSATION_MOTIF_FAMILIES
+        if (
+            term_set.intersection(markers)
+            and term_set.intersection(
+                _CONVERSATION_MOTIF_ANCHORS.get(family, frozenset())
+            )
+        )
+    )
+
+
+def _conversation_motif_predicates_for_values(
+    values: Iterable[str],
+) -> tuple[str, ...]:
+    predicates = {
+        "conversation_motif_%s" % family
+        for value in values
+        for family, _label in _conversation_motif_family_matches(
+            _conversation_motif_terms(
+                str(value or ""),
+                include_correction=True,
+                include_direct_fact=True,
+            )
+        )
+    }
+    if predicates:
+        return tuple(sorted(predicates))
+    normalized_values = tuple(str(value or "") for value in values)
+    if any(
+        _CONVERSATION_MOTIF_DIRECT_FACT_RE.search(value)
+        or _CONVERSATION_MOTIF_SENSITIVE_RE.search(value)
+        or _CONVERSATION_MOTIF_UNSAFE_RE.search(value)
+        for value in normalized_values
+    ):
+        return ()
+    # A generic or opaque correction cannot safely be assigned to one topic.
+    # Fence the finite known motif family set instead of guessing a target.
+    return tuple(
+        sorted(
+            "conversation_motif_%s" % family
+            for family, _label, _markers in _CONVERSATION_MOTIF_FAMILIES
+        )
+    )
+
+
+def _conversation_motif_fence_row(
+    conn: sqlite3.Connection,
+    *,
+    guild_id: int,
+    subject_key: str,
+    predicate_key: str,
+) -> dict[str, str]:
+    row = conn.execute(
+        """
+        SELECT correction_entry_id,correction_observed_at,reason_code,
+               fence_state,satisfied_at
+        FROM memory_ledger_conversation_motif_fences
+        WHERE guild_id=? AND subject_key=? AND predicate_key=?
+        """,
+        (
+            int(guild_id or 0),
+            str(subject_key or ""),
+            str(predicate_key or ""),
+        ),
+    ).fetchone()
+    if not row:
+        return {}
+    return {
+        "correction_entry_id": str(row[0] or ""),
+        "correction_observed_at": str(row[1] or ""),
+        "reason_code": str(row[2] or ""),
+        "fence_state": str(row[3] or "active"),
+        "satisfied_at": str(row[4] or ""),
+    }
+
+
+def _conversation_motif_entries_after_fence(
+    conn: sqlite3.Connection,
+    *,
+    guild_id: int,
+    subject_key: str,
+    predicate_key: str,
+    entries: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], dict[str, str]]:
+    fence = _conversation_motif_fence_row(
+        conn,
+        guild_id=guild_id,
+        subject_key=subject_key,
+        predicate_key=predicate_key,
+    )
+    if not fence:
+        return entries, {}
+    cutoff = _parse_knowledge_time(fence.get("correction_observed_at"))
+    if cutoff is None:
+        return [], fence
+    post_correction: list[dict[str, Any]] = []
+    for entry in entries:
+        observed = _parse_knowledge_time(entry.get("observed_at"))
+        if observed is not None and observed > cutoff:
+            post_correction.append(entry)
+    return post_correction, fence
+
+
+def _withhold_conversation_motif_candidates(
+    conn: sqlite3.Connection,
+    *,
+    guild_id: int,
+    subject_key: str,
+    predicate_keys: tuple[str, ...],
+    correction_entry_id: str,
+    reason_code: str,
+) -> None:
+    if not predicate_keys:
+        return
+    placeholders = ",".join("?" for _predicate in predicate_keys)
+    candidate_ids = tuple(
+        str(row[0] or "")
+        for row in conn.execute(
+            f"""
+            SELECT candidate_id
+            FROM memory_ledger_knowledge_candidates
+            WHERE guild_id=? AND subject_key=?
+              AND candidate_type='topic_or_motif'
+              AND predicate_key IN ({placeholders})
+              AND retrieval_tags_json LIKE '%recurring_public_conversation%'
+            ORDER BY candidate_id
+            """,
+            (
+                int(guild_id or 0),
+                str(subject_key or ""),
+                *predicate_keys,
+            ),
+        ).fetchall()
+        if str(row[0] or "")
+    )
+    if not candidate_ids:
+        return
+    now = _now()
+    candidate_placeholders = ",".join(
+        "?" for _candidate_id in candidate_ids
+    )
+    conn.execute(
+        f"""
+        UPDATE memory_ledger_knowledge_candidates
+        SET candidate_state=CASE
+              WHEN candidate_state IN ('superseded','retired','invalidated')
+                THEN candidate_state
+              ELSE 'contested'
+            END,
+            candidate_eligible=0,live_eligible=0,
+            invalidated_reason=CASE
+              WHEN candidate_state IN ('superseded','retired','invalidated')
+                THEN invalidated_reason
+              ELSE ?
+            END,
+            invalidated_at=CASE
+              WHEN candidate_state IN ('superseded','retired','invalidated')
+                THEN invalidated_at
+              ELSE ?
+            END,
+            lifecycle_reason=CASE
+              WHEN candidate_state IN ('superseded','retired','invalidated')
+                THEN lifecycle_reason
+              ELSE ?
+            END,
+            review_status='dirty',lifecycle_evaluated_at='',
+            updated_at=?
+        WHERE candidate_id IN ({candidate_placeholders})
+        """,
+        (
+            reason_code,
+            now,
+            reason_code,
+            now,
+            *candidate_ids,
+        ),
+    )
+    for candidate_id in candidate_ids:
+        _record_knowledge_receipt(
+            conn,
+            guild_id=int(guild_id or 0),
+            event_type="contested",
+            reason_code=reason_code,
+            candidate_id=candidate_id,
+            candidate_type="topic_or_motif",
+            root_entry_ids=(
+                (str(correction_entry_id),)
+                if str(correction_entry_id or "")
+                else ()
+            ),
+        )
+
+
+def _upsert_conversation_motif_correction_fences(
+    conn: sqlite3.Connection,
+    *,
+    correction_entry: dict[str, Any],
+    related_entry_ids: tuple[str, ...],
+    reason_code: str,
+) -> tuple[str, ...]:
+    related = _knowledge_entry_rows(
+        conn,
+        tuple(
+            sorted(
+                {
+                    str(entry_id or "")
+                    for entry_id in related_entry_ids
+                    if str(entry_id or "")
+                }
+            )
+        ),
+    )
+    values = [
+        str(correction_entry.get("normalized_value") or ""),
+        *(
+            str(entry.get("normalized_value") or "")
+            for entry in related.values()
+        ),
+    ]
+    predicate_keys = _conversation_motif_predicates_for_values(values)
+    observed = _parse_knowledge_time(correction_entry.get("observed_at"))
+    observed_at = _knowledge_time(observed) if observed is not None else ""
+    guild_id = int(correction_entry.get("guild_id") or 0)
+    subject_key = str(correction_entry.get("subject_key") or "")
+    correction_entry_id = str(correction_entry.get("entry_id") or "")
+    now = _now()
+    active_predicate_keys: list[str] = []
+    for predicate_key in predicate_keys:
+        existing = _conversation_motif_fence_row(
+            conn,
+            guild_id=guild_id,
+            subject_key=subject_key,
+            predicate_key=predicate_key,
+        )
+        existing_time = _parse_knowledge_time(
+            existing.get("correction_observed_at")
+        )
+        if (
+            existing
+            and existing_time is not None
+            and observed is not None
+            and existing_time > observed
+        ):
+            continue
+        if (
+            existing
+            and str(existing.get("correction_entry_id") or "")
+            == correction_entry_id
+            and str(existing.get("fence_state") or "active")
+            == "satisfied"
+        ):
+            continue
+        conn.execute(
+            """
+            INSERT INTO memory_ledger_conversation_motif_fences(
+              guild_id,subject_key,predicate_key,correction_entry_id,
+              correction_observed_at,reason_code,fence_state,satisfied_at,
+              created_at,updated_at
+            ) VALUES(?,?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(guild_id,subject_key,predicate_key) DO UPDATE SET
+              correction_entry_id=excluded.correction_entry_id,
+              correction_observed_at=excluded.correction_observed_at,
+              reason_code=excluded.reason_code,
+              fence_state='active',
+              satisfied_at='',
+              updated_at=excluded.updated_at
+            """,
+            (
+                guild_id,
+                subject_key,
+                predicate_key,
+                correction_entry_id,
+                observed_at,
+                reason_code,
+                "active",
+                "",
+                now,
+                now,
+            ),
+        )
+        active_predicate_keys.append(predicate_key)
+    _withhold_conversation_motif_candidates(
+        conn,
+        guild_id=guild_id,
+        subject_key=subject_key,
+        predicate_keys=tuple(active_predicate_keys),
+        correction_entry_id=correction_entry_id,
+        reason_code=reason_code,
+    )
+    return tuple(active_predicate_keys)
+
+
+def _finalize_conversation_motif_refresh(
+    conn: sqlite3.Connection,
+    *,
+    guild_id: int,
+    subject_key: str,
+    predicate_key: str,
+    result: AtomicKnowledgeResult,
+    root_entry_ids: tuple[str, ...],
+    correction_fence: dict[str, str],
+) -> bool:
+    candidate_id = str(result.candidate_id or "")
+    if (
+        not candidate_id
+        or result.outcome not in {"created", "matched_existing"}
+    ):
+        return False
+    state = conn.execute(
+        """
+        SELECT candidate_state,invalidated_reason
+        FROM memory_ledger_knowledge_candidates
+        WHERE candidate_id=?
+        """,
+        (candidate_id,),
+    ).fetchone()
+    if not state:
+        return False
+    active_correction_fence = bool(
+        correction_fence
+        and str(correction_fence.get("fence_state") or "active")
+        == "active"
+    )
+    refreshable = str(state[0] or "") in {
+        "candidate",
+        "provisional",
+        "established",
+    } or (
+        str(state[0] or "") == "contested"
+        and str(state[1] or "")
+        == "conversation_motif_correction_fence"
+    )
+    if not refreshable:
+        return False
+    sibling_rows = tuple(
+        (
+            str(row[0] or ""),
+            str(row[1] or ""),
+        )
+        for row in conn.execute(
+            """
+            SELECT candidate_id,candidate_state
+            FROM memory_ledger_knowledge_candidates
+            WHERE guild_id=? AND subject_key=?
+              AND candidate_type='topic_or_motif'
+              AND predicate_key=? AND candidate_id<>?
+              AND retrieval_tags_json LIKE '%recurring_public_conversation%'
+            ORDER BY candidate_id
+            """,
+            (
+                int(guild_id or 0),
+                str(subject_key or ""),
+                str(predicate_key or ""),
+                candidate_id,
+            ),
+        ).fetchall()
+        if str(row[0] or "")
+    )
+    superseded_sibling_ids = tuple(
+        sibling_id
+        for sibling_id, sibling_state in sibling_rows
+        if sibling_state not in KNOWLEDGE_TERMINAL_CANDIDATE_STATES
+    )
+    if superseded_sibling_ids:
+        placeholders = ",".join(
+            "?" for _candidate_id in superseded_sibling_ids
+        )
+        now = _now()
+        conn.execute(
+            f"""
+            UPDATE memory_ledger_knowledge_candidates
+            SET candidate_state='superseded',candidate_eligible=0,
+                live_eligible=0,
+                invalidated_reason='conversation_motif_canonical_refresh',
+                invalidated_at=?,lifecycle_reason=
+                  'conversation_motif_canonical_refresh',
+                review_status='dirty',lifecycle_evaluated_at='',updated_at=?
+            WHERE candidate_id IN ({placeholders})
+            """,
+            (now, now, *superseded_sibling_ids),
+        )
+        for sibling_id in superseded_sibling_ids:
+            _record_knowledge_receipt(
+                conn,
+                guild_id=int(guild_id or 0),
+                event_type="superseded",
+                reason_code="conversation_motif_canonical_refresh",
+                candidate_id=sibling_id,
+                candidate_type="topic_or_motif",
+                root_entry_ids=root_entry_ids,
+            )
+    if active_correction_fence:
+        satisfied_at = _now()
+        conn.execute(
+            """
+            UPDATE memory_ledger_conversation_motif_fences
+            SET fence_state='satisfied',satisfied_at=?,updated_at=?
+            WHERE guild_id=? AND subject_key=? AND predicate_key=?
+              AND correction_entry_id=?
+            """,
+            (
+                satisfied_at,
+                satisfied_at,
+                int(guild_id or 0),
+                str(subject_key or ""),
+                str(predicate_key or ""),
+                str(correction_fence.get("correction_entry_id") or ""),
+            ),
+        )
+    reconcile_atomic_knowledge_lifecycle(
+        conn,
+        candidate_ids=(candidate_id,),
+    )
+    if (
+        superseded_sibling_ids
+        or active_correction_fence
+        or result.reason_code == "conversation_motif_roots_refreshed"
+    ):
+        _record_knowledge_receipt(
+            conn,
+            guild_id=int(guild_id or 0),
+            event_type="refreshed",
+            reason_code=(
+                "conversation_motif_post_correction_reestablished"
+                if active_correction_fence
+                else "conversation_motif_bounded_refresh"
+            ),
+            candidate_id=candidate_id,
+            candidate_type="topic_or_motif",
+            root_entry_ids=root_entry_ids,
+        )
+    return True
+
+
+def _conversation_motif_roots_by_occurrence(
+    entries: list[dict[str, Any]],
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Retain bounded human roots while counting each occurrence only once."""
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for entry in sorted(
+        entries,
+        key=lambda item: (
+            str(item.get("observed_at") or ""),
+            str(item.get("entry_id") or ""),
+        ),
+        reverse=True,
+    ):
+        occurrence = str(entry.get("occurrence_identity") or "")
+        if occurrence:
+            grouped.setdefault(occurrence, []).append(entry)
+
+    def latest_timestamp(occurrence_entries: list[dict[str, Any]]) -> float:
+        timestamps = []
+        for entry in occurrence_entries:
+            observed = _parse_knowledge_time(
+                str(entry.get("observed_at") or "")
+            )
+            if observed is not None:
+                timestamps.append(observed.timestamp())
+        return max(timestamps, default=0.0)
+
+    ordered_groups = tuple(
+        sorted(
+            grouped.items(),
+            key=lambda pair: (
+                -latest_timestamp(pair[1]),
+                pair[0],
+            ),
+        )
+    )
+    selected: list[str] = []
+    selected_occurrences: list[str] = []
+    # Reserve one exact root for each newest occurrence first, so the bounded
+    # root cap cannot accidentally erase the recurrence that justified the
+    # proposal.
+    for occurrence, occurrence_entries in ordered_groups:
+        root_id = str(occurrence_entries[0].get("entry_id") or "")
+        if not root_id:
+            continue
+        selected.append(root_id)
+        selected_occurrences.append(occurrence)
+        if len(selected) >= _CONVERSATION_MOTIF_MAX_ROOTS:
+            break
+    if len(selected) < _CONVERSATION_MOTIF_MAX_ROOTS:
+        selected_set = set(selected)
+        for _occurrence, occurrence_entries in ordered_groups:
+            for entry in occurrence_entries:
+                root_id = str(entry.get("entry_id") or "")
+                if not root_id or root_id in selected_set:
+                    continue
+                selected.append(root_id)
+                selected_set.add(root_id)
+                if len(selected) >= _CONVERSATION_MOTIF_MAX_ROOTS:
+                    break
+            if len(selected) >= _CONVERSATION_MOTIF_MAX_ROOTS:
+                break
+    return tuple(sorted(selected)), tuple(sorted(selected_occurrences))
+
+
+def _sync_bounded_conversation_motif_corrections(
+    conn: sqlite3.Connection,
+    *,
+    guild_id: int,
+    subject_key: str,
+    max_scan: int,
+) -> None:
+    """Discover recent raw corrections missed while formation was disabled."""
+    rows = conn.execute(
+        """
+        SELECT entry_id,normalized_value
+        FROM memory_ledger_entries
+        WHERE guild_id=? AND subject_key=?
+          AND entry_type='observation' AND predicate_key='conversation'
+          AND source_table='conversations' AND source_role='user'
+          AND source_class='public_observation'
+          AND channel_policy IN ('public_home','public_context')
+          AND visibility IN ('public','public_safe')
+          AND public_usable=1 AND derived=0 AND projection=0
+          AND lifecycle_status='active'
+        ORDER BY source_sequence DESC,entry_id DESC
+        LIMIT ?
+        """,
+        (
+            int(guild_id or 0),
+            str(subject_key or ""),
+            max(
+                1,
+                min(
+                    int(max_scan or _CONVERSATION_MOTIF_MAX_SCAN),
+                    _CONVERSATION_MOTIF_MAX_SCAN,
+                ),
+            ),
+        ),
+    ).fetchall()
+    corrections = [
+        (str(row[0] or ""), str(row[1] or ""))
+        for row in rows
+        if str(row[0] or "")
+        and _CONVERSATION_CORRECTION_RE.search(str(row[1] or ""))
+    ][:_CONVERSATION_CORRECTION_MAX_SCAN]
+    # Apply oldest first so a newer correction deterministically owns a
+    # family fence.  The total work remains bounded by the scans above and in
+    # the conservative raw resolver.
+    for correction_entry_id, correction_value in reversed(corrections):
+        correction_entry = _knowledge_entry_rows(
+            conn,
+            (correction_entry_id,),
+        ).get(correction_entry_id)
+        if not correction_entry:
+            continue
+        lineage_targets = tuple(
+            sorted(
+                {
+                    str(row[0] or "")
+                    for row in conn.execute(
+                        """
+                        SELECT target_entry_id
+                        FROM memory_ledger_lineage
+                        WHERE entry_id=?
+                          AND lineage_type IN ('correction_of','supersedes')
+                        ORDER BY target_entry_id
+                        """,
+                        (correction_entry_id,),
+                    ).fetchall()
+                    if str(row[0] or "")
+                }
+            )
+        )
+        correction_target = (
+            lineage_targets[0] if len(lineage_targets) == 1 else ""
+        )
+        ambiguous_targets = (
+            lineage_targets if len(lineage_targets) > 1 else ()
+        )
+        if not correction_target and not ambiguous_targets:
+            correction_target, ambiguous_targets = (
+                _raw_conversation_correction_resolution(
+                    conn,
+                    guild_id=int(guild_id or 0),
+                    subject_key=str(subject_key or ""),
+                    correction_value=correction_value,
+                    channel_policy=str(
+                        correction_entry.get("channel_policy") or ""
+                    ),
+                    current_entry_id=correction_entry_id,
+                )
+            )
+        reason_code = (
+            "conversation_motif_correction"
+            if correction_target
+            else "conversation_motif_correction_ambiguous"
+            if ambiguous_targets
+            else "conversation_motif_correction_unresolved"
+        )
+        _upsert_conversation_motif_correction_fences(
+            conn,
+            correction_entry=correction_entry,
+            related_entry_ids=tuple(
+                sorted(
+                    {
+                        str(entry_id or "")
+                        for entry_id in (
+                            correction_target,
+                            *ambiguous_targets,
+                        )
+                        if str(entry_id or "")
+                    }
+                )
+            ),
+            reason_code=reason_code,
+        )
+
+
+def _conversation_motif_history(
+    conn: sqlite3.Connection,
+    *,
+    guild_id: int,
+    subject_key: str,
+    max_scan: int,
+) -> list[dict[str, Any]]:
+    rows = conn.execute(
+        """
+        SELECT entry_id,subject_display_name,normalized_value,observed_at,
+               channel_id,channel_policy,source_table,source_row_id,
+               source_role,source_class,visibility,public_usable,
+               derived,projection,lifecycle_status
+        FROM memory_ledger_entries e
+        WHERE guild_id=? AND subject_key=?
+          AND entry_type='observation' AND predicate_key='conversation'
+          AND source_table='conversations' AND source_role='user'
+          AND source_class='public_observation'
+          AND channel_policy IN ('public_home','public_context')
+          AND visibility IN ('public','public_safe')
+          AND public_usable=1 AND derived=0 AND projection=0
+          AND lifecycle_status='active'
+          AND NOT EXISTS (
+            SELECT 1 FROM memory_ledger_lineage l
+            WHERE l.guild_id=e.guild_id AND l.target_entry_id=e.entry_id
+              AND l.lineage_type IN (
+                'correction_of','supersedes','retracts'
+              )
+          )
+        ORDER BY observed_at DESC,source_sequence DESC,entry_id DESC
+        LIMIT ?
+        """,
+        (
+            int(guild_id or 0),
+            str(subject_key or ""),
+            max(
+                1,
+                min(
+                    int(max_scan or _CONVERSATION_MOTIF_MAX_SCAN),
+                    _CONVERSATION_MOTIF_MAX_SCAN,
+                ),
+            ),
+        ),
+    ).fetchall()
+    keys = (
+        "entry_id",
+        "subject_display_name",
+        "normalized_value",
+        "observed_at",
+        "channel_id",
+        "channel_policy",
+        "source_table",
+        "source_row_id",
+        "source_role",
+        "source_class",
+        "visibility",
+        "public_usable",
+        "derived",
+        "projection",
+        "lifecycle_status",
+    )
+    history: list[dict[str, Any]] = []
+    for row in rows:
+        entry = dict(zip(keys, row))
+        terms = _conversation_motif_terms(
+            str(entry.get("normalized_value") or "")
+        )
+        if not terms:
+            continue
+        full_entry = _knowledge_entry_rows(
+            conn,
+            (str(entry.get("entry_id") or ""),),
+        ).get(str(entry.get("entry_id") or ""))
+        if not full_entry:
+            continue
+        entry["terms"] = terms
+        entry["occurrence_identity"] = _knowledge_occurrence_identity(
+            conn,
+            full_entry,
+        )
+        if not entry["occurrence_identity"]:
+            continue
+        history.append(entry)
+    return history
+
+
+def form_atomic_candidates_from_recurring_conversation(
+    conn: sqlite3.Connection,
+    *,
+    guild_id: int = 0,
+    subject_key: str = "",
+    trigger_entry_id: str = "",
+    max_scan: int = _CONVERSATION_MOTIF_MAX_SCAN,
+    environ: dict[str, str] | None = None,
+) -> list[AtomicKnowledgeResult]:
+    """Form conservative motifs from repeated production-shaped public chat.
+
+    This is a bounded, subject-scoped bridge into the existing atomic
+    lifecycle. It never turns one exchange into recurrence and never promotes
+    raw text into scalar identity or role facts.
+    """
+    if not conversation_motif_formation_enabled(environ):
+        return []
+    ensure_memory_ledger_schema(conn)
+    trigger_id = str(trigger_entry_id or "").strip()
+    if trigger_id:
+        trigger = _knowledge_entry_rows(conn, (trigger_id,)).get(trigger_id)
+        if not trigger:
+            return []
+        guild_id = int(trigger.get("guild_id") or 0)
+        subject_key = str(trigger.get("subject_key") or "")
+        if (
+            str(trigger.get("source_table") or "") != "conversations"
+            or str(trigger.get("source_role") or "").lower() != "user"
+            or str(trigger.get("entry_type") or "") != "observation"
+            or str(trigger.get("predicate_key") or "") != "conversation"
+        ):
+            return []
+    if (
+        not int(guild_id or 0)
+        or not str(subject_key or "").startswith("discord_user:")
+    ):
+        return []
+
+    _sync_bounded_conversation_motif_corrections(
+        conn,
+        guild_id=int(guild_id or 0),
+        subject_key=str(subject_key),
+        max_scan=max_scan,
+    )
+    history = _conversation_motif_history(
+        conn,
+        guild_id=int(guild_id or 0),
+        subject_key=str(subject_key),
+        max_scan=max_scan,
+    )
+    if not history:
+        _record_knowledge_receipt(
+            conn,
+            guild_id=int(guild_id or 0),
+            event_type="formation_skipped",
+            reason_code="conversation_motif_no_eligible_history",
+            candidate_type="topic_or_motif",
+        )
+        return []
+
+    grouped: dict[str, dict[str, Any]] = {}
+    for entry in history:
+        matches = _conversation_motif_family_matches(
+            tuple(entry.get("terms") or ())
+        )
+        for family, label in matches:
+            group = grouped.setdefault(
+                "family:%s" % family,
+                {
+                    "predicate": "conversation_motif_%s" % family,
+                    "label": label,
+                    "entries": [],
+                    "tags": (family, "recurring_public_conversation"),
+                },
+            )
+            group["entries"].append(entry)
+
+    results: list[AtomicKnowledgeResult] = []
+    ranked_groups: list[tuple[int, float, str, dict[str, Any]]] = []
+    for group_key, group in grouped.items():
+        filtered_entries, correction_fence = (
+            _conversation_motif_entries_after_fence(
+                conn,
+                guild_id=int(guild_id or 0),
+                subject_key=str(subject_key),
+                predicate_key=str(group["predicate"]),
+                entries=list(group["entries"]),
+            )
+        )
+        group["entries"] = filtered_entries
+        group["correction_fence"] = correction_fence
+        _root_ids, occurrence_ids = _conversation_motif_roots_by_occurrence(
+            list(group["entries"])
+        )
+        last_seen = max(
+            (
+                str(entry.get("observed_at") or "")
+                for entry in group["entries"]
+            ),
+            default="",
+        )
+        last_seen_time = _parse_knowledge_time(last_seen)
+        ranked_groups.append(
+            (
+                -len(occurrence_ids),
+                -(last_seen_time.timestamp() if last_seen_time else 0.0),
+                group_key,
+                group,
+            )
+        )
+    for _count, _last_seen, _group_key, group in sorted(
+        ranked_groups,
+        key=lambda row: (row[0], row[1], row[2]),
+    ):
+        root_ids, occurrence_ids = _conversation_motif_roots_by_occurrence(
+            list(group["entries"])
+        )
+        if len(occurrence_ids) < 2 or len(root_ids) < 2:
+            continue
+        display_name = next(
+            (
+                str(entry.get("subject_display_name") or "")
+                for entry in group["entries"]
+                if str(entry.get("subject_display_name") or "")
+            ),
+            "",
+        )
+        result = form_atomic_knowledge_candidate(
+            conn,
+            AtomicKnowledgeProposal(
+                candidate_type="topic_or_motif",
+                subject_key=str(subject_key),
+                subject_display_name=display_name,
+                predicate_key=str(group["predicate"]),
+                meaning=(
+                    "Recurring public conversation about %s."
+                    % str(group["label"]).strip()
+                ),
+                root_entry_ids=root_ids,
+                participant_keys=(str(subject_key),),
+                epistemic_status="observed",
+                uncertainty_note=(
+                    "Repeated public conversation observation; not a scalar "
+                    "identity fact or exact quote."
+                ),
+                currentness="historical",
+                contradiction_key=(
+                    "%s:%s" % (str(subject_key), str(group["predicate"]))
+                ),
+                retrieval_tags=tuple(group["tags"]),
+            ),
+        )
+        _finalize_conversation_motif_refresh(
+            conn,
+            guild_id=int(guild_id or 0),
+            subject_key=str(subject_key),
+            predicate_key=str(group["predicate"]),
+            result=result,
+            root_entry_ids=root_ids,
+            correction_fence=dict(group.get("correction_fence") or {}),
+        )
+        results.append(result)
+        if len(results) >= _CONVERSATION_MOTIF_MAX_CANDIDATES:
+            break
+    if not results:
+        _record_knowledge_receipt(
+            conn,
+            guild_id=int(guild_id or 0),
+            event_type="formation_skipped",
+            reason_code="conversation_motif_recurrence_not_met",
+            candidate_type="topic_or_motif",
+            root_entry_ids=tuple(
+                str(entry.get("entry_id") or "")
+                for entry in history[:16]
+                if str(entry.get("entry_id") or "")
+            ),
+        )
+    return results
 
 
 def form_atomic_candidates_from_moment(
@@ -3621,6 +5430,91 @@ def sweep_atomic_knowledge_lifecycle(
     }
 
 
+def _purge_atomic_candidate_boundaries_for_subject(
+    conn: sqlite3.Connection,
+    candidate_ids: Iterable[str],
+) -> dict[str, int]:
+    """Delete audit boundaries only for an explicit complete-subject purge."""
+    clean_ids = tuple(
+        sorted(
+            {
+                str(candidate_id or "")
+                for candidate_id in candidate_ids
+                if str(candidate_id or "")
+            }
+        )
+    )
+    counts = {
+        "memory_ledger_knowledge_candidates": 0,
+        "memory_ledger_knowledge_roots": 0,
+        "memory_ledger_knowledge_participants": 0,
+        "memory_ledger_knowledge_receipts": 0,
+        "memory_ledger_knowledge_lifecycle_events": 0,
+        "memory_ledger_knowledge_lifecycle_roots": 0,
+    }
+    if not clean_ids:
+        return counts
+    placeholders = ",".join("?" for _candidate_id in clean_ids)
+    lifecycle_event_ids = tuple(
+        str(row[0])
+        for row in conn.execute(
+            """
+            SELECT event_id
+            FROM memory_ledger_knowledge_lifecycle_events
+            WHERE candidate_id IN (%s)
+            """ % placeholders,
+            clean_ids,
+        ).fetchall()
+    )
+    if lifecycle_event_ids:
+        event_placeholders = ",".join(
+            "?" for _event_id in lifecycle_event_ids
+        )
+        counts["memory_ledger_knowledge_lifecycle_roots"] = conn.execute(
+            """
+            DELETE FROM memory_ledger_knowledge_lifecycle_roots
+            WHERE event_id IN (%s)
+            """ % event_placeholders,
+            lifecycle_event_ids,
+        ).rowcount
+    counts["memory_ledger_knowledge_lifecycle_events"] = conn.execute(
+        """
+        DELETE FROM memory_ledger_knowledge_lifecycle_events
+        WHERE candidate_id IN (%s)
+        """ % placeholders,
+        clean_ids,
+    ).rowcount
+    counts["memory_ledger_knowledge_receipts"] = conn.execute(
+        """
+        DELETE FROM memory_ledger_knowledge_receipts
+        WHERE candidate_id IN (%s)
+        """ % placeholders,
+        clean_ids,
+    ).rowcount
+    counts["memory_ledger_knowledge_participants"] = conn.execute(
+        """
+        DELETE FROM memory_ledger_knowledge_participants
+        WHERE candidate_id IN (%s)
+        """ % placeholders,
+        clean_ids,
+    ).rowcount
+    counts["memory_ledger_knowledge_roots"] = conn.execute(
+        """
+        DELETE FROM memory_ledger_knowledge_roots
+        WHERE candidate_id IN (%s)
+        """ % placeholders,
+        clean_ids,
+    ).rowcount
+    counts["memory_ledger_knowledge_candidates"] = conn.execute(
+        """
+        DELETE FROM memory_ledger_knowledge_candidates
+        WHERE candidate_id IN (%s)
+        """ % placeholders,
+        clean_ids,
+    ).rowcount
+    return counts
+
+
 def purge_atomic_knowledge_for_subject(
     conn: sqlite3.Connection,
     *,
@@ -3644,74 +5538,16 @@ def purge_atomic_knowledge_for_subject(
             (guild_id, subject_key, guild_id, subject_key),
         ).fetchall()
     }
-    counts = {
-        "memory_ledger_knowledge_candidates": 0,
-        "memory_ledger_knowledge_roots": 0,
-        "memory_ledger_knowledge_participants": 0,
-        "memory_ledger_knowledge_receipts": 0,
-        "memory_ledger_knowledge_lifecycle_events": 0,
-        "memory_ledger_knowledge_lifecycle_roots": 0,
-    }
-    if not candidate_ids:
-        return counts
-    placeholders = ",".join("?" for _candidate_id in candidate_ids)
-    params = tuple(sorted(candidate_ids))
-    lifecycle_event_ids = tuple(
-        str(row[0])
-        for row in conn.execute(
-            """
-            SELECT event_id
-            FROM memory_ledger_knowledge_lifecycle_events
-            WHERE candidate_id IN (%s)
-            """ % placeholders,
-            params,
-        ).fetchall()
+    counts = _purge_atomic_candidate_boundaries_for_subject(
+        conn,
+        candidate_ids,
     )
-    if lifecycle_event_ids:
-        event_placeholders = ",".join(
-            "?" for _event_id in lifecycle_event_ids
-        )
-        counts["memory_ledger_knowledge_lifecycle_roots"] = conn.execute(
-            """
-            DELETE FROM memory_ledger_knowledge_lifecycle_roots
-            WHERE event_id IN (%s)
-            """ % event_placeholders,
-            lifecycle_event_ids,
-        ).rowcount
-    counts["memory_ledger_knowledge_lifecycle_events"] = conn.execute(
+    counts["memory_ledger_conversation_motif_fences"] = conn.execute(
         """
-        DELETE FROM memory_ledger_knowledge_lifecycle_events
-        WHERE candidate_id IN (%s)
-        """ % placeholders,
-        params,
-    ).rowcount
-    counts["memory_ledger_knowledge_receipts"] = conn.execute(
-        """
-        DELETE FROM memory_ledger_knowledge_receipts
-        WHERE candidate_id IN (%s)
-        """ % placeholders,
-        params,
-    ).rowcount
-    counts["memory_ledger_knowledge_participants"] = conn.execute(
-        """
-        DELETE FROM memory_ledger_knowledge_participants
-        WHERE candidate_id IN (%s)
-        """ % placeholders,
-        params,
-    ).rowcount
-    counts["memory_ledger_knowledge_roots"] = conn.execute(
-        """
-        DELETE FROM memory_ledger_knowledge_roots
-        WHERE candidate_id IN (%s)
-        """ % placeholders,
-        params,
-    ).rowcount
-    counts["memory_ledger_knowledge_candidates"] = conn.execute(
-        """
-        DELETE FROM memory_ledger_knowledge_candidates
-        WHERE candidate_id IN (%s)
-        """ % placeholders,
-        params,
+        DELETE FROM memory_ledger_conversation_motif_fences
+        WHERE guild_id=? AND subject_key=?
+        """,
+        (int(guild_id or 0), str(subject_key or "")),
     ).rowcount
     return counts
 
@@ -3816,6 +5652,93 @@ def _finalized_conversation_correction_resolution(
     return "", tuple(sorted(strongest))
 
 
+def _raw_conversation_correction_resolution(
+    conn: sqlite3.Connection,
+    *,
+    guild_id: int,
+    subject_key: str,
+    correction_value: str,
+    channel_policy: str,
+    current_entry_id: str,
+) -> tuple[str, tuple[str, ...]]:
+    """Resolve one bounded raw source only when the evidence is unambiguous."""
+    if (
+        not _CONVERSATION_CORRECTION_RE.search(correction_value or "")
+        or _canon(channel_policy) not in {"public_home", "public_context"}
+    ):
+        return "", ()
+    correction_tokens = _conversation_correction_topic_tokens(
+        correction_value
+    )
+    current = _knowledge_entry_rows(
+        conn,
+        (str(current_entry_id or ""),),
+    ).get(str(current_entry_id or ""))
+    if not correction_tokens or not current:
+        return "", ()
+    current_sequence = int(current.get("source_sequence") or 0)
+    if current_sequence <= 0:
+        return "", ()
+    rows = conn.execute(
+        """
+        SELECT e.entry_id,e.normalized_value
+        FROM memory_ledger_entries e
+        WHERE e.guild_id=? AND e.subject_key=?
+          AND e.entry_id<>?
+          AND e.source_table='conversations' AND e.source_role='user'
+          AND e.entry_type='observation' AND e.predicate_key='conversation'
+          AND e.lifecycle_status='active' AND e.public_usable=1
+          AND e.derived=0 AND e.projection=0
+          AND e.channel_id=? AND e.channel_policy=?
+          AND e.visibility IN ('public','public_safe')
+          AND e.source_sequence<?
+          AND NOT EXISTS (
+            SELECT 1 FROM memory_ledger_lineage l
+            WHERE l.guild_id=e.guild_id
+              AND l.target_entry_id=e.entry_id
+              AND l.lineage_type IN (
+                'correction_of','supersedes','retracts'
+              )
+          )
+        ORDER BY e.source_sequence DESC,e.entry_id DESC
+        LIMIT ?
+        """,
+        (
+            int(guild_id or 0),
+            str(subject_key or ""),
+            str(current_entry_id or ""),
+            int(current.get("channel_id") or 0),
+            _canon(channel_policy),
+            current_sequence,
+            _CONVERSATION_CORRECTION_MAX_SCAN,
+        ),
+    ).fetchall()
+    ranked: list[tuple[int, str]] = []
+    for entry_id, value in rows:
+        value = str(value or "")
+        if _CONVERSATION_CORRECTION_RE.search(value):
+            continue
+        overlap = len(
+            correction_tokens
+            & _conversation_correction_topic_tokens(value)
+        )
+        if overlap > 0:
+            ranked.append((overlap, str(entry_id or "")))
+    if not ranked:
+        return "", ()
+    highest = max(score for score, _entry_id in ranked)
+    if highest < 2:
+        return "", ()
+    strongest = {
+        entry_id
+        for score, entry_id in ranked
+        if score == highest and entry_id
+    }
+    if len(strongest) == 1:
+        return next(iter(strongest)), ()
+    return "", tuple(sorted(strongest))
+
+
 def _public_ok(subject_key: str, predicate: str, value: str, source_class: SourceClass, visibility: Visibility, confidence: Confidence, *, valid: bool = True, projection: bool = False) -> bool:
     claim = SourceClaim(stable_entry_id(guild_id=0, source_table="eval", source_row_id=0, entry_type="claim", subject_key=subject_key, predicate_key=predicate), SubjectIdentity(subject_key, subject_key), predicate, value, source_class, visibility, confidence, valid=valid, projection=projection)
     return is_public_usable(claim)
@@ -3863,6 +5786,7 @@ def shadow_conversation_row(
     route_mode: str = "unknown",
     observed_at: str = "",
     conversation_target_user_ids: tuple[int, ...] = (),
+    environ: dict[str, str] | None = None,
 ) -> LedgerWriteResult:
     role_norm = (role or "").lower()
     visibility = _visibility(channel_policy)
@@ -3948,6 +5872,22 @@ def shadow_conversation_row(
             channel_policy=channel_policy,
             current_entry_id=result.entry_id,
         )
+        if (
+            not correction_target
+            and not ambiguous_correction_targets
+            and conversation_motif_formation_enabled(environ)
+        ):
+            (
+                correction_target,
+                ambiguous_correction_targets,
+            ) = _raw_conversation_correction_resolution(
+                conn,
+                guild_id=guild_id,
+                subject_key=subject_key,
+                correction_value=value,
+                channel_policy=channel_policy,
+                current_entry_id=result.entry_id,
+            )
         if correction_target:
             now = _now()
             for lineage_type in ("correction_of", "supersedes"):
@@ -3965,7 +5905,15 @@ def shadow_conversation_row(
                         now,
                     ),
                 )
-        elif ambiguous_correction_targets:
+        elif (
+            ambiguous_correction_targets
+            and conn.execute(
+                """
+                SELECT 1 FROM sqlite_master
+                WHERE type='table' AND name='memory_moment_windows'
+                """
+            ).fetchone()
+        ):
             placeholders = ",".join(
                 "?" for _target in ambiguous_correction_targets
             )
@@ -3985,6 +5933,39 @@ def shadow_conversation_row(
                     *ambiguous_correction_targets,
                 ),
             )
+        if (
+            _CONVERSATION_CORRECTION_RE.search(value)
+            and conversation_motif_formation_enabled(environ)
+        ):
+            correction_entry = _knowledge_entry_rows(
+                conn,
+                (result.entry_id,),
+            ).get(result.entry_id)
+            if correction_entry:
+                reason_code = (
+                    "conversation_motif_correction"
+                    if correction_target
+                    else "conversation_motif_correction_ambiguous"
+                    if ambiguous_correction_targets
+                    else "conversation_motif_correction_unresolved"
+                )
+                _upsert_conversation_motif_correction_fences(
+                    conn,
+                    correction_entry=correction_entry,
+                    related_entry_ids=tuple(
+                        sorted(
+                            {
+                                str(entry_id or "")
+                                for entry_id in (
+                                    correction_target,
+                                    *ambiguous_correction_targets,
+                                )
+                                if str(entry_id or "")
+                            }
+                        )
+                    ),
+                    reason_code=reason_code,
+                )
     return result
 
 
