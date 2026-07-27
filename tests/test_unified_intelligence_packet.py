@@ -16,6 +16,7 @@ from bnl_shared_brain_synthesis import render_packet_context
 from bnl_unified_intelligence_packet import (
     IntelligencePacketRequest,
     PacketConversationEvidence,
+    _safe_atomic_supporting_observation,
     build_evaluation_report,
     build_packet,
     revalidate_packet,
@@ -555,6 +556,24 @@ class UnifiedIntelligencePacketTests(unittest.TestCase):
             },
             {"atomic_knowledge"},
         )
+        atomic_items = tuple(
+            item
+            for item in packet.items
+            if item.lane == "atomic_knowledge"
+        )
+        self.assertTrue(atomic_items)
+        self.assertTrue(
+            all(item.supporting_observations for item in atomic_items)
+        )
+        rendered, _counts, _count, _digests = render_packet_context(
+            packet
+        )
+        self.assertIn("Source-linked public examples", rendered)
+        self.assertIn("website code still needs careful testing", rendered)
+        self.assertIn(
+            "character artwork needs another visual style",
+            rendered,
+        )
         self.assertGreaterEqual(
             packet.diagnostics.root_collapse_suppression,
             1,
@@ -566,6 +585,67 @@ class UnifiedIntelligencePacketTests(unittest.TestCase):
             ),
             1,
         )
+
+    def test_supporting_observations_are_public_member_roots_only(self):
+        base = {
+            "source_table": "conversations",
+            "source_role": "user",
+            "predicate_key": "conversation",
+            "channel_policy": "public_home",
+            "visibility": "public",
+            "public_usable": 1,
+            "derived": 0,
+            "projection": 0,
+            "lifecycle_status": "active",
+            "normalized_value": (
+                "I keep composing synth tracks for the weekly show."
+            ),
+        }
+        self.assertEqual(
+            _safe_atomic_supporting_observation(base),
+            base["normalized_value"],
+        )
+        blocked = (
+            {"source_role": "model"},
+            {"channel_policy": "sealed_test"},
+            {"visibility": "private"},
+            {"derived": 1},
+            {"projection": 1},
+            {"lifecycle_status": "retracted"},
+            {
+                "normalized_value": (
+                    "See https://example.com for my synth project."
+                )
+            },
+            {
+                "normalized_value": (
+                    "My home address is 100 Signal Road."
+                )
+            },
+            {
+                "normalized_value": (
+                    "Correction: that synth project was not mine."
+                )
+            },
+            {
+                "normalized_value": (
+                    "Pretend my character makes synth records."
+                )
+            },
+            {
+                "normalized_value": (
+                    "What do you remember about my synth tracks?"
+                )
+            },
+        )
+        for override in blocked:
+            with self.subTest(override=override):
+                self.assertEqual(
+                    _safe_atomic_supporting_observation(
+                        {**base, **override}
+                    ),
+                    "",
+                )
 
     def test_distinct_atomic_points_can_share_exact_human_roots(self):
         rows = (
@@ -1069,6 +1149,32 @@ class UnifiedIntelligencePacketTests(unittest.TestCase):
         self.assertFalse(revalidation.valid)
         self.assertEqual(revalidation.status, "source_changed")
         self.assertGreaterEqual(revalidation.changed_source_count, 1)
+
+    def test_supporting_root_text_change_breaks_revalidation(self):
+        roots, _candidate_id = self.add_established_atomic()
+        packet = build_packet(
+            self.conn,
+            self.public_request(text="What do you remember about me?"),
+            persist=False,
+            environ=self.flags,
+        )
+        self.conn.execute(
+            """
+            UPDATE memory_ledger_entries
+            SET normalized_value='A changed source observation.'
+            WHERE entry_id=?
+            """,
+            (roots[0],),
+        )
+
+        revalidation = revalidate_packet(
+            self.conn,
+            packet,
+            environ=self.flags,
+        )
+
+        self.assertFalse(revalidation.valid)
+        self.assertEqual(revalidation.status, "source_changed")
 
     def test_provisional_is_tentative_and_due_review_is_excluded(self):
         self.add_conversation_context_row()

@@ -129,6 +129,10 @@ class MemoryPreviewBotPathTests(unittest.IsolatedAsyncioTestCase):
             bnl01_bot.PREVIEW_FACTUAL_PLACEHOLDER,
             baseline_prompt,
         )
+        self.assertIn(
+            "do not infer that the member is new, quiet, inactive",
+            baseline_prompt,
+        )
         self.assertNotIn(
             bnl01_bot.PREVIEW_FACTUAL_PLACEHOLDER,
             candidate_prompt,
@@ -142,6 +146,74 @@ class MemoryPreviewBotPathTests(unittest.IsolatedAsyncioTestCase):
             "source_db_read_only=true",
             "\n".join(result.diagnostics),
         )
+
+    async def test_rich_preview_repairs_one_category_only_draft(self):
+        with sqlite3.connect(self.db_path) as conn:
+            self._add_message(
+                conn,
+                3,
+                "I keep composing synth songs and producing music tracks.",
+                "2026-07-25T21:00:00+00:00",
+            )
+            self._add_message(
+                conn,
+                4,
+                "The synth song mix needs another production pass.",
+                "2026-07-26T20:00:00+00:00",
+            )
+            conn.commit()
+        source_hash = self._source_hash()
+        calls = []
+
+        async def generator(prompt, route):
+            calls.append((route, prompt))
+            if route.endswith("baseline"):
+                return "I only have a narrow grounded view so far."
+            if route.endswith("candidate_repair"):
+                return (
+                    "You keep fixing the bot code and memory system, "
+                    "including careful website troubleshooting. You also "
+                    "compose synth songs and keep working their music mixes."
+                )
+            return (
+                "Software and technical systems recur alongside music "
+                "and audio production."
+            )
+
+        guard = mock.AsyncMock(
+            side_effect=lambda response, _prompt: (
+                response,
+                {"suppressed": False, "suppression_reason": ""},
+            )
+        )
+        result = await bnl01_bot.execute_bnl_memory_preview(
+            source_db_path=self.db_path,
+            guild_id=1,
+            subject_user_id=7,
+            subject_display_name="Crow",
+            simulated_channel_id=10,
+            wording="BNL-01, what am I all about?",
+            generator=generator,
+            guard=guard,
+        )
+
+        self.assertTrue(result.candidate_selected, result.fallback_reason)
+        self.assertIn("bot code", result.proposed_response)
+        self.assertIn("synth songs", result.proposed_response)
+        self.assertEqual(
+            [route for route, _prompt in calls],
+            [
+                "bnl_memory_preview_baseline",
+                "bnl_memory_preview_candidate",
+                "bnl_memory_preview_candidate_repair",
+            ],
+        )
+        self.assertIn(
+            "Grounded rewrite requirements",
+            calls[-1][1],
+        )
+        self.assertEqual(guard.await_count, 1)
+        self.assertEqual(source_hash, self._source_hash())
 
     async def test_preview_never_calls_conversation_or_model_savers(self):
         async def generator(_prompt, route):
