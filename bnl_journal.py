@@ -479,6 +479,7 @@ def purge_user_journal_derivatives_on_connection(
             for column in (
                 "run_id", "lifecycle_state", "journal_entry_id", "journal_revision",
                 "cadence", "source_window_start", "source_window_end", "frozen_packet_json",
+                "preparation_epoch",
             )
             if column in run_columns
         ]
@@ -785,6 +786,42 @@ def purge_user_journal_derivatives_on_connection(
                 counts["bnl_journal_automation_runs_invalidated"] = counts.get(
                     "bnl_journal_automation_runs_invalidated", 0
                 ) + changed
+                if changed and table_exists(
+                    conn,
+                    "bnl_journal_preparation_attempts",
+                ):
+                    conn.execute(
+                        "UPDATE bnl_journal_preparation_attempts "
+                        "SET finished_at=COALESCE(finished_at,?),"
+                        "result_status='interrupted',"
+                        "result_reason='privacy_source_deleted',updated_at=? "
+                        "WHERE run_id=? AND preparation_epoch=? "
+                        "AND finished_at IS NULL",
+                        (
+                            now,
+                            now,
+                            run_id,
+                            int(run.get("preparation_epoch") or 0),
+                        ),
+                    )
+                if changed and table_exists(
+                    conn,
+                    "bnl_journal_generation_attempts",
+                ):
+                    conn.execute(
+                        "UPDATE bnl_journal_generation_attempts "
+                        "SET finished_at=COALESCE(finished_at,?),"
+                        "outcome='interrupted',"
+                        "outcome_reason='privacy_source_deleted',updated_at=? "
+                        "WHERE run_id=? AND preparation_epoch=? "
+                        "AND finished_at IS NULL",
+                        (
+                            now,
+                            now,
+                            run_id,
+                            int(run.get("preparation_epoch") or 0),
+                        ),
+                    )
 
             # Keep the existing website-facing run telemetry truthful without
             # requiring any newly migrated automation-state columns.
@@ -3588,12 +3625,28 @@ def _generate_article_with_repairs(
     packet: dict[str, Any],
     generator: Callable[[dict[str, Any], str], str],
     prior_titles: list[str],
+    attempt_observer: Optional[Callable[[dict[str, Any]], None]] = None,
 ) -> tuple[Optional[dict[str, Any]], str, bool]:
     """Return the best blocking-clean article without letting polish cancel publication."""
+    def observe(event: dict[str, Any]) -> None:
+        if attempt_observer is None:
+            return
+        try:
+            attempt_observer(event)
+        except Exception:
+            # Diagnostics must never become a new publication dependency.
+            return
+
     last_reason = ""
     previous_output = ""
     retained_publishable: Optional[dict[str, Any]] = None
     for attempt in range(JOURNAL_GENERATION_ATTEMPTS):
+        attempt_number = attempt + 1
+        observe({
+            "generationAttempt": attempt_number,
+            "phase": "started",
+            "repairReason": last_reason,
+        })
         try:
             raw = generator(
                 packet,
@@ -3605,20 +3658,49 @@ def _generate_article_with_repairs(
             )
         except Exception as exc:
             if retained_publishable is not None:
+                observe({
+                    "generationAttempt": attempt_number,
+                    "phase": "finished",
+                    "outcome": "provider_failure",
+                    "reason": "provider_failure_after_publishable_advisory",
+                    "retainedPublishable": True,
+                })
                 return retained_publishable, "", True
             lowered = str(exc).lower()
-            if "quota" in lowered:
+            if "local_model_budget_exhausted" in lowered:
+                reason = "local_budget_unavailable"
+                outcome = "local_budget_refusal"
+            elif "quota" in lowered:
                 reason = "quota_unavailable"
+                outcome = "provider_quota_failure"
             elif "journal_preparation_timeout" in lowered:
                 reason = "journal_preparation_timeout"
+                outcome = "preparation_timeout"
             else:
                 reason = "provider_failure"
+                outcome = "provider_failure"
+            observe({
+                "generationAttempt": attempt_number,
+                "phase": "finished",
+                "outcome": outcome,
+                "reason": reason,
+            })
             return None, reason, False
         previous_output = raw
+        response_bytes = len(
+            str(raw).encode("utf-8", errors="replace")
+        )
         try:
             article = parse_generated_json(raw)
         except ValueError as exc:
             last_reason = str(exc)
+            observe({
+                "generationAttempt": attempt_number,
+                "phase": "finished",
+                "outcome": "parse_rejected",
+                "reason": last_reason,
+                "responseBytes": response_bytes,
+            })
             continue
 
         blocking_reason = validate_article(
@@ -3629,18 +3711,47 @@ def _generate_article_with_repairs(
         )
         if blocking_reason:
             last_reason = blocking_reason
+            observe({
+                "generationAttempt": attempt_number,
+                "phase": "finished",
+                "outcome": "validation_rejected",
+                "reason": last_reason,
+                "responseBytes": response_bytes,
+            })
             continue
 
         validation = validate_article(article, packet, prior_titles)
         if not validation:
+            observe({
+                "generationAttempt": attempt_number,
+                "phase": "finished",
+                "outcome": "accepted",
+                "reason": "",
+                "responseBytes": response_bytes,
+            })
             return article, "", False
         if validation not in ADVISORY_VALIDATION_REASONS:
             # Future validation reasons remain blocking unless explicitly
             # classified as editorial guidance above.
             last_reason = validation
+            observe({
+                "generationAttempt": attempt_number,
+                "phase": "finished",
+                "outcome": "validation_rejected",
+                "reason": last_reason,
+                "responseBytes": response_bytes,
+            })
             continue
         retained_publishable = article
         last_reason = validation
+        observe({
+            "generationAttempt": attempt_number,
+            "phase": "finished",
+            "outcome": "advisory_publishable",
+            "reason": last_reason,
+            "responseBytes": response_bytes,
+            "retainedPublishable": True,
+        })
 
     if retained_publishable is not None:
         return retained_publishable, "", True
@@ -3704,6 +3815,7 @@ def generate_and_store_packet_draft(
     revision: int = 1,
     attempt_fence: Optional[tuple[str, int]] = None,
     source_hash: str = "",
+    attempt_observer: Optional[Callable[[dict[str, Any]], None]] = None,
 ) -> JournalResult:
     if not packet.get("coverageComplete", True):
         return JournalResult(False, "no_draft", "incomplete_source_window", entry_id=entry_id)
@@ -3715,6 +3827,7 @@ def generate_and_store_packet_draft(
         packet,
         generator,
         prior_titles,
+        attempt_observer,
     )
     if article is None:
         return JournalResult(False, "no_draft", reason, entry_id=entry_id)
