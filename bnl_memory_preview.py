@@ -15,7 +15,7 @@ from pathlib import Path
 import re
 import sqlite3
 from collections import Counter
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 from urllib.parse import quote
 
 from bnl_conversation_context_v2 import (
@@ -92,7 +92,14 @@ class MemoryPreviewRequest:
     wording: str
     baseline_prompt: str
     factual_placeholder: str = PREVIEW_FACTUAL_PLACEHOLDER
+    competing_factual_contexts: tuple[str, ...] = ()
     now: str = ""
+
+
+BaselinePromptBuilder = Callable[
+    [sqlite3.Connection, MemoryPreviewRequest, Mapping[str, str]],
+    tuple[str, tuple[str, ...]],
+]
 
 
 @dataclass(frozen=True)
@@ -174,6 +181,12 @@ class MemoryPreviewEvaluation:
     candidate_member_occurrence_count: int = 0
     candidate_canon_count: int = 0
     candidate_lore_dominant: bool = False
+    candidate_member_supported_claim_count: int = 0
+    candidate_canon_supported_claim_count: int = 0
+    candidate_opinion_claim_count: int = 0
+    candidate_connective_claim_count: int = 0
+    candidate_unsupported_factual_claim_count: int = 0
+    candidate_claim_classifications: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -836,6 +849,7 @@ def _assessment_from_packet(
 def _snapshot_digest(
     packet: UnifiedIntelligencePacket | None,
     basis: SharedBrainSynthesisBasis | None,
+    request: MemoryPreviewRequest,
     conversation_context_digest: str = "",
 ) -> str:
     if packet is None:
@@ -854,6 +868,11 @@ def _snapshot_digest(
         profile.selected_point_count,
         profile.independent_root_count,
         profile.independent_occurrence_count,
+        _digest(str(request.baseline_prompt or "")),
+        tuple(
+            _digest(str(context or ""))
+            for context in request.competing_factual_contexts
+        ),
         str(conversation_context_digest or ""),
         tuple(
             sorted(
@@ -1008,6 +1027,7 @@ def prepare_memory_preview(
     request: MemoryPreviewRequest,
     *,
     environ: Mapping[str, str] | None = None,
+    baseline_prompt_builder: BaselinePromptBuilder | None = None,
 ) -> PreparedMemoryPreview:
     """Prepare one route-equivalent snapshot without touching the source DB."""
 
@@ -1045,11 +1065,6 @@ def prepare_memory_preview(
     conn: sqlite3.Connection | None = None
     try:
         conn = _open_read_only_memory_clone(request.source_db_path)
-        (
-            formation_outcomes,
-            formation_reasons,
-            lifecycle,
-        ) = _formation_and_lifecycle(conn, request, env)
         conversation_context = _preview_conversation_context(
             conn,
             request,
@@ -1058,6 +1073,28 @@ def prepare_memory_preview(
             request,
             conversation_context,
         )
+        if baseline_prompt_builder is not None:
+            baseline_prompt, factual_contexts = baseline_prompt_builder(
+                conn,
+                effective_request,
+                env,
+            )
+            if not str(baseline_prompt or "").strip():
+                raise ValueError("preview_baseline_prompt_unavailable")
+            effective_request = replace(
+                effective_request,
+                baseline_prompt=str(baseline_prompt),
+                competing_factual_contexts=tuple(
+                    str(context)
+                    for context in factual_contexts
+                    if str(context or "").strip()
+                ),
+            )
+        (
+            formation_outcomes,
+            formation_reasons,
+            lifecycle,
+        ) = _formation_and_lifecycle(conn, effective_request, env)
         packet = build_packet(
             conn,
             _packet_request(effective_request, conversation_context),
@@ -1097,9 +1134,12 @@ def prepare_memory_preview(
             packet=packet,
             assessment=assessment,
             competing_factual_contexts=(
-                (effective_request.factual_placeholder,)
-                if effective_request.factual_placeholder
-                else ()
+                effective_request.competing_factual_contexts
+                or (
+                    (effective_request.factual_placeholder,)
+                    if effective_request.factual_placeholder
+                    else ()
+                )
             ),
             environ=env,
         )
@@ -1140,6 +1180,7 @@ def prepare_memory_preview(
             snapshot_digest=_snapshot_digest(
                 packet,
                 basis,
+                effective_request,
                 conversation_context.digest,
             ),
             conversation_context_digest=conversation_context.digest,
@@ -1253,6 +1294,24 @@ def evaluate_memory_preview(
             decision.candidate_canon_coverage_count
         ),
         candidate_lore_dominant=decision.candidate_lore_dominant,
+        candidate_member_supported_claim_count=(
+            decision.candidate_member_supported_claim_count
+        ),
+        candidate_canon_supported_claim_count=(
+            decision.candidate_canon_supported_claim_count
+        ),
+        candidate_opinion_claim_count=(
+            decision.candidate_opinion_claim_count
+        ),
+        candidate_connective_claim_count=(
+            decision.candidate_connective_claim_count
+        ),
+        candidate_unsupported_factual_claim_count=(
+            decision.candidate_unsupported_factual_claim_count
+        ),
+        candidate_claim_classifications=(
+            decision.candidate_claim_classifications
+        ),
     )
 
 
@@ -1284,6 +1343,24 @@ def fallback_memory_preview(
             candidate_lore_dominant=(
                 evaluation.candidate_lore_dominant
             ),
+            candidate_member_supported_claim_count=(
+                evaluation.candidate_member_supported_claim_count
+            ),
+            candidate_canon_supported_claim_count=(
+                evaluation.candidate_canon_supported_claim_count
+            ),
+            candidate_opinion_claim_count=(
+                evaluation.candidate_opinion_claim_count
+            ),
+            candidate_connective_claim_count=(
+                evaluation.candidate_connective_claim_count
+            ),
+            candidate_unsupported_factual_claim_count=(
+                evaluation.candidate_unsupported_factual_claim_count
+            ),
+            candidate_claim_classifications=(
+                evaluation.candidate_claim_classifications
+            ),
         )
     decision = record_fallback(
         prepared.connection,
@@ -1309,6 +1386,24 @@ def fallback_memory_preview(
             decision.candidate_canon_coverage_count
         ),
         candidate_lore_dominant=decision.candidate_lore_dominant,
+        candidate_member_supported_claim_count=(
+            decision.candidate_member_supported_claim_count
+        ),
+        candidate_canon_supported_claim_count=(
+            decision.candidate_canon_supported_claim_count
+        ),
+        candidate_opinion_claim_count=(
+            decision.candidate_opinion_claim_count
+        ),
+        candidate_connective_claim_count=(
+            decision.candidate_connective_claim_count
+        ),
+        candidate_unsupported_factual_claim_count=(
+            decision.candidate_unsupported_factual_claim_count
+        ),
+        candidate_claim_classifications=(
+            decision.candidate_claim_classifications
+        ),
     )
 
 
@@ -1357,6 +1452,24 @@ def reevaluate_memory_preview(
             decision.candidate_canon_coverage_count
         ),
         candidate_lore_dominant=decision.candidate_lore_dominant,
+        candidate_member_supported_claim_count=(
+            decision.candidate_member_supported_claim_count
+        ),
+        candidate_canon_supported_claim_count=(
+            decision.candidate_canon_supported_claim_count
+        ),
+        candidate_opinion_claim_count=(
+            decision.candidate_opinion_claim_count
+        ),
+        candidate_connective_claim_count=(
+            decision.candidate_connective_claim_count
+        ),
+        candidate_unsupported_factual_claim_count=(
+            decision.candidate_unsupported_factual_claim_count
+        ),
+        candidate_claim_classifications=(
+            decision.candidate_claim_classifications
+        ),
     )
 
 
@@ -1448,7 +1561,8 @@ def render_content_free_diagnostics(
             diag.prompt_owner_reason or "none",
         ),
         "- candidate_gate: `selected=%s fallback=%s points=%s "
-        "roots=%s occurrences=%s canon=%s lore_dominant=%s`"
+        "roots=%s occurrences=%s canon=%s member_claims=%s "
+        "canon_claims=%s opinions=%s connective=%s unsupported=%s`"
         % (
             str(evaluation.candidate_selected).lower(),
             evaluation.fallback_reason or "none",
@@ -1456,7 +1570,16 @@ def render_content_free_diagnostics(
             evaluation.candidate_member_root_count,
             evaluation.candidate_member_occurrence_count,
             evaluation.candidate_canon_count,
-            str(evaluation.candidate_lore_dominant).lower(),
+            evaluation.candidate_member_supported_claim_count,
+            evaluation.candidate_canon_supported_claim_count,
+            evaluation.candidate_opinion_claim_count,
+            evaluation.candidate_connective_claim_count,
+            evaluation.candidate_unsupported_factual_claim_count,
+        ),
+        "- claim_classifications: `%s`"
+        % (
+            list(evaluation.candidate_claim_classifications)
+            or ["not_evaluated"]
         ),
         "- stale_source: `%s`"
         % (stale_reason or "none"),

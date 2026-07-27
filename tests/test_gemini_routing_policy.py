@@ -23,6 +23,27 @@ class GeminiRoutingPolicyTests(unittest.TestCase):
         self.assertTrue(journal.journal_protected)
         self.assertEqual(0, journal.provider_retries)
 
+    def test_memory_preview_ab_uses_one_protected_model_policy(self):
+        routes = (
+            "bnl_memory_preview_baseline",
+            "bnl_memory_preview_candidate",
+            "bnl_memory_preview_candidate_repair",
+        )
+        policies = tuple(routing.policy_for_route(route) for route in routes)
+        expected = policies[0]
+        for policy in policies:
+            self.assertEqual(policy.lane, "protected")
+            self.assertEqual(policy.max_output_tokens, expected.max_output_tokens)
+            self.assertEqual(
+                policy.legacy_thinking_budget,
+                expected.legacy_thinking_budget,
+            )
+            self.assertEqual(
+                policy.provider_retries,
+                expected.provider_retries,
+            )
+            self.assertFalse(policy.allow_fallback)
+
     def test_journal_and_relay_reserves_are_mutual_and_released_as_used(self):
         with mock.patch.dict(
             "os.environ",

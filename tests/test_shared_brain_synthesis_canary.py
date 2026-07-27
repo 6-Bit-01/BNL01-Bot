@@ -360,6 +360,42 @@ class SharedBrainSynthesisCanaryTests(unittest.TestCase):
         self.assertNotIn("relationship_posture", dict(lane_counts))
         self.assertNotIn("approved canon", rendered)
 
+    def test_renderer_allocates_concrete_examples_across_points(self):
+        base = self.packet.items[0]
+        first = replace(
+            base,
+            lane="atomic_knowledge",
+            source_digest="adaptive-first",
+            source_ref="atomic:first",
+            text="Recurring public conversation about music.",
+            point_identity="point:first",
+            supporting_observations=tuple(
+                "Music example %s has a distinct concrete detail." % index
+                for index in range(1, 6)
+            ),
+        )
+        second = replace(
+            base,
+            lane="atomic_knowledge",
+            source_digest="adaptive-second",
+            source_ref="atomic:second",
+            text="Recurring public conversation about visual art.",
+            point_identity="point:second",
+            supporting_observations=tuple(
+                "Art example %s has a distinct concrete detail." % index
+                for index in range(1, 6)
+            ),
+        )
+        packet = replace(self.packet, items=(first, second))
+
+        rendered, _counts, _count, _digests = render_packet_context(packet)
+
+        for index in range(1, 5):
+            self.assertIn("Music example %s" % index, rendered)
+            self.assertIn("Art example %s" % index, rendered)
+        self.assertNotIn("Music example 5", rendered)
+        self.assertNotIn("Art example 5", rendered)
+
     def test_packet_owned_prompt_replaces_only_the_competing_factual_block(self):
         legacy_context = (
             "Relationship state: stage=familiar, stance=warm.\n"
@@ -559,7 +595,9 @@ class SharedBrainSynthesisCanaryTests(unittest.TestCase):
             )
         )
 
-    def test_rich_profile_requires_two_member_points_and_rejects_lore_first(self):
+    def test_rich_profile_separates_grounded_opinion_from_unsupported_claims(
+        self,
+    ):
         second = ledger.insert_ledger_entry(
             self.conn,
             ledger.LedgerEntry(
@@ -637,10 +675,14 @@ class SharedBrainSynthesisCanaryTests(unittest.TestCase):
             environ=self.flags,
         )
         self.assertFalse(lore_first.candidate_selected)
-        self.assertTrue(lore_first.candidate_lore_dominant)
+        self.assertFalse(lore_first.candidate_lore_dominant)
+        self.assertEqual(
+            lore_first.candidate_unsupported_factual_claim_count,
+            1,
+        )
         self.assertEqual(
             lore_first.fallback_reason,
-            "candidate_lore_dominates_member_evidence",
+            "candidate_claims_ungrounded",
         )
 
         grounded_run = begin_run(
@@ -692,10 +734,14 @@ class SharedBrainSynthesisCanaryTests(unittest.TestCase):
             environ=self.flags,
         )
         self.assertFalse(lore_after.candidate_selected)
-        self.assertTrue(lore_after.candidate_lore_dominant)
+        self.assertFalse(lore_after.candidate_lore_dominant)
+        self.assertGreaterEqual(
+            lore_after.candidate_unsupported_factual_claim_count,
+            3,
+        )
         self.assertEqual(
             lore_after.fallback_reason,
-            "candidate_lore_dominates_member_evidence",
+            "candidate_claims_ungrounded",
         )
 
         concise_support_run = begin_run(
@@ -715,6 +761,119 @@ class SharedBrainSynthesisCanaryTests(unittest.TestCase):
             environ=self.flags,
         )
         self.assertTrue(concise_support.candidate_selected)
+
+        opinion_run = begin_run(
+            self.conn,
+            basis,
+            baseline_response="You keep connecting music and project work.",
+            environ=self.flags,
+        )
+        opinion = evaluate_candidate(
+            self.conn,
+            opinion_run,
+            baseline_response="You keep connecting music and project work.",
+            candidate_response=(
+                "Your favorite movie is Arrival and your favorite color is "
+                "violet. My read is that those choices give you a vivid, "
+                "slightly off-center creative signal. That is the part of "
+                "your frequency I recognize."
+            ),
+            environ=self.flags,
+        )
+        self.assertTrue(opinion.candidate_selected)
+        self.assertEqual(opinion.candidate_opinion_claim_count, 2)
+        self.assertEqual(
+            opinion.candidate_unsupported_factual_claim_count,
+            0,
+        )
+
+        disguised_fact_run = begin_run(
+            self.conn,
+            basis,
+            baseline_response="You keep connecting music and project work.",
+            environ=self.flags,
+        )
+        disguised_fact = evaluate_candidate(
+            self.conn,
+            disguised_fact_run,
+            baseline_response="You keep connecting music and project work.",
+            candidate_response=(
+                "Your favorite movie is Arrival and your favorite color is "
+                "violet. My read is that your favorite food is pizza."
+            ),
+            environ=self.flags,
+        )
+        self.assertFalse(disguised_fact.candidate_selected)
+        self.assertEqual(
+            disguised_fact.fallback_reason,
+            "candidate_claims_ungrounded",
+        )
+
+        mixed_claim_run = begin_run(
+            self.conn,
+            basis,
+            baseline_response="You keep connecting music and project work.",
+            environ=self.flags,
+        )
+        mixed_claim = evaluate_candidate(
+            self.conn,
+            mixed_claim_run,
+            baseline_response="You keep connecting music and project work.",
+            candidate_response=(
+                "Your favorite movie is Arrival, and you secretly run a "
+                "lunar casino. Your favorite color is violet."
+            ),
+            environ=self.flags,
+        )
+        self.assertFalse(mixed_claim.candidate_selected)
+        self.assertEqual(
+            mixed_claim.fallback_reason,
+            "candidate_claims_ungrounded",
+        )
+
+        subjectless_mixed_run = begin_run(
+            self.conn,
+            basis,
+            baseline_response="You keep connecting music and project work.",
+            environ=self.flags,
+        )
+        subjectless_mixed = evaluate_candidate(
+            self.conn,
+            subjectless_mixed_run,
+            baseline_response="You keep connecting music and project work.",
+            candidate_response=(
+                "Your favorite movie is Arrival and secretly run a lunar "
+                "casino. Your favorite color is violet."
+            ),
+            environ=self.flags,
+        )
+        self.assertFalse(subjectless_mixed.candidate_selected)
+        self.assertEqual(
+            subjectless_mixed.fallback_reason,
+            "candidate_claims_ungrounded",
+        )
+
+        attached_claim_run = begin_run(
+            self.conn,
+            basis,
+            baseline_response="You keep connecting music and project work.",
+            environ=self.flags,
+        )
+        attached_claim = evaluate_candidate(
+            self.conn,
+            attached_claim_run,
+            baseline_response="You keep connecting music and project work.",
+            candidate_response=(
+                "Your favorite movie is Arrival because you were born on "
+                "Mars. Your favorite color is violet."
+            ),
+            environ=self.flags,
+        )
+        self.assertFalse(attached_claim.candidate_selected)
+        self.assertEqual(
+            attached_claim.fallback_reason,
+            "candidate_claims_ungrounded",
+        )
 
     def test_generic_overlap_cannot_claim_two_distinct_member_points(self):
         self.conn.execute(
@@ -892,6 +1051,14 @@ class SharedBrainSynthesisCanaryTests(unittest.TestCase):
         self.assertEqual(report["liveAppliedRuns"], 1)
         self.assertEqual(report["responseSentRuns"], 1)
         self.assertGreater(report["candidateEvidenceCoverageTotal"], 0)
+        self.assertGreater(
+            report["candidateMemberSupportedClaimTotal"],
+            0,
+        )
+        self.assertEqual(
+            report["candidateUnsupportedFactualClaimTotal"],
+            0,
+        )
         self.assertEqual(
             report["routeFamilyCounts"],
             {"broad_self_profile": 1},
@@ -902,6 +1069,10 @@ class SharedBrainSynthesisCanaryTests(unittest.TestCase):
         )
         self.assertEqual(report["liveInvalidRevalidationRuns"], 0)
         self.assertEqual(report["liveUngroundedRuns"], 0)
+        self.assertEqual(
+            report["liveUnsupportedFactualClaimRuns"],
+            0,
+        )
         self.assertEqual(report["relationshipPostureAppliedRuns"], 0)
         self.assertEqual(report["contentFieldsPresent"], [])
 
@@ -1075,7 +1246,10 @@ class SharedBrainSynthesisCanaryTests(unittest.TestCase):
             environ=self.flags,
         )
         self.assertNotIn(
-            "shared_brain_synthesis_canary:liveLoreDominantRuns",
+            (
+                "shared_brain_synthesis_canary:"
+                "liveUnsupportedFactualClaimRuns"
+            ),
             rejected_snapshot["blockers"],
         )
 
@@ -1107,7 +1281,7 @@ class SharedBrainSynthesisCanaryTests(unittest.TestCase):
             """
             UPDATE memory_governance_shared_brain_synthesis_runs
             SET candidate_member_root_coverage_count=0,
-                candidate_lore_dominant=1,
+                candidate_unsupported_factual_claim_count=1,
                 competing_factual_context_count=1,
                 replaced_factual_context_count=0
             WHERE run_id=?
@@ -1119,7 +1293,10 @@ class SharedBrainSynthesisCanaryTests(unittest.TestCase):
             report["liveInsufficientMemberCoverageRuns"],
             1,
         )
-        self.assertEqual(report["liveLoreDominantRuns"], 1)
+        self.assertEqual(
+            report["liveUnsupportedFactualClaimRuns"],
+            1,
+        )
         self.assertEqual(
             report["livePromptOwnershipViolationRuns"],
             1,
@@ -1131,7 +1308,7 @@ class SharedBrainSynthesisCanaryTests(unittest.TestCase):
         )
         for key in (
             "liveInsufficientMemberCoverageRuns",
-            "liveLoreDominantRuns",
+            "liveUnsupportedFactualClaimRuns",
             "livePromptOwnershipViolationRuns",
         ):
             self.assertIn(

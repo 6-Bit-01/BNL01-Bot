@@ -85,6 +85,35 @@ class MemoryPreviewBotPathTests(unittest.IsolatedAsyncioTestCase):
             Path(self.db_path).read_bytes()
         ).hexdigest()
 
+    def test_partial_clone_reads_do_not_hide_live_database_errors(self):
+        with sqlite3.connect(":memory:") as clone:
+            self.assertIsNone(
+                bnl01_bot.get_relationship_state(
+                    7,
+                    1,
+                    connection=clone,
+                )
+            )
+            self.assertEqual(
+                bnl01_bot.get_memory_tiers(
+                    7,
+                    1,
+                    connection=clone,
+                ),
+                [],
+            )
+
+        empty_live_path = str(
+            Path(self.tempdir.name) / "empty-live.db"
+        )
+        with mock.patch.object(
+            bnl01_bot,
+            "DB_FILE",
+            empty_live_path,
+        ):
+            with self.assertRaises(sqlite3.DatabaseError):
+                bnl01_bot.get_relationship_state(7, 1)
+
     async def test_full_preview_uses_packet_prompt_and_leaves_source_unchanged(
         self,
     ):
@@ -125,10 +154,11 @@ class MemoryPreviewBotPathTests(unittest.IsolatedAsyncioTestCase):
         ])
         baseline_prompt = calls[0][1]
         candidate_prompt = calls[1][1]
-        self.assertIn(
+        self.assertNotIn(
             bnl01_bot.PREVIEW_FACTUAL_PLACEHOLDER,
             baseline_prompt,
         )
+        self.assertIn("No durable memory yet.", baseline_prompt)
         self.assertIn(
             "do not infer that the member is new, quiet, inactive",
             baseline_prompt,
@@ -141,6 +171,19 @@ class MemoryPreviewBotPathTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Mode contract: normal_chat", candidate_prompt)
         self.assertIn("Current channel policy: public_home", candidate_prompt)
         self.assertEqual(guard.await_count, 1)
+        self.assertEqual(
+            result.established_response,
+            "I only have a narrow grounded view so far.",
+        )
+        self.assertEqual(
+            result.packet_candidate_response,
+            (
+                "You keep returning to software and technical "
+                "systems."
+            ),
+        )
+        self.assertEqual(result.repair_response, "")
+        self.assertEqual(result.final_selection, "packet_candidate")
         self.assertEqual(source_hash, self._source_hash())
         self.assertIn(
             "source_db_read_only=true",
@@ -214,6 +257,86 @@ class MemoryPreviewBotPathTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(guard.await_count, 1)
         self.assertEqual(source_hash, self._source_hash())
+
+    async def test_preview_compares_real_established_memory_to_packet(self):
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                """
+                CREATE TABLE memory_tiers (
+                  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  user_id INTEGER NOT NULL,
+                  guild_id INTEGER NOT NULL,
+                  tier TEXT NOT NULL,
+                  summary TEXT NOT NULL,
+                  salience REAL DEFAULT 0.5,
+                  mentions INTEGER DEFAULT 1,
+                  updated_at TEXT NOT NULL,
+                  source_role TEXT DEFAULT 'user',
+                  source_channel_policy TEXT DEFAULT 'public_home',
+                  source_channel_name TEXT DEFAULT 'barcode-bot',
+                  source_origin TEXT DEFAULT 'conversation',
+                  source_trust TEXT DEFAULT 'source_safe_public',
+                  topic_key TEXT DEFAULT '',
+                  subject_key TEXT DEFAULT '',
+                  project_key TEXT DEFAULT '',
+                  first_seen TEXT DEFAULT '',
+                  last_seen TEXT DEFAULT '',
+                  lifecycle_note TEXT DEFAULT ''
+                )
+                """
+            )
+            conn.execute(
+                """
+                INSERT INTO memory_tiers(
+                  user_id,guild_id,tier,summary,salience,mentions,
+                  updated_at,source_role,source_channel_policy,
+                  source_channel_name,source_origin,source_trust
+                ) VALUES(7,1,'long',?,0.95,3,?,'user','public_home',
+                         'barcode-bot','conversation','source_safe_public')
+                """,
+                (
+                    "I build pocket synthesizers.",
+                    "2026-07-25T20:00:00+00:00",
+                ),
+            )
+            conn.commit()
+        calls = []
+
+        async def generator(prompt, route):
+            calls.append((route, prompt))
+            if route.endswith("baseline"):
+                return "I remember your pocket-synthesizer work."
+            return (
+                "You keep returning to software and technical "
+                "systems."
+            )
+
+        result = await bnl01_bot.execute_bnl_memory_preview(
+            source_db_path=self.db_path,
+            guild_id=1,
+            subject_user_id=7,
+            subject_display_name="Crow",
+            simulated_channel_id=10,
+            wording="BNL-01, what am I all about?",
+            generator=generator,
+            guard=mock.AsyncMock(
+                side_effect=lambda response, _prompt: (
+                    response,
+                    {"suppressed": False, "suppression_reason": ""},
+                )
+            ),
+        )
+
+        baseline_prompt = calls[0][1]
+        packet_prompt = calls[1][1]
+        self.assertIn("I build pocket synthesizers.", baseline_prompt)
+        self.assertIn("Derived memory summaries", baseline_prompt)
+        self.assertNotIn("Derived memory summaries", packet_prompt)
+        self.assertEqual(
+            result.established_response,
+            "I remember your pocket-synthesizer work.",
+        )
+        self.assertTrue(result.packet_candidate_response)
 
     async def test_preview_never_calls_conversation_or_model_savers(self):
         async def generator(_prompt, route):
@@ -414,7 +537,7 @@ class MemoryPreviewBotPathTests(unittest.IsolatedAsyncioTestCase):
             if route.endswith("baseline"):
                 return "I only have a narrow grounded view so far."
             return (
-                "No direct matches; you keep returning to software "
+                "Archive records show you keep returning to software "
                 "and technical systems."
             )
 
@@ -480,6 +603,10 @@ class MemoryPreviewBotPathTests(unittest.IsolatedAsyncioTestCase):
             route_status="matched",
             candidate_selected=True,
             fallback_reason="",
+            established_response="Established response.",
+            packet_candidate_response="Packet response.",
+            repair_response="Repair response.",
+            final_selection="repair_attempt",
         )
         sent = mock.AsyncMock()
 
@@ -533,6 +660,16 @@ class MemoryPreviewBotPathTests(unittest.IsolatedAsyncioTestCase):
         sent.assert_awaited_once()
         rendered = sent.await_args.args[1]
         self.assertIn("BNL Memory Preview", rendered)
+        self.assertIn(
+            "Established normal-generation baseline",
+            rendered,
+        )
+        self.assertIn("Established response.", rendered)
+        self.assertIn("Packet candidate", rendered)
+        self.assertIn("Packet response.", rendered)
+        self.assertIn("Grounded repair attempt", rendered)
+        self.assertIn("Repair response.", rendered)
+        self.assertIn("final_selection: `repair_attempt`", rendered)
         self.assertIn("Grounded proposed response.", rendered)
         self.assertIn("Content-free diagnostics", rendered)
 

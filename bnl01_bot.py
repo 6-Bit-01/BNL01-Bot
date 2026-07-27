@@ -13,7 +13,8 @@
 
 from __future__ import annotations
 
-from typing import Any, Awaitable, Callable, Union
+from contextlib import nullcontext
+from typing import Any, Awaitable, Callable, Mapping, Union
 
 from bnl_canon_source_contract import (
     CANON_SOURCE_CONTRACT_VERSION,
@@ -5825,20 +5826,33 @@ def update_relationship_state(user_id: int, guild_id: int, signal_text: str = ""
     conn.commit()
     conn.close()
 
-def get_relationship_state(user_id: int, guild_id: int):
-    conn = sqlite3.connect(DB_FILE)
+def get_relationship_state(
+    user_id: int,
+    guild_id: int,
+    *,
+    connection: sqlite3.Connection | None = None,
+):
+    conn = connection or sqlite3.connect(DB_FILE)
+    owns_connection = connection is None
     cursor = conn.cursor()
-    cursor.execute(
-        """
-        SELECT interaction_count, affinity_score, trust_stage, social_stance, last_topic, updated_at
-        FROM relationship_state
-        WHERE user_id = ? AND guild_id = ?
-        """,
-        (user_id, guild_id),
-    )
-    row = cursor.fetchone()
-    conn.close()
-    return row
+    try:
+        cursor.execute(
+            """
+            SELECT interaction_count, affinity_score, trust_stage,
+                   social_stance, last_topic, updated_at
+            FROM relationship_state
+            WHERE user_id = ? AND guild_id = ?
+            """,
+            (user_id, guild_id),
+        )
+        return cursor.fetchone()
+    except sqlite3.DatabaseError:
+        if owns_connection:
+            raise
+        return None
+    finally:
+        if owns_connection:
+            conn.close()
 
 def add_relationship_journal(user_id: int, guild_id: int, entry_type: str, summary: str):
     now = datetime.now(PACIFIC_TZ).isoformat()
@@ -5860,22 +5874,35 @@ def add_relationship_journal(user_id: int, guild_id: int, entry_type: str, summa
         guild_id=guild_id, source_table="relationship_journal", source_row_id=row_id, source_revision=str(row_id),
     )
 
-def get_relationship_journal(user_id: int, guild_id: int, limit: int = 5):
-    conn = sqlite3.connect(DB_FILE)
+def get_relationship_journal(
+    user_id: int,
+    guild_id: int,
+    limit: int = 5,
+    *,
+    connection: sqlite3.Connection | None = None,
+):
+    conn = connection or sqlite3.connect(DB_FILE)
+    owns_connection = connection is None
     cursor = conn.cursor()
-    cursor.execute(
-        """
-        SELECT entry_type, summary, timestamp
-        FROM relationship_journal
-        WHERE user_id = ? AND guild_id = ?
-        ORDER BY id DESC
-        LIMIT ?
-        """,
-        (user_id, guild_id, limit),
-    )
-    rows = cursor.fetchall()
-    conn.close()
-    return list(reversed(rows))
+    try:
+        cursor.execute(
+            """
+            SELECT entry_type, summary, timestamp
+            FROM relationship_journal
+            WHERE user_id = ? AND guild_id = ?
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (user_id, guild_id, limit),
+        )
+        return list(reversed(cursor.fetchall()))
+    except sqlite3.DatabaseError:
+        if owns_connection:
+            raise
+        return []
+    finally:
+        if owns_connection:
+            conn.close()
 
 def update_user_habits(user_id: int, guild_id: int, content: str):
     text = (content or "").strip()
@@ -5915,20 +5942,33 @@ def update_user_habits(user_id: int, guild_id: int, content: str):
     conn.commit()
     conn.close()
 
-def get_user_habits(user_id: int, guild_id: int):
-    conn = sqlite3.connect(DB_FILE)
+def get_user_habits(
+    user_id: int,
+    guild_id: int,
+    *,
+    connection: sqlite3.Connection | None = None,
+):
+    conn = connection or sqlite3.connect(DB_FILE)
+    owns_connection = connection is None
     cursor = conn.cursor()
-    cursor.execute(
-        """
-        SELECT total_messages, question_messages, humor_messages, late_night_messages, avg_length, last_topic, updated_at
-        FROM user_habits
-        WHERE user_id = ? AND guild_id = ?
-        """,
-        (user_id, guild_id),
-    )
-    row = cursor.fetchone()
-    conn.close()
-    return row
+    try:
+        cursor.execute(
+            """
+            SELECT total_messages, question_messages, humor_messages,
+                   late_night_messages, avg_length, last_topic, updated_at
+            FROM user_habits
+            WHERE user_id = ? AND guild_id = ?
+            """,
+            (user_id, guild_id),
+        )
+        return cursor.fetchone()
+    except sqlite3.DatabaseError:
+        if owns_connection:
+            raise
+        return None
+    finally:
+        if owns_connection:
+            conn.close()
 
 def _memory_lifecycle_config() -> dict:
     return {
@@ -6045,10 +6085,32 @@ def _compress_memory_fragments(fragments: list, tier: str, topic_key: str = "gen
     return _safe_boundary_truncate(f"Durable {label} memory: {body}", MEMORY_TIER_ENTRY_CHARS, use_ellipsis=True)
 
 
-def calculate_adaptive_memory_limits(user_id: int, guild_id: int, route_mode: str = ROUTE_MODE_NORMAL_CHAT, channel_policy: str = "unknown", user_text: str = "", is_owner_or_mod: bool = False) -> dict:
-    relation = get_relationship_state(user_id, guild_id)
-    habits = get_user_habits(user_id, guild_id)
-    recent_rows = get_recent_conversation_count(user_id, guild_id, limit=CONVERSATION_ROWS_PER_USER_MAX)
+def calculate_adaptive_memory_limits(
+    user_id: int,
+    guild_id: int,
+    route_mode: str = ROUTE_MODE_NORMAL_CHAT,
+    channel_policy: str = "unknown",
+    user_text: str = "",
+    is_owner_or_mod: bool = False,
+    *,
+    connection: sqlite3.Connection | None = None,
+) -> dict:
+    relation = get_relationship_state(
+        user_id,
+        guild_id,
+        connection=connection,
+    )
+    habits = get_user_habits(
+        user_id,
+        guild_id,
+        connection=connection,
+    )
+    recent_rows = get_recent_conversation_count(
+        user_id,
+        guild_id,
+        limit=CONVERSATION_ROWS_PER_USER_MAX,
+        connection=connection,
+    )
     interactions = int(relation[0]) if relation else 0
     stage = str(relation[2]) if relation and len(relation) > 2 else "new"
     habit_total = int(habits[0]) if habits else 0
@@ -6296,41 +6358,66 @@ def maybe_add_memory_trace(
     )
 
 
-def get_memory_tiers(user_id: int, guild_id: int):
-    conn = sqlite3.connect(DB_FILE)
+def get_memory_tiers(
+    user_id: int,
+    guild_id: int,
+    *,
+    connection: sqlite3.Connection | None = None,
+):
+    conn = connection or sqlite3.connect(DB_FILE)
+    owns_connection = connection is None
     cursor = conn.cursor()
-    cols = _memory_tiers_columns(cursor)
-    wanted = ["tier", "summary", "salience", "mentions", "updated_at", "source_role", "source_channel_policy", "source_channel_name", "source_origin", "source_trust"]
-    wanted += [c for c in ("topic_key", "subject_key", "project_key", "first_seen", "last_seen", "lifecycle_note") if c in cols]
-    cursor.execute(
-        f"""
-        SELECT {', '.join(wanted)}
-        FROM memory_tiers
-        WHERE user_id = ? AND guild_id = ?
-        ORDER BY
-            CASE tier WHEN 'short' THEN 1 WHEN 'medium' THEN 2 ELSE 3 END,
-            id DESC
-        """,
-        (user_id, guild_id),
-    )
-    rows = cursor.fetchall()
-    conn.close()
-    return rows
+    try:
+        cols = _memory_tiers_columns(cursor)
+        wanted = ["tier", "summary", "salience", "mentions", "updated_at", "source_role", "source_channel_policy", "source_channel_name", "source_origin", "source_trust"]
+        wanted += [c for c in ("topic_key", "subject_key", "project_key", "first_seen", "last_seen", "lifecycle_note") if c in cols]
+        cursor.execute(
+            f"""
+            SELECT {', '.join(wanted)}
+            FROM memory_tiers
+            WHERE user_id = ? AND guild_id = ?
+            ORDER BY
+                CASE tier WHEN 'short' THEN 1 WHEN 'medium' THEN 2 ELSE 3 END,
+                id DESC
+            """,
+            (user_id, guild_id),
+        )
+        return cursor.fetchall()
+    except sqlite3.DatabaseError:
+        if owns_connection:
+            raise
+        return []
+    finally:
+        if owns_connection:
+            conn.close()
 
-def get_memory_tier_counts(user_id: int, guild_id: int):
-    conn = sqlite3.connect(DB_FILE)
+def get_memory_tier_counts(
+    user_id: int,
+    guild_id: int,
+    *,
+    connection: sqlite3.Connection | None = None,
+):
+    conn = connection or sqlite3.connect(DB_FILE)
+    owns_connection = connection is None
     cursor = conn.cursor()
-    cursor.execute(
-        """
-        SELECT tier, COUNT(*)
-        FROM memory_tiers
-        WHERE user_id = ? AND guild_id = ?
-        GROUP BY tier
-        """,
-        (user_id, guild_id),
-    )
-    rows = cursor.fetchall()
-    conn.close()
+    try:
+        cursor.execute(
+            """
+            SELECT tier, COUNT(*)
+            FROM memory_tiers
+            WHERE user_id = ? AND guild_id = ?
+            GROUP BY tier
+            """,
+            (user_id, guild_id),
+        )
+        rows = cursor.fetchall()
+    except sqlite3.DatabaseError:
+        if owns_connection:
+            raise
+        rows = []
+    finally:
+        if owns_connection:
+            conn.close()
     counts = {"short": 0, "medium": 0, "long": 0}
     for tier, c in rows:
         counts[tier] = c
@@ -12645,25 +12732,39 @@ def set_preferred_name(user_id: int, guild_id: int, preferred_name: str):
 
 
 
-def get_recent_conversation_count(user_id: int, guild_id: int, limit: int = 200) -> int:
-    conn = sqlite3.connect(DB_FILE)
+def get_recent_conversation_count(
+    user_id: int,
+    guild_id: int,
+    limit: int = 200,
+    *,
+    connection: sqlite3.Connection | None = None,
+) -> int:
+    conn = connection or sqlite3.connect(DB_FILE)
+    owns_connection = connection is None
     cursor = conn.cursor()
-    cursor.execute(
-        """
-        SELECT COUNT(*)
-        FROM (
-            SELECT id
-            FROM conversations
-            WHERE user_id=? AND guild_id=?
-            ORDER BY id DESC
-            LIMIT ?
+    try:
+        cursor.execute(
+            """
+            SELECT COUNT(*)
+            FROM (
+                SELECT id
+                FROM conversations
+                WHERE user_id=? AND guild_id=?
+                ORDER BY id DESC
+                LIMIT ?
+            )
+            """,
+            (user_id, guild_id, max(1, int(limit))),
         )
-        """,
-        (user_id, guild_id, max(1, int(limit))),
-    )
-    row = cursor.fetchone()
-    conn.close()
-    return int(row[0]) if row and row[0] is not None else 0
+        row = cursor.fetchone()
+        return int(row[0]) if row and row[0] is not None else 0
+    except sqlite3.DatabaseError:
+        if owns_connection:
+            raise
+        return 0
+    finally:
+        if owns_connection:
+            conn.close()
 
 
 def get_recent_public_context_count(guild_id: int, limit: int = 500) -> int:
@@ -17867,6 +17968,8 @@ _PERSONAL_OBSERVATION_TOPIC_LABELS = {
 def get_approved_member_fact_evidence(
     user_id: int,
     guild_id: int,
+    *,
+    connection: sqlite3.Connection | None = None,
 ) -> tuple[ApprovedMemberFactEvidence, ...]:
     """Return current approved facts from persisted source-bearing rows.
 
@@ -17874,41 +17977,65 @@ def get_approved_member_fact_evidence(
     direct member self-report. Persisted provenance survives bounded
     conversation pruning and remains aligned with correction/forget lifecycle.
     """
-    conn = sqlite3.connect(DB_FILE)
+    conn = connection or sqlite3.connect(DB_FILE)
+    owns_connection = connection is None
     cursor = conn.cursor()
-    _ensure_user_fact_provenance_schema(cursor)
-    placeholders = ",".join("?" for _ in APPROVED_AUTOMATIC_MEMBER_FACT_KEYS)
-    rows = cursor.execute(
-        f"""
-        SELECT fact_key, fact_value, source_conversation_row_id,
-               source_observed_at, source_kind, updated_at
-        FROM user_memory_facts
-        WHERE guild_id=? AND user_id=?
-          AND fact_key IN ({placeholders})
-          AND lifecycle_status='active'
-          AND source_directed=1
-          AND source_kind IN ('member_self_report','member_correction','member_control')
-          AND (
+    try:
+        table_present = cursor.execute(
+            """
+            SELECT 1 FROM sqlite_master
+            WHERE type='table' AND name='user_memory_facts'
+            """
+        ).fetchone()
+        if not table_present and not owns_connection:
+            return ()
+        _ensure_user_fact_provenance_schema(cursor)
+        placeholders = ",".join(
+            "?" for _ in APPROVED_AUTOMATIC_MEMBER_FACT_KEYS
+        )
+        rows = cursor.execute(
+            f"""
+            SELECT fact_key, fact_value, source_conversation_row_id,
+                   source_observed_at, source_kind, updated_at
+            FROM user_memory_facts
+            WHERE guild_id=? AND user_id=?
+              AND fact_key IN ({placeholders})
+              AND lifecycle_status='active'
+              AND source_directed=1
+              AND source_kind IN (
+                'member_self_report','member_correction','member_control'
+              )
+              AND (
+                (
+                  source_kind IN (
+                    'member_self_report','member_correction'
+                  )
+                  AND source_conversation_row_id > 0
+                  AND source_channel_policy IN (
+                    'public_home','public_context'
+                  )
+                )
+                OR (
+                  source_kind='member_control'
+                  AND source_channel_policy='member_control'
+                  AND TRIM(COALESCE(source_control_ref,'')) <> ''
+                )
+              )
+            ORDER BY updated_at DESC, id DESC
+            """,
             (
-              source_kind IN ('member_self_report','member_correction')
-              AND source_conversation_row_id > 0
-              AND source_channel_policy IN ('public_home','public_context')
-            )
-            OR (
-              source_kind='member_control'
-              AND source_channel_policy='member_control'
-              AND TRIM(COALESCE(source_control_ref,'')) <> ''
-            )
-          )
-        ORDER BY updated_at DESC, id DESC
-        """,
-        (
-            int(guild_id),
-            int(user_id),
-            *APPROVED_AUTOMATIC_MEMBER_FACT_KEYS,
-        ),
-    ).fetchall()
-    conn.close()
+                int(guild_id),
+                int(user_id),
+                *APPROVED_AUTOMATIC_MEMBER_FACT_KEYS,
+            ),
+        ).fetchall()
+    except sqlite3.DatabaseError:
+        if owns_connection:
+            raise
+        return ()
+    finally:
+        if owns_connection:
+            conn.close()
     selected: dict[str, ApprovedMemberFactEvidence] = {}
     for key, value, row_id, observed_at, source_kind, updated_at in rows:
         key = str(key or "").strip().lower()
@@ -18910,7 +19037,18 @@ def build_user_memory_context(
     channel_id: int = 0,
     moment_attribution_target_user_id: int = 0,
     source_metadata: dict | None = None,
+    connection: sqlite3.Connection | None = None,
+    environ: dict[str, str] | None = None,
+    record_operational_diagnostics: bool = True,
 ) -> str:
+    env = os.environ if environ is None else environ
+
+    def record_prompt_diagnostics(value: dict) -> None:
+        if record_operational_diagnostics:
+            LAST_MEMORY_PROMPT_DIAGNOSTICS[
+                (user_id, guild_id)
+            ] = value
+
     if source_metadata is not None:
         source_metadata.update(
             {
@@ -18932,11 +19070,11 @@ def build_user_memory_context(
             }
         )
     if route_mode == ROUTE_MODE_SIMPLE_GREETING:
-        LAST_MEMORY_PROMPT_DIAGNOSTICS[(user_id, guild_id)] = {"skipped_reason": "simple_greeting", "included": {"short": 0, "medium": 0, "long": 0}}
+        record_prompt_diagnostics({"skipped_reason": "simple_greeting", "included": {"short": 0, "medium": 0, "long": 0}})
         return "Memory intentionally skipped for simple greeting."
     policy = (channel_policy or "unknown").strip().lower() or "unknown"
     if route_mode in SOURCE_INTERNAL_MODES or policy in {"unknown", "sealed_test", "protected_system", "broadcast_memory", "reference_canon", "ai_image_tool"}:
-        LAST_MEMORY_PROMPT_DIAGNOSTICS[(user_id, guild_id)] = {"skipped_reason": f"route_or_policy_{policy}", "included": {"short": 0, "medium": 0, "long": 0}}
+        record_prompt_diagnostics({"skipped_reason": f"route_or_policy_{policy}", "included": {"short": 0, "medium": 0, "long": 0}})
         return "No route-safe durable memory for this mode/channel."
 
     source_safe_recall_synthesis = source_safe_recall_synthesis_enabled(
@@ -18946,18 +19084,48 @@ def build_user_memory_context(
         channel_policy=policy,
         user_text=user_text,
         current_direct=current_direct,
+        environ=env,
     )
     if source_metadata is not None:
         source_metadata["source_safe_recall_synthesis"] = bool(
             source_safe_recall_synthesis
         )
 
-    limits = calculate_adaptive_memory_limits(user_id, guild_id, route_mode=route_mode, channel_policy=policy, user_text=user_text, is_owner_or_mod=is_owner_or_mod)
-    approved_facts = get_approved_member_fact_evidence(user_id, guild_id)
-    relation = get_relationship_state(user_id, guild_id)
-    journal = get_relationship_journal(user_id, guild_id, limit=4)
-    habits = get_user_habits(user_id, guild_id)
-    tier_rows = get_memory_tiers(user_id, guild_id)
+    limits = calculate_adaptive_memory_limits(
+        user_id,
+        guild_id,
+        route_mode=route_mode,
+        channel_policy=policy,
+        user_text=user_text,
+        is_owner_or_mod=is_owner_or_mod,
+        connection=connection,
+    )
+    approved_facts = get_approved_member_fact_evidence(
+        user_id,
+        guild_id,
+        connection=connection,
+    )
+    relation = get_relationship_state(
+        user_id,
+        guild_id,
+        connection=connection,
+    )
+    journal = get_relationship_journal(
+        user_id,
+        guild_id,
+        limit=4,
+        connection=connection,
+    )
+    habits = get_user_habits(
+        user_id,
+        guild_id,
+        connection=connection,
+    )
+    tier_rows = get_memory_tiers(
+        user_id,
+        guild_id,
+        connection=connection,
+    )
     if source_metadata is not None:
         source_metadata.update(
             {
@@ -18975,29 +19143,32 @@ def build_user_memory_context(
         route_mode=route_mode,
         channel_policy=policy,
         current_direct=current_direct,
+        environ=env,
     ):
+        moment_conn = connection
         try:
-            with sqlite3.connect(DB_FILE) as moment_conn:
-                moment_gist_context = render_shadow_moment_context(
-                    moment_conn,
-                    guild_id=int(guild_id),
-                    channel_id=int(channel_id or 0),
-                    participant_key=subject_key_for_user(user_id),
-                    attribution_target_key=(
-                        subject_key_for_user(moment_attribution_target_user_id)
-                        if int(moment_attribution_target_user_id or 0) > 0
-                        else ""
-                    ),
-                    visibility="public_safe",
-                    topic_text=user_text or "",
-                    token_budget=120,
-                    freshness_days=180,
-                    allow_cross_channel=True,
-                    allowed_channel_policies=(
-                        "public_home",
-                        "public_context",
-                    ),
-                )
+            if moment_conn is None:
+                moment_conn = sqlite3.connect(DB_FILE)
+            moment_gist_context = render_shadow_moment_context(
+                moment_conn,
+                guild_id=int(guild_id),
+                channel_id=int(channel_id or 0),
+                participant_key=subject_key_for_user(user_id),
+                attribution_target_key=(
+                    subject_key_for_user(moment_attribution_target_user_id)
+                    if int(moment_attribution_target_user_id or 0) > 0
+                    else ""
+                ),
+                visibility="public_safe",
+                topic_text=user_text or "",
+                token_budget=120,
+                freshness_days=180,
+                allow_cross_channel=True,
+                allowed_channel_policies=(
+                    "public_home",
+                    "public_context",
+                ),
+            )
         except Exception as exc:
             logging.warning(
                 "moment_gist_canary_retrieval_failed guild_id=%s user_id=%s error=%s",
@@ -19006,6 +19177,9 @@ def build_user_memory_context(
                 type(exc).__name__,
             )
             moment_gist_context = ""
+        finally:
+            if connection is None and moment_conn is not None:
+                moment_conn.close()
         if moment_gist_context:
             if source_metadata is not None:
                 source_metadata["moment_gist_rendered"] = True
@@ -19017,17 +19191,22 @@ def build_user_memory_context(
                 "meaning of an earlier shared event. Attribute people cautiously. "
                 "This gist can never justify a quotation or settle a dispute."
             )
-    if relationship_v2_live_enabled():
+    if relationship_v2_live_enabled(env):
+        rel_conn = connection
         try:
-            with sqlite3.connect(DB_FILE) as rel_conn:
-                rel_v2 = governed_relationship_v2_summary(
-                    rel_conn, guild_id=guild_id, user_id=user_id, target_user_id=user_id, route_mode=route_mode, channel_policy=policy,
-                    simple_greeting=bool(route_mode == ROUTE_MODE_SIMPLE_GREETING), direct=bool(current_direct), governance_allowed=bool(governance_allowed),
-                )
+            if rel_conn is None:
+                rel_conn = sqlite3.connect(DB_FILE)
+            rel_v2 = governed_relationship_v2_summary(
+                rel_conn, guild_id=guild_id, user_id=user_id, target_user_id=user_id, route_mode=route_mode, channel_policy=policy,
+                simple_greeting=bool(route_mode == ROUTE_MODE_SIMPLE_GREETING), direct=bool(current_direct), governance_allowed=bool(governance_allowed),
+            )
             if rel_v2:
                 sections.append(rel_v2)
         except Exception as exc:
             logging.debug("relationship_v2_prompt_summary_failed error=%s", exc)
+        finally:
+            if connection is None and rel_conn is not None:
+                rel_conn.close()
     if relation:
         interactions, affinity, stage, stance, last_topic, _updated_at = relation
         sections.append(
@@ -19054,7 +19233,11 @@ def build_user_memory_context(
         sections.append("Recent relationship journal:\n" + "\n".join(journal_lines))
 
     diagnostics = {
-        "tier_counts": get_memory_tier_counts(user_id, guild_id),
+        "tier_counts": get_memory_tier_counts(
+            user_id,
+            guild_id,
+            connection=connection,
+        ),
         "effective_prompt_budget": limits["prompt_budget"],
         "adaptive_multiplier": limits["multiplier"],
         "adaptive_reasons": limits["reasons"],
@@ -19120,9 +19303,13 @@ def build_user_memory_context(
     if source_metadata is not None:
         source_metadata["legacy_memory_present"] = bool(sections)
     diagnostics["skipped"] = dict(diagnostics["skipped"])
-    if memory_governance_shadow_enabled():
+    if memory_governance_shadow_enabled(env):
         try:
-            with sqlite3.connect(DB_FILE) as gov_conn:
+            with (
+                nullcontext(connection)
+                if connection is not None
+                else sqlite3.connect(DB_FILE)
+            ) as gov_conn:
                 gov_req = GovernanceRequest(
                     guild_id=guild_id,
                     subject_user_id=user_id,
@@ -19151,17 +19338,17 @@ def build_user_memory_context(
                     legacy_context=legacy_context,
                     include_review_moments=True,
                     include_public_moment_gists=bool(
-                        moment_engine_shadow_enabled()
+                        moment_engine_shadow_enabled(env)
                         and (
                             source_safe_recall_synthesis
-                            or memory_governance_live_enabled()
+                            or memory_governance_live_enabled(env)
                         )
                     ),
                 )
                 safety = assess_governance_result_safety(gov_result)
                 diagnostics["memory_governance"] = {
                     "shadow_enabled": True,
-                    "live_enabled": memory_governance_live_enabled(),
+                    "live_enabled": memory_governance_live_enabled(env),
                     "selected_count": gov_result.diagnostics.selected_count,
                     "excluded_by_reason": gov_result.diagnostics.excluded_by_reason,
                     "rendered_size": gov_result.diagnostics.rendered_size,
@@ -19221,15 +19408,16 @@ def build_user_memory_context(
                         if unsafe_governed
                         else ""
                     )
-                    _record_source_safe_recall_canary_result(
-                        user_id=user_id,
-                        guild_id=guild_id,
-                        enabled_for_route=True,
-                        response_mode=response_mode,
-                        gov_result=gov_result,
-                        safety=safety,
-                        fallback_reason=fallback_reason,
-                    )
+                    if record_operational_diagnostics:
+                        _record_source_safe_recall_canary_result(
+                            user_id=user_id,
+                            guild_id=guild_id,
+                            enabled_for_route=True,
+                            response_mode=response_mode,
+                            gov_result=gov_result,
+                            safety=safety,
+                            fallback_reason=fallback_reason,
+                        )
                     if source_metadata is not None:
                         source_metadata.update(
                             {
@@ -19241,9 +19429,7 @@ def build_user_memory_context(
                                 ),
                             }
                         )
-                    LAST_MEMORY_PROMPT_DIAGNOSTICS[
-                        (user_id, guild_id)
-                    ] = diagnostics
+                    record_prompt_diagnostics(diagnostics)
                     if unsafe_governed:
                         diagnostics["memory_governance"][
                             "fallback_reason"
@@ -19256,8 +19442,8 @@ def build_user_memory_context(
                         gov_result.rendered_context
                         or "No currently eligible governed durable memory."
                     )
-                if memory_governance_live_enabled() and not unsafe_governed:
-                    LAST_MEMORY_PROMPT_DIAGNOSTICS[(user_id, guild_id)] = diagnostics
+                if memory_governance_live_enabled(env) and not unsafe_governed:
+                    record_prompt_diagnostics(diagnostics)
                     governed_context = gov_result.rendered_context
                     if (
                         moment_gist_context
@@ -19273,18 +19459,19 @@ def build_user_memory_context(
                             "It can never justify a quotation or settle a dispute."
                         )
                     return governed_context
-                if memory_governance_live_enabled() and unsafe_governed:
+                if memory_governance_live_enabled(env) and unsafe_governed:
                     diagnostics["memory_governance"]["fallback_reason"] = "unsafe_governed_result"
         except Exception as e:
             diagnostics["memory_governance"] = {"shadow_enabled": True, "live_enabled": False, "fallback_reason": type(e).__name__}
             if source_safe_recall_synthesis:
-                _record_source_safe_recall_canary_result(
-                    user_id=user_id,
-                    guild_id=guild_id,
-                    enabled_for_route=True,
-                    response_mode="source_safe_synthesis_exception",
-                    fallback_reason=type(e).__name__,
-                )
+                if record_operational_diagnostics:
+                    _record_source_safe_recall_canary_result(
+                        user_id=user_id,
+                        guild_id=guild_id,
+                        enabled_for_route=True,
+                        response_mode="source_safe_synthesis_exception",
+                        fallback_reason=type(e).__name__,
+                    )
                 if source_metadata is not None:
                     source_metadata.update(
                         {
@@ -19294,11 +19481,9 @@ def build_user_memory_context(
                             "atomic_candidates_live_used": 0,
                         }
                     )
-                LAST_MEMORY_PROMPT_DIAGNOSTICS[
-                    (user_id, guild_id)
-                ] = diagnostics
+                record_prompt_diagnostics(diagnostics)
                 return "No currently eligible source-bearing durable memory context."
-    LAST_MEMORY_PROMPT_DIAGNOSTICS[(user_id, guild_id)] = diagnostics
+    record_prompt_diagnostics(diagnostics)
     return legacy_context
 
 
@@ -33511,6 +33696,10 @@ class BnlMemoryPreviewExecution:
     route_status: str
     candidate_selected: bool
     fallback_reason: str
+    established_response: str = ""
+    packet_candidate_response: str = ""
+    repair_response: str = ""
+    final_selection: str = "established_path"
     stale_reason: str = ""
     guard_suppression_reason: str = ""
 
@@ -33519,8 +33708,9 @@ def build_bnl_memory_preview_baseline_prompt(
     *,
     wording: str,
     subject_display_name: str,
+    memory_context: str = PREVIEW_FACTUAL_PLACEHOLDER,
 ) -> str:
-    """Build a public-home comparison prompt without reading legacy memory."""
+    """Build the same public-home prompt shape used by normal generation."""
 
     safe_name = _safe_prompt_display_label(
         subject_display_name,
@@ -33556,10 +33746,46 @@ def build_bnl_memory_preview_baseline_prompt(
             normal_chat_prompt_contract(ROUTE_MODE_NORMAL_CHAT),
             personal_recall_interpretation_contract(wording),
             fake_lookup_safety_prompt_rules(),
-            PREVIEW_FACTUAL_PLACEHOLDER,
+            str(memory_context or "No durable memory yet."),
             safe_name,
             safe_name,
         )
+    )
+
+
+def build_bnl_memory_preview_established_prompt(
+    connection: sqlite3.Connection,
+    request: MemoryPreviewRequest,
+    environ: Mapping[str, str],
+) -> tuple[str, tuple[str, ...]]:
+    """Rebuild the established memory owner on the disposable DB clone."""
+
+    memory_context = build_user_memory_context(
+        request.subject_user_id,
+        request.guild_id,
+        route_mode=ROUTE_MODE_NORMAL_CHAT,
+        channel_policy="public_home",
+        user_text=request.wording,
+        is_owner_or_mod=False,
+        current_direct=True,
+        governance_allowed=bool(memory_governance_live_enabled(environ)),
+        channel_id=request.simulated_channel_id,
+        source_metadata={},
+        connection=connection,
+        environ=dict(environ),
+        record_operational_diagnostics=False,
+    )
+    placeholder = str(request.factual_placeholder or "")
+    baseline_prompt = str(request.baseline_prompt or "")
+    if not placeholder or placeholder not in baseline_prompt:
+        raise ValueError("preview_factual_placeholder_missing")
+    return (
+        baseline_prompt.replace(
+            placeholder,
+            str(memory_context or "No durable memory yet."),
+            1,
+        ),
+        (str(memory_context or "No durable memory yet."),),
     )
 
 
@@ -33643,10 +33869,16 @@ async def execute_bnl_memory_preview(
     stale_reason = ""
     guard_suppression_reason = ""
     proposed_response = ""
+    baseline_response = ""
+    packet_candidate_response = ""
+    repair_response = ""
     try:
         initial = await asyncio.to_thread(
             prepare_memory_preview,
             request,
+            baseline_prompt_builder=(
+                build_bnl_memory_preview_established_prompt
+            ),
         )
         if initial.connection is None:
             if initial.diagnostics.route_status == "needs_context":
@@ -33707,10 +33939,14 @@ async def execute_bnl_memory_preview(
                     )
                 ),
             )
+            packet_candidate_response = candidate_response
 
         fresh = await asyncio.to_thread(
             prepare_memory_preview,
             request,
+            baseline_prompt_builder=(
+                build_bnl_memory_preview_established_prompt
+            ),
         )
         unchanged, stale_reason = (
             memory_preview_snapshots_equivalent(initial, fresh)
@@ -33765,6 +34001,7 @@ async def execute_bnl_memory_preview(
                 )
                 or ""
             ).strip()
+            repair_response = repaired_response
             candidate_latency_ms += max(
                 0,
                 int(
@@ -33777,6 +34014,9 @@ async def execute_bnl_memory_preview(
             repaired_fresh = await asyncio.to_thread(
                 prepare_memory_preview,
                 request,
+                baseline_prompt_builder=(
+                    build_bnl_memory_preview_established_prompt
+                ),
             )
             repair_unchanged, repair_stale_reason = (
                 memory_preview_snapshots_equivalent(
@@ -33868,6 +34108,9 @@ async def execute_bnl_memory_preview(
             final_snapshot = await asyncio.to_thread(
                 prepare_memory_preview,
                 request,
+                baseline_prompt_builder=(
+                    build_bnl_memory_preview_established_prompt
+                ),
             )
             final_unchanged, final_reason = (
                 memory_preview_snapshots_equivalent(
@@ -33898,6 +34141,15 @@ async def execute_bnl_memory_preview(
             stale_reason = ""
 
         proposed_response = str(guarded_response or "").strip()
+        final_selection = (
+            "suppressed"
+            if not proposed_response
+            else "repair_attempt"
+            if evaluation.candidate_selected and repair_response
+            else "packet_candidate"
+            if evaluation.candidate_selected
+            else "established_path"
+        )
         await asyncio.to_thread(
             finalize_memory_preview,
             fresh,
@@ -33922,6 +34174,10 @@ async def execute_bnl_memory_preview(
             route_status=fresh.diagnostics.route_status,
             candidate_selected=evaluation.candidate_selected,
             fallback_reason=evaluation.fallback_reason,
+            established_response=baseline_response,
+            packet_candidate_response=packet_candidate_response,
+            repair_response=repair_response,
+            final_selection=final_selection,
             stale_reason=stale_reason,
             guard_suppression_reason=guard_suppression_reason,
         )
@@ -34072,8 +34328,18 @@ async def bnl_memory_preview(
         f"`{str(execution.candidate_selected).lower()}`",
         f"- fallback_reason: "
         f"`{execution.fallback_reason or 'none'}`",
+        f"- final_selection: `{execution.final_selection}`",
         "",
-        "**Proposed response**",
+        "**Established normal-generation baseline**",
+        execution.established_response or "(not generated)",
+        "",
+        "**Packet candidate**",
+        execution.packet_candidate_response or "(not generated)",
+        "",
+        "**Grounded repair attempt**",
+        execution.repair_response or "(not needed)",
+        "",
+        "**Final selected response**",
         proposed,
         "",
         "**Content-free diagnostics**",
