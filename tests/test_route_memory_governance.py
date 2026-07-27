@@ -1967,7 +1967,10 @@ class GuardedResponseRegenerationTests(unittest.IsolatedAsyncioTestCase):
         record_status.assert_called_once()
         result = record_status.call_args.args[0]
         self.assertFalse(result.success)
-        self.assertEqual(result.provider_error_code, "local_quota_guard")
+        self.assertEqual(
+            result.provider_error_code,
+            bnl01_bot.GENERATION_ERROR_LOCAL_MODEL_BUDGET,
+        )
 
     async def test_shared_grounding_retry_does_not_tone_filter_safe_machine_voice(self):
         provider_result = bnl01_bot.GenerationResult(

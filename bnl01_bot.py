@@ -340,6 +340,22 @@ from discord import app_commands
 from discord.ext import tasks
 from google import genai
 
+from bnl_gemini_routing import (
+    DEFAULT_FALLBACK_MODEL,
+    DEFAULT_PRIMARY_MODEL,
+    ProviderFailureKind,
+    budget_ceiling_for_route,
+    estimated_generation_reservation,
+    fallback_eligible_failure,
+    journal_protected_tokens,
+    policy_for_route,
+    provider_failure_kind,
+    provider_status_code,
+    retry_delay_seconds,
+    retryable_failure,
+    single_attempt_reservation,
+)
+
 from bnl_website_relay_state import (
     RelaySourceDecision,
     WebsiteRelayDecision,
@@ -368,8 +384,8 @@ from bnl_website_relay_state import (
 #   export GEMINI_API_KEY="..."
 #   export DISCORD_BOT_TOKEN="..."
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip() or "gemini-2.5-flash"
-GEMINI_FALLBACK_MODEL = os.getenv("GEMINI_FALLBACK_MODEL", "gemini-2.5-flash-lite").strip() or "gemini-2.5-flash-lite"
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", DEFAULT_PRIMARY_MODEL).strip() or DEFAULT_PRIMARY_MODEL
+GEMINI_FALLBACK_MODEL = os.getenv("GEMINI_FALLBACK_MODEL", DEFAULT_FALLBACK_MODEL).strip() or DEFAULT_FALLBACK_MODEL
 DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 BNL_API_KEY = os.getenv("BNL_API_KEY")
 BNL_STATUS_URL = os.getenv("BNL_STATUS_URL")
@@ -416,6 +432,13 @@ GENERATION_ERROR_PROVIDER_NETWORK = "provider_network_error"
 GENERATION_ERROR_PROVIDER_SERVER = "provider_server_error"
 GENERATION_ERROR_PROVIDER_EMPTY = "provider_empty_response"
 GENERATION_ERROR_PROVIDER_UNKNOWN = "provider_unknown_error"
+GENERATION_ERROR_PROVIDER_MODEL_UNAVAILABLE = "provider_model_unavailable"
+GENERATION_ERROR_PROVIDER_INVALID_REQUEST = "provider_invalid_request"
+GENERATION_ERROR_LOCAL_MODEL_BUDGET = "local_model_budget_exhausted"
+
+
+class LocalModelBudgetExhausted(RuntimeError):
+    """Raised when BNL's own daily API-token safety budget is exhausted."""
 
 PUBLIC_GENERATION_FALLBACK = (
     "BNL-01 received the message, but the upper processing layer is refusing clean output right now. "
@@ -444,6 +467,25 @@ class GenerationResult:
     model: str = ""
 
 
+@dataclass(frozen=True)
+class TokenUsageBreakdown:
+    total_tokens: int = 0
+    prompt_tokens: int = 0
+    candidate_tokens: int = 0
+    thought_tokens: int = 0
+    cached_tokens: int = 0
+
+
+@dataclass(frozen=True)
+class RoutedGenerationResponse:
+    raw_response: Any
+    model_name: str
+    fallback_used: bool = False
+
+    def __getattr__(self, name: str):
+        return getattr(self.raw_response, name)
+
+
 _last_generation_status = {
     "status": "never",
     "error_category": "",
@@ -462,6 +504,28 @@ BNL_COMMUNITY_SCOUTING_ENABLED = community_scouting_enabled()
 BNL_COMMUNITY_SCOUTING_MIN_SIGNALS = community_min_signals()
 
 DAILY_TOKEN_LIMIT = 1_350_000
+
+
+def _bounded_env_int(
+    name: str,
+    default: int,
+    *,
+    minimum: int,
+    maximum: int,
+) -> int:
+    try:
+        value = int(os.getenv(name, str(default)) or default)
+    except (TypeError, ValueError):
+        value = default
+    return max(minimum, min(maximum, value))
+
+
+# The pinned Python 3.9-compatible SDK can call Gemini 3 but cannot express
+# Gemini 3 thinking_level. Route policies therefore protect quality with
+# route-specific output allowances and leave Gemini 3 reasoning provider-managed.
+BNL_GEMINI_JOURNAL_PROTECTED_TOKENS = journal_protected_tokens(
+    DAILY_TOKEN_LIMIT
+)
 PACIFIC_TZ = pytz.timezone("US/Pacific")
 JOURNAL_PREPARATION_SCHEDULE_TIME = datetime_time(
     hour=18,
@@ -3766,10 +3830,7 @@ async def build_low_signal_relay_message(guild_id: int, reason: str, recent_rela
     if GEMINI_API_KEY and check_quota_availability():
         try:
             response = await asyncio.to_thread(_generate_gemini_content_with_fallback, prompt, "website_low_signal_relay")
-            generated, tokens = _extract_text_and_tokens(response)
-            if tokens:
-                increment_token_usage(tokens)
-                logging.info(f"📊 Tokens used: {tokens}")
+            generated, _tokens = _extract_text_and_tokens(response)
             candidate = _sanitize_low_signal_candidate(generated, guild_id, recent_relay_messages)
             if candidate:
                 lane_ok, _lane_reason = _validate_relay_lane_adherence(candidate, relay_lane or "carrier_trace", False, guild_id)
@@ -4853,6 +4914,28 @@ def init_db():
             tokens_used_today INTEGER DEFAULT 0,
             last_reset_date DATE DEFAULT CURRENT_DATE
         )
+        """
+    )
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS token_usage_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            usage_date TEXT NOT NULL,
+            recorded_at TEXT NOT NULL,
+            route TEXT NOT NULL,
+            model TEXT NOT NULL,
+            prompt_tokens INTEGER NOT NULL DEFAULT 0,
+            candidate_tokens INTEGER NOT NULL DEFAULT 0,
+            thought_tokens INTEGER NOT NULL DEFAULT 0,
+            cached_tokens INTEGER NOT NULL DEFAULT 0,
+            total_tokens INTEGER NOT NULL DEFAULT 0
+        )
+        """
+    )
+    cursor.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_token_usage_events_date_route
+        ON token_usage_events (usage_date, route)
         """
     )
 
@@ -7020,12 +7103,12 @@ def _journal_website_base_url() -> str:
 
 
 def _generate_journal_json_sync(_packet: dict, prompt: str) -> str:
-    if not check_quota_availability():
-        raise RuntimeError("quota_unavailable")
+    if not check_quota_availability(JOURNAL_ROUTE):
+        raise LocalModelBudgetExhausted(
+            "local_model_budget_exhausted"
+        )
     response = _generate_gemini_content_with_fallback(f"{BNL01_SYSTEM_PROMPT}\n\n{prompt}", JOURNAL_ROUTE)
-    text, tokens = _extract_text_and_tokens(response)
-    if tokens:
-        increment_token_usage(tokens)
+    text, _tokens = _extract_text_and_tokens(response)
     return text or ""
 
 
@@ -8146,6 +8229,38 @@ def _safe_provider_message(exc: Exception) -> str:
 def classify_generation_error(exc: Exception | None = None, *, empty_response: bool = False) -> tuple[str, str, str]:
     if empty_response:
         return GENERATION_ERROR_PROVIDER_EMPTY, "", ""
+    if isinstance(exc, LocalModelBudgetExhausted):
+        return (
+            GENERATION_ERROR_LOCAL_MODEL_BUDGET,
+            GENERATION_ERROR_LOCAL_MODEL_BUDGET,
+            "BNL's local daily model budget is exhausted.",
+        )
+    provider_kind = provider_failure_kind(exc)
+    status_code = provider_status_code(exc)
+    if provider_kind == ProviderFailureKind.RATE_LIMITED:
+        return (
+            GENERATION_ERROR_PROVIDER_RATE_LIMITED,
+            str(status_code or 429),
+            "Google's project/model rate limit is temporarily exhausted.",
+        )
+    if provider_kind == ProviderFailureKind.SERVER:
+        return (
+            GENERATION_ERROR_PROVIDER_SERVER,
+            str(status_code or 503),
+            "Google's generation service is temporarily unavailable.",
+        )
+    if provider_kind == ProviderFailureKind.MODEL_UNAVAILABLE:
+        return (
+            GENERATION_ERROR_PROVIDER_MODEL_UNAVAILABLE,
+            str(status_code or 404),
+            "The configured Google model is unavailable.",
+        )
+    if provider_kind == ProviderFailureKind.INVALID_REQUEST:
+        return (
+            GENERATION_ERROR_PROVIDER_INVALID_REQUEST,
+            str(status_code or 400),
+            "The configured Google model request is invalid.",
+        )
     msg = str(exc or "")
     msg_l = msg.lower()
     code = ""
@@ -15851,56 +15966,481 @@ def build_dynamic_curiosity_payload(guild_id: int):
 
 # ==================== TOKEN LIMITING ====================
 
-def check_and_reset_daily_counters():
-    today_pacific = datetime.now(PACIFIC_TZ).date().isoformat()
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    cursor.execute("SELECT last_reset_date FROM token_usage WHERE id = 1")
-    result = cursor.fetchone()
-    last_reset = result[0] if result else today_pacific
+_token_budget_reservation_lock = threading.Lock()
+_token_budget_reserved_tokens = 0
 
-    if last_reset != today_pacific:
+
+def _pacific_usage_date() -> str:
+    return datetime.now(PACIFIC_TZ).date().isoformat()
+
+
+def _ensure_token_usage_schema(cursor: sqlite3.Cursor) -> None:
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS token_usage (
+            id INTEGER PRIMARY KEY,
+            tokens_used_today INTEGER DEFAULT 0,
+            last_reset_date DATE DEFAULT CURRENT_DATE
+        )
+        """
+    )
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS token_usage_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            usage_date TEXT NOT NULL,
+            recorded_at TEXT NOT NULL,
+            route TEXT NOT NULL,
+            model TEXT NOT NULL,
+            prompt_tokens INTEGER NOT NULL DEFAULT 0,
+            candidate_tokens INTEGER NOT NULL DEFAULT 0,
+            thought_tokens INTEGER NOT NULL DEFAULT 0,
+            cached_tokens INTEGER NOT NULL DEFAULT 0,
+            total_tokens INTEGER NOT NULL DEFAULT 0
+        )
+        """
+    )
+    cursor.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_token_usage_events_date_route
+        ON token_usage_events (usage_date, route)
+        """
+    )
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS model_generation_attempts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            usage_date TEXT NOT NULL,
+            recorded_at TEXT NOT NULL,
+            route TEXT NOT NULL,
+            model TEXT NOT NULL,
+            outcome TEXT NOT NULL,
+            error_category TEXT NOT NULL DEFAULT '',
+            provider_status_code INTEGER NOT NULL DEFAULT 0,
+            prompt_tokens INTEGER NOT NULL DEFAULT 0,
+            candidate_tokens INTEGER NOT NULL DEFAULT 0,
+            thought_tokens INTEGER NOT NULL DEFAULT 0,
+            cached_tokens INTEGER NOT NULL DEFAULT 0,
+            total_tokens INTEGER NOT NULL DEFAULT 0
+        )
+        """
+    )
+    cursor.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_model_generation_attempts_date_route
+        ON model_generation_attempts (usage_date, route)
+        """
+    )
+    cursor.execute("INSERT OR IGNORE INTO token_usage (id) VALUES (1)")
+
+
+def _reset_token_counter_if_needed(
+    cursor: sqlite3.Cursor,
+    today_pacific: str,
+) -> bool:
+    cursor.execute(
+        "SELECT last_reset_date FROM token_usage WHERE id = 1"
+    )
+    result = cursor.fetchone()
+    last_reset = str(result[0] or "") if result else ""
+    if last_reset == today_pacific:
+        return False
+    cursor.execute(
+        """
+        UPDATE token_usage
+        SET tokens_used_today = 0, last_reset_date = ?
+        WHERE id = 1
+        """,
+        (today_pacific,),
+    )
+    return True
+
+
+def check_and_reset_daily_counters():
+    today_pacific = _pacific_usage_date()
+    reset = False
+    with sqlite3.connect(DB_FILE, timeout=30) as conn:
+        cursor = conn.cursor()
+        cursor.execute("BEGIN IMMEDIATE")
+        _ensure_token_usage_schema(cursor)
+        reset = _reset_token_counter_if_needed(cursor, today_pacific)
+        conn.commit()
+    if reset:
+        logging.info(
+            "local_model_budget_reset usage_date=%s timezone=America/Los_Angeles",
+            today_pacific,
+        )
+
+def check_quota_availability(route: str = ""):
+    check_and_reset_daily_counters()
+    with sqlite3.connect(DB_FILE) as conn:
+        result = conn.execute(
+            "SELECT tokens_used_today FROM token_usage WHERE id = 1"
+        ).fetchone()
+    tokens_used = result[0] if result else 0
+    ceiling = budget_ceiling_for_route(DAILY_TOKEN_LIMIT, route)
+    return tokens_used < ceiling
+
+
+def _usage_int(value) -> int:
+    try:
+        return max(0, int(value or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _extract_token_usage_breakdown(response) -> TokenUsageBreakdown:
+    usage = getattr(response, "usage_metadata", None)
+    if usage is None:
+        return TokenUsageBreakdown()
+    prompt_tokens = _usage_int(
+        getattr(usage, "prompt_token_count", None)
+    )
+    candidate_tokens = _usage_int(
+        getattr(usage, "candidates_token_count", None)
+    )
+    thought_tokens = _usage_int(
+        getattr(usage, "thoughts_token_count", None)
+    )
+    cached_tokens = _usage_int(
+        getattr(usage, "cached_content_token_count", None)
+    )
+    total_tokens = _usage_int(
+        getattr(usage, "total_token_count", None)
+    )
+    if not total_tokens:
+        total_tokens = prompt_tokens + candidate_tokens + thought_tokens
+    return TokenUsageBreakdown(
+        total_tokens=total_tokens,
+        prompt_tokens=prompt_tokens,
+        candidate_tokens=candidate_tokens,
+        thought_tokens=thought_tokens,
+        cached_tokens=cached_tokens,
+    )
+
+
+def record_token_usage(
+    breakdown: TokenUsageBreakdown,
+    *,
+    route: str,
+    model: str,
+) -> int:
+    total_tokens = _usage_int(breakdown.total_tokens)
+    if not total_tokens:
+        return 0
+    today_pacific = _pacific_usage_date()
+    safe_route = re.sub(
+        r"[^a-zA-Z0-9_.:-]+",
+        "_",
+        str(route or "unknown"),
+    )[:120] or "unknown"
+    safe_model = re.sub(
+        r"[^a-zA-Z0-9_.:/-]+",
+        "_",
+        str(model or "unknown"),
+    )[:120] or "unknown"
+    reset = False
+    with sqlite3.connect(DB_FILE, timeout=30) as conn:
+        cursor = conn.cursor()
+        cursor.execute("BEGIN IMMEDIATE")
+        _ensure_token_usage_schema(cursor)
+        reset = _reset_token_counter_if_needed(cursor, today_pacific)
         cursor.execute(
-            "UPDATE token_usage SET tokens_used_today = 0, last_reset_date = ? WHERE id = 1",
-            (today_pacific,),
+            """
+            INSERT INTO token_usage_events (
+                usage_date,
+                recorded_at,
+                route,
+                model,
+                prompt_tokens,
+                candidate_tokens,
+                thought_tokens,
+                cached_tokens,
+                total_tokens
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                today_pacific,
+                datetime.now(timezone.utc).isoformat(),
+                safe_route,
+                safe_model,
+                _usage_int(breakdown.prompt_tokens),
+                _usage_int(breakdown.candidate_tokens),
+                _usage_int(breakdown.thought_tokens),
+                _usage_int(breakdown.cached_tokens),
+                total_tokens,
+            ),
+        )
+        cursor.execute(
+            """
+            UPDATE token_usage
+            SET tokens_used_today = tokens_used_today + ?
+            WHERE id = 1
+            """,
+            (total_tokens,),
+        )
+        daily_total_row = cursor.execute(
+            "SELECT tokens_used_today FROM token_usage WHERE id = 1"
+        ).fetchone()
+        conn.commit()
+    if reset:
+        logging.info(
+            "local_model_budget_reset usage_date=%s timezone=America/Los_Angeles",
+            today_pacific,
+        )
+    daily_total = _usage_int(
+        daily_total_row[0] if daily_total_row else total_tokens
+    )
+    logging.info(
+        "model_token_usage route=%s model=%s total=%s prompt=%s "
+        "candidate=%s thoughts=%s cached=%s daily_total=%s daily_limit=%s",
+        safe_route,
+        safe_model,
+        total_tokens,
+        _usage_int(breakdown.prompt_tokens),
+        _usage_int(breakdown.candidate_tokens),
+        _usage_int(breakdown.thought_tokens),
+        _usage_int(breakdown.cached_tokens),
+        daily_total,
+        DAILY_TOKEN_LIMIT,
+    )
+    return daily_total
+
+
+def record_generation_token_usage(
+    response,
+    *,
+    route: str,
+    model: str,
+    fallback_total: int = 0,
+) -> int:
+    breakdown = _extract_token_usage_breakdown(response)
+    accounting_route = route
+    if not breakdown.total_tokens and fallback_total:
+        breakdown = TokenUsageBreakdown(
+            total_tokens=_usage_int(fallback_total)
+        )
+        accounting_route = f"{route}.usage_estimated"
+        logging.warning(
+            "model_token_usage_estimated route=%s model=%s reason="
+            "provider_usage_metadata_missing estimate=%s",
+            route,
+            model,
+            breakdown.total_tokens,
+        )
+    return record_token_usage(
+        breakdown,
+        route=accounting_route,
+        model=model,
+    )
+
+
+def record_failed_generation_attempt(
+    exc: Exception,
+    *,
+    route: str,
+    model: str,
+) -> int:
+    kind = provider_failure_kind(exc)
+    status_code = provider_status_code(exc)
+    usage_carrier = getattr(exc, "response", None)
+    breakdown = _extract_token_usage_breakdown(usage_carrier)
+    if breakdown.total_tokens:
+        record_token_usage(
+            breakdown,
+            route=f"{route}.failed_{kind.value}",
+            model=model,
+        )
+    today_pacific = _pacific_usage_date()
+    safe_route = re.sub(
+        r"[^a-zA-Z0-9_.:-]+",
+        "_",
+        str(route or "unknown"),
+    )[:120] or "unknown"
+    safe_model = re.sub(
+        r"[^a-zA-Z0-9_.:/-]+",
+        "_",
+        str(model or "unknown"),
+    )[:120] or "unknown"
+    with sqlite3.connect(DB_FILE, timeout=30) as conn:
+        cursor = conn.cursor()
+        cursor.execute("BEGIN IMMEDIATE")
+        _ensure_token_usage_schema(cursor)
+        _reset_token_counter_if_needed(cursor, today_pacific)
+        cursor.execute(
+            """
+            INSERT INTO model_generation_attempts (
+                usage_date,
+                recorded_at,
+                route,
+                model,
+                outcome,
+                error_category,
+                provider_status_code,
+                prompt_tokens,
+                candidate_tokens,
+                thought_tokens,
+                cached_tokens,
+                total_tokens
+            )
+            VALUES (?, ?, ?, ?, 'failure', ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                today_pacific,
+                datetime.now(timezone.utc).isoformat(),
+                safe_route,
+                safe_model,
+                kind.value,
+                status_code,
+                _usage_int(breakdown.prompt_tokens),
+                _usage_int(breakdown.candidate_tokens),
+                _usage_int(breakdown.thought_tokens),
+                _usage_int(breakdown.cached_tokens),
+                _usage_int(breakdown.total_tokens),
+            ),
         )
         conn.commit()
-        logging.info(f"🔄 Daily token counter reset for {today_pacific} (Pacific Time)")
-    conn.close()
+    logging.warning(
+        "model_generation_attempt_failed route=%s model=%s category=%s "
+        "status=%s total_tokens=%s",
+        safe_route,
+        safe_model,
+        kind.value,
+        status_code,
+        _usage_int(breakdown.total_tokens),
+    )
+    return _usage_int(breakdown.total_tokens)
 
-def check_quota_availability():
-    check_and_reset_daily_counters()
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    cursor.execute("SELECT tokens_used_today FROM token_usage WHERE id = 1")
-    result = cursor.fetchone()
-    conn.close()
-    tokens_used = result[0] if result else 0
-    return tokens_used < DAILY_TOKEN_LIMIT
 
 def increment_token_usage(tokens: int):
-    if not tokens:
-        return
-    check_and_reset_daily_counters()
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    cursor.execute(
-        "UPDATE token_usage SET tokens_used_today = tokens_used_today + ? WHERE id = 1",
-        (tokens,),
+    """Backward-compatible unattributed accounting for legacy callers."""
+    return record_token_usage(
+        TokenUsageBreakdown(total_tokens=_usage_int(tokens)),
+        route="legacy_unattributed",
+        model="unknown",
     )
-    conn.commit()
-    conn.close()
+
+
+def _estimated_generation_reservation(
+    contents: str,
+    route: str = "",
+) -> int:
+    return estimated_generation_reservation(
+        contents,
+        policy_for_route(route),
+    )
+
+
+def reserve_local_model_budget(
+    contents: str,
+    route: str = "",
+) -> int:
+    global _token_budget_reserved_tokens
+    reservation = _estimated_generation_reservation(contents, route)
+    ceiling = budget_ceiling_for_route(DAILY_TOKEN_LIMIT, route)
+    with _token_budget_reservation_lock:
+        tokens_used, _ = get_usage_stats()
+        projected_total = (
+            tokens_used
+            + _token_budget_reserved_tokens
+            + reservation
+        )
+        if projected_total > ceiling:
+            raise LocalModelBudgetExhausted(
+                "local_model_budget_exhausted"
+            )
+        _token_budget_reserved_tokens += reservation
+    return reservation
+
+
+def release_local_model_budget(reservation: int) -> None:
+    global _token_budget_reserved_tokens
+    with _token_budget_reservation_lock:
+        _token_budget_reserved_tokens = max(
+            0,
+            _token_budget_reserved_tokens - _usage_int(reservation),
+        )
 
 def get_usage_stats():
     check_and_reset_daily_counters()
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    cursor.execute("SELECT tokens_used_today, last_reset_date FROM token_usage WHERE id = 1")
-    result = cursor.fetchone()
-    conn.close()
+    with sqlite3.connect(DB_FILE) as conn:
+        result = conn.execute(
+            """
+            SELECT tokens_used_today, last_reset_date
+            FROM token_usage
+            WHERE id = 1
+            """
+        ).fetchone()
     if result:
         return result[0], result[1]
-    return 0, datetime.now(PACIFIC_TZ).date().isoformat()
+    return 0, _pacific_usage_date()
+
+
+def get_usage_breakdown() -> dict:
+    tokens_used, last_reset = get_usage_stats()
+    with sqlite3.connect(DB_FILE) as conn:
+        _ensure_token_usage_schema(conn.cursor())
+        totals = conn.execute(
+            """
+            SELECT
+                COUNT(*),
+                COALESCE(SUM(total_tokens), 0),
+                COALESCE(SUM(prompt_tokens), 0),
+                COALESCE(SUM(candidate_tokens), 0),
+                COALESCE(SUM(thought_tokens), 0),
+                COALESCE(SUM(cached_tokens), 0)
+            FROM token_usage_events
+            WHERE usage_date = ?
+            """,
+            (last_reset,),
+        ).fetchone()
+        routes = conn.execute(
+            """
+            SELECT route, COUNT(*), COALESCE(SUM(total_tokens), 0)
+            FROM token_usage_events
+            WHERE usage_date = ?
+            GROUP BY route
+            ORDER BY SUM(total_tokens) DESC, route ASC
+            """,
+            (last_reset,),
+        ).fetchall()
+    tracked_total = _usage_int(totals[1] if totals else 0)
+    ordinary_route_ceiling = budget_ceiling_for_route(
+        DAILY_TOKEN_LIMIT,
+        "normal_chat",
+    )
+    return {
+        "usage_date": last_reset,
+        "ordinary_route_ceiling": ordinary_route_ceiling,
+        "ordinary_route_remaining": max(
+            0,
+            ordinary_route_ceiling - _usage_int(tokens_used),
+        ),
+        "journal_protected_tokens": max(
+            0,
+            DAILY_TOKEN_LIMIT - ordinary_route_ceiling,
+        ),
+        "total_tokens": _usage_int(tokens_used),
+        "tracked_calls": _usage_int(totals[0] if totals else 0),
+        "tracked_total_tokens": tracked_total,
+        "prompt_tokens": _usage_int(totals[2] if totals else 0),
+        "candidate_tokens": _usage_int(totals[3] if totals else 0),
+        "thought_tokens": _usage_int(totals[4] if totals else 0),
+        "cached_tokens": _usage_int(totals[5] if totals else 0),
+        "unattributed_tokens": max(
+            0,
+            _usage_int(tokens_used) - tracked_total,
+        ),
+        "routes": [
+            {
+                "route": str(row[0] or "unknown"),
+                "calls": _usage_int(row[1]),
+                "total_tokens": _usage_int(row[2]),
+            }
+            for row in routes
+        ],
+    }
 
 # ==================== AMBIENT SCHEDULING ====================
 
@@ -20451,6 +20991,27 @@ def _gemini_model_resource_name(model_name: str) -> str:
         return model_name
     return f"models/{model_name}"
 
+
+def _generation_config_for_model(
+    model_name: str,
+    route: str,
+):
+    policy = policy_for_route(route)
+    config_kwargs = {
+        "max_output_tokens": policy.max_output_tokens,
+    }
+    normalized_model = str(model_name or "").lower()
+    if "gemini-2.5" in normalized_model:
+        legacy_budget = min(
+            policy.legacy_thinking_budget,
+            max(0, policy.max_output_tokens - 600),
+        )
+        config_kwargs["thinking_config"] = genai.types.ThinkingConfig(
+            thinking_budget=legacy_budget,
+        )
+    return genai.types.GenerateContentConfig(**config_kwargs)
+
+
 async def _generate_gemini_content_with_fallback_async(contents: str, route: str):
     started = time.monotonic()
     logging.info(f"gemini_generation_offloaded route={route}")
@@ -20466,16 +21027,14 @@ async def _generate_gemini_content_result_async(contents: str, route: str) -> Ge
     model = GEMINI_MODEL
     try:
         response = await _generate_gemini_content_with_fallback_async(contents, route)
-        text, tokens = _extract_text_and_tokens(response)
+        model = getattr(response, "model_name", GEMINI_MODEL)
+        text, _tokens = _extract_text_and_tokens(response)
         elapsed = time.monotonic() - started
         if not text:
             cat, code, safe_msg = classify_generation_error(empty_response=True)
             result = GenerationResult(False, "", cat, code, safe_msg, route, elapsed, model)
             record_generation_result_status(result)
             return result
-        if tokens:
-            increment_token_usage(tokens)
-            logging.info(f"📊 Tokens used: {tokens}")
         result = GenerationResult(True, text.strip(), "", "", "", route, elapsed, model)
         record_generation_result_status(result)
         return result
@@ -20488,35 +21047,123 @@ async def _generate_gemini_content_result_async(contents: str, route: str) -> Ge
         return result
 
 
-def _generate_gemini_content_with_fallback(contents: str, route: str):
-    client = get_gemini_client()
-    logging.info(f"gemini_model_attempt model={GEMINI_MODEL} route={route}")
-    try:
-        return client.models.generate_content(
-            model=_gemini_model_resource_name(GEMINI_MODEL),
-            contents=contents
+def _generate_model_with_retry(
+    client,
+    *,
+    model_name: str,
+    contents: str,
+    route: str,
+    policy,
+):
+    last_error = None
+    for attempt_index in range(policy.provider_retries + 1):
+        logging.info(
+            "gemini_model_attempt model=%s route=%s attempt=%s",
+            model_name,
+            route,
+            attempt_index + 1,
         )
-    except Exception as primary_error:
-        if not _is_gemini_503(primary_error):
-            raise
-
-        logging.warning(
-            f"gemini_primary_unavailable_trying_fallback primary={GEMINI_MODEL} "
-            f"fallback={GEMINI_FALLBACK_MODEL} reason=gemini_503"
-        )
-        logging.info(f"gemini_model_attempt model={GEMINI_FALLBACK_MODEL} route={route}")
         try:
             response = client.models.generate_content(
-                model=_gemini_model_resource_name(GEMINI_FALLBACK_MODEL),
-                contents=contents
+                model=_gemini_model_resource_name(model_name),
+                contents=contents,
+                config=_generation_config_for_model(model_name, route),
             )
-            logging.info(f"gemini_fallback_succeeded fallback={GEMINI_FALLBACK_MODEL}")
+            record_generation_token_usage(
+                response,
+                route=route,
+                model=model_name,
+                fallback_total=single_attempt_reservation(contents, policy),
+            )
             return response
-        except Exception as fallback_error:
-            if _is_gemini_503(fallback_error):
-                logging.error(f"gemini_fallback_failed fallback={GEMINI_FALLBACK_MODEL} reason=gemini_503")
-                logging.error("direct_generation_failed reason=gemini_503")
+        except Exception as error:
+            last_error = error
+            kind = provider_failure_kind(error)
+            record_failed_generation_attempt(
+                error,
+                route=route,
+                model=model_name,
+            )
+            if attempt_index < policy.provider_retries and retryable_failure(kind):
+                delay = retry_delay_seconds(attempt_index)
+                logging.warning(
+                    "gemini_model_retry model=%s route=%s category=%s "
+                    "delay_seconds=%s",
+                    model_name,
+                    route,
+                    kind.value,
+                    delay,
+                )
+                time.sleep(delay)
+                continue
             raise
+    raise last_error or RuntimeError("provider_generation_failed")
+
+
+def _generate_gemini_content_with_fallback(contents: str, route: str):
+    policy = policy_for_route(route)
+    reservation = reserve_local_model_budget(contents, route)
+    client = get_gemini_client()
+    try:
+        try:
+            response = _generate_model_with_retry(
+                client,
+                model_name=GEMINI_MODEL,
+                contents=contents,
+                route=route,
+                policy=policy,
+            )
+            return RoutedGenerationResponse(
+                raw_response=response,
+                model_name=GEMINI_MODEL,
+                fallback_used=False,
+            )
+        except Exception as primary_error:
+            kind = provider_failure_kind(primary_error)
+            fallback_allowed = (
+                policy.allow_fallback
+                and GEMINI_FALLBACK_MODEL
+                and GEMINI_FALLBACK_MODEL != GEMINI_MODEL
+                and fallback_eligible_failure(kind)
+            )
+            if not fallback_allowed:
+                raise
+            logging.warning(
+                "gemini_primary_failed_trying_fallback primary=%s "
+                "fallback=%s route=%s category=%s same_project=true",
+                GEMINI_MODEL,
+                GEMINI_FALLBACK_MODEL,
+                route,
+                kind.value,
+            )
+            try:
+                response = _generate_model_with_retry(
+                    client,
+                    model_name=GEMINI_FALLBACK_MODEL,
+                    contents=contents,
+                    route=route,
+                    policy=policy,
+                )
+            except Exception as fallback_error:
+                logging.error(
+                    "gemini_fallback_failed fallback=%s route=%s category=%s",
+                    GEMINI_FALLBACK_MODEL,
+                    route,
+                    provider_failure_kind(fallback_error).value,
+                )
+                raise
+            logging.info(
+                "gemini_fallback_succeeded fallback=%s route=%s",
+                GEMINI_FALLBACK_MODEL,
+                route,
+            )
+            return RoutedGenerationResponse(
+                raw_response=response,
+                model_name=GEMINI_FALLBACK_MODEL,
+                fallback_used=True,
+            )
+    finally:
+        release_local_model_budget(reservation)
 
 
 FAKE_LOOKUP_CLAIM_PATTERNS = (
@@ -21051,9 +21698,7 @@ Draft to repair:
 Repaired response:"""
     try:
         response = await _generate_gemini_content_with_fallback_async(repair_prompt, "media_response_grounding_repair")
-        repaired, tokens = _extract_text_and_tokens(response)
-        if tokens:
-            increment_token_usage(tokens)
+        repaired, _tokens = _extract_text_and_tokens(response)
         repaired = (repaired or "").strip()
         if not repaired:
             return ""
@@ -21104,9 +21749,7 @@ Current prompt context:
 BNL-01 response:"""
     try:
         response = await _generate_gemini_content_with_fallback_async(strict_prompt, "media_grounding_strict_regeneration")
-        regenerated, tokens = _extract_text_and_tokens(response)
-        if tokens:
-            increment_token_usage(tokens)
+        regenerated, _tokens = _extract_text_and_tokens(response)
         regenerated = (regenerated or "").strip()
         if not regenerated:
             logging.info("media_grounding_strict_regeneration_failed reason=empty route=%s channel_policy=%s current_message_media_context=%s recent_media_context=%s explicit_media_followup=%s", route, _extract_channel_policy_from_prompt(prompt), int(_prompt_has_current_message_media_context(prompt)), int(_prompt_has_recent_media_context(prompt)), int(prompt_has_explicit_media_followup(prompt)))
@@ -21174,9 +21817,9 @@ BNL-01 response:"""
             result = GenerationResult(
                 False,
                 "",
-                GENERATION_ERROR_PROVIDER_RATE_LIMITED,
-                "local_quota_guard",
-                "",
+                GENERATION_ERROR_LOCAL_MODEL_BUDGET,
+                GENERATION_ERROR_LOCAL_MODEL_BUDGET,
+                "BNL's local daily model budget is exhausted.",
                 "conversation_grounding_regeneration",
                 0.0,
                 GEMINI_MODEL,
@@ -21267,14 +21910,17 @@ def _safe_uncertain_response_from_prompt(prompt: str) -> str:
 async def get_gemini_generation_result(prompt: str, user_id: int, guild_id: int, route: str = "get_gemini_response") -> GenerationResult:
     started = time.monotonic()
     try:
-        if not check_quota_availability():
-            tokens_used, _ = get_usage_stats()
-            pct = (tokens_used / DAILY_TOKEN_LIMIT) * 100
-            text = (
-                f"🚫 **Daily quota exhausted!** Used {tokens_used:,}/{DAILY_TOKEN_LIMIT:,} tokens "
-                f"({pct:.1f}%). Quota resets at midnight Pacific Time."
+        if not check_quota_availability(route):
+            result = GenerationResult(
+                False,
+                "",
+                GENERATION_ERROR_LOCAL_MODEL_BUDGET,
+                GENERATION_ERROR_LOCAL_MODEL_BUDGET,
+                "BNL's local daily model budget is exhausted.",
+                route,
+                time.monotonic() - started,
+                GEMINI_MODEL,
             )
-            result = GenerationResult(True, text, "", "", "", route, time.monotonic() - started, "local_quota_guard")
             record_generation_result_status(result)
             return result
 
@@ -21329,13 +21975,19 @@ async def get_gemini_response(
     source_context_available: bool = False,
 ):
     try:
-        if not check_quota_availability():
-            tokens_used, _ = get_usage_stats()
-            pct = (tokens_used / DAILY_TOKEN_LIMIT) * 100
-            return (
-                f"🚫 **Daily quota exhausted!** Used {tokens_used:,}/{DAILY_TOKEN_LIMIT:,} tokens "
-                f"({pct:.1f}%). Quota resets at midnight Pacific Time."
+        if not check_quota_availability(route):
+            result = GenerationResult(
+                False,
+                "",
+                GENERATION_ERROR_LOCAL_MODEL_BUDGET,
+                GENERATION_ERROR_LOCAL_MODEL_BUDGET,
+                "BNL's local daily model budget is exhausted.",
+                route,
+                0.0,
+                GEMINI_MODEL,
             )
+            record_generation_result_status(result)
+            return ""
 
         history = await asyncio.to_thread(get_conversation_history, user_id, guild_id) if (user_id and not conversation_context_v2_enabled()) else []
 
@@ -21352,12 +22004,6 @@ async def get_gemini_response(
                     text = msg["parts"][0] if msg.get("parts") else ""
                     conversation_context += f"User: {text}\n"
 
-        generation_config = genai.types.GenerationConfig(
-            temperature=0.9,
-            top_p=0.95,
-            top_k=50,
-            max_output_tokens=600,
-        )
         print("BNL DEBUG: sending prompt to Gemini")
 
         is_show_state_route = (route or "").startswith("show_state")
@@ -32288,27 +32934,78 @@ async def relationship_settings(interaction: discord.Interaction, action: str = 
             msg = summary + "\nActions: `disable_proactive`, `enable_proactive`, `disable_playful_rivalry`, `enable_playful_rivalry`, or `controls`."
     await interaction.response.send_message(msg[:1900], ephemeral=True)
 
-@tree.command(name="usage", description="View BNL-01's daily token usage statistics.")
+@tree.command(
+    name="usage",
+    description="View BNL-01's local daily API-token budget.",
+)
 @app_commands.checks.has_permissions(administrator=True)
 async def usage(interaction: discord.Interaction):
-    tokens_used, last_reset = get_usage_stats()
+    diagnostics = get_usage_breakdown()
+    tokens_used = diagnostics["total_tokens"]
+    last_reset = diagnostics["usage_date"]
     percentage = (tokens_used / DAILY_TOKEN_LIMIT) * 100
-    remaining = DAILY_TOKEN_LIMIT - tokens_used
+    remaining = max(0, DAILY_TOKEN_LIMIT - tokens_used)
 
     status_indicator = "🟢" if percentage < 80 else "🟡" if percentage < 95 else "🔴"
 
-    embed = discord.Embed(title="📊 BNL-01 Token Usage", color=discord.Color.blue())
+    embed = discord.Embed(
+        title="📊 BNL-01 Local Model Budget",
+        color=discord.Color.blue(),
+    )
     embed.add_field(
-        name="Today's Usage",
+        name="Today's BNL API Usage",
         value=(
             f"{status_indicator} **{tokens_used:,} / {DAILY_TOKEN_LIMIT:,} tokens** ({percentage:.1f}%)\n"
             f"{remaining:,} tokens remaining"
         ),
         inline=False,
     )
+    embed.add_field(
+        name="Journal-Protected Capacity",
+        value=(
+            f"**{diagnostics['journal_protected_tokens']:,} tokens** held "
+            "for Journal generation before ordinary routes may use the "
+            "rest of the daily budget.\n"
+            f"Ordinary-route capacity remaining: "
+            f"**{diagnostics['ordinary_route_remaining']:,}**"
+        ),
+        inline=False,
+    )
+    route_lines = [
+        f"`{item['route']}` — {item['total_tokens']:,} "
+        f"tokens / {item['calls']:,} call(s)"
+        for item in diagnostics["routes"][:6]
+    ]
+    if diagnostics["unattributed_tokens"]:
+        route_lines.append(
+            "`pre-ledger/unattributed` — "
+            f"{diagnostics['unattributed_tokens']:,} tokens"
+        )
+    embed.add_field(
+        name="Provider Breakdown",
+        value=(
+            f"Tracked calls: **{diagnostics['tracked_calls']:,}**\n"
+            f"Input: **{diagnostics['prompt_tokens']:,}**\n"
+            f"Visible output: **{diagnostics['candidate_tokens']:,}**\n"
+            f"Thinking: **{diagnostics['thought_tokens']:,}**\n"
+            f"Cached input (already included above): "
+            f"**{diagnostics['cached_tokens']:,}**"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="Highest-Use Routes",
+        value="\n".join(route_lines) if route_lines else "No tracked calls yet.",
+        inline=False,
+    )
     embed.add_field(name="Last Reset", value=last_reset, inline=True)
     embed.add_field(name="Next Reset", value="Midnight Pacific Time", inline=True)
-    embed.set_footer(text="The Network monitors resource allocation carefully.")
+    embed.set_footer(
+        text=(
+            "This is BNL's own API safety budget, not a Gemini app "
+            "subscription or Google provider quota."
+        )
+    )
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 @tree.command(name="about", description="Learn about BNL-01 and the BARCODE Network.")
@@ -33035,6 +33732,18 @@ async def bnl_memory_preview(
     if not clean_wording or len(clean_wording) > 1000:
         await interaction.response.send_message(
             "❌ Preview wording must contain 1–1000 characters.",
+            ephemeral=True,
+        )
+        return
+    if not check_quota_availability("bnl_memory_preview_candidate"):
+        tokens_used, _last_reset = get_usage_stats()
+        await interaction.response.send_message(
+            "❌ Preview not run: BNL's local daily model budget is "
+            f"exhausted ({tokens_used:,}/{DAILY_TOKEN_LIMIT:,} API "
+            "tokens). This is BNL's own safety counter, not the Gemini "
+            "app allowance or a Google provider-quota error. It resets "
+            "at midnight Pacific Time. No preview generation was "
+            "attempted.",
             ephemeral=True,
         )
         return

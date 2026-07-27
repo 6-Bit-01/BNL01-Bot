@@ -1,0 +1,244 @@
+"""Route-aware Gemini model, budget, retry, and fallback policy for BNL-01.
+
+This module contains no provider client calls. It keeps routing decisions small,
+testable, and independent from Discord, SQLite, and Journal implementation code.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from enum import Enum
+import os
+import re
+
+
+DEFAULT_PRIMARY_MODEL = "gemini-3.6-flash"
+DEFAULT_FALLBACK_MODEL = "gemini-3.5-flash"
+
+
+class ProviderFailureKind(str, Enum):
+    RATE_LIMITED = "rate_limited"
+    SERVER = "server"
+    MODEL_UNAVAILABLE = "model_unavailable"
+    INVALID_REQUEST = "invalid_request"
+    UNKNOWN = "unknown"
+
+
+@dataclass(frozen=True)
+class GeminiRoutePolicy:
+    lane: str
+    max_output_tokens: int
+    legacy_thinking_budget: int
+    provider_retries: int
+    allow_fallback: bool
+    journal_protected: bool = False
+
+
+def _bounded_env_int(
+    name: str,
+    default: int,
+    *,
+    minimum: int,
+    maximum: int,
+) -> int:
+    try:
+        value = int(os.getenv(name, str(default)) or default)
+    except (TypeError, ValueError):
+        value = default
+    return max(minimum, min(maximum, value))
+
+
+def journal_protected_tokens(daily_limit: int) -> int:
+    configured = _bounded_env_int(
+        "BNL_GEMINI_JOURNAL_PROTECTED_TOKENS",
+        250_000,
+        minimum=0,
+        maximum=max(0, int(daily_limit)),
+    )
+    return min(configured, max(0, int(daily_limit) // 2))
+
+
+def _route_lane(route: str) -> str:
+    normalized = re.sub(r"[^a-z0-9_:-]+", "_", str(route or "").lower())
+    if normalized == "bnl_journal_generation" or "journal" in normalized:
+        return "journal"
+    protected_markers = (
+        "memory_preview",
+        "memory_governance",
+        "relationship",
+        "shared_brain",
+        "source_file",
+        "source_enrichment",
+        "dossier",
+        "population",
+        "entity_intelligence",
+        "canon",
+    )
+    if any(marker in normalized for marker in protected_markers):
+        return "protected"
+    background_markers = (
+        "website",
+        "relay",
+        "ambient",
+        "occasion",
+        "community_scouting",
+        "curiosity",
+        "heartbeat",
+    )
+    if any(marker in normalized for marker in background_markers):
+        return "background"
+    return "conversation"
+
+
+def policy_for_route(route: str) -> GeminiRoutePolicy:
+    lane = _route_lane(route)
+    retries = _bounded_env_int(
+        "BNL_GEMINI_PROVIDER_RETRIES",
+        1,
+        minimum=0,
+        maximum=2,
+    )
+    if lane == "journal":
+        return GeminiRoutePolicy(
+            lane=lane,
+            max_output_tokens=_bounded_env_int(
+                "BNL_GEMINI_JOURNAL_MAX_OUTPUT_TOKENS",
+                16_384,
+                minimum=4_096,
+                maximum=32_768,
+            ),
+            legacy_thinking_budget=_bounded_env_int(
+                "BNL_GEMINI_JOURNAL_LEGACY_THINKING_BUDGET",
+                8_192,
+                minimum=0,
+                maximum=24_576,
+            ),
+            provider_retries=retries,
+            allow_fallback=False,
+            journal_protected=True,
+        )
+    if lane == "protected":
+        return GeminiRoutePolicy(
+            lane=lane,
+            max_output_tokens=_bounded_env_int(
+                "BNL_GEMINI_PROTECTED_MAX_OUTPUT_TOKENS",
+                8_192,
+                minimum=2_048,
+                maximum=24_576,
+            ),
+            legacy_thinking_budget=_bounded_env_int(
+                "BNL_GEMINI_PROTECTED_LEGACY_THINKING_BUDGET",
+                4_096,
+                minimum=0,
+                maximum=16_384,
+            ),
+            provider_retries=retries,
+            allow_fallback=False,
+        )
+    if lane == "background":
+        return GeminiRoutePolicy(
+            lane=lane,
+            max_output_tokens=_bounded_env_int(
+                "BNL_GEMINI_BACKGROUND_MAX_OUTPUT_TOKENS",
+                4_096,
+                minimum=1_024,
+                maximum=16_384,
+            ),
+            legacy_thinking_budget=_bounded_env_int(
+                "BNL_GEMINI_BACKGROUND_LEGACY_THINKING_BUDGET",
+                1_024,
+                minimum=0,
+                maximum=8_192,
+            ),
+            provider_retries=retries,
+            allow_fallback=True,
+        )
+    return GeminiRoutePolicy(
+        lane=lane,
+        max_output_tokens=_bounded_env_int(
+            "BNL_GEMINI_CONVERSATION_MAX_OUTPUT_TOKENS",
+            4_096,
+            minimum=1_024,
+            maximum=16_384,
+        ),
+        legacy_thinking_budget=_bounded_env_int(
+            "BNL_GEMINI_CONVERSATION_LEGACY_THINKING_BUDGET",
+            2_048,
+            minimum=0,
+            maximum=8_192,
+        ),
+        provider_retries=retries,
+        allow_fallback=True,
+    )
+
+
+def single_attempt_reservation(contents: str, policy: GeminiRoutePolicy) -> int:
+    prompt_tokens = max(1, (len(str(contents or "")) + 2) // 3)
+    return prompt_tokens + int(policy.max_output_tokens)
+
+
+def estimated_generation_reservation(
+    contents: str,
+    policy: GeminiRoutePolicy,
+) -> int:
+    model_count = 2 if policy.allow_fallback else 1
+    attempts_per_model = 1 + max(0, int(policy.provider_retries))
+    return single_attempt_reservation(contents, policy) * model_count * attempts_per_model
+
+
+def budget_ceiling_for_route(daily_limit: int, route: str) -> int:
+    policy = policy_for_route(route)
+    if policy.journal_protected:
+        return max(0, int(daily_limit))
+    return max(0, int(daily_limit) - journal_protected_tokens(daily_limit))
+
+
+def provider_status_code(exc: Exception | None) -> int:
+    for attr in ("status_code", "code"):
+        value = getattr(exc, attr, None)
+        try:
+            if value is not None:
+                return int(value)
+        except (TypeError, ValueError):
+            pass
+    match = re.search(r"\b(400|404|429|500|502|503|504)\b", str(exc or ""))
+    return int(match.group(1)) if match else 0
+
+
+def provider_failure_kind(exc: Exception | None) -> ProviderFailureKind:
+    status = provider_status_code(exc)
+    text = str(exc or "").lower()
+    if status == 429 or any(
+        marker in text
+        for marker in ("resource_exhausted", "rate limit", "rate_limit", "quota exceeded")
+    ):
+        return ProviderFailureKind.RATE_LIMITED
+    if status in {500, 502, 503, 504} or any(
+        marker in text
+        for marker in ("service unavailable", "temporarily unavailable", "server error")
+    ):
+        return ProviderFailureKind.SERVER
+    if status == 404 or any(
+        marker in text
+        for marker in ("model is no longer available", "model not found", "not_found")
+    ):
+        return ProviderFailureKind.MODEL_UNAVAILABLE
+    if status == 400 or "invalid_argument" in text or "invalid argument" in text:
+        return ProviderFailureKind.INVALID_REQUEST
+    return ProviderFailureKind.UNKNOWN
+
+
+def retryable_failure(kind: ProviderFailureKind) -> bool:
+    return kind in {ProviderFailureKind.RATE_LIMITED, ProviderFailureKind.SERVER}
+
+
+def fallback_eligible_failure(kind: ProviderFailureKind) -> bool:
+    return kind in {
+        ProviderFailureKind.RATE_LIMITED,
+        ProviderFailureKind.SERVER,
+        ProviderFailureKind.MODEL_UNAVAILABLE,
+    }
+
+
+def retry_delay_seconds(attempt_index: int) -> float:
+    return min(2.0, 0.5 * (2 ** max(0, int(attempt_index))))

@@ -72,23 +72,112 @@ class GeminiOffloadTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_async_gemini_helper_preserves_fallback_model_behavior(self):
         calls = []
+        fallback_response = gemini_response("fallback ok", 5)
+        primary_resource = bnl01_bot._gemini_model_resource_name(
+            bnl01_bot.GEMINI_MODEL
+        )
 
-        def fake_generate_content(model, contents):
-            calls.append((model, contents))
-            if len(calls) == 1:
+        def fake_generate_content(model, contents, config=None):
+            calls.append((model, contents, config))
+            if model == primary_resource:
                 raise Exception("503 service unavailable")
-            return gemini_response("fallback ok", 5)
+            return fallback_response
 
-        fake_client = SimpleNamespace(models=SimpleNamespace(generate_content=mock.Mock(side_effect=fake_generate_content)))
-        with mock.patch.object(bnl01_bot, "gemini_client", fake_client):
-            response = await bnl01_bot._generate_gemini_content_with_fallback_async("contents", "fallback_route")
+        fake_client = SimpleNamespace(
+            models=SimpleNamespace(
+                generate_content=mock.Mock(side_effect=fake_generate_content)
+            )
+        )
+        with mock.patch.object(bnl01_bot, "gemini_client", fake_client), \
+             mock.patch.object(
+                 bnl01_bot,
+                 "reserve_local_model_budget",
+                 return_value=17,
+             ) as reserve, \
+             mock.patch.object(
+                 bnl01_bot,
+                 "release_local_model_budget",
+             ) as release, \
+             mock.patch.object(
+                 bnl01_bot,
+                 "record_generation_token_usage",
+             ) as record, \
+             mock.patch.object(
+                 bnl01_bot,
+                 "record_failed_generation_attempt",
+             ) as record_failed, \
+             mock.patch.object(bnl01_bot.time, "sleep"):
+            response = await bnl01_bot._generate_gemini_content_with_fallback_async(
+                "contents",
+                "fallback_route",
+            )
 
-        self.assertEqual(bnl01_bot._extract_text_and_tokens(response), ("fallback ok", 5))
+        self.assertEqual(
+            bnl01_bot._extract_text_and_tokens(response),
+            ("fallback ok", 5),
+        )
+        self.assertEqual(response.model_name, bnl01_bot.GEMINI_FALLBACK_MODEL)
+        self.assertTrue(response.fallback_used)
+        primary_calls = [call for call in calls if call[0] == primary_resource]
+        fallback_calls = [call for call in calls if call[0] != primary_resource]
+        self.assertEqual(len(primary_calls), 2)
+        self.assertEqual(len(fallback_calls), 1)
+        self.assertIsNone(primary_calls[0][2].thinking_config)
+        self.assertEqual(
+            primary_calls[0][2].max_output_tokens,
+            bnl01_bot.policy_for_route("fallback_route").max_output_tokens,
+        )
+        reserve.assert_called_once_with("contents", "fallback_route")
+        self.assertEqual(record_failed.call_count, 2)
+        record.assert_called_once()
+        self.assertEqual(
+            record.call_args.kwargs["model"],
+            bnl01_bot.GEMINI_FALLBACK_MODEL,
+        )
+        release.assert_called_once_with(17)
+
+    async def test_journal_does_not_automatically_fallback(self):
+        calls = []
+
+        def fail_generation(model, contents, config=None):
+            calls.append(model)
+            raise Exception("503 service unavailable")
+
+        fake_client = SimpleNamespace(
+            models=SimpleNamespace(
+                generate_content=mock.Mock(side_effect=fail_generation)
+            )
+        )
+        with mock.patch.object(bnl01_bot, "gemini_client", fake_client), \
+             mock.patch.object(
+                 bnl01_bot,
+                 "reserve_local_model_budget",
+                 return_value=17,
+             ), \
+             mock.patch.object(bnl01_bot, "release_local_model_budget"), \
+             mock.patch.object(
+                 bnl01_bot,
+                 "record_failed_generation_attempt",
+             ), \
+             mock.patch.object(bnl01_bot.time, "sleep"):
+            with self.assertRaisesRegex(Exception, "503"):
+                await bnl01_bot._generate_gemini_content_with_fallback_async(
+                    "journal contents",
+                    bnl01_bot.JOURNAL_ROUTE,
+                )
+
         self.assertEqual(len(calls), 2)
-        self.assertEqual(calls[0][0], bnl01_bot._gemini_model_resource_name(bnl01_bot.GEMINI_MODEL))
-        self.assertEqual(calls[1][0], bnl01_bot._gemini_model_resource_name(bnl01_bot.GEMINI_FALLBACK_MODEL))
+        self.assertTrue(
+            all(
+                model
+                == bnl01_bot._gemini_model_resource_name(
+                    bnl01_bot.GEMINI_MODEL
+                )
+                for model in calls
+            )
+        )
 
-    async def test_get_gemini_response_keeps_token_accounting(self):
+    async def test_get_gemini_response_does_not_double_count_central_accounting(self):
         with mock.patch.object(bnl01_bot, "check_quota_availability", return_value=True), \
              mock.patch.object(bnl01_bot, "get_conversation_history", return_value=[]), \
              mock.patch.object(bnl01_bot, "_generate_gemini_content_with_fallback_async", return_value=gemini_response("token text", 42)), \
@@ -97,16 +186,22 @@ class GeminiOffloadTests(unittest.IsolatedAsyncioTestCase):
             text = await bnl01_bot.get_gemini_response("hello", user_id=123, guild_id=456, route="normal_chat")
 
         self.assertEqual(text, "token text")
-        inc.assert_called_once_with(42)
+        inc.assert_not_called()
 
     async def test_get_gemini_response_keeps_quota_handling_without_generation(self):
         with mock.patch.object(bnl01_bot, "check_quota_availability", return_value=False), \
-             mock.patch.object(bnl01_bot, "get_usage_stats", return_value=(bnl01_bot.DAILY_TOKEN_LIMIT, "today")), \
-             mock.patch.object(bnl01_bot, "_generate_gemini_content_with_fallback_async") as generate:
+             mock.patch.object(bnl01_bot, "_generate_gemini_content_with_fallback_async") as generate, \
+             mock.patch.object(bnl01_bot, "record_generation_result_status") as record_status:
             text = await bnl01_bot.get_gemini_response("hello", user_id=123, guild_id=456)
 
-        self.assertIn("Daily quota exhausted", text)
+        self.assertEqual(text, "")
         generate.assert_not_called()
+        result = record_status.call_args.args[0]
+        self.assertFalse(result.success)
+        self.assertEqual(
+            result.error_category,
+            bnl01_bot.GENERATION_ERROR_LOCAL_MODEL_BUDGET,
+        )
 
     async def test_glitch_rewrite_uses_offloaded_generation(self):
         responses = [gemini_response("base text", 11), gemini_response("glitched text", 2)]

@@ -518,6 +518,76 @@ class MemoryPreviewBotPathTests(unittest.IsolatedAsyncioTestCase):
         execute.assert_not_awaited()
         interaction.response.defer.assert_not_awaited()
 
+    async def test_slash_command_reports_local_budget_without_running_preview(self):
+        class FakeGuildChannel:
+            def __init__(self):
+                self.id = 20
+                self.name = "bnl-testing"
+
+        channel = FakeGuildChannel()
+        interaction = SimpleNamespace(
+            user=SimpleNamespace(id=99),
+            guild=SimpleNamespace(id=1, text_channels=[]),
+            channel=channel,
+            response=SimpleNamespace(
+                defer=mock.AsyncMock(),
+                send_message=mock.AsyncMock(),
+            ),
+        )
+        subject = SimpleNamespace(id=7, display_name="Crow")
+        with (
+            mock.patch.object(bnl01_bot, "BNL_OWNER_USER_ID", 99),
+            mock.patch.object(bnl01_bot, "BNL_TESTING_CHANNEL_ID", 20),
+            mock.patch.object(
+                bnl01_bot,
+                "is_owner_operator",
+                return_value=True,
+            ),
+            mock.patch.object(
+                bnl01_bot.discord.abc,
+                "GuildChannel",
+                FakeGuildChannel,
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "resolve_channel_policy",
+                return_value="sealed_test",
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "check_quota_availability",
+                return_value=False,
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "get_usage_stats",
+                return_value=(1_356_677, "2026-07-26"),
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "execute_bnl_memory_preview",
+                new=mock.AsyncMock(),
+            ) as execute,
+        ):
+            await bnl01_bot.bnl_memory_preview.callback(
+                interaction,
+                subject,
+            )
+
+        interaction.response.send_message.assert_awaited_once()
+        message = interaction.response.send_message.await_args.args[0]
+        self.assertIn("local daily model budget", message)
+        self.assertIn("1,356,677/1,350,000", message)
+        self.assertIn("not the Gemini app allowance", message)
+        self.assertIn("No preview generation was attempted", message)
+        self.assertTrue(
+            interaction.response.send_message.await_args.kwargs[
+                "ephemeral"
+            ]
+        )
+        execute.assert_not_awaited()
+        interaction.response.defer.assert_not_awaited()
+
     async def test_slash_command_rejects_non_owner_before_preparing(self):
         interaction = SimpleNamespace(
             user=SimpleNamespace(id=41),
