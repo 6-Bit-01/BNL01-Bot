@@ -401,9 +401,9 @@ class ProductionShapedBroadRecallAcceptanceTests(unittest.TestCase):
                     ),
                 ),
                 (
-                    "Music and audio production keep showing up in what "
-                    "you work on, and jokes and community banter are "
-                    "another recurring public thread."
+                    "Digi-Screwed tracks and the song-mix work keep "
+                    "showing up in your music production, while your dad "
+                    "jokes keep driving the community banter."
                 ),
             ),
             (
@@ -421,8 +421,10 @@ class ProductionShapedBroadRecallAcceptanceTests(unittest.TestCase):
                     ),
                 ),
                 (
-                    "Music and audio production recur in your public "
-                    "conversations, alongside jokes and community banter."
+                    "Your art-pop songs, dynamic vocals, and synth-track "
+                    "passes form a clear music production thread; the "
+                    "jokes you share in community chats form another "
+                    "community banter thread."
                 ),
             ),
             (
@@ -440,8 +442,9 @@ class ProductionShapedBroadRecallAcceptanceTests(unittest.TestCase):
                     ),
                 ),
                 (
-                    "Your public history keeps returning to music and "
-                    "audio production, plus games and interactive systems."
+                    "You keep returning to comedy songs and the mix on "
+                    "funny music tracks, alongside Diablo conversations "
+                    "about players and battle classes."
                 ),
             ),
             (
@@ -459,8 +462,9 @@ class ProductionShapedBroadRecallAcceptanceTests(unittest.TestCase):
                     ),
                 ),
                 (
-                    "Community collaboration around music keeps recurring "
-                    "in your public history, along with jokes and banter."
+                    "You keep collaborating with the community on music "
+                    "and the next track, while your jokes and banter "
+                    "regularly get the group laughing."
                 ),
             ),
         )
@@ -494,6 +498,50 @@ class ProductionShapedBroadRecallAcceptanceTests(unittest.TestCase):
         finally:
             for prepared in prepared_cases:
                 prepared.close()
+
+    def test_rich_profile_rejects_category_only_candidate(self):
+        self.add_recurring_topic(
+            user_id=101,
+            user_name="Chris",
+            first="I keep developing Digi-Screwed music tracks.",
+            second="The Digi-Screwed song mix needs another pass.",
+        )
+        self.add_recurring_topic(
+            user_id=101,
+            user_name="Chris",
+            first="I keep bringing dad jokes to the community.",
+            second="Another joke had the whole community laughing.",
+            day_offset=2,
+        )
+        prepared = prepare_memory_preview(
+            self.request(
+                user_id=101,
+                user_name="Chris",
+                wording="BNL, what am I all about?",
+            )
+        )
+        try:
+            prompt = prepared.packet_owned_prompt.prompt
+            self.assertIn("Digi-Screwed", prompt)
+            self.assertIn("dad jokes", prompt)
+            evaluation = evaluate_memory_preview(
+                prepared,
+                baseline_response=(
+                    "I only have a narrow grounded view so far."
+                ),
+                candidate_response=(
+                    "Music and audio production keep showing up in what "
+                    "you work on, and jokes and community banter are "
+                    "another recurring public thread."
+                ),
+            )
+            self.assertFalse(evaluation.candidate_selected)
+            self.assertEqual(
+                evaluation.fallback_reason,
+                "candidate_member_details_insufficient",
+            )
+        finally:
+            prepared.close()
 
     def test_lostmarbles_never_inherits_wittyfox_evidence(self):
         self.add_recurring_topic(
@@ -560,15 +608,17 @@ class ProductionShapedBroadRecallAcceptanceTests(unittest.TestCase):
                 "BNL, what am I all about in the BARCODE project?"
             ),
             candidate=(
-                "You keep returning to software and technical systems, "
-                "alongside music and audio production. In the BARCODE "
-                "Network, that connects your project work to its "
-                "community, software, and live broadcast signal."
+                "You keep debugging the bot memory system and carefully "
+                "testing the website, while writing songs and producing "
+                "synth tracks. As a founding BARCODE member, that puts "
+                "your software and music work inside the Network's "
+                "community and live-broadcast signal."
             ),
             expected_status="rich",
             expected_points=2,
         )
         try:
+            self.assertTrue(prepared.basis.profile_requires_canon)
             rendered = prepared.basis.rendered_context
             self.assertIn("durable observation", rendered)
             self.assertIn("approved canon", rendered)
@@ -581,6 +631,22 @@ class ProductionShapedBroadRecallAcceptanceTests(unittest.TestCase):
                     prepared.basis.rendered_lane_counts
                 ).get("atomic_knowledge", 0),
                 2,
+            )
+            memory_only = evaluate_memory_preview(
+                prepared,
+                baseline_response=(
+                    "I only have a narrow grounded view so far."
+                ),
+                candidate_response=(
+                    "You keep debugging the bot memory system and testing "
+                    "the website, while writing songs and producing synth "
+                    "tracks."
+                ),
+            )
+            self.assertFalse(memory_only.candidate_selected)
+            self.assertEqual(
+                memory_only.fallback_reason,
+                "candidate_project_canon_missing",
             )
         finally:
             prepared.close()
@@ -651,9 +717,9 @@ class ProductionShapedBroadRecallAcceptanceTests(unittest.TestCase):
         user_id = 109
         wording = "BNL, what am I all about?"
         candidate_response = (
-            "Your public history keeps returning to software and technical "
-            "systems, and music and audio production is another recurring "
-            "thread."
+            "You keep debugging bot code and the memory system, including "
+            "careful website testing. You also keep producing synth music, "
+            "writing songs, and working on the tracks' vocal mix."
         )
         baseline_response = "I only have a narrow grounded view so far."
         message = _ProductionMessage(

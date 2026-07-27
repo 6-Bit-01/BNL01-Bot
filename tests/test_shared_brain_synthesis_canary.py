@@ -640,7 +640,7 @@ class SharedBrainSynthesisCanaryTests(unittest.TestCase):
         self.assertTrue(lore_first.candidate_lore_dominant)
         self.assertEqual(
             lore_first.fallback_reason,
-            "candidate_canon_dominates_member_evidence",
+            "candidate_lore_dominates_member_evidence",
         )
 
         grounded_run = begin_run(
@@ -695,7 +695,7 @@ class SharedBrainSynthesisCanaryTests(unittest.TestCase):
         self.assertTrue(lore_after.candidate_lore_dominant)
         self.assertEqual(
             lore_after.fallback_reason,
-            "candidate_canon_dominates_member_evidence",
+            "candidate_lore_dominates_member_evidence",
         )
 
         concise_support_run = begin_run(

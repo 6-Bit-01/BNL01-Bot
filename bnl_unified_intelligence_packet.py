@@ -193,6 +193,37 @@ _CURRENT_ACTUALLY_STATEMENT_RE = re.compile(
     r"\b(?:am|are|is|prefer|like|want|need|use|have)\b",
     re.I,
 )
+_ATOMIC_SUPPORT_BLOCK_RE = re.compile(
+    r"(?:\bhttps?://|\bwww\.|<@!?\d+>|"
+    r"\b[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}\b|"
+    r"\b(?:password|passcode|pin|one[- ]?time\s+(?:code|password)|"
+    r"otp|verification\s+code|security\s+code|recovery\s+code|"
+    r"api\s+key|secret\s+key|private\s+key|seed\s+phrase|"
+    r"(?:auth|access|deployment|session)\s+token|routing\s+number|"
+    r"bank\s+account|credit\s+card|debit\s+card|social\s+security|"
+    r"ssn)\b|"
+    r"\b(?:ignore|disregard|override|bypass|reveal)\b.{0,40}"
+    r"\b(?:system|developer|assistant|prompt|instructions?|rules?|"
+    r"secret)\b|"
+    r"\b(?:diagnos(?:ed|is)|medical\s+condition|health\s+condition|"
+    r"medication|therapy|therapist|pregnan(?:t|cy)|sexuality|"
+    r"sexual\s+orientation|gender\s+identity|race|ethnicity|religion|"
+    r"political\s+affiliation|immigration\s+status|criminal\s+record|"
+    r"salary|income|bank\s+balance|financial\s+account|home\s+location|"
+    r"where\s+i\s+live|family\s+emergency|private\s+relationship)\b|"
+    r"\b(?:call\s+me|my\s+(?:email|phone(?:\s+number)?|home\s+address|"
+    r"street\s+address|legal\s+name|real\s+name|full\s+name|"
+    r"preferred\s+name|pronouns?|birthday|date\s+of\s+birth|employer|"
+    r"workplace|favorite\s+(?:color|movie|food|place))\s+(?:is|are)|"
+    r"i\s+(?:live|reside)\s+(?:at|in|near))\b|"
+    r"\b(?:what\s+do\s+you\s+remember|what\s+am\s+i\s+all\s+about|"
+    r"tell\s+me\s+(?:everything\s+)?you\s+remember)\b|"
+    r"\b(?:pretend|role[- ]?play|my\s+character|hypothetically|"
+    r"just\s+kidding|sarcasm)\b)",
+    re.I,
+)
+_ATOMIC_SUPPORT_MAX_ITEMS = 2
+_ATOMIC_SUPPORT_ITEM_CHARS = 180
 
 
 @dataclass(frozen=True)
@@ -249,6 +280,7 @@ class IntelligencePacketItem:
     root_identities: tuple[str, ...] = ()
     occurrence_identities: tuple[str, ...] = ()
     point_identity: str = ""
+    supporting_observations: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -1249,7 +1281,8 @@ def _atomic_root_snapshot(
                e.source_row_id,e.source_revision,e.source_role,
                e.route_mode,e.channel_id,e.channel_name,e.channel_policy,
                e.visibility,e.public_usable,e.derived,e.projection,
-               e.lifecycle_status,e.updated_at
+               e.lifecycle_status,e.updated_at,e.normalized_value,
+               e.predicate_key,e.observed_at,e.source_sequence
         FROM memory_ledger_knowledge_roots r
         JOIN memory_ledger_knowledge_candidates c
           ON c.candidate_id=r.candidate_id
@@ -1289,6 +1322,10 @@ def _atomic_root_snapshot(
         "projection",
         "lifecycle_status",
         "updated_at",
+        "normalized_value",
+        "predicate_key",
+        "observed_at",
+        "source_sequence",
     )
     return tuple(dict(zip(keys, row)) for row in rows)
 
@@ -1357,6 +1394,86 @@ def _atomic_root_valid(
             }
         )
     return str(root.get("visibility") or "") in _INTERNAL_VISIBILITIES
+
+
+def _safe_atomic_supporting_observation(root: Mapping[str, Any]) -> str:
+    """Return one inert public member-authored root excerpt for paraphrase."""
+
+    if (
+        str(root.get("source_table") or "") != "conversations"
+        or str(root.get("source_role") or "").strip().lower() != "user"
+        or str(root.get("predicate_key") or "").strip().lower()
+        != "conversation"
+        or str(root.get("channel_policy") or "").strip().lower()
+        not in _PUBLIC_POLICIES
+        or str(root.get("visibility") or "").strip().lower()
+        not in _PUBLIC_VISIBILITIES
+        or not bool(root.get("public_usable"))
+        or bool(root.get("derived"))
+        or bool(root.get("projection"))
+        or str(root.get("lifecycle_status") or "").strip().lower()
+        != "active"
+    ):
+        return ""
+    text = re.sub(
+        r"\s+",
+        " ",
+        str(root.get("normalized_value") or ""),
+    ).strip()
+    if (
+        len(text.split()) < 4
+        or _ATOMIC_SUPPORT_BLOCK_RE.search(text)
+        or _CURRENT_CORRECTION_RE.search(text)
+    ):
+        return ""
+    return text.replace("```", "")[:_ATOMIC_SUPPORT_ITEM_CHARS]
+
+
+def _atomic_supporting_observations(
+    conn: sqlite3.Connection,
+    candidate: Mapping[str, Any],
+    roots: Sequence[Mapping[str, Any]],
+    *,
+    tags: Sequence[str],
+) -> tuple[str, ...]:
+    """Project bounded concrete roots without promoting them into new facts."""
+
+    if (
+        str(candidate.get("candidate_type") or "") != "topic_or_motif"
+        or "recurring_public_conversation" not in set(tags)
+    ):
+        return ()
+    ranked = sorted(
+        roots,
+        key=lambda root: (
+            str(root.get("observed_at") or ""),
+            int(root.get("source_sequence") or 0),
+            str(root.get("root_entry_id") or ""),
+        ),
+        reverse=True,
+    )
+    observations: list[str] = []
+    seen_occurrences: set[str] = set()
+    seen_text: set[str] = set()
+    for root in ranked:
+        root_entry_id = str(root.get("root_entry_id") or "")
+        occurrence = (
+            knowledge_occurrence_identity(conn, root_entry_id)
+            if root_entry_id
+            else ""
+        )
+        if not occurrence or occurrence in seen_occurrences:
+            continue
+        observation = _safe_atomic_supporting_observation(root)
+        normalized = re.sub(r"\W+", " ", observation.lower()).strip()
+        if not observation or not normalized or normalized in seen_text:
+            continue
+        observations.append(observation)
+        seen_occurrences.add(occurrence)
+        seen_text.add(normalized)
+        if len(observations) >= _ATOMIC_SUPPORT_MAX_ITEMS:
+            break
+    return tuple(observations)
 
 
 def _atomic_member_fact_authorized(
@@ -1620,6 +1737,12 @@ def _atomic_items(
                 if identity
             )
         )
+        supporting_observations = _atomic_supporting_observations(
+            conn,
+            candidate,
+            roots,
+            tags=tags,
+        )
         if broad and (
             not root_identities or not occurrence_identities
         ):
@@ -1670,6 +1793,7 @@ def _atomic_items(
                     ),
                     text=text,
                 ),
+                supporting_observations=supporting_observations,
             )
         )
     return items
@@ -2449,6 +2573,12 @@ def _packet_invariants(
             )
         ):
             invalid.append("profile_item_root_lineage_violation")
+        if item.supporting_observations and not (
+            item.lane == "atomic_knowledge"
+            and item.source_type == "topic_or_motif"
+            and item.subject_key == subject
+        ):
+            invalid.append("supporting_observation_scope_violation")
     return tuple(dict.fromkeys(invalid))
 
 

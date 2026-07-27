@@ -132,10 +132,12 @@ from bnl_shared_brain_synthesis import (
     begin_run as begin_shared_brain_synthesis_run,
     build_basis as build_shared_brain_synthesis_basis,
     build_packet_owned_prompt,
+    build_profile_candidate_repair_prompt,
     configuration as shared_brain_synthesis_canary_configuration,
     ensure_schema as ensure_shared_brain_synthesis_schema,
     evaluate_candidate as evaluate_shared_brain_synthesis_candidate,
     finalize_run as finalize_shared_brain_synthesis_run,
+    profile_candidate_repairable,
     record_fallback as record_shared_brain_synthesis_fallback,
     revalidate_basis as revalidate_shared_brain_synthesis_basis,
     route_scope_enabled as shared_brain_synthesis_route_scope_enabled,
@@ -30549,6 +30551,60 @@ async def maybe_generate_shared_brain_synthesis_canary(
             candidate_generation_latency_ms,
         )
         if (
+            candidate_response
+            and not decision.candidate_selected
+            and profile_candidate_repairable(
+                decision.fallback_reason
+            )
+        ):
+            repair_prompt = build_profile_candidate_repair_prompt(
+                candidate_prompt,
+                candidate_response,
+                basis=basis,
+                reason=decision.fallback_reason,
+            )
+            repair_started = time.monotonic()
+            try:
+                repaired_response = (
+                    await get_gemini_response_with_optional_typing(
+                        channel,
+                        repair_prompt,
+                        user_id,
+                        guild_id,
+                        route="shared_brain_synthesis_canary_repair",
+                        source_context_available=(
+                            source_context_available
+                        ),
+                    )
+                    or ""
+                ).strip()
+            except Exception as exc:
+                logging.warning(
+                    "shared_brain_synthesis_canary_repair_failed "
+                    "error=%s",
+                    type(exc).__name__,
+                )
+                repaired_response = ""
+            candidate_generation_latency_ms += max(
+                0,
+                int(
+                    round(
+                        (time.monotonic() - repair_started)
+                        * 1000
+                    )
+                ),
+            )
+            if repaired_response:
+                decision = await asyncio.to_thread(
+                    _evaluate_shared_brain_synthesis_receipt,
+                    run,
+                    baseline_response,
+                    repaired_response,
+                    candidate_generation_latency_ms,
+                )
+                candidate_response = repaired_response
+                candidate_prompt = repair_prompt
+        if (
             decision.candidate_selected
             and is_generic_non_answer_response(
                 candidate_response or "",
@@ -33483,6 +33539,10 @@ def build_bnl_memory_preview_baseline_prompt(
         "Response style mode: steady_reply\n"
         "Answer naturally and directly. Preserve BNL's mechanical, strange "
         "BARCODE flavor without turning the member into a protocol report.\n"
+        "Evidence-absence rule: if no stored member context is supplied, do "
+        "not infer that the member is new, quiet, inactive, or has not "
+        "interacted. Say only that the available reliable context is not "
+        "enough to summarize them without guessing.\n"
         "Prompt operator authority: public_or_standard_context\n"
         "Authority safety: do not expose or infer hidden Discord privileges "
         "from this public conversation.\n"
@@ -33623,12 +33683,17 @@ async def execute_bnl_memory_preview(
             )
 
         candidate_response = ""
+        candidate_prompt = (
+            initial.packet_owned_prompt.prompt
+            if initial.ready
+            else ""
+        )
         candidate_latency_ms = 0
         if initial.ready:
             candidate_started = time.monotonic()
             candidate_response = (
                 await generate(
-                    initial.packet_owned_prompt.prompt,
+                    candidate_prompt,
                     "bnl_memory_preview_candidate",
                 )
                 or ""
@@ -33677,8 +33742,81 @@ async def execute_bnl_memory_preview(
                 ),
             )
 
+        if (
+            unchanged
+            and fresh.ready
+            and candidate_response
+            and not evaluation.candidate_selected
+            and profile_candidate_repairable(
+                evaluation.fallback_reason
+            )
+        ):
+            repair_prompt = build_profile_candidate_repair_prompt(
+                fresh.packet_owned_prompt.prompt,
+                candidate_response,
+                basis=fresh.basis,
+                reason=evaluation.fallback_reason,
+            )
+            repair_started = time.monotonic()
+            repaired_response = (
+                await generate(
+                    repair_prompt,
+                    "bnl_memory_preview_candidate_repair",
+                )
+                or ""
+            ).strip()
+            candidate_latency_ms += max(
+                0,
+                int(
+                    round(
+                        (time.monotonic() - repair_started)
+                        * 1000
+                    )
+                ),
+            )
+            repaired_fresh = await asyncio.to_thread(
+                prepare_memory_preview,
+                request,
+            )
+            repair_unchanged, repair_stale_reason = (
+                memory_preview_snapshots_equivalent(
+                    fresh,
+                    repaired_fresh,
+                )
+            )
+            if repair_unchanged and repaired_response:
+                repaired_evaluation = await asyncio.to_thread(
+                    evaluate_memory_preview,
+                    repaired_fresh,
+                    baseline_response=baseline_response,
+                    candidate_response=repaired_response,
+                    candidate_generation_latency_ms=(
+                        candidate_latency_ms
+                    ),
+                )
+                fresh.close()
+                fresh = repaired_fresh
+                evaluation = repaired_evaluation
+                candidate_response = repaired_response
+                candidate_prompt = repair_prompt
+                stale_reason = ""
+            else:
+                repaired_fresh.close()
+                stale_reason = (
+                    repair_stale_reason
+                    if not repair_unchanged
+                    else stale_reason
+                )
+                if not repair_unchanged and evaluation.decision is not None:
+                    evaluation = await asyncio.to_thread(
+                        fallback_memory_preview,
+                        fresh,
+                        evaluation,
+                        reason="candidate_%s" % repair_stale_reason,
+                    )
+
         selected_prompt = (
-            fresh.packet_owned_prompt.prompt
+            candidate_prompt
             if evaluation.candidate_selected and fresh.ready
             else fresh.request.baseline_prompt
         )
