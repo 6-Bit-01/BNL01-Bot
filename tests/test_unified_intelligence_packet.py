@@ -647,6 +647,45 @@ class UnifiedIntelligencePacketTests(unittest.TestCase):
                     "",
                 )
 
+    def test_packet_retains_a_larger_safe_pool_for_adaptive_rendering(self):
+        entry_ids = []
+        for index in range(6):
+            entry_ids.append(
+                self.add_raw_public_conversation(
+                    950 + index,
+                    (
+                        "I keep producing synth music mix number %s for "
+                        "the radio show detail %s."
+                        % (index, chr(ord("a") + index))
+                    ),
+                    "2026-07-%02dT10:00:00+00:00" % (20 + index),
+                )
+            )
+        formed = ledger.form_atomic_candidates_from_recurring_conversation(
+            self.conn,
+            trigger_entry_id=entry_ids[-1],
+            environ=self.flags,
+        )
+        self.assertTrue(formed)
+
+        packet = build_packet(
+            self.conn,
+            self.public_request(),
+            persist=False,
+            environ=self.flags,
+        )
+        music_item = next(
+            item
+            for item in packet.items
+            if item.lane == "atomic_knowledge"
+            and "music and audio production" in item.text
+        )
+        self.assertEqual(len(music_item.supporting_observations), 6)
+
+        rendered, _counts, _count, _digests = render_packet_context(packet)
+        self.assertIn("mix number 0", rendered)
+        self.assertIn("mix number 5", rendered)
+
     def test_distinct_atomic_points_can_share_exact_human_roots(self):
         rows = (
             (

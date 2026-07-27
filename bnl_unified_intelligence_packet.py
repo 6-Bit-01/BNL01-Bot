@@ -222,7 +222,7 @@ _ATOMIC_SUPPORT_BLOCK_RE = re.compile(
     r"just\s+kidding|sarcasm)\b)",
     re.I,
 )
-_ATOMIC_SUPPORT_MAX_ITEMS = 2
+_ATOMIC_SUPPORT_POOL_MAX_ITEMS = 12
 _ATOMIC_SUPPORT_ITEM_CHARS = 180
 
 
@@ -1471,7 +1471,7 @@ def _atomic_supporting_observations(
         observations.append(observation)
         seen_occurrences.add(occurrence)
         seen_text.add(normalized)
-        if len(observations) >= _ATOMIC_SUPPORT_MAX_ITEMS:
+        if len(observations) >= _ATOMIC_SUPPORT_POOL_MAX_ITEMS:
             break
     return tuple(observations)
 

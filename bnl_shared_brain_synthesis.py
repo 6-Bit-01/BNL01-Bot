@@ -36,7 +36,7 @@ from bnl_unified_response_assessment import (
 )
 
 
-SCHEMA_VERSION = "shared_brain_synthesis_canary_v2"
+SCHEMA_VERSION = "shared_brain_synthesis_canary_v3"
 TABLE_NAME = "memory_governance_shared_brain_synthesis_runs"
 ENABLED_ENV = "BNL_SHARED_BRAIN_SYNTHESIS_CANARY_ENABLED"
 GUILD_IDS_ENV = "BNL_SHARED_BRAIN_SYNTHESIS_CANARY_GUILD_IDS"
@@ -62,6 +62,15 @@ _RENDERABLE_LANES = {
 }
 _PROFILE_MEMBER_LANES = frozenset(
     {"approved_fact", "moment", "atomic_knowledge"}
+)
+_CLAIM_MEMBER_LANES = frozenset(
+    {
+        "conversation_context",
+        "approved_fact",
+        "moment",
+        "atomic_knowledge",
+        "open_loop",
+    }
 )
 _NON_PACKET_FACTUAL_OWNER_LANES = frozenset(
     {
@@ -220,15 +229,77 @@ _PROFILE_PROJECT_SCOPE_RE = re.compile(
 _REPAIRABLE_PROFILE_FAILURES = frozenset(
     {
         "candidate_evidence_ungrounded",
+        "candidate_claims_ungrounded",
         "candidate_member_points_insufficient",
         "candidate_member_details_insufficient",
         "candidate_member_roots_insufficient",
         "candidate_member_occurrences_insufficient",
         "candidate_project_canon_missing",
-        "candidate_lore_dominates_member_evidence",
         "candidate_coherence_regressed",
     }
 )
+_CLAIM_SPLIT_RE = re.compile(
+    r"(?:[.!?;]+\s+|\n+|"
+    r"\s+[—–]\s+|"
+    r",\s+(?=(?:and|but|yet|while|whereas|which|so|meaning|"
+    r"making|showing|proving)\b)|"
+    r"\s+(?=(?:and|but|yet|while|whereas)\s+"
+    r"(?:you|your|i|my|this|that|those|these)\b)|"
+    r"\s+(?=(?:and|but|yet|while|whereas)\s+"
+    r"(?:(?:secretly|actually|also|regularly|always|never|"
+    r"personally|apparently|supposedly)\s+)?"
+    r"(?:run|own|live|work|have|make|build|create|prefer|like|"
+    r"love|broadcast|transmit|control|command|operate|fund)\b)|"
+    r"\s+(?=(?:because|although|though|even\s+though|since)\s+"
+    r"(?:you|your|this|that|those|these)\b))",
+    re.I,
+)
+_OPINION_FRAME_RE = re.compile(
+    r"\b(?:i\s+(?:think|believe|suspect|figure)|"
+    r"i(?:'d|\s+would)\s+(?:say|call)|"
+    r"my\s+(?:read|view|take|assessment)|"
+    r"to\s+me|in\s+my\s+view|from\s+where\s+i\s+(?:sit|stand)|"
+    r"it\s+seems|you\s+seem|you\s+strike\s+me|"
+    r"i\s+get\s+the\s+(?:sense|impression)|"
+    r"feels?\s+like|looks?\s+like)\b",
+    re.I,
+)
+_DERIVED_ASSESSMENT_RE = re.compile(
+    r"^\s*(?:that|those|these|this|both|together|overall|put\s+together|"
+    r"in\s+combination|the\s+combination|the\s+throughline)\b",
+    re.I,
+)
+_DIRECT_MEMBER_ASSERTION_RE = re.compile(
+    r"\b(?:you(?:'re|\s+are|\s+were|\s+have|\s+had|\s+keep|\s+kept|"
+    r"\s+make|\s+made|\s+build|\s+built|\s+create|\s+created|"
+    r"\s+prefer|\s+like|\s+love|\s+work|\s+live)|"
+    r"your\s+(?:favorite|name|pronouns?|home|address|job|employer|"
+    r"workplace|birthday|age|role|project|music|art|work))\b",
+    re.I,
+)
+_UNSUPPORTED_SCALAR_ASSERTION_RE = re.compile(
+    r"\b(?:your\s+(?:favorite|name|pronouns?|home|address|job|employer|"
+    r"workplace|birthday|age)\b|"
+    r"you\s+(?:live|reside|work)\s+(?:at|in|near|for)\b|"
+    r"you\s+(?:prefer|like|love|own|have)\b)",
+    re.I,
+)
+_CLAIM_GENERIC_TERMS = frozenset(
+    {
+        "alright",
+        "answer",
+        "bnl",
+        "hey",
+        "hello",
+        "member",
+        "network",
+        "okay",
+        "profile",
+        "signal",
+    }
+)
+_MAX_RENDERED_SUPPORTING_OBSERVATIONS = 8
+_MAX_RENDERED_SUPPORTING_OBSERVATION_CHARS = 1440
 
 
 @dataclass(frozen=True)
@@ -281,6 +352,12 @@ class SynthesisCanaryDecision:
     candidate_member_occurrence_coverage_count: int = 0
     candidate_canon_coverage_count: int = 0
     candidate_lore_dominant: bool = False
+    candidate_member_supported_claim_count: int = 0
+    candidate_canon_supported_claim_count: int = 0
+    candidate_opinion_claim_count: int = 0
+    candidate_connective_claim_count: int = 0
+    candidate_unsupported_factual_claim_count: int = 0
+    candidate_claim_classifications: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -311,6 +388,12 @@ class CandidateProfileCoverage:
     canon_only_segment_count: int = 0
     member_first: bool = False
     lore_dominant: bool = False
+    member_supported_claim_count: int = 0
+    canon_supported_claim_count: int = 0
+    opinion_claim_count: int = 0
+    connective_claim_count: int = 0
+    unsupported_factual_claim_count: int = 0
+    claim_classifications: tuple[str, ...] = ()
 
 
 def _flag(value: Any) -> bool:
@@ -682,6 +765,77 @@ def _canon_relevant_to_profile_request(
     return bool(query_terms & _semantic_terms(item.text))
 
 
+def _adaptive_supporting_observation_map(
+    packet: UnifiedIntelligencePacket,
+    ordered_items: Sequence[Any],
+    *,
+    max_items: int,
+    max_chars: int,
+) -> dict[str, tuple[str, ...]]:
+    """Allocate concrete examples across points without a fixed per-point dump."""
+
+    eligible = tuple(
+        item
+        for item in ordered_items
+        if item.lane in _RENDERABLE_LANES
+        and not (
+            item.lane == "canon"
+            and not _canon_relevant_to_profile_request(packet, item)
+        )
+    )[: max(1, int(max_items or 1))]
+    support_items = tuple(
+        item
+        for item in eligible
+        if tuple(getattr(item, "supporting_observations", ()) or ())
+    )
+    if not support_items:
+        return {}
+    total_item_cap = min(
+        _MAX_RENDERED_SUPPORTING_OBSERVATIONS,
+        max(2, int(max_chars or 0) // 320),
+    )
+    total_char_cap = min(
+        _MAX_RENDERED_SUPPORTING_OBSERVATION_CHARS,
+        max(360, int(max_chars or 0) // 2),
+    )
+    selected: dict[str, list[str]] = {
+        str(item.source_digest): [] for item in support_items
+    }
+    used_items = 0
+    used_chars = 0
+    observation_index = 0
+    while used_items < total_item_cap:
+        added = False
+        for item in support_items:
+            observations = tuple(
+                str(value or "")
+                for value in (
+                    getattr(item, "supporting_observations", ()) or ()
+                )
+                if str(value or "")
+            )
+            if observation_index >= len(observations):
+                continue
+            observation = observations[observation_index]
+            cost = len(observation) + 3
+            if used_chars + cost > total_char_cap:
+                continue
+            selected[str(item.source_digest)].append(observation)
+            used_items += 1
+            used_chars += cost
+            added = True
+            if used_items >= total_item_cap:
+                break
+        if not added:
+            break
+        observation_index += 1
+    return {
+        source_digest: tuple(observations)
+        for source_digest, observations in selected.items()
+        if observations
+    }
+
+
 def render_packet_context(
     packet: UnifiedIntelligencePacket,
     *,
@@ -709,6 +863,12 @@ def render_packet_context(
             ),
         )
     )
+    adaptive_support = _adaptive_supporting_observation_map(
+        packet,
+        ordered_items,
+        max_items=max_items,
+        max_chars=max_chars,
+    )
     for item in ordered_items:
         if item.lane not in _RENDERABLE_LANES:
             continue
@@ -722,8 +882,9 @@ def render_packet_context(
             continue
         supporting = tuple(
             _safe_evidence_text(observation, limit=240)
-            for observation in (
-                getattr(item, "supporting_observations", ()) or ()
+            for observation in adaptive_support.get(
+                str(item.source_digest),
+                (),
             )
             if _safe_evidence_text(observation, limit=240)
         )
@@ -790,7 +951,8 @@ def render_packet_context(
     project_rule = (
         "- The request explicitly asks for BARCODE/project context. After "
         "the member-specific substance, connect it to at least one relevant "
-        "approved canon point; answer as neither memory-only nor lore-only.\n"
+        "approved canon point; answer as neither member-history-only nor "
+        "canon-only.\n"
         if _profile_requires_canon(packet)
         else ""
     )
@@ -803,6 +965,10 @@ def render_packet_context(
         "not recite this evidence as a database report.\n"
         "- Lead with member-specific substance. Relevant BARCODE canon may "
         "support that substance afterward, but can never substitute for it.\n"
+        "- Look across the selected observations for a useful throughline. "
+        "Separate what is directly known, what BNL has observed, and BNL's "
+        "revisable opinion. Frame interpretation naturally as a read or "
+        "impression instead of presenting it as a stored fact.\n"
         + profile_rule
         + project_rule
         + "- Prefer recognizable names, works, interests, activities, and "
@@ -812,6 +978,8 @@ def render_packet_context(
         "- When source-linked public examples are present, paraphrase them "
         "naturally. Never quote them or claim that one example defines the "
         "member.\n"
+        "- Mechanical, strange, or interdimensional language may make the "
+        "answer sound like BNL, but it cannot invent a new member fact.\n"
         "- Do not use stock 'unmapped signal,' 'fresh presence,' or 'what "
         "you broadcast next' language when supported member evidence is "
         "available.\n"
@@ -1006,7 +1174,7 @@ def build_packet_owned_prompt(
 ) -> PacketOwnedPrompt:
     """Replace competing factual memory views before adding the packet.
 
-    The current request, persona/lore, Conversation Context, and route/style
+    The current request, persona/canon, Conversation Context, and route/style
     contracts stay byte-identical. Only exact, caller-supplied factual memory
     contexts are replaced, using the last occurrence so matching user text
     cannot redirect the replacement.
@@ -1105,8 +1273,18 @@ def build_profile_candidate_repair_prompt(
             "After the member details, connect them to at least one relevant "
             "approved BARCODE canon point."
             if basis.profile_requires_canon
-            else "Use BARCODE lore only as brief connective flavor after the "
-            "member details."
+            else "Use BARCODE canon only when it helps answer the request; it "
+            "is not a required ingredient."
+        ),
+        (
+            "Keep factual claims inside the supplied support. You may form a "
+            "natural interpretation or opinion across the evidence, but label "
+            "it as BNL's read with phrasing such as 'My read is...' or "
+            "'It seems...'."
+        ),
+        (
+            "Mechanical or interdimensional flavor may connect the answer, "
+            "but it must not masquerade as a new fact about the member."
         ),
         "Do not mention this rewrite, a failed draft, evidence, or controls.",
     ]
@@ -1166,6 +1344,137 @@ def _profile_item_covered(
         return False
     required = 1 if len(item_terms) == 1 else 2
     return len(item_terms & response_terms) >= required
+
+
+def _candidate_claim_units(response: str) -> tuple[str, ...]:
+    cleaned = re.sub(r"[ \t]+", " ", str(response or "")).strip()
+    if not cleaned:
+        return ()
+    units = []
+    for value in _CLAIM_SPLIT_RE.split(cleaned):
+        claim = re.sub(
+            r"^\s*(?:and|but|yet|while|whereas|which|so)\s+",
+            "",
+            str(value or ""),
+            flags=re.I,
+        ).strip(" \t,.;:—–-")
+        if claim:
+            units.append(claim)
+    return tuple(units)
+
+
+def _claim_is_connective(
+    claim: str,
+    substantive_terms: frozenset[str],
+) -> bool:
+    lowered = str(claim or "").strip().lower()
+    if not lowered:
+        return True
+    if re.fullmatch(
+        r"(?:hey|hello|alright|okay|fair(?: enough)?|copy|exactly|"
+        r"signal received|static approves|that tracks|i hear you)",
+        lowered,
+    ):
+        return True
+    return bool(
+        len(substantive_terms) <= 3
+        and not _DIRECT_MEMBER_ASSERTION_RE.search(claim)
+        and re.search(
+            r"\b(?:bnl|barcode|network|signal|static|frequency|circuit|"
+            r"machine|mechanical|chrome|antenna|broadcast|transmission)\b",
+            lowered,
+        )
+    )
+
+
+def _classify_candidate_claims(
+    response: str,
+    *,
+    member_items: Sequence[Any],
+    canon_items: Sequence[Any],
+    supported_member_points: frozenset[str],
+) -> tuple[
+    tuple[str, ...],
+    int,
+    int,
+    int,
+    int,
+    int,
+    bool,
+]:
+    classifications = []
+    member_supported = 0
+    canon_supported = 0
+    opinions = 0
+    connective = 0
+    unsupported = 0
+    first_supported_member: bool | None = None
+    has_member_basis = bool(supported_member_points)
+    for claim in _candidate_claim_units(response):
+        claim_terms = _semantic_terms(claim)
+        if not claim_terms:
+            classifications.append("connective_flavor")
+            connective += 1
+            continue
+        member_hit = any(
+            _profile_item_covered(item, claim_terms)
+            for item in member_items
+        )
+        canon_hit = any(
+            len(claim_terms & _semantic_terms(item.text)) >= 2
+            for item in canon_items
+        )
+        if member_hit or canon_hit:
+            if first_supported_member is None:
+                first_supported_member = bool(member_hit)
+            member_supported += int(member_hit)
+            canon_supported += int(canon_hit)
+            classifications.append(
+                "member_and_canon_supported"
+                if member_hit and canon_hit
+                else "member_supported"
+                if member_hit
+                else "canon_supported"
+            )
+            continue
+        substantive_terms = (
+            claim_terms - _PROFILE_GENERIC_TERMS - _CLAIM_GENERIC_TERMS
+        )
+        scalar_assertion = bool(
+            _UNSUPPORTED_SCALAR_ASSERTION_RE.search(claim)
+        )
+        if (
+            has_member_basis
+            and not scalar_assertion
+            and not _DIRECT_MEMBER_ASSERTION_RE.search(claim)
+            and _OPINION_FRAME_RE.search(claim)
+        ):
+            classifications.append("framed_opinion")
+            opinions += 1
+            continue
+        if (
+            has_member_basis
+            and not scalar_assertion
+            and _DERIVED_ASSESSMENT_RE.search(claim)
+        ):
+            classifications.append("linked_assessment")
+            opinions += 1
+            continue
+        if _claim_is_connective(claim, substantive_terms):
+            classifications.append("connective_flavor")
+            connective += 1
+            continue
+        classifications.append("unsupported_factual")
+        unsupported += 1
+    return (
+        tuple(classifications),
+        member_supported,
+        canon_supported,
+        opinions,
+        connective,
+        unsupported,
+        bool(first_supported_member),
+    )
 
 
 def candidate_profile_coverage(
@@ -1261,66 +1570,27 @@ def candidate_profile_coverage(
         if item.lane == "canon"
         and response_terms & _item_profile_terms(item)
     )
-
-    segments = tuple(
-        segment.strip()
-        for segment in re.split(r"(?:[.!?\n]+)", str(response or ""))
-        if segment.strip()
+    canon_items = tuple(
+        item for item in rendered_items if item.lane == "canon"
     )
-    member_segments = 0
-    canon_only_segments = 0
-    nonmember_substantive_segments = 0
-    first_evidence_segment_member: bool | None = None
-    for segment in segments:
-        segment_terms = _semantic_terms(segment)
-        if not segment_terms:
-            continue
-        member_hit = any(
-            _profile_item_covered(
-                item,
-                segment_terms,
-                distinctive_terms=distinctive_terms(item),
-                require_distinctive=require_distinctive,
-            )
-            for item in member_items
-        )
-        canon_hit = any(
-            segment_terms & _item_profile_terms(item)
-            for item in rendered_items
-            if item.lane == "canon"
-        )
-        substantive_terms = segment_terms - _PROFILE_GENERIC_TERMS - {
-            "alright",
-            "hello",
-            "hey",
-        }
-        if (
-            not member_hit
-            and not canon_hit
-            and len(substantive_terms) < 3
-        ):
-            continue
-        if first_evidence_segment_member is None:
-            first_evidence_segment_member = member_hit
-        if member_hit:
-            member_segments += 1
-        elif canon_hit:
-            canon_only_segments += 1
-        else:
-            nonmember_substantive_segments += 1
-    member_first = bool(first_evidence_segment_member)
-    lore_dominant = bool(
-        (
-            member_segments > 0
-            and not member_first
-        )
-        or (
-            member_segments > 0
-            and (
-                canon_only_segments + nonmember_substantive_segments
-                > member_segments
-            )
-        )
+    claim_member_items = tuple(
+        item
+        for item in rendered_items
+        if item.lane in _CLAIM_MEMBER_LANES
+    )
+    (
+        claim_classifications,
+        member_supported_claims,
+        canon_supported_claims,
+        opinion_claims,
+        connective_claims,
+        unsupported_factual_claims,
+        member_first,
+    ) = _classify_candidate_claims(
+        response,
+        member_items=claim_member_items,
+        canon_items=canon_items,
+        supported_member_points=frozenset(covered_points),
     )
     return CandidateProfileCoverage(
         total_item_count=len(covered_items),
@@ -1329,10 +1599,16 @@ def candidate_profile_coverage(
         member_occurrence_count=len(covered_occurrences),
         member_detail_point_count=len(covered_detail_points),
         canon_item_count=len(covered_canon),
-        member_segment_count=member_segments,
-        canon_only_segment_count=canon_only_segments,
+        member_segment_count=member_supported_claims,
+        canon_only_segment_count=canon_supported_claims,
         member_first=member_first,
-        lore_dominant=lore_dominant,
+        lore_dominant=False,
+        member_supported_claim_count=member_supported_claims,
+        canon_supported_claim_count=canon_supported_claims,
+        opinion_claim_count=opinion_claims,
+        connective_claim_count=connective_claims,
+        unsupported_factual_claim_count=unsupported_factual_claims,
+        claim_classifications=claim_classifications,
     )
 
 
@@ -1380,6 +1656,12 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
             candidate_member_occurrence_coverage_count INTEGER NOT NULL DEFAULT 0,
             candidate_canon_coverage_count INTEGER NOT NULL DEFAULT 0,
             candidate_lore_dominant INTEGER NOT NULL DEFAULT 0,
+            candidate_member_supported_claim_count INTEGER NOT NULL DEFAULT 0,
+            candidate_canon_supported_claim_count INTEGER NOT NULL DEFAULT 0,
+            candidate_opinion_claim_count INTEGER NOT NULL DEFAULT 0,
+            candidate_connective_claim_count INTEGER NOT NULL DEFAULT 0,
+            candidate_unsupported_factual_claim_count INTEGER NOT NULL DEFAULT 0,
+            candidate_claim_classification_counts_json TEXT NOT NULL DEFAULT '{}',
             candidate_output_leak INTEGER NOT NULL DEFAULT 0,
             profile_sufficiency_status TEXT NOT NULL DEFAULT 'not_applicable',
             profile_required_point_count INTEGER NOT NULL DEFAULT 0,
@@ -1436,6 +1718,30 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
             "INTEGER NOT NULL DEFAULT 0",
         ),
         ("candidate_lore_dominant", "INTEGER NOT NULL DEFAULT 0"),
+        (
+            "candidate_member_supported_claim_count",
+            "INTEGER NOT NULL DEFAULT 0",
+        ),
+        (
+            "candidate_canon_supported_claim_count",
+            "INTEGER NOT NULL DEFAULT 0",
+        ),
+        (
+            "candidate_opinion_claim_count",
+            "INTEGER NOT NULL DEFAULT 0",
+        ),
+        (
+            "candidate_connective_claim_count",
+            "INTEGER NOT NULL DEFAULT 0",
+        ),
+        (
+            "candidate_unsupported_factual_claim_count",
+            "INTEGER NOT NULL DEFAULT 0",
+        ),
+        (
+            "candidate_claim_classification_counts_json",
+            "TEXT NOT NULL DEFAULT '{}'",
+        ),
         (
             "profile_sufficiency_status",
             "TEXT NOT NULL DEFAULT 'not_applicable'",
@@ -1667,8 +1973,8 @@ def evaluate_candidate(
         and profile_coverage.canon_item_count < 1
     ):
         fallback_reason = "candidate_project_canon_missing"
-    elif profile_coverage.lore_dominant:
-        fallback_reason = "candidate_lore_dominates_member_evidence"
+    elif profile_coverage.unsupported_factual_claim_count > 0:
+        fallback_reason = "candidate_claims_ungrounded"
     elif coherence_rank.get(candidate_coherence.status, 0) < coherence_rank.get(
         baseline_coherence.status,
         0,
@@ -1690,6 +1996,12 @@ def evaluate_candidate(
             candidate_member_root_coverage_count=?,
             candidate_member_occurrence_coverage_count=?,
             candidate_canon_coverage_count=?,candidate_lore_dominant=?,
+            candidate_member_supported_claim_count=?,
+            candidate_canon_supported_claim_count=?,
+            candidate_opinion_claim_count=?,
+            candidate_connective_claim_count=?,
+            candidate_unsupported_factual_claim_count=?,
+            candidate_claim_classification_counts_json=?,
             revalidation_status=?,
             candidate_selected=?,fallback_reason=?,
             processing_error_count=processing_error_count+?,
@@ -1715,6 +2027,15 @@ def evaluate_candidate(
             profile_coverage.member_occurrence_count,
             profile_coverage.canon_item_count,
             int(profile_coverage.lore_dominant),
+            profile_coverage.member_supported_claim_count,
+            profile_coverage.canon_supported_claim_count,
+            profile_coverage.opinion_claim_count,
+            profile_coverage.connective_claim_count,
+            profile_coverage.unsupported_factual_claim_count,
+            json.dumps(
+                dict(Counter(profile_coverage.claim_classifications)),
+                sort_keys=True,
+            ),
             revalidation_status,
             int(candidate_selected),
             fallback_reason,
@@ -1756,6 +2077,24 @@ def evaluate_candidate(
         ),
         candidate_canon_coverage_count=profile_coverage.canon_item_count,
         candidate_lore_dominant=profile_coverage.lore_dominant,
+        candidate_member_supported_claim_count=(
+            profile_coverage.member_supported_claim_count
+        ),
+        candidate_canon_supported_claim_count=(
+            profile_coverage.canon_supported_claim_count
+        ),
+        candidate_opinion_claim_count=(
+            profile_coverage.opinion_claim_count
+        ),
+        candidate_connective_claim_count=(
+            profile_coverage.connective_claim_count
+        ),
+        candidate_unsupported_factual_claim_count=(
+            profile_coverage.unsupported_factual_claim_count
+        ),
+        candidate_claim_classifications=(
+            profile_coverage.claim_classifications
+        ),
     )
 
 
@@ -1816,6 +2155,24 @@ def record_fallback(
             decision.candidate_canon_coverage_count
         ),
         candidate_lore_dominant=decision.candidate_lore_dominant,
+        candidate_member_supported_claim_count=(
+            decision.candidate_member_supported_claim_count
+        ),
+        candidate_canon_supported_claim_count=(
+            decision.candidate_canon_supported_claim_count
+        ),
+        candidate_opinion_claim_count=(
+            decision.candidate_opinion_claim_count
+        ),
+        candidate_connective_claim_count=(
+            decision.candidate_connective_claim_count
+        ),
+        candidate_unsupported_factual_claim_count=(
+            decision.candidate_unsupported_factual_claim_count
+        ),
+        candidate_claim_classifications=(
+            decision.candidate_claim_classifications
+        ),
     )
 
 
@@ -1885,6 +2242,11 @@ def _empty_report() -> dict[str, Any]:
         "candidateMemberOccurrenceCoverageTotal": 0,
         "candidateCanonCoverageTotal": 0,
         "loreDominantRuns": 0,
+        "candidateMemberSupportedClaimTotal": 0,
+        "candidateCanonSupportedClaimTotal": 0,
+        "candidateOpinionClaimTotal": 0,
+        "candidateConnectiveClaimTotal": 0,
+        "candidateUnsupportedFactualClaimTotal": 0,
         "promptFactualOwnerRuns": 0,
         "promptOwnershipFailureRuns": 0,
         "routeFamilyCounts": {},
@@ -1902,6 +2264,7 @@ def _empty_report() -> dict[str, Any]:
         "liveUngroundedRuns": 0,
         "liveInsufficientMemberCoverageRuns": 0,
         "liveLoreDominantRuns": 0,
+        "liveUnsupportedFactualClaimRuns": 0,
         "livePromptOwnershipViolationRuns": 0,
         "relationshipPostureAppliedRuns": 0,
         "contentFieldsPresent": [],
@@ -1972,6 +2335,31 @@ def build_evaluation_report(
     lore_dominant_expr = (
         "candidate_lore_dominant"
         if "candidate_lore_dominant" in columns
+        else "0"
+    )
+    member_supported_claim_expr = (
+        "candidate_member_supported_claim_count"
+        if "candidate_member_supported_claim_count" in columns
+        else "0"
+    )
+    canon_supported_claim_expr = (
+        "candidate_canon_supported_claim_count"
+        if "candidate_canon_supported_claim_count" in columns
+        else "0"
+    )
+    opinion_claim_expr = (
+        "candidate_opinion_claim_count"
+        if "candidate_opinion_claim_count" in columns
+        else "0"
+    )
+    connective_claim_expr = (
+        "candidate_connective_claim_count"
+        if "candidate_connective_claim_count" in columns
+        else "0"
+    )
+    unsupported_factual_claim_expr = (
+        "candidate_unsupported_factual_claim_count"
+        if "candidate_unsupported_factual_claim_count" in columns
         else "0"
     )
     profile_status_expr = (
@@ -2074,6 +2462,22 @@ def build_evaluation_report(
         ).fetchone()[0]
         or 0
     )
+    live_unsupported_factual_claims = int(
+        conn.execute(
+            """
+            SELECT COUNT(*)
+            FROM memory_governance_shared_brain_synthesis_runs
+            WHERE guild_id=? AND live_applied=1
+              AND {unsupported_factual_claim_expr}>0
+            """.format(
+                unsupported_factual_claim_expr=(
+                    unsupported_factual_claim_expr
+                )
+            ),
+            (int(guild_id or 0),),
+        ).fetchone()[0]
+        or 0
+    )
     live_prompt_ownership_violations = int(
         conn.execute(
             """
@@ -2142,7 +2546,11 @@ def build_evaluation_report(
                {route_family_expr},{latency_expr},
                {member_point_expr},{member_root_expr},
                {member_occurrence_expr},{canon_coverage_expr},
-               {lore_dominant_expr},created_at
+               {lore_dominant_expr},
+               {member_supported_claim_expr},
+               {canon_supported_claim_expr},{opinion_claim_expr},
+               {connective_claim_expr},{unsupported_factual_claim_expr},
+               created_at
         FROM memory_governance_shared_brain_synthesis_runs
         WHERE guild_id=?
         ORDER BY created_at DESC,run_id DESC
@@ -2155,6 +2563,11 @@ def build_evaluation_report(
             member_occurrence_expr=member_occurrence_expr,
             canon_coverage_expr=canon_coverage_expr,
             lore_dominant_expr=lore_dominant_expr,
+            member_supported_claim_expr=member_supported_claim_expr,
+            canon_supported_claim_expr=canon_supported_claim_expr,
+            opinion_claim_expr=opinion_claim_expr,
+            connective_claim_expr=connective_claim_expr,
+            unsupported_factual_claim_expr=unsupported_factual_claim_expr,
         ),
         (int(guild_id or 0), max(1, min(int(limit or 500), 2000))),
     ).fetchall()
@@ -2168,6 +2581,8 @@ def build_evaluation_report(
     prompt = live = selected = coverage = leaks = errors = sent = 0
     member_points = member_roots = member_occurrences = canon_coverage = 0
     lore_dominant_runs = 0
+    member_supported_claims = canon_supported_claims = 0
+    opinion_claims = connective_claims = unsupported_factual_claims = 0
     for row in rows:
         (
             _schema,
@@ -2190,6 +2605,11 @@ def build_evaluation_report(
             candidate_member_occurrences,
             candidate_canon_coverage,
             candidate_lore_dominant,
+            candidate_member_supported_claims,
+            candidate_canon_supported_claims,
+            candidate_opinion_claims,
+            candidate_connective_claims,
+            candidate_unsupported_factual_claims,
             _created_at,
         ) = row
         prompt += int(bool(prompt_applied))
@@ -2206,6 +2626,13 @@ def build_evaluation_report(
         member_occurrences += int(candidate_member_occurrences or 0)
         canon_coverage += int(candidate_canon_coverage or 0)
         lore_dominant_runs += int(bool(candidate_lore_dominant))
+        member_supported_claims += int(candidate_member_supported_claims or 0)
+        canon_supported_claims += int(candidate_canon_supported_claims or 0)
+        opinion_claims += int(candidate_opinion_claims or 0)
+        connective_claims += int(candidate_connective_claims or 0)
+        unsupported_factual_claims += int(
+            candidate_unsupported_factual_claims or 0
+        )
         revalidation[str(revalidation_status or "unknown")] += 1
         leaks += int(bool(output_leak))
         errors += int(processing_errors or 0)
@@ -2238,6 +2665,13 @@ def build_evaluation_report(
         "candidateMemberOccurrenceCoverageTotal": member_occurrences,
         "candidateCanonCoverageTotal": canon_coverage,
         "loreDominantRuns": lore_dominant_runs,
+        "candidateMemberSupportedClaimTotal": member_supported_claims,
+        "candidateCanonSupportedClaimTotal": canon_supported_claims,
+        "candidateOpinionClaimTotal": opinion_claims,
+        "candidateConnectiveClaimTotal": connective_claims,
+        "candidateUnsupportedFactualClaimTotal": (
+            unsupported_factual_claims
+        ),
         "promptFactualOwnerRuns": prompt_factual_owner_runs,
         "promptOwnershipFailureRuns": prompt_ownership_failures,
         "routeFamilyCounts": dict(sorted(route_families.items())),
@@ -2261,6 +2695,9 @@ def build_evaluation_report(
             live_insufficient_member_coverage
         ),
         "liveLoreDominantRuns": live_lore_dominant,
+        "liveUnsupportedFactualClaimRuns": (
+            live_unsupported_factual_claims
+        ),
         "livePromptOwnershipViolationRuns": (
             live_prompt_ownership_violations
         ),
