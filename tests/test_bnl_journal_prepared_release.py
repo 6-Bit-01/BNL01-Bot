@@ -987,6 +987,171 @@ class PreparedReleaseTests(unittest.TestCase):
         self.assertIsNone(run["prepared_payload_hash"])
         self.assert_owed_occurrence_has_no_revision_link(result)
 
+    def test_attempt_ledgers_retain_each_repair_outcome_without_generated_text(self):
+        calls = []
+
+        def repaired(packet, _prompt):
+            calls.append(1)
+            if len(calls) == 1:
+                return "not-json"
+            return article_json(packet)
+
+        result = self.prepare(repaired)
+        self.assertEqual("prepared", result.status, result)
+        self.assertEqual(2, len(calls))
+
+        with sqlite3.connect(self.db) as conn:
+            conn.row_factory = sqlite3.Row
+            preparation = dict(
+                conn.execute(
+                    "SELECT * FROM bnl_journal_preparation_attempts"
+                ).fetchone()
+            )
+            generations = [
+                dict(row)
+                for row in conn.execute(
+                    "SELECT * FROM bnl_journal_generation_attempts "
+                    "ORDER BY generation_attempt"
+                ).fetchall()
+            ]
+            generation_columns = {
+                str(row[1])
+                for row in conn.execute(
+                    "PRAGMA table_info(bnl_journal_generation_attempts)"
+                ).fetchall()
+            }
+
+        self.assertEqual("prepared", preparation["result_status"])
+        self.assertEqual(
+            "prepared_waiting_release",
+            preparation["result_reason"],
+        )
+        self.assertTrue(preparation["finished_at"])
+        self.assertEqual(
+            [
+                (1, "parse_rejected", "malformed_json"),
+                (2, "accepted", ""),
+            ],
+            [
+                (
+                    row["generation_attempt"],
+                    row["outcome"],
+                    row["outcome_reason"],
+                )
+                for row in generations
+            ],
+        )
+        self.assertGreater(generations[0]["response_bytes"], 0)
+        self.assertNotIn("response_text", generation_columns)
+        self.assertNotIn("prompt", generation_columns)
+
+    def test_attempt_ledgers_bound_exact_model_accounting_rows(self):
+        with sqlite3.connect(self.db) as conn:
+            conn.execute(
+                "CREATE TABLE token_usage_events("
+                "id INTEGER PRIMARY KEY AUTOINCREMENT)"
+            )
+            conn.execute(
+                "CREATE TABLE model_generation_attempts("
+                "id INTEGER PRIMARY KEY AUTOINCREMENT)"
+            )
+
+        def accounted(packet, _prompt):
+            with sqlite3.connect(self.db) as conn:
+                conn.execute("INSERT INTO token_usage_events DEFAULT VALUES")
+            return article_json(packet)
+
+        result = self.prepare(accounted)
+        self.assertEqual("prepared", result.status, result)
+        with sqlite3.connect(self.db) as conn:
+            preparation = conn.execute(
+                "SELECT token_event_start_id,token_event_end_id,"
+                "model_attempt_start_id,model_attempt_end_id "
+                "FROM bnl_journal_preparation_attempts"
+            ).fetchone()
+            generation = conn.execute(
+                "SELECT token_event_start_id,token_event_end_id,"
+                "model_attempt_start_id,model_attempt_end_id "
+                "FROM bnl_journal_generation_attempts"
+            ).fetchone()
+        self.assertEqual((0, 1, 0, 0), preparation)
+        self.assertEqual((0, 1, 0, 0), generation)
+
+    def test_local_budget_refusal_is_typed_and_retained_for_retry(self):
+        result = self.prepare(
+            lambda _packet, _prompt: (_ for _ in ()).throw(
+                RuntimeError("local_model_budget_exhausted")
+            )
+        )
+
+        self.assertEqual("held", result.status, result)
+        self.assertEqual("local_budget_unavailable", result.reason)
+        with sqlite3.connect(self.db) as conn:
+            preparation = conn.execute(
+                "SELECT result_status,result_reason,next_retry_at "
+                "FROM bnl_journal_preparation_attempts"
+            ).fetchone()
+            generation = conn.execute(
+                "SELECT outcome,outcome_reason "
+                "FROM bnl_journal_generation_attempts"
+            ).fetchone()
+        self.assertEqual(
+            ("held", "local_budget_unavailable"),
+            preparation[:2],
+        )
+        self.assertTrue(preparation[2])
+        self.assertEqual(
+            ("local_budget_refusal", "local_budget_unavailable"),
+            generation,
+        )
+
+    def test_expired_preparation_epoch_is_reconciled_before_retry(self):
+        start, end, _ = automation._daily_period_for_day(TARGET_DAY)
+        first_claim, run_id, first_epoch, _ = automation._claim_preparation(
+            self.db,
+            1,
+            "daily",
+            start,
+            end,
+            force=True,
+        )
+        self.assertEqual("claimed", first_claim)
+        with sqlite3.connect(self.db) as conn:
+            conn.execute(
+                "UPDATE bnl_journal_automation_runs "
+                "SET lease_expires_at='2000-01-01T00:00:00Z' "
+                "WHERE run_id=?",
+                (run_id,),
+            )
+
+        second_claim, second_run_id, second_epoch, _ = (
+            automation._claim_preparation(
+                self.db,
+                1,
+                "daily",
+                start,
+                end,
+                force=True,
+            )
+        )
+
+        self.assertEqual("claimed", second_claim)
+        self.assertEqual(run_id, second_run_id)
+        self.assertEqual(first_epoch + 1, second_epoch)
+        with sqlite3.connect(self.db) as conn:
+            rows = conn.execute(
+                "SELECT preparation_epoch,result_status,result_reason,"
+                "finished_at FROM bnl_journal_preparation_attempts "
+                "WHERE run_id=? ORDER BY preparation_epoch",
+                (run_id,),
+            ).fetchall()
+        self.assertEqual(
+            (first_epoch, "interrupted", "preparation_lease_expired"),
+            rows[0][:3],
+        )
+        self.assertTrue(rows[0][3])
+        self.assertEqual((second_epoch, "preparing", ""), rows[1][:3])
+
     def test_storage_failure_stays_held_and_owed_with_frozen_packet(self):
         with patch.object(
             automation,

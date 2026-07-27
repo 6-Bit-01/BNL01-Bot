@@ -290,6 +290,54 @@ def ensure_schema(db_path: str) -> None:
                END"""
         )
         conn.execute("CREATE INDEX IF NOT EXISTS idx_bnl_journal_runs_latest ON bnl_journal_automation_runs(guild_id,updated_at DESC)")
+        conn.execute("""CREATE TABLE IF NOT EXISTS bnl_journal_preparation_attempts (
+            run_id TEXT NOT NULL,
+            preparation_epoch INTEGER NOT NULL,
+            guild_id INTEGER NOT NULL,
+            cadence TEXT NOT NULL,
+            source_window_start TEXT NOT NULL,
+            source_window_end TEXT NOT NULL,
+            started_at TEXT NOT NULL,
+            lease_expires_at TEXT,
+            finished_at TEXT,
+            result_status TEXT NOT NULL DEFAULT 'preparing',
+            result_reason TEXT NOT NULL DEFAULT '',
+            next_retry_at TEXT,
+            token_event_start_id INTEGER NOT NULL DEFAULT 0,
+            token_event_end_id INTEGER NOT NULL DEFAULT 0,
+            model_attempt_start_id INTEGER NOT NULL DEFAULT 0,
+            model_attempt_end_id INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY(run_id,preparation_epoch))""")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_bnl_journal_preparation_attempts_window "
+            "ON bnl_journal_preparation_attempts("
+            "guild_id,source_window_end,started_at)"
+        )
+        conn.execute("""CREATE TABLE IF NOT EXISTS bnl_journal_generation_attempts (
+            run_id TEXT NOT NULL,
+            preparation_epoch INTEGER NOT NULL,
+            generation_attempt INTEGER NOT NULL,
+            started_at TEXT NOT NULL,
+            finished_at TEXT,
+            repair_reason TEXT NOT NULL DEFAULT '',
+            outcome TEXT NOT NULL DEFAULT 'started',
+            outcome_reason TEXT NOT NULL DEFAULT '',
+            response_bytes INTEGER NOT NULL DEFAULT 0,
+            retained_publishable INTEGER NOT NULL DEFAULT 0,
+            token_event_start_id INTEGER NOT NULL DEFAULT 0,
+            token_event_end_id INTEGER NOT NULL DEFAULT 0,
+            model_attempt_start_id INTEGER NOT NULL DEFAULT 0,
+            model_attempt_end_id INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY(run_id,preparation_epoch,generation_attempt))""")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_bnl_journal_generation_attempts_window "
+            "ON bnl_journal_generation_attempts("
+            "run_id,preparation_epoch,generation_attempt)"
+        )
         conn.execute("""CREATE TABLE IF NOT EXISTS bnl_journal_automation_state (
             guild_id INTEGER PRIMARY KEY,
             last_checked_at TEXT,
@@ -1004,6 +1052,204 @@ def _reconcile_daily_observation(
     )
 
 
+def _max_table_id(conn: sqlite3.Connection, table: str) -> int:
+    exists = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+        (table,),
+    ).fetchone()
+    if not exists:
+        return 0
+    row = conn.execute(f"SELECT COALESCE(MAX(id),0) FROM {table}").fetchone()
+    return int(row[0] or 0) if row else 0
+
+
+def _model_event_boundaries(conn: sqlite3.Connection) -> tuple[int, int]:
+    return (
+        _max_table_id(conn, "token_usage_events"),
+        _max_table_id(conn, "model_generation_attempts"),
+    )
+
+
+def _start_preparation_attempt_on_connection(
+    conn: sqlite3.Connection,
+    *,
+    run_id: str,
+    preparation_epoch: int,
+    guild_id: int,
+    cadence: str,
+    start: str,
+    end: str,
+    lease_expires_at: str,
+    now: str,
+) -> None:
+    token_start, model_start = _model_event_boundaries(conn)
+    conn.execute(
+        """INSERT INTO bnl_journal_preparation_attempts(
+               run_id,preparation_epoch,guild_id,cadence,
+               source_window_start,source_window_end,started_at,
+               lease_expires_at,result_status,
+               token_event_start_id,model_attempt_start_id,
+               created_at,updated_at
+           ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
+           ON CONFLICT(run_id,preparation_epoch) DO NOTHING""",
+        (
+            run_id,
+            int(preparation_epoch),
+            int(guild_id),
+            cadence,
+            start,
+            end,
+            now,
+            lease_expires_at,
+            "preparing",
+            token_start,
+            model_start,
+            now,
+            now,
+        ),
+    )
+
+
+def _finish_preparation_attempt_on_connection(
+    conn: sqlite3.Connection,
+    *,
+    run_id: str,
+    preparation_epoch: int,
+    result_status: str,
+    result_reason: str,
+    finished_at: str,
+    next_retry_at: str = "",
+) -> None:
+    token_end, model_end = _model_event_boundaries(conn)
+    conn.execute(
+        """UPDATE bnl_journal_preparation_attempts
+           SET finished_at=?,result_status=?,result_reason=?,
+               next_retry_at=?,token_event_end_id=?,
+               model_attempt_end_id=?,updated_at=?
+           WHERE run_id=? AND preparation_epoch=?""",
+        (
+            finished_at,
+            result_status,
+            result_reason,
+            next_retry_at or None,
+            token_end,
+            model_end,
+            finished_at,
+            run_id,
+            int(preparation_epoch),
+        ),
+    )
+    conn.execute(
+        """UPDATE bnl_journal_generation_attempts
+           SET finished_at=COALESCE(finished_at,?),
+               outcome=CASE
+                   WHEN outcome='started' THEN 'interrupted'
+                   ELSE outcome
+               END,
+               outcome_reason=CASE
+                   WHEN outcome='started'
+                       THEN 'generation_attempt_unfinished_at_cycle_completion'
+                   ELSE outcome_reason
+               END,
+               token_event_end_id=CASE
+                   WHEN outcome='started' THEN ?
+                   ELSE token_event_end_id
+               END,
+               model_attempt_end_id=CASE
+                   WHEN outcome='started' THEN ?
+                   ELSE model_attempt_end_id
+               END,
+               updated_at=?
+           WHERE run_id=? AND preparation_epoch=? AND finished_at IS NULL""",
+        (
+            finished_at,
+            token_end,
+            model_end,
+            finished_at,
+            run_id,
+            int(preparation_epoch),
+        ),
+    )
+
+
+def _reconcile_expired_preparation_attempt_on_connection(
+    conn: sqlite3.Connection,
+    *,
+    run_id: str,
+    preparation_epoch: int,
+    now: str,
+) -> None:
+    _finish_preparation_attempt_on_connection(
+        conn,
+        run_id=run_id,
+        preparation_epoch=preparation_epoch,
+        result_status="interrupted",
+        result_reason="preparation_lease_expired",
+        finished_at=now,
+    )
+
+
+def _record_generation_attempt_event(
+    db_path: str,
+    run_id: str,
+    preparation_epoch: int,
+    event: dict[str, Any],
+) -> None:
+    attempt = int(event.get("generationAttempt") or 0)
+    if attempt < 1:
+        return
+    phase = str(event.get("phase") or "")
+    now = utc_now_iso()
+    with sqlite3.connect(db_path, timeout=30) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        token_boundary, model_boundary = _model_event_boundaries(conn)
+        if phase == "started":
+            conn.execute(
+                """INSERT INTO bnl_journal_generation_attempts(
+                       run_id,preparation_epoch,generation_attempt,
+                       started_at,repair_reason,outcome,
+                       token_event_start_id,model_attempt_start_id,
+                       created_at,updated_at
+                   ) VALUES(?,?,?,?,?,'started',?,?,?,?)
+                   ON CONFLICT(run_id,preparation_epoch,generation_attempt)
+                   DO NOTHING""",
+                (
+                    run_id,
+                    int(preparation_epoch),
+                    attempt,
+                    now,
+                    str(event.get("repairReason") or ""),
+                    token_boundary,
+                    model_boundary,
+                    now,
+                    now,
+                ),
+            )
+        elif phase == "finished":
+            conn.execute(
+                """UPDATE bnl_journal_generation_attempts
+                   SET finished_at=?,outcome=?,outcome_reason=?,
+                       response_bytes=?,retained_publishable=?,
+                       token_event_end_id=?,model_attempt_end_id=?,updated_at=?
+                   WHERE run_id=? AND preparation_epoch=?
+                     AND generation_attempt=?""",
+                (
+                    now,
+                    str(event.get("outcome") or "unknown"),
+                    str(event.get("reason") or ""),
+                    max(0, int(event.get("responseBytes") or 0)),
+                    int(bool(event.get("retainedPublishable"))),
+                    token_boundary,
+                    model_boundary,
+                    now,
+                    run_id,
+                    int(preparation_epoch),
+                    attempt,
+                ),
+            )
+        conn.commit()
+
+
 def _claim_preparation(
     db_path: str,
     guild_id: int,
@@ -1018,6 +1264,7 @@ def _claim_preparation(
     run_id = _run_id(guild_id, cadence, start, end)
     now = datetime.now(timezone.utc)
     lease = _utc_iso(now + timedelta(minutes=LEASE_MINUTES))
+    now_iso = _utc_iso(now)
     with sqlite3.connect(db_path) as conn:
         conn.row_factory = sqlite3.Row
         conn.execute("BEGIN IMMEDIATE")
@@ -1056,6 +1303,13 @@ def _claim_preparation(
             ):
                 conn.commit()
                 return "busy", run_id, int(current.get("preparation_epoch") or 0), current
+            if current["lifecycle_state"] in {"running", "preparing"}:
+                _reconcile_expired_preparation_attempt_on_connection(
+                    conn,
+                    run_id=run_id,
+                    preparation_epoch=int(current.get("preparation_epoch") or 0),
+                    now=now_iso,
+                )
             epoch = int(current.get("preparation_epoch") or 0) + 1
             conn.execute("""UPDATE bnl_journal_automation_runs
                 SET lifecycle_state='preparing',reason='',attempt_count=attempt_count+1,
@@ -1065,11 +1319,10 @@ def _claim_preparation(
                     epoch,
                     lease,
                     int(schedule_contract_version),
-                    utc_now_iso(),
+                    now_iso,
                     run_id,
                 ))
         else:
-            now_iso = utc_now_iso()
             epoch = 1
             conn.execute("""INSERT INTO bnl_journal_automation_runs(
                 run_id,guild_id,cadence,source_window_start,source_window_end,lifecycle_state,reason,
@@ -1087,6 +1340,17 @@ def _claim_preparation(
                 now_iso,
                 now_iso,
             ))
+        _start_preparation_attempt_on_connection(
+            conn,
+            run_id=run_id,
+            preparation_epoch=epoch,
+            guild_id=guild_id,
+            cadence=cadence,
+            start=start,
+            end=end,
+            lease_expires_at=lease,
+            now=now_iso,
+        )
         conn.commit()
     return "claimed", run_id, epoch, {}
 
@@ -1103,6 +1367,7 @@ def _finish_preparation(
             datetime.now(timezone.utc)
             + timedelta(minutes=PREPARATION_RETRY_MINUTES)
         )
+    finished_at = utc_now_iso()
     with sqlite3.connect(db_path) as conn:
         conn.execute("BEGIN IMMEDIATE")
         row = conn.execute(
@@ -1124,14 +1389,33 @@ def _finish_preparation(
                 journal_revision=?,aggregate_counts_json=?,lease_expires_at=NULL,updated_at=?
                 WHERE run_id=? AND preparation_epoch=? AND lifecycle_state='preparing'""", (
                 result.status, result.reason, result.entry_id or None, int(result.revision or 0),
-                _json(result.aggregate_counts or {}), utc_now_iso(), run_id, int(preparation_epoch),
+                _json(result.aggregate_counts or {}), finished_at, run_id, int(preparation_epoch),
             )).rowcount
         if updated != 1:
             conn.rollback()
             return AutomationResult(False, result.cadence, "busy", "preparation_epoch_superseded")
+        _finish_preparation_attempt_on_connection(
+            conn,
+            run_id=run_id,
+            preparation_epoch=preparation_epoch,
+            result_status=result.status,
+            result_reason=result.reason,
+            finished_at=finished_at,
+            next_retry_at=retry_at,
+        )
         _reconcile_daily_observation(conn, int(row[0]), result)
         _update_state(conn, int(row[0]), result, next_retry_at=retry_at)
         conn.commit()
+    logging.info(
+        "journal_preparation_finished run=%s epoch=%s cadence=%s "
+        "status=%s reason=%s next_retry_at=%s",
+        run_id,
+        preparation_epoch,
+        result.cadence,
+        result.status,
+        result.reason or "none",
+        retry_at or "none",
+    )
     return result
 
 
@@ -1504,6 +1788,18 @@ def _adopt_legacy_staged_revision(
                 "WHERE run_id=? AND preparation_epoch=? AND lifecycle_state='preparing'",
                 (failure, now, run_id, int(preparation_epoch)),
             )
+            _finish_preparation_attempt_on_connection(
+                conn,
+                run_id=run_id,
+                preparation_epoch=preparation_epoch,
+                result_status=result.status,
+                result_reason=result.reason,
+                finished_at=now,
+                next_retry_at=_utc_iso(
+                    datetime.now(timezone.utc)
+                    + timedelta(minutes=PREPARATION_RETRY_MINUTES)
+                ),
+            )
             _reconcile_daily_observation(conn, guild_id, result)
             _update_state(conn, guild_id, result)
             conn.commit()
@@ -1614,6 +1910,14 @@ def _adopt_legacy_staged_revision(
         if updated != 1:
             conn.rollback()
             return AutomationResult(False, cadence, "busy", "preparation_epoch_superseded")
+        _finish_preparation_attempt_on_connection(
+            conn,
+            run_id=run_id,
+            preparation_epoch=preparation_epoch,
+            result_status=result.status,
+            result_reason=result.reason,
+            finished_at=now,
+        )
         _reconcile_daily_observation(conn, guild_id, result)
         _update_state(conn, guild_id, result)
         conn.commit()
@@ -1779,6 +2083,14 @@ def _mark_prepared(
         if updated != 1:
             conn.rollback()
             return AutomationResult(False, cadence, "busy", "preparation_epoch_superseded")
+        _finish_preparation_attempt_on_connection(
+            conn,
+            run_id=run_id,
+            preparation_epoch=preparation_epoch,
+            result_status=result.status,
+            result_reason=result.reason,
+            finished_at=now,
+        )
         _reconcile_daily_observation(conn, guild_id, result)
         _update_state(conn, guild_id, result)
         conn.commit()
@@ -2096,6 +2408,12 @@ def _prepare_packet(
         revision=revision,
         attempt_fence=(run_id, preparation_epoch),
         source_hash=source_hash,
+        attempt_observer=lambda event: _record_generation_attempt_event(
+            db_path,
+            run_id,
+            preparation_epoch,
+            event,
+        ),
     )
     if not generated.ok:
         if generated.reason == "preparation_epoch_lost":
@@ -3787,6 +4105,63 @@ def _latest_daily_day(now_utc: Optional[datetime]) -> date:
     return latest
 
 
+def _run_has_saved_delivery(row: Optional[dict[str, Any]]) -> bool:
+    if not row:
+        return False
+    return bool(
+        str(row.get("lifecycle_state") or "")
+        in {"prepared", "delivery_failed", "delivering"}
+        and row.get("journal_entry_id")
+        and int(row.get("journal_revision") or 0) > 0
+        and row.get("prepared_payload_hash")
+        and row.get("frozen_packet_hash")
+    )
+
+
+def _run_recovery_ready(
+    row: Optional[dict[str, Any]],
+    now_utc: Optional[datetime],
+) -> bool:
+    if not row:
+        return True
+    now = (now_utc or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    lifecycle = str(row.get("lifecycle_state") or "")
+    if lifecycle in TERMINAL_RUN_STATES:
+        return False
+    if lifecycle in {"running", "preparing"}:
+        lease = str(row.get("lease_expires_at") or "")
+        return not lease or _parse_utc(lease) <= now
+    if lifecycle == "delivering":
+        lease = str(row.get("delivery_lease_expires_at") or "")
+        return not lease or _parse_utc(lease) <= now
+    updated = str(row.get("updated_at") or "")
+    if lifecycle in {"held", "deferred"} and updated:
+        return (
+            _parse_utc(updated) + timedelta(minutes=PREPARATION_RETRY_MINUTES)
+            <= now
+        )
+    if lifecycle == "delivery_failed" and updated:
+        return (
+            _parse_utc(updated) + timedelta(minutes=DELIVERY_RETRY_MINUTES)
+            <= now
+        )
+    return True
+
+
+def _pending_occurrence_priority(
+    row: Optional[dict[str, Any]],
+    end: str,
+    now_utc: Optional[datetime],
+) -> tuple[int, int, int, float]:
+    end_timestamp = _parse_utc(end).timestamp()
+    return (
+        0 if _run_recovery_ready(row, now_utc) else 1,
+        0 if _run_has_saved_delivery(row) else 1,
+        0 if row else 1,
+        end_timestamp if row else -end_timestamp,
+    )
+
+
 def _pending_daily_day(db_path: str, guild_id: int, now_utc: Optional[datetime]) -> Optional[date]:
     state = ensure_cadence_activation(db_path, guild_id, now_utc=now_utc)
     transition_end = str(state.get("daily_transition_end") or "")
@@ -3795,19 +4170,22 @@ def _pending_daily_day(db_path: str, guild_id: int, now_utc: Optional[datetime])
     first = _parse_utc(transition_end).astimezone(PACIFIC).date() - timedelta(days=1)
     latest = _latest_daily_day(now_utc)
     with sqlite3.connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
         rows = {
-            (str(row[0]), str(row[1]), str(row[2])): str(row[3])
+            (
+                str(row["cadence"]),
+                str(row["source_window_start"]),
+                str(row["source_window_end"]),
+            ): dict(row)
             for row in conn.execute(
-                "SELECT cadence,source_window_start,source_window_end,lifecycle_state "
+                "SELECT * "
                 "FROM bnl_journal_automation_runs "
                 "WHERE guild_id=? AND cadence='daily' "
                 "AND COALESCE(schedule_contract_version,1)=?",
                 (guild_id, CADENCE_CONTRACT_VERSION),
             ).fetchall()
         }
-    # Always give the newly closed 6:30-to-6:30 window first priority. Once that
-    # window is terminal, the interval worker walks backward through any
-    # older backlog without letting an old held run starve today's Journal.
+    candidates: list[tuple[date, str, Optional[dict[str, Any]]]] = []
     if first <= latest:
         current = latest
         while current >= first:
@@ -3820,22 +4198,41 @@ def _pending_daily_day(db_path: str, guild_id: int, now_utc: Optional[datetime])
             if not _daily_window_is_scheduled(end):
                 current -= timedelta(days=1)
                 continue
-            if rows.get(("daily", start, end)) not in TERMINAL_RUN_STATES:
-                return current
+            row = rows.get(("daily", start, end))
+            if (
+                not row
+                or str(row.get("lifecycle_state") or "")
+                not in TERMINAL_RUN_STATES
+            ):
+                candidates.append((current, end, row))
             current -= timedelta(days=1)
-    existing_pending = [
-        (
-            _parse_utc(end),
-            _parse_utc(start).astimezone(PACIFIC).date(),
-        )
-        for (_cadence, start, end), lifecycle in rows.items()
-        if lifecycle not in TERMINAL_RUN_STATES
-        and _daily_window_is_scheduled(end)
-        and _window_is_closed(end, now_utc)
-    ]
-    if existing_pending:
-        return max(existing_pending, key=lambda item: item[0])[1]
-    return None
+    candidate_ends = {end for _target, end, _row in candidates}
+    for (_cadence, start, end), row in rows.items():
+        if (
+            end not in candidate_ends
+            and str(row.get("lifecycle_state") or "")
+            not in TERMINAL_RUN_STATES
+            and _daily_window_is_scheduled(end)
+            and _window_is_closed(end, now_utc)
+        ):
+            candidates.append(
+                (
+                    _parse_utc(start).astimezone(PACIFIC).date(),
+                    end,
+                    row,
+                )
+            )
+    if not candidates:
+        return None
+    selected = min(
+        candidates,
+        key=lambda item: _pending_occurrence_priority(
+            item[2],
+            item[1],
+            now_utc,
+        ),
+    )
+    return selected[0]
 
 
 def _latest_week_monday(now_utc: Optional[datetime]) -> date:
@@ -3857,16 +4254,21 @@ def _pending_week_monday(db_path: str, guild_id: int, now_utc: Optional[datetime
     first_monday = _parse_utc(transition_end).astimezone(PACIFIC).date() - timedelta(days=7)
     latest = _latest_week_monday(now_utc)
     with sqlite3.connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
         rows = {
-            (str(row[0]), str(row[1])): str(row[2])
+            (
+                str(row["source_window_start"]),
+                str(row["source_window_end"]),
+            ): dict(row)
             for row in conn.execute(
-                "SELECT source_window_start,source_window_end,lifecycle_state "
+                "SELECT * "
                 "FROM bnl_journal_automation_runs "
                 "WHERE guild_id=? AND cadence='weekly' "
                 "AND COALESCE(schedule_contract_version,1)=?",
                 (guild_id, CADENCE_CONTRACT_VERSION),
             ).fetchall()
         }
+    candidates: list[tuple[date, str, Optional[dict[str, Any]]]] = []
     if first_monday <= latest:
         current = latest
         while current >= first_monday:
@@ -3876,20 +4278,40 @@ def _pending_week_monday(db_path: str, guild_id: int, now_utc: Optional[datetime
                 current,
                 now_utc=now_utc,
             )
-            if rows.get((start, end)) not in TERMINAL_RUN_STATES:
-                return current
+            row = rows.get((start, end))
+            if (
+                not row
+                or str(row.get("lifecycle_state") or "")
+                not in TERMINAL_RUN_STATES
+            ):
+                candidates.append((current, end, row))
             current -= timedelta(days=7)
-    existing_pending = [
-        (
-            _parse_utc(end),
-            _parse_utc(start).astimezone(PACIFIC).date(),
-        )
-        for (start, end), lifecycle in rows.items()
-        if lifecycle not in TERMINAL_RUN_STATES and _window_is_closed(end, now_utc)
-    ]
-    if existing_pending:
-        return max(existing_pending, key=lambda item: item[0])[1]
-    return None
+    candidate_ends = {end for _target, end, _row in candidates}
+    for (start, end), row in rows.items():
+        if (
+            end not in candidate_ends
+            and str(row.get("lifecycle_state") or "")
+            not in TERMINAL_RUN_STATES
+            and _window_is_closed(end, now_utc)
+        ):
+            candidates.append(
+                (
+                    _parse_utc(start).astimezone(PACIFIC).date(),
+                    end,
+                    row,
+                )
+            )
+    if not candidates:
+        return None
+    selected = min(
+        candidates,
+        key=lambda item: _pending_occurrence_priority(
+            item[2],
+            item[1],
+            now_utc,
+        ),
+    )
+    return selected[0]
 
 
 def _pending_legacy_run(
@@ -3910,6 +4332,7 @@ def _pending_legacy_run(
                 (int(guild_id), LEGACY_CADENCE_CONTRACT_VERSION),
             ).fetchall()
         ]
+    candidates: list[dict[str, Any]] = []
     for row in rows:
         if str(row.get("lifecycle_state") or "") in TERMINAL_RUN_STATES:
             continue
@@ -3922,8 +4345,17 @@ def _pending_legacy_run(
             # a partially upgraded database is observed.
             continue
         if _window_is_closed(end, now_utc):
-            return row
-    return None
+            candidates.append(row)
+    if not candidates:
+        return None
+    return min(
+        candidates,
+        key=lambda row: _pending_occurrence_priority(
+            row,
+            str(row.get("source_window_end") or ""),
+            now_utc,
+        ),
+    )
 
 
 def _run_legacy_occurrence(
@@ -4216,7 +4648,7 @@ def run_scheduled(
     now_utc: Optional[datetime] = None,
     opener=None,
 ) -> list[AutomationResult]:
-    """Recover the newest owed occurrence without changing exact-time phases."""
+    """Recover saved delivery first, then the oldest retry-ready obligation."""
     controls, memory_excluded_entry_ids, memory_exclusions_confirmed = (
         _scheduled_controls(flags)
     )
@@ -4275,28 +4707,57 @@ def run_scheduled(
         ):
             legacy = None
 
-    def candidate_end(item: tuple[str, date]) -> datetime:
+    candidate_rows: dict[tuple[str, str, str], Optional[dict[str, Any]]] = {}
+
+    def candidate_window(item: tuple[str, date]) -> tuple[str, str]:
         cadence, target = item
         if cadence == "daily":
-            _start, end, _label = _daily_period_for_target(
+            start, end, _label = _daily_period_for_target(
                 db_path,
                 guild_id,
                 target,
                 now_utc=now_utc,
             )
         else:
-            _start, end, _label = _weekly_period_for_target(
+            start, end, _label = _weekly_period_for_target(
                 db_path,
                 guild_id,
                 target,
                 now_utc=now_utc,
             )
-        return _parse_utc(end)
+        return start, end
+
+    def candidate_priority(
+        item: tuple[str, date],
+    ) -> tuple[int, int, int, float]:
+        cadence, _target = item
+        start, end = candidate_window(item)
+        key = (cadence, start, end)
+        if key not in candidate_rows:
+            with sqlite3.connect(db_path) as conn:
+                conn.row_factory = sqlite3.Row
+                row = conn.execute(
+                    "SELECT * FROM bnl_journal_automation_runs "
+                    "WHERE guild_id=? AND cadence=? "
+                    "AND source_window_start=? AND source_window_end=? "
+                    "ORDER BY schedule_contract_version DESC LIMIT 1",
+                    (guild_id, cadence, start, end),
+                ).fetchone()
+            candidate_rows[key] = dict(row) if row else None
+        return _pending_occurrence_priority(
+            candidate_rows[key],
+            end,
+            now_utc,
+        )
 
     if legacy is not None and (
         not candidates
-        or _parse_utc(str(legacy.get("source_window_end") or ""))
-        > max(candidate_end(item) for item in candidates)
+        or _pending_occurrence_priority(
+            legacy,
+            str(legacy.get("source_window_end") or ""),
+            now_utc,
+        )
+        < min(candidate_priority(item) for item in candidates)
     ):
         return [
             _run_legacy_occurrence(
@@ -4314,7 +4775,7 @@ def run_scheduled(
     if not candidates:
         return [AutomationResult(False, "all", "not_due", "no_schedule_due")]
 
-    cadence, target = max(candidates, key=candidate_end)
+    cadence, target = min(candidates, key=candidate_priority)
     if cadence == "daily":
         prepared = prepare_daily(
             db_path,

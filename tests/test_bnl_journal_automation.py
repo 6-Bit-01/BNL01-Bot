@@ -435,6 +435,135 @@ class JournalAutomationTests(unittest.TestCase):
             ),
         )
 
+    def test_retry_ready_older_owed_day_runs_before_a_new_missing_day(self):
+        self.add_day("2026-07-18")
+        self.add_day("2026-07-20")
+        self.set_archive_activation("2026-07-18T01:30:00Z")
+        automation.ensure_cadence_activation(
+            self.db,
+            1,
+            now_utc=datetime(2026, 7, 21, 1, 0, tzinfo=timezone.utc),
+        )
+
+        held = automation.run_daily(
+            self.db,
+            1,
+            lambda _packet, _prompt: (_ for _ in ()).throw(
+                RuntimeError("provider down")
+            ),
+            "https://site.example",
+            "key",
+            target_day=date(2026, 7, 18),
+            now_utc=datetime(2026, 7, 21, 1, 0, tzinfo=timezone.utc),
+            force=True,
+            opener=self.opener,
+        )
+        self.assertEqual("held", held.status)
+        with sqlite3.connect(self.db) as conn:
+            conn.execute(
+                "UPDATE bnl_journal_automation_runs "
+                "SET updated_at='2026-07-21T01:00:00Z' "
+                "WHERE source_window_start=?",
+                (held.source_window_start,),
+            )
+
+        results = automation.run_scheduled(
+            self.db,
+            1,
+            lambda packet, _prompt: article_json(packet),
+            "https://site.example",
+            "key",
+            {
+                "journalAutoPublishEnabled": True,
+                "journalDailyEnabled": True,
+                "journalWeeklyEnabled": False,
+            },
+            now_utc=datetime(2026, 7, 22, 3, 0, tzinfo=timezone.utc),
+            opener=self.opener,
+        )
+
+        self.assertEqual("published", results[0].status)
+        expected_start, expected_end, _ = automation._daily_period_for_day(
+            date(2026, 7, 18)
+        )
+        self.assertEqual(expected_start, results[0].source_window_start)
+        self.assertEqual(expected_end, results[0].source_window_end)
+        self.assertEqual(
+            date(2026, 7, 20),
+            automation._pending_daily_day(
+                self.db,
+                1,
+                datetime(2026, 7, 22, 3, 0, tzinfo=timezone.utc),
+            ),
+        )
+
+    def test_saved_delivery_runs_before_retry_ready_preparation_backlog(self):
+        self.add_day("2026-07-18")
+        self.add_day("2026-07-20")
+        self.set_archive_activation("2026-07-18T01:30:00Z")
+        automation.ensure_cadence_activation(
+            self.db,
+            1,
+            now_utc=datetime(2026, 7, 21, 1, 0, tzinfo=timezone.utc),
+        )
+
+        held = automation.run_daily(
+            self.db,
+            1,
+            lambda _packet, _prompt: (_ for _ in ()).throw(
+                RuntimeError("provider down")
+            ),
+            "https://site.example",
+            "key",
+            target_day=date(2026, 7, 18),
+            now_utc=datetime(2026, 7, 21, 1, 0, tzinfo=timezone.utc),
+            force=True,
+            opener=self.opener,
+        )
+        prepared = automation.prepare_daily(
+            self.db,
+            1,
+            lambda packet, _prompt: article_json(packet),
+            target_day=date(2026, 7, 20),
+            now_utc=datetime(2026, 7, 22, 1, 45, tzinfo=timezone.utc),
+            force=True,
+        )
+        self.assertEqual("held", held.status)
+        self.assertEqual("prepared", prepared.status)
+        with sqlite3.connect(self.db) as conn:
+            conn.execute(
+                "UPDATE bnl_journal_automation_runs "
+                "SET updated_at='2026-07-21T01:00:00Z' "
+                "WHERE source_window_start=?",
+                (held.source_window_start,),
+            )
+
+        results = automation.run_scheduled(
+            self.db,
+            1,
+            lambda *_args: self.fail("saved payload was regenerated"),
+            "https://site.example",
+            "key",
+            {
+                "journalAutoPublishEnabled": True,
+                "journalDailyEnabled": True,
+                "journalWeeklyEnabled": False,
+            },
+            now_utc=datetime(2026, 7, 22, 3, 0, tzinfo=timezone.utc),
+            opener=self.opener,
+        )
+
+        self.assertEqual("published", results[0].status)
+        self.assertEqual(prepared.entry_id, results[0].entry_id)
+        self.assertEqual(
+            date(2026, 7, 18),
+            automation._pending_daily_day(
+                self.db,
+                1,
+                datetime(2026, 7, 22, 3, 0, tzinfo=timezone.utc),
+            ),
+        )
+
     def test_daily_uses_complete_half_open_window_and_far_more_than_25(self):
         with sqlite3.connect(self.db) as conn:
             for index in range(90):
