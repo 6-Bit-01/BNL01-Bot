@@ -738,6 +738,108 @@ class PreparedReleaseTests(unittest.TestCase):
         self.assertEqual(1, len(generation_calls))
         self.assertEqual(first_attempt[0], generation_calls[0])
 
+    def test_automatic_generation_cycles_are_bounded_but_occurrence_stays_owed(self):
+        generation_calls = []
+
+        def provider_down(_packet, _prompt):
+            generation_calls.append(1)
+            raise RuntimeError("provider down")
+
+        first = self.prepare(provider_down)
+        self.assertEqual("held", first.status, first)
+
+        for _index in range(
+            1,
+            automation.MAX_AUTOMATIC_GENERATION_CYCLES,
+        ):
+            with sqlite3.connect(self.db) as conn:
+                conn.execute(
+                    "UPDATE bnl_journal_automation_runs SET updated_at=? "
+                    "WHERE cadence='daily'",
+                    (
+                        automation._utc_iso(
+                            datetime.now(timezone.utc)
+                            - timedelta(minutes=31)
+                        ),
+                    ),
+                )
+            failed = automation.prepare_daily(
+                self.db,
+                1,
+                provider_down,
+                target_day=TARGET_DAY,
+                force=False,
+            )
+            self.assertEqual("held", failed.status, failed)
+
+        self.assertEqual(
+            automation.MAX_AUTOMATIC_GENERATION_CYCLES,
+            len(generation_calls),
+        )
+        with sqlite3.connect(self.db) as conn:
+            conn.execute(
+                "UPDATE bnl_journal_automation_runs SET updated_at=? "
+                "WHERE cadence='daily'",
+                (
+                    automation._utc_iso(
+                        datetime.now(timezone.utc)
+                        - timedelta(minutes=31)
+                    ),
+                ),
+            )
+        capped = automation.prepare_daily(
+            self.db,
+            1,
+            lambda *_args: self.fail(
+                "generation ran after the rolling cycle cap"
+            ),
+            target_day=TARGET_DAY,
+            force=False,
+        )
+        self.assertEqual("backoff", capped.status, capped)
+        self.assertTrue(
+            capped.reason.startswith(
+                "generation_cycle_limit_until_"
+            ),
+            capped,
+        )
+        self.assertEqual(
+            "held",
+            self.run_row()["lifecycle_state"],
+        )
+
+        expired = automation._utc_iso(
+            datetime.now(timezone.utc)
+            - timedelta(
+                hours=automation.GENERATION_CYCLE_WINDOW_HOURS,
+                minutes=1,
+            )
+        )
+        with sqlite3.connect(self.db) as conn:
+            conn.execute(
+                "UPDATE bnl_journal_preparation_attempts "
+                "SET started_at=?,finished_at=?",
+                (expired, expired),
+            )
+            conn.execute(
+                "UPDATE bnl_journal_automation_runs SET updated_at=? "
+                "WHERE cadence='daily'",
+                (
+                    automation._utc_iso(
+                        datetime.now(timezone.utc)
+                        - timedelta(minutes=31)
+                    ),
+                ),
+            )
+        recovered = automation.prepare_daily(
+            self.db,
+            1,
+            lambda packet, _prompt: article_json(packet),
+            target_day=TARGET_DAY,
+            force=False,
+        )
+        self.assertEqual("prepared", recovered.status, recovered)
+
     def test_delivery_retry_waits_fifteen_minutes_and_never_regenerates(self):
         prepared = self.prepare()
         attempts = []

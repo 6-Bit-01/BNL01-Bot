@@ -351,6 +351,7 @@ from bnl_gemini_routing import (
     policy_for_route,
     provider_failure_kind,
     provider_status_code,
+    relay_protected_tokens,
     retry_delay_seconds,
     retryable_failure,
     single_attempt_reservation,
@@ -440,6 +441,16 @@ GENERATION_ERROR_LOCAL_MODEL_BUDGET = "local_model_budget_exhausted"
 class LocalModelBudgetExhausted(RuntimeError):
     """Raised when BNL's own daily API-token safety budget is exhausted."""
 
+
+class LocalBudgetReservation(int):
+    """Integer-compatible reservation that remembers its protected lane."""
+
+    def __new__(cls, amount: int, lane: str):
+        instance = int.__new__(cls, int(amount))
+        instance.lane = str(lane or "conversation")
+        return instance
+
+
 PUBLIC_GENERATION_FALLBACK = (
     "BNL-01 received the message, but the upper processing layer is refusing clean output right now. "
     "I’m holding the channel open until the connection stabilizes."
@@ -524,6 +535,9 @@ def _bounded_env_int(
 # Gemini 3 thinking_level. Route policies therefore protect quality with
 # route-specific output allowances and leave Gemini 3 reasoning provider-managed.
 BNL_GEMINI_JOURNAL_PROTECTED_TOKENS = journal_protected_tokens(
+    DAILY_TOKEN_LIMIT
+)
+BNL_GEMINI_RELAY_PROTECTED_TOKENS = relay_protected_tokens(
     DAILY_TOKEN_LIMIT
 )
 PACIFIC_TZ = pytz.timezone("US/Pacific")
@@ -15968,6 +15982,7 @@ def build_dynamic_curiosity_payload(guild_id: int):
 
 _token_budget_reservation_lock = threading.Lock()
 _token_budget_reserved_tokens = 0
+_token_budget_reserved_by_lane: dict[str, int] = {}
 
 
 def _pacific_usage_date() -> str:
@@ -16077,9 +16092,29 @@ def check_quota_availability(route: str = ""):
         result = conn.execute(
             "SELECT tokens_used_today FROM token_usage WHERE id = 1"
         ).fetchone()
+        usage_date = _pacific_usage_date()
+        lane_usage = _generation_lane_usage_on_connection(
+            conn,
+            usage_date,
+        )
     tokens_used = result[0] if result else 0
-    ceiling = budget_ceiling_for_route(DAILY_TOKEN_LIMIT, route)
-    return tokens_used < ceiling
+    with _token_budget_reservation_lock:
+        journal_used = (
+            lane_usage["journal"]
+            + _token_budget_reserved_by_lane.get("journal", 0)
+        )
+        relay_used = (
+            lane_usage["relay"]
+            + _token_budget_reserved_by_lane.get("relay", 0)
+        )
+        ceiling = budget_ceiling_for_route(
+            DAILY_TOKEN_LIMIT,
+            route,
+            journal_used=journal_used,
+            relay_used=relay_used,
+        )
+        projected = tokens_used + _token_budget_reserved_tokens
+    return projected < ceiling
 
 
 def _usage_int(value) -> int:
@@ -16332,15 +16367,63 @@ def _estimated_generation_reservation(
     )
 
 
+def _protected_usage_lane(route: str) -> str:
+    policy = policy_for_route(route)
+    if policy.journal_protected:
+        return "journal"
+    if policy.relay_protected:
+        return "relay"
+    return "ordinary"
+
+
+def _generation_lane_usage_on_connection(
+    conn: sqlite3.Connection,
+    usage_date: str,
+) -> dict[str, int]:
+    _ensure_token_usage_schema(conn.cursor())
+    totals = {"journal": 0, "relay": 0, "ordinary": 0}
+    for route, total in conn.execute(
+        """
+        SELECT route, COALESCE(SUM(total_tokens), 0)
+        FROM token_usage_events
+        WHERE usage_date=?
+        GROUP BY route
+        """,
+        (str(usage_date),),
+    ).fetchall():
+        lane = _protected_usage_lane(str(route or ""))
+        totals[lane] += _usage_int(total)
+    return totals
+
+
 def reserve_local_model_budget(
     contents: str,
     route: str = "",
 ) -> int:
     global _token_budget_reserved_tokens
     reservation = _estimated_generation_reservation(contents, route)
-    ceiling = budget_ceiling_for_route(DAILY_TOKEN_LIMIT, route)
+    lane = _protected_usage_lane(route)
     with _token_budget_reservation_lock:
-        tokens_used, _ = get_usage_stats()
+        tokens_used, usage_date = get_usage_stats()
+        with sqlite3.connect(DB_FILE) as conn:
+            lane_usage = _generation_lane_usage_on_connection(
+                conn,
+                usage_date,
+            )
+        journal_used = (
+            lane_usage["journal"]
+            + _token_budget_reserved_by_lane.get("journal", 0)
+        )
+        relay_used = (
+            lane_usage["relay"]
+            + _token_budget_reserved_by_lane.get("relay", 0)
+        )
+        ceiling = budget_ceiling_for_route(
+            DAILY_TOKEN_LIMIT,
+            route,
+            journal_used=journal_used,
+            relay_used=relay_used,
+        )
         projected_total = (
             tokens_used
             + _token_budget_reserved_tokens
@@ -16351,16 +16434,33 @@ def reserve_local_model_budget(
                 "local_model_budget_exhausted"
             )
         _token_budget_reserved_tokens += reservation
-    return reservation
+        _token_budget_reserved_by_lane[lane] = (
+            _token_budget_reserved_by_lane.get(lane, 0)
+            + reservation
+        )
+    return LocalBudgetReservation(reservation, lane)
 
 
 def release_local_model_budget(reservation: int) -> None:
     global _token_budget_reserved_tokens
+    lane = str(
+        getattr(reservation, "lane", "ordinary")
+        or "ordinary"
+    )
+    amount = _usage_int(reservation)
     with _token_budget_reservation_lock:
         _token_budget_reserved_tokens = max(
             0,
-            _token_budget_reserved_tokens - _usage_int(reservation),
+            _token_budget_reserved_tokens - amount,
         )
+        remaining = max(
+            0,
+            _token_budget_reserved_by_lane.get(lane, 0) - amount,
+        )
+        if remaining:
+            _token_budget_reserved_by_lane[lane] = remaining
+        else:
+            _token_budget_reserved_by_lane.pop(lane, None)
 
 def get_usage_stats():
     check_and_reset_daily_counters()
@@ -16381,6 +16481,10 @@ def get_usage_breakdown() -> dict:
     tokens_used, last_reset = get_usage_stats()
     with sqlite3.connect(DB_FILE) as conn:
         _ensure_token_usage_schema(conn.cursor())
+        lane_usage = _generation_lane_usage_on_connection(
+            conn,
+            last_reset,
+        )
         totals = conn.execute(
             """
             SELECT
@@ -16409,6 +16513,20 @@ def get_usage_breakdown() -> dict:
     ordinary_route_ceiling = budget_ceiling_for_route(
         DAILY_TOKEN_LIMIT,
         "normal_chat",
+        journal_used=lane_usage["journal"],
+        relay_used=lane_usage["relay"],
+    )
+    journal_route_ceiling = budget_ceiling_for_route(
+        DAILY_TOKEN_LIMIT,
+        JOURNAL_ROUTE,
+        journal_used=lane_usage["journal"],
+        relay_used=lane_usage["relay"],
+    )
+    relay_route_ceiling = budget_ceiling_for_route(
+        DAILY_TOKEN_LIMIT,
+        "website_relay_event",
+        journal_used=lane_usage["journal"],
+        relay_used=lane_usage["relay"],
     )
     return {
         "usage_date": last_reset,
@@ -16419,8 +16537,15 @@ def get_usage_breakdown() -> dict:
         ),
         "journal_protected_tokens": max(
             0,
-            DAILY_TOKEN_LIMIT - ordinary_route_ceiling,
+            BNL_GEMINI_JOURNAL_PROTECTED_TOKENS,
         ),
+        "relay_protected_tokens": max(
+            0,
+            BNL_GEMINI_RELAY_PROTECTED_TOKENS,
+        ),
+        "journal_route_ceiling": journal_route_ceiling,
+        "relay_route_ceiling": relay_route_ceiling,
+        "lane_usage": lane_usage,
         "total_tokens": _usage_int(tokens_used),
         "tracked_calls": _usage_int(totals[0] if totals else 0),
         "tracked_total_tokens": tracked_total,

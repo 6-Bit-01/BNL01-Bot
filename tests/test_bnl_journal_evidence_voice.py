@@ -1,9 +1,11 @@
 import json
+import sqlite3
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 
 import bnl_journal as journal
+import bnl_journal_source_store as source_store
 
 
 def _article(
@@ -83,6 +85,7 @@ class JournalEvidenceVoiceTests(unittest.TestCase):
         contract = self.packet["evidenceCoverageContract"]
         self.assertEqual(5, contract["minimumDistinctFreshSources"])
         self.assertEqual(["conversation", "relay"], contract["requiredSourceKinds"])
+        self.assertNotIn("minimumDistinctFreshSourcesByKind", contract)
         self.assertEqual(3, contract["minimumDistinctParticipants"])
         self.assertEqual(3, contract["minimumDistinctWindowSegments"])
 
@@ -107,6 +110,155 @@ class JournalEvidenceVoiceTests(unittest.TestCase):
         self.assertIn("Use both relaySources and conversationSources", prompt)
         self.assertIn("windowSegmentActivity", prompt)
         self.assertNotIn("Do not include direct quotes", prompt)
+
+    def test_degraded_relay_window_enters_source_recovery_and_rejects_thin_citations(self):
+        source_store.ensure_schema(self.db)
+        current_start = datetime(2026, 7, 23, 7, tzinfo=timezone.utc)
+        current_end = current_start + timedelta(days=1)
+        baseline_counts = (50, 60, 69)
+        oldest_start = current_start - timedelta(days=len(baseline_counts))
+
+        with sqlite3.connect(self.db) as conn:
+            oldest_ms = int(oldest_start.timestamp() * 1000)
+            conn.execute(
+                """
+                INSERT INTO bnl_journal_source_archive_state(
+                    guild_id,activated_at_ms,created_at_ms
+                ) VALUES(?,?,?)
+                ON CONFLICT(guild_id) DO UPDATE
+                SET activated_at_ms=excluded.activated_at_ms
+                """,
+                (1, oldest_ms, oldest_ms),
+            )
+            for window_offset, count in enumerate(
+                baseline_counts,
+                1,
+            ):
+                window_start = (
+                    current_start - timedelta(days=window_offset)
+                )
+                for index in range(count):
+                    occurred = window_start + timedelta(
+                        seconds=(index + 1) * 86_400 / (count + 1)
+                    )
+                    key = f"baseline-{window_offset}-{index}"
+                    conn.execute(
+                        """
+                        INSERT INTO bnl_journal_source_events(
+                            guild_id,source_kind,source_key,
+                            occurred_at_ms,ingested_at_ms,
+                            channel_id,channel_policy,subject_ref,
+                            private_display_name,raw_text,
+                            sanitized_summary,content_hash,
+                            public_usable,metadata_json
+                        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                        """,
+                        (
+                            1,
+                            "website_relay",
+                            key,
+                            int(occurred.timestamp() * 1000),
+                            oldest_ms,
+                            None,
+                            "public_home",
+                            "",
+                            "",
+                            "A public Relay captured community activity.",
+                            "A public Relay captured community activity.",
+                            key,
+                            1,
+                            "{}",
+                        ),
+                    )
+
+        def stamp(index, count):
+            return (
+                current_start
+                + timedelta(seconds=(index + 1) * 86_400 / (count + 1))
+            ).isoformat().replace("+00:00", "Z")
+
+        relays = [
+            {
+                "refId": f"fresh:degraded-relay-{index}",
+                "sourceKind": "relay",
+                "summary": f"A Relay preserved current public moment {index}.",
+                "observedAt": stamp(index, 27),
+                "eventType": "fresh_public_discord_activity",
+            }
+            for index in range(27)
+        ]
+        conversations = [
+            {
+                "refId": f"fresh:degraded-conversation-{index}",
+                "sourceKind": "conversation",
+                "summary": f"A regular shared current public detail {index}.",
+                "observedAt": stamp(index, 153),
+                "participantAlias": f"participant-recovery-{index}",
+                "subjectRef": f"discord_user:{10_000 + index}",
+                "displayName": f"RecoveryMember{index:03d}",
+                "channelPolicy": "public_home",
+            }
+            for index in range(153)
+        ]
+        packet = journal.build_packet_from_sources(
+            self.db,
+            1,
+            current_start.isoformat().replace("+00:00", "Z"),
+            current_end.isoformat().replace("+00:00", "Z"),
+            relays,
+            conversations,
+            entry_kind="daily",
+        )
+
+        self.assertTrue(packet["sourceRecoveryMode"])
+        self.assertFalse(packet.get("lowActivityMode", False))
+        self.assertEqual("degraded", packet["sourceHealth"]["status"])
+        self.assertEqual(
+            [50, 60, 69],
+            sorted(packet["sourceHealth"]["baselineRelayCounts"]),
+        )
+        self.assertEqual(
+            60,
+            packet["sourceHealth"]["baselineMedianRelaySources"],
+        )
+        self.assertEqual(
+            39,
+            packet["sourceHealth"]["minimumHealthyRelaySources"],
+        )
+        contract = packet["evidenceCoverageContract"]
+        self.assertEqual(18, contract["minimumDistinctFreshSources"])
+        self.assertEqual(
+            {"conversation": 16, "relay": 3},
+            contract["minimumDistinctFreshSourcesByKind"],
+        )
+
+        prompt = journal.build_generation_prompt(packet)
+        self.assertIn("SOURCE-RECOVERY EVIDENCE RULE", prompt)
+        self.assertIn("coequal fresh evidence", prompt)
+        self.assertNotIn(
+            "relay stream is the primary chronology and narrative spine",
+            prompt,
+        )
+
+        thin = _article(
+            packet,
+            refs=[
+                source["refId"]
+                for source in packet["safeSources"][:17]
+            ],
+        )
+        self.assertEqual(
+            "insufficient_source_breadth",
+            journal.validate_article(thin, packet, []),
+        )
+        self.assertEqual(
+            "",
+            journal.validate_article(
+                _article(packet),
+                packet,
+                [],
+            ),
+        )
 
     def test_daily_packet_keeps_relay_spine_and_balances_conversation_context(self):
         start_at = datetime(2026, 7, 19, tzinfo=timezone.utc)

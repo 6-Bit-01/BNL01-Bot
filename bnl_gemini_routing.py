@@ -32,6 +32,7 @@ class GeminiRoutePolicy:
     provider_retries: int
     allow_fallback: bool
     journal_protected: bool = False
+    relay_protected: bool = False
 
 
 def _bounded_env_int(
@@ -52,6 +53,16 @@ def journal_protected_tokens(daily_limit: int) -> int:
     configured = _bounded_env_int(
         "BNL_GEMINI_JOURNAL_PROTECTED_TOKENS",
         250_000,
+        minimum=0,
+        maximum=max(0, int(daily_limit)),
+    )
+    return min(configured, max(0, int(daily_limit) // 2))
+
+
+def relay_protected_tokens(daily_limit: int) -> int:
+    configured = _bounded_env_int(
+        "BNL_GEMINI_RELAY_PROTECTED_TOKENS",
+        100_000,
         minimum=0,
         maximum=max(0, int(daily_limit)),
     )
@@ -92,6 +103,11 @@ def _route_lane(route: str) -> str:
 
 def policy_for_route(route: str) -> GeminiRoutePolicy:
     lane = _route_lane(route)
+    normalized_route = re.sub(
+        r"[^a-z0-9_:-]+",
+        "_",
+        str(route or "").lower(),
+    )
     retries = _bounded_env_int(
         "BNL_GEMINI_PROVIDER_RETRIES",
         1,
@@ -113,7 +129,15 @@ def policy_for_route(route: str) -> GeminiRoutePolicy:
                 minimum=0,
                 maximum=24_576,
             ),
-            provider_retries=retries,
+            # The Journal already has four validator-guided generation
+            # attempts. Retrying each provider call underneath that loop
+            # multiplies shared-project pressure without adding a new repair.
+            provider_retries=_bounded_env_int(
+                "BNL_GEMINI_JOURNAL_PROVIDER_RETRIES",
+                0,
+                minimum=0,
+                maximum=1,
+            ),
             allow_fallback=False,
             journal_protected=True,
         )
@@ -152,6 +176,7 @@ def policy_for_route(route: str) -> GeminiRoutePolicy:
             ),
             provider_retries=retries,
             allow_fallback=True,
+            relay_protected="relay" in normalized_route,
         )
     return GeminiRoutePolicy(
         lane=lane,
@@ -186,11 +211,38 @@ def estimated_generation_reservation(
     return single_attempt_reservation(contents, policy) * model_count * attempts_per_model
 
 
-def budget_ceiling_for_route(daily_limit: int, route: str) -> int:
+def budget_ceiling_for_route(
+    daily_limit: int,
+    route: str,
+    *,
+    journal_used: int = 0,
+    relay_used: int = 0,
+) -> int:
+    """Return the shared-total ceiling while preserving unused protected lanes.
+
+    The reserves are mutual rather than one-way. A Journal call leaves only the
+    *unused* Relay reserve untouched, a Relay call leaves only the unused
+    Journal reserve untouched, and ordinary calls leave both. Once a protected
+    lane has used its own reserve, those tokens no longer need to be held back
+    from the other lane.
+    """
+    limit = max(0, int(daily_limit))
     policy = policy_for_route(route)
+    journal_remaining = max(
+        0,
+        journal_protected_tokens(limit) - max(0, int(journal_used)),
+    )
+    relay_remaining = max(
+        0,
+        relay_protected_tokens(limit) - max(0, int(relay_used)),
+    )
     if policy.journal_protected:
-        return max(0, int(daily_limit))
-    return max(0, int(daily_limit) - journal_protected_tokens(daily_limit))
+        protected_remaining = relay_remaining
+    elif policy.relay_protected:
+        protected_remaining = journal_remaining
+    else:
+        protected_remaining = journal_remaining + relay_remaining
+    return max(0, limit - min(limit, protected_remaining))
 
 
 def provider_status_code(exc: Exception | None) -> int:

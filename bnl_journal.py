@@ -51,6 +51,10 @@ MAX_RUMOR_CONTEXT = 4
 MAX_REFLECTION_SOURCE_CONTEXT = 8
 MAX_REFLECTION_MEMORY_CONTEXT = 4
 MAX_REFLECTION_CANON_CONTEXT = 4
+SOURCE_HEALTH_BASELINE_WINDOWS = 3
+SOURCE_HEALTH_MIN_BASELINE_WINDOWS = 2
+SOURCE_HEALTH_RELAY_RATIO_PERCENT = 65
+SOURCE_HEALTH_MIN_CURRENT_CONVERSATIONS = 12
 JOURNAL_PUBLIC_BROADCAST_SCOPES = {"ambient", "direct", "journal", "relay", "show_status"}
 JOURNAL_CONTEXT_LANE_TYPES = {
     "established_broadcast_memory",
@@ -2169,7 +2173,7 @@ def _minimum_fresh_sources_for_entry(entry_kind: str, total: int) -> int:
     if entry_kind == "weekly":
         return min(total, 14)
     if entry_kind == "daily":
-        return min(total, 10)
+        return min(total, max(10, (total + 9) // 10))
     return min(total, 8)
 
 
@@ -2241,13 +2245,187 @@ def build_evidence_coverage_contract(
     else:
         target_segments = 1
 
-    return {
-        "minimumDistinctFreshSources": _minimum_fresh_sources_for_entry(entry_kind, total),
+    minimum_sources = _minimum_fresh_sources_for_entry(
+        entry_kind,
+        total,
+    )
+    contract = {
+        "minimumDistinctFreshSources": minimum_sources,
         "requiredSourceKinds": required_kinds,
         "minimumDistinctParticipants": required_participants,
         "minimumDistinctWindowSegments": min(target_segments, len(available_segments)),
         "segmentBySourceRef": segment_by_ref,
     }
+    if total >= 75 and entry_kind in {"daily", "weekly"}:
+        contract["minimumDistinctFreshSourcesByKind"] = {
+            kind: min(
+                kind_counts[kind],
+                max(
+                    1,
+                    (
+                        minimum_sources * kind_counts[kind]
+                        + total
+                        - 1
+                    )
+                    // total,
+                ),
+            )
+            for kind in required_kinds
+        }
+    return contract
+
+
+def _median_int(values: list[int]) -> int:
+    ordered = sorted(max(0, int(value)) for value in values)
+    if not ordered:
+        return 0
+    midpoint = len(ordered) // 2
+    if len(ordered) % 2:
+        return ordered[midpoint]
+    return (ordered[midpoint - 1] + ordered[midpoint]) // 2
+
+
+def _relay_source_health(
+    db_path: str,
+    guild_id: int,
+    start: str,
+    end: str,
+    *,
+    entry_kind: str,
+    relay_count: int,
+    conversation_count: int,
+) -> dict[str, Any]:
+    """Detect a current Relay collapse against fully covered recent windows."""
+    health = {
+        "status": "not_evaluated",
+        "reason": "",
+        "currentRelaySources": max(0, int(relay_count)),
+        "currentConversationSources": max(
+            0,
+            int(conversation_count),
+        ),
+        "baselineRelayCounts": [],
+        "baselineMedianRelaySources": 0,
+        "minimumHealthyRelaySources": 0,
+        "relayAttemptCount": 0,
+        "relayFailedAttemptCount": 0,
+    }
+    if entry_kind != "daily":
+        health["reason"] = "daily_only_contract"
+        return health
+    if conversation_count < SOURCE_HEALTH_MIN_CURRENT_CONVERSATIONS:
+        health["status"] = "sparse_window"
+        health["reason"] = "insufficient_current_activity_for_comparison"
+        return health
+
+    start_ms = timestamp_to_epoch_ms(start)
+    end_ms = timestamp_to_epoch_ms(end)
+    if start_ms is None or end_ms is None or end_ms <= start_ms:
+        health["status"] = "unobserved"
+        health["reason"] = "invalid_source_window"
+        return health
+    duration_ms = end_ms - start_ms
+
+    try:
+        with sqlite3.connect(db_path) as conn:
+            if not table_exists(conn, "bnl_journal_source_events"):
+                health["status"] = "unobserved"
+                health["reason"] = "source_archive_unavailable"
+                return health
+            activation = conn.execute(
+                "SELECT activated_at_ms "
+                "FROM bnl_journal_source_archive_state "
+                "WHERE guild_id=?",
+                (int(guild_id),),
+            ).fetchone()
+            activated_at_ms = (
+                int(activation[0])
+                if activation and activation[0] is not None
+                else None
+            )
+            baseline_counts: list[int] = []
+            for offset in range(
+                1,
+                SOURCE_HEALTH_BASELINE_WINDOWS + 1,
+            ):
+                prior_end = start_ms - duration_ms * (offset - 1)
+                prior_start = prior_end - duration_ms
+                if (
+                    activated_at_ms is None
+                    or prior_start < activated_at_ms
+                ):
+                    continue
+                row = conn.execute(
+                    """
+                    SELECT COUNT(*)
+                    FROM bnl_journal_source_events
+                    WHERE guild_id=?
+                      AND source_kind='website_relay'
+                      AND public_usable=1
+                      AND sanitized_summary<>''
+                      AND occurred_at_ms>=?
+                      AND occurred_at_ms<?
+                    """,
+                    (int(guild_id), prior_start, prior_end),
+                ).fetchone()
+                baseline_counts.append(int((row or [0])[0] or 0))
+            health["baselineRelayCounts"] = baseline_counts
+
+            if table_exists(conn, "website_relay_attempts"):
+                attempts = conn.execute(
+                    """
+                    SELECT
+                        COUNT(*),
+                        COALESCE(SUM(
+                            CASE
+                                WHEN outcome='provider_failed'
+                                  OR reason IN (
+                                      'provider_failure',
+                                      'relay_generation_timeout',
+                                      'local_model_budget_exhausted'
+                                  )
+                                THEN 1 ELSE 0
+                            END
+                        ),0)
+                    FROM website_relay_attempts
+                    WHERE guild_id=? AND started_at>=? AND started_at<?
+                    """,
+                    (int(guild_id), start, end),
+                ).fetchone()
+                health["relayAttemptCount"] = int(
+                    (attempts or [0, 0])[0] or 0
+                )
+                health["relayFailedAttemptCount"] = int(
+                    (attempts or [0, 0])[1] or 0
+                )
+    except sqlite3.Error:
+        health["status"] = "unobserved"
+        health["reason"] = "source_health_query_failed"
+        return health
+
+    baseline_counts = list(health["baselineRelayCounts"])
+    if len(baseline_counts) < SOURCE_HEALTH_MIN_BASELINE_WINDOWS:
+        health["status"] = "insufficient_history"
+        health["reason"] = "comparable_windows_unavailable"
+        return health
+    median_count = _median_int(baseline_counts)
+    minimum_healthy = max(
+        1,
+        (
+            median_count * SOURCE_HEALTH_RELAY_RATIO_PERCENT
+            + 99
+        )
+        // 100,
+    )
+    health["baselineMedianRelaySources"] = median_count
+    health["minimumHealthyRelaySources"] = minimum_healthy
+    if relay_count < minimum_healthy:
+        health["status"] = "degraded"
+        health["reason"] = "relay_source_supply_below_recent_baseline"
+    else:
+        health["status"] = "healthy"
+        health["reason"] = "relay_source_supply_within_recent_baseline"
+    return health
 
 
 def _count_legacy_sources(conn: sqlite3.Connection, guild_id: int, start: str, end: str) -> tuple[int, int]:
@@ -2533,17 +2711,30 @@ def build_packet_from_sources(
         end,
         safe_sources,
     )
-    if (
+    source_health = _relay_source_health(
+        db_path,
+        guild_id,
+        start,
+        end,
+        entry_kind=packet["entryKind"],
+        relay_count=len(relays),
+        conversation_count=len(conversations),
+    )
+    packet["sourceHealth"] = source_health
+    source_recovery = source_health.get("status") == "degraded"
+    if source_recovery:
+        packet["sourceRecoveryMode"] = True
+    low_activity = (
         packet["entryKind"] in {"daily", "weekly"}
         and not journal_source_packet_has_meaningful_activity(packet)
-    ):
+    )
+    if low_activity or source_recovery:
         reflection_basis, private_reflection_provenance = _build_reflection_basis(
             db_path,
             guild_id,
             start,
             end,
         )
-        packet["lowActivityMode"] = True
         packet["reflectionBasis"] = reflection_basis
         packet["reflectionBasisContract"] = {
             "version": 1,
@@ -2555,6 +2746,8 @@ def build_packet_from_sources(
         packet["privateReflectionBasisProvenance"] = (
             private_reflection_provenance
         )
+    if low_activity:
+        packet["lowActivityMode"] = True
         packet["evidenceCoverageContract"] = {
             **packet["evidenceCoverageContract"],
             "minimumDistinctFreshSources": 0,
@@ -2788,6 +2981,8 @@ def _eligible_reflection_basis(packet: dict[str, Any]) -> list[dict[str, Any]]:
 def build_generation_prompt(packet: dict[str, Any], *, repair_reason: str = "", previous_output: str = "") -> str:
     entry_kind = str(packet.get("entryKind") or "manual")
     low_activity = bool(packet.get("lowActivityMode"))
+    source_recovery = bool(packet.get("sourceRecoveryMode"))
+    historical_basis_mode = low_activity or source_recovery
     context_lanes = packet.get("generationContextLanes") if isinstance(packet.get("generationContextLanes"), dict) else {}
     safe_sources = packet.get("safeSources", [])[:MAX_PROMPT_SOURCES]
     reflection_basis = _eligible_reflection_basis(packet)
@@ -2817,12 +3012,15 @@ def build_generation_prompt(packet: dict[str, Any], *, repair_reason: str = "", 
         "windowSegmentActivity": packet.get("windowSegmentActivity", []),
         "privateGenerationContextLanes": context_lanes,
     }
-    if low_activity:
+    if source_recovery:
+        safe_packet["sourceRecoveryMode"] = True
+    if historical_basis_mode:
         safe_packet["reflectionBasis"] = reflection_basis
         safe_packet["reflectionBasisContract"] = packet.get(
             "reflectionBasisContract",
             {},
         )
+    if low_activity:
         safe_packet["editorialContract"] = {
             "requiresFirstPersonReaction": False,
             "requiredBeatsAcrossEntry": [
@@ -2840,6 +3038,10 @@ def build_generation_prompt(packet: dict[str, Any], *, repair_reason: str = "", 
     elif low_activity:
         cadence_rule = (
             "\nThis is a daily Journal entry covering one complete source window. Low activity does not cancel the entry and does not authorize a claim that something happened in that window. Build a coherent grounded reflection from the supplied basis, using current-window material only when a fresh sourceRefId supports it."
+        )
+    elif source_recovery:
+        cadence_rule = (
+            "\nThis is a daily Journal entry covering one complete source window, but the Relay supply is materially below recent fully observed windows. Treat the supplied fresh evidence as real but not as a complete Relay chronology. Build the current story from what the fresh sources actually establish, using reflectionBasis only for clearly historical continuity. Never mention source health, capacity, retries, providers, or an internal pipeline in public prose."
         )
     else:
         cadence_rule = (
@@ -2880,12 +3082,20 @@ def build_generation_prompt(packet: dict[str, Any], *, repair_reason: str = "", 
     daily_spine_rule = (
         "\nFor a low-activity daily entry, do not manufacture a relay chronology or Discord digest. A reflection may connect eligible historical, canon, or continuity material, but every claim about activity inside the current window must cite a fresh sourceRefId from that window."
         if low_activity
-        else "\nFor a daily entry, the relay stream is the primary chronology and narrative spine. Conversation sources are supporting public context: use them to ground or explain the context surrounding the relays, and do not turn the Journal into a Discord digest. When relay and conversation sources describe the same episode, connect them instead of presenting them as unrelated events."
+        else (
+            "\nFor this source-recovery daily entry, do not treat the Relay stream as a complete chronology or claim it represents the whole day. Relay and conversation sources are coequal fresh evidence. Connect them when they support the same episode, and write a selective, honest chronicle without turning it into a Discord digest."
+            if source_recovery
+            else "\nFor a daily entry, the relay stream is the primary chronology and narrative spine. Conversation sources are supporting public context: use them to ground or explain the context surrounding the relays, and do not turn the Journal into a Discord digest. When relay and conversation sources describe the same episode, connect them instead of presenting them as unrelated events."
+        )
     )
     window_rule = (
         "\nTreat windowSegmentActivity and aggregate counts as coverage metadata, not an event. Do not convert absence, thin counts, or quiet markers into a scene or a claim that the community moved."
         if low_activity
-        else "\nKeep the whole daily source window in view. Use both relaySources and conversationSources in windowSegmentActivity: relaySources shows the relay arc and conversationSources shows its public context. The busiest or strongest stretch may lead, but give meaningful earlier and middle activity proportionate narrative attention. Do not make a multi-segment day sound as though it began with the latest cluster."
+        else (
+            "\nKeep the whole daily source window in view without implying that thin Relay coverage proves quiet activity. Use windowSegmentActivity only to distribute the fresh evidence honestly across the window; it is coverage metadata, not an event."
+            if source_recovery
+            else "\nKeep the whole daily source window in view. Use both relaySources and conversationSources in windowSegmentActivity: relaySources shows the relay arc and conversationSources shows its public context. The busiest or strongest stretch may lead, but give meaningful earlier and middle activity proportionate narrative attention. Do not make a multi-segment day sound as though it began with the latest cluster."
+        )
     )
     people_rule = (
         "\nKeep historical community members anonymous. Use a role such as producer, listener, or artist only when the cited reflection basis establishes it. Named approved-canon subjects may retain their supplied canon names. Never invent nicknames, honorifics, or a person acting in the current window."
@@ -2895,12 +3105,20 @@ def build_generation_prompt(packet: dict[str, Any], *, repair_reason: str = "", 
     coverage_rule = (
         "\nThe evidenceCoverageContract remains mandatory for fresh evidence. Reflection-basis refs never count as fresh sources, current participants, current source kinds, or current-window segments. Every cited fresh or reflection ref must materially support its section."
         if low_activity
-        else "\nThe evidenceCoverageContract is mandatory. Across all section sourceRefIds, meet its minimum distinct fresh sources, participants, source kinds, and available window segments. Every cited ref must materially support that section. Use this breadth to identify a few connected patterns rather than listing sources."
+        else (
+            "\nThe evidenceCoverageContract is mandatory and remains entirely fresh-evidence based. Meet its total and per-kind minimums, participant breadth, and window-segment breadth. Reflection-basis refs may add historical continuity but never count toward those minimums or prove current activity."
+            if source_recovery
+            else "\nThe evidenceCoverageContract is mandatory. Across all section sourceRefIds, meet its minimum distinct fresh sources, participants, source kinds, and available window segments. Every cited ref must materially support that section. Use this breadth to identify a few connected patterns rather than listing sources."
+        )
     )
     section_source_rule = (
         "\nEvery section must cite at least one supplied fresh or reflection sourceRefId. A purely reflective section may cite reflectionBasis refs. A section that says or implies something happened today, tonight, this day, this week, or in the current window must cite at least one fresh sourceRefId in that same section. Reflection basis is historical-or-canon only and is never proof of current activity."
         if low_activity
-        else "\nEvery section must cite at least one fresh sourceRefId from the current window. Older Journal material is continuity and callback context only, never proof of current activity. Do not repeat an older conclusion when the current evidence changes it."
+        else (
+            "\nEvery section must cite at least one fresh sourceRefId from the current window. Reflection refs may supplement a section only as explicitly historical continuity and never replace its fresh evidence."
+            if source_recovery
+            else "\nEvery section must cite at least one fresh sourceRefId from the current window. Older Journal material is continuity and callback context only, never proof of current activity. Do not repeat an older conclusion when the current evidence changes it."
+        )
     )
     quote_rule = (
         "\nParaphrase reflection summaries. Do not turn a historical summary into dialogue or a quote. Use a direct quote only from an unusually valuable fresh public-safe source, cite it in that section, and keep the speaker anonymous."
@@ -2910,7 +3128,11 @@ def build_generation_prompt(packet: dict[str, Any], *, repair_reason: str = "", 
     reflection_rule = (
         "\nLOW-ACTIVITY EVIDENCE RULE: This is the same Journal voice, prose standard, validator, and four-attempt generation path—not a fallback persona or a stock nothing-happened template. Use only supplied reflectionBasis records. Their stable reflection: refs are valid citations but never fresh evidence. Keep historical and canon tense explicit, preserve corrected canon, and never describe 6 Bit as BARCODE's music producer; the supplied corrected canon identifies GALAKNOISE as the producer."
         if low_activity
-        else ""
+        else (
+            "\nSOURCE-RECOVERY EVIDENCE RULE: This is the normal Journal voice, validator, and four-attempt generation path. The recovery flag changes evidence handling, not quality. Use reflectionBasis only as explicitly historical continuity; never use it to fill a missing current chronology, and never disclose the recovery condition publicly."
+            if source_recovery
+            else ""
+        )
     )
     return (
         "You are BNL-01 writing a BARCODE Network Journal entry. Return strict JSON only; no markdown fences."
@@ -3093,6 +3315,17 @@ def _evidence_coverage_reason(article: dict[str, Any], packet: dict[str, Any]) -
     cited_kinds = {str(source.get("sourceKind") or "") for source in cited_sources}
     if not set(str(kind) for kind in contract.get("requiredSourceKinds", []) if str(kind)) <= cited_kinds:
         return "insufficient_source_breadth"
+    minimum_by_kind = contract.get("minimumDistinctFreshSourcesByKind")
+    if not isinstance(minimum_by_kind, dict):
+        minimum_by_kind = {}
+    for kind, minimum in minimum_by_kind.items():
+        cited_kind_count = sum(
+            1
+            for source in cited_sources
+            if str(source.get("sourceKind") or "") == str(kind)
+        )
+        if cited_kind_count < int(minimum or 0):
+            return "insufficient_source_breadth"
 
     cited_participants = {
         str(source.get("participantAlias") or "")
@@ -3124,6 +3357,8 @@ def validate_article(
     blocking_only: bool = False,
 ) -> str:
     low_activity = bool(packet.get("lowActivityMode"))
+    source_recovery = bool(packet.get("sourceRecoveryMode"))
+    historical_basis_mode = low_activity or source_recovery
     sections = article.get("sections")
     if not isinstance(sections, list) or not (1 <= len(sections) <= 3):
         return "invalid_section_count"
@@ -3160,8 +3395,13 @@ def validate_article(
         if not refs or any(str(r) not in valid_refs for r in refs):
             return "invalid_section_source_refs"
         if (
-            low_activity
+            historical_basis_mode
             and _CURRENT_WINDOW_CLAIM_RE.search(str(section.get("body") or ""))
+            and not ({str(ref) for ref in refs} & fresh_refs)
+        ):
+            return "current_activity_without_fresh_source"
+        if (
+            source_recovery
             and not ({str(ref) for ref in refs} & fresh_refs)
         ):
             return "current_activity_without_fresh_source"
@@ -3174,7 +3414,7 @@ def validate_article(
         ):
             return "reflection_scope_not_explicit"
     if (
-        low_activity
+        historical_basis_mode
         and _CURRENT_WINDOW_CLAIM_RE.search(
             "\n".join(
                 [
@@ -3588,6 +3828,8 @@ def _draft_records(
         "usedGenerationContextLanes": used_context_lanes,
         "usedContextLaneProvenance": used_context_provenance,
         "lowActivityMode": bool(packet.get("lowActivityMode")),
+        "sourceRecoveryMode": bool(packet.get("sourceRecoveryMode")),
+        "sourceHealth": dict(packet.get("sourceHealth") or {}),
         "reflectionBasisCandidateCounts": {
             kind: len(
                 [

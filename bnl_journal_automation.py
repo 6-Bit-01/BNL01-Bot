@@ -41,6 +41,8 @@ LEASE_MINUTES = 30
 DELIVERY_LEASE_MINUTES = 2
 PREPARATION_RETRY_MINUTES = 30
 DELIVERY_RETRY_MINUTES = 15
+MAX_AUTOMATIC_GENERATION_CYCLES = 4
+GENERATION_CYCLE_WINDOW_HOURS = 24
 TERMINAL_RUN_STATES = {"published", "quiet", "incomplete", "superseded"}
 DELIVERY_PREFLIGHT_INVALIDATION_REASONS = frozenset({
     "prepared_revision_missing",
@@ -1250,6 +1252,39 @@ def _record_generation_attempt_event(
         conn.commit()
 
 
+def _generation_cycle_retry_at_on_connection(
+    conn: sqlite3.Connection,
+    run_id: str,
+    now: datetime,
+) -> str:
+    """Bound automatic full-quality cycles without abandoning the occurrence."""
+    cutoff = _utc_iso(
+        now.astimezone(timezone.utc)
+        - timedelta(hours=GENERATION_CYCLE_WINDOW_HOURS)
+    )
+    rows = conn.execute(
+        """
+        SELECT p.started_at
+        FROM bnl_journal_preparation_attempts p
+        WHERE p.run_id=? AND p.started_at>?
+          AND EXISTS (
+              SELECT 1
+              FROM bnl_journal_generation_attempts g
+              WHERE g.run_id=p.run_id
+                AND g.preparation_epoch=p.preparation_epoch
+          )
+        ORDER BY p.started_at ASC,p.preparation_epoch ASC
+        """,
+        (run_id, cutoff),
+    ).fetchall()
+    if len(rows) < MAX_AUTOMATIC_GENERATION_CYCLES:
+        return ""
+    return _utc_iso(
+        _parse_utc(str(rows[0][0]))
+        + timedelta(hours=GENERATION_CYCLE_WINDOW_HOURS)
+    )
+
+
 def _claim_preparation(
     db_path: str,
     guild_id: int,
@@ -1310,6 +1345,26 @@ def _claim_preparation(
                     preparation_epoch=int(current.get("preparation_epoch") or 0),
                     now=now_iso,
                 )
+            if not force:
+                generation_retry_at = (
+                    _generation_cycle_retry_at_on_connection(
+                        conn,
+                        run_id,
+                        now,
+                    )
+                )
+                if generation_retry_at and _parse_utc(
+                    generation_retry_at
+                ) > now:
+                    current["retry_at"] = generation_retry_at
+                    current["reason"] = "generation_cycle_limit"
+                    conn.commit()
+                    return (
+                        "generation_backoff",
+                        run_id,
+                        int(current.get("preparation_epoch") or 0),
+                        current,
+                    )
             epoch = int(current.get("preparation_epoch") or 0) + 1
             conn.execute("""UPDATE bnl_journal_automation_runs
                 SET lifecycle_state='preparing',reason='',attempt_count=attempt_count+1,
@@ -1429,6 +1484,12 @@ def _result_from_existing(cadence: str, row: dict[str, Any], *, claim: str = "co
     elif claim == "backoff":
         status = "backoff"
         reason = "retry_after_" + str(row.get("retry_at") or "later")
+    elif claim == "generation_backoff":
+        status = "backoff"
+        reason = (
+            "generation_cycle_limit_until_"
+            + str(row.get("retry_at") or "later")
+        )
     elif claim == "prepared":
         status = "prepared"
         reason = "prepared_waiting_release"
@@ -4128,6 +4189,15 @@ def _run_recovery_ready(
     lifecycle = str(row.get("lifecycle_state") or "")
     if lifecycle in TERMINAL_RUN_STATES:
         return False
+    generation_retry_at = str(
+        row.get("generation_retry_at") or ""
+    )
+    if (
+        lifecycle in {"held", "deferred"}
+        and generation_retry_at
+        and _parse_utc(generation_retry_at) > now
+    ):
+        return False
     if lifecycle in {"running", "preparing"}:
         lease = str(row.get("lease_expires_at") or "")
         return not lease or _parse_utc(lease) <= now
@@ -4171,20 +4241,32 @@ def _pending_daily_day(db_path: str, guild_id: int, now_utc: Optional[datetime])
     latest = _latest_daily_day(now_utc)
     with sqlite3.connect(db_path) as conn:
         conn.row_factory = sqlite3.Row
-        rows = {
-            (
-                str(row["cadence"]),
-                str(row["source_window_start"]),
-                str(row["source_window_end"]),
-            ): dict(row)
-            for row in conn.execute(
-                "SELECT * "
-                "FROM bnl_journal_automation_runs "
-                "WHERE guild_id=? AND cadence='daily' "
-                "AND COALESCE(schedule_contract_version,1)=?",
-                (guild_id, CADENCE_CONTRACT_VERSION),
-            ).fetchall()
-        }
+        rows = {}
+        now = (now_utc or datetime.now(timezone.utc)).astimezone(
+            timezone.utc
+        )
+        for row in conn.execute(
+            "SELECT * "
+            "FROM bnl_journal_automation_runs "
+            "WHERE guild_id=? AND cadence='daily' "
+            "AND COALESCE(schedule_contract_version,1)=?",
+            (guild_id, CADENCE_CONTRACT_VERSION),
+        ).fetchall():
+            current = dict(row)
+            current["generation_retry_at"] = (
+                _generation_cycle_retry_at_on_connection(
+                    conn,
+                    str(current.get("run_id") or ""),
+                    now,
+                )
+            )
+            rows[
+                (
+                    str(row["cadence"]),
+                    str(row["source_window_start"]),
+                    str(row["source_window_end"]),
+                )
+            ] = current
     candidates: list[tuple[date, str, Optional[dict[str, Any]]]] = []
     if first <= latest:
         current = latest
@@ -4255,19 +4337,31 @@ def _pending_week_monday(db_path: str, guild_id: int, now_utc: Optional[datetime
     latest = _latest_week_monday(now_utc)
     with sqlite3.connect(db_path) as conn:
         conn.row_factory = sqlite3.Row
-        rows = {
-            (
-                str(row["source_window_start"]),
-                str(row["source_window_end"]),
-            ): dict(row)
-            for row in conn.execute(
-                "SELECT * "
-                "FROM bnl_journal_automation_runs "
-                "WHERE guild_id=? AND cadence='weekly' "
-                "AND COALESCE(schedule_contract_version,1)=?",
-                (guild_id, CADENCE_CONTRACT_VERSION),
-            ).fetchall()
-        }
+        rows = {}
+        now = (now_utc or datetime.now(timezone.utc)).astimezone(
+            timezone.utc
+        )
+        for row in conn.execute(
+            "SELECT * "
+            "FROM bnl_journal_automation_runs "
+            "WHERE guild_id=? AND cadence='weekly' "
+            "AND COALESCE(schedule_contract_version,1)=?",
+            (guild_id, CADENCE_CONTRACT_VERSION),
+        ).fetchall():
+            current = dict(row)
+            current["generation_retry_at"] = (
+                _generation_cycle_retry_at_on_connection(
+                    conn,
+                    str(current.get("run_id") or ""),
+                    now,
+                )
+            )
+            rows[
+                (
+                    str(row["source_window_start"]),
+                    str(row["source_window_end"]),
+                )
+            ] = current
     candidates: list[tuple[date, str, Optional[dict[str, Any]]]] = []
     if first_monday <= latest:
         current = latest
@@ -4323,15 +4417,25 @@ def _pending_legacy_run(
     ensure_cadence_activation(db_path, guild_id, now_utc=now_utc)
     with sqlite3.connect(db_path) as conn:
         conn.row_factory = sqlite3.Row
-        rows = [
-            dict(row)
-            for row in conn.execute(
-                "SELECT * FROM bnl_journal_automation_runs "
-                "WHERE guild_id=? AND COALESCE(schedule_contract_version,1)=? "
-                "ORDER BY source_window_end DESC,created_at DESC",
-                (int(guild_id), LEGACY_CADENCE_CONTRACT_VERSION),
-            ).fetchall()
-        ]
+        now = (now_utc or datetime.now(timezone.utc)).astimezone(
+            timezone.utc
+        )
+        rows = []
+        for row in conn.execute(
+            "SELECT * FROM bnl_journal_automation_runs "
+            "WHERE guild_id=? AND COALESCE(schedule_contract_version,1)=? "
+            "ORDER BY source_window_end DESC,created_at DESC",
+            (int(guild_id), LEGACY_CADENCE_CONTRACT_VERSION),
+        ).fetchall():
+            current = dict(row)
+            current["generation_retry_at"] = (
+                _generation_cycle_retry_at_on_connection(
+                    conn,
+                    str(current.get("run_id") or ""),
+                    now,
+                )
+            )
+            rows.append(current)
     candidates: list[dict[str, Any]] = []
     for row in rows:
         if str(row.get("lifecycle_state") or "") in TERMINAL_RUN_STATES:
