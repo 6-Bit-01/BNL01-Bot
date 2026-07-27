@@ -21,21 +21,48 @@ class GeminiRoutingPolicyTests(unittest.TestCase):
         self.assertFalse(memory.allow_fallback)
         self.assertTrue(chat.allow_fallback)
         self.assertTrue(journal.journal_protected)
+        self.assertEqual(0, journal.provider_retries)
 
-    def test_non_journal_routes_preserve_daily_journal_capacity(self):
+    def test_journal_and_relay_reserves_are_mutual_and_released_as_used(self):
         with mock.patch.dict(
             "os.environ",
-            {"BNL_GEMINI_JOURNAL_PROTECTED_TOKENS": "250000"},
+            {
+                "BNL_GEMINI_JOURNAL_PROTECTED_TOKENS": "250000",
+                "BNL_GEMINI_RELAY_PROTECTED_TOKENS": "100000",
+            },
             clear=False,
         ):
             self.assertEqual(
                 routing.budget_ceiling_for_route(1_350_000, "normal_chat"),
-                1_100_000,
+                1_000_000,
             )
             self.assertEqual(
                 routing.budget_ceiling_for_route(
                     1_350_000,
                     "bnl_journal_generation",
+                ),
+                1_250_000,
+            )
+            self.assertEqual(
+                routing.budget_ceiling_for_route(
+                    1_350_000,
+                    "website_relay_event",
+                ),
+                1_100_000,
+            )
+            self.assertEqual(
+                routing.budget_ceiling_for_route(
+                    1_350_000,
+                    "website_relay_event",
+                    journal_used=250_000,
+                ),
+                1_350_000,
+            )
+            self.assertEqual(
+                routing.budget_ceiling_for_route(
+                    1_350_000,
+                    "bnl_journal_generation",
+                    relay_used=100_000,
                 ),
                 1_350_000,
             )

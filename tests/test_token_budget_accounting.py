@@ -47,11 +47,13 @@ class TokenBudgetAccountingTests(unittest.TestCase):
         bnl01_bot.DB_FILE = self.db_path
         with bnl01_bot._token_budget_reservation_lock:
             bnl01_bot._token_budget_reserved_tokens = 0
+            bnl01_bot._token_budget_reserved_by_lane.clear()
 
     def tearDown(self):
         bnl01_bot.DB_FILE = self.original_db_file
         with bnl01_bot._token_budget_reservation_lock:
             bnl01_bot._token_budget_reserved_tokens = 0
+            bnl01_bot._token_budget_reserved_by_lane.clear()
         self.tempdir.cleanup()
 
     def test_provider_metadata_is_recorded_once_with_route_breakdown(self):
@@ -245,6 +247,10 @@ class TokenBudgetAccountingTests(unittest.TestCase):
 
     def test_reservation_blocks_new_call_before_soft_counter_is_crossed(self):
         today = "2026-07-26"
+        journal_ceiling = bnl01_bot.budget_ceiling_for_route(
+            bnl01_bot.DAILY_TOKEN_LIMIT,
+            bnl01_bot.JOURNAL_ROUTE,
+        )
         with sqlite3.connect(self.db_path) as conn:
             bnl01_bot._ensure_token_usage_schema(conn.cursor())
             conn.execute(
@@ -254,7 +260,7 @@ class TokenBudgetAccountingTests(unittest.TestCase):
                     last_reset_date = ?
                 WHERE id = 1
                 """,
-                (bnl01_bot.DAILY_TOKEN_LIMIT - 100, today),
+                (journal_ceiling - 100, today),
             )
         with mock.patch.object(
             bnl01_bot,
@@ -286,6 +292,14 @@ class TokenBudgetAccountingTests(unittest.TestCase):
                 bnl01_bot,
                 "DAILY_TOKEN_LIMIT",
                 reservation * 2 - 1,
+            ),
+            mock.patch.dict(
+                "os.environ",
+                {
+                    "BNL_GEMINI_JOURNAL_PROTECTED_TOKENS": "0",
+                    "BNL_GEMINI_RELAY_PROTECTED_TOKENS": "0",
+                },
+                clear=False,
             ),
         ):
             first = bnl01_bot.reserve_local_model_budget(prompt, "normal_chat")
@@ -365,6 +379,91 @@ class TokenBudgetAccountingTests(unittest.TestCase):
             )
             bnl01_bot.release_local_model_budget(journal_reservation)
         self.assertEqual(bnl01_bot._token_budget_reserved_tokens, 0)
+
+    def test_journal_usage_cannot_consume_unused_relay_capacity(self):
+        today = "2026-07-26"
+        with sqlite3.connect(self.db_path) as conn:
+            bnl01_bot._ensure_token_usage_schema(conn.cursor())
+            conn.execute(
+                """
+                UPDATE token_usage
+                SET tokens_used_today = ?, last_reset_date = ?
+                WHERE id = 1
+                """,
+                (1_240_000, today),
+            )
+            conn.execute(
+                """
+                INSERT INTO token_usage_events(
+                    usage_date,recorded_at,route,model,total_tokens
+                ) VALUES(?,?,?,?,?)
+                """,
+                (
+                    today,
+                    "2026-07-26T20:00:00Z",
+                    bnl01_bot.JOURNAL_ROUTE,
+                    "gemini-3.6-flash",
+                    250_000,
+                ),
+            )
+        with mock.patch.object(
+            bnl01_bot,
+            "_pacific_usage_date",
+            return_value=today,
+        ):
+            with self.assertRaises(bnl01_bot.LocalModelBudgetExhausted):
+                bnl01_bot.reserve_local_model_budget(
+                    "small prompt",
+                    "normal_chat",
+                )
+            relay_reservation = bnl01_bot.reserve_local_model_budget(
+                "small prompt",
+                "website_relay_event",
+            )
+            self.assertEqual("relay", relay_reservation.lane)
+            bnl01_bot.release_local_model_budget(relay_reservation)
+        self.assertEqual(0, bnl01_bot._token_budget_reserved_tokens)
+        self.assertEqual({}, bnl01_bot._token_budget_reserved_by_lane)
+
+    def test_relay_usage_cannot_consume_unused_journal_capacity(self):
+        today = "2026-07-26"
+        with sqlite3.connect(self.db_path) as conn:
+            bnl01_bot._ensure_token_usage_schema(conn.cursor())
+            conn.execute(
+                """
+                UPDATE token_usage
+                SET tokens_used_today = ?, last_reset_date = ?
+                WHERE id = 1
+                """,
+                (1_240_000, today),
+            )
+            conn.execute(
+                """
+                INSERT INTO token_usage_events(
+                    usage_date,recorded_at,route,model,total_tokens
+                ) VALUES(?,?,?,?,?)
+                """,
+                (
+                    today,
+                    "2026-07-26T20:00:00Z",
+                    "website_relay_event",
+                    "gemini-3.6-flash",
+                    100_000,
+                ),
+            )
+        with mock.patch.object(
+            bnl01_bot,
+            "_pacific_usage_date",
+            return_value=today,
+        ):
+            journal_reservation = bnl01_bot.reserve_local_model_budget(
+                "small prompt",
+                bnl01_bot.JOURNAL_ROUTE,
+            )
+            self.assertEqual("journal", journal_reservation.lane)
+            bnl01_bot.release_local_model_budget(journal_reservation)
+        self.assertEqual(0, bnl01_bot._token_budget_reserved_tokens)
+        self.assertEqual({}, bnl01_bot._token_budget_reserved_by_lane)
 
     def test_gemini3_journal_config_preserves_large_output_without_legacy_cap(self):
         config = bnl01_bot._generation_config_for_model(

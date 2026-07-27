@@ -497,6 +497,133 @@ class JournalAutomationTests(unittest.TestCase):
             ),
         )
 
+    def test_generation_cycle_cap_yields_to_a_new_missing_day(self):
+        self.add_day("2026-07-18")
+        self.add_day("2026-07-20")
+        self.set_archive_activation("2026-07-18T01:30:00Z")
+        automation.ensure_cadence_activation(
+            self.db,
+            1,
+            now_utc=datetime(2026, 7, 21, 1, 0, tzinfo=timezone.utc),
+        )
+
+        held = automation.run_daily(
+            self.db,
+            1,
+            lambda _packet, _prompt: (_ for _ in ()).throw(
+                RuntimeError("provider down")
+            ),
+            "https://site.example",
+            "key",
+            target_day=date(2026, 7, 18),
+            now_utc=datetime(2026, 7, 22, 1, 0, tzinfo=timezone.utc),
+            force=True,
+            opener=self.opener,
+        )
+        self.assertEqual("held", held.status)
+
+        with sqlite3.connect(self.db) as conn:
+            run = conn.execute(
+                "SELECT run_id,source_window_start,source_window_end "
+                "FROM bnl_journal_automation_runs "
+                "WHERE source_window_start=?",
+                (held.source_window_start,),
+            ).fetchone()
+            self.assertIsNotNone(run)
+            run_id, source_start, source_end = run
+            for epoch in range(
+                2,
+                automation.MAX_AUTOMATIC_GENERATION_CYCLES + 1,
+            ):
+                started_at = automation._utc_iso(
+                    datetime(
+                        2026,
+                        7,
+                        22,
+                        1,
+                        epoch * 5,
+                        tzinfo=timezone.utc,
+                    )
+                )
+                automation._start_preparation_attempt_on_connection(
+                    conn,
+                    run_id=run_id,
+                    preparation_epoch=epoch,
+                    guild_id=1,
+                    cadence="daily",
+                    start=source_start,
+                    end=source_end,
+                    lease_expires_at=automation._utc_iso(
+                        automation._parse_utc(started_at)
+                        + timedelta(minutes=30)
+                    ),
+                    now=started_at,
+                )
+                conn.execute(
+                    """
+                    INSERT INTO bnl_journal_generation_attempts(
+                        run_id,preparation_epoch,generation_attempt,
+                        started_at,finished_at,outcome,
+                        outcome_reason,created_at,updated_at
+                    ) VALUES(?,?,?,?,?,'provider_failure',
+                             'provider down',?,?)
+                    """,
+                    (
+                        run_id,
+                        epoch,
+                        1,
+                        started_at,
+                        started_at,
+                        started_at,
+                        started_at,
+                    ),
+                )
+                automation._finish_preparation_attempt_on_connection(
+                    conn,
+                    run_id=run_id,
+                    preparation_epoch=epoch,
+                    result_status="held",
+                    result_reason="provider_failure",
+                    finished_at=started_at,
+                )
+            conn.execute(
+                "UPDATE bnl_journal_automation_runs "
+                "SET updated_at='2026-07-22T01:00:00Z' "
+                "WHERE run_id=?",
+                (run_id,),
+            )
+
+        results = automation.run_scheduled(
+            self.db,
+            1,
+            lambda packet, _prompt: article_json(packet),
+            "https://site.example",
+            "key",
+            {
+                "journalAutoPublishEnabled": True,
+                "journalDailyEnabled": True,
+                "journalWeeklyEnabled": False,
+            },
+            now_utc=datetime(2026, 7, 22, 3, 0, tzinfo=timezone.utc),
+            opener=self.opener,
+        )
+
+        self.assertEqual(1, len(results))
+        self.assertEqual("published", results[0].status)
+        expected_start, expected_end, _ = automation._daily_period_for_day(
+            date(2026, 7, 20)
+        )
+        self.assertEqual(expected_start, results[0].source_window_start)
+        self.assertEqual(expected_end, results[0].source_window_end)
+        self.assertEqual(
+            date(2026, 7, 18),
+            automation._pending_daily_day(
+                self.db,
+                1,
+                datetime(2026, 7, 22, 3, 0, tzinfo=timezone.utc),
+            ),
+        )
+
     def test_saved_delivery_runs_before_retry_ready_preparation_backlog(self):
         self.add_day("2026-07-18")
         self.add_day("2026-07-20")

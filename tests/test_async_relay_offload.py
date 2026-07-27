@@ -166,7 +166,7 @@ class GeminiOffloadTests(unittest.IsolatedAsyncioTestCase):
                     bnl01_bot.JOURNAL_ROUTE,
                 )
 
-        self.assertEqual(len(calls), 2)
+        self.assertEqual(len(calls), 1)
         self.assertTrue(
             all(
                 model
