@@ -17,6 +17,7 @@ from bnl_conversation_context_v2 import (
     CONVERSATION_CONTEXT_VERSION,
     ConversationContextRequest,
     ConversationContextResult,
+    assess_reply_referent_grounding,
     assemble_conversation_context_v2,
 )
 from bnl_memory_ledger import (
@@ -1593,6 +1594,142 @@ class OrchestrationHardeningRegressionTests(unittest.TestCase):
         self.assertEqual(result.referent_selected_row_ids, (1,))
         self.assertIn("exact older source", result.rendered_context)
         self.assertNotIn("newer but unrelated", result.rendered_context)
+
+    def test_exact_reply_is_the_only_continuity_source_without_scope_expansion(self):
+        result = assemble_conversation_context_v2(
+            [
+                _context_row(
+                    1,
+                    "Idea A: a radio tower that wakes up at midnight.",
+                    user_name="Jon",
+                    minutes=3,
+                    message_id=4001,
+                ),
+                _context_row(
+                    2,
+                    "Idea B: a vending machine that trades memories.",
+                    user_name="Jon",
+                    minutes=2,
+                    message_id=4002,
+                ),
+            ],
+            _context_request(
+                "BNL, improve this idea in one sentence.",
+                referenced_message_ids=frozenset({4001}),
+            ),
+        )
+
+        self.assertEqual(result.referent_status, "resolved")
+        self.assertEqual(result.referent_selected_row_ids, (1,))
+        self.assertEqual(result.referent_competing_row_ids, (2,))
+        self.assertFalse(result.referent_scope_expanded)
+        self.assertEqual(result.thread_focus_mode, "exact_discord_reply")
+        self.assertIn("exact Discord reply source", result.rendered_context)
+        self.assertIn("radio tower", result.rendered_context)
+        self.assertNotIn("vending machine", result.rendered_context)
+
+    def test_exact_reply_can_explicitly_expand_to_another_room_contribution(self):
+        result = assemble_conversation_context_v2(
+            [
+                _context_row(
+                    1,
+                    "Idea A: a radio tower that wakes up at midnight.",
+                    user_name="Jon",
+                    minutes=3,
+                    message_id=4001,
+                ),
+                _context_row(
+                    2,
+                    "Idea B: a vending machine that trades memories.",
+                    user_name="Jon",
+                    minutes=2,
+                    message_id=4002,
+                ),
+            ],
+            _context_request(
+                "BNL, compare this idea with the newer idea.",
+                referenced_message_ids=frozenset({4001}),
+            ),
+        )
+
+        self.assertEqual(result.referent_selected_row_ids, (1,))
+        self.assertTrue(result.referent_scope_expanded)
+        self.assertIn("radio tower", result.rendered_context)
+        self.assertIn("vending machine", result.rendered_context)
+
+    def test_choice_inside_exact_reply_does_not_widen_to_other_messages(self):
+        result = assemble_conversation_context_v2(
+            [
+                _context_row(
+                    1,
+                    "Choose a red tower or a blue tower.",
+                    user_name="Jon",
+                    minutes=3,
+                    message_id=4001,
+                ),
+                _context_row(
+                    2,
+                    "A newer room message about a memory vending machine.",
+                    user_name="Jon",
+                    minutes=2,
+                    message_id=4002,
+                ),
+            ],
+            _context_request(
+                "BNL, which one is stronger?",
+                referenced_message_ids=frozenset({4001}),
+            ),
+        )
+
+        self.assertFalse(result.referent_scope_expanded)
+        self.assertIn("red tower or a blue tower", result.rendered_context)
+        self.assertNotIn("memory vending machine", result.rendered_context)
+
+    def test_reply_grounding_assessment_detects_the_canary_source_switch(self):
+        wrong = assess_reply_referent_grounding(
+            (
+                "The vending machine hums after dark, accepting memories "
+                "instead of coins."
+            ),
+            referent_texts=(
+                "Idea A: a radio tower that wakes up at midnight.",
+            ),
+            competing_texts=(
+                "Idea B: a vending machine that trades memories.",
+            ),
+        )
+        correct = assess_reply_referent_grounding(
+            (
+                "At midnight, the radio tower wakes and broadcasts one "
+                "forgotten voice across the sleeping city."
+            ),
+            referent_texts=(
+                "Idea A: a radio tower that wakes up at midnight.",
+            ),
+            competing_texts=(
+                "Idea B: a vending machine that trades memories.",
+            ),
+        )
+        expanded = assess_reply_referent_grounding(
+            "The vending machine trades memories.",
+            referent_texts=(
+                "Idea A: a radio tower that wakes up at midnight.",
+            ),
+            competing_texts=(
+                "Idea B: a vending machine that trades memories.",
+            ),
+            scope_expanded=True,
+        )
+
+        self.assertEqual(
+            wrong.status,
+            "competing_reply_source_substitution",
+        )
+        self.assertTrue(wrong.failed)
+        self.assertEqual(correct.status, "grounded_exact_reply_source")
+        self.assertFalse(correct.failed)
+        self.assertEqual(expanded.status, "not_applicable")
+        self.assertFalse(expanded.failed)
 
     def test_exact_reply_source_is_loaded_beyond_general_row_limit(self):
         with tempfile.TemporaryDirectory() as temp_dir:

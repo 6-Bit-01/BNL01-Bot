@@ -124,6 +124,17 @@ clarification naming the bounded candidates. If no eligible source exists, BNL
 may clarify honestly. BNL must not claim content is missing when it is safely
 available.
 
+An exact Discord reply target is the sole continuity source for that turn
+unless the current request explicitly names another message, reply,
+contribution, thread, or newer/older idea to combine or compare. A generic
+choice, transformation, or question about material inside the exact target
+does not widen scope. Nearby non-target contributions remain typed,
+source-linked revalidation evidence for drift detection, but they are not
+rendered into the generation prompt. If a draft positively switches to or
+mixes in one of those competing sources, the shared response guard may perform
+one regeneration using only the exact target; a second proven switch is
+suppressed before delivery.
+
 ## Moment boundary
 
 The Moment Engine may inform the coordinator that a recent window is open,
@@ -140,6 +151,9 @@ Conversation Context v2 remains the only owner of raw nearby content.
 - Optional Context or Moment read failure cannot veto a confirmed address.
 - Ambiguous or unresolved direct referents produce clarification, not invented
   context and not a false absence claim.
+- A resolved exact reply cannot silently fall back to recency. Prompt
+  construction, regeneration, and the final pre-send check preserve the same
+  typed reply source; a proven competing-source substitution fails closed.
 - A self-name decision is not persisted when generation fails, delivery fails,
   parsing is ambiguous, or the source conversation cannot be linked.
 - A partial multi-chunk delivery writes no complete model conversation row and
@@ -159,10 +173,13 @@ denial, deferral, correction, revocation, restart persistence, deletion,
 forgetting, retraction, provenance loss, visibility boundaries, known-human
 collisions, direct and batched response obligations, resolved and unresolved
 exact reply references, multiple replies, replies to BNL, partial sends,
-cross-speaker structural references, current payload precedence, contribution
-type, ambiguity, cross-room exclusion, long-source budget priority, Moment
-state, third-party-only turns, route blocks, interruption rebuilds, and
-event-loop offloading.
+replies to another human while addressing BNL, competing newer same-room
+messages, explicit reply-scope expansion, cross-speaker structural references,
+current payload precedence, contribution type, ambiguity, cross-room
+exclusion, long-source budget priority, Moment state, third-party-only turns,
+route blocks, interruption rebuilds, and event-loop offloading. Exact-reply
+coverage must exercise the complete handler path through prompt construction,
+generation, guard regeneration or suppression, and final send.
 
 Response influence has one dedicated fail-closed gate:
 `BNL_CONVERSATION_ORCHESTRATION_INFLUENCE_ENABLED`. It defaults off and is not
