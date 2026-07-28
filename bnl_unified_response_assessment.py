@@ -25,6 +25,7 @@ from bnl_conversation_context_v2 import assess_payload_grounding
 
 
 ASSESSMENT_VERSION = "unified_response_assessment_v7"
+CONVERSATION_TURN_PACKET_VERSION = "conversation_turn_evidence_v2"
 SHADOW_ENV = "BNL_UNIFIED_RESPONSE_ASSESSMENT_SHADOW_ENABLED"
 TABLE_NAME = "unified_response_assessment_shadow_runs"
 
@@ -259,6 +260,254 @@ _TERM_FAMILIES = {
     "funny": frozenset({"funny", "joke", "joking", "playful", "humorous"}),
     "serious": frozenset({"serious", "formal", "professional", "solemn"}),
 }
+
+
+@dataclass(frozen=True)
+class ConversationTurnEvidencePacket:
+    """Typed outputs from existing owners before silence or generation.
+
+    This coordinator retrieves and stores nothing.  Addressing, Context v2,
+    Moments, route policy, and engagement keep their ownership; this object is
+    only the convergence point that prevents one early heuristic from silently
+    vetoing the rest.
+    """
+
+    route_allowed: bool
+    engagement_decision: str
+    engagement_reason: str
+    response_obligation: bool = False
+    address_kind: str = "none"
+    third_party_only: bool = False
+    continuity_required: bool = False
+    referent_status: str = "not_requested"
+    referent_candidate_count: int = 0
+    referent_candidate_labels: tuple[str, ...] = ()
+    moment_situation_state: str = "none"
+    moment_topic_coherent: bool = False
+    moment_participant_overlap: bool = False
+    moment_human_entry_count: int = 0
+    moment_model_entry_count: int = 0
+    influence_mode: str = "off"
+    packet_version: str = CONVERSATION_TURN_PACKET_VERSION
+    packet_revision: str = ""
+    governed_memory_state: str = "owner_not_requested"
+    relationship_state: str = "owner_tone_only"
+    canon_state: str = "owner_not_requested"
+    source_control_state: str = "route_policy_only"
+
+
+# Compatibility name for existing callers. The packet itself is the authority
+# boundary; callers must not maintain a second mutable orchestration input.
+ConversationOrchestrationInput = ConversationTurnEvidencePacket
+
+
+@dataclass(frozen=True)
+class ConversationOrchestrationDecision:
+    """One authoritative response act for the current conversational turn."""
+
+    response_act: str
+    reason: str
+    response_required: bool
+    address_kind: str
+    continuity_required: bool
+    referent_status: str
+    referent_candidate_count: int
+    referent_candidate_labels: tuple[str, ...]
+    moment_situation_state: str
+    moment_topic_coherent: bool
+    moment_participant_overlap: bool
+    moment_human_entry_count: int
+    moment_model_entry_count: int
+    engagement_decision: str
+    engagement_reason: str
+    influence_mode: str
+    packet_version: str
+    packet_revision: str
+    governed_memory_state: str
+    relationship_state: str
+    canon_state: str
+    source_control_state: str
+
+    @property
+    def should_generate(self) -> bool:
+        return self.response_act in {"answer", "clarify"}
+
+    @property
+    def influences_response(self) -> bool:
+        return self.influence_mode in {"live", "sealed_canary"}
+
+
+def coordinate_conversation_turn(
+    input_state: ConversationTurnEvidencePacket,
+) -> ConversationOrchestrationDecision:
+    """Resolve one response act after all currently available owners report."""
+
+    engagement = str(input_state.engagement_decision or "observe").lower()
+    referent = str(input_state.referent_status or "not_requested").lower()
+    response_required = bool(input_state.response_obligation)
+
+    if not input_state.route_allowed:
+        act, reason = "blocked", "route_policy_blocked"
+        response_required = False
+    elif input_state.third_party_only and not response_required:
+        act, reason = "observe", "third_party_only"
+    elif response_required and referent in {"ambiguous", "unresolved"}:
+        act = "clarify"
+        reason = "addressed_referent_%s" % referent
+    elif response_required:
+        act, reason = "answer", "addressed_response_obligation"
+    elif engagement == "answer" and referent in {"ambiguous", "unresolved"}:
+        act = "clarify"
+        reason = "engaged_referent_%s" % referent
+    elif engagement == "answer":
+        act, reason = "answer", str(
+            input_state.engagement_reason or "engagement_answer"
+        )
+    elif engagement == "acknowledge":
+        act, reason = "acknowledge", str(
+            input_state.engagement_reason or "engagement_acknowledge"
+        )
+    else:
+        act = "observe"
+        reason = str(
+            input_state.engagement_reason
+            or (
+                "moment_observed_without_response_obligation"
+                if input_state.moment_situation_state not in {"", "none"}
+                else "no_response_obligation"
+            )
+        )
+
+    return ConversationOrchestrationDecision(
+        response_act=act,
+        reason=reason,
+        response_required=response_required,
+        address_kind=str(input_state.address_kind or "none")[:80],
+        continuity_required=bool(
+            input_state.continuity_required
+            or referent != "not_requested"
+        ),
+        referent_status=referent,
+        referent_candidate_count=max(
+            0, int(input_state.referent_candidate_count or 0)
+        ),
+        referent_candidate_labels=tuple(
+            dict.fromkeys(
+                str(label or "").strip()[:72]
+                for label in input_state.referent_candidate_labels
+                if str(label or "").strip()
+            )
+        )[:8],
+        moment_situation_state=str(
+            input_state.moment_situation_state or "none"
+        )[:80],
+        moment_topic_coherent=bool(input_state.moment_topic_coherent),
+        moment_participant_overlap=bool(
+            input_state.moment_participant_overlap
+        ),
+        moment_human_entry_count=max(
+            0, int(input_state.moment_human_entry_count or 0)
+        ),
+        moment_model_entry_count=max(
+            0, int(input_state.moment_model_entry_count or 0)
+        ),
+        engagement_decision=engagement,
+        engagement_reason=str(input_state.engagement_reason or "")[:160],
+        influence_mode=(
+            str(input_state.influence_mode or "off").strip().lower()[:40]
+        ),
+        packet_version=(
+            str(
+                input_state.packet_version
+                or CONVERSATION_TURN_PACKET_VERSION
+            )[:80]
+        ),
+        packet_revision=(
+            str(input_state.packet_revision or "").strip()[:80]
+            or uuid.uuid5(
+                uuid.NAMESPACE_URL,
+                repr(input_state),
+            ).hex[:16]
+        ),
+        governed_memory_state=str(
+            input_state.governed_memory_state or "owner_not_requested"
+        )[:80],
+        relationship_state=str(
+            input_state.relationship_state or "owner_tone_only"
+        )[:80],
+        canon_state=str(
+            input_state.canon_state or "owner_not_requested"
+        )[:80],
+        source_control_state=str(
+            input_state.source_control_state or "route_policy_only"
+        )[:80],
+    )
+
+
+def render_conversation_orchestration_prompt(
+    decision: ConversationOrchestrationDecision | None,
+) -> str:
+    """Render the decision as an instruction, never as factual evidence."""
+
+    if (
+        decision is None
+        or not decision.influences_response
+        or decision.response_act in {"blocked", "observe"}
+    ):
+        return ""
+    lines = [
+        "[CONVERSATION_ORCHESTRATION_V1]",
+        "Response act: %s" % decision.response_act,
+        "Response obligation: %s"
+        % ("required" if decision.response_required else "optional"),
+        "Address basis: %s" % decision.address_kind,
+        "Nearby referent status: %s" % decision.referent_status,
+        "Recent Moment situation state: %s"
+        % decision.moment_situation_state,
+        (
+            "Recent room-flow evidence: human contributions=%s; "
+            "BNL replies=%s; current participant overlap=%s; "
+            "topic coherent=%s."
+        )
+        % (
+            decision.moment_human_entry_count,
+            decision.moment_model_entry_count,
+            "yes" if decision.moment_participant_overlap else "no",
+            "yes" if decision.moment_topic_coherent else "no",
+        ),
+        (
+            "Use Context v2's selected raw contribution as the content "
+            "authority. Moment state describes activity/flow only; it never "
+            "supplies a quote or replaces raw context."
+        ),
+    ]
+    if decision.response_act == "clarify":
+        lines.append(
+            "Bounded candidate count: %s"
+            % decision.referent_candidate_count
+        )
+        if decision.referent_candidate_labels:
+            lines.append(
+                "Bounded candidate speakers: "
+                + ", ".join(decision.referent_candidate_labels)
+            )
+        lines.append(
+            "Ask one honest, specific clarification about which nearby "
+            "contribution the member means. Do not claim the referenced "
+            "content is absent or forgotten."
+        )
+    elif decision.referent_status == "resolved":
+        lines.append(
+            "Carry out the requested conversational act against the resolved "
+            "nearby contribution. Preserve its speaker attribution."
+        )
+    if decision.response_required:
+        lines.append(
+            "Do not turn this addressed turn into silence or a generic "
+            "acknowledgement."
+        )
+    lines.append("[/CONVERSATION_ORCHESTRATION_V1]")
+    return "\n".join(lines)
 
 
 def _flag(value: Any) -> bool:
