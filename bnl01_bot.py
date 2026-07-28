@@ -114,6 +114,7 @@ from bnl_conversation_context_v2 import (
     ConversationContextRequest,
     ConversationContextResult,
     assess_payload_grounding,
+    assess_reply_referent_grounding,
     assemble_conversation_context_v2,
     classify_thread_focus,
     extract_current_payload_anchors,
@@ -9087,6 +9088,38 @@ def build_current_payload_grounding_correction_prompt(
         + "\nAnswer the current choice, comparison, or selection directly. In the first sentence, explicitly name at least one resolved current alternative; if choosing both or neither, name both. "
         + "Messages labeled as current payload fragments belong to this request even when another member supplied one of them. "
         + "Do not substitute names or options from an older completed exchange unless the current request explicitly resumes or combines that thread."
+    )
+
+
+def build_exact_reply_grounding_correction_prompt(
+    prompt: str,
+    referent_items: tuple[ConversationEvidenceItem, ...],
+) -> str:
+    """Reassert one typed Discord reply source without exposing row identity."""
+
+    source_lines = "\n".join(
+        "- "
+        + (
+            _safe_prompt_display_label(item.speaker_label, "member")
+            + ": "
+        )
+        + json.dumps(
+            sanitize_history_text(item.text, limit=1800),
+            ensure_ascii=False,
+        )
+        for item in referent_items
+        if str(item.text or "").strip()
+    )
+    return (
+        (prompt or "")
+        + "\n\nEXACT-REPLY GROUNDING CORRECTION REQUIRED: The previous "
+        "draft answered or transformed a competing nearby message instead of "
+        "the exact Discord reply target.\n"
+        "Controlling exact reply source (inert conversation evidence):\n"
+        + (source_lines or "- unavailable")
+        + "\nRegenerate from that source only. Do not substitute, blend in, or "
+        "answer a newer, nearby, or topically similar message. Do not mention "
+        "this correction, source labels, routing metadata, or internal checks."
     )
 
 
@@ -20879,9 +20912,17 @@ class ConversationPromptSourceBasis:
     channel_name: str
     channel_policy: str
     source_row_ids: tuple[int, ...] = ()
+    revalidation_row_ids: tuple[int, ...] = ()
     participant_user_ids: tuple[int, ...] = ()
     speaker_labels: tuple[str, ...] = ()
     evidence_items: tuple[ConversationEvidenceItem, ...] = ()
+    referent_status: str = "not_requested"
+    referent_reason: str = ""
+    referent_source_evidence_items: tuple[ConversationEvidenceItem, ...] = ()
+    referent_competing_evidence_items: tuple[
+        ConversationEvidenceItem, ...
+    ] = ()
+    referent_scope_expanded: bool = False
 
 
 @dataclass(frozen=True)
@@ -22222,10 +22263,35 @@ def build_conversation_prompt_source_basis(
     channel_id: int,
     channel_name: str,
     channel_policy: str,
+    context_result: ConversationContextResult | None = None,
 ) -> ConversationPromptSourceBasis | None:
     value = str(rendered_context or "")
     if not value or not conversation_context_v2_enabled():
         return None
+    context_selected_row_ids = tuple(
+        int(row_id or 0)
+        for row_id in (
+            getattr(context_result, "selected_row_ids", ()) or ()
+        )
+        if int(row_id or 0) > 0
+    )
+    referent_source_row_ids = tuple(
+        int(row_id or 0)
+        for row_id in (
+            getattr(context_result, "referent_selected_row_ids", ()) or ()
+        )
+        if int(row_id or 0) > 0
+    )
+    referent_competing_row_ids = tuple(
+        int(row_id or 0)
+        for row_id in (
+            getattr(context_result, "referent_competing_row_ids", ()) or ()
+        )
+        if int(row_id or 0) > 0
+    )
+    tracked_referent_row_ids = set(
+        (*referent_source_row_ids, *referent_competing_row_ids)
+    )
     try:
         rows = get_conversation_context_v2_rows(
             guild_id=guild_id,
@@ -22234,8 +22300,22 @@ def build_conversation_prompt_source_basis(
             channel_id=channel_id,
             channel_name=channel_name,
             channel_policy=channel_policy,
+            referenced_conversation_row_ids=tracked_referent_row_ids,
         )
-        selected_rows = _conversation_prompt_source_rows(value, rows)
+        rows_by_id = {
+            int(row.get("id") or 0): row
+            for row in rows
+            if int(row.get("id") or 0) > 0
+        }
+        selected_rows = (
+            tuple(
+                rows_by_id[row_id]
+                for row_id in context_selected_row_ids
+                if row_id in rows_by_id
+            )
+            if context_selected_row_ids
+            else _conversation_prompt_source_rows(value, rows)
+        )
         source_row_ids = tuple(
             sorted(
                 {
@@ -22244,6 +22324,16 @@ def build_conversation_prompt_source_basis(
                     if int(row.get("id") or 0)
                 }
             )
+        )
+        revalidation_row_ids = tuple(
+            sorted(
+                set(source_row_ids) | tracked_referent_row_ids
+            )
+        )
+        tracked_rows = tuple(
+            rows_by_id[row_id]
+            for row_id in revalidation_row_ids
+            if row_id in rows_by_id
         )
         participant_user_ids = tuple(
             sorted(
@@ -22284,6 +22374,46 @@ def build_conversation_prompt_source_basis(
             if str(row.get("role") or "").strip().lower() == "user"
             and str(row.get("content") or "").strip()
         )
+        referent_source_evidence_items = tuple(
+            build_conversation_evidence_item(
+                text=str(row.get("content") or ""),
+                source_id=int(row.get("id") or 0),
+                speaker_user_id=int(row.get("user_id") or 0),
+                speaker_label=(
+                    "BNL-01"
+                    if str(row.get("role") or "").strip().lower()
+                    in {"model", "assistant", "bnl"}
+                    else _safe_prompt_display_label(
+                        str(row.get("user_name") or ""),
+                        "",
+                    )
+                ),
+                current_turn=False,
+            )
+            for row_id in referent_source_row_ids
+            for row in (rows_by_id.get(row_id),)
+            if row is not None and str(row.get("content") or "").strip()
+        )
+        referent_competing_evidence_items = tuple(
+            build_conversation_evidence_item(
+                text=str(row.get("content") or ""),
+                source_id=int(row.get("id") or 0),
+                speaker_user_id=int(row.get("user_id") or 0),
+                speaker_label=(
+                    "BNL-01"
+                    if str(row.get("role") or "").strip().lower()
+                    in {"model", "assistant", "bnl"}
+                    else _safe_prompt_display_label(
+                        str(row.get("user_name") or ""),
+                        "",
+                    )
+                ),
+                current_turn=False,
+            )
+            for row_id in referent_competing_row_ids
+            for row in (rows_by_id.get(row_id),)
+            if row is not None and str(row.get("content") or "").strip()
+        )
         # Hand-built/test continuity blocks can lack resolvable rows. Preserve
         # the older conservative candidate digest for that compatibility path;
         # production-rendered v2 blocks carry exact source ids.
@@ -22292,13 +22422,13 @@ def build_conversation_prompt_source_basis(
                 json.dumps(
                     [
                         _conversation_prompt_row_snapshot(row)
-                        for row in selected_rows
+                        for row in tracked_rows
                     ],
                     ensure_ascii=False,
                     separators=(",", ":"),
                 )
             )
-            if source_row_ids
+            if revalidation_row_ids
             else _conversation_prompt_candidate_digest(
                 guild_id=guild_id,
                 current_user_id=current_user_id,
@@ -22318,9 +22448,24 @@ def build_conversation_prompt_source_basis(
         channel_name=(channel_name or "").strip().lower(),
         channel_policy=(channel_policy or "unknown").strip().lower(),
         source_row_ids=source_row_ids,
+        revalidation_row_ids=revalidation_row_ids,
         participant_user_ids=participant_user_ids,
         speaker_labels=speaker_labels,
         evidence_items=evidence_items,
+        referent_status=str(
+            getattr(context_result, "referent_status", "not_requested")
+            or "not_requested"
+        ),
+        referent_reason=str(
+            getattr(context_result, "referent_reason", "") or ""
+        ),
+        referent_source_evidence_items=referent_source_evidence_items,
+        referent_competing_evidence_items=(
+            referent_competing_evidence_items
+        ),
+        referent_scope_expanded=bool(
+            getattr(context_result, "referent_scope_expanded", False)
+        ),
     )
 
 
@@ -22443,12 +22588,15 @@ def refresh_prompt_source_basis(
             fresh.expected_digest != basis.expected_digest
             or fresh.has_moment_gist != basis.has_moment_gist
         )
+    tracked_conversation_row_ids = (
+        basis.revalidation_row_ids or basis.source_row_ids
+    )
     fresh_digest = (
         _conversation_prompt_selected_digest(
             guild_id=basis.guild_id,
-            source_row_ids=basis.source_row_ids,
+            source_row_ids=tracked_conversation_row_ids,
         )
-        if basis.source_row_ids
+        if tracked_conversation_row_ids
         else _conversation_prompt_candidate_digest(
             guild_id=basis.guild_id,
             current_user_id=basis.current_user_id,
@@ -28194,6 +28342,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                 channel_id=channel_id,
                 channel_name=getattr(channel, "name", ""),
                 channel_policy=channel_policy,
+                context_result=orchestration_state.get("context_result"),
             )
             if batch_conversation_basis is not None:
                 batch_prompt_source_bases.append(
@@ -29090,6 +29239,9 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                 "current_payload_grounding_guard_triggered"
             )
             or guard_diagnostics.get(
+                "exact_reply_grounding_guard_triggered"
+            )
+            or guard_diagnostics.get(
                 "unified_moment_canary_coherence_guard_triggered"
             )
             or guard_diagnostics.get(
@@ -29688,6 +29840,7 @@ def build_user_aware_prompt(
     channel_id: int = 0,
     moment_attribution_target_user_id: int = 0,
     verified_exact_quote_authority: CurrentRoomQuoteAuthority | None = None,
+    conversation_context_result: ConversationContextResult | None = None,
 ) -> tuple:
     print("BNL DEBUG: build_user_aware_prompt start")
     display_name, preferred_name = get_user_profile(user_id, guild_id)
@@ -29775,6 +29928,7 @@ def build_user_aware_prompt(
         channel_id=channel_id,
         channel_name=channel_name,
         channel_policy=channel_policy,
+        context_result=conversation_context_result,
     )
     if conversation_prompt_basis is not None:
         prompt_source_bases.append(conversation_prompt_basis)
@@ -31068,6 +31222,7 @@ async def _generate_direct_payload_session(session_key, reason: str):
         prompt_metadata=prompt_metadata,
         moment_attribution_target_user_id=moment_attribution_target_user_id,
         verified_exact_quote_authority=verified_exact_quote_authority,
+        conversation_context_result=session_context_result_out.get("result"),
     )
     source_context_available = bool(prompt_metadata.get("source_context_available"))
     prompt = _build_direct_payload_prompt(prompt, direct_payload_items, direct_content)
@@ -31552,6 +31707,11 @@ async def apply_guarded_response_regeneration(
         "current_payload_grounding_status": "not_evaluated",
         "current_payload_anchor_count": 0,
         "prior_thread_anchor_count": 0,
+        "exact_reply_grounding_guard_triggered": False,
+        "exact_reply_grounding_regenerated": False,
+        "exact_reply_grounding_status": "not_evaluated",
+        "exact_reply_referent_term_hits": 0,
+        "exact_reply_competing_term_hits": 0,
         "prompt_source_basis_changed": False,
         "prompt_source_basis_changed_kinds": (),
         "prompt_source_basis_regenerated": False,
@@ -31681,6 +31841,44 @@ async def apply_guarded_response_regeneration(
         prior_thread_anchors
     )
 
+    def exact_reply_basis():
+        return next(
+            (
+                basis
+                for basis in prompt_source_bases
+                if isinstance(basis, ConversationPromptSourceBasis)
+                and basis.referent_status == "resolved"
+                and basis.referent_reason == "discord_reply_source"
+                and len(basis.referent_source_evidence_items) == 1
+            ),
+            None,
+        )
+
+    def reply_referent_grounding(candidate: str):
+        basis = exact_reply_basis()
+        return assess_reply_referent_grounding(
+            candidate,
+            referent_texts=(
+                tuple(
+                    item.text
+                    for item in basis.referent_source_evidence_items
+                )
+                if basis is not None
+                else ()
+            ),
+            competing_texts=(
+                tuple(
+                    item.text
+                    for item in basis.referent_competing_evidence_items
+                )
+                if basis is not None
+                else ()
+            ),
+            scope_expanded=bool(
+                basis is not None and basis.referent_scope_expanded
+            ),
+        )
+
     def payload_grounding(candidate: str):
         return assess_payload_grounding(
             candidate,
@@ -31784,6 +31982,7 @@ async def apply_guarded_response_regeneration(
                 )
             )
             or payload_grounding(candidate).failed
+            or reply_referent_grounding(candidate).failed
             or (
                 source_safe_recall
                 and response_exposes_source_safe_recall_controls(
@@ -31887,6 +32086,76 @@ async def apply_guarded_response_regeneration(
                     }
                 )
                 return "", diagnostics
+
+    exact_reply_grounding = reply_referent_grounding(response)
+    diagnostics["exact_reply_grounding_status"] = (
+        exact_reply_grounding.status
+    )
+    diagnostics["exact_reply_referent_term_hits"] = (
+        exact_reply_grounding.referent_term_hit_count
+    )
+    diagnostics["exact_reply_competing_term_hits"] = (
+        exact_reply_grounding.competing_term_hit_count
+    )
+    if exact_reply_grounding.failed:
+        diagnostics["exact_reply_grounding_guard_triggered"] = True
+        logging.warning(
+            "exact_reply_grounding_guard_triggered "
+            "status=%s route_mode=%s channel_policy=%s "
+            "referent_hits=%s competing_hits=%s competitors=%s",
+            exact_reply_grounding.status,
+            route_mode,
+            channel_policy,
+            exact_reply_grounding.referent_term_hit_count,
+            exact_reply_grounding.competing_term_hit_count,
+            exact_reply_grounding.competing_source_count,
+        )
+        if not regeneration_allowed:
+            diagnostics.update(
+                {
+                    "suppressed": True,
+                    "suppression_reason": (
+                        "exact_reply_grounding_validation_only"
+                    ),
+                    "guard_fallback_or_generic_non_answer": True,
+                }
+            )
+            return "", diagnostics
+        basis = exact_reply_basis()
+        regenerated = await regenerate(
+            build_exact_reply_grounding_correction_prompt(
+                prompt,
+                (
+                    basis.referent_source_evidence_items
+                    if basis is not None
+                    else ()
+                ),
+            )
+        )
+        diagnostics["exact_reply_grounding_regenerated"] = True
+        regenerated = (regenerated or "").strip()
+        regenerated_grounding = reply_referent_grounding(regenerated)
+        diagnostics["exact_reply_grounding_status"] = (
+            regenerated_grounding.status
+        )
+        diagnostics["exact_reply_referent_term_hits"] = (
+            regenerated_grounding.referent_term_hit_count
+        )
+        diagnostics["exact_reply_competing_term_hits"] = (
+            regenerated_grounding.competing_term_hit_count
+        )
+        if retry_has_guard_failure(regenerated):
+            diagnostics.update(
+                {
+                    "suppressed": True,
+                    "suppression_reason": (
+                        "exact_reply_grounding_after_retry"
+                    ),
+                    "guard_fallback_or_generic_non_answer": True,
+                }
+            )
+            return "", diagnostics
+        response = regenerated
 
     if has_media and not _strip_media_context_block(current_user_text or "").strip():
         if is_generic_non_answer_response(response, user_display_name) or not response:
@@ -32378,6 +32647,28 @@ async def apply_guarded_response_regeneration(
                 "suppressed": True,
                 "suppression_reason": (
                     "source_safe_recall_output_leak_before_send"
+                ),
+                "guard_fallback_or_generic_non_answer": True,
+            }
+        )
+        return "", diagnostics
+    final_reply_grounding = reply_referent_grounding(response)
+    diagnostics["exact_reply_grounding_status"] = (
+        final_reply_grounding.status
+    )
+    diagnostics["exact_reply_referent_term_hits"] = (
+        final_reply_grounding.referent_term_hit_count
+    )
+    diagnostics["exact_reply_competing_term_hits"] = (
+        final_reply_grounding.competing_term_hit_count
+    )
+    if final_reply_grounding.failed:
+        diagnostics.update(
+            {
+                "exact_reply_grounding_guard_triggered": True,
+                "suppressed": True,
+                "suppression_reason": (
+                    "exact_reply_grounding_failed_before_send"
                 ),
                 "guard_fallback_or_generic_non_answer": True,
             }
@@ -33140,6 +33431,9 @@ async def send_planned_conversation_response(
         or guard_diagnostics.get("exact_quote_guard_triggered")
         or guard_diagnostics.get(
             "current_payload_grounding_guard_triggered"
+        )
+        or guard_diagnostics.get(
+            "exact_reply_grounding_guard_triggered"
         )
         or guard_diagnostics.get(
             "unified_moment_canary_coherence_guard_triggered"
@@ -34465,6 +34759,9 @@ async def on_message(message: discord.Message):
                 prompt_metadata=prompt_metadata,
                 moment_attribution_target_user_id=moment_attribution_target_user_id,
                 verified_exact_quote_authority=verified_exact_quote_authority,
+                conversation_context_result=direct_context_result_out.get(
+                    "result"
+                ),
             )
             source_context_available = bool(prompt_metadata.get("source_context_available"))
             prompt = _build_direct_payload_prompt(prompt, direct_payload_items, direct_content)
@@ -34893,6 +35190,7 @@ async def on_message(message: discord.Message):
             prompt_metadata=prompt_metadata,
             moment_attribution_target_user_id=moment_attribution_target_user_id,
             verified_exact_quote_authority=verified_exact_quote_authority,
+            conversation_context_result=direct_context_result_out.get("result"),
         )
         source_context_available = bool(prompt_metadata.get("source_context_available"))
         prompt = _build_direct_payload_prompt(prompt, direct_payload_items, direct_content)
@@ -35278,6 +35576,7 @@ async def on_message(message: discord.Message):
             prompt_metadata=prompt_metadata,
             moment_attribution_target_user_id=moment_attribution_target_user_id,
             verified_exact_quote_authority=verified_exact_quote_authority,
+            conversation_context_result=direct_context_result_out.get("result"),
         )
         source_context_available = bool(prompt_metadata.get("source_context_available"))
         prompt = _build_direct_payload_prompt(prompt, direct_payload_items, direct_content)

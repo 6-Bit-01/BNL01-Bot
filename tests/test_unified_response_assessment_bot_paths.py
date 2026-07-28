@@ -381,6 +381,88 @@ class UnifiedResponseAssessmentBotPathTests(unittest.TestCase):
         self.assertEqual(item.criterion_positive_terms, ("place",))
         self.assertEqual(item.criterion_negative_terms, ("character",))
 
+    def test_conversation_basis_tracks_exact_reply_and_hidden_competitor(self):
+        exact_row = {
+            "id": 10,
+            "role": "user",
+            "content": (
+                "Idea A: a radio tower that wakes up at midnight."
+            ),
+            "user_id": 101,
+            "user_name": "Jon",
+        }
+        competing_row = {
+            "id": 11,
+            "role": "user",
+            "content": (
+                "Idea B: a vending machine that trades memories."
+            ),
+            "user_id": 101,
+            "user_name": "Jon",
+        }
+        context_result = SimpleNamespace(
+            referent_status="resolved",
+            referent_reason="discord_reply_source",
+            referent_selected_row_ids=(10,),
+            referent_competing_row_ids=(11,),
+            referent_scope_expanded=False,
+        )
+        rendered = (
+            "Conversation continuity:\n"
+            "Jon (exact Discord reply source): "
+            "Idea A: a radio tower that wakes up at midnight."
+        )
+        with (
+            mock.patch.object(
+                bnl01_bot,
+                "conversation_context_v2_enabled",
+                return_value=True,
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "get_conversation_context_v2_rows",
+                return_value=[exact_row, competing_row],
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "_conversation_prompt_source_rows",
+                return_value=[exact_row],
+            ),
+        ):
+            basis = bnl01_bot.build_conversation_prompt_source_basis(
+                rendered,
+                guild_id=1,
+                current_user_id=101,
+                channel_id=303,
+                channel_name="bnl-testing",
+                channel_policy="sealed_test",
+                context_result=context_result,
+            )
+
+        self.assertIsNotNone(basis)
+        self.assertEqual(basis.source_row_ids, (10,))
+        self.assertEqual(basis.revalidation_row_ids, (10, 11))
+        self.assertEqual(
+            tuple(item.source_id for item in basis.evidence_items),
+            (10,),
+        )
+        self.assertEqual(
+            tuple(
+                item.text
+                for item in basis.referent_source_evidence_items
+            ),
+            ("Idea A: a radio tower that wakes up at midnight.",),
+        )
+        self.assertEqual(
+            tuple(
+                item.text
+                for item in basis.referent_competing_evidence_items
+            ),
+            ("Idea B: a vending machine that trades memories.",),
+        )
+        self.assertNotIn("vending machine", basis.rendered_context)
+        self.assertFalse(basis.referent_scope_expanded)
+
     def test_bot_adapter_distinguishes_current_fragments_from_prior_choice(self):
         basis = bnl01_bot.ConversationPromptSourceBasis(
             expected_digest="digest",
@@ -634,6 +716,166 @@ class CurrentPayloadGroundingGuardTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             diagnostics["suppression_reason"],
             "current_payload_grounding_after_retry",
+        )
+
+
+class ExactReplyGroundingGuardTests(unittest.IsolatedAsyncioTestCase):
+    def reply_basis(self):
+        return bnl01_bot.ConversationPromptSourceBasis(
+            expected_digest="stable",
+            rendered_context=(
+                "Conversation continuity:\n"
+                "Jon (exact Discord reply source): "
+                "Idea A: a radio tower that wakes up at midnight."
+            ),
+            guild_id=1,
+            current_user_id=101,
+            channel_id=303,
+            channel_name="bnl-testing",
+            channel_policy="sealed_test",
+            referent_status="resolved",
+            referent_reason="discord_reply_source",
+            referent_source_evidence_items=(
+                bnl01_bot.build_conversation_evidence_item(
+                    text=(
+                        "Idea A: a radio tower that wakes up at midnight."
+                    ),
+                    source_id=10,
+                    speaker_user_id=101,
+                    speaker_label="Jon",
+                ),
+            ),
+            referent_competing_evidence_items=(
+                bnl01_bot.build_conversation_evidence_item(
+                    text=(
+                        "Idea B: a vending machine that trades memories."
+                    ),
+                    source_id=11,
+                    speaker_user_id=101,
+                    speaker_label="Jon",
+                ),
+            ),
+        )
+
+    async def test_shared_guard_regenerates_exact_canary_source_switch(self):
+        provider = mock.AsyncMock(
+            return_value=(
+                "At midnight, the radio tower wakes and broadcasts one "
+                "forgotten voice across the sleeping city."
+            )
+        )
+        basis = self.reply_basis()
+        prompt = (
+            "Current user request: BNL, improve this idea in one sentence.\n\n"
+            + basis.rendered_context
+        )
+        with (
+            mock.patch.object(
+                bnl01_bot,
+                "get_gemini_response_with_optional_typing",
+                provider,
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "refresh_prompt_source_bases",
+                return_value=(prompt, (basis,), (), False),
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "prompt_source_basis_failure",
+                return_value="",
+            ),
+        ):
+            response, diagnostics = (
+                await bnl01_bot.apply_guarded_response_regeneration(
+                    (
+                        "The vending machine hums after dark, accepting "
+                        "memories instead of coins."
+                    ),
+                    prompt=prompt,
+                    user_id=101,
+                    guild_id=1,
+                    route_mode=bnl01_bot.ROUTE_MODE_NORMAL_CHAT,
+                    channel_policy="sealed_test",
+                    current_user_text=(
+                        "BNL, improve this idea in one sentence."
+                    ),
+                    prompt_source_bases=(basis,),
+                )
+            )
+
+        self.assertIn("radio tower", response)
+        self.assertTrue(
+            diagnostics["exact_reply_grounding_guard_triggered"]
+        )
+        self.assertTrue(
+            diagnostics["exact_reply_grounding_regenerated"]
+        )
+        self.assertEqual(
+            diagnostics["exact_reply_grounding_status"],
+            "grounded_exact_reply_source",
+        )
+        self.assertFalse(diagnostics["suppressed"])
+        provider.assert_awaited_once()
+        retry_prompt = provider.await_args.args[1]
+        self.assertIn(
+            "EXACT-REPLY GROUNDING CORRECTION REQUIRED",
+            retry_prompt,
+        )
+        self.assertIn("radio tower", retry_prompt)
+        self.assertNotIn("vending machine", retry_prompt)
+
+    async def test_shared_guard_suppresses_a_second_competing_reply_answer(self):
+        provider = mock.AsyncMock(
+            return_value=(
+                "The vending machine trades memories after midnight."
+            )
+        )
+        basis = self.reply_basis()
+        prompt = (
+            "Current user request: BNL, improve this idea in one sentence.\n\n"
+            + basis.rendered_context
+        )
+        with (
+            mock.patch.object(
+                bnl01_bot,
+                "get_gemini_response_with_optional_typing",
+                provider,
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "refresh_prompt_source_bases",
+                return_value=(prompt, (basis,), (), False),
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "prompt_source_basis_failure",
+                return_value="",
+            ),
+        ):
+            response, diagnostics = (
+                await bnl01_bot.apply_guarded_response_regeneration(
+                    (
+                        "The vending machine hums after dark, accepting "
+                        "memories instead of coins."
+                    ),
+                    prompt=prompt,
+                    user_id=101,
+                    guild_id=1,
+                    route_mode=bnl01_bot.ROUTE_MODE_NORMAL_CHAT,
+                    channel_policy="sealed_test",
+                    current_user_text=(
+                        "BNL, improve this idea in one sentence."
+                    ),
+                    prompt_source_bases=(basis,),
+                )
+            )
+
+        self.assertEqual(response, "")
+        self.assertTrue(diagnostics["suppressed"])
+        self.assertEqual(
+            diagnostics["suppression_reason"],
+            "exact_reply_grounding_after_retry",
         )
 
 

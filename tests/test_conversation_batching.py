@@ -2,6 +2,7 @@ import asyncio
 import os
 import subprocess
 import sys
+import tempfile
 import time
 import unittest
 from contextlib import ExitStack
@@ -820,6 +821,194 @@ class ConversationBatchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
             channel.sent,
             ["Crow preferred the stronger cobalt framing."],
         )
+
+    async def test_active_batch_enforces_exact_human_reply_through_final_send(self):
+        channel = self._channel(8146)
+        prompts = []
+        exact_message_id = 4001
+        competing_message_id = 4002
+        current_message_id = 4003
+        real_guard = bnl01_bot.apply_guarded_response_regeneration
+        wrong_response = (
+            "The vending machine hums after dark, accepting memories "
+            "instead of coins."
+        )
+        repaired_response = (
+            "At midnight, the radio tower wakes and broadcasts one "
+            "forgotten voice across the sleeping city."
+        )
+
+        async def generate(prompt, *_args, **_kwargs):
+            prompts.append(prompt)
+            return wrong_response if len(prompts) == 1 else repaired_response
+
+        addressing = bnl01_bot.DiscordTurnAddressing(
+            speaker="Jon",
+            explicit_tag_recipients=(),
+            reply_target="Jon",
+            explicitly_mentions_bnl=False,
+            reply_targets_bnl=False,
+            directly_targets_bnl=False,
+            targets_other_human=True,
+            plain_text_names_bnl=True,
+            bnl_name_state="canonical",
+            bnl_name_influence_mode="sealed_canary",
+            source_message_id=current_message_id,
+            reply_message_id=exact_message_id,
+        )
+        turn = bnl01_bot.BatchConversationTurn(
+            "Jon",
+            "BNL, improve this idea in one sentence.",
+            100,
+            addressing,
+        )
+        now = bnl01_bot.datetime.now(bnl01_bot.PACIFIC_TZ)
+        bnl01_bot._channel_buffers[channel.id].append(turn)
+        bnl01_bot._channel_first_seen[channel.id] = now
+        bnl01_bot._channel_last_message_at[channel.id] = now
+        bnl01_bot._channel_last_reply_at[channel.id] = (
+            now - bnl01_bot.timedelta(hours=2)
+        )
+
+        canary_env = {
+            "BNL_CONVERSATION_CONTEXT_V2_ENABLED": "true",
+            "BNL_CONVERSATION_ORCHESTRATION_INFLUENCE_ENABLED": "false",
+            "BNL_CONVERSATION_ORCHESTRATION_SEALED_CANARY_ENABLED": "true",
+            "BNL_CONVERSATION_ORCHESTRATION_SEALED_CANARY_GUILD_IDS": str(
+                channel.guild.id
+            ),
+            "BNL_CONVERSATION_ORCHESTRATION_SEALED_CANARY_CHANNEL_IDS": str(
+                channel.id
+            ),
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = os.path.join(temp_dir, "reply-grounding.sqlite")
+            with (
+                mock.patch.object(bnl01_bot, "DB_FILE", db_path),
+                mock.patch.dict(os.environ, canary_env, clear=False),
+            ):
+                bnl01_bot.init_db()
+                with bnl01_bot.sqlite3.connect(db_path) as connection:
+                    connection.executemany(
+                        """
+                        INSERT INTO conversations (
+                            user_id,user_name,guild_id,role,content,
+                            channel_name,channel_policy,channel_id,
+                            timestamp,message_id
+                        ) VALUES (?,?,?,?,?,?,?,?,?,?)
+                        """,
+                        (
+                            (
+                                100,
+                                "Jon",
+                                channel.guild.id,
+                                "user",
+                                (
+                                    "Idea A: a radio tower that wakes up "
+                                    "at midnight."
+                                ),
+                                channel.name,
+                                "sealed_test",
+                                channel.id,
+                                now.isoformat(),
+                                exact_message_id,
+                            ),
+                            (
+                                100,
+                                "Jon",
+                                channel.guild.id,
+                                "user",
+                                (
+                                    "Idea B: a vending machine that trades "
+                                    "memories."
+                                ),
+                                channel.name,
+                                "sealed_test",
+                                channel.id,
+                                now.isoformat(),
+                                competing_message_id,
+                            ),
+                        ),
+                    )
+                    reply_row_id = connection.execute(
+                        "SELECT id FROM conversations WHERE message_id=?",
+                        (exact_message_id,),
+                    ).fetchone()[0]
+                    connection.commit()
+
+                turn = bnl01_bot.BatchConversationTurn(
+                    turn.name,
+                    turn.content,
+                    turn.user_id,
+                    bnl01_bot.replace(
+                        addressing,
+                        reply_conversation_row_id=reply_row_id,
+                    ),
+                )
+                bnl01_bot._channel_buffers[channel.id].clear()
+                bnl01_bot._channel_buffers[channel.id].append(turn)
+
+                with (
+                    self._flush_runtime(channel.id, generate),
+                    mock.patch.object(
+                        bnl01_bot,
+                        "conversation_context_v2_enabled",
+                        return_value=True,
+                    ),
+                    mock.patch.object(
+                        bnl01_bot,
+                        "apply_guarded_response_regeneration",
+                        new=real_guard,
+                    ),
+                    mock.patch.object(
+                        bnl01_bot,
+                        "build_user_memory_context",
+                        return_value="",
+                    ),
+                    mock.patch.object(
+                        bnl01_bot,
+                        "memory_governance_live_enabled",
+                        return_value=False,
+                    ),
+                    mock.patch.object(
+                        bnl01_bot,
+                        "unified_response_assessment_shadow_enabled",
+                        return_value=False,
+                    ),
+                    mock.patch.object(
+                        bnl01_bot,
+                        "unified_moment_canary_enabled",
+                        return_value=False,
+                    ),
+                    mock.patch.object(
+                        bnl01_bot,
+                        "build_community_visual_basis",
+                        return_value=None,
+                    ),
+                    mock.patch.object(
+                        bnl01_bot,
+                        "render_community_visual_basis_for_prompt",
+                        return_value="",
+                    ),
+                    mock.patch.object(
+                        bnl01_bot,
+                        "maybe_generate_shared_brain_synthesis_canary",
+                        new=mock.AsyncMock(return_value=None),
+                    ),
+                ):
+                    await bnl01_bot._flush_channel_buffer(channel)
+
+        self.assertEqual(len(prompts), 2)
+        self.assertIn("exact Discord reply source", prompts[0])
+        self.assertIn("radio tower", prompts[0])
+        self.assertNotIn("vending machine", prompts[0])
+        self.assertIn(
+            "EXACT-REPLY GROUNDING CORRECTION REQUIRED",
+            prompts[1],
+        )
+        self.assertIn("radio tower", prompts[1])
+        self.assertNotIn("vending machine", prompts[1])
+        self.assertEqual(channel.sent, [repaired_response])
 
     async def test_batch_records_one_participant_neutral_unified_assessment_after_send(self):
         channel = self._channel(8137)
