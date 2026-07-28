@@ -1,3 +1,4 @@
+import asyncio
 import json
 import os
 import sqlite3
@@ -36,6 +37,31 @@ from bnl_unified_response_assessment import (
 
 
 NOW = datetime(2026, 7, 27, 15, 0, tzinfo=timezone.utc)
+
+
+def _seed_conversation_source_rows(conn, *rows):
+    """Create the source rows that governed Ledger decisions must retain."""
+
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS conversations (
+            id INTEGER PRIMARY KEY,
+            guild_id INTEGER,
+            role TEXT,
+            channel_id INTEGER,
+            channel_policy TEXT,
+            content TEXT
+        )
+        """
+    )
+    conn.executemany(
+        """
+        INSERT INTO conversations (
+            id,guild_id,role,channel_id,channel_policy,content
+        ) VALUES (?,?,?,?,?,?)
+        """,
+        rows,
+    )
 
 
 def _context_row(
@@ -120,6 +146,7 @@ def _addressing(
         bnl_name_state=state,
         bnl_name_value=value,
         bnl_name_requires_decision=requires_decision,
+        bnl_name_influence_mode="live",
         source_message_id=1234,
     )
 
@@ -233,6 +260,25 @@ class GovernedSelfNameTests(unittest.TestCase):
             db_path = os.path.join(temp_dir, "bnl.sqlite")
             with sqlite3.connect(db_path) as conn:
                 ensure_memory_ledger_schema(conn)
+                _seed_conversation_source_rows(
+                    conn,
+                    (
+                        1,
+                        77,
+                        "user",
+                        700,
+                        "public_home",
+                        "Can I call you Blue?",
+                    ),
+                    (
+                        2,
+                        77,
+                        "model",
+                        700,
+                        "public_home",
+                        "People can call me Blue.",
+                    ),
+                )
                 source = shadow_conversation_row(
                     conn,
                     row_id=1,
@@ -290,6 +336,13 @@ class GovernedSelfNameTests(unittest.TestCase):
                     "memory_ledger_shadow_enabled",
                     return_value=True,
                 ),
+                mock.patch.dict(
+                    os.environ,
+                    {
+                        "BNL_CONVERSATION_ORCHESTRATION_INFLUENCE_ENABLED": "1"
+                    },
+                    clear=False,
+                ),
             ):
                 bnl01_bot._bnl_self_name_cache.clear()
                 routed = bnl01_bot._resolve_bnl_self_name_address(
@@ -302,6 +355,41 @@ class GovernedSelfNameTests(unittest.TestCase):
     def test_correction_supersedes_acceptance_and_reconsideration_stays_possible(self):
         with sqlite3.connect(":memory:") as conn:
             ensure_memory_ledger_schema(conn)
+            _seed_conversation_source_rows(
+                conn,
+                (
+                    1,
+                    77,
+                    "user",
+                    700,
+                    "public_home",
+                    "Can I call you Blue?",
+                ),
+                (
+                    2,
+                    77,
+                    "user",
+                    700,
+                    "public_home",
+                    "Are you still okay with Blue?",
+                ),
+                (
+                    101,
+                    77,
+                    "model",
+                    700,
+                    "public_home",
+                    "People can call me Blue.",
+                ),
+                (
+                    102,
+                    77,
+                    "model",
+                    700,
+                    "public_home",
+                    "Don't call me Blue. Stick with BNL.",
+                ),
+            )
             for row_id, content in (
                 (1, "Can I call you Blue?"),
                 (2, "Are you still okay with Blue?"),
@@ -485,6 +573,13 @@ class GovernedSelfNameTests(unittest.TestCase):
                     "memory_ledger_shadow_enabled",
                     return_value=True,
                 ),
+                mock.patch.dict(
+                    os.environ,
+                    {
+                        "BNL_CONVERSATION_ORCHESTRATION_INFLUENCE_ENABLED": "1"
+                    },
+                    clear=False,
+                ),
             ):
                 result = bnl01_bot.persist_bnl_self_name_decision_after_send(
                     guild_id=77,
@@ -517,6 +612,25 @@ class GovernedSelfNameTests(unittest.TestCase):
             db_path = os.path.join(temp_dir, "bnl.sqlite")
             with sqlite3.connect(db_path) as conn:
                 ensure_memory_ledger_schema(conn)
+                _seed_conversation_source_rows(
+                    conn,
+                    (
+                        1,
+                        77,
+                        "user",
+                        701,
+                        "sealed_test",
+                        "Can I call you Test Lantern?",
+                    ),
+                    (
+                        2,
+                        77,
+                        "model",
+                        701,
+                        "sealed_test",
+                        "People can call me Test Lantern.",
+                    ),
+                )
                 shadow_conversation_row(
                     conn,
                     row_id=1,
@@ -595,6 +709,41 @@ class GovernedSelfNameTests(unittest.TestCase):
             db_path = os.path.join(temp_dir, "bnl.sqlite")
             with sqlite3.connect(db_path) as conn:
                 ensure_memory_ledger_schema(conn)
+                _seed_conversation_source_rows(
+                    conn,
+                    (
+                        1,
+                        77,
+                        "user",
+                        700,
+                        "public_home",
+                        "Can I call you Blue?",
+                    ),
+                    (
+                        2,
+                        77,
+                        "model",
+                        700,
+                        "public_home",
+                        "People can call me Blue.",
+                    ),
+                    (
+                        3,
+                        77,
+                        "user",
+                        701,
+                        "sealed_test",
+                        "Do you still want to be called Blue here?",
+                    ),
+                    (
+                        4,
+                        77,
+                        "model",
+                        701,
+                        "sealed_test",
+                        "Don't call me Blue here. Stick with BNL.",
+                    ),
+                )
                 rows = (
                     (
                         1,
@@ -921,6 +1070,7 @@ class StructuralReferentTests(unittest.TestCase):
             ),
             context_result=result,
             moment_situation=None,
+            influence_mode="live",
         )
         prompt = render_conversation_orchestration_prompt(decision)
 
@@ -1047,6 +1197,7 @@ class StructuralReferentTests(unittest.TestCase):
             addressings=(addressed,),
             context_result=result,
             moment_situation=None,
+            influence_mode="live",
         )
         prompt = render_conversation_orchestration_prompt(decision)
 
@@ -1092,6 +1243,7 @@ class OneMindCoordinatorTests(unittest.TestCase):
             ),
             context_result=None,
             moment_situation=None,
+            influence_mode="live",
         )
 
         self.assertEqual(decision.response_act, "answer")
@@ -1115,6 +1267,7 @@ class OneMindCoordinatorTests(unittest.TestCase):
             addressings=(_addressing(other_human=True),),
             context_result=None,
             moment_situation=None,
+            influence_mode="live",
         )
 
         self.assertEqual(blocked.response_act, "blocked")
@@ -1135,6 +1288,7 @@ class OneMindCoordinatorTests(unittest.TestCase):
             ),
             context_result=None,
             moment_situation=None,
+            influence_mode="live",
         )
 
         self.assertTrue(decision.should_generate)
@@ -1251,6 +1405,7 @@ class OneMindCoordinatorTests(unittest.TestCase):
             addressings=(),
             context_result=None,
             moment_situation=situation,
+            influence_mode="live",
         )
         self.assertEqual(decision.response_act, "observe")
         self.assertEqual(decision.moment_human_entry_count, 1)
@@ -1273,6 +1428,7 @@ class OneMindCoordinatorTests(unittest.TestCase):
                 moment_participant_overlap=True,
                 moment_human_entry_count=3,
                 moment_model_entry_count=1,
+                influence_mode="live",
             )
         )
         prompt = render_conversation_orchestration_prompt(decision)
@@ -1284,6 +1440,1435 @@ class OneMindCoordinatorTests(unittest.TestCase):
         self.assertIn("BNL replies=1", prompt)
         self.assertIn("current participant overlap=yes", prompt)
         self.assertIn("topic coherent=yes", prompt)
+
+
+class OrchestrationHardeningRegressionTests(unittest.TestCase):
+    """Merge blockers found by the independent review of PR #396."""
+
+    def setUp(self):
+        bnl01_bot._bnl_self_name_cache.clear()
+
+    def tearDown(self):
+        bnl01_bot._bnl_self_name_cache.clear()
+
+    def _seed_governed_self_name(self):
+        conn = sqlite3.connect(":memory:")
+        conn.execute(
+            """
+            CREATE TABLE conversations (
+                id INTEGER PRIMARY KEY,
+                guild_id INTEGER,
+                message_id INTEGER,
+                role TEXT,
+                channel_id INTEGER,
+                channel_policy TEXT,
+                content TEXT
+            )
+            """
+        )
+        conn.executemany(
+            """
+            INSERT INTO conversations (
+                id,guild_id,message_id,role,channel_id,channel_policy,content
+            ) VALUES (?,?,?,?,?,?,?)
+            """,
+            (
+                (1, 77, 8001, "user", 700, "public_home", "proposal"),
+                (2, 77, 9001, "model", 700, "public_home", "acceptance"),
+            ),
+        )
+        ensure_memory_ledger_schema(conn)
+        for row_id, role, content, message_id in (
+            (1, "user", "proposal", 8001),
+            (2, "model", "acceptance", 9001),
+        ):
+            shadow_conversation_row(
+                conn,
+                row_id=row_id,
+                user_id=44 if role == "user" else 0,
+                user_name="member" if role == "user" else "BNL-01",
+                guild_id=77,
+                role=role,
+                content=content,
+                channel_name="home",
+                channel_policy="public_home",
+                channel_id=700,
+                message_id=message_id,
+                route_mode="normal_chat",
+                observed_at=NOW.isoformat(),
+            )
+        decision = record_bnl_self_name_decision(
+            conn,
+            guild_id=77,
+            name="Blue",
+            decision="accepted",
+            source_conversation_row_id=1,
+            decision_conversation_row_id=2,
+            source_message_id=8001,
+            channel_id=700,
+            channel_name="home",
+            channel_policy="public_home",
+            route_mode="normal_chat",
+            response_digest="c" * 64,
+            observed_at=(NOW + timedelta(seconds=1)).isoformat(),
+        )
+        conn.commit()
+        return conn, decision
+
+    def test_exact_reply_identity_is_resolved_without_linguistic_pointer(self):
+        result = assemble_conversation_context_v2(
+            [
+                _context_row(
+                    1,
+                    "The exact source BNL was asked to revisit.",
+                    user_name="Writer",
+                    minutes=2,
+                    message_id=4001,
+                )
+            ],
+            _context_request(
+                "BNL, thoughts?",
+                referenced_message_ids=frozenset({4001}),
+            ),
+        )
+
+        self.assertEqual(result.referent_status, "resolved")
+        self.assertEqual(result.referent_reason, "discord_reply_source")
+        self.assertEqual(result.referent_selected_row_ids, (1,))
+
+    def test_multiple_exact_reply_sources_remain_ambiguous(self):
+        result = assemble_conversation_context_v2(
+            [
+                _context_row(
+                    1,
+                    "First exact reply source.",
+                    user_name="First",
+                    minutes=3,
+                    message_id=4001,
+                ),
+                _context_row(
+                    2,
+                    "Second exact reply source.",
+                    user_name="Second",
+                    minutes=2,
+                    message_id=4002,
+                ),
+            ],
+            _context_request(
+                "BNL, thoughts?",
+                referenced_message_ids=frozenset({4001, 4002}),
+            ),
+        )
+
+        self.assertEqual(result.referent_status, "ambiguous")
+        self.assertEqual(result.referent_reason, "multiple_discord_reply_sources")
+        self.assertEqual(result.referent_candidate_count, 2)
+        self.assertEqual(result.referent_selected_row_ids, ())
+
+    def test_exact_reply_source_outranks_general_recency_without_widening_context(self):
+        result = assemble_conversation_context_v2(
+            [
+                _context_row(
+                    1,
+                    "The exact older source named by the Discord reply.",
+                    user_name="Writer",
+                    minutes=90,
+                    message_id=4001,
+                ),
+                _context_row(
+                    2,
+                    "A newer but unrelated room contribution.",
+                    user_name="Other",
+                    minutes=2,
+                    message_id=4002,
+                ),
+            ],
+            _context_request(
+                "BNL, thoughts?",
+                referenced_message_ids=frozenset({4001}),
+            ),
+        )
+
+        self.assertEqual(result.referent_status, "resolved")
+        self.assertEqual(result.referent_selected_row_ids, (1,))
+        self.assertIn("exact older source", result.rendered_context)
+        self.assertNotIn("newer but unrelated", result.rendered_context)
+
+    def test_exact_reply_source_is_loaded_beyond_general_row_limit(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = os.path.join(temp_dir, "bnl.sqlite")
+            with mock.patch.object(bnl01_bot, "DB_FILE", db_path):
+                bnl01_bot.init_db()
+                with sqlite3.connect(db_path) as conn:
+                    conn.execute(
+                        """
+                        INSERT INTO conversations (
+                            user_id,user_name,guild_id,role,content,
+                            channel_name,channel_policy,channel_id,
+                            timestamp,message_id
+                        ) VALUES (?,?,?,?,?,?,?,?,?,?)
+                        """,
+                        (
+                            44,
+                            "Writer",
+                            77,
+                            "user",
+                            "Exact source outside the general row limit.",
+                            "home",
+                            "public_home",
+                            700,
+                            (NOW - timedelta(hours=2)).isoformat(),
+                            4001,
+                        ),
+                    )
+                    for index in range(3):
+                        conn.execute(
+                            """
+                            INSERT INTO conversations (
+                                user_id,user_name,guild_id,role,content,
+                                channel_name,channel_policy,channel_id,
+                                timestamp,message_id
+                            ) VALUES (?,?,?,?,?,?,?,?,?,?)
+                            """,
+                            (
+                                55,
+                                "Other",
+                                77,
+                                "user",
+                                f"Newer unrelated row {index}.",
+                                "home",
+                                "public_home",
+                                700,
+                                (NOW - timedelta(minutes=index + 1)).isoformat(),
+                                5000 + index,
+                            ),
+                        )
+                    conn.commit()
+
+                rows = bnl01_bot.get_conversation_context_v2_rows(
+                    77,
+                    limit=1,
+                    current_user_id=44,
+                    channel_id=700,
+                    channel_name="home",
+                    channel_policy="public_home",
+                    referenced_message_ids={4001},
+                )
+
+        self.assertIn(4001, {row["message_id"] for row in rows})
+
+    def test_complete_current_payload_outranks_generic_demonstratives(self):
+        rows = [
+            _context_row(
+                1,
+                "An unrelated older answer about another deployment.",
+                user_name="BNL-01",
+                role="model",
+                minutes=2,
+            ),
+            _context_row(
+                2,
+                "An unrelated older idea about moving a release.",
+                user_name="Member",
+                minutes=1,
+            ),
+        ]
+        question = assemble_conversation_context_v2(
+            rows,
+            _context_request(
+                "BNL, can you answer this question: is the deployment ready?"
+            ),
+        )
+        idea = assemble_conversation_context_v2(
+            rows,
+            _context_request(
+                "BNL, what do you think about this idea: "
+                "We should move the meeting?"
+            ),
+        )
+
+        self.assertEqual(question.referent_status, "not_requested")
+        self.assertEqual(idea.referent_status, "not_requested")
+
+    def test_self_name_request_parser_is_typed_and_bounded(self):
+        classify = bnl01_bot.classify_bnl_self_name_request
+
+        false_positive_one = classify("Okay cool, thanks.")
+        false_positive_two = classify("Okay perfect, that works.")
+        explicit = classify("BNL, can I call you Blue?")
+        contextual = classify("Can I call you Blue when we are joking?")
+        temporal = classify("Can I call you Blue tomorrow?")
+        short_form = classify("Can I call you Blue for short?")
+        revoke = classify("Can we stop calling you Blue?")
+        correction = classify(
+            "Stop calling you Blue and call you Circuit."
+        )
+
+        self.assertEqual(false_positive_one.action, "none")
+        self.assertEqual(false_positive_two.action, "none")
+        self.assertEqual((explicit.action, explicit.name), ("propose", "Blue"))
+        self.assertEqual(
+            (contextual.action, contextual.name),
+            ("propose", "Blue"),
+        )
+        self.assertEqual((temporal.action, temporal.name), ("propose", "Blue"))
+        self.assertEqual(
+            (short_form.action, short_form.name),
+            ("propose", "Blue"),
+        )
+        self.assertEqual((revoke.action, revoke.name), ("revoke", "Blue"))
+        self.assertEqual(
+            (
+                correction.action,
+                correction.prior_name,
+                correction.name,
+            ),
+            ("correct", "Blue", "Circuit"),
+        )
+
+    def test_self_name_response_decision_is_action_aware(self):
+        self.assertEqual(
+            bnl01_bot.infer_bnl_self_name_decision(
+                "Blue",
+                "Never call me Blue. Stick with BNL.",
+                request_action="propose",
+            ),
+            "denied",
+        )
+        self.assertEqual(
+            bnl01_bot.infer_bnl_self_name_decision(
+                "Blue",
+                "I don't think you should call me Blue.",
+                request_action="propose",
+            ),
+            "denied",
+        )
+        self.assertEqual(
+            bnl01_bot.infer_bnl_self_name_decision(
+                "Blue",
+                "Yeah, stop using Blue for me. Stick with BNL.",
+                request_action="revoke",
+            ),
+            "revoked",
+        )
+
+    def test_self_name_correction_rolls_back_as_one_lifecycle_transaction(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = os.path.join(temp_dir, "bnl.sqlite")
+            response = (
+                "I'll stop using Blue. People may call me Circuit."
+            )
+            with (
+                mock.patch.object(bnl01_bot, "DB_FILE", db_path),
+                mock.patch.dict(
+                    os.environ,
+                    {
+                        "BNL_MEMORY_LEDGER_SHADOW_ENABLED": "1",
+                        "BNL_CONVERSATION_ORCHESTRATION_INFLUENCE_ENABLED": "1",
+                    },
+                    clear=False,
+                ),
+            ):
+                bnl01_bot.init_db()
+                bnl01_bot.save_user_message(
+                    44,
+                    "Member",
+                    77,
+                    "Stop calling you Blue and call you Circuit.",
+                    channel_name="home",
+                    channel_policy="public_home",
+                    channel_id=700,
+                    message_id=8001,
+                )
+                bnl01_bot.save_model_message(
+                    44,
+                    77,
+                    response,
+                    channel_name="home",
+                    channel_policy="public_home",
+                    channel_id=700,
+                    discord_message_ids=(9001,),
+                )
+                addressing = bnl01_bot.DiscordTurnAddressing(
+                    speaker="Member",
+                    explicit_tag_recipients=(),
+                    reply_target="none",
+                    explicitly_mentions_bnl=False,
+                    reply_targets_bnl=False,
+                    directly_targets_bnl=False,
+                    targets_other_human=False,
+                    plain_text_names_bnl=True,
+                    bnl_name_state="correction",
+                    bnl_name_value="Circuit",
+                    bnl_name_requires_decision=True,
+                    bnl_name_action="correct",
+                    bnl_name_prior_value="Blue",
+                    bnl_name_influence_mode="live",
+                    source_message_id=8001,
+                )
+                original_record = (
+                    bnl01_bot.record_bnl_self_name_decision
+                )
+
+                def fail_second_decision(conn, **kwargs):
+                    if kwargs.get("name") == "Circuit":
+                        return bnl01_bot.LedgerWriteResult(
+                            outcome="skipped",
+                            reason_code="injected_second_write_failure",
+                            guild_id=77,
+                        )
+                    return original_record(conn, **kwargs)
+
+                with mock.patch.object(
+                    bnl01_bot,
+                    "record_bnl_self_name_decision",
+                    side_effect=fail_second_decision,
+                ):
+                    result = (
+                        bnl01_bot.persist_bnl_self_name_decision_after_send(
+                            guild_id=77,
+                            addressing=addressing,
+                            response=response,
+                            channel_id=700,
+                            channel_name="home",
+                            channel_policy="public_home",
+                            route_mode="normal_chat",
+                        )
+                    )
+
+                self.assertIsNone(result)
+                with sqlite3.connect(db_path) as conn:
+                    derived_count = conn.execute(
+                        """
+                        SELECT COUNT(*)
+                        FROM memory_ledger_entries
+                        WHERE source_table='bnl_self_name_decisions'
+                        """
+                    ).fetchone()[0]
+                self.assertEqual(derived_count, 0)
+
+                success = (
+                    bnl01_bot.persist_bnl_self_name_decision_after_send(
+                        guild_id=77,
+                        addressing=addressing,
+                        response=response,
+                        channel_id=700,
+                        channel_name="home",
+                        channel_policy="public_home",
+                        route_mode="normal_chat",
+                    )
+                )
+                self.assertIn(
+                    success.outcome,
+                    {"inserted", "deduplicated"},
+                )
+                with sqlite3.connect(db_path) as conn:
+                    states = {
+                        record.normalized_name: record.decision
+                        for record in current_bnl_self_name_records(
+                            conn,
+                            guild_id=77,
+                        )
+                    }
+                self.assertEqual(
+                    states,
+                    {"blue": "revoked", "circuit": "accepted"},
+                )
+
+    def test_self_name_authority_fails_closed_when_provenance_is_removed(self):
+        with sqlite3.connect(":memory:") as conn:
+            conn.execute(
+                """
+                CREATE TABLE conversations (
+                    id INTEGER PRIMARY KEY,
+                    guild_id INTEGER,
+                    message_id INTEGER,
+                    role TEXT,
+                    channel_id INTEGER,
+                    channel_policy TEXT,
+                    content TEXT
+                )
+                """
+            )
+            conn.executemany(
+                """
+                INSERT INTO conversations (
+                    id,guild_id,message_id,role,channel_id,channel_policy,content
+                ) VALUES (?,?,?,?,?,?,?)
+                """,
+                (
+                    (
+                        1,
+                        77,
+                        8001,
+                        "user",
+                        700,
+                        "public_home",
+                        "Can I call you Blue?",
+                    ),
+                    (
+                        2,
+                        77,
+                        9001,
+                        "model",
+                        700,
+                        "public_home",
+                        "People can call me Blue.",
+                    ),
+                ),
+            )
+            ensure_memory_ledger_schema(conn)
+            for row_id, role, content, message_id in (
+                (1, "user", "Can I call you Blue?", 8001),
+                (2, "model", "People can call me Blue.", 9001),
+            ):
+                shadow_conversation_row(
+                    conn,
+                    row_id=row_id,
+                    user_id=44 if role == "user" else 0,
+                    user_name="member" if role == "user" else "BNL-01",
+                    guild_id=77,
+                    role=role,
+                    content=content,
+                    channel_name="home",
+                    channel_policy="public_home",
+                    channel_id=700,
+                    message_id=message_id,
+                    route_mode="normal_chat",
+                    observed_at=NOW.isoformat(),
+                )
+            decision = record_bnl_self_name_decision(
+                conn,
+                guild_id=77,
+                name="Blue",
+                decision="accepted",
+                source_conversation_row_id=1,
+                decision_conversation_row_id=2,
+                source_message_id=8001,
+                channel_id=700,
+                channel_name="home",
+                channel_policy="public_home",
+                route_mode="normal_chat",
+                response_digest="a" * 64,
+                observed_at=(NOW + timedelta(seconds=1)).isoformat(),
+            )
+            self.assertEqual(
+                len(current_bnl_self_name_records(conn, guild_id=77)),
+                1,
+            )
+
+            conn.execute(
+                """
+                DELETE FROM memory_ledger_lineage
+                WHERE entry_id=? AND lineage_type='derived_from'
+                """,
+                (decision.entry_id,),
+            )
+            conn.commit()
+
+            self.assertEqual(
+                current_bnl_self_name_records(conn, guild_id=77),
+                (),
+            )
+
+    def test_self_name_authority_fails_closed_when_source_is_deleted(self):
+        with sqlite3.connect(":memory:") as conn:
+            conn.execute(
+                """
+                CREATE TABLE conversations (
+                    id INTEGER PRIMARY KEY,
+                    guild_id INTEGER,
+                    message_id INTEGER,
+                    role TEXT,
+                    channel_id INTEGER,
+                    channel_policy TEXT,
+                    content TEXT
+                )
+                """
+            )
+            conn.executemany(
+                """
+                INSERT INTO conversations (
+                    id,guild_id,message_id,role,channel_id,channel_policy,content
+                ) VALUES (?,?,?,?,?,?,?)
+                """,
+                (
+                    (1, 77, 8001, "user", 700, "public_home", "proposal"),
+                    (2, 77, 9001, "model", 700, "public_home", "acceptance"),
+                ),
+            )
+            ensure_memory_ledger_schema(conn)
+            for row_id, role, content, message_id in (
+                (1, "user", "proposal", 8001),
+                (2, "model", "acceptance", 9001),
+            ):
+                shadow_conversation_row(
+                    conn,
+                    row_id=row_id,
+                    user_id=44 if role == "user" else 0,
+                    user_name="member" if role == "user" else "BNL-01",
+                    guild_id=77,
+                    role=role,
+                    content=content,
+                    channel_name="home",
+                    channel_policy="public_home",
+                    channel_id=700,
+                    message_id=message_id,
+                    route_mode="normal_chat",
+                    observed_at=NOW.isoformat(),
+                )
+            record_bnl_self_name_decision(
+                conn,
+                guild_id=77,
+                name="Blue",
+                decision="accepted",
+                source_conversation_row_id=1,
+                decision_conversation_row_id=2,
+                source_message_id=8001,
+                channel_id=700,
+                channel_name="home",
+                channel_policy="public_home",
+                route_mode="normal_chat",
+                response_digest="b" * 64,
+                observed_at=(NOW + timedelta(seconds=1)).isoformat(),
+            )
+            conn.execute("DELETE FROM conversations WHERE id=1")
+            conn.commit()
+
+            self.assertEqual(
+                current_bnl_self_name_records(conn, guild_id=77),
+                (),
+            )
+
+    def test_self_name_authority_fails_closed_without_conversation_store(self):
+        conn, _decision = self._seed_governed_self_name()
+        try:
+            self.assertEqual(
+                len(current_bnl_self_name_records(conn, guild_id=77)),
+                1,
+            )
+            conn.execute("DROP TABLE conversations")
+            conn.commit()
+            self.assertEqual(
+                current_bnl_self_name_records(conn, guild_id=77),
+                (),
+            )
+        finally:
+            conn.close()
+
+    def test_self_name_authority_tracks_root_lifecycle_and_visibility(self):
+        conn, _decision = self._seed_governed_self_name()
+        try:
+            roots = conn.execute(
+                """
+                SELECT entry_id
+                FROM memory_ledger_entries
+                WHERE guild_id=77 AND source_table='conversations'
+                ORDER BY source_row_id
+                """
+            ).fetchall()
+            self.assertEqual(
+                len(current_bnl_self_name_records(conn, guild_id=77)),
+                1,
+            )
+
+            conn.execute(
+                """
+                UPDATE memory_ledger_entries
+                SET lifecycle_status='retracted'
+                WHERE entry_id=?
+                """,
+                (roots[0][0],),
+            )
+            conn.commit()
+            self.assertEqual(
+                current_bnl_self_name_records(conn, guild_id=77),
+                (),
+            )
+        finally:
+            conn.close()
+
+        conn, _decision = self._seed_governed_self_name()
+        try:
+            user_root = conn.execute(
+                """
+                SELECT entry_id
+                FROM memory_ledger_entries
+                WHERE guild_id=77 AND source_table='conversations'
+                  AND source_role='user'
+                """
+            ).fetchone()[0]
+            conn.execute(
+                """
+                UPDATE memory_ledger_entries
+                SET visibility='sealed_test'
+                WHERE entry_id=?
+                """,
+                (user_root,),
+            )
+            conn.commit()
+            self.assertEqual(
+                current_bnl_self_name_records(conn, guild_id=77),
+                (),
+            )
+        finally:
+            conn.close()
+
+    def test_self_name_lookup_does_not_reuse_stale_positive_cache(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = os.path.join(temp_dir, "bnl.sqlite")
+            conn, _decision = self._seed_governed_self_name()
+            try:
+                with sqlite3.connect(db_path) as persisted:
+                    conn.backup(persisted)
+            finally:
+                conn.close()
+            with (
+                mock.patch.object(bnl01_bot, "DB_FILE", db_path),
+                mock.patch.object(
+                    bnl01_bot,
+                    "memory_ledger_shadow_enabled",
+                    return_value=True,
+                ),
+            ):
+                first = bnl01_bot._load_bnl_self_name_records(
+                    77,
+                    "public_home",
+                )
+                self.assertEqual(len(first), 1)
+                bnl01_bot._bnl_self_name_cache[
+                    (77, ("public_home",))
+                ] = (9999999999.0, first)
+                with sqlite3.connect(db_path) as persisted:
+                    persisted.execute(
+                        """
+                        UPDATE memory_ledger_entries
+                        SET lifecycle_status='retracted'
+                        WHERE source_table='conversations'
+                          AND source_role='user'
+                        """
+                    )
+                    persisted.commit()
+                self.assertEqual(
+                    bnl01_bot._load_bnl_self_name_records(
+                        77,
+                        "public_home",
+                    ),
+                    (),
+                )
+
+    def test_orchestration_influence_requires_its_own_fail_closed_gate(self):
+        env_names = {
+            "BNL_CONVERSATION_ORCHESTRATION_INFLUENCE_ENABLED": "0",
+            "BNL_CONVERSATION_ORCHESTRATION_SEALED_CANARY_ENABLED": "0",
+            "BNL_CONVERSATION_ORCHESTRATION_SEALED_CANARY_GUILD_IDS": "",
+            "BNL_CONVERSATION_ORCHESTRATION_SEALED_CANARY_CHANNEL_IDS": "",
+            "BNL_MEMORY_LEDGER_SHADOW_ENABLED": "1",
+            "BNL_MOMENT_ENGINE_SHADOW_ENABLED": "1",
+        }
+        with mock.patch.dict(os.environ, env_names, clear=False):
+            self.assertEqual(
+                bnl01_bot.conversation_orchestration_influence_mode(
+                    guild_id=77,
+                    channel_id=700,
+                    channel_policy="public_home",
+                ),
+                "off",
+            )
+            self.assertEqual(
+                bnl01_bot.conversation_orchestration_influence_mode(
+                    guild_id=77,
+                    channel_id=700,
+                    channel_policy="sealed_test",
+                ),
+                "off",
+            )
+
+    def test_sealed_canary_requires_exact_guild_and_channel_scope(self):
+        with mock.patch.dict(
+            os.environ,
+            {
+                "BNL_CONVERSATION_ORCHESTRATION_INFLUENCE_ENABLED": "0",
+                "BNL_CONVERSATION_ORCHESTRATION_SEALED_CANARY_ENABLED": "1",
+                "BNL_CONVERSATION_ORCHESTRATION_SEALED_CANARY_GUILD_IDS": "77",
+                "BNL_CONVERSATION_ORCHESTRATION_SEALED_CANARY_CHANNEL_IDS": "700",
+            },
+            clear=False,
+        ):
+            self.assertEqual(
+                bnl01_bot.conversation_orchestration_influence_mode(
+                    guild_id=77,
+                    channel_id=700,
+                    channel_policy="sealed_test",
+                ),
+                "sealed_canary",
+            )
+            self.assertEqual(
+                bnl01_bot.conversation_orchestration_influence_mode(
+                    guild_id=77,
+                    channel_id=701,
+                    channel_policy="sealed_test",
+                ),
+                "off",
+            )
+            self.assertEqual(
+                bnl01_bot.conversation_orchestration_influence_mode(
+                    guild_id=77,
+                    channel_id=700,
+                    channel_policy="public_home",
+                ),
+                "off",
+            )
+
+    def test_orchestration_gate_re_evaluates_and_rolls_back_fail_closed(self):
+        env = {
+            "BNL_CONVERSATION_ORCHESTRATION_INFLUENCE_ENABLED": "1",
+            "BNL_CONVERSATION_ORCHESTRATION_SEALED_CANARY_ENABLED": "0",
+            "BNL_CONVERSATION_ORCHESTRATION_SEALED_CANARY_GUILD_IDS": "",
+            "BNL_CONVERSATION_ORCHESTRATION_SEALED_CANARY_CHANNEL_IDS": "",
+        }
+        self.assertEqual(
+            bnl01_bot.conversation_orchestration_influence_mode(
+                guild_id=77,
+                channel_id=700,
+                channel_policy="public_home",
+                environ=env,
+            ),
+            "live",
+        )
+        env["BNL_CONVERSATION_ORCHESTRATION_INFLUENCE_ENABLED"] = "0"
+        self.assertEqual(
+            bnl01_bot.conversation_orchestration_influence_mode(
+                guild_id=77,
+                channel_id=700,
+                channel_policy="public_home",
+                environ=env,
+            ),
+            "off",
+        )
+
+        env.update(
+            {
+                "BNL_CONVERSATION_ORCHESTRATION_SEALED_CANARY_ENABLED": "1",
+                "BNL_CONVERSATION_ORCHESTRATION_SEALED_CANARY_GUILD_IDS": "77",
+                "BNL_CONVERSATION_ORCHESTRATION_SEALED_CANARY_CHANNEL_IDS": "700",
+            }
+        )
+        self.assertEqual(
+            bnl01_bot.conversation_orchestration_influence_mode(
+                guild_id=77,
+                channel_id=700,
+                channel_policy="sealed_test",
+                environ=env,
+            ),
+            "sealed_canary",
+        )
+        env["BNL_CONVERSATION_ORCHESTRATION_SEALED_CANARY_ENABLED"] = "0"
+        self.assertEqual(
+            bnl01_bot.conversation_orchestration_influence_mode(
+                guild_id=77,
+                channel_id=700,
+                channel_policy="sealed_test",
+                environ=env,
+            ),
+            "off",
+        )
+
+    def test_supporting_owner_states_are_typed_and_relationship_read_is_offloaded(
+        self,
+    ):
+        relation = (12, 0.8, "trusted", "warm", "topic", NOW.isoformat())
+
+        async def run():
+            with (
+                mock.patch.object(
+                    bnl01_bot.os.path,
+                    "exists",
+                    return_value=True,
+                ),
+                mock.patch(
+                    "bnl01_bot.asyncio.to_thread",
+                    new=mock.AsyncMock(return_value=relation),
+                ) as to_thread,
+                mock.patch.object(
+                    bnl01_bot,
+                    "_canon_relevant_to_response",
+                    return_value=True,
+                ),
+            ):
+                states = await bnl01_bot.conversation_supporting_owner_states(
+                    guild_id=77,
+                    channel_policy="public_home",
+                    current_text="A canon-sensitive request.",
+                    participant_user_ids=(44,),
+                    addressings=(
+                        _addressing(
+                            bnl=True,
+                            state="accepted",
+                            value="Blue",
+                        ),
+                    ),
+                )
+                return states, to_thread
+
+        states, to_thread = asyncio.run(run())
+        self.assertEqual(
+            states["governed_memory_state"],
+            "routing_self_name:accepted",
+        )
+        self.assertEqual(states["relationship_state"], "tone:trusted:warm")
+        self.assertEqual(states["canon_state"], "applicable_content_owner")
+        self.assertEqual(
+            states["source_control_state"],
+            "route_and_visibility_applied",
+        )
+        to_thread.assert_awaited_once_with(
+            bnl01_bot._relationship_state_for_turn,
+            44,
+            77,
+        )
+
+    def test_supporting_owner_states_cannot_become_a_second_response_veto(self):
+        baseline = coordinate_conversation_turn(
+            ConversationOrchestrationInput(
+                route_allowed=True,
+                engagement_decision="answer",
+                engagement_reason="request",
+            )
+        )
+        with_owner_states = coordinate_conversation_turn(
+            ConversationOrchestrationInput(
+                route_allowed=True,
+                engagement_decision="answer",
+                engagement_reason="request",
+                governed_memory_state="content_memory_not_routing_authority",
+                relationship_state="tone:trusted:warm",
+                canon_state="applicable_content_owner",
+                source_control_state="route_and_visibility_applied",
+            )
+        )
+
+        self.assertEqual(
+            with_owner_states.response_act,
+            baseline.response_act,
+        )
+        self.assertEqual(
+            with_owner_states.reason,
+            baseline.reason,
+        )
+        self.assertEqual(
+            with_owner_states.relationship_state,
+            "tone:trusted:warm",
+        )
+        self.assertEqual(
+            with_owner_states.canon_state,
+            "applicable_content_owner",
+        )
+
+    def test_optional_direct_context_failure_fails_closed(self):
+        result_out = {}
+
+        async def run():
+            with mock.patch.object(
+                bnl01_bot,
+                "build_room_first_direct_context",
+                side_effect=sqlite3.OperationalError("locked"),
+            ):
+                return await (
+                    bnl01_bot.build_room_first_direct_context_async(
+                        77,
+                        700,
+                        "home",
+                        "public_home",
+                        "Member",
+                        context_result_out=result_out,
+                    )
+                )
+
+        self.assertEqual(asyncio.run(run()), "")
+        self.assertIsNone(result_out["result"])
+
+    def test_optional_batch_context_failure_cannot_veto_direct_address(self):
+        direct_addressing = bnl01_bot.DiscordTurnAddressing(
+            **{
+                **_addressing().__dict__,
+                "explicitly_mentions_bnl": True,
+                "directly_targets_bnl": True,
+            }
+        )
+        item = bnl01_bot.BatchConversationTurn(
+            "Member",
+            "Please answer.",
+            44,
+            direct_addressing,
+        )
+        active_packet = {
+            "items": (item,),
+            "addressed_to_bot": True,
+            "has_request_payload": False,
+            "payload_items": (),
+        }
+
+        async def run():
+            with (
+                mock.patch.dict(
+                    os.environ,
+                    {
+                        "BNL_CONVERSATION_ORCHESTRATION_INFLUENCE_ENABLED": "1",
+                    },
+                    clear=False,
+                ),
+                mock.patch.object(
+                    bnl01_bot,
+                    "conversation_context_v2_enabled",
+                    return_value=True,
+                ),
+                mock.patch.object(
+                    bnl01_bot,
+                    "build_active_batch_conversation_context_v2_prompt",
+                    side_effect=sqlite3.OperationalError("locked"),
+                ),
+                mock.patch.object(
+                    bnl01_bot,
+                    "_recent_moment_situation_for_turn_async",
+                    new=mock.AsyncMock(return_value=None),
+                ),
+                mock.patch.object(
+                    bnl01_bot,
+                    "conversation_supporting_owner_states",
+                    new=mock.AsyncMock(
+                        return_value={
+                            "governed_memory_state": (
+                                "content_memory_not_routing_authority"
+                            ),
+                            "relationship_state": "owner_unavailable",
+                            "canon_state": "not_relevant",
+                            "source_control_state": (
+                                "route_and_visibility_applied"
+                            ),
+                        }
+                    ),
+                ),
+            ):
+                return await bnl01_bot.build_active_batch_orchestration(
+                    guild_id=77,
+                    channel_id=700,
+                    channel_name="home",
+                    channel_policy="public_home",
+                    first_uid=44,
+                    collapsed_items=(item,),
+                    unique_user_ids=(44,),
+                    active_packet=active_packet,
+                    engagement_decision="observe",
+                    engagement_reason="no_response_needed",
+                )
+
+        state = asyncio.run(run())
+        self.assertIsNone(state["context_result"])
+        self.assertEqual(state["recent_room_prompt"], "")
+        self.assertEqual(state["decision"].response_act, "answer")
+        self.assertTrue(state["decision"].response_required)
+
+    def test_model_discord_message_ids_are_persisted_as_reply_identity(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = os.path.join(temp_dir, "bnl.sqlite")
+            with mock.patch.object(bnl01_bot, "DB_FILE", db_path):
+                bnl01_bot.init_db()
+                bnl01_bot.save_model_message(
+                    44,
+                    77,
+                    "A delivered BNL response.",
+                    channel_name="home",
+                    channel_policy="public_home",
+                    channel_id=700,
+                    discord_message_ids=(9001, 9002),
+                )
+                with sqlite3.connect(db_path) as conn:
+                    model_row = conn.execute(
+                        """
+                        SELECT id,message_id
+                        FROM conversations
+                        WHERE guild_id=77 AND role='model'
+                        """
+                    ).fetchone()
+                    links = conn.execute(
+                        """
+                        SELECT message_id
+                        FROM conversation_discord_message_links
+                        WHERE conversation_row_id=?
+                        ORDER BY message_id
+                        """,
+                        (model_row[0],),
+                    ).fetchall()
+
+            self.assertEqual(model_row[1], 9001)
+            self.assertEqual(links, [(9001,), (9002,)])
+
+    def test_unresolved_discord_reference_uses_persisted_model_identity(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = os.path.join(temp_dir, "bnl.sqlite")
+            with mock.patch.object(bnl01_bot, "DB_FILE", db_path):
+                bnl01_bot.init_db()
+                bnl01_bot.save_model_message(
+                    44,
+                    77,
+                    "A delivered BNL response.",
+                    channel_name="home",
+                    channel_policy="public_home",
+                    channel_id=700,
+                    discord_message_ids=(9001,),
+                )
+                message = SimpleNamespace(
+                    id=9100,
+                    content="Thoughts?",
+                    author=SimpleNamespace(display_name="Member"),
+                    guild=SimpleNamespace(id=77, members=[]),
+                    channel=SimpleNamespace(
+                        id=700,
+                        name="home",
+                        category=None,
+                        guild=SimpleNamespace(id=77),
+                    ),
+                    raw_mentions=[],
+                    mentions=[],
+                    reference=SimpleNamespace(
+                        resolved=None,
+                        message_id=9001,
+                    ),
+                )
+                with (
+                    mock.patch.object(
+                        bnl01_bot,
+                        "_load_bnl_self_name_records",
+                        return_value=(),
+                    ),
+                    mock.patch.object(
+                        bnl01_bot.client._connection,
+                        "user",
+                        SimpleNamespace(id=999, display_name="BNL-01"),
+                    ),
+                ):
+                    addressing = bnl01_bot.resolve_discord_turn_addressing(
+                        message
+                    )
+
+            self.assertEqual(addressing.reply_message_id, 9001)
+            self.assertTrue(addressing.reply_targets_bnl)
+            self.assertTrue(addressing.directly_targets_bnl)
+            self.assertGreater(addressing.reply_conversation_row_id, 0)
+
+    def test_unresolved_discord_reference_to_member_stays_third_party_only(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = os.path.join(temp_dir, "bnl.sqlite")
+            with mock.patch.object(bnl01_bot, "DB_FILE", db_path):
+                bnl01_bot.init_db()
+                bnl01_bot.save_user_message(
+                    55,
+                    "Prior Member",
+                    77,
+                    "A member contribution.",
+                    channel_name="home",
+                    channel_policy="public_home",
+                    channel_id=700,
+                    message_id=9003,
+                )
+                message = SimpleNamespace(
+                    id=9100,
+                    content="What do you think?",
+                    author=SimpleNamespace(display_name="Current Member"),
+                    guild=SimpleNamespace(id=77, members=[]),
+                    channel=SimpleNamespace(
+                        id=700,
+                        name="home",
+                        category=None,
+                        guild=SimpleNamespace(id=77),
+                    ),
+                    raw_mentions=[],
+                    mentions=[],
+                    reference=SimpleNamespace(
+                        resolved=None,
+                        message_id=9003,
+                    ),
+                )
+                with (
+                    mock.patch.object(
+                        bnl01_bot,
+                        "_load_bnl_self_name_records",
+                        return_value=(),
+                    ),
+                    mock.patch.object(
+                        bnl01_bot.client._connection,
+                        "user",
+                        SimpleNamespace(id=999, display_name="BNL-01"),
+                    ),
+                ):
+                    addressing = bnl01_bot.resolve_discord_turn_addressing(
+                        message
+                    )
+
+            self.assertEqual(addressing.reply_target, "Prior Member")
+            self.assertFalse(addressing.reply_targets_bnl)
+            self.assertFalse(addressing.directly_targets_bnl)
+            self.assertTrue(addressing.targets_other_human)
+            self.assertTrue(addressing.third_party_only)
+
+    def test_live_address_resolution_offloads_database_reads(self):
+        sentinel = _addressing()
+
+        async def run():
+            with (
+                mock.patch(
+                    "bnl01_bot.asyncio.to_thread",
+                    new=mock.AsyncMock(return_value=sentinel),
+                ) as to_thread,
+            ):
+                result = await bnl01_bot.resolve_discord_turn_addressing_async(
+                    SimpleNamespace()
+                )
+                return result, to_thread
+
+        result, to_thread = asyncio.run(run())
+        self.assertIs(result, sentinel)
+        to_thread.assert_awaited_once()
+
+    def test_disabled_gate_skips_governed_name_ledger_read(self):
+        message = SimpleNamespace(
+            id=9100,
+            content="BNL, thoughts?",
+            author=SimpleNamespace(display_name="Member"),
+            guild=SimpleNamespace(id=77, members=[]),
+            channel=SimpleNamespace(
+                id=700,
+                name="home",
+                category=None,
+                guild=SimpleNamespace(id=77),
+            ),
+            raw_mentions=[],
+            mentions=[],
+            reference=None,
+        )
+        with (
+            mock.patch.dict(
+                os.environ,
+                {
+                    "BNL_CONVERSATION_ORCHESTRATION_INFLUENCE_ENABLED": "0",
+                    "BNL_CONVERSATION_ORCHESTRATION_SEALED_CANARY_ENABLED": "0",
+                    "BNL_CONVERSATION_ORCHESTRATION_SEALED_CANARY_GUILD_IDS": "",
+                    "BNL_CONVERSATION_ORCHESTRATION_SEALED_CANARY_CHANNEL_IDS": "",
+                },
+                clear=False,
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "_load_bnl_self_name_records",
+            ) as load_records,
+            mock.patch.object(
+                bnl01_bot.client._connection,
+                "user",
+                SimpleNamespace(id=999, display_name="BNL-01"),
+            ),
+        ):
+            addressing = bnl01_bot.resolve_discord_turn_addressing(message)
+
+        load_records.assert_not_called()
+        self.assertEqual(addressing.bnl_name_influence_mode, "off")
+        self.assertEqual(addressing.bnl_name_state, "canonical")
+        self.assertTrue(addressing.addresses_bnl)
+
+    def test_interruption_rebuild_has_no_stale_answer_latch(self):
+        with open("bnl01_bot.py", encoding="utf-8") as source_file:
+            source = source_file.read()
+
+        self.assertNotIn("answer_intent_locked", source)
+        self.assertNotIn("preserved_prior_request_intent", source)
+
+    def test_legacy_previous_message_shortcut_cannot_bypass_live_packet(self):
+        with open("bnl01_bot.py", encoding="utf-8") as source_file:
+            source = source_file.read()
+
+        self.assertIn(
+            "_is_previous_message_request(clean_content)\n"
+            "        and not orchestration_influences",
+            source,
+        )
+
+    def test_live_third_party_batch_reaches_final_packet_authority(self):
+        with open("bnl01_bot.py", encoding="utf-8") as source_file:
+            source = source_file.read()
+
+        self.assertEqual(
+            source.count(
+                "batch_exclusively_targets_other_people(items)\n"
+                "                and not (pending_state or pending_anchor)\n"
+                "                and not batch_orchestration_influences"
+            ),
+            1,
+        )
+        self.assertIn(
+            "batch_exclusively_targets_other_people(items)\n"
+            "            and not (pending_state or pending_anchor)\n"
+            "            and not batch_orchestration_influences",
+            source,
+        )
+
+    def test_delivered_direct_snapshot_preserves_newer_payload_revision(self):
+        key = (77, 700, 44)
+        session = {
+            "revision": 2,
+            "payload_lines": ["first", "newer"],
+            "last_committed_payload_count": 0,
+            "generating": True,
+            "generation_invalidated": True,
+        }
+        bnl01_bot._direct_payload_sessions[key] = session
+        try:
+            state = bnl01_bot.commit_direct_payload_session_delivery(
+                key,
+                session,
+                generation_revision=1,
+                payload_count=1,
+            )
+        finally:
+            bnl01_bot._direct_payload_sessions.pop(key, None)
+
+        self.assertEqual(state, "newer_revision_pending")
+        self.assertEqual(session["last_committed_revision"], 1)
+        self.assertEqual(session["last_committed_payload_count"], 1)
+        self.assertEqual(session["revision"], 2)
+        self.assertEqual(session["payload_lines"], ["first", "newer"])
+        self.assertFalse(session["generating"])
+        self.assertFalse(session["generation_invalidated"])
+
+    def test_old_delivery_never_mutates_replacement_session(self):
+        key = (77, 700, 44)
+        old_session = {
+            "revision": 1,
+            "payload_lines": ["old"],
+            "generating": True,
+        }
+        replacement = {
+            "revision": 0,
+            "payload_lines": ["replacement"],
+            "generating": False,
+        }
+        bnl01_bot._direct_payload_sessions[key] = replacement
+        try:
+            state = bnl01_bot.commit_direct_payload_session_delivery(
+                key,
+                old_session,
+                generation_revision=1,
+                payload_count=1,
+            )
+        finally:
+            bnl01_bot._direct_payload_sessions.pop(key, None)
+
+        self.assertEqual(state, "replaced")
+        self.assertFalse(old_session["generating"])
+        self.assertEqual(
+            replacement,
+            {
+                "revision": 0,
+                "payload_lines": ["replacement"],
+                "generating": False,
+            },
+        )
+
+    def test_batch_prompt_uses_the_same_typed_name_lifecycle(self):
+        addressing = bnl01_bot.replace(
+            _addressing(
+                bnl=True,
+                state="correction",
+                value="Circuit",
+                requires_decision=True,
+            ),
+            bnl_name_action="correct",
+            bnl_name_prior_value="Blue",
+        )
+        turn = bnl01_bot.BatchConversationTurn(
+            "Member",
+            "Stop calling you Blue and call you Circuit.",
+            44,
+            addressing,
+        )
+
+        prompt = bnl01_bot._format_batched_prompt(
+            [turn],
+            "steady_reply",
+            "Answer naturally.",
+        )
+
+        self.assertIn("BNL self-name lifecycle action=correct", prompt)
+        self.assertIn('prior self-name="Blue"', prompt)
+        self.assertIn("explicitly retire the prior name", prompt)
+        self.assertIn("accept the new one only if BNL agrees", prompt)
+
+    def test_turn_evidence_packet_is_immutable_and_revisioned(self):
+        packet = ConversationOrchestrationInput(
+            route_allowed=True,
+            engagement_decision="answer",
+            engagement_reason="request",
+        )
+        first = coordinate_conversation_turn(packet)
+        second = coordinate_conversation_turn(packet)
+        changed = coordinate_conversation_turn(
+            ConversationOrchestrationInput(
+                route_allowed=True,
+                engagement_decision="observe",
+                engagement_reason="newer_packet",
+            )
+        )
+
+        with self.assertRaises(AttributeError):
+            packet.engagement_decision = "observe"
+        self.assertEqual(first.packet_revision, second.packet_revision)
+        self.assertNotEqual(first.packet_revision, changed.packet_revision)
+        self.assertFalse(first.influences_response)
+
+    def test_packet_revision_includes_each_discord_source_identity(self):
+        first_addressing = _addressing()
+        second_addressing = bnl01_bot.DiscordTurnAddressing(
+            **{
+                **first_addressing.__dict__,
+                "source_message_id": 5678,
+            }
+        )
+        first = bnl01_bot.BatchConversationTurn(
+            "Member",
+            "Same text",
+            44,
+            first_addressing,
+        )
+        second = bnl01_bot.BatchConversationTurn(
+            "Member",
+            "Same text",
+            44,
+            second_addressing,
+        )
+
+        first_revision = bnl01_bot.conversation_turn_packet_revision(
+            guild_id=77,
+            channel_id=700,
+            route_mode="normal_chat",
+            current_items=(first,),
+        )
+        second_revision = bnl01_bot.conversation_turn_packet_revision(
+            guild_id=77,
+            channel_id=700,
+            route_mode="normal_chat",
+            current_items=(second,),
+        )
+        combined_revision = bnl01_bot.conversation_turn_packet_revision(
+            guild_id=77,
+            channel_id=700,
+            route_mode="normal_chat",
+            current_items=(first, second),
+        )
+
+        self.assertNotEqual(first_revision, second_revision)
+        self.assertNotEqual(first_revision, combined_revision)
+        self.assertNotEqual(second_revision, combined_revision)
 
 
 if __name__ == "__main__":

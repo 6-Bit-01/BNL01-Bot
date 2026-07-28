@@ -83,6 +83,11 @@ CURRENT_CORRECTION_REPLACEMENT_RE = re.compile(
     r"|\binstead\s+of\s+\S",
     re.I,
 )
+CURRENT_TURN_NAMED_PAYLOAD_RE = re.compile(
+    r"\b(?:this|that)\s+"
+    r"(?:question|idea|request|proposal|plan|point|prompt|task)\s*:\s*\S",
+    re.I,
+)
 ADDRESSING_EVENT_RE = re.compile(r"(?:<@!?\d+>|(?<!\w)@[\w][\w .\-]{0,71})", re.I)
 STRONG_CONTINUATION_RE = re.compile(r"\b(?:continue(?:\s+\w+){0,6}\s+from before|earlier in (?:the )?(?:other )?conversation|same topic as before|pick up where we left off|from the other channel|from that other conversation)\b", re.I)
 CHOICE_PAYLOAD_REQUEST_RE = re.compile(
@@ -205,6 +210,9 @@ class ConversationContextRequest:
     current_texts: tuple[str, ...] = ()
     current_participants: frozenset[int] = field(default_factory=frozenset)
     referenced_message_ids: frozenset[int] = field(default_factory=frozenset)
+    referenced_conversation_row_ids: frozenset[int] = field(
+        default_factory=frozenset
+    )
     is_direct_target: bool = False
     is_reply_to_bnl: bool = False
     is_batch: bool = False
@@ -895,6 +903,18 @@ def nearby_contribution_referent_requested(text: str) -> bool:
     current_correction_resolved = bool(
         CURRENT_CORRECTION_REPLACEMENT_RE.search(value)
     )
+    current_payload_complete = bool(
+        CURRENT_TURN_NAMED_PAYLOAD_RE.search(value)
+    )
+    explicit_historical_position = bool(
+        POSITIONAL_REFERENT_RE.search(value)
+    )
+    if (
+        current_payload_complete
+        and not attribution
+        and not explicit_historical_position
+    ):
+        return False
     return bool(
         attribution
         or (pointer and noun)
@@ -1003,19 +1023,24 @@ def _resolve_nearby_contribution_referent(
 ) -> _ReferentResolution:
     """Resolve one bounded room contribution by structure and attribution."""
 
-    dynamic_speaker_reference = any(
-        str(row.get("role") or "").lower() == "user"
-        and _speaker_label_referenced(
-            current_text,
-            str(row.get("user_name") or ""),
+    referenced_message_ids = {
+        int(message_id)
+        for message_id in req.referenced_message_ids
+        if int(message_id or 0) > 0
+    }
+    referenced_conversation_row_ids = {
+        int(row_id)
+        for row_id in req.referenced_conversation_row_ids
+        if int(row_id or 0) > 0
+    }
+
+    def _is_exact_reference(row: dict) -> bool:
+        return bool(
+            int(row.get("message_id") or 0) in referenced_message_ids
+            or int(row.get("id") or 0)
+            in referenced_conversation_row_ids
         )
-        for row in rows
-    )
-    if (
-        not nearby_contribution_referent_requested(current_text)
-        and not dynamic_speaker_reference
-    ):
-        return _ReferentResolution()
+
     candidates = tuple(
         sorted(
             (
@@ -1025,7 +1050,14 @@ def _resolve_nearby_contribution_referent(
                     str(row.get("role") or "").lower()
                     in {"user", "model", "assistant", "bnl"}
                     and _row_is_same_room(row, req)
-                    and _row_age_ok(row, now, SAME_ROOM_RECENCY_MINUTES)
+                    and (
+                        _is_exact_reference(row)
+                        or _row_age_ok(
+                            row,
+                            now,
+                            SAME_ROOM_RECENCY_MINUTES,
+                        )
+                    )
                     and not _unsafe_row(row)
                 )
             ),
@@ -1033,28 +1065,20 @@ def _resolve_nearby_contribution_referent(
             reverse=True,
         )
     )
-    if not candidates:
-        return _ReferentResolution(
-            status="unresolved",
-            reason="no_bounded_same_room_candidates",
-        )
-
-    referenced_message_ids = {
-        int(message_id)
-        for message_id in req.referenced_message_ids
-        if int(message_id or 0) > 0
-    }
     reply_matches = tuple(
         row
         for row in candidates
-        if int(row.get("message_id") or 0) in referenced_message_ids
+        if (
+            int(row.get("message_id") or 0) in referenced_message_ids
+            or int(row.get("id") or 0)
+            in referenced_conversation_row_ids
+        )
     )
-    if reply_matches:
-        selected = reply_matches[:1]
+    if len(reply_matches) == 1:
         return _ReferentResolution(
             status="resolved",
             candidates=reply_matches,
-            selected=selected,
+            selected=reply_matches,
             labels=tuple(
                 dict.fromkeys(
                     sanitize_speaker_name(
@@ -1070,6 +1094,37 @@ def _resolve_nearby_contribution_referent(
                 )
             ),
             reason="discord_reply_source",
+        )
+    if len(reply_matches) > 1:
+        return _ReferentResolution(
+            status="ambiguous",
+            candidates=reply_matches,
+            labels=_referent_candidate_labels(reply_matches),
+            reason="multiple_discord_reply_sources",
+        )
+    if referenced_message_ids or referenced_conversation_row_ids:
+        return _ReferentResolution(
+            status="unresolved",
+            reason="discord_reply_source_unavailable",
+        )
+
+    dynamic_speaker_reference = any(
+        str(row.get("role") or "").lower() == "user"
+        and _speaker_label_referenced(
+            current_text,
+            str(row.get("user_name") or ""),
+        )
+        for row in rows
+    )
+    if (
+        not nearby_contribution_referent_requested(current_text)
+        and not dynamic_speaker_reference
+    ):
+        return _ReferentResolution()
+    if not candidates:
+        return _ReferentResolution(
+            status="unresolved",
+            reason="no_bounded_same_room_candidates",
         )
 
     speaker_matches = tuple(
@@ -1415,8 +1470,36 @@ def assemble_conversation_context_v2(rows: Iterable[dict], req: ConversationCont
             continue
         unpaired_users.append(dict(row, _same_room=same))
     referent_eligible_rows = []
+    exact_message_ids = {
+        int(message_id)
+        for message_id in req.referenced_message_ids
+        if int(message_id or 0) > 0
+    }
+    exact_conversation_row_ids = {
+        int(row_id)
+        for row_id in req.referenced_conversation_row_ids
+        if int(row_id or 0) > 0
+    }
     for row in source_rows:
         if _is_current_duplicate(row, req, current_norms):
+            continue
+        exact_reference = bool(
+            int(row.get("message_id") or 0) in exact_message_ids
+            or int(row.get("id") or 0) in exact_conversation_row_ids
+        )
+        if exact_reference:
+            same_room = _row_is_same_room(row, req)
+            policy = _policy(row)
+            if (
+                same_room
+                and not _unsafe_row(row)
+                and policy == target_policy
+                and target_policy in SAME_CHANNEL_CONTEXT_POLICIES
+                and policy not in BLOCKED_PUBLIC_POLICIES
+            ):
+                referent_eligible_rows.append(
+                    dict(row, _same_room=True)
+                )
             continue
         ok, same = _eligible_row(row)
         if ok and same:

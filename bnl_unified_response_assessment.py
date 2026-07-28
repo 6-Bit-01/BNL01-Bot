@@ -25,6 +25,7 @@ from bnl_conversation_context_v2 import assess_payload_grounding
 
 
 ASSESSMENT_VERSION = "unified_response_assessment_v7"
+CONVERSATION_TURN_PACKET_VERSION = "conversation_turn_evidence_v2"
 SHADOW_ENV = "BNL_UNIFIED_RESPONSE_ASSESSMENT_SHADOW_ENABLED"
 TABLE_NAME = "unified_response_assessment_shadow_runs"
 
@@ -262,7 +263,7 @@ _TERM_FAMILIES = {
 
 
 @dataclass(frozen=True)
-class ConversationOrchestrationInput:
+class ConversationTurnEvidencePacket:
     """Typed outputs from existing owners before silence or generation.
 
     This coordinator retrieves and stores nothing.  Addressing, Context v2,
@@ -286,6 +287,18 @@ class ConversationOrchestrationInput:
     moment_participant_overlap: bool = False
     moment_human_entry_count: int = 0
     moment_model_entry_count: int = 0
+    influence_mode: str = "off"
+    packet_version: str = CONVERSATION_TURN_PACKET_VERSION
+    packet_revision: str = ""
+    governed_memory_state: str = "owner_not_requested"
+    relationship_state: str = "owner_tone_only"
+    canon_state: str = "owner_not_requested"
+    source_control_state: str = "route_policy_only"
+
+
+# Compatibility name for existing callers. The packet itself is the authority
+# boundary; callers must not maintain a second mutable orchestration input.
+ConversationOrchestrationInput = ConversationTurnEvidencePacket
 
 
 @dataclass(frozen=True)
@@ -307,14 +320,25 @@ class ConversationOrchestrationDecision:
     moment_model_entry_count: int
     engagement_decision: str
     engagement_reason: str
+    influence_mode: str
+    packet_version: str
+    packet_revision: str
+    governed_memory_state: str
+    relationship_state: str
+    canon_state: str
+    source_control_state: str
 
     @property
     def should_generate(self) -> bool:
         return self.response_act in {"answer", "clarify"}
 
+    @property
+    def influences_response(self) -> bool:
+        return self.influence_mode in {"live", "sealed_canary"}
+
 
 def coordinate_conversation_turn(
-    input_state: ConversationOrchestrationInput,
+    input_state: ConversationTurnEvidencePacket,
 ) -> ConversationOrchestrationDecision:
     """Resolve one response act after all currently available owners report."""
 
@@ -389,6 +413,34 @@ def coordinate_conversation_turn(
         ),
         engagement_decision=engagement,
         engagement_reason=str(input_state.engagement_reason or "")[:160],
+        influence_mode=(
+            str(input_state.influence_mode or "off").strip().lower()[:40]
+        ),
+        packet_version=(
+            str(
+                input_state.packet_version
+                or CONVERSATION_TURN_PACKET_VERSION
+            )[:80]
+        ),
+        packet_revision=(
+            str(input_state.packet_revision or "").strip()[:80]
+            or uuid.uuid5(
+                uuid.NAMESPACE_URL,
+                repr(input_state),
+            ).hex[:16]
+        ),
+        governed_memory_state=str(
+            input_state.governed_memory_state or "owner_not_requested"
+        )[:80],
+        relationship_state=str(
+            input_state.relationship_state or "owner_tone_only"
+        )[:80],
+        canon_state=str(
+            input_state.canon_state or "owner_not_requested"
+        )[:80],
+        source_control_state=str(
+            input_state.source_control_state or "route_policy_only"
+        )[:80],
     )
 
 
@@ -397,7 +449,11 @@ def render_conversation_orchestration_prompt(
 ) -> str:
     """Render the decision as an instruction, never as factual evidence."""
 
-    if decision is None or decision.response_act in {"blocked", "observe"}:
+    if (
+        decision is None
+        or not decision.influences_response
+        or decision.response_act in {"blocked", "observe"}
+    ):
         return ""
     lines = [
         "[CONVERSATION_ORCHESTRATION_V1]",

@@ -736,7 +736,8 @@ def current_bnl_self_name_records(
     rows = conn.execute(
         (
             """
-        SELECT entry_id,normalized_value,observed_at
+        SELECT entry_id,normalized_value,observed_at,channel_policy,
+               channel_id,visibility
         FROM memory_ledger_entries
         WHERE guild_id=? AND subject_key=?
           AND predicate_key LIKE ?
@@ -754,7 +755,130 @@ def current_bnl_self_name_records(
         tuple(params),
     ).fetchall()
     selected: dict[str, BnlSelfNameRecord] = {}
-    for entry_id, raw_value, observed_at in rows:
+    table_names = {
+        str(row[0] or "")
+        for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()
+    }
+    conversation_columns = (
+        {
+            str(row[1] or "")
+            for row in conn.execute(
+                "PRAGMA table_info(conversations)"
+            ).fetchall()
+        }
+        if "conversations" in table_names
+        else set()
+    )
+
+    def _source_lineage_is_current(
+        decision_entry_id: str,
+        *,
+        decision_policy: str,
+        decision_channel_id: int,
+        decision_visibility: str,
+    ) -> bool:
+        if not {"id", "guild_id", "role"}.issubset(
+            conversation_columns
+        ):
+            return False
+        roots = conn.execute(
+            """
+            SELECT root.entry_id,root.source_table,root.source_row_id,
+                   root.source_role,root.lifecycle_status,
+                   root.channel_policy,root.channel_id,root.visibility
+            FROM memory_ledger_lineage AS edge
+            JOIN memory_ledger_entries AS root
+              ON root.entry_id=edge.target_entry_id
+             AND root.guild_id=edge.guild_id
+            WHERE edge.guild_id=? AND edge.entry_id=?
+              AND edge.lineage_type='derived_from'
+            ORDER BY root.entry_id
+            """,
+            (int(guild_id), str(decision_entry_id or "")),
+        ).fetchall()
+        if len(roots) != 2:
+            return False
+        roles = {str(root[3] or "").strip().lower() for root in roots}
+        if roles != {"user", "model"}:
+            return False
+        for (
+            root_entry_id,
+            source_table,
+            source_row_id,
+            _source_role,
+            lifecycle_status,
+            source_policy,
+            source_channel_id,
+            source_visibility,
+        ) in roots:
+            if (
+                str(source_table or "") != "conversations"
+                or str(lifecycle_status or "") != ACTIVE_LIFECYCLE
+                or str(source_policy or "").strip().lower()
+                != decision_policy
+                or int(source_channel_id or 0)
+                != int(decision_channel_id or 0)
+                or str(source_visibility or "").strip().lower()
+                != decision_visibility
+            ):
+                return False
+            superseded = conn.execute(
+                """
+                SELECT 1
+                FROM memory_ledger_lineage
+                WHERE guild_id=? AND target_entry_id=?
+                  AND lineage_type IN ('supersedes','retracts')
+                LIMIT 1
+                """,
+                (int(guild_id), str(root_entry_id or "")),
+            ).fetchone()
+            if superseded:
+                return False
+            if conversation_columns:
+                required = {"id", "guild_id", "role"}
+                if not required.issubset(conversation_columns):
+                    return False
+                selected_columns = ["role"]
+                if "channel_id" in conversation_columns:
+                    selected_columns.append("channel_id")
+                if "channel_policy" in conversation_columns:
+                    selected_columns.append("channel_policy")
+                conversation = conn.execute(
+                    "SELECT %s FROM conversations "
+                    "WHERE id=? AND guild_id=? LIMIT 1"
+                    % ",".join(selected_columns),
+                    (int(source_row_id or 0), int(guild_id)),
+                ).fetchone()
+                if not conversation:
+                    return False
+                if str(conversation[0] or "").strip().lower() != str(
+                    _source_role or ""
+                ).strip().lower():
+                    return False
+                offset = 1
+                if "channel_id" in conversation_columns:
+                    if int(conversation[offset] or 0) != int(
+                        decision_channel_id or 0
+                    ):
+                        return False
+                    offset += 1
+                if "channel_policy" in conversation_columns:
+                    if str(conversation[offset] or "").strip().lower() != (
+                        decision_policy
+                    ):
+                        return False
+        return True
+
+    for (
+        entry_id,
+        raw_value,
+        observed_at,
+        channel_policy,
+        channel_id,
+        visibility,
+    ) in rows:
         try:
             payload = json.loads(str(raw_value or "{}"))
         except (TypeError, ValueError, json.JSONDecodeError):
@@ -765,8 +889,18 @@ def current_bnl_self_name_records(
         if (
             not normalized
             or not display
-            or decision not in {"accepted", "denied", "deferred"}
+            or decision
+            not in {"accepted", "denied", "deferred", "revoked"}
             or normalized in selected
+        ):
+            continue
+        decision_policy = str(channel_policy or "").strip().lower()
+        decision_visibility = str(visibility or "").strip().lower()
+        if not _source_lineage_is_current(
+            str(entry_id or ""),
+            decision_policy=decision_policy,
+            decision_channel_id=int(channel_id or 0),
+            decision_visibility=decision_visibility,
         ):
             continue
         selected[normalized] = BnlSelfNameRecord(
@@ -795,7 +929,7 @@ def record_bnl_self_name_decision(
     response_digest: str,
     observed_at: str = "",
 ) -> LedgerWriteResult:
-    """Record BNL's explicit accept/deny/defer decision with source lineage."""
+    """Record BNL's explicit accept/deny/defer/revoke decision with lineage."""
 
     ensure_memory_ledger_schema(conn)
     normalized = normalize_bnl_self_name(name)
@@ -805,7 +939,8 @@ def record_bnl_self_name_decision(
         int(guild_id or 0) <= 0
         or not normalized
         or not clean_display
-        or resolved_decision not in {"accepted", "denied", "deferred"}
+        or resolved_decision
+        not in {"accepted", "denied", "deferred", "revoked"}
         or int(source_conversation_row_id or 0) <= 0
         or int(decision_conversation_row_id or 0) <= 0
     ):
@@ -941,7 +1076,7 @@ def record_bnl_self_name_decision(
                 "preference"
                 if resolved_decision == "accepted"
                 else "boundary"
-                if resolved_decision == "denied"
+                if resolved_decision in {"denied", "revoked"}
                 else "open_loop"
             ),
             subject_key=BNL_SUBJECT_KEY,

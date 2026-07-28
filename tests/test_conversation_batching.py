@@ -958,14 +958,23 @@ class ConversationBatchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
             return "You're right—the Friday opener was the question, and I answered the wrong person."
 
         self._prime_flush(channel, "that's not what I asked")
-        with self._flush_runtime(channel.id, generate), mock.patch.object(
-            bnl01_bot,
-            "build_recent_text_room_context_for_prompt",
-            return_value=prior_exchange,
+        with (
+            self._flush_runtime(channel.id, generate),
+            mock.patch.object(
+                bnl01_bot,
+                "build_recent_text_room_context_for_prompt",
+                return_value=prior_exchange,
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "coordinate_conversation_turn",
+                wraps=bnl01_bot.coordinate_conversation_turn,
+            ) as coordinate,
         ):
             await bnl01_bot._flush_channel_buffer(channel)
 
         self.assertEqual(len(prompts), 1)
+        self.assertEqual(coordinate.call_count, 1)
         self.assertIn("This is a correction turn", prompts[0])
         self.assertIn("visible prior exchange", prompts[0])
         self.assertIn("what do you think about Friday's opener?", prompts[0])
@@ -1041,6 +1050,37 @@ class ConversationBatchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Hackers", channel.sent[0])
         self.assertIn("BARCODE Radio", channel.sent[0])
         self.assertNotRegex(channel.sent[0].lower(), r"archive recall|\[core\]|current project")
+
+    async def test_live_orchestration_gate_prevents_deterministic_shortcut_bypass(self):
+        channel = self._channel(8137)
+        provider = mock.AsyncMock(
+            return_value="I remember the governed thread and can answer from it."
+        )
+        self._prime_flush(channel, "what do you remember about me?")
+
+        with (
+            self._flush_runtime(channel.id, provider),
+            mock.patch.dict(
+                os.environ,
+                {
+                    "BNL_CONVERSATION_ORCHESTRATION_INFLUENCE_ENABLED": "1",
+                },
+                clear=False,
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "try_memory_recall_response",
+                return_value="A legacy deterministic shortcut.",
+            ) as deterministic_recall,
+        ):
+            await bnl01_bot._flush_channel_buffer(channel)
+
+        deterministic_recall.assert_not_called()
+        provider.assert_awaited_once()
+        self.assertEqual(
+            channel.sent,
+            ["I remember the governed thread and can answer from it."],
+        )
 
     async def test_batched_broad_recall_canary_enters_source_safe_synthesis(self):
         channel = self._channel(8120)
@@ -1369,7 +1409,14 @@ class ConversationBatchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
             return "Fresh combined response."
 
         self._prime_flush(channel, "BNL, why are routers weird?")
-        with self._flush_runtime(channel.id, generate):
+        with (
+            self._flush_runtime(channel.id, generate),
+            mock.patch.object(
+                bnl01_bot,
+                "coordinate_conversation_turn",
+                wraps=bnl01_bot.coordinate_conversation_turn,
+            ) as coordinate,
+        ):
             task = asyncio.create_task(bnl01_bot._flush_channel_buffer(channel))
             bnl01_bot._channel_tasks[channel.id] = task
             await asyncio.wait_for(generation_started.wait(), timeout=0.5)
@@ -1386,6 +1433,12 @@ class ConversationBatchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.wait_for(task, timeout=1)
 
         self.assertEqual(len(prompts), 2)
+        self.assertEqual(coordinate.call_count, 2)
+        packet_revisions = {
+            call.args[0].packet_revision
+            for call in coordinate.call_args_list
+        }
+        self.assertEqual(len(packet_revisions), 2)
         self.assertNotIn("and why do they blink?", prompts[0])
         self.assertIn("and why do they blink?", prompts[1])
         self.assertEqual(channel.sent, ["Fresh combined response."])

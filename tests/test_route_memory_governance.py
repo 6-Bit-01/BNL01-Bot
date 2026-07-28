@@ -2560,8 +2560,26 @@ class SendThenSaveOrderingTests(unittest.IsolatedAsyncioTestCase):
         conn.close()
         return count
 
+    def linked_message_ids(self):
+        import sqlite3
+        conn = sqlite3.connect(bnl01_bot.DB_FILE)
+        try:
+            return [
+                row[0]
+                for row in conn.execute(
+                    """
+                    SELECT message_id
+                    FROM conversation_discord_message_links
+                    ORDER BY message_id
+                    """
+                ).fetchall()
+            ]
+        finally:
+            conn.close()
+
     async def test_successful_send_writes_one_model_row_after_delivery(self):
         msg = self.message()
+        msg.reply.return_value = SimpleNamespace(id=9101)
         await bnl01_bot.send_reply_then_save_model(
             msg, "You told me to remember 8.", user_id=101, guild_id=1,
             channel_name="bnl-testing", channel_policy="sealed_test", channel_id=2,
@@ -2573,6 +2591,33 @@ class SendThenSaveOrderingTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(allowed_mentions.roles)
         self.assertFalse(allowed_mentions.replied_user)
         self.assertEqual(self.model_count(), 1)
+        self.assertEqual(self.linked_message_ids(), [9101])
+
+    async def test_reply_override_saves_only_the_text_actually_delivered(self):
+        import sqlite3
+
+        msg = self.message()
+        msg.reply.return_value = SimpleNamespace(id=9102)
+        await bnl01_bot.send_reply_then_save_model(
+            msg,
+            "Long internal candidate that was not delivered.",
+            user_id=101,
+            guild_id=1,
+            channel_name="bnl-testing",
+            channel_policy="sealed_test",
+            channel_id=2,
+            reply_text="Delivered excerpt...",
+        )
+
+        msg.reply.assert_awaited_once_with(
+            "Delivered excerpt...",
+            allowed_mentions=mock.ANY,
+        )
+        with sqlite3.connect(bnl01_bot.DB_FILE) as conn:
+            saved = conn.execute(
+                "SELECT content FROM conversations WHERE role='model'"
+            ).fetchone()[0]
+        self.assertEqual(saved, "Delivered excerpt...")
 
     async def test_failed_send_writes_zero_model_rows(self):
         msg = self.message(fail_reply=True)
@@ -2585,7 +2630,12 @@ class SendThenSaveOrderingTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_multi_chunk_successful_send_writes_one_complete_model_row(self):
         channel = mock.Mock(id=2, name="bnl-testing")
-        channel.send = mock.AsyncMock()
+        next_message_id = iter(range(9201, 9300))
+        channel.send = mock.AsyncMock(
+            side_effect=lambda *_args, **_kwargs: SimpleNamespace(
+                id=next(next_message_id)
+            )
+        )
         long_response = "chunk " * 900
         await bnl01_bot.send_channel_then_save_model(
             channel, long_response, user_id=101, guild_id=1,
@@ -2605,6 +2655,36 @@ class SendThenSaveOrderingTests(unittest.IsolatedAsyncioTestCase):
         cur.execute("SELECT content FROM conversations WHERE role='model'")
         self.assertEqual(cur.fetchone()[0], long_response)
         conn.close()
+        self.assertEqual(
+            len(self.linked_message_ids()),
+            channel.send.await_count,
+        )
+
+    async def test_partial_multi_chunk_send_records_no_false_reply_identity(self):
+        channel = mock.Mock(id=2, name="bnl-testing")
+        calls = 0
+
+        async def partial_send(*_args, **_kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                return SimpleNamespace(id=9301)
+            raise RuntimeError("discord down")
+
+        channel.send = mock.AsyncMock(side_effect=partial_send)
+        with self.assertRaises(RuntimeError):
+            await bnl01_bot.send_channel_then_save_model(
+                channel,
+                "chunk " * 900,
+                user_id=101,
+                guild_id=1,
+                channel_name="bnl-testing",
+                channel_policy="sealed_test",
+                channel_id=2,
+            )
+
+        self.assertEqual(self.model_count(), 0)
+        self.assertEqual(self.linked_message_ids(), [])
 
     async def test_single_helper_execution_saves_exactly_one_model_row(self):
         msg = self.message()
