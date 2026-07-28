@@ -43,6 +43,10 @@ CONVERSATION_MOTIF_FORMATION_ENV = (
     "BNL_CONVERSATION_MOTIF_FORMATION_SHADOW_ENABLED"
 )
 BNL_SUBJECT_KEY = "bnl_01"
+BNL_SELF_NAME_PREDICATE_PREFIX = "bnl_self_name:"
+BNL_SELF_NAME_PUBLIC_POLICIES = frozenset(
+    {"public_home", "public_context", "public_selective"}
+)
 
 ENTRY_TYPES = frozenset({
     "observation", "claim", "event", "preference", "boundary", "goal", "open_loop", "commitment",
@@ -633,6 +637,22 @@ class AtomicKnowledgeResult:
         )
 
 
+@dataclass(frozen=True)
+class BnlSelfNameRecord:
+    """Current governed routing state for one name people may use for BNL.
+
+    This is a read projection over Memory Ledger entries, not a separate
+    nickname store.  The original conversation remains the human source and
+    BNL's explicit response is the first-party decision.
+    """
+
+    normalized_name: str
+    display_name: str
+    decision: str
+    entry_id: str
+    observed_at: str = ""
+
+
 def shadow_enabled(environ: dict[str, str] | None = None) -> bool:
     value = (environ or os.environ).get(MEMORY_LEDGER_SHADOW_ENV, "")
     return str(value).strip().lower() in {"1", "true", "yes", "on", "enabled"}
@@ -666,6 +686,288 @@ def _canon(value: Any) -> str:
 
 def subject_key_for_user(user_id: int | str | None) -> str:
     return f"discord_user:{int(user_id or 0)}"
+
+
+def normalize_bnl_self_name(value: Any) -> str:
+    """Return one conservative comparison key without inventing aliases."""
+
+    cleaned = re.sub(r"\s+", " ", str(value or "")).strip(" \t\r\n,.;:!?\"'“”‘’")
+    if not cleaned or len(cleaned) > 48:
+        return ""
+    if len(cleaned.split()) > 4:
+        return ""
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9 _.'’\-]{0,47}", cleaned):
+        return ""
+    return _canon(cleaned)
+
+
+def current_bnl_self_name_records(
+    conn: sqlite3.Connection,
+    *,
+    guild_id: int,
+    channel_policies: tuple[str, ...] = (),
+) -> tuple[BnlSelfNameRecord, ...]:
+    """Read current self-name decisions from the existing Ledger lifecycle."""
+
+    if int(guild_id or 0) <= 0:
+        return ()
+    ensure_memory_ledger_schema(conn)
+    scoped_policies = tuple(
+        sorted(
+            {
+                str(policy or "").strip().lower()
+                for policy in channel_policies
+                if str(policy or "").strip()
+            }
+        )
+    )
+    policy_clause = ""
+    params: list[Any] = [
+        int(guild_id),
+        BNL_SUBJECT_KEY,
+        BNL_SELF_NAME_PREDICATE_PREFIX + "%",
+    ]
+    if scoped_policies:
+        policy_clause = " AND channel_policy IN (%s)" % ",".join(
+            "?" for _ in scoped_policies
+        )
+        params.extend(scoped_policies)
+    params.append(int(guild_id))
+    rows = conn.execute(
+        (
+            """
+        SELECT entry_id,normalized_value,observed_at
+        FROM memory_ledger_entries
+        WHERE guild_id=? AND subject_key=?
+          AND predicate_key LIKE ?
+          %s
+          AND lifecycle_status='active'
+          AND entry_id NOT IN (
+            SELECT target_entry_id
+            FROM memory_ledger_lineage
+            WHERE guild_id=? AND lineage_type IN ('supersedes','retracts')
+          )
+        ORDER BY observed_at DESC,created_at DESC,entry_id DESC
+        """
+            % policy_clause
+        ),
+        tuple(params),
+    ).fetchall()
+    selected: dict[str, BnlSelfNameRecord] = {}
+    for entry_id, raw_value, observed_at in rows:
+        try:
+            payload = json.loads(str(raw_value or "{}"))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        normalized = normalize_bnl_self_name(payload.get("normalized"))
+        display = re.sub(r"\s+", " ", str(payload.get("name") or "")).strip()[:48]
+        decision = str(payload.get("decision") or "").strip().lower()
+        if (
+            not normalized
+            or not display
+            or decision not in {"accepted", "denied", "deferred"}
+            or normalized in selected
+        ):
+            continue
+        selected[normalized] = BnlSelfNameRecord(
+            normalized_name=normalized,
+            display_name=display,
+            decision=decision,
+            entry_id=str(entry_id or ""),
+            observed_at=str(observed_at or ""),
+        )
+    return tuple(selected[key] for key in sorted(selected))
+
+
+def record_bnl_self_name_decision(
+    conn: sqlite3.Connection,
+    *,
+    guild_id: int,
+    name: str,
+    decision: str,
+    source_conversation_row_id: int,
+    decision_conversation_row_id: int,
+    source_message_id: int | None,
+    channel_id: int,
+    channel_name: str,
+    channel_policy: str,
+    route_mode: str,
+    response_digest: str,
+    observed_at: str = "",
+) -> LedgerWriteResult:
+    """Record BNL's explicit accept/deny/defer decision with source lineage."""
+
+    ensure_memory_ledger_schema(conn)
+    normalized = normalize_bnl_self_name(name)
+    clean_display = re.sub(r"\s+", " ", str(name or "")).strip()[:48]
+    resolved_decision = str(decision or "").strip().lower()
+    if (
+        int(guild_id or 0) <= 0
+        or not normalized
+        or not clean_display
+        or resolved_decision not in {"accepted", "denied", "deferred"}
+        or int(source_conversation_row_id or 0) <= 0
+        or int(decision_conversation_row_id or 0) <= 0
+    ):
+        return LedgerWriteResult(
+            outcome="skipped",
+            reason_code="invalid_bnl_self_name_decision",
+            guild_id=int(guild_id or 0),
+        )
+
+    source_row_id = int(source_conversation_row_id)
+    decision_row_id = int(decision_conversation_row_id)
+    source_entry_row = conn.execute(
+        """
+        SELECT entry_id
+        FROM memory_ledger_entries
+        WHERE guild_id=? AND source_table='conversations'
+          AND source_row_id=? AND source_role='user'
+        ORDER BY created_at,entry_id
+        LIMIT 1
+        """,
+        (int(guild_id), str(source_row_id)),
+    ).fetchone()
+    if not source_entry_row or not str(source_entry_row[0] or ""):
+        return LedgerWriteResult(
+            outcome="skipped",
+            reason_code="bnl_self_name_source_missing",
+            source_table="conversations",
+            source_row_id=str(source_row_id),
+            source_revision=str(source_row_id),
+            guild_id=int(guild_id),
+        )
+    decision_entry_row = conn.execute(
+        """
+        SELECT entry_id
+        FROM memory_ledger_entries
+        WHERE guild_id=? AND source_table='conversations'
+          AND source_row_id=? AND source_role='model'
+        ORDER BY created_at,entry_id
+        LIMIT 1
+        """,
+        (int(guild_id), str(decision_row_id)),
+    ).fetchone()
+    if not decision_entry_row or not str(decision_entry_row[0] or ""):
+        return LedgerWriteResult(
+            outcome="skipped",
+            reason_code="bnl_self_name_decision_response_missing",
+            source_table="conversations",
+            source_row_id=str(decision_row_id),
+            source_revision=str(decision_row_id),
+            guild_id=int(guild_id),
+        )
+
+    predicate_key = (
+        BNL_SELF_NAME_PREDICATE_PREFIX
+        + hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:20]
+    )
+    decision_policy = str(channel_policy or "unknown").strip().lower()
+    supersession_policies = (
+        tuple(sorted(BNL_SELF_NAME_PUBLIC_POLICIES))
+        if decision_policy in BNL_SELF_NAME_PUBLIC_POLICIES
+        else (decision_policy,)
+    )
+    prior_entry_ids = tuple(
+        str(row[0] or "")
+        for row in conn.execute(
+            (
+                """
+            SELECT entry_id
+            FROM memory_ledger_entries
+            WHERE guild_id=? AND subject_key=? AND predicate_key=?
+              AND channel_policy IN (%s)
+              AND lifecycle_status='active'
+              AND entry_id NOT IN (
+                SELECT target_entry_id
+                FROM memory_ledger_lineage
+                WHERE guild_id=? AND lineage_type IN ('supersedes','retracts')
+            )
+            ORDER BY observed_at DESC,created_at DESC,entry_id DESC
+            """
+                % ",".join("?" for _ in supersession_policies)
+            ),
+            (
+                int(guild_id),
+                BNL_SUBJECT_KEY,
+                predicate_key,
+                *supersession_policies,
+                int(guild_id),
+            ),
+        ).fetchall()
+        if str(row[0] or "")
+    )
+    digest = re.sub(r"[^a-f0-9]", "", str(response_digest or "").lower())[:64]
+    if not digest:
+        digest = hashlib.sha256(
+            (
+                f"{normalized}\x1f{resolved_decision}\x1f"
+                f"{source_row_id}\x1f{decision_row_id}"
+            ).encode("utf-8")
+        ).hexdigest()
+    source_revision = f"{resolved_decision}:{digest}"
+    value = json.dumps(
+        {
+            "decision": resolved_decision,
+            "name": clean_display,
+            "normalized": normalized,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    # The durable state belongs to BNL, not to the member who happened to
+    # propose the name.  Proposal identity remains on the governed source
+    # conversation and is not duplicated into this global preference.
+    participants = (
+        LedgerParticipant(BNL_SUBJECT_KEY, "BNL-01", "decision_owner", 0),
+    )
+    lineage = (
+        ("derived_from", str(source_entry_row[0])),
+        ("derived_from", str(decision_entry_row[0])),
+        *tuple(("supersedes", entry_id) for entry_id in prior_entry_ids),
+    )
+    return insert_ledger_entry(
+        conn,
+        LedgerEntry(
+            guild_id=int(guild_id),
+            source_table="bnl_self_name_decisions",
+            source_row_id=(
+                f"{source_row_id}:{decision_row_id}:{predicate_key}"
+            ),
+            source_revision=source_revision,
+            source_event_key=f"{resolved_decision}:{normalized}",
+            source_role="bnl_first_party_decision",
+            entry_type=(
+                "preference"
+                if resolved_decision == "accepted"
+                else "boundary"
+                if resolved_decision == "denied"
+                else "open_loop"
+            ),
+            subject_key=BNL_SUBJECT_KEY,
+            subject_display_name="BNL-01",
+            predicate_key=predicate_key,
+            value=value,
+            source_class=SourceClass.FIRST_PARTY_RECORD,
+            route_mode=str(route_mode or "normal_chat")[:80],
+            channel_id=int(channel_id or 0),
+            channel_name=str(channel_name or "")[:120],
+            channel_policy=str(channel_policy or "unknown")[:80],
+            source_message_id=(
+                int(source_message_id)
+                if int(source_message_id or 0) > 0
+                else None
+            ),
+            visibility=_visibility(channel_policy),
+            confidence=Confidence.HIGH,
+            public_usable=False,
+            observed_at=observed_at or _now(),
+            source_sequence=decision_row_id,
+            lifecycle_status=ACTIVE_LIFECYCLE,
+            participants=participants,
+            lineage=lineage,
+        ),
+    )
 
 
 def source_revision_for(row_id: int | str, updated_at: str | None = None, event: str | None = None) -> str:

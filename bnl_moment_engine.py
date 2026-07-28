@@ -40,6 +40,7 @@ MAX_WINDOW_SECONDS = 5 * 60
 INACTIVITY_SECONDS = 2 * 60
 EPISODE_INACTIVITY_SECONDS = 24 * 60 * 60
 EPISODE_REOPEN_SECONDS = 30 * 24 * 60 * 60
+TURN_SITUATION_RECENCY_SECONDS = 45 * 60
 CONTRIBUTION_GIST_VERSION = "moment_contribution_gist_v1"
 EPISODE_EVENT_TYPES = (
     "action",
@@ -169,6 +170,22 @@ class ActiveEpisodeReference:
     participant_count: int
     open_loop_count: int
     semantic_types: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class MomentSituationReference:
+    """Content-free recent activity/flow state for turn coordination."""
+
+    moment_id: str
+    lifecycle_status: str
+    qualification_type: str
+    qualification_reason: str
+    human_entry_count: int
+    model_entry_count: int
+    participant_count: int
+    participant_overlap: bool
+    topic_coherent: bool
+    last_activity_at: str
 
 
 @dataclass(frozen=True)
@@ -4179,6 +4196,136 @@ def active_episode_for_assessment(
         open_loop_count=max(0, int(candidate[11] or 0)),
         semantic_types=semantic_types,
     )
+
+
+def recent_moment_situation_for_assessment(
+    conn: sqlite3.Connection,
+    *,
+    guild_id: int,
+    channel_id: int,
+    channel_policy: str,
+    route_mode: str,
+    topic_text: str,
+    participant_keys: tuple[str, ...] = (),
+    now: str | None = None,
+    recency_seconds: int = TURN_SITUATION_RECENCY_SECONDS,
+) -> MomentSituationReference | None:
+    """Read the engine's newest bounded situation without treating it as text.
+
+    Open, finalized, rejected, and needs-review windows all describe what the
+    Moment Engine observed about activity/flow.  Only Context v2 may provide
+    raw conversational content to a response.
+    """
+
+    if (
+        not shadow_enabled()
+        or not ledger_shadow_enabled()
+        or not _table_exists(conn, "memory_moment_windows")
+        or int(guild_id or 0) <= 0
+        or int(channel_id or 0) <= 0
+    ):
+        return None
+    base = _parse_ts(now or _now())
+    rows = conn.execute(
+        """
+        SELECT moment_id,lifecycle_status,qualification_type,
+               qualification_reason,human_entry_count,model_entry_count,
+               participant_count,topic_family,topic_signature,last_activity_at
+        FROM memory_moment_windows
+        WHERE guild_id=? AND channel_id=? AND channel_policy=? AND route_mode=?
+          AND lifecycle_status IN ('open','finalized','rejected','needs_review')
+        ORDER BY last_activity_at DESC,moment_id DESC
+        LIMIT 8
+        """,
+        (
+            int(guild_id),
+            int(channel_id),
+            str(channel_policy or "unknown"),
+            str(route_mode or "unknown"),
+        ),
+    ).fetchall()
+    if not rows:
+        return None
+    current_family = _topic_family(topic_text, "conversation")
+    current_signature = _topic_signature(topic_text, "conversation")
+    scoped_participants = tuple(
+        sorted(
+            {
+                str(key)
+                for key in participant_keys
+                if re.fullmatch(r"discord_user:[1-9]\d*", str(key or ""))
+            }
+        )
+    )
+    candidates: list[
+        tuple[tuple[int, int, float], MomentSituationReference]
+    ] = []
+    for row in rows:
+        last_activity = str(row[9] or "")
+        try:
+            parsed_activity = datetime.fromisoformat(
+                last_activity.replace("Z", "+00:00")
+            )
+            if not parsed_activity.tzinfo:
+                parsed_activity = parsed_activity.replace(
+                    tzinfo=timezone.utc
+                )
+        except (TypeError, ValueError):
+            continue
+        age_seconds = (base - parsed_activity).total_seconds()
+        if age_seconds < 0 or age_seconds > max(1, int(recency_seconds or 1)):
+            continue
+        moment_id = str(row[0] or "")
+        participant_overlap = False
+        if scoped_participants:
+            participant_overlap = bool(
+                conn.execute(
+                    """
+                    SELECT 1 FROM memory_moment_participants
+                    WHERE moment_id=? AND participant_role='human_author'
+                      AND participant_key IN (%s)
+                    LIMIT 1
+                    """
+                    % ",".join("?" for _ in scoped_participants),
+                    (moment_id, *scoped_participants),
+                ).fetchone()
+            )
+        stored_signature = _load_sig(str(row[8] or "[]"))
+        topic_coherent = bool(
+            not current_signature
+            or _coherent(
+                current_family,
+                current_signature,
+                str(row[7] or ""),
+                stored_signature,
+            )
+        )
+        reference = MomentSituationReference(
+            moment_id=moment_id,
+            lifecycle_status=str(row[1] or ""),
+            qualification_type=str(row[2] or ""),
+            qualification_reason=str(row[3] or ""),
+            human_entry_count=max(0, int(row[4] or 0)),
+            model_entry_count=max(0, int(row[5] or 0)),
+            participant_count=max(0, int(row[6] or 0)),
+            participant_overlap=participant_overlap,
+            topic_coherent=topic_coherent,
+            last_activity_at=last_activity,
+        )
+        candidates.append(
+            (
+                (
+                    int(participant_overlap),
+                    int(topic_coherent),
+                    parsed_activity.timestamp(),
+                ),
+                reference,
+            )
+        )
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    return candidates[0][1]
 
 
 def render_active_episode_canary_context(

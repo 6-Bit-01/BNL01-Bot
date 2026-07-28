@@ -14,6 +14,7 @@ MAX_SAME_ROOM_PAIRS = 4
 MAX_CROSS_CHANNEL_PAIRS = 1
 MAX_UNPAIRED_ROWS = 2
 IMMEDIATE_REFERENT_RECENCY_MINUTES = 10
+MAX_REFERENT_LINE_CHARS = 1200
 IMMEDIATE_ROOM_RECAP_RECENCY_MINUTES = 12
 IMMEDIATE_ROOM_RECAP_MAX_GAP_SECONDS = 5 * 60
 RESPONSE_CLUSTER_MAX_USER_SPAN_SECONDS = 30
@@ -42,6 +43,44 @@ BOUNDARY_RE = re.compile(r"\b(?:don't|do not|stop|never|please don't|no longer|b
 OPEN_LOOP_RE = re.compile(r"\?|\b(?:which one|choose|pick|decide|i will|i'll|remind me|next time|use the first|use the second|second one|first one)\b", re.I)
 IMMEDIATE_REFERENT_RE = re.compile(
     r"\b(?:tag|tagged|tagging|mention|mentioned|mentioning|not you|not me|who tagged|what tag|which tag|the tag|that tag)\b",
+    re.I,
+)
+NEARBY_REFERENT_POINTER_RE = re.compile(
+    r"\b(?:above|below|previous|prior|earlier|last|latest|recent|"
+    r"that|this|those|these|it)\b",
+    re.I,
+)
+NEARBY_REFERENT_NOUN_RE = re.compile(
+    r"\b(?:message|passage|poem|text|post|comment|story|paragraph|"
+    r"response|answer|reply|contribution|idea|point|part|thing|one)\b",
+    re.I,
+)
+NEARBY_REFERENT_ACT_RE = re.compile(
+    r"\b(?:analy[sz](?:e|is)|explain|review|read|respond|answer|"
+    r"summari[sz]e|interpret|discuss|continue|mean|think|said|wrote|"
+    r"posted|shared|sent|called|refer(?:ring)?\s+to)\b",
+    re.I,
+)
+SPEAKER_ATTRIBUTION_REFERENT_RE = re.compile(
+    r"\b(?:said|wrote|posted|shared|sent|called)\s+"
+    r"(?:it|that|this|the\s+(?:message|passage|text|post|poem|thing))\b",
+    re.I,
+)
+LONG_FORM_REFERENT_NOUN_RE = re.compile(
+    r"\b(?:passage|poem|story|paragraph)\b",
+    re.I,
+)
+MODEL_REFERENT_NOUN_RE = re.compile(
+    r"\b(?:response|answer|reply)\b",
+    re.I,
+)
+POSITIONAL_REFERENT_RE = re.compile(
+    r"\b(?:above|previous|prior|earlier|last|latest|recent)\b",
+    re.I,
+)
+CURRENT_CORRECTION_REPLACEMENT_RE = re.compile(
+    r"\bi\s+meant\s+(?!(?:that|this|it|those|these)\b)\S"
+    r"|\binstead\s+of\s+\S",
     re.I,
 )
 ADDRESSING_EVENT_RE = re.compile(r"(?:<@!?\d+>|(?<!\w)@[\w][\w .\-]{0,71})", re.I)
@@ -165,6 +204,7 @@ class ConversationContextRequest:
     current_message_ids: frozenset[int] = field(default_factory=frozenset)
     current_texts: tuple[str, ...] = ()
     current_participants: frozenset[int] = field(default_factory=frozenset)
+    referenced_message_ids: frozenset[int] = field(default_factory=frozenset)
     is_direct_target: bool = False
     is_reply_to_bnl: bool = False
     is_batch: bool = False
@@ -190,6 +230,21 @@ class ConversationContextResult:
     current_payload_anchor_count: int = 0
     matched_thread_count: int = 0
     suppressed_thread_count: int = 0
+    referent_status: str = "not_requested"
+    referent_candidate_count: int = 0
+    referent_selected_row_ids: tuple[int, ...] = ()
+    referent_candidate_labels: tuple[str, ...] = ()
+    referent_reason: str = ""
+
+
+@dataclass(frozen=True)
+class _ReferentResolution:
+    status: str = "not_requested"
+    candidates: tuple[dict, ...] = ()
+    selected: tuple[dict, ...] = ()
+    labels: tuple[str, ...] = ()
+    reason: str = ""
+
 
 @dataclass(frozen=True)
 class _ParsedTime:
@@ -828,6 +883,303 @@ def _unsafe_row(row: dict) -> bool:
         return True
     return False
 
+
+def nearby_contribution_referent_requested(text: str) -> bool:
+    """Recognize a structural reference without keying on one exact phrase."""
+
+    value = str(text or "")
+    pointer = bool(NEARBY_REFERENT_POINTER_RE.search(value))
+    noun = bool(NEARBY_REFERENT_NOUN_RE.search(value))
+    act = bool(NEARBY_REFERENT_ACT_RE.search(value))
+    attribution = bool(SPEAKER_ATTRIBUTION_REFERENT_RE.search(value))
+    current_correction_resolved = bool(
+        CURRENT_CORRECTION_REPLACEMENT_RE.search(value)
+    )
+    return bool(
+        attribution
+        or (pointer and noun)
+        or (noun and act)
+        or (pointer and act and not current_correction_resolved)
+    )
+
+
+def _speaker_label_referenced(text: str, label: str) -> bool:
+    cleaned = sanitize_speaker_name(label)
+    if not cleaned:
+        return False
+    words = tuple(re.findall(r"[a-z0-9]+", cleaned.lower()))
+    if not words:
+        return False
+    pattern = r"(?<![a-z0-9])" + r"\s+".join(
+        re.escape(word) for word in words
+    ) + r"(?![a-z0-9])"
+    value = str(text or "").lower()
+    attribution_patterns = (
+        pattern
+        + r"(?:'s|’s)?\s+(?:said|wrote|posted|shared|sent|called|"
+        r"message|passage|text|post|poem|story|paragraph|response|reply)\b",
+        pattern
+        + r"(?:'s|’s)\s+(?:message|passage|text|post|poem|story|"
+        r"paragraph|response|answer|reply|contribution|idea|point)\b",
+        r"\b(?:by|from)\s+" + pattern,
+        r"\b(?:what|which)\b.{0,40}" + pattern + r"\s+(?:said|wrote|posted|shared|sent)\b",
+        r"\b(?:what|which)\s+(?:did|does|has)\s+"
+        + pattern
+        + r"\s+(?:say|write|post|share|send)\b",
+    )
+    return any(
+        re.search(attribution_pattern, value)
+        for attribution_pattern in attribution_patterns
+    )
+
+
+def _narrow_referent_contribution_type(
+    candidates: tuple[dict, ...],
+    current_text: str,
+) -> tuple[tuple[dict, ...], bool]:
+    """Apply an explicitly requested contribution type without fallback."""
+
+    if LONG_FORM_REFERENT_NOUN_RE.search(current_text or ""):
+        return (
+            tuple(
+                row
+                for row in candidates
+                if (
+                    str(row.get("role") or "").lower() == "user"
+                    and (
+                        len(str(row.get("content") or "").strip()) >= 80
+                        or "\n" in str(row.get("content") or "")
+                    )
+                )
+            ),
+            True,
+        )
+    if MODEL_REFERENT_NOUN_RE.search(current_text or ""):
+        return (
+            tuple(
+                row
+                for row in candidates
+                if str(row.get("role") or "").lower()
+                in {"model", "assistant", "bnl"}
+            ),
+            True,
+        )
+    if NEARBY_REFERENT_NOUN_RE.search(current_text or ""):
+        return (
+            tuple(
+                row
+                for row in candidates
+                if str(row.get("role") or "").lower() == "user"
+            ),
+            True,
+        )
+    return candidates, False
+
+
+def _referent_candidate_labels(
+    candidates: tuple[dict, ...],
+) -> tuple[str, ...]:
+    return tuple(
+        dict.fromkeys(
+            sanitize_speaker_name(
+                row.get("user_name")
+                or (
+                    "BNL-01"
+                    if str(row.get("role") or "").lower()
+                    in {"model", "assistant", "bnl"}
+                    else "member"
+                )
+            )
+            for row in candidates
+        )
+    )
+
+
+def _resolve_nearby_contribution_referent(
+    rows: list[dict],
+    req: ConversationContextRequest,
+    current_text: str,
+    now: datetime,
+) -> _ReferentResolution:
+    """Resolve one bounded room contribution by structure and attribution."""
+
+    dynamic_speaker_reference = any(
+        str(row.get("role") or "").lower() == "user"
+        and _speaker_label_referenced(
+            current_text,
+            str(row.get("user_name") or ""),
+        )
+        for row in rows
+    )
+    if (
+        not nearby_contribution_referent_requested(current_text)
+        and not dynamic_speaker_reference
+    ):
+        return _ReferentResolution()
+    candidates = tuple(
+        sorted(
+            (
+                dict(row)
+                for row in rows
+                if (
+                    str(row.get("role") or "").lower()
+                    in {"user", "model", "assistant", "bnl"}
+                    and _row_is_same_room(row, req)
+                    and _row_age_ok(row, now, SAME_ROOM_RECENCY_MINUTES)
+                    and not _unsafe_row(row)
+                )
+            ),
+            key=lambda row: int(row.get("id") or 0),
+            reverse=True,
+        )
+    )
+    if not candidates:
+        return _ReferentResolution(
+            status="unresolved",
+            reason="no_bounded_same_room_candidates",
+        )
+
+    referenced_message_ids = {
+        int(message_id)
+        for message_id in req.referenced_message_ids
+        if int(message_id or 0) > 0
+    }
+    reply_matches = tuple(
+        row
+        for row in candidates
+        if int(row.get("message_id") or 0) in referenced_message_ids
+    )
+    if reply_matches:
+        selected = reply_matches[:1]
+        return _ReferentResolution(
+            status="resolved",
+            candidates=reply_matches,
+            selected=selected,
+            labels=tuple(
+                dict.fromkeys(
+                    sanitize_speaker_name(
+                        row.get("user_name")
+                        or (
+                            "BNL-01"
+                            if str(row.get("role") or "").lower()
+                            in {"model", "assistant", "bnl"}
+                            else "member"
+                        )
+                    )
+                    for row in reply_matches
+                )
+            ),
+            reason="discord_reply_source",
+        )
+
+    speaker_matches = tuple(
+        row
+        for row in candidates
+        if (
+            str(row.get("role") or "").lower() == "user"
+            and _speaker_label_referenced(
+                current_text,
+                str(row.get("user_name") or ""),
+            )
+        )
+    )
+    if speaker_matches:
+        narrowed_speakers, type_requested = (
+            _narrow_referent_contribution_type(
+                speaker_matches,
+                current_text,
+            )
+        )
+        if type_requested and not narrowed_speakers:
+            return _ReferentResolution(
+                status="unresolved",
+                reason="speaker_contribution_type_not_found",
+            )
+        labels = _referent_candidate_labels(narrowed_speakers)
+        if len(narrowed_speakers) == 1:
+            return _ReferentResolution(
+                status="resolved",
+                candidates=narrowed_speakers,
+                selected=narrowed_speakers,
+                labels=labels,
+                reason="speaker_attribution",
+            )
+        if POSITIONAL_REFERENT_RE.search(current_text or ""):
+            return _ReferentResolution(
+                status="resolved",
+                candidates=narrowed_speakers,
+                selected=narrowed_speakers[:1],
+                labels=labels,
+                reason="speaker_attribution_nearest",
+            )
+        immediate_speakers = tuple(
+            row
+            for row in narrowed_speakers
+            if _row_age_ok(
+                row,
+                now,
+                IMMEDIATE_REFERENT_RECENCY_MINUTES,
+            )
+        )
+        if len(immediate_speakers) == 1:
+            return _ReferentResolution(
+                status="resolved",
+                candidates=narrowed_speakers,
+                selected=immediate_speakers,
+                labels=labels,
+                reason="single_immediate_speaker_contribution",
+            )
+        return _ReferentResolution(
+            status="ambiguous",
+            candidates=narrowed_speakers,
+            labels=labels,
+            reason="multiple_speaker_contributions",
+        )
+
+    narrowed, type_requested = _narrow_referent_contribution_type(
+        candidates,
+        current_text,
+    )
+    if type_requested and not narrowed:
+        return _ReferentResolution(
+            status="unresolved",
+            reason="no_matching_contribution_type",
+        )
+    labels = _referent_candidate_labels(narrowed)
+    positional = bool(POSITIONAL_REFERENT_RE.search(current_text or ""))
+    if narrowed and positional:
+        return _ReferentResolution(
+            status="resolved",
+            candidates=narrowed,
+            selected=narrowed[:1],
+            labels=labels,
+            reason="nearest_structural_contribution",
+        )
+    immediate = tuple(
+        row
+        for row in narrowed
+        if _row_age_ok(row, now, IMMEDIATE_REFERENT_RECENCY_MINUTES)
+    )
+    if len(immediate) == 1:
+        return _ReferentResolution(
+            status="resolved",
+            candidates=immediate,
+            selected=immediate,
+            labels=labels,
+            reason="single_immediate_contribution",
+        )
+    return _ReferentResolution(
+        status="ambiguous" if narrowed else "unresolved",
+        candidates=narrowed,
+        labels=labels,
+        reason=(
+            "multiple_bounded_contributions"
+            if narrowed
+            else "no_matching_contribution_type"
+        ),
+    )
+
+
 def _unsafe_operational_state_assertion(content: str) -> bool:
     text = re.sub(r"\s+", " ", content or "").strip()
     lowered = text.lower()
@@ -1062,6 +1414,13 @@ def assemble_conversation_context_v2(rows: Iterable[dict], req: ConversationCont
             excluded += 1
             continue
         unpaired_users.append(dict(row, _same_room=same))
+    referent_eligible_rows = []
+    for row in source_rows:
+        if _is_current_duplicate(row, req, current_norms):
+            continue
+        ok, same = _eligible_row(row)
+        if ok and same:
+            referent_eligible_rows.append(dict(row, _same_room=True))
     excluded += len(orphan_models)
     scored_same, scored_cross = [], []
     for pair in pairs:
@@ -1139,6 +1498,12 @@ def assemble_conversation_context_v2(rows: Iterable[dict], req: ConversationCont
     )[:8]
     if len(current_payload_anchors) < 2:
         current_payload_anchors = ()
+    referent_resolution = _resolve_nearby_contribution_referent(
+        referent_eligible_rows,
+        req,
+        current_text,
+        now,
+    )
     selected_pairs = scored_same[:MAX_SAME_ROOM_PAIRS]
     explicit_cross_channel_continuation = bool(
         STRONG_CONTINUATION_RE.search(current_text or "")
@@ -1256,9 +1621,14 @@ def assemble_conversation_context_v2(rows: Iterable[dict], req: ConversationCont
             if len(open_unpaired) >= MAX_UNPAIRED_ROWS:
                 break
     candidates = []
+    candidate_row_ids: set[int] = set()
     for _score, pair, why in selected_pairs:
         if pair.get("_room_group"):
             users = tuple(pair.get("users") or ())
+            candidate_row_ids.update(
+                int(user.get("id") or 0) for user in users
+            )
+            candidate_row_ids.add(int(pair["model"].get("id") or 0))
             candidates.append(
                 (
                     min((int(user.get("id") or 0) for user in users), default=0),
@@ -1268,13 +1638,50 @@ def assemble_conversation_context_v2(rows: Iterable[dict], req: ConversationCont
                 )
             )
         else:
+            candidate_row_ids.update(
+                (
+                    int(pair["user"].get("id") or 0),
+                    int(pair["model"].get("id") or 0),
+                )
+            )
             candidates.append((int(pair["user"].get("id") or 0), "same_pair", pair, why))
     for _score, pair, why in selected_cross:
+        candidate_row_ids.update(
+            (
+                int(pair["user"].get("id") or 0),
+                int(pair["model"].get("id") or 0),
+            )
+        )
         candidates.append((int(pair["user"].get("id") or 0), "cross_pair", pair, why))
+    for row in referent_resolution.selected:
+        row_id = int(row.get("id") or 0)
+        role = str(row.get("role") or "").lower()
+        candidates.append(
+            (
+                row_id,
+                (
+                    "referent_model"
+                    if role in {"model", "assistant", "bnl"}
+                    else "referent_user"
+                ),
+                row,
+                ("structural_referent", referent_resolution.reason),
+            )
+        )
+        candidate_row_ids.add(row_id)
     for row in open_unpaired:
         reason = str(row.get("_unpaired_reason") or "open_loop_unpaired")
+        if int(row.get("id") or 0) in candidate_row_ids:
+            continue
         candidates.append((int(row.get("id") or 0), "unpaired_user", row, (reason,)))
-    candidates.sort(key=lambda x: x[0])
+    candidates.sort(
+        key=lambda candidate: (
+            0
+            if candidate[1] in {"referent_user", "referent_model"}
+            else 1,
+            candidate[0],
+        )
+    )
     lines = []
     header = [
         "Conversation continuity (bounded; continuity-only, not canon/current-state evidence):",
@@ -1315,29 +1722,52 @@ def assemble_conversation_context_v2(rows: Iterable[dict], req: ConversationCont
     row_ids: list[int] = []
     reasons: list[str] = [focus_reason] if focus_reason else []
     rendered_same = rendered_cross = rendered_unpaired = 0
+    rendered_row_ids: set[int] = set()
     if candidates:
         if not _append_block(lines, header, MAX_RENDERED_CHARS):
             lines = []
         for _id, kind, item, why in candidates:
             if kind in {"same_pair", "cross_pair"}:
+                cluster_ids = tuple(
+                    item["user"].get("_cluster_row_ids") or ()
+                )
+                pair_row_ids = {
+                    *(
+                        cluster_ids
+                        or (int(item["user"].get("id") or 0),)
+                    ),
+                    int(item["model"].get("id") or 0),
+                }
+                if pair_row_ids & rendered_row_ids:
+                    continue
                 block = [
                     f"{_user_role_label(item['user'])}: {sanitize_history_text(item['user'].get('content') or '')}",
                     f"{_model_role_label(item['user'])}: {sanitize_history_text(item['model'].get('content') or '')}",
                 ]
                 if not _append_block(lines, block, MAX_RENDERED_CHARS):
                     continue
-                cluster_ids = tuple(item["user"].get("_cluster_row_ids") or ())
                 row_ids.extend(
                     [
                         *(cluster_ids or (int(item["user"].get("id") or 0),)),
                         int(item["model"].get("id") or 0),
                     ]
                 )
+                rendered_row_ids.update(pair_row_ids)
                 if kind == "same_pair": rendered_same += 1
                 else: rendered_cross += 1
                 reasons.extend(why)
             elif kind == "room_group":
                 users = tuple(item.get("users") or ())
+                group_row_ids = {
+                    *(
+                        int(user.get("id") or 0)
+                        for user in users
+                        if int(user.get("id") or 0)
+                    ),
+                    int(item["model"].get("id") or 0),
+                }
+                if group_row_ids & rendered_row_ids:
+                    continue
                 block = [
                     *[
                         f"{_user_role_label(user)}: {sanitize_history_text(user.get('content') or '')}"
@@ -1357,9 +1787,13 @@ def assemble_conversation_context_v2(rows: Iterable[dict], req: ConversationCont
                         int(item["model"].get("id") or 0),
                     ]
                 )
+                rendered_row_ids.update(group_row_ids)
                 rendered_same += 1
                 reasons.extend(why)
             elif kind == "unpaired_user":
+                row_id = int(item.get("id") or 0)
+                if row_id in rendered_row_ids:
+                    continue
                 qualifier = (
                     "immediate room recap"
                     if item.get("_unpaired_reason") == "immediate_room_recap"
@@ -1372,8 +1806,70 @@ def assemble_conversation_context_v2(rows: Iterable[dict], req: ConversationCont
                 block = [f"{_user_role_label(item, qualifier)}: {sanitize_history_text(item.get('content') or '')}"]
                 if not _append_block(lines, block, MAX_RENDERED_CHARS):
                     continue
-                row_ids.append(int(item.get("id") or 0)); rendered_unpaired += 1; reasons.extend(why)
+                row_ids.append(row_id)
+                rendered_row_ids.add(row_id)
+                rendered_unpaired += 1
+                reasons.extend(why)
+            elif kind in {"referent_user", "referent_model"}:
+                row_id = int(item.get("id") or 0)
+                if row_id in rendered_row_ids:
+                    continue
+                if kind == "referent_model":
+                    label = "BNL-01 (resolved nearby referent)"
+                else:
+                    label = _user_role_label(
+                        item,
+                        "resolved nearby referent",
+                    )
+                block = [
+                    f"{label}: "
+                    + sanitize_history_text(
+                        item.get("content") or "",
+                        limit=MAX_REFERENT_LINE_CHARS,
+                    )
+                ]
+                if not _append_block(lines, block, MAX_RENDERED_CHARS):
+                    continue
+                row_ids.append(row_id)
+                rendered_row_ids.add(row_id)
+                rendered_unpaired += 1
+                reasons.extend(why)
+    resolved_referent_ids = tuple(
+        int(row.get("id") or 0)
+        for row in referent_resolution.selected
+        if int(row.get("id") or 0) > 0
+    )
+    final_referent_status = referent_resolution.status
+    final_referent_reason = referent_resolution.reason
+    if (
+        final_referent_status == "resolved"
+        and (
+            not resolved_referent_ids
+            or not all(
+                row_id in rendered_row_ids
+                for row_id in resolved_referent_ids
+            )
+        )
+    ):
+        final_referent_status = "unresolved"
+        final_referent_reason = "resolved_source_not_rendered"
+    if final_referent_status != "not_requested":
+        reasons.extend(
+            (
+                "referent_%s" % final_referent_status,
+                final_referent_reason,
+            )
+        )
     rendered = "\n".join(lines).strip()
+    fallback_reason = (
+        "selected"
+        if rendered
+        else (
+            "referent_%s" % final_referent_status
+            if final_referent_status in {"ambiguous", "unresolved"}
+            else "no_relevant_context"
+        )
+    )
     return ConversationContextResult(
         rendered,
         tuple(row_ids),
@@ -1384,9 +1880,20 @@ def assemble_conversation_context_v2(rows: Iterable[dict], req: ConversationCont
         excluded,
         tuple(sorted(set(reasons))) or ("no_relevant_context",),
         len(rendered),
-        fallback_reason="selected" if rendered else "no_relevant_context",
+        fallback_reason=fallback_reason,
         thread_focus_mode=thread_focus_mode,
         current_payload_anchor_count=len(current_payload_anchors),
         matched_thread_count=matched_thread_count,
         suppressed_thread_count=suppressed_thread_count,
+        referent_status=final_referent_status,
+        referent_candidate_count=len(referent_resolution.candidates),
+        referent_selected_row_ids=tuple(
+            row_id
+            for row_id in resolved_referent_ids
+            if row_id in rendered_row_ids
+        ),
+        referent_candidate_labels=tuple(
+            label for label in referent_resolution.labels if label
+        ),
+        referent_reason=final_referent_reason,
     )
