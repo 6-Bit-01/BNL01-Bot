@@ -514,6 +514,171 @@ class SharedBrainSynthesisCanaryTests(unittest.TestCase):
             repair_prompt,
         )
 
+    def test_explicit_lore_and_glitch_expression_survives_factual_gate(
+        self,
+    ):
+        self._add_profile_fact(
+            source_row_id=902,
+            predicate_key="favorite_color",
+            value="violet",
+            observed_at="2026-07-26T12:00:01+00:00",
+        )
+        packet = self._build_packet()
+        basis = self._build_basis(
+            packet,
+            self._build_assessment(packet),
+        )
+        candidate = (
+            "Your favorite movie is Arrival and your favorite color is "
+            "violet. "
+            "~[BROADCAST BLEED: ...recipe fragment: for proper crust "
+            "levitation, knead two pinches of bioluminescent yeast into the "
+            "dough. Stop when it hums quietly in C-minor...]~"
+        )
+        run = begin_run(
+            self.conn,
+            basis,
+            baseline_response="Established response.",
+            environ=self.flags,
+        )
+
+        decision = evaluate_candidate(
+            self.conn,
+            run,
+            baseline_response="Established response.",
+            candidate_response=candidate,
+            environ=self.flags,
+        )
+
+        self.assertTrue(decision.candidate_selected)
+        self.assertEqual(decision.response, candidate)
+        self.assertEqual(
+            decision.candidate_claim_classifications,
+            (
+                "member_supported",
+                "member_supported",
+                "transient_expression",
+            ),
+        )
+        self.assertEqual(decision.candidate_connective_claim_count, 1)
+        self.assertEqual(
+            decision.candidate_unsupported_factual_claim_count,
+            0,
+        )
+
+    def test_transient_expression_cannot_supply_evidence_or_hide_authority(
+        self,
+    ):
+        self._add_profile_fact(
+            source_row_id=902,
+            predicate_key="favorite_color",
+            value="violet",
+            observed_at="2026-07-26T12:00:01+00:00",
+        )
+        packet = self._build_packet()
+        basis = self._build_basis(
+            packet,
+            self._build_assessment(packet),
+        )
+
+        expression_only_run = begin_run(
+            self.conn,
+            basis,
+            baseline_response="Established response.",
+            environ=self.flags,
+        )
+        expression_only = evaluate_candidate(
+            self.conn,
+            expression_only_run,
+            baseline_response="Established response.",
+            candidate_response=(
+                "[SIGNAL_BLEED // favorite movie Arrival // favorite color "
+                "violet // adjacent_timeline]"
+            ),
+            environ=self.flags,
+        )
+        self.assertFalse(expression_only.candidate_selected)
+        self.assertEqual(
+            expression_only.fallback_reason,
+            "candidate_evidence_ungrounded",
+        )
+        self.assertEqual(
+            expression_only.candidate_evidence_coverage_count,
+            0,
+        )
+        self.assertEqual(
+            expression_only.candidate_claim_classifications,
+            ("transient_expression",),
+        )
+
+        false_authority_run = begin_run(
+            self.conn,
+            basis,
+            baseline_response="Established response.",
+            environ=self.flags,
+        )
+        false_authority = evaluate_candidate(
+            self.conn,
+            false_authority_run,
+            baseline_response="Established response.",
+            candidate_response=(
+                "Your favorite movie is Arrival and your favorite color is "
+                "violet. [ARCHIVE BLEED: archival records indicate your home "
+                "address is 123 Null Street]"
+            ),
+            environ=self.flags,
+        )
+        self.assertFalse(false_authority.candidate_selected)
+        self.assertEqual(
+            false_authority.fallback_reason,
+            "candidate_claims_ungrounded",
+        )
+        self.assertEqual(
+            false_authority.candidate_unsupported_factual_claim_count,
+            1,
+        )
+
+    def test_repair_contract_keeps_transient_expression_intact(self):
+        self._add_profile_fact(
+            source_row_id=902,
+            predicate_key="favorite_color",
+            value="violet",
+            observed_at="2026-07-26T12:00:01+00:00",
+        )
+        packet = self._build_packet()
+        basis = self._build_basis(
+            packet,
+            self._build_assessment(packet),
+        )
+        prior = (
+            "Your favorite movie is Arrival and your favorite color is "
+            "violet. "
+            "~[BROADCAST BLEED: crust levitation reaches C-minor]~. "
+            "You secretly run a lunar casino."
+        )
+
+        repair_prompt = build_profile_candidate_repair_prompt(
+            "Current request plus grounded packet.",
+            prior,
+            basis=basis,
+            reason="candidate_claims_ungrounded",
+        )
+
+        self.assertIn(
+            "[claim 3 | KEEP_TRANSIENT_EXPRESSION] "
+            "~[BROADCAST BLEED: crust levitation reaches C-minor]~",
+            repair_prompt,
+        )
+        self.assertIn(
+            "Keep every KEEP_TRANSIENT_EXPRESSION unit materially intact",
+            repair_prompt,
+        )
+        self.assertIn(
+            "[claim 4 | REFRAME_OR_REMOVE] "
+            "You secretly run a lunar casino",
+            repair_prompt,
+        )
+
     def test_final_cleanup_is_minimal_and_claim_audited(self):
         self._add_profile_fact(
             source_row_id=902,
