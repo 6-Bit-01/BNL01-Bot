@@ -108,7 +108,7 @@ class FakeChannel:
 
 
 class FakeAuthor:
-    def __init__(self, user_id=100, display_name="Jon"):
+    def __init__(self, user_id=100, display_name="Test Member"):
         self.id = user_id
         self.display_name = display_name
         self.bot = False
@@ -231,14 +231,14 @@ class ConversationBatchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         channel_type = BlockingSendChannel if blocking_send else FakeChannel
         return channel_type(channel_id)
 
-    def _append(self, channel, text, *, user_id=100, name="Jon"):
+    def _append(self, channel, text, *, user_id=100, name="Test Member"):
         bnl01_bot._channel_buffers[channel.id].append((name, text, user_id))
         bnl01_bot._channel_last_message_at[channel.id] = bnl01_bot.datetime.now(bnl01_bot.PACIFIC_TZ)
 
     def _prime_flush(self, channel, *texts):
         now = bnl01_bot.datetime.now(bnl01_bot.PACIFIC_TZ)
         for text in texts:
-            bnl01_bot._channel_buffers[channel.id].append(("Jon", text, 100))
+            bnl01_bot._channel_buffers[channel.id].append(("Test Member", text, 100))
         bnl01_bot._channel_first_seen[channel.id] = now
         bnl01_bot._channel_last_message_at[channel.id] = now
         bnl01_bot._channel_last_reply_at[channel.id] = now - bnl01_bot.timedelta(hours=2)
@@ -454,7 +454,7 @@ class ConversationBatchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
                     mock.patch.object(
                         bnl01_bot,
                         "get_user_profile",
-                        return_value=("Jon", None),
+                        return_value=("Test Member", None),
                     ),
                     mock.patch.object(
                         bnl01_bot,
@@ -752,7 +752,7 @@ class ConversationBatchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         prompts = []
         guard_kwargs = []
         addressing = bnl01_bot.DiscordTurnAddressing(
-            speaker="Jon",
+            speaker="Test Member",
             explicit_tag_recipients=("BNL-01", "@Crow"),
             reply_target="none",
             explicitly_mentions_bnl=True,
@@ -762,7 +762,7 @@ class ConversationBatchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
             plain_text_names_bnl=False,
         )
         turn = bnl01_bot.BatchConversationTurn(
-            "Jon",
+            "Test Member",
             "what did @Crow mean about the poster layout?",
             100,
             addressing,
@@ -843,9 +843,9 @@ class ConversationBatchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
             return wrong_response if len(prompts) == 1 else repaired_response
 
         addressing = bnl01_bot.DiscordTurnAddressing(
-            speaker="Jon",
+            speaker="Test Member",
             explicit_tag_recipients=(),
-            reply_target="Jon",
+            reply_target="Test Member",
             explicitly_mentions_bnl=False,
             reply_targets_bnl=False,
             directly_targets_bnl=False,
@@ -857,7 +857,7 @@ class ConversationBatchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
             reply_message_id=exact_message_id,
         )
         turn = bnl01_bot.BatchConversationTurn(
-            "Jon",
+            "Test Member",
             "BNL, improve this idea in one sentence.",
             100,
             addressing,
@@ -900,7 +900,7 @@ class ConversationBatchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
                         (
                             (
                                 100,
-                                "Jon",
+                                "Test Member",
                                 channel.guild.id,
                                 "user",
                                 (
@@ -915,7 +915,7 @@ class ConversationBatchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
                             ),
                             (
                                 100,
-                                "Jon",
+                                "Test Member",
                                 channel.guild.id,
                                 "user",
                                 (
@@ -1014,10 +1014,10 @@ class ConversationBatchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         channel = self._channel(8137)
         now = bnl01_bot.datetime.now(bnl01_bot.PACIFIC_TZ)
         for item in (
-            ("Jon", "I will handle the intro.", 100),
+            ("Test Member", "I will handle the intro.", 100),
             ("Miss Bit", "I will handle the artwork.", 101),
             ("Crow", "I will handle the promo clips.", 102),
-            ("Jon", "What did everyone just decide?", 100),
+            ("Test Member", "What did everyone just decide?", 100),
         ):
             bnl01_bot._channel_buffers[channel.id].append(item)
         bnl01_bot._channel_first_seen[channel.id] = now
@@ -1029,7 +1029,7 @@ class ConversationBatchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
 
         async def generate(_prompt, **_kwargs):
             return (
-                "Jon has the intro, Miss Bit has the artwork, and Crow has "
+                "Test Member has the intro, Miss Bit has the artwork, and Crow has "
                 "the promo clips."
             )
 
@@ -1138,7 +1138,7 @@ class ConversationBatchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         prompts = []
         prior_exchange = (
             "Conversation continuity (bounded same-room window):\n"
-            "- Jon: @Miss Bit what do you think about Friday's opener?\n"
+            "- Test Member: @Miss Bit what do you think about Friday's opener?\n"
             "- BNL-01: The tag was for Miss Bit, but I answered anyway."
         )
 
@@ -1844,10 +1844,10 @@ class ConversationBatchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
 
         now = bnl01_bot.datetime.now(bnl01_bot.PACIFIC_TZ)
         bnl01_bot._channel_interrupt_handoff[channel.id] = [
-            ("Jon", "BNL, why are routers weird?", 100),
-            ("Jon", "and why do they blink?", 100),
+            ("Test Member", "BNL, why are routers weird?", 100),
+            ("Test Member", "and why do they blink?", 100),
         ]
-        bnl01_bot._channel_buffers[channel.id].append(("Jon", "also, why are they warm?", 100))
+        bnl01_bot._channel_buffers[channel.id].append(("Test Member", "also, why are they warm?", 100))
         bnl01_bot._channel_first_seen[channel.id] = now
         bnl01_bot._channel_last_message_at[channel.id] = now
         bnl01_bot._channel_last_reply_at[channel.id] = now - bnl01_bot.timedelta(hours=2)
@@ -1946,7 +1946,7 @@ class ConversationBatchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         message = FakeMessage(channel, "BNL, answer this now")
         now = bnl01_bot.datetime.now(bnl01_bot.PACIFIC_TZ)
         bnl01_bot._channel_interrupt_handoff[channel.id] = [
-            ("Jon", "an older interrupted fragment", 100),
+            ("Test Member", "an older interrupted fragment", 100),
         ]
         bnl01_bot._channel_first_seen[channel.id] = now
         bnl01_bot._channel_last_message_at[channel.id] = now

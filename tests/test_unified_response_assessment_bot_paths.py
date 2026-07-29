@@ -389,7 +389,7 @@ class UnifiedResponseAssessmentBotPathTests(unittest.TestCase):
                 "Idea A: a radio tower that wakes up at midnight."
             ),
             "user_id": 101,
-            "user_name": "Jon",
+            "user_name": "Test Member",
         }
         competing_row = {
             "id": 11,
@@ -398,7 +398,7 @@ class UnifiedResponseAssessmentBotPathTests(unittest.TestCase):
                 "Idea B: a vending machine that trades memories."
             ),
             "user_id": 101,
-            "user_name": "Jon",
+            "user_name": "Test Member",
         }
         context_result = SimpleNamespace(
             referent_status="resolved",
@@ -409,7 +409,7 @@ class UnifiedResponseAssessmentBotPathTests(unittest.TestCase):
         )
         rendered = (
             "Conversation continuity:\n"
-            "Jon (exact Discord reply source): "
+            "Test Member (exact Discord reply source): "
             "Idea A: a radio tower that wakes up at midnight."
         )
         with (
@@ -482,19 +482,19 @@ class UnifiedResponseAssessmentBotPathTests(unittest.TestCase):
             channel_policy="sealed_test",
             source_row_ids=(1, 2, 3, 4),
             participant_user_ids=(101, 102),
-            speaker_labels=("Jon", "Miss Bit"),
+            speaker_labels=("Test Member", "Miss Bit"),
             evidence_items=(
                 bnl01_bot.build_conversation_evidence_item(
                     text="Pick Ghost Signal or Neon Static.",
                     source_id=1,
                     speaker_user_id=101,
-                    speaker_label="Jon",
+                    speaker_label="Test Member",
                 ),
                 bnl01_bot.build_conversation_evidence_item(
                     text="“Dead Channel” sounds abandoned.",
                     source_id=3,
                     speaker_user_id=101,
-                    speaker_label="Jon",
+                    speaker_label="Test Member",
                 ),
                 bnl01_bot.build_conversation_evidence_item(
                     text=(
@@ -509,7 +509,7 @@ class UnifiedResponseAssessmentBotPathTests(unittest.TestCase):
                     text="“Open Circuit” sounds active.",
                     source_id=5,
                     speaker_user_id=101,
-                    speaker_label="Jon",
+                    speaker_label="Test Member",
                 ),
             ),
         )
@@ -528,7 +528,7 @@ class UnifiedResponseAssessmentBotPathTests(unittest.TestCase):
                         "Which title fits a hidden test zone better, and why?"
                     ),
                     current_speaker_user_ids=(101,),
-                    current_speaker_labels=("Jon",),
+                    current_speaker_labels=("Test Member",),
                     prompt_source_bases=(basis,),
                     prompt_lanes=(
                         "current_exchange",
@@ -725,7 +725,7 @@ class ExactReplyGroundingGuardTests(unittest.IsolatedAsyncioTestCase):
             expected_digest="stable",
             rendered_context=(
                 "Conversation continuity:\n"
-                "Jon (exact Discord reply source): "
+                "Test Member (exact Discord reply source): "
                 "Idea A: a radio tower that wakes up at midnight."
             ),
             guild_id=1,
@@ -742,7 +742,7 @@ class ExactReplyGroundingGuardTests(unittest.IsolatedAsyncioTestCase):
                     ),
                     source_id=10,
                     speaker_user_id=101,
-                    speaker_label="Jon",
+                    speaker_label="Test Member",
                 ),
             ),
             referent_competing_evidence_items=(
@@ -752,7 +752,7 @@ class ExactReplyGroundingGuardTests(unittest.IsolatedAsyncioTestCase):
                     ),
                     source_id=11,
                     speaker_user_id=101,
-                    speaker_label="Jon",
+                    speaker_label="Test Member",
                 ),
             ),
         )
