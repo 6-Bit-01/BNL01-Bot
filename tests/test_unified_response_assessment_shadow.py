@@ -39,7 +39,7 @@ class UnifiedResponseAssessmentShadowTests(unittest.TestCase):
                 text="“Chrome Prophet” sounds like a person.",
                 source_id=10,
                 speaker_user_id=101,
-                speaker_label="Jon",
+                speaker_label="Test Member",
             ),
             build_conversation_evidence_item(
                 text=(
@@ -54,12 +54,12 @@ class UnifiedResponseAssessmentShadowTests(unittest.TestCase):
                 text="“Null Basilica” sounds like a place.",
                 source_id=12,
                 speaker_user_id=101,
-                speaker_label="Jon",
+                speaker_label="Test Member",
             ),
             build_conversation_evidence_item(
                 text=final_question,
                 speaker_user_id=101,
-                speaker_label="Jon",
+                speaker_label="Test Member",
                 current_turn=True,
             ),
         )
@@ -70,7 +70,7 @@ class UnifiedResponseAssessmentShadowTests(unittest.TestCase):
             conversation_surface="test",
             current_speaker_user_ids=(101,),
             participant_user_ids=(101, 202),
-            speaker_labels=("Jon", "Miss Bit"),
+            speaker_labels=("Test Member", "Miss Bit"),
             current_exchange_source_ids=(10, 11, 12),
             prompt_lanes=("current_exchange", "conversation_context"),
             current_payload_anchors=(
@@ -448,7 +448,7 @@ class UnifiedResponseAssessmentShadowTests(unittest.TestCase):
                 build_conversation_evidence_item(
                     text=request,
                     speaker_user_id=101,
-                    speaker_label="Jon",
+                    speaker_label="Test Member",
                     current_turn=True,
                 ),
             ),
@@ -482,7 +482,7 @@ class UnifiedResponseAssessmentShadowTests(unittest.TestCase):
             conversation_surface="test",
             current_speaker_user_ids=(101,),
             participant_user_ids=(101, 202),
-            speaker_labels=("Jon", "Miss Bit"),
+            speaker_labels=("Test Member", "Miss Bit"),
             current_exchange_source_ids=(40,),
             prompt_lanes=("current_exchange", "conversation_context"),
             current_text=request,
@@ -499,7 +499,7 @@ class UnifiedResponseAssessmentShadowTests(unittest.TestCase):
                 build_conversation_evidence_item(
                     text=request,
                     speaker_user_id=101,
-                    speaker_label="Jon",
+                    speaker_label="Test Member",
                     current_turn=True,
                 ),
             ),
@@ -543,7 +543,7 @@ class UnifiedResponseAssessmentShadowTests(unittest.TestCase):
                 build_conversation_evidence_item(
                     text=request,
                     speaker_user_id=101,
-                    speaker_label="Jon",
+                    speaker_label="Test Member",
                     current_turn=True,
                 ),
             ),
@@ -571,13 +571,13 @@ class UnifiedResponseAssessmentShadowTests(unittest.TestCase):
                 build_conversation_evidence_item(
                     text="The retry guard now has a bounded fallback.",
                     speaker_user_id=101,
-                    speaker_label="Jon",
+                    speaker_label="Test Member",
                     current_turn=True,
                 ),
                 build_conversation_evidence_item(
                     text=request,
                     speaker_user_id=101,
-                    speaker_label="Jon",
+                    speaker_label="Test Member",
                     current_turn=True,
                 ),
             ),
@@ -594,7 +594,7 @@ class UnifiedResponseAssessmentShadowTests(unittest.TestCase):
                 ),
                 source_id=20,
                 speaker_user_id=101,
-                speaker_label="Jon",
+                speaker_label="Test Member",
             ),
             build_conversation_evidence_item(
                 text="Who owns the artwork?",
@@ -610,7 +610,7 @@ class UnifiedResponseAssessmentShadowTests(unittest.TestCase):
             conversation_surface="test",
             current_speaker_user_ids=(202,),
             participant_user_ids=(101, 202),
-            speaker_labels=("Jon", "Miss Bit"),
+            speaker_labels=("Test Member", "Miss Bit"),
             current_exchange_source_ids=(20, 21),
             prompt_lanes=("current_exchange", "conversation_context"),
             current_text="Who owns the artwork?",
@@ -720,7 +720,7 @@ class UnifiedResponseAssessmentShadowTests(unittest.TestCase):
                         text=prior_text,
                         source_id=10,
                         speaker_user_id=101,
-                        speaker_label="Jon",
+                        speaker_label="Test Member",
                     ),
                     build_conversation_evidence_item(
                         text=current_text,
@@ -736,7 +736,7 @@ class UnifiedResponseAssessmentShadowTests(unittest.TestCase):
                     conversation_surface="test",
                     current_speaker_user_ids=(202,),
                     participant_user_ids=(101, 202),
-                    speaker_labels=("Jon", "Miss Bit"),
+                    speaker_labels=("Test Member", "Miss Bit"),
                     current_exchange_source_ids=(10,),
                     prompt_lanes=(
                         "current_exchange",

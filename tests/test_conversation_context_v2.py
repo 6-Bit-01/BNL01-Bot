@@ -136,7 +136,7 @@ class ConversationContextV2Tests(unittest.TestCase):
                 "user",
                 "Pick one: Ghost Signal or Neon Static?",
                 user=1,
-                name="Jon",
+                name="Test Member",
                 minutes=8,
             ),
             row(
@@ -151,7 +151,7 @@ class ConversationContextV2Tests(unittest.TestCase):
                 "user",
                 "Dead Channel sounds abandoned.",
                 user=1,
-                name="Jon",
+                name="Test Member",
                 minutes=2,
             ),
             row(
@@ -348,7 +348,7 @@ class ConversationContextV2Tests(unittest.TestCase):
                 "user",
                 "The machine only fails on its second restart.",
                 user=1,
-                name="Jon",
+                name="Test Member",
                 minutes=8,
             ),
             row(
@@ -363,7 +363,7 @@ class ConversationContextV2Tests(unittest.TestCase):
                 "user",
                 "I'm handling the intro.",
                 user=1,
-                name="Jon",
+                name="Test Member",
                 minutes=3,
             ),
             row(
@@ -386,7 +386,7 @@ class ConversationContextV2Tests(unittest.TestCase):
         )
 
         self.assertIn(
-            'User/member (display name “Jon”; immediate room recap): '
+            'User/member (display name “Test Member”; immediate room recap): '
             "I'm handling the intro.",
             result.rendered_context,
         )
@@ -476,7 +476,7 @@ class ConversationContextV2Tests(unittest.TestCase):
                 "user",
                 "The machine only fails on its second restart.",
                 user=1,
-                name="Jon",
+                name="Test Member",
                 minutes=8,
             ),
             row(
@@ -511,7 +511,7 @@ class ConversationContextV2Tests(unittest.TestCase):
                 "user",
                 "The older thread was about restart logs.",
                 user=1,
-                name="Jon",
+                name="Test Member",
                 minutes=8,
             ),
             row(
@@ -1244,7 +1244,7 @@ class BotConversationContextV2IntegrationTests(unittest.TestCase):
             "user",
             "The machine only fails on its second restart.",
             uid=1,
-            name="Jon",
+            name="Test Member",
             minutes=8,
         )
         self._insert(
@@ -1254,10 +1254,10 @@ class BotConversationContextV2IntegrationTests(unittest.TestCase):
             minutes=7,
         )
         current_items = [
-            ("Jon", "I'm handling the intro.", 1),
+            ("Test Member", "I'm handling the intro.", 1),
             ("Miss Bit", "I'm handling the artwork.", 2),
             (
-                "Jon",
+                "Test Member",
                 "BNL, what were Miss Bit and I just talking about?",
                 1,
             ),
@@ -1294,7 +1294,7 @@ class BotConversationContextV2IntegrationTests(unittest.TestCase):
         if continuity_contract:
             prompt += "\n\n" + continuity_contract
 
-        self.assertIn("- Jon: I'm handling the intro.", prompt)
+        self.assertIn("- Test Member: I'm handling the intro.", prompt)
         self.assertIn("- Miss Bit: I'm handling the artwork.", prompt)
         self.assertIn("Immediate room recap contract:", prompt)
         self.assertIn("no magic word such as “gist” is required", prompt)

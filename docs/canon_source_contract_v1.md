@@ -15,6 +15,18 @@ This PR adds a small typed vocabulary for approved in-world canon and source saf
 - BNL-01 remains an in-world BARCODE Network Liaison Entity with filtered surfaces and incomplete-record behavior.
 - “Reality first. Meaning second. Mythology deeper.” remains website information architecture, not BNL’s speaking order.
 
+## Owner identity privacy
+
+6 Bit is the only human-readable BARCODE identity for the project owner. A
+real-world personal or legal name is private, is not BARCODE canon, and must not
+appear in code, tests, fixtures, prompts, seed data, logs, diagnostics,
+documentation, or public/admin surfaces.
+
+Owner-only access and diagnostics use `BNL_OWNER_USER_ID` or another opaque
+stable identifier. Public BNL output may recognize 6 Bit as an artist, host,
+and founding BARCODE figure, but it must not reveal or imply private account,
+owner, controller, admin, operator, or infrastructure facts.
+
 ## Central sanitized read-model boundary
 
 `fetch_bnl_read_model()` may retain the raw validated payload in its private cache for capability checks, cache metadata, and privacy-safe diagnostics. Normal consumers use the sanitized consumption view through the bot boundary before prompt assembly or intent dispatch.

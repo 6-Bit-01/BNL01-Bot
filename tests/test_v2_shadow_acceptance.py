@@ -316,7 +316,7 @@ class V2ShadowAcceptanceTests(unittest.TestCase):
             conversation_surface="test",
             current_speaker_user_ids=(99,),
             participant_user_ids=(99, 100),
-            speaker_labels=("Jon", "Miss Bit"),
+            speaker_labels=("Test Member", "Miss Bit"),
             prompt_lanes=("current_exchange", "conversation_context"),
             current_exchange_source_ids=(1, 2, 3),
             current_payload_anchors=(
@@ -329,7 +329,7 @@ class V2ShadowAcceptanceTests(unittest.TestCase):
                     text="Chrome Prophet sounds like a person.",
                     source_id=1,
                     speaker_user_id=99,
-                    speaker_label="Jon",
+                    speaker_label="Test Member",
                 ),
                 build_conversation_evidence_item(
                     text=(
@@ -344,12 +344,12 @@ class V2ShadowAcceptanceTests(unittest.TestCase):
                     text="Null Basilica sounds like a place.",
                     source_id=3,
                     speaker_user_id=99,
-                    speaker_label="Jon",
+                    speaker_label="Test Member",
                 ),
                 build_conversation_evidence_item(
                     text=request,
                     speaker_user_id=99,
-                    speaker_label="Jon",
+                    speaker_label="Test Member",
                     current_turn=True,
                 ),
             ),

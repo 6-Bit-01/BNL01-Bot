@@ -484,7 +484,7 @@ class DirectPayloadAddressingTests(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_deferred_plan_starts_existing_protected_payload_waiter(self):
-        author = SimpleNamespace(id=100, display_name="Jon")
+        author = SimpleNamespace(id=100, display_name="Test Member")
         guild = SimpleNamespace(id=1)
         channel = SimpleNamespace(id=2, name="bnl-testing", guild=guild)
         message = SimpleNamespace(id=10, guild=guild, channel=channel, author=author)

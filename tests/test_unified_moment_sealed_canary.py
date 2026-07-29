@@ -31,7 +31,7 @@ class UnifiedMomentSealedCanaryTests(unittest.IsolatedAsyncioTestCase):
                 text="“Chrome Prophet” sounds like a person.",
                 source_id=10,
                 speaker_user_id=101,
-                speaker_label="Jon",
+                speaker_label="Test Member",
             ),
             bnl01_bot.build_conversation_evidence_item(
                 text=(
@@ -46,7 +46,7 @@ class UnifiedMomentSealedCanaryTests(unittest.IsolatedAsyncioTestCase):
                 text="“Null Basilica” sounds like a place.",
                 source_id=12,
                 speaker_user_id=101,
-                speaker_label="Jon",
+                speaker_label="Test Member",
             ),
         )
         return bnl01_bot.build_unified_response_assessment(
@@ -56,7 +56,7 @@ class UnifiedMomentSealedCanaryTests(unittest.IsolatedAsyncioTestCase):
             conversation_surface="test",
             current_speaker_user_ids=(101,),
             participant_user_ids=(101, 202),
-            speaker_labels=("Jon", "Miss Bit"),
+            speaker_labels=("Test Member", "Miss Bit"),
             current_exchange_source_ids=(10, 11, 12),
             prompt_lanes=("current_exchange", "conversation_context"),
             current_payload_anchors=(
@@ -203,7 +203,7 @@ class UnifiedMomentSealedCanaryTests(unittest.IsolatedAsyncioTestCase):
             channel_policy="sealed_test",
             source_row_ids=(10, 11, 12),
             participant_user_ids=(101, 202),
-            speaker_labels=("Jon", "Miss Bit"),
+            speaker_labels=("Test Member", "Miss Bit"),
             evidence_items=self.assessment().conversation_evidence_items,
         )
 
@@ -222,7 +222,7 @@ class UnifiedMomentSealedCanaryTests(unittest.IsolatedAsyncioTestCase):
             mock.patch.object(
                 bnl01_bot,
                 "get_user_profile",
-                return_value=("Jon", ""),
+                return_value=("Test Member", ""),
             ),
             mock.patch.object(
                 bnl01_bot,
@@ -279,7 +279,7 @@ class UnifiedMomentSealedCanaryTests(unittest.IsolatedAsyncioTestCase):
             sealed_prompt, *_ = bnl01_bot.build_user_aware_prompt(
                 101,
                 1,
-                "Jon",
+                "Test Member",
                 request,
                 room_context="bounded room context",
                 channel_name="bnl-testing",
@@ -292,7 +292,7 @@ class UnifiedMomentSealedCanaryTests(unittest.IsolatedAsyncioTestCase):
             public_prompt_on, *_ = bnl01_bot.build_user_aware_prompt(
                 101,
                 1,
-                "Jon",
+                "Test Member",
                 request,
                 room_context="bounded room context",
                 channel_name="general",
@@ -307,7 +307,7 @@ class UnifiedMomentSealedCanaryTests(unittest.IsolatedAsyncioTestCase):
             public_prompt_off, *_ = bnl01_bot.build_user_aware_prompt(
                 101,
                 1,
-                "Jon",
+                "Test Member",
                 request,
                 room_context="bounded room context",
                 channel_name="general",
