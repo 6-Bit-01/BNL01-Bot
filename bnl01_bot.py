@@ -141,6 +141,7 @@ from bnl_shared_brain_synthesis import (
     begin_run as begin_shared_brain_synthesis_run,
     build_basis as build_shared_brain_synthesis_basis,
     build_packet_owned_prompt,
+    build_profile_candidate_cleanup_prompt,
     build_profile_candidate_repair_prompt,
     configuration as shared_brain_synthesis_canary_configuration,
     ensure_schema as ensure_shared_brain_synthesis_schema,
@@ -33114,6 +33115,62 @@ async def maybe_generate_shared_brain_synthesis_canary(
                 )
                 candidate_response = repaired_response
                 candidate_prompt = repair_prompt
+                if (
+                    not decision.candidate_selected
+                    and decision.fallback_reason
+                    == "candidate_claims_ungrounded"
+                ):
+                    cleanup_prompt = (
+                        build_profile_candidate_cleanup_prompt(
+                            packet_owned_prompt.prompt,
+                            repaired_response,
+                            basis=basis,
+                            reason=decision.fallback_reason,
+                        )
+                    )
+                    cleanup_started = time.monotonic()
+                    try:
+                        cleaned_response = (
+                            await get_gemini_response_with_optional_typing(
+                                channel,
+                                cleanup_prompt,
+                                user_id,
+                                guild_id,
+                                route=(
+                                    "shared_brain_synthesis_canary_cleanup"
+                                ),
+                                source_context_available=(
+                                    source_context_available
+                                ),
+                            )
+                            or ""
+                        ).strip()
+                    except Exception as exc:
+                        logging.warning(
+                            "shared_brain_synthesis_canary_cleanup_failed "
+                            "error=%s",
+                            type(exc).__name__,
+                        )
+                        cleaned_response = ""
+                    candidate_generation_latency_ms += max(
+                        0,
+                        int(
+                            round(
+                                (time.monotonic() - cleanup_started)
+                                * 1000
+                            )
+                        ),
+                    )
+                    if cleaned_response:
+                        decision = await asyncio.to_thread(
+                            _evaluate_shared_brain_synthesis_receipt,
+                            run,
+                            baseline_response,
+                            cleaned_response,
+                            candidate_generation_latency_ms,
+                        )
+                        candidate_response = cleaned_response
+                        candidate_prompt = cleanup_prompt
         if (
             decision.candidate_selected
             and is_generic_non_answer_response(
@@ -36359,6 +36416,7 @@ class BnlMemoryPreviewExecution:
     established_response: str = ""
     packet_candidate_response: str = ""
     repair_response: str = ""
+    cleanup_response: str = ""
     final_selection: str = "established_path"
     stale_reason: str = ""
     guard_suppression_reason: str = ""
@@ -36532,6 +36590,7 @@ async def execute_bnl_memory_preview(
     baseline_response = ""
     packet_candidate_response = ""
     repair_response = ""
+    cleanup_response = ""
     try:
         initial = await asyncio.to_thread(
             prepare_memory_preview,
@@ -36715,6 +36774,87 @@ async def execute_bnl_memory_preview(
                         reason="candidate_%s" % repair_stale_reason,
                     )
 
+        if (
+            unchanged
+            and fresh.ready
+            and repair_response
+            and not evaluation.candidate_selected
+            and evaluation.fallback_reason
+            == "candidate_claims_ungrounded"
+        ):
+            cleanup_prompt = build_profile_candidate_cleanup_prompt(
+                fresh.packet_owned_prompt.prompt,
+                candidate_response,
+                basis=fresh.basis,
+                reason=evaluation.fallback_reason,
+            )
+            cleanup_started = time.monotonic()
+            cleaned_response = (
+                await generate(
+                    cleanup_prompt,
+                    "bnl_memory_preview_candidate_cleanup",
+                )
+                or ""
+            ).strip()
+            cleanup_response = cleaned_response
+            candidate_latency_ms += max(
+                0,
+                int(
+                    round(
+                        (time.monotonic() - cleanup_started)
+                        * 1000
+                    )
+                ),
+            )
+            cleanup_fresh = await asyncio.to_thread(
+                prepare_memory_preview,
+                request,
+                baseline_prompt_builder=(
+                    build_bnl_memory_preview_established_prompt
+                ),
+            )
+            cleanup_unchanged, cleanup_stale_reason = (
+                memory_preview_snapshots_equivalent(
+                    fresh,
+                    cleanup_fresh,
+                )
+            )
+            if cleanup_unchanged and cleaned_response:
+                cleanup_evaluation = await asyncio.to_thread(
+                    evaluate_memory_preview,
+                    cleanup_fresh,
+                    baseline_response=baseline_response,
+                    candidate_response=cleaned_response,
+                    candidate_generation_latency_ms=(
+                        candidate_latency_ms
+                    ),
+                )
+                fresh.close()
+                fresh = cleanup_fresh
+                evaluation = cleanup_evaluation
+                candidate_response = cleaned_response
+                candidate_prompt = cleanup_prompt
+                stale_reason = ""
+            else:
+                cleanup_fresh.close()
+                stale_reason = (
+                    cleanup_stale_reason
+                    if not cleanup_unchanged
+                    else stale_reason
+                )
+                if (
+                    not cleanup_unchanged
+                    and evaluation.decision is not None
+                ):
+                    evaluation = await asyncio.to_thread(
+                        fallback_memory_preview,
+                        fresh,
+                        evaluation,
+                        reason=(
+                            "candidate_%s" % cleanup_stale_reason
+                        ),
+                    )
+
         selected_prompt = (
             candidate_prompt
             if evaluation.candidate_selected and fresh.ready
@@ -36804,6 +36944,8 @@ async def execute_bnl_memory_preview(
         final_selection = (
             "suppressed"
             if not proposed_response
+            else "cleanup_attempt"
+            if evaluation.candidate_selected and cleanup_response
             else "repair_attempt"
             if evaluation.candidate_selected and repair_response
             else "packet_candidate"
@@ -36837,6 +36979,7 @@ async def execute_bnl_memory_preview(
             established_response=baseline_response,
             packet_candidate_response=packet_candidate_response,
             repair_response=repair_response,
+            cleanup_response=cleanup_response,
             final_selection=final_selection,
             stale_reason=stale_reason,
             guard_suppression_reason=guard_suppression_reason,
@@ -36998,6 +37141,9 @@ async def bnl_memory_preview(
         "",
         "**Grounded repair attempt**",
         execution.repair_response or "(not needed)",
+        "",
+        "**Final constrained cleanup**",
+        execution.cleanup_response or "(not needed)",
         "",
         "**Final selected response**",
         proposed,

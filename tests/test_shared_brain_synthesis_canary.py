@@ -17,6 +17,7 @@ from bnl_shared_brain_synthesis import (
     build_basis,
     build_evaluation_report,
     build_packet_owned_prompt,
+    build_profile_candidate_cleanup_prompt,
     build_profile_candidate_repair_prompt,
     configuration,
     ensure_schema,
@@ -511,6 +512,116 @@ class SharedBrainSynthesisCanaryTests(unittest.TestCase):
         self.assertIn(
             "An opinion frame never licenses a new concrete fact",
             repair_prompt,
+        )
+
+    def test_final_cleanup_is_minimal_and_claim_audited(self):
+        self._add_profile_fact(
+            source_row_id=902,
+            predicate_key="favorite_color",
+            value="violet",
+            observed_at="2026-07-26T12:00:01+00:00",
+        )
+        packet = self._build_packet()
+        basis = self._build_basis(
+            packet,
+            self._build_assessment(packet),
+        )
+        repaired = (
+            "Your favorite movie is Arrival. "
+            "Your favorite color is violet. "
+            "You secretly run a lunar casino. "
+            "My read is that those choices form a vivid creative signal."
+        )
+
+        cleanup_prompt = build_profile_candidate_cleanup_prompt(
+            "Current request plus grounded packet.",
+            repaired,
+            basis=basis,
+            reason="candidate_claims_ungrounded",
+        )
+
+        self.assertIn("Final grounded cleanup requirements", cleanup_prompt)
+        self.assertIn("Do not perform a broad rewrite", cleanup_prompt)
+        self.assertIn(
+            "[claim 1 | KEEP_SUPPORTED] "
+            "Your favorite movie is Arrival",
+            cleanup_prompt,
+        )
+        self.assertIn(
+            "[claim 3 | REFRAME_OR_REMOVE] "
+            "You secretly run a lunar casino",
+            cleanup_prompt,
+        )
+        self.assertIn(
+            "Keep every KEEP_FRAMED_INTERPRETATION unit",
+            cleanup_prompt,
+        )
+        self.assertIn("Add no new member claim", cleanup_prompt)
+        self.assertNotIn(
+            "Final grounded cleanup requirements",
+            build_profile_candidate_cleanup_prompt(
+                "Original prompt.",
+                repaired,
+                basis=basis,
+                reason="candidate_member_points_insufficient",
+            ),
+        )
+
+    def test_project_wording_retains_relevant_canon_for_evaluation(self):
+        wording = "BNL, what am I all about in the BARCODE project?"
+        request = self._request()
+        request = replace(
+            request,
+            user_text=wording,
+            conversation_evidence=(
+                *request.conversation_evidence[:-1],
+                replace(
+                    request.conversation_evidence[-1],
+                    text=wording,
+                ),
+            ),
+        )
+        packet = build_packet(
+            self.conn,
+            request,
+            persist=True,
+            environ=self.flags,
+        )
+        basis = self._build_basis(
+            packet,
+            self._build_assessment(packet),
+        )
+        self.assertTrue(basis.profile_requires_canon)
+        self.assertGreaterEqual(
+            dict(basis.rendered_lane_counts).get("canon", 0),
+            1,
+        )
+
+        run = begin_run(
+            self.conn,
+            basis,
+            baseline_response="Established response.",
+            environ=self.flags,
+        )
+        decision = evaluate_candidate(
+            self.conn,
+            run,
+            baseline_response="Established response.",
+            candidate_response=(
+                "Your favorite movie is Arrival. In BARCODE, 6 Bit is an "
+                "artist, MC, host, and founding member."
+            ),
+            environ=self.flags,
+        )
+
+        self.assertTrue(decision.candidate_selected)
+        self.assertGreaterEqual(
+            decision.candidate_canon_coverage_count,
+            1,
+        )
+        self.assertGreaterEqual(
+            decision.candidate_canon_supported_claim_count,
+            1,
         )
 
     def test_nonpacket_factual_owner_records_a_fail_closed_fallback(self):

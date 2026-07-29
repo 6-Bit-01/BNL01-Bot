@@ -1534,6 +1534,20 @@ def render_content_free_diagnostics(
             diag.lifecycle_state_changes,
         ),
         "- packet_lanes: `%s`" % dict(diag.packet_lane_counts),
+        "- rendered_packet_lanes: `%s` project_canon_required=`%s`"
+        % (
+            (
+                dict(prepared.basis.rendered_lane_counts)
+                if prepared.basis is not None
+                else {}
+            ),
+            str(
+                bool(
+                    prepared.basis is not None
+                    and prepared.basis.profile_requires_canon
+                )
+            ).lower(),
+        ),
         "- profile_sufficiency: `%s` satisfied=`%s` "
         "points=`%s/%s` roots=`%s` occurrences=`%s` reasons=`%s`"
         % (
