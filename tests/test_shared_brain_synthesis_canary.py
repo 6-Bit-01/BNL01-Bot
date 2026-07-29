@@ -17,6 +17,7 @@ from bnl_shared_brain_synthesis import (
     build_basis,
     build_evaluation_report,
     build_packet_owned_prompt,
+    build_profile_candidate_repair_prompt,
     configuration,
     ensure_schema,
     evaluate_candidate,
@@ -435,6 +436,82 @@ class SharedBrainSynthesisCanaryTests(unittest.TestCase):
         self.assertIn("Recent room context:", result.prompt)
         self.assertIn("Personal-recall route contract", result.prompt)
         self.assertEqual(result.prompt.count(basis.rendered_context), 1)
+
+    def test_repair_prompt_audits_unsupported_claims_without_loosening_gate(
+        self,
+    ):
+        second_entry_id = self._add_profile_fact(
+            source_row_id=902,
+            predicate_key="favorite_color",
+            value="violet",
+            observed_at="2026-07-26T12:00:01+00:00",
+        )
+        self.assertTrue(second_entry_id)
+        packet = self._build_packet()
+        self.assertEqual(packet.profile_sufficiency.status, "rich")
+        basis = self._build_basis(
+            packet,
+            self._build_assessment(packet),
+        )
+        prior = (
+            "You are a lunar creative architect. "
+            "Your favorite movie is Arrival and your favorite color is "
+            "violet. My read is that your favorite food is pizza."
+        )
+
+        run = begin_run(
+            self.conn,
+            basis,
+            baseline_response="Established response.",
+            environ=self.flags,
+        )
+        decision = evaluate_candidate(
+            self.conn,
+            run,
+            baseline_response="Established response.",
+            candidate_response=prior,
+            environ=self.flags,
+        )
+        self.assertFalse(decision.candidate_selected)
+        self.assertEqual(
+            decision.fallback_reason,
+            "candidate_claims_ungrounded",
+        )
+
+        repair_prompt = build_profile_candidate_repair_prompt(
+            "Current request plus grounded packet.",
+            prior,
+            basis=basis,
+            reason=decision.fallback_reason,
+        )
+
+        self.assertIn(
+            "[claim 1 | REFRAME_OR_REMOVE] "
+            "You are a lunar creative architect",
+            repair_prompt,
+        )
+        self.assertIn(
+            "[claim 2 | KEEP_SUPPORTED] "
+            "Your favorite movie is Arrival",
+            repair_prompt,
+        )
+        self.assertIn(
+            "[claim 3 | KEEP_SUPPORTED] your favorite color is violet",
+            repair_prompt,
+        )
+        self.assertIn(
+            "[claim 4 | REFRAME_OR_REMOVE] "
+            "My read is that your favorite food is pizza",
+            repair_prompt,
+        )
+        self.assertIn(
+            "Resolve every REFRAME_OR_REMOVE unit (2 detected)",
+            repair_prompt,
+        )
+        self.assertIn(
+            "An opinion frame never licenses a new concrete fact",
+            repair_prompt,
+        )
 
     def test_nonpacket_factual_owner_records_a_fail_closed_fallback(self):
         for lane in (
