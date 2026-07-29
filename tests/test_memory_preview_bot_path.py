@@ -258,6 +258,86 @@ class MemoryPreviewBotPathTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(guard.await_count, 1)
         self.assertEqual(source_hash, self._source_hash())
 
+    async def test_rich_preview_reframes_interpretation_without_losing_it(self):
+        with sqlite3.connect(self.db_path) as conn:
+            self._add_message(
+                conn,
+                3,
+                "I keep composing synth songs and producing music tracks.",
+                "2026-07-25T21:00:00+00:00",
+            )
+            self._add_message(
+                conn,
+                4,
+                "The synth song mix needs another production pass.",
+                "2026-07-26T20:00:00+00:00",
+            )
+            conn.commit()
+        source_hash = self._source_hash()
+        calls = []
+
+        async def generator(prompt, route):
+            calls.append((route, prompt))
+            if route.endswith("baseline"):
+                return "I only have a narrow grounded view so far."
+            if route.endswith("candidate_repair"):
+                self.assertIn(
+                    "[claim 1 | REFRAME_OR_REMOVE]",
+                    prompt,
+                )
+                self.assertIn(
+                    "You are a multi-frequency creative architect",
+                    prompt,
+                )
+                self.assertIn("KEEP_SUPPORTED", prompt)
+                return (
+                    "You keep fixing the bot code and memory system, and you "
+                    "also troubleshoot the website code. You compose synth "
+                    "songs and keep working their music mixes. You strike me "
+                    "as a multi-frequency creative architect because careful "
+                    "iteration connects those parts."
+                )
+            return (
+                "You are a multi-frequency creative architect. You keep "
+                "fixing the bot code and memory system while troubleshooting "
+                "the website code. You also compose synth songs and keep "
+                "working their music mixes."
+            )
+
+        guard = mock.AsyncMock(
+            side_effect=lambda response, _prompt: (
+                response,
+                {"suppressed": False, "suppression_reason": ""},
+            )
+        )
+        result = await bnl01_bot.execute_bnl_memory_preview(
+            source_db_path=self.db_path,
+            guild_id=1,
+            subject_user_id=7,
+            subject_display_name="Crow",
+            simulated_channel_id=10,
+            wording="BNL-01, what am I all about?",
+            generator=generator,
+            guard=guard,
+        )
+
+        self.assertTrue(result.candidate_selected, result.fallback_reason)
+        self.assertIn("creative architect", result.proposed_response)
+        self.assertIn("You strike me as", result.proposed_response)
+        self.assertIn("bot code", result.proposed_response)
+        self.assertIn("synth songs", result.proposed_response)
+        self.assertEqual(result.final_selection, "repair_attempt")
+        self.assertEqual(
+            [route for route, _prompt in calls],
+            [
+                "bnl_memory_preview_baseline",
+                "bnl_memory_preview_candidate",
+                "bnl_memory_preview_candidate_repair",
+            ],
+        )
+        self.assertEqual(guard.await_count, 1)
+        self.assertEqual(source_hash, self._source_hash())
+
     async def test_preview_compares_real_established_memory_to_packet(self):
         with sqlite3.connect(self.db_path) as conn:
             conn.execute(
