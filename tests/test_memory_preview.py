@@ -594,6 +594,180 @@ class MemoryPreviewTests(unittest.TestCase):
         finally:
             prepared.close()
 
+    def test_retained_public_history_reaches_multiple_profile_points(self):
+        raw_markers = (
+            "NEON MIX SOURCE",
+            "GLASS ART SOURCE",
+            "PRIVATE SOURCE SENTINEL",
+        )
+        with sqlite3.connect(self.db_path) as source:
+            self._ensure_conversation_context_schema(source)
+            rows = (
+                (
+                    401,
+                    "user",
+                    (
+                        "NEON MIX SOURCE: I am revising the music track "
+                        "with <@123456789012345678> at "
+                        "https://example.com/one."
+                    ),
+                    "2026-07-20T10:00:00+00:00",
+                    20,
+                    "artist-room",
+                    "public_selective",
+                    7,
+                    "Crow",
+                ),
+                (
+                    402,
+                    "user",
+                    (
+                        "The album vocals and music mix need another "
+                        "production pass."
+                    ),
+                    "2026-07-21T10:00:00+00:00",
+                    21,
+                    "music-chat",
+                    "public_context",
+                    7,
+                    "Crow",
+                ),
+                (
+                    403,
+                    "user",
+                    (
+                        "GLASS ART SOURCE: I am comparing artwork and "
+                        "visual design for the cover."
+                    ),
+                    "2026-07-22T10:00:00+00:00",
+                    10,
+                    "barcode-bot",
+                    "public_home",
+                    7,
+                    "Crow",
+                ),
+                (
+                    404,
+                    "user",
+                    (
+                        "The animation and artwork need a stronger visual "
+                        "style."
+                    ),
+                    "2026-07-23T10:00:00+00:00",
+                    20,
+                    "artist-room",
+                    "public_selective",
+                    7,
+                    "Crow",
+                ),
+                (
+                    405,
+                    "user",
+                    "The queue rehearsal website code needs another test.",
+                    "2026-07-24T10:00:00+00:00",
+                    10,
+                    "barcode-bot",
+                    "public_home",
+                    7,
+                    "Crow",
+                ),
+                (
+                    406,
+                    "user",
+                    "PRIVATE SOURCE SENTINEL about visual design.",
+                    "2026-07-25T10:00:00+00:00",
+                    30,
+                    "operations",
+                    "internal_controlled",
+                    7,
+                    "Crow",
+                ),
+                (
+                    407,
+                    "user",
+                    "Another member is mixing an unrelated music track.",
+                    "2026-07-25T11:00:00+00:00",
+                    10,
+                    "barcode-bot",
+                    "public_home",
+                    8,
+                    "Other Member",
+                ),
+            )
+            for (
+                row_id,
+                role,
+                content,
+                observed_at,
+                channel_id,
+                channel_name,
+                channel_policy,
+                user_id,
+                user_name,
+            ) in rows:
+                self._insert_conversation_context_row(
+                    source,
+                    row_id=row_id,
+                    role=role,
+                    content=content,
+                    observed_at=observed_at,
+                    channel_id=channel_id,
+                    channel_name=channel_name,
+                    channel_policy=channel_policy,
+                    user_id=user_id,
+                    user_name=user_name,
+                )
+            source.commit()
+        source_hash = self._source_hash()
+
+        prepared = prepare_memory_preview(self._request())
+        try:
+            self.assertTrue(prepared.ready)
+            self.assertEqual(prepared.diagnostics.profile_status, "rich")
+            self.assertGreaterEqual(
+                prepared.diagnostics.profile_selected_point_count,
+                2,
+            )
+            self.assertGreaterEqual(
+                dict(prepared.diagnostics.packet_lane_counts).get(
+                    "atomic_knowledge",
+                    0,
+                ),
+                2,
+            )
+            funnel = dict(prepared.diagnostics.source_funnel_counts)
+            self.assertEqual(funnel["retained_rows_total"], 6)
+            self.assertEqual(funnel["retained_rows_public_safe"], 5)
+            self.assertEqual(funnel["retained_rows_policy_excluded"], 1)
+            self.assertEqual(funnel["ledger_projection_inserted"], 5)
+            self.assertEqual(
+                funnel["ledger_rows_operational_excluded"],
+                1,
+            )
+            self.assertGreaterEqual(funnel["motif_candidates_returned"], 2)
+            diagnostics = "\n".join(
+                render_content_free_diagnostics(prepared)
+            )
+            self.assertIn("source_funnel", diagnostics)
+            for marker in raw_markers:
+                self.assertNotIn(marker, diagnostics)
+            self.assertNotIn("Other Member", diagnostics)
+        finally:
+            prepared.close()
+
+        self.assertEqual(source_hash, self._source_hash())
+        with sqlite3.connect(self.db_path) as source:
+            self.assertEqual(
+                source.execute(
+                    """
+                    SELECT COUNT(*)
+                    FROM memory_ledger_entries
+                    WHERE source_row_id IN ('401','402','403','404','405')
+                    """
+                ).fetchone()[0],
+                0,
+            )
+
     def test_diagnostics_are_content_free(self):
         prepared = prepare_memory_preview(self._request())
         try:
