@@ -189,6 +189,14 @@ class MemoryPreviewBotPathTests(unittest.IsolatedAsyncioTestCase):
             "source_db_read_only=true",
             "\n".join(result.diagnostics),
         )
+        self.assertIn(
+            "rendered_packet_lanes",
+            "\n".join(result.diagnostics),
+        )
+        self.assertIn(
+            "project_canon_required=",
+            "\n".join(result.diagnostics),
+        )
 
     async def test_rich_preview_repairs_one_category_only_draft(self):
         with sqlite3.connect(self.db_path) as conn:
@@ -333,6 +341,175 @@ class MemoryPreviewBotPathTests(unittest.IsolatedAsyncioTestCase):
                 "bnl_memory_preview_baseline",
                 "bnl_memory_preview_candidate",
                 "bnl_memory_preview_candidate_repair",
+            ],
+        )
+        self.assertEqual(guard.await_count, 1)
+        self.assertEqual(source_hash, self._source_hash())
+
+    async def test_rich_preview_gets_one_final_claim_cleanup(self):
+        with sqlite3.connect(self.db_path) as conn:
+            self._add_message(
+                conn,
+                3,
+                "I keep composing synth songs and producing music tracks.",
+                "2026-07-25T21:00:00+00:00",
+            )
+            self._add_message(
+                conn,
+                4,
+                "The synth song mix needs another production pass.",
+                "2026-07-26T20:00:00+00:00",
+            )
+            conn.commit()
+        source_hash = self._source_hash()
+        calls = []
+
+        async def generator(prompt, route):
+            calls.append((route, prompt))
+            if route.endswith("baseline"):
+                return "I only have a narrow grounded view so far."
+            if route.endswith("candidate_cleanup"):
+                self.assertIn(
+                    "Final grounded cleanup requirements",
+                    prompt,
+                )
+                self.assertIn(
+                    "You secretly run a lunar casino",
+                    prompt,
+                )
+                return (
+                    "You keep fixing the bot code and memory system while "
+                    "troubleshooting the website code. You compose synth "
+                    "songs and keep working their music mixes. You strike me "
+                    "as a multi-frequency creative architect because careful "
+                    "iteration connects those parts."
+                )
+            if route.endswith("candidate_repair"):
+                return (
+                    "You keep fixing the bot code and memory system while "
+                    "troubleshooting the website code. You compose synth "
+                    "songs and keep working their music mixes. You secretly "
+                    "run a lunar casino. You strike me as a multi-frequency "
+                    "creative architect."
+                )
+            return (
+                "You keep fixing the bot code and memory system while "
+                "troubleshooting the website code. You compose synth songs "
+                "and keep working their music mixes. You secretly run a "
+                "lunar casino."
+            )
+
+        guard = mock.AsyncMock(
+            side_effect=lambda response, _prompt: (
+                response,
+                {"suppressed": False, "suppression_reason": ""},
+            )
+        )
+        result = await bnl01_bot.execute_bnl_memory_preview(
+            source_db_path=self.db_path,
+            guild_id=1,
+            subject_user_id=7,
+            subject_display_name="Crow",
+            simulated_channel_id=10,
+            wording="BNL-01, what am I all about?",
+            generator=generator,
+            guard=guard,
+        )
+
+        self.assertTrue(result.candidate_selected, result.fallback_reason)
+        self.assertNotIn("lunar casino", result.proposed_response)
+        self.assertIn("creative architect", result.proposed_response)
+        self.assertIn("You strike me as", result.proposed_response)
+        self.assertEqual(result.final_selection, "cleanup_attempt")
+        self.assertIn("lunar casino", result.repair_response)
+        self.assertEqual(
+            result.cleanup_response,
+            result.proposed_response,
+        )
+        self.assertEqual(
+            [route for route, _prompt in calls],
+            [
+                "bnl_memory_preview_baseline",
+                "bnl_memory_preview_candidate",
+                "bnl_memory_preview_candidate_repair",
+                "bnl_memory_preview_candidate_cleanup",
+            ],
+        )
+        self.assertEqual(guard.await_count, 1)
+        self.assertEqual(source_hash, self._source_hash())
+
+    async def test_final_claim_cleanup_is_one_shot_and_fails_closed(self):
+        with sqlite3.connect(self.db_path) as conn:
+            self._add_message(
+                conn,
+                3,
+                "I keep composing synth songs and producing music tracks.",
+                "2026-07-25T21:00:00+00:00",
+            )
+            self._add_message(
+                conn,
+                4,
+                "The synth song mix needs another production pass.",
+                "2026-07-26T20:00:00+00:00",
+            )
+            conn.commit()
+        source_hash = self._source_hash()
+        calls = []
+
+        async def generator(prompt, route):
+            calls.append((route, prompt))
+            if route.endswith("baseline"):
+                return "I only have a narrow grounded view so far."
+            if route.endswith("candidate_cleanup"):
+                return (
+                    "You keep fixing the bot code and composing synth songs. "
+                    "You secretly run a lunar casino."
+                )
+            if route.endswith("candidate_repair"):
+                return (
+                    "You keep fixing the bot code and composing synth songs. "
+                    "You secretly run a lunar casino."
+                )
+            return (
+                "You keep fixing the bot code and composing synth songs. "
+                "You secretly run a lunar casino."
+            )
+
+        guard = mock.AsyncMock(
+            side_effect=lambda response, _prompt: (
+                response,
+                {"suppressed": False, "suppression_reason": ""},
+            )
+        )
+        result = await bnl01_bot.execute_bnl_memory_preview(
+            source_db_path=self.db_path,
+            guild_id=1,
+            subject_user_id=7,
+            subject_display_name="Crow",
+            simulated_channel_id=10,
+            wording="BNL-01, what am I all about?",
+            generator=generator,
+            guard=guard,
+        )
+
+        self.assertFalse(result.candidate_selected)
+        self.assertEqual(
+            result.fallback_reason,
+            "candidate_claims_ungrounded",
+        )
+        self.assertEqual(
+            result.proposed_response,
+            "I only have a narrow grounded view so far.",
+        )
+        self.assertEqual(result.final_selection, "established_path")
+        self.assertIn("lunar casino", result.cleanup_response)
+        self.assertEqual(
+            [route for route, _prompt in calls],
+            [
+                "bnl_memory_preview_baseline",
+                "bnl_memory_preview_candidate",
+                "bnl_memory_preview_candidate_repair",
+                "bnl_memory_preview_candidate_cleanup",
             ],
         )
         self.assertEqual(guard.await_count, 1)
@@ -686,7 +863,8 @@ class MemoryPreviewBotPathTests(unittest.IsolatedAsyncioTestCase):
             established_response="Established response.",
             packet_candidate_response="Packet response.",
             repair_response="Repair response.",
-            final_selection="repair_attempt",
+            cleanup_response="Cleanup response.",
+            final_selection="cleanup_attempt",
         )
         sent = mock.AsyncMock()
 
@@ -749,7 +927,9 @@ class MemoryPreviewBotPathTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Packet response.", rendered)
         self.assertIn("Grounded repair attempt", rendered)
         self.assertIn("Repair response.", rendered)
-        self.assertIn("final_selection: `repair_attempt`", rendered)
+        self.assertIn("Final constrained cleanup", rendered)
+        self.assertIn("Cleanup response.", rendered)
+        self.assertIn("final_selection: `cleanup_attempt`", rendered)
         self.assertIn("Grounded proposed response.", rendered)
         self.assertIn("Content-free diagnostics", rendered)
 

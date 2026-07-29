@@ -28,6 +28,7 @@ class GeminiRoutingPolicyTests(unittest.TestCase):
             "bnl_memory_preview_baseline",
             "bnl_memory_preview_candidate",
             "bnl_memory_preview_candidate_repair",
+            "bnl_memory_preview_candidate_cleanup",
         )
         policies = tuple(routing.policy_for_route(route) for route in routes)
         expected = policies[0]

@@ -348,6 +348,203 @@ class SharedBrainSynthesisBotPathTests(
         )
         self.assertEqual(evaluator.call_count, 2)
 
+    async def test_ungrounded_repair_gets_one_final_cleanup(self):
+        legacy_context = "Legacy factual profile block."
+        basis = replace(
+            self.synthesis_basis(legacy_context),
+            profile_sufficiency_status="rich",
+            profile_required_point_count=2,
+            profile_required_detail_count=2,
+        )
+        run = SimpleNamespace(
+            prompt_applied=True,
+            fallback_reason="",
+            revalidation_status="unchanged",
+        )
+        first_rejected = SimpleNamespace(
+            run=run,
+            candidate_selected=False,
+            fallback_reason="candidate_member_details_insufficient",
+        )
+        repair_rejected = SimpleNamespace(
+            run=run,
+            candidate_selected=False,
+            fallback_reason="candidate_claims_ungrounded",
+        )
+        cleanup_accepted = SimpleNamespace(
+            run=run,
+            candidate_selected=True,
+            fallback_reason="",
+        )
+        generation = mock.AsyncMock(
+            side_effect=(
+                "Software and music are recurring themes.",
+                (
+                    "You keep fixing bot code and composing synth songs. "
+                    "You secretly run a lunar casino."
+                ),
+                (
+                    "You keep fixing bot code and composing synth songs. "
+                    "You strike me as a persistent creative architect."
+                ),
+            )
+        )
+        evaluator = mock.Mock(
+            side_effect=(
+                first_rejected,
+                repair_rejected,
+                cleanup_accepted,
+            )
+        )
+        prompt = (
+            "Current user request: BNL-01, what am I all about?\n"
+            "Durable memory context:\n"
+            + legacy_context
+        )
+        with (
+            mock.patch.object(
+                bnl01_bot,
+                "_begin_shared_brain_synthesis_receipt",
+                return_value=run,
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "get_gemini_response_with_optional_typing",
+                new=generation,
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "_evaluate_shared_brain_synthesis_receipt",
+                new=evaluator,
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "is_generic_non_answer_response",
+                return_value=False,
+            ),
+        ):
+            execution = (
+                await bnl01_bot
+                .maybe_generate_shared_brain_synthesis_canary(
+                    channel=FakeChannel(),
+                    baseline_response="Established baseline.",
+                    prompt=prompt,
+                    prompt_source_bases=(
+                        self.memory_source_basis(legacy_context),
+                    ),
+                    basis=basis,
+                    user_id=7,
+                    guild_id=1,
+                    user_display_name="Crow",
+                    source_context_available=True,
+                )
+            )
+
+        self.assertTrue(execution.candidate_active)
+        self.assertNotIn("lunar casino", execution.response)
+        self.assertIn("creative architect", execution.response)
+        self.assertEqual(generation.await_count, 3)
+        self.assertEqual(
+            generation.await_args_list[2].kwargs["route"],
+            "shared_brain_synthesis_canary_cleanup",
+        )
+        self.assertIn(
+            "Final grounded cleanup requirements",
+            generation.await_args_list[2].args[1],
+        )
+        self.assertEqual(evaluator.call_count, 3)
+
+    async def test_final_cleanup_rejection_falls_back_without_retrying(self):
+        legacy_context = "Legacy factual profile block."
+        basis = replace(
+            self.synthesis_basis(legacy_context),
+            profile_sufficiency_status="rich",
+            profile_required_point_count=2,
+            profile_required_detail_count=2,
+        )
+        run = SimpleNamespace(
+            prompt_applied=True,
+            fallback_reason="",
+            revalidation_status="unchanged",
+        )
+        first_rejected = SimpleNamespace(
+            run=run,
+            candidate_selected=False,
+            fallback_reason="candidate_member_details_insufficient",
+        )
+        claims_rejected = SimpleNamespace(
+            run=run,
+            candidate_selected=False,
+            fallback_reason="candidate_claims_ungrounded",
+        )
+        generation = mock.AsyncMock(
+            side_effect=(
+                "Software and music are recurring themes.",
+                (
+                    "You keep fixing bot code and composing synth songs. "
+                    "You secretly run a lunar casino."
+                ),
+                (
+                    "You keep fixing bot code and composing synth songs. "
+                    "You secretly run a lunar casino."
+                ),
+            )
+        )
+        evaluator = mock.Mock(
+            side_effect=(
+                first_rejected,
+                claims_rejected,
+                claims_rejected,
+            )
+        )
+        prompt = (
+            "Current user request: BNL-01, what am I all about?\n"
+            "Durable memory context:\n"
+            + legacy_context
+        )
+        with (
+            mock.patch.object(
+                bnl01_bot,
+                "_begin_shared_brain_synthesis_receipt",
+                return_value=run,
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "get_gemini_response_with_optional_typing",
+                new=generation,
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "_evaluate_shared_brain_synthesis_receipt",
+                new=evaluator,
+            ),
+        ):
+            execution = (
+                await bnl01_bot
+                .maybe_generate_shared_brain_synthesis_canary(
+                    channel=FakeChannel(),
+                    baseline_response="Established baseline.",
+                    prompt=prompt,
+                    prompt_source_bases=(
+                        self.memory_source_basis(legacy_context),
+                    ),
+                    basis=basis,
+                    user_id=7,
+                    guild_id=1,
+                    user_display_name="Crow",
+                    source_context_available=True,
+                )
+            )
+
+        self.assertFalse(execution.candidate_active)
+        self.assertEqual(execution.response, "Established baseline.")
+        self.assertEqual(
+            execution.decision.fallback_reason,
+            "candidate_claims_ungrounded",
+        )
+        self.assertEqual(generation.await_count, 3)
+        self.assertEqual(evaluator.call_count, 3)
+
     async def test_missing_legacy_block_fails_closed_to_baseline(self):
         legacy_context = "Relationship state: familiar."
         basis = self.synthesis_basis(legacy_context)
