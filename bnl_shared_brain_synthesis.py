@@ -284,6 +284,76 @@ _UNSUPPORTED_SCALAR_ASSERTION_RE = re.compile(
     r"you\s+(?:prefer|like|love|own|have)\b)",
     re.I,
 )
+_TRANSIENT_EXPRESSION_WRAPPER_RE = re.compile(
+    r"^\s*[~*_`-]*\[(?P<body>[\s\S]{1,900})\]\s*[~*_`-]*$",
+)
+_TRANSIENT_EXPRESSION_BLOCK_RE = re.compile(
+    r"[~*_`-]*\[[\s\S]{1,900}?\][~*_`-]*",
+)
+_TRANSIENT_EXPRESSION_FRAME_RE = re.compile(
+    r"^\s*(?:(?:in|from)\s+(?:an?\s+|one\s+|the\s+)?"
+    r"(?:adjacent|alternate|nearby|parallel|cross[- ]universe|"
+    r"interdimensional)\s+(?:timeline|reality|universe|signal|"
+    r"dimension)\b|"
+    r"(?:interdimensional|cross[- ]universe|alternate[- ]timeline|"
+    r"broadcast|signal|frequency|reality)\s+"
+    r"(?:bleed|fragment|glitch|anomaly)\s*[:/])",
+    re.I,
+)
+_TRANSIENT_EXPRESSION_AUTHORITY_RE = re.compile(
+    r"(?:\baccording\s+to\b.{0,50}"
+    r"\b(?:archive|records?|database|dossier|source|logs?|scan)\b|"
+    r"\b(?:archive|archival|records?|database|dossiers?|source\s+files?|"
+    r"logs?|scans?)\b.{0,50}"
+    r"\b(?:show|shows|showed|indicate|indicates|indicated|confirm|"
+    r"confirms|confirmed|prove|proves|proved|verify|verifies|verified|"
+    r"establish|establishes|established)\b)",
+    re.I,
+)
+_TRANSIENT_EXPRESSION_PRIVATE_RE = re.compile(
+    r"(?:\b(?:home|street|mailing)\s+address\b|"
+    r"\b(?:phone|telephone|email)\s+(?:number|address)\b|"
+    r"\b(?:birthday|date\s+of\s+birth|legal\s+name|real\s+name|"
+    r"pronouns?|employer|workplace|salary|income|bank\s+account|"
+    r"credit\s+card|social\s+security|ssn|password|passcode|"
+    r"api\s+key|secret|private\s+key|access\s+token)\b|"
+    r"\b(?:live|reside|work)\s+(?:at|in|near|for)\b|"
+    r"\b[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}\b|"
+    r"<@!?\d+>)",
+    re.I,
+)
+_TRANSIENT_EXPRESSION_CORE_MARKERS = (
+    "archive",
+    "broadcast",
+    "carrier",
+    "dimension",
+    "echo",
+    "feed",
+    "frequency",
+    "glitch",
+    "interdimensional",
+    "reality",
+    "signal",
+    "sys",
+    "system",
+    "timeline",
+    "transmission",
+    "universe",
+)
+_TRANSIENT_EXPRESSION_EVENT_MARKERS = (
+    "anomaly",
+    "bleed",
+    "corrupt",
+    "drift",
+    "error",
+    "fault",
+    "fragment",
+    "glitch",
+    "leak",
+    "overlap",
+    "spill",
+    "static",
+)
 _CLAIM_GENERIC_TERMS = frozenset(
     {
         "alright",
@@ -1286,6 +1356,7 @@ def _profile_candidate_claim_audit(
         "member_and_canon_supported": "KEEP_SUPPORTED",
         "framed_opinion": "KEEP_FRAMED_INTERPRETATION",
         "linked_assessment": "KEEP_FRAMED_INTERPRETATION",
+        "transient_expression": "KEEP_TRANSIENT_EXPRESSION",
         "connective_flavor": "OMIT_OR_REWRITE_AS_FLAVOR",
         "unsupported_factual": "REFRAME_OR_REMOVE",
     }
@@ -1372,6 +1443,11 @@ def build_profile_candidate_repair_prompt(
             % unsupported_count
         ),
         (
+            "Keep every KEEP_TRANSIENT_EXPRESSION unit materially intact. It "
+            "is explicitly marked live BNL expression, not factual support "
+            "and not a canon claim."
+        ),
+        (
             "OMIT_OR_REWRITE_AS_FLAVOR units are optional connective voice "
             "only. They cannot carry a claim about the member."
         ),
@@ -1418,7 +1494,9 @@ def build_profile_candidate_cleanup_prompt(
         ),
         (
             "Keep every KEEP_SUPPORTED unit materially intact. Keep every "
-            "KEEP_FRAMED_INTERPRETATION unit as BNL's revisable assessment."
+            "KEEP_FRAMED_INTERPRETATION unit as BNL's revisable assessment. "
+            "Keep every KEEP_TRANSIENT_EXPRESSION unit materially intact as "
+            "explicit live expression, never as factual support or canon."
         ),
         (
             "Resolve all %s REFRAME_OR_REMOVE units. If a unit is only an "
@@ -1510,8 +1588,26 @@ def _candidate_claim_units(response: str) -> tuple[str, ...]:
     cleaned = re.sub(r"[ \t]+", " ", str(response or "")).strip()
     if not cleaned:
         return ()
+    protected_expressions: dict[str, str] = {}
+
+    def protect_expression(match: re.Match[str]) -> str:
+        value = str(match.group(0) or "")
+        if not _claim_is_transient_expression(value):
+            return value
+        token = "BNLTRANSIENTEXPRESSION%sTOKEN" % len(
+            protected_expressions
+        )
+        protected_expressions[token] = value
+        return token
+
+    cleaned = _TRANSIENT_EXPRESSION_BLOCK_RE.sub(
+        protect_expression,
+        cleaned,
+    )
     units = []
     for value in _CLAIM_SPLIT_RE.split(cleaned):
+        for token, expression in protected_expressions.items():
+            value = str(value or "").replace(token, expression)
         claim = re.sub(
             r"^\s*(?:and|but|yet|while|whereas|which|so)\s+",
             "",
@@ -1521,6 +1617,63 @@ def _candidate_claim_units(response: str) -> tuple[str, ...]:
         if claim:
             units.append(claim)
     return tuple(units)
+
+
+def _claim_is_transient_expression(claim: str) -> bool:
+    """Recognize explicit, non-authoritative lore/glitch expression.
+
+    These units remain part of BNL's response, but they are never evidence for
+    a member fact or BARCODE canon claim.  Only unmistakably framed anomaly
+    output qualifies; fake source authority and private/member data do not.
+    """
+
+    value = str(claim or "").strip()
+    if not value:
+        return False
+    if (
+        _TRANSIENT_EXPRESSION_AUTHORITY_RE.search(value)
+        or _TRANSIENT_EXPRESSION_PRIVATE_RE.search(value)
+    ):
+        return False
+    wrapper = _TRANSIENT_EXPRESSION_WRAPPER_RE.fullmatch(value)
+    if wrapper is not None:
+        body = str(wrapper.group("body") or "")
+        compressed = re.sub(r"[^a-z0-9]+", "", body.lower())
+        has_core_marker = any(
+            marker in compressed
+            for marker in _TRANSIENT_EXPRESSION_CORE_MARKERS
+        )
+        has_event_marker = any(
+            marker in compressed
+            for marker in _TRANSIENT_EXPRESSION_EVENT_MARKERS
+        )
+        machine_shaped = "//" in body or "_" in body
+        return bool(
+            has_core_marker and (has_event_marker or machine_shaped)
+        )
+    return bool(_TRANSIENT_EXPRESSION_FRAME_RE.search(value))
+
+
+def _strip_transient_expression_blocks(claim: str) -> str:
+    def strip_expression(match: re.Match[str]) -> str:
+        value = str(match.group(0) or "")
+        return " " if _claim_is_transient_expression(value) else value
+
+    return _TRANSIENT_EXPRESSION_BLOCK_RE.sub(
+        strip_expression,
+        str(claim or ""),
+    ).strip()
+
+
+def _factual_candidate_text(response: str) -> str:
+    """Remove explicit transient expression from factual coverage only."""
+
+    return " ".join(
+        _strip_transient_expression_blocks(claim)
+        for claim in _candidate_claim_units(response)
+        if not _claim_is_transient_expression(claim)
+        and _strip_transient_expression_blocks(claim)
+    )
 
 
 def _claim_is_connective(
@@ -1571,9 +1724,18 @@ def _classify_candidate_claims(
     first_supported_member: bool | None = None
     has_member_basis = bool(supported_member_points)
     for claim in _candidate_claim_units(response):
-        claim_terms = _semantic_terms(claim)
+        if _claim_is_transient_expression(claim):
+            classifications.append("transient_expression")
+            connective += 1
+            continue
+        factual_claim = _strip_transient_expression_blocks(claim)
+        claim_terms = _semantic_terms(factual_claim)
         if not claim_terms:
-            classifications.append("connective_flavor")
+            classifications.append(
+                "transient_expression"
+                if factual_claim != claim
+                else "connective_flavor"
+            )
             connective += 1
             continue
         member_hit = any(
@@ -1601,13 +1763,13 @@ def _classify_candidate_claims(
             claim_terms - _PROFILE_GENERIC_TERMS - _CLAIM_GENERIC_TERMS
         )
         scalar_assertion = bool(
-            _UNSUPPORTED_SCALAR_ASSERTION_RE.search(claim)
+            _UNSUPPORTED_SCALAR_ASSERTION_RE.search(factual_claim)
         )
         if (
             has_member_basis
             and not scalar_assertion
-            and not _DIRECT_MEMBER_ASSERTION_RE.search(claim)
-            and _OPINION_FRAME_RE.search(claim)
+            and not _DIRECT_MEMBER_ASSERTION_RE.search(factual_claim)
+            and _OPINION_FRAME_RE.search(factual_claim)
         ):
             classifications.append("framed_opinion")
             opinions += 1
@@ -1615,12 +1777,12 @@ def _classify_candidate_claims(
         if (
             has_member_basis
             and not scalar_assertion
-            and _DERIVED_ASSESSMENT_RE.search(claim)
+            and _DERIVED_ASSESSMENT_RE.search(factual_claim)
         ):
             classifications.append("linked_assessment")
             opinions += 1
             continue
-        if _claim_is_connective(claim, substantive_terms):
+        if _claim_is_connective(factual_claim, substantive_terms):
             classifications.append("connective_flavor")
             connective += 1
             continue
@@ -1641,9 +1803,9 @@ def candidate_profile_coverage(
     basis: SharedBrainSynthesisBasis,
     response: str,
 ) -> CandidateProfileCoverage:
-    response_terms = _semantic_terms(str(response or ""))
-    if not response_terms:
+    if not _candidate_claim_units(response):
         return CandidateProfileCoverage()
+    response_terms = _semantic_terms(_factual_candidate_text(response))
     rendered_items = tuple(
         item
         for item in basis.packet.items
