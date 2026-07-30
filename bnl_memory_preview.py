@@ -109,6 +109,7 @@ class MemoryPreviewDiagnostics:
     route_reason: str = ""
     formation_outcomes: tuple[tuple[str, int], ...] = ()
     formation_reason_codes: tuple[str, ...] = ()
+    source_funnel_counts: tuple[tuple[str, int], ...] = ()
     lifecycle_scopes: int = 0
     lifecycle_candidates: int = 0
     lifecycle_state_changes: int = 0
@@ -675,12 +676,14 @@ def _formation_and_lifecycle(
 ) -> tuple[
     tuple[tuple[str, int], ...],
     tuple[str, ...],
+    tuple[tuple[str, int], ...],
     dict[str, int],
 ]:
     ledger.ensure_memory_ledger_schema(conn)
     moments.ensure_moment_schema(conn)
     relationships.ensure_relationship_v2_schema(conn)
     governance.ensure_governance_schema(conn)
+    source_funnel: dict[str, int] = {}
     results = ledger.form_atomic_candidates_from_recurring_conversation(
         conn,
         guild_id=request.guild_id,
@@ -688,6 +691,7 @@ def _formation_and_lifecycle(
             request.subject_user_id
         ),
         environ=dict(environ),
+        diagnostics=source_funnel,
     )
     candidate_ids = tuple(
         dict.fromkeys(
@@ -719,6 +723,7 @@ def _formation_and_lifecycle(
     return (
         tuple(sorted(outcomes.items())),
         reason_codes,
+        tuple(sorted(source_funnel.items())),
         {
             "scopes": int(lifecycle.get("scopes", 0) or 0),
             "candidates": int(
@@ -894,6 +899,7 @@ def _diagnostics(
     route_reason: str,
     formation_outcomes: tuple[tuple[str, int], ...] = (),
     formation_reason_codes: tuple[str, ...] = (),
+    source_funnel_counts: tuple[tuple[str, int], ...] = (),
     lifecycle: Mapping[str, int] | None = None,
     packet: UnifiedIntelligencePacket | None = None,
     assessment: UnifiedResponseAssessment | None = None,
@@ -951,6 +957,7 @@ def _diagnostics(
         route_reason=str(route_reason or ""),
         formation_outcomes=formation_outcomes,
         formation_reason_codes=formation_reason_codes,
+        source_funnel_counts=source_funnel_counts,
         lifecycle_scopes=int(lifecycle.get("scopes", 0) or 0),
         lifecycle_candidates=int(
             lifecycle.get("candidates", 0) or 0
@@ -1093,6 +1100,7 @@ def prepare_memory_preview(
         (
             formation_outcomes,
             formation_reasons,
+            source_funnel,
             lifecycle,
         ) = _formation_and_lifecycle(conn, effective_request, env)
         packet = build_packet(
@@ -1107,6 +1115,7 @@ def prepare_memory_preview(
                 route_reason="packet_unavailable",
                 formation_outcomes=formation_outcomes,
                 formation_reason_codes=formation_reasons,
+                source_funnel_counts=source_funnel,
                 lifecycle=lifecycle,
             )
             return PreparedMemoryPreview(
@@ -1163,6 +1172,7 @@ def prepare_memory_preview(
             route_reason=intent.reason,
             formation_outcomes=formation_outcomes,
             formation_reason_codes=formation_reasons,
+            source_funnel_counts=source_funnel,
             lifecycle=lifecycle,
             packet=packet,
             assessment=assessment,
@@ -1527,6 +1537,8 @@ def render_content_free_diagnostics(
         % dict(diag.formation_outcomes),
         "- formation_reasons: `%s`"
         % (list(diag.formation_reason_codes) or ["none"]),
+        "- source_funnel: `%s`"
+        % dict(diag.source_funnel_counts),
         "- lifecycle: `scopes=%s candidates=%s state_changes=%s`"
         % (
             diag.lifecycle_scopes,

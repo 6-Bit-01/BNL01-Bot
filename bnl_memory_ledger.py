@@ -205,8 +205,8 @@ _CONVERSATION_MOTIF_ROLEPLAY_RE = re.compile(
     r"hypothetically|just\s+kidding|j/?k|sarcasm)\b",
     re.I,
 )
-_CONVERSATION_MOTIF_URL_OR_MENTION_RE = re.compile(
-    r"(?:\bhttps?://|\bwww\.|"
+_CONVERSATION_MOTIF_URL_OR_MENTION_TOKEN_RE = re.compile(
+    r"(?:https?://\S+|www\.\S+|"
     r"\b[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}\b|<@!?\d+>)",
     re.I,
 )
@@ -536,9 +536,12 @@ _CONVERSATION_MOTIF_ANCHORS = {
 _CONVERSATION_MOTIF_WINDOW_SECONDS = 30 * 60
 _CONVERSATION_OCCURRENCE_MAX_SCAN = 64
 _CONVERSATION_CORRECTION_MAX_SCAN = 40
-_CONVERSATION_MOTIF_MAX_SCAN = 240
+_CONVERSATION_MOTIF_MAX_SCAN = 1200
 _CONVERSATION_MOTIF_MAX_CANDIDATES = 6
 _CONVERSATION_MOTIF_MAX_ROOTS = 12
+_CONVERSATION_MOTIF_PUBLIC_POLICIES = frozenset(
+    {"public_home", "public_context", "public_selective"}
+)
 
 APPROVED_SELF_AUTHORED_FACT_KEYS = frozenset({
     "preferred_name",
@@ -4466,24 +4469,32 @@ def _conversation_motif_terms(
     include_correction: bool = False,
     include_direct_fact: bool = False,
 ) -> tuple[str, ...]:
-    text = re.sub(r"\s+", " ", str(value or "")).strip()
+    source_text = re.sub(r"\s+", " ", str(value or "")).strip()
     if (
-        not text
-        or len(text.split()) < 4
+        not source_text
         or (
             not include_correction
-            and _CONVERSATION_CORRECTION_RE.search(text)
+            and _CONVERSATION_CORRECTION_RE.search(source_text)
         )
-        or _CONVERSATION_MOTIF_RECALL_RE.search(text)
-        or _CONVERSATION_MOTIF_UNSAFE_RE.search(text)
+        or _CONVERSATION_MOTIF_RECALL_RE.search(source_text)
+        or _CONVERSATION_MOTIF_UNSAFE_RE.search(source_text)
         or (
             not include_direct_fact
-            and _CONVERSATION_MOTIF_DIRECT_FACT_RE.search(text)
+            and _CONVERSATION_MOTIF_DIRECT_FACT_RE.search(source_text)
         )
-        or _CONVERSATION_MOTIF_SENSITIVE_RE.search(text)
-        or _CONVERSATION_MOTIF_ROLEPLAY_RE.search(text)
-        or _CONVERSATION_MOTIF_URL_OR_MENTION_RE.search(text)
+        or _CONVERSATION_MOTIF_SENSITIVE_RE.search(source_text)
+        or _CONVERSATION_MOTIF_ROLEPLAY_RE.search(source_text)
     ):
+        return ()
+    text = re.sub(
+        r"\s+",
+        " ",
+        _CONVERSATION_MOTIF_URL_OR_MENTION_TOKEN_RE.sub(
+            " ",
+            source_text,
+        ),
+    ).strip()
+    if not text or len(text.split()) < 4:
         return ()
     return tuple(
         dict.fromkeys(
@@ -5014,7 +5025,9 @@ def _sync_bounded_conversation_motif_corrections(
           AND entry_type='observation' AND predicate_key='conversation'
           AND source_table='conversations' AND source_role='user'
           AND source_class='public_observation'
-          AND channel_policy IN ('public_home','public_context')
+          AND channel_policy IN (
+            'public_home','public_context','public_selective'
+          )
           AND visibility IN ('public','public_safe')
           AND public_usable=1 AND derived=0 AND projection=0
           AND lifecycle_status='active'
@@ -5118,6 +5131,7 @@ def _conversation_motif_history(
     guild_id: int,
     subject_key: str,
     max_scan: int,
+    diagnostics: dict[str, int] | None = None,
 ) -> list[dict[str, Any]]:
     rows = conn.execute(
         """
@@ -5130,7 +5144,9 @@ def _conversation_motif_history(
           AND entry_type='observation' AND predicate_key='conversation'
           AND source_table='conversations' AND source_role='user'
           AND source_class='public_observation'
-          AND channel_policy IN ('public_home','public_context')
+          AND channel_policy IN (
+            'public_home','public_context','public_selective'
+          )
           AND visibility IN ('public','public_safe')
           AND public_usable=1 AND derived=0 AND projection=0
           AND lifecycle_status='active'
@@ -5174,18 +5190,55 @@ def _conversation_motif_history(
         "lifecycle_status",
     )
     history: list[dict[str, Any]] = []
+    if diagnostics is not None:
+        diagnostics["ledger_rows_scanned"] = len(rows)
     for row in rows:
         entry = dict(zip(keys, row))
         terms = _conversation_motif_terms(
             str(entry.get("normalized_value") or "")
         )
         if not terms:
+            if diagnostics is not None:
+                diagnostics["ledger_rows_term_excluded"] = (
+                    int(
+                        diagnostics.get(
+                            "ledger_rows_term_excluded",
+                            0,
+                        )
+                        or 0
+                    )
+                    + 1
+                )
             continue
         full_entry = _knowledge_entry_rows(
             conn,
             (str(entry.get("entry_id") or ""),),
         ).get(str(entry.get("entry_id") or ""))
         if not full_entry:
+            if diagnostics is not None:
+                diagnostics["ledger_rows_missing_root"] = (
+                    int(
+                        diagnostics.get(
+                            "ledger_rows_missing_root",
+                            0,
+                        )
+                        or 0
+                    )
+                    + 1
+                )
+            continue
+        if _knowledge_operational_or_test_source(full_entry):
+            if diagnostics is not None:
+                diagnostics["ledger_rows_operational_excluded"] = (
+                    int(
+                        diagnostics.get(
+                            "ledger_rows_operational_excluded",
+                            0,
+                        )
+                        or 0
+                    )
+                    + 1
+                )
             continue
         entry["terms"] = terms
         entry["occurrence_identity"] = _knowledge_occurrence_identity(
@@ -5193,9 +5246,260 @@ def _conversation_motif_history(
             full_entry,
         )
         if not entry["occurrence_identity"]:
+            if diagnostics is not None:
+                diagnostics["ledger_rows_occurrence_excluded"] = (
+                    int(
+                        diagnostics.get(
+                            "ledger_rows_occurrence_excluded",
+                            0,
+                        )
+                        or 0
+                    )
+                    + 1
+                )
             continue
         history.append(entry)
+    if diagnostics is not None:
+        diagnostics["ledger_rows_motif_eligible"] = len(history)
     return history
+
+
+def _conversation_projection_columns(
+    conn: sqlite3.Connection,
+) -> set[str]:
+    if not conn.execute(
+        """
+        SELECT 1 FROM sqlite_master
+        WHERE type='table' AND name='conversations'
+        """
+    ).fetchone():
+        return set()
+    return {
+        str(row[1] or "")
+        for row in conn.execute(
+            "PRAGMA table_info(conversations)"
+        ).fetchall()
+        if len(row) > 1 and str(row[1] or "")
+    }
+
+
+def project_retained_conversations_to_ledger(
+    conn: sqlite3.Connection,
+    *,
+    guild_id: int,
+    subject_key: str,
+    max_scan: int = _CONVERSATION_MOTIF_MAX_SCAN,
+    diagnostics: dict[str, int] | None = None,
+    environ: dict[str, str] | None = None,
+) -> dict[str, int]:
+    """Project retained public rows through the existing Ledger write owner.
+
+    The operation is bounded, subject-isolated, and idempotent. It is enabled
+    only with the recurring-conversation formation gate, so ordinary startup
+    and normal chat do not silently backfill production history.
+    """
+    counts: dict[str, int] = {}
+    if not conversation_motif_formation_enabled(environ):
+        counts["projection_gate_disabled"] = 1
+        if diagnostics is not None:
+            diagnostics.update(counts)
+        return counts
+    if (
+        not int(guild_id or 0)
+        or not str(subject_key or "").startswith("discord_user:")
+    ):
+        counts["projection_scope_invalid"] = 1
+        if diagnostics is not None:
+            diagnostics.update(counts)
+        return counts
+    try:
+        subject_user_id = int(str(subject_key).split(":", 1)[1])
+    except (IndexError, TypeError, ValueError):
+        counts["projection_scope_invalid"] = 1
+        if diagnostics is not None:
+            diagnostics.update(counts)
+        return counts
+    columns = _conversation_projection_columns(conn)
+    required = {
+        "id",
+        "guild_id",
+        "user_id",
+        "role",
+        "content",
+        "channel_policy",
+    }
+    if not required.issubset(columns):
+        counts["retained_source_unavailable"] = 1
+        if diagnostics is not None:
+            diagnostics.update(counts)
+        return counts
+    ensure_memory_ledger_schema(conn)
+    safe_limit = max(
+        1,
+        min(
+            int(max_scan or _CONVERSATION_MOTIF_MAX_SCAN),
+            _CONVERSATION_MOTIF_MAX_SCAN,
+        ),
+    )
+    counts["retained_rows_total"] = int(
+        conn.execute(
+            """
+            SELECT COUNT(*) FROM conversations
+            WHERE guild_id=? AND user_id=? AND role='user'
+            """,
+            (int(guild_id or 0), subject_user_id),
+        ).fetchone()[0]
+        or 0
+    )
+    optional = {
+        "user_name": "''",
+        "channel_name": "''",
+        "channel_id": "0",
+        "message_id": "NULL",
+        "timestamp": "''",
+    }
+    select = [
+        "id",
+        "user_id",
+        (
+            "user_name"
+            if "user_name" in columns
+            else "%s AS user_name" % optional["user_name"]
+        ),
+        "content",
+        (
+            "channel_name"
+            if "channel_name" in columns
+            else "%s AS channel_name" % optional["channel_name"]
+        ),
+        "channel_policy",
+        (
+            "channel_id"
+            if "channel_id" in columns
+            else "%s AS channel_id" % optional["channel_id"]
+        ),
+        (
+            "message_id"
+            if "message_id" in columns
+            else "%s AS message_id" % optional["message_id"]
+        ),
+        (
+            "timestamp"
+            if "timestamp" in columns
+            else "%s AS timestamp" % optional["timestamp"]
+        ),
+    ]
+    order = (
+        "timestamp DESC,id DESC"
+        if "timestamp" in columns
+        else "id DESC"
+    )
+    rows = conn.execute(
+        """
+        SELECT %s
+        FROM conversations
+        WHERE guild_id=? AND user_id=? AND role='user'
+        ORDER BY %s
+        LIMIT ?
+        """
+        % (",".join(select), order),
+        (int(guild_id or 0), subject_user_id, safe_limit),
+    ).fetchall()
+    counts["retained_rows_scanned"] = len(rows)
+    counts["retained_rows_outside_scan"] = max(
+        0,
+        counts["retained_rows_total"] - len(rows),
+    )
+    existing = {
+        str(row[0] or "")
+        for row in conn.execute(
+            """
+            SELECT source_row_id
+            FROM memory_ledger_entries
+            WHERE guild_id=? AND subject_key=?
+              AND source_table='conversations' AND source_role='user'
+            """,
+            (int(guild_id or 0), str(subject_key or "")),
+        ).fetchall()
+        if str(row[0] or "")
+    }
+    keys = (
+        "id",
+        "user_id",
+        "user_name",
+        "content",
+        "channel_name",
+        "channel_policy",
+        "channel_id",
+        "message_id",
+        "timestamp",
+    )
+    for raw in reversed(rows):
+        row = dict(zip(keys, raw))
+        row_id = int(row.get("id") or 0)
+        policy = _canon(row.get("channel_policy"))
+        if (
+            row_id <= 0
+            or not str(row.get("content") or "").strip()
+        ):
+            counts["retained_rows_invalid"] = (
+                int(counts.get("retained_rows_invalid", 0) or 0) + 1
+            )
+            continue
+        if policy not in _CONVERSATION_MOTIF_PUBLIC_POLICIES:
+            counts["retained_rows_policy_excluded"] = (
+                int(
+                    counts.get(
+                        "retained_rows_policy_excluded",
+                        0,
+                    )
+                    or 0
+                )
+                + 1
+            )
+            continue
+        counts["retained_rows_public_safe"] = (
+            int(counts.get("retained_rows_public_safe", 0) or 0) + 1
+        )
+        if str(row_id) in existing:
+            counts["ledger_projection_existing"] = (
+                int(
+                    counts.get(
+                        "ledger_projection_existing",
+                        0,
+                    )
+                    or 0
+                )
+                + 1
+            )
+            continue
+        result = shadow_conversation_row(
+            conn,
+            row_id=row_id,
+            user_id=subject_user_id,
+            user_name=str(row.get("user_name") or ""),
+            guild_id=int(guild_id or 0),
+            role="user",
+            content=str(row.get("content") or "")[:1000],
+            channel_name=str(row.get("channel_name") or "")[:80],
+            channel_policy=policy,
+            channel_id=int(row.get("channel_id") or 0),
+            message_id=(
+                int(row.get("message_id") or 0) or None
+            ),
+            route_mode="conversation_continuity",
+            observed_at=str(row.get("timestamp") or ""),
+            source_sequence=(
+                int(row.get("message_id") or 0) or row_id
+            ),
+            environ=environ,
+        )
+        outcome = str(result.outcome or "unknown")
+        key = "ledger_projection_%s" % outcome
+        counts[key] = int(counts.get(key, 0) or 0) + 1
+    if diagnostics is not None:
+        diagnostics.update(counts)
+    return counts
 
 
 def form_atomic_candidates_from_recurring_conversation(
@@ -5206,6 +5510,7 @@ def form_atomic_candidates_from_recurring_conversation(
     trigger_entry_id: str = "",
     max_scan: int = _CONVERSATION_MOTIF_MAX_SCAN,
     environ: dict[str, str] | None = None,
+    diagnostics: dict[str, int] | None = None,
 ) -> list[AtomicKnowledgeResult]:
     """Form conservative motifs from repeated production-shaped public chat.
 
@@ -5236,6 +5541,14 @@ def form_atomic_candidates_from_recurring_conversation(
     ):
         return []
 
+    project_retained_conversations_to_ledger(
+        conn,
+        guild_id=int(guild_id or 0),
+        subject_key=str(subject_key),
+        max_scan=max_scan,
+        diagnostics=diagnostics,
+        environ=environ,
+    )
     _sync_bounded_conversation_motif_corrections(
         conn,
         guild_id=int(guild_id or 0),
@@ -5247,6 +5560,7 @@ def form_atomic_candidates_from_recurring_conversation(
         guild_id=int(guild_id or 0),
         subject_key=str(subject_key),
         max_scan=max_scan,
+        diagnostics=diagnostics,
     )
     if not history:
         _record_knowledge_receipt(
@@ -5263,6 +5577,17 @@ def form_atomic_candidates_from_recurring_conversation(
         matches = _conversation_motif_family_matches(
             tuple(entry.get("terms") or ())
         )
+        if not matches and diagnostics is not None:
+            diagnostics["ledger_rows_family_unmatched"] = (
+                int(
+                    diagnostics.get(
+                        "ledger_rows_family_unmatched",
+                        0,
+                    )
+                    or 0
+                )
+                + 1
+            )
         for family, label in matches:
             group = grouped.setdefault(
                 "family:%s" % family,
@@ -5274,6 +5599,8 @@ def form_atomic_candidates_from_recurring_conversation(
                 },
             )
             group["entries"].append(entry)
+    if diagnostics is not None:
+        diagnostics["motif_families_matched"] = len(grouped)
 
     results: list[AtomicKnowledgeResult] = []
     ranked_groups: list[tuple[int, float, str, dict[str, Any]]] = []
@@ -5316,6 +5643,17 @@ def form_atomic_candidates_from_recurring_conversation(
             list(group["entries"])
         )
         if len(occurrence_ids) < 2 or len(root_ids) < 2:
+            if diagnostics is not None:
+                diagnostics["motif_families_recurrence_not_met"] = (
+                    int(
+                        diagnostics.get(
+                            "motif_families_recurrence_not_met",
+                            0,
+                        )
+                        or 0
+                    )
+                    + 1
+                )
             continue
         display_name = next(
             (
@@ -5362,6 +5700,8 @@ def form_atomic_candidates_from_recurring_conversation(
         results.append(result)
         if len(results) >= _CONVERSATION_MOTIF_MAX_CANDIDATES:
             break
+    if diagnostics is not None:
+        diagnostics["motif_candidates_returned"] = len(results)
     if not results:
         _record_knowledge_receipt(
             conn,
@@ -6017,7 +6357,8 @@ def _finalized_conversation_correction_resolution(
     """Resolve only one same-author finalized source; ambiguity never guesses."""
     if (
         not _CONVERSATION_CORRECTION_RE.search(correction_value or "")
-        or _canon(channel_policy) not in {"public_home", "public_context"}
+        or _canon(channel_policy)
+        not in _CONVERSATION_MOTIF_PUBLIC_POLICIES
         or not conn.execute(
             """
             SELECT 1 FROM sqlite_master
@@ -6046,7 +6387,9 @@ def _finalized_conversation_correction_resolution(
           AND e.entry_type='observation'
           AND e.lifecycle_status='active'
           AND e.public_usable=1
-          AND e.channel_policy IN ('public_home','public_context')
+          AND e.channel_policy IN (
+            'public_home','public_context','public_selective'
+          )
           AND w.guild_id=e.guild_id
           AND w.lifecycle_status='finalized'
           AND w.public_usable=1
@@ -6101,7 +6444,8 @@ def _raw_conversation_correction_resolution(
     """Resolve one bounded raw source only when the evidence is unambiguous."""
     if (
         not _CONVERSATION_CORRECTION_RE.search(correction_value or "")
-        or _canon(channel_policy) not in {"public_home", "public_context"}
+        or _canon(channel_policy)
+        not in _CONVERSATION_MOTIF_PUBLIC_POLICIES
     ):
         return "", ()
     correction_tokens = _conversation_correction_topic_tokens(
@@ -6222,6 +6566,7 @@ def shadow_conversation_row(
     message_id: int | None = None,
     route_mode: str = "unknown",
     observed_at: str = "",
+    source_sequence: int | None = None,
     conversation_target_user_ids: tuple[int, ...] = (),
     environ: dict[str, str] | None = None,
 ) -> LedgerWriteResult:
@@ -6256,7 +6601,7 @@ def shadow_conversation_row(
                 )
             ),
         )
-        entry = LedgerEntry(guild_id=guild_id, source_table="conversations", source_row_id=row_id, source_revision=str(row_id), source_role="model", entry_type="derived_summary", subject_key=BNL_SUBJECT_KEY, subject_display_name="BNL-01", predicate_key="model_output", value=(content or "")[:500], source_class=SourceClass.DERIVED_SUMMARY, route_mode=route_mode, channel_id=channel_id, channel_name=channel_name, channel_policy=channel_policy, source_message_id=message_id, visibility=visibility, confidence=Confidence.LOW, public_usable=False, derived=True, projection=True, salience=0.1, observed_at=observed_at or _now(), source_sequence=row_id, participants=participants)
+        entry = LedgerEntry(guild_id=guild_id, source_table="conversations", source_row_id=row_id, source_revision=str(row_id), source_role="model", entry_type="derived_summary", subject_key=BNL_SUBJECT_KEY, subject_display_name="BNL-01", predicate_key="model_output", value=(content or "")[:500], source_class=SourceClass.DERIVED_SUMMARY, route_mode=route_mode, channel_id=channel_id, channel_name=channel_name, channel_policy=channel_policy, source_message_id=message_id, visibility=visibility, confidence=Confidence.LOW, public_usable=False, derived=True, projection=True, salience=0.1, observed_at=observed_at or _now(), source_sequence=int(source_sequence or row_id), participants=participants)
         return insert_ledger_entry(conn, entry)
     subject_key = subject_key_for_user(user_id)
     source_class = _source_class("conversation_continuity", SourceClass.PUBLIC_OBSERVATION)
@@ -6293,7 +6638,7 @@ def shadow_conversation_row(
             public_usable=public_ok,
             salience=0.2,
             observed_at=observed_at or _now(),
-            source_sequence=row_id,
+            source_sequence=int(source_sequence or row_id),
             participants=(LedgerParticipant(subject_key, user_name or "", "author", 0),),
         ),
     )

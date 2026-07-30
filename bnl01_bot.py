@@ -5003,6 +5003,23 @@ def init_db():
     _try_alter(cursor, "ALTER TABLE conversations ADD COLUMN channel_policy TEXT")
     _try_alter(cursor, "ALTER TABLE conversations ADD COLUMN channel_id INTEGER")
     _try_alter(cursor, "ALTER TABLE conversations ADD COLUMN message_id INTEGER")
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS conversation_history_backfill_cursors (
+            guild_id INTEGER NOT NULL,
+            channel_id INTEGER NOT NULL,
+            channel_name TEXT NOT NULL DEFAULT '',
+            channel_policy TEXT NOT NULL DEFAULT 'unknown',
+            before_message_id INTEGER,
+            completed INTEGER NOT NULL DEFAULT 0,
+            pages_completed INTEGER NOT NULL DEFAULT 0,
+            messages_scanned INTEGER NOT NULL DEFAULT 0,
+            messages_inserted INTEGER NOT NULL DEFAULT 0,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (guild_id, channel_id)
+        )
+        """
+    )
 
     cursor.execute(
         """
@@ -10064,6 +10081,29 @@ def insert_backfilled_conversation_row(*, guild_id: int, channel_id: int, channe
             )
         row_id = int(cur.lastrowid or 0)
         conn.commit()
+        _shadow_memory_ledger_write(
+            "conversations_backfill",
+            lambda ledger_conn: shadow_conversation_row(
+                ledger_conn,
+                row_id=row_id,
+                user_id=user_id,
+                user_name=user_name,
+                guild_id=guild_id,
+                role="user",
+                content=content,
+                channel_name=(channel_name or "").lower()[:80],
+                channel_policy=(channel_policy or "unknown")[:40],
+                channel_id=int(channel_id or 0),
+                message_id=int(message_id or 0) or None,
+                route_mode=ROUTE_MODE_CONVERSATION_CONTINUITY,
+                observed_at=timestamp,
+                source_sequence=int(message_id or 0) or row_id,
+            ),
+            guild_id=guild_id,
+            source_table="conversations",
+            source_row_id=row_id,
+            source_revision=str(row_id),
+        )
         if (channel_policy or "").strip().lower() in PUBLIC_CHAT_POLICIES:
             try:
                 occurred_at_ms = journal_timestamp_to_epoch_ms(timestamp)
@@ -10100,6 +10140,94 @@ def _iso_timestamp(value) -> str:
 
 def _message_clean_content(msg) -> str:
     return re.sub(r"\s+", " ", getattr(msg, "clean_content", None) or getattr(msg, "content", "") or "").strip()
+
+
+def get_channel_backfill_cursor(guild_id: int, channel_id: int) -> dict:
+    """Return content-free paging state for one Discord history source."""
+    conn = sqlite3.connect(DB_FILE)
+    try:
+        row = conn.execute(
+            """
+            SELECT before_message_id,completed,pages_completed,
+                   messages_scanned,messages_inserted
+            FROM conversation_history_backfill_cursors
+            WHERE guild_id=? AND channel_id=?
+            """,
+            (int(guild_id or 0), int(channel_id or 0)),
+        ).fetchone()
+    finally:
+        conn.close()
+    if not row:
+        return {
+            "before_message_id": 0,
+            "completed": False,
+            "pages_completed": 0,
+            "messages_scanned": 0,
+            "messages_inserted": 0,
+        }
+    return {
+        "before_message_id": int(row[0] or 0),
+        "completed": bool(row[1]),
+        "pages_completed": int(row[2] or 0),
+        "messages_scanned": int(row[3] or 0),
+        "messages_inserted": int(row[4] or 0),
+    }
+
+
+def advance_channel_backfill_cursor(
+    *,
+    guild_id: int,
+    channel_id: int,
+    channel_name: str,
+    channel_policy: str,
+    before_message_id: int,
+    completed: bool,
+    messages_scanned: int,
+    messages_inserted: int,
+) -> dict:
+    """Advance one page without deriving progress from scattered stored rows."""
+    now = datetime.now(timezone.utc).isoformat()
+    conn = sqlite3.connect(DB_FILE)
+    try:
+        conn.execute(
+            """
+            INSERT INTO conversation_history_backfill_cursors(
+              guild_id,channel_id,channel_name,channel_policy,
+              before_message_id,completed,pages_completed,
+              messages_scanned,messages_inserted,updated_at
+            ) VALUES(?,?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(guild_id,channel_id) DO UPDATE SET
+              channel_name=excluded.channel_name,
+              channel_policy=excluded.channel_policy,
+              before_message_id=excluded.before_message_id,
+              completed=excluded.completed,
+              pages_completed=
+                conversation_history_backfill_cursors.pages_completed+1,
+              messages_scanned=
+                conversation_history_backfill_cursors.messages_scanned+
+                excluded.messages_scanned,
+              messages_inserted=
+                conversation_history_backfill_cursors.messages_inserted+
+                excluded.messages_inserted,
+              updated_at=excluded.updated_at
+            """,
+            (
+                int(guild_id or 0),
+                int(channel_id or 0),
+                (channel_name or "").lower()[:80],
+                (channel_policy or "unknown")[:40],
+                int(before_message_id or 0) or None,
+                1 if completed else 0,
+                1,
+                int(messages_scanned or 0),
+                int(messages_inserted or 0),
+                now,
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return get_channel_backfill_cursor(guild_id, channel_id)
 
 
 def mark_backfill_status(channel_name: str = "", status: str = "", scanned: int = 0, inserted: int = 0, skipped: int = 0, error: str = "none", dry_run: bool = True) -> None:
@@ -10147,12 +10275,52 @@ async def run_channel_backfill(channel, *, limit: int = BACKFILL_DEFAULT_LIMIT, 
         return result
     per_user = Counter()
     guild = getattr(channel, "guild", None)
+    guild_id = int(getattr(guild, "id", 0) or 0)
+    channel_id = int(getattr(channel, "id", 0) or 0)
+    cursor_state = get_channel_backfill_cursor(guild_id, channel_id)
+    result["cursorBeforeMessageId"] = int(
+        cursor_state.get("before_message_id") or 0
+    )
+    result["cursorAfterMessageId"] = result["cursorBeforeMessageId"]
+    result["historyComplete"] = bool(cursor_state.get("completed"))
+    result["pagesCompleted"] = int(
+        cursor_state.get("pages_completed") or 0
+    )
+    if cursor_state.get("completed") and not dry_run:
+        result["status"] = "complete"
+        result["skipReasons"] = {}
+        mark_backfill_status(
+            result["channelName"],
+            "complete",
+            0,
+            0,
+            0,
+            "none",
+            dry_run,
+        )
+        return result
+    oldest_scanned_message_id = 0
     try:
-        async for msg in channel.history(limit=limit, oldest_first=True):
+        # Page newest-to-oldest with a Discord `before` cursor. Passing
+        # `oldest_first=True` switches discord.py to its `after` strategy,
+        # which would repeatedly start at the beginning of the channel and
+        # can leave the middle of a long history uncollected.
+        history_kwargs = {"limit": limit, "oldest_first": False}
+        if result["cursorBeforeMessageId"]:
+            history_kwargs["before"] = discord.Object(
+                id=result["cursorBeforeMessageId"]
+            )
+        async for msg in channel.history(**history_kwargs):
             result["messagesScanned"] += 1
             author = getattr(msg, "author", None)
             content = _message_clean_content(msg)
             message_id = int(getattr(msg, "id", 0) or 0) or None
+            if message_id:
+                oldest_scanned_message_id = (
+                    min(oldest_scanned_message_id, message_id)
+                    if oldest_scanned_message_id
+                    else message_id
+                )
             timestamp = _iso_timestamp(getattr(msg, "created_at", None))
             if not guild:
                 result["skipReasons"]["dm_or_missing_guild"] += 1; continue
@@ -10201,7 +10369,33 @@ async def run_channel_backfill(channel, *, limit: int = BACKFILL_DEFAULT_LIMIT, 
     result["uniqueUsersFound"] = len(per_user)
     result["topUsers"] = per_user.most_common(5)
     result["skipReasons"] = dict(result["skipReasons"])
-    result["status"] = "dry_run" if dry_run else "stored"
+    page_exhausted = result["messagesScanned"] < limit
+    result["cursorAfterMessageId"] = (
+        oldest_scanned_message_id
+        or result["cursorBeforeMessageId"]
+    )
+    result["historyComplete"] = bool(page_exhausted)
+    if not dry_run:
+        cursor_state = advance_channel_backfill_cursor(
+            guild_id=guild_id,
+            channel_id=channel_id,
+            channel_name=result["channelName"],
+            channel_policy=policy,
+            before_message_id=result["cursorAfterMessageId"],
+            completed=page_exhausted,
+            messages_scanned=result["messagesScanned"],
+            messages_inserted=result["messagesInserted"],
+        )
+        result["pagesCompleted"] = int(
+            cursor_state.get("pages_completed") or 0
+        )
+    result["status"] = (
+        "dry_run"
+        if dry_run
+        else "complete"
+        if result["historyComplete"]
+        else "stored_page"
+    )
     mark_backfill_status(result["channelName"], result["status"], result["messagesScanned"], result["messagesInserted"], sum(result["skipReasons"].values()), "none", dry_run)
     logging.info("approved_channel_backfill channel=%s policy=%s dry_run=%s scanned=%s eligible=%s inserted=%s skipped=%s", result["channelName"], policy, dry_run, result["messagesScanned"], result["messagesEligible"], result["messagesInserted"], sum(result["skipReasons"].values()))
     return result
@@ -10221,6 +10415,7 @@ def format_channel_backfill_result(result: dict) -> str:
         f"channel policy: `{result.get('channelPolicy')}` | eligible: `{'yes' if result.get('eligible') else 'no'}` ({result.get('eligibilityReason')})",
         f"dry_run: `{'yes' if result.get('dryRun') else 'no'}` | limit: `{result.get('limit')}` | status: `{result.get('status')}`",
         f"messages scanned: `{result.get('messagesScanned')}` | eligible: `{result.get('messagesEligible')}` | inserted: `{result.get('messagesInserted')}` | truncated: `{result.get('messagesTruncated')}` | already_exists: `{result.get('rowsAlreadyExist')}`",
+        f"history paging: pages=`{result.get('pagesCompleted', 0)}` complete=`{'yes' if result.get('historyComplete') else 'no'}` cursor_before=`{result.get('cursorBeforeMessageId') or 'none'}` cursor_after=`{result.get('cursorAfterMessageId') or 'none'}`",
         f"messages skipped by reason: `{skip_text}`",
         f"unique users found: `{result.get('uniqueUsersFound')}` | top users by eligible count: `{top_text}`",
         f"tables {'would update' if result.get('dryRun') else 'updated'}: `{tables}`",

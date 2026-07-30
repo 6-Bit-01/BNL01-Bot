@@ -47,6 +47,7 @@ class FakeChannel:
         self._perms = perms or FakePerms()
         self.sent = []
         self._history = []
+        self.history_calls = []
 
     def permissions_for(self, _member):
         return self._perms
@@ -54,8 +55,24 @@ class FakeChannel:
     async def send(self, content):
         self.sent.append(content)
 
-    def history(self, limit=100, oldest_first=False, **_kwargs):
-        rows = list(self._history)[:limit]
+    def history(self, limit=100, oldest_first=False, **kwargs):
+        self.history_calls.append(
+            {
+                "limit": limit,
+                "oldest_first": oldest_first,
+                **kwargs,
+            }
+        )
+        rows = list(self._history)
+        before = kwargs.get("before")
+        before_id = int(getattr(before, "id", 0) or 0)
+        if before_id:
+            rows = [
+                row
+                for row in rows
+                if int(getattr(row, "id", 0) or 0) < before_id
+            ]
+        rows = rows[-limit:]
         if not oldest_first:
             rows = list(reversed(rows))
         class _History:
@@ -286,10 +303,81 @@ class ChannelAuditPassiveCaptureTests(unittest.TestCase):
         self.assertGreaterEqual(presence, 1)
         again = asyncio.run(bnl01_bot.run_channel_backfill(channel, limit=50, dry_run=False))
         self.assertEqual(again["messagesInserted"], 0)
-        self.assertGreaterEqual(again["rowsAlreadyExist"], 1)
+        self.assertTrue(again["historyComplete"])
+        self.assertEqual(again["status"], "complete")
         diag = bnl01_bot.build_dossier_recommendation_diagnostics(123)
         self.assertTrue(diag["backfill_available"])
         self.assertEqual(diag["backfill_last_channel"], "hellcat-nz")
+
+    def test_backfill_pages_oldest_history_with_a_dedicated_cursor(self):
+        guild, channel = self.make_guild_channel("hellcat-nz", 991)
+        channel._history = [
+            FakeMessage(
+                f"Historical music note {index} about a track mix.",
+                channel,
+                guild=guild,
+                author=FakeAuthor(42, "HellcatNZ"),
+                message_id=9000 + index,
+                created_at=f"2026-05-{index:02d}T00:00:00+00:00",
+            )
+            for index in range(1, 6)
+        ]
+
+        first = asyncio.run(
+            bnl01_bot.run_channel_backfill(
+                channel,
+                limit=2,
+                dry_run=False,
+            )
+        )
+        second = asyncio.run(
+            bnl01_bot.run_channel_backfill(
+                channel,
+                limit=2,
+                dry_run=False,
+            )
+        )
+        third = asyncio.run(
+            bnl01_bot.run_channel_backfill(
+                channel,
+                limit=2,
+                dry_run=False,
+            )
+        )
+
+        self.assertEqual(first["messagesInserted"], 2)
+        self.assertEqual(first["cursorAfterMessageId"], 9004)
+        self.assertFalse(first["historyComplete"])
+        self.assertFalse(channel.history_calls[0]["oldest_first"])
+        self.assertEqual(second["messagesInserted"], 2)
+        self.assertEqual(second["cursorBeforeMessageId"], 9004)
+        self.assertEqual(second["cursorAfterMessageId"], 9002)
+        self.assertFalse(second["historyComplete"])
+        self.assertEqual(channel.history_calls[1]["before"].id, 9004)
+        self.assertEqual(third["messagesInserted"], 1)
+        self.assertEqual(third["cursorBeforeMessageId"], 9002)
+        self.assertEqual(third["cursorAfterMessageId"], 9001)
+        self.assertTrue(third["historyComplete"])
+        self.assertEqual(third["pagesCompleted"], 3)
+        conn = sqlite3.connect(self.tmp.name)
+        try:
+            self.assertEqual(
+                conn.execute(
+                    "SELECT COUNT(*) FROM conversations"
+                ).fetchone()[0],
+                5,
+            )
+            cursor_row = conn.execute(
+                """
+                SELECT before_message_id,completed,pages_completed,
+                       messages_scanned,messages_inserted
+                FROM conversation_history_backfill_cursors
+                WHERE guild_id=123 AND channel_id=991
+                """
+            ).fetchone()
+        finally:
+            conn.close()
+        self.assertEqual(cursor_row, (9001, 1, 3, 5, 5))
 
     def test_backfill_keeps_bounded_long_public_messages(self):
         guild, channel = self.make_guild_channel("hellcat-nz", 991)

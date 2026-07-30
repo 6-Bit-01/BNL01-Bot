@@ -1039,6 +1039,240 @@ class ProductionShapedMemoryFormationTests(unittest.TestCase):
         self.assertEqual(results, [])
         self.assertEqual(self.candidate_rows(), [])
 
+    def test_public_selective_linked_rows_can_form_a_safe_motif(self):
+        first = self.add_conversation(
+            120,
+            (
+                "I am revising the track mix with <@123456789012345678> "
+                "after sharing https://example.com/demo."
+            ),
+            "2026-07-20T10:00:00+00:00",
+            channel_policy="public_selective",
+            visibility=Visibility.PUBLIC_SAFE,
+        )
+        self.add_conversation(
+            121,
+            (
+                "The album vocals and music mix need another pass at "
+                "https://example.com/revision."
+            ),
+            "2026-07-22T10:00:00+00:00",
+            channel_policy="public_selective",
+            visibility=Visibility.PUBLIC_SAFE,
+        )
+        diagnostics = {}
+
+        results = ledger.form_atomic_candidates_from_recurring_conversation(
+            self.conn,
+            trigger_entry_id=first,
+            environ=self.env,
+            diagnostics=diagnostics,
+        )
+
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0].outcome, "created")
+        self.assertEqual(diagnostics["ledger_rows_motif_eligible"], 2)
+        self.assertEqual(diagnostics["motif_families_matched"], 1)
+        self.assertIn(
+            "music and audio production",
+            self.candidate_rows()[0][1],
+        )
+
+    def test_operational_root_is_filtered_without_poisoning_safe_topic(self):
+        self.add_conversation(
+            130,
+            "I keep fixing the bot code and memory system carefully.",
+            "2026-07-20T10:00:00+00:00",
+        )
+        self.add_conversation(
+            131,
+            "The queue rehearsal website code needs another test.",
+            "2026-07-21T10:00:00+00:00",
+        )
+        self.add_conversation(
+            132,
+            "The website code needs another careful architecture pass.",
+            "2026-07-22T10:00:00+00:00",
+        )
+        diagnostics = {}
+
+        results = ledger.form_atomic_candidates_from_recurring_conversation(
+            self.conn,
+            guild_id=1,
+            subject_key="discord_user:7",
+            environ=self.env,
+            diagnostics=diagnostics,
+        )
+
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0].outcome, "created")
+        self.assertEqual(
+            diagnostics["ledger_rows_operational_excluded"],
+            1,
+        )
+        self.assertEqual(
+            self.conn.execute(
+                """
+                SELECT eligible_independent_root_count
+                FROM memory_ledger_knowledge_candidates
+                """
+            ).fetchone()[0],
+            2,
+        )
+
+    def test_retained_rows_project_through_ledger_subject_isolation(self):
+        self.conn.execute(
+            """
+            CREATE TABLE conversations (
+              id INTEGER PRIMARY KEY,
+              guild_id INTEGER NOT NULL,
+              user_id INTEGER NOT NULL,
+              user_name TEXT,
+              role TEXT NOT NULL,
+              content TEXT NOT NULL,
+              channel_name TEXT,
+              channel_policy TEXT,
+              channel_id INTEGER,
+              message_id INTEGER,
+              timestamp TEXT
+            )
+            """
+        )
+        self.conn.executemany(
+            """
+            INSERT INTO conversations(
+              id,guild_id,user_id,user_name,role,content,channel_name,
+              channel_policy,channel_id,message_id,timestamp
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                (
+                    1,
+                    1,
+                    7,
+                    "Crow",
+                    "user",
+                    "I am mixing a new music track tonight.",
+                    "barcode-bot",
+                    "public_home",
+                    10,
+                    7001,
+                    "2026-07-20T10:00:00+00:00",
+                ),
+                (
+                    2,
+                    1,
+                    7,
+                    "Crow",
+                    "user",
+                    "The album vocals need another production pass.",
+                    "artist-room",
+                    "public_selective",
+                    11,
+                    7002,
+                    "2026-07-22T10:00:00+00:00",
+                ),
+                (
+                    3,
+                    1,
+                    7,
+                    "Crow",
+                    "user",
+                    "Private internal visual planning.",
+                    "operations",
+                    "internal_controlled",
+                    12,
+                    7003,
+                    "2026-07-23T10:00:00+00:00",
+                ),
+                (
+                    4,
+                    1,
+                    8,
+                    "Other Member",
+                    "user",
+                    "Another member is mixing a music track.",
+                    "barcode-bot",
+                    "public_home",
+                    10,
+                    7004,
+                    "2026-07-24T10:00:00+00:00",
+                ),
+            ),
+        )
+        diagnostics = {}
+
+        first = ledger.project_retained_conversations_to_ledger(
+            self.conn,
+            guild_id=1,
+            subject_key="discord_user:7",
+            diagnostics=diagnostics,
+            environ=self.env,
+        )
+        second = ledger.project_retained_conversations_to_ledger(
+            self.conn,
+            guild_id=1,
+            subject_key="discord_user:7",
+            environ=self.env,
+        )
+
+        self.assertEqual(first["retained_rows_total"], 3)
+        self.assertEqual(first["retained_rows_public_safe"], 2)
+        self.assertEqual(first["retained_rows_policy_excluded"], 1)
+        self.assertEqual(first["ledger_projection_inserted"], 2)
+        self.assertEqual(second["ledger_projection_existing"], 2)
+        projected = self.conn.execute(
+            """
+            SELECT source_row_id,subject_key,channel_policy
+            FROM memory_ledger_entries
+            WHERE source_table='conversations'
+            ORDER BY source_row_id
+            """
+        ).fetchall()
+        self.assertEqual(
+            projected,
+            [
+                ("1", "discord_user:7", "public_home"),
+                ("2", "discord_user:7", "public_selective"),
+            ],
+        )
+
+    def test_motif_scan_reaches_supported_history_beyond_240_rows(self):
+        started = datetime(2025, 1, 1, 10, 0, tzinfo=timezone.utc)
+        self.add_conversation(
+            1,
+            "I am mixing the music track and adjusting vocals.",
+            started.isoformat(),
+        )
+        self.add_conversation(
+            2,
+            "The album mix and drums need another production pass.",
+            (started + timedelta(days=1)).isoformat(),
+        )
+        for index in range(3, 243):
+            self.add_conversation(
+                index,
+                "Planning details continue around an unrelated subject.",
+                (started + timedelta(days=index)).isoformat(),
+            )
+        diagnostics = {}
+
+        results = ledger.form_atomic_candidates_from_recurring_conversation(
+            self.conn,
+            guild_id=1,
+            subject_key="discord_user:7",
+            environ=self.env,
+            diagnostics=diagnostics,
+        )
+
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0].outcome, "created")
+        self.assertEqual(diagnostics["ledger_rows_scanned"], 242)
+        self.assertEqual(
+            diagnostics["ledger_rows_family_unmatched"],
+            240,
+        )
+
     def test_incremental_motif_refresh_stays_one_candidate_and_twelve_roots(self):
         roots = []
         last_trigger = ""
