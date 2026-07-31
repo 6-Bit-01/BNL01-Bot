@@ -80,6 +80,20 @@ class MemoryPreviewBotPathTests(unittest.IsolatedAsyncioTestCase):
             ),
         )
 
+    def test_slash_command_requires_explicit_question_argument(self):
+        parameters = {
+            parameter.name: parameter
+            for parameter in bnl01_bot.bnl_memory_preview.parameters
+        }
+        self.assertIn("subject", parameters)
+        self.assertIn("question", parameters)
+        self.assertNotIn("wording", parameters)
+        self.assertTrue(parameters["question"].required)
+        self.assertEqual(
+            parameters["question"].description,
+            "Required question to simulate as that member.",
+        )
+
     def _source_hash(self):
         return hashlib.sha256(
             Path(self.db_path).read_bytes()
@@ -1159,6 +1173,10 @@ class MemoryPreviewBotPathTests(unittest.IsolatedAsyncioTestCase):
         )
         interaction.response.send_message.assert_not_awaited()
         execute.assert_awaited_once()
+        self.assertEqual(
+            execute.await_args.kwargs["wording"],
+            "What am I all about?",
+        )
         sent.assert_awaited_once()
         rendered = sent.await_args.args[1]
         self.assertIn("BNL Memory Preview", rendered)
@@ -1220,6 +1238,7 @@ class MemoryPreviewBotPathTests(unittest.IsolatedAsyncioTestCase):
             await bnl01_bot.bnl_memory_preview.callback(
                 interaction,
                 subject,
+                "What am I all about?",
             )
 
         interaction.response.send_message.assert_awaited_once()
@@ -1285,6 +1304,7 @@ class MemoryPreviewBotPathTests(unittest.IsolatedAsyncioTestCase):
             await bnl01_bot.bnl_memory_preview.callback(
                 interaction,
                 subject,
+                "What am I all about?",
             )
 
         interaction.response.send_message.assert_awaited_once()
@@ -1328,6 +1348,7 @@ class MemoryPreviewBotPathTests(unittest.IsolatedAsyncioTestCase):
             await bnl01_bot.bnl_memory_preview.callback(
                 interaction,
                 subject,
+                "What am I all about?",
             )
 
         interaction.response.send_message.assert_awaited_once()

@@ -37242,12 +37242,12 @@ async def execute_bnl_memory_preview(
 )
 @app_commands.describe(
     subject="Member whose public-safe broad recall should be simulated.",
-    wording="Broad self-recall wording to simulate as that member.",
+    question="Required question to simulate as that member.",
 )
 async def bnl_memory_preview(
     interaction: discord.Interaction,
     subject: discord.Member,
-    wording: str = "BNL-01, what am I all about?",
+    question: str,
 ):
     if not BNL_OWNER_USER_ID:
         await interaction.response.send_message(
@@ -37296,10 +37296,10 @@ async def bnl_memory_preview(
             ephemeral=True,
         )
         return
-    clean_wording = re.sub(r"\s+", " ", str(wording or "")).strip()
+    clean_wording = re.sub(r"\s+", " ", str(question or "")).strip()
     if not clean_wording or len(clean_wording) > 1000:
         await interaction.response.send_message(
-            "❌ Preview wording must contain 1–1000 characters.",
+            "❌ Preview question must contain 1–1000 characters.",
             ephemeral=True,
         )
         return
