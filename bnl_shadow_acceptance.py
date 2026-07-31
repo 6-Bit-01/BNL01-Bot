@@ -30,7 +30,7 @@ from bnl_unified_response_assessment import (
 )
 
 
-SHADOW_ACCEPTANCE_VERSION = "v2_shadow_acceptance_v5"
+SHADOW_ACCEPTANCE_VERSION = "v2_shadow_acceptance_v6"
 SHADOW_EVALUATION_ORDER = (
     "memory_ledger",
     "moment_engine",
@@ -97,16 +97,41 @@ def build_gate_snapshot(environ: Optional[Mapping[str, str]] = None) -> Dict[str
             intelligence_packet["reason"]
         ),
         "shared_brain_synthesis_canary_requested": bool(
-            shared_brain_synthesis["configured_enabled"]
+            shared_brain_synthesis["canary_requested"]
         ),
         "shared_brain_synthesis_canary_effective": bool(
-            shared_brain_synthesis["effective"]
+            shared_brain_synthesis["canary_effective"]
         ),
         "shared_brain_synthesis_canary_reason": str(
             shared_brain_synthesis["reason"]
         ),
         "shared_brain_synthesis_canary_fully_scoped": bool(
             shared_brain_synthesis["fully_scoped"]
+            and shared_brain_synthesis["canary_requested"]
+        ),
+        "public_home_broad_recall_owner_requested": bool(
+            shared_brain_synthesis["public_home_owner_requested"]
+        ),
+        "public_home_broad_recall_owner_effective": bool(
+            shared_brain_synthesis["public_home_owner_effective"]
+        ),
+        "shared_brain_synthesis_requested": bool(
+            shared_brain_synthesis["configured_enabled"]
+        ),
+        "shared_brain_synthesis_effective": bool(
+            shared_brain_synthesis["effective"]
+        ),
+        "shared_brain_synthesis_reason": str(
+            shared_brain_synthesis["reason"]
+        ),
+        "shared_brain_synthesis_fully_scoped": bool(
+            shared_brain_synthesis["fully_scoped"]
+        ),
+        "shared_brain_synthesis_authority_mode": str(
+            shared_brain_synthesis["authority_mode"]
+        ),
+        "shared_brain_synthesis_kill_switch_env": str(
+            shared_brain_synthesis["kill_switch_env"]
         ),
         "all_live_gates_clear": not (
             governance_live_requested or relationship_live or engagement_live
@@ -773,7 +798,7 @@ def _read_shared_brain_synthesis_report(
         return _report_error(
             {
                 "tablePresent": False,
-                "schemaVersion": "shared_brain_synthesis_canary_v3",
+                "schemaVersion": "shared_brain_synthesis_v4",
                 "runs": 0,
                 "promptAppliedRuns": 0,
                 "liveAppliedRuns": 0,
@@ -1193,7 +1218,7 @@ def build_v2_shadow_acceptance_snapshot(
     ]
     shared_brain_synthesis_status = _stage_status(
         requested=bool(
-            gates.get("shared_brain_synthesis_canary_requested")
+            gates.get("shared_brain_synthesis_requested")
         ),
         prerequisites=shared_brain_synthesis_prerequisites,
         evidence=shared_brain_synthesis_evidence,
@@ -1397,10 +1422,10 @@ def build_v2_shadow_acceptance_snapshot(
     ):
         warnings.append("shared_brain_synthesis_selected_not_sent_review")
     if (
-        gates.get("shared_brain_synthesis_canary_effective")
+        gates.get("shared_brain_synthesis_effective")
         and not shared_brain_synthesis_evidence
     ):
-        warnings.append("shared_brain_synthesis_no_canary_evidence")
+        warnings.append("shared_brain_synthesis_no_route_evidence")
 
     stage_statuses = [stage["status"] for stage in stages.values()]
     unified_assessment_ready = bool(
@@ -1418,7 +1443,7 @@ def build_v2_shadow_acceptance_snapshot(
         )
     )
     shared_brain_synthesis_ready = bool(
-        not gates.get("shared_brain_synthesis_canary_requested")
+        not gates.get("shared_brain_synthesis_requested")
         or (
             shared_brain_synthesis_evidence
             and not shared_brain_synthesis_blockers
@@ -1458,6 +1483,7 @@ def build_v2_shadow_acceptance_snapshot(
             "memoryGovernance": governance,
             "relationshipV2": relationship,
             "unifiedIntelligencePacket": intelligence_packet,
+            "sharedBrainSynthesis": shared_brain_synthesis,
             "sharedBrainSynthesisCanary": shared_brain_synthesis,
             "unifiedResponseAssessment": unified_assessment,
         },
@@ -1499,6 +1525,41 @@ def build_v2_shadow_acceptance_snapshot(
             "fullyScoped": bool(
                 gates.get(
                     "shared_brain_synthesis_canary_fully_scoped"
+                )
+            ),
+            "evidenceObserved": shared_brain_synthesis_evidence,
+            "blockers": shared_brain_synthesis_blockers,
+            "unauthorizedPacketApplications": (
+                unauthorized_packet_applications
+            ),
+        },
+        "sharedBrainSynthesis": {
+            "status": shared_brain_synthesis_status,
+            "requested": bool(
+                gates.get("shared_brain_synthesis_requested")
+            ),
+            "effective": bool(
+                gates.get("shared_brain_synthesis_effective")
+            ),
+            "reason": str(
+                gates.get(
+                    "shared_brain_synthesis_reason",
+                    "disabled",
+                )
+            ),
+            "fullyScoped": bool(
+                gates.get("shared_brain_synthesis_fully_scoped")
+            ),
+            "authorityMode": str(
+                gates.get(
+                    "shared_brain_synthesis_authority_mode",
+                    "none",
+                )
+            ),
+            "killSwitchEnv": str(
+                gates.get(
+                    "shared_brain_synthesis_kill_switch_env",
+                    "none",
                 )
             ),
             "evidenceObserved": shared_brain_synthesis_evidence,
@@ -1586,14 +1647,18 @@ def render_v2_shadow_acceptance_lines(snapshot: Mapping[str, Any]) -> List[str]:
     relationship = reports.get("relationshipV2") or {}
     intelligence_packet = reports.get("unifiedIntelligencePacket") or {}
     shared_brain_synthesis = (
-        reports.get("sharedBrainSynthesisCanary") or {}
+        reports.get("sharedBrainSynthesis")
+        or reports.get("sharedBrainSynthesisCanary")
+        or {}
     )
     unified_assessment = reports.get("unifiedResponseAssessment") or {}
     intelligence_packet_state = (
         snapshot.get("unifiedIntelligencePacketShadow") or {}
     )
     shared_brain_synthesis_state = (
-        snapshot.get("sharedBrainSynthesisCanary") or {}
+        snapshot.get("sharedBrainSynthesis")
+        or snapshot.get("sharedBrainSynthesisCanary")
+        or {}
     )
     unified_state = snapshot.get("unifiedResponseAssessmentShadow") or {}
     blockers = snapshot.get("blockers") or []
@@ -1605,7 +1670,10 @@ def render_v2_shadow_acceptance_lines(snapshot: Mapping[str, Any]) -> List[str]:
         "- overall_status: `%s`" % snapshot.get("status", "unknown"),
         "- behavior_changes_applied: `%s`"
         % (
-            "scoped_shared_brain_synthesis_canary"
+            shared_brain_synthesis_state.get(
+                "authorityMode",
+                "scoped_shared_brain_synthesis_canary",
+            )
             if snapshot.get("behaviorChangesApplied")
             else "none"
         ),
@@ -1885,7 +1953,28 @@ def render_v2_shadow_acceptance_lines(snapshot: Mapping[str, Any]) -> List[str]:
                 "none",
             ),
         ),
-        "- shared_brain_synthesis_canary: status=`%s` requested=`%s` effective=`%s` reason=`%s` fully_scoped=`%s` schema=`%s` runs=`%s` route_families=`%s` prompt_applied=`%s` candidate_selected=`%s` live_applied=`%s` responses_sent=`%s` fallbacks=`%s` fallback_reasons=`%s` comparison=`%s` baseline_coherence=`%s` candidate_coherence=`%s` evidence_coverage=`%s` member_points=`%s` member_roots=`%s` member_occurrences=`%s` canon_coverage=`%s` member_supported_claims=`%s` canon_supported_claims=`%s` opinion_claims=`%s` connective_claims=`%s` unsupported_factual_claims=`%s` prompt_factual_owner=`%s` prompt_owner_failures=`%s` candidate_latency_ms=`%s` revalidation=`%s` control_leaks=`%s` errors=`%s` invalid_scope=`%s` invalid_revalidation_live=`%s` ungrounded_live=`%s` insufficient_member_live=`%s` unsupported_factual_live=`%s` prompt_owner_violation_live=`%s` relationship_posture_applied=`%s` content_fields=`%s` window_last=`%s`" % (
+        "- public_home_broad_recall_owner: requested=`%s` effective=`%s` authority_mode=`%s` fully_scoped=`%s` kill_switch=`%s`" % (
+            _on(
+                gates.get(
+                    "public_home_broad_recall_owner_requested"
+                )
+            ),
+            _on(
+                gates.get(
+                    "public_home_broad_recall_owner_effective"
+                )
+            ),
+            shared_brain_synthesis_state.get(
+                "authorityMode",
+                "none",
+            ),
+            _on(shared_brain_synthesis_state.get("fullyScoped")),
+            shared_brain_synthesis_state.get(
+                "killSwitchEnv",
+                "none",
+            ),
+        ),
+        "- shared_brain_synthesis_canary: status=`%s` requested=`%s` effective=`%s` reason=`%s` fully_scoped=`%s` schema=`%s` runs=`%s` route_families=`%s` authority_modes=`%s` prompt_applied=`%s` candidate_selected=`%s` live_applied=`%s` responses_sent=`%s` fallbacks=`%s` fallback_reasons=`%s` comparison=`%s` baseline_coherence=`%s` candidate_coherence=`%s` evidence_coverage=`%s` member_points=`%s` member_roots=`%s` member_occurrences=`%s` canon_coverage=`%s` member_supported_claims=`%s` canon_supported_claims=`%s` opinion_claims=`%s` connective_claims=`%s` unsupported_factual_claims=`%s` prompt_factual_owner=`%s` prompt_owner_failures=`%s` candidate_latency_ms=`%s` revalidation=`%s` control_leaks=`%s` errors=`%s` invalid_scope=`%s` invalid_revalidation_live=`%s` ungrounded_live=`%s` insufficient_member_live=`%s` unsupported_factual_live=`%s` prompt_owner_violation_live=`%s` relationship_posture_applied=`%s` content_fields=`%s` window_last=`%s`" % (
             shared_brain_synthesis_state.get("status", "unknown"),
             _on(shared_brain_synthesis_state.get("requested")),
             _on(shared_brain_synthesis_state.get("effective")),
@@ -1893,11 +1982,15 @@ def render_v2_shadow_acceptance_lines(snapshot: Mapping[str, Any]) -> List[str]:
             _on(shared_brain_synthesis_state.get("fullyScoped")),
             shared_brain_synthesis.get(
                 "schemaVersion",
-                "shared_brain_synthesis_canary_v3",
+                "shared_brain_synthesis_v4",
             ),
             shared_brain_synthesis.get("runs", 0),
             json.dumps(
                 shared_brain_synthesis.get("routeFamilyCounts", {}),
+                sort_keys=True,
+            ),
+            json.dumps(
+                shared_brain_synthesis.get("authorityModeCounts", {}),
                 sort_keys=True,
             ),
             shared_brain_synthesis.get("promptAppliedRuns", 0),

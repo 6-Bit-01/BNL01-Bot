@@ -1,9 +1,10 @@
-"""Scoped live synthesis canary for the unified intelligence packet.
+"""Guarded synthesis for the unified intelligence packet.
 
 The established response is always generated first.  This module may prepare a
-second, packet-grounded comparison only for one explicitly configured
-guild/member/channel route.  It owns no knowledge and persists no packet or
-response content.
+second, packet-grounded comparison for either the scoped acceptance canary or
+the separately gated public-home broad-recall owner.  Both modes reuse the same
+packet, selector, fallback, revalidation, and content-free receipt path.  This
+module owns no knowledge and persists no packet or response content.
 """
 from __future__ import annotations
 
@@ -36,16 +37,29 @@ from bnl_unified_response_assessment import (
 )
 
 
-SCHEMA_VERSION = "shared_brain_synthesis_canary_v3"
+SCHEMA_VERSION = "shared_brain_synthesis_v4"
 TABLE_NAME = "memory_governance_shared_brain_synthesis_runs"
 ENABLED_ENV = "BNL_SHARED_BRAIN_SYNTHESIS_CANARY_ENABLED"
 GUILD_IDS_ENV = "BNL_SHARED_BRAIN_SYNTHESIS_CANARY_GUILD_IDS"
 USER_IDS_ENV = "BNL_SHARED_BRAIN_SYNTHESIS_CANARY_USER_IDS"
 CHANNEL_IDS_ENV = "BNL_SHARED_BRAIN_SYNTHESIS_CANARY_CHANNEL_IDS"
+PUBLIC_HOME_OWNER_ENABLED_ENV = (
+    "BNL_PUBLIC_HOME_BROAD_RECALL_OWNER_ENABLED"
+)
+PUBLIC_HOME_OWNER_GUILD_IDS_ENV = (
+    "BNL_PUBLIC_HOME_BROAD_RECALL_OWNER_GUILD_IDS"
+)
+PUBLIC_HOME_OWNER_CHANNEL_IDS_ENV = (
+    "BNL_PUBLIC_HOME_BROAD_RECALL_OWNER_CHANNEL_IDS"
+)
+SCOPED_CANARY_AUTHORITY = "scoped_canary"
+PUBLIC_HOME_OWNER_AUTHORITY = "public_home_broad_recall_owner"
 _ROUTE_MODE = "normal_chat"
-_CHANNEL_POLICIES = frozenset({"public_home", "public_context"})
+_CANARY_CHANNEL_POLICIES = frozenset({"public_home", "public_context"})
+_PUBLIC_HOME_OWNER_CHANNEL_POLICIES = frozenset({"public_home"})
 _MAX_SCOPED_USERS = 8
 _MAX_SCOPED_CHANNELS = 4
+_MAX_PUBLIC_HOME_OWNER_CHANNELS = 1
 _LIVE_GATES = (
     "BNL_MEMORY_GOVERNANCE_LIVE_ENABLED",
     "BNL_RELATIONSHIP_V2_LIVE_ENABLED",
@@ -516,6 +530,7 @@ class SharedBrainSynthesisBasis:
     rendered_item_count: int
     rendered_lane_counts: tuple[tuple[str, int], ...]
     rendered_source_digests: tuple[str, ...]
+    authority_mode: str = SCOPED_CANARY_AUTHORITY
     competing_factual_contexts: tuple[str, ...] = ()
     competing_factual_context_digests: tuple[str, ...] = ()
     blocking_factual_owner_lanes: tuple[str, ...] = ()
@@ -565,6 +580,7 @@ class RouteScopeDecision:
     reason: str
     intent_status: str
     route_family: str
+    authority_mode: str = "none"
 
 
 @dataclass(frozen=True)
@@ -632,29 +648,67 @@ def _digest(*values: Any) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
-def configuration(
-    environ: Mapping[str, str] | None = None,
+def _configuration_details(
+    environ: Mapping[str, str],
 ) -> dict[str, Any]:
-    """Return safe configuration state without exposing allowlisted IDs."""
+    """Resolve one authority without exposing its opaque IDs publicly."""
 
-    env = os.environ if environ is None else environ
-    requested = _flag(env.get(ENABLED_ENV, ""))
-    guilds = _positive_ids(env.get(GUILD_IDS_ENV, ""))
-    users = _positive_ids(env.get(USER_IDS_ENV, ""))
-    channels = _positive_ids(env.get(CHANNEL_IDS_ENV, ""))
-    scope_present = bool(requested and guilds and users and channels)
-    scope_within_limits = bool(
-        len(guilds) == 1
-        and 1 <= len(users) <= _MAX_SCOPED_USERS
-        and 1 <= len(channels) <= _MAX_SCOPED_CHANNELS
+    canary_requested = _flag(environ.get(ENABLED_ENV, ""))
+    owner_requested = _flag(
+        environ.get(PUBLIC_HOME_OWNER_ENABLED_ENV, "")
     )
+    authority_conflict = bool(canary_requested and owner_requested)
+
+    if canary_requested and not authority_conflict:
+        authority_mode = SCOPED_CANARY_AUTHORITY
+        guilds = _positive_ids(environ.get(GUILD_IDS_ENV, ""))
+        users = _positive_ids(environ.get(USER_IDS_ENV, ""))
+        channels = _positive_ids(environ.get(CHANNEL_IDS_ENV, ""))
+        channel_policies = _CANARY_CHANNEL_POLICIES
+        user_scope_required = True
+        scope_present = bool(guilds and users and channels)
+        scope_within_limits = bool(
+            len(guilds) == 1
+            and 1 <= len(users) <= _MAX_SCOPED_USERS
+            and 1 <= len(channels) <= _MAX_SCOPED_CHANNELS
+        )
+    elif owner_requested and not authority_conflict:
+        authority_mode = PUBLIC_HOME_OWNER_AUTHORITY
+        guilds = _positive_ids(
+            environ.get(PUBLIC_HOME_OWNER_GUILD_IDS_ENV, "")
+        )
+        users = frozenset()
+        channels = _positive_ids(
+            environ.get(PUBLIC_HOME_OWNER_CHANNEL_IDS_ENV, "")
+        )
+        channel_policies = _PUBLIC_HOME_OWNER_CHANNEL_POLICIES
+        user_scope_required = False
+        scope_present = bool(guilds and channels)
+        scope_within_limits = bool(
+            len(guilds) == 1
+            and len(channels) == _MAX_PUBLIC_HOME_OWNER_CHANNELS
+        )
+    else:
+        authority_mode = "conflict" if authority_conflict else "none"
+        guilds = frozenset()
+        users = frozenset()
+        channels = frozenset()
+        channel_policies = frozenset()
+        user_scope_required = False
+        scope_present = False
+        scope_within_limits = False
+
+    requested = bool(canary_requested or owner_requested)
     fully_scoped = bool(
-        scope_present and scope_within_limits
+        requested
+        and not authority_conflict
+        and scope_present
+        and scope_within_limits
     )
-    packet_ready = packet_shadow_enabled(env)
-    assessment_ready = assessment_shadow_enabled(env)
+    packet_ready = packet_shadow_enabled(environ)
+    assessment_ready = assessment_shadow_enabled(environ)
     active_live_gates = tuple(
-        name for name in _LIVE_GATES if _flag(env.get(name, ""))
+        name for name in _LIVE_GATES if _flag(environ.get(name, ""))
     )
     effective = bool(
         fully_scoped
@@ -664,6 +718,8 @@ def configuration(
     )
     if not requested:
         reason = "disabled"
+    elif authority_conflict:
+        reason = "authority_conflict"
     elif scope_present and not scope_within_limits:
         reason = "scope_limit_exceeded"
     elif not fully_scoped:
@@ -673,21 +729,75 @@ def configuration(
     elif not packet_ready or not assessment_ready:
         reason = "missing_shadow_prerequisites"
     else:
-        reason = "scoped_canary"
+        reason = authority_mode
+
     return {
-        "configured_enabled": requested,
-        "guild_allowlist_count": len(guilds),
-        "user_allowlist_count": len(users),
-        "channel_allowlist_count": len(channels),
+        "requested": requested,
+        "canary_requested": canary_requested,
+        "public_home_owner_requested": owner_requested,
+        "authority_mode": authority_mode,
+        "guilds": guilds,
+        "users": users,
+        "channels": channels,
+        "channel_policies": channel_policies,
+        "user_scope_required": user_scope_required,
         "fully_scoped": fully_scoped,
         "effective": effective,
         "reason": reason,
+        "packet_ready": packet_ready,
+        "assessment_ready": assessment_ready,
+        "active_live_gates": active_live_gates,
+    }
+
+
+def configuration(
+    environ: Mapping[str, str] | None = None,
+) -> dict[str, Any]:
+    """Return safe configuration state without exposing allowlisted IDs."""
+
+    env = os.environ if environ is None else environ
+    details = _configuration_details(env)
+    return {
+        "configured_enabled": details["requested"],
+        "canary_requested": details["canary_requested"],
+        "canary_effective": bool(
+            details["effective"]
+            and details["authority_mode"] == SCOPED_CANARY_AUTHORITY
+        ),
+        "public_home_owner_requested": details[
+            "public_home_owner_requested"
+        ],
+        "public_home_owner_effective": bool(
+            details["effective"]
+            and details["authority_mode"]
+            == PUBLIC_HOME_OWNER_AUTHORITY
+        ),
+        "authority_mode": details["authority_mode"],
+        "guild_allowlist_count": len(details["guilds"]),
+        "user_allowlist_count": len(details["users"]),
+        "channel_allowlist_count": len(details["channels"]),
+        "user_scope_required": details["user_scope_required"],
+        "fully_scoped": details["fully_scoped"],
+        "effective": details["effective"],
+        "reason": details["reason"],
         "route_mode": _ROUTE_MODE,
         "route_family": PERSONAL_RECALL_ROUTE_FAMILY,
-        "channel_policies": tuple(sorted(_CHANNEL_POLICIES)),
+        "channel_policies": tuple(
+            sorted(details["channel_policies"])
+        ),
         "max_scoped_users": _MAX_SCOPED_USERS,
         "max_scoped_channels": _MAX_SCOPED_CHANNELS,
-        "active_live_gates": active_live_gates,
+        "max_public_home_owner_channels": (
+            _MAX_PUBLIC_HOME_OWNER_CHANNELS
+        ),
+        "active_live_gates": details["active_live_gates"],
+        "kill_switch_env": (
+            PUBLIC_HOME_OWNER_ENABLED_ENV
+            if details["authority_mode"] == PUBLIC_HOME_OWNER_AUTHORITY
+            else ENABLED_ENV
+            if details["authority_mode"] == SCOPED_CANARY_AUTHORITY
+            else "none"
+        ),
     }
 
 
@@ -742,25 +852,26 @@ def route_scope_decision(
     """Evaluate the route family before packet/assessment availability."""
 
     env = os.environ if environ is None else environ
+    details = _configuration_details(env)
     config = configuration(env)
     intent = classify_personal_recall_intent(user_text)
     if not config["effective"]:
         reason = "configuration_%s" % config["reason"]
-    elif int(guild_id or 0) not in _positive_ids(
-        env.get(GUILD_IDS_ENV, "")
-    ):
+    elif int(guild_id or 0) not in details["guilds"]:
         reason = "guild_not_allowlisted"
-    elif int(user_id or 0) not in _positive_ids(
-        env.get(USER_IDS_ENV, "")
+    elif (
+        details["user_scope_required"]
+        and int(user_id or 0) not in details["users"]
     ):
         reason = "user_not_allowlisted"
-    elif int(channel_id or 0) not in _positive_ids(
-        env.get(CHANNEL_IDS_ENV, "")
-    ):
+    elif int(channel_id or 0) not in details["channels"]:
         reason = "channel_not_allowlisted"
     elif str(route_mode or "") != _ROUTE_MODE:
         reason = "route_mode_not_supported"
-    elif str(channel_policy or "").strip().lower() not in _CHANNEL_POLICIES:
+    elif (
+        str(channel_policy or "").strip().lower()
+        not in details["channel_policies"]
+    ):
         reason = "channel_policy_not_supported"
     elif not current_direct:
         reason = "not_direct"
@@ -781,6 +892,7 @@ def route_scope_decision(
         route_family=(
             intent.route_family or PERSONAL_RECALL_ROUTE_FAMILY
         ),
+        authority_mode=str(config["authority_mode"]),
     )
 
 
@@ -1344,6 +1456,7 @@ def build_basis(
     competing_factual_contexts: Sequence[str] = (),
     environ: Mapping[str, str] | None = None,
 ) -> SharedBrainSynthesisBasis | None:
+    env = os.environ if environ is None else environ
     if not scope_enabled(
         guild_id=guild_id,
         user_id=user_id,
@@ -1359,9 +1472,10 @@ def build_basis(
         third_party_attribution_requested=(
             third_party_attribution_requested
         ),
-        environ=environ,
+        environ=env,
     ):
         return None
+    authority_mode = str(configuration(env)["authority_mode"])
     (
         rendered,
         lane_counts,
@@ -1392,6 +1506,7 @@ def build_basis(
         rendered_item_count=item_count,
         rendered_lane_counts=lane_counts,
         rendered_source_digests=source_digests,
+        authority_mode=authority_mode,
         competing_factual_contexts=factual_contexts,
         competing_factual_context_digests=tuple(
             _digest(value) for value in factual_contexts
@@ -1424,17 +1539,20 @@ def revalidate_basis(
     environ: Mapping[str, str] | None = None,
 ) -> tuple[bool, str]:
     env = os.environ if environ is None else environ
+    details = _configuration_details(env)
     config = configuration(env)
     if not config["effective"]:
         return False, "scope_disabled"
     if (
-        basis.guild_id not in _positive_ids(env.get(GUILD_IDS_ENV, ""))
-        or basis.user_id not in _positive_ids(env.get(USER_IDS_ENV, ""))
-        or basis.channel_id not in _positive_ids(
-            env.get(CHANNEL_IDS_ENV, "")
+        basis.authority_mode != config["authority_mode"]
+        or basis.guild_id not in details["guilds"]
+        or (
+            details["user_scope_required"]
+            and basis.user_id not in details["users"]
         )
+        or basis.channel_id not in details["channels"]
         or basis.route_mode != _ROUTE_MODE
-        or basis.channel_policy not in _CHANNEL_POLICIES
+        or basis.channel_policy not in details["channel_policies"]
         or basis.packet.request.subject_user_id != basis.user_id
         or basis.packet.request.guild_id != basis.guild_id
         or basis.packet.request.channel_id != basis.channel_id
@@ -2448,6 +2566,7 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
             subject_hash TEXT NOT NULL,
             channel_scope_hash TEXT NOT NULL,
             route_family TEXT NOT NULL DEFAULT 'broad_self_profile',
+            authority_mode TEXT NOT NULL DEFAULT 'scoped_canary',
             route_mode TEXT NOT NULL,
             channel_policy TEXT NOT NULL,
             packet_item_count INTEGER NOT NULL DEFAULT 0,
@@ -2515,6 +2634,14 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
             ALTER TABLE memory_governance_shared_brain_synthesis_runs
             ADD COLUMN candidate_generation_latency_ms INTEGER NOT NULL
             DEFAULT 0
+            """
+        )
+    if "authority_mode" not in columns:
+        conn.execute(
+            """
+            ALTER TABLE memory_governance_shared_brain_synthesis_runs
+            ADD COLUMN authority_mode TEXT NOT NULL
+            DEFAULT 'scoped_canary'
             """
         )
     for column, definition in (
@@ -2645,8 +2772,8 @@ def begin_run(
         """
         INSERT INTO memory_governance_shared_brain_synthesis_runs(
           run_id,packet_run_id,packet_id,schema_version,guild_id,
-          subject_hash,channel_scope_hash,route_family,route_mode,
-          channel_policy,
+          subject_hash,channel_scope_hash,route_family,authority_mode,
+          route_mode,channel_policy,
           packet_item_count,rendered_item_count,rendered_lane_counts_json,
           packet_digest,source_ref_digest,baseline_generated,
           baseline_response_hash,baseline_response_length,
@@ -2654,7 +2781,7 @@ def begin_run(
           competing_factual_context_count,replaced_factual_context_count,
           revalidation_status,prompt_applied,fallback_reason,
           processing_error_count,created_at,updated_at
-        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """,
         (
             run_id,
@@ -2665,6 +2792,7 @@ def begin_run(
             _digest(subject_key_for_user(basis.user_id))[:16],
             _digest(basis.guild_id, basis.channel_id)[:16],
             PERSONAL_RECALL_ROUTE_FAMILY,
+            basis.authority_mode,
             basis.route_mode,
             basis.channel_policy,
             len(basis.packet.items),
@@ -3074,6 +3202,7 @@ def _empty_report() -> dict[str, Any]:
         "promptFactualOwnerRuns": 0,
         "promptOwnershipFailureRuns": 0,
         "routeFamilyCounts": {},
+        "authorityModeCounts": {},
         "candidateGenerationLatencyMs": {
             "average": 0,
             "maximum": 0,
@@ -3130,6 +3259,11 @@ def build_evaluation_report(
         "route_family"
         if "route_family" in columns
         else "'broad_self_profile'"
+    )
+    authority_mode_expr = (
+        "authority_mode"
+        if "authority_mode" in columns
+        else "'scoped_canary'"
     )
     latency_expr = (
         "candidate_generation_latency_ms"
@@ -3210,9 +3344,16 @@ def build_evaluation_report(
               AND (
                 route_mode<>?
                 OR channel_policy NOT IN ('public_home','public_context')
+                OR {authority_mode_expr} NOT IN (
+                  'scoped_canary','public_home_broad_recall_owner'
+                )
+                OR (
+                  {authority_mode_expr}='public_home_broad_recall_owner'
+                  AND channel_policy<>'public_home'
+                )
                 OR subject_hash='' OR channel_scope_hash=''
               )
-            """,
+            """.format(authority_mode_expr=authority_mode_expr),
             (int(guild_id or 0), _ROUTE_MODE),
         ).fetchone()[0]
         or 0
@@ -3367,7 +3508,7 @@ def build_evaluation_report(
                candidate_evidence_coverage_count,revalidation_status,
                candidate_output_leak,
                processing_error_count,response_sent,
-               {route_family_expr},{latency_expr},
+               {route_family_expr},{authority_mode_expr},{latency_expr},
                {member_point_expr},{member_root_expr},
                {member_occurrence_expr},{canon_coverage_expr},
                {lore_dominant_expr},
@@ -3381,6 +3522,7 @@ def build_evaluation_report(
         LIMIT ?
         """.format(
             route_family_expr=route_family_expr,
+            authority_mode_expr=authority_mode_expr,
             latency_expr=latency_expr,
             member_point_expr=member_point_expr,
             member_root_expr=member_root_expr,
@@ -3401,6 +3543,7 @@ def build_evaluation_report(
     candidate_coherence: Counter[str] = Counter()
     revalidation: Counter[str] = Counter()
     route_families: Counter[str] = Counter()
+    authority_modes: Counter[str] = Counter()
     latency_values: list[int] = []
     prompt = live = selected = coverage = leaks = errors = sent = 0
     member_points = member_roots = member_occurrences = canon_coverage = 0
@@ -3423,6 +3566,7 @@ def build_evaluation_report(
             processing_errors,
             response_sent,
             route_family,
+            authority_mode,
             candidate_latency_ms,
             candidate_member_points,
             candidate_member_roots,
@@ -3464,6 +3608,9 @@ def build_evaluation_report(
         route_families[
             str(route_family or PERSONAL_RECALL_ROUTE_FAMILY)
         ] += 1
+        authority_modes[
+            str(authority_mode or SCOPED_CANARY_AUTHORITY)
+        ] += 1
         latency = max(0, int(candidate_latency_ms or 0))
         if latency:
             latency_values.append(latency)
@@ -3499,6 +3646,7 @@ def build_evaluation_report(
         "promptFactualOwnerRuns": prompt_factual_owner_runs,
         "promptOwnershipFailureRuns": prompt_ownership_failures,
         "routeFamilyCounts": dict(sorted(route_families.items())),
+        "authorityModeCounts": dict(sorted(authority_modes.items())),
         "candidateGenerationLatencyMs": {
             "average": (
                 int(round(sum(latency_values) / len(latency_values)))
