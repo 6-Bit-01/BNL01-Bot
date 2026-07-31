@@ -626,6 +626,162 @@ class ProductionShapedBroadRecallAcceptanceTests(unittest.TestCase):
         finally:
             prepared.close()
 
+    def test_work_and_decision_profile_uses_full_pool_and_rejects_icon_role(
+        self,
+    ):
+        user_id = 112
+        user_name = "DecisionMember"
+        process_rows = (
+            (
+                "I want to compare both approaches before choosing one.",
+                "2026-07-20T12:00:00+00:00",
+            ),
+            (
+                "Let's test the smaller version and check the result first.",
+                "2026-07-22T12:00:00+00:00",
+            ),
+            (
+                "We should revise one piece at a time before deciding.",
+                "2026-07-24T12:00:00+00:00",
+            ),
+        )
+        for content, observed_at in process_rows:
+            self.add_raw_message(
+                user_id=user_id,
+                user_name=user_name,
+                content=content,
+                observed_at=observed_at,
+            )
+        self.add_recurring_topic(
+            user_id=user_id,
+            user_name=user_name,
+            first="I keep producing synth music and mixing audio tracks.",
+            second="The song vocals and drum mix need another pass.",
+            day_offset=0,
+        )
+        self.add_raw_message(
+            user_id=user_id,
+            user_name=user_name,
+            content="The synth track still needs a careful audio mix.",
+            observed_at="2026-07-22T20:00:00+00:00",
+        )
+        self.add_recurring_topic(
+            user_id=user_id,
+            user_name=user_name,
+            first=(
+                "I want custom character emotes for Modem and "
+                "Floppydisc."
+            ),
+            second=(
+                "The Modem and Floppydisc icons need another visual "
+                "design pass."
+            ),
+            day_offset=3,
+        )
+        self.add_raw_message(
+            user_id=user_id,
+            user_name=user_name,
+            content=(
+                "The custom character emotes need one more artwork "
+                "review."
+            ),
+            observed_at="2026-07-25T20:00:00+00:00",
+        )
+        wording = (
+            "What have you learned about how I work and make decisions?"
+        )
+        prepared = prepare_memory_preview(
+            self.request(
+                user_id=user_id,
+                user_name=user_name,
+                wording=wording,
+            )
+        )
+        try:
+            self.assertTrue(prepared.ready)
+            self.assertGreaterEqual(
+                prepared.diagnostics.assessment_pool_eligible_count,
+                7,
+            )
+            self.assertEqual(
+                prepared.diagnostics.assessment_pool_selected_count,
+                4,
+            )
+            self.assertEqual(
+                dict(prepared.basis.rendered_lane_counts).get(
+                    "assessment_observation",
+                    0,
+                ),
+                4,
+            )
+            prompt = prepared.packet_owned_prompt.prompt
+            self.assertIn("compare both approaches", prompt)
+            self.assertIn("test the smaller version", prompt)
+            self.assertIn(
+                "An inventory of projects, interests, or community "
+                "activities does not answer this question.",
+                prompt,
+            )
+
+            activity_inventory = evaluate_memory_preview(
+                prepared,
+                baseline_response=(
+                    "I only have a narrow grounded view so far."
+                ),
+                candidate_response=(
+                    "Testing the smaller version, checking the result, "
+                    "and revising one piece at a time are recurring "
+                    "activities in your public history."
+                ),
+            )
+            self.assertFalse(activity_inventory.candidate_selected)
+            self.assertEqual(
+                activity_inventory.fallback_reason,
+                "candidate_request_angle_missed",
+            )
+
+            grounded_process = evaluate_memory_preview(
+                prepared,
+                baseline_response=(
+                    "I only have a narrow grounded view so far."
+                ),
+                candidate_response=(
+                    "My read is that you make decisions by comparing "
+                    "approaches, testing a smaller version, checking the "
+                    "result, and then choosing. My read is that the "
+                    "pattern is iterative rather than impulsive."
+                ),
+            )
+            self.assertTrue(
+                grounded_process.candidate_selected,
+                grounded_process.fallback_reason,
+            )
+
+            invented_icon_role = evaluate_memory_preview(
+                prepared,
+                baseline_response=(
+                    "I only have a narrow grounded view so far."
+                ),
+                candidate_response=(
+                    "My read is that you make decisions by comparing "
+                    "approaches, testing a smaller version, and checking "
+                    "the result before choosing. You organize character "
+                    "icons like Modem and Floppydisc."
+                ),
+            )
+            self.assertFalse(invented_icon_role.candidate_selected)
+            self.assertEqual(
+                invented_icon_role.fallback_reason,
+                "candidate_claims_ungrounded",
+            )
+            self.assertEqual(
+                invented_icon_role
+                .candidate_unsupported_factual_claim_count,
+                1,
+            )
+        finally:
+            prepared.close()
+
     def test_lostmarbles_never_inherits_wittyfox_evidence(self):
         self.add_recurring_topic(
             user_id=103,

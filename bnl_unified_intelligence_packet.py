@@ -37,6 +37,7 @@ from bnl_memory_ledger import (
     knowledge_occurrence_identity,
     knowledge_root_identity,
     knowledge_source_root_identity,
+    select_public_conversation_assessment_evidence,
     subject_key_for_user,
 )
 from bnl_moment_engine import select_public_participant_moment_gists
@@ -103,6 +104,7 @@ _CONFIDENCE_RANK = {
 _LANE_CAPS = {
     "current_intent": 8,
     "conversation_context": 6,
+    "assessment_observation": 4,
     "approved_fact": 4,
     "moment": 3,
     "atomic_knowledge": 6,
@@ -114,6 +116,7 @@ _LANE_CAPS = {
 _BROAD_PROFILE_LANE_CAPS = {
     **_LANE_CAPS,
     "conversation_context": 2,
+    "assessment_observation": 4,
     "atomic_knowledge": 6,
     "moment": 2,
     "open_loop": 1,
@@ -129,6 +132,7 @@ _ROOT_COLLAPSE_MEMBER_LANES = (
 _ASSESSMENT_LANE_MAP = {
     "current_intent": "current_exchange",
     "conversation_context": "conversation_context",
+    "assessment_observation": "governed_memory",
     "approved_fact": "governed_memory",
     "atomic_knowledge": "governed_memory",
     "open_loop": "governed_memory",
@@ -1052,6 +1056,101 @@ def _ledger_entry_digest(
         (int(data.get("guild_id") or 0), entry_id),
     ).fetchall()
     return _digest("ledger", data, lineage, incoming)
+
+
+def _assessment_observation_items(
+    conn: sqlite3.Connection,
+    request: IntelligencePacketRequest,
+    diagnostics: IntelligencePacketDiagnostics,
+    exclusions: list[IntelligencePacketExclusion],
+    *,
+    broad: bool,
+) -> list[IntelligencePacketItem]:
+    """Build ephemeral question-scoped items from all eligible public roots."""
+
+    if not broad or int(request.subject_user_id or 0) <= 0:
+        return []
+    subject = subject_key_for_user(request.subject_user_id)
+    selection = select_public_conversation_assessment_evidence(
+        conn,
+        guild_id=int(request.guild_id or 0),
+        subject_key=subject,
+        request_text=str(request.user_text or ""),
+        max_results=_BROAD_PROFILE_LANE_CAPS["assessment_observation"],
+    )
+    diagnostics.candidates_by_lane["assessment_observation"] = int(
+        selection.eligible_count or 0
+    )
+    not_selected = max(
+        0,
+        int(selection.eligible_count or 0) - len(selection.items),
+    )
+    if not_selected:
+        diagnostics.excluded_by_reason[
+            "assessment_pool_not_selected"
+        ] = not_selected
+
+    items: list[IntelligencePacketItem] = []
+    for evidence in selection.items:
+        entry_id = str(evidence.entry_id or "")
+        source_digest = _ledger_entry_digest(conn, entry_id)
+        root = knowledge_root_identity(conn, entry_id)
+        occurrence = str(evidence.occurrence_identity or "")
+        if not source_digest or not root or not occurrence:
+            _add_exclusion(
+                diagnostics,
+                exclusions,
+                lane="assessment_observation",
+                reason="assessment_source_unversioned",
+                source_class=SourceClass.PUBLIC_OBSERVATION.value,
+            )
+            continue
+        item = IntelligencePacketItem(
+            lane="assessment_observation",
+            source_class=SourceClass.PUBLIC_OBSERVATION.value,
+            source_type="public_assessment_observation",
+            source_ref="ledger:%s" % entry_id,
+            source_digest=source_digest,
+            subject_key=subject,
+            predicate_key="public_assessment_observation",
+            text=str(evidence.text or "")[:240],
+            visibility=str(evidence.visibility or "unknown"),
+            confidence=Confidence.HIGH.value,
+            lifecycle="active",
+            authority=_AUTHORITY_RANK[
+                SourceClass.PUBLIC_OBSERVATION.value
+            ],
+            participants=(subject,),
+            lineage=(entry_id,),
+            observed_at=str(evidence.observed_at or ""),
+            usage="assessment_only",
+            score=(
+                92.0
+                + min(24.0, float(evidence.score or 0.0))
+                + (12.0 if evidence.request_relevant else 0.0)
+            ),
+            revalidation_kind="ledger",
+            revalidation_key=entry_id,
+            root_identities=(root,),
+            occurrence_identities=(occurrence,),
+            point_identity=_point_identity(
+                subject_key=subject,
+                predicate_key="public_assessment_observation",
+                text=str(evidence.text or ""),
+            ),
+        )
+        if not _route_allows_item(request, item):
+            diagnostics.visibility_exclusions += 1
+            _add_exclusion(
+                diagnostics,
+                exclusions,
+                lane="assessment_observation",
+                reason="assessment_visibility",
+                source_class=item.source_class,
+            )
+            continue
+        items.append(item)
+    return items
 
 
 def _governed_items(
@@ -2105,6 +2204,18 @@ def _apply_current_turn_precedence(
         predicate_terms = _terms(item.predicate_key.replace("_", " "))
         item_value = re.sub(r"\W+", " ", item.text.lower()).strip()
         if (
+            item.lane == "assessment_observation"
+            and item.subject_key == subject
+        ):
+            _add_exclusion(
+                diagnostics,
+                exclusions,
+                lane=item.lane,
+                reason="current_turn_correction_precedence",
+                source_class=item.source_class,
+            )
+            continue
+        if (
             item.lane
             in {"approved_fact", "atomic_knowledge", "open_loop"}
             and item.subject_key == subject
@@ -2169,12 +2280,13 @@ def _select_items(
         "current_intent": 0,
         "approved_fact": 1,
         "atomic_knowledge": 2,
-        "moment": 3,
-        "open_loop": 4,
-        "conversation_context": 5,
-        "canon": 6,
-        "source_file": 7,
-        "relationship_posture": 8,
+        "conversation_context": 3,
+        "assessment_observation": 4,
+        "moment": 5,
+        "open_loop": 6,
+        "canon": 7,
+        "source_file": 8,
+        "relationship_posture": 9,
     }
     ordered = sorted(
         candidates,
@@ -2530,6 +2642,7 @@ def _packet_invariants(
             item.lane
             in {
                 "approved_fact",
+                "assessment_observation",
                 "atomic_knowledge",
                 "open_loop",
                 "moment",
@@ -2601,6 +2714,15 @@ def build_packet(
     try:
         candidates.extend(
             _conversation_items(conn, request, diagnostics, exclusions)
+        )
+        candidates.extend(
+            _assessment_observation_items(
+                conn,
+                request,
+                diagnostics,
+                exclusions,
+                broad=broad,
+            )
         )
         candidates.extend(
             _governed_items(

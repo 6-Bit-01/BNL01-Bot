@@ -686,6 +686,115 @@ class UnifiedIntelligencePacketTests(unittest.TestCase):
         self.assertIn("mix number 0", rendered)
         self.assertIn("mix number 5", rendered)
 
+    def test_process_profile_selects_across_family_unmatched_public_pool(self):
+        rows = (
+            (
+                970,
+                "I want to compare both approaches before choosing one.",
+                "2026-07-20T10:00:00+00:00",
+            ),
+            (
+                971,
+                "Let's test the smaller version and check the result first.",
+                "2026-07-21T10:00:00+00:00",
+            ),
+            (
+                972,
+                "We should revise one piece at a time before deciding.",
+                "2026-07-22T10:00:00+00:00",
+            ),
+            (
+                973,
+                "I prefer a bounded plan with careful verification.",
+                "2026-07-23T10:00:00+00:00",
+            ),
+            (
+                974,
+                "I want custom emotes for Modem and Floppydisc.",
+                "2026-07-24T10:00:00+00:00",
+            ),
+            (
+                975,
+                "The character icons need another visual design pass.",
+                "2026-07-25T10:00:00+00:00",
+            ),
+        )
+        entry_ids = tuple(
+            self.add_raw_public_conversation(*row) for row in rows
+        )
+        self.add_raw_public_conversation(
+            976,
+            "Another member privately chooses a completely different plan.",
+            "2026-07-25T11:00:00+00:00",
+            user_id=8,
+            user_name="Moth",
+        )
+        formation_diagnostics = {}
+        ledger.form_atomic_candidates_from_recurring_conversation(
+            self.conn,
+            trigger_entry_id=entry_ids[-1],
+            environ=self.flags,
+            diagnostics=formation_diagnostics,
+        )
+        self.assertGreaterEqual(
+            formation_diagnostics["ledger_rows_family_unmatched"],
+            4,
+        )
+
+        packet = build_packet(
+            self.conn,
+            self.public_request(
+                text=(
+                    "What have you learned about how I work and make "
+                    "decisions?"
+                )
+            ),
+            persist=False,
+            environ=self.flags,
+        )
+        assessment_items = tuple(
+            item
+            for item in packet.items
+            if item.lane == "assessment_observation"
+        )
+
+        self.assertEqual(
+            packet.diagnostics.candidates_by_lane[
+                "assessment_observation"
+            ],
+            6,
+        )
+        self.assertEqual(len(assessment_items), 4)
+        self.assertGreaterEqual(
+            sum(
+                any(
+                    marker in item.text.lower()
+                    for marker in (
+                        "approach",
+                        "test",
+                        "revise",
+                        "plan",
+                    )
+                )
+                for item in assessment_items
+            ),
+            3,
+        )
+        self.assertEqual(
+            {item.subject_key for item in assessment_items},
+            {"discord_user:7"},
+        )
+        self.assertTrue(
+            all(item.usage == "assessment_only" for item in assessment_items)
+        )
+        rendered, counts, _count, _digests = render_packet_context(packet)
+        self.assertEqual(
+            dict(counts).get("assessment_observation"),
+            4,
+        )
+        self.assertIn("selected after considering the full eligible", rendered)
+        self.assertNotIn("completely different plan", rendered)
+
     def test_distinct_atomic_points_can_share_exact_human_roots(self):
         rows = (
             (

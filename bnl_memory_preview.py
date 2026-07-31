@@ -117,6 +117,8 @@ class MemoryPreviewDiagnostics:
     packet_exclusion_reason_counts: tuple[tuple[str, int], ...] = ()
     packet_missing_lanes: tuple[str, ...] = ()
     packet_revalidation_status: str = "not_evaluated"
+    assessment_pool_eligible_count: int = 0
+    assessment_pool_selected_count: int = 0
     root_collapse_suppression_count: int = 0
     shared_root_projection_count: int = 0
     profile_status: str = "not_applicable"
@@ -983,6 +985,28 @@ def _diagnostics(
             if packet is not None
             else "not_evaluated"
         ),
+        assessment_pool_eligible_count=(
+            int(
+                packet.diagnostics.candidates_by_lane.get(
+                    "assessment_observation",
+                    0,
+                )
+                or 0
+            )
+            if packet is not None
+            else 0
+        ),
+        assessment_pool_selected_count=(
+            int(
+                packet.diagnostics.selected_by_lane.get(
+                    "assessment_observation",
+                    0,
+                )
+                or 0
+            )
+            if packet is not None
+            else 0
+        ),
         root_collapse_suppression_count=(
             int(packet.diagnostics.root_collapse_suppression or 0)
             if packet is not None
@@ -1555,6 +1579,11 @@ def render_content_free_diagnostics(
             diag.lifecycle_state_changes,
         ),
         "- packet_lanes: `%s`" % dict(diag.packet_lane_counts),
+        "- public_assessment_pool: `eligible=%s selected=%s`"
+        % (
+            diag.assessment_pool_eligible_count,
+            diag.assessment_pool_selected_count,
+        ),
         "- rendered_packet_lanes: `%s` project_canon_required=`%s`"
         % (
             (
