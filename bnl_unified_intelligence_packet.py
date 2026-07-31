@@ -114,7 +114,7 @@ _LANE_CAPS = {
 _BROAD_PROFILE_LANE_CAPS = {
     **_LANE_CAPS,
     "conversation_context": 2,
-    "atomic_knowledge": 4,
+    "atomic_knowledge": 6,
     "moment": 2,
     "open_loop": 1,
     "canon": 2,

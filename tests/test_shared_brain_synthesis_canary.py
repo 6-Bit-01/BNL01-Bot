@@ -13,6 +13,7 @@ from bnl_shadow_acceptance import (
     render_v2_shadow_acceptance_lines,
 )
 from bnl_shared_brain_synthesis import (
+    _candidate_claim_units,
     begin_run,
     build_basis,
     build_evaluation_report,
@@ -740,6 +741,69 @@ class SharedBrainSynthesisCanaryTests(unittest.TestCase):
             ),
         )
 
+    def test_claim_splitter_preserves_coordinated_profile_language(self):
+        first_cleanup = (
+            "Based on my observations, you are largely driven by audio, "
+            "visual craft, and community alignment. You're consistently "
+            "hyping up synth-driven tracks, showing appreciation for badass "
+            "song art, and diving into lore and worldbuilding. Parallel to "
+            "that, your focus stays on bringing people together—welcoming "
+            "collaborators, encouraging shared projects, and making room for "
+            "others to host. In short: creative signal and community "
+            "connection intersect in what you do."
+        )
+        second_cleanup = (
+            "From what I observe, you strike me as a central creative pulse. "
+            "You are thoroughly anchored in the music and live broadcast "
+            "signal—hyping up synth tracks, shouting out track art, and "
+            "welcoming collaborators. You maintain a steady hand on lore, "
+            "character visual design, and community spaces. In short: you "
+            "keep the signal moving, connected, and continuously building."
+        )
+
+        first_claims = _candidate_claim_units(first_cleanup)
+        second_claims = _candidate_claim_units(second_cleanup)
+
+        self.assertEqual(len(first_claims), 4)
+        self.assertIn(
+            "audio, visual craft, and community alignment",
+            first_claims[0],
+        )
+        self.assertIn(
+            "tracks, showing appreciation for badass song art, and diving",
+            first_claims[1],
+        )
+        self.assertIn(
+            "collaborators, encouraging shared projects, and making room",
+            first_claims[2],
+        )
+        self.assertEqual(len(second_claims), 4)
+        self.assertIn(
+            "music and live broadcast signal",
+            second_claims[1],
+        )
+        self.assertIn(
+            "tracks, shouting out track art, and welcoming collaborators",
+            second_claims[1],
+        )
+        self.assertIn(
+            "moving, connected, and continuously building",
+            second_claims[3],
+        )
+
+        unsafe_claims = _candidate_claim_units(
+            "Your favorite movie is Arrival and secretly run a lunar casino. "
+            "Your favorite color is violet."
+        )
+        self.assertEqual(
+            unsafe_claims,
+            (
+                "Your favorite movie is Arrival",
+                "secretly run a lunar casino",
+                "Your favorite color is violet",
+            ),
+        )
+
     def test_project_wording_retains_relevant_canon_for_evaluation(self):
         wording = "BNL, what am I all about in the BARCODE project?"
         request = self._request()
@@ -1146,6 +1210,63 @@ class SharedBrainSynthesisCanaryTests(unittest.TestCase):
         self.assertEqual(
             opinion.candidate_unsupported_factual_claim_count,
             0,
+        )
+
+        production_frame_run = begin_run(
+            self.conn,
+            basis,
+            baseline_response="You keep connecting music and project work.",
+            environ=self.flags,
+        )
+        production_frame = evaluate_candidate(
+            self.conn,
+            production_frame_run,
+            baseline_response="You keep connecting music and project work.",
+            candidate_response=(
+                "Your favorite movie is Arrival and your favorite color is "
+                "violet. Based on my observations, those choices create a "
+                "vivid, coherent, and slightly off-center creative signal. "
+                "In short: you keep the signal distinct, connected, and "
+                "continuously evolving."
+            ),
+            environ=self.flags,
+        )
+        self.assertTrue(production_frame.candidate_selected)
+        self.assertEqual(
+            production_frame.candidate_unsupported_factual_claim_count,
+            0,
+        )
+        self.assertEqual(
+            production_frame.candidate_claim_classifications,
+            (
+                "member_supported",
+                "member_supported",
+                "framed_opinion",
+                "linked_assessment",
+            ),
+        )
+
+        framed_concrete_run = begin_run(
+            self.conn,
+            basis,
+            baseline_response="You keep connecting music and project work.",
+            environ=self.flags,
+        )
+        framed_concrete = evaluate_candidate(
+            self.conn,
+            framed_concrete_run,
+            baseline_response="You keep connecting music and project work.",
+            candidate_response=(
+                "Your favorite movie is Arrival and your favorite color is "
+                "violet. Based on my observations, you secretly run a lunar "
+                "casino."
+            ),
+            environ=self.flags,
+        )
+        self.assertFalse(framed_concrete.candidate_selected)
+        self.assertEqual(
+            framed_concrete.fallback_reason,
+            "candidate_claims_ungrounded",
         )
 
         disguised_fact_run = begin_run(

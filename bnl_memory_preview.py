@@ -123,6 +123,7 @@ class MemoryPreviewDiagnostics:
     profile_satisfied: bool = False
     profile_required_point_count: int = 0
     profile_selected_point_count: int = 0
+    profile_candidate_point_count: int = 0
     profile_independent_root_count: int = 0
     profile_independent_occurrence_count: int = 0
     profile_reason_codes: tuple[str, ...] = ()
@@ -924,7 +925,7 @@ def _diagnostics(
     omission_reasons = {
         "excluded:%s" % reason
         for reason, count in exclusion_counts
-        if int(count or 0) > 0
+        if int(count or 0) > 0 and reason != "lane_cap"
     }
     omission_reasons.update(
         "missing_lane:%s" % lane for lane in missing_lanes
@@ -937,6 +938,11 @@ def _diagnostics(
         if str(reason or "")
     )
     if packet is not None:
+        omission_reasons.update(
+            "excluded:lane_cap:%s" % exclusion.lane
+            for exclusion in packet.exclusions
+            if exclusion.reason == "lane_cap"
+        )
         omission_reasons.update(
             "packet_error:%s" % reason
             for reason in packet.diagnostics.processing_errors
@@ -1000,6 +1006,9 @@ def _diagnostics(
         ),
         profile_selected_point_count=int(
             getattr(profile, "selected_point_count", 0) or 0
+        ),
+        profile_candidate_point_count=int(
+            getattr(profile, "candidate_point_count", 0) or 0
         ),
         profile_independent_root_count=int(
             getattr(profile, "independent_root_count", 0) or 0
@@ -1561,12 +1570,14 @@ def render_content_free_diagnostics(
             ).lower(),
         ),
         "- profile_sufficiency: `%s` satisfied=`%s` "
-        "points=`%s/%s` roots=`%s` occurrences=`%s` reasons=`%s`"
+        "points=`%s/%s` eligible_points=`%s` roots=`%s` "
+        "occurrences=`%s` reasons=`%s`"
         % (
             diag.profile_status,
             str(diag.profile_satisfied).lower(),
             diag.profile_selected_point_count,
             diag.profile_required_point_count,
+            diag.profile_candidate_point_count,
             diag.profile_independent_root_count,
             diag.profile_independent_occurrence_count,
             list(diag.profile_reason_codes) or ["none"],
