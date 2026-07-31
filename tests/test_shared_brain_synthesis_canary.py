@@ -13,6 +13,7 @@ from bnl_shadow_acceptance import (
     render_v2_shadow_acceptance_lines,
 )
 from bnl_shared_brain_synthesis import (
+    PUBLIC_HOME_OWNER_AUTHORITY,
     _candidate_claim_units,
     begin_run,
     build_basis,
@@ -346,6 +347,111 @@ class SharedBrainSynthesisCanaryTests(unittest.TestCase):
             {"third_party_attribution_requested": True},
         ):
             self.assertFalse(scope_enabled(**{**common, **override}))
+
+    def test_public_home_owner_revalidates_through_its_own_kill_switch(self):
+        owner_flags = {
+            **self.flags,
+            "BNL_SHARED_BRAIN_SYNTHESIS_CANARY_ENABLED": "false",
+            "BNL_PUBLIC_HOME_BROAD_RECALL_OWNER_ENABLED": "true",
+            "BNL_PUBLIC_HOME_BROAD_RECALL_OWNER_GUILD_IDS": "1",
+            "BNL_PUBLIC_HOME_BROAD_RECALL_OWNER_CHANNEL_IDS": "10",
+        }
+        owner_packet = replace(
+            self.packet,
+            request=replace(
+                self.packet.request,
+                channel_policy="public_home",
+            ),
+        )
+        owner_assessment = replace(
+            self.assessment,
+            channel_policy="public_home",
+        )
+        owner_basis = build_basis(
+            guild_id=1,
+            user_id=7,
+            channel_id=10,
+            route_mode="normal_chat",
+            channel_policy="public_home",
+            current_direct=True,
+            user_text=owner_packet.request.user_text,
+            packet=owner_packet,
+            assessment=owner_assessment,
+            environ=owner_flags,
+        )
+        self.assertIsNotNone(owner_basis)
+        self.assertEqual(
+            owner_basis.authority_mode,
+            PUBLIC_HOME_OWNER_AUTHORITY,
+        )
+
+        ensure_schema(self.conn)
+        run = begin_run(
+            self.conn,
+            owner_basis,
+            baseline_response="Established response.",
+        )
+        stored_authority = self.conn.execute(
+            """
+            SELECT authority_mode
+            FROM memory_governance_shared_brain_synthesis_runs
+            WHERE run_id=?
+            """,
+            (run.run_id,),
+        ).fetchone()[0]
+        self.assertEqual(
+            stored_authority,
+            PUBLIC_HOME_OWNER_AUTHORITY,
+        )
+        snapshot = build_v2_shadow_acceptance_snapshot(
+            self.conn,
+            guild_id=1,
+            environ=owner_flags,
+        )
+        owner_state = snapshot["sharedBrainSynthesis"]
+        self.assertTrue(owner_state["requested"])
+        self.assertTrue(owner_state["effective"])
+        self.assertEqual(
+            owner_state["authorityMode"],
+            PUBLIC_HOME_OWNER_AUTHORITY,
+        )
+        rendered = "\n".join(
+            render_v2_shadow_acceptance_lines(snapshot)
+        )
+        self.assertIn(
+            "- public_home_broad_recall_owner: requested=`on`",
+            rendered,
+        )
+        self.assertIn(
+            'authority_modes=`{"public_home_broad_recall_owner": 1}`',
+            rendered,
+        )
+
+        with mock.patch(
+            "bnl_shared_brain_synthesis.revalidate_packet",
+            return_value=mock.Mock(valid=True, status="passed_owner"),
+        ):
+            self.assertEqual(
+                revalidate_basis(
+                    self.conn,
+                    owner_basis,
+                    environ=owner_flags,
+                ),
+                (True, "passed_owner"),
+            )
+            self.assertEqual(
+                revalidate_basis(
+                    self.conn,
+                    owner_basis,
+                    environ={
+                        **owner_flags,
+                        "BNL_PUBLIC_HOME_BROAD_RECALL_OWNER_ENABLED": (
+                            "false"
+                        ),
+                    },
+                ),
+                (False, "scope_disabled"),
+            )
 
     def test_renderer_excludes_current_intent_and_relationship_posture(self):
         (
@@ -1668,6 +1774,10 @@ class SharedBrainSynthesisCanaryTests(unittest.TestCase):
             {"broad_self_profile": 1},
         )
         self.assertEqual(
+            report["authorityModeCounts"],
+            {"scoped_canary": 1},
+        )
+        self.assertEqual(
             report["candidateGenerationLatencyMs"],
             {"average": 125, "maximum": 125, "samples": 1},
         )
@@ -1943,6 +2053,7 @@ class SharedBrainSynthesisCanaryTests(unittest.TestCase):
             "source_refs",
         }
         self.assertFalse(columns & forbidden)
+        self.assertIn("authority_mode", columns)
 
 
 if __name__ == "__main__":

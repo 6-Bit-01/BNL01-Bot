@@ -8,6 +8,7 @@ os.environ.setdefault("DISCORD_BOT_TOKEN", "test-discord-token")
 import bnl01_bot
 from bnl_memory_governance import classify_personal_recall_intent
 from bnl_shared_brain_synthesis import (
+    PUBLIC_HOME_OWNER_AUTHORITY,
     configuration,
     route_scope_decision,
 )
@@ -196,6 +197,93 @@ class GovernedBroadRecallRouteExpansionTests(unittest.TestCase):
         self.assertFalse(decision.eligible)
         self.assertEqual(decision.reason, "user_not_allowlisted")
 
+    def test_public_home_owner_is_a_separate_default_off_route_gate(self):
+        owner_flags = {
+            **self.flags,
+            "BNL_SHARED_BRAIN_SYNTHESIS_CANARY_ENABLED": "false",
+            "BNL_PUBLIC_HOME_BROAD_RECALL_OWNER_ENABLED": "true",
+            "BNL_PUBLIC_HOME_BROAD_RECALL_OWNER_GUILD_IDS": "1",
+            "BNL_PUBLIC_HOME_BROAD_RECALL_OWNER_CHANNEL_IDS": "10",
+        }
+        configured = configuration(owner_flags)
+        self.assertTrue(configured["effective"])
+        self.assertFalse(configured["canary_effective"])
+        self.assertTrue(configured["public_home_owner_effective"])
+        self.assertEqual(
+            configured["authority_mode"],
+            PUBLIC_HOME_OWNER_AUTHORITY,
+        )
+        self.assertFalse(configured["user_scope_required"])
+        self.assertEqual(configured["user_allowlist_count"], 0)
+        self.assertEqual(configured["channel_policies"], ("public_home",))
+        self.assertEqual(
+            configured["kill_switch_env"],
+            "BNL_PUBLIC_HOME_BROAD_RECALL_OWNER_ENABLED",
+        )
+
+        for user_id in (7, 99):
+            with self.subTest(user_id=user_id):
+                decision = route_scope_decision(
+                    guild_id=1,
+                    user_id=user_id,
+                    channel_id=10,
+                    route_mode="normal_chat",
+                    channel_policy="public_home",
+                    current_direct=True,
+                    user_text="What do you know about me?",
+                    environ=owner_flags,
+                )
+                self.assertTrue(decision.eligible)
+                self.assertEqual(
+                    decision.authority_mode,
+                    PUBLIC_HOME_OWNER_AUTHORITY,
+                )
+
+        for override in (
+            {"guild_id": 2},
+            {"channel_id": 11},
+            {"channel_policy": "public_context"},
+            {"route_mode": "direct_payload"},
+            {"current_direct": False},
+            {"user_text": "Tell me a joke."},
+        ):
+            common = {
+                "guild_id": 1,
+                "user_id": 99,
+                "channel_id": 10,
+                "route_mode": "normal_chat",
+                "channel_policy": "public_home",
+                "current_direct": True,
+                "user_text": "What do you know about me?",
+                "environ": owner_flags,
+            }
+            with self.subTest(override=override):
+                self.assertFalse(
+                    route_scope_decision(
+                        **{**common, **override}
+                    ).eligible
+                )
+
+    def test_route_authorities_conflict_and_kill_switch_fail_closed(self):
+        owner_scope = {
+            **self.flags,
+            "BNL_PUBLIC_HOME_BROAD_RECALL_OWNER_ENABLED": "true",
+            "BNL_PUBLIC_HOME_BROAD_RECALL_OWNER_GUILD_IDS": "1",
+            "BNL_PUBLIC_HOME_BROAD_RECALL_OWNER_CHANNEL_IDS": "10",
+        }
+        conflict = configuration(owner_scope)
+        self.assertFalse(conflict["effective"])
+        self.assertEqual(conflict["reason"], "authority_conflict")
+
+        disabled = configuration(
+            {
+                **owner_scope,
+                "BNL_SHARED_BRAIN_SYNTHESIS_CANARY_ENABLED": "false",
+                "BNL_PUBLIC_HOME_BROAD_RECALL_OWNER_ENABLED": "false",
+            }
+        )
+        self.assertFalse(disabled["effective"])
+        self.assertEqual(disabled["reason"], "disabled")
 
 if __name__ == "__main__":
     unittest.main()
