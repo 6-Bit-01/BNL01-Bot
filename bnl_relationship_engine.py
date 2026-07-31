@@ -509,22 +509,55 @@ def build_evaluation_report(conn: sqlite3.Connection, *, guild_id: int | None = 
     by_type={r[0]:r[1] for r in conn.execute(f"SELECT event_type,COUNT(*) FROM relationship_events_v2 {where} GROUP BY event_type", p).fetchall()}
     lifecycle={r[0]:r[1] for r in conn.execute(f"SELECT lifecycle,COUNT(*) FROM relationship_events_v2 {where} GROUP BY lifecycle", p).fetchall()}
     scoped = "guild_id=? AND " if guild_id is not None else ""
+    ledger_link_scope = "l.guild_id=? AND " if guild_id is not None else ""
+    ledger_link_problem = (
+        "(e.event_id IS NULL OR e.guild_id<>l.guild_id "
+        "OR e.subject_user_id<>l.subject_user_id "
+        "OR m.entry_id IS NULL OR m.guild_id<>l.guild_id "
+        "OR m.subject_key<>('discord_user:' || "
+        "CAST(l.subject_user_id AS TEXT)))"
+    )
     if _table_exists(conn, "memory_ledger_entries"):
         ledger_link_integrity_violations = one(
             "SELECT COUNT(*) FROM relationship_event_ledger_links_v2 l "
             "LEFT JOIN relationship_events_v2 e ON e.event_id=l.event_id "
             "LEFT JOIN memory_ledger_entries m ON m.entry_id=l.ledger_entry_id "
-            f"WHERE {('l.guild_id=? AND ' if guild_id is not None else '')}"
-            "(e.event_id IS NULL OR e.guild_id<>l.guild_id "
-            "OR e.subject_user_id<>l.subject_user_id "
-            "OR m.entry_id IS NULL OR m.guild_id<>l.guild_id "
-            "OR m.subject_key<>('discord_user:' || CAST(l.subject_user_id AS TEXT)))"
+            f"WHERE {ledger_link_scope}{ledger_link_problem} "
+            "AND (e.event_id IS NULL OR e.lifecycle='active')"
+        )
+        retired_ledger_link_integrity_observations = one(
+            "SELECT COUNT(*) FROM relationship_event_ledger_links_v2 l "
+            "JOIN relationship_events_v2 e ON e.event_id=l.event_id "
+            "LEFT JOIN memory_ledger_entries m ON m.entry_id=l.ledger_entry_id "
+            f"WHERE {ledger_link_scope}{ledger_link_problem} "
+            "AND e.lifecycle<>'active'"
         )
     else:
-        # A persisted link cannot be verified when its target table is absent.
+        # An active persisted link cannot be verified when its target table is
+        # absent. Retired links remain visible for audit without blocking the
+        # currently usable relationship graph.
         ledger_link_integrity_violations = one(
-            f"SELECT COUNT(*) FROM relationship_event_ledger_links_v2 {where}"
+            "SELECT COUNT(*) FROM relationship_event_ledger_links_v2 l "
+            "LEFT JOIN relationship_events_v2 e ON e.event_id=l.event_id "
+            f"WHERE {ledger_link_scope}"
+            "(e.event_id IS NULL OR e.lifecycle='active')"
         )
+        retired_ledger_link_integrity_observations = one(
+            "SELECT COUNT(*) FROM relationship_event_ledger_links_v2 l "
+            "JOIN relationship_events_v2 e ON e.event_id=l.event_id "
+            f"WHERE {ledger_link_scope}e.lifecycle<>'active'"
+        )
+    moment_link_scope = "l.guild_id=? AND " if guild_id is not None else ""
+    moment_link_problem = (
+        "(e.event_id IS NULL OR e.guild_id<>l.guild_id "
+        "OR e.subject_user_id<>l.subject_user_id "
+        "OR w.moment_id IS NULL OR w.guild_id<>l.guild_id "
+        "OR NOT EXISTS ("
+        "SELECT 1 FROM memory_moment_participants p "
+        "WHERE p.moment_id=l.moment_id "
+        "AND p.participant_key=('discord_user:' || "
+        "CAST(l.subject_user_id AS TEXT))))"
+    )
     if _table_exists(conn, "memory_moment_windows") and _table_exists(
         conn, "memory_moment_participants"
     ):
@@ -532,20 +565,30 @@ def build_evaluation_report(conn: sqlite3.Connection, *, guild_id: int | None = 
             "SELECT COUNT(*) FROM relationship_event_moment_links_v2 l "
             "LEFT JOIN relationship_events_v2 e ON e.event_id=l.event_id "
             "LEFT JOIN memory_moment_windows w ON w.moment_id=l.moment_id "
-            f"WHERE {('l.guild_id=? AND ' if guild_id is not None else '')}"
-            "(e.event_id IS NULL OR e.guild_id<>l.guild_id "
-            "OR e.subject_user_id<>l.subject_user_id "
-            "OR w.moment_id IS NULL OR w.guild_id<>l.guild_id "
-            "OR NOT EXISTS ("
-            "SELECT 1 FROM memory_moment_participants p "
-            "WHERE p.moment_id=l.moment_id "
-            "AND p.participant_key=('discord_user:' || CAST(l.subject_user_id AS TEXT))"
-            "))"
+            f"WHERE {moment_link_scope}"
+            "COALESCE(l.lifecycle,'active')='active' AND "
+            f"({moment_link_problem} OR e.lifecycle<>'active')"
+        )
+        retired_moment_link_integrity_observations = one(
+            "SELECT COUNT(*) FROM relationship_event_moment_links_v2 l "
+            "LEFT JOIN relationship_events_v2 e ON e.event_id=l.event_id "
+            "LEFT JOIN memory_moment_windows w ON w.moment_id=l.moment_id "
+            f"WHERE {moment_link_scope}"
+            "COALESCE(l.lifecycle,'active')<>'active' AND "
+            f"{moment_link_problem}"
         )
     else:
-        # A persisted link cannot be verified when either target table is absent.
+        # Active links are blocking when their targets cannot be verified.
+        # Retired links are retained as historical observations.
         moment_link_integrity_violations = one(
-            f"SELECT COUNT(*) FROM relationship_event_moment_links_v2 {where}"
+            "SELECT COUNT(*) FROM relationship_event_moment_links_v2 l "
+            f"WHERE {moment_link_scope}"
+            "COALESCE(l.lifecycle,'active')='active'"
+        )
+        retired_moment_link_integrity_observations = one(
+            "SELECT COUNT(*) FROM relationship_event_moment_links_v2 l "
+            f"WHERE {moment_link_scope}"
+            "COALESCE(l.lifecycle,'active')<>'active'"
         )
     cross_guild_member_violations = sum([
         one(f"SELECT COUNT(*) FROM relationship_events_v2 WHERE {scoped}subject_key<>('discord_user:' || CAST(subject_user_id AS TEXT))"),
@@ -578,6 +621,8 @@ def build_evaluation_report(conn: sqlite3.Connection, *, guild_id: int | None = 
         "cross_guild_member_violations": cross_guild_member_violations,
         "ledger_link_integrity_violations": ledger_link_integrity_violations,
         "moment_link_integrity_violations": moment_link_integrity_violations,
+        "retired_ledger_link_integrity_observations": retired_ledger_link_integrity_observations,
+        "retired_moment_link_integrity_observations": retired_moment_link_integrity_observations,
         "visibility_violations": one(f"SELECT COUNT(*) FROM relationship_events_v2 {where + (' AND' if where else 'WHERE')} visibility<>'private'"),
         "shadow_runs": one(f"SELECT COUNT(*) FROM relationship_engagement_shadow_runs {where}"),
         "policy_eligible_shadow_candidates": one(f"SELECT COUNT(*) FROM relationship_engagement_shadow_runs {where + (' AND' if where else 'WHERE')} policy_eligible=1"),

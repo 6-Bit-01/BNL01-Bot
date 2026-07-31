@@ -2698,6 +2698,7 @@ def build_evaluation_report(
     guild_id: int,
     prepare_schema: bool = False,
     limit: int = 500,
+    created_at_since: str = "",
 ) -> Dict[str, Any]:
     """Aggregate retained receipts without exposing people, text, or source IDs."""
 
@@ -2731,6 +2732,13 @@ def build_evaluation_report(
     def _column(name: str, fallback: str) -> str:
         return name if name in columns else fallback
 
+    since = str(created_at_since or "").strip()
+    time_clause = " AND created_at>=?" if since else ""
+    query_params: tuple[Any, ...] = (
+        (int(guild_id or 0), since, max(1, min(int(limit or 500), 5000)))
+        if since
+        else (int(guild_id or 0), max(1, min(int(limit or 500), 5000)))
+    )
     rows = conn.execute(
         """
         SELECT response_sent, selected_lanes_json, excluded_lanes_json,
@@ -2743,7 +2751,7 @@ def build_evaluation_report(
                %s, %s, %s, %s, %s, %s,
                created_at
         FROM unified_response_assessment_shadow_runs
-        WHERE guild_id=?
+        WHERE guild_id=?%s
         ORDER BY created_at DESC, run_id DESC
         LIMIT ?
         """ % (
@@ -2796,8 +2804,9 @@ def build_evaluation_report(
             _column("scoped_canary_guard_triggered", "0"),
             _column("scoped_canary_guard_repaired", "0"),
             _column("scoped_canary_output_leak_guard", "0"),
+            time_clause,
         ),
-        (int(guild_id or 0), max(1, min(int(limit or 500), 5000))),
+        query_params,
     ).fetchall()
 
     selected_counts = Counter()

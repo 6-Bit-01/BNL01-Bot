@@ -572,6 +572,7 @@ JOURNAL_PREPARATION_MAX_SECONDS = max(
     int(os.getenv("BNL_JOURNAL_PREPARATION_MAX_SECONDS", "1500") or 1500),
 )
 DB_FILE = "bnl01_conversations.db"
+BNL_RUNTIME_STARTED_AT = datetime.now(timezone.utc).isoformat()
 
 # The provider client owns HTTP transports and proxy discovery. Keep module
 # import side-effect free; construct and cache it only when generation starts.
@@ -36563,6 +36564,7 @@ def _collect_bnl_memory_diagnostic_data(
                 conversation_context_diagnostics=dict(
                     LAST_CONVERSATION_CONTEXT_V2_DIAGNOSTICS
                 ),
+                runtime_evidence_since=BNL_RUNTIME_STARTED_AT,
             )
             ledger_diag = shadow_acceptance["reports"]["memoryLedger"]
         finally:
