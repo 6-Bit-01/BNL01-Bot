@@ -718,6 +718,82 @@ class MemoryPreviewBotPathTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(guard.await_count, 1)
         self.assertEqual(source_hash, self._source_hash())
 
+    async def test_process_cleanup_preserves_a_linked_revisable_assessment(
+        self,
+    ):
+        with sqlite3.connect(self.db_path) as conn:
+            self._add_message(
+                conn,
+                3,
+                "I compare test results before choosing the next pass.",
+                "2026-07-25T21:00:00+00:00",
+            )
+            self._add_message(
+                conn,
+                4,
+                "I adjust the implementation after checking failures.",
+                "2026-07-26T20:00:00+00:00",
+            )
+            self._add_message(
+                conn,
+                5,
+                "I keep composing synth songs and producing music tracks.",
+                "2026-07-27T20:00:00+00:00",
+            )
+            self._add_message(
+                conn,
+                6,
+                "The synth song mix needs another production pass.",
+                "2026-07-28T20:00:00+00:00",
+            )
+            conn.commit()
+        source_hash = self._source_hash()
+        cleanup = (
+            "My observation is that you operate through live iteration "
+            "rather than rigid pre-planning. You compare test results "
+            "before choosing the next pass and adjust the implementation "
+            "after checking failures. If a feature or handoff hits a "
+            "friction point, you calibrate on the fly rather than halting "
+            "the system. In short: test, observe, adjust. It strikes me as "
+            "an unusually adaptive way to operate."
+        )
+
+        async def generator(_prompt, route):
+            if route.endswith("baseline"):
+                return "I do not have enough context to describe your process."
+            return cleanup
+
+        result = await bnl01_bot.execute_bnl_memory_preview(
+            source_db_path=self.db_path,
+            guild_id=1,
+            subject_user_id=7,
+            subject_display_name="Crow",
+            simulated_channel_id=10,
+            wording=(
+                "What have you learned about how I work and make decisions?"
+            ),
+            generator=generator,
+            guard=mock.AsyncMock(
+                side_effect=lambda response, _prompt: (
+                    response,
+                    {"suppressed": False, "suppression_reason": ""},
+                )
+            ),
+        )
+
+        self.assertTrue(result.candidate_selected, result.fallback_reason)
+        self.assertEqual(result.final_selection, "cleanup_salvage")
+        self.assertIn(
+            "My read is that if a feature or handoff hits a friction point",
+            result.proposed_response,
+        )
+        self.assertIn(
+            "It strikes me as an unusually adaptive way to operate",
+            result.proposed_response,
+        )
+        self.assertNotIn("do not have enough context", result.proposed_response)
+        self.assertEqual(source_hash, self._source_hash())
+
     async def test_final_cleanup_with_multiple_bad_claims_still_falls_back(
         self,
     ):
