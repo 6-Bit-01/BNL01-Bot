@@ -299,11 +299,12 @@ _OPINION_FRAME_RE = re.compile(
     r"\b(?:i\s+(?:think|believe|suspect|figure)|"
     r"i(?:'d|\s+would)\s+(?:say|call)|"
     r"my\s+(?:read|view|take|assessment)|"
+    r"my\s+(?:observation|impression)\s+is|"
     r"based\s+on\s+my\s+observations?|"
     r"from\s+(?:my\s+observations?|what\s+i\s+observe|my\s+perspective)|"
     r"if\s+i\s+had\s+to\s+summarize(?:\s+my\s+read)?|"
     r"to\s+me|in\s+my\s+view|from\s+where\s+i\s+(?:sit|stand)|"
-    r"it\s+seems|you\s+seem|you\s+strike\s+me|"
+    r"it\s+seems|it\s+strikes?\s+me|you\s+seem|you\s+strike\s+me|"
     r"i\s+get\s+the\s+(?:sense|impression)|"
     r"feels?\s+like|looks?\s+like)\b",
     re.I,
@@ -404,6 +405,14 @@ _CONCRETE_RELATION_ACTION_CANON = {
     "writing": "write",
     "wrote": "write",
 }
+_PROCESS_ASSESSMENT_CONCEPTS = (
+    ("adjust", re.compile(r"\b(?:adjust\w*|calibrat\w*)\b", re.I)),
+    ("compare", re.compile(r"\b(?:compar\w*|weigh\w*)\b", re.I)),
+    ("decide", re.compile(r"\b(?:cho(?:ose|oses|se|sen|osing)|decid\w*)\b", re.I)),
+    ("observe", re.compile(r"\b(?:observ\w*|review\w*)\b", re.I)),
+    ("refine", re.compile(r"\b(?:refin\w*|revis\w*)\b", re.I)),
+    ("test", re.compile(r"\b(?:test\w*|trial\w*)\b", re.I)),
+)
 _TRANSIENT_EXPRESSION_WRAPPER_RE = re.compile(
     r"^\s*[~*_`-]*\[(?P<body>[\s\S]{1,900})\]\s*[~*_`-]*$",
 )
@@ -1808,13 +1817,14 @@ def salvage_profile_candidate_response(
     basis: SharedBrainSynthesisBasis,
     reason: str,
 ) -> str:
-    """Remove one leftover unsupported claim without generating new prose.
+    """Resolve one leftover unsupported claim without model generation.
 
     The model already received one constrained cleanup opportunity. This
     deterministic last step is intentionally limited to one independently
-    split unsupported unit. The normal candidate gate still decides whether
-    the remaining answer is sufficient, coherent, correctly angled, and
-    source-valid.
+    split unsupported unit. A locally linked conditional process assessment
+    may be explicitly framed as BNL's read; every other unsupported unit is
+    removed. The normal candidate gate still decides whether the remaining
+    answer is sufficient, coherent, correctly angled, and source-valid.
     """
 
     if str(reason or "") != "candidate_claims_ungrounded":
@@ -1831,12 +1841,24 @@ def salvage_profile_candidate_response(
         or int(coverage.unsupported_factual_claim_count or 0) != 1
     ):
         return ""
-    kept = tuple(
-        claim
-        for claim, classification in zip(claims, classifications)
-        if classification != "unsupported_factual"
+    unsupported_index = classifications.index("unsupported_factual")
+    unsupported_claim = claims[unsupported_index]
+    replacement = _reframe_locally_linked_process_assessment(
+        unsupported_claim,
+        prior_claims=claims[:unsupported_index],
+        prior_classifications=classifications[:unsupported_index],
+        basis=basis,
     )
-    if not kept or len(kept) == len(claims):
+    kept = tuple(
+        replacement
+        if index == unsupported_index and replacement
+        else claim
+        for index, (claim, classification) in enumerate(
+            zip(claims, classifications)
+        )
+        if classification != "unsupported_factual" or replacement
+    )
+    if not kept or (len(kept) == len(claims) and not replacement):
         return ""
     salvaged = " ".join(
         claim
@@ -1851,6 +1873,59 @@ def salvage_profile_candidate_response(
     if salvaged_coverage.unsupported_factual_claim_count:
         return ""
     return salvaged
+
+
+def _process_assessment_concepts(value: str) -> frozenset[str]:
+    return frozenset(
+        concept
+        for concept, pattern in _PROCESS_ASSESSMENT_CONCEPTS
+        if pattern.search(str(value or ""))
+    )
+
+
+def _reframe_locally_linked_process_assessment(
+    claim: str,
+    *,
+    prior_claims: Sequence[str],
+    prior_classifications: Sequence[str],
+    basis: SharedBrainSynthesisBasis,
+) -> str:
+    """Make one locally supported process inference explicitly revisable.
+
+    This does not license a new concrete fact. It is limited to a conditional
+    process interpretation that repeats a process concept already present in
+    an earlier supported member unit from the same response.
+    """
+
+    value = str(claim or "").strip()
+    if (
+        not value
+        or not _profile_process_request(_basis_profile_request_text(basis))
+        or not re.match(r"^(?:if|when|whenever)\b", value, re.I)
+        or _UNSUPPORTED_SCALAR_ASSERTION_RE.search(value)
+        or _UNSUPPORTED_FRAMED_CONCRETE_RE.search(value)
+        or _INTERNAL_PROPER_NOUN_RE.search(value)
+    ):
+        return ""
+    supported_process_concepts = frozenset().union(
+        *(
+            _process_assessment_concepts(prior_claim)
+            for prior_claim, classification in zip(
+                prior_claims,
+                prior_classifications,
+            )
+            if classification
+            in {"member_supported", "member_and_canon_supported"}
+        )
+    )
+    if not (
+        supported_process_concepts
+        and supported_process_concepts.intersection(
+            _process_assessment_concepts(value)
+        )
+    ):
+        return ""
+    return "My read is that " + value[:1].lower() + value[1:]
 
 
 def response_exposes_controls(response: str) -> bool:
