@@ -151,6 +151,7 @@ from bnl_shared_brain_synthesis import (
     record_fallback as record_shared_brain_synthesis_fallback,
     revalidate_basis as revalidate_shared_brain_synthesis_basis,
     route_scope_enabled as shared_brain_synthesis_route_scope_enabled,
+    salvage_profile_candidate_response,
 )
 from bnl_memory_preview import (
     MemoryPreviewEvaluation,
@@ -33363,6 +33364,29 @@ async def maybe_generate_shared_brain_synthesis_canary(
                 )
                 candidate_response = cleaned_response
                 candidate_prompt = cleanup_prompt
+                if (
+                    not decision.candidate_selected
+                    and decision.fallback_reason
+                    == "candidate_claims_ungrounded"
+                ):
+                    salvaged_response = (
+                        salvage_profile_candidate_response(
+                            cleaned_response,
+                            basis=basis,
+                            reason=decision.fallback_reason,
+                        )
+                    )
+                    if salvaged_response:
+                        salvaged_decision = await asyncio.to_thread(
+                            _evaluate_shared_brain_synthesis_receipt,
+                            run,
+                            baseline_response,
+                            salvaged_response,
+                            candidate_generation_latency_ms,
+                        )
+                        decision = salvaged_decision
+                        if salvaged_decision.candidate_selected:
+                            candidate_response = salvaged_response
         if (
             decision.candidate_selected
             and is_generic_non_answer_response(
@@ -36784,6 +36808,7 @@ async def execute_bnl_memory_preview(
     packet_candidate_response = ""
     repair_response = ""
     cleanup_response = ""
+    cleanup_salvage_applied = False
     try:
         initial = await asyncio.to_thread(
             prepare_memory_preview,
@@ -37030,6 +37055,32 @@ async def execute_bnl_memory_preview(
                 candidate_response = cleaned_response
                 candidate_prompt = cleanup_prompt
                 stale_reason = ""
+                if (
+                    not cleanup_evaluation.candidate_selected
+                    and cleanup_evaluation.fallback_reason
+                    == "candidate_claims_ungrounded"
+                ):
+                    salvaged_response = (
+                        salvage_profile_candidate_response(
+                            cleaned_response,
+                            basis=fresh.basis,
+                            reason=cleanup_evaluation.fallback_reason,
+                        )
+                    )
+                    if salvaged_response:
+                        salvaged_evaluation = await asyncio.to_thread(
+                            evaluate_memory_preview,
+                            fresh,
+                            baseline_response=baseline_response,
+                            candidate_response=salvaged_response,
+                            candidate_generation_latency_ms=(
+                                candidate_latency_ms
+                            ),
+                        )
+                        evaluation = salvaged_evaluation
+                        if salvaged_evaluation.candidate_selected:
+                            candidate_response = salvaged_response
+                            cleanup_salvage_applied = True
             else:
                 cleanup_fresh.close()
                 stale_reason = (
@@ -37137,6 +37188,8 @@ async def execute_bnl_memory_preview(
         final_selection = (
             "suppressed"
             if not proposed_response
+            else "cleanup_salvage"
+            if evaluation.candidate_selected and cleanup_salvage_applied
             else "cleanup_attempt"
             if evaluation.candidate_selected and cleanup_response
             else "repair_attempt"

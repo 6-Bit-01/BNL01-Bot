@@ -849,9 +849,10 @@ class ProductionShapedBroadRecallAcceptanceTests(unittest.TestCase):
             candidate=(
                 "You keep debugging the bot memory system and carefully "
                 "testing the website, while writing songs and producing "
-                "synth tracks. As a founding BARCODE member, that puts "
-                "your software and music work inside the Network's "
-                "community and live-broadcast signal."
+                "synth tracks. In BARCODE, the Network connects music, "
+                "live broadcasts, community, software, archive, characters, "
+                "and story; that context connects your software and music "
+                "work without replacing the observed pattern."
             ),
             expected_status="rich",
             expected_points=2,

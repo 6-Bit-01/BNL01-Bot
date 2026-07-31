@@ -628,7 +628,7 @@ class MemoryPreviewBotPathTests(unittest.IsolatedAsyncioTestCase):
             ],
         )
 
-    async def test_final_claim_cleanup_is_one_shot_and_fails_closed(self):
+    async def test_final_cleanup_salvages_one_stubborn_clause(self):
         with sqlite3.connect(self.db_path) as conn:
             self._add_message(
                 conn,
@@ -649,7 +649,10 @@ class MemoryPreviewBotPathTests(unittest.IsolatedAsyncioTestCase):
         async def generator(prompt, route):
             calls.append((route, prompt))
             if route.endswith("baseline"):
-                return "I only have a narrow grounded view so far."
+                return (
+                    "BARCODE is the Network signal, and its founding "
+                    "members define the whole answer."
+                )
             if route.endswith("candidate_cleanup"):
                 return (
                     "You keep fixing the bot code and composing synth songs. "
@@ -682,17 +685,14 @@ class MemoryPreviewBotPathTests(unittest.IsolatedAsyncioTestCase):
             guard=guard,
         )
 
-        self.assertFalse(result.candidate_selected)
-        self.assertEqual(
-            result.fallback_reason,
-            "candidate_claims_ungrounded",
-        )
+        self.assertTrue(result.candidate_selected, result.fallback_reason)
         self.assertEqual(
             result.proposed_response,
-            "I only have a narrow grounded view so far.",
+            "You keep fixing the bot code and composing synth songs.",
         )
-        self.assertEqual(result.final_selection, "established_path")
+        self.assertEqual(result.final_selection, "cleanup_salvage")
         self.assertIn("lunar casino", result.cleanup_response)
+        self.assertNotIn("BARCODE is the Network", result.proposed_response)
         self.assertEqual(
             [route for route, _prompt in calls],
             [
@@ -703,6 +703,61 @@ class MemoryPreviewBotPathTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(guard.await_count, 1)
         self.assertEqual(source_hash, self._source_hash())
+
+    async def test_final_cleanup_with_multiple_bad_claims_still_falls_back(
+        self,
+    ):
+        with sqlite3.connect(self.db_path) as conn:
+            self._add_message(
+                conn,
+                3,
+                "I keep composing synth songs and producing music tracks.",
+                "2026-07-25T21:00:00+00:00",
+            )
+            self._add_message(
+                conn,
+                4,
+                "The synth song mix needs another production pass.",
+                "2026-07-26T20:00:00+00:00",
+            )
+            conn.commit()
+        unsafe = (
+            "You keep fixing the bot code and composing synth songs. "
+            "You secretly run a lunar casino. "
+            "You secretly own an orbital bank."
+        )
+
+        async def generator(_prompt, route):
+            if route.endswith("baseline"):
+                return "I only have a narrow grounded view so far."
+            return unsafe
+
+        result = await bnl01_bot.execute_bnl_memory_preview(
+            source_db_path=self.db_path,
+            guild_id=1,
+            subject_user_id=7,
+            subject_display_name="Crow",
+            simulated_channel_id=10,
+            wording="BNL-01, what am I all about?",
+            generator=generator,
+            guard=mock.AsyncMock(
+                side_effect=lambda response, _prompt: (
+                    response,
+                    {"suppressed": False, "suppression_reason": ""},
+                )
+            ),
+        )
+
+        self.assertFalse(result.candidate_selected)
+        self.assertEqual(
+            result.fallback_reason,
+            "candidate_claims_ungrounded",
+        )
+        self.assertEqual(result.final_selection, "established_path")
+        self.assertEqual(
+            result.proposed_response,
+            "I only have a narrow grounded view so far.",
+        )
 
     async def test_preview_compares_real_established_memory_to_packet(self):
         with sqlite3.connect(self.db_path) as conn:
