@@ -6,6 +6,7 @@ adapters may consume only revalidated, route-safe projections.
 """
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 import hashlib
@@ -542,6 +543,66 @@ _CONVERSATION_MOTIF_MAX_ROOTS = 12
 _CONVERSATION_MOTIF_PUBLIC_POLICIES = frozenset(
     {"public_home", "public_context", "public_selective"}
 )
+_PUBLIC_ASSESSMENT_MAX_RESULTS = 4
+_PUBLIC_ASSESSMENT_TERM_RE = re.compile(
+    r"[a-z0-9][a-z0-9'’-]{2,}",
+    re.I,
+)
+_PUBLIC_ASSESSMENT_STOPWORDS = frozenset(
+    """
+    about after again also and are because been before being but can could
+    did does doing for from getting going had has have here how into its just
+    know more much now okay only our really remember said some still than that
+    the their them then there these they thing things this those through too
+    was were what when where which who why will with would yeah yes you your
+    """.split()
+)
+_PUBLIC_ASSESSMENT_PROCESS_QUERY_RE = re.compile(
+    r"\b(?:how\s+(?:i|we|you)\s+work|"
+    r"make\s+decisions?|decision[-\s]?making|"
+    r"approach(?:es)?|process|method|workflow)\b",
+    re.I,
+)
+_PUBLIC_ASSESSMENT_PROCESS_TERMS = frozenset(
+    {
+        "approach",
+        "build",
+        "building",
+        "careful",
+        "check",
+        "checking",
+        "choose",
+        "choosing",
+        "compare",
+        "comparing",
+        "decide",
+        "deciding",
+        "decision",
+        "decisions",
+        "fix",
+        "fixing",
+        "iterate",
+        "iterating",
+        "iteration",
+        "method",
+        "plan",
+        "planning",
+        "prefer",
+        "priority",
+        "process",
+        "refine",
+        "refining",
+        "revise",
+        "revising",
+        "standard",
+        "standards",
+        "test",
+        "testing",
+        "tradeoff",
+        "work",
+        "working",
+    }
+)
 
 APPROVED_SELF_AUTHORED_FACT_KEYS = frozenset({
     "preferred_name",
@@ -638,6 +699,29 @@ class AtomicKnowledgeResult:
         return self.outcome in {"created", "matched_existing"} and bool(
             self.candidate_id
         )
+
+
+@dataclass(frozen=True)
+class PublicAssessmentEvidence:
+    """One public, source-linked observation selected for current assessment."""
+
+    entry_id: str
+    text: str
+    observed_at: str
+    visibility: str
+    occurrence_identity: str
+    score: float
+    request_relevant: bool = False
+
+
+@dataclass(frozen=True)
+class PublicAssessmentSelection:
+    """Bounded response-time selection over the whole eligible public pool."""
+
+    scanned_count: int = 0
+    eligible_count: int = 0
+    request_relevant_count: int = 0
+    items: tuple[PublicAssessmentEvidence, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -5262,6 +5346,213 @@ def _conversation_motif_history(
     if diagnostics is not None:
         diagnostics["ledger_rows_motif_eligible"] = len(history)
     return history
+
+
+def _public_assessment_terms(value: str) -> frozenset[str]:
+    return frozenset(
+        token
+        for token in _PUBLIC_ASSESSMENT_TERM_RE.findall(
+            str(value or "").lower()
+        )
+        if token not in _PUBLIC_ASSESSMENT_STOPWORDS
+    )
+
+
+def _public_assessment_text(value: str) -> str:
+    """Return inert public prose suitable for a bounded response-time packet."""
+
+    text = re.sub(
+        r"\s+",
+        " ",
+        _CONVERSATION_MOTIF_URL_OR_MENTION_TOKEN_RE.sub(
+            " ",
+            str(value or ""),
+        ),
+    ).strip()
+    if (
+        len(text.split()) < 4
+        or _CONVERSATION_MOTIF_UNSAFE_RE.search(text)
+        or _CONVERSATION_MOTIF_DIRECT_FACT_RE.search(text)
+        or _CONVERSATION_MOTIF_SENSITIVE_RE.search(text)
+        or _CONVERSATION_MOTIF_ROLEPLAY_RE.search(text)
+        or _CONVERSATION_CORRECTION_RE.search(text)
+    ):
+        return ""
+    return text.replace("```", "")[:240]
+
+
+def select_public_conversation_assessment_evidence(
+    conn: sqlite3.Connection,
+    *,
+    guild_id: int,
+    subject_key: str,
+    request_text: str,
+    max_scan: int = _CONVERSATION_MOTIF_MAX_SCAN,
+    max_results: int = _PUBLIC_ASSESSMENT_MAX_RESULTS,
+) -> PublicAssessmentSelection:
+    """Select diverse evidence after considering the full eligible public pool.
+
+    This is an ephemeral read projection, not another memory owner and not a
+    durable personality inference. The same subject, visibility, lifecycle,
+    correction, unsafe-content, and operational-source fences used by
+    recurring-conversation formation remain controlling.
+    """
+
+    diagnostics: dict[str, int] = {}
+    history = _conversation_motif_history(
+        conn,
+        guild_id=int(guild_id or 0),
+        subject_key=str(subject_key or ""),
+        max_scan=max_scan,
+        diagnostics=diagnostics,
+    )
+    scanned_count = int(diagnostics.get("ledger_rows_scanned", 0) or 0)
+    if not history:
+        return PublicAssessmentSelection(scanned_count=scanned_count)
+
+    request_terms = _public_assessment_terms(request_text)
+    process_request = bool(
+        _PUBLIC_ASSESSMENT_PROCESS_QUERY_RE.search(
+            str(request_text or "")
+        )
+    )
+    target_terms = set(request_terms)
+    if process_request:
+        target_terms.update(_PUBLIC_ASSESSMENT_PROCESS_TERMS)
+
+    occurrence_terms: dict[str, set[str]] = {}
+    prepared: list[dict[str, Any]] = []
+    seen_text: set[str] = set()
+    for recency_rank, entry in enumerate(history):
+        text = _public_assessment_text(
+            str(entry.get("normalized_value") or "")
+        )
+        occurrence = str(entry.get("occurrence_identity") or "")
+        normalized = re.sub(r"\W+", " ", text.lower()).strip()
+        if (
+            not text
+            or not occurrence
+            or not normalized
+            or normalized in seen_text
+        ):
+            continue
+        terms = _public_assessment_terms(text)
+        if not terms:
+            continue
+        seen_text.add(normalized)
+        occurrence_terms.setdefault(occurrence, set()).update(terms)
+        prepared.append(
+            {
+                "entry": entry,
+                "text": text,
+                "terms": terms,
+                "occurrence": occurrence,
+                "recency_rank": recency_rank,
+            }
+        )
+
+    term_occurrence_frequency: Counter[str] = Counter()
+    for terms in occurrence_terms.values():
+        term_occurrence_frequency.update(terms)
+
+    for candidate in prepared:
+        terms = set(candidate["terms"])
+        direct_overlap = terms.intersection(request_terms)
+        target_overlap = terms.intersection(target_terms)
+        recurrent_score = sum(
+            min(3, max(0, int(term_occurrence_frequency[term]) - 1))
+            for term in terms
+        )
+        candidate["request_relevant"] = bool(target_overlap)
+        candidate["base_score"] = (
+            10.0 * len(direct_overlap)
+            + 5.0 * len(target_overlap - direct_overlap)
+            + min(18.0, float(recurrent_score))
+            + max(
+                0.0,
+                2.0
+                - (
+                    float(candidate["recency_rank"])
+                    / max(1.0, float(len(prepared)))
+                ),
+            )
+        )
+
+    selected: list[dict[str, Any]] = []
+    selected_occurrences: set[str] = set()
+    covered_terms: set[str] = set()
+    relevant_available = sum(
+        1 for candidate in prepared if candidate["request_relevant"]
+    )
+    required_relevant = (
+        min(3, relevant_available) if process_request else 0
+    )
+    safe_max = max(
+        1,
+        min(
+            int(max_results or _PUBLIC_ASSESSMENT_MAX_RESULTS),
+            8,
+        ),
+    )
+    while len(selected) < safe_max:
+        need_relevant = sum(
+            1 for candidate in selected if candidate["request_relevant"]
+        ) < required_relevant
+        ranked: list[tuple[float, int, str, dict[str, Any]]] = []
+        for candidate in prepared:
+            occurrence = str(candidate["occurrence"])
+            if candidate in selected or occurrence in selected_occurrences:
+                continue
+            terms = set(candidate["terms"])
+            new_terms = terms - covered_terms
+            repeated_terms = terms.intersection(covered_terms)
+            adjusted = (
+                float(candidate["base_score"])
+                + min(8.0, 0.75 * len(new_terms))
+                - min(6.0, 0.5 * len(repeated_terms))
+            )
+            if need_relevant:
+                adjusted += (
+                    24.0 if candidate["request_relevant"] else -24.0
+                )
+            ranked.append(
+                (
+                    -adjusted,
+                    int(candidate["recency_rank"]),
+                    str(candidate["entry"].get("entry_id") or ""),
+                    candidate,
+                )
+            )
+        if not ranked:
+            break
+        chosen = sorted(ranked, key=lambda value: value[:3])[0][3]
+        selected.append(chosen)
+        selected_occurrences.add(str(chosen["occurrence"]))
+        covered_terms.update(chosen["terms"])
+
+    items = tuple(
+        PublicAssessmentEvidence(
+            entry_id=str(candidate["entry"].get("entry_id") or ""),
+            text=str(candidate["text"]),
+            observed_at=str(
+                candidate["entry"].get("observed_at") or ""
+            ),
+            visibility=str(
+                candidate["entry"].get("visibility") or "unknown"
+            ),
+            occurrence_identity=str(candidate["occurrence"]),
+            score=float(candidate["base_score"]),
+            request_relevant=bool(candidate["request_relevant"]),
+        )
+        for candidate in selected
+        if str(candidate["entry"].get("entry_id") or "")
+    )
+    return PublicAssessmentSelection(
+        scanned_count=scanned_count,
+        eligible_count=len(prepared),
+        request_relevant_count=relevant_available,
+        items=items,
+    )
 
 
 def _conversation_projection_columns(

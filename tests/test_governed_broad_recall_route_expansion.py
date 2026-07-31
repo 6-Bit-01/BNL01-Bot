@@ -75,6 +75,25 @@ class GovernedBroadRecallRouteExpansionTests(unittest.TestCase):
                     ).broad_self_profile
                 )
 
+    def test_private_acceptance_questions_share_the_profile_route(self):
+        for text in (
+            "BNL-01, what am I all about?",
+            (
+                "What have you learned about how I work and make "
+                "decisions?"
+            ),
+            (
+                "What parts of BARCODE seem to matter most to me, and "
+                "why?"
+            ),
+        ):
+            with self.subTest(text=text):
+                self.assertTrue(
+                    classify_personal_recall_intent(
+                        text
+                    ).broad_self_profile
+                )
+
     def test_mixed_negated_and_third_party_requests_do_not_enter_route(self):
         for text in (
             "What do you know about me and tell me a joke?",

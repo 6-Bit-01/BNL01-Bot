@@ -115,6 +115,9 @@ _BROAD_SELF_PROFILE_PATTERNS = (
     r"what do you have on me",
     rf"what am i all about{_PROFILE_SCOPE_SUFFIX}",
     rf"what have you learned about me{_PROFILE_SCOPE_SUFFIX}",
+    r"what have you learned about how i work and make decisions",
+    r"what have you learned about how i (?:work|decide|make decisions)",
+    r"what parts of barcode seem to matter most to me,? and why",
     rf"tell me (?:everything )?(?:you )?(?:know|remember) about me"
     rf"{_PROFILE_SCOPE_SUFFIX}",
     r"tell me everything you remember",
