@@ -454,6 +454,115 @@ class SharedBrainSynthesisBotPathTests(
         )
         self.assertEqual(evaluator.call_count, 3)
 
+    async def test_claims_only_candidate_goes_directly_to_minimal_cleanup(self):
+        legacy_context = "Legacy factual profile block."
+        basis = replace(
+            self.synthesis_basis(legacy_context),
+            profile_sufficiency_status="rich",
+            profile_required_point_count=2,
+            profile_required_detail_count=2,
+        )
+        run = SimpleNamespace(
+            prompt_applied=True,
+            fallback_reason="",
+            revalidation_status="unchanged",
+        )
+        claims_rejected = SimpleNamespace(
+            run=run,
+            candidate_selected=False,
+            fallback_reason="candidate_claims_ungrounded",
+        )
+        cleanup_accepted = SimpleNamespace(
+            run=run,
+            candidate_selected=True,
+            fallback_reason="",
+        )
+        packet_candidate = (
+            "You keep fixing bot code and composing synth songs. "
+            "You secretly run a lunar casino."
+        )
+        cleaned_candidate = (
+            "You keep fixing bot code and composing synth songs. "
+            "My read is that careful iteration connects those parts."
+        )
+        generation = mock.AsyncMock(
+            side_effect=(
+                packet_candidate,
+                cleaned_candidate,
+            )
+        )
+        evaluator = mock.Mock(
+            side_effect=(
+                claims_rejected,
+                cleanup_accepted,
+            )
+        )
+        prompt = (
+            "Current user request: What have you learned about how I work "
+            "and make decisions?\n"
+            "Durable memory context:\n"
+            + legacy_context
+        )
+        with (
+            mock.patch.object(
+                bnl01_bot,
+                "_begin_shared_brain_synthesis_receipt",
+                return_value=run,
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "get_gemini_response_with_optional_typing",
+                new=generation,
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "_evaluate_shared_brain_synthesis_receipt",
+                new=evaluator,
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "is_generic_non_answer_response",
+                return_value=False,
+            ),
+        ):
+            execution = (
+                await bnl01_bot
+                .maybe_generate_shared_brain_synthesis_canary(
+                    channel=FakeChannel(),
+                    baseline_response="Established baseline.",
+                    prompt=prompt,
+                    prompt_source_bases=(
+                        self.memory_source_basis(legacy_context),
+                    ),
+                    basis=basis,
+                    user_id=7,
+                    guild_id=1,
+                    user_display_name="Crow",
+                    source_context_available=True,
+                )
+            )
+
+        self.assertTrue(execution.candidate_active)
+        self.assertEqual(execution.response, cleaned_candidate)
+        self.assertEqual(generation.await_count, 2)
+        self.assertEqual(
+            generation.await_args_list[0].kwargs["route"],
+            "shared_brain_synthesis_canary",
+        )
+        self.assertEqual(
+            generation.await_args_list[1].kwargs["route"],
+            "shared_brain_synthesis_canary_cleanup",
+        )
+        self.assertIn(
+            "Final grounded cleanup requirements",
+            generation.await_args_list[1].args[1],
+        )
+        self.assertNotIn(
+            "Grounded rewrite requirements",
+            generation.await_args_list[1].args[1],
+        )
+        self.assertEqual(evaluator.call_count, 2)
+
     async def test_final_cleanup_rejection_falls_back_without_retrying(self):
         legacy_context = "Legacy factual profile block."
         basis = replace(

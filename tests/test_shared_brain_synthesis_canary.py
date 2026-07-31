@@ -722,6 +722,14 @@ class SharedBrainSynthesisCanaryTests(unittest.TestCase):
             cleanup_prompt,
         )
         self.assertIn("Add no new member claim", cleanup_prompt)
+        self.assertIn(
+            "Preserve the exact angle of the current request",
+            cleanup_prompt,
+        )
+        self.assertIn(
+            "Do not flatten the answer into a list",
+            cleanup_prompt,
+        )
         self.assertNotIn(
             "Final grounded cleanup requirements",
             build_profile_candidate_cleanup_prompt(
