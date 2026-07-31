@@ -33263,6 +33263,8 @@ async def maybe_generate_shared_brain_synthesis_canary(
             and profile_candidate_repairable(
                 decision.fallback_reason
             )
+            and decision.fallback_reason
+            != "candidate_claims_ungrounded"
         ):
             repair_prompt = build_profile_candidate_repair_prompt(
                 candidate_prompt,
@@ -33311,62 +33313,56 @@ async def maybe_generate_shared_brain_synthesis_canary(
                 )
                 candidate_response = repaired_response
                 candidate_prompt = repair_prompt
-                if (
-                    not decision.candidate_selected
-                    and decision.fallback_reason
-                    == "candidate_claims_ungrounded"
-                ):
-                    cleanup_prompt = (
-                        build_profile_candidate_cleanup_prompt(
-                            packet_owned_prompt.prompt,
-                            repaired_response,
-                            basis=basis,
-                            reason=decision.fallback_reason,
-                        )
+        if (
+            candidate_response
+            and not decision.candidate_selected
+            and decision.fallback_reason
+            == "candidate_claims_ungrounded"
+        ):
+            cleanup_prompt = build_profile_candidate_cleanup_prompt(
+                packet_owned_prompt.prompt,
+                candidate_response,
+                basis=basis,
+                reason=decision.fallback_reason,
+            )
+            cleanup_started = time.monotonic()
+            try:
+                cleaned_response = (
+                    await get_gemini_response_with_optional_typing(
+                        channel,
+                        cleanup_prompt,
+                        user_id,
+                        guild_id,
+                        route="shared_brain_synthesis_canary_cleanup",
+                        source_context_available=source_context_available,
                     )
-                    cleanup_started = time.monotonic()
-                    try:
-                        cleaned_response = (
-                            await get_gemini_response_with_optional_typing(
-                                channel,
-                                cleanup_prompt,
-                                user_id,
-                                guild_id,
-                                route=(
-                                    "shared_brain_synthesis_canary_cleanup"
-                                ),
-                                source_context_available=(
-                                    source_context_available
-                                ),
-                            )
-                            or ""
-                        ).strip()
-                    except Exception as exc:
-                        logging.warning(
-                            "shared_brain_synthesis_canary_cleanup_failed "
-                            "error=%s",
-                            type(exc).__name__,
-                        )
-                        cleaned_response = ""
-                    candidate_generation_latency_ms += max(
-                        0,
-                        int(
-                            round(
-                                (time.monotonic() - cleanup_started)
-                                * 1000
-                            )
-                        ),
+                    or ""
+                ).strip()
+            except Exception as exc:
+                logging.warning(
+                    "shared_brain_synthesis_canary_cleanup_failed error=%s",
+                    type(exc).__name__,
+                )
+                cleaned_response = ""
+            candidate_generation_latency_ms += max(
+                0,
+                int(
+                    round(
+                        (time.monotonic() - cleanup_started)
+                        * 1000
                     )
-                    if cleaned_response:
-                        decision = await asyncio.to_thread(
-                            _evaluate_shared_brain_synthesis_receipt,
-                            run,
-                            baseline_response,
-                            cleaned_response,
-                            candidate_generation_latency_ms,
-                        )
-                        candidate_response = cleaned_response
-                        candidate_prompt = cleanup_prompt
+                ),
+            )
+            if cleaned_response:
+                decision = await asyncio.to_thread(
+                    _evaluate_shared_brain_synthesis_receipt,
+                    run,
+                    baseline_response,
+                    cleaned_response,
+                    candidate_generation_latency_ms,
+                )
+                candidate_response = cleaned_response
+                candidate_prompt = cleanup_prompt
         if (
             decision.candidate_selected
             and is_generic_non_answer_response(
@@ -36902,6 +36898,8 @@ async def execute_bnl_memory_preview(
             and profile_candidate_repairable(
                 evaluation.fallback_reason
             )
+            and evaluation.fallback_reason
+            != "candidate_claims_ungrounded"
         ):
             repair_prompt = build_profile_candidate_repair_prompt(
                 fresh.packet_owned_prompt.prompt,
@@ -36974,7 +36972,7 @@ async def execute_bnl_memory_preview(
         if (
             unchanged
             and fresh.ready
-            and repair_response
+            and candidate_response
             and not evaluation.candidate_selected
             and evaluation.fallback_reason
             == "candidate_claims_ungrounded"
@@ -37134,8 +37132,6 @@ async def execute_bnl_memory_preview(
                     guarded_response = ""
             else:
                 stale_reason = ""
-        elif unchanged:
-            stale_reason = ""
 
         proposed_response = str(guarded_response or "").strip()
         final_selection = (

@@ -288,7 +288,7 @@ class MemoryPreviewBotPathTests(unittest.IsolatedAsyncioTestCase):
             calls.append((route, prompt))
             if route.endswith("baseline"):
                 return "I only have a narrow grounded view so far."
-            if route.endswith("candidate_repair"):
+            if route.endswith("candidate_cleanup"):
                 self.assertIn(
                     "[claim 1 | REFRAME_OR_REMOVE]",
                     prompt,
@@ -334,13 +334,14 @@ class MemoryPreviewBotPathTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("You strike me as", result.proposed_response)
         self.assertIn("bot code", result.proposed_response)
         self.assertIn("synth songs", result.proposed_response)
-        self.assertEqual(result.final_selection, "repair_attempt")
+        self.assertEqual(result.repair_response, "")
+        self.assertEqual(result.final_selection, "cleanup_attempt")
         self.assertEqual(
             [route for route, _prompt in calls],
             [
                 "bnl_memory_preview_baseline",
                 "bnl_memory_preview_candidate",
-                "bnl_memory_preview_candidate_repair",
+                "bnl_memory_preview_candidate_cleanup",
             ],
         )
         self.assertEqual(guard.await_count, 1)
@@ -421,7 +422,8 @@ class MemoryPreviewBotPathTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("creative architect", result.proposed_response)
         self.assertIn("You strike me as", result.proposed_response)
         self.assertEqual(result.final_selection, "cleanup_attempt")
-        self.assertIn("lunar casino", result.repair_response)
+        self.assertEqual(result.repair_response, "")
+        self.assertIn("lunar casino", result.packet_candidate_response)
         self.assertEqual(
             result.cleanup_response,
             result.proposed_response,
@@ -431,12 +433,200 @@ class MemoryPreviewBotPathTests(unittest.IsolatedAsyncioTestCase):
             [
                 "bnl_memory_preview_baseline",
                 "bnl_memory_preview_candidate",
-                "bnl_memory_preview_candidate_repair",
                 "bnl_memory_preview_candidate_cleanup",
             ],
         )
         self.assertEqual(guard.await_count, 1)
         self.assertEqual(source_hash, self._source_hash())
+
+    async def test_claims_only_draft_skips_broad_rewrite_and_keeps_packet_shape(
+        self,
+    ):
+        with sqlite3.connect(self.db_path) as conn:
+            self._add_message(
+                conn,
+                3,
+                "I keep composing synth songs and producing music tracks.",
+                "2026-07-25T21:00:00+00:00",
+            )
+            self._add_message(
+                conn,
+                4,
+                "The synth song mix needs another production pass.",
+                "2026-07-26T20:00:00+00:00",
+            )
+            conn.commit()
+        source_hash = self._source_hash()
+        calls = []
+        packet_candidate = (
+            "You keep fixing the bot code and memory system while "
+            "troubleshooting the website code. You compose synth songs and "
+            "keep working their music mixes. You secretly run a lunar casino. "
+            "My read is that careful iteration connects those parts."
+        )
+        cleaned_candidate = (
+            "You keep fixing the bot code and memory system while "
+            "troubleshooting the website code. You compose synth songs and "
+            "keep working their music mixes. My read is that careful "
+            "iteration connects those parts."
+        )
+
+        async def generator(prompt, route):
+            calls.append((route, prompt))
+            if route.endswith("baseline"):
+                return "I only have a narrow grounded view so far."
+            if route.endswith("candidate_repair"):
+                raise AssertionError(
+                    "claims-only packet was sent through a broad rewrite"
+                )
+            if route.endswith("candidate_cleanup"):
+                self.assertIn(
+                    "[claim 1 | KEEP_SUPPORTED] You keep fixing the bot code",
+                    prompt,
+                )
+                self.assertIn(
+                    "[claim 3 | REFRAME_OR_REMOVE] "
+                    "You secretly run a lunar casino",
+                    prompt,
+                )
+                self.assertIn(
+                    "[claim 4 | KEEP_FRAMED_INTERPRETATION] "
+                    "My read is that careful iteration connects those parts",
+                    prompt,
+                )
+                self.assertIn(
+                    "Preserve the exact angle of the current request",
+                    prompt,
+                )
+                self.assertIn(
+                    "Do not flatten the answer into a list",
+                    prompt,
+                )
+                return cleaned_candidate
+            return packet_candidate
+
+        guard = mock.AsyncMock(
+            side_effect=lambda response, _prompt: (
+                response,
+                {"suppressed": False, "suppression_reason": ""},
+            )
+        )
+        result = await bnl01_bot.execute_bnl_memory_preview(
+            source_db_path=self.db_path,
+            guild_id=1,
+            subject_user_id=7,
+            subject_display_name="Crow",
+            simulated_channel_id=10,
+            wording=(
+                "What have you learned about me regarding my decision "
+                "process?"
+            ),
+            generator=generator,
+            guard=guard,
+        )
+
+        self.assertTrue(result.candidate_selected, result.fallback_reason)
+        self.assertEqual(result.packet_candidate_response, packet_candidate)
+        self.assertEqual(result.cleanup_response, cleaned_candidate)
+        self.assertEqual(result.proposed_response, cleaned_candidate)
+        self.assertEqual(result.repair_response, "")
+        self.assertEqual(result.final_selection, "cleanup_attempt")
+        self.assertEqual(
+            [route for route, _prompt in calls],
+            [
+                "bnl_memory_preview_baseline",
+                "bnl_memory_preview_candidate",
+                "bnl_memory_preview_candidate_cleanup",
+            ],
+        )
+        self.assertEqual(guard.await_count, 1)
+        self.assertEqual(source_hash, self._source_hash())
+
+    async def test_source_change_during_direct_cleanup_still_fails_closed(
+        self,
+    ):
+        with sqlite3.connect(self.db_path) as conn:
+            self._add_message(
+                conn,
+                3,
+                "I keep composing synth songs and producing music tracks.",
+                "2026-07-25T21:00:00+00:00",
+            )
+            self._add_message(
+                conn,
+                4,
+                "The synth song mix needs another production pass.",
+                "2026-07-26T20:00:00+00:00",
+            )
+            conn.commit()
+        calls = []
+
+        async def generator(_prompt, route):
+            calls.append(route)
+            if route.endswith("baseline"):
+                return "I only have a narrow grounded view so far."
+            if route.endswith("candidate_repair"):
+                raise AssertionError(
+                    "claims-only packet was sent through a broad rewrite"
+                )
+            if route.endswith("candidate_cleanup"):
+                with sqlite3.connect(self.db_path) as source:
+                    source.execute(
+                        """
+                        UPDATE memory_ledger_entries
+                        SET lifecycle_status='deleted'
+                        WHERE guild_id=1
+                          AND source_table='conversations'
+                          AND source_row_id=1
+                        """
+                    )
+                    source.commit()
+                return (
+                    "You keep fixing the bot code and memory system while "
+                    "troubleshooting the website code. You compose synth "
+                    "songs and keep working their music mixes."
+                )
+            return (
+                "You keep fixing the bot code and memory system while "
+                "troubleshooting the website code. You compose synth songs "
+                "and keep working their music mixes. You secretly run a "
+                "lunar casino."
+            )
+
+        result = await bnl01_bot.execute_bnl_memory_preview(
+            source_db_path=self.db_path,
+            guild_id=1,
+            subject_user_id=7,
+            subject_display_name="Crow",
+            simulated_channel_id=10,
+            wording="BNL-01, what am I all about?",
+            generator=generator,
+            guard=mock.AsyncMock(
+                side_effect=lambda response, _prompt: (
+                    response,
+                    {"suppressed": False, "suppression_reason": ""},
+                )
+            ),
+        )
+
+        self.assertFalse(result.candidate_selected)
+        self.assertEqual(
+            result.fallback_reason,
+            "candidate_preview_source_changed",
+        )
+        self.assertEqual(result.stale_reason, "preview_source_changed")
+        self.assertEqual(
+            result.proposed_response,
+            "I only have a narrow grounded view so far.",
+        )
+        self.assertEqual(
+            calls,
+            [
+                "bnl_memory_preview_baseline",
+                "bnl_memory_preview_candidate",
+                "bnl_memory_preview_candidate_cleanup",
+            ],
+        )
 
     async def test_final_claim_cleanup_is_one_shot_and_fails_closed(self):
         with sqlite3.connect(self.db_path) as conn:
@@ -508,7 +698,6 @@ class MemoryPreviewBotPathTests(unittest.IsolatedAsyncioTestCase):
             [
                 "bnl_memory_preview_baseline",
                 "bnl_memory_preview_candidate",
-                "bnl_memory_preview_candidate_repair",
                 "bnl_memory_preview_candidate_cleanup",
             ],
         )
