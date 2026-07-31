@@ -241,15 +241,24 @@ _REPAIRABLE_PROFILE_FAILURES = frozenset(
 _CLAIM_SPLIT_RE = re.compile(
     r"(?:[.!?;]+\s+|\n+|"
     r"\s+[—–]\s+|"
-    r",\s+(?=(?:and|but|yet|while|whereas|which|so|meaning|"
-    r"making|showing|proving)\b)|"
+    r",\s+(?=(?:but|yet|while|whereas|which|so|meaning|proving)\b)|"
+    r",\s+(?=(?:making|showing)\s+"
+    r"(?:you|your|it|this|that|those|these)\b)|"
     r"\s+(?=(?:and|but|yet|while|whereas)\s+"
     r"(?:you|your|i|my|this|that|those|these)\b)|"
     r"\s+(?=(?:and|but|yet|while|whereas)\s+"
     r"(?:(?:secretly|actually|also|regularly|always|never|"
     r"personally|apparently|supposedly)\s+)?"
-    r"(?:run|own|live|work|have|make|build|create|prefer|like|"
-    r"love|broadcast|transmit|control|command|operate|fund)\b)|"
+    r"(?:run|own|have|make|build|create|prefer|like|love|"
+    r"transmit|control|command|operate|fund)\b)|"
+    r"\s+(?=(?:and|but|yet|while|whereas)\s+"
+    r"(?:(?:secretly|actually|also|regularly|always|never|"
+    r"personally|apparently|supposedly)\s+)?"
+    r"(?:live|work)\s+(?:at|in|near|for|on)\b)|"
+    r"\s+(?=(?:and|but|yet|while|whereas)\s+"
+    r"(?:(?:secretly|actually|also|regularly|always|never|"
+    r"personally|apparently|supposedly)\s+)?"
+    r"broadcast\s+(?:at|on|every|each|from|to)\b)|"
     r"\s+(?=(?:because|although|though|even\s+though|since)\s+"
     r"(?:you|your|this|that|those|these)\b))",
     re.I,
@@ -258,6 +267,9 @@ _OPINION_FRAME_RE = re.compile(
     r"\b(?:i\s+(?:think|believe|suspect|figure)|"
     r"i(?:'d|\s+would)\s+(?:say|call)|"
     r"my\s+(?:read|view|take|assessment)|"
+    r"based\s+on\s+my\s+observations?|"
+    r"from\s+(?:my\s+observations?|what\s+i\s+observe|my\s+perspective)|"
+    r"if\s+i\s+had\s+to\s+summarize(?:\s+my\s+read)?|"
     r"to\s+me|in\s+my\s+view|from\s+where\s+i\s+(?:sit|stand)|"
     r"it\s+seems|you\s+seem|you\s+strike\s+me|"
     r"i\s+get\s+the\s+(?:sense|impression)|"
@@ -266,7 +278,8 @@ _OPINION_FRAME_RE = re.compile(
 )
 _DERIVED_ASSESSMENT_RE = re.compile(
     r"^\s*(?:that|those|these|this|both|together|overall|put\s+together|"
-    r"in\s+combination|the\s+combination|the\s+throughline)\b",
+    r"in\s+combination|in\s+short|in\s+sum|summed\s+up|"
+    r"the\s+combination|the\s+throughline)\b",
     re.I,
 )
 _DIRECT_MEMBER_ASSERTION_RE = re.compile(
@@ -284,6 +297,22 @@ _UNSUPPORTED_SCALAR_ASSERTION_RE = re.compile(
     r"you\s+(?:prefer|like|love|own|have)\b)",
     re.I,
 )
+_UNSUPPORTED_FRAMED_CONCRETE_RE = re.compile(
+    r"(?:https?://|www\.|<@!?\d+>|"
+    r"\b[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}\b|"
+    r"\b\d+(?:[.:/-]\d+)*\b|"
+    r"\byou\s+(?:(?:secretly|actually|also|regularly|always|never|"
+    r"personally|apparently|supposedly)\s+)?"
+    r"(?:run|own|host|manage|lead|found|founded|join|joined|"
+    r"release|released|write|wrote|visit|visited|attend|attended|"
+    r"buy|bought|sell|sold|pay|paid|earn|earned|live|reside|work)\b|"
+    r"\byou\s+(?:are|were)\s+(?:a|an|the|from|in|at|near)\b|"
+    r"\byou\s+(?:were\s+)?born\b|"
+    r"\byour\s+(?:favorite|name|pronouns?|home|address|job|employer|"
+    r"workplace|birthday|age|role|project)\b)",
+    re.I,
+)
+_INTERNAL_PROPER_NOUN_RE = re.compile(r"(?<!^)(?<![.!?]\s)\b[A-Z][\w'-]{2,}\b")
 _TRANSIENT_EXPRESSION_WRAPPER_RE = re.compile(
     r"^\s*[~*_`-]*\[(?P<body>[\s\S]{1,900})\]\s*[~*_`-]*$",
 )
@@ -1777,10 +1806,14 @@ def _classify_candidate_claims(
         scalar_assertion = bool(
             _UNSUPPORTED_SCALAR_ASSERTION_RE.search(factual_claim)
         )
+        framed_concrete_assertion = bool(
+            scalar_assertion
+            or _UNSUPPORTED_FRAMED_CONCRETE_RE.search(factual_claim)
+            or _INTERNAL_PROPER_NOUN_RE.search(factual_claim)
+        )
         if (
             has_member_basis
-            and not scalar_assertion
-            and not _DIRECT_MEMBER_ASSERTION_RE.search(factual_claim)
+            and not framed_concrete_assertion
             and _OPINION_FRAME_RE.search(factual_claim)
         ):
             classifications.append("framed_opinion")
@@ -1788,7 +1821,7 @@ def _classify_candidate_claims(
             continue
         if (
             has_member_basis
-            and not scalar_assertion
+            and not framed_concrete_assertion
             and _DERIVED_ASSESSMENT_RE.search(factual_claim)
         ):
             classifications.append("linked_assessment")

@@ -543,6 +543,89 @@ class ProductionShapedBroadRecallAcceptanceTests(unittest.TestCase):
         finally:
             prepared.close()
 
+    def test_broad_profile_keeps_all_six_bounded_recurrent_points(self):
+        user_id = 102
+        user_name = "Test Member"
+        topics = (
+            (
+                "I keep producing synth music and mixing audio tracks.",
+                "The song vocals and drum mix need another pass.",
+            ),
+            (
+                "I keep designing visual artwork and animation sprites.",
+                "The image style and banner design need another pass.",
+            ),
+            (
+                "I keep debugging bot code and testing deployments.",
+                "The website system still has another bug to fix.",
+            ),
+            (
+                "I keep organizing community collaboration in Discord.",
+                "The server team has another shared project to coordinate.",
+            ),
+            (
+                "I keep writing lore and shaping the worldbuilding.",
+                "The story narrative and canon need another writing pass.",
+            ),
+            (
+                "I keep balancing game battles and creature cards.",
+                "The player classes and monster levels need another pass.",
+            ),
+        )
+        for index, (first, second) in enumerate(topics):
+            self.add_recurring_topic(
+                user_id=user_id,
+                user_name=user_name,
+                first=first,
+                second=second,
+                day_offset=index,
+            )
+
+        prepared = prepare_memory_preview(
+            self.request(
+                user_id=user_id,
+                user_name=user_name,
+                wording="BNL-01, what am I all about?",
+            )
+        )
+        try:
+            funnel = dict(prepared.diagnostics.source_funnel_counts)
+            self.assertEqual(funnel["motif_candidates_returned"], 6)
+            atomic_items = tuple(
+                item
+                for item in prepared.packet.items
+                if item.lane == "atomic_knowledge"
+            )
+            self.assertEqual(len(atomic_items), 6)
+            self.assertEqual(
+                prepared.packet.profile_sufficiency.candidate_point_count,
+                6,
+            )
+            self.assertEqual(
+                prepared.packet.profile_sufficiency.selected_point_count,
+                6,
+            )
+            self.assertEqual(
+                prepared.diagnostics.profile_candidate_point_count,
+                6,
+            )
+            self.assertEqual(
+                dict(prepared.basis.rendered_lane_counts).get(
+                    "atomic_knowledge",
+                    0,
+                ),
+                6,
+            )
+            self.assertFalse(
+                any(
+                    exclusion.lane == "atomic_knowledge"
+                    and exclusion.reason == "lane_cap"
+                    for exclusion in prepared.packet.exclusions
+                ),
+            )
+        finally:
+            prepared.close()
+
     def test_lostmarbles_never_inherits_wittyfox_evidence(self):
         self.add_recurring_topic(
             user_id=103,
