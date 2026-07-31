@@ -120,14 +120,23 @@ _BROAD_PROFILE_LANE_CAPS = {
     "atomic_knowledge": 6,
     "moment": 2,
     "open_loop": 1,
-    "canon": 2,
+    "canon": 1,
     "source_file": 1,
 }
 _PROFILE_MEMBER_EVIDENCE_LANES = frozenset(
     {"approved_fact", "atomic_knowledge", "moment"}
 )
+_PROFILE_CANON_MATCH_LANES = (
+    _PROFILE_MEMBER_EVIDENCE_LANES
+    | {"assessment_observation", "conversation_context"}
+)
 _ROOT_COLLAPSE_MEMBER_LANES = (
     _PROFILE_MEMBER_EVIDENCE_LANES | {"conversation_context"}
+)
+_PROFILE_PROJECT_SCOPE_RE = re.compile(
+    r"\b(?:barcode(?:\s+(?:network|radio))?|"
+    r"project|collective|broadcast)\b",
+    re.I,
 )
 _ASSESSMENT_LANE_MAP = {
     "current_intent": "current_exchange",
@@ -646,6 +655,59 @@ def _root_bearing_member_item(
 
 def _broad_profile_request(value: str) -> bool:
     return classify_personal_recall_intent(value).broad_self_profile
+
+
+def _profile_project_request(value: str) -> bool:
+    return bool(_PROFILE_PROJECT_SCOPE_RE.search(str(value or "")))
+
+
+def _profile_canon_anchor(
+    request: IntelligencePacketRequest,
+    candidates: Sequence[IntelligencePacketItem],
+) -> IntelligencePacketItem | None:
+    """Choose one canon point that best contextualizes selected public work."""
+
+    if (
+        not _broad_profile_request(request.user_text)
+        or not _profile_project_request(request.user_text)
+    ):
+        return None
+    subject = subject_key_for_user(request.subject_user_id)
+    member_terms: set[str] = set()
+    for item in candidates:
+        if (
+            item.subject_key != subject
+            or item.lane not in _PROFILE_CANON_MATCH_LANES
+        ):
+            continue
+        member_terms.update(_terms(item.text))
+        for observation in item.supporting_observations:
+            member_terms.update(_terms(observation))
+    query = re.sub(
+        r"^\s*(?:hey\s+|yo\s+|hi\s+)?"
+        r"(?:bnl(?:-?01)?|barcode bot)\s*[,;:—-]*\s*",
+        "",
+        str(request.user_text or ""),
+        flags=re.I,
+    )
+    request_terms = _terms(query)
+    canon_items = tuple(
+        item
+        for item in candidates
+        if item.lane == "canon"
+        and request_terms.intersection(_terms(item.text))
+    )
+    if not canon_items:
+        return None
+    return sorted(
+        canon_items,
+        key=lambda item: (
+            -len(member_terms & _terms(item.text)),
+            -len(request_terms & _terms(item.text)),
+            -len(_terms(item.text)),
+            item.source_ref,
+        ),
+    )[0]
 
 
 def _public_route(request: IntelligencePacketRequest) -> bool:
@@ -2275,24 +2337,29 @@ def _select_items(
         diagnostics,
         exclusions,
     )
+    canon_anchor = _profile_canon_anchor(request, candidates)
     profile_candidates: list[IntelligencePacketItem] = []
     broad_lane_priority = {
         "current_intent": 0,
         "approved_fact": 1,
-        "atomic_knowledge": 2,
-        "conversation_context": 3,
-        "assessment_observation": 4,
-        "moment": 5,
-        "open_loop": 6,
-        "canon": 7,
-        "source_file": 8,
-        "relationship_posture": 9,
+        "atomic_knowledge": 3,
+        "conversation_context": 4,
+        "assessment_observation": 5,
+        "moment": 6,
+        "open_loop": 7,
+        "canon": 8,
+        "source_file": 9,
+        "relationship_posture": 10,
     }
     ordered = sorted(
         candidates,
         key=lambda item: (
             (
-                broad_lane_priority.get(item.lane, 9)
+                (
+                    2
+                    if item is canon_anchor
+                    else broad_lane_priority.get(item.lane, 10)
+                )
                 if broad
                 else 0
             ),

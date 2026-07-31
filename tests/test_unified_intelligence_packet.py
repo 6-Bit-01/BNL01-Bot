@@ -795,6 +795,103 @@ class UnifiedIntelligencePacketTests(unittest.TestCase):
         self.assertIn("selected after considering the full eligible", rendered)
         self.assertNotIn("completely different plan", rendered)
 
+    def test_barcode_profile_blends_one_relevant_canon_anchor_last(self):
+        rows = (
+            (
+                980,
+                (
+                    "I keep comparing BARCODE music mixes before choosing "
+                    "the strongest track."
+                ),
+                "2026-07-20T10:00:00+00:00",
+            ),
+            (
+                981,
+                (
+                    "The live broadcast format needs another careful test "
+                    "before release."
+                ),
+                "2026-07-21T10:00:00+00:00",
+            ),
+            (
+                982,
+                (
+                    "I want the community involved while the software and "
+                    "archive keep improving."
+                ),
+                "2026-07-22T10:00:00+00:00",
+            ),
+            (
+                983,
+                (
+                    "The character visuals and story need another revision "
+                    "pass."
+                ),
+                "2026-07-23T10:00:00+00:00",
+            ),
+            (
+                984,
+                (
+                    "I keep refining songs and the radio show with the "
+                    "artists."
+                ),
+                "2026-07-24T10:00:00+00:00",
+            ),
+            (
+                985,
+                (
+                    "The Network should connect real participation before "
+                    "deeper lore."
+                ),
+                "2026-07-25T10:00:00+00:00",
+            ),
+        )
+        entry_ids = tuple(
+            self.add_raw_public_conversation(*row) for row in rows
+        )
+        ledger.form_atomic_candidates_from_recurring_conversation(
+            self.conn,
+            trigger_entry_id=entry_ids[-1],
+            environ=self.flags,
+        )
+
+        packet = build_packet(
+            self.conn,
+            self.public_request(
+                text=(
+                    "What parts of BARCODE seem to matter most to me, "
+                    "and why?"
+                )
+            ),
+            persist=False,
+            environ=self.flags,
+        )
+        selected_canon = tuple(
+            item for item in packet.items if item.lane == "canon"
+        )
+
+        self.assertEqual(len(selected_canon), 1)
+        self.assertIn(
+            "connects music, live broadcasts, community, software, "
+            "archive, characters, and story",
+            selected_canon[0].text,
+        )
+        rendered, counts, _count, _digests = render_packet_context(packet)
+        rendered_counts = dict(counts)
+        self.assertEqual(rendered_counts.get("canon"), 1)
+        self.assertGreaterEqual(
+            rendered_counts.get("assessment_observation", 0),
+            3,
+        )
+        self.assertLess(
+            rendered.index("question-scoped public observation"),
+            rendered.index("approved canon"),
+        )
+        self.assertIn(
+            "one concise context anchor after the member assessment",
+            rendered,
+        )
+
     def test_distinct_atomic_points_can_share_exact_human_roots(self):
         rows = (
             (

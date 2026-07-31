@@ -26,6 +26,7 @@ from bnl_shared_brain_synthesis import (
     finalize_run,
     render_packet_context,
     revalidate_basis,
+    salvage_profile_candidate_response,
     scope_enabled,
 )
 from bnl_unified_intelligence_packet import (
@@ -845,8 +846,10 @@ class SharedBrainSynthesisCanaryTests(unittest.TestCase):
             run,
             baseline_response="Established response.",
             candidate_response=(
-                "Your favorite movie is Arrival. In BARCODE, 6 Bit is an "
-                "artist, MC, host, and founding member."
+                "Your favorite movie is Arrival. In BARCODE, the Network "
+                "grew around the music and collective and connects music, "
+                "live broadcasts, community, software, archive, characters, "
+                "and story."
             ),
             environ=self.flags,
         )
@@ -859,6 +862,125 @@ class SharedBrainSynthesisCanaryTests(unittest.TestCase):
         self.assertGreaterEqual(
             decision.candidate_canon_supported_claim_count,
             1,
+        )
+
+    def test_canon_must_follow_and_support_the_member_assessment(self):
+        self._add_profile_fact(
+            source_row_id=902,
+            predicate_key="favorite_color",
+            value="violet",
+            observed_at="2026-07-26T12:00:01+00:00",
+        )
+        wording = (
+            "What parts of BARCODE seem to matter most to me, and why?"
+        )
+        request = replace(
+            self._request(),
+            user_text=wording,
+            conversation_evidence=(
+                *self._request().conversation_evidence[:-1],
+                replace(
+                    self._request().conversation_evidence[-1],
+                    text=wording,
+                ),
+            ),
+        )
+        packet = build_packet(
+            self.conn,
+            request,
+            persist=True,
+            environ=self.flags,
+        )
+        basis = self._build_basis(
+            packet,
+            self._build_assessment(packet),
+        )
+        canon_first = (
+            "BARCODE Network grew around the music and collective and "
+            "connects music, live broadcasts, community, software, archive, "
+            "characters, and story. Your favorite movie is Arrival, and "
+            "your favorite color is violet."
+        )
+        run = begin_run(
+            self.conn,
+            basis,
+            baseline_response="Established response.",
+            environ=self.flags,
+        )
+        rejected = evaluate_candidate(
+            self.conn,
+            run,
+            baseline_response="Established response.",
+            candidate_response=canon_first,
+            environ=self.flags,
+        )
+
+        self.assertFalse(rejected.candidate_selected)
+        self.assertEqual(
+            rejected.fallback_reason,
+            "candidate_canon_dominant",
+        )
+        self.assertTrue(rejected.candidate_lore_dominant)
+
+        member_first = (
+            "Your favorite movie is Arrival, and your favorite color is "
+            "violet. In BARCODE, that sits inside a Network connecting "
+            "music, live broadcasts, community, software, archive, "
+            "characters, and story."
+        )
+        balanced_run = begin_run(
+            self.conn,
+            basis,
+            baseline_response="Established response.",
+            environ=self.flags,
+        )
+        balanced = evaluate_candidate(
+            self.conn,
+            balanced_run,
+            baseline_response="Established response.",
+            candidate_response=member_first,
+            environ=self.flags,
+        )
+
+        self.assertTrue(balanced.candidate_selected)
+        self.assertFalse(balanced.candidate_lore_dominant)
+
+    def test_single_unsupported_clause_can_be_removed_without_rewriting(self):
+        self._add_profile_fact(
+            source_row_id=902,
+            predicate_key="favorite_color",
+            value="violet",
+            observed_at="2026-07-26T12:00:01+00:00",
+        )
+        packet = self._build_packet()
+        basis = self._build_basis(
+            packet,
+            self._build_assessment(packet),
+        )
+        stubborn_cleanup = (
+            "Your favorite movie is Arrival. Your favorite color is violet. "
+            "You secretly run a lunar casino. My read is that those choices "
+            "share a taste for vivid atmosphere."
+        )
+
+        salvaged = salvage_profile_candidate_response(
+            stubborn_cleanup,
+            basis=basis,
+            reason="candidate_claims_ungrounded",
+        )
+
+        self.assertNotIn("lunar casino", salvaged)
+        self.assertIn("favorite movie is Arrival", salvaged)
+        self.assertIn("favorite color is violet", salvaged)
+        self.assertIn("My read is", salvaged)
+        self.assertEqual(
+            salvage_profile_candidate_response(
+                stubborn_cleanup
+                + " You secretly own an orbital bank.",
+                basis=basis,
+                reason="candidate_claims_ungrounded",
+            ),
+            "",
         )
 
     def test_nonpacket_factual_owner_records_a_fail_closed_fallback(self):

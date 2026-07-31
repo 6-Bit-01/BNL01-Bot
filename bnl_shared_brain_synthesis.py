@@ -265,6 +265,7 @@ _REPAIRABLE_PROFILE_FAILURES = frozenset(
         "candidate_member_roots_insufficient",
         "candidate_member_occurrences_insufficient",
         "candidate_project_canon_missing",
+        "candidate_canon_dominant",
         "candidate_request_angle_missed",
         "candidate_coherence_regressed",
     }
@@ -1105,9 +1106,9 @@ def render_packet_context(
             {
                 "approved_fact": 0,
                 "atomic_knowledge": 1,
-                "moment": 2,
-                "canon": 3,
-                "assessment_observation": 4,
+                "assessment_observation": 2,
+                "moment": 3,
+                "canon": 4,
             }
         )
     ordered_items = tuple(
@@ -1126,12 +1127,36 @@ def render_packet_context(
         max_items=max_items,
         max_chars=max_chars,
     )
+    required_canon_item = (
+        next(
+            (
+                item
+                for item in ordered_items
+                if item.lane == "canon"
+                and _canon_relevant_to_profile_request(packet, item)
+            ),
+            None,
+        )
+        if _profile_requires_canon(packet)
+        else None
+    )
+    canon_char_reserve = (
+        len(_safe_evidence_text(required_canon_item.text)) + 64
+        if required_canon_item is not None
+        else 0
+    )
     for item in ordered_items:
         if item.lane not in _RENDERABLE_LANES:
             continue
         if item.lane == "canon" and not _canon_relevant_to_profile_request(
             packet,
             item,
+        ):
+            continue
+        if (
+            required_canon_item is not None
+            and item.lane == "canon"
+            and item is not required_canon_item
         ):
             continue
         text = _safe_evidence_text(item.text)
@@ -1174,7 +1199,12 @@ def render_packet_context(
             qualifier,
             text,
         )
-        if used + len(line) > max_chars:
+        if required_canon_item is not None and item is not required_canon_item:
+            if len(lines) >= max(0, int(max_items or 0) - 1):
+                continue
+            if used + len(line) > max_chars - canon_char_reserve:
+                continue
+        elif used + len(line) > max_chars:
             break
         lines.append(line)
         lane_counts[item.lane] += 1
@@ -1211,10 +1241,10 @@ def render_packet_context(
     else:
         profile_rule = ""
     project_rule = (
-        "- The request explicitly asks for BARCODE/project context. After "
-        "the member-specific substance, connect it to at least one relevant "
-        "approved canon point; answer as neither member-history-only nor "
-        "canon-only.\n"
+        "- The request explicitly asks for BARCODE/project context. Use one "
+        "concise context anchor after the member assessment; canon may "
+        "clarify why the observed priorities fit BARCODE, but it must not "
+        "become the answer's organizing frame.\n"
         if _profile_requires_canon(packet)
         else ""
     )
@@ -1234,7 +1264,8 @@ def render_packet_context(
         "- Answer the current user naturally in BNL's established voice; do "
         "not recite this evidence as a database report.\n"
         "- Lead with member-specific substance. Relevant BARCODE canon may "
-        "support that substance afterward, but can never substitute for it.\n"
+        "add one concise context anchor afterward, but can never substitute "
+        "for the public assessment or become its governing frame.\n"
         "- Look across the selected observations for a useful throughline. "
         "Separate what is directly known, what BNL has observed, and BNL's "
         "revisable opinion. Frame interpretation naturally as a read or "
@@ -1632,11 +1663,13 @@ def build_profile_candidate_repair_prompt(
             else "Keep every personal claim within the supported evidence."
         ),
         (
-            "After the member details, connect them to at least one relevant "
-            "approved BARCODE canon point."
+            "After the member assessment, use one concise relevant approved "
+            "BARCODE canon point as context. Do not organize the answer "
+            "around canon or let it displace public member evidence."
             if basis.profile_requires_canon
             else "Use BARCODE canon only when it helps answer the request; it "
-            "is not a required ingredient."
+            "is not a required ingredient and must not become the answer's "
+            "organizing frame."
         ),
         (
             "Keep factual claims inside the supplied support. You may form a "
@@ -1725,6 +1758,13 @@ def build_profile_candidate_cleanup_prompt(
             "the flagged units removed or minimally reframed."
         ),
         (
+            "Keep no more than one concise approved BARCODE canon anchor, "
+            "and keep it after the member assessment. Canon may contextualize "
+            "the answer but must not become its organizing frame."
+            if basis.profile_requires_canon
+            else "Do not add canon that the current request does not need."
+        ),
+        (
             "Resolve all %s REFRAME_OR_REMOVE units. If a unit is only an "
             "abstract creative or personality interpretation that genuinely "
             "follows from KEEP_SUPPORTED details, retain its idea once and "
@@ -1760,6 +1800,57 @@ def build_profile_candidate_cleanup_prompt(
         "audit labels must not appear in the answer):\n"
         + claim_audit
     )
+
+
+def salvage_profile_candidate_response(
+    prior_response: str,
+    *,
+    basis: SharedBrainSynthesisBasis,
+    reason: str,
+) -> str:
+    """Remove one leftover unsupported claim without generating new prose.
+
+    The model already received one constrained cleanup opportunity. This
+    deterministic last step is intentionally limited to one independently
+    split unsupported unit. The normal candidate gate still decides whether
+    the remaining answer is sufficient, coherent, correctly angled, and
+    source-valid.
+    """
+
+    if str(reason or "") != "candidate_claims_ungrounded":
+        return ""
+    claims = _candidate_claim_units(prior_response)
+    try:
+        coverage = candidate_profile_coverage(basis, prior_response)
+    except (AttributeError, TypeError, ValueError):
+        return ""
+    classifications = tuple(coverage.claim_classifications)
+    if (
+        not claims
+        or len(claims) != len(classifications)
+        or int(coverage.unsupported_factual_claim_count or 0) != 1
+    ):
+        return ""
+    kept = tuple(
+        claim
+        for claim, classification in zip(claims, classifications)
+        if classification != "unsupported_factual"
+    )
+    if not kept or len(kept) == len(claims):
+        return ""
+    salvaged = " ".join(
+        claim
+        if claim.endswith((".", "!", "?"))
+        else claim + "."
+        for claim in kept
+    ).strip()
+    try:
+        salvaged_coverage = candidate_profile_coverage(basis, salvaged)
+    except (AttributeError, TypeError, ValueError):
+        return ""
+    if salvaged_coverage.unsupported_factual_claim_count:
+        return ""
+    return salvaged
 
 
 def response_exposes_controls(response: str) -> bool:
@@ -2232,6 +2323,17 @@ def candidate_profile_coverage(
         canon_items=canon_items,
         supported_member_points=frozenset(covered_points),
     )
+    canon_only_claims = sum(
+        classification == "canon_supported"
+        for classification in claim_classifications
+    )
+    lore_dominant = bool(
+        canon_only_claims
+        and (
+            not member_first
+            or canon_only_claims > member_supported_claims
+        )
+    )
     return CandidateProfileCoverage(
         total_item_count=len(covered_items),
         member_point_count=len(covered_points),
@@ -2240,9 +2342,9 @@ def candidate_profile_coverage(
         member_detail_point_count=len(covered_detail_points),
         canon_item_count=len(covered_canon),
         member_segment_count=member_supported_claims,
-        canon_only_segment_count=canon_supported_claims,
+        canon_only_segment_count=canon_only_claims,
         member_first=member_first,
-        lore_dominant=False,
+        lore_dominant=lore_dominant,
         member_supported_claim_count=member_supported_claims,
         canon_supported_claim_count=canon_supported_claims,
         opinion_claim_count=opinion_claims,
@@ -2613,6 +2715,8 @@ def evaluate_candidate(
         and profile_coverage.canon_item_count < 1
     ):
         fallback_reason = "candidate_project_canon_missing"
+    elif profile_coverage.lore_dominant:
+        fallback_reason = "candidate_canon_dominant"
     elif not _candidate_matches_profile_request_angle(
         run.basis,
         candidate,
