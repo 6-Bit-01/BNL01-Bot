@@ -30,7 +30,7 @@ from bnl_unified_response_assessment import (
 )
 
 
-SHADOW_ACCEPTANCE_VERSION = "v2_shadow_acceptance_v4"
+SHADOW_ACCEPTANCE_VERSION = "v2_shadow_acceptance_v5"
 SHADOW_EVALUATION_ORDER = (
     "memory_ledger",
     "moment_engine",
@@ -569,6 +569,8 @@ def _empty_relationship_report() -> Dict[str, Any]:
         "cross_guild_member_violations": 0,
         "ledger_link_integrity_violations": 0,
         "moment_link_integrity_violations": 0,
+        "retired_ledger_link_integrity_observations": 0,
+        "retired_moment_link_integrity_observations": 0,
         "visibility_violations": 0,
         "processing_errors": 0,
         "legacy_v2_comparison": "not_collected",
@@ -655,6 +657,17 @@ def _empty_unified_assessment_report() -> Dict[str, Any]:
         "scoped_canary_guard_triggered_runs": 0,
         "scoped_canary_guard_repaired_runs": 0,
         "scoped_canary_output_leak_guard_runs": 0,
+        "runtime_evidence_since": "all_retained",
+        "runtime_runs": 0,
+        "runtime_payload_grounding_failure_runs": 0,
+        "runtime_response_coherence_failure_runs": 0,
+        "runtime_response_coherence_review_runs": 0,
+        "runtime_processing_errors": 0,
+        "runtime_behavior_changed_runs": 0,
+        "runtime_new_authority_applied_runs": 0,
+        "runtime_scoped_canary_runs": 0,
+        "runtime_scoped_canary_invalid_scope_runs": 0,
+        "runtime_evidence_window": {"first": "none", "last": "none"},
         "content_fields_present": [],
         "evidenceWindow": {"first": "none", "last": "none"},
     }
@@ -663,13 +676,43 @@ def _empty_unified_assessment_report() -> Dict[str, Any]:
 def _read_unified_assessment_report(
     conn: sqlite3.Connection,
     guild_id: int,
+    runtime_evidence_since: str = "",
 ) -> Dict[str, Any]:
     try:
-        return build_unified_assessment_evaluation_report(
+        retained = build_unified_assessment_evaluation_report(
             conn,
             guild_id=guild_id,
             prepare_schema=False,
         )
+        since = str(runtime_evidence_since or "").strip()
+        runtime = (
+            build_unified_assessment_evaluation_report(
+                conn,
+                guild_id=guild_id,
+                prepare_schema=False,
+                created_at_since=since,
+            )
+            if since
+            else retained
+        )
+        retained["runtime_evidence_since"] = since or "all_retained"
+        for key in (
+            "runs",
+            "payload_grounding_failure_runs",
+            "response_coherence_failure_runs",
+            "response_coherence_review_runs",
+            "processing_errors",
+            "behavior_changed_runs",
+            "new_authority_applied_runs",
+            "scoped_canary_runs",
+            "scoped_canary_invalid_scope_runs",
+        ):
+            retained["runtime_" + key] = int(runtime.get(key, 0) or 0)
+        retained["runtime_evidence_window"] = dict(
+            runtime.get("evidenceWindow")
+            or {"first": "none", "last": "none"}
+        )
+        return retained
     except (sqlite3.DatabaseError, ValueError, TypeError) as exc:
         return _report_error(
             _empty_unified_assessment_report(),
@@ -888,6 +931,7 @@ def build_v2_shadow_acceptance_snapshot(
     guild_id: int,
     environ: Optional[Mapping[str, str]] = None,
     conversation_context_diagnostics: Optional[Mapping[str, Any]] = None,
+    runtime_evidence_since: str = "",
 ) -> Dict[str, Any]:
     """Build a dependency-aware snapshot from aggregate evidence only."""
 
@@ -907,7 +951,11 @@ def build_v2_shadow_acceptance_snapshot(
             guild_id,
         )
     )
-    unified_assessment = _read_unified_assessment_report(conn, guild_id)
+    unified_assessment = _read_unified_assessment_report(
+        conn,
+        guild_id,
+        runtime_evidence_since=runtime_evidence_since,
+    )
     context = _safe_context_report(conversation_context_diagnostics)
 
     live_gates = [
@@ -1190,24 +1238,31 @@ def build_v2_shadow_acceptance_snapshot(
     }
 
     unified_assessment_blockers = []
-    for key in (
-        "processing_errors",
-        "behavior_changed_runs",
-        "new_authority_applied_runs",
+    for runtime_key, blocker_name in (
+        ("runtime_processing_errors", "processing_errors"),
+        ("runtime_behavior_changed_runs", "behavior_changed_runs"),
+        (
+            "runtime_new_authority_applied_runs",
+            "new_authority_applied_runs",
+        ),
     ):
-        if int(unified_assessment.get(key, 0) or 0):
-            unified_assessment_blockers.append(key)
+        if int(unified_assessment.get(runtime_key, 0) or 0):
+            unified_assessment_blockers.append(blocker_name)
     if unified_assessment.get("content_fields_present"):
         unified_assessment_blockers.append("content_fields_present")
     if int(
-        unified_assessment.get("payload_grounding_failure_runs", 0) or 0
+        unified_assessment.get(
+            "runtime_payload_grounding_failure_runs",
+            0,
+        )
+        or 0
     ):
         unified_assessment_blockers.append(
             "payload_grounding_failure_runs"
         )
     if int(
         unified_assessment.get(
-            "response_coherence_failure_runs",
+            "runtime_response_coherence_failure_runs",
             0,
         )
         or 0
@@ -1221,7 +1276,7 @@ def build_v2_shadow_acceptance_snapshot(
         )
     if int(
         unified_assessment.get(
-            "scoped_canary_invalid_scope_runs",
+            "runtime_scoped_canary_invalid_scope_runs",
             0,
         )
         or 0
@@ -1261,6 +1316,14 @@ def build_v2_shadow_acceptance_snapshot(
         warnings.append("moment_episode_review_pending")
     if relationship.get("legacy_v2_comparison") == "not_collected":
         warnings.append("relationship_legacy_v2_comparison_not_collected")
+    if any(
+        int(relationship.get(key, 0) or 0)
+        for key in (
+            "retired_ledger_link_integrity_observations",
+            "retired_moment_link_integrity_observations",
+        )
+    ):
+        warnings.append("relationship_retired_link_anomalies_retained_for_audit")
     if int(governance.get("aggregateDiagnosticRuns", 0) or 0) < int(
         governance.get("runs", 0) or 0
     ):
@@ -1269,9 +1332,36 @@ def build_v2_shadow_acceptance_snapshot(
         warnings.append("governance_legacy_safe_exclusions_reclassified")
     if (
         gates.get("unified_response_assessment_shadow_effective")
-        and int(unified_assessment.get("runs", 0) or 0) == 0
+        and int(unified_assessment.get("runtime_runs", 0) or 0) == 0
     ):
-        warnings.append("unified_assessment_no_response_evidence")
+        warnings.append("unified_assessment_no_current_runtime_evidence")
+    if (
+        int(unified_assessment.get("payload_grounding_failure_runs", 0) or 0)
+        > int(
+            unified_assessment.get(
+                "runtime_payload_grounding_failure_runs",
+                0,
+            )
+            or 0
+        )
+        or int(
+            unified_assessment.get(
+                "response_coherence_failure_runs",
+                0,
+            )
+            or 0
+        )
+        > int(
+            unified_assessment.get(
+                "runtime_response_coherence_failure_runs",
+                0,
+            )
+            or 0
+        )
+    ):
+        warnings.append(
+            "unified_assessment_historical_failures_outside_runtime_window"
+        )
     if any(
         int(unified_assessment.get(key, 0) or 0)
         for key in (
@@ -1284,7 +1374,11 @@ def build_v2_shadow_acceptance_snapshot(
     if int(unified_assessment.get("visible_control_marker_runs", 0) or 0):
         warnings.append("unified_assessment_visible_control_marker_review")
     if int(
-        unified_assessment.get("response_coherence_review_runs", 0) or 0
+        unified_assessment.get(
+            "runtime_response_coherence_review_runs",
+            0,
+        )
+        or 0
     ):
         warnings.append("unified_assessment_response_coherence_review")
     if int(intelligence_packet.get("conflictRuns", 0) or 0):
@@ -1312,7 +1406,7 @@ def build_v2_shadow_acceptance_snapshot(
     unified_assessment_ready = bool(
         not gates.get("unified_response_assessment_shadow_requested")
         or (
-            int(unified_assessment.get("runs", 0) or 0) > 0
+            int(unified_assessment.get("runtime_runs", 0) or 0) > 0
             and not unified_assessment_blockers
         )
     )
@@ -1431,6 +1525,10 @@ def build_v2_shadow_acceptance_snapshot(
                 )
             ),
             "evidenceObserved": int(
+                unified_assessment.get("runtime_runs", 0) or 0
+            )
+            > 0,
+            "retainedEvidenceObserved": int(
                 unified_assessment.get("runs", 0) or 0
             )
             > 0,
@@ -1722,9 +1820,17 @@ def render_v2_shadow_acceptance_lines(snapshot: Mapping[str, Any]) -> List[str]:
             (relationship.get("evidenceWindow") or {}).get("last", "none"),
         ),
         "- relationship_withheld_reasons: `%s`" % json.dumps(relationship.get("withheld_reasons", {}), sort_keys=True),
-        "- relationship_link_integrity: ledger=`%s` moments=`%s`" % (
+        "- relationship_link_integrity: active_ledger=`%s` active_moments=`%s` retired_ledger_audit=`%s` retired_moments_audit=`%s`" % (
             relationship.get("ledger_link_integrity_violations", 0),
             relationship.get("moment_link_integrity_violations", 0),
+            relationship.get(
+                "retired_ledger_link_integrity_observations",
+                0,
+            ),
+            relationship.get(
+                "retired_moment_link_integrity_observations",
+                0,
+            ),
         ),
         "- relationship_legacy_v2_comparison: `%s`" % relationship.get("legacy_v2_comparison", "not_collected"),
         "- unified_intelligence_packet: status=`%s` requested=`%s` effective=`%s` reason=`%s` schema=`%s` runs=`%s` items=`%s` lanes=`%s` sources=`%s` atomic_states=`%s` missing=`%s` conflicts=`%s` revalidation=`%s` source_changes=`%s` errors=`%s` invalid_invariants=`%s` prompt_applied=`%s` live_applied=`%s` content_fields=`%s` window_last=`%s`" % (
@@ -2010,6 +2116,42 @@ def render_v2_shadow_acceptance_lines(snapshot: Mapping[str, Any]) -> List[str]:
             unified_assessment.get("criterion_total", 0),
             unified_assessment.get("option_total", 0),
             unified_assessment.get("ambiguity_reason_total", 0),
+        ),
+        "- unified_assessment_runtime_window: since=`%s` runs=`%s` grounding_failures=`%s` coherence_failures=`%s` coherence_reviews=`%s` errors=`%s` behavior_changes=`%s` new_authority=`%s` canary_runs=`%s` invalid_canary_scope=`%s` window_first=`%s` window_last=`%s`" % (
+            unified_assessment.get(
+                "runtime_evidence_since",
+                "all_retained",
+            ),
+            unified_assessment.get("runtime_runs", 0),
+            unified_assessment.get(
+                "runtime_payload_grounding_failure_runs",
+                0,
+            ),
+            unified_assessment.get(
+                "runtime_response_coherence_failure_runs",
+                0,
+            ),
+            unified_assessment.get(
+                "runtime_response_coherence_review_runs",
+                0,
+            ),
+            unified_assessment.get("runtime_processing_errors", 0),
+            unified_assessment.get("runtime_behavior_changed_runs", 0),
+            unified_assessment.get(
+                "runtime_new_authority_applied_runs",
+                0,
+            ),
+            unified_assessment.get("runtime_scoped_canary_runs", 0),
+            unified_assessment.get(
+                "runtime_scoped_canary_invalid_scope_runs",
+                0,
+            ),
+            (
+                unified_assessment.get("runtime_evidence_window") or {}
+            ).get("first", "none"),
+            (
+                unified_assessment.get("runtime_evidence_window") or {}
+            ).get("last", "none"),
         ),
         "- unified_moment_canary: runs=`%s` episode_context=`%s` guards=`%s/%s` output_leak_guards=`%s` invalid_scope=`%s`" % (
             unified_assessment.get("scoped_canary_runs", 0),

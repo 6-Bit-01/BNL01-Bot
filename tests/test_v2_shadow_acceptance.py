@@ -64,12 +64,13 @@ class V2ShadowAcceptanceTests(unittest.TestCase):
         self.conn.close()
         self.environment.stop()
 
-    def snapshot(self, environ=None, context=None):
+    def snapshot(self, environ=None, context=None, runtime_since=""):
         return build_v2_shadow_acceptance_snapshot(
             self.conn,
             guild_id=1,
             environ=environ or {},
             conversation_context_diagnostics=context,
+            runtime_evidence_since=runtime_since,
         )
 
     def test_defaults_are_reporting_only_and_all_shadow_stages_are_disabled(self):
@@ -389,6 +390,165 @@ class V2ShadowAcceptanceTests(unittest.TestCase):
             render_v2_shadow_acceptance_lines(snapshot)
         )
         self.assertIn("contradictions=`1`", rendered)
+
+    def test_pre_runtime_failures_remain_visible_without_blocking_fresh_evidence(self):
+        assessment = build_unified_response_assessment(
+            guild_id=1,
+            route_mode="normal_chat",
+            channel_policy="sealed_test",
+            conversation_surface="test",
+            current_speaker_user_ids=(99,),
+        )
+        persist_unified_assessment_shadow_run(
+            self.conn,
+            assessment,
+            response="Earlier response.",
+            created_at="2026-07-29T15:38:01+00:00",
+        )
+        persist_unified_assessment_shadow_run(
+            self.conn,
+            assessment,
+            response="Current response.",
+            created_at="2026-07-30T12:20:00+00:00",
+        )
+        self.conn.execute(
+            """
+            UPDATE unified_response_assessment_shadow_runs
+            SET response_coherence_status='failed',
+                payload_grounding_status='stale_thread_substitution'
+            WHERE created_at='2026-07-29T15:38:01+00:00'
+            """
+        )
+        self.conn.commit()
+        environ = {
+            "BNL_MEMORY_LEDGER_SHADOW_ENABLED": "true",
+            "BNL_MOMENT_ENGINE_SHADOW_ENABLED": "true",
+            "BNL_MEMORY_GOVERNANCE_SHADOW_ENABLED": "true",
+            "BNL_RELATIONSHIP_V2_SHADOW_ENABLED": "true",
+        }
+
+        snapshot = self.snapshot(
+            environ,
+            runtime_since="2026-07-30T12:14:00+00:00",
+        )
+        report = snapshot["reports"]["unifiedResponseAssessment"]
+        self.assertEqual(report["runs"], 2)
+        self.assertEqual(report["response_coherence_failure_runs"], 1)
+        self.assertEqual(report["payload_grounding_failure_runs"], 1)
+        self.assertEqual(report["runtime_runs"], 1)
+        self.assertEqual(
+            report["runtime_response_coherence_failure_runs"],
+            0,
+        )
+        self.assertEqual(
+            report["runtime_payload_grounding_failure_runs"],
+            0,
+        )
+        self.assertNotIn(
+            "unified_response_assessment:"
+            "response_coherence_failure_runs",
+            snapshot["blockers"],
+        )
+        self.assertNotIn(
+            "unified_response_assessment:"
+            "payload_grounding_failure_runs",
+            snapshot["blockers"],
+        )
+        self.assertIn(
+            "unified_assessment_historical_failures_outside_runtime_window",
+            snapshot["warnings"],
+        )
+        rendered = "\n".join(
+            render_v2_shadow_acceptance_lines(snapshot)
+        )
+        self.assertIn(
+            "unified_assessment_runtime_window: "
+            "since=`2026-07-30T12:14:00+00:00` runs=`1`",
+            rendered,
+        )
+
+    def test_current_runtime_failure_remains_a_hard_blocker(self):
+        assessment = build_unified_response_assessment(
+            guild_id=1,
+            route_mode="normal_chat",
+            channel_policy="sealed_test",
+            conversation_surface="test",
+            current_speaker_user_ids=(99,),
+        )
+        persist_unified_assessment_shadow_run(
+            self.conn,
+            assessment,
+            response="Current response.",
+            created_at="2026-07-30T12:20:00+00:00",
+        )
+        self.conn.execute(
+            """
+            UPDATE unified_response_assessment_shadow_runs
+            SET response_coherence_status='failed'
+            WHERE created_at='2026-07-30T12:20:00+00:00'
+            """
+        )
+        self.conn.commit()
+
+        snapshot = self.snapshot(
+            {
+                "BNL_MEMORY_LEDGER_SHADOW_ENABLED": "true",
+                "BNL_MOMENT_ENGINE_SHADOW_ENABLED": "true",
+                "BNL_MEMORY_GOVERNANCE_SHADOW_ENABLED": "true",
+                "BNL_RELATIONSHIP_V2_SHADOW_ENABLED": "true",
+            },
+            runtime_since="2026-07-30T12:14:00+00:00",
+        )
+        report = snapshot["reports"]["unifiedResponseAssessment"]
+        self.assertEqual(
+            report["runtime_response_coherence_failure_runs"],
+            1,
+        )
+        self.assertIn(
+            "unified_response_assessment:"
+            "response_coherence_failure_runs",
+            snapshot["blockers"],
+        )
+
+    def test_pre_runtime_receipts_cannot_satisfy_current_evidence(self):
+        assessment = build_unified_response_assessment(
+            guild_id=1,
+            route_mode="normal_chat",
+            channel_policy="sealed_test",
+            conversation_surface="test",
+            current_speaker_user_ids=(99,),
+        )
+        persist_unified_assessment_shadow_run(
+            self.conn,
+            assessment,
+            response="Earlier response.",
+            created_at="2026-07-29T15:38:01+00:00",
+        )
+        self.conn.commit()
+
+        snapshot = self.snapshot(
+            {
+                "BNL_MEMORY_LEDGER_SHADOW_ENABLED": "true",
+                "BNL_MOMENT_ENGINE_SHADOW_ENABLED": "true",
+                "BNL_MEMORY_GOVERNANCE_SHADOW_ENABLED": "true",
+                "BNL_RELATIONSHIP_V2_SHADOW_ENABLED": "true",
+            },
+            runtime_since="2026-07-30T12:14:00+00:00",
+        )
+        report = snapshot["reports"]["unifiedResponseAssessment"]
+        overlay = snapshot["unifiedResponseAssessmentShadow"]
+        self.assertEqual(report["runs"], 1)
+        self.assertEqual(report["runtime_runs"], 0)
+        self.assertTrue(overlay["retainedEvidenceObserved"])
+        self.assertFalse(overlay["evidenceObserved"])
+        self.assertIn(
+            "unified_assessment_no_current_runtime_evidence",
+            snapshot["warnings"],
+        )
+        self.assertNotEqual(
+            snapshot["status"],
+            "ready_for_owner_review_not_live_cutover",
+        )
 
     def test_missing_schemas_are_reported_without_creating_tables(self):
         empty = sqlite3.connect(":memory:")
@@ -965,6 +1125,72 @@ class V2ShadowAcceptanceTests(unittest.TestCase):
             "relationship_v2:moment_link_integrity_violations",
             snapshot["blockers"],
         )
+
+    def test_retracted_moment_link_anomaly_is_audit_only(self):
+        event_id = observe_message(
+            self.conn,
+            guild_id=1,
+            user_id=2,
+            role="user",
+            content="thank you",
+            source_row_id="retired-link",
+            channel_policy="public_home",
+            route_mode="normal_chat",
+            directed=True,
+            observed_at="2026-07-19T00:00:00+00:00",
+        )
+        self.conn.execute(
+            """
+            INSERT INTO memory_moment_windows (
+                moment_id,guild_id,channel_id,topic_key,
+                window_started_at,last_activity_at,lifecycle_status,
+                created_at,updated_at
+            ) VALUES (?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                "retired-moment",
+                1,
+                100,
+                "retired-link",
+                "2026-07-19T00:00:00+00:00",
+                "2026-07-19T00:01:00+00:00",
+                "finalized",
+                "2026-07-19T00:00:00+00:00",
+                "2026-07-19T00:01:00+00:00",
+            ),
+        )
+        self.conn.execute(
+            "INSERT INTO relationship_event_moment_links_v2 VALUES "
+            "(?, 'retired-moment', 1, 2, 'retracted', ?, ?)",
+            (
+                event_id,
+                "2026-07-19T00:00:00+00:00",
+                "2026-07-19T00:01:00+00:00",
+            ),
+        )
+        self.conn.commit()
+
+        snapshot = self.snapshot(
+            {"BNL_RELATIONSHIP_V2_SHADOW_ENABLED": "true"}
+        )
+        report = snapshot["reports"]["relationshipV2"]
+        self.assertEqual(report["moment_link_integrity_violations"], 0)
+        self.assertEqual(
+            report["retired_moment_link_integrity_observations"],
+            1,
+        )
+        self.assertNotIn(
+            "relationship_v2:moment_link_integrity_violations",
+            snapshot["blockers"],
+        )
+        self.assertIn(
+            "relationship_retired_link_anomalies_retained_for_audit",
+            snapshot["warnings"],
+        )
+        rendered = "\n".join(
+            render_v2_shadow_acceptance_lines(snapshot)
+        )
+        self.assertIn("retired_moments_audit=`1`", rendered)
 
     def test_live_emission_authorization_or_actual_emission_is_a_hard_stop(self):
         observe_message(
