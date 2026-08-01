@@ -19,10 +19,15 @@ import uuid
 from typing import Any, Mapping, Sequence
 
 from bnl_canon_source_contract import (
+    AUTOMATIC_CANON_SIGNAL_IDENTITIES,
     CANON_FACTS,
+    CANON_MEMBER_IDENTITIES,
     CANON_SOURCE_CONTRACT_VERSION,
     Confidence,
     SourceClass,
+    SubjectIdentity,
+    matching_canon_member_identities,
+    normalize_canon_identity_label,
 )
 from bnl_memory_governance import (
     APPROVED_MEMBER_SCALAR_PREDICATES,
@@ -123,15 +128,27 @@ _BROAD_PROFILE_LANE_CAPS = {
     "canon": 1,
     "source_file": 1,
 }
-_PROFILE_MEMBER_EVIDENCE_LANES = frozenset(
+_PROFILE_DURABLE_MEMBER_EVIDENCE_LANES = frozenset(
     {"approved_fact", "atomic_knowledge", "moment"}
+)
+_PROFILE_MEMBER_EVIDENCE_LANES = (
+    _PROFILE_DURABLE_MEMBER_EVIDENCE_LANES
+    | {"assessment_observation"}
 )
 _PROFILE_CANON_MATCH_LANES = (
     _PROFILE_MEMBER_EVIDENCE_LANES
-    | {"assessment_observation", "conversation_context"}
+    | {"conversation_context"}
 )
 _ROOT_COLLAPSE_MEMBER_LANES = (
-    _PROFILE_MEMBER_EVIDENCE_LANES | {"conversation_context"}
+    _PROFILE_DURABLE_MEMBER_EVIDENCE_LANES
+    | {"conversation_context"}
+)
+_CANON_IDENTITY_MIN_STABLE_ROWS = 2
+_AUTOMATIC_CANON_SIGNAL_SUBJECT_KEYS = frozenset(
+    subject.key for subject in AUTOMATIC_CANON_SIGNAL_IDENTITIES
+)
+_CANON_MEMBER_SUBJECT_KEYS = frozenset(
+    subject.key for subject in CANON_MEMBER_IDENTITIES
 )
 _PROFILE_PROJECT_SCOPE_RE = re.compile(
     r"\b(?:barcode(?:\s+(?:network|radio))?|"
@@ -254,6 +271,7 @@ class IntelligencePacketRequest:
     subject_user_id: int
     route_mode: str
     conversation_surface: str
+    subject_display_name: str = ""
     channel_id: int = 0
     channel_name: str = ""
     channel_policy: str = "unknown"
@@ -317,6 +335,8 @@ class IntelligencePacketDiagnostics:
     duplicate_suppression: int = 0
     root_collapse_suppression: int = 0
     shared_root_projection_count: int = 0
+    canon_identity_status: str = "not_evaluated"
+    canon_identity_stable_row_count: int = 0
     processing_errors: list[str] = field(default_factory=list)
     invalid_invariants: list[str] = field(default_factory=list)
     revalidation_status: str = "not_evaluated"
@@ -345,6 +365,22 @@ class ProfileSufficiency:
     independent_root_count: int = 0
     independent_occurrence_count: int = 0
     reason_codes: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class _CanonIdentitySignal:
+    status: str
+    subject: SubjectIdentity | None = None
+    stable_row_count: int = 0
+    evidence_digest: str = ""
+
+    @property
+    def recognized(self) -> bool:
+        return bool(
+            self.status == "recognized"
+            and self.subject is not None
+            and self.evidence_digest
+        )
 
 
 @dataclass(frozen=True)
@@ -501,6 +537,153 @@ def _stable_json(value: Any) -> str:
 def _digest(*values: Any) -> str:
     payload = "\x1f".join(_stable_json(value) for value in values)
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _table_columns(
+    conn: sqlite3.Connection,
+    table_name: str,
+) -> set[str]:
+    if not conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+        (str(table_name or ""),),
+    ).fetchone():
+        return set()
+    return {
+        str(row[1] or "")
+        for row in conn.execute(
+            "PRAGMA table_info(%s)" % str(table_name or "")
+        ).fetchall()
+        if len(row) > 1 and str(row[1] or "")
+    }
+
+
+def _canon_identity_signal(
+    conn: sqlite3.Connection,
+    request: IntelligencePacketRequest,
+) -> _CanonIdentitySignal:
+    """Recognize one reversible same-platform canon signal.
+
+    This is deliberately not an account merge. A current exact approved label
+    must agree with at least two active public Ledger roots carrying that same
+    Discord label, and every current label must resolve unambiguously.
+    """
+
+    if (
+        int(request.guild_id or 0) <= 0
+        or int(request.subject_user_id or 0) <= 0
+    ):
+        return _CanonIdentitySignal("invalid_subject_scope")
+    labels = [str(request.subject_display_name or "")]
+    profile_columns = _table_columns(conn, "user_profiles")
+    if {
+        "guild_id",
+        "user_id",
+    }.issubset(profile_columns):
+        selected = tuple(
+            column
+            for column in ("display_name", "preferred_name")
+            if column in profile_columns
+        )
+        if selected:
+            row = conn.execute(
+                "SELECT %s FROM user_profiles WHERE guild_id=? AND user_id=?"
+                % ",".join(selected),
+                (
+                    int(request.guild_id or 0),
+                    int(request.subject_user_id or 0),
+                ),
+            ).fetchone()
+            if row:
+                labels.extend(str(value or "") for value in row)
+    current_labels = tuple(
+        dict.fromkeys(
+            normalized
+            for normalized in (
+                normalize_canon_identity_label(label) for label in labels
+            )
+            if normalized
+        )
+    )
+    if not current_labels:
+        return _CanonIdentitySignal("current_label_unavailable")
+    matches = tuple(
+        subject
+        for subject in matching_canon_member_identities(current_labels)
+        if subject.key in _AUTOMATIC_CANON_SIGNAL_SUBJECT_KEYS
+    )
+    if not matches:
+        return _CanonIdentitySignal("no_exact_canon_label")
+    if len(matches) != 1:
+        return _CanonIdentitySignal("ambiguous_canon_label")
+    subject = matches[0]
+    subject_key = subject_key_for_user(request.subject_user_id)
+    ledger_columns = _table_columns(conn, "memory_ledger_entries")
+    required_ledger_columns = {
+        "entry_id",
+        "guild_id",
+        "subject_key",
+        "subject_display_name",
+        "source_table",
+        "source_role",
+        "channel_policy",
+        "visibility",
+        "public_usable",
+        "derived",
+        "projection",
+        "lifecycle_status",
+    }
+    if not required_ledger_columns.issubset(ledger_columns):
+        return _CanonIdentitySignal("stable_history_unavailable")
+    history_rows = conn.execute(
+        """
+        SELECT entry_id,subject_display_name
+        FROM memory_ledger_entries
+        WHERE guild_id=? AND subject_key=?
+          AND source_table='conversations' AND source_role='user'
+          AND channel_policy IN (
+            'public_home','public_context','public_selective'
+          )
+          AND visibility IN ('public','public_safe')
+          AND public_usable=1 AND derived=0 AND projection=0
+          AND lifecycle_status='active'
+        ORDER BY observed_at DESC,source_sequence DESC,entry_id DESC
+        LIMIT 256
+        """,
+        (int(request.guild_id or 0), subject_key),
+    ).fetchall()
+    stable_rows = []
+    for entry_id, display_name in history_rows:
+        row_matches = matching_canon_member_identities((display_name,))
+        if len(row_matches) != 1 or row_matches[0].key != subject.key:
+            continue
+        stable_rows.append(
+            (
+                str(entry_id or ""),
+                normalize_canon_identity_label(display_name),
+            )
+        )
+    stable_rows = list(dict.fromkeys(stable_rows))
+    if len(stable_rows) < _CANON_IDENTITY_MIN_STABLE_ROWS:
+        return _CanonIdentitySignal(
+            "stable_history_insufficient",
+            subject=subject,
+            stable_row_count=len(stable_rows),
+        )
+    evidence_digest = _digest(
+        "same_platform_canon_signal_v1",
+        CANON_SOURCE_CONTRACT_VERSION,
+        int(request.guild_id or 0),
+        subject_key,
+        subject.key,
+        current_labels,
+        tuple(sorted(stable_rows)),
+    )
+    return _CanonIdentitySignal(
+        "recognized",
+        subject=subject,
+        stable_row_count=len(stable_rows),
+        evidence_digest=evidence_digest,
+    )
 
 
 def _terms(value: Any) -> set[str]:
@@ -667,12 +850,23 @@ def _profile_canon_anchor(
 ) -> IntelligencePacketItem | None:
     """Choose one canon point that best contextualizes selected public work."""
 
-    if (
-        not _broad_profile_request(request.user_text)
-        or not _profile_project_request(request.user_text)
-    ):
+    if not _broad_profile_request(request.user_text):
         return None
     subject = subject_key_for_user(request.subject_user_id)
+    recognized = tuple(
+        item
+        for item in candidates
+        if item.lane == "canon"
+        and item.source_type == "recognized_canon_fact"
+        and item.subject_key == subject
+    )
+    if recognized:
+        return sorted(
+            recognized,
+            key=lambda item: (-item.score, item.source_ref),
+        )[0]
+    if not _profile_project_request(request.user_text):
+        return None
     member_terms: set[str] = set()
     for item in candidates:
         if (
@@ -1982,7 +2176,21 @@ def _canon_digest(fact: Any) -> str:
     )
 
 
+def _recognized_canon_digest(
+    fact: Any,
+    signal: _CanonIdentitySignal,
+    subject_key: str,
+) -> str:
+    return _digest(
+        "recognized_canon_fact_v1",
+        _canon_digest(fact),
+        signal.evidence_digest,
+        str(subject_key or ""),
+    )
+
+
 def _canon_items(
+    conn: sqlite3.Connection,
     request: IntelligencePacketRequest,
     diagnostics: IntelligencePacketDiagnostics,
     exclusions: list[IntelligencePacketExclusion],
@@ -1991,7 +2199,78 @@ def _canon_items(
 ) -> list[IntelligencePacketItem]:
     items: list[IntelligencePacketItem] = []
     lowered = str(request.user_text or "").lower()
+    broad = _broad_profile_request(request.user_text)
+    subject_key = subject_key_for_user(request.subject_user_id)
+    signal = _canon_identity_signal(conn, request)
+    diagnostics.canon_identity_status = signal.status
+    diagnostics.canon_identity_stable_row_count = int(
+        signal.stable_row_count or 0
+    )
+    recognized_fact_keys = set()
+    if broad and signal.recognized and signal.subject is not None:
+        for fact in CANON_FACTS:
+            if fact.subject.key != signal.subject.key:
+                continue
+            recognized_fact_keys.add((fact.subject.key, fact.predicate))
+            value = _canon_value(fact.value)
+            fact_text = "%s %s: %s" % (
+                fact.subject.name,
+                fact.predicate.replace("_", " "),
+                value,
+            )
+            diagnostics.candidates_by_lane["canon"] = (
+                diagnostics.candidates_by_lane.get("canon", 0) + 1
+            )
+            source_digest = _recognized_canon_digest(
+                fact,
+                signal,
+                subject_key,
+            )
+            item = IntelligencePacketItem(
+                lane="canon",
+                source_class=fact.source_class.value,
+                source_type="recognized_canon_fact",
+                source_ref=(
+                    "canon_signal:%s:%s:%s"
+                    % (
+                        CANON_SOURCE_CONTRACT_VERSION,
+                        fact.subject.key,
+                        fact.predicate,
+                    )
+                ),
+                source_digest=source_digest,
+                subject_key=subject_key,
+                predicate_key=fact.predicate,
+                text=fact_text[:1000],
+                visibility=fact.visibility.value,
+                confidence=fact.confidence.value,
+                lifecycle="approved",
+                authority=_AUTHORITY_RANK[fact.source_class.value],
+                participants=(subject_key,),
+                observed_at="",
+                usage="content",
+                score=(
+                    120.0
+                    if fact.predicate == "primary_identity"
+                    else 104.0
+                ),
+                revalidation_kind="recognized_canon",
+                revalidation_key=source_digest,
+            )
+            if not _route_allows_item(request, item):
+                diagnostics.visibility_exclusions += 1
+                _add_exclusion(
+                    diagnostics,
+                    exclusions,
+                    lane="canon",
+                    reason="canon_visibility",
+                    source_class=item.source_class,
+                )
+                continue
+            items.append(item)
     for fact in CANON_FACTS:
+        if (fact.subject.key, fact.predicate) in recognized_fact_keys:
+            continue
         value = _canon_value(fact.value)
         fact_text = "%s %s: %s" % (
             fact.subject.name,
@@ -2004,6 +2283,11 @@ def _canon_items(
             for alias in aliases
             if alias
         )
+        if (
+            fact.subject.key in _CANON_MEMBER_SUBJECT_KEYS
+            and not alias_relevant
+        ):
+            continue
         if not alias_relevant and not (
             request_terms
             & (
@@ -2338,6 +2622,21 @@ def _select_items(
         exclusions,
     )
     canon_anchor = _profile_canon_anchor(request, candidates)
+    subject_key = subject_key_for_user(request.subject_user_id)
+    recognized_canon_signal = any(
+        item.lane == "canon"
+        and item.source_type == "recognized_canon_fact"
+        and item.subject_key == subject_key
+        for item in candidates
+    )
+    durable_member_candidate = any(
+        item.lane in _PROFILE_DURABLE_MEMBER_EVIDENCE_LANES
+        and item.subject_key == subject_key
+        and item.point_identity
+        and item.root_identities
+        and item.occurrence_identities
+        for item in candidates
+    )
     profile_candidates: list[IntelligencePacketItem] = []
     broad_lane_priority = {
         "current_intent": 0,
@@ -2376,7 +2675,14 @@ def _select_items(
     lane_counts: Counter[str] = Counter()
     used = 0
     budget = min(max(int(request.budget_chars or 2400), 400), 6000)
-    lane_caps = _BROAD_PROFILE_LANE_CAPS if broad else _LANE_CAPS
+    lane_caps = dict(
+        _BROAD_PROFILE_LANE_CAPS if broad else _LANE_CAPS
+    )
+    if broad and recognized_canon_signal and not durable_member_candidate:
+        # One stable canon-name signal may unlock one cautious historical
+        # example. It must never turn several isolated examples into a rich
+        # or durable personality profile.
+        lane_caps["assessment_observation"] = 1
     for item in ordered:
         item_roots = set(item.root_identities)
         if broad and _root_bearing_member_item(request, item) and item_roots:
@@ -2497,12 +2803,51 @@ def _profile_sufficiency(
             satisfied=True,
             reason_codes=("not_broad_profile",),
         )
-    candidate_items = tuple(
-        item for item in candidates if _profile_member_item(request, item)
+    durable_candidate_items = tuple(
+        item
+        for item in candidates
+        if _profile_member_item(request, item)
+        and item.lane in _PROFILE_DURABLE_MEMBER_EVIDENCE_LANES
     )
-    selected_items = tuple(
-        item for item in selected if _profile_member_item(request, item)
+    durable_selected_items = tuple(
+        item
+        for item in selected
+        if _profile_member_item(request, item)
+        and item.lane in _PROFILE_DURABLE_MEMBER_EVIDENCE_LANES
     )
+    recognized_canon_signal = any(
+        item.lane == "canon"
+        and item.source_type == "recognized_canon_fact"
+        and item.subject_key
+        == subject_key_for_user(request.subject_user_id)
+        for item in selected
+    )
+    observational_candidate_items = tuple(
+        item
+        for item in candidates
+        if _profile_member_item(request, item)
+        and item.lane == "assessment_observation"
+    )
+    observational_selected_items = tuple(
+        item
+        for item in selected
+        if _profile_member_item(request, item)
+        and item.lane == "assessment_observation"
+    )
+    observation_only = bool(
+        not durable_candidate_items
+        and recognized_canon_signal
+        and observational_candidate_items
+    )
+    if durable_candidate_items:
+        candidate_items = durable_candidate_items
+        selected_items = durable_selected_items
+    elif observation_only:
+        candidate_items = observational_candidate_items
+        selected_items = observational_selected_items
+    else:
+        candidate_items = ()
+        selected_items = ()
     candidate_points = {
         item.point_identity for item in candidate_items if item.point_identity
     }
@@ -2529,7 +2874,9 @@ def _profile_sufficiency(
     }
     candidate_point_count = len(candidate_points)
     required_points = (
-        2
+        1
+        if observation_only
+        else 2
         if candidate_point_count >= 2
         and len(candidate_occurrences) >= 2
         else 1
@@ -2541,7 +2888,11 @@ def _profile_sufficiency(
     if required_points == 0:
         status = "empty"
         satisfied = False
-        reasons.append("no_supported_member_evidence")
+        reasons.append(
+            "recognized_canon_without_supported_observation"
+            if recognized_canon_signal
+            else "no_supported_member_evidence"
+        )
     elif required_points == 1:
         satisfied = bool(
             len(selected_points) >= 1
@@ -2549,11 +2900,18 @@ def _profile_sufficiency(
             and len(selected_occurrences) >= 1
         )
         status = "sparse" if satisfied else "insufficient"
-        reasons.append(
-            "sparse_supported_member_evidence"
-            if satisfied
-            else "sparse_member_evidence_not_selected"
-        )
+        if observation_only:
+            reasons.append(
+                "recognized_canon_sparse_public_observation"
+                if satisfied
+                else "recognized_canon_observation_not_selected"
+            )
+        else:
+            reasons.append(
+                "sparse_supported_member_evidence"
+                if satisfied
+                else "sparse_member_evidence_not_selected"
+            )
     else:
         enough_points = len(selected_points) >= 2
         enough_roots = len(selected_roots) >= 2
@@ -2623,6 +2981,41 @@ def _canon_version(item: IntelligencePacketItem) -> str:
     return ""
 
 
+def _recognized_canon_version(
+    conn: sqlite3.Connection,
+    packet: UnifiedIntelligencePacket,
+    item: IntelligencePacketItem,
+) -> str:
+    signal = _canon_identity_signal(conn, packet.request)
+    if not signal.recognized or signal.subject is None:
+        return ""
+    parts = str(item.source_ref or "").split(":", 3)
+    if (
+        len(parts) != 4
+        or parts[0] != "canon_signal"
+        or parts[1] != CANON_SOURCE_CONTRACT_VERSION
+        or parts[2] != signal.subject.key
+    ):
+        return ""
+    predicate = parts[3]
+    fact = next(
+        (
+            candidate
+            for candidate in CANON_FACTS
+            if candidate.subject.key == signal.subject.key
+            and candidate.predicate == predicate
+        ),
+        None,
+    )
+    if fact is None:
+        return ""
+    return _recognized_canon_digest(
+        fact,
+        signal,
+        subject_key_for_user(packet.request.subject_user_id),
+    )
+
+
 def _relationship_version(
     conn: sqlite3.Connection,
     packet: UnifiedIntelligencePacket,
@@ -2665,6 +3058,12 @@ def revalidate_packet(
                 current = _atomic_candidate_digest(conn, item.revalidation_key)
             elif item.revalidation_kind == "canon":
                 current = _canon_version(item)
+            elif item.revalidation_kind == "recognized_canon":
+                current = _recognized_canon_version(
+                    conn,
+                    packet,
+                    item,
+                )
             elif item.revalidation_kind == "relationship":
                 current = _relationship_version(
                     conn,
@@ -2726,6 +3125,13 @@ def _packet_invariants(
             "provisional",
         }:
             invalid.append("atomic_state_violation")
+        if item.revalidation_kind == "recognized_canon" and not (
+            item.lane == "canon"
+            and item.source_type == "recognized_canon_fact"
+            and item.subject_key == subject
+            and item.source_class == SourceClass.APPROVED_CANON.value
+        ):
+            invalid.append("recognized_canon_scope_violation")
         if (
             item.revalidation_kind == "atomic"
             and item.source_class == SourceClass.LEGACY_SOURCE_BLIND.value
@@ -2812,6 +3218,7 @@ def build_packet(
         )
         candidates.extend(
             _canon_items(
+                conn,
                 request,
                 diagnostics,
                 exclusions,

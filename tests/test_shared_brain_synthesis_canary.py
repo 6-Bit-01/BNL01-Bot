@@ -1147,7 +1147,7 @@ class SharedBrainSynthesisCanaryTests(unittest.TestCase):
                     ),
                 )
 
-    def test_empty_or_canon_only_profile_cannot_enter_synthesis(self):
+    def test_empty_profile_uses_non_generative_honest_fallback_basis(self):
         self.conn.execute(
             """
             UPDATE memory_ledger_entries
@@ -1160,20 +1160,24 @@ class SharedBrainSynthesisCanaryTests(unittest.TestCase):
         self.assertEqual(packet.profile_sufficiency.status, "empty")
         self.assertFalse(packet.profile_sufficiency.satisfied)
         assessment = self._build_assessment(packet)
-        self.assertIsNone(
-            build_basis(
-                guild_id=1,
-                user_id=7,
-                channel_id=10,
-                route_mode="normal_chat",
-                channel_policy="public_context",
-                current_direct=True,
-                user_text=packet.request.user_text,
-                packet=packet,
-                assessment=assessment,
-                environ=self.flags,
-            )
+        basis = build_basis(
+            guild_id=1,
+            user_id=7,
+            channel_id=10,
+            route_mode="normal_chat",
+            channel_policy="public_context",
+            current_direct=True,
+            user_text=packet.request.user_text,
+            packet=packet,
+            assessment=assessment,
+            environ=self.flags,
         )
+        self.assertIsNotNone(basis)
+        self.assertTrue(basis.honest_empty_profile_fallback)
+        self.assertEqual(basis.rendered_context, "")
+        owned = build_packet_owned_prompt("Baseline prompt.", basis)
+        self.assertFalse(owned.ready)
+        self.assertEqual(owned.reason, "profile_sufficiency_empty")
 
     def test_malformed_profile_status_count_pairs_cannot_enter_synthesis(self):
         def basis_for(packet, assessment):

@@ -891,6 +891,121 @@ class ProductionShapedBroadRecallAcceptanceTests(unittest.TestCase):
         finally:
             prepared.close()
 
+    def test_stable_exact_canon_name_unlocks_one_cautious_observation(self):
+        self.add_raw_message(
+            user_id=111,
+            user_name="Mac Modem",
+            content=(
+                "I patched the signal meter so the interface stops "
+                "flickering."
+            ),
+            observed_at="2026-07-20T18:00:00+00:00",
+        )
+        self.add_raw_message(
+            user_id=111,
+            user_name="Mac Modem",
+            content=(
+                "Old modem tones could shape a short interlude in the "
+                "broadcast."
+            ),
+            observed_at="2026-07-22T18:00:00+00:00",
+        )
+        prepared = prepare_memory_preview(
+            self.request(
+                user_id=111,
+                user_name="Mac Modem",
+                wording="BNL, what am I all about?",
+            )
+        )
+        try:
+            self.assertTrue(prepared.ready)
+            self.assertEqual(prepared.diagnostics.profile_status, "sparse")
+            self.assertEqual(
+                prepared.diagnostics.canon_identity_status,
+                "recognized",
+            )
+            self.assertEqual(
+                prepared.diagnostics.canon_identity_stable_row_count,
+                2,
+            )
+            selected_observations = tuple(
+                item
+                for item in prepared.packet.items
+                if item.lane == "assessment_observation"
+            )
+            self.assertEqual(len(selected_observations), 1)
+            self.assertEqual(
+                {
+                    item.source_type
+                    for item in prepared.packet.items
+                    if item.lane == "canon"
+                },
+                {"recognized_canon_fact"},
+            )
+            self.assertFalse(
+                any(
+                    item.lane in {"atomic_knowledge", "moment"}
+                    for item in prepared.packet.items
+                )
+            )
+            evaluation = evaluate_memory_preview(
+                prepared,
+                baseline_response="The record is still thin.",
+                candidate_response=(
+                    "I recognize your signal as Mac Modem, a founding "
+                    "BARCODE member and chaotic tech entity. From your "
+                    "public appearances, I noticed you considering old "
+                    "modem tones for a short broadcast interlude."
+                ),
+            )
+            self.assertTrue(
+                evaluation.candidate_selected,
+                evaluation.fallback_reason,
+            )
+            self.assertEqual(evaluation.candidate_member_point_count, 1)
+            self.assertGreaterEqual(evaluation.candidate_canon_count, 1)
+        finally:
+            prepared.close()
+
+    def test_near_or_unstable_canon_name_does_not_resolve(self):
+        cases = (
+            (112, "Mac Modem Fan", "no_exact_canon_label"),
+            (113, "Mac Modem", "stable_history_insufficient"),
+        )
+        for user_id, user_name, expected_status in cases:
+            with self.subTest(user_name=user_name):
+                self.add_raw_message(
+                    user_id=user_id,
+                    user_name=user_name,
+                    content="I mentioned one isolated topic in passing.",
+                    observed_at="2026-07-22T18:00:00+00:00",
+                )
+                prepared = prepare_memory_preview(
+                    self.request(
+                        user_id=user_id,
+                        user_name=user_name,
+                        wording="BNL, what am I all about?",
+                    )
+                )
+                try:
+                    self.assertFalse(prepared.ready)
+                    self.assertEqual(
+                        prepared.diagnostics.profile_status,
+                        "empty",
+                    )
+                    self.assertEqual(
+                        prepared.diagnostics.canon_identity_status,
+                        expected_status,
+                    )
+                    self.assertFalse(
+                        any(
+                            item.source_type == "recognized_canon_fact"
+                            for item in prepared.packet.items
+                        )
+                    )
+                finally:
+                    prepared.close()
+
     def test_sparse_empty_and_ambiguous_profiles_do_not_invent_breadth(self):
         self.add_recurring_topic(
             user_id=106,

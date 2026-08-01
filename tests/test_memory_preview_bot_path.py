@@ -212,6 +212,45 @@ class MemoryPreviewBotPathTests(unittest.IsolatedAsyncioTestCase):
             "\n".join(result.diagnostics),
         )
 
+    async def test_empty_profile_skips_model_and_uses_honest_fallback(self):
+        generator = mock.AsyncMock(
+            return_value="Invented generic member biography."
+        )
+        guard = mock.AsyncMock(
+            side_effect=lambda response, _prompt: (
+                response,
+                {"suppressed": False, "suppression_reason": ""},
+            )
+        )
+
+        result = await bnl01_bot.execute_bnl_memory_preview(
+            source_db_path=self.db_path,
+            guild_id=1,
+            subject_user_id=8,
+            subject_display_name="Empty Member",
+            simulated_channel_id=10,
+            wording="BNL-01, what am I all about?",
+            generator=generator,
+            guard=guard,
+        )
+
+        generator.assert_not_awaited()
+        guard.assert_awaited_once()
+        self.assertFalse(result.candidate_selected)
+        self.assertEqual(
+            result.proposed_response,
+            bnl01_bot.honest_empty_profile_response(),
+        )
+        self.assertEqual(
+            result.established_response,
+            bnl01_bot.honest_empty_profile_response(),
+        )
+        self.assertEqual(result.fallback_reason, "profile_sufficiency_empty")
+        self.assertEqual(
+            result.final_selection,
+            "honest_empty_profile_fallback",
+        )
+
     async def test_rich_preview_repairs_one_category_only_draft(self):
         with sqlite3.connect(self.db_path) as conn:
             self._add_message(

@@ -245,6 +245,11 @@ _PACKET_FACTUAL_OWNER_REPLACEMENT = (
     "Use only the selected evidence block below for stored member facts, "
     "observations, episodes, and unresolved threads."
 )
+_HONEST_EMPTY_PROFILE_RESPONSE = (
+    "I do not have enough reliable public history to summarize you without "
+    "guessing. I can respond to what you say here, but the longer-term "
+    "signal is still too thin for a grounded profile."
+)
 _PROFILE_PROJECT_SCOPE_RE = re.compile(
     r"\b(?:barcode(?:\s+(?:network|radio))?|project|collective|broadcast)\b",
     re.I,
@@ -538,6 +543,8 @@ class SharedBrainSynthesisBasis:
     profile_required_point_count: int = 0
     profile_required_detail_count: int = 0
     profile_requires_canon: bool = False
+    profile_recognized_canon_identity: bool = False
+    honest_empty_profile_fallback: bool = False
 
 
 @dataclass(frozen=True)
@@ -963,6 +970,94 @@ def _profile_sufficiency_usable(
     )
 
 
+def _empty_profile_usable(
+    packet: UnifiedIntelligencePacket | None,
+    assessment: UnifiedResponseAssessment | None,
+) -> bool:
+    if (
+        packet is None
+        or not isinstance(assessment, UnifiedResponseAssessment)
+    ):
+        return False
+    profile = getattr(packet, "profile_sufficiency", None)
+    return bool(
+        str(getattr(profile, "status", "") or "").strip().lower()
+        == "empty"
+        and not bool(getattr(profile, "satisfied", False))
+        and int(getattr(profile, "required_point_count", 0) or 0) == 0
+        and int(getattr(profile, "selected_point_count", 0) or 0) == 0
+        and int(getattr(profile, "independent_root_count", 0) or 0) == 0
+        and int(
+            getattr(profile, "independent_occurrence_count", 0) or 0
+        )
+        == 0
+        and assessment.profile_sufficiency_status == "empty"
+        and not assessment.profile_sufficiency_met
+        and assessment.profile_required_point_count == 0
+        and assessment.profile_selected_point_count == 0
+        and assessment.profile_independent_root_count == 0
+        and assessment.profile_independent_occurrence_count == 0
+    )
+
+
+def honest_empty_profile_response() -> str:
+    return _HONEST_EMPTY_PROFILE_RESPONSE
+
+
+def _empty_profile_fallback_scope_enabled(
+    *,
+    guild_id: int,
+    user_id: int,
+    channel_id: int,
+    route_mode: str,
+    channel_policy: str,
+    current_direct: bool,
+    user_text: str,
+    packet: UnifiedIntelligencePacket | None,
+    assessment: UnifiedResponseAssessment | None,
+    has_media: bool = False,
+    exact_quote_requested: bool = False,
+    third_party_attribution_requested: bool = False,
+    environ: Mapping[str, str] | None = None,
+) -> bool:
+    env = os.environ if environ is None else environ
+    return bool(
+        route_scope_enabled(
+            guild_id=guild_id,
+            user_id=user_id,
+            channel_id=channel_id,
+            route_mode=route_mode,
+            channel_policy=channel_policy,
+            current_direct=current_direct,
+            user_text=user_text,
+            has_media=has_media,
+            exact_quote_requested=exact_quote_requested,
+            third_party_attribution_requested=(
+                third_party_attribution_requested
+            ),
+            environ=env,
+        )
+        and _packet_usable(packet)
+        and _empty_profile_usable(packet, assessment)
+        and isinstance(assessment, UnifiedResponseAssessment)
+        and not (
+            set(assessment.selected_lanes)
+            & _NON_PACKET_FACTUAL_OWNER_LANES
+        )
+        and packet.request.guild_id == int(guild_id or 0)
+        and packet.request.subject_user_id == int(user_id or 0)
+        and packet.request.channel_id == int(channel_id or 0)
+        and packet.request.route_mode == _ROUTE_MODE
+        and packet.request.channel_policy
+        == str(channel_policy or "").strip().lower()
+        and packet.request.direct_state == "direct"
+        and assessment.guild_id == int(guild_id or 0)
+        and assessment.route_mode == _ROUTE_MODE
+        and assessment.channel_policy
+        == str(channel_policy or "").strip().lower()
+    )
+
+
 def scope_enabled(
     *,
     guild_id: int,
@@ -1087,12 +1182,33 @@ def _profile_requires_canon(
     packet: UnifiedIntelligencePacket,
 ) -> bool:
     return bool(
-        _PROFILE_PROJECT_SCOPE_RE.search(
-            str(packet.request.user_text or "")
+        _profile_recognized_canon_identity(packet)
+        or (
+            _PROFILE_PROJECT_SCOPE_RE.search(
+                str(packet.request.user_text or "")
+            )
+            and any(
+                item.lane == "canon"
+                and _canon_relevant_to_profile_request(packet, item)
+                for item in packet.items
+            )
         )
+    )
+
+
+def _profile_recognized_canon_identity(
+    packet: UnifiedIntelligencePacket,
+) -> bool:
+    return bool(
+        str(
+            getattr(packet.profile_sufficiency, "status", "") or ""
+        ).strip().lower()
+        == "sparse"
         and any(
             item.lane == "canon"
-            and _canon_relevant_to_profile_request(packet, item)
+            and item.source_type == "recognized_canon_fact"
+            and item.subject_key
+            == subject_key_for_user(packet.request.subject_user_id)
             for item in packet.items
         )
     )
@@ -1361,13 +1477,22 @@ def render_packet_context(
         )
     else:
         profile_rule = ""
+    recognized_identity = _profile_recognized_canon_identity(packet)
     project_rule = (
-        "- The request explicitly asks for BARCODE/project context. Use one "
-        "concise context anchor after the member assessment; canon may "
-        "clarify why the observed priorities fit BARCODE, but it must not "
-        "become the answer's organizing frame.\n"
-        if _profile_requires_canon(packet)
-        else ""
+        "- A unique, historically stable same-platform name signal matches "
+        "one approved BARCODE identity. State that approved identity "
+        "directly, then give exactly one narrow public observation. Treat "
+        "the match as recognition for this response, never as a permanent "
+        "account merge or proof of private identity.\n"
+        if recognized_identity
+        else (
+            "- The request explicitly asks for BARCODE/project context. Use "
+            "one concise context anchor after the member assessment; canon "
+            "may clarify why the observed priorities fit BARCODE, but it "
+            "must not become the answer's organizing frame.\n"
+            if _profile_requires_canon(packet)
+            else ""
+        )
     )
     request_angle_rule = (
         "- This request asks how the member works and makes decisions. State "
@@ -1384,10 +1509,16 @@ def render_packet_context(
         + "\nResponse rules:\n"
         "- Answer the current user naturally in BNL's established voice; do "
         "not recite this evidence as a database report.\n"
-        "- Lead with member-specific substance. Relevant BARCODE canon may "
-        "add one concise context anchor afterward, but can never substitute "
-        "for the public assessment or become its governing frame.\n"
-        "- Look across the selected observations for a useful throughline. "
+        + (
+            "- Lead with the approved recognized identity, then immediately "
+            "ground the rest in the single selected public observation.\n"
+            if recognized_identity
+            else "- Lead with member-specific substance. Relevant BARCODE "
+            "canon may add one concise context anchor afterward, but can "
+            "never substitute for the public assessment or become its "
+            "governing frame.\n"
+        )
+        + "- Look across the selected observations for a useful throughline. "
         "Separate what is directly known, what BNL has observed, and BNL's "
         "revisable opinion. Frame interpretation naturally as a read or "
         "impression instead of presenting it as a stored fact.\n"
@@ -1457,7 +1588,7 @@ def build_basis(
     environ: Mapping[str, str] | None = None,
 ) -> SharedBrainSynthesisBasis | None:
     env = os.environ if environ is None else environ
-    if not scope_enabled(
+    grounded_scope = scope_enabled(
         guild_id=guild_id,
         user_id=user_id,
         channel_id=channel_id,
@@ -1473,17 +1604,52 @@ def build_basis(
             third_party_attribution_requested
         ),
         environ=env,
+    )
+    empty_fallback_scope = bool(
+        not grounded_scope
+        and _empty_profile_fallback_scope_enabled(
+            guild_id=guild_id,
+            user_id=user_id,
+            channel_id=channel_id,
+            route_mode=route_mode,
+            channel_policy=channel_policy,
+            current_direct=current_direct,
+            user_text=user_text,
+            packet=packet,
+            assessment=assessment,
+            has_media=has_media,
+            exact_quote_requested=exact_quote_requested,
+            third_party_attribution_requested=(
+                third_party_attribution_requested
+            ),
+            environ=env,
+        )
+    )
+    if (
+        not grounded_scope
+        and not empty_fallback_scope
+    ):
+        return None
+    if packet is None or not isinstance(
+        assessment,
+        UnifiedResponseAssessment,
     ):
         return None
     authority_mode = str(configuration(env)["authority_mode"])
-    (
-        rendered,
-        lane_counts,
-        item_count,
-        source_digests,
-    ) = render_packet_context(packet)
-    if not rendered or not item_count:
-        return None
+    if empty_fallback_scope:
+        rendered = ""
+        lane_counts = ()
+        item_count = 0
+        source_digests = ()
+    else:
+        (
+            rendered,
+            lane_counts,
+            item_count,
+            source_digests,
+        ) = render_packet_context(packet)
+        if not rendered or not item_count:
+            return None
     factual_contexts = tuple(
         dict.fromkeys(
             str(value or "")
@@ -1529,6 +1695,10 @@ def build_basis(
             packet
         ),
         profile_requires_canon=_profile_requires_canon(packet),
+        profile_recognized_canon_identity=(
+            _profile_recognized_canon_identity(packet)
+        ),
+        honest_empty_profile_fallback=empty_fallback_scope,
     )
 
 
@@ -1599,9 +1769,18 @@ def revalidate_basis(
         != basis.profile_required_detail_count
         or _profile_requires_canon(basis.packet)
         != basis.profile_requires_canon
-        or not _profile_sufficiency_usable(
-            basis.packet,
-            basis.assessment,
+        or _profile_recognized_canon_identity(basis.packet)
+        != basis.profile_recognized_canon_identity
+        or (
+            not _empty_profile_usable(
+                basis.packet,
+                basis.assessment,
+            )
+            if basis.honest_empty_profile_fallback
+            else not _profile_sufficiency_usable(
+                basis.packet,
+                basis.assessment,
+            )
         )
     ):
         return False, "scope_or_basis_changed"
@@ -1622,6 +1801,12 @@ def build_packet_owned_prompt(
     """
 
     updated = str(prompt or "")
+    if basis.honest_empty_profile_fallback:
+        return PacketOwnedPrompt(
+            prompt=updated,
+            ready=False,
+            reason="profile_sufficiency_empty",
+        )
     if not updated.strip():
         return PacketOwnedPrompt(
             prompt=updated,
@@ -1765,10 +1950,14 @@ def build_profile_candidate_repair_prompt(
             "request. The claim audit below is controlling for the old draft."
         ),
         (
-            "Begin immediately with a concrete member-specific detail from a "
-            "KEEP_SUPPORTED unit or evidence line. A creative assessment may "
-            "share that opening sentence when it is explicitly tied to those "
-            "details; do not begin with an unframed broad label."
+            "Begin with the one approved recognized identity, then immediately "
+            "give the single concrete KEEP_SUPPORTED public observation. Do "
+            "not describe the match as a permanent account merge."
+            if basis.profile_recognized_canon_identity
+            else "Begin immediately with a concrete member-specific detail "
+            "from a KEEP_SUPPORTED unit or evidence line. A creative "
+            "assessment may share that opening sentence when it is explicitly "
+            "tied to those details; do not begin with an unframed broad label."
         ),
         (
             "Use at least %s materially distinct supported member points."
@@ -1790,9 +1979,12 @@ def build_profile_candidate_repair_prompt(
             else "Keep every personal claim within the supported evidence."
         ),
         (
-            "After the member assessment, use one concise relevant approved "
-            "BARCODE canon point as context. Do not organize the answer "
-            "around canon or let it displace public member evidence."
+            "Use the one approved recognized identity and exactly one public "
+            "observation; neither licenses a broader personality profile."
+            if basis.profile_recognized_canon_identity
+            else "After the member assessment, use one concise relevant "
+            "approved BARCODE canon point as context. Do not organize the "
+            "answer around canon or let it displace public member evidence."
             if basis.profile_requires_canon
             else "Use BARCODE canon only when it helps answer the request; it "
             "is not a required ingredient and must not become the answer's "
@@ -2523,7 +2715,10 @@ def candidate_profile_coverage(
     lore_dominant = bool(
         canon_only_claims
         and (
-            not member_first
+            (
+                not member_first
+                and not basis.profile_recognized_canon_identity
+            )
             or canon_only_claims > member_supported_claims
         )
     )

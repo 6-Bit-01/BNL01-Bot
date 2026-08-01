@@ -121,6 +121,8 @@ class MemoryPreviewDiagnostics:
     assessment_pool_selected_count: int = 0
     root_collapse_suppression_count: int = 0
     shared_root_projection_count: int = 0
+    canon_identity_status: str = "not_evaluated"
+    canon_identity_stable_row_count: int = 0
     profile_status: str = "not_applicable"
     profile_satisfied: bool = False
     profile_required_point_count: int = 0
@@ -756,6 +758,7 @@ def _packet_request(
         subject_user_id=int(request.subject_user_id or 0),
         route_mode=SIMULATED_ROUTE_MODE,
         conversation_surface=SIMULATED_CONVERSATION_SURFACE,
+        subject_display_name=str(request.subject_display_name or "")[:120],
         channel_id=int(request.simulated_channel_id or 0),
         channel_name=SIMULATED_CHANNEL_NAME,
         channel_policy=SIMULATED_CHANNEL_POLICY,
@@ -1014,6 +1017,16 @@ def _diagnostics(
         ),
         shared_root_projection_count=(
             int(packet.diagnostics.shared_root_projection_count or 0)
+            if packet is not None
+            else 0
+        ),
+        canon_identity_status=(
+            str(packet.diagnostics.canon_identity_status or "not_evaluated")
+            if packet is not None
+            else "not_evaluated"
+        ),
+        canon_identity_stable_row_count=(
+            int(packet.diagnostics.canon_identity_stable_row_count or 0)
             if packet is not None
             else 0
         ),
@@ -1583,6 +1596,11 @@ def render_content_free_diagnostics(
         % (
             diag.assessment_pool_eligible_count,
             diag.assessment_pool_selected_count,
+        ),
+        "- canon_identity_signal: `status=%s stable_public_rows=%s`"
+        % (
+            diag.canon_identity_status,
+            diag.canon_identity_stable_row_count,
         ),
         "- rendered_packet_lanes: `%s` project_canon_required=`%s`"
         % (

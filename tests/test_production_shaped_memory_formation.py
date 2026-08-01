@@ -1237,6 +1237,91 @@ class ProductionShapedMemoryFormationTests(unittest.TestCase):
             ],
         )
 
+    def test_retained_conversation_backfill_is_resumable_and_nonpromoting(self):
+        self.conn.execute(
+            """
+            CREATE TABLE conversations (
+              id INTEGER PRIMARY KEY,
+              guild_id INTEGER NOT NULL,
+              user_id INTEGER NOT NULL,
+              user_name TEXT,
+              role TEXT NOT NULL,
+              content TEXT NOT NULL,
+              channel_name TEXT,
+              channel_policy TEXT,
+              channel_id INTEGER,
+              message_id INTEGER,
+              timestamp TEXT
+            )
+            """
+        )
+        self.conn.executemany(
+            """
+            INSERT INTO conversations(
+              id,guild_id,user_id,user_name,role,content,channel_name,
+              channel_policy,channel_id,message_id,timestamp
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                (
+                    1, 1, 7, "Mac Modem", "user",
+                    "I adjusted a signal meter in the interface.",
+                    "barcode-bot", "public_home", 10, 7001,
+                    "2026-07-20T10:00:00+00:00",
+                ),
+                (
+                    2, 1, 7, "Mac Modem", "user",
+                    "Old modem tones could shape a short interlude.",
+                    "barcode-bot", "public_home", 10, 7002,
+                    "2026-07-22T10:00:00+00:00",
+                ),
+                (
+                    3, 1, 7, "Mac Modem", "user",
+                    "Internal planning must remain internal.",
+                    "operations", "internal_controlled", 12, 7003,
+                    "2026-07-23T10:00:00+00:00",
+                ),
+            ),
+        )
+
+        first = ledger.backfill_retained_conversation_ledger_entries(
+            self.conn,
+            batch_size=1,
+            environ=self.env,
+        )
+        second = ledger.backfill_retained_conversation_ledger_entries(
+            self.conn,
+            batch_size=1,
+            environ=self.env,
+        )
+        third = ledger.backfill_retained_conversation_ledger_entries(
+            self.conn,
+            batch_size=1,
+            environ=self.env,
+        )
+
+        self.assertFalse(first["completed"])
+        self.assertTrue(second["completed"])
+        self.assertEqual(second, third)
+        self.assertEqual(second["counts"]["rows_scanned"], 2)
+        self.assertEqual(second["counts"]["inserted"], 2)
+        projected = self.conn.execute(
+            """
+            SELECT source_row_id,subject_key,channel_policy
+            FROM memory_ledger_entries
+            WHERE source_table='conversations'
+            ORDER BY source_row_id
+            """
+        ).fetchall()
+        self.assertEqual(
+            projected,
+            [
+                ("1", "discord_user:7", "public_home"),
+                ("2", "discord_user:7", "public_home"),
+            ],
+        )
+        self.assertEqual(self.candidate_rows(), [])
+
     def test_motif_scan_reaches_supported_history_beyond_240_rows(self):
         started = datetime(2025, 1, 1, 10, 0, tzinfo=timezone.utc)
         self.add_conversation(
