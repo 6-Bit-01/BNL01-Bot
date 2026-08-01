@@ -28,6 +28,9 @@ or when the packet and response-assessment shadows are unavailable.
 
 - The governed packet is the only stored factual prompt owner for this route.
 - Competing legacy factual context is replaced before the candidate call.
+- Prompt selection stays bounded, while claim validation uses a separate
+  route-safe support set from the same existing source owners. Lane and prompt
+  budget exclusions do not make otherwise eligible support "unsupported."
 - Current-turn and exact-reply authority remain ahead of stored memory.
 - The subject is always the requesting member; cross-member facts remain
   ineligible.
@@ -35,6 +38,11 @@ or when the packet and response-assessment shadows are unavailable.
 - BNL-authored derivatives cannot corroborate themselves.
 - Every candidate is revalidated before send; any failure returns to the
   established response.
+- A candidate may replace the established response only when it retains every
+  exact, question-relevant member point, concrete detail, and approved canon
+  item that the established response used from that support set. A shorter or
+  differently framed candidate is allowed; loss of supported substance is not.
+- Unsupported baseline language does not gain authority from this comparison.
 
 ## Same-platform canon recognition
 
@@ -60,8 +68,9 @@ observation and require cautious wording. That observation does not become a
 trait, Moment, or atomic-memory candidate. Stronger claims still require the
 existing independent-root and independent-occurrence thresholds.
 
-If a broad profile remains empty, the enabled owner route returns a fixed
-thin-record response rather than asking the model to improvise a biography.
+An empty packet never suppresses a nonempty established response. The fixed
+thin-record response is used only when both the packet route and the already
+generated established path are empty.
 
 ## Retained-conversation catch-up
 
@@ -78,7 +87,8 @@ Content-free synthesis receipts record `authority_mode` as either
 `scoped_canary` or `public_home_broad_recall_owner`. Owner diagnostics report
 the requested/effective state, authority mode, scope status, kill switch,
 route counts, selection/fallback totals, revalidation, prompt ownership, guard
-outcomes, and live applications.
+outcomes, validation-support lane counts, baseline/candidate supported
+coverage, supported-coverage regressions, and live applications.
 
 Rollback is the independent kill switch:
 

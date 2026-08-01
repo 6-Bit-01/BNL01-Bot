@@ -33221,12 +33221,15 @@ async def maybe_generate_shared_brain_synthesis_canary(
     if basis is None:
         return None
     if basis.honest_empty_profile_fallback:
-        honest_response = honest_empty_profile_response()
+        fallback_response = (
+            str(baseline_response or "").strip()
+            or honest_empty_profile_response()
+        )
         try:
             run = await asyncio.to_thread(
                 _begin_shared_brain_synthesis_receipt,
                 basis,
-                honest_response,
+                fallback_response,
                 candidate_prompt_ready=False,
                 candidate_prompt_failure_reason=(
                     "profile_sufficiency_empty"
@@ -33241,7 +33244,7 @@ async def maybe_generate_shared_brain_synthesis_canary(
             return None
         decision = SynthesisCanaryDecision(
             run=run,
-            response=honest_response,
+            response=fallback_response,
             candidate_selected=False,
             fallback_reason=(
                 run.fallback_reason
@@ -33255,7 +33258,7 @@ async def maybe_generate_shared_brain_synthesis_canary(
         )
         return SharedBrainSynthesisExecution(
             decision=decision,
-            response=honest_response,
+            response=fallback_response,
             prompt=prompt,
             prompt_source_bases=prompt_source_bases,
             candidate_active=False,
@@ -36918,21 +36921,22 @@ async def execute_bnl_memory_preview(
             and initial.basis.honest_empty_profile_fallback
         )
         baseline_response = (
-            honest_empty_profile_response()
-            if honest_empty_profile
-            else (
-                await generate(
-                    initial.request.baseline_prompt,
-                    "bnl_memory_preview_baseline",
-                )
-                or ""
-            ).strip()
-        )
-        if not baseline_response:
-            baseline_response = (
-                "I do not have enough eligible public-safe memory to give "
-                "you a grounded profile without guessing."
+            await generate(
+                initial.request.baseline_prompt,
+                "bnl_memory_preview_baseline",
             )
+            or ""
+        ).strip()
+        used_honest_empty_fallback = False
+        if not baseline_response:
+            if honest_empty_profile:
+                baseline_response = honest_empty_profile_response()
+                used_honest_empty_fallback = True
+            else:
+                baseline_response = (
+                    "I do not have enough eligible public-safe memory to "
+                    "give you a grounded profile without guessing."
+                )
 
         candidate_response = ""
         candidate_prompt = (
@@ -37272,7 +37276,7 @@ async def execute_bnl_memory_preview(
             "suppressed"
             if not proposed_response
             else "honest_empty_profile_fallback"
-            if honest_empty_profile
+            if used_honest_empty_fallback
             else "cleanup_salvage"
             if evaluation.candidate_selected and cleanup_salvage_applied
             else "cleanup_attempt"

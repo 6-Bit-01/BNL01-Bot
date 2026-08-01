@@ -3,7 +3,8 @@
 This module owns no facts.  It coordinates references selected by the existing
 Conversation Context, Memory Governance, Ledger, Moment, Relationship, canon,
 and Source File owners into one bounded comparison packet.  The packet is never
-rendered into a live prompt in this stage.
+rendered into a live prompt in this stage. Prompt items remain bounded
+separately from the route-safe factual support retained for validation.
 """
 from __future__ import annotations
 
@@ -49,7 +50,7 @@ from bnl_moment_engine import select_public_participant_moment_gists
 from bnl_relationship_engine import shadow_packet_posture
 
 
-SCHEMA_VERSION = "unified_intelligence_packet_v2"
+SCHEMA_VERSION = "unified_intelligence_packet_v3"
 TABLE_NAME = "memory_governance_intelligence_packet_runs"
 SHADOW_ENV = "BNL_UNIFIED_INTELLIGENCE_PACKET_SHADOW_ENABLED"
 _SHADOW_PREREQUISITES = (
@@ -128,6 +129,28 @@ _BROAD_PROFILE_LANE_CAPS = {
     "canon": 1,
     "source_file": 1,
 }
+_VALIDATION_SUPPORT_ASSESSMENT_LIMIT = 8
+_VALIDATION_SUPPORT_LANES = frozenset(
+    {
+        "conversation_context",
+        "assessment_observation",
+        "approved_fact",
+        "moment",
+        "atomic_knowledge",
+        "open_loop",
+        "canon",
+        "source_file",
+    }
+)
+_CLAIM_SUBJECT_SCOPED_LANES = frozenset(
+    {
+        "assessment_observation",
+        "approved_fact",
+        "moment",
+        "atomic_knowledge",
+        "open_loop",
+    }
+)
 _PROFILE_DURABLE_MEMBER_EVIDENCE_LANES = frozenset(
     {"approved_fact", "atomic_knowledge", "moment"}
 )
@@ -327,6 +350,7 @@ class IntelligencePacketDiagnostics:
     selected_by_lane: dict[str, int] = field(default_factory=dict)
     selected_by_source_class: dict[str, int] = field(default_factory=dict)
     selected_atomic_states: dict[str, int] = field(default_factory=dict)
+    validation_support_by_lane: dict[str, int] = field(default_factory=dict)
     excluded_by_reason: dict[str, int] = field(default_factory=dict)
     missing_lanes: list[str] = field(default_factory=list)
     conflict_reasons: list[str] = field(default_factory=list)
@@ -392,10 +416,17 @@ class UnifiedIntelligencePacket:
     exclusions: tuple[IntelligencePacketExclusion, ...]
     diagnostics: IntelligencePacketDiagnostics
     profile_sufficiency: ProfileSufficiency = ProfileSufficiency()
+    validation_items: tuple[IntelligencePacketItem, ...] = ()
 
     @property
     def detailed_lanes(self) -> tuple[str, ...]:
         return tuple(dict.fromkeys(item.lane for item in self.items))
+
+    @property
+    def validation_lanes(self) -> tuple[str, ...]:
+        return tuple(
+            dict.fromkeys(item.lane for item in self.validation_items)
+        )
 
     @property
     def assessment_lanes(self) -> tuple[str, ...]:
@@ -1000,6 +1031,8 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
             channel_policy TEXT NOT NULL,
             visibility_allowance TEXT NOT NULL,
             item_count INTEGER NOT NULL DEFAULT 0,
+            validation_item_count INTEGER NOT NULL DEFAULT 0,
+            validation_lane_counts_json TEXT NOT NULL DEFAULT '{}',
             selected_lane_counts_json TEXT NOT NULL DEFAULT '{}',
             source_class_counts_json TEXT NOT NULL DEFAULT '{}',
             atomic_state_counts_json TEXT NOT NULL DEFAULT '{}',
@@ -1022,6 +1055,11 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
         """
     )
     for column, definition in (
+        ("validation_item_count", "INTEGER NOT NULL DEFAULT 0"),
+        (
+            "validation_lane_counts_json",
+            "TEXT NOT NULL DEFAULT '{}'",
+        ),
         ("root_collapse_suppression_count", "INTEGER NOT NULL DEFAULT 0"),
         ("shared_root_projection_count", "INTEGER NOT NULL DEFAULT 0"),
         (
@@ -1332,7 +1370,7 @@ def _assessment_observation_items(
         guild_id=int(request.guild_id or 0),
         subject_key=subject,
         request_text=str(request.user_text or ""),
-        max_results=_BROAD_PROFILE_LANE_CAPS["assessment_observation"],
+        max_results=_VALIDATION_SUPPORT_ASSESSMENT_LIMIT,
     )
     diagnostics.candidates_by_lane["assessment_observation"] = int(
         selection.eligible_count or 0
@@ -2594,6 +2632,7 @@ def _select_items(
 ) -> tuple[
     tuple[IntelligencePacketItem, ...],
     tuple[IntelligencePacketItem, ...],
+    tuple[IntelligencePacketItem, ...],
 ]:
     broad = _broad_profile_request(request.user_text)
     if request.immediate_recap:
@@ -2788,7 +2827,45 @@ def _select_items(
     diagnostics.missing_lanes = list(
         dict.fromkeys(diagnostics.missing_lanes)
     )
-    return tuple(selected), tuple(profile_candidates)
+    validation_items: list[IntelligencePacketItem] = []
+    seen_validation_sources: set[tuple[str, str, str]] = set()
+    validation_canon = tuple(
+        candidate
+        for candidate in ordered
+        if candidate.lane == "canon"
+        and (
+            (
+                recognized_canon_signal
+                and candidate.source_type == "recognized_canon_fact"
+                and candidate.subject_key == subject_key
+            )
+            or (
+                not recognized_canon_signal
+                and canon_anchor is not None
+                and candidate.subject_key == canon_anchor.subject_key
+            )
+        )
+    )
+    for item in (
+        *(item for item in selected if item.lane != "canon"),
+        *profile_candidates,
+        *validation_canon,
+    ):
+        if item.lane not in _VALIDATION_SUPPORT_LANES:
+            continue
+        source_key = (item.lane, item.source_ref, item.source_digest)
+        if source_key in seen_validation_sources:
+            continue
+        seen_validation_sources.add(source_key)
+        validation_items.append(item)
+        diagnostics.validation_support_by_lane[item.lane] = (
+            diagnostics.validation_support_by_lane.get(item.lane, 0) + 1
+        )
+    return (
+        tuple(selected),
+        tuple(profile_candidates),
+        tuple(validation_items),
+    )
 
 
 def _profile_sufficiency(
@@ -3045,7 +3122,13 @@ def revalidate_packet(
     """Re-read every durable source without applying packet content live."""
     changed = 0
     errors = 0
-    for item in packet.items:
+    revalidation_items = tuple(
+        {
+            (item.lane, item.source_ref, item.source_digest): item
+            for item in (*packet.items, *packet.validation_items)
+        }.values()
+    )
+    for item in revalidation_items:
         try:
             if item.revalidation_kind == "conversation":
                 row = _conversation_row(conn, int(item.revalidation_key or 0))
@@ -3083,7 +3166,10 @@ def revalidate_packet(
         status = "processing_error"
     elif changed:
         status = "source_changed"
-    elif any(item.revalidation_kind == "snapshot" for item in packet.items):
+    elif any(
+        item.revalidation_kind == "snapshot"
+        for item in revalidation_items
+    ):
         status = "passed_with_provider_snapshot"
     else:
         status = "passed"
@@ -3165,6 +3251,46 @@ def _packet_invariants(
             and item.subject_key == subject
         ):
             invalid.append("supporting_observation_scope_violation")
+    validation_keys = {
+        (item.lane, item.source_ref, item.source_digest)
+        for item in packet.validation_items
+    }
+    for item in packet.validation_items:
+        if item.lane not in _VALIDATION_SUPPORT_LANES:
+            invalid.append("validation_support_lane_violation")
+        if not _route_allows_item(packet.request, item):
+            invalid.append("validation_support_visibility_violation")
+        if (
+            item.lane in _CLAIM_SUBJECT_SCOPED_LANES
+            and int(packet.request.subject_user_id or 0) > 0
+            and item.subject_key != subject
+        ):
+            invalid.append("validation_support_subject_violation")
+        if (
+            broad
+            and item.lane in _PROFILE_MEMBER_EVIDENCE_LANES
+            and (
+                not item.root_identities
+                or not item.occurrence_identities
+                or not item.point_identity
+            )
+        ):
+            invalid.append("validation_support_root_lineage_violation")
+        if item.revalidation_kind == "recognized_canon" and not (
+            item.lane == "canon"
+            and item.source_type == "recognized_canon_fact"
+            and item.subject_key == subject
+            and item.source_class == SourceClass.APPROVED_CANON.value
+        ):
+            invalid.append("validation_support_canon_scope_violation")
+    for item in packet.items:
+        if (
+            item.lane in _VALIDATION_SUPPORT_LANES
+            and item.lane != "canon"
+            and (item.lane, item.source_ref, item.source_digest)
+            not in validation_keys
+        ):
+            invalid.append("selected_factual_item_missing_validation_support")
     return tuple(dict.fromkeys(invalid))
 
 
@@ -3238,7 +3364,7 @@ def build_packet(
         )
     except (sqlite3.DatabaseError, TypeError, ValueError) as exc:
         diagnostics.processing_errors.append(type(exc).__name__)
-    selected, profile_candidates = _select_items(
+    selected, profile_candidates, validation_items = _select_items(
         request,
         candidates,
         diagnostics,
@@ -3249,7 +3375,7 @@ def build_packet(
         selected=selected,
         candidates=profile_candidates,
     )
-    digest_payload = tuple(
+    prompt_digest_payload = tuple(
         (
             item.lane,
             item.source_class,
@@ -3263,9 +3389,24 @@ def build_packet(
         )
         for item in selected
     )
+    validation_digest_payload = tuple(
+        (
+            item.lane,
+            item.source_class,
+            item.source_ref,
+            item.source_digest,
+            item.lifecycle,
+            item.usage,
+            item.root_identities,
+            item.occurrence_identities,
+            item.point_identity,
+        )
+        for item in validation_items
+    )
     diagnostics.packet_digest = _digest(
         SCHEMA_VERSION,
-        digest_payload,
+        prompt_digest_payload,
+        validation_digest_payload,
         profile_sufficiency,
     )
     packet_id = "uip_" + _digest(
@@ -3284,6 +3425,7 @@ def build_packet(
         exclusions=tuple(exclusions),
         diagnostics=diagnostics,
         profile_sufficiency=profile_sufficiency,
+        validation_items=validation_items,
     )
     invalid = _packet_invariants(packet)
     if invalid:
@@ -3324,7 +3466,14 @@ def persist_packet_run(
     ensure_schema(conn)
     run_id = "uipr_" + uuid.uuid4().hex
     source_ref_digest = _digest(
-        tuple(sorted(item.source_ref for item in packet.items))
+        tuple(
+            sorted(
+                {
+                    item.source_ref
+                    for item in (*packet.items, *packet.validation_items)
+                }
+            )
+        )
     )
     conn.execute(
         """
@@ -3414,6 +3563,21 @@ def persist_packet_run(
             int(packet.request.guild_id or 0),
         ),
     )
+    conn.execute(
+        """
+        UPDATE memory_governance_intelligence_packet_runs
+        SET validation_item_count=?,validation_lane_counts_json=?
+        WHERE run_id=?
+        """,
+        (
+            len(packet.validation_items),
+            json.dumps(
+                packet.diagnostics.validation_support_by_lane,
+                sort_keys=True,
+            ),
+            run_id,
+        ),
+    )
     return run_id
 
 
@@ -3483,6 +3647,8 @@ def _empty_report() -> dict[str, Any]:
         "schemaVersion": SCHEMA_VERSION,
         "runs": 0,
         "itemTotal": 0,
+        "validationItemTotal": 0,
+        "validationByLane": {},
         "selectedByLane": {},
         "selectedBySourceClass": {},
         "selectedAtomicStates": {},
@@ -3546,7 +3712,7 @@ def build_evaluation_report(
 
     rows = conn.execute(
         """
-        SELECT schema_version,item_count,selected_lane_counts_json,
+        SELECT schema_version,item_count,%s,%s,selected_lane_counts_json,
                source_class_counts_json,atomic_state_counts_json,
                excluded_by_reason_json,missing_lanes_json,conflict_count,
                visibility_exclusion_count,budget_exclusion_count,
@@ -3562,6 +3728,8 @@ def build_evaluation_report(
         LIMIT ?
         """
         % (
+            column("validation_item_count", "0"),
+            column("validation_lane_counts_json", "'{}'"),
             column("root_collapse_suppression_count", "0"),
             column("shared_root_projection_count", "0"),
             column(
@@ -3578,6 +3746,7 @@ def build_evaluation_report(
         (int(guild_id or 0), max(1, min(int(limit or 1000), 5000))),
     ).fetchall()
     selected_lanes: Counter[str] = Counter()
+    validation_lanes: Counter[str] = Counter()
     source_classes: Counter[str] = Counter()
     atomic_states: Counter[str] = Counter()
     exclusions: Counter[str] = Counter()
@@ -3585,7 +3754,8 @@ def build_evaluation_report(
     revalidation: Counter[str] = Counter()
     profile_statuses: Counter[str] = Counter()
     profile_reasons: Counter[str] = Counter()
-    item_total = conflicts = visibility = budget = duplicates = 0
+    item_total = validation_item_total = 0
+    conflicts = visibility = budget = duplicates = 0
     root_collapses = shared_roots = profile_met = 0
     profile_points = profile_roots = profile_occurrences = 0
     errors = invalid = changed = prompt = live = 0
@@ -3593,6 +3763,8 @@ def build_evaluation_report(
         (
             _schema,
             item_count,
+            validation_item_count,
+            validation_lane_json,
             lane_json,
             source_json,
             atomic_json,
@@ -3620,8 +3792,10 @@ def build_evaluation_report(
             _created_at,
         ) = row
         item_total += int(item_count or 0)
+        validation_item_total += int(validation_item_count or 0)
         for counter, raw in (
             (selected_lanes, lane_json),
+            (validation_lanes, validation_lane_json),
             (source_classes, source_json),
             (atomic_states, atomic_json),
             (exclusions, exclusion_json),
@@ -3670,6 +3844,8 @@ def build_evaluation_report(
         "schemaVersion": str(rows[0][0]) if rows else SCHEMA_VERSION,
         "runs": len(rows),
         "itemTotal": item_total,
+        "validationItemTotal": validation_item_total,
+        "validationByLane": dict(sorted(validation_lanes.items())),
         "selectedByLane": dict(sorted(selected_lanes.items())),
         "selectedBySourceClass": dict(sorted(source_classes.items())),
         "selectedAtomicStates": dict(sorted(atomic_states.items())),

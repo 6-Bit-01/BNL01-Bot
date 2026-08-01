@@ -2000,6 +2000,7 @@ class SharedBrainSynthesisCanaryTests(unittest.TestCase):
             UPDATE memory_governance_shared_brain_synthesis_runs
             SET candidate_member_root_coverage_count=0,
                 candidate_unsupported_factual_claim_count=1,
+                supported_coverage_regressed=1,
                 competing_factual_context_count=1,
                 replaced_factual_context_count=0
             WHERE run_id=?
@@ -2016,6 +2017,10 @@ class SharedBrainSynthesisCanaryTests(unittest.TestCase):
             1,
         )
         self.assertEqual(
+            report["liveSupportedCoverageRegressionRuns"],
+            1,
+        )
+        self.assertEqual(
             report["livePromptOwnershipViolationRuns"],
             1,
         )
@@ -2027,6 +2032,7 @@ class SharedBrainSynthesisCanaryTests(unittest.TestCase):
         for key in (
             "liveInsufficientMemberCoverageRuns",
             "liveUnsupportedFactualClaimRuns",
+            "liveSupportedCoverageRegressionRuns",
             "livePromptOwnershipViolationRuns",
         ):
             self.assertIn(

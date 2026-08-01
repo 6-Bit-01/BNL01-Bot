@@ -153,6 +153,52 @@ class SharedBrainSynthesisBotPathTests(
             ),
         )
 
+    async def test_empty_packet_keeps_nonempty_established_response(self):
+        basis = replace(
+            self.synthesis_basis("Legacy factual profile block."),
+            honest_empty_profile_fallback=True,
+        )
+        run = SimpleNamespace(
+            prompt_applied=False,
+            fallback_reason="candidate_prompt_profile_sufficiency_empty",
+            revalidation_status="passed",
+        )
+        generation = mock.AsyncMock()
+        with (
+            mock.patch.object(
+                bnl01_bot,
+                "_begin_shared_brain_synthesis_receipt",
+                return_value=run,
+            ) as begin,
+            mock.patch.object(
+                bnl01_bot,
+                "get_gemini_response_with_optional_typing",
+                new=generation,
+            ),
+        ):
+            execution = await (
+                bnl01_bot.maybe_generate_shared_brain_synthesis_canary(
+                    channel=FakeChannel(),
+                    baseline_response="Established useful response.",
+                    prompt="Baseline prompt.",
+                    prompt_source_bases=("existing-basis",),
+                    basis=basis,
+                    user_id=7,
+                    guild_id=1,
+                    user_display_name="Crow",
+                    source_context_available=True,
+                )
+            )
+
+        self.assertIsNotNone(execution)
+        self.assertEqual(execution.response, "Established useful response.")
+        self.assertFalse(execution.candidate_active)
+        generation.assert_not_awaited()
+        self.assertEqual(
+            begin.call_args.args[1],
+            "Established useful response.",
+        )
+
     async def test_candidate_call_uses_packet_as_only_factual_owner(self):
         legacy_context = (
             "Relationship state: stage=familiar, stance=warm.\n"

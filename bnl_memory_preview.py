@@ -49,7 +49,7 @@ from bnl_unified_response_assessment import (
 )
 
 
-PREVIEW_SCHEMA_VERSION = "bnl_memory_preview_v1"
+PREVIEW_SCHEMA_VERSION = "bnl_memory_preview_v2"
 SIMULATED_ROUTE_MODE = "normal_chat"
 SIMULATED_CHANNEL_POLICY = "public_home"
 SIMULATED_CHANNEL_NAME = "barcode-bot"
@@ -114,6 +114,7 @@ class MemoryPreviewDiagnostics:
     lifecycle_candidates: int = 0
     lifecycle_state_changes: int = 0
     packet_lane_counts: tuple[tuple[str, int], ...] = ()
+    validation_support_lane_counts: tuple[tuple[str, int], ...] = ()
     packet_exclusion_reason_counts: tuple[tuple[str, int], ...] = ()
     packet_missing_lanes: tuple[str, ...] = ()
     packet_revalidation_status: str = "not_evaluated"
@@ -182,7 +183,11 @@ class MemoryPreviewEvaluation:
     response: str
     candidate_selected: bool
     fallback_reason: str
+    baseline_member_point_count: int = 0
+    baseline_member_detail_count: int = 0
+    baseline_canon_count: int = 0
     candidate_member_point_count: int = 0
+    candidate_member_detail_count: int = 0
     candidate_member_root_count: int = 0
     candidate_member_occurrence_count: int = 0
     candidate_canon_count: int = 0
@@ -193,6 +198,7 @@ class MemoryPreviewEvaluation:
     candidate_connective_claim_count: int = 0
     candidate_unsupported_factual_claim_count: int = 0
     candidate_claim_classifications: tuple[str, ...] = ()
+    supported_coverage_regressed: bool = False
 
 
 @dataclass(frozen=True)
@@ -981,6 +987,15 @@ def _diagnostics(
             if packet is not None
             else ()
         ),
+        validation_support_lane_counts=(
+            tuple(
+                sorted(
+                    packet.diagnostics.validation_support_by_lane.items()
+                )
+            )
+            if packet is not None
+            else ()
+        ),
         packet_exclusion_reason_counts=exclusion_counts,
         packet_missing_lanes=missing_lanes,
         packet_revalidation_status=(
@@ -1337,8 +1352,18 @@ def evaluate_memory_preview(
         response=decision.response,
         candidate_selected=decision.candidate_selected,
         fallback_reason=decision.fallback_reason,
+        baseline_member_point_count=(
+            decision.baseline_member_point_coverage_count
+        ),
+        baseline_member_detail_count=(
+            decision.baseline_member_detail_coverage_count
+        ),
+        baseline_canon_count=decision.baseline_canon_coverage_count,
         candidate_member_point_count=(
             decision.candidate_member_point_coverage_count
+        ),
+        candidate_member_detail_count=(
+            decision.candidate_member_detail_coverage_count
         ),
         candidate_member_root_count=(
             decision.candidate_member_root_coverage_count
@@ -1368,6 +1393,9 @@ def evaluate_memory_preview(
         candidate_claim_classifications=(
             decision.candidate_claim_classifications
         ),
+        supported_coverage_regressed=(
+            decision.supported_coverage_regressed
+        ),
     )
 
 
@@ -1386,8 +1414,18 @@ def fallback_memory_preview(
             response=evaluation.response,
             candidate_selected=False,
             fallback_reason=str(reason or "preview_fallback"),
+            baseline_member_point_count=(
+                evaluation.baseline_member_point_count
+            ),
+            baseline_member_detail_count=(
+                evaluation.baseline_member_detail_count
+            ),
+            baseline_canon_count=evaluation.baseline_canon_count,
             candidate_member_point_count=(
                 evaluation.candidate_member_point_count
+            ),
+            candidate_member_detail_count=(
+                evaluation.candidate_member_detail_count
             ),
             candidate_member_root_count=(
                 evaluation.candidate_member_root_count
@@ -1417,6 +1455,9 @@ def fallback_memory_preview(
             candidate_claim_classifications=(
                 evaluation.candidate_claim_classifications
             ),
+            supported_coverage_regressed=(
+                evaluation.supported_coverage_regressed
+            ),
         )
     decision = record_fallback(
         prepared.connection,
@@ -1429,8 +1470,18 @@ def fallback_memory_preview(
         response=decision.response,
         candidate_selected=False,
         fallback_reason=decision.fallback_reason,
+        baseline_member_point_count=(
+            decision.baseline_member_point_coverage_count
+        ),
+        baseline_member_detail_count=(
+            decision.baseline_member_detail_coverage_count
+        ),
+        baseline_canon_count=decision.baseline_canon_coverage_count,
         candidate_member_point_count=(
             decision.candidate_member_point_coverage_count
+        ),
+        candidate_member_detail_count=(
+            decision.candidate_member_detail_coverage_count
         ),
         candidate_member_root_count=(
             decision.candidate_member_root_coverage_count
@@ -1459,6 +1510,9 @@ def fallback_memory_preview(
         ),
         candidate_claim_classifications=(
             decision.candidate_claim_classifications
+        ),
+        supported_coverage_regressed=(
+            decision.supported_coverage_regressed
         ),
     )
 
@@ -1495,8 +1549,18 @@ def reevaluate_memory_preview(
         response=decision.response,
         candidate_selected=decision.candidate_selected,
         fallback_reason=decision.fallback_reason,
+        baseline_member_point_count=(
+            decision.baseline_member_point_coverage_count
+        ),
+        baseline_member_detail_count=(
+            decision.baseline_member_detail_coverage_count
+        ),
+        baseline_canon_count=decision.baseline_canon_coverage_count,
         candidate_member_point_count=(
             decision.candidate_member_point_coverage_count
+        ),
+        candidate_member_detail_count=(
+            decision.candidate_member_detail_coverage_count
         ),
         candidate_member_root_count=(
             decision.candidate_member_root_coverage_count
@@ -1525,6 +1589,9 @@ def reevaluate_memory_preview(
         ),
         candidate_claim_classifications=(
             decision.candidate_claim_classifications
+        ),
+        supported_coverage_regressed=(
+            decision.supported_coverage_regressed
         ),
     )
 
@@ -1592,6 +1659,8 @@ def render_content_free_diagnostics(
             diag.lifecycle_state_changes,
         ),
         "- packet_lanes: `%s`" % dict(diag.packet_lane_counts),
+        "- validation_support_lanes: `%s`"
+        % dict(diag.validation_support_lane_counts),
         "- public_assessment_pool: `eligible=%s selected=%s`"
         % (
             diag.assessment_pool_eligible_count,
@@ -1644,16 +1713,23 @@ def render_content_free_diagnostics(
             diag.replaced_factual_context_count,
             diag.prompt_owner_reason or "none",
         ),
-        "- candidate_gate: `selected=%s fallback=%s points=%s "
-        "roots=%s occurrences=%s canon=%s member_claims=%s "
-        "canon_claims=%s opinions=%s connective=%s unsupported=%s`"
+        "- candidate_gate: `selected=%s fallback=%s baseline_points=%s "
+        "candidate_points=%s baseline_details=%s candidate_details=%s "
+        "roots=%s occurrences=%s baseline_canon=%s candidate_canon=%s "
+        "coverage_regressed=%s member_claims=%s canon_claims=%s "
+        "opinions=%s connective=%s unsupported=%s`"
         % (
             str(evaluation.candidate_selected).lower(),
             evaluation.fallback_reason or "none",
+            evaluation.baseline_member_point_count,
             evaluation.candidate_member_point_count,
+            evaluation.baseline_member_detail_count,
+            evaluation.candidate_member_detail_count,
             evaluation.candidate_member_root_count,
             evaluation.candidate_member_occurrence_count,
+            evaluation.baseline_canon_count,
             evaluation.candidate_canon_count,
+            str(evaluation.supported_coverage_regressed).lower(),
             evaluation.candidate_member_supported_claim_count,
             evaluation.candidate_canon_supported_claim_count,
             evaluation.candidate_opinion_claim_count,
