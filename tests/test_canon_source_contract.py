@@ -73,6 +73,29 @@ class CanonSourceContractTests(unittest.TestCase):
         self.assertIn("GALAKNOISE is BARCODE's music producer", prompt_canon)
         self.assertNotIn("6 Bit is an artist, producer", prompt_canon)
 
+    def test_core_members_have_structured_canon_and_exact_aliases(self):
+        facts = {
+            (fact.subject.key, fact.predicate): str(fact.value)
+            for fact in c.CANON_FACTS
+        }
+        for subject in (c.DJ_FLOPPYDISC, c.CACHE_BACK, c.MAC_MODEM):
+            self.assertIn((subject.key, "primary_identity"), facts)
+            self.assertIn((subject.key, "behavior"), facts)
+            self.assertIn((subject.key, "typical_involvement"), facts)
+        self.assertEqual(
+            c.matching_canon_member_identities(("  mac modem!  ",)),
+            (c.MAC_MODEM,),
+        )
+        self.assertEqual(
+            c.matching_canon_member_identities(("Mac Modem Fan",)),
+            (),
+        )
+        prompt_block = c.render_key_personnel_canon_block()
+        self.assertIn("Mac Modem", prompt_block)
+        self.assertIn("DJ Floppydisc", prompt_block)
+        self.assertIn("Cache Back", prompt_block)
+        self.assertIn(prompt_block, BNL01_SYSTEM_PROMPT)
+
     def test_schedule_distinguishes_intake_show_first_track(self):
         self.assertEqual(c.FRIDAY_PUBLIC_SCHEDULE.intake_begins, "6:40 PM Pacific")
         self.assertEqual(c.FRIDAY_PUBLIC_SCHEDULE.show_begins, "7:00 PM Pacific")

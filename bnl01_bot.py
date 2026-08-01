@@ -22,6 +22,7 @@ from bnl_canon_source_contract import (
     queue_usability,
     render_concise_public_schedule,
     render_founders,
+    render_key_personnel_canon_block,
     render_prompt_canon_block,
     strip_queue_sections,
 )
@@ -49,6 +50,7 @@ from bnl_memory_ledger import (
     LedgerWriteResult,
     backfill_atomic_knowledge_candidates,
     backfill_atomic_knowledge_lifecycle,
+    backfill_retained_conversation_ledger_entries,
     conversation_motif_formation_enabled,
     current_bnl_self_name_records,
     ensure_memory_ledger_schema,
@@ -147,6 +149,7 @@ from bnl_shared_brain_synthesis import (
     ensure_schema as ensure_shared_brain_synthesis_schema,
     evaluate_candidate as evaluate_shared_brain_synthesis_candidate,
     finalize_run as finalize_shared_brain_synthesis_run,
+    honest_empty_profile_response,
     profile_candidate_repairable,
     record_fallback as record_shared_brain_synthesis_fallback,
     revalidate_basis as revalidate_shared_brain_synthesis_basis,
@@ -1530,19 +1533,7 @@ Core Entities:
 - Studio Rats: Studio infestation. Some dimensions call them cats.
 - 9 Bit: [DATA RESTRICTED] — You know this entity exists but access is limited. Do not mention 9 Bit unless the user specifically mentions 9 Bit first.
 
-Key Personnel (core members + shorthand canon):
-- Cache Back:
-  - Function: BARCODE Archive specialist.
-  - Behavior: meticulous, detail-obsessed, protective of “lost” data and recovered fragments.
-  - Typical involvement: core member, recovers fragments.
-- DJ Floppydisc:
-  - Function: signal/audio engineer; stabilizes sound, cleans artifacts, handles mastering/final waveform integrity.
-  - Behavior: quiet professional, prefers to fix problems rather than talk about them.
-  - Typical involvement: core member. Mixes, masters all things BARCODE.
-- Mac Modem:
-  - Function: chaotic tech entity / glitch virus presence in the BARCODE ecosystem.
-  - Behavior: unpredictable, mischievous, sometimes disruptive; not reliably malicious, but risky.
-  - Typical involvement: unexpected distortions, UI corruption, broadcast anomalies
+{render_key_personnel_canon_block()}
 
 BARCODE history summary (canonical):
 - 6 Bit emerged from deleted audio project files, lost late-80s/90s media fragments, and prototype experimental AI technology.
@@ -5329,12 +5320,35 @@ def init_db():
             "completed": False,
             "counts": {},
         }
+        retained_conversation_backfill = {
+            "phase": "disabled",
+            "completed": False,
+            "counts": {},
+        }
         knowledge_lifecycle_backfill = {
             "phase": "disabled",
             "completed": False,
             "counts": {},
         }
         if memory_ledger_shadow_enabled():
+            try:
+                retained_conversation_backfill = (
+                    backfill_retained_conversation_ledger_entries(
+                        evidence_conn,
+                        batch_size=1000,
+                    )
+                )
+            except Exception as retained_exc:
+                logging.warning(
+                    "retained_conversation_ledger_backfill_failed "
+                    "error_type=%s",
+                    type(retained_exc).__name__,
+                )
+                retained_conversation_backfill = {
+                    "phase": "error",
+                    "completed": False,
+                    "counts": {"processing_error": 1},
+                }
             try:
                 knowledge_backfill = backfill_atomic_knowledge_candidates(
                     evidence_conn,
@@ -5405,6 +5419,13 @@ def init_db():
             orphan_reconciliation,
         )
     if memory_ledger_shadow_enabled():
+        logging.info(
+            "retained_conversation_ledger_backfill "
+            "phase=%s completed=%s counts=%s",
+            retained_conversation_backfill.get("phase"),
+            int(bool(retained_conversation_backfill.get("completed"))),
+            retained_conversation_backfill.get("counts"),
+        )
         logging.info(
             "atomic_knowledge_backfill phase=%s completed=%s counts=%s",
             knowledge_backfill.get("phase"),
@@ -21580,6 +21601,7 @@ def _build_unified_intelligence_packet_shadow(
     channel_id: int,
     current_text: str,
     current_speaker_user_ids: tuple[int, ...],
+    current_speaker_labels: tuple[str, ...],
     target_user_ids: tuple[int, ...],
     participant_user_ids: tuple[int, ...],
     conversation_evidence_items: tuple[ConversationEvidenceItem, ...],
@@ -21615,6 +21637,14 @@ def _build_unified_intelligence_packet_shadow(
         subject_user_id = current_speakers[0]
     else:
         subject_user_id = 0
+    speaker_labels_by_user_id = {
+        int(user_id): str(label or "")[:120]
+        for user_id, label in zip(
+            current_speakers,
+            tuple(current_speaker_labels or ()),
+        )
+        if int(user_id or 0) > 0 and str(label or "").strip()
+    }
     participants = tuple(
         dict.fromkeys(
             int(user_id or 0)
@@ -21649,6 +21679,10 @@ def _build_unified_intelligence_packet_shadow(
         subject_user_id=int(subject_user_id or 0),
         route_mode=str(route_mode or "unknown"),
         conversation_surface=str(conversation_surface or "unknown"),
+        subject_display_name=speaker_labels_by_user_id.get(
+            int(subject_user_id or 0),
+            "",
+        ),
         channel_id=int(channel_id or 0),
         channel_policy=str(channel_policy or "unknown"),
         visibility_allowance=visibility_allowance,
@@ -21837,6 +21871,7 @@ def build_unified_response_assessment_shadow(
         channel_id=channel_id,
         current_text=current_text,
         current_speaker_user_ids=current_speaker_user_ids,
+        current_speaker_labels=current_speaker_labels,
         target_user_ids=target_user_ids,
         participant_user_ids=participant_user_ids,
         conversation_evidence_items=semantic_evidence_items,
@@ -33185,6 +33220,46 @@ async def maybe_generate_shared_brain_synthesis_canary(
 
     if basis is None:
         return None
+    if basis.honest_empty_profile_fallback:
+        honest_response = honest_empty_profile_response()
+        try:
+            run = await asyncio.to_thread(
+                _begin_shared_brain_synthesis_receipt,
+                basis,
+                honest_response,
+                candidate_prompt_ready=False,
+                candidate_prompt_failure_reason=(
+                    "profile_sufficiency_empty"
+                ),
+                replaced_factual_context_count=0,
+            )
+        except Exception as exc:
+            logging.warning(
+                "shared_brain_empty_profile_receipt_failed error=%s",
+                type(exc).__name__,
+            )
+            return None
+        decision = SynthesisCanaryDecision(
+            run=run,
+            response=honest_response,
+            candidate_selected=False,
+            fallback_reason=(
+                run.fallback_reason
+                or "profile_sufficiency_empty_honest_fallback"
+            ),
+            comparison_status="not_comparable",
+            baseline_coherence_status="not_evaluated",
+            candidate_coherence_status="not_evaluated",
+            candidate_evidence_coverage_count=0,
+            revalidation_status=run.revalidation_status,
+        )
+        return SharedBrainSynthesisExecution(
+            decision=decision,
+            response=honest_response,
+            prompt=prompt,
+            prompt_source_bases=prompt_source_bases,
+            candidate_active=False,
+        )
     packet_owned_prompt = build_packet_owned_prompt(prompt, basis)
     try:
         run = await asyncio.to_thread(
@@ -36838,13 +36913,21 @@ async def execute_bnl_memory_preview(
                 ),
             )
 
+        honest_empty_profile = bool(
+            initial.basis is not None
+            and initial.basis.honest_empty_profile_fallback
+        )
         baseline_response = (
-            await generate(
-                initial.request.baseline_prompt,
-                "bnl_memory_preview_baseline",
-            )
-            or ""
-        ).strip()
+            honest_empty_profile_response()
+            if honest_empty_profile
+            else (
+                await generate(
+                    initial.request.baseline_prompt,
+                    "bnl_memory_preview_baseline",
+                )
+                or ""
+            ).strip()
+        )
         if not baseline_response:
             baseline_response = (
                 "I do not have enough eligible public-safe memory to give "
@@ -37188,6 +37271,8 @@ async def execute_bnl_memory_preview(
         final_selection = (
             "suppressed"
             if not proposed_response
+            else "honest_empty_profile_fallback"
+            if honest_empty_profile
             else "cleanup_salvage"
             if evaluation.candidate_selected and cleanup_salvage_applied
             else "cleanup_attempt"

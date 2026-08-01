@@ -36,6 +36,42 @@ or when the packet and response-assessment shadows are unavailable.
 - Every candidate is revalidated before send; any failure returns to the
   established response.
 
+## Same-platform canon recognition
+
+Mac Modem, Cache Back, and DJ Floppydisc now have standalone facts in the
+structured canon contract. A broad self-profile may connect one of those
+identities to the requesting Discord account only when all of these conditions
+hold:
+
+- the member's current Discord display name is an exact, unambiguous approved
+  canon name or alias;
+- at least two active, public-safe conversation Ledger roots for that same
+  Discord user carry the same approved name; and
+- the signal still matches during send-time packet revalidation.
+
+The result is a reversible response-time recognition signal, not a persistent
+account merge or cross-platform identity claim. Near matches, ambiguous names,
+one-row names, private rows, and non-public routes do not qualify. The existing
+6 Bit owner path is unchanged.
+
+When the recognized member has no durable motif but does have public
+conversation evidence, the packet may select exactly one assessment
+observation and require cautious wording. That observation does not become a
+trait, Moment, or atomic-memory candidate. Stronger claims still require the
+existing independent-root and independent-occurrence thresholds.
+
+If a broad profile remains empty, the enabled owner route returns a fixed
+thin-record response rather than asking the model to improvise a biography.
+
+## Retained-conversation catch-up
+
+Startup runs one bounded, resumable pass through public retained user
+conversations that predate their Ledger projection. It uses the existing
+Ledger writer, excludes internal/sealed and model rows, and is idempotent.
+Motif formation is explicitly disabled during this pass, so catch-up alone
+cannot create or promote durable memory. Later restarts resume an unfinished
+slice from the recorded cursor.
+
 ## Diagnostics and rollback
 
 Content-free synthesis receipts record `authority_mode` as either

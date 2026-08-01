@@ -4,7 +4,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import Enum
 from datetime import datetime, timezone, timedelta
+import re
 from typing import Any, Iterable
+import unicodedata
 
 CANON_SOURCE_CONTRACT_VERSION = "canon_source_contract_v1"
 
@@ -91,8 +93,35 @@ BARCODE = SubjectIdentity("barcode", "BARCODE", ("BARCODE collective",))
 BARCODE_NETWORK = SubjectIdentity("barcode_network", "BARCODE Network")
 BARCODE_RADIO = SubjectIdentity("barcode_radio", "BARCODE Radio")
 SIX_BIT = SubjectIdentity("6_bit", "6 Bit", ("Six Bit",))
+DJ_FLOPPYDISC = SubjectIdentity(
+    "dj_floppydisc",
+    "DJ Floppydisc",
+    ("DJ Floppy Disc",),
+)
+CACHE_BACK = SubjectIdentity(
+    "cache_back",
+    "Cache Back",
+    ("Call'em Bini", "Call’em Bini"),
+)
+MAC_MODEM = SubjectIdentity(
+    "mac_modem",
+    "Mac Modem",
+    ("Mac Mod3m",),
+)
 GALAKNOISE = SubjectIdentity("galaknoise", "GALAKNOISE")
 BNL01 = SubjectIdentity("bnl_01", "BNL-01", ("BNL", "BARCODE Network Liaison Entity"))
+
+CANON_MEMBER_IDENTITIES = (
+    SIX_BIT,
+    DJ_FLOPPYDISC,
+    CACHE_BACK,
+    MAC_MODEM,
+)
+AUTOMATIC_CANON_SIGNAL_IDENTITIES = (
+    DJ_FLOPPYDISC,
+    CACHE_BACK,
+    MAC_MODEM,
+)
 
 FOUNDING_MEMBERS = ("6 Bit", "DJ Floppydisc", "Cache Back", "Mac Modem")
 FRIDAY_PUBLIC_SCHEDULE = FridaySchedule("6:40 PM Pacific", "7:00 PM Pacific", "7:05 PM Pacific")
@@ -106,6 +135,15 @@ CANON_FACTS = (
     CanonFact(BARCODE, "founding_members", FOUNDING_MEMBERS),
     CanonFact(BARCODE_NETWORK, "origin", "The music and collective existed before BARCODE Network; the Network grew around that signal and now connects music, live broadcasts, community, software, archive, characters, and story."),
     CanonFact(SIX_BIT, "primary_identity", "artist, MC, host, and founding BARCODE member first"),
+    CanonFact(DJ_FLOPPYDISC, "primary_identity", "founding BARCODE member and signal/audio engineer who stabilizes sound, cleans artifacts, and handles mastering and final waveform integrity"),
+    CanonFact(DJ_FLOPPYDISC, "behavior", "quiet professional who prefers to fix problems rather than talk about them"),
+    CanonFact(DJ_FLOPPYDISC, "typical_involvement", "mixes and masters BARCODE material"),
+    CanonFact(CACHE_BACK, "primary_identity", "founding BARCODE member and BARCODE Archive specialist"),
+    CanonFact(CACHE_BACK, "behavior", "meticulous, detail-obsessed, and protective of lost data and recovered fragments"),
+    CanonFact(CACHE_BACK, "typical_involvement", "recovers fragments and protects archive continuity"),
+    CanonFact(MAC_MODEM, "primary_identity", "founding BARCODE member and chaotic tech entity / glitch-virus presence in the BARCODE ecosystem"),
+    CanonFact(MAC_MODEM, "behavior", "unpredictable, mischievous, and sometimes disruptive; not reliably malicious, but risky"),
+    CanonFact(MAC_MODEM, "typical_involvement", "unexpected distortions, interface corruption, and broadcast anomalies"),
     CanonFact(GALAKNOISE, "primary_role", "music producer for BARCODE"),
     CanonFact(BARCODE_RADIO, "public_nature", "real weekly live broadcast and community music space on TikTok"),
     CanonFact(BARCODE_RADIO, "friday_public_schedule", FRIDAY_PUBLIC_SCHEDULE),
@@ -178,6 +216,69 @@ _PROJECTION_CLASSES = {SourceClass.DERIVED_SUMMARY, SourceClass.SOURCE_FILE_PROJ
 
 def render_founders() -> str:
     return " • ".join(FOUNDING_MEMBERS)
+
+
+def normalize_canon_identity_label(value: Any) -> str:
+    """Normalize one same-platform display label for exact canon matching."""
+
+    cleaned = unicodedata.normalize("NFKC", str(value or ""))
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    cleaned = cleaned.strip(" \t\r\n,.;:!?\"'“”‘’")
+    if not cleaned or len(cleaned) > 80:
+        return ""
+    return cleaned.casefold()
+
+
+def matching_canon_member_identities(
+    labels: Iterable[Any],
+) -> tuple[SubjectIdentity, ...]:
+    """Return unique approved member subjects matched by exact labels only."""
+
+    normalized = set()
+    for label in labels:
+        normalized_label = normalize_canon_identity_label(label)
+        if normalized_label:
+            normalized.add(normalized_label)
+    if not normalized:
+        return ()
+    matches = []
+    for subject in CANON_MEMBER_IDENTITIES:
+        aliases = set()
+        for alias in (subject.name, *subject.aliases):
+            normalized_alias = normalize_canon_identity_label(alias)
+            if normalized_alias:
+                aliases.add(normalized_alias)
+        if normalized.intersection(aliases):
+            matches.append(subject)
+    return tuple(matches)
+
+
+def canon_facts_for_subject(
+    subject: SubjectIdentity,
+) -> tuple[CanonFact, ...]:
+    return tuple(
+        fact for fact in CANON_FACTS if fact.subject.key == subject.key
+    )
+
+
+def render_key_personnel_canon_block() -> str:
+    """Render the prompt shorthand from the structured canon facts."""
+
+    lines = ["Key Personnel (core members + shorthand canon):"]
+    for subject in (CACHE_BACK, DJ_FLOPPYDISC, MAC_MODEM):
+        facts = {
+            fact.predicate: str(fact.value)
+            for fact in canon_facts_for_subject(subject)
+        }
+        lines.extend(
+            (
+                f"- {subject.name}:",
+                f"  - Function: {facts['primary_identity']}.",
+                f"  - Behavior: {facts['behavior']}.",
+                f"  - Typical involvement: {facts['typical_involvement']}.",
+            )
+        )
+    return "\n".join(lines)
 
 def render_full_friday_schedule() -> str:
     return f"BARCODE Radio Friday schedule: submissions/intake begins at {FRIDAY_PUBLIC_SCHEDULE.intake_begins}; the show begins at {FRIDAY_PUBLIC_SCHEDULE.show_begins}; the first track is targeted for {FRIDAY_PUBLIC_SCHEDULE.first_track_target}."

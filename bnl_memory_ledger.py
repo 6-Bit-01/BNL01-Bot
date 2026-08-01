@@ -32,6 +32,9 @@ from bnl_canon_source_contract import (
 MEMORY_LEDGER_SCHEMA_VERSION = "memory_ledger_v1"
 ATOMIC_KNOWLEDGE_SCHEMA_VERSION = "memory_ledger_atomic_knowledge_v1"
 ATOMIC_KNOWLEDGE_BACKFILL = "atomic_knowledge_backfill_v1"
+RETAINED_CONVERSATION_LEDGER_BACKFILL = (
+    "retained_conversation_ledger_backfill_v1"
+)
 ATOMIC_KNOWLEDGE_LIFECYCLE_SCHEMA_VERSION = (
     "memory_ledger_atomic_knowledge_lifecycle_v1"
 )
@@ -6128,6 +6131,227 @@ def form_atomic_candidates_from_moment(
 def _merge_backfill_count(counts: dict[str, int], outcome: str) -> None:
     key = str(outcome or "unknown")
     counts[key] = int(counts.get(key, 0) or 0) + 1
+
+
+def backfill_retained_conversation_ledger_entries(
+    conn: sqlite3.Connection,
+    *,
+    batch_size: int = 1000,
+    environ: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    """Project one bounded slice of retained public chat into the Ledger.
+
+    This is a resumable repair for conversation rows that predate the Ledger
+    adapter. It uses the ordinary Ledger writer, excludes non-public and model
+    rows, and explicitly disables motif formation so projection alone cannot
+    create or promote a durable member claim.
+    """
+
+    env = dict(os.environ if environ is None else environ)
+    if not shadow_enabled(env):
+        return {
+            "migration": RETAINED_CONVERSATION_LEDGER_BACKFILL,
+            "phase": "disabled",
+            "completed": False,
+            "counts": {},
+        }
+    ensure_memory_ledger_schema(conn)
+    columns = _conversation_projection_columns(conn)
+    required = {
+        "id",
+        "guild_id",
+        "user_id",
+        "role",
+        "content",
+        "channel_policy",
+    }
+    if not required.issubset(columns):
+        return {
+            "migration": RETAINED_CONVERSATION_LEDGER_BACKFILL,
+            "phase": "source_unavailable",
+            "completed": False,
+            "counts": {"retained_source_unavailable": 1},
+        }
+    safe_batch = max(1, min(int(batch_size or 1000), 2000))
+    state = conn.execute(
+        """
+        SELECT phase,cursor_value,completed,counts_json
+        FROM memory_ledger_knowledge_backfill
+        WHERE migration_key=?
+        """,
+        (RETAINED_CONVERSATION_LEDGER_BACKFILL,),
+    ).fetchone()
+    if state:
+        phase = str(state[0] or "conversations")
+        cursor = int(state[1] or 0)
+        completed = bool(state[2])
+        try:
+            counts = {
+                str(key): int(value or 0)
+                for key, value in json.loads(str(state[3] or "{}")).items()
+            }
+        except (TypeError, ValueError, json.JSONDecodeError):
+            counts = {}
+    else:
+        phase, cursor, completed, counts = "conversations", 0, False, {}
+        conn.execute(
+            """
+            INSERT INTO memory_ledger_knowledge_backfill(
+              migration_key,phase,cursor_value,completed,counts_json,updated_at
+            ) VALUES(?,?,?,?,?,?)
+            """,
+            (
+                RETAINED_CONVERSATION_LEDGER_BACKFILL,
+                phase,
+                "",
+                0,
+                "{}",
+                _now(),
+            ),
+        )
+    if completed:
+        return {
+            "migration": RETAINED_CONVERSATION_LEDGER_BACKFILL,
+            "phase": phase,
+            "completed": True,
+            "counts": counts,
+        }
+
+    optional = {
+        "user_name": "''",
+        "channel_name": "''",
+        "channel_id": "0",
+        "message_id": "NULL",
+        "timestamp": "''",
+    }
+    select = [
+        "c.id",
+        "c.user_id",
+        (
+            "c.user_name"
+            if "user_name" in columns
+            else "%s AS user_name" % optional["user_name"]
+        ),
+        "c.guild_id",
+        "c.content",
+        (
+            "c.channel_name"
+            if "channel_name" in columns
+            else "%s AS channel_name" % optional["channel_name"]
+        ),
+        "c.channel_policy",
+        (
+            "c.channel_id"
+            if "channel_id" in columns
+            else "%s AS channel_id" % optional["channel_id"]
+        ),
+        (
+            "c.message_id"
+            if "message_id" in columns
+            else "%s AS message_id" % optional["message_id"]
+        ),
+        (
+            "c.timestamp"
+            if "timestamp" in columns
+            else "%s AS timestamp" % optional["timestamp"]
+        ),
+    ]
+    cursor_filter = "AND c.id<?" if cursor > 0 else ""
+    parameters: tuple[Any, ...] = (
+        (cursor, safe_batch + 1)
+        if cursor > 0
+        else (safe_batch + 1,)
+    )
+    rows = conn.execute(
+        """
+        SELECT %s
+        FROM conversations c
+        LEFT JOIN memory_ledger_entries entry
+          ON entry.guild_id=c.guild_id
+         AND entry.source_table='conversations'
+         AND entry.source_row_id=CAST(c.id AS TEXT)
+         AND entry.source_role='user'
+        WHERE c.role='user'
+          AND c.guild_id>0 AND c.user_id>0
+          AND TRIM(c.content)<>''
+          AND c.channel_policy IN (
+            'public_home','public_context','public_selective'
+          )
+          AND entry.entry_id IS NULL
+          %s
+        ORDER BY c.id DESC
+        LIMIT ?
+        """
+        % (",".join(select), cursor_filter),
+        parameters,
+    ).fetchall()
+    batch = rows[:safe_batch]
+    keys = (
+        "id",
+        "user_id",
+        "user_name",
+        "guild_id",
+        "content",
+        "channel_name",
+        "channel_policy",
+        "channel_id",
+        "message_id",
+        "timestamp",
+    )
+    projection_env = dict(env)
+    projection_env[CONVERSATION_MOTIF_FORMATION_ENV] = "false"
+    for raw in reversed(batch):
+        row = dict(zip(keys, raw))
+        result = shadow_conversation_row(
+            conn,
+            row_id=int(row.get("id") or 0),
+            user_id=int(row.get("user_id") or 0),
+            user_name=str(row.get("user_name") or "")[:120],
+            guild_id=int(row.get("guild_id") or 0),
+            role="user",
+            content=str(row.get("content") or "")[:1000],
+            channel_name=str(row.get("channel_name") or "")[:80],
+            channel_policy=str(row.get("channel_policy") or ""),
+            channel_id=int(row.get("channel_id") or 0),
+            message_id=(int(row.get("message_id") or 0) or None),
+            route_mode="conversation_continuity",
+            observed_at=str(row.get("timestamp") or ""),
+            source_sequence=(
+                int(row.get("message_id") or 0)
+                or int(row.get("id") or 0)
+            ),
+            environ=projection_env,
+        )
+        _merge_backfill_count(counts, result.outcome)
+    counts["rows_scanned"] = int(counts.get("rows_scanned", 0) or 0) + len(
+        batch
+    )
+    if batch:
+        cursor = int(batch[-1][0] or 0)
+    completed = len(rows) <= safe_batch
+    if completed:
+        phase, cursor = "complete", 0
+    conn.execute(
+        """
+        UPDATE memory_ledger_knowledge_backfill
+        SET phase=?,cursor_value=?,completed=?,counts_json=?,updated_at=?
+        WHERE migration_key=?
+        """,
+        (
+            phase,
+            str(cursor or ""),
+            1 if completed else 0,
+            json.dumps(counts, sort_keys=True),
+            _now(),
+            RETAINED_CONVERSATION_LEDGER_BACKFILL,
+        ),
+    )
+    return {
+        "migration": RETAINED_CONVERSATION_LEDGER_BACKFILL,
+        "phase": phase,
+        "completed": completed,
+        "counts": counts,
+    }
 
 
 def backfill_atomic_knowledge_candidates(
