@@ -757,6 +757,11 @@ class UnifiedIntelligencePacketTests(unittest.TestCase):
             for item in packet.items
             if item.lane == "assessment_observation"
         )
+        validation_observations = tuple(
+            item
+            for item in packet.validation_items
+            if item.lane == "assessment_observation"
+        )
 
         self.assertEqual(
             packet.diagnostics.candidates_by_lane[
@@ -765,6 +770,13 @@ class UnifiedIntelligencePacketTests(unittest.TestCase):
             6,
         )
         self.assertEqual(len(assessment_items), 4)
+        self.assertEqual(len(validation_observations), 6)
+        self.assertEqual(
+            packet.diagnostics.validation_support_by_lane.get(
+                "assessment_observation"
+            ),
+            6,
+        )
         self.assertGreaterEqual(
             sum(
                 any(

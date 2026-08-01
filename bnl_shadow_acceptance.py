@@ -759,9 +759,11 @@ def _read_intelligence_packet_report(
         return _report_error(
             {
                 "tablePresent": False,
-                "schemaVersion": "unified_intelligence_packet_v2",
+                "schemaVersion": "unified_intelligence_packet_v3",
                 "runs": 0,
                 "itemTotal": 0,
+                "validationItemTotal": 0,
+                "validationByLane": {},
                 "selectedByLane": {},
                 "selectedBySourceClass": {},
                 "selectedAtomicStates": {},
@@ -798,7 +800,7 @@ def _read_shared_brain_synthesis_report(
         return _report_error(
             {
                 "tablePresent": False,
-                "schemaVersion": "shared_brain_synthesis_v4",
+                "schemaVersion": "shared_brain_synthesis_v5",
                 "runs": 0,
                 "promptAppliedRuns": 0,
                 "liveAppliedRuns": 0,
@@ -809,7 +811,12 @@ def _read_shared_brain_synthesis_report(
                 "baselineCoherenceStatusCounts": {},
                 "candidateCoherenceStatusCounts": {},
                 "candidateEvidenceCoverageTotal": 0,
+                "validationItemTotal": 0,
+                "baselineMemberPointCoverageTotal": 0,
+                "baselineMemberDetailCoverageTotal": 0,
+                "baselineCanonCoverageTotal": 0,
                 "candidateMemberPointCoverageTotal": 0,
+                "candidateMemberDetailCoverageTotal": 0,
                 "candidateMemberRootCoverageTotal": 0,
                 "candidateMemberOccurrenceCoverageTotal": 0,
                 "candidateCanonCoverageTotal": 0,
@@ -818,6 +825,7 @@ def _read_shared_brain_synthesis_report(
                 "candidateCanonSupportedClaimTotal": 0,
                 "candidateOpinionClaimTotal": 0,
                 "candidateConnectiveClaimTotal": 0,
+                "supportedCoverageRegressionRuns": 0,
                 "candidateUnsupportedFactualClaimTotal": 0,
                 "promptFactualOwnerRuns": 0,
                 "promptOwnershipFailureRuns": 0,
@@ -837,6 +845,7 @@ def _read_shared_brain_synthesis_report(
                 "liveInsufficientMemberCoverageRuns": 0,
                 "liveLoreDominantRuns": 0,
                 "liveUnsupportedFactualClaimRuns": 0,
+                "liveSupportedCoverageRegressionRuns": 0,
                 "livePromptOwnershipViolationRuns": 0,
                 "relationshipPostureAppliedRuns": 0,
                 "contentFieldsPresent": [],
@@ -1172,6 +1181,7 @@ def build_v2_shadow_acceptance_snapshot(
         "liveUngroundedRuns",
         "liveInsufficientMemberCoverageRuns",
         "liveUnsupportedFactualClaimRuns",
+        "liveSupportedCoverageRegressionRuns",
         "livePromptOwnershipViolationRuns",
         "relationshipPostureAppliedRuns",
     ):
@@ -1901,7 +1911,7 @@ def render_v2_shadow_acceptance_lines(snapshot: Mapping[str, Any]) -> List[str]:
             ),
         ),
         "- relationship_legacy_v2_comparison: `%s`" % relationship.get("legacy_v2_comparison", "not_collected"),
-        "- unified_intelligence_packet: status=`%s` requested=`%s` effective=`%s` reason=`%s` schema=`%s` runs=`%s` items=`%s` lanes=`%s` sources=`%s` atomic_states=`%s` missing=`%s` conflicts=`%s` revalidation=`%s` source_changes=`%s` errors=`%s` invalid_invariants=`%s` prompt_applied=`%s` live_applied=`%s` content_fields=`%s` window_last=`%s`" % (
+        "- unified_intelligence_packet: status=`%s` requested=`%s` effective=`%s` reason=`%s` schema=`%s` runs=`%s` items=`%s` validation_items=`%s` lanes=`%s` validation_lanes=`%s` sources=`%s` atomic_states=`%s` missing=`%s` conflicts=`%s` revalidation=`%s` source_changes=`%s` errors=`%s` invalid_invariants=`%s` prompt_applied=`%s` live_applied=`%s` content_fields=`%s` window_last=`%s`" % (
             intelligence_packet_state.get(
                 "status",
                 "unknown",
@@ -1911,12 +1921,17 @@ def render_v2_shadow_acceptance_lines(snapshot: Mapping[str, Any]) -> List[str]:
             intelligence_packet_state.get("reason", "disabled"),
             intelligence_packet.get(
                 "schemaVersion",
-                "unified_intelligence_packet_v2",
+                "unified_intelligence_packet_v3",
             ),
             intelligence_packet.get("runs", 0),
             intelligence_packet.get("itemTotal", 0),
+            intelligence_packet.get("validationItemTotal", 0),
             json.dumps(
                 intelligence_packet.get("selectedByLane", {}),
+                sort_keys=True,
+            ),
+            json.dumps(
+                intelligence_packet.get("validationByLane", {}),
                 sort_keys=True,
             ),
             json.dumps(
@@ -1974,7 +1989,7 @@ def render_v2_shadow_acceptance_lines(snapshot: Mapping[str, Any]) -> List[str]:
                 "none",
             ),
         ),
-        "- shared_brain_synthesis_canary: status=`%s` requested=`%s` effective=`%s` reason=`%s` fully_scoped=`%s` schema=`%s` runs=`%s` route_families=`%s` authority_modes=`%s` prompt_applied=`%s` candidate_selected=`%s` live_applied=`%s` responses_sent=`%s` fallbacks=`%s` fallback_reasons=`%s` comparison=`%s` baseline_coherence=`%s` candidate_coherence=`%s` evidence_coverage=`%s` member_points=`%s` member_roots=`%s` member_occurrences=`%s` canon_coverage=`%s` member_supported_claims=`%s` canon_supported_claims=`%s` opinion_claims=`%s` connective_claims=`%s` unsupported_factual_claims=`%s` prompt_factual_owner=`%s` prompt_owner_failures=`%s` candidate_latency_ms=`%s` revalidation=`%s` control_leaks=`%s` errors=`%s` invalid_scope=`%s` invalid_revalidation_live=`%s` ungrounded_live=`%s` insufficient_member_live=`%s` unsupported_factual_live=`%s` prompt_owner_violation_live=`%s` relationship_posture_applied=`%s` content_fields=`%s` window_last=`%s`" % (
+        "- shared_brain_synthesis_canary: status=`%s` requested=`%s` effective=`%s` reason=`%s` fully_scoped=`%s` schema=`%s` runs=`%s` route_families=`%s` authority_modes=`%s` prompt_applied=`%s` candidate_selected=`%s` live_applied=`%s` responses_sent=`%s` fallbacks=`%s` fallback_reasons=`%s` comparison=`%s` baseline_coherence=`%s` candidate_coherence=`%s` evidence_coverage=`%s` validation_items=`%s` baseline_points=`%s` baseline_details=`%s` baseline_canon=`%s` member_points=`%s` member_details=`%s` member_roots=`%s` member_occurrences=`%s` canon_coverage=`%s` coverage_regressions=`%s` member_supported_claims=`%s` canon_supported_claims=`%s` opinion_claims=`%s` connective_claims=`%s` unsupported_factual_claims=`%s` prompt_factual_owner=`%s` prompt_owner_failures=`%s` candidate_latency_ms=`%s` revalidation=`%s` control_leaks=`%s` errors=`%s` invalid_scope=`%s` invalid_revalidation_live=`%s` ungrounded_live=`%s` insufficient_member_live=`%s` unsupported_factual_live=`%s` coverage_regression_live=`%s` prompt_owner_violation_live=`%s` relationship_posture_applied=`%s` content_fields=`%s` window_last=`%s`" % (
             shared_brain_synthesis_state.get("status", "unknown"),
             _on(shared_brain_synthesis_state.get("requested")),
             _on(shared_brain_synthesis_state.get("effective")),
@@ -1982,7 +1997,7 @@ def render_v2_shadow_acceptance_lines(snapshot: Mapping[str, Any]) -> List[str]:
             _on(shared_brain_synthesis_state.get("fullyScoped")),
             shared_brain_synthesis.get(
                 "schemaVersion",
-                "shared_brain_synthesis_v4",
+                "shared_brain_synthesis_v5",
             ),
             shared_brain_synthesis.get("runs", 0),
             json.dumps(
@@ -2027,8 +2042,25 @@ def render_v2_shadow_acceptance_lines(snapshot: Mapping[str, Any]) -> List[str]:
                 "candidateEvidenceCoverageTotal",
                 0,
             ),
+            shared_brain_synthesis.get("validationItemTotal", 0),
+            shared_brain_synthesis.get(
+                "baselineMemberPointCoverageTotal",
+                0,
+            ),
+            shared_brain_synthesis.get(
+                "baselineMemberDetailCoverageTotal",
+                0,
+            ),
+            shared_brain_synthesis.get(
+                "baselineCanonCoverageTotal",
+                0,
+            ),
             shared_brain_synthesis.get(
                 "candidateMemberPointCoverageTotal",
+                0,
+            ),
+            shared_brain_synthesis.get(
+                "candidateMemberDetailCoverageTotal",
                 0,
             ),
             shared_brain_synthesis.get(
@@ -2041,6 +2073,10 @@ def render_v2_shadow_acceptance_lines(snapshot: Mapping[str, Any]) -> List[str]:
             ),
             shared_brain_synthesis.get(
                 "candidateCanonCoverageTotal",
+                0,
+            ),
+            shared_brain_synthesis.get(
+                "supportedCoverageRegressionRuns",
                 0,
             ),
             shared_brain_synthesis.get(
@@ -2096,6 +2132,10 @@ def render_v2_shadow_acceptance_lines(snapshot: Mapping[str, Any]) -> List[str]:
             ),
             shared_brain_synthesis.get(
                 "liveUnsupportedFactualClaimRuns",
+                0,
+            ),
+            shared_brain_synthesis.get(
+                "liveSupportedCoverageRegressionRuns",
                 0,
             ),
             shared_brain_synthesis.get(

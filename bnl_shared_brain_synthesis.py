@@ -37,7 +37,7 @@ from bnl_unified_response_assessment import (
 )
 
 
-SCHEMA_VERSION = "shared_brain_synthesis_v4"
+SCHEMA_VERSION = "shared_brain_synthesis_v5"
 TABLE_NAME = "memory_governance_shared_brain_synthesis_runs"
 ENABLED_ENV = "BNL_SHARED_BRAIN_SYNTHESIS_CANARY_ENABLED"
 GUILD_IDS_ENV = "BNL_SHARED_BRAIN_SYNTHESIS_CANARY_GUILD_IDS"
@@ -568,7 +568,11 @@ class SynthesisCanaryDecision:
     candidate_evidence_coverage_count: int
     revalidation_status: str
     candidate_generation_latency_ms: int = 0
+    baseline_member_point_coverage_count: int = 0
+    baseline_member_detail_coverage_count: int = 0
+    baseline_canon_coverage_count: int = 0
     candidate_member_point_coverage_count: int = 0
+    candidate_member_detail_coverage_count: int = 0
     candidate_member_root_coverage_count: int = 0
     candidate_member_occurrence_coverage_count: int = 0
     candidate_canon_coverage_count: int = 0
@@ -579,6 +583,7 @@ class SynthesisCanaryDecision:
     candidate_connective_claim_count: int = 0
     candidate_unsupported_factual_claim_count: int = 0
     candidate_claim_classifications: tuple[str, ...] = ()
+    supported_coverage_regressed: bool = False
 
 
 @dataclass(frozen=True)
@@ -616,6 +621,9 @@ class CandidateProfileCoverage:
     connective_claim_count: int = 0
     unsupported_factual_claim_count: int = 0
     claim_classifications: tuple[str, ...] = ()
+    covered_member_point_identities: tuple[str, ...] = ()
+    covered_member_detail_point_identities: tuple[str, ...] = ()
+    covered_canon_source_digests: tuple[str, ...] = ()
 
 
 def _flag(value: Any) -> bool:
@@ -2582,14 +2590,12 @@ def candidate_profile_coverage(
     if not _candidate_claim_units(response):
         return CandidateProfileCoverage()
     response_terms = _semantic_terms(_factual_candidate_text(response))
-    rendered_items = tuple(
-        item
-        for item in basis.packet.items
-        if item.source_digest in basis.rendered_source_digests
+    validation_items = tuple(
+        getattr(basis.packet, "validation_items", ()) or basis.packet.items
     )
     member_items = tuple(
         item
-        for item in rendered_items
+        for item in validation_items
         if item.lane in _PROFILE_MEMBER_LANES
         and item.point_identity
     )
@@ -2642,7 +2648,7 @@ def candidate_profile_coverage(
 
     covered_items = tuple(
         item
-        for item in rendered_items
+        for item in validation_items
         if response_terms & _semantic_terms(_item_evidence_text(item))
     )
     covered_member_items = tuple(
@@ -2682,16 +2688,16 @@ def candidate_profile_coverage(
     }
     covered_canon = tuple(
         item
-        for item in rendered_items
+        for item in validation_items
         if item.lane == "canon"
-        and response_terms & _item_profile_terms(item)
+        and len(response_terms & _item_profile_terms(item)) >= 2
     )
     canon_items = tuple(
-        item for item in rendered_items if item.lane == "canon"
+        item for item in validation_items if item.lane == "canon"
     )
     claim_member_items = tuple(
         item
-        for item in rendered_items
+        for item in validation_items
         if item.lane in _CLAIM_MEMBER_LANES
     )
     (
@@ -2739,6 +2745,13 @@ def candidate_profile_coverage(
         connective_claim_count=connective_claims,
         unsupported_factual_claim_count=unsupported_factual_claims,
         claim_classifications=claim_classifications,
+        covered_member_point_identities=tuple(sorted(covered_points)),
+        covered_member_detail_point_identities=tuple(
+            sorted(covered_detail_points)
+        ),
+        covered_canon_source_digests=tuple(
+            sorted(item.source_digest for item in covered_canon)
+        ),
     )
 
 
@@ -2747,6 +2760,25 @@ def candidate_evidence_coverage(
     response: str,
 ) -> int:
     return candidate_profile_coverage(basis, response).total_item_count
+
+
+def _supported_profile_coverage_regressed(
+    baseline: CandidateProfileCoverage,
+    candidate: CandidateProfileCoverage,
+) -> bool:
+    """Return whether a candidate drops exact safe support used by baseline."""
+
+    return bool(
+        not set(baseline.covered_member_point_identities).issubset(
+            candidate.covered_member_point_identities
+        )
+        or not set(
+            baseline.covered_member_detail_point_identities
+        ).issubset(candidate.covered_member_detail_point_identities)
+        or not set(baseline.covered_canon_source_digests).issubset(
+            candidate.covered_canon_source_digests
+        )
+    )
 
 
 def ensure_schema(conn: sqlite3.Connection) -> None:
@@ -2765,6 +2797,7 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
             route_mode TEXT NOT NULL,
             channel_policy TEXT NOT NULL,
             packet_item_count INTEGER NOT NULL DEFAULT 0,
+            validation_item_count INTEGER NOT NULL DEFAULT 0,
             rendered_item_count INTEGER NOT NULL DEFAULT 0,
             rendered_lane_counts_json TEXT NOT NULL DEFAULT '{}',
             packet_digest TEXT NOT NULL,
@@ -2782,7 +2815,11 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
             baseline_coherence_status TEXT NOT NULL DEFAULT 'not_evaluated',
             candidate_coherence_status TEXT NOT NULL DEFAULT 'not_evaluated',
             candidate_evidence_coverage_count INTEGER NOT NULL DEFAULT 0,
+            baseline_member_point_coverage_count INTEGER NOT NULL DEFAULT 0,
+            baseline_member_detail_coverage_count INTEGER NOT NULL DEFAULT 0,
+            baseline_canon_coverage_count INTEGER NOT NULL DEFAULT 0,
             candidate_member_point_coverage_count INTEGER NOT NULL DEFAULT 0,
+            candidate_member_detail_coverage_count INTEGER NOT NULL DEFAULT 0,
             candidate_member_root_coverage_count INTEGER NOT NULL DEFAULT 0,
             candidate_member_occurrence_coverage_count INTEGER NOT NULL DEFAULT 0,
             candidate_canon_coverage_count INTEGER NOT NULL DEFAULT 0,
@@ -2793,6 +2830,7 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
             candidate_connective_claim_count INTEGER NOT NULL DEFAULT 0,
             candidate_unsupported_factual_claim_count INTEGER NOT NULL DEFAULT 0,
             candidate_claim_classification_counts_json TEXT NOT NULL DEFAULT '{}',
+            supported_coverage_regressed INTEGER NOT NULL DEFAULT 0,
             candidate_output_leak INTEGER NOT NULL DEFAULT 0,
             profile_sufficiency_status TEXT NOT NULL DEFAULT 'not_applicable',
             profile_required_point_count INTEGER NOT NULL DEFAULT 0,
@@ -2840,8 +2878,25 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
             """
         )
     for column, definition in (
+        ("validation_item_count", "INTEGER NOT NULL DEFAULT 0"),
+        (
+            "baseline_member_point_coverage_count",
+            "INTEGER NOT NULL DEFAULT 0",
+        ),
+        (
+            "baseline_member_detail_coverage_count",
+            "INTEGER NOT NULL DEFAULT 0",
+        ),
+        (
+            "baseline_canon_coverage_count",
+            "INTEGER NOT NULL DEFAULT 0",
+        ),
         (
             "candidate_member_point_coverage_count",
+            "INTEGER NOT NULL DEFAULT 0",
+        ),
+        (
+            "candidate_member_detail_coverage_count",
             "INTEGER NOT NULL DEFAULT 0",
         ),
         (
@@ -2881,6 +2936,7 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
             "candidate_claim_classification_counts_json",
             "TEXT NOT NULL DEFAULT '{}'",
         ),
+        ("supported_coverage_regressed", "INTEGER NOT NULL DEFAULT 0"),
         (
             "profile_sufficiency_status",
             "TEXT NOT NULL DEFAULT 'not_applicable'",
@@ -2960,7 +3016,17 @@ def begin_run(
         fallback_reason = "packet_receipt_update_failed"
         processing_errors = 1
     source_ref_digest = _digest(
-        tuple(sorted(item.source_ref for item in basis.packet.items))
+        tuple(
+            sorted(
+                {
+                    item.source_ref
+                    for item in (
+                        *basis.packet.items,
+                        *getattr(basis.packet, "validation_items", ()),
+                    )
+                }
+            )
+        )
     )
     timestamp = created_at or _now()
     conn.execute(
@@ -3012,6 +3078,17 @@ def begin_run(
     )
     conn.execute(
         """
+        UPDATE memory_governance_shared_brain_synthesis_runs
+        SET validation_item_count=?
+        WHERE run_id=?
+        """,
+        (
+            len(getattr(basis.packet, "validation_items", ())),
+            run_id,
+        ),
+    )
+    conn.execute(
+        """
         DELETE FROM memory_governance_shared_brain_synthesis_runs
         WHERE guild_id=? AND run_id NOT IN (
           SELECT run_id
@@ -3055,9 +3132,17 @@ def evaluate_candidate(
         run.basis.assessment,
         candidate,
     )
+    baseline_coverage = candidate_profile_coverage(
+        run.basis,
+        baseline,
+    )
     profile_coverage = candidate_profile_coverage(
         run.basis,
         candidate,
+    )
+    supported_coverage_regressed = _supported_profile_coverage_regressed(
+        baseline_coverage,
+        profile_coverage,
     )
     evidence_coverage = profile_coverage.total_item_count
     output_leak = response_exposes_controls(candidate)
@@ -3122,6 +3207,8 @@ def evaluate_candidate(
         fallback_reason = "candidate_request_angle_missed"
     elif profile_coverage.unsupported_factual_claim_count > 0:
         fallback_reason = "candidate_claims_ungrounded"
+    elif supported_coverage_regressed:
+        fallback_reason = "candidate_supported_coverage_regressed"
     elif coherence_rank.get(candidate_coherence.status, 0) < coherence_rank.get(
         baseline_coherence.status,
         0,
@@ -3139,7 +3226,11 @@ def evaluate_candidate(
             ),comparison_status=?,
             baseline_coherence_status=?,candidate_coherence_status=?,
             candidate_evidence_coverage_count=?,candidate_output_leak=?,
+            baseline_member_point_coverage_count=?,
+            baseline_member_detail_coverage_count=?,
+            baseline_canon_coverage_count=?,
             candidate_member_point_coverage_count=?,
+            candidate_member_detail_coverage_count=?,
             candidate_member_root_coverage_count=?,
             candidate_member_occurrence_coverage_count=?,
             candidate_canon_coverage_count=?,candidate_lore_dominant=?,
@@ -3149,6 +3240,7 @@ def evaluate_candidate(
             candidate_connective_claim_count=?,
             candidate_unsupported_factual_claim_count=?,
             candidate_claim_classification_counts_json=?,
+            supported_coverage_regressed=?,
             revalidation_status=?,
             candidate_selected=?,fallback_reason=?,
             processing_error_count=processing_error_count+?,
@@ -3169,7 +3261,11 @@ def evaluate_candidate(
             candidate_coherence.status,
             evidence_coverage,
             int(output_leak),
+            baseline_coverage.member_point_count,
+            baseline_coverage.member_detail_point_count,
+            baseline_coverage.canon_item_count,
             profile_coverage.member_point_count,
+            profile_coverage.member_detail_point_count,
             profile_coverage.member_root_count,
             profile_coverage.member_occurrence_count,
             profile_coverage.canon_item_count,
@@ -3183,6 +3279,7 @@ def evaluate_candidate(
                 dict(Counter(profile_coverage.claim_classifications)),
                 sort_keys=True,
             ),
+            int(supported_coverage_regressed),
             revalidation_status,
             int(candidate_selected),
             fallback_reason,
@@ -3213,8 +3310,18 @@ def evaluate_candidate(
         candidate_evidence_coverage_count=evidence_coverage,
         revalidation_status=revalidation_status,
         candidate_generation_latency_ms=stored_latency,
+        baseline_member_point_coverage_count=(
+            baseline_coverage.member_point_count
+        ),
+        baseline_member_detail_coverage_count=(
+            baseline_coverage.member_detail_point_count
+        ),
+        baseline_canon_coverage_count=baseline_coverage.canon_item_count,
         candidate_member_point_coverage_count=(
             profile_coverage.member_point_count
+        ),
+        candidate_member_detail_coverage_count=(
+            profile_coverage.member_detail_point_count
         ),
         candidate_member_root_coverage_count=(
             profile_coverage.member_root_count
@@ -3242,6 +3349,7 @@ def evaluate_candidate(
         candidate_claim_classifications=(
             profile_coverage.claim_classifications
         ),
+        supported_coverage_regressed=supported_coverage_regressed,
     )
 
 
@@ -3289,8 +3397,20 @@ def record_fallback(
         candidate_generation_latency_ms=(
             decision.candidate_generation_latency_ms
         ),
+        baseline_member_point_coverage_count=(
+            decision.baseline_member_point_coverage_count
+        ),
+        baseline_member_detail_coverage_count=(
+            decision.baseline_member_detail_coverage_count
+        ),
+        baseline_canon_coverage_count=(
+            decision.baseline_canon_coverage_count
+        ),
         candidate_member_point_coverage_count=(
             decision.candidate_member_point_coverage_count
+        ),
+        candidate_member_detail_coverage_count=(
+            decision.candidate_member_detail_coverage_count
         ),
         candidate_member_root_coverage_count=(
             decision.candidate_member_root_coverage_count
@@ -3319,6 +3439,9 @@ def record_fallback(
         ),
         candidate_claim_classifications=(
             decision.candidate_claim_classifications
+        ),
+        supported_coverage_regressed=(
+            decision.supported_coverage_regressed
         ),
     )
 
@@ -3384,7 +3507,12 @@ def _empty_report() -> dict[str, Any]:
         "baselineCoherenceStatusCounts": {},
         "candidateCoherenceStatusCounts": {},
         "candidateEvidenceCoverageTotal": 0,
+        "validationItemTotal": 0,
+        "baselineMemberPointCoverageTotal": 0,
+        "baselineMemberDetailCoverageTotal": 0,
+        "baselineCanonCoverageTotal": 0,
         "candidateMemberPointCoverageTotal": 0,
+        "candidateMemberDetailCoverageTotal": 0,
         "candidateMemberRootCoverageTotal": 0,
         "candidateMemberOccurrenceCoverageTotal": 0,
         "candidateCanonCoverageTotal": 0,
@@ -3394,6 +3522,7 @@ def _empty_report() -> dict[str, Any]:
         "candidateOpinionClaimTotal": 0,
         "candidateConnectiveClaimTotal": 0,
         "candidateUnsupportedFactualClaimTotal": 0,
+        "supportedCoverageRegressionRuns": 0,
         "promptFactualOwnerRuns": 0,
         "promptOwnershipFailureRuns": 0,
         "routeFamilyCounts": {},
@@ -3413,6 +3542,7 @@ def _empty_report() -> dict[str, Any]:
         "liveInsufficientMemberCoverageRuns": 0,
         "liveLoreDominantRuns": 0,
         "liveUnsupportedFactualClaimRuns": 0,
+        "liveSupportedCoverageRegressionRuns": 0,
         "livePromptOwnershipViolationRuns": 0,
         "relationshipPostureAppliedRuns": 0,
         "contentFieldsPresent": [],
@@ -3465,6 +3595,26 @@ def build_evaluation_report(
         if "candidate_generation_latency_ms" in columns
         else "0"
     )
+    validation_item_expr = (
+        "validation_item_count"
+        if "validation_item_count" in columns
+        else "0"
+    )
+    baseline_member_point_expr = (
+        "baseline_member_point_coverage_count"
+        if "baseline_member_point_coverage_count" in columns
+        else "0"
+    )
+    baseline_member_detail_expr = (
+        "baseline_member_detail_coverage_count"
+        if "baseline_member_detail_coverage_count" in columns
+        else "0"
+    )
+    baseline_canon_expr = (
+        "baseline_canon_coverage_count"
+        if "baseline_canon_coverage_count" in columns
+        else "0"
+    )
     member_point_expr = (
         "candidate_member_point_coverage_count"
         if "candidate_member_point_coverage_count" in columns
@@ -3473,6 +3623,11 @@ def build_evaluation_report(
     member_root_expr = (
         "candidate_member_root_coverage_count"
         if "candidate_member_root_coverage_count" in columns
+        else "0"
+    )
+    member_detail_expr = (
+        "candidate_member_detail_coverage_count"
+        if "candidate_member_detail_coverage_count" in columns
         else "0"
     )
     member_occurrence_expr = (
@@ -3513,6 +3668,11 @@ def build_evaluation_report(
     unsupported_factual_claim_expr = (
         "candidate_unsupported_factual_claim_count"
         if "candidate_unsupported_factual_claim_count" in columns
+        else "0"
+    )
+    supported_coverage_regressed_expr = (
+        "supported_coverage_regressed"
+        if "supported_coverage_regressed" in columns
         else "0"
     )
     profile_status_expr = (
@@ -3638,6 +3798,22 @@ def build_evaluation_report(
         ).fetchone()[0]
         or 0
     )
+    live_supported_coverage_regressions = int(
+        conn.execute(
+            """
+            SELECT COUNT(*)
+            FROM memory_governance_shared_brain_synthesis_runs
+            WHERE guild_id=? AND live_applied=1
+              AND {supported_coverage_regressed_expr}=1
+            """.format(
+                supported_coverage_regressed_expr=(
+                    supported_coverage_regressed_expr
+                )
+            ),
+            (int(guild_id or 0),),
+        ).fetchone()[0]
+        or 0
+    )
     live_prompt_ownership_violations = int(
         conn.execute(
             """
@@ -3704,12 +3880,16 @@ def build_evaluation_report(
                candidate_output_leak,
                processing_error_count,response_sent,
                {route_family_expr},{authority_mode_expr},{latency_expr},
-               {member_point_expr},{member_root_expr},
+               {validation_item_expr},
+               {baseline_member_point_expr},
+               {baseline_member_detail_expr},{baseline_canon_expr},
+               {member_point_expr},{member_detail_expr},{member_root_expr},
                {member_occurrence_expr},{canon_coverage_expr},
                {lore_dominant_expr},
                {member_supported_claim_expr},
                {canon_supported_claim_expr},{opinion_claim_expr},
                {connective_claim_expr},{unsupported_factual_claim_expr},
+               {supported_coverage_regressed_expr},
                created_at
         FROM memory_governance_shared_brain_synthesis_runs
         WHERE guild_id=?
@@ -3719,7 +3899,12 @@ def build_evaluation_report(
             route_family_expr=route_family_expr,
             authority_mode_expr=authority_mode_expr,
             latency_expr=latency_expr,
+            validation_item_expr=validation_item_expr,
+            baseline_member_point_expr=baseline_member_point_expr,
+            baseline_member_detail_expr=baseline_member_detail_expr,
+            baseline_canon_expr=baseline_canon_expr,
             member_point_expr=member_point_expr,
+            member_detail_expr=member_detail_expr,
             member_root_expr=member_root_expr,
             member_occurrence_expr=member_occurrence_expr,
             canon_coverage_expr=canon_coverage_expr,
@@ -3729,6 +3914,9 @@ def build_evaluation_report(
             opinion_claim_expr=opinion_claim_expr,
             connective_claim_expr=connective_claim_expr,
             unsupported_factual_claim_expr=unsupported_factual_claim_expr,
+            supported_coverage_regressed_expr=(
+                supported_coverage_regressed_expr
+            ),
         ),
         (int(guild_id or 0), max(1, min(int(limit or 500), 2000))),
     ).fetchall()
@@ -3741,10 +3929,14 @@ def build_evaluation_report(
     authority_modes: Counter[str] = Counter()
     latency_values: list[int] = []
     prompt = live = selected = coverage = leaks = errors = sent = 0
-    member_points = member_roots = member_occurrences = canon_coverage = 0
+    validation_items = 0
+    baseline_points = baseline_details = baseline_canon = 0
+    member_points = member_details = member_roots = 0
+    member_occurrences = canon_coverage = 0
     lore_dominant_runs = 0
     member_supported_claims = canon_supported_claims = 0
     opinion_claims = connective_claims = unsupported_factual_claims = 0
+    supported_coverage_regressions = 0
     for row in rows:
         (
             _schema,
@@ -3763,7 +3955,12 @@ def build_evaluation_report(
             route_family,
             authority_mode,
             candidate_latency_ms,
+            validation_item_count,
+            baseline_member_points,
+            baseline_member_details,
+            baseline_canon_coverage,
             candidate_member_points,
+            candidate_member_details,
             candidate_member_roots,
             candidate_member_occurrences,
             candidate_canon_coverage,
@@ -3773,6 +3970,7 @@ def build_evaluation_report(
             candidate_opinion_claims,
             candidate_connective_claims,
             candidate_unsupported_factual_claims,
+            supported_coverage_regressed,
             _created_at,
         ) = row
         prompt += int(bool(prompt_applied))
@@ -3784,7 +3982,12 @@ def build_evaluation_report(
         baseline_coherence[str(baseline_status or "unknown")] += 1
         candidate_coherence[str(candidate_status or "unknown")] += 1
         coverage += int(evidence_coverage or 0)
+        validation_items += int(validation_item_count or 0)
+        baseline_points += int(baseline_member_points or 0)
+        baseline_details += int(baseline_member_details or 0)
+        baseline_canon += int(baseline_canon_coverage or 0)
         member_points += int(candidate_member_points or 0)
+        member_details += int(candidate_member_details or 0)
         member_roots += int(candidate_member_roots or 0)
         member_occurrences += int(candidate_member_occurrences or 0)
         canon_coverage += int(candidate_canon_coverage or 0)
@@ -3795,6 +3998,9 @@ def build_evaluation_report(
         connective_claims += int(candidate_connective_claims or 0)
         unsupported_factual_claims += int(
             candidate_unsupported_factual_claims or 0
+        )
+        supported_coverage_regressions += int(
+            bool(supported_coverage_regressed)
         )
         revalidation[str(revalidation_status or "unknown")] += 1
         leaks += int(bool(output_leak))
@@ -3826,7 +4032,12 @@ def build_evaluation_report(
             sorted(candidate_coherence.items())
         ),
         "candidateEvidenceCoverageTotal": coverage,
+        "validationItemTotal": validation_items,
+        "baselineMemberPointCoverageTotal": baseline_points,
+        "baselineMemberDetailCoverageTotal": baseline_details,
+        "baselineCanonCoverageTotal": baseline_canon,
         "candidateMemberPointCoverageTotal": member_points,
+        "candidateMemberDetailCoverageTotal": member_details,
         "candidateMemberRootCoverageTotal": member_roots,
         "candidateMemberOccurrenceCoverageTotal": member_occurrences,
         "candidateCanonCoverageTotal": canon_coverage,
@@ -3837,6 +4048,9 @@ def build_evaluation_report(
         "candidateConnectiveClaimTotal": connective_claims,
         "candidateUnsupportedFactualClaimTotal": (
             unsupported_factual_claims
+        ),
+        "supportedCoverageRegressionRuns": (
+            supported_coverage_regressions
         ),
         "promptFactualOwnerRuns": prompt_factual_owner_runs,
         "promptOwnershipFailureRuns": prompt_ownership_failures,
@@ -3864,6 +4078,9 @@ def build_evaluation_report(
         "liveLoreDominantRuns": live_lore_dominant,
         "liveUnsupportedFactualClaimRuns": (
             live_unsupported_factual_claims
+        ),
+        "liveSupportedCoverageRegressionRuns": (
+            live_supported_coverage_regressions
         ),
         "livePromptOwnershipViolationRuns": (
             live_prompt_ownership_violations

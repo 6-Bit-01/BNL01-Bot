@@ -212,9 +212,9 @@ class MemoryPreviewBotPathTests(unittest.IsolatedAsyncioTestCase):
             "\n".join(result.diagnostics),
         )
 
-    async def test_empty_profile_skips_model_and_uses_honest_fallback(self):
+    async def test_empty_packet_preserves_established_response(self):
         generator = mock.AsyncMock(
-            return_value="Invented generic member biography."
+            return_value="The established path still recognizes your signal."
         )
         guard = mock.AsyncMock(
             side_effect=lambda response, _prompt: (
@@ -234,18 +234,47 @@ class MemoryPreviewBotPathTests(unittest.IsolatedAsyncioTestCase):
             guard=guard,
         )
 
-        generator.assert_not_awaited()
+        generator.assert_awaited_once()
+        self.assertTrue(
+            generator.await_args.args[1].endswith("baseline")
+        )
         guard.assert_awaited_once()
+        self.assertFalse(result.candidate_selected)
+        self.assertEqual(
+            result.proposed_response,
+            "The established path still recognizes your signal.",
+        )
+        self.assertEqual(
+            result.established_response,
+            "The established path still recognizes your signal.",
+        )
+        self.assertEqual(result.fallback_reason, "profile_sufficiency_empty")
+        self.assertEqual(result.final_selection, "established_path")
+
+    async def test_empty_packet_uses_honest_response_only_if_baseline_fails(
+        self,
+    ):
+        result = await bnl01_bot.execute_bnl_memory_preview(
+            source_db_path=self.db_path,
+            guild_id=1,
+            subject_user_id=8,
+            subject_display_name="Empty Member",
+            simulated_channel_id=10,
+            wording="BNL-01, what am I all about?",
+            generator=mock.AsyncMock(return_value=""),
+            guard=mock.AsyncMock(
+                side_effect=lambda response, _prompt: (
+                    response,
+                    {"suppressed": False, "suppression_reason": ""},
+                )
+            ),
+        )
+
         self.assertFalse(result.candidate_selected)
         self.assertEqual(
             result.proposed_response,
             bnl01_bot.honest_empty_profile_response(),
         )
-        self.assertEqual(
-            result.established_response,
-            bnl01_bot.honest_empty_profile_response(),
-        )
-        self.assertEqual(result.fallback_reason, "profile_sufficiency_empty")
         self.assertEqual(
             result.final_selection,
             "honest_empty_profile_fallback",
@@ -890,6 +919,12 @@ class MemoryPreviewBotPathTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_preview_compares_real_established_memory_to_packet(self):
         with sqlite3.connect(self.db_path) as conn:
+            self._add_message(
+                conn,
+                3,
+                "I build pocket synthesizers.",
+                "2026-07-26T19:00:00+00:00",
+            )
             conn.execute(
                 """
                 CREATE TABLE memory_tiers (
@@ -935,7 +970,7 @@ class MemoryPreviewBotPathTests(unittest.IsolatedAsyncioTestCase):
         async def generator(prompt, route):
             calls.append((route, prompt))
             if route.endswith("baseline"):
-                return "I remember your pocket-synthesizer work."
+                return "I remember that you build pocket synthesizers."
             return (
                 "You keep returning to software and technical "
                 "systems."
@@ -964,9 +999,19 @@ class MemoryPreviewBotPathTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("Derived memory summaries", packet_prompt)
         self.assertEqual(
             result.established_response,
-            "I remember your pocket-synthesizer work.",
+            "I remember that you build pocket synthesizers.",
         )
         self.assertTrue(result.packet_candidate_response)
+        self.assertFalse(result.candidate_selected)
+        self.assertEqual(
+            result.fallback_reason,
+            "candidate_supported_coverage_regressed",
+        )
+        self.assertEqual(result.final_selection, "established_path")
+        self.assertEqual(
+            result.proposed_response,
+            "I remember that you build pocket synthesizers.",
+        )
 
     async def test_preview_never_calls_conversation_or_model_savers(self):
         async def generator(_prompt, route):

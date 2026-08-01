@@ -933,7 +933,13 @@ class ProductionShapedBroadRecallAcceptanceTests(unittest.TestCase):
                 for item in prepared.packet.items
                 if item.lane == "assessment_observation"
             )
+            validation_observations = tuple(
+                item
+                for item in prepared.packet.validation_items
+                if item.lane == "assessment_observation"
+            )
             self.assertEqual(len(selected_observations), 1)
+            self.assertEqual(len(validation_observations), 2)
             self.assertEqual(
                 {
                     item.source_type
@@ -964,6 +970,46 @@ class ProductionShapedBroadRecallAcceptanceTests(unittest.TestCase):
             )
             self.assertEqual(evaluation.candidate_member_point_count, 1)
             self.assertGreaterEqual(evaluation.candidate_canon_count, 1)
+
+            selected_point = selected_observations[0].point_identity
+            unrendered_observation = next(
+                item
+                for item in validation_observations
+                if item.point_identity != selected_point
+            )
+            unrendered_evaluation = evaluate_memory_preview(
+                prepared,
+                baseline_response="The record is still thin.",
+                candidate_response=(
+                    "I recognize your signal as Mac Modem, a founding "
+                    "BARCODE member and chaotic tech entity. From your "
+                    "public appearances, I noticed that "
+                    + unrendered_observation.text
+                ),
+            )
+            self.assertTrue(
+                unrendered_evaluation.candidate_selected,
+                unrendered_evaluation.fallback_reason,
+            )
+
+            coverage_regression = evaluate_memory_preview(
+                prepared,
+                baseline_response=selected_observations[0].text,
+                candidate_response=(
+                    "I recognize your signal as Mac Modem, a founding "
+                    "BARCODE member and chaotic tech entity. From your "
+                    "public appearances, I noticed that "
+                    + unrendered_observation.text
+                ),
+            )
+            self.assertFalse(coverage_regression.candidate_selected)
+            self.assertTrue(
+                coverage_regression.supported_coverage_regressed
+            )
+            self.assertEqual(
+                coverage_regression.fallback_reason,
+                "candidate_supported_coverage_regressed",
+            )
         finally:
             prepared.close()
 
