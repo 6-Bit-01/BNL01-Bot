@@ -1,14 +1,19 @@
 import os
 import sqlite3
+import tempfile
 import unittest
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 from unittest import mock
 
 from bnl_canon_source_contract import Confidence, SourceClass, Visibility
 import bnl_memory_ledger as ledger
+import bnl_unified_intelligence_packet as packet_module
 import bnl_declared_canon as declared
 import bnl_moment_engine as moments
 import bnl_relationship_engine as relationships
+from bnl_profile_points import material_profile_point_map
 from bnl_shadow_acceptance import (
     build_v2_shadow_acceptance_snapshot,
     render_v2_shadow_acceptance_lines,
@@ -771,12 +776,12 @@ class UnifiedIntelligencePacketTests(unittest.TestCase):
             6,
         )
         self.assertEqual(len(assessment_items), 4)
-        self.assertEqual(len(validation_observations), 6)
+        self.assertEqual(len(validation_observations), 4)
         self.assertEqual(
             packet.diagnostics.validation_support_by_lane.get(
                 "assessment_observation"
             ),
-            6,
+            4,
         )
         self.assertGreaterEqual(
             sum(
@@ -894,7 +899,14 @@ class UnifiedIntelligencePacketTests(unittest.TestCase):
         self.assertEqual(rendered_counts.get("canon"), 1)
         self.assertGreaterEqual(
             rendered_counts.get("assessment_observation", 0),
-            3,
+            2,
+        )
+        self.assertGreaterEqual(
+            packet.diagnostics.excluded_by_reason.get(
+                "same_root_projection",
+                0,
+            ),
+            1,
         )
         self.assertLess(
             rendered.index("question-scoped public observation"),
@@ -1046,6 +1058,133 @@ class UnifiedIntelligencePacketTests(unittest.TestCase):
             1,
         )
 
+    def test_moment_wins_same_root_open_signal_but_distinct_open_root_survives(self):
+        self.add_public_moment()
+        packet = build_packet(
+            self.conn,
+            self.public_request(text="What am I all about?"),
+            persist=False,
+            environ=self.flags,
+        )
+        self.assertTrue(any(item.lane == "moment" for item in packet.items))
+        self.assertFalse(
+            any(
+                item.lane == "assessment_observation"
+                for item in packet.items
+            )
+        )
+        self.assertTrue(
+            any(
+                exclusion.lane == "assessment_observation"
+                and exclusion.reason == "same_root_projection"
+                for exclusion in packet.exclusions
+            )
+        )
+
+        distinct_text = "I tune ceramic antennas for unusual harmonics."
+        self.add_raw_public_conversation(
+            205,
+            distinct_text,
+            "2026-07-27T12:00:00+00:00",
+        )
+        with_distinct = build_packet(
+            self.conn,
+            self.public_request(text="What am I all about?"),
+            persist=False,
+            environ=self.flags,
+        )
+        self.assertIn(
+            distinct_text,
+            {
+                item.text
+                for item in with_distinct.items
+                if item.lane == "assessment_observation"
+            },
+        )
+
+    def test_process_open_signal_wins_same_root_generic_atomic_projection(self):
+        moment_id = self.add_public_moment()
+        roots = tuple(
+            str(row[0])
+            for row in self.conn.execute(
+                """
+                SELECT ledger_entry_id
+                FROM memory_moment_contribution_sources
+                WHERE moment_id=? AND participant_key='discord_user:7'
+                ORDER BY ledger_entry_id
+                """,
+                (moment_id,),
+            ).fetchall()
+        )
+        self.assertEqual(len(roots), 2)
+        process_texts = (
+            "I want to compare both approaches before choosing one.",
+            "I test the smaller version and revise after failures.",
+        )
+        for entry_id, text in zip(roots, process_texts):
+            self.conn.execute(
+                """
+                UPDATE memory_ledger_entries
+                SET normalized_value=?
+                WHERE entry_id=?
+                """,
+                (text, entry_id),
+            )
+        self.conn.commit()
+        formed = ledger.form_atomic_knowledge_candidate(
+            self.conn,
+            ledger.AtomicKnowledgeProposal(
+                candidate_type="topic_or_motif",
+                subject_key="discord_user:7",
+                subject_display_name="Crow",
+                predicate_key="decision_process_motif",
+                meaning=(
+                    "Recurring public conversation about comparing options "
+                    "and testing revisions."
+                ),
+                root_entry_ids=roots,
+                participant_keys=("discord_user:7",),
+                epistemic_status="observed",
+                uncertainty_note=(
+                    "Repeated observation; not a scalar identity fact."
+                ),
+                currentness="historical",
+                contradiction_key="discord_user:7:decision_process_motif",
+                retrieval_tags=("decision_process",),
+            ),
+        )
+        self.assertEqual(formed.outcome, "created")
+        packet = build_packet(
+            self.conn,
+            self.public_request(
+                text=(
+                    "What have you learned about how I work and make "
+                    "decisions?"
+                )
+            ),
+            persist=False,
+            environ=self.flags,
+        )
+
+        observations = tuple(
+            item
+            for item in packet.items
+            if item.lane == "assessment_observation"
+        )
+        self.assertEqual(len(observations), 1)
+        self.assertFalse(
+            any(item.lane == "atomic_knowledge" for item in packet.items)
+        )
+        self.assertTrue(
+            any(
+                exclusion.lane == "atomic_knowledge"
+                and exclusion.reason == "same_root_projection"
+                for exclusion in packet.exclusions
+            )
+        )
+        self.assertEqual(packet.profile_sufficiency.status, "sparse")
+        self.assertTrue(packet.profile_sufficiency.satisfied)
+
     def test_moment_superset_projection_does_not_inflate_profile(self):
         moment_id = self.add_public_moment()
         roots = tuple(
@@ -1195,6 +1334,25 @@ class UnifiedIntelligencePacketTests(unittest.TestCase):
         self.assertEqual(
             packet.profile_sufficiency.independent_occurrence_count,
             0,
+        )
+
+    def test_direct_non_broad_canon_route_remains_available(self):
+        packet = build_packet(
+            self.conn,
+            self.public_request(text="Who is Mac Modem?"),
+            persist=False,
+            environ=self.flags,
+        )
+
+        self.assertEqual(
+            packet.profile_sufficiency.status,
+            "not_applicable",
+        )
+        self.assertTrue(
+            any(
+                item.lane == "canon" and "Mac Modem" in item.text
+                for item in packet.items
+            )
         )
 
     def test_private_cross_subject_contested_and_live_rows_fail_closed(self):
@@ -1433,6 +1591,308 @@ class UnifiedIntelligencePacketTests(unittest.TestCase):
 
         self.assertFalse(revalidation.valid)
         self.assertEqual(revalidation.status, "source_changed")
+
+    def test_open_signal_source_authority_change_breaks_revalidation(self):
+        entry_id = self.add_raw_public_conversation(
+            1500,
+            "I tune ceramic antennas for unusual signal harmonics.",
+            "2026-07-20T10:00:00+00:00",
+        )
+        packet = build_packet(
+            self.conn,
+            self.public_request(text="What am I all about?"),
+            persist=False,
+            environ=self.flags,
+        )
+        self.assertEqual(packet.profile_sufficiency.status, "sparse")
+        self.conn.execute(
+            """
+            UPDATE memory_ledger_entries
+            SET source_role='model',source_sequence=source_sequence+100
+            WHERE entry_id=?
+            """,
+            (entry_id,),
+        )
+
+        result = revalidate_packet(self.conn, packet, environ=self.flags)
+
+        self.assertFalse(result.valid)
+        self.assertEqual(result.status, "source_changed")
+
+    def test_hostile_or_stale_open_signal_selector_dto_fails_closed(self):
+        entry_id = self.add_raw_public_conversation(
+            1510,
+            "I tune ceramic antennas for unusual signal harmonics.",
+            "2026-07-20T10:00:00+00:00",
+        )
+        real_selection = ledger.select_public_conversation_assessment_evidence(
+            self.conn,
+            guild_id=1,
+            subject_key="discord_user:7",
+            request_text="What am I all about?",
+        )
+        hostile = replace(
+            real_selection.items[0],
+            subject_key="discord_user:8",
+        )
+        with mock.patch(
+            "bnl_unified_intelligence_packet."
+            "select_public_conversation_assessment_evidence",
+            return_value=replace(real_selection, items=(hostile,)),
+        ):
+            packet = build_packet(
+                self.conn,
+                self.public_request(text="What am I all about?"),
+                persist=False,
+                environ=self.flags,
+            )
+        self.assertEqual(packet.profile_sufficiency.status, "empty")
+        self.assertFalse(
+            any(item.lane == "assessment_observation" for item in packet.items)
+        )
+
+        def stale_selection(*_args, **_kwargs):
+            selected = ledger.select_public_conversation_assessment_evidence(
+                self.conn,
+                guild_id=1,
+                subject_key="discord_user:7",
+                request_text="What am I all about?",
+            )
+            self.conn.execute(
+                """
+                UPDATE memory_ledger_entries
+                SET normalized_value='A changed authoritative source.'
+                WHERE entry_id=?
+                """,
+                (entry_id,),
+            )
+            return selected
+
+        with mock.patch(
+            "bnl_unified_intelligence_packet."
+            "select_public_conversation_assessment_evidence",
+            side_effect=stale_selection,
+        ):
+            packet = build_packet(
+                self.conn,
+                self.public_request(text="What am I all about?"),
+                persist=False,
+                environ=self.flags,
+            )
+        self.assertEqual(packet.profile_sufficiency.status, "empty")
+        self.assertGreaterEqual(
+            packet.diagnostics.excluded_by_reason.get(
+                "assessment_selector_source_mismatch",
+                0,
+            ),
+            1,
+        )
+
+    def test_open_signal_material_distinctness_and_process_relevance(self):
+        self.add_raw_public_conversation(
+            1520,
+            "I compare audio mixes carefully before final release.",
+            "2026-07-20T10:00:00+00:00",
+        )
+        self.add_raw_public_conversation(
+            1521,
+            "I compare audio mixes carefully before release.",
+            "2026-07-21T10:00:00+00:00",
+        )
+        paraphrase = build_packet(
+            self.conn,
+            self.public_request(text="What am I all about?"),
+            persist=False,
+            environ=self.flags,
+        )
+        self.assertEqual(paraphrase.profile_sufficiency.status, "sparse")
+        self.assertEqual(
+            paraphrase.profile_sufficiency.candidate_point_count,
+            1,
+        )
+
+        self.add_raw_public_conversation(
+            1522,
+            "I test website changes carefully before release.",
+            "2026-07-22T10:00:00+00:00",
+        )
+        distinct = build_packet(
+            self.conn,
+            self.public_request(text="What am I all about?"),
+            persist=False,
+            environ=self.flags,
+        )
+        self.assertEqual(distinct.profile_sufficiency.status, "rich")
+        self.assertGreaterEqual(
+            distinct.profile_sufficiency.candidate_point_count,
+            2,
+        )
+        observation_items = tuple(
+            item
+            for item in distinct.validation_items
+            if item.lane == "assessment_observation"
+        )
+        material_points = material_profile_point_map(observation_items)
+        self.assertEqual(
+            material_points,
+            material_profile_point_map(tuple(reversed(observation_items))),
+        )
+        self.assertEqual(len(set(material_points.values())), 2)
+
+        other = sqlite3.connect(":memory:")
+        try:
+            ledger.ensure_memory_ledger_schema(other)
+            for row_id, text in (
+                (1, "I make custom emotes for the broadcast characters."),
+                (2, "The character icons use bright cyan outlines."),
+                (3, "The synth track has a noisy bass texture."),
+            ):
+                ledger.shadow_conversation_row(
+                    other,
+                    row_id=row_id,
+                    user_id=7,
+                    user_name="Crow",
+                    guild_id=1,
+                    role="user",
+                    content=text,
+                    channel_name="barcode-bot",
+                    channel_policy="public_home",
+                    channel_id=10,
+                    route_mode="normal_chat",
+                    observed_at="2026-07-%02dT10:00:00+00:00" % (19 + row_id),
+                )
+            irrelevant = build_packet(
+                other,
+                self.public_request(
+                    text="What have you learned about how I work and make decisions?"
+                ),
+                persist=False,
+                environ=self.flags,
+            )
+            self.assertEqual(irrelevant.profile_sufficiency.status, "empty")
+            self.assertGreaterEqual(
+                irrelevant.diagnostics.excluded_by_reason.get(
+                    "assessment_question_irrelevant",
+                    0,
+                ),
+                1,
+            )
+        finally:
+            other.close()
+
+    def test_material_point_clustering_does_not_bridge_distinct_endpoints(self):
+        points = (
+            SimpleNamespace(
+                lane="assessment_observation",
+                point_identity="point-a",
+                text="alpha beta gamma delta",
+            ),
+            SimpleNamespace(
+                lane="assessment_observation",
+                point_identity="point-b",
+                text="alpha beta gamma delta epsilon",
+            ),
+            SimpleNamespace(
+                lane="assessment_observation",
+                point_identity="point-c",
+                text="beta gamma delta epsilon",
+            ),
+        )
+
+        forward = material_profile_point_map(points)
+        reversed_order = material_profile_point_map(tuple(reversed(points)))
+
+        self.assertEqual(forward, reversed_order)
+        self.assertEqual(forward["point-a"], forward["point-b"])
+        self.assertNotEqual(forward["point-a"], forward["point-c"])
+        self.assertEqual(len(set(forward.values())), 2)
+
+    def test_revalidation_uses_one_wal_snapshot(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            path = os.path.join(tempdir, "revalidation.db")
+            reader = sqlite3.connect(path, timeout=5)
+            writer = sqlite3.connect(path, timeout=5)
+            try:
+                reader.execute("PRAGMA journal_mode=WAL")
+                ledger.ensure_memory_ledger_schema(reader)
+                entry_ids = []
+                for row_id, text, observed_at in (
+                    (
+                        1,
+                        "I tune ceramic antennas for unusual harmonics.",
+                        "2026-07-20T10:00:00+00:00",
+                    ),
+                    (
+                        2,
+                        "I test website changes before publishing them.",
+                        "2026-07-21T10:00:00+00:00",
+                    ),
+                ):
+                    entry_ids.append(
+                        ledger.shadow_conversation_row(
+                            reader,
+                            row_id=row_id,
+                            user_id=7,
+                            user_name="Crow",
+                            guild_id=1,
+                            role="user",
+                            content=text,
+                            channel_name="barcode-bot",
+                            channel_policy="public_home",
+                            channel_id=10,
+                            route_mode="normal_chat",
+                            observed_at=observed_at,
+                        ).entry_id
+                    )
+                reader.commit()
+                packet = build_packet(
+                    reader,
+                    self.public_request(text="What am I all about?"),
+                    persist=False,
+                    environ=self.flags,
+                )
+                reader.commit()
+                original_digest = packet_module._ledger_entry_digest
+                interleaved = False
+
+                def digest_with_writer(conn, entry_id):
+                    nonlocal interleaved
+                    current = original_digest(conn, entry_id)
+                    if not interleaved:
+                        interleaved = True
+                        writer.execute(
+                            """
+                            UPDATE memory_ledger_entries
+                            SET source_sequence=source_sequence+100
+                            WHERE entry_id=?
+                            """,
+                            (entry_ids[-1],),
+                        )
+                        writer.commit()
+                    return current
+
+                with mock.patch.object(
+                    packet_module,
+                    "_ledger_entry_digest",
+                    side_effect=digest_with_writer,
+                ):
+                    coherent = revalidate_packet(
+                        reader,
+                        packet,
+                        environ=self.flags,
+                    )
+                self.assertTrue(interleaved)
+                self.assertTrue(coherent.valid)
+                changed = revalidate_packet(
+                    reader,
+                    packet,
+                    environ=self.flags,
+                )
+                self.assertFalse(changed.valid)
+                self.assertEqual(changed.status, "source_changed")
+            finally:
+                writer.close()
+                reader.close()
 
     def test_provisional_is_tentative_and_due_review_is_excluded(self):
         self.add_conversation_context_row()

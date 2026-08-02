@@ -599,10 +599,7 @@ class MemoryPreviewBotPathTests(unittest.IsolatedAsyncioTestCase):
             subject_user_id=7,
             subject_display_name="Crow",
             simulated_channel_id=10,
-            wording=(
-                "What have you learned about me regarding my decision "
-                "process?"
-            ),
+            wording="What have you learned about me?",
             generator=generator,
             guard=guard,
         )

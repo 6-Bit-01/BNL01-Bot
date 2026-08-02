@@ -1989,7 +1989,18 @@ class HybridCanonClaimContractTests(unittest.TestCase):
             self.assertFalse(
                 any("Cache Back" in item.text for item in built.items)
             )
-            self.assertEqual(built.profile_sufficiency.status, "empty")
+            self.assertEqual(built.profile_sufficiency.status, "rich")
+            self.assertTrue(built.profile_sufficiency.satisfied)
+            self.assertEqual(
+                len(
+                    tuple(
+                        item
+                        for item in built.items
+                        if item.lane == "assessment_observation"
+                    )
+                ),
+                2,
+            )
         finally:
             conn.close()
 

@@ -24,6 +24,7 @@ from bnl_memory_governance import (
     classify_personal_recall_intent,
 )
 from bnl_memory_ledger import subject_key_for_user
+from bnl_profile_points import material_profile_point_map
 from bnl_unified_intelligence_packet import (
     UnifiedIntelligencePacket,
     mark_packet_application,
@@ -1190,7 +1191,7 @@ def _profile_requires_canon(
     packet: UnifiedIntelligencePacket,
 ) -> bool:
     return bool(
-        _profile_recognized_canon_identity(packet)
+        _profile_has_recognized_canon_identity(packet)
         or (
             _PROFILE_PROJECT_SCOPE_RE.search(
                 str(packet.request.user_text or "")
@@ -1207,18 +1208,28 @@ def _profile_requires_canon(
 def _profile_recognized_canon_identity(
     packet: UnifiedIntelligencePacket,
 ) -> bool:
+    """Whether a sparse profile has a required additive identity anchor."""
+
     return bool(
         str(
             getattr(packet.profile_sufficiency, "status", "") or ""
         ).strip().lower()
         == "sparse"
-        and any(
-            item.lane == "canon"
-            and item.source_type == "recognized_canon_fact"
-            and item.subject_key
-            == subject_key_for_user(packet.request.subject_user_id)
-            for item in packet.items
-        )
+        and _profile_has_recognized_canon_identity(packet)
+    )
+
+
+def _profile_has_recognized_canon_identity(
+    packet: UnifiedIntelligencePacket,
+) -> bool:
+    """Return recognition independently of sparse/rich profile status."""
+
+    return any(
+        item.lane == "canon"
+        and item.source_type == "recognized_canon_fact"
+        and item.subject_key
+        == subject_key_for_user(packet.request.subject_user_id)
+        for item in packet.items
     )
 
 
@@ -1466,9 +1477,11 @@ def render_packet_context(
     if profile_status == "rich":
         required_detail_count = _profile_required_detail_count(packet)
         profile_rule = (
-            "- This profile has sufficient durable support. Ground the answer "
-            "in at least two materially distinct member-specific points before "
-            "adding any BARCODE canon.\n"
+            "- This profile has sufficient independent member-specific "
+            "support. Ground the answer in at least two materially distinct "
+            "points before adding any BARCODE canon. Question-scoped public "
+            "observations remain non-durable even when independently "
+            "supported for this answer.\n"
             + (
                 "- Use a recognizable concrete detail from each of at least "
                 "%s distinct supported member points; do not flatten the "
@@ -1486,15 +1499,23 @@ def render_packet_context(
     else:
         profile_rule = ""
     recognized_identity = _profile_recognized_canon_identity(packet)
+    recognized_canon_present = _profile_has_recognized_canon_identity(packet)
     project_rule = (
         "- A unique, historically stable same-platform name signal matches "
-        "one approved BARCODE identity. State that approved identity "
-        "directly, then give exactly one narrow public observation. Treat "
+        "one approved BARCODE identity. Give the one supported public "
+        "observation first, then add that identity as one concise context "
+        "anchor. Treat "
         "the match as recognition for this response, never as a permanent "
         "account merge or proof of private identity.\n"
         if recognized_identity
         else (
-            "- The request explicitly asks for BARCODE/project context. Use "
+            "- A stable approved BARCODE identity is available as additive "
+            "context. Ground the answer in the required member-specific "
+            "points first, then add one concise identity anchor; never treat "
+            "recognition as a permanent account merge or as personal "
+            "interaction evidence.\n"
+            if recognized_canon_present
+            else "- The request explicitly asks for BARCODE/project context. Use "
             "one concise context anchor after the member assessment; canon "
             "may clarify why the observed priorities fit BARCODE, but it "
             "must not become the answer's organizing frame.\n"
@@ -1517,15 +1538,9 @@ def render_packet_context(
         + "\nResponse rules:\n"
         "- Answer the current user naturally in BNL's established voice; do "
         "not recite this evidence as a database report.\n"
-        + (
-            "- Lead with the approved recognized identity, then immediately "
-            "ground the rest in the single selected public observation.\n"
-            if recognized_identity
-            else "- Lead with member-specific substance. Relevant BARCODE "
-            "canon may add one concise context anchor afterward, but can "
-            "never substitute for the public assessment or become its "
-            "governing frame.\n"
-        )
+        + "- Lead with member-specific substance. Relevant BARCODE canon may "
+        "add one concise context anchor afterward, but can never substitute "
+        "for the public assessment or become its governing frame.\n"
         + "- Look across the selected observations for a useful throughline. "
         "Separate what is directly known, what BNL has observed, and BNL's "
         "revisable opinion. Frame interpretation naturally as a read or "
@@ -1958,14 +1973,10 @@ def build_profile_candidate_repair_prompt(
             "request. The claim audit below is controlling for the old draft."
         ),
         (
-            "Begin with the one approved recognized identity, then immediately "
-            "give the single concrete KEEP_SUPPORTED public observation. Do "
-            "not describe the match as a permanent account merge."
-            if basis.profile_recognized_canon_identity
-            else "Begin immediately with a concrete member-specific detail "
-            "from a KEEP_SUPPORTED unit or evidence line. A creative "
-            "assessment may share that opening sentence when it is explicitly "
-            "tied to those details; do not begin with an unframed broad label."
+            "Begin immediately with a concrete member-specific detail from a "
+            "KEEP_SUPPORTED unit or evidence line. A creative assessment may "
+            "share that opening sentence when it is explicitly tied to those "
+            "details; do not begin with canon or an unframed broad label."
         ),
         (
             "Use at least %s materially distinct supported member points."
@@ -1987,8 +1998,9 @@ def build_profile_candidate_repair_prompt(
             else "Keep every personal claim within the supported evidence."
         ),
         (
-            "Use the one approved recognized identity and exactly one public "
-            "observation; neither licenses a broader personality profile."
+            "Use exactly one supported public observation first, then the one "
+            "approved recognized identity as concise additive context; "
+            "neither licenses a broader personality profile."
             if basis.profile_recognized_canon_identity
             else "After the member assessment, use one concise relevant "
             "approved BARCODE canon point as context. Do not organize the "
@@ -2593,12 +2605,20 @@ def candidate_profile_coverage(
     validation_items = tuple(
         getattr(basis.packet, "validation_items", ()) or basis.packet.items
     )
+    process_profile = _profile_process_request(
+        _basis_profile_request_text(basis)
+    )
     member_items = tuple(
         item
         for item in validation_items
         if item.lane in _PROFILE_MEMBER_LANES
+        and (
+            not process_profile
+            or item.lane == "assessment_observation"
+        )
         and item.point_identity
     )
+    material_point_map = material_profile_point_map(member_items)
     member_point_terms: dict[str, frozenset[str]] = {}
     member_point_lanes: dict[str, frozenset[str]] = {}
     member_label_terms = frozenset().union(
@@ -2608,30 +2628,34 @@ def candidate_profile_coverage(
             if item.lane != "assessment_observation"
         )
     )
-    for point_identity in {
-        item.point_identity for item in member_items
-    }:
-        member_point_terms[point_identity] = frozenset().union(
+    for material_identity in sorted(set(material_point_map.values())):
+        member_point_terms[material_identity] = frozenset().union(
             *(
                 _item_profile_terms(item)
                 for item in member_items
-                if item.point_identity == point_identity
+                if material_point_map.get(item.point_identity)
+                == material_identity
             )
         )
-        member_point_lanes[point_identity] = frozenset(
+        member_point_lanes[material_identity] = frozenset(
             item.lane
             for item in member_items
-            if item.point_identity == point_identity
+            if material_point_map.get(item.point_identity)
+            == material_identity
         )
     require_distinctive = len(member_point_terms) > 1
 
     def distinctive_terms(item: Any) -> frozenset[str]:
         item_is_assessment = item.lane == "assessment_observation"
+        item_material_identity = material_point_map.get(
+            item.point_identity,
+            item.point_identity,
+        )
         other_terms = frozenset().union(
             *(
                 terms
                 for point_identity, terms in member_point_terms.items()
-                if point_identity != item.point_identity
+                if point_identity != item_material_identity
                 and (
                     (
                         "assessment_observation"
@@ -2662,7 +2686,7 @@ def candidate_profile_coverage(
         )
     )
     covered_points = {
-        item.point_identity
+        material_point_map.get(item.point_identity, item.point_identity)
         for item in covered_member_items
         if item.point_identity
     }
@@ -2679,7 +2703,7 @@ def candidate_profile_coverage(
         if identity
     }
     covered_detail_points = {
-        item.point_identity
+        material_point_map.get(item.point_identity, item.point_identity)
         for item in covered_member_items
         if item.point_identity
         and response_terms.intersection(
@@ -2721,10 +2745,7 @@ def candidate_profile_coverage(
     lore_dominant = bool(
         canon_only_claims
         and (
-            (
-                not member_first
-                and not basis.profile_recognized_canon_identity
-            )
+            not member_first
             or canon_only_claims > member_supported_claims
         )
     )

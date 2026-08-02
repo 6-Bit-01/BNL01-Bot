@@ -28,6 +28,7 @@ from bnl_canon_source_contract import (
     EntityAccountBinding,
     SourceClass,
     SubjectIdentity,
+    adapt_open_signal_claim,
     matching_canon_member_identities,
     normalize_canon_identity_label,
     resolve_entity_identity,
@@ -46,10 +47,13 @@ from bnl_memory_ledger import (
     knowledge_occurrence_identity,
     knowledge_root_identity,
     knowledge_source_root_identity,
+    public_assessment_process_request,
+    public_assessment_safe_text,
     select_public_conversation_assessment_evidence,
     subject_key_for_user,
 )
 from bnl_moment_engine import select_public_participant_moment_gists
+from bnl_profile_points import material_profile_point_map
 from bnl_relationship_engine import shadow_packet_posture
 
 
@@ -167,7 +171,7 @@ _PROFILE_CANON_MATCH_LANES = (
 )
 _ROOT_COLLAPSE_MEMBER_LANES = (
     _PROFILE_DURABLE_MEMBER_EVIDENCE_LANES
-    | {"conversation_context"}
+    | {"conversation_context", "assessment_observation"}
 )
 _CANON_IDENTITY_MIN_STABLE_ROWS = 2
 _AUTOMATIC_CANON_SIGNAL_SUBJECT_KEYS = frozenset(
@@ -650,7 +654,7 @@ def _explicit_canon_binding_signal(
         return _CanonIdentitySignal("ambiguous_account_binding")
     if resolution.status != "resolved" or resolution.subject is None:
         return _CanonIdentitySignal("invalid_account_binding")
-    if resolution.subject.key not in _AUTOMATIC_CANON_SIGNAL_SUBJECT_KEYS:
+    if resolution.subject.key not in _CANON_MEMBER_SUBJECT_KEYS:
         return _CanonIdentitySignal(
             "bound_non_signal_identity",
             subject=resolution.subject,
@@ -758,7 +762,7 @@ def _canon_identity_signal(
     history_rows = conn.execute(
         """
         SELECT entry_id,subject_display_name
-        FROM memory_ledger_entries
+        FROM memory_ledger_entries e
         WHERE guild_id=? AND subject_key=?
           AND source_table='conversations' AND source_role='user'
           AND channel_policy IN (
@@ -767,6 +771,13 @@ def _canon_identity_signal(
           AND visibility IN ('public','public_safe')
           AND public_usable=1 AND derived=0 AND projection=0
           AND lifecycle_status='active'
+          AND NOT EXISTS (
+            SELECT 1 FROM memory_ledger_lineage l
+            WHERE l.guild_id=e.guild_id AND l.target_entry_id=e.entry_id
+              AND l.lineage_type IN (
+                'correction_of','supersedes','retracts'
+              )
+          )
         ORDER BY observed_at DESC,source_sequence DESC,entry_id DESC
         LIMIT 256
         """,
@@ -1396,9 +1407,16 @@ def _ledger_entry_digest(
             "entry_id",
             "guild_id",
             "subject_key",
+            "entry_type",
             "predicate_key",
             "normalized_value",
+            "source_table",
+            "source_row_id",
+            "source_revision",
+            "source_role",
             "source_class",
+            "source_sequence",
+            "channel_id",
             "route_mode",
             "channel_policy",
             "visibility",
@@ -1442,7 +1460,7 @@ def _ledger_entry_digest(
     return _digest("ledger", data, lineage, incoming)
 
 
-def _assessment_observation_items(
+def _assessment_observation_items_in_snapshot(
     conn: sqlite3.Connection,
     request: IntelligencePacketRequest,
     diagnostics: IntelligencePacketDiagnostics,
@@ -1475,11 +1493,109 @@ def _assessment_observation_items(
         ] = not_selected
 
     items: list[IntelligencePacketItem] = []
+    process_request = public_assessment_process_request(request.user_text)
     for evidence in selection.items:
         entry_id = str(evidence.entry_id or "")
+        adapted = adapt_open_signal_claim(evidence)
+        adapted_claim = adapted.claim
+        expected_source_ref = "memory_ledger:%s" % entry_id
+        if not (
+            entry_id
+            and adapted_claim is not None
+            and adapted_claim.subject_id == subject
+            and adapted_claim.source_refs == (expected_source_ref,)
+            and adapted_claim.root_ids == (expected_source_ref,)
+            and adapted_claim.occurrence_ids
+            == (str(evidence.occurrence_identity or ""),)
+        ):
+            _add_exclusion(
+                diagnostics,
+                exclusions,
+                lane="assessment_observation",
+                reason=(
+                    "assessment_selector_%s" % str(adapted.reason or "invalid")
+                ),
+                source_class=SourceClass.PUBLIC_OBSERVATION.value,
+            )
+            continue
+        if process_request and not bool(evidence.request_relevant):
+            _add_exclusion(
+                diagnostics,
+                exclusions,
+                lane="assessment_observation",
+                reason="assessment_question_irrelevant",
+                source_class=SourceClass.PUBLIC_OBSERVATION.value,
+            )
+            continue
+        row = conn.execute(
+            """
+            SELECT guild_id,subject_key,normalized_value,observed_at,
+                   channel_policy,source_table,source_role,source_class,
+                   visibility,public_usable,derived,projection,
+                   lifecycle_status,entry_type,predicate_key
+            FROM memory_ledger_entries e
+            WHERE entry_id=? AND guild_id=? AND subject_key=?
+              AND entry_type='observation' AND predicate_key='conversation'
+              AND source_table='conversations' AND source_role='user'
+              AND source_class='public_observation'
+              AND channel_policy IN (
+                'public_home','public_context','public_selective'
+              )
+              AND visibility IN ('public','public_safe')
+              AND public_usable=1 AND derived=0 AND projection=0
+              AND lifecycle_status='active'
+              AND NOT EXISTS (
+                SELECT 1 FROM memory_ledger_lineage l
+                WHERE l.guild_id=e.guild_id
+                  AND l.target_entry_id=e.entry_id
+                  AND l.lineage_type IN (
+                    'correction_of','supersedes','retracts'
+                  )
+              )
+            """,
+            (entry_id, int(request.guild_id or 0), subject),
+        ).fetchone()
+        if not row:
+            _add_exclusion(
+                diagnostics,
+                exclusions,
+                lane="assessment_observation",
+                reason="assessment_source_no_longer_eligible",
+                source_class=SourceClass.PUBLIC_OBSERVATION.value,
+            )
+            continue
+        authoritative_text = public_assessment_safe_text(str(row[2] or ""))
+        authoritative_occurrence = knowledge_occurrence_identity(
+            conn,
+            entry_id,
+        )
+        if not (
+            authoritative_text
+            and authoritative_text == str(evidence.text or "")
+            and str(row[3] or "") == str(evidence.observed_at or "")
+            and str(row[4] or "") == str(evidence.channel_policy or "")
+            and str(row[6] or "") == str(evidence.source_role or "")
+            and str(row[7] or "") == str(evidence.source_class or "")
+            and str(row[8] or "") == str(evidence.visibility or "")
+            and bool(row[9]) == bool(evidence.public_usable)
+            and bool(row[10]) == bool(evidence.derived)
+            and bool(row[11]) == bool(evidence.projection)
+            and str(row[12] or "") == str(evidence.lifecycle_status or "")
+            and authoritative_occurrence
+            and authoritative_occurrence
+            == str(evidence.occurrence_identity or "")
+        ):
+            _add_exclusion(
+                diagnostics,
+                exclusions,
+                lane="assessment_observation",
+                reason="assessment_selector_source_mismatch",
+                source_class=SourceClass.PUBLIC_OBSERVATION.value,
+            )
+            continue
         source_digest = _ledger_entry_digest(conn, entry_id)
         root = knowledge_root_identity(conn, entry_id)
-        occurrence = str(evidence.occurrence_identity or "")
+        occurrence = authoritative_occurrence
         if not source_digest or not root or not occurrence:
             _add_exclusion(
                 diagnostics,
@@ -1497,8 +1613,8 @@ def _assessment_observation_items(
             source_digest=source_digest,
             subject_key=subject,
             predicate_key="public_assessment_observation",
-            text=str(evidence.text or "")[:240],
-            visibility=str(evidence.visibility or "unknown"),
+            text=authoritative_text[:240],
+            visibility=str(row[8] or "unknown"),
             confidence=Confidence.HIGH.value,
             lifecycle="active",
             authority=_AUTHORITY_RANK[
@@ -1506,7 +1622,7 @@ def _assessment_observation_items(
             ],
             participants=(subject,),
             lineage=(entry_id,),
-            observed_at=str(evidence.observed_at or ""),
+            observed_at=str(row[3] or ""),
             usage="assessment_only",
             score=(
                 92.0
@@ -1520,7 +1636,7 @@ def _assessment_observation_items(
             point_identity=_point_identity(
                 subject_key=subject,
                 predicate_key="public_assessment_observation",
-                text=str(evidence.text or ""),
+                text=authoritative_text,
             ),
         )
         if not _route_allows_item(request, item):
@@ -1535,6 +1651,35 @@ def _assessment_observation_items(
             continue
         items.append(item)
     return items
+
+
+def _assessment_observation_items(
+    conn: sqlite3.Connection,
+    request: IntelligencePacketRequest,
+    diagnostics: IntelligencePacketDiagnostics,
+    exclusions: list[IntelligencePacketExclusion],
+    *,
+    broad: bool,
+) -> list[IntelligencePacketItem]:
+    """Read selector DTOs and their source rows in one coherent snapshot."""
+
+    owns_snapshot = not conn.in_transaction
+    if owns_snapshot:
+        conn.execute("BEGIN")
+    try:
+        return _assessment_observation_items_in_snapshot(
+            conn,
+            request,
+            diagnostics,
+            exclusions,
+            broad=broad,
+        )
+    finally:
+        if owns_snapshot and conn.in_transaction:
+            # This owner performs no writes. Rollback ends the read snapshot
+            # without committing unrelated work that a future caller might
+            # accidentally add here.
+            conn.rollback()
 
 
 def _governed_items(
@@ -2758,33 +2903,43 @@ def _select_items(
         and item.subject_key == subject_key
         for item in candidates
     )
-    durable_member_candidate = any(
-        item.lane in _PROFILE_DURABLE_MEMBER_EVIDENCE_LANES
-        and item.subject_key == subject_key
-        and item.point_identity
-        and item.root_identities
-        and item.occurrence_identities
-        for item in candidates
-    )
     profile_candidates: list[IntelligencePacketItem] = []
-    broad_lane_priority = {
-        "current_intent": 0,
-        "approved_fact": 1,
-        "atomic_knowledge": 3,
-        "conversation_context": 4,
-        "assessment_observation": 5,
-        "moment": 6,
-        "open_loop": 7,
-        "canon": 8,
-        "source_file": 9,
-        "relationship_posture": 10,
-    }
+    if public_assessment_process_request(request.user_text):
+        # Durable projections do not carry explicit process relevance. Keep
+        # exact nearby Context first when it is the same source representation,
+        # then let the selector-qualified Open item represent any overlap with
+        # generic atomic/Moment projections for this route only.
+        broad_lane_priority = {
+            "current_intent": 0,
+            "approved_fact": 1,
+            "conversation_context": 2,
+            "assessment_observation": 3,
+            "atomic_knowledge": 4,
+            "moment": 5,
+            "open_loop": 6,
+            "canon": 8,
+            "source_file": 9,
+            "relationship_posture": 10,
+        }
+    else:
+        broad_lane_priority = {
+            "current_intent": 0,
+            "approved_fact": 1,
+            "atomic_knowledge": 2,
+            "conversation_context": 3,
+            "moment": 4,
+            "assessment_observation": 5,
+            "open_loop": 6,
+            "canon": 8,
+            "source_file": 9,
+            "relationship_posture": 10,
+        }
     ordered = sorted(
         candidates,
         key=lambda item: (
             (
                 (
-                    2
+                    7
                     if item is canon_anchor
                     else broad_lane_priority.get(item.lane, 10)
                 )
@@ -2807,12 +2962,15 @@ def _select_items(
     lane_caps = dict(
         _BROAD_PROFILE_LANE_CAPS if broad else _LANE_CAPS
     )
-    if broad and recognized_canon_signal and not durable_member_candidate:
-        # One stable canon-name signal may unlock one cautious historical
-        # example. It must never turn several isolated examples into a rich
-        # or durable personality profile.
-        lane_caps["assessment_observation"] = 1
     for item in ordered:
+        if (
+            _profile_member_item(request, item)
+            and item.lane == "assessment_observation"
+        ):
+            # Retain qualifying profile evidence for sufficiency/validation
+            # even when a higher-priority projection of the same human root
+            # is the one rendered in the frozen packet.
+            profile_candidates.append(item)
         item_roots = set(item.root_identities)
         if broad and _root_bearing_member_item(request, item) and item_roots:
             root_overlap = item_roots.intersection(seen_profile_roots)
@@ -2842,7 +3000,10 @@ def _select_items(
                 continue
             if root_overlap:
                 diagnostics.shared_root_projection_count += 1
-        if _profile_member_item(request, item):
+        if (
+            _profile_member_item(request, item)
+            and item.lane != "assessment_observation"
+        ):
             profile_candidates.append(item)
         normalized = re.sub(r"\W+", " ", item.text.lower()).strip()
         if normalized and normalized in seen_text:
@@ -2958,6 +3119,26 @@ def _select_items(
     )
 
 
+def _observation_represented_by_selected_context(
+    observation: IntelligencePacketItem,
+    selected: Sequence[IntelligencePacketItem],
+) -> bool:
+    """Recognize an Open root rendered once through exact nearby context."""
+
+    observation_roots = set(observation.root_identities)
+    observation_occurrences = set(observation.occurrence_identities)
+    if not observation_roots or not observation_occurrences:
+        return False
+    return any(
+        item.lane == "conversation_context"
+        and item.subject_key == observation.subject_key
+        and observation_roots == set(item.root_identities)
+        and observation_occurrences == set(item.occurrence_identities)
+        and public_assessment_safe_text(item.text) == observation.text
+        for item in selected
+    )
+
+
 def _profile_sufficiency(
     request: IntelligencePacketRequest,
     *,
@@ -2970,18 +3151,19 @@ def _profile_sufficiency(
             satisfied=True,
             reason_codes=("not_broad_profile",),
         )
+    process_profile = public_assessment_process_request(request.user_text)
     durable_candidate_items = tuple(
         item
         for item in candidates
         if _profile_member_item(request, item)
         and item.lane in _PROFILE_DURABLE_MEMBER_EVIDENCE_LANES
-    )
+    ) if not process_profile else ()
     durable_selected_items = tuple(
         item
         for item in selected
         if _profile_member_item(request, item)
         and item.lane in _PROFILE_DURABLE_MEMBER_EVIDENCE_LANES
-    )
+    ) if not process_profile else ()
     recognized_canon_signal = any(
         item.lane == "canon"
         and item.source_type == "recognized_canon_fact"
@@ -2997,15 +3179,17 @@ def _profile_sufficiency(
     )
     observational_selected_items = tuple(
         item
-        for item in selected
-        if _profile_member_item(request, item)
-        and item.lane == "assessment_observation"
+        for item in observational_candidate_items
+        if item in selected
+        or _observation_represented_by_selected_context(item, selected)
     )
     observation_only = bool(
-        not durable_candidate_items
-        and recognized_canon_signal
-        and observational_candidate_items
+        not durable_candidate_items and observational_candidate_items
     )
+    # Durable projections remain the preferred sufficiency bucket so one raw
+    # observation cannot recount a root already summarized by a Moment or
+    # atomic item.  When no durable point exists, Open Signal observations use
+    # the same generic point/root/occurrence contract for every subject.
     if durable_candidate_items:
         candidate_items = durable_candidate_items
         selected_items = durable_selected_items
@@ -3015,9 +3199,8 @@ def _profile_sufficiency(
     else:
         candidate_items = ()
         selected_items = ()
-    candidate_points = {
-        item.point_identity for item in candidate_items if item.point_identity
-    }
+    candidate_point_map = material_profile_point_map(candidate_items)
+    candidate_points = set(candidate_point_map.values())
     candidate_occurrences = {
         identity
         for item in candidate_items
@@ -3025,7 +3208,9 @@ def _profile_sufficiency(
         if identity
     }
     selected_points = {
-        item.point_identity for item in selected_items if item.point_identity
+        candidate_point_map.get(item.point_identity, item.point_identity)
+        for item in selected_items
+        if item.point_identity
     }
     selected_roots = {
         identity
@@ -3041,9 +3226,7 @@ def _profile_sufficiency(
     }
     candidate_point_count = len(candidate_points)
     required_points = (
-        1
-        if observation_only
-        else 2
+        2
         if candidate_point_count >= 2
         and len(candidate_occurrences) >= 2
         else 1
@@ -3069,9 +3252,9 @@ def _profile_sufficiency(
         status = "sparse" if satisfied else "insufficient"
         if observation_only:
             reasons.append(
-                "recognized_canon_sparse_public_observation"
+                "sparse_public_observation"
                 if satisfied
-                else "recognized_canon_observation_not_selected"
+                else "public_observation_not_selected"
             )
         else:
             reasons.append(
@@ -3203,7 +3386,7 @@ def _relationship_version(
     return str(posture.get("source_digest") or "")
 
 
-def revalidate_packet(
+def _revalidate_packet_in_snapshot(
     conn: sqlite3.Connection,
     packet: UnifiedIntelligencePacket,
     *,
@@ -3269,6 +3452,31 @@ def revalidate_packet(
         changed_source_count=changed,
         processing_error_count=errors,
     )
+
+
+def revalidate_packet(
+    conn: sqlite3.Connection,
+    packet: UnifiedIntelligencePacket,
+    *,
+    environ: Mapping[str, str] | None = None,
+) -> PacketRevalidationResult:
+    """Revalidate every source against one coherent database snapshot."""
+
+    owns_snapshot = not conn.in_transaction
+    if owns_snapshot:
+        conn.execute("BEGIN")
+    try:
+        return _revalidate_packet_in_snapshot(
+            conn,
+            packet,
+            environ=environ,
+        )
+    finally:
+        if owns_snapshot and conn.in_transaction:
+            # Revalidation is strictly read-only. Ending an owned snapshot by
+            # rollback prevents this helper from committing caller work if a
+            # later refactor accidentally adds writes.
+            conn.rollback()
 
 
 def _packet_invariants(

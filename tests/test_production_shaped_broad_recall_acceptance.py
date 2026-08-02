@@ -18,6 +18,7 @@ from bnl_memory_preview import (
     evaluate_memory_preview,
     prepare_memory_preview,
 )
+from bnl_shared_brain_synthesis import build_profile_candidate_repair_prompt
 
 
 class _ProductionChannel:
@@ -705,14 +706,14 @@ class ProductionShapedBroadRecallAcceptanceTests(unittest.TestCase):
             )
             self.assertEqual(
                 prepared.diagnostics.assessment_pool_selected_count,
-                4,
+                3,
             )
             self.assertEqual(
                 dict(prepared.basis.rendered_lane_counts).get(
                     "assessment_observation",
                     0,
                 ),
-                4,
+                3,
             )
             prompt = prepared.packet_owned_prompt.prompt
             self.assertIn("compare both approaches", prompt)
@@ -778,6 +779,27 @@ class ProductionShapedBroadRecallAcceptanceTests(unittest.TestCase):
                 invented_icon_role
                 .candidate_unsupported_factual_claim_count,
                 1,
+            )
+
+            unrelated_durable_only = evaluate_memory_preview(
+                prepared,
+                baseline_response=(
+                    "I only have a narrow grounded view so far."
+                ),
+                candidate_response=(
+                    "You keep producing synth music and mixing audio "
+                    "tracks, while developing custom character emotes "
+                    "and visual designs."
+                ),
+            )
+            self.assertFalse(unrelated_durable_only.candidate_selected)
+            self.assertEqual(
+                unrelated_durable_only.fallback_reason,
+                "candidate_member_points_insufficient",
+            )
+            self.assertEqual(
+                unrelated_durable_only.candidate_member_point_count,
+                0,
             )
         finally:
             prepared.close()
@@ -891,7 +913,7 @@ class ProductionShapedBroadRecallAcceptanceTests(unittest.TestCase):
         finally:
             prepared.close()
 
-    def test_stable_exact_canon_name_unlocks_one_cautious_observation(self):
+    def test_stable_exact_canon_name_enriches_generic_rich_observations(self):
         self.add_raw_message(
             user_id=111,
             user_name="Mac Modem",
@@ -919,7 +941,7 @@ class ProductionShapedBroadRecallAcceptanceTests(unittest.TestCase):
         )
         try:
             self.assertTrue(prepared.ready)
-            self.assertEqual(prepared.diagnostics.profile_status, "sparse")
+            self.assertEqual(prepared.diagnostics.profile_status, "rich")
             self.assertEqual(
                 prepared.diagnostics.canon_identity_status,
                 "recognized",
@@ -938,7 +960,7 @@ class ProductionShapedBroadRecallAcceptanceTests(unittest.TestCase):
                 for item in prepared.packet.validation_items
                 if item.lane == "assessment_observation"
             )
-            self.assertEqual(len(selected_observations), 1)
+            self.assertEqual(len(selected_observations), 2)
             self.assertEqual(len(validation_observations), 2)
             self.assertEqual(
                 {
@@ -958,58 +980,19 @@ class ProductionShapedBroadRecallAcceptanceTests(unittest.TestCase):
                 prepared,
                 baseline_response="The record is still thin.",
                 candidate_response=(
-                    "I recognize your signal as Mac Modem, a founding "
-                    "BARCODE member and chaotic tech entity. From your "
-                    "public appearances, I noticed you considering old "
-                    "modem tones for a short broadcast interlude."
+                    "From your public appearances, I noticed you patched "
+                    "the signal meter so the interface stopped flickering "
+                    "and considered old modem tones for a short broadcast "
+                    "interlude. In BARCODE, that signal is Mac Modem, a "
+                    "founding member and chaotic tech entity."
                 ),
             )
             self.assertTrue(
                 evaluation.candidate_selected,
                 evaluation.fallback_reason,
             )
-            self.assertEqual(evaluation.candidate_member_point_count, 1)
+            self.assertEqual(evaluation.candidate_member_point_count, 2)
             self.assertGreaterEqual(evaluation.candidate_canon_count, 1)
-
-            selected_point = selected_observations[0].point_identity
-            unrendered_observation = next(
-                item
-                for item in validation_observations
-                if item.point_identity != selected_point
-            )
-            unrendered_evaluation = evaluate_memory_preview(
-                prepared,
-                baseline_response="The record is still thin.",
-                candidate_response=(
-                    "I recognize your signal as Mac Modem, a founding "
-                    "BARCODE member and chaotic tech entity. From your "
-                    "public appearances, I noticed that "
-                    + unrendered_observation.text
-                ),
-            )
-            self.assertTrue(
-                unrendered_evaluation.candidate_selected,
-                unrendered_evaluation.fallback_reason,
-            )
-
-            coverage_regression = evaluate_memory_preview(
-                prepared,
-                baseline_response=selected_observations[0].text,
-                candidate_response=(
-                    "I recognize your signal as Mac Modem, a founding "
-                    "BARCODE member and chaotic tech entity. From your "
-                    "public appearances, I noticed that "
-                    + unrendered_observation.text
-                ),
-            )
-            self.assertFalse(coverage_regression.candidate_selected)
-            self.assertTrue(
-                coverage_regression.supported_coverage_regressed
-            )
-            self.assertEqual(
-                coverage_regression.fallback_reason,
-                "candidate_supported_coverage_regressed",
-            )
         finally:
             prepared.close()
 
@@ -1034,10 +1017,10 @@ class ProductionShapedBroadRecallAcceptanceTests(unittest.TestCase):
                     )
                 )
                 try:
-                    self.assertFalse(prepared.ready)
+                    self.assertTrue(prepared.ready)
                     self.assertEqual(
                         prepared.diagnostics.profile_status,
-                        "empty",
+                        "sparse",
                     )
                     self.assertEqual(
                         prepared.diagnostics.canon_identity_status,
@@ -1049,8 +1032,226 @@ class ProductionShapedBroadRecallAcceptanceTests(unittest.TestCase):
                             for item in prepared.packet.items
                         )
                     )
+                    self.assertEqual(
+                        len(
+                            tuple(
+                                item
+                                for item in prepared.packet.items
+                                if item.lane == "assessment_observation"
+                            )
+                        ),
+                        1,
+                    )
                 finally:
                     prepared.close()
+
+    def test_six_bit_uses_generic_open_signal_with_additive_canon(self):
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                """
+                CREATE TABLE canon_entity_account_bindings(
+                  guild_id INTEGER NOT NULL,
+                  platform TEXT NOT NULL,
+                  account_id TEXT NOT NULL,
+                  entity_id TEXT NOT NULL,
+                  authority_receipt TEXT NOT NULL,
+                  authority_actor TEXT NOT NULL,
+                  binding_version TEXT NOT NULL,
+                  authority_verified INTEGER NOT NULL,
+                  active INTEGER NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                "INSERT INTO canon_entity_account_bindings "
+                "VALUES(?,?,?,?,?,?,?,?,?)",
+                (
+                    1,
+                    "discord",
+                    "114",
+                    "6_bit",
+                    "binding_receipt:114",
+                    "discord_user:1",
+                    "canon_entity_account_binding_v1",
+                    1,
+                    1,
+                ),
+            )
+            conn.commit()
+        self.add_raw_message(
+            user_id=114,
+            user_name="6 Bit",
+            content="I compare two antenna layouts before choosing one.",
+            observed_at="2026-07-20T18:00:00+00:00",
+        )
+        self.add_raw_message(
+            user_id=114,
+            user_name="6 Bit",
+            content="I test the smaller interface change before release.",
+            observed_at="2026-07-22T18:00:00+00:00",
+        )
+        prepared = prepare_memory_preview(
+            self.request(
+                user_id=114,
+                user_name="6 Bit",
+                wording="BNL, what am I all about?",
+            )
+        )
+        try:
+            self.assertTrue(prepared.ready)
+            self.assertEqual(prepared.diagnostics.profile_status, "rich")
+            observation_indexes = tuple(
+                index
+                for index, item in enumerate(prepared.packet.items)
+                if item.lane == "assessment_observation"
+            )
+            canon_indexes = tuple(
+                index
+                for index, item in enumerate(prepared.packet.items)
+                if item.lane == "canon" and "6 Bit" in item.text
+            )
+            self.assertEqual(len(observation_indexes), 2)
+            self.assertTrue(canon_indexes)
+            self.assertLess(max(observation_indexes), min(canon_indexes))
+        finally:
+            prepared.close()
+
+    def test_corrected_canon_name_root_loses_recognition_but_keeps_open_signal(self):
+        row_ids = (
+            self.add_raw_message(
+                user_id=115,
+                user_name="Mac Modem",
+                content="I patch signal meters for the interface.",
+                observed_at="2026-07-20T18:00:00+00:00",
+            ),
+            self.add_raw_message(
+                user_id=115,
+                user_name="Mac Modem",
+                content="I test modem tones for a broadcast interlude.",
+                observed_at="2026-07-22T18:00:00+00:00",
+            ),
+        )
+        with sqlite3.connect(self.db_path) as conn:
+            corrected_entry = conn.execute(
+                """
+                SELECT entry_id FROM memory_ledger_entries
+                WHERE guild_id=1 AND source_table='conversations'
+                  AND source_row_id=?
+                """,
+                (str(row_ids[0]),),
+            ).fetchone()[0]
+            conn.execute(
+                """
+                INSERT INTO memory_ledger_lineage(
+                  entry_id,guild_id,lineage_type,target_entry_id,created_at
+                ) VALUES(?,?,?,?,?)
+                """,
+                (
+                    "correction-fixture-115",
+                    1,
+                    "correction_of",
+                    corrected_entry,
+                    "2026-07-23T00:00:00+00:00",
+                ),
+            )
+            conn.commit()
+        prepared = prepare_memory_preview(
+            self.request(
+                user_id=115,
+                user_name="Mac Modem",
+                wording="BNL, what am I all about?",
+            )
+        )
+        try:
+            self.assertTrue(prepared.ready)
+            self.assertEqual(prepared.diagnostics.profile_status, "sparse")
+            self.assertEqual(
+                prepared.diagnostics.canon_identity_status,
+                "stable_history_insufficient",
+            )
+            self.assertFalse(
+                any(
+                    item.source_type == "recognized_canon_fact"
+                    for item in prepared.packet.items
+                )
+            )
+        finally:
+            prepared.close()
+
+    def test_sparse_recognized_profile_is_member_first_and_repairs_canon_first(self):
+        self.add_raw_message(
+            user_id=118,
+            user_name="Mac Modem",
+            content="I tune ceramic antennas for unusual signal harmonics.",
+            observed_at="2026-07-20T18:00:00+00:00",
+        )
+        self.add_raw_message(
+            user_id=118,
+            user_name="Mac Modem",
+            content="Signal check.",
+            observed_at="2026-07-22T18:00:00+00:00",
+        )
+        prepared = prepare_memory_preview(
+            self.request(
+                user_id=118,
+                user_name="Mac Modem",
+                wording="BNL, what am I all about?",
+            )
+        )
+        try:
+            self.assertTrue(prepared.ready)
+            self.assertEqual(prepared.diagnostics.profile_status, "sparse")
+            self.assertEqual(
+                prepared.diagnostics.canon_identity_status,
+                "recognized",
+            )
+            observation_indexes = tuple(
+                index
+                for index, item in enumerate(prepared.packet.items)
+                if item.lane == "assessment_observation"
+            )
+            canon_indexes = tuple(
+                index
+                for index, item in enumerate(prepared.packet.items)
+                if item.lane == "canon" and "Mac Modem" in item.text
+            )
+            self.assertEqual(len(observation_indexes), 1)
+            self.assertTrue(canon_indexes)
+            self.assertLess(max(observation_indexes), min(canon_indexes))
+            prompt = prepared.packet_owned_prompt.prompt
+            self.assertLess(
+                prompt.index("ceramic antennas"),
+                prompt.index("Mac Modem"),
+            )
+
+            canon_first = (
+                "Mac Modem is a founding BARCODE member and chaotic tech "
+                "entity. I noticed you tune ceramic antennas for unusual "
+                "signal harmonics."
+            )
+            rejected = evaluate_memory_preview(
+                prepared,
+                baseline_response="I only have a thin record so far.",
+                candidate_response=canon_first,
+            )
+            self.assertFalse(rejected.candidate_selected)
+            self.assertEqual(
+                rejected.fallback_reason,
+                "candidate_canon_dominant",
+            )
+            repair_prompt = build_profile_candidate_repair_prompt(
+                prepared.packet_owned_prompt.prompt,
+                canon_first,
+                basis=prepared.basis,
+                reason=rejected.fallback_reason,
+            )
+            self.assertIn("do not begin with canon", repair_prompt)
+            self.assertIn(
+                "Use exactly one supported public observation first",
+                repair_prompt,
+            )
+        finally:
+            prepared.close()
 
     def test_sparse_empty_and_ambiguous_profiles_do_not_invent_breadth(self):
         self.add_recurring_topic(
@@ -1110,6 +1311,187 @@ class ProductionShapedBroadRecallAcceptanceTests(unittest.TestCase):
         self.assertEqual(
             ambiguous.diagnostics.route_reason,
             "recall_target_ambiguous",
+        )
+
+    def test_ordinary_one_observation_selects_a_grounded_sparse_candidate(self):
+        self.add_raw_message(
+            user_id=116,
+            user_name="OrdinarySignal",
+            content="I tune ceramic antennas for unusual signal harmonics.",
+            observed_at="2026-07-22T18:00:00+00:00",
+        )
+        prepared = prepare_memory_preview(
+            self.request(
+                user_id=116,
+                user_name="OrdinarySignal",
+                wording="BNL, what am I all about?",
+            )
+        )
+        try:
+            self.assertTrue(prepared.ready)
+            self.assertEqual(prepared.diagnostics.profile_status, "sparse")
+            selected = evaluate_memory_preview(
+                prepared,
+                baseline_response="I only have a thin record so far.",
+                candidate_response=(
+                    "One narrow public signal I can ground is that you tune "
+                    "ceramic antennas for unusual signal harmonics."
+                ),
+            )
+            self.assertTrue(selected.candidate_selected, selected.fallback_reason)
+            self.assertEqual(selected.candidate_member_point_count, 1)
+            self.assertEqual(selected.candidate_canon_count, 0)
+        finally:
+            prepared.close()
+
+    def test_material_paraphrases_cannot_satisfy_two_candidate_points(self):
+        user_id = 119
+        user_name = "MaterialPoints"
+        for content, observed_at in (
+            (
+                "I compare alternatives carefully before choosing a "
+                "direction.",
+                "2026-07-20T18:00:00+00:00",
+            ),
+            (
+                "I compare alternatives carefully before choosing "
+                "direction.",
+                "2026-07-21T18:00:00+00:00",
+            ),
+            (
+                "I test assumptions against failures before deciding.",
+                "2026-07-22T18:00:00+00:00",
+            ),
+        ):
+            self.add_raw_message(
+                user_id=user_id,
+                user_name=user_name,
+                content=content,
+                observed_at=observed_at,
+            )
+
+        for wording, duplicate_candidate, distinct_candidate in (
+            (
+                "BNL, what am I all about?",
+                (
+                    "You compare alternatives carefully before choosing a "
+                    "direction, and compare alternatives carefully before "
+                    "choosing direction."
+                ),
+                (
+                    "You compare alternatives carefully before choosing a "
+                    "direction, and test assumptions against failures before "
+                    "deciding."
+                ),
+            ),
+            (
+                (
+                    "What have you learned about how I work and make "
+                    "decisions?"
+                ),
+                (
+                    "My read is that you make decisions by comparing "
+                    "alternatives carefully before choosing a direction and "
+                    "comparing alternatives before choosing direction."
+                ),
+                (
+                    "My read is that you make decisions by comparing "
+                    "alternatives before choosing a direction and testing "
+                    "assumptions against failures before deciding."
+                ),
+            ),
+        ):
+            with self.subTest(wording=wording):
+                prepared = prepare_memory_preview(
+                    self.request(
+                        user_id=user_id,
+                        user_name=user_name,
+                        wording=wording,
+                    )
+                )
+                try:
+                    self.assertTrue(prepared.ready)
+                    self.assertEqual(
+                        prepared.diagnostics.profile_status,
+                        "rich",
+                    )
+                    self.assertEqual(
+                        prepared.diagnostics.profile_required_point_count,
+                        2,
+                    )
+
+                    duplicate = evaluate_memory_preview(
+                        prepared,
+                        baseline_response=(
+                            "I only have a narrow grounded view so far."
+                        ),
+                        candidate_response=duplicate_candidate,
+                    )
+                    self.assertFalse(duplicate.candidate_selected)
+                    self.assertEqual(
+                        duplicate.fallback_reason,
+                        "candidate_member_points_insufficient",
+                    )
+                    self.assertEqual(
+                        duplicate.candidate_member_point_count,
+                        1,
+                    )
+
+                    distinct = evaluate_memory_preview(
+                        prepared,
+                        baseline_response=(
+                            "I only have a narrow grounded view so far."
+                        ),
+                        candidate_response=distinct_candidate,
+                    )
+                    self.assertTrue(
+                        distinct.candidate_selected,
+                        distinct.fallback_reason,
+                    )
+                    self.assertEqual(
+                        distinct.candidate_member_point_count,
+                        2,
+                    )
+                finally:
+                    prepared.close()
+
+    def test_process_profile_ignores_unrelated_durable_motifs_and_skips_candidate(self):
+        self.add_recurring_topic(
+            user_id=117,
+            user_name="UnrelatedDurable",
+            first="I keep producing synth music and mixing audio tracks.",
+            second="The song vocals and drum mix need another pass.",
+        )
+        generator = mock.AsyncMock(
+            return_value="The established response remains available."
+        )
+        guard = mock.AsyncMock(
+            side_effect=lambda response, _prompt: (
+                response,
+                {"suppressed": False, "suppression_reason": ""},
+            )
+        )
+
+        result = asyncio.run(
+            bnl01_bot.execute_bnl_memory_preview(
+                source_db_path=self.db_path,
+                guild_id=1,
+                subject_user_id=117,
+                subject_display_name="UnrelatedDurable",
+                simulated_channel_id=10,
+                wording=(
+                    "What have you learned about how I work and make decisions?"
+                ),
+                generator=generator,
+                guard=guard,
+            )
+        )
+
+        self.assertFalse(result.candidate_selected)
+        self.assertEqual(result.fallback_reason, "profile_sufficiency_empty")
+        self.assertEqual(generator.await_count, 1)
+        self.assertTrue(
+            generator.await_args.args[1].endswith("baseline")
         )
 
     def test_real_prompt_to_send_records_packet_and_synthesis_live_receipts(

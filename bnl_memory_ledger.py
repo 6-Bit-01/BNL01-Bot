@@ -571,6 +571,8 @@ _PUBLIC_ASSESSMENT_PROCESS_QUERY_RE = re.compile(
 _PUBLIC_ASSESSMENT_PROCESS_TERMS = frozenset(
     {
         "approach",
+        "adjust",
+        "adjusting",
         "build",
         "building",
         "careful",
@@ -5376,6 +5378,21 @@ def _public_assessment_terms(value: str) -> frozenset[str]:
     )
 
 
+def _public_assessment_term_stem(value: str) -> str:
+    term = str(value or "").lower()
+    if len(term) > 5 and term.endswith("ies"):
+        return term[:-3] + "y"
+    for suffix in ("ing", "ed"):
+        if len(term) > len(suffix) + 3 and term.endswith(suffix):
+            stem = term[: -len(suffix)]
+            if len(stem) > 3 and stem[-1:] == stem[-2:-1]:
+                stem = stem[:-1]
+            return stem
+    if len(term) > 4 and term.endswith("s") and not term.endswith("ss"):
+        return term[:-1]
+    return term
+
+
 def _public_assessment_text(value: str) -> str:
     """Return inert public prose suitable for a bounded response-time packet."""
 
@@ -5397,6 +5414,23 @@ def _public_assessment_text(value: str) -> str:
     ):
         return ""
     return text.replace("```", "")[:240]
+
+
+def public_assessment_safe_text(value: str) -> str:
+    """Expose the selector's exact inert-text normalization for revalidation.
+
+    Packet assembly uses this read-only helper to bind a selector result back
+    to the current authoritative Ledger row without maintaining a second text
+    policy.
+    """
+
+    return _public_assessment_text(value)
+
+
+def public_assessment_process_request(value: str) -> bool:
+    """Return whether assessment selection must require process relevance."""
+
+    return bool(_PUBLIC_ASSESSMENT_PROCESS_QUERY_RE.search(str(value or "")))
 
 
 def select_public_conversation_assessment_evidence(
@@ -5437,6 +5471,14 @@ def select_public_conversation_assessment_evidence(
     target_terms = set(request_terms)
     if process_request:
         target_terms.update(_PUBLIC_ASSESSMENT_PROCESS_TERMS)
+    process_stems = {
+        _public_assessment_term_stem(term)
+        for term in _PUBLIC_ASSESSMENT_PROCESS_TERMS
+    }
+    request_non_process_stems = {
+        _public_assessment_term_stem(term)
+        for term in request_terms
+    } - process_stems
 
     occurrence_terms: dict[str, set[str]] = {}
     prepared: list[dict[str, Any]] = []
@@ -5477,11 +5519,28 @@ def select_public_conversation_assessment_evidence(
         terms = set(candidate["terms"])
         direct_overlap = terms.intersection(request_terms)
         target_overlap = terms.intersection(target_terms)
+        candidate_stems = {
+            _public_assessment_term_stem(term) for term in terms
+        }
+        process_overlap = candidate_stems.intersection(process_stems)
+        direct_non_process_overlap = candidate_stems.intersection(
+            request_non_process_stems
+        )
         recurrent_score = sum(
             min(3, max(0, int(term_occurrence_frequency[term]) - 1))
             for term in terms
         )
-        candidate["request_relevant"] = bool(target_overlap)
+        candidate["request_relevant"] = bool(
+            (
+                len(process_overlap) >= 2
+                or (
+                    len(process_overlap) >= 1
+                    and bool(direct_non_process_overlap)
+                )
+            )
+            if process_request
+            else target_overlap
+        )
         candidate["base_score"] = (
             10.0 * len(direct_overlap)
             + 5.0 * len(target_overlap - direct_overlap)

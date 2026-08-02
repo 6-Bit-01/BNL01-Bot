@@ -425,6 +425,17 @@ class MemoryPreviewTests(unittest.TestCase):
             )
             self.assertTrue(context_items[0].root_identities)
             self.assertTrue(context_items[0].occurrence_identities)
+            self.assertGreaterEqual(
+                first.packet.diagnostics.root_collapse_suppression,
+                1,
+            )
+            self.assertTrue(
+                any(
+                    exclusion.lane == "assessment_observation"
+                    and exclusion.reason == "same_root_projection"
+                    for exclusion in first.packet.exclusions
+                )
+            )
             self.assertTrue(
                 any(
                     item.lane == "current_intent"
