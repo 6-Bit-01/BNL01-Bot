@@ -1108,6 +1108,14 @@ class MemoryPreviewTests(unittest.TestCase):
         self.assertIn("source_db_read_only=true", lines)
         self.assertIn("invocation_saved=false", lines)
         self.assertIn("response_saved=false", lines)
+        self.assertIn(
+            "capability=shared_brain_public_broad_recall",
+            lines,
+        )
+        self.assertIn("contract=hybrid_shared_brain_v1", lines)
+        self.assertIn("prerequisites_ready=true", lines)
+        self.assertIn("canon_status_counts", lines)
+        self.assertIn("canon_domain_counts", lines)
 
 
 if __name__ == "__main__":

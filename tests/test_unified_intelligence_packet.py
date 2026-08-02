@@ -183,6 +183,72 @@ class UnifiedIntelligencePacketTests(unittest.TestCase):
         ).fetchone()[0]
         return roots, canonical_id or result.candidate_id
 
+    def add_established_living(self, *, first_row=1001):
+        living_flags = dict(self.flags)
+        living_flags[ledger.LIVING_CANON_V1_FORMATION_ENV] = "true"
+        texts = (
+            "I tune ceramic antennas with copper meshes during field experiments.",
+            "We tune the ceramic antenna with a copper mesh during the field experiment.",
+        )
+        for offset, text in enumerate(texts):
+            row_id = first_row + offset
+            observed_at = (
+                datetime(2026, 7, 20 + offset, 10, tzinfo=timezone.utc)
+                .isoformat()
+            )
+            self.conn.execute(
+                """
+                INSERT INTO conversations(
+                    id,guild_id,user_id,user_name,role,content,channel_id,
+                    channel_policy,route_mode,timestamp
+                ) VALUES(?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    row_id,
+                    1,
+                    7,
+                    "Crow",
+                    "user",
+                    text,
+                    10,
+                    "public_home",
+                    "normal_chat",
+                    observed_at,
+                ),
+            )
+            root = ledger.shadow_conversation_row(
+                self.conn,
+                row_id=row_id,
+                user_id=7,
+                user_name="Crow",
+                guild_id=1,
+                role="user",
+                content=text,
+                channel_name="barcode-bot",
+                channel_policy="public_home",
+                channel_id=10,
+                route_mode="normal_chat",
+                observed_at=observed_at,
+                environ=living_flags,
+            ).entry_id
+            ledger.form_atomic_candidates_from_recurring_conversation(
+                self.conn,
+                trigger_entry_id=root,
+                environ=living_flags,
+            )
+        row = self.conn.execute(
+            """
+            SELECT candidate_id
+            FROM memory_ledger_knowledge_candidates
+            WHERE recurrence_contract_version=?
+              AND candidate_state='established'
+            ORDER BY candidate_id LIMIT 1
+            """,
+            (ledger.LIVING_CANON_RECURRENCE_VERSION,),
+        ).fetchone()
+        self.assertIsNotNone(row)
+        return str(row[0]), living_flags
+
     def add_public_moment(self):
         base = datetime(2026, 7, 25, 12, 0, tzinfo=timezone.utc)
         messages = (
@@ -1341,7 +1407,115 @@ class UnifiedIntelligencePacketTests(unittest.TestCase):
             1,
         )
 
-    def test_family_neutral_living_candidate_waits_for_pr5_convergence(self):
+    def test_established_living_candidate_converges_into_frozen_packet(self):
+        self.add_conversation_context_row()
+        candidate_id, living_flags = self.add_established_living()
+
+        packet = build_packet(
+            self.conn,
+            self.public_request(text="What am I all about?"),
+            persist=False,
+            environ=living_flags,
+        )
+
+        item = next(
+            item
+            for item in packet.items
+            if item.source_ref == f"atomic:{candidate_id}"
+        )
+        self.assertEqual(item.canon_status, "living")
+        self.assertEqual(item.canon_domain, "real_community")
+        self.assertEqual(item.canon_claim_kind, "behavior_pattern")
+        self.assertEqual(item.lifecycle, "established")
+        self.assertGreaterEqual(len(item.root_identities), 2)
+        self.assertGreaterEqual(len(item.occurrence_identities), 2)
+        self.assertEqual(
+            packet.diagnostics.selected_by_canon_status.get("living"),
+            1,
+        )
+        self.assertEqual(
+            packet.diagnostics.selected_by_canon_domain.get(
+                "real_community"
+            ),
+            1,
+        )
+        self.assertEqual(packet.diagnostics.revalidation_status, "passed")
+        self.assertFalse(packet.diagnostics.invalid_invariants)
+
+    def test_authorized_declared_member_claim_converges_as_subject_fact(self):
+        self.add_conversation_context_row()
+        self.conn.commit()
+        authority = {
+            "BNL_OWNER_USER_ID": "61",
+            "BNL_PRIMARY_GUILD_ID": "1",
+            declared.DECLARED_CANON_AUTHORITY_SECRET_ENV: (
+                "pr5-declared-packet-authority-secret-0001"
+            ),
+        }
+        with mock.patch.dict(os.environ, authority, clear=False):
+            declared.ensure_declared_canon_schema(self.conn)
+            revision = declared.add_declared_canon(
+                self.conn,
+                actor_user_id=61,
+                authority_nonce="pr5-declared-packet-0001",
+                guild_id=1,
+                subject_type="person",
+                subject_id="discord_user:7",
+                predicate="community_role",
+                value={"role": "signal keeper", "current": True},
+                raw_declaration=(
+                    "6 Bit declares Test Member the signal keeper."
+                ),
+                cleaned_summary="Test Member is the signal keeper.",
+                domain="real_community",
+                claim_kind="role",
+                visibility="public_safe",
+                eligible_routes=("public_home",),
+                valid_from="2026-07-01T00:00:00+00:00",
+                now="2026-07-01T00:00:00+00:00",
+            ).primary
+            disabled_packet = build_packet(
+                self.conn,
+                self.public_request(text="What am I all about?"),
+                persist=False,
+                environ=self.flags,
+            )
+            self.assertFalse(
+                any(
+                    item.source_type == "declared_canon_claim"
+                    for item in disabled_packet.items
+                )
+            )
+            request = replace(
+                self.public_request(text="What am I all about?"),
+                declared_canon_authorized=True,
+            )
+            packet = build_packet(
+                self.conn,
+                request,
+                persist=False,
+                environ=self.flags,
+            )
+
+        item = next(
+            item
+            for item in packet.items
+            if item.source_type == "declared_canon_claim"
+        )
+        self.assertEqual(item.lane, "approved_fact")
+        self.assertEqual(item.subject_key, "discord_user:7")
+        self.assertEqual(item.canon_status, "declared")
+        self.assertEqual(item.canon_domain, "real_community")
+        self.assertEqual(item.canon_claim_kind, "role")
+        self.assertEqual(item.lifecycle, "established")
+        self.assertEqual(
+            item.root_identities,
+            (f"declared_canon:{revision.declaration_id}",),
+        )
+        self.assertEqual(packet.diagnostics.revalidation_status, "passed")
+        self.assertFalse(packet.diagnostics.invalid_invariants)
+
+    def test_partial_family_neutral_living_candidate_fails_closed(self):
         self.add_conversation_context_row()
         _roots, candidate_id = self.add_established_atomic(
             predicate_key="community_pattern",
@@ -1369,15 +1543,16 @@ class UnifiedIntelligencePacketTests(unittest.TestCase):
                 for item in packet.items
             )
         )
-        self.assertGreaterEqual(
-            packet.diagnostics.excluded_by_reason.get(
-                "living_canon_pending_packet_convergence",
-                0,
-            ),
-            1,
+        self.assertTrue(
+            any(
+                reason.startswith("living_") and count >= 1
+                for reason, count in (
+                    packet.diagnostics.excluded_by_reason.items()
+                )
+            )
         )
 
-    def test_family_matched_living_candidate_waits_for_pr5_convergence(self):
+    def test_partial_family_matched_living_candidate_fails_closed(self):
         self.add_conversation_context_row()
         _roots, candidate_id = self.add_established_atomic(
             predicate_key="conversation_motif_architecture",
@@ -1405,12 +1580,13 @@ class UnifiedIntelligencePacketTests(unittest.TestCase):
                 for item in packet.items
             )
         )
-        self.assertGreaterEqual(
-            packet.diagnostics.excluded_by_reason.get(
-                "living_canon_pending_packet_convergence",
-                0,
-            ),
-            1,
+        self.assertTrue(
+            any(
+                reason.startswith("living_") and count >= 1
+                for reason, count in (
+                    packet.diagnostics.excluded_by_reason.items()
+                )
+            )
         )
 
     def test_living_recurrence_contract_stays_quarantined_after_type_drift(self):
@@ -1442,12 +1618,13 @@ class UnifiedIntelligencePacketTests(unittest.TestCase):
                 for item in packet.items
             )
         )
-        self.assertGreaterEqual(
-            packet.diagnostics.excluded_by_reason.get(
-                "living_canon_pending_packet_convergence",
-                0,
-            ),
-            1,
+        self.assertTrue(
+            any(
+                reason.startswith("living_") and count >= 1
+                for reason, count in (
+                    packet.diagnostics.excluded_by_reason.items()
+                )
+            )
         )
 
     def test_malformed_living_version_stays_quarantined(self):
@@ -1475,12 +1652,13 @@ class UnifiedIntelligencePacketTests(unittest.TestCase):
         self.assertFalse(
             any(item.source_ref == f"atomic:{candidate_id}" for item in packet.items)
         )
-        self.assertGreaterEqual(
-            packet.diagnostics.excluded_by_reason.get(
-                "living_canon_pending_packet_convergence",
-                0,
-            ),
-            1,
+        self.assertTrue(
+            any(
+                reason.startswith("living_") and count >= 1
+                for reason, count in (
+                    packet.diagnostics.excluded_by_reason.items()
+                )
+            )
         )
 
     def test_malformed_neutral_prefix_stays_quarantined(self):
@@ -1592,12 +1770,13 @@ class UnifiedIntelligencePacketTests(unittest.TestCase):
         self.assertFalse(
             any(item.source_ref == f"atomic:{candidate_id}" for item in packet.items)
         )
-        self.assertGreaterEqual(
-            packet.diagnostics.excluded_by_reason.get(
-                "living_canon_pending_packet_convergence",
-                0,
-            ),
-            1,
+        self.assertTrue(
+            any(
+                reason.startswith("living_") and count >= 1
+                for reason, count in (
+                    packet.diagnostics.excluded_by_reason.items()
+                )
+            )
         )
 
     def test_atomic_source_blind_root_fails_closed_if_state_is_malformed(self):

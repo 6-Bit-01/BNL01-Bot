@@ -61,9 +61,11 @@ and correction checks. Neutral patterns cannot create scalar identity, roles,
 relationships, milestones, operational truth, Declared Canon, or Legacy
 Canon.
 
-PR 4 keeps every recurrence-marked Living candidate, curated-family or
-family-neutral, outside the live packet until PR 5 owns convergence. Its
-historical preview runs against a disposable in-memory clone and
+PR 5 admits a recurrence-marked Living candidate only when the complete v1
+adapter proof matches the current authoritative Ledger roots and occurrence
+identities. Partial markers, malformed proof, source drift, or a projection
+root remain excluded. The historical preview runs against a disposable
+in-memory clone and
 returns only versions, states, bounds, aggregate reason counts, and an explicit
 zero-source-write receipt. It does not expose source text or identifiers, and
 it never performs historical promotion.
@@ -148,10 +150,18 @@ has no transaction and reuse a caller-owned transaction otherwise. This keeps
 revision selection, stored-receipt validation, and authoritative source-row
 revalidation on one database state while remaining zero-write.
 
-Claim-content use in the live packet, website projection, and delegated
-authority remain disabled. New Declared Ledger projections are internal,
-derived, nonpublic, and confined to the `declared_canon_review` lane until
-final convergence. Established and contested rows use the `review_only`
-lifecycle; resolved, retired, and superseded terminal rows retain the
-`resolved` lifecycle. The packet's binding lookup remains read-only and
-effective only for already-approved binding rows.
+PR 5 gives the explicitly effective broad-recall packet owner a zero-write
+Declared read boundary. It returns only current public claims after stored
+HMAC, schema, revision, source, visibility, validity, and route validation;
+the default-off packet cannot read their content. New Declared Ledger
+projections remain internal, derived, nonpublic, and confined to the
+`declared_canon_review` lane. Established and contested projections use the
+`review_only` lifecycle; resolved, retired, and superseded terminal rows retain
+the `resolved` lifecycle. Website projection and delegated authority remain
+disabled. The packet's binding lookup remains read-only and effective only for
+already-approved binding rows.
+
+This convergence does not add seriousness inference, a member-facing
+correction feature, or member edit/delete controls. Existing source lifecycle
+and lineage validation is consumed as stored authority; PR 5 adds no new
+natural-language correction behavior.

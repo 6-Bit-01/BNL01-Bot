@@ -300,6 +300,18 @@ class SharedBrainSynthesisCanaryTests(unittest.TestCase):
         self.assertEqual(configured["guild_allowlist_count"], 1)
         self.assertEqual(configured["user_allowlist_count"], 1)
         self.assertEqual(configured["channel_allowlist_count"], 1)
+        receipt = configured["capability_receipt"]
+        self.assertEqual(
+            receipt["capability"],
+            "shared_brain_public_broad_recall",
+        )
+        self.assertEqual(
+            receipt["contract_version"],
+            "hybrid_shared_brain_v1",
+        )
+        self.assertTrue(receipt["prerequisites_ready"])
+        self.assertEqual(receipt["conflicts"], ())
+        self.assertTrue(receipt["scope_digest"])
 
         bounded_expansion = configuration(
             {
@@ -332,6 +344,21 @@ class SharedBrainSynthesisCanaryTests(unittest.TestCase):
         self.assertEqual(
             global_live["reason"],
             "global_live_authority_detected",
+        )
+
+        with mock.patch(
+            "bnl_shared_brain_synthesis.PACKET_SCHEMA_VERSION",
+            "unified_intelligence_packet_unexpected",
+        ):
+            version_conflict = configuration(self.flags)
+        self.assertFalse(version_conflict["effective"])
+        self.assertEqual(
+            version_conflict["reason"],
+            "prerequisite_version_conflict",
+        )
+        self.assertIn(
+            "version:packet_version",
+            version_conflict["capability_receipt"]["conflicts"],
         )
 
     def test_scope_excludes_wrong_route_surface_media_and_attribution(self):

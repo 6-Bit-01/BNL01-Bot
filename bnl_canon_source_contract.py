@@ -227,6 +227,17 @@ class CanonAdapterResult:
 
 
 @dataclass(frozen=True)
+class DeclaredCanonPacketSelection:
+    """Bounded PR 5 read result for the explicitly authorized packet owner."""
+
+    claims: tuple[CanonClaim, ...] = ()
+    reason: str = "disabled"
+    candidate_count: int = 0
+    rejected_count: int = 0
+    blocker_count: int = 0
+
+
+@dataclass(frozen=True)
 class Resolution:
     usable: bool
     claim: SourceClaim | None
@@ -2430,6 +2441,122 @@ def _inventory_declared_canon_claims(
         dict(stats),
         truncated,
     )
+
+
+def select_declared_canon_claims_for_packet(
+    conn: Any,
+    *,
+    guild_id: int,
+    route_mode: str,
+    channel_policy: str,
+    capability_authorized: bool = False,
+    limit: int = 200,
+    now: datetime | str | None = None,
+) -> DeclaredCanonPacketSelection:
+    """Return only current public Declared claims for the PR 5 packet owner.
+
+    Mutation authority remains in Declared Canon.  This read boundary is
+    unavailable unless the caller has already resolved the one broad-recall
+    capability as effective, and every stored revision is HMAC/source/schema
+    validated again inside the same read snapshot.
+    """
+
+    if not strict_contract_bool(capability_authorized):
+        return DeclaredCanonPacketSelection(reason="capability_disabled")
+    if (
+        int(guild_id or 0) <= 0
+        or str(route_mode or "") != "normal_chat"
+        or str(channel_policy or "") != "public_home"
+    ):
+        return DeclaredCanonPacketSelection(reason="route_scope_ineligible")
+    safe_limit = max(1, min(int(limit or 1), 200))
+    if isinstance(now, datetime):
+        evaluation_now = now
+        if evaluation_now.tzinfo is None:
+            evaluation_now = evaluation_now.replace(tzinfo=timezone.utc)
+        evaluation_now = evaluation_now.astimezone(timezone.utc)
+    elif now is None or not str(now or "").strip():
+        evaluation_now = datetime.now(timezone.utc)
+    else:
+        parsed_now = _parse_contract_time(now)
+        if parsed_now is None:
+            return DeclaredCanonPacketSelection(reason="time_invalid")
+        evaluation_now = parsed_now
+
+    with _read_snapshot(conn):
+        before_changes = int(getattr(conn, "total_changes", 0) or 0)
+        _broadcast_total, broadcast_rows, broadcast_truncated = (
+            _inventory_table_rows(
+                conn,
+                table_name="broadcast_memory",
+                wanted_columns=("id",),
+                guild_id=int(guild_id or 0),
+                limit=safe_limit,
+            )
+        )
+        (
+            general_claims,
+            broadcast_claims,
+            stats,
+            declared_truncated,
+        ) = _inventory_declared_canon_claims(
+            conn,
+            guild_id=int(guild_id or 0),
+            broadcast_rows=broadcast_rows,
+            limit=safe_limit,
+            now=evaluation_now,
+        )
+        blockers = int(bool(broadcast_truncated or declared_truncated))
+        blockers += int(stats.get("declaredBoundaryRejectedCount", 0) or 0)
+        blockers += int(stats.get("broadcastDuplicateAuthorityCount", 0) or 0)
+        blockers += int(stats.get("broadcastStaleSidecarCount", 0) or 0)
+        blockers += int(
+            stats.get("declaredOrphanBroadcastSourceCount", 0) or 0
+        )
+        all_claims = tuple(
+            sorted(
+                (*general_claims, *broadcast_claims.values()),
+                key=lambda claim: (claim.claim_id, claim.revision_id),
+            )
+        )
+        eligible = tuple(
+            claim
+            for claim in all_claims
+            if claim.canon_status == CanonStatus.DECLARED
+            and claim.lifecycle == ClaimLifecycle.ESTABLISHED
+            and claim.visibility
+            in {
+                Visibility.PUBLIC,
+                Visibility.PUBLIC_SAFE,
+                Visibility.REFERENCE_CANON,
+            }
+            and "public_home" in claim.eligible_routes
+        )
+        mutation_count = max(
+            0,
+            int(getattr(conn, "total_changes", 0) or 0) - before_changes,
+        )
+        if mutation_count:
+            return DeclaredCanonPacketSelection(
+                reason="read_boundary_mutated_state",
+                candidate_count=len(all_claims),
+                rejected_count=len(all_claims),
+                blocker_count=blockers + 1,
+            )
+        if blockers:
+            return DeclaredCanonPacketSelection(
+                reason="source_conflict",
+                candidate_count=len(all_claims),
+                rejected_count=len(all_claims),
+                blocker_count=blockers,
+            )
+        return DeclaredCanonPacketSelection(
+            claims=eligible,
+            reason="eligible" if eligible else "no_eligible_claims",
+            candidate_count=len(all_claims),
+            rejected_count=max(0, len(all_claims) - len(eligible)),
+            blocker_count=0,
+        )
 
 
 def _build_claim_contract_inventory_in_snapshot(
