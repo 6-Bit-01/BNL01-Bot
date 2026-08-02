@@ -1,3 +1,5 @@
+import hashlib
+import json
 import sqlite3
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -44,10 +46,94 @@ class PublicAssessmentSelectorCostTests(unittest.TestCase):
             )
             """
         )
+        self._journal_ready = False
         self.conn.commit()
 
     def tearDown(self):
         self.conn.close()
+
+    def _ensure_journal_receipt_schema(self):
+        if self._journal_ready:
+            return
+        self.conn.executescript(
+            """
+            CREATE TABLE bnl_journal_source_events (
+              event_seq INTEGER PRIMARY KEY AUTOINCREMENT,
+              guild_id INTEGER NOT NULL,source_kind TEXT NOT NULL,
+              source_key TEXT NOT NULL,occurred_at_ms INTEGER NOT NULL,
+              ingested_at_ms INTEGER NOT NULL,channel_id INTEGER,
+              channel_policy TEXT NOT NULL,subject_ref TEXT NOT NULL,
+              private_display_name TEXT NOT NULL,raw_text TEXT NOT NULL,
+              sanitized_summary TEXT NOT NULL,content_hash TEXT NOT NULL,
+              public_usable INTEGER NOT NULL,metadata_json TEXT NOT NULL,
+              UNIQUE(guild_id,source_kind,source_key)
+            );
+            CREATE TRIGGER trg_bnl_journal_sources_no_duplicate_insert
+            BEFORE INSERT ON bnl_journal_source_events
+            WHEN EXISTS (
+              SELECT 1 FROM bnl_journal_source_events
+              WHERE event_seq=NEW.event_seq OR (
+                guild_id=NEW.guild_id AND source_kind=NEW.source_kind
+                AND source_key=NEW.source_key
+              )
+            ) BEGIN
+              SELECT RAISE(ABORT,'bnl_journal_source_events_duplicate_identity');
+            END;
+            CREATE TRIGGER trg_bnl_journal_sources_no_update
+            BEFORE UPDATE ON bnl_journal_source_events
+            BEGIN
+              SELECT RAISE(ABORT,'bnl_journal_source_events_immutable');
+            END;
+            CREATE TRIGGER trg_bnl_journal_sources_no_delete
+            BEFORE DELETE ON bnl_journal_source_events
+            BEGIN
+              SELECT RAISE(ABORT,'bnl_journal_source_events_immutable');
+            END;
+            """
+        )
+        self._journal_ready = True
+
+    def _add_continuity_receipt(
+        self,
+        *,
+        row_id,
+        message_id,
+        source_text,
+        observed_at,
+    ):
+        self._ensure_journal_receipt_schema()
+        observed = datetime.fromisoformat(str(observed_at).replace("Z", "+00:00"))
+        metadata = {
+            "conversationRowId": int(row_id),
+            "messageId": int(message_id),
+            "source": "discord_backfill",
+        }
+        self.conn.execute(
+            """
+            INSERT INTO bnl_journal_source_events(
+              guild_id,source_kind,source_key,occurred_at_ms,ingested_at_ms,
+              channel_id,channel_policy,subject_ref,private_display_name,
+              raw_text,sanitized_summary,content_hash,public_usable,
+              metadata_json
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                self.GUILD_ID,
+                "discord_message",
+                str(message_id),
+                int(observed.timestamp() * 1000),
+                int(observed.timestamp() * 1000) + 1,
+                10,
+                "public_home",
+                self.SUBJECT_KEY,
+                self.USER_NAME,
+                source_text,
+                "inert summary",
+                hashlib.sha256(source_text.encode("utf-8")).hexdigest(),
+                1,
+                json.dumps(metadata, sort_keys=True, separators=(",", ":")),
+            ),
+        )
 
     def _add_source(
         self,
@@ -108,6 +194,13 @@ class PublicAssessmentSelectorCostTests(unittest.TestCase):
             source_sequence=source_sequence,
         )
         self.assertEqual(result.outcome, "inserted")
+        if str(route_mode) == "conversation_continuity":
+            self._add_continuity_receipt(
+                row_id=row_id,
+                message_id=message_id,
+                source_text=source_text,
+                observed_at=observed_at,
+            )
         return result.entry_id
 
     def _select(self, *, max_results=4):

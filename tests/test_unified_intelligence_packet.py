@@ -1341,6 +1341,265 @@ class UnifiedIntelligencePacketTests(unittest.TestCase):
             1,
         )
 
+    def test_family_neutral_living_candidate_waits_for_pr5_convergence(self):
+        self.add_conversation_context_row()
+        _roots, candidate_id = self.add_established_atomic(
+            predicate_key="community_pattern",
+            value="careful antenna calibration",
+        )
+        self.conn.execute(
+            """
+            UPDATE memory_ledger_knowledge_candidates
+            SET predicate_key='conversation_motif_neutral_deadbeef'
+            WHERE candidate_id=?
+            """,
+            (candidate_id,),
+        )
+
+        packet = build_packet(
+            self.conn,
+            self.public_request(text="What am I all about?"),
+            persist=False,
+            environ=self.flags,
+        )
+
+        self.assertFalse(
+            any(
+                item.source_ref == f"atomic:{candidate_id}"
+                for item in packet.items
+            )
+        )
+        self.assertGreaterEqual(
+            packet.diagnostics.excluded_by_reason.get(
+                "living_canon_pending_packet_convergence",
+                0,
+            ),
+            1,
+        )
+
+    def test_family_matched_living_candidate_waits_for_pr5_convergence(self):
+        self.add_conversation_context_row()
+        _roots, candidate_id = self.add_established_atomic(
+            predicate_key="conversation_motif_architecture",
+            value="careful antenna calibration",
+        )
+        self.conn.execute(
+            """
+            UPDATE memory_ledger_knowledge_candidates
+            SET recurrence_contract_version=?
+            WHERE candidate_id=?
+            """,
+            (ledger.LIVING_CANON_RECURRENCE_VERSION, candidate_id),
+        )
+
+        packet = build_packet(
+            self.conn,
+            self.public_request(text="What am I all about?"),
+            persist=False,
+            environ=self.flags,
+        )
+
+        self.assertFalse(
+            any(
+                item.source_ref == f"atomic:{candidate_id}"
+                for item in packet.items
+            )
+        )
+        self.assertGreaterEqual(
+            packet.diagnostics.excluded_by_reason.get(
+                "living_canon_pending_packet_convergence",
+                0,
+            ),
+            1,
+        )
+
+    def test_living_recurrence_contract_stays_quarantined_after_type_drift(self):
+        self.add_conversation_context_row()
+        _roots, candidate_id = self.add_established_atomic(
+            predicate_key="conversation_motif_architecture",
+            value="careful antenna calibration",
+        )
+        self.conn.execute(
+            """
+            UPDATE memory_ledger_knowledge_candidates
+            SET recurrence_contract_version=?,
+                candidate_type='open_loop_or_question'
+            WHERE candidate_id=?
+            """,
+            (ledger.LIVING_CANON_RECURRENCE_VERSION, candidate_id),
+        )
+
+        packet = build_packet(
+            self.conn,
+            self.public_request(text="What am I all about?"),
+            persist=False,
+            environ=self.flags,
+        )
+
+        self.assertFalse(
+            any(
+                item.source_ref == f"atomic:{candidate_id}"
+                for item in packet.items
+            )
+        )
+        self.assertGreaterEqual(
+            packet.diagnostics.excluded_by_reason.get(
+                "living_canon_pending_packet_convergence",
+                0,
+            ),
+            1,
+        )
+
+    def test_malformed_living_version_stays_quarantined(self):
+        self.add_conversation_context_row()
+        _roots, candidate_id = self.add_established_atomic(
+            predicate_key="conversation_motif_architecture",
+            value="careful antenna calibration",
+        )
+        self.conn.execute(
+            """
+            UPDATE memory_ledger_knowledge_candidates
+            SET recurrence_contract_version='living_canon_recurrence_v1 '
+            WHERE candidate_id=?
+            """,
+            (candidate_id,),
+        )
+
+        packet = build_packet(
+            self.conn,
+            self.public_request(text="What am I all about?"),
+            persist=False,
+            environ=self.flags,
+        )
+
+        self.assertFalse(
+            any(item.source_ref == f"atomic:{candidate_id}" for item in packet.items)
+        )
+        self.assertGreaterEqual(
+            packet.diagnostics.excluded_by_reason.get(
+                "living_canon_pending_packet_convergence",
+                0,
+            ),
+            1,
+        )
+
+    def test_malformed_neutral_prefix_stays_quarantined(self):
+        self.add_conversation_context_row()
+        for predicate in (
+            "Conversation_Motif_Neutral_deadbeef",
+            " conversation_motif_neutral_deadbeef",
+        ):
+            with self.subTest(predicate=predicate):
+                _roots, candidate_id = self.add_established_atomic(
+                    first_row=(910 if predicate.startswith("C") else 920),
+                    predicate_key="community_pattern",
+                    value="careful antenna calibration",
+                )
+                self.conn.execute(
+                    """
+                    UPDATE memory_ledger_knowledge_candidates
+                    SET predicate_key=? WHERE candidate_id=?
+                    """,
+                    (predicate, candidate_id),
+                )
+                packet = build_packet(
+                    self.conn,
+                    self.public_request(text="What am I all about?"),
+                    persist=False,
+                    environ=self.flags,
+                )
+                self.assertFalse(
+                    any(
+                        item.source_ref == f"atomic:{candidate_id}"
+                        for item in packet.items
+                    )
+                )
+
+    def test_partial_living_metadata_stays_quarantined(self):
+        self.add_conversation_context_row()
+        drift_cases = (
+            ("grouping_signature_version", "living_grouping_v1"),
+            ("grouping_identity", "a" * 64),
+            ("canon_domain", "real_community"),
+            ("canon_claim_kind", "behavior_pattern"),
+            ("independent_occurrence_count", 2),
+            ("occurrence_ids_json", '["occurrence-1"]'),
+            ("occurrence_digest", "b" * 64),
+            ("recurrence_proof_json", '{"contract":"v1"}'),
+            ("public_usable", 1),
+        )
+        for index, (column, value) in enumerate(drift_cases, start=1):
+            with self.subTest(column=column):
+                _roots, candidate_id = self.add_established_atomic(
+                    first_row=900 + (index * 10),
+                    predicate_key="conversation_motif_architecture_%s" % index,
+                    value="careful antenna calibration %s" % index,
+                )
+                self.conn.execute(
+                    "UPDATE memory_ledger_knowledge_candidates SET %s=? "
+                    "WHERE candidate_id=?" % column,
+                    (value, candidate_id),
+                )
+                packet = build_packet(
+                    self.conn,
+                    self.public_request(text="What am I all about?"),
+                    persist=False,
+                    environ=self.flags,
+                )
+                self.assertFalse(
+                    any(
+                        item.source_ref == f"atomic:{candidate_id}"
+                        for item in packet.items
+                    )
+                )
+
+    def test_temp_candidate_shadow_cannot_bypass_living_quarantine(self):
+        self.add_conversation_context_row()
+        _roots, candidate_id = self.add_established_atomic(
+            predicate_key="conversation_motif_architecture",
+            value="careful antenna calibration",
+        )
+        self.conn.execute(
+            """
+            UPDATE main.memory_ledger_knowledge_candidates
+            SET recurrence_contract_version=?
+            WHERE candidate_id=?
+            """,
+            (ledger.LIVING_CANON_RECURRENCE_VERSION, candidate_id),
+        )
+        self.conn.execute(
+            """
+            CREATE TEMP TABLE memory_ledger_knowledge_candidates AS
+            SELECT * FROM main.memory_ledger_knowledge_candidates
+            """
+        )
+        self.conn.execute(
+            """
+            UPDATE temp.memory_ledger_knowledge_candidates
+            SET recurrence_contract_version=''
+            WHERE candidate_id=?
+            """,
+            (candidate_id,),
+        )
+
+        packet = build_packet(
+            self.conn,
+            self.public_request(text="What am I all about?"),
+            persist=False,
+            environ=self.flags,
+        )
+
+        self.assertFalse(
+            any(item.source_ref == f"atomic:{candidate_id}" for item in packet.items)
+        )
+        self.assertGreaterEqual(
+            packet.diagnostics.excluded_by_reason.get(
+                "living_canon_pending_packet_convergence",
+                0,
+            ),
+            1,
+        )
+
     def test_atomic_source_blind_root_fails_closed_if_state_is_malformed(self):
         self.add_conversation_context_row()
         roots, candidate_id = self.add_established_atomic(first_row=57)

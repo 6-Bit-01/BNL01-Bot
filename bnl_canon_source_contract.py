@@ -22,6 +22,12 @@ LIVING_CANON_ADAPTER_VERSION = "living_canon_adapter_v1"
 OPEN_SIGNAL_ADAPTER_VERSION = "open_signal_adapter_v3"
 WEBSITE_LORE_ADAPTER_VERSION = "website_lore_review_adapter_v1"
 LIVING_CANON_RECURRENCE_VERSION = "living_canon_recurrence_v1"
+LIVING_CANON_GROUPING_SIGNATURE_VERSION = (
+    "living_canon_exact_root_grouping_v1"
+)
+ATOMIC_KNOWLEDGE_LIFECYCLE_SCHEMA_VERSION = (
+    "memory_ledger_atomic_knowledge_lifecycle_v1"
+)
 PUBLIC_ASSESSMENT_EVIDENCE_VERSION = "public_assessment_evidence_v3"
 ENTITY_ACCOUNT_BINDING_CONTRACT_VERSION = "canon_entity_account_binding_v1"
 
@@ -200,6 +206,8 @@ class CanonClaim:
     supersedes: tuple[str, ...] = ()
     correction_of: tuple[str, ...] = ()
     recurrence_contract_version: str = ""
+    grouping_signature_version: str = ""
+    grouping_identity: str = ""
     projection_state: str = "shadow"
     projection_version: str = HYBRID_CANON_CLAIM_CONTRACT_VERSION
     subject_type: str = ""
@@ -405,6 +413,14 @@ def _claim_revision_payload(
         claim.projection_state,
         claim.projection_version,
     )
+    grouping_identity = (
+        str(claim.grouping_signature_version or ""),
+        str(claim.grouping_identity or ""),
+    )
+    # Preserve existing revision IDs for non-Living adapters.  A recurrence-
+    # verified Living claim opts into the grouping extension explicitly.
+    if any(grouping_identity):
+        payload += ("living_grouping_contract_v1", *grouping_identity)
     typed_identity = (
         str(claim.subject_type or ""),
         str(claim.object_subject_type or ""),
@@ -934,17 +950,19 @@ def adapt_declared_canon_revision(
 
 
 def _normalized_identity_tuple(value: Any) -> tuple[str, ...]:
-    if isinstance(value, str):
-        values: Iterable[Any] = (value,)
-    elif isinstance(value, Iterable):
-        values = value
-    else:
-        values = ()
-    return tuple(
-        dict.fromkeys(
-            str(item).strip() for item in values if str(item).strip()
-        )
-    )
+    """Return only a native, unique, sorted sequence of opaque identities."""
+
+    if not isinstance(value, (list, tuple)):
+        return ()
+    if not value or any(not isinstance(item, str) for item in value):
+        return ()
+    identities = tuple(str(item).strip() for item in value)
+    if (
+        any(not identity for identity in identities)
+        or len(identities) != len(set(identities))
+    ):
+        return ()
+    return tuple(sorted(identities))
 
 
 def _strict_nonnegative_int(value: Any) -> int:
@@ -955,6 +973,108 @@ def _strict_nonnegative_int(value: Any) -> int:
     except (TypeError, ValueError):
         return 0
     return max(0, parsed)
+
+
+_LIVING_CANON_PROOF_BOOL_KEYS = (
+    "candidate_eligible",
+    "source_eligible",
+    "roots_valid",
+    "occurrence_bounded",
+    "correction_fence_clear",
+    "contradiction_clear",
+)
+_LIVING_CANON_PROOF_BOUNDS = {
+    "eligible_ledger_scan_max": 1200,
+    "motif_candidates_max": 6,
+    "retained_roots_max": 12,
+    "occurrence_lookback_max": 64,
+    "idle_boundary_seconds": 30 * 60,
+}
+
+
+def _strict_json_mapping(value: Any) -> dict[str, Any] | None:
+    if type(value) is dict:
+        return dict(value)
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        parsed = json.loads(value)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+    return dict(parsed) if isinstance(parsed, Mapping) else None
+
+
+def _strict_json_identity_tuple(value: Any) -> tuple[str, ...]:
+    parsed = value
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return ()
+    if not isinstance(parsed, list):
+        return ()
+    return _normalized_identity_tuple(parsed)
+
+
+def _living_recurrence_proof(
+    row: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    """Return explicit proof only; lifecycle state never synthesizes proof."""
+
+    if "recurrence_proof_json" in row:
+        return _strict_json_mapping(row.get("recurrence_proof_json"))
+    if "recurrence_proof" in row:
+        return _strict_json_mapping(row.get("recurrence_proof"))
+    return None
+
+
+def _strict_native_nonnegative_int(value: Any) -> int | None:
+    if type(value) is not int or value < 0:
+        return None
+    return value
+
+
+def _strict_living_storage_bool(value: Any) -> bool:
+    return value is True or (type(value) is int and value == 1)
+
+
+def _strict_living_storage_false(value: Any) -> bool:
+    return value is False or (type(value) is int and value == 0)
+
+
+def _living_proof_bounds_valid(proof: Mapping[str, Any]) -> bool:
+    bounds = proof.get("bounds")
+    if (
+        type(bounds) is not dict
+        or set(bounds) != set(_LIVING_CANON_PROOF_BOUNDS)
+    ):
+        return False
+    for key, maximum in _LIVING_CANON_PROOF_BOUNDS.items():
+        value = _strict_native_nonnegative_int(bounds.get(key))
+        if value != maximum:
+            return False
+    return True
+
+
+def _living_digest_value(value: Any) -> str:
+    normalized = str(value or "").strip()
+    if not re.fullmatch(r"[0-9a-f]{64}", normalized):
+        return ""
+    return normalized
+
+
+def _living_knowledge_digest(*parts: Any) -> str:
+    """Mirror the Ledger producer's content-free identity digest exactly."""
+
+    return hashlib.sha256(
+        "\x1f".join(str(part or "") for part in parts).encode("utf-8")
+    ).hexdigest()
+
+
+def _living_canonical_value(value: Any) -> str:
+    """Mirror the Ledger producer's value normalization exactly."""
+
+    return re.sub(r"\s+", " ", str(value or "").strip().lower())
 
 
 def _review_only_source_claim(
@@ -1024,11 +1144,15 @@ def _adapt_living_pattern_claim(
         _mapping_text(row, "updated_at", "last_seen_at") or source_identity
     )
     try:
-        review_domain_hint = CanonDomain(_mapping_text(row, "domain"))
+        review_domain_hint = CanonDomain(
+            _mapping_text(row, "domain", "canon_domain")
+        )
     except ValueError:
         review_domain_hint = CanonDomain.REAL_COMMUNITY
     try:
-        review_kind_hint = ClaimKind(_mapping_text(row, "claim_kind"))
+        review_kind_hint = ClaimKind(
+            _mapping_text(row, "claim_kind", "canon_claim_kind")
+        )
     except ValueError:
         review_kind_hint = (
             ClaimKind.BEHAVIOR_PATTERN
@@ -1065,54 +1189,160 @@ def _adapt_living_pattern_claim(
         )
     if not root_ids:
         return review("living_source_lineage_missing")
+    recurrence_version = _mapping_text(
+        row,
+        "recurrence_contract_version",
+    )
+    proof = _living_recurrence_proof(row)
     if (
-        _mapping_text(row, "recurrence_contract_version")
-        != LIVING_CANON_RECURRENCE_VERSION
+        recurrence_version != LIVING_CANON_RECURRENCE_VERSION
+        or proof is None
+        or _mapping_text(proof, "recurrence_contract_version")
+        != recurrence_version
     ):
         return review("living_recurrence_unverified")
+    grouping_version = _mapping_text(row, "grouping_signature_version")
+    grouping_identity = _living_digest_value(row.get("grouping_identity"))
     try:
-        domain = CanonDomain(_mapping_text(row, "domain"))
-        claim_kind = ClaimKind(_mapping_text(row, "claim_kind"))
+        domain = CanonDomain(_mapping_text(row, "domain", "canon_domain"))
+        claim_kind = ClaimKind(
+            _mapping_text(row, "claim_kind", "canon_claim_kind")
+        )
     except ValueError:
         return review("living_domain_unverified")
     if domain not in {
         CanonDomain.REAL_COMMUNITY,
         CanonDomain.LORE,
         CanonDomain.HYBRID,
-    } or claim_kind not in {
-        ClaimKind.BEHAVIOR_PATTERN,
-        ClaimKind.TRADITION_OR_JOKE,
-    }:
+    } or claim_kind != ClaimKind.BEHAVIOR_PATTERN:
         return review(
             "living_domain_ineligible",
             review_domain=domain,
             review_kind=claim_kind,
         )
-    required_proofs = (
-        "candidate_eligible",
-        "source_eligible",
-        "roots_valid",
-        "occurrence_bounded",
-        "correction_fence_clear",
-        "contradiction_clear",
+    expected_grouping_identity = _living_knowledge_digest(
+        LIVING_CANON_GROUPING_SIGNATURE_VERSION,
+        subject_id,
+        predicate,
+        domain.value,
     )
-    if not all(strict_contract_bool(row.get(key)) for key in required_proofs):
+    if (
+        grouping_version != LIVING_CANON_GROUPING_SIGNATURE_VERSION
+        or not grouping_identity
+        or grouping_identity != expected_grouping_identity
+        or proof.get("grouping_signature_version") != grouping_version
+        or _living_digest_value(proof.get("grouping_identity"))
+        != grouping_identity
+    ):
+        return review(
+            "living_grouping_unverified",
+            review_domain=domain,
+            review_kind=claim_kind,
+        )
+    if (
+        proof.get("candidate_state") != candidate_state
+        or not _strict_living_storage_bool(row.get("candidate_eligible"))
+        or not all(
+            proof.get(key) is True
+            for key in _LIVING_CANON_PROOF_BOOL_KEYS
+        )
+        or not _living_proof_bounds_valid(proof)
+    ):
         return review(
             "living_recurrence_unverified",
             review_domain=domain,
             review_kind=claim_kind,
         )
-    independent_roots = _strict_nonnegative_int(
+    conflict_value_count = _strict_native_nonnegative_int(
+        row.get("conflict_value_count")
+    )
+    if (
+        _mapping_text(row, "lifecycle_schema_version")
+        != ATOMIC_KNOWLEDGE_LIFECYCLE_SCHEMA_VERSION
+        or conflict_value_count is None
+        or conflict_value_count != 1
+        or _mapping_text(row, "review_status") != "not_required"
+        or "review_due_at" not in row
+        or _mapping_text(row, "review_due_at")
+        or not {"invalidated_reason", "invalidated_at"}.issubset(row)
+        or _mapping_text(row, "invalidated_reason", "invalidated_at")
+        or not _strict_living_storage_false(row.get("live_eligible"))
+    ):
+        return review(
+            "living_lifecycle_unverified",
+            review_domain=domain,
+            review_kind=claim_kind,
+        )
+    independent_roots = _strict_native_nonnegative_int(
         row.get("independent_root_count")
     )
-    independent_occurrences = _strict_nonnegative_int(
+    independent_occurrences = _strict_native_nonnegative_int(
         row.get("independent_occurrence_count")
     )
+    proof_roots = _strict_native_nonnegative_int(
+        proof.get("independent_root_count")
+    )
+    proof_occurrences = _strict_native_nonnegative_int(
+        proof.get("independent_occurrence_count")
+    )
+    eligible_independent_roots = _strict_native_nonnegative_int(
+        row.get("eligible_independent_root_count")
+    )
+    reinforcement_count = _strict_native_nonnegative_int(
+        row.get("reinforcement_count")
+    )
+    root_digest = _living_digest_value(row.get("root_digest"))
+    occurrence_digest = _living_digest_value(
+        row.get("occurrence_digest")
+    )
+    expected_root_digest = _living_knowledge_digest(*root_ids)
+    expected_occurrence_digest = _living_knowledge_digest(*occurrence_ids)
+    value_digest = _living_digest_value(row.get("value_digest"))
+    expected_value_digest = _living_knowledge_digest(
+        _living_canonical_value(value)
+    )
+    if (
+        independent_roots is None
+        or independent_occurrences is None
+        or proof_roots is None
+        or proof_occurrences is None
+        or independent_roots != proof_roots
+        or independent_occurrences != proof_occurrences
+        or independent_roots != len(root_ids)
+        or independent_occurrences != len(occurrence_ids)
+        or independent_roots > _LIVING_CANON_PROOF_BOUNDS["retained_roots_max"]
+        or independent_occurrences
+        > _LIVING_CANON_PROOF_BOUNDS["retained_roots_max"]
+        or not root_digest
+        or not occurrence_digest
+        or not value_digest
+        or value_digest != expected_value_digest
+        or root_digest != expected_root_digest
+        or occurrence_digest != expected_occurrence_digest
+        or _living_digest_value(proof.get("root_digest")) != root_digest
+        or _living_digest_value(proof.get("occurrence_digest"))
+        != occurrence_digest
+    ):
+        return review(
+            "living_recurrence_proof_mismatch",
+            review_domain=domain,
+            review_kind=claim_kind,
+        )
+    if (
+        eligible_independent_roots != independent_roots
+        or reinforcement_count != independent_occurrences
+        or _mapping_text(row, "lifecycle_reason")
+        != "independent_recurrence_established"
+        or _parse_contract_time(row.get("lifecycle_evaluated_at")) is None
+    ):
+        return review(
+            "living_lifecycle_unverified",
+            review_domain=domain,
+            review_kind=claim_kind,
+        )
     if (
         independent_roots < 2
         or independent_occurrences < 2
-        or len(root_ids) < 2
-        or len(occurrence_ids) < 2
     ):
         return review(
             "living_recurrence_insufficient",
@@ -1124,12 +1354,16 @@ def _adapt_living_pattern_claim(
         source_system,
         source_identity,
     )
-    visibility = (
-        Visibility.PUBLIC_SAFE
-        if _mapping_text(row, "visibility") in {"public", "public_safe"}
-        and strict_contract_bool(row.get("public_usable"))
-        else Visibility.INTERNAL
-    )
+    if (
+        _mapping_text(row, "visibility") not in {"public", "public_safe"}
+        or not _strict_living_storage_bool(row.get("public_usable"))
+    ):
+        return review(
+            "living_visibility_ineligible",
+            review_domain=domain,
+            review_kind=claim_kind,
+        )
+    visibility = Visibility.PUBLIC_SAFE
     claim = CanonClaim(
         claim_id=claim_id,
         revision_id="",
@@ -1154,6 +1388,8 @@ def _adapt_living_pattern_claim(
             else ()
         ),
         recurrence_contract_version=LIVING_CANON_RECURRENCE_VERSION,
+        grouping_signature_version=grouping_version,
+        grouping_identity=grouping_identity,
         projection_state="shadow",
         projection_version=LIVING_CANON_ADAPTER_VERSION,
     )
@@ -1744,6 +1980,21 @@ def canon_claim_inventory_diagnostics(
             if binding.authority_actor
             and not _opaque_actor_valid(binding.authority_actor)
         ),
+        "livingRecurrenceVerifiedCount": sum(
+            1
+            for claim in normalized_claims
+            if claim.canon_status == CanonStatus.LIVING
+            and claim.recurrence_contract_version
+            == LIVING_CANON_RECURRENCE_VERSION
+        ),
+        "livingGroupingVerifiedCount": sum(
+            1
+            for claim in normalized_claims
+            if claim.canon_status == CanonStatus.LIVING
+            and claim.grouping_signature_version
+            == LIVING_CANON_GROUPING_SIGNATURE_VERSION
+            and bool(claim.grouping_identity)
+        ),
         "sourceSystems": tuple(
             sorted({claim.source_system for claim in normalized_claims})
         ),
@@ -1854,6 +2105,10 @@ def _inventory_scoped_lineage_map(
     normalized_table = str(table_name or "").strip()
     columns = _sqlite_table_columns(conn, normalized_table)
     required = {owner_column, root_column}
+    if guild_id is not None:
+        required.add("guild_id")
+    if independent_only:
+        required.add("is_independent")
     normalized_ids = tuple(
         dict.fromkeys(str(value or "").strip() for value in owner_ids)
     )
@@ -1867,10 +2122,10 @@ def _inventory_scoped_lineage_map(
             "%s IN (%s)" % (owner_column, ",".join("?" for _ in chunk))
         ]
         params: list[Any] = list(chunk)
-        if guild_id is not None and "guild_id" in columns:
+        if guild_id is not None:
             where.append("guild_id=?")
             params.append(int(guild_id or 0))
-        if independent_only and "is_independent" in columns:
+        if independent_only:
             where.append("is_independent=1")
         query = (
             "SELECT %s,%s FROM %s WHERE %s ORDER BY %s,%s"
@@ -2314,10 +2569,32 @@ def _build_claim_contract_inventory_in_snapshot(
             "subject_key",
             "predicate_key",
             "normalized_value",
+            "value_digest",
             "visibility",
             "public_usable",
             "candidate_eligible",
+            "live_eligible",
+            "invalidated_reason",
+            "invalidated_at",
+            "lifecycle_schema_version",
+            "conflict_value_count",
+            "review_status",
+            "review_due_at",
+            "eligible_independent_root_count",
+            "reinforcement_count",
+            "lifecycle_reason",
+            "lifecycle_evaluated_at",
             "independent_root_count",
+            "recurrence_contract_version",
+            "grouping_signature_version",
+            "grouping_identity",
+            "canon_domain",
+            "canon_claim_kind",
+            "independent_occurrence_count",
+            "occurrence_ids_json",
+            "recurrence_proof_json",
+            "root_digest",
+            "occurrence_digest",
             "updated_at",
             "last_seen_at",
         ),
@@ -2345,6 +2622,11 @@ def _build_claim_contract_inventory_in_snapshot(
         normalized["root_ids"] = tuple(
             root_map.get(str(normalized.get("candidate_id") or ""), ())
         )
+        normalized["occurrence_ids"] = _strict_json_identity_tuple(
+            normalized.get("occurrence_ids_json")
+        )
+        normalized["domain"] = normalized.get("canon_domain")
+        normalized["claim_kind"] = normalized.get("canon_claim_kind")
         result = adapt_living_atomic_claim(normalized)
         reason_counts[result.reason] += 1
         if result.claim is not None:

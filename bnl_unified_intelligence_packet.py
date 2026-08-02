@@ -207,6 +207,7 @@ _ADDITIVE_PREDICATES = {
     "shared_moment",
     "topic_or_motif",
 }
+_LIVING_CANON_NEUTRAL_PREDICATE_PREFIX = "conversation_motif_neutral_"
 _TERM_RE = re.compile(r"[a-z0-9][a-z0-9'’-]*", re.I)
 _TERM_STOPWORDS = {
     "a",
@@ -244,6 +245,53 @@ _TERM_STOPWORDS = {
     "with",
     "you",
 }
+
+
+def _living_candidate_pending_convergence(
+    candidate: Mapping[str, Any],
+) -> bool:
+    """Fail closed on any PR 4 Living marker until PR 5 owns the lane."""
+
+    predicate = str(candidate.get("predicate_key") or "").strip().casefold()
+    if predicate.startswith(_LIVING_CANON_NEUTRAL_PREDICATE_PREFIX):
+        return True
+    if any(
+        str(candidate.get(key) or "")
+        for key in (
+            "recurrence_contract_version",
+            "grouping_signature_version",
+            "grouping_identity",
+            "canon_domain",
+            "canon_claim_kind",
+            "occurrence_digest",
+        )
+    ):
+        return True
+    if candidate.get("independent_occurrence_count") not in {
+        None,
+        "",
+        0,
+        False,
+        "0",
+    }:
+        return True
+    if str(candidate.get("occurrence_ids_json") or "").strip() not in {
+        "",
+        "[]",
+    }:
+        return True
+    if str(candidate.get("recurrence_proof_json") or "").strip() not in {
+        "",
+        "{}",
+    }:
+        return True
+    return candidate.get("public_usable") not in {
+        None,
+        "",
+        0,
+        False,
+        "0",
+    }
 _CURRENT_CORRECTION_RE = re.compile(
     r"\b(?:correction|correcting|that's\s+wrong|that\s+is\s+wrong|"
     r"not\s+anymore|no[,;:]?\s+(?:my|i|we)|"
@@ -596,7 +644,7 @@ def _table_columns(
     return {
         str(row[1] or "")
         for row in conn.execute(
-            "PRAGMA table_info(%s)" % str(table_name or "")
+            "PRAGMA main.table_info(%s)" % str(table_name or "")
         ).fetchall()
         if len(row) > 1 and str(row[1] or "")
     }
@@ -769,7 +817,7 @@ def _canon_identity_signal(
     history_rows = conn.execute(
         """
         SELECT entry_id,subject_display_name
-        FROM memory_ledger_entries e
+        FROM main.memory_ledger_entries e
         WHERE guild_id=? AND subject_key=?
           AND source_table='conversations' AND source_role='user'
           AND channel_policy IN (
@@ -779,7 +827,7 @@ def _canon_identity_signal(
           AND public_usable=1 AND derived=0 AND projection=0
           AND lifecycle_status='active'
           AND NOT EXISTS (
-            SELECT 1 FROM memory_ledger_lineage l
+            SELECT 1 FROM main.memory_ledger_lineage l
             WHERE l.guild_id=e.guild_id AND l.target_entry_id=e.entry_id
               AND l.lineage_type IN (
                 'correction_of','supersedes','retracts'
@@ -877,7 +925,7 @@ def _conversation_root_metadata(
     entry_row = conn.execute(
         """
         SELECT entry_id
-        FROM memory_ledger_entries
+        FROM main.memory_ledger_entries
         WHERE guild_id=? AND subject_key=?
           AND source_table='conversations' AND source_row_id=?
           AND lifecycle_status='active'
@@ -952,7 +1000,7 @@ def _moment_root_metadata(
             """
             SELECT DISTINCT source.ledger_entry_id
             FROM memory_moment_contribution_sources source
-            JOIN memory_ledger_entries entry
+            JOIN main.memory_ledger_entries entry
               ON entry.entry_id=source.ledger_entry_id
             WHERE source.moment_id=? AND source.participant_key=?
               AND entry.subject_key=? AND entry.lifecycle_status='active'
@@ -1522,7 +1570,9 @@ def _ledger_entry_digest(
 ) -> str:
     columns = {
         str(row[1])
-        for row in conn.execute("PRAGMA table_info(memory_ledger_entries)").fetchall()
+        for row in conn.execute(
+            "PRAGMA main.table_info(memory_ledger_entries)"
+        ).fetchall()
     }
     if not columns or "entry_id" not in columns:
         return ""
@@ -1556,7 +1606,7 @@ def _ledger_entry_digest(
         if column in columns
     )
     row = conn.execute(
-        "SELECT %s FROM memory_ledger_entries WHERE entry_id=?"
+        "SELECT %s FROM main.memory_ledger_entries WHERE entry_id=?"
         % ",".join(selected_columns),
         (entry_id,),
     ).fetchone()
@@ -1566,7 +1616,7 @@ def _ledger_entry_digest(
     lineage = conn.execute(
         """
         SELECT lineage_type,target_entry_id
-        FROM memory_ledger_lineage
+        FROM main.memory_ledger_lineage
         WHERE guild_id=? AND entry_id=?
         ORDER BY lineage_type,target_entry_id
         """,
@@ -1575,7 +1625,7 @@ def _ledger_entry_digest(
     incoming = conn.execute(
         """
         SELECT entry_id,lineage_type
-        FROM memory_ledger_lineage
+        FROM main.memory_ledger_lineage
         WHERE guild_id=? AND target_entry_id=?
           AND lineage_type IN ('correction_of','supersedes','retracts')
         ORDER BY entry_id,lineage_type
@@ -1985,9 +2035,19 @@ def _atomic_candidate_row(
         "review_status",
         "review_due_at",
         "last_seen_at",
+        "recurrence_contract_version",
+        "grouping_signature_version",
+        "grouping_identity",
+        "canon_domain",
+        "canon_claim_kind",
+        "independent_occurrence_count",
+        "occurrence_ids_json",
+        "occurrence_digest",
+        "recurrence_proof_json",
+        "public_usable",
     )
     row = conn.execute(
-        "SELECT %s FROM memory_ledger_knowledge_candidates WHERE candidate_id=?"
+        "SELECT %s FROM main.memory_ledger_knowledge_candidates WHERE candidate_id=?"
         % ",".join(columns),
         (candidate_id,),
     ).fetchone()
@@ -2009,10 +2069,10 @@ def _atomic_root_snapshot(
                e.visibility,e.public_usable,e.derived,e.projection,
                e.lifecycle_status,e.updated_at,e.normalized_value,
                e.predicate_key,e.observed_at,e.source_sequence
-        FROM memory_ledger_knowledge_roots r
-        JOIN memory_ledger_knowledge_candidates c
+        FROM main.memory_ledger_knowledge_roots r
+        JOIN main.memory_ledger_knowledge_candidates c
           ON c.candidate_id=r.candidate_id
-        LEFT JOIN memory_ledger_entries e ON e.entry_id=r.root_entry_id
+        LEFT JOIN main.memory_ledger_entries e ON e.entry_id=r.root_entry_id
         WHERE r.is_independent=1 AND r.root_status='eligible'
           AND (
             (?<>'' AND c.consolidation_id=?)
@@ -2070,7 +2130,7 @@ def _atomic_candidate_digest(
             conn.execute(
                 """
                 SELECT entry_id,lineage_type
-                FROM memory_ledger_lineage
+                FROM main.memory_ledger_lineage
                 WHERE guild_id=? AND target_entry_id=?
                   AND lineage_type IN ('correction_of','supersedes','retracts')
                 ORDER BY entry_id,lineage_type
@@ -2245,7 +2305,7 @@ def _atomic_items(
         for row in conn.execute(
             """
             SELECT candidate_id
-            FROM memory_ledger_knowledge_candidates
+            FROM main.memory_ledger_knowledge_candidates
             WHERE guild_id=? AND subject_key=?
               AND (
                 COALESCE(canonical_candidate_id,'')=''
@@ -2286,7 +2346,13 @@ def _atomic_items(
             _parse_time(request.now) or datetime.now(timezone.utc)
         )
         reason = ""
-        if candidate.get("lifecycle_schema_version") != (
+        if _living_candidate_pending_convergence(candidate):
+            # PR 4 owns formation and proof only. Neither a curated-family nor
+            # family-neutral Living candidate can become response evidence
+            # until PR 5 converges every canon status under the one-packet
+            # factual owner.
+            reason = "living_canon_pending_packet_convergence"
+        elif candidate.get("lifecycle_schema_version") != (
             ATOMIC_KNOWLEDGE_LIFECYCLE_SCHEMA_VERSION
         ):
             reason = "atomic_lifecycle_not_reconciled"
@@ -2358,7 +2424,7 @@ def _atomic_items(
             for root in roots:
                 if conn.execute(
                     """
-                    SELECT 1 FROM memory_ledger_lineage
+                    SELECT 1 FROM main.memory_ledger_lineage
                     WHERE guild_id=? AND target_entry_id=?
                       AND lineage_type IN (
                         'correction_of','supersedes','retracts'
@@ -2425,7 +2491,7 @@ def _atomic_items(
             for row in conn.execute(
                 """
                 SELECT participant_key
-                FROM memory_ledger_knowledge_participants
+                FROM main.memory_ledger_knowledge_participants
                 WHERE candidate_id=?
                 ORDER BY participant_role,participant_key
                 """,

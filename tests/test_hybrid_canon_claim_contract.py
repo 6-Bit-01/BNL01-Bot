@@ -1,3 +1,5 @@
+import hashlib
+import json
 import os
 import sqlite3
 import tempfile
@@ -10,6 +12,93 @@ import bnl_declared_canon as declared_canon
 import bnl_memory_ledger as ledger
 import bnl_moment_engine as moments
 import bnl_unified_intelligence_packet as packet
+
+
+def _ledger_digest(*parts):
+    return hashlib.sha256(
+        "\x1f".join(str(part or "") for part in parts).encode("utf-8")
+    ).hexdigest()
+
+
+def _living_adapter_row():
+    subject_key = "discord_user:7"
+    predicate_key = "unseen_topic_pattern"
+    domain = "real_community"
+    root_ids = ("root-1", "root-2")
+    occurrence_ids = ("exchange-1", "exchange-2")
+    grouping_identity = _ledger_digest(
+        canon.LIVING_CANON_GROUPING_SIGNATURE_VERSION,
+        subject_key,
+        predicate_key,
+        domain,
+    )
+    root_digest = _ledger_digest(*root_ids)
+    occurrence_digest = _ledger_digest(*occurrence_ids)
+    meaning = "They repeatedly compare unusual antenna materials."
+    proof = {
+        "recurrence_contract_version": canon.LIVING_CANON_RECURRENCE_VERSION,
+        "grouping_signature_version": (
+            canon.LIVING_CANON_GROUPING_SIGNATURE_VERSION
+        ),
+        "grouping_identity": grouping_identity,
+        "candidate_state": "established",
+        "candidate_eligible": True,
+        "source_eligible": True,
+        "roots_valid": True,
+        "occurrence_bounded": True,
+        "correction_fence_clear": True,
+        "contradiction_clear": True,
+        "independent_root_count": 2,
+        "independent_occurrence_count": 2,
+        "root_digest": root_digest,
+        "occurrence_digest": occurrence_digest,
+        "bounds": {
+            "eligible_ledger_scan_max": 1200,
+            "motif_candidates_max": 6,
+            "retained_roots_max": 12,
+            "occurrence_lookback_max": 64,
+            "idle_boundary_seconds": 1800,
+        },
+    }
+    return {
+        "candidate_id": "candidate-2",
+        "candidate_type": "topic_or_motif",
+        "candidate_state": "established",
+        "subject_key": subject_key,
+        "predicate_key": predicate_key,
+        "meaning": meaning,
+        "value_digest": _ledger_digest(" ".join(meaning.lower().split())),
+        "root_ids": root_ids,
+        "occurrence_ids": occurrence_ids,
+        "recurrence_contract_version": canon.LIVING_CANON_RECURRENCE_VERSION,
+        "grouping_signature_version": (
+            canon.LIVING_CANON_GROUPING_SIGNATURE_VERSION
+        ),
+        "grouping_identity": grouping_identity,
+        "domain": domain,
+        "claim_kind": "behavior_pattern",
+        "candidate_eligible": True,
+        "live_eligible": False,
+        "invalidated_reason": "",
+        "invalidated_at": "",
+        "lifecycle_schema_version": (
+            canon.ATOMIC_KNOWLEDGE_LIFECYCLE_SCHEMA_VERSION
+        ),
+        "conflict_value_count": 1,
+        "review_status": "not_required",
+        "review_due_at": "",
+        "eligible_independent_root_count": 2,
+        "reinforcement_count": 2,
+        "lifecycle_reason": "independent_recurrence_established",
+        "lifecycle_evaluated_at": "2026-08-02T00:00:00+00:00",
+        "independent_root_count": 2,
+        "independent_occurrence_count": 2,
+        "root_digest": root_digest,
+        "occurrence_digest": occurrence_digest,
+        "recurrence_proof_json": json.dumps(proof, sort_keys=True),
+        "visibility": "public_safe",
+        "public_usable": True,
+    }
 
 
 class HybridCanonClaimContractTests(unittest.TestCase):
@@ -1164,17 +1253,28 @@ class HybridCanonClaimContractTests(unittest.TestCase):
                 conn.close()
 
     def test_living_adapter_rejects_heterogeneous_or_unestablished_rows(self):
-        role = canon.adapt_living_atomic_claim(
-            {
-                "candidate_id": "role-candidate",
-                "candidate_type": "person_role_fact",
-                "candidate_state": "established",
-                "subject_key": "discord_user:7",
-                "predicate_key": "role",
-                "meaning": "A role claim.",
-                "root_ids": ("root-1", "root-2"),
-            }
-        )
+        for candidate_type in (
+            "person_role_fact",
+            "milestone",
+            "open_loop_or_question",
+            "inference_or_contested_claim",
+        ):
+            with self.subTest(candidate_type=candidate_type):
+                heterogeneous = canon.adapt_living_atomic_claim(
+                    {
+                        "candidate_id": "%s-candidate" % candidate_type,
+                        "candidate_type": candidate_type,
+                        "candidate_state": "established",
+                        "subject_key": "discord_user:7",
+                        "predicate_key": "heterogeneous",
+                        "meaning": "A non-topic claim.",
+                        "root_ids": ("root-1", "root-2"),
+                    }
+                )
+                self.assertEqual(
+                    heterogeneous.reason,
+                    "living_claim_kind_ineligible",
+                )
         provisional = canon.adapt_living_atomic_claim(
             {
                 "candidate_id": "provisional-candidate",
@@ -1186,11 +1286,22 @@ class HybridCanonClaimContractTests(unittest.TestCase):
                 "root_ids": ("root-1", "root-2"),
             }
         )
-        self.assertEqual(role.reason, "living_claim_kind_ineligible")
         self.assertEqual(
             provisional.reason,
             "living_lifecycle_ineligible",
         )
+        contested = canon.adapt_living_atomic_claim(
+            {
+                "candidate_id": "contested-candidate",
+                "candidate_type": "topic_or_motif",
+                "candidate_state": "contested",
+                "subject_key": "discord_user:7",
+                "predicate_key": "topic",
+                "meaning": "A contested motif.",
+                "root_ids": ("root-1", "root-2"),
+            }
+        )
+        self.assertEqual(contested.reason, "living_lifecycle_ineligible")
 
     def test_established_atomic_or_finalized_moment_needs_recurrence_proof(self):
         established = canon.adapt_living_atomic_claim(
@@ -1230,38 +1341,93 @@ class HybridCanonClaimContractTests(unittest.TestCase):
         self.assertEqual(moment.claim.lifecycle, canon.ClaimLifecycle.REVIEW_ONLY)
 
     def test_living_adapter_accepts_only_explicit_cross_occurrence_proof(self):
-        adapted = canon.adapt_living_atomic_claim(
-            {
-                "candidate_id": "candidate-2",
-                "candidate_type": "topic_or_motif",
-                "candidate_state": "established",
-                "subject_key": "discord_user:7",
-                "predicate_key": "unseen_topic_pattern",
-                "meaning": "They repeatedly compare unusual antenna materials.",
-                "root_ids": ("root-1", "root-2"),
-                "occurrence_ids": ("exchange-1", "exchange-2"),
-                "recurrence_contract_version": "living_canon_recurrence_v1",
-                "domain": "real_community",
-                "claim_kind": "behavior_pattern",
-                "candidate_eligible": True,
-                "source_eligible": True,
-                "roots_valid": True,
-                "occurrence_bounded": True,
-                "correction_fence_clear": True,
-                "contradiction_clear": True,
-                "independent_root_count": 2,
-                "independent_occurrence_count": 2,
-                "visibility": "public_safe",
-                "public_usable": True,
-            }
-        )
+        row = _living_adapter_row()
+        adapted = canon.adapt_living_atomic_claim(row)
         self.assertEqual(adapted.reason, "eligible_living")
         self.assertEqual(adapted.claim.canon_status, canon.CanonStatus.LIVING)
         self.assertEqual(
             adapted.claim.recurrence_contract_version,
             canon.LIVING_CANON_RECURRENCE_VERSION,
         )
+        self.assertEqual(
+            adapted.claim.grouping_signature_version,
+            canon.LIVING_CANON_GROUPING_SIGNATURE_VERSION,
+        )
+        self.assertEqual(
+            adapted.claim.grouping_identity,
+            row["grouping_identity"],
+        )
         self.assertFalse(adapted.live_eligible)
+
+        for drift in (
+            {"invalidated_reason": "root_deleted"},
+            {"invalidated_at": "2026-08-01T00:00:00+00:00"},
+            {"conflict_value_count": 0},
+            {"conflict_value_count": 2},
+            {"conflict_value_count": "1"},
+            {"conflict_value_count": True},
+            {"lifecycle_schema_version": "bogus"},
+            {"review_status": "contested"},
+            {"review_status": "current", "review_due_at": "2099-01-01"},
+            {"review_due_at": "2020-01-01T00:00:00+00:00"},
+            {"review_due_at": "malformed"},
+            {"eligible_independent_root_count": 0},
+            {"reinforcement_count": 0},
+            {"lifecycle_reason": "unresolved_contradiction"},
+            {"lifecycle_evaluated_at": "malformed"},
+            {"live_eligible": True},
+        ):
+            hostile = canon.adapt_living_atomic_claim({**row, **drift})
+            self.assertEqual(hostile.reason, "living_lifecycle_unverified")
+            self.assertEqual(
+                hostile.claim.lifecycle,
+                canon.ClaimLifecycle.REVIEW_ONLY,
+            )
+        missing_review_due = dict(row)
+        missing_review_due.pop("review_due_at")
+        self.assertEqual(
+            canon.adapt_living_atomic_claim(missing_review_due).reason,
+            "living_lifecycle_unverified",
+        )
+        for missing_field in (
+            "eligible_independent_root_count",
+            "reinforcement_count",
+            "lifecycle_reason",
+            "lifecycle_evaluated_at",
+        ):
+            missing = dict(row)
+            missing.pop(missing_field)
+            self.assertEqual(
+                canon.adapt_living_atomic_claim(missing).reason,
+                "living_lifecycle_unverified",
+                missing_field,
+            )
+        self.assertEqual(
+            canon.adapt_living_atomic_claim(
+                {**row, "meaning": "Arbitrary replacement text."}
+            ).reason,
+            "living_recurrence_proof_mismatch",
+        )
+        self.assertEqual(
+            canon.adapt_living_atomic_claim(
+                {**row, "claim_kind": "tradition_or_joke"}
+            ).reason,
+            "living_domain_ineligible",
+        )
+
+        stored_proof = json.loads(row["recurrence_proof_json"])
+        stored_proof["independent_occurrence_count"] = 3
+        tampered = canon.adapt_living_atomic_claim(
+            {
+                **row,
+                "recurrence_proof_json": json.dumps(stored_proof),
+            }
+        )
+        self.assertEqual(tampered.reason, "living_recurrence_proof_mismatch")
+        self.assertEqual(
+            tampered.claim.lifecycle,
+            canon.ClaimLifecycle.REVIEW_ONLY,
+        )
 
         missing_identity = canon.adapt_living_atomic_claim(
             {
@@ -1290,6 +1456,381 @@ class HybridCanonClaimContractTests(unittest.TestCase):
             missing_identity.reason,
             "living_source_identity_missing",
         )
+
+    def test_living_adapter_rejects_forged_or_stale_recurrence_proof(self):
+        row = _living_adapter_row()
+        proof = json.loads(row["recurrence_proof_json"])
+
+        self_asserted = dict(row)
+        self_asserted.pop("recurrence_proof_json")
+        self_asserted.update(proof)
+
+        string_boolean_proof = dict(proof)
+        string_boolean_proof["source_eligible"] = "true"
+
+        wrong_grouping = "f" * 64
+        wrong_grouping_proof = dict(proof)
+        wrong_grouping_proof["grouping_identity"] = wrong_grouping
+
+        wrong_root_digest = "e" * 64
+        wrong_root_proof = dict(proof)
+        wrong_root_proof["root_digest"] = wrong_root_digest
+
+        cases = (
+            (
+                "missing stored proof",
+                self_asserted,
+                "living_recurrence_unverified",
+            ),
+            (
+                "string proof boolean",
+                {
+                    **row,
+                    "recurrence_proof_json": json.dumps(
+                        string_boolean_proof,
+                        sort_keys=True,
+                    ),
+                },
+                "living_recurrence_unverified",
+            ),
+            (
+                "wrong deterministic grouping",
+                {
+                    **row,
+                    "grouping_identity": wrong_grouping,
+                    "recurrence_proof_json": json.dumps(
+                        wrong_grouping_proof,
+                        sort_keys=True,
+                    ),
+                },
+                "living_grouping_unverified",
+            ),
+            (
+                "wrong deterministic root digest",
+                {
+                    **row,
+                    "root_digest": wrong_root_digest,
+                    "recurrence_proof_json": json.dumps(
+                        wrong_root_proof,
+                        sort_keys=True,
+                    ),
+                },
+                "living_recurrence_proof_mismatch",
+            ),
+            (
+                "same-count mutated roots",
+                {
+                    **row,
+                    "root_ids": ("root-3", "root-4"),
+                },
+                "living_recurrence_proof_mismatch",
+            ),
+            (
+                "same-count mutated occurrences",
+                {
+                    **row,
+                    "occurrence_ids": ("exchange-3", "exchange-4"),
+                },
+                "living_recurrence_proof_mismatch",
+            ),
+            (
+                "non-string occurrence identity",
+                {
+                    **row,
+                    "occurrence_ids": ("exchange-1", 2),
+                },
+                "living_recurrence_proof_mismatch",
+            ),
+        )
+        for label, candidate, expected_reason in cases:
+            with self.subTest(label=label):
+                result = canon.adapt_living_atomic_claim(candidate)
+                self.assertEqual(result.reason, expected_reason)
+                self.assertIsNotNone(result.claim)
+                self.assertEqual(
+                    result.claim.lifecycle,
+                    canon.ClaimLifecycle.REVIEW_ONLY,
+                )
+
+    def test_atomic_inventory_requires_stored_grouping_and_recurrence_proof(self):
+        conn = sqlite3.connect(":memory:")
+        try:
+            conn.executescript(
+                """
+                CREATE TABLE memory_ledger_knowledge_candidates (
+                  candidate_id TEXT PRIMARY KEY,
+                  guild_id INTEGER NOT NULL,
+                  candidate_type TEXT NOT NULL,
+                  candidate_state TEXT NOT NULL,
+                  subject_key TEXT NOT NULL,
+                  predicate_key TEXT NOT NULL,
+                  normalized_value TEXT NOT NULL,
+                  value_digest TEXT NOT NULL,
+                  visibility TEXT NOT NULL,
+                  public_usable INTEGER NOT NULL DEFAULT 0,
+                  candidate_eligible INTEGER NOT NULL DEFAULT 0,
+                  live_eligible INTEGER NOT NULL DEFAULT 0,
+                  invalidated_reason TEXT DEFAULT '',
+                  invalidated_at TEXT DEFAULT '',
+                  lifecycle_schema_version TEXT DEFAULT '',
+                  conflict_value_count INTEGER NOT NULL DEFAULT 0,
+                  review_status TEXT DEFAULT '',
+                  review_due_at TEXT DEFAULT '',
+                  eligible_independent_root_count INTEGER NOT NULL DEFAULT 0,
+                  reinforcement_count INTEGER NOT NULL DEFAULT 0,
+                  lifecycle_reason TEXT DEFAULT '',
+                  lifecycle_evaluated_at TEXT DEFAULT '',
+                  independent_root_count INTEGER NOT NULL DEFAULT 0,
+                  recurrence_contract_version TEXT DEFAULT '',
+                  grouping_signature_version TEXT DEFAULT '',
+                  grouping_identity TEXT DEFAULT '',
+                  canon_domain TEXT DEFAULT '',
+                  canon_claim_kind TEXT DEFAULT '',
+                  independent_occurrence_count INTEGER NOT NULL DEFAULT 0,
+                  occurrence_ids_json TEXT NOT NULL DEFAULT '[]',
+                  recurrence_proof_json TEXT NOT NULL DEFAULT '{}',
+                  root_digest TEXT DEFAULT '',
+                  occurrence_digest TEXT DEFAULT '',
+                  updated_at TEXT DEFAULT '',
+                  last_seen_at TEXT DEFAULT ''
+                );
+                CREATE TABLE memory_ledger_knowledge_roots (
+                  candidate_id TEXT NOT NULL,
+                  guild_id INTEGER NOT NULL,
+                  root_entry_id TEXT NOT NULL,
+                  is_independent INTEGER NOT NULL DEFAULT 0,
+                  PRIMARY KEY(candidate_id, root_entry_id)
+                );
+                """
+            )
+            bounds = {
+                "eligible_ledger_scan_max": 1200,
+                "motif_candidates_max": 6,
+                "retained_roots_max": 12,
+                "occurrence_lookback_max": 64,
+                "idle_boundary_seconds": 1800,
+            }
+            subject_key = "discord_user:7"
+            predicate_key = "conversation_pattern_unseen_topic"
+            domain = "real_community"
+            valid_roots = ("root:1", "root:2")
+            valid_occurrences = ("occurrence:1", "occurrence:2")
+            grouping_identity = _ledger_digest(
+                canon.LIVING_CANON_GROUPING_SIGNATURE_VERSION,
+                subject_key,
+                predicate_key,
+                domain,
+            )
+            root_digest = _ledger_digest(*valid_roots)
+            occurrence_digest = _ledger_digest(*valid_occurrences)
+            proof = {
+                "recurrence_contract_version": (
+                    canon.LIVING_CANON_RECURRENCE_VERSION
+                ),
+                "grouping_signature_version": (
+                    canon.LIVING_CANON_GROUPING_SIGNATURE_VERSION
+                ),
+                "grouping_identity": grouping_identity,
+                "candidate_state": "established",
+                "candidate_eligible": True,
+                "source_eligible": True,
+                "roots_valid": True,
+                "occurrence_bounded": True,
+                "correction_fence_clear": True,
+                "contradiction_clear": True,
+                "independent_root_count": 2,
+                "independent_occurrence_count": 2,
+                "root_digest": root_digest,
+                "occurrence_digest": occurrence_digest,
+                "bounds": bounds,
+            }
+            base_values = (
+                1,
+                "topic_or_motif",
+                "established",
+                subject_key,
+                predicate_key,
+                "private-source-text-must-not-appear",
+                _ledger_digest("private-source-text-must-not-appear"),
+                "public_safe",
+                1,
+                1,
+                2,
+            )
+            conn.execute(
+                """
+                INSERT INTO memory_ledger_knowledge_candidates(
+                  candidate_id,guild_id,candidate_type,candidate_state,
+                  subject_key,predicate_key,normalized_value,value_digest,visibility,
+                  public_usable,candidate_eligible,independent_root_count,
+                  recurrence_contract_version,grouping_signature_version,
+                  grouping_identity,canon_domain,canon_claim_kind,
+                  independent_occurrence_count,occurrence_ids_json,
+                  recurrence_proof_json,root_digest,occurrence_digest,
+                  live_eligible,lifecycle_schema_version,invalidated_reason,
+                  invalidated_at,conflict_value_count,review_status,
+                  review_due_at,
+                  eligible_independent_root_count,reinforcement_count,
+                  lifecycle_reason,lifecycle_evaluated_at,
+                  updated_at,last_seen_at
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    "candidate-valid",
+                    *base_values,
+                    canon.LIVING_CANON_RECURRENCE_VERSION,
+                    canon.LIVING_CANON_GROUPING_SIGNATURE_VERSION,
+                    grouping_identity,
+                    domain,
+                    "behavior_pattern",
+                    2,
+                    json.dumps(valid_occurrences),
+                    json.dumps(proof, sort_keys=True),
+                    root_digest,
+                    occurrence_digest,
+                    0,
+                    canon.ATOMIC_KNOWLEDGE_LIFECYCLE_SCHEMA_VERSION,
+                    "",
+                    "",
+                    1,
+                    "not_required",
+                    "",
+                    2,
+                    2,
+                    "independent_recurrence_established",
+                    "2026-08-02T00:00:00+00:00",
+                    "2026-08-02T00:00:00+00:00",
+                    "2026-08-02T00:00:00+00:00",
+                ),
+            )
+            conn.execute(
+                """
+                INSERT INTO memory_ledger_knowledge_candidates(
+                  candidate_id,guild_id,candidate_type,candidate_state,
+                  subject_key,predicate_key,normalized_value,value_digest,visibility,
+                  public_usable,candidate_eligible,independent_root_count,
+                  root_digest,updated_at,last_seen_at
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    "candidate-old",
+                    *base_values,
+                    "c" * 64,
+                    "2026-08-02T00:00:00+00:00",
+                    "2026-08-02T00:00:00+00:00",
+                ),
+            )
+            for candidate_id, root_ids in (
+                ("candidate-valid", ("root:1", "root:2")),
+                ("candidate-old", ("root:3", "root:4")),
+            ):
+                conn.executemany(
+                    """
+                    INSERT INTO memory_ledger_knowledge_roots(
+                      candidate_id,guild_id,root_entry_id,is_independent
+                    ) VALUES(?,1,?,1)
+                    """,
+                    ((candidate_id, root_id) for root_id in root_ids),
+                )
+            conn.commit()
+
+            inventory = canon.build_claim_contract_inventory(conn, guild_id=1)
+
+            self.assertEqual(inventory["mutationCount"], 0)
+            self.assertEqual(inventory["sourceRows"]["atomic_knowledge"], 2)
+            self.assertEqual(inventory["statuses"]["living"], 1)
+            self.assertEqual(inventory["livingRecurrenceVerifiedCount"], 1)
+            self.assertEqual(inventory["livingGroupingVerifiedCount"], 1)
+            self.assertEqual(inventory["reasonCounts"]["eligible_living"], 1)
+            self.assertEqual(
+                inventory["reasonCounts"]["living_recurrence_unverified"],
+                1,
+            )
+            self.assertNotIn("private-source-text-must-not-appear", repr(inventory))
+            self.assertNotIn("root:1", repr(inventory))
+            self.assertNotIn("occurrence:1", repr(inventory))
+        finally:
+            conn.close()
+
+    def test_pre_pr4_atomic_schema_stays_review_only_and_zero_write(self):
+        conn = sqlite3.connect(":memory:")
+        try:
+            conn.executescript(
+                """
+                CREATE TABLE memory_ledger_knowledge_candidates (
+                  candidate_id TEXT PRIMARY KEY,
+                  guild_id INTEGER NOT NULL,
+                  candidate_type TEXT NOT NULL,
+                  candidate_state TEXT NOT NULL,
+                  subject_key TEXT NOT NULL,
+                  predicate_key TEXT NOT NULL,
+                  normalized_value TEXT NOT NULL,
+                  visibility TEXT NOT NULL,
+                  candidate_eligible INTEGER NOT NULL DEFAULT 0,
+                  independent_root_count INTEGER NOT NULL DEFAULT 0,
+                  root_digest TEXT NOT NULL,
+                  last_seen_at TEXT DEFAULT '',
+                  updated_at TEXT NOT NULL
+                );
+                CREATE TABLE memory_ledger_knowledge_roots (
+                  candidate_id TEXT NOT NULL,
+                  guild_id INTEGER NOT NULL,
+                  root_entry_id TEXT NOT NULL,
+                  is_independent INTEGER NOT NULL DEFAULT 0,
+                  PRIMARY KEY(candidate_id, root_entry_id)
+                );
+                """
+            )
+            conn.execute(
+                """
+                INSERT INTO memory_ledger_knowledge_candidates(
+                  candidate_id,guild_id,candidate_type,candidate_state,
+                  subject_key,predicate_key,normalized_value,visibility,
+                  candidate_eligible,independent_root_count,root_digest,
+                  last_seen_at,updated_at
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    "pre-pr4-candidate",
+                    1,
+                    "topic_or_motif",
+                    "established",
+                    "discord_user:7",
+                    "conversation_motif_old",
+                    "pre-pr4-private-text",
+                    "public_safe",
+                    1,
+                    2,
+                    _ledger_digest("pre-pr4-root-1", "pre-pr4-root-2"),
+                    "2026-08-01T00:00:00+00:00",
+                    "2026-08-01T00:00:00+00:00",
+                ),
+            )
+            conn.executemany(
+                """
+                INSERT INTO memory_ledger_knowledge_roots(
+                  candidate_id,guild_id,root_entry_id,is_independent
+                ) VALUES('pre-pr4-candidate',1,?,1)
+                """,
+                (("pre-pr4-root-1",), ("pre-pr4-root-2",)),
+            )
+            conn.commit()
+            before_changes = conn.total_changes
+
+            inventory = canon.build_claim_contract_inventory(conn, guild_id=1)
+
+            self.assertEqual(conn.total_changes, before_changes)
+            self.assertEqual(inventory["mutationCount"], 0)
+            self.assertEqual(inventory["sourceRows"]["atomic_knowledge"], 1)
+            self.assertEqual(inventory["statuses"]["living"], 0)
+            self.assertEqual(
+                inventory["reasonCounts"]["living_recurrence_unverified"],
+                1,
+            )
+            self.assertNotIn("pre-pr4-private-text", repr(inventory))
+            self.assertNotIn("pre-pr4-root-1", repr(inventory))
+        finally:
+            conn.close()
 
     def test_open_signal_is_ephemeral_and_source_linked(self):
         adapted = canon.adapt_open_signal_claim(
@@ -1807,6 +2348,76 @@ class HybridCanonClaimContractTests(unittest.TestCase):
         finally:
             conn.close()
 
+    def test_current_v1_living_candidate_normalizes_as_verified_living(self):
+        conn = sqlite3.connect(":memory:")
+        try:
+            ledger.ensure_memory_ledger_schema(conn)
+            conn.execute(
+                """
+                CREATE TABLE conversations(
+                  id INTEGER PRIMARY KEY,guild_id INTEGER,user_id INTEGER,
+                  user_name TEXT,role TEXT,content TEXT,channel_id INTEGER,
+                  channel_name TEXT,channel_policy TEXT,route_mode TEXT,
+                  timestamp TEXT
+                )
+                """
+            )
+            roots = []
+            for row_id, observed_at, text in (
+                (
+                    811,
+                    "2026-07-24T20:00:00+00:00",
+                    "I tune ceramic antennas with copper meshes during field experiments.",
+                ),
+                (
+                    812,
+                    "2026-07-25T20:00:00+00:00",
+                    "We tune the ceramic antenna with a copper mesh during the field experiment.",
+                ),
+            ):
+                conn.execute(
+                    "INSERT INTO conversations VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        row_id, 1, 7, "Test Member", "user", text, 10,
+                        "barcode-bot", "public_home", "normal_chat",
+                        observed_at,
+                    ),
+                )
+                roots.append(
+                    ledger.shadow_conversation_row(
+                        conn,
+                        row_id=row_id,
+                        user_id=7,
+                        user_name="Test Member",
+                        guild_id=1,
+                        role="user",
+                        content=text,
+                        channel_name="barcode-bot",
+                        channel_policy="public_home",
+                        channel_id=10,
+                        route_mode="normal_chat",
+                        observed_at=observed_at,
+                        source_sequence=row_id,
+                        environ={ledger.MEMORY_LEDGER_SHADOW_ENV: "true"},
+                    ).entry_id
+                )
+            formed = ledger.form_atomic_candidates_from_recurring_conversation(
+                conn,
+                trigger_entry_id=roots[-1],
+                environ={
+                    ledger.MEMORY_LEDGER_SHADOW_ENV: "true",
+                    ledger.LIVING_CANON_V1_FORMATION_ENV: "true",
+                },
+            )
+            self.assertEqual(len(formed), 1)
+            inventory = canon.build_claim_contract_inventory(conn, guild_id=1)
+            self.assertEqual(inventory["statuses"]["living"], 1)
+            self.assertEqual(inventory["reasonCounts"]["eligible_living"], 1)
+            self.assertEqual(inventory["livingRecurrenceVerifiedCount"], 1)
+            self.assertEqual(inventory["livingGroupingVerifiedCount"], 1)
+        finally:
+            conn.close()
+
     def test_current_finalized_moment_normalizes_as_review_only(self):
         conn = sqlite3.connect(":memory:")
         try:
@@ -1950,6 +2561,54 @@ class HybridCanonClaimContractTests(unittest.TestCase):
             self.assertEqual(roots, {"candidate-1": ["guild-1-root"]})
         finally:
             conn.close()
+
+    def test_inventory_lineage_lookup_requires_requested_scope_columns(self):
+        for omitted_column in ("guild_id", "is_independent"):
+            conn = sqlite3.connect(":memory:")
+            try:
+                definitions = {
+                    "candidate_id": "TEXT",
+                    "guild_id": "INTEGER",
+                    "root_entry_id": "TEXT",
+                    "is_independent": "INTEGER",
+                }
+                selected = tuple(
+                    column
+                    for column in definitions
+                    if column != omitted_column
+                )
+                conn.execute(
+                    "CREATE TABLE memory_ledger_knowledge_roots(%s)"
+                    % ",".join(
+                        "%s %s" % (column, definitions[column])
+                        for column in selected
+                    )
+                )
+                values = {
+                    "candidate_id": "candidate-1",
+                    "guild_id": 1,
+                    "root_entry_id": "root-x",
+                    "is_independent": 1,
+                }
+                conn.execute(
+                    "INSERT INTO memory_ledger_knowledge_roots VALUES(%s)"
+                    % ",".join("?" for _column in selected),
+                    tuple(values[column] for column in selected),
+                )
+
+                roots = canon._inventory_scoped_lineage_map(
+                    conn,
+                    table_name="memory_ledger_knowledge_roots",
+                    owner_column="candidate_id",
+                    root_column="root_entry_id",
+                    owner_ids=("candidate-1",),
+                    guild_id=1,
+                    independent_only=True,
+                )
+
+                self.assertEqual(roots, {}, omitted_column)
+            finally:
+                conn.close()
 
     def test_callem_bini_cannot_unlock_cache_back_in_broad_packet(self):
         conn = sqlite3.connect(":memory:")

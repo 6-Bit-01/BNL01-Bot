@@ -41,6 +41,33 @@ validity, lifecycle, and correction lineage. Claim IDs use the permanent
 `bnl_canon_claim_identity_v1` namespace, so a contract-version change creates a
 new revision without changing the logical claim identity.
 
+### Living Canon recurrence proof
+
+A Living claim must carry explicit stored proof for
+`living_canon_recurrence_v1`: an allowed community domain and pattern claim
+kind, a versioned deterministic grouping signature, distinct immutable human
+root identities, distinct canonical occurrence identities, and matching
+content-free proof counts. Blank, malformed, negative, count-mismatched, or
+inconsistent self-asserted fields fail closed. The database inventory also
+requires the current reconciled lifecycle state and stored lineage; the proof
+is a consistency contract, not a cryptographic attestation. Neither
+`candidate_state='established'` nor a finalized Moment is a substitute for
+this proof.
+
+Curated family labels and the family-neutral fallback use the same recurrence
+standard. One occurrence stays provisional; two qualifying roots across two
+qualifying occurrences may become establishment-eligible only after lifecycle
+and correction checks. Neutral patterns cannot create scalar identity, roles,
+relationships, milestones, operational truth, Declared Canon, or Legacy
+Canon.
+
+PR 4 keeps every recurrence-marked Living candidate, curated-family or
+family-neutral, outside the live packet until PR 5 owns convergence. Its
+historical preview runs against a disposable in-memory clone and
+returns only versions, states, bounds, aggregate reason counts, and an explicit
+zero-source-write receipt. It does not expose source text or identifiers, and
+it never performs historical promotion.
+
 Broadcast normalization uses `cleaned_summary` for any public-safe projection.
 `raw_note`, an internal usage scope, an inactive lifecycle, or an ambiguous
 boolean always fails closed to internal review metadata. Question-scoped Open

@@ -3,16 +3,22 @@ from pathlib import Path
 import sqlite3
 import tempfile
 import unittest
+from unittest import mock
 
 from bnl_canon_source_contract import (
     Confidence,
+    LIVING_CANON_GROUPING_SIGNATURE_VERSION,
+    LIVING_CANON_RECURRENCE_VERSION,
     SourceClass,
     Visibility,
 )
 import bnl_memory_ledger as ledger
 from bnl_memory_preview import (
+    MemoryPreviewDiagnostics,
     MemoryPreviewRequest,
     PREVIEW_FACTUAL_PLACEHOLDER,
+    PreparedMemoryPreview,
+    build_living_canon_preview_diagnostics,
     evaluate_memory_preview,
     finalize_memory_preview,
     prepare_memory_preview,
@@ -766,6 +772,324 @@ class MemoryPreviewTests(unittest.TestCase):
                     """
                 ).fetchone()[0],
                 0,
+            )
+
+    def test_living_canon_preview_is_pure_bounded_and_content_free(self):
+        source_hash_before = self._source_hash()
+
+        def analyzer(conn, *, guild_id, subject_key, max_scan):
+            self.assertEqual(guild_id, 1)
+            self.assertEqual(subject_key, "discord_user:7")
+            self.assertEqual(max_scan, 1200)
+            return {
+                "recurrence_contract_version": (
+                    LIVING_CANON_RECURRENCE_VERSION
+                ),
+                "grouping_signature_version": (
+                    LIVING_CANON_GROUPING_SIGNATURE_VERSION
+                ),
+                "proposed_count": 2,
+                "skipped_count": 3,
+                "ambiguous_count": 1,
+                "rejected_count": 4,
+                "candidate_state_counts": (
+                    ("established", 1),
+                    ("provisional", 1),
+                ),
+                "reason_counts": (
+                    ("same_root_projection_collapsed", 2),
+                    ("provisional_subject_bound_reached", 1),
+                    ("moment_lifecycle_or_membership_ineligible", 1),
+                ),
+                "independent_root_count": 4,
+                "independent_occurrence_count": 2,
+                "collapsed_root_count": 2,
+                "bounds": (
+                    ("eligible_ledger_scan_max", 1200),
+                    ("motif_candidates_max", 6),
+                    ("retained_roots_max", 12),
+                    ("occurrence_lookback_max", 64),
+                    ("idle_boundary_seconds", 1800),
+                ),
+                "source_write_count": 0,
+                "write_occurred": False,
+            }
+
+        with mock.patch.object(
+            ledger,
+            "preview_living_canon_formation",
+            side_effect=analyzer,
+            create=True,
+        ):
+            prepared = prepare_memory_preview(self._request())
+        try:
+            living = prepared.diagnostics.living_canon
+            self.assertEqual(living.status, "analyzed")
+            self.assertEqual(living.proposed_count, 2)
+            self.assertEqual(living.independent_root_count, 4)
+            self.assertEqual(living.independent_occurrence_count, 2)
+            self.assertEqual(
+                dict(living.candidate_state_counts),
+                {"established": 1, "provisional": 1},
+            )
+            self.assertEqual(
+                dict(living.reason_counts),
+                {
+                    "moment_lifecycle_or_membership_ineligible": 1,
+                    "provisional_subject_bound_reached": 1,
+                    "same_root_projection_collapsed": 2,
+                },
+            )
+            self.assertFalse(living.source_write_occurred)
+            rendered = "\n".join(render_content_free_diagnostics(prepared))
+            self.assertIn("living_canon_dry_run", rendered)
+            self.assertIn("source_write_occurred=false", rendered)
+            self.assertNotIn("discord_user:7", rendered)
+            self.assertNotIn("private-source-text-must-not-appear", rendered)
+        finally:
+            prepared.close()
+        self.assertEqual(source_hash_before, self._source_hash())
+
+    def test_living_canon_preview_rejects_write_or_unverified_version(self):
+        conn = sqlite3.connect(":memory:")
+        try:
+            report = {
+                "recurrence_contract_version": "private-version-marker",
+                "grouping_signature_version": "private-group-marker",
+                "proposed_count": 1,
+                "skipped_count": 0,
+                "ambiguous_count": 0,
+                "rejected_count": 0,
+                "candidate_state_counts": (),
+                "reason_counts": (),
+                "independent_root_count": 2,
+                "independent_occurrence_count": 2,
+                "collapsed_root_count": 0,
+                "bounds": tuple(
+                    (
+                        key,
+                        value,
+                    )
+                    for key, value in {
+                        "eligible_ledger_scan_max": 1200,
+                        "motif_candidates_max": 6,
+                        "retained_roots_max": 12,
+                        "occurrence_lookback_max": 64,
+                        "idle_boundary_seconds": 1800,
+                    }.items()
+                ),
+                "source_write_count": 1,
+                "write_occurred": True,
+            }
+            living = build_living_canon_preview_diagnostics(
+                conn,
+                guild_id=1,
+                subject_key="discord_user:7",
+                analyzer=lambda *_args, **_kwargs: report,
+            )
+            self.assertEqual(living.status, "rejected")
+            self.assertEqual(
+                living.status_reason,
+                "pure_analyzer_write_detected",
+            )
+            self.assertEqual(living.recurrence_contract_version, "unverified")
+            self.assertEqual(living.grouping_signature_version, "unverified")
+            self.assertTrue(living.source_write_occurred)
+            prepared = PreparedMemoryPreview(
+                connection=None,
+                request=self._request(),
+                environ={},
+                diagnostics=MemoryPreviewDiagnostics(living_canon=living),
+            )
+            rendered = "\n".join(render_content_free_diagnostics(prepared))
+            self.assertNotIn("private-version-marker", rendered)
+            self.assertNotIn("private-group-marker", rendered)
+        finally:
+            conn.close()
+
+    def test_living_canon_preview_rejects_incoherent_report(self):
+        conn = sqlite3.connect(":memory:")
+        try:
+            impossible = ledger.LivingCanonDryRunReport(
+                proposed_count=999_999_999,
+                candidate_state_counts=(("established", 999_999_999),),
+                independent_root_count=999_999_999,
+                independent_occurrence_count=999_999_999,
+                collapsed_root_count=999_999_999,
+            )
+            living = build_living_canon_preview_diagnostics(
+                conn,
+                guild_id=1,
+                subject_key="discord_user:7",
+                analyzer=lambda *_args, **_kwargs: impossible,
+            )
+            self.assertEqual(living.status, "rejected")
+            self.assertEqual(
+                living.status_reason,
+                "pure_analyzer_report_invalid",
+            )
+            self.assertEqual(living.proposed_count, 0)
+            self.assertEqual(living.candidate_state_counts, ())
+            self.assertEqual(living.independent_root_count, 0)
+        finally:
+            conn.close()
+
+    def test_living_canon_preview_rejects_malformed_counts_or_reason(self):
+        conn = sqlite3.connect(":memory:")
+        try:
+            for report in (
+                {
+                    **ledger.LivingCanonDryRunReport().__dict__,
+                    "proposed_count": -1,
+                },
+                {
+                    **ledger.LivingCanonDryRunReport().__dict__,
+                    "independent_root_count": "0",
+                },
+                {
+                    **ledger.LivingCanonDryRunReport().__dict__,
+                    "reason_counts": (("future_unversioned_reason", 1),),
+                },
+            ):
+                living = build_living_canon_preview_diagnostics(
+                    conn,
+                    guild_id=1,
+                    subject_key="discord_user:7",
+                    analyzer=lambda *_args, report=report, **_kwargs: report,
+                )
+                self.assertEqual(living.status, "rejected")
+                self.assertEqual(
+                    living.status_reason,
+                    "pure_analyzer_report_invalid",
+                )
+                self.assertEqual(living.proposed_count, 0)
+                self.assertEqual(living.reason_counts, ())
+        finally:
+            conn.close()
+
+    def test_rejected_living_analyzer_cannot_contaminate_downstream_preview(self):
+        private_marker = "FORGED_PRIVATE_PREVIEW_MARKER_9f23"
+
+        def analyzer(conn, *, guild_id, subject_key, max_scan):
+            conn.execute(
+                "CREATE TABLE analyzer_contamination(marker TEXT NOT NULL)"
+            )
+            conn.execute(
+                "INSERT INTO analyzer_contamination VALUES(?)",
+                (private_marker,),
+            )
+            return ledger.LivingCanonDryRunReport()
+
+        with mock.patch.object(
+            ledger,
+            "preview_living_canon_formation",
+            side_effect=analyzer,
+        ):
+            prepared = prepare_memory_preview(self._request())
+        try:
+            self.assertEqual(
+                prepared.diagnostics.living_canon.status,
+                "rejected",
+            )
+            self.assertEqual(
+                prepared.diagnostics.living_canon.status_reason,
+                "pure_analyzer_write_detected",
+            )
+            self.assertIsNotNone(prepared.connection)
+            self.assertEqual(
+                prepared.connection.execute(
+                    """
+                    SELECT COUNT(*) FROM sqlite_master
+                    WHERE type='table' AND name='analyzer_contamination'
+                    """
+                ).fetchone()[0],
+                0,
+            )
+            self.assertNotIn(private_marker, repr(prepared))
+        finally:
+            prepared.close()
+
+    def test_analyzed_temp_schema_cannot_contaminate_downstream_preview(self):
+        private_marker = "INJECTED_TEMP_SOURCE_CONTENT_8d41"
+
+        def analyzer(conn, *, guild_id, subject_key, max_scan):
+            conn.execute(
+                """
+                CREATE TEMP VIEW analyzer_contamination_view AS
+                SELECT '%s' AS marker
+                """ % private_marker
+            )
+            return ledger.LivingCanonDryRunReport()
+
+        with mock.patch.object(
+            ledger,
+            "preview_living_canon_formation",
+            side_effect=analyzer,
+        ):
+            prepared = prepare_memory_preview(self._request())
+        try:
+            self.assertEqual(
+                prepared.diagnostics.living_canon.status,
+                "analyzed",
+            )
+            self.assertIsNotNone(prepared.connection)
+            self.assertEqual(
+                prepared.connection.execute(
+                    """
+                    SELECT COUNT(*) FROM sqlite_temp_master
+                    WHERE name='analyzer_contamination_view'
+                    """
+                ).fetchone()[0],
+                0,
+            )
+            self.assertNotIn(private_marker, repr(prepared))
+        finally:
+            prepared.close()
+
+    def test_living_analysis_and_downstream_share_one_frozen_source_image(self):
+        source_marker = "SOURCE_ADVANCED_AFTER_SNAPSHOT_51c7"
+
+        def analyzer(conn, *, guild_id, subject_key, max_scan):
+            with sqlite3.connect(self.db_path) as source:
+                source.execute(
+                    "CREATE TABLE source_advanced_after_snapshot(marker TEXT)"
+                )
+                source.execute(
+                    "INSERT INTO source_advanced_after_snapshot VALUES(?)",
+                    (source_marker,),
+                )
+            return ledger.LivingCanonDryRunReport()
+
+        with mock.patch.object(
+            ledger,
+            "preview_living_canon_formation",
+            side_effect=analyzer,
+        ):
+            prepared = prepare_memory_preview(self._request())
+        try:
+            self.assertEqual(
+                prepared.diagnostics.living_canon.status,
+                "analyzed",
+            )
+            self.assertIsNotNone(prepared.connection)
+            self.assertEqual(
+                prepared.connection.execute(
+                    """
+                    SELECT COUNT(*) FROM sqlite_master
+                    WHERE name='source_advanced_after_snapshot'
+                    """
+                ).fetchone()[0],
+                0,
+            )
+            self.assertNotIn(source_marker, repr(prepared))
+        finally:
+            prepared.close()
+        with sqlite3.connect(self.db_path) as source:
+            self.assertEqual(
+                source.execute(
+                    "SELECT marker FROM source_advanced_after_snapshot"
+                ).fetchone()[0],
+                source_marker,
             )
 
     def test_diagnostics_are_content_free(self):

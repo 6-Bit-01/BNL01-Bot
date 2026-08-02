@@ -98,6 +98,29 @@ Motif formation is explicitly disabled during this pass, so catch-up alone
 cannot create or promote durable memory. Later restarts resume an unfinished
 slice from the recorded cursor.
 
+## Living Canon recurrence v1 boundary
+
+PR 4 extends the existing Ledger/Moment/atomic owner with the versioned
+`living_canon_recurrence_v1` contract. The nine curated motif families remain
+strong labels, while an unmatched public-human meaning may be proposed under
+a deterministic family-neutral signature. One eligible occurrence remains
+provisional. Establishment requires at least two distinct immutable human
+roots across at least two canonical occurrences; message volume, roles,
+Relationship state, canon recognition, and confidence scores cannot replace
+that proof.
+
+Occurrence counting is exchange-anchored and bounded. Multiple rows in one
+continuous exchange, a finalized Moment representing that exchange, and
+overlapping Moment representations collapse to one occurrence. A correction,
+deletion, privacy change, retraction, or supersession removes the affected
+support, and post-correction establishment requires two fresh qualifying
+occurrences.
+
+This PR does not activate that formation path, run historical catch-up, or add
+Living claims to the live packet. Its historical analyzer is content-free and
+zero-write. Any bounded historical apply remains a separately approved
+operation, and packet convergence remains PR 5 work.
+
 ## Diagnostics and rollback
 
 Content-free synthesis receipts record `authority_mode` as either
