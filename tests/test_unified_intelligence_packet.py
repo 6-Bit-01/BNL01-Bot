@@ -1617,6 +1617,9 @@ class UnifiedIntelligencePacketTests(unittest.TestCase):
             {
                 "BNL_OWNER_USER_ID": "61",
                 "BNL_PRIMARY_GUILD_ID": "1",
+                "BNL_DECLARED_CANON_AUTHORITY_SECRET": (
+                    "packet-test-declared-authority-secret-0001"
+                ),
             },
             clear=False,
         ):

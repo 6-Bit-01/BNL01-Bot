@@ -93,12 +93,23 @@ fingerprint stored beside it. No historical classifications are written
 automatically.
 
 Every stored revision carries a request fingerprint and an internally issued,
-deterministic, versioned receipt. It requires no runtime signing secret and no
-public API accepts a caller-supplied authority or receipt. Under the trusted
-application-and-database threat model, read boundaries recompute the receipt
-over the exact actor, guild, operation, nonce/request bindings and complete
-immutable stored payload, then recompute the revision ID. A conflicting
-`INSERT OR REPLACE` is rejected before SQLite can replace history.
+keyed, versioned receipt. `BNL_DECLARED_CANON_AUTHORITY_SECRET` must contain at
+least 32 bytes, and no public API accepts a caller-supplied authority or
+receipt. Read boundaries recompute the HMAC over the exact actor, guild,
+operation, nonce/request bindings and complete immutable stored payload, then
+recompute the revision ID. Missing, short, or rotated key material fails
+closed; rotation requires an explicit reviewed migration rather than silently
+re-signing history. A conflicting `INSERT OR REPLACE` is rejected before
+SQLite can replace history.
+
+The sidecar and source reads are pinned to SQLite's `main` schema, and every
+admission path verifies the exact table/constraint/trigger contract inside the
+same mutation transaction or read snapshot. These controls detect schema
+damage and ordinary rollback attempts within the active database. They do not
+claim protection against a privileged attacker who can restore both an older
+signed database state and the exact schema; a later live authority boundary
+would require an external signed head/checkpoint for that stronger threat
+model.
 
 Broadcast sidecars bind to `broadcast_memory_complete_row_v2`, which hashes the
 complete deterministically canonicalized source row including unknown/future
@@ -112,6 +123,8 @@ revalidation on one database state while remaining zero-write.
 
 Claim-content use in the live packet, website projection, and delegated
 authority remain disabled. New Declared Ledger projections are internal,
-derived, review-only, and nonpublic until final convergence. The packet's
-binding lookup remains read-only and effective only for already-approved
-binding rows.
+derived, nonpublic, and confined to the `declared_canon_review` lane until
+final convergence. Established and contested rows use the `review_only`
+lifecycle; resolved, retired, and superseded terminal rows retain the
+`resolved` lifecycle. The packet's binding lookup remains read-only and
+effective only for already-approved binding rows.
