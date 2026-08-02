@@ -1,11 +1,14 @@
 import os
 import sqlite3
+import tempfile
 import unittest
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from unittest import mock
 
 from bnl_canon_source_contract import Confidence, SourceClass, Visibility
 import bnl_memory_ledger as ledger
+import bnl_unified_intelligence_packet as packet_module
 import bnl_declared_canon as declared
 import bnl_moment_engine as moments
 import bnl_relationship_engine as relationships
@@ -58,6 +61,7 @@ class UnifiedIntelligencePacketTests(unittest.TestCase):
                 content TEXT,
                 channel_id INTEGER,
                 channel_policy TEXT,
+                route_mode TEXT NOT NULL,
                 timestamp TEXT
             )
             """
@@ -243,8 +247,8 @@ class UnifiedIntelligencePacketTests(unittest.TestCase):
             """
             INSERT INTO conversations(
                 id,guild_id,user_id,user_name,role,content,channel_id,
-                channel_policy,timestamp
-            ) VALUES(?,?,?,?,?,?,?,?,?)
+                channel_policy,route_mode,timestamp
+            ) VALUES(?,?,?,?,?,?,?,?,?,?)
             """,
             (
                 900,
@@ -255,6 +259,7 @@ class UnifiedIntelligencePacketTests(unittest.TestCase):
                 "I want the archive to connect my music and project work.",
                 10,
                 "public_home",
+                "normal_chat",
                 "2026-07-25T12:06:00+00:00",
             ),
         )
@@ -272,8 +277,8 @@ class UnifiedIntelligencePacketTests(unittest.TestCase):
             """
             INSERT INTO conversations(
                 id,guild_id,user_id,user_name,role,content,channel_id,
-                channel_policy,timestamp
-            ) VALUES(?,?,?,?,?,?,?,?,?)
+                channel_policy,route_mode,timestamp
+            ) VALUES(?,?,?,?,?,?,?,?,?,?)
             """,
             (
                 int(row_id),
@@ -284,6 +289,7 @@ class UnifiedIntelligencePacketTests(unittest.TestCase):
                 text,
                 10,
                 "public_home",
+                "normal_chat",
                 observed_at,
             ),
         )
@@ -771,12 +777,12 @@ class UnifiedIntelligencePacketTests(unittest.TestCase):
             6,
         )
         self.assertEqual(len(assessment_items), 4)
-        self.assertEqual(len(validation_observations), 6)
+        self.assertEqual(len(validation_observations), 4)
         self.assertEqual(
             packet.diagnostics.validation_support_by_lane.get(
                 "assessment_observation"
             ),
-            6,
+            4,
         )
         self.assertGreaterEqual(
             sum(
@@ -894,7 +900,7 @@ class UnifiedIntelligencePacketTests(unittest.TestCase):
         self.assertEqual(rendered_counts.get("canon"), 1)
         self.assertGreaterEqual(
             rendered_counts.get("assessment_observation", 0),
-            3,
+            2,
         )
         self.assertLess(
             rendered.index("question-scoped public observation"),
@@ -1197,6 +1203,25 @@ class UnifiedIntelligencePacketTests(unittest.TestCase):
             0,
         )
 
+    def test_direct_non_broad_canon_route_remains_available(self):
+        packet = build_packet(
+            self.conn,
+            self.public_request(text="Who is Mac Modem?"),
+            persist=False,
+            environ=self.flags,
+        )
+
+        self.assertEqual(
+            packet.profile_sufficiency.status,
+            "not_applicable",
+        )
+        self.assertTrue(
+            any(
+                item.lane == "canon" and "Mac Modem" in item.text
+                for item in packet.items
+            )
+        )
+
     def test_private_cross_subject_contested_and_live_rows_fail_closed(self):
         self.add_conversation_context_row()
         _roots, selected_candidate = self.add_established_atomic()
@@ -1408,6 +1433,48 @@ class UnifiedIntelligencePacketTests(unittest.TestCase):
         self.assertEqual(revalidation.status, "source_changed")
         self.assertGreaterEqual(revalidation.changed_source_count, 1)
 
+    def test_temp_conversation_table_cannot_poison_assessment_context(self):
+        clean_text = (
+            "I keep connecting modular synths to the archive project."
+        )
+        poison = "TEMP POISON secret password is HUNTERSEVEN"
+        self.add_raw_public_conversation(
+            900,
+            clean_text,
+            "2026-07-25T12:06:00+00:00",
+        )
+        self.conn.execute(
+            "CREATE TEMP TABLE conversations AS "
+            "SELECT * FROM main.conversations"
+        )
+        self.conn.execute(
+            "UPDATE temp.conversations SET content=? WHERE id=900",
+            (poison,),
+        )
+
+        packet = build_packet(
+            self.conn,
+            self.public_request(),
+            persist=False,
+            environ=self.flags,
+        )
+        context_items = tuple(
+            item
+            for item in (*packet.items, *packet.validation_items)
+            if item.lane == "conversation_context"
+            and item.source_ref == "conversation:900"
+        )
+
+        self.assertTrue(context_items)
+        self.assertEqual(
+            {item.text for item in context_items},
+            {clean_text},
+        )
+        rendered, _counts, _count, _digests = render_packet_context(packet)
+        self.assertNotIn("HUNTERSEVEN", rendered)
+        self.assertNotIn("TEMP POISON", rendered)
+        self.assertTrue(revalidate_packet(self.conn, packet).valid)
+
     def test_supporting_root_text_change_breaks_revalidation(self):
         roots, _candidate_id = self.add_established_atomic()
         packet = build_packet(
@@ -1433,6 +1500,299 @@ class UnifiedIntelligencePacketTests(unittest.TestCase):
 
         self.assertFalse(revalidation.valid)
         self.assertEqual(revalidation.status, "source_changed")
+
+    def test_open_signal_source_authority_change_breaks_revalidation(self):
+        entry_id = self.add_raw_public_conversation(
+            1500,
+            "I tune ceramic antennas for unusual signal harmonics.",
+            "2026-07-20T10:00:00+00:00",
+        )
+        packet = build_packet(
+            self.conn,
+            self.public_request(text="What am I all about?"),
+            persist=False,
+            environ=self.flags,
+        )
+        self.assertEqual(packet.profile_sufficiency.status, "sparse")
+        self.conn.execute(
+            """
+            UPDATE memory_ledger_entries
+            SET source_role='model',source_sequence=source_sequence+100
+            WHERE entry_id=?
+            """,
+            (entry_id,),
+        )
+
+        result = revalidate_packet(self.conn, packet, environ=self.flags)
+
+        self.assertFalse(result.valid)
+        self.assertEqual(result.status, "source_changed")
+
+    def test_hostile_or_stale_open_signal_selector_dto_fails_closed(self):
+        entry_id = self.add_raw_public_conversation(
+            1510,
+            "I tune ceramic antennas for unusual signal harmonics.",
+            "2026-07-20T10:00:00+00:00",
+        )
+        real_selection = ledger.select_public_conversation_assessment_evidence(
+            self.conn,
+            guild_id=1,
+            subject_key="discord_user:7",
+            request_text="What am I all about?",
+        )
+        hostile = replace(
+            real_selection.items[0],
+            subject_key="discord_user:8",
+        )
+        with mock.patch(
+            "bnl_unified_intelligence_packet."
+            "select_public_conversation_assessment_evidence",
+            return_value=replace(real_selection, items=(hostile,)),
+        ):
+            packet = build_packet(
+                self.conn,
+                self.public_request(text="What am I all about?"),
+                persist=False,
+                environ=self.flags,
+            )
+        self.assertEqual(packet.profile_sufficiency.status, "empty")
+        self.assertFalse(
+            any(item.lane == "assessment_observation" for item in packet.items)
+        )
+
+        def stale_selection(*_args, **_kwargs):
+            selected = ledger.select_public_conversation_assessment_evidence(
+                self.conn,
+                guild_id=1,
+                subject_key="discord_user:7",
+                request_text="What am I all about?",
+            )
+            self.conn.execute(
+                """
+                UPDATE memory_ledger_entries
+                SET normalized_value='A changed authoritative source.'
+                WHERE entry_id=?
+                """,
+                (entry_id,),
+            )
+            return selected
+
+        with mock.patch(
+            "bnl_unified_intelligence_packet."
+            "select_public_conversation_assessment_evidence",
+            side_effect=stale_selection,
+        ):
+            packet = build_packet(
+                self.conn,
+                self.public_request(text="What am I all about?"),
+                persist=False,
+                environ=self.flags,
+            )
+        self.assertEqual(packet.profile_sufficiency.status, "empty")
+        self.assertGreaterEqual(
+            packet.diagnostics.excluded_by_reason.get(
+                "assessment_selector_source_mismatch",
+                0,
+            ),
+            1,
+        )
+
+    def test_open_signal_material_distinctness_and_process_relevance(self):
+        self.add_raw_public_conversation(
+            1520,
+            "I compare audio mixes carefully before final release.",
+            "2026-07-20T10:00:00+00:00",
+        )
+        self.add_raw_public_conversation(
+            1521,
+            "I compare audio mixes carefully before release.",
+            "2026-07-21T10:00:00+00:00",
+        )
+        paraphrase = build_packet(
+            self.conn,
+            self.public_request(text="What am I all about?"),
+            persist=False,
+            environ=self.flags,
+        )
+        self.assertEqual(paraphrase.profile_sufficiency.status, "sparse")
+        self.assertEqual(
+            paraphrase.profile_sufficiency.candidate_point_count,
+            1,
+        )
+
+        self.add_raw_public_conversation(
+            1522,
+            "I test website changes carefully before release.",
+            "2026-07-22T10:00:00+00:00",
+        )
+        distinct = build_packet(
+            self.conn,
+            self.public_request(text="What am I all about?"),
+            persist=False,
+            environ=self.flags,
+        )
+        self.assertEqual(distinct.profile_sufficiency.status, "rich")
+        self.assertGreaterEqual(
+            distinct.profile_sufficiency.candidate_point_count,
+            2,
+        )
+
+        other = sqlite3.connect(":memory:")
+        try:
+            ledger.ensure_memory_ledger_schema(other)
+            other.execute(
+                """
+                CREATE TABLE conversations (
+                  id INTEGER PRIMARY KEY,guild_id INTEGER,user_id INTEGER,
+                  user_name TEXT,role TEXT,content TEXT,channel_id INTEGER,
+                  channel_policy TEXT,route_mode TEXT NOT NULL,timestamp TEXT
+                )
+                """
+            )
+            for row_id, text in (
+                (1, "I make custom emotes for the broadcast characters."),
+                (2, "The character icons use bright cyan outlines."),
+                (3, "The synth track has a noisy bass texture."),
+            ):
+                observed_at = "2026-07-%02dT10:00:00+00:00" % (19 + row_id)
+                other.execute(
+                    "INSERT INTO conversations VALUES(?,1,7,'Crow','user',?,10,'public_home','normal_chat',?)",
+                    (row_id, text, observed_at),
+                )
+                ledger.shadow_conversation_row(
+                    other,
+                    row_id=row_id,
+                    user_id=7,
+                    user_name="Crow",
+                    guild_id=1,
+                    role="user",
+                    content=text,
+                    channel_name="barcode-bot",
+                    channel_policy="public_home",
+                    channel_id=10,
+                    route_mode="normal_chat",
+                    observed_at=observed_at,
+                )
+            irrelevant = build_packet(
+                other,
+                self.public_request(
+                    text="What have you learned about how I work and make decisions?"
+                ),
+                persist=False,
+                environ=self.flags,
+            )
+            self.assertEqual(irrelevant.profile_sufficiency.status, "empty")
+            self.assertGreaterEqual(
+                irrelevant.diagnostics.excluded_by_reason.get(
+                    "assessment_question_irrelevant",
+                    0,
+                ),
+                1,
+            )
+        finally:
+            other.close()
+
+    def test_revalidation_uses_one_wal_snapshot(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            path = os.path.join(tempdir, "revalidation.db")
+            reader = sqlite3.connect(path, timeout=5)
+            writer = sqlite3.connect(path, timeout=5)
+            try:
+                reader.execute("PRAGMA journal_mode=WAL")
+                ledger.ensure_memory_ledger_schema(reader)
+                reader.execute(
+                    """
+                    CREATE TABLE conversations (
+                      id INTEGER PRIMARY KEY,guild_id INTEGER,user_id INTEGER,
+                      user_name TEXT,role TEXT,content TEXT,channel_id INTEGER,
+                      channel_policy TEXT,route_mode TEXT NOT NULL,timestamp TEXT
+                    )
+                    """
+                )
+                entry_ids = []
+                for row_id, text, observed_at in (
+                    (
+                        1,
+                        "I tune ceramic antennas for unusual harmonics.",
+                        "2026-07-20T10:00:00+00:00",
+                    ),
+                    (
+                        2,
+                        "I test website changes before publishing them.",
+                        "2026-07-21T10:00:00+00:00",
+                    ),
+                ):
+                    reader.execute(
+                        "INSERT INTO conversations VALUES(?,1,7,'Crow','user',?,10,'public_home','normal_chat',?)",
+                        (row_id, text, observed_at),
+                    )
+                    entry_ids.append(
+                        ledger.shadow_conversation_row(
+                            reader,
+                            row_id=row_id,
+                            user_id=7,
+                            user_name="Crow",
+                            guild_id=1,
+                            role="user",
+                            content=text,
+                            channel_name="barcode-bot",
+                            channel_policy="public_home",
+                            channel_id=10,
+                            route_mode="normal_chat",
+                            observed_at=observed_at,
+                        ).entry_id
+                    )
+                reader.commit()
+                packet = build_packet(
+                    reader,
+                    self.public_request(text="What am I all about?"),
+                    persist=False,
+                    environ=self.flags,
+                )
+                reader.commit()
+                original_state = (
+                    packet_module.read_public_assessment_root_state
+                )
+                interleaved = False
+
+                def state_with_writer(conn, **kwargs):
+                    nonlocal interleaved
+                    current = original_state(conn, **kwargs)
+                    if not interleaved:
+                        interleaved = True
+                        writer.execute(
+                            """
+                            UPDATE memory_ledger_entries
+                            SET source_sequence=source_sequence+100
+                            WHERE entry_id=?
+                            """,
+                            (entry_ids[-1],),
+                        )
+                        writer.commit()
+                    return current
+
+                with mock.patch.object(
+                    packet_module,
+                    "read_public_assessment_root_state",
+                    side_effect=state_with_writer,
+                ):
+                    coherent = revalidate_packet(
+                        reader,
+                        packet,
+                        environ=self.flags,
+                    )
+                self.assertTrue(interleaved)
+                self.assertTrue(coherent.valid)
+                changed = revalidate_packet(
+                    reader,
+                    packet,
+                    environ=self.flags,
+                )
+                self.assertFalse(changed.valid)
+                self.assertEqual(changed.status, "source_changed")
+            finally:
+                writer.close()
+                reader.close()
 
     def test_provisional_is_tentative_and_due_review_is_excluded(self):
         self.add_conversation_context_row()

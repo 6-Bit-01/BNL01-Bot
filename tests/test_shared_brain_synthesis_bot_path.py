@@ -271,6 +271,15 @@ class SharedBrainSynthesisBotPathTests(
 
         self.assertIsNotNone(execution)
         self.assertTrue(execution.candidate_active)
+        self.assertEqual(generation.await_count, 1)
+        self.assertEqual(
+            generation.await_args.kwargs["route"],
+            "shared_brain_synthesis_canary",
+        )
+        self.assertEqual(
+            begin.call_count,
+            1,
+        )
         candidate_prompt = generation.await_args.args[1]
         self.assertNotIn("Relationship state:", candidate_prompt)
         self.assertNotIn("Observed habits:", candidate_prompt)
@@ -300,7 +309,7 @@ class SharedBrainSynthesisBotPathTests(
             1,
         )
 
-    async def test_category_only_candidate_gets_one_grounded_repair(self):
+    async def test_category_only_candidate_falls_back_without_retry(self):
         legacy_context = "Legacy factual profile block."
         basis = replace(
             self.synthesis_basis(legacy_context),
@@ -318,21 +327,10 @@ class SharedBrainSynthesisBotPathTests(
             candidate_selected=False,
             fallback_reason="candidate_member_details_insufficient",
         )
-        accepted = SimpleNamespace(
-            run=run,
-            candidate_selected=True,
-            fallback_reason="",
-        )
         generation = mock.AsyncMock(
-            side_effect=(
-                "Software and music are recurring themes.",
-                (
-                    "You keep fixing the bot code and memory system, "
-                    "while composing synth songs and refining their mixes."
-                ),
-            )
+            return_value="Software and music are recurring themes."
         )
-        evaluator = mock.Mock(side_effect=(rejected, accepted))
+        evaluator = mock.Mock(return_value=rejected)
         prompt = (
             "Current user request: BNL-01, what am I all about?\n"
             "Durable memory context:\n"
@@ -377,24 +375,20 @@ class SharedBrainSynthesisBotPathTests(
                 )
             )
 
-        self.assertTrue(execution.candidate_active)
-        self.assertIn("bot code", execution.response)
-        self.assertEqual(generation.await_count, 2)
+        self.assertFalse(execution.candidate_active)
+        self.assertEqual(execution.response, "Established baseline.")
+        self.assertEqual(generation.await_count, 1)
         self.assertEqual(
             generation.await_args_list[0].kwargs["route"],
             "shared_brain_synthesis_canary",
         )
         self.assertEqual(
-            generation.await_args_list[1].kwargs["route"],
-            "shared_brain_synthesis_canary_repair",
+            execution.decision.fallback_reason,
+            "candidate_member_details_insufficient",
         )
-        self.assertIn(
-            "Grounded rewrite requirements",
-            generation.await_args_list[1].args[1],
-        )
-        self.assertEqual(evaluator.call_count, 2)
+        self.assertEqual(evaluator.call_count, 1)
 
-    async def test_ungrounded_repair_gets_one_final_cleanup(self):
+    async def test_rejected_candidate_never_gets_repair_or_cleanup(self):
         legacy_context = "Legacy factual profile block."
         basis = replace(
             self.synthesis_basis(legacy_context),
@@ -412,36 +406,10 @@ class SharedBrainSynthesisBotPathTests(
             candidate_selected=False,
             fallback_reason="candidate_member_details_insufficient",
         )
-        repair_rejected = SimpleNamespace(
-            run=run,
-            candidate_selected=False,
-            fallback_reason="candidate_claims_ungrounded",
-        )
-        cleanup_accepted = SimpleNamespace(
-            run=run,
-            candidate_selected=True,
-            fallback_reason="",
-        )
         generation = mock.AsyncMock(
-            side_effect=(
-                "Software and music are recurring themes.",
-                (
-                    "You keep fixing bot code and composing synth songs. "
-                    "You secretly run a lunar casino."
-                ),
-                (
-                    "You keep fixing bot code and composing synth songs. "
-                    "You strike me as a persistent creative architect."
-                ),
-            )
+            return_value="Software and music are recurring themes."
         )
-        evaluator = mock.Mock(
-            side_effect=(
-                first_rejected,
-                repair_rejected,
-                cleanup_accepted,
-            )
-        )
+        evaluator = mock.Mock(return_value=first_rejected)
         prompt = (
             "Current user request: BNL-01, what am I all about?\n"
             "Durable memory context:\n"
@@ -486,21 +454,12 @@ class SharedBrainSynthesisBotPathTests(
                 )
             )
 
-        self.assertTrue(execution.candidate_active)
-        self.assertNotIn("lunar casino", execution.response)
-        self.assertIn("creative architect", execution.response)
-        self.assertEqual(generation.await_count, 3)
-        self.assertEqual(
-            generation.await_args_list[2].kwargs["route"],
-            "shared_brain_synthesis_canary_cleanup",
-        )
-        self.assertIn(
-            "Final grounded cleanup requirements",
-            generation.await_args_list[2].args[1],
-        )
-        self.assertEqual(evaluator.call_count, 3)
+        self.assertFalse(execution.candidate_active)
+        self.assertEqual(execution.response, "Established baseline.")
+        self.assertEqual(generation.await_count, 1)
+        self.assertEqual(evaluator.call_count, 1)
 
-    async def test_claims_only_candidate_goes_directly_to_minimal_cleanup(self):
+    async def test_claims_ungrounded_candidate_falls_back_without_cleanup(self):
         legacy_context = "Legacy factual profile block."
         basis = replace(
             self.synthesis_basis(legacy_context),
@@ -518,31 +477,12 @@ class SharedBrainSynthesisBotPathTests(
             candidate_selected=False,
             fallback_reason="candidate_claims_ungrounded",
         )
-        cleanup_accepted = SimpleNamespace(
-            run=run,
-            candidate_selected=True,
-            fallback_reason="",
-        )
         packet_candidate = (
             "You keep fixing bot code and composing synth songs. "
             "You secretly run a lunar casino."
         )
-        cleaned_candidate = (
-            "You keep fixing bot code and composing synth songs. "
-            "My read is that careful iteration connects those parts."
-        )
-        generation = mock.AsyncMock(
-            side_effect=(
-                packet_candidate,
-                cleaned_candidate,
-            )
-        )
-        evaluator = mock.Mock(
-            side_effect=(
-                claims_rejected,
-                cleanup_accepted,
-            )
-        )
+        generation = mock.AsyncMock(return_value=packet_candidate)
+        evaluator = mock.Mock(return_value=claims_rejected)
         prompt = (
             "Current user request: What have you learned about how I work "
             "and make decisions?\n"
@@ -588,28 +528,20 @@ class SharedBrainSynthesisBotPathTests(
                 )
             )
 
-        self.assertTrue(execution.candidate_active)
-        self.assertEqual(execution.response, cleaned_candidate)
-        self.assertEqual(generation.await_count, 2)
+        self.assertFalse(execution.candidate_active)
+        self.assertEqual(execution.response, "Established baseline.")
+        self.assertEqual(generation.await_count, 1)
         self.assertEqual(
             generation.await_args_list[0].kwargs["route"],
             "shared_brain_synthesis_canary",
         )
         self.assertEqual(
-            generation.await_args_list[1].kwargs["route"],
-            "shared_brain_synthesis_canary_cleanup",
+            execution.decision.fallback_reason,
+            "candidate_claims_ungrounded",
         )
-        self.assertIn(
-            "Final grounded cleanup requirements",
-            generation.await_args_list[1].args[1],
-        )
-        self.assertNotIn(
-            "Grounded rewrite requirements",
-            generation.await_args_list[1].args[1],
-        )
-        self.assertEqual(evaluator.call_count, 2)
+        self.assertEqual(evaluator.call_count, 1)
 
-    async def test_final_cleanup_rejection_falls_back_without_retrying(self):
+    async def test_single_candidate_rejection_preserves_fallback_reason(self):
         legacy_context = "Legacy factual profile block."
         basis = replace(
             self.synthesis_basis(legacy_context),
@@ -627,31 +559,10 @@ class SharedBrainSynthesisBotPathTests(
             candidate_selected=False,
             fallback_reason="candidate_member_details_insufficient",
         )
-        claims_rejected = SimpleNamespace(
-            run=run,
-            candidate_selected=False,
-            fallback_reason="candidate_claims_ungrounded",
-        )
         generation = mock.AsyncMock(
-            side_effect=(
-                "Software and music are recurring themes.",
-                (
-                    "You keep fixing bot code and composing synth songs. "
-                    "You secretly run a lunar casino."
-                ),
-                (
-                    "You keep fixing bot code and composing synth songs. "
-                    "You secretly run a lunar casino."
-                ),
-            )
+            return_value="Software and music are recurring themes."
         )
-        evaluator = mock.Mock(
-            side_effect=(
-                first_rejected,
-                claims_rejected,
-                claims_rejected,
-            )
-        )
+        evaluator = mock.Mock(return_value=first_rejected)
         prompt = (
             "Current user request: BNL-01, what am I all about?\n"
             "Durable memory context:\n"
@@ -695,10 +606,10 @@ class SharedBrainSynthesisBotPathTests(
         self.assertEqual(execution.response, "Established baseline.")
         self.assertEqual(
             execution.decision.fallback_reason,
-            "candidate_claims_ungrounded",
+            "candidate_member_details_insufficient",
         )
-        self.assertEqual(generation.await_count, 3)
-        self.assertEqual(evaluator.call_count, 3)
+        self.assertEqual(generation.await_count, 1)
+        self.assertEqual(evaluator.call_count, 1)
 
     async def test_missing_legacy_block_fails_closed_to_baseline(self):
         legacy_context = "Relationship state: familiar."
@@ -774,6 +685,19 @@ class SharedBrainSynthesisBotPathTests(
             fallback_reason="",
         )
         finalized = mock.AsyncMock(return_value=True)
+        guard = mock.AsyncMock(
+            return_value=(
+                "Packet-grounded candidate.",
+                {
+                    "suppressed": False,
+                    "_revalidated_prompt_source_bases": (
+                        "existing-basis",
+                        "synthesis-basis",
+                    ),
+                },
+            )
+        )
+        evaluator = mock.Mock(return_value=final_decision)
         with ExitStack() as stack:
             for patcher in self.common_patches():
                 stack.enter_context(patcher)
@@ -785,23 +709,12 @@ class SharedBrainSynthesisBotPathTests(
             stack.enter_context(mock.patch.object(
                 bnl01_bot,
                 "_evaluate_shared_brain_synthesis_receipt",
-                return_value=final_decision,
+                new=evaluator,
             ))
             stack.enter_context(mock.patch.object(
                 bnl01_bot,
                 "apply_guarded_response_regeneration",
-                new=mock.AsyncMock(
-                    return_value=(
-                        "Packet-grounded candidate.",
-                        {
-                            "suppressed": False,
-                            "_revalidated_prompt_source_bases": (
-                                "existing-basis",
-                                "synthesis-basis",
-                            ),
-                        },
-                    )
-                ),
+                new=guard,
             ))
             stack.enter_context(mock.patch.object(
                 bnl01_bot,
@@ -824,6 +737,11 @@ class SharedBrainSynthesisBotPathTests(
             message.replies,
             ["Packet-grounded candidate."],
         )
+        guard.assert_awaited_once()
+        self.assertFalse(
+            guard.await_args.kwargs["regeneration_allowed"]
+        )
+        evaluator.assert_not_called()
         finalized.assert_awaited_once()
         self.assertTrue(
             finalized.await_args.kwargs["response_sent"]
@@ -896,6 +814,12 @@ class SharedBrainSynthesisBotPathTests(
 
         self.assertEqual(message.replies, ["Established baseline."])
         self.assertEqual(guard.await_count, 2)
+        self.assertFalse(
+            guard.await_args_list[0].kwargs["regeneration_allowed"]
+        )
+        self.assertTrue(
+            guard.await_args_list[1].kwargs["regeneration_allowed"]
+        )
         fallback.assert_awaited_once()
         self.assertEqual(
             fallback.await_args.args[1],
@@ -998,6 +922,9 @@ class SharedBrainSynthesisBotPathTests(
         self.assertEqual(
             guard.await_args.kwargs["prompt_source_bases"],
             source_bases,
+        )
+        self.assertTrue(
+            guard.await_args.kwargs["regeneration_allowed"]
         )
         generation.assert_not_awaited()
         begin.assert_not_called()

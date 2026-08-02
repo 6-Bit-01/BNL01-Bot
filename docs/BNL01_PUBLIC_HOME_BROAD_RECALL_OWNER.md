@@ -44,6 +44,22 @@ or when the packet and response-assessment shadows are unavailable.
   differently framed candidate is allowed; loss of supported substance is not.
 - Unsupported baseline language does not gain authority from this comparison.
 
+## Universal Open Signal and additive canon
+
+Every correctly resolved Discord subject may use bounded, question-scoped
+public observations selected by the existing Ledger assessment selector. The
+packet rechecks exact authorship, subject, route, visibility, lifecycle,
+correction lineage, source text, root, and occurrence under one coherent read
+snapshot. One materially supported point is an honest sparse Open Signal;
+two materially distinct points with independent roots and occurrences may
+support a rich answer. Near-paraphrases do not manufacture breadth, and
+process-profile questions admit only process-relevant observations.
+
+Canon never unlocks that personal evidence. On broad profiles it is ordered
+after member-specific evidence and remains additive; canon alone leaves
+profile sufficiency empty and triggers no candidate generation. Direct
+non-broad canon and lore questions retain their existing route.
+
 ## Same-platform canon recognition
 
 Mac Modem, Cache Back, and DJ Floppydisc now have standalone facts in the
@@ -59,14 +75,15 @@ hold:
 
 The result is a reversible response-time recognition signal, not a persistent
 account merge or cross-platform identity claim. Near matches, ambiguous names,
-one-row names, private rows, and non-public routes do not qualify. The existing
-6 Bit owner path is unchanged.
+one-row names, private rows, and non-public routes do not qualify. 6 Bit uses
+the approved explicit same-platform account-binding path rather than automatic
+name recognition; that binding adds canon only after generic member evidence.
 
-When the recognized member has no durable motif but does have public
-conversation evidence, the packet may select exactly one assessment
-observation and require cautious wording. That observation does not become a
-trait, Moment, or atomic-memory candidate. Stronger claims still require the
-existing independent-root and independent-occurrence thresholds.
+Recognition adds the approved identity only after the same generic member
+evidence rule succeeds. A single observation stays sparse; multiple materially
+distinct observations may be rich only with independent roots and occurrences.
+No assessment observation becomes a trait, Moment, or atomic-memory candidate
+through response-time use.
 
 An empty packet never suppresses a nonempty established response. The fixed
 thin-record response is used only when both the packet route and the already
