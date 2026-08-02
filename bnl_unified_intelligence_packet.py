@@ -25,10 +25,13 @@ from bnl_canon_source_contract import (
     CANON_MEMBER_IDENTITIES,
     CANON_SOURCE_CONTRACT_VERSION,
     Confidence,
+    EntityAccountBinding,
     SourceClass,
     SubjectIdentity,
     matching_canon_member_identities,
     normalize_canon_identity_label,
+    resolve_entity_identity,
+    strict_contract_bool,
 )
 from bnl_memory_governance import (
     APPROVED_MEMBER_SCALAR_PREDICATES,
@@ -588,6 +591,90 @@ def _table_columns(
     }
 
 
+def _explicit_canon_binding_signal(
+    conn: sqlite3.Connection,
+    request: IntelligencePacketRequest,
+) -> _CanonIdentitySignal | None:
+    """Prefer a versioned, boundary-verified immutable account binding."""
+
+    columns = _table_columns(conn, "canon_entity_account_bindings")
+    required = {
+        "guild_id",
+        "platform",
+        "account_id",
+        "entity_id",
+        "authority_receipt",
+        "authority_actor",
+        "binding_version",
+        "authority_verified",
+        "active",
+    }
+    if not required.issubset(columns):
+        return None
+    rows = conn.execute(
+        """
+        SELECT entity_id,platform,account_id,authority_receipt,
+               authority_actor,binding_version,authority_verified,active
+        FROM canon_entity_account_bindings
+        WHERE guild_id=?
+          AND lower(trim(platform))='discord'
+          AND trim(CAST(account_id AS TEXT))=?
+        ORDER BY entity_id,authority_receipt
+        """,
+        (
+            int(request.guild_id or 0),
+            str(int(request.subject_user_id or 0)),
+        ),
+    ).fetchall()
+    if not rows:
+        return None
+    bindings = tuple(
+        EntityAccountBinding(
+            entity_id=str(row[0] or ""),
+            platform=str(row[1] or ""),
+            account_id=str(row[2] or ""),
+            authority_receipt=str(row[3] or ""),
+            authority_actor=str(row[4] or ""),
+            binding_version=str(row[5] or ""),
+            authority_verified=strict_contract_bool(row[6]),
+            active=strict_contract_bool(row[7]),
+        )
+        for row in rows
+    )
+    resolution = resolve_entity_identity(
+        platform="discord",
+        account_id=str(int(request.subject_user_id or 0)),
+        bindings=bindings,
+    )
+    if resolution.status == "ambiguous":
+        return _CanonIdentitySignal("ambiguous_account_binding")
+    if resolution.status != "resolved" or resolution.subject is None:
+        return _CanonIdentitySignal("invalid_account_binding")
+    if resolution.subject.key not in _AUTOMATIC_CANON_SIGNAL_SUBJECT_KEYS:
+        return _CanonIdentitySignal(
+            "bound_non_signal_identity",
+            subject=resolution.subject,
+        )
+    return _CanonIdentitySignal(
+        "recognized",
+        subject=resolution.subject,
+        stable_row_count=1,
+        evidence_digest=_digest(
+            "same_platform_account_binding_v1",
+            CANON_SOURCE_CONTRACT_VERSION,
+            int(request.guild_id or 0),
+            int(request.subject_user_id or 0),
+            resolution.subject.key,
+            tuple(
+                sorted(
+                    _digest(*row)
+                    for row in rows
+                )
+            ),
+        ),
+    )
+
+
 def _canon_identity_signal(
     conn: sqlite3.Connection,
     request: IntelligencePacketRequest,
@@ -604,6 +691,9 @@ def _canon_identity_signal(
         or int(request.subject_user_id or 0) <= 0
     ):
         return _CanonIdentitySignal("invalid_subject_scope")
+    explicit_binding = _explicit_canon_binding_signal(conn, request)
+    if explicit_binding is not None:
+        return explicit_binding
     labels = [str(request.subject_display_name or "")]
     profile_columns = _table_columns(conn, "user_profiles")
     if {

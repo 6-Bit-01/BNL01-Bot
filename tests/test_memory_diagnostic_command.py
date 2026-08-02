@@ -61,6 +61,26 @@ def diagnostic_data():
             "schemaVersion": "memory_ledger_v1",
             "insertedLedgerEntries": 0,
         },
+        {
+            "claimContractVersion": "hybrid_canon_claim_v1",
+            "sourceRows": {"legacy_canon_registry": 19},
+            "inspectedRows": {"legacy_canon_registry": 19},
+            "adaptedRows": {"legacy_canon_registry": 19},
+            "reviewOnlyCount": 0,
+            "reasonCounts": {"eligible_legacy": 19},
+            "identityLabelCollisionCount": 0,
+            "identityBindingCollisionCount": 0,
+            "callemCacheIdentityCollisionCount": 0,
+            "claimIdCollisionCount": 0,
+            "revisionIdCollisionCount": 0,
+            "revisionDigestMismatchCount": 0,
+            "nonOpaqueAuthorityActorCount": 0,
+            "nonOpaqueBindingActorCount": 0,
+            "truncatedSources": (),
+            "sourceReconciliationStatus": "complete",
+            "sourceAdaptedReconciled": True,
+            "mutationCount": 0,
+        },
     )
 
 
@@ -107,6 +127,19 @@ class MemoryDiagnosticCommandTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("BNL Memory Diagnostic", text)
             self.assertIn(
                 "- conversation_motif_formation_shadow_enabled: `yes`",
+                text,
+            )
+            self.assertIn(
+                "- hybrid_claim_contract: `hybrid_canon_claim_v1`",
+                text,
+            )
+            self.assertIn("- hybrid_claim_mutation_count: `0`", text)
+            self.assertIn(
+                "- hybrid_claim_reconciliation_status: `complete`",
+                text,
+            )
+            self.assertIn(
+                "- hybrid_claim_truncated_sources: `()`",
                 text,
             )
             self.assertEqual(limit, 1700)

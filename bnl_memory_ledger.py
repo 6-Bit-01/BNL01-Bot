@@ -18,6 +18,7 @@ from typing import Any, Iterable
 
 from bnl_canon_source_contract import (
     Confidence,
+    PUBLIC_ASSESSMENT_EVIDENCE_VERSION,
     SourceClass,
     SourceClaim,
     SubjectIdentity,
@@ -715,6 +716,18 @@ class PublicAssessmentEvidence:
     occurrence_identity: str
     score: float
     request_relevant: bool = False
+    subject_key: str = ""
+    assessment_contract_version: str = PUBLIC_ASSESSMENT_EVIDENCE_VERSION
+    source_system: str = "memory_ledger_public_assessment"
+    source_role: str = "user"
+    source_class: str = SourceClass.PUBLIC_OBSERVATION.value
+    lifecycle_status: str = ACTIVE_LIFECYCLE
+    channel_policy: str = "unknown"
+    public_usable: bool = False
+    subject_authored: bool = False
+    selector_eligible: bool = False
+    derived: bool = True
+    projection: bool = True
 
 
 @dataclass(frozen=True)
@@ -5222,7 +5235,7 @@ def _conversation_motif_history(
 ) -> list[dict[str, Any]]:
     rows = conn.execute(
         """
-        SELECT entry_id,subject_display_name,normalized_value,observed_at,
+        SELECT entry_id,subject_key,subject_display_name,normalized_value,observed_at,
                channel_id,channel_policy,source_table,source_row_id,
                source_role,source_class,visibility,public_usable,
                derived,projection,lifecycle_status
@@ -5261,6 +5274,7 @@ def _conversation_motif_history(
     ).fetchall()
     keys = (
         "entry_id",
+        "subject_key",
         "subject_display_name",
         "normalized_value",
         "observed_at",
@@ -5546,6 +5560,23 @@ def select_public_conversation_assessment_evidence(
             occurrence_identity=str(candidate["occurrence"]),
             score=float(candidate["base_score"]),
             request_relevant=bool(candidate["request_relevant"]),
+            subject_key=str(subject_key or ""),
+            source_role=str(candidate["entry"].get("source_role") or ""),
+            source_class=str(candidate["entry"].get("source_class") or ""),
+            lifecycle_status=str(
+                candidate["entry"].get("lifecycle_status") or ""
+            ),
+            channel_policy=str(
+                candidate["entry"].get("channel_policy") or "unknown"
+            ),
+            public_usable=bool(candidate["entry"].get("public_usable")),
+            subject_authored=bool(
+                str(candidate["entry"].get("subject_key") or "")
+                == str(subject_key or "")
+            ),
+            selector_eligible=True,
+            derived=bool(candidate["entry"].get("derived")),
+            projection=bool(candidate["entry"].get("projection")),
         )
         for candidate in selected
         if str(candidate["entry"].get("entry_id") or "")
@@ -7551,10 +7582,64 @@ def shadow_broadcast_status_event(conn: sqlite3.Connection, *, row_id: int, guil
     return result
 
 
-def shadow_canon_reference(conn: sqlite3.Connection, *, guild_id: int, canon_id: str, subject_key: str, subject_display_name: str, predicate_key: str, value: str, observed_at: str = "") -> LedgerWriteResult:
+def shadow_canon_reference(
+    conn: sqlite3.Connection,
+    *,
+    guild_id: int,
+    canon_id: str,
+    subject_key: str,
+    subject_display_name: str,
+    predicate_key: str,
+    value: str,
+    observed_at: str = "",
+    revision_id: str = "",
+    root_entry_ids: tuple[str, ...] = (),
+) -> LedgerWriteResult:
+    """Project an approved canon revision without becoming its authority.
+
+    The canon registry/declaration remains the source of truth.  This Ledger
+    row is explicitly derived and projected so it can support governed packet
+    lookup while never independently corroborating or re-canonizing itself.
+    """
     if not canon_id or not subject_key or not predicate_key:
-        return skipped_result(guild_id=guild_id, source_table="approved_canon", source_row_id=canon_id or "", reason_code="missing_canon_source_identity")
-    return insert_ledger_entry(conn, LedgerEntry(guild_id=guild_id, source_table="approved_canon", source_row_id=canon_id, source_revision=str(canon_id), source_role="approved_canon", entry_type="canon_reference", subject_key=subject_key, subject_display_name=subject_display_name, predicate_key=predicate_key, value=(value or "")[:500], source_class=SourceClass.APPROVED_CANON, route_mode="approved_canon", channel_policy="reference_canon", visibility=Visibility.REFERENCE_CANON, confidence=Confidence.APPROVED, public_usable=True, observed_at=observed_at or _now(), lifecycle_status=ACTIVE_LIFECYCLE))
+        return skipped_result(guild_id=guild_id, source_table="canon_claim_projection", source_row_id=canon_id or "", reason_code="missing_canon_source_identity")
+    roots = tuple(
+        sorted(
+            {
+                str(entry_id or "").strip()
+                for entry_id in root_entry_ids
+                if str(entry_id or "").strip()
+            }
+        )
+    )
+    revision = str(revision_id or canon_id)
+    return insert_ledger_entry(
+        conn,
+        LedgerEntry(
+            guild_id=guild_id,
+            source_table="canon_claim_projection",
+            source_row_id=canon_id,
+            source_revision=revision,
+            source_event_key="revision:%s" % revision,
+            source_role="canon_projection",
+            entry_type="canon_reference",
+            subject_key=subject_key,
+            subject_display_name=subject_display_name,
+            predicate_key=predicate_key,
+            value=(value or "")[:500],
+            source_class=SourceClass.APPROVED_CANON,
+            route_mode="approved_canon",
+            channel_policy="reference_canon",
+            visibility=Visibility.REFERENCE_CANON,
+            confidence=Confidence.APPROVED,
+            public_usable=True,
+            derived=True,
+            projection=True,
+            observed_at=observed_at or _now(),
+            lifecycle_status=ACTIVE_LIFECYCLE,
+            lineage=tuple(("derived_from", entry_id) for entry_id in roots),
+        ),
+    )
 
 
 def build_memory_ledger_evaluation(

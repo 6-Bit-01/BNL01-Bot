@@ -240,16 +240,22 @@ class AtomicKnowledgeLifecycleTests(unittest.TestCase):
         self.assertTrue(first)
 
     def test_authority_can_establish_but_confidence_cannot_create_authority(self):
-        approved_root = ledger.shadow_canon_reference(
-            self.conn,
-            canon_id="lifecycle-canon",
-            guild_id=1,
+        approved_root = self.add_root(
+            90,
             subject_key=ledger.BNL_SUBJECT_KEY,
-            subject_display_name="BNL-01",
+            entry_type="canon_reference",
             predicate_key="roles",
             value="BNL is the Network continuity layer.",
+            source_class=SourceClass.APPROVED_CANON,
+            source_role="approved_canon_source",
+            visibility=Visibility.REFERENCE_CANON,
+            confidence=Confidence.APPROVED,
+            route_mode="approved_canon",
+            channel_policy="reference_canon",
+            participants=(),
+            source_table="approved_canon_registry",
             observed_at="2026-07-25T00:00:05+00:00",
-        ).entry_id
+        )
         approved = ledger.form_atomic_candidate_from_ledger_entry(
             self.conn,
             approved_root,
