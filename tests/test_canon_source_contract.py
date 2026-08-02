@@ -90,6 +90,15 @@ class CanonSourceContractTests(unittest.TestCase):
             c.matching_canon_member_identities(("Mac Modem Fan",)),
             (),
         )
+        self.assertEqual(
+            c.matching_canon_member_identities(("Call'em Bini",)),
+            (),
+        )
+        self.assertEqual(
+            c.matching_canon_entity_identities(("Call'em Bini",)),
+            (c.CALLEM_BINI,),
+        )
+        self.assertNotIn("Call'em Bini", c.CACHE_BACK.aliases)
         prompt_block = c.render_key_personnel_canon_block()
         self.assertIn("Mac Modem", prompt_block)
         self.assertIn("DJ Floppydisc", prompt_block)

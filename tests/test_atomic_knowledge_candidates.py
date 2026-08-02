@@ -170,16 +170,21 @@ class AtomicKnowledgeCandidateTests(unittest.TestCase):
             source_class=SourceClass.PUBLIC_OBSERVATION,
             source_role="user",
         )
-        bnl_role_root = ledger.shadow_canon_reference(
-            self.conn,
-            canon_id="b001",
-            guild_id=1,
+        bnl_role_root = self.add_root(
+            90,
             subject_key=ledger.BNL_SUBJECT_KEY,
-            subject_display_name="BNL-01",
+            entry_type="canon_reference",
             predicate_key="roles",
             value="BNL-01 is the Network's memory and continuity layer.",
-            observed_at="2026-07-25T00:00:05+00:00",
-        ).entry_id
+            source_class=SourceClass.APPROVED_CANON,
+            source_role="approved_canon_source",
+            route_mode="approved_canon",
+            channel_policy="reference_canon",
+            visibility=Visibility.REFERENCE_CANON,
+            confidence=Confidence.APPROVED,
+            participants=(),
+            source_table="approved_canon_registry",
+        )
 
         results = [
             ledger.form_atomic_candidate_from_ledger_entry(

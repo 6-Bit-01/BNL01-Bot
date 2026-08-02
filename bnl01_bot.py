@@ -18,6 +18,7 @@ from typing import Any, Awaitable, Callable, Mapping, Union
 
 from bnl_canon_source_contract import (
     CANON_SOURCE_CONTRACT_VERSION,
+    build_claim_contract_inventory,
     diagnostics as canon_source_diagnostics,
     queue_usability,
     render_concise_public_schedule,
@@ -36652,9 +36653,23 @@ def _collect_bnl_memory_diagnostic_data(
         get_member_activity_event_counts(guild_id)
     )
     shadow_acceptance = None
+    claim_contract_inventory = {
+        "claimContractVersion": "unavailable",
+        "mutationCount": 0,
+    }
     try:
         diagnostic_conn = sqlite3.connect(DB_FILE)
         try:
+            try:
+                claim_contract_inventory = build_claim_contract_inventory(
+                    diagnostic_conn,
+                    guild_id=guild_id,
+                )
+            except Exception as exc:
+                logging.debug(
+                    "hybrid_claim_inventory_failed error=%s",
+                    exc,
+                )
             shadow_acceptance = build_v2_shadow_acceptance_snapshot(
                 diagnostic_conn,
                 guild_id=guild_id,
@@ -36698,6 +36713,7 @@ def _collect_bnl_memory_diagnostic_data(
         recent_member_events_count_7d,
         shadow_acceptance,
         ledger_diag,
+        claim_contract_inventory,
     )
 
 
@@ -37543,6 +37559,7 @@ async def bnl_memory_check(interaction: discord.Interaction):
             recent_member_events_count_7d,
             shadow_acceptance,
             ledger_diag,
+            claim_contract_inventory,
         ) = await asyncio.to_thread(
             _collect_bnl_memory_diagnostic_data,
             guild_id=guild.id,
@@ -37575,6 +37592,24 @@ async def bnl_memory_check(interaction: discord.Interaction):
         f"- read_model_cache_age_seconds: `{read_model_diag.get('cache_age_seconds') if read_model_diag.get('cache_age_seconds') is not None else 'none'}`",
         f"- read_model_last_section_counts: `{read_model_diag.get('last_section_counts') or {}}`",
         f"- canon_source_contract: `{(read_model_diag.get('canon_source_contract') or {}).get('contractVersion')}`",
+        f"- hybrid_claim_contract: `{claim_contract_inventory.get('claimContractVersion')}`",
+        f"- hybrid_claim_source_rows: `{claim_contract_inventory.get('sourceRows') or {}}`",
+        f"- hybrid_claim_inspected_rows: `{claim_contract_inventory.get('inspectedRows') or {}}`",
+        f"- hybrid_claim_adapted_rows: `{claim_contract_inventory.get('adaptedRows') or {}}`",
+        f"- hybrid_claim_review_only: `{claim_contract_inventory.get('reviewOnlyCount', 0)}`",
+        f"- hybrid_claim_reasons: `{claim_contract_inventory.get('reasonCounts') or {}}`",
+        f"- hybrid_claim_identity_label_collisions: `{claim_contract_inventory.get('identityLabelCollisionCount', 0)}`",
+        f"- hybrid_claim_account_binding_collisions: `{claim_contract_inventory.get('identityBindingCollisionCount', 0)}`",
+        f"- hybrid_claim_callem_cache_collisions: `{claim_contract_inventory.get('callemCacheIdentityCollisionCount', 0)}`",
+        f"- hybrid_claim_id_collisions: `{claim_contract_inventory.get('claimIdCollisionCount', 0)}`",
+        f"- hybrid_claim_revision_collisions: `{claim_contract_inventory.get('revisionIdCollisionCount', 0)}`",
+        f"- hybrid_claim_revision_digest_mismatches: `{claim_contract_inventory.get('revisionDigestMismatchCount', 0)}`",
+        f"- hybrid_claim_nonopaque_authority_actors: `{claim_contract_inventory.get('nonOpaqueAuthorityActorCount', 0)}`",
+        f"- hybrid_claim_nonopaque_binding_actors: `{claim_contract_inventory.get('nonOpaqueBindingActorCount', 0)}`",
+        f"- hybrid_claim_truncated_sources: `{claim_contract_inventory.get('truncatedSources') or ()}`",
+        f"- hybrid_claim_reconciliation_status: `{claim_contract_inventory.get('sourceReconciliationStatus')}`",
+        f"- hybrid_claim_source_reconciled: `{'yes' if claim_contract_inventory.get('sourceAdaptedReconciled') else 'no'}`",
+        f"- hybrid_claim_mutation_count: `{claim_contract_inventory.get('mutationCount', 0)}`",
         f"- conversation_context_contract: `{LAST_CONVERSATION_CONTEXT_V2_DIAGNOSTICS.get('contract_version')}`",
         f"- conversation_context_enabled: `{'yes' if conversation_context_v2_enabled() else 'no'}`",
         f"- conversation_context_last_route_mode: `{LAST_CONVERSATION_CONTEXT_V2_DIAGNOSTICS.get('route_mode')}`",
