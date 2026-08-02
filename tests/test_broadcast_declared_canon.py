@@ -17,6 +17,9 @@ class BroadcastDeclaredCanonTests(unittest.TestCase):
             {
                 "BNL_OWNER_USER_ID": "61",
                 "BNL_PRIMARY_GUILD_ID": "7",
+                "BNL_DECLARED_CANON_AUTHORITY_SECRET": (
+                    "declared-canon-test-signing-secret-0001"
+                ),
             },
         )
         self.env.start()
@@ -792,18 +795,23 @@ class BroadcastDeclaredCanonTests(unittest.TestCase):
             "WHERE revision_id=?",
             (revision.revision_id,),
         )
+        self.conn.execute(
+            declared._DECLARED_CANON_TRIGGER_DDL[
+                "trg_declared_canon_revisions_no_update"
+            ]
+        )
         self.conn.commit()
-        preview = declared.preview_historical_broadcast_memory(
-            self.conn,
-            actor_user_id=61,
-            authority_nonce="forged-preview1",
-            guild_id=7,
-            now="2026-08-01T04:00:00+00:00",
-        )
-        self.assertEqual(preview.items[0].disposition, "stale_classification_review")
-        self.assertIn(
-            "classification_authority_invalid", preview.items[0].reason_codes
-        )
+        declared._require_schema(self.conn)
+        with self.assertRaisesRegex(
+            declared.DeclaredCanonError, "stored_authority_invalid"
+        ):
+            declared.preview_historical_broadcast_memory(
+                self.conn,
+                actor_user_id=61,
+                authority_nonce="forged-preview1",
+                guild_id=7,
+                now="2026-08-01T04:00:00+00:00",
+            )
         with self.assertRaisesRegex(
             declared.DeclaredCanonError, "stored_authority_invalid"
         ):
@@ -817,6 +825,47 @@ class BroadcastDeclaredCanonTests(unittest.TestCase):
                 expected_source_fingerprint=revision.source_fingerprint,
                 now="2026-08-01T04:00:00+00:00",
             )
+
+    def test_temp_broadcast_table_cannot_shadow_terminal_main_source(self):
+        row_id = self.insert_broadcast(public_safe=1, usage_scope="ambient,direct")
+        revision = self.classify(
+            row_id,
+            nonce="temp-broadcast1",
+            visibility="public_safe",
+            eligible_routes=("public_home",),
+        ).primary
+        self.conn.execute(
+            "CREATE TEMP TABLE broadcast_memory AS "
+            "SELECT * FROM main.broadcast_memory WHERE id=?",
+            (row_id,),
+        )
+        self.conn.execute(
+            "UPDATE main.broadcast_memory SET status='resolved',public_safe=0,"
+            "usage_scope='internal',updated_at=? WHERE id=?",
+            ("2026-08-01T05:00:00+00:00", row_id),
+        )
+        self.conn.commit()
+        with self.assertRaisesRegex(
+            declared.DeclaredCanonError, "expected_source_fingerprint_mismatch"
+        ):
+            declared.validate_current_declared_canon_revision(
+                self.conn,
+                actor_user_id=61,
+                authority_nonce="temp-broadcast2",
+                guild_id=7,
+                declaration_id=revision.declaration_id,
+                expected_revision_id=revision.revision_id,
+                expected_source_fingerprint=revision.source_fingerprint,
+                now="2026-08-01T06:00:00+00:00",
+            )
+        preview = declared.preview_historical_broadcast_memory(
+            self.conn,
+            actor_user_id=61,
+            authority_nonce="temp-broadcast3",
+            guild_id=7,
+            now="2026-08-01T06:00:00+00:00",
+        )
+        self.assertEqual(preview.items[0].source_fingerprint_state, "stale_or_unversioned")
 
     def test_no_projection_or_derived_classification_api_exists(self):
         signature = inspect.signature(declared.classify_broadcast_memory)

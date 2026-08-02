@@ -34,15 +34,21 @@ All preview and mutation APIs independently require:
 - an internally issued, versioned receipt bound to the exact operation,
   target, expected snapshot, payload, and Discord-message nonce.
 
-No Declared Canon signing key or secret environment variable exists. Under the
-trusted application-and-database threat model, the core deterministically
-issues the receipt itself after authenticating the configured owner and guild;
-no public API accepts a caller-built authority or receipt. The visible receipt
-version commits to actor, guild, operation, nonce, normalized request, and the
-complete immutable stored revision. Validators recompute both that receipt and
-the revision ID before admitting a row. This detects accidental or partial row
-tampering but does not claim to defend against an attacker who can both rewrite
-the trusted database and execute trusted application code.
+`BNL_DECLARED_CANON_AUTHORITY_SECRET` is a dedicated signing secret and must
+contain at least 32 UTF-8 bytes. The core uses HMAC-SHA-256 to authenticate both
+the normalized owner request and the complete immutable stored revision. No
+public API accepts a caller-built authority, receipt, or signing key. A missing
+or short secret fails before a write; changing the secret makes every existing
+receipt invalid and blocks reads and mutations until an explicit, reviewed
+rotation/migration restores one coherent signing epoch. Rotation is never
+silently accepted as new authority.
+
+The visible receipt version commits to actor, primary guild, operation, nonce,
+normalized request, and every stored revision field except its self-referential
+receipt and revision ID. Validators recompute the HMAC and revision ID before
+admitting a row and compare the integrity values in constant time. Stored rows
+must still name the currently configured owner and current primary guild; a
+historically valid receipt from different runtime authority does not qualify.
 
 The Discord route is a first boundary, not the only boundary. A direct helper
 call with missing, mismatched, cross-guild, malformed, or stale authority fails
@@ -53,6 +59,39 @@ exact current revision ID. Broadcast classifications require both the exact
 current declaration revision (when reclassifying) and a fingerprint of the
 approved source snapshot. Operation nonces are idempotent only for an exact
 request; reusing one with a changed binding fails closed.
+
+## Schema and chain integrity
+
+All authoritative table lookups, reads, and writes are explicitly qualified to
+SQLite's `main` schema. A same-named TEMP table therefore cannot shadow an older
+Declared Canon head or an older Broadcast source row. Every write verifies the
+schema after `BEGIN IMMEDIATE` has acquired the write boundary; every exported
+read and preview verifies it inside one pinned read snapshot.
+
+Schema creation is one-time and exact. If `declared_canon_revisions` already
+exists, initialization validates the complete table definition, primary and
+unique constraints, named indexes, and the exact append-only triggers. A
+missing, extra, or same-name-but-altered trigger, weakened constraint, changed
+column, or unexpected index fails with a schema-integrity error. Initialization
+does not repair, recreate, or normalize a damaged existing authority schema.
+
+The insert-conflict, no-update, and no-delete triggers cover ordinary SQL and
+SQLite conflict forms including `REPLACE`, `INSERT OR REPLACE`,
+`UPDATE OR REPLACE`, and UPSERT against either the primary key or composite
+unique constraints. Each trusted head is also derived only after validating the
+complete ordered chain: revision numbers must be contiguous from one, every
+`previous_revision_id` must name the immediately prior authenticated revision,
+source identity must remain stable, and every row must pass its contract and
+HMAC checks. Internal inventory code may perform this check inside its existing
+read transaction without minting a synthetic owner request.
+
+This design cannot, by itself, prove that an attacker with arbitrary write and
+DDL access to the same SQLite file did not delete the newest signed rows and
+then restore the exact expected schema. Detecting that perfect whole-file
+rollback requires a trusted monotonic head or signed checkpoint stored outside
+the database. The lifecycle therefore detects damaged schema, row tampering,
+and broken/missing middle links, but does not claim external rollback
+attestation that PR 2 does not own.
 
 Exported current/latest validators hold one coherent SQLite read snapshot for
 their complete revision-and-source validation sequence. They open and close a
@@ -106,6 +145,10 @@ bounded page is a global aggregate. Malformed historical timestamps or
 submitter identifiers remain reviewable as reason-coded, unknown provenance
 instead of aborting the preview.
 
+If a Declared Canon table is present, the preview first authenticates its exact
+schema and every complete declaration chain. Corrupt sidecar authority aborts
+the preview rather than being displayed as a merely stale classification.
+
 Applying any historical classification or subject link remains a separate
 owner-approved data operation. PR 2 creates no backfill and runs no such write.
 
@@ -114,29 +157,38 @@ owner-approved data operation. PR 2 creates no backfill and runs no such write.
 New Broadcast primary projections are derived from an exact source row inside
 the source write transaction. Resolve, clear, and replacement transitions
 re-read the exact owner/guild/status/update/supersession snapshot and retract
-every still-effective Ledger primary for that exact source row in the same
-transaction. A missing primary is safe because there is no Ledger
-representation to invalidate. If an older defect left duplicate primaries,
-the status event must retract the complete pre-write set or the source
-transition rolls back; it never chooses one as more authoritative. New primary
-creation remains strict at exactly one. A disabled shadow flag therefore
-cannot strand an already-written active primary, and a skipped, conflicting,
-or failed required projection rolls back the Broadcast source transition.
+every still-effective Ledger representation for that source row in the same
+transaction: all primary roots, every Declared projection derived from those
+roots, and an orphaned Declared projection still linked by the authoritative
+sidecar. A missing primary is safe only when no other effective representation
+exists. If an older defect left duplicates, multiplicity is diagnostic rather
+than a reason to choose one or skip invalidation; the complete pre-write set
+must be retracted or the source transition rolls back. Exact terminal-event
+retries may add missing lineage only after the complete stored event and
+participant set match. New primary creation remains strict at exactly one. A
+disabled shadow flag therefore cannot strand an already-written
+representation, and a skipped, conflicting, or failed required projection
+rolls back the Broadcast source transition.
 
 ## Non-live boundary
 
-Declared claim adapters remain read models. New Ledger projections are always:
+Declared claim adapters remain read models. New Ledger projections always
+remain in the non-live review lane:
 
 - derived and projected;
 - internal;
-- review-only; and
 - `public_usable=0`.
+
+Established and contested projection rows use the `review_only` lifecycle.
+Resolved, retired, and superseded terminal projection rows retain the
+`resolved` lifecycle while remaining non-live.
 
 Their route and channel labels are both `declared_canon_review`, so no existing
 approved-canon or public-route selector can mistake the PR 2 shadow for live
-canon evidence. Corrections emit
-supersession lineage; contested, resolved, retired, and superseded revisions
-emit retraction lineage against the exact prior projection.
+canon evidence. Corrections supersede every effective older projection;
+contested, resolved, retired, and superseded revisions retract every effective
+older projection. Already-ineffective historical rows retain their existing
+lineage without a redundant edge.
 
 Existing Broadcast readers continue to use the mature `broadcast_memory`
 compatibility lane in PR 2. The new declaration view does not feed the unified
@@ -154,6 +206,15 @@ from natural language. Mutation replies contain only operation/declaration/
 revision IDs, lifecycle state, and shadow outcome; they never echo the raw
 declaration or Broadcast content.
 
+`broadcast-preview` is an aggregate, content-free diagnostic rather than an A5
+classification handoff. The dependency-free core computes per-row,
+receipt-scoped opaque `preview_item` values, but the Discord reply exposes only
+grouped counts and those values are intentionally neither stable nor resolvable
+back to a source row through the command surface. Any historical A5 write needs
+a later, separately owner-approved resolver or review manifest that binds an
+opaque selection to the exact row ID and source fingerprint inside one reviewed
+snapshot. PR 2 does not expose raw row IDs/fingerprints or create that workflow.
+
 Control-shaped messages are dispatched from the original Discord payload
 before mention/whitespace normalization, direct-conversation ingress, room
 context, batching, or other conversational sinks. This preserves exact JSON
@@ -163,5 +224,7 @@ prompts.
 
 No environment gate, deployment state, website authority, delegated steward
 power, historical classification, or live response behavior is changed by
-this lifecycle contract. It introduces no credential, environment variable,
-or deployment prerequisite.
+this lifecycle contract. The new authority secret is code-level configuration
+only in this PR: it is not generated, deployed, rotated, or written to any
+repository file. Provisioning it is a separate deployment operation that must
+occur before the owner command surface can be enabled.

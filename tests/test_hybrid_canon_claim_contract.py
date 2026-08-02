@@ -13,6 +13,25 @@ import bnl_unified_intelligence_packet as packet
 
 
 class HybridCanonClaimContractTests(unittest.TestCase):
+    def setUp(self):
+        self._authority_secret = os.environ.get(
+            declared_canon.DECLARED_CANON_AUTHORITY_SECRET_ENV
+        )
+        os.environ[
+            declared_canon.DECLARED_CANON_AUTHORITY_SECRET_ENV
+        ] = "hybrid-contract-test-authority-secret-0001"
+
+    def tearDown(self):
+        if self._authority_secret is None:
+            os.environ.pop(
+                declared_canon.DECLARED_CANON_AUTHORITY_SECRET_ENV,
+                None,
+            )
+        else:
+            os.environ[
+                declared_canon.DECLARED_CANON_AUTHORITY_SECRET_ENV
+            ] = self._authority_secret
+
     def create_pr2_broadcast_table(self, conn):
         conn.execute(
             """
@@ -75,7 +94,7 @@ class HybridCanonClaimContractTests(unittest.TestCase):
                 7,
                 "2026-08-01",
                 61,
-                "Owner Fixture",
+                "6 Bit",
                 raw,
                 cleaned,
                 entry_type,

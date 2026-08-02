@@ -35,6 +35,9 @@ class DeclaredCanonLifecycleTests(unittest.TestCase):
             {
                 "BNL_OWNER_USER_ID": "61",
                 "BNL_PRIMARY_GUILD_ID": "7",
+                "BNL_DECLARED_CANON_AUTHORITY_SECRET": (
+                    "declared-canon-test-signing-secret-0001"
+                ),
             },
         )
         self.env.start()
@@ -104,6 +107,95 @@ class DeclaredCanonLifecycleTests(unittest.TestCase):
         )
         self.assertEqual(stored, [(created.cleaned_summary,)])
 
+    def test_all_sqlite_replace_and_upsert_forms_are_blocked(self):
+        created = self.add("replace-matrix1").primary
+        replacement = asdict(created)
+        replacement["cleaned_summary"] = "REPLACED HISTORY"
+        columns = ",".join(declared._REVISION_COLUMNS)
+        placeholders = ",".join("?" for _ in declared._REVISION_COLUMNS)
+        values = tuple(replacement[column] for column in declared._REVISION_COLUMNS)
+        statements = (
+            ("REPLACE INTO main.declared_canon_revisions (%s) VALUES (%s)" % (
+                columns, placeholders
+            ), values, "declared_canon_append_only_conflict"),
+            ("INSERT OR REPLACE INTO main.declared_canon_revisions (%s) VALUES (%s)" % (
+                columns, placeholders
+            ), values, "declared_canon_append_only_conflict"),
+            ("INSERT INTO main.declared_canon_revisions (%s) VALUES (%s) "
+             "ON CONFLICT(revision_id) DO UPDATE SET "
+             "cleaned_summary=excluded.cleaned_summary" % (columns, placeholders),
+             values, "declared_canon_append_only_conflict"),
+            ("INSERT INTO main.declared_canon_revisions (%s) VALUES (%s) "
+             "ON CONFLICT(guild_id,declaration_id,revision_number) DO UPDATE SET "
+             "cleaned_summary=excluded.cleaned_summary" % (columns, placeholders),
+             values, "declared_canon_append_only_conflict"),
+            ("INSERT INTO main.declared_canon_revisions (%s) VALUES (%s) "
+             "ON CONFLICT(guild_id,declaration_id,operation_id) DO UPDATE SET "
+             "cleaned_summary=excluded.cleaned_summary" % (columns, placeholders),
+             values, "declared_canon_append_only_conflict"),
+            ("UPDATE OR REPLACE main.declared_canon_revisions "
+             "SET cleaned_summary=? WHERE revision_id=?",
+             ("REPLACED HISTORY", created.revision_id),
+             "declared_canon_append_only_update"),
+        )
+        for statement, params, error in statements:
+            with self.subTest(statement=statement.split(" ", 3)[:3]):
+                with self.assertRaisesRegex(sqlite3.IntegrityError, error):
+                    self.conn.execute(statement, params)
+                self.conn.rollback()
+                stored = self.conn.execute(
+                    "SELECT cleaned_summary FROM main.declared_canon_revisions "
+                    "WHERE revision_id=?",
+                    (created.revision_id,),
+                ).fetchone()
+                self.assertEqual(stored, (created.cleaned_summary,))
+
+    def test_existing_damaged_schema_is_rejected_without_auto_healing(self):
+        trigger_name = "trg_declared_canon_revisions_no_delete"
+        self.conn.execute("DROP TRIGGER main.%s" % trigger_name)
+        self.conn.commit()
+        with self.assertRaisesRegex(
+            declared.DeclaredCanonError, "declared_canon_schema_integrity_invalid"
+        ):
+            declared.ensure_declared_canon_schema(self.conn)
+        self.assertIsNone(
+            self.conn.execute(
+                "SELECT 1 FROM main.sqlite_master WHERE type='trigger' AND name=?",
+                (trigger_name,),
+            ).fetchone()
+        )
+
+        self.conn.execute(
+            "CREATE TRIGGER main.%s BEFORE DELETE ON declared_canon_revisions "
+            "BEGIN SELECT 1; END" % trigger_name
+        )
+        self.conn.commit()
+        with self.assertRaisesRegex(
+            declared.DeclaredCanonError, "declared_canon_schema_integrity_invalid"
+        ):
+            declared.ensure_declared_canon_schema(self.conn)
+
+        malformed = sqlite3.connect(":memory:")
+        try:
+            malformed.execute(
+                "CREATE TABLE declared_canon_revisions (%s)"
+                % ",".join("%s TEXT" % column for column in declared._REVISION_COLUMNS)
+            )
+            malformed.commit()
+            with self.assertRaisesRegex(
+                declared.DeclaredCanonError,
+                "declared_canon_schema_integrity_invalid",
+            ):
+                declared.ensure_declared_canon_schema(malformed)
+            self.assertEqual(
+                malformed.execute(
+                    "SELECT COUNT(*) FROM main.sqlite_master WHERE type='trigger'"
+                ).fetchone()[0],
+                0,
+            )
+        finally:
+            malformed.close()
+
     def test_public_apis_accept_no_caller_built_owner_or_receipt(self):
         signature = inspect.signature(declared.add_declared_canon)
         self.assertNotIn("authority", signature.parameters)
@@ -150,6 +242,10 @@ class DeclaredCanonLifecycleTests(unittest.TestCase):
         finally:
             no_schema.close()
 
+        created = self.add("guild-binding01").primary
+        with mock.patch.dict(os.environ, {"BNL_PRIMARY_GUILD_ID": "8"}):
+            self.assertFalse(declared._stored_authority_valid(created))
+
     def test_add_separates_content_and_stores_bound_versioned_receipt(self):
         revision = self.add().primary
         self.assertEqual(revision.revision_number, 1)
@@ -177,9 +273,15 @@ class DeclaredCanonLifecycleTests(unittest.TestCase):
         forged["operation_id"] = "op_" + "3" * 32
         forged["authority_request_fingerprint"] = "req_" + "4" * 48
         forged["authority_verified"] = 1
+        former_unkeyed_digest = declared._digest(
+            declared.INTERNAL_AUTHORITY_RECEIPT_VERSION,
+            declared.STORED_AUTHORITY_BINDING_VERSION,
+            *(forged[column] for column in declared._REVISION_COLUMNS
+              if column not in {"revision_id", "authority_receipt"}),
+        )
         forged["authority_receipt"] = (
             "owner_command:declared_canon_lifecycle_v1:"
-            "declared_canon_internal_receipt_v1:add:" + "5" * 64
+            "declared_canon_internal_receipt_v1:add:" + former_unkeyed_digest
         )
         forged["revision_id"] = "drev_" + declared._digest(
             *(forged[column] for column in declared._REVISION_COLUMNS
@@ -201,6 +303,46 @@ class DeclaredCanonLifecycleTests(unittest.TestCase):
                 self.conn,
                 actor_user_id=61,
                 authority_nonce="forge-validate1",
+                guild_id=7,
+                declaration_id=forged["declaration_id"],
+                expected_revision_id=forged["revision_id"],
+                expected_source_fingerprint=forged["source_fingerprint"],
+                now="2026-08-01T12:00:00+00:00",
+            )
+            declared.preview_declared_canon(
+                self.conn,
+                actor_user_id=61,
+                authority_nonce="transaction-prev1",
+                guild_id=7,
+            )
+
+    def test_copied_valid_receipt_cannot_authorize_changed_stored_fields(self):
+        created = self.add("copy-receipt01").primary
+        forged = asdict(created)
+        forged["declaration_id"] = "dcl_" + "9" * 32
+        forged["source_row_id"] = forged["declaration_id"]
+        forged["operation_id"] = "op_" + "a" * 32
+        forged["authority_request_fingerprint"] = "req_" + "b" * 48
+        forged["revision_id"] = "drev_" + declared._digest(
+            *(forged[column] for column in declared._REVISION_COLUMNS
+              if column != "revision_id")
+        )[:40]
+        self.conn.execute(
+            "INSERT INTO main.declared_canon_revisions (%s) VALUES (%s)"
+            % (
+                ",".join(declared._REVISION_COLUMNS),
+                ",".join("?" for _ in declared._REVISION_COLUMNS),
+            ),
+            tuple(forged[column] for column in declared._REVISION_COLUMNS),
+        )
+        self.conn.commit()
+        with self.assertRaisesRegex(
+            declared.DeclaredCanonError, "stored_authority_invalid"
+        ):
+            declared.validate_current_declared_canon_revision(
+                self.conn,
+                actor_user_id=61,
+                authority_nonce="copy-validate1",
                 guild_id=7,
                 declaration_id=forged["declaration_id"],
                 expected_revision_id=forged["revision_id"],
@@ -259,20 +401,55 @@ class DeclaredCanonLifecycleTests(unittest.TestCase):
             2,
         )
 
-    def test_receipts_require_no_secret_configuration(self):
-        created = self.add("no-secret-source1").primary
-        changed = declared.change_declared_canon_status(
-            self.conn,
-            actor_user_id=61,
-            authority_nonce="no-secret-status1",
-            guild_id=7,
-            declaration_id=created.declaration_id,
-            expected_revision_id=created.revision_id,
-            lifecycle_status="contested",
-        ).primary
-        self.assertEqual(changed.lifecycle_status, "contested")
+    def test_secret_configuration_and_rotation_fail_closed(self):
+        created = self.add("secret-source01").primary
         self.assertTrue(declared._stored_authority_valid(created))
-        self.assertTrue(declared._stored_authority_valid(changed))
+
+        before = self.conn.total_changes
+        with mock.patch.dict(
+            os.environ, {"BNL_DECLARED_CANON_AUTHORITY_SECRET": ""}
+        ):
+            with self.assertRaisesRegex(
+                declared.DeclaredCanonError,
+                "declared_canon_authority_secret_not_configured",
+            ):
+                self.add("missing-secret1")
+            self.assertFalse(declared._stored_authority_valid(created))
+        self.assertEqual(self.conn.total_changes, before)
+
+        with mock.patch.dict(
+            os.environ, {"BNL_DECLARED_CANON_AUTHORITY_SECRET": "too-short"}
+        ):
+            with self.assertRaisesRegex(
+                declared.DeclaredCanonError,
+                "declared_canon_authority_secret_invalid",
+            ):
+                self.add("short-secret01")
+            self.assertFalse(declared._stored_authority_valid(created))
+        self.assertEqual(self.conn.total_changes, before)
+
+        with mock.patch.dict(
+            os.environ,
+            {
+                "BNL_DECLARED_CANON_AUTHORITY_SECRET": (
+                    "rotated-declared-canon-test-secret-0002"
+                )
+            },
+        ):
+            self.assertFalse(declared._stored_authority_valid(created))
+            with self.assertRaisesRegex(
+                declared.DeclaredCanonError, "stored_authority_invalid"
+            ):
+                declared.change_declared_canon_status(
+                    self.conn,
+                    actor_user_id=61,
+                    authority_nonce="rotated-status1",
+                    guild_id=7,
+                    declaration_id=created.declaration_id,
+                    expected_revision_id=created.revision_id,
+                    lifecycle_status="contested",
+                )
+        self.assertEqual(self.conn.total_changes, before)
 
     def test_exact_retry_is_zero_write_and_changed_binding_rejects(self):
         first = self.add("idempotent-0001")
@@ -517,30 +694,31 @@ class DeclaredCanonLifecycleTests(unittest.TestCase):
         replacement = self.add(
             "atomic-new-001", subject_id="atomic_new"
         ).primary
-        self.conn.execute(
-            """
-            CREATE TRIGGER fail_old_supersede
-            BEFORE INSERT ON declared_canon_revisions
-            WHEN NEW.operation='supersede' AND NEW.declaration_id='%s'
-            BEGIN
-                SELECT RAISE(ABORT, 'forced_second_insert_failure');
-            END
-            """ % old.declaration_id
-        )
-        self.conn.commit()
-        with self.assertRaisesRegex(
-            sqlite3.IntegrityError, "forced_second_insert_failure"
+        real_insert = declared._insert_revision
+        inserts = {"count": 0}
+
+        def fail_second_insert(conn, payload):
+            inserts["count"] += 1
+            real_insert(conn, payload)
+            if inserts["count"] == 2:
+                raise sqlite3.IntegrityError("forced_second_insert_failure")
+
+        with mock.patch.object(
+            declared, "_insert_revision", side_effect=fail_second_insert
         ):
-            declared.supersede_declared_canon(
-                self.conn,
-                actor_user_id=61,
-                authority_nonce="atomic-super001",
-                guild_id=7,
-                declaration_id=old.declaration_id,
-                expected_revision_id=old.revision_id,
-                replacement_declaration_id=replacement.declaration_id,
-                expected_replacement_revision_id=replacement.revision_id,
-            )
+            with self.assertRaisesRegex(
+                sqlite3.IntegrityError, "forced_second_insert_failure"
+            ):
+                declared.supersede_declared_canon(
+                    self.conn,
+                    actor_user_id=61,
+                    authority_nonce="atomic-super001",
+                    guild_id=7,
+                    declaration_id=old.declaration_id,
+                    expected_revision_id=old.revision_id,
+                    replacement_declaration_id=replacement.declaration_id,
+                    expected_replacement_revision_id=replacement.revision_id,
+                )
         rows = self.rows(
             "SELECT declaration_id,revision_number,lifecycle_status "
             "FROM declared_canon_revisions ORDER BY rowid"
@@ -863,6 +1041,134 @@ class DeclaredCanonLifecycleTests(unittest.TestCase):
                     reader.rollback()
                 reader.close()
                 writer.close()
+
+    def test_temp_table_cannot_shadow_retired_main_head(self):
+        original = self.add("temp-shadow-add1").primary
+        retired = declared.retire_declared_canon(
+            self.conn,
+            actor_user_id=61,
+            authority_nonce="temp-shadow-ret1",
+            guild_id=7,
+            declaration_id=original.declaration_id,
+            expected_revision_id=original.revision_id,
+        ).primary
+        self.conn.execute(
+            "CREATE TEMP TABLE declared_canon_revisions AS "
+            "SELECT * FROM main.declared_canon_revisions "
+            "WHERE revision_id=?",
+            (original.revision_id,),
+        )
+        with self.assertRaisesRegex(
+            declared.DeclaredCanonError, "expected_revision_mismatch"
+        ):
+            declared.validate_current_declared_canon_revision(
+                self.conn,
+                actor_user_id=61,
+                authority_nonce="temp-shadow-read1",
+                guild_id=7,
+                declaration_id=original.declaration_id,
+                expected_revision_id=original.revision_id,
+                expected_source_fingerprint=original.source_fingerprint,
+            )
+        latest = declared.validate_latest_declared_canon_revision(
+            self.conn,
+            actor_user_id=61,
+            authority_nonce="temp-shadow-read2",
+            guild_id=7,
+            declaration_id=retired.declaration_id,
+            expected_revision_id=retired.revision_id,
+            expected_source_fingerprint=retired.source_fingerprint,
+            expected_lifecycle_status="retired",
+        )
+        self.assertEqual(latest.revision_id, retired.revision_id)
+
+    def test_complete_chain_validation_rejects_restored_schema_with_missing_middle(self):
+        original = self.add("chain-original1").primary
+        contested = declared.change_declared_canon_status(
+            self.conn,
+            actor_user_id=61,
+            authority_nonce="chain-status01",
+            guild_id=7,
+            declaration_id=original.declaration_id,
+            expected_revision_id=original.revision_id,
+            lifecycle_status="contested",
+        ).primary
+        resolved = declared.change_declared_canon_status(
+            self.conn,
+            actor_user_id=61,
+            authority_nonce="chain-status02",
+            guild_id=7,
+            declaration_id=original.declaration_id,
+            expected_revision_id=contested.revision_id,
+            lifecycle_status="resolved",
+        ).primary
+        trigger_name = "trg_declared_canon_revisions_no_delete"
+        self.conn.execute("DROP TRIGGER main.%s" % trigger_name)
+        self.conn.execute(
+            "DELETE FROM main.declared_canon_revisions WHERE revision_id=?",
+            (contested.revision_id,),
+        )
+        self.conn.execute(declared._DECLARED_CANON_TRIGGER_DDL[trigger_name])
+        self.conn.commit()
+        declared._require_schema(self.conn)
+        with self.assertRaisesRegex(
+            declared.DeclaredCanonError,
+            "declared_canon_revision_chain_invalid",
+        ):
+            declared.validate_latest_declared_canon_revision(
+                self.conn,
+                actor_user_id=61,
+                authority_nonce="chain-validate1",
+                guild_id=7,
+                declaration_id=resolved.declaration_id,
+                expected_revision_id=resolved.revision_id,
+                expected_source_fingerprint=resolved.source_fingerprint,
+                expected_lifecycle_status="resolved",
+            )
+
+    def test_internal_read_boundary_requires_snapshot_and_validates_all_chains(self):
+        created = self.add("read-boundary1").primary
+        with self.assertRaisesRegex(
+            declared.DeclaredCanonError,
+            "declared_canon_read_snapshot_required",
+        ):
+            declared.validate_declared_canon_read_boundary(self.conn, guild_id=7)
+        before = self.conn.total_changes
+        self.conn.execute("BEGIN")
+        try:
+            latest = declared.validate_declared_canon_read_boundary(
+                self.conn, guild_id=7
+            )
+            self.assertEqual(tuple(item.revision_id for item in latest), (
+                created.revision_id,
+            ))
+            self.assertTrue(self.conn.in_transaction)
+            self.assertEqual(self.conn.total_changes, before)
+        finally:
+            self.conn.rollback()
+
+    def test_schema_checks_run_inside_owned_write_and_read_transactions(self):
+        observed: list[bool] = []
+        real_require_schema = declared._require_schema
+
+        def checked(conn):
+            observed.append(bool(conn.in_transaction))
+            return real_require_schema(conn)
+
+        with mock.patch.object(declared, "_require_schema", side_effect=checked):
+            created = self.add("transaction-check1").primary
+            declared.validate_current_declared_canon_revision(
+                self.conn,
+                actor_user_id=61,
+                authority_nonce="transaction-read1",
+                guild_id=7,
+                declaration_id=created.declaration_id,
+                expected_revision_id=created.revision_id,
+                expected_source_fingerprint=created.source_fingerprint,
+                now="2026-08-01T12:00:00+00:00",
+            )
+        self.assertTrue(observed)
+        self.assertTrue(all(observed))
 
     def test_mutation_refuses_caller_owned_transaction(self):
         self.conn.execute("BEGIN")

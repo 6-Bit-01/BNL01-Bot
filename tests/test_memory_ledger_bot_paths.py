@@ -68,6 +68,41 @@ class MemoryLedgerBotPathTests(unittest.TestCase):
     def enable(self):
         os.environ["BNL_MEMORY_LEDGER_SHADOW_ENABLED"] = "1"
 
+    def add_declared_broadcast_projection(
+        self,
+        *,
+        memory_id,
+        root_entry_id,
+        suffix,
+    ):
+        with sqlite3.connect(bnl01_bot.DB_FILE) as conn:
+            result = ledger.insert_ledger_entry(
+                conn,
+                ledger.LedgerEntry(
+                    guild_id=1,
+                    source_table="declared_canon_projection",
+                    source_row_id="bot-declared-%s" % suffix,
+                    source_revision="bot-declared-revision-%s" % suffix,
+                    source_event_key="revision:bot-%s" % suffix,
+                    source_role="declared_canon_projection",
+                    entry_type="canon_reference",
+                    subject_key="broadcast:barcode_radio",
+                    predicate_key="broadcast_memory",
+                    value="Bot-path Declared Broadcast projection.",
+                    source_class=ledger.SourceClass.EVIDENCE_PROJECTION,
+                    visibility=ledger.Visibility.INTERNAL,
+                    confidence=ledger.Confidence.LOW,
+                    public_usable=False,
+                    derived=True,
+                    projection=True,
+                    observed_at="2026-08-01T00:00:00+00:00",
+                    lifecycle_status=ledger.REVIEW_ONLY_LIFECYCLE,
+                    lineage=(("derived_from", root_entry_id),),
+                ),
+            )
+            self.assertEqual(result.outcome, "inserted")
+            return result
+
     def test_group_model_reply_is_one_room_source_with_all_participants(self):
         self.enable()
 
@@ -1003,6 +1038,145 @@ class MemoryLedgerBotPathTests(unittest.TestCase):
                 )
             },
             primary_ids,
+        )
+
+    def test_broadcast_status_resolution_retracts_declared_projection_atomically(self):
+        self.enable()
+        memory_id = bnl01_bot.add_broadcast_memory_entry(
+            1,
+            _Message("RAW declared projection status note"),
+            {
+                "cleaned_summary": "Declared projection status fixture.",
+                "entry_type": "notable_moment",
+                "public_safe": True,
+                "usage_scope": "ambient,direct",
+            },
+        )
+        primary_id = self.rows(
+            """
+            SELECT entry_id FROM memory_ledger_entries
+            WHERE source_table='broadcast_memory'
+              AND source_role='broadcast_memory' AND source_row_id=?
+            """,
+            (str(memory_id),),
+        )[0][0]
+        projection = self.add_declared_broadcast_projection(
+            memory_id=memory_id,
+            root_entry_id=primary_id,
+            suffix="status-success",
+        )
+
+        self.assertEqual(
+            bnl01_bot._set_broadcast_memory_status(
+                1, memory_id, "resolved", 42, "6 Bit", "terminal correction"
+            ),
+            1,
+        )
+
+        status_entry = self.rows(
+            """
+            SELECT entry_id FROM memory_ledger_entries
+            WHERE source_table='broadcast_memory'
+              AND source_role='broadcast_memory_status' AND source_row_id=?
+            """,
+            (str(memory_id),),
+        )[0][0]
+        projection_status_entry = self.rows(
+            """
+            SELECT entry_id FROM memory_ledger_entries
+            WHERE source_table='broadcast_memory'
+              AND source_role='broadcast_memory_projection_status'
+              AND source_row_id=?
+            """,
+            (str(memory_id),),
+        )[0][0]
+        self.assertEqual(
+            self.rows(
+                """
+                SELECT lineage_type,target_entry_id
+                FROM memory_ledger_lineage WHERE entry_id=?
+                """,
+                (status_entry,),
+            ),
+            [("retracts", primary_id)],
+        )
+        self.assertEqual(
+            self.rows(
+                """
+                SELECT lineage_type,target_entry_id
+                FROM memory_ledger_lineage WHERE entry_id=?
+                """,
+                (projection_status_entry,),
+            ),
+            [("retracts", projection.entry_id)],
+        )
+
+    def test_broadcast_projection_retraction_failure_rolls_back_source_status(self):
+        self.enable()
+        memory_id = bnl01_bot.add_broadcast_memory_entry(
+            1,
+            _Message("RAW declared rollback status note"),
+            {
+                "cleaned_summary": "Declared rollback status fixture.",
+                "entry_type": "notable_moment",
+                "public_safe": True,
+                "usage_scope": "ambient,direct",
+            },
+        )
+        primary_id = self.rows(
+            """
+            SELECT entry_id FROM memory_ledger_entries
+            WHERE source_table='broadcast_memory'
+              AND source_role='broadcast_memory' AND source_row_id=?
+            """,
+            (str(memory_id),),
+        )[0][0]
+        projection = self.add_declared_broadcast_projection(
+            memory_id=memory_id,
+            root_entry_id=primary_id,
+            suffix="status-rollback",
+        )
+        with sqlite3.connect(bnl01_bot.DB_FILE) as conn:
+            conn.execute(
+                """
+                CREATE TRIGGER reject_bot_projection_retraction
+                BEFORE INSERT ON memory_ledger_lineage
+                WHEN NEW.lineage_type='retracts'
+                 AND NEW.target_entry_id='%s'
+                BEGIN
+                    SELECT RAISE(ABORT, 'bot projection retraction rejected');
+                END
+                """ % projection.entry_id
+            )
+
+        with self.assertRaisesRegex(
+            sqlite3.IntegrityError, "bot projection retraction rejected"
+        ):
+            bnl01_bot._set_broadcast_memory_status(
+                1, memory_id, "resolved", 42, "6 Bit", "must roll back"
+            )
+
+        self.assertEqual(
+            self.rows(
+                "SELECT status FROM broadcast_memory WHERE id=?",
+                (memory_id,),
+            ),
+            [("active",)],
+        )
+        self.assertEqual(
+            self.rows(
+                """
+                SELECT COUNT(*) FROM memory_ledger_entries
+                WHERE source_table='broadcast_memory'
+                  AND source_row_id=?
+                  AND source_role IN (
+                    'broadcast_memory_status',
+                    'broadcast_memory_projection_status'
+                  )
+                """,
+                (str(memory_id),),
+            ),
+            [(0,)],
         )
 
     def test_broadcast_status_resolution_cannot_rewrite_superseded_source(self):

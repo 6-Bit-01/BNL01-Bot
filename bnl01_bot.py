@@ -55,6 +55,7 @@ from bnl_memory_ledger import (
     conversation_motif_formation_enabled,
     current_bnl_self_name_records,
     ensure_memory_ledger_schema,
+    effective_broadcast_representations,
     form_atomic_candidate_from_ledger_entry,
     form_atomic_candidates_from_recurring_conversation,
     normalize_bnl_self_name,
@@ -9853,26 +9854,13 @@ def _shadow_declared_revision_after_owner_command(
             revision.source_system == DECLARED_BROADCAST_MEMORY_SOURCE
             and revision.lifecycle_status == "established"
         ):
-            rows = ledger_conn.execute(
-                """
-                SELECT entry_id
-                FROM memory_ledger_entries
-                WHERE guild_id=? AND source_table='broadcast_memory'
-                  AND source_row_id=? AND source_role='broadcast_memory'
-                  AND lifecycle_status='active'
-                  AND NOT EXISTS (
-                      SELECT 1
-                      FROM memory_ledger_lineage AS edge
-                      WHERE edge.guild_id=memory_ledger_entries.guild_id
-                        AND edge.target_entry_id=memory_ledger_entries.entry_id
-                        AND edge.lineage_type IN ('supersedes','retracts')
-                  )
-                ORDER BY created_at DESC
-                """,
-                (guild_id, revision.source_row_id),
-            ).fetchall()
-            if len(rows) == 1:
-                roots = (str(rows[0][0]),)
+            primary_ids = effective_broadcast_representations(
+                ledger_conn,
+                guild_id=guild_id,
+                source_row_id=revision.source_row_id,
+            ).primary_entry_ids
+            if len(primary_ids) == 1:
+                roots = primary_ids
         return shadow_declared_canon_projection(
             ledger_conn,
             guild_id=guild_id,
@@ -16729,7 +16717,7 @@ def _insert_broadcast_memory_row(
     cursor = conn.cursor()
     cursor.execute(
         """
-        INSERT INTO broadcast_memory (
+        INSERT INTO main.broadcast_memory (
             guild_id, episode_date, submitted_by_user_id, submitted_by_name, raw_note,
             cleaned_summary, entry_type, importance, public_safe, affects_next_show,
             usage_scope, target_show_date, valid_until, override_span_count, needs_clarification,
@@ -16767,7 +16755,7 @@ def _insert_broadcast_memory_row(
         SELECT cleaned_summary, entry_type, public_safe, status, usage_scope,
                submitted_by_user_id, submitted_by_name, created_at, updated_at,
                supersedes_id
-        FROM broadcast_memory
+        FROM main.broadcast_memory
         WHERE guild_id=? AND id=?
         """,
         (int(guild_id), new_id),
@@ -16783,29 +16771,24 @@ def _broadcast_primary_projection_ids(
     guild_id: int,
     row_id: int,
 ) -> tuple[str, ...]:
-    if not conn.execute(
-        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='memory_ledger_entries'"
-    ).fetchone():
-        return ()
-    return tuple(
-        str(row[0])
-        for row in conn.execute(
-            """
-            SELECT entry_id
-            FROM memory_ledger_entries
-            WHERE guild_id=? AND source_table='broadcast_memory'
-              AND source_row_id=? AND source_role='broadcast_memory'
-              AND NOT EXISTS (
-                  SELECT 1 FROM memory_ledger_lineage l
-                  WHERE l.guild_id=memory_ledger_entries.guild_id
-                    AND l.target_entry_id=memory_ledger_entries.entry_id
-                    AND l.lineage_type IN ('supersedes','retracts')
-              )
-            ORDER BY entry_id
-            """,
-            (int(guild_id), str(int(row_id))),
-        ).fetchall()
-    )
+    return effective_broadcast_representations(
+        conn,
+        guild_id=int(guild_id),
+        source_row_id=int(row_id),
+    ).primary_entry_ids
+
+
+def _broadcast_effective_representation_ids(
+    conn: sqlite3.Connection,
+    *,
+    guild_id: int,
+    row_id: int,
+) -> tuple[str, ...]:
+    return effective_broadcast_representations(
+        conn,
+        guild_id=int(guild_id),
+        source_row_id=int(row_id),
+    ).all_entry_ids
 
 
 def _finalize_required_broadcast_shadow_in_transaction(
@@ -16898,7 +16881,7 @@ def _write_new_broadcast_primary_shadow_in_transaction(
         SELECT cleaned_summary,entry_type,public_safe,status,usage_scope,
                submitted_by_user_id,submitted_by_name,created_at,updated_at,
                supersedes_id
-        FROM broadcast_memory
+        FROM main.broadcast_memory
         WHERE guild_id=? AND id=?
         """,
         (int(guild_id), int(row_id)),
@@ -16963,15 +16946,15 @@ def _write_broadcast_status_shadow_in_transaction(
     require_configured_owner_mutation_actor(actor_id, guild_id)
     if not conn.in_transaction:
         raise RuntimeError("broadcast_shadow_transaction_required")
-    primary_ids = _broadcast_primary_projection_ids(
+    representation_ids = _broadcast_effective_representation_ids(
         conn,
         guild_id=int(guild_id),
         row_id=int(row_id),
     )
-    # With no primary Ledger representation there is no stale evidence to
+    # With no Ledger representation there is no stale evidence to
     # retract. The authoritative source transition may safely commit; a later
     # backfill will observe its terminal source state.
-    if not primary_ids and not required_for_source_transition:
+    if not representation_ids and not required_for_source_transition:
         return None
     result = shadow_broadcast_status_event(
         conn,
@@ -16988,20 +16971,12 @@ def _write_broadcast_status_shadow_in_transaction(
         writer="broadcast_memory_status",
         result=result,
     )
-    if primary_ids:
-        retracted_ids = {
-            str(row[0])
-            for row in conn.execute(
-                """
-                SELECT target_entry_id
-                FROM memory_ledger_lineage
-                WHERE entry_id=? AND lineage_type='retracts'
-                """,
-                (result.entry_id,),
-            ).fetchall()
-        }
-        if retracted_ids != set(primary_ids):
-            raise RuntimeError("broadcast_shadow_retraction_required")
+    if _broadcast_effective_representation_ids(
+        conn,
+        guild_id=int(guild_id),
+        row_id=int(row_id),
+    ):
+        raise RuntimeError("broadcast_shadow_retraction_required")
     return result
 
 
@@ -17468,7 +17443,7 @@ def clear_active_show_state_overrides(guild_id: int, actor_id: int):
             rows = conn.execute(
                 """
                 SELECT id
-                FROM broadcast_memory
+                FROM main.broadcast_memory
                 WHERE guild_id=? AND status='active'
                   AND superseded_by_id IS NULL
                   AND entry_type='show_state_override'
@@ -17478,7 +17453,7 @@ def clear_active_show_state_overrides(guild_id: int, actor_id: int):
             ).fetchall()
             cursor = conn.execute(
                 """
-                UPDATE broadcast_memory
+                UPDATE main.broadcast_memory
                 SET status='resolved', updated_at=?,
                     corrected_by_user_id=?, corrected_by_name=?,
                     correction_reason=?
@@ -17582,7 +17557,7 @@ def _set_broadcast_memory_status(
         with sqlite3.connect(DB_FILE, timeout=30) as conn:
             cursor = conn.execute(
                 """
-                UPDATE broadcast_memory
+                UPDATE main.broadcast_memory
                 SET status=?, updated_at=?, corrected_by_user_id=?, corrected_by_name=?, correction_reason=?
                 WHERE guild_id=? AND id=?
                   AND status='active' AND superseded_by_id IS NULL
@@ -17599,7 +17574,7 @@ def _set_broadcast_memory_status(
             )
             changed = cursor.rowcount
             row = conn.execute(
-                "SELECT guild_id, superseded_by_id FROM broadcast_memory WHERE guild_id=? AND id=?",
+                "SELECT guild_id, superseded_by_id FROM main.broadcast_memory WHERE guild_id=? AND id=?",
                 (int(guild_id), memory_id),
             ).fetchone()
             if changed and row:
@@ -17643,7 +17618,7 @@ def _replace_broadcast_memory_entry(
             target = conn.execute(
                 """
                 SELECT 1
-                FROM broadcast_memory
+                FROM main.broadcast_memory
                 WHERE guild_id=? AND id=? AND status='active'
                   AND superseded_by_id IS NULL
                 """,
@@ -17663,7 +17638,7 @@ def _replace_broadcast_memory_entry(
             )
             changed = conn.execute(
                 """
-                UPDATE broadcast_memory
+                UPDATE main.broadcast_memory
                 SET status='superseded', superseded_by_id=?, updated_at=?,
                     corrected_by_user_id=?, corrected_by_name=?, correction_reason=?
                 WHERE guild_id=? AND id=? AND status='active'
@@ -17681,7 +17656,7 @@ def _replace_broadcast_memory_entry(
             ).rowcount
             if int(changed or 0) != 1:
                 raise RuntimeError("broadcast_replacement_lost_target")
-            existing_primary_ids = _broadcast_primary_projection_ids(
+            existing_representation_ids = _broadcast_effective_representation_ids(
                 conn,
                 guild_id=guild_id,
                 row_id=memory_id,
@@ -17692,7 +17667,7 @@ def _replace_broadcast_memory_entry(
                 row_id=new_id,
                 actor_id=actor_id,
                 expected_updated_at=str(committed[8] or now),
-                required_for_existing_lineage=bool(existing_primary_ids),
+                required_for_existing_lineage=bool(existing_representation_ids),
             )
             _write_broadcast_status_shadow_in_transaction(
                 conn,
@@ -17703,7 +17678,7 @@ def _replace_broadcast_memory_entry(
                 actor_id=actor_id,
                 actor_name=actor_name,
                 superseded_by_id=new_id,
-                required_for_source_transition=bool(existing_primary_ids),
+                required_for_source_transition=bool(existing_representation_ids),
             )
     return new_id
 
