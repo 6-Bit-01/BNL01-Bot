@@ -16,7 +16,7 @@ import bnl_declared_canon as declared
 class _Author:
     def __init__(self, user_id=61):
         self.id = user_id
-        self.display_name = "Owner" if user_id == 61 else "Other"
+        self.display_name = "6 Bit" if user_id == 61 else "Test Member"
 
 
 class _Guild:
@@ -57,6 +57,9 @@ class DeclaredCanonBotControlTests(unittest.TestCase):
             {
                 "BNL_OWNER_USER_ID": "61",
                 "BNL_PRIMARY_GUILD_ID": "7",
+                "BNL_DECLARED_CANON_AUTHORITY_SECRET": (
+                    "declared-canon-test-signing-secret-0001"
+                ),
                 "BNL_MEMORY_LEDGER_SHADOW_ENABLED": "1",
             },
             clear=False,
@@ -336,7 +339,7 @@ class DeclaredCanonBotControlTests(unittest.TestCase):
         )
 
     def test_on_message_preserves_raw_control_before_any_conversational_sink(self):
-        raw_declaration = "Owner keeps <@123>  and  exact spacing."
+        raw_declaration = "6 Bit keeps <@123>  and  exact spacing."
         payload = self.add_payload()
         payload["raw_declaration"] = raw_declaration
         command = "!bnl canon add " + json.dumps(payload)

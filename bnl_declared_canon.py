@@ -9,8 +9,8 @@ message/interaction object.  This dependency-free core cannot authenticate a
 network principal; it independently rechecks that opaque ID and the exact guild
 against ``BNL_OWNER_USER_ID`` and ``BNL_PRIMARY_GUILD_ID`` on every public read
 or mutation.  It accepts neither caller-built authority objects nor receipts.
-Receipts are deterministic integrity labels bound to the complete request and
-stored revision. They add no runtime secret or deployment prerequisite.
+Receipts are keyed integrity labels bound to the complete request and stored
+revision.  The signing secret is runtime configuration, never caller input.
 """
 from __future__ import annotations
 
@@ -18,6 +18,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
+import hmac
 import json
 import os
 import re
@@ -33,6 +34,9 @@ BROADCAST_DECLARED_CANON_OWNER_ERA_CUTOFF = "2026-07-23T19:16:22+00:00"
 BROADCAST_SOURCE_FINGERPRINT_VERSION = "broadcast_memory_complete_row_v2"
 INTERNAL_AUTHORITY_RECEIPT_VERSION = "declared_canon_internal_receipt_v1"
 STORED_AUTHORITY_BINDING_VERSION = "declared_canon_stored_payload_v1"
+DECLARED_CANON_AUTHORITY_SECRET_ENV = "BNL_DECLARED_CANON_AUTHORITY_SECRET"
+DECLARED_CANON_AUTHORITY_SECRET_MIN_BYTES = 32
+
 # These fields are the minimum recognized Broadcast schema, not a fingerprint
 # allowlist.  Every column returned by the authoritative source row, including
 # unknown/future columns, is included in the v2 fingerprint.  Adding a column
@@ -351,6 +355,111 @@ _REVISION_COLUMNS = (
     "created_at",
 )
 
+_DECLARED_CANON_TABLE_DDL = """
+CREATE TABLE IF NOT EXISTS main.declared_canon_revisions (
+    revision_id TEXT PRIMARY KEY,
+    declaration_id TEXT NOT NULL,
+    revision_number INTEGER NOT NULL CHECK(revision_number > 0),
+    guild_id INTEGER NOT NULL CHECK(guild_id > 0),
+    source_system TEXT NOT NULL,
+    source_row_id TEXT NOT NULL,
+    source_fingerprint TEXT NOT NULL,
+    operation TEXT NOT NULL,
+    operation_id TEXT NOT NULL,
+    operation_reason TEXT NOT NULL DEFAULT '',
+    classification_mode TEXT NOT NULL,
+    raw_declaration TEXT NOT NULL DEFAULT '',
+    cleaned_summary TEXT NOT NULL DEFAULT '',
+    subject_type TEXT NOT NULL,
+    subject_id TEXT NOT NULL,
+    object_subject_type TEXT NOT NULL DEFAULT '',
+    object_subject_id TEXT NOT NULL DEFAULT '',
+    predicate TEXT NOT NULL,
+    value_json TEXT NOT NULL DEFAULT '',
+    domain TEXT NOT NULL,
+    claim_kind TEXT NOT NULL,
+    visibility TEXT NOT NULL,
+    eligible_routes_json TEXT NOT NULL DEFAULT '[]',
+    valid_from TEXT NOT NULL DEFAULT '',
+    valid_until TEXT NOT NULL DEFAULT '',
+    lifecycle_status TEXT NOT NULL,
+    previous_revision_id TEXT NOT NULL DEFAULT '',
+    correction_of_revision_id TEXT NOT NULL DEFAULT '',
+    supersedes_declaration_id TEXT NOT NULL DEFAULT '',
+    superseded_by_declaration_id TEXT NOT NULL DEFAULT '',
+    derived_from_source_ref TEXT NOT NULL DEFAULT '',
+    authority_request_fingerprint TEXT NOT NULL,
+    authority_actor TEXT NOT NULL,
+    authority_receipt TEXT NOT NULL,
+    authority_verified INTEGER NOT NULL CHECK(authority_verified IN (0,1)),
+    contract_version TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE(guild_id, declaration_id, revision_number),
+    UNIQUE(guild_id, declaration_id, operation_id)
+)
+"""
+
+_DECLARED_CANON_INDEX_DDL = {
+    "idx_declared_canon_source": """
+        CREATE INDEX IF NOT EXISTS main.idx_declared_canon_source
+        ON declared_canon_revisions(
+            guild_id, source_system, source_row_id, revision_number
+        )
+    """,
+    "idx_declared_canon_subject": """
+        CREATE INDEX IF NOT EXISTS main.idx_declared_canon_subject
+        ON declared_canon_revisions(
+            guild_id, subject_type, subject_id, lifecycle_status
+        )
+    """,
+}
+
+_DECLARED_CANON_TRIGGER_DDL = {
+    "trg_declared_canon_revisions_no_conflicting_insert": """
+        CREATE TRIGGER IF NOT EXISTS main.trg_declared_canon_revisions_no_conflicting_insert
+        BEFORE INSERT ON declared_canon_revisions
+        WHEN EXISTS(
+            SELECT 1 FROM declared_canon_revisions existing
+            WHERE existing.revision_id=NEW.revision_id
+               OR (
+                   existing.guild_id=NEW.guild_id
+                   AND existing.declaration_id=NEW.declaration_id
+                   AND existing.revision_number=NEW.revision_number
+               )
+               OR (
+                   existing.guild_id=NEW.guild_id
+                   AND existing.declaration_id=NEW.declaration_id
+                   AND existing.operation_id=NEW.operation_id
+               )
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'declared_canon_append_only_conflict');
+        END
+    """,
+    "trg_declared_canon_revisions_no_update": """
+        CREATE TRIGGER IF NOT EXISTS main.trg_declared_canon_revisions_no_update
+        BEFORE UPDATE ON declared_canon_revisions
+        BEGIN
+            SELECT RAISE(ABORT, 'declared_canon_append_only_update');
+        END
+    """,
+    "trg_declared_canon_revisions_no_delete": """
+        CREATE TRIGGER IF NOT EXISTS main.trg_declared_canon_revisions_no_delete
+        BEFORE DELETE ON declared_canon_revisions
+        BEGIN
+            SELECT RAISE(ABORT, 'declared_canon_append_only_delete');
+        END
+    """,
+}
+
+_DECLARED_CANON_UNIQUE_COLUMN_SETS = frozenset(
+    {
+        ("revision_id",),
+        ("guild_id", "declaration_id", "revision_number"),
+        ("guild_id", "declaration_id", "operation_id"),
+    }
+)
+
 
 def _utc_now() -> str:
     # Broadcast intake stores microseconds. Keep equal precision so an
@@ -367,6 +476,29 @@ def _digest(*values: Any) -> str:
         default=str,
     ).encode("utf-8")
     return hashlib.sha256(payload).hexdigest()
+
+
+def _authority_secret() -> bytes:
+    """Load the dedicated authority key without accepting a caller override."""
+
+    raw = os.getenv(DECLARED_CANON_AUTHORITY_SECRET_ENV, "")
+    if not raw:
+        raise DeclaredCanonError("declared_canon_authority_secret_not_configured")
+    encoded = raw.encode("utf-8")
+    if len(encoded) < DECLARED_CANON_AUTHORITY_SECRET_MIN_BYTES:
+        raise DeclaredCanonError("declared_canon_authority_secret_invalid")
+    return encoded
+
+
+def _authority_hmac(*values: Any) -> str:
+    payload = json.dumps(
+        values,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    ).encode("utf-8")
+    return hmac.new(_authority_secret(), payload, hashlib.sha256).hexdigest()
 
 
 def _strict_bool(value: Any) -> bool:
@@ -423,9 +555,9 @@ def _authorize_request(
 
     Callers cannot supply a configured-owner value or a prebuilt receipt.  The
     actor is compared with ``BNL_OWNER_USER_ID`` at this boundary on every call.
-    No secret or caller-supplied receipt participates. The internally computed,
-    visibly versioned receipt commits to the operation, guild, actor, nonce,
-    target, expected revision/source fingerprint, and normalized payload.
+    No caller-supplied secret or receipt participates. The internally computed,
+    keyed and visibly versioned receipt commits to the operation, guild, actor,
+    nonce, target, expected revision/source fingerprint, and normalized payload.
     """
 
     normalized_operation = str(operation or "").strip().casefold()
@@ -450,7 +582,7 @@ def _authorize_request(
         actor,
         nonce,
     )[:32]
-    receipt_digest = _digest(
+    receipt_digest = _authority_hmac(
         INTERNAL_AUTHORITY_RECEIPT_VERSION,
         "request_authority",
         DECLARED_CANON_CONTRACT_VERSION,
@@ -481,9 +613,11 @@ def _authorize_request(
 
 
 def _table_exists(conn: sqlite3.Connection, table_name: str) -> bool:
+    if table_name not in {DECLARED_CANON_TABLE, BROADCAST_MEMORY_SOURCE}:
+        raise DeclaredCanonError("invalid_main_table_identifier")
     return bool(
         conn.execute(
-            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+            "SELECT 1 FROM main.sqlite_master WHERE type='table' AND name=?",
             (str(table_name or ""),),
         ).fetchone()
     )
@@ -492,7 +626,38 @@ def _table_exists(conn: sqlite3.Connection, table_name: str) -> bool:
 def _table_columns(conn: sqlite3.Connection, table_name: str) -> tuple[str, ...]:
     if not _table_exists(conn, table_name):
         return ()
-    return tuple(str(row[1]) for row in conn.execute("PRAGMA table_info(%s)" % table_name))
+    return tuple(
+        str(row[1])
+        for row in conn.execute("PRAGMA main.table_info(%s)" % table_name)
+    )
+
+
+def _normalized_schema_sql(value: Any) -> str:
+    normalized = " ".join(str(value or "").strip().casefold().split())
+    normalized = normalized.replace(" if not exists ", " ")
+    normalized = normalized.replace("main.", "")
+    return normalized.rstrip(";")
+
+
+def _main_schema_sql(
+    conn: sqlite3.Connection, *, object_type: str, name: str
+) -> str:
+    row = conn.execute(
+        "SELECT sql FROM main.sqlite_master WHERE type=? AND name=?",
+        (str(object_type), str(name)),
+    ).fetchone()
+    return str(row[0] or "") if row else ""
+
+
+def _main_index_columns(
+    conn: sqlite3.Connection, index_name: str
+) -> tuple[str, ...]:
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", str(index_name or "")):
+        raise DeclaredCanonError("declared_canon_schema_integrity_invalid")
+    return tuple(
+        str(row[2])
+        for row in conn.execute("PRAGMA main.index_info(%s)" % index_name)
+    )
 
 
 @contextmanager
@@ -520,7 +685,7 @@ def _read_snapshot(conn: sqlite3.Connection):
         # BEGIN is deferred in SQLite. This read pins the snapshot before any
         # validator query so a WAL writer cannot splice a newer revision/source
         # row into the remainder of the validation sequence.
-        conn.execute("SELECT 1 FROM sqlite_schema LIMIT 1").fetchone()
+        conn.execute("SELECT 1 FROM main.sqlite_schema LIMIT 1").fetchone()
     try:
         yield
         if int(conn.total_changes or 0) != before:
@@ -535,117 +700,80 @@ def _read_snapshot(conn: sqlite3.Connection):
 
 
 def ensure_declared_canon_schema(conn: sqlite3.Connection) -> None:
-    """Create the one additive revision table and append-only guards."""
+    """Create the exact schema once; never auto-heal an existing damaged one."""
 
     with _immediate_transaction(conn):
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS declared_canon_revisions (
-                revision_id TEXT PRIMARY KEY,
-                declaration_id TEXT NOT NULL,
-                revision_number INTEGER NOT NULL CHECK(revision_number > 0),
-                guild_id INTEGER NOT NULL CHECK(guild_id > 0),
-                source_system TEXT NOT NULL,
-                source_row_id TEXT NOT NULL,
-                source_fingerprint TEXT NOT NULL,
-                operation TEXT NOT NULL,
-                operation_id TEXT NOT NULL,
-                operation_reason TEXT NOT NULL DEFAULT '',
-                classification_mode TEXT NOT NULL,
-                raw_declaration TEXT NOT NULL DEFAULT '',
-                cleaned_summary TEXT NOT NULL DEFAULT '',
-                subject_type TEXT NOT NULL,
-                subject_id TEXT NOT NULL,
-                object_subject_type TEXT NOT NULL DEFAULT '',
-                object_subject_id TEXT NOT NULL DEFAULT '',
-                predicate TEXT NOT NULL,
-                value_json TEXT NOT NULL DEFAULT '',
-                domain TEXT NOT NULL,
-                claim_kind TEXT NOT NULL,
-                visibility TEXT NOT NULL,
-                eligible_routes_json TEXT NOT NULL DEFAULT '[]',
-                valid_from TEXT NOT NULL DEFAULT '',
-                valid_until TEXT NOT NULL DEFAULT '',
-                lifecycle_status TEXT NOT NULL,
-                previous_revision_id TEXT NOT NULL DEFAULT '',
-                correction_of_revision_id TEXT NOT NULL DEFAULT '',
-                supersedes_declaration_id TEXT NOT NULL DEFAULT '',
-                superseded_by_declaration_id TEXT NOT NULL DEFAULT '',
-                derived_from_source_ref TEXT NOT NULL DEFAULT '',
-                authority_request_fingerprint TEXT NOT NULL,
-                authority_actor TEXT NOT NULL,
-                authority_receipt TEXT NOT NULL,
-                authority_verified INTEGER NOT NULL CHECK(authority_verified IN (0,1)),
-                contract_version TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                UNIQUE(guild_id, declaration_id, revision_number),
-                UNIQUE(guild_id, declaration_id, operation_id)
-            )
-            """
-        )
-        conn.execute(
-            """
-            CREATE INDEX IF NOT EXISTS idx_declared_canon_source
-            ON declared_canon_revisions(
-                guild_id, source_system, source_row_id, revision_number
-            )
-            """
-        )
-        conn.execute(
-            """
-            CREATE INDEX IF NOT EXISTS idx_declared_canon_subject
-            ON declared_canon_revisions(
-                guild_id, subject_type, subject_id, lifecycle_status
-            )
-            """
-        )
-        conn.execute(
-            """
-            CREATE TRIGGER IF NOT EXISTS trg_declared_canon_revisions_no_conflicting_insert
-            BEFORE INSERT ON declared_canon_revisions
-            WHEN EXISTS(
-                SELECT 1 FROM declared_canon_revisions existing
-                WHERE existing.revision_id=NEW.revision_id
-                   OR (
-                       existing.guild_id=NEW.guild_id
-                       AND existing.declaration_id=NEW.declaration_id
-                       AND existing.revision_number=NEW.revision_number
-                   )
-                   OR (
-                       existing.guild_id=NEW.guild_id
-                       AND existing.declaration_id=NEW.declaration_id
-                       AND existing.operation_id=NEW.operation_id
-                   )
-            )
-            BEGIN
-                SELECT RAISE(ABORT, 'declared_canon_append_only_conflict');
-            END
-            """
-        )
-        conn.execute(
-            """
-            CREATE TRIGGER IF NOT EXISTS trg_declared_canon_revisions_no_update
-            BEFORE UPDATE ON declared_canon_revisions
-            BEGIN
-                SELECT RAISE(ABORT, 'declared_canon_append_only_update');
-            END
-            """
-        )
-        conn.execute(
-            """
-            CREATE TRIGGER IF NOT EXISTS trg_declared_canon_revisions_no_delete
-            BEFORE DELETE ON declared_canon_revisions
-            BEGIN
-                SELECT RAISE(ABORT, 'declared_canon_append_only_delete');
-            END
-            """
-        )
+        if _table_exists(conn, DECLARED_CANON_TABLE):
+            _require_schema(conn)
+            return
+        conn.execute(_DECLARED_CANON_TABLE_DDL)
+        for statement in _DECLARED_CANON_INDEX_DDL.values():
+            conn.execute(statement)
+        for statement in _DECLARED_CANON_TRIGGER_DDL.values():
+            conn.execute(statement)
+        _require_schema(conn)
 
 
 def _require_schema(conn: sqlite3.Connection) -> None:
-    columns = set(_table_columns(conn, DECLARED_CANON_TABLE))
-    if not set(_REVISION_COLUMNS).issubset(columns):
+    if not _table_exists(conn, DECLARED_CANON_TABLE):
         raise DeclaredCanonError("declared_canon_schema_unavailable")
+    if _table_columns(conn, DECLARED_CANON_TABLE) != _REVISION_COLUMNS:
+        raise DeclaredCanonError("declared_canon_schema_integrity_invalid")
+    actual_table_sql = _main_schema_sql(
+        conn, object_type="table", name=DECLARED_CANON_TABLE
+    )
+    if _normalized_schema_sql(actual_table_sql) != _normalized_schema_sql(
+        _DECLARED_CANON_TABLE_DDL
+    ):
+        raise DeclaredCanonError("declared_canon_schema_integrity_invalid")
+
+    index_rows = conn.execute(
+        "PRAGMA main.index_list(%s)" % DECLARED_CANON_TABLE
+    ).fetchall()
+    explicit_indexes = {
+        str(row[1]): (_strict_bool(row[2]), _main_index_columns(conn, str(row[1])))
+        for row in index_rows
+        if str(row[3] or "") == "c"
+    }
+    expected_explicit_indexes = {
+        "idx_declared_canon_source": (
+            False,
+            ("guild_id", "source_system", "source_row_id", "revision_number"),
+        ),
+        "idx_declared_canon_subject": (
+            False,
+            ("guild_id", "subject_type", "subject_id", "lifecycle_status"),
+        ),
+    }
+    if explicit_indexes != expected_explicit_indexes:
+        raise DeclaredCanonError("declared_canon_schema_integrity_invalid")
+    for name, expected_sql in _DECLARED_CANON_INDEX_DDL.items():
+        if _normalized_schema_sql(
+            _main_schema_sql(conn, object_type="index", name=name)
+        ) != _normalized_schema_sql(expected_sql):
+            raise DeclaredCanonError("declared_canon_schema_integrity_invalid")
+
+    unique_column_sets = frozenset(
+        _main_index_columns(conn, str(row[1]))
+        for row in index_rows
+        if _strict_bool(row[2])
+    )
+    if unique_column_sets != _DECLARED_CANON_UNIQUE_COLUMN_SETS:
+        raise DeclaredCanonError("declared_canon_schema_integrity_invalid")
+
+    trigger_rows = conn.execute(
+        "SELECT name,sql FROM main.sqlite_master "
+        "WHERE type='trigger' AND tbl_name=?",
+        (DECLARED_CANON_TABLE,),
+    ).fetchall()
+    actual_triggers = {str(row[0]): str(row[1] or "") for row in trigger_rows}
+    if set(actual_triggers) != set(_DECLARED_CANON_TRIGGER_DDL):
+        raise DeclaredCanonError("declared_canon_schema_integrity_invalid")
+    for name, expected_sql in _DECLARED_CANON_TRIGGER_DDL.items():
+        if _normalized_schema_sql(actual_triggers.get(name)) != _normalized_schema_sql(
+            expected_sql
+        ):
+            raise DeclaredCanonError("declared_canon_schema_integrity_invalid")
 
 
 def _bounded_text(value: Any, *, field: str, maximum: int, required: bool = True) -> str:
@@ -835,7 +963,7 @@ def _general_fingerprint(fields: Mapping[str, str]) -> str:
 
 def _stored_authority_receipt(payload: Mapping[str, Any]) -> str:
     operation = str(payload.get("operation") or "")
-    digest = _digest(
+    digest = _authority_hmac(
         INTERNAL_AUTHORITY_RECEIPT_VERSION,
         STORED_AUTHORITY_BINDING_VERSION,
         *(payload.get(column) for column in _REVISION_COLUMNS
@@ -999,7 +1127,7 @@ def _copy_revision_payload(
 
 def _insert_revision(conn: sqlite3.Connection, payload: Mapping[str, Any]) -> None:
     conn.execute(
-        "INSERT INTO declared_canon_revisions (%s) VALUES (%s)"
+        "INSERT INTO main.declared_canon_revisions (%s) VALUES (%s)"
         % (",".join(_REVISION_COLUMNS), ",".join("?" for _ in _REVISION_COLUMNS)),
         tuple(payload[column] for column in _REVISION_COLUMNS),
     )
@@ -1011,19 +1139,59 @@ def _row_to_revision(row: Sequence[Any]) -> DeclaredCanonRevision:
     return DeclaredCanonRevision(**values)
 
 
+def _validated_revision_chain(
+    conn: sqlite3.Connection,
+    *,
+    guild_id: int,
+    declaration_id: str,
+) -> tuple[DeclaredCanonRevision, ...]:
+    """Load and authenticate every revision before trusting the current head."""
+
+    rows = conn.execute(
+        "SELECT %s FROM main.declared_canon_revisions "
+        "WHERE guild_id=? AND declaration_id=? ORDER BY revision_number"
+        % ",".join(_REVISION_COLUMNS),
+        (int(guild_id), str(declaration_id or "")),
+    ).fetchall()
+    revisions = tuple(_row_to_revision(row) for row in rows)
+    prior: DeclaredCanonRevision | None = None
+    for expected_number, revision in enumerate(revisions, start=1):
+        if (
+            int(revision.guild_id) != int(guild_id)
+            or revision.declaration_id != str(declaration_id or "")
+            or int(revision.revision_number) != expected_number
+            or (
+                not prior
+                and bool(str(revision.previous_revision_id or ""))
+            )
+            or (
+                prior is not None
+                and revision.previous_revision_id != prior.revision_id
+            )
+            or (
+                prior is not None
+                and (
+                    revision.source_system != prior.source_system
+                    or revision.source_row_id != prior.source_row_id
+                )
+            )
+        ):
+            raise DeclaredCanonError("declared_canon_revision_chain_invalid")
+        _require_trusted_stored_revision(revision)
+        prior = revision
+    return revisions
+
+
 def _latest_revision(
     conn: sqlite3.Connection,
     *,
     guild_id: int,
     declaration_id: str,
 ) -> DeclaredCanonRevision | None:
-    row = conn.execute(
-        "SELECT %s FROM declared_canon_revisions "
-        "WHERE guild_id=? AND declaration_id=? "
-        "ORDER BY revision_number DESC LIMIT 1" % ",".join(_REVISION_COLUMNS),
-        (int(guild_id), str(declaration_id or "")),
-    ).fetchone()
-    return _row_to_revision(row) if row else None
+    chain = _validated_revision_chain(
+        conn, guild_id=int(guild_id), declaration_id=str(declaration_id or "")
+    )
+    return chain[-1] if chain else None
 
 
 def _existing_operation(
@@ -1032,7 +1200,7 @@ def _existing_operation(
     authority: _VerifiedAuthority,
 ) -> tuple[DeclaredCanonRevision, ...] | None:
     rows = conn.execute(
-        "SELECT %s FROM declared_canon_revisions "
+        "SELECT %s FROM main.declared_canon_revisions "
         "WHERE guild_id=? AND operation_id=? ORDER BY rowid"
         % ",".join(_REVISION_COLUMNS),
         (authority.guild_id, authority.operation_id),
@@ -1048,8 +1216,10 @@ def _existing_operation(
         for revision in revisions
     ):
         raise DeclaredCanonError("authority_nonce_replay_mismatch")
-    for revision in revisions:
-        _require_trusted_stored_revision(revision)
+    for declaration_id in {revision.declaration_id for revision in revisions}:
+        _validated_revision_chain(
+            conn, guild_id=authority.guild_id, declaration_id=declaration_id
+        )
     return revisions
 
 
@@ -1106,7 +1276,6 @@ def add_declared_canon(
     _require_configured_owner_actor(
         actor_user_id=actor_user_id, guild_id=guild_id
     )
-    _require_schema(conn)
     fields = _validated_claim_fields(
         subject_type=subject_type,
         subject_id=subject_id,
@@ -1161,6 +1330,7 @@ def add_declared_canon(
         **fields,
     )
     with _immediate_transaction(conn):
+        _require_schema(conn)
         existing = _existing_operation(conn, authority=authority)
         if existing is not None:
             return MutationResult(operation_id, existing)
@@ -1196,7 +1366,6 @@ def correct_declared_canon(
     _require_configured_owner_actor(
         actor_user_id=actor_user_id, guild_id=guild_id
     )
-    _require_schema(conn)
     fields = _validated_claim_fields(
         subject_type=subject_type,
         subject_id=subject_id,
@@ -1237,6 +1406,7 @@ def correct_declared_canon(
     )
     operation_id = _operation_id(authority)
     with _immediate_transaction(conn):
+        _require_schema(conn)
         existing = _existing_operation(conn, authority=authority)
         if existing is not None:
             return MutationResult(operation_id, existing)
@@ -1285,7 +1455,6 @@ def retire_declared_canon(
     _require_configured_owner_actor(
         actor_user_id=actor_user_id, guild_id=guild_id
     )
-    _require_schema(conn)
     expected_revision = _validate_stable_token(
         expected_revision_id,
         field="expected_revision_id",
@@ -1309,6 +1478,7 @@ def retire_declared_canon(
     )
     operation_id = _operation_id(authority)
     with _immediate_transaction(conn):
+        _require_schema(conn)
         existing = _existing_operation(conn, authority=authority)
         if existing is not None:
             return MutationResult(operation_id, existing)
@@ -1345,7 +1515,6 @@ def change_declared_canon_status(
     _require_configured_owner_actor(
         actor_user_id=actor_user_id, guild_id=guild_id
     )
-    _require_schema(conn)
     normalized_status = str(lifecycle_status or "").strip().casefold()
     if normalized_status not in {"established", "contested", "resolved"}:
         raise DeclaredCanonError("invalid_status_change")
@@ -1373,6 +1542,7 @@ def change_declared_canon_status(
     )
     operation_id = _operation_id(authority)
     with _immediate_transaction(conn):
+        _require_schema(conn)
         existing = _existing_operation(conn, authority=authority)
         if existing is not None:
             return MutationResult(operation_id, existing)
@@ -1414,7 +1584,6 @@ def supersede_declared_canon(
     _require_configured_owner_actor(
         actor_user_id=actor_user_id, guild_id=guild_id
     )
-    _require_schema(conn)
     normalized_declaration_id = _validate_stable_token(
         declaration_id, field="declaration_id", pattern=_STABLE_ID_RE
     )
@@ -1455,6 +1624,7 @@ def supersede_declared_canon(
     )
     operation_id = _operation_id(authority)
     with _immediate_transaction(conn):
+        _require_schema(conn)
         existing = _existing_operation(conn, authority=authority)
         if existing is not None:
             by_declaration = {item.declaration_id: item for item in existing}
@@ -1516,7 +1686,7 @@ def _broadcast_row(
     if not required.issubset(set(columns)):
         return None
     cursor = conn.execute(
-        "SELECT * FROM broadcast_memory WHERE guild_id=? AND id=? LIMIT 1",
+        "SELECT * FROM main.broadcast_memory WHERE guild_id=? AND id=? LIMIT 1",
         (int(guild_id), int(row_id)),
     )
     row = cursor.fetchone()
@@ -1659,7 +1829,6 @@ def classify_broadcast_memory(
     _require_configured_owner_actor(
         actor_user_id=actor_user_id, guild_id=guild_id
     )
-    _require_schema(conn)
     normalized_subject_type = str(subject_type or "").strip().casefold()
     if normalized_subject_type not in GENERAL_SUBJECT_TYPES:
         raise DeclaredCanonError("invalid_subject_type")
@@ -1717,6 +1886,7 @@ def classify_broadcast_memory(
     )
     operation_id = _operation_id(authority)
     with _immediate_transaction(conn):
+        _require_schema(conn)
         existing = _existing_operation(conn, authority=authority)
         if existing is not None:
             return MutationResult(operation_id, existing)
@@ -1868,10 +2038,15 @@ def _stored_authority_valid(revision: DeclaredCanonRevision) -> bool:
             INTERNAL_AUTHORITY_RECEIPT_VERSION,
             operation,
         )
+        configured_owner = _configured_owner_user_id()
+        configured_guild = _configured_primary_guild_id()
         if not (
-            _strict_bool(revision.authority_verified)
+            configured_owner > 0
+            and configured_guild > 0
+            and _strict_bool(revision.authority_verified)
             and str(revision.contract_version or "")
             == DECLARED_CANON_CONTRACT_VERSION
+            and int(revision.guild_id) == configured_guild
             and operation in _MUTATION_OPERATIONS
             and str(revision.operation_id or "").startswith("op_")
             and re.fullmatch(r"op_[0-9a-f]{32}", revision.operation_id or "")
@@ -1880,18 +2055,22 @@ def _stored_authority_valid(revision: DeclaredCanonRevision) -> bool:
                 revision.authority_request_fingerprint or "",
             )
             and str(revision.authority_actor or "")
-            == "discord_user:%s" % _configured_owner_user_id()
+            == "discord_user:%s" % configured_owner
             and str(revision.authority_receipt or "").startswith(prefix)
         ):
             return False
         expected_receipt = _stored_authority_receipt(payload)
-        if str(revision.authority_receipt or "") != expected_receipt:
+        if not hmac.compare_digest(
+            str(revision.authority_receipt or ""), expected_receipt
+        ):
             return False
         expected_revision_id = "drev_" + _digest(
             *(payload[column] for column in _REVISION_COLUMNS
               if column != "revision_id")
         )[:40]
-        return str(revision.revision_id or "") == expected_revision_id
+        return hmac.compare_digest(
+            str(revision.revision_id or ""), expected_revision_id
+        )
     except (DeclaredCanonError, AttributeError, TypeError, ValueError):
         return False
 
@@ -2007,6 +2186,48 @@ def _require_trusted_stored_revision(
             raise DeclaredCanonError("broadcast_source_fingerprint_invalid")
         return
     raise DeclaredCanonError("invalid_source_system")
+
+
+def validate_declared_canon_read_boundary(
+    conn: sqlite3.Connection, *, guild_id: int
+) -> tuple[DeclaredCanonRevision, ...]:
+    """Validate schema and every current chain inside a caller-owned snapshot.
+
+    Internal inventory adapters use this boundary after opening their own read
+    snapshot.  It authenticates stored authority without manufacturing a new
+    owner request, nonce, or receipt.
+    """
+
+    if not conn.in_transaction:
+        raise DeclaredCanonError("declared_canon_read_snapshot_required")
+    configured_owner = _configured_owner_user_id()
+    if configured_owner <= 0:
+        raise DeclaredCanonError("owner_user_id_not_configured")
+    configured_guild = _configured_primary_guild_id()
+    if configured_guild <= 0:
+        raise DeclaredCanonError("primary_guild_id_not_configured")
+    if int(guild_id or 0) != configured_guild:
+        raise DeclaredCanonError("configured_primary_guild_required")
+    _authority_secret()
+    _require_schema(conn)
+    declaration_ids = tuple(
+        str(row[0])
+        for row in conn.execute(
+            "SELECT DISTINCT declaration_id "
+            "FROM main.declared_canon_revisions WHERE guild_id=? "
+            "ORDER BY declaration_id",
+            (configured_guild,),
+        ).fetchall()
+    )
+    latest: list[DeclaredCanonRevision] = []
+    for declaration_id in declaration_ids:
+        chain = _validated_revision_chain(
+            conn, guild_id=configured_guild, declaration_id=declaration_id
+        )
+        if not chain:
+            raise DeclaredCanonError("declared_canon_revision_chain_invalid")
+        latest.append(chain[-1])
+    return tuple(latest)
 
 
 def validate_current_declared_canon_revision(
@@ -2336,6 +2557,28 @@ def preview_declared_canon(
     source_system: str = "",
     limit: int = 100,
 ) -> DeclaredPreview:
+    """Return content-free revision metadata from one coherent read snapshot."""
+
+    with _read_snapshot(conn):
+        return _preview_declared_canon(
+            conn,
+            actor_user_id=actor_user_id,
+            authority_nonce=authority_nonce,
+            guild_id=guild_id,
+            source_system=source_system,
+            limit=limit,
+        )
+
+
+def _preview_declared_canon(
+    conn: sqlite3.Connection,
+    *,
+    actor_user_id: int,
+    authority_nonce: str,
+    guild_id: int,
+    source_system: str = "",
+    limit: int = 100,
+) -> DeclaredPreview:
     """Return content-free revision metadata without creating schema or rows."""
 
     before = int(conn.total_changes or 0)
@@ -2361,6 +2604,7 @@ def preview_declared_canon(
             False,
             int(conn.total_changes or 0) - before,
         )
+    validate_declared_canon_read_boundary(conn, guild_id=int(guild_id))
     where = ["guild_id=?"]
     params: list[Any] = [int(guild_id)]
     if normalized_source:
@@ -2368,7 +2612,7 @@ def preview_declared_canon(
         params.append(normalized_source)
     total = int(
         conn.execute(
-            "SELECT COUNT(*) FROM declared_canon_revisions WHERE %s"
+            "SELECT COUNT(*) FROM main.declared_canon_revisions WHERE %s"
             % " AND ".join(where),
             tuple(params),
         ).fetchone()[0]
@@ -2376,15 +2620,15 @@ def preview_declared_canon(
     )
     rows = conn.execute(
         """
-        SELECT declaration_id,revision_id,revision_number,source_system,
+        SELECT d.declaration_id,d.revision_id,d.revision_number,d.source_system,
                domain,claim_kind,visibility,lifecycle_status,classification_mode,
                CASE WHEN revision_number=(
                    SELECT MAX(r2.revision_number)
-                   FROM declared_canon_revisions r2
-                   WHERE r2.guild_id=declared_canon_revisions.guild_id
-                     AND r2.declaration_id=declared_canon_revisions.declaration_id
+                   FROM main.declared_canon_revisions r2
+                   WHERE r2.guild_id=d.guild_id
+                     AND r2.declaration_id=d.declaration_id
                ) THEN 1 ELSE 0 END
-        FROM declared_canon_revisions
+        FROM main.declared_canon_revisions d
         WHERE %s
         ORDER BY declaration_id,revision_number DESC
         LIMIT ?
@@ -2462,6 +2706,30 @@ def preview_historical_broadcast_memory(
     offset: int = 0,
     now: str = "",
 ) -> BroadcastHistoryPreview:
+    """Build a zero-write preview from one coherent read snapshot."""
+
+    with _read_snapshot(conn):
+        return _preview_historical_broadcast_memory(
+            conn,
+            actor_user_id=actor_user_id,
+            authority_nonce=authority_nonce,
+            guild_id=guild_id,
+            limit=limit,
+            offset=offset,
+            now=now,
+        )
+
+
+def _preview_historical_broadcast_memory(
+    conn: sqlite3.Connection,
+    *,
+    actor_user_id: int,
+    authority_nonce: str,
+    guild_id: int,
+    limit: int = 200,
+    offset: int = 0,
+    now: str = "",
+) -> BroadcastHistoryPreview:
     """Build a zero-write, content-free classification preview.
 
     Raw/clean content, source row IDs, stable source tokens, names, and account
@@ -2514,13 +2782,13 @@ def preview_historical_broadcast_memory(
         )
     total = int(
         conn.execute(
-            "SELECT COUNT(*) FROM broadcast_memory WHERE guild_id=?",
+            "SELECT COUNT(*) FROM main.broadcast_memory WHERE guild_id=?",
             (int(guild_id),),
         ).fetchone()[0]
         or 0
     )
     source_cursor = conn.execute(
-        "SELECT * FROM broadcast_memory WHERE guild_id=? ORDER BY id LIMIT ? OFFSET ?",
+        "SELECT * FROM main.broadcast_memory WHERE guild_id=? ORDER BY id LIMIT ? OFFSET ?",
         (int(guild_id), safe_limit, safe_offset),
     )
     returned_columns = tuple(
@@ -2530,6 +2798,7 @@ def preview_historical_broadcast_memory(
     rows = tuple(dict(zip(returned_columns, row)) for row in raw_rows)
     classification_rows: dict[str, dict[str, str]] = {}
     if _table_exists(conn, DECLARED_CANON_TABLE):
+        validate_declared_canon_read_boundary(conn, guild_id=int(guild_id))
         source_ids = tuple(str(row.get("id")) for row in rows)
         if source_ids:
             placeholders = ",".join("?" for _ in source_ids)
@@ -2539,10 +2808,10 @@ def preview_historical_broadcast_memory(
             for classified_row in conn.execute(
                 """
                 SELECT %s
-                FROM declared_canon_revisions d
+                FROM main.declared_canon_revisions d
                 JOIN (
                     SELECT declaration_id,MAX(revision_number) AS max_revision
-                    FROM declared_canon_revisions
+                    FROM main.declared_canon_revisions
                     WHERE guild_id=? AND source_system='broadcast_memory'
                       AND source_row_id IN (%s)
                     GROUP BY declaration_id
@@ -2831,6 +3100,8 @@ __all__ = [
     "BroadcastHistoryPreview",
     "BroadcastPreviewItem",
     "DECLARED_CANON_CONTRACT_VERSION",
+    "DECLARED_CANON_AUTHORITY_SECRET_ENV",
+    "DECLARED_CANON_AUTHORITY_SECRET_MIN_BYTES",
     "DECLARED_CANON_TABLE",
     "DeclaredCanonError",
     "DeclaredCanonRevision",
@@ -2850,5 +3121,6 @@ __all__ = [
     "retire_declared_canon",
     "supersede_declared_canon",
     "validate_current_declared_canon_revision",
+    "validate_declared_canon_read_boundary",
     "validate_latest_declared_canon_revision",
 ]

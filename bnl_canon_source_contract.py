@@ -2002,11 +2002,11 @@ def _inventory_declared_canon_claims(
     from bnl_declared_canon import (
         BROADCAST_MEMORY_SOURCE,
         DECLARED_CANON_TABLE,
+        DeclaredCanonError,
         GENERAL_DECLARATION_SOURCE,
-        _REVISION_COLUMNS,
         _digest,
-        _row_to_revision,
         DECLARED_CANON_CONTRACT_VERSION,
+        validate_declared_canon_read_boundary,
     )
 
     stats = Counter(
@@ -2015,6 +2015,7 @@ def _inventory_declared_canon_claims(
             "declaredHistoricalRevisionCount": 0,
             "declaredCurrentClaimCount": 0,
             "declaredInvalidLatestCount": 0,
+            "declaredBoundaryRejectedCount": 0,
             "broadcastDeclaredCurrentCount": 0,
             "broadcastOpenReviewCount": len(broadcast_rows),
             "broadcastStaleSidecarCount": 0,
@@ -2022,13 +2023,21 @@ def _inventory_declared_canon_claims(
             "declaredOrphanBroadcastSourceCount": 0,
         }
     )
-    columns = set(_sqlite_table_columns(conn, DECLARED_CANON_TABLE))
+    columns = _sqlite_table_columns(conn, DECLARED_CANON_TABLE)
     if not columns:
         return (), {}, dict(stats), False
-    if not set(_REVISION_COLUMNS).issubset(columns) or guild_id is None:
+    if guild_id is None:
         return (), {}, dict(stats), True
     safe_limit = max(1, min(int(limit or 1), 2000))
     scoped_guild = int(guild_id or 0)
+    try:
+        latest_revisions = validate_declared_canon_read_boundary(
+            conn,
+            guild_id=scoped_guild,
+        )
+    except DeclaredCanonError:
+        stats["declaredBoundaryRejectedCount"] = 1
+        return (), {}, dict(stats), True
     total_revisions, total_declarations = conn.execute(
         """
         SELECT COUNT(*),COUNT(DISTINCT declaration_id)
@@ -2040,45 +2049,22 @@ def _inventory_declared_canon_claims(
     stats["declaredHistoricalRevisionCount"] = max(
         0, int(total_revisions or 0) - int(total_declarations or 0)
     )
-    general_count = int(
-        conn.execute(
-            """
-            SELECT COUNT(DISTINCT declaration_id)
-            FROM main.declared_canon_revisions
-            WHERE guild_id=? AND source_system=?
-            """,
-            (scoped_guild, GENERAL_DECLARATION_SOURCE),
-        ).fetchone()[0]
-        or 0
+    general_revisions = tuple(
+        sorted(
+            (
+                revision
+                for revision in latest_revisions
+                if revision.source_system == GENERAL_DECLARATION_SOURCE
+            ),
+            key=lambda revision: revision.declaration_id,
+        )
     )
-    general_rows = conn.execute(
-        """
-        SELECT %s
-        FROM main.declared_canon_revisions d
-        JOIN (
-          SELECT declaration_id,MAX(revision_number) AS max_revision
-          FROM main.declared_canon_revisions
-          WHERE guild_id=? AND source_system=?
-          GROUP BY declaration_id
-        ) latest
-          ON latest.declaration_id=d.declaration_id
-         AND latest.max_revision=d.revision_number
-        WHERE d.guild_id=? AND d.source_system=?
-        ORDER BY d.declaration_id LIMIT ?
-        """ % ",".join("d.%s" % column for column in _REVISION_COLUMNS),
-        (
-            scoped_guild,
-            GENERAL_DECLARATION_SOURCE,
-            scoped_guild,
-            GENERAL_DECLARATION_SOURCE,
-            safe_limit,
-        ),
-    ).fetchall()
+    general_count = len(general_revisions)
     general_claims: list[CanonClaim] = []
-    for raw_revision in general_rows:
+    for revision in general_revisions[:safe_limit]:
         claim, _reason = _inventory_current_declared_claim(
             conn,
-            _row_to_revision(raw_revision),
+            revision,
             now=now,
         )
         if claim is None:
@@ -2093,7 +2079,7 @@ def _inventory_declared_canon_claims(
         )
     )
     broadcast_ids = tuple(value for value in broadcast_ids if value)
-    sidecar_counts: dict[str, int] = {}
+    sidecar_declarations: dict[str, set[str]] = {}
     expected_declarations: dict[str, str] = {
         source_id: "dcl_"
         + _digest(
@@ -2105,58 +2091,19 @@ def _inventory_declared_canon_claims(
         for source_id in broadcast_ids
         if str(source_id).isdigit()
     }
-    if broadcast_ids:
-        for start in range(0, len(broadcast_ids), 400):
-            chunk = broadcast_ids[start : start + 400]
-            placeholders = ",".join("?" for _ in chunk)
-            for source_id, declaration_count in conn.execute(
-                """
-                SELECT source_row_id,COUNT(DISTINCT declaration_id)
-                FROM main.declared_canon_revisions
-                WHERE guild_id=? AND source_system=?
-                  AND source_row_id IN (%s)
-                GROUP BY source_row_id
-                """ % placeholders,
-                (scoped_guild, BROADCAST_MEMORY_SOURCE, *chunk),
-            ).fetchall():
-                sidecar_counts[str(source_id)] = int(declaration_count or 0)
     latest_by_source: dict[str, Any] = {}
-    expected_ids = tuple(expected_declarations.values())
-    for start in range(0, len(expected_ids), 400):
-        chunk = expected_ids[start : start + 400]
-        if not chunk:
+    for revision in latest_revisions:
+        if revision.source_system != BROADCAST_MEMORY_SOURCE:
             continue
-        placeholders = ",".join("?" for _ in chunk)
-        rows = conn.execute(
-            """
-            SELECT %s
-            FROM main.declared_canon_revisions d
-            JOIN (
-              SELECT declaration_id,MAX(revision_number) AS max_revision
-              FROM main.declared_canon_revisions
-              WHERE guild_id=? AND declaration_id IN (%s)
-              GROUP BY declaration_id
-            ) latest
-              ON latest.declaration_id=d.declaration_id
-             AND latest.max_revision=d.revision_number
-            WHERE d.guild_id=? AND d.source_system=?
-            """ % (
-                ",".join("d.%s" % column for column in _REVISION_COLUMNS),
-                placeholders,
-            ),
-            (
-                scoped_guild,
-                *chunk,
-                scoped_guild,
-                BROADCAST_MEMORY_SOURCE,
-            ),
-        ).fetchall()
-        for raw_revision in rows:
-            revision = _row_to_revision(raw_revision)
-            latest_by_source[str(revision.source_row_id)] = revision
+        source_id = str(revision.source_row_id)
+        sidecar_declarations.setdefault(source_id, set()).add(
+            str(revision.declaration_id)
+        )
+        if revision.declaration_id == expected_declarations.get(source_id):
+            latest_by_source[source_id] = revision
     broadcast_claims: dict[str, CanonClaim] = {}
     for source_id in broadcast_ids:
-        declaration_count = sidecar_counts.get(source_id, 0)
+        declaration_count = len(sidecar_declarations.get(source_id, set()))
         if declaration_count == 0:
             continue
         if declaration_count != 1:
@@ -2197,7 +2144,7 @@ def _inventory_declared_canon_claims(
         ).fetchone()[0]
         or 0
     ) if _sqlite_table_columns(conn, "broadcast_memory") else 0
-    truncated = bool(general_count > len(general_rows))
+    truncated = bool(general_count > safe_limit)
     return (
         tuple(general_claims),
         broadcast_claims,

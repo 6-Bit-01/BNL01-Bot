@@ -7584,7 +7584,7 @@ class BroadcastEffectiveRepresentations:
 def _entry_is_unretracted_sql(alias: str) -> str:
     return """
         NOT EXISTS (
-            SELECT 1 FROM memory_ledger_lineage AS incoming
+            SELECT 1 FROM main.memory_ledger_lineage AS incoming
             WHERE incoming.guild_id={alias}.guild_id
               AND incoming.target_entry_id={alias}.entry_id
               AND incoming.lineage_type IN ('supersedes','retracts')
@@ -7592,7 +7592,7 @@ def _entry_is_unretracted_sql(alias: str) -> str:
     """.format(alias=alias)
 
 
-def _effective_broadcast_representations(
+def effective_broadcast_representations(
     conn: sqlite3.Connection,
     *,
     guild_id: int,
@@ -7614,7 +7614,7 @@ def _effective_broadcast_representations(
     primary_rows = conn.execute(
         """
         SELECT entry.entry_id
-        FROM memory_ledger_entries AS entry
+        FROM main.memory_ledger_entries AS entry
         WHERE entry.guild_id=?
           AND entry.source_table='broadcast_memory'
           AND entry.source_row_id=?
@@ -7632,12 +7632,12 @@ def _effective_broadcast_representations(
     derived_projection_rows = conn.execute(
         """
         SELECT DISTINCT projection_row.entry_id
-        FROM memory_ledger_entries AS projection_row
-        JOIN memory_ledger_lineage AS source_edge
+        FROM main.memory_ledger_entries AS projection_row
+        JOIN main.memory_ledger_lineage AS source_edge
           ON source_edge.guild_id=projection_row.guild_id
          AND source_edge.entry_id=projection_row.entry_id
          AND source_edge.lineage_type='derived_from'
-        JOIN memory_ledger_entries AS source_root
+        JOIN main.memory_ledger_entries AS source_root
           ON source_root.guild_id=source_edge.guild_id
          AND source_root.entry_id=source_edge.target_entry_id
         WHERE projection_row.guild_id=?
@@ -7659,7 +7659,9 @@ def _effective_broadcast_representations(
 
     declared_columns = {
         str(row[1] or "")
-        for row in conn.execute("PRAGMA table_info(declared_canon_revisions)")
+        for row in conn.execute(
+            "PRAGMA main.table_info(declared_canon_revisions)"
+        )
     }
     if {
         "revision_id",
@@ -7672,8 +7674,8 @@ def _effective_broadcast_representations(
         orphan_rows = conn.execute(
             """
             SELECT DISTINCT projection_row.entry_id
-            FROM memory_ledger_entries AS projection_row
-            JOIN declared_canon_revisions AS revision
+            FROM main.memory_ledger_entries AS projection_row
+            JOIN main.declared_canon_revisions AS revision
               ON revision.guild_id=projection_row.guild_id
              AND revision.declaration_id=projection_row.source_row_id
              AND revision.revision_id=projection_row.source_revision
@@ -7695,6 +7697,21 @@ def _effective_broadcast_representations(
     return BroadcastEffectiveRepresentations(
         primary_entry_ids=tuple(sorted(primary_ids)),
         declared_projection_entry_ids=tuple(sorted(projection_ids)),
+    )
+
+
+def _effective_broadcast_representations(
+    conn: sqlite3.Connection,
+    *,
+    guild_id: int,
+    source_row_id: int | str,
+) -> BroadcastEffectiveRepresentations:
+    """Compatibility alias for callers introduced before the public helper."""
+
+    return effective_broadcast_representations(
+        conn,
+        guild_id=guild_id,
+        source_row_id=source_row_id,
     )
 
 
@@ -7758,7 +7775,7 @@ def _stored_ledger_entry_matches(
                source_message_id,visibility,confidence,public_usable,derived,
                projection,salience,observed_at,source_sequence,valid_from,
                valid_until,freshness,lifecycle_status
-        FROM memory_ledger_entries WHERE entry_id=?
+        FROM main.memory_ledger_entries WHERE entry_id=?
         """,
         (entry.entry_id,),
     ).fetchone()
@@ -7815,7 +7832,7 @@ def _stored_ledger_entry_matches(
         for row in conn.execute(
             """
             SELECT participant_key,display_name,participant_role,order_index
-            FROM memory_ledger_participants WHERE entry_id=?
+            FROM main.memory_ledger_participants WHERE entry_id=?
             """,
             (entry.entry_id,),
         ).fetchall()
@@ -7857,7 +7874,7 @@ def _insert_or_reconcile_ledger_lineage(
             continue
         target_row = conn.execute(
             """
-            SELECT 1 FROM memory_ledger_entries
+            SELECT 1 FROM main.memory_ledger_entries
             WHERE guild_id=? AND entry_id=?
             """,
             (int(entry.guild_id or 0), str(target)),
@@ -7875,7 +7892,7 @@ def _insert_or_reconcile_ledger_lineage(
             )
         conn.execute(
             """
-            INSERT OR IGNORE INTO memory_ledger_lineage
+            INSERT OR IGNORE INTO main.memory_ledger_lineage
               (entry_id,guild_id,lineage_type,target_entry_id,created_at)
             VALUES(?,?,?,?,?)
             """,
@@ -8030,7 +8047,7 @@ def shadow_broadcast_status_event(
     with _ledger_atomic_projection_transaction(conn):
         columns = {
             str(row[1] or "")
-            for row in conn.execute("PRAGMA table_info(broadcast_memory)")
+            for row in conn.execute("PRAGMA main.table_info(broadcast_memory)")
         }
         required_columns = {
             "id",
@@ -8054,7 +8071,7 @@ def shadow_broadcast_status_event(
             """
             SELECT guild_id,status,updated_at,corrected_by_user_id,
                    corrected_by_name,superseded_by_id
-            FROM broadcast_memory
+            FROM main.broadcast_memory
             WHERE guild_id=? AND id=?
             LIMIT 1
             """,
@@ -8091,10 +8108,14 @@ def shadow_broadcast_status_event(
                 reason_code="broadcast_status_source_snapshot_mismatch",
             )
 
-        old_entries = _effective_broadcast_primary_entries(
+        old_representations = _effective_broadcast_representations(
             conn,
             guild_id=normalized_guild_id,
             source_row_id=normalized_row_id,
+        )
+        old_entries = old_representations.primary_entry_ids
+        old_declared_projections = (
+            old_representations.declared_projection_entry_ids
         )
         lineage_items = [
             ("retracts", old_entry) for old_entry in old_entries
@@ -8115,38 +8136,124 @@ def shadow_broadcast_status_event(
             if normalized_status == "resolved"
             else REVIEW_ONLY_LIFECYCLE
         )
-        return insert_ledger_entry(
+        participants = (
+            LedgerParticipant(
+                "discord_user:%s" % normalized_actor_id,
+                str(source_row[4] or ""),
+                "correction_actor",
+                0,
+            ),
+        )
+        status_entry = LedgerEntry(
+            guild_id=normalized_guild_id,
+            source_table="broadcast_memory",
+            source_row_id=normalized_row_id,
+            source_revision=rev,
+            source_event_key="status:%s" % normalized_status,
+            source_role="broadcast_memory_status",
+            entry_type="event",
+            subject_key="barcode_radio",
+            subject_display_name="BARCODE Radio",
+            predicate_key="broadcast_status:%s" % normalized_status,
+            value=normalized_status,
+            source_class=SourceClass.FIRST_PARTY_RECORD,
+            visibility=Visibility.INTERNAL,
+            confidence=Confidence.HIGH,
+            public_usable=False,
+            observed_at=normalized_updated_at,
+            source_sequence=normalized_row_id,
+            lifecycle_status=lifecycle,
+            participants=participants,
+            lineage=tuple(lineage_items),
+        )
+        status_result = _insert_or_reconcile_ledger_lineage(
             conn,
-            LedgerEntry(
+            status_entry,
+            conflict_reason="broadcast_status_identity_conflict",
+        )
+        if status_result.outcome not in {"inserted", "deduplicated"}:
+            raise RuntimeError(
+                "broadcast_status_lineage_write_failed:%s"
+                % status_result.reason_code
+            )
+
+        # Keep projection retractions on their own internal event so the
+        # established bot boundary can continue verifying the primary event's
+        # exact root set. Both events are nevertheless written and verified in
+        # this same source transaction.
+        if old_declared_projections:
+            projection_rev = source_revision_for(
+                normalized_row_id,
+                normalized_updated_at,
+                event=(
+                    "declared_projection_status_v1:%s:%s"
+                    % (normalized_status, normalized_updated_at)
+                ),
+            )
+            projection_entry = LedgerEntry(
                 guild_id=normalized_guild_id,
                 source_table="broadcast_memory",
                 source_row_id=normalized_row_id,
-                source_revision=rev,
-                source_event_key="status:%s" % normalized_status,
-                source_role="broadcast_memory_status",
+                source_revision=projection_rev,
+                source_event_key=(
+                    "declared_projection_status_v1:%s" % normalized_status
+                ),
+                source_role="broadcast_memory_projection_status",
                 entry_type="event",
                 subject_key="barcode_radio",
                 subject_display_name="BARCODE Radio",
-                predicate_key="broadcast_status:%s" % normalized_status,
+                predicate_key=(
+                    "broadcast_projection_status:%s" % normalized_status
+                ),
                 value=normalized_status,
                 source_class=SourceClass.FIRST_PARTY_RECORD,
                 visibility=Visibility.INTERNAL,
                 confidence=Confidence.HIGH,
                 public_usable=False,
+                derived=True,
+                projection=True,
                 observed_at=normalized_updated_at,
                 source_sequence=normalized_row_id,
                 lifecycle_status=lifecycle,
-                participants=(
-                    LedgerParticipant(
-                        "discord_user:%s" % normalized_actor_id,
-                        str(source_row[4] or ""),
-                        "correction_actor",
-                        0,
-                    ),
+                participants=participants,
+                lineage=tuple(
+                    ("retracts", entry_id)
+                    for entry_id in old_declared_projections
                 ),
-                lineage=tuple(lineage_items),
-            ),
+            )
+            projection_result = _insert_or_reconcile_ledger_lineage(
+                conn,
+                projection_entry,
+                conflict_reason=(
+                    "broadcast_projection_status_identity_conflict"
+                ),
+            )
+            if projection_result.outcome not in {"inserted", "deduplicated"}:
+                raise RuntimeError(
+                    "broadcast_projection_lineage_write_failed:%s"
+                    % projection_result.reason_code
+                )
+            record_shadow_receipt(
+                conn,
+                guild_id=normalized_guild_id,
+                writer="broadcast_memory_projection_status",
+                source_table=projection_result.source_table,
+                source_row_id=projection_result.source_row_id,
+                source_revision=projection_result.source_revision,
+                source_event_key=projection_result.source_event_key,
+                outcome=projection_result.outcome,
+                reason_code=projection_result.reason_code,
+                entry_id=projection_result.entry_id,
+            )
+
+        remaining = _effective_broadcast_representations(
+            conn,
+            guild_id=normalized_guild_id,
+            source_row_id=normalized_row_id,
         )
+        if remaining.all_entry_ids:
+            raise RuntimeError("broadcast_terminal_retraction_incomplete")
+        return status_result
 
 
 def shadow_canon_reference(
@@ -8213,6 +8320,53 @@ def _declared_projection_subject_key(subject_type: str, subject_id: str) -> str:
     return "%s:%s" % (
         str(subject_type or "").strip().casefold(),
         str(subject_id or "").strip(),
+    )
+
+
+def _effective_declared_projection_entries(
+    conn: sqlite3.Connection,
+    *,
+    guild_id: int,
+    declaration_id: str,
+    exclude_revision_id: str = "",
+) -> tuple[str, ...]:
+    """Return every unretracted projection for one Declared declaration.
+
+    The declaration revision store decides which revision is current.  This
+    helper deliberately preserves multiplicity in the Ledger so a validated
+    current/terminal projection can invalidate every stale representation
+    instead of electing one duplicate and leaving the others effective.
+    """
+
+    ensure_memory_ledger_schema(conn)
+    sql = """
+        SELECT projection_row.entry_id
+        FROM main.memory_ledger_entries AS projection_row
+        WHERE projection_row.guild_id=?
+          AND projection_row.source_table='declared_canon_projection'
+          AND projection_row.source_role='declared_canon_projection'
+          AND projection_row.source_row_id=?
+          AND NOT EXISTS (
+              SELECT 1 FROM main.memory_ledger_lineage AS incoming
+              WHERE incoming.guild_id=projection_row.guild_id
+                AND incoming.target_entry_id=projection_row.entry_id
+                AND incoming.lineage_type IN ('supersedes','retracts')
+          )
+    """
+    params: list[Any] = [int(guild_id or 0), str(declaration_id or "")]
+    normalized_exclusion = str(exclude_revision_id or "").strip()
+    if normalized_exclusion:
+        sql += " AND projection_row.source_revision!=?"
+        params.append(normalized_exclusion)
+    sql += " ORDER BY projection_row.created_at,projection_row.entry_id"
+    return tuple(
+        sorted(
+            {
+                str(row[0])
+                for row in conn.execute(sql, params).fetchall()
+                if str(row[0] or "")
+            }
+        )
     )
 
 
@@ -8333,7 +8487,7 @@ def shadow_declared_canon_projection(
                 source_row = conn.execute(
                     """
                     SELECT cleaned_summary,updated_at,status
-                    FROM broadcast_memory
+                    FROM main.broadcast_memory
                     WHERE guild_id=? AND id=?
                     """,
                     (normalized_guild_id, int(revision.source_row_id)),
@@ -8360,7 +8514,7 @@ def shadow_declared_canon_projection(
                     """
                     SELECT guild_id,source_table,source_row_id,source_role,
                            source_revision,normalized_value,lifecycle_status
-                    FROM memory_ledger_entries
+                    FROM main.memory_ledger_entries
                     WHERE entry_id=?
                     """,
                     (roots[0],),
@@ -8392,7 +8546,7 @@ def shadow_declared_canon_projection(
                     or conn.execute(
                         """
                         SELECT 1
-                        FROM memory_ledger_lineage
+                        FROM main.memory_ledger_lineage
                         WHERE guild_id=? AND target_entry_id=?
                           AND lineage_type IN ('supersedes','retracts')
                         LIMIT 1
@@ -8410,7 +8564,7 @@ def shadow_declared_canon_projection(
                 current_primary_count = conn.execute(
                     """
                     SELECT COUNT(*)
-                    FROM memory_ledger_entries AS root
+                    FROM main.memory_ledger_entries AS root
                     WHERE root.guild_id=?
                       AND root.source_table='broadcast_memory'
                       AND root.source_row_id=?
@@ -8418,7 +8572,7 @@ def shadow_declared_canon_projection(
                       AND root.lifecycle_status='active'
                       AND NOT EXISTS (
                         SELECT 1
-                        FROM memory_ledger_lineage AS edge
+                        FROM main.memory_ledger_lineage AS edge
                         WHERE edge.guild_id=root.guild_id
                           AND edge.target_entry_id=root.entry_id
                           AND edge.lineage_type IN ('supersedes','retracts')
@@ -8445,33 +8599,12 @@ def shadow_declared_canon_projection(
                 )
             value = revision.cleaned_summary or revision.value_json
 
-        previous: tuple[str, ...] = ()
-        if revision.previous_revision_id:
-            prior_rows = conn.execute(
-                """
-                SELECT entry_id
-                FROM memory_ledger_entries
-                WHERE guild_id=?
-                  AND source_table='declared_canon_projection'
-                  AND source_row_id=?
-                  AND source_revision=?
-                ORDER BY created_at DESC
-                """,
-                (
-                    normalized_guild_id,
-                    declaration_id,
-                    revision.previous_revision_id,
-                ),
-            ).fetchall()
-            if len(prior_rows) != 1:
-                return skipped_result(
-                    guild_id=normalized_guild_id,
-                    source_table="declared_canon_projection",
-                    source_row_id=declaration_id,
-                    source_revision=revision_id,
-                    reason_code="declared_projection_previous_revision_missing",
-                )
-            previous = (str(prior_rows[0][0]),)
+        previous = _effective_declared_projection_entries(
+            conn,
+            guild_id=normalized_guild_id,
+            declaration_id=declaration_id,
+            exclude_revision_id=revision_id,
+        )
 
         cross_declaration_previous: tuple[str, ...] = ()
         if revision.supersedes_declaration_id:
@@ -8479,7 +8612,7 @@ def shadow_declared_canon_projection(
                 """
                 SELECT previous_revision_id,lifecycle_status,
                        superseded_by_declaration_id
-                FROM declared_canon_revisions
+                FROM main.declared_canon_revisions
                 WHERE guild_id=? AND declaration_id=?
                 ORDER BY revision_number DESC
                 LIMIT 1
@@ -8504,34 +8637,10 @@ def shadow_declared_canon_projection(
                         "declared_projection_cross_supersession_invalid"
                     ),
                 )
-            superseded_projection_rows = conn.execute(
-                """
-                SELECT entry_id
-                FROM memory_ledger_entries
-                WHERE guild_id=?
-                  AND source_table='declared_canon_projection'
-                  AND source_row_id=?
-                  AND source_revision=?
-                ORDER BY created_at DESC
-                """,
-                (
-                    normalized_guild_id,
-                    revision.supersedes_declaration_id,
-                    str(superseded_latest[0]),
-                ),
-            ).fetchall()
-            if len(superseded_projection_rows) != 1:
-                return skipped_result(
-                    guild_id=normalized_guild_id,
-                    source_table="declared_canon_projection",
-                    source_row_id=declaration_id,
-                    source_revision=revision_id,
-                    reason_code=(
-                        "declared_projection_superseded_source_projection_missing"
-                    ),
-                )
-            cross_declaration_previous = (
-                str(superseded_projection_rows[0][0]),
+            cross_declaration_previous = _effective_declared_projection_entries(
+                conn,
+                guild_id=normalized_guild_id,
+                declaration_id=revision.supersedes_declaration_id,
             )
 
         lineage_items = [("derived_from", entry_id) for entry_id in roots]
@@ -8565,38 +8674,40 @@ def shadow_declared_canon_projection(
                 )
             )
 
-        return insert_ledger_entry(
-            conn,
-            LedgerEntry(
-                guild_id=normalized_guild_id,
-                source_table="declared_canon_projection",
-                source_row_id=declaration_id,
-                source_revision=revision_id,
-                source_event_key="revision:%s" % revision_id,
-                source_role="declared_canon_projection",
-                entry_type="canon_reference",
-                subject_key=subject_key,
-                subject_display_name="",
-                predicate_key=revision.predicate,
-                value=(value or "")[:500],
-                source_class=SourceClass.EVIDENCE_PROJECTION,
-                route_mode="declared_canon_review",
-                channel_policy="declared_canon_review",
-                visibility=Visibility.INTERNAL,
-                confidence=Confidence.LOW,
-                public_usable=False,
-                derived=True,
-                projection=True,
-                observed_at=revision.created_at or _now(),
-                lifecycle_status=(
-                    RESOLVED_LIFECYCLE
-                    if revision.lifecycle_status
-                    in {"resolved", "retired", "superseded"}
-                    else REVIEW_ONLY_LIFECYCLE
-                ),
-                participants=tuple(participants),
-                lineage=lineage,
+        projection_entry = LedgerEntry(
+            guild_id=normalized_guild_id,
+            source_table="declared_canon_projection",
+            source_row_id=declaration_id,
+            source_revision=revision_id,
+            source_event_key="revision:%s" % revision_id,
+            source_role="declared_canon_projection",
+            entry_type="canon_reference",
+            subject_key=subject_key,
+            subject_display_name="",
+            predicate_key=revision.predicate,
+            value=(value or "")[:500],
+            source_class=SourceClass.EVIDENCE_PROJECTION,
+            route_mode="declared_canon_review",
+            channel_policy="declared_canon_review",
+            visibility=Visibility.INTERNAL,
+            confidence=Confidence.LOW,
+            public_usable=False,
+            derived=True,
+            projection=True,
+            observed_at=revision.created_at or _now(),
+            lifecycle_status=(
+                RESOLVED_LIFECYCLE
+                if revision.lifecycle_status
+                in {"resolved", "retired", "superseded"}
+                else REVIEW_ONLY_LIFECYCLE
             ),
+            participants=tuple(participants),
+            lineage=lineage,
+        )
+        return _insert_or_reconcile_ledger_lineage(
+            conn,
+            projection_entry,
+            conflict_reason="declared_projection_identity_conflict",
         )
 
 

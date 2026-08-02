@@ -35,6 +35,9 @@ class DeclaredCanonProjectionTests(unittest.TestCase):
             {
                 "BNL_OWNER_USER_ID": "61",
                 "BNL_PRIMARY_GUILD_ID": "7",
+                "BNL_DECLARED_CANON_AUTHORITY_SECRET": (
+                    "declared-projection-test-authority-secret-2026-08-01"
+                ),
             },
         )
         self.env.start()
@@ -66,6 +69,46 @@ class DeclaredCanonProjectionTests(unittest.TestCase):
             expected_lifecycle_status=revision.lifecycle_status,
             root_entry_ids=root_entry_ids,
         )
+
+    def add_projection_fixture(
+        self,
+        *,
+        declaration_id,
+        revision_id,
+        value="Stale Declared projection fixture.",
+    ):
+        result = ledger.insert_ledger_entry(
+            self.conn,
+            ledger.LedgerEntry(
+                guild_id=7,
+                source_table="declared_canon_projection",
+                source_row_id=declaration_id,
+                source_revision=revision_id,
+                source_event_key="revision:%s" % revision_id,
+                source_role="declared_canon_projection",
+                entry_type="canon_reference",
+                subject_key="project:barcode_radio",
+                predicate_key="current_role",
+                value=value,
+                source_class=ledger.SourceClass.EVIDENCE_PROJECTION,
+                route_mode="declared_canon_review",
+                channel_policy="declared_canon_review",
+                visibility=ledger.Visibility.INTERNAL,
+                confidence=ledger.Confidence.LOW,
+                public_usable=False,
+                derived=True,
+                projection=True,
+                observed_at="2026-08-01T00:00:00+00:00",
+                lifecycle_status=ledger.REVIEW_ONLY_LIFECYCLE,
+                participants=(
+                    ledger.LedgerParticipant(
+                        "project:barcode_radio", "", "subject", 0
+                    ),
+                ),
+            ),
+        )
+        self.assertEqual(result.outcome, "inserted")
+        return result
 
     @staticmethod
     def create_broadcast_table(conn):
@@ -506,6 +549,153 @@ class DeclaredCanonProjectionTests(unittest.TestCase):
         ).fetchone()[0]
         self.assertEqual(live_rows, 0)
 
+    def test_terminal_projection_retracts_all_effective_older_rows_and_retry(self):
+        original_revision = self.add_claim("projection-terminal-all-add1")
+        original_projection = self.project(
+            original_revision, "projection-terminal-all-run1"
+        )
+        duplicate_projection = self.add_projection_fixture(
+            declaration_id=original_revision.declaration_id,
+            revision_id="stale-terminal-duplicate-revision",
+        )
+        self.conn.commit()
+        retired_revision = declared.retire_declared_canon(
+            self.conn,
+            actor_user_id=61,
+            authority_nonce="projection-terminal-all-retire1",
+            guild_id=7,
+            declaration_id=original_revision.declaration_id,
+            expected_revision_id=original_revision.revision_id,
+            reason="Retire every stale Declared representation.",
+            now="2026-08-01T00:02:00+00:00",
+        ).primary
+
+        terminal_projection = self.project(
+            retired_revision, "projection-terminal-all-run2"
+        )
+
+        self.assertEqual(terminal_projection.outcome, "inserted")
+        self.assertEqual(
+            {
+                row[1]
+                for row in self.conn.execute(
+                    """
+                    SELECT lineage_type,target_entry_id
+                    FROM memory_ledger_lineage WHERE entry_id=?
+                      AND lineage_type='retracts'
+                    """,
+                    (terminal_projection.entry_id,),
+                ).fetchall()
+            },
+            {original_projection.entry_id, duplicate_projection.entry_id},
+        )
+
+        late_projection = self.add_projection_fixture(
+            declaration_id=original_revision.declaration_id,
+            revision_id="late-terminal-duplicate-revision",
+        )
+        self.conn.commit()
+        retry = self.project(
+            retired_revision, "projection-terminal-all-run3"
+        )
+
+        self.assertEqual(retry.entry_id, terminal_projection.entry_id)
+        self.assertEqual(retry.outcome, "deduplicated")
+        self.assertEqual(
+            retry.reason_code,
+            "exact_source_duplicate_lineage_reconciled",
+        )
+        self.assertEqual(
+            {
+                row[0]
+                for row in self.conn.execute(
+                    """
+                    SELECT target_entry_id FROM memory_ledger_lineage
+                    WHERE entry_id=? AND lineage_type='retracts'
+                    """,
+                    (terminal_projection.entry_id,),
+                ).fetchall()
+            },
+            {
+                original_projection.entry_id,
+                duplicate_projection.entry_id,
+                late_projection.entry_id,
+            },
+        )
+        self.assertEqual(
+            ledger._effective_declared_projection_entries(
+                self.conn,
+                guild_id=7,
+                declaration_id=original_revision.declaration_id,
+                exclude_revision_id=retired_revision.revision_id,
+            ),
+            (),
+        )
+
+    def test_terminal_projection_lineage_failure_rolls_back_entry_and_edges(self):
+        original_revision = self.add_claim("projection-rollback-add1")
+        original_projection = self.project(
+            original_revision, "projection-rollback-run1"
+        )
+        duplicate_projection = self.add_projection_fixture(
+            declaration_id=original_revision.declaration_id,
+            revision_id="rollback-duplicate-revision",
+        )
+        self.conn.commit()
+        retired_revision = declared.retire_declared_canon(
+            self.conn,
+            actor_user_id=61,
+            authority_nonce="projection-rollback-retire1",
+            guild_id=7,
+            declaration_id=original_revision.declaration_id,
+            expected_revision_id=original_revision.revision_id,
+            reason="Atomic rollback fixture.",
+            now="2026-08-01T00:02:00+00:00",
+        ).primary
+        self.conn.execute(
+            """
+            CREATE TRIGGER reject_declared_projection_retraction
+            BEFORE INSERT ON memory_ledger_lineage
+            WHEN NEW.lineage_type='retracts'
+             AND NEW.target_entry_id='%s'
+            BEGIN
+                SELECT RAISE(ABORT, 'declared retraction rejected');
+            END
+            """ % duplicate_projection.entry_id
+        )
+        self.conn.commit()
+
+        with self.assertRaisesRegex(
+            sqlite3.IntegrityError, "declared retraction rejected"
+        ):
+            self.project(retired_revision, "projection-rollback-run2")
+
+        terminal_entry_id = ledger.stable_entry_id(
+            guild_id=7,
+            source_table="declared_canon_projection",
+            source_row_id=retired_revision.declaration_id,
+            source_revision=retired_revision.revision_id,
+            entry_type="canon_reference",
+            subject_key="project:barcode_radio",
+            predicate_key="current_role",
+        )
+        self.assertIsNone(
+            self.conn.execute(
+                "SELECT 1 FROM memory_ledger_entries WHERE entry_id=?",
+                (terminal_entry_id,),
+            ).fetchone()
+        )
+        self.assertEqual(
+            set(
+                ledger._effective_declared_projection_entries(
+                    self.conn,
+                    guild_id=7,
+                    declaration_id=original_revision.declaration_id,
+                )
+            ),
+            {original_projection.entry_id, duplicate_projection.entry_id},
+        )
+
     def test_typed_subject_keys_do_not_collapse_person_and_project(self):
         person = self.add_claim(
             "projection-person1",
@@ -579,7 +769,7 @@ class DeclaredCanonProjectionTests(unittest.TestCase):
             ],
         )
 
-    def test_cross_declaration_supersession_preserves_exact_lineage(self):
+    def test_cross_declaration_supersession_invalidates_all_effective_lineage(self):
         old_revision = self.add_claim(
             "projection-old-add1",
             subject_id="old_broadcast_role",
@@ -595,6 +785,15 @@ class DeclaredCanonProjectionTests(unittest.TestCase):
             replacement_revision,
             "projection-new-run1",
         )
+        old_duplicate = self.add_projection_fixture(
+            declaration_id=old_revision.declaration_id,
+            revision_id="old-cross-duplicate-revision",
+        )
+        replacement_duplicate = self.add_projection_fixture(
+            declaration_id=replacement_revision.declaration_id,
+            revision_id="replacement-cross-duplicate-revision",
+        )
+        self.conn.commit()
 
         supersession = declared.supersede_declared_canon(
             self.conn,
@@ -646,13 +845,12 @@ class DeclaredCanonProjectionTests(unittest.TestCase):
             replacement_edges,
             {
                 ("supersedes", replacement_projection.entry_id),
+                ("supersedes", replacement_duplicate.entry_id),
                 ("supersedes", old_projection.entry_id),
+                ("supersedes", old_duplicate.entry_id),
             },
         )
-        self.assertEqual(
-            old_terminal_edges,
-            {("retracts", old_projection.entry_id)},
-        )
+        self.assertEqual(old_terminal_edges, set())
 
     def test_projection_holds_source_snapshot_until_insert(self):
         handle = tempfile.NamedTemporaryFile(delete=False)
