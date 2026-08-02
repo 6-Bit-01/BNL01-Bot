@@ -544,6 +544,114 @@ class MemoryLedgerV1Tests(unittest.TestCase):
             (),
         )
 
+    def test_broadcast_status_event_retracts_all_terminal_orphan_sidecars(self):
+        self.conn.execute(
+            """
+            CREATE TABLE broadcast_memory(
+                id INTEGER PRIMARY KEY,
+                guild_id INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                corrected_by_user_id INTEGER,
+                corrected_by_name TEXT,
+                superseded_by_id INTEGER
+            )
+            """
+        )
+        self.conn.execute(
+            """
+            CREATE TABLE declared_canon_revisions(
+                revision_id TEXT NOT NULL,
+                declaration_id TEXT NOT NULL,
+                guild_id INTEGER NOT NULL,
+                source_system TEXT NOT NULL,
+                source_row_id TEXT NOT NULL,
+                lifecycle_status TEXT NOT NULL
+            )
+            """
+        )
+        self.conn.execute(
+            """
+            INSERT INTO broadcast_memory VALUES(
+                76,1,'resolved','2026-08-01T01:00:00+00:00',
+                61,'configured_owner',NULL
+            )
+            """
+        )
+        projections = []
+        for status in (
+            "established",
+            "contested",
+            "review_only",
+            "resolved",
+            "retired",
+            "superseded",
+        ):
+            declaration_id = "orphan-%s-declaration" % status
+            revision_id = "orphan-%s-revision" % status
+            projections.append(
+                self.add_declared_projection(
+                    declaration_id=declaration_id,
+                    revision_id=revision_id,
+                ).entry_id
+            )
+            self.conn.execute(
+                """
+                INSERT INTO declared_canon_revisions VALUES(
+                    ?,?,1,'broadcast_memory','76',?
+                )
+                """,
+                (revision_id, declaration_id, status),
+            )
+        self.conn.commit()
+
+        before = ledger.effective_broadcast_representations(
+            self.conn, guild_id=1, source_row_id=76
+        )
+        self.assertEqual(
+            set(before.declared_projection_entry_ids),
+            set(projections),
+        )
+
+        status = ledger.shadow_broadcast_status_event(
+            self.conn,
+            row_id=76,
+            guild_id=1,
+            status="resolved",
+            updated_at="2026-08-01T01:00:00+00:00",
+            actor_id=61,
+            actor_name="configured_owner",
+        )
+
+        self.assertEqual(status.outcome, "inserted")
+        projection_status = self.conn.execute(
+            """
+            SELECT entry_id FROM memory_ledger_entries
+            WHERE source_table='broadcast_memory'
+              AND source_row_id='76'
+              AND source_role='broadcast_memory_projection_status'
+            """
+        ).fetchone()[0]
+        self.assertEqual(
+            {
+                row[0]
+                for row in self.conn.execute(
+                    """
+                    SELECT target_entry_id FROM memory_ledger_lineage
+                    WHERE entry_id=? AND lineage_type='retracts'
+                    """,
+                    (projection_status,),
+                ).fetchall()
+            },
+            set(projections),
+        )
+        self.assertEqual(
+            ledger.effective_broadcast_representations(
+                self.conn, guild_id=1, source_row_id=76
+            ).all_entry_ids,
+            (),
+        )
+
     def test_broadcast_status_retry_reconciles_late_duplicate_lineage(self):
         self.conn.execute(
             """

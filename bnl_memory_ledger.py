@@ -7684,7 +7684,6 @@ def effective_broadcast_representations(
               AND projection_row.source_role='declared_canon_projection'
               AND revision.source_system='broadcast_memory'
               AND revision.source_row_id=?
-              AND revision.lifecycle_status='established'
               AND %s
             ORDER BY projection_row.entry_id
             """ % projection_clause,
