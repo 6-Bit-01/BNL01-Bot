@@ -574,7 +574,7 @@ class MemoryLedgerV1Tests(unittest.TestCase):
             """
             INSERT INTO broadcast_memory VALUES(
                 76,1,'resolved','2026-08-01T01:00:00+00:00',
-                61,'configured_owner',NULL
+                61,'Test Member',NULL
             )
             """
         )
@@ -620,7 +620,7 @@ class MemoryLedgerV1Tests(unittest.TestCase):
             status="resolved",
             updated_at="2026-08-01T01:00:00+00:00",
             actor_id=61,
-            actor_name="configured_owner",
+            actor_name="Test Member",
         )
 
         self.assertEqual(status.outcome, "inserted")
