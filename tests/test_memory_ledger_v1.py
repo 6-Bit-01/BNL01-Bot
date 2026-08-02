@@ -8,11 +8,17 @@ import bnl_memory_ledger as ledger
 
 class MemoryLedgerV1Tests(unittest.TestCase):
     def setUp(self):
+        self.env = mock.patch.dict(
+            os.environ,
+            {"BNL_OWNER_USER_ID": "61", "BNL_PRIMARY_GUILD_ID": "1"},
+        )
+        self.env.start()
         self.conn = sqlite3.connect(":memory:")
         ledger.ensure_memory_ledger_schema(self.conn)
 
     def tearDown(self):
         self.conn.close()
+        self.env.stop()
 
     def count_entries(self):
         return self.conn.execute("SELECT COUNT(*) FROM memory_ledger_entries").fetchone()[0]
@@ -237,6 +243,237 @@ class MemoryLedgerV1Tests(unittest.TestCase):
             ledger.shadow_broadcast_memory_row(self.conn, row_id=idx, guild_id=1, cleaned_summary=f"Summary {idx}", entry_type="show_note", public_safe=(idx != 64), status="active", usage_scope=scope)
             row = self.conn.execute("SELECT public_usable, visibility FROM memory_ledger_entries WHERE source_row_id=?", (str(idx),)).fetchone()
             self.assertEqual(row, (expected_public, expected_visibility))
+
+    def test_broadcast_status_event_retracts_the_active_source_projection(self):
+        self.conn.execute(
+            """
+            CREATE TABLE broadcast_memory(
+                id INTEGER PRIMARY KEY,
+                guild_id INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                corrected_by_user_id INTEGER,
+                corrected_by_name TEXT,
+                superseded_by_id INTEGER
+            )
+            """
+        )
+        self.conn.execute(
+            """
+            INSERT INTO broadcast_memory(
+                id,guild_id,status,updated_at,corrected_by_user_id,
+                corrected_by_name,superseded_by_id
+            ) VALUES(70,1,'active','2026-08-01T00:00:00+00:00',NULL,NULL,NULL)
+            """
+        )
+        original = ledger.shadow_broadcast_memory_row(
+            self.conn,
+            row_id=70,
+            guild_id=1,
+            cleaned_summary="A current Broadcast fact.",
+            entry_type="notable_moment",
+            public_safe=True,
+            status="active",
+            usage_scope="ambient,direct",
+            updated_at="2026-08-01T00:00:00+00:00",
+        )
+        self.conn.execute(
+            """
+            UPDATE broadcast_memory
+            SET status='resolved',updated_at=?,corrected_by_user_id=?,
+                corrected_by_name=?
+            WHERE guild_id=1 AND id=70
+            """,
+            ("2026-08-01T01:00:00+00:00", 61, "configured_owner"),
+        )
+        status = ledger.shadow_broadcast_status_event(
+            self.conn,
+            row_id=70,
+            guild_id=1,
+            status="resolved",
+            updated_at="2026-08-01T01:00:00+00:00",
+            actor_id=61,
+            actor_name="configured_owner",
+        )
+        self.assertEqual(status.outcome, "inserted")
+        self.assertEqual(
+            self.conn.execute(
+                """
+                SELECT lineage_type,target_entry_id
+                FROM memory_ledger_lineage WHERE entry_id=?
+                """,
+                (status.entry_id,),
+            ).fetchall(),
+            [("retracts", original.entry_id)],
+        )
+        self.assertEqual(
+            self.conn.execute(
+                """
+                SELECT COUNT(*) FROM memory_ledger_entries
+                WHERE source_table='broadcast_memory'
+                  AND source_role='broadcast_memory'
+                  AND lifecycle_status='active'
+                  AND entry_id NOT IN (
+                    SELECT target_entry_id FROM memory_ledger_lineage
+                    WHERE lineage_type IN ('supersedes','retracts')
+                  )
+                """
+            ).fetchone()[0],
+            0,
+        )
+
+    def test_broadcast_status_event_retracts_every_duplicate_effective_root(self):
+        self.conn.execute(
+            """
+            CREATE TABLE broadcast_memory(
+                id INTEGER PRIMARY KEY,
+                guild_id INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                corrected_by_user_id INTEGER,
+                corrected_by_name TEXT,
+                superseded_by_id INTEGER
+            )
+            """
+        )
+        self.conn.execute(
+            "INSERT INTO broadcast_memory VALUES(72,1,'active',?,NULL,NULL,NULL)",
+            ("2026-08-01T00:00:00+00:00",),
+        )
+        roots = tuple(
+            ledger.shadow_broadcast_memory_row(
+                self.conn,
+                row_id=72,
+                guild_id=1,
+                cleaned_summary="Duplicate effective Broadcast root.",
+                entry_type="notable_moment",
+                public_safe=True,
+                status="active",
+                usage_scope="ambient,direct",
+                updated_at=updated_at,
+            ).entry_id
+            for updated_at in (
+                "2026-08-01T00:00:00+00:00",
+                "2026-08-01T00:01:00+00:00",
+            )
+        )
+        self.assertEqual(len(set(roots)), 2)
+        self.conn.execute(
+            """
+            UPDATE broadcast_memory
+            SET status='resolved',updated_at=?,corrected_by_user_id=?,
+                corrected_by_name=? WHERE guild_id=1 AND id=72
+            """,
+            ("2026-08-01T01:00:00+00:00", 61, "configured_owner"),
+        )
+        status = ledger.shadow_broadcast_status_event(
+            self.conn,
+            row_id=72,
+            guild_id=1,
+            status="resolved",
+            updated_at="2026-08-01T01:00:00+00:00",
+            actor_id=61,
+            actor_name="configured_owner",
+        )
+        self.assertEqual(status.outcome, "inserted")
+        self.assertEqual(
+            {
+                row[0]
+                for row in self.conn.execute(
+                    """
+                    SELECT target_entry_id FROM memory_ledger_lineage
+                    WHERE entry_id=? AND lineage_type='retracts'
+                    """,
+                    (status.entry_id,),
+                ).fetchall()
+            },
+            set(roots),
+        )
+        self.assertEqual(
+            ledger._effective_broadcast_primary_entries(
+                self.conn, guild_id=1, source_row_id=72
+            ),
+            (),
+        )
+
+    def test_broadcast_status_event_fails_closed_on_actor_or_stale_snapshot(self):
+        self.conn.execute(
+            """
+            CREATE TABLE broadcast_memory(
+                id INTEGER PRIMARY KEY,
+                guild_id INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                corrected_by_user_id INTEGER,
+                corrected_by_name TEXT,
+                superseded_by_id INTEGER
+            )
+            """
+        )
+        self.conn.execute(
+            """
+            INSERT INTO broadcast_memory VALUES(
+                71,1,'resolved','2026-08-01T01:00:00+00:00',
+                61,'configured_owner',NULL
+            )
+            """
+        )
+        original = ledger.shadow_broadcast_memory_row(
+            self.conn,
+            row_id=71,
+            guild_id=1,
+            cleaned_summary="A source that must not be retracted by stale input.",
+            entry_type="notable_moment",
+            public_safe=True,
+            status="active",
+            usage_scope="ambient,direct",
+            updated_at="2026-08-01T00:00:00+00:00",
+        )
+        before_entries = self.count_entries()
+
+        nonowner = ledger.shadow_broadcast_status_event(
+            self.conn,
+            row_id=71,
+            guild_id=1,
+            status="resolved",
+            updated_at="2026-08-01T01:00:00+00:00",
+            actor_id=62,
+            actor_name="forged",
+        )
+        stale = ledger.shadow_broadcast_status_event(
+            self.conn,
+            row_id=71,
+            guild_id=1,
+            status="resolved",
+            updated_at="2026-08-01T00:59:59+00:00",
+            actor_id=61,
+            actor_name="configured_owner",
+        )
+
+        self.assertEqual(nonowner.outcome, "skipped")
+        self.assertEqual(
+            nonowner.reason_code,
+            "broadcast_status_configured_owner_required",
+        )
+        self.assertEqual(stale.outcome, "skipped")
+        self.assertEqual(
+            stale.reason_code,
+            "broadcast_status_source_snapshot_mismatch",
+        )
+        self.assertEqual(self.count_entries(), before_entries)
+        self.assertEqual(
+            self.conn.execute(
+                "SELECT COUNT(*) FROM memory_ledger_lineage"
+            ).fetchone()[0],
+            0,
+        )
+        self.assertEqual(
+            self.conn.execute(
+                "SELECT lifecycle_status FROM memory_ledger_entries WHERE entry_id=?",
+                (original.entry_id,),
+            ).fetchone()[0],
+            "active",
+        )
 
     def test_evaluation_detects_missing_success_receipt_entry_and_dangling_lineage(self):
         ledger.record_shadow_receipt(self.conn, guild_id=1, writer="test", source_table="conversations", source_row_id=999, outcome="inserted", reason_code="ok", entry_id="missing")

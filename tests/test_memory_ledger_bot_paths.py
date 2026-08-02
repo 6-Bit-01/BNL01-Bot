@@ -32,10 +32,21 @@ class _FailMessage(_Message):
 class MemoryLedgerBotPathTests(unittest.TestCase):
     def setUp(self):
         self.old_db = bnl01_bot.DB_FILE
+        self.old_owner_user_id = bnl01_bot.BNL_OWNER_USER_ID
+        self.old_primary_guild_id = bnl01_bot.BNL_PRIMARY_GUILD_ID
         self.tmp = tempfile.NamedTemporaryFile(delete=False)
         self.tmp.close()
         bnl01_bot.DB_FILE = self.tmp.name
-        self.env = mock.patch.dict(os.environ, {}, clear=False)
+        bnl01_bot.BNL_OWNER_USER_ID = 42
+        bnl01_bot.BNL_PRIMARY_GUILD_ID = 1
+        self.env = mock.patch.dict(
+            os.environ,
+            {
+                "BNL_OWNER_USER_ID": "42",
+                "BNL_PRIMARY_GUILD_ID": "1",
+            },
+            clear=False,
+        )
         self.env.start()
         os.environ.pop("BNL_MEMORY_LEDGER_SHADOW_ENABLED", None)
         bnl01_bot.init_db()
@@ -43,6 +54,8 @@ class MemoryLedgerBotPathTests(unittest.TestCase):
     def tearDown(self):
         self.env.stop()
         bnl01_bot.DB_FILE = self.old_db
+        bnl01_bot.BNL_OWNER_USER_ID = self.old_owner_user_id
+        bnl01_bot.BNL_PRIMARY_GUILD_ID = self.old_primary_guild_id
         try:
             os.unlink(self.tmp.name)
         except OSError:
@@ -702,6 +715,758 @@ class MemoryLedgerBotPathTests(unittest.TestCase):
         dump = str(self.rows("SELECT * FROM memory_ledger_shadow_receipts"))
         self.assertNotIn("RAW SECRET", dump)
 
+    def test_broadcast_low_level_mutations_require_configured_owner(self):
+        msg = _Message("RAW owner boundary note")
+        with mock.patch.object(bnl01_bot, "BNL_OWNER_USER_ID", 0):
+            with self.assertRaisesRegex(
+                PermissionError,
+                "owner_user_id_not_configured",
+            ):
+                bnl01_bot.add_broadcast_memory_entry(
+                    1,
+                    msg,
+                    {
+                        "cleaned_summary": "No write is allowed.",
+                        "entry_type": "notable_moment",
+                    },
+                )
+        with mock.patch.object(bnl01_bot, "BNL_OWNER_USER_ID", 999):
+            with self.assertRaisesRegex(
+                PermissionError,
+                "configured_owner_required",
+            ):
+                bnl01_bot.add_broadcast_memory_entry(
+                    1,
+                    msg,
+                    {
+                        "cleaned_summary": "Still no write is allowed.",
+                        "entry_type": "notable_moment",
+                    },
+                )
+        self.assertEqual(self.rows("SELECT COUNT(*) FROM broadcast_memory")[0][0], 0)
+
+    def test_broadcast_low_level_mutations_require_configured_primary_guild(self):
+        msg = _Message("RAW primary guild boundary note")
+        with mock.patch.object(bnl01_bot, "BNL_PRIMARY_GUILD_ID", 0):
+            with self.assertRaisesRegex(
+                PermissionError,
+                "primary_guild_id_not_configured",
+            ):
+                bnl01_bot.add_broadcast_memory_entry(
+                    1,
+                    msg,
+                    {
+                        "cleaned_summary": "No write without configured scope.",
+                        "entry_type": "notable_moment",
+                    },
+                )
+        with self.assertRaisesRegex(
+            PermissionError,
+            "configured_primary_guild_required",
+        ):
+            bnl01_bot.add_broadcast_memory_entry(
+                2,
+                msg,
+                {
+                    "cleaned_summary": "No cross-guild owner write.",
+                    "entry_type": "notable_moment",
+                },
+            )
+        self.assertEqual(self.rows("SELECT COUNT(*) FROM broadcast_memory")[0][0], 0)
+
+    def test_raw_broadcast_insert_helper_rechecks_owner_and_guild(self):
+        with sqlite3.connect(bnl01_bot.DB_FILE) as conn:
+            with mock.patch.object(bnl01_bot, "BNL_OWNER_USER_ID", 999):
+                with self.assertRaisesRegex(
+                    PermissionError,
+                    "configured_owner_required",
+                ):
+                    bnl01_bot._insert_broadcast_memory_row(
+                        conn,
+                        guild_id=1,
+                        actor_id=42,
+                        actor_name="forged",
+                        raw_content="RAW direct helper bypass",
+                        processed={
+                            "cleaned_summary": "Must not be inserted.",
+                            "entry_type": "notable_moment",
+                        },
+                        now="2026-08-01T00:00:00+00:00",
+                    )
+        self.assertEqual(self.rows("SELECT COUNT(*) FROM broadcast_memory")[0][0], 0)
+
+    def test_broadcast_status_mutation_rejects_cross_guild_scope(self):
+        memory_id = bnl01_bot.add_broadcast_memory_entry(
+            1,
+            _Message("RAW scoped status note"),
+            {
+                "cleaned_summary": "Guild-scoped status fixture.",
+                "entry_type": "notable_moment",
+                "public_safe": True,
+                "usage_scope": "ambient,direct",
+            },
+        )
+        with self.assertRaisesRegex(
+            PermissionError,
+            "configured_primary_guild_required",
+        ):
+            bnl01_bot._set_broadcast_memory_status(
+                2,
+                memory_id,
+                "resolved",
+                42,
+                "6 Bit",
+                "cross-guild hostile fixture",
+            )
+        self.assertEqual(
+            self.rows(
+                "SELECT status FROM broadcast_memory WHERE guild_id=1 AND id=?",
+                (memory_id,),
+            )[0][0],
+            "active",
+        )
+
+    def test_broadcast_status_helper_rejects_unowned_transition(self):
+        memory_id = bnl01_bot.add_broadcast_memory_entry(
+            1,
+            _Message("RAW status transition note"),
+            {
+                "cleaned_summary": "Status transition fixture.",
+                "entry_type": "notable_moment",
+            },
+        )
+        with self.assertRaisesRegex(
+            ValueError,
+            "broadcast_status_transition_not_allowed",
+        ):
+            bnl01_bot._set_broadcast_memory_status(
+                1,
+                memory_id,
+                "active",
+                42,
+                "6 Bit",
+                "attempted reactivation",
+            )
+        self.assertEqual(
+            self.rows("SELECT status FROM broadcast_memory WHERE id=?", (memory_id,))[0][0],
+            "active",
+        )
+
+    def test_broadcast_status_cannot_rewrite_superseded_source(self):
+        original_id = bnl01_bot.add_broadcast_memory_entry(
+            1,
+            _Message("RAW original status fixture"),
+            {
+                "cleaned_summary": "Original status fixture.",
+                "entry_type": "notable_moment",
+            },
+        )
+        replacement_id = bnl01_bot._replace_broadcast_memory_entry(
+            1,
+            original_id,
+            _Message("RAW replacement status fixture"),
+            {
+                "cleaned_summary": "Replacement status fixture.",
+                "entry_type": "notable_moment",
+            },
+        )
+        self.assertEqual(
+            bnl01_bot._set_broadcast_memory_status(
+                1,
+                original_id,
+                "resolved",
+                42,
+                "6 Bit",
+                "hostile terminal rewrite",
+            ),
+            0,
+        )
+        self.assertEqual(
+            self.rows(
+                "SELECT status,superseded_by_id FROM broadcast_memory WHERE id=?",
+                (original_id,),
+            )[0],
+            ("superseded", replacement_id),
+        )
+
+    def test_broadcast_status_resolution_is_single_use_and_retracts_source(self):
+        self.enable()
+        memory_id = bnl01_bot.add_broadcast_memory_entry(
+            1,
+            _Message("RAW status resolution note"),
+            {
+                "cleaned_summary": "Status resolution fixture.",
+                "entry_type": "notable_moment",
+                "public_safe": True,
+                "usage_scope": "ambient,direct",
+            },
+        )
+        self.assertEqual(
+            bnl01_bot._set_broadcast_memory_status(
+                1, memory_id, "resolved", 42, "6 Bit", "no longer current"
+            ),
+            1,
+        )
+        self.assertEqual(
+            bnl01_bot._set_broadcast_memory_status(
+                1, memory_id, "resolved", 42, "6 Bit", "replayed command"
+            ),
+            0,
+        )
+        source_entry = self.rows(
+            """
+            SELECT entry_id FROM memory_ledger_entries
+            WHERE source_table='broadcast_memory'
+              AND source_role='broadcast_memory' AND source_row_id=?
+            """,
+            (str(memory_id),),
+        )[0][0]
+        status_entry = self.rows(
+            """
+            SELECT entry_id FROM memory_ledger_entries
+            WHERE source_table='broadcast_memory'
+              AND source_role='broadcast_memory_status' AND source_row_id=?
+            """,
+            (str(memory_id),),
+        )[0][0]
+        self.assertEqual(
+            self.rows(
+                """
+                SELECT lineage_type,target_entry_id
+                FROM memory_ledger_lineage WHERE entry_id=?
+                """,
+                (status_entry,),
+            ),
+            [("retracts", source_entry)],
+        )
+
+    def test_broadcast_status_resolution_retracts_all_duplicate_primary_roots(self):
+        self.enable()
+        memory_id = bnl01_bot.add_broadcast_memory_entry(
+            1,
+            _Message("RAW duplicate primary resolution note"),
+            {
+                "cleaned_summary": "Duplicate primary resolution fixture.",
+                "entry_type": "notable_moment",
+                "public_safe": True,
+                "usage_scope": "ambient,direct",
+            },
+        )
+        with sqlite3.connect(bnl01_bot.DB_FILE) as conn:
+            duplicate = ledger.shadow_broadcast_memory_row(
+                conn,
+                row_id=memory_id,
+                guild_id=1,
+                cleaned_summary="Duplicate primary resolution fixture.",
+                entry_type="notable_moment",
+                public_safe=True,
+                status="active",
+                usage_scope="ambient,direct",
+                updated_at="duplicate-effective-revision",
+            )
+            self.assertEqual(duplicate.outcome, "inserted")
+        primary_ids = {
+            row[0]
+            for row in self.rows(
+                """
+                SELECT entry_id FROM memory_ledger_entries
+                WHERE source_table='broadcast_memory'
+                  AND source_role='broadcast_memory' AND source_row_id=?
+                """,
+                (str(memory_id),),
+            )
+        }
+        self.assertEqual(len(primary_ids), 2)
+        self.assertEqual(
+            bnl01_bot._set_broadcast_memory_status(
+                1, memory_id, "resolved", 42, "6 Bit", "terminal correction"
+            ),
+            1,
+        )
+        status_entry = self.rows(
+            """
+            SELECT entry_id FROM memory_ledger_entries
+            WHERE source_table='broadcast_memory'
+              AND source_role='broadcast_memory_status' AND source_row_id=?
+            """,
+            (str(memory_id),),
+        )[0][0]
+        self.assertEqual(
+            {
+                row[0]
+                for row in self.rows(
+                    """
+                    SELECT target_entry_id FROM memory_ledger_lineage
+                    WHERE entry_id=? AND lineage_type='retracts'
+                    """,
+                    (status_entry,),
+                )
+            },
+            primary_ids,
+        )
+
+    def test_broadcast_status_resolution_cannot_rewrite_superseded_source(self):
+        self.enable()
+        original_id = bnl01_bot.add_broadcast_memory_entry(
+            1,
+            _Message("RAW original status source"),
+            {
+                "cleaned_summary": "Original source.",
+                "entry_type": "notable_moment",
+                "public_safe": True,
+                "usage_scope": "ambient,direct",
+            },
+        )
+        replacement_id = bnl01_bot._replace_broadcast_memory_entry(
+            1,
+            original_id,
+            _Message("RAW replacement status source"),
+            {
+                "cleaned_summary": "Replacement source.",
+                "entry_type": "notable_moment",
+                "public_safe": True,
+                "usage_scope": "ambient,direct",
+            },
+        )
+        before = self.rows(
+            """
+            SELECT status,superseded_by_id,corrected_by_user_id,correction_reason
+            FROM broadcast_memory WHERE id=?
+            """,
+            (original_id,),
+        )[0]
+        self.assertEqual(
+            bnl01_bot._set_broadcast_memory_status(
+                1, original_id, "resolved", 42, "6 Bit", "hostile replay"
+            ),
+            0,
+        )
+        self.assertEqual(
+            self.rows(
+                """
+                SELECT status,superseded_by_id,corrected_by_user_id,correction_reason
+                FROM broadcast_memory WHERE id=?
+                """,
+                (original_id,),
+            )[0],
+            before,
+        )
+        self.assertEqual(before[0:2], ("superseded", replacement_id))
+
+    def test_clear_show_state_low_level_helper_requires_owner(self):
+        with mock.patch.object(bnl01_bot, "BNL_OWNER_USER_ID", 999):
+            with self.assertRaisesRegex(
+                PermissionError,
+                "configured_owner_required",
+            ):
+                bnl01_bot.clear_active_show_state_overrides(1, 42)
+
+    def test_clear_show_state_records_each_resolved_lineage_event(self):
+        self.enable()
+        ids = [
+            bnl01_bot.add_broadcast_memory_entry(
+                1,
+                _Message(f"RAW show override {index}"),
+                {
+                    "cleaned_summary": f"Show override fixture {index}.",
+                    "entry_type": "show_state_override",
+                    "importance": "high",
+                    "public_safe": True,
+                    "usage_scope": "show_status,direct",
+                },
+            )
+            for index in (1, 2)
+        ]
+        self.assertEqual(bnl01_bot.clear_active_show_state_overrides(1, 42), 2)
+        self.assertEqual(
+            self.rows(
+                """
+                SELECT id,status,corrected_by_user_id,corrected_by_name,
+                       correction_reason
+                FROM broadcast_memory WHERE id IN (?,?) ORDER BY id
+                """,
+                tuple(ids),
+            ),
+            [
+                (
+                    ids[0],
+                    "resolved",
+                    42,
+                    "configured_owner",
+                    "owner restored normal show state",
+                ),
+                (
+                    ids[1],
+                    "resolved",
+                    42,
+                    "configured_owner",
+                    "owner restored normal show state",
+                ),
+            ],
+        )
+        self.assertEqual(
+            self.rows(
+                """
+                SELECT source_row_id,lifecycle_status
+                FROM memory_ledger_entries
+                WHERE source_table='broadcast_memory'
+                  AND source_role='broadcast_memory_status'
+                ORDER BY CAST(source_row_id AS INTEGER)
+                """
+            ),
+            [(str(ids[0]), "resolved"), (str(ids[1]), "resolved")],
+        )
+
+    def test_clear_show_state_rolls_back_before_shadow_on_update_failure(self):
+        self.enable()
+        memory_id = bnl01_bot.add_broadcast_memory_entry(
+            1,
+            _Message("RAW show override rollback"),
+            {
+                "cleaned_summary": "Show override rollback fixture.",
+                "entry_type": "show_state_override",
+                "importance": "high",
+            },
+        )
+        with sqlite3.connect(bnl01_bot.DB_FILE) as conn:
+            conn.execute(
+                """
+                CREATE TRIGGER reject_test_show_state_resolution
+                BEFORE UPDATE OF status ON broadcast_memory
+                WHEN NEW.status='resolved'
+                BEGIN
+                    SELECT RAISE(ABORT, 'forced show-state failure');
+                END
+                """
+            )
+        with self.assertRaises(sqlite3.DatabaseError):
+            bnl01_bot.clear_active_show_state_overrides(1, 42)
+        self.assertEqual(
+            self.rows("SELECT status FROM broadcast_memory WHERE id=?", (memory_id,))[0][0],
+            "active",
+        )
+        self.assertEqual(
+            self.rows(
+                """
+                SELECT COUNT(*) FROM memory_ledger_entries
+                WHERE source_table='broadcast_memory'
+                  AND source_role='broadcast_memory_status'
+                  AND source_row_id=?
+                """,
+                (str(memory_id),),
+            )[0][0],
+            0,
+        )
+
+    def test_broadcast_add_rolls_back_when_required_primary_shadow_fails(self):
+        self.enable()
+        with mock.patch.object(
+            bnl01_bot,
+            "shadow_broadcast_memory_row",
+            side_effect=RuntimeError("forced primary shadow failure"),
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "forced primary shadow failure",
+            ):
+                bnl01_bot.add_broadcast_memory_entry(
+                    1,
+                    _Message("RAW atomic add rollback"),
+                    {
+                        "cleaned_summary": "Atomic add rollback fixture.",
+                        "entry_type": "notable_moment",
+                        "public_safe": True,
+                        "usage_scope": "ambient,direct",
+                    },
+                )
+        self.assertEqual(
+            self.rows("SELECT COUNT(*) FROM broadcast_memory")[0][0],
+            0,
+        )
+        self.assertEqual(
+            self.rows(
+                "SELECT COUNT(*) FROM memory_ledger_entries "
+                "WHERE source_table='broadcast_memory'"
+            )[0][0],
+            0,
+        )
+
+    def test_broadcast_add_rejects_a_wrong_primary_deduplication(self):
+        self.enable()
+        hostile_dedup = ledger.LedgerWriteResult(
+            entry_id="mle_hostile_existing_snapshot",
+            outcome="deduplicated",
+            reason_code="exact_source_duplicate",
+            source_table="broadcast_memory",
+            source_row_id="1",
+            source_revision="rev:1:hostile",
+            guild_id=1,
+        )
+        with mock.patch.object(
+            bnl01_bot,
+            "shadow_broadcast_memory_row",
+            return_value=hostile_dedup,
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "broadcast_shadow_write_required:deduplicated",
+            ):
+                bnl01_bot.add_broadcast_memory_entry(
+                    1,
+                    _Message("RAW hostile dedup rollback"),
+                    {
+                        "cleaned_summary": "Hostile dedup rollback fixture.",
+                        "entry_type": "notable_moment",
+                        "public_safe": True,
+                        "usage_scope": "ambient,direct",
+                    },
+                )
+        self.assertEqual(
+            self.rows("SELECT COUNT(*) FROM broadcast_memory")[0][0],
+            0,
+        )
+
+    def test_broadcast_resolution_rolls_back_when_required_retraction_fails(self):
+        self.enable()
+        memory_id = bnl01_bot.add_broadcast_memory_entry(
+            1,
+            _Message("RAW atomic resolve rollback"),
+            {
+                "cleaned_summary": "Atomic resolve rollback fixture.",
+                "entry_type": "notable_moment",
+                "public_safe": True,
+                "usage_scope": "ambient,direct",
+            },
+        )
+        with mock.patch.object(
+            bnl01_bot,
+            "shadow_broadcast_status_event",
+            side_effect=RuntimeError("forced status shadow failure"),
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "forced status shadow failure",
+            ):
+                bnl01_bot._set_broadcast_memory_status(
+                    1,
+                    memory_id,
+                    "resolved",
+                    42,
+                    "6 Bit",
+                    "atomic rollback fixture",
+                )
+        self.assertEqual(
+            self.rows(
+                "SELECT status FROM broadcast_memory WHERE id=?",
+                (memory_id,),
+            )[0][0],
+            "active",
+        )
+        self.assertEqual(
+            self.rows(
+                """
+                SELECT COUNT(*) FROM memory_ledger_entries
+                WHERE source_table='broadcast_memory'
+                  AND source_role='broadcast_memory_status'
+                  AND source_row_id=?
+                """,
+                (str(memory_id),),
+            )[0][0],
+            0,
+        )
+
+    def test_disabled_shadow_still_retracts_an_existing_primary(self):
+        self.enable()
+        memory_id = bnl01_bot.add_broadcast_memory_entry(
+            1,
+            _Message("RAW disabled gate retraction"),
+            {
+                "cleaned_summary": "Existing public primary fixture.",
+                "entry_type": "notable_moment",
+                "public_safe": True,
+                "usage_scope": "ambient,direct",
+            },
+        )
+        os.environ.pop("BNL_MEMORY_LEDGER_SHADOW_ENABLED", None)
+        self.assertEqual(
+            bnl01_bot._set_broadcast_memory_status(
+                1,
+                memory_id,
+                "resolved",
+                42,
+                "6 Bit",
+                "source no longer current",
+            ),
+            1,
+        )
+        primary_id = self.rows(
+            """
+            SELECT entry_id FROM memory_ledger_entries
+            WHERE source_table='broadcast_memory'
+              AND source_role='broadcast_memory' AND source_row_id=?
+            """,
+            (str(memory_id),),
+        )[0][0]
+        self.assertEqual(
+            self.rows(
+                """
+                SELECT l.lineage_type,l.target_entry_id
+                FROM memory_ledger_lineage l
+                JOIN memory_ledger_entries e ON e.entry_id=l.entry_id
+                WHERE e.source_table='broadcast_memory'
+                  AND e.source_role='broadcast_memory_status'
+                  AND e.source_row_id=?
+                """,
+                (str(memory_id),),
+            ),
+            [("retracts", primary_id)],
+        )
+
+    def test_disabled_shadow_replacement_without_primary_writes_no_ledger_rows(self):
+        memory_id = bnl01_bot.add_broadcast_memory_entry(
+            1,
+            _Message("RAW disabled replacement source"),
+            {
+                "cleaned_summary": "Disabled replacement source.",
+                "entry_type": "notable_moment",
+                "public_safe": True,
+                "usage_scope": "ambient,direct",
+            },
+        )
+        self.assertEqual(
+            self.rows(
+                "SELECT COUNT(*) FROM memory_ledger_entries "
+                "WHERE source_table='broadcast_memory'"
+            )[0][0],
+            0,
+        )
+
+        replacement_id = bnl01_bot._replace_broadcast_memory_entry(
+            1,
+            memory_id,
+            _Message("RAW disabled replacement target"),
+            {
+                "cleaned_summary": "Disabled replacement target.",
+                "entry_type": "notable_moment",
+                "public_safe": True,
+                "usage_scope": "ambient,direct",
+            },
+        )
+
+        self.assertGreater(replacement_id, memory_id)
+        self.assertEqual(
+            self.rows(
+                "SELECT id,status,supersedes_id,superseded_by_id "
+                "FROM broadcast_memory ORDER BY id"
+            ),
+            [
+                (memory_id, "superseded", None, replacement_id),
+                (replacement_id, "active", memory_id, None),
+            ],
+        )
+        self.assertEqual(
+            self.rows(
+                "SELECT COUNT(*) FROM memory_ledger_entries "
+                "WHERE source_table='broadcast_memory'"
+            )[0][0],
+            0,
+        )
+
+    def test_replacement_retracts_all_duplicate_existing_primaries(self):
+        self.enable()
+        memory_id = bnl01_bot.add_broadcast_memory_entry(
+            1,
+            _Message("RAW ambiguous primary fixture"),
+            {
+                "cleaned_summary": "Ambiguous primary fixture.",
+                "entry_type": "notable_moment",
+                "public_safe": True,
+                "usage_scope": "ambient,direct",
+            },
+        )
+        with sqlite3.connect(bnl01_bot.DB_FILE) as conn:
+            second = ledger.shadow_broadcast_memory_row(
+                conn,
+                row_id=memory_id,
+                guild_id=1,
+                cleaned_summary="Conflicting stale primary fixture.",
+                entry_type="notable_moment",
+                public_safe=True,
+                status="active",
+                usage_scope="ambient,direct",
+                submitted_by_user_id=42,
+                submitted_by_name="6 Bit",
+                created_at="2026-08-01T00:00:00+00:00",
+                updated_at="2026-08-01T00:01:00+00:00",
+            )
+            self.assertEqual(second.outcome, "inserted")
+        old_primary_ids = {
+            row[0]
+            for row in self.rows(
+                """
+                SELECT entry_id FROM memory_ledger_entries
+                WHERE source_table='broadcast_memory'
+                  AND source_role='broadcast_memory' AND source_row_id=?
+                """,
+                (str(memory_id),),
+            )
+        }
+        self.assertEqual(len(old_primary_ids), 2)
+        os.environ.pop("BNL_MEMORY_LEDGER_SHADOW_ENABLED", None)
+        replacement_id = bnl01_bot._replace_broadcast_memory_entry(
+            1,
+            memory_id,
+            _Message("RAW duplicate-root replacement"),
+            {
+                "cleaned_summary": "Replacement after duplicate roots.",
+                "entry_type": "notable_moment",
+                "public_safe": True,
+                "usage_scope": "ambient,direct",
+            },
+        )
+        self.assertGreater(replacement_id, memory_id)
+        self.assertEqual(
+            self.rows(
+                "SELECT status,superseded_by_id FROM broadcast_memory WHERE id=?",
+                (memory_id,),
+            )[0],
+            ("superseded", replacement_id),
+        )
+        status_entry = self.rows(
+            """
+            SELECT entry_id FROM memory_ledger_entries
+            WHERE source_table='broadcast_memory'
+              AND source_role='broadcast_memory_status' AND source_row_id=?
+            """,
+            (str(memory_id),),
+        )[0][0]
+        self.assertEqual(
+            {
+                row[0]
+                for row in self.rows(
+                    """
+                    SELECT target_entry_id FROM memory_ledger_lineage
+                    WHERE entry_id=? AND lineage_type='retracts'
+                    """,
+                    (status_entry,),
+                )
+            },
+            old_primary_ids,
+        )
+        self.assertEqual(
+            len(
+                self.rows(
+                    """
+                    SELECT entry_id FROM memory_ledger_entries
+                    WHERE source_table='broadcast_memory'
+                      AND source_role='broadcast_memory' AND source_row_id=?
+                    """,
+                    (str(replacement_id),),
+                )
+            ),
+            1,
+        )
+
     def test_broadcast_replacement_has_one_revision_and_real_lineage(self):
         self.enable()
         original_id = bnl01_bot.add_broadcast_memory_entry(
@@ -714,41 +1479,23 @@ class MemoryLedgerBotPathTests(unittest.TestCase):
                 "usage_scope": "ambient,direct",
             },
         )
-        replacement_id = bnl01_bot.add_broadcast_memory_entry(
+        replacement_id = bnl01_bot._replace_broadcast_memory_entry(
             1,
+            original_id,
             _Message("RAW replacement"),
             {
                 "cleaned_summary": "Replacement safe summary.",
                 "entry_type": "show_note",
                 "public_safe": True,
                 "usage_scope": "ambient,direct",
-                "supersedes_id": original_id,
             },
         )
-        updated_at = "2026-07-16T00:00:00-07:00"
-        with sqlite3.connect(bnl01_bot.DB_FILE) as conn:
-            conn.execute(
-                "UPDATE broadcast_memory SET status='superseded', superseded_by_id=?, updated_at=? WHERE id=?",
-                (replacement_id, updated_at, original_id),
-            )
-            conn.commit()
-        bnl01_bot._shadow_memory_ledger_write(
-            "broadcast_memory_status",
-            lambda ledger_conn: ledger.shadow_broadcast_status_event(
-                ledger_conn,
-                row_id=original_id,
-                guild_id=1,
-                status="superseded",
-                updated_at=updated_at,
-                actor_id=42,
-                actor_name="Crow",
-                superseded_by_id=replacement_id,
-            ),
-            guild_id=1,
-            source_table="broadcast_memory",
-            source_row_id=original_id,
-            source_revision=f"event:status:superseded:{updated_at.lower()}",
-            source_event_key="status:superseded",
+        self.assertEqual(
+            self.rows(
+                "SELECT status,superseded_by_id FROM broadcast_memory WHERE id=?",
+                (original_id,),
+            )[0],
+            ("superseded", replacement_id),
         )
         primary_rows = self.rows(
             """
@@ -808,6 +1555,73 @@ class MemoryLedgerBotPathTests(unittest.TestCase):
             """
         )
         self.assertEqual(effective_active, [(replacement_entry,)])
+
+    def test_broadcast_replacement_requires_atomic_helper(self):
+        original_id = bnl01_bot.add_broadcast_memory_entry(
+            1,
+            _Message("RAW original"),
+            {
+                "cleaned_summary": "Original safe summary.",
+                "entry_type": "notable_moment",
+                "public_safe": True,
+                "usage_scope": "ambient,direct",
+            },
+        )
+        with self.assertRaisesRegex(
+            ValueError,
+            "broadcast_replacement_requires_atomic_helper",
+        ):
+            bnl01_bot.add_broadcast_memory_entry(
+                1,
+                _Message("RAW unsafe split replacement"),
+                {
+                    "cleaned_summary": "This must not be stored separately.",
+                    "entry_type": "notable_moment",
+                    "supersedes_id": original_id,
+                },
+            )
+        self.assertEqual(self.rows("SELECT COUNT(*) FROM broadcast_memory")[0][0], 1)
+
+    def test_broadcast_replacement_rolls_back_if_supersession_update_fails(self):
+        original_id = bnl01_bot.add_broadcast_memory_entry(
+            1,
+            _Message("RAW original"),
+            {
+                "cleaned_summary": "Original safe summary.",
+                "entry_type": "notable_moment",
+                "public_safe": True,
+                "usage_scope": "ambient,direct",
+            },
+        )
+        with sqlite3.connect(bnl01_bot.DB_FILE) as conn:
+            conn.execute(
+                """
+                CREATE TRIGGER reject_test_broadcast_supersession
+                BEFORE UPDATE OF status ON broadcast_memory
+                WHEN NEW.status='superseded'
+                BEGIN
+                    SELECT RAISE(ABORT, 'forced supersession failure');
+                END
+                """
+            )
+        with self.assertRaises(sqlite3.DatabaseError):
+            bnl01_bot._replace_broadcast_memory_entry(
+                1,
+                original_id,
+                _Message("RAW replacement"),
+                {
+                    "cleaned_summary": "Replacement must roll back.",
+                    "entry_type": "notable_moment",
+                    "public_safe": True,
+                    "usage_scope": "ambient,direct",
+                },
+            )
+        self.assertEqual(
+            self.rows(
+                "SELECT id,status,superseded_by_id FROM broadcast_memory ORDER BY id"
+            ),
+            [(original_id, "active", None)],
+        )
 
     def test_prune_purges_exact_raw_source_and_moment_before_transcript_delete(self):
         self.enable()

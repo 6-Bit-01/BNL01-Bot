@@ -62,6 +62,7 @@ from bnl_memory_ledger import (
     record_bnl_self_name_decision,
     subject_key_for_user,
     shadow_broadcast_memory_row,
+    shadow_declared_canon_projection,
     shadow_conversation_row,
     record_shadow_receipt,
     shadow_broadcast_status_event,
@@ -208,6 +209,19 @@ from bnl_journal_source_store import (
     record_source_event as record_journal_source_event,
     sanitize_summary as sanitize_journal_source_summary,
     timestamp_to_epoch_ms as journal_timestamp_to_epoch_ms,
+)
+from bnl_declared_canon import (
+    BROADCAST_MEMORY_SOURCE as DECLARED_BROADCAST_MEMORY_SOURCE,
+    DeclaredCanonError,
+    add_declared_canon,
+    change_declared_canon_status,
+    classify_broadcast_memory,
+    correct_declared_canon,
+    ensure_declared_canon_schema,
+    preview_declared_canon,
+    preview_historical_broadcast_memory,
+    retire_declared_canon,
+    supersede_declared_canon,
 )
 from bnl_journal_automation import (
     automation_status as journal_automation_status,
@@ -5304,6 +5318,7 @@ def init_db():
     from bnl_entity_evidence import ensure_entity_evidence_schema
     evidence_conn = sqlite3.connect(DB_FILE)
     try:
+        ensure_declared_canon_schema(evidence_conn)
         ensure_entity_evidence_schema(evidence_conn)
         ensure_memory_ledger_schema(evidence_conn)
         ensure_relationship_v2_schema(evidence_conn)
@@ -6665,6 +6680,27 @@ def configured_owner_control_denial_reason(user: discord.abc.User) -> str:
     if not is_owner_operator(user):
         return "configured_owner_required"
     return ""
+
+
+def require_configured_owner_mutation_actor(
+    actor_user_id: int,
+    guild_id: int,
+) -> int:
+    """Enforce configured owner and primary-guild mutation boundaries."""
+
+    configured = int(BNL_OWNER_USER_ID or 0)
+    actor = int(actor_user_id or 0)
+    primary_guild = int(BNL_PRIMARY_GUILD_ID or 0)
+    target_guild = int(guild_id or 0)
+    if configured <= 0:
+        raise PermissionError("owner_user_id_not_configured")
+    if actor <= 0 or actor != configured:
+        raise PermissionError("configured_owner_required")
+    if primary_guild <= 0:
+        raise PermissionError("primary_guild_id_not_configured")
+    if target_guild <= 0 or target_guild != primary_guild:
+        raise PermissionError("configured_primary_guild_required")
+    return actor
 
 
 def has_mod_role(member: discord.Member) -> bool:
@@ -9716,6 +9752,462 @@ async def maybe_handle_provider_status_command(message: discord.Message, clean_c
     ]
     await message.reply("\n".join(lines))
     return True
+
+
+_DECLARED_CANON_COMMON_FIELDS = frozenset(
+    {
+        "subject_type",
+        "subject_id",
+        "object_subject_type",
+        "object_subject_id",
+        "predicate",
+        "value",
+        "raw_declaration",
+        "cleaned_summary",
+        "domain",
+        "claim_kind",
+        "visibility",
+        "eligible_routes",
+        "valid_from",
+        "valid_until",
+    }
+)
+
+
+def _declared_canon_command_nonce(message: discord.Message, suffix: str) -> str:
+    message_id = int(getattr(message, "id", 0) or 0)
+    if message_id <= 0:
+        raise DeclaredCanonError("discord_message_id_required")
+    normalized_suffix = re.sub(r"[^A-Za-z0-9._-]+", "-", suffix or "command")
+    return (f"discord-{message_id}-{normalized_suffix}")[:128]
+
+
+def _declared_canon_json_payload(raw: str, *, required: bool) -> dict:
+    text = str(raw or "").strip()
+    if not text:
+        if required:
+            raise DeclaredCanonError("declared_command_json_required")
+        return {}
+    try:
+        payload = json.loads(text)
+    except (TypeError, json.JSONDecodeError):
+        raise DeclaredCanonError("declared_command_json_invalid")
+    if not isinstance(payload, dict):
+        raise DeclaredCanonError("declared_command_object_required")
+    return payload
+
+
+def _declared_canon_validate_command_fields(
+    payload: dict,
+    *,
+    allowed: set[str] | frozenset[str],
+    required: set[str] | frozenset[str] = frozenset(),
+) -> None:
+    if set(payload) - set(allowed):
+        raise DeclaredCanonError("declared_command_unexpected_field")
+    if set(required) - set(payload):
+        raise DeclaredCanonError("declared_command_missing_field")
+    if "eligible_routes" in payload and not isinstance(
+        payload.get("eligible_routes"), (list, tuple)
+    ):
+        raise DeclaredCanonError("declared_command_routes_list_required")
+
+
+def _declared_canon_claim_kwargs(payload: dict) -> dict:
+    return {
+        "subject_type": payload.get("subject_type", ""),
+        "subject_id": payload.get("subject_id", ""),
+        "object_subject_type": payload.get("object_subject_type", ""),
+        "object_subject_id": payload.get("object_subject_id", ""),
+        "predicate": payload.get("predicate", ""),
+        "value": payload.get("value"),
+        "raw_declaration": payload.get("raw_declaration", ""),
+        "cleaned_summary": payload.get("cleaned_summary", ""),
+        "domain": payload.get("domain", ""),
+        "claim_kind": payload.get("claim_kind", ""),
+        "visibility": payload.get("visibility", "internal"),
+        "eligible_routes": tuple(payload.get("eligible_routes") or ()),
+        "valid_from": payload.get("valid_from", ""),
+        "valid_until": payload.get("valid_until", ""),
+    }
+
+
+def _shadow_declared_revision_after_owner_command(
+    message: discord.Message,
+    revision,
+    *,
+    projection_index: int,
+) -> str:
+    if not memory_ledger_shadow_enabled():
+        return "disabled"
+
+    guild_id = int(getattr(getattr(message, "guild", None), "id", 0) or 0)
+    actor_id = int(getattr(getattr(message, "author", None), "id", 0) or 0)
+    nonce = _declared_canon_command_nonce(
+        message, f"declared-projection-{projection_index}"
+    )
+
+    def project(ledger_conn):
+        roots = ()
+        if (
+            revision.source_system == DECLARED_BROADCAST_MEMORY_SOURCE
+            and revision.lifecycle_status == "established"
+        ):
+            rows = ledger_conn.execute(
+                """
+                SELECT entry_id
+                FROM memory_ledger_entries
+                WHERE guild_id=? AND source_table='broadcast_memory'
+                  AND source_row_id=? AND source_role='broadcast_memory'
+                  AND lifecycle_status='active'
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM memory_ledger_lineage AS edge
+                      WHERE edge.guild_id=memory_ledger_entries.guild_id
+                        AND edge.target_entry_id=memory_ledger_entries.entry_id
+                        AND edge.lineage_type IN ('supersedes','retracts')
+                  )
+                ORDER BY created_at DESC
+                """,
+                (guild_id, revision.source_row_id),
+            ).fetchall()
+            if len(rows) == 1:
+                roots = (str(rows[0][0]),)
+        return shadow_declared_canon_projection(
+            ledger_conn,
+            guild_id=guild_id,
+            declaration_id=revision.declaration_id,
+            revision_id=revision.revision_id,
+            actor_user_id=actor_id,
+            authority_nonce=nonce,
+            expected_source_fingerprint=revision.source_fingerprint,
+            expected_lifecycle_status=revision.lifecycle_status,
+            root_entry_ids=roots,
+        )
+
+    result = _shadow_memory_ledger_write(
+        "declared_canon_projection",
+        project,
+        guild_id=guild_id,
+        source_table="declared_canon_revisions",
+        source_row_id=revision.declaration_id,
+        source_revision=revision.revision_id,
+        source_event_key=f"revision:{revision.revision_id}",
+    )
+    if result is None:
+        return "error:shadow_exception"
+    return f"{result.outcome}:{result.reason_code}"
+
+
+def _declared_canon_mutation_summary(result, projection_states: list[str]) -> str:
+    revisions = ", ".join(
+        f"{item.declaration_id}/{item.revision_id} [{item.lifecycle_status}]"
+        for item in result.revisions
+    )
+    return (
+        f"Declared Canon operation committed: {result.operation_id}. "
+        f"Revisions: {revisions}. Shadow projections: {', '.join(projection_states)}."
+    )
+
+
+async def maybe_handle_declared_canon_command(
+    message: discord.Message,
+    clean_content: str,
+) -> bool:
+    """Handle strict owner-only Declared Canon JSON controls in R&D."""
+
+    match = re.match(
+        r"^!bnl\s+canon(?:\s+(.*))?$",
+        str(clean_content or "").strip(),
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    if not match:
+        return False
+    if not is_research_and_development_channel(message):
+        await message.reply(
+            "Declared Canon controls are restricted to #research-and-development."
+        )
+        return True
+    denial_reason = configured_owner_control_denial_reason(
+        getattr(message, "author", None)
+    )
+    if denial_reason:
+        await message.reply(f"Declared Canon control denied: {denial_reason}.")
+        return True
+    guild_id = int(getattr(getattr(message, "guild", None), "id", 0) or 0)
+    if not BNL_PRIMARY_GUILD_ID:
+        await message.reply(
+            "Declared Canon control denied: primary_guild_id_not_configured."
+        )
+        return True
+    if guild_id != int(BNL_PRIMARY_GUILD_ID):
+        await message.reply(
+            "Declared Canon control denied: configured_primary_guild_required."
+        )
+        return True
+    command = str(match.group(1) or "").strip()
+    action, _, raw_payload = command.partition(" ")
+    action = action.strip().casefold()
+    if not action:
+        await message.reply(
+            "Declared Canon action required: preview, broadcast-preview, add, "
+            "correct, retire, status, supersede, or broadcast-classify."
+        )
+        return True
+    actor_id = int(getattr(getattr(message, "author", None), "id", 0) or 0)
+    nonce = _declared_canon_command_nonce(message, action)
+    try:
+        payload = _declared_canon_json_payload(
+            raw_payload,
+            required=action
+            not in {"preview", "broadcast-preview"},
+        )
+        if action == "preview":
+            _declared_canon_validate_command_fields(
+                payload,
+                allowed={"source_system", "limit"},
+            )
+            with journal_release_privacy_fence(DB_FILE):
+                with sqlite3.connect(DB_FILE, timeout=30) as conn:
+                    preview = preview_declared_canon(
+                        conn,
+                        actor_user_id=actor_id,
+                        authority_nonce=nonce,
+                        guild_id=guild_id,
+                        source_system=payload.get("source_system", ""),
+                        limit=int(payload.get("limit", 100) or 100),
+                    )
+            if preview.mutation_count:
+                raise DeclaredCanonError("declared_preview_mutated_state")
+            counts = {}
+            for item in preview.items:
+                key = f"{item.source_system}:{item.lifecycle_status}"
+                counts[key] = counts.get(key, 0) + 1
+            await message.reply(
+                "Declared Canon preview (content-free): "
+                f"rows={preview.total_rows}, returned={len(preview.items)}, "
+                f"truncated={int(preview.truncated)}, counts={json.dumps(counts, sort_keys=True)}."
+            )
+            return True
+        if action == "broadcast-preview":
+            _declared_canon_validate_command_fields(
+                payload,
+                allowed={"limit", "offset"},
+            )
+            with journal_release_privacy_fence(DB_FILE):
+                with sqlite3.connect(DB_FILE, timeout=30) as conn:
+                    preview = preview_historical_broadcast_memory(
+                        conn,
+                        actor_user_id=actor_id,
+                        authority_nonce=nonce,
+                        guild_id=guild_id,
+                        limit=int(payload.get("limit", 200) or 200),
+                        offset=int(payload.get("offset", 0) or 0),
+                    )
+            if preview.mutation_count:
+                raise DeclaredCanonError("broadcast_preview_mutated_state")
+            await message.reply(
+                "Broadcast → Declared preview (content-free): "
+                f"rows={preview.total_rows}, returned={len(preview.items)}, "
+                f"truncated={int(preview.truncated)}, "
+                f"counts_scope={preview.counts_scope}, "
+                f"types={json.dumps(dict(preview.type_counts), sort_keys=True)}, "
+                f"eras={json.dumps(dict(preview.era_counts), sort_keys=True)}, "
+                f"dispositions={json.dumps(dict(preview.disposition_counts), sort_keys=True)}."
+            )
+            return True
+
+        result = None
+        with journal_release_privacy_fence(DB_FILE):
+            with sqlite3.connect(DB_FILE, timeout=30) as conn:
+                if action == "add":
+                    required = {
+                        "subject_type",
+                        "subject_id",
+                        "predicate",
+                        "value",
+                        "raw_declaration",
+                        "domain",
+                        "claim_kind",
+                    }
+                    _declared_canon_validate_command_fields(
+                        payload,
+                        allowed=_DECLARED_CANON_COMMON_FIELDS,
+                        required=required,
+                    )
+                    result = add_declared_canon(
+                        conn,
+                        actor_user_id=actor_id,
+                        authority_nonce=nonce,
+                        guild_id=guild_id,
+                        **_declared_canon_claim_kwargs(payload),
+                    )
+                elif action == "correct":
+                    required = {
+                        "declaration_id",
+                        "expected_revision_id",
+                        "subject_type",
+                        "subject_id",
+                        "predicate",
+                        "value",
+                        "raw_declaration",
+                        "domain",
+                        "claim_kind",
+                    }
+                    _declared_canon_validate_command_fields(
+                        payload,
+                        allowed=_DECLARED_CANON_COMMON_FIELDS
+                        | {"declaration_id", "expected_revision_id", "reason"},
+                        required=required,
+                    )
+                    result = correct_declared_canon(
+                        conn,
+                        actor_user_id=actor_id,
+                        authority_nonce=nonce,
+                        guild_id=guild_id,
+                        declaration_id=payload["declaration_id"],
+                        expected_revision_id=payload["expected_revision_id"],
+                        reason=payload.get("reason", ""),
+                        **_declared_canon_claim_kwargs(payload),
+                    )
+                elif action == "retire":
+                    _declared_canon_validate_command_fields(
+                        payload,
+                        allowed={"declaration_id", "expected_revision_id", "reason"},
+                        required={"declaration_id", "expected_revision_id"},
+                    )
+                    result = retire_declared_canon(
+                        conn,
+                        actor_user_id=actor_id,
+                        authority_nonce=nonce,
+                        guild_id=guild_id,
+                        declaration_id=payload["declaration_id"],
+                        expected_revision_id=payload["expected_revision_id"],
+                        reason=payload.get("reason", ""),
+                    )
+                elif action == "status":
+                    _declared_canon_validate_command_fields(
+                        payload,
+                        allowed={
+                            "declaration_id",
+                            "expected_revision_id",
+                            "lifecycle_status",
+                            "reason",
+                        },
+                        required={
+                            "declaration_id",
+                            "expected_revision_id",
+                            "lifecycle_status",
+                        },
+                    )
+                    result = change_declared_canon_status(
+                        conn,
+                        actor_user_id=actor_id,
+                        authority_nonce=nonce,
+                        guild_id=guild_id,
+                        declaration_id=payload["declaration_id"],
+                        expected_revision_id=payload["expected_revision_id"],
+                        lifecycle_status=payload["lifecycle_status"],
+                        reason=payload.get("reason", ""),
+                    )
+                elif action == "supersede":
+                    _declared_canon_validate_command_fields(
+                        payload,
+                        allowed={
+                            "declaration_id",
+                            "expected_revision_id",
+                            "replacement_declaration_id",
+                            "expected_replacement_revision_id",
+                            "reason",
+                        },
+                        required={
+                            "declaration_id",
+                            "expected_revision_id",
+                            "replacement_declaration_id",
+                            "expected_replacement_revision_id",
+                        },
+                    )
+                    result = supersede_declared_canon(
+                        conn,
+                        actor_user_id=actor_id,
+                        authority_nonce=nonce,
+                        guild_id=guild_id,
+                        declaration_id=payload["declaration_id"],
+                        expected_revision_id=payload["expected_revision_id"],
+                        replacement_declaration_id=payload[
+                            "replacement_declaration_id"
+                        ],
+                        expected_replacement_revision_id=payload[
+                            "expected_replacement_revision_id"
+                        ],
+                        reason=payload.get("reason", ""),
+                    )
+                elif action == "broadcast-classify":
+                    allowed = {
+                        "broadcast_row_id",
+                        "expected_source_fingerprint",
+                        "expected_revision_id",
+                        "subject_type",
+                        "subject_id",
+                        "object_subject_type",
+                        "object_subject_id",
+                        "predicate",
+                        "domain",
+                        "claim_kind",
+                        "visibility",
+                        "eligible_routes",
+                        "reason",
+                    }
+                    required = {
+                        "broadcast_row_id",
+                        "expected_source_fingerprint",
+                        "subject_type",
+                        "subject_id",
+                    }
+                    _declared_canon_validate_command_fields(
+                        payload, allowed=allowed, required=required
+                    )
+                    result = classify_broadcast_memory(
+                        conn,
+                        actor_user_id=actor_id,
+                        authority_nonce=nonce,
+                        guild_id=guild_id,
+                        broadcast_row_id=int(payload["broadcast_row_id"]),
+                        expected_source_fingerprint=payload[
+                            "expected_source_fingerprint"
+                        ],
+                        expected_revision_id=payload.get("expected_revision_id", ""),
+                        subject_type=payload["subject_type"],
+                        subject_id=payload["subject_id"],
+                        object_subject_type=payload.get("object_subject_type", ""),
+                        object_subject_id=payload.get("object_subject_id", ""),
+                        predicate=payload.get("predicate", ""),
+                        domain=payload.get("domain", ""),
+                        claim_kind=payload.get("claim_kind", ""),
+                        visibility=payload.get("visibility", "internal"),
+                        eligible_routes=tuple(payload.get("eligible_routes") or ()),
+                        reason=payload.get("reason", ""),
+                    )
+                else:
+                    raise DeclaredCanonError("declared_command_action_unknown")
+        projection_states = [
+            _shadow_declared_revision_after_owner_command(
+                message,
+                revision,
+                projection_index=index,
+            )
+            for index, revision in enumerate(result.revisions, start=1)
+        ]
+        await message.reply(
+            _declared_canon_mutation_summary(result, projection_states)
+        )
+        return True
+    except (DeclaredCanonError, ValueError, TypeError) as exc:
+        reason = str(exc or "declared_command_rejected")
+        if not re.fullmatch(r"[a-z0-9_.:-]{1,120}", reason):
+            reason = "declared_command_rejected"
+        await message.reply(f"Declared Canon operation not applied: {reason}.")
+        return True
 
 
 async def maybe_handle_debug_last_route_command(message: discord.Message, clean_content: str) -> bool:
@@ -16222,9 +16714,18 @@ def format_member_activity_summary(events: list[dict]) -> str:
     return "\n".join(lines)
 
 
-def add_broadcast_memory_entry(guild_id: int, message: discord.Message, processed: dict):
-    now = datetime.now(PACIFIC_TZ).isoformat()
-    conn = sqlite3.connect(DB_FILE)
+def _insert_broadcast_memory_row(
+    conn: sqlite3.Connection,
+    *,
+    guild_id: int,
+    actor_id: int,
+    actor_name: str,
+    raw_content: str,
+    processed: dict,
+    now: str,
+    supersedes_id: int = 0,
+) -> tuple[int, tuple]:
+    require_configured_owner_mutation_actor(actor_id, guild_id)
     cursor = conn.cursor()
     cursor.execute(
         """
@@ -16232,15 +16733,16 @@ def add_broadcast_memory_entry(guild_id: int, message: discord.Message, processe
             guild_id, episode_date, submitted_by_user_id, submitted_by_name, raw_note,
             cleaned_summary, entry_type, importance, public_safe, affects_next_show,
             usage_scope, target_show_date, valid_until, override_span_count, needs_clarification,
-            status, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)
+            status, created_at, updated_at, corrected_by_user_id, corrected_by_name,
+            correction_reason, supersedes_id
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?)
         """,
         (
-            guild_id,
-            processed.get("episode_date") or _recent_friday_pacific_for_note(message.content),
-            getattr(getattr(message, "author", None), "id", None),
-            getattr(getattr(message, "author", None), "display_name", "system"),
-            _truncate_raw_note(getattr(message, "content", "")),
+            int(guild_id),
+            processed.get("episode_date") or _recent_friday_pacific_for_note(raw_content),
+            actor_id,
+            actor_name,
+            _truncate_raw_note(raw_content),
             processed.get("cleaned_summary", ""),
             processed.get("entry_type", "notable_moment"),
             processed.get("importance", "medium"),
@@ -16253,27 +16755,285 @@ def add_broadcast_memory_entry(guild_id: int, message: discord.Message, processe
             1 if processed.get("needs_clarification") else 0,
             now,
             now,
+            actor_id if supersedes_id else None,
+            actor_name if supersedes_id else None,
+            "explicit correction/replace request" if supersedes_id else None,
+            int(supersedes_id) if supersedes_id else None,
         ),
     )
-    new_id = cursor.lastrowid
-    if processed.get("supersedes_id"):
-        cursor.execute("UPDATE broadcast_memory SET supersedes_id=?, corrected_by_user_id=?, corrected_by_name=?, correction_reason=?, updated_at=? WHERE id=?", (int(processed.get("supersedes_id") or 0), getattr(getattr(message, "author", None), "id", None), getattr(getattr(message, "author", None), "display_name", "system"), "replacement", now, new_id))
-    committed = cursor.execute("SELECT cleaned_summary, entry_type, public_safe, status, usage_scope, submitted_by_user_id, submitted_by_name, created_at, updated_at, supersedes_id FROM broadcast_memory WHERE id=?", (new_id,)).fetchone()
-    conn.commit()
-    conn.close()
-    if committed:
-        committed_updated_at = committed[8] or committed[7] or now
-        _shadow_memory_ledger_write(
-            "broadcast_memory",
-            lambda ledger_conn: shadow_broadcast_memory_row(
-                ledger_conn, row_id=int(new_id or 0), guild_id=guild_id, cleaned_summary=committed[0] or "",
-                entry_type=committed[1] or "notable_moment", public_safe=bool(committed[2]),
-                status=committed[3] or "active", usage_scope=committed[4] or "internal",
-                submitted_by_user_id=committed[5], submitted_by_name=committed[6] or "system",
-                created_at=committed[7] or committed_updated_at, updated_at=committed_updated_at, supersedes_id=committed[9],
-            ),
-            guild_id=guild_id, source_table="broadcast_memory", source_row_id=int(new_id or 0), source_revision=f"rev:{int(new_id or 0)}:{committed_updated_at.lower()}",
+    new_id = int(cursor.lastrowid or 0)
+    committed = cursor.execute(
+        """
+        SELECT cleaned_summary, entry_type, public_safe, status, usage_scope,
+               submitted_by_user_id, submitted_by_name, created_at, updated_at,
+               supersedes_id
+        FROM broadcast_memory
+        WHERE guild_id=? AND id=?
+        """,
+        (int(guild_id), new_id),
+    ).fetchone()
+    if not committed:
+        raise RuntimeError("broadcast_memory_insert_missing")
+    return new_id, committed
+
+
+def _broadcast_primary_projection_ids(
+    conn: sqlite3.Connection,
+    *,
+    guild_id: int,
+    row_id: int,
+) -> tuple[str, ...]:
+    if not conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='memory_ledger_entries'"
+    ).fetchone():
+        return ()
+    return tuple(
+        str(row[0])
+        for row in conn.execute(
+            """
+            SELECT entry_id
+            FROM memory_ledger_entries
+            WHERE guild_id=? AND source_table='broadcast_memory'
+              AND source_row_id=? AND source_role='broadcast_memory'
+              AND NOT EXISTS (
+                  SELECT 1 FROM memory_ledger_lineage l
+                  WHERE l.guild_id=memory_ledger_entries.guild_id
+                    AND l.target_entry_id=memory_ledger_entries.entry_id
+                    AND l.lineage_type IN ('supersedes','retracts')
+              )
+            ORDER BY entry_id
+            """,
+            (int(guild_id), str(int(row_id))),
+        ).fetchall()
+    )
+
+
+def _finalize_required_broadcast_shadow_in_transaction(
+    conn: sqlite3.Connection,
+    *,
+    writer: str,
+    result: LedgerWriteResult,
+) -> LedgerWriteResult:
+    """Record one exact new shadow row without weakening source atomicity."""
+
+    if not conn.in_transaction:
+        raise RuntimeError("broadcast_shadow_transaction_required")
+    if not isinstance(result, LedgerWriteResult):
+        raise RuntimeError("broadcast_shadow_result_required")
+    # Every caller below performs a single-use source mutation. A dedup here
+    # means a row with the same identity predated this source transaction and
+    # must be treated as a conflicting snapshot, not silently accepted.
+    if result.outcome != "inserted" or not result.entry_id:
+        raise RuntimeError(
+            "broadcast_shadow_write_required:%s:%s"
+            % (result.outcome, result.reason_code)
         )
+    try:
+        record_shadow_receipt(
+            conn,
+            guild_id=result.guild_id,
+            writer=writer,
+            source_table=result.source_table,
+            source_row_id=result.source_row_id,
+            source_revision=result.source_revision,
+            source_event_key=result.source_event_key,
+            outcome=result.outcome,
+            reason_code=result.reason_code,
+            entry_id=result.entry_id,
+        )
+    except Exception as receipt_exc:
+        logging.debug(
+            "broadcast_shadow_receipt_failed writer=%s error_type=%s",
+            writer,
+            type(receipt_exc).__name__,
+        )
+    try:
+        form_atomic_candidate_from_ledger_entry(conn, result.entry_id)
+    except Exception as knowledge_exc:
+        logging.debug(
+            "broadcast_atomic_shadow_failed writer=%s error_type=%s",
+            writer,
+            type(knowledge_exc).__name__,
+        )
+        try:
+            record_atomic_knowledge_processing_error(
+                conn,
+                guild_id=result.guild_id,
+                reason_code=(
+                    "broadcast_shadow_" + type(knowledge_exc).__name__
+                )[:120],
+                root_entry_ids=(result.entry_id,),
+            )
+        except Exception as diagnostic_exc:
+            logging.debug(
+                "broadcast_atomic_shadow_diagnostic_failed "
+                "writer=%s error_type=%s",
+                writer,
+                type(diagnostic_exc).__name__,
+            )
+    return result
+
+
+def _write_new_broadcast_primary_shadow_in_transaction(
+    conn: sqlite3.Connection,
+    *,
+    guild_id: int,
+    row_id: int,
+    actor_id: int,
+    expected_updated_at: str,
+    required_for_existing_lineage: bool = False,
+) -> LedgerWriteResult | None:
+    """Project an exact just-inserted source row inside its source transaction."""
+
+    require_configured_owner_mutation_actor(actor_id, guild_id)
+    if not conn.in_transaction:
+        raise RuntimeError("broadcast_shadow_transaction_required")
+    if (
+        not memory_ledger_shadow_enabled()
+        and not required_for_existing_lineage
+    ):
+        return None
+    row = conn.execute(
+        """
+        SELECT cleaned_summary,entry_type,public_safe,status,usage_scope,
+               submitted_by_user_id,submitted_by_name,created_at,updated_at,
+               supersedes_id
+        FROM broadcast_memory
+        WHERE guild_id=? AND id=?
+        """,
+        (int(guild_id), int(row_id)),
+    ).fetchone()
+    if not row:
+        raise RuntimeError("broadcast_shadow_source_missing")
+    if int(row[5] or 0) != int(actor_id):
+        raise PermissionError("broadcast_shadow_source_actor_mismatch")
+    if str(row[8] or "") != str(expected_updated_at or ""):
+        raise RuntimeError("broadcast_shadow_source_snapshot_mismatch")
+    if str(row[3] or "").strip().casefold() != "active":
+        raise RuntimeError("broadcast_shadow_new_source_not_active")
+    if _broadcast_primary_projection_ids(
+        conn,
+        guild_id=int(guild_id),
+        row_id=int(row_id),
+    ):
+        raise RuntimeError("broadcast_shadow_new_primary_conflict")
+    result = shadow_broadcast_memory_row(
+        conn,
+        row_id=int(row_id),
+        guild_id=int(guild_id),
+        cleaned_summary=str(row[0] or ""),
+        entry_type=str(row[1] or "notable_moment"),
+        public_safe=bool(row[2]),
+        status=str(row[3] or "active"),
+        usage_scope=str(row[4] or "internal"),
+        submitted_by_user_id=int(row[5] or 0),
+        submitted_by_name=str(row[6] or "system"),
+        created_at=str(row[7] or row[8] or ""),
+        updated_at=str(row[8] or ""),
+        supersedes_id=row[9],
+    )
+    finalized = _finalize_required_broadcast_shadow_in_transaction(
+        conn,
+        writer="broadcast_memory",
+        result=result,
+    )
+    if _broadcast_primary_projection_ids(
+        conn,
+        guild_id=int(guild_id),
+        row_id=int(row_id),
+    ) != (result.entry_id,):
+        raise RuntimeError("broadcast_shadow_new_primary_mismatch")
+    return finalized
+
+
+def _write_broadcast_status_shadow_in_transaction(
+    conn: sqlite3.Connection,
+    *,
+    guild_id: int,
+    row_id: int,
+    status: str,
+    updated_at: str,
+    actor_id: int,
+    actor_name: str,
+    superseded_by_id: int | None = None,
+    required_for_source_transition: bool = False,
+) -> LedgerWriteResult | None:
+    """Atomically retract an existing Broadcast primary when source changes."""
+
+    require_configured_owner_mutation_actor(actor_id, guild_id)
+    if not conn.in_transaction:
+        raise RuntimeError("broadcast_shadow_transaction_required")
+    primary_ids = _broadcast_primary_projection_ids(
+        conn,
+        guild_id=int(guild_id),
+        row_id=int(row_id),
+    )
+    # With no primary Ledger representation there is no stale evidence to
+    # retract. The authoritative source transition may safely commit; a later
+    # backfill will observe its terminal source state.
+    if not primary_ids and not required_for_source_transition:
+        return None
+    result = shadow_broadcast_status_event(
+        conn,
+        row_id=int(row_id),
+        guild_id=int(guild_id),
+        status=str(status or ""),
+        updated_at=str(updated_at or ""),
+        actor_id=int(actor_id),
+        actor_name=str(actor_name or ""),
+        superseded_by_id=superseded_by_id,
+    )
+    _finalize_required_broadcast_shadow_in_transaction(
+        conn,
+        writer="broadcast_memory_status",
+        result=result,
+    )
+    if primary_ids:
+        retracted_ids = {
+            str(row[0])
+            for row in conn.execute(
+                """
+                SELECT target_entry_id
+                FROM memory_ledger_lineage
+                WHERE entry_id=? AND lineage_type='retracts'
+                """,
+                (result.entry_id,),
+            ).fetchall()
+        }
+        if retracted_ids != set(primary_ids):
+            raise RuntimeError("broadcast_shadow_retraction_required")
+    return result
+
+
+def add_broadcast_memory_entry(guild_id: int, message: discord.Message, processed: dict):
+    actor_id = require_configured_owner_mutation_actor(
+        getattr(getattr(message, "author", None), "id", 0),
+        guild_id,
+    )
+    if int(guild_id or 0) <= 0:
+        raise ValueError("broadcast_memory_guild_required")
+    if int(processed.get("supersedes_id") or 0):
+        raise ValueError("broadcast_replacement_requires_atomic_helper")
+    now = datetime.now(PACIFIC_TZ).isoformat()
+    actor_name = getattr(getattr(message, "author", None), "display_name", "system")
+    with journal_release_privacy_fence(DB_FILE):
+        with sqlite3.connect(DB_FILE, timeout=30) as conn:
+            new_id, committed = _insert_broadcast_memory_row(
+                conn,
+                guild_id=int(guild_id),
+                actor_id=actor_id,
+                actor_name=actor_name,
+                raw_content=getattr(message, "content", ""),
+                processed=processed,
+                now=now,
+            )
+            _write_new_broadcast_primary_shadow_in_transaction(
+                conn,
+                guild_id=int(guild_id),
+                row_id=new_id,
+                actor_id=actor_id,
+                expected_updated_at=str(committed[8] or now),
+            )
     return int(new_id or 0)
 
 
@@ -16695,19 +17455,58 @@ def get_active_show_state_override(guild_id: int, show_date: str = None):
     return row
 
 
-def clear_active_show_state_overrides(guild_id: int):
+def clear_active_show_state_overrides(guild_id: int, actor_id: int):
+    require_configured_owner_mutation_actor(actor_id, guild_id)
+    if int(guild_id or 0) <= 0:
+        raise ValueError("broadcast_memory_guild_required")
     now_iso = datetime.now(PACIFIC_TZ).isoformat()
+    actor_name = "configured_owner"
+    correction_reason = "owner restored normal show state"
     with journal_release_privacy_fence(DB_FILE):
         with sqlite3.connect(DB_FILE, timeout=30) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            rows = conn.execute(
+                """
+                SELECT id
+                FROM broadcast_memory
+                WHERE guild_id=? AND status='active'
+                  AND superseded_by_id IS NULL
+                  AND entry_type='show_state_override'
+                ORDER BY id
+                """,
+                (int(guild_id),),
+            ).fetchall()
             cursor = conn.execute(
                 """
                 UPDATE broadcast_memory
-                SET status='resolved', updated_at=?
-                WHERE guild_id=? AND status='active' AND entry_type='show_state_override'
+                SET status='resolved', updated_at=?,
+                    corrected_by_user_id=?, corrected_by_name=?,
+                    correction_reason=?
+                WHERE guild_id=? AND status='active'
+                  AND superseded_by_id IS NULL
+                  AND entry_type='show_state_override'
                 """,
-                (now_iso, guild_id),
+                (
+                    now_iso,
+                    int(actor_id),
+                    actor_name,
+                    correction_reason,
+                    int(guild_id),
+                ),
             )
             changed = cursor.rowcount
+            if int(changed or 0) != len(rows):
+                raise RuntimeError("broadcast_override_transition_race")
+            for (memory_id,) in rows:
+                _write_broadcast_status_shadow_in_transaction(
+                    conn,
+                    guild_id=int(guild_id),
+                    row_id=int(memory_id),
+                    status="resolved",
+                    updated_at=now_iso,
+                    actor_id=int(actor_id),
+                    actor_name=actor_name,
+                )
     return int(changed or 0)
 
 def _summary_snippet(text: str, limit: int = 70) -> str:
@@ -16764,7 +17563,20 @@ def _find_active_broadcast_memory_by_id(guild_id: int, memory_id: int):
     return row
 
 
-def _set_broadcast_memory_status(memory_id: int, status: str, actor_id: int, actor_name: str, reason: str = ""):
+def _set_broadcast_memory_status(
+    guild_id: int,
+    memory_id: int,
+    status: str,
+    actor_id: int,
+    actor_name: str,
+    reason: str = "",
+):
+    require_configured_owner_mutation_actor(actor_id, guild_id)
+    if int(guild_id or 0) <= 0:
+        raise ValueError("broadcast_memory_guild_required")
+    normalized_status = str(status or "").strip().casefold()
+    if normalized_status != "resolved":
+        raise ValueError("broadcast_status_transition_not_allowed")
     now_iso = datetime.now(PACIFIC_TZ).isoformat()
     with journal_release_privacy_fence(DB_FILE):
         with sqlite3.connect(DB_FILE, timeout=30) as conn:
@@ -16772,48 +17584,128 @@ def _set_broadcast_memory_status(memory_id: int, status: str, actor_id: int, act
                 """
                 UPDATE broadcast_memory
                 SET status=?, updated_at=?, corrected_by_user_id=?, corrected_by_name=?, correction_reason=?
-                WHERE id=?
+                WHERE guild_id=? AND id=?
+                  AND status='active' AND superseded_by_id IS NULL
                 """,
-                (status, now_iso, actor_id, actor_name, reason[:200], memory_id),
+                (
+                    normalized_status,
+                    now_iso,
+                    actor_id,
+                    actor_name,
+                    reason[:200],
+                    int(guild_id),
+                    memory_id,
+                ),
             )
             changed = cursor.rowcount
             row = conn.execute(
-                "SELECT guild_id, superseded_by_id FROM broadcast_memory WHERE id=?",
-                (memory_id,),
+                "SELECT guild_id, superseded_by_id FROM broadcast_memory WHERE guild_id=? AND id=?",
+                (int(guild_id), memory_id),
             ).fetchone()
-    if changed and row and not (str(status or "").lower() == "superseded" and not row[1]):
-        _shadow_memory_ledger_write(
-            "broadcast_memory_status",
-            lambda ledger_conn: shadow_broadcast_status_event(ledger_conn, row_id=memory_id, guild_id=int(row[0] or 0), status=status, updated_at=now_iso, actor_id=actor_id, actor_name=actor_name, superseded_by_id=row[1]),
-            guild_id=int(row[0] or 0), source_table="broadcast_memory", source_row_id=memory_id, source_revision=f"event:status:{status}:{now_iso.lower()}", source_event_key=f"status:{status}",
-        )
+            if changed and row:
+                _write_broadcast_status_shadow_in_transaction(
+                    conn,
+                    guild_id=int(row[0] or 0),
+                    row_id=int(memory_id),
+                    status=normalized_status,
+                    updated_at=now_iso,
+                    actor_id=int(actor_id),
+                    actor_name=actor_name,
+                    superseded_by_id=row[1],
+                )
     return int(changed or 0)
 
 
-def _supersede_broadcast_memory(
+def _replace_broadcast_memory_entry(
+    guild_id: int,
     memory_id: int,
-    replacement_id: int,
-    actor_id: int,
-    actor_name: str,
-    updated_at: str,
+    message: discord.Message,
+    processed: dict,
 ) -> int:
-    """Make an established-memory row ineligible behind the Journal fence."""
+    """Atomically insert a replacement and supersede its active source row."""
+
+    actor_id = require_configured_owner_mutation_actor(
+        getattr(getattr(message, "author", None), "id", 0),
+        guild_id,
+    )
+    guild_id = int(guild_id or 0)
+    memory_id = int(memory_id or 0)
+    if guild_id <= 0:
+        raise ValueError("broadcast_memory_guild_required")
+    if memory_id <= 0:
+        raise ValueError("broadcast_supersession_target_required")
+    now = datetime.now(PACIFIC_TZ).isoformat()
+    actor_name = getattr(getattr(message, "author", None), "display_name", "system")
+    prepared = dict(processed or {})
+    prepared.pop("supersedes_id", None)
     with journal_release_privacy_fence(DB_FILE):
         with sqlite3.connect(DB_FILE, timeout=30) as conn:
+            target = conn.execute(
+                """
+                SELECT 1
+                FROM broadcast_memory
+                WHERE guild_id=? AND id=? AND status='active'
+                  AND superseded_by_id IS NULL
+                """,
+                (guild_id, memory_id),
+            ).fetchone()
+            if not target:
+                return 0
+            new_id, committed = _insert_broadcast_memory_row(
+                conn,
+                guild_id=guild_id,
+                actor_id=actor_id,
+                actor_name=actor_name,
+                raw_content=getattr(message, "content", ""),
+                processed=prepared,
+                now=now,
+                supersedes_id=memory_id,
+            )
             changed = conn.execute(
-                "UPDATE broadcast_memory SET status='superseded', superseded_by_id=?, "
-                "updated_at=?, corrected_by_user_id=?, corrected_by_name=?, correction_reason=? "
-                "WHERE id=?",
+                """
+                UPDATE broadcast_memory
+                SET status='superseded', superseded_by_id=?, updated_at=?,
+                    corrected_by_user_id=?, corrected_by_name=?, correction_reason=?
+                WHERE guild_id=? AND id=? AND status='active'
+                  AND superseded_by_id IS NULL
+                """,
                 (
-                    int(replacement_id),
-                    updated_at,
-                    int(actor_id),
+                    new_id,
+                    now,
+                    actor_id,
                     actor_name,
                     "explicit correction/replace request",
-                    int(memory_id),
+                    guild_id,
+                    memory_id,
                 ),
             ).rowcount
-    return int(changed or 0)
+            if int(changed or 0) != 1:
+                raise RuntimeError("broadcast_replacement_lost_target")
+            existing_primary_ids = _broadcast_primary_projection_ids(
+                conn,
+                guild_id=guild_id,
+                row_id=memory_id,
+            )
+            _write_new_broadcast_primary_shadow_in_transaction(
+                conn,
+                guild_id=guild_id,
+                row_id=new_id,
+                actor_id=actor_id,
+                expected_updated_at=str(committed[8] or now),
+                required_for_existing_lineage=bool(existing_primary_ids),
+            )
+            _write_broadcast_status_shadow_in_transaction(
+                conn,
+                guild_id=guild_id,
+                row_id=memory_id,
+                status="superseded",
+                updated_at=now,
+                actor_id=actor_id,
+                actor_name=actor_name,
+                superseded_by_id=new_id,
+                required_for_source_transition=bool(existing_primary_ids),
+            )
+    return new_id
 
 async def process_broadcast_memory_note(message) -> dict:
     raw_content = (message.content or "").strip()
@@ -30724,10 +31616,19 @@ async def maybe_reject_unauthorized_official_broadcast_memory(
     message: discord.Message,
     clean_content: str,
 ) -> bool:
-    """Reject official broadcast-memory mutations unless the configured owner acts."""
+    """Reject Broadcast mutations outside the exact owner/primary-guild scope."""
     denial_reason = configured_owner_control_denial_reason(
         getattr(message, "author", None)
     )
+    if not denial_reason:
+        configured_guild = int(BNL_PRIMARY_GUILD_ID or 0)
+        message_guild = int(
+            getattr(getattr(message, "guild", None), "id", 0) or 0
+        )
+        if configured_guild <= 0:
+            denial_reason = "primary_guild_id_not_configured"
+        elif message_guild != configured_guild:
+            denial_reason = "configured_primary_guild_required"
     if not denial_reason:
         return False
     logging.info(
@@ -30754,6 +31655,16 @@ async def maybe_reject_unauthorized_official_broadcast_memory(
                 reply = (
                     "Not stored. Official broadcast-memory controls are disabled "
                     "because `BNL_OWNER_USER_ID` is not configured."
+                )
+            elif denial_reason == "primary_guild_id_not_configured":
+                reply = (
+                    "Not stored. Official broadcast-memory controls are disabled "
+                    "because `BNL_PRIMARY_GUILD_ID` is not configured."
+                )
+            elif denial_reason == "configured_primary_guild_required":
+                reply = (
+                    "Not stored. Official broadcast memory is restricted to the "
+                    "configured primary guild."
                 )
             else:
                 reply = (
@@ -34099,11 +35010,19 @@ async def on_message(message: discord.Message):
         return
     if getattr(message.author, "bot", False):
         return
-
-    direct_conversation_ingress = _register_direct_conversation_ingress(message)
-
     if message.content.startswith("/"):
         return
+
+    # Declared Canon controls may contain owner-authored raw authority text.
+    # Dispatch the original Discord payload before *any* conversational state
+    # or normalization.  Mention/whitespace rewriting would otherwise mutate
+    # JSON string values, and even denied or malformed controls must never
+    # enter promptable room/batch/context stores.  The handler owns all scope,
+    # authentication, payload validation, and denial/error replies.
+    if await maybe_handle_declared_canon_command(message, message.content):
+        return
+
+    direct_conversation_ingress = _register_direct_conversation_ingress(message)
 
     active_channel_id = get_guild_config(message.guild.id)
 
@@ -34359,6 +35278,7 @@ async def on_message(message: discord.Message):
             if resolve_last_intent or resolve_by_topic or resolve_by_id:
                 changed = await asyncio.to_thread(
                     _set_broadcast_memory_status,
+                    message.guild.id,
                     target_id,
                     "resolved",
                     message.author.id,
@@ -34387,6 +35307,7 @@ async def on_message(message: discord.Message):
             if processed.get("entry_type") == "show_state_resume":
                 await asyncio.to_thread(
                     _set_broadcast_memory_status,
+                    message.guild.id,
                     target_id,
                     "resolved",
                     message.author.id,
@@ -34396,6 +35317,7 @@ async def on_message(message: discord.Message):
                 cleared = await asyncio.to_thread(
                     clear_active_show_state_overrides,
                     message.guild.id,
+                    message.author.id,
                 )
                 await message.reply(f"Logged. Normal schedule restored; resolved overrides: {cleared}.")
                 return
@@ -34411,22 +35333,16 @@ async def on_message(message: discord.Message):
                 }
             processed["episode_date"] = _extract_exact_episode_date(correction_text) or target_date
             processed["entry_type"] = processed.get("entry_type") or target_type
-            processed["supersedes_id"] = target_id
-            new_id = add_broadcast_memory_entry(message.guild.id, faux_message, processed)
-            updated_at = datetime.now(PACIFIC_TZ).isoformat()
-            await asyncio.to_thread(
-                _supersede_broadcast_memory,
+            new_id = await asyncio.to_thread(
+                _replace_broadcast_memory_entry,
+                message.guild.id,
                 target_id,
-                new_id,
-                message.author.id,
-                message.author.display_name,
-                updated_at,
+                faux_message,
+                processed,
             )
-            _shadow_memory_ledger_write(
-                "broadcast_memory_status",
-                lambda ledger_conn: shadow_broadcast_status_event(ledger_conn, row_id=target_id, guild_id=message.guild.id, status="superseded", updated_at=updated_at, actor_id=message.author.id, actor_name=message.author.display_name, superseded_by_id=new_id),
-                guild_id=message.guild.id, source_table="broadcast_memory", source_row_id=target_id, source_revision=f"event:status:superseded:{updated_at.lower()}", source_event_key="status:superseded",
-            )
+            if not new_id:
+                await message.reply("Correction not applied. The active broadcast-memory entry changed before the replacement could be committed.")
+                return
             await message.reply(f"Corrected broadcast memory: resolved/superseded id {target_id} and added replacement id {new_id} for {processed.get('episode_date')}.")
             return
         processed_entries = await process_broadcast_memory_notes(message)
@@ -34435,6 +35351,7 @@ async def on_message(message: discord.Message):
             cleared = await asyncio.to_thread(
                 clear_active_show_state_overrides,
                 message.guild.id,
+                message.author.id,
             )
             await message.reply(f"Logged. Normal schedule restored; resolved overrides: {cleared}.")
             return

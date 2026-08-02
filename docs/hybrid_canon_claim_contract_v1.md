@@ -21,9 +21,10 @@ proof of recurrence.
 ## Source ownership
 
 - `CANON_FACTS` remains the Legacy source.
-- `broadcast_memory` remains the Broadcast source. Only rows carrying verified
-  owner authority normalize as Declared; historical rows without that proof
-  stay internal, review-only Open Signal.
+- `broadcast_memory` remains the Broadcast content source. A raw row alone is
+  always internal, review-only Open Signal. Only an exact current join to an
+  owner-verified `declared_canon_revisions` sidecar can normalize it as a
+  Declared shadow; stale or absent sidecars fall back to the raw Open view.
 - Ledger, Moments, and atomic lifecycle remain the Living source machinery.
   Current established atomic and finalized Moment rows normalize as internal,
   review-only Open Signal until the recurrence contract is proved; they are not
@@ -46,8 +47,10 @@ boolean always fails closed to internal review metadata. Question-scoped Open
 Signal normalization likewise requires explicit active, public, subject-
 authored, human-source, nonderived assessment proof.
 
-`shadow_canon_reference()` is a derived Ledger projection. It is never an
-independent canon root and cannot corroborate or promote itself.
+`shadow_canon_reference()` and `shadow_declared_canon_projection()` are derived
+Ledger projections. They are never independent canon roots and cannot
+corroborate or promote themselves. The Declared projection revalidates the
+exact latest authority/source revision and same-guild roots before insertion.
 
 ## Identity
 
@@ -82,7 +85,33 @@ source text, display label, account ID, or row ID is emitted.
 
 ## Mutation boundary
 
-This version is shadow/read-only. Declared mutation, historical Broadcast
-classification, claim-content use in the live packet, website projection, and
-delegated authority are not enabled by this contract. The packet's binding
-lookup is read-only and effective only for already-approved binding rows.
+PR 2 adds the owner-only, append-only `declared_canon_lifecycle_v1` mutation
+contract described in `BNL01_DECLARED_CANON_LIFECYCLE_V1.md`. General
+declarations live in its revision table; Broadcast content remains in
+`broadcast_memory`, with only typed classification metadata and a source
+fingerprint stored beside it. No historical classifications are written
+automatically.
+
+Every stored revision carries a request fingerprint and an internally issued,
+deterministic, versioned receipt. It requires no runtime signing secret and no
+public API accepts a caller-supplied authority or receipt. Under the trusted
+application-and-database threat model, read boundaries recompute the receipt
+over the exact actor, guild, operation, nonce/request bindings and complete
+immutable stored payload, then recompute the revision ID. A conflicting
+`INSERT OR REPLACE` is rejected before SQLite can replace history.
+
+Broadcast sidecars bind to `broadcast_memory_complete_row_v2`, which hashes the
+complete deterministically canonicalized source row including unknown/future
+columns. Any schema addition stales prior approval and requires explicit owner
+review; no column is silently treated as non-authoritative.
+
+Core current/latest validators own one coherent read snapshot when the caller
+has no transaction and reuse a caller-owned transaction otherwise. This keeps
+revision selection, stored-receipt validation, and authoritative source-row
+revalidation on one database state while remaining zero-write.
+
+Claim-content use in the live packet, website projection, and delegated
+authority remain disabled. New Declared Ledger projections are internal,
+derived, review-only, and nonpublic until final convergence. The packet's
+binding lookup remains read-only and effective only for already-approved
+binding rows.

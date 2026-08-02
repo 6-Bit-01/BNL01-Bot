@@ -6,6 +6,7 @@ from unittest import mock
 
 from bnl_canon_source_contract import Confidence, SourceClass, Visibility
 import bnl_memory_ledger as ledger
+import bnl_declared_canon as declared
 import bnl_moment_engine as moments
 import bnl_relationship_engine as relationships
 from bnl_shadow_acceptance import (
@@ -1609,6 +1610,58 @@ class UnifiedIntelligencePacketTests(unittest.TestCase):
         )
         self.assertFalse(internal.diagnostics.prompt_applied)
         self.assertFalse(internal.diagnostics.live_applied)
+
+    def test_declared_canon_shadow_projection_is_not_packet_evidence(self):
+        with mock.patch.dict(
+            os.environ,
+            {
+                "BNL_OWNER_USER_ID": "61",
+                "BNL_PRIMARY_GUILD_ID": "1",
+            },
+            clear=False,
+        ):
+            self.conn.commit()
+            declared.ensure_declared_canon_schema(self.conn)
+            revision = declared.add_declared_canon(
+                self.conn,
+                actor_user_id=61,
+                authority_nonce="packet-declared-add-001",
+                guild_id=1,
+                subject_type="person",
+                subject_id="discord_user:7",
+                predicate="private_declared_fixture",
+                value={"fixture": "DECLARED PROJECTION SENTINEL"},
+                raw_declaration="DECLARED PROJECTION SENTINEL raw authority.",
+                cleaned_summary="DECLARED PROJECTION SENTINEL",
+                domain="real_community",
+                claim_kind="other",
+                visibility="internal",
+                eligible_routes=("declared_canon_review",),
+                now="2026-07-25T12:00:00+00:00",
+            ).primary
+            projected = ledger.shadow_declared_canon_projection(
+                self.conn,
+                guild_id=1,
+                declaration_id=revision.declaration_id,
+                revision_id=revision.revision_id,
+                actor_user_id=61,
+                authority_nonce="packet-declared-project-001",
+                expected_source_fingerprint=revision.source_fingerprint,
+                expected_lifecycle_status=revision.lifecycle_status,
+            )
+            self.assertEqual(projected.outcome, "inserted")
+            self.conn.commit()
+        packet = build_packet(
+            self.conn,
+            self.public_request(text="What do you know about me?"),
+            environ=self.flags,
+        )
+        rendered = render_packet_context(packet)
+        self.assertNotIn("DECLARED PROJECTION SENTINEL", rendered)
+        self.assertNotIn(
+            projected.entry_id,
+            {item.source_ref for item in packet.items},
+        )
 
     def test_gate_requires_all_shadows_and_rejects_live_authority(self):
         enabled = shadow_configuration(self.flags)
