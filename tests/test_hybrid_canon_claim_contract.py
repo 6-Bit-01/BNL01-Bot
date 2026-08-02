@@ -1296,16 +1296,23 @@ class HybridCanonClaimContractTests(unittest.TestCase):
             {
                 "subject_key": "discord_user:7",
                 "entry_id": "entry-7",
-                "text": "They keep returning to unusual signal routing.",
+                "text": "I keep returning to unusual signal routing.",
                 "occurrence_identity": "occurrence-7",
+                "root_identity": "root-7",
+                "source_digest": "digest-7",
+                "point_identity": "point-7",
+                "attribution_mode": "subject_action",
+                "polarity": "affirmative",
+                "action_identity": "return",
                 "observed_at": "2026-08-01T00:00:00+00:00",
-                "assessment_contract_version": "public_assessment_evidence_v1",
+                "assessment_contract_version": "public_assessment_evidence_v3",
                 "source_system": "memory_ledger_public_assessment",
                 "source_role": "user",
                 "source_class": "public_observation",
                 "lifecycle_status": "active",
                 "visibility": "public_safe",
                 "channel_policy": "public_home",
+                "route_mode": "normal_chat",
                 "public_usable": True,
                 "subject_authored": True,
                 "request_relevant": True,
@@ -1326,7 +1333,7 @@ class HybridCanonClaimContractTests(unittest.TestCase):
         self.assertEqual(adapted.claim.projection_state, "ephemeral")
         self.assertEqual(
             adapted.claim.root_ids,
-            ("memory_ledger:entry-7",),
+            ("root-7",),
         )
         self.assertEqual(adapted.claim.occurrence_ids, ("occurrence-7",))
 
@@ -1336,13 +1343,20 @@ class HybridCanonClaimContractTests(unittest.TestCase):
             "entry_id": "entry-7",
             "text": "A bounded observation.",
             "occurrence_identity": "occurrence-7",
-            "assessment_contract_version": "public_assessment_evidence_v1",
+            "root_identity": "root-7",
+            "source_digest": "digest-7",
+            "point_identity": "point-7",
+            "attribution_mode": "subject_action",
+            "polarity": "affirmative",
+            "action_identity": "discuss",
+            "assessment_contract_version": "public_assessment_evidence_v3",
             "source_system": "memory_ledger_public_assessment",
             "source_role": "user",
             "source_class": "public_observation",
             "lifecycle_status": "active",
             "visibility": "public_safe",
             "channel_policy": "public_home",
+            "route_mode": "normal_chat",
             "public_usable": True,
             "subject_authored": True,
             "request_relevant": True,
@@ -1366,6 +1380,25 @@ class HybridCanonClaimContractTests(unittest.TestCase):
         conn = sqlite3.connect(":memory:")
         try:
             ledger.ensure_memory_ledger_schema(conn)
+            conn.execute(
+                """
+                CREATE TABLE conversations (
+                  id INTEGER PRIMARY KEY,guild_id INTEGER,user_id INTEGER,
+                  user_name TEXT,role TEXT,content TEXT,channel_id INTEGER,
+                  channel_policy TEXT,route_mode TEXT NOT NULL,timestamp TEXT
+                )
+                """
+            )
+            conn.execute(
+                """
+                INSERT INTO conversations VALUES(701,1,7,'Crow','user',?,10,
+                                                  'public_home','normal_chat',?)
+                """,
+                (
+                    "I keep testing unusual antenna materials for the signal.",
+                    "2026-08-01T00:00:00+00:00",
+                ),
+            )
             inserted = ledger.shadow_conversation_row(
                 conn,
                 row_id=701,
@@ -1922,6 +1955,15 @@ class HybridCanonClaimContractTests(unittest.TestCase):
         conn = sqlite3.connect(":memory:")
         try:
             ledger.ensure_memory_ledger_schema(conn)
+            conn.execute(
+                """
+                CREATE TABLE conversations (
+                  id INTEGER PRIMARY KEY,guild_id INTEGER,user_id INTEGER,
+                  user_name TEXT,role TEXT,content TEXT,channel_id INTEGER,
+                  channel_policy TEXT,route_mode TEXT NOT NULL,timestamp TEXT
+                )
+                """
+            )
             for row_id, observed_at, text in (
                 (
                     1,
@@ -1934,6 +1976,13 @@ class HybridCanonClaimContractTests(unittest.TestCase):
                     "I tested another transition for the live set.",
                 ),
             ):
+                conn.execute(
+                    """
+                    INSERT INTO conversations VALUES(?,1,42,?, 'user',?,10,
+                                                      'public_home','normal_chat',?)
+                    """,
+                    (row_id, "Call'em Bini", text, observed_at),
+                )
                 result = ledger.shadow_conversation_row(
                     conn,
                     row_id=row_id,
@@ -1989,7 +2038,18 @@ class HybridCanonClaimContractTests(unittest.TestCase):
             self.assertFalse(
                 any("Cache Back" in item.text for item in built.items)
             )
-            self.assertEqual(built.profile_sufficiency.status, "empty")
+            self.assertEqual(built.profile_sufficiency.status, "rich")
+            self.assertTrue(built.profile_sufficiency.satisfied)
+            self.assertEqual(
+                len(
+                    tuple(
+                        item
+                        for item in built.items
+                        if item.lane == "assessment_observation"
+                    )
+                ),
+                2,
+            )
         finally:
             conn.close()
 

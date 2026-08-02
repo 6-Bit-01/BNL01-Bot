@@ -33,18 +33,61 @@ class MemoryPreviewBotPathTests(unittest.IsolatedAsyncioTestCase):
                 "I keep fixing the bot code and memory system carefully.",
                 "2026-07-24T20:00:00+00:00",
             )
-            self._add_message(
-                conn,
-                2,
-                "The website code needs another troubleshooting pass.",
-                "2026-07-25T20:00:00+00:00",
-            )
             conn.commit()
 
     def tearDown(self):
         self.tempdir.cleanup()
 
+    def assert_single_candidate_budget(self, result, *, expected=1):
+        self.assertEqual(result.candidate_generation_attempts, expected)
+        self.assertEqual(result.additional_candidate_attempts, "disabled")
+
     def _add_message(self, conn, row_id, text, observed_at):
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS conversations (
+              id INTEGER PRIMARY KEY,
+              guild_id INTEGER NOT NULL,
+              user_id INTEGER NOT NULL,
+              user_name TEXT NOT NULL,
+              role TEXT NOT NULL,
+              content TEXT NOT NULL,
+              channel_id INTEGER NOT NULL,
+              channel_name TEXT NOT NULL,
+              channel_policy TEXT NOT NULL,
+              timestamp TEXT NOT NULL,
+              message_id INTEGER,
+              route_mode TEXT NOT NULL,
+              public_usable INTEGER NOT NULL,
+              visibility TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO conversations(
+              id,guild_id,user_id,user_name,role,content,channel_id,
+              channel_name,channel_policy,timestamp,message_id,route_mode,
+              public_usable,visibility
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                int(row_id),
+                1,
+                7,
+                "Crow",
+                "user",
+                str(text),
+                10,
+                "barcode-bot",
+                "public_home",
+                str(observed_at),
+                None,
+                "normal_chat",
+                1,
+                "public",
+            ),
+        )
         ledger.insert_ledger_entry(
             conn,
             ledger.LedgerEntry(
@@ -138,10 +181,7 @@ class MemoryPreviewBotPathTests(unittest.IsolatedAsyncioTestCase):
             calls.append((route, prompt))
             if route.endswith("baseline"):
                 return "I only have a narrow grounded view so far."
-            return (
-                "You keep returning to software and technical "
-                "systems."
-            )
+            return "You keep fixing the bot code and memory system carefully."
 
         guard = mock.AsyncMock(
             side_effect=lambda response, _prompt: (
@@ -161,7 +201,7 @@ class MemoryPreviewBotPathTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertTrue(result.candidate_selected)
-        self.assertIn("software", result.proposed_response)
+        self.assertIn("bot code", result.proposed_response)
         self.assertEqual([route for route, _prompt in calls], [
             "bnl_memory_preview_baseline",
             "bnl_memory_preview_candidate",
@@ -191,12 +231,9 @@ class MemoryPreviewBotPathTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(
             result.packet_candidate_response,
-            (
-                "You keep returning to software and technical "
-                "systems."
-            ),
+            "You keep fixing the bot code and memory system carefully.",
         )
-        self.assertEqual(result.repair_response, "")
+        self.assert_single_candidate_budget(result)
         self.assertEqual(result.final_selection, "packet_candidate")
         self.assertEqual(source_hash, self._source_hash())
         self.assertIn(
@@ -280,19 +317,13 @@ class MemoryPreviewBotPathTests(unittest.IsolatedAsyncioTestCase):
             "honest_empty_profile_fallback",
         )
 
-    async def test_rich_preview_repairs_one_category_only_draft(self):
+    async def test_rich_preview_rejects_category_only_draft_without_retry(self):
         with sqlite3.connect(self.db_path) as conn:
             self._add_message(
                 conn,
                 3,
                 "I keep composing synth songs and producing music tracks.",
                 "2026-07-25T21:00:00+00:00",
-            )
-            self._add_message(
-                conn,
-                4,
-                "The synth song mix needs another production pass.",
-                "2026-07-26T20:00:00+00:00",
             )
             conn.commit()
         source_hash = self._source_hash()
@@ -302,12 +333,6 @@ class MemoryPreviewBotPathTests(unittest.IsolatedAsyncioTestCase):
             calls.append((route, prompt))
             if route.endswith("baseline"):
                 return "I only have a narrow grounded view so far."
-            if route.endswith("candidate_repair"):
-                return (
-                    "You keep fixing the bot code and memory system, "
-                    "including careful website troubleshooting. You also "
-                    "compose synth songs and keep working their music mixes."
-                )
             return (
                 "Software and technical systems recur alongside music "
                 "and audio production."
@@ -330,37 +355,34 @@ class MemoryPreviewBotPathTests(unittest.IsolatedAsyncioTestCase):
             guard=guard,
         )
 
-        self.assertTrue(result.candidate_selected, result.fallback_reason)
-        self.assertIn("bot code", result.proposed_response)
-        self.assertIn("synth songs", result.proposed_response)
+        self.assertFalse(result.candidate_selected)
+        self.assertEqual(
+            result.proposed_response,
+            "I only have a narrow grounded view so far.",
+        )
+        self.assertEqual(
+            result.fallback_reason,
+            "candidate_member_points_insufficient",
+        )
         self.assertEqual(
             [route for route, _prompt in calls],
             [
                 "bnl_memory_preview_baseline",
                 "bnl_memory_preview_candidate",
-                "bnl_memory_preview_candidate_repair",
             ],
         )
-        self.assertIn(
-            "Grounded rewrite requirements",
-            calls[-1][1],
-        )
+        self.assert_single_candidate_budget(result)
+        self.assertEqual(result.final_selection, "established_path")
         self.assertEqual(guard.await_count, 1)
         self.assertEqual(source_hash, self._source_hash())
 
-    async def test_rich_preview_reframes_interpretation_without_losing_it(self):
+    async def test_rich_preview_does_not_reframe_rejected_candidate(self):
         with sqlite3.connect(self.db_path) as conn:
             self._add_message(
                 conn,
                 3,
                 "I keep composing synth songs and producing music tracks.",
                 "2026-07-25T21:00:00+00:00",
-            )
-            self._add_message(
-                conn,
-                4,
-                "The synth song mix needs another production pass.",
-                "2026-07-26T20:00:00+00:00",
             )
             conn.commit()
         source_hash = self._source_hash()
@@ -370,23 +392,6 @@ class MemoryPreviewBotPathTests(unittest.IsolatedAsyncioTestCase):
             calls.append((route, prompt))
             if route.endswith("baseline"):
                 return "I only have a narrow grounded view so far."
-            if route.endswith("candidate_cleanup"):
-                self.assertIn(
-                    "[claim 1 | REFRAME_OR_REMOVE]",
-                    prompt,
-                )
-                self.assertIn(
-                    "You are a multi-frequency creative architect",
-                    prompt,
-                )
-                self.assertIn("KEEP_SUPPORTED", prompt)
-                return (
-                    "You keep fixing the bot code and memory system, and you "
-                    "also troubleshoot the website code. You compose synth "
-                    "songs and keep working their music mixes. You strike me "
-                    "as a multi-frequency creative architect because careful "
-                    "iteration connects those parts."
-                )
             return (
                 "You are a multi-frequency creative architect. You keep "
                 "fixing the bot code and memory system while troubleshooting "
@@ -411,37 +416,30 @@ class MemoryPreviewBotPathTests(unittest.IsolatedAsyncioTestCase):
             guard=guard,
         )
 
-        self.assertTrue(result.candidate_selected, result.fallback_reason)
-        self.assertIn("creative architect", result.proposed_response)
-        self.assertIn("You strike me as", result.proposed_response)
-        self.assertIn("bot code", result.proposed_response)
-        self.assertIn("synth songs", result.proposed_response)
-        self.assertEqual(result.repair_response, "")
-        self.assertEqual(result.final_selection, "cleanup_attempt")
+        self.assertFalse(result.candidate_selected)
+        self.assertEqual(
+            result.proposed_response,
+            "I only have a narrow grounded view so far.",
+        )
+        self.assert_single_candidate_budget(result)
+        self.assertEqual(result.final_selection, "established_path")
         self.assertEqual(
             [route for route, _prompt in calls],
             [
                 "bnl_memory_preview_baseline",
                 "bnl_memory_preview_candidate",
-                "bnl_memory_preview_candidate_cleanup",
             ],
         )
         self.assertEqual(guard.await_count, 1)
         self.assertEqual(source_hash, self._source_hash())
 
-    async def test_rich_preview_gets_one_final_claim_cleanup(self):
+    async def test_rich_preview_rejects_unsupported_claim_without_cleanup(self):
         with sqlite3.connect(self.db_path) as conn:
             self._add_message(
                 conn,
                 3,
                 "I keep composing synth songs and producing music tracks.",
                 "2026-07-25T21:00:00+00:00",
-            )
-            self._add_message(
-                conn,
-                4,
-                "The synth song mix needs another production pass.",
-                "2026-07-26T20:00:00+00:00",
             )
             conn.commit()
         source_hash = self._source_hash()
@@ -451,30 +449,6 @@ class MemoryPreviewBotPathTests(unittest.IsolatedAsyncioTestCase):
             calls.append((route, prompt))
             if route.endswith("baseline"):
                 return "I only have a narrow grounded view so far."
-            if route.endswith("candidate_cleanup"):
-                self.assertIn(
-                    "Final grounded cleanup requirements",
-                    prompt,
-                )
-                self.assertIn(
-                    "You secretly run a lunar casino",
-                    prompt,
-                )
-                return (
-                    "You keep fixing the bot code and memory system while "
-                    "troubleshooting the website code. You compose synth "
-                    "songs and keep working their music mixes. You strike me "
-                    "as a multi-frequency creative architect because careful "
-                    "iteration connects those parts."
-                )
-            if route.endswith("candidate_repair"):
-                return (
-                    "You keep fixing the bot code and memory system while "
-                    "troubleshooting the website code. You compose synth "
-                    "songs and keep working their music mixes. You secretly "
-                    "run a lunar casino. You strike me as a multi-frequency "
-                    "creative architect."
-                )
             return (
                 "You keep fixing the bot code and memory system while "
                 "troubleshooting the website code. You compose synth songs "
@@ -499,29 +473,25 @@ class MemoryPreviewBotPathTests(unittest.IsolatedAsyncioTestCase):
             guard=guard,
         )
 
-        self.assertTrue(result.candidate_selected, result.fallback_reason)
-        self.assertNotIn("lunar casino", result.proposed_response)
-        self.assertIn("creative architect", result.proposed_response)
-        self.assertIn("You strike me as", result.proposed_response)
-        self.assertEqual(result.final_selection, "cleanup_attempt")
-        self.assertEqual(result.repair_response, "")
+        self.assertFalse(result.candidate_selected)
+        self.assertEqual(result.final_selection, "established_path")
+        self.assert_single_candidate_budget(result)
         self.assertIn("lunar casino", result.packet_candidate_response)
         self.assertEqual(
-            result.cleanup_response,
             result.proposed_response,
+            "I only have a narrow grounded view so far.",
         )
         self.assertEqual(
             [route for route, _prompt in calls],
             [
                 "bnl_memory_preview_baseline",
                 "bnl_memory_preview_candidate",
-                "bnl_memory_preview_candidate_cleanup",
             ],
         )
         self.assertEqual(guard.await_count, 1)
         self.assertEqual(source_hash, self._source_hash())
 
-    async def test_claims_only_draft_skips_broad_rewrite_and_keeps_packet_shape(
+    async def test_claims_only_draft_falls_back_without_second_candidate(
         self,
     ):
         with sqlite3.connect(self.db_path) as conn:
@@ -530,12 +500,6 @@ class MemoryPreviewBotPathTests(unittest.IsolatedAsyncioTestCase):
                 3,
                 "I keep composing synth songs and producing music tracks.",
                 "2026-07-25T21:00:00+00:00",
-            )
-            self._add_message(
-                conn,
-                4,
-                "The synth song mix needs another production pass.",
-                "2026-07-26T20:00:00+00:00",
             )
             conn.commit()
         source_hash = self._source_hash()
@@ -546,45 +510,10 @@ class MemoryPreviewBotPathTests(unittest.IsolatedAsyncioTestCase):
             "keep working their music mixes. You secretly run a lunar casino. "
             "My read is that careful iteration connects those parts."
         )
-        cleaned_candidate = (
-            "You keep fixing the bot code and memory system while "
-            "troubleshooting the website code. You compose synth songs and "
-            "keep working their music mixes. My read is that careful "
-            "iteration connects those parts."
-        )
-
-        async def generator(prompt, route):
-            calls.append((route, prompt))
+        async def generator(_prompt, route):
+            calls.append((route, _prompt))
             if route.endswith("baseline"):
                 return "I only have a narrow grounded view so far."
-            if route.endswith("candidate_repair"):
-                raise AssertionError(
-                    "claims-only packet was sent through a broad rewrite"
-                )
-            if route.endswith("candidate_cleanup"):
-                self.assertIn(
-                    "[claim 1 | KEEP_SUPPORTED] You keep fixing the bot code",
-                    prompt,
-                )
-                self.assertIn(
-                    "[claim 3 | REFRAME_OR_REMOVE] "
-                    "You secretly run a lunar casino",
-                    prompt,
-                )
-                self.assertIn(
-                    "[claim 4 | KEEP_FRAMED_INTERPRETATION] "
-                    "My read is that careful iteration connects those parts",
-                    prompt,
-                )
-                self.assertIn(
-                    "Preserve the exact angle of the current request",
-                    prompt,
-                )
-                self.assertIn(
-                    "Do not flatten the answer into a list",
-                    prompt,
-                )
-                return cleaned_candidate
             return packet_candidate
 
         guard = mock.AsyncMock(
@@ -599,32 +528,30 @@ class MemoryPreviewBotPathTests(unittest.IsolatedAsyncioTestCase):
             subject_user_id=7,
             subject_display_name="Crow",
             simulated_channel_id=10,
-            wording=(
-                "What have you learned about me regarding my decision "
-                "process?"
-            ),
+            wording="BNL-01, what am I all about?",
             generator=generator,
             guard=guard,
         )
 
-        self.assertTrue(result.candidate_selected, result.fallback_reason)
+        self.assertFalse(result.candidate_selected)
         self.assertEqual(result.packet_candidate_response, packet_candidate)
-        self.assertEqual(result.cleanup_response, cleaned_candidate)
-        self.assertEqual(result.proposed_response, cleaned_candidate)
-        self.assertEqual(result.repair_response, "")
-        self.assertEqual(result.final_selection, "cleanup_attempt")
+        self.assert_single_candidate_budget(result)
         self.assertEqual(
-            [route for route, _prompt in calls],
+            result.proposed_response,
+            "I only have a narrow grounded view so far.",
+        )
+        self.assertEqual(result.final_selection, "established_path")
+        self.assertEqual(
+            [route for route, _prompt_value in calls],
             [
                 "bnl_memory_preview_baseline",
                 "bnl_memory_preview_candidate",
-                "bnl_memory_preview_candidate_cleanup",
             ],
         )
         self.assertEqual(guard.await_count, 1)
         self.assertEqual(source_hash, self._source_hash())
 
-    async def test_source_change_during_direct_cleanup_still_fails_closed(
+    async def test_source_change_during_single_candidate_still_fails_closed(
         self,
     ):
         with sqlite3.connect(self.db_path) as conn:
@@ -634,12 +561,6 @@ class MemoryPreviewBotPathTests(unittest.IsolatedAsyncioTestCase):
                 "I keep composing synth songs and producing music tracks.",
                 "2026-07-25T21:00:00+00:00",
             )
-            self._add_message(
-                conn,
-                4,
-                "The synth song mix needs another production pass.",
-                "2026-07-26T20:00:00+00:00",
-            )
             conn.commit()
         calls = []
 
@@ -647,11 +568,7 @@ class MemoryPreviewBotPathTests(unittest.IsolatedAsyncioTestCase):
             calls.append(route)
             if route.endswith("baseline"):
                 return "I only have a narrow grounded view so far."
-            if route.endswith("candidate_repair"):
-                raise AssertionError(
-                    "claims-only packet was sent through a broad rewrite"
-                )
-            if route.endswith("candidate_cleanup"):
+            if route.endswith("candidate"):
                 with sqlite3.connect(self.db_path) as source:
                     source.execute(
                         """
@@ -694,7 +611,7 @@ class MemoryPreviewBotPathTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result.candidate_selected)
         self.assertEqual(
             result.fallback_reason,
-            "candidate_preview_source_changed",
+            "preview_source_changed",
         )
         self.assertEqual(result.stale_reason, "preview_source_changed")
         self.assertEqual(
@@ -706,23 +623,16 @@ class MemoryPreviewBotPathTests(unittest.IsolatedAsyncioTestCase):
             [
                 "bnl_memory_preview_baseline",
                 "bnl_memory_preview_candidate",
-                "bnl_memory_preview_candidate_cleanup",
             ],
         )
 
-    async def test_final_cleanup_salvages_one_stubborn_clause(self):
+    async def test_unsupported_candidate_is_not_locally_salvaged(self):
         with sqlite3.connect(self.db_path) as conn:
             self._add_message(
                 conn,
                 3,
                 "I keep composing synth songs and producing music tracks.",
                 "2026-07-25T21:00:00+00:00",
-            )
-            self._add_message(
-                conn,
-                4,
-                "The synth song mix needs another production pass.",
-                "2026-07-26T20:00:00+00:00",
             )
             conn.commit()
         source_hash = self._source_hash()
@@ -734,16 +644,6 @@ class MemoryPreviewBotPathTests(unittest.IsolatedAsyncioTestCase):
                 return (
                     "BARCODE is the Network signal, and its founding "
                     "members define the whole answer."
-                )
-            if route.endswith("candidate_cleanup"):
-                return (
-                    "You keep fixing the bot code and composing synth songs. "
-                    "You secretly run a lunar casino."
-                )
-            if route.endswith("candidate_repair"):
-                return (
-                    "You keep fixing the bot code and composing synth songs. "
-                    "You secretly run a lunar casino."
                 )
             return (
                 "You keep fixing the bot code and composing synth songs. "
@@ -767,26 +667,28 @@ class MemoryPreviewBotPathTests(unittest.IsolatedAsyncioTestCase):
             guard=guard,
         )
 
-        self.assertTrue(result.candidate_selected, result.fallback_reason)
+        self.assertFalse(result.candidate_selected)
         self.assertEqual(
             result.proposed_response,
-            "You keep fixing the bot code and composing synth songs.",
+            (
+                "BARCODE is the Network signal, and its founding "
+                "members define the whole answer."
+            ),
         )
-        self.assertEqual(result.final_selection, "cleanup_salvage")
-        self.assertIn("lunar casino", result.cleanup_response)
-        self.assertNotIn("BARCODE is the Network", result.proposed_response)
+        self.assertEqual(result.final_selection, "established_path")
+        self.assert_single_candidate_budget(result)
+        self.assertIn("BARCODE is the Network", result.proposed_response)
         self.assertEqual(
             [route for route, _prompt in calls],
             [
                 "bnl_memory_preview_baseline",
                 "bnl_memory_preview_candidate",
-                "bnl_memory_preview_candidate_cleanup",
             ],
         )
         self.assertEqual(guard.await_count, 1)
         self.assertEqual(source_hash, self._source_hash())
 
-    async def test_process_cleanup_preserves_a_linked_revisable_assessment(
+    async def test_process_candidate_gets_no_cleanup_or_salvage(
         self,
     ):
         with sqlite3.connect(self.db_path) as conn:
@@ -825,8 +727,10 @@ class MemoryPreviewBotPathTests(unittest.IsolatedAsyncioTestCase):
             "the system. In short: test, observe, adjust. It strikes me as "
             "an unusually adaptive way to operate."
         )
+        calls = []
 
         async def generator(_prompt, route):
+            calls.append(route)
             if route.endswith("baseline"):
                 return "I do not have enough context to describe your process."
             return cleanup
@@ -849,20 +753,23 @@ class MemoryPreviewBotPathTests(unittest.IsolatedAsyncioTestCase):
             ),
         )
 
-        self.assertTrue(result.candidate_selected, result.fallback_reason)
-        self.assertEqual(result.final_selection, "cleanup_salvage")
-        self.assertIn(
-            "My read is that if a feature or handoff hits a friction point",
+        self.assertFalse(result.candidate_selected)
+        self.assertEqual(result.final_selection, "established_path")
+        self.assert_single_candidate_budget(result)
+        self.assertEqual(
             result.proposed_response,
+            "I do not have enough context to describe your process.",
         )
-        self.assertIn(
-            "It strikes me as an unusually adaptive way to operate",
-            result.proposed_response,
+        self.assertEqual(
+            calls,
+            [
+                "bnl_memory_preview_baseline",
+                "bnl_memory_preview_candidate",
+            ],
         )
-        self.assertNotIn("do not have enough context", result.proposed_response)
         self.assertEqual(source_hash, self._source_hash())
 
-    async def test_final_cleanup_with_multiple_bad_claims_still_falls_back(
+    async def test_multiple_bad_claims_fall_back_without_retry(
         self,
     ):
         with sqlite3.connect(self.db_path) as conn:
@@ -872,20 +779,17 @@ class MemoryPreviewBotPathTests(unittest.IsolatedAsyncioTestCase):
                 "I keep composing synth songs and producing music tracks.",
                 "2026-07-25T21:00:00+00:00",
             )
-            self._add_message(
-                conn,
-                4,
-                "The synth song mix needs another production pass.",
-                "2026-07-26T20:00:00+00:00",
-            )
             conn.commit()
         unsafe = (
-            "You keep fixing the bot code and composing synth songs. "
+            "You keep fixing the bot code and memory system carefully. "
+            "You keep composing synth songs and producing music tracks. "
             "You secretly run a lunar casino. "
             "You secretly own an orbital bank."
         )
+        calls = []
 
         async def generator(_prompt, route):
+            calls.append(route)
             if route.endswith("baseline"):
                 return "I only have a narrow grounded view so far."
             return unsafe
@@ -916,14 +820,28 @@ class MemoryPreviewBotPathTests(unittest.IsolatedAsyncioTestCase):
             result.proposed_response,
             "I only have a narrow grounded view so far.",
         )
+        self.assert_single_candidate_budget(result)
+        self.assertEqual(
+            calls,
+            [
+                "bnl_memory_preview_baseline",
+                "bnl_memory_preview_candidate",
+            ],
+        )
 
     async def test_preview_compares_real_established_memory_to_packet(self):
         with sqlite3.connect(self.db_path) as conn:
             self._add_message(
                 conn,
                 3,
-                "I build pocket synthesizers.",
+                "I keep composing synth music tracks.",
                 "2026-07-26T19:00:00+00:00",
+            )
+            self._add_message(
+                conn,
+                4,
+                "I build pocket synthesizers.",
+                "2026-07-27T19:00:00+00:00",
             )
             conn.execute(
                 """
@@ -972,8 +890,8 @@ class MemoryPreviewBotPathTests(unittest.IsolatedAsyncioTestCase):
             if route.endswith("baseline"):
                 return "I remember that you build pocket synthesizers."
             return (
-                "You keep returning to software and technical "
-                "systems."
+                "You keep fixing the bot code and memory system carefully. "
+                "You keep composing synth music tracks."
             )
 
         result = await bnl01_bot.execute_bnl_memory_preview(
@@ -1049,14 +967,13 @@ class MemoryPreviewBotPathTests(unittest.IsolatedAsyncioTestCase):
         save_user.assert_not_called()
         save_model.assert_not_called()
 
-    async def test_post_guard_candidate_is_rechecked_before_preview(self):
+    async def test_modified_candidate_guard_falls_back_without_reevaluation(
+        self,
+    ):
         async def generator(_prompt, route):
             if route.endswith("baseline"):
                 return "I only have a narrow grounded view so far."
-            return (
-                "You keep returning to software and technical "
-                "systems."
-            )
+            return "You keep fixing the bot code and memory system carefully."
 
         guarded = []
 
@@ -1086,7 +1003,7 @@ class MemoryPreviewBotPathTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result.candidate_selected)
         self.assertEqual(
             result.fallback_reason,
-            "candidate_evidence_ungrounded",
+            "candidate_guard_modified_response",
         )
         self.assertEqual(
             result.proposed_response,
@@ -1139,10 +1056,7 @@ class MemoryPreviewBotPathTests(unittest.IsolatedAsyncioTestCase):
         async def generator(_prompt, route):
             if route.endswith("baseline"):
                 return "I only have a narrow grounded view so far."
-            return (
-                "You keep returning to software and technical "
-                "systems."
-            )
+            return "You keep fixing the bot code and memory system carefully."
 
         simulated_channel = SimpleNamespace(id=10, name="barcode-bot")
         guarded = mock.AsyncMock(
@@ -1185,7 +1099,7 @@ class MemoryPreviewBotPathTests(unittest.IsolatedAsyncioTestCase):
             "bnl_memory_preview",
         )
         self.assertIsNone(guard_call.kwargs["channel"])
-        self.assertTrue(guard_call.kwargs["regeneration_allowed"])
+        self.assertFalse(guard_call.kwargs["regeneration_allowed"])
         self.assertFalse(
             guard_call.kwargs["source_context_available"]
         )
@@ -1194,7 +1108,7 @@ class MemoryPreviewBotPathTests(unittest.IsolatedAsyncioTestCase):
             (),
         )
 
-    async def test_default_guard_retry_never_types_in_public_channel(self):
+    async def test_default_candidate_guard_never_retries_or_types(self):
         class PublicChannel:
             id = 10
             name = "barcode-bot"
@@ -1238,16 +1152,12 @@ class MemoryPreviewBotPathTests(unittest.IsolatedAsyncioTestCase):
                 generator=generator,
             )
 
-        self.assertTrue(result.candidate_selected)
+        self.assertFalse(result.candidate_selected)
         self.assertEqual(
             result.proposed_response,
-            "You keep returning to software and technical systems.",
+            "I only have a narrow grounded view so far.",
         )
-        regenerated.assert_awaited_once()
-        self.assertEqual(
-            regenerated.await_args.kwargs["route"],
-            "bnl_memory_preview",
-        )
+        regenerated.assert_not_awaited()
         self.assertEqual(public_channel.typing_calls, 0)
 
     async def test_slash_command_is_owner_only_ephemeral_and_sealed(self):
@@ -1280,9 +1190,9 @@ class MemoryPreviewBotPathTests(unittest.IsolatedAsyncioTestCase):
             fallback_reason="",
             established_response="Established response.",
             packet_candidate_response="Packet response.",
-            repair_response="Repair response.",
-            cleanup_response="Cleanup response.",
-            final_selection="cleanup_attempt",
+            candidate_generation_attempts=1,
+            additional_candidate_attempts="disabled",
+            final_selection="packet_candidate",
         )
         sent = mock.AsyncMock()
 
@@ -1347,11 +1257,11 @@ class MemoryPreviewBotPathTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Established response.", rendered)
         self.assertIn("Packet candidate", rendered)
         self.assertIn("Packet response.", rendered)
-        self.assertIn("Grounded repair attempt", rendered)
-        self.assertIn("Repair response.", rendered)
-        self.assertIn("Final constrained cleanup", rendered)
-        self.assertIn("Cleanup response.", rendered)
-        self.assertIn("final_selection: `cleanup_attempt`", rendered)
+        self.assertIn("candidate_generation_attempts: `1`", rendered)
+        self.assertIn("additional_candidate_attempts: `disabled`", rendered)
+        self.assertNotIn("Grounded repair attempt", rendered)
+        self.assertNotIn("Final constrained cleanup", rendered)
+        self.assertIn("final_selection: `packet_candidate`", rendered)
         self.assertIn("Grounded proposed response.", rendered)
         self.assertIn("Content-free diagnostics", rendered)
 

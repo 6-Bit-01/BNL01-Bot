@@ -76,6 +76,7 @@ class SharedBrainSynthesisCanaryTests(unittest.TestCase):
                 content TEXT,
                 channel_id INTEGER,
                 channel_policy TEXT,
+                route_mode TEXT NOT NULL,
                 timestamp TEXT
             )
             """
@@ -84,14 +85,32 @@ class SharedBrainSynthesisCanaryTests(unittest.TestCase):
             """
             INSERT INTO conversations(
                 id,guild_id,user_id,user_name,role,content,channel_id,
-                channel_policy,timestamp
-            ) VALUES(900,1,7,'Crow','user',?,10,'public_context',?)
+                channel_policy,route_mode,timestamp
+            ) VALUES(900,1,7,'Crow','user',?,10,'public_context','normal_chat',?)
             """,
             (
                 "I keep connecting modular synths to the archive project.",
                 "2026-07-25T12:00:00+00:00",
             ),
         )
+        context_result = ledger.shadow_conversation_row(
+            self.conn,
+            row_id=900,
+            user_id=7,
+            user_name="Crow",
+            guild_id=1,
+            role="user",
+            content=(
+                "I keep connecting modular synths to the archive project."
+            ),
+            channel_name="",
+            channel_policy="public_context",
+            channel_id=10,
+            route_mode="normal_chat",
+            observed_at="2026-07-25T12:00:00+00:00",
+        )
+        self.assertEqual(context_result.outcome, "inserted")
+        self.context_entry_id = context_result.entry_id
         result = ledger.insert_ledger_entry(
             self.conn,
             ledger.LedgerEntry(
@@ -911,6 +930,35 @@ class SharedBrainSynthesisCanaryTests(unittest.TestCase):
             ),
         )
 
+        framed_compound = _candidate_claim_units(
+            "From your public appearances, I noticed you patched the "
+            "signal meter and considered old modem tones for an interlude."
+        )
+        self.assertEqual(
+            framed_compound,
+            (
+                "you patched the signal meter",
+                "you considered old modem tones for an interlude",
+            ),
+        )
+        self.assertEqual(
+            _candidate_claim_units(
+                "From your public activity, I noticed you produced music "
+                "and audio tracks."
+            ),
+            ("you produced music and audio tracks",),
+        )
+        self.assertEqual(
+            _candidate_claim_units(
+                "Music production is one recurring thread, and jokes and "
+                "community banter are another recurring thread."
+            ),
+            (
+                "Music production is one recurring thread",
+                "jokes and community banter are another recurring thread",
+            ),
+        )
+
     def test_project_wording_retains_relevant_canon_for_evaluation(self):
         wording = "BNL, what am I all about in the BARCODE project?"
         request = self._request()
@@ -1030,9 +1078,9 @@ class SharedBrainSynthesisCanaryTests(unittest.TestCase):
 
         member_first = (
             "Your favorite movie is Arrival, and your favorite color is "
-            "violet. In BARCODE, that sits inside a Network connecting "
-            "music, live broadcasts, community, software, archive, "
-            "characters, and story."
+            "violet. In BARCODE, the Network grew around the music and "
+            "collective and connects music, live broadcasts, community, "
+            "software, archive, characters, and story."
         )
         balanced_run = begin_run(
             self.conn,
@@ -1155,6 +1203,14 @@ class SharedBrainSynthesisCanaryTests(unittest.TestCase):
             WHERE entry_id=?
             """,
             (self.fact_entry_id,),
+        )
+        self.conn.execute(
+            """
+            UPDATE memory_ledger_entries
+            SET lifecycle_status='deleted'
+            WHERE entry_id=?
+            """,
+            (self.context_entry_id,),
         )
         packet = self._build_packet()
         self.assertEqual(packet.profile_sufficiency.status, "empty")
@@ -1353,6 +1409,7 @@ class SharedBrainSynthesisCanaryTests(unittest.TestCase):
             grounded_run,
             baseline_response="You keep connecting music and project work.",
             candidate_response=(
+                "You keep connecting modular synths to the archive project. "
                 "Your favorite movie is Arrival, and your favorite color is "
                 "violet."
             ),
@@ -1361,7 +1418,7 @@ class SharedBrainSynthesisCanaryTests(unittest.TestCase):
         self.assertTrue(grounded.candidate_selected)
         self.assertEqual(
             grounded.candidate_member_point_coverage_count,
-            2,
+            3,
         )
         self.assertGreaterEqual(
             grounded.candidate_member_root_coverage_count,
@@ -1412,6 +1469,7 @@ class SharedBrainSynthesisCanaryTests(unittest.TestCase):
             concise_support_run,
             baseline_response="You keep connecting music and project work.",
             candidate_response=(
+                "You keep connecting modular synths to the archive project. "
                 "Your favorite movie is Arrival and your favorite color is "
                 "violet. Those preferences make a vivid pairing."
             ),
@@ -1430,6 +1488,7 @@ class SharedBrainSynthesisCanaryTests(unittest.TestCase):
             opinion_run,
             baseline_response="You keep connecting music and project work.",
             candidate_response=(
+                "You keep connecting modular synths to the archive project. "
                 "Your favorite movie is Arrival and your favorite color is "
                 "violet. My read is that those choices give you a vivid, "
                 "slightly off-center creative signal. That is the part of "
@@ -1455,6 +1514,7 @@ class SharedBrainSynthesisCanaryTests(unittest.TestCase):
             production_frame_run,
             baseline_response="You keep connecting music and project work.",
             candidate_response=(
+                "You keep connecting modular synths to the archive project. "
                 "Your favorite movie is Arrival and your favorite color is "
                 "violet. Based on my observations, those choices create a "
                 "vivid, coherent, and slightly off-center creative signal. "
@@ -1471,6 +1531,7 @@ class SharedBrainSynthesisCanaryTests(unittest.TestCase):
         self.assertEqual(
             production_frame.candidate_claim_classifications,
             (
+                "member_supported",
                 "member_supported",
                 "member_supported",
                 "framed_opinion",
@@ -1652,8 +1713,8 @@ class SharedBrainSynthesisCanaryTests(unittest.TestCase):
             anchored_run,
             baseline_response="You keep building connected systems.",
             candidate_response=(
-                "You keep returning to bot code systems and website code "
-                "systems."
+                "Your favorite movie is bot code systems, and your favorite "
+                "color is website code systems."
             ),
             environ=self.flags,
         )
@@ -1735,9 +1796,7 @@ class SharedBrainSynthesisCanaryTests(unittest.TestCase):
                 "You keep connecting music and project work."
             ),
             candidate_response=(
-                "Your favorite movie is Arrival. You are also about modular "
-                "synths, music, and building the archive project into "
-                "something shared."
+                "You keep connecting modular synths to the archive project."
             ),
             candidate_generation_latency_ms=125,
             environ=self.flags,
@@ -1872,9 +1931,8 @@ class SharedBrainSynthesisCanaryTests(unittest.TestCase):
             run,
             baseline_response="You are about music and project work.",
             candidate_response=(
-                "Your favorite movie is Arrival. You are also all about "
-                "modular synths and the archive project; both keep showing "
-                "up in the way you build."
+                "You keep connecting modular synths to the archive project; "
+                "that's what you're all about."
             ),
             environ=self.flags,
         )
@@ -1918,6 +1976,102 @@ class SharedBrainSynthesisCanaryTests(unittest.TestCase):
         self.assertIn("live_applied=`1`", rendered)
         self.assertIn("relationship_posture_applied=`0`", rendered)
         self.assertNotIn("modular synths", rendered)
+
+    def test_cross_subject_context_cannot_satisfy_member_coverage(self):
+        rows = (
+            (
+                902,
+                8,
+                "Other",
+                "I review audio mixes before the final release.",
+                "2026-07-25T11:00:00+00:00",
+            ),
+            (
+                903,
+                7,
+                "Crow",
+                "I plan website interfaces before releasing changes.",
+                "2026-07-25T10:00:00+00:00",
+            ),
+        )
+        for row_id, user_id, user_name, content, observed_at in rows:
+            self.conn.execute(
+                """
+                INSERT INTO conversations(
+                    id,guild_id,user_id,user_name,role,content,channel_id,
+                    channel_policy,route_mode,timestamp
+                ) VALUES(?,1,?,?, 'user',?,10,'public_context','normal_chat',?)
+                """,
+                (row_id, user_id, user_name, content, observed_at),
+            )
+            result = ledger.shadow_conversation_row(
+                self.conn,
+                row_id=row_id,
+                user_id=user_id,
+                user_name=user_name,
+                guild_id=1,
+                role="user",
+                content=content,
+                channel_name="",
+                channel_policy="public_context",
+                channel_id=10,
+                route_mode="normal_chat",
+                observed_at=observed_at,
+            )
+            self.assertEqual(result.outcome, "inserted")
+
+        request = replace(
+            self._request(),
+            conversation_evidence=(
+                PacketConversationEvidence(
+                    text=rows[0][3],
+                    source_id=902,
+                    speaker_user_id=8,
+                    speaker_label="Other",
+                ),
+                PacketConversationEvidence(
+                    text=rows[1][3],
+                    source_id=903,
+                    speaker_user_id=7,
+                    speaker_label="Crow",
+                ),
+                *self._request().conversation_evidence,
+            ),
+        )
+        packet = build_packet(
+            self.conn,
+            request,
+            persist=True,
+            environ=self.flags,
+        )
+        self.assertEqual(packet.profile_sufficiency.status, "rich")
+        assessment = self._build_assessment(packet)
+        basis = self._build_basis(packet, assessment)
+        run = begin_run(
+            self.conn,
+            basis,
+            baseline_response="I have a narrow grounded view so far.",
+            environ=self.flags,
+        )
+        decision = evaluate_candidate(
+            self.conn,
+            run,
+            baseline_response="I have a narrow grounded view so far.",
+            candidate_response=(
+                "You keep connecting modular synths to the archive project. "
+                "You review audio mixes before the final release."
+            ),
+            environ=self.flags,
+        )
+
+        self.assertFalse(decision.candidate_selected)
+        self.assertIn(
+            decision.fallback_reason,
+            {
+                "candidate_member_points_insufficient",
+                "candidate_evidence_ungrounded",
+            },
+        )
 
     def test_acceptance_blocks_packet_application_without_canary_receipt(self):
         self.assertTrue(
@@ -1981,7 +2135,9 @@ class SharedBrainSynthesisCanaryTests(unittest.TestCase):
             self.conn,
             accepted_run,
             baseline_response="You keep connecting music and project work.",
-            candidate_response="Your favorite movie is Arrival.",
+            candidate_response=(
+                "You keep connecting modular synths to the archive project."
+            ),
             environ=self.flags,
         )
         self.assertTrue(accepted.candidate_selected)

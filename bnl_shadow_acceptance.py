@@ -759,7 +759,7 @@ def _read_intelligence_packet_report(
         return _report_error(
             {
                 "tablePresent": False,
-                "schemaVersion": "unified_intelligence_packet_v3",
+                "schemaVersion": "unified_intelligence_packet_v4",
                 "runs": 0,
                 "itemTotal": 0,
                 "validationItemTotal": 0,
@@ -800,7 +800,7 @@ def _read_shared_brain_synthesis_report(
         return _report_error(
             {
                 "tablePresent": False,
-                "schemaVersion": "shared_brain_synthesis_v5",
+                "schemaVersion": "shared_brain_synthesis_v6",
                 "runs": 0,
                 "promptAppliedRuns": 0,
                 "liveAppliedRuns": 0,
@@ -1921,7 +1921,7 @@ def render_v2_shadow_acceptance_lines(snapshot: Mapping[str, Any]) -> List[str]:
             intelligence_packet_state.get("reason", "disabled"),
             intelligence_packet.get(
                 "schemaVersion",
-                "unified_intelligence_packet_v3",
+                "unified_intelligence_packet_v4",
             ),
             intelligence_packet.get("runs", 0),
             intelligence_packet.get("itemTotal", 0),
@@ -1997,7 +1997,7 @@ def render_v2_shadow_acceptance_lines(snapshot: Mapping[str, Any]) -> List[str]:
             _on(shared_brain_synthesis_state.get("fullyScoped")),
             shared_brain_synthesis.get(
                 "schemaVersion",
-                "shared_brain_synthesis_v5",
+                "shared_brain_synthesis_v6",
             ),
             shared_brain_synthesis.get("runs", 0),
             json.dumps(

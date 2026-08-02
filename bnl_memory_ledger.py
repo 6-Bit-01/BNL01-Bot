@@ -15,7 +15,7 @@ import json
 import os
 import re
 import sqlite3
-from typing import Any, Iterable
+from typing import Any, Iterable, Mapping
 
 from bnl_canon_source_contract import (
     Confidence,
@@ -571,6 +571,8 @@ _PUBLIC_ASSESSMENT_PROCESS_QUERY_RE = re.compile(
 _PUBLIC_ASSESSMENT_PROCESS_TERMS = frozenset(
     {
         "approach",
+        "adjust",
+        "adjusting",
         "build",
         "building",
         "careful",
@@ -608,6 +610,304 @@ _PUBLIC_ASSESSMENT_PROCESS_TERMS = frozenset(
         "working",
     }
 )
+_PUBLIC_ASSESSMENT_ALLOWED_ROUTES = frozenset(
+    {"normal_chat", "conversation_continuity"}
+)
+_PUBLIC_ASSESSMENT_GENERIC_PROFILE_TERMS = frozenset(
+    {
+        "all",
+        "barcode",
+        "bnl",
+        "bnl-01",
+        "bnl01",
+        "everything",
+        "learn",
+        "me",
+        "my",
+        "myself",
+        "part",
+        "tell",
+    }
+)
+_PUBLIC_ASSESSMENT_SEMANTICS_VERSION = "public_assessment_semantics_v3"
+_PUBLIC_ASSESSMENT_ROOT_STATE_VERSION = "public_assessment_root_state_v3"
+_PUBLIC_ASSESSMENT_ACTION_ALIASES = {
+    "ask": "ask",
+    "asked": "ask",
+    "asking": "ask",
+    "question": "ask",
+    "request": "ask",
+    "suggest": "suggest",
+    "propose": "suggest",
+    "recommend": "suggest",
+    "consider": "suggest",
+    "imagine": "suggest",
+    "discuss": "discuss",
+    "mention": "discuss",
+    "talk": "discuss",
+    "describe": "discuss",
+    "say": "discuss",
+    "tell": "discuss",
+    "note": "discuss",
+    "raise": "discuss",
+    "revisit": "return",
+    "return": "return",
+    "compare": "evaluate",
+    "compar": "evaluate",
+    "evaluat": "evaluate",
+    "weigh": "evaluate",
+    "evaluate": "evaluate",
+    "assess": "evaluate",
+    "asses": "evaluate",
+    "inspect": "evaluate",
+    "review": "evaluate",
+    "test": "test",
+    "tried": "test",
+    "try": "test",
+    "trying": "test",
+    "verifi": "test",
+    "validat": "test",
+    "verify": "test",
+    "validate": "test",
+    "check": "test",
+    "patch": "fix",
+    "fix": "fix",
+    "fixed": "fix",
+    "repair": "fix",
+    "debug": "fix",
+    "tune": "adjust",
+    "tun": "adjust",
+    "tuned": "adjust",
+    "tuning": "adjust",
+    "adjust": "adjust",
+    "calibrate": "adjust",
+    "calibrat": "adjust",
+    "refine": "adjust",
+    "refin": "adjust",
+    "build": "build",
+    "make": "build",
+    "mak": "build",
+    "making": "build",
+    "create": "build",
+    "creat": "build",
+    "craft": "build",
+    "produce": "build",
+    "design": "build",
+    "choose": "choose",
+    "choos": "choose",
+    "decide": "choose",
+    "decid": "choose",
+    "select": "choose",
+    "pick": "choose",
+    "prefer": "choose",
+    "plan": "plan",
+    "organize": "plan",
+    "organiz": "plan",
+    "coordinate": "plan",
+    "coordinat": "plan",
+    "schedule": "plan",
+    "schedul": "plan",
+    "write": "write",
+    "writ": "write",
+    "draft": "write",
+    "edit": "write",
+    "share": "share",
+    "shar": "share",
+    "post": "share",
+    "publish": "share",
+    "release": "share",
+    "releas": "share",
+    "learn": "learn",
+    "research": "learn",
+    "investigate": "learn",
+    "investigat": "learn",
+    "study": "learn",
+    "studi": "learn",
+}
+_PUBLIC_ASSESSMENT_TOPIC_ALIASES = {
+    "audio": "audio",
+    "sound": "audio",
+    "mix": "audio",
+    "music": "audio",
+    "tone": "audio",
+    "track": "audio",
+    "synth": "audio",
+    "harmonic": "audio",
+    "release": "release",
+    "publish": "release",
+    "website": "interface",
+    "site": "interface",
+    "interface": "interface",
+    "screen": "interface",
+    "antenna": "signal",
+    "signal": "signal",
+    "modem": "signal",
+    "meter": "signal",
+    "network": "signal",
+    "radio": "broadcast",
+    "broadcast": "broadcast",
+    "show": "broadcast",
+    "stream": "broadcast",
+    "visual": "visual",
+    "image": "visual",
+    "icon": "visual",
+    "emote": "visual",
+    "art": "visual",
+    "transition": "transition",
+    "interlude": "transition",
+    "tape": "transition",
+    "code": "software",
+    "bot": "software",
+    "software": "software",
+    "system": "software",
+    "memory": "software",
+    "community": "community",
+    "member": "community",
+    "discord": "community",
+    "team": "community",
+    "lore": "lore",
+    "canon": "lore",
+    "story": "lore",
+}
+_PUBLIC_ASSESSMENT_MATERIAL_STOPWORDS = frozenset(
+    """
+    after again always anymore another around before barely careful carefully
+    constantly
+    change changes could daily day days did do does doing don't each evening
+    evenings every final first frequently had hardly has have having here hour
+    hours keep keeps last later may might month monthly months more morn morning
+    mornings never night nightly nights no not occasionally often once only our
+    quarterly rarely really regular regularly routinely seldom should smaller
+    sometime sometimes still than then there today tomorrow usually very want wants week
+    weekly weeks whenever will without would yesterday yearly years
+    """.split()
+)
+_PUBLIC_ASSESSMENT_ACTION_SKIP = frozenset(
+    """
+    also am are be been being can could did do does had has have having keep keeps
+    hardly longer may might must never no not often only rarely really seldom should
+    sometimes tend tends usually was were will without would
+    """.split()
+)
+_PUBLIC_ASSESSMENT_NEGATIVE_RE = re.compile(
+    r"\b(?:never|not|no\s+longer|cannot|can't|don't|doesn't|didn't|"
+    r"won't|wouldn't|shouldn't|without)\b",
+    re.I,
+)
+_PUBLIC_ASSESSMENT_CONDITIONAL_RE = re.compile(
+    r"\b(?:barely|can|could|hardly|would|might|may|rarely|seldom|should|"
+    r"will|if|unless)\b",
+    re.I,
+)
+_PUBLIC_ASSESSMENT_PASSIVE_ACTOR_RE = re.compile(
+    r"\b(?:i|we|you)\s+(?:(?:have|had)\s+been|am|are|was|were|be|been|being)"
+    r"\s+(?:[a-z]+ly\s+)?(?:asked|assigned|encouraged|forced|given|invited|"
+    r"required|requested|reminded|told|warned)\b",
+    re.I,
+)
+_PUBLIC_ASSESSMENT_POST_ACTION_CONDITION_RE = re.compile(
+    r"\b(?:only\s+if|if|unless|depending\s+on|as\s+long\s+as)\b",
+    re.I,
+)
+_PUBLIC_ASSESSMENT_CESSATION_RE = re.compile(
+    r"\b(?:i|we|you)\s+(?:have\s+)?(?:stopped?|quit(?:s|ting)?)\s+"
+    r"[a-z][a-z'’-]{2,}ing\b",
+    re.I,
+)
+_PUBLIC_ASSESSMENT_SINGLE_OCCURRENCE_RE = re.compile(
+    r"\b(?:once|one\s+time|this\s+time|just\s+once)\b",
+    re.I,
+)
+_PUBLIC_ASSESSMENT_INTERMITTENT_RE = re.compile(
+    r"\b(?:sometimes|occasionally|rarely|seldom|now\s+and\s+then)\b",
+    re.I,
+)
+_PUBLIC_ASSESSMENT_HABITUAL_RE = re.compile(
+    r"\b(?:always|constantly|daily|every\s+(?:day|morning|evening|night|"
+    r"week|month)|frequently|often|regularly|routinely|usually|weekly|"
+    r"monthly|yearly)\b",
+    re.I,
+)
+_PUBLIC_ASSESSMENT_LEADING_ADDRESSEE_RE = re.compile(
+    r"^\s*(?:<@!?\d+>\s*)?"
+    r"(?:(?:hey|yo|hi|hello)[\s,]+)?"
+    r"(?:@?bnl(?:-?0?1)?|barcode\s+(?:bot|network\s+layer)|b|bud|buddy)"
+    r"(?:\s*[,;:!?—–-]+\s*|\s+)",
+    re.I,
+)
+_PUBLIC_ASSESSMENT_CANDIDATE_EPISTEMIC_FRAME_RE = re.compile(
+    r"^\s*(?:(?:from|based\s+on)\s+(?:your\s+public\s+"
+    r"(?:messages|activity|appearances)|the\s+public\s+(?:thread|record)|"
+    r"what\s+i(?:'ve|\s+have)?\s+(?:seen|noticed|observed))"
+    r"\s*[,;:—–-]\s*(?:i(?:'ve|\s+have)?\s+"
+    r"(?:noticed|observed|seen)\s+(?:that\s+)?)?|"
+    r"i(?:'ve|\s+have)\s+"
+    r"(?:noticed|observed|seen)\s+(?:that\s+)?)",
+    re.I,
+)
+_PUBLIC_ASSESSMENT_SENSITIVE_DISCLOSURE_RE = re.compile(
+    r"\b(?:add|adhd|aids|anxiety|autis(?:m|tic)|bipolar|cancer|clinic|"
+    r"depression|diabetes|dyslexia|ocd|prozac|ptsd|schizophrenia|"
+    r"diagnos(?:ed|is)|disease|disorder|doctor|hospital|insulin|medical|"
+    r"medication|medicine|mental\s+health|nurse|patient|prescription|"
+    r"psychiatr(?:y|ist|ic)|therapy|therapist|treatment)\b|"
+    r"\b(?:arrest(?:ed)?|convict(?:ed|ion)?|court|crime|criminal|felony|"
+    r"jail|lawsuit|misdemeanor|parole|prison|probation)\b|"
+    r"\b(?:bank|bankrupt(?:cy)?|debt|dollars?|earn(?:ed|ing|s)?|finance|"
+    r"financial|income|loan|mortgage|rent|salary|wage)\b|"
+    r"\b(?:democrat(?:ic)?|election|liberal|politic(?:al(?:ly)?|s)?|republican|"
+    r"socialist|vote[ds]?|voting)\b|"
+    r"\b(?:bisexual|christian|gay|hindu|islam|jewish|lesbian|muslim|"
+    r"nonbinary|queer|religious|transgender)\b|"
+    r"\b(?:administrator|admin|moderator|server\s+owner|staff\s+member)\b|"
+    r"\b(?:identify|identified|practice|practicing)\s+as\b",
+    re.I,
+)
+_PUBLIC_ASSESSMENT_CONTEXTUAL_PRIVATE_RE = re.compile(
+    r"\b(?:i|we|you)\s+(?:have|had|manage|managed|live\s+with|"
+    r"suffer(?:ed|ing)?\s+from)\s+(?:a|an|the|my|our|your)?\s*"
+    r"(?:[A-Z]{2,}[A-Z0-9-]*|(?:mental|medical|chronic)\s+"
+    r"(?:condition|issue|disorder))\b|"
+    r"\b(?:i|we|you)\s+(?:take|took|use|used)\s+(?:my|our|your)?\s*"
+    r"(?:medication|medicine|prescription|[A-Z][A-Za-z0-9-]{2,})\b|"
+    r"\b(?:i|we|you)\s+(?:moved?|relocat(?:e|ed|ing))\s+"
+    r"(?:to|from|near)\b|"
+    r"\b(?:i|we|you)\s+(?:owe|owed|owing)\b|"
+    r"\b(?:credit\s+card|mastercard|money|visa)\b|"
+    r"\b(?:i|we|you)\s+(?:strongly\s+)?(?:support|oppose|back)\s+"
+    r"[A-Z][A-Za-z0-9'’_-]+\b",
+    re.I,
+)
+_PUBLIC_ASSESSMENT_ROLE_REPORT_RE = re.compile(
+    r"\b(?:i|we|you)\s+(?:work|serve|served|act|acted|volunteer|"
+    r"volunteered)\s+as\b",
+    re.I,
+)
+_PUBLIC_ASSESSMENT_EXACT_NUMBER_RE = re.compile(
+    r"(?<![A-Za-z-])\b\d[\d,]*(?:\.\d+)?\b"
+)
+_PUBLIC_ASSESSMENT_THIRD_PARTY_LEAD_RE = re.compile(
+    r"^\s*(?:<@!?\d+>|he|she|they|them|"
+    r"[A-Z][A-Za-z0-9'’_-]*(?:\s+[A-Z][A-Za-z0-9'’_-]*){1,3}|"
+    r"[A-Z]{2,}(?:-\d+)?)\s+"
+    r"(?:is|are|was|were|has|have|had|can|could|will|would|should|"
+    r"[a-z][a-z'’-]{2,})\b"
+)
+_PUBLIC_ASSESSMENT_REPORTED_THIRD_PARTY_RE = re.compile(
+    r"\b(?:i|we)\s+(?:think|believe|heard|noticed|saw|know)\s+"
+    r"(?:that\s+)?(?:<@!?\d+>|"
+    r"[A-Z][A-Za-z0-9'’_-]*(?:\s+[A-Z][A-Za-z0-9'’_-]*){1,3})\b"
+    ,
+    re.I,
+)
+_PUBLIC_ASSESSMENT_SINGLE_PARTY_LEAD_RE = re.compile(
+    r"^\s*[A-Z][A-Za-z0-9'’_-]{1,31}\s+"
+    r"(?:(?:always|often|usually|sometimes|never)\s+)?"
+    r"(?:is|was|has|does|like(?:s|d)?|test(?:s|ed)?|build(?:s|t)?|"
+    r"make(?:s|d)?|use(?:s|d)?|check(?:s|ed)?|prefer(?:s|red)?|"
+    r"keep(?:s|t)?|ask(?:s|ed)?|suggest(?:s|ed)?|review(?:s|ed)?|"
+    r"tun(?:e|es|ed)|mix(?:es|ed)?|post(?:s|ed)?|share(?:s|d)?)\b"
+)
 
 APPROVED_SELF_AUTHORED_FACT_KEYS = frozenset({
     "preferred_name",
@@ -619,8 +919,22 @@ _CONVERSATION_CORRECTION_RE = re.compile(
     r"(?:"
     r"^\s*(?:actually|correction|correcting)\b"
     r"|\b(?:i|we)\s+meant\b"
+    r"|^\s*(?:i|we)\s+no\s+longer\b"
+    r"|^\s*(?:i|we)\s+(?:have\s+)?(?:stopped?|quit(?:s|ting)?)\s+"
+    r"(?!by\b|to\b|at\b)[a-z][a-z'’-]{2,}"
+    r"|^\s*(?:i|we)\s+(?:was|were)\s+wrong\b"
+    r"|^\s*(?:i|we)\s+(?:do|did)\s+not\b[^.!?]{0,180}\banymore\b"
+    r"|^\s*(?:i|we)\s+used\s+to\b[^.!?]{0,180}"
+    r"\b(?:i|we)\s+(?:do|did)\s+not\b[^.!?]{0,80}\banymore\b"
+    r"|\b(?:i|we)\s+(?:have\s+)?changed\s+(?:my|our)\s+mind\b"
+    r"|\b(?:i|we)\s+(?:take|took)\s+(?:that|this|it)\s+back\b"
+    r"|^\s*(?:i|we)\s+(?:have\s+)?switched\s+from\b"
+    r"|^\s*(?:i|we)\s+(?:have\s+)?moved\s+on\s+from\b"
     r"|\b(?:that's|that\s+is)\s+wrong\b"
     r"|^\s*no\s*[,;:]\s*not\s+that\b"
+    r"|^\s*no\s*[,;:]\s*[^.!?]{0,180}\binstead\b"
+    r"|\bscratch\s+(?:that|this)\b"
+    r"|\b(?:forget|ignore)\s+(?:that|what\s+(?:i|we)\s+said)\b"
     r"|\b(?:i|we)\s+(?:need|want)\s+to\s+correct\b"
     r"|\b(?:please\s+)?correct\s+(?:that|this|my|the\s+(?:last|previous))\b"
     r"|\b(?:change|replace|swap)\s+"
@@ -716,6 +1030,13 @@ class PublicAssessmentEvidence:
     visibility: str
     occurrence_identity: str
     score: float
+    root_identity: str = ""
+    source_digest: str = ""
+    point_identity: str = ""
+    attribution_mode: str = ""
+    polarity: str = ""
+    action_identity: str = ""
+    material_facets: tuple[str, ...] = field(default_factory=tuple)
     request_relevant: bool = False
     subject_key: str = ""
     assessment_contract_version: str = PUBLIC_ASSESSMENT_EVIDENCE_VERSION
@@ -724,11 +1045,47 @@ class PublicAssessmentEvidence:
     source_class: str = SourceClass.PUBLIC_OBSERVATION.value
     lifecycle_status: str = ACTIVE_LIFECYCLE
     channel_policy: str = "unknown"
+    route_mode: str = "unknown"
     public_usable: bool = False
     subject_authored: bool = False
     selector_eligible: bool = False
     derived: bool = True
     projection: bool = True
+
+
+@dataclass(frozen=True)
+class PublicAssessmentSemantics:
+    """Deterministic actor, polarity, and material-point interpretation."""
+
+    attribution_mode: str = "third_party_or_ambiguous"
+    polarity: str = "affirmative"
+    action_identity: str = ""
+    material_facets: tuple[str, ...] = field(default_factory=tuple)
+    point_identity: str = ""
+
+
+@dataclass(frozen=True)
+class PublicAssessmentRootState:
+    """One source-bound public observation state used at build and send."""
+
+    entry_id: str
+    subject_key: str
+    text: str
+    observed_at: str
+    visibility: str
+    channel_policy: str
+    route_mode: str
+    source_role: str
+    source_class: str
+    lifecycle_status: str
+    source_row_id: str
+    root_identity: str
+    occurrence_identity: str
+    source_digest: str
+    semantics: PublicAssessmentSemantics
+    public_usable: bool = True
+    derived: bool = False
+    projection: bool = False
 
 
 @dataclass(frozen=True)
@@ -842,7 +1199,7 @@ def current_bnl_self_name_records(
             """
         SELECT entry_id,normalized_value,observed_at,channel_policy,
                channel_id,visibility
-        FROM memory_ledger_entries
+        FROM main.memory_ledger_entries
         WHERE guild_id=? AND subject_key=?
           AND predicate_key LIKE ?
           %s
@@ -2056,7 +2413,7 @@ def _knowledge_entry_rows(
           source_row_id,source_revision,source_role,route_mode,channel_id,
           channel_name,channel_policy,visibility,confidence,public_usable,
           derived,projection,observed_at,source_sequence,lifecycle_status
-        FROM memory_ledger_entries
+        FROM main.memory_ledger_entries
         WHERE entry_id IN (%s)
         """ % placeholders,
         tuple(entry_ids),
@@ -2094,7 +2451,7 @@ def _knowledge_entry_rows(
         for entry_id, participant_key, participant_role in conn.execute(
             """
             SELECT entry_id,participant_key,participant_role
-            FROM memory_ledger_participants
+            FROM main.memory_ledger_participants
             WHERE entry_id IN (%s)
             ORDER BY entry_id,order_index,participant_key
             """ % placeholders,
@@ -5233,18 +5590,22 @@ def _conversation_motif_history(
     subject_key: str,
     max_scan: int,
     diagnostics: dict[str, int] | None = None,
+    require_legacy_occurrence: bool = True,
+    normal_chat_only: bool = False,
 ) -> list[dict[str, Any]]:
     rows = conn.execute(
         """
         SELECT entry_id,subject_key,subject_display_name,normalized_value,observed_at,
-               channel_id,channel_policy,source_table,source_row_id,
-               source_role,source_class,visibility,public_usable,
+               channel_id,channel_name,channel_policy,source_table,source_row_id,
+               source_role,source_class,route_mode,visibility,public_usable,
                derived,projection,lifecycle_status
-        FROM memory_ledger_entries e
+        FROM main.memory_ledger_entries e
         WHERE guild_id=? AND subject_key=?
           AND entry_type='observation' AND predicate_key='conversation'
           AND source_table='conversations' AND source_role='user'
           AND source_class='public_observation'
+          AND route_mode IN ('normal_chat','conversation_continuity')
+          AND (?=0 OR route_mode='normal_chat')
           AND channel_policy IN (
             'public_home','public_context','public_selective'
           )
@@ -5252,8 +5613,8 @@ def _conversation_motif_history(
           AND public_usable=1 AND derived=0 AND projection=0
           AND lifecycle_status='active'
           AND NOT EXISTS (
-            SELECT 1 FROM memory_ledger_lineage l
-            WHERE l.guild_id=e.guild_id AND l.target_entry_id=e.entry_id
+            SELECT 1 FROM main.memory_ledger_lineage l
+            WHERE l.target_entry_id=e.entry_id
               AND l.lineage_type IN (
                 'correction_of','supersedes','retracts'
               )
@@ -5264,6 +5625,7 @@ def _conversation_motif_history(
         (
             int(guild_id or 0),
             str(subject_key or ""),
+            int(bool(normal_chat_only)),
             max(
                 1,
                 min(
@@ -5280,11 +5642,13 @@ def _conversation_motif_history(
         "normalized_value",
         "observed_at",
         "channel_id",
+        "channel_name",
         "channel_policy",
         "source_table",
         "source_row_id",
         "source_role",
         "source_class",
+        "route_mode",
         "visibility",
         "public_usable",
         "derived",
@@ -5312,10 +5676,18 @@ def _conversation_motif_history(
                     + 1
                 )
             continue
-        full_entry = _knowledge_entry_rows(
-            conn,
-            (str(entry.get("entry_id") or ""),),
-        ).get(str(entry.get("entry_id") or ""))
+        full_entry = (
+            _main_public_assessment_entry(
+                conn,
+                str(entry.get("entry_id") or ""),
+            )
+            if require_legacy_occurrence
+            else {
+                **entry,
+                "entry_type": "observation",
+                "predicate_key": "conversation",
+            }
+        )
         if not full_entry:
             if diagnostics is not None:
                 diagnostics["ledger_rows_missing_root"] = (
@@ -5343,23 +5715,28 @@ def _conversation_motif_history(
                 )
             continue
         entry["terms"] = terms
-        entry["occurrence_identity"] = _knowledge_occurrence_identity(
-            conn,
-            full_entry,
-        )
-        if not entry["occurrence_identity"]:
-            if diagnostics is not None:
-                diagnostics["ledger_rows_occurrence_excluded"] = (
-                    int(
-                        diagnostics.get(
-                            "ledger_rows_occurrence_excluded",
-                            0,
+        if require_legacy_occurrence:
+            # Durable motif formation predates retained raw-conversation
+            # binding; keep its existing occurrence owner here.  Open Signal
+            # selection independently recomputes the stricter main/raw-bound
+            # occurrence and therefore skips this legacy prefilter.
+            entry["occurrence_identity"] = _knowledge_occurrence_identity(
+                conn,
+                full_entry,
+            )
+            if not entry["occurrence_identity"]:
+                if diagnostics is not None:
+                    diagnostics["ledger_rows_occurrence_excluded"] = (
+                        int(
+                            diagnostics.get(
+                                "ledger_rows_occurrence_excluded",
+                                0,
+                            )
+                            or 0
                         )
-                        or 0
+                        + 1
                     )
-                    + 1
-                )
-            continue
+                continue
         history.append(entry)
     if diagnostics is not None:
         diagnostics["ledger_rows_motif_eligible"] = len(history)
@@ -5374,6 +5751,485 @@ def _public_assessment_terms(value: str) -> frozenset[str]:
         )
         if token not in _PUBLIC_ASSESSMENT_STOPWORDS
     )
+
+
+def _public_assessment_term_stem(value: str) -> str:
+    term = str(value or "").lower()
+    if len(term) > 5 and term.endswith("ies"):
+        return term[:-3] + "y"
+    if len(term) > 4 and term.endswith("es") and term[:-2].endswith(
+        ("s", "x", "z", "ch", "sh")
+    ):
+        return term[:-2]
+    for suffix in ("ing", "ed"):
+        if len(term) > len(suffix) + 3 and term.endswith(suffix):
+            stem = term[: -len(suffix)]
+            if len(stem) > 3 and stem[-1:] == stem[-2:-1]:
+                stem = stem[:-1]
+            return stem
+    if len(term) > 4 and term.endswith("s") and not term.endswith("ss"):
+        return term[:-1]
+    return term
+
+
+def _public_assessment_action_identity(value: str) -> str:
+    stem = _public_assessment_term_stem(value)
+    return _PUBLIC_ASSESSMENT_ACTION_ALIASES.get(stem, stem)
+
+
+def _public_assessment_word_tokens(value: str) -> tuple[str, ...]:
+    expanded = re.sub(
+        r"\b(i'm|we're|you're)\b",
+        lambda match: {
+            "i'm": "i am",
+            "we're": "we are",
+            "you're": "you are",
+        }[match.group(1).lower()],
+        str(value or "").lower(),
+    )
+    for contraction, replacement in (
+        ("can't", "can not"),
+        ("cannot", "can not"),
+        ("don't", "do not"),
+        ("doesn't", "does not"),
+        ("didn't", "did not"),
+        ("won't", "will not"),
+        ("wouldn't", "would not"),
+        ("shouldn't", "should not"),
+        ("i've", "i have"),
+        ("we've", "we have"),
+        ("i'd", "i would"),
+        ("we'd", "we would"),
+    ):
+        expanded = expanded.replace(contraction, replacement)
+    return tuple(re.findall(r"[a-z]+(?:'[a-z]+)?", expanded))
+
+
+def _public_assessment_static_subject_status(value: str) -> bool:
+    """Return whether a direct actor clause is a static identity/status."""
+
+    tokens = _public_assessment_word_tokens(value)
+    for index, token in enumerate(tokens):
+        if token not in {"i", "we", "you"} or index + 1 >= len(tokens):
+            continue
+        if tokens[index + 1] not in {"am", "are", "was", "were"}:
+            continue
+        cursor = index + 2
+        while cursor < len(tokens) and (
+            tokens[cursor]
+            in {"currently", "never", "not", "only", "really", "still"}
+            or tokens[cursor].endswith("ly")
+        ):
+            cursor += 1
+        if cursor >= len(tokens):
+            return True
+        return not tokens[cursor].endswith("ing")
+    return False
+
+
+def public_assessment_claim_restricted(value: str) -> bool:
+    """Fail closed for identity/status and sensitive direct profile claims."""
+
+    text = re.sub(r"\s+", " ", str(value or "")).strip()
+    return bool(
+        not text
+        or _public_assessment_static_subject_status(text)
+        or _PUBLIC_ASSESSMENT_ROLE_REPORT_RE.search(text)
+        or _PUBLIC_ASSESSMENT_SENSITIVE_DISCLOSURE_RE.search(text)
+        or _PUBLIC_ASSESSMENT_CONTEXTUAL_PRIVATE_RE.search(text)
+        or _PUBLIC_ASSESSMENT_EXACT_NUMBER_RE.search(text)
+    )
+
+
+def _public_assessment_actor_action_details(
+    value: str,
+    *,
+    actor_tokens: frozenset[str],
+) -> tuple[str, int, int, tuple[str, ...]]:
+    tokens = _public_assessment_word_tokens(value)
+    for index, token in enumerate(tokens):
+        if token not in actor_tokens:
+            continue
+        tail = tokens[index + 1 : index + 9]
+        for tail_index, candidate in enumerate(tail):
+            if candidate in {"stop", "stopped", "stops", "stopping", "quit", "quits", "quitting"}:
+                for action_offset, action_token in enumerate(
+                    tail[tail_index + 1 :],
+                    start=tail_index + 1,
+                ):
+                    if action_token in _PUBLIC_ASSESSMENT_ACTION_SKIP:
+                        continue
+                    if not action_token.endswith("ing"):
+                        break
+                    action = _public_assessment_action_identity(action_token)
+                    if action and action not in {"i", "we", "you", "your"}:
+                        return (
+                            action,
+                            index,
+                            index + 1 + action_offset,
+                            tokens,
+                        )
+                    break
+        for candidate in tokens[index + 1 : index + 9]:
+            if (
+                candidate in _PUBLIC_ASSESSMENT_ACTION_SKIP
+                or candidate in {"to", "the", "a", "an"}
+                or candidate.endswith("ly")
+            ):
+                continue
+            action = _public_assessment_action_identity(candidate)
+            if action and action not in {"i", "we", "you", "your"}:
+                return action, index, tokens.index(candidate, index + 1), tokens
+            break
+    return "", -1, -1, tokens
+
+
+def _public_assessment_actor_action(
+    value: str,
+    *,
+    actor_tokens: frozenset[str],
+) -> str:
+    return _public_assessment_actor_action_details(
+        value,
+        actor_tokens=actor_tokens,
+    )[0]
+
+
+def _public_assessment_first_action(value: str) -> str:
+    for token in _public_assessment_word_tokens(value):
+        if token in {"let", "let's", "lets", "s", "to", "the", "a", "an"}:
+            continue
+        if token in _PUBLIC_ASSESSMENT_ACTION_SKIP or token.endswith("ly"):
+            continue
+        action = _public_assessment_action_identity(token)
+        if action:
+            return action
+    return ""
+
+
+def _public_assessment_temporal_facets(
+    value: str,
+    *,
+    attribution_mode: str,
+    action_index: int,
+    tokens: tuple[str, ...],
+) -> tuple[str, ...]:
+    if attribution_mode != "subject_action" or action_index < 0:
+        return ("mode:intent",) if attribution_mode == "authored_topic" else ()
+    prefix = tuple(tokens[max(0, action_index - 6) : action_index])
+    action_token = str(tokens[action_index] if action_index < len(tokens) else "")
+    if "will" in prefix:
+        temporal = "future"
+    elif "had" in prefix:
+        temporal = "past_perfect"
+    elif "have" in prefix or "has" in prefix:
+        temporal = "perfect"
+    elif (
+        "did" in prefix
+        or "was" in prefix
+        or "were" in prefix
+        or action_token.endswith("ed")
+        or action_token
+        in {
+            "bought",
+            "built",
+            "chose",
+            "did",
+            "felt",
+            "found",
+            "gave",
+            "grew",
+            "made",
+            "ran",
+            "said",
+            "saw",
+            "taught",
+            "told",
+            "took",
+            "wrote",
+        }
+    ):
+        temporal = "past"
+    else:
+        temporal = "present"
+    frequency = ""
+    text = str(value or "")
+    if _PUBLIC_ASSESSMENT_SINGLE_OCCURRENCE_RE.search(text):
+        frequency = "single"
+    elif _PUBLIC_ASSESSMENT_INTERMITTENT_RE.search(text):
+        frequency = "intermittent"
+    elif _PUBLIC_ASSESSMENT_HABITUAL_RE.search(text):
+        frequency = "habitual"
+    return tuple(
+        ["temporal:%s" % temporal]
+        + (["frequency:%s" % frequency] if frequency else [])
+    )
+
+
+def _public_assessment_material_facets(
+    value: str,
+    *,
+    attribution_mode: str,
+    action_identity: str,
+    action_index: int = -1,
+    tokens: tuple[str, ...] = (),
+) -> tuple[str, ...]:
+    canonical_topics: list[str] = []
+    unknown_topics: list[str] = []
+    details: list[str] = []
+    for token in sorted(_public_assessment_terms(value)):
+        stem = _public_assessment_term_stem(token)
+        candidate_action = _public_assessment_action_identity(stem)
+        if (
+            not stem
+            or stem in _PUBLIC_ASSESSMENT_MATERIAL_STOPWORDS
+            or candidate_action == action_identity
+            or stem in _PUBLIC_ASSESSMENT_ACTION_SKIP
+            or stem in {"let", "let'", "lets", "let's"}
+        ):
+            continue
+        canonical = _PUBLIC_ASSESSMENT_TOPIC_ALIASES.get(stem)
+        if canonical:
+            if canonical not in canonical_topics:
+                canonical_topics.append(canonical)
+            continue
+        detail = (
+            candidate_action
+            if stem in _PUBLIC_ASSESSMENT_ACTION_ALIASES
+            else stem
+        )
+        if detail and detail not in details:
+            details.append(detail)
+        if (
+            attribution_mode in {"subject_action", "authored_topic"}
+            and stem not in _PUBLIC_ASSESSMENT_ACTION_ALIASES
+            and stem not in unknown_topics
+        ):
+            unknown_topics.append(stem)
+    topics = tuple(sorted(canonical_topics)[:4])
+    # Canonical topics define the material point when available.  Otherwise an
+    # incidental modifier (for example "noisy" in "noisy sound") could mint a
+    # second point for the same audio behavior and falsely satisfy breadth.
+    # Unknown facets remain available for genuinely family-neutral evidence.
+    if attribution_mode in {"subject_action", "authored_topic"} and not canonical_topics:
+        topics += tuple(sorted(unknown_topics)[:3])
+    relations: list[str] = []
+    for relation, pattern in (
+        ("after", r"\bafter\b"),
+        ("before", r"\bbefore\b"),
+        ("without", r"\bwithout\b"),
+        ("with", r"\bwith\b"),
+        ("quality_negative", r"\b(?:awful|bad|hate|horrible|terrible)\b"),
+        ("quality_positive", r"\b(?:excellent|good|great|love|wonderful)\b"),
+    ):
+        if re.search(pattern, str(value or ""), re.I):
+            relations.append("relation:%s" % relation)
+    entities = tuple(
+        "entity:%s" % token.lower()
+        for token in re.findall(r"\b[A-Z][A-Za-z0-9'’_-]{2,}\b", str(value or ""))
+        if token.lower()
+        not in {
+            "barcode",
+            "bnl",
+            "discord",
+            "from",
+            "let's",
+            "lets",
+            "the",
+            "you",
+            "your",
+        }
+    )
+    temporal = _public_assessment_temporal_facets(
+        value,
+        attribution_mode=attribution_mode,
+        action_index=action_index,
+        tokens=tokens,
+    )
+    return tuple(
+        ["action:%s" % action_identity]
+        + ["topic:%s" % topic for topic in topics]
+        + ["detail:%s" % detail for detail in sorted(set(details))]
+        + sorted(set(relations))
+        + sorted(set(entities))
+        + list(temporal)
+    )
+
+
+def public_assessment_candidate_core_text(value: str) -> str:
+    """Return the direct second-person core after one approved evidence frame."""
+
+    text = re.sub(r"\s+", " ", str(value or "")).strip()
+    if not text:
+        return ""
+    core = _PUBLIC_ASSESSMENT_CANDIDATE_EPISTEMIC_FRAME_RE.sub(
+        "",
+        text,
+        count=1,
+    ).strip()
+    return core if re.match(r"^you\b", core, re.I) else ""
+
+
+def public_assessment_semantics(
+    value: str,
+    *,
+    candidate_claim: bool = False,
+) -> PublicAssessmentSemantics:
+    """Derive conservative actor/action semantics without model inference."""
+
+    text = re.sub(r"\s+", " ", str(value or "")).strip()
+    if not text:
+        return PublicAssessmentSemantics()
+    if candidate_claim:
+        text = public_assessment_candidate_core_text(text)
+        if not text:
+            return PublicAssessmentSemantics()
+    elif re.search(r"\b(?:i|we)\b", text, re.I) and not re.match(
+        r"^\s*(?:i|we)\b",
+        text,
+        re.I,
+    ):
+        # A quoted or externally attributed first-person clause is not a
+        # direct self-authored action assertion.
+        return PublicAssessmentSemantics()
+    if public_assessment_claim_restricted(text):
+        return PublicAssessmentSemantics()
+    # A first-person grammatical patient is not evidence that the author
+    # performed the passive verb.  The deterministic contract has no patient
+    # role, so reject instead of reversing actor and action.
+    if _PUBLIC_ASSESSMENT_PASSIVE_ACTOR_RE.search(text):
+        return PublicAssessmentSemantics()
+    if candidate_claim:
+        attribution_mode = (
+            "subject_action"
+            if re.search(r"\b(?:you|your)\b", text, re.I)
+            else "third_party_or_ambiguous"
+        )
+        action, actor_index, action_index, tokens = (
+            _public_assessment_actor_action_details(
+            text,
+            actor_tokens=frozenset({"you"}),
+            )
+        )
+    else:
+        if _PUBLIC_ASSESSMENT_REPORTED_THIRD_PARTY_RE.search(text):
+            return PublicAssessmentSemantics()
+        first_person = bool(re.search(r"\b(?:i|we|my|our)\b", text, re.I))
+        action, actor_index, action_index, tokens = (
+            _public_assessment_actor_action_details(
+            text,
+            actor_tokens=frozenset({"i", "we"}),
+            )
+        )
+        if first_person and action:
+            attribution_mode = "subject_action"
+        elif re.match(r"^\s*let(?:'s|s)\b", text, re.I):
+            attribution_mode = "authored_topic"
+            action = "suggest"
+            actor_index = -1
+            action_index = -1
+            tokens = _public_assessment_word_tokens(text)
+        elif (
+            _PUBLIC_ASSESSMENT_THIRD_PARTY_LEAD_RE.search(text)
+            or _PUBLIC_ASSESSMENT_SINGLE_PARTY_LEAD_RE.search(text)
+        ):
+            return PublicAssessmentSemantics()
+        elif text.endswith("?"):
+            attribution_mode = "authored_topic"
+            action = "ask"
+        elif re.search(r"\b(?:could|should|might|may|would)\b", text, re.I):
+            attribution_mode = "authored_topic"
+            action = "suggest"
+        else:
+            attribution_mode = "authored_topic"
+            action = "discuss"
+    if not action or attribution_mode == "third_party_or_ambiguous":
+        return PublicAssessmentSemantics()
+    actor_clause = (
+        " ".join(tokens[actor_index + 1 : action_index + 1])
+        if attribution_mode == "subject_action"
+        and actor_index >= 0
+        and action_index > actor_index
+        else ""
+    )
+    polarity = "affirmative"
+    if attribution_mode == "subject_action":
+        post_action = tuple(tokens[action_index + 1 :])
+        first_post_action = post_action[0] if post_action else ""
+        if (
+            _PUBLIC_ASSESSMENT_NEGATIVE_RE.search(actor_clause)
+            or _PUBLIC_ASSESSMENT_CESSATION_RE.search(text)
+        ):
+            polarity = (
+                "conditional"
+                if (
+                    first_post_action in {"all", "always", "every", "only"}
+                    or re.search(
+                        r"\bnot\s+(?:all|always|every|only)\b",
+                        actor_clause,
+                        re.I,
+                    )
+                )
+                else "negative"
+            )
+        else:
+            if first_post_action in {"never", "no", "not", "without"}:
+                polarity = "negative"
+            elif (
+                _PUBLIC_ASSESSMENT_CONDITIONAL_RE.search(actor_clause)
+                or _PUBLIC_ASSESSMENT_POST_ACTION_CONDITION_RE.search(text)
+            ):
+                polarity = "conditional"
+    facets = _public_assessment_material_facets(
+        text,
+        attribution_mode=attribution_mode,
+        action_identity=action,
+        action_index=action_index,
+        tokens=tokens,
+    )
+    point_facets = tuple(
+        facet
+        for facet in facets
+        if facet.startswith(("action:", "topic:"))
+    )
+    point_identity = _knowledge_digest(
+        _PUBLIC_ASSESSMENT_SEMANTICS_VERSION,
+        attribution_mode,
+        action,
+        point_facets,
+    )
+    return PublicAssessmentSemantics(
+        attribution_mode=attribution_mode,
+        polarity=polarity,
+        action_identity=action,
+        material_facets=facets,
+        point_identity=point_identity,
+    )
+
+
+def public_assessment_claim_compatible(
+    *,
+    attribution_mode: str,
+    polarity: str,
+    action_identity: str,
+    claim: str,
+) -> bool:
+    """Require actor, action, and polarity compatibility for direct claims."""
+
+    if attribution_mode not in {"subject_action", "authored_topic"}:
+        return False
+    if attribution_mode == "authored_topic" and str(action_identity or "") not in {
+        "ask",
+        "discuss",
+        "suggest",
+    }:
+        return False
+    semantics = public_assessment_semantics(claim, candidate_claim=True)
+    if semantics.attribution_mode != "subject_action":
+        return False
+    if semantics.action_identity != str(action_identity or ""):
+        return False
+    return semantics.polarity == str(polarity or "")
 
 
 def _public_assessment_text(value: str) -> str:
@@ -5394,12 +6250,1910 @@ def _public_assessment_text(value: str) -> str:
         or _CONVERSATION_MOTIF_SENSITIVE_RE.search(text)
         or _CONVERSATION_MOTIF_ROLEPLAY_RE.search(text)
         or _CONVERSATION_CORRECTION_RE.search(text)
+        or public_assessment_claim_restricted(text)
     ):
         return ""
     return text.replace("```", "")[:240]
 
 
-def select_public_conversation_assessment_evidence(
+def public_assessment_safe_text(value: str) -> str:
+    """Expose the selector's exact inert-text normalization for revalidation.
+
+    Packet assembly uses this read-only helper to bind a selector result back
+    to the current authoritative Ledger row without maintaining a second text
+    policy.
+    """
+
+    return _public_assessment_text(value)
+
+
+def _main_table_columns(
+    conn: sqlite3.Connection,
+    table_name: str,
+) -> set[str]:
+    """Return columns from the authoritative main schema only."""
+
+    safe_name = str(table_name or "")
+    if safe_name not in {
+        "conversations",
+        "memory_ledger_entries",
+        "memory_ledger_lineage",
+        "memory_ledger_participants",
+        "memory_ledger_conversation_motif_fences",
+        "memory_moment_windows",
+        "memory_moment_members",
+        "memory_moment_participants",
+        "bnl_journal_source_events",
+    }:
+        return set()
+    if not conn.execute(
+        "SELECT 1 FROM main.sqlite_master WHERE type='table' AND name=?",
+        (safe_name,),
+    ).fetchone():
+        return set()
+    return {
+        str(row[1] or "")
+        for row in conn.execute(
+            "PRAGMA main.table_info(%s)" % safe_name
+        ).fetchall()
+        if len(row) > 1 and str(row[1] or "")
+    }
+
+
+_PUBLIC_ASSESSMENT_LEDGER_COLUMNS = (
+    "entry_id",
+    "schema_version",
+    "guild_id",
+    "subject_key",
+    "subject_display_name",
+    "entry_type",
+    "predicate_key",
+    "normalized_value",
+    "source_class",
+    "source_table",
+    "source_row_id",
+    "source_revision",
+    "source_role",
+    "route_mode",
+    "channel_id",
+    "channel_name",
+    "channel_policy",
+    "source_message_id",
+    "visibility",
+    "confidence",
+    "public_usable",
+    "derived",
+    "projection",
+    "observed_at",
+    "source_sequence",
+    "lifecycle_status",
+    "updated_at",
+)
+
+
+def _main_public_assessment_entry(
+    conn: sqlite3.Connection,
+    entry_id: str,
+) -> dict[str, Any]:
+    if not str(entry_id or ""):
+        return {}
+    required = set(_PUBLIC_ASSESSMENT_LEDGER_COLUMNS)
+    if not required.issubset(
+        _main_table_columns(conn, "memory_ledger_entries")
+    ):
+        return {}
+    row = conn.execute(
+        "SELECT %s FROM main.memory_ledger_entries WHERE entry_id=?"
+        % ",".join(_PUBLIC_ASSESSMENT_LEDGER_COLUMNS),
+        (str(entry_id),),
+    ).fetchone()
+    if not row:
+        return {}
+    return dict(zip(_PUBLIC_ASSESSMENT_LEDGER_COLUMNS, row))
+
+
+def _public_assessment_sql_identity(value: Any) -> str:
+    normalized = re.sub(r"\s+", " ", str(value or "").strip()).lower()
+    normalized = re.sub(r"\s*([(),=])\s*", r"\1", normalized)
+    return normalized.rstrip(";")
+
+
+def _main_public_assessment_journal_trigger_snapshot(
+    conn: sqlite3.Connection,
+) -> tuple[tuple[str, str], ...]:
+    """Return the exact immutable Journal trigger contract or no authority."""
+
+    expected_sql = {
+        "trg_bnl_journal_sources_no_duplicate_insert": """
+            CREATE TRIGGER trg_bnl_journal_sources_no_duplicate_insert
+            BEFORE INSERT ON bnl_journal_source_events
+            WHEN EXISTS (
+                SELECT 1 FROM bnl_journal_source_events
+                WHERE event_seq=NEW.event_seq
+                   OR (
+                        guild_id=NEW.guild_id
+                        AND source_kind=NEW.source_kind
+                        AND source_key=NEW.source_key
+                   )
+            )
+            BEGIN
+                SELECT RAISE(ABORT, 'bnl_journal_source_events_duplicate_identity');
+            END
+        """,
+        "trg_bnl_journal_sources_no_update": """
+            CREATE TRIGGER trg_bnl_journal_sources_no_update
+            BEFORE UPDATE ON bnl_journal_source_events
+            BEGIN
+                SELECT RAISE(ABORT, 'bnl_journal_source_events_immutable');
+            END
+        """,
+        "trg_bnl_journal_sources_no_delete": """
+            CREATE TRIGGER trg_bnl_journal_sources_no_delete
+            BEFORE DELETE ON bnl_journal_source_events
+            BEGIN
+                SELECT RAISE(ABORT, 'bnl_journal_source_events_immutable');
+            END
+        """,
+    }
+    rows = conn.execute(
+        """
+        SELECT name,tbl_name,sql
+        FROM main.sqlite_master
+        WHERE type='trigger' AND name IN (?,?,?)
+        ORDER BY name
+        """,
+        tuple(sorted(expected_sql)),
+    ).fetchall()
+    snapshot = tuple(
+        (str(name or ""), _public_assessment_sql_identity(sql))
+        for name, table_name, sql in rows
+        if str(table_name or "") == "bnl_journal_source_events"
+    )
+    expected = tuple(
+        sorted(
+            (name, _public_assessment_sql_identity(sql))
+            for name, sql in expected_sql.items()
+        )
+    )
+    return snapshot if snapshot == expected else ()
+
+
+_PUBLIC_ASSESSMENT_JOURNAL_RECEIPT_COLUMNS = (
+    "event_seq",
+    "guild_id",
+    "source_kind",
+    "source_key",
+    "occurred_at_ms",
+    "channel_id",
+    "channel_policy",
+    "subject_ref",
+    "private_display_name",
+    "raw_text",
+    "content_hash",
+    "public_usable",
+    "metadata_json",
+)
+
+
+def _public_assessment_journal_source_identity(
+    raw: Mapping[str, Any],
+) -> tuple[int, str] | None:
+    raw_id = _public_assessment_int(raw.get("id"))
+    raw_guild = _public_assessment_int(raw.get("guild_id"))
+    raw_message = _public_assessment_int(raw.get("message_id"))
+    if raw_id is None or raw_guild is None:
+        return None
+    source_key = (
+        str(raw_message)
+        if raw_message not in {None, 0}
+        else "legacy_row:%s" % raw_id
+    )
+    return raw_guild, source_key
+
+
+def _main_public_assessment_journal_receipt_map(
+    conn: sqlite3.Connection,
+    raw_rows: Iterable[Mapping[str, Any]],
+    *,
+    journal_trigger_snapshot: tuple[tuple[str, str], ...],
+) -> dict[tuple[int, str], tuple[tuple[Any, ...], ...]]:
+    """Bulk-read exact Journal receipts for a bounded raw source set."""
+
+    if not journal_trigger_snapshot:
+        return {}
+    identities = {
+        identity
+        for raw in raw_rows
+        if (identity := _public_assessment_journal_source_identity(raw))
+        is not None
+    }
+    grouped: dict[tuple[int, str], list[tuple[Any, ...]]] = {}
+    for guild_id in sorted({identity[0] for identity in identities}):
+        source_keys = sorted(
+            identity[1] for identity in identities if identity[0] == guild_id
+        )
+        for offset in range(0, len(source_keys), 250):
+            chunk = source_keys[offset : offset + 250]
+            if not chunk:
+                continue
+            placeholders = ",".join("?" for _key in chunk)
+            row_limit = (len(chunk) * 2) + 1
+            rows = conn.execute(
+                "SELECT %s FROM main.bnl_journal_source_events "
+                "WHERE guild_id=? AND source_kind='discord_message' "
+                "AND source_key IN (%s) ORDER BY event_seq LIMIT ?"
+                % (
+                    ",".join(_PUBLIC_ASSESSMENT_JOURNAL_RECEIPT_COLUMNS),
+                    placeholders,
+                ),
+                (guild_id, *chunk, row_limit),
+            ).fetchall()
+            if len(rows) >= row_limit:
+                for source_key in chunk:
+                    grouped[(guild_id, source_key)] = [(), ()]
+                continue
+            for row in rows:
+                identity = (
+                    _public_assessment_int(row[1]),
+                    str(row[3] or ""),
+                )
+                if identity[0] is None or not identity[1]:
+                    continue
+                grouped.setdefault(identity, []).append(tuple(row))
+    return {
+        identity: tuple(rows)
+        for identity, rows in grouped.items()
+    }
+
+
+def _main_public_assessment_route_authority(
+    conn: sqlite3.Connection,
+    raw: Mapping[str, Any],
+    *,
+    journal_columns: frozenset[str] | None = None,
+    journal_trigger_snapshot: tuple[tuple[str, str], ...] | None = None,
+    journal_receipts: Mapping[
+        tuple[int, str], tuple[tuple[Any, ...], ...]
+    ] | None = None,
+) -> tuple[str, tuple[Any, ...]] | None:
+    """Resolve route from raw capture or an exact immutable Journal receipt."""
+
+    raw_route = str(raw.get("route_mode") or "").strip().lower()
+    if raw_route == "unknown":
+        raw_route = ""
+    receipt_snapshot: tuple[Any, ...] = ()
+    receipt_route = ""
+    if journal_columns is None:
+        journal_columns = frozenset(
+            _main_table_columns(conn, "bnl_journal_source_events")
+        )
+    required_journal = {
+        "event_seq",
+        "guild_id",
+        "source_kind",
+        "source_key",
+        "occurred_at_ms",
+        "channel_id",
+        "channel_policy",
+        "subject_ref",
+        "private_display_name",
+        "raw_text",
+        "content_hash",
+        "public_usable",
+        "metadata_json",
+    }
+    if required_journal.issubset(journal_columns):
+        if journal_trigger_snapshot is None:
+            journal_trigger_snapshot = (
+                _main_public_assessment_journal_trigger_snapshot(conn)
+            )
+        if journal_trigger_snapshot:
+            raw_id = _public_assessment_int(raw.get("id"))
+            raw_guild = _public_assessment_int(raw.get("guild_id"))
+            raw_user = _public_assessment_int(raw.get("user_id"))
+            raw_channel = _public_assessment_int(raw.get("channel_id"))
+            raw_message = _public_assessment_int(raw.get("message_id"))
+            source_identity = _public_assessment_journal_source_identity(raw)
+            if source_identity is None:
+                return None
+            source_key = source_identity[1]
+            rows = (
+                tuple(journal_receipts.get(source_identity, ()))
+                if journal_receipts is not None
+                else tuple(
+                    conn.execute(
+                        "SELECT %s FROM main.bnl_journal_source_events "
+                        "WHERE guild_id=? AND source_kind='discord_message' "
+                        "AND source_key=? ORDER BY event_seq LIMIT 2"
+                        % ",".join(
+                            _PUBLIC_ASSESSMENT_JOURNAL_RECEIPT_COLUMNS
+                        ),
+                        (int(raw_guild or 0), source_key),
+                    ).fetchall()
+                )
+            )
+            if len(rows) > 1:
+                return None
+            if rows:
+                row = tuple(rows[0])
+                try:
+                    metadata = json.loads(str(row[12] or "{}"))
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    return None
+                if not isinstance(metadata, dict):
+                    return None
+                observed = _parse_knowledge_time(raw.get("timestamp"))
+                expected_ms = (
+                    int(observed.timestamp() * 1000) if observed is not None else None
+                )
+                metadata_row = _public_assessment_int(
+                    metadata.get("conversationRowId")
+                )
+                metadata_message = _public_assessment_int(
+                    metadata.get("messageId")
+                )
+                if (
+                    None
+                    in {
+                        raw_id,
+                        raw_guild,
+                        raw_user,
+                        raw_channel,
+                        expected_ms,
+                    }
+                    or _public_assessment_int(row[1]) != raw_guild
+                    or str(row[2] or "") != "discord_message"
+                    or str(row[3] or "") != source_key
+                    or _public_assessment_int(row[4]) != expected_ms
+                    or _public_assessment_int(row[5]) != raw_channel
+                    or str(row[6] or "") != str(raw.get("channel_policy") or "")
+                    or str(row[7] or "") != subject_key_for_user(raw_user)
+                    or str(row[8] or "") != str(raw.get("user_name") or "")
+                    or str(row[9] or "") != str(raw.get("content") or "")
+                    or str(row[10] or "")
+                    != hashlib.sha256(
+                        str(raw.get("content") or "").encode("utf-8")
+                    ).hexdigest()
+                    or _public_assessment_bool_state(row[11]) is not True
+                    or metadata_row != raw_id
+                    or (
+                        raw_message not in {None, 0}
+                        and metadata_message != raw_message
+                    )
+                ):
+                    return None
+                metadata_route = str(metadata.get("routeMode") or "").strip().lower()
+                metadata_source = str(metadata.get("source") or "").strip().lower()
+                if metadata_source == "discord_backfill":
+                    if metadata_route not in {"", "unknown", "conversation_continuity"}:
+                        return None
+                    receipt_route = "conversation_continuity"
+                elif metadata_route and metadata_route != "unknown":
+                    receipt_route = metadata_route
+                receipt_snapshot = (journal_trigger_snapshot, row)
+    if raw_route and receipt_route and raw_route != receipt_route:
+        return None
+    resolved = raw_route or receipt_route
+    if not resolved:
+        return None
+    return resolved, receipt_snapshot
+
+
+def _main_public_assessment_root_identity(
+    conn: sqlite3.Connection,
+    entry: Mapping[str, Any],
+) -> str:
+    """Return the exact raw root; raw Open Signal never follows aliases."""
+
+    entry_id = str(entry.get("entry_id") or "")
+    guild_id = _public_assessment_int(entry.get("guild_id"))
+    source_table = str(entry.get("source_table") or "")
+    source_row_id = str(entry.get("source_row_id") or "")
+    if (
+        not entry_id
+        or not guild_id
+        or source_table != "conversations"
+        or not source_row_id
+    ):
+        return ""
+    # No production owner emits duplicate aliases for a raw conversation.  Any
+    # such edge is therefore malformed authority, including cross-guild edges,
+    # self loops, cycles, and dangling/cross-subject targets.
+    if conn.execute(
+        """
+        SELECT 1
+        FROM main.memory_ledger_lineage
+        WHERE entry_id=? AND lineage_type='duplicate_of'
+        LIMIT 1
+        """,
+        (entry_id,),
+    ).fetchone():
+        return ""
+    return _knowledge_digest(guild_id, source_table, source_row_id)
+
+
+def _main_public_assessment_moment_occurrence(
+    conn: sqlite3.Connection,
+    entry: Mapping[str, Any],
+) -> str | None:
+    """Return a validated canonical Moment occurrence, or None when absent.
+
+    An empty string means a Moment-shaped edge exists but fails authority
+    validation.  Callers must fail closed instead of falling back to a raw
+    exchange window.
+    """
+
+    entry_id = str(entry.get("entry_id") or "")
+    guild_id = _public_assessment_int(entry.get("guild_id"))
+    subject_key = str(entry.get("subject_key") or "")
+    rows = conn.execute(
+        """
+        SELECT guild_id,target_entry_id
+        FROM main.memory_ledger_lineage
+        WHERE entry_id=? AND lineage_type='part_of_moment'
+        ORDER BY guild_id,target_entry_id
+        """,
+        (entry_id,),
+    ).fetchall()
+    if not rows:
+        return None
+    if len(rows) != 1 or guild_id is None:
+        return ""
+    edge_guild = _public_assessment_int(rows[0][0])
+    target_id = str(rows[0][1] or "")
+    if edge_guild != guild_id or not target_id or target_id == entry_id:
+        return ""
+    target = _main_public_assessment_entry(conn, target_id)
+    target_guild = _public_assessment_int(target.get("guild_id")) if target else None
+    target_public = (
+        _public_assessment_bool_state(target.get("public_usable"))
+        if target
+        else None
+    )
+    target_derived = (
+        _public_assessment_bool_state(target.get("derived")) if target else None
+    )
+    target_projection = (
+        _public_assessment_bool_state(target.get("projection")) if target else None
+    )
+    moment_id = str(target.get("source_row_id") or "") if target else ""
+    expected_target_id = (
+        stable_entry_id(
+            guild_id=guild_id,
+            source_table="memory_moment_windows",
+            source_row_id=moment_id,
+            source_revision="1",
+            entry_type="shared_moment",
+            subject_key="moment:%s" % moment_id,
+            predicate_key="shared_moment",
+        )
+        if moment_id
+        else ""
+    )
+    if not target or (
+        target_guild != guild_id
+        or str(target.get("schema_version") or "") != MEMORY_LEDGER_SCHEMA_VERSION
+        or target_id != expected_target_id
+        or str(target.get("source_table") or "") != "memory_moment_windows"
+        or str(target.get("source_revision") or "") != "1"
+        or str(target.get("source_role") or "") != "derived_assessment"
+        or str(target.get("entry_type") or "") != "shared_moment"
+        or str(target.get("subject_key") or "") != "moment:%s" % moment_id
+        or str(target.get("predicate_key") or "") != "shared_moment"
+        or str(target.get("source_class") or "")
+        != SourceClass.DERIVED_SUMMARY.value
+        or str(target.get("lifecycle_status") or "") != REVIEW_ONLY_LIFECYCLE
+        or str(target.get("visibility") or "")
+        not in {Visibility.PUBLIC.value, Visibility.PUBLIC_SAFE.value}
+        or target_public is not True
+        or target_derived is not True
+        or target_projection is not True
+    ):
+        return ""
+    reverse = conn.execute(
+        """
+        SELECT guild_id
+        FROM main.memory_ledger_lineage
+        WHERE entry_id=? AND lineage_type='derived_from'
+          AND target_entry_id=?
+        ORDER BY guild_id
+        """,
+        (target_id, entry_id),
+    ).fetchall()
+    if len(reverse) != 1 or _public_assessment_int(reverse[0][0]) != guild_id:
+        return ""
+    target_lineage = conn.execute(
+        """
+        SELECT guild_id,lineage_type,target_entry_id
+        FROM main.memory_ledger_lineage
+        WHERE entry_id=?
+        ORDER BY guild_id,lineage_type,target_entry_id
+        """,
+        (target_id,),
+    ).fetchall()
+    if not target_lineage or any(
+        _public_assessment_int(edge[0]) != guild_id
+        or str(edge[1] or "") != "derived_from"
+        or not str(edge[2] or "")
+        or str(edge[2] or "") == target_id
+        for edge in target_lineage
+    ):
+        return ""
+    target_subject_participants = conn.execute(
+        """
+        SELECT guild_id FROM main.memory_ledger_participants
+        WHERE entry_id=? AND participant_key=?
+        """,
+        (target_id, subject_key),
+    ).fetchall()
+    if not target_subject_participants or any(
+        _public_assessment_int(row[0]) != guild_id
+        for row in target_subject_participants
+    ):
+        return ""
+    derived_targets = {str(edge[2] or "") for edge in target_lineage}
+    if any(
+        _public_assessment_int(
+            _main_public_assessment_entry(conn, source_id).get("guild_id")
+        )
+        != guild_id
+        for source_id in derived_targets
+    ):
+        return ""
+    required_moment_columns = {
+        "moment_id",
+        "guild_id",
+        "channel_id",
+        "channel_policy",
+        "route_mode",
+        "lifecycle_status",
+        "visibility",
+        "public_usable",
+        "canonical_ledger_entry_id",
+    }
+    if not required_moment_columns.issubset(
+        _main_table_columns(conn, "memory_moment_windows")
+    ) or not {"moment_id", "ledger_entry_id"}.issubset(
+        _main_table_columns(conn, "memory_moment_members")
+    ) or not {"moment_id", "participant_key"}.issubset(
+        _main_table_columns(conn, "memory_moment_participants")
+    ):
+        return ""
+    window = conn.execute(
+        """
+        SELECT guild_id,channel_id,channel_policy,route_mode,lifecycle_status,
+               visibility,public_usable,canonical_ledger_entry_id
+        FROM main.memory_moment_windows
+        WHERE moment_id=?
+        """,
+        (moment_id,),
+    ).fetchone()
+    if not window or (
+        _public_assessment_int(window[0]) != guild_id
+        or _public_assessment_int(window[1])
+        != _public_assessment_int(entry.get("channel_id"))
+        or str(window[2] or "") != str(entry.get("channel_policy") or "")
+        or str(window[3] or "") != str(entry.get("route_mode") or "")
+        or str(window[4] or "") != "finalized"
+        or str(window[5] or "") != str(target.get("visibility") or "")
+        or _public_assessment_bool_state(window[6]) is not True
+        or str(window[7] or "") != target_id
+    ):
+        return ""
+    all_member_rows = conn.execute(
+        """
+        SELECT ledger_entry_id FROM main.memory_moment_members
+        WHERE moment_id=?
+        ORDER BY ledger_entry_id
+        """,
+        (moment_id,),
+    ).fetchall()
+    subject_rows = conn.execute(
+        """
+        SELECT 1 FROM main.memory_moment_participants
+        WHERE moment_id=? AND participant_key=?
+        """,
+        (moment_id, subject_key),
+    ).fetchall()
+    if (
+        {str(row[0] or "") for row in all_member_rows} != derived_targets
+        or entry_id not in derived_targets
+        or len(subject_rows) < 1
+    ):
+        return ""
+    return _knowledge_digest(
+        "conversation_moment_occurrence",
+        guild_id,
+        target_id,
+    )
+
+
+def _main_public_assessment_occurrence_candidates(
+    conn: sqlite3.Connection,
+    *,
+    guild_id: int,
+    subject_key: str,
+    channel_id: int,
+    channel_policy: str,
+    max_observed_at: str,
+) -> list[tuple[str, str, int]]:
+    """Read only raw-bound eligible rows that may define an exchange window."""
+
+    raw_columns = _main_table_columns(conn, "conversations")
+    if not {
+        "id",
+        "guild_id",
+        "user_id",
+        "user_name",
+        "role",
+        "content",
+        "channel_id",
+        "channel_policy",
+        "timestamp",
+    }.issubset(raw_columns):
+        return []
+    ledger_select = ",".join(
+        "e.%s" % column for column in _PUBLIC_ASSESSMENT_LEDGER_COLUMNS
+    )
+    raw_select = (
+        "c.id,c.guild_id,c.user_id,c.user_name,c.role,c.content,"
+        "c.channel_id,c.channel_policy,c.timestamp,"
+        + ("c.channel_name" if "channel_name" in raw_columns else "''")
+        + ","
+        + ("c.message_id" if "message_id" in raw_columns else "NULL")
+        + ","
+        + ("c.route_mode" if "route_mode" in raw_columns else "NULL")
+        + ","
+        + ("c.public_usable" if "public_usable" in raw_columns else "NULL")
+        + ","
+        + ("c.visibility" if "visibility" in raw_columns else "NULL")
+    )
+    rows = conn.execute(
+        """
+        SELECT %s,%s
+        FROM main.memory_ledger_entries e
+        JOIN main.conversations c
+          ON c.guild_id=e.guild_id
+         AND CAST(c.id AS TEXT)=e.source_row_id
+        WHERE e.guild_id=? AND e.subject_key=?
+          AND e.entry_type='observation' AND e.predicate_key='conversation'
+          AND e.source_table='conversations' AND e.source_role='user'
+          AND e.source_class='public_observation'
+          AND e.route_mode IN ('normal_chat','conversation_continuity')
+          AND e.channel_id=? AND e.channel_policy=?
+          AND e.visibility IN ('public','public_safe')
+          AND e.confidence='medium'
+          AND e.public_usable=1 AND e.derived=0 AND e.projection=0
+          AND e.lifecycle_status='active'
+          AND julianday(e.observed_at) <= julianday(?)
+          AND NOT EXISTS (
+            SELECT 1 FROM main.memory_ledger_lineage incoming
+            WHERE incoming.target_entry_id=e.entry_id
+              AND incoming.lineage_type IN (
+                'correction_of','supersedes','retracts'
+              )
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM main.memory_ledger_lineage duplicate_edge
+            WHERE duplicate_edge.entry_id=e.entry_id
+              AND duplicate_edge.lineage_type='duplicate_of'
+          )
+          AND (
+            SELECT COUNT(*) FROM main.memory_ledger_participants participant
+            WHERE participant.entry_id=e.entry_id
+          )=1
+          AND EXISTS (
+            SELECT 1 FROM main.memory_ledger_participants participant
+            WHERE participant.entry_id=e.entry_id
+              AND participant.guild_id=e.guild_id
+              AND participant.participant_key=e.subject_key
+              AND LOWER(participant.participant_role)='author'
+              AND participant.order_index=0
+          )
+        ORDER BY julianday(e.observed_at) DESC,e.observed_at DESC,e.entry_id DESC
+        LIMIT ?
+        """
+        % (ledger_select, raw_select),
+        (
+            int(guild_id or 0),
+            str(subject_key or ""),
+            int(channel_id or 0),
+            str(channel_policy or ""),
+            str(max_observed_at or ""),
+            _CONVERSATION_OCCURRENCE_MAX_SCAN + 1,
+        ),
+    ).fetchall()
+    ledger_count = len(_PUBLIC_ASSESSMENT_LEDGER_COLUMNS)
+    raw_keys = (
+        "id",
+        "guild_id",
+        "user_id",
+        "user_name",
+        "role",
+        "content",
+        "channel_id",
+        "channel_policy",
+        "timestamp",
+        "channel_name",
+        "message_id",
+        "route_mode",
+        "public_usable",
+        "visibility",
+    )
+    journal_columns = frozenset(
+        _main_table_columns(conn, "bnl_journal_source_events")
+    )
+    required_journal = {
+        "event_seq",
+        "guild_id",
+        "source_kind",
+        "source_key",
+        "occurred_at_ms",
+        "channel_id",
+        "channel_policy",
+        "subject_ref",
+        "private_display_name",
+        "raw_text",
+        "content_hash",
+        "public_usable",
+        "metadata_json",
+    }
+    journal_trigger_snapshot = (
+        _main_public_assessment_journal_trigger_snapshot(conn)
+        if required_journal.issubset(journal_columns)
+        else ()
+    )
+    raw_mappings = tuple(
+        dict(zip(raw_keys, row[ledger_count:])) for row in rows
+    )
+    journal_receipts = _main_public_assessment_journal_receipt_map(
+        conn,
+        raw_mappings,
+        journal_trigger_snapshot=journal_trigger_snapshot,
+    )
+    eligible: list[tuple[str, str, int]] = []
+    for row, raw in zip(rows, raw_mappings):
+        candidate = dict(
+            zip(_PUBLIC_ASSESSMENT_LEDGER_COLUMNS, row[:ledger_count])
+        )
+        candidate_guild = _public_assessment_int(candidate.get("guild_id"))
+        candidate_channel = _public_assessment_int(candidate.get("channel_id"))
+        raw_id = _public_assessment_int(raw.get("id"))
+        raw_guild = _public_assessment_int(raw.get("guild_id"))
+        raw_user = _public_assessment_int(raw.get("user_id"))
+        raw_channel = _public_assessment_int(raw.get("channel_id"))
+        sequence = _public_assessment_int(candidate.get("source_sequence"))
+        message_id = _public_assessment_int(raw.get("message_id"))
+        expected_entry_id = stable_entry_id(
+            guild_id=candidate_guild,
+            source_table="conversations",
+            source_row_id=str(candidate.get("source_row_id") or ""),
+            source_revision=str(candidate.get("source_revision") or ""),
+            entry_type="observation",
+            subject_key=str(candidate.get("subject_key") or ""),
+            predicate_key="conversation",
+        )
+        mapped_visibility = _visibility(
+            str(candidate.get("channel_policy") or "")
+        ).value
+        if None in {
+            candidate_guild,
+            candidate_channel,
+            raw_id,
+            raw_guild,
+            raw_user,
+            raw_channel,
+            sequence,
+        } or (
+            str(candidate.get("schema_version") or "")
+            != MEMORY_LEDGER_SCHEMA_VERSION
+            or str(candidate.get("entry_id") or "") != expected_entry_id
+            or str(candidate.get("source_row_id") or "") != str(raw_id)
+            or str(candidate.get("source_revision") or "") != str(raw_id)
+            or sequence not in {raw_id, message_id if message_id else raw_id}
+            or candidate_guild != raw_guild
+            or candidate_channel != raw_channel
+            or subject_key_for_user(raw_user) != str(candidate.get("subject_key") or "")
+            or str(raw.get("user_name") or "")
+            != str(candidate.get("subject_display_name") or "")
+            or str(raw.get("role") or "").lower() != "user"
+            or str(raw.get("content") or "")[:500]
+            != str(candidate.get("normalized_value") or "")
+            or str(raw.get("channel_policy") or "")
+            != str(candidate.get("channel_policy") or "")
+            or str(raw.get("timestamp") or "")
+            != str(candidate.get("observed_at") or "")
+            or str(candidate.get("visibility") or "") != mapped_visibility
+            or (
+                "channel_name" in raw_columns
+                and str(raw.get("channel_name") or "")
+                != str(candidate.get("channel_name") or "")
+            )
+            or (
+                "message_id" in raw_columns
+                and str(message_id or "")
+                != str(_public_assessment_int(candidate.get("source_message_id")) or "")
+            )
+            or (
+                "public_usable" in raw_columns
+                and _public_assessment_bool_state(raw.get("public_usable"))
+                is not True
+            )
+            or (
+                "visibility" in raw_columns
+                and str(raw.get("visibility") or "") != mapped_visibility
+            )
+            or not _public_assessment_text(
+                str(candidate.get("normalized_value") or "")
+            )
+            or not public_assessment_semantics(
+                str(candidate.get("normalized_value") or "")
+            ).point_identity
+            or _knowledge_operational_or_test_source(dict(candidate))
+        ):
+            continue
+        route_authority = _main_public_assessment_route_authority(
+            conn,
+            raw,
+            journal_columns=journal_columns,
+            journal_trigger_snapshot=journal_trigger_snapshot,
+            journal_receipts=journal_receipts,
+        )
+        if (
+            route_authority is None
+            or route_authority[0] != str(candidate.get("route_mode") or "")
+            or route_authority[0] not in _PUBLIC_ASSESSMENT_ALLOWED_ROUTES
+        ):
+            continue
+        participant = conn.execute(
+            """
+            SELECT display_name FROM main.memory_ledger_participants
+            WHERE entry_id=? AND guild_id=? AND participant_key=?
+              AND LOWER(participant_role)='author' AND order_index=0
+            """,
+            (
+                str(candidate.get("entry_id") or ""),
+                candidate_guild,
+                str(candidate.get("subject_key") or ""),
+            ),
+        ).fetchone()
+        if not participant or str(participant[0] or "") != str(raw.get("user_name") or ""):
+            continue
+        eligible.append(
+            (
+                str(candidate.get("entry_id") or ""),
+                str(candidate.get("observed_at") or ""),
+                int(sequence or 0),
+            )
+        )
+    return eligible
+
+
+def _main_public_assessment_occurrence_identity(
+    conn: sqlite3.Connection,
+    entry: Mapping[str, Any],
+) -> str:
+    """Recompute the bounded exchange identity from the current main state."""
+
+    root_identity = _main_public_assessment_root_identity(conn, entry)
+    if not root_identity:
+        return ""
+    if (
+        str(entry.get("source_table") or "") != "conversations"
+        or str(entry.get("source_role") or "").lower() != "user"
+    ):
+        return root_identity
+    moment_occurrence = _main_public_assessment_moment_occurrence(conn, entry)
+    if moment_occurrence is not None:
+        return moment_occurrence
+    observed = _parse_knowledge_time(entry.get("observed_at"))
+    current_sequence = _public_assessment_int(entry.get("source_sequence"))
+    if observed is None or current_sequence is None or current_sequence <= 0:
+        return ""
+    scope = (
+        _public_assessment_int(entry.get("guild_id")) or 0,
+        _public_assessment_int(entry.get("channel_id")) or 0,
+        str(entry.get("channel_policy") or "unknown"),
+        str(entry.get("subject_key") or ""),
+    )
+    rows = _main_public_assessment_occurrence_candidates(
+        conn,
+        guild_id=scope[0],
+        subject_key=scope[3],
+        channel_id=scope[1],
+        channel_policy=scope[2],
+        max_observed_at=str(entry.get("observed_at") or ""),
+    )
+    current_id = str(entry.get("entry_id") or "")
+    current_index = next(
+        (
+            index
+            for index, row in enumerate(rows)
+            if str(row[0] or "") == current_id
+        ),
+        -1,
+    )
+    if current_index < 0:
+        return ""
+    bounded_rows = rows[
+        current_index : current_index + _CONVERSATION_OCCURRENCE_MAX_SCAN
+    ]
+    has_unscanned_prior = (
+        len(rows) > current_index + _CONVERSATION_OCCURRENCE_MAX_SCAN
+    )
+    anchor_id = current_id
+    prior_time = observed
+    found_idle_boundary = False
+    for row_entry_id, row_observed_at, _row_sequence in bounded_rows[1:]:
+        row_time = _parse_knowledge_time(row_observed_at)
+        if row_time is None or row_time > prior_time:
+            return ""
+        if (
+            prior_time - row_time
+        ).total_seconds() > _CONVERSATION_MOTIF_WINDOW_SECONDS:
+            found_idle_boundary = True
+            break
+        anchor_id = str(row_entry_id or anchor_id)
+        prior_time = row_time
+    if has_unscanned_prior and not found_idle_boundary:
+        return ""
+    return _knowledge_digest("conversation_occurrence", *scope, anchor_id)
+
+
+def _main_public_assessment_fences(
+    conn: sqlite3.Connection,
+    *,
+    guild_id: int,
+    subject_key: str,
+) -> tuple[tuple[str, ...], ...] | None:
+    columns = _main_table_columns(
+        conn,
+        "memory_ledger_conversation_motif_fences",
+    )
+    required = {
+        "guild_id",
+        "subject_key",
+        "predicate_key",
+        "correction_entry_id",
+        "correction_observed_at",
+        "reason_code",
+        "fence_state",
+        "satisfied_at",
+        "updated_at",
+    }
+    if not required.issubset(columns):
+        return None
+    return tuple(
+        tuple(str(value or "") for value in row)
+        for row in conn.execute(
+            """
+            SELECT predicate_key,correction_entry_id,
+                   correction_observed_at,reason_code,fence_state,
+                   satisfied_at,updated_at
+            FROM main.memory_ledger_conversation_motif_fences
+            WHERE guild_id=? AND subject_key=?
+              AND reason_code IN (
+                'conversation_motif_correction_ambiguous',
+                'conversation_motif_correction_unresolved'
+              )
+            ORDER BY predicate_key,correction_entry_id
+            """,
+            (int(guild_id or 0), str(subject_key or "")),
+        ).fetchall()
+    )
+
+
+def _public_assessment_state_digest(*parts: Any) -> str:
+    payload = json.dumps(
+        parts,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+        default=str,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _public_assessment_bool_state(value: Any) -> bool | None:
+    if value is True or value is False:
+        return bool(value)
+    if isinstance(value, int) and not isinstance(value, bool):
+        if value in {0, 1}:
+            return bool(value)
+        return None
+    if isinstance(value, str):
+        normalized = value.strip().casefold()
+        if normalized in {"1", "true", "yes", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "off"}:
+            return False
+    return None
+
+
+def _public_assessment_int(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str) and re.fullmatch(r"[+-]?\d+", value.strip()):
+        try:
+            return int(value.strip())
+        except (ValueError, OverflowError):
+            return None
+    return None
+
+
+def _main_public_assessment_later_guard_state(
+    conn: sqlite3.Connection,
+    *,
+    entry: Mapping[str, Any],
+    semantics: PublicAssessmentSemantics,
+) -> tuple[tuple[tuple[Any, ...], ...], bool, bool] | None:
+    """Bind later corrections and contradictions to retained raw authorship."""
+
+    guild_id = _public_assessment_int(entry.get("guild_id"))
+    subject_key = str(entry.get("subject_key") or "")
+    entry_id = str(entry.get("entry_id") or "")
+    source_row_id = str(entry.get("source_row_id") or "")
+    observed_at = str(entry.get("observed_at") or "")
+    observed = _parse_knowledge_time(observed_at)
+    if (
+        guild_id is None
+        or not subject_key.startswith("discord_user:")
+        or not entry_id
+        or not source_row_id
+        or observed is None
+        or not semantics.point_identity
+        or not semantics.polarity
+    ):
+        return None
+    try:
+        user_id = int(subject_key.split(":", 1)[1])
+    except (TypeError, ValueError, IndexError):
+        return None
+    raw_columns = _main_table_columns(conn, "conversations")
+    required_raw = {
+        "id",
+        "guild_id",
+        "user_id",
+        "user_name",
+        "role",
+        "content",
+        "channel_id",
+        "channel_policy",
+        "timestamp",
+    }
+    if not required_raw.issubset(raw_columns):
+        return None
+    optional_raw = tuple(
+        column
+        for column in (
+            "channel_name",
+            "message_id",
+            "route_mode",
+            "public_usable",
+            "visibility",
+        )
+        if column in raw_columns
+    )
+    raw_selected = (
+        "id",
+        "guild_id",
+        "user_id",
+        "user_name",
+        "role",
+        "content",
+        "channel_id",
+        "channel_policy",
+        "timestamp",
+        *optional_raw,
+    )
+    def text_flags(value: Any) -> tuple[bool, bool]:
+        text = str(value or "")
+        correction_like = bool(_CONVERSATION_CORRECTION_RE.search(text))
+        candidate = public_assessment_semantics(text)
+        opposite_point = bool(
+            _public_assessment_text(text)
+            and candidate.point_identity == semantics.point_identity
+            and candidate.polarity
+            and candidate.polarity != semantics.polarity
+        )
+        return correction_like, opposite_point
+
+    malformed_raw = conn.execute(
+        "SELECT content FROM main.conversations "
+        "WHERE guild_id=? AND user_id=? AND role='user' "
+        "AND julianday(timestamp) IS NULL ORDER BY id LIMIT ?",
+        (guild_id, user_id, _CONVERSATION_MOTIF_MAX_SCAN + 1),
+    ).fetchall()
+    malformed_ledger = conn.execute(
+        "SELECT normalized_value FROM main.memory_ledger_entries "
+        "WHERE guild_id=? AND subject_key=? "
+        "AND source_table='conversations' AND source_role='user' "
+        "AND julianday(observed_at) IS NULL ORDER BY entry_id LIMIT ?",
+        (guild_id, subject_key, _CONVERSATION_MOTIF_MAX_SCAN + 1),
+    ).fetchall()
+    if (
+        len(malformed_raw) > _CONVERSATION_MOTIF_MAX_SCAN
+        or len(malformed_ledger) > _CONVERSATION_MOTIF_MAX_SCAN
+        or any(any(text_flags(row[0])) for row in (*malformed_raw, *malformed_ledger))
+    ):
+        return None
+    raw_rows = conn.execute(
+        "SELECT %s FROM main.conversations "
+        "WHERE guild_id=? AND user_id=? AND role='user' "
+        "AND CAST(id AS TEXT)<>? "
+        "AND julianday(timestamp)>=julianday(?) "
+        "ORDER BY julianday(timestamp),timestamp,id LIMIT ?"
+        % ",".join(raw_selected),
+        (
+            guild_id,
+            user_id,
+            source_row_id,
+            observed_at,
+            _CONVERSATION_MOTIF_MAX_SCAN + 1,
+        ),
+    ).fetchall()
+    ledger_rows = conn.execute(
+        "SELECT %s FROM main.memory_ledger_entries "
+        "WHERE guild_id=? AND subject_key=? AND source_table='conversations' "
+        "AND source_role='user' AND entry_id<>? "
+        "AND julianday(observed_at)>=julianday(?) "
+        "ORDER BY julianday(observed_at),observed_at,entry_id LIMIT ?"
+        % ",".join(_PUBLIC_ASSESSMENT_LEDGER_COLUMNS),
+        (
+            guild_id,
+            subject_key,
+            entry_id,
+            observed_at,
+            _CONVERSATION_MOTIF_MAX_SCAN + 1,
+        ),
+    ).fetchall()
+    if (
+        len(raw_rows) > _CONVERSATION_MOTIF_MAX_SCAN
+        or len(ledger_rows) > _CONVERSATION_MOTIF_MAX_SCAN
+    ):
+        return None
+    raw_by_id: dict[str, dict[str, Any]] = {}
+    for row in raw_rows:
+        row_id = _public_assessment_int(row[0])
+        if row_id is None or str(row_id) in raw_by_id:
+            return None
+        raw_by_id[str(row_id)] = dict(zip(raw_selected, row))
+    ledger_by_row: dict[str, list[dict[str, Any]]] = {}
+    for row in ledger_rows:
+        candidate = dict(zip(_PUBLIC_ASSESSMENT_LEDGER_COLUMNS, row))
+        ledger_by_row.setdefault(
+            str(candidate.get("source_row_id") or ""),
+            [],
+        ).append(candidate)
+    # A later Ledger claim without its retained source is authority drift. It
+    # cannot be allowed to disappear merely because its indexed text changed.
+    if any(row_id not in raw_by_id for row_id in ledger_by_row):
+        return None
+
+    relevant: list[
+        tuple[str, dict[str, Any], bool, bool, dict[str, Any]]
+    ] = []
+    for row_id, raw in raw_by_id.items():
+        correction_like, opposite_point = text_flags(raw.get("content"))
+        if not correction_like and not opposite_point:
+            continue
+        twins = ledger_by_row.get(row_id, [])
+        if len(twins) != 1:
+            return None
+        relevant.append((row_id, raw, correction_like, opposite_point, twins[0]))
+
+    participant_limit = (_CONVERSATION_MOTIF_MAX_SCAN * 4) + 1
+    participant_rows = conn.execute(
+        """
+        SELECT p.entry_id,p.guild_id,p.participant_key,p.display_name,
+               p.participant_role,p.order_index
+        FROM main.memory_ledger_participants p
+        JOIN main.memory_ledger_entries e ON e.entry_id=p.entry_id
+        WHERE e.guild_id=? AND e.subject_key=?
+          AND e.source_table='conversations' AND e.source_role='user'
+          AND e.entry_id<>? AND julianday(e.observed_at)>=julianday(?)
+        ORDER BY p.entry_id,p.guild_id,p.participant_role,
+                 p.participant_key,p.order_index
+        LIMIT ?
+        """,
+        (guild_id, subject_key, entry_id, observed_at, participant_limit),
+    ).fetchall()
+    if len(participant_rows) >= participant_limit:
+        return None
+    participants_by_entry: dict[str, list[tuple[Any, ...]]] = {}
+    for row in participant_rows:
+        participants_by_entry.setdefault(str(row[0] or ""), []).append(tuple(row[1:]))
+
+    lineage_limit = (_CONVERSATION_MOTIF_MAX_SCAN * 4) + 1
+    scoped_lineage_rows = conn.execute(
+        """
+        SELECT l.entry_id,l.guild_id,l.lineage_type,l.target_entry_id,l.created_at
+        FROM main.memory_ledger_lineage l
+        JOIN main.memory_ledger_entries e ON e.entry_id=l.entry_id
+        WHERE e.guild_id=? AND e.subject_key=?
+          AND e.source_table='conversations' AND e.source_role='user'
+          AND e.entry_id<>? AND julianday(e.observed_at)>=julianday(?)
+          AND l.lineage_type IN ('correction_of','supersedes','retracts')
+        ORDER BY l.entry_id,l.guild_id,l.lineage_type,l.target_entry_id,l.created_at
+        LIMIT ?
+        """,
+        (guild_id, subject_key, entry_id, observed_at, lineage_limit),
+    ).fetchall()
+    if len(scoped_lineage_rows) >= lineage_limit:
+        return None
+    lineage_by_entry: dict[str, list[tuple[Any, ...]]] = {}
+    for row in scoped_lineage_rows:
+        lineage_by_entry.setdefault(str(row[0] or ""), []).append(tuple(row[1:]))
+
+    target_rows = conn.execute(
+        "SELECT DISTINCT %s FROM main.memory_ledger_entries target "
+        "WHERE target.entry_id IN ("
+        "SELECT l.target_entry_id FROM main.memory_ledger_lineage l "
+        "JOIN main.memory_ledger_entries source ON source.entry_id=l.entry_id "
+        "WHERE source.guild_id=? AND source.subject_key=? "
+        "AND source.source_table='conversations' AND source.source_role='user' "
+        "AND source.entry_id<>? AND julianday(source.observed_at)>=julianday(?) "
+        "AND l.lineage_type IN ('correction_of','supersedes','retracts')) "
+        "ORDER BY target.entry_id LIMIT ?"
+        % ",".join("target.%s" % column for column in _PUBLIC_ASSESSMENT_LEDGER_COLUMNS),
+        (guild_id, subject_key, entry_id, observed_at, _CONVERSATION_MOTIF_MAX_SCAN + 1),
+    ).fetchall()
+    if len(target_rows) > _CONVERSATION_MOTIF_MAX_SCAN:
+        return None
+    targets = {
+        str(row[0] or ""): dict(zip(_PUBLIC_ASSESSMENT_LEDGER_COLUMNS, row))
+        for row in target_rows
+        if str(row[0] or "")
+    }
+    target_raw_rows = conn.execute(
+        "SELECT DISTINCT target.entry_id,%s "
+        "FROM main.memory_ledger_entries target "
+        "JOIN main.conversations c ON CAST(c.id AS TEXT)=target.source_row_id "
+        "WHERE target.entry_id IN ("
+        "SELECT l.target_entry_id FROM main.memory_ledger_lineage l "
+        "JOIN main.memory_ledger_entries source ON source.entry_id=l.entry_id "
+        "WHERE source.guild_id=? AND source.subject_key=? "
+        "AND source.source_table='conversations' AND source.source_role='user' "
+        "AND source.entry_id<>? AND julianday(source.observed_at)>=julianday(?) "
+        "AND l.lineage_type IN ('correction_of','supersedes','retracts')) "
+        "ORDER BY target.entry_id LIMIT ?"
+        % ",".join("c.%s" % column for column in raw_selected),
+        (guild_id, subject_key, entry_id, observed_at, _CONVERSATION_MOTIF_MAX_SCAN + 1),
+    ).fetchall()
+    if len(target_raw_rows) > _CONVERSATION_MOTIF_MAX_SCAN:
+        return None
+    target_raw = {
+        str(row[0] or ""): dict(zip(raw_selected, row[1:]))
+        for row in target_raw_rows
+        if str(row[0] or "")
+    }
+    journal_columns = frozenset(
+        _main_table_columns(conn, "bnl_journal_source_events")
+    )
+    required_journal = {
+        "event_seq",
+        "guild_id",
+        "source_kind",
+        "source_key",
+        "occurred_at_ms",
+        "channel_id",
+        "channel_policy",
+        "subject_ref",
+        "private_display_name",
+        "raw_text",
+        "content_hash",
+        "public_usable",
+        "metadata_json",
+    }
+    journal_trigger_snapshot = (
+        _main_public_assessment_journal_trigger_snapshot(conn)
+        if required_journal.issubset(journal_columns)
+        else ()
+    )
+    journal_receipts = _main_public_assessment_journal_receipt_map(
+        conn,
+        (
+            *(raw for _row_id, raw, _correction, _opposite, _twin in relevant),
+            *target_raw.values(),
+        ),
+        journal_trigger_snapshot=journal_trigger_snapshot,
+    )
+
+    def bound_source_snapshot(
+        candidate: Mapping[str, Any],
+        raw: Mapping[str, Any],
+        *,
+        allowed_routes: frozenset[str],
+    ) -> tuple[Any, ...] | None:
+        candidate_guild = _public_assessment_int(candidate.get("guild_id"))
+        candidate_channel = _public_assessment_int(candidate.get("channel_id"))
+        raw_id = _public_assessment_int(raw.get("id"))
+        raw_guild = _public_assessment_int(raw.get("guild_id"))
+        raw_user = _public_assessment_int(raw.get("user_id"))
+        raw_channel = _public_assessment_int(raw.get("channel_id"))
+        raw_message = _public_assessment_int(raw.get("message_id"))
+        source_sequence = _public_assessment_int(candidate.get("source_sequence"))
+        expected_entry_id = stable_entry_id(
+            guild_id=candidate_guild,
+            source_table=str(candidate.get("source_table") or ""),
+            source_row_id=str(candidate.get("source_row_id") or ""),
+            source_revision=str(candidate.get("source_revision") or ""),
+            entry_type=str(candidate.get("entry_type") or ""),
+            subject_key=str(candidate.get("subject_key") or ""),
+            predicate_key=str(candidate.get("predicate_key") or ""),
+        )
+        expected_sequences = {
+            value for value in (raw_id, raw_message) if value not in {None, 0}
+        }
+        public_state = _public_assessment_bool_state(candidate.get("public_usable"))
+        derived_state = _public_assessment_bool_state(candidate.get("derived"))
+        projection_state = _public_assessment_bool_state(candidate.get("projection"))
+        mapped_visibility = _visibility(str(raw.get("channel_policy") or "")).value
+        if None in {
+            candidate_guild,
+            candidate_channel,
+            raw_id,
+            raw_guild,
+            raw_user,
+            raw_channel,
+            source_sequence,
+        } or (
+            str(candidate.get("schema_version") or "") != MEMORY_LEDGER_SCHEMA_VERSION
+            or str(candidate.get("entry_id") or "") != expected_entry_id
+            or candidate_guild != guild_id
+            or raw_guild != guild_id
+            or raw_user != user_id
+            or candidate_channel != raw_channel
+            or str(candidate.get("subject_key") or "") != subject_key
+            or str(candidate.get("entry_type") or "") != "observation"
+            or str(candidate.get("predicate_key") or "") != "conversation"
+            or str(candidate.get("source_table") or "") != "conversations"
+            or str(candidate.get("source_row_id") or "") != str(raw_id)
+            or str(candidate.get("source_revision") or "") != str(raw_id)
+            or str(candidate.get("source_role") or "").lower() != "user"
+            or str(candidate.get("source_class") or "")
+            != SourceClass.PUBLIC_OBSERVATION.value
+            or str(candidate.get("route_mode") or "") not in allowed_routes
+            or str(candidate.get("channel_policy") or "")
+            not in _CONVERSATION_MOTIF_PUBLIC_POLICIES
+            or str(candidate.get("channel_policy") or "")
+            != str(raw.get("channel_policy") or "")
+            or str(candidate.get("visibility") or "")
+            not in {Visibility.PUBLIC.value, Visibility.PUBLIC_SAFE.value}
+            or str(candidate.get("visibility") or "") != mapped_visibility
+            or str(candidate.get("confidence") or "") != Confidence.MEDIUM.value
+            or public_state is not True
+            or derived_state is not False
+            or projection_state is not False
+            or str(candidate.get("lifecycle_status") or "") != ACTIVE_LIFECYCLE
+            or str(raw.get("role") or "").lower() != "user"
+            or str(candidate.get("normalized_value") or "")
+            != str(raw.get("content") or "")[:500]
+            or str(candidate.get("subject_display_name") or "")
+            != str(raw.get("user_name") or "")
+            or str(candidate.get("observed_at") or "")
+            != str(raw.get("timestamp") or "")
+            or _parse_knowledge_time(candidate.get("observed_at")) is None
+            or source_sequence not in expected_sequences
+            or (
+                "channel_name" in raw
+                and str(candidate.get("channel_name") or "")
+                != str(raw.get("channel_name") or "")
+            )
+            or (
+                "message_id" in raw
+                and _public_assessment_int(candidate.get("source_message_id"))
+                != raw_message
+            )
+            or (
+                "public_usable" in raw
+                and _public_assessment_bool_state(raw.get("public_usable")) is not True
+            )
+            or (
+                "visibility" in raw
+                and str(raw.get("visibility") or "") != mapped_visibility
+            )
+            or _knowledge_operational_or_test_source(dict(candidate))
+        ):
+            return None
+        route_authority = _main_public_assessment_route_authority(
+            conn,
+            raw,
+            journal_columns=journal_columns,
+            journal_trigger_snapshot=journal_trigger_snapshot,
+            journal_receipts=journal_receipts,
+        )
+        if (
+            route_authority is None
+            or route_authority[0] != str(candidate.get("route_mode") or "")
+            or route_authority[0] not in allowed_routes
+        ):
+            return None
+        return (
+            tuple(candidate.get(column) for column in _PUBLIC_ASSESSMENT_LEDGER_COLUMNS),
+            tuple(raw.get(column) for column in raw_selected),
+            route_authority[1],
+        )
+
+    snapshots: list[tuple[Any, ...]] = []
+    unresolved_correction = False
+    polarity_conflict = False
+    for row_id, raw, correction_like, opposite_point, twin in relevant:
+        source_snapshot = bound_source_snapshot(
+            twin,
+            raw,
+            allowed_routes=frozenset({"normal_chat", "conversation_continuity"}),
+        )
+        if source_snapshot is None:
+            return None
+        twin_id = str(twin.get("entry_id") or "")
+        participant_snapshot = tuple(participants_by_entry.get(twin_id, ()))
+        if len(participant_snapshot) != 1 or (
+            _public_assessment_int(participant_snapshot[0][0]) != guild_id
+            or str(participant_snapshot[0][1] or "") != subject_key
+            or str(participant_snapshot[0][2] or "")
+            != str(raw.get("user_name") or "")
+            or str(participant_snapshot[0][3] or "").lower() != "author"
+            or _public_assessment_int(participant_snapshot[0][4]) != 0
+        ):
+            return None
+        lineage_rows: tuple[tuple[Any, ...], ...] = ()
+        target_snapshot: tuple[Any, ...] = ()
+        if correction_like:
+            lineage_rows = tuple(lineage_by_entry.get(twin_id, ()))
+            target_ids = {
+                str(edge[2] or "")
+                for edge in lineage_rows
+                if str(edge[2] or "")
+            }
+            valid_target = False
+            if (
+                lineage_rows
+                and len(target_ids) == 1
+                and all(_public_assessment_int(edge[0]) == guild_id for edge in lineage_rows)
+            ):
+                target_id = next(iter(target_ids))
+                target = targets.get(target_id, {})
+                target_observed = _parse_knowledge_time(target.get("observed_at"))
+                target_raw_row = target_raw.get(target_id, {})
+                target_source_snapshot = bound_source_snapshot(
+                    target,
+                    target_raw_row,
+                    allowed_routes=frozenset(
+                        {"normal_chat", "conversation_continuity"}
+                    ),
+                )
+                twin_observed = _parse_knowledge_time(twin.get("observed_at"))
+                valid_target = bool(
+                    target_source_snapshot is not None
+                    and target_id != twin_id
+                    and target_observed is not None
+                    and twin_observed is not None
+                    and target_observed < twin_observed
+                )
+                if valid_target:
+                    target_snapshot = tuple(target_source_snapshot or ())
+            if not valid_target:
+                unresolved_correction = True
+        if opposite_point:
+            polarity_conflict = True
+        snapshots.append(
+            (
+                source_snapshot,
+                participant_snapshot,
+                lineage_rows,
+                target_snapshot,
+                correction_like,
+                opposite_point,
+            )
+        )
+    return tuple(snapshots), unresolved_correction, polarity_conflict
+
+
+def read_public_assessment_root_state(
+    conn: sqlite3.Connection,
+    *,
+    entry_id: str,
+    guild_id: int,
+    subject_key: str,
+) -> PublicAssessmentRootState | None:
+    """Return one content-bound Open Signal root or fail closed.
+
+    The Ledger row is a shadow index, never sufficient authority by itself.
+    This read binds it to the original retained conversation, exact author,
+    current lineage/correction state, route, recurrence window, and deterministic
+    claim semantics.  Packet assembly and send-time revalidation use the same
+    state and digest.
+    """
+
+    required_ledger_tables = (
+        "memory_ledger_entries",
+        "memory_ledger_lineage",
+        "memory_ledger_participants",
+    )
+    if any(not _main_table_columns(conn, table) for table in required_ledger_tables):
+        return None
+    entry = _main_public_assessment_entry(conn, str(entry_id or ""))
+    expected_subject = str(subject_key or "")
+    entry_guild_id = _public_assessment_int(entry.get("guild_id")) if entry else None
+    entry_channel_id = _public_assessment_int(entry.get("channel_id")) if entry else None
+    public_usable_state = (
+        _public_assessment_bool_state(entry.get("public_usable"))
+        if entry
+        else None
+    )
+    derived_state = (
+        _public_assessment_bool_state(entry.get("derived")) if entry else None
+    )
+    projection_state = (
+        _public_assessment_bool_state(entry.get("projection")) if entry else None
+    )
+    expected_entry_id = (
+        stable_entry_id(
+            guild_id=entry_guild_id,
+            source_table=str(entry.get("source_table") or ""),
+            source_row_id=str(entry.get("source_row_id") or ""),
+            source_revision=str(entry.get("source_revision") or ""),
+            entry_type=str(entry.get("entry_type") or ""),
+            subject_key=str(entry.get("subject_key") or ""),
+            predicate_key=str(entry.get("predicate_key") or ""),
+        )
+        if entry
+        else ""
+    )
+    if not entry or (
+        entry_guild_id != int(guild_id or 0)
+        or entry_channel_id is None
+        or str(entry.get("schema_version") or "")
+        != MEMORY_LEDGER_SCHEMA_VERSION
+        or str(entry.get("entry_id") or "") != expected_entry_id
+        or str(entry.get("subject_key") or "") != expected_subject
+        or str(entry.get("entry_type") or "") != "observation"
+        or str(entry.get("predicate_key") or "") != "conversation"
+        or str(entry.get("source_table") or "") != "conversations"
+        or str(entry.get("source_revision") or "")
+        != str(entry.get("source_row_id") or "")
+        or str(entry.get("source_role") or "") != "user"
+        or str(entry.get("source_class") or "")
+        != SourceClass.PUBLIC_OBSERVATION.value
+        or str(entry.get("route_mode") or "")
+        not in _PUBLIC_ASSESSMENT_ALLOWED_ROUTES
+        or str(entry.get("channel_policy") or "")
+        not in {"public_home", "public_context", "public_selective"}
+        or str(entry.get("visibility") or "")
+        not in {Visibility.PUBLIC.value, Visibility.PUBLIC_SAFE.value}
+        or str(entry.get("confidence") or "") != Confidence.MEDIUM.value
+        or public_usable_state is not True
+        or derived_state is not False
+        or projection_state is not False
+        or str(entry.get("lifecycle_status") or "") != ACTIVE_LIFECYCLE
+    ):
+        return None
+
+    participant_columns = _main_table_columns(
+        conn,
+        "memory_ledger_participants",
+    )
+    if not {
+        "entry_id",
+        "guild_id",
+        "participant_key",
+        "display_name",
+        "participant_role",
+        "order_index",
+    }.issubset(participant_columns):
+        return None
+    participant_rows = tuple(
+        tuple(row)
+        for row in conn.execute(
+            """
+            SELECT guild_id,participant_key,display_name,
+                   participant_role,order_index
+            FROM main.memory_ledger_participants
+            WHERE entry_id=?
+            ORDER BY guild_id,participant_role,participant_key,order_index
+            """,
+            (str(entry_id),),
+        ).fetchall()
+    )
+    participant_guilds = tuple(
+        _public_assessment_int(row[0]) for row in participant_rows
+    )
+    if (
+        len(participant_rows) != 1
+        or any(value != int(guild_id or 0) for value in participant_guilds)
+    ):
+        return None
+    author_rows = tuple(
+        row
+        for row in participant_rows
+        if str(row[3] or "").lower() == "author"
+    )
+    if (
+        len(author_rows) != 1
+        or str(author_rows[0][1] or "") != expected_subject
+        or str(author_rows[0][2] or "")
+        != str(entry.get("subject_display_name") or "")
+        or _public_assessment_int(author_rows[0][4]) != 0
+    ):
+        return None
+
+    lineage_columns = _main_table_columns(conn, "memory_ledger_lineage")
+    if not {
+        "entry_id",
+        "guild_id",
+        "lineage_type",
+        "target_entry_id",
+        "created_at",
+    }.issubset(lineage_columns):
+        return None
+    outgoing = tuple(
+        tuple(str(value or "") for value in row)
+        for row in conn.execute(
+            """
+            SELECT guild_id,lineage_type,target_entry_id,created_at
+            FROM main.memory_ledger_lineage
+            WHERE entry_id=?
+            ORDER BY guild_id,lineage_type,target_entry_id,created_at
+            """,
+            (str(entry_id),),
+        ).fetchall()
+    )
+    incoming = tuple(
+        tuple(str(value or "") for value in row)
+        for row in conn.execute(
+            """
+            SELECT guild_id,entry_id,lineage_type,created_at
+            FROM main.memory_ledger_lineage
+            WHERE target_entry_id=?
+            ORDER BY guild_id,entry_id,lineage_type,created_at
+            """,
+            (str(entry_id),),
+        ).fetchall()
+    )
+    lineage_guilds = tuple(
+        _public_assessment_int(row[0]) for row in (*outgoing, *incoming)
+    )
+    if any(value != int(guild_id or 0) for value in lineage_guilds):
+        return None
+    if any(
+        str(row[2] or "") in {"correction_of", "supersedes", "retracts"}
+        for row in incoming
+    ):
+        return None
+
+    raw_columns = _main_table_columns(conn, "conversations")
+    required_raw = {
+        "id",
+        "guild_id",
+        "user_id",
+        "user_name",
+        "role",
+        "content",
+        "channel_id",
+        "channel_policy",
+        "timestamp",
+    }
+    if not required_raw.issubset(raw_columns):
+        return None
+    optional_raw = tuple(
+        column
+        for column in (
+            "channel_name",
+            "message_id",
+            "route_mode",
+            "public_usable",
+            "visibility",
+        )
+        if column in raw_columns
+    )
+    raw_selected = (
+        "id",
+        "guild_id",
+        "user_id",
+        "user_name",
+        "role",
+        "content",
+        "channel_id",
+        "channel_policy",
+        "timestamp",
+        *optional_raw,
+    )
+    raw_row = conn.execute(
+        "SELECT %s FROM main.conversations WHERE id=?"
+        % ",".join(raw_selected),
+        (str(entry.get("source_row_id") or ""),),
+    ).fetchone()
+    if not raw_row:
+        return None
+    raw = dict(zip(raw_selected, raw_row))
+    raw_id = _public_assessment_int(raw.get("id"))
+    raw_guild_id = _public_assessment_int(raw.get("guild_id"))
+    raw_user_id = _public_assessment_int(raw.get("user_id"))
+    raw_channel_id = _public_assessment_int(raw.get("channel_id"))
+    source_sequence = _public_assessment_int(entry.get("source_sequence"))
+    raw_message_id = _public_assessment_int(raw.get("message_id"))
+    expected_sequences = {
+        int(raw_id or 0),
+        int(raw_message_id or 0),
+    } - {0}
+    mapped_visibility = _visibility(str(raw.get("channel_policy") or "")).value
+    if None in {raw_id, raw_guild_id, raw_user_id, raw_channel_id}:
+        return None
+    raw_subject = subject_key_for_user(raw_user_id)
+    if (
+        str(raw_id) != str(entry.get("source_row_id") or "")
+        or raw_guild_id != int(guild_id or 0)
+        or raw_subject != expected_subject
+        or str(raw.get("user_name") or "")
+        != str(entry.get("subject_display_name") or "")
+        or str(raw.get("role") or "").lower() != "user"
+        or str(raw.get("content") or "")[:500]
+        != str(entry.get("normalized_value") or "")
+        or raw_channel_id != entry_channel_id
+        or str(raw.get("channel_policy") or "")
+        != str(entry.get("channel_policy") or "")
+        or str(raw.get("timestamp") or "")
+        != str(entry.get("observed_at") or "")
+        or source_sequence not in expected_sequences
+        or str(entry.get("visibility") or "") != mapped_visibility
+    ):
+        return None
+    if "channel_name" in raw and str(raw.get("channel_name") or "") != str(
+        entry.get("channel_name") or ""
+    ):
+        return None
+    if "message_id" in raw and str(raw_message_id or "") != str(
+        _public_assessment_int(entry.get("source_message_id")) or ""
+    ):
+        return None
+    route_authority = _main_public_assessment_route_authority(conn, raw)
+    if (
+        route_authority is None
+        or route_authority[0] != str(entry.get("route_mode") or "")
+        or route_authority[0] not in _PUBLIC_ASSESSMENT_ALLOWED_ROUTES
+    ):
+        return None
+    route_authority_snapshot = route_authority[1]
+    if "public_usable" in raw and _public_assessment_bool_state(
+        raw.get("public_usable")
+    ) is not True:
+        return None
+    if "visibility" in raw and str(raw.get("visibility") or "") not in {
+        Visibility.PUBLIC.value,
+        Visibility.PUBLIC_SAFE.value,
+    }:
+        return None
+    if "visibility" in raw and str(raw.get("visibility") or "") != mapped_visibility:
+        return None
+    if _knowledge_operational_or_test_source(dict(entry)):
+        return None
+
+    safe_text = _public_assessment_text(str(entry.get("normalized_value") or ""))
+    semantics = public_assessment_semantics(
+        str(entry.get("normalized_value") or "")
+    )
+    root_identity = _main_public_assessment_root_identity(conn, entry)
+    occurrence_identity = _main_public_assessment_occurrence_identity(conn, entry)
+    if (
+        not safe_text
+        or semantics.attribution_mode
+        not in {"subject_action", "authored_topic"}
+        or not semantics.action_identity
+        or not semantics.point_identity
+        or not root_identity
+        or not occurrence_identity
+    ):
+        return None
+
+    fences = _main_public_assessment_fences(
+        conn,
+        guild_id=int(guild_id or 0),
+        subject_key=expected_subject,
+    )
+    if fences is None:
+        return None
+    later_guard_state = _main_public_assessment_later_guard_state(
+        conn,
+        entry=entry,
+        semantics=semantics,
+    )
+    if later_guard_state is None:
+        return None
+    later_guards, unresolved_later_correction, polarity_conflict = (
+        later_guard_state
+    )
+    if unresolved_later_correction or polarity_conflict:
+        return None
+    observed = _parse_knowledge_time(entry.get("observed_at"))
+    if observed is None:
+        return None
+    for fence in fences:
+        cutoff = _parse_knowledge_time(fence[2] if len(fence) > 2 else "")
+        if cutoff is None or observed <= cutoff:
+            return None
+
+    source_digest = _public_assessment_state_digest(
+        _PUBLIC_ASSESSMENT_ROOT_STATE_VERSION,
+        tuple(entry.get(column) for column in _PUBLIC_ASSESSMENT_LEDGER_COLUMNS),
+        tuple(raw.get(column) for column in raw_selected),
+        route_authority_snapshot,
+        participant_rows,
+        outgoing,
+        incoming,
+        fences,
+        later_guards,
+        root_identity,
+        occurrence_identity,
+        semantics.attribution_mode,
+        semantics.polarity,
+        semantics.action_identity,
+        semantics.material_facets,
+        semantics.point_identity,
+    )
+    return PublicAssessmentRootState(
+        entry_id=str(entry.get("entry_id") or ""),
+        subject_key=expected_subject,
+        text=safe_text,
+        observed_at=str(entry.get("observed_at") or ""),
+        visibility=str(entry.get("visibility") or ""),
+        channel_policy=str(entry.get("channel_policy") or ""),
+        route_mode=str(entry.get("route_mode") or ""),
+        source_role=str(entry.get("source_role") or ""),
+        source_class=str(entry.get("source_class") or ""),
+        lifecycle_status=str(entry.get("lifecycle_status") or ""),
+        source_row_id=str(entry.get("source_row_id") or ""),
+        root_identity=root_identity,
+        occurrence_identity=occurrence_identity,
+        source_digest=source_digest,
+        semantics=semantics,
+        public_usable=True,
+        derived=False,
+        projection=False,
+    )
+
+
+def _public_assessment_scope_text(value: str) -> str:
+    """Remove only a leading bot mention/vocative from request scope."""
+
+    normalized = re.sub(r"^\s*<@!?\d+>\s*[,;:!?—–-]*\s*", "", str(value or ""))
+    return _PUBLIC_ASSESSMENT_LEADING_ADDRESSEE_RE.sub(
+        "",
+        normalized,
+        count=1,
+    ).strip()
+
+
+def public_assessment_process_request(value: str) -> bool:
+    """Return whether assessment selection must require process relevance."""
+
+    return bool(
+        _PUBLIC_ASSESSMENT_PROCESS_QUERY_RE.search(
+            _public_assessment_scope_text(value)
+        )
+    )
+
+
+def public_assessment_relevance_required(value: str) -> bool:
+    """Return whether a profile request names a specific question scope."""
+
+    scope_text = _public_assessment_scope_text(value)
+    if public_assessment_process_request(scope_text):
+        return True
+    request_stems = {
+        _public_assessment_term_stem(term)
+        for term in _public_assessment_terms(scope_text)
+    }
+    generic_stems = {
+        _public_assessment_term_stem(term)
+        for term in _PUBLIC_ASSESSMENT_GENERIC_PROFILE_TERMS
+    }
+    return bool(request_stems - generic_stems)
+
+
+def _select_public_conversation_assessment_evidence_in_snapshot(
     conn: sqlite3.Connection,
     *,
     guild_id: int,
@@ -5423,29 +8177,193 @@ def select_public_conversation_assessment_evidence(
         subject_key=str(subject_key or ""),
         max_scan=max_scan,
         diagnostics=diagnostics,
+        require_legacy_occurrence=False,
+        normal_chat_only=False,
     )
     scanned_count = int(diagnostics.get("ledger_rows_scanned", 0) or 0)
     if not history:
         return PublicAssessmentSelection(scanned_count=scanned_count)
 
-    request_terms = _public_assessment_terms(request_text)
-    process_request = bool(
-        _PUBLIC_ASSESSMENT_PROCESS_QUERY_RE.search(
-            str(request_text or "")
-        )
-    )
+    scope_text = _public_assessment_scope_text(request_text)
+    request_terms = _public_assessment_terms(scope_text)
+    process_request = public_assessment_process_request(scope_text)
+    relevance_required = public_assessment_relevance_required(scope_text)
     target_terms = set(request_terms)
     if process_request:
         target_terms.update(_PUBLIC_ASSESSMENT_PROCESS_TERMS)
+    process_stems = {
+        _public_assessment_term_stem(term)
+        for term in _PUBLIC_ASSESSMENT_PROCESS_TERMS
+    }
+    request_non_process_stems = {
+        _public_assessment_term_stem(term)
+        for term in request_terms
+    } - process_stems
+    request_topic_facets = {
+        "topic:%s" % canonical
+        for term in request_terms
+        for canonical in (
+            _PUBLIC_ASSESSMENT_TOPIC_ALIASES.get(
+                _public_assessment_term_stem(term)
+            ),
+        )
+        if canonical
+    }
+    if "barcode" in request_terms:
+        request_topic_facets.update(
+            "topic:%s" % topic
+            for topic in set(_PUBLIC_ASSESSMENT_TOPIC_ALIASES.values())
+        )
 
-    occurrence_terms: dict[str, set[str]] = {}
-    prepared: list[dict[str, Any]] = []
-    seen_text: set[str] = set()
+    def request_relevant(
+        terms: frozenset[str],
+        semantics: PublicAssessmentSemantics,
+    ) -> bool:
+        candidate_stems = {
+            _public_assessment_term_stem(term) for term in terms
+        }
+        process_overlap = candidate_stems.intersection(process_stems)
+        direct_non_process_overlap = candidate_stems.intersection(
+            request_non_process_stems
+        )
+        candidate_topic_facets = {
+            facet
+            for facet in semantics.material_facets
+            if str(facet).startswith("topic:")
+        }
+        return bool(
+            (
+                len(process_overlap) >= 2
+                or (
+                    len(process_overlap) >= 1
+                    and bool(direct_non_process_overlap)
+                )
+            )
+            if process_request
+            else (
+                set(terms).intersection(target_terms)
+                or candidate_stems.intersection(request_non_process_stems)
+                or candidate_topic_facets.intersection(request_topic_facets)
+            )
+        )
+
+    safe_max = max(
+        1,
+        min(
+            int(max_results or _PUBLIC_ASSESSMENT_MAX_RESULTS),
+            8,
+        ),
+    )
+    # Rank the full bounded Ledger pool using non-authoritative text only, then
+    # run the expensive content-bound validator over a fixed backfill budget.
+    # Preliminary rows can influence order or cause a safe omission, but they
+    # can never enter the returned packet without central root validation.
+    provisional: list[dict[str, Any]] = []
+    provisional_seen_text: set[str] = set()
+    provisional_frequency: Counter[str] = Counter()
     for recency_rank, entry in enumerate(history):
         text = _public_assessment_text(
             str(entry.get("normalized_value") or "")
         )
-        occurrence = str(entry.get("occurrence_identity") or "")
+        semantics = public_assessment_semantics(text)
+        normalized = re.sub(r"\W+", " ", text.lower()).strip()
+        terms = _public_assessment_terms(text)
+        if (
+            not text
+            or not semantics.point_identity
+            or not normalized
+            or normalized in provisional_seen_text
+            or not terms
+        ):
+            continue
+        provisional_seen_text.add(normalized)
+        provisional_frequency.update(terms)
+        provisional.append(
+            {
+                "entry": entry,
+                "text": text,
+                "terms": terms,
+                "semantics": semantics,
+                "recency_rank": recency_rank,
+            }
+        )
+    for candidate in provisional:
+        terms = set(candidate["terms"])
+        direct_overlap = terms.intersection(request_terms)
+        target_overlap = terms.intersection(target_terms)
+        recurrent_score = sum(
+            min(3, max(0, int(provisional_frequency[term]) - 1))
+            for term in terms
+        )
+        candidate["request_relevant"] = request_relevant(
+            candidate["terms"],
+            candidate["semantics"],
+        )
+        candidate["base_score"] = (
+            10.0 * len(direct_overlap)
+            + 5.0 * len(target_overlap - direct_overlap)
+            + min(18.0, float(recurrent_score))
+            + max(
+                0.0,
+                2.0
+                - (
+                    float(candidate["recency_rank"])
+                    / max(1.0, float(len(provisional)))
+                ),
+            )
+        )
+
+    validation_budget = min(12, max(8, safe_max * 2))
+    validation_order: list[dict[str, Any]] = []
+    provisional_points: set[str] = set()
+    provisional_terms: set[str] = set()
+    while provisional and len(validation_order) < validation_budget:
+        ranked: list[tuple[float, int, str, dict[str, Any]]] = []
+        for candidate in provisional:
+            point_identity = str(
+                candidate["semantics"].point_identity or ""
+            )
+            terms = set(candidate["terms"])
+            adjusted = (
+                float(candidate["base_score"])
+                + (14.0 if point_identity not in provisional_points else 0.0)
+                + min(8.0, 0.75 * len(terms - provisional_terms))
+                + (
+                    24.0
+                    if relevance_required and candidate["request_relevant"]
+                    else 0.0
+                )
+            )
+            ranked.append(
+                (
+                    -adjusted,
+                    int(candidate["recency_rank"]),
+                    str(candidate["entry"].get("entry_id") or ""),
+                    candidate,
+                )
+            )
+        chosen = sorted(ranked, key=lambda value: value[:3])[0][3]
+        provisional.remove(chosen)
+        validation_order.append(chosen)
+        provisional_points.add(str(chosen["semantics"].point_identity or ""))
+        provisional_terms.update(chosen["terms"])
+
+    occurrence_terms: dict[str, set[str]] = {}
+    prepared: list[dict[str, Any]] = []
+    seen_text: set[str] = set()
+    for provisional_candidate in validation_order:
+        entry = provisional_candidate["entry"]
+        recency_rank = int(provisional_candidate["recency_rank"])
+        state = read_public_assessment_root_state(
+            conn,
+            entry_id=str(entry.get("entry_id") or ""),
+            guild_id=int(guild_id or 0),
+            subject_key=str(subject_key or ""),
+        )
+        if state is None:
+            continue
+        text = state.text
+        occurrence = state.occurrence_identity
         normalized = re.sub(r"\W+", " ", text.lower()).strip()
         if (
             not text
@@ -5462,6 +8380,7 @@ def select_public_conversation_assessment_evidence(
         prepared.append(
             {
                 "entry": entry,
+                "state": state,
                 "text": text,
                 "terms": terms,
                 "occurrence": occurrence,
@@ -5481,7 +8400,10 @@ def select_public_conversation_assessment_evidence(
             min(3, max(0, int(term_occurrence_frequency[term]) - 1))
             for term in terms
         )
-        candidate["request_relevant"] = bool(target_overlap)
+        candidate["request_relevant"] = request_relevant(
+            candidate["terms"],
+            candidate["state"].semantics,
+        )
         candidate["base_score"] = (
             10.0 * len(direct_overlap)
             + 5.0 * len(target_overlap - direct_overlap)
@@ -5503,14 +8425,7 @@ def select_public_conversation_assessment_evidence(
         1 for candidate in prepared if candidate["request_relevant"]
     )
     required_relevant = (
-        min(3, relevant_available) if process_request else 0
-    )
-    safe_max = max(
-        1,
-        min(
-            int(max_results or _PUBLIC_ASSESSMENT_MAX_RESULTS),
-            8,
-        ),
+        min(3, relevant_available) if relevance_required else 0
     )
     while len(selected) < safe_max:
         need_relevant = sum(
@@ -5550,37 +8465,42 @@ def select_public_conversation_assessment_evidence(
 
     items = tuple(
         PublicAssessmentEvidence(
-            entry_id=str(candidate["entry"].get("entry_id") or ""),
+            entry_id=str(candidate["state"].entry_id or ""),
             text=str(candidate["text"]),
-            observed_at=str(
-                candidate["entry"].get("observed_at") or ""
-            ),
-            visibility=str(
-                candidate["entry"].get("visibility") or "unknown"
-            ),
+            observed_at=str(candidate["state"].observed_at or ""),
+            visibility=str(candidate["state"].visibility or "unknown"),
             occurrence_identity=str(candidate["occurrence"]),
             score=float(candidate["base_score"]),
+            root_identity=str(candidate["state"].root_identity or ""),
+            source_digest=str(candidate["state"].source_digest or ""),
+            point_identity=str(
+                candidate["state"].semantics.point_identity or ""
+            ),
+            attribution_mode=str(
+                candidate["state"].semantics.attribution_mode or ""
+            ),
+            polarity=str(candidate["state"].semantics.polarity or ""),
+            action_identity=str(
+                candidate["state"].semantics.action_identity or ""
+            ),
+            material_facets=tuple(
+                candidate["state"].semantics.material_facets
+            ),
             request_relevant=bool(candidate["request_relevant"]),
             subject_key=str(subject_key or ""),
-            source_role=str(candidate["entry"].get("source_role") or ""),
-            source_class=str(candidate["entry"].get("source_class") or ""),
-            lifecycle_status=str(
-                candidate["entry"].get("lifecycle_status") or ""
-            ),
-            channel_policy=str(
-                candidate["entry"].get("channel_policy") or "unknown"
-            ),
-            public_usable=bool(candidate["entry"].get("public_usable")),
-            subject_authored=bool(
-                str(candidate["entry"].get("subject_key") or "")
-                == str(subject_key or "")
-            ),
+            source_role=str(candidate["state"].source_role or ""),
+            source_class=str(candidate["state"].source_class or ""),
+            lifecycle_status=str(candidate["state"].lifecycle_status or ""),
+            channel_policy=str(candidate["state"].channel_policy or "unknown"),
+            route_mode=str(candidate["state"].route_mode or "unknown"),
+            public_usable=bool(candidate["state"].public_usable),
+            subject_authored=True,
             selector_eligible=True,
-            derived=bool(candidate["entry"].get("derived")),
-            projection=bool(candidate["entry"].get("projection")),
+            derived=bool(candidate["state"].derived),
+            projection=bool(candidate["state"].projection),
         )
         for candidate in selected
-        if str(candidate["entry"].get("entry_id") or "")
+        if str(candidate["state"].entry_id or "")
     )
     return PublicAssessmentSelection(
         scanned_count=scanned_count,
@@ -5588,6 +8508,34 @@ def select_public_conversation_assessment_evidence(
         request_relevant_count=relevant_available,
         items=items,
     )
+
+
+def select_public_conversation_assessment_evidence(
+    conn: sqlite3.Connection,
+    *,
+    guild_id: int,
+    subject_key: str,
+    request_text: str,
+    max_scan: int = _CONVERSATION_MOTIF_MAX_SCAN,
+    max_results: int = _PUBLIC_ASSESSMENT_MAX_RESULTS,
+) -> PublicAssessmentSelection:
+    """Select Open evidence from one coherent, read-only snapshot."""
+
+    owns_snapshot = not conn.in_transaction
+    if owns_snapshot:
+        conn.execute("BEGIN")
+    try:
+        return _select_public_conversation_assessment_evidence_in_snapshot(
+            conn,
+            guild_id=guild_id,
+            subject_key=subject_key,
+            request_text=request_text,
+            max_scan=max_scan,
+            max_results=max_results,
+        )
+    finally:
+        if owns_snapshot and conn.in_transaction:
+            conn.rollback()
 
 
 def _conversation_projection_columns(
@@ -5682,6 +8630,7 @@ def project_retained_conversations_to_ledger(
         "channel_name": "''",
         "channel_id": "0",
         "message_id": "NULL",
+        "route_mode": "'unknown'",
         "timestamp": "''",
     }
     select = [
@@ -5708,6 +8657,11 @@ def project_retained_conversations_to_ledger(
             "message_id"
             if "message_id" in columns
             else "%s AS message_id" % optional["message_id"]
+        ),
+        (
+            "route_mode"
+            if "route_mode" in columns
+            else "%s AS route_mode" % optional["route_mode"]
         ),
         (
             "timestamp"
@@ -5758,6 +8712,7 @@ def project_retained_conversations_to_ledger(
         "channel_policy",
         "channel_id",
         "message_id",
+        "route_mode",
         "timestamp",
     )
     for raw in reversed(rows):
@@ -5813,7 +8768,11 @@ def project_retained_conversations_to_ledger(
             message_id=(
                 int(row.get("message_id") or 0) or None
             ),
-            route_mode="conversation_continuity",
+            route_mode=(
+                _canon(row.get("route_mode"))
+                if _canon(row.get("route_mode")) not in {"", "unknown"}
+                else "conversation_continuity"
+            ),
             observed_at=str(row.get("timestamp") or ""),
             source_sequence=(
                 int(row.get("message_id") or 0) or row_id
@@ -6254,6 +9213,7 @@ def backfill_retained_conversation_ledger_entries(
         "channel_name": "''",
         "channel_id": "0",
         "message_id": "NULL",
+        "route_mode": "'unknown'",
         "timestamp": "''",
     }
     select = [
@@ -6281,6 +9241,11 @@ def backfill_retained_conversation_ledger_entries(
             "c.message_id"
             if "message_id" in columns
             else "%s AS message_id" % optional["message_id"]
+        ),
+        (
+            "c.route_mode"
+            if "route_mode" in columns
+            else "%s AS route_mode" % optional["route_mode"]
         ),
         (
             "c.timestamp"
@@ -6328,6 +9293,7 @@ def backfill_retained_conversation_ledger_entries(
         "channel_policy",
         "channel_id",
         "message_id",
+        "route_mode",
         "timestamp",
     )
     projection_env = dict(env)
@@ -6346,7 +9312,11 @@ def backfill_retained_conversation_ledger_entries(
             channel_policy=str(row.get("channel_policy") or ""),
             channel_id=int(row.get("channel_id") or 0),
             message_id=(int(row.get("message_id") or 0) or None),
-            route_mode="conversation_continuity",
+            route_mode=(
+                _canon(row.get("route_mode"))
+                if _canon(row.get("route_mode")) not in {"", "unknown"}
+                else "conversation_continuity"
+            ),
             observed_at=str(row.get("timestamp") or ""),
             source_sequence=(
                 int(row.get("message_id") or 0)

@@ -19,10 +19,10 @@ LEGACY_CANON_ADAPTER_VERSION = "legacy_canon_adapter_v1"
 DECLARED_CANON_ADAPTER_VERSION = "declared_canon_adapter_v1"
 BROADCAST_CANON_ADAPTER_VERSION = "broadcast_declared_adapter_v1"
 LIVING_CANON_ADAPTER_VERSION = "living_canon_adapter_v1"
-OPEN_SIGNAL_ADAPTER_VERSION = "open_signal_adapter_v1"
+OPEN_SIGNAL_ADAPTER_VERSION = "open_signal_adapter_v3"
 WEBSITE_LORE_ADAPTER_VERSION = "website_lore_review_adapter_v1"
 LIVING_CANON_RECURRENCE_VERSION = "living_canon_recurrence_v1"
-PUBLIC_ASSESSMENT_EVIDENCE_VERSION = "public_assessment_evidence_v1"
+PUBLIC_ASSESSMENT_EVIDENCE_VERSION = "public_assessment_evidence_v3"
 ENTITY_ACCOUNT_BINDING_CONTRACT_VERSION = "canon_entity_account_binding_v1"
 
 
@@ -1221,7 +1221,24 @@ def adapt_open_signal_claim(row: Any) -> CanonAdapterResult:
     entry_id = _mapping_text(row, "entry_id", "source_ref")
     value = _mapping_text(row, "text", "value")
     occurrence_id = _mapping_text(row, "occurrence_identity")
-    if not subject_id or not entry_id or not value or not occurrence_id:
+    root_id = _mapping_text(row, "root_identity")
+    source_digest = _mapping_text(row, "source_digest")
+    point_identity = _mapping_text(row, "point_identity")
+    attribution_mode = _mapping_text(row, "attribution_mode")
+    polarity = _mapping_text(row, "polarity")
+    action_identity = _mapping_text(row, "action_identity")
+    if not (
+        subject_id
+        and entry_id
+        and value
+        and occurrence_id
+        and root_id
+        and source_digest
+        and point_identity
+        and attribution_mode
+        and polarity
+        and action_identity
+    ):
         return CanonAdapterResult(None, "open_signal_source_lineage_missing")
     if (
         _mapping_text(row, "assessment_contract_version")
@@ -1239,6 +1256,12 @@ def adapt_open_signal_claim(row: Any) -> CanonAdapterResult:
         not in {Visibility.PUBLIC.value, Visibility.PUBLIC_SAFE.value}
         or _mapping_text(row, "channel_policy").casefold()
         not in {"public_home", "public_context", "public_selective"}
+        or _mapping_text(row, "route_mode").casefold()
+        not in {"normal_chat", "conversation_continuity"}
+        or attribution_mode
+        not in {"subject_action", "authored_topic"}
+        or polarity
+        not in {"affirmative", "negative", "conditional"}
         or not strict_contract_bool(row.get("public_usable"))
         or not strict_contract_bool(row.get("subject_authored"))
         or not strict_contract_bool(row.get("selector_eligible"))
@@ -1249,14 +1272,15 @@ def adapt_open_signal_claim(row: Any) -> CanonAdapterResult:
     source_ref = (
         entry_id if entry_id.startswith("memory_ledger:") else "memory_ledger:%s" % entry_id
     )
-    predicate = _mapping_text(row, "predicate", "predicate_key") or "public_observation"
+    predicate = (
+        _mapping_text(row, "predicate", "predicate_key")
+        or "public_observation:%s" % action_identity
+    )
     claim_id = _stable_claim_id(
         "public_assessment_observation",
         source_ref,
     )
-    source_revision = (
-        _mapping_text(row, "source_digest", "observed_at") or entry_id
-    )
+    source_revision = source_digest
     claim = CanonClaim(
         claim_id=claim_id,
         revision_id="",
@@ -1270,7 +1294,7 @@ def adapt_open_signal_claim(row: Any) -> CanonAdapterResult:
         adapter_version=OPEN_SIGNAL_ADAPTER_VERSION,
         source_class=SourceClass.PUBLIC_OBSERVATION,
         source_refs=(source_ref,),
-        root_ids=(source_ref,),
+        root_ids=(root_id,),
         occurrence_ids=(occurrence_id,),
         visibility=Visibility.PUBLIC_SAFE,
         lifecycle=ClaimLifecycle.CANDIDATE,

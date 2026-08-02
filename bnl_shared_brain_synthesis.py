@@ -23,8 +23,17 @@ from bnl_memory_governance import (
     PERSONAL_RECALL_ROUTE_FAMILY,
     classify_personal_recall_intent,
 )
-from bnl_memory_ledger import subject_key_for_user
+from bnl_memory_ledger import (
+    public_assessment_candidate_core_text,
+    public_assessment_claim_compatible,
+    public_assessment_claim_restricted,
+    public_assessment_process_request,
+    public_assessment_semantics,
+    subject_key_for_user,
+)
+from bnl_profile_points import material_profile_point_map
 from bnl_unified_intelligence_packet import (
+    SCHEMA_VERSION as PACKET_SCHEMA_VERSION,
     UnifiedIntelligencePacket,
     mark_packet_application,
     revalidate_packet,
@@ -37,7 +46,7 @@ from bnl_unified_response_assessment import (
 )
 
 
-SCHEMA_VERSION = "shared_brain_synthesis_v5"
+SCHEMA_VERSION = "shared_brain_synthesis_v6"
 TABLE_NAME = "memory_governance_shared_brain_synthesis_runs"
 ENABLED_ENV = "BNL_SHARED_BRAIN_SYNTHESIS_CANARY_ENABLED"
 GUILD_IDS_ENV = "BNL_SHARED_BRAIN_SYNTHESIS_CANARY_GUILD_IDS"
@@ -79,6 +88,7 @@ _PROFILE_MEMBER_LANES = frozenset(
     {
         "approved_fact",
         "assessment_observation",
+        "conversation_context",
         "moment",
         "atomic_knowledge",
     }
@@ -254,12 +264,6 @@ _PROFILE_PROJECT_SCOPE_RE = re.compile(
     r"\b(?:barcode(?:\s+(?:network|radio))?|project|collective|broadcast)\b",
     re.I,
 )
-_PROFILE_PROCESS_REQUEST_RE = re.compile(
-    r"\b(?:how\s+(?:i|we|you)\s+work|"
-    r"make\s+decisions?|decision[-\s]?making|"
-    r"work\s+and\s+(?:make\s+)?decisions?)\b",
-    re.I,
-)
 _PROFILE_PROCESS_RESPONSE_DECISION_RE = re.compile(
     r"\b(?:choose|chooses|choosing|choice|decide|decides|deciding|"
     r"decision|decisions|prioriti[sz]e|prioriti[sz]es|priority|"
@@ -292,6 +296,10 @@ _REPAIRABLE_PROFILE_FAILURES = frozenset(
 _CLAIM_SPLIT_RE = re.compile(
     r"(?:[.!?;]+\s+|\n+|"
     r"\s+[—–]\s+|"
+    r",\s+(?=alongside\b)|"
+    r",\s+(?=and\s+(?![a-z][a-z'’–-]*ing\b)"
+    r"(?:[a-z][a-z'’–-]*\s+){1,6}"
+    r"(?:are|is|form|forms|become|becomes)\b)|"
     r",\s+(?=(?:but|yet|while|whereas|which|so|meaning|proving)\b)|"
     r",\s+(?=(?:making|showing)\s+"
     r"(?:you|your|it|this|that|those|these)\b)|"
@@ -313,6 +321,36 @@ _CLAIM_SPLIT_RE = re.compile(
     r"\s+(?=(?:because|although|though|even\s+though|since)\s+"
     r"(?:you|your|this|that|those|these)\b))",
     re.I,
+)
+_PUBLIC_OBSERVATION_SCOPE_RE = re.compile(
+    r"^\s*(?:from|based\s+on)\s+(?:your\s+public\s+"
+    r"(?:messages|activity|appearances)|the\s+public\s+"
+    r"(?:thread|record)|what\s+i(?:'ve|\s+have)?\s+"
+    r"(?:seen|noticed|observed))\s*[,;:—–-]\s*",
+    re.I,
+)
+_PUBLIC_OBSERVATION_REPORT_RE = re.compile(
+    r"^\s*i(?:'ve|\s+have)?\s+(?:noticed|observed|seen)\s+"
+    r"(?:that\s+)?",
+    re.I,
+)
+_PUBLIC_OBSERVATION_COMPOUND_ACTIONS = frozenset(
+    {
+        "adjust",
+        "ask",
+        "build",
+        "choose",
+        "discuss",
+        "evaluate",
+        "fix",
+        "learn",
+        "plan",
+        "return",
+        "share",
+        "suggest",
+        "test",
+        "write",
+    }
 )
 _OPINION_FRAME_RE = re.compile(
     r"\b(?:i\s+(?:think|believe|suspect|figure)|"
@@ -374,6 +412,7 @@ _CONCRETE_RELATION_ACTION_CANON = {
     "built": "build",
     "connect": "connect",
     "connected": "connect",
+    "connects": "connect",
     "connecting": "connect",
     "coordinate": "coordinate",
     "coordinated": "coordinate",
@@ -821,7 +860,7 @@ def broad_profile_request(text: str) -> bool:
 
 
 def _profile_process_request(text: str) -> bool:
-    return bool(_PROFILE_PROCESS_REQUEST_RE.search(str(text or "")))
+    return public_assessment_process_request(text)
 
 
 def _basis_profile_request_text(basis: SharedBrainSynthesisBasis) -> str:
@@ -1139,6 +1178,14 @@ def _item_evidence_text(item: Any) -> str:
     )
 
 
+def _item_point_group(item: Any) -> str:
+    return str(
+        getattr(item, "point_group_identity", "")
+        or getattr(item, "point_identity", "")
+        or ""
+    )
+
+
 def _semantic_terms(value: str) -> frozenset[str]:
     return frozenset(
         token
@@ -1160,24 +1207,32 @@ def _profile_required_detail_count(
         0,
         int(getattr(profile, "required_point_count", 0) or 0),
     )
+    material_points = material_profile_point_map(packet.items)
     if (
         _profile_process_request(packet.request.user_text)
         and len(
             {
-                item.point_identity
+                material_points.get(
+                    _item_point_group(item),
+                    _item_point_group(item),
+                )
                 for item in packet.items
-                if item.lane == "assessment_observation"
-                and item.point_identity
+                if item.lane
+                in {"assessment_observation", "conversation_context"}
+                and _item_point_group(item)
             }
         )
         >= required_points
     ):
         return 0
     supported_points = {
-        item.point_identity
+        material_points.get(
+            _item_point_group(item),
+            _item_point_group(item),
+        )
         for item in packet.items
         if item.lane in _PROFILE_MEMBER_LANES
-        and item.point_identity
+        and _item_point_group(item)
         and tuple(getattr(item, "supporting_observations", ()) or ())
     }
     return min(
@@ -1190,7 +1245,7 @@ def _profile_requires_canon(
     packet: UnifiedIntelligencePacket,
 ) -> bool:
     return bool(
-        _profile_recognized_canon_identity(packet)
+        _profile_has_recognized_canon_identity(packet)
         or (
             _PROFILE_PROJECT_SCOPE_RE.search(
                 str(packet.request.user_text or "")
@@ -1207,18 +1262,22 @@ def _profile_requires_canon(
 def _profile_recognized_canon_identity(
     packet: UnifiedIntelligencePacket,
 ) -> bool:
-    return bool(
-        str(
-            getattr(packet.profile_sufficiency, "status", "") or ""
-        ).strip().lower()
-        == "sparse"
-        and any(
-            item.lane == "canon"
-            and item.source_type == "recognized_canon_fact"
-            and item.subject_key
-            == subject_key_for_user(packet.request.subject_user_id)
-            for item in packet.items
-        )
+    """Content-free recognition diagnostic; never a wording exception."""
+
+    return _profile_has_recognized_canon_identity(packet)
+
+
+def _profile_has_recognized_canon_identity(
+    packet: UnifiedIntelligencePacket,
+) -> bool:
+    """Return recognition independently of sparse/rich profile status."""
+
+    return any(
+        item.lane == "canon"
+        and item.source_type == "recognized_canon_fact"
+        and item.subject_key
+        == subject_key_for_user(packet.request.subject_user_id)
+        for item in packet.items
     )
 
 
@@ -1339,21 +1398,23 @@ def render_packet_context(
     if _profile_process_request(packet.request.user_text):
         render_priority.update(
             {
-                "approved_fact": 0,
+                "conversation_context": 0,
                 "assessment_observation": 1,
-                "atomic_knowledge": 2,
-                "moment": 3,
-                "canon": 4,
+                "approved_fact": 2,
+                "atomic_knowledge": 3,
+                "moment": 4,
+                "canon": 5,
             }
         )
     elif _profile_requires_canon(packet):
         render_priority.update(
             {
-                "approved_fact": 0,
-                "atomic_knowledge": 1,
-                "assessment_observation": 2,
-                "moment": 3,
-                "canon": 4,
+                "conversation_context": 0,
+                "assessment_observation": 1,
+                "approved_fact": 2,
+                "atomic_knowledge": 3,
+                "moment": 4,
+                "canon": 5,
             }
         )
     ordered_items = tuple(
@@ -1466,9 +1527,11 @@ def render_packet_context(
     if profile_status == "rich":
         required_detail_count = _profile_required_detail_count(packet)
         profile_rule = (
-            "- This profile has sufficient durable support. Ground the answer "
-            "in at least two materially distinct member-specific points before "
-            "adding any BARCODE canon.\n"
+            "- This profile has sufficient independent member-specific "
+            "support. Ground the answer in at least two materially distinct "
+            "points before adding any BARCODE canon. Question-scoped public "
+            "observations remain non-durable even when independently "
+            "supported for this answer.\n"
             + (
                 "- Use a recognizable concrete detail from each of at least "
                 "%s distinct supported member points; do not flatten the "
@@ -1485,22 +1548,19 @@ def render_packet_context(
         )
     else:
         profile_rule = ""
-    recognized_identity = _profile_recognized_canon_identity(packet)
+    recognized_canon_present = _profile_has_recognized_canon_identity(packet)
     project_rule = (
-        "- A unique, historically stable same-platform name signal matches "
-        "one approved BARCODE identity. State that approved identity "
-        "directly, then give exactly one narrow public observation. Treat "
-        "the match as recognition for this response, never as a permanent "
-        "account merge or proof of private identity.\n"
-        if recognized_identity
-        else (
-            "- The request explicitly asks for BARCODE/project context. Use "
-            "one concise context anchor after the member assessment; canon "
-            "may clarify why the observed priorities fit BARCODE, but it "
-            "must not become the answer's organizing frame.\n"
-            if _profile_requires_canon(packet)
-            else ""
-        )
+        "- A stable approved BARCODE identity is available as additive "
+        "context. Ground the answer in the required member-specific points "
+        "first, then add one concise identity anchor; never treat recognition "
+        "as a permanent account merge or as personal interaction evidence.\n"
+        if recognized_canon_present
+        else "- The request explicitly asks for BARCODE/project context. Use "
+        "one concise context anchor after the member assessment; canon may "
+        "clarify why the observed priorities fit BARCODE, but it must not "
+        "become the answer's organizing frame.\n"
+        if _profile_requires_canon(packet)
+        else ""
     )
     request_angle_rule = (
         "- This request asks how the member works and makes decisions. State "
@@ -1517,15 +1577,9 @@ def render_packet_context(
         + "\nResponse rules:\n"
         "- Answer the current user naturally in BNL's established voice; do "
         "not recite this evidence as a database report.\n"
-        + (
-            "- Lead with the approved recognized identity, then immediately "
-            "ground the rest in the single selected public observation.\n"
-            if recognized_identity
-            else "- Lead with member-specific substance. Relevant BARCODE "
-            "canon may add one concise context anchor afterward, but can "
-            "never substitute for the public assessment or become its "
-            "governing frame.\n"
-        )
+        + "- Lead with member-specific substance. Relevant BARCODE canon may "
+        "add one concise context anchor afterward, but can never substitute "
+        "for the public assessment or become its governing frame.\n"
         + "- Look across the selected observations for a useful throughline. "
         "Separate what is directly known, what BNL has observed, and BNL's "
         "revisable opinion. Frame interpretation naturally as a read or "
@@ -1732,6 +1786,7 @@ def revalidate_basis(
         or basis.route_mode != _ROUTE_MODE
         or basis.channel_policy not in details["channel_policies"]
         or basis.packet.request.subject_user_id != basis.user_id
+        or basis.packet.schema_version != PACKET_SCHEMA_VERSION
         or basis.packet.request.guild_id != basis.guild_id
         or basis.packet.request.channel_id != basis.channel_id
         or basis.packet.request.route_mode != basis.route_mode
@@ -1958,11 +2013,7 @@ def build_profile_candidate_repair_prompt(
             "request. The claim audit below is controlling for the old draft."
         ),
         (
-            "Begin with the one approved recognized identity, then immediately "
-            "give the single concrete KEEP_SUPPORTED public observation. Do "
-            "not describe the match as a permanent account merge."
-            if basis.profile_recognized_canon_identity
-            else "Begin immediately with a concrete member-specific detail "
+            "Begin immediately with a concrete member-specific detail "
             "from a KEEP_SUPPORTED unit or evidence line. A creative "
             "assessment may share that opening sentence when it is explicitly "
             "tied to those details; do not begin with an unframed broad label."
@@ -1987,10 +2038,7 @@ def build_profile_candidate_repair_prompt(
             else "Keep every personal claim within the supported evidence."
         ),
         (
-            "Use the one approved recognized identity and exactly one public "
-            "observation; neither licenses a broader personality profile."
-            if basis.profile_recognized_canon_identity
-            else "After the member assessment, use one concise relevant "
+            "After the member assessment, use one concise relevant "
             "approved BARCODE canon point as context. Do not organize the "
             "answer around canon or let it displace public member evidence."
             if basis.profile_requires_canon
@@ -2275,13 +2323,161 @@ def _item_support_terms(item: Any) -> frozenset[str]:
     )
 
 
+def _nominal_public_history_process_match(item: Any, claim: str) -> bool:
+    """Bind a subject-scoped activity inventory without treating it as a read.
+
+    A nominal list such as "testing..., checking..., and revising... in your
+    public history" may accurately restate sourced actions while still failing
+    the later request-angle rule for a question about decision-making.  This
+    keeps evidence grounding and interpretive sufficiency as separate gates.
+    """
+
+    if (
+        str(getattr(item, "lane", "") or "")
+        not in {"assessment_observation", "conversation_context"}
+        or not re.search(r"\bin\s+your\s+public\s+history\b", claim, re.I)
+    ):
+        return False
+    claim_concepts = _process_assessment_concepts(claim)
+    source_concepts = _process_assessment_concepts(
+        _item_evidence_text(item)
+    )
+    return bool(claim_concepts.intersection(source_concepts))
+
+
+def _framed_public_process_observation_match(item: Any, claim: str) -> bool:
+    """Bind a cautious cross-observation process read to each source action."""
+
+    if (
+        str(getattr(item, "lane", "") or "")
+        not in {"assessment_observation", "conversation_context"}
+        or not _OPINION_FRAME_RE.search(str(claim or ""))
+        or not re.search(r"\b(?:you|your)\b", str(claim or ""), re.I)
+    ):
+        return False
+    return bool(
+        _process_assessment_concepts(claim).intersection(
+            _process_assessment_concepts(_item_evidence_text(item))
+        )
+    )
+
+
 def _profile_item_covered(
     item: Any,
     response_terms: frozenset[str],
     *,
+    claim_text: str = "",
     distinctive_terms: frozenset[str] | None = None,
     require_distinctive: bool = False,
 ) -> bool:
+    if item.lane in {"assessment_observation", "conversation_context"}:
+        attribution_mode = str(
+            getattr(item, "attribution_mode", "") or ""
+        )
+        polarity = str(getattr(item, "polarity", "") or "")
+        action_identity = str(
+            getattr(item, "action_identity", "") or ""
+        )
+        nominal_process_match = _nominal_public_history_process_match(
+            item,
+            claim_text,
+        ) or _framed_public_process_observation_match(item, claim_text)
+        if not (
+            claim_text
+            and (
+                nominal_process_match
+                or public_assessment_claim_compatible(
+                    attribution_mode=attribution_mode,
+                    polarity=polarity,
+                    action_identity=action_identity,
+                    claim=claim_text,
+                )
+            )
+        ):
+            return False
+        if nominal_process_match:
+            return True
+        claim_semantics = public_assessment_semantics(
+            claim_text,
+            candidate_claim=True,
+        )
+        source_topics = {
+            facet
+            for facet in tuple(getattr(item, "material_facets", ()) or ())
+            if str(facet).startswith("topic:")
+        }
+        claim_topics = {
+            facet
+            for facet in claim_semantics.material_facets
+            if str(facet).startswith("topic:")
+        }
+        source_relations = {
+            facet
+            for facet in tuple(getattr(item, "material_facets", ()) or ())
+            if str(facet).startswith("relation:")
+        }
+        claim_relations = {
+            facet
+            for facet in claim_semantics.material_facets
+            if str(facet).startswith("relation:")
+        }
+        source_entities = {
+            facet
+            for facet in tuple(getattr(item, "material_facets", ()) or ())
+            if str(facet).startswith("entity:")
+        }
+        claim_entities = {
+            facet
+            for facet in claim_semantics.material_facets
+            if str(facet).startswith("entity:")
+        }
+        source_details = {
+            facet
+            for facet in tuple(getattr(item, "material_facets", ()) or ())
+            if str(facet).startswith("detail:")
+        }
+        claim_details = {
+            facet
+            for facet in claim_semantics.material_facets
+            if str(facet).startswith("detail:")
+        }
+        source_temporal = {
+            facet
+            for facet in tuple(getattr(item, "material_facets", ()) or ())
+            if str(facet).startswith("temporal:")
+        }
+        claim_temporal = {
+            facet
+            for facet in claim_semantics.material_facets
+            if str(facet).startswith("temporal:")
+        }
+        source_frequency = {
+            facet
+            for facet in tuple(getattr(item, "material_facets", ()) or ())
+            if str(facet).startswith("frequency:")
+        }
+        claim_frequency = {
+            facet
+            for facet in claim_semantics.material_facets
+            if str(facet).startswith("frequency:")
+        }
+        if claim_relations and not claim_relations.issubset(source_relations):
+            return False
+        if claim_entities and not claim_entities.issubset(source_entities):
+            return False
+        if claim_details and not claim_details.issubset(source_details):
+            return False
+        if attribution_mode == "subject_action":
+            if source_temporal != claim_temporal:
+                return False
+            if claim_frequency and not claim_frequency.issubset(source_frequency):
+                return False
+            if source_frequency.intersection(
+                {"frequency:single", "frequency:intermittent"}
+            ) and source_frequency != claim_frequency:
+                return False
+        if source_topics:
+            return bool(claim_topics) and claim_topics.issubset(source_topics)
     item_terms = _item_profile_terms(item)
     if not item_terms:
         return False
@@ -2292,6 +2488,55 @@ def _profile_item_covered(
         return False
     required = 1 if len(item_terms) == 1 else 2
     return len(item_terms & response_terms) >= required
+
+
+def _framed_public_observation_clauses(claim: str) -> tuple[str, ...]:
+    """Split explicitly observed compound actions into provable clauses.
+
+    A model may naturally bind multiple first-person public observations under
+    one frame ("I noticed you fixed X and considered Y").  Validation must
+    prove each action independently; it must never let the first supported
+    predicate carry an unsupported second predicate.
+    """
+
+    original = str(claim or "").strip()
+    if not original:
+        return ()
+    body = _PUBLIC_OBSERVATION_SCOPE_RE.sub("", original, count=1)
+    scoped = body != original
+    reported_body = _PUBLIC_OBSERVATION_REPORT_RE.sub("", body, count=1)
+    reported = reported_body != body
+    body = reported_body.strip()
+    if not (scoped or reported) or not re.match(r"^you\b", body, re.I):
+        return (original,)
+
+    parts = re.split(r"\s+and\s+", body, flags=re.I)
+    if len(parts) < 2:
+        return (body,)
+    clauses: list[str] = []
+    current = str(parts[0] or "").strip()
+    for raw_tail in parts[1:]:
+        tail = str(raw_tail or "").strip()
+        if not tail:
+            continue
+        candidate = tail if re.match(r"^you\b", tail, re.I) else "you " + tail
+        semantics = public_assessment_semantics(
+            candidate,
+            candidate_claim=True,
+        )
+        if (
+            current
+            and semantics.attribution_mode == "subject_action"
+            and semantics.action_identity
+            in _PUBLIC_OBSERVATION_COMPOUND_ACTIONS
+        ):
+            clauses.append(current)
+            current = candidate
+        else:
+            current = (current + " and " + tail).strip()
+    if current:
+        clauses.append(current)
+    return tuple(clauses) or (body,)
 
 
 def _candidate_claim_units(response: str) -> tuple[str, ...]:
@@ -2319,13 +2564,13 @@ def _candidate_claim_units(response: str) -> tuple[str, ...]:
         for token, expression in protected_expressions.items():
             value = str(value or "").replace(token, expression)
         claim = re.sub(
-            r"^\s*(?:and|but|yet|while|whereas|which|so)\s+",
+            r"^\s*(?:alongside|and|but|yet|while|whereas|which|so)\s+",
             "",
             str(value or ""),
             flags=re.I,
         ).strip(" \t,.;:—–-")
         if claim:
-            units.append(claim)
+            units.extend(_framed_public_observation_clauses(claim))
     return tuple(units)
 
 
@@ -2393,6 +2638,8 @@ def _claim_is_connective(
     lowered = str(claim or "").strip().lower()
     if not lowered:
         return True
+    if re.search(r"\b(?:you|your)\b", lowered):
+        return False
     if re.fullmatch(
         r"(?:hey|hello|alright|okay|fair(?: enough)?|copy|exactly|"
         r"signal received|static approves|that tracks|i hear you)",
@@ -2425,9 +2672,13 @@ def _concrete_relation_action_terms(value: str) -> frozenset[str]:
 
 def _concrete_relation_name_terms(value: str) -> frozenset[str]:
     return frozenset(
-        name.lower()
-        for name in _INTERNAL_PROPER_NOUN_RE.findall(str(value or ""))
-        if name.lower() not in _CONCRETE_RELATION_GENERIC_NAMES
+        re.sub(r"(?:['’]s)$", "", name.lower())
+        for name in re.findall(r"\b[A-Z][\w'-]{2,}\b", str(value or ""))
+        if re.sub(r"(?:['’]s)$", "", name.lower())
+        not in (
+            _CONCRETE_RELATION_GENERIC_NAMES
+            | {"from", "in", "the", "this", "that", "you", "your"}
+        )
     )
 
 
@@ -2447,24 +2698,386 @@ def _item_evidence_segments(item: Any) -> tuple[str, ...]:
     )
 
 
-def _concrete_relation_grounded(
+_RELATION_TOKEN_SKIP = frozenset(
+    {
+        "a",
+        "an",
+        "and",
+        "also",
+        "are",
+        "as",
+        "be",
+        "been",
+        "being",
+        "can",
+        "could",
+        "did",
+        "do",
+        "does",
+        "had",
+        "has",
+        "have",
+        "is",
+        "may",
+        "might",
+        "must",
+        "not",
+        "should",
+        "the",
+        "to",
+        "was",
+        "were",
+        "will",
+        "would",
+        "you",
+        "your",
+    }
+)
+_TYPED_PREDICATE_GENERIC_TERMS = frozenset(
+    {
+        "approved",
+        "canon",
+        "conversation",
+        "fact",
+        "knowledge",
+        "member",
+        "observation",
+        "primary",
+        "public",
+        "recognized",
+        "typical",
+    }
+)
+
+
+def _relation_term_stem(value: str) -> str:
+    token = str(value or "").lower()
+    if token in _CONCRETE_RELATION_ACTION_CANON:
+        return _CONCRETE_RELATION_ACTION_CANON[token]
+    irregular = {
+        "bought": "buy",
+        "felt": "feel",
+        "found": "find",
+        "gave": "give",
+        "grown": "grow",
+        "grew": "grow",
+        "made": "make",
+        "ran": "run",
+        "said": "say",
+        "saw": "see",
+        "taught": "teach",
+        "told": "tell",
+        "took": "take",
+        "wrote": "write",
+    }
+    if token in irregular:
+        return irregular[token]
+    if len(token) > 5 and token.endswith("ies"):
+        return token[:-3] + "y"
+    for suffix in ("ing", "ed"):
+        if len(token) > len(suffix) + 3 and token.endswith(suffix):
+            stem = token[: -len(suffix)]
+            if len(stem) > 3 and stem[-1:] == stem[-2:-1]:
+                stem = stem[:-1]
+            return stem
+    if len(token) > 4 and token.endswith("s") and not token.endswith("ss"):
+        return token[:-1]
+    return token
+
+
+def _normalized_relation_terms(value: str) -> frozenset[str]:
+    return frozenset(
+        _relation_term_stem(token)
+        for token in _semantic_terms(str(value or ""))
+        if token not in _RELATION_TOKEN_SKIP and _relation_term_stem(token)
+    )
+
+
+def _direct_relation_action_terms(value: str) -> frozenset[str]:
+    actions = set(_concrete_relation_action_terms(value))
+    semantics = public_assessment_semantics(value, candidate_claim=True)
+    if semantics.attribution_mode == "subject_action" and semantics.action_identity:
+        actions.add(str(semantics.action_identity))
+    source_semantics = public_assessment_semantics(value)
+    if (
+        source_semantics.attribution_mode == "subject_action"
+        and source_semantics.action_identity
+    ):
+        actions.add(str(source_semantics.action_identity))
+    if re.search(
+        r"\b(?:you(?:\s+and\s+[A-Z][\w'-]*(?:\s+[A-Z][\w'-]*){0,2})?"
+        r"|[A-Z][\w'-]*(?:\s+[A-Z][\w'-]*){0,3})\s+"
+        r"(?:am|are|is|was|were)\b",
+        str(value or ""),
+    ):
+        return frozenset(action for action in actions if action)
+    lead = re.match(
+        r"^\s*(?:[A-Z][\w'-]*(?:\s+[A-Z][\w'-]*){0,3})\s+"
+        r"(?P<tail>[\s\S]{1,160})$",
+        str(value or ""),
+    )
+    if lead:
+        tail_tokens = re.findall(
+            r"[a-z][a-z'’-]{1,}",
+            lead.group("tail").lower(),
+        )
+        if tail_tokens and tail_tokens[0] in {"am", "are", "is", "was", "were"}:
+            return frozenset(action for action in actions if action)
+        for token in tail_tokens:
+            if token in _RELATION_TOKEN_SKIP or token.endswith("ly"):
+                continue
+            actions.add(_relation_term_stem(token))
+            break
+    return frozenset(action for action in actions if action)
+
+
+def _relation_polarity(value: str) -> str:
+    return (
+        "negative"
+        if re.search(
+            r"\b(?:never|no|not|cannot|can't|don't|doesn't|didn't|"
+            r"won't|wouldn't|shouldn't)\b",
+            str(value or ""),
+            re.I,
+        )
+        else "affirmative"
+    )
+
+
+def _copular_object_terms(value: str) -> frozenset[str]:
+    match = re.search(
+        r"\b(?:you(?:\s+and\s+[A-Z][\w'-]*(?:\s+[A-Z][\w'-]*){0,2})?"
+        r"|[A-Z][\w'-]*(?:\s+[A-Z][\w'-]*){0,3})\s+"
+        r"(?:am|are|is|was|were)\s+(?P<object>[\s\S]{1,160})$",
+        str(value or ""),
+    )
+    if not match:
+        return frozenset()
+    return (
+        _semantic_terms(match.group("object"))
+        - _PROFILE_GENERIC_TERMS
+        - _CLAIM_GENERIC_TERMS
+        - _concrete_relation_name_terms(value)
+        - {"own", "your"}
+    )
+
+
+def _typed_predicate_grounded(
+    claim: str,
+    claim_terms: frozenset[str],
+    item: Any,
+) -> bool:
+    lane = str(getattr(item, "lane", "") or "")
+    direct_requester = bool(re.search(r"\b(?:you|your)\b", claim, re.I))
+    if lane != "canon" and not direct_requester:
+        return False
+    predicate_terms = (
+        _normalized_relation_terms(
+            str(getattr(item, "predicate_key", "") or "").replace("_", " ")
+        )
+        - _TYPED_PREDICATE_GENERIC_TERMS
+    )
+    if not predicate_terms or not predicate_terms.issubset(claim_terms):
+        return False
+    names = _concrete_relation_name_terms(claim)
+    claim_relation_terms = _normalized_relation_terms(claim)
+    for segment in _item_evidence_segments(item):
+        segment_terms = _normalized_relation_terms(segment)
+        segment_names = _concrete_relation_name_terms(segment)
+        if lane == "canon" and not direct_requester:
+            if segment_names and (not names or not names.issubset(segment_names)):
+                continue
+        elif names and not names.issubset(segment_terms):
+            continue
+        if _relation_polarity(claim) != _relation_polarity(segment):
+            continue
+        label_terms = frozenset()
+        if ":" in segment:
+            label = segment.split(":", 1)[0]
+            if predicate_terms.intersection(_normalized_relation_terms(label)):
+                label_terms = _concrete_relation_name_terms(label)
+        value_terms = (
+            segment_terms
+            - predicate_terms
+            - _TYPED_PREDICATE_GENERIC_TERMS
+            - label_terms
+        )
+        claim_value_terms = (
+            claim_relation_terms
+            - predicate_terms
+            - _TYPED_PREDICATE_GENERIC_TERMS
+            - {"his", "their", "them", "they", "you", "your"}
+        )
+        if claim_value_terms and claim_value_terms.issubset(value_terms):
+            return True
+    return False
+
+
+def _item_predicate_grounded(
     claim: str,
     *,
-    evidence_items: Sequence[Any],
+    item: Any,
+    member_subject_keys: frozenset[str],
 ) -> bool:
-    """Prevent names and actions from being assembled across source lines."""
+    """Bind a claim's subject, predicate, and object to one evidence item."""
 
-    names = _concrete_relation_name_terms(claim)
-    actions = _concrete_relation_action_terms(claim)
-    if not names or not actions:
+    predicate_claim = public_assessment_candidate_core_text(claim) or claim
+    claim_terms = _semantic_terms(predicate_claim)
+    if not claim_terms:
+        return False
+    if (
+        str(getattr(item, "lane", "") or "")
+        in {"assessment_observation", "conversation_context"}
+        and str(getattr(item, "attribution_mode", "") or "")
+        == "authored_topic"
+        and _profile_item_covered(
+            item,
+            claim_terms,
+            claim_text=claim,
+        )
+    ):
         return True
-    for item in evidence_items:
+    if (
+        _nominal_public_history_process_match(item, claim)
+        or _framed_public_process_observation_match(item, claim)
+    ):
+        return True
+    direct_member_claim = bool(
+        re.search(r"\b(?:you|your)\b", predicate_claim, re.I)
+    )
+    item_subject = str(getattr(item, "subject_key", "") or "")
+    participant_keys = {
+        str(value or "")
+        for value in tuple(getattr(item, "participants", ()) or ())
+        if str(value or "")
+    }
+    if (
+        str(getattr(item, "lane", "") or "") == "canon"
+        and direct_member_claim
+        and item_subject not in member_subject_keys
+        and not participant_keys.intersection(member_subject_keys)
+    ):
+        return False
+    if (
+        str(getattr(item, "lane", "") or "") == "approved_fact"
+        and not direct_member_claim
+    ):
+        return False
+    if _typed_predicate_grounded(predicate_claim, claim_terms, item):
+        return True
+    if str(getattr(item, "lane", "") or "") == "canon":
+        claim_names = _concrete_relation_name_terms(predicate_claim)
+        claim_material = (
+            _normalized_relation_terms(predicate_claim)
+            - _PROFILE_GENERIC_TERMS
+            - _CLAIM_GENERIC_TERMS
+        )
         for segment in _item_evidence_segments(item):
-            segment_terms = _semantic_terms(segment)
-            if not names.issubset(segment_terms):
+            segment_names = _concrete_relation_name_terms(segment)
+            segment_material = (
+                _normalized_relation_terms(segment)
+                - _PROFILE_GENERIC_TERMS
+                - _CLAIM_GENERIC_TERMS
+            )
+            if (
+                claim_names
+                and claim_names.issubset(segment_names)
+                and claim_material.issubset(segment_material)
+                and _relation_polarity(predicate_claim)
+                == _relation_polarity(segment)
+            ):
+                return True
+
+    if str(getattr(item, "lane", "") or "") in {"approved_fact", "canon"}:
+        claim_names = _concrete_relation_name_terms(predicate_claim)
+        claim_material = (
+            _normalized_relation_terms(predicate_claim)
+            - _PROFILE_GENERIC_TERMS
+            - _CLAIM_GENERIC_TERMS
+            - {"his", "their", "them", "they", "you", "your"}
+        )
+        for segment in _item_evidence_segments(item):
+            segment_names = _concrete_relation_name_terms(segment)
+            if (
+                str(getattr(item, "lane", "") or "") == "canon"
+                and not direct_member_claim
+                and segment_names
+                and (not claim_names or not claim_names.issubset(segment_names))
+            ):
                 continue
-            if actions.intersection(
-                _concrete_relation_action_terms(segment)
+            segment_material = (
+                _normalized_relation_terms(segment)
+                - _PROFILE_GENERIC_TERMS
+                - _CLAIM_GENERIC_TERMS
+            )
+            if (
+                claim_material
+                and claim_material.issubset(segment_material)
+                and _relation_polarity(predicate_claim)
+                == _relation_polarity(segment)
+            ):
+                return True
+        return False
+
+    if (
+        str(getattr(item, "lane", "") or "") == "atomic_knowledge"
+        and str(getattr(item, "source_type", "") or "")
+        == "topic_or_motif"
+        and tuple(getattr(item, "supporting_observations", ()) or ())
+    ):
+        evidence_terms = frozenset().union(
+            *(
+                _semantic_terms(segment)
+                for segment in _item_evidence_segments(item)
+            )
+        )
+        names = _concrete_relation_name_terms(predicate_claim)
+        direct_action = re.search(
+            r"\byou\s+(?:(?:always|often|regularly)\s+)?"
+            r"(?:(?:keep|kept)\s+)?[a-z][a-z'’-]{2,}",
+            predicate_claim,
+            re.I,
+        )
+        recurrence_frame = re.search(
+            r"\b(?:keep|keeps|kept)\s+(?:return\w*|revisit\w*|"
+            r"show\w*)\b|\b(?:recurring|thread|throughline)\b",
+            claim,
+            re.I,
+        )
+        material_overlap = (
+            claim_terms
+            - _PROFILE_GENERIC_TERMS
+            - _CLAIM_GENERIC_TERMS
+        ).intersection(evidence_terms)
+        non_name_overlap = material_overlap - names
+        if (
+            (not direct_action or recurrence_frame)
+            and names.issubset(evidence_terms)
+            and len(non_name_overlap) >= 2
+        ):
+            return True
+
+    names = _concrete_relation_name_terms(predicate_claim)
+    claim_actions = _direct_relation_action_terms(predicate_claim)
+    copular_terms = _copular_object_terms(predicate_claim)
+    for segment in _item_evidence_segments(item):
+        segment_terms = _semantic_terms(segment)
+        if names and not names.issubset(segment_terms):
+            continue
+        if claim_actions:
+            segment_actions = _direct_relation_action_terms(segment)
+            if (
+                claim_actions.issubset(segment_actions)
+                and _relation_polarity(predicate_claim)
+                == _relation_polarity(segment)
+            ):
+                return True
+            continue
+        if copular_terms:
+            if (
+                copular_terms.issubset(segment_terms)
+                and _relation_polarity(predicate_claim)
+                == _relation_polarity(segment)
             ):
                 return True
     return False
@@ -2493,6 +3106,11 @@ def _classify_candidate_claims(
     unsupported = 0
     first_supported_member: bool | None = None
     has_member_basis = bool(supported_member_points)
+    member_subject_keys = frozenset(
+        str(getattr(item, "subject_key", "") or "")
+        for item in member_items
+        if str(getattr(item, "subject_key", "") or "")
+    )
     for claim in _candidate_claim_units(response):
         if _claim_is_transient_expression(claim):
             classifications.append("transient_expression")
@@ -2508,27 +3126,36 @@ def _classify_candidate_claims(
             )
             connective += 1
             continue
-        relation_grounded = _concrete_relation_grounded(
-            factual_claim,
-            evidence_items=(*member_items, *canon_items),
-        )
         member_hit = bool(
-            relation_grounded
-            and any(
-                _profile_item_covered(item, claim_terms)
+            any(
+                _item_predicate_grounded(
+                    factual_claim,
+                    item=item,
+                    member_subject_keys=member_subject_keys,
+                )
+                and
+                _profile_item_covered(
+                    item,
+                    claim_terms,
+                    claim_text=factual_claim,
+                )
                 for item in member_items
             )
         )
         canon_hit = bool(
-            relation_grounded
-            and any(
-                len(claim_terms & _semantic_terms(item.text)) >= 2
+            any(
+                _item_predicate_grounded(
+                    factual_claim,
+                    item=item,
+                    member_subject_keys=member_subject_keys,
+                )
+                and len(claim_terms & _semantic_terms(item.text)) >= 2
                 for item in canon_items
             )
         )
         if member_hit or canon_hit:
             if first_supported_member is None:
-                first_supported_member = bool(member_hit)
+                first_supported_member = bool(member_hit and not canon_hit)
             member_supported += int(member_hit)
             canon_supported += int(canon_hit)
             classifications.append(
@@ -2589,82 +3216,118 @@ def candidate_profile_coverage(
 ) -> CandidateProfileCoverage:
     if not _candidate_claim_units(response):
         return CandidateProfileCoverage()
-    response_terms = _semantic_terms(_factual_candidate_text(response))
+    claim_pairs = tuple(
+        (factual_claim, _semantic_terms(factual_claim))
+        for claim in _candidate_claim_units(response)
+        for factual_claim in (_strip_transient_expression_blocks(claim),)
+        if factual_claim and _semantic_terms(factual_claim)
+    )
     validation_items = tuple(
         getattr(basis.packet, "validation_items", ()) or basis.packet.items
     )
+    requester_subject_key = subject_key_for_user(basis.user_id)
     member_items = tuple(
         item
         for item in validation_items
         if item.lane in _PROFILE_MEMBER_LANES
-        and item.point_identity
+        and item.subject_key == requester_subject_key
+        and _item_point_group(item)
     )
+    member_subject_keys = frozenset(
+        str(getattr(item, "subject_key", "") or "")
+        for item in member_items
+        if str(getattr(item, "subject_key", "") or "")
+    )
+    material_point_map = material_profile_point_map(member_items)
+
+    def material_group(item: Any) -> str:
+        raw_group = _item_point_group(item)
+        return material_point_map.get(raw_group, raw_group)
+
     member_point_terms: dict[str, frozenset[str]] = {}
-    member_point_lanes: dict[str, frozenset[str]] = {}
     member_label_terms = frozenset().union(
         *(
             _semantic_terms(str(getattr(item, "text", "") or ""))
             for item in member_items
-            if item.lane != "assessment_observation"
+            if item.lane
+            not in {"assessment_observation", "conversation_context"}
         )
     )
-    for point_identity in {
-        item.point_identity for item in member_items
-    }:
-        member_point_terms[point_identity] = frozenset().union(
+    for point_group in {material_group(item) for item in member_items}:
+        member_point_terms[point_group] = frozenset().union(
             *(
-                _item_profile_terms(item)
+                (
+                    _semantic_terms(
+                        str(getattr(item, "text", "") or "")
+                    )
+                    - _PROFILE_GENERIC_TERMS
+                    - _PROFILE_SUPPORT_GENERIC_TERMS
+                )
                 for item in member_items
-                if item.point_identity == point_identity
+                if material_group(item) == point_group
             )
-        )
-        member_point_lanes[point_identity] = frozenset(
-            item.lane
-            for item in member_items
-            if item.point_identity == point_identity
         )
     require_distinctive = len(member_point_terms) > 1
 
     def distinctive_terms(item: Any) -> frozenset[str]:
-        item_is_assessment = item.lane == "assessment_observation"
+        item_group = material_group(item)
         other_terms = frozenset().union(
             *(
                 terms
-                for point_identity, terms in member_point_terms.items()
-                if point_identity != item.point_identity
-                and (
-                    (
-                        "assessment_observation"
-                        in member_point_lanes.get(
-                            point_identity,
-                            frozenset(),
-                        )
-                    )
-                    == item_is_assessment
-                )
+                for point_group, terms in member_point_terms.items()
+                if point_group != item_group
             )
         )
         return _item_profile_terms(item) - other_terms
 
+    def item_matches_claim(item: Any, claim: str, terms: frozenset[str]) -> bool:
+        return bool(
+            _item_predicate_grounded(
+                claim,
+                item=item,
+                member_subject_keys=member_subject_keys,
+            )
+            and _profile_item_covered(
+                item,
+                terms,
+                claim_text=claim,
+                distinctive_terms=distinctive_terms(item),
+                require_distinctive=require_distinctive,
+            )
+        )
+
     covered_items = tuple(
         item
         for item in validation_items
-        if response_terms & _semantic_terms(_item_evidence_text(item))
+        if (
+            item.lane not in _PROFILE_MEMBER_LANES
+            or item.subject_key == requester_subject_key
+        )
+        if any(
+            terms & _semantic_terms(_item_evidence_text(item))
+            and (
+                item.lane != "canon"
+                or _item_predicate_grounded(
+                    claim,
+                    item=item,
+                    member_subject_keys=member_subject_keys,
+                )
+            )
+            for claim, terms in claim_pairs
+        )
     )
     covered_member_items = tuple(
         item
         for item in member_items
-        if _profile_item_covered(
-            item,
-            response_terms,
-            distinctive_terms=distinctive_terms(item),
-            require_distinctive=require_distinctive,
+        if any(
+            item_matches_claim(item, claim, terms)
+            for claim, terms in claim_pairs
         )
     )
     covered_points = {
-        item.point_identity
+        material_group(item)
         for item in covered_member_items
-        if item.point_identity
+        if material_group(item)
     }
     covered_roots = {
         identity
@@ -2679,18 +3342,30 @@ def candidate_profile_coverage(
         if identity
     }
     covered_detail_points = {
-        item.point_identity
+        material_group(item)
         for item in covered_member_items
-        if item.point_identity
-        and response_terms.intersection(
-            _item_support_terms(item) - member_label_terms
+        if material_group(item)
+        and any(
+            item_matches_claim(item, claim, terms)
+            and terms.intersection(
+                _item_support_terms(item) - member_label_terms
+            )
+            for claim, terms in claim_pairs
         )
     }
     covered_canon = tuple(
         item
         for item in validation_items
         if item.lane == "canon"
-        and len(response_terms & _item_profile_terms(item)) >= 2
+        and any(
+            _item_predicate_grounded(
+                claim,
+                item=item,
+                member_subject_keys=member_subject_keys,
+            )
+            and len(terms & _item_profile_terms(item)) >= 2
+            for claim, terms in claim_pairs
+        )
     )
     canon_items = tuple(
         item for item in validation_items if item.lane == "canon"
@@ -2699,6 +3374,7 @@ def candidate_profile_coverage(
         item
         for item in validation_items
         if item.lane in _CLAIM_MEMBER_LANES
+        and item.subject_key == requester_subject_key
     )
     (
         claim_classifications,
@@ -2721,10 +3397,7 @@ def candidate_profile_coverage(
     lore_dominant = bool(
         canon_only_claims
         and (
-            (
-                not member_first
-                and not basis.profile_recognized_canon_identity
-            )
+            not member_first
             or canon_only_claims > member_supported_claims
         )
     )
@@ -2765,10 +3438,14 @@ def candidate_evidence_coverage(
 def _supported_profile_coverage_regressed(
     baseline: CandidateProfileCoverage,
     candidate: CandidateProfileCoverage,
+    *,
+    baseline_response: str = "",
+    candidate_response: str = "",
+    competing_factual_contexts: Sequence[str] = (),
 ) -> bool:
     """Return whether a candidate drops exact safe support used by baseline."""
 
-    return bool(
+    identity_regressed = bool(
         not set(baseline.covered_member_point_identities).issubset(
             candidate.covered_member_point_identities
         )
@@ -2779,6 +3456,26 @@ def _supported_profile_coverage_regressed(
             candidate.covered_canon_source_digests
         )
     )
+    if identity_regressed:
+        return True
+
+    baseline_terms = _semantic_terms(baseline_response)
+    candidate_terms = _semantic_terms(candidate_response)
+    for context in competing_factual_contexts:
+        context_terms = (
+            _semantic_terms(str(context or ""))
+            - _PROFILE_GENERIC_TERMS
+            - _PROFILE_SUPPORT_GENERIC_TERMS
+            - _CLAIM_GENERIC_TERMS
+        )
+        supported_terms = context_terms.intersection(baseline_terms)
+        required = 1 if len(context_terms) == 1 else 2
+        if (
+            len(supported_terms) >= required
+            and len(supported_terms.intersection(candidate_terms)) < required
+        ):
+            return True
+    return False
 
 
 def ensure_schema(conn: sqlite3.Connection) -> None:
@@ -3143,6 +3840,9 @@ def evaluate_candidate(
     supported_coverage_regressed = _supported_profile_coverage_regressed(
         baseline_coverage,
         profile_coverage,
+        baseline_response=baseline,
+        candidate_response=candidate,
+        competing_factual_contexts=run.basis.competing_factual_contexts,
     )
     evidence_coverage = profile_coverage.total_item_count
     output_leak = response_exposes_controls(candidate)

@@ -146,18 +146,14 @@ from bnl_shared_brain_synthesis import (
     begin_run as begin_shared_brain_synthesis_run,
     build_basis as build_shared_brain_synthesis_basis,
     build_packet_owned_prompt,
-    build_profile_candidate_cleanup_prompt,
-    build_profile_candidate_repair_prompt,
     configuration as shared_brain_synthesis_canary_configuration,
     ensure_schema as ensure_shared_brain_synthesis_schema,
     evaluate_candidate as evaluate_shared_brain_synthesis_candidate,
     finalize_run as finalize_shared_brain_synthesis_run,
     honest_empty_profile_response,
-    profile_candidate_repairable,
     record_fallback as record_shared_brain_synthesis_fallback,
     revalidate_basis as revalidate_shared_brain_synthesis_basis,
     route_scope_enabled as shared_brain_synthesis_route_scope_enabled,
-    salvage_profile_candidate_response,
 )
 from bnl_memory_preview import (
     MemoryPreviewEvaluation,
@@ -168,7 +164,6 @@ from bnl_memory_preview import (
     fallback_memory_preview,
     finalize_memory_preview,
     prepare_memory_preview,
-    reevaluate_memory_preview,
     render_content_free_diagnostics as render_memory_preview_diagnostics,
     snapshots_equivalent as memory_preview_snapshots_equivalent,
 )
@@ -697,6 +692,7 @@ REACTION_CHANCE = 0.22
 #   or protected_system behavior by their own Discord permission checks.
 
 ROUTE_MODE_NORMAL_CHAT = "normal_chat"
+ROUTE_MODE_CONVERSATION_CONTINUITY = "conversation_continuity"
 ROUTE_MODE_SIMPLE_GREETING = "simple_greeting"
 ROUTE_MODE_SHOW_STATUS = "show_status_answer"
 ROUTE_MODE_DIRECT_PAYLOAD = "direct_payload_task"
@@ -4951,6 +4947,7 @@ def init_db():
             guild_id INTEGER NOT NULL,
             channel_name TEXT,
             channel_policy TEXT,
+            route_mode TEXT NOT NULL DEFAULT 'unknown',
             role TEXT NOT NULL,
             content TEXT NOT NULL,
             timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
@@ -5012,6 +5009,11 @@ def init_db():
     _try_alter(cursor, "ALTER TABLE conversations ADD COLUMN channel_policy TEXT")
     _try_alter(cursor, "ALTER TABLE conversations ADD COLUMN channel_id INTEGER")
     _try_alter(cursor, "ALTER TABLE conversations ADD COLUMN message_id INTEGER")
+    _try_alter(
+        cursor,
+        "ALTER TABLE conversations ADD COLUMN route_mode TEXT NOT NULL "
+        "DEFAULT 'unknown'",
+    )
     cursor.execute(
         """
         CREATE TABLE IF NOT EXISTS conversation_history_backfill_cursors (
@@ -10567,22 +10569,38 @@ def insert_backfilled_conversation_row(*, guild_id: int, channel_id: int, channe
     conn = sqlite3.connect(DB_FILE)
     cur = conn.cursor()
     try:
+        insert_columns = [
+            "user_id",
+            "user_name",
+            "guild_id",
+            "channel_name",
+            "channel_policy",
+            "channel_id",
+        ]
+        insert_values = [
+            user_id,
+            user_name,
+            guild_id,
+            (channel_name or "").lower()[:80],
+            (channel_policy or "unknown")[:40],
+            int(channel_id or 0),
+        ]
         if "message_id" in cols:
-            cur.execute(
-                """
-                INSERT INTO conversations (user_id, user_name, guild_id, channel_name, channel_policy, channel_id, message_id, role, content, timestamp)
-                VALUES (?, ?, ?, ?, ?, ?, ?, 'user', ?, ?)
-                """,
-                (user_id, user_name, guild_id, (channel_name or "").lower()[:80], (channel_policy or "unknown")[:40], int(channel_id or 0), int(message_id or 0) or None, content, timestamp),
-            )
-        else:
-            cur.execute(
-                """
-                INSERT INTO conversations (user_id, user_name, guild_id, channel_name, channel_policy, channel_id, role, content, timestamp)
-                VALUES (?, ?, ?, ?, ?, ?, 'user', ?, ?)
-                """,
-                (user_id, user_name, guild_id, (channel_name or "").lower()[:80], (channel_policy or "unknown")[:40], int(channel_id or 0), content, timestamp),
-            )
+            insert_columns.append("message_id")
+            insert_values.append(int(message_id or 0) or None)
+        if "route_mode" in cols:
+            insert_columns.append("route_mode")
+            insert_values.append(ROUTE_MODE_CONVERSATION_CONTINUITY)
+        insert_columns.extend(("role", "content", "timestamp"))
+        insert_values.extend(("user", content, timestamp))
+        cur.execute(
+            "INSERT INTO conversations (%s) VALUES (%s)"
+            % (
+                ",".join(insert_columns),
+                ",".join("?" for _ in insert_columns),
+            ),
+            tuple(insert_values),
+        )
         row_id = int(cur.lastrowid or 0)
         conn.commit()
         _shadow_memory_ledger_write(
@@ -15393,17 +15411,39 @@ def save_user_message(user_id: int, user_name: str, guild_id: int, content: str,
         return decision
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
-    has_message_id = "message_id" in _conversations_columns()
-    if has_message_id:
-        cursor.execute(
-            "INSERT INTO conversations (user_id, user_name, guild_id, channel_name, channel_policy, channel_id, message_id, role, content) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (user_id, user_name, guild_id, (channel_name or "").lower()[:80], (channel_policy or "unknown")[:40], int(channel_id or 0), int(message_id or 0) or None, "user", content),
-        )
-    else:
-        cursor.execute(
-            "INSERT INTO conversations (user_id, user_name, guild_id, channel_name, channel_policy, channel_id, role, content) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (user_id, user_name, guild_id, (channel_name or "").lower()[:80], (channel_policy or "unknown")[:40], int(channel_id or 0), "user", content),
-        )
+    conversation_columns = _conversations_columns()
+    insert_columns = [
+        "user_id",
+        "user_name",
+        "guild_id",
+        "channel_name",
+        "channel_policy",
+        "channel_id",
+    ]
+    insert_values = [
+        user_id,
+        user_name,
+        guild_id,
+        (channel_name or "").lower()[:80],
+        (channel_policy or "unknown")[:40],
+        int(channel_id or 0),
+    ]
+    if "message_id" in conversation_columns:
+        insert_columns.append("message_id")
+        insert_values.append(int(message_id or 0) or None)
+    if "route_mode" in conversation_columns:
+        insert_columns.append("route_mode")
+        insert_values.append(str(route_mode or "unknown")[:80])
+    insert_columns.extend(("role", "content"))
+    insert_values.extend(("user", content))
+    cursor.execute(
+        "INSERT INTO conversations (%s) VALUES (%s)"
+        % (
+            ",".join(insert_columns),
+            ",".join("?" for _ in insert_columns),
+        ),
+        tuple(insert_values),
+    )
     row_id = int(cursor.lastrowid or 0)
     observed_at = cursor.execute("SELECT timestamp FROM conversations WHERE id=?", (row_id,)).fetchone()
     observed_at = observed_at[0] if observed_at else ""
@@ -15583,40 +15623,38 @@ def save_model_message(
             "PRAGMA table_info(conversations)"
         ).fetchall()
     }
+    insert_columns = [
+        "user_id",
+        "user_name",
+        "guild_id",
+        "channel_name",
+        "channel_policy",
+        "channel_id",
+    ]
+    insert_values = [
+        storage_user_id,
+        "BNL-01",
+        guild_id,
+        (channel_name or "").lower()[:80],
+        (channel_policy or "unknown")[:40],
+        int(channel_id or 0),
+    ]
     if "message_id" in conversation_columns:
-        cursor.execute(
-            "INSERT INTO conversations "
-            "(user_id,user_name,guild_id,channel_name,channel_policy,"
-            "channel_id,message_id,role,content) "
-            "VALUES (?,?,?,?,?,?,?,?,?)",
-            (
-                storage_user_id,
-                "BNL-01",
-                guild_id,
-                (channel_name or "").lower()[:80],
-                (channel_policy or "unknown")[:40],
-                int(channel_id or 0),
-                primary_message_id,
-                "model",
-                content,
-            ),
-        )
-    else:
-        cursor.execute(
-            "INSERT INTO conversations "
-            "(user_id,user_name,guild_id,channel_name,channel_policy,"
-            "channel_id,role,content) VALUES (?,?,?,?,?,?,?,?)",
-            (
-                storage_user_id,
-                "BNL-01",
-                guild_id,
-                (channel_name or "").lower()[:80],
-                (channel_policy or "unknown")[:40],
-                int(channel_id or 0),
-                "model",
-                content,
-            ),
-        )
+        insert_columns.append("message_id")
+        insert_values.append(primary_message_id)
+    if "route_mode" in conversation_columns:
+        insert_columns.append("route_mode")
+        insert_values.append(str(route_mode or "unknown")[:80])
+    insert_columns.extend(("role", "content"))
+    insert_values.extend(("model", content))
+    cursor.execute(
+        "INSERT INTO conversations (%s) VALUES (%s)"
+        % (
+            ",".join(insert_columns),
+            ",".join("?" for _ in insert_columns),
+        ),
+        tuple(insert_values),
+    )
     row_id = int(cursor.lastrowid or 0)
     link_table_exists = cursor.execute(
         """
@@ -30217,6 +30255,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                 batch_attribution_contract.third_party_attribution_requested
             ),
             prompt_source_bases=tuple(batch_prompt_source_bases),
+            regeneration_allowed=not batch_synthesis_candidate_active,
         )
         if (
             batch_synthesis_candidate_active
@@ -30225,42 +30264,11 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
             batch_fallback_reason = ""
             if guard_diagnostics.get("suppressed"):
                 batch_fallback_reason = "candidate_guard_suppressed"
-            else:
-                try:
-                    batch_synthesis_decision = await asyncio.to_thread(
-                        _evaluate_shared_brain_synthesis_receipt,
-                        batch_synthesis_decision.run,
-                        batch_baseline_response,
-                        response or "",
-                    )
-                    if (
-                        batch_synthesis_decision.candidate_selected
-                        and is_generic_non_answer_response(
-                            response or "",
-                            (
-                                collapsed_items[-1][0]
-                                if collapsed_items
-                                else ""
-                            ),
-                        )
-                    ):
-                        batch_fallback_reason = (
-                            "candidate_generic_non_answer"
-                        )
-                    elif not batch_synthesis_decision.candidate_selected:
-                        batch_fallback_reason = (
-                            batch_synthesis_decision.fallback_reason
-                            or "candidate_post_guard_rejected"
-                        )
-                except Exception as exc:
-                    logging.warning(
-                        "shared_brain_synthesis_batch_post_guard_failed "
-                        "error=%s",
-                        type(exc).__name__,
-                    )
-                    batch_fallback_reason = (
-                        "candidate_post_guard_evaluation_failed"
-                    )
+            elif (
+                batch_synthesis_execution is None
+                or response != batch_synthesis_execution.response
+            ):
+                batch_fallback_reason = "candidate_guard_modified_response"
             if batch_fallback_reason:
                 batch_synthesis_decision = (
                     await safely_fallback_shared_brain_synthesis(
@@ -30326,6 +30334,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                         prompt_source_bases=tuple(
                             batch_prompt_source_bases
                         ),
+                        regeneration_allowed=True,
                     )
                 )
         guard_triggered = bool(
@@ -30506,6 +30515,7 @@ async def _flush_channel_buffer(channel: discord.TextChannel, scheduler_wait_sta
                     prompt_source_bases=tuple(
                         batch_prompt_source_bases
                     ),
+                    regeneration_allowed=True,
                 )
             )
             if guard_diagnostics.get("suppressed"):
@@ -34224,135 +34234,6 @@ async def maybe_generate_shared_brain_synthesis_canary(
             candidate_generation_latency_ms,
         )
         if (
-            candidate_response
-            and not decision.candidate_selected
-            and profile_candidate_repairable(
-                decision.fallback_reason
-            )
-            and decision.fallback_reason
-            != "candidate_claims_ungrounded"
-        ):
-            repair_prompt = build_profile_candidate_repair_prompt(
-                candidate_prompt,
-                candidate_response,
-                basis=basis,
-                reason=decision.fallback_reason,
-            )
-            repair_started = time.monotonic()
-            try:
-                repaired_response = (
-                    await get_gemini_response_with_optional_typing(
-                        channel,
-                        repair_prompt,
-                        user_id,
-                        guild_id,
-                        route="shared_brain_synthesis_canary_repair",
-                        source_context_available=(
-                            source_context_available
-                        ),
-                    )
-                    or ""
-                ).strip()
-            except Exception as exc:
-                logging.warning(
-                    "shared_brain_synthesis_canary_repair_failed "
-                    "error=%s",
-                    type(exc).__name__,
-                )
-                repaired_response = ""
-            candidate_generation_latency_ms += max(
-                0,
-                int(
-                    round(
-                        (time.monotonic() - repair_started)
-                        * 1000
-                    )
-                ),
-            )
-            if repaired_response:
-                decision = await asyncio.to_thread(
-                    _evaluate_shared_brain_synthesis_receipt,
-                    run,
-                    baseline_response,
-                    repaired_response,
-                    candidate_generation_latency_ms,
-                )
-                candidate_response = repaired_response
-                candidate_prompt = repair_prompt
-        if (
-            candidate_response
-            and not decision.candidate_selected
-            and decision.fallback_reason
-            == "candidate_claims_ungrounded"
-        ):
-            cleanup_prompt = build_profile_candidate_cleanup_prompt(
-                packet_owned_prompt.prompt,
-                candidate_response,
-                basis=basis,
-                reason=decision.fallback_reason,
-            )
-            cleanup_started = time.monotonic()
-            try:
-                cleaned_response = (
-                    await get_gemini_response_with_optional_typing(
-                        channel,
-                        cleanup_prompt,
-                        user_id,
-                        guild_id,
-                        route="shared_brain_synthesis_canary_cleanup",
-                        source_context_available=source_context_available,
-                    )
-                    or ""
-                ).strip()
-            except Exception as exc:
-                logging.warning(
-                    "shared_brain_synthesis_canary_cleanup_failed error=%s",
-                    type(exc).__name__,
-                )
-                cleaned_response = ""
-            candidate_generation_latency_ms += max(
-                0,
-                int(
-                    round(
-                        (time.monotonic() - cleanup_started)
-                        * 1000
-                    )
-                ),
-            )
-            if cleaned_response:
-                decision = await asyncio.to_thread(
-                    _evaluate_shared_brain_synthesis_receipt,
-                    run,
-                    baseline_response,
-                    cleaned_response,
-                    candidate_generation_latency_ms,
-                )
-                candidate_response = cleaned_response
-                candidate_prompt = cleanup_prompt
-                if (
-                    not decision.candidate_selected
-                    and decision.fallback_reason
-                    == "candidate_claims_ungrounded"
-                ):
-                    salvaged_response = (
-                        salvage_profile_candidate_response(
-                            cleaned_response,
-                            basis=basis,
-                            reason=decision.fallback_reason,
-                        )
-                    )
-                    if salvaged_response:
-                        salvaged_decision = await asyncio.to_thread(
-                            _evaluate_shared_brain_synthesis_receipt,
-                            run,
-                            baseline_response,
-                            salvaged_response,
-                            candidate_generation_latency_ms,
-                        )
-                        decision = salvaged_decision
-                        if salvaged_decision.candidate_selected:
-                            candidate_response = salvaged_response
-        if (
             decision.candidate_selected
             and is_generic_non_answer_response(
                 candidate_response or "",
@@ -34543,6 +34424,8 @@ async def send_planned_conversation_response(
         selected_response: str,
         selected_prompt: str,
         selected_bases: tuple[PromptSourceBasis, ...],
+        *,
+        regeneration_allowed: bool,
     ):
         return await apply_guarded_response_regeneration(
             selected_response or "",
@@ -34573,6 +34456,7 @@ async def send_planned_conversation_response(
                 third_party_attribution_requested
             ),
             prompt_source_bases=selected_bases,
+            regeneration_allowed=regeneration_allowed,
         )
 
     archive_guard_triggered = bool(
@@ -34583,40 +34467,18 @@ async def send_planned_conversation_response(
         response or "",
         prompt,
         tuple(prompt_source_bases or ()),
+        regeneration_allowed=not synthesis_candidate_active,
     )
     canary_guard_fallback_triggered = False
     if synthesis_candidate_active and synthesis_decision is not None:
         fallback_reason = ""
         if guard_diagnostics.get("suppressed"):
             fallback_reason = "candidate_guard_suppressed"
-        else:
-            try:
-                synthesis_decision = await asyncio.to_thread(
-                    _evaluate_shared_brain_synthesis_receipt,
-                    synthesis_decision.run,
-                    baseline_response,
-                    response or "",
-                )
-                if (
-                    synthesis_decision.candidate_selected
-                    and is_generic_non_answer_response(
-                        response or "",
-                        getattr(message.author, "display_name", ""),
-                    )
-                ):
-                    fallback_reason = "candidate_generic_non_answer"
-                elif not synthesis_decision.candidate_selected:
-                    fallback_reason = (
-                        synthesis_decision.fallback_reason
-                        or "candidate_post_guard_rejected"
-                    )
-            except Exception as exc:
-                logging.warning(
-                    "shared_brain_synthesis_canary_post_guard_failed "
-                    "error=%s",
-                    type(exc).__name__,
-                )
-                fallback_reason = "candidate_post_guard_evaluation_failed"
+        elif (
+            synthesis_execution is None
+            or response != synthesis_execution.response
+        ):
+            fallback_reason = "candidate_guard_modified_response"
         if fallback_reason:
             synthesis_decision = (
                 await safely_fallback_shared_brain_synthesis(
@@ -34639,6 +34501,7 @@ async def send_planned_conversation_response(
                 response,
                 prompt,
                 prompt_source_bases,
+                regeneration_allowed=True,
             )
 
     if _abort_stale_direct_repair_generation(
@@ -34813,6 +34676,7 @@ async def send_planned_conversation_response(
             response,
             prompt,
             prompt_source_bases,
+            regeneration_allowed=True,
         )
         if guard_diagnostics.get("suppressed"):
             await safely_finalize_shared_brain_synthesis(
@@ -37618,8 +37482,8 @@ class BnlMemoryPreviewExecution:
     fallback_reason: str
     established_response: str = ""
     packet_candidate_response: str = ""
-    repair_response: str = ""
-    cleanup_response: str = ""
+    candidate_generation_attempts: int = 0
+    additional_candidate_attempts: str = "disabled"
     final_selection: str = "established_path"
     stale_reason: str = ""
     guard_suppression_reason: str = ""
@@ -37753,6 +37617,8 @@ async def execute_bnl_memory_preview(
     async def default_guard(
         response: str,
         prompt: str,
+        *,
+        regeneration_allowed: bool,
     ) -> tuple[str, dict]:
         # Preserve the production public-home policy and guard behavior without
         # exposing the real public channel to retry-time typing indicators or
@@ -37773,7 +37639,7 @@ async def execute_bnl_memory_preview(
             generation_route="bnl_memory_preview",
             channel=None,
             source_context_available=False,
-            regeneration_allowed=True,
+            regeneration_allowed=regeneration_allowed,
             conversation_continuity_required=False,
             exact_quote_requested=False,
             exact_quote_authority=None,
@@ -37782,7 +37648,20 @@ async def execute_bnl_memory_preview(
         )
 
     generate = generator or default_generator
-    run_guard = guard or default_guard
+
+    async def run_guard(
+        response: str,
+        prompt: str,
+        *,
+        regeneration_allowed: bool,
+    ) -> tuple[str, dict]:
+        if guard is not None:
+            return await guard(response, prompt)
+        return await default_guard(
+            response,
+            prompt,
+            regeneration_allowed=regeneration_allowed,
+        )
     initial: PreparedMemoryPreview | None = None
     fresh: PreparedMemoryPreview | None = None
     final_snapshot: PreparedMemoryPreview | None = None
@@ -37792,9 +37671,7 @@ async def execute_bnl_memory_preview(
     proposed_response = ""
     baseline_response = ""
     packet_candidate_response = ""
-    repair_response = ""
-    cleanup_response = ""
-    cleanup_salvage_applied = False
+    candidate_generation_attempts = 0
     try:
         initial = await asyncio.to_thread(
             prepare_memory_preview,
@@ -37854,6 +37731,7 @@ async def execute_bnl_memory_preview(
         )
         candidate_latency_ms = 0
         if initial.ready:
+            candidate_generation_attempts = 1
             candidate_started = time.monotonic()
             candidate_response = (
                 await generate(
@@ -37910,192 +37788,6 @@ async def execute_bnl_memory_preview(
                 ),
             )
 
-        if (
-            unchanged
-            and fresh.ready
-            and candidate_response
-            and not evaluation.candidate_selected
-            and profile_candidate_repairable(
-                evaluation.fallback_reason
-            )
-            and evaluation.fallback_reason
-            != "candidate_claims_ungrounded"
-        ):
-            repair_prompt = build_profile_candidate_repair_prompt(
-                fresh.packet_owned_prompt.prompt,
-                candidate_response,
-                basis=fresh.basis,
-                reason=evaluation.fallback_reason,
-            )
-            repair_started = time.monotonic()
-            repaired_response = (
-                await generate(
-                    repair_prompt,
-                    "bnl_memory_preview_candidate_repair",
-                )
-                or ""
-            ).strip()
-            repair_response = repaired_response
-            candidate_latency_ms += max(
-                0,
-                int(
-                    round(
-                        (time.monotonic() - repair_started)
-                        * 1000
-                    )
-                ),
-            )
-            repaired_fresh = await asyncio.to_thread(
-                prepare_memory_preview,
-                request,
-                baseline_prompt_builder=(
-                    build_bnl_memory_preview_established_prompt
-                ),
-            )
-            repair_unchanged, repair_stale_reason = (
-                memory_preview_snapshots_equivalent(
-                    fresh,
-                    repaired_fresh,
-                )
-            )
-            if repair_unchanged and repaired_response:
-                repaired_evaluation = await asyncio.to_thread(
-                    evaluate_memory_preview,
-                    repaired_fresh,
-                    baseline_response=baseline_response,
-                    candidate_response=repaired_response,
-                    candidate_generation_latency_ms=(
-                        candidate_latency_ms
-                    ),
-                )
-                fresh.close()
-                fresh = repaired_fresh
-                evaluation = repaired_evaluation
-                candidate_response = repaired_response
-                candidate_prompt = repair_prompt
-                stale_reason = ""
-            else:
-                repaired_fresh.close()
-                stale_reason = (
-                    repair_stale_reason
-                    if not repair_unchanged
-                    else stale_reason
-                )
-                if not repair_unchanged and evaluation.decision is not None:
-                    evaluation = await asyncio.to_thread(
-                        fallback_memory_preview,
-                        fresh,
-                        evaluation,
-                        reason="candidate_%s" % repair_stale_reason,
-                    )
-
-        if (
-            unchanged
-            and fresh.ready
-            and candidate_response
-            and not evaluation.candidate_selected
-            and evaluation.fallback_reason
-            == "candidate_claims_ungrounded"
-        ):
-            cleanup_prompt = build_profile_candidate_cleanup_prompt(
-                fresh.packet_owned_prompt.prompt,
-                candidate_response,
-                basis=fresh.basis,
-                reason=evaluation.fallback_reason,
-            )
-            cleanup_started = time.monotonic()
-            cleaned_response = (
-                await generate(
-                    cleanup_prompt,
-                    "bnl_memory_preview_candidate_cleanup",
-                )
-                or ""
-            ).strip()
-            cleanup_response = cleaned_response
-            candidate_latency_ms += max(
-                0,
-                int(
-                    round(
-                        (time.monotonic() - cleanup_started)
-                        * 1000
-                    )
-                ),
-            )
-            cleanup_fresh = await asyncio.to_thread(
-                prepare_memory_preview,
-                request,
-                baseline_prompt_builder=(
-                    build_bnl_memory_preview_established_prompt
-                ),
-            )
-            cleanup_unchanged, cleanup_stale_reason = (
-                memory_preview_snapshots_equivalent(
-                    fresh,
-                    cleanup_fresh,
-                )
-            )
-            if cleanup_unchanged and cleaned_response:
-                cleanup_evaluation = await asyncio.to_thread(
-                    evaluate_memory_preview,
-                    cleanup_fresh,
-                    baseline_response=baseline_response,
-                    candidate_response=cleaned_response,
-                    candidate_generation_latency_ms=(
-                        candidate_latency_ms
-                    ),
-                )
-                fresh.close()
-                fresh = cleanup_fresh
-                evaluation = cleanup_evaluation
-                candidate_response = cleaned_response
-                candidate_prompt = cleanup_prompt
-                stale_reason = ""
-                if (
-                    not cleanup_evaluation.candidate_selected
-                    and cleanup_evaluation.fallback_reason
-                    == "candidate_claims_ungrounded"
-                ):
-                    salvaged_response = (
-                        salvage_profile_candidate_response(
-                            cleaned_response,
-                            basis=fresh.basis,
-                            reason=cleanup_evaluation.fallback_reason,
-                        )
-                    )
-                    if salvaged_response:
-                        salvaged_evaluation = await asyncio.to_thread(
-                            evaluate_memory_preview,
-                            fresh,
-                            baseline_response=baseline_response,
-                            candidate_response=salvaged_response,
-                            candidate_generation_latency_ms=(
-                                candidate_latency_ms
-                            ),
-                        )
-                        evaluation = salvaged_evaluation
-                        if salvaged_evaluation.candidate_selected:
-                            candidate_response = salvaged_response
-                            cleanup_salvage_applied = True
-            else:
-                cleanup_fresh.close()
-                stale_reason = (
-                    cleanup_stale_reason
-                    if not cleanup_unchanged
-                    else stale_reason
-                )
-                if (
-                    not cleanup_unchanged
-                    and evaluation.decision is not None
-                ):
-                    evaluation = await asyncio.to_thread(
-                        fallback_memory_preview,
-                        fresh,
-                        evaluation,
-                        reason=(
-                            "candidate_%s" % cleanup_stale_reason
-                        ),
-                    )
-
         selected_prompt = (
             candidate_prompt
             if evaluation.candidate_selected and fresh.ready
@@ -38109,6 +37801,7 @@ async def execute_bnl_memory_preview(
         guarded_response, guard_diagnostics = await run_guard(
             selected_response,
             selected_prompt,
+            regeneration_allowed=not evaluation.candidate_selected,
         )
         guard_suppression_reason = str(
             guard_diagnostics.get("suppression_reason") or ""
@@ -38121,22 +37814,19 @@ async def execute_bnl_memory_preview(
                     evaluation,
                     reason="candidate_guard_suppressed",
                 )
-            else:
+            elif str(guarded_response or "").strip() != candidate_response:
                 evaluation = await asyncio.to_thread(
-                    reevaluate_memory_preview,
+                    fallback_memory_preview,
                     fresh,
                     evaluation,
-                    baseline_response=baseline_response,
-                    candidate_response=guarded_response,
+                    reason="candidate_guard_modified_response",
                 )
-                if not evaluation.candidate_selected:
-                    guard_suppression_reason = (
-                        evaluation.fallback_reason
-                    )
+                guard_suppression_reason = evaluation.fallback_reason
             if not evaluation.candidate_selected:
                 guarded_response, baseline_guard = await run_guard(
                     baseline_response,
                     fresh.request.baseline_prompt,
+                    regeneration_allowed=True,
                 )
                 guard_suppression_reason = str(
                     baseline_guard.get("suppression_reason")
@@ -38170,6 +37860,7 @@ async def execute_bnl_memory_preview(
                 guarded_response, baseline_guard = await run_guard(
                     baseline_response,
                     fresh.request.baseline_prompt,
+                    regeneration_allowed=True,
                 )
                 guard_suppression_reason = str(
                     baseline_guard.get("suppression_reason") or ""
@@ -38185,12 +37876,6 @@ async def execute_bnl_memory_preview(
             if not proposed_response
             else "honest_empty_profile_fallback"
             if used_honest_empty_fallback
-            else "cleanup_salvage"
-            if evaluation.candidate_selected and cleanup_salvage_applied
-            else "cleanup_attempt"
-            if evaluation.candidate_selected and cleanup_response
-            else "repair_attempt"
-            if evaluation.candidate_selected and repair_response
             else "packet_candidate"
             if evaluation.candidate_selected
             else "established_path"
@@ -38221,8 +37906,8 @@ async def execute_bnl_memory_preview(
             fallback_reason=evaluation.fallback_reason,
             established_response=baseline_response,
             packet_candidate_response=packet_candidate_response,
-            repair_response=repair_response,
-            cleanup_response=cleanup_response,
+            candidate_generation_attempts=candidate_generation_attempts,
+            additional_candidate_attempts="disabled",
             final_selection=final_selection,
             stale_reason=stale_reason,
             guard_suppression_reason=guard_suppression_reason,
@@ -38381,12 +38066,10 @@ async def bnl_memory_preview(
         "",
         "**Packet candidate**",
         execution.packet_candidate_response or "(not generated)",
-        "",
-        "**Grounded repair attempt**",
-        execution.repair_response or "(not needed)",
-        "",
-        "**Final constrained cleanup**",
-        execution.cleanup_response or "(not needed)",
+        f"- candidate_generation_attempts: "
+        f"`{execution.candidate_generation_attempts}`",
+        f"- additional_candidate_attempts: "
+        f"`{execution.additional_candidate_attempts}`",
         "",
         "**Final selected response**",
         proposed,

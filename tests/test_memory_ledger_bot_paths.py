@@ -11,6 +11,7 @@ os.environ.setdefault("DISCORD_BOT_TOKEN", "test-discord-token")
 import bnl01_bot
 import bnl_memory_ledger as ledger
 import bnl_moment_engine as moments
+import bnl_unified_intelligence_packet as packet
 
 
 class _Author:
@@ -67,6 +68,62 @@ class MemoryLedgerBotPathTests(unittest.TestCase):
 
     def enable(self):
         os.environ["BNL_MEMORY_LEDGER_SHADOW_ENABLED"] = "1"
+
+    def replace_conversations_with_legacy_schema(self):
+        """Install the last production shape that had no raw route column."""
+
+        with sqlite3.connect(bnl01_bot.DB_FILE) as conn:
+            conn.execute("DROP TABLE conversations")
+            conn.execute(
+                """
+                CREATE TABLE conversations (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL,
+                    user_name TEXT NOT NULL,
+                    guild_id INTEGER NOT NULL,
+                    channel_name TEXT,
+                    channel_policy TEXT,
+                    channel_id INTEGER,
+                    message_id INTEGER,
+                    role TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+            conn.commit()
+
+    def open_assessment_for_source_row(self, *, user_id, source_row_id):
+        subject_key = ledger.subject_key_for_user(user_id)
+        with sqlite3.connect(bnl01_bot.DB_FILE) as conn:
+            row = conn.execute(
+                """
+                SELECT entry_id
+                FROM memory_ledger_entries
+                WHERE guild_id=1 AND subject_key=?
+                  AND source_table='conversations' AND source_row_id=?
+                  AND source_role='user'
+                ORDER BY entry_id
+                """,
+                (subject_key, str(source_row_id)),
+            ).fetchone()
+            state = (
+                ledger.read_public_assessment_root_state(
+                    conn,
+                    entry_id=str(row[0]),
+                    guild_id=1,
+                    subject_key=subject_key,
+                )
+                if row
+                else None
+            )
+            selection = ledger.select_public_conversation_assessment_evidence(
+                conn,
+                guild_id=1,
+                subject_key=subject_key,
+                request_text="What am I all about?",
+            )
+        return state, selection
 
     def add_declared_broadcast_projection(
         self,
@@ -608,6 +665,384 @@ class MemoryLedgerBotPathTests(unittest.TestCase):
             bnl01_bot.save_user_message(42, "Crow", 1, "hello", channel_policy="public_home")
         self.assertEqual(self.rows("SELECT COUNT(*) FROM conversations")[0][0], 1)
         self.assertEqual(self.rows("SELECT outcome, reason_code FROM memory_ledger_shadow_receipts")[0], ("error", "shadow_exception"))
+
+    def test_legacy_schema_migration_defaults_route_unknown_and_stays_out_of_open(self):
+        self.replace_conversations_with_legacy_schema()
+        with sqlite3.connect(bnl01_bot.DB_FILE) as conn:
+            conn.execute(
+                """
+                INSERT INTO conversations(
+                    id,user_id,user_name,guild_id,channel_name,
+                    channel_policy,channel_id,message_id,role,content,timestamp
+                ) VALUES(1,42,'Crow',1,'barcode-bot','public_home',10,101,
+                         'user',?,?)
+                """,
+                (
+                    "I compare audio mixes before the final release.",
+                    "2026-08-01T12:00:00+00:00",
+                ),
+            )
+            conn.commit()
+
+        bnl01_bot.init_db()
+
+        self.assertIn(
+            "route_mode",
+            {
+                str(row[1])
+                for row in self.rows("PRAGMA table_info(conversations)")
+            },
+        )
+        self.assertEqual(
+            self.rows("SELECT route_mode FROM conversations WHERE id=1"),
+            [("unknown",)],
+        )
+        with sqlite3.connect(bnl01_bot.DB_FILE) as conn:
+            result = ledger.shadow_conversation_row(
+                conn,
+                row_id=1,
+                user_id=42,
+                user_name="Crow",
+                guild_id=1,
+                role="user",
+                content="I compare audio mixes before the final release.",
+                channel_name="barcode-bot",
+                channel_policy="public_home",
+                channel_id=10,
+                message_id=101,
+                route_mode="normal_chat",
+                observed_at="2026-08-01T12:00:00+00:00",
+                source_sequence=101,
+            )
+            conn.commit()
+        self.assertEqual(result.outcome, "inserted")
+
+        state, selection = self.open_assessment_for_source_row(
+            user_id=42,
+            source_row_id=1,
+        )
+        self.assertIsNone(state)
+        self.assertEqual(selection.items, ())
+
+    def test_real_save_persists_matching_normal_route_and_qualifies_open(self):
+        self.enable()
+
+        decision = bnl01_bot.save_user_message(
+            42,
+            "Crow",
+            1,
+            "I compare audio mixes before the final release.",
+            channel_name="barcode-bot",
+            channel_policy="public_home",
+            channel_id=10,
+            message_id=101,
+            route_mode=bnl01_bot.ROUTE_MODE_NORMAL_CHAT,
+        )
+
+        self.assertTrue(decision.save_conversation)
+        row_id, raw_route = self.rows(
+            "SELECT id,route_mode FROM conversations WHERE role='user'"
+        )[0]
+        self.assertEqual(raw_route, bnl01_bot.ROUTE_MODE_NORMAL_CHAT)
+        self.assertEqual(
+            self.rows(
+                "SELECT route_mode FROM memory_ledger_entries "
+                "WHERE source_table='conversations' AND source_row_id=?",
+                (str(row_id),),
+            ),
+            [(bnl01_bot.ROUTE_MODE_NORMAL_CHAT,)],
+        )
+
+        state, selection = self.open_assessment_for_source_row(
+            user_id=42,
+            source_row_id=row_id,
+        )
+        self.assertIsNotNone(state)
+        self.assertEqual(state.route_mode, bnl01_bot.ROUTE_MODE_NORMAL_CHAT)
+        self.assertEqual(
+            [item.entry_id for item in selection.items],
+            [state.entry_id],
+        )
+
+    def test_legacy_schema_exact_immutable_journal_receipt_qualifies_open(self):
+        self.replace_conversations_with_legacy_schema()
+        self.enable()
+
+        bnl01_bot.save_user_message(
+            42,
+            "Crow",
+            1,
+            "I compare audio mixes before the final release.",
+            channel_name="barcode-bot",
+            channel_policy="public_home",
+            channel_id=10,
+            message_id=101,
+            route_mode=bnl01_bot.ROUTE_MODE_NORMAL_CHAT,
+        )
+
+        self.assertNotIn(
+            "route_mode",
+            {
+                str(row[1])
+                for row in self.rows("PRAGMA table_info(conversations)")
+            },
+        )
+        state, selection = self.open_assessment_for_source_row(
+            user_id=42,
+            source_row_id=1,
+        )
+        self.assertIsNotNone(state)
+        self.assertEqual(state.route_mode, bnl01_bot.ROUTE_MODE_NORMAL_CHAT)
+        self.assertEqual(
+            [item.entry_id for item in selection.items],
+            [state.entry_id],
+        )
+        with sqlite3.connect(bnl01_bot.DB_FILE) as conn:
+            with self.assertRaises(sqlite3.IntegrityError):
+                conn.execute(
+                    "UPDATE bnl_journal_source_events SET metadata_json='{}'"
+                )
+
+    def test_legacy_schema_missing_journal_receipt_stays_out_of_open(self):
+        self.replace_conversations_with_legacy_schema()
+        self.enable()
+
+        with mock.patch.object(
+            bnl01_bot,
+            "record_journal_source_event",
+            side_effect=RuntimeError("journal unavailable"),
+        ):
+            bnl01_bot.save_user_message(
+                42,
+                "Crow",
+                1,
+                "I compare audio mixes before the final release.",
+                channel_name="barcode-bot",
+                channel_policy="public_home",
+                channel_id=10,
+                message_id=101,
+                route_mode=bnl01_bot.ROUTE_MODE_NORMAL_CHAT,
+            )
+
+        state, selection = self.open_assessment_for_source_row(
+            user_id=42,
+            source_row_id=1,
+        )
+        self.assertIsNone(state)
+        self.assertEqual(selection.items, ())
+
+    def test_legacy_schema_mismatched_journal_receipt_stays_out_of_open(self):
+        self.replace_conversations_with_legacy_schema()
+        self.enable()
+        real_record = bnl01_bot.record_journal_source_event
+
+        def record_with_wrong_row(db_path, **kwargs):
+            mismatched = dict(kwargs)
+            metadata = dict(mismatched.get("metadata") or {})
+            metadata["conversationRowId"] = int(
+                metadata.get("conversationRowId") or 0
+            ) + 1000
+            mismatched["metadata"] = metadata
+            return real_record(db_path, **mismatched)
+
+        with mock.patch.object(
+            bnl01_bot,
+            "record_journal_source_event",
+            side_effect=record_with_wrong_row,
+        ):
+            bnl01_bot.save_user_message(
+                42,
+                "Crow",
+                1,
+                "I compare audio mixes before the final release.",
+                channel_name="barcode-bot",
+                channel_policy="public_home",
+                channel_id=10,
+                message_id=101,
+                route_mode=bnl01_bot.ROUTE_MODE_NORMAL_CHAT,
+            )
+
+        self.assertEqual(
+            self.rows("SELECT COUNT(*) FROM bnl_journal_source_events"),
+            [(1,)],
+        )
+        state, selection = self.open_assessment_for_source_row(
+            user_id=42,
+            source_row_id=1,
+        )
+        self.assertIsNone(state)
+        self.assertEqual(selection.items, ())
+
+    def test_retained_repair_preserves_explicit_normal_but_not_unknown_legacy(self):
+        self.enable()
+        with sqlite3.connect(bnl01_bot.DB_FILE) as conn:
+            conn.executemany(
+                """
+                INSERT INTO conversations(
+                    id,user_id,user_name,guild_id,channel_name,
+                    channel_policy,channel_id,message_id,route_mode,
+                    role,content,timestamp
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    (
+                        1,
+                        42,
+                        "Crow",
+                        1,
+                        "barcode-bot",
+                        "public_home",
+                        10,
+                        101,
+                        "normal_chat",
+                        "user",
+                        "I compare audio mixes before the final release.",
+                        "2026-08-01T12:00:00+00:00",
+                    ),
+                    (
+                        2,
+                        43,
+                        "Legacy Member",
+                        1,
+                        "barcode-bot",
+                        "public_home",
+                        10,
+                        102,
+                        "unknown",
+                        "user",
+                        "I organize visual drafts before the archive release.",
+                        "2026-08-01T13:00:00+00:00",
+                    ),
+                ),
+            )
+            result = ledger.backfill_retained_conversation_ledger_entries(
+                conn,
+                environ={
+                    ledger.MEMORY_LEDGER_SHADOW_ENV: "true",
+                    ledger.CONVERSATION_MOTIF_FORMATION_ENV: "false",
+                },
+            )
+            conn.commit()
+
+        self.assertTrue(result["completed"])
+        self.assertEqual(
+            self.rows(
+                "SELECT source_row_id,route_mode FROM memory_ledger_entries "
+                "WHERE source_table='conversations' ORDER BY source_row_id"
+            ),
+            [
+                ("1", "normal_chat"),
+                ("2", "conversation_continuity"),
+            ],
+        )
+        normal_state, normal_selection = self.open_assessment_for_source_row(
+            user_id=42,
+            source_row_id=1,
+        )
+        legacy_state, legacy_selection = self.open_assessment_for_source_row(
+            user_id=43,
+            source_row_id=2,
+        )
+        self.assertIsNotNone(normal_state)
+        self.assertEqual(
+            [item.entry_id for item in normal_selection.items],
+            [normal_state.entry_id],
+        )
+        self.assertIsNone(legacy_state)
+        self.assertEqual(legacy_selection.items, ())
+
+    def test_backfill_continuity_enters_open_signal_through_bound_authority(self):
+        self.enable()
+
+        inserted = bnl01_bot.insert_backfilled_conversation_row(
+            guild_id=1,
+            channel_id=10,
+            channel_name="barcode-bot",
+            channel_policy="public_home",
+            user_id=42,
+            user_name="Crow",
+            content="I compare audio mixes before the final release.",
+            timestamp="2026-08-01T12:00:00+00:00",
+            message_id=101,
+        )
+
+        self.assertTrue(inserted)
+        self.assertEqual(
+            self.rows("SELECT route_mode FROM conversations"),
+            [(bnl01_bot.ROUTE_MODE_CONVERSATION_CONTINUITY,)],
+        )
+        self.assertEqual(
+            self.rows(
+                "SELECT route_mode FROM memory_ledger_entries "
+                "WHERE source_table='conversations'"
+            ),
+            [(bnl01_bot.ROUTE_MODE_CONVERSATION_CONTINUITY,)],
+        )
+        with sqlite3.connect(bnl01_bot.DB_FILE) as conn:
+            entry_id = self.rows(
+                "SELECT entry_id FROM memory_ledger_entries "
+                "WHERE source_table='conversations'"
+            )[0][0]
+            root_state = ledger.read_public_assessment_root_state(
+                conn,
+                entry_id=entry_id,
+                guild_id=1,
+                subject_key="discord_user:42",
+            )
+            selection = ledger.select_public_conversation_assessment_evidence(
+                conn,
+                guild_id=1,
+                subject_key="discord_user:42",
+                request_text="What am I all about?",
+            )
+            built = packet.build_packet(
+                conn,
+                packet.IntelligencePacketRequest(
+                    guild_id=1,
+                    subject_user_id=42,
+                    subject_display_name="Crow",
+                    route_mode="normal_chat",
+                    conversation_surface="mention_or_reply",
+                    channel_id=10,
+                    channel_name="barcode-bot",
+                    channel_policy="public_home",
+                    visibility_allowance="public_safe",
+                    user_text="What am I all about?",
+                    participant_user_ids=(42,),
+                    direct_state="direct",
+                    now="2026-08-01T12:01:00+00:00",
+                ),
+                persist=False,
+                environ={
+                    "BNL_UNIFIED_INTELLIGENCE_PACKET_SHADOW_ENABLED": "true",
+                    "BNL_MEMORY_LEDGER_SHADOW_ENABLED": "true",
+                    "BNL_MOMENT_ENGINE_SHADOW_ENABLED": "true",
+                    "BNL_MEMORY_GOVERNANCE_SHADOW_ENABLED": "true",
+                    "BNL_RELATIONSHIP_V2_SHADOW_ENABLED": "true",
+                    "BNL_MEMORY_GOVERNANCE_LIVE_ENABLED": "false",
+                    "BNL_RELATIONSHIP_V2_LIVE_ENABLED": "false",
+                    "BNL_ACTIVE_ENGAGEMENT_V2_LIVE_ENABLED": "false",
+                },
+            )
+            revalidation = packet.revalidate_packet(conn, built)
+        self.assertIsNotNone(root_state)
+        self.assertEqual(root_state.route_mode, "conversation_continuity")
+        self.assertEqual(len(selection.items), 1)
+        self.assertEqual(
+            selection.items[0].route_mode,
+            "conversation_continuity",
+        )
+        self.assertEqual(built.profile_sufficiency.status, "sparse")
+        self.assertEqual(built.request.route_mode, "normal_chat")
+        self.assertTrue(revalidation.valid)
+        self.assertTrue(
+            any(
+                item.lane == "assessment_observation"
+                and item.text
+                == "I compare audio mixes before the final release."
+                for item in built.items
+            )
+        )
 
     def test_model_send_after_delivery_subject_and_participants(self):
         self.enable()

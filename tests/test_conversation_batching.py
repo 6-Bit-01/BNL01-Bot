@@ -1373,6 +1373,18 @@ class ConversationBatchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
             fallback_reason="",
         )
         finalized = mock.AsyncMock(return_value=True)
+        guard = mock.AsyncMock(
+            side_effect=lambda response, **_kwargs: (
+                response,
+                {
+                    "suppressed": False,
+                    "scripted_mode_leak_guard_triggered": False,
+                    "source_grounding_guard_triggered": False,
+                    "regenerated_for_mode_leak": False,
+                },
+            )
+        )
+        evaluator = mock.Mock(return_value=final_decision)
 
         self._prime_flush(
             channel,
@@ -1387,6 +1399,11 @@ class ConversationBatchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
                 bnl01_bot,
                 "resolve_channel_policy",
                 return_value="public_home",
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "apply_guarded_response_regeneration",
+                new=guard,
             ),
             mock.patch.object(
                 bnl01_bot,
@@ -1424,7 +1441,7 @@ class ConversationBatchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
             mock.patch.object(
                 bnl01_bot,
                 "_evaluate_shared_brain_synthesis_receipt",
-                return_value=final_decision,
+                new=evaluator,
             ),
             mock.patch.object(
                 bnl01_bot,
@@ -1446,6 +1463,11 @@ class ConversationBatchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
 
         deterministic_governance.assert_not_called()
         synthesize.assert_awaited_once()
+        guard.assert_awaited_once()
+        self.assertFalse(
+            guard.await_args.kwargs["regeneration_allowed"]
+        )
+        evaluator.assert_not_called()
         self.assertEqual(channel.sent, [candidate])
         finalized.assert_awaited_once()
         self.assertTrue(finalized.await_args.kwargs["response_sent"])
@@ -1479,6 +1501,18 @@ class ConversationBatchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         )
         finalized = mock.AsyncMock(return_value=True)
         source_results = iter(("packet_source_changed", ""))
+        guard = mock.AsyncMock(
+            side_effect=lambda response, **_kwargs: (
+                response,
+                {
+                    "suppressed": False,
+                    "scripted_mode_leak_guard_triggered": False,
+                    "source_grounding_guard_triggered": False,
+                    "regenerated_for_mode_leak": False,
+                },
+            )
+        )
+        evaluator = mock.Mock(return_value=selected)
 
         self._prime_flush(
             channel,
@@ -1493,6 +1527,11 @@ class ConversationBatchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
                 bnl01_bot,
                 "resolve_channel_policy",
                 return_value="public_home",
+            ),
+            mock.patch.object(
+                bnl01_bot,
+                "apply_guarded_response_regeneration",
+                new=guard,
             ),
             mock.patch.object(
                 bnl01_bot,
@@ -1529,7 +1568,7 @@ class ConversationBatchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
             mock.patch.object(
                 bnl01_bot,
                 "_evaluate_shared_brain_synthesis_receipt",
-                return_value=selected,
+                new=evaluator,
             ),
             mock.patch.object(
                 bnl01_bot,
@@ -1555,6 +1594,14 @@ class ConversationBatchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
             await bnl01_bot._flush_channel_buffer(channel)
 
         self.assertEqual(channel.sent, [baseline])
+        self.assertEqual(guard.await_count, 2)
+        self.assertFalse(
+            guard.await_args_list[0].kwargs["regeneration_allowed"]
+        )
+        self.assertTrue(
+            guard.await_args_list[1].kwargs["regeneration_allowed"]
+        )
+        evaluator.assert_not_called()
         fall_back.assert_awaited_once()
         self.assertEqual(
             fall_back.await_args.args[1],

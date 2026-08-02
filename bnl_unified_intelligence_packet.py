@@ -9,7 +9,7 @@ separately from the route-safe factual support retained for validation.
 from __future__ import annotations
 
 from collections import Counter
-from dataclasses import asdict, dataclass, field, is_dataclass
+from dataclasses import asdict, dataclass, field, is_dataclass, replace
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -28,6 +28,7 @@ from bnl_canon_source_contract import (
     EntityAccountBinding,
     SourceClass,
     SubjectIdentity,
+    adapt_open_signal_claim,
     matching_canon_member_identities,
     normalize_canon_identity_label,
     resolve_entity_identity,
@@ -46,14 +47,19 @@ from bnl_memory_ledger import (
     knowledge_occurrence_identity,
     knowledge_root_identity,
     knowledge_source_root_identity,
+    public_assessment_process_request,
+    public_assessment_relevance_required,
+    public_assessment_semantics,
+    read_public_assessment_root_state,
     select_public_conversation_assessment_evidence,
     subject_key_for_user,
 )
 from bnl_moment_engine import select_public_participant_moment_gists
+from bnl_profile_points import material_profile_point_map
 from bnl_relationship_engine import shadow_packet_posture
 
 
-SCHEMA_VERSION = "unified_intelligence_packet_v3"
+SCHEMA_VERSION = "unified_intelligence_packet_v4"
 TABLE_NAME = "memory_governance_intelligence_packet_runs"
 SHADOW_ENV = "BNL_UNIFIED_INTELLIGENCE_PACKET_SHADOW_ENABLED"
 _SHADOW_PREREQUISITES = (
@@ -159,7 +165,7 @@ _PROFILE_DURABLE_MEMBER_EVIDENCE_LANES = frozenset(
 )
 _PROFILE_MEMBER_EVIDENCE_LANES = (
     _PROFILE_DURABLE_MEMBER_EVIDENCE_LANES
-    | {"assessment_observation"}
+    | {"assessment_observation", "conversation_context"}
 )
 _PROFILE_CANON_MATCH_LANES = (
     _PROFILE_MEMBER_EVIDENCE_LANES
@@ -167,7 +173,7 @@ _PROFILE_CANON_MATCH_LANES = (
 )
 _ROOT_COLLAPSE_MEMBER_LANES = (
     _PROFILE_DURABLE_MEMBER_EVIDENCE_LANES
-    | {"conversation_context"}
+    | {"assessment_observation", "conversation_context"}
 )
 _CANON_IDENTITY_MIN_STABLE_ROWS = 2
 _AUTOMATIC_CANON_SIGNAL_SUBJECT_KEYS = frozenset(
@@ -337,6 +343,11 @@ class IntelligencePacketItem:
     root_identities: tuple[str, ...] = ()
     occurrence_identities: tuple[str, ...] = ()
     point_identity: str = ""
+    point_group_identity: str = ""
+    attribution_mode: str = ""
+    polarity: str = ""
+    action_identity: str = ""
+    material_facets: tuple[str, ...] = ()
     supporting_observations: tuple[str, ...] = ()
 
 
@@ -650,7 +661,7 @@ def _explicit_canon_binding_signal(
         return _CanonIdentitySignal("ambiguous_account_binding")
     if resolution.status != "resolved" or resolution.subject is None:
         return _CanonIdentitySignal("invalid_account_binding")
-    if resolution.subject.key not in _AUTOMATIC_CANON_SIGNAL_SUBJECT_KEYS:
+    if resolution.subject.key not in _CANON_MEMBER_SUBJECT_KEYS:
         return _CanonIdentitySignal(
             "bound_non_signal_identity",
             subject=resolution.subject,
@@ -758,7 +769,7 @@ def _canon_identity_signal(
     history_rows = conn.execute(
         """
         SELECT entry_id,subject_display_name
-        FROM memory_ledger_entries
+        FROM memory_ledger_entries e
         WHERE guild_id=? AND subject_key=?
           AND source_table='conversations' AND source_role='user'
           AND channel_policy IN (
@@ -767,6 +778,13 @@ def _canon_identity_signal(
           AND visibility IN ('public','public_safe')
           AND public_usable=1 AND derived=0 AND projection=0
           AND lifecycle_status='active'
+          AND NOT EXISTS (
+            SELECT 1 FROM memory_ledger_lineage l
+            WHERE l.guild_id=e.guild_id AND l.target_entry_id=e.entry_id
+              AND l.lineage_type IN (
+                'correction_of','supersedes','retracts'
+              )
+          )
         ORDER BY observed_at DESC,source_sequence DESC,entry_id DESC
         LIMIT 256
         """,
@@ -889,6 +907,40 @@ def _conversation_root_metadata(
     )
 
 
+def _conversation_public_assessment_state(
+    conn: sqlite3.Connection,
+    *,
+    guild_id: int,
+    subject_key: str,
+    source_row_id: int,
+):
+    """Resolve one exact retained conversation to its governed Open state."""
+
+    rows = conn.execute(
+        """
+        SELECT entry_id
+        FROM main.memory_ledger_entries
+        WHERE guild_id=? AND subject_key=?
+          AND source_table='conversations' AND source_row_id=?
+          AND entry_type='observation' AND predicate_key='conversation'
+          AND source_role='user' AND lifecycle_status='active'
+        ORDER BY entry_id
+        """,
+        (int(guild_id or 0), str(subject_key or ""), str(source_row_id or 0)),
+    ).fetchall()
+    entry_ids = tuple(
+        str(row[0] or "") for row in rows if str(row[0] or "")
+    )
+    if len(entry_ids) != 1:
+        return None
+    return read_public_assessment_root_state(
+        conn,
+        entry_id=entry_ids[0],
+        guild_id=int(guild_id or 0),
+        subject_key=str(subject_key or ""),
+    )
+
+
 def _moment_root_metadata(
     conn: sqlite3.Connection,
     *,
@@ -937,12 +989,23 @@ def _profile_member_item(
     request: IntelligencePacketRequest,
     item: IntelligencePacketItem,
 ) -> bool:
-    return bool(
+    base = bool(
         item.lane in _PROFILE_MEMBER_EVIDENCE_LANES
         and item.subject_key == subject_key_for_user(request.subject_user_id)
         and item.point_identity
         and item.root_identities
         and item.occurrence_identities
+    )
+    if not base:
+        return False
+    if item.lane not in {"assessment_observation", "conversation_context"}:
+        return True
+    return bool(
+        item.point_group_identity
+        and item.attribution_mode in {"subject_action", "authored_topic"}
+        and item.polarity in {"affirmative", "negative", "conditional"}
+        and item.action_identity
+        and item.material_facets
     )
 
 
@@ -1014,9 +1077,19 @@ def _profile_canon_anchor(
     )
     if not canon_items:
         return None
+    umbrella_barcode_request = bool(
+        "barcode" in request_terms
+        and not request_terms.intersection(
+            {"radio", "broadcast", "show", "schedule", "website", "site"}
+        )
+    )
     return sorted(
         canon_items,
         key=lambda item: (
+            -int(
+                umbrella_barcode_request
+                and item.predicate_key == "origin"
+            ),
             -len(member_terms & _terms(item.text)),
             -len(request_terms & _terms(item.text)),
             -len(_terms(item.text)),
@@ -1188,7 +1261,9 @@ def _conversation_row(
 ) -> dict[str, Any]:
     columns = {
         str(row[1])
-        for row in conn.execute("PRAGMA table_info(conversations)").fetchall()
+        for row in conn.execute(
+            "PRAGMA main.table_info(conversations)"
+        ).fetchall()
     }
     required = {
         "id",
@@ -1207,7 +1282,7 @@ def _conversation_row(
         """
         SELECT id,guild_id,user_id,user_name,role,content,channel_id,
                channel_policy,timestamp
-        FROM conversations
+        FROM main.conversations
         WHERE id=?
         """,
         (int(source_id or 0),),
@@ -1298,15 +1373,51 @@ def _conversation_items(
                 subject_key=row_subject,
                 source_row_id=int(row.get("id") or 0),
             )
+            assessment_state = (
+                None
+                if evidence.current_turn
+                else _conversation_public_assessment_state(
+                    conn,
+                    guild_id=int(row.get("guild_id") or 0),
+                    subject_key=row_subject,
+                    source_row_id=int(row.get("id") or 0),
+                )
+            )
+            if assessment_state is not None:
+                roots = (assessment_state.root_identity,)
+                occurrences = (assessment_state.occurrence_identity,)
+            authoritative_text = (
+                assessment_state.text
+                if assessment_state is not None
+                else str(row.get("content") or "")
+            )
+            source_digest = (
+                assessment_state.source_digest
+                if assessment_state is not None
+                else _conversation_digest(row)
+            )
+            point_identity = (
+                assessment_state.semantics.point_identity
+                if assessment_state is not None
+                else _point_identity(
+                    subject_key=row_subject,
+                    predicate_key=(
+                        "current_intent"
+                        if evidence.current_turn
+                        else "conversation_context"
+                    ),
+                    text=authoritative_text,
+                )
+            )
             item = IntelligencePacketItem(
                 lane=lane,
                 source_class=SourceClass.PUBLIC_OBSERVATION.value,
                 source_type="conversation_row",
                 source_ref="conversation:%s" % int(row["id"]),
-                source_digest=_conversation_digest(row),
+                source_digest=source_digest,
                 subject_key=row_subject,
                 predicate_key="current_intent" if evidence.current_turn else "conversation_context",
-                text=str(row.get("content") or "")[:1200],
+                text=authoritative_text[:1200],
                 visibility=_visibility_for_policy(policy),
                 confidence=Confidence.HIGH.value,
                 lifecycle="current" if evidence.current_turn else "active",
@@ -1317,18 +1428,43 @@ def _conversation_items(
                 observed_at=str(row.get("timestamp") or ""),
                 usage="current_intent" if evidence.current_turn else "continuity",
                 score=100.0 if evidence.current_turn else 88.0,
-                revalidation_kind="conversation",
-                revalidation_key=str(int(row["id"])),
+                revalidation_kind=(
+                    "public_assessment"
+                    if assessment_state is not None
+                    else "conversation"
+                ),
+                revalidation_key=(
+                    assessment_state.entry_id
+                    if assessment_state is not None
+                    else str(int(row["id"]))
+                ),
                 root_identities=roots,
                 occurrence_identities=occurrences,
-                point_identity=_point_identity(
-                    subject_key=row_subject,
-                    predicate_key=(
-                        "current_intent"
-                        if evidence.current_turn
-                        else "conversation_context"
-                    ),
-                    text=str(row.get("content") or ""),
+                point_identity=point_identity,
+                point_group_identity=(
+                    assessment_state.semantics.point_identity
+                    if assessment_state is not None
+                    else ""
+                ),
+                attribution_mode=(
+                    assessment_state.semantics.attribution_mode
+                    if assessment_state is not None
+                    else ""
+                ),
+                polarity=(
+                    assessment_state.semantics.polarity
+                    if assessment_state is not None
+                    else ""
+                ),
+                action_identity=(
+                    assessment_state.semantics.action_identity
+                    if assessment_state is not None
+                    else ""
+                ),
+                material_facets=(
+                    assessment_state.semantics.material_facets
+                    if assessment_state is not None
+                    else ()
                 ),
             )
         else:
@@ -1396,9 +1532,16 @@ def _ledger_entry_digest(
             "entry_id",
             "guild_id",
             "subject_key",
+            "entry_type",
             "predicate_key",
             "normalized_value",
+            "source_table",
+            "source_row_id",
+            "source_revision",
+            "source_role",
             "source_class",
+            "source_sequence",
+            "channel_id",
             "route_mode",
             "channel_policy",
             "visibility",
@@ -1442,7 +1585,7 @@ def _ledger_entry_digest(
     return _digest("ledger", data, lineage, incoming)
 
 
-def _assessment_observation_items(
+def _assessment_observation_items_in_snapshot(
     conn: sqlite3.Connection,
     request: IntelligencePacketRequest,
     diagnostics: IntelligencePacketDiagnostics,
@@ -1475,17 +1618,87 @@ def _assessment_observation_items(
         ] = not_selected
 
     items: list[IntelligencePacketItem] = []
+    relevance_required = public_assessment_relevance_required(
+        request.user_text
+    )
     for evidence in selection.items:
         entry_id = str(evidence.entry_id or "")
-        source_digest = _ledger_entry_digest(conn, entry_id)
-        root = knowledge_root_identity(conn, entry_id)
-        occurrence = str(evidence.occurrence_identity or "")
-        if not source_digest or not root or not occurrence:
+        state = read_public_assessment_root_state(
+            conn,
+            entry_id=entry_id,
+            guild_id=int(request.guild_id or 0),
+            subject_key=subject,
+        )
+        if not entry_id or state is None:
             _add_exclusion(
                 diagnostics,
                 exclusions,
                 lane="assessment_observation",
-                reason="assessment_source_unversioned",
+                reason="assessment_selector_source_mismatch",
+                source_class=SourceClass.PUBLIC_OBSERVATION.value,
+            )
+            continue
+        adapted = adapt_open_signal_claim(evidence)
+        adapted_claim = adapted.claim
+        expected_source_ref = "memory_ledger:%s" % entry_id
+        if not (
+            adapted_claim is not None
+            and adapted_claim.subject_id == subject
+            and adapted_claim.source_refs == (expected_source_ref,)
+            and adapted_claim.root_ids == (state.root_identity,)
+            and adapted_claim.occurrence_ids
+            == (state.occurrence_identity,)
+        ):
+            _add_exclusion(
+                diagnostics,
+                exclusions,
+                lane="assessment_observation",
+                reason=(
+                    "assessment_selector_%s" % str(adapted.reason or "invalid")
+                ),
+                source_class=SourceClass.PUBLIC_OBSERVATION.value,
+            )
+            continue
+        if relevance_required and not bool(evidence.request_relevant):
+            _add_exclusion(
+                diagnostics,
+                exclusions,
+                lane="assessment_observation",
+                reason="assessment_question_irrelevant",
+                source_class=SourceClass.PUBLIC_OBSERVATION.value,
+            )
+            continue
+        if not (
+            state.text == str(evidence.text or "")
+            and state.observed_at == str(evidence.observed_at or "")
+            and state.channel_policy == str(evidence.channel_policy or "")
+            and state.route_mode == str(evidence.route_mode or "")
+            and state.source_role == str(evidence.source_role or "")
+            and state.source_class == str(evidence.source_class or "")
+            and state.visibility == str(evidence.visibility or "")
+            and state.public_usable == bool(evidence.public_usable)
+            and state.derived == bool(evidence.derived)
+            and state.projection == bool(evidence.projection)
+            and state.lifecycle_status == str(evidence.lifecycle_status or "")
+            and state.root_identity == str(evidence.root_identity or "")
+            and state.occurrence_identity
+            == str(evidence.occurrence_identity or "")
+            and state.source_digest == str(evidence.source_digest or "")
+            and state.semantics.point_identity
+            == str(evidence.point_identity or "")
+            and state.semantics.attribution_mode
+            == str(evidence.attribution_mode or "")
+            and state.semantics.polarity == str(evidence.polarity or "")
+            and state.semantics.action_identity
+            == str(evidence.action_identity or "")
+            and state.semantics.material_facets
+            == tuple(evidence.material_facets)
+        ):
+            _add_exclusion(
+                diagnostics,
+                exclusions,
+                lane="assessment_observation",
+                reason="assessment_selector_source_mismatch",
                 source_class=SourceClass.PUBLIC_OBSERVATION.value,
             )
             continue
@@ -1494,34 +1707,35 @@ def _assessment_observation_items(
             source_class=SourceClass.PUBLIC_OBSERVATION.value,
             source_type="public_assessment_observation",
             source_ref="ledger:%s" % entry_id,
-            source_digest=source_digest,
+            source_digest=state.source_digest,
             subject_key=subject,
             predicate_key="public_assessment_observation",
-            text=str(evidence.text or "")[:240],
-            visibility=str(evidence.visibility or "unknown"),
-            confidence=Confidence.HIGH.value,
+            text=state.text[:240],
+            visibility=state.visibility,
+            confidence=adapted_claim.confidence.value,
             lifecycle="active",
             authority=_AUTHORITY_RANK[
                 SourceClass.PUBLIC_OBSERVATION.value
             ],
             participants=(subject,),
             lineage=(entry_id,),
-            observed_at=str(evidence.observed_at or ""),
+            observed_at=state.observed_at,
             usage="assessment_only",
             score=(
                 92.0
                 + min(24.0, float(evidence.score or 0.0))
                 + (12.0 if evidence.request_relevant else 0.0)
             ),
-            revalidation_kind="ledger",
+            revalidation_kind="public_assessment",
             revalidation_key=entry_id,
-            root_identities=(root,),
-            occurrence_identities=(occurrence,),
-            point_identity=_point_identity(
-                subject_key=subject,
-                predicate_key="public_assessment_observation",
-                text=str(evidence.text or ""),
-            ),
+            root_identities=(state.root_identity,),
+            occurrence_identities=(state.occurrence_identity,),
+            point_identity=state.semantics.point_identity,
+            point_group_identity=state.semantics.point_identity,
+            attribution_mode=state.semantics.attribution_mode,
+            polarity=state.semantics.polarity,
+            action_identity=state.semantics.action_identity,
+            material_facets=state.semantics.material_facets,
         )
         if not _route_allows_item(request, item):
             diagnostics.visibility_exclusions += 1
@@ -1535,6 +1749,35 @@ def _assessment_observation_items(
             continue
         items.append(item)
     return items
+
+
+def _assessment_observation_items(
+    conn: sqlite3.Connection,
+    request: IntelligencePacketRequest,
+    diagnostics: IntelligencePacketDiagnostics,
+    exclusions: list[IntelligencePacketExclusion],
+    *,
+    broad: bool,
+) -> list[IntelligencePacketItem]:
+    """Read selector DTOs and their source rows in one coherent snapshot."""
+
+    owns_snapshot = not conn.in_transaction
+    if owns_snapshot:
+        conn.execute("BEGIN")
+    try:
+        return _assessment_observation_items_in_snapshot(
+            conn,
+            request,
+            diagnostics,
+            exclusions,
+            broad=broad,
+        )
+    finally:
+        if owns_snapshot and conn.in_transaction:
+            # This owner performs no writes. Rollback ends the read snapshot
+            # without committing unrelated work that a future caller might
+            # accidentally add here.
+            conn.rollback()
 
 
 def _governed_items(
@@ -2750,6 +2993,34 @@ def _select_items(
         diagnostics,
         exclusions,
     )
+    ephemeral_member_items = tuple(
+        item
+        for item in candidates
+        if item.lane in {"assessment_observation", "conversation_context"}
+        and _profile_member_item(request, item)
+    )
+    if ephemeral_member_items:
+        enriched_candidates: list[IntelligencePacketItem] = []
+        for item in candidates:
+            if item.lane == "atomic_knowledge" and item.source_type == "topic_or_motif":
+                item_roots = set(item.root_identities)
+                exact_support = tuple(
+                    candidate.text
+                    for candidate in ephemeral_member_items
+                    if set(candidate.root_identities)
+                    and set(candidate.root_identities).issubset(item_roots)
+                )
+                if exact_support:
+                    item = replace(
+                        item,
+                        supporting_observations=tuple(
+                            dict.fromkeys(
+                                (*item.supporting_observations, *exact_support)
+                            )
+                        )[:_ATOMIC_SUPPORT_POOL_MAX_ITEMS],
+                    )
+            enriched_candidates.append(item)
+        candidates = enriched_candidates
     canon_anchor = _profile_canon_anchor(request, candidates)
     subject_key = subject_key_for_user(request.subject_user_id)
     recognized_canon_signal = any(
@@ -2758,33 +3029,37 @@ def _select_items(
         and item.subject_key == subject_key
         for item in candidates
     )
-    durable_member_candidate = any(
-        item.lane in _PROFILE_DURABLE_MEMBER_EVIDENCE_LANES
-        and item.subject_key == subject_key
-        and item.point_identity
-        and item.root_identities
-        and item.occurrence_identities
-        for item in candidates
-    )
     profile_candidates: list[IntelligencePacketItem] = []
     broad_lane_priority = {
         "current_intent": 0,
         "approved_fact": 1,
-        "atomic_knowledge": 3,
-        "conversation_context": 4,
-        "assessment_observation": 5,
-        "moment": 6,
-        "open_loop": 7,
+        "atomic_knowledge": 2,
+        "conversation_context": 3,
+        "assessment_observation": 4,
+        "moment": 5,
+        "open_loop": 6,
         "canon": 8,
         "source_file": 9,
         "relationship_posture": 10,
     }
+    if broad and public_assessment_process_request(request.user_text):
+        broad_lane_priority.update(
+            {
+                "current_intent": 0,
+                "conversation_context": 1,
+                "assessment_observation": 2,
+                "approved_fact": 3,
+                "atomic_knowledge": 4,
+                "moment": 5,
+                "open_loop": 6,
+            }
+        )
     ordered = sorted(
         candidates,
         key=lambda item: (
             (
                 (
-                    2
+                    7
                     if item is canon_anchor
                     else broad_lane_priority.get(item.lane, 10)
                 )
@@ -2800,6 +3075,7 @@ def _select_items(
     selected: list[IntelligencePacketItem] = []
     seen_text: set[str] = set()
     seen_profile_roots: set[str] = set()
+    seen_context_roots: set[str] = set()
     selected_root_items: list[IntelligencePacketItem] = []
     lane_counts: Counter[str] = Counter()
     used = 0
@@ -2807,13 +3083,29 @@ def _select_items(
     lane_caps = dict(
         _BROAD_PROFILE_LANE_CAPS if broad else _LANE_CAPS
     )
-    if broad and recognized_canon_signal and not durable_member_candidate:
-        # One stable canon-name signal may unlock one cautious historical
-        # example. It must never turn several isolated examples into a rich
-        # or durable personality profile.
-        lane_caps["assessment_observation"] = 1
     for item in ordered:
+        # Keep all valid member evidence for sufficiency and response
+        # validation before collapsing duplicate renderings of one source.
+        if (
+            item.lane in {"assessment_observation", "conversation_context"}
+            and _profile_member_item(request, item)
+        ):
+            profile_candidates.append(item)
         item_roots = set(item.root_identities)
+        if (
+            broad
+            and item.lane == "assessment_observation"
+            and item_roots.intersection(seen_context_roots)
+        ):
+            diagnostics.root_collapse_suppression += 1
+            _add_exclusion(
+                diagnostics,
+                exclusions,
+                lane=item.lane,
+                reason="same_root_conversation_context",
+                source_class=item.source_class,
+            )
+            continue
         if broad and _root_bearing_member_item(request, item) and item_roots:
             root_overlap = item_roots.intersection(seen_profile_roots)
             same_root_projection = any(
@@ -2842,8 +3134,6 @@ def _select_items(
                 continue
             if root_overlap:
                 diagnostics.shared_root_projection_count += 1
-        if _profile_member_item(request, item):
-            profile_candidates.append(item)
         normalized = re.sub(r"\W+", " ", item.text.lower()).strip()
         if normalized and normalized in seen_text:
             diagnostics.duplicate_suppression += 1
@@ -2855,6 +3145,11 @@ def _select_items(
                 source_class=item.source_class,
             )
             continue
+        if (
+            item.lane not in {"assessment_observation", "conversation_context"}
+            and _profile_member_item(request, item)
+        ):
+            profile_candidates.append(item)
         if lane_counts[item.lane] >= lane_caps.get(item.lane, 2):
             _add_exclusion(
                 diagnostics,
@@ -2883,6 +3178,8 @@ def _select_items(
         if broad and _root_bearing_member_item(request, item):
             seen_profile_roots.update(item_roots)
             selected_root_items.append(item)
+        if broad and item.lane == "conversation_context":
+            seen_context_roots.update(item_roots)
         if normalized:
             seen_text.add(normalized)
         lane_counts[item.lane] += 1
@@ -2970,18 +3267,66 @@ def _profile_sufficiency(
             satisfied=True,
             reason_codes=("not_broad_profile",),
         )
-    durable_candidate_items = tuple(
+    candidate_items = tuple(
         item
         for item in candidates
         if _profile_member_item(request, item)
-        and item.lane in _PROFILE_DURABLE_MEMBER_EVIDENCE_LANES
     )
-    durable_selected_items = tuple(
+    selected_items = tuple(
         item
         for item in selected
         if _profile_member_item(request, item)
-        and item.lane in _PROFILE_DURABLE_MEMBER_EVIDENCE_LANES
     )
+    process_request = public_assessment_process_request(request.user_text)
+    if not process_request:
+        durable_root_sets = tuple(
+            set(item.root_identities)
+            for item in candidate_items
+            if item.lane in _PROFILE_DURABLE_MEMBER_EVIDENCE_LANES
+            and item.root_identities
+        )
+
+        def represented_by_durable(item: IntelligencePacketItem) -> bool:
+            item_roots = set(item.root_identities)
+            return bool(
+                item.lane
+                in {"assessment_observation", "conversation_context"}
+                and item_roots
+                and any(item_roots.issubset(roots) for roots in durable_root_sets)
+            )
+
+        candidate_items = tuple(
+            item for item in candidate_items if not represented_by_durable(item)
+        )
+        selected_items = tuple(
+            item for item in selected_items if not represented_by_durable(item)
+        )
+    if process_request:
+        relevant_open_roots = {
+            root
+            for item in candidate_items
+            if item.lane == "assessment_observation"
+            for root in item.root_identities
+            if root
+        }
+        candidate_items = tuple(
+            item
+            for item in candidate_items
+            if item.lane == "assessment_observation"
+            or (
+                item.lane == "conversation_context"
+                and bool(set(item.root_identities).intersection(relevant_open_roots))
+            )
+        )
+        selected_items = tuple(
+            item
+            for item in selected_items
+            if item.lane == "assessment_observation"
+            or (
+                item.lane == "conversation_context"
+                and bool(set(item.root_identities).intersection(relevant_open_roots))
+            )
+        )
     recognized_canon_signal = any(
         item.lane == "canon"
         and item.source_type == "recognized_canon_fact"
@@ -2989,35 +3334,18 @@ def _profile_sufficiency(
         == subject_key_for_user(request.subject_user_id)
         for item in selected
     )
-    observational_candidate_items = tuple(
-        item
-        for item in candidates
-        if _profile_member_item(request, item)
-        and item.lane == "assessment_observation"
-    )
-    observational_selected_items = tuple(
-        item
-        for item in selected
-        if _profile_member_item(request, item)
-        and item.lane == "assessment_observation"
-    )
     observation_only = bool(
-        not durable_candidate_items
-        and recognized_canon_signal
-        and observational_candidate_items
+        candidate_items
+        and all(
+            item.lane in {"assessment_observation", "conversation_context"}
+            for item in candidate_items
+        )
     )
-    if durable_candidate_items:
-        candidate_items = durable_candidate_items
-        selected_items = durable_selected_items
-    elif observation_only:
-        candidate_items = observational_candidate_items
-        selected_items = observational_selected_items
-    else:
-        candidate_items = ()
-        selected_items = ()
-    candidate_points = {
-        item.point_identity for item in candidate_items if item.point_identity
-    }
+    # Root collapse and semantic point grouping happen before this union.  A
+    # distinct durable point and a distinct Open point may therefore combine,
+    # while a projection and its raw source cannot manufacture breadth.
+    candidate_point_map = material_profile_point_map(candidate_items)
+    candidate_points = set(candidate_point_map.values())
     candidate_occurrences = {
         identity
         for item in candidate_items
@@ -3025,7 +3353,12 @@ def _profile_sufficiency(
         if identity
     }
     selected_points = {
-        item.point_identity for item in selected_items if item.point_identity
+        candidate_point_map.get(
+            item.point_group_identity or item.point_identity,
+            item.point_group_identity or item.point_identity,
+        )
+        for item in selected_items
+        if item.point_identity
     }
     selected_roots = {
         identity
@@ -3041,9 +3374,7 @@ def _profile_sufficiency(
     }
     candidate_point_count = len(candidate_points)
     required_points = (
-        1
-        if observation_only
-        else 2
+        2
         if candidate_point_count >= 2
         and len(candidate_occurrences) >= 2
         else 1
@@ -3069,9 +3400,9 @@ def _profile_sufficiency(
         status = "sparse" if satisfied else "insufficient"
         if observation_only:
             reasons.append(
-                "recognized_canon_sparse_public_observation"
+                "sparse_public_observation"
                 if satisfied
-                else "recognized_canon_observation_not_selected"
+                else "public_observation_not_selected"
             )
         else:
             reasons.append(
@@ -3203,7 +3534,7 @@ def _relationship_version(
     return str(posture.get("source_digest") or "")
 
 
-def revalidate_packet(
+def _revalidate_packet_in_snapshot(
     conn: sqlite3.Connection,
     packet: UnifiedIntelligencePacket,
     *,
@@ -3223,6 +3554,42 @@ def revalidate_packet(
             if item.revalidation_kind == "conversation":
                 row = _conversation_row(conn, int(item.revalidation_key or 0))
                 current = _conversation_digest(row) if row else ""
+            elif item.revalidation_kind == "public_assessment":
+                state = read_public_assessment_root_state(
+                    conn,
+                    entry_id=item.revalidation_key,
+                    guild_id=packet.request.guild_id,
+                    subject_key=item.subject_key,
+                )
+                context_row_id = (
+                    item.source_ref.split(":", 1)[1]
+                    if item.lane == "conversation_context"
+                    and item.source_ref.startswith("conversation:")
+                    else ""
+                )
+                state_matches = bool(
+                    state is not None
+                    and item.root_identities == (state.root_identity,)
+                    and item.occurrence_identities
+                    == (state.occurrence_identity,)
+                    and item.point_identity
+                    == state.semantics.point_identity
+                    and item.point_group_identity
+                    == state.semantics.point_identity
+                    and item.attribution_mode
+                    == state.semantics.attribution_mode
+                    and item.polarity == state.semantics.polarity
+                    and item.action_identity
+                    == state.semantics.action_identity
+                    and item.material_facets
+                    == state.semantics.material_facets
+                    and item.text == state.text[:1200]
+                    and (
+                        not context_row_id
+                        or context_row_id == state.source_row_id
+                    )
+                )
+                current = state.source_digest if state_matches else ""
             elif item.revalidation_kind == "ledger":
                 current = _ledger_entry_digest(conn, item.revalidation_key)
             elif item.revalidation_kind == "moment":
@@ -3269,6 +3636,31 @@ def revalidate_packet(
         changed_source_count=changed,
         processing_error_count=errors,
     )
+
+
+def revalidate_packet(
+    conn: sqlite3.Connection,
+    packet: UnifiedIntelligencePacket,
+    *,
+    environ: Mapping[str, str] | None = None,
+) -> PacketRevalidationResult:
+    """Revalidate every source against one coherent database snapshot."""
+
+    owns_snapshot = not conn.in_transaction
+    if owns_snapshot:
+        conn.execute("BEGIN")
+    try:
+        return _revalidate_packet_in_snapshot(
+            conn,
+            packet,
+            environ=environ,
+        )
+    finally:
+        if owns_snapshot and conn.in_transaction:
+            # Revalidation is strictly read-only. Ending an owned snapshot by
+            # rollback prevents this helper from committing caller work if a
+            # later refactor accidentally adds writes.
+            conn.rollback()
 
 
 def _packet_invariants(
@@ -3328,6 +3720,7 @@ def _packet_invariants(
         if (
             broad
             and item.lane in _PROFILE_MEMBER_EVIDENCE_LANES
+            and item.lane != "conversation_context"
             and (
                 not item.root_identities
                 or not item.occurrence_identities
@@ -3359,6 +3752,7 @@ def _packet_invariants(
         if (
             broad
             and item.lane in _PROFILE_MEMBER_EVIDENCE_LANES
+            and item.lane != "conversation_context"
             and (
                 not item.root_identities
                 or not item.occurrence_identities
