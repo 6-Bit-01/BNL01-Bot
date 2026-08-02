@@ -782,14 +782,15 @@ class PublicAssessmentRootStateTests(unittest.TestCase):
         self.assertEqual(after.status, "source_changed")
 
     def test_only_approved_source_routes_are_admitted(self):
-        for route in ("normal_chat", "conversation_continuity"):
-            with self.subTest(route=route):
-                fixture = _RootStateFixture()
-                self.addCleanup(fixture.close)
-                root = fixture.add_observation(route_mode=route)
-                self.assertIsNotNone(fixture.state(root))
+        fixture = _RootStateFixture()
+        self.addCleanup(fixture.close)
+        root = fixture.add_observation(route_mode="normal_chat")
+        self.assertIsNotNone(fixture.state(root))
 
         for route in (
+            # Continuity/backfill requires an immutable Journal receipt; raw
+            # and Ledger route labels alone cannot manufacture that authority.
+            "conversation_continuity",
             "room",
             "approved_channel_history",
             "operator_command",

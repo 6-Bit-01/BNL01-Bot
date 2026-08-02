@@ -16,9 +16,11 @@ import os
 import re
 import sqlite3
 from typing import Any, Iterable, Mapping
+import unicodedata
 
 from bnl_canon_source_contract import (
     Confidence,
+    LIVING_CANON_RECURRENCE_VERSION,
     PUBLIC_ASSESSMENT_EVIDENCE_VERSION,
     SourceClass,
     SourceClaim,
@@ -47,6 +49,28 @@ ATOMIC_KNOWLEDGE_LIFECYCLE_SWEEP = "atomic_knowledge_lifecycle_sweep_v1"
 MEMORY_LEDGER_SHADOW_ENV = "BNL_MEMORY_LEDGER_SHADOW_ENABLED"
 CONVERSATION_MOTIF_FORMATION_ENV = (
     "BNL_CONVERSATION_MOTIF_FORMATION_SHADOW_ENABLED"
+)
+LIVING_CANON_V1_FORMATION_ENV = (
+    "BNL_LIVING_CANON_V1_FORMATION_SHADOW_ENABLED"
+)
+LIVING_CANON_GROUPING_SIGNATURE_VERSION = (
+    "living_canon_exact_root_grouping_v1"
+)
+_LIVING_CANON_AUTHORITY_TABLES = frozenset(
+    {
+        "conversations",
+        "bnl_journal_source_events",
+        "memory_ledger_entries",
+        "memory_ledger_lineage",
+        "memory_ledger_participants",
+        "memory_ledger_knowledge_candidates",
+        "memory_ledger_knowledge_roots",
+        "memory_ledger_knowledge_participants",
+        "memory_ledger_conversation_motif_fences",
+        "memory_moment_windows",
+        "memory_moment_members",
+        "memory_moment_participants",
+    }
 )
 BNL_SUBJECT_KEY = "bnl_01"
 BNL_SELF_NAME_PREDICATE_PREFIX = "bnl_self_name:"
@@ -545,6 +569,10 @@ _CONVERSATION_CORRECTION_MAX_SCAN = 40
 _CONVERSATION_MOTIF_MAX_SCAN = 1200
 _CONVERSATION_MOTIF_MAX_CANDIDATES = 6
 _CONVERSATION_MOTIF_MAX_ROOTS = 12
+_CONVERSATION_MOTIF_NEUTRAL_PREFIX = "conversation_motif_neutral_"
+_CONVERSATION_MOTIF_NEUTRAL_FENCE_WILDCARD = (
+    "conversation_motif_neutral_*"
+)
 _CONVERSATION_MOTIF_PUBLIC_POLICIES = frozenset(
     {"public_home", "public_context", "public_selective"}
 )
@@ -1004,6 +1032,28 @@ class AtomicKnowledgeProposal:
     currentness: str = "current"
     contradiction_key: str = ""
     retrieval_tags: tuple[str, ...] = field(default_factory=tuple)
+    recurrence_contract_version: str = ""
+    grouping_signature_version: str = ""
+    grouping_identity: str = ""
+    canon_domain: str = ""
+    canon_claim_kind: str = ""
+    occurrence_ids: tuple[str, ...] = field(default_factory=tuple)
+
+
+_LIVING_CANON_FORMATION_AUTHORITY = object()
+
+
+@dataclass(frozen=True)
+class _LivingCanonFormationReceipt:
+    """Unforgeable process-local authority minted by the formation owner."""
+
+    authority: object
+
+
+def _living_canon_formation_receipt() -> _LivingCanonFormationReceipt:
+    return _LivingCanonFormationReceipt(
+        authority=_LIVING_CANON_FORMATION_AUTHORITY,
+    )
 
 
 @dataclass(frozen=True)
@@ -1018,6 +1068,32 @@ class AtomicKnowledgeResult:
         return self.outcome in {"created", "matched_existing"} and bool(
             self.candidate_id
         )
+
+
+@dataclass(frozen=True)
+class LivingCanonDryRunReport:
+    """Content-free result from the read-only PR4 recurrence analyzer."""
+
+    recurrence_contract_version: str = LIVING_CANON_RECURRENCE_VERSION
+    grouping_signature_version: str = LIVING_CANON_GROUPING_SIGNATURE_VERSION
+    proposed_count: int = 0
+    skipped_count: int = 0
+    ambiguous_count: int = 0
+    rejected_count: int = 0
+    candidate_state_counts: tuple[tuple[str, int], ...] = ()
+    reason_counts: tuple[tuple[str, int], ...] = ()
+    independent_root_count: int = 0
+    independent_occurrence_count: int = 0
+    collapsed_root_count: int = 0
+    bounds: tuple[tuple[str, int], ...] = (
+        ("eligible_ledger_scan_max", _CONVERSATION_MOTIF_MAX_SCAN),
+        ("motif_candidates_max", _CONVERSATION_MOTIF_MAX_CANDIDATES),
+        ("retained_roots_max", _CONVERSATION_MOTIF_MAX_ROOTS),
+        ("occurrence_lookback_max", _CONVERSATION_OCCURRENCE_MAX_SCAN),
+        ("idle_boundary_seconds", _CONVERSATION_MOTIF_WINDOW_SECONDS),
+    )
+    source_write_count: int = 0
+    write_occurred: bool = False
 
 
 @dataclass(frozen=True)
@@ -1135,6 +1211,38 @@ def conversation_motif_formation_enabled(
     }
 
 
+def living_canon_v1_formation_enabled(
+    environ: Mapping[str, str] | None = None,
+) -> bool:
+    """Require an explicit shadow gate for the PR4 recurrence contract."""
+
+    env = os.environ if environ is None else environ
+    if not shadow_enabled(dict(env)):
+        return False
+    return str(env.get(LIVING_CANON_V1_FORMATION_ENV, "")).strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+        "enabled",
+    }
+
+
+def _living_canon_main_authority_unshadowed(
+    conn: sqlite3.Connection,
+) -> bool:
+    """Reject PR4 evaluation when TEMP can shadow an authority table."""
+
+    placeholders = ",".join("?" for _name in _LIVING_CANON_AUTHORITY_TABLES)
+    return not bool(
+        conn.execute(
+            "SELECT 1 FROM temp.sqlite_master WHERE type='table' "
+            "AND name IN (%s) LIMIT 1" % placeholders,
+            tuple(sorted(_LIVING_CANON_AUTHORITY_TABLES)),
+        ).fetchone()
+    )
+
+
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -1219,7 +1327,7 @@ def current_bnl_self_name_records(
     table_names = {
         str(row[0] or "")
         for row in conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table'"
+            "SELECT name FROM main.sqlite_master WHERE type='table'"
         ).fetchall()
     }
     conversation_columns = (
@@ -1416,7 +1524,7 @@ def record_bnl_self_name_decision(
     source_entry_row = conn.execute(
         """
         SELECT entry_id
-        FROM memory_ledger_entries
+        FROM main.memory_ledger_entries
         WHERE guild_id=? AND source_table='conversations'
           AND source_row_id=? AND source_role='user'
         ORDER BY created_at,entry_id
@@ -1724,6 +1832,16 @@ def ensure_memory_ledger_schema(conn: sqlite3.Connection) -> None:
             review_status TEXT NOT NULL DEFAULT 'not_evaluated',
             review_due_at TEXT DEFAULT '',
             lifecycle_evaluated_at TEXT DEFAULT '',
+            recurrence_contract_version TEXT DEFAULT '',
+            grouping_signature_version TEXT DEFAULT '',
+            grouping_identity TEXT DEFAULT '',
+            canon_domain TEXT DEFAULT '',
+            canon_claim_kind TEXT DEFAULT '',
+            independent_occurrence_count INTEGER NOT NULL DEFAULT 0,
+            occurrence_ids_json TEXT NOT NULL DEFAULT '[]',
+            occurrence_digest TEXT DEFAULT '',
+            recurrence_proof_json TEXT NOT NULL DEFAULT '{}',
+            public_usable INTEGER NOT NULL DEFAULT 0,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
             UNIQUE(
@@ -1863,6 +1981,16 @@ def ensure_memory_ledger_schema(conn: sqlite3.Connection) -> None:
         "ALTER TABLE memory_ledger_knowledge_candidates ADD COLUMN review_status TEXT NOT NULL DEFAULT 'not_evaluated'",
         "ALTER TABLE memory_ledger_knowledge_candidates ADD COLUMN review_due_at TEXT DEFAULT ''",
         "ALTER TABLE memory_ledger_knowledge_candidates ADD COLUMN lifecycle_evaluated_at TEXT DEFAULT ''",
+        "ALTER TABLE memory_ledger_knowledge_candidates ADD COLUMN recurrence_contract_version TEXT DEFAULT ''",
+        "ALTER TABLE memory_ledger_knowledge_candidates ADD COLUMN grouping_signature_version TEXT DEFAULT ''",
+        "ALTER TABLE memory_ledger_knowledge_candidates ADD COLUMN grouping_identity TEXT DEFAULT ''",
+        "ALTER TABLE memory_ledger_knowledge_candidates ADD COLUMN canon_domain TEXT DEFAULT ''",
+        "ALTER TABLE memory_ledger_knowledge_candidates ADD COLUMN canon_claim_kind TEXT DEFAULT ''",
+        "ALTER TABLE memory_ledger_knowledge_candidates ADD COLUMN independent_occurrence_count INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE memory_ledger_knowledge_candidates ADD COLUMN occurrence_ids_json TEXT NOT NULL DEFAULT '[]'",
+        "ALTER TABLE memory_ledger_knowledge_candidates ADD COLUMN occurrence_digest TEXT DEFAULT ''",
+        "ALTER TABLE memory_ledger_knowledge_candidates ADD COLUMN recurrence_proof_json TEXT NOT NULL DEFAULT '{}'",
+        "ALTER TABLE memory_ledger_knowledge_candidates ADD COLUMN public_usable INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE memory_ledger_conversation_motif_fences ADD COLUMN fence_state TEXT NOT NULL DEFAULT 'active'",
         "ALTER TABLE memory_ledger_conversation_motif_fences ADD COLUMN satisfied_at TEXT DEFAULT ''",
     ):
@@ -1903,11 +2031,16 @@ def ensure_memory_ledger_schema(conn: sqlite3.Connection) -> None:
         "trg_atomic_knowledge_root_change",
         "trg_atomic_knowledge_participant_delete",
         "trg_atomic_knowledge_lineage_change",
+        "trg_atomic_knowledge_root_delete_v2",
+        "trg_atomic_knowledge_root_change_v2",
+        "trg_atomic_knowledge_participant_delete_v2",
+        "trg_atomic_knowledge_lineage_change_v2",
+        "trg_conversation_motif_fence_source_delete_v1",
     ):
         cur.execute(f"DROP TRIGGER IF EXISTS {trigger_name}")
     cur.execute(
         """
-        CREATE TRIGGER IF NOT EXISTS trg_atomic_knowledge_root_delete_v2
+        CREATE TRIGGER IF NOT EXISTS trg_atomic_knowledge_root_delete_v3
         AFTER DELETE ON memory_ledger_entries
         BEGIN
           INSERT OR IGNORE INTO memory_ledger_knowledge_receipts(
@@ -1927,6 +2060,13 @@ def ensure_memory_ledger_schema(conn: sqlite3.Connection) -> None:
           UPDATE memory_ledger_knowledge_candidates
           SET normalized_value='',candidate_state='invalidated',
               candidate_eligible=0,live_eligible=0,
+              public_usable=CASE
+                WHEN COALESCE(recurrence_contract_version,'')='living_canon_recurrence_v1'
+                  THEN 0 ELSE public_usable END,
+              recurrence_proof_json=CASE
+                WHEN COALESCE(recurrence_contract_version,'')='living_canon_recurrence_v1'
+                  THEN '{"candidate_eligible":false,"source_eligible":false,"roots_valid":false,"invalidated":true}'
+                ELSE recurrence_proof_json END,
               invalidated_reason='root_deleted',
               invalidated_at=CURRENT_TIMESTAMP,
               lifecycle_reason='root_deleted',review_status='dirty',
@@ -1945,7 +2085,7 @@ def ensure_memory_ledger_schema(conn: sqlite3.Connection) -> None:
     )
     cur.execute(
         """
-        CREATE TRIGGER IF NOT EXISTS trg_atomic_knowledge_root_change_v2
+        CREATE TRIGGER IF NOT EXISTS trg_atomic_knowledge_root_change_v3
         AFTER UPDATE OF lifecycle_status,normalized_value,public_usable,
           visibility,source_class,confidence,subject_key,channel_policy,
           route_mode
@@ -2025,6 +2165,13 @@ def ensure_memory_ledger_schema(conn: sqlite3.Connection) -> None:
               ELSE 'invalidated'
             END,
             candidate_eligible=0,live_eligible=0,
+            public_usable=CASE
+              WHEN COALESCE(recurrence_contract_version,'')='living_canon_recurrence_v1'
+                THEN 0 ELSE public_usable END,
+            recurrence_proof_json=CASE
+              WHEN COALESCE(recurrence_contract_version,'')='living_canon_recurrence_v1'
+                THEN '{"candidate_eligible":false,"source_eligible":false,"roots_valid":false,"invalidated":true}'
+              ELSE recurrence_proof_json END,
             invalidated_reason=CASE
               WHEN NEW.lifecycle_status IN ('corrected','superseded')
                 THEN 'root_superseded'
@@ -2090,7 +2237,7 @@ def ensure_memory_ledger_schema(conn: sqlite3.Connection) -> None:
     )
     cur.execute(
         """
-        CREATE TRIGGER IF NOT EXISTS trg_atomic_knowledge_participant_delete_v2
+        CREATE TRIGGER IF NOT EXISTS trg_atomic_knowledge_participant_delete_v3
         AFTER DELETE ON memory_ledger_participants
         BEGIN
           INSERT OR IGNORE INTO memory_ledger_knowledge_receipts(
@@ -2111,6 +2258,13 @@ def ensure_memory_ledger_schema(conn: sqlite3.Connection) -> None:
           UPDATE memory_ledger_knowledge_candidates
           SET normalized_value='',candidate_state='invalidated',
               candidate_eligible=0,live_eligible=0,
+              public_usable=CASE
+                WHEN COALESCE(recurrence_contract_version,'')='living_canon_recurrence_v1'
+                  THEN 0 ELSE public_usable END,
+              recurrence_proof_json=CASE
+                WHEN COALESCE(recurrence_contract_version,'')='living_canon_recurrence_v1'
+                  THEN '{"candidate_eligible":false,"source_eligible":false,"roots_valid":false,"invalidated":true}'
+                ELSE recurrence_proof_json END,
               invalidated_reason='participant_deleted',
               invalidated_at=CURRENT_TIMESTAMP,
               lifecycle_reason='participant_deleted',review_status='dirty',
@@ -2124,7 +2278,7 @@ def ensure_memory_ledger_schema(conn: sqlite3.Connection) -> None:
     )
     cur.execute(
         """
-        CREATE TRIGGER IF NOT EXISTS trg_atomic_knowledge_lineage_change_v2
+        CREATE TRIGGER IF NOT EXISTS trg_atomic_knowledge_lineage_change_v3
         AFTER INSERT ON memory_ledger_lineage
         WHEN NEW.lineage_type IN ('correction_of','supersedes','retracts')
         BEGIN
@@ -2161,6 +2315,13 @@ def ensure_memory_ledger_schema(conn: sqlite3.Connection) -> None:
               ELSE 'invalidated'
             END,
             candidate_eligible=0,live_eligible=0,
+            public_usable=CASE
+              WHEN COALESCE(recurrence_contract_version,'')='living_canon_recurrence_v1'
+                THEN 0 ELSE public_usable END,
+            recurrence_proof_json=CASE
+              WHEN COALESCE(recurrence_contract_version,'')='living_canon_recurrence_v1'
+                THEN '{"candidate_eligible":false,"source_eligible":false,"roots_valid":false,"invalidated":true}'
+              ELSE recurrence_proof_json END,
             invalidated_reason='root_' || NEW.lineage_type,
             invalidated_at=CURRENT_TIMESTAMP,
             lifecycle_reason='root_' || NEW.lineage_type,
@@ -2175,12 +2336,19 @@ def ensure_memory_ledger_schema(conn: sqlite3.Connection) -> None:
     )
     cur.execute(
         """
-        CREATE TRIGGER IF NOT EXISTS trg_conversation_motif_fence_source_delete_v1
+        CREATE TRIGGER IF NOT EXISTS trg_conversation_motif_fence_source_delete_v2
         AFTER DELETE ON memory_ledger_entries
         BEGIN
           UPDATE memory_ledger_knowledge_candidates
           SET normalized_value='',candidate_state='invalidated',
               candidate_eligible=0,live_eligible=0,
+              public_usable=CASE
+                WHEN COALESCE(recurrence_contract_version,'')='living_canon_recurrence_v1'
+                  THEN 0 ELSE public_usable END,
+              recurrence_proof_json=CASE
+                WHEN COALESCE(recurrence_contract_version,'')='living_canon_recurrence_v1'
+                  THEN '{"candidate_eligible":false,"source_eligible":false,"roots_valid":false,"invalidated":true}'
+                ELSE recurrence_proof_json END,
               invalidated_reason='correction_fence_source_deleted',
               invalidated_at=CURRENT_TIMESTAMP,
               lifecycle_reason='correction_fence_source_deleted',
@@ -2955,10 +3123,16 @@ def _knowledge_candidate_roots(
     conn: sqlite3.Connection,
     candidate: dict[str, Any],
 ) -> tuple[list[dict[str, Any]], int]:
+    living_v1 = bool(
+        str(candidate.get("recurrence_contract_version") or "")
+        == LIVING_CANON_RECURRENCE_VERSION
+    )
+    if living_v1 and not _living_canon_main_authority_unshadowed(conn):
+        return [], 0
     rows = conn.execute(
         """
         SELECT root_entry_id,is_independent,root_status
-        FROM memory_ledger_knowledge_roots
+        FROM main.memory_ledger_knowledge_roots
         WHERE candidate_id=?
         ORDER BY root_entry_id
         """,
@@ -2966,6 +3140,36 @@ def _knowledge_candidate_roots(
     ).fetchall()
     entry_ids = tuple(str(row[0] or "") for row in rows if str(row[0] or ""))
     entries = _knowledge_entry_rows(conn, entry_ids)
+    living_states: dict[str, PublicAssessmentRootState] = {}
+    living_occurrences: dict[str, str] = {}
+    candidate_tags = set(_knowledge_retrieval_tags(candidate))
+    motif_fence = (
+        _conversation_motif_fence_row(
+            conn,
+            guild_id=int(candidate.get("guild_id") or 0),
+            subject_key=str(candidate.get("subject_key") or ""),
+            predicate_key=str(candidate.get("predicate_key") or ""),
+        )
+        if "recurring_public_conversation" in candidate_tags
+        else {}
+    )
+    motif_cutoff = _parse_knowledge_time(
+        motif_fence.get("correction_observed_at")
+    )
+    if living_v1:
+        independent_entry_ids = tuple(
+            str(row[0] or "")
+            for row in rows
+            if bool(row[1]) and str(row[0] or "")
+        )
+        living_states, living_occurrences, _living_reasons = (
+            _living_canon_root_states_and_occurrences(
+                conn,
+                guild_id=int(candidate.get("guild_id") or 0),
+                subject_key=str(candidate.get("subject_key") or ""),
+                entry_ids=independent_entry_ids,
+            )
+        )
     roots: list[dict[str, Any]] = []
     derivative_count = 0
     for entry_id, is_independent, root_status in rows:
@@ -2982,15 +3186,31 @@ def _knowledge_candidate_roots(
             candidate=candidate,
             root=root,
         ):
-            root["evidence_identity"] = _knowledge_evidence_identity(
-                conn,
-                root["entry"],
+            root_observed = _parse_knowledge_time(
+                root["entry"].get("observed_at")
             )
-            root["occurrence_identity"] = _knowledge_occurrence_identity(
-                conn,
-                root["entry"],
-            )
-            candidate_tags = set(_knowledge_retrieval_tags(candidate))
+            if motif_fence and (
+                motif_cutoff is None
+                or root_observed is None
+                or root_observed <= motif_cutoff
+            ):
+                continue
+            if living_v1:
+                state = living_states.get(str(entry_id or ""))
+                occurrence = living_occurrences.get(str(entry_id or ""), "")
+                if state is None or not occurrence:
+                    continue
+                root["evidence_identity"] = state.root_identity
+                root["occurrence_identity"] = occurrence
+            else:
+                root["evidence_identity"] = _knowledge_evidence_identity(
+                    conn,
+                    root["entry"],
+                )
+                root["occurrence_identity"] = _knowledge_occurrence_identity(
+                    conn,
+                    root["entry"],
+                )
             root["reinforcement_identity"] = (
                 root["occurrence_identity"]
                 if "recurring_public_conversation" in candidate_tags
@@ -3161,8 +3381,12 @@ def _knowledge_scope_rows(
           conflict_value_count,consolidated_authority_class,
           consolidated_confidence_class,lifecycle_support_digest,
           lifecycle_reason,review_status,review_due_at,
-          lifecycle_evaluated_at
-        FROM memory_ledger_knowledge_candidates
+          lifecycle_evaluated_at,recurrence_contract_version,
+          grouping_signature_version,grouping_identity,canon_domain,
+          canon_claim_kind,independent_occurrence_count,
+          occurrence_ids_json,occurrence_digest,recurrence_proof_json,
+          public_usable
+        FROM main.memory_ledger_knowledge_candidates
         WHERE guild_id=? AND candidate_type=? AND subject_key=?
           AND predicate_key=? AND contradiction_key=? AND visibility=?
           AND participant_scope_digest=?
@@ -3208,6 +3432,16 @@ def _knowledge_scope_rows(
         "review_status",
         "review_due_at",
         "lifecycle_evaluated_at",
+        "recurrence_contract_version",
+        "grouping_signature_version",
+        "grouping_identity",
+        "canon_domain",
+        "canon_claim_kind",
+        "independent_occurrence_count",
+        "occurrence_ids_json",
+        "occurrence_digest",
+        "recurrence_proof_json",
+        "public_usable",
     )
     return [dict(zip(keys, row)) for row in rows]
 
@@ -3259,6 +3493,13 @@ def _reconcile_atomic_knowledge_scope(
                 candidate.get("participant_scope_digest") or ""
             ),
         )
+        if str(candidate.get("recurrence_contract_version") or ""):
+            consolidation_id = _knowledge_digest(
+                consolidation_id,
+                str(candidate.get("recurrence_contract_version") or ""),
+                str(candidate.get("grouping_signature_version") or ""),
+                str(candidate.get("grouping_identity") or ""),
+            )
         group = groups.setdefault(
             consolidation_id,
             {
@@ -3288,6 +3529,11 @@ def _reconcile_atomic_knowledge_scope(
         group["recurring_public_conversation"] = any(
             "recurring_public_conversation"
             in set(_knowledge_retrieval_tags(candidate))
+            for candidate in group["candidates"]
+        )
+        group["living_canon_v1"] = any(
+            str(candidate.get("recurrence_contract_version") or "")
+            == LIVING_CANON_RECURRENCE_VERSION
             for candidate in group["candidates"]
         )
         motif_fence = (
@@ -3430,13 +3676,20 @@ def _reconcile_atomic_knowledge_scope(
         for consolidation_id, group in groups.items()
         if group["roots"] and not group["stale_retired"]
     }
-    conflict_value_count = len(active_group_ids)
+    for consolidation_id, group in groups.items():
+        group["conflict_value_count"] = sum(
+            1
+            for other_id in active_group_ids
+            if bool(groups[other_id].get("living_canon_v1"))
+            == bool(group.get("living_canon_v1"))
+        )
     changes = 0
     evaluated_at = _knowledge_time(now)
     for consolidation_id, group in groups.items():
         roots = list(group["roots"].values())
         root_count = len(group["roots"])
         reinforcement_count = len(group["evidence"])
+        conflict_value_count = int(group.get("conflict_value_count") or 0)
         duplicate_support_count = max(0, root_count - reinforcement_count)
         supporting_candidate_count = sum(
             1
@@ -3504,8 +3757,12 @@ def _reconcile_atomic_knowledge_scope(
                 bool(group["recurring_public_conversation"])
                 and reinforcement_count < 2
             ):
-                next_state = "invalidated"
-                reason = "recurring_conversation_reinforcement_lost"
+                if bool(group.get("living_canon_v1")) and reinforcement_count == 1:
+                    next_state = "provisional"
+                    reason = "single_occurrence_provisional"
+                else:
+                    next_state = "invalidated"
+                    reason = "recurring_conversation_reinforcement_lost"
             elif conflict_value_count > 1:
                 next_state = "contested"
                 reason = "unresolved_contradiction"
@@ -3537,6 +3794,8 @@ def _reconcile_atomic_knowledge_scope(
                     if bool(group["explicit_correction_source"])
                     else "authoritative_source_established"
                     if bool(group["authoritative_single_source"])
+                    else "independent_recurrence_established"
+                    if bool(group.get("living_canon_v1"))
                     else "independent_reinforcement_established"
                 )
             elif str(candidate.get("epistemic_status") or "") == "inference":
@@ -3667,6 +3926,52 @@ def _reconcile_atomic_knowledge_scope(
                       )
                     """,
                     (evaluated_at, candidate_id),
+                )
+            if str(candidate.get("recurrence_contract_version") or "") == (
+                LIVING_CANON_RECURRENCE_VERSION
+            ):
+                current_occurrence_ids = tuple(
+                    sorted(
+                        {
+                            str(
+                                root.get("reinforcement_identity")
+                                or root.get("occurrence_identity")
+                                or ""
+                            )
+                            for root in roots
+                            if str(
+                                root.get("reinforcement_identity")
+                                or root.get("occurrence_identity")
+                                or ""
+                            )
+                        }
+                    )
+                )
+                current_occurrence_digest = (
+                    _knowledge_digest(*current_occurrence_ids)
+                    if current_occurrence_ids
+                    else ""
+                )
+                conn.execute(
+                    """
+                    UPDATE memory_ledger_knowledge_candidates
+                    SET independent_occurrence_count=?,occurrence_ids_json=?,
+                        occurrence_digest=?
+                    WHERE candidate_id=?
+                    """,
+                    (
+                        len(current_occurrence_ids),
+                        json.dumps(
+                            current_occurrence_ids,
+                            separators=(",", ":"),
+                        ),
+                        current_occurrence_digest,
+                        candidate_id,
+                    ),
+                )
+                _refresh_living_canon_recurrence_proof(
+                    conn,
+                    candidate_id=candidate_id,
                 )
     return {
         "scopes": 1,
@@ -3910,6 +4215,7 @@ def _recurring_motif_candidate_id(
     participant_scope_digest: str,
     root_digest: str,
     fallback_candidate_id: str,
+    recurrence_contract_version: str = "",
 ) -> str:
     """Reuse one nonterminal recurring-motif identity across root refreshes."""
     rows = conn.execute(
@@ -3920,6 +4226,7 @@ def _recurring_motif_candidate_id(
         WHERE guild_id=? AND candidate_type='topic_or_motif'
           AND subject_key=? AND predicate_key=? AND contradiction_key=?
           AND visibility=? AND participant_scope_digest=?
+          AND COALESCE(recurrence_contract_version,'')=?
           AND retrieval_tags_json LIKE '%recurring_public_conversation%'
         ORDER BY created_at,candidate_id
         """,
@@ -3930,6 +4237,7 @@ def _recurring_motif_candidate_id(
             str(contradiction_key or ""),
             str(visibility or ""),
             str(participant_scope_digest or ""),
+            str(recurrence_contract_version or ""),
         ),
     ).fetchall()
     # An exact legacy row must win even if terminal; otherwise the candidate
@@ -3961,6 +4269,22 @@ def _recurring_motif_candidate_id(
         )
     ]
     if not refreshable:
+        if rows and str(recurrence_contract_version or ""):
+            terminal_fingerprint = _knowledge_digest(
+                "living_canon_terminal_generations_v1",
+                str(fallback_candidate_id or ""),
+                *tuple(
+                    "%s:%s:%s:%s"
+                    % (
+                        str(row[0] or ""),
+                        str(row[1] or ""),
+                        str(row[2] or ""),
+                        str(row[3] or ""),
+                    )
+                    for row in rows
+                ),
+            )
+            return "mlkc_" + terminal_fingerprint[:40]
         return fallback_candidate_id
     refreshable.sort(
         key=lambda row: (
@@ -3972,16 +4296,153 @@ def _recurring_motif_candidate_id(
     return str(refreshable[0][0] or fallback_candidate_id)
 
 
+def _store_living_canon_contract(
+    conn: sqlite3.Connection,
+    *,
+    candidate_id: str,
+    recurrence_contract_version: str,
+    grouping_signature_version: str,
+    grouping_identity: str,
+    canon_domain: str,
+    canon_claim_kind: str,
+    occurrence_ids: tuple[str, ...],
+    occurrence_digest: str,
+) -> None:
+    """Store only formation-owner-minted recurrence metadata."""
+
+    conn.execute(
+        """
+        UPDATE main.memory_ledger_knowledge_candidates
+        SET recurrence_contract_version=?,grouping_signature_version=?,
+            grouping_identity=?,canon_domain=?,canon_claim_kind=?,
+            independent_occurrence_count=?,occurrence_ids_json=?,
+            occurrence_digest=?,recurrence_proof_json='{}',public_usable=0,
+            updated_at=?
+        WHERE candidate_id=?
+        """,
+        (
+            recurrence_contract_version,
+            grouping_signature_version,
+            grouping_identity,
+            canon_domain,
+            canon_claim_kind,
+            len(occurrence_ids),
+            json.dumps(occurrence_ids, separators=(",", ":")),
+            occurrence_digest,
+            _now(),
+            str(candidate_id or ""),
+        ),
+    )
+
+
+def _refresh_living_canon_recurrence_proof(
+    conn: sqlite3.Connection,
+    *,
+    candidate_id: str,
+) -> None:
+    """Mirror current lifecycle state into a strict content-free proof."""
+
+    row = conn.execute(
+        """
+        SELECT candidate_state,candidate_eligible,invalidated_reason,
+               eligible_independent_root_count,conflict_value_count,root_digest,
+               recurrence_contract_version,grouping_signature_version,
+               grouping_identity,canon_domain,canon_claim_kind,
+               independent_occurrence_count,occurrence_ids_json,
+               occurrence_digest
+        FROM main.memory_ledger_knowledge_candidates WHERE candidate_id=?
+        """,
+        (str(candidate_id or ""),),
+    ).fetchone()
+    if not row:
+        return
+    (
+        candidate_state,
+        candidate_eligible,
+        invalidated_reason,
+        independent_root_count,
+        conflict_value_count,
+        root_digest,
+        recurrence_contract_version,
+        grouping_signature_version,
+        grouping_identity,
+        _canon_domain,
+        _canon_claim_kind,
+        independent_occurrence_count,
+        occurrence_ids_json,
+        occurrence_digest,
+    ) = row
+    if str(recurrence_contract_version or "") != LIVING_CANON_RECURRENCE_VERSION:
+        return
+    correction_fence_clear = not str(invalidated_reason or "").startswith(
+        "conversation_motif_correction"
+    )
+    contradiction_clear = bool(
+        int(conflict_value_count or 0) <= 1
+        and str(candidate_state or "") != "contested"
+    )
+    proof = {
+        "recurrence_contract_version": str(recurrence_contract_version or ""),
+        "grouping_signature_version": str(grouping_signature_version or ""),
+        "grouping_identity": str(grouping_identity or ""),
+        "candidate_state": str(candidate_state or ""),
+        "candidate_eligible": bool(candidate_eligible),
+        "source_eligible": True,
+        "roots_valid": bool(int(independent_root_count or 0) > 0),
+        "occurrence_bounded": bool(int(independent_occurrence_count or 0) > 0),
+        "correction_fence_clear": correction_fence_clear,
+        "contradiction_clear": contradiction_clear,
+        "independent_root_count": int(independent_root_count or 0),
+        "independent_occurrence_count": int(independent_occurrence_count or 0),
+        "root_digest": str(root_digest or ""),
+        "occurrence_digest": str(occurrence_digest or ""),
+        "bounds": {
+            "eligible_ledger_scan_max": _CONVERSATION_MOTIF_MAX_SCAN,
+            "motif_candidates_max": _CONVERSATION_MOTIF_MAX_CANDIDATES,
+            "retained_roots_max": _CONVERSATION_MOTIF_MAX_ROOTS,
+            "occurrence_lookback_max": _CONVERSATION_OCCURRENCE_MAX_SCAN,
+            "idle_boundary_seconds": _CONVERSATION_MOTIF_WINDOW_SECONDS,
+        },
+    }
+    established_public = bool(
+        str(candidate_state or "") == "established"
+        and bool(candidate_eligible)
+        and int(independent_root_count or 0) >= 2
+        and int(independent_occurrence_count or 0) >= 2
+        and correction_fence_clear
+        and contradiction_clear
+    )
+    conn.execute(
+        """
+        UPDATE main.memory_ledger_knowledge_candidates
+        SET recurrence_proof_json=?,public_usable=?,updated_at=?
+        WHERE candidate_id=?
+        """,
+        (
+            json.dumps(proof, sort_keys=True, separators=(",", ":")),
+            int(established_public),
+            _now(),
+            str(candidate_id or ""),
+        ),
+    )
+
+
 def form_atomic_knowledge_candidate(
     conn: sqlite3.Connection,
     proposal: AtomicKnowledgeProposal,
+    *,
+    _living_formation_receipt: _LivingCanonFormationReceipt | None = None,
 ) -> AtomicKnowledgeResult:
     """Atomically form one candidate without owning the caller transaction."""
     ensure_memory_ledger_schema(conn)
     savepoint = f"atomic_knowledge_{id(proposal):x}"
     conn.execute(f"SAVEPOINT {savepoint}")
     try:
-        result = _form_atomic_knowledge_candidate_impl(conn, proposal)
+        result = _form_atomic_knowledge_candidate_impl(
+            conn,
+            proposal,
+            _living_formation_receipt=_living_formation_receipt,
+        )
     except Exception:
         conn.execute(f"ROLLBACK TO {savepoint}")
         conn.execute(f"RELEASE {savepoint}")
@@ -3993,6 +4454,8 @@ def form_atomic_knowledge_candidate(
 def _form_atomic_knowledge_candidate_impl(
     conn: sqlite3.Connection,
     proposal: AtomicKnowledgeProposal,
+    *,
+    _living_formation_receipt: _LivingCanonFormationReceipt | None = None,
 ) -> AtomicKnowledgeResult:
     """Create one unpromoted candidate from exact revalidated Ledger roots."""
     candidate_type = _canon(proposal.candidate_type)
@@ -4019,6 +4482,78 @@ def _form_atomic_knowledge_candidate_impl(
     )
     all_ids = tuple(sorted(set(independent_ids + derivative_ids)))
     guild_hint = 0
+    recurrence_contract_version = str(
+        proposal.recurrence_contract_version or ""
+    ).strip()
+    grouping_signature_version = str(
+        proposal.grouping_signature_version or ""
+    ).strip()
+    grouping_identity = str(proposal.grouping_identity or "").strip()
+    canon_domain = _knowledge_tag(proposal.canon_domain)
+    canon_claim_kind = _knowledge_tag(proposal.canon_claim_kind)
+    occurrence_ids = tuple(
+        sorted(
+            {
+                str(identity or "").strip()
+                for identity in proposal.occurrence_ids
+                if str(identity or "").strip()
+            }
+        )
+    )
+    living_contract_requested = any(
+        (
+            recurrence_contract_version,
+            grouping_signature_version,
+            grouping_identity,
+            canon_domain,
+            canon_claim_kind,
+            occurrence_ids,
+        )
+    )
+    living_authorized = bool(
+        _living_formation_receipt is not None
+        and _living_formation_receipt.authority
+        is _LIVING_CANON_FORMATION_AUTHORITY
+    )
+    if living_contract_requested and not living_authorized:
+        return _reject_atomic_knowledge(
+            conn,
+            proposal,
+            guild_id=guild_hint,
+            reason_code="living_canon_formation_authority_missing",
+            root_entry_ids=all_ids,
+        )
+    if living_authorized and not _living_canon_main_authority_unshadowed(conn):
+        return AtomicKnowledgeResult(
+            outcome="rejected",
+            reason_code="living_canon_authority_shadowed",
+            candidate_type=str(proposal.candidate_type or ""),
+            root_count=len(all_ids),
+        )
+    if living_authorized and (
+        recurrence_contract_version != LIVING_CANON_RECURRENCE_VERSION
+        or grouping_signature_version
+        != LIVING_CANON_GROUPING_SIGNATURE_VERSION
+        or not re.fullmatch(r"[0-9a-f]{64}", grouping_identity)
+        or grouping_identity
+        != _knowledge_digest(
+            LIVING_CANON_GROUPING_SIGNATURE_VERSION,
+            subject_key,
+            predicate_key,
+            canon_domain,
+        )
+        or canon_domain not in {"real_community", "lore", "hybrid"}
+        or canon_claim_kind not in {"behavior_pattern", "tradition_or_joke"}
+        or not occurrence_ids
+        or len(occurrence_ids) > _CONVERSATION_MOTIF_MAX_ROOTS
+    ):
+        return _reject_atomic_knowledge(
+            conn,
+            proposal,
+            guild_id=guild_hint,
+            reason_code="living_canon_contract_invalid",
+            root_entry_ids=all_ids,
+        )
     if candidate_type not in KNOWLEDGE_CANDIDATE_TYPES:
         return _reject_atomic_knowledge(
             conn,
@@ -4125,6 +4660,62 @@ def _form_atomic_knowledge_candidate_impl(
     guild_hint = guild_id
     independent_entries = [entries[entry_id] for entry_id in independent_ids]
     derivative_entries = [entries[entry_id] for entry_id in derivative_ids]
+
+    living_root_states: dict[str, PublicAssessmentRootState] = {}
+    living_occurrences: dict[str, str] = {}
+    if living_authorized:
+        if (
+            candidate_type != "topic_or_motif"
+            or proposal.epistemic_status != "observed"
+            or derivative_ids
+            or not subject_key.startswith("discord_user:")
+        ):
+            return _reject_atomic_knowledge(
+                conn,
+                proposal,
+                guild_id=guild_id,
+                reason_code="living_canon_claim_kind_ineligible",
+                root_entry_ids=all_ids,
+            )
+        (
+            living_root_states,
+            living_occurrences,
+            living_reasons,
+        ) = _living_canon_root_states_and_occurrences(
+            conn,
+            guild_id=guild_id,
+            subject_key=subject_key,
+            entry_ids=independent_ids,
+        )
+        if any(entry_id not in living_root_states for entry_id in independent_ids):
+            return _reject_atomic_knowledge(
+                conn,
+                proposal,
+                guild_id=guild_id,
+                reason_code=(
+                    living_reasons[0]
+                    if living_reasons
+                    else "source_ineligible"
+                ),
+                root_entry_ids=all_ids,
+            )
+        recomputed_occurrences = tuple(
+            sorted(
+                {
+                    str(living_occurrences.get(entry_id) or "")
+                    for entry_id in independent_ids
+                    if str(living_occurrences.get(entry_id) or "")
+                }
+            )
+        )
+        if not recomputed_occurrences or recomputed_occurrences != occurrence_ids:
+            return _reject_atomic_knowledge(
+                conn,
+                proposal,
+                guild_id=guild_id,
+                reason_code="living_canon_occurrence_proof_mismatch",
+                root_entry_ids=all_ids,
+            )
 
     if any(
         entry.get("source_class") == SourceClass.LEGACY_SOURCE_BLIND.value
@@ -4401,14 +4992,33 @@ def _form_atomic_knowledge_candidate_impl(
         separators=(",", ":"),
     )
     root_digest = _knowledge_digest(*independent_ids)
+    occurrence_digest = (
+        _knowledge_digest(*occurrence_ids) if living_authorized else ""
+    )
     participant_scope_digest = _knowledge_digest(*participants)
-    candidate_id = _stable_knowledge_candidate_id(
-        guild_id=guild_id,
-        candidate_type=candidate_type,
-        subject_key=subject_key,
-        predicate_key=predicate_key,
-        contradiction_key=contradiction_key,
-        root_entry_ids=independent_ids,
+    candidate_id = (
+        "mlkc_"
+        + _knowledge_digest(
+            ATOMIC_KNOWLEDGE_SCHEMA_VERSION,
+            LIVING_CANON_RECURRENCE_VERSION,
+            grouping_identity,
+            int(guild_id or 0),
+            candidate_type,
+            subject_key,
+            predicate_key,
+            contradiction_key,
+            visibility,
+            participant_scope_digest,
+        )[:40]
+        if living_authorized
+        else _stable_knowledge_candidate_id(
+            guild_id=guild_id,
+            candidate_type=candidate_type,
+            subject_key=subject_key,
+            predicate_key=predicate_key,
+            contradiction_key=contradiction_key,
+            root_entry_ids=independent_ids,
+        )
     )
     recurring_public_conversation = bool(
         candidate_type == "topic_or_motif"
@@ -4425,6 +5035,7 @@ def _form_atomic_knowledge_candidate_impl(
             participant_scope_digest=participant_scope_digest,
             root_digest=root_digest,
             fallback_candidate_id=candidate_id,
+            recurrence_contract_version=recurrence_contract_version,
         )
     value_digest = _knowledge_digest(_canon(meaning))
     first_seen = min(
@@ -4581,10 +5192,27 @@ def _form_atomic_knowledge_candidate_impl(
             root_entry_ids=all_ids,
             proposal_digest=value_digest,
         )
+        if living_authorized:
+            _store_living_canon_contract(
+                conn,
+                candidate_id=candidate_id,
+                recurrence_contract_version=recurrence_contract_version,
+                grouping_signature_version=grouping_signature_version,
+                grouping_identity=grouping_identity,
+                canon_domain=canon_domain,
+                canon_claim_kind=canon_claim_kind,
+                occurrence_ids=occurrence_ids,
+                occurrence_digest=occurrence_digest,
+            )
         reconcile_atomic_knowledge_lifecycle(
             conn,
             candidate_ids=(candidate_id,),
         )
+        if living_authorized:
+            _refresh_living_canon_recurrence_proof(
+                conn,
+                candidate_id=candidate_id,
+            )
         return AtomicKnowledgeResult(
             candidate_id,
             "matched_existing",
@@ -4728,6 +5356,18 @@ def _form_atomic_knowledge_candidate_impl(
         derivation_paths=derivation_paths,
         now=now,
     )
+    if living_authorized:
+        _store_living_canon_contract(
+            conn,
+            candidate_id=candidate_id,
+            recurrence_contract_version=recurrence_contract_version,
+            grouping_signature_version=grouping_signature_version,
+            grouping_identity=grouping_identity,
+            canon_domain=canon_domain,
+            canon_claim_kind=canon_claim_kind,
+            occurrence_ids=occurrence_ids,
+            occurrence_digest=occurrence_digest,
+        )
 
     for superseded_id in explicitly_superseded:
         conn.execute(
@@ -4791,6 +5431,11 @@ def _form_atomic_knowledge_candidate_impl(
         conn,
         candidate_ids=(candidate_id,),
     )
+    if living_authorized:
+        _refresh_living_canon_recurrence_proof(
+            conn,
+            candidate_id=candidate_id,
+        )
     return AtomicKnowledgeResult(
         candidate_id,
         event_type,
@@ -4979,6 +5624,165 @@ def _conversation_motif_family_matches(
     )
 
 
+_CONVERSATION_MOTIF_EXACT_TOKEN_RE = re.compile(
+    r"[a-z0-9]+(?:['’][a-z0-9]+)?",
+    re.I,
+)
+_CONVERSATION_MOTIF_EXACT_REFERENCE_RE = re.compile(
+    r"\b(?:this|that|these|those|same|above|earlier|previous|latter)\b",
+    re.I,
+)
+_CONVERSATION_MOTIF_EXACT_DROP = frozenset(
+    {
+        "a",
+        "an",
+        "the",
+        "am",
+        "are",
+        "be",
+        "been",
+        "being",
+        "is",
+        "was",
+        "were",
+        "really",
+        "just",
+    }
+)
+
+
+def _conversation_motif_exact_inflection(value: str) -> str:
+    token = str(value or "")
+    if len(token) > 5 and token.endswith("ies"):
+        return token[:-3] + "y"
+    if len(token) > 5 and token.endswith(("ches", "shes", "sses", "xes", "zes")):
+        return token[:-2]
+    if len(token) > 5 and token.endswith("ing"):
+        base = token[:-3]
+        if len(base) >= 3 and base[-1:] == base[-2:-1] and base[-1] != "s":
+            base = base[:-1]
+        return base
+    if len(token) > 4 and token.endswith("ed"):
+        return token[:-2]
+    if (
+        len(token) > 3
+        and token.endswith("s")
+        and not token.endswith(("is", "ous", "ss", "us"))
+    ):
+        return token[:-1]
+    return token
+
+
+def _conversation_motif_exact_signature(value: str) -> tuple[str, ...]:
+    """Return one conservative ordered signature for an authoritative root."""
+
+    source_text = re.sub(r"\s+", " ", str(value or "")).strip()
+    if (
+        not _conversation_motif_terms(source_text)
+        or _CONVERSATION_MOTIF_EXACT_REFERENCE_RE.search(source_text)
+    ):
+        return ()
+    normalized = unicodedata.normalize("NFKC", source_text).casefold()
+    normalized = normalized.replace("’", "'")
+    tokens = list(_CONVERSATION_MOTIF_EXACT_TOKEN_RE.findall(normalized))
+    signature: list[str] = []
+    leading_actor = True
+    for token in tokens:
+        if token in _CONVERSATION_MOTIF_EXACT_DROP:
+            continue
+        if leading_actor and token in {"i", "we"}:
+            continue
+        leading_actor = False
+        signature.append(_conversation_motif_exact_inflection(token))
+    if not 3 <= len(signature) <= 32:
+        return ()
+    return tuple(signature)
+
+
+def _conversation_motif_neutral_predicate(
+    signature: tuple[str, ...],
+    *,
+    subject_key: str,
+) -> str:
+    if not signature or not str(subject_key or ""):
+        return ""
+    return "%s%s" % (
+        _CONVERSATION_MOTIF_NEUTRAL_PREFIX,
+        _knowledge_digest(
+            LIVING_CANON_GROUPING_SIGNATURE_VERSION,
+            str(subject_key or ""),
+            "real_community",
+            *signature,
+        )[:20],
+    )
+
+
+def _conversation_motif_neutral_groups(
+    entries: list[dict[str, Any]],
+    *,
+    subject_key: str,
+    diagnostics: dict[str, int] | None = None,
+) -> dict[str, dict[str, Any]]:
+    """Group only identical ordered signatures; ambiguous bags fail closed."""
+
+    grouped: dict[tuple[str, ...], list[dict[str, Any]]] = {}
+    for entry in entries:
+        signature = _conversation_motif_exact_signature(
+            str(entry.get("validated_text") or entry.get("normalized_value") or "")
+        )
+        if not signature:
+            if diagnostics is not None:
+                diagnostics["meaning_ambiguous_review_only"] = int(
+                    diagnostics.get("meaning_ambiguous_review_only", 0) or 0
+                ) + 1
+            continue
+        grouped.setdefault(signature, []).append(entry)
+    bag_orders: dict[tuple[str, ...], set[tuple[str, ...]]] = {}
+    for signature in grouped:
+        bag_orders.setdefault(tuple(sorted(signature)), set()).add(signature)
+    ambiguous = {
+        signature
+        for signatures in bag_orders.values()
+        if len(signatures) > 1
+        for signature in signatures
+    }
+    if ambiguous and diagnostics is not None:
+        diagnostics["meaning_ambiguous_review_only"] = int(
+            diagnostics.get("meaning_ambiguous_review_only", 0) or 0
+        ) + len(ambiguous)
+    result: dict[str, dict[str, Any]] = {}
+    for signature, signature_entries in sorted(
+        grouped.items(),
+        key=lambda item: (
+            -len({str(row.get("occurrence_identity") or "") for row in item[1]}),
+            item[0],
+        ),
+    ):
+        if signature in ambiguous:
+            continue
+        predicate = _conversation_motif_neutral_predicate(
+            signature,
+            subject_key=str(subject_key or ""),
+        )
+        if not predicate:
+            continue
+        result["neutral:%s" % predicate] = {
+            "predicate": predicate,
+            "label": " ".join(signature),
+            "entries": list(signature_entries),
+            "tags": (
+                "family_neutral",
+                "recurring_public_conversation",
+                LIVING_CANON_RECURRENCE_VERSION,
+                LIVING_CANON_GROUPING_SIGNATURE_VERSION,
+            ),
+            "neutral": True,
+            "living_v1": True,
+            "signature": signature,
+        }
+    return result
+
+
 def _conversation_motif_predicates_for_values(
     values: Iterable[str],
 ) -> tuple[str, ...]:
@@ -5019,29 +5823,104 @@ def _conversation_motif_fence_row(
     guild_id: int,
     subject_key: str,
     predicate_key: str,
+    fence_overrides: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> dict[str, str]:
-    row = conn.execute(
+    requested_predicate = str(predicate_key or "")
+    include_neutral_wildcard = bool(
+        requested_predicate.startswith(_CONVERSATION_MOTIF_NEUTRAL_PREFIX)
+        and requested_predicate != _CONVERSATION_MOTIF_NEUTRAL_FENCE_WILDCARD
+    )
+    rows = conn.execute(
         """
         SELECT correction_entry_id,correction_observed_at,reason_code,
-               fence_state,satisfied_at
-        FROM memory_ledger_conversation_motif_fences
-        WHERE guild_id=? AND subject_key=? AND predicate_key=?
+               fence_state,satisfied_at,predicate_key
+        FROM main.memory_ledger_conversation_motif_fences
+        WHERE guild_id=? AND subject_key=?
+          AND (
+            predicate_key=?
+            OR (?=1 AND predicate_key='conversation_motif_neutral_*')
+          )
+        ORDER BY predicate_key
         """,
         (
             int(guild_id or 0),
             str(subject_key or ""),
-            str(predicate_key or ""),
+            requested_predicate,
+            int(include_neutral_wildcard),
         ),
-    ).fetchone()
-    if not row:
-        return {}
-    return {
-        "correction_entry_id": str(row[0] or ""),
-        "correction_observed_at": str(row[1] or ""),
-        "reason_code": str(row[2] or ""),
-        "fence_state": str(row[3] or "active"),
-        "satisfied_at": str(row[4] or ""),
+    ).fetchall()
+    by_predicate = {
+        str(row[5] or ""): {
+            "correction_entry_id": str(row[0] or ""),
+            "correction_observed_at": str(row[1] or ""),
+            "reason_code": str(row[2] or ""),
+            "fence_state": str(row[3] or "active"),
+            "satisfied_at": str(row[4] or ""),
+            "predicate_key": str(row[5] or ""),
+        }
+        for row in rows
+        if str(row[5] or "")
     }
+    allowed_override_predicates = {requested_predicate}
+    if include_neutral_wildcard:
+        allowed_override_predicates.add(
+            _CONVERSATION_MOTIF_NEUTRAL_FENCE_WILDCARD
+        )
+    for override_predicate, override in (fence_overrides or {}).items():
+        normalized_predicate = str(override_predicate or "")
+        if normalized_predicate in allowed_override_predicates and override:
+            by_predicate[normalized_predicate] = {
+                "correction_entry_id": str(
+                    override.get("correction_entry_id") or ""
+                ),
+                "correction_observed_at": str(
+                    override.get("correction_observed_at") or ""
+                ),
+                "reason_code": str(override.get("reason_code") or ""),
+                "fence_state": str(
+                    override.get("fence_state") or "active"
+                ),
+                "satisfied_at": str(override.get("satisfied_at") or ""),
+                "predicate_key": normalized_predicate,
+            }
+    exact = by_predicate.get(requested_predicate)
+    wildcard = by_predicate.get(_CONVERSATION_MOTIF_NEUTRAL_FENCE_WILDCARD)
+    row = exact or wildcard
+    if wildcard and str(wildcard.get("fence_state") or "active") == "active":
+        exact_satisfies_wildcard = bool(
+            exact
+            and str(exact.get("fence_state") or "") == "satisfied"
+            and str(exact.get("correction_entry_id") or "")
+            == str(wildcard.get("correction_entry_id") or "")
+            and _parse_knowledge_time(exact.get("satisfied_at")) is not None
+            and _parse_knowledge_time(
+                wildcard.get("correction_observed_at")
+            )
+            is not None
+            and _parse_knowledge_time(exact.get("satisfied_at"))
+            > _parse_knowledge_time(wildcard.get("correction_observed_at"))
+        )
+        if not exact_satisfies_wildcard:
+            if (
+                exact
+                and str(exact.get("fence_state") or "active") == "active"
+                and _parse_knowledge_time(
+                    exact.get("correction_observed_at")
+                )
+                is not None
+                and _parse_knowledge_time(
+                    wildcard.get("correction_observed_at")
+                )
+                is not None
+                and _parse_knowledge_time(exact.get("correction_observed_at"))
+                > _parse_knowledge_time(wildcard.get("correction_observed_at"))
+            ):
+                row = exact
+            else:
+                row = wildcard
+    if row is None:
+        return {}
+    return dict(row)
 
 
 def _conversation_motif_entries_after_fence(
@@ -5051,12 +5930,14 @@ def _conversation_motif_entries_after_fence(
     subject_key: str,
     predicate_key: str,
     entries: list[dict[str, Any]],
+    fence_overrides: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, str]]:
     fence = _conversation_motif_fence_row(
         conn,
         guild_id=guild_id,
         subject_key=subject_key,
         predicate_key=predicate_key,
+        fence_overrides=fence_overrides,
     )
     if not fence:
         return entries, {}
@@ -5082,23 +5963,42 @@ def _withhold_conversation_motif_candidates(
 ) -> None:
     if not predicate_keys:
         return
-    placeholders = ",".join("?" for _predicate in predicate_keys)
+    wildcard_neutral = _CONVERSATION_MOTIF_NEUTRAL_FENCE_WILDCARD in set(
+        predicate_keys
+    )
+    exact_predicates = tuple(
+        predicate
+        for predicate in predicate_keys
+        if predicate != _CONVERSATION_MOTIF_NEUTRAL_FENCE_WILDCARD
+    )
+    predicate_clauses: list[str] = []
+    predicate_params: list[str] = []
+    if exact_predicates:
+        predicate_clauses.append(
+            "predicate_key IN (%s)"
+            % ",".join("?" for _predicate in exact_predicates)
+        )
+        predicate_params.extend(exact_predicates)
+    if wildcard_neutral:
+        predicate_clauses.append("predicate_key LIKE 'conversation_motif_neutral_%'")
+    if not predicate_clauses:
+        return
     candidate_ids = tuple(
         str(row[0] or "")
         for row in conn.execute(
             f"""
             SELECT candidate_id
-            FROM memory_ledger_knowledge_candidates
+            FROM main.memory_ledger_knowledge_candidates
             WHERE guild_id=? AND subject_key=?
               AND candidate_type='topic_or_motif'
-              AND predicate_key IN ({placeholders})
+              AND ({' OR '.join(predicate_clauses)})
               AND retrieval_tags_json LIKE '%recurring_public_conversation%'
             ORDER BY candidate_id
             """,
             (
                 int(guild_id or 0),
                 str(subject_key or ""),
-                *predicate_keys,
+                *predicate_params,
             ),
         ).fetchall()
         if str(row[0] or "")
@@ -5111,13 +6011,23 @@ def _withhold_conversation_motif_candidates(
     )
     conn.execute(
         f"""
-        UPDATE memory_ledger_knowledge_candidates
+        UPDATE main.memory_ledger_knowledge_candidates
         SET candidate_state=CASE
               WHEN candidate_state IN ('superseded','retired','invalidated')
                 THEN candidate_state
               ELSE 'contested'
             END,
             candidate_eligible=0,live_eligible=0,
+            public_usable=CASE
+              WHEN COALESCE(recurrence_contract_version,'')=?
+                THEN 0
+              ELSE public_usable
+            END,
+            recurrence_proof_json=CASE
+              WHEN COALESCE(recurrence_contract_version,'')=?
+                THEN '{{"candidate_eligible":false,"source_eligible":false,"roots_valid":false,"correction_fence_clear":false,"invalidated":true}}'
+              ELSE recurrence_proof_json
+            END,
             invalidated_reason=CASE
               WHEN candidate_state IN ('superseded','retired','invalidated')
                 THEN invalidated_reason
@@ -5138,6 +6048,8 @@ def _withhold_conversation_motif_candidates(
         WHERE candidate_id IN ({candidate_placeholders})
         """,
         (
+            LIVING_CANON_RECURRENCE_VERSION,
+            LIVING_CANON_RECURRENCE_VERSION,
             reason_code,
             now,
             reason_code,
@@ -5161,13 +6073,16 @@ def _withhold_conversation_motif_candidates(
         )
 
 
-def _upsert_conversation_motif_correction_fences(
+def _conversation_motif_correction_predicates(
     conn: sqlite3.Connection,
     *,
-    correction_entry: dict[str, Any],
+    correction_entry: Mapping[str, Any],
     related_entry_ids: tuple[str, ...],
     reason_code: str,
+    include_neutral: bool = False,
 ) -> tuple[str, ...]:
+    """Return the deterministic finite predicates affected by a correction."""
+
     related = _knowledge_entry_rows(
         conn,
         tuple(
@@ -5187,7 +6102,48 @@ def _upsert_conversation_motif_correction_fences(
             for entry in related.values()
         ),
     ]
-    predicate_keys = _conversation_motif_predicates_for_values(values)
+    predicate_keys = set(_conversation_motif_predicates_for_values(values))
+    if include_neutral:
+        neutral_predicates = {
+            predicate
+            for entry in related.values()
+            for signature in (
+                _conversation_motif_exact_signature(
+                    str(entry.get("normalized_value") or "")
+                ),
+            )
+            for predicate in (
+                _conversation_motif_neutral_predicate(
+                    signature,
+                    subject_key=str(correction_entry.get("subject_key") or ""),
+                ),
+            )
+            if signature and predicate
+        }
+        predicate_keys.update(neutral_predicates)
+        if not neutral_predicates and reason_code in {
+            "conversation_motif_correction_ambiguous",
+            "conversation_motif_correction_unresolved",
+        }:
+            predicate_keys.add(_CONVERSATION_MOTIF_NEUTRAL_FENCE_WILDCARD)
+    return tuple(sorted(predicate_keys))
+
+
+def _upsert_conversation_motif_correction_fences(
+    conn: sqlite3.Connection,
+    *,
+    correction_entry: dict[str, Any],
+    related_entry_ids: tuple[str, ...],
+    reason_code: str,
+    include_neutral: bool = False,
+) -> tuple[str, ...]:
+    predicate_keys = _conversation_motif_correction_predicates(
+        conn,
+        correction_entry=correction_entry,
+        related_entry_ids=related_entry_ids,
+        reason_code=reason_code,
+        include_neutral=include_neutral,
+    )
     observed = _parse_knowledge_time(correction_entry.get("observed_at"))
     observed_at = _knowledge_time(observed) if observed is not None else ""
     guild_id = int(correction_entry.get("guild_id") or 0)
@@ -5278,7 +6234,8 @@ def _finalize_conversation_motif_refresh(
         return False
     state = conn.execute(
         """
-        SELECT candidate_state,invalidated_reason
+        SELECT candidate_state,invalidated_reason,
+               recurrence_contract_version,independent_occurrence_count
         FROM memory_ledger_knowledge_candidates
         WHERE candidate_id=?
         """,
@@ -5290,6 +6247,9 @@ def _finalize_conversation_motif_refresh(
         correction_fence
         and str(correction_fence.get("fence_state") or "active")
         == "active"
+    )
+    living_v1 = bool(
+        str(state[2] or "") == LIVING_CANON_RECURRENCE_VERSION
     )
     refreshable = str(state[0] or "") in {
         "candidate",
@@ -5314,6 +6274,7 @@ def _finalize_conversation_motif_refresh(
             WHERE guild_id=? AND subject_key=?
               AND candidate_type='topic_or_motif'
               AND predicate_key=? AND candidate_id<>?
+              AND COALESCE(recurrence_contract_version,'')=?
               AND retrieval_tags_json LIKE '%recurring_public_conversation%'
             ORDER BY candidate_id
             """,
@@ -5322,6 +6283,7 @@ def _finalize_conversation_motif_refresh(
                 str(subject_key or ""),
                 str(predicate_key or ""),
                 candidate_id,
+                str(state[2] or ""),
             ),
         ).fetchall()
         if str(row[0] or "")
@@ -5359,31 +6321,64 @@ def _finalize_conversation_motif_refresh(
                 candidate_type="topic_or_motif",
                 root_entry_ids=root_entry_ids,
             )
-    if active_correction_fence:
+    correction_recurrence_satisfied = bool(
+        active_correction_fence
+        and (not living_v1 or int(state[3] or 0) >= 2)
+    )
+    if correction_recurrence_satisfied:
         satisfied_at = _now()
-        conn.execute(
-            """
-            UPDATE memory_ledger_conversation_motif_fences
-            SET fence_state='satisfied',satisfied_at=?,updated_at=?
-            WHERE guild_id=? AND subject_key=? AND predicate_key=?
-              AND correction_entry_id=?
-            """,
-            (
-                satisfied_at,
-                satisfied_at,
-                int(guild_id or 0),
-                str(subject_key or ""),
-                str(predicate_key or ""),
-                str(correction_fence.get("correction_entry_id") or ""),
-            ),
-        )
+        fence_predicate = str(correction_fence.get("predicate_key") or "")
+        if fence_predicate == _CONVERSATION_MOTIF_NEUTRAL_FENCE_WILDCARD:
+            conn.execute(
+                """
+                INSERT INTO memory_ledger_conversation_motif_fences(
+                  guild_id,subject_key,predicate_key,correction_entry_id,
+                  correction_observed_at,reason_code,fence_state,satisfied_at,
+                  created_at,updated_at
+                ) VALUES(?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(guild_id,subject_key,predicate_key) DO UPDATE SET
+                  correction_entry_id=excluded.correction_entry_id,
+                  correction_observed_at=excluded.correction_observed_at,
+                  reason_code=excluded.reason_code,fence_state='satisfied',
+                  satisfied_at=excluded.satisfied_at,updated_at=excluded.updated_at
+                """,
+                (
+                    int(guild_id or 0),
+                    str(subject_key or ""),
+                    str(predicate_key or ""),
+                    str(correction_fence.get("correction_entry_id") or ""),
+                    str(correction_fence.get("correction_observed_at") or ""),
+                    str(correction_fence.get("reason_code") or ""),
+                    "satisfied",
+                    satisfied_at,
+                    satisfied_at,
+                    satisfied_at,
+                ),
+            )
+        else:
+            conn.execute(
+                """
+                UPDATE memory_ledger_conversation_motif_fences
+                SET fence_state='satisfied',satisfied_at=?,updated_at=?
+                WHERE guild_id=? AND subject_key=? AND predicate_key=?
+                  AND correction_entry_id=?
+                """,
+                (
+                    satisfied_at,
+                    satisfied_at,
+                    int(guild_id or 0),
+                    str(subject_key or ""),
+                    str(predicate_key or ""),
+                    str(correction_fence.get("correction_entry_id") or ""),
+                ),
+            )
     reconcile_atomic_knowledge_lifecycle(
         conn,
         candidate_ids=(candidate_id,),
     )
     if (
         superseded_sibling_ids
-        or active_correction_fence
+        or correction_recurrence_satisfied
         or result.reason_code == "conversation_motif_roots_refreshed"
     ):
         _record_knowledge_receipt(
@@ -5392,7 +6387,7 @@ def _finalize_conversation_motif_refresh(
             event_type="refreshed",
             reason_code=(
                 "conversation_motif_post_correction_reestablished"
-                if active_correction_fence
+                if correction_recurrence_satisfied
                 else "conversation_motif_bounded_refresh"
             ),
             candidate_id=candidate_id,
@@ -5467,18 +6462,20 @@ def _conversation_motif_roots_by_occurrence(
     return tuple(sorted(selected)), tuple(sorted(selected_occurrences))
 
 
-def _sync_bounded_conversation_motif_corrections(
+def _bounded_conversation_motif_corrections(
     conn: sqlite3.Connection,
     *,
     guild_id: int,
     subject_key: str,
     max_scan: int,
-) -> None:
-    """Discover recent raw corrections missed while formation was disabled."""
+    include_neutral: bool = False,
+) -> tuple[tuple[dict[str, Any], tuple[str, ...], str], ...]:
+    """Resolve a bounded correction set without mutating lifecycle state."""
+
     rows = conn.execute(
         """
         SELECT entry_id,normalized_value
-        FROM memory_ledger_entries
+        FROM main.memory_ledger_entries
         WHERE guild_id=? AND subject_key=?
           AND entry_type='observation' AND predicate_key='conversation'
           AND source_table='conversations' AND source_role='user'
@@ -5513,6 +6510,7 @@ def _sync_bounded_conversation_motif_corrections(
     # Apply oldest first so a newer correction deterministically owns a
     # family fence.  The total work remains bounded by the scans above and in
     # the conservative raw resolver.
+    resolved: list[tuple[dict[str, Any], tuple[str, ...], str]] = []
     for correction_entry_id, correction_value in reversed(corrections):
         correction_entry = _knowledge_entry_rows(
             conn,
@@ -5527,7 +6525,7 @@ def _sync_bounded_conversation_motif_corrections(
                     for row in conn.execute(
                         """
                         SELECT target_entry_id
-                        FROM memory_ledger_lineage
+                        FROM main.memory_ledger_lineage
                         WHERE entry_id=?
                           AND lineage_type IN ('correction_of','supersedes')
                         ORDER BY target_entry_id
@@ -5564,22 +6562,110 @@ def _sync_bounded_conversation_motif_corrections(
             if ambiguous_targets
             else "conversation_motif_correction_unresolved"
         )
+        related_entry_ids = tuple(
+            sorted(
+                {
+                    str(entry_id or "")
+                    for entry_id in (
+                        correction_target,
+                        *ambiguous_targets,
+                    )
+                    if str(entry_id or "")
+                }
+            )
+        )
+        resolved.append((correction_entry, related_entry_ids, reason_code))
+    return tuple(resolved)
+
+
+def _preview_conversation_motif_correction_fences(
+    conn: sqlite3.Connection,
+    *,
+    guild_id: int,
+    subject_key: str,
+    max_scan: int,
+    include_neutral: bool = False,
+) -> dict[str, dict[str, str]]:
+    """Compute the fences formation would sync, without writing any table."""
+
+    planned: dict[str, dict[str, str]] = {}
+    for correction_entry, related_entry_ids, reason_code in (
+        _bounded_conversation_motif_corrections(
+            conn,
+            guild_id=int(guild_id or 0),
+            subject_key=str(subject_key or ""),
+            max_scan=max_scan,
+            include_neutral=include_neutral,
+        )
+    ):
+        observed = _parse_knowledge_time(correction_entry.get("observed_at"))
+        if observed is None:
+            continue
+        observed_at = _knowledge_time(observed)
+        correction_entry_id = str(correction_entry.get("entry_id") or "")
+        for predicate_key in _conversation_motif_correction_predicates(
+            conn,
+            correction_entry=correction_entry,
+            related_entry_ids=related_entry_ids,
+            reason_code=reason_code,
+            include_neutral=include_neutral,
+        ):
+            existing = _conversation_motif_fence_row(
+                conn,
+                guild_id=int(guild_id or 0),
+                subject_key=str(subject_key or ""),
+                predicate_key=predicate_key,
+                fence_overrides=planned,
+            )
+            existing_time = _parse_knowledge_time(
+                existing.get("correction_observed_at")
+            )
+            if existing and existing_time is not None and existing_time > observed:
+                continue
+            if (
+                existing
+                and str(existing.get("correction_entry_id") or "")
+                == correction_entry_id
+                and str(existing.get("fence_state") or "active")
+                == "satisfied"
+            ):
+                continue
+            planned[predicate_key] = {
+                "correction_entry_id": correction_entry_id,
+                "correction_observed_at": observed_at,
+                "reason_code": reason_code,
+                "fence_state": "active",
+                "satisfied_at": "",
+                "predicate_key": predicate_key,
+            }
+    return planned
+
+
+def _sync_bounded_conversation_motif_corrections(
+    conn: sqlite3.Connection,
+    *,
+    guild_id: int,
+    subject_key: str,
+    max_scan: int,
+    include_neutral: bool = False,
+) -> None:
+    """Discover recent raw corrections missed while formation was disabled."""
+
+    for correction_entry, related_entry_ids, reason_code in (
+        _bounded_conversation_motif_corrections(
+            conn,
+            guild_id=int(guild_id or 0),
+            subject_key=str(subject_key or ""),
+            max_scan=max_scan,
+            include_neutral=include_neutral,
+        )
+    ):
         _upsert_conversation_motif_correction_fences(
             conn,
             correction_entry=correction_entry,
-            related_entry_ids=tuple(
-                sorted(
-                    {
-                        str(entry_id or "")
-                        for entry_id in (
-                            correction_target,
-                            *ambiguous_targets,
-                        )
-                        if str(entry_id or "")
-                    }
-                )
-            ),
+            related_entry_ids=related_entry_ids,
             reason_code=reason_code,
+            include_neutral=include_neutral,
         )
 
 
@@ -6636,6 +7722,12 @@ def _main_public_assessment_route_authority(
     resolved = raw_route or receipt_route
     if not resolved:
         return None
+    # Conversation-continuity is a historical/backfill route.  A mutable raw
+    # label is never sufficient authority for that route; require the exact
+    # immutable Journal receipt.  Native normal_chat capture remains bound by
+    # its raw route column as before.
+    if resolved == "conversation_continuity" and receipt_route != resolved:
+        return None
     return resolved, receipt_snapshot
 
 
@@ -7132,6 +8224,8 @@ def _main_public_assessment_occurrence_candidates(
 def _main_public_assessment_occurrence_identity(
     conn: sqlite3.Connection,
     entry: Mapping[str, Any],
+    *,
+    raw_exchange_only: bool = False,
 ) -> str:
     """Recompute the bounded exchange identity from the current main state."""
 
@@ -7143,9 +8237,10 @@ def _main_public_assessment_occurrence_identity(
         or str(entry.get("source_role") or "").lower() != "user"
     ):
         return root_identity
-    moment_occurrence = _main_public_assessment_moment_occurrence(conn, entry)
-    if moment_occurrence is not None:
-        return moment_occurrence
+    if not raw_exchange_only:
+        moment_occurrence = _main_public_assessment_moment_occurrence(conn, entry)
+        if moment_occurrence is not None:
+            return moment_occurrence
     observed = _parse_knowledge_time(entry.get("observed_at"))
     current_sequence = _public_assessment_int(entry.get("source_sequence"))
     if observed is None or current_sequence is None or current_sequence <= 0:
@@ -7758,6 +8853,7 @@ def read_public_assessment_root_state(
     entry_id: str,
     guild_id: int,
     subject_key: str,
+    _living_formation_receipt: _LivingCanonFormationReceipt | None = None,
 ) -> PublicAssessmentRootState | None:
     """Return one content-bound Open Signal root or fail closed.
 
@@ -7768,6 +8864,11 @@ def read_public_assessment_root_state(
     state and digest.
     """
 
+    living_validation = bool(
+        _living_formation_receipt is not None
+        and _living_formation_receipt.authority
+        is _LIVING_CANON_FORMATION_AUTHORITY
+    )
     required_ledger_tables = (
         "memory_ledger_entries",
         "memory_ledger_lineage",
@@ -8036,7 +9137,11 @@ def read_public_assessment_root_state(
         str(entry.get("normalized_value") or "")
     )
     root_identity = _main_public_assessment_root_identity(conn, entry)
-    occurrence_identity = _main_public_assessment_occurrence_identity(conn, entry)
+    occurrence_identity = _main_public_assessment_occurrence_identity(
+        conn,
+        entry,
+        raw_exchange_only=living_validation,
+    )
     if (
         not safe_text
         or semantics.attribution_mode
@@ -8048,25 +9153,32 @@ def read_public_assessment_root_state(
     ):
         return None
 
-    fences = _main_public_assessment_fences(
-        conn,
-        guild_id=int(guild_id or 0),
-        subject_key=expected_subject,
-    )
-    if fences is None:
-        return None
-    later_guard_state = _main_public_assessment_later_guard_state(
-        conn,
-        entry=entry,
-        semantics=semantics,
-    )
-    if later_guard_state is None:
-        return None
-    later_guards, unresolved_later_correction, polarity_conflict = (
-        later_guard_state
-    )
-    if unresolved_later_correction or polarity_conflict:
-        return None
+    if living_validation:
+        # Living formation applies correction fences only after the meaning
+        # predicate has been determined.  Global subject fences here would
+        # incorrectly erase unrelated topics.
+        fences: tuple[tuple[str, ...], ...] = ()
+        later_guards: tuple[Any, ...] = ()
+    else:
+        fences = _main_public_assessment_fences(
+            conn,
+            guild_id=int(guild_id or 0),
+            subject_key=expected_subject,
+        )
+        if fences is None:
+            return None
+        later_guard_state = _main_public_assessment_later_guard_state(
+            conn,
+            entry=entry,
+            semantics=semantics,
+        )
+        if later_guard_state is None:
+            return None
+        later_guards, unresolved_later_correction, polarity_conflict = (
+            later_guard_state
+        )
+        if unresolved_later_correction or polarity_conflict:
+            return None
     observed = _parse_knowledge_time(entry.get("observed_at"))
     if observed is None:
         return None
@@ -8113,6 +9225,467 @@ def read_public_assessment_root_state(
         derived=False,
         projection=False,
     )
+
+
+def _living_canon_raw_exchange_component(
+    conn: sqlite3.Connection,
+    entry: Mapping[str, Any],
+) -> tuple[str, tuple[str, ...], tuple[str, int, str]]:
+    """Return a bounded exchange keyed by its earliest raw-authoritative root."""
+
+    current_id = str(entry.get("entry_id") or "")
+    observed_at = str(entry.get("observed_at") or "")
+    observed = _parse_knowledge_time(observed_at)
+    scope = (
+        int(entry.get("guild_id") or 0),
+        int(entry.get("channel_id") or 0),
+        str(entry.get("channel_policy") or ""),
+        str(entry.get("subject_key") or ""),
+    )
+    if not current_id or observed is None or not all((scope[0], scope[1], scope[2], scope[3])):
+        return "", (), ("", 0, "")
+    params = (
+        scope[0],
+        scope[3],
+        scope[1],
+        scope[2],
+        observed_at,
+        _CONVERSATION_OCCURRENCE_MAX_SCAN + 1,
+    )
+    before = conn.execute(
+        """
+        SELECT entry_id,observed_at,source_sequence
+        FROM main.memory_ledger_entries
+        WHERE guild_id=? AND subject_key=? AND source_table='conversations'
+          AND source_role='user' AND channel_id=? AND channel_policy=?
+          AND observed_at<=?
+        ORDER BY observed_at DESC,source_sequence DESC,entry_id DESC LIMIT ?
+        """,
+        params,
+    ).fetchall()
+    after = conn.execute(
+        """
+        SELECT entry_id,observed_at,source_sequence
+        FROM main.memory_ledger_entries
+        WHERE guild_id=? AND subject_key=? AND source_table='conversations'
+          AND source_role='user' AND channel_id=? AND channel_policy=?
+          AND observed_at>=?
+        ORDER BY observed_at,source_sequence,entry_id LIMIT ?
+        """,
+        params,
+    ).fetchall()
+    row_map = {
+        str(row[0] or ""): (
+            str(row[0] or ""),
+            str(row[1] or ""),
+            int(row[2] or 0),
+        )
+        for row in (*before, *after)
+        if str(row[0] or "")
+    }
+    ordered = sorted(
+        row_map.values(),
+        key=lambda row: (
+            _parse_knowledge_time(row[1])
+            or datetime.min.replace(tzinfo=timezone.utc),
+            row[2],
+            row[0],
+        ),
+    )
+    current_index = next(
+        (index for index, row in enumerate(ordered) if row[0] == current_id),
+        -1,
+    )
+    if current_index < 0:
+        return "", (), ("", 0, "")
+    left = current_index
+    while left > 0:
+        newer = _parse_knowledge_time(ordered[left][1])
+        older = _parse_knowledge_time(ordered[left - 1][1])
+        if newer is None or older is None or newer < older:
+            return "", (), ("", 0, "")
+        if (newer - older).total_seconds() > _CONVERSATION_MOTIF_WINDOW_SECONDS:
+            break
+        left -= 1
+    right = current_index
+    while right + 1 < len(ordered):
+        older = _parse_knowledge_time(ordered[right][1])
+        newer = _parse_knowledge_time(ordered[right + 1][1])
+        if newer is None or older is None or newer < older:
+            return "", (), ("", 0, "")
+        if (newer - older).total_seconds() > _CONVERSATION_MOTIF_WINDOW_SECONDS:
+            break
+        right += 1
+    members = ordered[left : right + 1]
+    if (
+        len(members) > _CONVERSATION_OCCURRENCE_MAX_SCAN
+        or (left == 0 and len(before) > _CONVERSATION_OCCURRENCE_MAX_SCAN)
+        or (right == len(ordered) - 1 and len(after) > _CONVERSATION_OCCURRENCE_MAX_SCAN)
+    ):
+        return "", (), ("", 0, "")
+    anchor = members[0] if members else ("", "", 0)
+    if not anchor[0]:
+        return "", (), ("", 0, "")
+    identity = _knowledge_digest("conversation_occurrence", *scope, anchor[0])
+    return identity, tuple(row[0] for row in members), (
+        anchor[1],
+        anchor[2],
+        anchor[0],
+    )
+
+
+def _living_canon_validated_moment_members(
+    conn: sqlite3.Connection,
+    *,
+    guild_id: int,
+    subject_key: str,
+    target_id: str,
+) -> tuple[str, ...] | None:
+    """Validate one finalized Moment and return only this subject's roots."""
+
+    target = _main_public_assessment_entry(conn, str(target_id or ""))
+    moment_id = str(target.get("source_row_id") or "") if target else ""
+    expected_target_id = (
+        stable_entry_id(
+            guild_id=int(guild_id or 0),
+            source_table="memory_moment_windows",
+            source_row_id=moment_id,
+            source_revision="1",
+            entry_type="shared_moment",
+            subject_key="moment:%s" % moment_id,
+            predicate_key="shared_moment",
+        )
+        if moment_id
+        else ""
+    )
+    if not target or (
+        str(target_id or "") != expected_target_id
+        or int(target.get("guild_id") or 0) != int(guild_id or 0)
+        or str(target.get("source_table") or "") != "memory_moment_windows"
+        or str(target.get("source_revision") or "") != "1"
+        or str(target.get("source_role") or "") != "derived_assessment"
+        or str(target.get("entry_type") or "") != "shared_moment"
+        or str(target.get("subject_key") or "") != "moment:%s" % moment_id
+        or str(target.get("predicate_key") or "") != "shared_moment"
+        or str(target.get("source_class") or "")
+        != SourceClass.DERIVED_SUMMARY.value
+        or str(target.get("lifecycle_status") or "") != REVIEW_ONLY_LIFECYCLE
+        or str(target.get("visibility") or "")
+        not in {Visibility.PUBLIC.value, Visibility.PUBLIC_SAFE.value}
+        or _public_assessment_bool_state(target.get("public_usable")) is not True
+        or _public_assessment_bool_state(target.get("derived")) is not True
+        or _public_assessment_bool_state(target.get("projection")) is not True
+    ):
+        return None
+    required_tables = {
+        "memory_moment_windows",
+        "memory_moment_members",
+        "memory_moment_participants",
+    }
+    main_tables = {
+        str(row[0] or "")
+        for row in conn.execute(
+            "SELECT name FROM main.sqlite_master WHERE type='table'"
+        ).fetchall()
+    }
+    if not required_tables.issubset(main_tables):
+        return None
+    lineage_rows = conn.execute(
+        """
+        SELECT guild_id,lineage_type,target_entry_id
+        FROM main.memory_ledger_lineage
+        WHERE entry_id=?
+        ORDER BY guild_id,lineage_type,target_entry_id
+        LIMIT ?
+        """,
+        (str(target_id or ""), _CONVERSATION_OCCURRENCE_MAX_SCAN + 1),
+    ).fetchall()
+    if (
+        not lineage_rows
+        or len(lineage_rows) > _CONVERSATION_OCCURRENCE_MAX_SCAN
+        or any(
+            int(row[0] or 0) != int(guild_id or 0)
+            or str(row[1] or "") != "derived_from"
+            or not str(row[2] or "")
+            for row in lineage_rows
+        )
+    ):
+        return None
+    derived_targets = {str(row[2] or "") for row in lineage_rows}
+    window = conn.execute(
+        """
+        SELECT guild_id,channel_id,channel_policy,route_mode,lifecycle_status,
+               visibility,public_usable,canonical_ledger_entry_id
+        FROM main.memory_moment_windows
+        WHERE moment_id=?
+        """,
+        (moment_id,),
+    ).fetchone()
+    if not window or (
+        int(window[0] or 0) != int(guild_id or 0)
+        or int(window[1] or 0) != int(target.get("channel_id") or 0)
+        or str(window[2] or "") != str(target.get("channel_policy") or "")
+        or str(window[3] or "") != str(target.get("route_mode") or "")
+        or str(window[4] or "") != "finalized"
+        or str(window[5] or "") != str(target.get("visibility") or "")
+        or _public_assessment_bool_state(window[6]) is not True
+        or str(window[7] or "") != str(target_id or "")
+    ):
+        return None
+    member_rows = conn.execute(
+        """
+        SELECT ledger_entry_id,membership_role
+        FROM main.memory_moment_members
+        WHERE moment_id=?
+        ORDER BY ledger_entry_id
+        LIMIT ?
+        """,
+        (moment_id, _CONVERSATION_OCCURRENCE_MAX_SCAN + 1),
+    ).fetchall()
+    member_ids = tuple(str(row[0] or "") for row in member_rows)
+    if (
+        not member_ids
+        or len(member_ids) > _CONVERSATION_OCCURRENCE_MAX_SCAN
+        or set(member_ids) != derived_targets
+        or any(
+            str(row[1] or "") not in {"human_author", "bnl_participant"}
+            for row in member_rows
+        )
+    ):
+        return None
+    participant_rows = conn.execute(
+        """
+        SELECT participant_key,participant_role
+        FROM main.memory_moment_participants
+        WHERE moment_id=?
+        ORDER BY participant_key,participant_role
+        LIMIT ?
+        """,
+        (moment_id, _CONVERSATION_OCCURRENCE_MAX_SCAN + 1),
+    ).fetchall()
+    if (
+        not participant_rows
+        or len(participant_rows) > _CONVERSATION_OCCURRENCE_MAX_SCAN
+        or len(participant_rows) != len(set(participant_rows))
+    ):
+        return None
+    expected_participants: set[tuple[str, str]] = set()
+    subject_member_ids: list[str] = []
+    for member_id, membership_role in member_rows:
+        member_id = str(member_id or "")
+        membership_role = str(membership_role or "")
+        member = _main_public_assessment_entry(conn, member_id)
+        source_role = str(member.get("source_role") or "") if member else ""
+        expected_role = (
+            "human_author" if source_role == "user" else "bnl_participant"
+        )
+        participant_key = (
+            str(member.get("subject_key") or "")
+            if source_role == "user" and member
+            else BNL_SUBJECT_KEY
+        )
+        if not member or (
+            int(member.get("guild_id") or 0) != int(guild_id or 0)
+            or str(member.get("source_table") or "") != "conversations"
+            or str(member.get("entry_type") or "")
+            not in {"observation", "derived_summary"}
+            or int(member.get("channel_id") or 0) != int(window[1] or 0)
+            or str(member.get("channel_policy") or "") != str(window[2] or "")
+            or str(member.get("route_mode") or "") != str(window[3] or "")
+            or str(member.get("visibility") or "") != str(window[5] or "")
+            or str(member.get("lifecycle_status") or "")
+            not in {ACTIVE_LIFECYCLE, REVIEW_ONLY_LIFECYCLE}
+            or membership_role != expected_role
+            or not participant_key
+            or (
+                source_role == "user"
+                and _public_assessment_bool_state(member.get("public_usable"))
+                is not True
+            )
+            or conn.execute(
+                """
+                SELECT 1 FROM main.memory_ledger_lineage
+                WHERE guild_id=? AND target_entry_id=?
+                  AND lineage_type IN ('correction_of','supersedes','retracts')
+                LIMIT 1
+                """,
+                (int(guild_id or 0), member_id),
+            ).fetchone()
+        ):
+            return None
+        expected_participants.add((participant_key, expected_role))
+        if (
+            expected_role == "human_author"
+            and participant_key == str(subject_key or "")
+        ):
+            subject_member_ids.append(member_id)
+        edges = conn.execute(
+            """
+            SELECT guild_id,target_entry_id
+            FROM main.memory_ledger_lineage
+            WHERE entry_id=? AND lineage_type='part_of_moment'
+            ORDER BY guild_id,target_entry_id
+            LIMIT ?
+            """,
+            (member_id, _CONVERSATION_OCCURRENCE_MAX_SCAN + 1),
+        ).fetchall()
+        if (
+            len(edges) > _CONVERSATION_OCCURRENCE_MAX_SCAN
+            or (int(guild_id or 0), str(target_id or "")) not in edges
+            or any(
+                int(edge[0] or 0) != int(guild_id or 0)
+                or not str(edge[1] or "")
+                for edge in edges
+            )
+        ):
+            return None
+    if (
+        set(
+            (str(row[0] or ""), str(row[1] or ""))
+            for row in participant_rows
+        )
+        != expected_participants
+        or (str(subject_key or ""), "human_author")
+        not in expected_participants
+        or not subject_member_ids
+    ):
+        return None
+    return tuple(sorted(subject_member_ids))
+
+
+def _living_canon_root_states_and_occurrences(
+    conn: sqlite3.Connection,
+    *,
+    guild_id: int,
+    subject_key: str,
+    entry_ids: tuple[str, ...],
+) -> tuple[
+    dict[str, PublicAssessmentRootState],
+    dict[str, str],
+    tuple[str, ...],
+]:
+    """Bind roots to raw state, then collapse validated Moment representations."""
+
+    if not _living_canon_main_authority_unshadowed(conn):
+        return {}, {}, ("living_canon_authority_shadowed",)
+    requested = tuple(sorted({str(value or "") for value in entry_ids if str(value or "")}))
+    if not requested or len(requested) > _CONVERSATION_MOTIF_MAX_ROOTS:
+        return {}, {}, ("source_ineligible",)
+    states: dict[str, PublicAssessmentRootState] = {}
+    entries: dict[str, dict[str, Any]] = {}
+    exchanges: dict[str, str] = {}
+    anchors: dict[str, tuple[str, int, str]] = {}
+
+    def load_root(entry_id: str) -> bool:
+        if entry_id in states:
+            return True
+        state = read_public_assessment_root_state(
+            conn,
+            entry_id=entry_id,
+            guild_id=int(guild_id or 0),
+            subject_key=str(subject_key or ""),
+            _living_formation_receipt=_living_canon_formation_receipt(),
+        )
+        entry = _main_public_assessment_entry(conn, entry_id)
+        if state is None or not entry:
+            return False
+        exchange, _members, anchor = _living_canon_raw_exchange_component(
+            conn,
+            entry,
+        )
+        if not exchange or not anchor[2]:
+            return False
+        states[entry_id] = state
+        entries[entry_id] = entry
+        exchanges[entry_id] = exchange
+        anchors[exchange] = min(anchors.get(exchange, anchor), anchor)
+        return True
+
+    for entry_id in requested:
+        if not load_root(entry_id):
+            return states, {}, ("source_ineligible",)
+
+    parent: dict[str, str] = {exchange: exchange for exchange in set(exchanges.values())}
+
+    def find(value: str) -> str:
+        parent.setdefault(value, value)
+        while parent[value] != value:
+            parent[value] = parent[parent[value]]
+            value = parent[value]
+        return value
+
+    def union(left: str, right: str) -> None:
+        left_root, right_root = find(left), find(right)
+        if left_root == right_root:
+            return
+        left_anchor = anchors.get(left_root, ("", 0, left_root))
+        right_anchor = anchors.get(right_root, ("", 0, right_root))
+        winner, loser = (
+            (left_root, right_root)
+            if left_anchor <= right_anchor
+            else (right_root, left_root)
+        )
+        parent[loser] = winner
+        anchors[winner] = min(left_anchor, right_anchor)
+
+    reasons: set[str] = set()
+    pending = list(requested)
+    seen_roots: set[str] = set()
+    seen_moments: set[str] = set()
+    while pending:
+        root_id = pending.pop()
+        if root_id in seen_roots:
+            continue
+        seen_roots.add(root_id)
+        if len(seen_roots) > _CONVERSATION_OCCURRENCE_MAX_SCAN:
+            return states, {}, ("unbounded_occurrence_withheld",)
+        links = conn.execute(
+            """
+            SELECT guild_id,target_entry_id
+            FROM main.memory_ledger_lineage
+            WHERE entry_id=? AND lineage_type='part_of_moment'
+            ORDER BY guild_id,target_entry_id
+            LIMIT ?
+            """,
+            (root_id, _CONVERSATION_OCCURRENCE_MAX_SCAN + 1),
+        ).fetchall()
+        if len(links) > _CONVERSATION_OCCURRENCE_MAX_SCAN:
+            return states, {}, ("unbounded_occurrence_withheld",)
+        for edge_guild, target_id in links:
+            target_id = str(target_id or "")
+            if int(edge_guild or 0) != int(guild_id or 0) or not target_id:
+                return states, {}, ("moment_lifecycle_or_membership_ineligible",)
+            if target_id in seen_moments:
+                continue
+            member_ids = _living_canon_validated_moment_members(
+                conn,
+                guild_id=int(guild_id or 0),
+                subject_key=str(subject_key or ""),
+                target_id=target_id,
+            )
+            if not member_ids or root_id not in member_ids:
+                return states, {}, ("moment_lifecycle_or_membership_ineligible",)
+            if any(not load_root(member_id) for member_id in member_ids):
+                return states, {}, ("moment_lifecycle_or_membership_ineligible",)
+            seen_moments.add(target_id)
+            first_exchange = exchanges[member_ids[0]]
+            for member_id in member_ids:
+                union(first_exchange, exchanges[member_id])
+                pending.append(member_id)
+            reasons.add("same_root_projection_collapsed")
+            if len(member_ids) > 1 or len(seen_moments) > 1:
+                reasons.add("overlapping_occurrence_representation_collapsed")
+
+    component_identity: dict[str, str] = {}
+    for exchange in tuple(parent):
+        root = find(exchange)
+        component_identity[exchange] = root
+    occurrences = {
+        entry_id: component_identity.get(exchange, exchange)
+        for entry_id, exchange in exchanges.items()
+        if entry_id in requested
+    }
+    return states, occurrences, tuple(sorted(reasons))
 
 
 def _public_assessment_scope_text(value: str) -> str:
@@ -8787,6 +10360,330 @@ def project_retained_conversations_to_ledger(
     return counts
 
 
+_LIVING_CANON_STRICT_ROOTS_PER_GROUP = 2
+
+
+def _living_canon_prevalidation_entries(
+    entries: Iterable[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    """Choose at most two likely-independent roots before strict validation.
+
+    Ledger timestamps can only affect bounded nomination here.  They never
+    confer eligibility; the selected roots are subsequently rebound to main
+    raw authority.  Prefer roots separated by an idle boundary, then fill.
+    """
+
+    ordered = sorted(
+        (dict(entry) for entry in entries),
+        key=lambda entry: (
+            str(entry.get("observed_at") or ""),
+            str(entry.get("entry_id") or ""),
+        ),
+        reverse=True,
+    )
+    selected: list[dict[str, Any]] = []
+    for entry in ordered:
+        observed = _parse_knowledge_time(entry.get("observed_at"))
+        scope = (
+            int(entry.get("channel_id") or 0),
+            str(entry.get("channel_policy") or ""),
+        )
+        if observed is None:
+            continue
+        if all(
+            scope
+            != (
+                int(prior.get("channel_id") or 0),
+                str(prior.get("channel_policy") or ""),
+            )
+            or abs(
+                (
+                    observed
+                    - (_parse_knowledge_time(prior.get("observed_at")) or observed)
+                ).total_seconds()
+            )
+            > _CONVERSATION_MOTIF_WINDOW_SECONDS
+            for prior in selected
+        ):
+            selected.append(entry)
+            if len(selected) >= _LIVING_CANON_STRICT_ROOTS_PER_GROUP:
+                return selected
+    selected_ids = {str(entry.get("entry_id") or "") for entry in selected}
+    for entry in ordered:
+        if str(entry.get("entry_id") or "") in selected_ids:
+            continue
+        selected.append(entry)
+        if len(selected) >= _LIVING_CANON_STRICT_ROOTS_PER_GROUP:
+            break
+    return selected
+
+
+def _living_canon_rejection_reason_counts(
+    conn: sqlite3.Connection,
+    *,
+    guild_id: int,
+    subject_key: str,
+    max_scan: int,
+) -> Counter[str]:
+    """Classify bounded rows excluded by the eligible-history SQL."""
+
+    reasons: Counter[str] = Counter()
+    rows = conn.execute(
+        """
+        SELECT visibility,public_usable,derived,projection,source_role,
+               source_class,channel_policy,lifecycle_status
+        FROM main.memory_ledger_entries
+        WHERE guild_id=? AND subject_key=? AND source_table='conversations'
+          AND entry_type='observation' AND predicate_key='conversation'
+        ORDER BY observed_at DESC,source_sequence DESC,entry_id DESC
+        LIMIT ?
+        """,
+        (
+            int(guild_id or 0),
+            str(subject_key or ""),
+            max(1, min(int(max_scan or 1), _CONVERSATION_MOTIF_MAX_SCAN)),
+        ),
+    ).fetchall()
+    for row in rows:
+        if (
+            str(row[0] or "")
+            not in {Visibility.PUBLIC.value, Visibility.PUBLIC_SAFE.value}
+            or _public_assessment_bool_state(row[1]) is not True
+            or str(row[6] or "") not in _CONVERSATION_MOTIF_PUBLIC_POLICIES
+        ):
+            reasons["visibility_ineligible"] += 1
+        if (
+            _public_assessment_bool_state(row[2]) is not False
+            or _public_assessment_bool_state(row[3]) is not False
+            or str(row[4] or "").lower() != "user"
+            or str(row[5] or "") != SourceClass.PUBLIC_OBSERVATION.value
+        ):
+            reasons["derived_source_not_independent"] += 1
+    return reasons
+
+
+def _living_canon_analyze_groups(
+    conn: sqlite3.Connection,
+    *,
+    guild_id: int,
+    subject_key: str,
+    trigger_entry_id: str = "",
+    max_scan: int = _CONVERSATION_MOTIF_MAX_SCAN,
+    diagnostics: dict[str, int] | None = None,
+    fence_overrides: Mapping[str, Mapping[str, Any]] | None = None,
+) -> tuple[list[dict[str, Any]], Counter[str], int, int]:
+    """Group cheaply, then strictly validate at most 6 x 2 roots."""
+
+    reasons = _living_canon_rejection_reason_counts(
+        conn,
+        guild_id=int(guild_id or 0),
+        subject_key=str(subject_key or ""),
+        max_scan=max_scan,
+    )
+    history = _conversation_motif_history(
+        conn,
+        guild_id=int(guild_id or 0),
+        subject_key=str(subject_key or ""),
+        max_scan=max_scan,
+        diagnostics=diagnostics,
+        require_legacy_occurrence=False,
+    )
+    grouped: dict[str, dict[str, Any]] = {}
+    unmatched: list[dict[str, Any]] = []
+    for entry in history:
+        matches = _conversation_motif_family_matches(
+            tuple(entry.get("terms") or ())
+        )
+        if not matches:
+            unmatched.append(entry)
+        for family, label in matches:
+            group = grouped.setdefault(
+                "family:%s" % family,
+                {
+                    "predicate": "conversation_motif_%s" % family,
+                    "family": family,
+                    "label": label,
+                    "entries": [],
+                    "tags": (
+                        family,
+                        "recurring_public_conversation",
+                        LIVING_CANON_RECURRENCE_VERSION,
+                        LIVING_CANON_GROUPING_SIGNATURE_VERSION,
+                    ),
+                    "living_v1": True,
+                },
+            )
+            group["entries"].append(entry)
+    grouped.update(
+        _conversation_motif_neutral_groups(
+            unmatched,
+            subject_key=str(subject_key or ""),
+            diagnostics=diagnostics,
+        )
+    )
+    ranked: list[tuple[int, float, str, dict[str, Any]]] = []
+    for group_key, group in grouped.items():
+        nominated = _living_canon_prevalidation_entries(group["entries"])
+        last_seen = max(
+            (str(entry.get("observed_at") or "") for entry in nominated),
+            default="",
+        )
+        parsed = _parse_knowledge_time(last_seen)
+        ranked.append(
+            (-len(nominated), -(parsed.timestamp() if parsed else 0.0), group_key, group)
+        )
+
+    existing_rows = conn.execute(
+        """
+        SELECT predicate_key,candidate_state,invalidated_reason
+        FROM main.memory_ledger_knowledge_candidates
+        WHERE guild_id=? AND subject_key=? AND candidate_type='topic_or_motif'
+          AND COALESCE(recurrence_contract_version,'')=?
+        ORDER BY candidate_id
+        """,
+        (
+            int(guild_id or 0),
+            str(subject_key or ""),
+            LIVING_CANON_RECURRENCE_VERSION,
+        ),
+    ).fetchall()
+    existing_by_predicate: dict[str, list[tuple[str, str]]] = {}
+    active_provisional_count = 0
+    for predicate, state, invalidated_reason in existing_rows:
+        existing_by_predicate.setdefault(str(predicate or ""), []).append(
+            (str(state or ""), str(invalidated_reason or ""))
+        )
+        if str(state or "") == "provisional":
+            active_provisional_count += 1
+
+    accepted: list[dict[str, Any]] = []
+    rejected = 0
+    for _count, _last_seen, _group_key, group in sorted(ranked)[:
+        _CONVERSATION_MOTIF_MAX_CANDIDATES
+    ]:
+        fenced_entries, fence = _conversation_motif_entries_after_fence(
+            conn,
+            guild_id=int(guild_id or 0),
+            subject_key=str(subject_key or ""),
+            predicate_key=str(group["predicate"]),
+            entries=list(group["entries"]),
+            fence_overrides=fence_overrides,
+        )
+        active_fence = bool(
+            fence and str(fence.get("fence_state") or "active") == "active"
+        )
+        if active_fence:
+            reasons["correction_fence_active"] += 1
+        nominated = _living_canon_prevalidation_entries(fenced_entries)
+        nominated_ids = tuple(
+            str(entry.get("entry_id") or "")
+            for entry in nominated
+            if str(entry.get("entry_id") or "")
+        )
+        if not nominated_ids:
+            rejected += 1
+            if fence and str(fence.get("fence_state") or "active") == "active":
+                reasons["fresh_recurrence_required_after_correction"] += 1
+            continue
+        states, occurrence_map, root_reasons = (
+            _living_canon_root_states_and_occurrences(
+                conn,
+                guild_id=int(guild_id or 0),
+                subject_key=str(subject_key or ""),
+                entry_ids=nominated_ids,
+            )
+        )
+        reasons.update(root_reasons)
+        if (
+            any(entry_id not in states for entry_id in nominated_ids)
+            or any(entry_id not in occurrence_map for entry_id in nominated_ids)
+            or not occurrence_map
+        ):
+            rejected += 1
+            if not root_reasons:
+                reasons["source_ineligible"] += 1
+            continue
+        authoritative: list[dict[str, Any]] = []
+        expected_signature = tuple(group.get("signature") or ())
+        expected_family = str(group.get("family") or "")
+        for nominated_entry in nominated:
+            entry_id = str(nominated_entry.get("entry_id") or "")
+            state = states.get(entry_id)
+            occurrence = occurrence_map.get(entry_id, "")
+            if state is None or not occurrence:
+                continue
+            terms = _conversation_motif_terms(state.text)
+            if expected_family and expected_family not in {
+                family for family, _label in _conversation_motif_family_matches(terms)
+            }:
+                continue
+            if expected_signature and _conversation_motif_exact_signature(
+                state.text
+            ) != expected_signature:
+                reasons["meaning_ambiguous_review_only"] += 1
+                continue
+            item = dict(nominated_entry)
+            item["normalized_value"] = state.text
+            item["validated_text"] = state.text
+            item["terms"] = terms
+            item["root_identity"] = state.root_identity
+            item["occurrence_identity"] = occurrence
+            authoritative.append(item)
+        root_ids, occurrence_ids = _conversation_motif_roots_by_occurrence(
+            authoritative
+        )
+        if not root_ids or not occurrence_ids:
+            rejected += 1
+            reasons["source_ineligible"] += 1
+            continue
+        collapsed = max(0, len(root_ids) - len(occurrence_ids))
+        if collapsed:
+            reasons["same_occurrence_collapsed"] += collapsed
+        if active_fence and len(occurrence_ids) < 2:
+            reasons["fresh_recurrence_required_after_correction"] += 1
+        existing = existing_by_predicate.get(str(group["predicate"]), [])
+        if any(
+            state == "contested"
+            and invalidated_reason
+            in {"unresolved_contradiction", "explicitly_contested_evidence"}
+            for state, invalidated_reason in existing
+        ):
+            reasons["contradiction_contested"] += 1
+        if (
+            len(occurrence_ids) == 1
+            and str(trigger_entry_id or "")
+            and str(trigger_entry_id or "") not in root_ids
+        ):
+            rejected += 1
+            continue
+        if (
+            len(occurrence_ids) == 1
+            and not existing
+            and active_provisional_count >= _CONVERSATION_MOTIF_MAX_CANDIDATES
+        ):
+            rejected += 1
+            reasons["provisional_subject_bound_reached"] += 1
+            continue
+        if len(occurrence_ids) == 1 and not existing:
+            active_provisional_count += 1
+        result_group = dict(group)
+        result_group["entries"] = authoritative
+        result_group["root_ids"] = root_ids
+        result_group["occurrence_ids"] = occurrence_ids
+        result_group["correction_fence"] = fence
+        accepted.append(result_group)
+    if diagnostics is not None:
+        for reason, count in reasons.items():
+            diagnostics[reason] = int(diagnostics.get(reason, 0) or 0) + int(count)
+        diagnostics["strict_validation_group_count"] = len(
+            sorted(ranked)[:_CONVERSATION_MOTIF_MAX_CANDIDATES]
+        )
+        diagnostics["strict_validation_root_count"] = sum(
+            len(group.get("root_ids") or ()) for group in accepted
+        )
+    return accepted, reasons, rejected, len(history)
+
+
 def form_atomic_candidates_from_recurring_conversation(
     conn: sqlite3.Connection,
     *,
@@ -8803,7 +10700,11 @@ def form_atomic_candidates_from_recurring_conversation(
     lifecycle. It never turns one exchange into recurrence and never promotes
     raw text into scalar identity or role facts.
     """
-    if not conversation_motif_formation_enabled(environ):
+    legacy_formation = conversation_motif_formation_enabled(environ)
+    living_v1_formation = living_canon_v1_formation_enabled(environ)
+    if not legacy_formation and not living_v1_formation:
+        return []
+    if living_v1_formation and not _living_canon_main_authority_unshadowed(conn):
         return []
     ensure_memory_ledger_schema(conn)
     trigger_id = str(trigger_entry_id or "").strip()
@@ -8826,66 +10727,98 @@ def form_atomic_candidates_from_recurring_conversation(
     ):
         return []
 
-    project_retained_conversations_to_ledger(
-        conn,
-        guild_id=int(guild_id or 0),
-        subject_key=str(subject_key),
-        max_scan=max_scan,
-        diagnostics=diagnostics,
-        environ=environ,
-    )
+    # Preserve the legacy path exactly.  Living v1 never silently projects
+    # retained history; historical projection remains a separately gated
+    # operation.
+    if legacy_formation and not living_v1_formation:
+        project_retained_conversations_to_ledger(
+            conn,
+            guild_id=int(guild_id or 0),
+            subject_key=str(subject_key),
+            max_scan=max_scan,
+            diagnostics=diagnostics,
+            environ=environ,
+        )
     _sync_bounded_conversation_motif_corrections(
         conn,
         guild_id=int(guild_id or 0),
         subject_key=str(subject_key),
         max_scan=max_scan,
+        include_neutral=living_v1_formation,
     )
-    history = _conversation_motif_history(
-        conn,
-        guild_id=int(guild_id or 0),
-        subject_key=str(subject_key),
-        max_scan=max_scan,
-        diagnostics=diagnostics,
-    )
-    if not history:
-        _record_knowledge_receipt(
+    if living_v1_formation:
+        analyzed_groups, _analysis_reasons, _rejected, history_count = (
+            _living_canon_analyze_groups(
+                conn,
+                guild_id=int(guild_id or 0),
+                subject_key=str(subject_key),
+                trigger_entry_id=trigger_id,
+                max_scan=max_scan,
+                diagnostics=diagnostics,
+            )
+        )
+        grouped = {
+            str(group.get("predicate") or ""): group
+            for group in analyzed_groups
+        }
+        history: list[dict[str, Any]] = [
+            entry for group in analyzed_groups for entry in group["entries"]
+        ]
+        if history_count <= 0:
+            _record_knowledge_receipt(
+                conn,
+                guild_id=int(guild_id or 0),
+                event_type="formation_skipped",
+                reason_code="conversation_motif_no_eligible_history",
+                candidate_type="topic_or_motif",
+            )
+            return []
+    else:
+        history = _conversation_motif_history(
             conn,
             guild_id=int(guild_id or 0),
-            event_type="formation_skipped",
-            reason_code="conversation_motif_no_eligible_history",
-            candidate_type="topic_or_motif",
+            subject_key=str(subject_key),
+            max_scan=max_scan,
+            diagnostics=diagnostics,
         )
-        return []
-
-    grouped: dict[str, dict[str, Any]] = {}
-    for entry in history:
-        matches = _conversation_motif_family_matches(
-            tuple(entry.get("terms") or ())
-        )
-        if not matches and diagnostics is not None:
-            diagnostics["ledger_rows_family_unmatched"] = (
-                int(
-                    diagnostics.get(
-                        "ledger_rows_family_unmatched",
-                        0,
-                    )
-                    or 0
+        if not history:
+            _record_knowledge_receipt(
+                conn,
+                guild_id=int(guild_id or 0),
+                event_type="formation_skipped",
+                reason_code="conversation_motif_no_eligible_history",
+                candidate_type="topic_or_motif",
+            )
+            return []
+        grouped = {}
+        for entry in history:
+            matches = _conversation_motif_family_matches(
+                tuple(entry.get("terms") or ())
+            )
+            if not matches and diagnostics is not None:
+                diagnostics["ledger_rows_family_unmatched"] = (
+                    int(diagnostics.get("ledger_rows_family_unmatched", 0) or 0)
+                    + 1
                 )
-                + 1
-            )
-        for family, label in matches:
-            group = grouped.setdefault(
-                "family:%s" % family,
-                {
-                    "predicate": "conversation_motif_%s" % family,
-                    "label": label,
-                    "entries": [],
-                    "tags": (family, "recurring_public_conversation"),
-                },
-            )
-            group["entries"].append(entry)
+            for family, label in matches:
+                group = grouped.setdefault(
+                    "family:%s" % family,
+                    {
+                        "predicate": "conversation_motif_%s" % family,
+                        "label": label,
+                        "entries": [],
+                        "tags": (family, "recurring_public_conversation"),
+                        "living_v1": False,
+                    },
+                )
+                group["entries"].append(entry)
     if diagnostics is not None:
-        diagnostics["motif_families_matched"] = len(grouped)
+        diagnostics["motif_families_matched"] = sum(
+            1 for group in grouped.values() if not group.get("neutral")
+        )
+        diagnostics["motif_neutral_groups_proposed"] = sum(
+            1 for group in grouped.values() if group.get("neutral")
+        )
 
     results: list[AtomicKnowledgeResult] = []
     ranked_groups: list[tuple[int, float, str, dict[str, Any]]] = []
@@ -8927,7 +10860,11 @@ def form_atomic_candidates_from_recurring_conversation(
         root_ids, occurrence_ids = _conversation_motif_roots_by_occurrence(
             list(group["entries"])
         )
-        if len(occurrence_ids) < 2 or len(root_ids) < 2:
+        minimum_recurrence = 1 if group.get("living_v1") else 2
+        if (
+            len(occurrence_ids) < minimum_recurrence
+            or len(root_ids) < minimum_recurrence
+        ):
             if diagnostics is not None:
                 diagnostics["motif_families_recurrence_not_met"] = (
                     int(
@@ -8948,6 +10885,17 @@ def form_atomic_candidates_from_recurring_conversation(
             ),
             "",
         )
+        living_v1 = bool(group.get("living_v1"))
+        grouping_identity = (
+            _knowledge_digest(
+                LIVING_CANON_GROUPING_SIGNATURE_VERSION,
+                str(subject_key),
+                str(group["predicate"]),
+                "real_community",
+            )
+            if living_v1
+            else ""
+        )
         result = form_atomic_knowledge_candidate(
             conn,
             AtomicKnowledgeProposal(
@@ -8956,14 +10904,14 @@ def form_atomic_candidates_from_recurring_conversation(
                 subject_display_name=display_name,
                 predicate_key=str(group["predicate"]),
                 meaning=(
-                    "Recurring public conversation about %s."
+                    "Possible public conversation theme about %s."
                     % str(group["label"]).strip()
                 ),
                 root_entry_ids=root_ids,
                 participant_keys=(str(subject_key),),
                 epistemic_status="observed",
                 uncertainty_note=(
-                    "Repeated public conversation observation; not a scalar "
+                    "Cautious public conversation observation; not a scalar "
                     "identity fact or exact quote."
                 ),
                 currentness="historical",
@@ -8971,6 +10919,19 @@ def form_atomic_candidates_from_recurring_conversation(
                     "%s:%s" % (str(subject_key), str(group["predicate"]))
                 ),
                 retrieval_tags=tuple(group["tags"]),
+                recurrence_contract_version=(
+                    LIVING_CANON_RECURRENCE_VERSION if living_v1 else ""
+                ),
+                grouping_signature_version=(
+                    LIVING_CANON_GROUPING_SIGNATURE_VERSION if living_v1 else ""
+                ),
+                grouping_identity=grouping_identity,
+                canon_domain="real_community" if living_v1 else "",
+                canon_claim_kind="behavior_pattern" if living_v1 else "",
+                occurrence_ids=occurrence_ids if living_v1 else (),
+            ),
+            _living_formation_receipt=(
+                _living_canon_formation_receipt() if living_v1 else None
             ),
         )
         _finalize_conversation_motif_refresh(
@@ -8983,6 +10944,15 @@ def form_atomic_candidates_from_recurring_conversation(
             correction_fence=dict(group.get("correction_fence") or {}),
         )
         results.append(result)
+        if diagnostics is not None and living_v1:
+            reason_key = (
+                "independent_recurrence_established"
+                if len(occurrence_ids) >= 2 and len(root_ids) >= 2
+                else "single_occurrence_provisional"
+            )
+            diagnostics[reason_key] = int(
+                diagnostics.get(reason_key, 0) or 0
+            ) + 1
         if len(results) >= _CONVERSATION_MOTIF_MAX_CANDIDATES:
             break
     if diagnostics is not None:
@@ -9001,6 +10971,93 @@ def form_atomic_candidates_from_recurring_conversation(
             ),
         )
     return results
+
+
+def preview_living_canon_formation(
+    conn: sqlite3.Connection,
+    *,
+    guild_id: int,
+    subject_key: str,
+    max_scan: int = _CONVERSATION_MOTIF_MAX_SCAN,
+) -> LivingCanonDryRunReport:
+    """Analyze existing source-bound Ledger roots without schema or data writes."""
+
+    before = int(conn.total_changes)
+    if (
+        int(guild_id or 0) <= 0
+        or not str(subject_key or "").startswith("discord_user:")
+        or not {
+            "memory_ledger_entries",
+            "memory_ledger_lineage",
+            "memory_ledger_participants",
+            "memory_ledger_conversation_motif_fences",
+            "conversations",
+        }.issubset(
+            {
+                str(row[0] or "")
+                for row in conn.execute(
+                    "SELECT name FROM main.sqlite_master WHERE type='table'"
+                ).fetchall()
+            }
+        )
+        or not _living_canon_main_authority_unshadowed(conn)
+    ):
+        return LivingCanonDryRunReport(
+            skipped_count=1,
+            reason_counts=(("source_ineligible", 1),),
+            source_write_count=int(conn.total_changes) - before,
+            write_occurred=int(conn.total_changes) != before,
+        )
+
+    diagnostics: dict[str, int] = {}
+    pending_fences = _preview_conversation_motif_correction_fences(
+        conn,
+        guild_id=int(guild_id or 0),
+        subject_key=str(subject_key),
+        max_scan=max_scan,
+        include_neutral=True,
+    )
+    groups, reasons, rejected, _history_count = _living_canon_analyze_groups(
+        conn,
+        guild_id=int(guild_id or 0),
+        subject_key=str(subject_key),
+        max_scan=max_scan,
+        diagnostics=diagnostics,
+        fence_overrides=pending_fences,
+    )
+    state_counts: Counter[str] = Counter()
+    root_total = occurrence_total = collapsed_total = 0
+    for group in groups:
+        roots = tuple(group.get("root_ids") or ())
+        occurrences = tuple(group.get("occurrence_ids") or ())
+        root_total += len(roots)
+        occurrence_total += len(occurrences)
+        collapsed_total += max(0, len(roots) - len(occurrences))
+        state = "established" if len(roots) >= 2 and len(occurrences) >= 2 else "provisional"
+        state_counts[state] += 1
+        reasons[
+            "independent_recurrence_established"
+            if state == "established"
+            else "single_occurrence_provisional"
+        ] += 1
+    changes = int(conn.total_changes) - before
+    return LivingCanonDryRunReport(
+        proposed_count=len(groups),
+        skipped_count=sum(
+            value
+            for key, value in reasons.items()
+            if key in {"source_ineligible", "unbounded_occurrence_withheld"}
+        ),
+        ambiguous_count=int(reasons.get("meaning_ambiguous_review_only", 0)),
+        rejected_count=int(rejected),
+        candidate_state_counts=tuple(sorted(state_counts.items())),
+        reason_counts=tuple(sorted(reasons.items())),
+        independent_root_count=root_total,
+        independent_occurrence_count=occurrence_total,
+        collapsed_root_count=collapsed_total,
+        source_write_count=changes,
+        write_occurred=bool(changes),
+    )
 
 
 def form_atomic_candidates_from_moment(
@@ -9892,7 +11949,7 @@ def _finalized_conversation_correction_resolution(
     rows = conn.execute(
         """
         SELECT DISTINCT e.entry_id,e.normalized_value
-        FROM memory_ledger_entries e
+        FROM main.memory_ledger_entries e
         JOIN memory_moment_members m
           ON m.ledger_entry_id=e.entry_id
         JOIN memory_moment_windows w
@@ -9911,7 +11968,7 @@ def _finalized_conversation_correction_resolution(
           AND w.lifecycle_status='finalized'
           AND w.public_usable=1
           AND NOT EXISTS (
-            SELECT 1 FROM memory_ledger_lineage l
+            SELECT 1 FROM main.memory_ledger_lineage l
             WHERE l.guild_id=e.guild_id
               AND l.target_entry_id=e.entry_id
               AND l.lineage_type IN (
@@ -9980,7 +12037,7 @@ def _raw_conversation_correction_resolution(
     rows = conn.execute(
         """
         SELECT e.entry_id,e.normalized_value
-        FROM memory_ledger_entries e
+        FROM main.memory_ledger_entries e
         WHERE e.guild_id=? AND e.subject_key=?
           AND e.entry_id<>?
           AND e.source_table='conversations' AND e.source_role='user'
@@ -9991,7 +12048,7 @@ def _raw_conversation_correction_resolution(
           AND e.visibility IN ('public','public_safe')
           AND e.source_sequence<?
           AND NOT EXISTS (
-            SELECT 1 FROM memory_ledger_lineage l
+            SELECT 1 FROM main.memory_ledger_lineage l
             WHERE l.guild_id=e.guild_id
               AND l.target_entry_id=e.entry_id
               AND l.lineage_type IN (

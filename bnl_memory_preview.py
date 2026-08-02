@@ -18,6 +18,10 @@ from collections import Counter
 from typing import Any, Callable, Mapping
 from urllib.parse import quote
 
+from bnl_canon_source_contract import (
+    LIVING_CANON_GROUPING_SIGNATURE_VERSION,
+    LIVING_CANON_RECURRENCE_VERSION,
+)
 from bnl_conversation_context_v2 import (
     ConversationContextRequest,
     assemble_conversation_context_v2,
@@ -50,6 +54,7 @@ from bnl_unified_response_assessment import (
 
 
 PREVIEW_SCHEMA_VERSION = "bnl_memory_preview_v2"
+LIVING_CANON_PREVIEW_SCHEMA_VERSION = "living_canon_preview_v1"
 SIMULATED_ROUTE_MODE = "normal_chat"
 SIMULATED_CHANNEL_POLICY = "public_home"
 SIMULATED_CHANNEL_NAME = "barcode-bot"
@@ -80,6 +85,50 @@ _PREVIEW_PROMPT_CONTROL_LABEL_RE = re.compile(
     r"broadcast memory)\b",
     re.I,
 )
+_LIVING_CANON_PREVIEW_STATES = frozenset(
+    {
+        "candidate",
+        "provisional",
+        "established",
+        "contested",
+        "superseded",
+        "retired",
+        "review_only",
+        "proposed",
+        "skipped",
+        "ambiguous",
+        "rejected",
+        "withheld",
+    }
+)
+_LIVING_CANON_PREVIEW_REASONS = frozenset(
+    {
+        "single_occurrence_provisional",
+        "independent_recurrence_established",
+        "same_occurrence_collapsed",
+        "overlapping_occurrence_representation_collapsed",
+        "same_root_projection_collapsed",
+        "unbounded_occurrence_withheld",
+        "correction_fence_active",
+        "fresh_recurrence_required_after_correction",
+        "source_ineligible",
+        "visibility_ineligible",
+        "derived_source_not_independent",
+        "meaning_ambiguous_review_only",
+        "contradiction_contested",
+        "moment_lifecycle_or_membership_ineligible",
+        "candidate_limit_reached",
+        "provisional_subject_bound_reached",
+        "no_eligible_recurrence",
+    }
+)
+_LIVING_CANON_PREVIEW_BOUND_LIMITS = {
+    "eligible_ledger_scan_max": 1200,
+    "motif_candidates_max": 6,
+    "retained_roots_max": 12,
+    "occurrence_lookback_max": 64,
+    "idle_boundary_seconds": 30 * 60,
+}
 
 
 @dataclass(frozen=True)
@@ -100,6 +149,27 @@ BaselinePromptBuilder = Callable[
     [sqlite3.Connection, MemoryPreviewRequest, Mapping[str, str]],
     tuple[str, tuple[str, ...]],
 ]
+
+
+@dataclass(frozen=True)
+class LivingCanonPreviewDiagnostics:
+    schema_version: str = LIVING_CANON_PREVIEW_SCHEMA_VERSION
+    status: str = "not_evaluated"
+    status_reason: str = ""
+    recurrence_contract_version: str = "unverified"
+    grouping_signature_version: str = "unverified"
+    proposed_count: int = 0
+    skipped_count: int = 0
+    ambiguous_count: int = 0
+    rejected_count: int = 0
+    candidate_state_counts: tuple[tuple[str, int], ...] = ()
+    reason_counts: tuple[tuple[str, int], ...] = ()
+    independent_root_count: int = 0
+    independent_occurrence_count: int = 0
+    collapsed_root_count: int = 0
+    bounds: tuple[tuple[str, int], ...] = ()
+    source_write_count: int = 0
+    source_write_occurred: bool = False
 
 
 @dataclass(frozen=True)
@@ -137,6 +207,9 @@ class MemoryPreviewDiagnostics:
     prompt_owner_reason: str = ""
     replaced_factual_context_count: int = 0
     omission_reason_codes: tuple[str, ...] = ()
+    living_canon: LivingCanonPreviewDiagnostics = field(
+        default_factory=LivingCanonPreviewDiagnostics
+    )
 
 
 @dataclass
@@ -680,6 +753,281 @@ def _request_with_conversation_context(
     )
 
 
+def _preview_report_field(report: Any, name: str, default: Any) -> Any:
+    if isinstance(report, Mapping):
+        return report.get(name, default)
+    return getattr(report, name, default)
+
+
+def _preview_nonnegative_count(value: Any) -> int:
+    if isinstance(value, bool):
+        return 0
+    try:
+        parsed = int(str(value).strip())
+    except (TypeError, ValueError):
+        return 0
+    return max(0, min(parsed, 1_000_000_000))
+
+
+def _content_free_count_pairs(
+    value: Any,
+    *,
+    allowed: frozenset[str],
+    unknown_label: str,
+) -> tuple[tuple[str, int], ...]:
+    items = value.items() if isinstance(value, Mapping) else value
+    counter: Counter[str] = Counter()
+    try:
+        pairs = tuple(items or ())
+    except TypeError:
+        return ()
+    for item in pairs:
+        if not isinstance(item, (tuple, list)) or len(item) != 2:
+            continue
+        label = str(item[0] or "").strip().casefold()
+        count = _preview_nonnegative_count(item[1])
+        if count <= 0:
+            continue
+        counter[label if label in allowed else unknown_label] += count
+    return tuple(sorted(counter.items()))
+
+
+def _content_free_preview_bounds(value: Any) -> tuple[tuple[str, int], ...]:
+    items = value.items() if isinstance(value, Mapping) else value
+    try:
+        supplied = dict(items or ())
+    except (TypeError, ValueError):
+        return ()
+    if set(supplied) != set(_LIVING_CANON_PREVIEW_BOUND_LIMITS):
+        return ()
+    if any(
+        type(supplied.get(key)) is not int
+        or supplied[key] < 0
+        for key in _LIVING_CANON_PREVIEW_BOUND_LIMITS
+    ):
+        return ()
+    bounds = tuple(
+        (
+            key,
+            supplied[key],
+        )
+        for key in _LIVING_CANON_PREVIEW_BOUND_LIMITS
+    )
+    if any(
+        value != _LIVING_CANON_PREVIEW_BOUND_LIMITS[key]
+        for key, value in bounds
+    ):
+        return ()
+    return bounds
+
+
+def _native_preview_count(value: Any) -> bool:
+    return type(value) is int and value >= 0
+
+
+def _native_preview_count_pairs(value: Any) -> bool:
+    items = value.items() if isinstance(value, Mapping) else value
+    try:
+        pairs = tuple(items or ())
+    except TypeError:
+        return False
+    return all(
+        isinstance(item, (tuple, list))
+        and len(item) == 2
+        and isinstance(item[0], str)
+        and bool(item[0].strip())
+        and _native_preview_count(item[1])
+        for item in pairs
+    )
+
+
+def build_living_canon_preview_diagnostics(
+    conn: sqlite3.Connection,
+    *,
+    guild_id: int,
+    subject_key: str,
+    analyzer: Callable[..., Any] | None = None,
+) -> LivingCanonPreviewDiagnostics:
+    """Consume the pure recurrence analyzer without exposing its evidence."""
+
+    selected_analyzer = analyzer or getattr(
+        ledger,
+        "preview_living_canon_formation",
+        None,
+    )
+    if not callable(selected_analyzer):
+        return LivingCanonPreviewDiagnostics(
+            status="unavailable",
+            status_reason="pure_analyzer_unavailable",
+        )
+    before_changes = int(getattr(conn, "total_changes", 0) or 0)
+    try:
+        report = selected_analyzer(
+            conn,
+            guild_id=int(guild_id or 0),
+            subject_key=str(subject_key or ""),
+            max_scan=1200,
+        )
+    except Exception:
+        after_changes = int(getattr(conn, "total_changes", 0) or 0)
+        write_count = max(0, after_changes - before_changes)
+        return LivingCanonPreviewDiagnostics(
+            status="rejected",
+            status_reason="pure_analyzer_error",
+            source_write_count=write_count,
+            source_write_occurred=bool(write_count),
+        )
+    after_changes = int(getattr(conn, "total_changes", 0) or 0)
+    observed_write_count = max(0, after_changes - before_changes)
+    reported_write_count = _preview_nonnegative_count(
+        _preview_report_field(report, "source_write_count", 0)
+    )
+    reported_write_occurred = _preview_report_field(
+        report,
+        "write_occurred",
+        None,
+    )
+    source_write_count = max(observed_write_count, reported_write_count)
+    source_write_occurred = bool(
+        source_write_count or reported_write_occurred is not False
+    )
+    recurrence_version = str(
+        _preview_report_field(
+            report,
+            "recurrence_contract_version",
+            "",
+        )
+        or ""
+    ).strip()
+    grouping_version = str(
+        _preview_report_field(
+            report,
+            "grouping_signature_version",
+            "",
+        )
+        or ""
+    ).strip()
+    versions_valid = bool(
+        recurrence_version == LIVING_CANON_RECURRENCE_VERSION
+        and grouping_version == LIVING_CANON_GROUPING_SIGNATURE_VERSION
+    )
+    bounds = _content_free_preview_bounds(
+        _preview_report_field(report, "bounds", ())
+    )
+    raw_counts = {
+        name: _preview_report_field(report, name, 0)
+        for name in (
+            "proposed_count",
+            "skipped_count",
+            "ambiguous_count",
+            "rejected_count",
+            "independent_root_count",
+            "independent_occurrence_count",
+            "collapsed_root_count",
+        )
+    }
+    proposed_count = _preview_nonnegative_count(raw_counts["proposed_count"])
+    skipped_count = _preview_nonnegative_count(raw_counts["skipped_count"])
+    ambiguous_count = _preview_nonnegative_count(raw_counts["ambiguous_count"])
+    rejected_count = _preview_nonnegative_count(raw_counts["rejected_count"])
+    raw_state_counts = _preview_report_field(
+        report,
+        "candidate_state_counts",
+        (),
+    )
+    raw_reason_counts = _preview_report_field(report, "reason_counts", ())
+    candidate_state_counts = _content_free_count_pairs(
+        raw_state_counts,
+        allowed=_LIVING_CANON_PREVIEW_STATES,
+        unknown_label="unrecognized_state",
+    )
+    reason_counts = _content_free_count_pairs(
+        raw_reason_counts,
+        allowed=_LIVING_CANON_PREVIEW_REASONS,
+        unknown_label="unrecognized_reason_code",
+    )
+    independent_root_count = _preview_nonnegative_count(
+        raw_counts["independent_root_count"]
+    )
+    independent_occurrence_count = _preview_nonnegative_count(
+        raw_counts["independent_occurrence_count"]
+    )
+    collapsed_root_count = _preview_nonnegative_count(
+        raw_counts["collapsed_root_count"]
+    )
+    state_map = dict(candidate_state_counts)
+    report_valid = bool(
+        all(_native_preview_count(value) for value in raw_counts.values())
+        and _native_preview_count_pairs(raw_state_counts)
+        and _native_preview_count_pairs(raw_reason_counts)
+        and proposed_count <= _LIVING_CANON_PREVIEW_BOUND_LIMITS[
+            "motif_candidates_max"
+        ]
+        and max(
+            skipped_count,
+            ambiguous_count,
+            rejected_count,
+        )
+        <= _LIVING_CANON_PREVIEW_BOUND_LIMITS["eligible_ledger_scan_max"]
+        and set(state_map).issubset({"provisional", "established"})
+        and "unrecognized_reason_code" not in dict(reason_counts)
+        and sum(state_map.values()) == proposed_count
+        and independent_root_count
+        <= (
+            _LIVING_CANON_PREVIEW_BOUND_LIMITS["motif_candidates_max"]
+            * _LIVING_CANON_PREVIEW_BOUND_LIMITS["retained_roots_max"]
+        )
+        and independent_occurrence_count <= independent_root_count
+        and collapsed_root_count
+        == independent_root_count - independent_occurrence_count
+    )
+    status = "analyzed"
+    status_reason = "pure_analyzer_complete"
+    if source_write_occurred:
+        status = "rejected"
+        status_reason = "pure_analyzer_write_detected"
+    elif not versions_valid:
+        status = "rejected"
+        status_reason = "pure_analyzer_version_unverified"
+    elif not bounds:
+        status = "rejected"
+        status_reason = "pure_analyzer_bounds_unverified"
+    elif not report_valid:
+        status = "rejected"
+        status_reason = "pure_analyzer_report_invalid"
+    report_trusted = status == "analyzed"
+    return LivingCanonPreviewDiagnostics(
+        status=status,
+        status_reason=status_reason,
+        recurrence_contract_version=(
+            recurrence_version if versions_valid else "unverified"
+        ),
+        grouping_signature_version=(
+            grouping_version if versions_valid else "unverified"
+        ),
+        proposed_count=proposed_count if report_trusted else 0,
+        skipped_count=skipped_count if report_trusted else 0,
+        ambiguous_count=ambiguous_count if report_trusted else 0,
+        rejected_count=rejected_count if report_trusted else 0,
+        candidate_state_counts=(
+            candidate_state_counts if report_trusted else ()
+        ),
+        reason_counts=reason_counts if report_trusted else (),
+        independent_root_count=(
+            independent_root_count if report_trusted else 0
+        ),
+        independent_occurrence_count=(
+            independent_occurrence_count if report_trusted else 0
+        ),
+        collapsed_root_count=(
+            collapsed_root_count if report_trusted else 0
+        ),
+        bounds=bounds,
+        source_write_count=source_write_count,
+        source_write_occurred=source_write_occurred,
+    )
+
+
 def _formation_and_lifecycle(
     conn: sqlite3.Connection,
     request: MemoryPreviewRequest,
@@ -916,6 +1264,7 @@ def _diagnostics(
     packet: UnifiedIntelligencePacket | None = None,
     assessment: UnifiedResponseAssessment | None = None,
     packet_prompt: PacketOwnedPrompt | None = None,
+    living_canon: LivingCanonPreviewDiagnostics | None = None,
 ) -> MemoryPreviewDiagnostics:
     lifecycle = lifecycle or {}
     profile = (
@@ -1088,6 +1437,7 @@ def _diagnostics(
             else 0
         ),
         omission_reason_codes=tuple(sorted(omission_reasons)),
+        living_canon=(living_canon or LivingCanonPreviewDiagnostics()),
     )
 
 
@@ -1131,8 +1481,28 @@ def prepare_memory_preview(
         base=environ,
     )
     conn: sqlite3.Connection | None = None
+    living_canon = LivingCanonPreviewDiagnostics()
     try:
         conn = _open_read_only_memory_clone(request.source_db_path)
+        analysis_conn = sqlite3.connect(":memory:", check_same_thread=False)
+        try:
+            # Fork the already-frozen source image.  The analyzer remains
+            # disposable without taking a second source snapshot that could
+            # drift from the packet/assessment/prompt snapshot.
+            conn.backup(analysis_conn)
+            living_canon = build_living_canon_preview_diagnostics(
+                analysis_conn,
+                guild_id=request.guild_id,
+                subject_key=ledger.subject_key_for_user(
+                    request.subject_user_id
+                ),
+            )
+        finally:
+            # The analyzer always receives a disposable clone.  DDL and TEMP
+            # objects do not increment total_changes, so write diagnostics
+            # alone cannot prove that a connection is safe for downstream
+            # packet or prompt owners.
+            analysis_conn.close()
         conversation_context = _preview_conversation_context(
             conn,
             request,
@@ -1178,6 +1548,7 @@ def prepare_memory_preview(
                 formation_reason_codes=formation_reasons,
                 source_funnel_counts=source_funnel,
                 lifecycle=lifecycle,
+                living_canon=living_canon,
             )
             return PreparedMemoryPreview(
                 connection=conn,
@@ -1238,6 +1609,7 @@ def prepare_memory_preview(
             packet=packet,
             assessment=assessment,
             packet_prompt=packet_prompt,
+            living_canon=living_canon,
         )
         return PreparedMemoryPreview(
             connection=conn,
@@ -1272,6 +1644,7 @@ def prepare_memory_preview(
             diagnostics=_diagnostics(
                 route_status="processing_error",
                 route_reason=type(exc).__name__,
+                living_canon=living_canon,
             ),
         )
 
@@ -1562,6 +1935,7 @@ def render_content_free_diagnostics(
             prepared.packet_owned_prompt.reason or "not_evaluated"
         ),
     )
+    living = diag.living_canon
     return (
         "- preview_schema: `%s`" % diag.schema_version,
         "- simulated_route: `normal_chat/public_home/#barcode-bot`",
@@ -1573,6 +1947,29 @@ def render_content_free_diagnostics(
         % (list(diag.formation_reason_codes) or ["none"]),
         "- source_funnel: `%s`"
         % dict(diag.source_funnel_counts),
+        "- living_canon_dry_run: `status=%s reason=%s recurrence=%s "
+        "grouping=%s proposed=%s skipped=%s ambiguous=%s rejected=%s "
+        "roots=%s occurrences=%s collapsed_roots=%s "
+        "source_write_count=%s source_write_occurred=%s`"
+        % (
+            living.status,
+            living.status_reason or "none",
+            living.recurrence_contract_version,
+            living.grouping_signature_version,
+            living.proposed_count,
+            living.skipped_count,
+            living.ambiguous_count,
+            living.rejected_count,
+            living.independent_root_count,
+            living.independent_occurrence_count,
+            living.collapsed_root_count,
+            living.source_write_count,
+            str(living.source_write_occurred).lower(),
+        ),
+        "- living_canon_states: `%s`"
+        % dict(living.candidate_state_counts),
+        "- living_canon_reasons: `%s`" % dict(living.reason_counts),
+        "- living_canon_bounds: `%s`" % dict(living.bounds),
         "- lifecycle: `scopes=%s candidates=%s state_changes=%s`"
         % (
             diag.lifecycle_scopes,
