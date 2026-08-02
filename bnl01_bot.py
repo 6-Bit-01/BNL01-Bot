@@ -22580,6 +22580,9 @@ def _build_unified_intelligence_packet_shadow(
         visibility_allowance = "sealed_test"
     else:
         visibility_allowance = "internal"
+    shared_brain_configuration = (
+        shared_brain_synthesis_canary_configuration()
+    )
     request = IntelligencePacketRequest(
         guild_id=int(guild_id or 0),
         subject_user_id=int(subject_user_id or 0),
@@ -22599,6 +22602,9 @@ def _build_unified_intelligence_packet_shadow(
         source_context_snapshot=str(source_context_snapshot or "")[:12000],
         source_context_authorized=bool(source_context_authorized),
         immediate_recap=immediate_room_recap_requested(current_text),
+        declared_canon_authorized=bool(
+            shared_brain_configuration.get("effective")
+        ),
     )
     try:
         with sqlite3.connect(DB_FILE, timeout=0.25) as packet_conn:

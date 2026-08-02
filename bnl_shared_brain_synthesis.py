@@ -19,6 +19,10 @@ import sqlite3
 import uuid
 from typing import Any, Mapping, Sequence
 
+from bnl_canon_source_contract import (
+    ENTITY_ACCOUNT_BINDING_CONTRACT_VERSION,
+    HYBRID_CANON_CLAIM_CONTRACT_VERSION,
+)
 from bnl_memory_governance import (
     PERSONAL_RECALL_ROUTE_FAMILY,
     classify_personal_recall_intent,
@@ -40,13 +44,21 @@ from bnl_unified_intelligence_packet import (
     shadow_enabled as packet_shadow_enabled,
 )
 from bnl_unified_response_assessment import (
+    ASSESSMENT_VERSION,
     UnifiedResponseAssessment,
     assess_response_coherence,
     shadow_enabled as assessment_shadow_enabled,
 )
 
 
-SCHEMA_VERSION = "shared_brain_synthesis_v6"
+SCHEMA_VERSION = "shared_brain_synthesis_v7"
+CAPABILITY_NAME = "shared_brain_public_broad_recall"
+CAPABILITY_CONTRACT_VERSION = "hybrid_shared_brain_v1"
+CAPABILITY_RECEIPT_VERSION = "shared_brain_capability_receipt_v1"
+_EXPECTED_PACKET_SCHEMA_VERSION = "unified_intelligence_packet_v5"
+_EXPECTED_CLAIM_CONTRACT_VERSION = "hybrid_canon_claim_v1"
+_EXPECTED_ASSESSMENT_VERSION = "unified_response_assessment_v7"
+_EXPECTED_IDENTITY_CONTRACT_VERSION = "canon_entity_account_binding_v1"
 TABLE_NAME = "memory_governance_shared_brain_synthesis_runs"
 ENABLED_ENV = "BNL_SHARED_BRAIN_SYNTHESIS_CANARY_ENABLED"
 GUILD_IDS_ENV = "BNL_SHARED_BRAIN_SYNTHESIS_CANARY_GUILD_IDS"
@@ -761,13 +773,38 @@ def _configuration_details(
     )
     packet_ready = packet_shadow_enabled(environ)
     assessment_ready = assessment_shadow_enabled(environ)
+    prerequisite_versions = {
+        "packet_version": PACKET_SCHEMA_VERSION,
+        "claim_contract_version": HYBRID_CANON_CLAIM_CONTRACT_VERSION,
+        "assessment_version": ASSESSMENT_VERSION,
+        "identity_contract_version": (
+            ENTITY_ACCOUNT_BINDING_CONTRACT_VERSION
+        ),
+        "synthesis_version": SCHEMA_VERSION,
+    }
+    expected_versions = {
+        "packet_version": _EXPECTED_PACKET_SCHEMA_VERSION,
+        "claim_contract_version": _EXPECTED_CLAIM_CONTRACT_VERSION,
+        "assessment_version": _EXPECTED_ASSESSMENT_VERSION,
+        "identity_contract_version": _EXPECTED_IDENTITY_CONTRACT_VERSION,
+        "synthesis_version": "shared_brain_synthesis_v7",
+    }
+    version_conflicts = tuple(
+        sorted(
+            "version:%s" % name
+            for name, version in prerequisite_versions.items()
+            if version != expected_versions[name]
+        )
+    )
     active_live_gates = tuple(
         name for name in _LIVE_GATES if _flag(environ.get(name, ""))
     )
+    prerequisites_ready = bool(
+        packet_ready and assessment_ready and not version_conflicts
+    )
     effective = bool(
         fully_scoped
-        and packet_ready
-        and assessment_ready
+        and prerequisites_ready
         and not active_live_gates
     )
     if not requested:
@@ -780,7 +817,9 @@ def _configuration_details(
         reason = "scope_incomplete"
     elif active_live_gates:
         reason = "global_live_authority_detected"
-    elif not packet_ready or not assessment_ready:
+    elif version_conflicts:
+        reason = "prerequisite_version_conflict"
+    elif not prerequisites_ready:
         reason = "missing_shadow_prerequisites"
     else:
         reason = authority_mode
@@ -800,7 +839,63 @@ def _configuration_details(
         "reason": reason,
         "packet_ready": packet_ready,
         "assessment_ready": assessment_ready,
+        "prerequisites_ready": prerequisites_ready,
+        "prerequisite_versions": prerequisite_versions,
+        "version_conflicts": version_conflicts,
         "active_live_gates": active_live_gates,
+        "scope_digest": (
+            _digest(
+                "shared_brain_capability_scope_v1",
+                authority_mode,
+                tuple(sorted(guilds)),
+                tuple(sorted(users)),
+                tuple(sorted(channels)),
+                tuple(sorted(channel_policies)),
+            )
+            if requested
+            else ""
+        ),
+    }
+
+
+def _capability_receipt(details: Mapping[str, Any]) -> dict[str, Any]:
+    conflicts = list(details.get("version_conflicts") or ())
+    conflicts.extend(details.get("active_live_gates") or ())
+    if details.get("authority_mode") == "conflict":
+        conflicts.append("authority_mode_conflict")
+    return {
+        "receipt_version": CAPABILITY_RECEIPT_VERSION,
+        "capability": CAPABILITY_NAME,
+        "contract_version": CAPABILITY_CONTRACT_VERSION,
+        "requested": bool(details.get("requested")),
+        "effective": bool(details.get("effective")),
+        "authority_mode": str(details.get("authority_mode") or "none"),
+        "scope_digest": str(details.get("scope_digest") or ""),
+        "scope": {
+            "guild_count": len(details.get("guilds") or ()),
+            "user_count": len(details.get("users") or ()),
+            "channel_count": len(details.get("channels") or ()),
+            "channel_policies": tuple(
+                sorted(details.get("channel_policies") or ())
+            ),
+            "user_scope_required": bool(
+                details.get("user_scope_required")
+            ),
+        },
+        **dict(details.get("prerequisite_versions") or {}),
+        "prerequisites_ready": bool(
+            details.get("prerequisites_ready")
+        ),
+        "conflicts": tuple(dict.fromkeys(conflicts)),
+        "reason": str(details.get("reason") or "disabled"),
+        "kill_switch": (
+            PUBLIC_HOME_OWNER_ENABLED_ENV
+            if details.get("authority_mode")
+            == PUBLIC_HOME_OWNER_AUTHORITY
+            else ENABLED_ENV
+            if details.get("authority_mode") == SCOPED_CANARY_AUTHORITY
+            else "none"
+        ),
     }
 
 
@@ -811,6 +906,7 @@ def configuration(
 
     env = os.environ if environ is None else environ
     details = _configuration_details(env)
+    capability = _capability_receipt(details)
     return {
         "configured_enabled": details["requested"],
         "canary_requested": details["canary_requested"],
@@ -845,6 +941,8 @@ def configuration(
             _MAX_PUBLIC_HOME_OWNER_CHANNELS
         ),
         "active_live_gates": details["active_live_gates"],
+        "prerequisites_ready": details["prerequisites_ready"],
+        "capability_receipt": capability,
         "kill_switch_env": (
             PUBLIC_HOME_OWNER_ENABLED_ENV
             if details["authority_mode"] == PUBLIC_HOME_OWNER_AUTHORITY

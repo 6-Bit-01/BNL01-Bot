@@ -220,6 +220,23 @@ class GovernedBroadRecallRouteExpansionTests(unittest.TestCase):
             configured["kill_switch_env"],
             "BNL_PUBLIC_HOME_BROAD_RECALL_OWNER_ENABLED",
         )
+        receipt = configured["capability_receipt"]
+        self.assertEqual(
+            receipt["capability"],
+            "shared_brain_public_broad_recall",
+        )
+        self.assertEqual(
+            receipt["contract_version"],
+            "hybrid_shared_brain_v1",
+        )
+        self.assertTrue(receipt["requested"])
+        self.assertTrue(receipt["effective"])
+        self.assertTrue(receipt["prerequisites_ready"])
+        self.assertEqual(receipt["packet_version"], "unified_intelligence_packet_v5")
+        self.assertEqual(receipt["conflicts"], ())
+        self.assertTrue(receipt["scope_digest"])
+        self.assertEqual(receipt["scope"]["guild_count"], 1)
+        self.assertEqual(receipt["scope"]["channel_count"], 1)
 
         for user_id in (7, 99):
             with self.subTest(user_id=user_id):
@@ -284,6 +301,21 @@ class GovernedBroadRecallRouteExpansionTests(unittest.TestCase):
         )
         self.assertFalse(disabled["effective"])
         self.assertEqual(disabled["reason"], "disabled")
+
+    def test_capability_receipt_fails_closed_on_version_conflict(self):
+        with mock.patch(
+            "bnl_shared_brain_synthesis.PACKET_SCHEMA_VERSION",
+            "unified_intelligence_packet_unexpected",
+        ):
+            configured = configuration(self.flags)
+        self.assertFalse(configured["effective"])
+        self.assertEqual(
+            configured["reason"],
+            "prerequisite_version_conflict",
+        )
+        receipt = configured["capability_receipt"]
+        self.assertFalse(receipt["prerequisites_ready"])
+        self.assertIn("version:packet_version", receipt["conflicts"])
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,10 +1,11 @@
-"""Shadow-only governed retrieval and unified intelligence packet assembly.
+"""Governed retrieval and unified intelligence packet assembly.
 
 This module owns no facts.  It coordinates references selected by the existing
 Conversation Context, Memory Governance, Ledger, Moment, Relationship, canon,
-and Source File owners into one bounded comparison packet.  The packet is never
-rendered into a live prompt in this stage. Prompt items remain bounded
-separately from the route-safe factual support retained for validation.
+and Source File owners into one bounded packet.  A separately gated synthesis
+owner may render the frozen packet for broad-profile recall; this module still
+owns no live gate or delivery authority. Prompt items remain bounded separately
+from the route-safe factual support retained for validation.
 """
 from __future__ import annotations
 
@@ -24,14 +25,18 @@ from bnl_canon_source_contract import (
     CANON_FACTS,
     CANON_MEMBER_IDENTITIES,
     CANON_SOURCE_CONTRACT_VERSION,
+    CanonStatus,
     Confidence,
     EntityAccountBinding,
     SourceClass,
     SubjectIdentity,
+    adapt_legacy_canon_fact,
+    adapt_living_atomic_claim,
     adapt_open_signal_claim,
     matching_canon_member_identities,
     normalize_canon_identity_label,
     resolve_entity_identity,
+    select_declared_canon_claims_for_packet,
     strict_contract_bool,
 )
 from bnl_memory_governance import (
@@ -59,7 +64,7 @@ from bnl_profile_points import material_profile_point_map
 from bnl_relationship_engine import shadow_packet_posture
 
 
-SCHEMA_VERSION = "unified_intelligence_packet_v4"
+SCHEMA_VERSION = "unified_intelligence_packet_v5"
 TABLE_NAME = "memory_governance_intelligence_packet_runs"
 SHADOW_ENV = "BNL_UNIFIED_INTELLIGENCE_PACKET_SHADOW_ENABLED"
 _SHADOW_PREREQUISITES = (
@@ -247,10 +252,10 @@ _TERM_STOPWORDS = {
 }
 
 
-def _living_candidate_pending_convergence(
+def _living_candidate_marked(
     candidate: Mapping[str, Any],
 ) -> bool:
-    """Fail closed on any PR 4 Living marker until PR 5 owns the lane."""
+    """Identify every complete or partial Living candidate representation."""
 
     predicate = str(candidate.get("predicate_key") or "").strip().casefold()
     if predicate.startswith(_LIVING_CANON_NEUTRAL_PREDICATE_PREFIX):
@@ -365,6 +370,7 @@ class IntelligencePacketRequest:
     source_context_authorized: bool = False
     immediate_recap: bool = False
     now: str = ""
+    declared_canon_authorized: bool = False
 
 
 @dataclass(frozen=True)
@@ -397,6 +403,9 @@ class IntelligencePacketItem:
     action_identity: str = ""
     material_facets: tuple[str, ...] = ()
     supporting_observations: tuple[str, ...] = ()
+    canon_status: str = ""
+    canon_domain: str = ""
+    canon_claim_kind: str = ""
 
 
 @dataclass(frozen=True)
@@ -411,6 +420,10 @@ class IntelligencePacketDiagnostics:
     candidates_by_lane: dict[str, int] = field(default_factory=dict)
     selected_by_lane: dict[str, int] = field(default_factory=dict)
     selected_by_source_class: dict[str, int] = field(default_factory=dict)
+    candidates_by_canon_status: dict[str, int] = field(default_factory=dict)
+    selected_by_canon_status: dict[str, int] = field(default_factory=dict)
+    candidates_by_canon_domain: dict[str, int] = field(default_factory=dict)
+    selected_by_canon_domain: dict[str, int] = field(default_factory=dict)
     selected_atomic_states: dict[str, int] = field(default_factory=dict)
     validation_support_by_lane: dict[str, int] = field(default_factory=dict)
     excluded_by_reason: dict[str, int] = field(default_factory=dict)
@@ -1786,6 +1799,9 @@ def _assessment_observation_items_in_snapshot(
             polarity=state.semantics.polarity,
             action_identity=state.semantics.action_identity,
             material_facets=state.semantics.material_facets,
+            canon_status=adapted_claim.canon_status.value,
+            canon_domain=adapted_claim.domain.value,
+            canon_claim_kind=adapted_claim.claim_kind.value,
         )
         if not _route_allows_item(request, item):
             diagnostics.visibility_exclusions += 1
@@ -2001,6 +2017,131 @@ def _governed_items(
     return items
 
 
+def _declared_items(
+    conn: sqlite3.Connection,
+    request: IntelligencePacketRequest,
+    diagnostics: IntelligencePacketDiagnostics,
+    exclusions: list[IntelligencePacketExclusion],
+    *,
+    broad: bool,
+    request_terms: set[str],
+) -> list[IntelligencePacketItem]:
+    """Normalize current Declared claims only for the effective PR 5 owner."""
+
+    if not broad or not bool(request.declared_canon_authorized):
+        return []
+    selection = select_declared_canon_claims_for_packet(
+        conn,
+        guild_id=int(request.guild_id or 0),
+        route_mode=request.route_mode,
+        channel_policy=request.channel_policy,
+        capability_authorized=True,
+        limit=200,
+        now=request.now or None,
+    )
+    if selection.reason not in {"eligible", "no_eligible_claims"}:
+        count = max(1, int(selection.candidate_count or 0))
+        diagnostics.candidates_by_canon_status[CanonStatus.DECLARED.value] = (
+            diagnostics.candidates_by_canon_status.get(
+                CanonStatus.DECLARED.value,
+                0,
+            )
+            + count
+        )
+        diagnostics.excluded_by_reason[
+            "declared_%s" % selection.reason
+        ] = diagnostics.excluded_by_reason.get(
+            "declared_%s" % selection.reason,
+            0,
+        ) + count
+        return []
+
+    subject = subject_key_for_user(request.subject_user_id)
+    items: list[IntelligencePacketItem] = []
+    for claim in selection.claims:
+        member_claim = claim.subject_id == subject
+        lane = "approved_fact" if member_claim else "canon"
+        text = _canon_value(claim.value).strip()
+        diagnostics.candidates_by_lane[lane] = (
+            diagnostics.candidates_by_lane.get(lane, 0) + 1
+        )
+        if not text or not claim.root_ids or not claim.occurrence_ids:
+            _add_exclusion(
+                diagnostics,
+                exclusions,
+                lane=lane,
+                reason="declared_source_lineage_missing",
+                source_class=claim.source_class.value,
+            )
+            continue
+        if not member_claim and not _relevant(
+            request_terms=request_terms,
+            broad=broad,
+            lane=lane,
+            text=text,
+            predicate_key=claim.predicate,
+            tags=tuple(
+                _terms(claim.subject_id)
+                | _terms(claim.domain.value)
+            ),
+        ):
+            _add_exclusion(
+                diagnostics,
+                exclusions,
+                lane=lane,
+                reason="declared_topic_relevance",
+                source_class=claim.source_class.value,
+            )
+            continue
+        item = IntelligencePacketItem(
+            lane=lane,
+            source_class=claim.source_class.value,
+            source_type="declared_canon_claim",
+            source_ref=claim.source_refs[0],
+            source_digest=claim.revision_id,
+            subject_key=claim.subject_id,
+            predicate_key=claim.predicate,
+            text=text[:1000],
+            visibility=claim.visibility.value,
+            confidence=claim.confidence.value,
+            lifecycle=claim.lifecycle.value,
+            authority=_AUTHORITY_RANK.get(claim.source_class.value, 0),
+            participants=((subject,) if member_claim else ()),
+            lineage=claim.source_refs,
+            observed_at=claim.valid_from,
+            usage="content",
+            score=112.0 if member_claim else 94.0,
+            revalidation_kind="declared",
+            revalidation_key=claim.claim_id,
+            root_identities=claim.root_ids,
+            occurrence_identities=claim.occurrence_ids,
+            point_identity=(
+                _point_identity(
+                    subject_key=subject,
+                    predicate_key=claim.predicate,
+                    text=text,
+                )
+                if member_claim
+                else ""
+            ),
+            canon_status=claim.canon_status.value,
+            canon_domain=claim.domain.value,
+            canon_claim_kind=claim.claim_kind.value,
+        )
+        if not _route_allows_item(request, item):
+            diagnostics.visibility_exclusions += 1
+            _add_exclusion(
+                diagnostics,
+                exclusions,
+                lane=lane,
+                reason="declared_visibility",
+                source_class=item.source_class,
+            )
+            continue
+        items.append(item)
+    return items
+
+
 def _atomic_candidate_row(
     conn: sqlite3.Connection,
     candidate_id: str,
@@ -2012,6 +2153,7 @@ def _atomic_candidate_row(
         "subject_key",
         "predicate_key",
         "normalized_value",
+        "value_digest",
         "epistemic_status",
         "currentness",
         "candidate_state",
@@ -2023,17 +2165,21 @@ def _atomic_candidate_row(
         "candidate_eligible",
         "live_eligible",
         "invalidated_reason",
+        "invalidated_at",
         "lifecycle_schema_version",
         "consolidation_id",
         "canonical_candidate_id",
         "eligible_independent_root_count",
+        "independent_root_count",
         "reinforcement_count",
         "conflict_value_count",
         "consolidated_authority_class",
         "consolidated_confidence_class",
         "lifecycle_support_digest",
+        "lifecycle_reason",
         "review_status",
         "review_due_at",
+        "lifecycle_evaluated_at",
         "last_seen_at",
         "recurrence_contract_version",
         "grouping_signature_version",
@@ -2043,6 +2189,7 @@ def _atomic_candidate_row(
         "independent_occurrence_count",
         "occurrence_ids_json",
         "occurrence_digest",
+        "root_digest",
         "recurrence_proof_json",
         "public_usable",
     )
@@ -2123,6 +2270,8 @@ def _atomic_candidate_digest(
     candidate = _atomic_candidate_row(conn, candidate_id)
     if not candidate:
         return ""
+    stable_candidate = dict(candidate)
+    stable_candidate.pop("lifecycle_evaluated_at", None)
     roots = _atomic_root_snapshot(conn, candidate_id)
     incoming = []
     for root in roots:
@@ -2141,7 +2290,45 @@ def _atomic_candidate_digest(
                 ),
             ).fetchall()
         )
-    return _digest("atomic", candidate, roots, sorted(incoming))
+    return _digest("atomic", stable_candidate, roots, sorted(incoming))
+
+
+def _living_atomic_candidate_digest(
+    conn: sqlite3.Connection,
+    candidate_id: str,
+) -> str:
+    """Version Living evidence by proof and sources, not clone write time."""
+
+    candidate = _atomic_candidate_row(conn, candidate_id)
+    if not candidate:
+        return ""
+    stable_candidate = dict(candidate)
+    stable_candidate.pop("updated_at", None)
+    stable_candidate.pop("lifecycle_evaluated_at", None)
+    roots = _atomic_root_snapshot(conn, candidate_id)
+    incoming = []
+    for root in roots:
+        incoming.extend(
+            conn.execute(
+                """
+                SELECT entry_id,lineage_type
+                FROM main.memory_ledger_lineage
+                WHERE guild_id=? AND target_entry_id=?
+                  AND lineage_type IN ('correction_of','supersedes','retracts')
+                ORDER BY entry_id,lineage_type
+                """,
+                (
+                    int(root.get("guild_id") or 0),
+                    str(root.get("root_entry_id") or ""),
+                ),
+            ).fetchall()
+        )
+    return _digest(
+        "living_atomic_packet_source_v1",
+        stable_candidate,
+        roots,
+        sorted(incoming),
+    )
 
 
 def _atomic_root_valid(
@@ -2262,6 +2449,75 @@ def _atomic_supporting_observations(
     return tuple(observations)
 
 
+def _living_claim_for_candidate(
+    conn: sqlite3.Connection,
+    candidate: Mapping[str, Any],
+    roots: Sequence[Mapping[str, Any]],
+) -> tuple[Any | None, str]:
+    """Adapt one Living row and bind its proof to authoritative roots."""
+
+    root_entry_ids = tuple(
+        sorted(
+            str(root.get("root_entry_id") or "")
+            for root in roots
+            if str(root.get("root_entry_id") or "")
+        )
+    )
+    try:
+        stored_occurrences = json.loads(
+            str(candidate.get("occurrence_ids_json") or "[]")
+        )
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None, "living_occurrence_lineage_invalid"
+    if not isinstance(stored_occurrences, list) or any(
+        not isinstance(identity, str) or not identity.strip()
+        for identity in stored_occurrences
+    ):
+        return None, "living_occurrence_lineage_invalid"
+    normalized_stored_occurrences = tuple(
+        sorted(identity.strip() for identity in stored_occurrences)
+    )
+    if len(normalized_stored_occurrences) != len(
+        set(normalized_stored_occurrences)
+    ):
+        return None, "living_occurrence_lineage_invalid"
+    authoritative_occurrences = tuple(
+        sorted(
+            {
+                identity
+                for identity in (
+                    knowledge_occurrence_identity(conn, entry_id)
+                    for entry_id in root_entry_ids
+                )
+                if identity
+            }
+        )
+    )
+    if normalized_stored_occurrences != authoritative_occurrences:
+        return None, "living_occurrence_lineage_mismatch"
+    adapter_row = dict(candidate)
+    adapter_row.update(
+        {
+            "meaning": candidate.get("normalized_value"),
+            "root_ids": root_entry_ids,
+            "occurrence_ids": normalized_stored_occurrences,
+            "domain": candidate.get("canon_domain"),
+            "claim_kind": candidate.get("canon_claim_kind"),
+        }
+    )
+    adapted = adapt_living_atomic_claim(adapter_row)
+    claim = adapted.claim
+    if (
+        claim is None
+        or adapted.reason != "eligible_living"
+        or claim.canon_status != CanonStatus.LIVING
+        or claim.root_ids != root_entry_ids
+        or claim.occurrence_ids != normalized_stored_occurrences
+    ):
+        return None, str(adapted.reason or "living_contract_invalid")
+    return claim, ""
+
+
 def _atomic_member_fact_authorized(
     candidate: Mapping[str, Any],
     authority_class: str,
@@ -2326,6 +2582,9 @@ def _atomic_items(
     items: list[IntelligencePacketItem] = []
     for candidate_id in candidate_ids:
         candidate = _atomic_candidate_row(conn, candidate_id)
+        roots = _atomic_root_snapshot(conn, candidate_id)
+        living_marked = _living_candidate_marked(candidate)
+        living_claim = None
         candidate_type = str(candidate.get("candidate_type") or "")
         authority_class = str(
             candidate.get("consolidated_authority_class")
@@ -2346,59 +2605,82 @@ def _atomic_items(
             _parse_time(request.now) or datetime.now(timezone.utc)
         )
         reason = ""
-        if _living_candidate_pending_convergence(candidate):
-            # PR 4 owns formation and proof only. Neither a curated-family nor
-            # family-neutral Living candidate can become response evidence
-            # until PR 5 converges every canon status under the one-packet
-            # factual owner.
-            reason = "living_canon_pending_packet_convergence"
-        elif candidate.get("lifecycle_schema_version") != (
+        if living_marked:
+            living_claim, reason = _living_claim_for_candidate(
+                conn,
+                candidate,
+                roots,
+            )
+            if reason:
+                diagnostics.candidates_by_canon_status[
+                    CanonStatus.LIVING.value
+                ] = diagnostics.candidates_by_canon_status.get(
+                    CanonStatus.LIVING.value,
+                    0,
+                ) + 1
+                candidate_domain = str(
+                    candidate.get("canon_domain") or ""
+                ).strip()
+                if candidate_domain:
+                    diagnostics.candidates_by_canon_domain[
+                        candidate_domain
+                    ] = diagnostics.candidates_by_canon_domain.get(
+                        candidate_domain,
+                        0,
+                    ) + 1
+            else:
+                authority_class = living_claim.source_class.value
+        if not reason and candidate.get("lifecycle_schema_version") != (
             ATOMIC_KNOWLEDGE_LIFECYCLE_SCHEMA_VERSION
         ):
             reason = "atomic_lifecycle_not_reconciled"
-        elif str(candidate.get("candidate_state") or "") not in {
+        elif not reason and str(candidate.get("candidate_state") or "") not in {
             "established",
             "provisional",
         }:
             reason = "atomic_state"
-        elif not bool(candidate.get("candidate_eligible")):
+        elif not reason and not bool(candidate.get("candidate_eligible")):
             reason = "atomic_ineligible"
-        elif int(candidate.get("live_eligible") or 0):
+        elif not reason and int(candidate.get("live_eligible") or 0):
             diagnostics.invalid_invariants.append(
                 "atomic_live_eligible_selected_in_shadow"
             )
             reason = "atomic_live_eligible_invariant"
-        elif str(candidate.get("invalidated_reason") or ""):
+        elif not reason and str(candidate.get("invalidated_reason") or ""):
             reason = "atomic_invalidated"
-        elif int(candidate.get("conflict_value_count") or 0) > 1:
+        elif not reason and int(candidate.get("conflict_value_count") or 0) > 1:
             reason = "atomic_contested"
-        elif review_status in {"due", "retired_stale"} or (
-            review_due is not None and review_due <= request_now
+        elif not reason and (
+            review_status in {"due", "retired_stale"}
+            or (review_due is not None and review_due <= request_now)
         ):
             reason = "atomic_review_due"
-        elif review_status not in {
+        elif not reason and review_status not in {
             "current",
             "not_required",
         }:
             reason = "atomic_review_not_current"
-        elif str(candidate.get("epistemic_status") or "") in {
+        elif not reason and str(candidate.get("epistemic_status") or "") in {
             "inference",
             "contested",
         }:
             reason = "atomic_inference_or_contested"
-        elif not _atomic_member_fact_authorized(
+        elif not reason and not _atomic_member_fact_authorized(
             candidate,
             authority_class,
         ):
             reason = "atomic_member_fact_not_authorized"
-        visibility = str(candidate.get("visibility") or "unknown")
+        visibility = (
+            living_claim.visibility.value
+            if living_claim is not None
+            else str(candidate.get("visibility") or "unknown")
+        )
         if not reason and _public_route(request) and visibility not in _PUBLIC_VISIBILITIES:
             reason = "atomic_visibility"
             diagnostics.visibility_exclusions += 1
         elif not reason and not _public_route(request) and visibility not in _INTERNAL_VISIBILITIES:
             reason = "atomic_visibility"
             diagnostics.visibility_exclusions += 1
-        roots = _atomic_root_snapshot(conn, candidate_id)
         if not reason and (
             not roots
             or len(roots)
@@ -2463,7 +2745,13 @@ def _atomic_items(
         ):
             reason = "atomic_topic_relevance"
         source_digest = (
-            _atomic_candidate_digest(conn, candidate_id) if not reason else ""
+            (
+                _living_atomic_candidate_digest(conn, candidate_id)
+                if living_claim is not None
+                else _atomic_candidate_digest(conn, candidate_id)
+            )
+            if not reason
+            else ""
         )
         if not reason and not source_digest:
             reason = "atomic_source_unversioned"
@@ -2481,10 +2769,14 @@ def _atomic_items(
             )
             continue
         state = str(candidate.get("candidate_state") or "")
-        confidence = str(
-            candidate.get("consolidated_confidence_class")
-            or candidate.get("confidence_class")
-            or Confidence.UNKNOWN.value
+        confidence = (
+            living_claim.confidence.value
+            if living_claim is not None
+            else str(
+                candidate.get("consolidated_confidence_class")
+                or candidate.get("confidence_class")
+                or Confidence.UNKNOWN.value
+            )
         )
         participants = tuple(
             str(row[0])
@@ -2586,6 +2878,21 @@ def _atomic_items(
                     text=text,
                 ),
                 supporting_observations=supporting_observations,
+                canon_status=(
+                    living_claim.canon_status.value
+                    if living_claim is not None
+                    else ""
+                ),
+                canon_domain=(
+                    living_claim.domain.value
+                    if living_claim is not None
+                    else ""
+                ),
+                canon_claim_kind=(
+                    living_claim.claim_kind.value
+                    if living_claim is not None
+                    else ""
+                ),
             )
         )
     return items
@@ -2648,6 +2955,7 @@ def _canon_items(
         for fact in CANON_FACTS:
             if fact.subject.key != signal.subject.key:
                 continue
+            normalized_claim = adapt_legacy_canon_fact(fact)
             recognized_fact_keys.add((fact.subject.key, fact.predicate))
             value = _canon_value(fact.value)
             fact_text = "%s %s: %s" % (
@@ -2693,6 +3001,9 @@ def _canon_items(
                 ),
                 revalidation_kind="recognized_canon",
                 revalidation_key=source_digest,
+                canon_status=normalized_claim.canon_status.value,
+                canon_domain=normalized_claim.domain.value,
+                canon_claim_kind=normalized_claim.claim_kind.value,
             )
             if not _route_allows_item(request, item):
                 diagnostics.visibility_exclusions += 1
@@ -2708,6 +3019,7 @@ def _canon_items(
     for fact in CANON_FACTS:
         if (fact.subject.key, fact.predicate) in recognized_fact_keys:
             continue
+        normalized_claim = adapt_legacy_canon_fact(fact)
         value = _canon_value(fact.value)
         fact_text = "%s %s: %s" % (
             fact.subject.name,
@@ -2764,6 +3076,9 @@ def _canon_items(
             score=92.0,
             revalidation_kind="canon",
             revalidation_key=source_digest,
+            canon_status=normalized_claim.canon_status.value,
+            canon_domain=normalized_claim.domain.value,
+            canon_claim_kind=normalized_claim.claim_kind.value,
         )
         if not _route_allows_item(request, item):
             diagnostics.visibility_exclusions += 1
@@ -3256,6 +3571,22 @@ def _select_items(
         diagnostics.selected_by_source_class[item.source_class] = (
             diagnostics.selected_by_source_class.get(item.source_class, 0) + 1
         )
+        if item.canon_status:
+            diagnostics.selected_by_canon_status[item.canon_status] = (
+                diagnostics.selected_by_canon_status.get(
+                    item.canon_status,
+                    0,
+                )
+                + 1
+            )
+        if item.canon_domain:
+            diagnostics.selected_by_canon_domain[item.canon_domain] = (
+                diagnostics.selected_by_canon_domain.get(
+                    item.canon_domain,
+                    0,
+                )
+                + 1
+            )
         if item.revalidation_kind == "atomic":
             diagnostics.selected_atomic_states[item.lifecycle] = (
                 diagnostics.selected_atomic_states.get(item.lifecycle, 0) + 1
@@ -3580,6 +3911,96 @@ def _recognized_canon_version(
     )
 
 
+def _living_atomic_version(
+    conn: sqlite3.Connection,
+    item: IntelligencePacketItem,
+) -> str:
+    candidate_id = str(item.revalidation_key or "")
+    candidate = _atomic_candidate_row(conn, candidate_id)
+    roots = _atomic_root_snapshot(conn, candidate_id)
+    claim, reason = _living_claim_for_candidate(conn, candidate, roots)
+    if claim is None or reason:
+        return ""
+    root_entry_ids = tuple(
+        str(root.get("root_entry_id") or "")
+        for root in roots
+        if str(root.get("root_entry_id") or "")
+    )
+    root_identities = tuple(
+        dict.fromkeys(
+            identity
+            for identity in (
+                knowledge_root_identity(conn, entry_id)
+                for entry_id in root_entry_ids
+            )
+            if identity
+        )
+    )
+    occurrence_identities = tuple(
+        dict.fromkeys(
+            identity
+            for identity in (
+                knowledge_occurrence_identity(conn, entry_id)
+                for entry_id in root_entry_ids
+            )
+            if identity
+        )
+    )
+    if not (
+        item.canon_status == claim.canon_status.value
+        and item.canon_domain == claim.domain.value
+        and item.canon_claim_kind == claim.claim_kind.value
+        and item.root_identities == root_identities
+        and item.occurrence_identities == occurrence_identities
+    ):
+        return ""
+    return _living_atomic_candidate_digest(conn, candidate_id)
+
+
+def _declared_version(
+    conn: sqlite3.Connection,
+    packet: UnifiedIntelligencePacket,
+    item: IntelligencePacketItem,
+) -> str:
+    selection = select_declared_canon_claims_for_packet(
+        conn,
+        guild_id=int(packet.request.guild_id or 0),
+        route_mode=packet.request.route_mode,
+        channel_policy=packet.request.channel_policy,
+        capability_authorized=bool(
+            packet.request.declared_canon_authorized
+        ),
+        limit=200,
+        now=packet.request.now or None,
+    )
+    if selection.reason != "eligible":
+        return ""
+    claim = next(
+        (
+            candidate
+            for candidate in selection.claims
+            if candidate.claim_id == item.revalidation_key
+        ),
+        None,
+    )
+    if claim is None or not (
+        item.source_ref == claim.source_refs[0]
+        and item.source_digest == claim.revision_id
+        and item.subject_key == claim.subject_id
+        and item.predicate_key == claim.predicate
+        and item.text == _canon_value(claim.value).strip()[:1000]
+        and item.visibility == claim.visibility.value
+        and item.lifecycle == claim.lifecycle.value
+        and item.root_identities == claim.root_ids
+        and item.occurrence_identities == claim.occurrence_ids
+        and item.canon_status == claim.canon_status.value
+        and item.canon_domain == claim.domain.value
+        and item.canon_claim_kind == claim.claim_kind.value
+    ):
+        return ""
+    return claim.revision_id
+
+
 def _relationship_version(
     conn: sqlite3.Connection,
     packet: UnifiedIntelligencePacket,
@@ -3661,7 +4082,14 @@ def _revalidate_packet_in_snapshot(
             elif item.revalidation_kind == "moment":
                 current = _moment_version(conn, packet, item)
             elif item.revalidation_kind == "atomic":
-                current = _atomic_candidate_digest(conn, item.revalidation_key)
+                current = (
+                    _living_atomic_version(conn, item)
+                    if item.canon_status == CanonStatus.LIVING.value
+                    else _atomic_candidate_digest(
+                        conn,
+                        item.revalidation_key,
+                    )
+                )
             elif item.revalidation_kind == "canon":
                 current = _canon_version(item)
             elif item.revalidation_kind == "recognized_canon":
@@ -3670,6 +4098,8 @@ def _revalidate_packet_in_snapshot(
                     packet,
                     item,
                 )
+            elif item.revalidation_kind == "declared":
+                current = _declared_version(conn, packet, item)
             elif item.revalidation_kind == "relationship":
                 current = _relationship_version(
                     conn,
@@ -3800,6 +4230,47 @@ def _packet_invariants(
             and item.subject_key == subject
         ):
             invalid.append("supporting_observation_scope_violation")
+        if item.canon_status == CanonStatus.LIVING.value and not (
+            item.lane == "atomic_knowledge"
+            and item.source_type == "topic_or_motif"
+            and item.lifecycle == "established"
+            and item.source_class == SourceClass.EVIDENCE_PROJECTION.value
+            and item.revalidation_kind == "atomic"
+            and item.canon_domain in {"real_community", "lore", "hybrid"}
+            and item.canon_claim_kind == "behavior_pattern"
+            and len(item.root_identities) >= 2
+            and len(item.occurrence_identities) >= 2
+        ):
+            invalid.append("living_canon_contract_violation")
+        if item.canon_status == CanonStatus.OPEN_SIGNAL.value and not (
+            item.lane == "assessment_observation"
+            and item.revalidation_kind == "public_assessment"
+        ):
+            invalid.append("open_signal_contract_violation")
+        if item.canon_status == CanonStatus.LEGACY.value and not (
+            item.lane == "canon"
+            and item.revalidation_kind in {"canon", "recognized_canon"}
+        ):
+            invalid.append("legacy_canon_contract_violation")
+        if item.canon_status == CanonStatus.DECLARED.value and not (
+            item.source_type == "declared_canon_claim"
+            and item.lane in {"approved_fact", "canon"}
+            and item.lifecycle == "established"
+            and item.revalidation_kind == "declared"
+            and bool(item.root_identities)
+            and bool(item.occurrence_identities)
+            and (
+                item.lane != "approved_fact"
+                or item.subject_key == subject
+            )
+        ):
+            invalid.append("declared_canon_contract_violation")
+        if any(
+            (item.canon_status, item.canon_domain, item.canon_claim_kind)
+        ) and not all(
+            (item.canon_status, item.canon_domain, item.canon_claim_kind)
+        ):
+            invalid.append("partial_canon_metadata_violation")
     validation_keys = {
         (item.lane, item.source_ref, item.source_digest)
         for item in packet.validation_items
@@ -3883,6 +4354,16 @@ def build_packet(
             )
         )
         candidates.extend(
+            _declared_items(
+                conn,
+                request,
+                diagnostics,
+                exclusions,
+                broad=broad,
+                request_terms=request_terms,
+            )
+        )
+        candidates.extend(
             _atomic_items(
                 conn,
                 request,
@@ -3914,6 +4395,23 @@ def build_packet(
         )
     except (sqlite3.DatabaseError, TypeError, ValueError) as exc:
         diagnostics.processing_errors.append(type(exc).__name__)
+    for item in candidates:
+        if item.canon_status:
+            diagnostics.candidates_by_canon_status[item.canon_status] = (
+                diagnostics.candidates_by_canon_status.get(
+                    item.canon_status,
+                    0,
+                )
+                + 1
+            )
+        if item.canon_domain:
+            diagnostics.candidates_by_canon_domain[item.canon_domain] = (
+                diagnostics.candidates_by_canon_domain.get(
+                    item.canon_domain,
+                    0,
+                )
+                + 1
+            )
     selected, profile_candidates, validation_items = _select_items(
         request,
         candidates,
@@ -3936,6 +4434,9 @@ def build_packet(
             item.root_identities,
             item.occurrence_identities,
             item.point_identity,
+            item.canon_status,
+            item.canon_domain,
+            item.canon_claim_kind,
         )
         for item in selected
     )
@@ -3950,6 +4451,9 @@ def build_packet(
             item.root_identities,
             item.occurrence_identities,
             item.point_identity,
+            item.canon_status,
+            item.canon_domain,
+            item.canon_claim_kind,
         )
         for item in validation_items
     )

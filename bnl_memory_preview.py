@@ -37,6 +37,7 @@ from bnl_shared_brain_synthesis import (
     begin_run,
     build_basis,
     build_packet_owned_prompt,
+    configuration as shared_brain_configuration,
     evaluate_candidate,
     finalize_run,
     record_fallback,
@@ -53,7 +54,7 @@ from bnl_unified_response_assessment import (
 )
 
 
-PREVIEW_SCHEMA_VERSION = "bnl_memory_preview_v2"
+PREVIEW_SCHEMA_VERSION = "bnl_memory_preview_v3"
 LIVING_CANON_PREVIEW_SCHEMA_VERSION = "living_canon_preview_v1"
 SIMULATED_ROUTE_MODE = "normal_chat"
 SIMULATED_CHANNEL_POLICY = "public_home"
@@ -185,6 +186,10 @@ class MemoryPreviewDiagnostics:
     lifecycle_state_changes: int = 0
     packet_lane_counts: tuple[tuple[str, int], ...] = ()
     validation_support_lane_counts: tuple[tuple[str, int], ...] = ()
+    packet_canon_candidate_status_counts: tuple[tuple[str, int], ...] = ()
+    packet_canon_selected_status_counts: tuple[tuple[str, int], ...] = ()
+    packet_canon_candidate_domain_counts: tuple[tuple[str, int], ...] = ()
+    packet_canon_selected_domain_counts: tuple[tuple[str, int], ...] = ()
     packet_exclusion_reason_counts: tuple[tuple[str, int], ...] = ()
     packet_missing_lanes: tuple[str, ...] = ()
     packet_revalidation_status: str = "not_evaluated"
@@ -230,6 +235,7 @@ class PreparedMemoryPreview:
     )
     snapshot_digest: str = ""
     conversation_context_digest: str = ""
+    capability_receipt: dict[str, Any] = field(default_factory=dict)
 
     @property
     def ready(self) -> bool:
@@ -1098,6 +1104,7 @@ def _formation_and_lifecycle(
 def _packet_request(
     request: MemoryPreviewRequest,
     conversation_context: _PreviewConversationContext,
+    environ: Mapping[str, str],
 ) -> IntelligencePacketRequest:
     participant_ids = tuple(
         dict.fromkeys(
@@ -1134,6 +1141,9 @@ def _packet_request(
             ),
         ),
         now=_now(request.now),
+        declared_canon_authorized=bool(
+            shared_brain_configuration(environ).get("effective")
+        ),
     )
 
 
@@ -1216,6 +1226,7 @@ def _snapshot_digest(
     basis: SharedBrainSynthesisBasis | None,
     request: MemoryPreviewRequest,
     conversation_context_digest: str = "",
+    capability_receipt: Mapping[str, Any] | None = None,
 ) -> str:
     if packet is None:
         return ""
@@ -1239,6 +1250,16 @@ def _snapshot_digest(
             for context in request.competing_factual_contexts
         ),
         str(conversation_context_digest or ""),
+        _digest(
+            tuple(
+                sorted(
+                    (str(key), str(value))
+                    for key, value in dict(
+                        capability_receipt or {}
+                    ).items()
+                )
+            )
+        ),
         tuple(
             sorted(
                 (
@@ -1340,6 +1361,42 @@ def _diagnostics(
             tuple(
                 sorted(
                     packet.diagnostics.validation_support_by_lane.items()
+                )
+            )
+            if packet is not None
+            else ()
+        ),
+        packet_canon_candidate_status_counts=(
+            tuple(
+                sorted(
+                    packet.diagnostics.candidates_by_canon_status.items()
+                )
+            )
+            if packet is not None
+            else ()
+        ),
+        packet_canon_selected_status_counts=(
+            tuple(
+                sorted(
+                    packet.diagnostics.selected_by_canon_status.items()
+                )
+            )
+            if packet is not None
+            else ()
+        ),
+        packet_canon_candidate_domain_counts=(
+            tuple(
+                sorted(
+                    packet.diagnostics.candidates_by_canon_domain.items()
+                )
+            )
+            if packet is not None
+            else ()
+        ),
+        packet_canon_selected_domain_counts=(
+            tuple(
+                sorted(
+                    packet.diagnostics.selected_by_canon_domain.items()
                 )
             )
             if packet is not None
@@ -1480,6 +1537,9 @@ def prepare_memory_preview(
         channel_id=request.simulated_channel_id,
         base=environ,
     )
+    capability_receipt = dict(
+        shared_brain_configuration(env).get("capability_receipt") or {}
+    )
     conn: sqlite3.Connection | None = None
     living_canon = LivingCanonPreviewDiagnostics()
     try:
@@ -1536,7 +1596,11 @@ def prepare_memory_preview(
         ) = _formation_and_lifecycle(conn, effective_request, env)
         packet = build_packet(
             conn,
-            _packet_request(effective_request, conversation_context),
+            _packet_request(
+                effective_request,
+                conversation_context,
+                env,
+            ),
             persist=True,
             environ=env,
         )
@@ -1558,6 +1622,7 @@ def prepare_memory_preview(
                 conversation_context_digest=(
                     conversation_context.digest
                 ),
+                capability_receipt=capability_receipt,
             )
         assessment = _assessment_from_packet(
             packet,
@@ -1625,8 +1690,10 @@ def prepare_memory_preview(
                 basis,
                 effective_request,
                 conversation_context.digest,
+                capability_receipt,
             ),
             conversation_context_digest=conversation_context.digest,
+            capability_receipt=capability_receipt,
         )
     except (
         FileNotFoundError,
@@ -1646,6 +1713,7 @@ def prepare_memory_preview(
                 route_reason=type(exc).__name__,
                 living_canon=living_canon,
             ),
+            capability_receipt=capability_receipt,
         )
 
 
@@ -1936,11 +2004,38 @@ def render_content_free_diagnostics(
         ),
     )
     living = diag.living_canon
+    capability = dict(prepared.capability_receipt or {})
+    capability_versions = {
+        key: capability.get(key, "unverified")
+        for key in (
+            "packet_version",
+            "claim_contract_version",
+            "assessment_version",
+            "identity_contract_version",
+            "synthesis_version",
+        )
+    }
     return (
         "- preview_schema: `%s`" % diag.schema_version,
         "- simulated_route: `normal_chat/public_home/#barcode-bot`",
         "- route_interpretation: `%s` reason=`%s`"
         % (diag.route_status, diag.route_reason or "none"),
+        "- capability_receipt: `version=%s capability=%s contract=%s "
+        "requested=%s effective=%s prerequisites_ready=%s scope=%s "
+        "versions=%s conflicts=%s reason=%s kill_switch=%s`"
+        % (
+            capability.get("receipt_version", "unverified"),
+            capability.get("capability", "unverified"),
+            capability.get("contract_version", "unverified"),
+            str(bool(capability.get("requested"))).lower(),
+            str(bool(capability.get("effective"))).lower(),
+            str(bool(capability.get("prerequisites_ready"))).lower(),
+            capability.get("scope_digest", "none") or "none",
+            capability_versions,
+            list(capability.get("conflicts") or ()) or ["none"],
+            capability.get("reason", "unverified"),
+            capability.get("kill_switch", "none"),
+        ),
         "- formation_outcomes: `%s`"
         % dict(diag.formation_outcomes),
         "- formation_reasons: `%s`"
@@ -1979,6 +2074,16 @@ def render_content_free_diagnostics(
         "- packet_lanes: `%s`" % dict(diag.packet_lane_counts),
         "- validation_support_lanes: `%s`"
         % dict(diag.validation_support_lane_counts),
+        "- canon_status_counts: `candidates=%s selected=%s`"
+        % (
+            dict(diag.packet_canon_candidate_status_counts),
+            dict(diag.packet_canon_selected_status_counts),
+        ),
+        "- canon_domain_counts: `candidates=%s selected=%s`"
+        % (
+            dict(diag.packet_canon_candidate_domain_counts),
+            dict(diag.packet_canon_selected_domain_counts),
+        ),
         "- public_assessment_pool: `eligible=%s selected=%s`"
         % (
             diag.assessment_pool_eligible_count,

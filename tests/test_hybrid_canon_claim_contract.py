@@ -827,6 +827,50 @@ class HybridCanonClaimContractTests(unittest.TestCase):
             finally:
                 conn.close()
 
+    def test_pr5_declared_packet_read_requires_effective_capability(self):
+        with mock.patch.dict(
+            os.environ,
+            {"BNL_OWNER_USER_ID": "61", "BNL_PRIMARY_GUILD_ID": "7"},
+        ):
+            conn = sqlite3.connect(":memory:")
+            try:
+                self.create_pr2_broadcast_table(conn)
+                row_id = self.insert_pr2_broadcast(conn)
+                revision = self.classify_pr2_broadcast(conn, row_id)
+                disabled = canon.select_declared_canon_claims_for_packet(
+                    conn,
+                    guild_id=7,
+                    route_mode="normal_chat",
+                    channel_policy="public_home",
+                    capability_authorized=False,
+                    now="2026-08-01T02:00:00+00:00",
+                )
+                self.assertEqual(disabled.reason, "capability_disabled")
+                self.assertEqual(disabled.claims, ())
+
+                before = conn.total_changes
+                selected = canon.select_declared_canon_claims_for_packet(
+                    conn,
+                    guild_id=7,
+                    route_mode="normal_chat",
+                    channel_policy="public_home",
+                    capability_authorized=True,
+                    now="2026-08-01T02:00:00+00:00",
+                )
+                self.assertEqual(conn.total_changes, before)
+                self.assertEqual(selected.reason, "eligible")
+                self.assertEqual(len(selected.claims), 1)
+                self.assertEqual(
+                    selected.claims[0].source_revision,
+                    revision.revision_id,
+                )
+                self.assertEqual(
+                    selected.claims[0].value,
+                    "A source-owned Broadcast summary.",
+                )
+            finally:
+                conn.close()
+
     def test_declared_join_rejects_stale_source_and_duplicate_authority(self):
         with mock.patch.dict(
             os.environ,
