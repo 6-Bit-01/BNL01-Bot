@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import sqlite3
 import unittest
 from dataclasses import dataclass
